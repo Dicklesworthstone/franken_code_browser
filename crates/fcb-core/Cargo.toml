@@ -1,0 +1,10 @@
+[package]
+name = "fcb-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+name = "fcb_core"
+path = "src/lib.rs"
