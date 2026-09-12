@@ -5,7 +5,7 @@
 **Product name:** FrankenCodeBrowser  
 **Executable:** `fcb`  
 **Public Rust library:** `fcb`, with separately consumable `fcb-*` components  
-**Plan revision:** R3 — delivery sequencing, source authority, search encoding, and distribution review  
+**Plan revision:** R4 — headless sequencing repair, platform-bridge ownership, FrankenTUI work package, and gate ordering review  
 **Document date:** September 12, 2026  
 **Status:** revised architecture and implementation specification. The plan has been reviewed and revised; the proposed application, APIs, upstream extensions, and performance targets are not represented as implemented or benchmarked.  
 **Primary target:** late-model Apple Silicon Macs, especially M4/M5 configurations with at least 24 GB of unified memory.  
@@ -152,7 +152,7 @@ All authoritative source, parsing, indexing, layout, UI-state, search, graph, an
 
 Native AppKit and Metal access requires an explicit system-ABI boundary. Rust's 2024 edition requires unsafe external declarations because their signatures and contracts are the binding author's responsibility. A safe Rust application cannot conjure a native Metal implementation from `std` alone. [A4]
 
-**Architecture decision:** create or extract a narrowly scoped, first-party `franken-macos` platform crate that provides safe, owned, thread-affine APIs and contains the audited system-ABI implementation. This is a proposed component, not a claim that a suitable existing bridge was found. It is the only new application-side exception to the `unsafe` prohibition. It may contain the minimal unsafe Rust required to call Apple frameworks and implement their callbacks, but no source parsing, arbitrary plugin loading, indexing algorithm, or general application logic.
+**Architecture decision:** create or extract a narrowly scoped, first-party `franken-macos` platform crate that provides safe, owned, thread-affine APIs and contains the audited system-ABI implementation. It lives in its own first-party repository, `franken_macos`, because both FCB and FrankenMarkdown's optional Mac font adapter consume it and neither may host the other's dependency (§6.2). This is a proposed component, not a claim that a suitable existing bridge was found. It is the only new application-side exception to the `unsafe` prohibition. It may contain the minimal unsafe Rust required to call Apple frameworks and implement their callbacks, but no source parsing, arbitrary plugin loading, indexing algorithm, or general application logic.
 
 The supported claim is therefore **a memory-safe Rust application above an explicit, audited native boundary**, not “there is no unsafe code anywhere in the operating system, standard library, GPU driver, or dependency closure.” Every inherited first-party unsafe boundary, especially storage VFS code, must also be inventoried. The native binding gate is a release blocker; wrapping an unsound ABI in a safe function does not satisfy the requirement.
 
@@ -409,7 +409,7 @@ These names specify future boundaries, not already available APIs. Publish only 
 | `fcb-conformance` | Test corpus, embedding consumers, replay, native/hardware qualification. | Test tooling; not linked into normal application. |
 | FrankenMarkdown root modules, proposed `flow`, `display`, `source_map` | Reusable document parsing/provenance, continuous flow, layout, renderer-neutral drawing/interaction output. | Implemented and maintained **inside `franken_markdown`**. No dependency on FCB. |
 | `fmd-font`, `fmd-math`; optional proposed `fmd-font-macos` | Shared text/font/math APIs; system shaping/raster adapter behind an optional Mac boundary. | All in FrankenMarkdown ownership. Base engine stays platform-neutral; no forced Asupersync. |
-| Proposed shared `franken-macos` | Safe AppKit/Metal/CoreText/CoreGraphics/input/accessibility/filesystem platform primitives. | Narrow system-ABI crate, separate from product semantics. It never depends on FCB or FMD. |
+| Proposed shared `franken-macos` | Safe AppKit/Metal/CoreText/CoreGraphics/input/accessibility/filesystem platform primitives. | Narrow system-ABI crate in its own first-party repository `franken_macos`, separate from product semantics. It never depends on FCB or FMD; FCB-003 delivers it there with FCB and `fmd-font-macos` as consumers. |
 
 Avoid an upstream cycle: start with flow/provenance/display modules in the existing FrankenMarkdown root. Do not create an `fmd-flow` crate that depends on that root and then make the root depend back on it. A later split first extracts shared document types downward and must preserve acyclic imports. The native font adapter can depend on `fmd-font` plus the system bridge; the system bridge does not depend on the adapter.
 
@@ -443,7 +443,7 @@ Cargo features are additive and may unify through another dependency. They must 
 | `source` / `search` / `map` | Independently useful headless functionality. | A GPU, a window, persistent storage, an installed app. |
 | `markdown` | `fcb-document` and no-default FrankenMarkdown engine/flow integration. | FMD CLI/batch/wasm-bindgen features or a WebView. |
 | `view` | Deterministic UI model and renderer-neutral frame plans. | Taking over the event loop or creating a device. |
-| `runtime` | Compatible Asupersync host integration. | A secretly created global executor. |
+| `runtime` | Compatible Asupersync host integration, or an explicitly requested owned runtime (§16.9). | A secretly created global executor. |
 | `persistence` | Qualified `fcb-store`; explicit runtime/context integration. | Mandatory persistent state for unrelated profiles. |
 | `macos-metal` | Native rendering/view adapter and optional system text support. | Whole FrankenTerm GUI, third-party graphics bindings. |
 | `fcb-app` release | Explicit fixed feature set for the full standalone product. | Any undeclared runtime, downloaded model, or separately installed GUI companion. |
@@ -627,11 +627,13 @@ A committed layout generation freezes its effective weights and ordering. Updati
 
 Separate a logical source provider from a native path. In-memory or host-supplied immutable sources work without granting filesystem access. A provider states its capture, ordering, range-read, and cancellation guarantees; FCB cannot infer stronger consistency from an interface returning bytes.
 
-For atomic-save replacements, preserving a logical file identity is an explicit namespace-continuity decision, not an assumption that its inode stayed the same. Reattach annotations to new bytes only when the chosen exact or qualified anchor-mapping rule succeeds. Otherwise keep an orphaned/stale annotation with its original source evidence. Never attach an old note to a unrelated new file simply because a path was recycled.
+For atomic-save replacements, preserving a logical file identity is an explicit namespace-continuity decision, not an assumption that its inode stayed the same. Reattach annotations to new bytes only when the chosen exact or qualified anchor-mapping rule succeeds. Otherwise keep an orphaned/stale annotation with its original source evidence. Never attach an old note to an unrelated new file simply because a path was recycled.
 
 ### 8.9 Root-grant lifecycle and native permissions
 
 A persisted root path or `RootId` is not itself a current access grant. On reopen, restore only the scope authorized by the user's saved policy and revalidate the native access route. G0 records the standalone and embedded sandbox/entitlement models; it must not assume an in-process root capability grants OS permission. For a security-scoped bookmark route, resolve the bookmark, handle stale data, and balance successful access acquisition with release after outstanding native users finish. A navigation bookmark is a different object from an OS access bookmark. Failed restoration leaves a visible unavailable root and a deliberate reauthorization action, not an empty successful workspace. [B14]
+
+The sandbox decision is cross-cutting, not a packaging detail. App Sandbox constrains the local IPC endpoints in §19.8, the external editor/link handoff in §22.6, watcher and font access scope, and makes security-scoped bookmarks the only durable access route across launches. An unsandboxed notarized distribution has none of those constraints and no bookmark requirement, but still needs the grant lifecycle above. G0 records the choice together with its consequences for each of those sections; no section may assume the other model.
 
 Every root grant has a revocation generation. Revoking it stops new admission and invalidates pending deliveries, link activation and new exports from that grant. Serialize grant revalidation with the export's publication decision so revocation cannot slip between a permission check and a new authorized effect; an already published destination retains its completed outcome. Drain foreign reads safely while discarding their results; another explicitly authorized root/session may retain independently permitted data. State whether already displayed captures are withdrawn under the selected host policy, and do not promise to retract bytes already returned to a host, copied to the clipboard or exported. Root access revocation, source-cache clearing and annotation deletion are separate actions. Test revocation during a read/query/export, unavailable volumes, and root restoration under changed native permissions.
 
@@ -1153,7 +1155,7 @@ AppKit owns the native event loop. A small main-thread reducer ingests native in
 
 Use a qualified display-link integration. Apple's `CAMetalDisplayLink` provides display-synchronized updates and frame-rate/latency controls; requests are not a guarantee that every connected display will run at 120 Hz. Its chosen run-loop/delegate route determines callback behavior. Do not assert an arbitrary callback thread or add a competing drawable-acquisition path. The application or embedding host designates one acquisition/presentation owner and validates its update/drawable contract on the pinned SDK. [A3] [B12]
 
-The exact callback threading, availability, and deployment-version contract is established against the pinned SDK in G0. Do not invent an availability shim from an untested selector.
+The exact callback threading, availability, and deployment-version contract is established against the pinned SDK in G0. Do not invent an availability shim from an untested selector. This route bounds the deployment floor: `CAMetalDisplayLink` requires macOS 14, and `CVDisplayLink` is deprecated from macOS 15, so a lower floor needs a separately qualified pacing route (§26.8).
 
 ### 15.2 Queue latency
 
@@ -1274,7 +1276,7 @@ Request replacement creates a new generation immediately; it does not await an o
 
 ### 16.9 Embedded runtime contract
 
-The application creates and closes its Asupersync runtime explicitly. An embedding host supplies a compatible runtime/context, time source and wake integration. The library creates only owned child regions and services named in its configuration. It does not infer that a process-wide default exists or install one on first method call.
+The application creates and closes its Asupersync runtime explicitly. An embedding host supplies a compatible runtime/context, time source and wake integration. A host without its own Asupersync integration may instead call an explicit facade constructor that builds a private owned runtime with the same bounded configuration the application uses; that call is never implicit, is the only route to a runtime FCB owns inside a host, and the host closes it through the same session drain path. The library creates only owned child regions and services named in its configuration. It does not infer that a process-wide default exists or install one on first method call.
 
 The FrankenSQLite adapter's dedicated worker is owned by the persistence service, with any required runtime instance/context explicitly declared. A `Cx` from another crate/version or logical clock is not interchangeable because its type name looks similar. Consumer tests cover matching versions, close while writes finish, cancellation after publication, and a host remaining alive after an embedded FCB session closes.
 
@@ -1806,7 +1808,7 @@ fcb bench replay TRACE_FILE --output RESULTS_DIRECTORY
 
 GUI operations and robot commands share the public library service APIs. The CLI must not implement a second search/index policy. Normal machine output goes to stdout; diagnostics go to stderr. JSON schemas and error codes are versioned. A first-party codec or small bounded schema-specific encoder is used only after inspection; a new serialization crate is not assumed exempt.
 
-Bare `fcb` is explicitly the human GUI launcher; machine callers use a subcommand with `--json`. A bare machine flag such as `fcb --json` resolves to capabilities/readiness without opening a window. Document this distinction. `capabilities` works without a selected source root, database, GPU, or network. Argument parsing supports `--`, raw native paths where possible, spaces, non-ASCII filenames, deterministic errors, bounded input, and no shell execution. JSON encoders escape all input correctly and round-trip arbitrary supported text under tests.
+`fcb open FILE` grants a read root at the file's parent directory unless `--root` names an authorized ancestor; a file inside an already-open workspace root reuses that root. The effective root is displayed, and opening a file never widens scope silently. Bare `fcb` is explicitly the human GUI launcher; machine callers use a subcommand with `--json`. A bare machine flag such as `fcb --json` resolves to capabilities/readiness without opening a window. Document this distinction. `capabilities` works without a selected source root, database, GPU, or network. Argument parsing supports `--`, raw native paths where possible, spaces, non-ASCII filenames, deterministic errors, bounded input, and no shell execution. JSON encoders escape all input correctly and round-trip arbitrary supported text under tests.
 
 `fcb` is a real standalone executable, not a shim that requires a separately installed `.app`. The Mac release embeds its required shaders/font/default resources or ships a self-contained declared artifact with the binary as its actual runtime; the strict single-file lane embeds required assets. The optional `.app` wraps the same executable/resources for Finder integration. Both launch routes exercise the same library and are qualified independently. An embedding library never parses process arguments on construction.
 
@@ -2006,7 +2008,7 @@ Build evidence records normal dependencies, build dependencies/proc macros, sele
 
 A standalone `fcb` executable can embed its runtime assets without requiring its downloadable distribution to be one bare Mach-O file. Apple issues notarization tickets for standalone binaries but does not support stapling directly to them or to ZIP archives. Select and qualify a supported stapled distribution container, such as a disk image or installer package, for offline installation; an app bundle has its own staple route. Do not promise identical offline Gatekeeper behavior for a bare downloaded binary merely because an online launch succeeded. [B17]
 
-Test the final signed/notarized downloads on a clean Mac, including quarantine, online and offline first launch, extraction/installation and arbitrary working directories. Record which artifact and route passed. Do not clear quarantine or disable Gatekeeper to manufacture acceptance. G0 chooses the deployment floor, architecture baseline, signing identity/entitlement model and SDK availability policy; G7 proves the complete distribution. The standalone runtime remains independent of a companion `.app`.
+Test the final signed/notarized downloads on a clean Mac, including quarantine, online and offline first launch, extraction/installation and arbitrary working directories. Record which artifact and route passed. Do not clear quarantine or disable Gatekeeper to manufacture acceptance. G0 chooses the deployment floor, architecture baseline, signing identity/entitlement model and SDK availability policy; G7 proves the complete distribution. The floor is already bounded below by the display-link route selected in §15.1 (macOS 14 for `CAMetalDisplayLink`) and interacts with the sandbox decision in §8.9. The standalone runtime remains independent of a companion `.app`.
 
 ---
 
@@ -2050,7 +2052,7 @@ Acceptance: a FrankenMarkdown-owned headless flow consumer; nested provenance an
 
 ### 27.5 U4: FrankenMarkdown shared text/font/math and optional Mac adapter
 
-**Owner:** `fmd-font`, `fmd-math`, and an optional `fmd-font-macos` component inside FrankenMarkdown. **System primitive owner:** shared `franken-macos`.
+**Owner:** `fmd-font`, `fmd-math`, and an optional `fmd-font-macos` component inside FrankenMarkdown. **System primitive owner:** the separate first-party `franken_macos` repository (§6.2), delivered by FCB-003.
 
 Improve immutable shared font backing, checked parsers, shaping/context APIs, glyph/cluster provenance, run metrics, font fallback identification, and reusable raster/display contracts upstream. The Mac adapter obtains owned platform results from the safe system bridge and returns the common run/raster representation. Base font/math engines remain platform-independent and unsafe-forbidden.
 
@@ -2062,7 +2064,7 @@ Qualification includes Latin/CJK/bidi/joining/combining text, ligatures, emoji/c
 
 Extract a supported dependency-clean non-terminal pane/focus transaction surface and a checked wide prefix/virtualization primitive. Preserve semantic input, reversible layouts, focus/announcements, versioning, and bounded retention. Avoid importing terminal presenters or cell-only geometry, and do not assume raw private module paths inherit the curated facade's stability contract. [B5]
 
-Use checked fixed-point logical heights and explicit structural-edit behavior. Acceptance covers sums beyond 2³², invalid indexes, negative adjustments, inserted/deleted blocks, deterministic transactions, scale conversion, accessibility focus, and a resolved no-terminal profile. Refactor upstream dependencies as needed; empty default features alone do not remove the inspected unconditional dependencies.
+Use checked fixed-point logical heights and explicit structural-edit behavior. Acceptance covers sums beyond 2³², invalid indexes, negative adjustments, inserted/deleted blocks, deterministic transactions, scale conversion, accessibility focus, and a resolved no-terminal profile. Refactor upstream dependencies as needed; empty default features alone do not remove the inspected unconditional dependencies. **Work package:** FCB-097, consumed by FCB-032 (heights) and FCB-050 (panes).
 
 ### 27.7 U6: FrankenNetworkX compact directed kernels
 
@@ -2209,7 +2211,7 @@ The IDs below are ready to translate into the project's issue/bead system. They 
 |---|---|---|---|
 | FCB-001 | Pin reviewed suite inputs and inspect exact selected package graph. | None | Machine-readable graph identifies all normal/build packages and incompatible runtime pins. |
 | FCB-002 | Asupersync dependency-clean desktop profile and bounded-runtime sample. | FCB-001 | Native sample has compliant closure and passes region/channel/cancel tests. |
-| FCB-003 | First-party macOS object/ABI ownership kernel. | FCB-001 | Signature/ownership ledger plus retain/release/reentry/lifetime tests. |
+| FCB-003 | First-party macOS object/ABI ownership kernel in the separate `franken_macos` repository. | FCB-001 | Signature/ownership ledger plus retain/release/reentry/lifetime tests; consumable by FCB and `fmd-font-macos` without either hosting it. |
 | FCB-004 | Native window, event conversion, resize, and close. | FCB-003 | Real AppKit lifecycle and input smoke tests with no late callback use. |
 | FCB-005 | Safe Metal resource/upload/submission layer. | FCB-003, FCB-065, FCB-068 | Real GPU round-trip; owned upload/submission leases, cross-owner and stale handles rejected. |
 | FCB-006 | Display-link integration and bounded frame ownership. | FCB-004, FCB-005, FCB-070, FCB-072 | Single drawable owner, verified callback route, native pacing/teardown; no event-thread completion wait. |
@@ -2221,9 +2223,9 @@ The IDs below are ready to translate into the project's issue/bead system. They 
 | ID | Deliverable | Dependencies | Completion evidence |
 |---|---|---|---|
 | FCB-009 | Root read capabilities, native permission lifecycle and raw-path identities. | FCB-003, FCB-007, FCB-067, FCB-068 | Symlink/rename/case/raw-byte corpus; unavailable/stale native grants and revocation during reads. |
-| FCB-010 | Bounded directory discovery and ignore matcher. | FCB-008, FCB-009, FCB-065 | Large/deep tree gives progressive output with descriptor/queue limits. |
+| FCB-010 | Bounded directory discovery and ignore matcher. | FCB-002, FCB-009, FCB-065, FCB-066 | Large/deep tree gives progressive output with descriptor/queue limits. |
 | FCB-011 | Immutable source chunks and observed-snapshot contract. | FCB-007, FCB-009, FCB-065, FCB-067 | Concurrent replacement/truncation tests without mutable-source mmap. |
-| FCB-012 | Sparse line index and exact byte/line translation. | FCB-011 | Huge-line/chunk/CRLF/UTF-8 and far-jump fixtures. |
+| FCB-012 | Sparse line index, exact byte/line translation and capture encoding maps. | FCB-011 | Huge-line/chunk/CRLF/UTF-8, UTF-16 BOM decoding-map and far-jump fixtures. |
 | FCB-013 | Stable retained partition-tree layout. | FCB-007, FCB-010, FCB-065 | Containment, deterministic stable generation, provisional discovery, local insertion/displacement tests. |
 | FCB-014 | Spatial hierarchy query and LOD admission. | FCB-013 | Visible-cost traces independent of total hidden leaves; threshold hysteresis. |
 | FCB-015 | Camera math, pointer anchoring, focus/back navigation. | FCB-004, FCB-014 | Deep-zoom precision and deterministic interaction replay. |
@@ -2239,12 +2241,12 @@ The IDs below are ready to translate into the project's issue/bead system. They 
 |---|---|---|---|
 | FCB-021 | FrankenMarkdown-owned resumable lexer and explicit EOF/checkpoint interface. | FCB-001, FCB-011, FCB-065 | Whole/chunked equivalence and exact byte tiling. |
 | FCB-022 | FrankenMarkdown language-state expansions and qualified lexical capabilities. | FCB-021 | Rust/JS/Python/shell/YAML and remaining release-language adversarial corpus. |
-| FCB-023 | Upstream FMD checkpoint convergence plus FCB bounded request/publication integration. | FCB-008, FCB-021, FCB-065, FCB-068 | External edits converge correctly without UI stalls or stale spans. |
+| FCB-023 | Upstream FMD checkpoint convergence plus FCB bounded request/publication integration. | FCB-002, FCB-021, FCB-065, FCB-066, FCB-068 | External edits converge correctly without UI stalls or stale spans. |
 | FCB-024 | Shared upstream token/theme outputs in FCB readers and excerpts. | FCB-018, FCB-019, FCB-023 | Same source tokenization across surfaces; recolor does not re-lex. |
-| FCB-025 | Path search index and stable fuzzy ranking. | FCB-010, FCB-020 | Exact/prefix/fuzzy results with distinct case-sensitive identities. |
-| FCB-026 | Bounded exact source scan and query scopes. | FCB-011, FCB-012, FCB-082 | Reference corpus including cross-chunk/short queries and decoded UTF-16 text versus raw-byte semantics. |
+| FCB-025 | Path search index and stable fuzzy ranking. | FCB-007, FCB-010 | Exact/prefix/fuzzy results with distinct case-sensitive identities. |
+| FCB-026 | Bounded exact source scan and query scopes. | FCB-011, FCB-012 | Reference corpus including cross-chunk/short queries and decoded UTF-16 text versus raw-byte semantics. |
 | FCB-027 | Ephemeral immutable substring candidate segments and exact verification. | FCB-026, FCB-065, FCB-085 | G2 bounded in-memory closed-manifest index; no database dependency or false negatives in admitted semantics. |
-| FCB-028 | Query-generation streams, cancellation, completeness UI. | FCB-008, FCB-025, FCB-026 | Rapid query changes, protected selection, truthful partial results. |
+| FCB-028 | Query-generation streams, cancellation, completeness UI. | FCB-002, FCB-025, FCB-026, FCB-066 | Rapid query changes, protected selection, truthful partial results. |
 | FCB-029 | Result navigation and compact spatial match overlays. | FCB-014, FCB-024, FCB-028 | Exact range landing and bounded million-match aggregation. |
 | FCB-030 | Source-specific structural outlines and evidence-class schema; reusable lexer fixes upstream. | FCB-007, FCB-022 | Language-scoped facts with source spans; no heuristic-as-exact claims. |
 
@@ -2253,7 +2255,7 @@ The IDs below are ready to translate into the project's issue/bead system. They 
 | ID | Deliverable | Dependencies | Completion evidence |
 |---|---|---|---|
 | FCB-031 | Consume upstream FMD nested document/flow APIs through thin fcb-document integration. | FCB-011, FCB-016, FCB-073, FCB-074 | Committed upstream headless flow API drives native FCB output; no local Markdown engine. |
-| FCB-032 | FrankenMarkdown-owned paragraph/list/quote/heading flow and checked height contracts. | FCB-031, FCB-065, FCB-074 | Resize, long paragraph, deep list, totals above 2³² fixtures. |
+| FCB-032 | FrankenMarkdown-owned paragraph/list/quote/heading flow and checked height contracts. | FCB-031, FCB-065, FCB-074, FCB-097 | Resize, long paragraph, deep list, totals above 2³² fixtures. |
 | FCB-033 | FrankenMarkdown-owned code-fence and large/wide table layout. | FCB-024, FCB-032 | Independent scrolling, row virtualization, exact code copy. |
 | FCB-034 | FrankenMarkdown math/diagram display output plus FCB renderer mapping. | FCB-018, FCB-031 | fmd-math/diagram fixtures rendered natively with source anchors. |
 | FCB-035 | FMD asset semantics, FCB capability I/O, and admitted first-party image decoders. | FCB-009, FCB-005, FCB-031, FCB-065 | Upstream asset-request semantics; confined bounded decoding and stale asset-response tests. |
@@ -2281,7 +2283,7 @@ The IDs below are ready to translate into the project's issue/bead system. They 
 | FCB-047 | Dependency-clean checked FrankenNetworkX directed views and selected kernels. | FCB-001, FCB-007, FCB-065 | Qualified graph corpus and deterministic/cancelable outputs. |
 | FCB-048 | Source relationship extraction and compact graph snapshots. | FCB-030, FCB-047 | Evidence-separated directed CSR; parallel multiplicity/provenance preserved; exact generation invalidation. |
 | FCB-049 | Contextual graph overlays and Inspector relationships. | FCB-020, FCB-048 | Bounded edges, linear list equivalent, no fake semantic completeness. |
-| FCB-050 | Pinned multi-reader workflow and pane transactions. | FCB-019, FCB-036, FCB-041, FCB-066, FCB-079 | Shared source memory, focus correctness, reversible arrangements. |
+| FCB-050 | Pinned multi-reader workflow and pane transactions. | FCB-019, FCB-036, FCB-041, FCB-066, FCB-079, FCB-097 | Shared source memory, focus correctness, reversible arrangements. |
 | FCB-051 | City extrusion, projection transitions, metric legends. | FCB-015, FCB-018, FCB-065, FCB-071, FCB-084 | Same map positions/selection retained across 2D/City transitions. |
 | FCB-052 | City picking, clip/depth/order, safe optional visual quality. | FCB-005, FCB-051 | Correct selection without synchronous GPU readback; pressure degradation. |
 | FCB-053 | Complete native text input, IME, clipboard, menu and open/drop qualification. | FCB-004, FCB-016, FCB-020, FCB-069, FCB-070, FCB-077 | Real native behavior and composition tests. |
@@ -2298,7 +2300,7 @@ The IDs below are ready to translate into the project's issue/bead system. They 
 | FCB-059 | Source/parser/asset hostile corpus and regression minimizer. | FCB-022, FCB-035, FCB-043 | Reproducible seeds, budgets, minimized failure fixtures. |
 | FCB-060 | GPU/native resource-lifetime and failure injection suite. | FCB-005, FCB-006, FCB-052, FCB-055, FCB-070, FCB-071, FCB-072, FCB-079, FCB-089 | Close/device/pressure/callback races preserve resource ownership. |
 | FCB-061 | CPU/GPU visual and source-semantic comparison suite. | FCB-038, FCB-049, FCB-054, FCB-071, FCB-076, FCB-089 | Qualified content/layout/pixel evidence by rendering route. |
-| FCB-062 | Real M4/M5 cold/warm/pressure/idle qualification. | FCB-044, FCB-045, FCB-058, FCB-060, FCB-061, FCB-095, FCB-096 | Named hardware traces and honest SLO results, including missed frames. |
+| FCB-062 | Real M4/M5 cold/warm/pressure/idle qualification. | FCB-044, FCB-045, FCB-058, FCB-060, FCB-061, FCB-063, FCB-095 | Named hardware traces and honest SLO results, including missed frames. |
 | FCB-063 | Real standalone fcb binary, optional .app, embedded assets, signing/install. | FCB-008, FCB-053, FCB-057, FCB-066, FCB-080 | Direct executable/bundle and quarantined online/offline distribution launches; supported stapling route; licensed embedded resources; no companion app or checkout. |
 | FCB-064 | Full-product release acceptance across app, library and upstream owners. | FCB-050, FCB-056, FCB-059, FCB-062, FCB-063, FCB-076, FCB-078, FCB-079, FCB-080, FCB-081, FCB-084, FCB-085, FCB-086, FCB-088, FCB-089, FCB-091, FCB-092, FCB-093, FCB-095, FCB-096 | All mandatory work reachable; functional/ownership/safety/closure/visual/hardware gates assessed without vacuous passes. |
 
@@ -2325,7 +2327,7 @@ IDs 065 onward are additions from this review, **not later scheduling priority**
 | FCB-079 | Two-instance native embedding and independent host/session shutdown tests. | FCB-019, FCB-020, FCB-070, FCB-071, FCB-072, FCB-077 | One view closes during work; other view, host loop, device and runtime remain valid. |
 | FCB-080 | Upstream reusable digest/canonical-envelope factoring and conformance. | FCB-001 | Inspected fmn-hash primitives selected with actual closure; bounded serialization and digest vectors. |
 | FCB-081 | Owned cache namespaces, pins, revocation and protected reclamation primitives. | FCB-009, FCB-065, FCB-068, FCB-080 | Wrong-root/retired writes rejected; no wall-clock liveness assumption; cold/hot equality tests. |
-| FCB-082 | Exact capture/encoding maps and qualified huge-line visual-context routes. | FCB-011, FCB-012, FCB-075 | No live-byte substitution under old captures; bidi/tabs/combining pathology stays bounded and truthful. |
+| FCB-082 | Old-capture anchor resolution and qualified huge-line visual-context routes. | FCB-011, FCB-012, FCB-075 | No live-byte substitution under old captures; bidi/tabs/combining pathology stays bounded and truthful. |
 | FCB-083 | Scan epochs, special-object admission, self-cache exclusion and continuity rules. | FCB-009, FCB-010, FCB-011 | Partial scan never deletes unseen files; FIFO/symlink races, traversal cycles/aliases, path display controls and atomic saves handled. |
 | FCB-084 | Retained semantic summary pyramids and precision-safe focus islands. | FCB-013, FCB-014, FCB-023 | Palette change avoids re-lex; bounded LOD work, deep hierarchy does not underflow into invisible parcels. |
 | FCB-085 | Closed search manifests, normalization maps and completeness semantics. | FCB-011, FCB-026, FCB-028 | Live-tree changes, unknown membership, normalized/short queries and exact counts distinguished. |
@@ -2336,10 +2338,11 @@ IDs 065 onward are additions from this review, **not later scheduling priority**
 | FCB-090 | CASS-owned reusable bounded evidence/readiness selection policy. | FCB-001, FCB-066, FCB-080 | Narrow first-party extraction, deterministic omissions, explicit non-exact token estimates. |
 | FCB-091 | FCB reading trails, documentation back-links and provenance navigation. | FCB-029, FCB-036, FCB-041, FCB-048, FCB-090 | Exact captured anchors; evidence labels; stable map/reader navigation with bounded pack selection. |
 | FCB-092 | Explicit source-pack export with upstream Markdown formatting and privacy. | FCB-036, FCB-080, FCB-088, FCB-091 | Destination/consent, exact byte budgets, omission ledger, no silent disclosure or command execution. |
-| FCB-093 | Resolved library/app closure and feature-leak external-consumer matrix. | FCB-001, FCB-002, FCB-039, FCB-047, FCB-066, FCB-078, FCB-079, FCB-080 | Additive profiles, actual unification/patch behavior, no accidental native/runtime/dependency leakage. |
+| FCB-093 | Resolved library/app closure and feature-leak external-consumer matrix. | FCB-001, FCB-002, FCB-039, FCB-047, FCB-066, FCB-078, FCB-079, FCB-080, FCB-097 | Additive profiles, actual unification/patch behavior, no accidental native/runtime/dependency leakage. |
 | FCB-094 | Early bounded tracing, admission fairness and clock-domain fixtures. | FCB-007, FCB-065, FCB-068 | G0/G1 evidence for wake/coalescing, priority meet, deadline conversion and zero per-glyph logging. |
 | FCB-095 | Expanded review-driven ownership/concurrency/hostile regression matrix. | FCB-059, FCB-060, FCB-077, FCB-079, FCB-081, FCB-082, FCB-083, FCB-085, FCB-086, FCB-087, FCB-088, FCB-089 | Every §25.9 defect class exercised with production routes and bounded reproducible artifacts. |
 | FCB-096 | Joint standalone/library/upstream delivery contract acceptance. | FCB-057, FCB-063, FCB-076, FCB-079, FCB-093 | Real standalone executable, app bundle, independent embedding, committed FMD APIs and exact features. |
+| FCB-097 | FrankenTUI-owned non-terminal pane/focus facade and checked wide-prefix height primitive (U5). | FCB-001, FCB-007, FCB-065 | Upstream no-terminal profile with resolved clean closure; sums beyond 2³², invalid-index, negative-adjustment and structural-edit fixtures; FCB consumers in FCB-032/050. |
 
 ### 29.9 Immediate implementation order
 
@@ -2349,7 +2352,7 @@ The first complete user loop is FCB-020 with the early accessibility and embeddi
 
 The added reading-trail and summary work compounds existing source/search/graph primitives; it does not introduce a second application or a model requirement. More speculative compute/adaptive/provider integrations remain outside the mandatory work graph until separately justified.
 
-Do not close a work package with a trait, stub return, screenshot, or test that never reaches the real implementation. A cross-repo task is complete only when the upstream commit and public FCB consumer both satisfy the row's evidence. The release package depends on every mandatory package transitively; dependency references and cycles are mechanically checked when this plan is edited.
+Do not close a work package with a trait, stub return, screenshot, or test that never reaches the real implementation. A cross-repo task is complete only when the upstream commit and public FCB consumer both satisfy the row's evidence. The release package depends on every mandatory package transitively. `scripts/check_plan_graph.py` checks dependency references, cycles, release reachability, headless-lane isolation, citations, anchors and numbering; run it after every edit to this plan.
 
 ---
 
@@ -2424,8 +2427,8 @@ This table records substantive changes already integrated above; it is not an al
 | Default-feature suppression could be mistaken for transitive closure isolation. | Additive Cargo matrix and independent downstream consumers/actual graphs. | §§3.2, 6.4, 26; FCB-093. |
 | Whole-file source identity could be inferred from unrelated captured ranges. | Complete versus extent captures and immutable backing validation. | §10.7; FCB-067/082. |
 | Huge-line virtualization implied context-free exact text shaping. | Qualified ASCII fast path and bounded paragraph/context preparation or labeled fallback. | §10.9; FCB-075/082. |
-| Byte, scalar, grapheme, UTF-16 and visual offsets risked conflation. | Separate typed domains, provenance conversions and sentinel tests. | §§10, 13, 23; FCB-069/073/077. |
-| A Fenwick tree could be read as a general logarithmic dynamic sequence. | Checked wide fixed-point heights with paged structural edits. | §§4.9, 10.10; FCB-032. |
+| Byte, scalar, grapheme, UTF-16 and visual offsets risked conflation. | Separate typed domains, provenance conversions and sentinel tests. | §§10, 13, 23; FCB-012/069/073/077. |
+| A Fenwick tree could be read as a general logarithmic dynamic sequence. | Checked wide fixed-point heights with paged structural edits. | §§4.9, 10.10, 27.6; FCB-097/032. |
 | Partial directory scans could imply deletions. | Successful reconciliation epochs and dirty-hint accounting. | §8.6; FCB-083. |
 | Source enumeration omitted FIFOs/devices and self-generated cache loops. | Opened-object validation, bounded native admission, cache identity exclusion. | §8.6; FCB-083. |
 | Deterministic layout could depend on unordered streamed arrival or changed estimates. | Stable committed ordering/weights, provisional aggregates and explicit repack. | §§8.7, 9; FCB-013/084. |
@@ -2472,7 +2475,7 @@ RaptorQ repair, neural search, general Git/LSP providers, full 3D scene-engine c
 | Rename to FrankenCodeBrowser / `fcb`. | Header, §§1, 6, 24, 26. | Canonical executable/library names and revised work IDs. |
 | Real standalone binary and modular Rust library. | §§6, 24–26, 28. | FCB-066/070/078/079/093/096; isolated consumers and direct executable. |
 | All reusable Markdown improvements implemented upstream. | §§4.3, 6, 11–13, 27.3–27.5. | FCB-021–024/031–038/073–076; FMD-owned implementation and independent consumer. |
-| Thorough fresh review and useful additional suite reuse. | §§4, 7–30, 32.5. | Review findings in §30.4; new source ledger; 96-package acyclic dependency graph. |
+| Thorough fresh review and useful additional suite reuse. | §§4, 7–30, 32.5. | Review findings in §30.4 and §§32.7–32.8; new source ledger; 97-package acyclic dependency graph. |
 
 ### 31.2 Release checklist
 
@@ -2635,7 +2638,7 @@ Key supported findings: real typed/generational handles and device-generation te
 
 ### 32.4 What has and has not been delivered
 
-The earlier planning pass delivered the UI study, nine-repository review, architecture and its original work graph. This revision replaces that graph with 96 dependency-linked packages, adds the standalone/library and strict upstream-ownership contracts, and corrects the issues summarized in §30.4. The fresh source-review record is in §32.5.
+The earlier planning pass delivered the UI study, nine-repository review, architecture and its original work graph. This revision replaces that graph with 96 dependency-linked packages (97 after R4 added FCB-097), adds the standalone/library and strict upstream-ownership contracts, and corrects the issues summarized in §30.4. The fresh source-review record is in §32.5.
 
 Not delivered or claimed: a running FrankenCodeBrowser binary, a new native bridge, committed upstream refactors, a compliant resolved application dependency graph, GitHub repository modifications, measured M4/M5 performance, or completed release qualification.
 
@@ -2689,5 +2692,11 @@ The original source/blob ledger remains historical. This pass did not rebuild or
 - **[B17] Native distribution:** [Apple's custom notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow) and [packaging Mac software](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution). Standalone binaries receive tickets but cannot be directly stapled; distribution-container and offline-launch claims require their own tests.
 
 The public repository and supporting documentation now exist. This remains a specification revision: no runtime, native bridge, upstream integration, compliant compiled closure or performance result has been delivered by this review. All product gates remain pending.
+
+### 32.8 R4 review: headless sequencing, bridge ownership, and gate ordering
+
+A second September 12, 2026 follow-up re-read the whole R3 plan and re-ran the structural checks. The graph was still acyclic and fully reachable, but R3's claim that the FCB-027 chain was the only scheduling defect was incomplete. FCB-010, FCB-023 and FCB-028 depended on FCB-008, the standalone composition, which transitively required FCB-004, FCB-005 and FCB-070. Discovery, layout, path search, the ephemeral index, closed manifests and the headless consumers of FCB-078 therefore all waited on the native window and Metal layer, contradicting §6.4 and §28.11. R4 points those packages at FCB-002 and FCB-066 instead, moves FCB-025 off the UI reducer, and moves capture encoding maps from FCB-082 into FCB-012 so FCB-026 no longer depends on font shaping through FCB-075.
+
+R4 also gives `franken-macos` a home (§§3.1, 6.2, 27.5), adds FCB-097 for the FrankenTUI extraction that §27.6 required without a package, removes the inverted FCB-062 → FCB-096 edge, defines the root granted by `fcb open FILE` (§24.1), records the cross-cutting consequences of the sandbox decision (§8.9), ties the deployment floor to the display-link route (§§15.1, 26.8), names the explicit owned-runtime route for hosts without Asupersync (§16.9), and replaces the unbacked “mechanically checked” statement with the repository script `scripts/check_plan_graph.py`. That script checks the document, not any implementation. All product gates remain pending.
 
 **End of plan.**

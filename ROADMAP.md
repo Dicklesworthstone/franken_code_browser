@@ -1,7 +1,7 @@
 # Roadmap
 
 The [comprehensive plan](COMPREHENSIVE_PLAN_FOR_FRANKEN_CODE_BROWSER.md), §§28–29, owns the complete
-96-package dependency graph. This is its navigation summary. All gates are pending at bootstrap;
+97-package dependency graph. This is its navigation summary. All gates are pending at bootstrap;
 there is no promised release date before foundation uncertainties are resolved.
 
 ## Product gates
@@ -47,9 +47,9 @@ A work package is complete only when its production behavior and specified evide
 Cross-repository work needs the owning upstream commit, its tests and a public FCB consumer.
 A trait, success-shaped JSON, mock renderer or screenshot is not sufficient.
 
-If converting the plan to Beads, preserve IDs, dependency meaning and acceptance evidence. Check
-references and cycles mechanically, and never silently alter dependencies to make a queue appear
-ready. The documentation bootstrap does not create or close those implementation tasks.
+If converting the plan to Beads, preserve IDs, dependency meaning and acceptance evidence. Run
+`python3 scripts/check_plan_graph.py` after any plan edit, and never silently alter dependencies to
+make a queue appear ready. The documentation bootstrap does not create or close those implementation tasks.
 
 Optional neural search, external Git/LSP providers, broad GPU compute and adaptive controllers
 remain separately justified enhancements. They must not displace the real source/Markdown/native

@@ -8,7 +8,7 @@ commands or describe document checks as product tests.
 
 | Lane | Establishes | Does not establish |
 |---|---|---|
-| Documentation checks | Existing links, naming, consistent status and work-package references | Executable behavior |
+| Documentation checks (`scripts/check_plan_graph.py`) | Existing links, naming, consistent status, work-package graph and citation references | Executable behavior |
 | Pure semantic tests | Checked IDs/ranges, capture/line semantics, layout invariants, exact search | Native text or GPU behavior |
 | Upstream conformance | FMD lexical/flow/provenance behavior and supported compatibility | FCB integration without its consumer |
 | Isolated consumers | Actual feature closure and headless/host ownership at tested profiles | Every possible host combination |

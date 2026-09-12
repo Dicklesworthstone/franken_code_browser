@@ -65,6 +65,7 @@ research ledger as historical evidence, not a live dependency lockfile.
   `#![forbid(unsafe_code)]`.
 - The proposed first-party `franken-macos` bridge is the sole new application-side native unsafe
   exception: minimal audited Apple ABI, object ownership, callbacks and thread/device lifetimes.
+  It lives in its own `franken_macos` repository; neither FCB nor FrankenMarkdown hosts it.
   It owns no parser, search engine, or product policy. Inherited unsafe boundaries, including a
   selected storage VFS, need their own inventory and qualification.
 - Shipping dependencies are std/toolchain libraries, FCB, Asupersync, FrankenMarkdown, and explicitly
@@ -188,7 +189,8 @@ requirement. Avoid bare interactive `bv` or `cass` in automated sessions.
 
 At bootstrap this is a documentation-only repository. There is no Cargo workspace, pinned
 toolchain, runnable `fcb`, or configured qualification runner. Check links, document consistency,
-plan preservation and Git hygiene. Do not invent build/test successes.
+plan preservation and Git hygiene. Run `python3 scripts/check_plan_graph.py` after editing the plan
+or any doc it cross-references; it checks documents only. Do not invent build/test successes.
 
 When code exists, run formatting, lints, focused semantic tests and isolated consumer checks for
 the selected features. Run UBS on changed supported code before committing; scanner success is

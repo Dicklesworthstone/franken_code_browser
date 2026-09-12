@@ -7,9 +7,9 @@ findings do not establish an FCB implementation.
 
 | Surface | Current state |
 |---|---|
-| Comprehensive specification | R3 plan, 32 sections and 96 planned work packages; delivery and boundary review applied |
+| Comprehensive specification | R4 plan, 32 sections and 97 planned work packages; delivery, boundary and sequencing reviews applied |
 | Project documentation | README, agent instructions, architecture, dependency policy, roadmap, qualification and security/privacy guidance |
-| Repository support | License, issue-report templates, ignore and text-format configuration |
+| Repository support | License, issue-report templates, ignore/text-format configuration and `scripts/check_plan_graph.py` document checker |
 | Rust workspace/toolchain | Not created or qualified |
 | Public `fcb` library / executable | Not implemented or published |
 | `franken-macos` bridge / native Metal renderer | Not implemented here |
@@ -23,7 +23,7 @@ findings do not establish an FCB implementation.
 
 All G0–G7 product gates remain pending. Documentation validation checks only the documentation;
 it cannot qualify source correctness, embedding, native behavior, dependency closure or performance.
-The `FCB-001`–`FCB-096` identifiers in the plan are work-package IDs, not evidence that issues exist.
+The `FCB-001`–`FCB-097` identifiers in the plan are work-package IDs, not evidence that issues exist.
 
 ## Next implementation boundary
 

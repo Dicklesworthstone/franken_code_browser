@@ -181,7 +181,7 @@ corpus, source revision and cache state. See plan §21 and
 
 ## Roadmap and documentation
 
-The plan defines 96 work packages and eight product gates, G0–G7. The next step is G0: qualify
+The plan defines 97 work packages and eight product gates, G0–G7. The next step is G0: qualify
 dependency and native boundaries, inert embedding, resource ownership, initial accessibility,
 and upstream Markdown contracts. The first complete user loop then opens a real tree and lets the
 user navigate, read and copy real source. All gates remain pending.
