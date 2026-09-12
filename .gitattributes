@@ -1,0 +1,15 @@
+* text=auto eol=lf
+*.rs text diff=rust
+*.md text
+*.toml text
+*.metal text
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.pdf binary
+*.ttf binary
+*.otf binary
+*.woff2 binary
+*.metallib binary
+*.bin binary
