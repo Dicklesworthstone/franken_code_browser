@@ -24,6 +24,8 @@ pub enum ContractError {
     WrongEdition,
     UndatedToolchain,
     WrongTarget,
+    WrongDeploymentTarget,
+    WrongSdk,
     MissingSandboxBoundary,
 }
 
@@ -47,6 +49,12 @@ pub fn validate_contract(contract: PlatformContract) -> Result<(), ContractError
     }
     if contract.target != "aarch64-apple-darwin" {
         return Err(ContractError::WrongTarget);
+    }
+    if contract.deployment_target != "14.0" {
+        return Err(ContractError::WrongDeploymentTarget);
+    }
+    if contract.sdk != "26.1" {
+        return Err(ContractError::WrongSdk);
     }
     if contract.sandbox_model != "read-only-root-grants" {
         return Err(ContractError::MissingSandboxBoundary);

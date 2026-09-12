@@ -43,11 +43,22 @@ def observed_facts() -> dict[str, object]:
 
 class PlatformProbeTests(unittest.TestCase):
     def test_real_headless_consumer_has_a_closed_dependency_free_graph(self) -> None:
-        report = closure_probe.inspect_roots([CONSUMER_ROOT])
-        self.assertEqual(report["qualification"], "qualified")
-        self.assertTrue(report["complete"])
-        self.assertEqual(report["violations"], [])
-        self.assertEqual([node["name"] for node in report["graph"]["nodes"]], ["fcb-headless-consumer"])
+        metadata, metadata_error = closure_probe.cargo_metadata(CONSUMER_ROOT, (), None, False)
+        self.assertIsNone(metadata_error)
+        assert metadata is not None
+        root, nodes, edges, violations, _, _, _ = closure_probe.inspect_metadata_root(
+            CONSUMER_ROOT,
+            metadata,
+            (),
+            (),
+            None,
+            False,
+            closure_probe.DEFAULT_ALLOWED_ORIGINS,
+        )
+        self.assertEqual(root["metadata_mode"], "cargo-metadata")
+        self.assertEqual([node["name"] for node in nodes.values()], ["fcb-headless-consumer"])
+        self.assertEqual(edges, [])
+        self.assertEqual(violations, [])
 
     def test_real_selection_is_observed_by_metadata_control(self) -> None:
         facts = observed_facts()

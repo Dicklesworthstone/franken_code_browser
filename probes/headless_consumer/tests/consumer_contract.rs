@@ -21,6 +21,18 @@ fn consumer_rejects_a_non_apple_target() {
 }
 
 #[test]
+fn consumer_rejects_a_platform_below_the_display_link_floor() {
+    let invalid = PlatformContract { deployment_target: "13.0", ..SELECTED_CONTRACT };
+    assert_eq!(validate_contract(invalid), Err(ContractError::WrongDeploymentTarget));
+}
+
+#[test]
+fn consumer_rejects_an_unselected_sdk() {
+    let invalid = PlatformContract { sdk: "25.0", ..SELECTED_CONTRACT };
+    assert_eq!(validate_contract(invalid), Err(ContractError::WrongSdk));
+}
+
+#[test]
 fn consumer_rejects_an_undated_nightly() {
     let invalid = PlatformContract { toolchain: "nightly", ..SELECTED_CONTRACT };
     assert_eq!(validate_contract(invalid), Err(ContractError::UndatedToolchain));
