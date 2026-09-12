@@ -5,7 +5,7 @@
 **Product name:** FrankenCodeBrowser  
 **Executable:** `fcb`  
 **Public Rust library:** `fcb`, with separately consumable `fcb-*` components  
-**Plan revision:** R2 — complete architecture review, upstream ownership correction, and library/app separation  
+**Plan revision:** R3 — delivery sequencing, source authority, search encoding, and distribution review  
 **Document date:** September 12, 2026  
 **Status:** revised architecture and implementation specification. The plan has been reviewed and revised; the proposed application, APIs, upstream extensions, and performance targets are not represented as implemented or benchmarked.  
 **Primary target:** late-model Apple Silicon Macs, especially M4/M5 configurations with at least 24 GB of unified memory.  
@@ -628,6 +628,18 @@ A committed layout generation freezes its effective weights and ordering. Updati
 Separate a logical source provider from a native path. In-memory or host-supplied immutable sources work without granting filesystem access. A provider states its capture, ordering, range-read, and cancellation guarantees; FCB cannot infer stronger consistency from an interface returning bytes.
 
 For atomic-save replacements, preserving a logical file identity is an explicit namespace-continuity decision, not an assumption that its inode stayed the same. Reattach annotations to new bytes only when the chosen exact or qualified anchor-mapping rule succeeds. Otherwise keep an orphaned/stale annotation with its original source evidence. Never attach an old note to a unrelated new file simply because a path was recycled.
+
+### 8.9 Root-grant lifecycle and native permissions
+
+A persisted root path or `RootId` is not itself a current access grant. On reopen, restore only the scope authorized by the user's saved policy and revalidate the native access route. G0 records the standalone and embedded sandbox/entitlement models; it must not assume an in-process root capability grants OS permission. For a security-scoped bookmark route, resolve the bookmark, handle stale data, and balance successful access acquisition with release after outstanding native users finish. A navigation bookmark is a different object from an OS access bookmark. Failed restoration leaves a visible unavailable root and a deliberate reauthorization action, not an empty successful workspace. [B14]
+
+Every root grant has a revocation generation. Revoking it stops new admission and invalidates pending deliveries, link activation and new exports from that grant. Serialize grant revalidation with the export's publication decision so revocation cannot slip between a permission check and a new authorized effect; an already published destination retains its completed outcome. Drain foreign reads safely while discarding their results; another explicitly authorized root/session may retain independently permitted data. State whether already displayed captures are withdrawn under the selected host policy, and do not promise to retract bytes already returned to a host, copied to the clipboard or exported. Root access revocation, source-cache clearing and annotation deletion are separate actions. Test revocation during a read/query/export, unavailable volumes, and root restoration under changed native permissions.
+
+### 8.10 Traversal cycles and path presentation
+
+Following an authorized in-root symlink still requires cycle control. Detect repeated opened directory identities along the current traversal ancestry, bound alias expansion, and report a cycle/alias limitation rather than repeating the same subtree until memory is exhausted. Do not globally deduplicate every path by file identity: two legitimate namespace entries may share bytes while retaining distinct path meaning. A depth limit is a fallback budget, not proof of a cycle-free traversal.
+
+Keep raw paths for identity and reversible interchange; render control characters and bidi formatting characters in filenames through an explicit escaped display form. A filename containing a newline must not forge extra result rows or diagnostics. Resolve link URI decoding and native path components once under a defined policy before the confined open; relative-looking encoded traversal and nonlocal `file:` authorities do not acquire a new grant. Test aliases, loops, raw bytes, control characters and encoded path traversal without executing repository content.
 
 ---
 
@@ -1286,7 +1298,7 @@ Use cached candidate sets for incremental query refinement where sound. If a cha
 
 ### 17.3 Literal source search
 
-For sufficiently large indexed collections, a compact trigram or equivalent substring candidate index is appropriate. Store postings by source/content generation and verify every candidate against exact source bytes. The prefilter may return false positives; it must not create false negatives inside its declared complete coverage.
+For sufficiently large indexed collections, a compact trigram or equivalent substring candidate index is appropriate. Store postings by source/content generation and verify every candidate against the captured source under the selected byte or decoded-text semantics (§17.11). The prefilter may return false positives; it must not create false negatives inside its declared complete coverage.
 
 Queries shorter than the index's gram width, Unicode normalization modes, case-insensitive modes, and cross-chunk matches need explicit routes. A byte trigram index cannot simply answer a normalized Unicode query without a compatible indexed representation or a verification scan over the correct candidate universe.
 
@@ -1349,9 +1361,21 @@ Use the CASS evidence-selection pattern to collect a user's selected ranges, nea
 
 The pack records the source manifest, per-item capture/ranges, evidence type, readiness/staleness, deduplication, exact byte/character budget, and every omitted or truncated category. Token estimates identify their estimator and are never described as exact token counts. Rank by explicit user selection first, then bounded coverage/diversity and relevance; no downloaded model is required.
 
+An exact character budget counts Unicode scalar values in the declared decoded/export representation, not glyphs, graphemes or UTF-16 code units. Count encoded export bytes separately, including headers and provenance, so fitting selected source alone does not permit an over-budget final pack. Malformed input uses the named escaped representation or reports unavailable decoding; it cannot invent an exact character count.
+
 The general readiness/selection policy is factored in CASS where appropriate. Markdown pack formatting/export improvements belong to FrankenMarkdown. FCB owns source-specific candidate generation and navigation. A CASS host can in turn embed FCB to inspect the exact source behind a result through a granted provider, without launching an external editor or granting access to unrelated roots.
 
 Export is an explicit operation with destination and privacy review. A pack can contain secrets present in source; redaction is best-effort unless a precise rule establishes otherwise. Hashes prove integrity relationships, not authorization or safe disclosure. No agent instructions found in source are executed as part of collecting a pack.
+
+### 17.11 Text search and original-byte search are distinct
+
+The human `--text` route searches the declared decoded text representation, with matching and normalization options recorded. A UTF-8 byte needle cannot search UTF-16 source correctly: even ordinary ASCII characters have a different byte encoding. Keep an explicitly named raw-byte query route separate if offered. Unsupported/invalid decoding remains an explicit coverage condition or a separately selected byte/escaped mode, never a successful no-match result for the requested text semantics.
+
+Decoded indexes carry decoder/normalization versions and maps back to the original captured byte ranges. Verify text hits by decoding the same capture under those semantics, then validate the mapped original ranges; do not require the UTF-8 query bytes to occur literally inside UTF-16 backing. Define matches within expansions or normalization units and map them to the complete contributing source units. The G2 oracle corpus includes UTF-8, UTF-16LE/BE BOMs, surrogate pairs, chunk boundaries, malformed sequences and normalized expansions. Exact byte copying continues to use the original capture.
+
+### 17.12 Ephemeral indexing precedes persistence
+
+G2's candidate index works over an in-memory closed capture manifest with bounded immutable segments and no database. It proves candidate completeness and exact verification independently of disk publication. Persistent segment encoding, manifest transactions, recovery and out-of-core merging arrive through G4's artifact/store integration. Both routes implement the same search semantics and are compared with the same reference scan. This separation prevents the early indexed-search gate from depending on later persistence work; it does not remove persistent indexing from the full product.
 
 ---
 
@@ -1832,6 +1856,14 @@ Headless capability output is meaningful without native resources. A Mac rendere
 
 Diagnostic requests are bounded and read-only by default. Rendering a doctor report must not launch a benchmark, touch every repository file, or rebuild an index unexpectedly. High-cardinality source/path contents remain redacted unless the user explicitly requests an unredacted export.
 
+### 24.7 Lossless wire identities and bounded response framing
+
+JSON uses UTF-8 Unicode strings; native paths need not be valid UTF-8. Provide a tagged reversible native-path payload (for example, bounded hexadecimal Unix path bytes) alongside an escaped display label. Never round-trip a source identity through lossy text or serialize Rust's unspecified `OsStr::as_encoded_bytes` representation as a portable format. Unsupported platform tags refuse explicitly. [B15]
+
+Serialize full-width integer IDs, generations, lengths and offsets as canonical decimal strings in the machine schema, with checked bounds and no sign/leading-zero ambiguity. Ordinary small counters may use numbers only with declared bounds. This avoids precision loss in clients using binary64 JSON numbers above the interoperable exact-integer range. Reject duplicate object fields and nonfinite numeric geometry rather than depending on parser-specific interpretation. [B16]
+
+Ordinary `--json` returns one bounded complete JSON document. Progressive GUI publication does not silently change stdout into multiple JSON documents. A separately selected streaming mode, if implemented, has versioned NDJSON records with sequence/query identity and a terminal coverage/outcome record. EOF without that terminal record is interrupted output, not complete search. Output backpressure has byte/time limits and cannot block AppKit or hold shared publication locks; a broken pipe cancels this client's subscription while preserving authoritative outcomes of already committed effects. Tests cover raw paths, integers around 2^53 and u64 limits, escaping, duplicate keys, truncated streams and slow/closed consumers.
+
 ---
 
 ## 25. Testing and qualification
@@ -1969,6 +2001,12 @@ Publish the `fcb` facade and only the independently useful subordinate crates. K
 Examples use only the supported facade or intentionally documented low-level modules. The standalone binary cannot hide missing public functionality behind private cross-crate imports. Preserve a concise migration guide for changing public contracts and a separate schema migration path for stored trails/anchors/layouts. Do not promise binary plugin ABI compatibility or dynamic library unloading; Rust source-level modularity is the required product surface.
 
 Build evidence records normal dependencies, build dependencies/proc macros, selected target features, native framework links, shader compiler/SDK, and license provenance. Test-only third-party oracle tools may run outside the shipping closure, but cannot be compiled into shipped adapters under a misleading label. A renamed or copied outside library is not a new first-party implementation.
+
+### 26.8 Single-file runtime versus distribution container
+
+A standalone `fcb` executable can embed its runtime assets without requiring its downloadable distribution to be one bare Mach-O file. Apple issues notarization tickets for standalone binaries but does not support stapling directly to them or to ZIP archives. Select and qualify a supported stapled distribution container, such as a disk image or installer package, for offline installation; an app bundle has its own staple route. Do not promise identical offline Gatekeeper behavior for a bare downloaded binary merely because an online launch succeeded. [B17]
+
+Test the final signed/notarized downloads on a clean Mac, including quarantine, online and offline first launch, extraction/installation and arbitrary working directories. Record which artifact and route passed. Do not clear quarantine or disable Gatekeeper to manufacture acceptance. G0 chooses the deployment floor, architecture baseline, signing identity/entitlement model and SDK availability policy; G7 proves the complete distribution. The standalone runtime remains independent of a companion `.app`.
 
 ---
 
@@ -2113,7 +2151,7 @@ Implement core identities, source snapshots, bounded discovery, basic stable lay
 
 Implement resumable lexers for the first qualified language set, token themes, checkpoint invalidation, path search, literal search, result-to-source jumps, matching overlays, and generation-safe progressive results.
 
-**G2:** full/chunked lexical equivalence passes; indexed search matches exact reference scans; rapid query changes cannot display stale results; source updates invalidate only affected data; selected result identity survives refinement.
+**G2:** full/chunked lexical equivalence passes; bounded ephemeral indexed search over closed captures matches exact reference scans, including supported text encodings; rapid query changes cannot display stale results; source updates invalidate only affected data; selected result identity survives refinement. Persistent publication/recovery is G4 work and is not a prerequisite to this gate.
 
 ### 28.5 Phase 3: native documentation
 
@@ -2182,7 +2220,7 @@ The IDs below are ready to translate into the project's issue/bead system. They 
 
 | ID | Deliverable | Dependencies | Completion evidence |
 |---|---|---|---|
-| FCB-009 | Root read capabilities and raw-path identities. | FCB-003, FCB-007, FCB-067, FCB-068 | Symlink/rename/case/raw-byte path corpus. |
+| FCB-009 | Root read capabilities, native permission lifecycle and raw-path identities. | FCB-003, FCB-007, FCB-067, FCB-068 | Symlink/rename/case/raw-byte corpus; unavailable/stale native grants and revocation during reads. |
 | FCB-010 | Bounded directory discovery and ignore matcher. | FCB-008, FCB-009, FCB-065 | Large/deep tree gives progressive output with descriptor/queue limits. |
 | FCB-011 | Immutable source chunks and observed-snapshot contract. | FCB-007, FCB-009, FCB-065, FCB-067 | Concurrent replacement/truncation tests without mutable-source mmap. |
 | FCB-012 | Sparse line index and exact byte/line translation. | FCB-011 | Huge-line/chunk/CRLF/UTF-8 and far-jump fixtures. |
@@ -2204,8 +2242,8 @@ The IDs below are ready to translate into the project's issue/bead system. They 
 | FCB-023 | Upstream FMD checkpoint convergence plus FCB bounded request/publication integration. | FCB-008, FCB-021, FCB-065, FCB-068 | External edits converge correctly without UI stalls or stale spans. |
 | FCB-024 | Shared upstream token/theme outputs in FCB readers and excerpts. | FCB-018, FCB-019, FCB-023 | Same source tokenization across surfaces; recolor does not re-lex. |
 | FCB-025 | Path search index and stable fuzzy ranking. | FCB-010, FCB-020 | Exact/prefix/fuzzy results with distinct case-sensitive identities. |
-| FCB-026 | Bounded exact source scan and query scopes. | FCB-011, FCB-012 | Reference search corpus including cross-chunk and short queries. |
-| FCB-027 | Persistent substring candidate segments and exact verification. | FCB-026, FCB-042, FCB-065, FCB-085 | Verified candidate segments, correct closed-manifest coverage, no false negatives in admitted semantics. |
+| FCB-026 | Bounded exact source scan and query scopes. | FCB-011, FCB-012, FCB-082 | Reference corpus including cross-chunk/short queries and decoded UTF-16 text versus raw-byte semantics. |
+| FCB-027 | Ephemeral immutable substring candidate segments and exact verification. | FCB-026, FCB-065, FCB-085 | G2 bounded in-memory closed-manifest index; no database dependency or false negatives in admitted semantics. |
 | FCB-028 | Query-generation streams, cancellation, completeness UI. | FCB-008, FCB-025, FCB-026 | Rapid query changes, protected selection, truthful partial results. |
 | FCB-029 | Result navigation and compact spatial match overlays. | FCB-014, FCB-024, FCB-028 | Exact range landing and bounded million-match aggregation. |
 | FCB-030 | Source-specific structural outlines and evidence-class schema; reusable lexer fixes upstream. | FCB-007, FCB-022 | Language-scoped facts with source spans; no heuristic-as-exact claims. |
@@ -2255,13 +2293,13 @@ The IDs below are ready to translate into the project's issue/bead system. They 
 
 | ID | Deliverable | Dependencies | Completion evidence |
 |---|---|---|---|
-| FCB-057 | Versioned standalone CLI/robot service schemas, public-facade capabilities. | FCB-008, FCB-028, FCB-039, FCB-066, FCB-087 | Real service calls, inert headless capabilities, single-file launcher behavior, versioned schemas. |
+| FCB-057 | Versioned standalone CLI/robot service schemas, public-facade capabilities. | FCB-008, FCB-028, FCB-039, FCB-066, FCB-087 | Real services, inert capabilities, single-file launcher behavior, lossless raw paths/full-width IDs, bounded JSON and explicit stream terminal/backpressure behavior. |
 | FCB-058 | Bounded telemetry/HUD and semantic replay. | FCB-020, FCB-046, FCB-057, FCB-094 | Reproducible trace with source-redaction and overhead reports. |
 | FCB-059 | Source/parser/asset hostile corpus and regression minimizer. | FCB-022, FCB-035, FCB-043 | Reproducible seeds, budgets, minimized failure fixtures. |
 | FCB-060 | GPU/native resource-lifetime and failure injection suite. | FCB-005, FCB-006, FCB-052, FCB-055, FCB-070, FCB-071, FCB-072, FCB-079, FCB-089 | Close/device/pressure/callback races preserve resource ownership. |
 | FCB-061 | CPU/GPU visual and source-semantic comparison suite. | FCB-038, FCB-049, FCB-054, FCB-071, FCB-076, FCB-089 | Qualified content/layout/pixel evidence by rendering route. |
 | FCB-062 | Real M4/M5 cold/warm/pressure/idle qualification. | FCB-044, FCB-045, FCB-058, FCB-060, FCB-061, FCB-095, FCB-096 | Named hardware traces and honest SLO results, including missed frames. |
-| FCB-063 | Real standalone fcb binary, optional .app, embedded assets, signing/install. | FCB-008, FCB-053, FCB-057, FCB-066, FCB-080 | Direct executable and bundle launches, no companion app/development checkout, licensed embedded resources. |
+| FCB-063 | Real standalone fcb binary, optional .app, embedded assets, signing/install. | FCB-008, FCB-053, FCB-057, FCB-066, FCB-080 | Direct executable/bundle and quarantined online/offline distribution launches; supported stapling route; licensed embedded resources; no companion app or checkout. |
 | FCB-064 | Full-product release acceptance across app, library and upstream owners. | FCB-050, FCB-056, FCB-059, FCB-062, FCB-063, FCB-076, FCB-078, FCB-079, FCB-080, FCB-081, FCB-084, FCB-085, FCB-086, FCB-088, FCB-089, FCB-091, FCB-092, FCB-093, FCB-095, FCB-096 | All mandatory work reachable; functional/ownership/safety/closure/visual/hardware gates assessed without vacuous passes. |
 
 ### 29.8 Review-driven foundation and integration packages
@@ -2288,10 +2326,10 @@ IDs 065 onward are additions from this review, **not later scheduling priority**
 | FCB-080 | Upstream reusable digest/canonical-envelope factoring and conformance. | FCB-001 | Inspected fmn-hash primitives selected with actual closure; bounded serialization and digest vectors. |
 | FCB-081 | Owned cache namespaces, pins, revocation and protected reclamation primitives. | FCB-009, FCB-065, FCB-068, FCB-080 | Wrong-root/retired writes rejected; no wall-clock liveness assumption; cold/hot equality tests. |
 | FCB-082 | Exact capture/encoding maps and qualified huge-line visual-context routes. | FCB-011, FCB-012, FCB-075 | No live-byte substitution under old captures; bidi/tabs/combining pathology stays bounded and truthful. |
-| FCB-083 | Scan epochs, special-object admission, self-cache exclusion and continuity rules. | FCB-009, FCB-010, FCB-011 | Partial scan never deletes unseen files; FIFO/symlink races and repeated atomic saves handled. |
+| FCB-083 | Scan epochs, special-object admission, self-cache exclusion and continuity rules. | FCB-009, FCB-010, FCB-011 | Partial scan never deletes unseen files; FIFO/symlink races, traversal cycles/aliases, path display controls and atomic saves handled. |
 | FCB-084 | Retained semantic summary pyramids and precision-safe focus islands. | FCB-013, FCB-014, FCB-023 | Palette change avoids re-lex; bounded LOD work, deep hierarchy does not underflow into invisible parcels. |
 | FCB-085 | Closed search manifests, normalization maps and completeness semantics. | FCB-011, FCB-026, FCB-028 | Live-tree changes, unknown membership, normalized/short queries and exact counts distinguished. |
-| FCB-086 | Index amplification, disk quota and bounded merge/paging contracts. | FCB-027, FCB-042, FCB-065, FCB-085 | High-entropy files respect quotas; uncovered captures retain correct direct-scan route. |
+| FCB-086 | Persistent index encoding/publication, disk quota and bounded merge/paging contracts. | FCB-027, FCB-042, FCB-065, FCB-085 | G4 persistent segments match ephemeral/reference search; crash publication and high-entropy quotas preserve uncovered direct-scan semantics. |
 | FCB-087 | Explicit multi-process store ownership and authenticated local protocol. | FCB-003, FCB-008, FCB-039, FCB-040, FCB-066 | GUI/CLI attach, owner death and schema negotiation without active-writer theft or root escalation. |
 | FCB-088 | User-state migration, full-width IDs and uncertain-commit recovery. | FCB-040, FCB-042, FCB-080, FCB-087 | Signed-integer boundaries, manifest crash points, duplicate retry and backup preservation tested. |
 | FCB-089 | Color/alpha/clip/depth and host-target shader ABI qualification. | FCB-005, FCB-017, FCB-018, FCB-070, FCB-071 | Real GPU/CPU fixtures; no double premultiply/gamma, incorrect clip, or invalid target reuse. |
@@ -2631,10 +2669,25 @@ Additional search excerpts identified existing incremental run shaping in FMD, t
 
 **[B13] Fallible allocation scope.** [Rust `Vec` documentation](https://doc.rust-lang.org/std/vec/struct.Vec.html), especially `try_reserve`/`try_reserve_exact` and capacity behavior. Used to distinguish controlled allocation admission from a promise that all OS/framework/allocator failure is recoverable.
 
-### 32.6 Revision completion statement
+### 32.6 R2 revision completion statement (historical)
 
 This revision delivers the fully revised **FrankenCodeBrowser (`fcb`)** plan, its standalone/library design, mandatory upstream Markdown ownership, corrected identity/source/rendering/search/persistence/resource contracts, additional source-grounded reuse, and a mechanically checked 96-package work graph. It retains the full original product scope while replacing conflicting old ownership and lifecycle rules in place.
 
 No running browser, compiled public API, upstream implementation commit, repository mutation, strict-compliant build closure, Mac GPU result, or native performance qualification is claimed. Structural document checks validate references, naming and work dependencies; they do not prove the future implementation's correctness. All code/API sketches and unimplemented names remain explicitly proposed.
+
+### 32.7 R3 review: delivery and boundary corrections
+
+The September 12, 2026 follow-up review checked the 96-package graph and the newly created repository documentation. The original graph was acyclic, with no missing dependency references and all packages reachable from FCB-064. Its scheduling defect was subtler: G2 indexed search depended through FCB-027 → FCB-042 → FCB-040 → FCB-039 on later persistent-store work. R3 separates the bounded ephemeral index from G4 persistent integration while preserving the full release scope.
+
+R3 also specifies native root-grant restoration/revocation, traversal cycles and safe path labels, decoded-text versus raw-byte search, full-width wire numbers and raw paths, response framing/backpressure, export accounting, and standalone notarization containers. Small counterexamples demonstrated why UTF-8 byte matching misses UTF-16 text, lossy path conversion cannot round-trip arbitrary Unix bytes, and binary64 number consumers can merge adjacent large IDs. These are specification counterexamples, not executions of an FCB implementation.
+
+The original source/blob ledger remains historical. This pass did not rebuild or re-audit every sibling implementation. New primary references checked for the boundary corrections are:
+
+- **[B14] Apple root-access lifecycle:** [resolving bookmark data](https://developer.apple.com/documentation/foundation/nsurl/urlbyresolvingbookmarkdata%3Aoptions%3Arelativetourl%3Abookmarkdataisstale%3Aerror%3A) and [accessing a security-scoped resource](https://developer.apple.com/documentation/foundation/url/startaccessingsecurityscopedresource%28%29). These establish explicit resolution/staleness and access lifecycle; the selected FCB sandbox/entitlement route still needs G0 native qualification.
+- **[B15] Native path representation:** [Rust std::ffi](https://doc.rust-lang.org/std/ffi/) and [OsStr::as_encoded_bytes](https://doc.rust-lang.org/std/ffi/struct.OsStr.html#method.as_encoded_bytes). Native strings are not necessarily UTF-8; the unspecified encoded representation is not a portable wire format. FCB's tagged reversible payload is a proposed schema choice.
+- **[B16] JSON interoperability:** [RFC 8259, §§6–8](https://www.rfc-editor.org/rfc/rfc8259.html). JSON number precision and Unicode interoperability motivate explicit full-width string fields and lossless path payloads; versioned framing is FCB policy.
+- **[B17] Native distribution:** [Apple's custom notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow) and [packaging Mac software](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution). Standalone binaries receive tickets but cannot be directly stapled; distribution-container and offline-launch claims require their own tests.
+
+The public repository and supporting documentation now exist. This remains a specification revision: no runtime, native bridge, upstream integration, compliant compiled closure or performance result has been delivered by this review. All product gates remain pending.
 
 **End of plan.**

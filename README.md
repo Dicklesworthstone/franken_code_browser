@@ -135,6 +135,10 @@ Planned distribution includes a real standalone `fcb` binary with required embed
 an optional signed/notarized `.app` using the same engine. Neither route should require a companion
 application, a development checkout, Node, Python, a WebView or a downloaded model.
 
+The standalone runtime can still be distributed inside a disk image or installer for offline
+notarization support. A self-contained executable and a bare downloadable file are different
+packaging choices; each launch route needs qualification.
+
 No distribution is available yet. The Rust 2024 dated nightly, minimum macOS version and exact
 SDK are foundation qualification decisions, not verified installation requirements today.
 

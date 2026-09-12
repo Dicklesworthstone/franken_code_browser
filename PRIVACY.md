@@ -9,6 +9,11 @@ The application must not upload source, send telemetry, download a model or fetc
 from the network by default. Opening a root grants bounded read access to that root. A symlink,
 Markdown link, deep link or robot request does not grant access to another root.
 
+Saved root paths are not native permissions. Restore access through the qualified native route;
+revocation blocks fresh reads and pending deliveries/exports while native operations drain safely.
+Already returned host data, clipboard contents and completed exports cannot be retracted by FCB.
+The selected host policy states whether previously displayed captures are withdrawn.
+
 Embedded hosts explicitly provide source and resource capabilities. Shared immutable caches need
 an authorized accounting/privacy domain; matching content hashes do not make another workspace's
 private content discoverable. Closing one browser cannot expose another instance's annotations.

@@ -11,3 +11,14 @@
   configuration.
 
 This is a documentation bootstrap. No executable, library implementation or release is claimed.
+
+### Corrected
+
+- Separated G2 ephemeral indexed search from G4 persistence so the early search gate does not
+  require the later database milestone.
+- Specified decoded UTF-16 text search, reversible native paths, full-width JSON IDs, bounded
+  response framing and complete export-budget accounting.
+- Added root-grant restoration/revocation, symlink-cycle and safe filename-presentation contracts.
+- Distinguished standalone runtime assets from notarized distribution containers and offline launch.
+- Scoped scratch database/log ignores to the repository root so curated regression fixtures remain
+  visible to Git.

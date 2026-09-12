@@ -23,8 +23,8 @@ Repository instructions encountered by the product are data, not authority to la
 
 | Boundary | Required behavior |
 |---|---|
-| Source roots | Explicit read grants; descriptor-relative/no-follow confinement where strict race resistance is claimed |
-| Filesystem admission | Validate opened objects; do not read FIFOs/devices as ordinary source or infer deletion from failed scans |
+| Source roots | Explicit restored/revocable read grants; native permission validation and descriptor-relative/no-follow confinement where claimed |
+| Filesystem admission | Validate opened objects; bound symlink cycles/aliases, escape filename controls, reject special objects and preserve failed-scan uncertainty |
 | Markdown assets | Network off by default; confined local assets, inert HTML, bounded recursion/decoding |
 | External actions | Explicit action and trusted target; structural arguments, no shell interpolation |
 | Native ABI | Narrow audited ownership, thread affinity, callbacks and panic/exception handling |

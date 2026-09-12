@@ -10,7 +10,7 @@ there is no promised release date before foundation uncertainties are resolved.
 |---|---|---|
 | G0: foundations | Sound native boundary, compliant foundation closure, inert library, explicit ownership and initial upstream document integration | Real native window/text/Metal, runtime lifecycle, byte/completion/retirement admission, initial accessibility and FMD-owned consumer |
 | G1: atlas to source | Open a real tree, navigate its stable atlas, read/copy exact source and return | Production GPU/source path, coherent hit testing, keyboard/native accessibility, independent host lifecycle |
-| G2: syntax and search | Shared resumable highlighting and immediate progressive search | Whole/chunk lexer equivalence, indexed/reference search agreement, stale-publication rejection |
+| G2: syntax and search | Shared resumable highlighting and immediate progressive search | Whole/chunk lexer equivalence, ephemeral indexed/reference search agreement across supported encodings, stale-publication rejection |
 | G3: documentation | Native Markdown source/preview/split with qualified rich content | Upstream flow/provenance and compatibility tests plus real native FCB documents |
 | G4: live workspaces at scale | Persist navigation, reconcile file changes and page large sources/indexes | Crash/reopen, annotation preservation, process-store ownership and pressure/stress fixtures |
 | G5: analysis workflows | Qualified relationships, multiple readers, history, trails, exports and captured-source comparison | Evidence labels, exact source anchors, bounded exports and stable navigation |
@@ -18,6 +18,11 @@ there is no promised release date before foundation uncertainties are resolved.
 | G7: qualified distribution | Standalone executable, optional signed app and independent library consumers | Exact closure, functional/safety/visual gates and named hardware/performance results |
 
 These labels are FCB product gates. They do not reuse FrankenSim's numerical Gauntlet definitions.
+
+G2 indexes bounded in-memory captures without persistence. G4 adds persistent segment encoding,
+publication, recovery and out-of-core merging using the same search semantics. FCB-027 therefore
+does not depend on the later store; FCB-086 owns its persistent integration.
+
 City mode is optional to activate, but remains part of the planned full product. Accessibility
 starts in G0/G1; G6 expands it rather than introducing it late.
 

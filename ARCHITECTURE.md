@@ -63,6 +63,11 @@ Search pins a closed source manifest. Candidate indexes cannot exclude valid mat
 declared query semantics; every candidate hit is checked against captured source. Unknown scope,
 unavailable captures, result limits and canceled work remain explicit.
 
+Text queries use the capture's declared decoding/normalization and map matches back to original
+bytes, including UTF-16 sources. G2 uses bounded ephemeral indexes; G4 supplies persistent
+encoding/publication/recovery. Root grants are restored and revoked explicitly, independently of
+saved paths and navigation bookmarks. Traversal bounds aliases and ancestor cycles.
+
 ## Presented pixels and input
 
 `FramePlan` bundles drawing with matching camera, layout, source, display and interaction identity.

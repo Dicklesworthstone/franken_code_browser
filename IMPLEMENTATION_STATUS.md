@@ -7,7 +7,7 @@ findings do not establish an FCB implementation.
 
 | Surface | Current state |
 |---|---|
-| Comprehensive specification | R2 plan, 32 sections and 96 planned work packages |
+| Comprehensive specification | R3 plan, 32 sections and 96 planned work packages; delivery and boundary review applied |
 | Project documentation | README, agent instructions, architecture, dependency policy, roadmap, qualification and security/privacy guidance |
 | Repository support | License, issue-report templates, ignore and text-format configuration |
 | Rust workspace/toolchain | Not created or qualified |

@@ -46,6 +46,9 @@ the changed contract, then the applicable broader lanes for a coherent release c
 - GPU completion during full ordinary queues and window close; CPU last-reference retirement.
 - Incomplete directory scans, permission failures, watcher overflow, FIFOs and symlink replacement.
 - Partial search universes, short/normalized queries, exact reference comparisons and index quotas.
+- UTF-16 decoded queries versus byte queries, raw non-UTF-8 paths, full-width JSON IDs, incomplete
+  output streams, slow clients and export sizes including formatting/provenance.
+- Revoked/restored root grants, stale native bookmarks, symlink loops and misleading filename controls.
 - Bidi/ligature/combining context, native UTF-16 sentinels, generated/disjoint Markdown provenance.
 - Memory pressure with old/new artifacts, in-flight frames and pinned captures competing for space.
 - Store-owner collisions, crash points around artifact/manifest publication and uncertain commits.
@@ -78,6 +81,9 @@ figures remain objectives until measured. Certify only hardware classes actually
 5. Exercise launches without a companion app or development checkout, including paths with spaces
    and non-ASCII text; verify headless CLI without a display and host-independent library use.
 6. Sign/notarize the declared distributions; retain integrity and provenance records.
+   Distinguish the embedded-asset standalone runtime from its distribution container: direct
+   stapling of a standalone binary is unsupported. Qualify the selected supported container and
+   quarantined online/offline launch without disabling Gatekeeper. See plan §26.8 and its Apple sources.
 7. Verify published assets by downloading and checking them, preserving authoritative user state
    through the supported install/update/reopen/rollback routes.
 

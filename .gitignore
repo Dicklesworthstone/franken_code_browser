@@ -30,7 +30,7 @@ perf.data.old
 *.pkg
 *.crate
 
-# Local runtime, captures and exports. Curated fixtures/evidence remain trackable.
+# Local runtime, captures and exports. Keep curated data under tests/fixtures/.
 /.fcb/
 /captures/
 /cache/
@@ -39,13 +39,13 @@ perf.data.old
 /scratch/
 /tmp/
 /doc/
-*.db
-*.db-*
-*.sqlite
-*.sqlite-*
-*.sqlite3
-*.sqlite3-*
-*.log
+/*.db
+/*.db-*
+/*.sqlite
+/*.sqlite-*
+/*.sqlite3
+/*.sqlite3-*
+/*.log
 *.tmp
 *.temp
 *.swp

@@ -119,6 +119,9 @@ and an FCB consumer test. Local path patches and research blob SHAs are not rele
 - Search verifies candidates against the exact captured bytes. Complete results require a closed
   source manifest. Coverage, unavailable sources, match counts, truncation and refinement are
   separate states; an incompatible prefilter cannot be repaired by exact verification alone.
+- Text search applies the declared decoder/normalization to that capture; a UTF-8 byte needle is
+  not a UTF-16 text query. Preserve maps back to original bytes. Machine schemas use reversible
+  native path payloads and canonical strings for full-width IDs/offsets, with bounded framing.
 - Giant-line shaping requires valid text context or an explicit pending/logical/escaped mode.
   A clipped substring is not necessarily exact bidi or ligature layout.
 
@@ -155,6 +158,10 @@ Opening a repository grants read scope, not execution. No automatic build script
 commands, network fetches or agent instructions from source. Root confinement must survive symlink
 replacement where claimed. Exports and external actions require an explicit destination/action.
 No source uploads or telemetry by default. Keep logs bounded and free of source payloads by default.
+
+Saved paths do not confer current native access. Revalidate restored root grants, invalidate
+pending deliveries on revocation, and drain native access leases safely. Bound symlink loops and
+alias expansion; escape filename controls without replacing raw identity.
 
 Keyboard, text selection, IME and native accessibility begin with the first reader. Light, dark,
 high-contrast and reduced-motion behavior are required product work. City mode preserves the same
