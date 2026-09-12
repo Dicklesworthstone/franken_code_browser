@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -20,21 +20,29 @@ SPEC.loader.exec_module(closure_probe)
 
 
 LOCK_HEADER = "version = 4\n\n"
+FIXTURE_ORIGIN = "https://example.invalid/fcb-closure.git"
 
 
-def _package(name: str, version: str, dependencies: tuple[str, ...] = (), source: str | None = None) -> str:
+def _package(name: str, version: str, dependencies: tuple[str, ...] = ()) -> str:
     lines = ["[[package]]", f'name = "{name}"', f'version = "{version}"']
-    if source is not None:
-        lines.append(f'source = "{source}"')
     if dependencies:
         rendered = ", ".join(f'"{dependency}"' for dependency in dependencies)
         lines.append(f"dependencies = [{rendered}]")
     return "\n".join(lines) + "\n\n"
 
 
+def _manifest(name: str, version: str, extra: str = "") -> str:
+    return f"""[package]
+name = "{name}"
+version = "{version}"
+edition = "2024"
+license = "MIT"
+{extra}"""
+
+
 @contextmanager
 def temporary_repo(files: dict[str, str]) -> Iterator[Path]:
-    """Create a real manifest/lock repository without invoking Cargo."""
+    """Create a retained real Cargo fixture without invoking Cargo here."""
     root = Path(tempfile.mkdtemp(prefix="fcb-closure-adversarial-"))
     for relative, content in files.items():
         destination = root / relative
@@ -44,235 +52,278 @@ def temporary_repo(files: dict[str, str]) -> Iterator[Path]:
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     subprocess.run(["git", "-C", str(root), "config", "user.email", "probe@example.invalid"], check=True)
     subprocess.run(["git", "-C", str(root), "config", "user.name", "FCB closure adversarial probe"], check=True)
-    subprocess.run(
-        ["git", "-C", str(root), "remote", "add", "origin", "https://example.invalid/fcb-closure.git"],
-        check=True,
-    )
+    subprocess.run(["git", "-C", str(root), "remote", "add", "origin", FIXTURE_ORIGIN], check=True)
     subprocess.run(["git", "-C", str(root), "add", "."], check=True)
     subprocess.run(["git", "-C", str(root), "commit", "-qm", "adversarial fixture"], check=True)
     yield root
 
 
-def _report(root: Path) -> dict[str, object]:
-    return closure_probe.inspect_roots([root], allowed_origins=())
+def _report(root: Path, **options: Any) -> dict[str, Any]:
+    return closure_probe.inspect_roots([root], allowed_origins=(FIXTURE_ORIGIN,), **options)
 
 
-def _codes(report: dict[str, object]) -> set[str]:
-    return {str(violation["code"]) for violation in report["violations"]}  # type: ignore[index]
+def _nodes(report: dict[str, Any]) -> list[dict[str, Any]]:
+    return report["graph"]["nodes"]
 
 
-def _declared_edges(report: dict[str, object], dependency: str) -> list[dict[str, object]]:
+def _node_named(report: dict[str, Any], name: str, version: str | None = None) -> dict[str, Any]:
+    matches = [
+        node
+        for node in _nodes(report)
+        if node["name"] == name and (version is None or node["version"] == version)
+    ]
+    if len(matches) != 1:
+        raise AssertionError(f"expected one {name}@{version} node, found {matches}")
+    return matches[0]
+
+
+def _edges_between(report: dict[str, Any], from_name: str, to_name: str) -> list[dict[str, Any]]:
+    from_ids = {node["id"] for node in _nodes(report) if node["name"] == from_name}
+    to_ids = {node["id"] for node in _nodes(report) if node["name"] == to_name}
     return [
         edge
-        for edge in report["graph"]["edges"]  # type: ignore[index]
-        if edge.get("to") == dependency and "declared_version" in edge
+        for edge in report["graph"]["edges"]
+        if edge["from"] in from_ids and edge["to"] in to_ids
     ]
 
 
+def _violation_codes(report: dict[str, Any]) -> set[str]:
+    return {str(violation["code"]) for violation in report["violations"]}
+
+
+def _assert_metadata_mode(test: unittest.TestCase, report: dict[str, Any]) -> None:
+    test.assertEqual(report["roots"][0]["metadata_mode"], "cargo-metadata")
+    test.assertIsNone(report["roots"][0]["metadata_error"])
+
+
 class ClosureProbeAdversarialTests(unittest.TestCase):
-    def test_near_identical_first_party_local_closure_is_qualified(self) -> None:
+    def test_first_party_local_closure_uses_metadata_ids_and_qualifies(self) -> None:
         with temporary_repo(
             {
-                "Cargo.toml": """[package]
-name = "probe-root"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
-
-[dependencies]
-foundation = { path = "foundation" }
-""",
-                "foundation/Cargo.toml": """[package]
-name = "foundation"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
-""",
-                "Cargo.lock": LOCK_HEADER + _package("probe-root", "0.1.0", ("foundation",)) + _package("foundation", "0.1.0"),
+                "Cargo.toml": _manifest("probe-root", "0.1.0", '\n[dependencies]\nfoundation = { path = "foundation" }\n'),
+                "src/lib.rs": "pub fn root_marker() {}\n",
+                "foundation/Cargo.toml": _manifest("foundation", "0.1.0"),
+                "foundation/src/lib.rs": "pub fn foundation_marker() {}\n",
+                "Cargo.lock": LOCK_HEADER
+                + _package("probe-root", "0.1.0", ("foundation",))
+                + _package("foundation", "0.1.0"),
             }
         ) as root:
             report = _report(root)
 
+        _assert_metadata_mode(self, report)
         self.assertEqual(report["qualification"], "qualified")
         self.assertTrue(report["complete"])
         self.assertEqual(report["violations"], [])
-        self.assertEqual(report["graph"]["node_count"], 2)  # type: ignore[index]
-        self.assertEqual(len(_declared_edges(report, "foundation")), 1)
+        self.assertEqual({node["name"] for node in _nodes(report)}, {"probe-root", "foundation"})
+        foundation = _node_named(report, "foundation")
+        self.assertTrue(foundation["id"].startswith("path+file://"))
+        self.assertTrue(foundation["allowed_origin"])
+        edges = _edges_between(report, "probe-root", "foundation")
+        self.assertEqual(len(edges), 1)
+        self.assertTrue(edges[0]["resolved"])
+        self.assertIn("normal", edges[0]["kind"])
 
-    def test_direct_forbidden_normal_edge_is_noncompliant(self) -> None:
+    def test_direct_forbidden_normal_path_edge_is_noncompliant(self) -> None:
         with temporary_repo(
             {
-                "Cargo.toml": """[package]
-name = "probe-root"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
-
-[dependencies]
-tokio = "1.0.0"
-""",
+                "Cargo.toml": _manifest("probe-root", "0.1.0", '\n[dependencies]\ntokio = { path = "tokio" }\n'),
+                "src/lib.rs": "pub fn root_marker() {}\n",
+                "tokio/Cargo.toml": _manifest("tokio", "1.0.0"),
+                "tokio/src/lib.rs": "pub fn tokio_marker() {}\n",
                 "Cargo.lock": LOCK_HEADER
-                + _package("probe-root", "0.1.0", ("tokio 1.0.0",))
-                + _package("tokio", "1.0.0", source="registry+https://github.com/rust-lang/crates.io-index"),
+                + _package("probe-root", "0.1.0", ("tokio",))
+                + _package("tokio", "1.0.0"),
             }
         ) as root:
             report = _report(root)
 
+        _assert_metadata_mode(self, report)
         self.assertEqual(report["qualification"], "noncompliant")
-        self.assertIn("forbidden_dependency", _codes(report))
-        self.assertEqual(len(_declared_edges(report, "tokio")), 1)
+        self.assertIn("forbidden_dependency", _violation_codes(report))
+        tokio = _node_named(report, "tokio", "1.0.0")
+        self.assertTrue(tokio["local"])
+        edges = _edges_between(report, "probe-root", "tokio")
+        self.assertEqual(len(edges), 1)
+        self.assertIn("normal", edges[0]["kind"])
 
-    def test_transitive_forbidden_normal_edge_is_noncompliant(self) -> None:
+    def test_transitive_forbidden_normal_path_edge_is_noncompliant(self) -> None:
         with temporary_repo(
             {
-                "Cargo.toml": """[package]
-name = "probe-root"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
-
-[dependencies]
-foundation = { path = "foundation" }
-""",
-                "foundation/Cargo.toml": """[package]
-name = "foundation"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
-
-[dependencies]
-tokio = "1.0.0"
-""",
+                "Cargo.toml": _manifest("probe-root", "0.1.0", '\n[dependencies]\nfoundation = { path = "foundation" }\n'),
+                "src/lib.rs": "pub fn root_marker() {}\n",
+                "foundation/Cargo.toml": _manifest(
+                    "foundation",
+                    "0.1.0",
+                    '\n[dependencies]\ntokio = { path = "../tokio" }\n',
+                ),
+                "foundation/src/lib.rs": "pub fn foundation_marker() {}\n",
+                "tokio/Cargo.toml": _manifest("tokio", "1.0.0"),
+                "tokio/src/lib.rs": "pub fn tokio_marker() {}\n",
                 "Cargo.lock": LOCK_HEADER
                 + _package("probe-root", "0.1.0", ("foundation",))
-                + _package("foundation", "0.1.0", ("tokio 1.0.0",))
-                + _package("tokio", "1.0.0", source="registry+https://github.com/rust-lang/crates.io-index"),
+                + _package("foundation", "0.1.0", ("tokio",))
+                + _package("tokio", "1.0.0"),
             }
         ) as root:
             report = _report(root)
 
+        _assert_metadata_mode(self, report)
         self.assertEqual(report["qualification"], "noncompliant")
-        self.assertIn("forbidden_dependency", _codes(report))
-        transitive_edges = [
-            edge
-            for edge in _declared_edges(report, "tokio")
-            if edge.get("from") == "foundation@0.1.0"
-        ]
+        self.assertIn("forbidden_dependency", _violation_codes(report))
+        transitive_edges = _edges_between(report, "foundation", "tokio")
         self.assertEqual(len(transitive_edges), 1)
+        self.assertIn("normal", transitive_edges[0]["kind"])
 
-    def test_forbidden_build_dependency_is_noncompliant_and_typed(self) -> None:
+    def test_forbidden_build_path_edge_is_noncompliant_and_typed(self) -> None:
         with temporary_repo(
             {
-                "Cargo.toml": """[package]
-name = "probe-root"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
-
-[build-dependencies]
-tokio = "1.0.0"
-""",
+                "Cargo.toml": _manifest(
+                    "probe-root",
+                    "0.1.0",
+                    '\n[build-dependencies]\ntokio = { path = "tokio" }\n',
+                ),
+                "src/lib.rs": "pub fn root_marker() {}\n",
+                "tokio/Cargo.toml": _manifest("tokio", "1.0.0"),
+                "tokio/src/lib.rs": "pub fn tokio_marker() {}\n",
                 "Cargo.lock": LOCK_HEADER
-                + _package("probe-root", "0.1.0", ("tokio 1.0.0",))
-                + _package("tokio", "1.0.0", source="registry+https://github.com/rust-lang/crates.io-index"),
+                + _package("probe-root", "0.1.0", ("tokio",))
+                + _package("tokio", "1.0.0"),
             }
         ) as root:
             report = _report(root)
 
+        _assert_metadata_mode(self, report)
         self.assertEqual(report["qualification"], "noncompliant")
-        self.assertIn("forbidden_dependency", _codes(report))
-        build_edges = [edge for edge in _declared_edges(report, "tokio") if edge.get("kind") == "build"]
+        self.assertIn("forbidden_dependency", _violation_codes(report))
+        build_edges = [
+            edge for edge in _edges_between(report, "probe-root", "tokio") if "build" in edge["kind"]
+        ]
         self.assertEqual(len(build_edges), 1)
 
-    def test_forbidden_target_dependency_is_not_omitted(self) -> None:
+    def test_forbidden_target_path_edge_is_not_omitted(self) -> None:
         with temporary_repo(
             {
-                "Cargo.toml": """[package]
-name = "probe-root"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-tokio = "1.0.0"
-""",
-                "Cargo.lock": LOCK_HEADER + _package("probe-root", "0.1.0"),
+                "Cargo.toml": _manifest(
+                    "probe-root",
+                    "0.1.0",
+                    '\n[target.\'cfg(target_os = "macos")\'.dependencies]\ntokio = { path = "tokio" }\n',
+                ),
+                "src/lib.rs": "pub fn root_marker() {}\n",
+                "tokio/Cargo.toml": _manifest("tokio", "1.0.0"),
+                "tokio/src/lib.rs": "pub fn tokio_marker() {}\n",
+                "Cargo.lock": LOCK_HEADER
+                + _package("probe-root", "0.1.0", ("tokio",))
+                + _package("tokio", "1.0.0"),
             }
         ) as root:
-            report = _report(root)
+            report = _report(root, filter_platform="aarch64-apple-darwin")
 
+        _assert_metadata_mode(self, report)
         self.assertEqual(report["qualification"], "noncompliant")
-        self.assertIn("forbidden_dependency", _codes(report))
-        target_edges = [edge for edge in _declared_edges(report, "tokio") if edge.get("kind") == "normal"]
+        self.assertIn("forbidden_dependency", _violation_codes(report))
+        target_edges = _edges_between(report, "probe-root", "tokio")
         self.assertEqual(len(target_edges), 1)
+        self.assertIn("normal", target_edges[0]["kind"])
 
-    def test_virtual_workspace_inherits_package_metadata(self) -> None:
+    def test_selected_workspace_member_excludes_dev_only_forbidden_edge(self) -> None:
         with temporary_repo(
             {
                 "Cargo.toml": """[workspace]
-members = ["app"]
+members = ["app", "foundation"]
+resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 license = "MIT"
 """,
-                "app/Cargo.toml": """[package]
-name = "app"
-version.workspace = true
-license.workspace = true
-edition = "2024"
-""",
-                "Cargo.lock": LOCK_HEADER + _package("app", "0.1.0"),
+                "app/Cargo.toml": _manifest(
+                    "app",
+                    "0.1.0",
+                    '\n[dependencies]\nfoundation = { path = "../foundation" }\n\n[dev-dependencies]\ntokio = { path = "../tokio" }\n',
+                ).replace('version = "0.1.0"', "version.workspace = true").replace('license = "MIT"', "license.workspace = true"),
+                "app/src/lib.rs": "pub fn app_marker() {}\n",
+                "foundation/Cargo.toml": _manifest("foundation", "0.1.0").replace(
+                    'version = "0.1.0"', "version.workspace = true"
+                ).replace('license = "MIT"', "license.workspace = true"),
+                "foundation/src/lib.rs": "pub fn foundation_marker() {}\n",
+                "tokio/Cargo.toml": _manifest("tokio", "1.0.0"),
+                "tokio/src/lib.rs": "pub fn tokio_marker() {}\n",
+                "Cargo.lock": LOCK_HEADER
+                + _package("app", "0.1.0", ("foundation", "tokio"))
+                + _package("foundation", "0.1.0")
+                + _package("tokio", "1.0.0"),
+            }
+        ) as root:
+            report = _report(root, selected_packages=("app",))
+
+        _assert_metadata_mode(self, report)
+        self.assertEqual(report["qualification"], "qualified")
+        self.assertTrue(report["complete"])
+        self.assertEqual({node["name"] for node in _nodes(report)}, {"app", "foundation"})
+        self.assertEqual(_edges_between(report, "app", "tokio"), [])
+        app = _node_named(report, "app", "0.1.0")
+        self.assertEqual(app["license"], "MIT")
+
+    def test_default_features_false_excludes_optional_forbidden_edge(self) -> None:
+        with temporary_repo(
+            {
+                "Cargo.toml": _manifest("probe-root", "0.1.0", '\n[dependencies]\nfoundation = { path = "foundation", default-features = false }\n'),
+                "src/lib.rs": "pub fn root_marker() {}\n",
+                "foundation/Cargo.toml": _manifest(
+                    "foundation",
+                    "0.1.0",
+                    '\n[features]\ndefault = ["bad-default"]\nbad-default = ["dep:tokio"]\n\n[dependencies]\ntokio = { path = "../tokio", optional = true }\n',
+                ),
+                "foundation/src/lib.rs": "pub fn foundation_marker() {}\n",
+                "tokio/Cargo.toml": _manifest("tokio", "1.0.0"),
+                "tokio/src/lib.rs": "pub fn tokio_marker() {}\n",
+                "Cargo.lock": LOCK_HEADER
+                + _package("probe-root", "0.1.0", ("foundation",))
+                + _package("foundation", "0.1.0"),
             }
         ) as root:
             report = _report(root)
 
+        _assert_metadata_mode(self, report)
         self.assertEqual(report["qualification"], "qualified")
-        self.assertTrue(report["complete"])
-        packages = report["roots"][0]["packages"]  # type: ignore[index]
-        self.assertEqual(len(packages), 1)
-        self.assertEqual(packages[0]["name"], "app")
-        self.assertEqual(packages[0]["version"], "0.1.0")
-        self.assertEqual(packages[0]["license"], "MIT")
-        self.assertEqual(report["graph"]["node_count"], 1)  # type: ignore[index]
+        self.assertEqual({node["name"] for node in _nodes(report)}, {"probe-root", "foundation"})
+        self.assertEqual(_edges_between(report, "foundation", "tokio"), [])
 
     def test_duplicate_asupersync_versions_are_noncompliant(self) -> None:
         with temporary_repo(
             {
-                "Cargo.toml": """[package]
-name = "probe-root"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
-
-[dependencies]
-runtime-old = { package = "asupersync", version = "0.4.11" }
-runtime-new = { package = "asupersync", version = "0.5.0" }
-""",
+                "Cargo.toml": _manifest(
+                    "probe-root",
+                    "0.1.0",
+                    '\n[dependencies]\nruntime-old = { package = "asupersync", path = "asupersync-old" }\nruntime-new = { package = "asupersync", path = "asupersync-new" }\n',
+                ),
+                "src/lib.rs": "pub fn root_marker() {}\n",
+                "asupersync-old/Cargo.toml": _manifest("asupersync", "0.4.11"),
+                "asupersync-old/src/lib.rs": "pub fn old_marker() {}\n",
+                "asupersync-new/Cargo.toml": _manifest("asupersync", "0.5.0"),
+                "asupersync-new/src/lib.rs": "pub fn new_marker() {}\n",
                 "Cargo.lock": LOCK_HEADER
                 + _package("probe-root", "0.1.0", ("asupersync 0.4.11", "asupersync 0.5.0"))
-                + _package(
-                    "asupersync",
-                    "0.4.11",
-                    source="git+https://github.com/Dicklesworthstone/asupersync",
-                )
-                + _package(
-                    "asupersync",
-                    "0.5.0",
-                    source="git+https://github.com/Dicklesworthstone/asupersync",
-                ),
+                + _package("asupersync", "0.4.11")
+                + _package("asupersync", "0.5.0"),
             }
         ) as root:
             report = _report(root)
 
+        _assert_metadata_mode(self, report)
         self.assertEqual(report["qualification"], "noncompliant")
         duplicate = [
             violation
-            for violation in report["violations"]  # type: ignore[index]
+            for violation in report["violations"]
             if violation.get("code") == "duplicate_runtime_version"
         ]
         self.assertEqual(len(duplicate), 1)
         self.assertEqual(duplicate[0]["versions"], ["0.4.11", "0.5.0"])
+        self.assertEqual(
+            {node["version"] for node in _nodes(report) if node["name"] == "asupersync"},
+            {"0.4.11", "0.5.0"},
+        )
 
 
 if __name__ == "__main__":
