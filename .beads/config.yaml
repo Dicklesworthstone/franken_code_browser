@@ -1,1 +1,3 @@
 issue_prefix: fcb
+inherited_context:
+  enabled: true
