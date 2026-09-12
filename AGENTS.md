@@ -212,3 +212,37 @@ The first implementation order is FCB-001/002/003/007, then foundational owner I
 byte budgets, accessibility/frame vocabulary and retirement/completion contracts as dependencies
 permit. Read plan §29.9. G0–G7 mean this project's product gates, **not FrankenSim's Gauntlet tiers**.
 Do not claim a gate passed from a trait, stub, fabricated response, or an unexecuted test.
+
+## Active swarm: code-first work and independent verification
+
+These rules apply to the user-authorized NTM implementation campaign and subsequent swarms.
+BlackCedar coordinates this campaign; a scheduled verifier may act under its explicit handoff.
+
+- Write real production code and relevant positive, boundary and failure tests in the same work
+  item. No placeholder macros, fabricated capability rows, fixture-as-live proof, weakened
+  assertions, regenerated goldens to force green, or source/spec edits that lower acceptance.
+- During code-first waves, workers do not run builds or test compilations. A narrowly authorized
+  syntax check is the maximum exception and still uses strict RCH. Commit coherent owned changes
+  with the bead ID and "code-first, batch verification pending"; this is not completion evidence.
+- Only the independent batch verifier closes work after reviewing production and test diffs and
+  executing the relevant tests through strict RCH at an exact source revision. Preserve every
+  failed attempt. Missing native hardware, skipped cases, compile-aborted suites and timeouts
+  cannot qualify the product. Never close merely to unblock dependents.
+- Use `br` exclusively for tracker changes and `--actor <AgentMailName>` on every mutation.
+  Atomically claim one ready implementation task per worker; epics are navigation, not work.
+  Workers may change their assignee/status/comments, never acceptance criteria or dependencies.
+  Keep committed verification debt explicit with `batch-pending` labels until the verifier acts.
+- Reserve narrow paths with Agent Mail and use bead-ID threads. Inspect the actual tree before
+  every edit/commit; never include a peer's staged or unstaged files. Coordinate shared manifests
+  through one owner. No branches, worktrees, stash, resets or file deletion.
+- Batch verification runs centrally when a prerequisite can unlock work, the ready pool dries,
+  verification debt reaches 24 items, or a wave reaches 30 minutes. Incomplete work stays open.
+  RCH must report remote execution; local fallback is refused, not accepted as remote proof.
+- Process artifacts require a named consumer, gated feature, observed defect and retirement
+  condition. They earn no capability credit. Refusal-only work stays open unless the bead itself
+  owns that boundary, with a near-identical permitted case that succeeds.
+- Gate self-weakening, proof laundering, refusal farming, commit pumping, follow-up laundering,
+  dependency smuggling and demo hardcoding are defects. The coordinator inspects for them every
+  few ticks and reopens unsupported closes with an incident comment. Commit count is not a KPI.
+- Report measured denominators and countermetrics, actual execution/effect outcomes, and exact
+  remaining limitations. Linux/unit/static proof never substitutes for native Mac qualification.
