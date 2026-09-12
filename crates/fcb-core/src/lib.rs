@@ -6,6 +6,7 @@ use std::{marker::PhantomData, sync::Arc};
 pub struct ArenaOwnerId(u64);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
 pub enum CoreError {
     InvalidId,
     RangeReversed,
@@ -15,6 +16,9 @@ pub enum CoreError {
     Exhausted,
     OwnershipMismatch,
     StalePublication,
+    StaleRequestGeneration,
+    StaleSourceRevision,
+    StaleDisplayGeneration,
 }
 
 impl CoreError {
@@ -28,6 +32,9 @@ impl CoreError {
             Self::Exhausted => "IDENTITY_EXHAUSTED",
             Self::OwnershipMismatch => "OWNERSHIP_MISMATCH",
             Self::StalePublication => "STALE_PUBLICATION",
+            Self::StaleRequestGeneration => "STALE_REQUEST_GENERATION",
+            Self::StaleSourceRevision => "STALE_SOURCE_REVISION",
+            Self::StaleDisplayGeneration => "STALE_DISPLAY_GENERATION",
         }
     }
 }
@@ -86,6 +93,7 @@ owner_qualified_id!(QueryGeneration);
 owner_qualified_id!(WindowGeneration);
 owner_qualified_id!(DeviceId);
 owner_qualified_id!(DeviceGeneration);
+owner_qualified_id!(DisplayGeneration);
 owner_qualified_id!(PresentedFrameId);
 
 pub trait AllocatedId: Copy {
@@ -114,6 +122,7 @@ allocated_id!(QueryGeneration);
 allocated_id!(WindowGeneration);
 allocated_id!(DeviceId);
 allocated_id!(DeviceGeneration);
+allocated_id!(DisplayGeneration);
 allocated_id!(PresentedFrameId);
 
 pub struct IdAllocator<I> {
@@ -296,6 +305,80 @@ pub type ScalarRange = OffsetRange<ScalarOffset>;
 pub type GraphemeRange = OffsetRange<GraphemeOffset>;
 pub type VisualRange = OffsetRange<VisualOffset>;
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PublicationContext {
+    owner: ArenaOwnerId,
+    request: QueryGeneration,
+    source: SourceRevision,
+    display: DisplayGeneration,
+}
+
+impl PublicationContext {
+    pub fn new(
+        owner: ArenaOwnerId,
+        request: QueryGeneration,
+        source: SourceRevision,
+        display: DisplayGeneration,
+    ) -> Result<Self, CoreError> {
+        if request.owner() != owner || source.owner() != owner || display.owner() != owner {
+            return Err(CoreError::OwnershipMismatch);
+        }
+        Ok(Self {
+            owner,
+            request,
+            source,
+            display,
+        })
+    }
+
+    pub const fn owner(self) -> ArenaOwnerId {
+        self.owner
+    }
+
+    pub const fn request(self) -> QueryGeneration {
+        self.request
+    }
+
+    pub const fn source(self) -> SourceRevision {
+        self.source
+    }
+
+    pub const fn display(self) -> DisplayGeneration {
+        self.display
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PublicationToken {
+    context: PublicationContext,
+}
+
+impl PublicationToken {
+    pub const fn new(context: PublicationContext) -> Self {
+        Self { context }
+    }
+
+    pub const fn context(self) -> PublicationContext {
+        self.context
+    }
+
+    pub fn validate_against(self, current: PublicationContext) -> Result<(), CoreError> {
+        if self.context.owner() != current.owner() {
+            return Err(CoreError::OwnershipMismatch);
+        }
+        if self.context.request() != current.request() {
+            return Err(CoreError::StaleRequestGeneration);
+        }
+        if self.context.source() != current.source() {
+            return Err(CoreError::StaleSourceRevision);
+        }
+        if self.context.display() != current.display() {
+            return Err(CoreError::StaleDisplayGeneration);
+        }
+        Ok(())
+    }
+}
+
 pub struct ImmutableSnapshot<T> {
     owner: ArenaOwnerId,
     revision: SourceRevision,
@@ -368,8 +451,94 @@ impl<T> SnapshotCell<T> {
         Ok(())
     }
 
+    pub fn publish_if_current(
+        &mut self,
+        token: PublicationToken,
+        current: PublicationContext,
+        snapshot: ImmutableSnapshot<T>,
+    ) -> Result<(), CoreError> {
+        token.validate_against(current)?;
+        if snapshot.revision() != token.context().source() {
+            return Err(CoreError::StaleSourceRevision);
+        }
+        self.publish(snapshot)
+    }
+
     pub fn head(&self) -> Option<&ImmutableSnapshot<T>> {
         self.head.as_ref()
+    }
+}
+
+pub struct SnapshotDelta<T> {
+    owner: ArenaOwnerId,
+    base: SourceRevision,
+    target: SourceRevision,
+    max_items: u64,
+    items: Vec<T>,
+    count: u64,
+}
+
+impl<T> SnapshotDelta<T> {
+    pub fn new(
+        owner: ArenaOwnerId,
+        base: SourceRevision,
+        target: SourceRevision,
+        max_items: u64,
+    ) -> Result<Self, CoreError> {
+        if base.owner() != owner || target.owner() != owner {
+            return Err(CoreError::OwnershipMismatch);
+        }
+        if target.get() <= base.get() {
+            return Err(CoreError::StalePublication);
+        }
+        if max_items == 0 {
+            return Err(CoreError::LimitExceeded);
+        }
+        Ok(Self {
+            owner,
+            base,
+            target,
+            max_items,
+            items: Vec::new(),
+            count: 0,
+        })
+    }
+
+    pub const fn owner(&self) -> ArenaOwnerId {
+        self.owner
+    }
+
+    pub const fn base(&self) -> SourceRevision {
+        self.base
+    }
+
+    pub const fn target(&self) -> SourceRevision {
+        self.target
+    }
+
+    pub const fn max_items(&self) -> u64 {
+        self.max_items
+    }
+
+    pub fn push(&mut self, item: T) -> Result<(), CoreError> {
+        if self.count >= self.max_items {
+            return Err(CoreError::LimitExceeded);
+        }
+        self.items.push(item);
+        self.count = self.count.checked_add(1).ok_or(CoreError::ArithmeticOverflow)?;
+        Ok(())
+    }
+
+    pub fn len(&self) -> u64 {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub fn items(&self) -> &[T] {
+        &self.items
     }
 }
 
@@ -422,5 +591,29 @@ mod tests {
         let foreign = ImmutableSnapshot::new(owner_b, revision_b, 42).unwrap();
         let mut cell = SnapshotCell::new(owner_a);
         assert_eq!(cell.publish(foreign), Err(CoreError::OwnershipMismatch));
+    }
+
+    #[test]
+    fn publication_token_rejects_each_stale_dimension() {
+        let owner = ArenaOwnerId::new(31).unwrap();
+        let request = QueryGeneration::new(owner, 1).unwrap();
+        let source = SourceRevision::new(owner, 2).unwrap();
+        let display = DisplayGeneration::new(owner, 3).unwrap();
+        let token = PublicationToken::new(PublicationContext::new(owner, request, source, display).unwrap());
+        assert_eq!(token.validate_against(PublicationContext::new(owner, QueryGeneration::new(owner, 2).unwrap(), source, display).unwrap()), Err(CoreError::StaleRequestGeneration));
+        assert_eq!(token.validate_against(PublicationContext::new(owner, request, SourceRevision::new(owner, 4).unwrap(), display).unwrap()), Err(CoreError::StaleSourceRevision));
+        assert_eq!(token.validate_against(PublicationContext::new(owner, request, source, DisplayGeneration::new(owner, 5).unwrap()).unwrap()), Err(CoreError::StaleDisplayGeneration));
+        assert_eq!(token.validate_against(token.context()), Ok(()));
+    }
+
+    #[test]
+    fn snapshot_delta_is_bounded_and_owner_qualified() {
+        let owner = ArenaOwnerId::new(41).unwrap();
+        let base = SourceRevision::new(owner, 1).unwrap();
+        let target = SourceRevision::new(owner, 2).unwrap();
+        let mut delta = SnapshotDelta::new(owner, base, target, 1).unwrap();
+        delta.push("change").unwrap();
+        assert_eq!(delta.push("overflow"), Err(CoreError::LimitExceeded));
+        assert_eq!(delta.items(), &["change"]);
     }
 }

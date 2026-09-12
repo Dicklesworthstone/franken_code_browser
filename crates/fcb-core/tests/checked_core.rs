@@ -1,5 +1,7 @@
 use fcb_core::{
-    ArenaOwnerId, CoreError, FileId, IdAllocator, ImmutableSnapshot, SnapshotCell, SourceRevision,
+    ArenaOwnerId, CoreError, DisplayGeneration, FileId, IdAllocator, ImmutableSnapshot,
+    PublicationContext, PublicationToken, QueryGeneration, SnapshotCell, SnapshotDelta,
+    SourceRevision,
 };
 
 #[test]
@@ -30,4 +32,40 @@ fn snapshot_cell_rejects_wrong_owner_and_stale_revision() {
         Err(CoreError::OwnershipMismatch)
     );
     assert_eq!(cell.head().unwrap().get(), &"new");
+}
+
+#[test]
+fn token_gates_snapshot_publication_against_current_context() {
+    let owner = ArenaOwnerId::new(77).unwrap();
+    let request = QueryGeneration::new(owner, 1).unwrap();
+    let source = SourceRevision::new(owner, 2).unwrap();
+    let display = DisplayGeneration::new(owner, 3).unwrap();
+    let context = PublicationContext::new(owner, request, source, display).unwrap();
+    let token = PublicationToken::new(context);
+    let snapshot = ImmutableSnapshot::new(owner, source, "published").unwrap();
+    let mut cell = SnapshotCell::new(owner);
+    cell.publish_if_current(token, context, snapshot).unwrap();
+    assert_eq!(cell.head().unwrap().get(), &"published");
+}
+
+#[test]
+fn token_rejects_foreign_owner_and_delta_rejects_stale_base() {
+    let owner = ArenaOwnerId::new(88).unwrap();
+    let other_owner = ArenaOwnerId::new(89).unwrap();
+    let request = QueryGeneration::new(owner, 1).unwrap();
+    let source = SourceRevision::new(owner, 1).unwrap();
+    let display = DisplayGeneration::new(owner, 1).unwrap();
+    let foreign = PublicationContext::new(
+        other_owner,
+        QueryGeneration::new(other_owner, 1).unwrap(),
+        SourceRevision::new(other_owner, 1).unwrap(),
+        DisplayGeneration::new(other_owner, 1).unwrap(),
+    )
+    .unwrap();
+    let token = PublicationToken::new(PublicationContext::new(owner, request, source, display).unwrap());
+    assert_eq!(token.validate_against(foreign), Err(CoreError::OwnershipMismatch));
+    assert!(matches!(
+        SnapshotDelta::<u8>::new(owner, source, source, 1),
+        Err(CoreError::StalePublication)
+    ));
 }
