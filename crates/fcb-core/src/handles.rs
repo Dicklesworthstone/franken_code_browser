@@ -548,14 +548,14 @@ impl<T> DeviceTable<T> {
     }
 
     pub fn validate(&self, handle: DeviceHandle) -> Result<(), CoreError> {
-        if handle.owner() != self.owner
-            || handle.domain() != self.domain
-            || handle.device() != self.device
-        {
+        if handle.owner() != self.owner || handle.device() != self.device {
             return Err(CoreError::OwnershipMismatch);
         }
         if handle.device_generation() != self.device_generation {
             return Err(CoreError::StalePublication);
+        }
+        if handle.domain() != self.domain {
+            return Err(CoreError::OwnershipMismatch);
         }
         self.slots.lookup(handle.slot(), handle.generation()).map(|_| ())
     }
