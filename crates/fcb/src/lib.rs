@@ -96,6 +96,28 @@ impl FeatureSet {
         Self(0)
     }
 
+    pub const fn single(feature: Feature) -> Self {
+        Self(feature.bit())
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn intersect(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    pub const fn all_known() -> Self {
+        let mut bits = 0;
+        let mut index = 0;
+        while index < Feature::ALL.len() {
+            bits |= Feature::ALL[index].bit();
+            index += 1;
+        }
+        Self(bits)
+    }
+
     pub const fn compiled() -> Self {
         let mut bits = 0;
         let mut index = 0;
@@ -150,6 +172,7 @@ pub enum FcbError {
     FeatureUnavailable,
     UnsupportedTarget,
     CaptureTooLarge,
+    HostServicesUnavailable,
 }
 
 impl FcbError {
@@ -163,6 +186,7 @@ impl FcbError {
             Self::FeatureUnavailable => "FEATURE_UNAVAILABLE",
             Self::UnsupportedTarget => "UNSUPPORTED_TARGET",
             Self::CaptureTooLarge => "CAPTURE_TOO_LARGE",
+            Self::HostServicesUnavailable => "HOST_SERVICES_UNAVAILABLE",
         }
     }
 }
@@ -174,6 +198,28 @@ impl fmt::Display for FcbError {
 }
 
 impl std::error::Error for FcbError {}
+
+/// A host request that the facade may forward only when the host explicitly
+/// supplies services and the consumer explicitly asks for it.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum HostRequest {
+    RequestRedraw,
+    Wake,
+}
+
+/// Host-selected resource, clock, capability, and wake boundary.
+///
+/// The facade never constructs an implementation, polls a clock, requests a
+/// redraw, or wakes a host during session construction or drop. Implementors
+/// own any side effects of these methods and may reject an explicit request.
+pub trait HostServices: Send + Sync {
+    fn capabilities(&self) -> FeatureSet;
+
+    fn monotonic_nanos(&self) -> u64;
+
+    fn request(&self, request: HostRequest) -> Result<(), FcbError>;
+}
 
 /// Immutable bytes captured by the host or by [`MemorySourceProvider`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -330,6 +376,7 @@ impl SourceProvider for MemorySourceProvider {
 pub struct BrowserSession {
     owner: ArenaOwnerId,
     provider: Option<Arc<dyn SourceProvider>>,
+    services: Option<Arc<dyn HostServices>>,
 }
 
 impl fmt::Debug for BrowserSession {
@@ -338,6 +385,7 @@ impl fmt::Debug for BrowserSession {
             .debug_struct("BrowserSession")
             .field("owner", &self.owner)
             .field("has_provider", &self.provider.is_some())
+            .field("has_services", &self.services.is_some())
             .finish()
     }
 }
@@ -347,6 +395,7 @@ impl BrowserSession {
         Self {
             owner,
             provider: None,
+            services: None,
         }
     }
 
@@ -354,6 +403,27 @@ impl BrowserSession {
         Self {
             owner,
             provider: Some(provider),
+            services: None,
+        }
+    }
+
+    pub fn with_services(owner: ArenaOwnerId, services: Arc<dyn HostServices>) -> Self {
+        Self {
+            owner,
+            provider: None,
+            services: Some(services),
+        }
+    }
+
+    pub fn with_provider_and_services(
+        owner: ArenaOwnerId,
+        provider: Arc<dyn SourceProvider>,
+        services: Arc<dyn HostServices>,
+    ) -> Self {
+        Self {
+            owner,
+            provider: Some(provider),
+            services: Some(services),
         }
     }
 
@@ -367,6 +437,27 @@ impl BrowserSession {
 
     pub const fn available_features(&self) -> FeatureSet {
         FeatureSet::available()
+    }
+
+    pub fn host_capabilities(&self) -> FeatureSet {
+        self.services
+            .as_ref()
+            .map(|services| services.capabilities().intersect(FeatureSet::available()))
+            .unwrap_or_else(FeatureSet::empty)
+    }
+
+    pub fn host_monotonic_nanos(&self) -> Result<u64, FcbError> {
+        self.services
+            .as_ref()
+            .ok_or(FcbError::HostServicesUnavailable)
+            .map(|services| services.monotonic_nanos())
+    }
+
+    pub fn request_host(&self, request: HostRequest) -> Result<(), FcbError> {
+        self.services
+            .as_ref()
+            .ok_or(FcbError::HostServicesUnavailable)?
+            .request(request)
     }
 
     pub fn require_feature(&self, feature: Feature) -> Result<(), FcbError> {
