@@ -204,3 +204,21 @@ fn zero_drain_limit_is_a_bounded_failure() {
         Err(WakeError::InvalidDrainLimit)
     );
 }
+
+#[test]
+fn equal_generation_from_another_probe_cannot_acknowledge_or_reset_state() {
+    let first = WakeProbe::new(capacity(1));
+    let second = WakeProbe::new(capacity(1));
+    first
+        .request_wake(WakePriority::Normal)
+        .expect("first probe wake");
+    second
+        .request_wake(WakePriority::Normal)
+        .expect("second probe reaches equal generation");
+    let foreign_batch = first.take(1).expect("request-only batch");
+    let own_batch = second.take(1).expect("second request-only batch");
+    assert_ne!(foreign_batch, own_batch);
+    let before = second.status().expect("second status before refusal");
+    assert_eq!(second.acknowledge(foreign_batch), Err(WakeError::ForeignBatch));
+    assert_eq!(second.status().expect("second status after refusal"), before);
+}

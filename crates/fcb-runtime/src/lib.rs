@@ -68,13 +68,26 @@ pub struct PublishOutcome {
 }
 
 /// A bounded snapshot delivered to one consumer turn.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct WakeBatch {
+    authority: std::sync::Arc<ProbeAuthority>,
     generation: u64,
     priority: WakePriority,
     ordered: Vec<WakeCommand>,
     motion: Option<MotionUpdate>,
 }
+
+impl PartialEq for WakeBatch {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.authority, &other.authority)
+            && self.generation == other.generation
+            && self.priority == other.priority
+            && self.ordered == other.ordered
+            && self.motion == other.motion
+    }
+}
+
+impl Eq for WakeBatch {}
 
 impl WakeBatch {
     /// Generation sampled when this batch was taken.
@@ -112,6 +125,8 @@ pub enum WakeReset {
 pub struct WakeStatus {
     /// Whether a consumer wake remains pending.
     pub wake_pending: bool,
+    /// Monotonic probe generation used to reject stale acknowledgements.
+    pub generation: u64,
     /// Highest urgency among pending requests.
     pub priority: WakePriority,
     /// Number of ordered commands waiting in FIFO storage.
@@ -137,6 +152,8 @@ pub enum WakeError {
     InvalidDrainLimit,
     /// A prior panic poisoned the host-owned mutex.
     Poisoned,
+    /// The batch belongs to a different wake probe.
+    ForeignBatch,
     /// The wake generation or command sequence space cannot advance.
     SequenceExhausted,
     /// The clock-domain adapter rejected a deadline operation.
@@ -151,6 +168,7 @@ impl fmt::Display for WakeError {
             }
             Self::InvalidDrainLimit => formatter.write_str("wake drain limit must be non-zero"),
             Self::Poisoned => formatter.write_str("wake probe state is poisoned"),
+            Self::ForeignBatch => formatter.write_str("wake batch belongs to another probe"),
             Self::SequenceExhausted => formatter.write_str("wake generation space exhausted"),
             Self::Deadline(error) => write!(formatter, "deadline rejected: {error:?}"),
         }
@@ -193,10 +211,14 @@ struct WakeState {
     maintenance_progress: u64,
 }
 
+#[derive(Debug)]
+struct ProbeAuthority(u8);
+
 /// A fixed-capacity, host-owned wake coalescing and fairness probe.
 pub struct WakeProbe {
     capacity: NonZeroUsize,
     state: Mutex<WakeState>,
+    authority: std::sync::Arc<ProbeAuthority>,
 }
 
 impl WakeProbe {
@@ -215,6 +237,7 @@ impl WakeProbe {
                 coalesced_motion: 0,
                 maintenance_progress: 0,
             }),
+            authority: std::sync::Arc::new(ProbeAuthority(0)),
         }
     }
 
@@ -226,7 +249,8 @@ impl WakeProbe {
     /// Request a wake without adding payload; urgency is combined by max.
     pub fn request_wake(&self, priority: WakePriority) -> Result<u64, WakeError> {
         let mut state = self.lock()?;
-        Self::arm(&mut state, priority)?;
+        let next_generation = Self::next_generation(&state)?;
+        Self::arm(&mut state, priority, next_generation);
         Ok(state.generation)
     }
 
@@ -243,12 +267,14 @@ impl WakeProbe {
                 capacity: self.capacity.get(),
             });
         }
-        if state.accepted_ordered == u64::MAX {
-            return Err(WakeError::SequenceExhausted);
-        }
+        let next_generation = Self::next_generation(&state)?;
+        let next_accepted = state
+            .accepted_ordered
+            .checked_add(1)
+            .ok_or(WakeError::SequenceExhausted)?;
         state.ordered.push_back(command);
-        state.accepted_ordered += 1;
-        Self::arm(&mut state, priority)?;
+        state.accepted_ordered = next_accepted;
+        Self::arm(&mut state, priority, next_generation);
         Ok(PublishOutcome {
             coalesced_motion: false,
             wake_generation: state.generation,
@@ -263,14 +289,18 @@ impl WakeProbe {
     ) -> Result<PublishOutcome, WakeError> {
         let mut state = self.lock()?;
         let coalesced = state.motion.is_some();
-        if coalesced && state.coalesced_motion == u64::MAX {
-            return Err(WakeError::SequenceExhausted);
-        }
+        let next_generation = Self::next_generation(&state)?;
+        let next_coalesced = if coalesced {
+            state
+                .coalesced_motion
+                .checked_add(1)
+                .ok_or(WakeError::SequenceExhausted)?
+        } else {
+            state.coalesced_motion
+        };
         state.motion = Some(motion);
-        if coalesced {
-            state.coalesced_motion += 1;
-        }
-        Self::arm(&mut state, priority)?;
+        state.coalesced_motion = next_coalesced;
+        Self::arm(&mut state, priority, next_generation);
         Ok(PublishOutcome {
             coalesced_motion: coalesced,
             wake_generation: state.generation,
@@ -298,6 +328,7 @@ impl WakeProbe {
         }
         state.maintenance_progress = new_progress;
         Ok(WakeBatch {
+            authority: std::sync::Arc::clone(&self.authority),
             generation: state.generation,
             priority: state.priority,
             ordered,
@@ -307,6 +338,9 @@ impl WakeProbe {
 
     /// Retire a batch only if no newer producer mutation occurred.
     pub fn acknowledge(&self, batch: WakeBatch) -> Result<WakeReset, WakeError> {
+        if !std::sync::Arc::ptr_eq(&self.authority, &batch.authority) {
+            return Err(WakeError::ForeignBatch);
+        }
         let mut state = self.lock()?;
         if state.generation == batch.generation
             && state.ordered.is_empty()
@@ -327,6 +361,7 @@ impl WakeProbe {
         let state = self.lock()?;
         Ok(WakeStatus {
             wake_pending: state.wake_pending,
+            generation: state.generation,
             priority: state.priority,
             ordered_pending: state.ordered.len(),
             motion_pending: state.motion.is_some(),
@@ -341,13 +376,62 @@ impl WakeProbe {
         self.state.lock().map_err(|_| WakeError::Poisoned)
     }
 
-    fn arm(state: &mut WakeState, priority: WakePriority) -> Result<(), WakeError> {
-        state.generation = state
+    fn next_generation(state: &WakeState) -> Result<u64, WakeError> {
+        state
             .generation
             .checked_add(1)
-            .ok_or(WakeError::SequenceExhausted)?;
+            .ok_or(WakeError::SequenceExhausted)
+    }
+
+    fn arm(state: &mut WakeState, priority: WakePriority, next_generation: u64) {
+        state.generation = next_generation;
         state.wake_pending = true;
         state.priority = state.priority.meet(priority);
-        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl WakeProbe {
+    fn with_generation(capacity: NonZeroUsize, generation: u64) -> Self {
+        let probe = Self::new(capacity);
+        probe.state.lock().expect("fresh probe lock").generation = generation;
+        probe
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn capacity(value: usize) -> NonZeroUsize {
+        NonZeroUsize::new(value).expect("test capacity is non-zero")
+    }
+
+    #[test]
+    fn generation_exhaustion_preserves_ordered_publish_state() {
+        let probe = WakeProbe::with_generation(capacity(2), u64::MAX);
+        let before = probe.status().expect("status before refusal");
+        assert_eq!(
+            probe.publish_ordered(
+                WakeCommand { id: 1, payload: 2 },
+                WakePriority::Normal,
+            ),
+            Err(WakeError::SequenceExhausted)
+        );
+        assert_eq!(probe.status().expect("status after refusal"), before);
+    }
+
+    #[test]
+    fn generation_exhaustion_preserves_motion_publish_state() {
+        let probe = WakeProbe::with_generation(capacity(2), u64::MAX);
+        let before = probe.status().expect("status before refusal");
+        assert_eq!(
+            probe.publish_motion(
+                MotionUpdate { sequence: 1, value: 2 },
+                WakePriority::Urgent,
+            ),
+            Err(WakeError::SequenceExhausted)
+        );
+        assert_eq!(probe.status().expect("status after refusal"), before);
     }
 }
