@@ -49,6 +49,124 @@ pub enum ResourceKind {
     Queue,
 }
 
+/// The protected part of a resource budget reserved for reclamation progress.
+///
+/// Ordinary work cannot consume terminal or retirement capacity. Keeping the
+/// two classes separate prevents a full candidate queue from making it
+/// impossible to record completion or retire an old generation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ResourceReservationClass {
+    /// Capacity available to ordinary managed allocations and queue payloads.
+    Ordinary,
+    /// Capacity reserved for an admitted terminal/completion record.
+    Terminal,
+    /// Capacity reserved for an admitted retirement/reclamation record.
+    Retirement,
+}
+
+/// Global order for acquiring resource-admission permits.
+///
+/// A [`ResourceAcquisitionSequence`] rejects a request that moves backwards
+/// in this order. Callers must therefore acquire publication, byte, pin, and
+/// service capacity in the same order across all subsystems.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ResourceAcquisitionOrder {
+    Publication,
+    Bytes,
+    SourcePin,
+    AssetPin,
+    Service,
+}
+
+/// Typed refusal from an ordered or protected resource admission operation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ResourceAdmissionError {
+    /// A zero-byte reservation or reconciliation is not a valid lease.
+    InvalidBytes,
+    /// The allocation key is already active; sharing requires a lease.
+    AllocationConflict,
+    /// The requested class has no remaining capacity.
+    CapacityExhausted {
+        class: ResourceReservationClass,
+        requested: ByteLength,
+        available: ByteLength,
+    },
+    /// The request would acquire resources out of the global order.
+    AcquisitionOrderViolation {
+        held: ResourceAcquisitionOrder,
+        requested: ResourceAcquisitionOrder,
+    },
+    /// The actual allocation is larger than its reservation and the extra
+    /// bytes cannot be admitted without changing the accounting first.
+    ReconciliationDenied {
+        class: ResourceReservationClass,
+        reserved: ByteLength,
+        actual: ByteLength,
+        available: ByteLength,
+    },
+    /// Internal checked arithmetic could not represent the next counters.
+    ArithmeticOverflow,
+}
+
+impl ResourceAdmissionError {
+    fn into_core_error(self) -> CoreError {
+        match self {
+            Self::InvalidBytes => CoreError::InvalidId,
+            Self::AllocationConflict => CoreError::OwnershipMismatch,
+            Self::CapacityExhausted { .. } | Self::ReconciliationDenied { .. } => {
+                CoreError::LimitExceeded
+            }
+            Self::AcquisitionOrderViolation { .. } => CoreError::OwnershipMismatch,
+            Self::ArithmeticOverflow => CoreError::ArithmeticOverflow,
+        }
+    }
+}
+
+/// A per-operation acquisition cursor enforcing the global resource order.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ResourceAcquisitionSequence {
+    owner: ArenaOwnerId,
+    last: Option<ResourceAcquisitionOrder>,
+}
+
+impl ResourceAcquisitionSequence {
+    /// Start an ordered admission sequence for one owner.
+    pub const fn new(owner: ArenaOwnerId) -> Self {
+        Self { owner, last: None }
+    }
+
+    pub const fn owner(self) -> ArenaOwnerId {
+        self.owner
+    }
+
+    pub const fn last(self) -> Option<ResourceAcquisitionOrder> {
+        self.last
+    }
+
+    /// Reserve a resource while advancing this sequence's acquisition order.
+    pub fn try_reserve(
+        &mut self,
+        budget: &ResourceBudget,
+        allocation: ResourceAllocationId,
+        kind: ResourceKind,
+        class: ResourceReservationClass,
+        order: ResourceAcquisitionOrder,
+        bytes: ByteLength,
+    ) -> Result<ResourceLease, ResourceAdmissionError> {
+        if let Some(held) = self.last {
+            if order < held {
+                return Err(ResourceAdmissionError::AcquisitionOrderViolation {
+                    held,
+                    requested: order,
+                });
+            }
+        }
+        let lease = budget.try_reserve_class(self.owner, allocation, kind, class, bytes)?;
+        self.last = Some(order);
+        Ok(lease)
+    }
+}
+
 /// Immutable identity and charge carried by a resource lease.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ResourceLeaseInfo {
@@ -85,7 +203,11 @@ impl ResourceLeaseInfo {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ResourceAccounting {
     capacity: ByteLength,
+    terminal_capacity: ByteLength,
+    retirement_capacity: ByteLength,
     reserved: ByteLength,
+    terminal_reserved: ByteLength,
+    retirement_reserved: ByteLength,
     managed: ByteLength,
     queue: ByteLength,
     peak_reserved: ByteLength,
@@ -98,8 +220,24 @@ impl ResourceAccounting {
         self.capacity
     }
 
+    pub const fn terminal_capacity(self) -> ByteLength {
+        self.terminal_capacity
+    }
+
+    pub const fn retirement_capacity(self) -> ByteLength {
+        self.retirement_capacity
+    }
+
     pub const fn reserved(self) -> ByteLength {
         self.reserved
+    }
+
+    pub const fn terminal_reserved(self) -> ByteLength {
+        self.terminal_reserved
+    }
+
+    pub const fn retirement_reserved(self) -> ByteLength {
+        self.retirement_reserved
     }
 
     pub const fn managed(self) -> ByteLength {
@@ -112,6 +250,45 @@ impl ResourceAccounting {
 
     pub const fn available(self) -> ByteLength {
         ByteLength::new(self.capacity.get() - self.reserved.get())
+    }
+
+    /// Capacity still available to ordinary work, excluding protected slots.
+    pub const fn ordinary_available(self) -> ByteLength {
+        let protected = self
+            .terminal_capacity
+            .get()
+            .saturating_add(self.retirement_capacity.get());
+        let ordinary_capacity = self.capacity.get().saturating_sub(protected);
+        let ordinary_reserved = self
+            .reserved
+            .get()
+            .saturating_sub(self.terminal_reserved.get())
+            .saturating_sub(self.retirement_reserved.get());
+        ByteLength::new(ordinary_capacity.saturating_sub(ordinary_reserved))
+    }
+
+    pub const fn terminal_available(self) -> ByteLength {
+        ByteLength::new(
+            self.terminal_capacity
+                .get()
+                .saturating_sub(self.terminal_reserved.get()),
+        )
+    }
+
+    pub const fn retirement_available(self) -> ByteLength {
+        ByteLength::new(
+            self.retirement_capacity
+                .get()
+                .saturating_sub(self.retirement_reserved.get()),
+        )
+    }
+
+    pub const fn protected_reserved(self) -> ByteLength {
+        ByteLength::new(
+            self.terminal_reserved
+                .get()
+                .saturating_add(self.retirement_reserved.get()),
+        )
     }
 
     pub const fn peak_reserved(self) -> ByteLength {
@@ -130,6 +307,7 @@ impl ResourceAccounting {
 #[derive(Debug)]
 struct AllocationRecord {
     kind: ResourceKind,
+    class: ResourceReservationClass,
     bytes: u64,
     references: u64,
     owners: BTreeMap<ArenaOwnerId, u64>,
@@ -139,7 +317,11 @@ struct AllocationRecord {
 struct ResourceLedger {
     domain: ArenaOwnerId,
     capacity: u64,
+    terminal_capacity: u64,
+    retirement_capacity: u64,
     reserved: u64,
+    terminal_reserved: u64,
+    retirement_reserved: u64,
     managed: u64,
     queue: u64,
     peak_reserved: u64,
@@ -151,12 +333,68 @@ impl ResourceLedger {
     fn accounting(&self) -> ResourceAccounting {
         ResourceAccounting {
             capacity: ByteLength::new(self.capacity),
+            terminal_capacity: ByteLength::new(self.terminal_capacity),
+            retirement_capacity: ByteLength::new(self.retirement_capacity),
             reserved: ByteLength::new(self.reserved),
+            terminal_reserved: ByteLength::new(self.terminal_reserved),
+            retirement_reserved: ByteLength::new(self.retirement_reserved),
             managed: ByteLength::new(self.managed),
             queue: ByteLength::new(self.queue),
             peak_reserved: ByteLength::new(self.peak_reserved),
             active_allocations: self.allocations.len() as u64,
             active_leases: self.active_leases,
+        }
+    }
+
+    fn class_available(&self, class: ResourceReservationClass) -> u64 {
+        match class {
+            ResourceReservationClass::Ordinary => self
+                .capacity
+                .saturating_sub(self.terminal_capacity)
+                .saturating_sub(self.retirement_capacity)
+                .saturating_sub(
+                    self.reserved
+                        .saturating_sub(self.terminal_reserved)
+                        .saturating_sub(self.retirement_reserved),
+                ),
+            ResourceReservationClass::Terminal => {
+                self.terminal_capacity.saturating_sub(self.terminal_reserved)
+            }
+            ResourceReservationClass::Retirement => self
+                .retirement_capacity
+                .saturating_sub(self.retirement_reserved),
+        }
+    }
+
+    fn add_class(
+        &mut self,
+        class: ResourceReservationClass,
+        bytes: u64,
+    ) -> Result<(), ResourceAdmissionError> {
+        match class {
+            ResourceReservationClass::Ordinary => Ok(()),
+            ResourceReservationClass::Terminal => {
+                self.terminal_reserved = self
+                    .terminal_reserved
+                    .checked_add(bytes)
+                    .ok_or(ResourceAdmissionError::ArithmeticOverflow)?;
+                Ok(())
+            }
+            ResourceReservationClass::Retirement => {
+                self.retirement_reserved = self
+                    .retirement_reserved
+                    .checked_add(bytes)
+                    .ok_or(ResourceAdmissionError::ArithmeticOverflow)?;
+                Ok(())
+            }
+        }
+    }
+
+    fn subtract_class(&mut self, class: ResourceReservationClass, bytes: u64) {
+        match class {
+            ResourceReservationClass::Ordinary => {}
+            ResourceReservationClass::Terminal => self.terminal_reserved -= bytes,
+            ResourceReservationClass::Retirement => self.retirement_reserved -= bytes,
         }
     }
 
@@ -245,8 +483,60 @@ impl ResourceLedger {
                 .remove(&allocation)
                 .expect("resource allocation disappeared during release");
             self.reserved -= record.bytes;
+            self.subtract_class(record.class, record.bytes);
             self.subtract_kind(record.kind, record.bytes);
         }
+    }
+
+    fn reconcile(
+        &mut self,
+        allocation: ResourceAllocationId,
+        actual: ByteLength,
+    ) -> Result<(), ResourceAdmissionError> {
+        if actual.get() == 0 {
+            return Err(ResourceAdmissionError::InvalidBytes);
+        }
+        let (class, kind, reserved) = {
+            let record = self
+                .allocations
+                .get(&allocation)
+                .ok_or(ResourceAdmissionError::AllocationConflict)?;
+            (record.class, record.kind, record.bytes)
+        };
+        if actual.get() == reserved {
+            return Ok(());
+        }
+
+        if actual.get() > reserved {
+            let additional = actual.get() - reserved;
+            let available = self.class_available(class);
+            if additional > available {
+                return Err(ResourceAdmissionError::ReconciliationDenied {
+                    class,
+                    reserved: ByteLength::new(reserved),
+                    actual,
+                    available: ByteLength::new(available),
+                });
+            }
+            self.reserved = self
+                .reserved
+                .checked_add(additional)
+                .ok_or(ResourceAdmissionError::ArithmeticOverflow)?;
+            self.add_class(class, additional)?;
+            self.add_kind(kind, additional)
+                .map_err(|_| ResourceAdmissionError::ArithmeticOverflow)?;
+            self.peak_reserved = self.peak_reserved.max(self.reserved);
+        } else {
+            let released = reserved - actual.get();
+            self.reserved -= released;
+            self.subtract_class(class, released);
+            self.subtract_kind(kind, released);
+        }
+        self.allocations
+            .get_mut(&allocation)
+            .expect("allocation checked above")
+            .bytes = actual.get();
+        Ok(())
     }
 }
 
@@ -267,14 +557,39 @@ impl std::fmt::Debug for ResourceBudget {
 impl ResourceBudget {
     /// Create a non-empty accounting domain with one shared hard ceiling.
     pub fn new(domain: ArenaOwnerId, capacity: ByteLength) -> Result<Self, CoreError> {
+        Self::new_with_protected_capacity(domain, capacity, ByteLength::new(0), ByteLength::new(0))
+    }
+
+    /// Create a budget with independent terminal and retirement capacity.
+    ///
+    /// The protected capacities are part of the supplied total, but ordinary
+    /// work cannot consume them. This makes terminal completion and retirement
+    /// progress possible while the ordinary pool is saturated.
+    pub fn new_with_protected_capacity(
+        domain: ArenaOwnerId,
+        capacity: ByteLength,
+        terminal_capacity: ByteLength,
+        retirement_capacity: ByteLength,
+    ) -> Result<Self, CoreError> {
         if capacity.get() == 0 {
             return Err(CoreError::InvalidId);
+        }
+        let protected = terminal_capacity
+            .get()
+            .checked_add(retirement_capacity.get())
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        if protected > capacity.get() {
+            return Err(CoreError::LimitExceeded);
         }
         Ok(Self {
             ledger: Arc::new(Mutex::new(ResourceLedger {
                 domain,
                 capacity: capacity.get(),
+                terminal_capacity: terminal_capacity.get(),
+                retirement_capacity: retirement_capacity.get(),
                 reserved: 0,
+                terminal_reserved: 0,
+                retirement_reserved: 0,
                 managed: 0,
                 queue: 0,
                 peak_reserved: 0,
@@ -309,26 +624,52 @@ impl ResourceBudget {
         kind: ResourceKind,
         bytes: ByteLength,
     ) -> Result<ResourceLease, CoreError> {
+        self.try_reserve_class(
+            owner,
+            allocation,
+            kind,
+            ResourceReservationClass::Ordinary,
+            bytes,
+        )
+        .map_err(ResourceAdmissionError::into_core_error)
+    }
+
+    /// Reserve capacity from a specific ordinary, terminal, or retirement pool.
+    pub fn try_reserve_class(
+        &self,
+        owner: ArenaOwnerId,
+        allocation: ResourceAllocationId,
+        kind: ResourceKind,
+        class: ResourceReservationClass,
+        bytes: ByteLength,
+    ) -> Result<ResourceLease, ResourceAdmissionError> {
         if bytes.get() == 0 {
-            return Err(CoreError::InvalidId);
+            return Err(ResourceAdmissionError::InvalidBytes);
         }
 
         let mut ledger = self.lock();
         if ledger.allocations.contains_key(&allocation) {
-            return Err(CoreError::OwnershipMismatch);
+            return Err(ResourceAdmissionError::AllocationConflict);
+        }
+        let available = ledger.class_available(class);
+        if bytes.get() > available {
+            return Err(ResourceAdmissionError::CapacityExhausted {
+                class,
+                requested: bytes,
+                available: ByteLength::new(available),
+            });
         }
         let next_active_leases = ledger
             .active_leases
             .checked_add(1)
-            .ok_or(CoreError::ArithmeticOverflow)?;
+            .ok_or(ResourceAdmissionError::ArithmeticOverflow)?;
         let reserved = ledger
             .reserved
             .checked_add(bytes.get())
-            .ok_or(CoreError::ArithmeticOverflow)?;
-        if reserved > ledger.capacity {
-            return Err(CoreError::LimitExceeded);
-        }
-        ledger.add_kind(kind, bytes.get())?;
+            .ok_or(ResourceAdmissionError::ArithmeticOverflow)?;
+        ledger.add_kind(kind, bytes.get())
+            .map_err(|_| ResourceAdmissionError::ArithmeticOverflow)?;
+        ledger.add_class(class, bytes.get())?;
         ledger.reserved = reserved;
         ledger.peak_reserved = ledger.peak_reserved.max(reserved);
         ledger.active_leases = next_active_leases;
@@ -338,6 +679,7 @@ impl ResourceBudget {
             allocation,
             AllocationRecord {
                 kind,
+                class,
                 bytes: bytes.get(),
                 references: 1,
                 owners,
@@ -346,16 +688,45 @@ impl ResourceBudget {
 
         Ok(ResourceLease {
             inner: Arc::new(LeaseInner {
-                info: ResourceLeaseInfo {
-                    domain: ledger.domain,
-                    owner,
-                    allocation,
-                    kind,
-                    bytes,
-                },
+                domain: ledger.domain,
+                owner,
+                allocation,
+                kind,
                 ledger: Arc::clone(&self.ledger),
             }),
         })
+    }
+
+    pub fn try_reserve_terminal(
+        &self,
+        owner: ArenaOwnerId,
+        allocation: ResourceAllocationId,
+        kind: ResourceKind,
+        bytes: ByteLength,
+    ) -> Result<ResourceLease, ResourceAdmissionError> {
+        self.try_reserve_class(
+            owner,
+            allocation,
+            kind,
+            ResourceReservationClass::Terminal,
+            bytes,
+        )
+    }
+
+    pub fn try_reserve_retirement(
+        &self,
+        owner: ArenaOwnerId,
+        allocation: ResourceAllocationId,
+        kind: ResourceKind,
+        bytes: ByteLength,
+    ) -> Result<ResourceLease, ResourceAdmissionError> {
+        self.try_reserve_class(
+            owner,
+            allocation,
+            kind,
+            ResourceReservationClass::Retirement,
+            bytes,
+        )
     }
 
     /// Share an existing allocation through a validated lease capability.
@@ -378,13 +749,10 @@ impl ResourceBudget {
         ledger.add_shared_reference(owner, info.allocation, info.kind, info.bytes.get())?;
         Ok(ResourceLease {
             inner: Arc::new(LeaseInner {
-                info: ResourceLeaseInfo {
-                    domain: ledger.domain,
-                    owner,
-                    allocation: info.allocation,
-                    kind: info.kind,
-                    bytes: info.bytes,
-                },
+                domain: ledger.domain,
+                owner,
+                allocation: info.allocation,
+                kind: info.kind,
                 ledger: Arc::clone(&self.ledger),
             }),
         })
@@ -432,14 +800,30 @@ impl Clone for ResourceLease {
 impl std::fmt::Debug for ResourceLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResourceLease")
-            .field("info", &self.inner.info)
+            .field("info", &self.info())
             .finish()
     }
 }
 
 impl ResourceLease {
     pub fn info(&self) -> ResourceLeaseInfo {
-        self.inner.info
+        let ledger = self
+            .inner
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bytes = ledger
+            .allocations
+            .get(&self.inner.allocation)
+            .expect("resource lease must correspond to an active allocation")
+            .bytes;
+        ResourceLeaseInfo {
+            domain: self.inner.domain,
+            owner: self.inner.owner,
+            allocation: self.inner.allocation,
+            kind: self.inner.kind,
+            bytes: ByteLength::new(bytes),
+        }
     }
 
     /// Read the authoritative accounting while this lease keeps its domain
@@ -452,6 +836,18 @@ impl ResourceLease {
             .accounting()
     }
 
+    /// Reconcile the reservation with the allocation's actual retained
+    /// capacity before publication. Shrinking returns bytes; growing requires
+    /// checked capacity in the same reservation class. A denied growth leaves
+    /// both the lease and every accounting counter unchanged.
+    pub fn reconcile(&self, actual: ByteLength) -> Result<(), ResourceAdmissionError> {
+        self.inner
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reconcile(self.inner.allocation, actual)
+    }
+
     /// Explicitly release this handle. Other clones or owners remain charged.
     pub fn release(self) {
         drop(self);
@@ -459,7 +855,10 @@ impl ResourceLease {
 }
 
 struct LeaseInner {
-    info: ResourceLeaseInfo,
+    domain: ArenaOwnerId,
+    owner: ArenaOwnerId,
+    allocation: ResourceAllocationId,
+    kind: ResourceKind,
     ledger: Arc<Mutex<ResourceLedger>>,
 }
 
@@ -469,6 +868,6 @@ impl Drop for LeaseInner {
             .ledger
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        ledger.remove_reference(self.info.owner, self.info.allocation);
+        ledger.remove_reference(self.owner, self.allocation);
     }
 }

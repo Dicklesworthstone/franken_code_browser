@@ -1,5 +1,9 @@
 use fcb_core::{
-    ArenaOwnerId, ByteLength, CoreError, ResourceAllocationId, ResourceBudget, ResourceKind,
+    resources::{
+        ResourceAcquisitionOrder, ResourceAcquisitionSequence, ResourceAdmissionError,
+        ResourceAllocationId, ResourceBudget, ResourceKind, ResourceReservationClass,
+    },
+    ArenaOwnerId, ByteLength, CoreError,
 };
 
 fn owner(value: u64) -> ArenaOwnerId {
@@ -210,4 +214,188 @@ fn lease_keeps_authoritative_accounting_alive_after_budget_drop() {
     assert_eq!(lease.accounting().reserved().get(), 6);
     assert_eq!(lease.accounting().queue().get(), 6);
     lease.release();
+}
+
+#[test]
+fn protected_terminal_and_retirement_capacity_survive_ordinary_saturation() {
+    let budget = ResourceBudget::new_with_protected_capacity(
+        owner(80),
+        ByteLength::new(10),
+        ByteLength::new(2),
+        ByteLength::new(3),
+    )
+    .unwrap();
+    let ordinary = budget
+        .try_reserve_managed(owner(81), allocation(81), ByteLength::new(5))
+        .unwrap();
+    let terminal = budget
+        .try_reserve_terminal(
+            owner(82),
+            allocation(82),
+            ResourceKind::Queue,
+            ByteLength::new(2),
+        )
+        .unwrap();
+    let retirement = budget
+        .try_reserve_retirement(
+            owner(83),
+            allocation(83),
+            ResourceKind::Managed,
+            ByteLength::new(3),
+        )
+        .unwrap();
+
+    let before = budget.accounting();
+    assert_eq!(before.ordinary_available().get(), 0);
+    assert_eq!(before.terminal_available().get(), 0);
+    assert_eq!(before.retirement_available().get(), 0);
+    assert_eq!(before.terminal_reserved().get(), 2);
+    assert_eq!(before.retirement_reserved().get(), 3);
+    assert!(matches!(
+        budget.try_reserve_managed(owner(84), allocation(84), ByteLength::new(1)),
+        Err(CoreError::LimitExceeded)
+    ));
+    assert_eq!(budget.accounting(), before);
+    assert_eq!(budget.accounting().queue().get(), 2);
+    assert_eq!(budget.accounting().managed().get(), 8);
+
+    drop(ordinary);
+    drop(terminal);
+    drop(retirement);
+    assert_eq!(budget.accounting().reserved().get(), 0);
+    assert_eq!(budget.accounting().protected_reserved().get(), 0);
+}
+
+#[test]
+fn typed_denial_distinguishes_protected_pool_exhaustion() {
+    let budget = ResourceBudget::new_with_protected_capacity(
+        owner(90),
+        ByteLength::new(8),
+        ByteLength::new(1),
+        ByteLength::new(1),
+    )
+    .unwrap();
+    let terminal = budget
+        .try_reserve_terminal(
+            owner(91),
+            allocation(91),
+            ResourceKind::Queue,
+            ByteLength::new(1),
+        )
+        .unwrap();
+    let before = budget.accounting();
+
+    let denial = budget
+        .try_reserve_terminal(
+            owner(92),
+            allocation(92),
+            ResourceKind::Queue,
+            ByteLength::new(1),
+        )
+        .unwrap_err();
+    assert_eq!(
+        denial,
+        ResourceAdmissionError::CapacityExhausted {
+            class: ResourceReservationClass::Terminal,
+            requested: ByteLength::new(1),
+            available: ByteLength::new(0),
+        }
+    );
+    assert_eq!(budget.accounting(), before);
+    drop(terminal);
+
+    let replacement = budget
+        .try_reserve_terminal(
+            owner(92),
+            allocation(92),
+            ResourceKind::Queue,
+            ByteLength::new(1),
+        )
+        .unwrap();
+    drop(replacement);
+}
+
+#[test]
+fn acquisition_sequence_refuses_order_regression_without_mutation() {
+    let budget = ResourceBudget::new(owner(100), ByteLength::new(6)).unwrap();
+    let mut sequence = ResourceAcquisitionSequence::new(owner(101));
+    let first = sequence
+        .try_reserve(
+            &budget,
+            allocation(101),
+            ResourceKind::Managed,
+            ResourceReservationClass::Ordinary,
+            ResourceAcquisitionOrder::Bytes,
+            ByteLength::new(2),
+        )
+        .unwrap();
+    let before = budget.accounting();
+
+    let denial = sequence
+        .try_reserve(
+            &budget,
+            allocation(102),
+            ResourceKind::Queue,
+            ResourceReservationClass::Ordinary,
+            ResourceAcquisitionOrder::Publication,
+            ByteLength::new(2),
+        )
+        .unwrap_err();
+    assert_eq!(
+        denial,
+        ResourceAdmissionError::AcquisitionOrderViolation {
+            held: ResourceAcquisitionOrder::Bytes,
+            requested: ResourceAcquisitionOrder::Publication,
+        }
+    );
+    assert_eq!(budget.accounting(), before);
+    drop(first);
+}
+
+#[test]
+fn reconciliation_returns_capacity_and_rejects_unavailable_growth() {
+    let budget = ResourceBudget::new(owner(110), ByteLength::new(10)).unwrap();
+    let lease = budget
+        .try_reserve_queue_bytes(owner(111), allocation(111), ByteLength::new(4))
+        .unwrap();
+    let blocker = budget
+        .try_reserve_managed(owner(112), allocation(112), ByteLength::new(6))
+        .unwrap();
+    let before = budget.accounting();
+
+    assert_eq!(
+        lease.reconcile(ByteLength::new(5)),
+        Err(ResourceAdmissionError::ReconciliationDenied {
+            class: ResourceReservationClass::Ordinary,
+            reserved: ByteLength::new(4),
+            actual: ByteLength::new(5),
+            available: ByteLength::new(0),
+        })
+    );
+    assert_eq!(budget.accounting(), before);
+    assert_eq!(lease.info().bytes().get(), 4);
+
+    drop(blocker);
+    lease.reconcile(ByteLength::new(2)).unwrap();
+    assert_eq!(lease.info().bytes().get(), 2);
+    assert_eq!(budget.accounting().reserved().get(), 2);
+    assert_eq!(budget.accounting().queue().get(), 2);
+    assert_eq!(budget.accounting().available().get(), 8);
+    assert_eq!(lease.reconcile(ByteLength::new(0)), Err(ResourceAdmissionError::InvalidBytes));
+    assert_eq!(lease.info().bytes().get(), 2);
+    lease.release();
+    assert_eq!(budget.accounting().reserved().get(), 0);
+}
+
+#[test]
+fn protected_capacity_configuration_is_checked_before_budget_creation() {
+    assert!(matches!(
+        ResourceBudget::new_with_protected_capacity(
+            owner(120),
+            ByteLength::new(3),
+            ByteLength::new(2),
+            ByteLength::new(2),
+        ),
+        Err(CoreError::LimitExceeded)
+    ));
 }
