@@ -474,6 +474,12 @@ pub enum SourceError {
     Canceled,
     /// A guaranteed capability was not actually declared.
     UnsupportedGuarantee,
+    /// No retained capture exists for the requested file and revision.
+    CaptureUnavailable,
+    /// The provider would return more bytes than its configured per-response limit.
+    PayloadTooLarge,
+    /// A capture for the same file and revision was already retained.
+    CaptureAlreadyPresent,
 }
 
 impl SourceError {
@@ -487,6 +493,9 @@ impl SourceError {
             Self::RangeAlreadySet => "SOURCE_RANGE_ALREADY_SET",
             Self::Canceled => "SOURCE_CANCELED",
             Self::UnsupportedGuarantee => "SOURCE_UNSUPPORTED_GUARANTEE",
+            Self::CaptureUnavailable => "SOURCE_CAPTURE_UNAVAILABLE",
+            Self::PayloadTooLarge => "SOURCE_PAYLOAD_TOO_LARGE",
+            Self::CaptureAlreadyPresent => "SOURCE_CAPTURE_ALREADY_PRESENT",
         }
     }
 }
@@ -521,6 +530,129 @@ pub trait HostSourceProvider: Send + Sync {
     ) -> Result<CaptureOutcome, SourceError>;
 }
 impl std::error::Error for SourceError {}
+
+/// A deterministic provider for immutable, host-supplied bytes.
+///
+/// The provider is deliberately keyed by the owner-qualified file and source
+/// revision rather than by a path. Hosts grant the corresponding file through
+/// [`SourceGrant`], and every request is checked against both that grant and
+/// this provider's owner before bytes are looked up. A request can select one
+/// checked non-empty range; the returned complete capture contains only that
+/// range. The per-response limit bounds every returned allocation, while a
+/// larger retained capture can still satisfy smaller range requests.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InMemorySourceProvider {
+    owner: ArenaOwnerId,
+    max_payload: ByteLength,
+    captures: std::collections::BTreeMap<(FileId, SourceRevision), Arc<[u8]>>,
+}
+
+impl InMemorySourceProvider {
+    /// Creates an inert provider. A zero limit is allowed and admits only
+    /// empty full captures; non-empty ranges are refused as too large.
+    pub fn new(owner: ArenaOwnerId, max_payload: ByteLength) -> Self {
+        Self {
+            owner,
+            max_payload,
+            captures: std::collections::BTreeMap::new(),
+        }
+    }
+
+    pub const fn owner(&self) -> ArenaOwnerId {
+        self.owner
+    }
+
+    pub const fn max_payload(&self) -> ByteLength {
+        self.max_payload
+    }
+
+    /// Retains one immutable source revision. The owner-qualified identities
+    /// must belong to this provider; inserting a duplicate is refused rather
+    /// than silently replacing a capture under the same identity.
+    pub fn insert(
+        &mut self,
+        file: FileId,
+        revision: SourceRevision,
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Result<(), SourceError> {
+        if file.owner() != self.owner || revision.owner() != self.owner {
+            return Err(SourceError::ForeignOwner);
+        }
+        let key = (file, revision);
+        if self.captures.contains_key(&key) {
+            return Err(SourceError::CaptureAlreadyPresent);
+        }
+        self.captures.insert(key, bytes.into());
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.captures.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.captures.is_empty()
+    }
+
+    pub fn capture(
+        &self,
+        grant: &SourceGrant,
+        request: &CaptureRequest,
+        cancel: &CancelFlag,
+    ) -> Result<CaptureOutcome, SourceError> {
+        <Self as HostSourceProvider>::capture(self, grant, request, cancel)
+    }
+}
+
+impl HostSourceProvider for InMemorySourceProvider {
+    fn guarantees(&self) -> CaptureGuarantees {
+        CaptureGuarantees {
+            consistency: CaptureConsistency::ObservedSequence,
+            ordering: ReadOrdering::StablePerRevision,
+            range_reads: RangeReadSupport::ByteRanges,
+            cancellation: CancellationSupport::Cooperative,
+        }
+    }
+
+    fn capture(
+        &self,
+        grant: &SourceGrant,
+        request: &CaptureRequest,
+        cancel: &CancelFlag,
+    ) -> Result<CaptureOutcome, SourceError> {
+        if request.owner() != self.owner
+            || grant.owner() != self.owner
+            || !grant.admits(request.file())
+        {
+            return Err(SourceError::ForeignOwner);
+        }
+        gate_request_on_cancel(cancel)?;
+
+        let stored = self
+            .captures
+            .get(&(request.file(), request.revision()))
+            .ok_or(SourceError::CaptureUnavailable)?;
+        let bytes: Arc<[u8]> = match request.range() {
+            None => Arc::clone(stored),
+            Some(range) => {
+                let (start, end) = range
+                    .as_usize_bounds()
+                    .map_err(|_| SourceError::RangeOutOfBounds)?;
+                if end > stored.len() {
+                    return Err(SourceError::RangeOutOfBounds);
+                }
+                Arc::from(stored[start..end].to_vec().into_boxed_slice())
+            }
+        };
+        if u64::try_from(bytes.len()).map_err(|_| SourceError::PayloadTooLarge)?
+            > self.max_payload.get()
+        {
+            return Err(SourceError::PayloadTooLarge);
+        }
+        let length = ByteLength::new(bytes.len() as u64);
+        CompleteCapture::new(*request, length, bytes).map(CaptureOutcome::Complete)
+    }
+}
 
 /// Ensures a cancellation is honored before work starts, while a capture
 /// delivered before cancellation stays valid and retained.

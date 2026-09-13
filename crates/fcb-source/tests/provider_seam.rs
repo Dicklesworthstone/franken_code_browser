@@ -7,7 +7,8 @@ use std::sync::Arc;
 use fcb_core::{ArenaOwnerId, ByteLength, ByteOffset, ByteRange, FileId, SourceRevision};
 use fcb_source::{
     gate_request_on_cancel, CancelFlag, CaptureGuarantees, CaptureOutcome, CaptureRequest,
-    CompleteCapture, HostSourceProvider, ObservedRange, SourceError, SourceGrant,
+    CompleteCapture, HostSourceProvider, InMemorySourceProvider, ObservedRange, SourceError,
+    SourceGrant,
 };
 
 fn owner(id: u64) -> ArenaOwnerId {
@@ -23,6 +24,12 @@ fn request_for(owner_id: u64, file_value: u64, start: u64, end: u64) -> CaptureR
     CaptureRequest::new(file(owner_id, file_value), SourceRevision::new(owner_id, 1).unwrap())
         .unwrap()
         .with_range(ByteRange::new(ByteOffset::new(start), ByteOffset::new(end)).unwrap())
+        .unwrap()
+}
+
+fn whole_request(owner_id: u64, file_value: u64) -> CaptureRequest {
+    let owner_id = owner(owner_id);
+    CaptureRequest::new(file(owner_id, file_value), SourceRevision::new(owner_id, 1).unwrap())
         .unwrap()
 }
 
@@ -203,4 +210,76 @@ fn extent_delivery_from_provider_carries_observations_and_holes() {
         assert!(!extent.covers(ByteRange::new(ByteOffset::new(2), ByteOffset::new(6)).unwrap()));
         assert_eq!(extent.holes().len(), 1);
     }
+}
+
+#[test]
+fn in_memory_provider_returns_exact_ranges_and_enforces_response_bound() {
+    let owner_id = owner(79);
+    let file_id = file(owner_id, 11);
+    let revision = SourceRevision::new(owner_id, 1).unwrap();
+    let grant = SourceGrant::new(owner_id).grant(file_id).unwrap();
+    let mut provider = InMemorySourceProvider::new(owner_id, ByteLength::new(4));
+    provider.insert(file_id, revision, b"abcdefghij".to_vec()).unwrap();
+
+    let full = provider.capture(&grant, &whole_request(79, 11), &CancelFlag::new());
+    assert_eq!(full, Err(SourceError::PayloadTooLarge));
+
+    let request = request_for(79, 11, 2, 6);
+    let outcome = provider.capture(&grant, &request, &CancelFlag::new()).unwrap();
+    grant.validate(&outcome).unwrap();
+    match outcome {
+        CaptureOutcome::Complete(capture) => {
+            assert_eq!(capture.bytes(), b"cdef");
+            assert_eq!(capture.request(), &request);
+            assert_eq!(capture.declared_length().get(), 4);
+        }
+        CaptureOutcome::Extent(_) => panic!("in-memory provider returns complete captures"),
+    }
+}
+
+#[test]
+fn in_memory_provider_refuses_missing_foreign_duplicate_and_canceled_requests() {
+    let owner_id = owner(80);
+    let file_id = file(owner_id, 12);
+    let revision = SourceRevision::new(owner_id, 1).unwrap();
+    let grant = SourceGrant::new(owner_id).grant(file_id).unwrap();
+    let mut provider = InMemorySourceProvider::new(owner_id, ByteLength::new(32));
+    provider.insert(file_id, revision, b"available".to_vec()).unwrap();
+    assert_eq!(
+        provider.insert(file_id, revision, b"replacement".to_vec()),
+        Err(SourceError::CaptureAlreadyPresent)
+    );
+
+    let missing = whole_request(80, 13);
+    assert_eq!(
+        provider.capture(&grant, &missing, &CancelFlag::new()),
+        Err(SourceError::CaptureUnavailable)
+    );
+
+    let foreign = whole_request(81, 12);
+    assert_eq!(
+        provider.capture(&grant, &foreign, &CancelFlag::new()),
+        Err(SourceError::ForeignOwner)
+    );
+
+    let canceled = CancelFlag::new();
+    canceled.cancel();
+    assert_eq!(
+        provider.capture(&grant, &whole_request(80, 12), &canceled),
+        Err(SourceError::Canceled)
+    );
+}
+
+#[test]
+fn in_memory_provider_guarantees_are_explicit_and_stable() {
+    let provider = InMemorySourceProvider::new(owner(82), ByteLength::new(8));
+    assert_eq!(
+        provider.guarantees(),
+        CaptureGuarantees {
+            consistency: fcb_source::CaptureConsistency::ObservedSequence,
+            ordering: fcb_source::ReadOrdering::StablePerRevision,
+            range_reads: fcb_source::RangeReadSupport::ByteRanges,
+            cancellation: fcb_source::CancellationSupport::Cooperative,
+        }
+    );
 }
