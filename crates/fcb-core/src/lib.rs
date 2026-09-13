@@ -1,10 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{
-    collections::BTreeSet,
-    marker::PhantomData,
-    sync::{Arc, Mutex, OnceLock},
-};
+use std::{collections::BTreeSet, marker::PhantomData, sync::Arc};
 
 pub mod handles;
 pub mod resources;
@@ -112,26 +108,7 @@ owner_qualified_id!(DisplayGeneration);
 owner_qualified_id!(PresentedFrameId);
 
 pub trait AllocatedId: Copy {
-    /// Whether the raw counter belongs to a process-persistent identity domain.
-    /// Persistent counters are reserved once and cannot be reused by another
-    /// owner, preventing a duplicate persisted identity after allocator loss.
-    const GLOBAL_PERSISTED_COUNTERS: bool = false;
-
     fn from_parts(owner: ArenaOwnerId, value: u64) -> Result<Self, CoreError>;
-}
-
-static PERSISTED_COUNTERS: OnceLock<Mutex<BTreeSet<u64>>> = OnceLock::new();
-
-fn reserve_persisted_counter(value: u64) -> Result<(), CoreError> {
-    let registry = PERSISTED_COUNTERS.get_or_init(|| Mutex::new(BTreeSet::new()));
-    let mut counters = registry
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if counters.insert(value) {
-        Ok(())
-    } else {
-        Err(CoreError::DuplicateId)
-    }
 }
 
 macro_rules! allocated_id {
@@ -158,11 +135,39 @@ allocated_id!(DeviceGeneration);
 allocated_id!(DisplayGeneration);
 allocated_id!(PresentedFrameId);
 
-impl AllocatedId for FileId {
-    const GLOBAL_PERSISTED_COUNTERS: bool = true;
+allocated_id!(FileId);
 
-    fn from_parts(owner: ArenaOwnerId, value: u64) -> Result<Self, CoreError> {
-        Self::new(owner, value)
+/// Receiving authority for persisted owner-qualified identities.
+///
+/// This state is deliberately owned by the logical store or consumer that
+/// receives IDs. It rejects duplicate full identities and IDs from another
+/// owner without conflating equal raw counters from independent owners.
+pub struct PersistedIdAuthority {
+    owner: ArenaOwnerId,
+    accepted: BTreeSet<FileId>,
+}
+
+impl PersistedIdAuthority {
+    pub fn new(owner: ArenaOwnerId) -> Self {
+        Self {
+            owner,
+            accepted: BTreeSet::new(),
+        }
+    }
+
+    pub const fn owner(&self) -> ArenaOwnerId {
+        self.owner
+    }
+
+    pub fn accept(&mut self, id: FileId) -> Result<(), CoreError> {
+        if id.owner() != self.owner {
+            return Err(CoreError::OwnershipMismatch);
+        }
+        if self.accepted.insert(id) {
+            Ok(())
+        } else {
+            Err(CoreError::DuplicateId)
+        }
     }
 }
 
@@ -191,10 +196,22 @@ impl<I: AllocatedId> IdAllocator<I> {
     pub fn allocate(&mut self) -> Result<I, CoreError> {
         let value = self.next.ok_or(CoreError::Exhausted)?;
         self.next = value.checked_add(1);
-        if I::GLOBAL_PERSISTED_COUNTERS {
-            reserve_persisted_counter(value)?;
-        }
         I::from_parts(self.owner, value)
+    }
+
+}
+
+impl IdAllocator<FileId> {
+    pub fn allocate_into(
+        &mut self,
+        authority: &mut PersistedIdAuthority,
+    ) -> Result<FileId, CoreError> {
+        if authority.owner() != self.owner {
+            return Err(CoreError::OwnershipMismatch);
+        }
+        let id = self.allocate()?;
+        authority.accept(id)?;
+        Ok(id)
     }
 }
 

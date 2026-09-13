@@ -1,33 +1,54 @@
 use fcb_core::{
     ArenaOwnerId, CoreError, DisplayGeneration, FileId, IdAllocator, ImmutableSnapshot,
-    PublicationContext, PublicationToken, QueryGeneration, SnapshotCell, SnapshotDelta,
-    SourceRevision,
+    PersistedIdAuthority, PublicationContext, PublicationToken, QueryGeneration, SnapshotCell,
+    SnapshotDelta, SourceRevision,
 };
 
 #[test]
 fn independent_allocators_are_owner_qualified() {
     let owner_a = ArenaOwnerId::new(101).unwrap();
     let owner_b = ArenaOwnerId::new(202).unwrap();
-    let mut allocator_a = IdAllocator::<FileId>::new(owner_a, 5101).unwrap();
-    let mut allocator_b = IdAllocator::<FileId>::new(owner_b, 5102).unwrap();
-    assert_ne!(allocator_a.allocate().unwrap(), allocator_b.allocate().unwrap());
+    let mut allocator_a = IdAllocator::<FileId>::new(owner_a, 1).unwrap();
+    let mut allocator_b = IdAllocator::<FileId>::new(owner_b, 1).unwrap();
+    let file_a = allocator_a.allocate().unwrap();
+    let file_b = allocator_b.allocate().unwrap();
+
+    assert_eq!(file_a.get(), file_b.get());
+    assert_ne!(file_a, file_b);
+    assert_ne!(file_a.owner(), file_b.owner());
 }
 
 #[test]
-fn persisted_counter_collision_across_owners_is_rejected() {
-    let owner_a = ArenaOwnerId::new(203).unwrap();
-    let owner_b = ArenaOwnerId::new(204).unwrap();
-    let mut allocator_a = IdAllocator::<FileId>::new(owner_a, 5201).unwrap();
-    let mut allocator_b = IdAllocator::<FileId>::new(owner_b, 5201).unwrap();
+fn allocator_rejects_invalid_start_and_keeps_full_ids_distinct() {
+    let owner = ArenaOwnerId::new(203).unwrap();
+    assert_eq!(IdAllocator::<FileId>::new(owner, 0), Err(CoreError::InvalidId));
 
-    assert_eq!(allocator_a.allocate().unwrap().get(), 5201);
-    assert_eq!(allocator_b.allocate(), Err(CoreError::DuplicateId));
-    assert_eq!(allocator_b.allocate().unwrap().get(), 5202);
+    let mut allocator = IdAllocator::<FileId>::new(owner, 1).unwrap();
+    let first = allocator.allocate().unwrap();
+    let second = allocator.allocate().unwrap();
+    assert_ne!(first, second);
+    assert_eq!(first.owner(), second.owner());
+    assert_ne!(first.get(), second.get());
+}
+
+#[test]
+fn receiving_authority_rejects_duplicate_full_ids_and_foreign_owner() {
+    let owner_a = ArenaOwnerId::new(204).unwrap();
+    let owner_b = ArenaOwnerId::new(205).unwrap();
+    let mut allocator_a = IdAllocator::<FileId>::new(owner_a, 1).unwrap();
+    let mut authority = PersistedIdAuthority::new(owner_a);
+    let first = allocator_a.allocate_into(&mut authority).unwrap();
+
+    assert_eq!(authority.accept(first), Err(CoreError::DuplicateId));
+    assert_eq!(
+        authority.accept(FileId::new(owner_b, first.get()).unwrap()),
+        Err(CoreError::OwnershipMismatch)
+    );
 }
 
 #[test]
 fn persisted_allocator_retires_at_u64_boundary_without_recycling() {
-    let owner = ArenaOwnerId::new(205).unwrap();
+    let owner = ArenaOwnerId::new(206).unwrap();
     let mut allocator = IdAllocator::<FileId>::new(owner, u64::MAX).unwrap();
 
     assert_eq!(allocator.allocate().unwrap().get(), u64::MAX);
