@@ -62,7 +62,7 @@ fn device_lookup_rejects_foreign_device_and_stale_device_generation() {
     let mut table = DeviceTable::new(owner, device, generation).unwrap();
     let handle = table.insert(99).unwrap();
 
-    let foreign_device = DeviceTable::new(owner, other_device, generation).unwrap();
+    let foreign_device: DeviceTable<u32> = DeviceTable::new(owner, other_device, generation).unwrap();
     assert_eq!(foreign_device.validate(handle), Err(CoreError::OwnershipMismatch));
     let stale_handle = fcb_core::handles::DeviceHandle::new(
         owner,
