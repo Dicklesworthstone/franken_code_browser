@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import subprocess
 import sys
@@ -366,12 +367,62 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--filter-platform")
     parser.add_argument("--no-default-features", action="store_true")
     parser.add_argument("--pretty", action="store_true")
+    parser.add_argument("--extension-ledger")
+    parser.add_argument("--extension-repo", action="append", default=[])
     return parser.parse_args(argv)
+
+
+def _apply_extension_ledger(
+    result: dict[str, Any],
+    ledger_path: Path,
+    repo_specs: list[str],
+) -> dict[str, Any]:
+    """Consume the upstream extension ledger and let it gate qualification.
+
+    A rejected ledger means a landing receipt violates the closure and
+    landing discipline, so a ``qualified`` result is downgraded to
+    ``noncompliant``.  An unverifiable ledger degrades ``qualified`` to
+    ``incomplete``; it never upgrades a failing result.
+    """
+    ledger_path = Path(ledger_path)
+    module_spec = importlib.util.spec_from_file_location(
+        "fcb_extension_ledger", Path(__file__).with_name("extension_ledger.py")
+    )
+    section: dict[str, Any]
+    if module_spec is None or module_spec.loader is None:
+        section = {"verdict": "incomplete", "violations": [], "unverified": [], "parse_error": "extension ledger module unavailable"}
+    else:
+        module = importlib.util.module_from_spec(module_spec)
+        sys.modules[module_spec.name] = module
+        module_spec.loader.exec_module(module)
+        repositories, repo_errors = module.parse_repo_specs(repo_specs)
+        for error in repo_errors:
+            print(error, file=sys.stderr)
+        document, load_error = module.load_ledger(ledger_path)
+        if document is None:
+            section = {
+                "verdict": "incomplete",
+                "violations": [],
+                "unverified": [],
+                "parse_error": load_error,
+                "receipt": {"ledger_digest": module.file_digest(ledger_path)},
+            }
+        else:
+            section = module.evaluate(document, repositories)
+    result["extension_ledger"] = section
+    if section["verdict"] == "rejected" and result["qualification"] == "qualified":
+        result["qualification"] = "noncompliant"
+    elif section["verdict"] == "incomplete" and result["qualification"] == "qualified":
+        result["qualification"] = "incomplete"
+    return result
+
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     result = inspect_roots(args.root, args.allow_origin, args.package, args.feature, args.filter_platform, args.no_default_features)
+    if args.extension_ledger is not None:
+        result = _apply_extension_ledger(result, Path(args.extension_ledger), args.extension_repo)
     print(json.dumps(result, indent=2 if args.pretty else None, sort_keys=True))
     return {"qualified": 0, "noncompliant": 2, "incomplete": 3}.get(result["qualification"], 4)
 
