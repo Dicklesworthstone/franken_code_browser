@@ -103,7 +103,7 @@ pub struct DeviceHandle {
 }
 
 impl DeviceHandle {
-    pub const fn new(
+    pub fn new(
         owner: ArenaOwnerId,
         device: DeviceId,
         device_generation: DeviceGeneration,
