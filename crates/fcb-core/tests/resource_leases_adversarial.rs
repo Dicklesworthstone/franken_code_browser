@@ -53,44 +53,61 @@ fn competing_owners_share_one_capacity_domain_and_reclaim_it() {
 }
 
 #[test]
-fn same_allocation_key_is_charged_once_across_owners() {
+fn duplicate_raw_allocation_id_is_rejected_without_sharing() {
     let budget = ResourceBudget::new(owner(110), ByteLength::new(10)).unwrap();
-    let first = budget
+    let original = budget
         .try_reserve_managed(owner(111), allocation(11), ByteLength::new(7))
         .unwrap();
-    let second = budget
-        .try_reserve_managed(owner(112), allocation(11), ByteLength::new(7))
-        .unwrap();
-
-    let shared = budget.accounting();
-    assert_eq!(shared.reserved().get(), 7);
-    assert_eq!(shared.managed().get(), 7);
-    assert_eq!(shared.active_allocations(), 1);
-    assert_eq!(shared.active_leases(), 2);
+    let before = budget.accounting();
 
     assert_eq!(
-        budget.try_reserve_queue_bytes(owner(113), allocation(11), ByteLength::new(7)),
+        budget.try_reserve_managed(owner(112), allocation(11), ByteLength::new(7)),
         Err(CoreError::OwnershipMismatch)
     );
     assert_eq!(
         budget.try_reserve_managed(owner(113), allocation(11), ByteLength::new(6)),
         Err(CoreError::OwnershipMismatch)
     );
-    assert_eq!(budget.accounting(), shared);
-
-    let distinct = budget
-        .try_reserve_queue_bytes(owner(113), allocation(12), ByteLength::new(3))
-        .unwrap();
-    assert_eq!(budget.accounting().reserved().get(), 10);
-
-    drop(first);
-    assert_eq!(budget.accounting().reserved().get(), 10);
-    assert_eq!(budget.accounting().active_leases(), 2);
-    drop(second);
-    assert_eq!(budget.accounting().reserved().get(), 3);
-    assert_eq!(budget.accounting().active_allocations(), 1);
-    drop(distinct);
+    assert_eq!(
+        budget.try_reserve_queue_bytes(owner(114), allocation(11), ByteLength::new(7)),
+        Err(CoreError::OwnershipMismatch)
+    );
+    assert_eq!(budget.accounting(), before);
+    assert_eq!(original.info().owner(), owner(111));
+    drop(original);
     assert_eq!(budget.accounting().reserved().get(), 0);
+}
+
+#[test]
+fn validated_lease_capability_shares_once_and_survives_budget_drop() {
+    let budget = ResourceBudget::new(owner(115), ByteLength::new(10)).unwrap();
+    let other_budget = ResourceBudget::new(owner(115), ByteLength::new(10)).unwrap();
+    let original = budget
+        .try_reserve_managed(owner(116), allocation(16), ByteLength::new(7))
+        .unwrap();
+    let shared = budget.try_share(owner(117), &original).unwrap();
+
+    let sharing = original.accounting();
+    assert_eq!(sharing.reserved().get(), 7);
+    assert_eq!(sharing.managed().get(), 7);
+    assert_eq!(sharing.active_allocations(), 1);
+    assert_eq!(sharing.active_leases(), 2);
+    assert_eq!(shared.info().owner(), owner(117));
+    assert_eq!(shared.info().allocation(), allocation(16));
+
+    assert_eq!(
+        other_budget.try_share(owner(118), &original),
+        Err(CoreError::OwnershipMismatch)
+    );
+    assert_eq!(other_budget.accounting().reserved().get(), 0);
+
+    drop(budget);
+    assert_eq!(original.accounting().reserved().get(), 7);
+    drop(original);
+    assert_eq!(shared.accounting().reserved().get(), 7);
+    assert_eq!(shared.accounting().active_leases(), 1);
+    shared.release();
+    assert_eq!(other_budget.accounting().reserved().get(), 0);
 }
 
 #[test]
