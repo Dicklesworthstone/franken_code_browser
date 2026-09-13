@@ -2,6 +2,15 @@
 
 use std::{marker::PhantomData, sync::Arc};
 
+pub mod handles;
+pub mod resources;
+
+pub use handles::{ArenaHandle, ArenaTable, DeviceHandle, DeviceTable, HandleLimits};
+pub use resources::{
+    ResourceAccounting, ResourceAllocationId, ResourceBudget, ResourceKind, ResourceLease,
+    ResourceLeaseInfo,
+};
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ArenaOwnerId(u64);
 
