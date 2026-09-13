@@ -1,0 +1,12 @@
+[package]
+name = "fcb-test-support"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+name = "fcb_test_support"
+path = "src/lib.rs"
+
+[dependencies]
