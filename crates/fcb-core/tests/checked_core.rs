@@ -8,9 +8,30 @@ use fcb_core::{
 fn independent_allocators_are_owner_qualified() {
     let owner_a = ArenaOwnerId::new(101).unwrap();
     let owner_b = ArenaOwnerId::new(202).unwrap();
-    let mut allocator_a = IdAllocator::<FileId>::new(owner_a, 1).unwrap();
-    let mut allocator_b = IdAllocator::<FileId>::new(owner_b, 1).unwrap();
+    let mut allocator_a = IdAllocator::<FileId>::new(owner_a, 5101).unwrap();
+    let mut allocator_b = IdAllocator::<FileId>::new(owner_b, 5102).unwrap();
     assert_ne!(allocator_a.allocate().unwrap(), allocator_b.allocate().unwrap());
+}
+
+#[test]
+fn persisted_counter_collision_across_owners_is_rejected() {
+    let owner_a = ArenaOwnerId::new(203).unwrap();
+    let owner_b = ArenaOwnerId::new(204).unwrap();
+    let mut allocator_a = IdAllocator::<FileId>::new(owner_a, 5201).unwrap();
+    let mut allocator_b = IdAllocator::<FileId>::new(owner_b, 5201).unwrap();
+
+    assert_eq!(allocator_a.allocate().unwrap().get(), 5201);
+    assert_eq!(allocator_b.allocate(), Err(CoreError::DuplicateId));
+    assert_eq!(allocator_b.allocate().unwrap().get(), 5202);
+}
+
+#[test]
+fn persisted_allocator_retires_at_u64_boundary_without_recycling() {
+    let owner = ArenaOwnerId::new(205).unwrap();
+    let mut allocator = IdAllocator::<FileId>::new(owner, u64::MAX).unwrap();
+
+    assert_eq!(allocator.allocate().unwrap().get(), u64::MAX);
+    assert_eq!(allocator.allocate(), Err(CoreError::Exhausted));
 }
 
 #[test]

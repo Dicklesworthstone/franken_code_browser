@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 
-use std::{marker::PhantomData, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    marker::PhantomData,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 pub mod handles;
 pub mod resources;
@@ -23,6 +27,7 @@ pub enum CoreError {
     ArithmeticUnderflow,
     LimitExceeded,
     Exhausted,
+    DuplicateId,
     OwnershipMismatch,
     StalePublication,
     StaleRequestGeneration,
@@ -39,6 +44,7 @@ impl CoreError {
             Self::ArithmeticUnderflow => "ARITHMETIC_UNDERFLOW",
             Self::LimitExceeded => "LIMIT_EXCEEDED",
             Self::Exhausted => "IDENTITY_EXHAUSTED",
+            Self::DuplicateId => "DUPLICATE_ID",
             Self::OwnershipMismatch => "OWNERSHIP_MISMATCH",
             Self::StalePublication => "STALE_PUBLICATION",
             Self::StaleRequestGeneration => "STALE_REQUEST_GENERATION",
@@ -106,7 +112,26 @@ owner_qualified_id!(DisplayGeneration);
 owner_qualified_id!(PresentedFrameId);
 
 pub trait AllocatedId: Copy {
+    /// Whether the raw counter belongs to a process-persistent identity domain.
+    /// Persistent counters are reserved once and cannot be reused by another
+    /// owner, preventing a duplicate persisted identity after allocator loss.
+    const GLOBAL_PERSISTED_COUNTERS: bool = false;
+
     fn from_parts(owner: ArenaOwnerId, value: u64) -> Result<Self, CoreError>;
+}
+
+static PERSISTED_COUNTERS: OnceLock<Mutex<BTreeSet<u64>>> = OnceLock::new();
+
+fn reserve_persisted_counter(value: u64) -> Result<(), CoreError> {
+    let registry = PERSISTED_COUNTERS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let mut counters = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if counters.insert(value) {
+        Ok(())
+    } else {
+        Err(CoreError::DuplicateId)
+    }
 }
 
 macro_rules! allocated_id {
@@ -122,7 +147,6 @@ macro_rules! allocated_id {
 allocated_id!(BrowserInstanceId);
 allocated_id!(WorkspaceId);
 allocated_id!(RootId);
-allocated_id!(FileId);
 allocated_id!(SourceRevision);
 allocated_id!(CaptureExtentId);
 allocated_id!(AnalysisRevision);
@@ -133,6 +157,14 @@ allocated_id!(DeviceId);
 allocated_id!(DeviceGeneration);
 allocated_id!(DisplayGeneration);
 allocated_id!(PresentedFrameId);
+
+impl AllocatedId for FileId {
+    const GLOBAL_PERSISTED_COUNTERS: bool = true;
+
+    fn from_parts(owner: ArenaOwnerId, value: u64) -> Result<Self, CoreError> {
+        Self::new(owner, value)
+    }
+}
 
 pub struct IdAllocator<I> {
     owner: ArenaOwnerId,
@@ -159,6 +191,9 @@ impl<I: AllocatedId> IdAllocator<I> {
     pub fn allocate(&mut self) -> Result<I, CoreError> {
         let value = self.next.ok_or(CoreError::Exhausted)?;
         self.next = value.checked_add(1);
+        if I::GLOBAL_PERSISTED_COUNTERS {
+            reserve_persisted_counter(value)?;
+        }
         I::from_parts(self.owner, value)
     }
 }
