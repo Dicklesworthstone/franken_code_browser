@@ -173,6 +173,52 @@ fn priority_meet_and_fairness_survive_motion_flood() {
 }
 
 #[test]
+fn wake_requests_preserve_maximum_priority_until_acknowledged() {
+    use WakePriority::{Background, Normal, Urgent};
+    // An explicit oracle detects last-wins, first-wins, and minimum-priority
+    // mutations without deriving the answer from the production meet method.
+    for (first, second, expected) in [
+        (Background, Background, Background),
+        (Background, Normal, Normal),
+        (Background, Urgent, Urgent),
+        (Normal, Background, Normal),
+        (Normal, Normal, Normal),
+        (Normal, Urgent, Urgent),
+        (Urgent, Background, Urgent),
+        (Urgent, Normal, Urgent),
+        (Urgent, Urgent, Urgent),
+    ] {
+        let probe = WakeProbe::new(capacity(1));
+        assert_eq!(probe.request_wake(first).unwrap(), 1);
+        assert_eq!(probe.request_wake(second).unwrap(), 2);
+        let status = probe.status().unwrap();
+        assert!(status.wake_pending);
+        assert_eq!(status.priority, expected, "requests: {first:?}, {second:?}");
+        let batch = probe.take(1).unwrap();
+        assert_eq!(batch.priority(), expected);
+        assert_eq!(probe.acknowledge(batch).unwrap(), WakeReset::Reset);
+        assert!(!probe.status().unwrap().wake_pending);
+        // Retired urgency must not leak into a subsequent wake cycle.
+        probe.request_wake(Background).unwrap();
+        assert_eq!(probe.status().unwrap().priority, Background);
+    }
+}
+
+#[test]
+fn background_payloads_cannot_downgrade_an_urgent_wake() {
+    let probe = WakeProbe::new(capacity(1));
+    probe.request_wake(WakePriority::Urgent).unwrap();
+    probe.publish_ordered(WakeCommand { id: 1, payload: 7 }, WakePriority::Background).unwrap();
+    assert_eq!(probe.status().unwrap().priority, WakePriority::Urgent);
+    probe.publish_motion(MotionUpdate { sequence: 1, value: 9 }, WakePriority::Background).unwrap();
+    let batch = probe.take(1).unwrap();
+    assert_eq!(batch.priority(), WakePriority::Urgent);
+    assert_eq!(batch.ordered(), &[WakeCommand { id: 1, payload: 7 }]);
+    assert_eq!(batch.motion(), Some(MotionUpdate { sequence: 1, value: 9 }));
+    assert_eq!(probe.acknowledge(batch).unwrap(), WakeReset::Reset);
+}
+
+#[test]
 fn duration_is_not_an_absolute_deadline_and_domain_errors_are_preserved() {
     let clock_domain = domain(41);
     let start = MonotonicTimestamp::new(clock_domain, 100);
