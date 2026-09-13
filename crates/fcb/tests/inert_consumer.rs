@@ -88,20 +88,30 @@ fn public_consumer_exposes_boundary_refusals() {
 }
 
 #[test]
-fn all_compiled_feature_flags_still_refuse_unimplemented_capabilities() {
+fn all_feature_selection_keeps_unimplemented_capabilities_unavailable() {
     let owner = ArenaOwnerId::new(404).expect("non-zero owner");
     let session = BrowserSession::new(owner);
+    let available = session.available_features();
 
     for feature in Feature::ALL {
-        let expected = if feature == Feature::MacosMetal && !cfg!(target_os = "macos") {
-            FcbError::UnsupportedTarget
+        let target_supported = feature != Feature::MacosMetal || cfg!(target_os = "macos");
+        let expected = if !target_supported {
+            Err(FcbError::UnsupportedTarget)
+        } else if feature.implemented() {
+            Ok(())
         } else {
-            FcbError::FeatureUnavailable
+            Err(FcbError::FeatureUnavailable)
         };
         assert_eq!(
             session.require_feature(feature),
-            Err(expected),
-            "feature {} must not advertise an empty implementation",
+            expected,
+            "feature {} must agree with its implementation status",
+            feature.name()
+        );
+        assert_eq!(
+            available.contains(feature),
+            feature.implemented() && target_supported,
+            "feature {} availability must not be inferred from Cargo selection",
             feature.name()
         );
     }
