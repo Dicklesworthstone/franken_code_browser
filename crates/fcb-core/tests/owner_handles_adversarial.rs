@@ -11,7 +11,7 @@ fn equal_slot_generation_from_two_same_owner_tables_cannot_alias() {
     let second_handle = second.insert("second").unwrap();
     assert_eq!(first_handle.slot(), second_handle.slot());
     assert_eq!(first_handle.generation(), second_handle.generation());
-    assert_eq!(first_handle, second_handle);
+    assert_ne!(first_handle, second_handle);
 
     assert_eq!(first.lookup(first_handle), Ok(&"first"));
     assert_eq!(second.lookup(second_handle), Ok(&"second"));
@@ -28,7 +28,7 @@ fn dropping_and_recreating_same_owner_table_does_not_resurrect_handle() {
 
     let mut recreated = ArenaTable::new(owner);
     let recreated_handle = recreated.insert(23).unwrap();
-    assert_eq!(retired_handle, recreated_handle);
+    assert_ne!(retired_handle, recreated_handle);
     assert_eq!(recreated.lookup(retired_handle), Err(CoreError::OwnershipMismatch));
     assert_eq!(recreated.lookup(recreated_handle), Ok(&23));
 }
@@ -45,7 +45,7 @@ fn equal_slot_generation_from_two_same_device_tables_cannot_alias() {
     let second_handle = second.insert("second-device").unwrap();
     assert_eq!(first_handle.slot(), second_handle.slot());
     assert_eq!(first_handle.generation(), second_handle.generation());
-    assert_eq!(first_handle, second_handle);
+    assert_ne!(first_handle, second_handle);
 
     assert_eq!(first.lookup(first_handle), Ok(&"first-device"));
     assert_eq!(second.lookup(second_handle), Ok(&"second-device"));
