@@ -174,17 +174,17 @@ fn priority_meet_and_fairness_survive_motion_flood() {
 
 #[test]
 fn duration_is_not_an_absolute_deadline_and_domain_errors_are_preserved() {
-    let domain = domain(41);
-    let start = MonotonicTimestamp::new(domain, 100);
+    let clock_domain = domain(41);
+    let start = MonotonicTimestamp::new(clock_domain, 100);
     let deadline = deadline_after(start, Duration::from_nanos(25)).expect("duration is checked");
     assert_eq!(
-        deadline_state(&deadline, MonotonicTimestamp::new(domain, 110)).expect("same domain"),
+        deadline_state(&deadline, MonotonicTimestamp::new(clock_domain, 110)).expect("same domain"),
         DeadlineState::Active {
             remaining: Duration::from_nanos(15)
         }
     );
     assert_eq!(
-        deadline_state(&deadline, MonotonicTimestamp::new(domain, 130)).expect("expired state"),
+        deadline_state(&deadline, MonotonicTimestamp::new(clock_domain, 130)).expect("expired state"),
         DeadlineState::Expired {
             ago: Duration::from_nanos(5)
         }

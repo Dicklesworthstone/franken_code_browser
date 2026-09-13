@@ -251,8 +251,16 @@ fn in_memory_provider_refuses_missing_foreign_duplicate_and_canceled_requests() 
     );
 
     let missing = whole_request(80, 13);
+    // Authorization precedes lookup, even when the requested content is absent.
     assert_eq!(
         provider.capture(&grant, &missing, &CancelFlag::new()),
+        Err(SourceError::ForeignOwner)
+    );
+    let missing_grant = SourceGrant::new(owner_id)
+        .grant(file(owner_id, 13))
+        .unwrap();
+    assert_eq!(
+        provider.capture(&missing_grant, &missing, &CancelFlag::new()),
         Err(SourceError::CaptureUnavailable)
     );
 
