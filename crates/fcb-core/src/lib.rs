@@ -103,7 +103,7 @@ macro_rules! owner_qualified_id {
             }
 
             pub const fn validate_for(self, owner: ArenaOwnerId) -> Result<(), CoreError> {
-                if self.owner == owner {
+                if self.owner.get() == owner.get() {
                     Ok(())
                 } else {
                     Err(CoreError::OwnershipMismatch)
