@@ -29,6 +29,21 @@ pub enum ContractError {
     MissingSandboxBoundary,
 }
 
+impl std::fmt::Display for ContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongEdition => f.write_str("wrong edition"),
+            Self::UndatedToolchain => f.write_str("undated toolchain"),
+            Self::WrongTarget => f.write_str("wrong target"),
+            Self::WrongDeploymentTarget => f.write_str("wrong deployment target"),
+            Self::WrongSdk => f.write_str("wrong sdk"),
+            Self::MissingSandboxBoundary => f.write_str("missing sandbox boundary"),
+        }
+    }
+}
+
+impl std::error::Error for ContractError {}
+
 pub fn validate_contract(contract: PlatformContract) -> Result<(), ContractError> {
     if contract.edition != "2024" {
         return Err(ContractError::WrongEdition);

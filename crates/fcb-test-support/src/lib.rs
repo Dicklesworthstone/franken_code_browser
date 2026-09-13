@@ -371,6 +371,20 @@ pub enum ScanError {
     OffsetOutsideInput,
 }
 
+impl fmt::Display for ScanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyNeedle => f.write_str("empty needle"),
+            Self::InputTooLarge => f.write_str("input too large"),
+            Self::OffsetOverflow => f.write_str("offset overflow"),
+            Self::TooManyLines => f.write_str("too many lines"),
+            Self::OffsetOutsideInput => f.write_str("offset outside input"),
+        }
+    }
+}
+
+impl std::error::Error for ScanError {}
+
 /// Straightforward overlapping byte scan over one captured byte sequence.
 pub fn reference_byte_scan(
     input: &[u8],
@@ -475,6 +489,19 @@ pub enum MinimizeError {
     InitialDefectMismatch,
 }
 
+impl fmt::Display for MinimizeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyInput => f.write_str("empty input"),
+            Self::InputTooLarge => f.write_str("input too large"),
+            Self::BudgetExhausted => f.write_str("budget exhausted"),
+            Self::InitialDefectMismatch => f.write_str("initial defect mismatch"),
+        }
+    }
+}
+
+impl std::error::Error for MinimizeError {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Minimization {
     pub input: Vec<u8>,
@@ -552,6 +579,19 @@ pub enum GraphError {
     Cycle,
 }
 
+impl fmt::Display for GraphError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooManyNodes => f.write_str("too many nodes"),
+            Self::NodeOutOfBounds => f.write_str("node out of bounds"),
+            Self::DuplicateEdge => f.write_str("duplicate edge"),
+            Self::Cycle => f.write_str("graph cycle detected"),
+        }
+    }
+}
+
+impl std::error::Error for GraphError {}
+
 /// Deterministic Kahn topological order with the smallest ready node first.
 pub fn reference_topological_order(
     node_count: usize,
@@ -604,6 +644,18 @@ pub enum LayoutError {
     ArithmeticOverflow,
 }
 
+impl fmt::Display for LayoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooManyItems => f.write_str("too many items"),
+            Self::ZeroTotalWeight => f.write_str("zero total weight"),
+            Self::ArithmeticOverflow => f.write_str("arithmetic overflow"),
+        }
+    }
+}
+
+impl std::error::Error for LayoutError {}
+
 /// A small integer reference layout: stable horizontal slices proportional
 /// to weights, with the final slice receiving the exact remaining width.
 pub fn reference_layout(weights: &[u64], width: u64, height: u64) -> Result<Vec<Rect>, LayoutError> {
@@ -622,10 +674,8 @@ pub fn reference_layout(weights: &[u64], width: u64, height: u64) -> Result<Vec<
         let slice_width = if index + 1 == weights.len() {
             width.checked_sub(x).ok_or(LayoutError::ArithmeticOverflow)?
         } else {
-            width
-                .checked_mul(weight)
-                .ok_or(LayoutError::ArithmeticOverflow)?
-                / total
+            let prod = (width as u128) * (weight as u128);
+            (prod / (total as u128)) as u64
         };
         result.push(Rect {
             x,
@@ -651,6 +701,16 @@ pub enum Outcome {
 pub enum ReceiptError {
     AttemptsTooLarge,
 }
+
+impl fmt::Display for ReceiptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AttemptsTooLarge => f.write_str("attempts count too large"),
+        }
+    }
+}
+
+impl std::error::Error for ReceiptError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Receipt {

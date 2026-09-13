@@ -399,3 +399,44 @@ fn protected_capacity_configuration_is_checked_before_budget_creation() {
         Err(CoreError::LimitExceeded)
     ));
 }
+
+#[test]
+fn resource_admission_error_implements_display_and_error() {
+    use std::error::Error;
+    let err = ResourceAdmissionError::InvalidBytes;
+    assert_eq!(format!("{err}"), "invalid resource byte length");
+    let trait_obj: &dyn Error = &err;
+    assert_eq!(trait_obj.to_string(), "invalid resource byte length");
+
+    let conflict = ResourceAdmissionError::AllocationConflict;
+    assert_eq!(format!("{conflict}"), "resource allocation conflict");
+
+    let overflow = ResourceAdmissionError::ArithmeticOverflow;
+    assert_eq!(format!("{overflow}"), "resource accounting arithmetic overflow");
+}
+
+#[test]
+fn try_share_succeeds_after_reconciliation_changes_allocated_bytes() {
+    let budget = ResourceBudget::new(owner(130), ByteLength::new(20)).unwrap();
+    let lease = budget
+        .try_reserve_managed(owner(131), allocation(131), ByteLength::new(10))
+        .unwrap();
+
+    // Reconcile changes the lease's allocated bytes from 10 to 4.
+    lease.reconcile(ByteLength::new(4)).unwrap();
+    assert_eq!(lease.info().bytes().get(), 4);
+
+    // Sharing the reconciled lease with another owner must succeed seamlessly.
+    let shared = budget.try_share(owner(132), &lease).unwrap();
+    assert_eq!(shared.info().bytes().get(), 4);
+    assert_eq!(budget.accounting().active_leases(), 2);
+    assert_eq!(budget.accounting().reserved().get(), 4);
+
+    drop(lease);
+    assert_eq!(budget.accounting().active_leases(), 1);
+    assert_eq!(budget.accounting().reserved().get(), 4);
+
+    drop(shared);
+    assert_eq!(budget.accounting().active_leases(), 0);
+    assert_eq!(budget.accounting().reserved().get(), 0);
+}

@@ -173,6 +173,7 @@ pub enum FcbError {
     UnsupportedTarget,
     CaptureTooLarge,
     HostServicesUnavailable,
+    IdentityExhausted,
 }
 
 impl FcbError {
@@ -187,6 +188,7 @@ impl FcbError {
             Self::UnsupportedTarget => "UNSUPPORTED_TARGET",
             Self::CaptureTooLarge => "CAPTURE_TOO_LARGE",
             Self::HostServicesUnavailable => "HOST_SERVICES_UNAVAILABLE",
+            Self::IdentityExhausted => "IDENTITY_EXHAUSTED",
         }
     }
 }
@@ -198,6 +200,17 @@ impl fmt::Display for FcbError {
 }
 
 impl std::error::Error for FcbError {}
+
+impl From<CoreError> for FcbError {
+    fn from(error: CoreError) -> Self {
+        match error {
+            CoreError::OwnershipMismatch => Self::OwnerMismatch,
+            CoreError::Exhausted => Self::IdentityExhausted,
+            CoreError::LimitExceeded | CoreError::ArithmeticOverflow => Self::CaptureTooLarge,
+            _ => Self::OwnerMismatch,
+        }
+    }
+}
 
 /// A host request that the facade may forward only when the host explicitly
 /// supplies services and the consumer explicitly asks for it.
@@ -336,11 +349,11 @@ impl MemorySourceProvider {
         let file = self
             .files_next
             .allocate()
-            .map_err(|_| FcbError::OwnerMismatch)?;
+            .map_err(FcbError::from)?;
         let revision = self
             .revisions_next
             .allocate()
-            .map_err(|_| FcbError::OwnerMismatch)?;
+            .map_err(FcbError::from)?;
         let capture =
             SourceCapture::from_bytes(self.owner, file, revision, logical_path.clone(), bytes)?;
         self.files.insert(logical_path, capture);
@@ -461,7 +474,7 @@ impl BrowserSession {
     }
 
     pub fn require_feature(&self, feature: Feature) -> Result<(), FcbError> {
-        if feature == Feature::MacosMetal && !cfg!(target_os = "macos") {
+        if !feature.target_supported() {
             return Err(FcbError::UnsupportedTarget);
         }
         if feature.implemented() {
@@ -615,5 +628,14 @@ mod tests {
         assert_eq!(session.require_feature(Feature::Source), Ok(()));
         assert_eq!(session.require_feature(Feature::View), Ok(()));
         assert_eq!(session.require_feature(Feature::MacosMetal), Err(if cfg!(target_os = "macos") { FcbError::FeatureUnavailable } else { FcbError::UnsupportedTarget }));
+    }
+
+    #[test]
+    fn core_error_conversions_and_codes_are_consistent() {
+        assert_eq!(FcbError::IdentityExhausted.code(), "IDENTITY_EXHAUSTED");
+        assert_eq!(FcbError::from(CoreError::Exhausted), FcbError::IdentityExhausted);
+        assert_eq!(FcbError::from(CoreError::OwnershipMismatch), FcbError::OwnerMismatch);
+        assert_eq!(FcbError::from(CoreError::LimitExceeded), FcbError::CaptureTooLarge);
+        assert_eq!(FcbError::from(CoreError::ArithmeticOverflow), FcbError::CaptureTooLarge);
     }
 }

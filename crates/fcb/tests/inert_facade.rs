@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use fcb::{
     ArenaOwnerId, BrowserSession, FcbError, Feature, FeatureSet, FileId, MemorySourceProvider,
-    SourceCapture, SourceProvider, SourceRevision,
+    SourceCapture, SourceRevision,
 };
 
 const COMPILE_TIME_AVAILABLE: FeatureSet = FeatureSet::available();

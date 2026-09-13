@@ -12,6 +12,7 @@
 //! [`FixedEventRing::overflow_summary`].
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
@@ -57,6 +58,33 @@ impl TracingError {
         }
     }
 }
+
+impl fmt::Display for TracingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TimestampOverflow => formatter.write_str("timestamp overflow"),
+            Self::TimestampUnderflow => formatter.write_str("timestamp underflow"),
+            Self::InvalidDuration => formatter.write_str("invalid duration"),
+            Self::DomainMismatch { expected, actual } => {
+                write!(
+                    formatter,
+                    "clock domain mismatch: expected domain {}, got domain {}",
+                    expected.get(),
+                    actual.get()
+                )
+            }
+            Self::RingFull { capacity, dropped_total } => {
+                write!(
+                    formatter,
+                    "trace event ring full (capacity {capacity}, total dropped {dropped_total})"
+                )
+            }
+            Self::SequenceExhausted => formatter.write_str("trace sequence space exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for TracingError {}
 
 /// A reading on one clock domain's monotonic timeline, in nanoseconds.
 ///
@@ -122,7 +150,13 @@ impl MonotonicTimestamp {
         adapter: &DomainOffset,
         target: ClockDomainId,
     ) -> Result<Self, TracingError> {
-        if adapter.source != self.domain || adapter.target != target {
+        if adapter.source != self.domain {
+            return Err(TracingError::DomainMismatch {
+                expected: adapter.source,
+                actual: self.domain,
+            });
+        }
+        if adapter.target != target {
             return Err(TracingError::DomainMismatch {
                 expected: adapter.target,
                 actual: target,

@@ -147,3 +147,37 @@ fn receipts_cover_outcomes_and_redaction_without_losing_measurements() {
         Err(ReceiptError::AttemptsTooLarge)
     );
 }
+
+#[test]
+fn test_support_errors_implement_display_and_error() {
+    use std::error::Error;
+
+    let scan_err = ScanError::EmptyNeedle;
+    assert_eq!(format!("{scan_err}"), "empty needle");
+    let obj: &dyn Error = &scan_err;
+    assert_eq!(obj.to_string(), "empty needle");
+
+    let min_err = MinimizeError::BudgetExhausted;
+    assert_eq!(format!("{min_err}"), "budget exhausted");
+
+    let graph_err = GraphError::Cycle;
+    assert_eq!(format!("{graph_err}"), "graph cycle detected");
+
+    let layout_err = LayoutError::TooManyItems;
+    assert_eq!(format!("{layout_err}"), "too many items");
+
+    let receipt_err = ReceiptError::AttemptsTooLarge;
+    assert_eq!(format!("{receipt_err}"), "attempts count too large");
+}
+
+#[test]
+fn reference_layout_handles_large_weights_without_premature_overflow() {
+    // width * weight would overflow u64 if computed in 64-bit: 1_000_000_000 * 30_000_000_000 = 3e19 > u64::MAX (~1.84e19)
+    let weights = [30_000_000_000_u64, 30_000_000_000_u64];
+    let width = 1_000_000_000_u64;
+    let layout = reference_layout(&weights, width, 10).unwrap();
+    assert_eq!(layout.len(), 2);
+    assert_eq!(layout[0].width, 500_000_000);
+    assert_eq!(layout[1].width, 500_000_000);
+    assert_eq!(layout[1].x, 500_000_000);
+}

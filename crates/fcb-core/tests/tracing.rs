@@ -203,3 +203,39 @@ fn backward_movement_stays_on_domain_timeline() {
         "the domain epoch is a valid reading"
     );
 }
+
+#[test]
+fn tracing_error_implements_display_and_error() {
+    use std::error::Error;
+    let err = TracingError::TimestampOverflow;
+    assert_eq!(format!("{err}"), "timestamp overflow");
+    let trait_obj: &dyn Error = &err;
+    assert_eq!(trait_obj.to_string(), "timestamp overflow");
+
+    let d_err = TracingError::DomainMismatch {
+        expected: domain(7, 1),
+        actual: domain(7, 2),
+    };
+    assert_eq!(
+        format!("{d_err}"),
+        "clock domain mismatch: expected domain 1, got domain 2"
+    );
+}
+
+#[test]
+fn convert_to_identifies_source_domain_mismatch_specifically() {
+    let d1 = domain(7, 1);
+    let d2 = domain(7, 2);
+    let d3 = domain(7, 3);
+    let adapter = DomainOffset::new(d1, d2, 10).unwrap();
+
+    // Timestamp from domain 3 passed to adapter mapping from domain 1
+    let reading_d3 = MonotonicTimestamp::new(d3, 100);
+    assert_eq!(
+        reading_d3.convert_to(&adapter, d2),
+        Err(TracingError::DomainMismatch {
+            expected: d1,
+            actual: d3,
+        })
+    );
+}

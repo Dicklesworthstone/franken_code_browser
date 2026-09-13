@@ -9,6 +9,7 @@
 
 use std::{
     collections::BTreeMap,
+    fmt,
     sync::{Arc, Mutex},
 };
 
@@ -121,6 +122,41 @@ impl ResourceAdmissionError {
         }
     }
 }
+
+impl fmt::Display for ResourceAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidBytes => formatter.write_str("invalid resource byte length"),
+            Self::AllocationConflict => formatter.write_str("resource allocation conflict"),
+            Self::CapacityExhausted { class, requested, available } => {
+                write!(
+                    formatter,
+                    "resource capacity exhausted for class {class:?}: requested {} bytes, available {} bytes",
+                    requested.get(),
+                    available.get()
+                )
+            }
+            Self::AcquisitionOrderViolation { held, requested } => {
+                write!(
+                    formatter,
+                    "resource acquisition order violation: held {held:?}, requested {requested:?}"
+                )
+            }
+            Self::ReconciliationDenied { class, reserved, actual, available } => {
+                write!(
+                    formatter,
+                    "resource reconciliation denied for class {class:?}: reserved {} bytes, actual {} bytes, available {} bytes",
+                    reserved.get(),
+                    actual.get(),
+                    available.get()
+                )
+            }
+            Self::ArithmeticOverflow => formatter.write_str("resource accounting arithmetic overflow"),
+        }
+    }
+}
+
+impl std::error::Error for ResourceAdmissionError {}
 
 /// A per-operation acquisition cursor enforcing the global resource order.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -428,7 +464,6 @@ impl ResourceLedger {
         owner: ArenaOwnerId,
         allocation: ResourceAllocationId,
         kind: ResourceKind,
-        bytes: u64,
     ) -> Result<(), CoreError> {
         let next_active_leases = self
             .active_leases
@@ -438,7 +473,7 @@ impl ResourceLedger {
             .allocations
             .get_mut(&allocation)
             .ok_or(CoreError::OwnershipMismatch)?;
-        if record.kind != kind || record.bytes != bytes {
+        if record.kind != kind {
             return Err(CoreError::OwnershipMismatch);
         }
         let next_references = record
@@ -518,13 +553,57 @@ impl ResourceLedger {
                     available: ByteLength::new(available),
                 });
             }
-            self.reserved = self
+            let next_reserved = self
                 .reserved
                 .checked_add(additional)
                 .ok_or(ResourceAdmissionError::ArithmeticOverflow)?;
-            self.add_class(class, additional)?;
-            self.add_kind(kind, additional)
-                .map_err(|_| ResourceAdmissionError::ArithmeticOverflow)?;
+            let next_terminal = match class {
+                ResourceReservationClass::Terminal => Some(
+                    self.terminal_reserved
+                        .checked_add(additional)
+                        .ok_or(ResourceAdmissionError::ArithmeticOverflow)?,
+                ),
+                _ => None,
+            };
+            let next_retirement = match class {
+                ResourceReservationClass::Retirement => Some(
+                    self.retirement_reserved
+                        .checked_add(additional)
+                        .ok_or(ResourceAdmissionError::ArithmeticOverflow)?,
+                ),
+                _ => None,
+            };
+            let (next_managed, next_queue) = match kind {
+                ResourceKind::Managed => (
+                    Some(
+                        self.managed
+                            .checked_add(additional)
+                            .ok_or(ResourceAdmissionError::ArithmeticOverflow)?,
+                    ),
+                    None,
+                ),
+                ResourceKind::Queue => (
+                    None,
+                    Some(
+                        self.queue
+                            .checked_add(additional)
+                            .ok_or(ResourceAdmissionError::ArithmeticOverflow)?,
+                    ),
+                ),
+            };
+            self.reserved = next_reserved;
+            if let Some(terminal) = next_terminal {
+                self.terminal_reserved = terminal;
+            }
+            if let Some(retirement) = next_retirement {
+                self.retirement_reserved = retirement;
+            }
+            if let Some(managed) = next_managed {
+                self.managed = managed;
+            }
+            if let Some(queue) = next_queue {
+                self.queue = queue;
+            }
             self.peak_reserved = self.peak_reserved.max(self.reserved);
         } else {
             let released = reserved - actual.get();
@@ -744,15 +823,16 @@ impl ResourceBudget {
         if !Arc::ptr_eq(&self.ledger, &source.inner.ledger) {
             return Err(CoreError::OwnershipMismatch);
         }
-        let info = source.info();
+        let allocation = source.inner.allocation;
+        let kind = source.inner.kind;
         let mut ledger = self.lock();
-        ledger.add_shared_reference(owner, info.allocation, info.kind, info.bytes.get())?;
+        ledger.add_shared_reference(owner, allocation, kind)?;
         Ok(ResourceLease {
             inner: Arc::new(LeaseInner {
                 domain: ledger.domain,
                 owner,
-                allocation: info.allocation,
-                kind: info.kind,
+                allocation,
+                kind,
                 ledger: Arc::clone(&self.ledger),
             }),
         })

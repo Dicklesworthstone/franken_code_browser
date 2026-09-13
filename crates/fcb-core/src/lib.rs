@@ -63,6 +63,14 @@ impl CoreError {
     }
 }
 
+impl std::fmt::Display for CoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+impl std::error::Error for CoreError {}
+
 impl ArenaOwnerId {
     pub const fn new(value: u64) -> Result<Self, CoreError> {
         if value == 0 {
@@ -162,6 +170,8 @@ allocated_id!(DeviceId);
 allocated_id!(DeviceGeneration);
 allocated_id!(DisplayGeneration);
 allocated_id!(PresentedFrameId);
+allocated_id!(SemanticNodeId);
+allocated_id!(ClockDomainId);
 
 allocated_id!(FileId);
 
@@ -196,6 +206,18 @@ impl PersistedIdAuthority {
         } else {
             Err(CoreError::DuplicateId)
         }
+    }
+
+    pub fn contains(&self, id: FileId) -> bool {
+        self.accepted.contains(&id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.accepted.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.accepted.is_empty()
     }
 }
 
@@ -461,6 +483,10 @@ impl ByteLength {
     pub const fn get(self) -> u64 {
         self.0
     }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -527,6 +553,10 @@ impl<O: Copy + Ord> OffsetRange<O> {
 
     pub const fn end(self) -> O {
         self.end
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.start == self.end
     }
 
     pub fn checked_within(self, limit: O) -> Result<Self, CoreError> {
@@ -978,5 +1008,44 @@ mod tests {
         delta.push("change").unwrap();
         assert_eq!(delta.push("overflow"), Err(CoreError::LimitExceeded));
         assert_eq!(delta.items(), &["change"]);
+    }
+
+    #[test]
+    fn core_error_implements_display_and_std_error() {
+        use std::error::Error;
+        let err = CoreError::InvalidId;
+        assert_eq!(format!("{err}"), "INVALID_ID");
+        let trait_obj: &dyn Error = &err;
+        assert_eq!(trait_obj.to_string(), "INVALID_ID");
+    }
+
+    #[test]
+    fn persisted_id_authority_query_methods_are_accurate() {
+        let owner = ArenaOwnerId::new(51).unwrap();
+        let mut authority = PersistedIdAuthority::new(owner);
+        assert!(authority.is_empty());
+        assert_eq!(authority.len(), 0);
+
+        let id = FileId::new(owner, 10).unwrap();
+        assert!(!authority.contains(id));
+
+        authority.accept(id).unwrap();
+        assert!(!authority.is_empty());
+        assert_eq!(authority.len(), 1);
+        assert!(authority.contains(id));
+    }
+
+    #[test]
+    fn range_and_byte_length_is_empty_are_consistent() {
+        assert!(ByteLength::new(0).is_empty());
+        assert!(!ByteLength::new(1).is_empty());
+
+        let empty_range = ByteRange::new(ByteOffset::new(5), ByteOffset::new(5)).unwrap();
+        assert!(empty_range.is_empty());
+        assert_eq!(empty_range.len().get(), 0);
+
+        let non_empty = ByteRange::new(ByteOffset::new(5), ByteOffset::new(10)).unwrap();
+        assert!(!non_empty.is_empty());
+        assert_eq!(non_empty.len().get(), 5);
     }
 }

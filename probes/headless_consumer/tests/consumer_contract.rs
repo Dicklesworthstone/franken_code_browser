@@ -37,3 +37,15 @@ fn consumer_rejects_an_undated_nightly() {
     let invalid = PlatformContract { toolchain: "nightly", ..SELECTED_CONTRACT };
     assert_eq!(validate_contract(invalid), Err(ContractError::UndatedToolchain));
 }
+
+#[test]
+fn contract_error_implements_display_and_error() {
+    use std::error::Error;
+    let err = ContractError::WrongEdition;
+    assert_eq!(format!("{err}"), "wrong edition");
+    let obj: &dyn Error = &err;
+    assert_eq!(obj.to_string(), "wrong edition");
+
+    let sdk_err = ContractError::WrongSdk;
+    assert_eq!(format!("{sdk_err}"), "wrong sdk");
+}
