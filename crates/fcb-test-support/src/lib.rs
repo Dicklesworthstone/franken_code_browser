@@ -8,6 +8,7 @@
 //! oracles use straightforward algorithms so an optimized consumer cannot
 //! accidentally prove itself against the same implementation.
 
+pub mod receipts;
 use std::fmt;
 
 pub const GENERATOR_VERSION: &str = "fcb-corpus-1";
