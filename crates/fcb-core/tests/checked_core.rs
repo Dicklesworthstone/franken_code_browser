@@ -21,7 +21,10 @@ fn independent_allocators_are_owner_qualified() {
 #[test]
 fn allocator_rejects_invalid_start_and_keeps_full_ids_distinct() {
     let owner = ArenaOwnerId::new(203).unwrap();
-    assert_eq!(IdAllocator::<FileId>::new(owner, 0), Err(CoreError::InvalidId));
+    assert!(matches!(
+        IdAllocator::<FileId>::new(owner, 0),
+        Err(CoreError::InvalidId)
+    ));
 
     let mut allocator = IdAllocator::<FileId>::new(owner, 1).unwrap();
     let first = allocator.allocate().unwrap();
