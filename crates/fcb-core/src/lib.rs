@@ -8,6 +8,7 @@ use std::{
 
 pub mod handles;
 pub mod resources;
+pub mod tracing;
 
 pub use handles::{ArenaHandle, ArenaTable, DeviceHandle, DeviceTable, HandleLimits};
 pub use resources::{
@@ -127,6 +128,7 @@ owner_qualified_id!(DeviceGeneration);
 owner_qualified_id!(DisplayGeneration);
 owner_qualified_id!(PresentedFrameId);
 owner_qualified_id!(SemanticNodeId);
+owner_qualified_id!(ClockDomainId);
 
 /// Compatibility name for integrations that refer to semantic nodes as
 /// stable nodes. The owner-qualified ID is the stable identity; tree position
