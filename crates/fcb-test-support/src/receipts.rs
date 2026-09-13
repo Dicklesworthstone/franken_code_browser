@@ -202,6 +202,16 @@ impl BoundedText {
             original_bytes: original,
         }
     }
+    /// Bound text that has already been redacted while recording
+    /// `original_bytes` as the caller-visible length from before redaction.
+    /// Redaction and bounding may both shrink the retained text; the count
+    /// must still tell the truth about how many bytes arrived.
+    pub fn from_redacted_with_original(text: &str, original_bytes: u64) -> Self {
+        let mut bounded = Self::from_redacted(text);
+        bounded.original_bytes = original_bytes;
+        bounded
+    }
+
 
     pub fn text(&self) -> &str {
         &self.text
@@ -266,7 +276,8 @@ impl EventRing {
 
     pub fn push(&mut self, redactor: &Redactor, message: &str) {
         let redacted = redactor.redact(message);
-        let bounded = BoundedText::from_redacted(&redacted);
+        let bounded =
+            BoundedText::from_redacted_with_original(&redacted, message.len() as u64);
         let sequence = self.next_sequence;
         self.next_sequence += 1;
         if self.capacity > 0 && self.events.len() == self.capacity {
@@ -313,12 +324,17 @@ pub struct ExpectedVsActual {
     expected: BoundedText,
     actual: BoundedText,
 }
-
 impl ExpectedVsActual {
     pub fn new(redactor: &Redactor, expected: &str, actual: &str) -> Self {
         Self {
-            expected: BoundedText::from_redacted(&redactor.redact(expected)),
-            actual: BoundedText::from_redacted(&redactor.redact(actual)),
+            expected: BoundedText::from_redacted_with_original(
+                &redactor.redact(expected),
+                expected.len() as u64,
+            ),
+            actual: BoundedText::from_redacted_with_original(
+                &redactor.redact(actual),
+                actual.len() as u64,
+            ),
         }
     }
 
@@ -602,6 +618,7 @@ impl ScenarioReceipt {
         ));
         match &self.comparison {
             Some(comparison) => {
+                out.push_str("comparison:present\n");
                 out.push_str(&length_field(
                     "comparison_expected",
                     comparison.expected.text(),
