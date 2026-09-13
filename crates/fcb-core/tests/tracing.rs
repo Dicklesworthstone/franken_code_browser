@@ -156,6 +156,17 @@ fn domain_adapters_are_pair_verified_and_checked() {
         })
     );
 
+    // A reading whose SOURCE domain is not the adapter's source is refused
+    // with the adapter's source as the expected domain (source-side check).
+    let foreign_source = MonotonicTimestamp::new(unrelated_domain, 1_000);
+    assert_eq!(
+        foreign_source.convert_to(&adapter, target_domain),
+        Err(TracingError::DomainMismatch {
+            expected: source_domain,
+            actual: unrelated_domain
+        })
+    );
+
     // Same-domain adapters are rejected at construction.
     assert_eq!(
         DomainOffset::new(source_domain, source_domain, 0),
