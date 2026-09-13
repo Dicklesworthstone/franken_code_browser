@@ -63,12 +63,22 @@ impl Feature {
         }
     }
 
+    /// Whether this facade revision has a concrete implementation for the
+    /// capability. Cargo feature selection alone never changes this answer.
+    pub const fn implemented(self) -> bool {
+        matches!(self, Self::Source | Self::View)
+    }
+
     const fn bit(self) -> u16 {
         1 << (self as u16)
     }
 }
 
-/// The optional capabilities compiled into this facade instance.
+/// The Cargo feature flags selected for this facade instance.
+///
+/// This is deliberately distinct from [`FeatureSet::available`]: a feature
+/// flag may be selected before its implementation lands and must not become a
+/// false capability claim.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct FeatureSet(u16);
 
@@ -83,6 +93,24 @@ impl FeatureSet {
         while index < Feature::ALL.len() {
             let feature = Feature::ALL[index];
             if feature.compiled() {
+                bits |= feature.bit();
+            }
+            index += 1;
+        }
+        Self(bits)
+    }
+
+    /// The capabilities implemented by this facade revision and usable on the
+    /// current target. Source capture and renderer-neutral views are the
+    /// concrete baseline; future profiles remain unavailable until implemented.
+    pub const fn available() -> Self {
+        let mut bits = 0;
+        let mut index = 0;
+        while index < Feature::ALL.len() {
+            let feature = Feature::ALL[index];
+            if feature.implemented()
+                && (feature != Feature::MacosMetal || cfg!(target_os = "macos"))
+            {
                 bits |= feature.bit();
             }
             index += 1;
@@ -213,8 +241,11 @@ fn valid_logical_path(path: &str) -> bool {
     !path.is_empty() && !path.as_bytes().contains(&0)
 }
 
-/// A source provider is an explicit host dependency.  Implementations own
-/// their storage and may not assume that the facade grants filesystem access.
+/// A source provider is an explicit host dependency. Implementations own their
+/// storage and may not assume that the facade grants filesystem access. Calls
+/// and destruction of a user-supplied provider may have host-defined side
+/// effects; the facade never invokes `capture` during session construction or
+/// fabricates a promise that arbitrary provider drops are inert.
 pub trait SourceProvider: Send + Sync {
     fn capture(&self, logical_path: &str) -> Result<SourceCapture, FcbError>;
 }
@@ -285,8 +316,10 @@ impl SourceProvider for MemorySourceProvider {
     }
 }
 
-/// The host-facing inert session.  Construction, use, and drop perform no
-/// thread, runtime, environment, filesystem, or GUI acquisition.
+/// The host-facing inert session. Its own construction, source lookup request,
+/// and drop perform no thread, runtime, environment, filesystem, or GUI
+/// acquisition. User-supplied provider calls and drop behavior remain under
+/// the provider's explicit host contract.
 pub struct BrowserSession {
     owner: ArenaOwnerId,
     provider: Option<Arc<dyn SourceProvider>>,
@@ -325,11 +358,15 @@ impl BrowserSession {
         FeatureSet::compiled()
     }
 
+    pub const fn available_features(&self) -> FeatureSet {
+        FeatureSet::available()
+    }
+
     pub fn require_feature(&self, feature: Feature) -> Result<(), FcbError> {
         if feature == Feature::MacosMetal && !cfg!(target_os = "macos") {
             return Err(FcbError::UnsupportedTarget);
         }
-        if feature.compiled() {
+        if feature.implemented() {
             Ok(())
         } else {
             Err(FcbError::FeatureUnavailable)
@@ -371,6 +408,7 @@ impl BrowserView {
     pub fn frame_plan(&self) -> Result<FramePlan, FcbError> {
         Ok(FramePlan {
             owner: self.capture.owner(),
+            file: self.capture.file(),
             source: self.capture.revision(),
             bytes: self.capture.byte_range()?,
         })
@@ -378,9 +416,13 @@ impl BrowserView {
 }
 
 /// Renderer-neutral plan for the complete captured byte extent.
+///
+/// File identity is carried separately from source revision: a revision value
+/// may repeat across files in one owner domain without aliasing their frames.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FramePlan {
     owner: ArenaOwnerId,
+    file: FileId,
     source: SourceRevision,
     bytes: ByteRange,
 }
@@ -388,6 +430,10 @@ pub struct FramePlan {
 impl FramePlan {
     pub const fn owner(self) -> ArenaOwnerId {
         self.owner
+    }
+
+    pub const fn file(self) -> FileId {
+        self.file
     }
 
     pub const fn source(self) -> SourceRevision {
@@ -430,6 +476,9 @@ mod tests {
     #[test]
     fn default_features_are_empty_but_in_memory_facade_is_useful() {
         assert!(FeatureSet::compiled().is_empty());
+        assert!(FeatureSet::available().contains(Feature::Source));
+        assert!(FeatureSet::available().contains(Feature::View));
+        assert!(!FeatureSet::available().contains(Feature::Search));
         let owner = ArenaOwnerId::new(1).unwrap();
         let mut provider = MemorySourceProvider::new(owner).unwrap();
         provider.insert("src/lib.rs", b"fn main() {}".to_vec()).unwrap();
@@ -461,6 +510,12 @@ mod tests {
         let owner = ArenaOwnerId::new(3).unwrap();
         let session = BrowserSession::new(owner);
         assert_eq!(session.require_feature(Feature::Search), Err(FcbError::FeatureUnavailable));
+        assert_eq!(session.require_feature(Feature::Map), Err(FcbError::FeatureUnavailable));
+        assert_eq!(session.require_feature(Feature::Markdown), Err(FcbError::FeatureUnavailable));
+        assert_eq!(session.require_feature(Feature::Runtime), Err(FcbError::FeatureUnavailable));
+        assert_eq!(session.require_feature(Feature::Persistence), Err(FcbError::FeatureUnavailable));
+        assert_eq!(session.require_feature(Feature::Source), Ok(()));
+        assert_eq!(session.require_feature(Feature::View), Ok(()));
         assert_eq!(session.require_feature(Feature::MacosMetal), Err(if cfg!(target_os = "macos") { FcbError::FeatureUnavailable } else { FcbError::UnsupportedTarget }));
     }
 }

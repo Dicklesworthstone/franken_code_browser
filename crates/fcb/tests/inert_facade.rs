@@ -68,4 +68,48 @@ fn feature_union_reports_only_compile_selected_capabilities() {
     for feature in Feature::ALL {
         assert_eq!(compiled.contains(feature), feature.compiled());
     }
+
+    let available = FeatureSet::available();
+    assert!(available.contains(Feature::Source));
+    assert!(available.contains(Feature::View));
+    for feature in [
+        Feature::Search,
+        Feature::Map,
+        Feature::Markdown,
+        Feature::Runtime,
+        Feature::Persistence,
+    ] {
+        assert!(!available.contains(feature));
+        assert_eq!(BrowserSession::new(ArenaOwnerId::new(505).unwrap()).require_feature(feature), Err(FcbError::FeatureUnavailable));
+    }
+}
+
+#[test]
+fn frame_identity_keeps_equal_revisions_for_distinct_files_separate() {
+    let owner = ArenaOwnerId::new(606).unwrap();
+    let revision = SourceRevision::new(owner, 9).unwrap();
+    let first = SourceCapture::from_bytes(
+        owner,
+        FileId::new(owner, 1).unwrap(),
+        revision,
+        "first.rs",
+        b"same revision".to_vec(),
+    )
+    .unwrap();
+    let second = SourceCapture::from_bytes(
+        owner,
+        FileId::new(owner, 2).unwrap(),
+        revision,
+        "second.rs",
+        b"same revision".to_vec(),
+    )
+    .unwrap();
+    let session = BrowserSession::new(owner);
+    let first_plan = session.open_capture(first).unwrap().frame_plan().unwrap();
+    let second_plan = session.open_capture(second).unwrap().frame_plan().unwrap();
+    assert_eq!(first_plan.owner(), second_plan.owner());
+    assert_eq!(first_plan.source(), second_plan.source());
+    assert_eq!(first_plan.bytes(), second_plan.bytes());
+    assert_ne!(first_plan.file(), second_plan.file());
+    assert_ne!(first_plan, second_plan);
 }
