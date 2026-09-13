@@ -73,6 +73,21 @@ impl ContentDigest {
         }
         output
     }
+
+    /// Parse the 32-hex-character form produced by [`Self::hex`].
+    pub fn from_hex(text: &str) -> Option<Self> {
+        let bytes = text.as_bytes();
+        if bytes.len() != 32 {
+            return None;
+        }
+        let mut decoded = [0_u8; 16];
+        for (index, pair) in bytes.chunks_exact(2).enumerate() {
+            let high = (pair[0] as char).to_digit(16)?;
+            let low = (pair[1] as char).to_digit(16)?;
+            decoded[index] = ((high << 4) | low) as u8;
+        }
+        Some(Self(decoded))
+    }
 }
 
 impl fmt::Display for ContentDigest {

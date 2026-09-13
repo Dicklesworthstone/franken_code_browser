@@ -1,125 +1,76 @@
 //! Shared bounded scenario-receipt infrastructure (fcb-wc0g).
 //!
-//! A scenario receipt is an evidence record for a test or probe run: identity
-//! (scenario, seed, pin, route), a bounded redacted event ring, an optional
-//! expected-vs-actual failure record, and a terminal exit/outcome record.
-//! Receipt generation never declares qualification itself: a receipt is input
-//! for an independent verifier, never a capability claim.
+//! A scenario receipt is an evidence record for one test or probe run:
+//! identity (scenario, seed, source pin, route), the corpus identity it ran
+//! against, a saturation-bounded redacted event ring, an optional
+//! expected-vs-actual comparison, artifact references, and the terminal
+//! outcome (effect, optional exit code, optional unexecuted reason).
 //!
-//! Bounded by construction: every text field is truncated to a fixed budget,
-//! the event ring saturates by dropping the oldest entries (the drop count is
-//! preserved), and the encoded stream is capped with the terminal record kept
-//! intact. The terminal record is the last line, prefixed with its payload
-//! length, so truncation of the middle can never destroy the verdict; a
-//! destroyed terminal record decodes to missing evidence, never to a
-//! fabricated one.
+//! Receipt generation never declares qualification itself: a receipt records
+//! what happened and carries the evidence; mapping a receipt to a pass/fail
+//! verdict belongs to an independent verifier.
+//!
+//! Bounded by construction: every string is redacted through the scenario
+//! [`Redactor`] before storage, [`BoundedText`] keeps the newest
+//! [`MAX_FIELD_BYTES`] bytes on a character boundary (truncation flags and
+//! original sizes are preserved truthfully), the event ring drops its oldest
+//! events at capacity while keeping exact counters, and
+//! [`ScenarioReceipt::from_draft`] retains the newest [`RECEIPT_MAX_EVENTS`]
+//! events. The codec is line-oriented and canonical: `decode(encode(x)) ==
+//! x`, re-encoding is byte-identical, and a foreign or truncated stream
+//! yields a typed error instead of an invented verdict.
 
-use std::fmt;
 use std::collections::VecDeque;
+use std::fmt;
 
-/// Fixed budgets. Chosen so a fully saturated receipt stays well under one
-/// small page and can never grow with flood input.
-pub const MAX_SCENARIO_LEN: usize = 64;
-pub const MAX_ID_LEN: usize = 64;
-pub const MAX_EVENT_BYTES: usize = 512;
-pub const MAX_FAILURE_TEXT: usize = 512;
-pub const MAX_RING_CAPACITY: usize = 4096;
-pub const MAX_SENTINELS: usize = 64;
-pub const MAX_SENTINEL_LEN: usize = 256;
-pub const MAX_RECEIPT_BYTES: usize = 64 * 1024;
-/// Upper bound reserved for the encoded terminal line when sizing the event
-/// section. The real terminal line is always shorter than this.
-const TERMINAL_LINE_RESERVE: usize = 8192;
-/// Replacement marker written wherever a registered secret sentinel appears.
-pub const REDACTION: &str = "[REDACTED]";
-/// Suffix appended to text truncated at a budget boundary.
-pub const TRUNCATION_SUFFIX: &str = "~";
+use crate::ContentDigest;
 
-/// Whether text was truncated, and the saturated original length.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Truncated {
-    pub truncated: bool,
-    pub original_len: u64,
-}
+/// Schema tag carried as the first line of every encoded receipt.
+pub const RECEIPT_SCHEMA: &str = "fcb.receipt.v1";
+/// Marker written wherever a registered sentinel appears.
+pub const REDACTED_TOKEN: &str = "[REDACTED]";
+/// Byte budget for any single stored text field.
+pub const MAX_FIELD_BYTES: usize = 1024;
+/// Longest sentinel the redactor accepts.
+pub const MAX_SENTINEL_BYTES: usize = 256;
+/// Events retained per receipt; older events are summarized, not stored.
+pub const RECEIPT_MAX_EVENTS: usize = 256;
+/// Default live-ring capacity.
+pub const DEFAULT_RING_CAPACITY: usize = 64;
+/// Upper bound on identifiers (source pins are exactly 40 bytes).
+pub const MAX_ID_BYTES: usize = 128;
 
-/// Text truncated to `max_bytes` on a UTF-8 character boundary with a
-/// [`TRUNCATION_SUFFIX`] marker appended when truncation occurred.
+/// A commit-shaped source identity: exactly 40 lowercase hex bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BoundedText {
-    text: String,
-    meta: Truncated,
-}
-
-impl BoundedText {
-    pub fn new(text: &str, max_bytes: usize) -> Self {
-        if text.len() <= max_bytes {
-            return Self {
-                text: text.to_string(),
-                meta: Truncated {
-                    truncated: false,
-                    original_len: text.len() as u64,
-                },
-            };
-        }
-        let mut cut = max_bytes.saturating_sub(TRUNCATION_SUFFIX.len());
-        while cut > 0 && !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        let mut bounded = String::with_capacity(cut + TRUNCATION_SUFFIX.len());
-        bounded.push_str(&text[..cut]);
-        bounded.push_str(TRUNCATION_SUFFIX);
-        Self {
-            text: bounded,
-            meta: Truncated {
-                truncated: true,
-                original_len: text.len() as u64,
-            },
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.text
-    }
-
-    pub const fn meta(&self) -> Truncated {
-        self.meta
-    }
-}
-
-/// Bounded identifier: non-empty, at most [`MAX_ID_LEN`] bytes, and free of
-/// control characters so it cannot forge extra lines in the encoding.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BoundedId(String);
+pub struct SourcePin(String);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IdError {
-    Empty,
-    TooLong,
-    ControlCharacter,
+pub enum PinError {
+    WrongLength,
+    NotHex,
 }
 
-impl fmt::Display for IdError {
+impl fmt::Display for PinError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Empty => f.write_str("identifier is empty"),
-            Self::TooLong => f.write_str("identifier exceeds the byte budget"),
-            Self::ControlCharacter => f.write_str("identifier contains a control character"),
+            Self::WrongLength => f.write_str("source pin must be exactly 40 bytes"),
+            Self::NotHex => f.write_str("source pin must be lowercase hex"),
         }
     }
 }
 
-impl std::error::Error for IdError {}
+impl std::error::Error for PinError {}
 
-impl BoundedId {
-    pub fn new(text: &str) -> Result<Self, IdError> {
-        if text.is_empty() {
-            return Err(IdError::Empty);
+impl SourcePin {
+    pub fn new(text: &str) -> Result<Self, PinError> {
+        if text.len() != 40 {
+            return Err(PinError::WrongLength);
         }
-        if text.len() > MAX_ID_LEN {
-            return Err(IdError::TooLong);
-        }
-        if text.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
-            return Err(IdError::ControlCharacter);
+        if !text
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(PinError::NotHex);
         }
         Ok(Self(text.to_string()))
     }
@@ -129,163 +80,208 @@ impl BoundedId {
     }
 }
 
-/// Registered secret sentinels. Every event, failure record, and identifier
-/// passes through [`SecretSentinels::redact`] before it can enter a receipt;
-/// occurrences of any registered sentinel are replaced with [`REDACTION`] and
-/// counted.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct SecretSentinels {
-    sentinels: Vec<String>,
-}
+/// A bounded execution-route label: non-empty, at most
+/// [`MAX_ID_BYTES`], free of spaces and control characters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteId(String);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SentinelError {
-    TooMany,
-    SentinelTooLong,
+pub enum RouteError {
+    Empty,
+    TooLong,
+    InvalidCharacter,
 }
 
-impl fmt::Display for SentinelError {
+impl fmt::Display for RouteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TooMany => f.write_str("too many secret sentinels"),
-            Self::SentinelTooLong => f.write_str("secret sentinel exceeds the byte budget"),
+            Self::Empty => f.write_str("route identifier is empty"),
+            Self::TooLong => f.write_str("route identifier exceeds the byte budget"),
+            Self::InvalidCharacter => f.write_str("route identifier contains a forbidden byte"),
         }
     }
 }
 
-impl std::error::Error for SentinelError {}
+impl std::error::Error for RouteError {}
 
-impl SecretSentinels {
+impl RouteId {
+    pub fn new(text: &str) -> Result<Self, RouteError> {
+        if text.is_empty() {
+            return Err(RouteError::Empty);
+        }
+        if text.len() > MAX_ID_BYTES {
+            return Err(RouteError::TooLong);
+        }
+        if text.bytes().any(|byte| byte == b' ' || byte < 0x20 || byte == 0x7f) {
+            return Err(RouteError::InvalidCharacter);
+        }
+        Ok(Self(text.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Deterministic scenario seed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct ScenarioSeed(pub u64);
+
+/// Secret-sentinel redactor. Registered sentinels are replaced with
+/// [`REDACTED_TOKEN`] wherever text enters a receipt; an empty sentinel is
+/// accepted but ignored (it cannot match anything safely).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Redactor {
+    sentinels: Vec<String>,
+}
+
+impl Redactor {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn register(&mut self, sentinel: &str) -> Result<(), SentinelError> {
-        if sentinel.is_empty() || sentinel.len() > MAX_SENTINEL_LEN {
-            return Err(SentinelError::SentinelTooLong);
+    /// Builder-style registration. Empty sentinels are ignored.
+    pub fn with_sentinel(mut self, sentinel: &str) -> Self {
+        if !sentinel.is_empty() && sentinel.len() <= MAX_SENTINEL_BYTES {
+            self.sentinels.push(sentinel.to_string());
         }
-        if self.sentinels.len() >= MAX_SENTINELS {
-            return Err(SentinelError::TooMany);
-        }
-        self.sentinels.push(sentinel.to_string());
-        Ok(())
+        self
     }
 
-    /// Replace every occurrence of every registered sentinel, longest first so
-    /// overlapping sentinels redact maximally. Returns the redacted text and
-    /// the number of replacements made.
-    pub fn redact(&self, text: &str) -> (String, u64) {
+    /// Replace every registered-sentinel occurrence, longest first. Returns
+    /// the redacted text.
+    pub fn redact(&self, text: &str) -> String {
         let mut ordered: Vec<&String> = self.sentinels.iter().collect();
         ordered.sort_by_key(|sentinel| std::cmp::Reverse(sentinel.len()));
         let mut out = text.to_string();
-        let mut replacements = 0_u64;
         for sentinel in ordered {
             let mut start = 0;
             while let Some(found) = out[start..].find(sentinel.as_str()) {
                 let at = start + found;
-                out.replace_range(at..at + sentinel.len(), REDACTION);
-                replacements += 1;
-                start = at + REDACTION.len();
+                out.replace_range(at..at + sentinel.len(), REDACTED_TOKEN);
+                start = at + REDACTED_TOKEN.len();
                 if start > out.len() {
                     break;
                 }
             }
         }
-        (out, replacements)
+        out
     }
 }
 
-/// Class of a recorded event.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EventKind {
-    Note,
-    ExpectedActual,
-    Metric,
+/// Text already through the redactor, bounded to [`MAX_FIELD_BYTES`] bytes.
+///
+/// Truncation keeps the newest bytes (the tail) on a UTF-8 character
+/// boundary: recent evidence survives, the truncation flag is set, and the
+/// original byte count is preserved exactly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundedText {
+    text: String,
+    truncated: bool,
+    original_bytes: u64,
 }
 
-impl EventKind {
-    const fn tag(self) -> &'static str {
-        match self {
-            Self::Note => "N",
-            Self::ExpectedActual => "EA",
-            Self::Metric => "M",
+impl BoundedText {
+    /// Bound text that has already been redacted.
+    pub fn from_redacted(text: &str) -> Self {
+        let original = text.len() as u64;
+        if text.len() <= MAX_FIELD_BYTES {
+            return Self {
+                text: text.to_string(),
+                truncated: false,
+                original_bytes: original,
+            };
+        }
+        let mut start = text.len() - MAX_FIELD_BYTES;
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        Self {
+            text: text[start..].to_string(),
+            truncated: true,
+            original_bytes: original,
         }
     }
 
-    fn from_tag(tag: &str) -> Option<Self> {
-        match tag {
-            "N" => Some(Self::Note),
-            "EA" => Some(Self::ExpectedActual),
-            "M" => Some(Self::Metric),
-            _ => None,
-        }
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    pub const fn original_bytes(&self) -> u64 {
+        self.original_bytes
     }
 }
 
-/// Saturation-bounded ring of redacted events. Pushing beyond capacity drops
-/// the oldest event and counts the drop; the ring itself never grows.
+/// One retained ring event: its ring-assigned sequence, the bounded message,
+/// and truthful truncation metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Event {
+    sequence: u64,
+    message: BoundedText,
+}
+
+impl Event {
+    pub fn message(&self) -> &str {
+        self.message.text()
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub const fn truncated(&self) -> bool {
+        self.message.truncated()
+    }
+
+    pub const fn original_bytes(&self) -> u64 {
+        self.message.original_bytes()
+    }
+}
+
+/// Saturation-bounded ring of redacted events. At capacity, the oldest event
+/// is dropped and [`Self::dropped`] counts it; sequence numbers keep the
+/// full-history position of every retained event.
 #[derive(Clone, Debug)]
-pub struct RedactedEventRing {
+pub struct EventRing {
     capacity: usize,
-    events: VecDeque<(EventKind, BoundedText)>,
-    total_pushed: u64,
+    next_sequence: u64,
     dropped: u64,
-    secrets_redacted: u64,
+    events: VecDeque<Event>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RingError {
-    CapacityOutOfBounds,
-}
-
-impl fmt::Display for RingError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CapacityOutOfBounds => f.write_str("ring capacity outside the bounded range"),
-        }
-    }
-}
-
-impl std::error::Error for RingError {}
-
-impl RedactedEventRing {
-    pub fn new(capacity: usize) -> Result<Self, RingError> {
-        if capacity == 0 || capacity > MAX_RING_CAPACITY {
-            return Err(RingError::CapacityOutOfBounds);
-        }
-        Ok(Self {
+impl EventRing {
+    /// Any capacity is accepted; saturation is handled by dropping.
+    pub fn new(capacity: usize) -> Self {
+        Self {
             capacity,
-            events: VecDeque::new(),
-            total_pushed: 0,
+            next_sequence: 0,
             dropped: 0,
-            secrets_redacted: 0,
-        })
+            events: VecDeque::new(),
+        }
     }
 
-    pub fn push(&mut self, sentinels: &SecretSentinels, kind: EventKind, text: &str) {
-        let (redacted, replacements) = sentinels.redact(text);
-        self.secrets_redacted += replacements;
-        let bounded = BoundedText::new(&redacted, MAX_EVENT_BYTES);
-        if self.events.len() == self.capacity {
+    pub fn push(&mut self, redactor: &Redactor, message: &str) {
+        let redacted = redactor.redact(message);
+        let bounded = BoundedText::from_redacted(&redacted);
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        if self.capacity > 0 && self.events.len() == self.capacity {
             self.events.pop_front();
             self.dropped += 1;
         }
-        self.events.push_back((kind, bounded));
-        self.total_pushed += 1;
-    }
-
-    /// Drop the single oldest retained event, accounting it as dropped. Used
-    /// by the encoder to fit the byte budget; the drop stays truthful.
-    fn drop_oldest(&mut self) -> bool {
-        if self.events.pop_front().is_some() {
-            self.dropped += 1;
-            true
-        } else {
-            false
+        if self.capacity > 0 {
+            self.events.push_back(Event {
+                sequence,
+                message: bounded,
+            });
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &(EventKind, BoundedText)> {
+    pub fn events(&self) -> impl Iterator<Item = &Event> {
         self.events.iter()
     }
 
@@ -301,12 +297,8 @@ impl RedactedEventRing {
         self.dropped
     }
 
-    pub const fn total_pushed(&self) -> u64 {
-        self.total_pushed
-    }
-
-    pub const fn secrets_redacted(&self) -> u64 {
-        self.secrets_redacted
+    pub const fn next_sequence(&self) -> u64 {
+        self.next_sequence
     }
 
     pub const fn capacity(&self) -> usize {
@@ -314,118 +306,170 @@ impl RedactedEventRing {
     }
 }
 
-/// Expected-vs-actual record for a deliberate or observed failure. Both sides
-/// are bounded and truncation-flagged independently.
+/// Recorded expected-vs-actual comparison. Both sides are redacted at
+/// construction and bounded independently.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FailureRecord {
-    pub expected: BoundedText,
-    pub actual: BoundedText,
+pub struct ExpectedVsActual {
+    expected: BoundedText,
+    actual: BoundedText,
 }
 
-impl FailureRecord {
-    pub fn new(expected: &str, actual: &str) -> Self {
+impl ExpectedVsActual {
+    pub fn new(redactor: &Redactor, expected: &str, actual: &str) -> Self {
         Self {
-            expected: BoundedText::new(expected, MAX_FAILURE_TEXT),
-            actual: BoundedText::new(actual, MAX_FAILURE_TEXT),
+            expected: BoundedText::from_redacted(&redactor.redact(expected)),
+            actual: BoundedText::from_redacted(&redactor.redact(actual)),
         }
+    }
+
+    pub const fn expected(&self) -> &BoundedText {
+        &self.expected
+    }
+
+    pub const fn actual(&self) -> &BoundedText {
+        &self.actual
     }
 }
 
-/// Terminal outcome of a scenario run. `MissingEvidence` marks a run whose
-/// stream lost its terminal record.
+/// What actually happened to the run: the effect, the process exit code when
+/// the run reached one, and, for runs that never executed to a terminal
+/// state, the reason.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalOutcome {
+    effect: Effect,
+    exit_code: Option<i32>,
+    unexecuted_reason: Option<String>,
+}
+
+/// Terminal effect vocabulary. This is the only verdict carrier in the
+/// receipt API; nothing else maps a receipt to pass or fail.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TerminalOutcome {
-    Success,
-    Failure,
-    Cancelled,
-    MissingEvidence,
+pub enum Effect {
+    Succeeded,
+    Failed,
+    Canceled,
 }
 
-impl TerminalOutcome {
-    pub const fn as_str(self) -> &'static str {
+impl Effect {
+    const fn as_str(self) -> &'static str {
         match self {
-            Self::Success => "success",
-            Self::Failure => "failure",
-            Self::Cancelled => "cancelled",
-            Self::MissingEvidence => "missing-evidence",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
         }
     }
 
-    pub fn parse(text: &str) -> Option<Self> {
+    fn parse(text: &str) -> Option<Self> {
         match text {
-            "success" => Some(Self::Success),
-            "failure" => Some(Self::Failure),
-            "cancelled" => Some(Self::Cancelled),
-            "missing-evidence" => Some(Self::MissingEvidence),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "canceled" => Some(Self::Canceled),
             _ => None,
         }
     }
 }
 
-/// The terminal exit/outcome record. Encoded as the last line with its
-/// payload length stated after the tag, so a decoder can always locate and
-/// validate it.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TerminalRecord {
+impl TerminalOutcome {
+    pub const fn new(
+        exit_code: Option<i32>,
+        effect: Effect,
+        unexecuted_reason: Option<String>,
+    ) -> Self {
+        Self {
+            effect,
+            exit_code,
+            unexecuted_reason,
+        }
+    }
+
+    pub const fn effect(&self) -> Effect {
+        self.effect
+    }
+
+    pub const fn exit_code(&self) -> Option<i32> {
+        self.exit_code
+    }
+
+    pub fn unexecuted_reason(&self) -> Option<&str> {
+        self.unexecuted_reason.as_deref()
+    }
+}
+
+/// Where the receipt's event section stands relative to the live ring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RingSummary {
+    /// Live ring capacity the events came from.
+    pub capacity: usize,
+    /// Events the receipt retains.
+    pub kept: usize,
+    /// Events lost to ring saturation plus receipt-level retention.
+    pub dropped: u64,
+    /// Sequence the live ring would assign to its next push.
+    pub next_sequence: u64,
+    /// True when the receipt retained fewer events than the ring held.
+    pub receipt_truncated: bool,
+}
+
+/// Pre-construction description of a scenario run. Strings in `scenario` and
+/// `artifacts` are redacted by [`ScenarioReceipt::from_draft`]; ring events
+/// are redacted at [`EventRing::push`].
+#[derive(Clone, Debug)]
+pub struct ScenarioReceiptDraft {
+    pub scenario: String,
+    pub seed: ScenarioSeed,
+    pub pin: SourcePin,
+    pub route: RouteId,
+    pub corpus_digest: ContentDigest,
+    pub corpus_count: u64,
     pub outcome: TerminalOutcome,
-    /// Process-style exit code, bounded to the conventional 0..=255 range.
-    pub exit_code: u8,
-    pub failure: Option<FailureRecord>,
-    pub events_total: u64,
-    pub events_dropped: u64,
-    pub secrets_redacted: u64,
+    pub comparison: Option<ExpectedVsActual>,
+    pub ring: EventRing,
+    pub artifacts: Vec<String>,
 }
 
-/// Identity of a scenario run.
+/// The immutable evidence record for one scenario run.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScenarioIdentity {
-    pub scenario: BoundedId,
-    pub seed: u64,
-    /// Optional source-capture pin this run was bound to.
-    pub pin: Option<BoundedId>,
-    /// Optional execution route label for the run.
-    pub route: Option<BoundedId>,
-}
-
-/// A decoded receipt: the terminal record when one survived, plus how much of
-/// the event history was recoverable. `terminal == None` means the stream is
-/// missing (or lost) its terminal record: the run is classified
-/// `MissingEvidence` and no verdict may be inferred from it.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DecodedReceipt {
-    pub identity: ScenarioIdentity,
-    pub terminal: Option<TerminalRecord>,
-    pub events_recovered: Vec<(EventKind, String)>,
-    /// Number of event lines present but unparseable after truncation.
-    pub events_unreadable: u64,
+pub struct ScenarioReceipt {
+    schema: &'static str,
+    scenario: String,
+    seed: ScenarioSeed,
+    pin: SourcePin,
+    route: RouteId,
+    corpus_digest: ContentDigest,
+    corpus_count: u64,
+    outcome: TerminalOutcome,
+    comparison: Option<ExpectedVsActual>,
+    ring_summary: RingSummary,
+    events: Vec<Event>,
+    artifacts: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CodecError {
-    NotAReceipt,
-    TerminalCorrupt,
+pub enum ReceiptError {
+    /// The stream's schema tag is foreign or missing.
+    SchemaMismatch,
+    /// A row is truncated, malformed, or required-but-absent.
+    MalformedRow,
 }
 
-impl fmt::Display for CodecError {
+impl fmt::Display for ReceiptError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotAReceipt => f.write_str("input is not a scenario receipt stream"),
-            Self::TerminalCorrupt => f.write_str("terminal record is corrupt"),
+            Self::SchemaMismatch => f.write_str("receipt schema does not match"),
+            Self::MalformedRow => f.write_str("receipt row is malformed or missing"),
         }
     }
 }
 
-impl std::error::Error for CodecError {}
+impl std::error::Error for ReceiptError {}
 
-/// Escape a string onto a single canonical line: backslash, quote, and control
-/// characters become fixed-width escapes; every other character passes
-/// through. Tab is escaped so `\t` field separators stay unambiguous.
-fn escape_line(text: &str) -> String {
+/// Escape a string onto one canonical line: backslash, control characters,
+/// and newline/carriage-return/tab become fixed-width escapes.
+fn escape_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for character in text.chars() {
         match character {
             '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
@@ -438,8 +482,8 @@ fn escape_line(text: &str) -> String {
     out
 }
 
-/// Inverse of [`escape_line`]. Returns `None` on malformed escapes.
-fn unescape_line(text: &str) -> Option<String> {
+/// Inverse of [`escape_text`]; `None` on malformed escapes.
+fn unescape_text(text: &str) -> Option<String> {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars();
     while let Some(character) = chars.next() {
@@ -449,7 +493,6 @@ fn unescape_line(text: &str) -> Option<String> {
         }
         match chars.next()? {
             '\\' => out.push('\\'),
-            '"' => out.push('"'),
             'n' => out.push('\n'),
             'r' => out.push('\r'),
             't' => out.push('\t'),
@@ -459,11 +502,10 @@ fn unescape_line(text: &str) -> Option<String> {
                     return None;
                 }
                 let value = u8::from_str_radix(&hex, 16).ok()?;
-                if value < 0x20 || value == 0x7f {
-                    out.push(value as char);
-                } else {
+                if (0x20..0x7f).contains(&value) || value >= 0x80 {
                     return None;
                 }
+                out.push(value as char);
             }
             _ => return None,
         }
@@ -471,553 +513,431 @@ fn unescape_line(text: &str) -> Option<String> {
     Some(out)
 }
 
-fn escape_optional_id(id: &Option<BoundedId>) -> String {
-    match id {
-        Some(id) => escape_line(id.as_str()),
-        None => "-".to_string(),
+/// Length-prefixed field value: `name:<len>:<escaped>`.
+fn length_field(name: &str, text: &str) -> String {
+    format!("{name}:{}:{text}\n", text.len())
+}
+
+/// Parse `name:<len>:<escaped>` after the `name:` prefix.
+fn parse_length_field(payload: &str) -> Option<String> {
+    let (length, value) = payload.split_once(':')?;
+    let length = length.parse::<usize>().ok()?;
+    if value.len() != length {
+        return None;
     }
+    unescape_text(value)
 }
 
-fn parse_optional_id(text: &str) -> Result<Option<BoundedId>, CodecError> {
-    if text == "-" {
-        return Ok(None);
+impl ScenarioReceipt {
+    /// Build a receipt from a draft. The scenario name and every artifact
+    /// reference pass through the redactor; the ring contributes its newest
+    /// [`RECEIPT_MAX_EVENTS`] events, with any excess accounted as dropped.
+    pub fn from_draft(redactor: &Redactor, draft: ScenarioReceiptDraft) -> Self {
+        let scenario = redactor.redact(&draft.scenario);
+        let artifacts: Vec<String> = draft
+            .artifacts
+            .iter()
+            .map(|artifact| redactor.redact(artifact))
+            .collect();
+
+        // Retain the newest RECEIPT_MAX_EVENTS events, oldest-first, and
+        // account every dropped event truthfully.
+        let total = draft.ring.len() as u64;
+        let kept = total.min(RECEIPT_MAX_EVENTS as u64);
+        let skip = (total - kept) as usize;
+        let events: Vec<Event> = draft.ring.events().skip(skip).cloned().collect();
+        let receipt_truncated = skip > 0;
+        let ring_summary = RingSummary {
+            capacity: draft.ring.capacity(),
+            kept: events.len(),
+            dropped: draft.ring.dropped() + skip as u64,
+            next_sequence: draft.ring.next_sequence(),
+            receipt_truncated,
+        };
+
+        Self {
+            schema: RECEIPT_SCHEMA,
+            scenario,
+            seed: draft.seed,
+            pin: draft.pin,
+            route: draft.route,
+            corpus_digest: draft.corpus_digest,
+            corpus_count: draft.corpus_count,
+            outcome: draft.outcome,
+            comparison: draft.comparison,
+            ring_summary,
+            events,
+            artifacts,
+        }
     }
-    BoundedId::new(text)
-        .map(Some)
-        .map_err(|_| CodecError::TerminalCorrupt)
-}
 
-/// One scenario recorder: identity plus a redacted event ring. [`Self::finish`]
-/// produces the terminal record and the bounded encoded stream in one step;
-/// flood input shrinks the event section (oldest first, accounted in
-/// `events_dropped`) and never the terminal record.
-pub struct ScenarioRecorder {
-    identity: ScenarioIdentity,
-    sentinels: SecretSentinels,
-    ring: RedactedEventRing,
-    failure: Option<FailureRecord>,
-}
+    /// Encode into the canonical line format. Row order is fixed; strings are
+    /// length-prefixed and escaped so no payload can forge extra rows.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = String::with_capacity(1024);
+        out.push_str(self.schema);
+        out.push('\n');
+        out.push_str(&length_field("scenario", &self.scenario));
+        out.push_str(&format!("seed:{}\n", self.seed.0));
+        out.push_str(&format!("pin:{}\n", self.pin.as_str()));
+        out.push_str(&length_field("route", self.route.as_str()));
+        out.push_str(&format!("corpus_digest:{}\n", self.corpus_digest.hex()));
+        out.push_str(&format!("corpus_count:{}\n", self.corpus_count));
+        out.push_str(&format!("effect:{}\n", self.outcome.effect.as_str()));
+        match self.outcome.exit_code {
+            Some(code) => out.push_str(&format!("exit:{code}\n")),
+            None => out.push_str("exit:-\n"),
+        }
+        match &self.outcome.unexecuted_reason {
+            Some(reason) => out.push_str(&length_field("reason", reason)),
+            None => out.push_str("reason:-\n"),
+        }
+        out.push_str(&format!(
+            "ring:{}:{}:{}:{}:{}\n",
+            self.ring_summary.capacity,
+            self.ring_summary.kept,
+            self.ring_summary.dropped,
+            self.ring_summary.next_sequence,
+            self.ring_summary.receipt_truncated as u8,
+        ));
+        match &self.comparison {
+            Some(comparison) => {
+                out.push_str(&length_field(
+                    "comparison_expected",
+                    comparison.expected.text(),
+                ));
+                out.push_str(&format!(
+                    "comparison_expected_truncated:{}\n",
+                    comparison.expected.truncated() as u8
+                ));
+                out.push_str(&format!(
+                    "comparison_expected_original:{}\n",
+                    comparison.expected.original_bytes()
+                ));
+                out.push_str(&length_field("comparison_actual", comparison.actual.text()));
+                out.push_str(&format!(
+                    "comparison_actual_truncated:{}\n",
+                    comparison.actual.truncated() as u8
+                ));
+                out.push_str(&format!(
+                    "comparison_actual_original:{}\n",
+                    comparison.actual.original_bytes()
+                ));
+            }
+            None => out.push_str("comparison:-\n"),
+        }
+        out.push_str(&format!("events:{}\n", self.events.len()));
+        for event in &self.events {
+            out.push_str(&format!(
+                "event:{}:{}:{}:{}:{}\n",
+                event.sequence,
+                event.message.truncated() as u8,
+                event.message.original_bytes(),
+                event.message.text().len(),
+                escape_text(event.message.text()),
+            ));
+        }
+        out.push_str(&format!("artifacts:{}\n", self.artifacts.len()));
+        for artifact in &self.artifacts {
+            out.push_str(&length_field("artifact", artifact));
+        }
+        out.into_bytes()
+    }
 
-impl ScenarioRecorder {
-    pub fn new(
-        identity: ScenarioIdentity,
-        sentinels: SecretSentinels,
-        ring_capacity: usize,
-    ) -> Result<Self, RingError> {
+    /// Decode a canonical receipt stream. Foreign schema tags are rejected as
+    /// [`ReceiptError::SchemaMismatch`]; truncated or malformed rows as
+    /// [`ReceiptError::MalformedRow`]. Decoding never invents evidence.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ReceiptError> {
+        let text = std::str::from_utf8(bytes).map_err(|_| ReceiptError::MalformedRow)?;
+        let mut lines = text.lines();
+        let schema = lines.next().ok_or(ReceiptError::MalformedRow)?;
+        if schema != RECEIPT_SCHEMA {
+            return Err(ReceiptError::SchemaMismatch);
+        }
+
+        let mut rows = lines.map(str::to_string).collect::<VecDeque<String>>();
+        let mut next_name = |expected: &str| -> Result<String, ReceiptError> {
+            let row = rows.pop_front().ok_or(ReceiptError::MalformedRow)?;
+            let (name, payload) = row.split_once(':').ok_or(ReceiptError::MalformedRow)?;
+            if name != expected {
+                return Err(ReceiptError::MalformedRow);
+            }
+            Ok(payload.to_string())
+        };
+
+        let scenario = parse_length_field(&next_name("scenario")?)
+            .ok_or(ReceiptError::MalformedRow)?;
+        let seed = next_name("seed")?
+            .parse::<u64>()
+            .map_err(|_| ReceiptError::MalformedRow)?;
+        let pin_text = next_name("pin")?;
+        let pin = SourcePin::new(&pin_text).map_err(|_| ReceiptError::MalformedRow)?;
+        let route_text = next_name("route")?;
+        let route = RouteId::new(&parse_length_field(&route_text).ok_or(ReceiptError::MalformedRow)?)
+            .map_err(|_| ReceiptError::MalformedRow)?;
+        let digest_text = next_name("corpus_digest")?;
+        let corpus_digest = ContentDigest::from_hex(&digest_text)
+            .ok_or(ReceiptError::MalformedRow)?;
+        let corpus_count = next_name("corpus_count")?
+            .parse::<u64>()
+            .map_err(|_| ReceiptError::MalformedRow)?;
+        let effect = Effect::parse(&next_name("effect")?).ok_or(ReceiptError::MalformedRow)?;
+        let exit_text = next_name("exit")?;
+        let exit_code = if exit_text == "-" {
+            None
+        } else {
+            Some(exit_text.parse::<i32>().map_err(|_| ReceiptError::MalformedRow)?)
+        };
+        let reason_text = next_name("reason")?;
+        let unexecuted_reason = if reason_text == "-" {
+            None
+        } else {
+            Some(parse_length_field(&reason_text).ok_or(ReceiptError::MalformedRow)?)
+        };
+        let ring_row = next_name("ring")?;
+        let mut ring_parts = ring_row.split(':');
+        let mut next_number = || -> Result<u64, ReceiptError> {
+            ring_parts
+                .next()
+                .ok_or(ReceiptError::MalformedRow)?
+                .parse::<u64>()
+                .map_err(|_| ReceiptError::MalformedRow)
+        };
+        let capacity = next_number()? as usize;
+        let kept = next_number()? as usize;
+        let dropped = next_number()?;
+        let next_sequence = next_number()?;
+        let receipt_truncated = next_number()? == 1;
+        if next_number().is_ok() {
+            return Err(ReceiptError::MalformedRow);
+        }
+        let ring_summary = RingSummary {
+            capacity,
+            kept,
+            dropped,
+            next_sequence,
+            receipt_truncated,
+        };
+
+        let comparison = {
+            let marker = next_name("comparison")?;
+            if marker == "-" {
+                None
+            } else if marker == "present" {
+                let expected = parse_length_field(&next_name("comparison_expected")?)
+                    .ok_or(ReceiptError::MalformedRow)?;
+                let expected_truncated = next_name("comparison_expected_truncated")?
+                    .parse::<u8>()
+                    .map_err(|_| ReceiptError::MalformedRow)?;
+                let expected_original = next_name("comparison_expected_original")?
+                    .parse::<u64>()
+                    .map_err(|_| ReceiptError::MalformedRow)?;
+                let actual = parse_length_field(&next_name("comparison_actual")?)
+                    .ok_or(ReceiptError::MalformedRow)?;
+                let actual_truncated = next_name("comparison_actual_truncated")?
+                    .parse::<u8>()
+                    .map_err(|_| ReceiptError::MalformedRow)?;
+                let actual_original = next_name("comparison_actual_original")?
+                    .parse::<u64>()
+                    .map_err(|_| ReceiptError::MalformedRow)?;
+                if expected_truncated > 1 || actual_truncated > 1 {
+                    return Err(ReceiptError::MalformedRow);
+                }
+                Some(ExpectedVsActual {
+                    expected: BoundedText {
+                        text: expected,
+                        truncated: expected_truncated == 1,
+                        original_bytes: expected_original,
+                    },
+                    actual: BoundedText {
+                        text: actual,
+                        truncated: actual_truncated == 1,
+                        original_bytes: actual_original,
+                    },
+                })
+            } else {
+                return Err(ReceiptError::MalformedRow);
+            }
+        };
+
+        let event_count = next_name("events")?
+            .parse::<usize>()
+            .map_err(|_| ReceiptError::MalformedRow)?;
+        if event_count > RECEIPT_MAX_EVENTS {
+            return Err(ReceiptError::MalformedRow);
+        }
+        let mut events = Vec::with_capacity(event_count);
+        for _ in 0..event_count {
+            let row = next_name("event")?;
+            let mut fields = row.split(':');
+            let sequence = fields
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or(ReceiptError::MalformedRow)?;
+            let truncated = fields
+                .next()
+                .and_then(|value| value.parse::<u8>().ok())
+                .ok_or(ReceiptError::MalformedRow)?;
+            let original_bytes = fields
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or(ReceiptError::MalformedRow)?;
+            let length = fields
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .ok_or(ReceiptError::MalformedRow)?;
+            let message = fields.next().ok_or(ReceiptError::MalformedRow)?;
+            if fields.next().is_some() {
+                return Err(ReceiptError::MalformedRow);
+            }
+            if message.len() != length {
+                return Err(ReceiptError::MalformedRow);
+            }
+            if truncated > 1 {
+                return Err(ReceiptError::MalformedRow);
+            }
+            let message = unescape_text(message).ok_or(ReceiptError::MalformedRow)?;
+            if message.len() > MAX_FIELD_BYTES {
+                return Err(ReceiptError::MalformedRow);
+            }
+            events.push(Event {
+                sequence,
+                message: BoundedText {
+                    text: message,
+                    truncated: truncated == 1,
+                    original_bytes,
+                },
+            });
+        }
+
+        let artifact_count = next_name("artifacts")?
+            .parse::<usize>()
+            .map_err(|_| ReceiptError::MalformedRow)?;
+        let mut artifacts = Vec::with_capacity(artifact_count);
+        for _ in 0..artifact_count {
+            let payload = next_name("artifact")?;
+            artifacts.push(parse_length_field(&payload).ok_or(ReceiptError::MalformedRow)?);
+        }
+        if !rows.is_empty() {
+            return Err(ReceiptError::MalformedRow);
+        }
+
         Ok(Self {
-            identity,
-            sentinels,
-            ring: RedactedEventRing::new(ring_capacity)?,
-            failure: None,
+            schema: RECEIPT_SCHEMA,
+            scenario,
+            seed: ScenarioSeed(seed),
+            pin,
+            route,
+            corpus_digest,
+            corpus_count,
+            outcome: TerminalOutcome {
+                effect,
+                exit_code,
+                unexecuted_reason,
+            },
+            comparison,
+            ring_summary,
+            events,
+            artifacts,
         })
     }
 
-    pub fn event(&mut self, kind: EventKind, text: &str) {
-        self.ring.push(&self.sentinels, kind, text);
+    pub fn scenario(&self) -> &str {
+        &self.scenario
     }
 
-    /// Record an expected-vs-actual failure. Both sides are redacted before
-    /// they are bounded and stored.
-    pub fn failure(&mut self, expected: &str, actual: &str) {
-        let (expected, _) = self.sentinels.redact(expected);
-        let (actual, _) = self.sentinels.redact(actual);
-        self.failure = Some(FailureRecord::new(&expected, &actual));
+    pub const fn seed(&self) -> ScenarioSeed {
+        self.seed
     }
 
-    /// Produce the terminal record and the bounded encoded stream. A `Success`
-    /// outcome clears any stale failure record: success carries no failure.
-    pub fn finish(mut self, outcome: TerminalOutcome, exit_code: u8) -> (TerminalRecord, Vec<u8>) {
-        if outcome == TerminalOutcome::Success {
-            self.failure = None;
-        }
-        // Shrink the event section until the whole stream fits the budget,
-        // dropping oldest first so the drop stays accounted in the ring (and
-        // therefore in the terminal record).
-        while self.encoded_size() > MAX_RECEIPT_BYTES {
-            if !self.ring.drop_oldest() {
-                break;
-            }
-        }
-        let terminal = TerminalRecord {
-            outcome,
-            exit_code,
-            failure: self.failure.take(),
-            events_total: self.ring.total_pushed(),
-            events_dropped: self.ring.dropped(),
-            secrets_redacted: self.ring.secrets_redacted(),
-        };
-        let encoded = encode(&self.identity, &self.ring, &terminal);
-        (terminal, encoded)
+    pub const fn pin(&self) -> &SourcePin {
+        &self.pin
     }
 
-    /// Upper-bound size of the encoded stream with the current ring contents,
-    /// using [`TERMINAL_LINE_RESERVE`] for the terminal line.
-    fn encoded_size(&self) -> usize {
-        let header = header_line(&self.identity).len() + 1;
-        let events: usize = self
-            .ring
-            .iter()
-            .map(|(kind, text)| event_line(*kind, text.as_str()).len() + 1)
-            .sum();
-        header + events + TERMINAL_LINE_RESERVE
+    pub const fn route(&self) -> &RouteId {
+        &self.route
     }
-}
 
-fn header_line(identity: &ScenarioIdentity) -> String {
-    format!(
-        "FCBRECEIPT1 {} {} {} {}",
-        escape_line(identity.scenario.as_str()),
-        identity.seed,
-        escape_optional_id(&identity.route),
-        escape_optional_id(&identity.pin),
-    )
-}
-
-fn event_line(kind: EventKind, text: &str) -> String {
-    format!("E {} {}", kind.tag(), escape_line(text))
-}
-
-fn encode(
-    identity: &ScenarioIdentity,
-    ring: &RedactedEventRing,
-    terminal: &TerminalRecord,
-) -> Vec<u8> {
-    let mut out = String::with_capacity(MAX_RECEIPT_BYTES.min(4096));
-    out.push_str(&header_line(identity));
-    out.push('\n');
-    for (kind, text) in ring.iter() {
-        out.push_str(&event_line(*kind, text.as_str()));
-        out.push('\n');
+    pub const fn corpus_digest(&self) -> &ContentDigest {
+        &self.corpus_digest
     }
-    let body = encode_terminal_body(terminal);
-    out.push_str(&format!("T {} {}\n", body.len(), body));
-    out.into_bytes()
-}
 
-fn encode_terminal_body(terminal: &TerminalRecord) -> String {
-    let mut body = format!(
-        "{} {} {} {} {}",
-        terminal.outcome.as_str(),
-        terminal.exit_code,
-        terminal.events_total,
-        terminal.events_dropped,
-        terminal.secrets_redacted,
-    );
-    if let Some(failure) = &terminal.failure {
-        body.push('\t');
-        body.push_str(&format!(
-            "F {}\t{}\t{}\t{}",
-            escape_line(failure.expected.as_str()),
-            escape_line(failure.actual.as_str()),
-            failure.expected.meta().truncated as u8,
-            failure.actual.meta().truncated as u8,
-        ));
+    pub const fn corpus_count(&self) -> u64 {
+        self.corpus_count
     }
-    body
-}
 
-/// Decode a receipt stream. The terminal line is the last line beginning with
-/// `T ` (event lines always begin with `E ` and the identity line with the
-/// receipt tag); its payload length must match exactly or the verdict counts
-/// as lost: the decoded receipt then has `terminal == None` (missing
-/// evidence). Truncation inside the event section is reported through
-/// `events_unreadable` and any counters the terminal record retained.
-pub fn decode(bytes: &[u8]) -> Result<DecodedReceipt, CodecError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| CodecError::NotAReceipt)?;
-    if !text.starts_with("FCBRECEIPT1 ") {
-        return Err(CodecError::NotAReceipt);
+    pub const fn outcome(&self) -> &TerminalOutcome {
+        &self.outcome
     }
-    // The identity line is line 0; event lines are every line after it that is
-    // not the terminal line. Event text cannot contain a literal newline (it
-    // is escaped), so the first "\nT " begins the terminal line.
-    let body_end = text.find("\nT ").map_or(text.len(), |at| at + 1);
-    let mut lines = text[..body_end].lines();
-    let header = lines.next().ok_or(CodecError::NotAReceipt)?;
-    let identity = parse_header(header)?;
-    let mut events_recovered = Vec::new();
-    let mut events_unreadable = 0_u64;
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        match parse_event_line(line) {
-            Some(event) => events_recovered.push(event),
-            None => events_unreadable += 1,
-        }
-    }
-    let terminal = text
-        .lines()
-        .rev()
-        .find(|line| line.starts_with("T "))
-        .and_then(|line| parse_terminal_line(line).ok());
-    Ok(DecodedReceipt {
-        identity,
-        terminal,
-        events_recovered,
-        events_unreadable,
-    })
-}
 
-fn parse_header(header: &str) -> Result<ScenarioIdentity, CodecError> {
-    let mut parts = header.splitn(5, ' ');
-    let tag = parts.next().ok_or(CodecError::NotAReceipt)?;
-    if tag != "FCBRECEIPT1" {
-        return Err(CodecError::NotAReceipt);
+    pub const fn comparison(&self) -> Option<&ExpectedVsActual> {
+        self.comparison.as_ref()
     }
-    let scenario = parts.next().ok_or(CodecError::NotAReceipt)?;
-    let seed = parts.next().ok_or(CodecError::NotAReceipt)?;
-    let route = parts.next().ok_or(CodecError::NotAReceipt)?;
-    let pin = parts.next().unwrap_or("-");
-    let scenario = unescape_line(scenario).ok_or(CodecError::NotAReceipt)?;
-    let scenario = BoundedId::new(&scenario).map_err(|_| CodecError::TerminalCorrupt)?;
-    let seed = seed.parse::<u64>().map_err(|_| CodecError::NotAReceipt)?;
-    Ok(ScenarioIdentity {
-        scenario,
-        seed,
-        pin: parse_optional_id(pin)?,
-        route: parse_optional_id(route)?,
-    })
-}
 
-fn parse_event_line(line: &str) -> Option<(EventKind, String)> {
-    let rest = line.strip_prefix("E ")?;
-    let (tag, text) = rest.split_once(' ')?;
-    let kind = EventKind::from_tag(tag)?;
-    Some((kind, unescape_line(text)?))
-}
-
-fn parse_terminal_line(line: &str) -> Result<TerminalRecord, CodecError> {
-    let rest = line.strip_prefix("T ").ok_or(CodecError::TerminalCorrupt)?;
-    let (length_text, body) = rest.split_once(' ').ok_or(CodecError::TerminalCorrupt)?;
-    let length = length_text
-        .parse::<usize>()
-        .map_err(|_| CodecError::TerminalCorrupt)?;
-    if body.len() != length {
-        return Err(CodecError::TerminalCorrupt);
+    pub const fn ring_summary(&self) -> &RingSummary {
+        &self.ring_summary
     }
-    // Body layout: "<outcome> <exit> <total> <dropped> <redacted>" optionally
-    // followed by "\tF <expected>\t<actual>\t<t>\t<a>". Escaped text cannot
-    // contain literal tabs, so the first tab starts the failure section.
-    let (counters, failure_text) = match body.split_once('\t') {
-        Some((counters, failure)) => {
-            let failure = failure
-                .strip_prefix("F ")
-                .ok_or(CodecError::TerminalCorrupt)?;
-            (counters, Some(failure))
-        }
-        None => (body, None),
-    };
-    let mut counters = counters.split(' ');
-    let outcome = counters.next().ok_or(CodecError::TerminalCorrupt)?;
-    let outcome = TerminalOutcome::parse(outcome).ok_or(CodecError::TerminalCorrupt)?;
-    let exit_code = counters
-        .next()
-        .and_then(|code| code.parse::<u8>().ok())
-        .ok_or(CodecError::TerminalCorrupt)?;
-    let events_total = counters
-        .next()
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or(CodecError::TerminalCorrupt)?;
-    let events_dropped = counters
-        .next()
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or(CodecError::TerminalCorrupt)?;
-    let secrets_redacted = counters
-        .next()
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or(CodecError::TerminalCorrupt)?;
-    let failure = match failure_text {
-        Some(failure_text) => {
-            let mut fields = failure_text.split('\t');
-            let expected = fields.next().ok_or(CodecError::TerminalCorrupt)?;
-            let actual = fields.next().ok_or(CodecError::TerminalCorrupt)?;
-            let expected_truncated = fields
-                .next()
-                .and_then(|flag| flag.parse::<u8>().ok())
-                .ok_or(CodecError::TerminalCorrupt)?;
-            let actual_truncated = fields
-                .next()
-                .and_then(|flag| flag.parse::<u8>().ok())
-                .ok_or(CodecError::TerminalCorrupt)?;
-            if fields.next().is_some() {
-                return Err(CodecError::TerminalCorrupt);
-            }
-            let expected = unescape_line(expected).ok_or(CodecError::TerminalCorrupt)?;
-            let actual = unescape_line(actual).ok_or(CodecError::TerminalCorrupt)?;
-            let expected_len = expected.len() as u64;
-            let actual_len = actual.len() as u64;
-            if expected_truncated > 1 || actual_truncated > 1 {
-                return Err(CodecError::TerminalCorrupt);
-            }
-            Some(FailureRecord {
-                expected: BoundedText {
-                    text: expected,
-                    meta: Truncated {
-                        truncated: expected_truncated == 1,
-                        original_len: expected_len,
-                    },
-                },
-                actual: BoundedText {
-                    text: actual,
-                    meta: Truncated {
-                        truncated: actual_truncated == 1,
-                        original_len: actual_len,
-                    },
-                },
-            })
-        }
-        None => None,
-    };
-    Ok(TerminalRecord {
-        outcome,
-        exit_code,
-        failure,
-        events_total,
-        events_dropped,
-        secrets_redacted,
-    })
+
+    pub fn ring_events(&self) -> &[Event] {
+        &self.events
+    }
+
+    pub fn artifacts(&self) -> &[String] {
+        &self.artifacts
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn identity() -> ScenarioIdentity {
-        ScenarioIdentity {
-            scenario: BoundedId::new("scenario-receipts").unwrap(),
-            seed: 0x1234_5678_9abc_def0,
-            pin: Some(BoundedId::new("pin-7").unwrap()),
-            route: Some(BoundedId::new("route-headless").unwrap()),
-        }
-    }
-
-    fn sentinels() -> SecretSentinels {
-        let mut sentinels = SecretSentinels::new();
-        sentinels.register("super-secret-token").unwrap();
-        sentinels
-    }
-
-    fn recorder() -> ScenarioRecorder {
-        ScenarioRecorder::new(identity(), sentinels(), 8).unwrap()
+    #[test]
+    fn escapes_cannot_forge_rows() {
+        let hostile = "safe\nT 0 fake\nevent:1";
+        let encoded = escape_text(hostile);
+        assert!(!encoded.contains('\n'));
+        assert_eq!(unescape_text(&encoded).as_deref(), Some(hostile));
     }
 
     #[test]
-    fn round_trip_keeps_identity_events_failure_and_terminal() {
-        let mut recorder = recorder();
-        recorder.event(EventKind::Note, "started with 3 files");
-        recorder.event(EventKind::Metric, "bytes=512");
-        recorder.event(EventKind::ExpectedActual, "line differs at 42");
-        let (terminal, encoded) = recorder.finish(TerminalOutcome::Failure, 1);
-        assert_eq!(terminal.outcome, TerminalOutcome::Failure);
-        assert_eq!(terminal.exit_code, 1);
-        assert!(terminal.failure.is_some());
-
-        let decoded = decode(&encoded).unwrap();
-        assert_eq!(decoded.identity.seed, identity().seed);
-        assert_eq!(decoded.identity.scenario, identity().scenario);
-        assert_eq!(decoded.identity.pin, identity().pin);
-        assert_eq!(decoded.identity.route, identity().route);
-        let decoded_terminal = decoded.terminal.unwrap();
-        assert_eq!(decoded_terminal.outcome, TerminalOutcome::Failure);
-        assert_eq!(decoded_terminal.exit_code, 1);
-        assert_eq!(decoded_terminal.events_total, 3);
-        assert_eq!(decoded.events_recovered.len(), 3);
-        assert_eq!(decoded.events_unreadable, 0);
+    fn adjacent_sentinels_redact_completely() {
+        let redactor = Redactor::new()
+            .with_sentinel("alpha")
+            .with_sentinel("alphabet");
+        let (long, short) = ("alphabetalphabet", "alphabet");
+        assert_eq!(redactor.redact(long), format!("{REDACTED_TOKEN}{REDACTED_TOKEN}"));
+        assert_eq!(redactor.redact(short), REDACTED_TOKEN);
     }
 
     #[test]
-    fn ring_saturation_drops_oldest_and_counts() {
-        let mut recorder = ScenarioRecorder::new(identity(), sentinels(), 4).unwrap();
-        for index in 0..10 {
-            recorder.event(EventKind::Note, &format!("event-{index}"));
-        }
-        let (terminal, encoded) = recorder.finish(TerminalOutcome::Success, 0);
-        assert_eq!(terminal.events_total, 10);
-        assert_eq!(terminal.events_dropped, 6);
-        let decoded = decode(&encoded).unwrap();
-        assert_eq!(decoded.events_recovered.len(), 4);
-        assert_eq!(decoded.events_recovered[0].1, "event-6");
-        assert_eq!(decoded.events_recovered[3].1, "event-9");
+    fn empty_sentinels_are_ignored() {
+        let redactor = Redactor::new().with_sentinel("");
+        assert_eq!(redactor.redact("untouched"), "untouched");
     }
 
     #[test]
-    fn secret_sentinels_never_reach_the_encoded_stream() {
-        let mut recorder = recorder();
-        recorder.event(EventKind::Note, "auth=super-secret-token ok");
-        recorder.failure("expected super-secret-token", "got super-secret-token instead");
-        let (terminal, encoded) = recorder.finish(TerminalOutcome::Failure, 2);
-        assert!(terminal.secrets_redacted >= 3);
-        let encoded_text = std::str::from_utf8(&encoded).unwrap();
-        assert!(!encoded_text.contains("super-secret-token"));
-        assert!(encoded_text.contains(REDACTION));
-        let decoded = decode(&encoded).unwrap();
-        let decoded_terminal = decoded.terminal.unwrap();
-        let failure = decoded_terminal.failure.unwrap();
-        assert!(failure.expected.as_str().contains(REDACTION));
-        assert!(!failure.actual.as_str().contains("super-secret-token"));
-    }
-
-    #[test]
-    fn flood_stays_bounded_and_terminal_survives() {
-        let mut recorder = ScenarioRecorder::new(identity(), sentinels(), 64).unwrap();
-        for index in 0..20_000 {
-            recorder.event(
-                EventKind::Note,
-                &format!("flood-{index}-payload-0123456789abcdef"),
-            );
-        }
-        let (terminal, encoded) = recorder.finish(TerminalOutcome::Failure, 3);
-        assert!(encoded.len() <= MAX_RECEIPT_BYTES);
-        assert_eq!(terminal.outcome, TerminalOutcome::Failure);
-        assert_eq!(terminal.events_total, 20_000);
-        // Ring capacity 64 retained 64; the encoder shrank the rest, and every
-        // dropped event is accounted.
-        assert_eq!(
-            terminal.events_total - terminal.events_dropped,
-            u64::try_from(terminal_len_events(&encoded)).unwrap_or(u64::MAX)
+    fn decode_rejects_truncated_single_row() {
+        let receipt = ScenarioReceipt::from_draft(
+            &Redactor::new(),
+            ScenarioReceiptDraft {
+                scenario: "s".to_string(),
+                seed: ScenarioSeed(1),
+                pin: SourcePin::new(&"a".repeat(40)).unwrap(),
+                route: RouteId::new("r").unwrap(),
+                corpus_digest: ContentDigest::of(b"c"),
+                corpus_count: 1,
+                outcome: TerminalOutcome::new(Some(0), Effect::Succeeded, None),
+                comparison: None,
+                ring: EventRing::new(2),
+                artifacts: vec![],
+            },
         );
-        let decoded = decode(&encoded).unwrap();
-        let decoded_terminal = decoded.terminal.unwrap();
-        assert_eq!(decoded_terminal.outcome, TerminalOutcome::Failure);
-        assert_eq!(decoded_terminal.exit_code, 3);
-        assert_eq!(decoded_terminal.events_total, 20_000);
-        assert!(decoded_terminal.events_dropped > 0);
-        assert!(decoded.events_unreadable == 0);
-    }
-
-    /// Number of events the encoded stream actually retained.
-    fn terminal_len_events(encoded: &[u8]) -> usize {
-        decode(encoded).unwrap().events_recovered.len()
-    }
-
-    #[test]
-    fn middle_truncation_preserves_the_verdict_and_reports_loss() {
-        let mut recorder = ScenarioRecorder::new(identity(), sentinels(), 32).unwrap();
-        for index in 0..32 {
-            recorder.event(EventKind::Note, &format!("keep-{index}-0123456789abcdef"));
-        }
-        let (_terminal, encoded) = recorder.finish(TerminalOutcome::Failure, 1);
-        let mut truncated = encoded.clone();
-        let start = truncated.len() / 3;
-        let end = 2 * (truncated.len() / 3);
-        truncated.drain(start..end);
-        let decoded = decode(&truncated).unwrap();
-        let decoded_terminal = decoded.terminal.unwrap();
-        assert_eq!(decoded_terminal.outcome, TerminalOutcome::Failure);
-        assert_eq!(decoded_terminal.exit_code, 1);
-        assert!(decoded.events_recovered.len() < 32);
-        assert!(decoded.events_unreadable > 0);
-    }
-
-    #[test]
-    fn cancelled_runs_carry_no_failure_record() {
-        let mut recorder = recorder();
-        recorder.event(EventKind::Note, "cancel requested");
-        let (terminal, encoded) = recorder.finish(TerminalOutcome::Cancelled, 130);
-        assert!(terminal.failure.is_none());
-        let decoded = decode(&encoded).unwrap();
-        let decoded_terminal = decoded.terminal.unwrap();
-        assert_eq!(decoded_terminal.outcome, TerminalOutcome::Cancelled);
-        assert_eq!(decoded_terminal.exit_code, 130);
-        assert!(decoded_terminal.failure.is_none());
-    }
-
-    #[test]
-    fn destroyed_terminal_decodes_to_missing_evidence_inputs() {
-        let mut recorder = recorder();
-        recorder.event(EventKind::Note, "half a run");
-        let (_terminal, encoded) = recorder.finish(TerminalOutcome::Success, 0);
-        let cut = encoded.len() - 8;
-        let decoded = decode(&encoded[..cut]).unwrap();
-        assert!(decoded.terminal.is_none());
-        assert!(!decoded.events_recovered.is_empty());
-    }
-
-    #[test]
-    fn non_receipt_input_is_rejected() {
-        assert_eq!(decode(b"hello world"), Err(CodecError::NotAReceipt));
-        assert_eq!(decode(b""), Err(CodecError::NotAReceipt));
-    }
-
-    #[test]
-    fn corrupt_terminal_length_is_not_parsed_as_a_verdict() {
-        let mut recorder = recorder();
-        recorder.event(EventKind::Note, "note");
-        let (_terminal, encoded) = recorder.finish(TerminalOutcome::Success, 0);
-        let mut corrupt = encoded.clone();
-        let terminal_at = corrupt
-            .windows(2)
-            .rposition(|window| window == b"\nT")
-            .unwrap();
-        // The stated payload length begins two bytes after the tag: corrupt it.
-        let length_at = terminal_at + 3;
-        assert!(corrupt[length_at].is_ascii_digit());
-        corrupt[length_at] = if corrupt[length_at] == b'9' {
-            b'8'
-        } else {
-            b'9'
-        };
-        let decoded = decode(&corrupt).unwrap();
-        // The corrupt line cannot validate as a terminal record; the decoder
-        // must not fabricate a verdict from it.
-        assert!(decoded.terminal.is_none());
-        assert!(!decoded.events_recovered.is_empty());
-    }
-
-    #[test]
-    fn identifiers_reject_control_characters_and_emptiness() {
-        assert_eq!(BoundedId::new(""), Err(IdError::Empty));
-        assert_eq!(BoundedId::new("bad\nid"), Err(IdError::ControlCharacter));
-        let long = "x".repeat(MAX_ID_LEN + 1);
-        assert_eq!(BoundedId::new(&long), Err(IdError::TooLong));
-        let okay = BoundedId::new("route-headless").unwrap();
-        assert_eq!(okay.as_str(), "route-headless");
-    }
-
-    #[test]
-    fn ring_capacity_bounds_are_enforced() {
+        let encoded_bytes = receipt.encode();
+        let encoded_text = std::str::from_utf8(&encoded_bytes).unwrap();
+        let half: String = encoded_text.lines().take(2).collect::<Vec<_>>().join("\n");
         assert_eq!(
-            RedactedEventRing::new(0).unwrap_err(),
-            RingError::CapacityOutOfBounds
-        );
-        assert_eq!(
-            RedactedEventRing::new(MAX_RING_CAPACITY + 1).unwrap_err(),
-            RingError::CapacityOutOfBounds
-        );
-        assert!(RedactedEventRing::new(1).is_ok());
-    }
-
-    #[test]
-    fn bounded_text_truncates_on_character_boundaries() {
-        let emoji = "a\u{1f600}\u{1f600}\u{1f600}";
-        let bounded = BoundedText::new(emoji, 6);
-        assert!(bounded.meta().truncated);
-        assert!(bounded.as_str().ends_with(TRUNCATION_SUFFIX));
-        assert_eq!(bounded.meta().original_len, emoji.len() as u64);
-        let fitting = BoundedText::new("small", 32);
-        assert!(!fitting.meta().truncated);
-    }
-
-    #[test]
-    fn success_finish_clears_stale_failure_records() {
-        let mut recorder = recorder();
-        recorder.failure("expected", "actual");
-        let (terminal, encoded) = recorder.finish(TerminalOutcome::Success, 0);
-        assert!(terminal.failure.is_none());
-        let decoded = decode(&encoded).unwrap();
-        assert!(decoded.terminal.unwrap().failure.is_none());
-    }
-
-    #[test]
-    fn multiline_event_text_cannot_forge_extra_lines() {
-        let mut recorder = recorder();
-        recorder.event(EventKind::Note, "line one\nE N forged line");
-        let (_terminal, encoded) = recorder.finish(TerminalOutcome::Success, 0);
-        let decoded = decode(&encoded).unwrap();
-        assert_eq!(decoded.events_recovered.len(), 1);
-        assert_eq!(
-            decoded.events_recovered[0].1,
-            "line one\nE N forged line"
+            ScenarioReceipt::decode(half.as_bytes()),
+            Err(ReceiptError::MalformedRow)
         );
     }
 }
