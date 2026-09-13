@@ -632,25 +632,26 @@ impl HostSourceProvider for InMemorySourceProvider {
             .captures
             .get(&(request.file(), request.revision()))
             .ok_or(SourceError::CaptureUnavailable)?;
-        let bytes: Arc<[u8]> = match request.range() {
-            None => Arc::clone(stored),
+        // Validate the borrowed range and its payload size before allocating
+        // backing or hashing bytes. A refused giant range must remain cheap.
+        let selected = match request.range() {
+            None => stored.as_ref(),
             Some(range) => {
                 let (start, end) = range
                     .as_usize_bounds()
                     .map_err(|_| SourceError::RangeOutOfBounds)?;
-                if end > stored.len() {
-                    return Err(SourceError::RangeOutOfBounds);
-                }
-                Arc::from(stored[start..end].to_vec().into_boxed_slice())
+                stored.get(start..end).ok_or(SourceError::RangeOutOfBounds)?
             }
         };
-        if u64::try_from(bytes.len()).map_err(|_| SourceError::PayloadTooLarge)?
-            > self.max_payload.get()
-        {
+        let length = u64::try_from(selected.len()).map_err(|_| SourceError::PayloadTooLarge)?;
+        if length > self.max_payload.get() {
             return Err(SourceError::PayloadTooLarge);
         }
-        let length = ByteLength::new(bytes.len() as u64);
-        CompleteCapture::new(*request, length, bytes).map(CaptureOutcome::Complete)
+        let bytes = match request.range() {
+            None => Arc::clone(stored),
+            Some(_) => Arc::from(selected),
+        };
+        CompleteCapture::new(*request, ByteLength::new(length), bytes).map(CaptureOutcome::Complete)
     }
 }
 

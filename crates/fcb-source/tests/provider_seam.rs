@@ -224,6 +224,17 @@ fn in_memory_provider_returns_exact_ranges_and_enforces_response_bound() {
     let full = provider.capture(&grant, &whole_request(79, 11), &CancelFlag::new());
     assert_eq!(full, Err(SourceError::PayloadTooLarge));
 
+    // A valid range can still exceed admission. Refusal must not damage the
+    // retained revision: the exact-limit request below must still succeed.
+    assert_eq!(
+        provider.capture(&grant, &request_for(79, 11, 2, 7), &CancelFlag::new()),
+        Err(SourceError::PayloadTooLarge)
+    );
+    assert_eq!(
+        provider.capture(&grant, &request_for(79, 11, 2, 11), &CancelFlag::new()),
+        Err(SourceError::RangeOutOfBounds)
+    );
+
     let request = request_for(79, 11, 2, 6);
     let outcome = provider.capture(&grant, &request, &CancelFlag::new()).unwrap();
     grant.validate(&outcome).unwrap();
@@ -235,6 +246,31 @@ fn in_memory_provider_returns_exact_ranges_and_enforces_response_bound() {
         }
         CaptureOutcome::Extent(_) => panic!("in-memory provider returns complete captures"),
     }
+}
+
+#[test]
+fn zero_payload_limit_admits_empty_capture_but_refuses_nonempty_ranges() {
+    let owner_id = owner(83);
+    let empty_file = file(owner_id, 1);
+    let populated_file = file(owner_id, 2);
+    let revision = SourceRevision::new(owner_id, 1).unwrap();
+    let grant = SourceGrant::new(owner_id)
+        .grant(empty_file).unwrap()
+        .grant(populated_file).unwrap();
+    let mut provider = InMemorySourceProvider::new(owner_id, ByteLength::new(0));
+    provider.insert(empty_file, revision, Vec::<u8>::new()).unwrap();
+    provider.insert(populated_file, revision, b"x".to_vec()).unwrap();
+
+    let empty = provider.capture(&grant, &whole_request(83, 1), &CancelFlag::new()).unwrap();
+    let CaptureOutcome::Complete(empty) = empty else {
+        panic!("empty immutable source must be a complete capture");
+    };
+    assert!(empty.bytes().is_empty());
+    assert_eq!(empty.declared_length().get(), 0);
+    assert_eq!(
+        provider.capture(&grant, &request_for(83, 2, 0, 1), &CancelFlag::new()),
+        Err(SourceError::PayloadTooLarge)
+    );
 }
 
 #[test]
