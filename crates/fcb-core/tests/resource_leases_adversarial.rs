@@ -28,10 +28,10 @@ fn competing_owners_share_one_capacity_domain_and_reclaim_it() {
     assert_eq!(saturated.active_allocations(), 2);
     assert_eq!(saturated.active_leases(), 2);
 
-    assert_eq!(
+    assert!(matches!(
         budget.try_reserve_managed(owner(103), allocation(3), ByteLength::new(1)),
         Err(CoreError::LimitExceeded)
-    );
+    ));
     assert_eq!(budget.accounting(), saturated);
 
     drop(managed);
@@ -60,18 +60,18 @@ fn duplicate_raw_allocation_id_is_rejected_without_sharing() {
         .unwrap();
     let before = budget.accounting();
 
-    assert_eq!(
+    assert!(matches!(
         budget.try_reserve_managed(owner(112), allocation(11), ByteLength::new(7)),
         Err(CoreError::OwnershipMismatch)
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         budget.try_reserve_managed(owner(113), allocation(11), ByteLength::new(6)),
         Err(CoreError::OwnershipMismatch)
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         budget.try_reserve_queue_bytes(owner(114), allocation(11), ByteLength::new(7)),
         Err(CoreError::OwnershipMismatch)
-    );
+    ));
     assert_eq!(budget.accounting(), before);
     assert_eq!(original.info().owner(), owner(111));
     drop(original);
@@ -95,10 +95,10 @@ fn validated_lease_capability_shares_once_and_survives_budget_drop() {
     assert_eq!(shared.info().owner(), owner(117));
     assert_eq!(shared.info().allocation(), allocation(16));
 
-    assert_eq!(
+    assert!(matches!(
         other_budget.try_share(owner(118), &original),
         Err(CoreError::OwnershipMismatch)
-    );
+    ));
     assert_eq!(other_budget.accounting().reserved().get(), 0);
 
     drop(budget);
@@ -128,10 +128,10 @@ fn old_new_overlap_is_charged_until_the_old_generation_releases() {
     assert_eq!(overlap.active_leases(), 2);
     assert!(overlap.reserved().get() > before_new.reserved().get());
 
-    assert_eq!(
+    assert!(matches!(
         budget.try_reserve_managed(owner(123), allocation(23), ByteLength::new(1)),
         Err(CoreError::LimitExceeded)
-    );
+    ));
     assert_eq!(budget.accounting(), overlap);
 
     drop(old);
@@ -156,18 +156,18 @@ fn failed_reservations_leave_all_conservation_counters_unchanged() {
         .unwrap();
     let before = budget.accounting();
 
-    assert_eq!(
+    assert!(matches!(
         budget.try_reserve_queue_bytes(owner(132), allocation(32), ByteLength::new(4)),
         Err(CoreError::LimitExceeded)
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         budget.try_reserve_managed(owner(132), allocation(31), ByteLength::new(4)),
         Err(CoreError::OwnershipMismatch)
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         budget.try_reserve_managed(owner(132), allocation(33), ByteLength::new(0)),
         Err(CoreError::InvalidId)
-    );
+    ));
     assert_eq!(budget.accounting(), before);
     assert_eq!(existing.info().allocation().get(), 31);
     assert_eq!(existing.info().kind(), ResourceKind::Managed);
@@ -193,10 +193,10 @@ fn reclamation_progresses_after_saturation_and_final_clone_release() {
     assert_eq!(saturated.available().get(), 0);
     assert_eq!(saturated.active_allocations(), 2);
     assert_eq!(saturated.active_leases(), 2);
-    assert_eq!(
+    assert!(matches!(
         budget.try_reserve_managed(owner(143), allocation(43), ByteLength::new(1)),
         Err(CoreError::LimitExceeded)
-    );
+    ));
     assert_eq!(budget.accounting(), saturated);
 
     drop(completion);
