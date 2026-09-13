@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeSet, marker::PhantomData, sync::Arc};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    marker::PhantomData,
+    sync::Arc,
+};
 
 pub mod handles;
 pub mod resources;
@@ -25,6 +29,10 @@ pub enum CoreError {
     Exhausted,
     DuplicateId,
     OwnershipMismatch,
+    NativeSentinel,
+    InvalidUtf8Boundary,
+    InvalidUtf16,
+    InvalidBidiBoundary,
     StalePublication,
     StaleRequestGeneration,
     StaleSourceRevision,
@@ -42,6 +50,10 @@ impl CoreError {
             Self::Exhausted => "IDENTITY_EXHAUSTED",
             Self::DuplicateId => "DUPLICATE_ID",
             Self::OwnershipMismatch => "OWNERSHIP_MISMATCH",
+            Self::NativeSentinel => "NATIVE_SENTINEL",
+            Self::InvalidUtf8Boundary => "INVALID_UTF8_BOUNDARY",
+            Self::InvalidUtf16 => "INVALID_UTF16",
+            Self::InvalidBidiBoundary => "INVALID_BIDI_BOUNDARY",
             Self::StalePublication => "STALE_PUBLICATION",
             Self::StaleRequestGeneration => "STALE_REQUEST_GENERATION",
             Self::StaleSourceRevision => "STALE_SOURCE_REVISION",
@@ -88,6 +100,14 @@ macro_rules! owner_qualified_id {
             pub const fn get(self) -> u64 {
                 self.value
             }
+
+            pub const fn validate_for(self, owner: ArenaOwnerId) -> Result<(), CoreError> {
+                if self.owner == owner {
+                    Ok(())
+                } else {
+                    Err(CoreError::OwnershipMismatch)
+                }
+            }
         }
     };
 }
@@ -106,6 +126,12 @@ owner_qualified_id!(DeviceId);
 owner_qualified_id!(DeviceGeneration);
 owner_qualified_id!(DisplayGeneration);
 owner_qualified_id!(PresentedFrameId);
+owner_qualified_id!(SemanticNodeId);
+
+/// Compatibility name for integrations that refer to semantic nodes as
+/// stable nodes. The owner-qualified ID is the stable identity; tree position
+/// is not part of the identity.
+pub type StableNodeId = SemanticNodeId;
 
 pub trait AllocatedId: Copy {
     fn from_parts(owner: ArenaOwnerId, value: u64) -> Result<Self, CoreError>;
@@ -247,11 +273,180 @@ macro_rules! offset_domain {
 }
 
 offset_domain!(ByteOffset);
-offset_domain!(Utf8Offset);
-offset_domain!(Utf16Offset);
-offset_domain!(ScalarOffset);
-offset_domain!(GraphemeOffset);
-offset_domain!(VisualOffset);
+offset_domain!(DecodedUtf8Offset);
+offset_domain!(Utf16CodeUnitOffset);
+offset_domain!(ScalarIndex);
+offset_domain!(GraphemeBoundary);
+offset_domain!(VisualPosition);
+
+/// The native text-range sentinel used by APIs that encode “not found” in an
+/// unsigned offset. It is never a valid source position.
+pub const NATIVE_NOT_FOUND: u64 = u64::MAX;
+
+/// Compatibility aliases retained for the original generic range vocabulary.
+pub type Utf8Offset = DecodedUtf8Offset;
+pub type Utf16Offset = Utf16CodeUnitOffset;
+pub type ScalarOffset = ScalarIndex;
+pub type GraphemeOffset = GraphemeBoundary;
+pub type VisualOffset = VisualPosition;
+
+impl Utf16CodeUnitOffset {
+    pub const fn from_native(value: u64) -> Result<Self, CoreError> {
+        if value == NATIVE_NOT_FOUND {
+            Err(CoreError::NativeSentinel)
+        } else {
+            Ok(Self::new(value))
+        }
+    }
+
+    pub const fn to_native(self) -> u64 {
+        self.get()
+    }
+}
+
+/// A caret may have two valid logical positions at one visual boundary in a
+/// bidirectional run. Affinity makes that choice explicit instead of
+/// pretending visual and source order are one-to-one.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CaretAffinity {
+    Upstream,
+    Downstream,
+}
+
+impl CaretAffinity {
+    pub const fn from_native(value: u8) -> Result<Self, CoreError> {
+        match value {
+            0 => Ok(Self::Upstream),
+            1 => Ok(Self::Downstream),
+            _ => Err(CoreError::InvalidBidiBoundary),
+        }
+    }
+
+    pub const fn to_native(self) -> u8 {
+        match self {
+            Self::Upstream => 0,
+            Self::Downstream => 1,
+        }
+    }
+}
+
+/// A source/visual boundary association for accessibility and hit testing.
+/// Multiple logical boundaries may share a visual position; affinity retains
+/// the distinction needed to move the caret without losing source order.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BidiBoundary {
+    logical: Utf16CodeUnitOffset,
+    visual: VisualPosition,
+    affinity: CaretAffinity,
+}
+
+impl BidiBoundary {
+    pub const fn new(
+        logical: Utf16CodeUnitOffset,
+        visual: VisualPosition,
+        affinity: CaretAffinity,
+    ) -> Self {
+        Self {
+            logical,
+            visual,
+            affinity,
+        }
+    }
+
+    pub const fn logical(self) -> Utf16CodeUnitOffset {
+        self.logical
+    }
+
+    pub const fn visual(self) -> VisualPosition {
+        self.visual
+    }
+
+    pub const fn affinity(self) -> CaretAffinity {
+        self.affinity
+    }
+}
+
+/// Bounded, source-free evidence for range validation outcomes.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RangeEvidenceKind {
+    NativeUtf16,
+    Utf8Boundary,
+    Utf16Boundary,
+    BidiBoundary,
+    SemanticNode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RangeEvidenceEvent {
+    kind: RangeEvidenceKind,
+    outcome: Result<(), CoreError>,
+}
+
+impl RangeEvidenceEvent {
+    pub const fn new(kind: RangeEvidenceKind, outcome: Result<(), CoreError>) -> Self {
+        Self { kind, outcome }
+    }
+
+    pub const fn kind(self) -> RangeEvidenceKind {
+        self.kind
+    }
+
+    pub const fn outcome(self) -> Result<(), CoreError> {
+        self.outcome
+    }
+}
+
+pub struct RangeEvidenceRing<const CAPACITY: usize> {
+    events: VecDeque<RangeEvidenceEvent>,
+    accepted: u64,
+    rejected: u64,
+}
+
+impl<const CAPACITY: usize> RangeEvidenceRing<CAPACITY> {
+    pub fn new() -> Self {
+        Self {
+            events: VecDeque::with_capacity(CAPACITY),
+            accepted: 0,
+            rejected: 0,
+        }
+    }
+
+    pub const fn capacity(&self) -> usize {
+        CAPACITY
+    }
+
+    pub fn record(&mut self, event: RangeEvidenceEvent) {
+        if event.outcome().is_ok() {
+            self.accepted = self.accepted.saturating_add(1);
+        } else {
+            self.rejected = self.rejected.saturating_add(1);
+        }
+        if CAPACITY != 0 && self.events.len() == CAPACITY {
+            let _ = self.events.pop_front();
+        }
+        if CAPACITY != 0 {
+            self.events.push_back(event);
+        }
+    }
+
+    pub const fn accepted(&self) -> u64 {
+        self.accepted
+    }
+
+    pub const fn rejected(&self) -> u64 {
+        self.rejected
+    }
+
+    pub fn events(&self) -> &VecDeque<RangeEvidenceEvent> {
+        &self.events
+    }
+}
+
+impl<const CAPACITY: usize> Default for RangeEvidenceRing<CAPACITY> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ByteLength(u64);
@@ -359,12 +554,117 @@ impl OffsetRange<Utf16Offset> {
     }
 }
 
+impl OffsetRange<ScalarIndex> {
+    pub const fn len(self) -> u64 {
+        self.end.get() - self.start.get()
+    }
+}
+
+impl OffsetRange<GraphemeBoundary> {
+    pub const fn len(self) -> u64 {
+        self.end.get() - self.start.get()
+    }
+}
+
+impl OffsetRange<VisualPosition> {
+    pub const fn len(self) -> u64 {
+        self.end.get() - self.start.get()
+    }
+}
+
 pub type ByteRange = OffsetRange<ByteOffset>;
 pub type Utf8Range = OffsetRange<Utf8Offset>;
 pub type Utf16Range = OffsetRange<Utf16Offset>;
 pub type ScalarRange = OffsetRange<ScalarOffset>;
 pub type GraphemeRange = OffsetRange<GraphemeOffset>;
 pub type VisualRange = OffsetRange<VisualOffset>;
+pub type DecodedUtf8Range = OffsetRange<DecodedUtf8Offset>;
+pub type Utf16CodeUnitRange = OffsetRange<Utf16CodeUnitOffset>;
+pub type ScalarIndexRange = OffsetRange<ScalarIndex>;
+pub type GraphemeBoundaryRange = OffsetRange<GraphemeBoundary>;
+pub type VisualPositionRange = OffsetRange<VisualPosition>;
+
+impl OffsetRange<ByteOffset> {
+    pub fn as_usize_bounds(self) -> Result<(usize, usize), CoreError> {
+        let start = usize::try_from(self.start.get()).map_err(|_| CoreError::ArithmeticOverflow)?;
+        let end = usize::try_from(self.end.get()).map_err(|_| CoreError::ArithmeticOverflow)?;
+        Ok((start, end))
+    }
+}
+
+/// Convert an offset in decoded UTF-8 text to a byte boundary without
+/// allowing an interior multi-byte character to become a slice index.
+pub fn decoded_utf8_to_byte_boundary(
+    text: &str,
+    offset: DecodedUtf8Offset,
+) -> Result<ByteOffset, CoreError> {
+    let length = u64::try_from(text.len()).map_err(|_| CoreError::ArithmeticOverflow)?;
+    if offset.get() > length {
+        return Err(CoreError::LimitExceeded);
+    }
+    let index = usize::try_from(offset.get()).map_err(|_| CoreError::ArithmeticOverflow)?;
+    if !text.is_char_boundary(index) {
+        return Err(CoreError::InvalidUtf8Boundary);
+    }
+    Ok(ByteOffset::new(offset.get()))
+}
+
+/// Convert a scalar boundary to a UTF-16 code-unit boundary.
+pub fn scalar_to_utf16_boundary(
+    text: &str,
+    scalar: ScalarIndex,
+) -> Result<Utf16CodeUnitOffset, CoreError> {
+    let target = scalar.get();
+    let mut scalar_index = 0_u64;
+    let mut code_units = 0_u64;
+    for character in text.chars() {
+        if scalar_index == target {
+            return Ok(Utf16CodeUnitOffset::new(code_units));
+        }
+        scalar_index = scalar_index
+            .checked_add(1)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        code_units = code_units
+            .checked_add(u64::from(character.len_utf16() as u16))
+            .ok_or(CoreError::ArithmeticOverflow)?;
+    }
+    if scalar_index == target {
+        Ok(Utf16CodeUnitOffset::new(code_units))
+    } else {
+        Err(CoreError::LimitExceeded)
+    }
+}
+
+/// Convert a UTF-16 code-unit boundary to a scalar boundary. An offset inside
+/// a surrogate pair is rejected rather than rounded to a neighboring scalar.
+pub fn utf16_to_scalar_boundary(
+    text: &str,
+    offset: Utf16CodeUnitOffset,
+) -> Result<ScalarIndex, CoreError> {
+    let target = offset.get();
+    let mut scalar_index = 0_u64;
+    let mut code_units = 0_u64;
+    for character in text.chars() {
+        if code_units == target {
+            return Ok(ScalarIndex::new(scalar_index));
+        }
+        let next_units = code_units
+            .checked_add(u64::from(character.len_utf16() as u16))
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        if target < next_units {
+            return Err(CoreError::InvalidUtf16);
+        }
+        code_units = next_units;
+        scalar_index = scalar_index
+            .checked_add(1)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+    }
+    if code_units == target {
+        Ok(ScalarIndex::new(scalar_index))
+    } else {
+        Err(CoreError::LimitExceeded)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PublicationContext {

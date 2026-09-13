@@ -1,8 +1,132 @@
 use fcb_core::{
-    ArenaOwnerId, CoreError, DisplayGeneration, FileId, IdAllocator, ImmutableSnapshot,
-    PersistedIdAuthority, PublicationContext, PublicationToken, QueryGeneration, SnapshotCell,
-    SnapshotDelta, SourceRevision,
+    decoded_utf8_to_byte_boundary, scalar_to_utf16_boundary, utf16_to_scalar_boundary,
+    ArenaOwnerId, BidiBoundary, ByteOffset, CaretAffinity, CoreError, DecodedUtf8Offset,
+    DisplayGeneration, FileId, GraphemeBoundary, GraphemeBoundaryRange, IdAllocator,
+    ImmutableSnapshot, NATIVE_NOT_FOUND, PersistedIdAuthority, PublicationContext,
+    PublicationToken, QueryGeneration, RangeEvidenceEvent, RangeEvidenceKind, RangeEvidenceRing,
+    ScalarIndex, SnapshotCell, SnapshotDelta, SourceRevision, Utf16CodeUnitOffset,
+    VisualPosition,
 };
+
+#[test]
+fn typed_ranges_preserve_domains_and_checked_boundaries() {
+    let bytes = fcb_core::ByteRange::new(ByteOffset::new(1), ByteOffset::new(4)).unwrap();
+    let graphemes = GraphemeBoundaryRange::new(
+        GraphemeBoundary::new(2),
+        GraphemeBoundary::new(5),
+    )
+    .unwrap();
+
+    assert_eq!(bytes.len().get(), 3);
+    assert_eq!(graphemes.len(), 3);
+    assert_eq!(
+        fcb_core::ByteRange::new(ByteOffset::new(4), ByteOffset::new(1)),
+        Err(CoreError::RangeReversed)
+    );
+    assert_eq!(
+        ByteOffset::new(u64::MAX).checked_add(1),
+        Err(CoreError::ArithmeticOverflow)
+    );
+}
+
+#[test]
+fn utf8_utf16_and_scalar_boundaries_reject_native_and_surrogate_errors() {
+    let text = "a😀b";
+
+    assert_eq!(
+        decoded_utf8_to_byte_boundary(text, DecodedUtf8Offset::new(1)),
+        Ok(ByteOffset::new(1))
+    );
+    assert_eq!(
+        decoded_utf8_to_byte_boundary(text, DecodedUtf8Offset::new(2)),
+        Err(CoreError::InvalidUtf8Boundary)
+    );
+    assert_eq!(
+        scalar_to_utf16_boundary(text, ScalarIndex::new(2)),
+        Ok(Utf16CodeUnitOffset::new(3))
+    );
+    assert_eq!(
+        utf16_to_scalar_boundary(text, Utf16CodeUnitOffset::new(2)),
+        Err(CoreError::InvalidUtf16)
+    );
+    assert_eq!(
+        utf16_to_scalar_boundary(text, Utf16CodeUnitOffset::new(5)),
+        Err(CoreError::LimitExceeded)
+    );
+    assert_eq!(
+        Utf16CodeUnitOffset::from_native(NATIVE_NOT_FOUND),
+        Err(CoreError::NativeSentinel)
+    );
+    assert_eq!(
+        Utf16CodeUnitOffset::from_native(3),
+        Ok(Utf16CodeUnitOffset::new(3))
+    );
+}
+
+#[test]
+fn semantic_nodes_and_bidi_boundaries_keep_owner_and_affinity_explicit() {
+    let owner = ArenaOwnerId::new(301).unwrap();
+    let foreign_owner = ArenaOwnerId::new(302).unwrap();
+    let node = fcb_core::SemanticNodeId::new(owner, 1).unwrap();
+    let same_node = fcb_core::SemanticNodeId::new(owner, 1).unwrap();
+    let foreign_node = fcb_core::SemanticNodeId::new(foreign_owner, 1).unwrap();
+
+    assert_eq!(node.validate_for(owner), Ok(()));
+    assert_eq!(node.validate_for(foreign_owner), Err(CoreError::OwnershipMismatch));
+    assert_eq!(node, same_node);
+    assert_ne!(node, foreign_node);
+    assert_eq!(
+        fcb_core::SemanticNodeId::new(owner, 0),
+        Err(CoreError::InvalidId)
+    );
+
+    let upstream = BidiBoundary::new(
+        Utf16CodeUnitOffset::new(1),
+        VisualPosition::new(7),
+        CaretAffinity::Upstream,
+    );
+    let downstream = BidiBoundary::new(
+        Utf16CodeUnitOffset::new(2),
+        VisualPosition::new(7),
+        CaretAffinity::Downstream,
+    );
+    assert_eq!(upstream.visual(), downstream.visual());
+    assert_ne!(upstream.logical(), downstream.logical());
+    assert_eq!(upstream.affinity().to_native(), 0);
+    assert_eq!(CaretAffinity::from_native(1), Ok(CaretAffinity::Downstream));
+    assert_eq!(CaretAffinity::from_native(2), Err(CoreError::InvalidBidiBoundary));
+    assert_eq!(
+        Utf16CodeUnitOffset::new(u64::MAX).checked_add(1),
+        Err(CoreError::ArithmeticOverflow)
+    );
+}
+
+#[test]
+fn range_evidence_ring_is_bounded_and_aggregated_without_source_payloads() {
+    let mut evidence = RangeEvidenceRing::<2>::new();
+    evidence.record(RangeEvidenceEvent::new(
+        RangeEvidenceKind::Utf16Boundary,
+        Ok(()),
+    ));
+    evidence.record(RangeEvidenceEvent::new(
+        RangeEvidenceKind::NativeUtf16,
+        Err(CoreError::NativeSentinel),
+    ));
+    evidence.record(RangeEvidenceEvent::new(
+        RangeEvidenceKind::BidiBoundary,
+        Err(CoreError::InvalidBidiBoundary),
+    ));
+
+    assert_eq!(evidence.capacity(), 2);
+    assert_eq!(evidence.accepted(), 1);
+    assert_eq!(evidence.rejected(), 2);
+    assert_eq!(evidence.events().len(), 2);
+    assert_eq!(evidence.events()[0].kind(), RangeEvidenceKind::NativeUtf16);
+    assert_eq!(
+        evidence.events()[1].outcome(),
+        Err(CoreError::InvalidBidiBoundary)
+    );
+}
 
 #[test]
 fn independent_allocators_are_owner_qualified() {
