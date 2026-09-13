@@ -69,6 +69,15 @@ impl Feature {
         matches!(self, Self::Source | Self::View)
     }
 
+    /// Whether this capability's target boundary is supported by this build.
+    /// Pattern matching keeps the const path independent of derived equality.
+    pub const fn target_supported(self) -> bool {
+        match self {
+            Self::MacosMetal => cfg!(target_os = "macos"),
+            _ => true,
+        }
+    }
+
     const fn bit(self) -> u16 {
         1 << (self as u16)
     }
@@ -108,11 +117,7 @@ impl FeatureSet {
         let mut index = 0;
         while index < Feature::ALL.len() {
             let feature = Feature::ALL[index];
-            let target_supported = match feature {
-                Feature::MacosMetal => cfg!(target_os = "macos"),
-                _ => true,
-            };
-            if feature.implemented() && target_supported {
+            if feature.implemented() && feature.target_supported() {
                 bits |= feature.bit();
             }
             index += 1;
