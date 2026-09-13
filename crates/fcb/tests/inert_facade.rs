@@ -5,6 +5,8 @@ use fcb::{
     SourceCapture, SourceProvider, SourceRevision,
 };
 
+const COMPILE_TIME_AVAILABLE: FeatureSet = FeatureSet::available();
+
 #[test]
 fn independent_consumers_keep_sources_and_ids_separate() {
     let owner_a = ArenaOwnerId::new(101).unwrap();
@@ -82,6 +84,14 @@ fn feature_union_reports_only_compile_selected_capabilities() {
         assert!(!available.contains(feature));
         assert_eq!(BrowserSession::new(ArenaOwnerId::new(505).unwrap()).require_feature(feature), Err(FcbError::FeatureUnavailable));
     }
+}
+
+#[test]
+fn available_capabilities_are_const_evaluable_and_honest() {
+    assert_eq!(COMPILE_TIME_AVAILABLE, FeatureSet::available());
+    assert!(COMPILE_TIME_AVAILABLE.contains(Feature::Source));
+    assert!(COMPILE_TIME_AVAILABLE.contains(Feature::View));
+    assert!(!COMPILE_TIME_AVAILABLE.contains(Feature::Search));
 }
 
 #[test]

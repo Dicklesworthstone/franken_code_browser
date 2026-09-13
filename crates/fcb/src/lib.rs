@@ -108,9 +108,11 @@ impl FeatureSet {
         let mut index = 0;
         while index < Feature::ALL.len() {
             let feature = Feature::ALL[index];
-            if feature.implemented()
-                && (feature != Feature::MacosMetal || cfg!(target_os = "macos"))
-            {
+            let target_supported = match feature {
+                Feature::MacosMetal => cfg!(target_os = "macos"),
+                _ => true,
+            };
+            if feature.implemented() && target_supported {
                 bits |= feature.bit();
             }
             index += 1;
