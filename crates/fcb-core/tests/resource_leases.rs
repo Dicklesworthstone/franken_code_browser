@@ -51,12 +51,7 @@ fn shared_allocation_is_charged_once_until_last_owner_releases() {
         )
         .unwrap();
     let second = budget
-        .try_reserve(
-            owner(12),
-            allocation(22),
-            ResourceKind::Managed,
-            ByteLength::new(9),
-        )
+        .try_share(owner(12), &first)
         .unwrap();
 
     let accounting = budget.accounting();
@@ -93,6 +88,40 @@ fn cloned_lease_does_not_release_shared_capacity_early() {
     retained.release();
     assert_eq!(budget.accounting().reserved().get(), 0);
     assert_eq!(budget.accounting().active_leases(), 0);
+}
+
+#[test]
+fn raw_allocation_id_collision_is_not_implicit_sharing() {
+    let budget = ResourceBudget::new(owner(25), ByteLength::new(12)).unwrap();
+    let first = budget
+        .try_reserve_managed(owner(26), allocation(27), ByteLength::new(8))
+        .unwrap();
+    let before = budget.accounting();
+
+    assert!(matches!(
+        budget.try_reserve_managed(owner(28), allocation(27), ByteLength::new(8)),
+        Err(CoreError::OwnershipMismatch)
+    ));
+    assert_eq!(budget.accounting(), before);
+
+    drop(first);
+}
+
+#[test]
+fn sharing_requires_the_receiving_budget_ledger_not_equal_domain_ids() {
+    let source_budget = ResourceBudget::new(owner(35), ByteLength::new(10)).unwrap();
+    let receiving_budget = ResourceBudget::new(owner(35), ByteLength::new(10)).unwrap();
+    let source = source_budget
+        .try_reserve_managed(owner(36), allocation(37), ByteLength::new(5))
+        .unwrap();
+
+    assert!(matches!(
+        receiving_budget.try_share(owner(38), &source),
+        Err(CoreError::OwnershipMismatch)
+    ));
+    assert_eq!(source_budget.accounting().reserved().get(), 5);
+    assert_eq!(receiving_budget.accounting().reserved().get(), 0);
+    drop(source);
 }
 
 #[test]
@@ -168,4 +197,17 @@ fn budget_clone_shares_domain_but_drops_are_owner_scoped() {
     assert_eq!(other_handle.accounting().queue().get(), 3);
     drop(second);
     assert_eq!(other_handle.accounting().reserved().get(), 0);
+}
+
+#[test]
+fn lease_keeps_authoritative_accounting_alive_after_budget_drop() {
+    let budget = ResourceBudget::new(owner(70), ByteLength::new(10)).unwrap();
+    let lease = budget
+        .try_reserve_queue_bytes(owner(71), allocation(71), ByteLength::new(6))
+        .unwrap();
+
+    drop(budget);
+    assert_eq!(lease.accounting().reserved().get(), 6);
+    assert_eq!(lease.accounting().queue().get(), 6);
+    lease.release();
 }

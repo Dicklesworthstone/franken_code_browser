@@ -9,17 +9,18 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex},
 };
 
 use crate::{ArenaOwnerId, ByteLength, CoreError};
 
 /// Stable key for one allocation within a [`ResourceBudget`] domain.
 ///
-/// Reusing a key represents shared ownership of the same allocation. The
-/// budget verifies that the resource kind and allocated capacity agree across
-/// all references to that key, so an `Arc` clone cannot silently create a
-/// second charge or change the charge underneath another owner.
+/// A raw key identifies a new allocation reservation. Reusing an active key
+/// through [`ResourceBudget::try_reserve`] is rejected; shared ownership must
+/// be obtained from an existing validated [`ResourceLease`]. The budget then
+/// verifies that the resource kind and allocated capacity agree across all
+/// references to that key.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ResourceAllocationId(u64);
 
@@ -184,11 +185,42 @@ impl ResourceLedger {
         }
     }
 
-    fn remove_reference(
+    fn add_shared_reference(
         &mut self,
         owner: ArenaOwnerId,
         allocation: ResourceAllocationId,
-    ) {
+        kind: ResourceKind,
+        bytes: u64,
+    ) -> Result<(), CoreError> {
+        let next_active_leases = self
+            .active_leases
+            .checked_add(1)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        let record = self
+            .allocations
+            .get_mut(&allocation)
+            .ok_or(CoreError::OwnershipMismatch)?;
+        if record.kind != kind || record.bytes != bytes {
+            return Err(CoreError::OwnershipMismatch);
+        }
+        let next_references = record
+            .references
+            .checked_add(1)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        let next_owner_references = record
+            .owners
+            .get(&owner)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        record.references = next_references;
+        record.owners.insert(owner, next_owner_references);
+        self.active_leases = next_active_leases;
+        Ok(())
+    }
+
+    fn remove_reference(&mut self, owner: ArenaOwnerId, allocation: ResourceAllocationId) {
         let should_remove = {
             let record = self
                 .allocations
@@ -264,10 +296,12 @@ impl ResourceBudget {
 
     /// Reserve allocated capacity for one managed or queue allocation.
     ///
-    /// The allocation key is charged once while any owner holds a lease for
-    /// it. A second key is an old/new overlap and is charged independently.
-    /// Capacity is checked before the ledger is changed, so a failed request
-    /// leaves every counter and existing lease untouched.
+    /// A raw allocation key can be reserved only once while active. A second
+    /// key is an old/new overlap and is charged independently. To represent
+    /// true shared ownership, pass an existing lease to [`Self::try_share`];
+    /// equal integers alone are not a sharing capability. Capacity is checked
+    /// before the ledger is changed, so a failed request leaves every counter
+    /// and existing lease untouched.
     pub fn try_reserve(
         &self,
         owner: ArenaOwnerId,
@@ -280,52 +314,35 @@ impl ResourceBudget {
         }
 
         let mut ledger = self.lock();
+        if ledger.allocations.contains_key(&allocation) {
+            return Err(CoreError::OwnershipMismatch);
+        }
         let next_active_leases = ledger
             .active_leases
             .checked_add(1)
             .ok_or(CoreError::ArithmeticOverflow)?;
-        if let Some(record) = ledger.allocations.get_mut(&allocation) {
-            if record.kind != kind || record.bytes != bytes.get() {
-                return Err(CoreError::OwnershipMismatch);
-            }
-            let next_references = record
-                .references
-                .checked_add(1)
-                .ok_or(CoreError::ArithmeticOverflow)?;
-            let next_owner_references = record
-                .owners
-                .get(&owner)
-                .copied()
-                .unwrap_or(0)
-                .checked_add(1)
-                .ok_or(CoreError::ArithmeticOverflow)?;
-            record.references = next_references;
-            record.owners.insert(owner, next_owner_references);
-            ledger.active_leases = next_active_leases;
-        } else {
-            let reserved = ledger
-                .reserved
-                .checked_add(bytes.get())
-                .ok_or(CoreError::ArithmeticOverflow)?;
-            if reserved > ledger.capacity {
-                return Err(CoreError::LimitExceeded);
-            }
-            ledger.add_kind(kind, bytes.get())?;
-            ledger.reserved = reserved;
-            ledger.peak_reserved = ledger.peak_reserved.max(reserved);
-            ledger.active_leases = next_active_leases;
-            let mut owners = BTreeMap::new();
-            owners.insert(owner, 1);
-            ledger.allocations.insert(
-                allocation,
-                AllocationRecord {
-                    kind,
-                    bytes: bytes.get(),
-                    references: 1,
-                    owners,
-                },
-            );
+        let reserved = ledger
+            .reserved
+            .checked_add(bytes.get())
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        if reserved > ledger.capacity {
+            return Err(CoreError::LimitExceeded);
         }
+        ledger.add_kind(kind, bytes.get())?;
+        ledger.reserved = reserved;
+        ledger.peak_reserved = ledger.peak_reserved.max(reserved);
+        ledger.active_leases = next_active_leases;
+        let mut owners = BTreeMap::new();
+        owners.insert(owner, 1);
+        ledger.allocations.insert(
+            allocation,
+            AllocationRecord {
+                kind,
+                bytes: bytes.get(),
+                references: 1,
+                owners,
+            },
+        );
 
         Ok(ResourceLease {
             inner: Arc::new(LeaseInner {
@@ -336,7 +353,39 @@ impl ResourceBudget {
                     kind,
                     bytes,
                 },
-                ledger: Arc::downgrade(&self.ledger),
+                ledger: Arc::clone(&self.ledger),
+            }),
+        })
+    }
+
+    /// Share an existing allocation through a validated lease capability.
+    ///
+    /// The source lease must belong to this exact budget ledger, not merely to
+    /// a budget with an equal domain ID. This prevents independent budgets or
+    /// guessed raw allocation keys from bypassing accounting. The shared
+    /// allocation remains charged until every reservation and lease clone is
+    /// released.
+    pub fn try_share(
+        &self,
+        owner: ArenaOwnerId,
+        source: &ResourceLease,
+    ) -> Result<ResourceLease, CoreError> {
+        if !Arc::ptr_eq(&self.ledger, &source.inner.ledger) {
+            return Err(CoreError::OwnershipMismatch);
+        }
+        let info = source.info();
+        let mut ledger = self.lock();
+        ledger.add_shared_reference(owner, info.allocation, info.kind, info.bytes.get())?;
+        Ok(ResourceLease {
+            inner: Arc::new(LeaseInner {
+                info: ResourceLeaseInfo {
+                    domain: ledger.domain,
+                    owner,
+                    allocation: info.allocation,
+                    kind: info.kind,
+                    bytes: info.bytes,
+                },
+                ledger: Arc::clone(&self.ledger),
             }),
         })
     }
@@ -393,6 +442,16 @@ impl ResourceLease {
         self.inner.info
     }
 
+    /// Read the authoritative accounting while this lease keeps its domain
+    /// alive, even if every [`ResourceBudget`] handle has been dropped.
+    pub fn accounting(&self) -> ResourceAccounting {
+        self.inner
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .accounting()
+    }
+
     /// Explicitly release this handle. Other clones or owners remain charged.
     pub fn release(self) {
         drop(self);
@@ -401,14 +460,15 @@ impl ResourceLease {
 
 struct LeaseInner {
     info: ResourceLeaseInfo,
-    ledger: Weak<Mutex<ResourceLedger>>,
+    ledger: Arc<Mutex<ResourceLedger>>,
 }
 
 impl Drop for LeaseInner {
     fn drop(&mut self) {
-        if let Some(ledger) = self.ledger.upgrade() {
-            let mut ledger = ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            ledger.remove_reference(self.info.owner, self.info.allocation);
-        }
+        let mut ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ledger.remove_reference(self.info.owner, self.info.allocation);
     }
 }
