@@ -6,7 +6,7 @@
 
 Explore the repository. Zoom into exact source. Search without losing your place.
 
-[![Status](https://img.shields.io/badge/status-design%20and%20planning-d29922)](IMPLEMENTATION_STATUS.md)
+[![Status](https://img.shields.io/badge/status-foundations%20landing-d29922)](IMPLEMENTATION_STATUS.md)
 [![Target](https://img.shields.io/badge/target-Apple%20Silicon-555555)](#platform-and-distribution)
 [![Design](https://img.shields.io/badge/design-Rust%20%2B%20Metal-b7410e)](ARCHITECTURE.md)
 [![License](https://img.shields.io/badge/license-MIT%20%2B%20rider-blue)](LICENSE)
@@ -14,9 +14,11 @@ Explore the repository. Zoom into exact source. Search without losing your place
 </div>
 
 > [!IMPORTANT]
-> This repository currently contains the comprehensive design and project documentation.
-> There is no application, Cargo workspace, published Rust crate, installer, or benchmark result
-> yet. Features and commands below describe the planned product. See
+> This repository contains the comprehensive design and project documentation plus the first
+> foundation crates (typed core, inert facade, runtime/source seams, test-support tooling) with
+> batch-verified test suites. There is no application, executable, installer, or benchmark result
+> yet: the atlas, source reader, search, Markdown integration and native renderer described below
+> remain unimplemented. Features and commands below describe the planned product. See
 > [implementation status](IMPLEMENTATION_STATUS.md) for the exact boundary.
 
 ## Why a spatial source browser?
