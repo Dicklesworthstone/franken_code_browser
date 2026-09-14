@@ -332,11 +332,19 @@ impl ExtentCapture {
             }
             hole_end = Some(hole.end());
         }
-        for observed in &observations {
-            for hole in &holes {
-                if observed.range().start() < hole.end() && hole.start() < observed.range().end() {
-                    return Err(SourceError::OverlappingExtent);
-                }
+        // Both lists are sorted and internally disjoint at this point. Each
+        // step retires one interval, bounding hostile fragmented inputs to
+        // O(observations + holes) comparisons with no auxiliary allocation.
+        let (mut observed_index, mut hole_index) = (0, 0);
+        while let (Some(observed), Some(hole)) =
+            (observations.get(observed_index), holes.get(hole_index))
+        {
+            if observed.range().end() <= hole.start() {
+                observed_index += 1;
+            } else if hole.end() <= observed.range().start() {
+                hole_index += 1;
+            } else {
+                return Err(SourceError::OverlappingExtent);
             }
         }
         if let Some(total) = total_length {
@@ -720,6 +728,53 @@ mod tests {
             Err(SourceError::RangeOutOfBounds)
         );
         assert_eq!(capture.declared_length().get(), 5);
+    }
+
+    #[test]
+    fn extent_merge_matches_exhaustive_small_interval_oracle() {
+        // Enumerate all internally disjoint subsets of nonempty intervals
+        // in [0,4]. Unlike the production merge, the reference examines every
+        // cross-list pair, including nesting, adjacency and empty lists.
+        let candidates: Vec<_> = (0..4)
+            .flat_map(|start| ((start + 1)..=4).map(move |end| range(start, end)))
+            .collect();
+        let mut lists = Vec::new();
+        for mask in 0..(1usize << candidates.len()) {
+            let selected: Vec<_> = candidates.iter().enumerate()
+                .filter(|(index, _)| mask & (1 << index) != 0)
+                .map(|(_, interval)| *interval)
+                .collect();
+            if selected.windows(2).all(|pair| pair[0].end() <= pair[1].start()) {
+                lists.push(selected);
+            }
+        }
+        for observed in &lists {
+            for holes in &lists {
+                let overlaps = observed.iter().any(|a| holes.iter().any(|b|
+                    a.start() < b.end() && b.start() < a.end()));
+                let observations = observed.iter().map(|r|
+                    ObservedRange::new(*r, &vec![0; r.len().get() as usize]).unwrap()
+                ).collect();
+                let actual = ExtentCapture::new(
+                    request(12, 3), observations, holes.clone(), Some(ByteLength::new(4)));
+                assert_eq!(actual.as_ref().err().copied(),
+                    overlaps.then_some(SourceError::OverlappingExtent),
+                    "observed={observed:?}, holes={holes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn fragmented_extent_accepts_adjacency_and_detects_late_overlap() {
+        let count = 20_000u64;
+        let observations: Vec<_> = (0..count).map(|i|
+            ObservedRange::new(range(2 * i, 2 * i + 1), b"x").unwrap()).collect();
+        let mut holes: Vec<_> = (0..count).map(|i| range(2 * i + 1, 2 * i + 2)).collect();
+        let total = Some(ByteLength::new(count * 2));
+        assert!(ExtentCapture::new(request(12, 3), observations.clone(), holes.clone(), total).is_ok());
+        *holes.last_mut().unwrap() = range(count * 2 - 2, count * 2);
+        assert_eq!(ExtentCapture::new(request(12, 3), observations, holes, total),
+            Err(SourceError::OverlappingExtent));
     }
 
     #[test]
