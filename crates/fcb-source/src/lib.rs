@@ -24,11 +24,16 @@
 //! overlap observations or exceed the declared total length, and complete
 //! captures whose declared length disagrees with their actual bytes.
 
+pub mod chunk;
 pub mod confined;
 pub mod path;
 pub mod restoration;
 pub mod root;
 
+pub use chunk::{
+    ChunkSize, ChunkedCapture, ChunkedReaderConfig, ExactRangeResult, RetainedCaptureStore,
+    SafeChunkReader, SourceChunk,
+};
 pub use confined::{ConfinedSourceReader, SymlinkPolicy};
 pub use path::{decode_uri_path, EscapedPathDisplay, NormalizedPath, RawPath};
 pub use restoration::{
@@ -54,6 +59,10 @@ pub struct ObservationDigest(u64);
 impl ObservationDigest {
     pub const fn get(self) -> u64 {
         self.0
+    }
+
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Self(raw)
     }
 
     /// FNV-1a 64-bit over the observed bytes, mixed with the byte length so
@@ -517,6 +526,12 @@ pub enum SourceError {
     SpecialObject,
     /// Invalid URI percent-encoding or malformed path bytes.
     EncodingError,
+    /// The source file was concurrently modified or truncated during read.
+    ConcurrentModification,
+    /// An operation requested a chunk outside valid chunk bounds.
+    ChunkOutOfBounds,
+    /// An anchor or query referred to an evicted or stale capture.
+    StaleCapture,
 }
 
 impl SourceError {
@@ -541,6 +556,9 @@ impl SourceError {
             Self::TraversalCycle => "SOURCE_TRAVERSAL_CYCLE",
             Self::SpecialObject => "SOURCE_SPECIAL_OBJECT",
             Self::EncodingError => "SOURCE_ENCODING_ERROR",
+            Self::ConcurrentModification => "SOURCE_CONCURRENT_MODIFICATION",
+            Self::ChunkOutOfBounds => "SOURCE_CHUNK_OUT_OF_BOUNDS",
+            Self::StaleCapture => "SOURCE_STALE_CAPTURE",
         }
     }
 }
@@ -1002,5 +1020,14 @@ mod tests {
         assert_eq!(SourceError::TraversalCycle.code(), "SOURCE_TRAVERSAL_CYCLE");
         assert_eq!(SourceError::SpecialObject.code(), "SOURCE_SPECIAL_OBJECT");
         assert_eq!(SourceError::EncodingError.code(), "SOURCE_ENCODING_ERROR");
+        assert_eq!(
+            SourceError::ConcurrentModification.code(),
+            "SOURCE_CONCURRENT_MODIFICATION"
+        );
+        assert_eq!(
+            SourceError::ChunkOutOfBounds.code(),
+            "SOURCE_CHUNK_OUT_OF_BOUNDS"
+        );
+        assert_eq!(SourceError::StaleCapture.code(), "SOURCE_STALE_CAPTURE");
     }
 }
