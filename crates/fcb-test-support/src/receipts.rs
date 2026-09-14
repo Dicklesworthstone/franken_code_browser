@@ -909,6 +909,7 @@ impl ScenarioReceipt {
         &self.scenario
     }
 
+
     pub const fn seed(&self) -> ScenarioSeed {
         self.seed
     }

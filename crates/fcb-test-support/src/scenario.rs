@@ -521,6 +521,109 @@ impl ScenarioDriver {
     }
 }
 
+
+/// Required outcome class for one named scenario in a result set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequiredOutcome {
+    Pass,
+    ExpectedFailure,
+}
+
+/// One named requirement for set-level validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequiredScenario {
+    pub name: String,
+    pub required: RequiredOutcome,
+}
+
+/// Set-level rejection reasons. An observed set that trips any of these is
+/// not evidence of a passing campaign, whatever its individual receipts
+/// claim.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SetRejection {
+    /// Zero observed cases cannot gate non-empty requirements.
+    NoCases,
+    /// A required scenario has no record at all.
+    MissingCase { name: String },
+    /// One scenario produced more than one terminal result.
+    DuplicateTerminal { name: String },
+    /// The recorded verdict class does not satisfy the requirement.
+    WrongFailureClass { name: String, actual: &'static str },
+    /// The receipt records the run as cancelled or successful while the
+    /// observed verdict was TimedOut.
+    TimeoutMislabeled { name: String, recorded_effect: &'static str },
+}
+
+/// Validate an observed result set against named requirements: every
+/// requirement must be present exactly once, in the required class, with
+/// receipts whose recorded effects agree with the observed verdicts.
+pub fn validate_results(
+    required: &[RequiredScenario],
+    records: &[ScenarioRecord],
+) -> Result<(), SetRejection> {
+    if !required.is_empty() && records.is_empty() {
+        return Err(SetRejection::NoCases);
+    }
+    for record in records {
+        if record.verdict == ScenarioVerdict::TimedOut {
+            let effect = record.receipt.outcome().effect();
+            if matches!(effect, Effect::Canceled | Effect::Succeeded) {
+                let recorded = match effect {
+                    Effect::Succeeded => "succeeded",
+                    Effect::Failed => "failed",
+                    Effect::Canceled => "canceled",
+                };
+                return Err(SetRejection::TimeoutMislabeled {
+                    name: record.name.clone(),
+                    recorded_effect: recorded,
+                });
+            }
+        }
+    }
+    for requirement in required {
+        let runs: Vec<&ScenarioRecord> = records
+            .iter()
+            .filter(|record| record.name == requirement.name)
+            .collect();
+        if runs.is_empty() {
+            return Err(SetRejection::MissingCase {
+                name: requirement.name.clone(),
+            });
+        }
+        let terminal: Vec<&ScenarioRecord> = runs
+            .into_iter()
+            .filter(|record| record.verdict != ScenarioVerdict::MissingEvidence)
+            .collect();
+        if terminal.len() > 1 {
+            return Err(SetRejection::DuplicateTerminal {
+                name: requirement.name.clone(),
+            });
+        }
+        let satisfied = match terminal.first() {
+            Some(record) => match requirement.required {
+                RequiredOutcome::Pass => record.verdict == ScenarioVerdict::Passed,
+                RequiredOutcome::ExpectedFailure => {
+                    record.verdict == ScenarioVerdict::ExpectedFailure
+                }
+            },
+            // Every record for the requirement is unexecuted: the required
+            // class was not produced.
+            None => false,
+        };
+        if !satisfied {
+            let actual = terminal
+                .first()
+                .map(|record| record.verdict.as_str())
+                .unwrap_or("missing_evidence");
+            return Err(SetRejection::WrongFailureClass {
+                name: requirement.name.clone(),
+                actual,
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,6 +652,142 @@ mod tests {
 
     fn redactor() -> Redactor {
         Redactor::new()
+    }
+
+
+    #[test]
+    fn set_validation_rejects_every_malformed_campaign() {
+        let redactor = Redactor::new();
+        let record_for = |name: &str, verdict: ScenarioVerdict, effect: Effect| ScenarioRecord {
+            name: name.to_string(),
+            route: ScenarioRoute::Headless,
+            verdict,
+            elapsed: Duration::ZERO,
+            receipt: ScenarioReceipt::from_draft(
+                &redactor,
+                ScenarioReceiptDraft {
+                    scenario: name.to_string(),
+                    seed: crate::receipts::ScenarioSeed(1),
+                    pin: scenario_pin(name, 1),
+                    route: crate::receipts::RouteId::new("route/headless").unwrap(),
+                    corpus_digest: ContentDigest::of(name.as_bytes()),
+                    corpus_count: 1,
+                    outcome: TerminalOutcome::new(None, effect, None),
+                    comparison: None,
+                    ring: EventRing::new(2),
+                    artifacts: vec![],
+                },
+            ),
+            replay: None,
+        };
+        let required = |name: &str, required: RequiredOutcome| RequiredScenario {
+            name: name.to_string(),
+            required,
+        };
+
+        // Zero cases gate nothing.
+        let mut driver = ScenarioDriver::new(4, false).unwrap();
+        driver.finish().unwrap();
+        assert_eq!(
+            validate_results(&[required("anything", RequiredOutcome::Pass)], &[]),
+            Err(SetRejection::NoCases)
+        );
+
+        // A missing required case is rejected.
+        let records = vec![record_for("present", ScenarioVerdict::Passed, Effect::Succeeded)];
+        assert_eq!(
+            validate_results(
+                &[
+                    required("present", RequiredOutcome::Pass),
+                    required("absent", RequiredOutcome::Pass),
+                ],
+                &records,
+            ),
+            Err(SetRejection::MissingCase {
+                name: "absent".to_string()
+            })
+        );
+
+        // A duplicate terminal result for one scenario is rejected.
+        let records = vec![
+            record_for("dup", ScenarioVerdict::Passed, Effect::Succeeded),
+            record_for("dup", ScenarioVerdict::Passed, Effect::Succeeded),
+        ];
+        assert_eq!(
+            validate_results(
+                &[required("dup", RequiredOutcome::Pass)],
+                &records,
+            ),
+            Err(SetRejection::DuplicateTerminal {
+                name: "dup".to_string()
+            })
+        );
+
+        // A wrong failure class does not satisfy the requirement.
+        let records = vec![record_for(
+            "controlled",
+            ScenarioVerdict::Passed,
+            Effect::Succeeded,
+        )];
+        assert_eq!(
+            validate_results(
+                &[required("controlled", RequiredOutcome::ExpectedFailure)],
+                &records,
+            ),
+            Err(SetRejection::WrongFailureClass {
+                name: "controlled".to_string(),
+                actual: "PASSED",
+            })
+        );
+
+        // A timeout recorded as a successful cancellation is rejected.
+        let records = vec![record_for(
+            "sneaky",
+            ScenarioVerdict::TimedOut,
+            Effect::Canceled,
+        )];
+        assert_eq!(
+            validate_results(
+                &[required("sneaky", RequiredOutcome::Pass)],
+                &records,
+            ),
+            Err(SetRejection::TimeoutMislabeled {
+                name: "sneaky".to_string(),
+                recorded_effect: "canceled",
+            })
+        );
+
+        // A truthful set passes validation.
+        let records = vec![
+            record_for("clean", ScenarioVerdict::Passed, Effect::Succeeded),
+            record_for(
+                "oracle",
+                ScenarioVerdict::ExpectedFailure,
+                Effect::Succeeded,
+            ),
+        ];
+        let requirements = vec![
+            required("clean", RequiredOutcome::Pass),
+            required("oracle", RequiredOutcome::ExpectedFailure),
+        ];
+        assert_eq!(validate_results(&requirements, &records), Ok(()));
+
+        // Unexecuted records do not satisfy a required class.
+        let records = vec![record_for(
+            "skipped",
+            ScenarioVerdict::MissingEvidence,
+            Effect::Canceled,
+        )];
+        assert_eq!(
+            validate_results(
+                &[required("skipped", RequiredOutcome::Pass)],
+                &records,
+            ),
+            Err(SetRejection::WrongFailureClass {
+                name: "skipped".to_string(),
+                actual: "missing_evidence",
+            })
+        );
     }
 
     #[test]
