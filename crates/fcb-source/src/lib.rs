@@ -26,6 +26,7 @@
 
 pub mod chunk;
 pub mod confined;
+pub mod line_index;
 pub mod path;
 pub mod restoration;
 pub mod root;
@@ -36,6 +37,10 @@ pub use chunk::{
     SafeChunkReader, SourceChunk,
 };
 pub use confined::{ConfinedSourceReader, SymlinkPolicy};
+pub use line_index::{
+    LineCheckpoint, LineJumpResult, LineNumber, LineRangeOffsets, ResumableLineScanner,
+    SparseLineIndex,
+};
 pub use path::{decode_uri_path, EscapedPathDisplay, NormalizedPath, RawPath};
 pub use restoration::{
     NativeAccessLease, RestoredRoot, RootAccessController, RootAccessStatus, RootSessionRegistry,
