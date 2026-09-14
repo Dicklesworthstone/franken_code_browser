@@ -29,6 +29,7 @@ pub mod confined;
 pub mod path;
 pub mod restoration;
 pub mod root;
+pub mod snapshot;
 
 pub use chunk::{
     ChunkSize, ChunkedCapture, ChunkedReaderConfig, ExactRangeResult, RetainedCaptureStore,
@@ -41,6 +42,11 @@ pub use restoration::{
     SandboxModel, SecurityScopedBookmark, StaleReason, UnavailableReason,
 };
 pub use root::{ExportPublicationGate, GrantRevocationToken, RootGrant};
+pub use snapshot::{
+    AnchorResolution, AnchorResolver, BoundedRetryReader, FileObservationMetadata,
+    ObservedSnapshot, ObservedSnapshotConsistency, PinnedSnapshotStore, RetryPolicy,
+    SnapshotBacking, SnapshotPin, SnapshotPinId,
+};
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -532,6 +538,8 @@ pub enum SourceError {
     ChunkOutOfBounds,
     /// An anchor or query referred to an evicted or stale capture.
     StaleCapture,
+    /// Eviction was refused because the snapshot backing is actively pinned.
+    PinActive,
 }
 
 impl SourceError {
@@ -559,6 +567,7 @@ impl SourceError {
             Self::ConcurrentModification => "SOURCE_CONCURRENT_MODIFICATION",
             Self::ChunkOutOfBounds => "SOURCE_CHUNK_OUT_OF_BOUNDS",
             Self::StaleCapture => "SOURCE_STALE_CAPTURE",
+            Self::PinActive => "SOURCE_PIN_ACTIVE",
         }
     }
 }
@@ -1029,5 +1038,6 @@ mod tests {
             "SOURCE_CHUNK_OUT_OF_BOUNDS"
         );
         assert_eq!(SourceError::StaleCapture.code(), "SOURCE_STALE_CAPTURE");
+        assert_eq!(SourceError::PinActive.code(), "SOURCE_PIN_ACTIVE");
     }
 }
