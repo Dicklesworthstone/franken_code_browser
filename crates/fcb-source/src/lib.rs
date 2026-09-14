@@ -24,6 +24,14 @@
 //! overlap observations or exceed the declared total length, and complete
 //! captures whose declared length disagrees with their actual bytes.
 
+pub mod confined;
+pub mod path;
+pub mod root;
+
+pub use confined::{ConfinedSourceReader, SymlinkPolicy};
+pub use path::{decode_uri_path, EscapedPathDisplay, NormalizedPath, RawPath};
+pub use root::{ExportPublicationGate, GrantRevocationToken, RootGrant};
+
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -488,6 +496,22 @@ pub enum SourceError {
     PayloadTooLarge,
     /// A capture for the same file and revision was already retained.
     CaptureAlreadyPresent,
+    /// The root grant was revoked or expired.
+    GrantRevoked,
+    /// The root directory was missing, unreadable, or unmounted.
+    RootUnavailable,
+    /// The requested path attempts to escape the authorized root boundary.
+    PathEscape,
+    /// A symlink was encountered when symlinks are forbidden by policy.
+    SymlinkForbidden,
+    /// A symlink points outside the authorized root directory.
+    ForeignSymlink,
+    /// A symlink cycle or alias expansion bound was exceeded during traversal.
+    TraversalCycle,
+    /// A filesystem object was a FIFO, socket, device, or other non-regular file.
+    SpecialObject,
+    /// Invalid URI percent-encoding or malformed path bytes.
+    EncodingError,
 }
 
 impl SourceError {
@@ -504,6 +528,14 @@ impl SourceError {
             Self::CaptureUnavailable => "SOURCE_CAPTURE_UNAVAILABLE",
             Self::PayloadTooLarge => "SOURCE_PAYLOAD_TOO_LARGE",
             Self::CaptureAlreadyPresent => "SOURCE_CAPTURE_ALREADY_PRESENT",
+            Self::GrantRevoked => "SOURCE_GRANT_REVOKED",
+            Self::RootUnavailable => "SOURCE_ROOT_UNAVAILABLE",
+            Self::PathEscape => "SOURCE_PATH_ESCAPE",
+            Self::SymlinkForbidden => "SOURCE_SYMLINK_FORBIDDEN",
+            Self::ForeignSymlink => "SOURCE_FOREIGN_SYMLINK",
+            Self::TraversalCycle => "SOURCE_TRAVERSAL_CYCLE",
+            Self::SpecialObject => "SOURCE_SPECIAL_OBJECT",
+            Self::EncodingError => "SOURCE_ENCODING_ERROR",
         }
     }
 }
@@ -957,5 +989,13 @@ mod tests {
             SourceError::MetadataMismatch.code(),
             "SOURCE_METADATA_MISMATCH"
         );
+        assert_eq!(SourceError::GrantRevoked.code(), "SOURCE_GRANT_REVOKED");
+        assert_eq!(SourceError::RootUnavailable.code(), "SOURCE_ROOT_UNAVAILABLE");
+        assert_eq!(SourceError::PathEscape.code(), "SOURCE_PATH_ESCAPE");
+        assert_eq!(SourceError::SymlinkForbidden.code(), "SOURCE_SYMLINK_FORBIDDEN");
+        assert_eq!(SourceError::ForeignSymlink.code(), "SOURCE_FOREIGN_SYMLINK");
+        assert_eq!(SourceError::TraversalCycle.code(), "SOURCE_TRAVERSAL_CYCLE");
+        assert_eq!(SourceError::SpecialObject.code(), "SOURCE_SPECIAL_OBJECT");
+        assert_eq!(SourceError::EncodingError.code(), "SOURCE_ENCODING_ERROR");
     }
 }
