@@ -319,7 +319,7 @@ impl CacheNamespace {
             .map_err(|_| CacheError::IdentityInvalid)?;
         Ok(RootGrant::new(
             root_id,
-            root.to_string_lossy().to_string(),
+            root.to_string_lossy().as_ref(),
         ))
     }
 
@@ -482,7 +482,7 @@ impl CacheNamespace {
         let entry_name = EntryName::new(name).map_err(|_| {
             self.counters.writes_rejected_name += 1;
             CacheError::EntryNameInvalid
-        });
+        })?;
         if bytes.len() as u64 > MAX_ENTRY_BYTES {
             self.counters.writes_rejected_size += 1;
             return Err(CacheError::EntryTooLarge);
@@ -517,11 +517,12 @@ impl CacheNamespace {
         let entry_name = EntryName::new(name).map_err(|_| CacheError::EntryNameInvalid)?;
         self.validate_root()?;
         let reader = self.confine();
-        let rel = NormalizedPath::new(format!(
+        let rel_text = format!(
             "{}/{}",
             generation_dir_name(generation),
             entry_name.as_str()
-        ))?;
+        );
+        let rel = NormalizedPath::new(rel_text.as_str())?;
         let file_id = FileId::new(self.owner, fnv64(name.as_bytes()) % 4096 + 1)
             .map_err(|_| CacheError::EntryNameInvalid)?;
         let revision = SourceRevision::new(self.owner, generation)
