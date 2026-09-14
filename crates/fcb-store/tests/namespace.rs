@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fcb_store::{
-    CacheError, CacheNamespace, EntryName, GenerationError, IdentityError, NamespaceIdentity,
+    CacheError, CacheNamespace, EntryName, GenerationError, IdentityError, MARKER_NAME,
+    NamespaceIdentity,
     MAX_ENTRY_BYTES,
 };
 
@@ -42,24 +43,24 @@ fn create_write_and_hot_cold_reads_are_equal() {
         CacheNamespace::create(&parent, identity("fcb-store-tests"), owner()).expect("create");
 
     let written = namespace
-        .write_entry("app/main.rs", b"fn main() {}")
+        .write_entry("app-main.rs", b"fn main() {}")
         .expect("write succeeds");
     assert_eq!(written.generation, 1);
     assert_eq!(written.len, 12);
 
     // Hot read: retained from this session.
-    let hot = namespace.read_hot("app/main.rs", 1).expect("hot copy");
+    let hot = namespace.read_hot("app-main.rs", 1).expect("hot copy");
     assert_eq!(hot.as_slice(), b"fn main() {}");
 
     // Cold read: through the confined pipeline from disk.
     let cold = namespace
-        .read_cold("app/main.rs", 1)
+        .read_cold("app-main.rs", 1)
         .expect("cold read succeeds");
     assert_eq!(cold, b"fn main() {}");
 
     // The unified read prefers hot but must agree with cold exactly.
     assert_eq!(
-        namespace.read_entry("app/main.rs", 1).expect("read"),
+        namespace.read_entry("app-main.rs", 1).expect("read"),
         b"fn main() {}".to_vec()
     );
     assert_eq!(namespace.current_generation(), 1);
@@ -90,13 +91,17 @@ fn reopen_preserves_identity_entries_and_generation() {
 #[test]
 fn wrong_identity_marker_is_refused() {
     let parent = temp_parent("wrong-marker");
-    CacheNamespace::create(&parent, identity("namespace-owner-a"), owner()).expect("create");
+    let namespace =
+        CacheNamespace::create(&parent, identity("namespace-owner-a"), owner()).expect("create");
 
-    // A different consumer opening the SAME root directory is refused:
-    // the marker names another consumer.
-    let foreign =
-        CacheNamespace::open(&parent, identity("namespace-owner-b"), owner()).unwrap_err();
-    assert_eq!(foreign, CacheError::WrongRoot);
+    // Tamper the marker so the root claims a different consumer. Reopening
+    // under identity A must refuse: the marker no longer matches.
+    let marker = namespace.root().join(MARKER_NAME);
+    std::fs::write(&marker, "fcb-store-cache.v1\nconsumer: namespace-owner-b\n")
+        .expect("tamper written");
+
+    let error = CacheNamespace::open(&parent, identity("namespace-owner-a"), owner()).unwrap_err();
+    assert_eq!(error, CacheError::WrongRoot);
 }
 
 #[test]
@@ -209,7 +214,7 @@ fn oversized_entries_are_refused_and_counted() {
     let parent = temp_parent("oversized");
     let mut namespace =
         CacheNamespace::create(&parent, identity("sizing"), owner()).expect("create");
-    let oversized = vec![b'x'; usize::try_from(fcb_store::MAX_ENTRY_BYTES).unwrap() + 1];
+    let oversized = vec![b'x'; usize::try_from(MAX_ENTRY_BYTES).unwrap() + 1];
     let error = namespace.write_entry("big.bin", &oversized).unwrap_err();
     assert_eq!(error, CacheError::EntryTooLarge);
     assert_eq!(namespace.counters().writes_rejected_size, 1);
@@ -284,7 +289,7 @@ fn counters_reconcile_attempts_against_outcomes() {
         CacheNamespace::create(&parent, identity("counters"), owner()).expect("create");
     namespace.write_entry("counted.bin", b"counted").expect("write");
     let _ = namespace.write_entry("../traversal.bin", b"nope");
-    let _ = namespace.write_entry("too-big.bin", &vec![0u8; 4097]);
+    let _ = namespace.write_entry("too-big.bin", &vec![0u8; usize::try_from(MAX_ENTRY_BYTES).unwrap() + 1]);
     namespace.advance_generation().expect("advance");
     namespace.pin(2).expect("pin");
     namespace.unpin(2).expect("unpin");
