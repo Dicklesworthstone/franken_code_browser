@@ -1,0 +1,14 @@
+[package]
+name = "fcb-store"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+name = "fcb_store"
+path = "src/lib.rs"
+
+[dependencies]
+fcb-core = { path = "../fcb-core" }
+fcb-source = { path = "../fcb-source" }
