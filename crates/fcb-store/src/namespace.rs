@@ -32,6 +32,7 @@
 //! confined-reader pipeline; this crate never re-implements traversal.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
