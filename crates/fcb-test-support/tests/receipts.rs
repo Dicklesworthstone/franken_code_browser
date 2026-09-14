@@ -35,6 +35,38 @@ fn sample_draft(outcome: TerminalOutcome, ring: EventRing) -> ScenarioReceiptDra
 }
 
 #[test]
+fn receipt_codec_preserves_delimiters_controls_and_literal_escapes() {
+    let redactor = Redactor::new();
+    let payload = "field:α\\n\nnext\r\t\0\u{7f}";
+    let mut ring = EventRing::new(2);
+    ring.push(&redactor, payload);
+    let mut draft = sample_draft(
+        TerminalOutcome::new(None, Effect::Canceled, Some(payload.to_string())), ring);
+    draft.scenario = payload.to_string();
+    draft.artifacts = vec![payload.to_string()];
+    draft.comparison = Some(ExpectedVsActual::new(&redactor, payload, payload));
+    let receipt = ScenarioReceipt::from_draft(&redactor, draft);
+    let encoded = receipt.encode();
+    let decoded = ScenarioReceipt::decode(&encoded).expect("all text fields round trip");
+    assert_eq!(decoded, receipt);
+    assert_eq!(decoded.encode(), encoded);
+}
+
+#[test]
+fn terminal_reason_redacts_registered_secrets() {
+    let secret = "SECRET-WORKER-CREDENTIAL";
+    let redactor = Redactor::new().with_sentinel(secret);
+    let receipt = ScenarioReceipt::from_draft(&redactor, sample_draft(
+        TerminalOutcome::new(None, Effect::Canceled, Some(format!("worker refused: {secret}"))),
+        EventRing::new(0)));
+    assert!(!String::from_utf8(receipt.encode()).unwrap().contains(secret));
+    let decoded = ScenarioReceipt::decode(&receipt.encode()).unwrap();
+    assert_eq!(decoded.outcome().unexecuted_reason(), Some("worker refused: [REDACTED]"));
+    assert_eq!(decoded.outcome().effect(), Effect::Canceled);
+    assert_eq!(decoded.outcome().exit_code(), None);
+}
+
+#[test]
 fn receipt_round_trips_exactly_through_the_codec() {
     let redactor = Redactor::new();
     let receipt = ScenarioReceipt::from_draft(

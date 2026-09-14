@@ -531,7 +531,8 @@ fn unescape_text(text: &str) -> Option<String> {
 
 /// Length-prefixed field value: `name:<len>:<escaped>`.
 fn length_field(name: &str, text: &str) -> String {
-    format!("{name}:{}:{text}\n", text.len())
+    let escaped = escape_text(text);
+    format!("{name}:{}:{escaped}\n", escaped.len())
 }
 
 /// Parse `name:<len>:<escaped>` after the `name:` prefix.
@@ -550,6 +551,9 @@ impl ScenarioReceipt {
     /// [`RECEIPT_MAX_EVENTS`] events, with any excess accounted as dropped.
     pub fn from_draft(redactor: &Redactor, draft: ScenarioReceiptDraft) -> Self {
         let scenario = redactor.redact(&draft.scenario);
+        let mut outcome = draft.outcome;
+        outcome.unexecuted_reason = outcome.unexecuted_reason
+            .map(|reason| redactor.redact(&reason));
         let artifacts: Vec<String> = draft
             .artifacts
             .iter()
@@ -579,7 +583,7 @@ impl ScenarioReceipt {
             route: draft.route,
             corpus_digest: draft.corpus_digest,
             corpus_count: draft.corpus_count,
-            outcome: draft.outcome,
+            outcome,
             comparison: draft.comparison,
             ring_summary,
             events,
@@ -645,13 +649,14 @@ impl ScenarioReceipt {
         }
         out.push_str(&format!("events:{}\n", self.events.len()));
         for event in &self.events {
+            let escaped = escape_text(event.message.text());
             out.push_str(&format!(
                 "event:{}:{}:{}:{}:{}\n",
                 event.sequence,
                 event.message.truncated() as u8,
                 event.message.original_bytes(),
-                event.message.text().len(),
-                escape_text(event.message.text()),
+                escaped.len(),
+                escaped,
             ));
         }
         out.push_str(&format!("artifacts:{}\n", self.artifacts.len()));
@@ -786,7 +791,9 @@ impl ScenarioReceipt {
         let mut events = Vec::with_capacity(event_count);
         for _ in 0..event_count {
             let row = next_name("event")?;
-            let mut fields = row.split(':');
+            // Only the four metadata delimiters are structural. Colons in
+            // the remaining length-prefixed message are ordinary text.
+            let mut fields = row.splitn(5, ':');
             let sequence = fields
                 .next()
                 .and_then(|value| value.parse::<u64>().ok())
