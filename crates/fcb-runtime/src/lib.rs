@@ -212,7 +212,7 @@ struct WakeState {
 }
 
 #[derive(Debug)]
-struct ProbeAuthority(u8);
+struct ProbeAuthority(#[allow(dead_code)] u8);
 
 /// A fixed-capacity, host-owned wake coalescing and fairness probe.
 pub struct WakeProbe {
