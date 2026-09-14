@@ -26,10 +26,15 @@
 
 pub mod confined;
 pub mod path;
+pub mod restoration;
 pub mod root;
 
 pub use confined::{ConfinedSourceReader, SymlinkPolicy};
 pub use path::{decode_uri_path, EscapedPathDisplay, NormalizedPath, RawPath};
+pub use restoration::{
+    NativeAccessLease, RestoredRoot, RootAccessController, RootAccessStatus, RootSessionRegistry,
+    SandboxModel, SecurityScopedBookmark, StaleReason, UnavailableReason,
+};
 pub use root::{ExportPublicationGate, GrantRevocationToken, RootGrant};
 
 use std::collections::BTreeSet;
