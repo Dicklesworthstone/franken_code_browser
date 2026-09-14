@@ -7,7 +7,8 @@
 use fcb_test_support::receipts::{
     BoundedText, Effect, EventRing, ExpectedVsActual, ReceiptError, Redactor, RingSummary,
     RouteId, ScenarioReceipt, ScenarioReceiptDraft, ScenarioSeed, SourcePin, TerminalOutcome,
-    DEFAULT_RING_CAPACITY, MAX_FIELD_BYTES, RECEIPT_MAX_EVENTS, RECEIPT_SCHEMA, REDACTED_TOKEN,
+    DEFAULT_RING_CAPACITY, MAX_FIELD_BYTES, RECEIPT_MAX_ARTIFACTS, RECEIPT_MAX_EVENTS,
+    RECEIPT_SCHEMA, REDACTED_TOKEN,
 };
 use fcb_test_support::ContentDigest;
 
@@ -440,4 +441,94 @@ fn default_ring_capacity_admits_isolated_events_without_loss() {
     assert_eq!(ring.len(), 1);
     assert_eq!(ring.dropped(), 0);
     assert_eq!(ring.capacity(), DEFAULT_RING_CAPACITY);
+}
+
+#[test]
+fn zero_capacity_ring_tracks_dropped_accurately() {
+    let mut ring = EventRing::new(0);
+    let redactor = Redactor::new();
+    for i in 0..5 {
+        ring.push(&redactor, &format!("msg-{i}"));
+    }
+    assert_eq!(ring.len(), 0);
+    assert_eq!(ring.dropped(), 5);
+    assert_eq!(ring.next_sequence(), 5);
+
+    let draft = sample_draft(TerminalOutcome::new(Some(0), Effect::Succeeded, None), ring);
+    let receipt = ScenarioReceipt::from_draft(&redactor, draft);
+    assert_eq!(receipt.ring_summary().dropped, 5);
+    assert_eq!(receipt.ring_summary().kept, 0);
+    assert_eq!(receipt.ring_summary().next_sequence, 5);
+
+    let encoded = receipt.encode();
+    let decoded = ScenarioReceipt::decode(&encoded).expect("decode receipt with zero-capacity ring");
+    assert_eq!(decoded.ring_summary().dropped, 5);
+    assert_eq!(decoded.ring_summary().kept, 0);
+}
+
+#[test]
+fn oversized_scenario_artifacts_and_reason_are_bounded() {
+    let redactor = Redactor::new();
+    let oversized_text = "x".repeat(MAX_FIELD_BYTES + 500);
+    let ring = EventRing::new(4);
+    let mut draft = sample_draft(
+        TerminalOutcome::new(None, Effect::Canceled, Some(oversized_text.clone())),
+        ring,
+    );
+    draft.scenario = oversized_text.clone();
+    draft.artifacts = (0..RECEIPT_MAX_ARTIFACTS + 50)
+        .map(|i| format!("{oversized_text}-{i}"))
+        .collect();
+
+    let receipt = ScenarioReceipt::from_draft(&redactor, draft);
+    assert!(receipt.scenario().len() <= MAX_FIELD_BYTES);
+    assert!(receipt.outcome().unexecuted_reason().unwrap().len() <= MAX_FIELD_BYTES);
+    assert_eq!(receipt.artifacts().len(), RECEIPT_MAX_ARTIFACTS);
+    for artifact in receipt.artifacts() {
+        assert!(artifact.len() <= MAX_FIELD_BYTES);
+    }
+
+    let encoded = receipt.encode();
+    let decoded = ScenarioReceipt::decode(&encoded).expect("bounded receipt decodes");
+    assert_eq!(decoded, receipt);
+}
+
+#[test]
+fn decode_rejects_excessive_artifact_count() {
+    let redactor = Redactor::new();
+    let receipt = ScenarioReceipt::from_draft(
+        &redactor,
+        sample_draft(TerminalOutcome::new(Some(0), Effect::Succeeded, None), EventRing::new(2)),
+    );
+    let mut encoded = String::from_utf8(receipt.encode()).unwrap();
+    let excessive_artifacts = format!("artifacts:{}\n", RECEIPT_MAX_ARTIFACTS + 1);
+    encoded = encoded.replacen("artifacts:1\n", &excessive_artifacts, 1);
+    assert_eq!(
+        ScenarioReceipt::decode(encoded.as_bytes()),
+        Err(ReceiptError::MalformedRow)
+    );
+}
+
+#[test]
+fn decode_rejects_oversized_text_fields() {
+    let redactor = Redactor::new();
+    let receipt = ScenarioReceipt::from_draft(
+        &redactor,
+        sample_draft(TerminalOutcome::new(Some(0), Effect::Succeeded, None), EventRing::new(2)),
+    );
+    let encoded = String::from_utf8(receipt.encode()).unwrap();
+    let huge_scenario = "y".repeat(MAX_FIELD_BYTES + 10);
+    let mut forged_lines = Vec::new();
+    for line in encoded.lines() {
+        if line.starts_with("scenario:") {
+            forged_lines.push(format!("scenario:{}:{huge_scenario}", huge_scenario.len()));
+        } else {
+            forged_lines.push(line.to_string());
+        }
+    }
+    let forged_doc = forged_lines.join("\n") + "\n";
+    assert_eq!(
+        ScenarioReceipt::decode(forged_doc.as_bytes()),
+        Err(ReceiptError::MalformedRow)
+    );
 }

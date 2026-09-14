@@ -35,6 +35,8 @@ pub const MAX_FIELD_BYTES: usize = 1024;
 pub const MAX_SENTINEL_BYTES: usize = 256;
 /// Events retained per receipt; older events are summarized, not stored.
 pub const RECEIPT_MAX_EVENTS: usize = 256;
+/// Maximum number of artifact references retained per receipt.
+pub const RECEIPT_MAX_ARTIFACTS: usize = 256;
 /// Default live-ring capacity.
 pub const DEFAULT_RING_CAPACITY: usize = 64;
 /// Upper bound on identifiers (source pins are exactly 40 bytes).
@@ -280,11 +282,13 @@ impl EventRing {
             BoundedText::from_redacted_with_original(&redacted, message.len() as u64);
         let sequence = self.next_sequence;
         self.next_sequence += 1;
-        if self.capacity > 0 && self.events.len() == self.capacity {
-            self.events.pop_front();
+        if self.capacity == 0 {
             self.dropped += 1;
-        }
-        if self.capacity > 0 {
+        } else {
+            if self.events.len() == self.capacity {
+                self.events.pop_front();
+                self.dropped += 1;
+            }
             self.events.push_back(Event {
                 sequence,
                 message: bounded,
@@ -545,19 +549,35 @@ fn parse_length_field(payload: &str) -> Option<String> {
     unescape_text(value)
 }
 
+/// Truncate text to [`MAX_FIELD_BYTES`] on a character boundary, preserving
+/// the beginning of the text.
+fn bound_text_field(text: &str) -> String {
+    if text.len() <= MAX_FIELD_BYTES {
+        text.to_string()
+    } else {
+        let mut end = MAX_FIELD_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text[..end].to_string()
+    }
+}
+
 impl ScenarioReceipt {
     /// Build a receipt from a draft. The scenario name and every artifact
     /// reference pass through the redactor; the ring contributes its newest
     /// [`RECEIPT_MAX_EVENTS`] events, with any excess accounted as dropped.
     pub fn from_draft(redactor: &Redactor, draft: ScenarioReceiptDraft) -> Self {
-        let scenario = redactor.redact(&draft.scenario);
+        let scenario = bound_text_field(&redactor.redact(&draft.scenario));
         let mut outcome = draft.outcome;
         outcome.unexecuted_reason = outcome.unexecuted_reason
-            .map(|reason| redactor.redact(&reason));
+            .map(|reason| bound_text_field(&redactor.redact(&reason)));
+        let kept_artifacts = draft.artifacts.len().min(RECEIPT_MAX_ARTIFACTS);
         let artifacts: Vec<String> = draft
             .artifacts
-            .iter()
-            .map(|artifact| redactor.redact(artifact))
+            .into_iter()
+            .take(kept_artifacts)
+            .map(|artifact| bound_text_field(&redactor.redact(&artifact)))
             .collect();
 
         // Retain the newest RECEIPT_MAX_EVENTS events, oldest-first, and
@@ -677,33 +697,35 @@ impl ScenarioReceipt {
             return Err(ReceiptError::SchemaMismatch);
         }
 
-        let mut rows = lines.map(str::to_string).collect::<VecDeque<String>>();
-        let mut next_name = |expected: &str| -> Result<String, ReceiptError> {
-            let row = rows.pop_front().ok_or(ReceiptError::MalformedRow)?;
+        let mut next_name = |expected: &str| -> Result<&str, ReceiptError> {
+            let row = lines.next().ok_or(ReceiptError::MalformedRow)?;
             let (name, payload) = row.split_once(':').ok_or(ReceiptError::MalformedRow)?;
             if name != expected {
                 return Err(ReceiptError::MalformedRow);
             }
-            Ok(payload.to_string())
+            Ok(payload)
         };
 
-        let scenario = parse_length_field(&next_name("scenario")?)
+        let scenario = parse_length_field(next_name("scenario")?)
             .ok_or(ReceiptError::MalformedRow)?;
+        if scenario.len() > MAX_FIELD_BYTES {
+            return Err(ReceiptError::MalformedRow);
+        }
         let seed = next_name("seed")?
             .parse::<u64>()
             .map_err(|_| ReceiptError::MalformedRow)?;
         let pin_text = next_name("pin")?;
-        let pin = SourcePin::new(&pin_text).map_err(|_| ReceiptError::MalformedRow)?;
+        let pin = SourcePin::new(pin_text).map_err(|_| ReceiptError::MalformedRow)?;
         let route_text = next_name("route")?;
-        let route = RouteId::new(&parse_length_field(&route_text).ok_or(ReceiptError::MalformedRow)?)
+        let route = RouteId::new(&parse_length_field(route_text).ok_or(ReceiptError::MalformedRow)?)
             .map_err(|_| ReceiptError::MalformedRow)?;
         let digest_text = next_name("corpus_digest")?;
-        let corpus_digest = ContentDigest::from_hex(&digest_text)
+        let corpus_digest = ContentDigest::from_hex(digest_text)
             .ok_or(ReceiptError::MalformedRow)?;
         let corpus_count = next_name("corpus_count")?
             .parse::<u64>()
             .map_err(|_| ReceiptError::MalformedRow)?;
-        let effect = Effect::parse(&next_name("effect")?).ok_or(ReceiptError::MalformedRow)?;
+        let effect = Effect::parse(next_name("effect")?).ok_or(ReceiptError::MalformedRow)?;
         let exit_text = next_name("exit")?;
         let exit_code = if exit_text == "-" {
             None
@@ -714,7 +736,11 @@ impl ScenarioReceipt {
         let unexecuted_reason = if reason_text == "-" {
             None
         } else {
-            Some(parse_length_field(&reason_text).ok_or(ReceiptError::MalformedRow)?)
+            let reason = parse_length_field(reason_text).ok_or(ReceiptError::MalformedRow)?;
+            if reason.len() > MAX_FIELD_BYTES {
+                return Err(ReceiptError::MalformedRow);
+            }
+            Some(reason)
         };
         let ring_row = next_name("ring")?;
         let mut ring_parts = ring_row.split(':');
@@ -746,16 +772,22 @@ impl ScenarioReceipt {
             if marker == "-" {
                 None
             } else if marker == "present" {
-                let expected = parse_length_field(&next_name("comparison_expected")?)
+                let expected = parse_length_field(next_name("comparison_expected")?)
                     .ok_or(ReceiptError::MalformedRow)?;
+                if expected.len() > MAX_FIELD_BYTES {
+                    return Err(ReceiptError::MalformedRow);
+                }
                 let expected_truncated = next_name("comparison_expected_truncated")?
                     .parse::<u8>()
                     .map_err(|_| ReceiptError::MalformedRow)?;
                 let expected_original = next_name("comparison_expected_original")?
                     .parse::<u64>()
                     .map_err(|_| ReceiptError::MalformedRow)?;
-                let actual = parse_length_field(&next_name("comparison_actual")?)
+                let actual = parse_length_field(next_name("comparison_actual")?)
                     .ok_or(ReceiptError::MalformedRow)?;
+                if actual.len() > MAX_FIELD_BYTES {
+                    return Err(ReceiptError::MalformedRow);
+                }
                 let actual_truncated = next_name("comparison_actual_truncated")?
                     .parse::<u8>()
                     .map_err(|_| ReceiptError::MalformedRow)?;
@@ -837,12 +869,19 @@ impl ScenarioReceipt {
         let artifact_count = next_name("artifacts")?
             .parse::<usize>()
             .map_err(|_| ReceiptError::MalformedRow)?;
+        if artifact_count > RECEIPT_MAX_ARTIFACTS {
+            return Err(ReceiptError::MalformedRow);
+        }
         let mut artifacts = Vec::with_capacity(artifact_count);
         for _ in 0..artifact_count {
             let payload = next_name("artifact")?;
-            artifacts.push(parse_length_field(&payload).ok_or(ReceiptError::MalformedRow)?);
+            let artifact = parse_length_field(payload).ok_or(ReceiptError::MalformedRow)?;
+            if artifact.len() > MAX_FIELD_BYTES {
+                return Err(ReceiptError::MalformedRow);
+            }
+            artifacts.push(artifact);
         }
-        if !rows.is_empty() {
+        if lines.next().is_some() {
             return Err(ReceiptError::MalformedRow);
         }
 
