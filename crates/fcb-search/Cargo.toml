@@ -1,0 +1,17 @@
+[package]
+name = "fcb-search"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+name = "fcb_search"
+path = "src/lib.rs"
+
+[dependencies]
+fcb-core = { path = "../fcb-core" }
+fcb-source = { path = "../fcb-source" }
+
+[dev-dependencies]
+fcb-test-support = { path = "../fcb-test-support" }
