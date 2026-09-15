@@ -1,0 +1,16 @@
+[package]
+name = "fcb-map"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+name = "fcb_map"
+path = "src/lib.rs"
+
+[dependencies]
+fcb-core = { path = "../fcb-core" }
+
+[dev-dependencies]
+fcb-test-support = { path = "../fcb-test-support" }

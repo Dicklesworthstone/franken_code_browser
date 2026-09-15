@@ -5,6 +5,7 @@ members = [
     "crates/fcb",
     "crates/fcb-runtime",
     "crates/fcb-source",
+    "crates/fcb-map",
     "crates/fcb-search",
     "crates/fcb-store",
     "crates/fcb-test-support",
