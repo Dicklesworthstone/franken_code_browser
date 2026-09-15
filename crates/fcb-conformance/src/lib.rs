@@ -4,15 +4,13 @@
 //! Everything here is deterministic and dependency-free: a fixed-seed
 //! generator reproduces the same hostile inputs on every host, digests are
 //! stable functions of input bytes, and the minimizer shrinks a failing input
-//! without ever changing its failure classification. The production adapter
-//! over the real FCB-021 lexical engine lives behind the `fmd-lexical`
-//! feature so the shipping closure stays dependency-free.
+//! without ever changing its failure classification. The production
+//! adapter over the real FCB-021 lexical engine lives in the upstream
+//! franken_markdown test suite, which wires this crate's minimizer to
+//! its own resumable engine.
 
 #![forbid(unsafe_code)]
 #![deny(missing_debug_implementations)]
-
-#[cfg(feature = "fmd-lexical")]
-pub mod fmd_lexical;
 
 use std::cell::Cell;
 
