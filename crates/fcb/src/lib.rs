@@ -3,8 +3,14 @@
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 pub use fcb_core::{
-    ArenaOwnerId, ByteLength, ByteOffset, ByteRange, CoreError, FileId, SourceRevision,
+    AcceptedLayoutIdentity, AcceptedLayoutSnapshot, ArenaOwnerId, ByteLength, ByteOffset, ByteRange,
+    CameraGeneration, ClockDomainId, CoreError, DisplayGeneration, DisplayMetrics, FileId,
+    InteractionGeneration, LayoutRevision, Point2D, PresentedFrameId, Rect2D, SceneGeneration,
+    SemanticNodeId, Size2D, SourceRevision,
 };
+pub use frame_plan::{FramePlan, InteractionResolution, PresentedFrameTracker};
+
+pub mod frame_plan;
 
 /// A capability whose implementation can be selected additively by a host.
 ///
@@ -71,10 +77,12 @@ impl Feature {
 
     /// Whether this capability's target boundary is supported by this build.
     /// Pattern matching keeps the const path independent of derived equality.
+    #[allow(clippy::needless_bool)]
     pub const fn target_supported(self) -> bool {
-        match self {
-            Self::MacosMetal => cfg!(target_os = "macos"),
-            _ => true,
+        if matches!(self, Self::MacosMetal) {
+            cfg!(target_os = "macos")
+        } else {
+            true
         }
     }
 
@@ -174,6 +182,10 @@ pub enum FcbError {
     CaptureTooLarge,
     HostServicesUnavailable,
     IdentityExhausted,
+    FrameUnpresented,
+    FrameNotFound,
+    FrameQueueExhausted,
+    StaleGeneration,
 }
 
 impl FcbError {
@@ -189,6 +201,10 @@ impl FcbError {
             Self::CaptureTooLarge => "CAPTURE_TOO_LARGE",
             Self::HostServicesUnavailable => "HOST_SERVICES_UNAVAILABLE",
             Self::IdentityExhausted => "IDENTITY_EXHAUSTED",
+            Self::FrameUnpresented => "FRAME_UNPRESENTED",
+            Self::FrameNotFound => "FRAME_NOT_FOUND",
+            Self::FrameQueueExhausted => "FRAME_QUEUE_EXHAUSTED",
+            Self::StaleGeneration => "STALE_GENERATION",
         }
     }
 }
@@ -207,6 +223,10 @@ impl From<CoreError> for FcbError {
             CoreError::OwnershipMismatch => Self::OwnerMismatch,
             CoreError::Exhausted => Self::IdentityExhausted,
             CoreError::LimitExceeded | CoreError::ArithmeticOverflow => Self::CaptureTooLarge,
+            CoreError::StaleLayoutRevision
+            | CoreError::StaleSourceRevision
+            | CoreError::StaleDisplayGeneration => Self::StaleGeneration,
+            CoreError::NodeNotFound => Self::FrameNotFound,
             _ => Self::OwnerMismatch,
         }
     }
@@ -517,42 +537,12 @@ impl BrowserView {
     }
 
     pub fn frame_plan(&self) -> Result<FramePlan, FcbError> {
-        Ok(FramePlan {
-            owner: self.capture.owner(),
-            file: self.capture.file(),
-            source: self.capture.revision(),
-            bytes: self.capture.byte_range()?,
-        })
-    }
-}
-
-/// Renderer-neutral plan for the complete captured byte extent.
-///
-/// File identity is carried separately from source revision: a revision value
-/// may repeat across files in one owner domain without aliasing their frames.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FramePlan {
-    owner: ArenaOwnerId,
-    file: FileId,
-    source: SourceRevision,
-    bytes: ByteRange,
-}
-
-impl FramePlan {
-    pub const fn owner(self) -> ArenaOwnerId {
-        self.owner
-    }
-
-    pub const fn file(self) -> FileId {
-        self.file
-    }
-
-    pub const fn source(self) -> SourceRevision {
-        self.source
-    }
-
-    pub const fn bytes(self) -> ByteRange {
-        self.bytes
+        Ok(FramePlan::new(
+            self.capture.owner(),
+            self.capture.file(),
+            self.capture.revision(),
+            self.capture.byte_range()?,
+        ))
     }
 }
 
@@ -633,9 +623,17 @@ mod tests {
     #[test]
     fn core_error_conversions_and_codes_are_consistent() {
         assert_eq!(FcbError::IdentityExhausted.code(), "IDENTITY_EXHAUSTED");
+        assert_eq!(FcbError::FrameUnpresented.code(), "FRAME_UNPRESENTED");
+        assert_eq!(FcbError::FrameNotFound.code(), "FRAME_NOT_FOUND");
+        assert_eq!(FcbError::FrameQueueExhausted.code(), "FRAME_QUEUE_EXHAUSTED");
+        assert_eq!(FcbError::StaleGeneration.code(), "STALE_GENERATION");
         assert_eq!(FcbError::from(CoreError::Exhausted), FcbError::IdentityExhausted);
         assert_eq!(FcbError::from(CoreError::OwnershipMismatch), FcbError::OwnerMismatch);
         assert_eq!(FcbError::from(CoreError::LimitExceeded), FcbError::CaptureTooLarge);
         assert_eq!(FcbError::from(CoreError::ArithmeticOverflow), FcbError::CaptureTooLarge);
+        assert_eq!(FcbError::from(CoreError::StaleLayoutRevision), FcbError::StaleGeneration);
+        assert_eq!(FcbError::from(CoreError::StaleSourceRevision), FcbError::StaleGeneration);
+        assert_eq!(FcbError::from(CoreError::StaleDisplayGeneration), FcbError::StaleGeneration);
+        assert_eq!(FcbError::from(CoreError::NodeNotFound), FcbError::FrameNotFound);
     }
 }
