@@ -19,9 +19,14 @@ use fcb_core::ByteLength;
 use crate::confined::{
     validate_not_special, ConfinedSourceReader, DirectoryId, SymlinkPolicy,
 };
+use crate::ignore::IgnoreMatcher;
 use crate::path::NormalizedPath;
 use crate::root::RootGrant;
 use crate::{CancelFlag, SourceError};
+
+/// Maximum bytes of one nested `.gitignore` / `.fcbignore` that discovery will
+/// parse. Larger files are skipped rather than allocating an unbounded rule set.
+const MAX_RULE_FILE_BYTES: u64 = 64 * 1024;
 
 /// Caps applied to one discovery session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,6 +142,7 @@ pub struct DiscoveryEntry {
     depth: u32,
     observed_len: Option<u64>,
     scan_epoch: ScanEpoch,
+    excluded: bool,
 }
 
 impl DiscoveryEntry {
@@ -158,6 +164,12 @@ impl DiscoveryEntry {
 
     pub fn scan_epoch(&self) -> ScanEpoch {
         self.scan_epoch
+    }
+
+    /// Whether ignore matching classified this observation as excluded.
+    /// Exclusion is not a deletion or tombstone.
+    pub fn is_excluded(&self) -> bool {
+        self.excluded
     }
 }
 
@@ -185,6 +197,8 @@ pub struct DiscoveryAggregate {
     pub depth_limited: u64,
     pub path_limited: u64,
     pub queue_refused: u64,
+    /// Observed entries classified as excluded. Not a deletion count.
+    pub excluded: u64,
 }
 
 /// Observed peaks; used to prove descriptor and queue caps held.
@@ -266,6 +280,7 @@ pub struct BoundedDiscovery {
     reader: ConfinedSourceReader,
     grant: RootGrant,
     limits: DiscoveryLimits,
+    ignore: IgnoreMatcher,
     pending: VecDeque<PendingDir>,
     open: VecDeque<OpenDir>,
     epoch: ScanEpoch,
@@ -295,6 +310,22 @@ impl BoundedDiscovery {
         symlink_policy: SymlinkPolicy,
         limits: DiscoveryLimits,
     ) -> Result<Self, SourceError> {
+        Self::open_with_ignore(
+            grant,
+            symlink_policy,
+            limits,
+            IgnoreMatcher::product_defaults(),
+        )
+    }
+
+    /// Same as [`Self::open`], with an explicit ignore matcher. Pass
+    /// [`IgnoreMatcher::include_all`] to disable default exclusions.
+    pub fn open_with_ignore(
+        grant: RootGrant,
+        symlink_policy: SymlinkPolicy,
+        limits: DiscoveryLimits,
+        ignore: IgnoreMatcher,
+    ) -> Result<Self, SourceError> {
         grant.validate_active()?;
         let reader = ConfinedSourceReader::new(grant.clone(), symlink_policy, ByteLength::new(u64::MAX));
         reader.canonical_root_path()?;
@@ -302,6 +333,7 @@ impl BoundedDiscovery {
             reader,
             grant,
             limits,
+            ignore,
             pending: VecDeque::new(),
             open: VecDeque::new(),
             epoch: ScanEpoch(1),
@@ -338,6 +370,14 @@ impl BoundedDiscovery {
 
     pub fn peaks(&self) -> DiscoveryPeaks {
         self.peaks
+    }
+
+    pub fn ignore(&self) -> &IgnoreMatcher {
+        &self.ignore
+    }
+
+    pub fn ignore_mut(&mut self) -> &mut IgnoreMatcher {
+        &mut self.ignore
     }
 
     pub fn is_complete(&self) -> bool {
@@ -525,7 +565,7 @@ impl BoundedDiscovery {
                 Ok(path) => path,
                 Err(SourceError::TraversalCycle) => {
                     if let Some(rel) = pending.rel {
-                        let entry = self.push_kind(rel, DiscoveryKind::Cycle, pending.depth, None);
+                        let entry = self.push_kind(rel, DiscoveryKind::Cycle, pending.depth, None, false);
                         return OpenResult::SkippedCycle(entry);
                     }
                     self.aggregate.cycles = self.aggregate.cycles.saturating_add(1);
@@ -563,7 +603,8 @@ impl BoundedDiscovery {
         };
         if pending.ancestry.contains(&dir_id) {
             if let Some(rel) = pending.rel {
-                let entry = self.push_kind(rel, DiscoveryKind::Cycle, pending.depth, None);
+                let entry =
+                    self.push_kind(rel, DiscoveryKind::Cycle, pending.depth, None, false);
                 return OpenResult::SkippedCycle(entry);
             }
             self.aggregate.cycles = self.aggregate.cycles.saturating_add(1);
@@ -577,6 +618,7 @@ impl BoundedDiscovery {
                 return OpenResult::SkippedUnavailable;
             }
         };
+        self.load_rule_files(pending.rel.as_ref(), &resolved);
 
         let mut ancestry = pending.ancestry;
         ancestry.push(dir_id);
@@ -687,32 +729,65 @@ impl BoundedDiscovery {
                     DiscoveryKind::Unavailable,
                     child_depth,
                     None,
+                    false,
                 ));
             }
         };
 
         if validate_not_special(&meta).is_err() {
-            return Some(self.push_kind(child_path, DiscoveryKind::Special, child_depth, None));
+            return Some(self.push_kind(
+                child_path,
+                DiscoveryKind::Special,
+                child_depth,
+                None,
+                false,
+            ));
         }
 
         let file_type = meta.file_type();
         if file_type.is_symlink() {
-            self.maybe_follow_symlink_dir(open, &child_path, child_depth, child_fs_path);
-            return Some(self.push_kind(child_path, DiscoveryKind::Symlink, child_depth, None));
+            let excluded = self.classify_exclusion(&child_path, false);
+            if !excluded {
+                self.maybe_follow_symlink_dir(open, &child_path, child_depth, child_fs_path);
+            }
+            return Some(self.push_kind(
+                child_path,
+                DiscoveryKind::Symlink,
+                child_depth,
+                None,
+                excluded,
+            ));
         }
         if file_type.is_dir() {
-            self.maybe_enqueue_dir(open, child_path.clone(), child_depth);
-            return Some(self.push_kind(child_path, DiscoveryKind::Directory, child_depth, None));
+            let excluded = self.classify_exclusion(&child_path, true);
+            if !excluded {
+                self.maybe_enqueue_dir(open, child_path.clone(), child_depth);
+            }
+            return Some(self.push_kind(
+                child_path,
+                DiscoveryKind::Directory,
+                child_depth,
+                None,
+                excluded,
+            ));
         }
         if file_type.is_file() {
+            let excluded = self.classify_exclusion(&child_path, false);
             return Some(self.push_kind(
                 child_path,
                 DiscoveryKind::File,
                 child_depth,
                 Some(meta.len()),
+                excluded,
             ));
         }
-        Some(self.push_kind(child_path, DiscoveryKind::Special, child_depth, None))
+        Some(self.push_kind(
+            child_path,
+            DiscoveryKind::Special,
+            child_depth,
+            None,
+            false,
+        ))
     }
 
     fn maybe_follow_symlink_dir(
@@ -758,12 +833,37 @@ impl BoundedDiscovery {
         self.note_queue_peak();
     }
 
+    fn classify_exclusion(&mut self, path: &NormalizedPath, is_dir: bool) -> bool {
+        self.ignore.decide(path, is_dir).is_excluded()
+    }
+
+    fn load_rule_files(&mut self, dir_rel: Option<&NormalizedPath>, resolved: &std::path::Path) {
+        for name in [".gitignore", ".fcbignore"] {
+            let rule_path = resolved.join(name);
+            let meta = match fs::symlink_metadata(&rule_path) {
+                Ok(meta) => meta,
+                Err(_) => continue,
+            };
+            if !meta.file_type().is_file() || meta.len() > MAX_RULE_FILE_BYTES {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&rule_path) else {
+                continue;
+            };
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            self.ignore.add_rule_file(dir_rel, text);
+        }
+    }
+
     fn push_kind(
         &mut self,
         path: NormalizedPath,
         kind: DiscoveryKind,
         depth: u32,
         observed_len: Option<u64>,
+        excluded: bool,
     ) -> DiscoveryEntry {
         match kind {
             DiscoveryKind::File => self.aggregate.files = self.aggregate.files.saturating_add(1),
@@ -783,12 +883,16 @@ impl BoundedDiscovery {
                 self.aggregate.cycles = self.aggregate.cycles.saturating_add(1);
             }
         }
+        if excluded {
+            self.aggregate.excluded = self.aggregate.excluded.saturating_add(1);
+        }
         DiscoveryEntry {
             path,
             kind,
             depth,
             observed_len,
             scan_epoch: self.epoch,
+            excluded,
         }
     }
 

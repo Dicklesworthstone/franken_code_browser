@@ -27,6 +27,7 @@ pub mod chunk;
 pub mod confined;
 pub mod discovery;
 pub mod encoding;
+pub mod ignore;
 pub mod line_index;
 pub mod path;
 pub mod restoration;
@@ -46,6 +47,10 @@ pub use discovery::{
     BoundedDiscovery, ChildOrderGeneration, DiscoveryAggregate, DiscoveryBatch, DiscoveryEntry,
     DiscoveryKind, DiscoveryLimits, DiscoveryPeaks, IncompleteReason, PublicationState, ScanEpoch,
     ScanStatus,
+};
+pub use ignore::{
+    ExclusionCause, IgnoreDecision, IgnoreLayerKind, IgnoreMatcher, UnsupportedPattern,
+    UnsupportedReason,
 };
 pub use line_index::{
     LineCheckpoint, LineJumpResult, LineNumber, LineRangeOffsets, ResumableLineScanner,
