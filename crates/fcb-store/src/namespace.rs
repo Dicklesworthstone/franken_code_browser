@@ -31,7 +31,7 @@
 //! Reads and confinement are delegated to `fcb_source`'s qualified
 //! confined-reader pipeline; this crate never re-implements traversal.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::Write as _;
@@ -42,6 +42,44 @@ use fcb_core::{ArenaOwnerId, FileId, RootId, SourceRevision};
 use fcb_source::{
     ConfinedSourceReader, NormalizedPath, RootGrant, SourceError, SymlinkPolicy,
 };
+
+/// Check whether a path refers to a protected filesystem root or ancestor.
+pub fn is_protected_path(path: &Path) -> bool {
+    let raw = path.to_string_lossy();
+    if is_protected_name(raw.as_ref()) {
+        return true;
+    }
+    let resolved = if let Ok(canonical) = fs::canonicalize(path) {
+        canonical
+    } else {
+        path.to_path_buf()
+    };
+    if resolved.parent().is_none() {
+        return true;
+    }
+    let s = resolved.to_string_lossy();
+    is_protected_name(s.as_ref())
+}
+
+fn is_protected_name(s: &str) -> bool {
+    matches!(
+        s,
+        "/" | "/home"
+            | "/Users"
+            | "/etc"
+            | "/root"
+            | "/var"
+            | "/usr"
+            | "/bin"
+            | "/sbin"
+            | "/usr/bin"
+            | "/usr/sbin"
+            | "/usr/local"
+            | "/System"
+            | "/Library"
+            | "/Applications"
+    )
+}
 
 /// Marker file stored in the namespace root, binding it to one identity.
 pub const MARKER_NAME: &str = "marker";
@@ -228,6 +266,12 @@ pub enum CacheError {
     NotPinned,
     /// The entry already exists in this generation.
     EntryExists,
+    /// Attempted write or operation on a rotated, stale, or retired generation.
+    StaleGeneration,
+    /// Operation refused on protected filesystem root or ancestor path.
+    ProtectedPath,
+    /// Generation has been logically cleared or revoked.
+    GenerationRevoked,
     /// An error surfaced by the delegated confined-reader pipeline.
     Source(SourceError),
 }
@@ -248,6 +292,15 @@ impl fmt::Display for CacheError {
             Self::AlreadyPinned => formatter.write_str("generation is already pinned"),
             Self::NotPinned => formatter.write_str("generation is not pinned"),
             Self::EntryExists => formatter.write_str("entry already exists in this generation"),
+            Self::StaleGeneration => {
+                formatter.write_str("write attempted into stale, rotated, or retired generation")
+            }
+            Self::ProtectedPath => {
+                formatter.write_str("operation refused on protected filesystem root or ancestor path")
+            }
+            Self::GenerationRevoked => {
+                formatter.write_str("generation has been logically cleared or revoked")
+            }
             Self::Source(error) => write!(formatter, "confined source error: {error:?}"),
         }
     }
@@ -269,6 +322,41 @@ pub struct EntryWrite {
     pub len: u64,
 }
 
+/// Report returned by [`CacheNamespace::clear_namespace`] or [`CacheNamespace::clear_generation`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClearReport {
+    pub new_generation: Generation,
+    pub reclaimed_generations: Vec<u64>,
+    pub deferred_generations: Vec<u64>,
+    pub reclaimed_bytes: u64,
+    pub reclaimed_entries: u64,
+}
+
+impl ClearReport {
+    /// Logical reclamation removes directory entries, but does NOT guarantee
+    /// forensic erasure from underlying media, APFS snapshots, backups, or OS caches.
+    pub const fn forensic_erasure_guaranteed(&self) -> bool {
+        false
+    }
+}
+
+/// Report returned by [`CacheNamespace::reclaim_deferred`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReclamationReport {
+    pub completed_generations: Vec<u64>,
+    pub remaining_deferred: Vec<u64>,
+    pub reclaimed_bytes: u64,
+    pub reclaimed_entries: u64,
+}
+
+impl ReclamationReport {
+    /// Logical reclamation removes directory entries, but does NOT guarantee
+    /// forensic erasure from underlying media, APFS snapshots, backups, or OS caches.
+    pub const fn forensic_erasure_guaranteed(&self) -> bool {
+        false
+    }
+}
+
 /// Aggregate counters for one namespace session. Monotonic and saturating;
 /// write-side rejections are counted per class so attempts reconcile
 /// against outcomes.
@@ -277,9 +365,14 @@ pub struct NamespaceCounters {
     pub entries_written: u64,
     pub writes_rejected_name: u64,
     pub writes_rejected_size: u64,
+    pub writes_rejected_stale: u64,
     pub generations_advanced: u64,
     pub pins: u64,
     pub unpins: u64,
+    pub clears_completed: u64,
+    pub entries_reclaimed: u64,
+    pub bytes_reclaimed: u64,
+    pub deferred_reclamations: u64,
 }
 
 /// An owned cache namespace rooted in one exclusively-created directory.
@@ -291,6 +384,8 @@ pub struct CacheNamespace {
     cancel: fcb_source::CancelFlag,
     current_generation: u64,
     hot: BTreeMap<(u64, String), Arc<Vec<u8>>>,
+    deferred_generations: BTreeSet<u64>,
+    cleared_generations: BTreeSet<u64>,
     counters: NamespaceCounters,
 }
 
@@ -357,7 +452,13 @@ impl CacheNamespace {
         identity: NamespaceIdentity,
         owner: ArenaOwnerId,
     ) -> Result<Self, CacheError> {
+        if is_protected_path(parent) {
+            return Err(CacheError::ProtectedPath);
+        }
         let root = parent.join(Self::root_dir_name(&identity));
+        if is_protected_path(&root) {
+            return Err(CacheError::ProtectedPath);
+        }
         if let Ok(existing) = fs::symlink_metadata(&root) {
             if existing.file_type().is_symlink() {
                 return Err(CacheError::RootUnavailable);
@@ -383,6 +484,8 @@ impl CacheNamespace {
             cancel: fcb_source::CancelFlag::new(),
             current_generation: 1,
             hot: BTreeMap::new(),
+            deferred_generations: BTreeSet::new(),
+            cleared_generations: BTreeSet::new(),
             counters: NamespaceCounters::default(),
         })
     }
@@ -395,7 +498,13 @@ impl CacheNamespace {
         identity: NamespaceIdentity,
         owner: ArenaOwnerId,
     ) -> Result<Self, CacheError> {
+        if is_protected_path(parent) {
+            return Err(CacheError::ProtectedPath);
+        }
         let root = parent.join(Self::root_dir_name(&identity));
+        if is_protected_path(&root) {
+            return Err(CacheError::ProtectedPath);
+        }
         let meta = fs::symlink_metadata(&root).map_err(|_| CacheError::RootUnavailable)?;
         if meta.file_type().is_symlink() || !meta.is_dir() {
             return Err(CacheError::RootUnavailable);
@@ -422,6 +531,8 @@ impl CacheNamespace {
             cancel: fcb_source::CancelFlag::new(),
             current_generation: highest,
             hot: BTreeMap::new(),
+            deferred_generations: BTreeSet::new(),
+            cleared_generations: BTreeSet::new(),
             counters: NamespaceCounters::default(),
         };
         namespace.validate_marker()?;
@@ -479,6 +590,24 @@ impl CacheNamespace {
     /// never overwritten. Creation is exclusive, so a symlink planted at
     /// the target path is refused by the filesystem itself.
     pub fn write_entry(&mut self, name: &str, bytes: &[u8]) -> Result<EntryWrite, CacheError> {
+        self.write_entry_in_generation(self.current_generation, name, bytes)
+    }
+
+    /// Write one immutable entry explicitly targeting a generation.
+    ///
+    /// If `generation != self.current_generation`, the write is rejected as
+    /// [`CacheError::StaleGeneration`]. This blocks delayed background reads or
+    /// retired handles from repopulating a cleared or advanced generation.
+    pub fn write_entry_in_generation(
+        &mut self,
+        generation: u64,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<EntryWrite, CacheError> {
+        if generation != self.current_generation {
+            self.counters.writes_rejected_stale += 1;
+            return Err(CacheError::StaleGeneration);
+        }
         let entry_name = EntryName::new(name).map_err(|_| {
             self.counters.writes_rejected_name += 1;
             CacheError::EntryNameInvalid
@@ -488,7 +617,6 @@ impl CacheNamespace {
             return Err(CacheError::EntryTooLarge);
         }
         self.validate_root()?;
-        let generation = self.current_generation;
         let target = self.generation_path(generation)?.join(entry_name.as_str());
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -514,6 +642,11 @@ impl CacheNamespace {
     /// Cold read: through the confined pipeline from disk, regardless of
     /// the hot map. Refuses symlink-swapped entries under DisallowAll.
     pub fn read_cold(&self, name: &str, generation: u64) -> Result<Vec<u8>, CacheError> {
+        if self.cleared_generations.contains(&generation)
+            && !self.deferred_generations.contains(&generation)
+        {
+            return Err(CacheError::GenerationRevoked);
+        }
         let entry_name = EntryName::new(name).map_err(|_| CacheError::EntryNameInvalid)?;
         self.validate_root()?;
         let reader = self.confine();
@@ -535,6 +668,11 @@ impl CacheNamespace {
     /// read. Both paths are byte-identical by construction; the tests
     /// assert it.
     pub fn read_entry(&self, name: &str, generation: u64) -> Result<Vec<u8>, CacheError> {
+        if self.cleared_generations.contains(&generation)
+            && !self.deferred_generations.contains(&generation)
+        {
+            return Err(CacheError::GenerationRevoked);
+        }
         if let Some(hot) = self.read_hot(name, generation) {
             return Ok((*hot).clone());
         }
@@ -542,8 +680,8 @@ impl CacheNamespace {
     }
 
     /// Pin a generation. Pinned generations are declared retained for
-    /// reclamation purposes (reclamation itself belongs to the adjacent
-    /// child). Pinning is exclusive per generation.
+    /// reclamation purposes. Active pins prevent directory deletion during
+    /// logical clear, deferring reclamation until all pins are released.
     pub fn pin(&mut self, generation: u64) -> Result<(), CacheError> {
         Generation::new(generation).map_err(|_| CacheError::GenerationInvalid)?;
         if generation > self.current_generation {
@@ -561,9 +699,7 @@ impl CacheNamespace {
         Ok(())
     }
 
-    /// Remove this namespace's own pin marker for a generation. The only
-    /// removal path in this child, and it is namespace-scoped by
-    /// construction (a validated generation marker inside `pins/`).
+    /// Remove this namespace's own pin marker for a generation.
     pub fn unpin(&mut self, generation: u64) -> Result<(), CacheError> {
         Generation::new(generation).map_err(|_| CacheError::GenerationInvalid)?;
         let marker = self
@@ -588,5 +724,196 @@ impl CacheNamespace {
             .join(PINS_DIR)
             .join(format!("gen-{generation:06}.pin"))
             .exists()
+    }
+
+    /// Whether a generation is currently awaiting deferred reclamation.
+    pub fn is_deferred(&self, generation: u64) -> bool {
+        self.deferred_generations.contains(&generation)
+    }
+
+    /// Generations currently awaiting deferred reclamation.
+    pub fn active_deferred_generations(&self) -> Vec<u64> {
+        self.deferred_generations.iter().copied().collect()
+    }
+
+    /// Generations that have been logically cleared or revoked.
+    pub fn cleared_generations(&self) -> Vec<u64> {
+        self.cleared_generations.iter().copied().collect()
+    }
+
+    /// Internal helper to reclaim one generation directory strictly within
+    /// this namespace root. Refuses symlink-swapped generation directories or
+    /// entries.
+    fn reclaim_generation_dir(&mut self, target_generation: u64) -> Result<(u64, u64), CacheError> {
+        let gen_dir = self.root.join(generation_dir_name(target_generation));
+        if !gen_dir.exists() {
+            return Ok((0, 0));
+        }
+        let meta = fs::symlink_metadata(&gen_dir).map_err(|_| CacheError::RootUnavailable)?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(CacheError::RootUnavailable);
+        }
+        let mut entries_count = 0u64;
+        let mut bytes_count = 0u64;
+        for entry in fs::read_dir(&gen_dir).map_err(|_| CacheError::RootUnavailable)? {
+            let entry = entry.map_err(|_| CacheError::RootUnavailable)?;
+            let entry_path = entry.path();
+            let entry_meta =
+                fs::symlink_metadata(&entry_path).map_err(|_| CacheError::RootUnavailable)?;
+            if entry_meta.file_type().is_symlink() {
+                return Err(CacheError::RootUnavailable);
+            }
+            if entry_meta.is_file() {
+                bytes_count = bytes_count.saturating_add(entry_meta.len());
+                entries_count = entries_count.saturating_add(1);
+                fs::remove_file(&entry_path).map_err(|_| CacheError::RootUnavailable)?;
+            }
+        }
+        fs::remove_dir(&gen_dir).map_err(|_| CacheError::RootUnavailable)?;
+        self.hot.retain(|&(g, _), _| g != target_generation);
+        Ok((entries_count, bytes_count))
+    }
+
+    /// Logically clear the entire namespace:
+    ///
+    /// 1. Re-validates root marker and non-symlink status; refuses protected paths.
+    /// 2. Rotates the generation before admitting any writes or deletions, ensuring
+    ///    that any delayed or in-flight writes referencing old generations are
+    ///    rejected as [`CacheError::StaleGeneration`].
+    /// 3. For every prior generation:
+    ///    - If pinned, retains the generation on disk and in memory; marks it for
+    ///      deferred reclamation.
+    ///    - If unpinned, immediately reclaims entries, frees disk space, and evicts
+    ///      hot cache copies.
+    /// 4. Updates counters and returns a [`ClearReport`].
+    pub fn clear_namespace(&mut self) -> Result<ClearReport, CacheError> {
+        self.validate_root()?;
+        if is_protected_path(&self.root) {
+            return Err(CacheError::ProtectedPath);
+        }
+
+        let old_current = self.current_generation;
+        let next_gen = self.advance_generation()?.get();
+
+        let mut reclaimed_generations = Vec::new();
+        let mut deferred_generations = Vec::new();
+        let mut total_reclaimed_bytes = 0u64;
+        let mut total_reclaimed_entries = 0u64;
+
+        for g in 1..=old_current {
+            self.cleared_generations.insert(g);
+            if self.is_pinned(g) {
+                self.deferred_generations.insert(g);
+                deferred_generations.push(g);
+                self.counters.deferred_reclamations += 1;
+            } else {
+                let (entries, bytes) = self.reclaim_generation_dir(g)?;
+                reclaimed_generations.push(g);
+                total_reclaimed_entries = total_reclaimed_entries.saturating_add(entries);
+                total_reclaimed_bytes = total_reclaimed_bytes.saturating_add(bytes);
+            }
+        }
+
+        self.counters.clears_completed += 1;
+        self.counters.entries_reclaimed =
+            self.counters.entries_reclaimed.saturating_add(total_reclaimed_entries);
+        self.counters.bytes_reclaimed =
+            self.counters.bytes_reclaimed.saturating_add(total_reclaimed_bytes);
+
+        Ok(ClearReport {
+            new_generation: Generation::new(next_gen)
+                .map_err(|_| CacheError::GenerationInvalid)?,
+            reclaimed_generations,
+            deferred_generations,
+            reclaimed_bytes: total_reclaimed_bytes,
+            reclaimed_entries: total_reclaimed_entries,
+        })
+    }
+
+    /// Clear a specific generation.
+    ///
+    /// If the target generation is currently active, advances the generation first
+    /// to preserve write ordering and block stale repopulation.
+    /// If pinned, defers reclamation until unpinned.
+    pub fn clear_generation(&mut self, generation: u64) -> Result<ClearReport, CacheError> {
+        Generation::new(generation).map_err(|_| CacheError::GenerationInvalid)?;
+        self.validate_root()?;
+        if is_protected_path(&self.root) {
+            return Err(CacheError::ProtectedPath);
+        }
+
+        let new_gen = if generation == self.current_generation {
+            self.advance_generation()?.get()
+        } else {
+            self.current_generation
+        };
+
+        self.cleared_generations.insert(generation);
+
+        let mut reclaimed_generations = Vec::new();
+        let mut deferred_generations = Vec::new();
+        let mut total_reclaimed_bytes = 0u64;
+        let mut total_reclaimed_entries = 0u64;
+
+        if self.is_pinned(generation) {
+            self.deferred_generations.insert(generation);
+            deferred_generations.push(generation);
+            self.counters.deferred_reclamations += 1;
+        } else {
+            let (entries, bytes) = self.reclaim_generation_dir(generation)?;
+            reclaimed_generations.push(generation);
+            total_reclaimed_entries = entries;
+            total_reclaimed_bytes = bytes;
+        }
+
+        self.counters.clears_completed += 1;
+        self.counters.entries_reclaimed =
+            self.counters.entries_reclaimed.saturating_add(total_reclaimed_entries);
+        self.counters.bytes_reclaimed =
+            self.counters.bytes_reclaimed.saturating_add(total_reclaimed_bytes);
+
+        Ok(ClearReport {
+            new_generation: Generation::new(new_gen)
+                .map_err(|_| CacheError::GenerationInvalid)?,
+            reclaimed_generations,
+            deferred_generations,
+            reclaimed_bytes: total_reclaimed_bytes,
+            reclaimed_entries: total_reclaimed_entries,
+        })
+    }
+
+    /// Reclaim any generations that were previously deferred and have now
+    /// been unpinned.
+    pub fn reclaim_deferred(&mut self) -> Result<ReclamationReport, CacheError> {
+        self.validate_root()?;
+        let mut completed_generations = Vec::new();
+        let mut remaining_deferred = Vec::new();
+        let mut total_bytes = 0u64;
+        let mut total_entries = 0u64;
+
+        let pending: Vec<u64> = self.deferred_generations.iter().copied().collect();
+        for g in pending {
+            if !self.is_pinned(g) {
+                let (entries, bytes) = self.reclaim_generation_dir(g)?;
+                self.deferred_generations.remove(&g);
+                completed_generations.push(g);
+                total_entries = total_entries.saturating_add(entries);
+                total_bytes = total_bytes.saturating_add(bytes);
+            } else {
+                remaining_deferred.push(g);
+            }
+        }
+
+        self.counters.entries_reclaimed =
+            self.counters.entries_reclaimed.saturating_add(total_entries);
+        self.counters.bytes_reclaimed =
+            self.counters.bytes_reclaimed.saturating_add(total_bytes);
+
+        Ok(ReclamationReport {
+            completed_generations,
+            remaining_deferred,
+            reclaimed_bytes: total_bytes,
+            reclaimed_entries: total_entries,
+        })
     }
 }

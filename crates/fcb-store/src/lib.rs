@@ -36,7 +36,7 @@
 pub mod namespace;
 
 pub use namespace::{
-    CacheError, CacheNamespace, EntryName, EntryNameError, EntryWrite, Generation,
-    GenerationError, IdentityError, NamespaceCounters, NamespaceIdentity, MARKER_NAME,
-    MAX_ENTRY_BYTES, MAX_ENTRY_NAME, MAX_GENERATIONS, PINS_DIR,
+    is_protected_path, CacheError, CacheNamespace, ClearReport, EntryName, EntryNameError,
+    EntryWrite, Generation, GenerationError, IdentityError, NamespaceCounters, NamespaceIdentity,
+    ReclamationReport, MARKER_NAME, MAX_ENTRY_BYTES, MAX_ENTRY_NAME, MAX_GENERATIONS, PINS_DIR,
 };
