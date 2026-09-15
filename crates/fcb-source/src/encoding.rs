@@ -751,7 +751,7 @@ impl CaptureEncodingMap {
                 }
             }
             SpanKind::EscapedByte => {
-                if (val - span.decoded_start) % 4 == 0 {
+                if (val - span.decoded_start).is_multiple_of(4) {
                     Ok(ByteOffset::new(span.raw_start))
                 } else {
                     Err(SourceError::InvalidUtf8Boundary)
@@ -785,7 +785,7 @@ impl CaptureEncodingMap {
             SpanKind::AsciiRun => {
                 let delta = val - span.raw_start;
                 if self.encoding.is_utf16() {
-                    if delta % 2 != 0 {
+                    if !delta.is_multiple_of(2) {
                         return Err(SourceError::InvalidUtf16);
                     }
                     Ok(DecodedUtf8Offset::new(span.decoded_start + (delta / 2)))
@@ -902,7 +902,7 @@ impl CaptureEncodingMap {
             SpanKind::AsciiRun => {
                 let delta = val - span.raw_start;
                 if self.encoding.is_utf16() {
-                    if delta % 2 != 0 {
+                    if !delta.is_multiple_of(2) {
                         return Err(SourceError::InvalidUtf16);
                     }
                     Ok(Utf16CodeUnitOffset::new(span.utf16_start + (delta / 2)))
@@ -993,7 +993,7 @@ impl CaptureEncodingMap {
             SpanKind::AsciiRun => {
                 let delta = val - span.raw_start;
                 if self.encoding.is_utf16() {
-                    if delta % 2 != 0 {
+                    if !delta.is_multiple_of(2) {
                         return Err(SourceError::InvalidUtf16);
                     }
                     Ok(ScalarIndex::new(span.scalar_start + (delta / 2)))

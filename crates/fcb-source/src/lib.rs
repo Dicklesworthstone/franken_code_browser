@@ -345,10 +345,10 @@ impl ExtentCapture {
         let mut previous_end: Option<ByteOffset> = None;
         for observed in &observations {
             let range = observed.range();
-            if let Some(end) = previous_end {
-                if range.start() < end {
-                    return Err(SourceError::OverlappingExtent);
-                }
+            if let Some(end) = previous_end
+                && range.start() < end
+            {
+                return Err(SourceError::OverlappingExtent);
             }
             previous_end = Some(range.end());
         }
@@ -358,15 +358,15 @@ impl ExtentCapture {
             if hole.start() == hole.end() {
                 return Err(SourceError::InvalidRange);
             }
-            if let Some(end) = hole_end {
-                if hole.start() < end {
-                    return Err(SourceError::OverlappingExtent);
-                }
+            if let Some(end) = hole_end
+                && hole.start() < end
+            {
+                return Err(SourceError::OverlappingExtent);
             }
-            if let Some(total) = total_length {
-                if hole.end().get() > total.get() {
-                    return Err(SourceError::RangeOutOfBounds);
-                }
+            if let Some(total) = total_length
+                && hole.end().get() > total.get()
+            {
+                return Err(SourceError::RangeOutOfBounds);
             }
             hole_end = Some(hole.end());
         }
@@ -385,12 +385,11 @@ impl ExtentCapture {
                 return Err(SourceError::OverlappingExtent);
             }
         }
-        if let Some(total) = total_length {
-            if let Some(last) = observations.last() {
-                if last.range().end().get() > total.get() {
-                    return Err(SourceError::RangeOutOfBounds);
-                }
-            }
+        if let Some(total) = total_length
+            && let Some(last) = observations.last()
+            && last.range().end().get() > total.get()
+        {
+            return Err(SourceError::RangeOutOfBounds);
         }
 
         Ok(Self {

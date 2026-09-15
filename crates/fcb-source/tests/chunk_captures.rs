@@ -168,7 +168,7 @@ fn cross_chunk_multibyte_utf8_and_crlf_boundary() {
     // Offset 14-15: "AB"
     // Offset 15-16: CRLF split: '\r' at 15 (chunk 0 end), '\n' at 16 (chunk 1 start)
     // Offset 20-24: 4-byte UTF-8 emoji "🚀" (0xF0, 0x9F, 0x99, 0x80)
-    let mut data = vec![b'.'; 32];
+    let mut data = [b'.'; 32];
     data[15] = b'\r';
     data[16] = b'\n';
 

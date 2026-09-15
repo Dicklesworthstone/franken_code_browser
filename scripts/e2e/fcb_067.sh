@@ -12,4 +12,6 @@
 # The script itself delegates to cargo for local convenience runs; remote
 # execution evidence for closure must come from the strict form above.
 set -eu
-exec cargo test --manifest-path crates/fcb-source/Cargo.toml --test fcb_067_scenario -- --nocapture
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+cd "$SCRIPT_DIR/../../crates/fcb-source"
+exec cargo test --test fcb_067_scenario -- --nocapture

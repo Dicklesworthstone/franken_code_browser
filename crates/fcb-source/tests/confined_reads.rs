@@ -263,24 +263,24 @@ fn special_object_fifo_is_refused_without_blocking() {
         .arg(&fifo_path)
         .status();
 
-    if let Ok(exit) = status {
-        if exit.success() {
-            let root_id = test_root_id(105, 1);
-            let grant = RootGrant::new(root_id, dir.path());
-            let reader = ConfinedSourceReader::new(
-                grant,
-                SymlinkPolicy::DisallowAll,
-                ByteLength::new(1024),
-            );
+    if let Ok(exit) = status
+        && exit.success()
+    {
+        let root_id = test_root_id(105, 1);
+        let grant = RootGrant::new(root_id, dir.path());
+        let reader = ConfinedSourceReader::new(
+            grant,
+            SymlinkPolicy::DisallowAll,
+            ByteLength::new(1024),
+        );
 
-            let norm = NormalizedPath::new("test_pipe.fifo").unwrap();
-            let cancel = CancelFlag::new();
-            let err = reader
-                .read_file(test_file_id(105, 1), test_revision(105, 1), &norm, &cancel)
-                .unwrap_err();
+        let norm = NormalizedPath::new("test_pipe.fifo").unwrap();
+        let cancel = CancelFlag::new();
+        let err = reader
+            .read_file(test_file_id(105, 1), test_revision(105, 1), &norm, &cancel)
+            .unwrap_err();
 
-            assert_eq!(err, SourceError::SpecialObject);
-        }
+        assert_eq!(err, SourceError::SpecialObject);
     }
 }
 
@@ -325,7 +325,7 @@ fn root_grant_revocation_during_read_and_export_publication() {
             grant_clone.revoke();
             Ok(vec![1, 2, 3])
         },
-        |data| Ok(data),
+        Ok,
     )
     .unwrap_err();
 

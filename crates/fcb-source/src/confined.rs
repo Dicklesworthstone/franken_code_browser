@@ -207,21 +207,20 @@ impl ConfinedSourceReader {
                         }
 
                         // Cycle detection on directory symlinks
-                        if canonical_target.is_dir() {
-                            if let Ok(dir_id) = DirectoryId::from_path(&canonical_target) {
-                                if !visited_dirs.insert(dir_id) {
-                                    return Err(SourceError::TraversalCycle);
-                                }
-                            }
+                        if canonical_target.is_dir()
+                            && let Ok(dir_id) = DirectoryId::from_path(&canonical_target)
+                            && !visited_dirs.insert(dir_id)
+                        {
+                            return Err(SourceError::TraversalCycle);
                         }
 
                         current = canonical_target;
                     }
                 }
-            } else if meta.is_dir() {
-                if let Ok(dir_id) = DirectoryId::from_path(&current) {
-                    visited_dirs.insert(dir_id);
-                }
+            } else if meta.is_dir()
+                && let Ok(dir_id) = DirectoryId::from_path(&current)
+            {
+                visited_dirs.insert(dir_id);
             }
         }
 

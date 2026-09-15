@@ -245,7 +245,7 @@ impl ChunkedCapture {
         }
 
         let chunk_bytes_u64 = chunk_size.as_u64();
-        let expected_count = (total_u64 + chunk_bytes_u64 - 1) / chunk_bytes_u64;
+        let expected_count = total_u64.div_ceil(chunk_bytes_u64);
         if chunks.len() as u64 != expected_count {
             return Err(SourceError::MetadataMismatch);
         }
@@ -451,10 +451,10 @@ impl SafeChunkReader {
             return Err(SourceError::Canceled);
         }
 
-        if let Some(expected) = expected_len {
-            if expected > config.max_payload_bytes.get() {
-                return Err(SourceError::PayloadTooLarge);
-            }
+        if let Some(expected) = expected_len
+            && expected > config.max_payload_bytes.get()
+        {
+            return Err(SourceError::PayloadTooLarge);
         }
 
         let chunk_size_bytes = config.chunk_size.bytes();
@@ -516,11 +516,11 @@ impl SafeChunkReader {
             }
         }
 
-        if let Some(expected) = expected_len {
-            if total_read != expected {
-                // Concurrent truncation or extension detected
-                return Err(SourceError::ConcurrentModification);
-            }
+        if let Some(expected) = expected_len
+            && total_read != expected
+        {
+            // Concurrent truncation or extension detected
+            return Err(SourceError::ConcurrentModification);
         }
 
         ChunkedCapture::new(
@@ -574,10 +574,10 @@ impl SafeChunkReader {
             return Err(SourceError::ConcurrentModification);
         }
 
-        if let (Some(before_mtime), Ok(after_mtime)) = (initial_modified, stat_after.modified()) {
-            if before_mtime != after_mtime {
-                return Err(SourceError::ConcurrentModification);
-            }
+        if let (Some(before_mtime), Ok(after_mtime)) = (initial_modified, stat_after.modified())
+            && before_mtime != after_mtime
+        {
+            return Err(SourceError::ConcurrentModification);
         }
 
         Ok(capture)

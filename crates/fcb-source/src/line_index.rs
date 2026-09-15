@@ -285,10 +285,10 @@ impl ResumableLineScanner {
                 if let Some(last_start) = self.line_starts.last_mut() {
                     *last_start = new_line_start;
                 }
-                if let Some(last_cp) = self.checkpoints.last_mut() {
-                    if last_cp.line.get() == self.current_line {
-                        last_cp.byte_offset = ByteOffset::new(new_line_start);
-                    }
+                if let Some(last_cp) = self.checkpoints.last_mut()
+                    && last_cp.line.get() == self.current_line
+                {
+                    last_cp.byte_offset = ByteOffset::new(new_line_start);
                 }
                 idx = 1;
             }
@@ -346,7 +346,7 @@ impl ResumableLineScanner {
         self.current_line += 1;
         self.line_starts.push(next_start);
 
-        if self.current_line % self.stride == 0 {
+        if self.current_line.is_multiple_of(self.stride) {
             let line_num = LineNumber::new(self.current_line)?;
             self.checkpoints.push(LineCheckpoint {
                 line: line_num,

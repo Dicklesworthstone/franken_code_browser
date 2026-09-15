@@ -262,7 +262,7 @@ mod tests {
         let res3 = ExportPublicationGate::publish(
             &grant,
             || Ok("never reached"),
-            |payload| Ok(payload),
+            Ok,
         );
         assert_eq!(res3, Err(SourceError::GrantRevoked));
     }
