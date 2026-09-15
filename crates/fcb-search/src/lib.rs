@@ -17,6 +17,14 @@
 //! - Machine-query empty needle rejection (`QUERY_EMPTY`).
 //! - Unsupported encoding recorded explicitly in coverage rather than false negative.
 
+pub mod oracle;
+pub mod query;
+
+pub use oracle::{OracleMismatchError, ReferenceScanOracle, SearchDocument};
+pub use query::{
+    LangFilterKind, ParsedQuery, PathFilterKind, MAX_QUERY_LEN, MAX_QUERY_TOKENS,
+};
+
 use fcb_core::{
     ByteOffset, ByteRange, DecodedUtf8Offset, DecodedUtf8Range, FileId,
     QueryGeneration, SourceRevision,
@@ -42,6 +50,10 @@ pub enum QueryError {
     UnsupportedEncoding,
     /// An invalid offset range was encountered or generated.
     InvalidRange,
+    /// Regular expression search is unqualified and not permitted (§17.6).
+    RegexUnqualified,
+    /// Query string has invalid syntax, such as an unclosed quote.
+    SyntaxError,
 }
 
 impl QueryError {
@@ -53,6 +65,8 @@ impl QueryError {
             Self::Canceled => "QUERY_CANCELED",
             Self::UnsupportedEncoding => "QUERY_UNSUPPORTED_ENCODING",
             Self::InvalidRange => "QUERY_INVALID_RANGE",
+            Self::RegexUnqualified => "QUERY_REGEX_UNQUALIFIED",
+            Self::SyntaxError => "QUERY_SYNTAX_ERROR",
         }
     }
 }
