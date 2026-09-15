@@ -10,6 +10,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod terminal;
+pub use terminal::{
+    GpuSubmissionId, GpuTerminalError, LosslessTerminalDrainQueue, TerminalCompletionStatus,
+    TerminalDrainCounters, TerminalDrainError, TerminalDrainReport, TerminalEventRecord,
+    TerminalEventType, TerminalRecordReservation, TerminalRecordSlotId,
+};
+
 use fcb_core::tracing::{AbsoluteDeadline, DeadlineState, MonotonicTimestamp, TracingError};
 use std::collections::VecDeque;
 use std::fmt;
