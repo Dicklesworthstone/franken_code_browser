@@ -82,7 +82,7 @@ impl ContentDigest {
             return None;
         }
         let mut decoded = [0_u8; 16];
-        for (index, pair) in bytes.chunks_exact(2).enumerate() {
+        for (index, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
             let high = (pair[0] as char).to_digit(16)?;
             let low = (pair[1] as char).to_digit(16)?;
             decoded[index] = ((high << 4) | low) as u8;
@@ -471,10 +471,10 @@ pub fn reference_line_scan(
         number = number.checked_add(1).ok_or(ScanError::OffsetOverflow)?;
         start = end_index;
     }
-    if let Some(last) = lines.last() {
-        if last.end > input_len {
-            return Err(ScanError::OffsetOverflow);
-        }
+    if let Some(last) = lines.last()
+        && last.end > input_len
+    {
+        return Err(ScanError::OffsetOverflow);
     }
     Ok(lines)
 }

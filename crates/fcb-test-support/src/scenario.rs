@@ -211,7 +211,7 @@ fn scenario_pin(name: &str, seed: u64) -> SourcePin {
     let digest_hex = ContentDigest::of(name.as_bytes()).hex();
     let mut mixed = seed ^ (name.len() as u64).rotate_left(17);
     for byte in name.as_bytes() {
-        mixed = mixed.wrapping_mul(0x1_0000_0001_b3) ^ u64::from(*byte);
+        mixed = mixed.wrapping_mul(0x0100_0000_01b3) ^ u64::from(*byte);
     }
     let pin_text = format!("{}{:016x}", &digest_hex[..24], mixed.rotate_left(13));
     SourcePin::new(&pin_text).expect("40 hex characters by construction")
@@ -686,7 +686,7 @@ mod tests {
         };
 
         // Zero cases gate nothing.
-        let mut driver = ScenarioDriver::new(4, false).unwrap();
+        let driver = ScenarioDriver::new(4, false).unwrap();
         driver.finish().unwrap();
         assert_eq!(
             validate_results(&[required("anything", RequiredOutcome::Pass)], &[]),

@@ -114,7 +114,7 @@ impl RouteId {
         if text.len() > MAX_ID_BYTES {
             return Err(RouteError::TooLong);
         }
-        if text.bytes().any(|byte| byte == b' ' || byte < 0x20 || byte == 0x7f) {
+        if text.bytes().any(|byte| byte <= b' ' || byte == 0x7f) {
             return Err(RouteError::InvalidCharacter);
         }
         Ok(Self(text.to_string()))
