@@ -8,7 +8,10 @@ pub use fcb_core::{
     InteractionGeneration, LayoutRevision, Point2D, PresentedFrameId, Rect2D, SceneGeneration,
     SemanticNodeId, Size2D, SourceRevision,
 };
-pub use frame_plan::{FramePlan, InteractionResolution, PresentedFrameTracker};
+pub use frame_plan::{
+    FrameEvidenceEvent, FrameEvidenceRing, FramePlan, FrameTimestamps, InteractionResolution,
+    PresentationMode, PresentedFrameTracker,
+};
 
 pub mod frame_plan;
 
@@ -186,6 +189,8 @@ pub enum FcbError {
     FrameNotFound,
     FrameQueueExhausted,
     StaleGeneration,
+    CoordinateDomainMismatch,
+    ClockDomainMismatch,
 }
 
 impl FcbError {
@@ -205,6 +210,8 @@ impl FcbError {
             Self::FrameNotFound => "FRAME_NOT_FOUND",
             Self::FrameQueueExhausted => "FRAME_QUEUE_EXHAUSTED",
             Self::StaleGeneration => "STALE_GENERATION",
+            Self::CoordinateDomainMismatch => "COORDINATE_DOMAIN_MISMATCH",
+            Self::ClockDomainMismatch => "CLOCK_DOMAIN_MISMATCH",
         }
     }
 }
@@ -227,6 +234,9 @@ impl From<CoreError> for FcbError {
             | CoreError::StaleSourceRevision
             | CoreError::StaleDisplayGeneration => Self::StaleGeneration,
             CoreError::NodeNotFound => Self::FrameNotFound,
+            CoreError::NonFiniteGeometry | CoreError::InvalidGeometry => {
+                Self::CoordinateDomainMismatch
+            }
             _ => Self::OwnerMismatch,
         }
     }
@@ -627,6 +637,8 @@ mod tests {
         assert_eq!(FcbError::FrameNotFound.code(), "FRAME_NOT_FOUND");
         assert_eq!(FcbError::FrameQueueExhausted.code(), "FRAME_QUEUE_EXHAUSTED");
         assert_eq!(FcbError::StaleGeneration.code(), "STALE_GENERATION");
+        assert_eq!(FcbError::CoordinateDomainMismatch.code(), "COORDINATE_DOMAIN_MISMATCH");
+        assert_eq!(FcbError::ClockDomainMismatch.code(), "CLOCK_DOMAIN_MISMATCH");
         assert_eq!(FcbError::from(CoreError::Exhausted), FcbError::IdentityExhausted);
         assert_eq!(FcbError::from(CoreError::OwnershipMismatch), FcbError::OwnerMismatch);
         assert_eq!(FcbError::from(CoreError::LimitExceeded), FcbError::CaptureTooLarge);
@@ -635,5 +647,7 @@ mod tests {
         assert_eq!(FcbError::from(CoreError::StaleSourceRevision), FcbError::StaleGeneration);
         assert_eq!(FcbError::from(CoreError::StaleDisplayGeneration), FcbError::StaleGeneration);
         assert_eq!(FcbError::from(CoreError::NodeNotFound), FcbError::FrameNotFound);
+        assert_eq!(FcbError::from(CoreError::NonFiniteGeometry), FcbError::CoordinateDomainMismatch);
+        assert_eq!(FcbError::from(CoreError::InvalidGeometry), FcbError::CoordinateDomainMismatch);
     }
 }
