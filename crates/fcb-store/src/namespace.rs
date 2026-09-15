@@ -406,12 +406,12 @@ impl CacheNamespace {
             let entry = entry.map_err(|_| CacheError::RootUnavailable)?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if let Some(digits) = name.strip_prefix("gen-") {
-                if let Ok(value) = digits.parse::<u64>() {
-                    if value > highest && value <= MAX_GENERATIONS {
-                        highest = value;
-                    }
-                }
+            if let Some(digits) = name.strip_prefix("gen-")
+                && let Ok(value) = digits.parse::<u64>()
+                && value > highest
+                && value <= MAX_GENERATIONS
+            {
+                highest = value;
             }
         }
         let namespace = Self {

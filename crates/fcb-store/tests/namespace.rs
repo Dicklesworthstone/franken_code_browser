@@ -192,7 +192,7 @@ fn generation_lifecycle_advance_pin_unpin() {
         GenerationError::Zero
     );
     assert_eq!(
-        fcb_store::Generation::new(u64::from(fcb_store::MAX_GENERATIONS) + 1).unwrap_err(),
+        fcb_store::Generation::new(fcb_store::MAX_GENERATIONS + 1).unwrap_err(),
         GenerationError::Exhausted
     );
 }
