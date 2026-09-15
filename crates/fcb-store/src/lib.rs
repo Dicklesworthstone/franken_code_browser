@@ -33,8 +33,14 @@
 //! Reads and confinement are delegated to `fcb_source`'s qualified
 //! confined-reader pipeline; this crate never re-implements traversal.
 
+pub mod envelope;
 pub mod namespace;
 
+pub use envelope::{
+    canonicalize_f32, canonicalize_f64, EnvelopeError, EnvelopeLimits, EnvelopeReader,
+    EnvelopeSchema, EnvelopeWriter, HexError, Sha256, Sha256Digest, UnknownPolicy, CHECKSUM_LEN,
+    DEFAULT_MAGIC, FRAME_LEN, HEADER_LEN,
+};
 pub use namespace::{
     is_protected_path, CacheError, CacheNamespace, ClearReport, EntryName, EntryNameError,
     EntryWrite, Generation, GenerationError, IdentityError, NamespaceCounters, NamespaceIdentity,

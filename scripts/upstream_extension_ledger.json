@@ -1,0 +1,36 @@
+{
+  "schema": "fcb.extension-ledger.v1",
+  "entries": [
+    {
+      "owner": "franken_manim",
+      "origin": "https://github.com/Dicklesworthstone/franken_manim",
+      "extension": "fmn-hash-canonical-envelopes",
+      "public_api": [
+        "fmn_hash::Sha256",
+        "fmn_hash::Digest",
+        "fmn_hash::serial::Writer",
+        "fmn_hash::serial::Reader"
+      ],
+      "source": {
+        "commit": "6b5dd7b3fb60ac91b3d4c653e86459259d3709ab"
+      },
+      "features": [
+        "std"
+      ],
+      "closure_delta": {
+        "added_packages": [],
+        "removed_packages": [
+          "fmn-core"
+        ]
+      },
+      "upstream_tests": [
+        "cargo test --locked -p fmn-hash -p fmn-cache"
+      ],
+      "fcb_consumer": {
+        "route": "crates/fcb-store/tests/fcb_080_production.rs",
+        "evidence": "fcb_080_production_verification"
+      },
+      "qualification": "implemented"
+    }
+  ]
+}
