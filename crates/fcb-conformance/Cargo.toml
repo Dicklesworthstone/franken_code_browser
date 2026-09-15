@@ -10,15 +10,5 @@ description = "Hostile input generation, bounded mutation, and failure-preservin
 name = "fcb_conformance"
 path = "src/lib.rs"
 
-[features]
-default = []
-# Gated production adapter over the real FCB-021 resumable lexical engine.
-# The path dependency is explicit, test-only in practice, and excluded from
-# the shipping closure unless the feature is selected.
-fmd-lexical = ["dep:franken_markdown"]
-
-[dependencies]
-franken_markdown = { path = "../../../franken_markdown", optional = true }
-
 [lints]
 rust.missing_debug_implementations = "deny"
