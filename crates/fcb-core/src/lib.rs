@@ -6,11 +6,24 @@ use std::{
     sync::Arc,
 };
 
+pub mod focus;
+pub mod geometry;
 pub mod handles;
+pub mod pending_range;
 pub mod resources;
 pub mod tracing;
 
+pub use focus::{
+    AcceptedLayoutIdentity, AcceptedLayoutSnapshot, SemanticFocusState, SemanticNode,
+    SemanticRole,
+};
+pub use geometry::{
+    DisplayColorConfig, DisplayMetrics, Point2D, Rect2D, SemanticGeometry, Size2D,
+};
 pub use handles::{ArenaHandle, ArenaTable, DeviceHandle, DeviceTable, HandleLimits};
+pub use pending_range::{
+    PendingRangeStatus, PendingTextRangeResolver, RangeRequestToken, ResolvedTextRange,
+};
 pub use resources::{
     ResourceAccounting, ResourceAllocationId, ResourceBudget, ResourceKind, ResourceLease,
     ResourceLeaseInfo,
@@ -38,6 +51,12 @@ pub enum CoreError {
     StaleRequestGeneration,
     StaleSourceRevision,
     StaleDisplayGeneration,
+    NonFiniteGeometry,
+    InvalidGeometry,
+    StaleLayoutRevision,
+    FocusTargetNotFound,
+    RangePending,
+    NodeNotFound,
 }
 
 impl CoreError {
@@ -59,6 +78,12 @@ impl CoreError {
             Self::StaleRequestGeneration => "STALE_REQUEST_GENERATION",
             Self::StaleSourceRevision => "STALE_SOURCE_REVISION",
             Self::StaleDisplayGeneration => "STALE_DISPLAY_GENERATION",
+            Self::NonFiniteGeometry => "NON_FINITE_GEOMETRY",
+            Self::InvalidGeometry => "INVALID_GEOMETRY",
+            Self::StaleLayoutRevision => "STALE_LAYOUT_REVISION",
+            Self::FocusTargetNotFound => "FOCUS_TARGET_NOT_FOUND",
+            Self::RangePending => "RANGE_PENDING",
+            Self::NodeNotFound => "NODE_NOT_FOUND",
         }
     }
 }
@@ -835,10 +860,10 @@ impl<T> SnapshotCell<T> {
         if snapshot.owner() != self.owner {
             return Err(CoreError::OwnershipMismatch);
         }
-        if let Some(current) = self.head.as_ref() {
-            if snapshot.revision().get() <= current.revision().get() {
-                return Err(CoreError::StalePublication);
-            }
+        if let Some(current) = self.head.as_ref()
+            && snapshot.revision().get() <= current.revision().get()
+        {
+            return Err(CoreError::StalePublication);
         }
         self.head = Some(snapshot);
         Ok(())

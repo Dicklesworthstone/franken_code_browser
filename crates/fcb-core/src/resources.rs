@@ -189,13 +189,13 @@ impl ResourceAcquisitionSequence {
         order: ResourceAcquisitionOrder,
         bytes: ByteLength,
     ) -> Result<ResourceLease, ResourceAdmissionError> {
-        if let Some(held) = self.last {
-            if order < held {
-                return Err(ResourceAdmissionError::AcquisitionOrderViolation {
-                    held,
-                    requested: order,
-                });
-            }
+        if let Some(held) = self.last
+            && order < held
+        {
+            return Err(ResourceAdmissionError::AcquisitionOrderViolation {
+                held,
+                requested: order,
+            });
         }
         let lease = budget.try_reserve_class(self.owner, allocation, kind, class, bytes)?;
         self.last = Some(order);
