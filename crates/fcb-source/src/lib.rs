@@ -26,6 +26,7 @@
 
 pub mod chunk;
 pub mod confined;
+pub mod encoding;
 pub mod line_index;
 pub mod path;
 pub mod restoration;
@@ -35,6 +36,10 @@ pub mod snapshot;
 pub use chunk::{
     ChunkSize, ChunkedCapture, ChunkedReaderConfig, ExactRangeResult, RetainedCaptureStore,
     SafeChunkReader, SourceChunk,
+};
+pub use encoding::{
+    detect_encoding, CaptureEncodingMap, DetectedEncoding, MappingSpan, SpanKind,
+    StatefulChunkDecoder,
 };
 pub use confined::{ConfinedSourceReader, SymlinkPolicy};
 pub use line_index::{
@@ -545,6 +550,14 @@ pub enum SourceError {
     StaleCapture,
     /// Eviction was refused because the snapshot backing is actively pinned.
     PinActive,
+    /// A native unsigned sentinel value (such as NSNotFound) was passed as an offset.
+    NativeSentinel,
+    /// An offset fell in the interior of a multi-byte UTF-8 character.
+    InvalidUtf8Boundary,
+    /// An offset fell in the interior of a surrogate pair, or an invalid surrogate was encountered.
+    InvalidUtf16,
+    /// The source encoding is unsupported and no explicit decoder was supplied.
+    UnsupportedEncoding,
 }
 
 impl SourceError {
@@ -573,6 +586,28 @@ impl SourceError {
             Self::ChunkOutOfBounds => "SOURCE_CHUNK_OUT_OF_BOUNDS",
             Self::StaleCapture => "SOURCE_STALE_CAPTURE",
             Self::PinActive => "SOURCE_PIN_ACTIVE",
+            Self::NativeSentinel => "SOURCE_NATIVE_SENTINEL",
+            Self::InvalidUtf8Boundary => "SOURCE_INVALID_UTF8_BOUNDARY",
+            Self::InvalidUtf16 => "SOURCE_INVALID_UTF16",
+            Self::UnsupportedEncoding => "SOURCE_UNSUPPORTED_ENCODING",
+        }
+    }
+}
+
+impl From<fcb_core::CoreError> for SourceError {
+    fn from(err: fcb_core::CoreError) -> Self {
+        match err {
+            fcb_core::CoreError::NativeSentinel => SourceError::NativeSentinel,
+            fcb_core::CoreError::InvalidUtf8Boundary => SourceError::InvalidUtf8Boundary,
+            fcb_core::CoreError::InvalidUtf16 => SourceError::InvalidUtf16,
+            fcb_core::CoreError::RangeReversed | fcb_core::CoreError::InvalidId => {
+                SourceError::InvalidRange
+            }
+            fcb_core::CoreError::LimitExceeded
+            | fcb_core::CoreError::ArithmeticOverflow
+            | fcb_core::CoreError::ArithmeticUnderflow => SourceError::RangeOutOfBounds,
+            fcb_core::CoreError::OwnershipMismatch => SourceError::ForeignOwner,
+            _ => SourceError::EncodingError,
         }
     }
 }
