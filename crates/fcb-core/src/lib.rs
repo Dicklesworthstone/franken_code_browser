@@ -11,6 +11,7 @@ pub mod geometry;
 pub mod handles;
 pub mod pending_range;
 pub mod resources;
+pub mod retirement;
 pub mod tracing;
 
 pub use focus::{
@@ -26,7 +27,11 @@ pub use pending_range::{
 };
 pub use resources::{
     ResourceAccounting, ResourceAllocationId, ResourceBudget, ResourceKind, ResourceLease,
-    ResourceLeaseInfo,
+    ResourceLeaseInfo, ResourceReservationClass,
+};
+pub use retirement::{
+    BoundedRetirementQueue, PublicationOutcome, RetirementDrainReport,
+    RetirementError, RetirementReservation, RetirementSlotId, RetirementStatus,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
