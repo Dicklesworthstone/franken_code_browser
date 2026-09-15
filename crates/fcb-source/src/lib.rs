@@ -2,12 +2,11 @@
 
 //! Host source-provider and capture capability types (FCB-067.A).
 //!
-//! This crate separates a logical source provider from any native path. It
-//! contains no filesystem, environment, thread, clock, or network access of
-//! its own: a host grants providers explicitly, and the types here only
-//! validate and describe what a provider delivered. "No ambient native
-//! permission" is a structural property — nothing in this crate can reach a
-//! file, socket, or process.
+//! This crate separates a logical source provider from any native path. Default
+//! provider types perform no ambient filesystem, environment, thread, clock, or
+//! network access: a host grants providers explicitly. Confined native reads and
+//! bounded directory discovery run only against an explicit [`RootGrant`]; they
+//! never scan from process-wide path lookup.
 //!
 //! A provider states its capture, ordering, range-read, and cancellation
 //! guarantees explicitly; consumers must not infer stronger consistency from
@@ -26,6 +25,7 @@
 
 pub mod chunk;
 pub mod confined;
+pub mod discovery;
 pub mod encoding;
 pub mod line_index;
 pub mod path;
@@ -42,6 +42,11 @@ pub use encoding::{
     StatefulChunkDecoder,
 };
 pub use confined::{ConfinedSourceReader, SymlinkPolicy};
+pub use discovery::{
+    BoundedDiscovery, ChildOrderGeneration, DiscoveryAggregate, DiscoveryBatch, DiscoveryEntry,
+    DiscoveryKind, DiscoveryLimits, DiscoveryPeaks, IncompleteReason, PublicationState, ScanEpoch,
+    ScanStatus,
+};
 pub use line_index::{
     LineCheckpoint, LineJumpResult, LineNumber, LineRangeOffsets, ResumableLineScanner,
     SparseLineIndex,

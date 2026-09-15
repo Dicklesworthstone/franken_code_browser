@@ -227,6 +227,22 @@ impl NormalizedPath {
         &self.segments
     }
 
+    /// Append one directory-entry name, rejecting separators and traversal names.
+    pub fn join_segment(&self, segment: &[u8]) -> Result<Self, SourceError> {
+        validate_dirent_name(segment)?;
+        let mut bytes = Vec::with_capacity(self.raw.len() + 1 + segment.len());
+        bytes.extend_from_slice(self.raw.as_bytes());
+        bytes.push(b'/');
+        bytes.extend_from_slice(segment);
+        Self::new(RawPath::from_bytes(bytes))
+    }
+
+    /// Build a root-relative path from a single directory-entry name.
+    pub fn from_dirent_name(segment: &[u8]) -> Result<Self, SourceError> {
+        validate_dirent_name(segment)?;
+        Self::new(RawPath::from_bytes(segment.to_vec()))
+    }
+
     pub fn as_str(&self) -> Result<&str, SourceError> {
         std::str::from_utf8(self.raw.as_bytes()).map_err(|_| SourceError::EncodingError)
     }
@@ -234,6 +250,19 @@ impl NormalizedPath {
     pub fn display_escaped(&self) -> EscapedPathDisplay<'_> {
         self.raw.display_escaped()
     }
+}
+
+fn validate_dirent_name(segment: &[u8]) -> Result<(), SourceError> {
+    if segment.is_empty()
+        || segment == b"."
+        || segment == b".."
+        || segment.contains(&0)
+        || segment.contains(&b'/')
+        || segment.contains(&b'\\')
+    {
+        return Err(SourceError::PathEscape);
+    }
+    Ok(())
 }
 
 impl fmt::Debug for NormalizedPath {

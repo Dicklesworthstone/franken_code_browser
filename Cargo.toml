@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/fcb-core",
+    "crates/fcb",
+    "crates/fcb-runtime",
+    "crates/fcb-source",
+    "crates/fcb-search",
+    "crates/fcb-store",
+    "crates/fcb-test-support",
+    "crates/fcb-conformance",
+]
+exclude = ["probes/headless_consumer"]

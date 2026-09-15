@@ -153,9 +153,19 @@ impl ConfinedSourceReader {
         CompleteCapture::new(request, byte_length, arc_bytes)
     }
 
+    /// Canonicalize the grant root after confirming it is still an accessible directory.
+    pub(crate) fn canonical_root_path(&self) -> Result<PathBuf, SourceError> {
+        self.grant.validate_active()?;
+        let root_dir = self.grant.root_path().to_path_buf();
+        if !root_dir.is_dir() {
+            return Err(SourceError::RootUnavailable);
+        }
+        fs::canonicalize(&root_dir).map_err(|_| SourceError::RootUnavailable)
+    }
+
     /// Step-by-step path traversal enforcing root containment, symlink policy,
     /// and cycle detection.
-    fn resolve_confined_path(
+    pub(crate) fn resolve_confined_path(
         &self,
         canonical_root: &Path,
         rel_path: &NormalizedPath,
@@ -236,7 +246,7 @@ impl ConfinedSourceReader {
 
 /// Identifies a directory by filesystem device and inode on Unix for cycle detection.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct DirectoryId {
+pub(crate) struct DirectoryId {
     #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
@@ -246,7 +256,7 @@ struct DirectoryId {
 }
 
 impl DirectoryId {
-    fn from_path(path: &Path) -> Result<Self, SourceError> {
+    pub(crate) fn from_path(path: &Path) -> Result<Self, SourceError> {
         let meta = fs::metadata(path).map_err(map_io_error)?;
         #[cfg(unix)]
         {
@@ -270,7 +280,7 @@ impl DirectoryId {
 }
 
 /// Validates that a filesystem object is not a FIFO, socket, or device file.
-fn validate_not_special(meta: &fs::Metadata) -> Result<(), SourceError> {
+pub(crate) fn validate_not_special(meta: &fs::Metadata) -> Result<(), SourceError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileTypeExt;
@@ -289,7 +299,7 @@ fn validate_not_special(meta: &fs::Metadata) -> Result<(), SourceError> {
     Ok(())
 }
 
-fn map_io_error(e: std::io::Error) -> SourceError {
+pub(crate) fn map_io_error(e: std::io::Error) -> SourceError {
     match e.kind() {
         std::io::ErrorKind::NotFound => SourceError::CaptureUnavailable,
         std::io::ErrorKind::PermissionDenied => SourceError::RootUnavailable,
