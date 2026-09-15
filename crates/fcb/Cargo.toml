@@ -18,3 +18,6 @@ macos-metal = []
 
 [dependencies]
 fcb-core = { path = "../fcb-core" }
+
+[dev-dependencies]
+fcb-test-support = { path = "../fcb-test-support" }
