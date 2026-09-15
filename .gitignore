@@ -87,3 +87,4 @@ xcuserdata/
 *~
 Thumbs.db
 Desktop.ini
+crates/fcb-conformance/Cargo.lock
