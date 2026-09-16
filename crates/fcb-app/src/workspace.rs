@@ -63,8 +63,16 @@ fn common(out: &mut Output, command: &str, catalog: &WorkspaceCatalog, root: &Pa
     out.literal(",\"discovery_pages\":")?; out.integer(catalog.discovery_pages() as u64)?;
     out.literal(",\"discovery_limit\":")?;
     match catalog.stopped_by_limit() { Some(limit) => out.quoted(&format!("{limit:?}"))?, None => out.literal("null")? }
+    out.literal(",\"discovery_error\":")?;
+    match catalog.discovery_error() { Some(error) => out.quoted(error.code())?, None => out.literal("null")? }
+    let limits = catalog.limits();
+    out.literal(",\"limits\":{\"max_files\":")?; out.integer(limits.max_files as u64)?;
+    out.literal(",\"max_file_bytes\":")?; out.integer(limits.max_file_bytes as u64)?;
+    out.literal(",\"max_source_bytes\":")?; out.integer(limits.max_source_bytes as u64)?;
+    out.literal(",\"max_total_path_bytes\":")?; out.integer(limits.max_total_path_bytes as u64)?;
+    out.literal(",\"max_discovery_pages\":")?; out.integer(limits.max_discovery_pages as u64)?;
     let a = catalog.aggregate();
-    out.literal(",\"discovery\":{")?;
+    out.literal("},\"discovery\":{")?;
     for (i, (name, count)) in [("files", a.files), ("directories", a.directories),
         ("excluded_entries", a.excluded), ("symlinks_not_followed", a.symlinks),
         ("special_objects", a.special), ("unavailable", a.unavailable),
@@ -108,8 +116,8 @@ fn inspect(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, out: &mut 
 fn paths(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str,
     out: &mut Output, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<u8, AppError> {
     let count = catalog.entries().len();
-    let _scratch = budget.try_reserve_managed(owner(), allocation(31),
-        ByteLength::new((count * std::mem::size_of::<PathEntry<'_>>()) as u64))
+    let scratch_bytes = std::mem::size_of::<Vec<PathEntry<'_>>>() + count * std::mem::size_of::<PathEntry<'_>>();
+    let _scratch = budget.try_reserve_managed(owner(), allocation(31), ByteLength::new(scratch_bytes as u64))
         .map_err(|_| AppError::Admission)?;
     let mut entries = Vec::new();
     entries.try_reserve_exact(count).map_err(|_| AppError::Admission)?;
@@ -134,6 +142,7 @@ fn paths(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str
         out.literal(",\"matches_seen\":")?; out.integer(query.matches_seen() as u64)?;
         out.literal(",\"hits\":[")?;
         for (i, hit) in query.ranked_matches().iter().enumerate() {
+            if canceled() { return Err(AppError::Canceled); }
             if i > 0 { out.literal(",")?; }
             out.literal("{\"file_id\":")?; out.integer(hit.file_id().get())?;
             out.literal(",\"path\":")?; out.path(&hit.path().raw_path().to_path_buf())?;
@@ -195,12 +204,19 @@ fn text(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str,
         }
         out.literal("],\"unavailable_files\":[")?;
         for (i, file) in report.unavailable_files().iter().enumerate() {
+            if canceled() { return Err(AppError::Canceled); }
             if i > 0 { out.literal(",")?; }
-            out.integer(file.get())?;
+            file_record(out, catalog, *file)?;
+            out.literal(",\"reason\":")?;
+            out.quoted(captures.file_failure(*file).ok_or(AppError::InvalidRange)?.code())?;
+            out.literal("}")?;
         }
         out.literal("],\"unsupported_text_files\":[")?;
         for (i, file) in result.unsupported_files.iter().enumerate() {
-            if i > 0 { out.literal(",")?; } out.integer(file.get())?;
+            if canceled() { return Err(AppError::Canceled); }
+            if i > 0 { out.literal(",")?; }
+            file_record(out, catalog, *file)?;
+            out.literal(",\"reason\":\"UNSUPPORTED_EXACT_TEXT_DECODING\"}")?;
         }
         out.literal("]}\n")?;
     } else {
@@ -216,6 +232,14 @@ fn text(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str,
     }
     catalog.validate_active()?;
     Ok(if !report.is_complete() { EXIT_PARTIAL } else if result.matches.is_empty() { EXIT_NO_MATCH } else { EXIT_OK })
+}
+
+// Opens an object so the caller can add its reason before closing the record.
+fn file_record(out: &mut Output, catalog: &WorkspaceCatalog, file: fcb::FileId) -> Result<(), AppError> {
+    out.literal("{\"file_id\":")?; out.integer(file.get())?;
+    out.literal(",\"path\":")?;
+    out.path(&catalog.entry(file).ok_or(AppError::InvalidRange)?.path().raw().to_path_buf())?;
+    Ok(())
 }
 
 #[derive(Default)]
