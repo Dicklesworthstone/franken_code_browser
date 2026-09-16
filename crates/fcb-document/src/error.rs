@@ -47,6 +47,29 @@ pub enum DocumentError {
     EmptyDocument,
     /// Owner mismatch between request and session.
     OwnerMismatch,
+    /// Asset reference attempts path traversal or unconfined escape.
+    AssetEscape {
+        uri: String,
+        reason: String,
+    },
+    /// Asset request or memory budget exceeded.
+    AssetBudgetExceeded {
+        reason: String,
+    },
+    /// Target asset request identifier was not found or is unknown.
+    UnknownAssetRequest {
+        request_id: u64,
+    },
+    /// Asset result was provided for an outdated or mismatched generation.
+    StaleAssetGeneration {
+        expected: DocumentGeneration,
+        actual: DocumentGeneration,
+    },
+    /// Asset resolution failed.
+    AssetResolutionFailed {
+        request_id: u64,
+        reason: String,
+    },
 }
 
 impl DocumentError {
@@ -66,6 +89,11 @@ impl DocumentError {
             Self::LimitExceeded => "DOCUMENT_LIMIT_EXCEEDED",
             Self::EmptyDocument => "DOCUMENT_EMPTY",
             Self::OwnerMismatch => "DOCUMENT_OWNER_MISMATCH",
+            Self::AssetEscape { .. } => "DOCUMENT_ASSET_ESCAPE",
+            Self::AssetBudgetExceeded { .. } => "DOCUMENT_ASSET_BUDGET_EXCEEDED",
+            Self::UnknownAssetRequest { .. } => "DOCUMENT_UNKNOWN_ASSET_REQUEST",
+            Self::StaleAssetGeneration { .. } => "DOCUMENT_STALE_ASSET_GENERATION",
+            Self::AssetResolutionFailed { .. } => "DOCUMENT_ASSET_RESOLUTION_FAILED",
         }
     }
 }
@@ -125,6 +153,27 @@ impl std::fmt::Display for DocumentError {
             Self::LimitExceeded => write!(f, "{}: document resource limits exceeded", self.code()),
             Self::EmptyDocument => write!(f, "{}: document source is empty", self.code()),
             Self::OwnerMismatch => write!(f, "{}: owner ID mismatch", self.code()),
+            Self::AssetEscape { uri, reason } => {
+                write!(f, "{}: asset escape rejected for '{}': {}", self.code(), uri, reason)
+            }
+            Self::AssetBudgetExceeded { reason } => {
+                write!(f, "{}: asset budget exceeded: {}", self.code(), reason)
+            }
+            Self::UnknownAssetRequest { request_id } => {
+                write!(f, "{}: unknown asset request ID {}", self.code(), request_id)
+            }
+            Self::StaleAssetGeneration { expected, actual } => {
+                write!(
+                    f,
+                    "{}: stale asset generation: expected {}, got {}",
+                    self.code(),
+                    expected.get(),
+                    actual.get()
+                )
+            }
+            Self::AssetResolutionFailed { request_id, reason } => {
+                write!(f, "{}: asset resolution failed for request {}: {}", self.code(), request_id, reason)
+            }
         }
     }
 }

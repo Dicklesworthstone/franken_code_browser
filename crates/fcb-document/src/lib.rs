@@ -13,18 +13,24 @@
 //! It performs zero parsing, layout, or font shaping locally, delegating 100% of
 //! document processing to upstream FrankenMarkdown.
 
+pub mod assets;
 pub mod display_adapter;
 pub mod error;
 pub mod lens;
 pub mod provenance;
+pub mod publication;
 pub mod session;
 
+pub use assets::{
+    AssetDomain, AuthorizedAssetRequest, BoundedAssetBudgets, BoundedAssetRegistry,
+};
 pub use display_adapter::DocumentDisplayPlan;
 pub use error::DocumentError;
 pub use lens::DocumentLens;
 pub use provenance::{
     resolve_reading_selection, verify_provenance_truthfulness, SelectionResolution,
 };
+pub use publication::{DocumentPublication, RetainedLayoutMetrics};
 pub use session::{
     DocumentBudgets, DocumentFlowLine, DocumentSession, DocumentViewConstraints,
     HeadlessDocumentOutput, ResumableDocumentLayout,
