@@ -1,32 +1,23 @@
 #![forbid(unsafe_code)]
 
-//! Confined native filesystem reads, symlink policy, cycle control, and special object rejection (FCB-009.A).
+//! Explicit native source reads and symlink policy (FCB-009 / FCB-011).
 //!
-//! # Invariants
+//! [`range`] provides byte-capped, resumable observations of an already OPEN
+//! regular file supplied by the host. It never resolves or reopens a pathname.
 //!
-//! 1. **Strict Root Confinement**: Reads are confined to the root directory
-//!    specified in the [`RootGrant`]. A lexical prefix check alone is not
-//!    sufficient; path components are inspected step-by-step using
-//!    `symlink_metadata()` to prevent symlink traversal escaping the root.
-//! 2. **Symlink Policy & Cycle Control**:
-//!    - Under [`SymlinkPolicy::DisallowAll`], any symlink encountered along the
-//!      path is rejected with [`SourceError::SymlinkForbidden`].
-//!    - Under [`SymlinkPolicy::AllowWithinRoot`], symlinks are followed only if
-//!      their targets resolve strictly within the authorized root. Foreign
-//!      symlinks are rejected with [`SourceError::ForeignSymlink`].
-//!    - Symlink cycles and loops along the traversal ancestry are detected and
-//!      rejected with [`SourceError::TraversalCycle`].
-//!    - Alias expansion depth is bounded (max 16 hops).
-//! 3. **Non-File Object Rejection**: Special filesystem objects (FIFOs, named
-//!    pipes, UNIX domain sockets, character/block devices) are strictly refused
-//!    with [`SourceError::SpecialObject`]. They are never opened or read, preventing
-//!    indefinite blocking on malicious pipes.
-//! 4. **Grant Revocation Check**: The root grant is revalidated before reading
-//!    and immediately before delivering bytes. A revoked grant returns
-//!    [`SourceError::GrantRevoked`].
-//! 5. **Cancellation & Size Bounds**: Cooperative cancellation is checked, and
-//!    payloads exceeding the configured [`ByteLength`] limit are refused with
-//!    [`SourceError::PayloadTooLarge`].
+//! The legacy [`ConfinedSourceReader`] checks paths and their canonical targets,
+//! refuses observed special objects, and validates grants before delivery. Its
+//! path checks and `File::open` are separate operations: they do NOT establish
+//! race-safe confinement under hostile concurrent path replacement, nor prove
+//! that a replaced special object cannot be opened. That FCB-009 native gate
+//! remains unmet by this path-based route. Use an authorized descriptor supplied
+//! by the host's qualified native boundary for the range-reading route.
+//!
+//! Both routes retain original observed bytes, not an atomic-filesystem claim.
+//! Whole reads are now bounded throughout growth and cooperative cancellation;
+//! `range` additionally reserves managed capacity before allocating a candidate.
+
+pub mod range;
 
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -49,7 +40,8 @@ pub enum SymlinkPolicy {
     AllowWithinRoot,
 }
 
-/// A confined reader for native source roots under an authorized [`RootGrant`].
+/// A path-checked reader under an explicit [`RootGrant`]. See the module's
+/// concurrent-path-replacement limitation before choosing this native route.
 #[derive(Clone, Debug)]
 pub struct ConfinedSourceReader {
     grant: RootGrant,
@@ -59,188 +51,131 @@ pub struct ConfinedSourceReader {
 
 impl ConfinedSourceReader {
     pub fn new(grant: RootGrant, symlink_policy: SymlinkPolicy, max_payload: ByteLength) -> Self {
-        Self {
-            grant,
-            symlink_policy,
-            max_payload,
-        }
+        Self { grant, symlink_policy, max_payload }
     }
 
-    pub fn grant(&self) -> &RootGrant {
-        &self.grant
-    }
+    pub fn grant(&self) -> &RootGrant { &self.grant }
+    pub fn symlink_policy(&self) -> SymlinkPolicy { self.symlink_policy }
+    pub fn max_payload(&self) -> ByteLength { self.max_payload }
 
-    pub fn symlink_policy(&self) -> SymlinkPolicy {
-        self.symlink_policy
-    }
-
-    pub fn max_payload(&self) -> ByteLength {
-        self.max_payload
-    }
-
-    /// Reads a file confined within the root grant, returning a [`CompleteCapture`].
-    pub fn read_file(
-        &self,
-        file_id: FileId,
-        revision: SourceRevision,
-        rel_path: &NormalizedPath,
-        cancel: &CancelFlag,
-    ) -> Result<CompleteCapture, SourceError> {
-        // 1. Initial grant and cancellation check
+    /// Capture a bounded whole file. This is explicit worker I/O, not a
+    /// viewport operation. It has the path-race limitation documented above.
+    pub fn read_file(&self, file_id: FileId, revision: SourceRevision,
+        rel_path: &NormalizedPath, cancel: &CancelFlag) -> Result<CompleteCapture, SourceError> {
+        let request = CaptureRequest::new(file_id, revision)?;
+        if file_id.owner() != self.grant.owner() { return Err(SourceError::ForeignOwner); }
         self.grant.validate_active()?;
-        if cancel.is_canceled() {
-            return Err(SourceError::Canceled);
-        }
-
-        // 2. Validate root directory existence
+        if cancel.is_canceled() { return Err(SourceError::Canceled); }
         let root_dir = self.grant.root_path().to_path_buf();
-        if !root_dir.is_dir() {
-            return Err(SourceError::RootUnavailable);
-        }
-
-        // Canonical root directory for containment verification
-        let canonical_root = fs::canonicalize(&root_dir)
-            .map_err(|_| SourceError::RootUnavailable)?;
-
-        // 3. Resolve path step-by-step with no-follow checks
+        if !root_dir.is_dir() { return Err(SourceError::RootUnavailable); }
+        let canonical_root = fs::canonicalize(&root_dir).map_err(|_| SourceError::RootUnavailable)?;
         let resolved_path = self.resolve_confined_path(&canonical_root, rel_path)?;
-
-        if cancel.is_canceled() {
-            return Err(SourceError::Canceled);
-        }
-
-        // 4. Validate opened object (no FIFOs, sockets, block/char devices)
-        let symlink_meta = fs::symlink_metadata(&resolved_path)
-            .map_err(map_io_error)?;
-
+        if cancel.is_canceled() { return Err(SourceError::Canceled); }
+        let symlink_meta = fs::symlink_metadata(&resolved_path).map_err(map_io_error)?;
         validate_not_special(&symlink_meta)?;
-
         let meta = fs::metadata(&resolved_path).map_err(map_io_error)?;
         validate_not_special(&meta)?;
-
-        if !meta.is_file() {
-            return Err(SourceError::SpecialObject);
-        }
-
-        // 5. Payload size bound check
+        if !meta.is_file() { return Err(SourceError::SpecialObject); }
         let file_len = meta.len();
-        if file_len > self.max_payload.get() {
-            return Err(SourceError::PayloadTooLarge);
-        }
-
-        // 6. Safe open and read
+        if file_len > self.max_payload.get() { return Err(SourceError::PayloadTooLarge); }
         let mut file = File::open(&resolved_path).map_err(map_io_error)?;
-
-        let mut buf = Vec::with_capacity(file_len as usize);
-        file.read_to_end(&mut buf).map_err(map_io_error)?;
-
-        if (buf.len() as u64) != file_len {
-            // Concurrent mutation detected during read
+        // Revalidate the actual opened object, not only an earlier path lookup.
+        // This detects some races; it does not make path-based opening atomic.
+        let opened = file.metadata().map_err(map_io_error)?;
+        if !opened.is_file() { return Err(SourceError::SpecialObject); }
+        if opened.len() != file_len { return Err(SourceError::MetadataMismatch); }
+        let buf = read_bounded(&mut file, file_len, self.max_payload, cancel,
+            || self.grant.validate_active())?;
+        let after = file.metadata().map_err(map_io_error)?;
+        if after.len() != file_len || matches!((opened.modified().ok(), after.modified().ok()),
+            (Some(before), Some(after)) if before != after) {
             return Err(SourceError::MetadataMismatch);
         }
-
-        // 7. Check cancellation and grant revocation immediately before delivering bytes
-        if cancel.is_canceled() {
-            return Err(SourceError::Canceled);
-        }
+        if cancel.is_canceled() { return Err(SourceError::Canceled); }
         self.grant.validate_active()?;
-
-        // 8. Construct complete capture
-        let request = CaptureRequest::new(file_id, revision)?;
-        let byte_length = ByteLength::new(file_len);
-        let arc_bytes = Arc::from(buf.into_boxed_slice());
-
-        CompleteCapture::new(request, byte_length, arc_bytes)
+        CompleteCapture::new(request, ByteLength::new(file_len), Arc::from(buf.into_boxed_slice()))
     }
 
     /// Canonicalize the grant root after confirming it is still an accessible directory.
     pub(crate) fn canonical_root_path(&self) -> Result<PathBuf, SourceError> {
         self.grant.validate_active()?;
         let root_dir = self.grant.root_path().to_path_buf();
-        if !root_dir.is_dir() {
-            return Err(SourceError::RootUnavailable);
-        }
+        if !root_dir.is_dir() { return Err(SourceError::RootUnavailable); }
         fs::canonicalize(&root_dir).map_err(|_| SourceError::RootUnavailable)
     }
 
-    /// Step-by-step path traversal enforcing root containment, symlink policy,
-    /// and cycle detection.
-    pub(crate) fn resolve_confined_path(
-        &self,
-        canonical_root: &Path,
-        rel_path: &NormalizedPath,
-    ) -> Result<PathBuf, SourceError> {
+    /// Step-by-step path checks. This does not supply descriptor-relative,
+    /// race-safe native traversal under concurrent namespace replacement.
+    pub(crate) fn resolve_confined_path(&self, canonical_root: &Path,
+        rel_path: &NormalizedPath) -> Result<PathBuf, SourceError> {
         let mut current = canonical_root.to_path_buf();
         let mut visited_dirs: HashSet<DirectoryId> = HashSet::new();
         let mut symlink_hops = 0;
-
-        // Record root in visited directory ancestry
-        if let Ok(id) = DirectoryId::from_path(canonical_root) {
-            visited_dirs.insert(id);
-        }
-
+        if let Ok(id) = DirectoryId::from_path(canonical_root) { visited_dirs.insert(id); }
         for segment in rel_path.segments() {
             let seg_path = segment.to_path_buf();
             current.push(seg_path);
-
             let meta = match fs::symlink_metadata(&current) {
                 Ok(m) => m,
                 Err(e) => return Err(map_io_error(e)),
             };
-
             if meta.file_type().is_symlink() {
                 match self.symlink_policy {
-                    SymlinkPolicy::DisallowAll => {
-                        return Err(SourceError::SymlinkForbidden);
-                    }
+                    SymlinkPolicy::DisallowAll => return Err(SourceError::SymlinkForbidden),
                     SymlinkPolicy::AllowWithinRoot => {
                         symlink_hops += 1;
-                        if symlink_hops > 16 {
-                            // Bounded alias expansion exceeded -> cycle/loop refusal
-                            return Err(SourceError::TraversalCycle);
-                        }
-
-                        // Read symlink target
+                        if symlink_hops > 16 { return Err(SourceError::TraversalCycle); }
                         let target = fs::read_link(&current).map_err(map_io_error)?;
-                        let target_resolved = if target.is_absolute() {
-                            target
-                        } else {
-                            current.parent().unwrap_or(canonical_root).join(target)
-                        };
-
-                        // Canonicalize target to verify containment
-                        let canonical_target = fs::canonicalize(&target_resolved)
-                            .map_err(map_io_error)?;
-
-                        if !canonical_target.starts_with(canonical_root) {
-                            return Err(SourceError::ForeignSymlink);
-                        }
-
-                        // Cycle detection on directory symlinks
+                        let target_resolved = if target.is_absolute() { target }
+                            else { current.parent().unwrap_or(canonical_root).join(target) };
+                        let canonical_target = fs::canonicalize(&target_resolved).map_err(map_io_error)?;
+                        if !canonical_target.starts_with(canonical_root) { return Err(SourceError::ForeignSymlink); }
                         if canonical_target.is_dir()
                             && let Ok(dir_id) = DirectoryId::from_path(&canonical_target)
-                            && !visited_dirs.insert(dir_id)
-                        {
+                            && !visited_dirs.insert(dir_id) {
                             return Err(SourceError::TraversalCycle);
                         }
-
                         current = canonical_target;
                     }
                 }
-            } else if meta.is_dir()
-                && let Ok(dir_id) = DirectoryId::from_path(&current)
-            {
+            } else if meta.is_dir() && let Ok(dir_id) = DirectoryId::from_path(&current) {
                 visited_dirs.insert(dir_id);
             }
         }
-
-        // Final verification that `current` canonicalizes within `canonical_root`
         let canonical_current = fs::canonicalize(&current).map_err(map_io_error)?;
-        if !canonical_current.starts_with(canonical_root) {
-            return Err(SourceError::PathEscape);
-        }
-
+        if !canonical_current.starts_with(canonical_root) { return Err(SourceError::PathEscape); }
         Ok(current)
+    }
+}
+
+/// Fixed allocation and one-byte growth lookahead, never an unbounded
+/// read_to_end. Repeated interruption is bounded even in this synchronous
+/// compatibility route. The range reader offers separately resumable I/O.
+fn read_bounded(reader: &mut impl Read, length: u64, max_payload: ByteLength,
+    cancel: &CancelFlag, mut authorized: impl FnMut() -> Result<(), SourceError>) -> Result<Vec<u8>, SourceError> {
+    if length > max_payload.get() { return Err(SourceError::PayloadTooLarge); }
+    let length = usize::try_from(length).map_err(|_| SourceError::PayloadTooLarge)?;
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(length).map_err(|_| SourceError::PayloadTooLarge)?;
+    buf.resize(length, 0);
+    let mut filled = 0;
+    let mut interruptions = 0;
+    loop {
+        if cancel.is_canceled() { return Err(SourceError::Canceled); }
+        authorized()?;
+        let mut extra = [0u8; 1];
+        let target = if filled == length { &mut extra[..] }
+            else { &mut buf[filled..length.min(filled.saturating_add(64 * 1024))] };
+        match reader.read(target) {
+            Ok(0) if filled == length => return Ok(buf),
+            Ok(0) => return Err(SourceError::MetadataMismatch),
+            Ok(_) if filled == length => return Err(SourceError::MetadataMismatch),
+            Ok(count) => { filled += count; interruptions = 0; }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted && interruptions < 32 => {
+                interruptions += 1;
+            }
+            Err(error) => return Err(map_io_error(error)),
+        }
     }
 }
 
@@ -254,17 +189,13 @@ pub(crate) struct DirectoryId {
     #[cfg(not(unix))]
     hash: u64,
 }
-
 impl DirectoryId {
     pub(crate) fn from_path(path: &Path) -> Result<Self, SourceError> {
         let meta = fs::metadata(path).map_err(map_io_error)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            Ok(Self {
-                dev: meta.dev(),
-                ino: meta.ino(),
-            })
+            Ok(Self { dev: meta.dev(), ino: meta.ino() })
         }
         #[cfg(not(unix))]
         {
@@ -272,14 +203,12 @@ impl DirectoryId {
             use std::hash::{Hash, Hasher};
             let mut hasher = DefaultHasher::new();
             path.hash(&mut hasher);
-            Ok(Self {
-                hash: hasher.finish(),
-            })
+            Ok(Self { hash: hasher.finish() })
         }
     }
 }
 
-/// Validates that a filesystem object is not a FIFO, socket, or device file.
+/// Validates an observed filesystem object is not a FIFO, socket, or device.
 pub(crate) fn validate_not_special(meta: &fs::Metadata) -> Result<(), SourceError> {
     #[cfg(unix)]
     {
@@ -292,17 +221,56 @@ pub(crate) fn validate_not_special(meta: &fs::Metadata) -> Result<(), SourceErro
     #[cfg(not(unix))]
     {
         let ft = meta.file_type();
-        if !ft.is_file() && !ft.is_dir() && !ft.is_symlink() {
-            return Err(SourceError::SpecialObject);
-        }
+        if !ft.is_file() && !ft.is_dir() && !ft.is_symlink() { return Err(SourceError::SpecialObject); }
     }
     Ok(())
 }
-
 pub(crate) fn map_io_error(e: std::io::Error) -> SourceError {
     match e.kind() {
         std::io::ErrorKind::NotFound => SourceError::CaptureUnavailable,
         std::io::ErrorKind::PermissionDenied => SourceError::RootUnavailable,
         _ => SourceError::CaptureUnavailable,
+    }
+}
+
+#[cfg(test)]
+mod bounded_compatibility_tests {
+    use super::*;
+    #[test]
+    fn fixed_length_capture_detects_growth_and_truncation() {
+        let cancel = CancelFlag::new();
+        for bytes in [b"ab".as_slice(), b"abcd"] {
+            let mut reader = bytes;
+            assert_eq!(read_bounded(&mut reader, 3, ByteLength::new(3), &cancel, || Ok(())), Err(SourceError::MetadataMismatch));
+        }
+        let mut exact = b"abc".as_slice();
+        assert_eq!(read_bounded(&mut exact, 3, ByteLength::new(3), &cancel, || Ok(())).unwrap(), b"abc");
+    }
+    #[test]
+    fn infinite_input_consumes_only_length_plus_one_byte() {
+        struct Infinite(usize);
+        impl Read for Infinite {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                bytes.fill(b'x'); self.0 += bytes.len(); Ok(bytes.len())
+            }
+        }
+        let mut reader = Infinite(0);
+        assert_eq!(read_bounded(&mut reader, 19, ByteLength::new(19), &CancelFlag::new(), || Ok(())), Err(SourceError::MetadataMismatch));
+        assert_eq!(reader.0, 20);
+    }
+    #[test]
+    fn revocation_and_repeated_interruptions_terminate() {
+        struct Interrupted(usize);
+        impl Read for Interrupted {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                self.0 += 1; Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+            }
+        }
+        let mut reader = Interrupted(0);
+        assert!(read_bounded(&mut reader, 1, ByteLength::new(1), &CancelFlag::new(), || Ok(())).is_err());
+        assert_eq!(reader.0, 33);
+        let before = reader.0;
+        assert_eq!(read_bounded(&mut reader, 1, ByteLength::new(1), &CancelFlag::new(), || Err(SourceError::GrantRevoked)), Err(SourceError::GrantRevoked));
+        assert_eq!(reader.0, before);
     }
 }
