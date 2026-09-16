@@ -51,6 +51,7 @@ pub fn export_workspace(captures: &WorkspaceCaptures<'_>, limits: SnapshotLimits
     catalog.validate_active()?;
     if !captures.finished() { return Err(WorkspaceError::Pending.into()); }
     let charge = catalog.entries().len().checked_mul(size_of::<SnapshotEntry<'_>>())
+        .and_then(|n| n.checked_add(size_of::<Vec<SnapshotEntry<'_>>>()))
         .ok_or(SavedSourceError::ResourceDenied)?;
     let _scratch = budget.try_reserve_managed(catalog.id().owner(), allocations[0], ByteLength::new(charge as u64))
         .map_err(|_| SavedSourceError::ResourceDenied)?;
