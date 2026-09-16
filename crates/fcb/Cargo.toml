@@ -10,6 +10,7 @@ default = []
 source = ["dep:fcb-source"]
 search = ["source", "dep:fcb-search"]
 map = ["dep:fcb-map"]
+analysis = ["dep:fcb-analysis"]
 markdown = []
 view = []
 runtime = []
@@ -21,6 +22,7 @@ fcb-core = { path = "../fcb-core" }
 fcb-source = { path = "../fcb-source", optional = true }
 fcb-search = { path = "../fcb-search", optional = true }
 fcb-map = { path = "../fcb-map", optional = true }
+fcb-analysis = { path = "../fcb-analysis", optional = true }
 
 [dev-dependencies]
 fcb-test-support = { path = "../fcb-test-support" }

@@ -1,0 +1,18 @@
+[package]
+name = "fcb-analysis"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Source-specific structural outlines, facts, and analysis coordination (FCB-030.A)."
+
+[lib]
+name = "fcb_analysis"
+path = "src/lib.rs"
+
+[dependencies]
+fcb-core = { path = "../fcb-core" }
+fcb-source = { path = "../fcb-source" }
+
+[dev-dependencies]
+fcb-test-support = { path = "../fcb-test-support" }

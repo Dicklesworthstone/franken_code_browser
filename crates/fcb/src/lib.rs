@@ -27,6 +27,10 @@ pub mod search;
 #[cfg(feature = "map")]
 pub mod map;
 
+/// Language-scoped structural outlines and evidence-grounded facts.
+#[cfg(feature = "analysis")]
+pub use fcb_analysis as analysis;
+
 /// A capability whose implementation can be selected additively by a host.
 ///
 /// The facade itself remains usable with no Cargo features.  In-memory source

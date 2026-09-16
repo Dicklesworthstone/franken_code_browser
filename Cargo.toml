@@ -11,5 +11,6 @@ members = [
     "crates/fcb-store",
     "crates/fcb-test-support",
     "crates/fcb-conformance",
+    "crates/fcb-analysis",
 ]
 exclude = ["probes/headless_consumer"]
