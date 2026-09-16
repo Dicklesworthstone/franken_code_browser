@@ -11,7 +11,7 @@ use crate::args::{Arguments, Command, Encoding, Needle};
 use crate::input::{self, Loaded};
 use crate::output::Output;
 
-const HELP: &str = "FrankenCodeBrowser — bounded headless file tools\n\n\
+const HELP: &str = "FrankenCodeBrowser — bounded headless source tools\n\n\
   fcb capabilities [--json]\n\
   fcb doctor [--json]                 Static capability report; no scans/repairs\n\
   fcb inspect FILE [--json]           Metadata only; no source payload read\n\
@@ -21,13 +21,23 @@ const HELP: &str = "FrankenCodeBrowser — bounded headless file tools\n\n\
   fcb search FILE --raw-hex HEX [--json]\n\
   fcb read --stdin [--json]           Bounded input; EOF required\n\
   fcb search --stdin --text TEXT [--json]\n\n\
-Options: --offset DECIMAL --bytes DECIMAL --limit DECIMAL\n\
-         --encoding auto|utf8|utf16le|utf16be\n\
-         -- ends options, allowing filenames beginning with a dash\n\n\
-Defaults: offset 0, 65536 visible source bytes, 100 stored matches.\n\
+Explicit workspace scope:\n\
+  fcb inspect ROOT --workspace [--json]\n\
+  fcb search ROOT --workspace --text TEXT [--json]\n\
+  fcb search ROOT --workspace --path QUERY [--json]\n\
+  --max-files N --max-file-bytes N --max-total-bytes N --include-excluded\n\
+Workspace defaults: 4096 files, 1 MiB/file, 32 MiB captured source.\n\
+Static product exclusions apply; nested .gitignore/.fcbignore are NOT loaded.\n\
+Path search and inspection read no source payload. Files refused by capture\n\
+quotas stay unavailable, not false no-match results. No atomic-repository claim.\n\n\
+File-window options: --offset DECIMAL --bytes DECIMAL --limit DECIMAL\n\
+                     --encoding auto|utf8|utf16le|utf16be\n\
+--limit also bounds workspace result/listing rows; -- ends options.\n\
+File defaults: offset 0, 65536 visible source bytes, 100 stored matches.\n\
 Limits: 262144 visible bytes, 4096 stored matches, 8 MiB response.\n\
 Far-offset text requires --encoding; --raw-hex searches original bytes.\n\
-Large files return explicit partial coverage; no directory tree is scanned.\n\
+No directory is scanned without --workspace. Workspace mode does not accept\n\
+stdin, window offsets, raw-byte queries or an encoding override.\n\
 IDs are response-local. Decoded offsets are window-local UTF-8, not file bytes.\n\
 Human source output escapes terminal controls; JSON retains logical text.\n\
 Exit: 0 complete, 1 complete no-match, 2 error, 3 partial/truncated, 130 canceled.\n\
@@ -48,12 +58,12 @@ pub(crate) fn capabilities(args: &Arguments, out: &mut Output) -> Result<u8, App
     let rows = [
         ("bounded-stdin-reading", implemented, "Explicit input only; EOF required within byte cap."),
         ("named-file-range-reading", file_state, "One regular file; no full-file capture prerequisite."),
-        ("file-inspection", file_state, "Opened-file metadata only; no recursive scan."),
+        ("file-inspection", file_state, "Metadata only; recursive catalog requires explicit --workspace."),
         ("exact-window-text-search", implemented, "Existing decoded UTF-8/UTF-16 range search; scope explicit."),
         ("exact-window-byte-search", implemented, "Existing overlapping byte matcher; scope explicit."),
         ("lossless-json-output", implemented, "One bounded document; decimal-string integers and Unix path hex."),
         ("native-gui", "unavailable", "AppKit/Metal composition is not implemented in this binary."),
-        ("workspace-cli-search", "unavailable", "Directory discovery is not connected to this CLI lane."),
+        ("workspace-cli-search", file_state, "Explicit bounded discovery, native-path lookup and indexed literal search over retained captures; static exclusions, no rule files."),
         ("persistent-cli-index", "unavailable", "No store is opened or implicitly created."),
         ("markdown-preview", "unavailable", "No integrated upstream document renderer in this lane."),
         ("regex-search", "unavailable", "No qualified regex engine selected."),
@@ -62,7 +72,7 @@ pub(crate) fn capabilities(args: &Arguments, out: &mut Output) -> Result<u8, App
     if args.json {
         begin(out, command)?;
         out.literal(",\"qualification\":\"pending-independent-RCH\",\"native_ready\":false,\"mode\":")?;
-        out.quoted(if diagnostic { "static-capabilities-only" } else { "headless-file-tools" })?;
+        out.quoted(if diagnostic { "static-capabilities-only" } else { "headless-source-tools" })?;
         out.literal(",\"source_scanned\":false,\"features\":[")?;
         for (index, (name, state, reason)) in rows.iter().enumerate() {
             if index != 0 { out.literal(",")?; }
@@ -72,7 +82,7 @@ pub(crate) fn capabilities(args: &Arguments, out: &mut Output) -> Result<u8, App
         }
         out.literal("]}\n")?;
     } else {
-        out.literal("FrankenCodeBrowser: headless file tools; independent verification pending.\n")?;
+        out.literal("FrankenCodeBrowser: headless source tools; independent verification pending.\n")?;
         if diagnostic { out.literal("Static diagnostic only: no source scans, benchmarks, database opens, or repairs.\n")?; }
         for (name, state, reason) in rows { out.literal(name)?; out.literal(": ")?;
             out.literal(state)?; out.literal(" — ")?; out.literal(reason)?; out.literal("\n")?; }
