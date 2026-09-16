@@ -87,7 +87,7 @@ fn test_real_readme_headless_output_consumed_through_public_api() {
 
     // Verify semantic fixture serialization
     assert!(
-        output.semantic_fixture.contains("SEMANTIC FLOW FIXTURE"),
+        output.semantic_fixture.contains("SEMANTIC LAYOUT FIXTURE"),
         "fixture must contain semantic header"
     );
 }
