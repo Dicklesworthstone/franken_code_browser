@@ -23,7 +23,8 @@ pub mod publication;
 pub mod session;
 
 pub use assets::{
-    AssetDomain, AuthorizedAssetRequest, BoundedAssetBudgets, BoundedAssetRegistry,
+    AssetDomain, AssetKind, AuthorizedAssetRequest, BoundedAssetBudgets, BoundedAssetRegistry,
+    ImageCodecValidator, ImageFormat, TransclusionPolicy, TransclusionTracker,
 };
 pub use dialect::{
     CalloutEvaluation, DialectCapabilityRow, DialectConfig, DialectFeature,

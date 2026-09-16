@@ -138,6 +138,7 @@ fn test_bounded_asset_registry_budget_defense() {
         max_pending_requests: 2,
         max_total_asset_bytes: 1024,
         max_single_asset_bytes: 512,
+        ..BoundedAssetBudgets::default()
     };
 
     let mut registry = BoundedAssetRegistry::new(doc_id, generation, budgets);

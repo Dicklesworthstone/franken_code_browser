@@ -237,6 +237,7 @@ fn bounded_asset_confinement_and_delivery() {
         max_pending_requests: 3,
         max_total_asset_bytes: 4096,
         max_single_asset_bytes: 1024,
+        ..BoundedAssetBudgets::default()
     };
 
     let mut registry = BoundedAssetRegistry::new(doc_id, generation, budgets);

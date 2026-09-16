@@ -70,6 +70,35 @@ pub enum DocumentError {
         request_id: u64,
         reason: String,
     },
+    /// Image dimensions or decoded memory exceeds decompression bomb thresholds.
+    DecompressionBomb {
+        width: u32,
+        height: u32,
+        reason: String,
+    },
+    /// Asset payload is corrupt, truncated, or fails magic header validation.
+    CorruptAssetPayload {
+        request_id: u64,
+        reason: String,
+    },
+    /// Transclusion cycle detected in document inclusion tree.
+    TransclusionCycle {
+        path: String,
+        chain: Vec<String>,
+    },
+    /// Transclusion nesting depth exceeds maximum permitted limit.
+    TransclusionDepthExceeded {
+        max_depth: usize,
+    },
+    /// Host capability or policy denied access to the requested asset.
+    AssetDenied {
+        request_id: u64,
+        reason: String,
+    },
+    /// Remote network fetch attempted while network is disabled by default.
+    NetworkDisabled {
+        uri: String,
+    },
 }
 
 impl DocumentError {
@@ -94,6 +123,12 @@ impl DocumentError {
             Self::UnknownAssetRequest { .. } => "DOCUMENT_UNKNOWN_ASSET_REQUEST",
             Self::StaleAssetGeneration { .. } => "DOCUMENT_STALE_ASSET_GENERATION",
             Self::AssetResolutionFailed { .. } => "DOCUMENT_ASSET_RESOLUTION_FAILED",
+            Self::DecompressionBomb { .. } => "DOCUMENT_DECOMPRESSION_BOMB",
+            Self::CorruptAssetPayload { .. } => "DOCUMENT_CORRUPT_ASSET_PAYLOAD",
+            Self::TransclusionCycle { .. } => "DOCUMENT_TRANSCLUSION_CYCLE",
+            Self::TransclusionDepthExceeded { .. } => "DOCUMENT_TRANSCLUSION_DEPTH_EXCEEDED",
+            Self::AssetDenied { .. } => "DOCUMENT_ASSET_DENIED",
+            Self::NetworkDisabled { .. } => "DOCUMENT_NETWORK_DISABLED",
         }
     }
 }
@@ -173,6 +208,24 @@ impl std::fmt::Display for DocumentError {
             }
             Self::AssetResolutionFailed { request_id, reason } => {
                 write!(f, "{}: asset resolution failed for request {}: {}", self.code(), request_id, reason)
+            }
+            Self::DecompressionBomb { width, height, reason } => {
+                write!(f, "{}: decompression bomb rejected for {}x{}: {}", self.code(), width, height, reason)
+            }
+            Self::CorruptAssetPayload { request_id, reason } => {
+                write!(f, "{}: corrupt asset payload for request {}: {}", self.code(), request_id, reason)
+            }
+            Self::TransclusionCycle { path, chain } => {
+                write!(f, "{}: transclusion cycle detected for '{}', chain: {:?}", self.code(), path, chain)
+            }
+            Self::TransclusionDepthExceeded { max_depth } => {
+                write!(f, "{}: transclusion nesting depth exceeds limit {}", self.code(), max_depth)
+            }
+            Self::AssetDenied { request_id, reason } => {
+                write!(f, "{}: asset request {} denied: {}", self.code(), request_id, reason)
+            }
+            Self::NetworkDisabled { uri } => {
+                write!(f, "{}: network disabled by default, refused fetch for '{}'", self.code(), uri)
             }
         }
     }
