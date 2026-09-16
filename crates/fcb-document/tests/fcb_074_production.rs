@@ -391,6 +391,10 @@ fn bounded_real_document_flow_and_resource_requests() {
                     | AccessibleReadingRole::ListItem
                     | AccessibleReadingRole::BlockQuote
                     | AccessibleReadingRole::Table
+                    | AccessibleReadingRole::TableHeaderRow
+                    | AccessibleReadingRole::TableRow
+                    | AccessibleReadingRole::TableHeaderCell
+                    | AccessibleReadingRole::TableCell
                     | AccessibleReadingRole::Image
                     | AccessibleReadingRole::ThematicBreak
                     | AccessibleReadingRole::Document
