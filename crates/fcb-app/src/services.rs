@@ -26,18 +26,28 @@ Explicit workspace scope:\n\
   fcb search ROOT --workspace --text TEXT [--json]\n\
   fcb search ROOT --workspace --path QUERY [--json]\n\
   --max-files N --max-file-bytes N --max-total-bytes N --include-excluded\n\
-Workspace defaults: 4096 files, 1 MiB/file, 32 MiB captured source.\n\
+Indexed-capture defaults: 4096 files, 1 MiB/file, 32 MiB captured source.\n\
 Static product exclusions apply; nested .gitignore/.fcbignore are NOT loaded.\n\
 Path search and inspection read no source payload. Files refused by capture\n\
 quotas stay unavailable, not false no-match results. No atomic-repository claim.\n\n\
+Continuous whole-file search, without retaining full source:\n\
+  fcb search FILE --whole-file --text TEXT [--json]\n\
+  fcb search ROOT --workspace --whole-file --text TEXT [--json]\n\
+  --raw-hex HEX also works; --max-scan-bytes N admits source I/O separately.\n\
+Default scan allowance: 256 MiB GLOBAL, maximum 1 TiB; input buffer: 16 KiB.\n\
+Only exact literal witnesses are retained. The scan has separate read-call\n\
+and result limits, preserves cross-buffer hits, and reports incomplete files.\n\
+Whole-file mode starts at byte zero, requires named files, and does not accept\n\
+window offsets, stdin, path queries or indexed-capture byte-limit switches.\n\n\
 File-window options: --offset DECIMAL --bytes DECIMAL --limit DECIMAL\n\
                      --encoding auto|utf8|utf16le|utf16be\n\
 --limit also bounds workspace result/listing rows; -- ends options.\n\
 File defaults: offset 0, 65536 visible source bytes, 100 stored matches.\n\
 Limits: 262144 visible bytes, 4096 stored matches, 8 MiB response.\n\
 Far-offset text requires --encoding; --raw-hex searches original bytes.\n\
-No directory is scanned without --workspace. Workspace mode does not accept\n\
-stdin, window offsets, raw-byte queries or an encoding override.\n\
+No directory is scanned without --workspace. Indexed workspace mode does not\n\
+accept stdin, window offsets, raw-byte queries or an encoding override.\n\
+Whole-file workspace mode accepts raw bytes and explicit text encoding.\n\
 IDs are response-local. Decoded offsets are window-local UTF-8, not file bytes.\n\
 Human source output escapes terminal controls; JSON retains logical text.\n\
 Exit: 0 complete, 1 complete no-match, 2 error, 3 partial/truncated, 130 canceled.\n\
@@ -63,7 +73,7 @@ pub(crate) fn capabilities(args: &Arguments, out: &mut Output) -> Result<u8, App
         ("exact-window-byte-search", implemented, "Existing overlapping byte matcher; scope explicit."),
         ("lossless-json-output", implemented, "One bounded document; decimal-string integers and Unix path hex."),
         ("native-gui", "unavailable", "AppKit/Metal composition is not implemented in this binary."),
-        ("workspace-cli-search", file_state, "Explicit bounded discovery, native-path lookup and indexed literal search over retained captures; static exclusions, no rule files."),
+        ("workspace-cli-search", file_state, "Explicit bounded discovery, native-path lookup, indexed captures or whole-file streaming; static exclusions, no rule files."),
         ("persistent-cli-index", "unavailable", "No store is opened or implicitly created."),
         ("markdown-preview", "unavailable", "No integrated upstream document renderer in this lane."),
         ("regex-search", "unavailable", "No qualified regex engine selected."),
@@ -80,12 +90,15 @@ pub(crate) fn capabilities(args: &Arguments, out: &mut Output) -> Result<u8, App
             out.literal(",\"state\":")?; out.quoted(state)?;
             out.literal(",\"reason\":")?; out.quoted(reason)?; out.literal("}")?;
         }
-        out.literal("]}\n")?;
+        out.literal("],\"whole_file_search\":{\"state\":")?; out.quoted(file_state)?;
+        out.literal(",\"flag\":\"--whole-file\",\"input_buffer_bytes\":\"16384\",\"default_max_scan_bytes\":\"268435456\",\"maximum_max_scan_bytes\":\"1099511627776\",\"retention\":\"literal-witnesses-only\"}}\n")?;
     } else {
         out.literal("FrankenCodeBrowser: headless source tools; independent verification pending.\n")?;
         if diagnostic { out.literal("Static diagnostic only: no source scans, benchmarks, database opens, or repairs.\n")?; }
         for (name, state, reason) in rows { out.literal(name)?; out.literal(": ")?;
             out.literal(state)?; out.literal(" — ")?; out.literal(reason)?; out.literal("\n")?; }
+        out.literal("whole-file-streaming: ")?; out.literal(file_state)?;
+        out.literal(" — explicit --whole-file; global I/O budget, 16 KiB input buffer, literal witnesses only.\n")?;
     }
     Ok(EXIT_OK)
 }
