@@ -9,11 +9,13 @@ pub mod args;
 pub mod output;
 mod input;
 mod services;
+mod workspace;
 
 use std::{ffi::OsString, io::{Read, Write}};
 use fcb::{ArenaOwnerId, ByteLength, FileId, SourceRevision};
 use fcb::search::{ExtentError, ExtentViewError, ExtentQueryError, QueryGeneration,
-    ResourceAllocationId, ResourceBudget};
+    ResourceAllocationId, ResourceBudget, IndexError, PathSearchError};
+use fcb::search::workspace::WorkspaceError;
 use args::{Arguments, ArgumentError, Command};
 use output::{Output, OutputError, MAX_RESPONSE_BYTES};
 
@@ -39,6 +41,7 @@ pub enum AppError {
     View(ExtentViewError), Query(ExtentQueryError), Io, UnsupportedPlatform,
     Symlink, Special, Directory, InputLimit, IoCallLimit, Canceled,
     GuiUnavailable, InvalidRange, Admission, SourceChanged,
+    Workspace(WorkspaceError), Index(IndexError), Path(PathSearchError),
 }
 impl AppError {
     pub fn code(self) -> String {
@@ -47,6 +50,8 @@ impl AppError {
             Self::Output(error) => return error.code().to_owned(),
             Self::Extent(error) => return error.code().to_owned(),
             Self::View(error) => return error.to_string(), Self::Query(error) => return error.to_string(),
+            Self::Workspace(error) => return error.to_string(), Self::Index(error) => return error.to_string(),
+            Self::Path(error) => return error.to_string(),
             Self::Io => "CLI_SOURCE_IO", Self::UnsupportedPlatform => "CLI_NATIVE_FILE_UNSUPPORTED",
             Self::Symlink => "CLI_SYMLINK_REFUSED", Self::Special => "CLI_SPECIAL_OBJECT_REFUSED",
             Self::Directory => "CLI_DIRECTORY_SCOPE_UNAVAILABLE", Self::InputLimit => "CLI_INPUT_LIMIT",
@@ -59,14 +64,14 @@ impl AppError {
     pub const fn subsystem(self) -> &'static str {
         match self {
             Self::Argument(_) => "arguments", Self::Output(_) => "output",
-            Self::View(_) => "decoder", Self::Query(_) => "search",
-            Self::GuiUnavailable => "native", _ => "source",
+            Self::View(_) => "decoder", Self::Query(_) | Self::Index(_) | Self::Path(_) => "search",
+            Self::Workspace(_) => "workspace", Self::GuiUnavailable => "native", _ => "source",
         }
     }
     pub const fn message(self) -> &'static str {
         match self {
-            Self::Argument(_) => "The command or its options are not supported in this bounded file-scoped lane.",
-            Self::Directory => "Directory discovery and workspace CLI search are not implemented by this command.",
+            Self::Argument(_) => "The command or its options are not supported in the selected scope.",
+            Self::Directory => "This file-scoped command does not authorize directory enumeration; use an explicit --workspace search or inspection.",
             Self::GuiUnavailable => "The native GUI launcher is not implemented in this build.",
             Self::UnsupportedPlatform => "Named-file opening is not implemented for this target ABI; bounded stdin remains available.",
             Self::Symlink => "The selected final path component is a symbolic link.",
@@ -77,9 +82,10 @@ impl AppError {
             Self::SourceChanged => "The source identity changed during admission.",
             Self::Output(_) => "The complete response did not fit its output admission budget.",
             Self::View(_) => "The requested text could not be decoded with the available exact source context.",
-            Self::Query(_) => "The exact query could not complete under its declared source semantics.",
+            Self::Query(_) | Self::Index(_) | Self::Path(_) => "The exact query could not complete under its declared source semantics.",
+            Self::Workspace(_) => "The workspace operation could not publish its bounded observation.",
             Self::Admission => "Managed resource capacity was refused before publication.",
-            Self::InvalidRange => "The requested range is not valid for this observation.",
+            Self::InvalidRange => "The requested range or source kind is not valid for this operation.",
             _ => "The explicitly selected source could not be read.",
         }
     }
@@ -87,14 +93,18 @@ impl AppError {
         match self {
             Self::GuiUnavailable => "Use fcb read FILE or fcb open FILE --json for headless reading.",
             Self::View(_) | Self::Query(_) => "Check the declared encoding or select original bytes with search --raw-hex.",
-            Self::Directory => "Select one file explicitly; no workspace was scanned.",
+            Self::Directory => "Use fcb inspect ROOT --workspace or fcb search ROOT --workspace --text TEXT.",
             Self::Argument(_) => "Run fcb --help for supported commands and limits.",
             _ => "Check the selected source and limits, then retry explicitly.",
         }
     }
     pub fn is_canceled(self) -> bool {
         matches!(self, Self::Canceled | Self::Extent(ExtentError::Canceled)
-            | Self::View(ExtentViewError::Canceled) | Self::Query(ExtentQueryError::Canceled))
+            | Self::View(ExtentViewError::Canceled) | Self::Query(ExtentQueryError::Canceled)
+            | Self::Workspace(WorkspaceError::Canceled)
+            | Self::Workspace(WorkspaceError::Index(IndexError::Canceled))
+            | Self::Workspace(WorkspaceError::Source(fcb::source::SourceError::Canceled))
+            | Self::Index(IndexError::Canceled) | Self::Path(PathSearchError::Canceled))
     }
     pub const fn retryable(self) -> bool {
         matches!(self, Self::Io | Self::SourceChanged | Self::Admission)
@@ -109,6 +119,9 @@ impl From<OutputError> for AppError { fn from(error: OutputError) -> Self { Self
 impl From<ExtentError> for AppError { fn from(error: ExtentError) -> Self { Self::Extent(error) } }
 impl From<ExtentViewError> for AppError { fn from(error: ExtentViewError) -> Self { Self::View(error) } }
 impl From<ExtentQueryError> for AppError { fn from(error: ExtentQueryError) -> Self { Self::Query(error) } }
+impl From<WorkspaceError> for AppError { fn from(error: WorkspaceError) -> Self { Self::Workspace(error) } }
+impl From<IndexError> for AppError { fn from(error: IndexError) -> Self { Self::Index(error) } }
+impl From<PathSearchError> for AppError { fn from(error: PathSearchError) -> Self { Self::Path(error) } }
 
 /// Ordinary --json writes ONE complete bounded document or one error document.
 /// Service failures discard the private partial encoder before writing errors.
@@ -122,8 +135,8 @@ pub fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut impl Writ
         Ok(budget) => budget,
         Err(_) => { let _ = stderr.write(b"CLI_RESOURCE_DENIED\n"); return EXIT_ERROR; }
     };
-    let size = match parsed.as_ref().map(|args| args.command) {
-        Ok(Command::Read | Command::Open | Command::Search) => MAX_RESPONSE_BYTES,
+    let size = match parsed.as_ref() {
+        Ok(args) if args.workspace || matches!(args.command, Command::Read | Command::Open | Command::Search) => MAX_RESPONSE_BYTES,
         _ => 16 * 1024,
     };
     let mut output = match Output::new(owner(), size, &budget, allocation(1)) {
@@ -162,6 +175,7 @@ pub fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut impl Writ
 fn execute(args: &Arguments, stdin: &mut impl Read, output: &mut Output,
     budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<u8, AppError> {
     if canceled() { return Err(AppError::Canceled); }
+    if args.workspace { return workspace::execute(args, output, budget, canceled); }
     match args.command {
         Command::Help => services::help(args.json, output),
         Command::Capabilities | Command::Doctor => services::capabilities(args, output),
