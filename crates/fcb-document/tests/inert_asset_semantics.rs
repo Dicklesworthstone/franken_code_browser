@@ -131,9 +131,10 @@ fn test_inert_network_and_url_restrictions() {
         "../secret/key.pem",
         "/etc/shadow",
         "nested/../../outside.png",
+        "images\\..\\secret.png",
+        "C:\\Windows\\system32",
         "   ",
         "",
-        "images\\win32\\backslashes.png",
     ];
 
     for url in hostile {
@@ -152,6 +153,7 @@ fn test_inert_network_and_url_restrictions() {
         "./assets/architecture.svg",
         "docs/subfolder/spec.md",
         "logo_2026.webp",
+        "images\\win32\\backslashes.png",
     ];
 
     for url in allowed {
