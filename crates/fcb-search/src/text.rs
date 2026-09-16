@@ -114,7 +114,11 @@ impl ExactScan<'_> {
     /// Return true for a terminal result (proven truncation or unavailable text).
     fn process(&mut self, staging: &mut Vec<u8>, eof: bool) -> Result<bool, QueryError> {
         // A budget ending inside a BOM is incomplete, not an unsupported file.
-        if staging.is_empty() || (!eof && self.raw_offset == 0 && staging.len() < 3) {
+        if staging.is_empty() {
+            return Ok(false);
+        }
+        if !eof && self.raw_offset == 0 && self.encoding.is_none()
+            && matches!(staging.as_slice(), [0xEF] | [0xEF, 0xBB] | [0xFF] | [0xFE]) {
             return Ok(false);
         }
         let encoding = *self.encoding.get_or_insert_with(|| detect_encoding(staging));
@@ -388,6 +392,28 @@ mod tests {
             assert_eq!(result.matches[0].original_byte_range.start().get(), WINDOW_BYTES as u64);
             assert_eq!(result.matches[0].original_byte_range.end().get(), bytes.len() as u64);
         }
+    }
+
+    #[test]
+    fn tiny_ascii_budget_returns_available_hits_without_waiting_for_a_bom() {
+        let result = scan(b"abc", "a", 1, Some(1));
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].original_byte_range.start().get(), 0);
+        assert_eq!(result.scanned_bytes, 1);
+        assert_eq!(result.coverage, SearchCoverage::BudgetExhausted { bytes_scanned: 1 });
+    }
+
+    #[test]
+    fn disabled_cross_chunk_respects_source_boundaries_not_decoding_windows() {
+        let owner = ArenaOwnerId::new(1).unwrap();
+        let mut options = QueryOptions::new(QueryGeneration::new(owner, 1).unwrap());
+        options.cross_chunk = false;
+        let result = scan_exact_chunks(b"abababa".chunks(2).map(Ok), 7,
+            FileId::new(owner, 1).unwrap(), SourceRevision::new(owner, 1).unwrap(),
+            "aba", &options, || false).unwrap();
+        assert!(result.matches.is_empty());
+        assert!(result.is_complete());
+        assert_eq!(result.scanned_bytes, 7);
     }
 
 }
