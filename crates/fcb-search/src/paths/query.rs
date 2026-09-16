@@ -84,8 +84,8 @@ pub enum PathSelection<'index> {
 /// sorted component range; fuzzy queries visit the immutable file-key universe.
 /// Top-k storage is bounded independently from the count of all matches seen.
 /// All-match bitsets, rather than truncated top-k rows, make refinement sound.
-/// Key processing and result shifts are admitted before visiting each file.
-/// This is worker work, not a claim about fixed-duration interaction callbacks.
+/// Key processing, tie comparisons and result shifts are admitted before each
+/// file. This is worker work, not a fixed-duration interaction callback claim.
 pub struct PathSearch<'index> {
     index: &'index PathIndex,
     options: PathSearchOptions,
@@ -167,12 +167,14 @@ impl<'index> PathSearch<'index> {
     /// subsequence eligibility narrow only for a normalized-key extension with
     /// unchanged mode/case/scope and a FINISHED scan of this exact index. Exact
     /// mode, backspace, scope changes, and unfinished/canceled scans restart.
-    /// A new query always has independent output capacity and generation.
+    /// Generations increase within the owner; exhaustion cannot wrap to an old
+    /// query. Output capacity is reserved independently from the old query.
     pub fn refine(
         &self, needle: &[u8], mut options: PathSearchOptions,
         budget: &ResourceBudget, allocation: ResourceAllocationId,
     ) -> Result<Self, PathSearchError> {
-        if options.generation == self.options.generation { return Err(PathSearchError::StaleQuery); }
+        if options.generation.owner() != self.options.generation.owner() { return Err(PathSearchError::OwnerMismatch); }
+        if options.generation.get() <= self.options.generation.get() { return Err(PathSearchError::StaleQuery); }
         if options.selected_file.is_none() { options.selected_file = self.selected; }
         let mut next = Self::new(self.index, needle, options, budget, allocation)?;
         if self.state == PathSearchState::Finished
@@ -196,11 +198,20 @@ impl<'index> PathSearch<'index> {
     pub const fn work_units(&self) -> u64 { self.work_units }
     pub const fn last_step_units(&self) -> usize { self.last_step_units }
     pub const fn reused_candidates(&self) -> bool { self.reused_candidates }
+    pub const fn ordering_protected(&self) -> bool { self.protected }
+    /// A completed scan may still have a newer ordering waiting behind the
+    /// protected interaction region. Hosts can show this without moving focus.
+    pub fn has_pending_ordering(&self) -> bool {
+        self.protected && (self.frozen.len() != self.ranked.len()
+            || self.frozen.iter().zip(&self.ranked).any(|(a, b)| a.file_id() != b.file_id()))
+    }
     pub fn ranked_matches(&self) -> &[PathMatch<'index>] { &self.ranked }
     pub fn visible_matches(&self) -> &[PathMatch<'index>] {
         if self.protected { &self.frozen } else { &self.ranked }
     }
     pub fn truncated(&self) -> bool { self.matches_seen > self.ranked.len() }
+    /// Completeness of the scan/count. Consult truncated() for omitted rows and
+    /// has_pending_ordering() for intentionally deferred visible refinements.
     pub fn is_complete(&self) -> bool {
         self.state == PathSearchState::Finished && self.index.membership == MembershipState::Closed
     }
@@ -253,9 +264,11 @@ impl<'index> PathSearch<'index> {
             return 1;
         }
         let record = &self.index.records[ordinal];
-        // Covers linear key passes plus bounded shifts in the top-k buffer.
+        let comparisons = usize::BITS as usize - self.options.max_results.leading_zeros() as usize + 1;
+        // Linear key passes, binary-search native-path tie comparisons, and
+        // bounded top-k shifts. All factors have validated hard size ceilings.
         8 * (record.sensitive.len() + record.folded.len() + self.sensitive.len() + self.folded.len() + 1)
-            + self.options.max_results
+            + 2 * record.path.as_bytes().len() * comparisons + self.options.max_results
     }
 
     pub fn step(
@@ -285,7 +298,8 @@ impl<'index> PathSearch<'index> {
             if has(&self.seen, ordinal) { continue; }
             set(&mut self.seen, ordinal);
             if !has(&self.eligible, ordinal) { continue; }
-            let record = self.index.records[ordinal].as_ref();
+            let index: &'index PathIndex = self.index;
+            let record: &'index IndexedPath = index.records[ordinal].as_ref();
             if self.options.scope_root.is_some_and(|root| root != record.root) { continue; }
             self.files_examined += 1;
             if let Some(rank) = rank(record, &self.sensitive, &self.folded, self.options) {
