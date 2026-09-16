@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 //! Process arguments belong to fcb-app, never to library construction.
-//! This first CLI lane operates on ONE explicitly named file or bounded stdin.
-//! Directory/workspace commands are not silently reinterpreted as file queries.
+//! Workspace enumeration requires an explicit --workspace switch; selecting a
+//! single file or stdin does not silently widen that authority to its siblings.
 
 use std::{ffi::OsString, path::PathBuf};
 
@@ -17,7 +17,7 @@ pub enum Command { Help, Capabilities, Doctor, Inspect, Open, Read, Search, Laun
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Encoding { Auto, Utf8, Utf16Le, Utf16Be }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Needle { Text(String), Raw(Vec<u8>) }
+pub enum Needle { Text(String), Raw(Vec<u8>), Path(String) }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Arguments {
     pub command: Command,
@@ -29,6 +29,11 @@ pub struct Arguments {
     pub limit: usize,
     pub encoding: Encoding,
     pub needle: Option<Needle>,
+    pub workspace: bool,
+    pub include_excluded: bool,
+    pub max_files: usize,
+    pub max_file_bytes: usize,
+    pub max_total_bytes: usize,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArgumentError { Limit, UnknownCommand, UnknownOption, DuplicateOption, MissingValue,
@@ -60,7 +65,8 @@ pub fn json_requested(args: &[OsString]) -> bool {
         let argument = &args[cursor]; cursor += 1;
         if argument == "--" { break; }
         if argument == "--json" { return true; }
-        if matches!(argument.to_str(), Some("--offset" | "--bytes" | "--limit" | "--encoding" | "--text" | "--raw-hex")) {
+        if matches!(argument.to_str(), Some("--offset" | "--bytes" | "--limit" | "--encoding" | "--text" | "--raw-hex"
+            | "--path" | "--max-files" | "--max-file-bytes" | "--max-total-bytes")) {
             cursor += 1;
         }
     }
@@ -78,7 +84,9 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         if total > MAX_ARGUMENT_BYTES { return Err(ArgumentError::Limit); }
     }
     let mut parsed = Arguments { command: Command::Launch, json: false, file: None,
-        stdin: false, offset: 0, bytes: 64 * 1024, limit: 100, encoding: Encoding::Auto, needle: None };
+        stdin: false, offset: 0, bytes: 64 * 1024, limit: 100, encoding: Encoding::Auto, needle: None,
+        workspace: false, include_excluded: false, max_files: 4096,
+        max_file_bytes: 1024 * 1024, max_total_bytes: 32 * 1024 * 1024 };
     if args.is_empty() { return Ok(parsed); }
     let mut start = 1;
     parsed.command = match args[0].to_str() {
@@ -104,12 +112,16 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
             let bit = match option {
                 "--json" => 1, "--stdin" => 2, "--offset" => 4, "--bytes" => 8,
                 "--limit" => 16, "--encoding" => 32, "--text" => 64, "--raw-hex" => 128,
+                "--workspace" => 256, "--include-excluded" => 512, "--max-files" => 1024,
+                "--max-file-bytes" => 2048, "--max-total-bytes" => 4096, "--path" => 8192,
                 _ => return Err(ArgumentError::UnknownOption),
             };
             if seen & bit != 0 { return Err(ArgumentError::DuplicateOption); }
             seen |= bit;
             if option == "--json" { parsed.json = true; continue; }
             if option == "--stdin" { parsed.stdin = true; continue; }
+            if option == "--workspace" { parsed.workspace = true; continue; }
+            if option == "--include-excluded" { parsed.include_excluded = true; continue; }
             let value = args.get(cursor).ok_or(ArgumentError::MissingValue)?; cursor += 1;
             let value = value.to_str().ok_or(ArgumentError::MissingValue)?;
             match option {
@@ -124,14 +136,29 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
                     if value > MAX_RESULTS as u64 { return Err(ArgumentError::Limit); }
                     parsed.limit = value as usize;
                 }
+                "--max-files" => {
+                    let value = decimal(value)?;
+                    if !(1..=65_536).contains(&value) { return Err(ArgumentError::Limit); }
+                    parsed.max_files = value as usize;
+                }
+                "--max-file-bytes" => {
+                    let value = decimal(value)?;
+                    if value > 1024 * 1024 { return Err(ArgumentError::Limit); }
+                    parsed.max_file_bytes = value as usize;
+                }
+                "--max-total-bytes" => {
+                    let value = decimal(value)?;
+                    if value > 64 * 1024 * 1024 { return Err(ArgumentError::Limit); }
+                    parsed.max_total_bytes = value as usize;
+                }
                 "--encoding" => parsed.encoding = match value {
                     "auto" => Encoding::Auto, "utf8" => Encoding::Utf8,
                     "utf16le" => Encoding::Utf16Le, "utf16be" => Encoding::Utf16Be,
                     _ => return Err(ArgumentError::InvalidEncoding),
                 },
-                "--text" => {
+                "--text" | "--path" => {
                     if value.is_empty() || parsed.needle.is_some() { return Err(ArgumentError::InvalidNeedle); }
-                    parsed.needle = Some(Needle::Text(value.to_owned()));
+                    parsed.needle = Some(if option == "--path" { Needle::Path(value.to_owned()) } else { Needle::Text(value.to_owned()) });
                 }
                 "--raw-hex" => {
                     if parsed.needle.is_some() { return Err(ArgumentError::InvalidNeedle); }
@@ -146,6 +173,19 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         }
     }
     if parsed.stdin && parsed.file.is_some() { return Err(ArgumentError::MultipleSources); }
+    if parsed.workspace {
+        if parsed.file.is_none() { return Err(ArgumentError::MissingSource); }
+        if !matches!(parsed.command, Command::Inspect | Command::Search)
+            || seen & (2 | 4 | 8 | 32 | 128) != 0 { return Err(ArgumentError::IncompatibleOptions); }
+        match (&parsed.command, &parsed.needle) {
+            (Command::Inspect, None) => {},
+            (Command::Search, Some(Needle::Text(text))) if text.len() <= 1024 => {},
+            (Command::Search, Some(Needle::Path(path))) if path.len() <= 256 => {},
+            _ => return Err(ArgumentError::InvalidNeedle),
+        }
+        return Ok(parsed);
+    }
+    if seen & (256 | 512 | 1024 | 2048 | 4096 | 8192) != 0 { return Err(ArgumentError::IncompatibleOptions); }
     match parsed.command {
         Command::Help | Command::Capabilities | Command::Doctor => {
             if parsed.file.is_some() || seen & !1 != 0 { return Err(ArgumentError::IncompatibleOptions); }
@@ -258,5 +298,18 @@ mod tests {
         assert!(json_requested(&args(&["search", "--stdin", "--text", "--json", "--json"])));
         assert!(!json_requested(&args(&["read", "--encoding", "--json"])));
         assert!(json_requested(&args(&["read", "--encoding", "--json", "--json"])));
+    }
+    #[test]
+    fn workspace_scope_is_explicit_and_cannot_mix_with_window_or_stdin_semantics() {
+        let good = parse(&args(&["search", "root", "--workspace", "--path", "foo", "--max-files", "100", "--include-excluded"])).unwrap();
+        assert!(good.workspace && good.include_excluded); assert_eq!(good.max_files, 100);
+        for input in [vec!["search", "root", "--path", "foo"],
+            vec!["read", "root", "--workspace"], vec!["search", "root", "--workspace", "--text", "x", "--bytes", "8"],
+            vec!["search", "root", "--workspace", "--raw-hex", "ff"], vec!["inspect", "root", "--include-excluded"],
+            vec!["search", "root", "--workspace", "--text", "x", "--path", "y"],
+            vec!["inspect", "root", "--workspace", "--max-files", "0"]] {
+            assert!(parse(&args(&input)).is_err(), "{input:?}");
+        }
+        assert!(!json_requested(&args(&["search", "root", "--workspace", "--path", "--json"])));
     }
 }
