@@ -4,7 +4,7 @@
 //! fcb-source; this adapter retains only a decoding window and the mapping spans
 //! needed by a needle that crosses windows. It never stitches a whole capture.
 
-use std::collections::VecDeque;
+use std::{borrow::Cow, collections::VecDeque};
 
 use fcb_core::{ByteOffset, ByteRange, DecodedUtf8Offset, DecodedUtf8Range, FileId, SourceRevision};
 use fcb_source::{CaptureEncodingMap, DetectedEncoding, MappingSpan, SpanKind, detect_encoding};
@@ -126,16 +126,47 @@ impl ExactScan<'_> {
         if process_len == 0 {
             return Ok(false);
         }
+        // fcb-source recognizes a BOM at the start of each supplied slice.
+        // At nonzero capture offsets those bytes are an actual U+FEFF scalar,
+        // not a new file header. Restore that scalar while using the same
+        // source decoder and provenance for the rest of the bounded window.
+        let interior_bom = self.raw_offset != 0 && match encoding {
+            DetectedEncoding::Utf8 { has_bom: true } => staging.starts_with(&[0xEF, 0xBB, 0xBF]),
+            DetectedEncoding::Utf16Le => staging.starts_with(&[0xFF, 0xFE]),
+            DetectedEncoding::Utf16Be => staging.starts_with(&[0xFE, 0xFF]),
+            _ => false,
+        };
+        let extra = if interior_bom { 1u64 } else { 0 };
         let map = CaptureEncodingMap::build_with_base_offset(
-            &staging[..process_len], encoding, self.raw_offset, self.decoded_offset,
-            self.utf16_offset, self.scalar_offset,
+            &staging[..process_len], encoding, self.raw_offset,
+            self.decoded_offset.checked_add(3 * extra).ok_or(QueryError::InvalidRange)?,
+            self.utf16_offset.checked_add(extra).ok_or(QueryError::InvalidRange)?,
+            self.scalar_offset.checked_add(extra).ok_or(QueryError::InvalidRange)?,
         ).map_err(|_| QueryError::UnsupportedEncoding)?;
         if map.spans().iter().any(|span| matches!(span.kind,
             SpanKind::ReplacementMalformed | SpanKind::EscapedByte)) {
             self.unavailable();
             return Ok(true);
         }
-        self.spans.try_reserve(map.spans().len()).map_err(|_| QueryError::LimitExceeded)?;
+        self.spans.try_reserve(map.spans().len() + interior_bom as usize)
+            .map_err(|_| QueryError::LimitExceeded)?;
+        let decoded = if interior_bom {
+            self.spans.push_back(MappingSpan {
+                raw_start: self.raw_offset, raw_len: encoding.bom_bytes_len(),
+                decoded_start: self.decoded_offset, decoded_len: 3,
+                utf16_start: self.utf16_offset, utf16_len: 1,
+                scalar_start: self.scalar_offset, scalar_len: 1,
+                kind: SpanKind::BmpMultiByte,
+            });
+            let mut decoded = String::new();
+            decoded.try_reserve_exact(3 + map.decoded_text().len())
+                .map_err(|_| QueryError::LimitExceeded)?;
+            decoded.push('\u{FEFF}');
+            decoded.push_str(map.decoded_text());
+            Cow::Owned(decoded)
+        } else {
+            Cow::Borrowed(map.decoded_text())
+        };
         for &span in map.spans() {
             if span.decoded_len > 0 {
                 self.spans.push_back(span);
@@ -145,9 +176,11 @@ impl ExactScan<'_> {
             self.utf16_offset = last.utf16_start + last.utf16_len;
             self.scalar_offset = last.scalar_start + last.scalar_len;
         }
-        self.raw_offset += process_len as u64;
-        self.decoded_offset += map.decoded_text().len() as u64;
-        let mut remaining = map.decoded_text().as_bytes();
+        self.raw_offset = self.raw_offset.checked_add(process_len as u64)
+            .ok_or(QueryError::InvalidRange)?;
+        self.decoded_offset = self.decoded_offset.checked_add(decoded.len() as u64)
+            .ok_or(QueryError::InvalidRange)?;
+        let mut remaining = decoded.as_bytes();
         while !remaining.is_empty() {
             let hit_budget = self.options.max_matches.saturating_sub(self.result.matches.len())
                 .saturating_add(1).min(MAX_STREAM_BATCH_HITS);
@@ -334,4 +367,27 @@ mod tests {
         let result = scan(b"ababababa", "ababa", 1, None);
         assert_eq!(result.matches.iter().map(|hit| hit.original_byte_range.start().get()).collect::<Vec<_>>(), [0, 2, 4]);
     }
+
+    #[test]
+    fn interior_bom_at_window_start_is_source_text_not_another_header() {
+        let text = format!("{}\u{FEFF}z", "x".repeat(WINDOW_BYTES - 3));
+        let mut utf8 = vec![0xEF, 0xBB, 0xBF];
+        utf8.extend_from_slice(text.as_bytes());
+        let result = scan(&utf8, "\u{FEFF}z", 3, None);
+        assert_eq!(result.match_count(), 1);
+        assert_eq!(result.matches[0].original_byte_range.start().get(), WINDOW_BYTES as u64);
+        assert_eq!(result.matches[0].decoded_range.unwrap().start().get(), (WINDOW_BYTES - 3) as u64);
+        for little in [true, false] {
+            let text = format!("{}\u{FEFF}z", "x".repeat(WINDOW_BYTES / 2 - 1));
+            let mut bytes = if little { vec![0xFF, 0xFE] } else { vec![0xFE, 0xFF] };
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&if little { unit.to_le_bytes() } else { unit.to_be_bytes() });
+            }
+            let result = scan(&bytes, "\u{FEFF}z", 3, None);
+            assert_eq!(result.match_count(), 1);
+            assert_eq!(result.matches[0].original_byte_range.start().get(), WINDOW_BYTES as u64);
+            assert_eq!(result.matches[0].original_byte_range.end().get(), bytes.len() as u64);
+        }
+    }
+
 }
