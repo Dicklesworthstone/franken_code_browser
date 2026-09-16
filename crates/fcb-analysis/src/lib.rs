@@ -9,10 +9,15 @@
 
 pub mod extractor;
 pub mod facts;
+pub mod inspector;
 pub mod outline;
 
 pub use extractor::{ExtractorLimits, OutlineExtractor};
 pub use facts::{FactAuditError, FactAuditor, SourceFact, SourceFactKind};
+pub use inspector::{
+    CountMetric, HeuristicFact, IndexingStatus, InspectorError, InspectorFacts,
+    InspectorFactsBuilder, NearbyDocSnippet, OutlineSummary, RelationshipEdge, RelationshipKind,
+};
 pub use outline::{
     CapabilityLevel, OutlineEvidence, OutlineItem, OutlineItemKind, OutlineStatus, SourceOutline,
 };
