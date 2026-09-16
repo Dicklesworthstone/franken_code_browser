@@ -2,21 +2,60 @@
 
 //! Headless search and exact result navigation through the public `fcb` facade.
 //!
-//! Enable `fcb`'s `search` feature. A host explicitly prepares captures, forms a
-//! `SearchManifest`, supplies a shared `ResourceBudget`, builds an
-//! `EphemeralIndex`, and drives `IndexedQuery` on its worker. These operations
-//! do not create a runtime, window, filesystem grant, or persistent store.
+//! Content search uses retained captures, `EphemeralIndex`, and `IndexedQuery`.
+//! Path navigation uses `PathIndex` and `PathSearch` without loading source.
+//! Both take explicit resource budgets and run on the host's worker; neither
+//! creates a runtime, window, filesystem grant, or persistent store.
 //!
-//! A path is a provider lookup key, not a capture identity. Keep the returned
-//! `PreparedSearchCapture` until navigation has finished. Opening a hit uses
-//! that retained capture, never a second call to a potentially changed provider.
+//! A content hit opens its searched capture. A path result instead identifies
+//! a file to capture explicitly; it does not pretend to pin unread source.
+//! Native identities never pass through lossy strings or escaped labels.
 
 pub use fcb_search::*;
-pub use fcb_core::{QueryGeneration, ResourceAllocationId, ResourceBudget};
+pub use fcb_search::paths::{IndexedPath, PathCase, PathEntry, PathIndex, PathIndexLimits,
+    PathMatch, PathMatchKind, PathMatchMode, PathRank, PathSearch, PathSearchError,
+    PathSearchOptions, PathSearchState, PathSelection, PathStepBudget, RawPath};
+pub use fcb_core::{QueryGeneration, ResourceAllocationId, ResourceBudget, RootId};
 pub use fcb_source::{CaptureRequest, CompleteCapture, DetectedEncoding};
 
 use std::sync::Arc;
-use crate::{BrowserSession, BrowserView, FcbError, SourceCapture};
+use crate::{BrowserSession, BrowserView, FcbError, FileId, SourceCapture};
+
+/// Native identity supplied by an authorized host source provider. This is a
+/// declaration to validate, NOT a grant and NOT permission to read a path.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeSourceIdentity<'path> {
+    pub root: RootId,
+    pub path: &'path RawPath,
+}
+
+/// Selection captured from one query's visible or explicitly pinned result.
+/// Index/query generations stay attached even if ordering subsequently changes.
+#[derive(Clone, Copy, Debug)]
+pub struct PathNavigationTarget<'index> {
+    hit: PathMatch<'index>,
+    index: SearchManifestId,
+    generation: QueryGeneration,
+}
+impl<'index> PathNavigationTarget<'index> {
+    pub fn from_search(search: &PathSearch<'index>, file: FileId) -> Result<Self, FcbError> {
+        let hit = search.visible_matches().iter().find(|hit| hit.file_id() == file).copied()
+            .or_else(|| match search.selection() {
+                PathSelection::Matched(hit) if hit.file_id() == file => Some(hit),
+                _ => None,
+            }).ok_or(FcbError::SourceNotFound)?;
+        Ok(Self { hit, index: search.index_id(), generation: search.generation() })
+    }
+    pub const fn file(&self) -> FileId { self.hit.file_id() }
+    pub const fn root(&self) -> RootId { self.hit.root_id() }
+    pub fn native_path(&self) -> &'index RawPath { self.hit.path().raw_path() }
+    pub const fn index(&self) -> SearchManifestId { self.index }
+    pub const fn generation(&self) -> QueryGeneration { self.generation }
+    pub fn validate_delivery(&self, index: SearchManifestId, generation: QueryGeneration) -> Result<(), FcbError> {
+        if self.index != index || self.generation != generation { return Err(FcbError::StaleGeneration); }
+        Ok(())
+    }
+}
 
 /// A facade source and the exact capture consumed by the search engine share
 /// the same immutable byte allocation. Preparation computes the observation
@@ -42,6 +81,29 @@ impl PreparedSearchCapture {
 }
 
 impl BrowserSession {
+    /// Open bytes explicitly captured for a selected path. The caller validates
+    /// its native grant and performs I/O on its worker before this operation.
+    /// File, root, raw path and active index/query must still agree. No provider
+    /// lookup is repeated here. The capture's UTF-8 logical key may be an escaped
+    /// label; it is deliberately NOT used as native path authority.
+    ///
+    /// Path lookup permits a newer content revision of the same file. Unlike a
+    /// content match, it never claimed to have searched that file's old bytes.
+    pub fn open_path_target(
+        &self, target: &PathNavigationTarget<'_>, active_index: SearchManifestId,
+        active_generation: QueryGeneration, native: NativeSourceIdentity<'_>,
+        capture: SourceCapture,
+    ) -> Result<BrowserView, FcbError> {
+        target.validate_delivery(active_index, active_generation)?;
+        if target.file().owner() != self.owner() || native.root.owner() != self.owner()
+            || capture.owner() != self.owner() || native.root != target.root() {
+            return Err(FcbError::OwnerMismatch);
+        }
+        if capture.file() != target.file() { return Err(FcbError::SourceNotFound); }
+        if native.path != target.native_path() { return Err(FcbError::StaleGeneration); }
+        self.open_capture(capture)
+    }
+
     /// Prepare source already supplied by the host, without another provider
     /// lookup or copying its payload. The session's owner must match the capture.
     pub fn prepare_search_capture(&self, source: SourceCapture) -> Result<PreparedSearchCapture, FcbError> {
