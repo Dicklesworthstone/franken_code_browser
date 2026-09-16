@@ -50,6 +50,16 @@ pub enum WorkspaceStage { Discovering, Ready, Canceled }
 pub enum WorkspaceLimit { Files, Paths, DiscoveryPages }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkspaceCaptureFailure { FileLimit, SourceLimit, Source(SourceError), InvalidCapture }
+impl WorkspaceCaptureFailure {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::FileLimit => "WORKSPACE_FILE_BYTE_LIMIT",
+            Self::SourceLimit => "WORKSPACE_TOTAL_SOURCE_LIMIT",
+            Self::Source(error) => error.code(),
+            Self::InvalidCapture => "WORKSPACE_INVALID_CAPTURE",
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum WorkspaceError {
@@ -153,7 +163,7 @@ impl WorkspaceCatalog {
         FileId::new(self.grant.owner(), self.first_file.get().checked_add(ordinal as u64)?).ok()
     }
     pub fn entry(&self, file: FileId) -> Option<&WorkspaceEntry> {
-        if file.owner() != self.grant.owner() { return None; }
+        if self.stage != WorkspaceStage::Ready || file.owner() != self.grant.owner() { return None; }
         let ordinal = usize::try_from(file.get().checked_sub(self.first_file.get())?).ok()?;
         self.entries.get(ordinal)
     }
@@ -227,6 +237,7 @@ enum CaptureSlot { Pending, Ready(CompleteCapture), Unavailable(WorkspaceCapture
 /// unavailable identity; it is never truncated into a purported whole capture.
 /// The callback's old/new buffers are separately admitted by its host. The lease
 /// below charges retained payload and bounded source-to-Arc copy overlap.
+/// Allocate a new catalog/manifest for a refreshed set of source observations.
 pub struct WorkspaceCaptures<'catalog> {
     catalog: &'catalog WorkspaceCatalog,
     first_revision: SourceRevision,
@@ -260,6 +271,11 @@ impl<'catalog> WorkspaceCaptures<'catalog> {
     pub fn failure(&self, ordinal: usize) -> Option<WorkspaceCaptureFailure> {
         match self.slots.get(ordinal)? { CaptureSlot::Unavailable(reason) => Some(*reason), _ => None }
     }
+    pub fn file_failure(&self, file: FileId) -> Option<WorkspaceCaptureFailure> {
+        self.catalog.entry(file)?;
+        let ordinal = usize::try_from(file.get().checked_sub(self.catalog.first_file.get())?).ok()?;
+        self.failure(ordinal)
+    }
     pub fn capture(&self, file: FileId) -> Option<&CompleteCapture> {
         self.catalog.entry(file)?;
         let ordinal = usize::try_from(file.get().checked_sub(self.catalog.first_file.get())?).ok()?;
@@ -288,10 +304,7 @@ impl<'catalog> WorkspaceCaptures<'catalog> {
             CaptureSlot::Unavailable(WorkspaceCaptureFailure::SourceLimit)
         } else {
             match capture(request, &entry.path, allowance) {
-                Ok(captured) if captured.request() == request && captured.bytes().len() <= allowance => {
-                    self.bytes += captured.bytes().len();
-                    CaptureSlot::Ready(captured)
-                }
+                Ok(captured) if captured.request() == request && captured.bytes().len() <= allowance => CaptureSlot::Ready(captured),
                 Ok(_) => CaptureSlot::Unavailable(WorkspaceCaptureFailure::InvalidCapture),
                 Err(SourceError::Canceled) => { self.cancel(); return Err(WorkspaceError::Canceled); }
                 Err(error) => CaptureSlot::Unavailable(WorkspaceCaptureFailure::Source(error)),
@@ -299,16 +312,21 @@ impl<'catalog> WorkspaceCaptures<'catalog> {
         };
         if cancel.is_canceled() { self.cancel(); return Err(WorkspaceError::Canceled); }
         self.catalog.validate_active()?;
+        // Candidate bytes become retained only at publication. A canceled or
+        // revoked callback result cannot spend retained-source accounting.
+        if let CaptureSlot::Ready(captured) = &slot { self.bytes += captured.bytes().len(); }
         self.slots[self.next] = slot;
         self.next += 1;
         Ok(self.finished())
     }
 
     /// Separate owning input vectors avoid a self-referential index. Keep these
-    /// alive while indexed queries run. Partial capture sessions remain usable;
-    /// pending slots are unavailable, never zero-length fake documents.
+    /// alive while indexed queries run. Pending slots are unavailable, never
+    /// zero-length fake documents. A host publishing progress under this source
+    /// universe must use a fresh QueryGeneration for each new search request.
     pub fn search_inputs(&self, budget: &ResourceBudget, allocation: ResourceAllocationId)
         -> Result<WorkspaceSearchInputs<'_>, WorkspaceError> {
+        if self.canceled { return Err(WorkspaceError::Canceled); }
         self.catalog.validate_active()?;
         let count = self.slots.len();
         let charge = count.checked_mul(size_of::<SearchDocument<'_>>() + size_of::<FileId>())
