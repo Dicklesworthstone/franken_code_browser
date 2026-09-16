@@ -50,8 +50,21 @@ impl std::fmt::Display for ArgumentError {
 }
 impl std::error::Error for ArgumentError {}
 
+/// Error-format selection must not mistake `--text --json` for a JSON switch.
+/// Options' values and positional-only paths are data, including when malformed.
+/// Inspect at most the admitted argument count plus its overflow sentinel.
 pub fn json_requested(args: &[OsString]) -> bool {
-    args.iter().take_while(|arg| *arg != "--").any(|arg| arg == "--json")
+    let mut cursor = 0;
+    let end = args.len().min(MAX_ARGUMENTS + 1);
+    while cursor < end {
+        let argument = &args[cursor]; cursor += 1;
+        if argument == "--" { break; }
+        if argument == "--json" { return true; }
+        if matches!(argument.to_str(), Some("--offset" | "--bytes" | "--limit" | "--encoding" | "--text" | "--raw-hex")) {
+            cursor += 1;
+        }
+    }
+    false
 }
 
 /// Excludes argv[0]. Numeric arguments are canonical unsigned decimal, not
@@ -153,10 +166,10 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
             // A later live read of a header is not the same observation as the
             // selected range. Far-offset text therefore requires a declaration.
             if parsed.offset != 0 && parsed.encoding == Encoding::Auto
-                && !matches!(parsed.needle, Some(Needle::Raw(_))) {
+                && !matches!(parsed.needle.as_ref(), Some(Needle::Raw(_))) {
                 return Err(ArgumentError::InvalidEncoding);
             }
-            if matches!(parsed.needle, Some(Needle::Raw(_))) && seen & 32 != 0 {
+            if matches!(parsed.needle.as_ref(), Some(Needle::Raw(_))) && seen & 32 != 0 {
                 return Err(ArgumentError::IncompatibleOptions);
             }
         }
@@ -237,5 +250,13 @@ mod tests {
         let text = parse(&args(&["search", "--stdin", "--text", "héllo world", "--encoding", "utf16le"])).unwrap();
         assert_eq!(text.needle, Some(Needle::Text("héllo world".to_owned())));
         for invalid in ["f", "gg", ""] { assert!(hex_bytes(invalid).is_err()); }
+    }
+    #[test]
+    fn literal_query_switches_cannot_change_output_mode() {
+        let raw = args(&["search", "--stdin", "--text", "--json"]);
+        assert!(!parse(&raw).unwrap().json); assert!(!json_requested(&raw));
+        assert!(json_requested(&args(&["search", "--stdin", "--text", "--json", "--json"])));
+        assert!(!json_requested(&args(&["read", "--encoding", "--json"])));
+        assert!(json_requested(&args(&["read", "--encoding", "--json", "--json"])));
     }
 }
