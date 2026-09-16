@@ -20,7 +20,7 @@
 //!   retained draw data cannot sample a different glyph accidentally. Stale references
 //!   fail validation immediately with [`AtlasError::StaleSlotGeneration`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::hash::Hash;
 
@@ -31,6 +31,12 @@ pub const DEFAULT_MAX_ATLAS_PAGES: usize = 16;
 
 /// Default page dimension in pixels (e.g. 1024x1024).
 pub const DEFAULT_ATLAS_PAGE_SIZE: u32 = 1024;
+
+/// Default capacity for the background raster miss priority queue.
+pub const DEFAULT_MAX_RASTER_QUEUE_CAPACITY: usize = 1024;
+
+/// Default capacity for the retained diagnostic atlas lifecycle event ring.
+pub const DEFAULT_ATLAS_LOG_CAPACITY: usize = 256;
 
 /// Rasterization mode governing pixel representation and channel format.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -260,6 +266,16 @@ impl AtlasPageKind {
             RasterMode::DistanceField => Self::LargeLabelOrTransient,
         }
     }
+
+    /// Number of bytes per pixel for texture memory accounting (Plan §4.5).
+    #[must_use]
+    pub const fn bytes_per_pixel(self) -> u32 {
+        match self {
+            Self::MonochromeGlyph => 1,
+            Self::ColorImage => 4,
+            Self::LargeLabelOrTransient => 4,
+        }
+    }
 }
 
 /// Mutable GPU residency reference for an atlas-resident glyph (Plan §13.4).
@@ -295,6 +311,8 @@ pub enum AtlasError {
     GlyphTooLargeForPage,
     InvalidDimensions,
     KeyNotFound,
+    RasterQueueFull,
+    RasterWorkerFailed,
     Core(CoreError),
 }
 
@@ -312,6 +330,8 @@ impl fmt::Display for AtlasError {
             Self::GlyphTooLargeForPage => write!(f, "ATLAS_GLYPH_TOO_LARGE_FOR_PAGE"),
             Self::InvalidDimensions => write!(f, "ATLAS_INVALID_DIMENSIONS"),
             Self::KeyNotFound => write!(f, "ATLAS_KEY_NOT_FOUND"),
+            Self::RasterQueueFull => write!(f, "ATLAS_RASTER_QUEUE_FULL"),
+            Self::RasterWorkerFailed => write!(f, "ATLAS_RASTER_WORKER_FAILED"),
             Self::Core(err) => write!(f, "ATLAS_CORE_ERROR: {err:?}"),
         }
     }
@@ -388,6 +408,12 @@ impl AtlasPage {
         }
     }
 
+    /// Total texture bytes backing this page in GPU memory (Plan §4.5).
+    #[must_use]
+    pub const fn byte_size(&self) -> u64 {
+        (self.width as u64) * (self.height as u64) * (self.kind.bytes_per_pixel() as u64)
+    }
+
     /// Calculate current fragmentation ratio (unusable/wasted space / total capacity).
     #[must_use]
     pub fn fragmentation_ratio(&self) -> f32 {
@@ -462,6 +488,342 @@ impl AtlasPage {
     }
 }
 
+/// Priority levels for background glyph rasterization misses (Plan §13.5).
+///
+/// Selected reading text takes strict precedence over ordinary visible text,
+/// which takes strict precedence over distant or overview map labels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub enum RasterPriority {
+    /// Distant zoom level labels, minimap, overview, or speculative prefetch.
+    DistantOrMapLabel = 0,
+    /// Text visible within the active reading viewport.
+    VisibleReadingText = 1,
+    /// Actively selected text, cursor line, or immediate keyboard focus target.
+    SelectedReadingText = 2,
+}
+
+/// A background rasterization miss request queued when a glyph is absent from the atlas.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RasterMissRequest {
+    pub key: GlyphRasterKey,
+    pub priority: RasterPriority,
+    pub requested_frame: u64,
+    pub estimated_width: u32,
+    pub estimated_height: u32,
+    pub sequence: u64,
+}
+
+/// Outcome of enqueuing a background raster miss request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnqueueResult {
+    /// New request admitted to the queue.
+    Enqueued,
+    /// New high-priority request admitted by evicting a lower-priority request.
+    EnqueuedWithEviction,
+    /// Request already existed in the queue and was upgraded to a higher priority.
+    Promoted,
+    /// Request already existed with equal or higher priority; requested frame refreshed.
+    AlreadyPresent,
+}
+
+/// Cumulative statistics for the background raster queue.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RasterQueueStats {
+    pub enqueued_count: u64,
+    pub promoted_count: u64,
+    pub evicted_count: u64,
+    pub serviced_count: u64,
+}
+
+/// Bounded, deduplicated priority queue for background glyph raster misses (Plan §13.5).
+///
+/// Ordering guarantees:
+/// 1. Higher priority tiers are serviced strictly before lower priority tiers
+///    (`SelectedReadingText` > `VisibleReadingText` > `DistantOrMapLabel`).
+/// 2. FIFO order is preserved among requests within the same priority tier.
+/// 3. Request deduplication: repeated queries for an already-enqueued key upgrade
+///    the existing request if the new query has higher priority, without queue growth.
+/// 4. Capacity bounds: when the queue is at capacity, high-priority requests
+///    evict the oldest lowest-priority request; lower-priority requests are rejected.
+#[derive(Clone, Debug)]
+pub struct BoundedRasterQueue {
+    max_capacity: usize,
+    requests: Vec<RasterMissRequest>,
+    next_sequence: u64,
+    enqueued_count: u64,
+    promoted_count: u64,
+    evicted_count: u64,
+    serviced_count: u64,
+}
+
+impl BoundedRasterQueue {
+    #[must_use]
+    pub fn new(max_capacity: usize) -> Self {
+        Self {
+            max_capacity,
+            requests: Vec::with_capacity(max_capacity.min(1024)),
+            next_sequence: 1,
+            enqueued_count: 0,
+            promoted_count: 0,
+            evicted_count: 0,
+            serviced_count: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.max_capacity
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.requests.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+
+    #[must_use]
+    pub fn contains(&self, key: &BorrowedGlyphRasterKey<'_>) -> bool {
+        self.requests.iter().any(|r| key.matches(&r.key))
+    }
+
+    #[must_use]
+    pub const fn stats(&self) -> RasterQueueStats {
+        RasterQueueStats {
+            enqueued_count: self.enqueued_count,
+            promoted_count: self.promoted_count,
+            evicted_count: self.evicted_count,
+            serviced_count: self.serviced_count,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.requests.clear();
+    }
+
+    /// Enqueue a raster request with deduplication, priority promotion, and capacity bounding.
+    pub fn enqueue(&mut self, mut req: RasterMissRequest) -> Result<EnqueueResult, AtlasError> {
+        // 1. Deduplication & priority promotion
+        for item in &mut self.requests {
+            if item.key == req.key {
+                item.requested_frame = item.requested_frame.max(req.requested_frame);
+                if req.priority > item.priority {
+                    item.priority = req.priority;
+                    self.promoted_count = self.promoted_count.saturating_add(1);
+                    return Ok(EnqueueResult::Promoted);
+                } else {
+                    return Ok(EnqueueResult::AlreadyPresent);
+                }
+            }
+        }
+
+        // Assign sequence
+        let seq = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        req.sequence = seq;
+
+        // 2. Capacity check
+        if self.requests.len() >= self.max_capacity {
+            if self.max_capacity == 0 {
+                return Err(AtlasError::RasterQueueFull);
+            }
+            // Find lowest priority candidate (lowest priority, then oldest sequence)
+            let mut lowest_idx = 0;
+            for i in 1..self.requests.len() {
+                let curr = &self.requests[i];
+                let lowest = &self.requests[lowest_idx];
+                if curr.priority < lowest.priority
+                    || (curr.priority == lowest.priority && curr.sequence < lowest.sequence)
+                {
+                    lowest_idx = i;
+                }
+            }
+
+            if self.requests[lowest_idx].priority < req.priority {
+                self.requests.remove(lowest_idx);
+                self.evicted_count = self.evicted_count.saturating_add(1);
+                self.requests.push(req);
+                self.enqueued_count = self.enqueued_count.saturating_add(1);
+                Ok(EnqueueResult::EnqueuedWithEviction)
+            } else {
+                Err(AtlasError::RasterQueueFull)
+            }
+        } else {
+            self.requests.push(req);
+            self.enqueued_count = self.enqueued_count.saturating_add(1);
+            Ok(EnqueueResult::Enqueued)
+        }
+    }
+
+    /// Pop the highest priority request. Ties are broken in FIFO sequence order.
+    pub fn pop_highest_priority(&mut self) -> Option<RasterMissRequest> {
+        if self.requests.is_empty() {
+            return None;
+        }
+        let mut best_idx = 0;
+        for i in 1..self.requests.len() {
+            let curr = &self.requests[i];
+            let best = &self.requests[best_idx];
+            if curr.priority > best.priority
+                || (curr.priority == best.priority && curr.sequence < best.sequence)
+            {
+                best_idx = i;
+            }
+        }
+        self.serviced_count = self.serviced_count.saturating_add(1);
+        Some(self.requests.remove(best_idx))
+    }
+}
+
+/// Result of querying the atlas for a glyph raster (Plan §13.5).
+///
+/// If absent, background rasterization is queued without blocking layout.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RasterLookupResult {
+    /// Glyph is resident in the GPU atlas.
+    Hit(GpuGlyphRef),
+    /// Glyph was a cache miss; background rasterization has been queued.
+    /// Non-blocking: caller may use the optional fallback glyph reference.
+    MissPending {
+        key: GlyphRasterKey,
+        priority: RasterPriority,
+        fallback_ref: Option<GpuGlyphRef>,
+    },
+}
+
+/// Rasterized glyph metrics and geometry ready for atlas allocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RasterizedGlyph {
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    pub bearing_x: i32,
+    pub bearing_y: i32,
+    pub advance_x: i32,
+}
+
+/// Summary report from processing a batch of queued raster requests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchProcessReport {
+    pub processed_count: usize,
+    pub remaining_in_queue: usize,
+    pub recomputed_count: usize,
+}
+
+/// Unified memory texture accounting for Apple Silicon / UMA architectures (Plan §4.5).
+///
+/// On unified memory, demoting an evicted GPU texture to a CPU shadow buffer
+/// duplicates physical memory without relieving pressure. FCB enforces a strict
+/// discard/recompute policy: evicted textures are released immediately and
+/// recomputed on demand from font sources.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnifiedMemoryAccounting {
+    /// Total bytes currently allocated in GPU texture backings across all active pages.
+    pub allocated_texture_bytes: u64,
+    /// Peak texture bytes allocated since atlas creation.
+    pub peak_texture_bytes: u64,
+    /// Cumulative texture bytes discarded via slot eviction or device reset (never copied to CPU).
+    pub discarded_texture_bytes: u64,
+    /// Total count of glyphs recomputed from font source after prior eviction.
+    pub recomputed_glyph_count: u64,
+    /// Number of active texture pages.
+    pub active_page_count: usize,
+    /// Invariant: true guarantees zero CPU shadow buffer demotion (Plan §4.5).
+    pub no_cpu_demotion_policy: bool,
+}
+
+/// Retained diagnostic event kinds for bounded atlas lifecycle logging.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AtlasLogEventKind {
+    PageAllocated,
+    SlotAllocated,
+    SlotEvicted,
+    SlotPinned,
+    SlotUnpinned,
+    RasterMissQueued,
+    RasterPriorityPromoted,
+    RasterServiced,
+    DeviceReset,
+}
+
+/// One recorded atlas lifecycle event with frame timestamp and detail payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AtlasLogEvent {
+    pub sequence: u64,
+    pub frame: u64,
+    pub kind: AtlasLogEventKind,
+    pub detail: u64,
+}
+
+/// Fixed-capacity ring buffer of diagnostic atlas lifecycle events.
+#[derive(Clone, Debug)]
+pub struct AtlasLogRing {
+    capacity: usize,
+    events: VecDeque<AtlasLogEvent>,
+    next_sequence: u64,
+    total_recorded: u64,
+}
+
+impl AtlasLogRing {
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            events: VecDeque::with_capacity(capacity.min(512)),
+            next_sequence: 1,
+            total_recorded: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    #[must_use]
+    pub const fn total_recorded(&self) -> u64 {
+        self.total_recorded
+    }
+
+    pub fn events(&self) -> &VecDeque<AtlasLogEvent> {
+        &self.events
+    }
+
+    pub fn record(&mut self, frame: u64, kind: AtlasLogEventKind, detail: u64) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.events.len() >= self.capacity {
+            self.events.pop_front();
+        }
+        let seq = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.total_recorded = self.total_recorded.saturating_add(1);
+        self.events.push_back(AtlasLogEvent {
+            sequence: seq,
+            frame,
+            kind,
+            detail,
+        });
+    }
+
+    pub fn clear(&mut self) {
+        self.events.clear();
+    }
+}
+
 /// Configuration options for the bounded glyph atlas.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BoundedAtlasConfig {
@@ -469,6 +831,10 @@ pub struct BoundedAtlasConfig {
     pub max_pages: usize,
     /// Width and height of each square atlas page in pixels.
     pub page_size: u32,
+    /// Maximum capacity of the background raster miss priority queue.
+    pub max_raster_queue_capacity: usize,
+    /// Maximum capacity of the retained diagnostic lifecycle event ring.
+    pub log_capacity: usize,
 }
 
 impl Default for BoundedAtlasConfig {
@@ -476,7 +842,35 @@ impl Default for BoundedAtlasConfig {
         Self {
             max_pages: DEFAULT_MAX_ATLAS_PAGES,
             page_size: DEFAULT_ATLAS_PAGE_SIZE,
+            max_raster_queue_capacity: DEFAULT_MAX_RASTER_QUEUE_CAPACITY,
+            log_capacity: DEFAULT_ATLAS_LOG_CAPACITY,
         }
+    }
+}
+
+impl BoundedAtlasConfig {
+    #[must_use]
+    pub const fn with_max_pages(mut self, max_pages: usize) -> Self {
+        self.max_pages = max_pages;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_page_size(mut self, page_size: u32) -> Self {
+        self.page_size = page_size;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_raster_queue_capacity(mut self, capacity: usize) -> Self {
+        self.max_raster_queue_capacity = capacity;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_log_capacity(mut self, capacity: usize) -> Self {
+        self.log_capacity = capacity;
+        self
     }
 }
 
@@ -493,6 +887,13 @@ pub struct BoundedGlyphAtlas {
     total_evictions: u64,
     total_lookups: u64,
     total_hits: u64,
+    raster_queue: BoundedRasterQueue,
+    allocated_texture_bytes: u64,
+    peak_texture_bytes: u64,
+    discarded_texture_bytes: u64,
+    recomputed_glyph_count: u64,
+    evicted_keys_history: BTreeSet<u64>,
+    log: AtlasLogRing,
 }
 
 impl BoundedGlyphAtlas {
@@ -504,6 +905,8 @@ impl BoundedGlyphAtlas {
         device_generation: u64,
         config: BoundedAtlasConfig,
     ) -> Self {
+        let max_q = config.max_raster_queue_capacity;
+        let log_cap = config.log_capacity;
         Self {
             owner,
             device_id,
@@ -515,6 +918,13 @@ impl BoundedGlyphAtlas {
             total_evictions: 0,
             total_lookups: 0,
             total_hits: 0,
+            raster_queue: BoundedRasterQueue::new(max_q),
+            allocated_texture_bytes: 0,
+            peak_texture_bytes: 0,
+            discarded_texture_bytes: 0,
+            recomputed_glyph_count: 0,
+            evicted_keys_history: BTreeSet::new(),
+            log: AtlasLogRing::new(log_cap),
         }
     }
 
@@ -553,12 +963,48 @@ impl BoundedGlyphAtlas {
         self.pages.get(idx).map(|p| p.kind)
     }
 
+    /// Read-only access to the background raster miss queue.
+    #[must_use]
+    pub fn raster_queue(&self) -> &BoundedRasterQueue {
+        &self.raster_queue
+    }
+
+    /// Mutable access to the background raster miss queue.
+    pub fn raster_queue_mut(&mut self) -> &mut BoundedRasterQueue {
+        &mut self.raster_queue
+    }
+
+    /// Read current unified memory accounting counters (Plan §4.5).
+    #[must_use]
+    pub fn memory_accounting(&self) -> UnifiedMemoryAccounting {
+        UnifiedMemoryAccounting {
+            allocated_texture_bytes: self.allocated_texture_bytes,
+            peak_texture_bytes: self.peak_texture_bytes,
+            discarded_texture_bytes: self.discarded_texture_bytes,
+            recomputed_glyph_count: self.recomputed_glyph_count,
+            active_page_count: self.pages.len(),
+            no_cpu_demotion_policy: true,
+        }
+    }
+
+    /// Read retained diagnostic lifecycle events.
+    #[must_use]
+    pub fn log_events(&self) -> &VecDeque<AtlasLogEvent> {
+        self.log.events()
+    }
+
     /// Invalidate entire atlas upon host device reset or GPU teardown (Plan §14.9).
     pub fn reset_device_generation(&mut self, new_generation: u64) {
         self.device_generation = new_generation;
+        self.discarded_texture_bytes = self
+            .discarded_texture_bytes
+            .saturating_add(self.allocated_texture_bytes);
+        self.allocated_texture_bytes = 0;
         self.pages.clear();
         self.by_hash.clear();
+        self.raster_queue.clear();
         self.next_page_id = 1;
+        self.log.record(0, AtlasLogEventKind::DeviceReset, new_generation);
     }
 
     /// Look up an existing resident glyph using a borrowed key without heap allocation.
@@ -643,6 +1089,16 @@ impl BoundedGlyphAtlas {
             self.next_page_id = self.next_page_id.saturating_add(1);
             let mut page = AtlasPage::new(page_id, page_kind, self.config.page_size);
             if let Some((x, y)) = page.allocate_rect(pixel_width, pixel_height) {
+                let page_bytes = page.byte_size();
+                self.allocated_texture_bytes =
+                    self.allocated_texture_bytes.saturating_add(page_bytes);
+                self.peak_texture_bytes =
+                    self.peak_texture_bytes.max(self.allocated_texture_bytes);
+                self.log.record(
+                    current_frame,
+                    AtlasLogEventKind::PageAllocated,
+                    page_id.0 as u64,
+                );
                 let page_idx = self.pages.len();
                 self.pages.push(page);
                 return self.create_slot_and_ref(
@@ -743,6 +1199,16 @@ impl BoundedGlyphAtlas {
             .or_default()
             .push((key, glyph_ref.clone()));
 
+        if self.evicted_keys_history.remove(&hash) {
+            self.recomputed_glyph_count = self.recomputed_glyph_count.saturating_add(1);
+        }
+
+        self.log.record(
+            current_frame,
+            AtlasLogEventKind::SlotAllocated,
+            slot_id.0 as u64,
+        );
+
         Ok(glyph_ref)
     }
 
@@ -767,7 +1233,11 @@ impl BoundedGlyphAtlas {
                 continue;
             }
             for (slot_idx, slot) in page.slots.iter().enumerate() {
-                if !slot.is_pinned() && slot.pixel_width >= w && slot.pixel_height >= h {
+                if !slot.is_pinned()
+                    && slot.last_used_frame < current_frame
+                    && slot.pixel_width >= w
+                    && slot.pixel_height >= h
+                {
                     match best_candidate {
                         None => best_candidate = Some((page_idx, slot_idx, slot.last_used_frame)),
                         Some((_, _, oldest_frame)) if slot.last_used_frame < oldest_frame => {
@@ -800,12 +1270,22 @@ impl BoundedGlyphAtlas {
         let page = &mut self.pages[page_idx];
         let slot = &mut page.slots[slot_idx];
 
-        // 1. Remove old key from index
+        // Discard texture bytes for this slot from unified memory (Plan §4.5)
+        let slot_bytes = (w as u64) * (h as u64) * (page_kind.bytes_per_pixel() as u64);
+        self.discarded_texture_bytes = self.discarded_texture_bytes.saturating_add(slot_bytes);
+
+        // 1. Remove old key from index and track in eviction history for recomputation metrics
         if let Some(ref old_key) = slot.current_key {
             let old_hash = old_key.compute_hash();
             if let Some(entries) = self.by_hash.get_mut(&old_hash) {
                 entries.retain(|(k, _)| k != old_key);
             }
+            if self.evicted_keys_history.len() >= 4096 {
+                if let Some(&first) = self.evicted_keys_history.iter().next() {
+                    self.evicted_keys_history.remove(&first);
+                }
+            }
+            self.evicted_keys_history.insert(old_hash);
         }
 
         // 2. Increment slot generation strictly!
@@ -834,10 +1314,20 @@ impl BoundedGlyphAtlas {
             raster_key: key.clone(),
         };
 
+        if self.evicted_keys_history.remove(&hash) {
+            self.recomputed_glyph_count = self.recomputed_glyph_count.saturating_add(1);
+        }
+
         self.by_hash
             .entry(hash)
             .or_default()
             .push((key, glyph_ref.clone()));
+
+        self.log.record(
+            current_frame,
+            AtlasLogEventKind::SlotEvicted,
+            slot.slot_id.0 as u64,
+        );
 
         Ok(glyph_ref)
     }
@@ -850,6 +1340,11 @@ impl BoundedGlyphAtlas {
         let slot_idx = glyph_ref.slot_id.0 as usize;
         let slot = page.slots.get_mut(slot_idx).ok_or(AtlasError::SlotNotFound)?;
         slot.in_flight_pins = slot.in_flight_pins.saturating_add(1);
+        self.log.record(
+            0,
+            AtlasLogEventKind::SlotPinned,
+            glyph_ref.slot_id.0 as u64,
+        );
         Ok(())
     }
 
@@ -861,6 +1356,11 @@ impl BoundedGlyphAtlas {
         let slot_idx = glyph_ref.slot_id.0 as usize;
         let slot = page.slots.get_mut(slot_idx).ok_or(AtlasError::SlotNotFound)?;
         slot.in_flight_pins = slot.in_flight_pins.saturating_sub(1);
+        self.log.record(
+            0,
+            AtlasLogEventKind::SlotUnpinned,
+            glyph_ref.slot_id.0 as u64,
+        );
         Ok(())
     }
 
@@ -894,5 +1394,146 @@ impl BoundedGlyphAtlas {
         }
 
         Ok(())
+    }
+
+    /// Query a glyph raster key, returning an immediate hit or enqueuing a background miss (Plan §13.5).
+    ///
+    /// Never blocks layout. If absent from atlas, enqueues request with the specified priority
+    /// and returns [`RasterLookupResult::MissPending`] with optional validated fallback slot.
+    pub fn query_or_enqueue(
+        &mut self,
+        key: GlyphRasterKey,
+        priority: RasterPriority,
+        current_frame: u64,
+        fallback_ref: Option<GpuGlyphRef>,
+    ) -> Result<RasterLookupResult, AtlasError> {
+        self.query_or_enqueue_with_estimated_dims(key, priority, current_frame, 0, 0, fallback_ref)
+    }
+
+    /// Query a glyph raster key with estimated geometry dimensions.
+    pub fn query_or_enqueue_with_estimated_dims(
+        &mut self,
+        key: GlyphRasterKey,
+        priority: RasterPriority,
+        current_frame: u64,
+        estimated_width: u32,
+        estimated_height: u32,
+        fallback_ref: Option<GpuGlyphRef>,
+    ) -> Result<RasterLookupResult, AtlasError> {
+        let borrowed = key.as_borrowed();
+        let hash = borrowed.compute_hash();
+
+        // 1. Check if resident
+        if let Some(r) = self.lookup(&borrowed) {
+            let r_clone = r.clone();
+            return Ok(RasterLookupResult::Hit(r_clone));
+        }
+
+        // 2. Not resident: validate optional fallback ref
+        let valid_fallback = fallback_ref.and_then(|f| {
+            if self.validate_ref(&f).is_ok() {
+                Some(f)
+            } else {
+                None
+            }
+        });
+
+        // 3. Enqueue background raster miss request
+        let miss_req = RasterMissRequest {
+            key: key.clone(),
+            priority,
+            requested_frame: current_frame,
+            estimated_width,
+            estimated_height,
+            sequence: 0,
+        };
+        let enq_res = self.raster_queue.enqueue(miss_req)?;
+        match enq_res {
+            EnqueueResult::Promoted => {
+                self.log.record(
+                    current_frame,
+                    AtlasLogEventKind::RasterPriorityPromoted,
+                    hash,
+                );
+            }
+            EnqueueResult::Enqueued | EnqueueResult::EnqueuedWithEviction => {
+                self.log.record(
+                    current_frame,
+                    AtlasLogEventKind::RasterMissQueued,
+                    hash,
+                );
+            }
+            EnqueueResult::AlreadyPresent => {}
+        }
+
+        Ok(RasterLookupResult::MissPending {
+            key,
+            priority,
+            fallback_ref: valid_fallback,
+        })
+    }
+
+    /// Process a batch of pending background raster requests in strict priority order.
+    ///
+    /// If in-flight GPU frames have pinned all available slots, stops processing
+    /// and preserves remaining requests in the queue until slots become unpinned.
+    pub fn process_raster_queue_batch<F>(
+        &mut self,
+        max_batch: usize,
+        current_frame: u64,
+        mut rasterizer: F,
+    ) -> Result<BatchProcessReport, AtlasError>
+    where
+        F: FnMut(&GlyphRasterKey) -> Result<RasterizedGlyph, AtlasError>,
+    {
+        let mut processed_count = 0;
+        let initial_recomputed = self.recomputed_glyph_count;
+
+        for _ in 0..max_batch {
+            let req = match self.raster_queue.pop_highest_priority() {
+                Some(r) => r,
+                None => break,
+            };
+
+            let glyph = rasterizer(&req.key)?;
+
+            let insert_res = self.allocate_and_insert(
+                req.key.clone(),
+                glyph.pixel_width,
+                glyph.pixel_height,
+                glyph.bearing_x,
+                glyph.bearing_y,
+                glyph.advance_x,
+                current_frame,
+            );
+
+            match insert_res {
+                Ok(_) => {
+                    processed_count += 1;
+                    self.log.record(
+                        current_frame,
+                        AtlasLogEventKind::RasterServiced,
+                        req.key.compute_hash(),
+                    );
+                }
+                Err(AtlasError::AllSlotsPinned) | Err(AtlasError::AtlasFull) => {
+                    // Cannot allocate because GPU is currently sampling all slots or
+                    // all unpinned slots are active in the current frame.
+                    // Put request back so it will be retried in a future frame!
+                    let _ = self.raster_queue.enqueue(req);
+                    break;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        let recomputed_count =
+            (self.recomputed_glyph_count.saturating_sub(initial_recomputed)) as usize;
+
+        Ok(BatchProcessReport {
+            processed_count,
+            remaining_in_queue: self.raster_queue.len(),
+            recomputed_count,
+        })
     }
 }

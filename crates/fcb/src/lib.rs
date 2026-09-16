@@ -13,10 +13,14 @@ pub use frame_plan::{
     PresentationMode, PresentedFrameTracker,
 };
 pub use glyph_atlas::{
-    AtlasError as GlyphAtlasError, AtlasPage, AtlasPageId, AtlasPageKind, AtlasSlot,
-    AtlasSlotId, BoundedAtlasConfig, BoundedGlyphAtlas, BorrowedGlyphRasterKey,
-    GlyphRasterKey, GpuGlyphRef, HintingPolicy, RasterMode, RasterScaleTier,
-    SlotGeneration, SubpixelBin, DEFAULT_ATLAS_PAGE_SIZE, DEFAULT_MAX_ATLAS_PAGES,
+    AtlasError as GlyphAtlasError, AtlasLogEvent, AtlasLogEventKind, AtlasLogRing,
+    AtlasPage, AtlasPageId, AtlasPageKind, AtlasSlot, AtlasSlotId,
+    BatchProcessReport, BoundedAtlasConfig, BoundedGlyphAtlas, BoundedRasterQueue,
+    BorrowedGlyphRasterKey, EnqueueResult, GlyphRasterKey, GpuGlyphRef, HintingPolicy,
+    RasterLookupResult, RasterMissRequest, RasterMode, RasterPriority, RasterQueueStats,
+    RasterScaleTier, RasterizedGlyph, SlotGeneration, SubpixelBin, UnifiedMemoryAccounting,
+    DEFAULT_ATLAS_LOG_CAPACITY, DEFAULT_ATLAS_PAGE_SIZE, DEFAULT_MAX_ATLAS_PAGES,
+    DEFAULT_MAX_RASTER_QUEUE_CAPACITY,
 };
 
 pub mod frame_plan;

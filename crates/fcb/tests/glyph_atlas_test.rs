@@ -150,6 +150,7 @@ fn test_shelf_packing_and_fragmentation_tracking() {
     let config = BoundedAtlasConfig {
         max_pages: 1,
         page_size: 128,
+        ..BoundedAtlasConfig::default()
     };
     let mut atlas = BoundedGlyphAtlas::new(owner, 300, 1, config);
 
@@ -184,6 +185,7 @@ fn test_in_flight_pinning_prevents_eviction() {
     let config = BoundedAtlasConfig {
         max_pages: 1,
         page_size: 64,
+        ..BoundedAtlasConfig::default()
     };
     let mut atlas = BoundedGlyphAtlas::new(owner, 400, 1, config);
 
@@ -239,6 +241,7 @@ fn test_stale_slot_generation_on_reuse() {
     let config = BoundedAtlasConfig {
         max_pages: 1,
         page_size: 64,
+        ..BoundedAtlasConfig::default()
     };
     let mut atlas = BoundedGlyphAtlas::new(owner, 500, 1, config);
 
@@ -290,6 +293,7 @@ fn test_completion_unpins_and_allows_reclamation() {
     let config = BoundedAtlasConfig {
         max_pages: 1,
         page_size: 64,
+        ..BoundedAtlasConfig::default()
     };
     let mut atlas = BoundedGlyphAtlas::new(owner, 600, 1, config);
 
