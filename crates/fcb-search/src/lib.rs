@@ -9,11 +9,18 @@
 //! of a newly qualified complete Unicode normalization implementation.
 
 mod capture;
+pub mod index;
+pub mod indexed_query;
 pub mod oracle;
 pub mod query;
 pub mod stream;
 mod text;
 
+pub use index::{
+    EphemeralIndex, IndexError, IndexLimits, IndexStatistics, ManifestLimits,
+    MembershipState, SearchManifest, SearchManifestId, SegmentCoverage, UncoveredReason,
+};
+pub use indexed_query::{IndexedQuery, IndexedQueryState, IndexedSearchReport};
 pub use oracle::{OracleMismatchError, ReferenceScanOracle, SearchDocument};
 pub use query::{LangFilterKind, ParsedQuery, PathFilterKind, MAX_QUERY_LEN, MAX_QUERY_TOKENS};
 
