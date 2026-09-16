@@ -44,6 +44,7 @@ pub(crate) fn execute(args: &Arguments, out: &mut Output, budget: &ResourceBudge
     }
     if canceled() { return Err(AppError::Canceled); }
     if args.command == Command::Inspect { return inspect(args, &catalog, &root, out, canceled); }
+    if args.whole_file { return crate::whole_file::workspace(args, &catalog, &root, out, budget, canceled); }
     match args.needle.as_ref() {
         Some(Needle::Path(needle)) => paths(args, &catalog, &root, needle, out, budget, canceled),
         Some(Needle::Text(needle)) => text(args, &catalog, &root, needle, out, budget, canceled),
@@ -51,7 +52,7 @@ pub(crate) fn execute(args: &Arguments, out: &mut Output, budget: &ResourceBudge
     }
 }
 
-fn common(out: &mut Output, command: &str, catalog: &WorkspaceCatalog, root: &Path) -> Result<(), AppError> {
+pub(crate) fn common(out: &mut Output, command: &str, catalog: &WorkspaceCatalog, root: &Path) -> Result<(), AppError> {
     out.literal("{\"schema\":")?; out.quoted(SCHEMA)?;
     out.literal(",\"status\":\"ok\",\"command\":")?; out.quoted(command)?;
     out.literal(",\"scope\":\"workspace\",\"identity_scope\":\"response-local\",\"owner\":\"1\",\"root_id\":\"1\",\"manifest\":\"1\",\"query_generation\":\"1\",\"root\":")?;
@@ -214,7 +215,8 @@ fn text(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str,
         out.literal("],\"unsupported_text_files\":[")?;
         for (i, file) in result.unsupported_files.iter().enumerate() {
             if canceled() { return Err(AppError::Canceled); }
-            if i > 0 { out.literal(",")?; }
+            if i > 0 { out.literal(",")?;
+            }
             file_record(out, catalog, *file)?;
             out.literal(",\"reason\":\"UNSUPPORTED_EXACT_TEXT_DECODING\"}")?;
         }
@@ -249,15 +251,7 @@ fn read_capture(root: &Path, request: CaptureRequest, path: &NormalizedPath, lim
     total_limit: u64, io: &mut IoCounts, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool)
     -> Result<CompleteCapture, SourceError> {
     if canceled() { return Err(SourceError::Canceled); }
-    let mut native: PathBuf = root.to_path_buf();
-    // Recheck each observed component. The final open additionally uses the
-    // existing no-follow/nonblocking flags; ancestor replacement is still an
-    // explicit native-confinement limitation, not a sandbox claim.
-    for segment in path.segments() {
-        native.push(segment.to_path_buf());
-        let metadata = fs::symlink_metadata(&native).map_err(|_| SourceError::CaptureUnavailable)?;
-        if metadata.file_type().is_symlink() { return Err(SourceError::SymlinkForbidden); }
-    }
+    let native = checked_source_path(root, path)?;
     let (file, metadata) = input::open_regular(&native).map_err(|_| SourceError::CaptureUnavailable)?;
     if metadata.len() > limit as u64 || metadata.len() > total_limit.saturating_sub(io.bytes) {
         return Err(SourceError::PayloadTooLarge);
@@ -287,4 +281,17 @@ fn read_capture(root: &Path, request: CaptureRequest, path: &NormalizedPath, lim
         return Err(SourceError::MetadataMismatch);
     }
     CompleteCapture::new(request, length, Arc::from(extent.bytes()))
+}
+
+/// Shared admission for capture and streaming strategies. These checks refuse
+/// observed symlinks; the final open also applies no-follow/nonblocking flags.
+/// Separate pathname checks still do not qualify hostile ancestor-race safety.
+pub(crate) fn checked_source_path(root: &Path, path: &NormalizedPath) -> Result<PathBuf, SourceError> {
+    let mut native = root.to_path_buf();
+    for segment in path.segments() {
+        native.push(segment.to_path_buf());
+        let metadata = fs::symlink_metadata(&native).map_err(|_| SourceError::CaptureUnavailable)?;
+        if metadata.file_type().is_symlink() { return Err(SourceError::SymlinkForbidden); }
+    }
+    Ok(native)
 }

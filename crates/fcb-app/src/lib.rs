@@ -10,11 +10,12 @@ pub mod output;
 mod input;
 mod services;
 mod workspace;
+mod whole_file;
 
 use std::{ffi::OsString, io::{Read, Write}};
 use fcb::{ArenaOwnerId, ByteLength, FileId, SourceRevision};
 use fcb::search::{ExtentError, ExtentViewError, ExtentQueryError, QueryGeneration,
-    ResourceAllocationId, ResourceBudget, IndexError, PathSearchError};
+    ResourceAllocationId, ResourceBudget, IndexError, PathSearchError, StreamReadError, FileSearchError};
 use fcb::search::workspace::WorkspaceError;
 use args::{Arguments, ArgumentError, Command};
 use output::{Output, OutputError, MAX_RESPONSE_BYTES};
@@ -42,6 +43,7 @@ pub enum AppError {
     Symlink, Special, Directory, InputLimit, IoCallLimit, Canceled,
     GuiUnavailable, InvalidRange, Admission, SourceChanged,
     Workspace(WorkspaceError), Index(IndexError), Path(PathSearchError),
+    Stream(StreamReadError), FileSearch(FileSearchError),
 }
 impl AppError {
     pub fn code(self) -> String {
@@ -52,6 +54,7 @@ impl AppError {
             Self::View(error) => return error.to_string(), Self::Query(error) => return error.to_string(),
             Self::Workspace(error) => return error.to_string(), Self::Index(error) => return error.to_string(),
             Self::Path(error) => return error.to_string(),
+            Self::Stream(error) => return error.to_string(), Self::FileSearch(error) => return error.to_string(),
             Self::Io => "CLI_SOURCE_IO", Self::UnsupportedPlatform => "CLI_NATIVE_FILE_UNSUPPORTED",
             Self::Symlink => "CLI_SYMLINK_REFUSED", Self::Special => "CLI_SPECIAL_OBJECT_REFUSED",
             Self::Directory => "CLI_DIRECTORY_SCOPE_UNAVAILABLE", Self::InputLimit => "CLI_INPUT_LIMIT",
@@ -64,7 +67,8 @@ impl AppError {
     pub const fn subsystem(self) -> &'static str {
         match self {
             Self::Argument(_) => "arguments", Self::Output(_) => "output",
-            Self::View(_) => "decoder", Self::Query(_) | Self::Index(_) | Self::Path(_) => "search",
+            Self::View(_) => "decoder", Self::Query(_) | Self::Index(_) | Self::Path(_)
+                | Self::Stream(_) | Self::FileSearch(_) => "search",
             Self::Workspace(_) => "workspace", Self::GuiUnavailable => "native", _ => "source",
         }
     }
@@ -82,7 +86,8 @@ impl AppError {
             Self::SourceChanged => "The source identity changed during admission.",
             Self::Output(_) => "The complete response did not fit its output admission budget.",
             Self::View(_) => "The requested text could not be decoded with the available exact source context.",
-            Self::Query(_) | Self::Index(_) | Self::Path(_) => "The exact query could not complete under its declared source semantics.",
+            Self::Query(_) | Self::Index(_) | Self::Path(_) | Self::Stream(_) | Self::FileSearch(_) =>
+                "The exact query could not complete under its declared source semantics.",
             Self::Workspace(_) => "The workspace operation could not publish its bounded observation.",
             Self::Admission => "Managed resource capacity was refused before publication.",
             Self::InvalidRange => "The requested range or source kind is not valid for this operation.",
@@ -122,6 +127,8 @@ impl From<ExtentQueryError> for AppError { fn from(error: ExtentQueryError) -> S
 impl From<WorkspaceError> for AppError { fn from(error: WorkspaceError) -> Self { Self::Workspace(error) } }
 impl From<IndexError> for AppError { fn from(error: IndexError) -> Self { Self::Index(error) } }
 impl From<PathSearchError> for AppError { fn from(error: PathSearchError) -> Self { Self::Path(error) } }
+impl From<StreamReadError> for AppError { fn from(error: StreamReadError) -> Self { Self::Stream(error) } }
+impl From<FileSearchError> for AppError { fn from(error: FileSearchError) -> Self { Self::FileSearch(error) } }
 
 /// Ordinary --json writes ONE complete bounded document or one error document.
 /// Service failures discard the private partial encoder before writing errors.
@@ -176,6 +183,7 @@ fn execute(args: &Arguments, stdin: &mut impl Read, output: &mut Output,
     budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<u8, AppError> {
     if canceled() { return Err(AppError::Canceled); }
     if args.workspace { return workspace::execute(args, output, budget, canceled); }
+    if args.whole_file { return whole_file::single(args, output, budget, canceled); }
     match args.command {
         Command::Help => services::help(args.json, output),
         Command::Capabilities | Command::Doctor => services::capabilities(args, output),
