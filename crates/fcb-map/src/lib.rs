@@ -6,14 +6,18 @@
 //! assigns parent-local rectangles from a frozen child order (raw path bytes,
 //! never size-sorted squarify), bounded sublinear weights, unknown-but-present
 //! placeholders, and reserved slack. A committed [`LayoutRevision`] restores
-//! identically. Local neighborhood repair and explicit global repack belong to
-//! FCB-013.B.
+//! identically. Local neighborhood repair and explicit global repack are in
+//! [`repair`].
+
+mod repair;
 
 use std::collections::BTreeMap;
 
 use fcb_core::{
     ArenaOwnerId, CoreError, LayoutRevision, Point2D, Rect2D, RootId, Size2D,
 };
+
+pub use repair::{DisplacementBudget, LayoutArchive, RepairReport};
 
 /// Named size metric. The legend must name this; it is not raw byte area.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -137,11 +141,11 @@ impl LayoutOptions {
 /// Parent-local laid-out node.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LaidOutNode {
-    path: Vec<u8>,
-    kind: NodeKind,
-    parent_local: Rect2D,
-    weight: f64,
-    slack: Option<Rect2D>,
+    pub(crate) path: Vec<u8>,
+    pub(crate) kind: NodeKind,
+    pub(crate) parent_local: Rect2D,
+    pub(crate) weight: f64,
+    pub(crate) slack: Option<Rect2D>,
 }
 
 impl LaidOutNode {
@@ -169,12 +173,12 @@ impl LaidOutNode {
 /// A committed partition tree. Restoring this revision yields the same rectangles.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PartitionLayout {
-    owner: ArenaOwnerId,
-    root: RootId,
-    revision: LayoutRevision,
-    options: LayoutOptions,
-    world: Rect2D,
-    nodes: Vec<LaidOutNode>,
+    pub(crate) owner: ArenaOwnerId,
+    pub(crate) root: RootId,
+    pub(crate) revision: LayoutRevision,
+    pub(crate) options: LayoutOptions,
+    pub(crate) world: Rect2D,
+    pub(crate) nodes: Vec<LaidOutNode>,
 }
 
 impl PartitionLayout {
@@ -222,6 +226,10 @@ pub enum LayoutError {
     DuplicatePath,
     InvalidPath,
     SlackOutOfRange,
+    /// Slack cannot absorb an insertion without moving neighbors.
+    RepairExceedsBudget,
+    /// Existing parcels would move; interaction must not commit that.
+    MovementDeferred,
 }
 
 impl LayoutError {
@@ -231,6 +239,8 @@ impl LayoutError {
             Self::DuplicatePath => "LAYOUT_DUPLICATE_PATH",
             Self::InvalidPath => "LAYOUT_INVALID_PATH",
             Self::SlackOutOfRange => "LAYOUT_SLACK_OUT_OF_RANGE",
+            Self::RepairExceedsBudget => "LAYOUT_REPAIR_EXCEEDS_BUDGET",
+            Self::MovementDeferred => "LAYOUT_MOVEMENT_DEFERRED",
         }
     }
 }
@@ -269,11 +279,11 @@ pub fn bounded_weight(metric: WeightMetric, kind: NodeKind, observed_bytes: Opti
     }
 }
 
-struct TreeNode {
-    path: Vec<u8>,
-    kind: NodeKind,
-    observed_bytes: Option<u64>,
-    children: BTreeMap<Vec<u8>, TreeNode>,
+pub(crate) struct TreeNode {
+    pub(crate) path: Vec<u8>,
+    pub(crate) kind: NodeKind,
+    pub(crate) observed_bytes: Option<u64>,
+    pub(crate) children: BTreeMap<Vec<u8>, TreeNode>,
 }
 
 impl TreeNode {
@@ -286,7 +296,7 @@ impl TreeNode {
         }
     }
 
-    fn weight(&self, metric: WeightMetric) -> f64 {
+    pub(crate) fn weight(&self, metric: WeightMetric) -> f64 {
         if self.children.is_empty() {
             return bounded_weight(metric, self.kind, self.observed_bytes);
         }
@@ -341,7 +351,7 @@ fn ensure_dir<'a>(root: &'a mut TreeNode, path: &[u8]) -> Result<&'a mut TreeNod
     Ok(cursor)
 }
 
-fn build_tree(spec: &HierarchySpec) -> Result<TreeNode, LayoutError> {
+pub(crate) fn build_tree(spec: &HierarchySpec) -> Result<TreeNode, LayoutError> {
     let mut root = TreeNode::new(Vec::new(), NodeKind::Directory, None);
     let mut seen: BTreeMap<Vec<u8>, NodeKind> = BTreeMap::new();
     seen.insert(Vec::new(), NodeKind::Directory);
@@ -516,7 +526,7 @@ fn pack_row(
     }
 }
 
-fn pack_ordered(rect: Rect2D, items: &[(Vec<u8>, f64)]) -> Result<Vec<(Vec<u8>, Rect2D)>, LayoutError> {
+pub(crate) fn pack_ordered(rect: Rect2D, items: &[(Vec<u8>, f64)]) -> Result<Vec<(Vec<u8>, Rect2D)>, LayoutError> {
     if items.is_empty() {
         return Ok(Vec::new());
     }
@@ -553,7 +563,7 @@ fn to_parent_local(parent_world: Rect2D, child_world: Rect2D) -> Result<Rect2D, 
     .map_err(LayoutError::from)
 }
 
-fn emit_tree(
+pub(crate) fn emit_tree(
     tree: &TreeNode,
     world_rect: Rect2D,
     parent_world: Rect2D,
