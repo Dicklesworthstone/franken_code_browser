@@ -292,17 +292,22 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
     fn prepare(&mut self) -> Result<(), StreamReadError> {
         let final_input = self.eof || self.stats.bytes_read == self.length.get();
         if self.cursor.is_none() {
-            // A possibly split BOM is not guessed from a one-byte read/budget.
-            if self.filled < 3 && !final_input { return Ok(()); }
-            let encoding = self.encoding.unwrap_or_else(|| detect_encoding(&self.buffer[..self.filled]));
+            // Only a possible partial header delays the encoding decision.
+            // Ordinary one-byte ASCII input may already produce a useful hit
+            // under a tiny budget; a byte budget is never treated as EOF.
+            let prefix = &self.buffer[..self.filled];
+            if !final_input && (prefix.is_empty()
+                || matches!(prefix, [0xef] | [0xef, 0xbb] | [0xff] | [0xfe])) { return Ok(()); }
+            let encoding = self.encoding.unwrap_or_else(|| detect_encoding(prefix));
             self.encoding = Some(encoding);
             self.header = match encoding {
-                DetectedEncoding::Utf8 { has_bom: true } if self.buffer[..self.filled].starts_with(&[0xef, 0xbb, 0xbf]) => 3,
-                DetectedEncoding::Utf16Le if self.buffer[..self.filled].starts_with(&[0xff, 0xfe]) => 2,
-                DetectedEncoding::Utf16Be if self.buffer[..self.filled].starts_with(&[0xfe, 0xff]) => 2,
+                DetectedEncoding::Utf8 { has_bom: true } if prefix.starts_with(&[0xef, 0xbb, 0xbf]) => 3,
+                DetectedEncoding::Utf16Le if prefix.starts_with(&[0xff, 0xfe]) => 2,
+                DetectedEncoding::Utf16Be if prefix.starts_with(&[0xfe, 0xff]) => 2,
                 _ => 0,
             };
-            self.cursor = Some(ByteSearchCursor::new(self.needle.encoded(self.encoding))?);
+            let needle: &'needle StreamingNeedle = self.needle;
+            self.cursor = Some(ByteSearchCursor::new(needle.encoded(self.encoding))?);
         }
         self.ready = if self.needle.mode == StreamingMode::OriginalBytes || final_input { self.filled }
             else { complete_prefix(&self.buffer[..self.filled], self.encoding.ok_or(StreamReadError::InvalidRange)?) };
@@ -406,5 +411,39 @@ fn complete_prefix(bytes: &[u8], encoding: DetectedEncoding) -> usize {
         end
     } else {
         match std::str::from_utf8(bytes) { Err(error) if error.error_len().is_none() => error.valid_up_to(), _ => bytes.len() }
+    }
+}
+
+#[cfg(test)]
+mod tiny_budget_tests {
+    use super::*;
+    #[test]
+    fn one_byte_ascii_budget_emits_available_prefix_without_claiming_eof() {
+        let owner = ArenaOwnerId::new(1515).unwrap();
+        let budget = ResourceBudget::new(owner, ByteLength::new(64 * 1024 * 1024)).unwrap();
+        let needle = StreamingNeedle::text(owner, "a", &budget, ResourceAllocationId::new(1).unwrap()).unwrap();
+        let request = CaptureRequest::new(FileId::new(owner, 1).unwrap(), SourceRevision::new(owner, 1).unwrap()).unwrap();
+        let mut options = StreamReadOptions::new(QueryGeneration::new(owner, 1).unwrap());
+        options.max_bytes = 1;
+        let mut query = ReaderSearch::new(b"abc".as_slice(), request, ByteLength::new(3), &needle,
+            options, &budget, ResourceAllocationId::new(2).unwrap()).unwrap();
+        query.step(StreamReadStep::default(), options.generation, || false).unwrap();
+        assert_eq!(query.state(), StreamReadState::ByteLimit);
+        assert_eq!(query.hits().len(), 1);
+        assert_eq!(query.stats().bytes_read, 1);
+    }
+    #[test]
+    fn byte_and_hit_zero_steps_do_not_consume_even_a_header() {
+        let owner = ArenaOwnerId::new(1516).unwrap();
+        let budget = ResourceBudget::new(owner, ByteLength::new(64 * 1024 * 1024)).unwrap();
+        let needle = StreamingNeedle::text(owner, "a", &budget, ResourceAllocationId::new(1).unwrap()).unwrap();
+        let request = CaptureRequest::new(FileId::new(owner, 1).unwrap(), SourceRevision::new(owner, 1).unwrap()).unwrap();
+        let options = StreamReadOptions::new(QueryGeneration::new(owner, 1).unwrap());
+        let mut query = ReaderSearch::new(b"abc".as_slice(), request, ByteLength::new(3), &needle,
+            options, &budget, ResourceAllocationId::new(2).unwrap()).unwrap();
+        for step in [StreamReadStep { max_bytes: 0, ..Default::default() }, StreamReadStep { max_hits: 0, ..Default::default() }] {
+            assert_eq!(query.step(step, options.generation, || false).unwrap(), StreamReadState::Pending);
+            assert_eq!(query.stats().bytes_read, 0); assert_eq!(query.stats().read_calls, 0);
+        }
     }
 }
