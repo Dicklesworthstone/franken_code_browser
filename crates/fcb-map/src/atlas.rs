@@ -13,7 +13,7 @@
 //! than accumulating the absolute coordinates of all its ancestors.
 
 use std::mem::size_of;
-use fcb_core::{ArenaOwnerId, ByteLength, LayoutRevision, Point2D, Rect2D,
+use fcb_core::{ArenaOwnerId, ByteLength, LayoutRevision, Rect2D,
     ResourceAllocationId, ResourceBudget, ResourceLease, RootId};
 use crate::{LaidOutNode, NodeKind, PartitionLayout};
 use crate::camera::{Camera2D, CameraError, checked_rect};
@@ -315,6 +315,7 @@ fn build_group(children: &[usize], parent: usize, layout: &PartitionLayout, node
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fcb_core::Point2D;
     use crate::{HierarchySpec, LayoutOptions, NodeSpec, Size2D, commit_layout};
     fn owner() -> ArenaOwnerId { ArenaOwnerId::new(415).unwrap() }
     fn layout(revision: u64) -> PartitionLayout {

@@ -48,16 +48,16 @@ pub struct DocumentBudgets {
     pub max_blocks: usize,
     pub max_bytes: usize,
     pub max_lines: usize,
-    pub max_table_cells: usize,
+    pub max_items: usize,
 }
 
 impl Default for DocumentBudgets {
     fn default() -> Self {
         Self {
-            max_blocks: 100_000,
+            max_blocks: 50_000,
+            max_lines: 200_000,
             max_bytes: 32 * 1024 * 1024,
-            max_lines: 500_000,
-            max_table_cells: 50_000,
+            max_items: 500_000,
         }
     }
 }
@@ -68,7 +68,7 @@ impl From<DocumentBudgets> for FlowBudgets {
             max_blocks: b.max_blocks,
             max_bytes: b.max_bytes,
             max_lines: b.max_lines,
-            max_table_cells: b.max_table_cells,
+            max_items: b.max_items,
         }
     }
 }
@@ -76,12 +76,12 @@ impl From<DocumentBudgets> for FlowBudgets {
 /// One rendered line in continuous document flow.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DocumentFlowLine {
-    pub text: String,
-    pub block_index: usize,
-    pub local_line: usize,
-    pub y_offset: u32,
-    pub height: u32,
-    pub is_continuation: bool,
+    pub line_index: usize,
+    pub baseline_y: u32,
+    pub rendered_text: String,
+    pub rendered_range: franken_markdown::TextSelectionRange,
+    pub source_span: franken_markdown::SourceSpan,
+    pub element_indices: Vec<usize>,
 }
 
 /// Headless layout and measurement output produced by the upstream flow engine.
@@ -256,21 +256,20 @@ impl DocumentSession {
 
         let consumer = HeadlessFlowConsumer::new(constraints.into(), budgets.into());
         let output = consumer.consume_source(&self.source_text)?;
+        let semantic_fixture = output.to_semantic_fixture();
 
         let lines = output
             .lines
             .into_iter()
             .map(|l| DocumentFlowLine {
-                text: l.text,
-                block_index: l.block_index,
-                local_line: l.local_line,
-                y_offset: l.y_offset,
-                height: l.height,
-                is_continuation: l.is_continuation,
+                line_index: l.line_index,
+                baseline_y: l.baseline_y,
+                rendered_text: l.rendered_text,
+                rendered_range: l.rendered_range,
+                source_span: l.source_span,
+                element_indices: l.element_indices,
             })
             .collect();
-
-        let semantic_fixture = output.to_semantic_fixture();
 
         Ok(HeadlessDocumentOutput {
             total_width: output.total_width,

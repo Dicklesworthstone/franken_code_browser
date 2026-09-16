@@ -195,7 +195,7 @@ impl SnapshotPair {
     }
     pub const fn change(&self) -> SnapshotChange { self.change }
     fn side(&self, side: ComparisonSide) -> &Side { match side { ComparisonSide::Before => &self.before, ComparisonSide::After => &self.after } }
-    pub fn request(&self, side: ComparisonSide) -> CaptureRequest { self.side(side).capture.request() }
+    pub fn request(&self, side: ComparisonSide) -> CaptureRequest { *self.side(side).capture.request() }
     pub fn bytes(&self, side: ComparisonSide) -> &[u8] { self.side(side).source.bytes() }
     pub fn compare(&self, generation: QueryGeneration, limits: ComparisonLimits,
         budget: &ResourceBudget, allocation: ResourceAllocationId, canceled: impl FnMut() -> bool)

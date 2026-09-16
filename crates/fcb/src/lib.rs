@@ -31,6 +31,10 @@ pub mod map;
 #[cfg(feature = "analysis")]
 pub use fcb_analysis as analysis;
 
+/// Upstream document semantics, flow layout, and display translation.
+#[cfg(feature = "markdown")]
+pub use fcb_document as document;
+
 /// A capability whose implementation can be selected additively by a host.
 ///
 /// The facade itself remains usable with no Cargo features.  In-memory source

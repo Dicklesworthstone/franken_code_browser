@@ -304,7 +304,7 @@ impl<'catalog> WorkspaceCaptures<'catalog> {
             CaptureSlot::Unavailable(WorkspaceCaptureFailure::SourceLimit)
         } else {
             match capture(request, &entry.path, allowance) {
-                Ok(captured) if captured.request() == request && captured.bytes().len() <= allowance => CaptureSlot::Ready(captured),
+                Ok(captured) if captured.request() == &request && captured.bytes().len() <= allowance => CaptureSlot::Ready(captured),
                 Ok(_) => CaptureSlot::Unavailable(WorkspaceCaptureFailure::InvalidCapture),
                 Err(SourceError::Canceled) => { self.cancel(); return Err(WorkspaceError::Canceled); }
                 Err(error) => CaptureSlot::Unavailable(WorkspaceCaptureFailure::Source(error)),

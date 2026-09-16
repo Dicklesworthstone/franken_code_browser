@@ -47,7 +47,7 @@ pub use reading_window::{LineEnding, ReadingLine, ReadingSelection, ReadingWindo
 
 pub use fcb_search::*;
 pub use fcb_search::paths::{IndexedPath, PathCase, PathEntry, PathIndex, PathIndexLimits,
-    PathMatch, PathMatchKind, PathMatchMode, PathRank, PathSearch, PathSearchOptions,
+    PathMatch, PathMatchKind, PathMatchMode, PathRank, PathSearch, PathSearchError, PathSearchOptions,
     PathSearchState, PathSelection, PathStepBudget, RawPath};
 pub use fcb_core::{QueryGeneration, ResourceAllocationId, ResourceBudget, RootId};
 pub use fcb_source::{CaptureRequest, CompleteCapture, DetectedEncoding};

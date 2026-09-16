@@ -37,26 +37,19 @@ pub fn resolve_reading_selection(
     capture: &CompleteCapture,
 ) -> Result<SelectionResolution, DocumentError> {
     let source_len = capture.bytes().len();
-    let elements = source_map.elements_in_range(selection);
+    let reading_text = source_map.copy_rendered_text(selection)?;
 
-    let mut reading_text = String::new();
     let mut source_ranges = Vec::new();
-
-    for elem in elements {
-        if !reading_text.is_empty() {
-            reading_text.push(' ');
-        }
-        reading_text.push_str(&elem.rendered_text);
-
-        let span = elem.source_span;
-        if span.start <= span.end && span.end <= source_len {
-            if let (Ok(start), Ok(end)) = (
-                ByteOffset::new(span.start as u64),
-                ByteOffset::new(span.end as u64),
-            ) {
-                if let Ok(range) = ByteRange::new(start, end) {
-                    if !source_ranges.contains(&range) {
-                        source_ranges.push(range);
+    for elem in source_map.elements() {
+        if elem.rendered_range.start < selection.end && elem.rendered_range.end > selection.start {
+            for span in elem.source_ranges.spans() {
+                if span.start <= span.end && span.end <= source_len {
+                    let start = ByteOffset::new(span.start as u64);
+                    let end = ByteOffset::new(span.end as u64);
+                    if let Ok(range) = ByteRange::new(start, end) {
+                        if !source_ranges.contains(&range) {
+                            source_ranges.push(range);
+                        }
                     }
                 }
             }

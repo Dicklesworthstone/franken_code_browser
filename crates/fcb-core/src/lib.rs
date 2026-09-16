@@ -170,6 +170,8 @@ owner_qualified_id!(ClockDomainId);
 owner_qualified_id!(CameraGeneration);
 owner_qualified_id!(SceneGeneration);
 owner_qualified_id!(InteractionGeneration);
+owner_qualified_id!(DocumentId);
+owner_qualified_id!(DocumentGeneration);
 
 /// Compatibility name for integrations that refer to semantic nodes as
 /// stable nodes. The owner-qualified ID is the stable identity; tree position
@@ -208,6 +210,8 @@ allocated_id!(ClockDomainId);
 allocated_id!(CameraGeneration);
 allocated_id!(SceneGeneration);
 allocated_id!(InteractionGeneration);
+allocated_id!(DocumentId);
+allocated_id!(DocumentGeneration);
 
 allocated_id!(FileId);
 

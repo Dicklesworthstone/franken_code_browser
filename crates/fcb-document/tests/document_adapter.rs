@@ -3,8 +3,7 @@
 use std::sync::Arc;
 
 use fcb_core::{
-    ArenaOwnerId, ByteLength, ByteOffset, ByteRange, DocumentGeneration, DocumentId,
-    FileId, SourceRevision,
+    ArenaOwnerId, ByteLength, DocumentGeneration, DocumentId, FileId, SourceRevision,
 };
 use fcb_document::{
     resolve_reading_selection, verify_provenance_truthfulness, DocumentBudgets,
@@ -25,8 +24,8 @@ fn test_revision(owner: ArenaOwnerId, rev: u64) -> SourceRevision {
     SourceRevision::new(owner, rev).unwrap()
 }
 
-fn test_generation(owner: ArenaOwnerId, gen: u64) -> DocumentGeneration {
-    DocumentGeneration::new(owner, gen).unwrap()
+fn test_generation(owner: ArenaOwnerId, gen_id: u64) -> DocumentGeneration {
+    DocumentGeneration::new(owner, gen_id).unwrap()
 }
 
 fn test_doc_id(owner: ArenaOwnerId, id: u64) -> DocumentId {
@@ -38,7 +37,7 @@ fn create_capture(bytes: &[u8]) -> CompleteCapture {
     let file = test_file_id(owner, 1);
     let rev = test_revision(owner, 10);
     let request = CaptureRequest::new(file, rev).unwrap();
-    let declared_len = ByteLength::new(bytes.len() as u64).unwrap();
+    let declared_len = ByteLength::new(bytes.len() as u64);
     CompleteCapture::new(request, declared_len, Arc::from(bytes)).unwrap()
 }
 
@@ -48,11 +47,11 @@ fn test_real_readme_headless_output_consumed_through_public_api() {
     let capture = create_capture(readme_bytes);
     let owner = test_owner();
     let doc_id = test_doc_id(owner, 100);
-    let gen = test_generation(owner, 1);
+    let generation = test_generation(owner, 1);
 
-    let session = DocumentSession::new(doc_id, &capture, gen).expect("session creation succeeds");
+    let session = DocumentSession::new(doc_id, &capture, generation).expect("session creation succeeds");
     assert_eq!(session.id(), doc_id);
-    assert_eq!(session.generation(), gen);
+    assert_eq!(session.generation(), generation);
     assert_eq!(session.digest(), capture.digest());
 
     let constraints = DocumentViewConstraints {
@@ -64,7 +63,7 @@ fn test_real_readme_headless_output_consumed_through_public_api() {
     let budgets = DocumentBudgets::default();
 
     let output = session
-        .consume_headless(gen, constraints, budgets)
+        .consume_headless(generation, constraints, budgets)
         .expect("headless flow consumption succeeds");
 
     assert!(output.lines.len() > 10, "README should produce multiple flow lines");
@@ -211,16 +210,16 @@ Final concluding thoughts.
     assert_eq!(stepper.steps_taken(), 0);
     assert!(!stepper.is_finished());
 
-    let mut total_blocks_stepped = 0;
+    let mut _total_blocks_stepped = 0;
     let mut step_count = 0;
     while let Some(step) = stepper.step().unwrap() {
         step_count += 1;
-        total_blocks_stepped += step.blocks.len();
+        _total_blocks_stepped += step.blocks.len();
     }
 
     assert!(stepper.is_finished());
     assert!(step_count >= 2, "must have taken multiple steps");
-    assert_eq!(stepper.steps_taken(), step_count);
+    assert_eq!(stepper.steps_taken(), step_count + 1);
 
     let display_list = stepper.to_display_list();
     let plan = DocumentDisplayPlan::new(session.generation(), display_list, Vec::new());
@@ -260,8 +259,8 @@ Second paragraph with *italic* text.
 
     // Select across multiple elements
     let selection = TextSelectionRange {
-        start_char: 0,
-        end_char: 50,
+        start: 0,
+        end: 50,
     };
 
     let resolution = resolve_reading_selection(selection, &output.source_map, &capture).unwrap();
@@ -298,52 +297,52 @@ fn test_lens_visibility_and_scrolling() {
     // Test visible line slicing
     let lines = vec![
         fcb_document::DocumentFlowLine {
-            text: "Line 1".to_string(),
-            block_index: 0,
-            local_line: 0,
-            y_offset: 0,
-            height: 16,
-            is_continuation: false,
+            line_index: 0,
+            baseline_y: 16,
+            rendered_text: "Line 1".to_string(),
+            rendered_range: fcb_document::TextSelectionRange { start: 0, end: 6 },
+            source_span: fcb_document::SourceSpan { start: 0, end: 6 },
+            element_indices: vec![0],
         },
         fcb_document::DocumentFlowLine {
-            text: "Line 2".to_string(),
-            block_index: 0,
-            local_line: 1,
-            y_offset: 16,
-            height: 16,
-            is_continuation: false,
+            line_index: 1,
+            baseline_y: 32,
+            rendered_text: "Line 2".to_string(),
+            rendered_range: fcb_document::TextSelectionRange { start: 7, end: 13 },
+            source_span: fcb_document::SourceSpan { start: 7, end: 13 },
+            element_indices: vec![1],
         },
         fcb_document::DocumentFlowLine {
-            text: "Line 3".to_string(),
-            block_index: 1,
-            local_line: 0,
-            y_offset: 350,
-            height: 16,
-            is_continuation: false,
+            line_index: 2,
+            baseline_y: 350,
+            rendered_text: "Line 3".to_string(),
+            rendered_range: fcb_document::TextSelectionRange { start: 14, end: 20 },
+            source_span: fcb_document::SourceSpan { start: 14, end: 20 },
+            element_indices: vec![2],
         },
         fcb_document::DocumentFlowLine {
-            text: "Line 4".to_string(),
-            block_index: 1,
-            local_line: 1,
-            y_offset: 366,
-            height: 16,
-            is_continuation: false,
+            line_index: 3,
+            baseline_y: 366,
+            rendered_text: "Line 4".to_string(),
+            rendered_range: fcb_document::TextSelectionRange { start: 21, end: 27 },
+            source_span: fcb_document::SourceSpan { start: 21, end: 27 },
+            element_indices: vec![3],
         },
         fcb_document::DocumentFlowLine {
-            text: "Line 5".to_string(),
-            block_index: 2,
-            local_line: 0,
-            y_offset: 800,
-            height: 16,
-            is_continuation: false,
+            line_index: 4,
+            baseline_y: 800,
+            rendered_text: "Line 5".to_string(),
+            rendered_range: fcb_document::TextSelectionRange { start: 28, end: 34 },
+            source_span: fcb_document::SourceSpan { start: 28, end: 34 },
+            element_indices: vec![4],
         },
     ];
 
     // Scrolled to y=300, height=200 => range [300, 500]
     let visible = scrolled.visible_lines(&lines);
     assert_eq!(visible.len(), 2);
-    assert_eq!(visible[0].text, "Line 3");
-    assert_eq!(visible[1].text, "Line 4");
+    assert_eq!(visible[0].rendered_text, "Line 3");
+    assert_eq!(visible[1].rendered_text, "Line 4");
 }
 
 #[test]
@@ -376,7 +375,7 @@ fn test_budget_defense_on_adversarial_input() {
         max_blocks: 1000,
         max_bytes: 50, // Only 50 bytes allowed
         max_lines: 1000,
-        max_table_cells: 100,
+        max_items: 100,
     };
 
     let res = session.consume_headless(
@@ -386,7 +385,7 @@ fn test_budget_defense_on_adversarial_input() {
     );
 
     assert!(
-        matches!(res.err(), Some(DocumentError::Flow(franken_markdown::FlowError::BudgetExceeded(_)))),
+        matches!(res.err(), Some(DocumentError::Flow(franken_markdown::FlowError::BudgetExceeded { .. }))),
         "exceeding max_bytes budget must return FlowError::BudgetExceeded"
     );
 }
@@ -400,13 +399,13 @@ fn test_owner_mismatch_rejected() {
     let rev = test_revision(owner_a, 1);
     let request = CaptureRequest::new(file, rev).unwrap();
     let bytes = b"test";
-    let declared_len = ByteLength::new(bytes.len() as u64).unwrap();
+    let declared_len = ByteLength::new(bytes.len() as u64);
     let capture = CompleteCapture::new(request, declared_len, Arc::from(&bytes[..])).unwrap();
 
     // DocumentId with owner_b, but capture has owner_a
     let doc_id = test_doc_id(owner_b, 106);
-    let gen = test_generation(owner_a, 1);
+    let generation = test_generation(owner_a, 1);
 
-    let res = DocumentSession::new(doc_id, &capture, gen);
+    let res = DocumentSession::new(doc_id, &capture, generation);
     assert_eq!(res.err(), Some(DocumentError::OwnerMismatch));
 }

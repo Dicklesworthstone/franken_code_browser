@@ -215,7 +215,7 @@ impl<'a> CaptureComparison<'a> {
     }
     pub fn validate_delivery(&self, before: CaptureRequest, after: CaptureRequest,
         generation: QueryGeneration) -> Result<(), ComparisonError> {
-        if before != self.before.request() || after != self.after.request() || generation != self.generation {
+        if &before != self.before.request() || &after != self.after.request() || generation != self.generation {
             return Err(ComparisonError::Stale);
         }
         Ok(())
@@ -367,7 +367,7 @@ mod tests {
         assert_eq!(diff.corresponding_after(old_tail).unwrap().start().get(), 12);
         assert!(diff.corresponding_after(ByteRange::new(ByteOffset::new(0), ByteOffset::new(9)).unwrap()).is_none());
         assert!(diff.corresponding_after(ByteRange::new(ByteOffset::new(5), ByteOffset::new(5)).unwrap()).is_none());
-        assert!(diff.validate_delivery(new.request(), old.request(), generation()).is_err());
+        assert!(diff.validate_delivery(*new.request(), *old.request(), generation()).is_err());
     }
     #[test]
     fn arbitrary_bytes_utf16_units_and_repeated_lines_remain_original_ranges() {

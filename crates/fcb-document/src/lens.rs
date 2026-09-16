@@ -77,9 +77,9 @@ impl DocumentLens {
         let view_bottom = self.scroll_y.saturating_add(self.viewport_height);
 
         let first = lines
-            .partition_point(|l| l.y_offset.saturating_add(l.height) < view_top);
+            .partition_point(|l| l.baseline_y.saturating_add(self.line_height) < view_top);
         let last = lines
-            .partition_point(|l| l.y_offset <= view_bottom);
+            .partition_point(|l| l.baseline_y <= view_bottom);
 
         if first < last && first < lines.len() {
             &lines[first..last.min(lines.len())]
@@ -94,7 +94,7 @@ impl DocumentLens {
         heading_id: &str,
         source_map: &'a DocumentSourceMap,
     ) -> Option<&'a HeadingSourceAnchor> {
-        source_map.find_heading(heading_id)
+        source_map.headings().iter().find(|h| h.slug == heading_id)
     }
 
     /// Translates an upstream `SourceSpan` into an authoritative FCB `ByteRange`.

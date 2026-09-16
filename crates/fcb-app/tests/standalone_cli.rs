@@ -125,12 +125,23 @@ fn executable_runs_without_checkout_resources_or_a_companion_application() {
     let standalone = fixture.path("fcb standalone ü");
     fs::copy(env!("CARGO_BIN_EXE_fcb"), &standalone).unwrap();
     fs::write(fixture.path("data.rs"), b"exact bytes").unwrap();
-    let result = document(&Command::new(&standalone).current_dir(&fixture.0)
-        .args(["open", "data.rs", "--json"]).output().unwrap(), 0);
+    let run = |cmd: &mut Command| -> Output {
+        for _ in 0..20 {
+            match cmd.output() {
+                Ok(out) => return out,
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy || e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("failed to run standalone command: {e}"),
+            }
+        }
+        cmd.output().expect("standalone command execution")
+    };
+    let result = document(&run(Command::new(&standalone).current_dir(&fixture.0).args(["open", "data.rs", "--json"])), 0);
     assert_eq!(result.get("text").text(), "exact bytes");
-    let result = document(&Command::new(&standalone).current_dir(&fixture.0).arg("--json").output().unwrap(), 0);
+    let result = document(&run(Command::new(&standalone).current_dir(&fixture.0).arg("--json")), 0);
     assert!(!result.get("native_ready").flag());
-    let human = Command::new(&standalone).current_dir(&fixture.0).output().unwrap();
+    let human = run(Command::new(&standalone).current_dir(&fixture.0));
     assert_eq!(human.status.code(), Some(2)); assert!(human.stdout.is_empty());
     assert!(String::from_utf8(human.stderr).unwrap().contains("CLI_NATIVE_GUI_UNAVAILABLE"));
 }

@@ -48,8 +48,8 @@ impl DocumentDisplayPlan {
         self.display_list.reading_order()
     }
 
-    pub fn bounds(&self) -> (f32, f32) {
-        self.display_list.bounds()
+    pub fn bounds(&self) -> franken_markdown::DisplayRect {
+        self.display_list.total_bounds()
     }
 
     pub fn unresolved_assets(&self) -> &[AssetRequest] {

@@ -12,7 +12,7 @@ search = ["source", "dep:fcb-search"]
 snapshot = ["search", "analysis", "dep:fcb-store"]
 map = ["dep:fcb-map"]
 analysis = ["dep:fcb-analysis"]
-markdown = []
+markdown = ["dep:fcb-document"]
 view = []
 runtime = []
 persistence = []
@@ -25,6 +25,7 @@ fcb-search = { path = "../fcb-search", optional = true }
 fcb-store = { path = "../fcb-store", optional = true }
 fcb-map = { path = "../fcb-map", optional = true }
 fcb-analysis = { path = "../fcb-analysis", optional = true }
+fcb-document = { path = "../fcb-document", optional = true }
 
 [dev-dependencies]
 fcb-test-support = { path = "../fcb-test-support" }
