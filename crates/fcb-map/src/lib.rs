@@ -10,6 +10,14 @@
 //! [`repair`].
 
 mod repair;
+pub mod atlas;
+pub mod camera;
+pub mod visible;
+
+pub use atlas::{AtlasBuildLimits, AtlasError, AtlasIndex, AtlasNodeId};
+pub use camera::{Camera2D, CameraError};
+pub use visible::{AggregateReason, AtlasDetail, AtlasHit, LodThresholds, PresentedAtlas,
+    VisibleLimits, VisibleParcel, VisiblePlan, VisibleQuery, VisibleState, VisibleStats};
 
 use std::collections::BTreeMap;
 
@@ -519,7 +527,7 @@ fn pack_row(
         let rest = Rect2D::from_xywh(
             rect.min_x(),
             rect.min_y() + thickness,
-            rect.size().width(),
+            (rect.size().width()).max(0.0),
             (rect.size().height() - thickness).max(0.0),
         )?;
         Ok((placed, rest))
