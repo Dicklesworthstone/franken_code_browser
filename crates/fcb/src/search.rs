@@ -4,8 +4,10 @@
 //!
 //! Content search uses retained captures, `EphemeralIndex`, and `IndexedQuery`.
 //! Path navigation uses `PathIndex` and `PathSearch` without loading source.
-//! Both take explicit resource budgets and run on the host's worker; neither
-//! creates a runtime, window, filesystem grant, or persistent store.
+//! Demand-read `ObservedExtent` values retain only requested source ranges;
+//! `ExtentView` and `ExtentQuery` read/search those bytes without filling holes.
+//! All worker operations take explicit bounds; none creates a runtime, window,
+//! filesystem grant, or persistent store.
 //!
 //! A content hit opens its searched capture. A path result instead identifies
 //! a file to capture explicitly; it does not pretend to pin unread source.
@@ -13,6 +15,13 @@
 
 pub mod reader;
 pub mod reading_window;
+pub mod extents;
+pub mod extent_query;
+pub use extents::{ExtentConsistency, ExtentError, ExtentReadState, ExtentReadStats,
+    ExtentStepBudget, ExtentWindowRequest, FileExtentRead, FileRangeReader,
+    ObservedExtent, ExtentView, ExtentViewError, ExtentText};
+pub use extent_query::{ExtentMatch, ExtentQuery, ExtentQueryError, ExtentQueryInput,
+    ExtentQueryOptions, ExtentQueryState};
 pub use reader::{ReaderError, ReaderIndexProgress, ReaderLimits, ReadingAnchor,
     ReadingSeek, ReadingSeekState, ReadingTarget, SourceReader};
 pub use reading_window::{LineEnding, ReadingLine, ReadingSelection, ReadingWindow, ReadingWindowOptions};
@@ -78,7 +87,6 @@ impl PreparedSearchCapture {
     pub fn document(&self) -> SearchDocument<'_> {
         SearchDocument::new(self.source.file(), self.source.logical_path(), &self.capture)
     }
-
     /// Read the exact original bytes named by a verified hit. Decoded UTF-8
     /// ranges are deliberately not used for slicing UTF-16 or arbitrary bytes.
     pub fn hit_bytes(&self, hit: &SearchMatch) -> Result<&[u8], FcbError> {
