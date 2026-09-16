@@ -31,6 +31,7 @@ pub mod ignore;
 pub mod line_index;
 pub mod path;
 pub mod restoration;
+pub mod old_anchor;
 pub mod root;
 pub mod snapshot;
 
