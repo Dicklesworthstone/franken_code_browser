@@ -10,6 +10,7 @@ dependencies = [
  "fcb-map",
  "fcb-search",
  "fcb-source",
+ "fcb-store",
  "fcb-test-support",
 ]
 

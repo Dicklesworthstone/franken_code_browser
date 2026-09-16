@@ -9,6 +9,7 @@ publish = false
 default = []
 source = ["dep:fcb-source"]
 search = ["source", "dep:fcb-search"]
+snapshot = ["search", "dep:fcb-store"]
 map = ["dep:fcb-map"]
 analysis = ["dep:fcb-analysis"]
 markdown = []
@@ -21,6 +22,7 @@ macos-metal = []
 fcb-core = { path = "../fcb-core" }
 fcb-source = { path = "../fcb-source", optional = true }
 fcb-search = { path = "../fcb-search", optional = true }
+fcb-store = { path = "../fcb-store", optional = true }
 fcb-map = { path = "../fcb-map", optional = true }
 fcb-analysis = { path = "../fcb-analysis", optional = true }
 

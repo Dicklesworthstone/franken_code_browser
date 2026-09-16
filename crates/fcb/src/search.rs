@@ -23,6 +23,9 @@ pub mod extent_navigation;
 pub mod workspace;
 pub mod streaming;
 pub mod file_search;
+/// Explicit source snapshot exports and offline restoration; no implicit I/O.
+#[cfg(feature = "snapshot")]
+pub mod snapshot;
 pub use streaming::{ReaderSearch, StreamReadError, StreamReadOptions, StreamReadReport,
     StreamReadState, StreamReadStats, StreamReadStep, StreamingHit, StreamingMode, StreamingNeedle};
 pub use file_search::{FileSearch, FileSearchError, FileSearchReport};
