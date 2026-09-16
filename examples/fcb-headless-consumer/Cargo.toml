@@ -1,0 +1,19 @@
+[package]
+name = "fcb-headless-consumer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Standalone external workspace: proves the FCB crates are consumable from
+# outside the main workspace with no dev-feature leakage. Own [workspace]
+# table keeps cargo from auto-nesting this into the root workspace.
+
+[workspace]
+
+[dependencies]
+fcb = { path = "../../crates/fcb" }
+fcb-core = { path = "../../crates/fcb-core" }
+fcb-source = { path = "../../crates/fcb-source" }
+fcb-search = { path = "../../crates/fcb-search" }
+fcb-map = { path = "../../crates/fcb-map" }

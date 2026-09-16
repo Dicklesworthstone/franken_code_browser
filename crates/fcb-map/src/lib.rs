@@ -13,9 +13,9 @@ mod repair;
 
 use std::collections::BTreeMap;
 
-use fcb_core::{
-    ArenaOwnerId, CoreError, LayoutRevision, Point2D, Rect2D, RootId, Size2D,
-};
+use fcb_core::{ArenaOwnerId, CoreError, Point2D, Rect2D, RootId};
+
+pub use fcb_core::{LayoutRevision, Size2D};
 
 pub use repair::{DisplacementBudget, LayoutArchive, RepairReport};
 
