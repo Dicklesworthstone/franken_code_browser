@@ -12,8 +12,10 @@
 //! Native identities never pass through lossy strings or escaped labels.
 
 pub mod reader;
+pub mod reading_window;
 pub use reader::{ReaderError, ReaderIndexProgress, ReaderLimits, ReadingAnchor,
     ReadingSeek, ReadingSeekState, ReadingTarget, SourceReader};
+pub use reading_window::{LineEnding, ReadingLine, ReadingSelection, ReadingWindow, ReadingWindowOptions};
 
 pub use fcb_search::*;
 pub use fcb_search::paths::{IndexedPath, PathCase, PathEntry, PathIndex, PathIndexLimits,
