@@ -3,22 +3,10 @@
 //! Raw path identities, normalized relative paths, escaped presentation,
 //! and URI decoding (FCB-009.A).
 //!
-//! # Invariants
-//!
-//! 1. **Raw path identity is byte-authoritative**: paths preserve original raw
-//!    bytes without lossy Unicode conversions. Two paths differing in case
-//!    (e.g., `test.rs` and `Test.rs`) or raw byte representations have distinct
-//!    identities.
-//! 2. **Root boundary confinement**: a [`NormalizedPath`] is always relative to
-//!    an authorized root. It strictly rejects `..` upward traversal, absolute
-//!    prefixes, empty segments (`//`), and null bytes (`\0`).
-//! 3. **Escape presentation for untrusted filenames**: filenames containing
-//!    newlines, control characters, ANSI escapes, or Unicode bidirectional (bidi)
-//!    formatting controls (`\u{202A}`–`\u{202E}`, `\u{2066}`–`\u{2069}`, etc.)
-//!    are escaped in display strings to prevent line forgery or layout tampering.
-//! 4. **No escalation via encoded paths**: URI decoding resolves percent-encoded
-//!    bytes once before confinement checks. Encoded `..` (e.g. `%2e%2e`) and
-//!    remote `file:` authorities are refused.
+//! Raw paths preserve bytes and case. External/URI path normalization is a
+//! separate operation from composing native directory entries: on Unix a
+//! backslash or a colon is an ordinary filename byte, not a path separator.
+//! Neither representation establishes race-safe native filesystem confinement.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -142,13 +130,11 @@ impl From<PathBuf> for RawPath {
     }
 }
 
-/// A validated, normalized relative path strictly confined within a root.
-///
-/// Guarantees:
-/// - Relative path: does not begin with `/` or Windows drive letter.
-/// - Does not contain empty segments (`//`), `.` segments, or `..` upward traversals.
-/// - Contains no null bytes (`\0`).
-/// - Uses `/` as canonical segment separator.
+/// A validated root-relative path and its authoritative component boundaries.
+/// No component is empty, `.` or `..`, and there are no NUL bytes. External
+/// paths passed to `new` normalize slash/backslash separators and refuse drive
+/// prefixes. Native Unix directory-entry constructors preserve backslashes and
+/// drive-looking names as literal bytes and NEVER normalize them into paths.
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NormalizedPath {
     raw: RawPath,
@@ -156,7 +142,8 @@ pub struct NormalizedPath {
 }
 
 impl NormalizedPath {
-    /// Validates and normalizes raw path bytes into a root-relative path.
+    /// Validates and normalizes external path bytes into a root-relative path.
+    /// Filesystem enumeration must use the native directory-entry constructors.
     pub fn new(raw: impl Into<RawPath>) -> Result<Self, SourceError> {
         let raw = raw.into();
         let bytes = raw.as_bytes();
@@ -164,18 +151,12 @@ impl NormalizedPath {
         if bytes.is_empty() {
             return Err(SourceError::PathEscape);
         }
-
-        // Refuse null bytes
         if bytes.contains(&0) {
             return Err(SourceError::EncodingError);
         }
-
-        // Refuse absolute paths (starts with / or \)
         if bytes.starts_with(b"/") || bytes.starts_with(b"\\") {
             return Err(SourceError::PathEscape);
         }
-
-        // Refuse Windows drive prefixes like `C:`
         if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
             return Err(SourceError::PathEscape);
         }
@@ -184,31 +165,18 @@ impl NormalizedPath {
         let mut canonical_bytes = Vec::with_capacity(bytes.len());
 
         for chunk in bytes.split(|b| *b == b'/' || *b == b'\\') {
-            if chunk.is_empty() {
-                // Empty segments from leading/trailing or repeated separators (e.g. `foo//bar`)
-                // are rejected to avoid ambiguity or canonicalization bypasses.
+            if chunk.is_empty() || chunk == b"." || chunk == b".." {
                 return Err(SourceError::PathEscape);
             }
-            if chunk == b"." {
-                // Current directory markers in paths are rejected to enforce clean paths.
-                return Err(SourceError::PathEscape);
-            }
-            if chunk == b".." {
-                // Upward traversal is strictly forbidden in root-confined paths.
-                return Err(SourceError::PathEscape);
-            }
-
             if !canonical_bytes.is_empty() {
                 canonical_bytes.push(b'/');
             }
             canonical_bytes.extend_from_slice(chunk);
             segments.push(RawPath::from_bytes(chunk));
         }
-
         if segments.is_empty() {
             return Err(SourceError::PathEscape);
         }
-
         Ok(Self {
             raw: RawPath::from_bytes(canonical_bytes),
             segments,
@@ -227,20 +195,40 @@ impl NormalizedPath {
         &self.segments
     }
 
-    /// Append one directory-entry name, rejecting separators and traversal names.
+    /// Append one native directory-entry name, without URI/path normalization.
+    /// On Unix only slash separates components; backslashes remain filename data.
     pub fn join_segment(&self, segment: &[u8]) -> Result<Self, SourceError> {
         validate_dirent_name(segment)?;
-        let mut bytes = Vec::with_capacity(self.raw.len() + 1 + segment.len());
+        let length = self.raw.len().checked_add(1).and_then(|n| n.checked_add(segment.len()))
+            .ok_or(SourceError::PayloadTooLarge)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(length).map_err(|_| SourceError::PayloadTooLarge)?;
         bytes.extend_from_slice(self.raw.as_bytes());
         bytes.push(b'/');
         bytes.extend_from_slice(segment);
-        Self::new(RawPath::from_bytes(bytes))
+        #[cfg(unix)]
+        {
+            let mut segments = Vec::new();
+            segments.try_reserve_exact(self.segments.len() + 1).map_err(|_| SourceError::PayloadTooLarge)?;
+            segments.extend(self.segments.iter().cloned());
+            segments.push(RawPath::from_bytes(segment));
+            Ok(Self { raw: RawPath::from_bytes(bytes), segments })
+        }
+        #[cfg(not(unix))]
+        { Self::new(RawPath::from_bytes(bytes)) }
     }
 
-    /// Build a root-relative path from a single directory-entry name.
+    /// Build a root-relative path from a native directory-entry name. Never
+    /// reinterpret a Unix filename such as `a\b` as the nested path `a/b`.
     pub fn from_dirent_name(segment: &[u8]) -> Result<Self, SourceError> {
         validate_dirent_name(segment)?;
-        Self::new(RawPath::from_bytes(segment.to_vec()))
+        #[cfg(unix)]
+        {
+            let raw = RawPath::from_bytes(segment);
+            Ok(Self { raw: raw.clone(), segments: vec![raw] })
+        }
+        #[cfg(not(unix))]
+        { Self::new(RawPath::from_bytes(segment.to_vec())) }
     }
 
     pub fn as_str(&self) -> Result<&str, SourceError> {
@@ -258,7 +246,7 @@ fn validate_dirent_name(segment: &[u8]) -> Result<(), SourceError> {
         || segment == b".."
         || segment.contains(&0)
         || segment.contains(&b'/')
-        || segment.contains(&b'\\')
+        || (!cfg!(unix) && segment.contains(&b'\\'))
     {
         return Err(SourceError::PathEscape);
     }
@@ -277,87 +265,31 @@ impl fmt::Display for NormalizedPath {
     }
 }
 
-/// Formatter that renders untrusted path bytes safely.
-///
-/// Escapes:
-/// - ASCII control characters (`\n`, `\r`, `\t`, `\0`, `\x01`..`\x1f`, `\x7f`)
-/// - ANSI escape sequence initiator `\x1b`
-/// - Unicode bidirectional control characters (RLO, LRO, RLE, LRE, PDF, RLI, LRI, FSI, PDI, ALM, LRM, RLM)
-/// - Invalid UTF-8 byte sequences
+/// Formatter that renders untrusted path bytes safely. Control characters,
+/// backslashes, Unicode direction controls and invalid bytes are escaped even
+/// in valid UTF-8 runs followed by a malformed byte. Each run is scanned once.
 pub struct EscapedPathDisplay<'a> {
     bytes: &'a [u8],
 }
 
-impl<'a> fmt::Display for EscapedPathDisplay<'a> {
+impl fmt::Display for EscapedPathDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut i = 0;
-        while i < self.bytes.len() {
-            let byte = self.bytes[i];
-
-            // 1. Check standard ASCII control characters
-            match byte {
-                b'\n' => {
-                    write!(f, "\\n")?;
-                    i += 1;
-                    continue;
+        let mut rest = self.bytes;
+        while !rest.is_empty() {
+            match std::str::from_utf8(rest) {
+                Ok(text) => {
+                    for ch in text.chars() { write_path_char(f, ch)?; }
+                    break;
                 }
-                b'\r' => {
-                    write!(f, "\\r")?;
-                    i += 1;
-                    continue;
-                }
-                b'\t' => {
-                    write!(f, "\\t")?;
-                    i += 1;
-                    continue;
-                }
-                b'\0' => {
-                    write!(f, "\\0")?;
-                    i += 1;
-                    continue;
-                }
-                b'\\' => {
-                    write!(f, "\\\\")?;
-                    i += 1;
-                    continue;
-                }
-                0x01..=0x1f | 0x7f => {
-                    write!(f, "\\x{:02x}", byte)?;
-                    i += 1;
-                    continue;
-                }
-                _ => {}
-            }
-
-            // 2. Check UTF-8 scalar values and Unicode directional controls
-            match std::str::from_utf8(&self.bytes[i..]) {
-                Ok(valid_str) => {
-                    let ch = valid_str.chars().next().unwrap();
-                    let ch_len = ch.len_utf8();
-                    if is_bidi_or_formatting_control(ch) {
-                        write!(f, "\\u{{{:x}}}", ch as u32)?;
-                    } else {
-                        write!(f, "{}", ch)?;
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    // valid_up_to is a verified UTF-8 boundary; no unchecked cast.
+                    if let Ok(text) = std::str::from_utf8(&rest[..valid]) {
+                        for ch in text.chars() { write_path_char(f, ch)?; }
                     }
-                    i += ch_len;
-                }
-                Err(e) => {
-                    let valid_up_to = e.valid_up_to();
-                    if valid_up_to > 0 {
-                        let valid_slice = &self.bytes[i..i + valid_up_to];
-                        for ch in std::str::from_utf8(valid_slice).unwrap().chars() {
-                            if is_bidi_or_formatting_control(ch) {
-                                write!(f, "\\u{{{:x}}}", ch as u32)?;
-                            } else {
-                                write!(f, "{}", ch)?;
-                            }
-                        }
-                        i += valid_up_to;
-                    } else {
-                        // Invalid byte
-                        write!(f, "\\x{:02x}", byte)?;
-                        i += 1;
-                    }
+                    let bad = error.error_len().unwrap_or(rest.len() - valid);
+                    for byte in &rest[valid..valid + bad] { write!(f, "\\x{byte:02x}")?; }
+                    rest = &rest[valid + bad..];
                 }
             }
         }
@@ -365,7 +297,18 @@ impl<'a> fmt::Display for EscapedPathDisplay<'a> {
     }
 }
 
-impl<'a> fmt::Debug for EscapedPathDisplay<'a> {
+fn write_path_char(f: &mut fmt::Formatter<'_>, ch: char) -> fmt::Result {
+    match ch {
+        '\n' => f.write_str("\\n"), '\r' => f.write_str("\\r"),
+        '\t' => f.write_str("\\t"), '\0' => f.write_str("\\0"),
+        '\\' => f.write_str("\\\\"),
+        ch if ch.is_ascii_control() => write!(f, "\\x{:02x}", ch as u32),
+        ch if ch.is_control() || is_bidi_or_formatting_control(ch) => write!(f, "\\u{{{:x}}}", ch as u32),
+        ch => write!(f, "{ch}"),
+    }
+}
+
+impl fmt::Debug for EscapedPathDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "\"{}\"", self)
     }
@@ -511,8 +454,6 @@ mod tests {
         assert!(!rendered.contains('\n'));
         assert!(!rendered.contains('\r'));
         assert_eq!(rendered, "line1\\nline2\\rline3\\tline4");
-
-        // Bidi override injection attempt (RLO = \u{202E})
         let bidi_path = RawPath::from_str("safe_\u{202E}txt.exe");
         let bidi_rendered = bidi_path.display_escaped().to_string();
         assert!(!bidi_rendered.contains('\u{202E}'));
@@ -523,16 +464,39 @@ mod tests {
     fn decode_uri_path_resolves_and_confines() {
         let valid = decode_uri_path("src%2Fmodel%2Fstate.rs").unwrap();
         assert_eq!(valid.as_bytes(), b"src/model/state.rs");
-
         let file_uri = decode_uri_path("file:///workspace/project/Cargo.toml").unwrap();
         assert_eq!(file_uri.as_bytes(), b"workspace/project/Cargo.toml");
-
-        // Encoded traversal attempts
         assert_eq!(decode_uri_path("%2e%2e/secret.key"), Err(SourceError::PathEscape));
         assert_eq!(decode_uri_path("foo/%2E%2E/secret.key"), Err(SourceError::PathEscape));
         assert_eq!(decode_uri_path("file://remote-host/repo/file.rs"), Err(SourceError::PathEscape));
-
-        // Embedded null
         assert_eq!(decode_uri_path("foo%00bar.rs"), Err(SourceError::EncodingError));
+    }
+
+    #[test]
+    fn malformed_suffix_cannot_bypass_control_escaping_in_a_valid_prefix() {
+        let raw = RawPath::from_bytes(b"a\n\x1b[0m\\x\xff\r\x80".as_slice());
+        let display = raw.display_escaped().to_string();
+        assert_eq!(display, "a\\n\\x1b[0m\\\\x\\xff\\r\\x80");
+        assert!(!display.chars().any(char::is_control));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_directory_entries_do_not_alias_external_path_syntax() {
+        let native = NormalizedPath::from_dirent_name(b"a\\b.rs").unwrap();
+        let nested = NormalizedPath::new("a/b.rs").unwrap();
+        assert_ne!(native, nested);
+        assert_eq!(native.segments().len(), 1);
+        assert_eq!(native.as_bytes(), b"a\\b.rs");
+        let drive_looking = NormalizedPath::from_dirent_name(b"C:source.rs").unwrap();
+        assert_eq!(drive_looking.as_bytes(), b"C:source.rs");
+        assert!(NormalizedPath::new("C:source.rs").is_err());
+        let joined = native.join_segment(b"child\\name").unwrap();
+        assert_eq!(joined.as_bytes(), b"a\\b.rs/child\\name");
+        assert_eq!(joined.segments().len(), 2);
+        for invalid in [b"".as_slice(), b".", b"..", b"a/b", b"nul\0"] {
+            assert!(NormalizedPath::from_dirent_name(invalid).is_err());
+            assert!(native.join_segment(invalid).is_err());
+        }
     }
 }
