@@ -7,11 +7,14 @@
 //! languages, and fact capability boundary enforcement ensuring highlighters and
 //! heuristic candidates never masquerade as proven compiler semantics.
 
+pub mod comparison;
 pub mod extractor;
 pub mod facts;
 pub mod inspector;
 pub mod outline;
 
+pub use comparison::{CaptureComparison, ComparisonError, ComparisonLimits, ComparisonQuality,
+    ComparisonRelation, ComparisonStats, Correspondence, CorrespondenceKind};
 pub use extractor::{ExtractorLimits, OutlineExtractor};
 pub use facts::{FactAuditError, FactAuditor, SourceFact, SourceFactKind};
 pub use inspector::{
