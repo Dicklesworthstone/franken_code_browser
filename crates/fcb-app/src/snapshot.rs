@@ -14,7 +14,7 @@ use fcb::search::{CaptureRequest, CompleteCapture, ExtentConsistency, ExtentRead
     FileRangeReader, IndexLimits, ParsedQuery, QueryOptions, RawPath, ResourceBudget, RootId,
     SearchCoverage, SearchManifestId};
 use fcb::search::workspace::{RootGrant, WorkspaceCatalog, WorkspaceCaptures, WorkspaceLimits, WorkspaceStage};
-use fcb::search::snapshot::{SavedSourceError, SavedWorkspace, SnapshotBytes, SnapshotData, SnapshotError,
+use fcb::search::snapshot::{SavedSourceError, SavedWorkspace, SnapshotData, SnapshotError,
     SnapshotLimits, SnapshotView, export_workspace, MAX_SNAPSHOT_BYTES};
 use fcb_core::ResourceLease;
 use crate::{AppError, MANAGED_BYTES, SCHEMA, EXIT_OK, EXIT_NO_MATCH, EXIT_ERROR, EXIT_PARTIAL, EXIT_CANCELED,
@@ -204,7 +204,7 @@ fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBudget, effec
     if settings.mode == Mode::Inspect { return inspect(settings, view, out, canceled); }
     let restored = SavedWorkspace::restore(view, SearchManifestId::new(owner(), 1).map_err(AppError::from)?,
         file_id(), revision(), budget, allocation(105), &mut *canceled)?;
-    drop(input); // All needed source bytes now belong to the restored owner.
+    drop(input);
     search(settings, &restored, out, budget, canceled)
 }
 fn begin(out: &mut Output, command: &str) -> Result<(), OutputError> {
@@ -250,7 +250,7 @@ fn save(settings: &Settings, out: &mut Output, budget: &ResourceBudget, effect: 
     if settings.json {
         begin(out, "snapshot-save")?; out.literal(",\"effect\":")?; out.quoted(effect.name())?;
         out.literal(",\"destination\":")?; out.path(&destination)?;
-        summary(out, view)?;
+        summary(out, view, true)?;
         out.literal(",\"payload_bytes_read\":")?; out.integer(io.bytes)?;
         out.literal(",\"read_calls\":")?; out.integer(io.calls)?;
         out.literal(",\"archive_bytes\":")?; out.integer(encoded.bytes().len() as u64)?;
@@ -360,9 +360,10 @@ fn load(path: &Path, budget: &ResourceBudget, canceled: &mut impl FnMut() -> boo
     }
     Ok(Loaded { bytes, _lease: lease })
 }
-fn summary(out: &mut Output, view: SnapshotView<'_>) -> Result<(), OutputError> {
-    out.literal(",\"source_scope\":\"saved-observations-only\",\"live_roots_accessed\":false,\"snapshot_digest\":")?;
-    out.quoted(&view.digest().to_hex())?;
+fn summary(out: &mut Output, view: SnapshotView<'_>, live_roots_accessed: bool) -> Result<(), OutputError> {
+    out.literal(",\"source_scope\":\"saved-observations-only\",\"live_roots_accessed\":")?;
+    out.boolean(live_roots_accessed)?;
+    out.literal(",\"snapshot_digest\":")?; out.quoted(&view.digest().to_hex())?;
     out.literal(",\"policy\":")?; out.quoted(view.policy())?;
     out.literal(",\"discovery_complete\":")?; out.boolean(view.discovery_complete())?;
     out.literal(",\"known_files\":")?; out.integer(view.len() as u64)?;
@@ -373,7 +374,7 @@ fn summary(out: &mut Output, view: SnapshotView<'_>) -> Result<(), OutputError> 
 fn inspect(settings: &Settings, view: SnapshotView<'_>, out: &mut Output,
     canceled: &mut impl FnMut() -> bool) -> Result<u8, Failure> {
     if settings.json {
-        begin(out, "snapshot-inspect")?; summary(out, view)?;
+        begin(out, "snapshot-inspect")?; summary(out, view, false)?;
         out.literal(",\"listing_truncated\":")?; out.boolean(view.len() > settings.limit)?;
         out.literal(",\"files\":[")?;
     } else { out.literal("Saved source observations; no live roots accessed.\n")?; }
