@@ -10,5 +10,5 @@ name = "fcb"
 path = "src/main.rs"
 
 [dependencies]
-fcb = { path = "../fcb", default-features = false, features = ["search"] }
+fcb = { path = "../fcb", default-features = false, features = ["snapshot"] }
 fcb-core = { path = "../fcb-core" }

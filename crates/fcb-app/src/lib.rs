@@ -11,6 +11,7 @@ mod input;
 mod services;
 mod workspace;
 mod whole_file;
+mod snapshot;
 
 use std::{ffi::OsString, io::{Read, Write}};
 use fcb::{ArenaOwnerId, ByteLength, FileId, SourceRevision};
@@ -136,6 +137,11 @@ impl From<FileSearchError> for AppError { fn from(error: FileSearchError) -> Sel
 /// redacted stderr diagnostic follows. No caller process exit or signal occurs.
 pub fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut impl Write,
     stderr: &mut impl Write, mut canceled: impl FnMut() -> bool) -> u8 {
+    // Snapshot save is the explicit source-export route with write-aware
+    // terminal receipts. Keep it separate from read-only cancellation delivery.
+    if arguments.first().is_some_and(|argument| argument == "snapshot") {
+        return snapshot::run(&arguments[1..], stdout, stderr, canceled);
+    }
     let wants_json = args::json_requested(arguments);
     let parsed = args::parse(arguments);
     let budget = match ResourceBudget::new(owner(), ByteLength::new(MANAGED_BYTES)) {
