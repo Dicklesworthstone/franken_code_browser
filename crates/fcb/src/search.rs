@@ -17,6 +17,8 @@ pub mod reader;
 pub mod reading_window;
 pub mod extents;
 pub mod extent_query;
+pub mod extent_navigation;
+pub use extent_navigation::ExtentActivationError;
 pub use extents::{ExtentConsistency, ExtentError, ExtentReadState, ExtentReadStats,
     ExtentStepBudget, ExtentWindowRequest, FileExtentRead, FileRangeReader,
     ObservedExtent, ExtentView, ExtentViewError, ExtentText};
