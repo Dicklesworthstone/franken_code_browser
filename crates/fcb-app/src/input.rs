@@ -103,7 +103,7 @@ fn read_stdin(limit: usize, input: &mut impl Read, budget: &ResourceBudget, path
     bytes.try_reserve_exact(capacity).map_err(|_| AppError::Admission)?;
     if bytes.capacity() > capacity { return Err(AppError::Admission); }
     bytes.resize(capacity, 0);
-    let mut filled = 0;
+    let mut filled: usize = 0;
     let mut calls = 0;
     loop {
         if canceled() { return Err(AppError::Canceled); }
