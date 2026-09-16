@@ -6,11 +6,21 @@ version = 4
 name = "fcb"
 version = "0.1.0"
 dependencies = [
+ "fcb-analysis",
  "fcb-core",
  "fcb-map",
  "fcb-search",
  "fcb-source",
  "fcb-store",
+ "fcb-test-support",
+]
+
+[[package]]
+name = "fcb-analysis"
+version = "0.1.0"
+dependencies = [
+ "fcb-core",
+ "fcb-source",
  "fcb-test-support",
 ]
 

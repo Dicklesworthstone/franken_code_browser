@@ -29,6 +29,9 @@ pub mod snapshot;
 /// File-backed snapshot access, one-member queries, and exact offline reading.
 #[cfg(feature = "snapshot")]
 pub mod paged_snapshot;
+/// Saved-scope comparison and bounded exact old/new source correspondence.
+#[cfg(feature = "snapshot")]
+pub mod snapshot_comparison;
 pub use streaming::{ReaderSearch, StreamReadError, StreamReadOptions, StreamReadReport,
     StreamReadState, StreamReadStats, StreamReadStep, StreamingHit, StreamingMode, StreamingNeedle};
 pub use file_search::{FileSearch, FileSearchError, FileSearchReport};
