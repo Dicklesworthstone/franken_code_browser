@@ -14,6 +14,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fcb-app"
+version = "0.1.0"
+dependencies = [
+ "fcb",
+ "fcb-core",
+]
+
+[[package]]
 name = "fcb-conformance"
 version = "0.1.0"
 

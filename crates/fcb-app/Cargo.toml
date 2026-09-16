@@ -1,0 +1,14 @@
+[package]
+name = "fcb-app"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "fcb"
+path = "src/main.rs"
+
+[dependencies]
+fcb = { path = "../fcb", default-features = false, features = ["search"] }
+fcb-core = { path = "../fcb-core" }

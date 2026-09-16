@@ -42,18 +42,19 @@ pub enum AppError {
 }
 impl AppError {
     pub fn code(self) -> String {
-        match self {
-            Self::Argument(error) => error.code().to_owned(),
-            Self::Output(error) => error.code().to_owned(),
-            Self::Extent(error) => error.code().to_owned(),
-            Self::View(error) => error.to_string(), Self::Query(error) => error.to_string(),
+        let code = match self {
+            Self::Argument(error) => return error.code().to_owned(),
+            Self::Output(error) => return error.code().to_owned(),
+            Self::Extent(error) => return error.code().to_owned(),
+            Self::View(error) => return error.to_string(), Self::Query(error) => return error.to_string(),
             Self::Io => "CLI_SOURCE_IO", Self::UnsupportedPlatform => "CLI_NATIVE_FILE_UNSUPPORTED",
             Self::Symlink => "CLI_SYMLINK_REFUSED", Self::Special => "CLI_SPECIAL_OBJECT_REFUSED",
             Self::Directory => "CLI_DIRECTORY_SCOPE_UNAVAILABLE", Self::InputLimit => "CLI_INPUT_LIMIT",
             Self::IoCallLimit => "CLI_IO_CALL_LIMIT", Self::Canceled => "CLI_CANCELED",
             Self::GuiUnavailable => "CLI_NATIVE_GUI_UNAVAILABLE", Self::InvalidRange => "CLI_INVALID_RANGE",
             Self::Admission => "CLI_RESOURCE_DENIED", Self::SourceChanged => "CLI_SOURCE_CHANGED",
-        }.into()
+        };
+        code.to_owned()
     }
     pub const fn subsystem(self) -> &'static str {
         match self {
@@ -94,6 +95,9 @@ impl AppError {
     pub fn is_canceled(self) -> bool {
         matches!(self, Self::Canceled | Self::Extent(ExtentError::Canceled)
             | Self::View(ExtentViewError::Canceled) | Self::Query(ExtentQueryError::Canceled))
+    }
+    pub const fn retryable(self) -> bool {
+        matches!(self, Self::Io | Self::SourceChanged | Self::Admission)
     }
 }
 impl std::fmt::Display for AppError {
@@ -141,12 +145,16 @@ pub fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut impl Writ
             if error.is_canceled() { EXIT_CANCELED } else { EXIT_ERROR }
         }
     };
-    let delivered = if wants_json || exit == EXIT_OK || exit == EXIT_NO_MATCH || exit == EXIT_PARTIAL {
-        output.deliver(stdout, 4096, || false)
-    } else { output.deliver(stderr, 4096, || false) };
+    let mut delivery_canceled = false;
+    let mut stop = || {
+        if exit != EXIT_CANCELED && canceled() { delivery_canceled = true; true } else { false }
+    };
+    let delivered = if wants_json || matches!(exit, EXIT_OK | EXIT_NO_MATCH | EXIT_PARTIAL) {
+        output.deliver(stdout, 4096, &mut stop)
+    } else { output.deliver(stderr, 4096, &mut stop) };
     if delivered.is_err() {
         let _ = stderr.write(b"CLI_OUTPUT_INTERRUPTED: response delivery incomplete\n");
-        return EXIT_ERROR;
+        return if delivery_canceled { EXIT_CANCELED } else { EXIT_ERROR };
     }
     exit
 }
@@ -177,6 +185,7 @@ fn encode_error(output: &mut Output, json: bool, error: AppError) -> Result<(), 
     output.literal(",\"status\":\"error\",\"complete\":false,\"error\":{\"code\":")?;
     output.quoted(&error.code())?; output.literal(",\"subsystem\":")?; output.quoted(error.subsystem())?;
     output.literal(",\"message\":")?; output.quoted(error.message())?;
-    output.literal(",\"retryable\":false,\"next_action\":")?; output.quoted(error.next_action())?;
+    output.literal(",\"retryable\":")?; output.boolean(error.retryable())?;
+    output.literal(",\"next_action\":")?; output.quoted(error.next_action())?;
     output.literal("}}\n")
 }
