@@ -31,6 +31,38 @@
         "evidence": "fcb_080_production_verification"
       },
       "qualification": "implemented"
+    },
+    {
+      "owner": "franken_macos",
+      "origin": "https://github.com/Dicklesworthstone/franken_macos",
+      "extension": "franken-macos-ownership-kernel",
+      "public_api": [
+        "franken_macos::MainThreadToken",
+        "franken_macos::MetalLayer",
+        "franken_macos::MetalDevice",
+        "franken_macos::OwnershipSnapshot",
+        "franken_macos::callbacks::CallbackCell",
+        "franken_macos::callbacks::RegisteredClassName",
+        "franken_macos::callbacks::InstanceId"
+      ],
+      "source": {
+        "commit": "8c94d49bd817d0fa30e2a005f9ded3ea96b1b94b"
+      },
+      "features": [
+        "std"
+      ],
+      "closure_delta": {
+        "added_packages": [],
+        "removed_packages": []
+      },
+      "upstream_tests": [
+        "scripts/e2e/fcb_003.sh"
+      ],
+      "fcb_consumer": {
+        "route": "crates/fcb/tests/fcb_003_production.rs",
+        "evidence": "fcb_003_production_verification"
+      },
+      "qualification": "implemented"
     }
   ]
 }
