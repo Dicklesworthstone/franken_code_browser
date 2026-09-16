@@ -11,6 +11,7 @@ pub const MAX_ARGUMENT_BYTES: usize = 65_536;
 pub const MAX_SINGLE_ARGUMENT: usize = 16_384;
 pub const MAX_WINDOW_BYTES: usize = 256 * 1024;
 pub const MAX_RESULTS: usize = 4096;
+pub const MAX_SCAN_BYTES: u64 = 1u64 << 40;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Command { Help, Capabilities, Doctor, Inspect, Open, Read, Search, Launch }
@@ -34,6 +35,8 @@ pub struct Arguments {
     pub max_files: usize,
     pub max_file_bytes: usize,
     pub max_total_bytes: usize,
+    pub whole_file: bool,
+    pub max_scan_bytes: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArgumentError { Limit, UnknownCommand, UnknownOption, DuplicateOption, MissingValue,
@@ -66,7 +69,7 @@ pub fn json_requested(args: &[OsString]) -> bool {
         if argument == "--" { break; }
         if argument == "--json" { return true; }
         if matches!(argument.to_str(), Some("--offset" | "--bytes" | "--limit" | "--encoding" | "--text" | "--raw-hex"
-            | "--path" | "--max-files" | "--max-file-bytes" | "--max-total-bytes")) {
+            | "--path" | "--max-files" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes")) {
             cursor += 1;
         }
     }
@@ -86,7 +89,8 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
     let mut parsed = Arguments { command: Command::Launch, json: false, file: None,
         stdin: false, offset: 0, bytes: 64 * 1024, limit: 100, encoding: Encoding::Auto, needle: None,
         workspace: false, include_excluded: false, max_files: 4096,
-        max_file_bytes: 1024 * 1024, max_total_bytes: 32 * 1024 * 1024 };
+        max_file_bytes: 1024 * 1024, max_total_bytes: 32 * 1024 * 1024,
+        whole_file: false, max_scan_bytes: 256 * 1024 * 1024 };
     if args.is_empty() { return Ok(parsed); }
     let mut start = 1;
     parsed.command = match args[0].to_str() {
@@ -114,6 +118,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
                 "--limit" => 16, "--encoding" => 32, "--text" => 64, "--raw-hex" => 128,
                 "--workspace" => 256, "--include-excluded" => 512, "--max-files" => 1024,
                 "--max-file-bytes" => 2048, "--max-total-bytes" => 4096, "--path" => 8192,
+                "--whole-file" => 16384, "--max-scan-bytes" => 32768,
                 _ => return Err(ArgumentError::UnknownOption),
             };
             if seen & bit != 0 { return Err(ArgumentError::DuplicateOption); }
@@ -122,6 +127,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
             if option == "--stdin" { parsed.stdin = true; continue; }
             if option == "--workspace" { parsed.workspace = true; continue; }
             if option == "--include-excluded" { parsed.include_excluded = true; continue; }
+            if option == "--whole-file" { parsed.whole_file = true; continue; }
             let value = args.get(cursor).ok_or(ArgumentError::MissingValue)?; cursor += 1;
             let value = value.to_str().ok_or(ArgumentError::MissingValue)?;
             match option {
@@ -151,6 +157,11 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
                     if value > 64 * 1024 * 1024 { return Err(ArgumentError::Limit); }
                     parsed.max_total_bytes = value as usize;
                 }
+                "--max-scan-bytes" => {
+                    let value = decimal(value)?;
+                    if value > MAX_SCAN_BYTES { return Err(ArgumentError::Limit); }
+                    parsed.max_scan_bytes = value;
+                }
                 "--encoding" => parsed.encoding = match value {
                     "auto" => Encoding::Auto, "utf8" => Encoding::Utf8,
                     "utf16le" => Encoding::Utf16Le, "utf16be" => Encoding::Utf16Be,
@@ -173,6 +184,19 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         }
     }
     if parsed.stdin && parsed.file.is_some() { return Err(ArgumentError::MultipleSources); }
+    if parsed.whole_file {
+        if parsed.command != Command::Search || parsed.stdin || seen & (4 | 8 | 2048 | 4096 | 8192) != 0 {
+            return Err(ArgumentError::IncompatibleOptions);
+        }
+        if parsed.file.is_none() { return Err(ArgumentError::MissingSource); }
+        if !matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Raw(_))) { return Err(ArgumentError::InvalidNeedle); }
+        if matches!(parsed.needle.as_ref(), Some(Needle::Raw(_))) && seen & 32 != 0 {
+            return Err(ArgumentError::IncompatibleOptions);
+        }
+        if !parsed.workspace && seen & (512 | 1024) != 0 { return Err(ArgumentError::IncompatibleOptions); }
+        return Ok(parsed);
+    }
+    if seen & 32768 != 0 { return Err(ArgumentError::IncompatibleOptions); }
     if parsed.workspace {
         if parsed.file.is_none() { return Err(ArgumentError::MissingSource); }
         if !matches!(parsed.command, Command::Inspect | Command::Search)
@@ -311,5 +335,21 @@ mod tests {
             assert!(parse(&args(&input)).is_err(), "{input:?}");
         }
         assert!(!json_requested(&args(&["search", "root", "--workspace", "--path", "--json"])));
+    }
+    #[test]
+    fn whole_file_search_has_explicit_nonconflicting_io_admission() {
+        let options = parse(&args(&["search", "file", "--whole-file", "--text", "needle", "--max-scan-bytes", "4294967297"])).unwrap();
+        assert!(options.whole_file); assert_eq!(options.max_scan_bytes, 4_294_967_297);
+        assert!(parse(&args(&["search", "root", "--workspace", "--whole-file", "--raw-hex", "ff"])).is_ok());
+        for input in [vec!["search", "file", "--whole-file", "--text", "x", "--offset", "0"],
+            vec!["search", "file", "--text", "x", "--max-scan-bytes", "10"],
+            vec!["search", "--stdin", "--whole-file", "--text", "x"],
+            vec!["search", "root", "--workspace", "--whole-file", "--path", "x"],
+            vec!["search", "root", "--workspace", "--whole-file", "--text", "x", "--max-file-bytes", "10"],
+            vec!["inspect", "root", "--whole-file"],
+            vec!["search", "file", "--whole-file", "--raw-hex", "ff", "--encoding", "utf8"]] {
+            assert!(parse(&args(&input)).is_err(), "{input:?}");
+        }
+        assert!(!json_requested(&args(&["search", "file", "--whole-file", "--text", "--json"])));
     }
 }
