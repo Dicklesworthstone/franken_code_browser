@@ -7,18 +7,18 @@
 //! checksum validation refuses incomplete bytes. This is not atomic rename/DB
 //! publication or a qualified power-loss-durability claim.
 
-use std::{ffi::OsString, fs::{self, File, OpenOptions}, io::{self, Read, Write}, path::{Path, PathBuf}, sync::Arc};
+mod paged;
+
+use std::{ffi::OsString, fs::{self, File, OpenOptions}, io::{self, Write}, path::{Path, PathBuf}, sync::Arc};
 use fcb::{ByteLength, ByteOffset, ByteRange};
 use fcb::source::{CancelFlag, SourceError, NormalizedPath};
 use fcb::search::{CaptureRequest, CompleteCapture, ExtentConsistency, ExtentReadState, ExtentStepBudget,
-    FileRangeReader, IndexLimits, ParsedQuery, QueryOptions, RawPath, ResourceBudget, RootId,
-    SearchCoverage, SearchManifestId};
+    FileRangeReader, RawPath, ResourceBudget, RootId, SearchManifestId};
 use fcb::search::workspace::{RootGrant, WorkspaceCatalog, WorkspaceCaptures, WorkspaceLimits, WorkspaceStage};
-use fcb::search::snapshot::{SavedSourceError, SavedWorkspace, SnapshotData, SnapshotError,
-    SnapshotLimits, SnapshotView, export_workspace, MAX_SNAPSHOT_BYTES};
-use fcb_core::ResourceLease;
+use fcb::search::snapshot::{SavedSourceError, SnapshotError, SnapshotLimits, SnapshotView,
+    export_workspace, MAX_SNAPSHOT_BYTES};
 use crate::{AppError, MANAGED_BYTES, SCHEMA, EXIT_OK, EXIT_NO_MATCH, EXIT_ERROR, EXIT_PARTIAL, EXIT_CANCELED,
-    allocation, file_id, generation, owner, revision};
+    allocation, file_id, owner, revision};
 use crate::args::{decimal, MAX_ARGUMENTS, MAX_ARGUMENT_BYTES, MAX_SINGLE_ARGUMENT};
 use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
 use crate::{input, workspace};
@@ -26,16 +26,21 @@ use crate::{input, workspace};
 const MAX_CALLS: u64 = 131_072;
 const HELP: &str = "fcb snapshot save ROOT --output NEW_FILE [--json] [--include-excluded]\n\
 fcb snapshot inspect FILE [--json] [--limit N]\n\
-fcb snapshot search FILE --text LITERAL [--json] [--limit N]\n\
+fcb snapshot search FILE (--text LITERAL | --raw-hex HEX) [--json] [--limit N]\n\
+fcb snapshot read FILE (--member NAME | --member-hex HEX) [--json]\n\
+Read options: --line N OR --offset N; --bytes N --lines N; --raw for original bytes\n\
 Save options: --max-files N --max-file-bytes N --max-total-bytes N\n\
 Explicit plaintext source export; no overwrite, no extraction, no restored root grants.\n\
+Offline reads/search use one verified member at a time after full archive validation.\n\
 Offline completeness describes saved observations, never the current filesystem.\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Mode { Help, Save, Inspect, Search }
+enum Mode { Help, Save, Inspect, Search, Read }
 #[derive(Debug)]
 struct Settings {
     mode: Mode, source: Option<PathBuf>, output: Option<PathBuf>, text: Option<String>,
+    raw_needle: Option<Vec<u8>>, member: Option<Vec<u8>>, offset: u64, line: Option<u64>,
+    window_bytes: usize, lines: usize, raw: bool,
     json: bool, limit: usize, limits: WorkspaceLimits, include_excluded: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,7 +71,8 @@ impl From<SavedSourceError> for Failure {
 }
 
 fn takes_value(text: &str) -> bool {
-    matches!(text, "--output" | "--text" | "--limit" | "--max-files" | "--max-file-bytes" | "--max-total-bytes")
+    matches!(text, "--output" | "--text" | "--raw-hex" | "--limit" | "--max-files" | "--max-file-bytes" | "--max-total-bytes"
+        | "--member" | "--member-hex" | "--offset" | "--line" | "--bytes" | "--lines")
 }
 fn wants_json(args: &[OsString]) -> bool {
     let mut cursor = 0;
@@ -88,11 +94,12 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
     let mode = match args.first().and_then(|arg| arg.to_str()) {
         None | Some("help" | "--help" | "-h") => Mode::Help,
         Some("save") => Mode::Save, Some("inspect") => Mode::Inspect, Some("search") => Mode::Search,
-        _ => return Err(Failure::new("SNAPSHOT_UNKNOWN_COMMAND")),
+        Some("read") => Mode::Read, _ => return Err(Failure::new("SNAPSHOT_UNKNOWN_COMMAND")),
     };
-    let mut settings = Settings { mode, source: None, output: None, text: None, json: false,
+    let mut settings = Settings { mode, source: None, output: None, text: None, raw_needle: None,
+        member: None, offset: 0, line: None, window_bytes: 64 * 1024, lines: 100, raw: false, json: false,
         limit: 100, limits: WorkspaceLimits::default(), include_excluded: false };
-    let mut seen = 0u16;
+    let mut seen = 0u32;
     let mut cursor = usize::from(!args.is_empty());
     let mut positional = false;
     while cursor < args.len() {
@@ -103,27 +110,43 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
             let bit = match option { "--json" => 1, "--output" => 2, "--text" => 4,
                 "--limit" => 8, "--include-excluded" => 16, "--max-files" => 32,
                 "--max-file-bytes" => 64, "--max-total-bytes" => 128,
+                "--member" => 256, "--member-hex" => 512, "--offset" => 1024, "--line" => 2048,
+                "--bytes" => 4096, "--lines" => 8192, "--raw" => 16384, "--raw-hex" => 32768,
                 _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")), };
             if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
             seen |= bit;
             if option == "--json" { settings.json = true; continue; }
             if option == "--include-excluded" { settings.include_excluded = true; continue; }
+            if option == "--raw" { settings.raw = true; continue; }
             let value = args.get(cursor).ok_or_else(|| Failure::new("CLI_MISSING_VALUE"))?; cursor += 1;
             if option == "--output" {
                 if value.is_empty() { return Err(Failure::new("CLI_MISSING_VALUE")); }
                 settings.output = Some(PathBuf::from(value)); continue;
+            }
+            if option == "--member" {
+                if value.is_empty() || settings.member.is_some() { return Err(Failure::new("CLI_INVALID_MEMBER")); }
+                settings.member = Some(RawPath::from_path(&PathBuf::from(value)).as_bytes().to_vec()); continue;
             }
             let text = value.to_str().ok_or_else(|| Failure::new("CLI_INVALID_VALUE"))?;
             if option == "--text" {
                 if text.is_empty() || text.len() > 1024 { return Err(Failure::new("CLI_INVALID_NEEDLE")); }
                 settings.text = Some(text.to_owned()); continue;
             }
+            if option == "--member-hex" {
+                if settings.member.is_some() { return Err(Failure::new("CLI_INVALID_MEMBER")); }
+                settings.member = Some(hex(text, 16_384)?); continue;
+            }
+            if option == "--raw-hex" { settings.raw_needle = Some(hex(text, 1024)?); continue; }
             let number = decimal(text).map_err(|error| Failure::new(error.code()))?;
             match option {
                 "--limit" if number <= 4096 => settings.limit = number as usize,
                 "--max-files" if (1..=65_536).contains(&number) => settings.limits.max_files = number as usize,
                 "--max-file-bytes" if number <= 1024 * 1024 => settings.limits.max_file_bytes = number as usize,
                 "--max-total-bytes" if number <= 64 * 1024 * 1024 => settings.limits.max_source_bytes = number as usize,
+                "--offset" => settings.offset = number,
+                "--line" if number > 0 => settings.line = Some(number),
+                "--bytes" if (4..=256 * 1024).contains(&number) => settings.window_bytes = number as usize,
+                "--lines" if (1..=4096).contains(&number) => settings.lines = number as usize,
                 _ => return Err(Failure::new("CLI_ARGUMENT_LIMIT")),
             }
         } else {
@@ -133,12 +156,26 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
     }
     let valid = match mode {
         Mode::Help => settings.source.is_none() && seen & !1 == 0,
-        Mode::Save => settings.source.is_some() && settings.output.is_some() && seen & (4 | 8) == 0,
+        Mode::Save => settings.source.is_some() && settings.output.is_some() && seen & !(1 | 2 | 16 | 32 | 64 | 128) == 0,
         Mode::Inspect => settings.source.is_some() && seen & !(1 | 8) == 0,
-        Mode::Search => settings.source.is_some() && settings.text.is_some() && seen & !(1 | 4 | 8) == 0,
+        Mode::Search => settings.source.is_some() && (settings.text.is_some() != settings.raw_needle.is_some())
+            && seen & !(1 | 4 | 8 | 32768) == 0,
+        Mode::Read => settings.source.is_some() && settings.member.is_some()
+            && seen & !(1 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384) == 0
+            && seen & (1024 | 2048) != (1024 | 2048)
+            && (!settings.raw || (settings.line.is_none() && seen & 8192 == 0)),
     };
     if !valid { return Err(Failure::new("CLI_INCOMPATIBLE_OPTIONS")); }
     Ok(settings)
+}
+fn hex(text: &str, maximum: usize) -> Result<Vec<u8>, Failure> {
+    if text.is_empty() || text.len() % 2 != 0 || text.len() / 2 > maximum { return Err(Failure::new("CLI_INVALID_HEX")); }
+    let nibble = |b: u8| match b { b'0'..=b'9' => Some(b - b'0'), b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10), _ => None };
+    text.as_bytes().chunks_exact(2).map(|pair| {
+        let a = nibble(pair[0]).ok_or_else(|| Failure::new("CLI_INVALID_HEX"))?;
+        let b = nibble(pair[1]).ok_or_else(|| Failure::new("CLI_INVALID_HEX"))?; Ok((a << 4) | b)
+    }).collect()
 }
 
 /// Separate write-aware delivery: cancellation after a complete synchronized
@@ -199,13 +236,7 @@ fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBudget, effec
         return Ok(EXIT_OK);
     }
     if settings.mode == Mode::Save { return save(settings, out, budget, effect, canceled); }
-    let input = load(settings.source.as_deref().ok_or_else(|| Failure::new("CLI_MISSING_SOURCE"))?, budget, canceled)?;
-    let view = SnapshotView::open(&input.bytes, SnapshotLimits::default(), &mut *canceled)?;
-    if settings.mode == Mode::Inspect { return inspect(settings, view, out, canceled); }
-    let restored = SavedWorkspace::restore(view, SearchManifestId::new(owner(), 1).map_err(AppError::from)?,
-        file_id(), revision(), budget, allocation(105), &mut *canceled)?;
-    drop(input);
-    search(settings, &restored, out, budget, canceled)
+    paged::execute(settings, out, budget, canceled)
 }
 fn begin(out: &mut Output, command: &str) -> Result<(), OutputError> {
     out.literal("{\"schema\":")?; out.quoted(SCHEMA)?;
@@ -246,7 +277,6 @@ fn save(settings: &Settings, out: &mut Output, budget: &ResourceBudget, effect: 
     let complete = view.discovery_complete() && view.captured_files() == view.len();
     catalog.validate_active().map_err(AppError::from)?;
     write_new(&destination, encoded.bytes(), effect, canceled)?;
-    // After the file is complete, response construction/delivery cannot undo it.
     if settings.json {
         begin(out, "snapshot-save")?; out.literal(",\"effect\":")?; out.quoted(effect.name())?;
         out.literal(",\"destination\":")?; out.path(&destination)?;
@@ -290,7 +320,6 @@ fn capture(root: &Path, request: CaptureRequest, path: &NormalizedPath, limit: u
         || extent.consistency() != ExtentConsistency::UnchangedMetadata { return Err(SourceError::MetadataMismatch); }
     CompleteCapture::new(request, length, Arc::from(extent.bytes()))
 }
-
 fn write_new(path: &Path, bytes: &[u8], effect: &mut Effect, canceled: &mut impl FnMut() -> bool) -> Result<(), Failure> {
     if canceled() { return Err(Failure::canceled()); }
     if bytes.len() > MAX_SNAPSHOT_BYTES { return Err(Failure::new("SNAPSHOT_LIMIT")); }
@@ -322,44 +351,6 @@ fn write_new(path: &Path, bytes: &[u8], effect: &mut Effect, canceled: &mut impl
     *effect = Effect::Synced;
     Ok(())
 }
-
-struct Loaded { bytes: Vec<u8>, _lease: ResourceLease }
-fn load(path: &Path, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<Loaded, Failure> {
-    if canceled() { return Err(Failure::canceled()); }
-    let path = input::absolute(path)?;
-    let (mut file, before) = input::open_regular(&path)?;
-    let size = usize::try_from(before.len()).map_err(|_| Failure::new("SNAPSHOT_LIMIT"))?;
-    if size > MAX_SNAPSHOT_BYTES { return Err(Failure::new("SNAPSHOT_LIMIT")); }
-    let lease = budget.try_reserve_managed(owner(), allocation(104), ByteLength::new(size as u64 + 256))
-        .map_err(|_| Failure::new("SNAPSHOT_RESOURCE_DENIED"))?;
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(size).map_err(|_| Failure::new("SNAPSHOT_RESOURCE_DENIED"))?;
-    if bytes.capacity() > size { return Err(Failure::new("SNAPSHOT_RESOURCE_DENIED")); }
-    bytes.resize(size, 0);
-    let mut offset = 0;
-    let mut calls = 0;
-    loop {
-        if canceled() { return Err(Failure::canceled()); }
-        if calls == MAX_CALLS { return Err(Failure::new("SNAPSHOT_READ_CALL_LIMIT")); }
-        calls += 1;
-        let mut extra = [0u8; 1];
-        let end = size.min(offset + 64 * 1024);
-        let target = if offset == size { &mut extra[..] } else { &mut bytes[offset..end] };
-        match file.read(target) {
-            Ok(0) if offset == size => break,
-            Ok(0) => return Err(Failure::new("SNAPSHOT_FILE_CHANGED")),
-            Ok(count) if offset < size && count <= end - offset => offset += count,
-            Ok(_) => return Err(Failure::new("SNAPSHOT_FILE_CHANGED")),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
-            Err(_) => return Err(Failure::new("SNAPSHOT_READ_FAILED")),
-        }
-    }
-    let after = file.metadata().map_err(|_| Failure::new("SNAPSHOT_READ_FAILED"))?;
-    if before.len() != after.len() || matches!((before.modified().ok(), after.modified().ok()), (Some(a), Some(b)) if a != b) {
-        return Err(Failure::new("SNAPSHOT_FILE_CHANGED"));
-    }
-    Ok(Loaded { bytes, _lease: lease })
-}
 fn summary(out: &mut Output, view: SnapshotView<'_>, live_roots_accessed: bool) -> Result<(), OutputError> {
     out.literal(",\"source_scope\":\"saved-observations-only\",\"live_roots_accessed\":")?;
     out.boolean(live_roots_accessed)?;
@@ -370,73 +361,6 @@ fn summary(out: &mut Output, view: SnapshotView<'_>, live_roots_accessed: bool) 
     out.literal(",\"captured_files\":")?; out.integer(view.captured_files() as u64)?;
     out.literal(",\"unavailable_files_count\":")?; out.integer((view.len() - view.captured_files()) as u64)?;
     out.literal(",\"captured_bytes\":")?; out.integer(view.source_bytes() as u64)
-}
-fn inspect(settings: &Settings, view: SnapshotView<'_>, out: &mut Output,
-    canceled: &mut impl FnMut() -> bool) -> Result<u8, Failure> {
-    if settings.json {
-        begin(out, "snapshot-inspect")?; summary(out, view, false)?;
-        out.literal(",\"listing_truncated\":")?; out.boolean(view.len() > settings.limit)?;
-        out.literal(",\"files\":[")?;
-    } else { out.literal("Saved source observations; no live roots accessed.\n")?; }
-    for (ordinal, entry) in view.entries().take(settings.limit).enumerate() {
-        if canceled() { return Err(Failure::canceled()); }
-        let entry = entry?;
-        let path = RawPath::from_bytes(entry.path).to_path_buf();
-        if settings.json {
-            if ordinal != 0 { out.literal(",")?; }
-            out.literal("{\"path\":")?; out.path(&path)?;
-            out.literal(",\"observed_bytes\":")?; out.integer(entry.observed_bytes)?;
-            out.literal(",\"captured\":")?; out.boolean(matches!(entry.data, SnapshotData::Captured(_)))?;
-            out.literal(",\"unavailable_reason\":")?;
-            match entry.data { SnapshotData::Unavailable(reason) => out.quoted(reason)?, _ => out.literal("null")? }
-            out.literal("}")?;
-        } else { out.path(&path)?; out.literal(if matches!(entry.data, SnapshotData::Captured(_)) { " captured\n" } else { " unavailable\n" })?; }
-    }
-    if settings.json { out.literal("]}\n")?; }
-    Ok(if !view.discovery_complete() || view.captured_files() != view.len() || view.len() > settings.limit { EXIT_PARTIAL } else { EXIT_OK })
-}
-fn search(settings: &Settings, saved: &SavedWorkspace, out: &mut Output, budget: &ResourceBudget,
-    canceled: &mut impl FnMut() -> bool) -> Result<u8, Failure> {
-    let inputs = saved.search_inputs(budget, allocation(106), &mut *canceled)?;
-    let index = inputs.index(IndexLimits::default(), budget, allocation(107), &mut *canceled)?;
-    let needle = settings.text.as_deref().ok_or_else(|| Failure::new("CLI_INVALID_NEEDLE"))?;
-    let query = ParsedQuery { primary_needle: needle.to_owned(), is_phrase: true, conjunction_terms: Vec::new(),
-        exclusion_terms: Vec::new(), path_filters: Vec::new(), lang_filters: Vec::new(), raw_query: needle.to_owned() };
-    let report = index.search(&query, QueryOptions::new(generation()).with_max_matches(settings.limit),
-        budget, allocation(108), &mut *canceled).map_err(AppError::from)?;
-    if canceled() { return Err(Failure::canceled()); }
-    let results = report.capture_results();
-    if settings.json {
-        begin(out, "snapshot-search")?;
-        out.literal(",\"source_scope\":\"saved-observations-only\",\"live_roots_accessed\":false,\"identity_scope\":\"response-local\",\"snapshot_digest\":")?;
-        out.quoted(&saved.digest().to_hex())?;
-        out.literal(",\"policy\":")?; out.quoted(saved.policy())?;
-        out.literal(",\"discovery_complete\":")?; out.boolean(saved.discovery_complete())?;
-        out.literal(",\"workspace_complete\":")?; out.boolean(report.is_complete())?;
-        out.literal(",\"truncated\":")?; out.boolean(matches!(results.coverage, SearchCoverage::TruncatedAtLimit { .. }))?;
-        out.literal(",\"unavailable_files_count\":")?; out.integer(report.unavailable_files().len() as u64)?;
-        out.literal(",\"unsupported_text_files_count\":")?; out.integer(results.unsupported_files.len() as u64)?;
-        out.literal(",\"matches_seen\":")?; out.integer(results.total_matches_counted as u64)?;
-        out.literal(",\"hits\":[")?;
-    } else { out.literal(if report.is_complete() { "Complete saved-scope search; no live roots accessed.\n" } else { "PARTIAL saved-scope search; no live roots accessed.\n" })?; }
-    for (ordinal, hit) in results.matches.iter().enumerate() {
-        if canceled() { return Err(Failure::canceled()); }
-        let member = saved.member(hit.file_id).ok_or_else(|| Failure::new("SNAPSHOT_MEMBER_MISSING"))?;
-        let path = member.path().to_path_buf();
-        if settings.json {
-            if ordinal > 0 { out.literal(",")?; }
-            out.literal("{\"file_id\":")?; out.integer(hit.file_id.get())?;
-            out.literal(",\"revision\":")?; out.integer(hit.revision.get())?;
-            out.literal(",\"path\":")?; out.path(&path)?;
-            out.literal(",\"original_range\":")?; out.range(hit.original_byte_range)?;
-            out.literal(",\"matched_text\":")?; out.quoted(&hit.matched_text)?; out.literal("}")?;
-        } else {
-            out.path(&path)?; out.literal(" bytes ")?; out.literal(&hit.original_byte_range.start().get().to_string())?;
-            out.literal("..")?; out.literal(&hit.original_byte_range.end().get().to_string())?; out.literal("\n")?;
-        }
-    }
-    if settings.json { out.literal("]}\n")?; }
-    Ok(if !report.is_complete() { EXIT_PARTIAL } else if results.matches.is_empty() { EXIT_NO_MATCH } else { EXIT_OK })
 }
 
 #[cfg(test)]
@@ -455,6 +379,7 @@ mod tests {
         assert!(!wants_json(&args(&["save", "root", "--output", "--json"])));
         assert!(!wants_json(&args(&["search", "saved", "--text", "--json"])));
         assert!(wants_json(&args(&["search", "saved", "--text", "--json", "--json"])));
+        assert!(!wants_json(&args(&["read", "saved", "--member", "--json"])));
         assert_eq!(parse(&args(&["inspect", "--", "--json"])).unwrap().source.unwrap(), PathBuf::from("--json"));
     }
     #[test]
@@ -462,6 +387,19 @@ mod tests {
         for values in [vec!["search", "saved", "--text", "x", "--include-excluded"],
             vec!["inspect", "saved", "--output", "other"], vec!["save", "root", "--output", "x", "--max-files", "65537"],
             vec!["inspect", "saved", "--limit", "4097"], vec!["search", "saved", "--text", "x", "--text", "y"]] {
+            assert!(parse(&args(&values)).is_err());
+        }
+    }
+    #[test]
+    fn reading_options_preserve_raw_identity_and_reject_ambiguous_coordinates() {
+        let options = parse(&args(&["read", "saved", "--member-hex", "61ff", "--line", "2", "--bytes", "16"])).unwrap();
+        assert_eq!(options.member, Some(vec![b'a', 0xff])); assert_eq!(options.line, Some(2));
+        for values in [vec!["read", "saved"], vec!["read", "saved", "--member", "a", "--line", "0"],
+            vec!["read", "saved", "--member", "a", "--line", "2", "--offset", "0"],
+            vec!["read", "saved", "--member", "a", "--member-hex", "61"],
+            vec!["read", "saved", "--member", "a", "--raw", "--line", "2"],
+            vec!["read", "saved", "--member", "a", "--bytes", "3"],
+            vec!["search", "saved", "--text", "x", "--raw-hex", "78"]] {
             assert!(parse(&args(&values)).is_err());
         }
     }
