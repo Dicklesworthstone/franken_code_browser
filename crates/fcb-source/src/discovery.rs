@@ -281,6 +281,7 @@ pub struct BoundedDiscovery {
     grant: RootGrant,
     limits: DiscoveryLimits,
     ignore: IgnoreMatcher,
+    read_rule_files: bool,
     pending: VecDeque<PendingDir>,
     open: VecDeque<OpenDir>,
     epoch: ScanEpoch,
@@ -318,6 +319,24 @@ impl BoundedDiscovery {
         )
     }
 
+    /// Metadata-only discovery: never reads repository rule files or source
+    /// payloads. The explicitly supplied matcher is the entire exclusion policy.
+    /// This is useful when a consumer must bound all admitted source bytes and
+    /// cannot let nested rule files grow its policy/state behind that budget.
+    /// As with the existing walker, pathname checks are NOT a race-safe sandbox.
+    pub fn open_metadata_only(
+        grant: RootGrant,
+        symlink_policy: SymlinkPolicy,
+        limits: DiscoveryLimits,
+        ignore: IgnoreMatcher,
+    ) -> Result<Self, SourceError> {
+        let mut discovery = Self::open_with_ignore(grant, symlink_policy, limits, ignore)?;
+        discovery.read_rule_files = false;
+        Ok(discovery)
+    }
+
+    pub fn reads_rule_files(&self) -> bool { self.read_rule_files }
+
     /// Same as [`Self::open`], with an explicit ignore matcher. Pass
     /// [`IgnoreMatcher::include_all`] to disable default exclusions.
     pub fn open_with_ignore(
@@ -334,6 +353,7 @@ impl BoundedDiscovery {
             grant,
             limits,
             ignore,
+            read_rule_files: true,
             pending: VecDeque::new(),
             open: VecDeque::new(),
             epoch: ScanEpoch(1),
@@ -386,6 +406,9 @@ impl BoundedDiscovery {
 
     /// Drain the next bounded page. `Ok(None)` means the session has no further
     /// work; inspect [`Self::status`] for completion versus incomplete stop.
+    /// A page may be empty with `more() == true`: rejected names and empty
+    /// directories still consume work. At most four times max_batch_entries
+    /// traversal transitions are processed per page, independently of output.
     pub fn next_batch(
         &mut self,
         cancel: &CancelFlag,
@@ -407,6 +430,8 @@ impl BoundedDiscovery {
         let mut batch_bytes: u64 = 0;
         let mut complete_unsplit_dirs: u32 = 0;
         let mut any_split = false;
+        let mut transitions = 0u64;
+        let max_transitions = u64::from(self.limits.max_batch_entries) * 4;
 
         loop {
             match self.ensure_runnable(cancel) {
@@ -420,15 +445,17 @@ impl BoundedDiscovery {
                 Err(err) => return Err(err),
             }
 
-            if self.batch_full(&entries, batch_bytes) {
+            if self.batch_full(&entries, batch_bytes) || transitions == max_transitions {
                 if self.open.front().is_some_and(|dir| dir.children_emitted > 0) {
                     if let Some(open) = self.open.front_mut() {
                         open.split_across_batches = true;
                     }
                     any_split = true;
                 }
+                if transitions == max_transitions { any_split = true; }
                 break;
             }
+            transitions += 1;
 
             if !self.open.is_empty() {
                 match self.advance_open_dir(&mut entries, &mut batch_bytes, &mut any_split) {
@@ -457,15 +484,9 @@ impl BoundedDiscovery {
             break;
         }
 
-        if entries.is_empty() {
-            if self.queue_empty() {
-                self.finalize_status();
-                return Ok(None);
-            }
-            if self.open.is_empty() {
-                self.finalize_status();
-                return Ok(None);
-            }
+        if entries.is_empty() && self.queue_empty() {
+            self.finalize_status();
+            return Ok(None);
         }
 
         entries.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
@@ -618,7 +639,7 @@ impl BoundedDiscovery {
                 return OpenResult::SkippedUnavailable;
             }
         };
-        self.load_rule_files(pending.rel.as_ref(), &resolved);
+        if self.read_rule_files { self.load_rule_files(pending.rel.as_ref(), &resolved); }
 
         let mut ancestry = pending.ancestry;
         ancestry.push(dir_id);
