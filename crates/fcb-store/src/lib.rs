@@ -26,6 +26,7 @@
 //!   entry reads traverse through `fcb_source`'s qualified confined reader
 //!   under `SymlinkPolicy::DisallowAll`. These are the claims std supports;
 //!   they are documented, not overstated.
+//!
 //! - **Hot/cold equality.** Entries written in this session are retained
 //!   in memory (hot); re-reading from disk (cold) must yield identical
 //!   bytes, and the tests assert it.
@@ -35,6 +36,8 @@
 
 pub mod envelope;
 pub mod namespace;
+/// Explicit, versioned exports of exact source captures and unavailable members.
+pub mod snapshot;
 
 pub use envelope::{
     canonicalize_f32, canonicalize_f64, EnvelopeError, EnvelopeLimits, EnvelopeReader,
