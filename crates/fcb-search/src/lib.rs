@@ -12,6 +12,7 @@ mod capture;
 pub mod index;
 pub mod indexed_query;
 pub mod oracle;
+pub mod paths;
 pub mod query;
 pub mod stream;
 mod text;
