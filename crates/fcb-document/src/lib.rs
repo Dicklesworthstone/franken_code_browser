@@ -14,6 +14,7 @@
 //! document processing to upstream FrankenMarkdown.
 
 pub mod assets;
+pub mod dialect;
 pub mod display_adapter;
 pub mod error;
 pub mod lens;
@@ -23,6 +24,11 @@ pub mod session;
 
 pub use assets::{
     AssetDomain, AuthorizedAssetRequest, BoundedAssetBudgets, BoundedAssetRegistry,
+};
+pub use dialect::{
+    CalloutEvaluation, DialectCapabilityRow, DialectConfig, DialectFeature,
+    DialectSupportLevel, DocumentDialectMatrix, DocumentProfile, HtmlTreatment,
+    TaskItemState,
 };
 pub use display_adapter::DocumentDisplayPlan;
 pub use error::DocumentError;
