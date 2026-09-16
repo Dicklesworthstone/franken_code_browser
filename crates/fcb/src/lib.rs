@@ -12,8 +12,15 @@ pub use frame_plan::{
     FrameEvidenceEvent, FrameEvidenceRing, FramePlan, FrameTimestamps, InteractionResolution,
     PresentationMode, PresentedFrameTracker,
 };
+pub use glyph_atlas::{
+    AtlasError as GlyphAtlasError, AtlasPage, AtlasPageId, AtlasPageKind, AtlasSlot,
+    AtlasSlotId, BoundedAtlasConfig, BoundedGlyphAtlas, BorrowedGlyphRasterKey,
+    GlyphRasterKey, GpuGlyphRef, HintingPolicy, RasterMode, RasterScaleTier,
+    SlotGeneration, SubpixelBin, DEFAULT_ATLAS_PAGE_SIZE, DEFAULT_MAX_ATLAS_PAGES,
+};
 
 pub mod frame_plan;
+pub mod glyph_atlas;
 
 /// Explicit host-neutral source services; enabling this module performs no I/O.
 #[cfg(feature = "source")]
