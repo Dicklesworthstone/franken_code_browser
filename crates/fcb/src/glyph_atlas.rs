@@ -1023,6 +1023,7 @@ impl BoundedGlyphAtlas {
     }
 
     /// Insert or allocate a glyph into the atlas, returning its resident [`GpuGlyphRef`].
+    #[allow(clippy::too_many_arguments)]
     pub fn allocate_and_insert(
         &mut self,
         key: GlyphRasterKey,
@@ -1064,8 +1065,10 @@ impl BoundedGlyphAtlas {
 
         // 1. Try to pack into an existing page of matching kind
         for page_idx in 0..self.pages.len() {
-            if self.pages[page_idx].kind == page_kind {
-                if let Some((x, y)) = self.pages[page_idx].allocate_rect(pixel_width, pixel_height) {
+            if self.pages[page_idx].kind != page_kind {
+                continue;
+            }
+            if let Some((x, y)) = self.pages[page_idx].allocate_rect(pixel_width, pixel_height) {
                     return self.create_slot_and_ref(
                         page_idx,
                         x,
@@ -1080,7 +1083,6 @@ impl BoundedGlyphAtlas {
                         current_frame,
                     );
                 }
-            }
         }
 
         // 2. Try to allocate a new page if under maximum page budget
@@ -1281,9 +1283,7 @@ impl BoundedGlyphAtlas {
                 entries.retain(|(k, _)| k != old_key);
             }
             if self.evicted_keys_history.len() >= 4096 {
-                if let Some(&first) = self.evicted_keys_history.iter().next() {
-                    self.evicted_keys_history.remove(&first);
-                }
+                self.evicted_keys_history.pop_first();
             }
             self.evicted_keys_history.insert(old_hash);
         }
@@ -1430,13 +1430,7 @@ impl BoundedGlyphAtlas {
         }
 
         // 2. Not resident: validate optional fallback ref
-        let valid_fallback = fallback_ref.and_then(|f| {
-            if self.validate_ref(&f).is_ok() {
-                Some(f)
-            } else {
-                None
-            }
-        });
+        let valid_fallback = fallback_ref.filter(|f| self.validate_ref(f).is_ok());
 
         // 3. Enqueue background raster miss request
         let miss_req = RasterMissRequest {

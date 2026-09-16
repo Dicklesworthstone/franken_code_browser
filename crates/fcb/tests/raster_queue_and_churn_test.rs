@@ -401,7 +401,7 @@ fn test_unified_memory_discard_and_recompute_lifecycle() {
         .unwrap();
 
     let mem_after_4 = atlas.memory_accounting();
-    assert_eq!(mem_after_4.allocated_texture_bytes, 64 * 64 * 1); // 4096 bytes
+    assert_eq!(mem_after_4.allocated_texture_bytes, 64 * 64); // 4096 bytes
     assert_eq!(mem_after_4.peak_texture_bytes, 4096);
     assert_eq!(mem_after_4.discarded_texture_bytes, 0);
     assert_eq!(mem_after_4.active_page_count, 1);
@@ -415,7 +415,7 @@ fn test_unified_memory_discard_and_recompute_lifecycle() {
 
     let mem_after_evict = atlas.memory_accounting();
     assert_eq!(mem_after_evict.allocated_texture_bytes, 4096);
-    assert_eq!(mem_after_evict.discarded_texture_bytes, 28 * 28 * 1); // 784 bytes discarded
+    assert_eq!(mem_after_evict.discarded_texture_bytes, 28 * 28); // 784 bytes discarded
     assert_eq!(mem_after_evict.recomputed_glyph_count, 0);
 
     // Now re-request key1: it is recomputed on demand from font source
@@ -428,7 +428,7 @@ fn test_unified_memory_discard_and_recompute_lifecycle() {
     assert_eq!(mem_after_recompute.recomputed_glyph_count, 1);
     assert_eq!(
         mem_after_recompute.discarded_texture_bytes,
-        28 * 28 * 1 + 28 * 28 * 1
+        2 * 28 * 28
     );
 
     // Device reset / teardown: all active page texture memory is discarded
