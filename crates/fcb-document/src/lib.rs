@@ -24,7 +24,8 @@ pub mod session;
 
 pub use assets::{
     AssetDomain, AssetKind, AuthorizedAssetRequest, BoundedAssetBudgets, BoundedAssetRegistry,
-    ImageCodecValidator, ImageFormat, TransclusionPolicy, TransclusionTracker,
+    BoundedImageDecoder, DecodedImage, ImageCacheKey, ImageCodecValidator, ImageFormat,
+    ImageFormatCapabilities, PrivateImageCache, TransclusionPolicy, TransclusionTracker,
 };
 pub use dialect::{
     CalloutEvaluation, DialectCapabilityRow, DialectConfig, DialectFeature,

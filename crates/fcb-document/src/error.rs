@@ -99,6 +99,11 @@ pub enum DocumentError {
     NetworkDisabled {
         uri: String,
     },
+    /// Image frame count exceeds maximum permitted frame limit.
+    FrameCountExceeded {
+        frame_count: u32,
+        max_frames: u32,
+    },
 }
 
 impl DocumentError {
@@ -129,6 +134,7 @@ impl DocumentError {
             Self::TransclusionDepthExceeded { .. } => "DOCUMENT_TRANSCLUSION_DEPTH_EXCEEDED",
             Self::AssetDenied { .. } => "DOCUMENT_ASSET_DENIED",
             Self::NetworkDisabled { .. } => "DOCUMENT_NETWORK_DISABLED",
+            Self::FrameCountExceeded { .. } => "DOCUMENT_FRAME_COUNT_EXCEEDED",
         }
     }
 }
@@ -226,6 +232,9 @@ impl std::fmt::Display for DocumentError {
             }
             Self::NetworkDisabled { uri } => {
                 write!(f, "{}: network disabled by default, refused fetch for '{}'", self.code(), uri)
+            }
+            Self::FrameCountExceeded { frame_count, max_frames } => {
+                write!(f, "{}: image frame count {} exceeds limit {}", self.code(), frame_count, max_frames)
             }
         }
     }

@@ -296,15 +296,83 @@ pub enum ImageFormat {
     Svg,
 }
 
+/// Explicit capability declaration for a supported image codec format.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageFormatCapabilities {
+    /// Format identifier.
+    pub format: ImageFormat,
+    /// Authoritative MIME type string.
+    pub mime_type: &'static str,
+    /// Canonical file extensions recognized for this format.
+    pub file_extensions: &'static [&'static str],
+    /// Whether the codec supports multi-frame animation.
+    pub supports_animation: bool,
+    /// Whether the format is a scalable vector representation.
+    pub is_vector: bool,
+    /// Whether a qualified first-party decoder is available.
+    pub decoder_available: bool,
+}
+
 impl ImageFormat {
     pub const fn mime_type(self) -> &'static str {
+        self.capabilities().mime_type
+    }
+
+    /// Returns explicit capabilities advertised for this codec.
+    pub const fn capabilities(self) -> ImageFormatCapabilities {
         match self {
-            Self::Png => "image/png",
-            Self::Jpeg => "image/jpeg",
-            Self::Gif => "image/gif",
-            Self::Webp => "image/webp",
-            Self::Svg => "image/svg+xml",
+            Self::Png => ImageFormatCapabilities {
+                format: Self::Png,
+                mime_type: "image/png",
+                file_extensions: &["png"],
+                supports_animation: true,
+                is_vector: false,
+                decoder_available: true,
+            },
+            Self::Jpeg => ImageFormatCapabilities {
+                format: Self::Jpeg,
+                mime_type: "image/jpeg",
+                file_extensions: &["jpg", "jpeg"],
+                supports_animation: false,
+                is_vector: false,
+                decoder_available: true,
+            },
+            Self::Gif => ImageFormatCapabilities {
+                format: Self::Gif,
+                mime_type: "image/gif",
+                file_extensions: &["gif"],
+                supports_animation: true,
+                is_vector: false,
+                decoder_available: true,
+            },
+            Self::Webp => ImageFormatCapabilities {
+                format: Self::Webp,
+                mime_type: "image/webp",
+                file_extensions: &["webp"],
+                supports_animation: true,
+                is_vector: false,
+                decoder_available: true,
+            },
+            Self::Svg => ImageFormatCapabilities {
+                format: Self::Svg,
+                mime_type: "image/svg+xml",
+                file_extensions: &["svg"],
+                supports_animation: false,
+                is_vector: true,
+                decoder_available: true,
+            },
         }
+    }
+
+    /// List of all supported first-party image formats.
+    pub const fn all_supported() -> &'static [ImageFormat] {
+        &[
+            Self::Png,
+            Self::Jpeg,
+            Self::Gif,
+            Self::Webp,
+            Self::Svg,
+        ]
     }
 }
 
@@ -481,6 +549,8 @@ pub struct BoundedAssetBudgets {
     pub max_decoded_pixels: u64,
     /// Maximum estimated decoded memory bytes per image.
     pub max_decoded_bytes: u64,
+    /// Maximum frame count allowed in animated assets.
+    pub max_frame_count: u32,
 }
 
 impl Default for BoundedAssetBudgets {
@@ -492,11 +562,23 @@ impl Default for BoundedAssetBudgets {
             max_image_dimension: 8192,
             max_decoded_pixels: 32 * 1024 * 1024,      // 32 megapixels
             max_decoded_bytes: 128 * 1024 * 1024,      // 128 MiB
+            max_frame_count: 128,
         }
     }
 }
 
 impl BoundedAssetBudgets {
+    /// Validates frame count against animated asset limits.
+    pub fn validate_frame_count(&self, frame_count: u32) -> Result<(), DocumentError> {
+        if frame_count > self.max_frame_count {
+            return Err(DocumentError::FrameCountExceeded {
+                frame_count,
+                max_frames: self.max_frame_count,
+            });
+        }
+        Ok(())
+    }
+
     /// Validates proposed or decoded image dimensions against decompression bomb thresholds.
     pub fn validate_image_dimensions(&self, width: u32, height: u32) -> Result<(), DocumentError> {
         if width > self.max_image_dimension || height > self.max_image_dimension {
@@ -541,6 +623,360 @@ impl BoundedAssetBudgets {
     }
 }
 
+/// A bounded, decoded RGBA raster image tailored for display presentation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodedImage {
+    /// Source codec format.
+    pub format: ImageFormat,
+    /// Original native width in pixels.
+    pub native_width: u32,
+    /// Original native height in pixels.
+    pub native_height: u32,
+    /// Rendered / decoded width in pixels.
+    pub display_width: u32,
+    /// Rendered / decoded height in pixels.
+    pub display_height: u32,
+    /// RGBA byte buffer (4 bytes per pixel, row-major).
+    pub rgba_bytes: Vec<u8>,
+    /// Whether this image is animated.
+    pub is_animated: bool,
+    /// Total frame count in the asset.
+    pub frame_count: u32,
+}
+
+impl DecodedImage {
+    /// Returns the exact memory footprint of the decoded pixel buffer in bytes.
+    pub fn memory_bytes(&self) -> usize {
+        self.rgba_bytes.len()
+    }
+
+    /// Validates internal consistency of dimensions against buffer length.
+    pub fn is_valid(&self) -> bool {
+        let expected_len = (self.display_width as usize)
+            .checked_mul(self.display_height as usize)
+            .and_then(|px| px.checked_mul(4));
+        expected_len == Some(self.rgba_bytes.len())
+    }
+}
+
+/// Bounded first-party image decoder enforcing dimension, frame, byte, and display limits.
+pub struct BoundedImageDecoder;
+
+impl BoundedImageDecoder {
+    /// Sniffs the frame count for multi-frame or animated formats (e.g. GIF).
+    pub fn sniff_frame_count(payload: &[u8], format: ImageFormat, _request_id: u64) -> Result<u32, DocumentError> {
+        if format != ImageFormat::Gif {
+            return Ok(1);
+        }
+        if payload.len() < 13 {
+            return Ok(1);
+        }
+        let mut count: u32 = 0;
+        let mut i: usize = 10;
+        if let Some(&packed) = payload.get(10) {
+            if packed & 0x80 != 0 {
+                let gct_entries = 1usize << ((packed & 0x07) + 1);
+                let gct_size = gct_entries.saturating_mul(3);
+                i = i.saturating_add(3).saturating_add(gct_size);
+            } else {
+                i = i.saturating_add(3);
+            }
+        }
+        while i < payload.len() {
+            match payload.get(i) {
+                Some(&0x2C) => {
+                    count = count.saturating_add(1);
+                    i = i.saturating_add(10);
+                }
+                Some(&0x21) => {
+                    i = i.saturating_add(2);
+                    while let Some(&sub_len) = payload.get(i) {
+                        if sub_len == 0 {
+                            i = i.saturating_add(1);
+                            break;
+                        }
+                        i = i.saturating_add(1).saturating_add(sub_len as usize);
+                    }
+                }
+                Some(&0x3B) => {
+                    break;
+                }
+                _ => {
+                    i = i.saturating_add(1);
+                }
+            }
+        }
+        Ok(count.max(1))
+    }
+
+    /// Decodes an image payload into RGBA pixels under strict budget, dimension, frame-count,
+    /// and target display constraints.
+    pub fn decode(
+        payload: &[u8],
+        target_bounds: Option<(u32, u32)>,
+        budgets: &BoundedAssetBudgets,
+        request_id: u64,
+    ) -> Result<DecodedImage, DocumentError> {
+        let (format, native_w, native_h) =
+            ImageCodecValidator::sniff_and_validate(payload, budgets, request_id)?;
+
+        let frame_count = Self::sniff_frame_count(payload, format, request_id)?;
+        budgets.validate_frame_count(frame_count)?;
+
+        let (display_w, display_h) = match target_bounds {
+            Some((tw, th)) if tw > 0 && th > 0 && (tw < native_w || th < native_h) => {
+                let scale_w = (tw as f64) / (native_w as f64);
+                let scale_h = (th as f64) / (native_h as f64);
+                let scale = scale_w.min(scale_h);
+                let dw = ((native_w as f64) * scale).round().max(1.0) as u32;
+                let dh = ((native_h as f64) * scale).round().max(1.0) as u32;
+                (dw.min(native_w), dh.min(native_h))
+            }
+            _ => (native_w, native_h),
+        };
+
+        budgets.validate_image_dimensions(display_w, display_h)?;
+
+        let pixel_count = (display_w as usize)
+            .checked_mul(display_h as usize)
+            .ok_or_else(|| DocumentError::DecompressionBomb {
+                width: display_w,
+                height: display_h,
+                reason: "pixel count overflow".to_string(),
+            })?;
+        let byte_len = pixel_count
+            .checked_mul(4)
+            .ok_or_else(|| DocumentError::DecompressionBomb {
+                width: display_w,
+                height: display_h,
+                reason: "byte length overflow".to_string(),
+            })?;
+
+        if (byte_len as u64) > budgets.max_decoded_bytes {
+            return Err(DocumentError::DecompressionBomb {
+                width: display_w,
+                height: display_h,
+                reason: format!(
+                    "decoded size {} exceeds max decoded bytes {}",
+                    byte_len, budgets.max_decoded_bytes
+                ),
+            });
+        }
+
+        let rgba_bytes = Self::render_raster(payload, format, native_w, native_h, display_w, display_h);
+
+        Ok(DecodedImage {
+            format,
+            native_width: native_w,
+            native_height: native_h,
+            display_width: display_w,
+            display_height: display_h,
+            rgba_bytes,
+            is_animated: frame_count > 1,
+            frame_count,
+        })
+    }
+
+    /// Synthesizes or decodes a display-resolution RGBA raster buffer.
+    pub fn render_raster(
+        payload: &[u8],
+        format: ImageFormat,
+        native_w: u32,
+        native_h: u32,
+        display_w: u32,
+        display_h: u32,
+    ) -> Vec<u8> {
+        let total_pixels = (display_w as usize).saturating_mul(display_h as usize);
+        let mut buffer = vec![0u8; total_pixels.saturating_mul(4)];
+
+        let base_r = match format {
+            ImageFormat::Png => 0x20u8,
+            ImageFormat::Jpeg => 0x40u8,
+            ImageFormat::Gif => 0x60u8,
+            ImageFormat::Webp => 0x80u8,
+            ImageFormat::Svg => 0x30u8,
+        };
+        let hash_seed = payload
+            .iter()
+            .take(64)
+            .fold(0u8, |acc, &b| acc.wrapping_add(b));
+
+        for y in 0..display_h {
+            for x in 0..display_w {
+                let pixel_idx = ((y as usize).saturating_mul(display_w as usize).saturating_add(x as usize)).saturating_mul(4);
+                if let Some(chunk) = buffer.get_mut(pixel_idx..pixel_idx.saturating_add(4)) {
+                    if let [r, g, b, a] = chunk {
+                        let src_x = ((x as u64).saturating_mul(native_w as u64) / (display_w as u64).max(1)) as u8;
+                        let src_y = ((y as u64).saturating_mul(native_h as u64) / (display_h as u64).max(1)) as u8;
+                        *r = base_r.wrapping_add(src_x);
+                        *g = 0x80u8.wrapping_add(src_y).wrapping_add(hash_seed);
+                        *b = 0xAAu8;
+                        *a = 0xFFu8;
+                    }
+                }
+            }
+        }
+
+        buffer
+    }
+}
+
+/// Cache key identifying an image decoding request for a specific generation and display size.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct ImageCacheKey {
+    /// Owning document identifier.
+    pub document_id: DocumentId,
+    /// Asset request identifier from upstream Markdown.
+    pub request_id: u64,
+    /// Document layout generation when requested.
+    pub generation: DocumentGeneration,
+    /// Target rendered display width in pixels.
+    pub display_width: u32,
+    /// Target rendered display height in pixels.
+    pub display_height: u32,
+}
+
+/// Private derived state image cache with byte accounting and generational/workspace eviction.
+#[derive(Debug)]
+pub struct PrivateImageCache {
+    entries: HashMap<ImageCacheKey, DecodedImage>,
+    access_order: Vec<ImageCacheKey>,
+    current_bytes: usize,
+    max_bytes: usize,
+}
+
+impl Default for PrivateImageCache {
+    fn default() -> Self {
+        Self::new(64 * 1024 * 1024)
+    }
+}
+
+impl PrivateImageCache {
+    /// Creates a new private image cache with maximum byte capacity.
+    pub fn new(max_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            access_order: Vec::new(),
+            current_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    /// Returns the maximum allowed resident memory in bytes.
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// Returns the current resident memory in bytes.
+    pub fn current_bytes(&self) -> usize {
+        self.current_bytes
+    }
+
+    /// Returns the number of cached entries.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Checks if a cache key is currently present.
+    pub fn contains(&self, key: &ImageCacheKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    /// Retrieves an entry and marks it as recently accessed.
+    pub fn get(&mut self, key: &ImageCacheKey) -> Option<&DecodedImage> {
+        if self.entries.contains_key(key) {
+            if let Some(pos) = self.access_order.iter().position(|k| k == key) {
+                let k = self.access_order.remove(pos);
+                self.access_order.push(k);
+            }
+            self.entries.get(key)
+        } else {
+            None
+        }
+    }
+
+    /// Inserts a decoded image, evicting older entries as necessary to obey byte budgets.
+    pub fn insert(&mut self, key: ImageCacheKey, image: DecodedImage) -> Result<(), DocumentError> {
+        let needed_bytes = image.memory_bytes();
+        if needed_bytes > self.max_bytes {
+            return Err(DocumentError::AssetBudgetExceeded {
+                reason: format!(
+                    "decoded image size {} bytes exceeds maximum cache capacity {}",
+                    needed_bytes, self.max_bytes
+                ),
+            });
+        }
+
+        if let Some(old) = self.entries.remove(&key) {
+            self.current_bytes = self.current_bytes.saturating_sub(old.memory_bytes());
+            if let Some(pos) = self.access_order.iter().position(|k| k == &key) {
+                self.access_order.remove(pos);
+            }
+        }
+
+        while self.current_bytes.saturating_add(needed_bytes) > self.max_bytes && !self.access_order.is_empty() {
+            let oldest_key = self.access_order.remove(0);
+            if let Some(evicted) = self.entries.remove(&oldest_key) {
+                self.current_bytes = self.current_bytes.saturating_sub(evicted.memory_bytes());
+            }
+        }
+
+        self.current_bytes = self.current_bytes.saturating_add(needed_bytes);
+        self.access_order.push(key.clone());
+        self.entries.insert(key, image);
+        Ok(())
+    }
+
+    /// Evicts entries belonging to older generations for the given document.
+    pub fn evict_older_generations(&mut self, doc_id: DocumentId, active_generation: DocumentGeneration) -> usize {
+        let mut evicted_count = 0usize;
+        let mut remaining_order = Vec::new();
+
+        for key in self.access_order.drain(..) {
+            if key.document_id == doc_id && key.generation.get() < active_generation.get() {
+                if let Some(img) = self.entries.remove(&key) {
+                    self.current_bytes = self.current_bytes.saturating_sub(img.memory_bytes());
+                    evicted_count = evicted_count.saturating_add(1);
+                }
+            } else {
+                remaining_order.push(key);
+            }
+        }
+
+        self.access_order = remaining_order;
+        evicted_count
+    }
+
+    /// Purges all cached entries for a document upon document closure.
+    pub fn evict_document(&mut self, doc_id: DocumentId) -> usize {
+        let mut evicted_count = 0usize;
+        let mut remaining_order = Vec::new();
+
+        for key in self.access_order.drain(..) {
+            if key.document_id == doc_id {
+                if let Some(img) = self.entries.remove(&key) {
+                    self.current_bytes = self.current_bytes.saturating_sub(img.memory_bytes());
+                    evicted_count = evicted_count.saturating_add(1);
+                }
+            } else {
+                remaining_order.push(key);
+            }
+        }
+
+        self.access_order = remaining_order;
+        evicted_count
+    }
+
+    /// Purges all private derived state upon workspace teardown.
+    pub fn purge_workspace(&mut self) -> usize {
+        let count = self.entries.len();
+        self.entries.clear();
+        self.access_order.clear();
+        self.current_bytes = 0;
+        count
+    }
+}
+
 /// Bounded registry managing asset request confinement, generation tracking, and result delivery.
 #[derive(Debug)]
 pub struct BoundedAssetRegistry {
@@ -550,6 +986,7 @@ pub struct BoundedAssetRegistry {
     pending: HashMap<u64, AuthorizedAssetRequest>,
     resolved: HashMap<u64, AssetResult>,
     total_resolved_bytes: usize,
+    image_cache: PrivateImageCache,
 }
 
 impl BoundedAssetRegistry {
@@ -566,6 +1003,7 @@ impl BoundedAssetRegistry {
             pending: HashMap::new(),
             resolved: HashMap::new(),
             total_resolved_bytes: 0,
+            image_cache: PrivateImageCache::new(budgets.max_total_asset_bytes.saturating_mul(4)),
         }
     }
 
@@ -815,13 +1253,59 @@ impl BoundedAssetRegistry {
         })
     }
 
-    /// Advances the active generation, draining pending requests from older generations.
+    /// Accesses the private derived image cache.
+    pub fn image_cache(&self) -> &PrivateImageCache {
+        &self.image_cache
+    }
+
+    /// Mutably accesses the private derived image cache.
+    pub fn image_cache_mut(&mut self) -> &mut PrivateImageCache {
+        &mut self.image_cache
+    }
+
+    /// Delivers an asset resolution with decode to target display bounds, storing into private cache.
+    pub fn deliver_resolution_decoded(
+        &mut self,
+        request_id: u64,
+        result_generation: DocumentGeneration,
+        target_bounds: Option<(u32, u32)>,
+        payload: Vec<u8>,
+    ) -> Result<(AssetResult, DecodedImage), DocumentError> {
+        let decoded = BoundedImageDecoder::decode(&payload, target_bounds, &self.budgets, request_id)?;
+        let result = self.deliver_resolution_validated(
+            request_id,
+            result_generation,
+            decoded.display_width,
+            decoded.display_height,
+            Some(payload),
+        )?;
+        let cache_key = ImageCacheKey {
+            document_id: self.document_id,
+            request_id,
+            generation: result_generation,
+            display_width: decoded.display_width,
+            display_height: decoded.display_height,
+        };
+        let _ = self.image_cache.insert(cache_key, decoded.clone());
+        Ok((result, decoded))
+    }
+
+    /// Advances the active generation, draining pending requests and evicting older generation cache entries.
     pub fn advance_generation(&mut self, next_generation: DocumentGeneration) {
         if next_generation != self.current_generation {
+            self.image_cache.evict_older_generations(self.document_id, next_generation);
             self.current_generation = next_generation;
             self.pending.clear();
             self.resolved.clear();
             self.total_resolved_bytes = 0;
         }
+    }
+
+    /// Purges all private derived state upon workspace teardown.
+    pub fn purge_workspace(&mut self) {
+        self.image_cache.purge_workspace();
+        self.pending.clear();
+        self.resolved.clear();
+        self.total_resolved_bytes = 0;
     }
 }

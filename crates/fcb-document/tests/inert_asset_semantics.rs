@@ -279,6 +279,7 @@ fn test_decompression_bomb_metadata_defense() {
         max_image_dimension: 8192,
         max_decoded_pixels: 32 * 1024 * 1024, // 32 megapixels
         max_decoded_bytes: 128 * 1024 * 1024, // 128 MiB
+        ..BoundedAssetBudgets::default()
     };
 
     // 1. Valid dimensions pass
