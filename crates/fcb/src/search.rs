@@ -26,6 +26,9 @@ pub mod file_search;
 /// Explicit source snapshot exports and offline restoration; no implicit I/O.
 #[cfg(feature = "snapshot")]
 pub mod snapshot;
+/// File-backed snapshot access, one-member queries, and exact offline reading.
+#[cfg(feature = "snapshot")]
+pub mod paged_snapshot;
 pub use streaming::{ReaderSearch, StreamReadError, StreamReadOptions, StreamReadReport,
     StreamReadState, StreamReadStats, StreamReadStep, StreamingHit, StreamingMode, StreamingNeedle};
 pub use file_search::{FileSearch, FileSearchError, FileSearchReport};
