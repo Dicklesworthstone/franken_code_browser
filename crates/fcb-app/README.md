@@ -35,6 +35,12 @@ fcb inspect /path/to/repository --workspace --json
 fcb search /path/to/repository --workspace --text 'pub fn' --json
 fcb search /path/to/repository --workspace --path 'src/lib' --json
 fcb search /path/to/repository --workspace --text needle --max-files 8192 --max-total-bytes 67108864 --json
+
+fcb search huge.rs --whole-file --text needle --json
+fcb search huge.rs --whole-file --text needle --max-scan-bytes 4294967296 --json
+fcb search payload.bin --whole-file --raw-hex 00ff --json
+fcb search /path/to/repository --workspace --whole-file --text 'pub fn' --json
+fcb search /path/to/repository --workspace --whole-file --raw-hex 00ff --json
 ```
 
 By default, the scope is **one explicitly selected file**, not its siblings or
@@ -47,7 +53,81 @@ Persistent index/cache commands, trail export, replay, Markdown preview, regex,
 and the native launcher remain unavailable. This CLI lane does not claim
 completion of all FCB-057 acceptance criteria.
 
-## Workspace inspection and search
+## Whole-file streaming search
+
+`search FILE --whole-file` scans one open regular file continuously from byte
+zero, without first retaining a full capture. With `--workspace`, it searches
+one admitted catalog member at a time. This route handles files larger than the
+default workspace capture limit and does not accumulate the repository's source
+payloads in memory. It uses the existing overlapping KMP matcher and source
+UTF-8/UTF-16 decoder, not an external search executable or a second engine.
+
+Text matching is exact and case-sensitive. A literal is prepared in UTF-8 and
+UTF-16LE/BE; decoder validation, code-unit alignment and actual leading-BOM
+handling make encoded matching equivalent to these exact text semantics.
+Literal matches may cross any number of short reads or buffer boundaries, even
+when the literal is longer than the 16 KiB input buffer. Internal U+FEFF scalars
+remain content. Normalization, case folding and regex are not silently applied.
+`--encoding` can declare `utf8`, `utf16le`, or `utf16be`; automatic detection uses
+the beginning of the SAME continuous observation. `--raw-hex` searches arbitrary
+original bytes and cannot be combined with an encoding override.
+
+The operation's allocations depend on fixed input/decoder scratch, literal
+length and result capacity, not the source file's length. The input buffer is
+16 KiB; decoder scratch and KMP state are separately admitted, so **16 KiB is not
+a claim about total process memory**. Each step performs at most one successful
+read, 32 read attempts including interruptions, and one batch of at most 64
+candidate matches. Both source processing and retained output are bounded.
+Blocking OS calls do not acquire a fabricated wall-clock deadline.
+
+`--max-scan-bytes` controls original-source I/O independently from capture
+capacity. Its default is 256 MiB and its maximum selectable allowance is 1 TiB.
+The command also has a fixed limit of 16,777,216 read attempts. These are
+independent limits: choosing the maximum byte allowance does not bypass the
+read-call limit. In a workspace, byte, read-call and stored-hit budgets are
+**global**, not reset per file; failed reads still spend their work allowance.
+A limit stops with explicit partial coverage and an unexamined-file count.
+
+`--whole-file` requires named files and `search`; it does not accept stdin,
+window offsets/byte counts, path queries, `--max-file-bytes` or
+`--max-total-bytes`. The latter are full-capture reservations for the default
+indexed route. Workspace discovery limits and static exclusions still apply.
+Use `--max-files` and `--include-excluded` with an explicit workspace as before.
+
+### Retention and consistency
+
+Streaming results retain **literal witnesses only**, not arbitrary discarded
+source ranges. The matched original bytes are proven equal to the encoded
+literal and share one immutable backing value rather than being copied for
+every occurrence. The public `FileSearchReport::retain_hit` can materialize an
+exact `ObservedExtent` for a selected occurrence without rereading a changed
+live file. It never synthesizes neighboring lines, a file digest, or a full
+snapshot. Reading neighboring source is a new observation with a new revision.
+
+Before/after metadata is taken on the actual open file. Length and modification
+time differences, short reads and missing metadata prevent a complete native
+result. An unchanged-metadata result is still **not an atomic snapshot**. A
+pathname replacement does not cause a mid-search reopen, and positioned reads
+do not move a cursor shared with the host's other file handle.
+
+`input_complete` means the declared continuous byte sequence was searched.
+`whole_file_complete` additionally requires unchanged before/after metadata.
+`state` distinguishes completion, match limit, byte limit, read-call limit,
+short read, unsupported text, cancellation and failure. Encountered malformed
+text invalidates that file's exact-text results; raw-byte search remains an
+explicit alternative. Other completed files' results remain useful.
+
+Whole-file JSON uses `strategy: "streaming-whole-file"`. Each file record carries
+exact original-byte hit ranges, counters, consistency and terminal state.
+`literal_original_hex` supplies the shared witness once when hits exist.
+`decoded_range` is null: the scanner does not invent global decoded coordinates.
+Workspace output has `files`, `files_examined`, `unexamined_files`,
+`incomplete_files`, `workspace_complete`, global counts and `stop_reason`.
+An exactly full result buffer is not truncation; one extra verified occurrence
+establishes truncation. A complete zero-match scan exits 1; incomplete scans exit
+3 even with zero hits. The 8 MiB response cap remains independent of scan size.
+
+## Workspace inspection and indexed-capture search
 
 `inspect ROOT --workspace` publishes a sorted catalog of regular files and
 metadata counts. `search ROOT --workspace --path QUERY` uses the existing
@@ -56,13 +136,12 @@ raw identities. Both operations read **zero source payload bytes**. Non-UTF8
 names, case-distinct names, and literal Unix backslashes/colons retain their
 native bytes; escaped display labels are not source identities.
 
-`search ROOT --workspace --text TEXT` captures admitted complete files, forms a
-search manifest, builds the existing ephemeral trigram index, and verifies
-candidate hits against retained exact source. Text is a **case-sensitive literal**,
-including spaces and strings resembling query syntax. Each file uses the
-existing UTF-8/BOM-marked UTF-16 decoder. Unsupported exact decoding is reported
-separately, not as a successful no-match result. No new regex/parser/matcher is
-used by this route.
+Without `--whole-file`, `search ROOT --workspace --text TEXT` captures admitted
+complete files, forms a search manifest, builds the existing ephemeral trigram
+index, and verifies candidate hits against retained exact source. Text is a
+**case-sensitive literal**, including spaces and strings resembling query
+syntax. Each file uses the existing UTF-8/BOM-marked UTF-16 decoder. Unsupported
+exact decoding is reported separately, not as a successful no-match result.
 
 The workspace default policy is explicitly named
 `product-defaults/no-rule-files-v1`: common build/dependency/VCS directories and
@@ -79,7 +158,7 @@ membership, so repository-provided rule files cannot cause hidden source reads
 or an unbounded growing rule set. This is not a claim of Git ignore compatibility
 for the workspace CLI.
 
-Workspace admission defaults and CLI maximums:
+Workspace admission defaults and CLI maximums for the indexed-capture strategy:
 
 | Limit | Default | CLI maximum |
 | --- | --- | --- |
@@ -102,41 +181,34 @@ catalog's admitted subset may depend on enumeration order.
 
 Every source read is bounded, uses the already-opened file, and has cancellation
 checks between steps. Interrupted/failed reads consume the shared I/O allowance;
-the operation is also capped at 131,072 read calls. A file that is too large,
-changed during reading, unavailable, or refused by a capture quota stays an
-**unavailable member**. It is not truncated into a complete capture or omitted
+indexed capture preparation is capped at 131,072 read calls. A file that is too
+large, changed during reading, unavailable, or refused by a capture quota stays
+an **unavailable member**. It is not truncated into a complete capture or omitted
 from the meaning of workspace search. Captured old bytes remain authoritative
 for index verification even if the live file changes later.
 
-Workspace output distinguishes:
+Workspace output distinguishes `discovery_complete`, `workspace_complete`, and
+`truncated`/`listing_truncated`. Content output includes captured-byte/read-call
+totals, index-eliminated files, fallback scans, exact source ranges, and
+`unavailable_files` / `unsupported_text_files` with reversible paths, file IDs
+and reason codes. Declared admission limits and discovery counters are included.
+An empty workspace may be complete; an unfinished workspace with zero hits may
+not. There is no atomic repository snapshot or persistent identifier inferred
+from live directory/file observations.
 
-- `discovery_complete`: the admitted regular-file membership was fully observed
-  under the reported policy and without discovery limitations.
-- `workspace_complete`: the query's declared scope was fully examined, without
-  missing captures/unsupported text in content mode. For path mode this describes
-  the completed scan/count; display truncation remains a separate fact.
-- `truncated` or `listing_truncated`: a bounded result/listing omitted rows.
+The default indexed strategy does not accept stdin, byte-window flags, raw-hex
+queries or an encoding override. The explicit whole-file strategy above accepts
+raw bytes and encoding declarations. Neither strategy is a persistent or
+out-of-core posting index: one retains bounded captures and an ephemeral index;
+the other scans continuous source while retaining only literal witnesses.
 
-Content output includes captured-byte/read-call totals, index-eliminated files,
-fallback scans, exact source ranges, and `unavailable_files` /
-`unsupported_text_files` records with reversible paths, file IDs and reason
-codes. Declared admission limits and discovery counters are included. An empty
-workspace may be complete; an unfinished workspace with zero hits may not.
-No whole-repository atomic snapshot or persistent identifier is inferred from
-ordinary live directory/file observations.
+## Single-file windows and stdin
 
-Workspace operations do not accept stdin, byte-window flags, raw-hex queries or
-an encoding override. Use the single-file route for bounded raw-byte access,
-far offsets, and explicit encoding declarations. This ephemeral implementation
-is bounded in-memory search, **not out-of-core whole-repository indexing**.
-
-## File windows and stdin
-
-Default visible size is 65,536 original source bytes; the maximum is 262,144.
-Capturing a file range can include up to eight context bytes on either side.
-Those bytes are counted in `payload_bytes_read` but not silently added to the
-searched scope. Each positioned read step uses at most 64 KiB and 32 calls;
-single-file operations also cap the operation at 4,096 read calls.
+Default visible size is 65,536 original bytes; the maximum is 262,144. A range
+capture may include up to eight decoding-context bytes on either side. Those
+bytes count toward `payload_bytes_read` but do not silently enlarge the search
+scope. Each positioned read step has 64 KiB/32-call bounds; windowed single-file
+operations also cap the operation at 4,096 read calls.
 
 For stdin, the byte limit bounds the **whole supplied observation**. The reader
 consumes at most one extra byte to distinguish EOF from oversized input. Input
@@ -176,10 +248,10 @@ Consult coverage fields and the exit status:
 | 0 | Complete admitted result/representation, or a successful inert command. |
 | 1 | A complete declared-scope search found no matches. |
 | 2 | Argument, source, decoder, admission, unavailable-capability or output error. |
-| 3 | Useful partial coverage or a truncated result/listing. Never an exhaustive negative. |
+| 3 | Useful partial coverage, a per-file streaming failure, or a truncated result/listing. Never an exhaustive negative. |
 | 130 | Cooperative cancellation through the application API. |
 
-File search keeps `scope_complete`, `whole_file_complete`, and `truncated`
+Windowed search keeps `scope_complete`, `whole_file_complete`, and `truncated`
 separate. An exactly full result buffer is not proof of truncation: the existing
 matcher performs one-match lookahead. Counts in a truncated content search are
 matches actually seen, not an exhaustive total. An actual leading BOM can be
@@ -223,12 +295,13 @@ https://doc.rust-lang.org/std/os/unix/fs/trait.OpenOptionsExt.html
 ```
 
 These checks do **not** establish race-safe ancestor confinement. Workspace
-capture rechecks each named component and does not intentionally follow
-symlinks, but concurrent ancestor replacement remains a native-service
-limitation. The public library's root grant tracks scope/revocation; it is not a
-kernel sandbox. A descriptor-relative native service and physical-Mac evidence
-are still required for stronger confinement claims. Reading an already-opened
-file does not resolve its pathname again after replacement.
+capture and streaming routes recheck each named component and do not
+intentionally follow symlinks, but concurrent ancestor replacement remains a
+native-service limitation. The public library's root grant tracks
+scope/revocation; it is not a kernel sandbox. A descriptor-relative native
+service and physical-Mac evidence are still required for stronger confinement
+claims. Reading an already-opened file does not resolve its pathname again
+after replacement.
 
 ## Verification surfaces
 
@@ -240,6 +313,12 @@ revocation and old-capture retention. A test-only independent JSON subset parser
 rejects duplicate fields, multiple documents, truncated output and numeric IDs.
 These test sources do not establish execution or native qualification.
 
+Streaming tests additionally compare continuous scans with the retained-capture
+oracle across short reads, long literals, BOMs, UTF-16 alignment, malformed
+suffixes and result limits. File tests exercise large-file tails, shared-cursor
+isolation, truncation/growth, namespace replacement and retained witnesses.
+`whole_file_cli` exercises actual command dispatch and the standalone binary.
+
 The independent verifier should run these selections using the repository's
 strict-RCH lane, not local worker builds:
 
@@ -250,11 +329,15 @@ cargo test --locked -p fcb-search --test ephemeral_index
 cargo test --locked -p fcb-search --test path_navigation
 cargo test --locked -p fcb --features search --test workspace_search
 cargo test --locked -p fcb --features search --test workspace_capture_commit
+cargo test --locked -p fcb --features search --test streaming_search
+cargo test --locked -p fcb --features search --test file_stream_search
+cargo test --locked -p fcb --features search --lib
 cargo test --locked -p fcb-app --lib
 cargo test --locked -p fcb-app --test headless_services
 cargo test --locked -p fcb-app --test standalone_cli
 cargo test --locked -p fcb-app --test workspace_cli
 cargo test --locked -p fcb-app --test workspace_native_names
+cargo test --locked -p fcb-app --test whole_file_cli
 ```
 
 No compiled binary, execution receipt, signed artifact, native qualification or
