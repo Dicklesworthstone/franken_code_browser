@@ -17,7 +17,7 @@
 use std::{cmp::Ordering, mem::size_of, sync::Arc};
 
 use fcb_core::{ArenaOwnerId, ByteLength, FileId, ResourceAllocationId, ResourceBudget, ResourceLease, RootId};
-use fcb_source::NativeRelativePath;
+pub use fcb_source::RawPath;
 use crate::{MembershipState, SearchManifestId};
 
 mod query;
@@ -81,13 +81,13 @@ impl Default for PathIndexLimits {
 pub struct PathEntry<'a> {
     pub file_id: FileId,
     pub root_id: RootId,
-    pub path: &'a NativeRelativePath,
+    pub path: &'a RawPath,
     /// Host-supplied navigation preference. Larger is more recent/preferred;
     /// this never outranks a better lexical match class.
     pub recent_weight: u16,
 }
 impl<'a> PathEntry<'a> {
-    pub fn new(file_id: FileId, root_id: RootId, path: &'a NativeRelativePath) -> Self {
+    pub fn new(file_id: FileId, root_id: RootId, path: &'a RawPath) -> Self {
         Self { file_id, root_id, path, recent_weight: 0 }
     }
 }
@@ -96,7 +96,7 @@ impl<'a> PathEntry<'a> {
 pub struct IndexedPath {
     file: FileId,
     root: RootId,
-    path: NativeRelativePath,
+    path: RawPath,
     sensitive: Vec<u32>,
     folded: Vec<u32>,
     components: usize,
@@ -106,7 +106,7 @@ pub struct IndexedPath {
 impl IndexedPath {
     pub const fn file_id(&self) -> FileId { self.file }
     pub const fn root_id(&self) -> RootId { self.root }
-    pub fn raw_path(&self) -> &NativeRelativePath { &self.path }
+    pub fn raw_path(&self) -> &RawPath { &self.path }
     pub const fn recent_weight(&self) -> u16 { self.recent }
 }
 
@@ -182,7 +182,7 @@ impl PathIndex {
             if canceled() { return Err(PathSearchError::Canceled); }
             validate_owner(id.owner(), entry.file_id, entry.root_id)?;
             if previous.is_some_and(|last| last >= entry.file_id) { return Err(PathSearchError::DuplicateFile); }
-            if entry.path.as_bytes().len() > limits.max_path_bytes { return Err(PathSearchError::LimitExceeded); }
+            validate_relative_path(entry.path.as_bytes(), limits.max_path_bytes)?;
             previous = Some(entry.file_id);
             new_raw = add(new_raw, entry.path.as_bytes().len())?;
             let (sensitive, folded) = key_lengths(entry.path.as_bytes())?;
@@ -217,11 +217,10 @@ impl PathIndex {
         if count > limits.max_files || raw_bytes > limits.max_total_path_bytes || components > limits.max_components {
             return Err(PathSearchError::LimitExceeded);
         }
-        let planned = add(size_of::<Self>(), add(
-            mul(count, size_of::<Arc<IndexedPath>>())?,
-            add(mul(components, size_of::<Component>())?, add(new_raw,
-                add(mul(new_units, size_of::<u32>())?, mul(upserts.len(),
-                    add(size_of::<IndexedPath>(), 2 * size_of::<usize>())?)?)?)?)?)?;
+        let metadata = add(mul(count, size_of::<Arc<IndexedPath>>())?, mul(components, size_of::<Component>())?)?;
+        let record_bytes = mul(upserts.len(), add(size_of::<IndexedPath>(), 4 * size_of::<usize>())?)?;
+        let payload = add(new_raw, mul(new_units, size_of::<u32>())?)?;
+        let planned = add(size_of::<Self>(), add(metadata, add(record_bytes, payload)?)?)?;
         if canceled() { return Err(PathSearchError::Canceled); }
         let lease = budget.try_reserve_managed(id.owner(), allocation, ByteLength::new(planned as u64))
             .map_err(|_| PathSearchError::ResourceDenied)?;
@@ -238,12 +237,9 @@ impl PathIndex {
         for entry in upserts {
             if canceled() { return Err(PathSearchError::Canceled); }
             let bytes = entry.path.as_bytes();
-            let mut raw = Vec::new();
-            reserve(&mut raw, bytes.len())?;
-            raw.extend_from_slice(bytes);
             let (sensitive, folded) = keys(bytes)?;
-            let path = NativeRelativePath::new(raw, limits.max_path_bytes)
-                .map_err(|_| PathSearchError::InvalidUpdate)?;
+            // Copy directly into immutable backing: no Vec-to-Arc payload overlap.
+            let path = RawPath::from_bytes(bytes);
             records.push(Arc::new(IndexedPath { file: entry.file_id, root: entry.root_id, path,
                 sensitive, folded, components: component_count(bytes), recent: entry.recent_weight,
                 _lease: lease.clone() }));
@@ -295,6 +291,16 @@ impl PathIndex {
 
 fn validate_owner(owner: ArenaOwnerId, file: FileId, root: RootId) -> Result<(), PathSearchError> {
     if file.owner() != owner || root.owner() != owner { return Err(PathSearchError::OwnerMismatch); }
+    Ok(())
+}
+fn validate_relative_path(bytes: &[u8], limit: usize) -> Result<(), PathSearchError> {
+    if bytes.len() > limit { return Err(PathSearchError::LimitExceeded); }
+    if bytes.is_empty() || bytes.contains(&0) || bytes.split(|&byte| byte == b'/')
+        .any(|part| part.is_empty() || part == b"." || part == b"..") {
+        return Err(PathSearchError::InvalidUpdate);
+    }
+    // Backslash is an ordinary native filename byte on the Unix/macOS lane.
+    // Do not feed this identity through a presentation/URI canonicalizer.
     Ok(())
 }
 fn component_count(path: &[u8]) -> usize {
