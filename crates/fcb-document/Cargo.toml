@@ -1,0 +1,19 @@
+[package]
+name = "fcb-document"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "FCB lens/session state, source-ID translation, and integration of FMD output (FCB-031.A)."
+
+[lib]
+name = "fcb_document"
+path = "src/lib.rs"
+
+[dependencies]
+fcb-core = { path = "../fcb-core" }
+fcb-source = { path = "../fcb-source" }
+franken_markdown = { path = "../../../franken_markdown", default-features = false }
+
+[dev-dependencies]
+fcb-test-support = { path = "../fcb-test-support" }
