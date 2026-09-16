@@ -6,6 +6,8 @@
 //! Path navigation uses `PathIndex` and `PathSearch` without loading source.
 //! Demand-read `ObservedExtent` values retain only requested source ranges;
 //! `ExtentView` and `ExtentQuery` read/search those bytes without filling holes.
+//! `FileSearch` scans one open file without retaining all its bytes; only exact
+//! literal witnesses can be retained from that observed stream afterward.
 //! All worker operations take explicit bounds; none creates a runtime, window,
 //! filesystem grant, or persistent store.
 //!
@@ -19,6 +21,11 @@ pub mod extents;
 pub mod extent_query;
 pub mod extent_navigation;
 pub mod workspace;
+pub mod streaming;
+pub mod file_search;
+pub use streaming::{ReaderSearch, StreamReadError, StreamReadOptions, StreamReadReport,
+    StreamReadState, StreamReadStats, StreamReadStep, StreamingHit, StreamingMode, StreamingNeedle};
+pub use file_search::{FileSearch, FileSearchError, FileSearchReport};
 pub use extent_navigation::ExtentActivationError;
 pub use extents::{ExtentConsistency, ExtentError, ExtentReadState, ExtentReadStats,
     ExtentStepBudget, ExtentWindowRequest, FileExtentRead, FileRangeReader,
@@ -31,8 +38,8 @@ pub use reading_window::{LineEnding, ReadingLine, ReadingSelection, ReadingWindo
 
 pub use fcb_search::*;
 pub use fcb_search::paths::{IndexedPath, PathCase, PathEntry, PathIndex, PathIndexLimits,
-    PathMatch, PathMatchKind, PathMatchMode, PathRank, PathSearch, PathSearchError,
-    PathSearchOptions, PathSearchState, PathSelection, PathStepBudget, RawPath};
+    PathMatch, PathMatchKind, PathMatchMode, PathRank, PathSearch, PathSearchOptions,
+    PathSearchState, PathSelection, PathStepBudget, RawPath};
 pub use fcb_core::{QueryGeneration, ResourceAllocationId, ResourceBudget, RootId};
 pub use fcb_source::{CaptureRequest, CompleteCapture, DetectedEncoding};
 
