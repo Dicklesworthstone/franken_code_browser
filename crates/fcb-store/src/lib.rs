@@ -38,6 +38,8 @@ pub mod envelope;
 pub mod namespace;
 /// Explicit, versioned exports of exact source captures and unavailable members.
 pub mod snapshot;
+/// Metadata-only archive residency and independently verified member loads.
+pub mod paged_snapshot;
 
 pub use envelope::{
     canonicalize_f32, canonicalize_f64, EnvelopeError, EnvelopeLimits, EnvelopeReader,
