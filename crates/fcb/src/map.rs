@@ -7,6 +7,8 @@
 //! bindings and already authorized captures. No pathname in this module grants
 //! filesystem access; display labels never substitute for a FileId.
 
+pub mod navigation;
+pub use navigation::{AtlasLocation, AtlasNavigation};
 pub use fcb_map::*;
 pub use fcb_core::{DisplayColorConfig, QueryGeneration, ResourceAllocationId,
     ResourceBudget, RootId};

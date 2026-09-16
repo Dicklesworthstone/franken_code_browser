@@ -76,10 +76,12 @@ fn feature_union_reports_only_compile_selected_capabilities() {
     assert!(available.contains(Feature::Source));
     assert!(available.contains(Feature::View));
     assert_eq!(available.contains(Feature::Search), cfg!(feature = "search"));
+    assert_eq!(available.contains(Feature::Map), cfg!(feature = "map"));
     assert_eq!(BrowserSession::new(ArenaOwnerId::new(505).unwrap()).require_feature(Feature::Search),
         if cfg!(feature = "search") { Ok(()) } else { Err(FcbError::FeatureUnavailable) });
+    assert_eq!(BrowserSession::new(ArenaOwnerId::new(505).unwrap()).require_feature(Feature::Map),
+        if cfg!(feature = "map") { Ok(()) } else { Err(FcbError::FeatureUnavailable) });
     for feature in [
-        Feature::Map,
         Feature::Markdown,
         Feature::Runtime,
         Feature::Persistence,
@@ -96,6 +98,7 @@ fn available_capabilities_are_const_evaluable_and_honest() {
     assert!(COMPILE_TIME_AVAILABLE.contains(Feature::Source));
     assert!(COMPILE_TIME_AVAILABLE.contains(Feature::View));
     assert_eq!(COMPILE_TIME_AVAILABLE.contains(Feature::Search), cfg!(feature = "search"));
+    assert_eq!(COMPILE_TIME_AVAILABLE.contains(Feature::Map), cfg!(feature = "map"));
     assert_eq!(
         Feature::MacosMetal.target_supported(),
         cfg!(target_os = "macos")

@@ -23,6 +23,10 @@ pub use fcb_source as source;
 #[cfg(feature = "search")]
 pub mod search;
 
+/// Retained atlas layout, camera, visible plans, navigation and file activation.
+#[cfg(feature = "map")]
+pub mod map;
+
 /// A capability whose implementation can be selected additively by a host.
 ///
 /// The facade itself remains usable with no Cargo features.  In-memory source
@@ -82,12 +86,14 @@ impl Feature {
 
     /// Whether this build contains the concrete capability implementation.
     /// Source/view are the inert baseline. Search selects real headless capture,
-    /// index and verification APIs; it does not claim a native search-results UI.
+    /// index and verification APIs. Map selects retained layout, camera, bounded
+    /// visible plans and source activation. Neither claims a native rendered UI.
     /// Selecting any still-unimplemented feature cannot make it available.
     pub const fn implemented(self) -> bool {
         match self {
             Self::Source | Self::View => true,
             Self::Search => cfg!(feature = "search"),
+            Self::Map => cfg!(feature = "map"),
             _ => false,
         }
     }
@@ -158,7 +164,7 @@ impl FeatureSet {
 
     /// The capabilities implemented by this facade revision and usable on the
     /// current target. Source capture and renderer-neutral views are the
-    /// concrete baseline; headless search is additive, and unimplemented
+    /// concrete baseline; headless search and map are additive. Unimplemented
     /// profiles remain unavailable even when their Cargo flags are selected.
     pub const fn available() -> Self {
         let mut bits = 0;
@@ -636,7 +642,7 @@ mod tests {
         let owner = ArenaOwnerId::new(3).unwrap();
         let session = BrowserSession::new(owner);
         assert_eq!(session.require_feature(Feature::Search), if cfg!(feature = "search") { Ok(()) } else { Err(FcbError::FeatureUnavailable) });
-        assert_eq!(session.require_feature(Feature::Map), Err(FcbError::FeatureUnavailable));
+        assert_eq!(session.require_feature(Feature::Map), if cfg!(feature = "map") { Ok(()) } else { Err(FcbError::FeatureUnavailable) });
         assert_eq!(session.require_feature(Feature::Markdown), Err(FcbError::FeatureUnavailable));
         assert_eq!(session.require_feature(Feature::Runtime), Err(FcbError::FeatureUnavailable));
         assert_eq!(session.require_feature(Feature::Persistence), Err(FcbError::FeatureUnavailable));

@@ -7,6 +7,9 @@ name = "fcb"
 version = "0.1.0"
 dependencies = [
  "fcb-core",
+ "fcb-map",
+ "fcb-search",
+ "fcb-source",
  "fcb-test-support",
 ]
 
@@ -17,6 +20,14 @@ version = "0.1.0"
 [[package]]
 name = "fcb-core"
 version = "0.1.0"
+
+[[package]]
+name = "fcb-map"
+version = "0.1.0"
+dependencies = [
+ "fcb-core",
+ "fcb-test-support",
+]
 
 [[package]]
 name = "fcb-runtime"

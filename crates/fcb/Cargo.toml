@@ -9,7 +9,7 @@ publish = false
 default = []
 source = ["dep:fcb-source"]
 search = ["source", "dep:fcb-search"]
-map = []
+map = ["dep:fcb-map"]
 markdown = []
 view = []
 runtime = []
@@ -20,6 +20,7 @@ macos-metal = []
 fcb-core = { path = "../fcb-core" }
 fcb-source = { path = "../fcb-source", optional = true }
 fcb-search = { path = "../fcb-search", optional = true }
+fcb-map = { path = "../fcb-map", optional = true }
 
 [dev-dependencies]
 fcb-test-support = { path = "../fcb-test-support" }

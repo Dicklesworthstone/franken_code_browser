@@ -88,7 +88,7 @@ fn host_capability_union_cannot_advertise_unimplemented_profiles() {
         assert_eq!(available.contains(feature), feature.implemented() && feature.target_supported());
     }
     assert_eq!(session.require_feature(Feature::Search), if cfg!(feature = "search") { Ok(()) } else { Err(FcbError::FeatureUnavailable) });
-    assert_eq!(session.require_feature(Feature::Map), Err(FcbError::FeatureUnavailable));
+    assert_eq!(session.require_feature(Feature::Map), if cfg!(feature = "map") { Ok(()) } else { Err(FcbError::FeatureUnavailable) });
     assert_eq!(session.require_feature(Feature::Markdown), Err(FcbError::FeatureUnavailable));
     assert_eq!(session.require_feature(Feature::Runtime), Err(FcbError::FeatureUnavailable));
     assert_eq!(session.require_feature(Feature::Persistence), Err(FcbError::FeatureUnavailable));
