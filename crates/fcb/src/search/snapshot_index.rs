@@ -13,7 +13,10 @@
 //! without such a pin must be rebuilt from its independently validated snapshot.
 
 mod refresh;
+mod postings;
 pub use refresh::{RefreshStats, SnapshotRefresh};
+pub use postings::{SnapshotPostings, PostingCandidates, PostingProbeStats, PostingStep,
+    POSTINGS_SCHEMA, MAX_POSTINGS_BYTES};
 
 use std::{io::{Read, Seek}, mem::size_of, sync::Arc};
 use fcb_core::{ArenaOwnerId, ByteLength, FileId, ResourceAllocationId, ResourceBudget,
@@ -90,8 +93,9 @@ impl Coverage {
 #[derive(Clone, Debug)]
 struct Row { coverage: Coverage, length: u64, digest: Sha256Digest, start: usize, count: usize }
 
-/// Immutable per-file segments. Metadata probes are O(files); this is not a
-/// global inverted posting list. Source payloads are never retained here.
+/// Immutable per-file segments. Metadata probes are O(files); `invert` builds
+/// an independently owned global posting table for selective repeated queries.
+/// Source payloads are never retained here.
 pub struct SnapshotIndex {
     owner: ArenaOwnerId,
     archive: Sha256Digest,
@@ -128,8 +132,7 @@ impl SnapshotIndex {
         self.probe(row, text.as_bytes())
     }
     /// Original-byte hosts may use this with the SAME raw needle they verify.
-    /// The paged query adapter currently accelerates exact text and leaves raw
-    /// mode on its existing full scan rather than accepting a mismatched needle.
+    /// IndexedNeedle in the paged adapter binds this pattern to its exact matcher.
     pub fn raw_decision(&self, ordinal: usize, bytes: &[u8]) -> IndexDecision {
         let Some(row) = self.rows.get(ordinal) else { return IndexDecision::Fallback; };
         if !row.coverage.indexed() { return IndexDecision::Fallback; }
@@ -175,13 +178,17 @@ impl SnapshotIndex {
         Ok(IndexArtifact { bytes, digest, _lease: lease })
     }
     /// Open an artifact under a separately retained TRUSTED full-document digest.
+    /// FCBO global postings are converted under a pre-admitted overlap reservation
+    /// for compatibility with refresh. Query hosts should decode SnapshotPostings
+    /// directly instead, retaining its global lookup and avoiding this conversion.
     /// Structural validation alone does not certify semantic completeness. The
     /// caller must NOT set trusted_digest = hash(untrusted_bytes) just to pass.
-    /// Any mismatch refuses the entire candidate; callers can explicitly rebuild
-    /// or run ordinary unfiltered snapshot search without losing user state.
     pub fn decode_pinned(bytes: &[u8], trusted_digest: Sha256Digest, directory: &SnapshotDirectory,
         budget: &ResourceBudget, allocation: ResourceAllocationId,
         mut canceled: impl FnMut() -> bool) -> Result<Self, SnapshotIndexError> {
+        if SnapshotPostings::is_encoded(bytes) {
+            return SnapshotPostings::decode_segments(bytes, trusted_digest, directory, budget, allocation, canceled);
+        }
         if bytes.len() < FRAME_LEN + PREFIX_BYTES || bytes.len() > MAX_INDEX_BYTES { return Err(SnapshotIndexError::Limits); }
         if canceled() { return Err(SnapshotIndexError::Canceled); }
         if Sha256::digest(bytes) != trusted_digest { return Err(SnapshotIndexError::PinMismatch); }
