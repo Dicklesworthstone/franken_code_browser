@@ -26,6 +26,7 @@ const MAX_READ_BYTES: usize = 4 << 20;
 /// rather than silently truncated (the shell surfaces the refusal).
 const ATLAS_MAX_FILES: usize = 20_000;
 const ATLAS_MAX_DEPTH: u16 = 14;
+const ATLAS_MAX_LINES: usize = 4000;
 
 fn is_ignored_dir(name: &[u8]) -> bool {
     matches!(
@@ -101,6 +102,59 @@ fn walk(
     Ok(())
 }
 
+/// Packed per-line profile: [length_frac, class] × lines.
+/// class: 0 code, 1 comment, 2 string, 3 keyword.
+fn line_profile(text: &str) -> Vec<u8> {
+    let mut profile = Vec::with_capacity(text.lines().count() * 2);
+    let max_len = text.lines().map(|line| line.len()).max().unwrap_or(1).max(1);
+    for line in text.lines().take(ATLAS_MAX_LINES) {
+        let trimmed = line.trim_start();
+        let class = if trimmed.starts_with("//") || trimmed.starts_with('#') {
+            1_u8
+        } else if line.contains('"') || line.contains('\'') {
+            2
+        } else {
+            let keywordish = [
+                "fn ", "func ", "def ", "class ", "struct ", "impl ", "pub ", "if ", "for ",
+                "while ", "return ",
+            ]
+            .iter()
+            .any(|marker| line.contains(marker));
+            if keywordish { 3 } else { 0 }
+        };
+        let length_frac = ((line.len().min(max_len) * 255) / max_len) as u8;
+        profile.push(length_frac);
+        profile.push(class);
+    }
+    profile
+}
+
+fn base64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let bytes = [
+            chunk.first().copied().unwrap_or(0),
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]);
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 fn json_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
@@ -155,12 +209,14 @@ fn atlas_json(root_path: &str) -> Option<String> {
         LayoutOptions::modest(),
     )
     .ok()?;
-    let mut out = String::from("{\"world\":{\"w\":4096,\"h\":4096},\"files\":[");
-    let mut first = true;
+
     let bytes_by_path: std::collections::HashMap<Vec<u8>, u64> = entries
         .iter()
         .map(|entry| (entry.relative.clone(), entry.bytes))
         .collect();
+
+    let mut out = String::from("{\"world\":{\"w\":4096,\"h\":4096},\"files\":[");
+    let mut first = true;
     for node in layout.nodes() {
         if node.kind() != NodeKind::File {
             continue;
@@ -171,16 +227,23 @@ fn atlas_json(root_path: &str) -> Option<String> {
             out.push(',');
         }
         first = false;
+        // Per-line profile (length+class per line, base64-packed) so the
+        // shell can draw the line-bar circuit texture without re-reading
+        // files. Unreadable files emit an empty profile.
+        let profile = std::fs::read_to_string(root_path.to_owned() + "/" + &path)
+            .map(|text| line_profile(&text))
+            .unwrap_or_default();
+        let (line_count, tex) = (profile.len() / 2, base64(&profile));
         out.push_str(&format!(
-            "{{\"path\":\"{}\",\"x\":{:.2},\"y\":{:.2},\"w\":{:.2},\"h\":{:.2},\"bytes\":{}}}",
+            "{{\"path\":\"{}\",\"x\":{:.2},\"y\":{:.2},\"w\":{:.2},\"h\":{:.2},\"bytes\":{},\"n\":{},\"tex\":\"{}\"}}",
             json_escape(&path),
             rect.min_x(),
             rect.min_y(),
             rect.max_x() - rect.min_x(),
-            bytes_by_path
-                .get(path.as_bytes())
-                .copied()
-                .unwrap_or(0)
+            rect.max_y() - rect.min_y(),
+            bytes_by_path.get(path.as_bytes()).copied().unwrap_or(0),
+            line_count,
+            tex
         ));
     }
     out.push_str("]}");
@@ -254,8 +317,10 @@ pub extern "C" fn fcb_read_file(path: *const c_char) -> *mut c_char {
 }
 
 /// Lays out every file under `root` with the fcb-map partition engine and
-/// returns JSON: {"world":{"w":W,"h":H},"files":[{"path","x","y","w","h"},
-/// ...]}. Null on refusal (empty root, depth/file caps, unreadable
+/// returns JSON: {"world":{"w":W,"h":H},"files":[{"path","x","y","w",
+/// "h","bytes","n","tex"},...]}, where `n` is the line count and `tex`
+/// the base64 per-line profile (2 bytes per line: length fraction and
+/// role class). Null on refusal (empty root, depth/file caps, unreadable
 /// entries) so the shell can surface the boundary honestly.
 ///
 /// # Safety
