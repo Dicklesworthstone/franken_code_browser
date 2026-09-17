@@ -10,5 +10,14 @@ description = "Hostile input generation, bounded mutation, and failure-preservin
 name = "fcb_conformance"
 path = "src/lib.rs"
 
+[dependencies]
+fcb-core = { path = "../fcb-core" }
+fcb-source = { path = "../fcb-source" }
+franken_markdown = { path = "../../../franken_markdown", default-features = false }
+
+[dev-dependencies]
+fcb-test-support = { path = "../fcb-test-support" }
+
 [lints]
 rust.missing_debug_implementations = "deny"
+

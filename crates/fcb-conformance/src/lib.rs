@@ -331,3 +331,6 @@ impl AttemptCounter {
         self.remaining.get()
     }
 }
+
+pub mod hostile_source;
+

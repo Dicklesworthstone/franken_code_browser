@@ -70,7 +70,7 @@ pub enum CaptureBacking {
 /// - `ByteVerified` if the current bytes hash to the recorded digest
 /// - `Stale` otherwise
 pub fn resolve_old_anchor(
-    anchor: &OldAnchor,
+    _anchor: &OldAnchor,
     backing: CaptureBacking,
     current_bytes: &[u8],
     recorded_digest: u64,
