@@ -42,6 +42,12 @@ pub enum HostFixtureError {
     DeviceTokenMismatch { expected_id: u64, actual_id: u64 },
     UnauthorizedFontAccess { owner: ArenaOwnerId },
     InstanceAlreadyClosed { owner: ArenaOwnerId },
+    ViewAlreadyDetached { owner: ArenaOwnerId },
+    ViewNotAttached { owner: ArenaOwnerId },
+    PendingQueryNotFound { query_id: u64 },
+    PendingTransactionNotFound { tx_id: u64 },
+    QueryAlreadyCompleted { query_id: u64 },
+    QueryCancelled { query_id: u64 },
     HostTerminated,
     CrossOwnerAccessDenied,
     DrainError(TerminalDrainError),
@@ -62,6 +68,24 @@ impl fmt::Display for HostFixtureError {
             Self::InstanceAlreadyClosed { owner } => {
                 write!(f, "Instance {owner:?} is already closed")
             }
+            Self::ViewAlreadyDetached { owner } => {
+                write!(f, "View for instance {owner:?} is already detached")
+            }
+            Self::ViewNotAttached { owner } => {
+                write!(f, "View for instance {owner:?} is not attached")
+            }
+            Self::PendingQueryNotFound { query_id } => {
+                write!(f, "Pending query {query_id} not found")
+            }
+            Self::PendingTransactionNotFound { tx_id } => {
+                write!(f, "Pending persistence transaction {tx_id} not found")
+            }
+            Self::QueryAlreadyCompleted { query_id } => {
+                write!(f, "Query {query_id} has already completed")
+            }
+            Self::QueryCancelled { query_id } => {
+                write!(f, "Query {query_id} was cancelled")
+            }
             Self::HostTerminated => write!(f, "Host run loop is terminated"),
             Self::CrossOwnerAccessDenied => write!(f, "Cross-owner handle or state access denied"),
             Self::DrainError(err) => write!(f, "Terminal drain error: {err}"),
@@ -75,6 +99,21 @@ impl From<TerminalDrainError> for HostFixtureError {
     fn from(err: TerminalDrainError) -> Self {
         Self::DrainError(err)
     }
+}
+
+/// Status of an in-flight background query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InFlightQueryStatus {
+    Pending { path: String },
+    Completed { capture: SourceCapture },
+    Cancelled,
+}
+
+/// An in-flight persistence transaction (e.g. annotation or bookmark write).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistenceTx {
+    pub key: String,
+    pub value: String,
 }
 
 /// Typed device token representing host GPU device ownership.
@@ -385,6 +424,8 @@ impl HostServices for InstanceHostServices {
 pub struct InstanceCloseSummary {
     pub owner: ArenaOwnerId,
     pub drain_report: TerminalDrainReport,
+    pub cancelled_queries: usize,
+    pub discarded_persistence_txs: usize,
     pub host_still_running: bool,
     pub peer_still_active: bool,
 }
@@ -408,6 +449,10 @@ pub struct TwoInstanceHost {
     drain_queue_b: LosslessTerminalDrainQueue,
     private_annotations_a: BTreeMap<String, String>,
     private_annotations_b: BTreeMap<String, String>,
+    in_flight_queries_a: BTreeMap<u64, InFlightQueryStatus>,
+    in_flight_queries_b: BTreeMap<u64, InFlightQueryStatus>,
+    in_flight_persistence_a: BTreeMap<u64, PersistenceTx>,
+    in_flight_persistence_b: BTreeMap<u64, PersistenceTx>,
 }
 
 impl TwoInstanceHost {
@@ -464,6 +509,10 @@ impl TwoInstanceHost {
             drain_queue_b,
             private_annotations_a: BTreeMap::new(),
             private_annotations_b: BTreeMap::new(),
+            in_flight_queries_a: BTreeMap::new(),
+            in_flight_queries_b: BTreeMap::new(),
+            in_flight_persistence_a: BTreeMap::new(),
+            in_flight_persistence_b: BTreeMap::new(),
         })
     }
 
