@@ -14,3 +14,4 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 fcb-source = { path = "../fcb-source" }
+fcb-test-support = { path = "../fcb-test-support" }
