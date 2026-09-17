@@ -12,6 +12,8 @@ pub mod extractor;
 pub mod facts;
 pub mod inspector;
 pub mod outline;
+/// Bounded navigation candidates with validated original-source coordinates.
+pub mod symbols;
 
 pub use comparison::{CaptureComparison, ComparisonError, ComparisonLimits, ComparisonQuality,
     ComparisonRelation, ComparisonStats, Correspondence, CorrespondenceKind};
