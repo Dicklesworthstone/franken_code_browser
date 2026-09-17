@@ -12,6 +12,9 @@
 //! interaction callback. Per-file sorting is bounded by the scratch admission;
 //! it is not preemptible. This is an in-memory index, not a persistence format.
 
+/// Immutable segment images for explicit, digest-bound persistence adapters.
+pub mod export;
+
 use std::mem::size_of;
 
 use fcb_core::{
