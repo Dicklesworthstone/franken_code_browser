@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 pub use fcb_core::{
     AcceptedLayoutIdentity, AcceptedLayoutSnapshot, ArenaOwnerId, ByteLength, ByteOffset, ByteRange,
     CameraGeneration, ClockDomainId, CoreError, DisplayGeneration, DisplayMetrics, FileId,
-    InteractionGeneration, LayoutRevision, Point2D, PresentedFrameId, Rect2D, SceneGeneration,
+    InteractionGeneration, LayoutRevision, Point2D, PresentedFrameId, QueryGeneration, Rect2D, SceneGeneration,
     SemanticNodeId, Size2D, SourceRevision,
 };
 pub use frame_plan::{
@@ -25,6 +25,7 @@ pub use glyph_atlas::{
 
 pub mod frame_plan;
 pub mod glyph_atlas;
+pub mod ui;
 
 /// Explicit host-neutral source services; enabling this module performs no I/O.
 #[cfg(feature = "source")]
