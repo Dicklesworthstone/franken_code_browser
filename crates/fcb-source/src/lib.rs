@@ -28,6 +28,7 @@ pub mod confined;
 pub mod discovery;
 pub mod encoding;
 pub mod ignore;
+pub mod huge_line;
 pub mod line_index;
 pub mod path;
 pub mod restoration;
@@ -63,6 +64,11 @@ pub use restoration::{
     SandboxModel, SecurityScopedBookmark, StaleReason, UnavailableReason,
 };
 pub use root::{ExportPublicationGate, GrantRevocationToken, RootGrant};
+pub use huge_line::{
+    BidiDirection, ContextPreparationBudget, ContextPreparationState, HorizontalCheckpoint,
+    HugeLineVisualRouter, MaterializedRun, TabConfig, TextRunKind, VisibleColumnWindow,
+    DEFAULT_MAX_CONTEXT_BYTES, HUGE_LINE_THRESHOLD_BYTES, MAX_SAFE_COMBINING_SEQUENCE,
+};
 pub use old_anchor::{
     AnchorResolutionResult, CaptureBacking, LineContextProperties, OldAnchor,
     OldAnchorResolution, OpenCurrentAction, VisualContextReadiness, fnv1a, resolve_old_anchor,

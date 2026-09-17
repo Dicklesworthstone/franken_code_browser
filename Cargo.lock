@@ -36,6 +36,13 @@ dependencies = [
 [[package]]
 name = "fcb-conformance"
 version = "0.1.0"
+dependencies = [
+ "fcb-core",
+ "fcb-document",
+ "fcb-source",
+ "fcb-test-support",
+ "franken_markdown",
+]
 
 [[package]]
 name = "fcb-core"
