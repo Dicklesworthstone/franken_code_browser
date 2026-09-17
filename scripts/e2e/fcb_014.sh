@@ -6,6 +6,7 @@
 # Supported routes:
 #   scripts/e2e/fcb_014.sh [cargo-test-args...]
 #   scripts/e2e/fcb_014.sh --lane lod
+#   scripts/e2e/fcb_014.sh --lane labels
 #   scripts/e2e/fcb_014.sh --lane visibility
 #   scripts/e2e/fcb_014.sh --lane all
 #
@@ -50,6 +51,12 @@ if [ "$LANE" = "lod" ] || [ "$LANE" = "all" ]; then
     echo "[fcb-014] running lod_traversal..."
     cargo test --manifest-path crates/fcb-map/Cargo.toml \
         --test lod_traversal "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+fi
+
+if [ "$LANE" = "labels" ] || [ "$LANE" = "all" ]; then
+    echo "[fcb-014] running stable_labels..."
+    cargo test --manifest-path crates/fcb-map/Cargo.toml \
+        --test stable_labels "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
 fi
 
 if [ "$LANE" = "visibility" ] || [ "$LANE" = "all" ]; then

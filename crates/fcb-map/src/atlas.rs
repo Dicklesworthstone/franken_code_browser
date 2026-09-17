@@ -64,6 +64,9 @@ pub struct AtlasNodeId {
     ordinal: u32,
 }
 impl AtlasNodeId {
+    pub const fn new(root: RootId, layout: LayoutRevision, ordinal: u32) -> Self {
+        Self { root, layout, ordinal }
+    }
     pub const fn root(self) -> RootId { self.root }
     pub const fn layout(self) -> LayoutRevision { self.layout }
     pub const fn ordinal(self) -> u32 { self.ordinal }
