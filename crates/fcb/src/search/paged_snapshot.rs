@@ -8,6 +8,7 @@
 //! Archive validation and member loads are bounded, cancellable worker I/O.
 //! A query step may load one admitted member, then runs one bounded matcher step.
 //! Global posting queries inspect at most one driver posting/fallback per step.
+//! Disk posting queries additionally load at most one verified 16 KiB index page.
 //! It is not an interaction callback or a wall-clock latency guarantee.
 
 use std::{io::{Cursor, Read, Seek}, mem::size_of, sync::Arc};
@@ -19,6 +20,7 @@ use super::{CaptureRequest, ReaderSearch, StreamingNeedle, StreamingMode, Stream
     ReaderIndexProgress, ReadingTarget, ReadingSeek, ReadingAnchor, ReadingWindow, ReadingWindowOptions};
 use super::snapshot_index::{SnapshotIndex, SnapshotIndexError, IndexDecision,
     SnapshotPostings, PostingCandidates, PostingStep};
+use super::snapshot_index::paged::{PagedPostings, PagedPostingCandidates, PagedPostingError};
 pub use fcb_store::paged_snapshot::{PagedSnapshot, PagedSnapshotError, PagedMember, PagedMemberData,
     SnapshotDirectory, SnapshotIoStats, VerifiedMember};
 pub use fcb_store::Sha256Digest;
@@ -27,13 +29,13 @@ pub use fcb_store::Sha256Digest;
 pub enum PagedSearchError {
     Archive(PagedSnapshotError), Search(StreamReadError), OwnerMismatch, IdentityExhausted,
     InvalidLimits, ResourceDenied, Pending, Canceled, StaleQuery, InvalidHit, IncompleteInput,
-    Index(SnapshotIndexError),
+    Index(SnapshotIndexError), PagedIndex(PagedPostingError),
 }
 impl std::fmt::Display for PagedSearchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Archive(error) => write!(f, "{error}"), Self::Search(error) => write!(f, "{error}"),
-            Self::Index(error) => write!(f, "{error}"),
+            Self::Index(error) => write!(f, "{error}"), Self::PagedIndex(error) => write!(f, "{error}"),
             Self::OwnerMismatch => f.write_str("SNAPSHOT_OWNER_MISMATCH"),
             Self::IdentityExhausted => f.write_str("SNAPSHOT_IDENTITY_EXHAUSTED"),
             Self::InvalidLimits => f.write_str("SNAPSHOT_QUERY_INVALID_LIMITS"),
@@ -50,6 +52,11 @@ impl std::error::Error for PagedSearchError {}
 impl From<PagedSnapshotError> for PagedSearchError { fn from(e: PagedSnapshotError) -> Self { Self::Archive(e) } }
 impl From<StreamReadError> for PagedSearchError { fn from(e: StreamReadError) -> Self { Self::Search(e) } }
 impl From<SnapshotIndexError> for PagedSearchError { fn from(e: SnapshotIndexError) -> Self { Self::Index(e) } }
+impl From<PagedPostingError> for PagedSearchError {
+    fn from(e: PagedPostingError) -> Self {
+        if e == PagedPostingError::Index(SnapshotIndexError::Canceled) { Self::Canceled } else { Self::PagedIndex(e) }
+    }
+}
 
 /// Binds prefilter bytes to the EXACT literal passed to the production matcher.
 /// The pattern is borrowed and cannot be changed during a query. This prevents a
@@ -120,6 +127,7 @@ pub struct PagedQuery<'archive, 'needle, R: Read + Seek> {
     needle: &'needle StreamingNeedle,
     index: Option<(&'needle SnapshotIndex, &'needle [u8])>,
     postings: Option<PostingCandidates<'needle>>,
+    paged_postings: Option<PagedPostingCandidates<'needle>>,
     options: PagedQueryOptions,
     allocations: [ResourceAllocationId; 3],
     next: usize,
@@ -154,8 +162,8 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
             .map_err(|_| PagedSearchError::ResourceDenied)?;
         let mut hits = Vec::new(); hits.try_reserve_exact(options.max_matches).map_err(|_| PagedSearchError::ResourceDenied)?;
         if hits.capacity() > options.max_matches { return Err(PagedSearchError::ResourceDenied); }
-        Ok(Self { archive, needle, index: None, postings: None, options, allocations, next: 0, active: None, hits, matches_seen: 0,
-            state: PagedQueryState::Pending, stats: PagedQueryStats::default(), _lease: lease })
+        Ok(Self { archive, needle, index: None, postings: None, paged_postings: None, options, allocations, next: 0,
+            active: None, hits, matches_seen: 0, state: PagedQueryState::Pending, stats: PagedQueryStats::default(), _lease: lease })
     }
     /// Same exact query, with complete compatible persisted segments allowed to
     /// eliminate files BEFORE loading them. No unchecked caller candidate list.
@@ -184,6 +192,20 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
         query.postings = Some(candidates);
         Ok(query)
     }
+    /// On-demand index-page variant of the SAME source verification pipeline.
+    /// Constructor does no page I/O. Each nonzero step can load one index page
+    /// in addition to the existing separately bounded source-member work.
+    pub fn new_paged<I: Read + Seek>(archive: &'archive mut PagedSnapshot<R>, needle: &'needle IndexedNeedle<'_>,
+        index: &'needle mut PagedPostings<I>, options: PagedQueryOptions, budget: &ResourceBudget,
+        allocations: [ResourceAllocationId; 3]) -> Result<Self, PagedSearchError> {
+        index.validate_directory(archive.directory())?;
+        if needle.owner != archive.directory().owner() { return Err(PagedSearchError::OwnerMismatch); }
+        let mut query = Self::new(archive, &needle.inner, options, budget, allocations)?;
+        let candidates = index.candidates(needle.pattern, matches!(needle.inner.mode(), StreamingMode::ExactText));
+        query.stats.posting_list_lookups = candidates.stats().list_lookups;
+        query.paged_postings = Some(candidates);
+        Ok(query)
+    }
     pub const fn state(&self) -> PagedQueryState { self.state }
     pub const fn generation(&self) -> QueryGeneration { self.options.generation }
     pub const fn stats(&self) -> PagedQueryStats { self.stats }
@@ -209,13 +231,18 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
     fn advance(&mut self, step: StreamReadStep, budget: &ResourceBudget,
         canceled: &mut impl FnMut() -> bool) -> Result<(), PagedSearchError> {
         if self.active.is_none() {
-            let (ordinal, posting_decision) = if let Some(cursor) = self.postings.as_mut() {
+            let selected = if let Some(cursor) = self.paged_postings.as_mut() {
+                let result = cursor.step(&mut *canceled)?;
+                Some((result, cursor.stats(), cursor.is_finished(), cursor.excluded_files()))
+            } else if let Some(cursor) = self.postings.as_mut() {
                 let result = cursor.step();
-                let stats = cursor.stats();
+                Some((result, cursor.stats(), cursor.is_finished(), cursor.excluded_files()))
+            } else { None };
+            let (ordinal, posting_decision) = if let Some((result, stats, finished, excluded)) = selected {
                 self.stats.posting_entries_visited = stats.posting_entries_visited;
                 self.stats.posting_membership_lookups = stats.membership_lookups;
-                self.stats.posting_cursor_complete = cursor.is_finished();
-                if let Some(excluded) = cursor.excluded_files() { self.stats.index_eliminated_files = excluded; }
+                self.stats.posting_cursor_complete = finished;
+                if let Some(excluded) = excluded { self.stats.index_eliminated_files = excluded; }
                 match result {
                     PostingStep::Pending => return Ok(()),
                     PostingStep::Finished => { self.state = PagedQueryState::Complete; return Ok(()); }
