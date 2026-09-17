@@ -8,6 +8,8 @@
 //! filesystem access; display labels never substitute for a FileId.
 
 pub mod navigation;
+#[cfg(feature = "search")]
+pub mod workspace;
 pub use navigation::{AtlasLocation, AtlasNavigation};
 pub use fcb_map::*;
 pub use fcb_core::{DisplayColorConfig, QueryGeneration, ResourceAllocationId,
