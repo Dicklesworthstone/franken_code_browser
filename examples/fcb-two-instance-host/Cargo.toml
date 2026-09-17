@@ -1,0 +1,19 @@
+[package]
+name = "fcb-two-instance-host"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Standalone external workspace: Mac host embedding two independent FCB views
+# with one compatible runtime, verifying multi-instance isolation, separate grants,
+# shared provider, authorized font domain, independent close, and cross-owner handle rejection.
+
+[workspace]
+
+[dependencies]
+fcb = { path = "../../crates/fcb" }
+fcb-core = { path = "../../crates/fcb-core" }
+fcb-runtime = { path = "../../crates/fcb-runtime" }
+fcb-source = { path = "../../crates/fcb-source" }
+fcb-test-support = { path = "../../crates/fcb-test-support" }
