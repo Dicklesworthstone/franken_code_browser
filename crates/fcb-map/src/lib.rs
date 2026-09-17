@@ -13,6 +13,7 @@ mod repair;
 pub mod atlas;
 pub mod camera;
 pub mod labels;
+pub mod navigation;
 pub mod visible;
 
 pub use atlas::{AtlasBuildLimits, AtlasError, AtlasIndex, AtlasNodeId};
@@ -21,6 +22,11 @@ pub use labels::{
     candidates_from_visible_parcels, place_labels, CollisionGrid, LabelCandidate, LabelContext,
     LabelLimits, LabelMeasureCache, LabelPlan, LabelStats, PlacedLabel, RetainedLabelSet,
     DEFAULT_MAX_LABELS, MAX_LABELS,
+};
+pub use navigation::{
+    HistoryEntry, MotionPreference, NavigationError, NavigationFlight, NavigationFlightConfig,
+    NavigationHistory, NavigationReason, DEFAULT_FLIGHT_DURATION_NANOS,
+    DEFAULT_MAX_HISTORY_CAPACITY, DEFAULT_MAX_STEP_DELTA_NANOS,
 };
 pub use visible::{AggregateReason, AtlasDetail, AtlasHit, LodThresholds, PresentedAtlas,
     VisibleLimits, VisibleParcel, VisiblePlan, VisibleQuery, VisibleState, VisibleStats};
