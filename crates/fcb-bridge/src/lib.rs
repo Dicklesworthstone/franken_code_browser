@@ -6,8 +6,12 @@
 //!
 //! Every returned non-null string is owned by the caller and must be released
 //! exactly once with `fcb_free_string`. Functions are synchronous worker work.
-//! New calls are new source observations; numeric IDs do not join invocations.
+//! Legacy one-shot calls observe sources independently. The reader_ffi exports
+//! instead share one immutable capture through explicit retained handles.
 //! Unwinding Rust panics become null; aborting failures cannot be recovered here.
+
+mod reader_sessions;
+mod reader_ffi;
 
 use std::{ffi::{c_char, CStr, CString}, panic::{catch_unwind, UnwindSafe}, path::Path};
 use fcb_app::host;

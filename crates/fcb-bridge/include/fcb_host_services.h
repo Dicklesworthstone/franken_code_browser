@@ -2,6 +2,7 @@
 #define FCB_HOST_SERVICES_H
 
 #include <stdint.h>
+#include "fcb_reader_sessions.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,7 +20,8 @@ extern "C" {
  * Structured calls return the application's bounded JSON, including ordinary
  * error and partial results. A non-null pointer alone does NOT mean completion.
  * NULL means no complete response could be handed off (or invalid C input).
- * IDs in separate calls cannot be joined: each call is a new observation.
+ * The one-shot functions BELOW make independent source observations. For a
+ * pinned source across calls, use the included fcb_reader_sessions.h API.
  */
 
 /* Legacy exact whole UTF-8 source, <= 4 MiB; NULL on oversize, invalid UTF-8,
