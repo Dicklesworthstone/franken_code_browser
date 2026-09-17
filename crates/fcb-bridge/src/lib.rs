@@ -128,6 +128,11 @@ fn atlas_json(root_path: &str) -> Option<String> {
     let owner = ArenaOwnerId::new(1).ok()?;
     let root_id = RootId::new(owner, 1).ok()?;
     let revision = fcb_map::LayoutRevision::new(owner, 1).ok()?;
+    // Overview weight = one file, one tile. Byte-weighting lets a few
+    // huge generated files swallow the world and push 19k sources into
+    // sub-pixel slivers; the uniform weight makes every file visibly
+    // present, which is the atlas contract. Directories aggregate their
+    // descendant file counts (walk already sums `bytes` that way).
     let nodes: Vec<NodeSpec> = entries
         .iter()
         .map(|entry| {
@@ -138,7 +143,7 @@ fn atlas_json(root_path: &str) -> Option<String> {
                 } else {
                     NodeKind::File
                 },
-                Some(entry.bytes),
+                Some(if entry.is_dir { entry.bytes } else { 1 }),
             )
         })
         .collect();
