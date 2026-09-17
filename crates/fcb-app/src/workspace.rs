@@ -2,7 +2,10 @@
 
 //! Explicit --workspace composition. Enumeration/capture/query policies live in
 //! the public facade; this module supplies CLI-authorized filesystem handles and
-//! the bounded wire response. No store, shell, watcher or background runtime.
+//! the bounded wire response. Repository configuration reads are independently
+//! selected by --respect-ignores and counted separately from source payloads.
+
+pub(crate) mod rule_output;
 
 use std::{fs, path::{Path, PathBuf}, sync::Arc};
 use fcb::{ByteLength, ByteOffset, ByteRange};
@@ -12,7 +15,7 @@ use fcb::search::{CaptureRequest, CompleteCapture, ExtentConsistency, ExtentRead
     ExtentStepBudget, FileRangeReader, IndexLimits, ParsedQuery, PathEntry, PathIndex,
     PathIndexLimits, PathSearch, PathSearchOptions, RawPath, ResourceBudget, RootId,
     QueryOptions, SearchCoverage, SearchManifestId};
-use fcb::search::workspace::{RootGrant, WorkspaceCatalog, WorkspaceCaptures,
+use fcb::search::workspace::{RootGrant, RuleLimits, WorkspaceCatalog, WorkspaceCaptures,
     WorkspaceLimits, WorkspaceStage};
 use crate::{AppError, EXIT_OK, EXIT_NO_MATCH, EXIT_PARTIAL, SCHEMA, allocation,
     file_id, generation, owner, revision};
@@ -35,14 +38,19 @@ pub(crate) fn execute(args: &Arguments, out: &mut Output, budget: &ResourceBudge
     let limits = WorkspaceLimits { max_files: args.max_files, max_file_bytes: args.max_file_bytes,
         max_source_bytes: args.max_total_bytes, ..WorkspaceLimits::default() };
     let id = SearchManifestId::new(owner(), 1)?;
-    let mut catalog = WorkspaceCatalog::open(grant, id, file_id(), limits,
-        args.include_excluded, budget, allocation(30))?;
+    let mut catalog = if args.respect_ignores {
+        WorkspaceCatalog::open_rule_aware(grant, id, file_id(), limits, RuleLimits::default(),
+            budget, [allocation(30), allocation(39)])?
+    } else {
+        WorkspaceCatalog::open(grant, id, file_id(), limits, args.include_excluded, budget, allocation(30))?
+    };
     let cancel = CancelFlag::new();
     while catalog.stage() == WorkspaceStage::Discovering {
         if canceled() { return Err(AppError::Canceled); }
         catalog.step(&cancel)?;
     }
     if canceled() { return Err(AppError::Canceled); }
+    if !args.json { rule_output::human(out, &catalog)?; }
     if args.command == Command::Inspect { return inspect(args, &catalog, &root, out, canceled); }
     if args.whole_file { return crate::whole_file::workspace(args, &catalog, &root, out, budget, canceled); }
     match args.needle.as_ref() {
@@ -83,6 +91,7 @@ pub(crate) fn common(out: &mut Output, command: &str, catalog: &WorkspaceCatalog
         out.quoted(name)?; out.literal(":")?; out.integer(count)?;
     }
     out.literal("}")?;
+    rule_output::fields(out, catalog)?;
     Ok(())
 }
 
@@ -118,19 +127,14 @@ fn paths(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str
     out: &mut Output, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<u8, AppError> {
     let count = catalog.entries().len();
     let scratch_bytes = std::mem::size_of::<Vec<PathEntry<'_>>>() + count * std::mem::size_of::<PathEntry<'_>>();
-    let _scratch = budget.try_reserve_managed(owner(), allocation(31), ByteLength::new(scratch_bytes as u64))
-        .map_err(|_| AppError::Admission)?;
-    let mut entries = Vec::new();
-    entries.try_reserve_exact(count).map_err(|_| AppError::Admission)?;
+    let _scratch = budget.try_reserve_managed(owner(), allocation(31), ByteLength::new(scratch_bytes as u64)).map_err(|_| AppError::Admission)?;
+    let mut entries = Vec::new(); entries.try_reserve_exact(count).map_err(|_| AppError::Admission)?;
     if entries.capacity() > count { return Err(AppError::Admission); }
     for (ordinal, entry) in catalog.entries().iter().enumerate() {
-        entries.push(PathEntry::new(catalog.file_id(ordinal).ok_or(AppError::InvalidRange)?,
-            catalog.grant().root_id(), entry.path().raw()));
+        entries.push(PathEntry::new(catalog.file_id(ordinal).ok_or(AppError::InvalidRange)?, catalog.grant().root_id(), entry.path().raw()));
     }
-    let membership = if catalog.discovery_complete() { fcb::search::MembershipState::Closed }
-        else { fcb::search::MembershipState::Discovering };
-    let index = PathIndex::build(catalog.id(), membership, &entries, PathIndexLimits::default(),
-        budget, allocation(32), &mut *canceled)?;
+    let membership = if catalog.discovery_complete() { fcb::search::MembershipState::Closed } else { fcb::search::MembershipState::Discovering };
+    let index = PathIndex::build(catalog.id(), membership, &entries, PathIndexLimits::default(), budget, allocation(32), &mut *canceled)?;
     let mut options = PathSearchOptions::new(generation()); options.max_results = args.limit;
     let mut query = PathSearch::new(&index, needle.as_bytes(), options, budget, allocation(33))?;
     query.run_to_completion(&mut *canceled)?;
@@ -172,8 +176,6 @@ fn text(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str,
     }
     let inputs = captures.search_inputs(budget, allocation(35))?;
     let index = inputs.index(IndexLimits::default(), budget, allocation(36), &mut *canceled)?;
-    // --text is a literal, including whitespace and strings like "path:foo".
-    // The existing advanced AST remains available to library callers separately.
     let query = ParsedQuery { primary_needle: needle.to_owned(), is_phrase: true,
         conjunction_terms: Vec::new(), exclusion_terms: Vec::new(), path_filters: Vec::new(),
         lang_filters: Vec::new(), raw_query: needle.to_owned() };
@@ -209,14 +211,12 @@ fn text(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str,
             if i > 0 { out.literal(",")?; }
             file_record(out, catalog, *file)?;
             out.literal(",\"reason\":")?;
-            out.quoted(captures.file_failure(*file).ok_or(AppError::InvalidRange)?.code())?;
-            out.literal("}")?;
+            out.quoted(captures.file_failure(*file).ok_or(AppError::InvalidRange)?.code())?; out.literal("}")?;
         }
         out.literal("],\"unsupported_text_files\":[")?;
         for (i, file) in result.unsupported_files.iter().enumerate() {
             if canceled() { return Err(AppError::Canceled); }
-            if i > 0 { out.literal(",")?;
-            }
+            if i > 0 { out.literal(",")?; }
             file_record(out, catalog, *file)?;
             out.literal(",\"reason\":\"UNSUPPORTED_EXACT_TEXT_DECODING\"}")?;
         }
@@ -236,14 +236,12 @@ fn text(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str,
     Ok(if !report.is_complete() { EXIT_PARTIAL } else if result.matches.is_empty() { EXIT_NO_MATCH } else { EXIT_OK })
 }
 
-// Opens an object so the caller can add its reason before closing the record.
 fn file_record(out: &mut Output, catalog: &WorkspaceCatalog, file: fcb::FileId) -> Result<(), AppError> {
     out.literal("{\"file_id\":")?; out.integer(file.get())?;
     out.literal(",\"path\":")?;
     out.path(&catalog.entry(file).ok_or(AppError::InvalidRange)?.path().raw().to_path_buf())?;
     Ok(())
 }
-
 #[derive(Default)]
 struct IoCounts { bytes: u64, calls: u64 }
 
@@ -253,9 +251,7 @@ fn read_capture(root: &Path, request: CaptureRequest, path: &NormalizedPath, lim
     if canceled() { return Err(SourceError::Canceled); }
     let native = checked_source_path(root, path)?;
     let (file, metadata) = input::open_regular(&native).map_err(|_| SourceError::CaptureUnavailable)?;
-    if metadata.len() > limit as u64 || metadata.len() > total_limit.saturating_sub(io.bytes) {
-        return Err(SourceError::PayloadTooLarge);
-    }
+    if metadata.len() > limit as u64 || metadata.len() > total_limit.saturating_sub(io.bytes) { return Err(SourceError::PayloadTooLarge); }
     let mut reader = FileRangeReader::new(request.file(), file).map_err(|_| SourceError::CaptureUnavailable)?;
     let length = ByteLength::new(metadata.len());
     let mut read_request = request;
@@ -268,11 +264,9 @@ fn read_capture(root: &Path, request: CaptureRequest, path: &NormalizedPath, lim
         if canceled() { return Err(SourceError::Canceled); }
         if io.calls >= MAX_READ_CALLS { return Err(SourceError::CaptureUnavailable); }
         let before = read.stats();
-        let status = read.step(ExtentStepBudget { max_bytes: 64 * 1024,
-            max_calls: (MAX_READ_CALLS - io.calls).min(32) as usize }, &mut *canceled);
+        let status = read.step(ExtentStepBudget { max_bytes: 64 * 1024, max_calls: (MAX_READ_CALLS - io.calls).min(32) as usize }, &mut *canceled);
         let after = read.stats();
-        io.bytes += after.bytes_read - before.bytes_read;
-        io.calls += after.read_calls - before.read_calls;
+        io.bytes += after.bytes_read - before.bytes_read; io.calls += after.read_calls - before.read_calls;
         status.map_err(|_| if canceled() { SourceError::Canceled } else { SourceError::CaptureUnavailable })?;
     }
     let extent = read.finish(&mut *canceled).map_err(|_| if canceled() { SourceError::Canceled } else { SourceError::CaptureUnavailable })?;
@@ -283,9 +277,8 @@ fn read_capture(root: &Path, request: CaptureRequest, path: &NormalizedPath, lim
     CompleteCapture::new(request, length, Arc::from(extent.bytes()))
 }
 
-/// Shared admission for capture and streaming strategies. These checks refuse
-/// observed symlinks; the final open also applies no-follow/nonblocking flags.
-/// Separate pathname checks still do not qualify hostile ancestor-race safety.
+/// Refuse observed symlinks; final native open applies its own checks.
+/// Separate pathname checks do not qualify hostile ancestor-race safety.
 pub(crate) fn checked_source_path(root: &Path, path: &NormalizedPath) -> Result<PathBuf, SourceError> {
     let mut native = root.to_path_buf();
     for segment in path.segments() {
