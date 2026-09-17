@@ -53,7 +53,7 @@ pub(super) fn execute(options: &Options, out: &mut Output, budget: &ResourceBudg
         out.literal(",\"member_payload_bytes_loaded\":")?; out.integer(target.load_stats().bytes_read)?;
         out.literal(",\"loaded_members\":")?; out.integer(target.load_stats().loaded_members)?;
         out.literal(",\"new_segment_source_bytes_loaded\":")?; out.integer(counters.loaded_source_bytes)?;
-        out.literal(",\"reuse_identity\":\"source-sha256-length-and-semantics\",\"rename_inferred\":false") ;
+        out.literal(",\"reuse_identity\":\"source-sha256-length-and-semantics\",\"rename_inferred\":false")?;
         out.literal(",\"source_derived_sensitive\":true,\"power_loss_qualified\":false}\n")?;
     } else {
         out.literal("Saved refreshed substring index. Retain its new trusted digest separately:\n")?;
