@@ -12,7 +12,7 @@
 use std::{fs, io::{self, Read}, mem::size_of, path::Path};
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
 use crate::{CancelFlag, RootGrant, SourceError, safe_open_regular_file};
-use super::{IgnoreLayerKind, IgnoreMatcher, NormalizedPath};
+use super::{IgnoreMatcher, NormalizedPath};
 use super::budget::IgnoreWorkError;
 
 pub const RULE_POLICY_NAME: &str = "repository-rules-v1";
@@ -23,6 +23,7 @@ const MAX_PATH_BYTES: usize = 4096;
 pub struct RuleLimits {
     pub max_file_bytes: usize,
     pub max_total_bytes: usize,
+    /// Retained successful observations, not a replacement for check/read caps.
     pub max_files: usize,
     pub max_checks: u64,
     pub max_read_calls: u64,
@@ -100,9 +101,8 @@ impl RuleDiagnostic {
     pub fn path(&self) -> &[u8] { &self.path }
     pub const fn error(&self) -> RuleError { self.error }
 }
-/// Exact successful rule observations, in native-path order. Useful for hashing
-/// policy identity in an explicitly requested snapshot export. No ambient root
-/// path is included. These bytes may themselves contain sensitive metadata.
+/// Successful rule observations in native-path order, useful for saved policy
+/// identity. No ambient root path is included; these bytes may still be sensitive.
 pub struct RuleObservation { path: Vec<u8>, bytes: Vec<u8> }
 impl RuleObservation {
     pub fn path(&self) -> &[u8] { &self.path }
@@ -119,9 +119,8 @@ pub struct RepositoryRules {
     _lease: ResourceLease,
 }
 impl RepositoryRules {
-    /// Construction reserves all configured compiled state, observations,
-    /// diagnostic paths and bounded per-file scratch before allocating. No I/O.
-    /// The private matcher cannot be enlarged through an unaccounted escape API.
+    /// Reserve compiled state, observations, diagnostic paths, and read scratch
+    /// before allocation. The private matcher has no uncharged mutation API.
     pub fn new(owner: ArenaOwnerId, limits: RuleLimits, budget: &ResourceBudget,
         allocation: ResourceAllocationId) -> Result<Self, RuleError> {
         limits.validate()?;
@@ -146,9 +145,8 @@ impl RepositoryRules {
     pub fn observations(&self) -> &[RuleObservation] { &self.evidence }
     pub fn diagnostics(&self) -> &[RuleDiagnostic] { &self.diagnostics }
 
-    /// Called BEFORE enumerating this directory. Parent rules were loaded first;
-    /// .fcbignore is later than .gitignore at equal depth. Sibling prefixes cannot
-    /// affect one another. Excluded parents are not entered to load child rules.
+    /// Run BEFORE enumerating a directory: parents precede children; .fcbignore
+    /// follows .gitignore at equal depth. Excluded directories are not entered.
     pub(crate) fn load_directory(&mut self, prefix: Option<&NormalizedPath>, resolved: &Path,
         grant: &RootGrant, cancel: &CancelFlag) -> Result<(), RuleError> {
         if grant.owner() != self.owner { return Err(SourceError::ForeignOwner.into()); }
@@ -179,8 +177,8 @@ impl RepositoryRules {
         Ok(())
     }
 
-    /// Atomically append one observed rule file. Unsupported syntax, malformed
-    /// text or a quota error never leaves a prefix of that file's rules active.
+    /// Append a complete accepted rule file, never a prefix preceding an invalid
+    /// pattern. Existing parser semantics are reused, not silently extended.
     fn admit(&mut self, prefix: Option<&NormalizedPath>, relative: &[u8], bytes: Vec<u8>,
         cancel: &CancelFlag) -> Result<(), RuleError> {
         if self.evidence.len() == self.limits.max_files { return Err(RuleError::FileLimit); }
@@ -195,16 +193,18 @@ impl RepositoryRules {
             if raw.len() > self.limits.max_pattern_bytes || raw.as_bytes().contains(&0) { return Err(RuleError::PatternLimit); }
             let raw = super::strip_unescaped_trailing_spaces(raw);
             if raw.is_empty() || raw.starts_with('#') { continue; }
-            // These POSIX class/collating forms are not in the existing compiler's
-            // qualified subset; do not reinterpret them as a different byte class.
-            if raw.contains("[[:") || raw.contains("[[.") || raw.contains("[[=") { return Err(RuleError::UnsupportedPattern); }
+            // The compatibility compiler collapses empty path segments and does
+            // not implement POSIX class/collating syntax. Do not silently guess
+            // their meaning when accepting repository-supplied policy.
+            if raw.contains("//") || raw.contains("[[:") || raw.contains("[[.") || raw.contains("[[=") {
+                return Err(RuleError::UnsupportedPattern);
+            }
             lines += 1;
             charge = charge.checked_add((raw.len() + 1) * 512 + prefix_cost + 512).ok_or(RuleError::CompileLimit)?;
         }
         if lines > self.limits.max_rules.saturating_sub(self.stats.rules_loaded) { return Err(RuleError::PatternLimit); }
         if charge > self.limits.max_compiled_bytes.saturating_sub(self.stats.compiled_admission_bytes) { return Err(RuleError::CompileLimit); }
-        // Conservative per-byte charge covers class expansion, prefix clones,
-        // AST vectors/strings and candidate-versus-retained allocation overlap.
+        // Covers class expansion, prefix clones and old/new AST overlap.
         let mut candidate = IgnoreMatcher::include_all();
         candidate.patterns.try_reserve_exact(lines).map_err(|_| RuleError::ResourceDenied)?;
         candidate.add_rule_file(prefix, text);
@@ -241,8 +241,9 @@ impl RepositoryRules {
     }
 }
 
-/// Shared by explicit policy discovery and the legacy per-file loader. A
-/// metadata-size check NEVER authorizes an unbounded fs::read/read_to_end.
+/// Shared with the legacy per-file loader. A metadata check never authorizes an
+/// unbounded read. EOF/growth probes also require remaining global byte capacity;
+/// a file can be refused at an exact exhausted boundary rather than guessing EOF.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn read_rule_file(path: &Path, max_file_bytes: usize, max_total_bytes: u64,
     max_calls: u64, grant: &RootGrant, cancel: &CancelFlag, stats: &mut RuleStats)
@@ -269,16 +270,18 @@ pub(crate) fn read_rule_file(path: &Path, max_file_bytes: usize, max_total_bytes
         grant.validate_active()?;
         if cancel.is_canceled() { return Err(SourceError::Canceled.into()); }
         if stats.read_calls == max_calls { return Err(RuleError::ReadCallLimit); }
+        let remaining = max_total_bytes.saturating_sub(stats.bytes_read);
+        if remaining == 0 { return Err(RuleError::ByteLimit); }
         stats.read_calls += 1;
-        let end = length.min(offset + 4096);
+        let end = length.min(offset + 4096).min(offset.saturating_add(usize::try_from(remaining).unwrap_or(usize::MAX)));
         let mut lookahead = [0u8; 1];
         let destination = if offset == length { &mut lookahead[..] } else { &mut bytes[offset..end] };
         match file.read(destination) {
             Ok(0) if offset == length => break,
             Ok(0) => return Err(RuleError::Changed),
             Ok(n) if n <= destination.len() => {
-                stats.bytes_read = stats.bytes_read.saturating_add(n as u64);
-                if offset == length || stats.bytes_read > max_total_bytes { return Err(RuleError::Changed); }
+                stats.bytes_read += n as u64;
+                if offset == length { return Err(RuleError::Changed); }
                 offset += n;
             }
             Ok(_) => return Err(RuleError::ReadFailed),
