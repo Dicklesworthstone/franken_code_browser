@@ -40,9 +40,10 @@ fn query<R: Read + Seek>(archive: &mut PagedSnapshot<R>, index: Option<&Snapshot
         while query.state() == PagedQueryState::Pending { query.step(StreamReadStep::default(), options.generation, b, || false).unwrap(); }
         query.finish().unwrap()
     } else {
-        let needle = if text { StreamingNeedle::text(owner(), std::str::from_utf8(needle).unwrap(), b, id(30)).unwrap() }
-            else { StreamingNeedle::raw(owner(), needle, b, id(30)).unwrap() };
-        let mut query = PagedQuery::new(archive, &needle, options, b, [id(31), id(32), id(33)]).unwrap();
+        // Reference and indexed reports may coexist for exact comparisons.
+        let needle = if text { StreamingNeedle::text(owner(), std::str::from_utf8(needle).unwrap(), b, id(40)).unwrap() }
+            else { StreamingNeedle::raw(owner(), needle, b, id(40)).unwrap() };
+        let mut query = PagedQuery::new(archive, &needle, options, b, [id(41), id(42), id(43)]).unwrap();
         while query.state() == PagedQueryState::Pending { query.step(StreamReadStep::default(), options.generation, b, || false).unwrap(); }
         query.finish().unwrap()
     }
@@ -108,9 +109,8 @@ fn refreshed_queries_equal_unfiltered_queries_across_encodings_short_needles_and
         for needle in [b"a".as_slice(), b"ana", b"banana", b"new", b"absent"] {
             for limit in [0, 1, 2, 100] {
                 let expected = query(&mut target, None, needle, !raw, limit, &b);
-                let expected = signature(&expected);
                 let actual = query(&mut target, Some(next.index()), needle, !raw, limit, &b);
-                assert_eq!(signature(&actual), expected, "raw={raw} needle={needle:?} limit={limit}");
+                assert_eq!(signature(&actual), signature(&expected), "raw={raw} needle={needle:?} limit={limit}");
             }
         }
     }
@@ -174,7 +174,7 @@ fn canceled_refused_and_foreign_refreshes_preserve_the_prior_generation() {
     let mut target = archive(&[entry(b"a", b"banana")], true, &b, 2);
     let baseline = b.accounting().reserved();
     assert!(matches!(old.refresh(&mut target, IndexLimits::default(), &b, [id(20), id(21), id(22), id(23), id(24)],
-        || b.accounting().reserved() > baseline), Err(SnapshotIndexError::Canceled)));
+        || b.accounting().reserved().get() > baseline.get()), Err(SnapshotIndexError::Canceled)));
     assert_eq!(b.accounting().reserved(), baseline);
     let tiny = ResourceBudget::new(owner(), ByteLength::new(1)).unwrap();
     assert!(matches!(old.refresh(&mut target, IndexLimits::default(), &tiny, [id(20), id(21), id(22), id(23), id(24)], || false),
