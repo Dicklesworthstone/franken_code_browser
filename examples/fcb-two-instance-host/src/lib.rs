@@ -600,8 +600,275 @@ impl TwoInstanceHost {
         &mut self.drain_queue_b
     }
 
+    pub fn is_view_a_attached(&self) -> bool {
+        self.active_view_a.is_some()
+    }
+
+    pub fn is_view_b_attached(&self) -> bool {
+        self.active_view_b.is_some()
+    }
+
+    pub fn active_view_a(&self) -> Option<&BrowserView> {
+        self.active_view_a.as_ref()
+    }
+
+    pub fn active_view_b(&self) -> Option<&BrowserView> {
+        self.active_view_b.as_ref()
+    }
+
+    pub fn detach_view_a(&mut self) -> Result<BrowserView, HostFixtureError> {
+        self.active_view_a
+            .take()
+            .ok_or(HostFixtureError::ViewAlreadyDetached {
+                owner: self.owner_a,
+            })
+    }
+
+    pub fn detach_view_b(&mut self) -> Result<BrowserView, HostFixtureError> {
+        self.active_view_b
+            .take()
+            .ok_or(HostFixtureError::ViewAlreadyDetached {
+                owner: self.owner_b,
+            })
+    }
+
+    pub fn reattach_view_a(&mut self, view: BrowserView) -> Result<(), HostFixtureError> {
+        if view.source().owner() != self.owner_a {
+            return Err(HostFixtureError::OwnerMismatch {
+                expected: self.owner_a,
+                actual: view.source().owner(),
+            });
+        }
+        self.active_view_a = Some(view);
+        Ok(())
+    }
+
+    pub fn reattach_view_b(&mut self, view: BrowserView) -> Result<(), HostFixtureError> {
+        if view.source().owner() != self.owner_b {
+            return Err(HostFixtureError::OwnerMismatch {
+                expected: self.owner_b,
+                actual: view.source().owner(),
+            });
+        }
+        self.active_view_b = Some(view);
+        Ok(())
+    }
+
+    pub fn request_redraw_view_a(&self) -> Result<(), HostFixtureError> {
+        if self.active_view_a.is_none() {
+            return Err(HostFixtureError::ViewNotAttached {
+                owner: self.owner_a,
+            });
+        }
+        self.run_loop
+            .record_request(self.owner_a, HostRequest::RequestRedraw)
+            .map_err(|_| HostFixtureError::HostTerminated)
+    }
+
+    pub fn request_redraw_view_b(&self) -> Result<(), HostFixtureError> {
+        if self.active_view_b.is_none() {
+            return Err(HostFixtureError::ViewNotAttached {
+                owner: self.owner_b,
+            });
+        }
+        self.run_loop
+            .record_request(self.owner_b, HostRequest::RequestRedraw)
+            .map_err(|_| HostFixtureError::HostTerminated)
+    }
+
+    // In-flight background queries
+    pub fn start_query_a(&mut self, query_id: u64, path: &str) -> Result<(), HostFixtureError> {
+        if self.session_a.is_none() {
+            return Err(HostFixtureError::InstanceAlreadyClosed {
+                owner: self.owner_a,
+            });
+        }
+        self.in_flight_queries_a.insert(
+            query_id,
+            InFlightQueryStatus::Pending {
+                path: path.to_string(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn start_query_b(&mut self, query_id: u64, path: &str) -> Result<(), HostFixtureError> {
+        if self.session_b.is_none() {
+            return Err(HostFixtureError::InstanceAlreadyClosed {
+                owner: self.owner_b,
+            });
+        }
+        self.in_flight_queries_b.insert(
+            query_id,
+            InFlightQueryStatus::Pending {
+                path: path.to_string(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn complete_query_a(&mut self, query_id: u64) -> Result<SourceCapture, HostFixtureError> {
+        let status = self
+            .in_flight_queries_a
+            .get_mut(&query_id)
+            .ok_or(HostFixtureError::PendingQueryNotFound { query_id })?;
+
+        match status {
+            InFlightQueryStatus::Pending { path } => {
+                let capture = self
+                    .shared_provider
+                    .capture_for_session(self.owner_a, path)
+                    .map_err(|_| HostFixtureError::CrossOwnerAccessDenied)?;
+                *status = InFlightQueryStatus::Completed {
+                    capture: capture.clone(),
+                };
+                Ok(capture)
+            }
+            InFlightQueryStatus::Completed { capture } => Ok(capture.clone()),
+            InFlightQueryStatus::Cancelled => Err(HostFixtureError::QueryCancelled { query_id }),
+        }
+    }
+
+    pub fn complete_query_b(&mut self, query_id: u64) -> Result<SourceCapture, HostFixtureError> {
+        let status = self
+            .in_flight_queries_b
+            .get_mut(&query_id)
+            .ok_or(HostFixtureError::PendingQueryNotFound { query_id })?;
+
+        match status {
+            InFlightQueryStatus::Pending { path } => {
+                let capture = self
+                    .shared_provider
+                    .capture_for_session(self.owner_b, path)
+                    .map_err(|_| HostFixtureError::CrossOwnerAccessDenied)?;
+                *status = InFlightQueryStatus::Completed {
+                    capture: capture.clone(),
+                };
+                Ok(capture)
+            }
+            InFlightQueryStatus::Completed { capture } => Ok(capture.clone()),
+            InFlightQueryStatus::Cancelled => Err(HostFixtureError::QueryCancelled { query_id }),
+        }
+    }
+
+    pub fn cancel_query_a(&mut self, query_id: u64) -> Result<(), HostFixtureError> {
+        let status = self
+            .in_flight_queries_a
+            .get_mut(&query_id)
+            .ok_or(HostFixtureError::PendingQueryNotFound { query_id })?;
+        *status = InFlightQueryStatus::Cancelled;
+        Ok(())
+    }
+
+    pub fn cancel_query_b(&mut self, query_id: u64) -> Result<(), HostFixtureError> {
+        let status = self
+            .in_flight_queries_b
+            .get_mut(&query_id)
+            .ok_or(HostFixtureError::PendingQueryNotFound { query_id })?;
+        *status = InFlightQueryStatus::Cancelled;
+        Ok(())
+    }
+
+    pub fn pending_queries_count_a(&self) -> usize {
+        self.in_flight_queries_a
+            .values()
+            .filter(|s| matches!(s, InFlightQueryStatus::Pending { .. }))
+            .count()
+    }
+
+    pub fn pending_queries_count_b(&self) -> usize {
+        self.in_flight_queries_b
+            .values()
+            .filter(|s| matches!(s, InFlightQueryStatus::Pending { .. }))
+            .count()
+    }
+
+    // In-flight persistence transactions
+    pub fn begin_persistence_tx_a(
+        &mut self,
+        tx_id: u64,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<(), HostFixtureError> {
+        if self.session_a.is_none() {
+            return Err(HostFixtureError::InstanceAlreadyClosed {
+                owner: self.owner_a,
+            });
+        }
+        self.in_flight_persistence_a.insert(
+            tx_id,
+            PersistenceTx {
+                key: key.into(),
+                value: value.into(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn begin_persistence_tx_b(
+        &mut self,
+        tx_id: u64,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<(), HostFixtureError> {
+        if self.session_b.is_none() {
+            return Err(HostFixtureError::InstanceAlreadyClosed {
+                owner: self.owner_b,
+            });
+        }
+        self.in_flight_persistence_b.insert(
+            tx_id,
+            PersistenceTx {
+                key: key.into(),
+                value: value.into(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn commit_persistence_tx_a(&mut self, tx_id: u64) -> Result<(), HostFixtureError> {
+        let tx = self
+            .in_flight_persistence_a
+            .remove(&tx_id)
+            .ok_or(HostFixtureError::PendingTransactionNotFound { tx_id })?;
+        self.private_annotations_a.insert(tx.key, tx.value);
+        Ok(())
+    }
+
+    pub fn commit_persistence_tx_b(&mut self, tx_id: u64) -> Result<(), HostFixtureError> {
+        let tx = self
+            .in_flight_persistence_b
+            .remove(&tx_id)
+            .ok_or(HostFixtureError::PendingTransactionNotFound { tx_id })?;
+        self.private_annotations_b.insert(tx.key, tx.value);
+        Ok(())
+    }
+
+    pub fn rollback_persistence_tx_a(&mut self, tx_id: u64) -> Result<(), HostFixtureError> {
+        self.in_flight_persistence_a
+            .remove(&tx_id)
+            .ok_or(HostFixtureError::PendingTransactionNotFound { tx_id })?;
+        Ok(())
+    }
+
+    pub fn rollback_persistence_tx_b(&mut self, tx_id: u64) -> Result<(), HostFixtureError> {
+        self.in_flight_persistence_b
+            .remove(&tx_id)
+            .ok_or(HostFixtureError::PendingTransactionNotFound { tx_id })?;
+        Ok(())
+    }
+
+    pub fn pending_persistence_count_a(&self) -> usize {
+        self.in_flight_persistence_a.len()
+    }
+
+    pub fn pending_persistence_count_b(&self) -> usize {
+        self.in_flight_persistence_b.len()
+    }
+
     /// Close instance A independently: drains its in-flight queue, closes its session,
-    /// clears its private state, but leaves instance B and the host run loop alive.
+    /// clears its private state, cancels pending queries/transactions, but leaves instance B
+    /// and the host run loop alive.
     pub fn close_instance_a(&mut self) -> Result<InstanceCloseSummary, HostFixtureError> {
         let session = self.session_a.take().ok_or(HostFixtureError::InstanceAlreadyClosed {
             owner: self.owner_a,
@@ -609,6 +876,10 @@ impl TwoInstanceHost {
 
         self.active_view_a = None;
         self.private_annotations_a.clear();
+        let cancelled_queries = self.in_flight_queries_a.len();
+        self.in_flight_queries_a.clear();
+        let discarded_persistence_txs = self.in_flight_persistence_a.len();
+        self.in_flight_persistence_a.clear();
         self.font_domain.revoke_consent(self.owner_a);
 
         self.drain_queue_a.close();
@@ -618,6 +889,8 @@ impl TwoInstanceHost {
         Ok(InstanceCloseSummary {
             owner: self.owner_a,
             drain_report,
+            cancelled_queries,
+            discarded_persistence_txs,
             host_still_running: self.run_loop.is_running(),
             peer_still_active: self.session_b.is_some(),
         })
@@ -631,6 +904,10 @@ impl TwoInstanceHost {
 
         self.active_view_b = None;
         self.private_annotations_b.clear();
+        let cancelled_queries = self.in_flight_queries_b.len();
+        self.in_flight_queries_b.clear();
+        let discarded_persistence_txs = self.in_flight_persistence_b.len();
+        self.in_flight_persistence_b.clear();
         self.font_domain.revoke_consent(self.owner_b);
 
         self.drain_queue_b.close();
@@ -640,6 +917,8 @@ impl TwoInstanceHost {
         Ok(InstanceCloseSummary {
             owner: self.owner_b,
             drain_report,
+            cancelled_queries,
+            discarded_persistence_txs,
             host_still_running: self.run_loop.is_running(),
             peer_still_active: self.session_a.is_some(),
         })
@@ -650,6 +929,7 @@ impl TwoInstanceHost {
     /// - Passing capture from A into session B is rejected (`OwnerMismatch`).
     /// - Passing device token A to an owner B check fails.
     /// - Font domain rejects unconsented queries.
+    /// - View reattachment across owners is rejected.
     pub fn verify_cross_owner_rejection(&self, capture_a: &SourceCapture) -> Result<(), HostFixtureError> {
         if let Some(session_b) = &self.session_b {
             let res = session_b.open_capture(capture_a.clone());
@@ -664,6 +944,17 @@ impl TwoInstanceHost {
 
         if self.device_b.validate_for(self.owner_a).is_ok() {
             return Err(HostFixtureError::CrossOwnerAccessDenied);
+        }
+
+        if let Some(view_a) = &self.active_view_a {
+            if view_a.source().owner() != self.owner_a {
+                return Err(HostFixtureError::CrossOwnerAccessDenied);
+            }
+        }
+        if let Some(view_b) = &self.active_view_b {
+            if view_b.source().owner() != self.owner_b {
+                return Err(HostFixtureError::CrossOwnerAccessDenied);
+            }
         }
 
         Ok(())
