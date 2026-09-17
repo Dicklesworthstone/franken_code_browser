@@ -12,6 +12,9 @@
 //! certificate merely by recomputing its embedded checksum. An untrusted index
 //! without such a pin must be rebuilt from its independently validated snapshot.
 
+mod refresh;
+pub use refresh::{RefreshStats, SnapshotRefresh};
+
 use std::{io::{Read, Seek}, mem::size_of, sync::Arc};
 use fcb_core::{ArenaOwnerId, ByteLength, FileId, ResourceAllocationId, ResourceBudget,
     ResourceLease, SourceRevision};
@@ -104,75 +107,9 @@ impl SnapshotIndex {
     /// allocations = [retained index, member load, capture copy, engine scratch].
     pub fn build<R: Read + Seek>(archive: &mut PagedSnapshot<R>, limits: IndexLimits,
         budget: &ResourceBudget, allocations: [ResourceAllocationId; 4],
-        mut canceled: impl FnMut() -> bool) -> Result<Self, SnapshotIndexError> {
-        if allocations.iter().enumerate().any(|(i, id)| allocations[..i].contains(id)) {
-            return Err(SnapshotIndexError::Limits);
-        }
-        let owner = archive.directory().owner();
-        let count = archive.directory().len();
-        if count > MAX_INDEX_MEMBERS || limits.max_total_grams > MAX_INDEX_GRAMS
-            || limits.max_source_bytes_per_file > 1024 * 1024 || limits.max_scratch_bytes > 4 * 1024 * 1024 {
-            return Err(SnapshotIndexError::Limits);
-        }
-        if canceled() { return Err(SnapshotIndexError::Canceled); }
-        let capacity = archive.directory().members().fold(0usize, |sum, member| {
-            let n = usize::try_from(member.observed_bytes).unwrap_or(usize::MAX);
-            if !matches!(member.data, PagedMemberData::Captured { .. }) || n > limits.max_source_bytes_per_file {
-                sum
-            } else { sum.saturating_add(n.saturating_sub(2).min(limits.max_grams_per_file)).min(limits.max_total_grams) }
-        });
-        let lease = reserve_charge(owner, count, capacity, budget, allocations[0])?;
-        let mut rows = reserve(count)?;
-        let mut grams = reserve(capacity)?;
-        let mut stats = SavedIndexStats { members: count, ..SavedIndexStats::default() };
-        for ordinal in 0..count {
-            if canceled() { return Err(SnapshotIndexError::Canceled); }
-            let member = archive.directory().member(ordinal).ok_or(SnapshotIndexError::SourceMismatch)?;
-            let (length, digest) = match member.data {
-                PagedMemberData::Unavailable(_) => {
-                    rows.push(Row { coverage: Coverage::Unavailable, length: member.observed_bytes,
-                        digest: Sha256Digest::new([0; 32]), start: grams.len(), count: 0 });
-                    stats.unavailable_files += 1; continue;
-                }
-                PagedMemberData::Captured { byte_length, digest, .. } => (byte_length, digest),
-            };
-            let mut row = Row { coverage: Coverage::Uncovered, length: length as u64,
-                digest, start: grams.len(), count: 0 };
-            let can_attempt = length <= limits.max_source_bytes_per_file
-                && length.saturating_sub(2) <= limits.max_scratch_bytes / 4
-                && length as u64 <= limits.max_source_bytes_total.saturating_sub(stats.build_source_bytes)
-                && (length < 3 || grams.len() < capacity);
-            if can_attempt {
-                let verified = archive.load(ordinal, budget, allocations[1], &mut canceled)?;
-                // The existing CompleteCapture owns Arc backing. Charge that
-                // copy before constructing it, alongside the verified read.
-                let copy_charge = length.checked_add(size_of::<CompleteCapture>() + 64).ok_or(SnapshotIndexError::Limits)?;
-                let _copy = budget.try_reserve_managed(owner, allocations[2], ByteLength::new(copy_charge as u64))
-                    .map_err(|_| SnapshotIndexError::ResourceDenied)?;
-                let file = FileId::new(owner, 1).map_err(|_| SnapshotIndexError::Limits)?;
-                let revision = SourceRevision::new(owner, 1).map_err(|_| SnapshotIndexError::Limits)?;
-                let capture = CompleteCapture::new(CaptureRequest::new(file, revision).map_err(|_| SnapshotIndexError::Format)?,
-                    ByteLength::new(length as u64), Arc::from(verified.bytes())).map_err(|_| SnapshotIndexError::Format)?;
-                let documents = [SearchDocument::new(file, "saved-member", &capture)];
-                let manifest = SearchManifest::new(SearchManifestId::new(owner, 1)?, &documents, &[],
-                    MembershipState::Closed, ManifestLimits::default())?;
-                let local_limits = IndexLimits { max_total_grams: capacity - grams.len(),
-                    max_source_bytes_total: limits.max_source_bytes_total - stats.build_source_bytes, ..limits };
-                let index = EphemeralIndex::build(manifest, local_limits, budget, allocations[3], &mut canceled)?;
-                stats.build_source_bytes += index.statistics().source_bytes_examined;
-                let image = index.segment_image(0).ok_or(SnapshotIndexError::Format)?;
-                if image.coverage() == SegmentCoverage::Indexed {
-                    row.coverage = if image.source_is_utf8() { Coverage::Utf8 } else { Coverage::Bytes };
-                    row.count = image.grams().len();
-                    grams.extend_from_slice(image.grams());
-                }
-            }
-            if row.coverage.indexed() { stats.indexed_files += 1; } else { stats.uncovered_files += 1; }
-            rows.push(row);
-        }
-        if canceled() { return Err(SnapshotIndexError::Canceled); }
-        stats.unique_grams = grams.len();
-        Ok(Self { owner, archive: archive.directory().digest(), rows, grams, stats, _lease: lease })
+        canceled: impl FnMut() -> bool) -> Result<Self, SnapshotIndexError> {
+        refresh::construct(archive, limits, budget, allocations, None, canceled)
+            .map(SnapshotRefresh::into_index)
     }
     pub const fn owner(&self) -> ArenaOwnerId { self.owner }
     pub const fn archive_digest(&self) -> Sha256Digest { self.archive }
