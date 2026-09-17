@@ -34,6 +34,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fcb-bridge"
+version = "0.1.0"
+dependencies = [
+ "fcb-app",
+]
+
+[[package]]
 name = "fcb-conformance"
 version = "0.1.0"
 dependencies = [
@@ -71,6 +78,7 @@ name = "fcb-render"
 version = "0.1.0"
 dependencies = [
  "fcb-core",
+ "fcb-test-support",
 ]
 
 [[package]]
@@ -78,6 +86,8 @@ name = "fcb-runtime"
 version = "0.1.0"
 dependencies = [
  "fcb-core",
+ "fcb-source",
+ "fcb-test-support",
 ]
 
 [[package]]
@@ -109,6 +119,14 @@ dependencies = [
 [[package]]
 name = "fcb-test-support"
 version = "0.1.0"
+
+[[package]]
+name = "fcb-ui"
+version = "0.1.0"
+dependencies = [
+ "fcb-core",
+ "fcb-test-support",
+]
 
 [[package]]
 name = "fmd-font"
