@@ -1,8 +1,7 @@
 #![forbid(unsafe_code)]
 
-//! Process arguments belong to fcb-app, never to library construction.
-//! Workspace enumeration requires an explicit --workspace switch; selecting a
-//! single file or stdin does not silently widen that authority to its siblings.
+//! Process arguments belong to fcb-app, never library construction. Workspace
+//! traversal and repository rule-file reads each require explicit switches.
 
 use std::{ffi::OsString, path::PathBuf};
 
@@ -21,22 +20,12 @@ pub enum Encoding { Auto, Utf8, Utf16Le, Utf16Be }
 pub enum Needle { Text(String), Raw(Vec<u8>), Path(String) }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Arguments {
-    pub command: Command,
-    pub json: bool,
-    pub file: Option<PathBuf>,
-    pub stdin: bool,
-    pub offset: u64,
-    pub bytes: usize,
-    pub limit: usize,
-    pub encoding: Encoding,
-    pub needle: Option<Needle>,
-    pub workspace: bool,
-    pub include_excluded: bool,
-    pub max_files: usize,
-    pub max_file_bytes: usize,
-    pub max_total_bytes: usize,
-    pub whole_file: bool,
-    pub max_scan_bytes: u64,
+    pub command: Command, pub json: bool, pub file: Option<PathBuf>, pub stdin: bool,
+    pub offset: u64, pub bytes: usize, pub limit: usize, pub encoding: Encoding,
+    pub needle: Option<Needle>, pub workspace: bool, pub include_excluded: bool,
+    pub respect_ignores: bool,
+    pub max_files: usize, pub max_file_bytes: usize, pub max_total_bytes: usize,
+    pub whole_file: bool, pub max_scan_bytes: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArgumentError { Limit, UnknownCommand, UnknownOption, DuplicateOption, MissingValue,
@@ -58,9 +47,7 @@ impl std::fmt::Display for ArgumentError {
 }
 impl std::error::Error for ArgumentError {}
 
-/// Error-format selection must not mistake `--text --json` for a JSON switch.
-/// Options' values and positional-only paths are data, including when malformed.
-/// Inspect at most the admitted argument count plus its overflow sentinel.
+/// Option values and positional-only paths remain data, not output-mode flags.
 pub fn json_requested(args: &[OsString]) -> bool {
     let mut cursor = 0;
     let end = args.len().min(MAX_ARGUMENTS + 1);
@@ -69,15 +56,12 @@ pub fn json_requested(args: &[OsString]) -> bool {
         if argument == "--" { break; }
         if argument == "--json" { return true; }
         if matches!(argument.to_str(), Some("--offset" | "--bytes" | "--limit" | "--encoding" | "--text" | "--raw-hex"
-            | "--path" | "--max-files" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes")) {
-            cursor += 1;
-        }
+            | "--path" | "--max-files" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes")) { cursor += 1; }
     }
     false
 }
 
-/// Excludes argv[0]. Numeric arguments are canonical unsigned decimal, not
-/// floating-point, signed, whitespace-padded or silently saturating values.
+/// Excludes argv[0]. Numeric arguments are canonical unsigned decimal.
 pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
     if args.len() > MAX_ARGUMENTS { return Err(ArgumentError::Limit); }
     let mut total = 0usize;
@@ -88,7 +72,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
     }
     let mut parsed = Arguments { command: Command::Launch, json: false, file: None,
         stdin: false, offset: 0, bytes: 64 * 1024, limit: 100, encoding: Encoding::Auto, needle: None,
-        workspace: false, include_excluded: false, max_files: 4096,
+        workspace: false, include_excluded: false, respect_ignores: false, max_files: 4096,
         max_file_bytes: 1024 * 1024, max_total_bytes: 32 * 1024 * 1024,
         whole_file: false, max_scan_bytes: 256 * 1024 * 1024 };
     if args.is_empty() { return Ok(parsed); }
@@ -105,7 +89,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         Some("index" | "cache" | "trail" | "bench") => return Err(ArgumentError::UnknownCommand),
         _ => { start = 0; Command::Launch },
     };
-    let mut seen = 0u16;
+    let mut seen = 0u32;
     let mut positional_only = false;
     let mut cursor = start;
     while cursor < args.len() {
@@ -118,7 +102,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
                 "--limit" => 16, "--encoding" => 32, "--text" => 64, "--raw-hex" => 128,
                 "--workspace" => 256, "--include-excluded" => 512, "--max-files" => 1024,
                 "--max-file-bytes" => 2048, "--max-total-bytes" => 4096, "--path" => 8192,
-                "--whole-file" => 16384, "--max-scan-bytes" => 32768,
+                "--whole-file" => 16384, "--max-scan-bytes" => 32768, "--respect-ignores" => 65536,
                 _ => return Err(ArgumentError::UnknownOption),
             };
             if seen & bit != 0 { return Err(ArgumentError::DuplicateOption); }
@@ -127,6 +111,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
             if option == "--stdin" { parsed.stdin = true; continue; }
             if option == "--workspace" { parsed.workspace = true; continue; }
             if option == "--include-excluded" { parsed.include_excluded = true; continue; }
+            if option == "--respect-ignores" { parsed.respect_ignores = true; continue; }
             if option == "--whole-file" { parsed.whole_file = true; continue; }
             let value = args.get(cursor).ok_or(ArgumentError::MissingValue)?; cursor += 1;
             let value = value.to_str().ok_or(ArgumentError::MissingValue)?;
@@ -138,28 +123,23 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
                     parsed.bytes = value as usize;
                 }
                 "--limit" => {
-                    let value = decimal(value)?;
-                    if value > MAX_RESULTS as u64 { return Err(ArgumentError::Limit); }
+                    let value = decimal(value)?; if value > MAX_RESULTS as u64 { return Err(ArgumentError::Limit); }
                     parsed.limit = value as usize;
                 }
                 "--max-files" => {
-                    let value = decimal(value)?;
-                    if !(1..=65_536).contains(&value) { return Err(ArgumentError::Limit); }
+                    let value = decimal(value)?; if !(1..=65_536).contains(&value) { return Err(ArgumentError::Limit); }
                     parsed.max_files = value as usize;
                 }
                 "--max-file-bytes" => {
-                    let value = decimal(value)?;
-                    if value > 1024 * 1024 { return Err(ArgumentError::Limit); }
+                    let value = decimal(value)?; if value > 1024 * 1024 { return Err(ArgumentError::Limit); }
                     parsed.max_file_bytes = value as usize;
                 }
                 "--max-total-bytes" => {
-                    let value = decimal(value)?;
-                    if value > 64 * 1024 * 1024 { return Err(ArgumentError::Limit); }
+                    let value = decimal(value)?; if value > 64 * 1024 * 1024 { return Err(ArgumentError::Limit); }
                     parsed.max_total_bytes = value as usize;
                 }
                 "--max-scan-bytes" => {
-                    let value = decimal(value)?;
-                    if value > MAX_SCAN_BYTES { return Err(ArgumentError::Limit); }
+                    let value = decimal(value)?; if value > MAX_SCAN_BYTES { return Err(ArgumentError::Limit); }
                     parsed.max_scan_bytes = value;
                 }
                 "--encoding" => parsed.encoding = match value {
@@ -184,15 +164,14 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         }
     }
     if parsed.stdin && parsed.file.is_some() { return Err(ArgumentError::MultipleSources); }
+    if parsed.respect_ignores && (!parsed.workspace || parsed.include_excluded) { return Err(ArgumentError::IncompatibleOptions); }
     if parsed.whole_file {
         if parsed.command != Command::Search || parsed.stdin || seen & (4 | 8 | 2048 | 4096 | 8192) != 0 {
             return Err(ArgumentError::IncompatibleOptions);
         }
         if parsed.file.is_none() { return Err(ArgumentError::MissingSource); }
         if !matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Raw(_))) { return Err(ArgumentError::InvalidNeedle); }
-        if matches!(parsed.needle.as_ref(), Some(Needle::Raw(_))) && seen & 32 != 0 {
-            return Err(ArgumentError::IncompatibleOptions);
-        }
+        if matches!(parsed.needle.as_ref(), Some(Needle::Raw(_))) && seen & 32 != 0 { return Err(ArgumentError::IncompatibleOptions); }
         if !parsed.workspace && seen & (512 | 1024) != 0 { return Err(ArgumentError::IncompatibleOptions); }
         return Ok(parsed);
     }
@@ -209,14 +188,12 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         }
         return Ok(parsed);
     }
-    if seen & (256 | 512 | 1024 | 2048 | 4096 | 8192) != 0 { return Err(ArgumentError::IncompatibleOptions); }
+    if seen & (256 | 512 | 1024 | 2048 | 4096 | 8192 | 65536) != 0 { return Err(ArgumentError::IncompatibleOptions); }
     match parsed.command {
         Command::Help | Command::Capabilities | Command::Doctor => {
             if parsed.file.is_some() || seen & !1 != 0 { return Err(ArgumentError::IncompatibleOptions); }
         }
-        Command::Launch => {
-            if seen != 0 { return Err(ArgumentError::IncompatibleOptions); }
-        }
+        Command::Launch => { if seen != 0 { return Err(ArgumentError::IncompatibleOptions); } }
         Command::Inspect => {
             if parsed.file.is_none() { return Err(ArgumentError::MissingSource); }
             if seen & !1 != 0 { return Err(ArgumentError::IncompatibleOptions); }
@@ -227,15 +204,10 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
                 if parsed.needle.is_none() { return Err(ArgumentError::InvalidNeedle); }
             } else if seen & (16 | 64 | 128) != 0 { return Err(ArgumentError::IncompatibleOptions); }
             if parsed.stdin && parsed.offset != 0 { return Err(ArgumentError::IncompatibleOptions); }
-            // A later live read of a header is not the same observation as the
-            // selected range. Far-offset text therefore requires a declaration.
-            if parsed.offset != 0 && parsed.encoding == Encoding::Auto
-                && !matches!(parsed.needle.as_ref(), Some(Needle::Raw(_))) {
+            if parsed.offset != 0 && parsed.encoding == Encoding::Auto && !matches!(parsed.needle.as_ref(), Some(Needle::Raw(_))) {
                 return Err(ArgumentError::InvalidEncoding);
             }
-            if matches!(parsed.needle.as_ref(), Some(Needle::Raw(_))) && seen & 32 != 0 {
-                return Err(ArgumentError::IncompatibleOptions);
-            }
+            if matches!(parsed.needle.as_ref(), Some(Needle::Raw(_))) && seen & 32 != 0 { return Err(ArgumentError::IncompatibleOptions); }
         }
     }
     Ok(parsed)
@@ -246,8 +218,7 @@ pub fn decimal(text: &str) -> Result<u64, ArgumentError> {
     let mut result = 0u64;
     for byte in text.bytes() {
         if !byte.is_ascii_digit() { return Err(ArgumentError::InvalidNumber); }
-        result = result.checked_mul(10).and_then(|n| n.checked_add(u64::from(byte - b'0')))
-            .ok_or(ArgumentError::InvalidNumber)?;
+        result = result.checked_mul(10).and_then(|n| n.checked_add(u64::from(byte - b'0'))).ok_or(ArgumentError::InvalidNumber)?;
     }
     Ok(result)
 }
@@ -281,16 +252,14 @@ mod tests {
         assert!(!json_requested(&args(&["read", "--", "--json"])));
         #[cfg(unix)] {
             use std::os::unix::ffi::OsStringExt;
-            let native = OsString::from_vec(vec![b'x', 0xff]);
-            let parsed = parse(&["read".into(), native.clone()]).unwrap();
+            let native = OsString::from_vec(vec![b'a', 0xff, b'.', b'r', b's']);
+            let parsed = parse(&[OsString::from("read"), native.clone()]).unwrap();
             assert_eq!(parsed.file.unwrap().into_os_string(), native);
         }
     }
     #[test]
     fn full_width_decimal_does_not_round_or_wrap() {
-        for value in [0, 1, (1u64 << 53) - 1, (1u64 << 53) + 1, u64::MAX] {
-            assert_eq!(decimal(&value.to_string()), Ok(value));
-        }
+        for value in [0, 1, (1u64 << 53) - 1, (1u64 << 53) + 1, u64::MAX] { assert_eq!(decimal(&value.to_string()), Ok(value)); }
         for invalid in ["", "00", "01", "-1", "+1", "1e3", "1.0", " 1", "18446744073709551616"] {
             assert_eq!(decimal(invalid), Err(ArgumentError::InvalidNumber));
         }
@@ -298,10 +267,9 @@ mod tests {
     #[test]
     fn duplicated_conflicting_and_excessive_options_fail_before_io() {
         for values in [vec!["read", "a", "--bytes", "4", "--bytes", "5"],
-            vec!["search", "a", "--text", "x", "--raw-hex", "ff"],
-            vec!["read", "a", "--stdin"], vec!["read", "a", "--bytes", "262145"],
-            vec!["read", "a", "--offset", "100"], vec!["search", "a", "--text", ""],
-            vec!["inspect", "a", "--offset", "0"], vec!["read", "a", "--encoding", "latin1"]] {
+            vec!["search", "a", "--text", "x", "--raw-hex", "ff"], vec!["read", "a", "--stdin"],
+            vec!["read", "a", "--bytes", "262145"], vec!["read", "a", "--offset", "100"],
+            vec!["search", "a", "--text", ""], vec!["inspect", "a", "--offset", "0"], vec!["read", "a", "--encoding", "latin1"]] {
             assert!(parse(&args(&values)).is_err(), "{values:?}");
         }
         assert_eq!(parse(&vec![OsString::from("a"); 65]), Err(ArgumentError::Limit));
@@ -309,8 +277,7 @@ mod tests {
     #[test]
     fn search_modes_are_explicit_and_hex_accepts_arbitrary_bytes() {
         let query = parse(&args(&["search", "--raw-hex", "00Ff", "--offset", "9007199254740993", "file"])).unwrap();
-        assert_eq!(query.needle, Some(Needle::Raw(vec![0, 255])));
-        assert_eq!(query.offset, (1u64 << 53) + 1);
+        assert_eq!(query.needle, Some(Needle::Raw(vec![0, 255]))); assert_eq!(query.offset, (1u64 << 53) + 1);
         let text = parse(&args(&["search", "--stdin", "--text", "héllo world", "--encoding", "utf16le"])).unwrap();
         assert_eq!(text.needle, Some(Needle::Text("héllo world".to_owned())));
         for invalid in ["f", "gg", ""] { assert!(hex_bytes(invalid).is_err()); }
@@ -327,11 +294,10 @@ mod tests {
     fn workspace_scope_is_explicit_and_cannot_mix_with_window_or_stdin_semantics() {
         let good = parse(&args(&["search", "root", "--workspace", "--path", "foo", "--max-files", "100", "--include-excluded"])).unwrap();
         assert!(good.workspace && good.include_excluded); assert_eq!(good.max_files, 100);
-        for input in [vec!["search", "root", "--path", "foo"],
-            vec!["read", "root", "--workspace"], vec!["search", "root", "--workspace", "--text", "x", "--bytes", "8"],
+        for input in [vec!["search", "root", "--path", "foo"], vec!["read", "root", "--workspace"],
+            vec!["search", "root", "--workspace", "--text", "x", "--bytes", "8"],
             vec!["search", "root", "--workspace", "--raw-hex", "ff"], vec!["inspect", "root", "--include-excluded"],
-            vec!["search", "root", "--workspace", "--text", "x", "--path", "y"],
-            vec!["inspect", "root", "--workspace", "--max-files", "0"]] {
+            vec!["search", "root", "--workspace", "--text", "x", "--path", "y"], vec!["inspect", "root", "--workspace", "--max-files", "0"]] {
             assert!(parse(&args(&input)).is_err(), "{input:?}");
         }
         assert!(!json_requested(&args(&["search", "root", "--workspace", "--path", "--json"])));
@@ -342,14 +308,24 @@ mod tests {
         assert!(options.whole_file); assert_eq!(options.max_scan_bytes, 4_294_967_297);
         assert!(parse(&args(&["search", "root", "--workspace", "--whole-file", "--raw-hex", "ff"])).is_ok());
         for input in [vec!["search", "file", "--whole-file", "--text", "x", "--offset", "0"],
-            vec!["search", "file", "--text", "x", "--max-scan-bytes", "10"],
-            vec!["search", "--stdin", "--whole-file", "--text", "x"],
+            vec!["search", "file", "--text", "x", "--max-scan-bytes", "10"], vec!["search", "--stdin", "--whole-file", "--text", "x"],
             vec!["search", "root", "--workspace", "--whole-file", "--path", "x"],
             vec!["search", "root", "--workspace", "--whole-file", "--text", "x", "--max-file-bytes", "10"],
-            vec!["inspect", "root", "--whole-file"],
-            vec!["search", "file", "--whole-file", "--raw-hex", "ff", "--encoding", "utf8"]] {
+            vec!["inspect", "root", "--whole-file"], vec!["search", "file", "--whole-file", "--raw-hex", "ff", "--encoding", "utf8"]] {
             assert!(parse(&args(&input)).is_err(), "{input:?}");
         }
         assert!(!json_requested(&args(&["search", "file", "--whole-file", "--text", "--json"])));
+    }
+    #[test]
+    fn repository_rule_permission_is_explicit_and_not_a_query_value() {
+        assert!(parse(&args(&["inspect", "root", "--workspace", "--respect-ignores"])).unwrap().respect_ignores);
+        assert!(parse(&args(&["search", "root", "--workspace", "--whole-file", "--text", "x", "--respect-ignores"])).unwrap().respect_ignores);
+        let data = parse(&args(&["search", "root", "--workspace", "--text", "--respect-ignores"])).unwrap();
+        assert!(!data.respect_ignores);
+        for input in [vec!["inspect", "file", "--respect-ignores"],
+            vec!["inspect", "root", "--workspace", "--respect-ignores", "--include-excluded"],
+            vec!["inspect", "root", "--workspace", "--respect-ignores", "--respect-ignores"]] {
+            assert!(parse(&args(&input)).is_err());
+        }
     }
 }
