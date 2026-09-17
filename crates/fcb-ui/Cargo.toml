@@ -1,0 +1,17 @@
+[package]
+name = "fcb-ui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Deterministic FCB UI reducer: native command routing, IME text composition state, and open/drop validation (FCB-053.A)."
+
+[lib]
+name = "fcb_ui"
+path = "src/lib.rs"
+
+[dependencies]
+fcb-core = { path = "../fcb-core" }
+
+[dev-dependencies]
+fcb-test-support = { path = "../fcb-test-support" }

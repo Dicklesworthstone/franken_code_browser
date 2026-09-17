@@ -14,5 +14,6 @@ members = [
     "crates/fcb-analysis",
     "crates/fcb-document",
     "crates/fcb-render",
+    "crates/fcb-ui",
 ]
 exclude = ["probes/headless_consumer"]
