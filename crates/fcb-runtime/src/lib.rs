@@ -10,7 +10,25 @@
 
 #![forbid(unsafe_code)]
 
+pub mod accessibility;
+pub mod clipboard;
+pub mod ime;
+pub mod responder;
 pub mod terminal;
+
+pub use accessibility::{
+    AxAction, AxLineIndex, AxNotification, AxRole, NativeAxRoute,
+};
+pub use clipboard::{
+    ClipboardError, ClipboardFlavor, ClipboardLimits, ClipboardPayload,
+    ClipboardRoundTrip, NativeClipboard,
+};
+pub use ime::{
+    ImeClient, ImeEvent, ImeOutcome, ImeState,
+};
+pub use responder::{
+    HostResponderChain, ResponderAction, ResponderId,
+};
 pub use terminal::{
     GpuSubmissionId, GpuTerminalError, LosslessTerminalDrainQueue, TerminalCompletionStatus,
     TerminalDrainCounters, TerminalDrainError, TerminalDrainReport, TerminalEventRecord,

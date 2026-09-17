@@ -11,3 +11,6 @@ fcb-core = { path = "../fcb-core" }
 [lib]
 name = "fcb_runtime"
 path = "src/lib.rs"
+
+[dev-dependencies]
+fcb-source = { path = "../fcb-source" }
