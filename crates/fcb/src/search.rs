@@ -33,6 +33,9 @@ pub mod snapshot;
 /// File-backed snapshot access, one-member queries, and exact offline reading.
 #[cfg(feature = "snapshot")]
 pub mod paged_snapshot;
+/// Trusted catalog publication and header/footer-only saved-observation reopening.
+#[cfg(feature = "snapshot")]
+pub mod snapshot_catalog;
 /// Digest-pinned persistent substring segments; exact verification stays required.
 #[cfg(feature = "snapshot")]
 pub mod snapshot_index;
