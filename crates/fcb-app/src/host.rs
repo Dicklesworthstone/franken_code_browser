@@ -6,6 +6,8 @@
 //! Structured services use the same dispatcher/JSON as the CLI. Legacy text
 //! handoff is an exact bounded UTF-8 observation, not a lossy/truncated preview.
 
+pub mod atlas;
+
 use std::{ffi::OsString, io::{self, Read, Write}, mem::size_of, path::Path};
 use fcb::{ByteLength, ByteOffset, ByteRange, SourceRevision};
 use fcb::search::{CaptureRequest, ExtentConsistency, ExtentReadState,
@@ -147,6 +149,19 @@ pub fn search_workspace(root: &Path, needle: &str, canceled: impl FnMut() -> boo
     -> Result<HostResponse, HostError> {
     if needle.len() > crate::args::MAX_SINGLE_ARGUMENT { return Err(AppError::InputLimit.into()); }
     invoke(root, vec!["search".into(), "--workspace".into(), "--text".into(), needle.into()], canceled)
+}
+/// Logical FrankenMarkdown flow, not native shaping or a reinterpreted source
+/// line number. Each invocation captures the explicitly named current file.
+pub fn markdown_window(path: &Path, first_line: u64, lines: u64, width: u64,
+    canceled: impl FnMut() -> bool) -> Result<HostResponse, HostError> {
+    invoke(path, vec!["markdown".into(), "--line".into(), first_line.to_string().into(),
+        "--lines".into(), lines.to_string().into(), "--width".into(), width.to_string().into()], canceled)
+}
+pub fn markdown_heading(path: &Path, heading: &str, lines: u64, width: u64,
+    canceled: impl FnMut() -> bool) -> Result<HostResponse, HostError> {
+    if heading.len() > 4096 { return Err(AppError::InputLimit.into()); }
+    invoke(path, vec!["markdown".into(), "--heading".into(), heading.into(),
+        "--lines".into(), lines.to_string().into(), "--width".into(), width.to_string().into()], canceled)
 }
 
 fn invoke(path: &Path, mut arguments: Vec<OsString>, canceled: impl FnMut() -> bool)
