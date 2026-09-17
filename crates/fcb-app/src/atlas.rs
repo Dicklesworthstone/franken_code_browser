@@ -6,6 +6,7 @@
 mod path_overlay;
 mod text_overlay;
 mod preview;
+mod document;
 
 use std::{ffi::OsString, fs, io::Write, path::{Component, Path, PathBuf}};
 use fcb::{ByteLength, CameraGeneration, DisplayGeneration, DisplayMetrics, Point2D, Rect2D, Size2D};
@@ -37,6 +38,9 @@ const HELP: &str = "Repository atlas plans\n\n\
   --max-scan-bytes N           Text verification allowance (default 32 MiB)\n\
   --preview-hit N             Read context around a zero-based retained text hit\n\
   --context-bytes N           Context per side (default 256, maximum 16384)\n\
+  --markdown-hit N            Read the hit's captured file as Markdown (UTF-8, 64 KiB cap)\n\
+  --markdown-heading SLUG     Start that document at an upstream canonical heading\n\
+  --markdown-lines N          Logical Markdown rows (default 40, maximum 1024)\n\
   --respect-ignores OR --include-excluded\n\n\
 This command explicitly authorizes bounded directory discovery. Source payload\n\
 reads require --text. Repository rule files require --respect-ignores separately.\n\
@@ -45,13 +49,15 @@ separate unavailable/truncated/byte-limited states. It searches the catalog,\n\
 not just the camera focus. --match-limit 0 is not a text count-only request.\n\
 Preview reads the SAME searched capture with no additional source I/O. It\n\
 preserves the entire occurrence plus bounded context, not full-line shaping.\n\
+Markdown starts at the document beginning or explicit heading; source matches\n\
+are not fabricated rendered highlights. No link, image, include or network access.\n\
 Files retain native byte paths and response-local FileIds. Only catalogued\n\
 regular files and their ancestors are mapped; empty/unavailable directories\n\
 are not a complete directory inventory. Partial discovery stays explicit.\n\
 Rectangles are clipped logical-viewport points, NOT native presented pixels.\n\
 Budget pressure produces labelled aggregates, never invented file hits.\n\
 The selected file remains identified even when aggregated or outside focus.\n\
-Exit: 0 complete plan/search, 2 error, 3 incomplete discovery/detail/search, 130 canceled.\n\
+Exit: 0 complete plan/search, 2 error, 3 incomplete discovery/detail/search or document window, 130 canceled.\n\
 Implemented-unqualified; independent Rust/RCH and native verification pending.\n";
 
 #[derive(Debug)]
@@ -61,12 +67,13 @@ struct Options {
     path_query: Option<OsString>, text_query: Option<String>, match_limit: usize,
     text_scan_bytes: u64,
     preview_hit: Option<usize>, context_bytes: usize,
+    markdown_hit: Option<usize>, markdown_view: crate::markdown::ViewOptions,
     width: f64, height: f64, scale: f64, zoom: f64, pan_x: f64, pan_y: f64,
     detail_pixels: f64, max_visits: usize,
 }
 #[derive(Clone, Copy, Debug)]
 enum Error { App(AppError), Atlas(WorkspaceAtlasError), Text(WorkspaceTextError),
-    Preview(AtlasTextPreviewError), FocusMissing, SelectionMissing }
+    Preview(AtlasTextPreviewError), Document(crate::markdown::Error), FocusMissing, SelectionMissing }
 impl From<AppError> for Error { fn from(e: AppError) -> Self { Self::App(e) } }
 impl From<ArgumentError> for Error { fn from(e: ArgumentError) -> Self { Self::App(e.into()) } }
 impl From<OutputError> for Error { fn from(e: OutputError) -> Self { Self::App(e.into()) } }
@@ -80,14 +87,14 @@ impl Error {
     fn code(self) -> String {
         match self {
             Self::App(e) => e.code(), Self::Atlas(e) => e.to_string(), Self::Text(e) => e.to_string(),
-            Self::Preview(e) => e.to_string(),
+            Self::Preview(e) => e.to_string(), Self::Document(e) => e.code(),
             Self::FocusMissing => "CLI_ATLAS_FOCUS_NOT_CATALOGUED".to_owned(),
             Self::SelectionMissing => "CLI_ATLAS_SELECTION_NOT_CATALOGUED".to_owned(),
         }
     }
     fn canceled(self) -> bool {
         match self {
-            Self::App(e) => e.is_canceled(),
+            Self::App(e) => e.is_canceled(), Self::Document(e) => e.canceled(),
             Self::Atlas(WorkspaceAtlasError::Atlas(AtlasError::Canceled)
                 | WorkspaceAtlasError::Workspace(WorkspaceError::Canceled)) => true,
             Self::Text(WorkspaceTextError::Index(IndexError::Canceled | IndexError::Query(QueryError::Canceled))
@@ -103,7 +110,7 @@ fn takes_value(option: &str) -> bool {
     matches!(option, "--focus" | "--select" | "--width" | "--height" | "--scale" | "--zoom"
         | "--pan-x" | "--pan-y" | "--detail-pixels" | "--limit" | "--max-visits" | "--max-files"
         | "--path" | "--match-limit" | "--text" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes"
-        | "--preview-hit" | "--context-bytes")
+        | "--preview-hit" | "--context-bytes" | "--markdown-hit" | "--markdown-heading" | "--markdown-lines")
 }
 fn json_requested(arguments: &[OsString]) -> bool {
     let mut cursor = 0;
@@ -136,6 +143,8 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
     let (mut path_query, mut text_query, mut match_limit) = (None, None, 100usize);
     let mut text_scan_bytes = 32 * 1024 * 1024u64;
     let (mut preview_hit, mut context_bytes) = (None, 256usize);
+    let mut markdown_hit = None;
+    let mut markdown_view = crate::markdown::ViewOptions::default();
     let mut text_settings = false;
     let (mut width, mut height, mut scale, mut zoom) = (1024.0, 768.0, 1.0, 1.0);
     let (mut pan_x, mut pan_y, mut detail_pixels, mut max_visits) = (0.0, 0.0, 48.0, 32_768usize);
@@ -162,6 +171,7 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
             "--detail-pixels" => 256, "--max-visits" => 512,
             "--path" => 1024, "--match-limit" => 2048, "--text" => 4096, "--max-scan-bytes" => 8192,
             "--preview-hit" => 16384, "--context-bytes" => 32768,
+            "--markdown-hit" => 65536, "--markdown-heading" => 131072, "--markdown-lines" => 262144,
             _ => return Err(ArgumentError::UnknownOption.into()),
         };
         if seen & bit != 0 { return Err(ArgumentError::DuplicateOption.into()); } seen |= bit;
@@ -174,6 +184,11 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
             let text = value.to_str().ok_or(ArgumentError::InvalidNeedle)?;
             if text.is_empty() || text.len() > 1024 { return Err(ArgumentError::InvalidNeedle.into()); }
             text_query = Some(text.to_owned()); continue;
+        }
+        if option == "--markdown-heading" {
+            let slug = value.to_str().ok_or(ArgumentError::InvalidNeedle)?;
+            if slug.is_empty() || slug.len() > 4096 { return Err(ArgumentError::Limit.into()); }
+            markdown_view.heading = Some(slug.to_owned()); continue;
         }
         if option == "--focus" || option == "--select" {
             if value.is_empty() { return Err(ArgumentError::MissingValue.into()); }
@@ -208,6 +223,16 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
                 if n >= 4096 { return Err(ArgumentError::Limit.into()); }
                 preview_hit = Some(n as usize);
             }
+            "--markdown-hit" => {
+                let n = args::decimal(value)?;
+                if n >= 4096 { return Err(ArgumentError::Limit.into()); }
+                markdown_hit = Some(n as usize);
+            }
+            "--markdown-lines" => {
+                let n = args::decimal(value)?;
+                if !(1..=1024).contains(&n) { return Err(ArgumentError::Limit.into()); }
+                markdown_view.lines = n as usize;
+            }
             "--context-bytes" => {
                 let n = args::decimal(value)?;
                 if n > 16_384 { return Err(ArgumentError::Limit.into()); }
@@ -224,7 +249,9 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
     if (path_query.is_some() && text_query.is_some()) || (text_settings && text_query.is_none())
         || (seen & 2048 != 0 && path_query.is_none() && text_query.is_none())
         || preview_hit.is_some_and(|i| text_query.is_none() || i >= match_limit)
-        || (seen & 32768 != 0 && preview_hit.is_none()) {
+        || (seen & 32768 != 0 && preview_hit.is_none())
+        || markdown_hit.is_some_and(|i| text_query.is_none() || i >= match_limit)
+        || (seen & (131072 | 262144) != 0 && markdown_hit.is_none()) {
         return Err(ArgumentError::IncompatibleOptions.into());
     }
     // Insert before a possible positional-only delimiter, not after it.
@@ -232,7 +259,8 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
     let workspace = args::parse(&forwarded)?;
     if workspace.limit == 0 { return Err(ArgumentError::Limit.into()); }
     Ok(Options { workspace, focus, select, path_query, text_query, match_limit, text_scan_bytes,
-        preview_hit, context_bytes, width, height, scale, zoom, pan_x, pan_y, detail_pixels, max_visits })
+        preview_hit, context_bytes, markdown_hit, markdown_view,
+        width, height, scale, zoom, pan_x, pan_y, detail_pixels, max_visits })
 }
 
 pub(crate) fn run(arguments: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write,
@@ -351,6 +379,7 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
         || text_hits.as_ref().is_some_and(|hits| !hits.is_complete());
     let stats = plan.stats();
     let detail_limited = stats.budget_aggregates != 0 || stats.precision_aggregates != 0;
+    let document_entire;
     if args.json {
         workspace::common(out, "atlas", &catalog, &root)?;
         out.literal(",\"atlas_schema\":\"fcb.atlas/1\",\"qualification\":\"implemented-unqualified\",\"plan_complete\":true,\"native_presented\":false,\"payload_bytes_read\":")?;
@@ -408,6 +437,7 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
         path_overlay::json(out, overlay.as_ref(), &index, focus, camera, canceled)?;
         text_overlay::json(out, text_hits.as_ref(), &io, &index, focus, camera, options, canceled)?;
         preview::json(out, text_preview.as_ref(), text_hits.as_ref(), &index, canceled)?;
+        document_entire = document::write(out, text_hits.as_ref(), &index, options, budget, canceled)?;
         out.literal("}\n")?;
     } else {
         out.literal("Retained repository atlas plan (not a native presented frame)\n")?;
@@ -424,12 +454,13 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
         path_overlay::human(out, overlay.as_ref(), canceled)?;
         text_overlay::human(out, text_hits.as_ref(), canceled)?;
         preview::human(out, text_preview.as_ref(), text_hits.as_ref(), canceled)?;
+        document_entire = document::write(out, text_hits.as_ref(), &index, options, budget, canceled)?;
         out.literal("Source payload bytes read: ")?; out.literal(&io.bytes.to_string())?; out.literal("\n")?;
         if !catalog.discovery_complete() || detail_limited { out.literal("PARTIAL discovery or aggregate-limited detail\n")?; }
     }
     atlas.validate_active()?;
     if canceled() { return Err(AppError::Canceled.into()); }
-    Ok(if catalog.discovery_complete() && !detail_limited && !search_partial { EXIT_OK } else { EXIT_PARTIAL })
+    Ok(if catalog.discovery_complete() && !detail_limited && !search_partial && document_entire { EXIT_OK } else { EXIT_PARTIAL })
 }
 fn lookup(index: &AtlasIndex<'_>, path: &Path) -> Result<Option<AtlasNodeId>, Error> {
     let mut normalized = PathBuf::new();
@@ -523,6 +554,21 @@ mod tests {
             vec!["root", "--text", "needle", "--preview-hit", "0", "--context-bytes", "16385"],
             vec!["root", "--text", "needle", "--preview-hit", "00"],
             vec!["root", "--text", "needle", "--preview-hit", "0", "--preview-hit", "1"]] {
+            assert!(parse(&argv(&values)).is_err(), "{values:?}");
+        }
+    }
+    #[test]
+    fn markdown_requires_a_text_hit_and_never_treats_heading_values_as_flags() {
+        let options = parse(&argv(&["root", "--text", "needle", "--markdown-hit", "0", "--markdown-heading", "--json"])).unwrap();
+        assert_eq!(options.markdown_hit, Some(0)); assert!(!options.workspace.json);
+        assert_eq!(options.markdown_view.heading.as_deref(), Some("--json"));
+        assert!(!json_requested(&argv(&["root", "--markdown-heading", "--json"])));
+        for values in [vec!["root", "--markdown-hit", "0"], vec!["root", "--path", "x", "--markdown-hit", "0"],
+            vec!["root", "--text", "x", "--markdown-heading", "section"],
+            vec!["root", "--text", "x", "--markdown-lines", "10"],
+            vec!["root", "--text", "x", "--markdown-hit", "1", "--match-limit", "1"],
+            vec!["root", "--text", "x", "--markdown-hit", "0", "--markdown-lines", "0"],
+            vec!["root", "--text", "x", "--markdown-hit", "0", "--markdown-lines", "1025"]] {
             assert!(parse(&argv(&values)).is_err(), "{values:?}");
         }
     }
