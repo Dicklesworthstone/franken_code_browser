@@ -24,6 +24,8 @@ pub mod split_navigation;
 pub mod provenance;
 pub mod publication;
 pub mod session;
+/// Bounded captured-document reading, heading navigation and explicit copy domains.
+pub mod reader;
 
 pub use gallery::{
     BackingScale, CharacterBoundary, ContrastOracle, FractionalOffset, GalleryCaret,
