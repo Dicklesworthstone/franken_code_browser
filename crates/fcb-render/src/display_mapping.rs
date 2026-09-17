@@ -101,7 +101,7 @@ pub enum DisplayPrimitive {
 }
 
 /// Why a display primitive could not be mapped to a Metal resource.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnsupportedReason {
     /// No math renderer is available for this expression.
     NoMathRenderer,
@@ -230,8 +230,9 @@ pub fn map_primitives(
                 color,
             } => {
                 let gx = GpuCoordinate::new(*x, *y)?;
+                let gw = GpuCoordinate::new(*width, *height)?;
                 let scissor = clip_stack.current();
-                let _ = (gx, scissor);
+                let _ = (gx, gw, scissor);
                 let color = ColorLinearSdr::straight(color[0], color[1], color[2], color[3])?;
                 MetalResource {
                     scissor: *scissor,
@@ -310,7 +311,7 @@ pub fn map_primitives(
                 y,
                 width,
                 height,
-                language,
+                language: _,
                 source,
             } => {
                 output.unsupported.push(RetainedSyntax {
@@ -348,4 +349,199 @@ pub fn map_primitives(
         output.mapped_count += 1;
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_scissor() -> ScissorRect {
+        ScissorRect::new(0, 0, 800, 600)
+    }
+
+    #[test]
+    fn test_solid_rect_mapping_premultiplies_color() {
+        let prims = vec![DisplayPrimitive::SolidRect {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 50.0,
+            color: [0.8, 0.4, 0.2, 0.5],
+        }];
+
+        let output = map_primitives(&prims, sample_scissor(), 8, 32).expect("mapping succeeds");
+        assert_eq!(output.mapped_count, 1);
+        assert_eq!(output.unsupported_count, 0);
+        assert_eq!(output.resources.len(), 1);
+
+        let res = &output.resources[0];
+        assert_eq!(res.kind, MetalResourceKind::SolidQuad);
+        assert!(res.color.is_premultiplied());
+        assert_eq!(res.color.alpha(), 0.5);
+        assert!((res.color.red() - 0.4).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_text_run_mapping_preserves_raw_bytes() {
+        let text_bytes = b"fn main() { println!(\"Hello\"); }".to_vec();
+        let prims = vec![DisplayPrimitive::TextRun {
+            x: 0.0,
+            y: 12.0,
+            text: text_bytes.clone(),
+            font_size: 14.0,
+        }];
+
+        let output = map_primitives(&prims, sample_scissor(), 8, 32).expect("mapping succeeds");
+        assert_eq!(output.mapped_count, 1);
+        assert_eq!(
+            output.resources[0].kind,
+            MetalResourceKind::GlyphRun {
+                text_bytes,
+                font_size_px: 14.0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_clip_push_and_pop_lifecycle() {
+        let prims = vec![
+            DisplayPrimitive::ClipPush {
+                x: 10.0,
+                y: 10.0,
+                width: 200.0,
+                height: 200.0,
+            },
+            DisplayPrimitive::SolidRect {
+                x: 15.0,
+                y: 15.0,
+                width: 50.0,
+                height: 50.0,
+                color: [1.0, 1.0, 1.0, 1.0],
+            },
+            DisplayPrimitive::ClipPop,
+        ];
+
+        let output = map_primitives(&prims, sample_scissor(), 8, 32).expect("mapping succeeds");
+        assert_eq!(output.mapped_count, 3);
+        assert_eq!(output.resources[0].kind, MetalResourceKind::ClipPush);
+        assert_eq!(output.resources[1].kind, MetalResourceKind::SolidQuad);
+        assert_eq!(output.resources[2].kind, MetalResourceKind::ClipPop);
+    }
+
+    #[test]
+    fn test_math_block_retained_visibly() {
+        let latex_source = br"\int_0^\infty e^{-x^2} dx = \frac{\sqrt{\pi}}{2}".to_vec();
+        let prims = vec![DisplayPrimitive::MathBlock {
+            x: 50.0,
+            y: 100.0,
+            width: 300.0,
+            height: 60.0,
+            source: latex_source.clone(),
+        }];
+
+        let output = map_primitives(&prims, sample_scissor(), 8, 32).expect("mapping succeeds");
+        assert_eq!(output.mapped_count, 0);
+        assert_eq!(output.unsupported_count, 1);
+        assert_eq!(output.unsupported.len(), 1);
+
+        let retained = &output.unsupported[0];
+        assert_eq!(retained.x, 50.0);
+        assert_eq!(retained.y, 100.0);
+        assert_eq!(retained.source, latex_source);
+        assert_eq!(retained.reason, UnsupportedReason::NoMathRenderer);
+        assert_eq!(retained.reason.code(), "NO_MATH_RENDERER");
+    }
+
+    #[test]
+    fn test_diagram_block_retained_visibly() {
+        let mermaid_source = b"graph TD\nA-->B\nB-->C".to_vec();
+        let prims = vec![DisplayPrimitive::DiagramBlock {
+            x: 20.0,
+            y: 40.0,
+            width: 400.0,
+            height: 250.0,
+            language: "mermaid".to_string(),
+            source: mermaid_source.clone(),
+        }];
+
+        let output = map_primitives(&prims, sample_scissor(), 8, 32).expect("mapping succeeds");
+        assert_eq!(output.mapped_count, 0);
+        assert_eq!(output.unsupported_count, 1);
+        assert_eq!(output.unsupported.len(), 1);
+
+        let retained = &output.unsupported[0];
+        assert_eq!(retained.source, mermaid_source);
+        assert_eq!(retained.reason, UnsupportedReason::NoDiagramRenderer);
+        assert_eq!(retained.reason.code(), "NO_DIAGRAM_RENDERER");
+    }
+
+    #[test]
+    fn test_explicit_unsupported_syntax_retained_visibly() {
+        let hostile_source = b"<script>alert('xss')</script>".to_vec();
+        let prims = vec![DisplayPrimitive::UnsupportedSyntax {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 20.0,
+            source: hostile_source.clone(),
+            reason: UnsupportedReason::HostileMarkup,
+        }];
+
+        let output = map_primitives(&prims, sample_scissor(), 8, 32).expect("mapping succeeds");
+        assert_eq!(output.unsupported_count, 1);
+        assert_eq!(output.unsupported[0].source, hostile_source);
+        assert_eq!(output.unsupported[0].reason, UnsupportedReason::HostileMarkup);
+    }
+
+    #[test]
+    fn test_max_resources_budget_stops_mapping() {
+        let prims = vec![
+            DisplayPrimitive::SolidRect {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+                color: [1.0, 0.0, 0.0, 1.0],
+            },
+            DisplayPrimitive::SolidRect {
+                x: 10.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+                color: [0.0, 1.0, 0.0, 1.0],
+            },
+            DisplayPrimitive::SolidRect {
+                x: 20.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+                color: [0.0, 0.0, 1.0, 1.0],
+            },
+        ];
+
+        let output = map_primitives(&prims, sample_scissor(), 8, 2).expect("mapping succeeds");
+        assert_eq!(output.mapped_count, 2);
+        assert_eq!(output.resources.len(), 2);
+    }
+
+    #[test]
+    fn test_non_finite_coordinates_rejected() {
+        let prims = vec![DisplayPrimitive::SolidRect {
+            x: f64::NAN,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+            color: [1.0, 1.0, 1.0, 1.0],
+        }];
+
+        let res = map_primitives(&prims, sample_scissor(), 8, 32);
+        assert_eq!(res, Err(RenderAbiError::NonFiniteCoordinate));
+    }
+
+    #[test]
+    fn test_clip_stack_underflow_error() {
+        let prims = vec![DisplayPrimitive::ClipPop];
+        let res = map_primitives(&prims, sample_scissor(), 8, 32);
+        assert_eq!(res, Err(RenderAbiError::ClipStackUnderflow));
+    }
 }
