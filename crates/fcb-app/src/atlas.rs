@@ -5,6 +5,7 @@
 //! algorithm. A plan is never acknowledged as a physically presented frame.
 mod path_overlay;
 mod text_overlay;
+mod preview;
 
 use std::{ffi::OsString, fs, io::Write, path::{Component, Path, PathBuf}};
 use fcb::{ByteLength, CameraGeneration, DisplayGeneration, DisplayMetrics, Point2D, Rect2D, Size2D};
@@ -12,7 +13,8 @@ use fcb::map::{AtlasDetail, AtlasError, AtlasIndex, AtlasNodeId, Camera2D, Camer
     DisplayColorConfig, LayoutOptions, LayoutRevision, LodThresholds, VisibleLimits, VisibleQuery, VisibleState};
 use fcb::map::workspace::{WorkspaceAtlas, WorkspaceAtlasError, WorkspaceAtlasLimits};
 use fcb::map::workspace::text_search::{WorkspaceTextError, WorkspaceTextSource};
-use fcb::search::{IndexError, QueryError, RawPath, ResourceBudget, RootId, SearchManifestId};
+use fcb::map::workspace::text_preview::{AtlasTextPreviewError, AtlasTextPreviewOptions};
+use fcb::search::{ExtentViewError, IndexError, QueryError, RawPath, ResourceBudget, RootId, SearchManifestId};
 use fcb::search::workspace::{RootGrant, RuleLimits, WorkspaceCatalog, WorkspaceError, WorkspaceLimits, WorkspaceStage};
 use fcb::source::CancelFlag;
 use crate::{AppError, EXIT_OK, EXIT_ERROR, EXIT_PARTIAL, EXIT_CANCELED, MANAGED_BYTES,
@@ -33,12 +35,16 @@ const HELP: &str = "Repository atlas plans\n\n\
   --text TEXT --match-limit N   Exact captured-text overlay (alternative to --path)\n\
   --max-file-bytes N --max-total-bytes N  Text capture limits (1 MiB / 32 MiB)\n\
   --max-scan-bytes N           Text verification allowance (default 32 MiB)\n\
+  --preview-hit N             Read context around a zero-based retained text hit\n\
+  --context-bytes N           Context per side (default 256, maximum 16384)\n\
   --respect-ignores OR --include-excluded\n\n\
 This command explicitly authorizes bounded directory discovery. Source payload\n\
 reads require --text. Repository rule files require --respect-ignores separately.\n\
 Text search uses retained captures, UTF-8/BOM UTF-16, original byte ranges, and\n\
 separate unavailable/truncated/byte-limited states. It searches the catalog,\n\
 not just the camera focus. --match-limit 0 is not a text count-only request.\n\
+Preview reads the SAME searched capture with no additional source I/O. It\n\
+preserves the entire occurrence plus bounded context, not full-line shaping.\n\
 Files retain native byte paths and response-local FileIds. Only catalogued\n\
 regular files and their ancestors are mapped; empty/unavailable directories\n\
 are not a complete directory inventory. Partial discovery stays explicit.\n\
@@ -54,23 +60,27 @@ struct Options {
     focus: Option<PathBuf>, select: Option<PathBuf>,
     path_query: Option<OsString>, text_query: Option<String>, match_limit: usize,
     text_scan_bytes: u64,
+    preview_hit: Option<usize>, context_bytes: usize,
     width: f64, height: f64, scale: f64, zoom: f64, pan_x: f64, pan_y: f64,
     detail_pixels: f64, max_visits: usize,
 }
 #[derive(Clone, Copy, Debug)]
-enum Error { App(AppError), Atlas(WorkspaceAtlasError), Text(WorkspaceTextError), FocusMissing, SelectionMissing }
+enum Error { App(AppError), Atlas(WorkspaceAtlasError), Text(WorkspaceTextError),
+    Preview(AtlasTextPreviewError), FocusMissing, SelectionMissing }
 impl From<AppError> for Error { fn from(e: AppError) -> Self { Self::App(e) } }
 impl From<ArgumentError> for Error { fn from(e: ArgumentError) -> Self { Self::App(e.into()) } }
 impl From<OutputError> for Error { fn from(e: OutputError) -> Self { Self::App(e.into()) } }
 impl From<WorkspaceError> for Error { fn from(e: WorkspaceError) -> Self { Self::App(e.into()) } }
 impl From<WorkspaceAtlasError> for Error { fn from(e: WorkspaceAtlasError) -> Self { Self::Atlas(e) } }
 impl From<WorkspaceTextError> for Error { fn from(e: WorkspaceTextError) -> Self { Self::Text(e) } }
+impl From<AtlasTextPreviewError> for Error { fn from(e: AtlasTextPreviewError) -> Self { Self::Preview(e) } }
 impl From<AtlasError> for Error { fn from(e: AtlasError) -> Self { Self::Atlas(e.into()) } }
 impl From<CameraError> for Error { fn from(e: CameraError) -> Self { AtlasError::Camera(e).into() } }
 impl Error {
     fn code(self) -> String {
         match self {
             Self::App(e) => e.code(), Self::Atlas(e) => e.to_string(), Self::Text(e) => e.to_string(),
+            Self::Preview(e) => e.to_string(),
             Self::FocusMissing => "CLI_ATLAS_FOCUS_NOT_CATALOGUED".to_owned(),
             Self::SelectionMissing => "CLI_ATLAS_SELECTION_NOT_CATALOGUED".to_owned(),
         }
@@ -82,6 +92,9 @@ impl Error {
                 | WorkspaceAtlasError::Workspace(WorkspaceError::Canceled)) => true,
             Self::Text(WorkspaceTextError::Index(IndexError::Canceled | IndexError::Query(QueryError::Canceled))
                 | WorkspaceTextError::Workspace(WorkspaceError::Canceled)) => true,
+            Self::Preview(AtlasTextPreviewError::Canceled | AtlasTextPreviewError::View(ExtentViewError::Canceled)
+                | AtlasTextPreviewError::Source(fcb::source::SourceError::Canceled)) => true,
+            Self::Preview(AtlasTextPreviewError::Search(e)) => Self::Text(e).canceled(),
             _ => false,
         }
     }
@@ -89,7 +102,8 @@ impl Error {
 fn takes_value(option: &str) -> bool {
     matches!(option, "--focus" | "--select" | "--width" | "--height" | "--scale" | "--zoom"
         | "--pan-x" | "--pan-y" | "--detail-pixels" | "--limit" | "--max-visits" | "--max-files"
-        | "--path" | "--match-limit" | "--text" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes")
+        | "--path" | "--match-limit" | "--text" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes"
+        | "--preview-hit" | "--context-bytes")
 }
 fn json_requested(arguments: &[OsString]) -> bool {
     let mut cursor = 0;
@@ -121,6 +135,7 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
     let (mut focus, mut select) = (None, None);
     let (mut path_query, mut text_query, mut match_limit) = (None, None, 100usize);
     let mut text_scan_bytes = 32 * 1024 * 1024u64;
+    let (mut preview_hit, mut context_bytes) = (None, 256usize);
     let mut text_settings = false;
     let (mut width, mut height, mut scale, mut zoom) = (1024.0, 768.0, 1.0, 1.0);
     let (mut pan_x, mut pan_y, mut detail_pixels, mut max_visits) = (0.0, 0.0, 48.0, 32_768usize);
@@ -146,6 +161,7 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
             "--scale" => 16, "--zoom" => 32, "--pan-x" => 64, "--pan-y" => 128,
             "--detail-pixels" => 256, "--max-visits" => 512,
             "--path" => 1024, "--match-limit" => 2048, "--text" => 4096, "--max-scan-bytes" => 8192,
+            "--preview-hit" => 16384, "--context-bytes" => 32768,
             _ => return Err(ArgumentError::UnknownOption.into()),
         };
         if seen & bit != 0 { return Err(ArgumentError::DuplicateOption.into()); } seen |= bit;
@@ -187,6 +203,16 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
                 if text_scan_bytes > args::MAX_SCAN_BYTES { return Err(ArgumentError::Limit.into()); }
                 text_settings = true;
             }
+            "--preview-hit" => {
+                let n = args::decimal(value)?;
+                if n >= 4096 { return Err(ArgumentError::Limit.into()); }
+                preview_hit = Some(n as usize);
+            }
+            "--context-bytes" => {
+                let n = args::decimal(value)?;
+                if n > 16_384 { return Err(ArgumentError::Limit.into()); }
+                context_bytes = n as usize;
+            }
             "--max-visits" => {
                 let n = args::decimal(value)?;
                 if !(1..=1_000_000).contains(&n) { return Err(ArgumentError::Limit.into()); }
@@ -196,7 +222,9 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
         }
     }
     if (path_query.is_some() && text_query.is_some()) || (text_settings && text_query.is_none())
-        || (seen & 2048 != 0 && path_query.is_none() && text_query.is_none()) {
+        || (seen & 2048 != 0 && path_query.is_none() && text_query.is_none())
+        || preview_hit.is_some_and(|i| text_query.is_none() || i >= match_limit)
+        || (seen & 32768 != 0 && preview_hit.is_none()) {
         return Err(ArgumentError::IncompatibleOptions.into());
     }
     // Insert before a possible positional-only delimiter, not after it.
@@ -204,7 +232,7 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
     let workspace = args::parse(&forwarded)?;
     if workspace.limit == 0 { return Err(ArgumentError::Limit.into()); }
     Ok(Options { workspace, focus, select, path_query, text_query, match_limit, text_scan_bytes,
-        width, height, scale, zoom, pan_x, pan_y, detail_pixels, max_visits })
+        preview_hit, context_bytes, width, height, scale, zoom, pan_x, pan_y, detail_pixels, max_visits })
 }
 
 pub(crate) fn run(arguments: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write,
@@ -313,6 +341,12 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
         (Some(source), Some(needle)) => Some(text_overlay::search(source, needle, options, budget, canceled)?),
         _ => None,
     };
+    let text_preview = match (text_hits.as_ref(), options.preview_hit) {
+        (Some(hits), Some(position)) => Some(hits.preview_hit(hits.source(), position, generation(),
+            AtlasTextPreviewOptions { context_bytes: options.context_bytes }, budget,
+            [allocation(73), allocation(74)], &mut *canceled)?),
+        _ => None,
+    };
     let search_partial = overlay.as_ref().is_some_and(|hits| !hits.is_complete() || hits.truncated())
         || text_hits.as_ref().is_some_and(|hits| !hits.is_complete());
     let stats = plan.stats();
@@ -373,6 +407,7 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
         out.literal("}")?;
         path_overlay::json(out, overlay.as_ref(), &index, focus, camera, canceled)?;
         text_overlay::json(out, text_hits.as_ref(), &io, &index, focus, camera, options, canceled)?;
+        preview::json(out, text_preview.as_ref(), text_hits.as_ref(), &index, canceled)?;
         out.literal("}\n")?;
     } else {
         out.literal("Retained repository atlas plan (not a native presented frame)\n")?;
@@ -388,6 +423,7 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
         }
         path_overlay::human(out, overlay.as_ref(), canceled)?;
         text_overlay::human(out, text_hits.as_ref(), canceled)?;
+        preview::human(out, text_preview.as_ref(), text_hits.as_ref(), canceled)?;
         out.literal("Source payload bytes read: ")?; out.literal(&io.bytes.to_string())?; out.literal("\n")?;
         if !catalog.discovery_complete() || detail_limited { out.literal("PARTIAL discovery or aggregate-limited detail\n")?; }
     }
@@ -471,6 +507,22 @@ mod tests {
             vec!["root", "--max-file-bytes", "8"], vec!["root", "--max-total-bytes", "8"],
             vec!["root", "--max-scan-bytes", "8"], vec!["root", "--text", "x", "--text", "y"],
             vec!["root", "--text", "x", "--max-scan-bytes", "1099511627777"]] {
+            assert!(parse(&argv(&values)).is_err(), "{values:?}");
+        }
+    }
+    #[test]
+    fn previews_require_a_retained_text_hit_and_bounded_explicit_context() {
+        let options = parse(&argv(&["root", "--text", "needle", "--preview-hit", "0", "--context-bytes", "0"])).unwrap();
+        assert_eq!(options.preview_hit, Some(0)); assert_eq!(options.context_bytes, 0);
+        assert!(!json_requested(&argv(&["root", "--preview-hit", "--json"])));
+        assert!(!json_requested(&argv(&["root", "--context-bytes", "--json"])));
+        for values in [vec!["root", "--preview-hit", "0"], vec!["root", "--path", "needle", "--preview-hit", "0"],
+            vec!["root", "--text", "needle", "--context-bytes", "10"],
+            vec!["root", "--text", "needle", "--preview-hit", "0", "--match-limit", "0"],
+            vec!["root", "--text", "needle", "--preview-hit", "5", "--match-limit", "5"],
+            vec!["root", "--text", "needle", "--preview-hit", "0", "--context-bytes", "16385"],
+            vec!["root", "--text", "needle", "--preview-hit", "00"],
+            vec!["root", "--text", "needle", "--preview-hit", "0", "--preview-hit", "1"]] {
             assert!(parse(&argv(&values)).is_err(), "{values:?}");
         }
     }
