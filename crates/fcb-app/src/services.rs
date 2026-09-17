@@ -25,9 +25,13 @@ Explicit workspace scope:\n\
   fcb inspect ROOT --workspace [--json]\n\
   fcb search ROOT --workspace --text TEXT [--json]\n\
   fcb search ROOT --workspace --path QUERY [--json]\n\
-  --max-files N --max-file-bytes N --max-total-bytes N --include-excluded\n\
+  --max-files N --max-file-bytes N --max-total-bytes N\n\
+  --respect-ignores OR --include-excluded (explicit, incompatible scopes)\n\
 Indexed-capture defaults: 4096 files, 1 MiB/file, 32 MiB captured source.\n\
-Static product exclusions apply; nested .gitignore/.fcbignore are NOT loaded.\n\
+Default discovery uses static product exclusions, without rule-file reads.\n\
+--respect-ignores separately authorizes bounded nested .gitignore/.fcbignore\n\
+reads. Unknown/unsupported policies withhold affected source and report partial\n\
+coverage. Configuration bytes/calls are counted separately from source payload.\n\
 Path search and inspection read no source payload. Files refused by capture\n\
 quotas stay unavailable, not false no-match results. No atomic-repository claim.\n\n\
 Continuous whole-file search, without retaining full source:\n\
@@ -73,7 +77,7 @@ pub(crate) fn capabilities(args: &Arguments, out: &mut Output) -> Result<u8, App
         ("exact-window-byte-search", implemented, "Existing overlapping byte matcher; scope explicit."),
         ("lossless-json-output", implemented, "One bounded document; decimal-string integers and Unix path hex."),
         ("native-gui", "unavailable", "AppKit/Metal composition is not implemented in this binary."),
-        ("workspace-cli-search", file_state, "Explicit bounded discovery, native-path lookup, indexed captures or whole-file streaming; static exclusions, no rule files."),
+        ("workspace-cli-search", file_state, "Explicit discovery, native paths, indexed captures or whole-file streaming; --respect-ignores separately admits bounded repository rules."),
         ("persistent-cli-index", "unavailable", "No store is opened or implicitly created."),
         ("markdown-preview", "unavailable", "No integrated upstream document renderer in this lane."),
         ("regex-search", "unavailable", "No qualified regex engine selected."),
