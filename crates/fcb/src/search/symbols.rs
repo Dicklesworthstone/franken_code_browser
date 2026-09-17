@@ -25,10 +25,11 @@ impl SymbolOptions {
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SymbolNavigationError { Symbol(SymbolError), Reader(ReaderError) }
+pub enum SymbolNavigationError { Symbol(SymbolError), Reader(ReaderError), EncodingMismatch }
 impl std::fmt::Display for SymbolNavigationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { Self::Symbol(error) => write!(f, "{error}"), Self::Reader(error) => write!(f, "{error}") }
+        match self { Self::Symbol(error) => write!(f, "{error}"), Self::Reader(error) => write!(f, "{error}"),
+            Self::EncodingMismatch => f.write_str("SYMBOL_READER_ENCODING_MISMATCH") }
     }
 }
 impl std::error::Error for SymbolNavigationError {}
@@ -60,14 +61,20 @@ fn selected_range(symbols: &CapturedSymbols<'_>, id: u64) -> Result<ByteRange, S
     let candidate = symbols.candidate(id).ok_or(SymbolError::NotFound)?;
     Ok(candidate.name_range().unwrap_or(candidate.original_range()))
 }
+fn encoding_compatible(left: DetectedEncoding, right: DetectedEncoding) -> bool {
+    left == right || matches!((left, right), (DetectedEncoding::Utf8 { .. }, DetectedEncoding::Utf8 { .. }))
+}
 impl<'a> SourceReader<'a> {
     /// Select the validated identifier span, or declaration evidence when the
     /// extractor supplies no exact name span. The ordinary resumable reader
     /// resolves the containing line. No guessed visual columns or new I/O.
+    /// Declared BOM-less UTF-16 can produce valid symbol ranges, but cannot be
+    /// silently activated in an auto-detected UTF-8 reader.
     pub fn seek_symbol(&self, symbols: &CapturedSymbols<'_>, id: u64,
         generation: QueryGeneration) -> Result<ReadingSeek<'a>, SymbolNavigationError> {
         let source = self.source();
         symbols.validate_source(source.bytes(), source.file(), source.revision(), generation)?;
+        if !encoding_compatible(symbols.encoding(), self.encoding()) { return Err(SymbolNavigationError::EncodingMismatch); }
         Ok(self.seek(ReadingTarget::Range(selected_range(symbols, id)?), generation)?)
     }
 }
@@ -82,11 +89,36 @@ impl super::paged_snapshot::PagedCapture {
         CapturedSymbols::build(self.bytes(), request, options.generation, options.language,
             options.encoding, options.max_items, budget, allocation, canceled)
     }
-    /// Feed this target to the capture's reader. The archive need not remain
-    /// open, and its member path is never interpreted as live filesystem access.
+    /// Feed this target to the capture's auto-detected reader. The archive need
+    /// not remain open. An incompatible declared encoding is refused explicitly.
     pub fn symbol_target(&self, symbols: &CapturedSymbols<'_>, id: u64,
-        generation: QueryGeneration) -> Result<ReadingTarget, SymbolError> {
+        generation: QueryGeneration) -> Result<ReadingTarget, SymbolNavigationError> {
         symbols.validate_source(self.bytes(), self.file(), self.revision(), generation)?;
+        let encoding = fcb_source::detect_encoding(&self.bytes()[..self.bytes().len().min(3)]);
+        if !encoding_compatible(symbols.encoding(), encoding) { return Err(SymbolNavigationError::EncodingMismatch); }
         Ok(ReadingTarget::Range(selected_range(symbols, id)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ArenaOwnerId, BrowserSession, ByteLength, FileId, SourceRevision};
+    #[test]
+    fn declared_bomless_utf16_is_not_silently_read_as_utf8() {
+        let owner = ArenaOwnerId::new(861).unwrap();
+        let bytes: Vec<u8> = "fn hello() {}\n".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let source = SourceCapture::from_bytes(owner, FileId::new(owner, 1).unwrap(), SourceRevision::new(owner, 1).unwrap(),
+            "hello.rs", bytes).unwrap();
+        let view = BrowserSession::new(owner).open_capture(source).unwrap();
+        let generation = QueryGeneration::new(owner, 1).unwrap();
+        let budget = ResourceBudget::new(owner, ByteLength::new(16 * 1024 * 1024)).unwrap();
+        let mut options = SymbolOptions::new(generation, SymbolLanguage::Rust);
+        options.encoding = Some(DetectedEncoding::Utf16Le);
+        let symbols = view.symbols(options, &budget, ResourceAllocationId::new(1).unwrap(), || false).unwrap();
+        assert_eq!(symbols.candidates()[0].name(), "hello");
+        assert_eq!(symbols.encoding(), DetectedEncoding::Utf16Le);
+        let reader = view.source_reader(super::super::ReaderLimits::default(), &budget, ResourceAllocationId::new(2).unwrap()).unwrap();
+        assert!(matches!(reader.seek_symbol(&symbols, 1, generation), Err(SymbolNavigationError::EncodingMismatch)));
     }
 }
