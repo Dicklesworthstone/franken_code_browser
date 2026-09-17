@@ -34,6 +34,9 @@ pub mod snapshot;
 /// File-backed snapshot access, one-member queries, and exact offline reading.
 #[cfg(feature = "snapshot")]
 pub mod paged_snapshot;
+/// Document-wide expressions, resumable predicates and exact hit activation.
+#[cfg(feature = "snapshot")]
+pub mod expression;
 /// Trusted catalog publication and header/footer-only saved-observation reopening.
 #[cfg(feature = "snapshot")]
 pub mod snapshot_catalog;
