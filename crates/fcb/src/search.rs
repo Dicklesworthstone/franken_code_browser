@@ -18,6 +18,7 @@
 pub mod reader;
 pub mod reading_window;
 pub mod lens;
+pub mod selection;
 pub mod extents;
 pub mod extent_query;
 pub mod extent_navigation;
@@ -64,6 +65,11 @@ pub use lens::{
     VirtualLineRow, WhitespaceKind, WhitespaceMarker, WrapMode,
     DEFAULT_OVERSCAN_COLUMNS, LENS_HUGE_LINE_BYTE_LIMIT,
     compute_indent_guides, compute_whitespace_markers, find_matching_bracket,
+};
+pub use selection::{
+    CaretAffinity, ClipboardError, ClipboardFlavor, ClipboardLimits, CopyMode,
+    ExportOutcome, NativeClipboard, SourceAnchor, SourceSelection, StagedClipboardData,
+    StreamedExportOptions, StreamedFileExport, TextHitResult, hit_test_line,
 };
 
 pub use fcb_search::*;
