@@ -6,6 +6,7 @@
 
 mod refresh;
 mod inverted;
+mod paging;
 
 use std::{ffi::OsString, fs, io::{self, Read, Seek, Write}, path::{Path, PathBuf}};
 use fcb::ByteLength;
@@ -21,16 +22,18 @@ use super::{Failure, Effect, begin, failure_output, write_new, hex, decimal, cat
     MAX_ARGUMENTS, MAX_ARGUMENT_BYTES, MAX_SINGLE_ARGUMENT, MANAGED_BYTES,
     EXIT_OK, EXIT_NO_MATCH, EXIT_ERROR, EXIT_PARTIAL, EXIT_CANCELED};
 
-const HELP: &str = "fcb snapshot index build SNAPSHOT --output NEW_INDEX [--inverted] [--json]\n\
+const HELP: &str = "fcb snapshot index build SNAPSHOT --output NEW_INDEX [--inverted | --paged] [--json]\n\
 fcb snapshot index refresh NEW_SNAPSHOT --base OLD_SNAPSHOT --index OLD_INDEX\n\
     --index-digest TRUSTED_OLD_SHA256 --output NEW_INDEX [--inverted] [--json]\n\
-fcb snapshot index inspect SNAPSHOT --index INDEX --index-digest TRUSTED_SHA256 [--json]\n\
+fcb snapshot index inspect SNAPSHOT --index INDEX --index-digest TRUSTED_SHA256 [--paged] [--json]\n\
 fcb snapshot index search SNAPSHOT --index INDEX --index-digest TRUSTED_SHA256\n\
-    (--text LITERAL | --raw-hex HEX) [--limit N] [--json]\n\
+    (--text LITERAL | --raw-hex HEX) [--paged] [--limit N] [--json]\n\
 Build/refresh options: --max-grams N --max-file-bytes N --max-source-bytes N\n\
---inverted persists global postings for rarest-list candidate intersection.\n\
-Search and inspect accept both layouts automatically under the trusted pin.\n\
-The posting table is read/validated in full; selected source is still verified.\n\
+--inverted persists resident global postings for rarest-list intersection.\n\
+--paged builds/opens FCBD verified pages with a four-page 64 KiB cache.\n\
+Its index_digest pins the metadata envelope and page hashes, not the full file.\n\
+Use --paged explicitly on build, inspect and search; refresh remains FCBI/FCBO.\n\
+Without --paged, search and inspect accept FCBI/FCBO under the full-artifact pin.\n\
 Optional target cold-open: --catalog FILE --catalog-digest TRUSTED_CATALOG_SHA256\n\
 Refresh base cold-open: --base-catalog FILE --base-catalog-digest TRUSTED_SHA256\n\
 Refresh copies only digest-identical complete segments; changed files rebuild or\n\
@@ -47,7 +50,7 @@ struct Options {
     pin: Option<Sha256Digest>, text: Option<String>, raw: Option<Vec<u8>>, json: bool,
     limit: usize, build: IndexLimits, catalog: Option<PathBuf>, catalog_pin: Option<Sha256Digest>,
     base: Option<PathBuf>, base_catalog: Option<PathBuf>, base_catalog_pin: Option<Sha256Digest>,
-    inverted: bool,
+    inverted: bool, paged: bool,
 }
 impl From<SnapshotIndexError> for Failure {
     fn from(error: SnapshotIndexError) -> Self {
@@ -86,8 +89,8 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
     };
     let mut out = Options { action, archive: None, output: None, index: None, pin: None, text: None,
         raw: None, json: false, limit: 100, build: IndexLimits::default(), catalog: None, catalog_pin: None,
-        base: None, base_catalog: None, base_catalog_pin: None, inverted: false };
-    let mut seen = 0u16;
+        base: None, base_catalog: None, base_catalog_pin: None, inverted: false, paged: false };
+    let mut seen = 0u32;
     let mut cursor = usize::from(!args.is_empty());
     let mut positional = false;
     while cursor < args.len() {
@@ -103,13 +106,14 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
             "--max-file-bytes" => 256, "--max-source-bytes" => 512,
             "--catalog" => 1024, "--catalog-digest" => 2048,
             "--base" => 4096, "--base-catalog" => 8192, "--base-catalog-digest" => 16384,
-            "--inverted" => 32768,
+            "--inverted" => 32768, "--paged" => 65536,
             _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")),
         };
         if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
         seen |= bit;
         if option == "--json" { out.json = true; continue; }
         if option == "--inverted" { out.inverted = true; continue; }
+        if option == "--paged" { out.paged = true; continue; }
         let value = args.get(cursor).ok_or_else(|| Failure::new("CLI_MISSING_VALUE"))?; cursor += 1;
         if value.is_empty() { return Err(Failure::new("CLI_MISSING_VALUE")); }
         match option {
@@ -148,14 +152,14 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
     let catalog_options = 1024 | 2048;
     let valid = match action {
         Action::Help => out.archive.is_none() && seen & !1 == 0,
-        Action::Build => out.archive.is_some() && out.output.is_some() && seen & !(1 | 2 | 128 | 256 | 512 | catalog_options | 32768) == 0,
+        Action::Build => out.archive.is_some() && out.output.is_some() && seen & !(1 | 2 | 128 | 256 | 512 | catalog_options | 32768 | 65536) == 0,
         Action::Refresh => out.archive.is_some() && out.base.is_some() && out.output.is_some() && out.index.is_some() && out.pin.is_some()
             && seen & !(1 | 2 | 4 | 8 | 128 | 256 | 512 | catalog_options | 4096 | 8192 | 16384 | 32768) == 0,
-        Action::Inspect => out.archive.is_some() && out.index.is_some() && out.pin.is_some() && seen & !(1 | 4 | 8 | catalog_options) == 0,
+        Action::Inspect => out.archive.is_some() && out.index.is_some() && out.pin.is_some() && seen & !(1 | 4 | 8 | catalog_options | 65536) == 0,
         Action::Search => out.archive.is_some() && out.index.is_some() && out.pin.is_some()
-            && (out.text.is_some() != out.raw.is_some()) && seen & !(1 | 4 | 8 | 16 | 32 | 64 | catalog_options) == 0,
+            && (out.text.is_some() != out.raw.is_some()) && seen & !(1 | 4 | 8 | 16 | 32 | 64 | catalog_options | 65536) == 0,
     };
-    if !valid { return Err(Failure::new("CLI_INCOMPATIBLE_OPTIONS")); }
+    if !valid || (out.inverted && out.paged) { return Err(Failure::new("CLI_INCOMPATIBLE_OPTIONS")); }
     Ok(out)
 }
 
@@ -214,6 +218,7 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
         }
     }
     if options.action == Action::Refresh { return refresh::execute(options, out, budget, effect, canceled); }
+    if options.paged { return paging::execute(options, out, budget, effect, canceled); }
     let mut archive = catalog::open(&source, options.catalog.as_deref(), options.catalog_pin,
         budget, [allocation(151), allocation(161)], canceled)?;
     if !options.json && !archive.directory().fully_verified_on_open() {
@@ -234,8 +239,7 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
             out.literal(",\"member_payload_bytes_loaded\":")?; out.integer(archive.load_stats().bytes_read)?;
             out.literal(",\"source_derived_sensitive\":true,\"power_loss_qualified\":false}\n")?;
         } else {
-            out.literal(if options.inverted { "Saved global posting index. Retain this trusted index digest separately:\n" }
-                else { "Saved substring index. Retain this trusted index digest separately:\n" })?;
+            out.literal("Saved substring index. Retain this trusted index digest separately:\n")?;
             out.literal(&artifact.digest().to_hex())?; out.literal("\n")?;
             out.literal("Source-derived data may expose source fragments. Existing destinations are never overwritten.\n")?;
             out.literal(if index.stats().uncovered_files > 0 { "Some files remain uncovered and will be scanned directly.\n" } else { "All captured members have segments.\n" })?;
@@ -428,5 +432,15 @@ mod tests {
         assert_eq!(parsed.text.as_deref(), Some("--inverted"));
         assert!(!parsed.inverted);
         assert!(parse(&args(&["inspect", "saved", "--index", "i", "--index-digest", &pin, "--inverted"])).is_err());
+    }
+    #[test]
+    fn paging_requires_explicit_mode_and_does_not_reinterpret_literal_values() {
+        let pin = "ab".repeat(32);
+        assert!(parse(&args(&["build", "saved", "--output", "new", "--paged"])).unwrap().paged);
+        assert!(parse(&args(&["build", "saved", "--output", "new", "--paged", "--inverted"])).is_err());
+        assert!(parse(&args(&["build", "saved", "--output", "new", "--paged", "--paged"])).is_err());
+        let parsed = parse(&args(&["search", "saved", "--index", "i", "--index-digest", &pin, "--text", "--paged"])).unwrap();
+        assert_eq!(parsed.text.as_deref(), Some("--paged")); assert!(!parsed.paged);
+        assert!(parse(&args(&["refresh", "new", "--base", "old", "--index", "i", "--index-digest", &pin, "--output", "next", "--paged"])).is_err());
     }
 }
