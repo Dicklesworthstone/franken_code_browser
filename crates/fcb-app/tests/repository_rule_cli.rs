@@ -60,6 +60,10 @@ fn workspace_inspection_and_path_search_separate_configuration_from_source_paylo
     assert_eq!(inspected.get("rule_policy").get("configuration_bytes_read").number(), 25);
     assert_eq!(inspected.get("payload_bytes_read").number(), 0);
     assert_eq!(inspected.get("known_files").number(), 4);
+    // Independently constructed with Python struct.pack and hashlib. The two
+    // exact rule files are sorted by raw path, not their enumeration order.
+    assert_eq!(inspected.get("policy").text(),
+        "repository-rules-v1:bb71c15f4c99e4fe273924f042a85f29b709d9b2c7a9486ccbf8feb4aecf3ea9");
     let (exit, paths) = invoke(&tree.workspace("search", &["--respect-ignores", "--path", "keep"]), || false);
     assert_eq!(exit, EXIT_OK); assert_eq!(paths.get("hits").array().len(), 1);
     assert_eq!(paths.get("payload_bytes_read").number(), 0);
@@ -74,12 +78,14 @@ fn captured_and_whole_file_search_use_the_same_rule_filtered_universe() {
         if whole_file { args.push("--whole-file".into()); }
         let (exit, result) = invoke(&args, || false);
         assert_eq!(exit, EXIT_OK);
-        assert_eq!(result.get("hits").array().len(), 2);
+        if whole_file {
+            assert_eq!(result.get("stored_hits").number(), 2);
+            assert_eq!(result.get("files").array().iter().map(|file| file.get("hits").array().len()).sum::<usize>(), 2);
+        } else { assert_eq!(result.get("hits").array().len(), 2); }
         assert!(result.get("rule_files_enabled").flag());
         assert_eq!(result.get("rule_policy").get("failed_files").number(), 0);
     }
-    // Negative control: the deliberately explicit static scope includes the
-    // matching ignored files, so omitting policy evaluation changes this result.
+    // Negative control: static scope includes the matching ignored files.
     let (exit, ordinary) = invoke(&tree.workspace("search", &["--text", "needle"]), || false);
     assert_eq!(exit, EXIT_OK); assert!(!ordinary.get("rule_files_enabled").flag());
     assert_eq!(ordinary.get("hits").array().len(), 4);
