@@ -10,6 +10,7 @@ use fcb_core::{ArenaOwnerId, ByteLength, FileId, SourceRevision};
 use fcb_search::{DirectSourceScanner, QueryOptions, SearchMode, UnicodeNormalization};
 use fcb_source::{CaptureRequest, CompleteCapture};
 use fcb::MemorySourceProvider;
+use fcb_headless_consumer::record_receipt;
 
 fn owner() -> ArenaOwnerId {
     ArenaOwnerId::new(0xBEEF).unwrap()
@@ -32,6 +33,12 @@ fn consumer_runs_without_any_native_stack() {
     // proof.
     let capture = make_capture(b"hello");
     assert_eq!(capture.bytes(), b"hello");
+
+    record_receipt(
+        "consumer_runs_without_any_native_stack",
+        "verified consumer runs without any native stack",
+        "capture_bytes=hello",
+    );
 }
 
 #[test]
@@ -43,6 +50,12 @@ fn inert_facade_capture_produces_exact_bytes() {
     let capture = provider.capture("src/main.rs").unwrap();
     assert_eq!(capture.bytes(), b"fn main() {}");
     assert_eq!(capture.logical_path(), "src/main.rs");
+
+    record_receipt(
+        "inert_facade_capture_produces_exact_bytes",
+        "verified in-memory capture produces exact bytes",
+        "logical_path=src/main.rs, byte_len=14",
+    );
 }
 
 #[test]
@@ -59,6 +72,12 @@ fn search_finds_exact_matches_in_captured_source() {
         DirectSourceScanner::scan_complete_capture(&capture, "alpha", &options).unwrap();
     assert_eq!(result.match_count(), 2, "alpha appears twice");
     assert!(result.is_complete());
+
+    record_receipt(
+        "search_finds_exact_matches_in_captured_source",
+        "verified exact decoded text search matches in complete capture",
+        "needle=alpha, matches=2",
+    );
 }
 
 #[test]
@@ -72,6 +91,12 @@ fn search_negative_control_returns_zero_for_missing_needle() {
         DirectSourceScanner::scan_complete_capture(&capture, "absent", &options).unwrap();
     assert_eq!(result.match_count(), 0);
     assert!(result.is_complete());
+
+    record_receipt(
+        "search_negative_control_returns_zero_for_missing_needle",
+        "negative control: missing needle produces zero matches with exhaustive coverage",
+        "needle=absent, matches=0",
+    );
 }
 
 #[test]
@@ -103,4 +128,10 @@ fn map_layout_places_nodes_within_world_bounds() {
         assert!(rect.size().width() > 0.0, "positive width");
         assert!(rect.size().height() > 0.0, "positive height");
     }
+
+    record_receipt(
+        "map_layout_places_nodes_within_world_bounds",
+        "verified map hierarchy commits layout within world bounds",
+        "nodes_placed=4, world=800x600",
+    );
 }

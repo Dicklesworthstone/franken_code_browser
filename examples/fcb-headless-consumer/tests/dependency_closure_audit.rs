@@ -28,8 +28,12 @@ use fcb_source::{CaptureRequest, CompleteCapture};
 const RUN_ID_ENV: &str = "FCB_078_RUN_ID";
 
 fn receipts_dir() -> PathBuf {
-    let run_id = std::env::var(RUN_ID_ENV).unwrap_or_else(|_| "local".to_string());
-    std::env::temp_dir().join(format!("fcb-078-receipts-{run_id}"))
+    if let Ok(custom) = std::env::var("FCB_RECEIPTS_DIR") {
+        PathBuf::from(custom)
+    } else {
+        let run_id = std::env::var(RUN_ID_ENV).unwrap_or_else(|_| "local".to_string());
+        std::env::temp_dir().join(format!("fcb-078-receipts-{run_id}"))
+    }
 }
 
 fn record_receipt(scenario: &str, effect: &str, invariant: &str, details: &str) {

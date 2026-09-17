@@ -137,8 +137,12 @@ pub fn commit_tree_layout(file_len: u64) -> PartitionLayout {
 /// Bounded scenario-receipt recorder retaining machine evidence under
 /// `${TMPDIR:-/tmp}/fcb-078-receipts-${FCB_078_RUN_ID:-local}/`.
 pub fn record_receipt(scenario: &str, invariant: &str, details: &str) {
-    let run_id = std::env::var("FCB_078_RUN_ID").unwrap_or_else(|_| "local".to_string());
-    let dir = std::env::temp_dir().join(format!("fcb-078-receipts-{run_id}"));
+    let dir = if let Ok(custom) = std::env::var("FCB_RECEIPTS_DIR") {
+        std::path::PathBuf::from(custom)
+    } else {
+        let run_id = std::env::var("FCB_078_RUN_ID").unwrap_or_else(|_| "local".to_string());
+        std::env::temp_dir().join(format!("fcb-078-receipts-{run_id}"))
+    };
     let _ = std::fs::create_dir_all(&dir);
     let sanitized_name = scenario.replace([' ', ':', '/', '(', ')', ','], "_");
     let content = format!(
