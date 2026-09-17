@@ -2,9 +2,11 @@
 //! engine.
 //!
 //! Thin marshaling only. Search and file reads route through
-//! [`fcb_app::run`] — the same command routing the `fcb` CLI uses — so a
-//! native shell and the terminal share one implementation, one policy,
-//! and one JSON contract. No parsing, policy, or caching lives here.
+//! [`fcb_app::run`] — the same command routing the `fcb` CLI uses — and
+//! atlas layout routes through `fcb-map`'s partition engine, so a native
+//! shell, the terminal, and the planned Metal renderer share one
+//! implementation, one policy, and one JSON contract. No parsing, policy,
+//! or caching lives here.
 //!
 //! FFI safety: the `unsafe` surface is exactly four sites, each limited
 //! to C-string marshaling at the ABI boundary. Callers own returned
@@ -12,9 +14,166 @@
 
 use std::ffi::{c_char, CStr, CString, OsString};
 
+use fcb_core::{ArenaOwnerId, RootId};
+use fcb_map::NodeKind;
+use fcb_map::{commit_layout, HierarchySpec, LayoutOptions, NodeSpec};
+
 /// The longest file body the bridge will hand a shell. The engine's own
 /// bounded-read policy stays authoritative; this only caps host memory.
 const MAX_READ_BYTES: usize = 4 << 20;
+
+/// Atlas walk bounds: workspaces above these are refused with a note
+/// rather than silently truncated (the shell surfaces the refusal).
+const ATLAS_MAX_FILES: usize = 20_000;
+const ATLAS_MAX_DEPTH: u16 = 14;
+
+fn is_ignored_dir(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b".git" | b"target" | b"node_modules" | b".build" | b"dist" | b".venv"
+            | b"__pycache__" | b".beads" | b".idea" | b".vscode"
+    )
+}
+
+struct WalkEntry {
+    relative: Vec<u8>,
+    is_dir: bool,
+    bytes: u64,
+}
+
+fn walk(
+    absolute: &std::path::Path,
+    prefix: &str,
+    depth: u16,
+    out: &mut Vec<WalkEntry>,
+) -> Result<(), String> {
+    if depth > ATLAS_MAX_DEPTH {
+        return Err(format!(
+            "directory tree deeper than {ATLAS_MAX_DEPTH} levels: {prefix}"
+        ));
+    }
+    let mut entries: Vec<_> = std::fs::read_dir(absolute)
+        .map_err(|error| format!("{}: {error}", absolute.display()))?
+        .filter_map(|entry| entry.ok())
+        .collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let name = entry.file_name();
+        let name_bytes = name.as_encoded_bytes().to_vec();
+        let name_str = String::from_utf8_lossy(&name_bytes).into_owned();
+        let child_absolute = entry.path();
+        let relative = if prefix.is_empty() {
+            name_str.clone()
+        } else {
+            format!("{prefix}/{name_str}")
+        };
+        let metadata = entry
+            .metadata()
+            .map_err(|error| format!("{}: {error}", child_absolute.display()))?;
+        if metadata.is_dir() {
+            if is_ignored_dir(&name_bytes) {
+                continue;
+            }
+            let marker = out.len();
+            out.push(WalkEntry {
+                relative: relative.clone().into_bytes(),
+                is_dir: true,
+                bytes: 0,
+            });
+            walk(&child_absolute, &relative, depth + 1, out)?;
+            // Directory weight aggregates its subtree so parent partitions
+            // size truthfully.
+            let subtree: u64 = out[marker + 1..].iter().map(|entry| entry.bytes).sum();
+            out[marker].bytes = subtree;
+            if out.iter().filter(|entry| !entry.is_dir).count() > ATLAS_MAX_FILES {
+                return Err(format!(
+                    "workspace has more than {ATLAS_MAX_FILES} files; scope the root tighter"
+                ));
+            }
+        } else if metadata.is_file() {
+            out.push(WalkEntry {
+                relative: relative.into_bytes(),
+                is_dir: false,
+                bytes: metadata.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn json_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if (character as u32) < 0x20 => {
+                escaped.push_str(&format!("\\u{:04x}", character as u32))
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn atlas_json(root_path: &str) -> Option<String> {
+    let mut entries = Vec::new();
+    walk(std::path::Path::new(root_path), "", 0, &mut entries).ok()?;
+    if entries.is_empty() {
+        return None;
+    }
+    let owner = ArenaOwnerId::new(1).ok()?;
+    let root_id = RootId::new(owner, 1).ok()?;
+    let revision = fcb_map::LayoutRevision::new(owner, 1).ok()?;
+    let nodes: Vec<NodeSpec> = entries
+        .iter()
+        .map(|entry| {
+            NodeSpec::new(
+                entry.relative.clone(),
+                if entry.is_dir {
+                    NodeKind::Directory
+                } else {
+                    NodeKind::File
+                },
+                Some(entry.bytes),
+            )
+        })
+        .collect();
+    let spec = HierarchySpec::new(owner, root_id, nodes).ok()?;
+    let layout = commit_layout(
+        revision,
+        fcb_map::Size2D::new(4096.0, 4096.0).ok()?,
+        &spec,
+        LayoutOptions::modest(),
+    )
+    .ok()?;
+    let mut out = String::from("{\"world\":{\"w\":4096,\"h\":4096},\"files\":[");
+    let mut first = true;
+    for node in layout.nodes() {
+        if node.kind() != NodeKind::File {
+            continue;
+        }
+        let rect = node.parent_local();
+        let path = String::from_utf8_lossy(node.path());
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push_str(&format!(
+            "{{\"path\":\"{}\",\"x\":{:.2},\"y\":{:.2},\"w\":{:.2},\"h\":{:.2}}}",
+            json_escape(&path),
+            rect.min_x(),
+            rect.min_y(),
+            rect.max_x() - rect.min_x(),
+            rect.max_y() - rect.min_y()
+        ));
+    }
+    out.push_str("]}");
+    Some(out)
+}
 
 /// Reads a C string at the ABI boundary; null or non-UTF-8 yields None.
 unsafe fn cstr<'a>(pointer: *const c_char) -> Option<&'a str> {
@@ -78,6 +237,23 @@ pub extern "C" fn fcb_read_file(path: *const c_char) -> *mut c_char {
         let bytes = std::fs::read(path).ok()?;
         let capped = &bytes[..bytes.len().min(MAX_READ_BYTES)];
         Some(String::from_utf8_lossy(capped).into_owned())
+    })();
+    string_out(reply)
+}
+
+/// Lays out every file under `root` with the fcb-map partition engine and
+/// returns JSON: {"world":{"w":W,"h":H},"files":[{"path","x","y","w","h"},
+/// ...]}. Null on refusal (empty root, depth/file caps, unreadable
+/// entries) so the shell can surface the boundary honestly.
+///
+/// # Safety
+/// `root` must be a valid NUL-terminated UTF-8 C string, or null. The
+/// returned string is released by the caller through [`fcb_free_string`].
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_atlas_layout(root: *const c_char) -> *mut c_char {
+    let reply = (|| {
+        let root = unsafe { cstr(root) }?;
+        atlas_json(root)
     })();
     string_out(reply)
 }

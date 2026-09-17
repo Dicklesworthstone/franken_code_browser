@@ -15,3 +15,5 @@ crate-type = ["staticlib"]
 
 [dependencies]
 fcb-app = { path = "../fcb-app" }
+fcb-core = { path = "../fcb-core" }
+fcb-map = { path = "../fcb-map" }
