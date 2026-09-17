@@ -117,11 +117,14 @@ pub struct CapturedSymbols<'source> {
     _lease: ResourceLease,
 }
 impl<'source> CapturedSymbols<'source> {
+    /// `source` is the complete immutable observation beginning at original
+    /// byte zero. Extent requests are refused, never relabelled as whole files.
     pub fn build(source: &'source [u8], request: CaptureRequest, generation: QueryGeneration,
         language: SymbolLanguage, encoding: Option<DetectedEncoding>, max_items: usize,
         budget: &ResourceBudget, allocation: ResourceAllocationId,
         mut canceled: impl FnMut() -> bool) -> Result<Self, SymbolError> {
         if generation.owner() != request.file().owner() { return Err(SymbolError::OwnerMismatch); }
+        if request.range().is_some() { return Err(SymbolError::InvalidEvidence); }
         if source.len() > MAX_SYMBOL_SOURCE_BYTES { return Err(SymbolError::SourceLimit); }
         if !(1..=MAX_SYMBOL_ITEMS).contains(&max_items) { return Err(SymbolError::InvalidLimits); }
         if canceled() { return Err(SymbolError::Canceled); }
@@ -130,7 +133,8 @@ impl<'source> CapturedSymbols<'source> {
         // Borrowed source bytes retain their host's separate source reservation.
         let charge = source.len().checked_add(1).and_then(|n| n.checked_mul(768))
             .and_then(|n| max_items.checked_mul(size_of::<SymbolCandidate>() + 32).and_then(|m| n.checked_add(m)))
-            .and_then(|n| n.checked_add(size_of::<Self>() + 4096)).ok_or(SymbolError::ResourceDenied)?;
+            .and_then(|n| n.checked_add(size_of::<Self>() + MAX_LINES * size_of::<usize>() + 4096))
+            .ok_or(SymbolError::ResourceDenied)?;
         let lease = budget.try_reserve_managed(request.file().owner(), allocation, ByteLength::new(charge as u64))
             .map_err(|_| SymbolError::ResourceDenied)?;
         let encoding = encoding.unwrap_or_else(|| detect_encoding(source));
@@ -141,13 +145,19 @@ impl<'source> CapturedSymbols<'source> {
         }
         let text = map.decoded_text();
         if text.len() > MAX_SYMBOL_SOURCE_BYTES { return Err(SymbolError::SourceLimit); }
-        if text.bytes().filter(|&b| b == b'\n').count() >= MAX_LINES { return Err(SymbolError::ComplexityLimit); }
+        let line_count = text.bytes().filter(|&b| b == b'\n').count() + 1;
+        if line_count > MAX_LINES { return Err(SymbolError::ComplexityLimit); }
         if language == SymbolLanguage::Rust && text.bytes().filter(|&b| b == b'{').count() > MAX_RECURSIVE_SCOPES {
             return Err(SymbolError::ComplexityLimit);
         }
         if language == SymbolLanguage::Python && text.lines().any(|line| line.len() - line.trim_start().len() > MAX_RECURSIVE_SCOPES) {
             return Err(SymbolError::ComplexityLimit);
         }
+        let mut line_starts = Vec::new();
+        line_starts.try_reserve_exact(line_count).map_err(|_| SymbolError::ResourceDenied)?;
+        if line_starts.capacity() > line_count { return Err(SymbolError::ResourceDenied); }
+        line_starts.push(0);
+        line_starts.extend(text.bytes().enumerate().filter_map(|(i, b)| (b == b'\n').then_some(i + 1)));
         if canceled() { return Err(SymbolError::Canceled); }
         // Do not pass the caller's display limit into extraction: nested items
         // outside earlier top-level results must not disappear during filtering.
@@ -160,7 +170,7 @@ impl<'source> CapturedSymbols<'source> {
         if candidates.capacity() > max_items { return Err(SymbolError::ResourceDenied); }
         let mut limited = false;
         for item in &extracted.items {
-            append(item, None, 0, &map, &mut candidates, max_items, &mut limited, &mut canceled)?;
+            append(item, None, 0, &map, &line_starts, &mut candidates, max_items, &mut limited, &mut canceled)?;
         }
         let fallback = candidates.is_empty() && !source.is_empty();
         if canceled() { return Err(SymbolError::Canceled); }
@@ -183,6 +193,14 @@ impl<'source> CapturedSymbols<'source> {
             || generation.owner() != self.file().owner() { return Err(SymbolError::OwnerMismatch); }
         if file != self.file() || revision != self.revision() { return Err(SymbolError::StaleSource); }
         if generation != self.generation { return Err(SymbolError::StaleQuery); }
+        Ok(())
+    }
+    /// Worker-side activation also checks the bytes, catching a caller that
+    /// improperly reused a source identity for changed content. No hidden I/O.
+    pub fn validate_source(&self, source: &[u8], file: FileId, revision: SourceRevision,
+        generation: QueryGeneration) -> Result<(), SymbolError> {
+        self.validate_delivery(file, revision, generation)?;
+        if self.source != source { return Err(SymbolError::StaleSource); }
         Ok(())
     }
     pub fn source_bytes(&self, id: u64) -> Result<&'source [u8], SymbolError> {
@@ -209,7 +227,8 @@ fn mapped(map: &CaptureEncodingMap, start: u64, end: u64) -> Result<ByteRange, S
         .map_err(|_| SymbolError::InvalidEvidence)?;
     map.decoded_utf8_range_to_byte_range(decoded).map_err(|_| SymbolError::InvalidEvidence)
 }
-fn append(item: &OutlineItem, parent: Option<u64>, depth: usize, map: &CaptureEncodingMap,
+#[allow(clippy::too_many_arguments)]
+fn append(item: &OutlineItem, parent: Option<u64>, depth: usize, map: &CaptureEncodingMap, line_starts: &[usize],
     out: &mut Vec<SymbolCandidate>, limit: usize, limited: &mut bool, canceled: &mut impl FnMut() -> bool)
     -> Result<(), SymbolError> {
     if canceled() { return Err(SymbolError::Canceled); }
@@ -227,18 +246,18 @@ fn append(item: &OutlineItem, parent: Option<u64>, depth: usize, map: &CaptureEn
         }
         None => None,
     };
-    // Legacy line-based routes and Rust both use LF-delimited source positions.
-    // Report that coordinate convention rather than invent visual columns.
-    let line = 1 + map.decoded_text().as_bytes()[..item.evidence.byte_start as usize].iter().filter(|&&b| b == b'\n').count() as u64;
+    // LF-delimited logical position, never a visual column or byte-as-UTF16 index.
+    let line = line_starts.partition_point(|&start| start as u64 <= item.evidence.byte_start) as u64;
     let id = out.len() as u64 + 1;
     out.push(SymbolCandidate { id, parent, depth, name: item.name.clone(), kind: item.kind.clone(), range, name_range, line });
-    for child in &item.children { append(child, Some(id), depth + 1, map, out, limit, limited, canceled)?; }
+    for child in &item.children { append(child, Some(id), depth + 1, map, line_starts, out, limit, limited, canceled)?; }
     Ok(())
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fcb_core::ArenaOwnerId;
+    use fcb_core::{ArenaOwnerId, ByteOffset};
     fn owner() -> ArenaOwnerId { ArenaOwnerId::new(831).unwrap() }
     fn request(rev: u64) -> CaptureRequest {
         CaptureRequest::new(FileId::new(owner(), 1).unwrap(), SourceRevision::new(owner(), rev).unwrap()).unwrap()
@@ -307,5 +326,19 @@ mod tests {
         assert!(matches!(CapturedSymbols::build(source, request(1), generation(), SymbolLanguage::Rust, None, 32,
             &budget, ResourceAllocationId::new(1).unwrap(), || budget.accounting().reserved().get() > 0), Err(SymbolError::Canceled)));
         assert_eq!(budget.accounting().reserved().get(), 0);
+    }
+    #[test]
+    fn extent_requests_cannot_be_interpreted_as_whole_source() {
+        let budget = budget();
+        let range = ByteRange::new(ByteOffset::new(100), ByteOffset::new(109)).unwrap();
+        assert!(matches!(CapturedSymbols::build(b"fn a() {}", request(1).with_range(range).unwrap(), generation(),
+            SymbolLanguage::Rust, None, 32, &budget, ResourceAllocationId::new(1).unwrap(), || false), Err(SymbolError::InvalidEvidence)));
+        assert_eq!(budget.accounting().reserved().get(), 0);
+    }
+    #[test]
+    fn reused_id_with_different_bytes_is_not_a_valid_navigation_target() {
+        let budget = budget(); let outline = build(b"fn old() {}", SymbolLanguage::Rust, 32, &budget);
+        assert_eq!(outline.validate_source(b"fn new() {}", request(1).file(), request(1).revision(), generation()), Err(SymbolError::StaleSource));
+        assert!(outline.validate_source(b"fn old() {}", request(1).file(), request(1).revision(), generation()).is_ok());
     }
 }
