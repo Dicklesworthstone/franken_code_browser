@@ -7,6 +7,7 @@
 //! handoff is an exact bounded UTF-8 observation, not a lossy/truncated preview.
 
 pub mod atlas;
+pub mod reader;
 
 use std::{ffi::OsString, io::{self, Read, Write}, mem::size_of, path::Path};
 use fcb::{ByteLength, ByteOffset, ByteRange, SourceRevision};
@@ -49,18 +50,30 @@ impl HostText {
     pub fn source_bytes_read(&self) -> usize { self.text.len() }
 }
 
+/// Exact whole-file UTF-8, including an initial BOM. The byte reader is shared
+/// with retained sessions; only this legacy C-text route refuses embedded NUL.
+pub fn read_text(path: &Path, max_bytes: usize, canceled: impl FnMut() -> bool)
+    -> Result<HostText, HostError> {
+    let raw = read_bytes(path, max_bytes, canceled)?;
+    let text = String::from_utf8(raw.bytes).map_err(|_| HostError::InvalidUtf8)?;
+    if text.as_bytes().contains(&0) { return Err(HostError::EmbeddedNul); }
+    Ok(HostText { text, read_calls: raw.read_calls, _lease: raw._lease })
+}
+
+struct HostBytes { bytes: Vec<u8>, read_calls: u64, _lease: ResourceLease }
+
 /// Read the WHOLE named regular file, or fail. Admission happens before source
 /// allocation/I/O. Independently bounded extents are copied in original order
 /// without per-chunk text decoding, so scalar boundaries need not align with
 /// chunk boundaries. A final length/mtime comparison covers the whole operation;
 /// this identifies an observed sequence, not an atomic filesystem snapshot.
 /// Symlink/special-file policy is the same as the ordinary application reader.
-pub fn read_text(path: &Path, max_bytes: usize, mut canceled: impl FnMut() -> bool)
-    -> Result<HostText, HostError> {
+fn read_bytes(path: &Path, max_bytes: usize, mut canceled: impl FnMut() -> bool)
+    -> Result<HostBytes, HostError> {
     if max_bytes == 0 || max_bytes > MAX_HOST_TEXT_BYTES { return Err(AppError::InputLimit.into()); }
     if canceled() { return Err(AppError::Canceled.into()); }
     let budget = ResourceBudget::new(owner(), ByteLength::new(MANAGED_BYTES)).map_err(|_| AppError::Admission)?;
-    // Original result + native CString handoff/terminator + path/handle scratch.
+    // Original result + native handoff or retained capture overlap + path scratch.
     let charge = max_bytes.checked_mul(3).and_then(|n| n.checked_add(256 * 1024 + size_of::<HostText>()))
         .ok_or(AppError::Admission)?;
     let lease = budget.try_reserve_managed(owner(), allocation(90), ByteLength::new(charge as u64))
@@ -104,21 +117,18 @@ pub fn read_text(path: &Path, max_bytes: usize, mut canceled: impl FnMut() -> bo
             return Err(AppError::SourceChanged.into());
         }
         bytes.extend_from_slice(extent.bytes());
-        // Extent payload and its decoder-independent lease drop before the next.
     }
-    // Empty files never issue a range-less read which could grow without bound.
     let after = observer.metadata().map_err(|_| AppError::Io)?;
     if after.len() != before.len() || after.modified().ok() != Some(modified) {
         return Err(AppError::SourceChanged.into());
     }
     if canceled() { return Err(AppError::Canceled.into()); }
-    let text = String::from_utf8(bytes).map_err(|_| HostError::InvalidUtf8)?;
-    if text.as_bytes().contains(&0) { return Err(HostError::EmbeddedNul); }
-    Ok(HostText { text, read_calls: calls, _lease: lease })
+    Ok(HostBytes { bytes, read_calls: calls, _lease: lease })
 }
 
 /// Complete machine response, including partial/error/canceled JSON outcomes.
-/// `exit_code` has the existing CLI meaning. Response IDs are invocation-local.
+/// `exit_code` has the existing CLI meaning. Response IDs are invocation-local
+/// except when an explicitly retained reader session supplies the identities.
 pub struct HostResponse {
     text: String,
     exit_code: u8,
@@ -167,18 +177,13 @@ pub fn markdown_heading(path: &Path, heading: &str, lines: u64, width: u64,
 fn invoke(path: &Path, mut arguments: Vec<OsString>, canceled: impl FnMut() -> bool)
     -> Result<HostResponse, HostError> {
     if path.as_os_str().is_empty() || path.as_os_str().len() > 16_384 { return Err(AppError::InputLimit.into()); }
-    // Paths are always positional, even when named --stdin or --include-excluded.
     arguments.extend(["--json".into(), "--".into(), path.as_os_str().to_owned()]);
     let budget = ResourceBudget::new(owner(), ByteLength::new(MANAGED_BYTES)).map_err(|_| AppError::Admission)?;
-    // App run owns its separate engine/output admission. This reservation covers
-    // receiving its bounded document plus one native handoff, not total RSS.
     let lease = budget.try_reserve_managed(owner(), allocation(92),
         ByteLength::new((3 * MAX_RESPONSE_BYTES + 256 * 1024) as u64)).map_err(|_| AppError::Admission)?;
     let mut stdout = Sink::new(MAX_RESPONSE_BYTES)?;
     let mut stderr = Sink::new(8192)?;
     let exit_code = crate::run(&arguments, &mut NoInput, &mut stdout, &mut stderr, canceled);
-    // Cancellation/write failure can leave a partial stdout. Never return it as
-    // a successful JSON document or append stderr to try to repair framing.
     if stdout.failed || stderr.failed || !stderr.bytes.is_empty() || stdout.bytes.is_empty() {
         return Err(HostError::DeliveryFailed);
     }
