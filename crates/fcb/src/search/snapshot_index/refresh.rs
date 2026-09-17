@@ -68,15 +68,18 @@ pub(super) fn construct<R: Read + Seek>(archive: &mut PagedSnapshot<R>, limits: 
         return Err(SnapshotIndexError::Limits);
     }
     if canceled() { return Err(SnapshotIndexError::Canceled); }
-    // Fixed-width sort keys only. No copies of paths, source or gram payloads.
-    // Construction sorting is bounded worker work, not an interaction callback.
-    let mut lookup = Vec::new();
+    // Declare the lease before its vector: every exit destroys the vector first,
+    // including cancellation while populating/sorting the lookup.
     let _lookup_lease = if let Some((old, allocation)) = prior {
         let bytes = old.rows.len().checked_mul(size_of::<usize>())
             .and_then(|n| n.checked_add(size_of::<Vec<usize>>())).ok_or(SnapshotIndexError::Limits)?;
-        let lease = budget.try_reserve_managed(owner, allocation, ByteLength::new(bytes as u64))
-            .map_err(|_| SnapshotIndexError::ResourceDenied)?;
-        lookup = reserve(old.rows.len())?;
+        Some(budget.try_reserve_managed(owner, allocation, ByteLength::new(bytes as u64))
+            .map_err(|_| SnapshotIndexError::ResourceDenied)?)
+    } else { None };
+    // Fixed-width sort keys only. No copies of paths, source or gram payloads.
+    // Construction sorting is bounded worker work, not an interaction callback.
+    let mut lookup = reserve(prior.map_or(0, |(old, _)| old.rows.len()))?;
+    if let Some((old, _)) = prior {
         for (ordinal, row) in old.rows.iter().enumerate() {
             if canceled() { return Err(SnapshotIndexError::Canceled); }
             if row.coverage.indexed() { lookup.push(ordinal); }
@@ -86,8 +89,7 @@ pub(super) fn construct<R: Read + Seek>(archive: &mut PagedSnapshot<R>, limits: 
             a_row.digest.as_bytes().cmp(b_row.digest.as_bytes())
                 .then_with(|| a_row.length.cmp(&b_row.length)).then_with(|| a.cmp(&b))
         });
-        Some(lease)
-    } else { None };
+    }
     let mut capacity = 0usize;
     for member in archive.directory().members() {
         if canceled() { return Err(SnapshotIndexError::Canceled); }
