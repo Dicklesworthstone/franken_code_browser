@@ -11,7 +11,7 @@ use super::{CompiledPattern, ExclusionCause, IgnoreDecision, IgnoreLayerKind,
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IgnoreWorkError { PathLimit, WorkLimit }
 
-pub(crate) fn spend(remaining: &mut u64, amount: usize) -> Result<(), IgnoreWorkError> {
+fn spend(remaining: &mut u64, amount: usize) -> Result<(), IgnoreWorkError> {
     let amount = u64::try_from(amount).map_err(|_| IgnoreWorkError::WorkLimit)?;
     if *remaining < amount { *remaining = 0; return Err(IgnoreWorkError::WorkLimit); }
     *remaining -= amount;
@@ -25,9 +25,7 @@ impl IgnoreMatcher {
     /// No recursion; path scratch is bounded to 256 borrowed segment pointers.
     pub fn decide_bounded(&mut self, path: &NormalizedPath, is_dir: bool,
         remaining: &mut u64) -> Result<IgnoreDecision, IgnoreWorkError> {
-        if path.as_bytes().len() > 4096 || path.segments().len() > 256 {
-            return Err(IgnoreWorkError::PathLimit);
-        }
+        if path.as_bytes().len() > 4096 || path.segments().len() > 256 { return Err(IgnoreWorkError::PathLimit); }
         spend(remaining, path.segments().len() + 1)?;
         let segments: Vec<&[u8]> = path.segments().iter().map(|segment| segment.as_bytes()).collect();
         let mut overridden = false;
@@ -45,9 +43,7 @@ impl IgnoreMatcher {
         for pattern in &self.patterns {
             spend(remaining, 1)?;
             if overridden && matches!(pattern.layer, IgnoreLayerKind::DefaultPolicy | IgnoreLayerKind::Scope) { continue; }
-            if pattern_matches(pattern, &segments, is_dir, remaining)? {
-                last = Some((pattern.negated, pattern.layer));
-            }
+            if pattern_matches(pattern, &segments, is_dir, remaining)? { last = Some((pattern.negated, pattern.layer)); }
         }
         Ok(match last {
             Some((false, layer)) => {
@@ -63,7 +59,7 @@ impl IgnoreMatcher {
     }
 }
 
-pub(crate) fn pattern_matches(pattern: &CompiledPattern, path: &[&[u8]], is_dir: bool,
+pub(super) fn pattern_matches(pattern: &CompiledPattern, path: &[&[u8]], is_dir: bool,
     remaining: &mut u64) -> Result<bool, IgnoreWorkError> {
     spend(remaining, 1)?;
     if pattern.directory_only && !is_dir { return Ok(false); }
@@ -84,30 +80,24 @@ pub(crate) fn pattern_matches(pattern: &CompiledPattern, path: &[&[u8]], is_dir:
     match_segments(&pattern.segs, relative, remaining)
 }
 
-fn match_segments(pattern: &[SegPat], path: &[&[u8]], remaining: &mut u64)
-    -> Result<bool, IgnoreWorkError> {
+fn match_segments(pattern: &[SegPat], path: &[&[u8]], remaining: &mut u64) -> Result<bool, IgnoreWorkError> {
     let (mut p, mut s) = (0usize, 0usize);
     let mut star: Option<(usize, usize)> = None;
     loop {
         spend(remaining, 1)?;
         if p == pattern.len() && s == path.len() { return Ok(true); }
-        if matches!(pattern.get(p), Some(SegPat::GlobStar)) {
-            star = Some((p + 1, s)); p += 1; continue;
-        }
+        if matches!(pattern.get(p), Some(SegPat::GlobStar)) { star = Some((p + 1, s)); p += 1; continue; }
         if let (Some(SegPat::Atoms(atoms)), Some(segment)) = (pattern.get(p), path.get(s)) {
             if match_atoms(atoms, segment, remaining)? { p += 1; s += 1; continue; }
         }
         match star.as_mut() {
-            Some((resume, consumed)) if *consumed < path.len() => {
-                *consumed += 1; p = *resume; s = *consumed;
-            }
+            Some((resume, consumed)) if *consumed < path.len() => { *consumed += 1; p = *resume; s = *consumed; }
             _ => return Ok(false),
         }
     }
 }
 
-fn match_atoms(atoms: &[SegAtom], bytes: &[u8], remaining: &mut u64)
-    -> Result<bool, IgnoreWorkError> {
+fn match_atoms(atoms: &[SegAtom], bytes: &[u8], remaining: &mut u64) -> Result<bool, IgnoreWorkError> {
     let (mut a, mut s) = (0usize, 0usize);
     let mut star: Option<(usize, usize)> = None;
     loop {
@@ -128,9 +118,7 @@ fn match_atoms(atoms: &[SegAtom], bytes: &[u8], remaining: &mut u64)
         };
         if let Some(width) = matched { a += 1; s += width; continue; }
         match star.as_mut() {
-            Some((resume, consumed)) if *consumed < bytes.len() => {
-                *consumed += 1; a = *resume; s = *consumed;
-            }
+            Some((resume, consumed)) if *consumed < bytes.len() => { *consumed += 1; a = *resume; s = *consumed; }
             _ => return Ok(false),
         }
     }
@@ -140,8 +128,6 @@ fn match_atoms(atoms: &[SegAtom], bytes: &[u8], remaining: &mut u64)
 mod tests {
     use super::*;
     use super::super::compile_pattern;
-
-    // Independent dynamic-programming wildcard oracle for small native bytes.
     fn reference(pattern: &[u8], text: &[u8]) -> bool {
         let mut row = vec![false; text.len() + 1]; row[0] = true;
         for &symbol in pattern {
@@ -171,8 +157,7 @@ mod tests {
     }
     #[test]
     fn global_work_refusal_is_not_the_last_partial_rule_decision() {
-        let mut matcher = IgnoreMatcher::include_all();
-        matcher.add_rule_file(None, "*.rs\n!keep.rs\n");
+        let mut matcher = IgnoreMatcher::include_all(); matcher.add_rule_file(None, "*.rs\n!keep.rs\n");
         let path = NormalizedPath::from_dirent_name(b"keep.rs").unwrap();
         for mut remaining in [0, 1, 4] {
             assert_eq!(matcher.decide_bounded(&path, false, &mut remaining), Err(IgnoreWorkError::WorkLimit));
