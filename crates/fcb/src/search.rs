@@ -23,6 +23,9 @@ pub mod extent_navigation;
 pub mod workspace;
 pub mod streaming;
 pub mod file_search;
+/// Bounded outline candidates and exact retained-source activation.
+#[cfg(feature = "analysis")]
+pub mod symbols;
 /// Explicit source snapshot exports and offline restoration; no implicit I/O.
 #[cfg(feature = "snapshot")]
 pub mod snapshot;
