@@ -43,6 +43,7 @@ fn build<'a>(catalog: &'a WorkspaceCatalog, budget: &ResourceBudget, id: u64) ->
 }
 
 #[test]
+#[cfg(target_os = "linux")] // Actual case-sensitive/raw-byte filesystem fixture.
 fn real_discovery_binds_case_distinct_and_non_utf8_paths_without_payload_captures() {
     use std::os::unix::ffi::OsStringExt;
     let root = root(); fs::create_dir(root.join("src")).unwrap();
@@ -157,4 +158,79 @@ fn foreign_layout_same_numeric_identity_and_revoked_grant_cannot_activate() {
     catalog.grant().revoke();
     assert!(matches!(atlas.file(original), Err(WorkspaceAtlasError::Workspace(WorkspaceError::Source(SourceError::GrantRevoked)))));
     assert!(atlas.index(&budget, allocation(4), || false).is_err());
+}
+
+use fcb::map::workspace::path_search::{WorkspacePathIndex, WorkspacePathSearchError};
+use fcb::search::{PathSearchError, PathSearchOptions};
+fn path_options(limit: usize, generation: u64) -> PathSearchOptions {
+    let mut options = PathSearchOptions::new(QueryGeneration::new(owner(), generation).unwrap());
+    options.max_results = limit; options
+}
+
+#[test]
+fn retained_path_search_matches_the_existing_engine_without_repacking_any_node() {
+    let root = root();
+    for dir in ["src", "src-old", "docs"] { fs::create_dir(root.join(dir)).unwrap(); }
+    for path in ["src/parser.rs", "src/parser_test.rs", "src-old/parser.rs", "docs/parser.md", "readme"] {
+        fs::write(root.join(path), b"source payload not needed for path queries").unwrap();
+    }
+    let budget = budget(); let catalog = catalog(&root, &budget, 10);
+    let atlas = build(&catalog, &budget, 2); let spatial = atlas.index(&budget, allocation(3), || false).unwrap();
+    let before = atlas.layout().nodes().to_vec();
+    let paths = WorkspacePathIndex::build(&atlas, &budget, [allocation(4), allocation(5)], || false).unwrap();
+    let options = path_options(100, 1);
+    let matches = paths.search(b"parser", options, &budget, [allocation(6), allocation(7)], || false).unwrap();
+    assert!(matches.is_complete()); assert!(!matches.truncated()); assert_eq!(matches.matches_seen(), 4);
+    assert_eq!(matches.hits().len(), 4);
+    for (path, expected) in [(b"".as_slice(), 4), (b"src", 2), (b"src-old", 1), (b"docs", 1), (b"readme", 0)] {
+        assert_eq!(matches.retained_matches_in(spatial.find_path(path).unwrap()).unwrap(), expected);
+    }
+    for hit in matches.hits() { assert_eq!(atlas.file(hit.node).unwrap(), hit.file); }
+    let refined = paths.search(b"parser_test", path_options(100, 2), &budget,
+        [allocation(8), allocation(9)], || false).unwrap();
+    assert_eq!(refined.hits().len(), 1); assert_eq!(matches.hits().len(), 4);
+    assert_eq!(atlas.entry(refined.hits()[0].node).unwrap().path().as_bytes(), b"src/parser_test.rs");
+    assert_eq!(atlas.layout().nodes(), before.as_slice());
+    assert_eq!(spatial.revision(), atlas.layout().revision());
+    assert!(matches.validate_delivery(&atlas, QueryGeneration::new(owner(), 2).unwrap()).is_err());
+    refined.validate_delivery(&atlas, QueryGeneration::new(owner(), 2).unwrap()).unwrap();
+}
+
+#[test]
+fn path_overlay_counting_distinguishes_truncated_rows_and_partial_membership() {
+    let root = root(); for name in ["match-a", "match-b", "match-c"] { fs::write(root.join(name), b"unused").unwrap(); }
+    let budget = budget(); let catalog = catalog(&root, &budget, 10); let atlas = build(&catalog, &budget, 2);
+    let paths = WorkspacePathIndex::build(&atlas, &budget, [allocation(3), allocation(4)], || false).unwrap();
+    for limit in [0, 1, 3] {
+        let results = paths.search(b"match", path_options(limit, 1), &budget, [allocation(5), allocation(6)], || false).unwrap();
+        assert!(results.is_complete()); assert_eq!(results.matches_seen(), 3);
+        assert_eq!(results.hits().len(), limit); assert_eq!(results.truncated(), limit < 3);
+        let node = AtlasNodeId::new(atlas.layout().root(), atlas.layout().revision(), 0);
+        assert_eq!(results.retained_matches_in(node).unwrap(), limit);
+    }
+    drop(paths); drop(atlas); drop(catalog);
+    let partial = self::catalog(&root, &budget, 1); let atlas = build(&partial, &budget, 2);
+    let paths = WorkspacePathIndex::build(&atlas, &budget, [allocation(3), allocation(4)], || false).unwrap();
+    let result = paths.search(b"absent", path_options(10, 1), &budget, [allocation(5), allocation(6)], || false).unwrap();
+    assert!(!result.is_complete()); assert!(!result.truncated()); assert_eq!(result.matches_seen(), 0);
+}
+
+#[test]
+fn path_overlays_reject_cancellation_foreign_queries_and_wrong_or_revoked_atlases() {
+    let root = root(); fs::write(root.join("needle"), b"unused").unwrap();
+    let budget = budget(); let catalog = catalog(&root, &budget, 10); let atlas = build(&catalog, &budget, 2);
+    let paths = WorkspacePathIndex::build(&atlas, &budget, [allocation(3), allocation(4)], || false).unwrap();
+    let result = paths.search(b"needle", path_options(10, 1), &budget, [allocation(5), allocation(6)], || false).unwrap();
+    assert!(matches!(paths.search(b"needle", path_options(10, 2), &budget, [allocation(7), allocation(8)], || true),
+        Err(WorkspacePathSearchError::Path(PathSearchError::Canceled))));
+    let mut foreign = path_options(10, 2); foreign.generation = QueryGeneration::new(ArenaOwnerId::new(999).unwrap(), 2).unwrap();
+    assert!(matches!(paths.search(b"needle", foreign, &budget, [allocation(7), allocation(8)], || false),
+        Err(WorkspacePathSearchError::Path(PathSearchError::OwnerMismatch))));
+    let other = build(&catalog, &budget, 9);
+    assert!(matches!(result.validate_delivery(&other, result.generation()),
+        Err(WorkspacePathSearchError::Path(PathSearchError::StaleIndex))));
+    assert_eq!(result.hits().len(), 1); // Failed replacement cannot destroy the old overlay.
+    catalog.grant().revoke();
+    assert!(result.validate_delivery(&atlas, result.generation()).is_err());
+    assert!(paths.search(b"needle", path_options(10, 3), &budget, [allocation(7), allocation(8)], || false).is_err());
 }

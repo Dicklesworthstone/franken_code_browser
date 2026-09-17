@@ -10,6 +10,7 @@ fcb atlas /path/to/repository --focus crates --select crates/fcb/src/lib.rs --js
 fcb atlas /path/to/repository --focus crates/fcb --zoom 2 --pan-x 80 --json
 fcb atlas /path/to/repository --limit 128 --max-visits 2048 --json
 fcb atlas /path/to/repository --respect-ignores --json
+fcb atlas /path/to/repository --path parser --match-limit 50 --json
 fcb atlas --help
 ```
 
@@ -57,11 +58,40 @@ null. Their `represented_leaves` counts are hierarchy leaves, not source-line,
 readable-file, or match counts. Ordinary distance aggregation is a complete
 requested detail level. Budget/precision aggregation sets `detail_limited`.
 
-Exit 0 is a complete plan with closed catalog membership; exit 3 means incomplete
-discovery or budget/precision-limited detail. Error is 2; cancellation is 130.
-JSON is privately encoded within an 8 MiB cap before delivery. A broken output
-pipe can leave incomplete output; no second JSON document is appended to repair
-it. There are no writes to the repository or implicit stdin consumption.
+Exit 0 is a complete plan with closed catalog membership and, when requested,
+complete path-search counts/rows. Exit 3 means incomplete discovery, budget or
+precision-limited detail, or truncated/incomplete path-search results. Error is
+2; cancellation is 130. JSON is privately encoded within an 8 MiB cap before
+delivery. A broken output pipe can leave incomplete output; no second JSON
+document is appended to repair it. There are no writes to the repository or
+implicit stdin consumption.
+
+## Path-search overlays
+
+`--path QUERY` reuses the public native-path fuzzy matcher on the SAME frozen
+catalog used to build the atlas. It does not search source text. The ranked
+`path_search.hits` carry those same FileIds, atlas nodes, rank classes and clipped
+rectangles. Matches outside the focus/viewport retain their IDs with null
+rectangles. None is treated as a presented interaction target.
+
+`--match-limit` is independent of `--limit`: it bounds retained matching-file
+markers, not visible parcels. It defaults to 100 and admits 0 through 4096.
+Zero counts all matching known paths without retaining rows. `matches_seen`,
+`retained_matches`, `scan_complete`, and `truncated` are separate: an empty
+result from incomplete discovery cannot establish repository-wide absence.
+
+`retained_path_matches` on a file or directory parcel counts ONLY retained
+matching files in that node's subtree, not total matches or text occurrences.
+Sibling-group boxes cover only subsets of their parents, so their count is null
+rather than incorrectly borrowing the containing directory's count. Raw path
+prefixes are component-aware (`src-old` is not inside `src`).
+
+The library's `WorkspacePathIndex` is prepared once and retained for repeated
+queries. `AtlasPathOverlay` holds a separate generation and bounded result lease;
+changing the query never changes layout rectangles or source bindings. Consumers
+validate the exact atlas and query generation before accepting an overlay.
+Old/new overlays may coexist under separate admission without silently dropping
+the old accepted result when a new query fails or is canceled.
 
 ## Embedding and verification boundary
 
@@ -77,7 +107,10 @@ is not a retained GUI session or a persisted-layout mechanism. Native hosts use
 the retained Rust objects instead of launching it on every gesture.
 
 Tests: `crates/fcb/tests/workspace_atlas.rs`,
-`crates/fcb-app/tests/atlas_cli.rs`, and parser cases in `src/atlas.rs`.
+`crates/fcb-app/tests/atlas_cli.rs`, path interval unit tests in
+`crates/fcb/src/map/workspace/path_search.rs`, and parser cases in `src/atlas.rs`.
+Filesystem fixtures requiring case-distinct or arbitrary non-UTF-8 names are
+Linux-specific and do not stand in for physical Mac qualification.
 Implementation is code-first, batch verification pending. Rust compilation,
 independent strict-RCH tests, and native integration have not been executed by
 the authoring session. Portable geometry tests cannot qualify native rendering.

@@ -3,6 +3,8 @@
 //! Explicit native-directory -> renderer-neutral atlas plan. The CLI consumes
 //! the public WorkspaceAtlas, camera and visible-query APIs, not a second map
 //! algorithm. A plan is never acknowledged as a physically presented frame.
+mod path_overlay;
+
 use std::{ffi::OsString, fs, io::Write, path::{Component, Path, PathBuf}};
 use fcb::{ByteLength, CameraGeneration, DisplayGeneration, DisplayMetrics, Point2D, Rect2D, Size2D};
 use fcb::map::{AtlasDetail, AtlasError, AtlasIndex, AtlasNodeId, Camera2D, CameraError,
@@ -25,6 +27,7 @@ const HELP: &str = "Repository atlas plans\n\n\
   --detail-pixels F           Expand threshold in physical pixels (default 48)\n\
   --limit N --max-visits N    Parcel and traversal limits (default 1024 / 32768)\n\
   --max-files N               Discovery file limit (default 4096)\n\
+  --path QUERY --match-limit N  Ranked filename/path overlay (default 100 rows)\n\
   --respect-ignores OR --include-excluded\n\n\
 This command explicitly authorizes bounded directory discovery. No source\n\
 payloads are read. Repository rule files require --respect-ignores separately.\n\
@@ -41,6 +44,7 @@ Implemented-unqualified; independent Rust/RCH and native verification pending.\n
 struct Options {
     workspace: Arguments,
     focus: Option<PathBuf>, select: Option<PathBuf>,
+    path_query: Option<OsString>, match_limit: usize,
     width: f64, height: f64, scale: f64, zoom: f64, pan_x: f64, pan_y: f64,
     detail_pixels: f64, max_visits: usize,
 }
@@ -72,7 +76,8 @@ impl Error {
 }
 fn takes_value(option: &str) -> bool {
     matches!(option, "--focus" | "--select" | "--width" | "--height" | "--scale" | "--zoom"
-        | "--pan-x" | "--pan-y" | "--detail-pixels" | "--limit" | "--max-visits" | "--max-files")
+        | "--pan-x" | "--pan-y" | "--detail-pixels" | "--limit" | "--max-visits" | "--max-files"
+        | "--path" | "--match-limit")
 }
 fn json_requested(arguments: &[OsString]) -> bool {
     let mut cursor = 0;
@@ -102,6 +107,7 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
     // values are consumed here; they can never turn into discovery switches.
     let mut forwarded = vec![OsString::from("inspect"), OsString::from("--workspace")];
     let (mut focus, mut select) = (None, None);
+    let (mut path_query, mut match_limit) = (None, 100usize);
     let (mut width, mut height, mut scale, mut zoom) = (1024.0, 768.0, 1.0, 1.0);
     let (mut pan_x, mut pan_y, mut detail_pixels, mut max_visits) = (0.0, 0.0, 48.0, 32_768usize);
     let (mut cursor, mut seen) = (0usize, 0u32);
@@ -123,10 +129,15 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
             "--focus" => 1, "--select" => 2, "--width" => 4, "--height" => 8,
             "--scale" => 16, "--zoom" => 32, "--pan-x" => 64, "--pan-y" => 128,
             "--detail-pixels" => 256, "--max-visits" => 512,
+            "--path" => 1024, "--match-limit" => 2048,
             _ => return Err(ArgumentError::UnknownOption.into()),
         };
         if seen & bit != 0 { return Err(ArgumentError::DuplicateOption.into()); } seen |= bit;
         let value = arguments.get(cursor).ok_or(ArgumentError::MissingValue)?; cursor += 1;
+        if option == "--path" {
+            if value.is_empty() || value.len() > 256 { return Err(ArgumentError::InvalidNeedle.into()); }
+            path_query = Some(value.clone()); continue;
+        }
         if option == "--focus" || option == "--select" {
             if value.is_empty() { return Err(ArgumentError::MissingValue.into()); }
             let path = PathBuf::from(value);
@@ -145,6 +156,11 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
             "--pan-x" => pan_x = real(value, -1e9, 1e9)?,
             "--pan-y" => pan_y = real(value, -1e9, 1e9)?,
             "--detail-pixels" => detail_pixels = real(value, 0.001, 4096.0)?,
+            "--match-limit" => {
+                let n = args::decimal(value)?;
+                if n > 4096 { return Err(ArgumentError::Limit.into()); }
+                match_limit = n as usize;
+            }
             "--max-visits" => {
                 let n = args::decimal(value)?;
                 if !(1..=1_000_000).contains(&n) { return Err(ArgumentError::Limit.into()); }
@@ -153,11 +169,12 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
             _ => unreachable!(),
         }
     }
+    if seen & 2048 != 0 && path_query.is_none() { return Err(ArgumentError::IncompatibleOptions.into()); }
     // Insert before a possible positional-only delimiter, not after it.
     if !limit_seen { forwarded.splice(2..2, [OsString::from("--limit"), OsString::from("1024")]); }
     let workspace = args::parse(&forwarded)?;
     if workspace.limit == 0 { return Err(ArgumentError::Limit.into()); }
-    Ok(Options { workspace, focus, select, width, height, scale, zoom, pan_x, pan_y, detail_pixels, max_visits })
+    Ok(Options { workspace, focus, select, path_query, match_limit, width, height, scale, zoom, pan_x, pan_y, detail_pixels, max_visits })
 }
 
 pub(crate) fn run(arguments: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write,
@@ -250,6 +267,11 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
         query.step(256, generation(), &mut *canceled)?;
     }
     let plan = query.finish()?;
+    let overlay = match options.path_query.as_deref() {
+        Some(needle) => Some(path_overlay::build(&atlas, needle, options.match_limit, budget, canceled)?),
+        None => None,
+    };
+    let search_partial = overlay.as_ref().is_some_and(|hits| !hits.is_complete() || hits.truncated());
     let stats = plan.stats();
     let detail_limited = stats.budget_aggregates != 0 || stats.precision_aggregates != 0;
     if args.json {
@@ -287,6 +309,12 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
             out.literal(",\"logical_rect\":")?; rectangle(out, parcel.logical_rect())?;
             out.literal(",\"file_id\":")?;
             if parcel.is_source_parcel() { out.integer(atlas.file(parcel.node())?.get())?; } else { out.literal("null")?; }
+            out.literal(",\"retained_path_matches\":")?;
+            match &overlay {
+                Some(hits) if parcel.detail() != AtlasDetail::SiblingGroup =>
+                    out.integer(hits.retained_matches_in(parcel.node()).map_err(Error::from)? as u64)?,
+                _ => out.literal("null")?,
+            }
             out.literal("}")?;
         }
         out.literal("],\"traversal\":{\"visited_nodes\":")?; out.integer(stats.visited_nodes as u64)?;
@@ -296,7 +324,9 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
         out.literal(",\"distance_aggregates\":")?; out.integer(stats.distance_aggregates as u64)?;
         out.literal(",\"max_items\":")?; out.integer(args.limit as u64)?;
         out.literal(",\"max_visits\":")?; out.integer(options.max_visits as u64)?;
-        out.literal("}}\n")?;
+        out.literal("}")?;
+        path_overlay::json(out, overlay.as_ref(), &index, focus, camera, canceled)?;
+        out.literal("}\n")?;
     } else {
         out.literal("Retained repository atlas plan (not a native presented frame)\n")?;
         workspace::rule_output::human(out, &catalog)?;
@@ -309,12 +339,13 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
         if let Some(node) = selected {
             out.literal("Selected file: ")?; out.path(&atlas.entry(node)?.path().raw().to_path_buf())?; out.literal("\n")?;
         }
+        path_overlay::human(out, overlay.as_ref(), canceled)?;
         out.literal("Source payload bytes read: 0\n")?;
         if !catalog.discovery_complete() || detail_limited { out.literal("PARTIAL discovery or aggregate-limited detail\n")?; }
     }
     atlas.validate_active()?;
     if canceled() { return Err(AppError::Canceled.into()); }
-    Ok(if catalog.discovery_complete() && !detail_limited { EXIT_OK } else { EXIT_PARTIAL })
+    Ok(if catalog.discovery_complete() && !detail_limited && !search_partial { EXIT_OK } else { EXIT_PARTIAL })
 }
 fn lookup(index: &AtlasIndex<'_>, path: &Path) -> Result<Option<AtlasNodeId>, Error> {
     let mut normalized = PathBuf::new();

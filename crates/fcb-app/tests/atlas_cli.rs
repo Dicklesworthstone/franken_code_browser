@@ -125,6 +125,7 @@ fn rule_files_require_the_explicit_permission_and_never_become_source_payload() 
 }
 
 #[test]
+#[cfg(target_os = "linux")] // Filesystem fixture with arbitrary non-UTF-8 bytes.
 fn native_filename_payload_survives_without_control_sequence_output() {
     use std::os::unix::ffi::OsStringExt;
     let root = root(); let name = OsString::from_vec(b"raw-\xff-\x1b.rs".to_vec());
@@ -179,4 +180,60 @@ fn cancellation_and_partial_writes_never_append_a_second_document() {
 fn help_is_available_without_any_root_or_native_startup() {
     let (code, out, err) = run(&[OsString::from("atlas"), OsString::from("--help"), OsString::from("--json")]);
     assert_eq!(code, EXIT_OK, "{out} {err}"); assert!(out.contains("atlas-help")); assert!(out.contains("--focus"));
+}
+
+#[test]
+fn path_matches_use_the_same_files_and_never_repack_the_underlying_geometry() {
+    let root = fixture();
+    fs::write(root.join("src/parser.rs"), b"UNREAD_QUERY_PAYLOAD").unwrap();
+    fs::write(root.join("docs/parser.md"), b"UNREAD_QUERY_PAYLOAD").unwrap();
+    let base = run(&arguments(&root, &["--json", "--detail-pixels", "0.001"]));
+    assert_eq!(base.0, EXIT_OK, "{} {}", base.1, base.2);
+    let (code, out, err) = run(&arguments(&root, &["--json", "--detail-pixels", "0.001", "--path", "parser"]));
+    assert_eq!(code, EXIT_OK, "{out} {err}");
+    let geometry = |text: &str| -> Vec<String> {
+        text.split("],\"traversal\":").next().unwrap().split("\"logical_rect\":{")
+            .skip(1).map(|part| part.split('}').next().unwrap().to_owned()).collect()
+    };
+    assert_eq!(geometry(&base.1), geometry(&out));
+    let hits = out.split("\"path_search\":").nth(1).unwrap();
+    assert!(hits.contains("\"scan_complete\":true")); assert!(hits.contains("\"truncated\":false"));
+    assert!(hits.contains("\"matches_seen\":\"2\"")); assert!(hits.contains("\"retained_matches\":\"2\""));
+    assert!(hits.contains("src/parser.rs") && hits.contains("docs/parser.md"));
+    assert!(!out.contains("UNREAD_QUERY_PAYLOAD")); assert!(out.contains("\"payload_bytes_read\":\"0\""));
+    assert_eq!(out.matches("\"retained_path_matches\":\"1\"").count(), 2);
+}
+
+#[test]
+fn top_k_match_rows_and_off_focus_matches_preserve_coverage_and_identity() {
+    let root = fixture();
+    let (code, out, err) = run(&arguments(&root, &["--json", "--path", ".rs", "--match-limit", "1"]));
+    assert_eq!(code, EXIT_PARTIAL, "{out} {err}");
+    let hits = out.split("\"path_search\":").nth(1).unwrap();
+    assert!(hits.contains("\"scan_complete\":true")); assert!(hits.contains("\"truncated\":true"));
+    assert!(hits.contains("\"matches_seen\":\"2\"")); assert!(hits.contains("\"retained_matches\":\"1\""));
+    let (code, out, err) = run(&arguments(&root, &["--json", "--focus", "docs", "--path", ".rs"]));
+    assert_eq!(code, EXIT_OK, "{out} {err}");
+    let hits = out.split("\"path_search\":").nth(1).unwrap();
+    assert!(hits.contains("src/a.rs") && hits.contains("src/b.rs"));
+    assert_eq!(hits.matches("\"logical_rect\":null").count(), 2);
+    let (code, out, _) = run(&arguments(&root, &["--json", "--path", ".rs", "--match-limit", "0"]));
+    assert_eq!(code, EXIT_PARTIAL); assert!(out.contains("\"retained_matches\":\"0\""));
+    assert!(out.contains("\"matches_seen\":\"2\""));
+    let (code, out, _) = run(&arguments(&root, &["--json", "--path", "never-exists", "--max-files", "1"]));
+    assert_eq!(code, EXIT_PARTIAL); assert!(out.contains("\"scan_complete\":false"));
+    assert!(out.contains("\"matches_seen\":\"0\""));
+}
+
+#[test]
+fn path_overlay_options_preserve_literal_values_and_reject_unpaired_limits() {
+    let root = fixture();
+    let (code, out, err) = run(&arguments(&root, &["--path", "--json"]));
+    assert_eq!(code, EXIT_OK, "{out} {err}"); assert!(!out.starts_with('{'));
+    for options in [vec!["--json", "--match-limit", "1"], vec!["--json", "--path", ""],
+        vec!["--json", "--path", "a", "--path", "b"],
+        vec!["--json", "--path", "a", "--match-limit", "4097"]] {
+        let (code, out, _) = run(&arguments(&root, &options));
+        assert_eq!(code, EXIT_ERROR); assert!(!out.contains("\"parcels\":"));
+    }
 }

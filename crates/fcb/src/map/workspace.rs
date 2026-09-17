@@ -9,6 +9,8 @@
 //! Empty directories and undiscovered/unavailable entries are NOT manufactured:
 //! this is an atlas of catalogued regular files and their ancestor directories.
 
+pub mod path_search;
+
 use std::mem::size_of;
 use fcb_core::{ByteLength, FileId, LayoutRevision, ResourceAllocationId, ResourceBudget, ResourceLease};
 use crate::search::workspace::{WorkspaceCatalog, WorkspaceEntry, WorkspaceError, WorkspaceStage};
@@ -25,8 +27,8 @@ pub enum WorkspaceAtlasError {
 impl std::fmt::Display for WorkspaceAtlasError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Workspace(e) => e.fmt(f), Self::Layout(e) => e.fmt(f),
-            Self::Atlas(e) => e.fmt(f), Self::Navigation(e) => e.fmt(f),
+            Self::Workspace(e) => write!(f, "{e}"), Self::Layout(e) => write!(f, "{e}"),
+            Self::Atlas(e) => write!(f, "{e}"), Self::Navigation(e) => write!(f, "{e}"),
             Self::InvalidLimits => f.write_str("WORKSPACE_ATLAS_INVALID_LIMITS"),
             Self::WrongIndex => f.write_str("WORKSPACE_ATLAS_WRONG_INDEX"),
         }
