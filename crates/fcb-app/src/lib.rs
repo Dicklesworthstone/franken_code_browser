@@ -17,6 +17,7 @@ mod trail;
 mod symbols;
 mod lines;
 mod atlas;
+mod markdown;
 
 use std::{ffi::OsString, io::{Read, Write}};
 use fcb::{ArenaOwnerId, ByteLength, FileId, SourceRevision};
@@ -142,6 +143,10 @@ impl From<FileSearchError> for AppError { fn from(error: FileSearchError) -> Sel
 /// redacted stderr diagnostic follows. No caller process exit or signal occurs.
 pub fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut impl Write,
     stderr: &mut impl Write, mut canceled: impl FnMut() -> bool) -> u8 {
+    // Markdown reads only the explicitly selected capture; never implicit stdin.
+    if arguments.first().is_some_and(|argument| argument == "markdown") {
+        return markdown::run(&arguments[1..], stdout, stderr, canceled);
+    }
     // Atlas plans consume explicit metadata discovery, never implicit stdin.
     if arguments.first().is_some_and(|argument| argument == "atlas") {
         return atlas::run(&arguments[1..], stdout, stderr, canceled);
