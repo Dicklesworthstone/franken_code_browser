@@ -4,18 +4,18 @@
 //! snapshot's no-overwrite writer and effect-aware receipt contract. The index
 //! digest must come from the prior trusted build receipt, never the input file.
 
-use std::{ffi::OsString, fs::{self, File}, io::{self, Read, Write}, path::{Path, PathBuf}};
+use std::{ffi::OsString, fs, io::{self, Read, Write}, path::{Path, PathBuf}};
 use fcb::ByteLength;
 use fcb::search::{IndexLimits, RawPath, ResourceBudget, StreamReadStep};
-use fcb::search::paged_snapshot::{PagedSnapshot, PagedQuery, PagedQueryOptions, PagedQueryState,
+use fcb::search::paged_snapshot::{PagedQuery, PagedQueryOptions, PagedQueryState,
     IndexedNeedle, SnapshotDirectory, PagedSnapshotError};
 use fcb::search::snapshot::Sha256Digest;
 use fcb::search::snapshot_index::{SnapshotIndex, SnapshotIndexError, SavedIndexStats, MAX_INDEX_BYTES, MAX_INDEX_GRAMS};
 use fcb_core::ResourceLease;
-use crate::{AppError, allocation, file_id, generation, owner, revision, input};
+use crate::{allocation, file_id, generation, owner, revision, input};
 use crate::output::{Output, MAX_RESPONSE_BYTES};
-use super::{Failure, Effect, begin, failure_output, write_new, hex, decimal, SnapshotLimits,
-    MAX_SNAPSHOT_BYTES, MAX_ARGUMENTS, MAX_ARGUMENT_BYTES, MAX_SINGLE_ARGUMENT, MANAGED_BYTES,
+use super::{Failure, Effect, begin, failure_output, write_new, hex, decimal, catalog,
+    MAX_ARGUMENTS, MAX_ARGUMENT_BYTES, MAX_SINGLE_ARGUMENT, MANAGED_BYTES,
     EXIT_OK, EXIT_NO_MATCH, EXIT_ERROR, EXIT_PARTIAL, EXIT_CANCELED};
 
 const HELP: &str = "fcb snapshot index build SNAPSHOT --output NEW_INDEX [--json]\n\
@@ -23,16 +23,18 @@ fcb snapshot index inspect SNAPSHOT --index INDEX --index-digest TRUSTED_SHA256 
 fcb snapshot index search SNAPSHOT --index INDEX --index-digest TRUSTED_SHA256\n\
     (--text LITERAL | --raw-hex HEX) [--limit N] [--json]\n\
 Build options: --max-grams N --max-file-bytes N --max-source-bytes N\n\
-Retain index_digest from the trusted build receipt separately. Do not compute\n\
-it from an untrusted index just to make that file pass. Ordinary snapshot search\n\
-needs no index or pin and remains the safe fallback/rebuild route.\n";
+Optional cold-open: --catalog FILE --catalog-digest TRUSTED_CATALOG_SHA256\n\
+A trusted catalog avoids the archive body scan, NOT member digest verification.\n\
+Unread body integrity remains unchecked. Both digests must be retained separately\n\
+from original trusted builds, never inferred from untrusted input files.\n\
+Ordinary snapshot search needs no index or pin and remains the full-scan fallback.\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Action { Help, Build, Inspect, Search }
 struct Options {
     action: Action, archive: Option<PathBuf>, output: Option<PathBuf>, index: Option<PathBuf>,
     pin: Option<Sha256Digest>, text: Option<String>, raw: Option<Vec<u8>>, json: bool,
-    limit: usize, build: IndexLimits,
+    limit: usize, build: IndexLimits, catalog: Option<PathBuf>, catalog_pin: Option<Sha256Digest>,
 }
 impl From<SnapshotIndexError> for Failure {
     fn from(error: SnapshotIndexError) -> Self {
@@ -43,7 +45,7 @@ impl From<SnapshotIndexError> for Failure {
 }
 fn takes_value(arg: &str) -> bool {
     matches!(arg, "--output" | "--index" | "--index-digest" | "--text" | "--raw-hex" | "--limit"
-        | "--max-grams" | "--max-file-bytes" | "--max-source-bytes")
+        | "--max-grams" | "--max-file-bytes" | "--max-source-bytes" | "--catalog" | "--catalog-digest")
 }
 fn wants_json(args: &[OsString]) -> bool {
     let mut i = 0;
@@ -68,7 +70,7 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
         _ => return Err(Failure::new("SAVED_INDEX_UNKNOWN_COMMAND")),
     };
     let mut out = Options { action, archive: None, output: None, index: None, pin: None, text: None,
-        raw: None, json: false, limit: 100, build: IndexLimits::default() };
+        raw: None, json: false, limit: 100, build: IndexLimits::default(), catalog: None, catalog_pin: None };
     let mut seen = 0u16;
     let mut cursor = usize::from(!args.is_empty());
     let mut positional = false;
@@ -83,6 +85,7 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
         let bit = match option { "--json" => 1, "--output" => 2, "--index" => 4, "--index-digest" => 8,
             "--text" => 16, "--raw-hex" => 32, "--limit" => 64, "--max-grams" => 128,
             "--max-file-bytes" => 256, "--max-source-bytes" => 512,
+            "--catalog" => 1024, "--catalog-digest" => 2048,
             _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")),
         };
         if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
@@ -93,9 +96,11 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
         match option {
             "--output" => { out.output = Some(PathBuf::from(value)); continue; }
             "--index" => { out.index = Some(PathBuf::from(value)); continue; }
+            "--catalog" => { out.catalog = Some(PathBuf::from(value)); continue; }
             _ => {},
         }
         let text = value.to_str().ok_or_else(|| Failure::new("CLI_INVALID_VALUE"))?;
+        if option == "--catalog-digest" { out.catalog_pin = Some(catalog::parse_pin(text)?); continue; }
         if option == "--index-digest" {
             if text.len() != 64 { return Err(Failure::new("SAVED_INDEX_INVALID_PIN")); }
             out.pin = Some(Sha256Digest::new(hex(text, 32)?.try_into().map_err(|_| Failure::new("SAVED_INDEX_INVALID_PIN"))?));
@@ -115,12 +120,14 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
             _ => return Err(Failure::new("CLI_ARGUMENT_LIMIT")),
         }
     }
+    if out.catalog.is_some() != out.catalog_pin.is_some() { return Err(Failure::new("CATALOG_PATH_AND_PIN_REQUIRED")); }
+    let catalog_options = 1024 | 2048;
     let valid = match action {
         Action::Help => out.archive.is_none() && seen & !1 == 0,
-        Action::Build => out.archive.is_some() && out.output.is_some() && seen & !(1 | 2 | 128 | 256 | 512) == 0,
-        Action::Inspect => out.archive.is_some() && out.index.is_some() && out.pin.is_some() && seen & !(1 | 4 | 8) == 0,
+        Action::Build => out.archive.is_some() && out.output.is_some() && seen & !(1 | 2 | 128 | 256 | 512 | catalog_options) == 0,
+        Action::Inspect => out.archive.is_some() && out.index.is_some() && out.pin.is_some() && seen & !(1 | 4 | 8 | catalog_options) == 0,
         Action::Search => out.archive.is_some() && out.index.is_some() && out.pin.is_some()
-            && (out.text.is_some() != out.raw.is_some()) && seen & !(1 | 4 | 8 | 16 | 32 | 64) == 0,
+            && (out.text.is_some() != out.raw.is_some()) && seen & !(1 | 4 | 8 | 16 | 32 | 64 | catalog_options) == 0,
     };
     if !valid { return Err(Failure::new("CLI_INCOMPATIBLE_OPTIONS")); }
     Ok(out)
@@ -180,9 +187,11 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
             Err(_) => return Err(Failure::new("SNAPSHOT_DESTINATION_UNAVAILABLE")),
         }
     }
-    let (file, metadata) = input::open_regular(&source)?;
-    if metadata.len() > MAX_SNAPSHOT_BYTES as u64 { return Err(Failure::new("SNAPSHOT_LIMIT")); }
-    let mut archive = PagedSnapshot::open(file, owner(), SnapshotLimits::default(), budget, allocation(151), &mut *canceled)?;
+    let mut archive = catalog::open(&source, options.catalog.as_deref(), options.catalog_pin,
+        budget, [allocation(151), allocation(161)], canceled)?;
+    if !options.json && !archive.directory().fully_verified_on_open() {
+        out.literal("Trusted catalog; archive boundaries checked. Unread body integrity is unchecked; loaded members are digest-verified.\n")?;
+    }
     if options.action == Action::Build {
         let index = SnapshotIndex::build(&mut archive, options.build, budget,
             [allocation(152), allocation(153), allocation(154), allocation(155)], &mut *canceled)?;
@@ -285,6 +294,7 @@ fn summary(out: &mut Output, directory: &SnapshotDirectory, stats: SavedIndexSta
     out.literal(",\"unique_grams\":")?; out.integer(stats.unique_grams as u64)?;
     out.literal(",\"index_build_source_bytes\":")?; out.integer(stats.build_source_bytes)?;
     out.literal(",\"archive_validation_bytes\":")?; out.integer(directory.validation_stats().bytes_read)?;
+    catalog::validation_fields(out, directory)?;
     Ok(())
 }
 struct LoadedIndex { bytes: Vec<u8>, _lease: ResourceLease }
@@ -341,5 +351,15 @@ mod tests {
             assert!(parse(&args(&values)).is_err());
         }
         assert_eq!(parse(&args(&["build", "saved", "--output", "new", "--max-grams", "0"])).unwrap().build.max_total_grams, 0);
+    }
+    #[test]
+    fn optional_catalog_pin_is_paired_and_independent_of_required_index_pin() {
+        let pin = "ab".repeat(32);
+        assert!(parse(&args(&["inspect", "saved", "--index", "index", "--index-digest", &pin, "--catalog", "meta"])).is_err());
+        assert!(parse(&args(&["inspect", "saved", "--index", "index", "--catalog", "meta", "--catalog-digest", &pin])).is_err());
+        assert!(parse(&args(&["inspect", "saved", "--index", "index", "--index-digest", &pin,
+            "--catalog", "meta", "--catalog-digest", &pin])).is_ok());
+        assert!(!wants_json(&args(&["inspect", "saved", "--catalog", "--json"])));
+        assert!(!wants_json(&args(&["inspect", "saved", "--catalog-digest", "--json"])));
     }
 }
