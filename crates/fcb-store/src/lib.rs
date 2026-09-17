@@ -40,6 +40,8 @@ pub mod namespace;
 pub mod snapshot;
 /// Metadata-only archive residency and independently verified member loads.
 pub mod paged_snapshot;
+/// User-owned ordered source references and rationale, separate from caches.
+pub mod trail;
 
 pub use envelope::{
     canonicalize_f32, canonicalize_f64, EnvelopeError, EnvelopeLimits, EnvelopeReader,
