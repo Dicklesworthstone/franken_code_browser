@@ -198,7 +198,7 @@ fn execute(args: &Arguments, stdin: &mut impl Read, output: &mut Output,
     budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<u8, AppError> {
     if canceled() { return Err(AppError::Canceled); }
     if args.workspace { return workspace::execute(args, output, budget, canceled); }
-    if args.whole_file { return whole_file::single(args, stdin, output, budget, canceled); }
+    if args.whole_file { return whole_file::single(args, output, budget, canceled); }
     match args.command {
         Command::Help => services::help(args.json, output),
         Command::Capabilities | Command::Doctor => services::capabilities(args, output),
