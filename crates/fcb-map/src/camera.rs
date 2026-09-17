@@ -161,6 +161,43 @@ pub(crate) fn checked_rect(rect: Rect2D) -> Result<(), CameraError> {
     Ok(())
 }
 
+/// A viewport-rebased point narrowed to `f32` for GPU submission.
+///
+/// Rebasing subtracts the camera origin before the `f64 -> f32`
+/// narrowing, so coordinates near the focal point stay exactly
+/// representable even after deep zoom. The narrowing is checked: a value
+/// that would lose precision or is non-finite is refused rather than
+/// silently drifting.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RebasedPointF32 {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Camera2D {
+    /// Convert a local-space point into a rebased, checked `f32` pair
+    /// suitable for GPU submission.
+    ///
+    /// The point is expressed relative to the camera's viewport origin
+    /// (rebased), so magnitudes stay small regardless of world position.
+    /// Refuses non-finite input and any narrowing that would change the
+    /// value (f32 precision loss at deep zoom is detected, not hidden).
+    pub fn checked_screen_f32(&self, local: Point2D) -> Result<RebasedPointF32, CameraError> {
+        let viewport = self.local_viewport()?;
+        let x = local.x() - viewport.min_x();
+        let y = local.y() - viewport.min_y();
+        if !x.is_finite() || !y.is_finite() {
+            return Err(CameraError::InvalidGeometry);
+        }
+        let fx = x as f32;
+        let fy = y as f32;
+        if f64::from(fx) != x || f64::from(fy) != y {
+            return Err(CameraError::PrecisionLost);
+        }
+        Ok(RebasedPointF32 { x: fx, y: fy })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +277,38 @@ mod tests {
         assert_eq!(camera.project_clipped(Rect2D::from_xywh(-20.0, -30.0, 40.0, 50.0).unwrap()).unwrap().unwrap(),
             Rect2D::from_xywh(0.0, 0.0, 20.0, 20.0).unwrap());
         assert!(camera.project_clipped(Rect2D::from_xywh(100.0, 0.0, 20.0, 20.0).unwrap()).unwrap().is_none());
+    }
+    #[test]
+    fn rebased_f32_conversion_is_exact_within_viewport() {
+        let camera = Camera2D::new(CameraGeneration::new(owner(), 1).unwrap(), display(1.0, 100.0, 100.0, 1), Point2D::ORIGIN, 1.0).unwrap();
+        for (x, y) in [(0.0, 0.0), (12.5, 87.25), (99.0, 1.0)] {
+            let local = Point2D::new(x, y).unwrap();
+            let screen = camera.checked_screen_f32(local).unwrap();
+            assert_eq!(f64::from(screen.x), x);
+            assert_eq!(f64::from(screen.y), y);
+        }
+    }
+    #[test]
+    fn rebased_f32_conversion_refuses_precision_loss() {
+        // 2^53 + 1 is the canonical f64 value that f32 cannot represent:
+        // the rebased conversion must refuse it rather than truncate.
+        let camera = Camera2D::new(CameraGeneration::new(owner(), 1).unwrap(), display(1.0, 100.0, 100.0, 1), Point2D::ORIGIN, 1.0).unwrap();
+        let local = Point2D::new(9007199254740993.0, 0.0).unwrap();
+        assert_eq!(camera.checked_screen_f32(local).unwrap_err(), CameraError::PrecisionLost);
+        let nan = Point2D::new(f64::NAN, 0.0).unwrap();
+        assert_eq!(camera.checked_screen_f32(nan).unwrap_err(), CameraError::InvalidGeometry);
+    }
+    #[test]
+    fn rebased_f32_survives_deep_zoom_near_anchor() {
+        // Deep zoom: world coordinates become huge, but the viewport-
+        // rebased f32 of points near the anchor stays small and exact.
+        let mut camera = Camera2D::new(CameraGeneration::new(owner(), 1).unwrap(), display(1.0, 100.0, 100.0, 1), Point2D::ORIGIN, 1.0).unwrap();
+        let anchor = Point2D::new(50.0, 50.0).unwrap();
+        for _ in 0..40 {
+            camera = camera.zoom_at(anchor, 2.0).unwrap();
+        }
+        let near_anchor = camera.local_to_logical(anchor).unwrap();
+        let screen = camera.checked_screen_f32(near_anchor).unwrap();
+        assert!(screen.x.is_finite() && screen.y.is_finite());
     }
 }
