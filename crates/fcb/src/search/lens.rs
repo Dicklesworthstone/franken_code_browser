@@ -367,17 +367,32 @@ pub fn find_matching_bracket(bytes: &[u8], cursor_offset: usize) -> BracketMatch
     }
 
     // Check at cursor_offset, then cursor_offset - 1 if applicable
-    let target_offset = if cursor_offset < bytes.len()
-        && (BracketKind::from_open(bytes[cursor_offset]).is_some()
-            || BracketKind::from_close(bytes[cursor_offset]).is_some())
-    {
-        Some(cursor_offset)
-    } else if cursor_offset > 0
-        && cursor_offset - 1 < bytes.len()
-        && (BracketKind::from_open(bytes[cursor_offset - 1]).is_some()
-            || BracketKind::from_close(bytes[cursor_offset - 1]).is_some())
-    {
-        Some(cursor_offset - 1)
+    let target_offset = if let Some(&b) = bytes.get(cursor_offset) {
+        if BracketKind::from_open(b).is_some() || BracketKind::from_close(b).is_some() {
+            Some(cursor_offset)
+        } else if cursor_offset > 0 {
+            if let Some(&b_prev) = bytes.get(cursor_offset - 1) {
+                if BracketKind::from_open(b_prev).is_some() || BracketKind::from_close(b_prev).is_some() {
+                    Some(cursor_offset - 1)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else if cursor_offset > 0 {
+        if let Some(&b_prev) = bytes.get(cursor_offset - 1) {
+            if BracketKind::from_open(b_prev).is_some() || BracketKind::from_close(b_prev).is_some() {
+                Some(cursor_offset - 1)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -387,7 +402,10 @@ pub fn find_matching_bracket(bytes: &[u8], cursor_offset: usize) -> BracketMatch
         None => return BracketMatchResult::None,
     };
 
-    let byte = bytes[offset];
+    let byte = match bytes.get(offset) {
+        Some(&b) => b,
+        None => return BracketMatchResult::None,
+    };
     if let Some(open_kind) = BracketKind::from_open(byte) {
         // Forward scan for closing bracket
         let close_target = open_kind.close_char();

@@ -54,7 +54,7 @@ pub use extents::{ExtentConsistency, ExtentError, ExtentReadState, ExtentReadSta
     ObservedExtent, ExtentView, ExtentViewError, ExtentText};
 pub use extent_query::{ExtentMatch, ExtentQuery, ExtentQueryError, ExtentQueryInput,
     ExtentQueryOptions, ExtentQueryState};
-pub use reader::{ReaderError, ReaderIndexProgress, ReaderLimits, ReadingAnchor,
+pub use reader::{LineNumber, ReaderError, ReaderIndexProgress, ReaderLimits, ReadingAnchor,
     ReadingSeek, ReadingSeekState, ReadingTarget, SourceReader};
 pub use reading_window::{LineEnding, ReadingLine, ReadingSelection, ReadingWindow, ReadingWindowOptions};
 pub use lens::{

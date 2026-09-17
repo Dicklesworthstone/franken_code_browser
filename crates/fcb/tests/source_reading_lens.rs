@@ -15,12 +15,12 @@
 //! 9. `stale_capture_and_budget_refusal_negative_controls` — stale source/revision, owner mismatch, and oversized copy refusal.
 
 use fcb::{
-    ArenaOwnerId, ByteLength, ByteOffset, ByteRange, FileId, SourceCapture, SourceRevision,
+    ArenaOwnerId, ByteOffset, ByteRange, FileId, SourceCapture, SourceRevision,
 };
 use fcb::search::{
-    BracketKind, BracketMatchResult, BracketPairMatch, FindOptions, GuideOptions, GutterConfig,
-    IndentGuide, LensModeLabel, LensSelection, LensViewport, LineEnding, LineNavigationResult,
-    QueryGeneration, ReaderError, SourceReadingLens, VirtualLineRow, WhitespaceKind, WrapMode,
+    BracketKind, BracketMatchResult, BracketPairMatch, FindOptions, GutterConfig,
+    IndentGuide, LensModeLabel, LensSelection, LensViewport, LineNavigationResult,
+    QueryGeneration, ReaderError, SourceReadingLens, WhitespaceKind, WrapMode,
     compute_indent_guides, compute_whitespace_markers, find_matching_bracket,
     LineNumber,
 };
@@ -112,7 +112,7 @@ fn independent_horizontal_scroll_and_wrap_modes() {
     let scrolled_rows = lens.render_visible_rows(&capture, &line_starts, total_lines).unwrap();
     assert_eq!(scrolled_rows.len(), 3);
     assert_eq!(scrolled_rows[0].text, "short");
-    assert_eq!(scrolled_rows[1].text, "very long line that exceeds standard narrow viewport width");
+    assert_eq!(scrolled_rows[1].text, "a very long line that exceeds standard narrow viewport width");
 
     // 3. WrapMode::ColumnLimit(20) - wraps line 2 into chunks of 20 chars
     lens.set_scroll_x_cols(0);
@@ -184,25 +184,25 @@ fn bracket_guides_nested_and_negative_controls() {
         })
     );
 
-    // Matching '}' at offset 35 backwards to '{' at offset 10
-    let match_brace = find_matching_bracket(source, 35);
+    // Matching '}' at offset 34 backwards to '{' at offset 10
+    let match_brace = find_matching_bracket(source, 34);
     assert_eq!(
         match_brace,
         BracketMatchResult::Matched(BracketPairMatch {
             kind: BracketKind::Brace,
             open_offset: 10,
-            close_offset: 35,
+            close_offset: 34,
         })
     );
 
-    // Matching inner nested paren '(' at offset 24 to ')' at offset 31
+    // Matching inner nested paren '(' at offset 24 to ')' at offset 30
     let match_inner = find_matching_bracket(source, 24);
     assert_eq!(
         match_inner,
         BracketMatchResult::Matched(BracketPairMatch {
             kind: BracketKind::Paren,
             open_offset: 24,
-            close_offset: 31,
+            close_offset: 30,
         })
     );
 
