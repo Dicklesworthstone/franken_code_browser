@@ -168,6 +168,7 @@ pub enum ReconciliationIncompleteReason {
     BudgetExhausted,
     PermissionDenied,
     RootUnavailable,
+    RulePolicyUnavailable,
 }
 
 impl From<IncompleteReason> for ReconciliationIncompleteReason {
@@ -177,6 +178,7 @@ impl From<IncompleteReason> for ReconciliationIncompleteReason {
             IncompleteReason::GrantRevoked => Self::GrantRevoked,
             IncompleteReason::QueueSaturated => Self::QueueSaturated,
             IncompleteReason::RootUnavailable => Self::RootUnavailable,
+            IncompleteReason::RulePolicyUnavailable => Self::RulePolicyUnavailable,
         }
     }
 }

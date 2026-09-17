@@ -1,0 +1,17 @@
+[package]
+name = "fcb-bridge"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# C ABI bridge for host application shells (SwiftUI) over the real fcb
+# engine. Thin marshaling only: search/read go through fcb-app's own
+# command routing, so the shell and the CLI share one implementation.
+
+[lib]
+name = "fcb_bridge"
+crate-type = ["staticlib"]
+
+[dependencies]
+fcb-app = { path = "../fcb-app" }
