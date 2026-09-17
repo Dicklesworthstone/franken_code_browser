@@ -1,0 +1,108 @@
+#!/bin/bash
+# FCB-035.V production verification scenario:
+# FrankenMarkdown asset semantics, capability I/O confinement,
+# decompression bomb defense, corrupt payload fallback, display downsampling,
+# transclusion cycle/depth defense, private cache isolation, and upstream API closure.
+#
+# Supported routes:
+#   scripts/e2e/fcb_035.sh [cargo-test-args...]
+#   scripts/e2e/fcb_035.sh --lane decoders
+#   scripts/e2e/fcb_035.sh --lane inert
+#   scripts/e2e/fcb_035.sh --lane integration
+#   scripts/e2e/fcb_035.sh --lane production
+#   scripts/e2e/fcb_035.sh --lane all
+#
+# Environment:
+#   FCB_035_RUN_ID  run identifier for receipt retention (default: UTC ts)
+#
+# Evidence: bounded redacted ScenarioReceipts retained under
+#   ${TMPDIR:-/tmp}/fcb-035-receipts-<run_id>/ and archived after the run
+#   under scripts/e2e/artifacts/fcb-035/<run_id>/receipts/.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_ROOT"
+
+RUN_ID="${FCB_035_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+export FCB_035_RUN_ID="$RUN_ID"
+
+ARTIFACT_DIR="scripts/e2e/artifacts/fcb-035/$RUN_ID"
+mkdir -p "$ARTIFACT_DIR"
+
+RECEIPTS_DIR="${TMPDIR:-/tmp}/fcb-035-receipts-$RUN_ID"
+mkdir -p "$RECEIPTS_DIR"
+export FCB_RECEIPTS_DIR="$RECEIPTS_DIR"
+
+LANE="all"
+EXTRA_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --lane)
+            LANE="$2"
+            shift 2
+            ;;
+        *)
+            EXTRA_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+echo "[fcb-035] route: headless cargo test (fcb_035_production, image_decoders, inert_assets, asset_integration)"
+echo "[fcb-035] lane: $LANE"
+echo "[fcb-035] run id: $RUN_ID"
+
+case "$LANE" in
+    decoders)
+        echo "[fcb-035] running first_party_image_decoders tests..."
+        cargo test --manifest-path crates/fcb-document/Cargo.toml \
+            --test first_party_image_decoders "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        ;;
+    inert)
+        echo "[fcb-035] running inert_asset_semantics tests..."
+        cargo test --manifest-path crates/fcb-document/Cargo.toml \
+            --test inert_asset_semantics "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        ;;
+    integration)
+        echo "[fcb-035] running asset_and_publication_integration tests..."
+        cargo test --manifest-path crates/fcb-document/Cargo.toml \
+            --test asset_and_publication_integration "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        ;;
+    production)
+        echo "[fcb-035] running fcb_035_production tests..."
+        cargo test --manifest-path crates/fcb-document/Cargo.toml \
+            --test fcb_035_production "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        ;;
+    all)
+        echo "[fcb-035] running all FCB-035 test suites..."
+        cargo test --manifest-path crates/fcb-document/Cargo.toml \
+            --test first_party_image_decoders "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        cargo test --manifest-path crates/fcb-document/Cargo.toml \
+            --test inert_asset_semantics "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        cargo test --manifest-path crates/fcb-document/Cargo.toml \
+            --test asset_and_publication_integration "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        cargo test --manifest-path crates/fcb-document/Cargo.toml \
+            --test fcb_035_production "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        ;;
+    *)
+        echo "[fcb-035] unknown lane: $LANE" >&2
+        exit 1
+        ;;
+esac
+
+# Retain the bounded redacted receipts produced by this run.
+if [ -d "$RECEIPTS_DIR" ]; then
+    mkdir -p "$ARTIFACT_DIR/receipts"
+    cp -R "$RECEIPTS_DIR/." "$ARTIFACT_DIR/receipts/"
+    RECEIPT_COUNT=$(find "$ARTIFACT_DIR/receipts" -name "*.receipt" | wc -l | tr -d ' ')
+    echo "[fcb-035] receipts archived ($RECEIPT_COUNT receipts): $ARTIFACT_DIR/receipts"
+    if [ "$LANE" = "production" ] || [ "$LANE" = "all" ]; then
+        if [ "$RECEIPT_COUNT" -lt 10 ]; then
+            echo "[fcb-035] ERROR: expected at least 10 receipts, got $RECEIPT_COUNT" >&2
+            exit 1
+        fi
+    fi
+fi
+
+echo "[fcb-035] PASS (all required routes executed)"
