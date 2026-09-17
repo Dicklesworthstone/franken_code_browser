@@ -18,6 +18,7 @@ pub mod dialect;
 pub mod display_adapter;
 pub mod error;
 pub mod lens;
+pub mod selection_copy;
 pub mod split_navigation;
 pub mod provenance;
 pub mod publication;
@@ -40,10 +41,17 @@ pub use provenance::{
     resolve_reading_selection, verify_provenance_truthfulness, SelectionResolution,
 };
 pub use publication::{DocumentPublication, RetainedLayoutMetrics};
+pub use selection_copy::{
+    DocumentClipboardFlavor, DocumentClipboardLimits, DocumentCopyAction, DocumentCopyError,
+    DocumentNativeClipboard, DocumentSyncPoint, MarkdownSourceCopy, RenderedSelectionKind,
+    RenderedSelectionProvenance, StagedDocumentClipboard, StreamedDocumentExport,
+    TruthfulSelectionResolver,
+};
 pub use session::{
     DocumentBudgets, DocumentFlowLine, DocumentSession, DocumentViewConstraints,
     HeadlessDocumentOutput, ResumableDocumentLayout,
 };
+pub use split_navigation::{discover_readme, SharedAnchor, SplitPaneNavigator};
 
 // Curated re-exports from upstream FrankenMarkdown for downstream consumers
 pub use franken_markdown::{
