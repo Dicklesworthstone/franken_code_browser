@@ -32,13 +32,17 @@ pub mod paged_snapshot;
 /// Saved-scope comparison and bounded exact old/new source correspondence.
 #[cfg(feature = "snapshot")]
 pub mod snapshot_comparison;
+/// Ordered, user-owned exact selections with rationale and offline reopening.
+#[cfg(feature = "snapshot")]
+pub mod trail;
 pub use streaming::{ReaderSearch, StreamReadError, StreamReadOptions, StreamReadReport,
     StreamReadState, StreamReadStats, StreamReadStep, StreamingHit, StreamingMode, StreamingNeedle};
 pub use file_search::{FileSearch, FileSearchError, FileSearchReport};
 pub use extent_navigation::ExtentActivationError;
 pub use extents::{ExtentConsistency, ExtentError, ExtentReadState, ExtentReadStats,
     ExtentStepBudget, ExtentWindowRequest, FileExtentRead, FileRangeReader,
-    ObservedExtent, ExtentView, ExtentViewError, ExtentText};
+    ObservedExtent, ExtentView, ExtentViewError, ExtentViewError as _ExtentViewErrorCompatibility,
+    ExtentText};
 pub use extent_query::{ExtentMatch, ExtentQuery, ExtentQueryError, ExtentQueryInput,
     ExtentQueryOptions, ExtentQueryState};
 pub use reader::{ReaderError, ReaderIndexProgress, ReaderLimits, ReadingAnchor,
