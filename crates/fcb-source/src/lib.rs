@@ -63,6 +63,10 @@ pub use restoration::{
     SandboxModel, SecurityScopedBookmark, StaleReason, UnavailableReason,
 };
 pub use root::{ExportPublicationGate, GrantRevocationToken, RootGrant};
+pub use old_anchor::{
+    AnchorResolutionResult, CaptureBacking, LineContextProperties, OldAnchor,
+    OldAnchorResolution, OpenCurrentAction, VisualContextReadiness, fnv1a, resolve_old_anchor,
+};
 pub use snapshot::{
     AnchorResolution, AnchorResolver, BoundedRetryReader, FileObservationMetadata,
     ObservedSnapshot, ObservedSnapshotConsistency, PinnedSnapshotStore, RetryPolicy,
