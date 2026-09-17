@@ -82,7 +82,7 @@ fn bracket_matching_finds_pairs_and_skips_strings() {
     assert_eq!(close_paren, Some(12), "matching ) for ( at pos 3");
     // Match the '{' at position 13.
     let close_brace = find_matching_bracket(source, 13);
-    assert_eq!(close_brace, Some(27), "matching } for { at pos 13");
+    assert_eq!(close_brace, Some(27), "matching close brace at pos 13");
     // Match the '[' at position 22.
     let close_bracket = find_matching_bracket(source, 22);
     assert_eq!(close_bracket, Some(26), "matching ] for [ at pos 22");
