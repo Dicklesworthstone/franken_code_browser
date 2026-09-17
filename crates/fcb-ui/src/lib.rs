@@ -19,7 +19,9 @@ pub mod clipboard;
 pub mod commands;
 pub mod composition;
 pub mod editor_link;
+pub mod focus_responder;
 pub mod open_drop;
+pub mod scope_disclosure;
 
 pub use clipboard::{
     ClipboardError, ClipboardFlavor, ClipboardPayload, NativePasteboard,
@@ -29,5 +31,12 @@ pub use composition::{CompositionError, CompositionState, MarkedRegion};
 pub use editor_link::{
     ActionRefusalReason, StructuredOsCommand, validate_editor_handoff, validate_web_link_handoff,
 };
+pub use focus_responder::{
+    dispatch_key_input, FocusNode, FocusReturnTracker, InputDispatchResult, KeyAction, KeyModifiers,
+};
 pub use open_drop::{OpenDecision, OpenRequest, RefusalReason, canceled_dialog, validate_open_request};
+pub use scope_disclosure::{
+    evaluate_open_file, normalize_lexical_path, validate_symlink_confinement, GrantedRoot,
+    ScopeDisclosure, ScopeEvaluation, ScopeRefusal,
+};
 

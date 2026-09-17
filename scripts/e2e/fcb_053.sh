@@ -63,11 +63,14 @@ case "$LANE" in
     production)
         echo "[fcb-053] running native_commands_composition tests..."
         cargo test -p fcb-ui --test native_commands_composition "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        echo "[fcb-053] running fcb_053_b_native_actions_scope_disclosure tests..."
+        cargo test -p fcb-ui --test fcb_053_b_native_actions_scope_disclosure "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
         ;;
     all)
         echo "[fcb-053] running all FCB-053 test suites..."
         cargo test -p fcb-ui --lib "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
         cargo test -p fcb-ui --test native_commands_composition "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        cargo test -p fcb-ui --test fcb_053_b_native_actions_scope_disclosure "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
         ;;
     *)
         echo "[fcb-053] unknown lane: $LANE" >&2
@@ -82,8 +85,8 @@ if [ -d "$RECEIPTS_DIR" ]; then
     RECEIPT_COUNT=$(find "$ARTIFACT_DIR/receipts" -name "*.receipt" | wc -l | tr -d ' ')
     echo "[fcb-053] receipts archived ($RECEIPT_COUNT receipts): $ARTIFACT_DIR/receipts"
     if [ "$LANE" = "production" ] || [ "$LANE" = "all" ]; then
-        if [ "$RECEIPT_COUNT" -lt 8 ]; then
-            echo "[fcb-053] ERROR: expected at least 8 receipts, got $RECEIPT_COUNT" >&2
+        if [ "$RECEIPT_COUNT" -lt 14 ]; then
+            echo "[fcb-053] ERROR: expected at least 14 receipts, got $RECEIPT_COUNT" >&2
             exit 1
         fi
     fi

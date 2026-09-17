@@ -61,6 +61,10 @@ fn contains_newlines(s: &str) -> bool {
     s.contains('\n') || s.contains('\r')
 }
 
+fn contains_shell_metachars(s: &str) -> bool {
+    s.chars().any(|c| matches!(c, ';' | '&' | '|' | '`' | '$' | '<' | '>' | '(' | ')' | '!' | '\\'))
+}
+
 /// Validate and build a structured command for opening an external editor.
 pub fn validate_editor_handoff(
     configured_editor: &str,
@@ -74,6 +78,9 @@ pub fn validate_editor_handoff(
     }
     if contains_newlines(configured_editor) || contains_newlines(file_path) {
         return Err(ActionRefusalReason::NewlineInjection);
+    }
+    if contains_shell_metachars(configured_editor) {
+        return Err(ActionRefusalReason::UntrustedEditor(configured_editor.to_string()));
     }
     if contains_bidi_controls(configured_editor) || contains_bidi_controls(file_path) {
         return Err(ActionRefusalReason::BidiSpoofing);
@@ -131,18 +138,22 @@ pub fn validate_web_link_handoff(
     let Some(scheme_end) = url.find("://") else {
         return Err(ActionRefusalReason::DisallowedScheme(url.to_string()));
     };
-    let scheme = &url[..scheme_end];
+    let scheme = url
+        .get(..scheme_end)
+        .ok_or_else(|| ActionRefusalReason::DisallowedScheme(url.to_string()))?;
     if !allowed_schemes.iter().any(|&s| s.eq_ignore_ascii_case(scheme)) {
         return Err(ActionRefusalReason::DisallowedScheme(scheme.to_string()));
     }
 
     // If file scheme, reject nonlocal authority.
     if scheme.eq_ignore_ascii_case("file") {
-        let remainder = &url[scheme_end + 3..];
-        if let Some(slash_idx) = remainder.find('/') {
-            let authority = &remainder[..slash_idx];
-            if !authority.is_empty() && authority != "localhost" {
-                return Err(ActionRefusalReason::NonlocalAuthority(authority.to_string()));
+        if let Some(remainder) = url.get(scheme_end + 3..) {
+            if let Some(slash_idx) = remainder.find('/') {
+                if let Some(authority) = remainder.get(..slash_idx) {
+                    if !authority.is_empty() && authority != "localhost" {
+                        return Err(ActionRefusalReason::NonlocalAuthority(authority.to_string()));
+                    }
+                }
             }
         }
     }
