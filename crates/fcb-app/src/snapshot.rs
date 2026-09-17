@@ -8,6 +8,7 @@
 //! publication or a qualified power-loss-durability claim.
 
 mod paged;
+mod index;
 
 use std::{ffi::OsString, fs::{self, File, OpenOptions}, io::{self, Write}, path::{Path, PathBuf}, sync::Arc};
 use fcb::{ByteLength, ByteOffset, ByteRange};
@@ -28,6 +29,7 @@ const HELP: &str = "fcb snapshot save ROOT --output NEW_FILE [--json] [--include
 fcb snapshot inspect FILE [--json] [--limit N]\n\
 fcb snapshot search FILE (--text LITERAL | --raw-hex HEX) [--json] [--limit N]\n\
 fcb snapshot read FILE (--member NAME | --member-hex HEX) [--json]\n\
+fcb snapshot index help  # Build/reopen pinned substring indexes\n\
 Read options: --line N OR --offset N; --bytes N --lines N; --raw for original bytes\n\
 Save options: --max-files N --max-file-bytes N --max-total-bytes N\n\
 Explicit plaintext source export; no overwrite, no extraction, no restored root grants.\n\
@@ -183,6 +185,9 @@ fn hex(text: &str, maximum: usize) -> Result<Vec<u8>, Failure> {
 /// the effect state; a broken stdout leaves a redacted effect marker on stderr.
 pub(crate) fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write,
     mut canceled: impl FnMut() -> bool) -> u8 {
+    if args.first().is_some_and(|arg| arg == "index") {
+        return index::run(&args[1..], stdout, stderr, canceled);
+    }
     let json = wants_json(args);
     let budget = match ResourceBudget::new(owner(), ByteLength::new(MANAGED_BYTES)) {
         Ok(budget) => budget, Err(_) => { let _ = stderr.write(b"SNAPSHOT_RESOURCE_DENIED\n"); return EXIT_ERROR; }
