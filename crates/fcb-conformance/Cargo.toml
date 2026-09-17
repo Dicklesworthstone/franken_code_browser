@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 fcb-core = { path = "../fcb-core" }
+fcb-document = { path = "../fcb-document" }
 fcb-source = { path = "../fcb-source" }
 franken_markdown = { path = "../../../franken_markdown", default-features = false }
 

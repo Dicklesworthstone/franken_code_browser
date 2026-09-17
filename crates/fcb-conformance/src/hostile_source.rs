@@ -188,13 +188,7 @@ impl SourceHostileCaseRegistry {
     }
 }
 
-/// A single bounded event log entry recorded during hostile execution.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HostileLogEvent {
-    pub step: usize,
-    pub phase: &'static str,
-    pub detail: String,
-}
+pub use crate::HostileLogEvent;
 
 /// Structured outcome of running one hostile regression case.
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -332,5 +332,14 @@ impl AttemptCounter {
     }
 }
 
+/// A single bounded event log entry recorded during hostile execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostileLogEvent {
+    pub step: usize,
+    pub phase: &'static str,
+    pub detail: String,
+}
+
+pub mod hostile_document;
 pub mod hostile_source;
 
