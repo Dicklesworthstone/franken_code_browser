@@ -1,0 +1,22 @@
+test_commit_absent_from_owner_repo_is_incomplete (tests.test_extension_ledger.ExtensionLedgerTests.test_commit_absent_from_owner_repo_is_incomplete) ... ok
+test_commit_without_owner_repo_is_incomplete (tests.test_extension_ledger.ExtensionLedgerTests.test_commit_without_owner_repo_is_incomplete) ... ok
+test_empty_ledger_gates_nothing_and_is_incomplete (tests.test_extension_ledger.ExtensionLedgerTests.test_empty_ledger_gates_nothing_and_is_incomplete) ... ok
+test_missing_evidence_rows_are_rejected (tests.test_extension_ledger.ExtensionLedgerTests.test_missing_evidence_rows_are_rejected) ... ok
+test_moving_branch_pin_is_rejected (tests.test_extension_ledger.ExtensionLedgerTests.test_moving_branch_pin_is_rejected) ... ok
+test_omitted_consumer_route_is_rejected (tests.test_extension_ledger.ExtensionLedgerTests.test_omitted_consumer_route_is_rejected) ... ok
+test_owner_origin_mismatch_is_rejected (tests.test_extension_ledger.ExtensionLedgerTests.test_owner_origin_mismatch_is_rejected) ... ok
+test_path_patch_receipt_is_rejected (tests.test_extension_ledger.ExtensionLedgerTests.test_path_patch_receipt_is_rejected) ... ok
+test_probe_downgrades_on_incomplete_ledger (tests.test_extension_ledger.ExtensionLedgerTests.test_probe_downgrades_on_incomplete_ledger) ... ok
+test_probe_downgrades_on_rejected_ledger (tests.test_extension_ledger.ExtensionLedgerTests.test_probe_downgrades_on_rejected_ledger) ... ok
+test_probe_stays_qualified_with_accepted_ledger (tests.test_extension_ledger.ExtensionLedgerTests.test_probe_stays_qualified_with_accepted_ledger) ... ok
+test_probe_without_ledger_keeps_contract (tests.test_extension_ledger.ExtensionLedgerTests.test_probe_without_ledger_keeps_contract) ... ok
+test_real_committed_input_is_accepted (tests.test_extension_ledger.ExtensionLedgerTests.test_real_committed_input_is_accepted) ... ok
+test_research_blob_id_as_commit_is_rejected (tests.test_extension_ledger.ExtensionLedgerTests.test_research_blob_id_as_commit_is_rejected) ... ok
+test_unreadable_ledger_is_incomplete (tests.test_extension_ledger.ExtensionLedgerTests.test_unreadable_ledger_is_incomplete) ... ok
+test_wrong_schema_is_rejected (tests.test_extension_ledger.ExtensionLedgerTests.test_wrong_schema_is_rejected) ... ok
+test_wrong_status_is_rejected (tests.test_extension_ledger.ExtensionLedgerTests.test_wrong_status_is_rejected) ... ok
+
+----------------------------------------------------------------------
+Ran 17 tests in 1.860s
+
+OK
