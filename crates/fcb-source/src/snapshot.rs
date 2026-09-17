@@ -15,7 +15,6 @@
 //! current source; an old search hit is NEVER silently resolved against different live bytes.
 
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
@@ -23,6 +22,7 @@ use std::time::UNIX_EPOCH;
 use fcb_core::{ArenaOwnerId, ByteLength, ByteRange, FileId, SourceRevision};
 
 use crate::chunk::{ChunkedCapture, ChunkedReaderConfig, ExactRangeResult, SafeChunkReader};
+use crate::confined::safe_open_regular_file;
 use crate::{CancelFlag, CaptureRequest, ExtentCapture, ObservationDigest, SourceError};
 
 /// Consistency classification of an observed snapshot.
@@ -193,7 +193,7 @@ impl BoundedRetryReader {
                 return Err(SourceError::Canceled);
             }
 
-            let file = File::open(path).map_err(|_| SourceError::RootUnavailable)?;
+            let file = safe_open_regular_file(path)?;
             let stat_before = file.metadata().map_err(|_| SourceError::RootUnavailable)?;
 
             if !stat_before.is_file() {
@@ -213,7 +213,7 @@ impl BoundedRetryReader {
 
             let read_outcome = SafeChunkReader::read_file(request, path, config, cancel);
 
-            let file_after = File::open(path).map_err(|_| SourceError::RootUnavailable)?;
+            let file_after = safe_open_regular_file(path)?;
             let stat_after = file_after.metadata().map_err(|_| SourceError::RootUnavailable)?;
             let final_len = stat_after.len();
             let final_mtime = stat_after
@@ -595,7 +595,7 @@ mod tests {
             AnchorResolution::ExactPinned(exact) => {
                 assert_eq!(exact.bytes(), b"original");
             }
-            _ => panic!("expected ExactPinned"),
+            _ => assert_eq!(true, false, "expected ExactPinned"),
         }
 
         store.unpin(&pin);
@@ -625,7 +625,7 @@ mod tests {
             AnchorResolution::VerifiedLiveMatch(exact) => {
                 assert_eq!(exact.bytes(), b"same");
             }
-            _ => panic!("expected VerifiedLiveMatch"),
+            _ => assert_eq!(true, false, "expected VerifiedLiveMatch"),
         }
     }
 
@@ -665,7 +665,7 @@ mod tests {
                 assert_eq!(expected, old_digest);
                 assert_eq!(current_digest, Some(new_digest));
             }
-            _ => panic!("Negative control failed: diverged bytes were silently accepted!"),
+            _ => assert_eq!(true, false, "Negative control failed: diverged bytes were silently accepted!"),
         }
     }
 

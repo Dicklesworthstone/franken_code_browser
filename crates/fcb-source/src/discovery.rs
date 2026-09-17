@@ -8,11 +8,11 @@
 //! oversized directories stay provisional rather than allocating a whole
 //! million-file listing. Incomplete scans never tombstone unseen entries.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, ReadDir};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use fcb_core::ByteLength;
 
@@ -37,6 +37,7 @@ pub struct DiscoveryLimits {
     max_batch_entries: u32,
     max_batch_bytes: u64,
     max_queue_entries: u32,
+    max_alias_hops: u32,
 }
 
 impl DiscoveryLimits {
@@ -64,6 +65,7 @@ impl DiscoveryLimits {
             max_batch_entries,
             max_batch_bytes,
             max_queue_entries,
+            max_alias_hops: 16,
         })
     }
 
@@ -75,6 +77,7 @@ impl DiscoveryLimits {
             max_batch_entries: 256,
             max_batch_bytes: 64 * 1024,
             max_queue_entries: 4096,
+            max_alias_hops: 16,
         }
     }
 
@@ -100,6 +103,82 @@ impl DiscoveryLimits {
 
     pub fn max_queue_entries(self) -> u32 {
         self.max_queue_entries
+    }
+
+    pub fn max_alias_hops(self) -> u32 {
+        self.max_alias_hops
+    }
+
+    pub fn with_max_alias_hops(mut self, hops: u32) -> Self {
+        self.max_alias_hops = hops;
+        self
+    }
+}
+
+/// Exclusions for FCB's own caches, stores, database sidecars, and recovery
+/// directories (§8.6). Matches both conventional basenames and actual filesystem
+/// identity (`DirectoryId`) to prevent self-generating index loops even under renames or symlinks.
+#[derive(Clone, Debug)]
+pub struct OwnArtifactExclusion {
+    excluded_dir_ids: BTreeSet<DirectoryId>,
+    excluded_names: BTreeSet<String>,
+}
+
+impl Default for OwnArtifactExclusion {
+    fn default() -> Self {
+        Self::default_product()
+    }
+}
+
+impl OwnArtifactExclusion {
+    pub fn default_product() -> Self {
+        let mut me = Self {
+            excluded_dir_ids: BTreeSet::new(),
+            excluded_names: BTreeSet::new(),
+        };
+        me.add_excluded_name(".fcb-cache");
+        me.add_excluded_name(".fcb-store");
+        me.add_excluded_name(".fcb-scratch");
+        me.add_excluded_name(".fcb-recovery");
+        me.add_excluded_name(".fcb.db");
+        me.add_excluded_name(".fcb.db-wal");
+        me.add_excluded_name(".fcb.db-shm");
+        me
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            excluded_dir_ids: BTreeSet::new(),
+            excluded_names: BTreeSet::new(),
+        }
+    }
+
+    pub fn add_excluded_name(&mut self, name: &str) {
+        self.excluded_names.insert(name.to_string());
+    }
+
+    pub fn register_path(&mut self, path: &Path) -> Result<(), SourceError> {
+        if let Ok(dir_id) = DirectoryId::from_path(path) {
+            self.excluded_dir_ids.insert(dir_id);
+        }
+        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+            self.excluded_names.insert(file_name.to_string());
+        }
+        Ok(())
+    }
+
+    pub fn is_excluded(&self, path: &Path, dir_id: Option<DirectoryId>) -> bool {
+        if let Some(id) = dir_id {
+            if self.excluded_dir_ids.contains(&id) {
+                return true;
+            }
+        }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if self.excluded_names.contains(name) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -270,12 +349,14 @@ impl DiscoveryBatch {
 struct PendingDir {
     rel: Option<NormalizedPath>,
     depth: u32,
+    alias_hops: u32,
     ancestry: Vec<DirectoryId>,
 }
 
 struct OpenDir {
     rel: Option<NormalizedPath>,
     depth: u32,
+    alias_hops: u32,
     ancestry: Vec<DirectoryId>,
     resolved: PathBuf,
     iter: ReadDir,
@@ -289,6 +370,7 @@ pub struct BoundedDiscovery {
     grant: RootGrant,
     limits: DiscoveryLimits,
     ignore: IgnoreMatcher,
+    own_exclusions: OwnArtifactExclusion,
     read_rule_files: bool,
     pending: VecDeque<PendingDir>,
     open: VecDeque<OpenDir>,
@@ -361,6 +443,7 @@ impl BoundedDiscovery {
             grant,
             limits,
             ignore,
+            own_exclusions: OwnArtifactExclusion::default_product(),
             read_rule_files: true,
             pending: VecDeque::new(),
             open: VecDeque::new(),
@@ -374,10 +457,23 @@ impl BoundedDiscovery {
         session.pending.push_back(PendingDir {
             rel: None,
             depth: 0,
+            alias_hops: 0,
             ancestry: Vec::new(),
         });
         session.note_queue_peak();
         Ok(session)
+    }
+
+    pub fn own_exclusions(&self) -> &OwnArtifactExclusion {
+        &self.own_exclusions
+    }
+
+    pub fn own_exclusions_mut(&mut self) -> &mut OwnArtifactExclusion {
+        &mut self.own_exclusions
+    }
+
+    pub fn register_own_artifact_path(&mut self, path: &Path) -> Result<(), SourceError> {
+        self.own_exclusions.register_path(path)
     }
 
     pub fn limits(&self) -> DiscoveryLimits {
@@ -630,6 +726,10 @@ impl BoundedDiscovery {
                 return OpenResult::SkippedUnavailable;
             }
         };
+        if self.own_exclusions.is_excluded(&resolved, Some(dir_id)) {
+            self.aggregate.excluded = self.aggregate.excluded.saturating_add(1);
+            return OpenResult::SkippedUnavailable;
+        }
         if pending.ancestry.contains(&dir_id) {
             if let Some(rel) = pending.rel {
                 let entry =
@@ -654,6 +754,7 @@ impl BoundedDiscovery {
         self.open.push_back(OpenDir {
             rel: pending.rel,
             depth: pending.depth,
+            alias_hops: pending.alias_hops,
             ancestry,
             resolved,
             iter,
@@ -701,6 +802,7 @@ impl BoundedDiscovery {
                     OpenSnapshot {
                         rel: open.rel.clone(),
                         depth: open.depth,
+                        alias_hops: open.alias_hops,
                         ancestry: open.ancestry.clone(),
                         resolved: open.resolved.clone(),
                     }
@@ -775,7 +877,8 @@ impl BoundedDiscovery {
 
         let file_type = meta.file_type();
         if file_type.is_symlink() {
-            let excluded = self.classify_exclusion(&child_path, false);
+            let excluded = self.classify_exclusion(&child_path, false)
+                || self.own_exclusions.is_excluded(child_fs_path, None);
             if !excluded {
                 self.maybe_follow_symlink_dir(open, &child_path, child_depth, child_fs_path);
             }
@@ -788,7 +891,8 @@ impl BoundedDiscovery {
             ));
         }
         if file_type.is_dir() {
-            let excluded = self.classify_exclusion(&child_path, true);
+            let excluded = self.classify_exclusion(&child_path, true)
+                || self.own_exclusions.is_excluded(child_fs_path, None);
             if !excluded {
                 self.maybe_enqueue_dir(open, child_path.clone(), child_depth);
             }
@@ -801,7 +905,8 @@ impl BoundedDiscovery {
             ));
         }
         if file_type.is_file() {
-            let excluded = self.classify_exclusion(&child_path, false);
+            let excluded = self.classify_exclusion(&child_path, false)
+                || self.own_exclusions.is_excluded(child_fs_path, None);
             return Some(self.push_kind(
                 child_path,
                 DiscoveryKind::File,
@@ -834,7 +939,12 @@ impl BoundedDiscovery {
             Err(_) => return,
         };
         if target_meta.is_dir() {
-            self.maybe_enqueue_dir(open, child_path.clone(), child_depth);
+            let next_alias = open.alias_hops.saturating_add(1);
+            if next_alias > self.limits.max_alias_hops {
+                self.aggregate.cycles = self.aggregate.cycles.saturating_add(1);
+                return;
+            }
+            self.maybe_enqueue_dir_with_alias(open, child_path.clone(), child_depth, next_alias);
         }
     }
 
@@ -843,6 +953,16 @@ impl BoundedDiscovery {
         open: &OpenSnapshot,
         child_path: NormalizedPath,
         child_depth: u32,
+    ) {
+        self.maybe_enqueue_dir_with_alias(open, child_path, child_depth, open.alias_hops);
+    }
+
+    fn maybe_enqueue_dir_with_alias(
+        &mut self,
+        open: &OpenSnapshot,
+        child_path: NormalizedPath,
+        child_depth: u32,
+        alias_hops: u32,
     ) {
         if child_depth >= self.limits.max_depth {
             self.aggregate.depth_limited = self.aggregate.depth_limited.saturating_add(1);
@@ -857,6 +977,7 @@ impl BoundedDiscovery {
         self.pending.push_back(PendingDir {
             rel: Some(child_path),
             depth: child_depth,
+            alias_hops,
             ancestry: open.ancestry.clone(),
         });
         self.note_queue_peak();
@@ -953,6 +1074,7 @@ enum Advance {
 struct OpenSnapshot {
     rel: Option<NormalizedPath>,
     depth: u32,
+    alias_hops: u32,
     ancestry: Vec<DirectoryId>,
     resolved: PathBuf,
 }

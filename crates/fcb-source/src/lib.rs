@@ -45,11 +45,11 @@ pub use encoding::{
     detect_encoding, CaptureEncodingMap, DetectedEncoding, MappingSpan, SpanKind,
     StatefulChunkDecoder,
 };
-pub use confined::{ConfinedSourceReader, SymlinkPolicy};
+pub use confined::{ConfinedSourceReader, DirectoryId, SymlinkPolicy, safe_open_regular_file};
 pub use discovery::{
     BoundedDiscovery, ChildOrderGeneration, DiscoveryAggregate, DiscoveryBatch, DiscoveryEntry,
-    DiscoveryKind, DiscoveryLimits, DiscoveryPeaks, IncompleteReason, PublicationState, ScanEpoch,
-    ScanStatus,
+    DiscoveryKind, DiscoveryLimits, DiscoveryPeaks, IncompleteReason, OwnArtifactExclusion,
+    PublicationState, ScanEpoch, ScanStatus,
 };
 pub use ignore::{
     ExclusionCause, IgnoreDecision, IgnoreLayerKind, IgnoreMatcher, UnsupportedPattern,

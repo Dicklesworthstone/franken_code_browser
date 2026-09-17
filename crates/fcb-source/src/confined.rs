@@ -78,11 +78,8 @@ impl ConfinedSourceReader {
         if !meta.is_file() { return Err(SourceError::SpecialObject); }
         let file_len = meta.len();
         if file_len > self.max_payload.get() { return Err(SourceError::PayloadTooLarge); }
-        let mut file = File::open(&resolved_path).map_err(map_io_error)?;
-        // Revalidate the actual opened object, not only an earlier path lookup.
-        // This detects some races; it does not make path-based opening atomic.
+        let mut file = safe_open_regular_file(&resolved_path)?;
         let opened = file.metadata().map_err(map_io_error)?;
-        if !opened.is_file() { return Err(SourceError::SpecialObject); }
         if opened.len() != file_len { return Err(SourceError::MetadataMismatch); }
         let buf = read_bounded(&mut file, file_len, self.max_payload, cancel,
             || self.grant.validate_active())?;
@@ -180,8 +177,8 @@ fn read_bounded(reader: &mut impl Read, length: u64, max_payload: ByteLength,
 }
 
 /// Identifies a directory by filesystem device and inode on Unix for cycle detection.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct DirectoryId {
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DirectoryId {
     #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
@@ -189,8 +186,9 @@ pub(crate) struct DirectoryId {
     #[cfg(not(unix))]
     hash: u64,
 }
+
 impl DirectoryId {
-    pub(crate) fn from_path(path: &Path) -> Result<Self, SourceError> {
+    pub fn from_path(path: &Path) -> Result<Self, SourceError> {
         let meta = fs::metadata(path).map_err(map_io_error)?;
         #[cfg(unix)]
         {
@@ -206,6 +204,45 @@ impl DirectoryId {
             Ok(Self { hash: hasher.finish() })
         }
     }
+}
+
+/// Safely open a regular source file without blocking on FIFOs or following forbidden objects.
+///
+/// On Unix, opens with non-blocking mode to ensure opening a malicious FIFO never indefinitely
+/// blocks worker threads (§8.6). After opening, validates the opened file descriptor's
+/// metadata: if it is not a regular file (e.g. FIFO, socket, device), the handle is
+/// immediately closed and `Err(SourceError::SpecialObject)` is returned.
+pub fn safe_open_regular_file(path: &Path) -> Result<File, SourceError> {
+    let sym_meta = fs::symlink_metadata(path).map_err(map_io_error)?;
+    validate_not_special(&sym_meta)?;
+
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(target_os = "linux")]
+        const O_NONBLOCK: i32 = 0o4000;
+        #[cfg(target_os = "macos")]
+        const O_NONBLOCK: i32 = 0x0004;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        const O_NONBLOCK: i32 = 0;
+
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK)
+            .open(path)
+            .map_err(map_io_error)?
+    };
+
+    #[cfg(not(unix))]
+    let file = fs::File::open(path).map_err(map_io_error)?;
+
+    let opened_meta = file.metadata().map_err(map_io_error)?;
+    validate_not_special(&opened_meta)?;
+    if !opened_meta.is_file() {
+        return Err(SourceError::SpecialObject);
+    }
+
+    Ok(file)
 }
 
 /// Validates an observed filesystem object is not a FIFO, socket, or device.
