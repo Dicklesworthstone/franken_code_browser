@@ -80,7 +80,7 @@ impl SplitPaneNavigator {
         heading_id: &str,
         source_map: &DocumentSourceMap,
         preview_total_height: u32,
-        line_height: u32,
+        _line_height: u32,
     ) -> Option<SharedAnchor> {
         let anchor = self.source_lens.find_heading_anchor(heading_id, source_map)?;
         let heading_byte = anchor.source_span.start as u64;

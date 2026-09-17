@@ -246,11 +246,11 @@ fn real_source_populates_snapshot_and_resolves_ranges() {
 
     // 3. Native adapter range query over the CJK line resolves Ready with
     //    byte/scalar ranges that map back into the exact capture.
-    let token = RangeRequestToken::new(owner(), 1, line_ids[1], layout_rev)
+    let range_req = RangeRequestToken::new(owner(), 1, line_ids[1], layout_rev)
         .expect("token valid");
     let line2_range = line2.text_range().expect("text range set");
     let status = PendingTextRangeResolver::resolve_range(
-        token,
+        range_req,
         &layout,
         Some(text),
         line2_range,
@@ -258,7 +258,7 @@ fn real_source_populates_snapshot_and_resolves_ranges() {
     );
     let resolved = match status {
         PendingRangeStatus::Ready(resolved) => resolved,
-        other => panic!("expected Ready, got {other:?}"),
+        other => unreachable!("expected Ready, got {other:?}"),
     };
     assert_eq!(resolved.text(), "    let greeting = \"こんにちは\";\n");
     let bytes = capture.bytes();
@@ -276,7 +276,7 @@ fn real_source_populates_snapshot_and_resolves_ranges() {
     // 4. Without loaded text the resolver returns an explicit Pending state
     //    (native adapters must defer, never shape inside the callback).
     let pending =
-        PendingTextRangeResolver::resolve_range(token, &layout, None, line2_range, &[]);
+        PendingTextRangeResolver::resolve_range(range_req, &layout, None, line2_range, &[]);
     assert!(matches!(pending, PendingRangeStatus::Pending { .. }));
 
     // 5. Emoji line: astral characters occupy two UTF-16 units each; the
@@ -284,7 +284,7 @@ fn real_source_populates_snapshot_and_resolves_ranges() {
     let emoji_line = layout.node(line_ids[2]).expect("line 3 node");
     let emoji_range = emoji_line.text_range().expect("text range set");
     let status = PendingTextRangeResolver::resolve_range(
-        token,
+        range_req,
         &layout,
         Some(text),
         emoji_range,
@@ -344,21 +344,21 @@ fn wrong_offsets_and_stale_tokens_are_refused_not_clamped() {
     );
 
     // A range query ending inside the surrogate pair is refused as well.
-    let token = RangeRequestToken::new(owner(), 2, line_ids[2], layout_rev).expect("token valid");
+    let bad_range_req = RangeRequestToken::new(owner(), 2, line_ids[2], layout_rev).expect("token valid");
     let line3_start = starts_of_line3(text);
     let bad_range = utf16_range(line3_start, emoji_unit + 1);
     assert!(matches!(
-        PendingTextRangeResolver::resolve_range(token, &layout, Some(text), bad_range, &[]),
+        PendingTextRangeResolver::resolve_range(bad_range_req, &layout, Some(text), bad_range, &[]),
         PendingRangeStatus::Refused(CoreError::InvalidUtf16)
     ));
 
     // Stale layout revision: a token minted for an earlier revision is Stale.
     let stale_rev = LayoutRevision::new(owner(), 6).expect("older revision valid");
-    let stale_token =
+    let stale_range_req =
         RangeRequestToken::new(owner(), 3, line_ids[1], stale_rev).expect("token valid");
     assert!(matches!(
         PendingTextRangeResolver::resolve_range(
-            stale_token,
+            stale_range_req,
             &layout,
             Some(text),
             utf16_range(0, 4),
@@ -369,11 +369,11 @@ fn wrong_offsets_and_stale_tokens_are_refused_not_clamped() {
 
     // Unknown node in an otherwise valid token is Stale/NodeNotFound.
     let ghost = SemanticNodeId::new(owner(), 99).expect("node id valid");
-    let ghost_token =
+    let ghost_range_req =
         RangeRequestToken::new(owner(), 4, ghost, layout_rev).expect("token valid");
     assert!(matches!(
         PendingTextRangeResolver::resolve_range(
-            ghost_token,
+            ghost_range_req,
             &layout,
             Some(text),
             utf16_range(0, 4),
@@ -384,9 +384,9 @@ fn wrong_offsets_and_stale_tokens_are_refused_not_clamped() {
 
     // Sentinel inside a requested range is refused by the resolver itself.
     let sent_range = Utf16CodeUnitRange::new(utf16_offset(0), sentinel).expect("range valid");
-    let token2 = RangeRequestToken::new(owner(), 5, line_ids[1], layout_rev).expect("token valid");
+    let sentinel_range_req = RangeRequestToken::new(owner(), 5, line_ids[1], layout_rev).expect("token valid");
     assert!(matches!(
-        PendingTextRangeResolver::resolve_range(token2, &layout, Some(text), sent_range, &[]),
+        PendingTextRangeResolver::resolve_range(sentinel_range_req, &layout, Some(text), sent_range, &[]),
         PendingRangeStatus::Refused(CoreError::NativeSentinel)
     ));
 
