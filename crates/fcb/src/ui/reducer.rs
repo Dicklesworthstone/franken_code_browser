@@ -15,6 +15,11 @@ use fcb_core::{ArenaOwnerId, FileId, QueryGeneration};
 use super::{
     breadcrumbs::ScopeBreadcrumbs,
     focus::{FocusDirection, FocusManager, FocusTarget},
+    gesture::{
+        GestureArbitrator, GestureKind, HitRegion, ModifierKeys, PointerButton, ScrollRouting,
+    },
+    motion_mailbox::{DiscreteInputEvent, MotionMailbox},
+    reading_panes::ReadingPaneManager,
     sidebar::{HistoryItem, SearchResultEntry, SidebarPanel, SidebarState},
     tree::{TreeNodeId, TreeProjection},
 };
@@ -96,6 +101,57 @@ pub enum UiAction {
     /// Fit camera to entire project atlas.
     FitProject,
 
+    /// Pointer pressed down at specified hit region.
+    PointerDown {
+        region: HitRegion,
+        pos: (f32, f32),
+        button: PointerButton,
+        modifiers: ModifierKeys,
+    },
+    /// Pointer moved to new position during potential gesture.
+    PointerMove { pos: (f32, f32) },
+    /// Pointer released.
+    PointerUp {
+        pos: (f32, f32),
+        button: PointerButton,
+    },
+    /// Scroll or wheel event on a specific hit region.
+    ScrollEvent {
+        region: HitRegion,
+        delta: (f32, f32),
+        modifiers: ModifierKeys,
+    },
+    /// Pinch magnification gesture on a hit region.
+    PinchEvent {
+        region: HitRegion,
+        centroid: (f32, f32),
+        magnification: f32,
+    },
+    /// Explicitly cancel any active gesture (e.g. on blur or Escape).
+    CancelGesture,
+
+    /// Promote currently selected file in atlas to an active reading lens pane.
+    PromoteSelectedToReadingLens,
+    /// Pin a reading pane for side-by-side reading.
+    PinReadingPane(u64),
+    /// Unpin a reading pane.
+    UnpinReadingPane(u64),
+    /// Toggle pin state of a reading pane.
+    TogglePinReadingPane(u64),
+    /// Close a specific reading pane by ID.
+    CloseReadingPane(u64),
+    /// Set City mode (enables deliberate 3D orbit gestures).
+    SetCityMode(bool),
+
+    /// Process a bounded batch from the motion mailbox (coalesced motion + discrete queue).
+    ProcessInputBatch { max_discrete: usize },
+    /// Enqueue discrete input into motion mailbox.
+    EnqueueDiscreteInput(DiscreteInputEvent),
+    /// Record continuous motion move tick into mailbox.
+    RecordContinuousMove { pos: (f32, f32), delta: (f32, f32) },
+    /// Record continuous scroll delta into mailbox.
+    RecordContinuousScroll { delta: (f32, f32) },
+
     /// Generic pointer click on a UI surface.
     PointerClick {
         target: FocusTarget,
@@ -107,7 +163,7 @@ pub enum UiAction {
 
 /// Outbound commands (intents) emitted for background workers or host renderers.
 /// The reducer never executes I/O synchronously; it routes intents via commands.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum UiCommand {
     /// Request background worker to perform search.
     DispatchSearch {
@@ -123,6 +179,18 @@ pub enum UiCommand {
     RequestCameraFocus {
         target_description: String,
     },
+    /// Camera pan translation.
+    CameraPan { dx: f32, dy: f32 },
+    /// Camera zoom factor adjustment.
+    CameraZoom { factor: f32 },
+    /// Camera orbit rotation in City mode.
+    CameraOrbit { dx: f32, dy: f32 },
+    /// Floating reading pane translated on screen.
+    ReadingPaneMoved { pane_id: u64, pos: (f32, f32) },
+    /// Reading pane scrolled internally.
+    ReadingPaneScrolled { pane_id: u64, offset: (f32, f32) },
+    /// Text selected inside reading pane.
+    ReadingPaneSelectedText { pane_id: u64, range: (usize, usize) },
     /// Notify host to schedule a redraw frame.
     RequestRedraw,
 }
@@ -161,6 +229,29 @@ pub enum UiEventKind {
     },
     CameraFitRequested {
         scope: String,
+    },
+    GestureStarted {
+        kind: GestureKind,
+    },
+    GestureCompleted {
+        kind: GestureKind,
+    },
+    GestureCancelled,
+    ReadingPaneMoved {
+        pane_id: u64,
+    },
+    ReadingPanePinned {
+        pane_id: u64,
+        is_pinned: bool,
+    },
+    ReadingPaneClosed {
+        pane_id: u64,
+    },
+    TextSelectedInLens {
+        pane_id: u64,
+    },
+    CityModeToggled {
+        is_city_mode: bool,
     },
 }
 
@@ -247,6 +338,10 @@ pub struct UiState {
     pub active_query_generation: Option<QueryGeneration>,
     pub event_ring: UiEventRing,
     pub seq_counter: u64,
+    pub gesture_arbitrator: GestureArbitrator,
+    pub motion_mailbox: MotionMailbox,
+    pub reading_panes: ReadingPaneManager,
+    pub is_city_mode: bool,
 }
 
 impl UiState {
@@ -264,6 +359,10 @@ impl UiState {
             active_query_generation: None,
             event_ring: UiEventRing::default(),
             seq_counter: 0,
+            gesture_arbitrator: GestureArbitrator::new(),
+            motion_mailbox: MotionMailbox::default(),
+            reading_panes: ReadingPaneManager::new(),
+            is_city_mode: false,
         }
     }
 
@@ -409,6 +508,7 @@ impl UiReducer {
                 path,
                 line,
             } => {
+                let _pane_id = state.reading_panes.open_or_focus(file_id, path.clone(), line);
                 state.reading_lens_open = true;
                 state.reading_lens_file = Some((file_id, path.clone(), line));
                 state.focus.set_focus(FocusTarget::ReadingLens);
@@ -424,7 +524,29 @@ impl UiReducer {
             }
 
             UiAction::CloseReadingLens => {
-                if state.reading_lens_open {
+                if state.reading_panes.is_any_open() {
+                    let closed_id = state.reading_panes.close_active_or_top_unpinned();
+                    if let Some(pid) = closed_id {
+                        let ev = UiEventKind::ReadingPaneClosed { pane_id: pid };
+                        state.record_event(ev.clone(), now_nanos);
+                        outcome.emitted_events.push(ev);
+                    }
+                    state.reading_lens_open = state.reading_panes.is_any_open();
+                    state.reading_lens_file = state
+                        .reading_panes
+                        .active_pane()
+                        .map(|p| (p.file_id, p.path.clone(), p.target_line));
+                    if !state.reading_lens_open {
+                        let _ = state.focus.return_focus();
+                    }
+                    let event = UiEventKind::LensToggled {
+                        open: state.reading_lens_open,
+                    };
+                    state.record_event(event.clone(), now_nanos);
+                    outcome.emitted_events.push(event);
+                    outcome.changed = true;
+                    outcome.commands.push(UiCommand::RequestRedraw);
+                } else if state.reading_lens_open {
                     state.reading_lens_open = false;
                     state.reading_lens_file = None;
                     let _ = state.focus.return_focus();
@@ -683,15 +805,433 @@ impl UiReducer {
                 outcome.commands.push(UiCommand::RequestRedraw);
             }
 
+            UiAction::PromoteSelectedToReadingLens => {
+                if let Some((file_id, path)) = state.selected_file.clone() {
+                    return Self::reduce(
+                        state,
+                        UiAction::OpenReadingLens {
+                            file_id,
+                            path,
+                            line: None,
+                        },
+                        now_nanos,
+                    );
+                }
+            }
+
+            UiAction::PinReadingPane(pane_id) => {
+                if state.reading_panes.pin_pane(pane_id) {
+                    let ev = UiEventKind::ReadingPanePinned {
+                        pane_id,
+                        is_pinned: true,
+                    };
+                    state.record_event(ev.clone(), now_nanos);
+                    outcome.emitted_events.push(ev);
+                    outcome.changed = true;
+                    outcome.commands.push(UiCommand::RequestRedraw);
+                }
+            }
+
+            UiAction::UnpinReadingPane(pane_id) => {
+                if state.reading_panes.unpin_pane(pane_id) {
+                    let ev = UiEventKind::ReadingPanePinned {
+                        pane_id,
+                        is_pinned: false,
+                    };
+                    state.record_event(ev.clone(), now_nanos);
+                    outcome.emitted_events.push(ev);
+                    outcome.changed = true;
+                    outcome.commands.push(UiCommand::RequestRedraw);
+                }
+            }
+
+            UiAction::TogglePinReadingPane(pane_id) => {
+                if state.reading_panes.toggle_pin(pane_id) {
+                    let is_pinned = state
+                        .reading_panes
+                        .get_pane(pane_id)
+                        .map(|p| p.is_pinned)
+                        .unwrap_or(false);
+                    let ev = UiEventKind::ReadingPanePinned {
+                        pane_id,
+                        is_pinned,
+                    };
+                    state.record_event(ev.clone(), now_nanos);
+                    outcome.emitted_events.push(ev);
+                    outcome.changed = true;
+                    outcome.commands.push(UiCommand::RequestRedraw);
+                }
+            }
+
+            UiAction::CloseReadingPane(pane_id) => {
+                if state.reading_panes.close_pane(pane_id).is_some() {
+                    let ev = UiEventKind::ReadingPaneClosed { pane_id };
+                    state.record_event(ev.clone(), now_nanos);
+                    outcome.emitted_events.push(ev);
+                    state.reading_lens_open = state.reading_panes.is_any_open();
+                    state.reading_lens_file = state
+                        .reading_panes
+                        .active_pane()
+                        .map(|p| (p.file_id, p.path.clone(), p.target_line));
+                    if !state.reading_lens_open
+                        && state.focus.current() == FocusTarget::ReadingLens
+                    {
+                        let _ = state.focus.return_focus();
+                    }
+                    outcome.changed = true;
+                    outcome.commands.push(UiCommand::RequestRedraw);
+                }
+            }
+
+            UiAction::SetCityMode(is_city) => {
+                if state.is_city_mode != is_city {
+                    state.is_city_mode = is_city;
+                    let ev = UiEventKind::CityModeToggled {
+                        is_city_mode: is_city,
+                    };
+                    state.record_event(ev.clone(), now_nanos);
+                    outcome.emitted_events.push(ev);
+                    outcome.changed = true;
+                    outcome.commands.push(UiCommand::RequestRedraw);
+                }
+            }
+
+            UiAction::PointerDown {
+                region,
+                pos,
+                button,
+                modifiers,
+            } => {
+                if let Some(kind) = state.gesture_arbitrator.start_pointer_drag(
+                    region,
+                    pos,
+                    button,
+                    modifiers,
+                    state.is_city_mode,
+                ) {
+                    let ev = UiEventKind::GestureStarted { kind };
+                    state.record_event(ev.clone(), now_nanos);
+                    outcome.emitted_events.push(ev);
+                    outcome.changed = true;
+                }
+
+                // Handle surface focus shift
+                match region {
+                    HitRegion::ReadingLensBody(pane_id)
+                    | HitRegion::ReadingLensTitleBar(pane_id) => {
+                        state.reading_panes.set_active_pane_id(Some(pane_id));
+                        if state.focus.current() != FocusTarget::ReadingLens {
+                            let from = state.focus.current();
+                            state.focus.set_focus(FocusTarget::ReadingLens);
+                            let ev = UiEventKind::FocusChanged {
+                                from,
+                                to: FocusTarget::ReadingLens,
+                            };
+                            state.record_event(ev.clone(), now_nanos);
+                            outcome.emitted_events.push(ev);
+                        }
+                        outcome.changed = true;
+                        outcome.commands.push(UiCommand::RequestRedraw);
+                    }
+                    HitRegion::AtlasBackground => {
+                        if state.focus.current() != FocusTarget::Atlas {
+                            let from = state.focus.current();
+                            state.focus.set_focus(FocusTarget::Atlas);
+                            let ev = UiEventKind::FocusChanged {
+                                from,
+                                to: FocusTarget::Atlas,
+                            };
+                            state.record_event(ev.clone(), now_nanos);
+                            outcome.emitted_events.push(ev);
+                            outcome.changed = true;
+                            outcome.commands.push(UiCommand::RequestRedraw);
+                        }
+                    }
+                    HitRegion::SidebarContent | HitRegion::SidebarSplitter => {
+                        let target = FocusTarget::Sidebar(state.sidebar.active_panel);
+                        if state.focus.current() != target {
+                            let from = state.focus.current();
+                            state.focus.set_focus(target);
+                            let ev = UiEventKind::FocusChanged { from, to: target };
+                            state.record_event(ev.clone(), now_nanos);
+                            outcome.emitted_events.push(ev);
+                            outcome.changed = true;
+                            outcome.commands.push(UiCommand::RequestRedraw);
+                        }
+                    }
+                    HitRegion::Breadcrumbs => {
+                        if state.focus.current() != FocusTarget::Breadcrumbs {
+                            let from = state.focus.current();
+                            state.focus.set_focus(FocusTarget::Breadcrumbs);
+                            let ev = UiEventKind::FocusChanged {
+                                from,
+                                to: FocusTarget::Breadcrumbs,
+                            };
+                            state.record_event(ev.clone(), now_nanos);
+                            outcome.emitted_events.push(ev);
+                            outcome.changed = true;
+                            outcome.commands.push(UiCommand::RequestRedraw);
+                        }
+                    }
+                    HitRegion::SearchPalette => {
+                        if state.focus.current() != FocusTarget::SearchPalette {
+                            let from = state.focus.current();
+                            state.focus.set_focus(FocusTarget::SearchPalette);
+                            let ev = UiEventKind::FocusChanged {
+                                from,
+                                to: FocusTarget::SearchPalette,
+                            };
+                            state.record_event(ev.clone(), now_nanos);
+                            outcome.emitted_events.push(ev);
+                            outcome.changed = true;
+                            outcome.commands.push(UiCommand::RequestRedraw);
+                        }
+                    }
+                    HitRegion::TreeProjection => {
+                        if state.focus.current() != FocusTarget::TreeProjection {
+                            let from = state.focus.current();
+                            state.focus.set_focus(FocusTarget::TreeProjection);
+                            let ev = UiEventKind::FocusChanged {
+                                from,
+                                to: FocusTarget::TreeProjection,
+                            };
+                            state.record_event(ev.clone(), now_nanos);
+                            outcome.emitted_events.push(ev);
+                            outcome.changed = true;
+                            outcome.commands.push(UiCommand::RequestRedraw);
+                        }
+                    }
+                }
+            }
+
+            UiAction::PointerMove { pos } => {
+                if let Some((kind, (dx, dy))) =
+                    state.gesture_arbitrator.update_pointer_move(pos)
+                {
+                    outcome.changed = true;
+                    match kind {
+                        GestureKind::LensDrag { pane_id } => {
+                            state.reading_panes.translate_pane(pane_id, dx, dy);
+                            if let Some(pane) = state.reading_panes.get_pane(pane_id) {
+                                outcome.commands.push(UiCommand::ReadingPaneMoved {
+                                    pane_id,
+                                    pos: pane.position,
+                                });
+                            }
+                            let ev = UiEventKind::ReadingPaneMoved { pane_id };
+                            state.record_event(ev.clone(), now_nanos);
+                            outcome.emitted_events.push(ev);
+                            outcome.commands.push(UiCommand::RequestRedraw);
+                        }
+                        GestureKind::TextSelect { pane_id } => {
+                            let ev = UiEventKind::TextSelectedInLens { pane_id };
+                            state.record_event(ev.clone(), now_nanos);
+                            outcome.emitted_events.push(ev);
+                            outcome.commands.push(UiCommand::ReadingPaneSelectedText {
+                                pane_id,
+                                range: (0, (dx.abs() * 10.0) as usize),
+                            });
+                            outcome.commands.push(UiCommand::RequestRedraw);
+                        }
+                        GestureKind::SidebarResize => {
+                            let new_width = state.sidebar.width - dx;
+                            state.sidebar.width = new_width
+                                .clamp(state.sidebar.min_width, state.sidebar.max_width);
+                            outcome.commands.push(UiCommand::RequestRedraw);
+                        }
+                        GestureKind::CameraPan => {
+                            outcome.commands.push(UiCommand::CameraPan { dx, dy });
+                            outcome.commands.push(UiCommand::RequestRedraw);
+                        }
+                        GestureKind::CameraOrbit => {
+                            outcome.commands.push(UiCommand::CameraOrbit { dx, dy });
+                            outcome.commands.push(UiCommand::RequestRedraw);
+                        }
+                        GestureKind::PinchZoom => {}
+                    }
+                }
+            }
+
+            UiAction::PointerUp { pos: _, button: _ } => {
+                if let Some(kind) = state.gesture_arbitrator.complete_pointer() {
+                    let ev = UiEventKind::GestureCompleted { kind };
+                    state.record_event(ev.clone(), now_nanos);
+                    outcome.emitted_events.push(ev);
+                    outcome.changed = true;
+                    outcome.commands.push(UiCommand::RequestRedraw);
+                }
+            }
+
+            UiAction::ScrollEvent {
+                region,
+                delta,
+                modifiers,
+            } => {
+                let routing = state
+                    .gesture_arbitrator
+                    .route_scroll(region, delta, modifiers);
+                match routing {
+                    ScrollRouting::LensScroll { pane_id, dx, dy } => {
+                        state.reading_panes.scroll_pane(pane_id, dx, dy);
+                        if let Some(pane) = state.reading_panes.get_pane(pane_id) {
+                            outcome.commands.push(UiCommand::ReadingPaneScrolled {
+                                pane_id,
+                                offset: pane.scroll_offset,
+                            });
+                        }
+                        outcome.changed = true;
+                        outcome.commands.push(UiCommand::RequestRedraw);
+                        // NEGATIVE INVARIANT: CameraPan is NOT emitted for reading lens scroll!
+                    }
+                    ScrollRouting::AtlasPan { dx, dy } => {
+                        outcome.commands.push(UiCommand::CameraPan { dx, dy });
+                        outcome.changed = true;
+                        outcome.commands.push(UiCommand::RequestRedraw);
+                    }
+                    ScrollRouting::AtlasZoom { factor } => {
+                        outcome.commands.push(UiCommand::CameraZoom { factor });
+                        outcome.changed = true;
+                        outcome.commands.push(UiCommand::RequestRedraw);
+                    }
+                    ScrollRouting::SidebarScroll { dy: _ } => {
+                        outcome.changed = true;
+                        outcome.commands.push(UiCommand::RequestRedraw);
+                    }
+                    ScrollRouting::TreeScroll { dy: _ } => {
+                        outcome.changed = true;
+                        outcome.commands.push(UiCommand::RequestRedraw);
+                    }
+                    ScrollRouting::Ignored => {}
+                }
+            }
+
+            UiAction::PinchEvent {
+                region,
+                centroid: _,
+                magnification,
+            } => {
+                if let Some(factor) = state
+                    .gesture_arbitrator
+                    .route_pinch(region, magnification)
+                {
+                    outcome.commands.push(UiCommand::CameraZoom { factor });
+                    outcome.changed = true;
+                    outcome.commands.push(UiCommand::RequestRedraw);
+                }
+            }
+
+            UiAction::CancelGesture => {
+                if state.gesture_arbitrator.cancel() {
+                    let ev = UiEventKind::GestureCancelled;
+                    state.record_event(ev.clone(), now_nanos);
+                    outcome.emitted_events.push(ev);
+                    outcome.changed = true;
+                    outcome.commands.push(UiCommand::RequestRedraw);
+                }
+            }
+
+            UiAction::EnqueueDiscreteInput(ev) => {
+                state.motion_mailbox.push_discrete(ev);
+            }
+
+            UiAction::RecordContinuousMove { pos, delta } => {
+                state.motion_mailbox.record_move(pos, delta);
+            }
+
+            UiAction::RecordContinuousScroll { delta } => {
+                state.motion_mailbox.record_scroll(delta);
+            }
+
+            UiAction::ProcessInputBatch { max_discrete } => {
+                // 1. Consume coalesced motion
+                if let Some(motion) = state.motion_mailbox.take_motion() {
+                    outcome.changed = true;
+                    if motion.pan_delta.0.abs() > f32::EPSILON
+                        || motion.pan_delta.1.abs() > f32::EPSILON
+                    {
+                        outcome.commands.push(UiCommand::CameraPan {
+                            dx: motion.pan_delta.0,
+                            dy: motion.pan_delta.1,
+                        });
+                    }
+                    if motion.scroll_delta.0.abs() > f32::EPSILON
+                        || motion.scroll_delta.1.abs() > f32::EPSILON
+                    {
+                        outcome.commands.push(UiCommand::CameraPan {
+                            dx: motion.scroll_delta.0,
+                            dy: motion.scroll_delta.1,
+                        });
+                    }
+                    if motion.pinch_magnification.abs() > f32::EPSILON {
+                        outcome.commands.push(UiCommand::CameraZoom {
+                            factor: 1.0 + motion.pinch_magnification,
+                        });
+                    }
+                    outcome.commands.push(UiCommand::RequestRedraw);
+                }
+
+                // 2. Consume bounded batch of discrete events
+                let discrete_batch =
+                    state.motion_mailbox.drain_discrete_batch(max_discrete);
+                for discrete in discrete_batch {
+                    let sub_outcome = match discrete {
+                        DiscreteInputEvent::PointerDown {
+                            region,
+                            pos,
+                            button,
+                            modifiers,
+                        } => Self::reduce(
+                            state,
+                            UiAction::PointerDown {
+                                region,
+                                pos,
+                                button,
+                                modifiers,
+                            },
+                            now_nanos,
+                        ),
+                        DiscreteInputEvent::PointerUp { pos, button } => Self::reduce(
+                            state,
+                            UiAction::PointerUp { pos, button },
+                            now_nanos,
+                        ),
+                        DiscreteInputEvent::KeyDown { key, modifiers: _ } => {
+                            Self::reduce(state, UiAction::KeyboardShortcut(key), now_nanos)
+                        }
+                        DiscreteInputEvent::KeyUp { .. } => UiReductionOutcome::default(),
+                        DiscreteInputEvent::FocusTargetSelected(target) => {
+                            Self::reduce(state, UiAction::FocusChange(target), now_nanos)
+                        }
+                        DiscreteInputEvent::MarkedTextCommit(text) => Self::reduce(
+                            state,
+                            UiAction::SearchQueryChanged(text),
+                            now_nanos,
+                        ),
+                    };
+                    outcome.changed |= sub_outcome.changed;
+                    outcome.commands.extend(sub_outcome.commands);
+                    outcome.emitted_events.extend(sub_outcome.emitted_events);
+                }
+            }
+
             UiAction::KeyboardShortcut(cmd) => {
                 match cmd.as_str() {
                     "Escape" => {
-                        if state.search_palette_open {
+                        // Priority 1: Cancel active gesture first before changing lens or scope
+                        if state.gesture_arbitrator.is_active() {
+                            return Self::reduce(state, UiAction::CancelGesture, now_nanos);
+                        } else if state.search_palette_open {
                             return Self::reduce(state, UiAction::CloseSearchPalette, now_nanos);
-                        } else if state.reading_lens_open {
+                        } else if state.reading_panes.is_any_open() || state.reading_lens_open {
                             return Self::reduce(state, UiAction::CloseReadingLens, now_nanos);
                         } else {
                             return Self::reduce(state, UiAction::FocusReturn, now_nanos);
+                        }
+                    }
+                    "Enter" => {
+                        // Enter on Atlas with selected file promotes to reading lens
+                        if state.focus.current() == FocusTarget::Atlas && state.selected_file.is_some() {
+                            return Self::reduce(state, UiAction::PromoteSelectedToReadingLens, now_nanos);
                         }
                     }
                     "Cmd+P" | "Ctrl+P" => {

@@ -12,12 +12,21 @@
 
 pub mod breadcrumbs;
 pub mod focus;
+pub mod gesture;
+pub mod motion_mailbox;
+pub mod reading_panes;
 pub mod reducer;
 pub mod sidebar;
 pub mod tree;
 
 pub use breadcrumbs::{ScopeBreadcrumbs, ScopeSegment};
 pub use focus::{FocusDirection, FocusManager, FocusStack, FocusTarget};
+pub use gesture::{
+    GestureArbitrator, GestureKind, GestureState, HitRegion, ModifierKeys, PointerButton,
+    ScrollRouting,
+};
+pub use motion_mailbox::{CoalescedMotion, DiscreteInputEvent, MotionMailbox};
+pub use reading_panes::{ReadingPane, ReadingPaneManager};
 pub use reducer::{
     UiAction, UiCommand, UiEvent, UiEventKind, UiEventRing, UiReducer, UiReductionOutcome, UiState,
 };
