@@ -138,7 +138,7 @@ pub struct MetalResource {
 }
 
 /// The kind of Metal resource a display primitive maps to.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MetalResourceKind {
     /// A solid-color quad drawn by a vertex/fragment shader pair.
     SolidQuad,

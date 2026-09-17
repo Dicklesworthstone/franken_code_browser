@@ -383,7 +383,8 @@ mod tests {
         let destination = ColorLinearSdr::premultiplied(1.0, 0.0, 0.0, 0.5).unwrap();
         let out = compose_source_over(&source, &destination).unwrap();
         assert_eq!(out.alpha(), 1.0);
-        assert_eq!(out.red(), 1.0);
+        // Opaque blue fully covers: destination red contributes 0.
+        assert_eq!(out.red(), 0.0);
         assert_eq!(out.blue(), 1.0);
     }
 
@@ -429,10 +430,11 @@ mod tests {
             tiny.push(ScissorRect::new(0, 0, 10, 10)).unwrap_err(),
             RenderAbiError::ClipStackOverflow { max: 2 }
         );
-        // Pops restore and underflow is refused.
-        tiny.pop().unwrap();
+        // Pops restore and underflow is refused. The seed entry counts
+        // toward max_depth, so exactly one pop is valid at depth 2.
         tiny.pop().unwrap();
         assert_eq!(tiny.pop().unwrap_err(), RenderAbiError::ClipStackUnderflow);
+        assert_eq!(tiny.depth(), 1);
     }
 
     #[test]
