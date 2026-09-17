@@ -15,6 +15,7 @@ pub mod clipboard;
 pub mod ime;
 pub mod responder;
 pub mod terminal;
+pub mod virtual_accessibility;
 
 pub use accessibility::{
     AxAction, AxLineIndex, AxNotification, AxRole, NativeAxRoute,
@@ -33,6 +34,12 @@ pub use terminal::{
     GpuSubmissionId, GpuTerminalError, LosslessTerminalDrainQueue, TerminalCompletionStatus,
     TerminalDrainCounters, TerminalDrainError, TerminalDrainReport, TerminalEventRecord,
     TerminalEventType, TerminalRecordReservation, TerminalRecordSlotId,
+};
+pub use virtual_accessibility::{
+    CityAxSurface, CityBuildingAxNode, CityDistrictAxNode, DocumentAxStructure,
+    HeadingMilestone, KeyboardNavEngine, LinkMilestone, NavAction, NavOutcome, NavSurface,
+    SourceLineMilestone, TableMilestone, VirtualOutlineEntry, VirtualOutlineTree,
+    VirtualSearchResultItem, VirtualSearchResults, MAX_ACCESSIBILITY_WINDOW,
 };
 
 use fcb_core::tracing::{AbsoluteDeadline, DeadlineState, MonotonicTimestamp, TracingError};
