@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Read-only CLI routes over the public paged archive APIs. The sole open is
+//! Read-only CLI routes over the public paged archive APIs. Source backing is
 //! the archive named by the caller; member names never become filesystem paths.
 
 use std::fs::File;
@@ -10,9 +10,9 @@ use fcb::search::{RawPath, ResourceBudget, StreamingNeedle, StreamReadStep,
 use fcb::search::reader::LineNumber;
 use fcb::search::paged_snapshot::{PagedSnapshot, PagedSnapshotError, PagedMemberData,
     PagedQuery, PagedQueryOptions, PagedQueryState, PagedSearchError, PagedCapture, SnapshotDirectory};
-use crate::{allocation, file_id, generation, owner, revision, input, EXIT_OK, EXIT_NO_MATCH, EXIT_PARTIAL};
+use crate::{allocation, file_id, generation, owner, revision, EXIT_OK, EXIT_NO_MATCH, EXIT_PARTIAL};
 use crate::output::{Output, OutputError};
-use super::{Settings, Mode, Failure, SnapshotLimits, MAX_SNAPSHOT_BYTES, begin};
+use super::{Settings, Mode, Failure, begin, catalog};
 
 impl From<PagedSnapshotError> for Failure {
     fn from(error: PagedSnapshotError) -> Self { Self { code: error.to_string(), canceled: error == PagedSnapshotError::Canceled } }
@@ -29,10 +29,12 @@ fn reader_error(error: fcb::search::ReaderError) -> Failure {
 
 pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBudget,
     canceled: &mut impl FnMut() -> bool) -> Result<u8, Failure> {
-    let path = input::absolute(settings.source.as_deref().ok_or_else(|| Failure::new("CLI_MISSING_SOURCE"))?)?;
-    let (file, metadata) = input::open_regular(&path)?;
-    if metadata.len() > MAX_SNAPSHOT_BYTES as u64 { return Err(Failure::new("SNAPSHOT_LIMIT")); }
-    let mut archive = PagedSnapshot::open(file, owner(), SnapshotLimits::default(), budget, allocation(104), &mut *canceled)?;
+    let path = settings.source.as_deref().ok_or_else(|| Failure::new("CLI_MISSING_SOURCE"))?;
+    let mut archive = catalog::open(path, settings.catalog.as_deref(), settings.catalog_pin,
+        budget, [allocation(104), allocation(110)], canceled)?;
+    if !settings.json && !archive.directory().fully_verified_on_open() {
+        out.literal("Trusted saved catalog; archive boundaries checked. Unread body integrity is unchecked; loaded members are digest-verified.\n")?;
+    }
     match settings.mode {
         Mode::Inspect => inspect(settings, archive.directory(), out, canceled),
         Mode::Search => search(settings, &mut archive, out, budget, canceled),
@@ -51,7 +53,8 @@ fn summary(out: &mut Output, directory: &SnapshotDirectory) -> Result<(), Output
     out.literal(",\"captured_bytes\":")?; out.integer(directory.source_bytes())?;
     out.literal(",\"archive_validation_bytes\":")?; out.integer(directory.validation_stats().bytes_read)?;
     out.literal(",\"archive_validation_read_calls\":")?; out.integer(directory.validation_stats().read_calls)?;
-    out.literal(",\"catalog_reserved_bytes\":")?; out.integer(directory.retained_charge() as u64)
+    out.literal(",\"catalog_reserved_bytes\":")?; out.integer(directory.retained_charge() as u64)?;
+    catalog::validation_fields(out, directory)
 }
 fn inspect(settings: &Settings, directory: &SnapshotDirectory, out: &mut Output,
     canceled: &mut impl FnMut() -> bool) -> Result<u8, Failure> {
@@ -59,7 +62,7 @@ fn inspect(settings: &Settings, directory: &SnapshotDirectory, out: &mut Output,
         begin(out, "snapshot-inspect")?; summary(out, directory)?;
         out.literal(",\"listing_truncated\":")?; out.boolean(directory.len() > settings.limit)?;
         out.literal(",\"member_payload_bytes_loaded\":\"0\",\"files\":[")?;
-    } else { out.literal("Verified saved observations; metadata retained, no live roots accessed.\n")?; }
+    } else { out.literal("Saved observations; metadata retained, no live roots accessed.\n")?; }
     for entry in directory.members().take(settings.limit) {
         if canceled() { return Err(Failure::canceled()); }
         let path = RawPath::from_bytes(entry.path).to_path_buf();
