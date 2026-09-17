@@ -246,9 +246,9 @@ fn file_record(out: &mut Output, catalog: &WorkspaceCatalog, file: fcb::FileId) 
     Ok(())
 }
 #[derive(Default)]
-struct IoCounts { bytes: u64, calls: u64 }
+pub(crate) struct IoCounts { pub(crate) bytes: u64, pub(crate) calls: u64 }
 
-fn read_capture(root: &Path, request: CaptureRequest, path: &NormalizedPath, limit: usize,
+pub(crate) fn read_capture(root: &Path, request: CaptureRequest, path: &NormalizedPath, limit: usize,
     total_limit: u64, io: &mut IoCounts, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool)
     -> Result<CompleteCapture, SourceError> {
     if canceled() { return Err(SourceError::Canceled); }

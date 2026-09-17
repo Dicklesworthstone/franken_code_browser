@@ -4,13 +4,15 @@
 //! the public WorkspaceAtlas, camera and visible-query APIs, not a second map
 //! algorithm. A plan is never acknowledged as a physically presented frame.
 mod path_overlay;
+mod text_overlay;
 
 use std::{ffi::OsString, fs, io::Write, path::{Component, Path, PathBuf}};
 use fcb::{ByteLength, CameraGeneration, DisplayGeneration, DisplayMetrics, Point2D, Rect2D, Size2D};
 use fcb::map::{AtlasDetail, AtlasError, AtlasIndex, AtlasNodeId, Camera2D, CameraError,
     DisplayColorConfig, LayoutOptions, LayoutRevision, LodThresholds, VisibleLimits, VisibleQuery, VisibleState};
 use fcb::map::workspace::{WorkspaceAtlas, WorkspaceAtlasError, WorkspaceAtlasLimits};
-use fcb::search::{RawPath, ResourceBudget, RootId, SearchManifestId};
+use fcb::map::workspace::text_search::{WorkspaceTextError, WorkspaceTextSource};
+use fcb::search::{IndexError, QueryError, RawPath, ResourceBudget, RootId, SearchManifestId};
 use fcb::search::workspace::{RootGrant, RuleLimits, WorkspaceCatalog, WorkspaceError, WorkspaceLimits, WorkspaceStage};
 use fcb::source::CancelFlag;
 use crate::{AppError, EXIT_OK, EXIT_ERROR, EXIT_PARTIAL, EXIT_CANCELED, MANAGED_BYTES,
@@ -28,39 +30,47 @@ const HELP: &str = "Repository atlas plans\n\n\
   --limit N --max-visits N    Parcel and traversal limits (default 1024 / 32768)\n\
   --max-files N               Discovery file limit (default 4096)\n\
   --path QUERY --match-limit N  Ranked filename/path overlay (default 100 rows)\n\
+  --text TEXT --match-limit N   Exact captured-text overlay (alternative to --path)\n\
+  --max-file-bytes N --max-total-bytes N  Text capture limits (1 MiB / 32 MiB)\n\
+  --max-scan-bytes N           Text verification allowance (default 32 MiB)\n\
   --respect-ignores OR --include-excluded\n\n\
-This command explicitly authorizes bounded directory discovery. No source\n\
-payloads are read. Repository rule files require --respect-ignores separately.\n\
+This command explicitly authorizes bounded directory discovery. Source payload\n\
+reads require --text. Repository rule files require --respect-ignores separately.\n\
+Text search uses retained captures, UTF-8/BOM UTF-16, original byte ranges, and\n\
+separate unavailable/truncated/byte-limited states. It searches the catalog,\n\
+not just the camera focus. --match-limit 0 is not a text count-only request.\n\
 Files retain native byte paths and response-local FileIds. Only catalogued\n\
 regular files and their ancestors are mapped; empty/unavailable directories\n\
 are not a complete directory inventory. Partial discovery stays explicit.\n\
 Rectangles are clipped logical-viewport points, NOT native presented pixels.\n\
 Budget pressure produces labelled aggregates, never invented file hits.\n\
 The selected file remains identified even when aggregated or outside focus.\n\
-Exit: 0 complete plan, 2 error, 3 incomplete discovery/detail, 130 canceled.\n\
+Exit: 0 complete plan/search, 2 error, 3 incomplete discovery/detail/search, 130 canceled.\n\
 Implemented-unqualified; independent Rust/RCH and native verification pending.\n";
 
 #[derive(Debug)]
 struct Options {
     workspace: Arguments,
     focus: Option<PathBuf>, select: Option<PathBuf>,
-    path_query: Option<OsString>, match_limit: usize,
+    path_query: Option<OsString>, text_query: Option<String>, match_limit: usize,
+    text_scan_bytes: u64,
     width: f64, height: f64, scale: f64, zoom: f64, pan_x: f64, pan_y: f64,
     detail_pixels: f64, max_visits: usize,
 }
 #[derive(Clone, Copy, Debug)]
-enum Error { App(AppError), Atlas(WorkspaceAtlasError), FocusMissing, SelectionMissing }
+enum Error { App(AppError), Atlas(WorkspaceAtlasError), Text(WorkspaceTextError), FocusMissing, SelectionMissing }
 impl From<AppError> for Error { fn from(e: AppError) -> Self { Self::App(e) } }
 impl From<ArgumentError> for Error { fn from(e: ArgumentError) -> Self { Self::App(e.into()) } }
 impl From<OutputError> for Error { fn from(e: OutputError) -> Self { Self::App(e.into()) } }
 impl From<WorkspaceError> for Error { fn from(e: WorkspaceError) -> Self { Self::App(e.into()) } }
 impl From<WorkspaceAtlasError> for Error { fn from(e: WorkspaceAtlasError) -> Self { Self::Atlas(e) } }
+impl From<WorkspaceTextError> for Error { fn from(e: WorkspaceTextError) -> Self { Self::Text(e) } }
 impl From<AtlasError> for Error { fn from(e: AtlasError) -> Self { Self::Atlas(e.into()) } }
 impl From<CameraError> for Error { fn from(e: CameraError) -> Self { AtlasError::Camera(e).into() } }
 impl Error {
     fn code(self) -> String {
         match self {
-            Self::App(e) => e.code(), Self::Atlas(e) => e.to_string(),
+            Self::App(e) => e.code(), Self::Atlas(e) => e.to_string(), Self::Text(e) => e.to_string(),
             Self::FocusMissing => "CLI_ATLAS_FOCUS_NOT_CATALOGUED".to_owned(),
             Self::SelectionMissing => "CLI_ATLAS_SELECTION_NOT_CATALOGUED".to_owned(),
         }
@@ -70,6 +80,8 @@ impl Error {
             Self::App(e) => e.is_canceled(),
             Self::Atlas(WorkspaceAtlasError::Atlas(AtlasError::Canceled)
                 | WorkspaceAtlasError::Workspace(WorkspaceError::Canceled)) => true,
+            Self::Text(WorkspaceTextError::Index(IndexError::Canceled | IndexError::Query(QueryError::Canceled))
+                | WorkspaceTextError::Workspace(WorkspaceError::Canceled)) => true,
             _ => false,
         }
     }
@@ -77,7 +89,7 @@ impl Error {
 fn takes_value(option: &str) -> bool {
     matches!(option, "--focus" | "--select" | "--width" | "--height" | "--scale" | "--zoom"
         | "--pan-x" | "--pan-y" | "--detail-pixels" | "--limit" | "--max-visits" | "--max-files"
-        | "--path" | "--match-limit")
+        | "--path" | "--match-limit" | "--text" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes")
 }
 fn json_requested(arguments: &[OsString]) -> bool {
     let mut cursor = 0;
@@ -107,7 +119,9 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
     // values are consumed here; they can never turn into discovery switches.
     let mut forwarded = vec![OsString::from("inspect"), OsString::from("--workspace")];
     let (mut focus, mut select) = (None, None);
-    let (mut path_query, mut match_limit) = (None, 100usize);
+    let (mut path_query, mut text_query, mut match_limit) = (None, None, 100usize);
+    let mut text_scan_bytes = 32 * 1024 * 1024u64;
+    let mut text_settings = false;
     let (mut width, mut height, mut scale, mut zoom) = (1024.0, 768.0, 1.0, 1.0);
     let (mut pan_x, mut pan_y, mut detail_pixels, mut max_visits) = (0.0, 0.0, 48.0, 32_768usize);
     let (mut cursor, mut seen) = (0usize, 0u32);
@@ -120,16 +134,18 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
         if matches!(option, "--json" | "--respect-ignores" | "--include-excluded") {
             forwarded.push(arg.clone()); continue;
         }
-        if matches!(option, "--limit" | "--max-files") {
+        if matches!(option, "--limit" | "--max-files" | "--max-file-bytes" | "--max-total-bytes") {
             let value = arguments.get(cursor).ok_or(ArgumentError::MissingValue)?; cursor += 1;
             forwarded.push(arg.clone()); forwarded.push(value.clone());
-            limit_seen |= option == "--limit"; continue;
+            limit_seen |= option == "--limit";
+            text_settings |= matches!(option, "--max-file-bytes" | "--max-total-bytes");
+            continue;
         }
         let bit = match option {
             "--focus" => 1, "--select" => 2, "--width" => 4, "--height" => 8,
             "--scale" => 16, "--zoom" => 32, "--pan-x" => 64, "--pan-y" => 128,
             "--detail-pixels" => 256, "--max-visits" => 512,
-            "--path" => 1024, "--match-limit" => 2048,
+            "--path" => 1024, "--match-limit" => 2048, "--text" => 4096, "--max-scan-bytes" => 8192,
             _ => return Err(ArgumentError::UnknownOption.into()),
         };
         if seen & bit != 0 { return Err(ArgumentError::DuplicateOption.into()); } seen |= bit;
@@ -137,6 +153,11 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
         if option == "--path" {
             if value.is_empty() || value.len() > 256 { return Err(ArgumentError::InvalidNeedle.into()); }
             path_query = Some(value.clone()); continue;
+        }
+        if option == "--text" {
+            let text = value.to_str().ok_or(ArgumentError::InvalidNeedle)?;
+            if text.is_empty() || text.len() > 1024 { return Err(ArgumentError::InvalidNeedle.into()); }
+            text_query = Some(text.to_owned()); continue;
         }
         if option == "--focus" || option == "--select" {
             if value.is_empty() { return Err(ArgumentError::MissingValue.into()); }
@@ -161,6 +182,11 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
                 if n > 4096 { return Err(ArgumentError::Limit.into()); }
                 match_limit = n as usize;
             }
+            "--max-scan-bytes" => {
+                text_scan_bytes = args::decimal(value)?;
+                if text_scan_bytes > args::MAX_SCAN_BYTES { return Err(ArgumentError::Limit.into()); }
+                text_settings = true;
+            }
             "--max-visits" => {
                 let n = args::decimal(value)?;
                 if !(1..=1_000_000).contains(&n) { return Err(ArgumentError::Limit.into()); }
@@ -169,12 +195,16 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
             _ => unreachable!(),
         }
     }
-    if seen & 2048 != 0 && path_query.is_none() { return Err(ArgumentError::IncompatibleOptions.into()); }
+    if (path_query.is_some() && text_query.is_some()) || (text_settings && text_query.is_none())
+        || (seen & 2048 != 0 && path_query.is_none() && text_query.is_none()) {
+        return Err(ArgumentError::IncompatibleOptions.into());
+    }
     // Insert before a possible positional-only delimiter, not after it.
     if !limit_seen { forwarded.splice(2..2, [OsString::from("--limit"), OsString::from("1024")]); }
     let workspace = args::parse(&forwarded)?;
     if workspace.limit == 0 { return Err(ArgumentError::Limit.into()); }
-    Ok(Options { workspace, focus, select, path_query, match_limit, width, height, scale, zoom, pan_x, pan_y, detail_pixels, max_visits })
+    Ok(Options { workspace, focus, select, path_query, text_query, match_limit, text_scan_bytes,
+        width, height, scale, zoom, pan_x, pan_y, detail_pixels, max_visits })
 }
 
 pub(crate) fn run(arguments: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write,
@@ -230,7 +260,10 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
     if !meta.is_dir() { return Err(AppError::InvalidRange.into()); }
     let root = fs::canonicalize(&requested).map_err(|_| AppError::Io)?;
     let grant = RootGrant::new(RootId::new(owner(), 1).map_err(|_| AppError::InvalidRange)?, RawPath::from_path(&root));
-    let limits = WorkspaceLimits { max_files: args.max_files, max_file_bytes: 0, max_source_bytes: 0, ..WorkspaceLimits::default() };
+    let text_requested = options.text_query.is_some();
+    let limits = WorkspaceLimits { max_files: args.max_files,
+        max_file_bytes: if text_requested { args.max_file_bytes } else { 0 },
+        max_source_bytes: if text_requested { args.max_total_bytes } else { 0 }, ..WorkspaceLimits::default() };
     let id = SearchManifestId::new(owner(), 1).map_err(AppError::from)?;
     let mut catalog = if args.respect_ignores {
         WorkspaceCatalog::open_rule_aware(grant, id, file_id(), limits, RuleLimits::default(), budget, [allocation(30), allocation(39)])?
@@ -271,12 +304,24 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
         Some(needle) => Some(path_overlay::build(&atlas, needle, options.match_limit, budget, canceled)?),
         None => None,
     };
-    let search_partial = overlay.as_ref().is_some_and(|hits| !hits.is_complete() || hits.truncated());
+    let (captures, io) = if text_requested {
+        let (captures, io) = text_overlay::capture(&catalog, &root, budget, canceled)?;
+        (Some(captures), io)
+    } else { (None, workspace::IoCounts::default()) };
+    let text_source = captures.as_ref().map(|captures| WorkspaceTextSource::new(&atlas, captures, budget, allocation(68))).transpose()?;
+    let text_hits = match (&text_source, options.text_query.as_deref()) {
+        (Some(source), Some(needle)) => Some(text_overlay::search(source, needle, options, budget, canceled)?),
+        _ => None,
+    };
+    let search_partial = overlay.as_ref().is_some_and(|hits| !hits.is_complete() || hits.truncated())
+        || text_hits.as_ref().is_some_and(|hits| !hits.is_complete());
     let stats = plan.stats();
     let detail_limited = stats.budget_aggregates != 0 || stats.precision_aggregates != 0;
     if args.json {
         workspace::common(out, "atlas", &catalog, &root)?;
-        out.literal(",\"atlas_schema\":\"fcb.atlas/1\",\"qualification\":\"implemented-unqualified\",\"plan_complete\":true,\"native_presented\":false,\"payload_bytes_read\":\"0\",\"hierarchy_scope\":\"catalogued-files-and-ancestors\",\"metric\":")?;
+        out.literal(",\"atlas_schema\":\"fcb.atlas/1\",\"qualification\":\"implemented-unqualified\",\"plan_complete\":true,\"native_presented\":false,\"payload_bytes_read\":")?;
+        out.integer(io.bytes)?;
+        out.literal(",\"hierarchy_scope\":\"catalogued-files-and-ancestors\",\"metric\":")?;
         out.quoted(atlas.layout().options().metric().name())?;
         out.literal(",\"layout_revision\":")?; out.integer(index.revision().get())?;
         out.literal(",\"hierarchy_nodes\":")?; out.integer(index.len() as u64)?;
@@ -315,6 +360,7 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
                     out.integer(hits.retained_matches_in(parcel.node()).map_err(Error::from)? as u64)?,
                 _ => out.literal("null")?,
             }
+            text_overlay::counts(out, text_hits.as_ref(), *parcel)?;
             out.literal("}")?;
         }
         out.literal("],\"traversal\":{\"visited_nodes\":")?; out.integer(stats.visited_nodes as u64)?;
@@ -326,6 +372,7 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
         out.literal(",\"max_visits\":")?; out.integer(options.max_visits as u64)?;
         out.literal("}")?;
         path_overlay::json(out, overlay.as_ref(), &index, focus, camera, canceled)?;
+        text_overlay::json(out, text_hits.as_ref(), &io, &index, focus, camera, options, canceled)?;
         out.literal("}\n")?;
     } else {
         out.literal("Retained repository atlas plan (not a native presented frame)\n")?;
@@ -340,7 +387,8 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
             out.literal("Selected file: ")?; out.path(&atlas.entry(node)?.path().raw().to_path_buf())?; out.literal("\n")?;
         }
         path_overlay::human(out, overlay.as_ref(), canceled)?;
-        out.literal("Source payload bytes read: 0\n")?;
+        text_overlay::human(out, text_hits.as_ref(), canceled)?;
+        out.literal("Source payload bytes read: ")?; out.literal(&io.bytes.to_string())?; out.literal("\n")?;
         if !catalog.discovery_complete() || detail_limited { out.literal("PARTIAL discovery or aggregate-limited detail\n")?; }
     }
     atlas.validate_active()?;
@@ -403,9 +451,27 @@ mod tests {
         for args in [vec!["root", "--zoom", "NaN"], vec!["root", "--scale", "inf"],
             vec!["root", "--width", "0"], vec!["root", "--limit", "0"],
             vec!["root", "--max-visits", "0"], vec!["root", "--zoom", "2", "--zoom", "3"],
-            vec!["root", "--stdin"], vec!["root", "--text", "x"],
+            vec!["root", "--stdin"], vec!["root", "--raw-hex", "ff"],
             vec!["root", "--respect-ignores", "--include-excluded"]] {
             assert!(parse(&argv(&args)).is_err(), "{args:?}");
+        }
+    }
+    #[test]
+    fn text_permissions_limits_and_literal_values_are_independent() {
+        let options = parse(&argv(&["root", "--text", "--respect-ignores", "--match-limit", "3",
+            "--max-file-bytes", "100", "--max-total-bytes", "1000", "--max-scan-bytes", "500"])).unwrap();
+        assert_eq!(options.text_query.as_deref(), Some("--respect-ignores"));
+        assert!(!options.workspace.respect_ignores); assert_eq!(options.match_limit, 3);
+        assert_eq!(options.workspace.max_file_bytes, 100); assert_eq!(options.workspace.max_total_bytes, 1000);
+        assert_eq!(options.text_scan_bytes, 500);
+        assert!(!json_requested(&argv(&["root", "--text", "--json"])));
+        assert!(json_requested(&argv(&["root", "--text", "--json", "--json"])));
+        assert!(!json_requested(&argv(&["root", "--max-scan-bytes", "--json"])));
+        for values in [vec!["root", "--text", ""], vec!["root", "--text", "x", "--path", "y"],
+            vec!["root", "--max-file-bytes", "8"], vec!["root", "--max-total-bytes", "8"],
+            vec!["root", "--max-scan-bytes", "8"], vec!["root", "--text", "x", "--text", "y"],
+            vec!["root", "--text", "x", "--max-scan-bytes", "1099511627777"]] {
+            assert!(parse(&argv(&values)).is_err(), "{values:?}");
         }
     }
 }
