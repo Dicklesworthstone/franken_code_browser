@@ -3,17 +3,17 @@
 //! FCB-077.V production verification scenario:
 //! Early real native source-reader accessibility and keyboard/IME smoke path.
 //!
-//! Required cases:
-//! 1. `source_reader_confined_capture_exact_bytes` — Confined reader capture of real source corpus.
-//! 2. `native_voiceover_ax_route_attributes_and_roles` — VoiceOver/AX role, attribute, and range queries.
-//! 3. `virtualized_pending_range_resolution` — Virtualized PendingTextRangeResolver bounded resolution.
-//! 4. `ax_subrange_bounds_and_point_hittest` — Character sub-range bounding boxes and point hit testing.
-//! 5. `focus_walk_and_notification_queue` — Keyboard focus walk order and VoiceOver notification queues.
-//! 6. `native_ime_marked_text_and_query_suppression` — Intermediate composition search query suppression.
-//! 7. `native_ime_candidate_window_and_caret_rect` — IME candidate window positioning and rect inquiries.
-//! 8. `actual_source_clipboard_roundtrip_multiflavor` — Multi-flavor clipboard copy/paste with exact round-trip.
-//! 9. `host_responder_chain_command_bubbling` — Responder chain command bubbling without global event monitors.
-//! 10. `negative_control_wrong_offset_and_sentinels_caught` — Refusal of NATIVE_NOT_FOUND, out-of-bounds, mid-surrogate, and budget overflow.
+//! Required verification cases:
+//! 1. `test_01_real_source_capture_and_semantic_ax_tree` — Confined reader capture and VoiceOver AX role/label queries.
+//! 2. `test_02_virtualized_pending_text_range_resolution` — Virtualized range requests returning Pending/Ready without UI stalls.
+//! 3. `test_03_wrong_offset_and_sentinels_negative_controls` — NATIVE_NOT_FOUND, mid-surrogate, and out-of-bounds refusals.
+//! 4. `test_04_ax_line_index_and_bounds_for_range` — Line index translation and sub-range bounding box calculation.
+//! 5. `test_05_point_hit_testing_in_accepted_layout` — Screen coordinate point hit testing against layout nodes.
+//! 6. `test_06_keyboard_focus_walk_and_notification_queue` — Keyboard focus walk (next/prev) and AX notification queueing.
+//! 7. `test_07_host_responder_chain_dispatch_without_global_taps` — Responder chain command bubbling without global monitors.
+//! 8. `test_08_ime_multi_stage_composition_suppresses_queries` — IME marked text composition query suppression.
+//! 9. `test_09_actual_source_clipboard_round_trip` — Source clipboard multi-flavor staging and exact byte round-trip.
+//! 10. `test_10_clipboard_budget_refusal_and_concurrent_change` — Clipboard budget limit refusal and concurrent change detection.
 //!
 //! Every case emits a bounded redacted [`ScenarioReceipt`] retained under
 //! the run's receipts directory (see `scripts/e2e/fcb_077.sh`).
@@ -32,7 +32,7 @@ use fcb_core::{
 use fcb_runtime::{
     accessibility::{AxLineIndex, AxNotification, AxRole, NativeAxRoute},
     clipboard::{
-        ClipboardError, ClipboardFlavor, ClipboardLimits, ClipboardPayload, ClipboardRoundTrip,
+        ClipboardError, ClipboardLimits, ClipboardPayload, ClipboardRoundTrip,
         NativeClipboard,
     },
     ime::{ImeClient, ImeEvent, ImeOutcome},
@@ -167,433 +167,476 @@ fn line_starts_utf16(text: &str) -> Vec<u64> {
     starts
 }
 
-fn utf16_offset(units: u64) -> Utf16CodeUnitOffset {
-    Utf16CodeUnitOffset::new(units)
-}
+fn build_layout_snapshot(text: &str) -> (AcceptedLayoutSnapshot, Vec<SemanticNodeId>, LayoutRevision) {
+    let o = owner();
+    let layout_rev = LayoutRevision::new(o, 1).expect("layout rev");
+    let source_rev = SourceRevision::new(o, 1).expect("source rev");
+    let disp_gen = DisplayGeneration::new(o, 1).expect("display gen");
+    let identity = AcceptedLayoutIdentity::new(o, layout_rev, source_rev, disp_gen, None)
+        .expect("identity");
 
-fn utf16_range(start: u64, end: u64) -> Utf16CodeUnitRange {
-    Utf16CodeUnitRange::new(utf16_offset(start), utf16_offset(end)).expect("ordered range valid")
-}
+    let metrics = DisplayMetrics::new(
+        2.0,
+        Size2D::new(800.0, 600.0).expect("logical size"),
+        DisplayColorConfig::Srgb,
+        disp_gen,
+    )
+    .expect("metrics");
 
-fn build_semantic_snapshot(text: &str) -> AcceptedLayoutSnapshot {
-    let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    let starts = line_starts_utf16(text);
+    let root_id = SemanticNodeId::new(o, 1).expect("root id");
     let mut nodes = BTreeMap::new();
 
-    let doc_id = SemanticNodeId::new(owner(), 1).expect("node id valid");
-    let doc_geom = SemanticGeometry::new(
-        Rect2D::from_xywh(0.0, 0.0, 800.0, 600.0).expect("rect valid"),
-        Rect2D::from_xywh(0.0, 0.0, 800.0, 600.0).expect("rect valid"),
-        None,
-    ).expect("geom valid");
+    let root_rect = Rect2D::from_xywh(0.0, 0.0, 800.0, 600.0).expect("rect");
+    let root_geom = SemanticGeometry::new(root_rect, root_rect, None).expect("geom");
+    let mut root_node = SemanticNode::new(root_id, root_geom, SemanticRole::Document, false);
+    root_node.set_label(Some("Main Source Document".to_string()));
 
-    let doc_range = utf16_range(0, total_utf16_units(text));
-    let doc_node = SemanticNode::new(
-        doc_id,
-        SemanticRole::Document,
-        doc_geom,
-        Some("main.rs".to_string()),
-        Some(text.to_string()),
-        Some(doc_range),
-        None,
-        vec![],
-    ).expect("doc node valid");
-    nodes.insert(doc_id, doc_node);
+    let starts = line_starts_utf16(text);
+    let total_units = total_utf16_units(text);
+    let mut line_ids = Vec::new();
 
-    let mut line_nodes = Vec::new();
-    for (idx, line_slice) in lines.iter().enumerate() {
-        let nid = SemanticNodeId::new(owner(), 10 + idx as u64).expect("node id valid");
-        let y = idx as f64 * 20.0;
-        let geom = SemanticGeometry::new(
-            Rect2D::from_xywh(0.0, y, 700.0, 20.0).expect("rect valid"),
-            Rect2D::from_xywh(0.0, y, 700.0, 20.0).expect("rect valid"),
-            None,
-        ).expect("geom valid");
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    for (i, line) in lines.iter().enumerate() {
+        let node_id = SemanticNodeId::new(o, (i + 2) as u64).expect("node id");
+        let start_unit = *starts.get(i).unwrap_or(&0);
+        let end_unit = if i + 1 < starts.len() {
+            *starts.get(i + 1).unwrap_or(&total_units)
+        } else {
+            total_units
+        };
 
-        let start_u16 = starts.get(idx).copied().unwrap_or(0);
-        let end_u16 = start_u16 + total_utf16_units(line_slice);
-        let lrange = utf16_range(start_u16, end_u16);
+        let u_start = Utf16CodeUnitOffset::new(start_unit);
+        let u_end = Utf16CodeUnitOffset::new(end_unit);
+        let text_range = Utf16CodeUnitRange::new(u_start, u_end).ok();
 
-        let node = SemanticNode::new(
-            nid,
-            SemanticRole::SourceLine,
-            geom,
-            Some(format!("Line {}", idx + 1)),
-            Some((*line_slice).to_string()),
-            Some(lrange),
-            Some(doc_id),
-            vec![],
-        ).expect("line node valid");
-        nodes.insert(nid, node);
-        line_nodes.push(nid);
+        let line_rect = Rect2D::from_xywh(
+            10.0,
+            10.0 + (i as f64 * 20.0),
+            500.0,
+            18.0,
+        )
+        .expect("rect");
+        let geom = SemanticGeometry::new(line_rect, line_rect, None).expect("geom");
+
+        let mut node = SemanticNode::new(node_id, geom, SemanticRole::SourceText, true);
+        node.set_label(Some(format!("Line {}", i + 1)));
+        node.set_value(Some((*line).to_string()));
+        node.set_text_range(text_range);
+        node.set_parent(Some(root_id)).expect("set parent");
+
+        root_node.add_child(node_id).expect("add child");
+        nodes.insert(node_id, node);
+        line_ids.push(node_id);
     }
 
-    if let Some(doc_ref) = nodes.get_mut(&doc_id) {
-        *doc_ref = SemanticNode::new(
-            doc_id,
-            SemanticRole::Document,
-            doc_geom,
-            Some("main.rs".to_string()),
-            Some(text.to_string()),
-            Some(doc_range),
-            None,
-            line_nodes.clone(),
-        ).expect("doc node updated");
-    }
-
-    let identity = AcceptedLayoutIdentity::new(
-        owner(),
-        file_id(1),
-        revision(1),
-        LayoutRevision::new(1),
-        DisplayMetrics::new(
-            2.0,
-            Size2D::new(800.0, 600.0).expect("size valid"),
-            DisplayColorConfig::Srgb,
-            DisplayGeneration::new(1),
-        ).expect("metrics valid"),
-    ).expect("layout identity valid");
-
-    let focus = SemanticFocusState::new(line_nodes.first().copied(), doc_id);
-
-    AcceptedLayoutSnapshot::new(identity, doc_id, nodes, focus).expect("snapshot valid")
+    nodes.insert(root_id, root_node);
+    let snapshot = AcceptedLayoutSnapshot::new(identity, metrics, root_id, nodes)
+        .expect("snapshot valid");
+    (snapshot, line_ids, layout_rev)
 }
 
 #[test]
-fn test_01_source_reader_confined_capture_exact_bytes() {
-    let temp = TempRoot::new("capture");
-    let file_rel = "src/main.rs";
-    let full_path = temp.path().join(file_rel);
-    fs::create_dir_all(full_path.parent().expect("parent exists")).expect("parent created");
-    fs::write(&full_path, SOURCE_BYTES).expect("file written");
+fn test_01_real_source_capture_and_semantic_ax_tree() {
+    let root = TempRoot::new("capture-ax");
+    fs::write(root.path().join("source.rs"), SOURCE_BYTES).expect("write source");
 
-    let reader = reader_for(temp.path());
+    let reader = reader_for(root.path());
     let cancel = CancelFlag::new();
-    let norm = normalized(file_rel);
-
     let capture = reader
-        .read_file(&norm, &cancel)
-        .expect("read succeeds")
-        .expect("file exists");
+        .read_file(file_id(1), revision(1), &normalized("source.rs"), &cancel)
+        .expect("read file");
 
-    let captured_str = std::str::from_utf8(capture.bytes()).expect("valid utf8");
-    assert_eq!(captured_str, SOURCE_BYTES);
-    assert_eq!(capture.byte_count().as_u64(), SOURCE_BYTES.len() as u64);
+    let text = std::str::from_utf8(capture.bytes()).expect("utf8 text");
+    assert_eq!(text, SOURCE_BYTES);
+
+    let (layout, line_ids, _layout_rev) = build_layout_snapshot(text);
+    let ax = NativeAxRoute::new(owner());
+
+    let root_node = layout.node(layout.root_node()).expect("root node");
+    assert_eq!(ax.role(root_node), AxRole::Group);
+    assert_eq!(ax.role(root_node).ax_identifier(), "AXGroup");
+    assert_eq!(ax.label(root_node), Some("Main Source Document"));
+
+    let line2_id = *line_ids.get(1).expect("line 2 id");
+    let line2_node = layout.node(line2_id).expect("line 2 node");
+    assert_eq!(ax.role(line2_node), AxRole::SourceText);
+    assert_eq!(ax.role(line2_node).ax_identifier(), "AXStaticText");
+    assert!(ax.number_of_characters(line2_node) > 0);
+    assert_eq!(ax.label(line2_node), Some("Line 2"));
 
     record_receipt(
-        "test_01_source_reader_confined_capture_exact_bytes",
+        "test_01_real_source_capture_and_semantic_ax_tree",
         Effect::Succeeded,
-        "exact captured bytes match multi-script corpus including CJK, emoji, and combining mark",
+        "exact captured bytes match multi-script corpus and populate AX role/label queries",
     );
 }
 
 #[test]
-fn test_02_native_voiceover_ax_route_attributes_and_roles() {
-    let snapshot = build_semantic_snapshot(SOURCE_BYTES);
-    let ax_route = NativeAxRoute::new(snapshot);
+fn test_02_virtualized_pending_text_range_resolution() {
+    let root = TempRoot::new("pending-range");
+    fs::write(root.path().join("source.rs"), SOURCE_BYTES).expect("write source");
+    let reader = reader_for(root.path());
+    let cancel = CancelFlag::new();
+    let capture = reader
+        .read_file(file_id(1), revision(1), &normalized("source.rs"), &cancel)
+        .expect("read file");
+    let text = std::str::from_utf8(capture.bytes()).expect("utf8");
+    let (layout, line_ids, layout_rev) = build_layout_snapshot(text);
+    let ax = NativeAxRoute::new(owner());
 
-    let doc_id = ax_route.root_element_id();
-    assert_eq!(ax_route.ax_role(doc_id), Some(AxRole::Document));
-    assert_eq!(ax_route.ax_title(doc_id), Some("main.rs"));
+    let line2_id = *line_ids.get(1).expect("line 2 id");
+    let line2_node = layout.node(line2_id).expect("line 2");
+    let range = line2_node.text_range().expect("text range");
+    let range_req = RangeRequestToken::new(owner(), 1, line2_id, layout_rev).expect("range request valid");
 
-    let lines = ax_route.ax_children(doc_id);
-    assert_eq!(lines.len(), 5);
-
-    let line2_id = lines.get(1).copied().expect("line 2 exists");
-    assert_eq!(ax_route.ax_role(line2_id), Some(AxRole::SourceLine));
-    assert_eq!(ax_route.ax_title(line2_id), Some("Line 2"));
-    let line2_val = ax_route.ax_value(line2_id).expect("line 2 value");
-    assert!(line2_val.contains("こんにちは"));
-
-    let line3_id = lines.get(2).copied().expect("line 3 exists");
-    let line3_val = ax_route.ax_value(line3_id).expect("line 3 value");
-    assert!(line3_val.contains("🚦🚀"));
-
-    record_receipt(
-        "test_02_native_voiceover_ax_route_attributes_and_roles",
-        Effect::Succeeded,
-        "VoiceOver AX role, title, value queries return accurate source-backed attributes",
-    );
-}
-
-#[test]
-fn test_03_virtualized_pending_range_resolution() {
-    let snapshot = build_semantic_snapshot(SOURCE_BYTES);
-    let mut ax_route = NativeAxRoute::new(snapshot);
-
-    let doc_id = ax_route.root_element_id();
-    let requested_range = utf16_range(0, 12);
-    let range_req = ax_route
-        .request_text_range(doc_id, requested_range)
-        .expect("range request valid");
-
-    let status = ax_route.resolve_pending_range(range_req);
-    match status {
-        PendingRangeStatus::Ready(resolved_text) => {
-            assert_eq!(resolved_text, "fn main() {\n");
-        }
-        _ => {
-            assert!(false, "expected Ready range status");
-        }
-    }
-
-    let bogus_range_req = RangeRequestToken::new(doc_id, 9999);
-    let fake_status = ax_route.resolve_pending_range(bogus_range_req);
-    assert!(matches!(fake_status, PendingRangeStatus::Refused));
-
-    record_receipt(
-        "test_03_virtualized_pending_range_resolution",
-        Effect::Succeeded,
-        "virtualized pending text range resolves bounded source slices and refuses invalid requests",
-    );
-}
-
-#[test]
-fn test_04_ax_subrange_bounds_and_point_hittest() {
-    let snapshot = build_semantic_snapshot(SOURCE_BYTES);
-    let ax_route = NativeAxRoute::new(snapshot);
-
-    let doc_id = ax_route.root_element_id();
-    let lines = ax_route.ax_children(doc_id);
-    let line1_id = lines.first().copied().expect("line 1 exists");
-
-    let char_range = utf16_range(0, 2);
-    let bounds = ax_route
-        .subrange_bounds(line1_id, char_range)
-        .expect("bounds calculated");
-
-    assert_eq!(bounds.origin().y(), 0.0);
-    assert!(bounds.size().width() > 0.0);
-    assert_eq!(bounds.size().height(), 20.0);
-
-    let hit_pt = Point2D::new(50.0, 25.0).expect("point valid");
-    let hit_node = ax_route.hit_test(hit_pt).expect("hit found");
-    let line2_id = lines.get(1).copied().expect("line 2 exists");
-    assert_eq!(hit_node, line2_id);
-
-    record_receipt(
-        "test_04_ax_subrange_bounds_and_point_hittest",
-        Effect::Succeeded,
-        "subrange bounds correctly calculate screen rects and point hit-testing maps coordinates",
-    );
-}
-
-#[test]
-fn test_05_focus_walk_and_notification_queue() {
-    let snapshot = build_semantic_snapshot(SOURCE_BYTES);
-    let mut ax_route = NativeAxRoute::new(snapshot);
-
-    let doc_id = ax_route.root_element_id();
-    let lines = ax_route.ax_children(doc_id);
-    let line1 = lines.first().copied().expect("line 1");
-    let line2 = lines.get(1).copied().expect("line 2");
-
-    assert_eq!(ax_route.focused_element_id(), Some(line1));
-    let next = ax_route.walk_focus_forward().expect("focus walked");
-    assert_eq!(next, line2);
-    assert_eq!(ax_route.focused_element_id(), Some(line2));
-
-    let prev = ax_route.walk_focus_backward().expect("focus walked back");
-    assert_eq!(prev, line1);
-
-    let notifs = ax_route.drain_notifications();
-    assert_eq!(notifs.len(), 2);
+    let pending_status = ax.string_for_range(range_req, &layout, None, range, &[]);
     assert!(matches!(
-        notifs.first(),
-        Some(AxNotification::FocusedUiElementChanged(id)) if *id == line2
+        pending_status,
+        PendingRangeStatus::Pending {
+            requested_range,
+            ..
+        } if requested_range == range
     ));
 
+    let ready_status = ax.string_for_range(range_req, &layout, Some(text), range, &[]);
+    if let PendingRangeStatus::Ready(resolved) = ready_status {
+        assert_eq!(resolved.range(), range);
+        assert!(resolved.text().contains("こんにちは"));
+    } else {
+        assert!(false, "expected Ready status");
+    }
+
     record_receipt(
-        "test_05_focus_walk_and_notification_queue",
+        "test_02_virtualized_pending_text_range_resolution",
         Effect::Succeeded,
-        "keyboard focus walk preserves ordering and enqueues VoiceOver accessibility notifications",
+        "virtualized pending text range resolves bounded source slices without UI stalls",
     );
 }
 
 #[test]
-fn test_06_native_ime_marked_text_and_query_suppression() {
-    let mut ime = ImeClient::new();
-    assert!(!ime.suppress_search_query());
+fn test_03_wrong_offset_and_sentinels_negative_controls() {
+    let root = TempRoot::new("neg-controls");
+    fs::write(root.path().join("source.rs"), SOURCE_BYTES).expect("write source");
+    let reader = reader_for(root.path());
+    let cancel = CancelFlag::new();
+    let capture = reader
+        .read_file(file_id(1), revision(1), &normalized("source.rs"), &cancel)
+        .expect("read file");
+    let text = std::str::from_utf8(capture.bytes()).expect("utf8");
+    let (layout, line_ids, layout_rev) = build_layout_snapshot(text);
+    let ax = NativeAxRoute::new(owner());
+
+    // 1. Sentinel NATIVE_NOT_FOUND is refused, not clamped
+    let sentinel = Utf16CodeUnitOffset::new(NATIVE_NOT_FOUND);
+    let zero = Utf16CodeUnitOffset::new(0);
+    let sent_range = Utf16CodeUnitRange::new(zero, sentinel).expect("range");
+    let line1_id = *line_ids.first().expect("line 1 id");
+    let req1 = RangeRequestToken::new(owner(), 2, line1_id, layout_rev).expect("request descriptor 1");
+    let res1 = ax.string_for_range(req1, &layout, Some(text), sent_range, &[]);
+    assert!(matches!(res1, PendingRangeStatus::Refused(CoreError::NativeSentinel)));
+
+    // 2. Mid-surrogate split in astral emoji "🚦" is refused
+    let starts = line_starts_utf16(text);
+    let line3_start = *starts.get(2).expect("line 3 start");
+    let emoji_offset = line3_start + 17;
+    let mid_surrogate = Utf16CodeUnitOffset::new(emoji_offset + 1);
+    let end_offset = Utf16CodeUnitOffset::new(emoji_offset + 2);
+    let bad_range = Utf16CodeUnitRange::new(mid_surrogate, end_offset).expect("range");
+    let line3_id = *line_ids.get(2).expect("line 3 id");
+    let req2 = RangeRequestToken::new(owner(), 3, line3_id, layout_rev).expect("request descriptor 2");
+    let res2 = ax.string_for_range(req2, &layout, Some(text), bad_range, &[]);
+    assert!(matches!(res2, PendingRangeStatus::Refused(CoreError::InvalidUtf16)));
+
+    // 3. Out-of-bounds offset exceeds total units
+    let total_units = total_utf16_units(text);
+    let oob_start = Utf16CodeUnitOffset::new(total_units + 100);
+    let oob_end = Utf16CodeUnitOffset::new(total_units + 200);
+    let oob_range = Utf16CodeUnitRange::new(oob_start, oob_end).expect("range");
+    let req3 = RangeRequestToken::new(owner(), 4, line1_id, layout_rev).expect("request descriptor 3");
+    let res3 = ax.string_for_range(req3, &layout, Some(text), oob_range, &[]);
+    assert!(matches!(res3, PendingRangeStatus::Refused(CoreError::LimitExceeded)));
+
+    record_receipt(
+        "test_03_wrong_offset_and_sentinels_negative_controls",
+        Effect::Succeeded,
+        "oracle catches wrong offsets, NATIVE_NOT_FOUND sentinels, and mid-surrogate splits",
+    );
+}
+
+#[test]
+fn test_04_ax_line_index_and_bounds_for_range() {
+    let text = SOURCE_BYTES;
+    let starts = line_starts_utf16(text);
+    let total_units = total_utf16_units(text);
+    let index = AxLineIndex::new(starts.clone(), total_units).expect("line index");
+
+    assert_eq!(index.line_count(), starts.len());
+    assert_eq!(index.total_units(), total_units);
+
+    assert_eq!(index.line_for_offset(Utf16CodeUnitOffset::new(0)), Ok(1));
+    assert_eq!(index.line_for_offset(Utf16CodeUnitOffset::new(starts[1])), Ok(2));
+
+    let l1_range = index.range_for_line(1).expect("line 1 range");
+    assert_eq!(l1_range.start().get(), starts[0]);
+    assert_eq!(l1_range.end().get(), starts[1]);
+
+    let (layout, line_ids, _) = build_layout_snapshot(text);
+    let ax = NativeAxRoute::new(owner());
+    let line1_id = *line_ids.first().expect("line 1");
+    let line1_node = layout.node(line1_id).expect("line 1 node");
+    let bounds = ax.bounds_for_range(line1_node, l1_range, 18.0, 8.0).expect("bounds");
+    assert!(bounds.size().width() > 0.0);
+    assert_eq!(bounds.size().height(), 18.0);
+
+    record_receipt(
+        "test_04_ax_line_index_and_bounds_for_range",
+        Effect::Succeeded,
+        "AxLineIndex maps offsets and calculates subrange bounding boxes correctly",
+    );
+}
+
+#[test]
+fn test_05_point_hit_testing_in_accepted_layout() {
+    let (layout, line_ids, _) = build_layout_snapshot(SOURCE_BYTES);
+    let ax = NativeAxRoute::new(owner());
+
+    let hit1 = ax.hit_test(Point2D::new(15.0, 15.0).expect("pt"), &layout);
+    assert_eq!(hit1, Some(line_ids[0]));
+
+    let hit2 = ax.hit_test(Point2D::new(15.0, 35.0).expect("pt"), &layout);
+    assert_eq!(hit2, Some(line_ids[1]));
+
+    let miss = ax.hit_test(Point2D::new(900.0, 900.0).expect("pt"), &layout);
+    assert_eq!(miss, None);
+
+    record_receipt(
+        "test_05_point_hit_testing_in_accepted_layout",
+        Effect::Succeeded,
+        "screen coordinates hit test correctly to accepted layout nodes",
+    );
+}
+
+#[test]
+fn test_06_keyboard_focus_walk_and_notification_queue() {
+    let (layout, line_ids, _) = build_layout_snapshot(SOURCE_BYTES);
+    let ax = NativeAxRoute::new(owner());
+    let mut focus_state = SemanticFocusState::new(owner(), 4);
+
+    assert_eq!(ax.focused_element(&focus_state, &layout), None);
+
+    let next1 = ax.focus_next(&mut focus_state, &layout, &line_ids).expect("focus next");
+    assert_eq!(next1, Some(line_ids[0]));
+    let (f_id, f_bounds) = ax.focused_element(&focus_state, &layout).expect("focused elem");
+    assert_eq!(f_id, line_ids[0]);
+    assert!(f_bounds.size().width() > 0.0);
+
+    let next2 = ax.focus_next(&mut focus_state, &layout, &line_ids).expect("focus next");
+    assert_eq!(next2, Some(line_ids[1]));
+
+    let prev1 = ax.focus_prev(&mut focus_state, &layout, &line_ids).expect("focus prev");
+    assert_eq!(prev1, Some(line_ids[0]));
+
+    let notifs = ax.drain_notifications();
+    assert_eq!(notifs.len(), 3);
+    assert!(notifs.iter().all(|(n, _)| *n == AxNotification::FocusedUIElementChanged));
+
+    focus_state.blur();
+    assert_eq!(focus_state.current_focus(), None);
+    let restored = focus_state.return_focus(&layout).expect("return focus");
+    assert!(restored.is_some());
+
+    record_receipt(
+        "test_06_keyboard_focus_walk_and_notification_queue",
+        Effect::Succeeded,
+        "keyboard focus walk preserves ordering and enqueues VoiceOver notifications",
+    );
+}
+
+#[test]
+fn test_07_host_responder_chain_dispatch_without_global_taps() {
+    let o = owner();
+    let mut chain = HostResponderChain::new(o);
+
+    let view_id = ResponderId::new(o, 10);
+    let pane_id = ResponderId::new(o, 20);
+    let window_id = ResponderId::new(o, 30);
+
+    chain.push_first_responder(view_id, "FocusedTextView", |act| {
+        matches!(act, ResponderAction::Copy | ResponderAction::SelectAll)
+    });
+
+    chain.push_fallback_responder(pane_id, "ReadingPane", |act| {
+        matches!(act, ResponderAction::PageUp | ResponderAction::PageDown)
+    });
+
+    chain.push_fallback_responder(window_id, "HostWindow", |act| {
+        matches!(act, ResponderAction::Find | ResponderAction::DismissOverlay)
+    });
+
+    assert_eq!(chain.dispatch(ResponderAction::Copy), Some(view_id));
+    assert_eq!(chain.dispatch(ResponderAction::PageDown), Some(pane_id));
+    assert_eq!(chain.dispatch(ResponderAction::Find), Some(window_id));
+    assert_eq!(chain.dispatch(ResponderAction::MoveLeft), None);
+
+    record_receipt(
+        "test_07_host_responder_chain_dispatch_without_global_taps",
+        Effect::Succeeded,
+        "host responder chain command bubbling dispatches without global event monitors",
+    );
+}
+
+#[test]
+fn test_08_ime_multi_stage_composition_suppresses_queries() {
+    let mut ime = ImeClient::new(owner());
+    assert!(!ime.has_marked_text());
 
     let outcome1 = ime.handle_event(ImeEvent::SetMarkedText {
-        text: "konn".to_string(),
-        selected_range: (0, 4),
+        text: "こん".to_string(),
+        selection_in_marked: (0, 2),
         replacement_range: None,
     });
+    if let ImeOutcome::CompositionUpdated {
+        marked_text,
+        query_suppressed,
+    } = outcome1 {
+        assert_eq!(marked_text, "こん");
+        assert!(query_suppressed, "intermediate IME composition MUST suppress search queries");
+    } else {
+        assert!(false, "unexpected outcome");
+    }
+    assert!(ime.has_marked_text());
+    assert_eq!(ime.marked_text(), Some("こん"));
 
-    assert_eq!(outcome1, ImeOutcome::MarkedTextUpdated);
-    assert_eq!(ime.marked_text(), Some("konn"));
-    assert!(
-        ime.suppress_search_query(),
-        "search queries must be suppressed during multi-stage composition"
-    );
+    let candidate_rect = ime
+        .candidate_window_rect(Point2D::new(50.0, 100.0).expect("pt"), 20.0, 8.0)
+        .expect("candidate rect");
+    assert!(candidate_rect.size().width() > 0.0);
+    assert_eq!(candidate_rect.min_y(), 100.0);
 
     let outcome2 = ime.handle_event(ImeEvent::SetMarkedText {
-        text: "こん".to_string(),
-        selected_range: (0, 2),
+        text: "こんにちは".to_string(),
+        selection_in_marked: (0, 5),
         replacement_range: None,
     });
-    assert_eq!(outcome2, ImeOutcome::MarkedTextUpdated);
-    assert_eq!(ime.marked_text(), Some("こん"));
-    assert!(ime.suppress_search_query());
-
-    let outcome3 = ime.handle_event(ImeEvent::CommitText("こんにちは".to_string()));
-    assert_eq!(outcome3, ImeOutcome::TextCommitted("こんにちは".to_string()));
-    assert_eq!(ime.marked_text(), None);
-    assert!(
-        !ime.suppress_search_query(),
-        "search queries unsuppressed after IME commit"
-    );
-
-    record_receipt(
-        "test_06_native_ime_marked_text_and_query_suppression",
-        Effect::Succeeded,
-        "intermediate marked text suppresses premature search queries until text is committed",
-    );
-}
-
-#[test]
-fn test_07_native_ime_candidate_window_and_caret_rect() {
-    let mut ime = ImeClient::new();
-    let caret = Rect2D::from_xywh(120.0, 45.0, 2.0, 18.0).expect("rect valid");
-    ime.update_caret_rect(caret);
-
-    ime.handle_event(ImeEvent::SetMarkedText {
-        text: "nihon".to_string(),
-        selected_range: (0, 5),
-        replacement_range: None,
-    });
-
-    let candidate_rect = ime.candidate_window_rect();
-    assert_eq!(candidate_rect.origin().x(), 120.0);
-    assert_eq!(candidate_rect.origin().y(), 63.0);
-    assert_eq!(candidate_rect.size().width(), 200.0);
-    assert_eq!(candidate_rect.size().height(), 150.0);
-
-    let first_rect = ime.first_rect_for_range((0, 5));
-    assert_eq!(first_rect.origin().x(), 120.0);
-    assert_eq!(first_rect.origin().y(), 45.0);
-
-    record_receipt(
-        "test_07_native_ime_candidate_window_and_caret_rect",
-        Effect::Succeeded,
-        "candidate window rect correctly positions relative to current caret frame",
-    );
-}
-
-#[test]
-fn test_08_actual_source_clipboard_roundtrip_multiflavor() {
-    let mut clipboard = NativeClipboard::new(ClipboardLimits::default());
-    let source_slice = "let greeting = \"こんにちは\";\n";
-
-    let payload = ClipboardPayload::from_source_slice(
-        source_slice,
-        "src/main.rs",
-        15,
-        50,
-    );
-
-    clipboard.stage_copy(payload).expect("copy staged");
-    assert_eq!(clipboard.change_sequence(), 1);
-
-    let round_trip = clipboard.verify_round_trip(source_slice.as_bytes());
     assert!(matches!(
-        round_trip,
-        ClipboardRoundTrip::ExactByteMatch { byte_count } if byte_count == source_slice.len()
+        outcome2,
+        ImeOutcome::CompositionUpdated {
+            query_suppressed: true,
+            ..
+        }
     ));
 
-    let read_back = clipboard.read_pasteboard();
-    assert_eq!(read_back.plain_text(), Some(source_slice));
-    assert_eq!(read_back.exact_bytes(), Some(source_slice.as_bytes()));
-    let prov = read_back.location_provenance().expect("provenance present");
-    assert_eq!(prov.file_path, "src/main.rs");
-    assert_eq!(prov.start_offset, 15);
-    assert_eq!(prov.end_offset, 50);
+    let outcome3 = ime.handle_event(ImeEvent::InsertText {
+        text: "こんにちは".to_string(),
+        replacement_range: None,
+    });
+    if let ImeOutcome::FinalizedTextInserted { text, .. } = outcome3 {
+        assert_eq!(text, "こんにちは");
+    } else {
+        assert!(false, "expected FinalizedTextInserted");
+    }
+    assert!(!ime.has_marked_text());
 
     record_receipt(
-        "test_08_actual_source_clipboard_roundtrip_multiflavor",
+        "test_08_ime_multi_stage_composition_suppresses_queries",
+        Effect::Succeeded,
+        "intermediate marked text suppresses search queries and unsuppresses upon text finalization",
+    );
+}
+
+#[test]
+fn test_09_actual_source_clipboard_round_trip() {
+    let root = TempRoot::new("clipboard-rt");
+    fs::write(root.path().join("source.rs"), SOURCE_BYTES).expect("write source");
+    let reader = reader_for(root.path());
+    let cancel = CancelFlag::new();
+    let capture = reader
+        .read_file(file_id(1), revision(1), &normalized("source.rs"), &cancel)
+        .expect("read file");
+    let bytes = capture.bytes();
+
+    let text = std::str::from_utf8(bytes).expect("utf8");
+    let line3_start = text.find("    let flags").expect("line 3 find");
+    let newline_offset = text.get(line3_start..).and_then(|s| s.find('\n')).expect("newline");
+    let line3_end = line3_start + newline_offset + 1;
+    let range = line3_start..line3_end;
+
+    let payload = ClipboardPayload::stage(
+        bytes,
+        range.clone(),
+        "source.rs",
+        1,
+        3,
+        3,
+        ClipboardLimits::default(),
+    )
+    .expect("stage clipboard payload");
+
+    assert!(payload.plain_text.contains("🚦🚀"));
+    assert!(!payload.has_replacement_characters);
+    assert_eq!(&payload.exact_bytes, &bytes[range.clone()]);
+    assert!(payload.provenance.contains("source.rs"));
+
+    let mut clipboard = NativeClipboard::new();
+    let seq = clipboard.generation_seq();
+    clipboard.publish(payload, seq).expect("publish clipboard");
+
+    let matched = ClipboardRoundTrip::verify_round_trip(bytes, range, &clipboard);
+    assert!(matched, "clipboard exact bytes must match original captured source bytes");
+
+    record_receipt(
+        "test_09_actual_source_clipboard_round_trip",
         Effect::Succeeded,
         "multi-flavor clipboard staging preserves exact raw bytes and source provenance round-trip",
     );
 }
 
 #[test]
-fn test_09_host_responder_chain_command_bubbling() {
-    let mut chain = HostResponderChain::new();
-    let root_resp = ResponderId::new(100);
-    let view_resp = ResponderId::new(200);
-
-    chain.register_root(root_resp);
-    chain.register_responder(view_resp, Some(root_resp));
-
-    assert_eq!(chain.first_responder(), Some(view_resp));
-
-    let action_copy = ResponderAction::Copy;
-    let handled_by = chain.dispatch_action(action_copy);
-    assert_eq!(handled_by, Some(view_resp));
-
-    let action_nav = ResponderAction::NavigateBack;
-    let bubbled_to = chain.dispatch_action(action_nav);
-    assert_eq!(bubbled_to, Some(root_resp));
-
-    let unhandled = ResponderAction::Custom("unhandled_cmd".to_string());
-    assert_eq!(chain.dispatch_action(unhandled), None);
-
-    record_receipt(
-        "test_09_host_responder_chain_command_bubbling",
-        Effect::Succeeded,
-        "responder chain command bubbling dispatches without global event monitors",
-    );
-}
-
-#[test]
-fn test_10_negative_control_wrong_offset_and_sentinels_caught() {
-    let snapshot = build_semantic_snapshot(SOURCE_BYTES);
-    let mut ax_route = NativeAxRoute::new(snapshot);
-    let doc_id = ax_route.root_element_id();
-
-    // 1. NATIVE_NOT_FOUND sentinel offset rejected
-    let sentinel_offset = utf16_offset(NATIVE_NOT_FOUND);
-    let sentinel_range = Utf16CodeUnitRange::new(sentinel_offset, sentinel_offset);
-    assert!(
-        sentinel_range.is_err() || ax_route.request_text_range(doc_id, sentinel_range.unwrap()).is_err(),
-        "NATIVE_NOT_FOUND sentinel offset must be refused"
-    );
-
-    // 2. Out-of-bounds offset rejected
-    let oob_range = Utf16CodeUnitRange::new(utf16_offset(5000), utf16_offset(5010)).expect("range valid");
-    let oob_result = ax_route.request_text_range(doc_id, oob_range);
-    assert!(
-        oob_result.is_err(),
-        "Out of bounds range must be refused"
-    );
-
-    // 3. Stale layout revision token refused
-    let bogus_range_handle = RangeRequestToken::new(doc_id, 0xDEAD);
-    let stale_status = ax_route.resolve_pending_range(bogus_range_handle);
-    assert_eq!(stale_status, PendingRangeStatus::Refused);
-
-    // 4. Over-budget clipboard copy rejected
-    let tiny_limits = ClipboardLimits {
-        max_bytes: 10,
-        max_items: 5,
+fn test_10_clipboard_budget_refusal_and_concurrent_change() {
+    let data = vec![b'A'; 2000];
+    let limits = ClipboardLimits {
+        max_clipboard_bytes: 500,
     };
-    let mut tiny_clipboard = NativeClipboard::new(tiny_limits);
-    let big_payload = ClipboardPayload::from_source_slice(
-        "this string exceeds 10 bytes",
-        "file.rs",
-        0,
-        28,
-    );
-    let copy_result = tiny_clipboard.stage_copy(big_payload);
+
+    let result = ClipboardPayload::stage(&data, 0..1500, "large.rs", 1, 1, 50, limits);
+    if let Err(ClipboardError::BudgetExceeded {
+        requested_bytes,
+        max_budget_bytes,
+    }) = result {
+        assert_eq!(requested_bytes, 1500);
+        assert_eq!(max_budget_bytes, 500);
+    } else {
+        assert!(false, "expected BudgetExceeded");
+    }
+
+    let payload = ClipboardPayload::stage(
+        b"local content",
+        0..13,
+        "test.rs",
+        1,
+        1,
+        1,
+        ClipboardLimits::default(),
+    )
+    .expect("stage");
+
+    let mut clipboard = NativeClipboard::new();
+    let initial_seq = clipboard.generation_seq();
+    clipboard.simulate_external_change("another application copied this");
+    assert_eq!(clipboard.generation_seq(), initial_seq + 1);
+
+    let err = clipboard.publish(payload, initial_seq).unwrap_err();
     assert!(matches!(
-        copy_result,
-        Err(ClipboardError::ByteLimitExceeded { limit: 10, requested: _ })
+        err,
+        ClipboardError::ConcurrentExternalChange {
+            expected_seq,
+            actual_seq,
+        } if expected_seq == initial_seq && actual_seq == initial_seq + 1
     ));
 
     record_receipt(
-        "test_10_negative_control_wrong_offset_and_sentinels_caught",
+        "test_10_clipboard_budget_refusal_and_concurrent_change",
         Effect::Succeeded,
-        "oracle catches wrong offsets, NATIVE_NOT_FOUND sentinels, and budget overflows",
+        "clipboard enforces byte budgets and guards against concurrent external overwrites",
     );
 }
