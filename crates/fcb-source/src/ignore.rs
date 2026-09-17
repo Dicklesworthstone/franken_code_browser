@@ -6,8 +6,11 @@
 //! Exclusion is classification, never deletion. An ignored path remains an
 //! observed namespace entry so user annotations and deliberate browse
 //! overrides can still name it. Unsupported patterns are retained as reports
-//! rather than guessed.
+//! rather than guessed. [`repository`] adds an explicit bounded file-loading
+//! policy; ordinary matcher construction never performs I/O.
 
+pub mod budget;
+pub mod repository;
 use crate::path::NormalizedPath;
 
 /// Why a pattern could not be compiled into the supported Git-style subset.
@@ -28,67 +31,36 @@ pub struct UnsupportedPattern {
     layer: IgnoreLayerKind,
     reason: UnsupportedReason,
 }
-
 impl UnsupportedPattern {
-    pub fn raw(&self) -> &str {
-        &self.raw
-    }
-
-    pub fn layer(&self) -> IgnoreLayerKind {
-        self.layer
-    }
-
-    pub fn reason(&self) -> UnsupportedReason {
-        self.reason
-    }
+    pub fn raw(&self) -> &str { &self.raw }
+    pub fn layer(&self) -> IgnoreLayerKind { self.layer }
+    pub fn reason(&self) -> UnsupportedReason { self.reason }
 }
 
 /// Origin of one compiled rule or unsupported report.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IgnoreLayerKind {
-    /// Built-in product defaults (source-control DBs, caches, build outputs).
     DefaultPolicy,
-    /// A nested `.gitignore` / `.fcbignore` relative to the scan root.
     RuleFile,
-    /// An explicit host/application scope rule.
     Scope,
 }
-
 /// Why a path was classified as excluded.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExclusionCause {
-    DefaultPolicy,
-    RuleFile,
-    Scope,
-}
-
+pub enum ExclusionCause { DefaultPolicy, RuleFile, Scope }
 /// Classification of one relative path. Exclusion is not a tombstone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IgnoreDecision {
-    Include,
-    Exclude { cause: ExclusionCause },
-}
-
+pub enum IgnoreDecision { Include, Exclude { cause: ExclusionCause } }
 impl IgnoreDecision {
-    pub const fn is_excluded(self) -> bool {
-        matches!(self, Self::Exclude { .. })
-    }
+    pub const fn is_excluded(self) -> bool { matches!(self, Self::Exclude { .. }) }
 }
 
 #[derive(Clone, Debug)]
 enum SegAtom {
-    Lit(Vec<u8>),
-    Star,
-    Ques,
+    Lit(Vec<u8>), Star, Ques,
     Class { negated: bool, bytes: Vec<u8> },
 }
-
 #[derive(Clone, Debug)]
-enum SegPat {
-    GlobStar,
-    Atoms(Vec<SegAtom>),
-}
-
+enum SegPat { GlobStar, Atoms(Vec<SegAtom>) }
 #[derive(Clone, Debug)]
 struct CompiledPattern {
     #[allow(dead_code)]
@@ -107,189 +79,78 @@ struct CompiledPattern {
 pub struct IgnoreMatcher {
     patterns: Vec<CompiledPattern>,
     unsupported: Vec<UnsupportedPattern>,
-    /// Prefixes the user asked to browse despite default/scope exclusion.
     overrides: Vec<Vec<Vec<u8>>>,
     excluded: u64,
 }
-
 impl IgnoreMatcher {
-    /// Match nothing: every path is included. Existing discovery tests stay
-    /// byte-identical when they construct a walker without ignore policy.
+    /// Match nothing; construction does not load repository policy files.
     pub fn include_all() -> Self {
-        Self {
-            patterns: Vec::new(),
-            unsupported: Vec::new(),
-            overrides: Vec::new(),
-            excluded: 0,
-        }
+        Self { patterns: Vec::new(), unsupported: Vec::new(), overrides: Vec::new(), excluded: 0 }
     }
-
-    /// Product defaults from plan §8.2: source-control object DBs, dependency
-    /// caches, common build outputs, and selected binary analysis payloads.
+    /// Product defaults from plan §8.2.
     pub fn product_defaults() -> Self {
-        let mut matcher = Self::include_all();
-        matcher.push_defaults();
-        matcher
+        let mut matcher = Self::include_all(); matcher.push_defaults(); matcher
     }
-
     fn push_defaults(&mut self) {
         const DEFAULTS: &[&str] = &[
-            ".git/",
-            ".hg/",
-            ".svn/",
-            "node_modules/",
-            "target/",
-            "dist/",
-            "build/",
-            ".venv/",
-            "__pycache__/",
-            "*.pyc",
-            "*.o",
-            "*.a",
-            "*.so",
-            "*.dylib",
-            "*.dll",
-            "*.exe",
-            "*.class",
+            ".git/", ".hg/", ".svn/", "node_modules/", "target/", "dist/", "build/",
+            ".venv/", "__pycache__/", "*.pyc", "*.o", "*.a", "*.so", "*.dylib", "*.dll", "*.exe", "*.class",
         ];
-        for raw in DEFAULTS {
-            self.add_raw(IgnoreLayerKind::DefaultPolicy, &[], raw);
-        }
+        for raw in DEFAULTS { self.add_raw(IgnoreLayerKind::DefaultPolicy, &[], raw); }
     }
-
-    /// Parse one rule file whose patterns are relative to `dir_prefix`.
-    ///
-    /// `dir_prefix` is the directory that contains the rule file, as a
-    /// root-relative [`NormalizedPath`]. `None` means the scan root.
+    /// Patterns are relative to the containing directory; None means the root.
+    /// Both LF and CRLF rule files use the same literal pattern bytes.
     pub fn add_rule_file(&mut self, dir_prefix: Option<&NormalizedPath>, text: &str) {
-        let prefix: Vec<Vec<u8>> = dir_prefix
-            .map(|path| {
-                path.segments()
-                    .iter()
-                    .map(|seg| seg.as_bytes().to_vec())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let prefix: Vec<Vec<u8>> = dir_prefix.map(|path| path.segments().iter()
+            .map(|segment| segment.as_bytes().to_vec()).collect()).unwrap_or_default();
         for line in text.split('\n') {
-            self.add_raw(IgnoreLayerKind::RuleFile, &prefix, line);
+            self.add_raw(IgnoreLayerKind::RuleFile, &prefix, line.strip_suffix('\r').unwrap_or(line));
         }
     }
-
     /// Add one extra application/host scope rule relative to the scan root.
-    pub fn add_scope_rule(&mut self, raw: &str) {
-        self.add_raw(IgnoreLayerKind::Scope, &[], raw);
-    }
-
-    /// Permit deliberate browsing of an excluded path and its descendants.
-    /// Default-policy and scope exclusions are overridden; nested rule-file
-    /// patterns still apply so a browsed `node_modules` can ignore its own
-    /// contents via a nested file.
+    pub fn add_scope_rule(&mut self, raw: &str) { self.add_raw(IgnoreLayerKind::Scope, &[], raw); }
+    /// Override default/scope exclusions, but still honor nested rule files.
     pub fn override_browse(&mut self, path: &NormalizedPath) {
-        let segs: Vec<Vec<u8>> = path
-            .segments()
-            .iter()
-            .map(|seg| seg.as_bytes().to_vec())
-            .collect();
-        if !self.overrides.iter().any(|existing| existing == &segs) {
-            self.overrides.push(segs);
-        }
+        let segs: Vec<Vec<u8>> = path.segments().iter().map(|seg| seg.as_bytes().to_vec()).collect();
+        if !self.overrides.iter().any(|existing| existing == &segs) { self.overrides.push(segs); }
     }
-
-    pub fn unsupported(&self) -> &[UnsupportedPattern] {
-        &self.unsupported
-    }
-
-    /// How many [`IgnoreDecision::Exclude`] results this matcher has issued.
-    /// This is a classification count, not a deletion count.
-    pub fn excluded_count(&self) -> u64 {
-        self.excluded
-    }
-
+    pub fn unsupported(&self) -> &[UnsupportedPattern] { &self.unsupported }
+    pub fn excluded_count(&self) -> u64 { self.excluded }
+    /// Compatibility API with iterative matching. Use decide_bounded when a
+    /// consumer needs an explicit work allowance and an unknown-on-limit result.
     pub fn decide(&mut self, path: &NormalizedPath, is_dir: bool) -> IgnoreDecision {
-        let segs: Vec<&[u8]> = path.segments().iter().map(|seg| seg.as_bytes()).collect();
-        let overridden = self.is_overridden(&segs);
-        let mut last: Option<(bool, IgnoreLayerKind)> = None;
-        for pattern in &self.patterns {
-            if overridden
-                && matches!(
-                    pattern.layer,
-                    IgnoreLayerKind::DefaultPolicy | IgnoreLayerKind::Scope
-                )
-            {
-                continue;
-            }
-            if pattern.matches(&segs, is_dir) {
-                last = Some((pattern.negated, pattern.layer));
-            }
-        }
-        match last {
-            Some((false, layer)) => {
-                self.excluded = self.excluded.saturating_add(1);
-                IgnoreDecision::Exclude {
-                    cause: match layer {
-                        IgnoreLayerKind::DefaultPolicy => ExclusionCause::DefaultPolicy,
-                        IgnoreLayerKind::RuleFile => ExclusionCause::RuleFile,
-                        IgnoreLayerKind::Scope => ExclusionCause::Scope,
-                    },
-                }
-            }
-            Some((true, _)) | None => IgnoreDecision::Include,
-        }
+        let decision = self.peek(path, is_dir);
+        if decision.is_excluded() { self.excluded = self.excluded.saturating_add(1); }
+        decision
     }
-
-    /// Non-mutating decision for callers that only need a snapshot. Does not
-    /// increment [`Self::excluded_count`].
+    /// Non-mutating decision; does not increment excluded_count.
     pub fn peek(&self, path: &NormalizedPath, is_dir: bool) -> IgnoreDecision {
         let segs: Vec<&[u8]> = path.segments().iter().map(|seg| seg.as_bytes()).collect();
         let overridden = self.is_overridden(&segs);
-        let mut last: Option<(bool, IgnoreLayerKind)> = None;
+        let mut last = None;
         for pattern in &self.patterns {
-            if overridden
-                && matches!(
-                    pattern.layer,
-                    IgnoreLayerKind::DefaultPolicy | IgnoreLayerKind::Scope
-                )
-            {
-                continue;
-            }
-            if pattern.matches(&segs, is_dir) {
-                last = Some((pattern.negated, pattern.layer));
-            }
+            if overridden && matches!(pattern.layer, IgnoreLayerKind::DefaultPolicy | IgnoreLayerKind::Scope) { continue; }
+            if pattern.matches(&segs, is_dir) { last = Some((pattern.negated, pattern.layer)); }
         }
         match last {
-            Some((false, layer)) => IgnoreDecision::Exclude {
-                cause: match layer {
-                    IgnoreLayerKind::DefaultPolicy => ExclusionCause::DefaultPolicy,
-                    IgnoreLayerKind::RuleFile => ExclusionCause::RuleFile,
-                    IgnoreLayerKind::Scope => ExclusionCause::Scope,
-                },
-            },
-            Some((true, _)) | None => IgnoreDecision::Include,
+            Some((false, layer)) => IgnoreDecision::Exclude { cause: match layer {
+                IgnoreLayerKind::DefaultPolicy => ExclusionCause::DefaultPolicy,
+                IgnoreLayerKind::RuleFile => ExclusionCause::RuleFile,
+                IgnoreLayerKind::Scope => ExclusionCause::Scope,
+            } },
+            _ => IgnoreDecision::Include,
         }
     }
-
     fn is_overridden(&self, segs: &[&[u8]]) -> bool {
-        self.overrides.iter().any(|prefix| {
-            segs.len() >= prefix.len()
-                && segs
-                    .iter()
-                    .zip(prefix.iter())
-                    .all(|(a, b)| *a == b.as_slice())
-        })
+        self.overrides.iter().any(|prefix| segs.len() >= prefix.len()
+            && segs.iter().zip(prefix.iter()).all(|(a, b)| *a == b.as_slice()))
     }
-
     fn add_raw(&mut self, layer: IgnoreLayerKind, prefix: &[Vec<u8>], raw_line: &str) {
         let trimmed = strip_unescaped_trailing_spaces(raw_line);
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            return;
-        }
+        if trimmed.is_empty() || trimmed.starts_with('#') { return; }
         match compile_pattern(layer, prefix, trimmed) {
             Ok(pattern) => self.patterns.push(pattern),
-            Err(reason) => self.unsupported.push(UnsupportedPattern {
-                raw: trimmed.to_string(),
-                layer,
-                reason,
-            }),
+            Err(reason) => self.unsupported.push(UnsupportedPattern { raw: trimmed.to_string(), layer, reason }),
         }
     }
 }
@@ -299,296 +160,105 @@ fn strip_unescaped_trailing_spaces(line: &str) -> &str {
     let mut end = bytes.len();
     while end > 0 && bytes[end - 1] == b' ' {
         let escaped = end >= 2 && bytes[end - 2] == b'\\' && !is_escaped(bytes, end - 2);
-        if escaped {
-            break;
-        }
+        if escaped { break; }
         end -= 1;
     }
-    // SAFETY: end is on a UTF-8 boundary because we only strip ASCII spaces.
-    &line[..end]
+    &line[..end] // Only ASCII spaces removed, so this remains a UTF-8 boundary.
 }
-
 fn is_escaped(bytes: &[u8], index: usize) -> bool {
-    let mut slashes = 0usize;
-    let mut i = index;
-    while i > 0 && bytes[i - 1] == b'\\' {
-        slashes += 1;
-        i -= 1;
-    }
+    let (mut slashes, mut i) = (0usize, index);
+    while i > 0 && bytes[i - 1] == b'\\' { slashes += 1; i -= 1; }
     slashes % 2 == 1
 }
-
-fn compile_pattern(
-    layer: IgnoreLayerKind,
-    prefix: &[Vec<u8>],
-    raw: &str,
-) -> Result<CompiledPattern, UnsupportedReason> {
+fn compile_pattern(layer: IgnoreLayerKind, prefix: &[Vec<u8>], raw: &str)
+    -> Result<CompiledPattern, UnsupportedReason> {
     let mut rest = raw;
-    let negated = if let Some(stripped) = rest.strip_prefix('!') {
-        rest = stripped;
-        true
-    } else {
-        false
-    };
+    let negated = if let Some(stripped) = rest.strip_prefix('!') { rest = stripped; true } else { false };
     let directory_only = rest.ends_with('/');
-    if directory_only {
-        rest = &rest[..rest.len() - 1];
-    }
-    if rest.is_empty() {
-        return Err(UnsupportedReason::EmptyPattern);
-    }
+    if directory_only { rest = &rest[..rest.len() - 1]; }
+    if rest.is_empty() { return Err(UnsupportedReason::EmptyPattern); }
     let rooted = rest.starts_with('/');
-    if rooted {
-        rest = &rest[1..];
-    }
-    if rest.is_empty() {
-        return Err(UnsupportedReason::EmptyPattern);
-    }
-    let has_slash = rest.as_bytes().contains(&b'/');
-    let basename_only = !rooted && !has_slash;
+    if rooted { rest = &rest[1..]; }
+    if rest.is_empty() { return Err(UnsupportedReason::EmptyPattern); }
+    let basename_only = !rooted && !rest.as_bytes().contains(&b'/');
     let segs = compile_segments(rest.as_bytes())?;
-    Ok(CompiledPattern {
-        raw: raw.to_string(),
-        layer,
-        negated,
-        directory_only,
-        basename_only,
-        layer_prefix: prefix.to_vec(),
-        segs,
-    })
+    Ok(CompiledPattern { raw: raw.to_string(), layer, negated, directory_only,
+        basename_only, layer_prefix: prefix.to_vec(), segs })
 }
-
 fn compile_segments(bytes: &[u8]) -> Result<Vec<SegPat>, UnsupportedReason> {
     let mut segs = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'/' {
-            i += 1;
-            continue;
-        }
+        if bytes[i] == b'/' { i += 1; continue; }
         if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
             let at_seg_start = i == 0 || bytes[i - 1] == b'/';
             let at_seg_end = i + 2 == bytes.len() || bytes[i + 2] == b'/';
-            if at_seg_start && at_seg_end {
-                segs.push(SegPat::GlobStar);
-                i += 2;
-                continue;
-            }
+            if at_seg_start && at_seg_end { segs.push(SegPat::GlobStar); i += 2; continue; }
         }
         let (atoms, next) = compile_segment_atoms(bytes, i)?;
-        segs.push(SegPat::Atoms(atoms));
-        i = next;
+        segs.push(SegPat::Atoms(atoms)); i = next;
     }
-    if segs.is_empty() {
-        return Err(UnsupportedReason::EmptyPattern);
-    }
+    if segs.is_empty() { return Err(UnsupportedReason::EmptyPattern); }
     Ok(segs)
 }
-
-fn compile_segment_atoms(
-    bytes: &[u8],
-    start: usize,
-) -> Result<(Vec<SegAtom>, usize), UnsupportedReason> {
+fn compile_segment_atoms(bytes: &[u8], start: usize) -> Result<(Vec<SegAtom>, usize), UnsupportedReason> {
     let mut atoms = Vec::new();
     let mut lit = Vec::new();
     let mut i = start;
     let flush_lit = |lit: &mut Vec<u8>, atoms: &mut Vec<SegAtom>| {
-        if !lit.is_empty() {
-            atoms.push(SegAtom::Lit(std::mem::take(lit)));
-        }
+        if !lit.is_empty() { atoms.push(SegAtom::Lit(std::mem::take(lit))); }
     };
     while i < bytes.len() && bytes[i] != b'/' {
         match bytes[i] {
             b'\\' => {
-                if i + 1 >= bytes.len() {
-                    return Err(UnsupportedReason::DanglingEscape);
-                }
-                lit.push(bytes[i + 1]);
-                i += 2;
+                if i + 1 >= bytes.len() { return Err(UnsupportedReason::DanglingEscape); }
+                lit.push(bytes[i + 1]); i += 2;
             }
             b'*' => {
                 flush_lit(&mut lit, &mut atoms);
-                // Consecutive asterisks inside a segment collapse to one `*`.
-                while i < bytes.len() && bytes[i] == b'*' {
-                    i += 1;
-                }
+                while i < bytes.len() && bytes[i] == b'*' { i += 1; }
                 atoms.push(SegAtom::Star);
             }
-            b'?' => {
-                flush_lit(&mut lit, &mut atoms);
-                atoms.push(SegAtom::Ques);
-                i += 1;
-            }
+            b'?' => { flush_lit(&mut lit, &mut atoms); atoms.push(SegAtom::Ques); i += 1; }
             b'[' => {
                 flush_lit(&mut lit, &mut atoms);
                 let (class, next) = compile_class(bytes, i)?;
-                atoms.push(class);
-                i = next;
+                atoms.push(class); i = next;
             }
-            other => {
-                lit.push(other);
-                i += 1;
-            }
+            other => { lit.push(other); i += 1; }
         }
     }
     flush_lit(&mut lit, &mut atoms);
     Ok((atoms, i))
 }
-
 fn compile_class(bytes: &[u8], start: usize) -> Result<(SegAtom, usize), UnsupportedReason> {
-    // start points at '['
     let mut i = start + 1;
-    if i >= bytes.len() {
-        return Err(UnsupportedReason::UnclosedClass);
-    }
+    if i >= bytes.len() { return Err(UnsupportedReason::UnclosedClass); }
     let negated = bytes[i] == b'!' || bytes[i] == b'^';
-    if negated {
-        i += 1;
-    }
+    if negated { i += 1; }
     let mut class_bytes = Vec::new();
     let mut closed = false;
     while i < bytes.len() && bytes[i] != b'/' {
         if bytes[i] == b'\\' {
-            if i + 1 >= bytes.len() {
-                return Err(UnsupportedReason::DanglingEscape);
-            }
-            class_bytes.push(bytes[i + 1]);
-            i += 2;
-            continue;
+            if i + 1 >= bytes.len() { return Err(UnsupportedReason::DanglingEscape); }
+            class_bytes.push(bytes[i + 1]); i += 2; continue;
         }
-        if bytes[i] == b']' && !class_bytes.is_empty() {
-            closed = true;
-            i += 1;
-            break;
-        }
+        if bytes[i] == b']' && !class_bytes.is_empty() { closed = true; i += 1; break; }
         if i + 2 < bytes.len() && bytes[i + 1] == b'-' && bytes[i + 2] != b']' {
-            let lo = bytes[i];
-            let hi = bytes[i + 2];
+            let (lo, hi) = (bytes[i], bytes[i + 2]);
             let (start_b, end_b) = if lo <= hi { (lo, hi) } else { (hi, lo) };
-            for b in start_b..=end_b {
-                class_bytes.push(b);
-            }
-            i += 3;
-            continue;
+            for b in start_b..=end_b { class_bytes.push(b); }
+            i += 3; continue;
         }
-        class_bytes.push(bytes[i]);
-        i += 1;
+        class_bytes.push(bytes[i]); i += 1;
     }
-    if !closed {
-        return Err(UnsupportedReason::UnclosedClass);
-    }
-    Ok((
-        SegAtom::Class {
-            negated,
-            bytes: class_bytes,
-        },
-        i,
-    ))
+    if !closed { return Err(UnsupportedReason::UnclosedClass); }
+    Ok((SegAtom::Class { negated, bytes: class_bytes }, i))
 }
-
 impl CompiledPattern {
-    fn matches(&self, path_segs: &[&[u8]], is_dir: bool) -> bool {
-        if self.directory_only && !is_dir {
-            return false;
-        }
-        let Some(relative) = strip_prefix(path_segs, &self.layer_prefix) else {
-            return false;
-        };
-        if relative.is_empty() {
-            return false;
-        }
-        if self.basename_only {
-            let last = *relative.last().expect("non-empty relative");
-            return match self.segs.as_slice() {
-                [SegPat::Atoms(atoms)] => match_atoms(atoms, last),
-                [SegPat::GlobStar] => true,
-                _ => false,
-            };
-        }
-        match_segs(&self.segs, relative)
-    }
-}
-
-fn strip_prefix<'a>(path: &'a [&'a [u8]], prefix: &[Vec<u8>]) -> Option<&'a [&'a [u8]]> {
-    if prefix.is_empty() {
-        return Some(path);
-    }
-    if path.len() < prefix.len() {
-        return None;
-    }
-    for (a, b) in path.iter().zip(prefix.iter()) {
-        if *a != b.as_slice() {
-            return None;
-        }
-    }
-    Some(&path[prefix.len()..])
-}
-
-fn match_segs(pat: &[SegPat], path: &[&[u8]]) -> bool {
-    match_segs_at(pat, 0, path, 0)
-}
-
-fn match_segs_at(pat: &[SegPat], pi: usize, path: &[&[u8]], si: usize) -> bool {
-    if pi == pat.len() {
-        return si == path.len();
-    }
-    match &pat[pi] {
-        SegPat::GlobStar => {
-            // `**` matches zero or more segments, including the remainder.
-            for k in si..=path.len() {
-                if match_segs_at(pat, pi + 1, path, k) {
-                    return true;
-                }
-            }
-            false
-        }
-        SegPat::Atoms(atoms) => {
-            if si >= path.len() {
-                return false;
-            }
-            match_atoms(atoms, path[si]) && match_segs_at(pat, pi + 1, path, si + 1)
-        }
-    }
-}
-
-fn match_atoms(atoms: &[SegAtom], seg: &[u8]) -> bool {
-    match_atoms_at(atoms, 0, seg, 0)
-}
-
-fn match_atoms_at(atoms: &[SegAtom], ai: usize, seg: &[u8], si: usize) -> bool {
-    if ai == atoms.len() {
-        return si == seg.len();
-    }
-    match &atoms[ai] {
-        SegAtom::Star => {
-            for k in si..=seg.len() {
-                if match_atoms_at(atoms, ai + 1, seg, k) {
-                    return true;
-                }
-            }
-            false
-        }
-        SegAtom::Ques => {
-            si < seg.len() && match_atoms_at(atoms, ai + 1, seg, si + 1)
-        }
-        SegAtom::Lit(lit) => {
-            let end = si.checked_add(lit.len());
-            match end {
-                Some(end) if end <= seg.len() && &seg[si..end] == lit.as_slice() => {
-                    match_atoms_at(atoms, ai + 1, seg, end)
-                }
-                _ => false,
-            }
-        }
-        SegAtom::Class { negated, bytes } => {
-            if si >= seg.len() {
-                return false;
-            }
-            let hit = bytes.contains(&seg[si]);
-            if *negated == hit {
-                return false;
-            }
-            match_atoms_at(atoms, ai + 1, seg, si + 1)
-        }
+    fn matches(&self, path: &[&[u8]], is_dir: bool) -> bool {
+        // The compatibility interface has no unknown result. Its admitted input
+        // is matched with the same iterative engine, without a practical work cap.
+        budget::pattern_matches(self, path, is_dir, &mut u64::MAX).unwrap_or(false)
     }
 }
