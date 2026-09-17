@@ -7,6 +7,7 @@
 
 pub mod args;
 pub mod output;
+pub mod host;
 mod input;
 mod services;
 mod workspace;
