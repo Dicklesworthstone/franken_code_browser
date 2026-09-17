@@ -41,8 +41,7 @@ pub use file_search::{FileSearch, FileSearchError, FileSearchReport};
 pub use extent_navigation::ExtentActivationError;
 pub use extents::{ExtentConsistency, ExtentError, ExtentReadState, ExtentReadStats,
     ExtentStepBudget, ExtentWindowRequest, FileExtentRead, FileRangeReader,
-    ObservedExtent, ExtentView, ExtentViewError, ExtentViewError as _ExtentViewErrorCompatibility,
-    ExtentText};
+    ObservedExtent, ExtentView, ExtentViewError, ExtentText};
 pub use extent_query::{ExtentMatch, ExtentQuery, ExtentQueryError, ExtentQueryInput,
     ExtentQueryOptions, ExtentQueryState};
 pub use reader::{ReaderError, ReaderIndexProgress, ReaderLimits, ReadingAnchor,
@@ -113,7 +112,7 @@ impl PreparedSearchCapture {
     /// Read the exact original bytes named by a verified hit. Decoded UTF-8
     /// ranges are deliberately not used for slicing UTF-16 or arbitrary bytes.
     pub fn hit_bytes(&self, hit: &SearchMatch) -> Result<&[u8], FcbError> {
-        exact_hit_bytes(&self.source, hit)
+        exact_hit_bytes(self.source(), hit)
     }
 }
 
