@@ -17,6 +17,7 @@
 
 pub mod reader;
 pub mod reading_window;
+pub mod lens;
 pub mod extents;
 pub mod extent_query;
 pub mod extent_navigation;
@@ -53,6 +54,14 @@ pub use extent_query::{ExtentMatch, ExtentQuery, ExtentQueryError, ExtentQueryIn
 pub use reader::{ReaderError, ReaderIndexProgress, ReaderLimits, ReadingAnchor,
     ReadingSeek, ReadingSeekState, ReadingTarget, SourceReader};
 pub use reading_window::{LineEnding, ReadingLine, ReadingSelection, ReadingWindow, ReadingWindowOptions};
+pub use lens::{
+    BracketKind, BracketMatchResult, BracketPairMatch, FindInFileSession, FindMatch,
+    FindOptions, FindStatus, GuideOptions, GutterConfig, IndentGuide, LensModeLabel,
+    LensSelection, LensViewport, LineNavigationResult, SelectionProvenance, SourceReadingLens,
+    VirtualLineRow, WhitespaceKind, WhitespaceMarker, WrapMode,
+    DEFAULT_OVERSCAN_COLUMNS, LENS_HUGE_LINE_BYTE_LIMIT,
+    compute_indent_guides, compute_whitespace_markers, find_matching_bracket,
+};
 
 pub use fcb_search::*;
 pub use fcb_search::paths::{IndexedPath, PathCase, PathEntry, PathIndex, PathIndexLimits,
