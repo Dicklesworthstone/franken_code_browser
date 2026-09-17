@@ -52,22 +52,29 @@ pub enum RenderAbiError {
 
 impl fmt::Display for RenderAbiError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let text = match self {
-            Self::DoublePremultiply => "double premultiply: color is already premultiplied",
-            Self::CoverageAsColor => "coverage mask used as sRGB color",
-            Self::MissingColor => "missing color for compositing",
-            Self::NonFiniteCoordinate => "non-finite coordinate rejected before GPU upload",
-            Self::InvalidScissorBounds => {
-                "scissor bounds must be finite, non-negative, integer-aligned physical pixels"
+        match self {
+            Self::DoublePremultiply => {
+                formatter.write_str("double premultiply: color is already premultiplied")
             }
+            Self::CoverageAsColor => {
+                formatter.write_str("coverage mask used as sRGB color")
+            }
+            Self::MissingColor => formatter.write_str("missing color for compositing"),
+            Self::NonFiniteCoordinate => {
+                formatter.write_str("non-finite coordinate rejected before GPU upload")
+            }
+            Self::InvalidScissorBounds => formatter.write_str(
+                "scissor bounds must be finite, non-negative, integer-aligned physical pixels",
+            ),
             Self::ClipStackOverflow { max } => {
-                return write!(formatter, "clip stack exceeded {max} entries");
+                write!(formatter, "clip stack exceeded {max} entries")
             }
             Self::ClipStackUnderflow => formatter.write_str("clip stack underflow"),
-            Self::ClipEmpty => formatter.write_str("clip rect does not intersect current clip"),
+            Self::ClipEmpty => {
+                formatter.write_str("clip rect does not intersect current clip")
+            }
             Self::DepthOutOfRange => formatter.write_str("depth value outside [0, 1]"),
-        };
-        formatter.write_str(text)
+        }
     }
 }
 
@@ -320,8 +327,9 @@ impl ClipStack {
 }
 
 /// Validate a depth value against the documented [0, 1] range.
-pub const fn validate_depth(depth: f64) -> Result<(), RenderAbiError> {
-    if !(0.0..=1.0).contains(&depth) {
+#[must_use]
+pub fn validate_depth(depth: f64) -> Result<(), RenderAbiError> {
+    if depth.is_nan() || !(0.0..=1.0).contains(&depth) {
         return Err(RenderAbiError::DepthOutOfRange);
     }
     Ok(())
@@ -443,3 +451,5 @@ mod tests {
         assert!(ColorLinearSdr::straight(f32::NAN, 0.0, 0.0, 1.0).is_err());
     }
 }
+
+pub mod display_mapping;
