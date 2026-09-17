@@ -1,18 +1,13 @@
 #![forbid(unsafe_code)]
 
-//! Bounded, ephemeral workspace composition through the existing source and
-//! search engines. No runtime, persistent store, shell, parser or second matcher.
+//! Bounded workspace composition through the existing source/search engines.
+//! `open` remains metadata-only with a named static exclusion policy.
+//! `open_rule_aware` explicitly admits nested repository configuration reads;
+//! unavailable policy makes discovery partial, not a complete negative scope.
 //!
-//! Discovery is metadata-only with an explicitly named static exclusion policy;
-//! nested rule files are NOT loaded. A completed traversal is an observation,
-//! not an atomic filesystem snapshot. Missing metadata/captures and quota stops
-//! prevent workspace completeness. Symlinks/special objects are outside scope.
-//!
-//! Native opening is supplied by the authorized host. A capture callback runs
-//! on a worker, must respect its byte allowance and cancellation, and must not
-//! turn a prefix into a CompleteCapture. Navigation later reads retained bytes,
-//! not the live path. Directory enumeration's path checks are not a sandbox
-//! against hostile concurrent ancestor replacement.
+//! Captures are supplied by the authorized host. Callbacks must respect their
+//! byte allowance and cancellation; no prefix becomes a CompleteCapture. Native
+//! path checks are not race-safe confinement against ancestor replacement.
 
 use std::mem::size_of;
 use fcb_core::{ByteLength, FileId, ResourceAllocationId, ResourceBudget, ResourceLease, SourceRevision};
@@ -20,6 +15,7 @@ use fcb_source::{CancelFlag, CaptureRequest, CompleteCapture, SourceError};
 use fcb_source::confined::SymlinkPolicy;
 use fcb_source::discovery::{BoundedDiscovery, DiscoveryAggregate, DiscoveryKind, DiscoveryLimits};
 use fcb_source::ignore::IgnoreMatcher;
+pub use fcb_source::ignore::repository::{RepositoryRules, RuleLimits, RuleError, RuleStats, RuleDiagnostic, RuleObservation};
 use fcb_source::path::NormalizedPath;
 pub use fcb_source::root::RootGrant;
 use super::{EphemeralIndex, IndexError, IndexLimits, ManifestLimits, MembershipState,
@@ -63,13 +59,14 @@ impl WorkspaceCaptureFailure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum WorkspaceError {
-    Source(SourceError), Index(IndexError), InvalidLimits, OwnerMismatch,
+    Source(SourceError), Index(IndexError), Rules(RuleError), InvalidLimits, OwnerMismatch,
     IdentityExhausted, AllocationFailed, ResourceDenied, Pending, Canceled, DuplicatePath,
 }
 impl std::fmt::Display for WorkspaceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Source(error) => write!(f, "{error}"), Self::Index(error) => write!(f, "{error}"),
+            Self::Rules(error) => write!(f, "{error}"),
             other => f.write_str(match other {
                 Self::InvalidLimits => "WORKSPACE_INVALID_LIMITS", Self::OwnerMismatch => "WORKSPACE_OWNER_MISMATCH",
                 Self::IdentityExhausted => "WORKSPACE_IDENTITY_EXHAUSTED", Self::AllocationFailed => "WORKSPACE_ALLOCATION_FAILED",
@@ -83,12 +80,15 @@ impl std::fmt::Display for WorkspaceError {
 impl std::error::Error for WorkspaceError {}
 impl From<SourceError> for WorkspaceError { fn from(error: SourceError) -> Self { Self::Source(error) } }
 impl From<IndexError> for WorkspaceError { fn from(error: IndexError) -> Self { Self::Index(error) } }
+impl From<RuleError> for WorkspaceError {
+    fn from(error: RuleError) -> Self { match error { RuleError::Source(error) => Self::Source(error), other => Self::Rules(other) } }
+}
 
 #[derive(Debug)]
 pub struct WorkspaceEntry {
     path: NormalizedPath,
     observed_bytes: u64,
-    // A UTF-8 query key, not native authority. Raw identities remain separate.
+    // UTF-8 query key only; native identities remain separate.
     search_key: String,
 }
 impl WorkspaceEntry {
@@ -103,6 +103,8 @@ pub struct WorkspaceCatalog {
     limits: WorkspaceLimits,
     include_excluded: bool,
     discovery: Option<BoundedDiscovery>,
+    repository_rules: Option<RepositoryRules>,
+    policy_key: Option<String>,
     entries: Vec<WorkspaceEntry>,
     stage: WorkspaceStage,
     aggregate: DiscoveryAggregate,
@@ -114,9 +116,8 @@ pub struct WorkspaceCatalog {
     _lease: ResourceLease,
 }
 impl WorkspaceCatalog {
-    /// Caller supplies a fresh manifest identity and a reserved FileId interval.
-    /// IDs are assigned AFTER raw-path sorting; complete scans are independent
-    /// of filesystem enumeration order. IDs are not persisted across scans.
+    /// Metadata-only compatibility route. Caller supplies fresh manifest/file
+    /// identities; final assignment follows raw-path sorting, not enumeration.
     pub fn open(grant: RootGrant, id: SearchManifestId, first_file: FileId,
         limits: WorkspaceLimits, include_excluded: bool,
         budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<Self, WorkspaceError> {
@@ -128,9 +129,6 @@ impl WorkspaceCatalog {
             || limits.max_file_bytes > 1024 * 1024 || limits.max_source_bytes > 512 * 1024 * 1024
             || grant.root_path().len() > 16_384 { return Err(WorkspaceError::InvalidLimits); }
         first_file.get().checked_add(limits.max_files as u64 - 1).ok_or(WorkspaceError::IdentityExhausted)?;
-        // Charge path payload, segment containers/Arc headers, escaped keys,
-        // worst admitted walker queue/page scratch and geometric overlap. This
-        // is deliberately conservative; OS directory internals remain external.
         let charge = limits.max_total_path_bytes.checked_mul(64)
             .and_then(|n| limits.max_files.checked_mul(size_of::<WorkspaceEntry>()).and_then(|m| n.checked_add(m)))
             .and_then(|n| n.checked_add(DISCOVERY_SCRATCH + size_of::<Self>())).ok_or(WorkspaceError::InvalidLimits)?;
@@ -140,9 +138,24 @@ impl WorkspaceCatalog {
         let discovery_limits = DiscoveryLimits::new(1, 32, MAX_WORKSPACE_PATH_BYTES as u32, 64, 16 * 1024, 64)?;
         let ignore = if include_excluded { IgnoreMatcher::include_all() } else { IgnoreMatcher::product_defaults() };
         let discovery = BoundedDiscovery::open_metadata_only(grant.clone(), SymlinkPolicy::DisallowAll, discovery_limits, ignore)?;
-        Ok(Self { grant, id, first_file, limits, include_excluded, discovery: Some(discovery), entries,
+        Ok(Self { grant, id, first_file, limits, include_excluded, discovery: Some(discovery),
+            repository_rules: None, policy_key: None, entries,
             stage: WorkspaceStage::Discovering, aggregate: DiscoveryAggregate::default(), pages: 0,
             path_bytes: 0, discovery_complete: false, limit: None, discovery_error: None, _lease: lease })
+    }
+    /// Explicit native rule-file permission, independent of source capture.
+    /// Allocations are [catalog/traversal, rule state]. No rule data is read until
+    /// step. include-excluded is a different, static scope and is not conflated
+    /// with honoring repository rules. Partial policy prevents closed membership.
+    pub fn open_rule_aware(grant: RootGrant, id: SearchManifestId, first_file: FileId,
+        limits: WorkspaceLimits, rules: RuleLimits, budget: &ResourceBudget,
+        allocations: [ResourceAllocationId; 2]) -> Result<Self, WorkspaceError> {
+        if allocations[0] == allocations[1] { return Err(WorkspaceError::InvalidLimits); }
+        let mut catalog = Self::open(grant, id, first_file, limits, false, budget, allocations[0])?;
+        let traversal = catalog.discovery.as_ref().ok_or(WorkspaceError::Pending)?.limits();
+        catalog.discovery = Some(BoundedDiscovery::open_rule_aware(catalog.grant.clone(), traversal, rules, budget, allocations[1])?);
+        catalog.policy_key = Some(fcb_source::ignore::repository::RULE_POLICY_NAME.to_owned());
+        Ok(catalog)
     }
     pub const fn id(&self) -> SearchManifestId { self.id }
     pub fn grant(&self) -> &RootGrant { &self.grant }
@@ -154,8 +167,17 @@ impl WorkspaceCatalog {
     pub const fn discovery_complete(&self) -> bool { self.discovery_complete }
     pub const fn stopped_by_limit(&self) -> Option<WorkspaceLimit> { self.limit }
     pub const fn discovery_error(&self) -> Option<SourceError> { self.discovery_error }
-    pub fn policy_name(&self) -> &'static str {
-        if self.include_excluded { "all-regular-files/no-rule-files-v1" } else { "product-defaults/no-rule-files-v1" }
+    pub fn reads_rule_files(&self) -> bool { self.policy_key.is_some() }
+    pub fn rule_policy(&self) -> Option<&RepositoryRules> {
+        self.repository_rules.as_ref().or_else(|| self.discovery.as_ref().and_then(|d| d.repository_rules()))
+    }
+    /// With snapshot support, frozen rule-aware scopes include the SHA-256 of
+    /// exact rule observations, in canonical native-path order. A policy edit
+    /// therefore cannot masquerade as a same-policy saved namespace deletion.
+    pub fn policy_name(&self) -> &str {
+        self.policy_key.as_deref().unwrap_or(if self.include_excluded {
+            "all-regular-files/no-rule-files-v1"
+        } else { "product-defaults/no-rule-files-v1" })
     }
     pub fn validate_active(&self) -> Result<(), WorkspaceError> { self.grant.validate_active().map_err(Into::into) }
     pub fn file_id(&self, ordinal: usize) -> Option<FileId> {
@@ -167,18 +189,16 @@ impl WorkspaceCatalog {
         let ordinal = usize::try_from(file.get().checked_sub(self.first_file.get())?).ok()?;
         self.entries.get(ordinal)
     }
-    pub fn cancel(&mut self) { self.stage = WorkspaceStage::Canceled; self.discovery = None; }
+    pub fn cancel(&mut self) { self.stage = WorkspaceStage::Canceled; self.discovery = None; self.repository_rules = None; }
 
-    /// One existing walker page, at most 256 traversal transitions. Empty pages
-    /// are progress, not EOF. Sorting at the final publication is bounded by the
-    /// admitted catalog size and is explicit worker work, never a UI callback.
+    /// One walker page. Rule bytes/calls/matching work are separately reported;
+    /// no configured source-payload allowance can hide configuration reads.
     pub fn step(&mut self, canceled: &CancelFlag) -> Result<WorkspaceStage, WorkspaceError> {
         if canceled.is_canceled() { self.cancel(); return Err(WorkspaceError::Canceled); }
         if let Err(error) = self.grant.validate_active() { self.cancel(); return Err(error.into()); }
         if self.stage != WorkspaceStage::Discovering { return Ok(self.stage); }
         if self.pages == self.limits.max_discovery_pages {
-            self.limit = Some(WorkspaceLimit::DiscoveryPages);
-            return self.freeze(false);
+            self.limit = Some(WorkspaceLimit::DiscoveryPages); return self.freeze(false);
         }
         self.pages += 1;
         let discovery = self.discovery.as_mut().ok_or(WorkspaceError::Pending)?;
@@ -186,10 +206,7 @@ impl WorkspaceCatalog {
             Ok(batch) => batch,
             Err(SourceError::Canceled) => { self.cancel(); return Err(WorkspaceError::Canceled); }
             Err(SourceError::GrantRevoked) => { self.cancel(); return Err(SourceError::GrantRevoked.into()); }
-            Err(error) => {
-                self.discovery_error = Some(error);
-                return self.freeze(false);
-            }
+            Err(error) => { self.discovery_error = Some(error); return self.freeze(false); }
         };
         self.aggregate = discovery.aggregate();
         let done = batch.as_ref().is_none_or(|batch| !batch.more());
@@ -206,11 +223,9 @@ impl WorkspaceCatalog {
                 }
                 self.path_bytes += bytes;
                 let search_key = match entry.path().as_str() {
-                    Ok(path) => path.to_owned(),
-                    Err(_) => entry.path().display_escaped().to_string(),
+                    Ok(path) => path.to_owned(), Err(_) => entry.path().display_escaped().to_string(),
                 };
-                self.entries.push(WorkspaceEntry { path: entry.path().clone(),
-                    observed_bytes: entry.observed_len().unwrap_or(0), search_key });
+                self.entries.push(WorkspaceEntry { path: entry.path().clone(), observed_bytes: entry.observed_len().unwrap_or(0), search_key });
             }
         }
         if canceled.is_canceled() { self.cancel(); return Err(WorkspaceError::Canceled); }
@@ -225,19 +240,41 @@ impl WorkspaceCatalog {
         let a = self.aggregate;
         self.discovery_complete = closed && self.limit.is_none() && self.discovery_error.is_none()
             && a.unavailable == 0 && a.cycles == 0 && a.depth_limited == 0 && a.path_limited == 0 && a.queue_refused == 0;
-        self.discovery = None;
+        self.repository_rules = self.discovery.take().and_then(BoundedDiscovery::into_repository_rules);
+        if let Some(rules) = &self.repository_rules {
+            self.discovery_complete &= rules.stats().is_complete();
+            self.policy_key = Some(policy_fingerprint(rules));
+        }
         self.stage = WorkspaceStage::Ready;
         Ok(self.stage)
+    }
+}
+fn policy_fingerprint(rules: &RepositoryRules) -> String {
+    #[cfg(feature = "snapshot")]
+    {
+        let mut digest = fcb_store::Sha256::new();
+        digest.update(b"fcb/repository-rules/v1\0");
+        digest.update(&[u8::from(rules.stats().is_complete())]);
+        digest.update(&(rules.observations().len() as u64).to_le_bytes());
+        for observation in rules.observations() {
+            digest.update(&(observation.path().len() as u64).to_le_bytes()); digest.update(observation.path());
+            digest.update(&(observation.bytes().len() as u64).to_le_bytes()); digest.update(observation.bytes());
+        }
+        format!("repository-rules-v1:{}", digest.finalize().to_hex())
+    }
+    #[cfg(not(feature = "snapshot"))]
+    {
+        let _ = rules;
+        // No store/hash dependency is acquired by search-only library consumers.
+        // Export is unavailable in this profile; this is a profile name, not a pin.
+        "repository-rules-v1".to_owned()
     }
 }
 
 enum CaptureSlot { Pending, Ready(CompleteCapture), Unavailable(WorkspaceCaptureFailure) }
 
-/// Complete captures for the discovered file set. A rejected large file has an
-/// unavailable identity; it is never truncated into a purported whole capture.
-/// The callback's old/new buffers are separately admitted by its host. The lease
-/// below charges retained payload and bounded source-to-Arc copy overlap.
-/// Allocate a new catalog/manifest for a refreshed set of source observations.
+/// Source capture remains independent from configuration ingestion. Rejected
+/// files have unavailable identities, never fake empty or truncated captures.
 pub struct WorkspaceCaptures<'catalog> {
     catalog: &'catalog WorkspaceCatalog,
     first_revision: SourceRevision,
@@ -253,8 +290,7 @@ impl<'catalog> WorkspaceCaptures<'catalog> {
         catalog.validate_active()?;
         if catalog.stage != WorkspaceStage::Ready { return Err(WorkspaceError::Pending); }
         if first_revision.owner() != catalog.grant.owner() { return Err(WorkspaceError::OwnerMismatch); }
-        first_revision.get().checked_add(catalog.entries.len().saturating_sub(1) as u64)
-            .ok_or(WorkspaceError::IdentityExhausted)?;
+        first_revision.get().checked_add(catalog.entries.len().saturating_sub(1) as u64).ok_or(WorkspaceError::IdentityExhausted)?;
         let charge = catalog.limits.max_source_bytes.checked_mul(2)
             .and_then(|n| catalog.entries.len().checked_mul(size_of::<CaptureSlot>() + 32).and_then(|m| n.checked_add(m)))
             .and_then(|n| n.checked_add(size_of::<Self>())).ok_or(WorkspaceError::InvalidLimits)?;
@@ -282,19 +318,14 @@ impl<'catalog> WorkspaceCaptures<'catalog> {
         match self.slots.get(ordinal)? { CaptureSlot::Ready(capture) => Some(capture), _ => None }
     }
     pub fn cancel(&mut self) { self.canceled = true; }
-
-    /// At most one host capture. Large synchronous host/OS operations have their
-    /// own work contract; this method does not invent a wall-clock deadline.
     pub fn step(&mut self, cancel: &CancelFlag,
-        mut capture: impl FnMut(CaptureRequest, &NormalizedPath, usize) -> Result<CompleteCapture, SourceError>)
-        -> Result<bool, WorkspaceError> {
+        mut capture: impl FnMut(CaptureRequest, &NormalizedPath, usize) -> Result<CompleteCapture, SourceError>) -> Result<bool, WorkspaceError> {
         if self.canceled || cancel.is_canceled() { self.cancel(); return Err(WorkspaceError::Canceled); }
         self.catalog.validate_active()?;
         if self.finished() { return Ok(true); }
         let entry = &self.catalog.entries[self.next];
         let file = self.catalog.file_id(self.next).ok_or(WorkspaceError::IdentityExhausted)?;
-        let revision = SourceRevision::new(file.owner(), self.first_revision.get() + self.next as u64)
-            .map_err(|_| WorkspaceError::IdentityExhausted)?;
+        let revision = SourceRevision::new(file.owner(), self.first_revision.get() + self.next as u64).map_err(|_| WorkspaceError::IdentityExhausted)?;
         let request = CaptureRequest::new(file, revision)?;
         let remaining = self.catalog.limits.max_source_bytes - self.bytes;
         let allowance = self.catalog.limits.max_file_bytes.min(remaining);
@@ -312,20 +343,12 @@ impl<'catalog> WorkspaceCaptures<'catalog> {
         };
         if cancel.is_canceled() { self.cancel(); return Err(WorkspaceError::Canceled); }
         self.catalog.validate_active()?;
-        // Candidate bytes become retained only at publication. A canceled or
-        // revoked callback result cannot spend retained-source accounting.
         if let CaptureSlot::Ready(captured) = &slot { self.bytes += captured.bytes().len(); }
-        self.slots[self.next] = slot;
-        self.next += 1;
-        Ok(self.finished())
+        self.slots[self.next] = slot; self.next += 1; Ok(self.finished())
     }
-
-    /// Separate owning input vectors avoid a self-referential index. Keep these
-    /// alive while indexed queries run. Pending slots are unavailable, never
-    /// zero-length fake documents. A host publishing progress under this source
-    /// universe must use a fresh QueryGeneration for each new search request.
-    pub fn search_inputs(&self, budget: &ResourceBudget, allocation: ResourceAllocationId)
-        -> Result<WorkspaceSearchInputs<'_>, WorkspaceError> {
+    /// Pending/unavailable slots and incomplete policies prevent completeness.
+    /// Input vectors own their lease and borrow the retained captures.
+    pub fn search_inputs(&self, budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<WorkspaceSearchInputs<'_>, WorkspaceError> {
         if self.canceled { return Err(WorkspaceError::Canceled); }
         self.catalog.validate_active()?;
         let count = self.slots.len();
@@ -342,23 +365,15 @@ impl<'catalog> WorkspaceCaptures<'catalog> {
                 _ => unavailable.push(file),
             }
         }
-        let membership = if self.catalog.discovery_complete && self.finished() { MembershipState::Closed }
-            else { MembershipState::Discovering };
+        let membership = if self.catalog.discovery_complete && self.finished() { MembershipState::Closed } else { MembershipState::Discovering };
         Ok(WorkspaceSearchInputs { catalog: self.catalog, documents, unavailable, membership, _lease: lease })
     }
 }
-
 pub struct WorkspaceSearchInputs<'source> {
-    catalog: &'source WorkspaceCatalog,
-    documents: Vec<SearchDocument<'source>>,
-    unavailable: Vec<FileId>,
-    membership: MembershipState,
-    _lease: ResourceLease,
+    catalog: &'source WorkspaceCatalog, documents: Vec<SearchDocument<'source>>,
+    unavailable: Vec<FileId>, membership: MembershipState, _lease: ResourceLease,
 }
 impl WorkspaceSearchInputs<'_> {
-    /// UTF-8 search keys preserve ordinary paths; non-UTF8 keys are escaped.
-    /// They are filter keys ONLY. Use catalog.entry(hit.file_id).path() for
-    /// native lookup/navigation and reversible interchange, never the key.
     pub fn manifest(&self) -> Result<SearchManifest<'_>, WorkspaceError> {
         self.catalog.validate_active()?;
         Ok(SearchManifest::new(self.catalog.id, &self.documents, &self.unavailable, self.membership,
@@ -370,8 +385,7 @@ impl WorkspaceSearchInputs<'_> {
     }
 }
 fn reserve<T>(count: usize) -> Result<Vec<T>, WorkspaceError> {
-    let mut items = Vec::new();
-    items.try_reserve_exact(count).map_err(|_| WorkspaceError::AllocationFailed)?;
+    let mut items = Vec::new(); items.try_reserve_exact(count).map_err(|_| WorkspaceError::AllocationFailed)?;
     if items.capacity() > count { return Err(WorkspaceError::ResourceDenied); }
     Ok(items)
 }
