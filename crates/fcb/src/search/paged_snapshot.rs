@@ -11,11 +11,12 @@
 
 use std::{io::{Cursor, Read, Seek}, mem::size_of, sync::Arc};
 use crate::{SourceCapture, FramePlan};
-use fcb_core::{ByteLength, ByteRange, FileId, QueryGeneration, ResourceAllocationId,
+use fcb_core::{ArenaOwnerId, ByteLength, ByteRange, FileId, QueryGeneration, ResourceAllocationId,
     ResourceBudget, ResourceLease, SourceRevision};
-use super::{CaptureRequest, ReaderSearch, StreamingNeedle, StreamReadOptions, StreamReadState,
+use super::{CaptureRequest, ReaderSearch, StreamingNeedle, StreamingMode, StreamReadOptions, StreamReadState,
     StreamReadStep, StreamReadError, RawPath, SourceReader, ReaderLimits, ReaderError,
     ReaderIndexProgress, ReadingTarget, ReadingSeek, ReadingAnchor, ReadingWindow, ReadingWindowOptions};
+use super::snapshot_index::{SnapshotIndex, SnapshotIndexError, IndexDecision};
 pub use fcb_store::paged_snapshot::{PagedSnapshot, PagedSnapshotError, PagedMember, PagedMemberData,
     SnapshotDirectory, SnapshotIoStats, VerifiedMember};
 pub use fcb_store::Sha256Digest;
@@ -24,11 +25,13 @@ pub use fcb_store::Sha256Digest;
 pub enum PagedSearchError {
     Archive(PagedSnapshotError), Search(StreamReadError), OwnerMismatch, IdentityExhausted,
     InvalidLimits, ResourceDenied, Pending, Canceled, StaleQuery, InvalidHit, IncompleteInput,
+    Index(SnapshotIndexError),
 }
 impl std::fmt::Display for PagedSearchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Archive(error) => write!(f, "{error}"), Self::Search(error) => write!(f, "{error}"),
+            Self::Index(error) => write!(f, "{error}"),
             Self::OwnerMismatch => f.write_str("SNAPSHOT_OWNER_MISMATCH"),
             Self::IdentityExhausted => f.write_str("SNAPSHOT_IDENTITY_EXHAUSTED"),
             Self::InvalidLimits => f.write_str("SNAPSHOT_QUERY_INVALID_LIMITS"),
@@ -44,6 +47,27 @@ impl std::fmt::Display for PagedSearchError {
 impl std::error::Error for PagedSearchError {}
 impl From<PagedSnapshotError> for PagedSearchError { fn from(e: PagedSnapshotError) -> Self { Self::Archive(e) } }
 impl From<StreamReadError> for PagedSearchError { fn from(e: StreamReadError) -> Self { Self::Search(e) } }
+impl From<SnapshotIndexError> for PagedSearchError { fn from(e: SnapshotIndexError) -> Self { Self::Index(e) } }
+
+/// Binds prefilter bytes to the EXACT literal passed to the production matcher.
+/// The pattern is borrowed and cannot be changed during a query. This prevents a
+/// caller from filtering for one literal and verifying a different one. Its
+/// StreamingNeedle backing retains the existing explicit resource reservation.
+pub struct IndexedNeedle<'pattern> {
+    owner: ArenaOwnerId,
+    pattern: &'pattern [u8],
+    inner: StreamingNeedle,
+}
+impl<'pattern> IndexedNeedle<'pattern> {
+    pub fn text(owner: ArenaOwnerId, text: &'pattern str, budget: &ResourceBudget,
+        allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
+        Ok(Self { owner, pattern: text.as_bytes(), inner: StreamingNeedle::text(owner, text, budget, allocation)? })
+    }
+    pub fn raw(owner: ArenaOwnerId, bytes: &'pattern [u8], budget: &ResourceBudget,
+        allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
+        Ok(Self { owner, pattern: bytes, inner: StreamingNeedle::raw(owner, bytes, budget, allocation)? })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PagedQueryOptions {
@@ -63,6 +87,9 @@ pub struct PagedQueryStats {
     pub peak_source_bytes: usize,
     pub last_step_loaded_bytes: usize,
     pub last_step_scanned_bytes: usize,
+    pub index_candidates: usize,
+    pub index_eliminated_files: usize,
+    pub index_fallback_files: usize,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PagedHit {
@@ -82,6 +109,7 @@ impl PagedHit {
 pub struct PagedQuery<'archive, 'needle, R: Read + Seek> {
     archive: &'archive mut PagedSnapshot<R>,
     needle: &'needle StreamingNeedle,
+    index: Option<(&'needle SnapshotIndex, &'needle [u8])>,
     options: PagedQueryOptions,
     allocations: [ResourceAllocationId; 3],
     next: usize,
@@ -116,8 +144,21 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
             .map_err(|_| PagedSearchError::ResourceDenied)?;
         let mut hits = Vec::new(); hits.try_reserve_exact(options.max_matches).map_err(|_| PagedSearchError::ResourceDenied)?;
         if hits.capacity() > options.max_matches { return Err(PagedSearchError::ResourceDenied); }
-        Ok(Self { archive, needle, options, allocations, next: 0, active: None, hits, matches_seen: 0,
+        Ok(Self { archive, needle, index: None, options, allocations, next: 0, active: None, hits, matches_seen: 0,
             state: PagedQueryState::Pending, stats: PagedQueryStats::default(), _lease: lease })
+    }
+    /// Same exact query, with complete compatible persisted segments allowed to
+    /// eliminate files BEFORE loading them. No unchecked caller candidate list.
+    /// Missing members, short needles, UTF-16 text and uncovered files retain the
+    /// ordinary route. Every candidate still receives digest and match verification.
+    pub fn new_indexed(archive: &'archive mut PagedSnapshot<R>, needle: &'needle IndexedNeedle<'_>,
+        index: &'needle SnapshotIndex, options: PagedQueryOptions, budget: &ResourceBudget,
+        allocations: [ResourceAllocationId; 3]) -> Result<Self, PagedSearchError> {
+        index.validate_directory(archive.directory())?;
+        if needle.owner != archive.directory().owner() { return Err(PagedSearchError::OwnerMismatch); }
+        let mut query = Self::new(archive, &needle.inner, options, budget, allocations)?;
+        query.index = Some((index, needle.pattern));
+        Ok(query)
     }
     pub const fn state(&self) -> PagedQueryState { self.state }
     pub const fn generation(&self) -> QueryGeneration { self.options.generation }
@@ -148,6 +189,17 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
             let ordinal = self.next; self.next += 1; self.stats.members_visited += 1;
             let member = self.archive.directory().member(ordinal).ok_or(PagedSearchError::InvalidHit)?;
             if matches!(member.data, PagedMemberData::Unavailable(_)) { return Ok(()); }
+            if let Some((index, pattern)) = self.index {
+                let decision = match self.needle.mode() {
+                    StreamingMode::OriginalBytes => index.raw_decision(ordinal, pattern),
+                    StreamingMode::ExactText => index.text_decision(ordinal, std::str::from_utf8(pattern).ok()),
+                };
+                match decision {
+                    IndexDecision::Excluded => { self.stats.index_eliminated_files += 1; return Ok(()); }
+                    IndexDecision::Verify => self.stats.index_candidates += 1,
+                    IndexDecision::Fallback => self.stats.index_fallback_files += 1,
+                }
+            }
             let file = FileId::new(self.options.first_file.owner(), self.options.first_file.get() + ordinal as u64)
                 .map_err(|_| PagedSearchError::IdentityExhausted)?;
             let revision = SourceRevision::new(file.owner(), self.options.first_revision.get() + ordinal as u64)
