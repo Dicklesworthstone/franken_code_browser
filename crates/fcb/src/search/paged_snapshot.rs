@@ -7,6 +7,7 @@
 //!
 //! Archive validation and member loads are bounded, cancellable worker I/O.
 //! A query step may load one admitted member, then runs one bounded matcher step.
+//! Global posting queries inspect at most one driver posting/fallback per step.
 //! It is not an interaction callback or a wall-clock latency guarantee.
 
 use std::{io::{Cursor, Read, Seek}, mem::size_of, sync::Arc};
@@ -16,7 +17,8 @@ use fcb_core::{ArenaOwnerId, ByteLength, ByteRange, FileId, QueryGeneration, Res
 use super::{CaptureRequest, ReaderSearch, StreamingNeedle, StreamingMode, StreamReadOptions, StreamReadState,
     StreamReadStep, StreamReadError, RawPath, SourceReader, ReaderLimits, ReaderError,
     ReaderIndexProgress, ReadingTarget, ReadingSeek, ReadingAnchor, ReadingWindow, ReadingWindowOptions};
-use super::snapshot_index::{SnapshotIndex, SnapshotIndexError, IndexDecision};
+use super::snapshot_index::{SnapshotIndex, SnapshotIndexError, IndexDecision,
+    SnapshotPostings, PostingCandidates, PostingStep};
 pub use fcb_store::paged_snapshot::{PagedSnapshot, PagedSnapshotError, PagedMember, PagedMemberData,
     SnapshotDirectory, SnapshotIoStats, VerifiedMember};
 pub use fcb_store::Sha256Digest;
@@ -80,6 +82,7 @@ pub struct PagedQueryOptions {
 pub enum PagedQueryState { Pending, Complete, Truncated, Canceled, Failed(PagedSearchError) }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PagedQueryStats {
+    /// Source-directory records actually visited, not the size of known scope.
     pub members_visited: usize,
     pub files_searched: usize,
     pub unsupported_files: usize,
@@ -88,8 +91,14 @@ pub struct PagedQueryStats {
     pub last_step_loaded_bytes: usize,
     pub last_step_scanned_bytes: usize,
     pub index_candidates: usize,
+    /// Posting queries publish this total only once their candidate cursor is
+    /// exhausted; before then zero is a conservative lower bound, not a total.
     pub index_eliminated_files: usize,
     pub index_fallback_files: usize,
+    pub posting_list_lookups: usize,
+    pub posting_entries_visited: usize,
+    pub posting_membership_lookups: usize,
+    pub posting_cursor_complete: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PagedHit {
@@ -110,6 +119,7 @@ pub struct PagedQuery<'archive, 'needle, R: Read + Seek> {
     archive: &'archive mut PagedSnapshot<R>,
     needle: &'needle StreamingNeedle,
     index: Option<(&'needle SnapshotIndex, &'needle [u8])>,
+    postings: Option<PostingCandidates<'needle>>,
     options: PagedQueryOptions,
     allocations: [ResourceAllocationId; 3],
     next: usize,
@@ -144,7 +154,7 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
             .map_err(|_| PagedSearchError::ResourceDenied)?;
         let mut hits = Vec::new(); hits.try_reserve_exact(options.max_matches).map_err(|_| PagedSearchError::ResourceDenied)?;
         if hits.capacity() > options.max_matches { return Err(PagedSearchError::ResourceDenied); }
-        Ok(Self { archive, needle, index: None, options, allocations, next: 0, active: None, hits, matches_seen: 0,
+        Ok(Self { archive, needle, index: None, postings: None, options, allocations, next: 0, active: None, hits, matches_seen: 0,
             state: PagedQueryState::Pending, stats: PagedQueryStats::default(), _lease: lease })
     }
     /// Same exact query, with complete compatible persisted segments allowed to
@@ -158,6 +168,20 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
         if needle.owner != archive.directory().owner() { return Err(PagedSearchError::OwnerMismatch); }
         let mut query = Self::new(archive, &needle.inner, options, budget, allocations)?;
         query.index = Some((index, needle.pattern));
+        Ok(query)
+    }
+    /// Select from a global posting intersection rather than probing all files.
+    /// The fallback merge is in the same original member order and uses exactly
+    /// this IndexedNeedle's mode/bytes. No candidate-universe allocation occurs.
+    pub fn new_postings(archive: &'archive mut PagedSnapshot<R>, needle: &'needle IndexedNeedle<'_>,
+        index: &'needle SnapshotPostings, options: PagedQueryOptions, budget: &ResourceBudget,
+        allocations: [ResourceAllocationId; 3]) -> Result<Self, PagedSearchError> {
+        index.validate_directory(archive.directory())?;
+        if needle.owner != archive.directory().owner() { return Err(PagedSearchError::OwnerMismatch); }
+        let mut query = Self::new(archive, &needle.inner, options, budget, allocations)?;
+        let candidates = index.candidates(needle.pattern, matches!(needle.inner.mode(), StreamingMode::ExactText));
+        query.stats.posting_list_lookups = candidates.stats().list_lookups;
+        query.postings = Some(candidates);
         Ok(query)
     }
     pub const fn state(&self) -> PagedQueryState { self.state }
@@ -185,15 +209,35 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
     fn advance(&mut self, step: StreamReadStep, budget: &ResourceBudget,
         canceled: &mut impl FnMut() -> bool) -> Result<(), PagedSearchError> {
         if self.active.is_none() {
-            if self.next == self.archive.directory().len() { self.state = PagedQueryState::Complete; return Ok(()); }
-            let ordinal = self.next; self.next += 1; self.stats.members_visited += 1;
+            let (ordinal, posting_decision) = if let Some(cursor) = self.postings.as_mut() {
+                let result = cursor.step();
+                let stats = cursor.stats();
+                self.stats.posting_entries_visited = stats.posting_entries_visited;
+                self.stats.posting_membership_lookups = stats.membership_lookups;
+                self.stats.posting_cursor_complete = cursor.is_finished();
+                if let Some(excluded) = cursor.excluded_files() { self.stats.index_eliminated_files = excluded; }
+                match result {
+                    PostingStep::Pending => return Ok(()),
+                    PostingStep::Finished => { self.state = PagedQueryState::Complete; return Ok(()); }
+                    PostingStep::Candidate { ordinal, decision } => (ordinal, Some(decision)),
+                }
+            } else {
+                if self.next == self.archive.directory().len() { self.state = PagedQueryState::Complete; return Ok(()); }
+                let ordinal = self.next; self.next += 1;
+                (ordinal, None)
+            };
+            self.stats.members_visited += 1;
             let member = self.archive.directory().member(ordinal).ok_or(PagedSearchError::InvalidHit)?;
             if matches!(member.data, PagedMemberData::Unavailable(_)) { return Ok(()); }
-            if let Some((index, pattern)) = self.index {
-                let decision = match self.needle.mode() {
+            let decision = match (posting_decision, self.index) {
+                (Some(decision), _) => Some(decision),
+                (None, Some((index, pattern))) => Some(match self.needle.mode() {
                     StreamingMode::OriginalBytes => index.raw_decision(ordinal, pattern),
                     StreamingMode::ExactText => index.text_decision(ordinal, std::str::from_utf8(pattern).ok()),
-                };
+                }),
+                _ => None,
+            };
+            if let Some(decision) = decision {
                 match decision {
                     IndexDecision::Excluded => { self.stats.index_eliminated_files += 1; return Ok(()); }
                     IndexDecision::Verify => self.stats.index_candidates += 1,
@@ -318,7 +362,7 @@ impl PagedCapture {
         capture.hit_bytes(hit)?;
         Ok(capture)
     }
-    pub fn bytes(&self) -> &[u8] { self.source.bytes() }
+    pub fn bytes(&self) -> &[u8] { &self.source.bytes() }
     pub const fn file(&self) -> FileId { self.source.file() }
     pub const fn revision(&self) -> SourceRevision { self.source.revision() }
     pub const fn source_digest(&self) -> Sha256Digest { self.digest }
