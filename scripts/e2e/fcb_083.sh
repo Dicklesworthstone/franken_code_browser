@@ -23,11 +23,14 @@ export FCB_083_RUN_ID="$RUN_ID"
 ARTIFACT_DIR="scripts/e2e/artifacts/fcb-083/$RUN_ID"
 mkdir -p "$ARTIFACT_DIR"
 
-echo "[fcb-083] route: headless cargo test (fcb-source/scan_epochs)"
+echo "[fcb-083] route: headless cargo test (fcb-source/scan_epochs and opened_object_protections)"
 echo "[fcb-083] run id: $RUN_ID"
 
 cargo test --manifest-path crates/fcb-source/Cargo.toml \
     --test scan_epochs "$@"
+
+cargo test --manifest-path crates/fcb-source/Cargo.toml \
+    --test opened_object_protections "$@"
 
 RECEIPTS_DIR="${TMPDIR:-/tmp}/fcb-083-receipts-$RUN_ID"
 if [ -d "$RECEIPTS_DIR" ]; then
