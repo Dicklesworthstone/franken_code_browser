@@ -33,6 +33,7 @@ pub mod line_index;
 pub mod path;
 pub mod restoration;
 pub mod old_anchor;
+pub mod reconciliation;
 pub mod root;
 pub mod snapshot;
 
@@ -77,6 +78,12 @@ pub use snapshot::{
     AnchorResolution, AnchorResolver, BoundedRetryReader, FileObservationMetadata,
     ObservedSnapshot, ObservedSnapshotConsistency, PinnedSnapshotStore, RetryPolicy,
     SnapshotBacking, SnapshotPin, SnapshotPinId,
+};
+pub use reconciliation::{
+    AnnotationId, AnnotationReattachment, AnnotationRegistry, ContinuityDecision, ContinuityPolicy,
+    DirtyHint, DirtyHintTracker, FileContinuityEntry, FileContinuityRegistry, FileContinuityResult,
+    KnownEntry, ObservedEntry, OrphanReason, OrphanedAnnotation, ReconciliationIncompleteReason,
+    ReconciliationPass, ReconciliationReport, ReconciliationStatus, SourceAnnotation,
 };
 
 use std::collections::BTreeSet;

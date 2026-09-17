@@ -108,8 +108,16 @@ impl DiscoveryLimits {
 pub struct ScanEpoch(u64);
 
 impl ScanEpoch {
+    pub const fn new(epoch: u64) -> Self {
+        Self(epoch)
+    }
+
     pub const fn get(self) -> u64 {
         self.0
+    }
+
+    pub const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
     }
 }
 
