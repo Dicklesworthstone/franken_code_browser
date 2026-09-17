@@ -1,15 +1,19 @@
 #![forbid(unsafe_code)]
 
 //! File-backed access to the existing FCBS/1 format, without retaining archive
-//! payloads. Opening validates the ENTIRE bounded envelope in one sequential
-//! pass, retaining only metadata and per-member SHA-256 digests. Loading a member
-//! seeks on the same host-supplied handle and verifies its bytes against that
-//! digest before returning them. No mmap, extraction, pathname lookup or grant.
+//! payloads. Ordinary opening validates the ENTIRE bounded envelope in one
+//! sequential pass, retaining metadata and per-member SHA-256 digests. Loading
+//! a member verifies its bytes against that digest before returning them.
+//! `open_pinned` is an explicit trusted-catalog alternative, not a full body scan.
+//! No mmap, extraction, pathname lookup or grant.
 //!
 //! Open is cancellable worker work, not a constant-time UI callback. Every read
 //! is at most 64 KiB, short/interrupted calls spend a hard call allowance, and all
-//! lengths/counts are admitted before allocation. Reopening cannot skip the
-//! integrity pass. This is paged source access, NOT persisted search postings.
+//! lengths/counts are admitted before allocation. This is paged source access,
+//! NOT persisted search postings. Consult fully_verified_on_open for the route.
+
+pub mod catalog;
+pub use catalog::{CatalogArtifact, CatalogError, PinnedCatalog};
 
 use std::{io::{self, Read, Seek, SeekFrom}, mem::size_of, ops::Range};
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
@@ -83,6 +87,7 @@ pub struct SnapshotDirectory {
     archive_bytes: u64,
     digest: Sha256Digest,
     validation: SnapshotIoStats,
+    catalog_pin: Option<Sha256Digest>,
     retained_charge: usize,
     _lease: ResourceLease,
 }
@@ -234,7 +239,7 @@ impl<R: Read + Seek> PagedSnapshot<R> {
         if digest.as_bytes() != &checksum { return Err(PagedSnapshotError::Checksum); }
         if canceled() { return Err(PagedSnapshotError::Canceled); }
         let directory = SnapshotDirectory { owner, entries, paths, reasons, policy, complete, captured,
-            source_bytes, archive_bytes, digest, validation: stats, retained_charge: charge, _lease: lease };
+            source_bytes, archive_bytes, digest, validation: stats, catalog_pin: None, retained_charge: charge, _lease: lease };
         Ok(Self { input, directory, loads: SnapshotIoStats::default() })
     }
     pub fn directory(&self) -> &SnapshotDirectory { &self.directory }
@@ -383,7 +388,7 @@ mod tests {
         for size in [16, 1024 * 1024] {
             let source = vec![b'x'; size];
             let bytes = encode(&[SnapshotEntry { path: b"a", observed_bytes: size as u64, data: SnapshotData::Captured(&source) }], true);
-            let b = budget(128 * 1024); // Less than the large source, more than metadata.
+            let b = budget(128 * 1024);
             let paged = PagedSnapshot::open(Cursor::new(bytes.as_slice()), owner(), SnapshotLimits::default(), &b, id(1), || false).unwrap();
             assert_eq!(paged.directory().validation_stats().bytes_read, bytes.len() as u64);
             assert!(paged.directory().retained_charge() < 128 * 1024);
