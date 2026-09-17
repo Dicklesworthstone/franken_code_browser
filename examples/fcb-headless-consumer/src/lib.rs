@@ -15,17 +15,17 @@ use fcb_search::{DirectSourceScanner, QueryOptions, SearchMode, UnicodeNormaliza
 use fcb_source::{CaptureRequest, CompleteCapture};
 use fcb::MemorySourceProvider;
 
-const SOURCE_PATH: &str = "src/widget.rs";
-const SOURCE_BYTES: &[u8] = b"pub fn widget() -> u32 {\n    42\n}\n";
-const NEEDLE: &str = "42";
-const OWNER_ID: u64 = 0xA11CE;
+pub const SOURCE_PATH: &str = "src/widget.rs";
+pub const SOURCE_BYTES: &[u8] = b"pub fn widget() -> u32 {\n    42\n}\n";
+pub const NEEDLE: &str = "42";
+pub const OWNER_ID: u64 = 0xA11CE;
 
-fn owner() -> ArenaOwnerId {
+pub fn owner() -> ArenaOwnerId {
     ArenaOwnerId::new(OWNER_ID).unwrap()
 }
 
 /// Seam 1 — capture: the inert facade's in-memory provider yields exact bytes.
-fn capture_source() -> fcb::SourceCapture {
+pub fn capture_source() -> fcb::SourceCapture {
     let mut provider = MemorySourceProvider::new(owner()).expect("provider constructs");
     provider.insert(SOURCE_PATH, SOURCE_BYTES.to_vec()).unwrap();
     provider.capture(SOURCE_PATH).expect("in-memory capture")
@@ -33,7 +33,7 @@ fn capture_source() -> fcb::SourceCapture {
 
 /// Seam 2 — search: scan the given bytes through the search engine's
 /// direct scanner, wrapping them in a complete capture first.
-fn search_bytes(bytes: &[u8], file_num: u64, needle: &str) -> fcb_search::SearchResult {
+pub fn search_bytes(bytes: &[u8], file_num: u64, needle: &str) -> fcb_search::SearchResult {
     let owner = owner();
     let file = fcb_core::FileId::new(owner, file_num).unwrap();
     let rev = fcb_core::SourceRevision::new(owner, 1).unwrap();
@@ -53,7 +53,7 @@ fn search_bytes(bytes: &[u8], file_num: u64, needle: &str) -> fcb_search::Search
 }
 
 /// Seam 3 — map: build the repository hierarchy and commit a layout.
-fn commit_tree_layout(file_len: u64) -> fcb_map::PartitionLayout {
+pub fn commit_tree_layout(file_len: u64) -> fcb_map::PartitionLayout {
     let root = RootId::new(owner(), 1).unwrap();
     let spec = HierarchySpec::new(
         owner(),
