@@ -122,7 +122,7 @@ fn percent_decode(url: &str) -> Option<String> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut idx = 0_usize;
     while idx < bytes.len() {
-        match bytes[idx] {
+        match bytes.get(idx).copied()? {
             b'%' => {
                 let hex = bytes.get(idx + 1..idx + 3)?;
                 let value = u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;

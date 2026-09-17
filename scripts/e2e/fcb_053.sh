@@ -1,0 +1,105 @@
+#!/bin/bash
+# FCB-053.A & FCB-053.B production verification scenario:
+# Native text input, IME composition, menu command routing, clipboard, open/drop, and editor link handoff.
+# Verifies:
+# - Headless NSTextInputClient-shaped multi-stage IME composition (marked text, commits, surrogate boundary protection).
+# - Standard AppKit menu command routing and validation predicates (copy/cut/paste/undo/redo/select-all/delete/find).
+# - Open panel and drag-drop validation (percent decoding before scheme check, localhost authority, traversal refusal, control character refusal).
+# - Multi-flavor clipboard (ordinary Unicode vs exact bytes with UTF-16 BOM/CRLF/bidi, budget enforcement, revocation, concurrency, native failure).
+# - External editor and web link handoff using structured OS argv (no shell strings, scheme allowlist, path traversal and injection refusal).
+#
+# Supported routes:
+#   scripts/e2e/fcb_053.sh [cargo-test-args...]
+#   scripts/e2e/fcb_053.sh --lane ui
+#   scripts/e2e/fcb_053.sh --lane production
+#   scripts/e2e/fcb_053.sh --lane all
+#
+# Environment:
+#   FCB_053_RUN_ID  run identifier for receipt retention (default: UTC ts)
+#
+# Evidence: bounded redacted ScenarioReceipts retained under
+#   ${TMPDIR:-/tmp}/fcb-053-receipts-<run_id>/ and archived after the run
+#   under scripts/e2e/artifacts/fcb-053/<run_id>/receipts/.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_ROOT"
+
+RUN_ID="${FCB_053_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+export FCB_053_RUN_ID="$RUN_ID"
+
+ARTIFACT_DIR="scripts/e2e/artifacts/fcb-053/$RUN_ID"
+mkdir -p "$ARTIFACT_DIR"
+
+RECEIPTS_DIR="${TMPDIR:-/tmp}/fcb-053-receipts-$RUN_ID"
+mkdir -p "$RECEIPTS_DIR"
+export FCB_RECEIPTS_DIR="$RECEIPTS_DIR"
+
+LANE="all"
+EXTRA_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --lane)
+            LANE="$2"
+            shift 2
+            ;;
+        *)
+            EXTRA_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+echo "[fcb-053] route: headless cargo test (fcb-ui lib, native_commands_composition)"
+echo "[fcb-053] lane: $LANE"
+echo "[fcb-053] run id: $RUN_ID"
+
+case "$LANE" in
+    ui)
+        echo "[fcb-053] running fcb-ui unit tests..."
+        cargo test -p fcb-ui --lib "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        ;;
+    production)
+        echo "[fcb-053] running native_commands_composition tests..."
+        cargo test -p fcb-ui --test native_commands_composition "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        ;;
+    all)
+        echo "[fcb-053] running all FCB-053 test suites..."
+        cargo test -p fcb-ui --lib "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        cargo test -p fcb-ui --test native_commands_composition "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        ;;
+    *)
+        echo "[fcb-053] unknown lane: $LANE" >&2
+        exit 1
+        ;;
+esac
+
+# Retain the bounded redacted receipts produced by this run.
+if [ -d "$RECEIPTS_DIR" ]; then
+    mkdir -p "$ARTIFACT_DIR/receipts"
+    cp -R "$RECEIPTS_DIR/." "$ARTIFACT_DIR/receipts/"
+    RECEIPT_COUNT=$(find "$ARTIFACT_DIR/receipts" -name "*.receipt" | wc -l | tr -d ' ')
+    echo "[fcb-053] receipts archived ($RECEIPT_COUNT receipts): $ARTIFACT_DIR/receipts"
+    if [ "$LANE" = "production" ] || [ "$LANE" = "all" ]; then
+        if [ "$RECEIPT_COUNT" -lt 8 ]; then
+            echo "[fcb-053] ERROR: expected at least 8 receipts, got $RECEIPT_COUNT" >&2
+            exit 1
+        fi
+    fi
+fi
+
+# Write structured outcome report.
+cat <<EOF > "$ARTIFACT_DIR/summary.json"
+{
+  "scenario": "FCB-053 native text input, IME composition, menu command routing, clipboard, open/drop, and editor link handoff",
+  "lane": "$LANE",
+  "run_id": "$RUN_ID",
+  "receipt_count": ${RECEIPT_COUNT:-0},
+  "receipts_dir": "$ARTIFACT_DIR/receipts",
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "exit_code": 0
+}
+EOF
+
+echo "[fcb-053] verification succeeded: summary written to $ARTIFACT_DIR/summary.json"

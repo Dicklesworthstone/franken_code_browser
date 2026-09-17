@@ -15,10 +15,19 @@
 //! payloads into calls here; the adjacent FCB-053.V child qualifies the live
 //! responder chain end to end.
 
+pub mod clipboard;
 pub mod commands;
 pub mod composition;
+pub mod editor_link;
 pub mod open_drop;
 
+pub use clipboard::{
+    ClipboardError, ClipboardFlavor, ClipboardPayload, NativePasteboard,
+};
 pub use commands::{CommandEffect, EditorCommand, EditorState, Pasteboard};
 pub use composition::{CompositionError, CompositionState, MarkedRegion};
+pub use editor_link::{
+    ActionRefusalReason, StructuredOsCommand, validate_editor_handoff, validate_web_link_handoff,
+};
 pub use open_drop::{OpenDecision, OpenRequest, RefusalReason, canceled_dialog, validate_open_request};
+

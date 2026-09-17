@@ -7,7 +7,7 @@
 //! validated against the document's actual code-unit count and every
 //! replacement is byte-budget bounded.
 
-use fcb_core::{CoreError, Utf16CodeUnitOffset, Utf16CodeUnitRange};
+use fcb_core::{Utf16CodeUnitOffset, Utf16CodeUnitRange};
 
 /// A marked (in-composition) region and the selection the IME wants inside it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,10 +160,18 @@ impl CompositionState {
         }
         let byte_start = units_to_byte(&self.text, start);
         let byte_end = units_to_byte(&self.text, end);
+        let prefix = self
+            .text
+            .get(..byte_start)
+            .ok_or(CompositionError::InvalidRange)?;
+        let suffix = self
+            .text
+            .get(byte_end..)
+            .ok_or(CompositionError::InvalidRange)?;
         let mut next = String::with_capacity(self.text.len() + text.len());
-        next.push_str(&self.text[..byte_start]);
+        next.push_str(prefix);
         next.push_str(text);
-        next.push_str(&self.text[byte_end..]);
+        next.push_str(suffix);
         if next.len() > self.max_text_bytes {
             return Err(CompositionError::TextBudgetExceeded);
         }

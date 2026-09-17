@@ -187,7 +187,7 @@ impl EditorState {
                 Ok(CommandEffect::Applied { action: "delete", changed_text: true })
             }
             EditorCommand::Undo => {
-                let Some(mut step) = self.undo.pop() else {
+                let Some(step) = self.undo.pop() else {
                     return Ok(CommandEffect::Disabled);
                 };
                 self.text = step.before.clone();
