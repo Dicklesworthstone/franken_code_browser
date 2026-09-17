@@ -9,6 +9,7 @@
 mod paged;
 mod index;
 mod catalog;
+mod expression;
 
 use std::{ffi::OsString, fs::{self, File, OpenOptions}, io::{self, Write}, path::{Path, PathBuf}, sync::Arc};
 use fcb::{ByteLength, ByteOffset, ByteRange};
@@ -28,9 +29,12 @@ const MAX_CALLS: u64 = 131_072;
 const HELP: &str = "fcb snapshot save ROOT --output NEW_FILE [--json] [--respect-ignores | --include-excluded]\n\
 fcb snapshot catalog FILE --output NEW_CATALOG [--json]\n\
 fcb snapshot inspect FILE [--json] [--limit N]\n\
-fcb snapshot search FILE (--text LITERAL | --raw-hex HEX) [--json] [--limit N]\n\
+fcb snapshot search FILE (--text LITERAL | --raw-hex HEX | --query EXPRESSION) [--json] [--limit N]\n\
 fcb snapshot read FILE (--member NAME | --member-hex HEX) [--json]\n\
 fcb snapshot index help  # Build/reopen pinned substring indexes\n\
+Expressions: quoted phrases, whitespace conjunctions, -excluded terms, path: and lang:/type: filters.\n\
+Expression work: --max-scan-bytes N, default 256 MiB across ALL predicate and primary scans.\n\
+--text always remains literal; expressions do not enable regex, OR, or compiler semantics.\n\
 Read options: --line N OR --offset N; --bytes N --lines N; --raw for original bytes\n\
 Save options: --max-files N --max-file-bytes N --max-total-bytes N\n\
 --respect-ignores explicitly reads bounded nested .gitignore/.fcbignore policies.\n\
@@ -50,6 +54,7 @@ struct Settings {
     window_bytes: usize, lines: usize, raw: bool,
     json: bool, limit: usize, limits: WorkspaceLimits, include_excluded: bool, respect_ignores: bool,
     catalog: Option<PathBuf>, catalog_pin: Option<Sha256Digest>,
+    expression: Option<String>, max_scan_bytes: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Effect { None, Incomplete, Written, Synced }
@@ -79,7 +84,8 @@ impl From<SavedSourceError> for Failure {
 }
 fn takes_value(text: &str) -> bool {
     matches!(text, "--output" | "--text" | "--raw-hex" | "--limit" | "--max-files" | "--max-file-bytes" | "--max-total-bytes"
-        | "--member" | "--member-hex" | "--offset" | "--line" | "--bytes" | "--lines" | "--catalog" | "--catalog-digest")
+        | "--member" | "--member-hex" | "--offset" | "--line" | "--bytes" | "--lines" | "--catalog" | "--catalog-digest"
+        | "--query" | "--max-scan-bytes")
 }
 fn wants_json(args: &[OsString]) -> bool {
     let mut cursor = 0;
@@ -107,7 +113,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
     let mut settings = Settings { mode, source: None, output: None, text: None, raw_needle: None,
         member: None, offset: 0, line: None, window_bytes: 64 * 1024, lines: 100, raw: false, json: false,
         limit: 100, limits: WorkspaceLimits::default(), include_excluded: false, respect_ignores: false,
-        catalog: None, catalog_pin: None };
+        catalog: None, catalog_pin: None, expression: None, max_scan_bytes: 256 * 1024 * 1024 };
     let mut seen = 0u32;
     let mut cursor = usize::from(!args.is_empty());
     let mut positional = false;
@@ -122,6 +128,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 "--member" => 256, "--member-hex" => 512, "--offset" => 1024, "--line" => 2048,
                 "--bytes" => 4096, "--lines" => 8192, "--raw" => 16384, "--raw-hex" => 32768,
                 "--catalog" => 65536, "--catalog-digest" => 131072, "--respect-ignores" => 262144,
+                "--query" => 524288, "--max-scan-bytes" => 1048576,
                 _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")), };
             if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
             seen |= bit;
@@ -142,9 +149,11 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
             }
             let text = value.to_str().ok_or_else(|| Failure::new("CLI_INVALID_VALUE"))?;
             if option == "--catalog-digest" { settings.catalog_pin = Some(catalog::parse_pin(text)?); continue; }
-            if option == "--text" {
+            if option == "--text" || option == "--query" {
                 if text.is_empty() || text.len() > 1024 { return Err(Failure::new("CLI_INVALID_NEEDLE")); }
-                settings.text = Some(text.to_owned()); continue;
+                if option == "--query" { settings.expression = Some(text.to_owned()); }
+                else { settings.text = Some(text.to_owned()); }
+                continue;
             }
             if option == "--member-hex" {
                 if settings.member.is_some() { return Err(Failure::new("CLI_INVALID_MEMBER")); }
@@ -157,6 +166,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 "--max-files" if (1..=65_536).contains(&number) => settings.limits.max_files = number as usize,
                 "--max-file-bytes" if number <= 1024 * 1024 => settings.limits.max_file_bytes = number as usize,
                 "--max-total-bytes" if number <= 64 * 1024 * 1024 => settings.limits.max_source_bytes = number as usize,
+                "--max-scan-bytes" if number <= crate::args::MAX_SCAN_BYTES => settings.max_scan_bytes = number,
                 "--offset" => settings.offset = number,
                 "--line" if number > 0 => settings.line = Some(number),
                 "--bytes" if (4..=256 * 1024).contains(&number) => settings.window_bytes = number as usize,
@@ -176,8 +186,10 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
         Mode::Save => settings.source.is_some() && settings.output.is_some() && seen & !(1 | 2 | 16 | 32 | 64 | 128 | 262144) == 0,
         Mode::Catalog => settings.source.is_some() && settings.output.is_some() && seen & !(1 | 2) == 0,
         Mode::Inspect => settings.source.is_some() && seen & !(1 | 8 | catalog_options) == 0,
-        Mode::Search => settings.source.is_some() && (settings.text.is_some() != settings.raw_needle.is_some())
-            && seen & !(1 | 4 | 8 | 32768 | catalog_options) == 0,
+        Mode::Search => settings.source.is_some()
+            && usize::from(settings.text.is_some()) + usize::from(settings.raw_needle.is_some()) + usize::from(settings.expression.is_some()) == 1
+            && seen & !(1 | 4 | 8 | 32768 | catalog_options | 524288 | 1048576) == 0
+            && (seen & 1048576 == 0 || settings.expression.is_some()),
         Mode::Read => settings.source.is_some() && settings.member.is_some()
             && seen & !(1 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 | catalog_options) == 0
             && seen & (1024 | 2048) != (1024 | 2048)
@@ -254,6 +266,7 @@ fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBudget, effec
     }
     if settings.mode == Mode::Save { return save(settings, out, budget, effect, canceled); }
     if settings.mode == Mode::Catalog { return catalog::build(settings, out, budget, effect, canceled); }
+    if settings.mode == Mode::Search && settings.expression.is_some() { return expression::execute(settings, out, budget, canceled); }
     paged::execute(settings, out, budget, canceled)
 }
 fn begin(out: &mut Output, command: &str) -> Result<(), OutputError> {
@@ -450,5 +463,19 @@ mod tests {
             vec!["save", "root", "--output", "new", "--respect-ignores", "--respect-ignores"]] {
             assert!(parse(&args(&values)).is_err());
         }
+    }
+    #[test]
+    fn expressions_are_disjoint_from_literal_raw_and_nonsearch_routes() {
+        let parsed = parse(&args(&["search", "saved", "--query", "needle required -forbidden", "--max-scan-bytes", "0"])).unwrap();
+        assert_eq!(parsed.max_scan_bytes, 0); assert!(parsed.expression.is_some()); assert!(parsed.text.is_none());
+        for values in [vec!["search", "saved", "--query", "x", "--text", "x"],
+            vec!["search", "saved", "--query", "x", "--raw-hex", "78"],
+            vec!["search", "saved", "--text", "x", "--max-scan-bytes", "0"],
+            vec!["read", "saved", "--member", "a", "--query", "x"],
+            vec!["save", "root", "--output", "new", "--query", "x"]] {
+            assert!(parse(&args(&values)).is_err());
+        }
+        assert!(!wants_json(&args(&["search", "saved", "--query", "--json"])));
+        assert!(!wants_json(&args(&["search", "saved", "--query", "x", "--max-scan-bytes", "--json"])));
     }
 }
