@@ -9,6 +9,7 @@
 
 mod paged;
 mod index;
+mod catalog;
 
 use std::{ffi::OsString, fs::{self, File, OpenOptions}, io::{self, Write}, path::{Path, PathBuf}, sync::Arc};
 use fcb::{ByteLength, ByteOffset, ByteRange};
@@ -16,7 +17,7 @@ use fcb::source::{CancelFlag, SourceError, NormalizedPath};
 use fcb::search::{CaptureRequest, CompleteCapture, ExtentConsistency, ExtentReadState, ExtentStepBudget,
     FileRangeReader, RawPath, ResourceBudget, RootId, SearchManifestId};
 use fcb::search::workspace::{RootGrant, WorkspaceCatalog, WorkspaceCaptures, WorkspaceLimits, WorkspaceStage};
-use fcb::search::snapshot::{SavedSourceError, SnapshotError, SnapshotLimits, SnapshotView,
+use fcb::search::snapshot::{SavedSourceError, SnapshotError, SnapshotLimits, SnapshotView, Sha256Digest,
     export_workspace, MAX_SNAPSHOT_BYTES};
 use crate::{AppError, MANAGED_BYTES, SCHEMA, EXIT_OK, EXIT_NO_MATCH, EXIT_ERROR, EXIT_PARTIAL, EXIT_CANCELED,
     allocation, file_id, owner, revision};
@@ -26,24 +27,28 @@ use crate::{input, workspace};
 
 const MAX_CALLS: u64 = 131_072;
 const HELP: &str = "fcb snapshot save ROOT --output NEW_FILE [--json] [--include-excluded]\n\
+fcb snapshot catalog FILE --output NEW_CATALOG [--json]\n\
 fcb snapshot inspect FILE [--json] [--limit N]\n\
 fcb snapshot search FILE (--text LITERAL | --raw-hex HEX) [--json] [--limit N]\n\
 fcb snapshot read FILE (--member NAME | --member-hex HEX) [--json]\n\
 fcb snapshot index help  # Build/reopen pinned substring indexes\n\
 Read options: --line N OR --offset N; --bytes N --lines N; --raw for original bytes\n\
 Save options: --max-files N --max-file-bytes N --max-total-bytes N\n\
-Explicit plaintext source export; no overwrite, no extraction, no restored root grants.\n\
-Offline reads/search use one verified member at a time after full archive validation.\n\
+Offline open options: --catalog FILE --catalog-digest TRUSTED_SHA256\n\
+Without a catalog, opening hashes the whole archive. A separately trusted catalog\n\
+checks archive boundaries and verifies loaded members; unread body integrity is unchecked.\n\
+Explicit plaintext source export; no overwrite, extraction, or restored root grants.\n\
 Offline completeness describes saved observations, never the current filesystem.\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Mode { Help, Save, Inspect, Search, Read }
+enum Mode { Help, Save, Catalog, Inspect, Search, Read }
 #[derive(Debug)]
 struct Settings {
     mode: Mode, source: Option<PathBuf>, output: Option<PathBuf>, text: Option<String>,
     raw_needle: Option<Vec<u8>>, member: Option<Vec<u8>>, offset: u64, line: Option<u64>,
     window_bytes: usize, lines: usize, raw: bool,
     json: bool, limit: usize, limits: WorkspaceLimits, include_excluded: bool,
+    catalog: Option<PathBuf>, catalog_pin: Option<Sha256Digest>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Effect { None, Incomplete, Written, Synced }
@@ -74,7 +79,7 @@ impl From<SavedSourceError> for Failure {
 
 fn takes_value(text: &str) -> bool {
     matches!(text, "--output" | "--text" | "--raw-hex" | "--limit" | "--max-files" | "--max-file-bytes" | "--max-total-bytes"
-        | "--member" | "--member-hex" | "--offset" | "--line" | "--bytes" | "--lines")
+        | "--member" | "--member-hex" | "--offset" | "--line" | "--bytes" | "--lines" | "--catalog" | "--catalog-digest")
 }
 fn wants_json(args: &[OsString]) -> bool {
     let mut cursor = 0;
@@ -95,12 +100,13 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
     }
     let mode = match args.first().and_then(|arg| arg.to_str()) {
         None | Some("help" | "--help" | "-h") => Mode::Help,
-        Some("save") => Mode::Save, Some("inspect") => Mode::Inspect, Some("search") => Mode::Search,
+        Some("save") => Mode::Save, Some("catalog") => Mode::Catalog,
+        Some("inspect") => Mode::Inspect, Some("search") => Mode::Search,
         Some("read") => Mode::Read, _ => return Err(Failure::new("SNAPSHOT_UNKNOWN_COMMAND")),
     };
     let mut settings = Settings { mode, source: None, output: None, text: None, raw_needle: None,
         member: None, offset: 0, line: None, window_bytes: 64 * 1024, lines: 100, raw: false, json: false,
-        limit: 100, limits: WorkspaceLimits::default(), include_excluded: false };
+        limit: 100, limits: WorkspaceLimits::default(), include_excluded: false, catalog: None, catalog_pin: None };
     let mut seen = 0u32;
     let mut cursor = usize::from(!args.is_empty());
     let mut positional = false;
@@ -114,6 +120,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 "--max-file-bytes" => 64, "--max-total-bytes" => 128,
                 "--member" => 256, "--member-hex" => 512, "--offset" => 1024, "--line" => 2048,
                 "--bytes" => 4096, "--lines" => 8192, "--raw" => 16384, "--raw-hex" => 32768,
+                "--catalog" => 65536, "--catalog-digest" => 131072,
                 _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")), };
             if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
             seen |= bit;
@@ -121,15 +128,18 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
             if option == "--include-excluded" { settings.include_excluded = true; continue; }
             if option == "--raw" { settings.raw = true; continue; }
             let value = args.get(cursor).ok_or_else(|| Failure::new("CLI_MISSING_VALUE"))?; cursor += 1;
-            if option == "--output" {
+            if option == "--output" || option == "--catalog" {
                 if value.is_empty() { return Err(Failure::new("CLI_MISSING_VALUE")); }
-                settings.output = Some(PathBuf::from(value)); continue;
+                if option == "--output" { settings.output = Some(PathBuf::from(value)); }
+                else { settings.catalog = Some(PathBuf::from(value)); }
+                continue;
             }
             if option == "--member" {
                 if value.is_empty() || settings.member.is_some() { return Err(Failure::new("CLI_INVALID_MEMBER")); }
                 settings.member = Some(RawPath::from_path(&PathBuf::from(value)).as_bytes().to_vec()); continue;
             }
             let text = value.to_str().ok_or_else(|| Failure::new("CLI_INVALID_VALUE"))?;
+            if option == "--catalog-digest" { settings.catalog_pin = Some(catalog::parse_pin(text)?); continue; }
             if option == "--text" {
                 if text.is_empty() || text.len() > 1024 { return Err(Failure::new("CLI_INVALID_NEEDLE")); }
                 settings.text = Some(text.to_owned()); continue;
@@ -156,14 +166,17 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
             settings.source = Some(PathBuf::from(arg));
         }
     }
+    if settings.catalog.is_some() != settings.catalog_pin.is_some() { return Err(Failure::new("CATALOG_PATH_AND_PIN_REQUIRED")); }
+    let catalog_options = 65536 | 131072;
     let valid = match mode {
         Mode::Help => settings.source.is_none() && seen & !1 == 0,
         Mode::Save => settings.source.is_some() && settings.output.is_some() && seen & !(1 | 2 | 16 | 32 | 64 | 128) == 0,
-        Mode::Inspect => settings.source.is_some() && seen & !(1 | 8) == 0,
+        Mode::Catalog => settings.source.is_some() && settings.output.is_some() && seen & !(1 | 2) == 0,
+        Mode::Inspect => settings.source.is_some() && seen & !(1 | 8 | catalog_options) == 0,
         Mode::Search => settings.source.is_some() && (settings.text.is_some() != settings.raw_needle.is_some())
-            && seen & !(1 | 4 | 8 | 32768) == 0,
+            && seen & !(1 | 4 | 8 | 32768 | catalog_options) == 0,
         Mode::Read => settings.source.is_some() && settings.member.is_some()
-            && seen & !(1 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384) == 0
+            && seen & !(1 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 | catalog_options) == 0
             && seen & (1024 | 2048) != (1024 | 2048)
             && (!settings.raw || (settings.line.is_none() && seen & 8192 == 0)),
     };
@@ -241,6 +254,7 @@ fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBudget, effec
         return Ok(EXIT_OK);
     }
     if settings.mode == Mode::Save { return save(settings, out, budget, effect, canceled); }
+    if settings.mode == Mode::Catalog { return catalog::build(settings, out, budget, effect, canceled); }
     paged::execute(settings, out, budget, canceled)
 }
 fn begin(out: &mut Output, command: &str) -> Result<(), OutputError> {
@@ -407,5 +421,17 @@ mod tests {
             vec!["search", "saved", "--text", "x", "--raw-hex", "78"]] {
             assert!(parse(&args(&values)).is_err());
         }
+    }
+    #[test]
+    fn catalog_options_require_explicit_pins_and_cannot_skip_validation_for_a_new_build() {
+        let pin = "ab".repeat(32);
+        assert!(parse(&args(&["inspect", "saved", "--catalog", "meta"])).is_err());
+        assert!(parse(&args(&["inspect", "saved", "--catalog-digest", &pin])).is_err());
+        assert!(parse(&args(&["catalog", "saved", "--output", "new", "--catalog", "meta", "--catalog-digest", &pin])).is_err());
+        assert!(parse(&args(&["save", "root", "--output", "new", "--catalog", "meta", "--catalog-digest", &pin])).is_err());
+        assert!(parse(&args(&["inspect", "saved", "--catalog", "meta", "--catalog-digest", &pin])).is_ok());
+        assert!(parse(&args(&["catalog", "saved", "--output", "new"])).is_ok());
+        assert!(!wants_json(&args(&["inspect", "saved", "--catalog", "--json"])));
+        assert!(!wants_json(&args(&["inspect", "saved", "--catalog-digest", "--json"])));
     }
 }
