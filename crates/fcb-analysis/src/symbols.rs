@@ -111,6 +111,7 @@ pub struct CapturedSymbols<'source> {
     request: CaptureRequest,
     generation: QueryGeneration,
     language: SymbolLanguage,
+    encoding: DetectedEncoding,
     candidates: Vec<SymbolCandidate>,
     limited: bool,
     fallback: bool,
@@ -174,12 +175,13 @@ impl<'source> CapturedSymbols<'source> {
         }
         let fallback = candidates.is_empty() && !source.is_empty();
         if canceled() { return Err(SymbolError::Canceled); }
-        Ok(Self { source, request, generation, language, candidates, limited, fallback, _lease: lease })
+        Ok(Self { source, request, generation, language, encoding, candidates, limited, fallback, _lease: lease })
     }
     pub const fn file(&self) -> FileId { self.request.file() }
     pub const fn revision(&self) -> SourceRevision { self.request.revision() }
     pub const fn generation(&self) -> QueryGeneration { self.generation }
     pub const fn language(&self) -> SymbolLanguage { self.language }
+    pub const fn encoding(&self) -> DetectedEncoding { self.encoding }
     pub fn candidates(&self) -> &[SymbolCandidate] { &self.candidates }
     pub const fn output_limited(&self) -> bool { self.limited }
     /// No recognized declaration, not proof that the file contains no symbols.
