@@ -32,6 +32,9 @@ pub mod snapshot;
 /// File-backed snapshot access, one-member queries, and exact offline reading.
 #[cfg(feature = "snapshot")]
 pub mod paged_snapshot;
+/// Digest-pinned persistent substring segments; exact verification stays required.
+#[cfg(feature = "snapshot")]
+pub mod snapshot_index;
 /// Saved-scope comparison and bounded exact old/new source correspondence.
 #[cfg(feature = "snapshot")]
 pub mod snapshot_comparison;
