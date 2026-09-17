@@ -16,6 +16,7 @@ mod snapshot_diff;
 mod trail;
 mod symbols;
 mod lines;
+mod atlas;
 
 use std::{ffi::OsString, io::{Read, Write}};
 use fcb::{ArenaOwnerId, ByteLength, FileId, SourceRevision};
@@ -141,6 +142,10 @@ impl From<FileSearchError> for AppError { fn from(error: FileSearchError) -> Sel
 /// redacted stderr diagnostic follows. No caller process exit or signal occurs.
 pub fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut impl Write,
     stderr: &mut impl Write, mut canceled: impl FnMut() -> bool) -> u8 {
+    // Atlas plans consume explicit metadata discovery, never implicit stdin.
+    if arguments.first().is_some_and(|argument| argument == "atlas") {
+        return atlas::run(&arguments[1..], stdout, stderr, canceled);
+    }
     // Line navigation uses a forward scan and never reads implicit stdin.
     if lines::requested(arguments) {
         return lines::run(arguments, stdout, stderr, canceled);
