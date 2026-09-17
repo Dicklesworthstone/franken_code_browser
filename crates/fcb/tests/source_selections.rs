@@ -129,6 +129,7 @@ fn exact_byte_copy_vs_decoded_unicode_with_utf16_bom() {
     let staged = StagedClipboardData::stage(
         &selection,
         &capture,
+        generation(1),
         ClipboardLimits::default(),
         || false,
     )
@@ -158,6 +159,7 @@ fn exact_byte_copy_vs_decoded_unicode_with_malformed_utf8() {
     let staged = StagedClipboardData::stage(
         &selection,
         &capture,
+        generation(1),
         ClipboardLimits::default(),
         || false,
     )
@@ -188,6 +190,7 @@ fn exact_byte_copy_crlf_and_bidi_logical_order() {
     let staged_crlf = StagedClipboardData::stage(
         &sel_crlf,
         &capture_crlf,
+        generation(1),
         ClipboardLimits::default(),
         || false,
     )
@@ -214,6 +217,7 @@ fn exact_byte_copy_crlf_and_bidi_logical_order() {
     let staged_hebrew = StagedClipboardData::stage(
         &sel_hebrew,
         &capture_hebrew,
+        generation(1),
         ClipboardLimits::default(),
         || false,
     )
@@ -241,6 +245,7 @@ fn markdown_markers_and_location_provenance() {
     let staged = StagedClipboardData::stage(
         &selection,
         &capture,
+        generation(1),
         ClipboardLimits::default(),
         || false,
     )
@@ -262,7 +267,7 @@ fn clipboard_budget_refusal_preserves_old_clipboard() {
     clipboard.simulate_external_change("preserved previous text");
 
     let initial_text = clipboard.plain_text().unwrap().to_string();
-    let initial_token = clipboard.generation_token();
+    let initial_sync_tag = clipboard.generation_seq();
 
     // Generate payload of 100 bytes
     let bytes = vec![b'X'; 100];
@@ -282,21 +287,18 @@ fn clipboard_budget_refusal_preserves_old_clipboard() {
         max_clipboard_bytes: 50,
     };
 
-    let result = StagedClipboardData::stage(&selection, &capture, limits, || false);
-    match result {
+    let result = StagedClipboardData::stage(&selection, &capture, generation(1), limits, || false);
+    assert_eq!(
+        result,
         Err(ClipboardError::BudgetExceeded {
-            requested_bytes,
-            max_budget_bytes,
-        }) => {
-            assert_eq!(requested_bytes, 100);
-            assert_eq!(max_budget_bytes, 50);
-        }
-        other => panic!("expected BudgetExceeded, got {other:?}"),
-    }
+            requested_bytes: 100,
+            max_budget_bytes: 50,
+        })
+    );
 
     // Crucial invariant: existing clipboard remains completely untouched
     assert_eq!(clipboard.plain_text(), Some(initial_text.as_str()));
-    assert_eq!(clipboard.generation_token(), initial_token);
+    assert_eq!(clipboard.generation_seq(), initial_sync_tag);
 }
 
 #[test]
@@ -317,6 +319,7 @@ fn clipboard_cancellation_and_stale_capture_refusal() {
     let cancel_res = StagedClipboardData::stage(
         &selection,
         &capture,
+        generation(1),
         ClipboardLimits::default(),
         || true, // Canceled!
     );
@@ -328,17 +331,17 @@ fn clipboard_cancellation_and_stale_capture_refusal() {
     let stale_rev_res = StagedClipboardData::stage(
         &selection,
         &capture_rev2,
+        generation(1),
         ClipboardLimits::default(),
         || false,
     );
     assert_eq!(stale_rev_res, Err(ClipboardError::StaleSource));
 
     // 3. Stale query generation
-    let mut stale_gen_sel = selection;
-    stale_gen_sel.generation = generation(99);
     let stale_gen_res = StagedClipboardData::stage(
-        &stale_gen_sel,
+        &selection,
         &capture,
+        generation(2), // Active generation is 2, but selection is generation 1
         ClipboardLimits::default(),
         || false,
     );
@@ -362,20 +365,21 @@ fn concurrent_external_clipboard_change_and_native_failure() {
     let staged = StagedClipboardData::stage(
         &selection,
         &capture,
+        generation(1),
         ClipboardLimits::default(),
         || false,
     )
     .unwrap();
 
-    let initial_token = clipboard.generation_token();
+    let initial_sync_tag = clipboard.generation_seq();
 
     // Simulate external clipboard change before publication finishes
     clipboard.simulate_external_change("another application copied this!");
-    let external_token = clipboard.generation_token();
-    assert_ne!(initial_token, external_token);
+    let external_sync_tag = clipboard.generation_seq();
+    assert_ne!(initial_sync_tag, external_sync_tag);
 
     // Attempting publication with old token MUST fail with ConcurrentExternalChange
-    let err_conflict = clipboard.publish(staged.clone(), initial_token);
+    let err_conflict = clipboard.publish(staged.clone(), initial_sync_tag);
     assert_eq!(err_conflict, Err(ClipboardError::ConcurrentExternalChange));
     // The external application's text must NOT be overwritten!
     assert_eq!(
@@ -384,14 +388,14 @@ fn concurrent_external_clipboard_change_and_native_failure() {
     );
 
     // Successful publication with current token
-    let ok = clipboard.publish(staged.clone(), external_token);
+    let ok = clipboard.publish(staged.clone(), external_sync_tag);
     assert!(ok.is_ok());
     assert_eq!(clipboard.plain_text(), Some("hello world"));
 
     // Native publication failure injection
     clipboard.inject_publication_failure(true);
-    let curr_token = clipboard.generation_token();
-    let err_fail = clipboard.publish(staged, curr_token);
+    let curr_sync_tag = clipboard.generation_seq();
+    let err_fail = clipboard.publish(staged, curr_sync_tag);
     assert_eq!(err_fail, Err(ClipboardError::PublicationFailed));
     // Clipboard contents preserved
     assert_eq!(clipboard.plain_text(), Some("hello world"));
@@ -426,6 +430,7 @@ fn streamed_file_export_chunked_and_cancellation() {
     let outcome = StreamedFileExport::stream_to_writer(
         &selection,
         &capture,
+        generation(1),
         options,
         &mut output,
         || false,
@@ -441,6 +446,7 @@ fn streamed_file_export_chunked_and_cancellation() {
     let cancel_outcome = StreamedFileExport::stream_to_writer(
         &selection,
         &capture,
+        generation(1),
         options,
         &mut partial_output,
         || {
@@ -450,11 +456,10 @@ fn streamed_file_export_chunked_and_cancellation() {
     )
     .unwrap();
 
-    match cancel_outcome {
-        ExportOutcome::Canceled { bytes_written } => {
-            assert!(bytes_written > 0 && bytes_written < size);
-            assert_eq!(partial_output.len(), bytes_written);
-        }
-        _ => panic!("expected Canceled outcome"),
+    if let ExportOutcome::Canceled { bytes_written } = cancel_outcome {
+        assert!(bytes_written > 0 && bytes_written < size);
+        assert_eq!(partial_output.len(), bytes_written);
+    } else {
+        assert!(matches!(cancel_outcome, ExportOutcome::Canceled { .. }));
     }
 }

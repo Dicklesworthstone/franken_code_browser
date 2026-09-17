@@ -252,13 +252,14 @@ impl StagedClipboardData {
     pub fn stage(
         selection: &SourceSelection,
         capture: &SourceCapture,
+        active_generation: QueryGeneration,
         limits: ClipboardLimits,
         canceled: impl Fn() -> bool,
     ) -> Result<Self, ClipboardError> {
         if canceled() {
             return Err(ClipboardError::Canceled);
         }
-        selection.validate(capture, selection.generation)?;
+        selection.validate(capture, active_generation)?;
 
         let (start, end) = selection
             .byte_range
@@ -326,7 +327,7 @@ pub struct NativeClipboard {
     plain_text: Option<String>,
     raw_bytes: Option<Vec<u8>>,
     provenance: Option<String>,
-    generation_token: u64,
+    generation_seq: u64,
     fail_next_publish: bool,
 }
 
@@ -342,13 +343,13 @@ impl NativeClipboard {
             plain_text: None,
             raw_bytes: None,
             provenance: None,
-            generation_token: 1,
+            generation_seq: 1,
             fail_next_publish: false,
         }
     }
 
-    pub const fn generation_token(&self) -> u64 {
-        self.generation_token
+    pub const fn generation_seq(&self) -> u64 {
+        self.generation_seq
     }
 
     pub fn plain_text(&self) -> Option<&str> {
@@ -373,20 +374,20 @@ impl NativeClipboard {
         self.plain_text = Some(text.to_string());
         self.raw_bytes = Some(text.as_bytes().to_vec());
         self.provenance = None;
-        self.generation_token = self.generation_token.wrapping_add(1);
+        self.generation_seq = self.generation_seq.wrapping_add(1);
     }
 
     /// Publish staged clipboard data atomically.
     ///
-    /// Returns [`ClipboardError::ConcurrentExternalChange`] if `expected_token != self.generation_token`.
+    /// Returns [`ClipboardError::ConcurrentExternalChange`] if `expected_seq != self.generation_seq`.
     /// Returns [`ClipboardError::PublicationFailed`] if native publication fails.
     /// On failure, the prior clipboard content is preserved without partial mutation.
     pub fn publish(
         &mut self,
         staged: StagedClipboardData,
-        expected_token: u64,
+        expected_seq: u64,
     ) -> Result<(), ClipboardError> {
-        if self.generation_token != expected_token {
+        if self.generation_seq != expected_seq {
             return Err(ClipboardError::ConcurrentExternalChange);
         }
 
@@ -398,7 +399,7 @@ impl NativeClipboard {
         self.plain_text = Some(staged.plain_text);
         self.raw_bytes = Some(staged.exact_bytes);
         self.provenance = Some(staged.provenance);
-        self.generation_token = self.generation_token.wrapping_add(1);
+        self.generation_seq = self.generation_seq.wrapping_add(1);
         Ok(())
     }
 }
@@ -433,11 +434,12 @@ impl StreamedFileExport {
     pub fn stream_to_writer<W: Write>(
         selection: &SourceSelection,
         capture: &SourceCapture,
+        active_generation: QueryGeneration,
         options: StreamedExportOptions,
         writer: &mut W,
         mut canceled: impl FnMut() -> bool,
     ) -> Result<ExportOutcome, ClipboardError> {
-        selection.validate(capture, selection.generation)?;
+        selection.validate(capture, active_generation)?;
 
         let (start, end) = selection
             .byte_range
