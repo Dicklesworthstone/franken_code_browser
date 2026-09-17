@@ -13,6 +13,7 @@ mod workspace;
 mod whole_file;
 mod snapshot;
 mod snapshot_diff;
+mod trail;
 
 use std::{ffi::OsString, io::{Read, Write}};
 use fcb::{ArenaOwnerId, ByteLength, FileId, SourceRevision};
@@ -138,6 +139,10 @@ impl From<FileSearchError> for AppError { fn from(error: FileSearchError) -> Sel
 /// redacted stderr diagnostic follows. No caller process exit or signal occurs.
 pub fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut impl Write,
     stderr: &mut impl Write, mut canceled: impl FnMut() -> bool) -> u8 {
+    // User-state exports have explicit write-aware terminal receipts.
+    if arguments.first().is_some_and(|argument| argument == "trail") {
+        return trail::run(&arguments[1..], stdout, stderr, canceled);
+    }
     // Snapshot save is the explicit source-export route with write-aware
     // terminal receipts. Diff remains a separate read-only operation.
     if arguments.first().is_some_and(|argument| argument == "snapshot") {
@@ -193,7 +198,7 @@ fn execute(args: &Arguments, stdin: &mut impl Read, output: &mut Output,
     budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<u8, AppError> {
     if canceled() { return Err(AppError::Canceled); }
     if args.workspace { return workspace::execute(args, output, budget, canceled); }
-    if args.whole_file { return whole_file::single(args, output, budget, canceled); }
+    if args.whole_file { return whole_file::single(args, stdin, output, budget, canceled); }
     match args.command {
         Command::Help => services::help(args.json, output),
         Command::Capabilities | Command::Doctor => services::capabilities(args, output),
