@@ -12,6 +12,8 @@
 //! avoids visiting unrelated members, but every candidate still needs exact
 //! source verification. Checksums alone never confer negative-certificate trust.
 
+pub mod paged;
+
 use std::ops::Range;
 use super::*;
 
