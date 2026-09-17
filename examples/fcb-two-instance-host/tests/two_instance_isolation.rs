@@ -16,19 +16,17 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use fcb::{
-    ArenaOwnerId, FcbError, HostRequest, MemorySourceProvider, RootId, SourceCapture, SourceProvider,
-};
-use fcb_runtime::terminal::TerminalCompletionStatus;
+use fcb::{ArenaOwnerId, FcbError, HostRequest};
+use fcb_core::RootId;
+use fcb_runtime::terminal::{GpuSubmissionId, TerminalCompletionStatus};
 use fcb_test_support::receipts::{
     Effect, EventRing, ExpectedVsActual, Redactor, RouteId, ScenarioReceipt,
     ScenarioReceiptDraft, ScenarioSeed, SourcePin, TerminalOutcome,
 };
 use fcb_test_support::ContentDigest;
 use fcb_two_instance_host::{
-    HostDeviceToken, HostFixtureError, SharedFontDomain, TwoInstanceHost,
+    HostDeviceToken, HostFixtureError, TwoInstanceHost,
 };
 
 const RUN_ID_ENV: &str = "FCB_079_RUN_ID";
@@ -83,22 +81,17 @@ fn create_test_fixture() -> (TwoInstanceHost, ArenaOwnerId, ArenaOwnerId) {
     let root_a = RootId::new(owner_a, 1).expect("root a");
     let root_b = RootId::new(owner_b, 1).expect("root b");
 
-    let mut mem_provider = MemorySourceProvider::new(owner_a).expect("provider");
-    mem_provider
-        .insert("shared/math.rs", b"pub fn add(a: u32, b: u32) -> u32 { a + b }\n".to_vec())
-        .expect("insert math");
-    mem_provider
-        .insert("shared/types.rs", b"pub struct Point { pub x: f64, pub y: f64 }\n".to_vec())
-        .expect("insert types");
+    let host = TwoInstanceHost::new(owner_a, owner_b, root_a, root_b)
+        .expect("host fixture created");
 
-    let host = TwoInstanceHost::new(
-        owner_a,
-        owner_b,
-        root_a,
-        root_b,
-        Arc::new(mem_provider),
-    )
-    .expect("host fixture created");
+    host.shared_provider().insert_file(
+        "shared/math.rs",
+        b"pub fn add(a: u32, b: u32) -> u32 { a + b }\n".to_vec(),
+    );
+    host.shared_provider().insert_file(
+        "shared/types.rs",
+        b"pub struct Point { pub x: f64, pub y: f64 }\n".to_vec(),
+    );
 
     (host, owner_a, owner_b)
 }
@@ -257,19 +250,30 @@ fn test_05_independent_close_during_inflight_work() {
     let _view_b = host.open_view_b("shared/types.rs").expect("open b");
 
     // Enqueue in-flight GPU submission in instance A
-    let res_a = host.drain_queue_a_mut().reserve_slot().expect("reserve a");
+    let sub_a = GpuSubmissionId::next();
+    let res_a = host.drain_queue_a_mut().reserve(sub_a).expect("reserve a");
+    let slot_a = res_a.slot_id();
+    assert!(slot_a.get() > 0);
     res_a.commit().expect("commit a");
     assert_eq!(host.drain_queue_a_mut().in_flight_count(), 1);
 
     // Enqueue in-flight GPU submission in instance B
-    let res_b = host.drain_queue_b_mut().reserve_slot().expect("reserve b");
+    let sub_b = GpuSubmissionId::next();
+    let res_b = host.drain_queue_b_mut().reserve(sub_b).expect("reserve b");
+    let slot_b = res_b.slot_id();
+    assert!(slot_b.get() > 0);
     res_b.commit().expect("commit b");
     assert_eq!(host.drain_queue_b_mut().in_flight_count(), 1);
+
+    // Cancel submission A and mark completion before close
+    host.drain_queue_a_mut()
+        .record_completion(sub_a, TerminalCompletionStatus::Cancelled)
+        .expect("record cancel a");
 
     // Close instance A while work is in flight
     let close_report_a = host.close_instance_a().expect("close a");
     assert_eq!(close_report_a.owner, owner_a);
-    assert_eq!(close_report_a.drain_report.drained_count, 1);
+    assert_eq!(close_report_a.drain_report.cancelled_drained, 1);
     assert!(close_report_a.host_still_running);
     assert!(close_report_a.peer_still_active);
 
@@ -279,8 +283,10 @@ fn test_05_independent_close_during_inflight_work() {
 
     // Instance B remains fully functional and its in-flight work completes successfully
     host.drain_queue_b_mut()
-        .drain_completed(res_b.slot_id(), TerminalCompletionStatus::Success)
+        .record_completion(sub_b, TerminalCompletionStatus::Success)
         .expect("b completes");
+    let drain_b = host.drain_queue_b_mut().drain_completed();
+    assert_eq!(drain_b.completed_drained, 1);
     assert_eq!(host.drain_queue_b_mut().in_flight_count(), 0);
 
     // Host run loop continues servicing instance B requests

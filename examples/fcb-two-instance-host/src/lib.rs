@@ -190,7 +190,11 @@ impl SharedFontDomain {
 
 /// Audited shared source provider tracking per-instance queries.
 pub struct AuditedSharedSourceProvider {
-    inner: Arc<dyn SourceProvider>,
+    files: Mutex<BTreeMap<String, Vec<u8>>>,
+    alloc_files_a: Mutex<fcb_core::IdAllocator<FileId>>,
+    alloc_rev_a: Mutex<fcb_core::IdAllocator<SourceRevision>>,
+    alloc_files_b: Mutex<fcb_core::IdAllocator<FileId>>,
+    alloc_rev_b: Mutex<fcb_core::IdAllocator<SourceRevision>>,
     queries_a: AtomicUsize,
     queries_b: AtomicUsize,
     owner_a: ArenaOwnerId,
@@ -198,29 +202,49 @@ pub struct AuditedSharedSourceProvider {
 }
 
 impl AuditedSharedSourceProvider {
-    pub fn new(
-        inner: Arc<dyn SourceProvider>,
-        owner_a: ArenaOwnerId,
-        owner_b: ArenaOwnerId,
-    ) -> Self {
-        Self {
-            inner,
+    pub fn new(owner_a: ArenaOwnerId, owner_b: ArenaOwnerId) -> Result<Self, fcb_core::CoreError> {
+        Ok(Self {
+            files: Mutex::new(BTreeMap::new()),
+            alloc_files_a: Mutex::new(fcb_core::IdAllocator::new(owner_a, 1)?),
+            alloc_rev_a: Mutex::new(fcb_core::IdAllocator::new(owner_a, 1)?),
+            alloc_files_b: Mutex::new(fcb_core::IdAllocator::new(owner_b, 1)?),
+            alloc_rev_b: Mutex::new(fcb_core::IdAllocator::new(owner_b, 1)?),
             queries_a: AtomicUsize::new(0),
             queries_b: AtomicUsize::new(0),
             owner_a,
             owner_b,
+        })
+    }
+
+    pub fn insert_file(&self, path: impl Into<String>, bytes: Vec<u8>) {
+        if let Ok(mut lock) = self.files.lock() {
+            lock.insert(path.into(), bytes);
         }
     }
 
     pub fn capture_for_session(&self, owner: ArenaOwnerId, path: &str) -> Result<SourceCapture, FcbError> {
+        let file_bytes = {
+            let lock = self.files.lock().map_err(|_| FcbError::ProviderUnavailable)?;
+            lock.get(path).cloned().ok_or(FcbError::SourceNotFound)?
+        };
+
         if owner == self.owner_a {
             self.queries_a.fetch_add(1, Ordering::SeqCst);
+            let mut fa = self.alloc_files_a.lock().map_err(|_| FcbError::ProviderUnavailable)?;
+            let mut ra = self.alloc_rev_a.lock().map_err(|_| FcbError::ProviderUnavailable)?;
+            let file = fa.allocate().map_err(FcbError::from)?;
+            let rev = ra.allocate().map_err(FcbError::from)?;
+            SourceCapture::from_bytes(owner, file, rev, path, file_bytes)
         } else if owner == self.owner_b {
             self.queries_b.fetch_add(1, Ordering::SeqCst);
+            let mut fb = self.alloc_files_b.lock().map_err(|_| FcbError::ProviderUnavailable)?;
+            let mut rb = self.alloc_rev_b.lock().map_err(|_| FcbError::ProviderUnavailable)?;
+            let file = fb.allocate().map_err(FcbError::from)?;
+            let rev = rb.allocate().map_err(FcbError::from)?;
+            SourceCapture::from_bytes(owner, file, rev, path, file_bytes)
         } else {
-            return Err(FcbError::OwnerMismatch);
+            Err(FcbError::OwnerMismatch)
         }
-        self.inner.capture(path)
     }
 
     pub fn audit_counters(&self) -> (usize, usize) {
@@ -228,6 +252,24 @@ impl AuditedSharedSourceProvider {
             self.queries_a.load(Ordering::SeqCst),
             self.queries_b.load(Ordering::SeqCst),
         )
+    }
+}
+
+/// Adapter allowing a session to query the shared provider using its own identity.
+pub struct SessionSourceProviderAdapter {
+    owner: ArenaOwnerId,
+    shared: Arc<AuditedSharedSourceProvider>,
+}
+
+impl SessionSourceProviderAdapter {
+    pub fn new(owner: ArenaOwnerId, shared: Arc<AuditedSharedSourceProvider>) -> Self {
+        Self { owner, shared }
+    }
+}
+
+impl SourceProvider for SessionSourceProviderAdapter {
+    fn capture(&self, logical_path: &str) -> Result<SourceCapture, FcbError> {
+        self.shared.capture_for_session(self.owner, logical_path)
     }
 }
 
@@ -297,6 +339,7 @@ impl HostRunLoop {
                     return Err(FcbError::OwnerMismatch);
                 }
             }
+            _ => {}
         }
         Ok(())
     }
@@ -373,7 +416,6 @@ impl TwoInstanceHost {
         owner_b: ArenaOwnerId,
         root_a: RootId,
         root_b: RootId,
-        provider: Arc<dyn SourceProvider>,
     ) -> Result<Self, HostFixtureError> {
         if owner_a == owner_b {
             return Err(HostFixtureError::OwnerMismatch {
@@ -384,17 +426,19 @@ impl TwoInstanceHost {
 
         let run_loop = Arc::new(HostRunLoop::new(owner_a, owner_b));
         let font_domain = Arc::new(SharedFontDomain::new(owner_a, owner_b));
-        let shared_provider = Arc::new(AuditedSharedSourceProvider::new(
-            provider.clone(),
-            owner_a,
-            owner_b,
-        ));
+        let shared_provider = Arc::new(
+            AuditedSharedSourceProvider::new(owner_a, owner_b)
+                .map_err(|_| HostFixtureError::CrossOwnerAccessDenied)?,
+        );
 
         let services_a: Arc<dyn HostServices> = Arc::new(InstanceHostServices::new(owner_a, run_loop.clone()));
         let services_b: Arc<dyn HostServices> = Arc::new(InstanceHostServices::new(owner_b, run_loop.clone()));
 
-        let session_a = BrowserSession::with_provider_and_services(owner_a, provider.clone(), services_a);
-        let session_b = BrowserSession::with_provider_and_services(owner_b, provider, services_b);
+        let prov_adapter_a: Arc<dyn SourceProvider> = Arc::new(SessionSourceProviderAdapter::new(owner_a, shared_provider.clone()));
+        let prov_adapter_b: Arc<dyn SourceProvider> = Arc::new(SessionSourceProviderAdapter::new(owner_b, shared_provider.clone()));
+
+        let session_a = BrowserSession::with_provider_and_services(owner_a, prov_adapter_a, services_a);
+        let session_b = BrowserSession::with_provider_and_services(owner_b, prov_adapter_b, services_b);
 
         let device_a = HostDeviceToken::new(101, owner_a);
         let device_b = HostDeviceToken::new(202, owner_b);
@@ -518,7 +562,8 @@ impl TwoInstanceHost {
         self.private_annotations_a.clear();
         self.font_domain.revoke_consent(self.owner_a);
 
-        let drain_report = self.drain_queue_a.close_and_drain_all(TerminalCompletionStatus::Cancelled)?;
+        self.drain_queue_a.close();
+        let drain_report = self.drain_queue_a.drain_completed();
         let _ = session.close();
 
         Ok(InstanceCloseSummary {
@@ -539,7 +584,8 @@ impl TwoInstanceHost {
         self.private_annotations_b.clear();
         self.font_domain.revoke_consent(self.owner_b);
 
-        let drain_report = self.drain_queue_b.close_and_drain_all(TerminalCompletionStatus::Cancelled)?;
+        self.drain_queue_b.close();
+        let drain_report = self.drain_queue_b.drain_completed();
         let _ = session.close();
 
         Ok(InstanceCloseSummary {
