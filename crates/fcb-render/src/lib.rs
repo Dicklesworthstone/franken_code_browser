@@ -455,3 +455,23 @@ mod tests {
 }
 
 pub mod display_mapping;
+pub mod host_target;
+pub mod reference_oracle;
+pub mod semantic_order;
+pub mod shader_abi;
+
+pub use host_target::{
+    HostDrawableLeaseTracker, RenderTargetDescriptor, TargetColorSpace, TargetLeaseState,
+    TargetPixelFormat, TargetSampleCount, TargetValidationError, MAX_TARGET_DIMENSION,
+};
+pub use reference_oracle::{
+    CpuReferenceCompositor, OracleDefect, ReferenceOracle, ReferencePixel,
+};
+pub use semantic_order::{
+    DepthPolicy, ProjectionMode, RenderLayer, SemanticOrderError, validate_semantic_order,
+    verify_projection_stability,
+};
+pub use shader_abi::{
+    FieldMetadata, GpuFrameUniforms, GpuGlyphRecord, GpuScissorRecord, GpuSolidRectRecord,
+    ShaderAbiError,
+};
