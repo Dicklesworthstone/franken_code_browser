@@ -5,14 +5,15 @@
 //! digest must come from the prior trusted build receipt, never the input file.
 
 mod refresh;
+mod inverted;
 
-use std::{ffi::OsString, fs, io::{self, Read, Write}, path::{Path, PathBuf}};
+use std::{ffi::OsString, fs, io::{self, Read, Seek, Write}, path::{Path, PathBuf}};
 use fcb::ByteLength;
 use fcb::search::{IndexLimits, RawPath, ResourceBudget, StreamReadStep};
 use fcb::search::paged_snapshot::{PagedQuery, PagedQueryOptions, PagedQueryState,
     IndexedNeedle, SnapshotDirectory, PagedSnapshotError};
 use fcb::search::snapshot::Sha256Digest;
-use fcb::search::snapshot_index::{SnapshotIndex, SnapshotIndexError, SavedIndexStats, MAX_INDEX_BYTES, MAX_INDEX_GRAMS};
+use fcb::search::snapshot_index::{SnapshotIndex, SnapshotIndexError, SavedIndexStats, MAX_POSTINGS_BYTES, MAX_INDEX_GRAMS};
 use fcb_core::ResourceLease;
 use crate::{allocation, file_id, generation, owner, revision, input};
 use crate::output::{Output, MAX_RESPONSE_BYTES};
@@ -20,13 +21,16 @@ use super::{Failure, Effect, begin, failure_output, write_new, hex, decimal, cat
     MAX_ARGUMENTS, MAX_ARGUMENT_BYTES, MAX_SINGLE_ARGUMENT, MANAGED_BYTES,
     EXIT_OK, EXIT_NO_MATCH, EXIT_ERROR, EXIT_PARTIAL, EXIT_CANCELED};
 
-const HELP: &str = "fcb snapshot index build SNAPSHOT --output NEW_INDEX [--json]\n\
+const HELP: &str = "fcb snapshot index build SNAPSHOT --output NEW_INDEX [--inverted] [--json]\n\
 fcb snapshot index refresh NEW_SNAPSHOT --base OLD_SNAPSHOT --index OLD_INDEX\n\
-    --index-digest TRUSTED_OLD_SHA256 --output NEW_INDEX [--json]\n\
+    --index-digest TRUSTED_OLD_SHA256 --output NEW_INDEX [--inverted] [--json]\n\
 fcb snapshot index inspect SNAPSHOT --index INDEX --index-digest TRUSTED_SHA256 [--json]\n\
 fcb snapshot index search SNAPSHOT --index INDEX --index-digest TRUSTED_SHA256\n\
     (--text LITERAL | --raw-hex HEX) [--limit N] [--json]\n\
 Build/refresh options: --max-grams N --max-file-bytes N --max-source-bytes N\n\
+--inverted persists global postings for rarest-list candidate intersection.\n\
+Search and inspect accept both layouts automatically under the trusted pin.\n\
+The posting table is read/validated in full; selected source is still verified.\n\
 Optional target cold-open: --catalog FILE --catalog-digest TRUSTED_CATALOG_SHA256\n\
 Refresh base cold-open: --base-catalog FILE --base-catalog-digest TRUSTED_SHA256\n\
 Refresh copies only digest-identical complete segments; changed files rebuild or\n\
@@ -43,6 +47,7 @@ struct Options {
     pin: Option<Sha256Digest>, text: Option<String>, raw: Option<Vec<u8>>, json: bool,
     limit: usize, build: IndexLimits, catalog: Option<PathBuf>, catalog_pin: Option<Sha256Digest>,
     base: Option<PathBuf>, base_catalog: Option<PathBuf>, base_catalog_pin: Option<Sha256Digest>,
+    inverted: bool,
 }
 impl From<SnapshotIndexError> for Failure {
     fn from(error: SnapshotIndexError) -> Self {
@@ -81,7 +86,7 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
     };
     let mut out = Options { action, archive: None, output: None, index: None, pin: None, text: None,
         raw: None, json: false, limit: 100, build: IndexLimits::default(), catalog: None, catalog_pin: None,
-        base: None, base_catalog: None, base_catalog_pin: None };
+        base: None, base_catalog: None, base_catalog_pin: None, inverted: false };
     let mut seen = 0u16;
     let mut cursor = usize::from(!args.is_empty());
     let mut positional = false;
@@ -98,11 +103,13 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
             "--max-file-bytes" => 256, "--max-source-bytes" => 512,
             "--catalog" => 1024, "--catalog-digest" => 2048,
             "--base" => 4096, "--base-catalog" => 8192, "--base-catalog-digest" => 16384,
+            "--inverted" => 32768,
             _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")),
         };
         if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
         seen |= bit;
         if option == "--json" { out.json = true; continue; }
+        if option == "--inverted" { out.inverted = true; continue; }
         let value = args.get(cursor).ok_or_else(|| Failure::new("CLI_MISSING_VALUE"))?; cursor += 1;
         if value.is_empty() { return Err(Failure::new("CLI_MISSING_VALUE")); }
         match option {
@@ -141,9 +148,9 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
     let catalog_options = 1024 | 2048;
     let valid = match action {
         Action::Help => out.archive.is_none() && seen & !1 == 0,
-        Action::Build => out.archive.is_some() && out.output.is_some() && seen & !(1 | 2 | 128 | 256 | 512 | catalog_options) == 0,
+        Action::Build => out.archive.is_some() && out.output.is_some() && seen & !(1 | 2 | 128 | 256 | 512 | catalog_options | 32768) == 0,
         Action::Refresh => out.archive.is_some() && out.base.is_some() && out.output.is_some() && out.index.is_some() && out.pin.is_some()
-            && seen & !(1 | 2 | 4 | 8 | 128 | 256 | 512 | catalog_options | 4096 | 8192 | 16384) == 0,
+            && seen & !(1 | 2 | 4 | 8 | 128 | 256 | 512 | catalog_options | 4096 | 8192 | 16384 | 32768) == 0,
         Action::Inspect => out.archive.is_some() && out.index.is_some() && out.pin.is_some() && seen & !(1 | 4 | 8 | catalog_options) == 0,
         Action::Search => out.archive.is_some() && out.index.is_some() && out.pin.is_some()
             && (out.text.is_some() != out.raw.is_some()) && seen & !(1 | 4 | 8 | 16 | 32 | 64 | catalog_options) == 0,
@@ -215,18 +222,20 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
     if options.action == Action::Build {
         let index = SnapshotIndex::build(&mut archive, options.build, budget,
             [allocation(152), allocation(153), allocation(154), allocation(155)], &mut *canceled)?;
-        let artifact = index.encode(budget, allocation(156), &mut *canceled)?;
+        let artifact = inverted::encode(&index, options.inverted, budget, canceled)?;
         let destination = destination.ok_or_else(|| Failure::new("SNAPSHOT_OUTPUT_REQUIRED"))?;
         write_new(&destination, artifact.bytes(), effect, canceled)?;
         if options.json {
             begin(out, "snapshot-index-build")?; summary(out, archive.directory(), index.stats(), artifact.digest())?;
+            inverted::fields(out, options.inverted)?;
             out.literal(",\"effect\":")?; out.quoted(effect.name())?;
             out.literal(",\"destination\":")?; out.path(&destination)?;
             out.literal(",\"index_bytes\":")?; out.integer(artifact.bytes().len() as u64)?;
             out.literal(",\"member_payload_bytes_loaded\":")?; out.integer(archive.load_stats().bytes_read)?;
             out.literal(",\"source_derived_sensitive\":true,\"power_loss_qualified\":false}\n")?;
         } else {
-            out.literal("Saved substring index. Retain this trusted index digest separately:\n")?;
+            out.literal(if options.inverted { "Saved global posting index. Retain this trusted index digest separately:\n" }
+                else { "Saved substring index. Retain this trusted index digest separately:\n" })?;
             out.literal(&artifact.digest().to_hex())?; out.literal("\n")?;
             out.literal("Source-derived data may expose source fragments. Existing destinations are never overwritten.\n")?;
             out.literal(if index.stats().uncovered_files > 0 { "Some files remain uncovered and will be scanned directly.\n" } else { "All captured members have segments.\n" })?;
@@ -236,15 +245,17 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
     }
     let pin = options.pin.ok_or_else(|| Failure::new("SAVED_INDEX_PIN_REQUIRED"))?;
     let loaded = load_index(options.index.as_deref().ok_or_else(|| Failure::new("SAVED_INDEX_REQUIRED"))?, budget, canceled)?;
-    let index = SnapshotIndex::decode_pinned(&loaded.bytes, pin, archive.directory(), budget, allocation(152), &mut *canceled)?;
+    let index = inverted::QueryIndex::decode(&loaded.bytes, pin, archive.directory(), budget, canceled)?;
     let index_bytes = loaded.bytes.len();
     drop(loaded);
     if options.action == Action::Inspect {
         if options.json {
             begin(out, "snapshot-index-inspect")?; summary(out, archive.directory(), index.stats(), pin)?;
+            inverted::fields(out, index.inverted())?;
             out.literal(",\"index_bytes\":")?; out.integer(index_bytes as u64)?;
             out.literal(",\"member_payload_bytes_loaded\":\"0\"}\n")?;
         } else { out.literal("Pinned index matches the selected saved scope.\n")?;
+            out.literal(if index.inverted() { "Layout: global posting lists.\n" } else { "Layout: per-member grams.\n" })?;
             out.literal("Indexed files: ")?; out.literal(&index.stats().indexed_files.to_string())?;
             out.literal("; uncovered files: ")?; out.literal(&index.stats().uncovered_files.to_string())?; out.literal("\n")?; }
         return Ok(if index.stats().uncovered_files > 0 || index.stats().unavailable_files > 0
@@ -256,8 +267,7 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
         _ => return Err(Failure::new("CLI_INVALID_NEEDLE")),
     }.map_err(|error| Failure::new(&error.to_string()))?;
     let opts = PagedQueryOptions { generation: generation(), first_file: file_id(), first_revision: revision(), max_matches: options.limit };
-    let mut query = PagedQuery::new_indexed(&mut archive, &needle, &index, opts, budget,
-        [allocation(158), allocation(159), allocation(160)])?;
+    let mut query = index.query(&mut archive, &needle, opts, budget)?;
     while query.state() == PagedQueryState::Pending {
         query.step(StreamReadStep::default(), generation(), budget, &mut *canceled)?;
     }
@@ -265,6 +275,7 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
     if canceled() { return Err(Failure::canceled()); }
     if options.json {
         begin(out, "snapshot-index-search")?; summary(out, archive.directory(), index.stats(), pin)?;
+        inverted::fields(out, index.inverted())?;
         out.literal(",\"identity_scope\":\"response-local\",\"mode\":")?;
         out.quoted(if options.text.is_some() { "exact-text" } else { "original-bytes" })?;
         out.literal(",\"workspace_complete\":")?; out.boolean(report.is_complete())?;
@@ -274,6 +285,12 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
         out.literal(",\"index_eliminated_files\":")?; out.integer(report.stats().index_eliminated_files as u64)?;
         out.literal(",\"index_candidates\":")?; out.integer(report.stats().index_candidates as u64)?;
         out.literal(",\"index_fallback_files\":")?; out.integer(report.stats().index_fallback_files as u64)?;
+        out.literal(",\"metadata_members_visited\":")?; out.integer(report.stats().members_visited as u64)?;
+        out.literal(",\"posting_list_lookups\":")?; out.integer(report.stats().posting_list_lookups as u64)?;
+        out.literal(",\"posting_entries_visited\":")?; out.integer(report.stats().posting_entries_visited as u64)?;
+        out.literal(",\"posting_membership_lookups\":")?; out.integer(report.stats().posting_membership_lookups as u64)?;
+        out.literal(",\"posting_cursor_complete\":")?; out.boolean(report.stats().posting_cursor_complete)?;
+        out.literal(",\"index_bytes\":")?; out.integer(index_bytes as u64)?;
         out.literal(",\"member_payload_bytes_loaded\":")?; out.integer(archive.load_stats().bytes_read)?;
         out.literal(",\"loaded_members\":")?; out.integer(archive.load_stats().loaded_members)?;
         out.literal(",\"scanned_bytes\":")?; out.integer(report.stats().scanned_bytes)?;
@@ -323,7 +340,7 @@ fn load_index(path: &Path, budget: &ResourceBudget, canceled: &mut impl FnMut() 
     let path = input::absolute(path)?;
     let (mut file, metadata) = input::open_regular(&path)?;
     let length = usize::try_from(metadata.len()).map_err(|_| Failure::new("SAVED_INDEX_LIMIT"))?;
-    if length > MAX_INDEX_BYTES { return Err(Failure::new("SAVED_INDEX_LIMIT")); }
+    if length > MAX_POSTINGS_BYTES { return Err(Failure::new("SAVED_INDEX_LIMIT")); }
     let lease = budget.try_reserve_managed(owner(), allocation(156), ByteLength::new(length as u64 + 256))
         .map_err(|_| Failure::new("SAVED_INDEX_RESOURCE_DENIED"))?;
     let mut bytes = Vec::new(); bytes.try_reserve_exact(length).map_err(|_| Failure::new("SAVED_INDEX_RESOURCE_DENIED"))?;
@@ -399,5 +416,17 @@ mod tests {
             assert!(!wants_json(&args(&["refresh", "new", option, "--json"])));
             assert!(parse(&args(&["build", "new", "--output", "fresh", option, "old"])).is_err());
         }
+    }
+    #[test]
+    fn inverted_layout_is_explicit_for_publication_and_never_changes_a_query_value() {
+        let parsed = parse(&args(&["build", "saved", "--output", "new", "--inverted"])).unwrap();
+        assert!(parsed.inverted);
+        assert!(parse(&args(&["build", "saved", "--output", "new", "--inverted", "--inverted"])).is_err());
+        assert!(!parse(&args(&["build", "saved", "--output", "--inverted"])).unwrap().inverted);
+        let pin = "ab".repeat(32);
+        let parsed = parse(&args(&["search", "saved", "--index", "i", "--index-digest", &pin, "--text", "--inverted"])).unwrap();
+        assert_eq!(parsed.text.as_deref(), Some("--inverted"));
+        assert!(!parsed.inverted);
+        assert!(parse(&args(&["inspect", "saved", "--index", "i", "--index-digest", &pin, "--inverted"])).is_err());
     }
 }
