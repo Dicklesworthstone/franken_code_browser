@@ -198,6 +198,11 @@ impl BoundedDiscovery {
     }
     pub fn reads_rule_files(&self) -> bool { self.read_rule_files || self.repository_rules.is_some() }
     pub fn repository_rules(&self) -> Option<&RepositoryRules> { self.repository_rules.as_ref() }
+    /// End traversal and transfer its exact policy evidence without copying.
+    /// Pending queues and directory descriptors are retired here on the worker;
+    /// the policy's own admission lease follows the returned value. This method
+    /// makes no completeness claim; preserve status/aggregate before consuming.
+    pub fn into_repository_rules(self) -> Option<RepositoryRules> { self.repository_rules }
     /// Compatibility route. Individual reads are bounded; use open_rule_aware
     /// for session-wide configuration allocation, work, and failure reporting.
     pub fn open_with_ignore(grant: RootGrant, symlink_policy: SymlinkPolicy,
