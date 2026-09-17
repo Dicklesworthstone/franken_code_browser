@@ -215,36 +215,64 @@ fn atlas_json(root_path: &str) -> Option<String> {
         .map(|entry| (entry.relative.clone(), entry.bytes))
         .collect();
 
+    // LaidOutNode rects are PARENT-LOCAL: each file's rect is relative to
+    // its parent directory's rect. Compose world coordinates by walking
+    // nodes in path-depth order, carrying each directory's world origin.
+    let mut nodes: Vec<&fcb_map::LaidOutNode> = layout.nodes().iter().collect();
+    nodes.sort_by_key(|node| node.path().iter().filter(|&&byte| byte == b'/').count());
+
+    let mut dir_world_origin: std::collections::HashMap<Vec<u8>, (f64, f64)> =
+        std::collections::HashMap::new();
     let mut out = String::from("{\"world\":{\"w\":4096,\"h\":4096},\"files\":[");
     let mut first = true;
-    for node in layout.nodes() {
-        if node.kind() != NodeKind::File {
-            continue;
-        }
+    for node in nodes {
+        let depth = node.path().iter().filter(|&&byte| byte == b'/').count();
         let rect = node.parent_local();
-        let path = String::from_utf8_lossy(node.path());
-        if !first {
-            out.push(',');
+        let (origin_x, origin_y) = if depth == 0 {
+            (rect.min_x(), rect.min_y())
+        } else {
+            let split = node
+                .path()
+                .iter()
+                .rposition(|&byte| byte == b'/')
+                .expect("depth > 0 implies a separator");
+            let parent_path = &node.path()[..split];
+            dir_world_origin
+                .get(parent_path)
+                .map(|(x, y)| (x + rect.min_x(), y + rect.min_y()))
+                .unwrap_or((rect.min_x(), rect.min_y()))
+        };
+        match node.kind() {
+            NodeKind::Directory => {
+                dir_world_origin.insert(node.path().to_vec(), (origin_x, origin_y));
+            }
+            NodeKind::File => {
+                let path = String::from_utf8_lossy(node.path());
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                // Per-line profile (length+class per line, base64-packed)
+                // so the shell can draw the line-bar circuit texture
+                // without re-reading files.
+                let profile = std::fs::read_to_string(root_path.to_owned() + "/" + &path)
+                    .map(|text| line_profile(&text))
+                    .unwrap_or_default();
+                let (line_count, tex) = (profile.len() / 2, base64(&profile));
+                out.push_str(&format!(
+                    "{{\"path\":\"{}\",\"x\":{:.2},\"y\":{:.2},\"w\":{:.2},\"h\":{:.2},\"bytes\":{},\"n\":{},\"tex\":\"{}\"}}",
+                    json_escape(&path),
+                    origin_x,
+                    origin_y,
+                    rect.max_x() - rect.min_x(),
+                    rect.max_y() - rect.min_y(),
+                    bytes_by_path.get(path.as_bytes()).copied().unwrap_or(0),
+                    line_count,
+                    tex
+                ));
+            }
+            NodeKind::Placeholder => {}
         }
-        first = false;
-        // Per-line profile (length+class per line, base64-packed) so the
-        // shell can draw the line-bar circuit texture without re-reading
-        // files. Unreadable files emit an empty profile.
-        let profile = std::fs::read_to_string(root_path.to_owned() + "/" + &path)
-            .map(|text| line_profile(&text))
-            .unwrap_or_default();
-        let (line_count, tex) = (profile.len() / 2, base64(&profile));
-        out.push_str(&format!(
-            "{{\"path\":\"{}\",\"x\":{:.2},\"y\":{:.2},\"w\":{:.2},\"h\":{:.2},\"bytes\":{},\"n\":{},\"tex\":\"{}\"}}",
-            json_escape(&path),
-            rect.min_x(),
-            rect.min_y(),
-            rect.max_x() - rect.min_x(),
-            rect.max_y() - rect.min_y(),
-            bytes_by_path.get(path.as_bytes()).copied().unwrap_or(0),
-            line_count,
-            tex
-        ));
     }
     out.push_str("]}");
     Some(out)
