@@ -10,7 +10,7 @@ use std::{fs::{self, File, OpenOptions}, os::unix::fs::FileExt,
 use fcb::{ArenaOwnerId, BrowserSession, ByteLength, ByteOffset, ByteRange, FcbError, FileId, SourceRevision};
 use fcb::search::{CaptureRequest, DetectedEncoding, ExtentActivationError, ExtentQuery,
     ExtentQueryError, ExtentQueryOptions, ExtentQueryState, ExtentReadState, ExtentStepBudget,
-    ExtentWindowRequest, FileRangeReader, ManifestLimits, MembershipState, NativeSourceIdentity,
+    ExtentWindowRequest, FileRangeReader, MembershipState, NativeSourceIdentity,
     ObservedExtent, PathEntry, PathIndex, PathIndexLimits, PathNavigationTarget, PathSearch,
     PathSearchOptions, QueryGeneration, RawPath, ResourceAllocationId, ResourceBudget, RootId, SearchManifestId};
 

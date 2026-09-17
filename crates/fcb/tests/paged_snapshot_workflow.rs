@@ -2,7 +2,7 @@
 #![cfg(feature = "snapshot")]
 
 use std::{io::Cursor, sync::Arc};
-use fcb::{ArenaOwnerId, ByteLength, ByteOffset, FileId, SourceRevision};
+use fcb::{ArenaOwnerId, ByteLength, FileId, SourceRevision};
 use fcb::search::{QueryGeneration, ResourceAllocationId, ResourceBudget, StreamingNeedle,
     StreamReadStep, ReaderLimits, ReadingTarget, ReadingSeekState, ReadingWindowOptions,
     CaptureRequest, CompleteCapture, DirectSourceScanner, QueryOptions};

@@ -40,6 +40,7 @@ impl Effect {
             Self::Written => "complete-file-sync-unconfirmed", Self::Synced => "complete-file-sync-requested" }
     }
 }
+#[derive(Debug)]
 struct Failure { code: String, canceled: bool }
 impl Failure {
     fn new(code: &str) -> Self { Self { code: code.to_owned(), canceled: code.ends_with("CANCELED") } }
