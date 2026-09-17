@@ -6,6 +6,7 @@
 //! selected by --respect-ignores and counted separately from source payloads.
 
 pub(crate) mod rule_output;
+mod expression;
 
 use std::{fs, path::{Path, PathBuf}, sync::Arc};
 use fcb::{ByteLength, ByteOffset, ByteRange};
@@ -56,6 +57,7 @@ pub(crate) fn execute(args: &Arguments, out: &mut Output, budget: &ResourceBudge
     match args.needle.as_ref() {
         Some(Needle::Path(needle)) => paths(args, &catalog, &root, needle, out, budget, canceled),
         Some(Needle::Text(needle)) => text(args, &catalog, &root, needle, out, budget, canceled),
+        Some(Needle::Query(query)) => expression::execute(args, query, &catalog, &root, out, budget, canceled),
         _ => Err(AppError::InvalidRange),
     }
 }
@@ -148,7 +150,8 @@ fn paths(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str
         out.literal(",\"hits\":[")?;
         for (i, hit) in query.ranked_matches().iter().enumerate() {
             if canceled() { return Err(AppError::Canceled); }
-            if i > 0 { out.literal(",")?; }
+            if i > 0 { out.literal(",")?;
+            }
             out.literal("{\"file_id\":")?; out.integer(hit.file_id().get())?;
             out.literal(",\"path\":")?; out.path(&hit.path().raw_path().to_path_buf())?;
             out.literal(",\"rank_kind\":")?; out.quoted(&format!("{:?}", hit.rank().kind))?; out.literal("}")?;
