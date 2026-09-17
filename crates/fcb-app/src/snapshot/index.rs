@@ -4,6 +4,8 @@
 //! snapshot's no-overwrite writer and effect-aware receipt contract. The index
 //! digest must come from the prior trusted build receipt, never the input file.
 
+mod refresh;
+
 use std::{ffi::OsString, fs, io::{self, Read, Write}, path::{Path, PathBuf}};
 use fcb::ByteLength;
 use fcb::search::{IndexLimits, RawPath, ResourceBudget, StreamReadStep};
@@ -19,22 +21,28 @@ use super::{Failure, Effect, begin, failure_output, write_new, hex, decimal, cat
     EXIT_OK, EXIT_NO_MATCH, EXIT_ERROR, EXIT_PARTIAL, EXIT_CANCELED};
 
 const HELP: &str = "fcb snapshot index build SNAPSHOT --output NEW_INDEX [--json]\n\
+fcb snapshot index refresh NEW_SNAPSHOT --base OLD_SNAPSHOT --index OLD_INDEX\n\
+    --index-digest TRUSTED_OLD_SHA256 --output NEW_INDEX [--json]\n\
 fcb snapshot index inspect SNAPSHOT --index INDEX --index-digest TRUSTED_SHA256 [--json]\n\
 fcb snapshot index search SNAPSHOT --index INDEX --index-digest TRUSTED_SHA256\n\
     (--text LITERAL | --raw-hex HEX) [--limit N] [--json]\n\
-Build options: --max-grams N --max-file-bytes N --max-source-bytes N\n\
-Optional cold-open: --catalog FILE --catalog-digest TRUSTED_CATALOG_SHA256\n\
+Build/refresh options: --max-grams N --max-file-bytes N --max-source-bytes N\n\
+Optional target cold-open: --catalog FILE --catalog-digest TRUSTED_CATALOG_SHA256\n\
+Refresh base cold-open: --base-catalog FILE --base-catalog-digest TRUSTED_SHA256\n\
+Refresh copies only digest-identical complete segments; changed files rebuild or\n\
+remain uncovered for direct scanning. It creates a NEW index, never overwrites.\n\
 A trusted catalog avoids the archive body scan, NOT member digest verification.\n\
-Unread body integrity remains unchecked. Both digests must be retained separately\n\
+Unread body integrity remains unchecked. Digests must be retained separately\n\
 from original trusted builds, never inferred from untrusted input files.\n\
 Ordinary snapshot search needs no index or pin and remains the full-scan fallback.\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Action { Help, Build, Inspect, Search }
+enum Action { Help, Build, Refresh, Inspect, Search }
 struct Options {
     action: Action, archive: Option<PathBuf>, output: Option<PathBuf>, index: Option<PathBuf>,
     pin: Option<Sha256Digest>, text: Option<String>, raw: Option<Vec<u8>>, json: bool,
     limit: usize, build: IndexLimits, catalog: Option<PathBuf>, catalog_pin: Option<Sha256Digest>,
+    base: Option<PathBuf>, base_catalog: Option<PathBuf>, base_catalog_pin: Option<Sha256Digest>,
 }
 impl From<SnapshotIndexError> for Failure {
     fn from(error: SnapshotIndexError) -> Self {
@@ -45,7 +53,8 @@ impl From<SnapshotIndexError> for Failure {
 }
 fn takes_value(arg: &str) -> bool {
     matches!(arg, "--output" | "--index" | "--index-digest" | "--text" | "--raw-hex" | "--limit"
-        | "--max-grams" | "--max-file-bytes" | "--max-source-bytes" | "--catalog" | "--catalog-digest")
+        | "--max-grams" | "--max-file-bytes" | "--max-source-bytes" | "--catalog" | "--catalog-digest"
+        | "--base" | "--base-catalog" | "--base-catalog-digest")
 }
 fn wants_json(args: &[OsString]) -> bool {
     let mut i = 0;
@@ -66,11 +75,13 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
     }
     let action = match args.first().and_then(|arg| arg.to_str()) {
         None | Some("help" | "--help" | "-h") => Action::Help,
-        Some("build") => Action::Build, Some("inspect") => Action::Inspect, Some("search") => Action::Search,
+        Some("build") => Action::Build, Some("refresh") => Action::Refresh,
+        Some("inspect") => Action::Inspect, Some("search") => Action::Search,
         _ => return Err(Failure::new("SAVED_INDEX_UNKNOWN_COMMAND")),
     };
     let mut out = Options { action, archive: None, output: None, index: None, pin: None, text: None,
-        raw: None, json: false, limit: 100, build: IndexLimits::default(), catalog: None, catalog_pin: None };
+        raw: None, json: false, limit: 100, build: IndexLimits::default(), catalog: None, catalog_pin: None,
+        base: None, base_catalog: None, base_catalog_pin: None };
     let mut seen = 0u16;
     let mut cursor = usize::from(!args.is_empty());
     let mut positional = false;
@@ -86,6 +97,7 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
             "--text" => 16, "--raw-hex" => 32, "--limit" => 64, "--max-grams" => 128,
             "--max-file-bytes" => 256, "--max-source-bytes" => 512,
             "--catalog" => 1024, "--catalog-digest" => 2048,
+            "--base" => 4096, "--base-catalog" => 8192, "--base-catalog-digest" => 16384,
             _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")),
         };
         if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
@@ -97,10 +109,13 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
             "--output" => { out.output = Some(PathBuf::from(value)); continue; }
             "--index" => { out.index = Some(PathBuf::from(value)); continue; }
             "--catalog" => { out.catalog = Some(PathBuf::from(value)); continue; }
+            "--base" => { out.base = Some(PathBuf::from(value)); continue; }
+            "--base-catalog" => { out.base_catalog = Some(PathBuf::from(value)); continue; }
             _ => {},
         }
         let text = value.to_str().ok_or_else(|| Failure::new("CLI_INVALID_VALUE"))?;
         if option == "--catalog-digest" { out.catalog_pin = Some(catalog::parse_pin(text)?); continue; }
+        if option == "--base-catalog-digest" { out.base_catalog_pin = Some(catalog::parse_pin(text)?); continue; }
         if option == "--index-digest" {
             if text.len() != 64 { return Err(Failure::new("SAVED_INDEX_INVALID_PIN")); }
             out.pin = Some(Sha256Digest::new(hex(text, 32)?.try_into().map_err(|_| Failure::new("SAVED_INDEX_INVALID_PIN"))?));
@@ -120,11 +135,15 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
             _ => return Err(Failure::new("CLI_ARGUMENT_LIMIT")),
         }
     }
-    if out.catalog.is_some() != out.catalog_pin.is_some() { return Err(Failure::new("CATALOG_PATH_AND_PIN_REQUIRED")); }
+    if out.catalog.is_some() != out.catalog_pin.is_some() || out.base_catalog.is_some() != out.base_catalog_pin.is_some() {
+        return Err(Failure::new("CATALOG_PATH_AND_PIN_REQUIRED"));
+    }
     let catalog_options = 1024 | 2048;
     let valid = match action {
         Action::Help => out.archive.is_none() && seen & !1 == 0,
         Action::Build => out.archive.is_some() && out.output.is_some() && seen & !(1 | 2 | 128 | 256 | 512 | catalog_options) == 0,
+        Action::Refresh => out.archive.is_some() && out.base.is_some() && out.output.is_some() && out.index.is_some() && out.pin.is_some()
+            && seen & !(1 | 2 | 4 | 8 | 128 | 256 | 512 | catalog_options | 4096 | 8192 | 16384) == 0,
         Action::Inspect => out.archive.is_some() && out.index.is_some() && out.pin.is_some() && seen & !(1 | 4 | 8 | catalog_options) == 0,
         Action::Search => out.archive.is_some() && out.index.is_some() && out.pin.is_some()
             && (out.text.is_some() != out.raw.is_some()) && seen & !(1 | 4 | 8 | 16 | 32 | 64 | catalog_options) == 0,
@@ -187,6 +206,7 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
             Err(_) => return Err(Failure::new("SNAPSHOT_DESTINATION_UNAVAILABLE")),
         }
     }
+    if options.action == Action::Refresh { return refresh::execute(options, out, budget, effect, canceled); }
     let mut archive = catalog::open(&source, options.catalog.as_deref(), options.catalog_pin,
         budget, [allocation(151), allocation(161)], canceled)?;
     if !options.json && !archive.directory().fully_verified_on_open() {
@@ -361,5 +381,23 @@ mod tests {
             "--catalog", "meta", "--catalog-digest", &pin])).is_ok());
         assert!(!wants_json(&args(&["inspect", "saved", "--catalog", "--json"])));
         assert!(!wants_json(&args(&["inspect", "saved", "--catalog-digest", "--json"])));
+    }
+    #[test]
+    fn refresh_requires_separate_base_target_output_and_trusted_index_pin() {
+        let pin = "ab".repeat(32);
+        let valid = args(&["refresh", "new", "--base", "old", "--index", "prior", "--index-digest", &pin, "--output", "fresh"]);
+        assert_eq!(parse(&valid).unwrap().action, Action::Refresh);
+        for range in [2..4, 4..6, 6..8, 8..10] {
+            let mut missing = valid.clone(); missing.drain(range); assert!(parse(&missing).is_err());
+        }
+        let mut invalid = valid.clone(); invalid.extend(args(&["--text", "needle"])); assert!(parse(&invalid).is_err());
+        let mut unpaired = valid.clone(); unpaired.extend(args(&["--base-catalog", "base.fcbc"])); assert!(parse(&unpaired).is_err());
+    }
+    #[test]
+    fn base_paths_and_pins_cannot_enable_json_or_leak_into_other_commands() {
+        for option in ["--base", "--base-catalog", "--base-catalog-digest"] {
+            assert!(!wants_json(&args(&["refresh", "new", option, "--json"])));
+            assert!(parse(&args(&["build", "new", "--output", "fresh", option, "old"])).is_err());
+        }
     }
 }
