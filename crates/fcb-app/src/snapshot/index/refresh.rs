@@ -18,6 +18,8 @@ pub(super) fn execute(options: &Options, out: &mut Output, budget: &ResourceBudg
     let old_pin = options.pin.ok_or_else(|| Failure::new("SAVED_INDEX_PIN_REQUIRED"))?;
     let loaded = load_index(options.index.as_deref().ok_or_else(|| Failure::new("SAVED_INDEX_REQUIRED"))?, budget, &mut *canceled)?;
     let old_index_bytes = loaded.bytes.len();
+    // Pinned FCBO inputs transpose into the existing per-member refresh engine;
+    // the decoder reserves both layouts before allocating that conversion.
     let old = SnapshotIndex::decode_pinned(&loaded.bytes, old_pin, base.directory(), budget, allocation(152), &mut *canceled)?;
     drop(loaded);
     drop(base); // All reusable source keys and semantics are owned by `old`.
@@ -29,13 +31,14 @@ pub(super) fn execute(options: &Options, out: &mut Output, budget: &ResourceBudg
     let counters = refreshed.stats();
     drop(old); // New segments are independent; this never changes old disk files.
     let next = refreshed.into_index();
-    let artifact = next.encode(budget, allocation(156), &mut *canceled)?;
+    let artifact = inverted::encode(&next, options.inverted, budget, canceled)?;
     let destination = input::absolute(options.output.as_deref().ok_or_else(|| Failure::new("SNAPSHOT_OUTPUT_REQUIRED"))?)?;
     write_new(&destination, artifact.bytes(), effect, canceled)?;
     // Once written, use the parent command's effect-aware receipt delivery.
     if options.json {
         begin(out, "snapshot-index-refresh")?;
         summary(out, target.directory(), next.stats(), artifact.digest())?;
+        inverted::fields(out, options.inverted)?;
         out.literal(",\"effect\":")?; out.quoted(effect.name())?;
         out.literal(",\"destination\":")?; out.path(&destination)?;
         out.literal(",\"index_bytes\":")?; out.integer(artifact.bytes().len() as u64)?;
@@ -56,7 +59,8 @@ pub(super) fn execute(options: &Options, out: &mut Output, budget: &ResourceBudg
         out.literal(",\"reuse_identity\":\"source-sha256-length-and-semantics\",\"rename_inferred\":false")?;
         out.literal(",\"source_derived_sensitive\":true,\"power_loss_qualified\":false}\n")?;
     } else {
-        out.literal("Saved refreshed substring index. Retain its new trusted digest separately:\n")?;
+        out.literal(if options.inverted { "Saved refreshed global posting index. Retain its new trusted digest separately:\n" }
+            else { "Saved refreshed substring index. Retain its new trusted digest separately:\n" })?;
         out.literal(&artifact.digest().to_hex())?; out.literal("\nReused files: ")?;
         out.literal(&counters.reused_files.to_string())?; out.literal("; newly indexed files: ")?;
         out.literal(&counters.rebuilt_files.to_string())?; out.literal("; uncovered files: ")?;
