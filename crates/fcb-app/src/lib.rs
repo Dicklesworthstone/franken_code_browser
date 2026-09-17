@@ -14,6 +14,7 @@ mod whole_file;
 mod snapshot;
 mod snapshot_diff;
 mod trail;
+mod symbols;
 
 use std::{ffi::OsString, io::{Read, Write}};
 use fcb::{ArenaOwnerId, ByteLength, FileId, SourceRevision};
@@ -135,10 +136,14 @@ impl From<FileSearchError> for AppError { fn from(error: FileSearchError) -> Sel
 
 /// Ordinary --json writes ONE complete bounded document or one error document.
 /// Service failures discard the private partial encoder before writing errors.
-/// A broken output pipe cannot be repaired with a second JSON document; only a
+/// A broken output pipe cannot be repaired by appending a second JSON document; only a
 /// redacted stderr diagnostic follows. No caller process exit or signal occurs.
 pub fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut impl Write,
     stderr: &mut impl Write, mut canceled: impl FnMut() -> bool) -> u8 {
+    // Candidate navigation remains read-only and never reads implicit stdin.
+    if arguments.first().is_some_and(|argument| argument == "symbols") {
+        return symbols::run(&arguments[1..], stdout, stderr, canceled);
+    }
     // User-state exports have explicit write-aware terminal receipts.
     if arguments.first().is_some_and(|argument| argument == "trail") {
         return trail::run(&arguments[1..], stdout, stderr, canceled);
