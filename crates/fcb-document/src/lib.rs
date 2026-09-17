@@ -17,12 +17,20 @@ pub mod assets;
 pub mod dialect;
 pub mod display_adapter;
 pub mod error;
+pub mod gallery;
 pub mod lens;
 pub mod selection_copy;
 pub mod split_navigation;
 pub mod provenance;
 pub mod publication;
 pub mod session;
+
+pub use gallery::{
+    BackingScale, CharacterBoundary, ContrastOracle, FractionalOffset, GalleryCaret,
+    GalleryGlyph, GalleryGlyphRun, GalleryRouteIdentity, GallerySectionId,
+    GallerySelectionOverlay, GalleryTestCase, GalleryThemeMode, GalleryVisualTokens,
+    ReadableRunInspection, TypographyGallery,
+};
 
 pub use assets::{
     AssetDomain, AssetKind, AuthorizedAssetRequest, BoundedAssetBudgets, BoundedAssetRegistry,

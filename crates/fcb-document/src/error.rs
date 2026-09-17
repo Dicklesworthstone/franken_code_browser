@@ -104,6 +104,10 @@ pub enum DocumentError {
         frame_count: u32,
         max_frames: u32,
     },
+    /// Native font shaping or glyph cluster layout error.
+    NativeShaping {
+        reason: String,
+    },
 }
 
 impl DocumentError {
@@ -135,6 +139,7 @@ impl DocumentError {
             Self::AssetDenied { .. } => "DOCUMENT_ASSET_DENIED",
             Self::NetworkDisabled { .. } => "DOCUMENT_NETWORK_DISABLED",
             Self::FrameCountExceeded { .. } => "DOCUMENT_FRAME_COUNT_EXCEEDED",
+            Self::NativeShaping { .. } => "DOCUMENT_NATIVE_SHAPING_ERROR",
         }
     }
 }
@@ -145,7 +150,7 @@ impl std::fmt::Display for DocumentError {
             Self::StaleRequest { expected, actual } => {
                 write!(
                     f,
-                    "{}: expected generation {}, got {}",
+                    "{}: stale document request: expected generation {}, got {}",
                     self.code(),
                     expected.get(),
                     actual.get()
@@ -154,7 +159,7 @@ impl std::fmt::Display for DocumentError {
             Self::StaleRevision { expected, actual } => {
                 write!(
                     f,
-                    "{}: expected revision {}, got {}",
+                    "{}: stale document request: expected revision {}, got {}",
                     self.code(),
                     expected.get(),
                     actual.get()
@@ -163,7 +168,7 @@ impl std::fmt::Display for DocumentError {
             Self::MismatchedDigest { expected, actual } => {
                 write!(
                     f,
-                    "{}: expected digest {:?}, got {:?}",
+                    "{}: mismatched observation digest: expected {:?}, got {:?}",
                     self.code(),
                     expected,
                     actual
@@ -172,28 +177,22 @@ impl std::fmt::Display for DocumentError {
             Self::MismatchedFile { expected, actual } => {
                 write!(
                     f,
-                    "{}: expected file {}, got {}",
+                    "{}: mismatched file: expected {:?}, got {:?}",
                     self.code(),
-                    expected.get(),
-                    actual.get()
+                    expected,
+                    actual
                 )
             }
-            Self::InvalidUtf8 => write!(f, "{}: capture bytes are not valid UTF-8", self.code()),
-            Self::InvalidRange => write!(f, "{}: range is invalid or out of bounds", self.code()),
-            Self::Flow(err) => write!(f, "{}: upstream flow layout failed: {:?}", self.code(), err),
-            Self::FlowDisplay(err) => {
-                write!(f, "{}: upstream flow display failed: {:?}", self.code(), err)
-            }
-            Self::Provenance(err) => {
-                write!(f, "{}: provenance verification failed: {:?}", self.code(), err)
-            }
-            Self::SourceMap(err) => {
-                write!(f, "{}: source map operation failed: {:?}", self.code(), err)
-            }
+            Self::InvalidUtf8 => write!(f, "{}: source bytes are not valid UTF-8", self.code()),
+            Self::InvalidRange => write!(f, "{}: document range is invalid or out of bounds", self.code()),
+            Self::Flow(err) => write!(f, "{}: flow layout error: {}", self.code(), err),
+            Self::FlowDisplay(err) => write!(f, "{}: flow display error: {}", self.code(), err),
+            Self::Provenance(err) => write!(f, "{}: provenance error: {}", self.code(), err),
+            Self::SourceMap(err) => write!(f, "{}: source map error: {}", self.code(), err),
             Self::Canceled => write!(f, "{}: document operation was canceled", self.code()),
-            Self::LimitExceeded => write!(f, "{}: document resource limits exceeded", self.code()),
-            Self::EmptyDocument => write!(f, "{}: document source is empty", self.code()),
-            Self::OwnerMismatch => write!(f, "{}: owner ID mismatch", self.code()),
+            Self::LimitExceeded => write!(f, "{}: document resource limit exceeded", self.code()),
+            Self::EmptyDocument => write!(f, "{}: document is empty", self.code()),
+            Self::OwnerMismatch => write!(f, "{}: document owner mismatch", self.code()),
             Self::AssetEscape { uri, reason } => {
                 write!(f, "{}: asset escape rejected for '{}': {}", self.code(), uri, reason)
             }
@@ -235,6 +234,9 @@ impl std::fmt::Display for DocumentError {
             }
             Self::FrameCountExceeded { frame_count, max_frames } => {
                 write!(f, "{}: image frame count {} exceeds limit {}", self.code(), frame_count, max_frames)
+            }
+            Self::NativeShaping { reason } => {
+                write!(f, "{}: native font shaping error: {}", self.code(), reason)
             }
         }
     }
