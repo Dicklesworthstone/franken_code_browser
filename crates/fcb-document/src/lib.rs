@@ -18,6 +18,7 @@ pub mod dialect;
 pub mod display_adapter;
 pub mod error;
 pub mod lens;
+pub mod split_navigation;
 pub mod provenance;
 pub mod publication;
 pub mod session;
