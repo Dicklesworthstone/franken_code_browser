@@ -4,6 +4,7 @@
 //! traversal and repository rule-file reads each require explicit switches.
 
 use std::{ffi::OsString, path::PathBuf};
+use fcb::search::{ParsedQuery, QueryError};
 
 pub const MAX_ARGUMENTS: usize = 64;
 pub const MAX_ARGUMENT_BYTES: usize = 65_536;
@@ -17,7 +18,7 @@ pub enum Command { Help, Capabilities, Doctor, Inspect, Open, Read, Search, Laun
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Encoding { Auto, Utf8, Utf16Le, Utf16Be }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Needle { Text(String), Raw(Vec<u8>), Path(String) }
+pub enum Needle { Text(String), Raw(Vec<u8>), Path(String), Query(ParsedQuery) }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Arguments {
     pub command: Command, pub json: bool, pub file: Option<PathBuf>, pub stdin: bool,
@@ -29,7 +30,8 @@ pub struct Arguments {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArgumentError { Limit, UnknownCommand, UnknownOption, DuplicateOption, MissingValue,
-    MissingSource, MultipleSources, InvalidNumber, InvalidEncoding, InvalidNeedle, IncompatibleOptions }
+    MissingSource, MultipleSources, InvalidNumber, InvalidEncoding, InvalidNeedle, IncompatibleOptions,
+    Query(QueryError) }
 impl ArgumentError {
     pub const fn code(self) -> &'static str {
         match self {
@@ -38,7 +40,7 @@ impl ArgumentError {
             Self::MissingValue => "CLI_MISSING_VALUE", Self::MissingSource => "CLI_MISSING_SOURCE",
             Self::MultipleSources => "CLI_MULTIPLE_SOURCES", Self::InvalidNumber => "CLI_INVALID_NUMBER",
             Self::InvalidEncoding => "CLI_INVALID_ENCODING", Self::InvalidNeedle => "CLI_INVALID_NEEDLE",
-            Self::IncompatibleOptions => "CLI_INCOMPATIBLE_OPTIONS",
+            Self::IncompatibleOptions => "CLI_INCOMPATIBLE_OPTIONS", Self::Query(error) => error.code(),
         }
     }
 }
@@ -56,7 +58,7 @@ pub fn json_requested(args: &[OsString]) -> bool {
         if argument == "--" { break; }
         if argument == "--json" { return true; }
         if matches!(argument.to_str(), Some("--offset" | "--bytes" | "--limit" | "--encoding" | "--text" | "--raw-hex"
-            | "--path" | "--max-files" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes")) { cursor += 1; }
+            | "--query" | "--path" | "--max-files" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes")) { cursor += 1; }
     }
     false
 }
@@ -103,6 +105,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
                 "--workspace" => 256, "--include-excluded" => 512, "--max-files" => 1024,
                 "--max-file-bytes" => 2048, "--max-total-bytes" => 4096, "--path" => 8192,
                 "--whole-file" => 16384, "--max-scan-bytes" => 32768, "--respect-ignores" => 65536,
+                "--query" => 131072,
                 _ => return Err(ArgumentError::UnknownOption),
             };
             if seen & bit != 0 { return Err(ArgumentError::DuplicateOption); }
@@ -151,6 +154,10 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
                     if value.is_empty() || parsed.needle.is_some() { return Err(ArgumentError::InvalidNeedle); }
                     parsed.needle = Some(if option == "--path" { Needle::Path(value.to_owned()) } else { Needle::Text(value.to_owned()) });
                 }
+                "--query" => {
+                    if parsed.needle.is_some() { return Err(ArgumentError::InvalidNeedle); }
+                    parsed.needle = Some(Needle::Query(ParsedQuery::parse(value).map_err(ArgumentError::Query)?));
+                }
                 "--raw-hex" => {
                     if parsed.needle.is_some() { return Err(ArgumentError::InvalidNeedle); }
                     parsed.needle = Some(Needle::Raw(hex_bytes(value)?));
@@ -175,7 +182,9 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         if !parsed.workspace && seen & (512 | 1024) != 0 { return Err(ArgumentError::IncompatibleOptions); }
         return Ok(parsed);
     }
-    if seen & 32768 != 0 { return Err(ArgumentError::IncompatibleOptions); }
+    if seen & 32768 != 0 && !(parsed.workspace && matches!(parsed.needle, Some(Needle::Query(_)))) {
+        return Err(ArgumentError::IncompatibleOptions);
+    }
     if parsed.workspace {
         if parsed.file.is_none() { return Err(ArgumentError::MissingSource); }
         if !matches!(parsed.command, Command::Inspect | Command::Search)
@@ -184,11 +193,12 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
             (Command::Inspect, None) => {},
             (Command::Search, Some(Needle::Text(text))) if text.len() <= 1024 => {},
             (Command::Search, Some(Needle::Path(path))) if path.len() <= 256 => {},
+            (Command::Search, Some(Needle::Query(_))) => {},
             _ => return Err(ArgumentError::InvalidNeedle),
         }
         return Ok(parsed);
     }
-    if seen & (256 | 512 | 1024 | 2048 | 4096 | 8192 | 65536) != 0 { return Err(ArgumentError::IncompatibleOptions); }
+    if seen & (256 | 512 | 1024 | 2048 | 4096 | 8192 | 65536 | 131072) != 0 { return Err(ArgumentError::IncompatibleOptions); }
     match parsed.command {
         Command::Help | Command::Capabilities | Command::Doctor => {
             if parsed.file.is_some() || seen & !1 != 0 { return Err(ArgumentError::IncompatibleOptions); }
@@ -326,6 +336,27 @@ mod tests {
             vec!["inspect", "root", "--workspace", "--respect-ignores", "--include-excluded"],
             vec!["inspect", "root", "--workspace", "--respect-ignores", "--respect-ignores"]] {
             assert!(parse(&args(&input)).is_err());
+        }
+    }
+    #[test]
+    fn expressions_are_explicit_and_retain_parser_error_codes() {
+        let parsed = parse(&args(&["search", "root", "--workspace", "--query", "\"pub fn\" Result -unsafe lang:rust", "--max-scan-bytes", "100"])).unwrap();
+        let Some(Needle::Query(query)) = parsed.needle else { panic!("expression expected") };
+        assert_eq!(query.primary_needle, "pub fn"); assert_eq!(query.conjunction_terms, ["Result"]);
+        assert_eq!(parse(&args(&["search", "root", "--workspace", "--query", "\"broken"])), Err(ArgumentError::Query(QueryError::SyntaxError)));
+        assert_eq!(parse(&args(&["search", "root", "--workspace", "--query", "regex:.*"])), Err(ArgumentError::Query(QueryError::RegexUnqualified)));
+        assert!(!json_requested(&args(&["search", "root", "--workspace", "--query", "--json"])));
+    }
+    #[test]
+    fn expressions_do_not_change_literal_or_partial_file_semantics() {
+        let parsed = parse(&args(&["search", "root", "--workspace", "--text", "needle -forbidden"])).unwrap();
+        assert_eq!(parsed.needle, Some(Needle::Text("needle -forbidden".to_owned())));
+        for input in [vec!["search", "root", "--workspace", "--query", "x", "--text", "y"],
+            vec!["search", "root", "--workspace", "--text", "x", "--query", "y"],
+            vec!["search", "file", "--query", "x"], vec!["search", "--stdin", "--query", "x"],
+            vec!["search", "root", "--workspace", "--whole-file", "--query", "x"],
+            vec!["inspect", "root", "--workspace", "--query", "x"]] {
+            assert!(parse(&args(&input)).is_err(), "{input:?}");
         }
     }
 }
