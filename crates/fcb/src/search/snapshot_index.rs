@@ -14,6 +14,7 @@
 
 mod refresh;
 mod postings;
+pub use postings::paged;
 pub use refresh::{RefreshStats, SnapshotRefresh};
 pub use postings::{SnapshotPostings, PostingCandidates, PostingProbeStats, PostingStep,
     POSTINGS_SCHEMA, MAX_POSTINGS_BYTES};
@@ -93,9 +94,8 @@ impl Coverage {
 #[derive(Clone, Debug)]
 struct Row { coverage: Coverage, length: u64, digest: Sha256Digest, start: usize, count: usize }
 
-/// Immutable per-file segments. Metadata probes are O(files); `invert` builds
-/// an independently owned global posting table for selective repeated queries.
-/// Source payloads are never retained here.
+/// Immutable per-file segments. Metadata probes are O(files); this is not a
+/// global inverted posting list. Source payloads are never retained here.
 pub struct SnapshotIndex {
     owner: ArenaOwnerId,
     archive: Sha256Digest,
