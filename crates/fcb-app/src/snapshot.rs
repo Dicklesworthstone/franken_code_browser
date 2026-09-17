@@ -3,9 +3,8 @@
 //! Explicit source-containing snapshot commands. Archives are never auto-opened,
 //! extracted into directories, or interpreted as root grants/configuration.
 //! Save creates ONE new destination and never overwrites/removes an existing
-//! file. An interrupted destination remains on disk and is reported as such;
-//! checksum validation refuses incomplete bytes. This is not atomic rename/DB
-//! publication or a qualified power-loss-durability claim.
+//! file. Interrupted destinations remain reported on disk; checksums refuse
+//! partial bytes. No atomic publication or power-loss qualification is claimed.
 
 mod paged;
 mod index;
@@ -16,7 +15,7 @@ use fcb::{ByteLength, ByteOffset, ByteRange};
 use fcb::source::{CancelFlag, SourceError, NormalizedPath};
 use fcb::search::{CaptureRequest, CompleteCapture, ExtentConsistency, ExtentReadState, ExtentStepBudget,
     FileRangeReader, RawPath, ResourceBudget, RootId, SearchManifestId};
-use fcb::search::workspace::{RootGrant, WorkspaceCatalog, WorkspaceCaptures, WorkspaceLimits, WorkspaceStage};
+use fcb::search::workspace::{RootGrant, RuleLimits, WorkspaceCatalog, WorkspaceCaptures, WorkspaceLimits, WorkspaceStage};
 use fcb::search::snapshot::{SavedSourceError, SnapshotError, SnapshotLimits, SnapshotView, Sha256Digest,
     export_workspace, MAX_SNAPSHOT_BYTES};
 use crate::{AppError, MANAGED_BYTES, SCHEMA, EXIT_OK, EXIT_NO_MATCH, EXIT_ERROR, EXIT_PARTIAL, EXIT_CANCELED,
@@ -26,7 +25,7 @@ use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
 use crate::{input, workspace};
 
 const MAX_CALLS: u64 = 131_072;
-const HELP: &str = "fcb snapshot save ROOT --output NEW_FILE [--json] [--include-excluded]\n\
+const HELP: &str = "fcb snapshot save ROOT --output NEW_FILE [--json] [--respect-ignores | --include-excluded]\n\
 fcb snapshot catalog FILE --output NEW_CATALOG [--json]\n\
 fcb snapshot inspect FILE [--json] [--limit N]\n\
 fcb snapshot search FILE (--text LITERAL | --raw-hex HEX) [--json] [--limit N]\n\
@@ -34,6 +33,8 @@ fcb snapshot read FILE (--member NAME | --member-hex HEX) [--json]\n\
 fcb snapshot index help  # Build/reopen pinned substring indexes\n\
 Read options: --line N OR --offset N; --bytes N --lines N; --raw for original bytes\n\
 Save options: --max-files N --max-file-bytes N --max-total-bytes N\n\
+--respect-ignores explicitly reads bounded nested .gitignore/.fcbignore policies.\n\
+Rule failures withhold affected source and preserve incomplete discovery in the archive.\n\
 Offline open options: --catalog FILE --catalog-digest TRUSTED_SHA256\n\
 Without a catalog, opening hashes the whole archive. A separately trusted catalog\n\
 checks archive boundaries and verifies loaded members; unread body integrity is unchecked.\n\
@@ -47,7 +48,7 @@ struct Settings {
     mode: Mode, source: Option<PathBuf>, output: Option<PathBuf>, text: Option<String>,
     raw_needle: Option<Vec<u8>>, member: Option<Vec<u8>>, offset: u64, line: Option<u64>,
     window_bytes: usize, lines: usize, raw: bool,
-    json: bool, limit: usize, limits: WorkspaceLimits, include_excluded: bool,
+    json: bool, limit: usize, limits: WorkspaceLimits, include_excluded: bool, respect_ignores: bool,
     catalog: Option<PathBuf>, catalog_pin: Option<Sha256Digest>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,7 +77,6 @@ impl From<SavedSourceError> for Failure {
         Self { code: error.to_string(), canceled: matches!(error, SavedSourceError::Canceled | SavedSourceError::Format(SnapshotError::Canceled)) }
     }
 }
-
 fn takes_value(text: &str) -> bool {
     matches!(text, "--output" | "--text" | "--raw-hex" | "--limit" | "--max-files" | "--max-file-bytes" | "--max-total-bytes"
         | "--member" | "--member-hex" | "--offset" | "--line" | "--bytes" | "--lines" | "--catalog" | "--catalog-digest")
@@ -106,7 +106,8 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
     };
     let mut settings = Settings { mode, source: None, output: None, text: None, raw_needle: None,
         member: None, offset: 0, line: None, window_bytes: 64 * 1024, lines: 100, raw: false, json: false,
-        limit: 100, limits: WorkspaceLimits::default(), include_excluded: false, catalog: None, catalog_pin: None };
+        limit: 100, limits: WorkspaceLimits::default(), include_excluded: false, respect_ignores: false,
+        catalog: None, catalog_pin: None };
     let mut seen = 0u32;
     let mut cursor = usize::from(!args.is_empty());
     let mut positional = false;
@@ -120,12 +121,13 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 "--max-file-bytes" => 64, "--max-total-bytes" => 128,
                 "--member" => 256, "--member-hex" => 512, "--offset" => 1024, "--line" => 2048,
                 "--bytes" => 4096, "--lines" => 8192, "--raw" => 16384, "--raw-hex" => 32768,
-                "--catalog" => 65536, "--catalog-digest" => 131072,
+                "--catalog" => 65536, "--catalog-digest" => 131072, "--respect-ignores" => 262144,
                 _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")), };
             if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
             seen |= bit;
             if option == "--json" { settings.json = true; continue; }
             if option == "--include-excluded" { settings.include_excluded = true; continue; }
+            if option == "--respect-ignores" { settings.respect_ignores = true; continue; }
             if option == "--raw" { settings.raw = true; continue; }
             let value = args.get(cursor).ok_or_else(|| Failure::new("CLI_MISSING_VALUE"))?; cursor += 1;
             if option == "--output" || option == "--catalog" {
@@ -167,10 +169,11 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
         }
     }
     if settings.catalog.is_some() != settings.catalog_pin.is_some() { return Err(Failure::new("CATALOG_PATH_AND_PIN_REQUIRED")); }
+    if settings.respect_ignores && settings.include_excluded { return Err(Failure::new("CLI_INCOMPATIBLE_OPTIONS")); }
     let catalog_options = 65536 | 131072;
     let valid = match mode {
         Mode::Help => settings.source.is_none() && seen & !1 == 0,
-        Mode::Save => settings.source.is_some() && settings.output.is_some() && seen & !(1 | 2 | 16 | 32 | 64 | 128) == 0,
+        Mode::Save => settings.source.is_some() && settings.output.is_some() && seen & !(1 | 2 | 16 | 32 | 64 | 128 | 262144) == 0,
         Mode::Catalog => settings.source.is_some() && settings.output.is_some() && seen & !(1 | 2) == 0,
         Mode::Inspect => settings.source.is_some() && seen & !(1 | 8 | catalog_options) == 0,
         Mode::Search => settings.source.is_some() && (settings.text.is_some() != settings.raw_needle.is_some())
@@ -193,14 +196,10 @@ fn hex(text: &str, maximum: usize) -> Result<Vec<u8>, Failure> {
     }).collect()
 }
 
-/// Separate write-aware delivery: cancellation after a complete synchronized
-/// save never changes its outcome into "nothing happened". Error receipts keep
-/// the effect state; a broken stdout leaves a redacted effect marker on stderr.
+/// Write-aware delivery never relabels a completed save as "nothing happened".
 pub(crate) fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write,
     mut canceled: impl FnMut() -> bool) -> u8 {
-    if args.first().is_some_and(|arg| arg == "index") {
-        return index::run(&args[1..], stdout, stderr, canceled);
-    }
+    if args.first().is_some_and(|arg| arg == "index") { return index::run(&args[1..], stdout, stderr, canceled); }
     let json = wants_json(args);
     let budget = match ResourceBudget::new(owner(), ByteLength::new(MANAGED_BYTES)) {
         Ok(budget) => budget, Err(_) => { let _ = stderr.write(b"SNAPSHOT_RESOURCE_DENIED\n"); return EXIT_ERROR; }
@@ -276,8 +275,13 @@ fn save(settings: &Settings, out: &mut Output, budget: &ResourceBudget, effect: 
         Err(_) => return Err(Failure::new("SNAPSHOT_DESTINATION_UNAVAILABLE")),
     }
     let grant = RootGrant::new(RootId::new(owner(), 1).map_err(|_| Failure::new("SNAPSHOT_OWNER"))?, RawPath::from_path(&root));
-    let mut catalog = WorkspaceCatalog::open(grant, SearchManifestId::new(owner(), 1).map_err(AppError::from)?,
-        file_id(), settings.limits, settings.include_excluded, budget, allocation(101)).map_err(AppError::from)?;
+    let id = SearchManifestId::new(owner(), 1).map_err(AppError::from)?;
+    let mut catalog = if settings.respect_ignores {
+        WorkspaceCatalog::open_rule_aware(grant, id, file_id(), settings.limits, RuleLimits::default(),
+            budget, [allocation(101), allocation(119)])
+    } else {
+        WorkspaceCatalog::open(grant, id, file_id(), settings.limits, settings.include_excluded, budget, allocation(101))
+    }.map_err(AppError::from)?;
     let cancel = CancelFlag::new();
     while catalog.stage() == WorkspaceStage::Discovering {
         if canceled() { return Err(Failure::canceled()); }
@@ -300,6 +304,7 @@ fn save(settings: &Settings, out: &mut Output, budget: &ResourceBudget, effect: 
         begin(out, "snapshot-save")?; out.literal(",\"effect\":")?; out.quoted(effect.name())?;
         out.literal(",\"destination\":")?; out.path(&destination)?;
         summary(out, view, true)?;
+        workspace::rule_output::fields(out, &catalog)?;
         out.literal(",\"payload_bytes_read\":")?; out.integer(io.bytes)?;
         out.literal(",\"read_calls\":")?; out.integer(io.calls)?;
         out.literal(",\"archive_bytes\":")?; out.integer(encoded.bytes().len() as u64)?;
@@ -307,6 +312,7 @@ fn save(settings: &Settings, out: &mut Output, budget: &ResourceBudget, effect: 
     } else {
         out.literal("Saved source-containing snapshot ")?; out.path(&destination)?;
         out.literal(if complete { "\nComplete observed membership and captures.\n" } else { "\nPARTIAL saved scope: discovery or captures are incomplete.\n" })?;
+        workspace::rule_output::human(out, &catalog)?;
         out.literal("No overwrite; sync requested; no power-loss durability qualification.\n")?;
     }
     Ok(if complete { EXIT_OK } else { EXIT_PARTIAL })
@@ -433,5 +439,16 @@ mod tests {
         assert!(parse(&args(&["catalog", "saved", "--output", "new"])).is_ok());
         assert!(!wants_json(&args(&["inspect", "saved", "--catalog", "--json"])));
         assert!(!wants_json(&args(&["inspect", "saved", "--catalog-digest", "--json"])));
+    }
+    #[test]
+    fn rule_reads_require_explicit_save_permission_and_never_apply_to_offline_names() {
+        assert!(parse(&args(&["save", "root", "--output", "new", "--respect-ignores"])).unwrap().respect_ignores);
+        let ordinary = parse(&args(&["save", "root", "--output", "--respect-ignores"])).unwrap();
+        assert!(!ordinary.respect_ignores);
+        for values in [vec!["save", "root", "--output", "new", "--respect-ignores", "--include-excluded"],
+            vec!["inspect", "saved", "--respect-ignores"], vec!["search", "saved", "--text", "x", "--respect-ignores"],
+            vec!["save", "root", "--output", "new", "--respect-ignores", "--respect-ignores"]] {
+            assert!(parse(&args(&values)).is_err());
+        }
     }
 }
