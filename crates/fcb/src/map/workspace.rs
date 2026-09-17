@@ -10,6 +10,7 @@
 //! this is an atlas of catalogued regular files and their ancestor directories.
 
 pub mod path_search;
+pub mod text_search;
 
 use std::mem::size_of;
 use fcb_core::{ByteLength, FileId, LayoutRevision, ResourceAllocationId, ResourceBudget, ResourceLease};
