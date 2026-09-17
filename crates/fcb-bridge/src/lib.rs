@@ -157,6 +157,10 @@ fn atlas_json(root_path: &str) -> Option<String> {
     .ok()?;
     let mut out = String::from("{\"world\":{\"w\":4096,\"h\":4096},\"files\":[");
     let mut first = true;
+    let bytes_by_path: std::collections::HashMap<Vec<u8>, u64> = entries
+        .iter()
+        .map(|entry| (entry.relative.clone(), entry.bytes))
+        .collect();
     for node in layout.nodes() {
         if node.kind() != NodeKind::File {
             continue;
@@ -168,12 +172,15 @@ fn atlas_json(root_path: &str) -> Option<String> {
         }
         first = false;
         out.push_str(&format!(
-            "{{\"path\":\"{}\",\"x\":{:.2},\"y\":{:.2},\"w\":{:.2},\"h\":{:.2}}}",
+            "{{\"path\":\"{}\",\"x\":{:.2},\"y\":{:.2},\"w\":{:.2},\"h\":{:.2},\"bytes\":{}}}",
             json_escape(&path),
             rect.min_x(),
             rect.min_y(),
             rect.max_x() - rect.min_x(),
-            rect.max_y() - rect.min_y()
+            bytes_by_path
+                .get(path.as_bytes())
+                .copied()
+                .unwrap_or(0)
         ));
     }
     out.push_str("]}");
