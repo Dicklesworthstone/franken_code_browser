@@ -3,6 +3,8 @@
 //! Integration test suite for FCB-015.B (fcb-gzx.2):
 //! Interruptible navigation history, semantic endpoints, and bounded camera flight.
 
+use std::path::PathBuf;
+
 use fcb_core::{
     ArenaOwnerId, CameraGeneration, DisplayColorConfig, DisplayGeneration, DisplayMetrics, Point2D,
     Size2D,
@@ -12,6 +14,55 @@ use fcb_map::{
     NavigationHistory, NavigationReason, DEFAULT_FLIGHT_DURATION_NANOS,
     DEFAULT_MAX_STEP_DELTA_NANOS,
 };
+use fcb_test_support::receipts::{
+    Effect, EventRing, ExpectedVsActual, Redactor, RouteId, ScenarioReceipt,
+    ScenarioReceiptDraft, ScenarioSeed, SourcePin, TerminalOutcome,
+};
+use fcb_test_support::ContentDigest;
+
+const RUN_ID_ENV: &str = "FCB_015_RUN_ID";
+
+fn receipts_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("FCB_RECEIPTS_DIR") {
+        PathBuf::from(dir)
+    } else {
+        let run_id = std::env::var(RUN_ID_ENV).unwrap_or_else(|_| "local".to_string());
+        std::env::temp_dir().join(format!("fcb-015-receipts-{run_id}"))
+    }
+}
+
+fn record_receipt(case: &str, effect: Effect, detail: &str) {
+    let run_dir = receipts_dir();
+    let _ = std::fs::create_dir_all(&run_dir);
+    let draft = ScenarioReceiptDraft {
+        scenario: format!("{case}: {detail}"),
+        seed: ScenarioSeed(0x0C_15_00_02),
+        pin: SourcePin::new("0150000000000000000000000000000000000002").expect("pin valid"),
+        route: RouteId::new("headless:rust").expect("route valid"),
+        corpus_digest: ContentDigest::of(detail.as_bytes()),
+        corpus_count: 1,
+        outcome: TerminalOutcome::new(
+            Some(if effect == Effect::Succeeded { 0 } else { 1 }),
+            effect,
+            None,
+        ),
+        comparison: Some(ExpectedVsActual::new(
+            &Redactor::new(),
+            "oracle holds",
+            detail,
+        )),
+        ring: EventRing::new(16),
+        artifacts: vec![],
+    };
+    let receipt = ScenarioReceipt::from_draft(&Redactor::new(), draft);
+    let encoded = receipt.encode();
+    let parsed = ScenarioReceipt::decode(&encoded).expect("receipt round-trips");
+    assert_eq!(parsed.outcome().effect(), receipt.outcome().effect());
+    let _ = std::fs::write(
+        run_dir.join(format!("{}.receipt", case.replace(['(', ')', ' ', ':'], "_"))),
+        encoded,
+    );
+}
 
 fn owner() -> ArenaOwnerId {
     ArenaOwnerId::new(0x0C15_000B).unwrap()
@@ -104,6 +155,12 @@ fn test_semantic_endpoints_and_history_branching() {
     // Back returns to c_dir1, then c_root
     assert_eq!(history.navigate_back(700).unwrap(), c_dir1);
     assert_eq!(history.navigate_back(800).unwrap(), c_root);
+
+    record_receipt(
+        "fcb_015_nav_semantic_endpoints_branching",
+        Effect::Succeeded,
+        "push semantic endpoints, back/forward history navigation, and future branch truncation on push",
+    );
 }
 
 #[test]
@@ -122,6 +179,12 @@ fn test_reduced_motion_transitions_directly() {
     let flight = NavigationFlight::new(c1, c2, NavigationReason::FitSelection, config).unwrap();
     assert!(flight.is_complete());
     assert_eq!(flight.current_camera().unwrap(), c2);
+
+    record_receipt(
+        "fcb_015_nav_reduced_motion_transitions",
+        Effect::Succeeded,
+        "reduced-motion transitions directly with zero flight frames to exact destination",
+    );
 }
 
 #[test]
@@ -148,6 +211,12 @@ fn test_sleep_delta_clamping_prevents_simulation_blowup() {
     assert_eq!(flight.elapsed_nanos(), max_step);
     assert!(!flight.is_complete());
     assert!(stepped.origin().x() < 500.0);
+
+    record_receipt(
+        "fcb_015_nav_sleep_delta_clamping",
+        Effect::Succeeded,
+        "extreme elapsed sleep intervals are clamped to max_step_delta_nanos",
+    );
 }
 
 #[test]
@@ -182,7 +251,17 @@ fn test_flight_interruption_hands_control_back_immediately() {
 
     // User pans by 25 points
     let panned = interrupted.pan(Point2D::new(25.0, 0.0).unwrap()).unwrap();
-    assert!((panned.origin().x() - (interrupted.origin().x() - 25.0 / interrupted.points_per_unit())).abs() < 1e-10);
+    assert!(
+        (panned.origin().x() - (interrupted.origin().x() - 25.0 / interrupted.points_per_unit()))
+            .abs()
+            < 1e-10
+    );
+
+    record_receipt(
+        "fcb_015_nav_flight_interruption",
+        Effect::Succeeded,
+        "interrupted camera flight hands control back immediately without fighting subsequent input",
+    );
 }
 
 #[test]
@@ -219,6 +298,12 @@ fn test_inverse_projection_oracle_during_all_flight_stages() {
             );
         }
     }
+
+    record_receipt(
+        "fcb_015_nav_inverse_projection_flight_stages",
+        Effect::Succeeded,
+        "inverse projection oracle invariant holds across all interpolation steps of flight",
+    );
 }
 
 #[test]
@@ -241,6 +326,12 @@ fn test_deep_zoom_drift_bounded_over_40_pinch_cycles() {
     // Drift must remain sub-micro-point
     assert!((cam.origin().x() - 42.0).abs() < 1e-6);
     assert!((cam.origin().y() - 84.0).abs() < 1e-6);
+
+    record_receipt(
+        "fcb_015_nav_deep_zoom_drift",
+        Effect::Succeeded,
+        "deep zoom to 10^9 and repeated zoom cycles drift bounded under 1e-6 points",
+    );
 }
 
 #[test]
@@ -260,10 +351,13 @@ fn test_deterministic_keyboard_replay_equality() {
         .unwrap();
 
         let mut h = NavigationHistory::with_initial_camera(own, c0, config).unwrap();
-        h.push_semantic_endpoint(c1, NavigationReason::KeyboardReplay, 10).unwrap();
-        h.push_semantic_endpoint(c2, NavigationReason::KeyboardReplay, 20).unwrap();
+        h.push_semantic_endpoint(c1, NavigationReason::KeyboardReplay, 10)
+            .unwrap();
+        h.push_semantic_endpoint(c2, NavigationReason::KeyboardReplay, 20)
+            .unwrap();
         let _ = h.navigate_back(30).unwrap();
-        h.push_semantic_endpoint(c3, NavigationReason::KeyboardReplay, 40).unwrap();
+        h.push_semantic_endpoint(c3, NavigationReason::KeyboardReplay, 40)
+            .unwrap();
         let _ = h.navigate_back(50).unwrap();
         let end = h.navigate_forward(60).unwrap();
         end
@@ -273,6 +367,12 @@ fn test_deterministic_keyboard_replay_equality() {
     let run_b = replay();
     assert_eq!(run_a, run_b);
     assert_eq!(run_a, c3);
+
+    record_receipt(
+        "fcb_015_nav_deterministic_keyboard_replay",
+        Effect::Succeeded,
+        "deterministic keyboard replay produces bit-for-bit identical camera endpoints",
+    );
 }
 
 #[test]
@@ -319,5 +419,11 @@ fn test_negative_controls_owner_mismatch_and_empty_history() {
     assert_eq!(
         NavigationFlightConfig::new(50, 0, MotionPreference::Normal),
         Err(NavigationError::InvalidDuration)
+    );
+
+    record_receipt(
+        "fcb_015_nav_negative_controls",
+        Effect::Succeeded,
+        "foreign owner camera, empty history navigation, and zero duration configurations are refused",
     );
 }
