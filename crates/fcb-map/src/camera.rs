@@ -290,13 +290,23 @@ mod tests {
     }
     #[test]
     fn rebased_f32_conversion_refuses_precision_loss() {
-        // 2^53 + 1 is the canonical f64 value that f32 cannot represent:
-        // the rebased conversion must refuse it rather than truncate.
-        let camera = Camera2D::new(CameraGeneration::new(owner(), 1).unwrap(), display(1.0, 100.0, 100.0, 1), Point2D::ORIGIN, 1.0).unwrap();
-        let local = Point2D::new(9007199254740993.0, 0.0).unwrap();
-        assert_eq!(camera.checked_screen_f32(local).unwrap_err(), CameraError::PrecisionLost);
-        let nan = Point2D::new(f64::NAN, 0.0).unwrap();
-        assert_eq!(camera.checked_screen_f32(nan).unwrap_err(), CameraError::InvalidGeometry);
+        // The rebasing subtraction itself can produce an f64 value that
+        // is NOT f32-exact: 2^24 (f32-exact) minus 0.5 (f32-exact) yields
+        // 16777215.5, which needs 25 significant bits. The conversion must
+        // refuse it rather than silently round.
+        let camera = Camera2D::new(CameraGeneration::new(owner(), 1).unwrap(), display(1.0, 100.0, 100.0, 1), Point2D::new(0.5, 0.5).unwrap(), 1.0).unwrap();
+        let local = Point2D::new(16777216.0, 0.0).unwrap();
+        assert_eq!(
+            camera.checked_screen_f32(local).unwrap_err(),
+            CameraError::PrecisionLost
+        );
+    }
+    #[test]
+    fn nan_point2d_is_rejected_at_construction() {
+        // Point2D structurally excludes NaN, so the InvalidGeometry arm of
+        // checked_screen_f32 is only reachable through the viewport; the
+        // constructor rejection is the typed boundary.
+        assert!(Point2D::new(f64::NAN, 0.0).is_err());
     }
     #[test]
     fn rebased_f32_survives_deep_zoom_near_anchor() {
