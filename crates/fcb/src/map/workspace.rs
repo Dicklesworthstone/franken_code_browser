@@ -13,6 +13,7 @@ pub mod path_search;
 pub mod text_search;
 pub mod text_preview;
 pub mod stream_search;
+pub mod retained;
 
 use std::mem::size_of;
 use fcb_core::{ByteLength, FileId, LayoutRevision, ResourceAllocationId, ResourceBudget, ResourceLease};

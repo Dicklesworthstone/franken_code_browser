@@ -12,7 +12,9 @@
 //! Bounds stay parent-local; focusing a subtree starts a new local origin rather
 //! than accumulating the absolute coordinates of all its ancestors.
 
-use std::mem::size_of;
+pub mod retained;
+
+use std::{mem::size_of, sync::Arc};
 use fcb_core::{ArenaOwnerId, ByteLength, LayoutRevision, Rect2D,
     ResourceAllocationId, ResourceBudget, ResourceLease, RootId};
 use crate::{LaidOutNode, NodeKind, PartitionLayout};
@@ -112,10 +114,10 @@ pub(crate) struct Branch {
 
 pub struct AtlasIndex<'layout> {
     pub(crate) layout: &'layout PartitionLayout,
-    pub(crate) nodes: Vec<IndexedNode>,
-    pub(crate) branches: Vec<Branch>,
-    children: Vec<usize>,
-    by_path: Vec<usize>,
+    pub(crate) nodes: Arc<Vec<IndexedNode>>,
+    pub(crate) branches: Arc<Vec<Branch>>,
+    children: Arc<Vec<usize>>,
+    by_path: Arc<Vec<usize>>,
     root_index: usize,
     _lease: ResourceLease,
 }
@@ -144,7 +146,8 @@ impl<'layout> AtlasIndex<'layout> {
         let branch_capacity = count.checked_mul(2).ok_or(AtlasError::InvalidLimits)?;
         let charge = count.checked_mul(size_of::<IndexedNode>() + 2 * size_of::<usize>())
             .and_then(|n| branch_capacity.checked_mul(size_of::<Branch>()).and_then(|b| n.checked_add(b)))
-            .and_then(|n| n.checked_add(size_of::<Self>())).ok_or(AtlasError::InvalidLimits)?;
+            // Four shared vector headers/control blocks and the retained owner/view.
+            .and_then(|n| n.checked_add(size_of::<Self>() + 256)).ok_or(AtlasError::InvalidLimits)?;
         let lease = budget.try_reserve_managed(layout.owner(), allocation, ByteLength::new(charge as u64))
             .map_err(|_| AtlasError::ResourceDenied)?;
         let mut nodes = reserved_vec::<IndexedNode>(count)?;
@@ -219,7 +222,8 @@ impl<'layout> AtlasIndex<'layout> {
             }
         }
         if canceled() { return Err(AtlasError::Canceled); }
-        Ok(Self { layout, nodes, branches, children, by_path, root_index, _lease: lease })
+        Ok(Self { layout, nodes: Arc::new(nodes), branches: Arc::new(branches),
+            children: Arc::new(children), by_path: Arc::new(by_path), root_index, _lease: lease })
     }
 
     pub fn owner(&self) -> ArenaOwnerId { self.layout.owner() }
