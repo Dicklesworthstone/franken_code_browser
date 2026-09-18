@@ -112,7 +112,7 @@ impl AtlasSession {
     pub fn open(owner: ArenaOwnerId, root: &Path, options: AtlasSessionOptions,
         mut canceled: impl FnMut() -> bool) -> Result<Self, AtlasSessionError> {
         check(&mut canceled)?;
-        if root.as_os_str().is_empty() || !(1..=MAX_ATLAS_SESSION_FILES).contains(&options.max_files)
+        if root.as_os_str().is_empty() || root.as_os_str().len() > 16_384 || !(1..=MAX_ATLAS_SESSION_FILES).contains(&options.max_files)
             || !(1..=MAX_ATLAS_SESSION_ITEMS).contains(&options.visible.max_items)
             || !(1..=MAX_ATLAS_SESSION_VISITS).contains(&options.visible.max_visits) {
             return Err(AtlasSessionError::InvalidLimits);
@@ -166,6 +166,10 @@ impl AtlasSession {
         if generation == 0 || generation <= self.last_attempt { return Err(AtlasSessionError::StaleGeneration); }
         self.last_attempt = generation;
         check(&mut canceled)?;
+        // Camera 1 belongs to the initial info state, before any plan exists.
+        // Keep plan/query generations distinct from that initial camera identity.
+        let camera_id = camera_generation(self.owner(), generation.checked_add(1)
+            .ok_or(AtlasSessionError::IdentityExhausted)?)?;
         let plan_allocation = self.next_id()?;
         let mut out = self.output("plan")?;
         let index = self.atlas.index()?;
@@ -186,7 +190,7 @@ impl AtlasSession {
                     push = true;
                 }
                 next.focus = node;
-                next.camera = index.focus_camera(node, camera_generation(self.owner(), generation)?, old.camera.display(), 12.0)?;
+                next.camera = index.focus_camera(node, camera_id, old.camera.display(), 12.0)?;
                 if self.atlas.file(node).is_ok() { selected = Some(node); }
             }
             AtlasAction::Back => {
@@ -201,7 +205,7 @@ impl AtlasSession {
             }
         }
         // History restores transforms, not old camera identities.
-        next.camera = Camera2D::new(camera_generation(self.owner(), generation)?, next.camera.display(),
+        next.camera = Camera2D::new(camera_id, next.camera.display(),
             next.camera.origin(), next.camera.points_per_unit())?;
         let query_generation = QueryGeneration::new(self.owner(), generation).map_err(|_| AtlasSessionError::IdentityExhausted)?;
         let previous = self.pending.as_ref().or(self.presented.as_ref());

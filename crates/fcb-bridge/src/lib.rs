@@ -12,6 +12,8 @@
 
 mod reader_sessions;
 mod reader_ffi;
+mod atlas_sessions;
+mod atlas_ffi;
 
 use std::{ffi::{c_char, CStr, CString}, panic::{catch_unwind, UnwindSafe}, path::Path};
 use fcb_app::host;

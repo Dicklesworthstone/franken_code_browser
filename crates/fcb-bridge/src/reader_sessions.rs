@@ -113,7 +113,7 @@ impl ReaderSessions {
         if self.live.load(Ordering::Acquire) >= MAX_READER_SESSIONS { return Err(AccessError::Capacity); }
         self.live.fetch_add(1, Ordering::AcqRel);
         let permit = Permit(Arc::clone(&self.live));
-        let id = allocate_handle(&NEXT_HANDLE)?;
+        let id = fresh_handle()?;
         let lease = self.budget.try_reserve_managed(ArenaOwnerId::new(1).expect("nonzero registry owner"),
             ResourceAllocationId::new(id).map_err(|_| AccessError::IdentityExhausted)?,
             ByteLength::new((size_of::<Cell>() + 256) as u64)).map_err(|_| AccessError::Capacity)?;
@@ -131,17 +131,31 @@ impl ReaderSessions {
     }
     fn initialize(&self, handle: u64,
         build: impl FnOnce(ArenaOwnerId, &mut dyn FnMut() -> bool) -> Result<ReaderSession, ReaderSessionError>,
-        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        self.initialize_prepared(handle, |owner, stop| {
+            let mut candidate = build(owner, &mut *stop)?;
+            let reply = candidate.info(&mut *stop)?;
+            Ok((candidate, reply))
+        }, canceled)
+    }
+    /// Admit an empty destination before a shared application workflow prepares
+    /// its capture and complete receipt. Used by acknowledged atlas activation;
+    /// the same cancellation/close/owner rules apply as ordinary reader open.
+    pub(super) fn initialize_prepared<E: From<AccessError>>(&self, handle: u64,
+        build: impl FnOnce(ArenaOwnerId, &mut dyn FnMut() -> bool) -> Result<(ReaderSession, HostResponse), E>,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, E> {
         let cell = self.get(handle)?;
         let epoch = cell.epoch.load(Ordering::Acquire);
         let mut state = lock(&cell.state)?;
         cell.validate(epoch)?;
-        if state.is_some() { return Err(AccessError::AlreadyOpen); }
+        if state.is_some() { return Err(AccessError::AlreadyOpen.into()); }
         let mut stop = || cell.validate(epoch).is_err() || canceled();
         let result = (|| {
-            let mut candidate = build(ArenaOwnerId::new(handle).map_err(|_| AccessError::IdentityExhausted)?, &mut stop)?;
-            let reply = candidate.info(&mut stop)?;
-            if stop() { return Err(AccessError::Canceled); }
+            let (candidate, reply) = build(ArenaOwnerId::new(handle).map_err(|_| AccessError::IdentityExhausted)?, &mut stop)?;
+            if candidate.capture().request().file().owner().get() != handle {
+                return Err(AccessError::InvalidArgument.into());
+            }
+            if stop() { return Err(AccessError::Canceled.into()); }
             *state = Some(candidate);
             Ok(reply)
         })();
@@ -207,6 +221,8 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, AccessError> {
         TryLockError::WouldBlock => AccessError::Busy, TryLockError::Poisoned(_) => AccessError::Poisoned,
     })
 }
+// One identity source for every retained C handle kind in this loaded library.
+pub(super) fn fresh_handle() -> Result<u64, AccessError> { allocate_handle(&NEXT_HANDLE) }
 fn allocate_handle(next: &AtomicU64) -> Result<u64, AccessError> {
     next.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
         .map_err(|_| AccessError::IdentityExhausted)

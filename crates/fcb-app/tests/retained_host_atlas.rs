@@ -89,6 +89,7 @@ fn superseded_candidates_and_wrong_display_cannot_be_acknowledged() {
 fn anchored_zoom_and_back_restore_focus_without_repacking() {
     let fixture = Fixture::new(); let mut session = fixture.open();
     session.prepare(1, AtlasAction::View, || false).unwrap();
+    assert_eq!(session.pending_plan().unwrap().camera().generation().get(), 2);
     let old = session.pending_plan().unwrap().camera(); let root = session.pending_plan().unwrap().focus();
     let anchor = point(100.25, 231.75); let local = old.logical_to_local(anchor).unwrap();
     session.prepare(2, AtlasAction::Zoom { anchor, factor: 2.0 }, || false).unwrap();
@@ -99,7 +100,7 @@ fn anchored_zoom_and_back_restore_focus_without_repacking() {
     let back = session.pending_plan().unwrap();
     assert_eq!(back.focus(), root); assert_eq!(back.camera().origin(), zoomed.origin());
     assert_eq!(back.camera().points_per_unit(), zoomed.points_per_unit());
-    assert_eq!(back.camera().generation().get(), 4);
+    assert_eq!(back.camera().generation().get(), 5);
     let info = session.info(|| false).unwrap();
     assert!(info.as_str().contains("\"history_depth\":\"0\""));
     assert!(info.as_str().contains("src/a.rs")); // Selection is independent from focus.

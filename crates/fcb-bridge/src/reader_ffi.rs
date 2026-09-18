@@ -10,6 +10,8 @@ use super::{cstr, reply, string_out};
 use super::reader_sessions::{AccessError, Command, ReaderSessions};
 
 static READERS: OnceLock<ReaderSessions> = OnceLock::new();
+// Atlas activation targets this exact registry, never an independent reader table.
+pub(super) fn registry() -> Option<&'static ReaderSessions> { READERS.get() }
 fn answer(handle: u64, work: impl FnOnce(&ReaderSessions) -> Result<HostResponse, AccessError>) -> Option<*mut c_char> {
     let result = match READERS.get() { Some(readers) => work(readers), None => Err(AccessError::UnknownHandle) };
     match result {
