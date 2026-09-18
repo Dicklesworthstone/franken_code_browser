@@ -1,25 +1,32 @@
 #![forbid(unsafe_code)]
 
-//! Bounded ownership for native retained atlases and captured search results.
+//! Bounded ownership for native retained atlases and search results.
 //! This table owns no discovery, geometry, matching, decoding or source policy.
 //! The table lock is never held during session work. All locks are try-locks.
 
 use std::{mem::size_of, path::Path, sync::{Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}};
 use fcb_app::host::{HostResponse, atlas_session::{AtlasAction, AtlasSession, AtlasSessionError, AtlasSessionOptions},
-    atlas_search::{AtlasSearchError, AtlasSearchOptions, RetainedAtlasSearch}};
+    atlas_search::{AtlasSearchError, AtlasSearchOptions, RetainedAtlasSearch},
+    atlas_paths::{AtlasPathError, RetainedAtlasPaths}};
 use fcb_core::{ArenaOwnerId, ByteLength, Point2D, ResourceAllocationId, ResourceBudget, ResourceLease};
 use super::reader_sessions::{self, ReaderSessions};
+
+#[path = "atlas_path_sessions.rs"]
+mod paths;
+pub(super) use paths::PathCommand;
 
 pub(super) const MAX_ATLAS_SESSIONS: usize = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AccessError {
     Unknown, NotOpen, AlreadyOpen, Busy, Capacity, Canceled, Closed, Poisoned,
     InvalidArgument, Atlas(AtlasSessionError), Reader(reader_sessions::AccessError), Search(AtlasSearchError),
+    Paths(AtlasPathError),
 }
 impl From<AtlasSessionError> for AccessError { fn from(e: AtlasSessionError) -> Self { Self::Atlas(e) } }
 impl From<reader_sessions::AccessError> for AccessError { fn from(e: reader_sessions::AccessError) -> Self { Self::Reader(e) } }
 impl From<AtlasSearchError> for AccessError { fn from(e: AtlasSearchError) -> Self { Self::Search(e) } }
+impl From<AtlasPathError> for AccessError { fn from(e: AtlasPathError) -> Self { Self::Paths(e) } }
 impl std::fmt::Display for AccessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -29,7 +36,7 @@ impl std::fmt::Display for AccessError {
             Self::Closed => "ATLAS_HANDLE_CLOSED", Self::Poisoned => "ATLAS_HANDLE_POISONED",
             Self::InvalidArgument => "ATLAS_HANDLE_INVALID_ARGUMENT",
             Self::Atlas(e) => return write!(f, "{e}"), Self::Reader(e) => return write!(f, "{e}"),
-            Self::Search(e) => return write!(f, "{e}"),
+            Self::Search(e) => return write!(f, "{e}"), Self::Paths(e) => return write!(f, "{e}"),
         })
     }
 }
@@ -65,7 +72,7 @@ pub(super) enum Command<'a> {
     SearchClear { generation: u64 },
     SearchFocus { generation: u64, hit: u64, plan_generation: u64 },
 }
-struct Session { atlas: AtlasSession, search: RetainedAtlasSearch, operation_epoch: u64 }
+struct Session { atlas: AtlasSession, search: RetainedAtlasSearch, paths: RetainedAtlasPaths, operation_epoch: u64 }
 impl Session {
     /// Cancellation can arrive BETWEEN resumable calls. Reclaim obsolete work
     /// on this worker before reading any provisional result or resuming it. A
@@ -142,9 +149,10 @@ impl AtlasSessions {
             let owner = ArenaOwnerId::new(handle).map_err(|_| AccessError::InvalidArgument)?;
             let mut candidate = AtlasSession::open(owner, root, options, &mut stop)?;
             let search = RetainedAtlasSearch::new(&candidate)?;
+            let paths = RetainedAtlasPaths::new(&candidate)?;
             let response = candidate.info(&mut stop)?;
             if stop() { return Err(AccessError::Canceled); }
-            *state = Some(Session { atlas: candidate, search, operation_epoch: epoch });
+            *state = Some(Session { atlas: candidate, search, paths, operation_epoch: epoch });
             Ok(response)
         })();
         cell.validate(epoch)?;

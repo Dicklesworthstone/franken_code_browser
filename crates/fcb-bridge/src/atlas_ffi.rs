@@ -107,6 +107,8 @@ pub extern "C" fn fcb_atlas_close(handle: u64) -> u8 {
 
 #[path = "atlas_search_ffi.rs"]
 mod search;
+#[path = "atlas_paths_ffi.rs"]
+mod paths;
 
 #[cfg(all(test, unix))]
 #[path = "atlas_ffi_tests.rs"]
