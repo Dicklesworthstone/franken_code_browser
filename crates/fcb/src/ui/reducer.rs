@@ -3,11 +3,14 @@
 //! Deterministic UI reducer, command routing, and bounded event log ring.
 //!
 //! Enforces:
-//! 1. Zero I/O, parsing, or bulk memory drops on the interaction thread.
+//! 1. Zero I/O or parsing on the interaction thread.
 //! 2. Strict separation of focus and selection.
 //! 3. Predictable focus-return on overlay dismissal.
 //! 4. Generation-validated search result publication (stale batches rejected).
 //! 5. Bounded event log ring without unbounded memory growth.
+//!
+//! Search producers must admit payloads before delivering owned vectors. This
+//! reducer limits retained results; it is not a bulk-payload retirement service.
 
 use std::collections::VecDeque;
 use fcb_core::{ArenaOwnerId, FileId, QueryGeneration};
@@ -20,7 +23,7 @@ use super::{
     },
     motion_mailbox::{DiscreteInputEvent, MotionMailbox},
     reading_panes::ReadingPaneManager,
-    sidebar::{HistoryItem, SearchResultEntry, SidebarPanel, SidebarState},
+    sidebar::{HistoryItem, SearchFailure, SearchResultEntry, SidebarPanel, SidebarState, MAX_UI_QUERY_BYTES},
     tree::{TreeNodeId, TreeProjection},
 };
 
@@ -62,13 +65,19 @@ pub enum UiAction {
     /// Close modal search / command palette.
     CloseSearchPalette,
 
-    /// Update search query text.
+    /// Update search query text. Published rows retain their previous label
+    /// and generation until a replacement is successfully admitted.
     SearchQueryChanged(String),
-    /// Search results received from background index worker.
+    /// A replacement result set from the background worker, not an append delta.
     SearchResultsReceived {
         query_generation: QueryGeneration,
         results: Vec<SearchResultEntry>,
         has_more: bool,
+    },
+    /// Terminal failure of a replacement; previously published rows survive.
+    SearchResultsFailed {
+        query_generation: QueryGeneration,
+        failure: SearchFailure,
     },
     /// Move to next search result row.
     SelectNextSearchResult,
@@ -170,6 +179,9 @@ pub enum UiCommand {
         query: String,
         query_generation: QueryGeneration,
     },
+    /// Detach this request's subscriber. A host must not cancel shared work
+    /// still required by another subscriber or invalidate retained old hits.
+    CancelSearch { query_generation: QueryGeneration },
     /// Request background source provider to capture or read a file.
     RequestCapture {
         file_id: FileId,
@@ -219,6 +231,10 @@ pub enum UiEventKind {
     },
     SearchResultsUpdated {
         count: usize,
+    },
+    SearchFailed {
+        query_generation: Option<QueryGeneration>,
+        failure: SearchFailure,
     },
     StaleResultsRejected {
         current_gen: Option<u64>,
@@ -336,6 +352,11 @@ pub struct UiState {
     pub breadcrumbs: ScopeBreadcrumbs,
     pub tree: TreeProjection,
     pub active_query_generation: Option<QueryGeneration>,
+    /// Draft/request text, separate from the label on published result rows.
+    pub search_input: String,
+    pub search_error: Option<SearchFailure>,
+    // Event sequence numbers are not request identities.
+    last_query_generation: u64,
     pub event_ring: UiEventRing,
     pub seq_counter: u64,
     pub gesture_arbitrator: GestureArbitrator,
@@ -357,6 +378,9 @@ impl UiState {
             breadcrumbs: ScopeBreadcrumbs::new(),
             tree: TreeProjection::new(),
             active_query_generation: None,
+            search_input: String::new(),
+            search_error: None,
+            last_query_generation: 0,
             event_ring: UiEventRing::default(),
             seq_counter: 0,
             gesture_arbitrator: GestureArbitrator::new(),
@@ -422,6 +446,10 @@ impl UiReducer {
 
             UiAction::SelectFile { file_id, path } => {
                 // Focus is explicitly NOT stolen by selection!
+                if state.sidebar.inspector.file_id != Some(file_id) {
+                    state.sidebar.inspector.clear();
+                    state.sidebar.outline.clear();
+                }
                 state.selected_file = Some((file_id, path.clone()));
                 state.sidebar.inspector.file_id = Some(file_id);
                 state.sidebar.inspector.file_path = Some(path.clone());
@@ -451,6 +479,7 @@ impl UiReducer {
                 if state.selected_file.is_some() {
                     state.selected_file = None;
                     state.sidebar.inspector.clear();
+                    state.sidebar.outline.clear();
                     let event = UiEventKind::SelectionChanged { path: None };
                     state.record_event(event.clone(), now_nanos);
                     outcome.emitted_events.push(event);
@@ -577,19 +606,38 @@ impl UiReducer {
             }
 
             UiAction::SearchQueryChanged(query) => {
-                state.sidebar.results.query = query.clone();
-                state.sidebar.results.is_searching = true;
-                // Generate a fresh QueryGeneration token for this query attempt
-                let gen_val = state.seq_counter.wrapping_add(100);
-                if let Ok(qgen) = QueryGeneration::new(state.owner, gen_val) {
-                    state.active_query_generation = Some(qgen);
-                    state.sidebar.results.query_generation = Some(qgen);
-                    outcome.commands.push(UiCommand::DispatchSearch {
-                        query: query.clone(),
-                        query_generation: qgen,
-                    });
+                if let Some(query_generation) = state.active_query_generation.take() {
+                    outcome.commands.push(UiCommand::CancelSearch { query_generation });
                 }
-                let event = UiEventKind::SearchQueryUpdated { query };
+                state.sidebar.results.is_searching = false;
+                state.search_error = None;
+                if query.is_empty() {
+                    state.search_input.clear();
+                    state.sidebar.results.clear();
+                } else if query.len() > MAX_UI_QUERY_BYTES {
+                    // Never retain or log an unbounded hostile draft.
+                    state.search_error = Some(SearchFailure::InvalidQuery);
+                } else if let Some(next) = state.last_query_generation.checked_add(1) {
+                    state.last_query_generation = next;
+                    match QueryGeneration::new(state.owner, next) {
+                        Ok(query_generation) => {
+                            state.search_input = query.clone();
+                            state.active_query_generation = Some(query_generation);
+                            state.sidebar.results.is_searching = true;
+                            outcome.commands.push(UiCommand::DispatchSearch {
+                                query: query.clone(),
+                                query_generation,
+                            });
+                        }
+                        Err(_) => state.search_error = Some(SearchFailure::IdentityExhausted),
+                    }
+                } else {
+                    state.search_error = Some(SearchFailure::IdentityExhausted);
+                }
+                let event = match state.search_error {
+                    Some(failure) => UiEventKind::SearchFailed { query_generation: None, failure },
+                    None => UiEventKind::SearchQueryUpdated { query },
+                };
                 state.record_event(event.clone(), now_nanos);
                 outcome.emitted_events.push(event);
                 outcome.changed = true;
@@ -601,20 +649,22 @@ impl UiReducer {
                 results,
                 has_more,
             } => {
-                // Reject stale query results!
                 if state.active_query_generation == Some(query_generation) {
-                    state.sidebar.results.results = results;
-                    state.sidebar.results.has_more = has_more;
-                    state.sidebar.results.is_searching = false;
-                    state.sidebar.results.selected_index =
-                        if state.sidebar.results.results.is_empty() {
-                            None
-                        } else {
-                            Some(0)
-                        };
-
-                    let count = state.sidebar.results.results.len();
-                    let event = UiEventKind::SearchResultsUpdated { count };
+                    let event = match state.sidebar.results.publish(
+                        &state.search_input, query_generation, results, has_more,
+                    ) {
+                        Ok(()) => {
+                            state.search_error = None;
+                            UiEventKind::SearchResultsUpdated { count: state.sidebar.results.results.len() }
+                        }
+                        Err(failure) => {
+                            state.active_query_generation = None;
+                            state.sidebar.results.is_searching = false;
+                            state.search_error = Some(failure);
+                            outcome.commands.push(UiCommand::CancelSearch { query_generation });
+                            UiEventKind::SearchFailed { query_generation: Some(query_generation), failure }
+                        }
+                    };
                     state.record_event(event.clone(), now_nanos);
                     outcome.emitted_events.push(event);
                     outcome.changed = true;
@@ -627,6 +677,24 @@ impl UiReducer {
                     state.record_event(event.clone(), now_nanos);
                     outcome.emitted_events.push(event);
                 }
+            }
+
+            UiAction::SearchResultsFailed { query_generation, failure } => {
+                let event = if state.active_query_generation == Some(query_generation) {
+                    state.active_query_generation = None;
+                    state.sidebar.results.is_searching = false;
+                    state.search_error = Some(failure);
+                    outcome.changed = true;
+                    outcome.commands.push(UiCommand::RequestRedraw);
+                    UiEventKind::SearchFailed { query_generation: Some(query_generation), failure }
+                } else {
+                    UiEventKind::StaleResultsRejected {
+                        current_gen: state.active_query_generation.map(|g| g.get()),
+                        rejected_gen: query_generation.get(),
+                    }
+                };
+                state.record_event(event.clone(), now_nanos);
+                outcome.emitted_events.push(event);
             }
 
             UiAction::SelectNextSearchResult => {
@@ -649,30 +717,31 @@ impl UiReducer {
                     if state.focus.current() == FocusTarget::SearchPalette {
                         let _ = state.focus.return_focus();
                     }
-                    state.selected_file = Some((entry.file_id, entry.path.clone()));
-                    state.reading_lens_open = true;
-                    state.reading_lens_file =
-                        Some((entry.file_id, entry.path.clone(), Some(entry.line_number)));
-                    state.focus.set_focus(FocusTarget::ReadingLens);
-                    outcome.changed = true;
-                    outcome.commands.push(UiCommand::RequestCapture {
-                        file_id: entry.file_id,
-                        path: entry.path,
-                    });
-                    outcome.commands.push(UiCommand::RequestRedraw);
+                    // Share selection/inspector/history behavior with tree and
+                    // atlas navigation, then open an actual managed reading pane.
+                    outcome = Self::reduce(state, UiAction::SelectFile {
+                        file_id: entry.file_id, path: entry.path.clone(),
+                    }, now_nanos);
+                    let opened = Self::reduce(state, UiAction::OpenReadingLens {
+                        file_id: entry.file_id, path: entry.path, line: Some(entry.line_number),
+                    }, now_nanos);
+                    // Both actions request the same file. Emit one capture and
+                    // one redraw rather than scheduling duplicate worker work.
+                    outcome.commands.retain(|command| !matches!(command,
+                        UiCommand::RequestCapture { .. } | UiCommand::RequestRedraw));
+                    outcome.commands.extend(opened.commands);
+                    outcome.emitted_events.extend(opened.emitted_events);
+                    outcome.changed |= opened.changed;
                 }
             }
 
             UiAction::TreeSelect(node_id) => {
                 if let Some(node) = state.tree.select(node_id).cloned() {
                     if node.is_file() {
-                        if let Some(fid) = node.file_id {
-                            state.selected_file = Some((fid, node.path.clone()));
-                            state.breadcrumbs.set_from_path(&node.path);
-                            outcome.commands.push(UiCommand::RequestCapture {
-                                file_id: fid,
-                                path: node.path,
-                            });
+                        if let Some(file_id) = node.file_id {
+                            return Self::reduce(state, UiAction::SelectFile {
+                                file_id, path: node.path,
+                            }, now_nanos);
                         }
                     } else {
                         state.breadcrumbs.set_from_path(&node.path);
@@ -1228,7 +1297,19 @@ impl UiReducer {
                             return Self::reduce(state, UiAction::FocusReturn, now_nanos);
                         }
                     }
+                    "ArrowDown" | "Down" if matches!(state.focus.current(),
+                        FocusTarget::SearchPalette | FocusTarget::Sidebar(SidebarPanel::Results)) => {
+                        return Self::reduce(state, UiAction::SelectNextSearchResult, now_nanos);
+                    }
+                    "ArrowUp" | "Up" if matches!(state.focus.current(),
+                        FocusTarget::SearchPalette | FocusTarget::Sidebar(SidebarPanel::Results)) => {
+                        return Self::reduce(state, UiAction::SelectPrevSearchResult, now_nanos);
+                    }
                     "Enter" => {
+                        if matches!(state.focus.current(), FocusTarget::SearchPalette
+                            | FocusTarget::Sidebar(SidebarPanel::Results)) {
+                            return Self::reduce(state, UiAction::ActivateSearchResult, now_nanos);
+                        }
                         // Enter on Atlas with selected file promotes to reading lens
                         if state.focus.current() == FocusTarget::Atlas && state.selected_file.is_some() {
                             return Self::reduce(state, UiAction::PromoteSelectedToReadingLens, now_nanos);
@@ -1246,5 +1327,23 @@ impl UiReducer {
         }
 
         outcome
+    }
+}
+
+#[cfg(test)]
+mod search_generation_tests {
+    use super::*;
+
+    #[test]
+    fn exhausted_query_identity_never_wraps_or_dispatches() {
+        let mut state = UiState::new(ArenaOwnerId::new(2903).unwrap());
+        state.last_query_generation = u64::MAX;
+        let out = UiReducer::reduce(&mut state, UiAction::SearchQueryChanged("last".into()), 0);
+        assert_eq!(state.search_error, Some(SearchFailure::IdentityExhausted));
+        assert!(state.active_query_generation.is_none());
+        assert!(!out.commands.iter().any(|c| matches!(c, UiCommand::DispatchSearch { .. })));
+        UiReducer::reduce(&mut state, UiAction::SearchQueryChanged(String::new()), 0);
+        UiReducer::reduce(&mut state, UiAction::SearchQueryChanged("retry".into()), 0);
+        assert_eq!(state.search_error, Some(SearchFailure::IdentityExhausted));
     }
 }
