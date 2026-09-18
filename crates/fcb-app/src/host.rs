@@ -9,6 +9,7 @@
 pub mod atlas;
 pub mod reader;
 pub mod atlas_session;
+pub mod atlas_search;
 
 use std::{ffi::OsString, io::{self, Read, Write}, mem::size_of, path::Path};
 use fcb::{ByteLength, ByteOffset, ByteRange, SourceRevision};
