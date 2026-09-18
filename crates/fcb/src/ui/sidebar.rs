@@ -92,7 +92,25 @@ pub struct SearchResultEntry {
     pub excerpt: String,
 }
 
-/// State for the Results panel.
+/// Maximum retained presentation payload. Producers must apply these limits
+/// before allocating a batch; publication also refuses oversized deliveries.
+pub const MAX_UI_QUERY_BYTES: usize = 4096;
+pub const MAX_UI_SEARCH_RESULTS: usize = 4096;
+pub const MAX_UI_RESULT_BYTES: usize = 1024 * 1024;
+
+/// A failed replacement is not an empty successful search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchFailure {
+    Canceled,
+    InvalidQuery,
+    Unavailable,
+    ResourceDenied,
+    InvalidResults,
+    IdentityExhausted,
+}
+
+/// State for the Results panel. `query` and `query_generation` describe the
+/// PUBLISHED rows, not the text of a replacement still being prepared.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResultsState {
     pub query: String,
@@ -124,6 +142,60 @@ impl ResultsState {
         self.has_more = false;
     }
 
+    /// Atomically publish a bounded replacement of the visible result set.
+    /// The reducer checks request freshness before calling this method. Ranking
+    /// changes preserve the selected occurrence, not its old row index; two
+    /// occurrences sharing a span remain distinct through their stable IDs.
+    pub fn publish(
+        &mut self,
+        query: &str,
+        generation: QueryGeneration,
+        results: Vec<SearchResultEntry>,
+        has_more: bool,
+    ) -> Result<(), SearchFailure> {
+        if query.is_empty() || query.len() > MAX_UI_QUERY_BYTES
+            || results.capacity() > MAX_UI_SEARCH_RESULTS
+        {
+            return Err(SearchFailure::ResourceDenied);
+        }
+        let mut retained = results.capacity()
+            .checked_mul(std::mem::size_of::<SearchResultEntry>())
+            .and_then(|n| n.checked_add(query.len()))
+            .ok_or(SearchFailure::ResourceDenied)?;
+        for entry in &results {
+            if entry.file_id.owner() != generation.owner()
+                || entry.byte_range.0 > entry.byte_range.1
+            {
+                return Err(SearchFailure::InvalidResults);
+            }
+            retained = retained.checked_add(entry.path.capacity())
+                .and_then(|n| n.checked_add(entry.excerpt.capacity()))
+                .ok_or(SearchFailure::ResourceDenied)?;
+            if retained > MAX_UI_RESULT_BYTES {
+                return Err(SearchFailure::ResourceDenied);
+            }
+        }
+        if retained > MAX_UI_RESULT_BYTES {
+            return Err(SearchFailure::ResourceDenied);
+        }
+        // Prepare the bounded query label before replacing any visible state.
+        let mut label = String::new();
+        label.try_reserve_exact(query.len()).map_err(|_| SearchFailure::ResourceDenied)?;
+        if label.capacity() > MAX_UI_QUERY_BYTES { return Err(SearchFailure::ResourceDenied); }
+        label.push_str(query);
+        let selected = self.selected_result().map(|entry| (entry.id, entry.file_id, entry.byte_range));
+        let selected_index = selected.and_then(|identity| results.iter().position(|entry|
+            (entry.id, entry.file_id, entry.byte_range) == identity))
+            .or_else(|| (!results.is_empty()).then_some(0));
+        self.query = label;
+        self.query_generation = Some(generation);
+        self.results = results;
+        self.selected_index = selected_index;
+        self.has_more = has_more;
+        self.is_searching = false;
+        Ok(())
+    }
+
     pub fn selected_result(&self) -> Option<&SearchResultEntry> {
         self.selected_index.and_then(|idx| self.results.get(idx))
     }
@@ -133,7 +205,7 @@ impl ResultsState {
             return None;
         }
         let next_idx = match self.selected_index {
-            Some(idx) => (idx + 1).min(self.results.len() - 1),
+            Some(idx) => idx.saturating_add(1).min(self.results.len() - 1),
             None => 0,
         };
         self.selected_index = Some(next_idx);
@@ -145,7 +217,7 @@ impl ResultsState {
             return None;
         }
         let prev_idx = match self.selected_index {
-            Some(idx) => idx.saturating_sub(1),
+            Some(idx) => idx.saturating_sub(1).min(self.results.len() - 1),
             None => 0,
         };
         self.selected_index = Some(prev_idx);
