@@ -105,6 +105,9 @@ pub extern "C" fn fcb_atlas_close(handle: u64) -> u8 {
     std::panic::catch_unwind(|| u8::from(ATLASES.get().is_some_and(|atlases| atlases.close(handle).is_ok()))).unwrap_or(0)
 }
 
+#[path = "atlas_search_ffi.rs"]
+mod search;
+
 #[cfg(all(test, unix))]
 #[path = "atlas_ffi_tests.rs"]
 mod tests;

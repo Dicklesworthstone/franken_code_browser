@@ -1,12 +1,13 @@
 #![forbid(unsafe_code)]
 
-//! Bounded ownership for native retained atlases. This table owns no discovery,
-//! geometry, source policy, camera math or renderer. All work uses AtlasSession.
+//! Bounded ownership for native retained atlases and captured search results.
+//! This table owns no discovery, geometry, matching, decoding or source policy.
 //! The table lock is never held during session work. All locks are try-locks.
 
 use std::{mem::size_of, path::Path, sync::{Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}};
-use fcb_app::host::{HostResponse, atlas_session::{AtlasAction, AtlasSession, AtlasSessionError, AtlasSessionOptions}};
+use fcb_app::host::{HostResponse, atlas_session::{AtlasAction, AtlasSession, AtlasSessionError, AtlasSessionOptions},
+    atlas_search::{AtlasSearchError, AtlasSearchOptions, RetainedAtlasSearch}};
 use fcb_core::{ArenaOwnerId, ByteLength, Point2D, ResourceAllocationId, ResourceBudget, ResourceLease};
 use super::reader_sessions::{self, ReaderSessions};
 
@@ -14,10 +15,11 @@ pub(super) const MAX_ATLAS_SESSIONS: usize = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AccessError {
     Unknown, NotOpen, AlreadyOpen, Busy, Capacity, Canceled, Closed, Poisoned,
-    InvalidArgument, Atlas(AtlasSessionError), Reader(reader_sessions::AccessError),
+    InvalidArgument, Atlas(AtlasSessionError), Reader(reader_sessions::AccessError), Search(AtlasSearchError),
 }
 impl From<AtlasSessionError> for AccessError { fn from(e: AtlasSessionError) -> Self { Self::Atlas(e) } }
 impl From<reader_sessions::AccessError> for AccessError { fn from(e: reader_sessions::AccessError) -> Self { Self::Reader(e) } }
+impl From<AtlasSearchError> for AccessError { fn from(e: AtlasSearchError) -> Self { Self::Search(e) } }
 impl std::fmt::Display for AccessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -27,6 +29,7 @@ impl std::fmt::Display for AccessError {
             Self::Closed => "ATLAS_HANDLE_CLOSED", Self::Poisoned => "ATLAS_HANDLE_POISONED",
             Self::InvalidArgument => "ATLAS_HANDLE_INVALID_ARGUMENT",
             Self::Atlas(e) => return write!(f, "{e}"), Self::Reader(e) => return write!(f, "{e}"),
+            Self::Search(e) => return write!(f, "{e}"),
         })
     }
 }
@@ -48,12 +51,22 @@ impl AccessError {
     }
 }
 
-pub(super) enum Command {
+pub(super) enum Command<'a> {
     Info,
     Prepare { generation: u64, action: AtlasAction },
     Present { generation: u64, frame: u64, display: u64 },
     Pick { frame: u64, display: u64, point: Point2D },
     Children { parent: u32, start: usize, limit: usize },
+    Search { generation: u64, needle: &'a str, options: AtlasSearchOptions },
+    SearchPage { generation: u64, start: usize, limit: usize },
+    SearchOverlay { generation: u64 },
+    SearchClear { generation: u64 },
+    SearchFocus { generation: u64, hit: u64, plan_generation: u64 },
+}
+struct Session { atlas: AtlasSession, search: RetainedAtlasSearch }
+impl std::ops::Deref for Session {
+    type Target = AtlasSession;
+    fn deref(&self) -> &Self::Target { &self.atlas }
 }
 struct Permit(Arc<AtomicUsize>);
 impl Drop for Permit { fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); } }
@@ -61,7 +74,7 @@ struct Cell {
     id: u64,
     closed: AtomicBool,
     epoch: AtomicU64,
-    state: Mutex<Option<AtlasSession>>,
+    state: Mutex<Option<Session>>,
     _lease: ResourceLease,
     _permit: Permit, // Last: source/geometry destruction precedes slot release.
 }
@@ -115,31 +128,37 @@ impl AtlasSessions {
         let result = (|| {
             let owner = ArenaOwnerId::new(handle).map_err(|_| AccessError::InvalidArgument)?;
             let mut candidate = AtlasSession::open(owner, root, options, &mut stop)?;
+            let search = RetainedAtlasSearch::new(&candidate)?;
             let response = candidate.info(&mut stop)?;
             if stop() { return Err(AccessError::Canceled); }
-            *state = Some(candidate);
+            *state = Some(Session { atlas: candidate, search });
             Ok(response)
         })();
         cell.validate(epoch)?;
         result
     }
-    pub(super) fn execute(&self, handle: u64, command: Command,
+    pub(super) fn execute(&self, handle: u64, command: Command<'_>,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
         let cell = self.get(handle)?;
         let epoch = cell.epoch.load(Ordering::Acquire);
         let mut state = lock(&cell.state)?;
         cell.validate(epoch)?;
-        let atlas = state.as_mut().ok_or(AccessError::NotOpen)?;
+        let session = state.as_mut().ok_or(AccessError::NotOpen)?;
         let mut stop = || cell.validate(epoch).is_err() || canceled();
         let result = match command {
-            Command::Info => atlas.info(&mut stop),
-            Command::Prepare { generation, action } => atlas.prepare(generation, action, &mut stop),
-            Command::Present { generation, frame, display } => atlas.acknowledge(generation, frame, display, &mut stop),
-            Command::Pick { frame, display, point } => atlas.pick(frame, display, point, &mut stop),
-            Command::Children { parent, start, limit } => atlas.children(parent, start, limit, &mut stop),
+            Command::Info => session.atlas.info(&mut stop).map_err(AccessError::from),
+            Command::Prepare { generation, action } => session.atlas.prepare(generation, action, &mut stop).map_err(AccessError::from),
+            Command::Present { generation, frame, display } => session.atlas.acknowledge(generation, frame, display, &mut stop).map_err(AccessError::from),
+            Command::Pick { frame, display, point } => session.atlas.pick(frame, display, point, &mut stop).map_err(AccessError::from),
+            Command::Children { parent, start, limit } => session.atlas.children(parent, start, limit, &mut stop).map_err(AccessError::from),
+            Command::Search { generation, needle, options } => session.search.search(&session.atlas, generation, needle, options, &mut stop).map_err(AccessError::from),
+            Command::SearchPage { generation, start, limit } => session.search.page(&session.atlas, generation, start, limit, &mut stop).map_err(AccessError::from),
+            Command::SearchOverlay { generation } => session.search.overlay(&session.atlas, generation, &mut stop).map_err(AccessError::from),
+            Command::SearchClear { generation } => session.search.clear(&session.atlas, generation, &mut stop).map_err(AccessError::from),
+            Command::SearchFocus { generation, hit, plan_generation } => session.search.focus_hit(&mut session.atlas, generation, hit, plan_generation, &mut stop).map_err(AccessError::from),
         };
         cell.validate(epoch)?;
-        result.map_err(AccessError::from)
+        result
     }
     /// Fixed lock order: atlas operation then reader operation, both nonblocking.
     /// Reader admission/empty-state checks precede capture. The shared safe app
@@ -151,7 +170,7 @@ impl AtlasSessions {
         let epoch = cell.epoch.load(Ordering::Acquire);
         let mut state = lock(&cell.state)?;
         cell.validate(epoch)?;
-        let atlas = state.as_mut().ok_or(AccessError::NotOpen)?;
+        let atlas = &mut state.as_mut().ok_or(AccessError::NotOpen)?.atlas;
         let mut stop = || cell.validate(epoch).is_err() || canceled();
         let result = readers.initialize_prepared(reader_handle,
             |owner, reader_stop| atlas.open_reader(owner, frame, display, point, max_bytes, reader_stop).map_err(AccessError::from),
@@ -159,6 +178,26 @@ impl AtlasSessions {
         // A late close/cancel suppresses delivery, but does not pretend to undo
         // an already installed reader. The caller knows its destination handle
         // and can inspect or close it explicitly to reconcile that boundary.
+        cell.validate(epoch)?;
+        result
+    }
+    /// Same destination admission and lock order as metadata activation, but
+    /// sources come ONLY from the accepted search capture. An already-open reader
+    /// is never overwritten, and cancellation of either handle aborts preparation.
+    pub(super) fn open_search_reader(&self, handle: u64, readers: &ReaderSessions,
+        reader_handle: u64, generation: u64, hit: u64,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        let cell = self.get(handle)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let mut state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        let session = state.as_mut().ok_or(AccessError::NotOpen)?;
+        let mut stop = || cell.validate(epoch).is_err() || canceled();
+        let result = readers.initialize_prepared(reader_handle,
+            |owner, reader_stop| session.search.open_reader(&session.atlas, owner, generation, hit, reader_stop).map_err(AccessError::from),
+            &mut stop);
+        // As above: post-install cancellation suppresses the response, not the
+        // installed effect. Reader info/close reconciles the known destination.
         cell.validate(epoch)?;
         result
     }
@@ -193,3 +232,6 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, AccessError> {
 #[cfg(all(test, unix))]
 #[path = "atlas_sessions_tests.rs"]
 mod tests;
+#[cfg(all(test, unix))]
+#[path = "atlas_search_sessions_tests.rs"]
+mod search_tests;
