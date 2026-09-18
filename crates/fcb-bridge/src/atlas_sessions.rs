@@ -58,12 +58,25 @@ pub(super) enum Command<'a> {
     Pick { frame: u64, display: u64, point: Point2D },
     Children { parent: u32, start: usize, limit: usize },
     Search { generation: u64, needle: &'a str, options: AtlasSearchOptions },
+    SearchBegin { generation: u64, needle: &'a str, options: AtlasSearchOptions },
+    SearchStep { generation: u64 },
     SearchPage { generation: u64, start: usize, limit: usize },
     SearchOverlay { generation: u64 },
     SearchClear { generation: u64 },
     SearchFocus { generation: u64, hit: u64, plan_generation: u64 },
 }
-struct Session { atlas: AtlasSession, search: RetainedAtlasSearch }
+struct Session { atlas: AtlasSession, search: RetainedAtlasSearch, operation_epoch: u64 }
+impl Session {
+    /// Cancellation can arrive BETWEEN resumable calls. Reclaim obsolete work
+    /// on this worker before reading any provisional result or resuming it. A
+    /// finished query is a committed result and is not rolled back by cancellation.
+    fn synchronize(&mut self, epoch: u64) {
+        if self.operation_epoch != epoch {
+            self.search.cancel_pending();
+            self.operation_epoch = epoch;
+        }
+    }
+}
 impl std::ops::Deref for Session {
     type Target = AtlasSession;
     fn deref(&self) -> &Self::Target { &self.atlas }
@@ -131,7 +144,7 @@ impl AtlasSessions {
             let search = RetainedAtlasSearch::new(&candidate)?;
             let response = candidate.info(&mut stop)?;
             if stop() { return Err(AccessError::Canceled); }
-            *state = Some(Session { atlas: candidate, search });
+            *state = Some(Session { atlas: candidate, search, operation_epoch: epoch });
             Ok(response)
         })();
         cell.validate(epoch)?;
@@ -144,6 +157,7 @@ impl AtlasSessions {
         let mut state = lock(&cell.state)?;
         cell.validate(epoch)?;
         let session = state.as_mut().ok_or(AccessError::NotOpen)?;
+        session.synchronize(epoch);
         let mut stop = || cell.validate(epoch).is_err() || canceled();
         let result = match command {
             Command::Info => session.atlas.info(&mut stop).map_err(AccessError::from),
@@ -152,12 +166,17 @@ impl AtlasSessions {
             Command::Pick { frame, display, point } => session.atlas.pick(frame, display, point, &mut stop).map_err(AccessError::from),
             Command::Children { parent, start, limit } => session.atlas.children(parent, start, limit, &mut stop).map_err(AccessError::from),
             Command::Search { generation, needle, options } => session.search.search(&session.atlas, generation, needle, options, &mut stop).map_err(AccessError::from),
+            Command::SearchBegin { generation, needle, options } => session.search.begin(&session.atlas, generation, needle, options, &mut stop).map_err(AccessError::from),
+            Command::SearchStep { generation } => session.search.step(&session.atlas, generation, &mut stop).map_err(AccessError::from),
             Command::SearchPage { generation, start, limit } => session.search.page(&session.atlas, generation, start, limit, &mut stop).map_err(AccessError::from),
             Command::SearchOverlay { generation } => session.search.overlay(&session.atlas, generation, &mut stop).map_err(AccessError::from),
             Command::SearchClear { generation } => session.search.clear(&session.atlas, generation, &mut stop).map_err(AccessError::from),
             Command::SearchFocus { generation, hit, plan_generation } => session.search.focus_hit(&mut session.atlas, generation, hit, plan_generation, &mut stop).map_err(AccessError::from),
         };
-        cell.validate(epoch)?;
+        if let Err(error) = cell.validate(epoch) {
+            session.search.cancel_pending();
+            return Err(error);
+        }
         result
     }
     /// Fixed lock order: atlas operation then reader operation, both nonblocking.
@@ -170,20 +189,23 @@ impl AtlasSessions {
         let epoch = cell.epoch.load(Ordering::Acquire);
         let mut state = lock(&cell.state)?;
         cell.validate(epoch)?;
-        let atlas = &mut state.as_mut().ok_or(AccessError::NotOpen)?.atlas;
+        let session = state.as_mut().ok_or(AccessError::NotOpen)?;
+        session.synchronize(epoch);
         let mut stop = || cell.validate(epoch).is_err() || canceled();
         let result = readers.initialize_prepared(reader_handle,
-            |owner, reader_stop| atlas.open_reader(owner, frame, display, point, max_bytes, reader_stop).map_err(AccessError::from),
+            |owner, reader_stop| session.atlas.open_reader(owner, frame, display, point, max_bytes, reader_stop).map_err(AccessError::from),
             &mut stop);
         // A late close/cancel suppresses delivery, but does not pretend to undo
-        // an already installed reader. The caller knows its destination handle
-        // and can inspect or close it explicitly to reconcile that boundary.
-        cell.validate(epoch)?;
+        // an already installed reader. The known destination can be reconciled.
+        if let Err(error) = cell.validate(epoch) {
+            session.search.cancel_pending();
+            return Err(error);
+        }
         result
     }
-    /// Same destination admission and lock order as metadata activation, but
-    /// sources come ONLY from the accepted search capture. An already-open reader
-    /// is never overwritten, and cancellation of either handle aborts preparation.
+    /// Same destination admission and lock order as metadata activation. Sources
+    /// come only from a finished/running query's retained capture. Reader-only
+    /// cancellation does not cancel the atlas query shared by other readers.
     pub(super) fn open_search_reader(&self, handle: u64, readers: &ReaderSessions,
         reader_handle: u64, generation: u64, hit: u64,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
@@ -192,13 +214,15 @@ impl AtlasSessions {
         let mut state = lock(&cell.state)?;
         cell.validate(epoch)?;
         let session = state.as_mut().ok_or(AccessError::NotOpen)?;
+        session.synchronize(epoch);
         let mut stop = || cell.validate(epoch).is_err() || canceled();
         let result = readers.initialize_prepared(reader_handle,
             |owner, reader_stop| session.search.open_reader(&session.atlas, owner, generation, hit, reader_stop).map_err(AccessError::from),
             &mut stop);
-        // As above: post-install cancellation suppresses the response, not the
-        // installed effect. Reader info/close reconciles the known destination.
-        cell.validate(epoch)?;
+        if let Err(error) = cell.validate(epoch) {
+            session.search.cancel_pending();
+            return Err(error);
+        }
         result
     }
     pub(super) fn cancel(&self, handle: u64) -> Result<(), AccessError> {
@@ -208,6 +232,8 @@ impl AtlasSessions {
             cell.closed.store(true, Ordering::Release);
             return Err(AccessError::Closed);
         }
+        // No source destruction on this path. Active work observes the epoch;
+        // a paused job is retired by the next worker operation or final close.
         Ok(())
     }
     pub(super) fn close(&self, handle: u64) -> Result<(), AccessError> {
@@ -235,3 +261,6 @@ mod tests;
 #[cfg(all(test, unix))]
 #[path = "atlas_search_sessions_tests.rs"]
 mod search_tests;
+#[cfg(all(test, unix))]
+#[path = "atlas_progressive_tests.rs"]
+mod progressive_tests;

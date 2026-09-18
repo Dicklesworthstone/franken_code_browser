@@ -15,7 +15,7 @@ use progressive::SearchWork;
 use std::{mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, ByteRange, FileId, SourceRevision};
 use fcb::map::{AtlasNodeId, LayoutRevision};
-use fcb::search::{ResourceAllocationId, ResourceBudget, SearchManifestId};
+use fcb::search::{CompleteCapture, ResourceAllocationId, ResourceBudget, SearchManifestId};
 use fcb_core::ResourceLease;
 use fcb::search::workspace::RootGrant;
 use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES};
