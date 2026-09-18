@@ -7,7 +7,7 @@
 //! - Bounded focus-return stack for predictable overlay exit.
 //! - Conventional file tree projection for accessibility and precision navigation.
 //! - Sidebar with Inspector, Results, History, and Outline panels.
-//! - Zero I/O, parsing, or bulk-drop on interaction thread.
+//! - No I/O or parsing on the interaction thread; producers admit payloads.
 //! - Generation-validated search results with stale batch rejection.
 
 pub mod breadcrumbs;
@@ -18,6 +18,9 @@ pub mod reading_panes;
 pub mod reducer;
 pub mod sidebar;
 pub mod tree;
+/// Exact captured-content activation, separate from live path navigation.
+#[cfg(feature = "search")]
+pub mod search_navigation;
 
 pub use breadcrumbs::{ScopeBreadcrumbs, ScopeSegment};
 pub use focus::{FocusDirection, FocusManager, FocusStack, FocusTarget};
@@ -26,12 +29,14 @@ pub use gesture::{
     ScrollRouting,
 };
 pub use motion_mailbox::{CoalescedMotion, DiscreteInputEvent, MotionMailbox};
-pub use reading_panes::{ReadingPane, ReadingPaneManager};
+pub use reading_panes::{ReadingPane, ReadingPaneManager, ReadingPaneOpenError};
 pub use reducer::{
     UiAction, UiCommand, UiEvent, UiEventKind, UiEventRing, UiReducer, UiReductionOutcome, UiState,
 };
 pub use sidebar::{
     FactCertainty, HistoryItem, HistoryState, InspectorFact, InspectorState, OutlineState,
-    OutlineSymbol, ResultsState, SearchResultEntry, SidebarPanel, SidebarState,
+    OutlineSymbol, ResultsState, SearchFailure, SearchResultEntry, SidebarPanel, SidebarState,
 };
+#[cfg(feature = "search")]
+pub use search_navigation::{CapturedSearchActivation, SearchActivationError};
 pub use tree::{TreeError, TreeNode, TreeNodeId, TreeNodeKind, TreeProjection};

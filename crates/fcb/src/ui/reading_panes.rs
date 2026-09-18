@@ -8,19 +8,32 @@
 
 #![forbid(unsafe_code)]
 
-use fcb_core::FileId;
+use fcb_core::{ByteRange, FileId, SourceRevision};
 
-/// Individual floating reading lens pane.
+pub const MAX_CAPTURED_READING_PANES: usize = 64;
+pub const MAX_READING_PATH_BYTES: usize = 16_384;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadingPaneOpenError {
+    InvalidTarget,
+    ResourceDenied,
+    IdentityExhausted,
+}
+
+/// Individual floating reading lens pane. Capture-qualified panes retain a
+/// revision descriptor; their host separately retains the immutable source.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReadingPane {
     pub id: u64,
     pub file_id: FileId,
+    pub revision: Option<SourceRevision>,
     pub path: String,
     pub position: (f32, f32),
     pub size: (f32, f32),
     pub is_pinned: bool,
     pub scroll_offset: (f32, f32),
     pub target_line: Option<usize>,
+    /// Original-byte selection, never decoded UTF-8 coordinates.
     pub selection: Option<(usize, usize)>,
 }
 
@@ -29,6 +42,7 @@ impl ReadingPane {
         Self {
             id,
             file_id,
+            revision: None,
             path,
             position,
             size: (640.0, 480.0),
@@ -106,13 +120,13 @@ impl ReadingPaneManager {
         self.panes.iter().filter(|p| !p.is_pinned).count()
     }
 
-    /// Open a file in a reading pane, or focus it if already open.
-    ///
-    /// If an existing pane has matching `file_id`, it is promoted to active and its target line updated.
-    /// If opening a new pane and existing panes exist, positions are staggered so they remain accessible.
+    /// Open an unqualified path result. This must not replace an already
+    /// captured version of the same file under its old revision label.
     pub fn open_or_focus(&mut self, file_id: FileId, path: String, line: Option<usize>) -> u64 {
-        if let Some(existing) = self.panes.iter_mut().find(|p| p.file_id == file_id) {
+        if let Some(existing) = self.panes.iter_mut().find(|p| p.file_id == file_id && p.revision.is_none()) {
+            existing.path = path;
             existing.target_line = line;
+            existing.selection = None;
             let id = existing.id;
             self.active_pane_id = Some(id);
             return id;
@@ -131,6 +145,45 @@ impl ReadingPaneManager {
         self.panes.push(pane);
         self.active_pane_id = Some(id);
         id
+    }
+
+    /// Open a validated captured-source selection without reusing another
+    /// revision's pane. Refusal leaves visible pane state and focus unchanged.
+    /// The source host must validate the range against its retained capture
+    /// before calling; a ByteRange alone is not proof that source bytes exist.
+    pub fn open_captured(&mut self, file_id: FileId, revision: SourceRevision,
+        path: String, line: usize, selection: ByteRange) -> Result<u64, ReadingPaneOpenError> {
+        if file_id.owner() != revision.owner() || path.is_empty()
+            || path.len() > MAX_READING_PATH_BYTES || line == 0 || selection.is_empty() {
+            return Err(ReadingPaneOpenError::InvalidTarget);
+        }
+        let range = selection.as_usize_bounds().map_err(|_| ReadingPaneOpenError::InvalidTarget)?;
+        if let Some(pane) = self.panes.iter_mut().find(|p| p.file_id == file_id && p.revision == Some(revision)) {
+            pane.path = path;
+            pane.target_line = Some(line);
+            pane.selection = Some(range);
+            self.active_pane_id = Some(pane.id);
+            return Ok(pane.id);
+        }
+        if self.panes.len() >= MAX_CAPTURED_READING_PANES || self.panes.capacity() > MAX_CAPTURED_READING_PANES {
+            return Err(ReadingPaneOpenError::ResourceDenied);
+        }
+        let id = self.next_id;
+        let next = id.checked_add(1).filter(|_| id != 0)
+            .ok_or(ReadingPaneOpenError::IdentityExhausted)?;
+        self.panes.try_reserve_exact(1).map_err(|_| ReadingPaneOpenError::ResourceDenied)?;
+        if self.panes.capacity() > MAX_CAPTURED_READING_PANES {
+            return Err(ReadingPaneOpenError::ResourceDenied);
+        }
+        let offset = self.panes.len() as f32 * 30.0;
+        let mut pane = ReadingPane::new(id, file_id, path, (80.0 + offset, 60.0 + offset));
+        pane.revision = Some(revision);
+        pane.target_line = Some(line);
+        pane.selection = Some(range);
+        self.panes.push(pane);
+        self.next_id = next;
+        self.active_pane_id = Some(id);
+        Ok(id)
     }
 
     /// Set pinning state on a pane.
