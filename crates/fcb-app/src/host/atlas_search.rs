@@ -4,18 +4,21 @@
 //! worker work over its frozen catalog, not a camera callback or a new walk.
 //! The existing capture and exact-text engines own I/O, decoding and matching.
 //! Matching files remain captured until successful replacement or explicit clear;
-//! result activation never reopens a live path. This is a bounded direct scan,
-//! not a persistent index or an atomic cross-file filesystem snapshot.
+//! result activation never reopens a live path. Both synchronous and resumable
+//! queries use the same bounded direct-scan pipeline. Neither is a persistent
+//! index or an atomic cross-file filesystem snapshot.
+
+mod progressive;
+pub use progressive::{AtlasSearchProgress, AtlasSearchStop};
+use progressive::SearchWork;
 
 use std::{mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, ByteRange, FileId, SourceRevision};
 use fcb::map::{AtlasNodeId, LayoutRevision};
-use fcb::search::{CaptureRequest, CompleteCapture, QueryGeneration, ReaderSearch,
-    ResourceAllocationId, ResourceBudget, SearchManifestId, StreamReadOptions,
-    StreamReadState, StreamReadStep, StreamingNeedle};
+use fcb::search::{ResourceAllocationId, ResourceBudget, SearchManifestId};
 use fcb_core::ResourceLease;
 use fcb::search::workspace::RootGrant;
-use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES, workspace};
+use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES};
 use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
 use super::{HostResponse, atlas_session::{AtlasAction, AtlasSession, AtlasSessionError},
     reader::{ReaderSession, ReaderSessionError}};
@@ -83,7 +86,8 @@ impl From<AtlasSessionError> for AtlasSearchError { fn from(e: AtlasSessionError
 impl From<ReaderSessionError> for AtlasSearchError { fn from(e: ReaderSessionError) -> Self { Self::Reader(e) } }
 impl From<OutputError> for AtlasSearchError { fn from(e: OutputError) -> Self { Self::App(e.into()) } }
 
-/// Occurrence IDs are local to one published query, not row positions in a UI.
+/// Occurrence IDs are local to one query, not row positions in a UI. A running
+/// query appends occurrences without renumbering its previously delivered hits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AtlasSearchHit {
     pub id: u64,
@@ -111,6 +115,11 @@ struct Snapshot {
     retained_bytes: usize,
     truncated: bool,
     complete: bool,
+    stop_reason: Option<AtlasSearchStop>,
+    step_count: u64,
+    last_step_files: usize,
+    last_step_bytes: u64,
+    last_step_calls: u64,
     _lease: ResourceLease,
 }
 impl Snapshot {
@@ -122,11 +131,12 @@ impl Snapshot {
     }
 }
 
-/// One atlas and one accepted query snapshot, plus privately prepared replacement
-/// work. The atlas owner must be fresh and never reused, as for AtlasSession.
-/// No source is read by construction. Hosts call these methods on their worker.
-/// This object and the atlas have independently bounded managed reservations;
-/// their limits are not a claim about process RSS or a host's native copies.
+/// One atlas, one finished query and at most one resumable replacement. A host
+/// can page/open the running query's exact captured hits, or keep displaying the
+/// finished query until replacement succeeds. Canceling/failing a replacement
+/// retires its progress, not the finished query. No thread or runtime is created.
+/// Source work and destruction belong on a worker, including cancel_pending.
+/// Managed reservations do not account for unrelated host/native allocations.
 pub struct RetainedAtlasSearch {
     manifest: SearchManifestId,
     grant: RootGrant,
@@ -134,6 +144,7 @@ pub struct RetainedAtlasSearch {
     last_attempt: u64,
     next_allocation: u64,
     accepted: Option<Snapshot>,
+    pending: Option<SearchWork>,
     budget: ResourceBudget,
     _metadata_lease: ResourceLease,
 }
@@ -149,9 +160,10 @@ impl RetainedAtlasSearch {
             ByteLength::new((2 * grant.root_path().len() + size_of::<Self>()) as u64))
             .map_err(|_| AppError::Admission)?;
         Ok(Self { manifest, grant: grant.clone(), layout: atlas.atlas().layout().revision(), last_attempt: 0,
-            next_allocation: 100, accepted: None, budget, _metadata_lease: metadata_lease })
+            next_allocation: 100, accepted: None, pending: None, budget, _metadata_lease: metadata_lease })
     }
     pub fn accepted_generation(&self) -> Option<u64> { self.accepted.as_ref().map(|q| q.generation) }
+    /// Bytes retained by the finished query. Pending progress is reported by progress().
     pub fn retained_source_bytes(&self) -> usize { self.accepted.as_ref().map_or(0, |q| q.retained_bytes) }
     fn validate(&self, atlas: &AtlasSession) -> Result<(), AtlasSearchError> {
         atlas.validate_active()?;
@@ -164,10 +176,18 @@ impl RetainedAtlasSearch {
     fn attempt(&mut self, generation: u64) -> Result<(), AtlasSearchError> {
         if generation == 0 || generation <= self.last_attempt { return Err(AtlasSearchError::StaleQuery); }
         self.last_attempt = generation;
+        // A newer attempt cannot leave an obsolete running request able to finish
+        // later. The finished query remains available even if the new attempt fails.
+        self.pending = None;
         Ok(())
     }
     fn snapshot(&self, generation: u64) -> Result<&Snapshot, AtlasSearchError> {
-        let query = self.accepted.as_ref().ok_or(AtlasSearchError::MissingQuery)?;
+        if let Some(work) = &self.pending {
+            if work.snapshot.generation == generation { return Ok(&work.snapshot); }
+        }
+        let query = self.accepted.as_ref().ok_or(if self.pending.is_some() {
+            AtlasSearchError::StaleQuery
+        } else { AtlasSearchError::MissingQuery })?;
         if query.generation != generation { return Err(AtlasSearchError::StaleQuery); }
         Ok(query)
     }
@@ -177,105 +197,24 @@ impl RetainedAtlasSearch {
         self.snapshot(generation)?.hits.get(position).copied().ok_or(AtlasSearchError::MissingHit)
     }
 
-    /// Scan only this atlas's frozen eligible membership. A successful query
-    /// atomically replaces rows AND their captures. Failure/cancellation preserves
-    /// old rows under their old generation, while consuming the attempted ID.
+    /// Compatibility worker operation: run the same resumable pipeline to its
+    /// terminal state without exposing intermediate progress. Use begin/step for
+    /// interleaving camera, paging, activation and cancellation between files.
     pub fn search(&mut self, atlas: &AtlasSession, generation: u64, needle: &str,
         options: AtlasSearchOptions, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
-        self.validate(atlas)?;
-        self.attempt(generation)?;
-        options.validate()?;
-        if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES { return Err(AtlasSearchError::InvalidLimits); }
-        check(&mut canceled)?;
-        let [state_id, pattern_id, scan_id] = [self.next_id()?, self.next_id()?, self.next_id()?];
-        let capacity = options.max_matches.min(options.max_files);
-        // Captures are Arc-owned; reserve payload plus capture conversion overlap
-        // before any read. The existing range reader/scanner reserve their own
-        // transient work in this SAME budget. Old accepted snapshots stay charged.
-        let charge = 2 * options.max_source_bytes + capacity * (size_of::<RetainedFile>() + 64)
-            + options.max_matches * size_of::<AtlasSearchHit>()
-            + MAX_DIAGNOSTICS * size_of::<Unavailable>() + needle.len() + size_of::<Snapshot>();
-        let lease = self.budget.try_reserve_managed(self.manifest.owner(), state_id, ByteLength::new(charge as u64))
-            .map_err(|_| AppError::Admission)?;
-        let mut candidate = Snapshot { generation, needle: copy_text(needle)?, files: reserve(capacity)?,
-            hits: reserve(options.max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?,
-            examined: 0, scanned: 0, unavailable: 0, pending: 0, matches_seen: 0,
-            source_bytes_read: 0, read_calls: 0, retained_bytes: 0, truncated: false,
-            complete: false, _lease: lease };
-        let pattern = StreamingNeedle::text(self.manifest.owner(), needle, &self.budget, pattern_id).map_err(AppError::from)?;
-        let qgen = QueryGeneration::new(self.manifest.owner(), generation).map_err(|_| AtlasSearchError::IdentityExhausted)?;
-        let revision = SourceRevision::new(self.manifest.owner(), generation).map_err(|_| AtlasSearchError::IdentityExhausted)?;
-        let catalog = atlas.atlas().catalog();
-        let root = catalog.grant().root_path().to_path_buf();
-        let mut io = workspace::IoCounts::default();
-        for (ordinal, entry) in catalog.entries().iter().enumerate() {
-            self.validate(atlas)?; check(&mut canceled)?;
-            if candidate.hits.len() == options.max_matches {
-                candidate.truncated = true; break;
-            }
-            if candidate.examined == options.max_files || io.bytes >= options.max_source_bytes as u64 { break; }
-            let file = catalog.file_id(ordinal).ok_or(AtlasSearchError::WrongAtlas)?;
-            candidate.examined += 1;
-            if entry.observed_bytes() > options.max_file_bytes as u64 {
-                candidate.unavailable(file, "FILE_BYTE_LIMIT"); continue;
-            }
-            let request = CaptureRequest::new(file, revision).map_err(|_| AtlasSearchError::WrongAtlas)?;
-            let mut stop = || canceled() || atlas.validate_active().is_err();
-            let captured = workspace::read_capture(&root, request, entry.path(), options.max_file_bytes,
-                options.max_source_bytes as u64, &mut io, &self.budget, &mut stop);
-            self.validate(atlas)?; check(&mut canceled)?;
-            let capture = match captured {
-                Ok(capture) => capture,
-                Err(fcb::source::SourceError::Canceled) => return Err(AtlasSearchError::Canceled),
-                Err(error) => { candidate.unavailable(file, error.code()); continue; }
-            };
-            let node = atlas.atlas().node_for_file(file).map_err(AtlasSessionError::from)?;
-            let before_hits = candidate.hits.len();
-            {
-                let mut scan_options = StreamReadOptions::new(qgen);
-                scan_options.max_matches = options.max_matches - before_hits;
-                scan_options.max_bytes = capture.bytes().len() as u64;
-                let mut scan = ReaderSearch::new(capture.bytes(), *capture.request(),
-                    ByteLength::new(capture.bytes().len() as u64), &pattern, scan_options,
-                    &self.budget, scan_id).map_err(AppError::from)?;
-                while scan.state() == StreamReadState::Pending {
-                    scan.step(StreamReadStep::default(), qgen,
-                        || canceled() || atlas.validate_active().is_err()).map_err(AppError::from)?;
-                }
-                let (_, report) = scan.finish().map_err(AppError::from)?;
-                self.validate(atlas)?; check(&mut canceled)?;
-                if report.state() == StreamReadState::Canceled { return Err(AtlasSearchError::Canceled); }
-                if let StreamReadState::Failed(error) = report.state() { return Err(AppError::from(error).into()); }
-                candidate.scanned += 1;
-                candidate.matches_seen += report.matches_seen();
-                if report.state() == StreamReadState::Truncated { candidate.truncated = true; }
-                else if !report.input_complete() { candidate.unavailable(file, report.state().code()); }
-                for hit in report.hits() {
-                    candidate.hits.push(AtlasSearchHit { id: candidate.hits.len() as u64 + 1,
-                        file, revision, node, original_range: hit.original_range(), source_slot: candidate.files.len() });
-                }
-            }
-            let hits = candidate.hits.len() - before_hits;
-            if hits != 0 {
-                candidate.retained_bytes += capture.bytes().len();
-                candidate.files.push(RetainedFile { capture, node, hits });
-            }
+        let mut work = self.prepare_work(atlas, generation, needle, options, &mut canceled)?;
+        while work.snapshot.stop_reason.is_none() {
+            self.advance_work(atlas, &mut work, &mut canceled)?;
         }
-        candidate.pending = catalog.entries().len() - candidate.examined;
-        candidate.source_bytes_read = io.bytes;
-        candidate.read_calls = io.calls;
-        candidate.complete = atlas.atlas().discovery_complete() && candidate.pending == 0
-            && candidate.unavailable == 0 && !candidate.truncated;
-        let mut out = self.output("search")?;
-        encode_page(&mut out, atlas, &candidate, 0, 64, &mut canceled)?;
-        let response = self.finish(atlas, out, !candidate.complete, &mut canceled)?;
-        self.accepted = Some(candidate);
+        let response = self.work_response(atlas, &work, "search", &mut canceled)?;
+        self.accepted = Some(work.snapshot);
         Ok(response)
     }
 
-    /// Paging never reads a source or recomputes a query. A page continuation is
-    /// separate from search completeness and from result-storage truncation.
+    /// Paging never reads a source or recomputes a query. Running-query pages
+    /// are explicitly provisional; next_offset=null means end of currently
+    /// retained rows, not proof that no later step can append another hit.
     pub fn page(&mut self, atlas: &AtlasSession, generation: u64, start: usize, limit: usize,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         self.validate(atlas)?; check(&mut canceled)?;
@@ -289,8 +228,7 @@ impl RetainedAtlasSearch {
     }
 
     /// One compact entry per matching file, never one drawable per occurrence.
-    /// Counts cover retained hits only. They are not whole-workspace totals when
-    /// the query is incomplete, and do not establish a presented GPU frame.
+    /// Counts cover retained hits only, including explicitly running queries.
     pub fn overlay(&mut self, atlas: &AtlasSession, generation: u64,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         self.validate(atlas)?; check(&mut canceled)?;
@@ -322,9 +260,8 @@ impl RetainedAtlasSearch {
         Ok(response)
     }
 
-    /// Prepare a camera plan for the exact accepted occurrence. No filesystem
-    /// work or implicit presentation acknowledgment occurs; old picking remains
-    /// authoritative until the host presents/acknowledges the new plan.
+    /// Prepare a camera plan for a finished or running query's exact occurrence.
+    /// Old picking stays authoritative until the new plan is acknowledged.
     pub fn focus_hit(&self, atlas: &mut AtlasSession, generation: u64, id: u64,
         plan_generation: u64, canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         let hit = self.hit(atlas, generation, id)?;
@@ -333,7 +270,8 @@ impl RetainedAtlasSearch {
 
     /// Copy the retained WHOLE matching capture into an independently owned
     /// reader. Source and reader identities are explicitly linked, not relabeled.
-    /// No path open occurs, even after deletion, rename or same-size live edits.
+    /// This also works for partial progress; subsequent cancellation or replacement
+    /// cannot change an already delivered reader's captured bytes.
     pub fn open_reader(&mut self, atlas: &AtlasSession, reader_owner: ArenaOwnerId,
         generation: u64, id: u64, mut canceled: impl FnMut() -> bool)
         -> Result<(ReaderSession, HostResponse), AtlasSearchError> {
@@ -352,6 +290,7 @@ impl RetainedAtlasSearch {
         let end = hit.original_range.end().get().saturating_add(132).min(source.bytes().len() as u64);
         let window = reader.read_window(start, (end - start) as usize, &mut stop)?;
         out.literal(",\"query_generation\":")?; out.integer(generation)?;
+        out.literal(",\"search_in_progress\":")?; out.boolean(snapshot.stop_reason.is_none())?;
         out.literal(",\"hit_id\":")?; out.integer(hit.id)?;
         encode_hit(&mut out, atlas, hit)?;
         out.literal(",\"source_observation\":\"retained-search-capture\",\"source_reopened\":false,\"reader_owner\":")?;
@@ -394,6 +333,9 @@ fn summary(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot) -> Resul
     out.literal(",\"needle\":")?; out.quoted(&snapshot.needle)?;
     out.literal(",\"mode\":\"exact-decoded-literal\",\"source_observation\":\"per-file-captures-not-atomic-workspace\",\"discovery_complete\":")?;
     out.boolean(atlas.atlas().discovery_complete())?;
+    out.literal(",\"search_in_progress\":")?; out.boolean(snapshot.stop_reason.is_none())?;
+    out.literal(",\"stop_reason\":")?;
+    if let Some(reason) = snapshot.stop_reason { out.quoted(reason.code())?; } else { out.literal("null")?; }
     out.literal(",\"search_complete\":")?; out.boolean(snapshot.complete)?;
     out.literal(",\"truncated\":")?; out.boolean(snapshot.truncated)?;
     for (key, value) in [("catalogued_files", atlas.atlas().file_count() as u64),
@@ -401,7 +343,9 @@ fn summary(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot) -> Resul
         ("unavailable_files", snapshot.unavailable as u64), ("pending_files", snapshot.pending as u64),
         ("matches_seen", snapshot.matches_seen), ("retained_hits", snapshot.hits.len() as u64),
         ("matching_files", snapshot.files.len() as u64), ("source_bytes_read", snapshot.source_bytes_read),
-        ("read_calls", snapshot.read_calls), ("retained_source_bytes", snapshot.retained_bytes as u64)] {
+        ("read_calls", snapshot.read_calls), ("retained_source_bytes", snapshot.retained_bytes as u64),
+        ("step_count", snapshot.step_count), ("last_step_files", snapshot.last_step_files as u64),
+        ("last_step_source_bytes", snapshot.last_step_bytes), ("last_step_read_calls", snapshot.last_step_calls)] {
         out.literal(",")?; out.quoted(key)?; out.literal(":")?; out.integer(value)?;
     }
     Ok(())
