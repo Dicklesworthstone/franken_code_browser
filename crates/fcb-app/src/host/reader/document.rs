@@ -206,7 +206,8 @@ fn rendered_limit(start: usize, end: usize) -> Result<(), ReaderSessionError> {
     if end <= start || end - start > MAX_READER_WINDOW_BYTES { return Err(ReaderSessionError::InvalidRange); }
     Ok(())
 }
-fn summary(out: &mut Output, document: &DocumentReader<'_>) -> Result<(), ReaderSessionError> {
+// Shared by single-reader and multi-pane desk hosts; neither owns a second flow engine.
+pub(crate) fn summary(out: &mut Output, document: &DocumentReader<'_>) -> Result<(), ReaderSessionError> {
     out.literal(",\"document_generation\":")?; out.integer(document.generation().get())?;
     out.literal(",\"document_ready\":true,\"layout_complete\":true,\"rendering\":\"logical-frankenmarkdown-flow\",\"native_shaped\":false,\"source_mapping\":\"enclosing-regions-not-glyph-exact\",\"width_columns\":")?;
     out.integer(document.options().width_columns as u64)?;
@@ -216,7 +217,7 @@ fn summary(out: &mut Output, document: &DocumentReader<'_>) -> Result<(), Reader
     out.literal(",\"parser_source_base\":")?; out.integer(document.source_base() as u64)?;
     Ok(())
 }
-fn encode_window(out: &mut Output, document: &DocumentReader<'_>, first: usize, count: usize,
+pub(crate) fn encode_window(out: &mut Output, document: &DocumentReader<'_>, first: usize, count: usize,
     canceled: &mut impl FnMut() -> bool) -> Result<(), ReaderSessionError> {
     let window = document.window(first, count)?;
     out.literal(",\"first_flow_line\":")?; out.integer(window.first_index() as u64)?;
@@ -238,7 +239,7 @@ fn encode_window(out: &mut Output, document: &DocumentReader<'_>, first: usize, 
     out.literal(",\"whole_document_visible\":")?; out.boolean(window.whole_document_visible())?;
     Ok(())
 }
-fn encode_headings(out: &mut Output, document: &DocumentReader<'_>, first: usize, count: usize,
+pub(crate) fn encode_headings(out: &mut Output, document: &DocumentReader<'_>, first: usize, count: usize,
     canceled: &mut impl FnMut() -> bool) -> Result<(), ReaderSessionError> {
     let headings = document.headings();
     if first > headings.len() { return Err(ReaderSessionError::InvalidRange); }

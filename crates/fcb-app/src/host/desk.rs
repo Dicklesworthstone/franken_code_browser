@@ -372,3 +372,6 @@ pub mod imports;
 
 /// Explicit repository search and exact-result adoption into persistent readers.
 pub mod repository;
+
+/// Source-linked Markdown preview and split reading on retained desk panes.
+pub mod document;
