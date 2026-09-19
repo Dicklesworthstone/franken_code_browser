@@ -7,7 +7,7 @@
 //! here. Calls are bounded synchronous worker operations, not redraw callbacks.
 
 mod outline;
-mod document;
+pub(crate) mod document;
 pub use outline::{ReaderOutlineOptions, MAX_READER_SYMBOL_PAGE, MAX_READER_SYMBOL_QUERY_BYTES};
 pub use document::{DocumentCopyMode, ReaderDocumentOptions, MAX_READER_DOCUMENT_PAGE};
 use outline::{AcceptedOutline, SelectionIdentity};
