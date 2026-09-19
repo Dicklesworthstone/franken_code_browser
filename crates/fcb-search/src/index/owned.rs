@@ -5,6 +5,9 @@
 //! one descriptor directly by ordinal, without rebuilding the descriptor array.
 //! Source and postings are shared/retained, never copied or rebuilt by a step.
 
+#[path = "builder.rs"]
+pub mod builder;
+
 use std::{mem::{size_of, take}, sync::Arc};
 use fcb_core::{ByteLength, FileId, ResourceAllocationId, ResourceBudget, ResourceLease};
 use fcb_source::CompleteCapture;

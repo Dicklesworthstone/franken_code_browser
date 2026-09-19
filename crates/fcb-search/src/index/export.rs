@@ -9,6 +9,7 @@
 #[path = "owned.rs"]
 mod owned;
 pub use owned::{OwnedEphemeralIndex, SourceRetentionLimits};
+pub use owned::builder::OwnedIndexBuilder;
 
 use super::{EphemeralIndex, SegmentCoverage};
 use fcb_core::{FileId, SourceRevision};
