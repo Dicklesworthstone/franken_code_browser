@@ -4,10 +4,14 @@
 //! Synchronous and one-file resumable queries use the same owning cursor and
 //! verifier. Native paths stay with the atlas; query text is literal, not syntax.
 
+#[path = "index_build.rs"]
+mod build;
+pub use build::AtlasIndexBuildProgress;
+pub(super) use build::IndexBuildWork;
+
 use std::mem::size_of;
-use fcb::search::{CaptureRequest, EphemeralIndex, IndexError, IndexLimits, IndexedQueryState,
-    ManifestLimits, MembershipState, ParsedQuery, QueryError, QueryGeneration, QueryOptions,
-    SearchCoverage, SearchDocument, SearchManifest};
+use fcb::search::{CaptureRequest, IndexError, IndexLimits, IndexedQueryState,
+    MembershipState, ParsedQuery, QueryError, QueryGeneration, QueryOptions, SearchCoverage};
 use fcb::search::index::export::{OwnedEphemeralIndex, SourceRetentionLimits};
 use fcb::search::indexed_query::OwnedIndexedQuery;
 use crate::workspace;
@@ -47,6 +51,10 @@ pub(super) struct RetainedIndex {
     read_bytes: u64,
     read_calls: u64,
     stop: AtlasSearchStop,
+    build_steps: u64,
+    last_build_files: usize,
+    last_build_bytes: u64,
+    last_build_calls: u64,
     _lease: ResourceLease,
 }
 pub(super) struct IndexedWork {
@@ -87,89 +95,17 @@ impl RetainedAtlasSearch {
     pub fn index_generation(&self) -> Option<u64> { self.index.as_ref().map(|i| i.generation) }
     pub fn indexed_source_bytes(&self) -> u64 { self.index.as_ref().map_or(0, |i| i.engine.source_bytes()) }
 
-    /// Capture the existing catalog once. Preparation remains a synchronous
-    /// bounded worker operation; resumable indexed QUERIES do not imply that
-    /// initial source capture/index construction is resumable as well.
+    /// Compatibility worker call over the SAME one-file preparation pipeline.
+    /// Use begin_index/step_index to yield between captured/indexed members.
     pub fn prepare_index(&mut self, atlas: &AtlasSession, generation: u64,
         options: AtlasIndexOptions, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
-        self.validate(atlas)?; self.attempt(generation)?; options.validate()?; check(&mut canceled)?;
-        let manifest_revision = generation.checked_add(self.manifest.revision())
-            .ok_or(AtlasSearchError::IdentityExhausted)?;
-        let manifest_id = SearchManifestId::new(self.manifest.owner(), manifest_revision)?;
-        let revision = SourceRevision::new(self.manifest.owner(), generation)
-            .map_err(|_| AtlasSearchError::IdentityExhausted)?;
-        let [scratch_id, metadata_id, index_id, source_id] =
-            [self.next_id()?, self.next_id()?, self.next_id()?, self.next_id()?];
-        let catalog = atlas.atlas().catalog();
-        let capacity = catalog.entries().len().min(options.max_files);
-        let scratch_bytes = 2 * options.max_source_bytes + 256 * 1024
-            + capacity * (size_of::<CompleteCapture>() + size_of::<SearchDocument<'_>>() + size_of::<FileId>() + 32);
-        let _scratch = self.budget.try_reserve_managed(self.manifest.owner(), scratch_id, ByteLength::new(scratch_bytes as u64))
-            .map_err(|_| AppError::Admission)?;
-        let lease = self.budget.try_reserve_managed(self.manifest.owner(), metadata_id,
-            ByteLength::new((size_of::<RetainedIndex>() + MAX_DIAGNOSTICS * size_of::<Unavailable>()) as u64))
-            .map_err(|_| AppError::Admission)?;
-        let mut captures = reserve(capacity)?;
-        let mut unavailable = reserve(capacity)?;
-        let mut diagnostics = reserve(MAX_DIAGNOSTICS)?;
-        let mut io = workspace::IoCounts::default();
-        let mut examined = 0;
-        let root = catalog.grant().root_path().to_path_buf();
-        for (ordinal, entry) in catalog.entries().iter().take(capacity).enumerate() {
-            self.validate(atlas)?; check(&mut canceled)?;
-            if io.bytes >= options.max_source_bytes as u64 { break; }
-            let file = catalog.file_id(ordinal).ok_or(AtlasSearchError::WrongAtlas)?;
-            examined += 1;
-            let result = if entry.observed_bytes() > options.max_file_bytes as u64 {
-                Err(fcb::source::SourceError::PayloadTooLarge)
-            } else {
-                let request = CaptureRequest::new(file, revision).map_err(|_| AtlasSearchError::WrongAtlas)?;
-                workspace::read_capture(&root, request, entry.path(), options.max_file_bytes,
-                    options.max_source_bytes as u64, &mut io, &self.budget,
-                    &mut || canceled() || atlas.validate_active().is_err())
-            };
-            self.validate(atlas)?; check(&mut canceled)?;
-            match result {
-                Ok(capture) => captures.push(capture),
-                Err(fcb::source::SourceError::Canceled) => return Err(AtlasSearchError::Canceled),
-                Err(error) => {
-                    unavailable.push(file);
-                    if diagnostics.len() < MAX_DIAGNOSTICS { diagnostics.push(Unavailable { file, reason: error.code() }); }
-                }
+        let mut work = self.prepare_index_build(atlas, generation, options, &mut canceled)?;
+        loop {
+            if let Some(stop) = self.advance_index_build(atlas, &mut work, &mut canceled)? {
+                return self.publish_index_build(atlas, work, stop, "index-prepare", &mut canceled);
             }
         }
-        let pending = catalog.entries().len() - examined;
-        let stop = if pending == 0 { AtlasSearchStop::AllFilesExamined }
-            else if examined == options.max_files { AtlasSearchStop::FileLimit }
-            else { AtlasSearchStop::SourceByteLimit };
-        let membership = if pending == 0 && atlas.atlas().discovery_complete() {
-            MembershipState::Closed
-        } else { MembershipState::Discovering };
-        let mut documents = reserve(captures.len())?;
-        for capture in &captures {
-            check(&mut canceled)?;
-            documents.push(SearchDocument::new(capture.request().file(), "", capture));
-        }
-        let manifest = SearchManifest::new(manifest_id, &documents, &unavailable, membership,
-            ManifestLimits { max_files: options.max_files, max_path_bytes: 0 })?;
-        let engine = EphemeralIndex::build(manifest, IndexLimits {
-            max_source_bytes_per_file: options.max_file_bytes,
-            max_source_bytes_total: options.max_source_bytes as u64,
-            max_total_grams: options.max_index_grams, max_scratch_bytes: 4 * 1024 * 1024,
-            ..IndexLimits::default()
-        }, &self.budget, index_id, || canceled() || atlas.validate_active().is_err())?;
-        let engine = engine.into_owned(SourceRetentionLimits { max_files: options.max_files,
-            max_source_bytes: options.max_source_bytes as u64, max_path_bytes: 0 },
-            &self.budget, source_id, || canceled() || atlas.validate_active().is_err())?;
-        let candidate = RetainedIndex { generation, engine, diagnostics, examined, pending,
-            read_bytes: io.bytes, read_calls: io.calls, stop, _lease: lease };
-        let mut out = self.output("index-prepare")?;
-        encode_index(&mut out, atlas, &candidate)?;
-        let partial = !capture_complete(atlas, &candidate) || candidate.engine.statistics().uncovered_files != 0;
-        let response = self.finish(atlas, out, partial, &mut canceled)?;
-        self.index = Some(candidate);
-        Ok(response)
     }
 
     /// Compatibility worker call: finish the SAME one-file cursor used by
@@ -314,7 +250,9 @@ impl RetainedAtlasSearch {
     }
     pub fn clear_index(&mut self, atlas: &AtlasSession, generation: u64, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
-        self.validate(atlas)?; self.attempt(generation)?; check(&mut canceled)?;
+        self.validate(atlas)?; self.attempt(generation)?;
+        self.building = None;
+        check(&mut canceled)?;
         let mut out = self.output("index-clear")?;
         out.literal(",\"generation\":")?; out.integer(generation)?;
         out.literal(",\"index_generation\":null,\"indexed_source_bytes\":\"0\"}\n")?;
@@ -329,6 +267,10 @@ fn capture_complete(atlas: &AtlasSession, index: &RetainedIndex) -> bool {
 fn encode_index(out: &mut Output, atlas: &AtlasSession, index: &RetainedIndex) -> Result<(), AtlasSearchError> {
     let stats = index.engine.statistics();
     out.literal(",\"index_generation\":")?; out.integer(index.generation)?;
+    out.literal(",\"index_build_in_progress\":false,\"build_steps\":")?; out.integer(index.build_steps)?;
+    out.literal(",\"last_step_files\":")?; out.integer(index.last_build_files as u64)?;
+    out.literal(",\"last_step_source_bytes\":")?; out.integer(index.last_build_bytes)?;
+    out.literal(",\"last_step_read_calls\":")?; out.integer(index.last_build_calls)?;
     out.literal(",\"capture_manifest\":")?; out.integer(index.engine.id().revision())?;
     out.literal(",\"index_kind\":\"retained-ephemeral-trigrams\",\"source_observation\":\"per-file-captures-not-atomic-workspace\",\"capture_complete\":")?;
     out.boolean(capture_complete(atlas, index))?;

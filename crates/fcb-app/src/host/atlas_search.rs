@@ -13,8 +13,8 @@ mod progressive;
 pub use progressive::{AtlasSearchProgress, AtlasSearchStop};
 use progressive::SearchWork;
 mod indexed;
-pub use indexed::{AtlasIndexOptions, MAX_ATLAS_INDEX_GRAMS};
-use indexed::{IndexQueryUsage, RetainedIndex};
+pub use indexed::{AtlasIndexOptions, AtlasIndexBuildProgress, MAX_ATLAS_INDEX_GRAMS};
+use indexed::{IndexQueryUsage, RetainedIndex, IndexBuildWork};
 
 use std::{mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, ByteRange, FileId, SourceRevision};
@@ -143,6 +143,7 @@ impl Snapshot {
 /// finished query until replacement succeeds. Canceling/failing a replacement
 /// retires its progress, not the finished query. A separately prepared index
 /// retains its complete captured membership for subsequent explicit queries.
+/// One incremental index replacement may coexist with queries on the old index.
 /// Source work and destruction belong on a worker, including cancel_pending.
 /// Managed reservations do not account for unrelated host/native allocations.
 pub struct RetainedAtlasSearch {
@@ -154,6 +155,7 @@ pub struct RetainedAtlasSearch {
     accepted: Option<Snapshot>,
     pending: Option<SearchWork>,
     index: Option<RetainedIndex>,
+    building: Option<IndexBuildWork>,
     budget: ResourceBudget,
     _metadata_lease: ResourceLease,
 }
@@ -169,7 +171,8 @@ impl RetainedAtlasSearch {
             ByteLength::new((2 * grant.root_path().len() + size_of::<Self>()) as u64))
             .map_err(|_| AppError::Admission)?;
         Ok(Self { manifest, grant: grant.clone(), layout: atlas.atlas().layout().revision(), last_attempt: 0,
-            next_allocation: 100, accepted: None, pending: None, index: None, budget, _metadata_lease: metadata_lease })
+            next_allocation: 100, accepted: None, pending: None, index: None, building: None,
+            budget, _metadata_lease: metadata_lease })
     }
     pub fn accepted_generation(&self) -> Option<u64> { self.accepted.as_ref().map(|q| q.generation) }
     /// Bytes retained by the finished query. Pending progress is reported by progress().
@@ -185,8 +188,9 @@ impl RetainedAtlasSearch {
     fn attempt(&mut self, generation: u64) -> Result<(), AtlasSearchError> {
         if generation == 0 || generation <= self.last_attempt { return Err(AtlasSearchError::StaleQuery); }
         self.last_attempt = generation;
-        // A newer attempt cannot leave an obsolete running request able to finish
-        // later. The finished query remains available even if the new attempt fails.
+        // Supersede query work. Index builds have separate progress and survive
+        // ordinary queries; only a new build/index-clear or explicit cancellation
+        // retires them. All attempts still share one non-reusing identity source.
         self.pending = None;
         Ok(())
     }
@@ -299,11 +303,10 @@ impl RetainedAtlasSearch {
         let start = hit.original_range.start().get().saturating_sub(132);
         let end = hit.original_range.end().get().saturating_add(132).min(source.bytes().len() as u64);
         // The decoder's minimum allowance is four bytes, not a minimum source
-        // length. read_window clips to the actual capture without padding it.
+        // length. An admitted one-byte capture must remain one byte, not padded.
         let window = reader.read_window(start, ((end - start) as usize).max(4), &mut stop)?;
         out.literal(",\"query_generation\":")?; out.integer(generation)?;
         out.literal(",\"search_in_progress\":")?; out.boolean(snapshot.stop_reason.is_none())?;
-        if let Some(usage) = snapshot.index_usage { usage.encode(&mut out)?; }
         out.literal(",\"hit_id\":")?; out.integer(hit.id)?;
         encode_hit(&mut out, atlas, hit)?;
         out.literal(",\"source_observation\":\"retained-search-capture\",\"source_reopened\":false,\"reader_owner\":")?;
