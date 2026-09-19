@@ -7,6 +7,9 @@
 //! source writes, implicit source stdin, asynchronous runtime or GUI is started.
 //! Checkpoint files are created only by an explicit save with a disclosure cap.
 
+mod repository;
+use repository::RepositoryCommands;
+
 use std::{ffi::OsString, io::{self, BufReader, Read, Write}, path::{Path, PathBuf}};
 use fcb::{ByteLength, ByteOffset, ByteRange};
 use fcb::search::{LineNumber, ReadingTarget, ReadingWindowOptions, ResourceBudget};
@@ -35,6 +38,11 @@ Commands (arguments separated by literal TABs, not spaces):\n\
   find-text-hex PANE QUERY_GEN LIMIT SCAN_BYTES UTF8_TEXT_HEX\n\
   hit PANE QUERY_GEN ZERO_BASED_HIT | clear-query QUERY_GEN\n\
   bookmark PANE LABEL | recall BOOKMARK | forget BOOKMARK\n\
+  repo-open ROOT | repo-open-hex ROOT_PATH_HEX\n\
+  repo-info TOKEN | repo-close TOKEN | repo-clear TOKEN QUERY_GEN\n\
+  repo-find TOKEN QUERY_GEN LIMIT SCAN_BYTES TEXT\n\
+  repo-find-text-hex TOKEN QUERY_GEN LIMIT SCAN_BYTES UTF8_TEXT_HEX\n\
+  repo-page TOKEN QUERY_GEN OFFSET LIMIT | repo-hit TOKEN QUERY_GEN HIT_ID\n\
   save NEW_CHECKPOINT MAX_SOURCE_BYTES | save-hex NEW_PATH_HEX MAX_SOURCE_BYTES\n\
   restore CHECKPOINT | restore-hex PATH_HEX\n\
 Copy returns original bytes as hex; it does not write the clipboard.\n\
@@ -46,6 +54,13 @@ explicit source-byte disclosure cap. Existing files are NEVER overwritten.\n\
 Restore replaces the desk only after validation, without reopening source paths.\n\
 Restored pane/bookmark/source IDs are fresh; read them from the returned state.\n\
 Search results are not restored. No autosave: quitting releases unsaved changes.\n\
+Repository tokens come from responses; every root replacement gets a new token.\n\
+Repository query generations are separate from pane-local query generations.\n\
+repo-open freezes up to 4096 catalog entries; repo-find explicitly reads sources\n\
+(up to 1 MiB each). Coverage and truncation remain explicit in query responses.\n\
+repo-hit uses retained bytes and changes the desk revision; other repo commands\n\
+do not. Detaching/replacing the root preserves already opened desk captures.\n\
+Save includes activated desk captures, not all search hits or a live root grant.\n\
 No quotes/escapes/shell expansion. Hex permits tabs, newlines and non-UTF-8 paths.\n\
 Frames need LF; partial EOF, overlong frames and output failures stop the session.\n\
 A save receipt reports filesystem effects even on failure. Inspect any created\n\
@@ -54,18 +69,19 @@ Ordinary command errors preserve the session; responses expose accepted state.\n
 ";
 
 #[derive(Debug)]
-enum Failure { Command(DeskSessionError), Checkpoint(CheckpointIoError), Protocol(&'static str), Io, Canceled }
+enum Failure { Command(DeskSessionError), Checkpoint(CheckpointIoError), Repository(repository::DeskRepositoryError), Protocol(&'static str), Io, Canceled }
 impl From<DeskSessionError> for Failure { fn from(e: DeskSessionError) -> Self { Self::Command(e) } }
 impl From<DeskError> for Failure { fn from(e: DeskError) -> Self { Self::Command(e.into()) } }
 impl From<CheckpointIoError> for Failure { fn from(e: CheckpointIoError) -> Self { Self::Checkpoint(e) } }
+impl From<repository::DeskRepositoryError> for Failure { fn from(e: repository::DeskRepositoryError) -> Self { Self::Repository(e) } }
 impl Failure {
     fn code(&self) -> String {
-        match self { Self::Command(e) => e.to_string(), Self::Checkpoint(e) => e.code(), Self::Protocol(code) => (*code).into(),
+        match self { Self::Command(e) => e.to_string(), Self::Checkpoint(e) => e.code(), Self::Repository(e) => e.to_string(), Self::Protocol(code) => (*code).into(),
             Self::Io => "DESK_INPUT_IO".into(), Self::Canceled => "DESK_CANCELED".into() }
     }
     fn canceled(&self) -> bool {
         match self { Self::Canceled => true, Self::Command(e) => e.is_canceled(),
-            Self::Checkpoint(e) => e.is_canceled(), _ => false }
+            Self::Checkpoint(e) => e.is_canceled(), Self::Repository(e) => e.is_canceled(), _ => false }
     }
 }
 
@@ -94,6 +110,7 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
     let mut output = match Output::new(owner(), 8 * 1024 * 1024, &budget, allocation(2)) {
         Ok(out) => out, Err(_) => return EXIT_ERROR,
     };
+    let mut repository = RepositoryCommands::new();
     let mut aggregate = EXIT_OK;
     for request in 1..=MAX_REQUESTS {
         let read = read_frame(&mut input, &mut frame, &mut canceled);
@@ -102,7 +119,7 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
         let mut effect = CheckpointSaveEffect::None;
         let result = read.and_then(|_| {
             let text = std::str::from_utf8(&frame).map_err(|_| Failure::Protocol("DESK_FRAME_UTF8"))?;
-            execute(&mut session, request, text, &mut canceled, &mut effect)
+            execute(&mut session, request, text, &mut canceled, &mut effect, &mut repository)
         });
         let (exit, quit) = match &result {
             Ok((reply, quit)) => (reply.exit_code(), *quit),
@@ -119,6 +136,10 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
             output.literal(",\"effect\":")?; output.quoted(effect.code())?;
             output.literal(",\"accepted_query_generation\":")?;
             match session.accepted_query() { Some(n) => output.integer(n)?, None => output.literal("null")? }
+            output.literal(",\"repository_token\":")?;
+            match repository.token() { Some(n) => output.integer(n)?, None => output.literal("null")? }
+            output.literal(",\"repository_query_generation\":")?;
+            match repository.query() { Some(n) => output.integer(n)?, None => output.literal("null")? }
             match &result {
                 Ok((reply, _)) => { output.literal(",\"result\":")?; output.literal(reply.as_str().trim_end())?; }
                 Err(error) => {
@@ -199,7 +220,8 @@ fn raw_path(text: &str) -> Result<PathBuf, Failure> {
     #[cfg(not(unix))] { let _ = text; Err(Failure::Protocol("DESK_NATIVE_PATH_UNSUPPORTED")) }
 }
 fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
-    canceled: &mut impl FnMut() -> bool, effect: &mut CheckpointSaveEffect) -> Result<(HostResponse, bool), Failure> {
+    canceled: &mut impl FnMut() -> bool, effect: &mut CheckpointSaveEffect,
+    repository: &mut RepositoryCommands) -> Result<(HostResponse, bool), Failure> {
     // Fixed field array: a hostile frame cannot allocate an unbounded token vector.
     let mut fields = [""; 8]; let mut used = 0;
     for field in frame.split('\t') {
@@ -211,6 +233,9 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
     if expected != session.model().revision() { return Err(DeskError::StaleRevision.into()); }
     let args = &fields[2..used];
     let command = fields[1];
+    if command.starts_with("repo-") {
+        return Ok((repository.execute(session, expected, attempt, command, args, &mut *canceled)?, false));
+    }
     let change = match (command, args) {
         ("state" | "quit", []) => return Ok((session.state(&mut *canceled)?, command == "quit")),
         ("open", [path]) => { session.open_file(expected, attempt, Path::new(path), &mut *canceled)?; None }
