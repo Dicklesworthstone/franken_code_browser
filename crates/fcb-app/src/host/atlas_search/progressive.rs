@@ -35,6 +35,9 @@ pub struct AtlasSearchProgress {
     pub scanned_files: usize,
     pub unavailable_files: usize,
     pub pending_files: usize,
+    /// Observed occurrences, including any unstored lookahead. This is not an
+    /// exhaustive total when coverage is partial; retained_hits is separate.
+    pub matches_seen: u64,
     pub retained_hits: usize,
     pub retained_source_bytes: usize,
     pub source_bytes_read: u64,
@@ -68,7 +71,7 @@ impl RetainedAtlasSearch {
         Ok(AtlasSearchProgress { generation: q.generation, stop_reason: q.stop_reason,
             complete: q.complete, truncated: q.truncated, examined_files: q.examined,
             scanned_files: q.scanned, unavailable_files: q.unavailable, pending_files: q.pending,
-            retained_hits: q.hits.len(), retained_source_bytes: q.retained_bytes,
+            matches_seen: q.matches_seen, retained_hits: q.hits.len(), retained_source_bytes: q.retained_bytes,
             source_bytes_read: q.source_bytes_read, read_calls: q.read_calls,
             step_count: q.step_count, last_step_files: q.last_step_files,
             last_step_source_bytes: q.last_step_bytes, last_step_read_calls: q.last_step_calls })
