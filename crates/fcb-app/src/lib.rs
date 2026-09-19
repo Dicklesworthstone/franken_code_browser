@@ -19,6 +19,7 @@ mod symbols;
 mod lines;
 mod atlas;
 mod markdown;
+mod desk;
 
 use std::{ffi::OsString, io::{Read, Write}};
 use fcb::{ArenaOwnerId, ByteLength, FileId, SourceRevision};
@@ -144,6 +145,10 @@ impl From<FileSearchError> for AppError { fn from(error: FileSearchError) -> Sel
 /// redacted stderr diagnostic follows. No caller process exit or signal occurs.
 pub fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut impl Write,
     stderr: &mut impl Write, mut canceled: impl FnMut() -> bool) -> u8 {
+    // Persistent commands read stdin only after explicit --stdio permission.
+    if arguments.first().is_some_and(|argument| argument == "desk") {
+        return desk::run(&arguments[1..], stdin, stdout, stderr, canceled);
+    }
     // Markdown reads only the explicitly selected capture; never implicit stdin.
     if arguments.first().is_some_and(|argument| argument == "markdown") {
         return markdown::run(&arguments[1..], stdout, stderr, canceled);
