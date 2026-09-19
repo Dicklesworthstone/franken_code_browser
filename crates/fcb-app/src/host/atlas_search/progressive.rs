@@ -1,15 +1,15 @@
 #![forbid(unsafe_code)]
 
-//! One-file scheduling slices over the existing bounded capture/text pipeline.
-//! There is no self-referential reader, new matcher, executor, timer or thread.
-//! A slice examines at most one catalog entry and captures at most the admitted
-//! per-file byte limit (hard maximum 1 MiB). Cancellation is also checked inside
-//! source read and exact-scan chunks. OS calls have no invented latency deadline.
+//! One-file scheduling slices over the existing live-capture and retained-index
+//! pipelines. The same pending slot, publication and cancellation rules serve
+//! both. A slice admits at most one source member under the existing file cap;
+//! it is worker work, not a fixed-duration UI callback or a native latency claim.
 
 use super::*;
 use crate::workspace;
 use fcb::search::{CaptureRequest, QueryGeneration, ReaderSearch, StreamReadOptions,
     StreamReadState, StreamReadStep, StreamingNeedle};
+use super::indexed::IndexedWork;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AtlasSearchStop { AllFilesExamined, FileLimit, SourceByteLimit, MatchLimit, VerificationByteLimit }
@@ -35,10 +35,9 @@ pub struct AtlasSearchProgress {
     pub scanned_files: usize,
     pub unavailable_files: usize,
     pub pending_files: usize,
-    /// Observed occurrences, including any unstored lookahead. This is not an
-    /// exhaustive total when coverage is partial; retained_hits is separate.
-    pub matches_seen: u64,
     pub retained_hits: usize,
+    /// Observed occurrences, including at most one unstored lookahead hit.
+    pub matches_seen: u64,
     pub retained_source_bytes: usize,
     pub source_bytes_read: u64,
     pub read_calls: u64,
@@ -53,6 +52,10 @@ impl AtlasSearchProgress {
 
 pub(super) struct SearchWork {
     pub(super) snapshot: Snapshot,
+    pub(super) execution: SearchExecution,
+}
+pub(super) enum SearchExecution { Live(LiveWork), Indexed(IndexedWork) }
+pub(super) struct LiveWork {
     pattern: StreamingNeedle,
     options: AtlasSearchOptions,
     scan_id: ResourceAllocationId,
@@ -71,19 +74,15 @@ impl RetainedAtlasSearch {
         Ok(AtlasSearchProgress { generation: q.generation, stop_reason: q.stop_reason,
             complete: q.complete, truncated: q.truncated, examined_files: q.examined,
             scanned_files: q.scanned, unavailable_files: q.unavailable, pending_files: q.pending,
-            matches_seen: q.matches_seen, retained_hits: q.hits.len(), retained_source_bytes: q.retained_bytes,
+            retained_hits: q.hits.len(), matches_seen: q.matches_seen, retained_source_bytes: q.retained_bytes,
             source_bytes_read: q.source_bytes_read, read_calls: q.read_calls,
             step_count: q.step_count, last_step_files: q.last_step_files,
             last_step_source_bytes: q.last_step_bytes, last_step_read_calls: q.last_step_calls })
     }
-    /// Retire only the running replacement. Finished-query rows/captures and
-    /// independently opened readers survive. This may free source memory: call
-    /// on a worker. Native cancellation can defer this until an operation drains.
+    /// Retire a running live OR indexed replacement on a worker. Accepted rows,
+    /// the reusable index and independently opened reader captures survive.
     pub fn cancel_pending(&mut self) -> bool { self.pending.take().is_some() }
 
-    /// Admit a new request without source I/O. Its generation supersedes any
-    /// running request, including if admission fails. The last finished query
-    /// remains available by its own generation until this replacement finishes.
     pub fn begin(&mut self, atlas: &AtlasSession, generation: u64, needle: &str,
         options: AtlasSearchOptions, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
@@ -93,12 +92,10 @@ impl RetainedAtlasSearch {
         Ok(response)
     }
 
-    /// Advance at most ONE file, release control, and expose append-only exact
-    /// progress. Hosts can page, open a hit or move the camera between calls.
-    /// Stale steps never discard a newer job. A failed/canceled matching step
-    /// retires its provisional progress and leaves the finished query untouched.
-    /// After success, query progress/page reconciles a lost response; repeating
-    /// a terminal step does no more source work.
+    /// Advance at most ONE live or captured file and return append-only progress.
+    /// Stale steps never discard a newer request. Any failed/canceled step drops
+    /// that request's provisional state, not the previously accepted query.
+    /// Repeating a terminal step returns its page without repeating verification.
     pub fn step(&mut self, atlas: &AtlasSession, generation: u64,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         self.validate(atlas)?;
@@ -109,8 +106,6 @@ impl RetainedAtlasSearch {
             }
             return Err(AtlasSearchError::StaleQuery);
         }
-        // Taking the job makes every error path fail closed, without exposing
-        // unencoded/half-built mutations. Only successful output reinstalls it.
         let mut work = self.pending.take().ok_or(AtlasSearchError::MissingQuery)?;
         self.advance_work(atlas, &mut work, &mut canceled)?;
         let response = self.work_response(atlas, &work, "step", &mut canceled)?;
@@ -130,9 +125,6 @@ impl RetainedAtlasSearch {
         check(canceled)?;
         let [state_id, pattern_id, scan_id] = [self.next_id()?, self.next_id()?, self.next_id()?];
         let capacity = options.max_matches.min(options.max_files);
-        // Before any source allocation/read, cover old/new capture conversion
-        // overlap, retained occurrence capacities and work state. The pattern,
-        // range reader, exact scanner and encoded responses share this budget.
         let charge = 2 * options.max_source_bytes + capacity * (size_of::<RetainedFile>() + 64)
             + options.max_matches * size_of::<AtlasSearchHit>()
             + MAX_DIAGNOSTICS * size_of::<Unavailable>() + needle.len() + size_of::<SearchWork>();
@@ -147,7 +139,8 @@ impl RetainedAtlasSearch {
         let pattern = StreamingNeedle::text(self.manifest.owner(), needle, &self.budget, pattern_id)
             .map_err(AppError::from)?;
         self.validate(atlas)?; check(canceled)?;
-        Ok(SearchWork { snapshot, pattern, options, scan_id, io: workspace::IoCounts::default() })
+        Ok(SearchWork { snapshot, execution: SearchExecution::Live(LiveWork {
+            pattern, options, scan_id, io: workspace::IoCounts::default() }) })
     }
 
     pub(super) fn work_response(&mut self, atlas: &AtlasSession, work: &SearchWork,
@@ -160,33 +153,35 @@ impl RetainedAtlasSearch {
     pub(super) fn advance_work(&self, atlas: &AtlasSession, work: &mut SearchWork,
         canceled: &mut impl FnMut() -> bool) -> Result<(), AtlasSearchError> {
         self.validate(atlas)?; check(canceled)?;
-        let before_files = work.snapshot.examined;
-        let before_bytes = work.io.bytes;
-        let before_calls = work.io.calls;
-        update_coverage(atlas, work);
-        if work.snapshot.stop_reason.is_none() {
-            self.scan_one_file(atlas, work, canceled)?;
+        let snapshot = &mut work.snapshot;
+        let before_files = snapshot.examined;
+        let before_bytes = snapshot.source_bytes_read;
+        let before_calls = snapshot.read_calls;
+        match &mut work.execution {
+            SearchExecution::Live(live) => {
+                update_coverage(atlas, snapshot, live);
+                if snapshot.stop_reason.is_none() { self.scan_one_file(atlas, snapshot, live, canceled)?; }
+                update_coverage(atlas, snapshot, live);
+            }
+            SearchExecution::Indexed(indexed) => self.advance_indexed_work(atlas, snapshot, indexed, canceled)?,
         }
         self.validate(atlas)?; check(canceled)?;
-        work.snapshot.step_count += 1; // At most max_files + one terminal check.
-        work.snapshot.last_step_files = work.snapshot.examined - before_files;
-        work.snapshot.last_step_bytes = work.io.bytes - before_bytes;
-        work.snapshot.last_step_calls = work.io.calls - before_calls;
-        update_coverage(atlas, work);
+        snapshot.step_count = snapshot.step_count.checked_add(1).ok_or(AtlasSearchError::IdentityExhausted)?;
+        snapshot.last_step_files = snapshot.examined - before_files;
+        snapshot.last_step_bytes = snapshot.source_bytes_read - before_bytes;
+        snapshot.last_step_calls = snapshot.read_calls - before_calls;
         Ok(())
     }
 
-    fn scan_one_file(&self, atlas: &AtlasSession, work: &mut SearchWork,
+    fn scan_one_file(&self, atlas: &AtlasSession, candidate: &mut Snapshot, work: &mut LiveWork,
         canceled: &mut impl FnMut() -> bool) -> Result<(), AtlasSearchError> {
         let catalog = atlas.atlas().catalog();
-        let ordinal = work.snapshot.examined;
+        let ordinal = candidate.examined;
         let entry = catalog.entries().get(ordinal).ok_or(AtlasSearchError::WrongAtlas)?;
         let file = catalog.file_id(ordinal).ok_or(AtlasSearchError::WrongAtlas)?;
-        let candidate = &mut work.snapshot;
         candidate.examined += 1;
         if entry.observed_bytes() > work.options.max_file_bytes as u64 {
-            candidate.unavailable(file, "FILE_BYTE_LIMIT");
-            return Ok(());
+            candidate.unavailable(file, "FILE_BYTE_LIMIT"); return Ok(());
         }
         let qgen = QueryGeneration::new(self.manifest.owner(), candidate.generation)
             .map_err(|_| AtlasSearchError::IdentityExhausted)?;
@@ -237,18 +232,14 @@ impl RetainedAtlasSearch {
         Ok(())
     }
 }
-
-fn update_coverage(atlas: &AtlasSession, work: &mut SearchWork) {
-    let q = &mut work.snapshot;
+fn update_coverage(atlas: &AtlasSession, q: &mut Snapshot, work: &LiveWork) {
     q.pending = atlas.atlas().catalog().entries().len() - q.examined;
     q.source_bytes_read = work.io.bytes;
     q.read_calls = work.io.calls;
     q.stop_reason = if q.pending == 0 {
-        // A per-file lookahead can prove truncation even on the final file.
         Some(if q.truncated { AtlasSearchStop::MatchLimit } else { AtlasSearchStop::AllFilesExamined })
     } else if q.hits.len() == work.options.max_matches {
-        q.truncated = true;
-        Some(AtlasSearchStop::MatchLimit)
+        q.truncated = true; Some(AtlasSearchStop::MatchLimit)
     } else if q.examined == work.options.max_files {
         Some(AtlasSearchStop::FileLimit)
     } else if work.io.bytes >= work.options.max_source_bytes as u64 {
