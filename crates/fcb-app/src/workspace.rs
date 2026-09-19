@@ -11,6 +11,7 @@ mod expression;
 use std::{fs, path::{Path, PathBuf}, sync::Arc};
 use fcb::{ByteLength, ByteOffset, ByteRange};
 use fcb::source::{CancelFlag, SourceError};
+use fcb::store::{Sha256, Sha256Digest};
 use fcb::source::path::NormalizedPath;
 use fcb::search::{CaptureRequest, CompleteCapture, ExtentConsistency, ExtentReadState,
     ExtentStepBudget, FileRangeReader, IndexLimits, ParsedQuery, PathEntry, PathIndex,
@@ -188,6 +189,18 @@ fn text(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str,
     let result = report.capture_results();
     let truncated = matches!(result.coverage, SearchCoverage::TruncatedAtLimit { .. });
     if args.json {
+        // One digest slot per admitted catalog entry; only matched captures are hashed.
+        // Keep the reservation alive through serialization and never reopen live paths.
+        let count = catalog.entries().len();
+        let scratch_bytes = count.checked_mul(std::mem::size_of::<Option<Sha256Digest>>())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<Option<Sha256Digest>>>()))
+            .ok_or(AppError::Admission)?;
+        let _scratch = budget.try_reserve_managed(owner(), allocation(40), ByteLength::new(scratch_bytes as u64))
+            .map_err(|_| AppError::Admission)?;
+        let mut digests = Vec::new();
+        digests.try_reserve_exact(count).map_err(|_| AppError::Admission)?;
+        if digests.capacity() > count { return Err(AppError::Admission); }
+        digests.resize(count, None);
         common(out, "search", catalog, root)?;
         out.literal(",\"mode\":\"decoded-text-literal\",\"workspace_complete\":")?; out.boolean(report.is_complete())?;
         out.literal(",\"truncated\":")?; out.boolean(truncated)?;
@@ -205,6 +218,25 @@ fn text(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str,
             out.literal(",\"revision\":")?; out.integer(hit.revision.get())?;
             out.literal(",\"path\":")?;
             out.path(&catalog.entry(hit.file_id).ok_or(AppError::InvalidRange)?.path().raw().to_path_buf())?;
+            let capture = captures.capture(hit.file_id).ok_or(AppError::InvalidRange)?;
+            let ordinal = hit.file_id.get().checked_sub(catalog.file_id(0).ok_or(AppError::InvalidRange)?.get())
+                .and_then(|value| usize::try_from(value).ok()).ok_or(AppError::InvalidRange)?;
+            let slot = digests.get_mut(ordinal).ok_or(AppError::InvalidRange)?;
+            let digest = match *slot {
+                Some(digest) => digest,
+                None => {
+                    let mut hash = Sha256::new();
+                    for chunk in capture.bytes().chunks(64 * 1024) {
+                        if canceled() { return Err(AppError::Canceled); }
+                        hash.update(chunk);
+                    }
+                    let digest = hash.finalize();
+                    *slot = Some(digest);
+                    digest
+                }
+            };
+            out.literal(",\"capture_sha256\":")?; out.quoted(&digest.to_hex())?;
+            out.literal(",\"capture_byte_length\":")?; out.integer(capture.bytes().len() as u64)?;
             out.literal(",\"original_range\":")?; out.range(hit.original_byte_range)?;
             out.literal(",\"matched_text\":")?; out.quoted(&hit.matched_text)?; out.literal("}")?;
         }

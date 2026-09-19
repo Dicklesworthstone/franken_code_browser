@@ -58,6 +58,8 @@ fn recursive_literal_search_verifies_mixed_encodings_and_original_byte_ranges() 
         let bytes = fs::read(tree.0.join(OsStr::from_bytes(&path))).unwrap();
         let start = hit.get("original_range").get("start").number() as usize;
         let end = hit.get("original_range").get("end").number() as usize;
+        assert_eq!(hit.get("capture_sha256").text(), fcb::store::Sha256::digest(&bytes).to_hex());
+        assert_eq!(hit.get("capture_byte_length").number(), bytes.len() as u64);
         let selected = &bytes[start..end];
         let expected = if path.ends_with(b"a.rs") { b"needle space".to_vec() }
             else if path.ends_with(b"b.txt") { utf16("needle space", true)[2..].to_vec() }
@@ -194,4 +196,35 @@ fn binary_scope_expansion_is_explicit_and_directory_errors_remain_machine_readab
         .args(["--text", "needle", "--json"]).output().unwrap();
     assert_eq!(result.status.code(), Some(i32::from(EXIT_ERROR)));
     assert_eq!(parse(&result.stdout).unwrap().get("error").get("code").text(), "CLI_DIRECTORY_SCOPE_UNAVAILABLE");
+}
+
+#[test]
+fn text_hit_identity_covers_the_entire_capture_not_only_matching_bytes() {
+    let tree = Tree::new();
+    let first = b"needle one needle";
+    let second = b"needle two needle";
+    tree.file("a.rs", first);
+    let (exit, before) = run(&tree, "search", &["--text", "needle"]);
+    assert_eq!(exit, EXIT_OK);
+    tree.file("a.rs", second);
+    let (exit, after) = run(&tree, "search", &["--text", "needle"]);
+    assert_eq!(exit, EXIT_OK);
+    let old_hits = before.get("hits").array();
+    let new_hits = after.get("hits").array();
+    assert_eq!(old_hits.len(), 2);
+    assert_eq!(new_hits.len(), 2);
+    for (i, (old, new)) in old_hits.iter().zip(new_hits).enumerate() {
+        let start = if i == 0 { 0 } else { 11 };
+        for (hit, bytes) in [(old, first), (new, second)] {
+            assert_eq!(hit.get("original_range").get("start").number(), start);
+            assert_eq!(hit.get("original_range").get("end").number(), start + 6);
+            assert_eq!(hit.get("matched_text").text(), "needle");
+            assert_eq!(hit.get("capture_byte_length").number(), bytes.len() as u64);
+            assert_eq!(hit.get("capture_sha256").text(), fcb::store::Sha256::digest(bytes).to_hex());
+        }
+        assert_ne!(old.get("capture_sha256").text(), new.get("capture_sha256").text());
+    }
+    // Adding capture identity must not introduce another filesystem payload read.
+    assert_eq!(before.get("payload_bytes_read").number(), first.len() as u64);
+    assert_eq!(after.get("payload_bytes_read").number(), second.len() as u64);
 }
