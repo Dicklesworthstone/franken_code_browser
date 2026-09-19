@@ -297,3 +297,6 @@ impl Default for ReadingPaneManager {
         Self::new()
     }
 }
+
+/// Source-owning multi-reader navigation, exact history and session bookmarks.
+pub mod desk;
