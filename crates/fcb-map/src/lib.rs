@@ -15,6 +15,7 @@ pub mod camera;
 pub mod labels;
 pub mod navigation;
 pub mod text_columns;
+pub mod text_parcels;
 pub mod visible;
 
 pub use atlas::{AtlasBuildLimits, AtlasError, AtlasIndex, AtlasNodeId};
