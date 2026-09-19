@@ -159,3 +159,4 @@ pub unsafe extern "C" fn fcb_source_document(path: *const c_char) -> *mut c_char
         let result = host::source_document::read(Path::new(path), || false).ok()?;
         string_out(result.as_str())
     })
+}
