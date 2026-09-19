@@ -6,79 +6,92 @@
 extern "C" {
 #endif
 
-/* Explicit reusable capture index on an existing OPEN atlas handle. All calls
- * are synchronous host-worker operations. No extra registry/runtime/discovery.
- * Free every non-null response once with fcb_free_string, including errors.
- * Null means marshaling/panic failure. Success JSON uses fcb.atlas-search/1;
- * errors use fcb.atlas-session/1. All full-width numbers are decimal strings.
- * Preparing/opening a repository never executes its contents.
+/* Reusable capture index on an existing OPEN atlas handle. All operations are
+ * synchronous host-worker calls; the library does not start a background task.
+ * Free every non-null response exactly once with fcb_free_string, including
+ * errors. Null means marshaling/panic failure. Success: fcb.atlas-search/1;
+ * errors: fcb.atlas-session/1. Full-width numbers are decimal JSON strings.
+ * No repository content is executed by opening, indexing, querying or reading.
  */
 
-/* Capture eligible catalog members and build the existing ephemeral index.
- * Limits: files 1..4096, file bytes 1..1048576, total actual source-read work
- * 1..33554432, retained trigrams 0..2097152. Failed reads count toward the source
- * budget. Uncovered segments retain source and use exact-scan fallback; they
- * are not empty negative certificates. Inspect capture_complete, pending_files,
- * unavailable_files, indexed_files and uncovered_files independently.
- * This is a frozen-catalog/per-file observation, NOT current Git status or an
- * atomic workspace snapshot. Refresh is explicit and does not rediscover paths.
- * Preparation can examine many files in one worker call. It is not a one-file
- * progressive API. Failure/cancellation preserves the older index and results.
- * Preparation, indexed/live queries and both clear operations SHARE one
- * increasing search-attempt sequence. Admitted failures consume their number.
- * New attempts retire obsolete paused queries, whether live or indexed.
+/* Capture and index to completion using the same one-file pipeline as begin/
+ * step below. Limits: files 1..4096, file bytes 1..1048576, actual source reads
+ * 1..33554432, retained trigrams 0..2097152. Failed reads consume source budget.
+ * Quota-uncovered segments retain source for exact-scan fallback. Inspect
+ * capture_complete, pending_files, unavailable_files and uncovered_files.
+ * Membership stays the frozen atlas catalog: no new filenames are discovered.
+ * Per-file observations are NOT an atomic workspace snapshot or Git history.
+ * Preparation/query/result-clear/index-clear attempts share a strictly
+ * increasing generation sequence. Failed admitted attempts consume their ID.
  */
 char *fcb_atlas_index_prepare(uint64_t handle, uint64_t generation,
     uint64_t max_files, uint64_t max_file_bytes, uint64_t max_source_bytes,
     uint64_t max_index_grams);
 
-/* Read accepted index_generation and capture_manifest for reconciliation. The
- * legacy source_manifest field identifies the atlas catalog, not captured bytes.
+/* Begin index preparation without source I/O or segment construction. Continue
+ * using index_step, NOT search_step. One replacement builder may coexist with
+ * queries on the previous accepted index. New build/index-clear supersedes an
+ * older builder; ordinary queries and result-clear do not cancel the builder.
+ * Starting a build still supersedes an unfinished query. Failure/cancellation
+ * preserves the old accepted index and completed result/source pins.
+ */
+char *fcb_atlas_index_begin(uint64_t handle, uint64_t generation,
+    uint64_t max_files, uint64_t max_file_bytes, uint64_t max_source_bytes,
+    uint64_t max_index_grams);
+
+/* Capture AND index at most one catalog member, then return. Finalization moves
+ * completed storage without a full-source scan/rebuild. Use
+ * index_build_in_progress, NOT capture_complete, to decide whether to continue.
+ * Actual read quotas and gram quotas apply across all steps. A completed build
+ * can remain incomplete/uncovered. A step bounds members, not elapsed time;
+ * OS I/O and the bounded per-file sort do not gain a hard cancellation deadline.
+ * A replacement is published only after preparing its full response. Publication
+ * retires unfinished queries tied to the replaced index; completed result pins,
+ * opened readers and independent live queries remain usable.
+ * Lost nonterminal replies reconcile through progress. Another step advances
+ * work; completed-step retries are read-only. Wrong generations never advance
+ * or discard a newer builder. Use existing atlas_cancel/close for cancellation.
+ */
+char *fcb_atlas_index_step(uint64_t handle, uint64_t generation);
+char *fcb_atlas_index_progress(uint64_t handle, uint64_t generation);
+
+/* Accepted index information, distinct from provisional build progress. The
+ * legacy source_manifest identifies the catalog; capture_manifest names source.
  */
 char *fcb_atlas_index_info(uint64_t handle);
 
 /* Literal UTF-8 needle 1..1024 bytes. NOT regex, filters, or query syntax.
- * index_generation must be the accepted preparation generation. max_matches
- * is 1..4096; max_scan_bytes is 0..33554432 captured bytes verified, NOT disk I/O.
- * UTF-16, short queries and uncovered segments use the shared exact scan route.
- * The synchronous form finishes the same cursor used by the progressive form.
- * Returns at most 64 initial rows. Use existing search_page/overlay/focus and
- * search_open_reader with query generation and hit ID afterward. Source remains
- * the indexed capture even after file changes, disappearance or index refresh.
- * Search success does not imply completeness; check search_complete, truncated,
- * unavailable_files and pending_files. Disk reads are zero. Verification and
- * skipped/fallback work are separate counters. No measured speedup is claimed.
- * needle is null or valid NUL-terminated UTF-8 for the duration of the call.
+ * index_generation must name the accepted preparation. max_matches: 1..4096;
+ * max_scan_bytes: 0..33554432 captured verification bytes, NOT disk I/O.
+ * UTF-16, short queries and uncovered segments use shared exact verification.
+ * Uses the same cursor as the progressive query form, to completion. Results
+ * support existing search_page/overlay/focus/open_reader. Original captures
+ * survive live changes and index replacement through independent result pins.
+ * needle is null or valid NUL-terminated UTF-8 stable until the call returns.
  */
 char *fcb_atlas_search_indexed(uint64_t handle, uint64_t generation,
     uint64_t index_generation, const char *needle, uint64_t max_matches,
     uint64_t max_scan_bytes);
 
-/* Progressive admission: retains query/results capacity but verifies no source.
- * Bounded metadata is inspected once for admission; this is still worker work.
- * The caller may release needle after return. Continue using the EXISTING
- * fcb_atlas_search_step(handle, generation). Each step visits at most one
- * captured member, without rebuilding grams or a repository descriptor array.
- * Use search_in_progress, NOT search_complete, to decide whether to continue.
- * Query-wide verification and lookahead limits apply across ALL steps.
- * Partial pages, overlays, focus and captured reader activation work immediately.
- * next_offset=null means end of current rows, not end of a running query.
- * Hit IDs append stably. Canceling a paused query invalidates further page/open/
- * resume operations for it, but preserves previously completed rows and readers.
- * Terminal step retries do not repeat work. After a lost nonterminal response,
- * page the known generation to reconcile progress; another step advances it.
- * Index preparation/clear supersede paused work. Reader-only cancellation does
- * not cancel the shared query. No per-call elapsed-time bound is promised.
+/* Admit without verifying source. Query text is copied. Continue using the
+ * EXISTING fcb_atlas_search_step(handle, generation), not index_step. Each step
+ * visits one captured member without rebuilding descriptors/grams. Query-wide
+ * verification/lookahead limits remain global. Use search_in_progress to
+ * continue; next_offset=null means end of current rows, not a complete query.
+ * Early pages, overlays and captured reader activation are usable immediately.
+ * IDs append stably, completed-step retries do no more work, and paused epoch
+ * cancellation prevents stale resumption. Reader-only cancel does not affect
+ * the atlas. No measured speedup or native presentation is inferred here.
  */
 char *fcb_atlas_search_indexed_begin(uint64_t handle, uint64_t generation,
     uint64_t index_generation, const char *needle, uint64_t max_matches,
     uint64_t max_scan_bytes);
 
-/* Clear index only; accepted query captures and opened readers survive. Normal
- * search_clear clears results but leaves this index available. Large retirement
- * is worker work. Cancel/close use the existing atlas functions. A cancellation
- * AFTER publication can suppress delivery without undoing publication; inspect
- * index_info or page the known query to reconcile that boundary.
+/* Clear index and builder, not completed result captures or opened readers.
+ * Result-clear leaves index/build state intact. Atlas cancellation invalidates
+ * provisional query AND build state; accepted state is not rolled back. A late
+ * cancellation can suppress a committed reply: reconcile info/progress/page.
+ * Destruction and close belong on a worker, not an input/redraw callback.
  */
 char *fcb_atlas_index_clear(uint64_t handle, uint64_t generation);
 

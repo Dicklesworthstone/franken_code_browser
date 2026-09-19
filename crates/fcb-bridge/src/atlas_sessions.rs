@@ -77,12 +77,13 @@ pub(super) enum Command<'a> {
 }
 struct Session { atlas: AtlasSession, search: RetainedAtlasSearch, paths: RetainedAtlasPaths, operation_epoch: u64 }
 impl Session {
-    /// Cancellation can arrive BETWEEN resumable calls. Reclaim obsolete work
-    /// on this worker before reading any provisional result or resuming it. A
-    /// finished query is a committed result and is not rolled back by cancellation.
+    /// Cancellation can arrive BETWEEN resumable calls. Reclaim obsolete query
+    /// and index-construction work on this worker before reading or resuming it.
+    /// Completed index/results are committed and are not rolled back here.
     fn synchronize(&mut self, epoch: u64) {
         if self.operation_epoch != epoch {
             self.search.cancel_pending();
+            self.search.cancel_index_build();
             self.operation_epoch = epoch;
         }
     }
@@ -186,6 +187,7 @@ impl AtlasSessions {
         };
         if let Err(error) = cell.validate(epoch) {
             session.search.cancel_pending();
+            session.search.cancel_index_build();
             return Err(error);
         }
         result
@@ -210,6 +212,7 @@ impl AtlasSessions {
         // an already installed reader. The known destination can be reconciled.
         if let Err(error) = cell.validate(epoch) {
             session.search.cancel_pending();
+            session.search.cancel_index_build();
             return Err(error);
         }
         result
@@ -232,6 +235,7 @@ impl AtlasSessions {
             &mut stop);
         if let Err(error) = cell.validate(epoch) {
             session.search.cancel_pending();
+            session.search.cancel_index_build();
             return Err(error);
         }
         result

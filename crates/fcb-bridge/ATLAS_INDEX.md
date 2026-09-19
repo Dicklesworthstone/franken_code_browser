@@ -1,118 +1,122 @@
 # Reusable captured repository indexes
 
 `include/fcb_atlas_index.h` connects the production ephemeral index to existing
-atlas handles. Prepare once, then issue queries over the same retained source
-universe. No database, new matcher, source walker, runtime, thread or independent
-handle registry is added. Native UI integration and qualification remain separate.
+atlas handles. Both preparation and queries can yield between files. No database,
+new matcher, source walker, runtime, thread or independent registry is added.
+Native UI integration, scheduling and hardware qualification remain separate.
 
-## Prepare and query
+## Incremental preparation
 
-Open an atlas normally. On a host-owned worker, call `fcb_atlas_index_prepare`
-with a fresh search-attempt generation and explicit capture/gram limits. It
-captures the existing eligible catalog and transfers the prepared engine into
-an owning index. Every successfully captured member is retained, including
-previous nonmatches and gram-quota refusals. Source buffers are shared with
-independent admission, not copied or rehashed during owning transfer.
+Open an atlas normally. On a host-owned worker, call `fcb_atlas_index_begin`
+with a fresh search-attempt generation and explicit capture/gram limits. This
+admits a private replacement without source I/O or segment construction. Continue
+with `fcb_atlas_index_step(handle, generation)`, not `fcb_atlas_search_step`.
+Each successful step examines at most one catalog member and builds its segment
+using the existing capture reader and production EphemeralIndex builder.
+Unavailable members are recorded separately. Gram-quota refusals retain source
+for exact-scan fallback rather than dropping the member from search membership.
 
-Initial capture/index construction remains a synchronous multi-file worker
-operation. This change makes indexed queries resumable, not index preparation.
+The source backing is Arc-shared without copying or rehashing during retention.
+A completed per-file gram segment is copied once into an admitted aggregate;
+earlier segments are neither rebuilt nor reallocated by subsequent steps.
+Finalization moves already-prepared storage. It does not perform a hidden
+whole-repository scan, descriptor-array rebuild, or gram reconstruction.
+`fcb_atlas_index_prepare` remains available as a synchronous worker call that
+runs this same preparation pipeline to completion without yielding.
 
-`fcb_atlas_search_indexed` finishes a query on one worker call. The new
-`fcb_atlas_search_indexed_begin` instead admits the same query cursor without
-verifying source. Both take the accepted `index_generation`, a fresh query
-`generation`, a case-sensitive decoded literal, maximum hits and a global
-captured-verification-byte allowance. The literal is not parsed as field or
-regular-expression syntax. Begin copies its foreign query text, so that string
-can be released immediately after the call.
+Use `index_build_in_progress`, not `capture_complete`, to continue preparation.
+A terminal build may have pending or unavailable members, or uncovered segments.
+Per-step files/read bytes/read calls and cumulative counts are explicit.
+`fcb_atlas_index_progress(handle, generation)` reconciles accepted provisional
+progress without advancing it. A lost nonterminal reply is not replayed by
+another step: that advances the next member. Completed-step retries are read-only.
+Wrong generations never advance or remove a newer candidate.
 
-Continue with the EXISTING `fcb_atlas_search_step(handle, generation)` on a host
-worker. Each step visits at most one captured file, including index-negative
-files. It performs no filesystem I/O, gram reconstruction, source copying or
-repository-wide descriptor rebuild. Admission inspects bounded file metadata
-once; the cursor then retains its next ordinal, results and global work limits.
-UTF-16, short queries and uncovered/incompatible segments keep the existing
-exact-scan fallback. Both ownership forms use the same segment probes and exact
-verifier. A negative prefilter cannot create a positive result or hide a source
-that needs fallback.
+The old accepted index remains queryable between replacement steps. Begin only
+supersedes an unfinished query at admission; later queries can run on the old
+index while preparation continues. Only after preparing the complete terminal
+response is the new index installed. Failure or cancellation keeps the old index
+and completed results. A successful replacement retires an unfinished indexed
+query tied to the old engine, not a pending live query. Completed hit captures
+and independently opened readers continue to name their old exact source.
 
-## Early results and continuation
+## Captured queries and early results
 
-Use `search_in_progress`, not `search_complete`, to decide whether to continue.
-A terminal query can be incomplete because membership is open, source was
-unavailable, or a limit stopped verification. Query-wide byte budgets and the
-unstored lookahead match apply across all steps, rather than resetting per call.
-A full hit buffer alone does not establish another match exists.
+`fcb_atlas_search_indexed` finishes a query in one worker call. The progressive
+`fcb_atlas_search_indexed_begin` instead admits the same cursor without verifying
+source. Both take the accepted index generation, a fresh query generation, a
+case-sensitive decoded literal, maximum hits and a query-wide verification-byte
+allowance. The literal is not field or regular-expression syntax. Begin copies
+its foreign query text, so the caller can release that string after return.
 
-The ordinary `fcb_atlas_search_page`, `overlay`, `focus` and `open_reader` calls
-work on partial progress. Hits append in source-member/occurrence order with
-stable query-local IDs and original source revisions. `next_offset: null` only
-means the current page reached the current result end: more steps can add rows.
-Diagnostics for an unavailable source are counted once, not once per delivery.
+Continue with the EXISTING `fcb_atlas_search_step(handle, generation)`. Each step
+visits at most one captured file without source-path I/O, rebuilding grams, or
+reconstructing the repository descriptor array. UTF-16, short queries and
+uncovered/incompatible segments keep the existing exact-verification fallback.
+An index-negative certificate cannot create a positive result or hide a member
+that requires fallback.
 
-Opening an early hit uses its whole retained capture even after a live edit or
-rename. Later query cancellation, index replacement or atlas closure cannot
-change an independently delivered reader. That reader can use source windows,
-search, outlines and Markdown through the ordinary reader APIs. Destination
-admission still precedes activation; already-open readers cannot be overwritten.
-Camera focus prepares a plan without acknowledging it as presented.
+Use `search_in_progress`, not `search_complete`, to continue queries. Verification
+bytes and unstored lookahead remain query-wide, not reset per step. A full hit
+buffer is not proof another match exists. Unavailable diagnostics are counted
+once. A terminal query can still be incomplete because of membership or limits.
 
-Only a completely prepared response publishes a step. After a lost nonterminal
-response, page the known query to reconcile accepted progress; another step
-advances it rather than replaying the prior step. Repeating a terminal step does
-not repeat verification. Counters distinguish per-step admitted files, cumulative
-verification, skipped files, fallback work and actual filesystem reads (zero).
-These counters are not a measured speedup or a fixed-duration callback guarantee.
+Normal `search_page`, `overlay`, `focus` and `open_reader` operations work on early
+results. Hits append with stable query-local IDs and original source revisions.
+`next_offset: null` means end of the current rows, not a finished running query.
+Opening a hit uses the whole retained capture after live changes or renames.
+Subsequent query/index replacement, clear or atlas closure cannot change a reader
+already delivered. Reader destination admission is checked before activation;
+an already-open reader cannot be overwritten. Camera focus prepares a plan
+without falsely acknowledging it as presented.
 
-## Identity, replacement and cancellation
+## Ownership, cancellation and independent state
 
-Live queries, indexed queries, index preparation and both clear operations
-share one strictly increasing search-attempt sequence. There is ONE pending
-query slot for either execution route. A newly admitted attempt supersedes it,
-even when the replacement subsequently fails. The last finished result snapshot
-remains available under its own generation until successful query replacement.
-
-Cursors bind to an actual private owned-index identity, not just equal manifest
-numbers. Index preparation still allocates a capture manifest distinct from the
-atlas catalog and assigns fresh source observations. The legacy `source_manifest`
-wire field denotes that frozen catalog; `capture_manifest` denotes indexed source.
+Preparation, queries and clear operations share a non-reusing increasing attempt
+sequence. A new query supersedes the pending query, not a replacement builder.
+A new index preparation or index-clear supersedes a builder and pending queries.
+Thus at most one builder and one query can coexist, each separately admitted.
+Result-clear preserves the reusable index and builder. Index-clear preserves
+completed result/source pins and readers. The legacy `source_manifest` field
+names the frozen catalog; `capture_manifest` names the indexed source universe.
 Filename-query and camera-plan generations remain independent.
 
-Canceling the atlas while a query is paused changes the existing operation epoch.
-The next worker call retires provisional work before page, activation or resume;
-an old query cannot restart under the new epoch. Canceling a reader alone leaves
-other readers and their shared indexed query intact. Close/cancel/try-lock and
-retiring-capacity rules use the existing registry, not another execution system.
+The existing `fcb_atlas_cancel` invalidates BOTH paused query and construction
+work. The next worker operation retires them before progress/page/activation or
+resume; an old builder cannot restart in a fresh cancellation epoch. Reader-only
+cancellation leaves shared atlas work intact. The safe host also exposes explicit
+`cancel_index_build` for retiring only its construction candidate on a worker.
 
-Index replacement or clear supersedes paused queries but preserves accepted
-result source pins. Result clear preserves the reusable index. Failed/canceled
-preparation preserves its predecessor. Cancellation after terminal acceptance
-can suppress a response without undoing acceptance: reconcile index info or the
-known result page. Final destruction of captures/layouts/indexes is worker work.
+Close removes authority immediately; source/index destruction and retiring-slot
+admission keep the existing registry lifetime rules. Cancellation after terminal
+acceptance may suppress its response but is not rollback: reconcile accepted
+index info, known build progress or query page. Already-returned JSON strings
+remain independently owned and must be freed exactly once with fcb_free_string.
 
-## Scope and verification boundary
+## Scope, limits and verification
 
-The catalog remains frozen: index refresh does not discover new filenames.
+The catalog stays frozen: rebuilding an index does not discover new filenames.
 Reopen/reconcile the atlas for changed membership. Per-file observations are not
-an atomic filesystem snapshot, Git history or watcher qualification. The index
-is bounded in-memory storage, not persistent/out-of-core search or a global
-inverted index. Query steps bound source members, not elapsed time: a single
-admitted file can require several exact-scanner quanta.
+an atomic filesystem snapshot, Git history or watcher qualification. This is a
+bounded in-memory per-file trigram index, not persistent/out-of-core storage or
+a global inverted index. Counters are not a measured speedup or RSS measurement.
 
 Preparation admits at most 4096 files, 1 MiB per capture and 32 MiB actual source
-reads; the gram buffer is at most 2097152 entries. Queries retain at most 4096
-hits and admit at most 32 MiB verification bytes. Source pins, index storage,
-query AST capacities, unavailable IDs, result overlap and returned responses
-retain separate reservations. Managed limits are not process RSS measurements.
+reads; failed reads consume that allowance. The aggregate gram limit is 2097152.
+Queries retain at most 4096 hits and admit at most 32 MiB verification bytes.
+Source pins, old/new overlap, aggregate segments, per-file scratch, query output
+and response buffers are separately reserved. A construction step includes
+bounded synchronous per-file sorting and OS calls, not an elapsed-time deadline.
+There is no hidden worker scheduling or claim that these APIs render a native UI.
 
-New regressions are in `fcb-search/tests/movable_indexed_query.rs`,
-`fcb-app/tests/progressive_indexed_search.rs`, and the bridge's
-`atlas_index_progressive_tests.rs`. Existing index C contract tests now include
-the begin entrypoint. These exercise actual prepared segments, verifier results,
-early activation, global budgets, cancellation, reader independence and handle
-lifetimes; native pixels and physical-Mac behavior are not simulated as proof.
+New tests: `fcb-search/tests/incremental_index_build.rs`,
+`fcb-app/tests/progressive_index_build.rs`, and the bridge's
+`atlas_index_build_sessions_tests.rs` / `atlas_index_build_ffi_tests.rs`.
+They exercise real engine segments, capture/query/reader workflows, one-file
+preparation, old-index availability, cancellation, failure, limits and ownership.
+Existing owned/borrowed index, progressive query, retained-reader and registry
+suites also require independent verification after this shared-path change.
 
-These changes are code-first, batch verification pending. Compilation, test
-execution and strict RCH have not run in the authoring environment. Existing
-borrowed-index, owned-index, retained-atlas-index and progressive-live-search
-suites must also be included in independent verification. No bead or product
-gate is declared complete.
+Code-first, batch verification pending. Compilation, test execution, strict RCH
+and native hardware qualification have not run in the authoring environment.
+No bead or product gate is declared complete and no tests are claimed passing.
