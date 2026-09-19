@@ -369,3 +369,6 @@ fn location_fields(out: &mut Output, at: DeskLocation) -> Result<(), OutputError
 pub mod persistence;
 /// Bounded cross-owner source transfer with exact identity receipts.
 pub mod imports;
+
+/// Explicit repository search and exact-result adoption into persistent readers.
+pub mod repository;
