@@ -154,3 +154,34 @@ fn node_budget_refuses_before_file_or_path_byte_budgets() {
     let files: Vec<_> = paths.iter().map(|s| file(s.as_bytes(), 1.0)).collect();
     assert!(pack_text_parcels(&files, 1.0).is_err());
 }
+
+
+#[test]
+fn golden_leaf_shapes_are_selected_when_exact_tilings_exist() {
+    let phi = (1.0 + 5.0_f64.sqrt()) / 2.0;
+    for (count, aspect) in [(3, phi / 3.0), (4, phi), (6, phi * 2.0 / 3.0)] {
+        let paths: Vec<_> = (0..count).map(|i| format!("src/f{i}")).collect();
+        let files: Vec<_> = paths.iter().map(|p| file(p.as_bytes(), 100.0)).collect();
+        let rects = check_partition(&files, aspect, 1e-12);
+        for rect in rects {
+            let ratio = rect.size().width() / rect.size().height();
+            close(ratio.max(1.0 / ratio), phi, 1e-12);
+        }
+    }
+}
+
+#[test]
+fn alternating_weight_hierarchy_preserves_full_area_and_directory_unions() {
+    let paths: Vec<_> = (0..96).map(|i| format!("dir{}/f{i:03}", i / 16)).collect();
+    let files: Vec<_> = paths.iter().enumerate().map(|(i, p)|
+        file(p.as_bytes(), [1.0, 1000.0, 7.0, 50000.0][i % 4])).collect();
+    for aspect in [0.25, 1.0, 4.0] {
+        let rects = check_partition(&files, aspect, 1e-9);
+        for group in rects.chunks(16) {
+            let (x0, y0, x1, y1) = bounds(group);
+            close((x1 - x0) * (y1 - y0), 4.0 * 51008.0, 1e-9);
+        }
+        let reversed: Vec<_> = files.iter().rev().copied().collect();
+        assert_eq!(rects, pack_text_parcels(&reversed, aspect).unwrap().into_iter().rev().collect::<Vec<_>>());
+    }
+}
