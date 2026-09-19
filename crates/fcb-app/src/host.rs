@@ -219,3 +219,6 @@ impl Write for Sink {
     }
     fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
+
+/// Exact source and upstream lexical roles for native attributed text.
+pub mod source_document;

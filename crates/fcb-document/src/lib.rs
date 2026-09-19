@@ -72,3 +72,6 @@ pub use franken_markdown::{
     ProvenanceAuditReport, RenderedElement, SourceSpan, TextSelectionRange,
     UnresolvedAsset,
 };
+
+/// Upstream lexical roles translated for native source presentation.
+pub mod source_highlight;

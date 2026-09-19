@@ -14,6 +14,7 @@ mod reader_sessions;
 mod reader_ffi;
 mod atlas_sessions;
 mod atlas_ffi;
+mod text_layout_ffi;
 
 use std::{ffi::{c_char, CStr, CString}, panic::{catch_unwind, UnwindSafe}, path::Path};
 use fcb_app::host;
@@ -146,3 +147,15 @@ pub unsafe extern "C" fn fcb_free_string(pointer: *mut c_char) {
 
 #[cfg(test)]
 mod tests;
+
+/// Complete UTF-8 source and upstream syntax runs in UTF-16 coordinates.
+/// Returns null on read, encoding, admission or response-limit failure.
+/// # Safety
+/// `path` is a valid NUL-terminated UTF-8 string or null, stable until return.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_source_document(path: *const c_char) -> *mut c_char {
+    reply(|| {
+        let path = unsafe { cstr(path) }?;
+        let result = host::source_document::read(Path::new(path), || false).ok()?;
+        string_out(result.as_str())
+    })
