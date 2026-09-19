@@ -147,6 +147,8 @@ pub struct ReadingDesk {
     limits: DeskLimits,
     state: State,
     last_attempt: u64,
+    // Never reset on eviction; restored captures must not alias an older view.
+    source_high_water: u64,
     budget: ResourceBudget,
     _lease: ResourceLease,
 }
@@ -172,7 +174,8 @@ impl ReadingDesk {
             .map_err(|_| DeskError::ResourceDenied)?;
         let state = State { revision: 0, panes: ReadingPaneManager::new(), offsets: Vec::new(),
             sources: Vec::new(), history: Vec::new(), cursor: None, bookmarks: Vec::new(), next_bookmark: 1 };
-        let mut desk = Self { owner, limits, state, last_attempt: 0, budget: budget.clone(), _lease: lease };
+        let mut desk = Self { owner, limits, state, last_attempt: 0, source_high_water: 0,
+            budget: budget.clone(), _lease: lease };
         desk.reserve_state()?;
         Ok(desk)
     }
@@ -237,6 +240,7 @@ impl ReadingDesk {
         if capture.owner() != self.owner { return Err(DeskError::OwnerMismatch); }
         validate_location(&capture, offset, selection)?;
         if capture.logical_path().len() > MAX_READING_PATH_BYTES { return Err(DeskError::InvalidLocation); }
+        self.source_high_water = self.source_high_water.max(capture.file().get()).max(capture.revision().get());
         if let Some(old) = next.sources.iter().find(|s| s.capture.file() == capture.file()
             && s.capture.revision() == capture.revision()) {
             if old.capture.bytes() != capture.bytes() { return Err(DeskError::IdentityConflict); }
@@ -466,3 +470,7 @@ fn record(state: &mut State, limit: usize, at: DeskLocation) {
 
 #[cfg(test)]
 mod tests;
+
+/// Explicit source-bearing checkpoint export and transactional restore.
+#[cfg(feature = "snapshot")]
+pub mod checkpoint;
