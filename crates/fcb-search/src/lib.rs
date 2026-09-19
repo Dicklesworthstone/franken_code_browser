@@ -320,10 +320,10 @@ fn scan_normalized(
     let text = map.decoded_text();
     let hits = match options.mode {
         SearchMode::DecodedText { normalization: UnicodeNormalization::CaseFold, .. } =>
-            find_unicode_folded_substrings(text, query, limit),
+            find_unicode_folded_substrings(text, query, limit)?,
         SearchMode::DecodedText { normalization: UnicodeNormalization::Canonical, case_sensitive } =>
             find_canonical_equivalent_substrings(text, query, case_sensitive, limit),
-        _ => find_case_insensitive_substrings(text, query, limit),
+        _ => find_case_insensitive_substrings(text, query, limit)?,
     };
     result.total_matches_counted = hits.len();
     if hits.len() > options.max_matches {
@@ -347,44 +347,78 @@ fn scan_normalized(
 
 struct NormalizedHit { start: usize, end: usize, multiplicity: usize }
 
-fn find_case_insensitive_substrings(haystack: &str, needle: &str, limit: usize) -> Vec<NormalizedHit> {
-    let needle_lower = needle.to_lowercase();
-    let needle_len = needle.len();
-    let mut results = Vec::new();
-    for (byte_idx, _) in haystack.char_indices() {
-        let Some(end) = byte_idx.checked_add(needle_len).filter(|&end| end <= haystack.len()) else { break; };
-        if haystack.is_char_boundary(end) && haystack[byte_idx..end].to_lowercase() == needle_lower {
-            results.push(NormalizedHit { start: byte_idx, end, multiplicity: 1 });
-            if results.len() == limit { break; }
-        }
-    }
-    results
+fn find_case_insensitive_substrings(
+    haystack: &str, needle: &str, limit: usize,
+) -> Result<Vec<NormalizedHit>, QueryError> {
+    find_lowered_substrings(haystack, needle, limit, false)
 }
 
-fn find_unicode_folded_substrings(haystack: &str, needle: &str, limit: usize) -> Vec<NormalizedHit> {
-    let needle_folded: String = needle.chars().flat_map(|c| c.to_lowercase()).collect();
-    let mut results = Vec::new();
-    let chars: Vec<(usize, char)> = haystack.char_indices().collect();
-    for (i, &(byte_idx, ch)) in chars.iter().enumerate() {
-        let ch_end = chars.get(i + 1).map_or(haystack.len(), |&(offset, _)| offset);
-        if ch == 'ß' && (needle_folded == "ss" || needle_folded == "s") {
-            results.push(NormalizedHit { start: byte_idx, end: ch_end,
-                multiplicity: if needle_folded == "s" { 2 } else { 1 } });
+fn find_unicode_folded_substrings(
+    haystack: &str, needle: &str, limit: usize,
+) -> Result<Vec<NormalizedHit>, QueryError> {
+    find_lowered_substrings(haystack, needle, limit, true)
+}
+
+/// Apply the same declared scalar transform to source and query. Comparing
+/// source slices of needle.len() bytes loses matches when lowercasing changes
+/// UTF-8 length. Expansions retain one provenance entry per transformed scalar;
+/// two occurrences inside one source scalar must not collapse into one hit.
+fn lowered_with_spans(s: &str, fold_eszett: bool) -> Result<Vec<DecomposedChar>, QueryError> {
+    let mut out = Vec::new();
+    for (orig_start, ch) in s.char_indices() {
+        let orig_end = orig_start + ch.len_utf8();
+        let mut push = |ch| -> Result<(), QueryError> {
+            out.try_reserve(1).map_err(|_| QueryError::LimitExceeded)?;
+            out.push(DecomposedChar { ch, orig_start, orig_end });
+            Ok(())
+        };
+        if fold_eszett && matches!(ch, 'ß' | 'ẞ') {
+            push('s')?;
+            push('s')?;
         } else {
-            let mut candidate_folded = String::new();
-            let mut end_idx = byte_idx;
-            for &(_, next_c) in &chars[i..] {
-                candidate_folded.extend(next_c.to_lowercase());
-                end_idx += next_c.len_utf8();
-                if candidate_folded == needle_folded {
-                    results.push(NormalizedHit { start: byte_idx, end: end_idx, multiplicity: 1 });
-                    break;
-                } else if candidate_folded.len() > needle_folded.len() { break; }
-            }
+            for lowered in ch.to_lowercase() { push(lowered)?; }
         }
-        if results.len() == limit { break; }
     }
-    results
+    Ok(out)
+}
+
+fn find_lowered_substrings(
+    haystack: &str, needle: &str, limit: usize, fold_eszett: bool,
+) -> Result<Vec<NormalizedHit>, QueryError> {
+    if limit == 0 { return Ok(Vec::new()); }
+    let needle = lowered_with_spans(needle, fold_eszett)?;
+    if needle.is_empty() { return Err(QueryError::EmptyNeedle); }
+    let source = lowered_with_spans(haystack, fold_eszett)?;
+    let mut failure = Vec::new();
+    failure.try_reserve_exact(needle.len()).map_err(|_| QueryError::LimitExceeded)?;
+    failure.resize(needle.len(), 0usize);
+    let mut prefix = 0;
+    for index in 1..needle.len() {
+        while prefix > 0 && needle[index].ch != needle[prefix].ch {
+            prefix = failure[prefix - 1];
+        }
+        if needle[index].ch == needle[prefix].ch { prefix += 1; }
+        failure[index] = prefix;
+    }
+    let mut results = Vec::new();
+    let mut matched = 0;
+    for (index, unit) in source.iter().enumerate() {
+        while matched > 0 && unit.ch != needle[matched].ch {
+            matched = failure[matched - 1];
+        }
+        if unit.ch == needle[matched].ch { matched += 1; }
+        if matched == needle.len() {
+            results.try_reserve(1).map_err(|_| QueryError::LimitExceeded)?;
+            results.push(NormalizedHit {
+                start: source[index + 1 - needle.len()].orig_start,
+                end: unit.orig_end,
+                multiplicity: 1,
+            });
+            if results.len() == limit { break; }
+            matched = failure[matched - 1];
+        }
+    }
+    Ok(results)
 }
 
 fn canonical_decompose_char(c: char) -> Option<&'static [char]> {
@@ -558,11 +592,99 @@ mod tests {
         assert_eq!(res_ss.matches[0].matched_text, "ß");
         assert_eq!(res_ss.matches[0].multiplicity, 1);
         let res_s = DirectSourceScanner::scan_complete_capture(&capture, "s", &options).unwrap();
-        assert_eq!(res_s.match_count(), 2);
+        assert_eq!(res_s.match_count(), 3);
         assert_eq!(res_s.matches[0].original_byte_range.start().get(), 0);
         assert_eq!(res_s.matches[0].multiplicity, 1);
         assert_eq!(res_s.matches[1].original_byte_range.start().get(), 4);
         assert_eq!(res_s.matches[1].original_byte_range.end().get(), 6);
-        assert_eq!(res_s.matches[1].multiplicity, 2);
+        assert_eq!(res_s.matches[1].multiplicity, 1);
+        assert_eq!(res_s.matches[2].original_byte_range, res_s.matches[1].original_byte_range);
+        assert_eq!(res_s.matches[2].multiplicity, 1);
+        assert_ne!(res_s.matches[1].occurrence_id, res_s.matches[2].occurrence_id);
+    }
+
+    #[test]
+    fn folded_words_and_needles_use_the_same_expansion() {
+        let (file, rev, generation) = test_file_and_revision();
+        let options = QueryOptions::new(generation).with_mode(SearchMode::DecodedText {
+            case_sensitive: false, normalization: UnicodeNormalization::CaseFold,
+        });
+        let capture = make_capture(file, rev, "Straße STRASSE straẞe".as_bytes());
+        for query in ["strasse", "Straße", "STRAẞE"] {
+            let result = DirectSourceScanner::scan_complete_capture(&capture, query, &options).unwrap();
+            assert!(result.is_complete());
+            assert_eq!(result.match_count(), 3, "{query}");
+            assert_eq!(result.matches.iter().map(|hit| hit.matched_text.as_str()).collect::<Vec<_>>(),
+                ["Straße", "STRASSE", "straẞe"]);
+        }
+    }
+
+    #[test]
+    fn insensitive_matches_preserve_variable_length_source_units() {
+        let (file, rev, generation) = test_file_and_revision();
+        let options = QueryOptions::new(generation).with_mode(SearchMode::DecodedText {
+            case_sensitive: false, normalization: UnicodeNormalization::Exact,
+        });
+        let capture = make_capture(file, rev, "K k İ i\u{0307}".as_bytes());
+        for query in ["k", "K"] {
+            let result = DirectSourceScanner::scan_complete_capture(&capture, query, &options).unwrap();
+            assert_eq!(result.match_count(), 2);
+            assert_eq!(result.matches[0].matched_text, "K");
+            assert_eq!(result.matches[0].original_byte_range.start().get(), 0);
+            assert_eq!(result.matches[0].original_byte_range.end().get(), 3);
+        }
+        for query in ["İ", "i\u{0307}"] {
+            let result = DirectSourceScanner::scan_complete_capture(&capture, query, &options).unwrap();
+            assert_eq!(result.match_count(), 2);
+            assert_eq!(result.matches[0].matched_text, "İ");
+            assert_eq!(result.matches[1].matched_text, "i\u{0307}");
+        }
+    }
+
+    #[test]
+    fn expansion_occurrences_obey_limits_and_utf16_source_mapping() {
+        let (file, rev, generation) = test_file_and_revision();
+        for little in [true, false] {
+            let mut raw = if little { vec![0xFF, 0xFE] } else { vec![0xFE, 0xFF] };
+            for unit in "ß".encode_utf16() {
+                raw.extend_from_slice(&if little { unit.to_le_bytes() } else { unit.to_be_bytes() });
+            }
+            let capture = make_capture(file, rev, &raw);
+            for cap in [1, 2, 3] {
+                let options = QueryOptions::new(generation).with_mode(SearchMode::DecodedText {
+                    case_sensitive: false, normalization: UnicodeNormalization::CaseFold,
+                }).with_max_matches(cap);
+                let result = DirectSourceScanner::scan_complete_capture(&capture, "s", &options).unwrap();
+                assert_eq!(result.match_count(), 2);
+                assert_eq!(result.matches.len(), cap.min(2));
+                assert_eq!(result.is_complete(), cap >= 2);
+                if cap == 1 {
+                    assert_eq!(result.coverage, SearchCoverage::TruncatedAtLimit { max_matches: 1 });
+                }
+                for hit in &result.matches {
+                    assert_eq!(hit.original_byte_range.start().get(), 2);
+                    assert_eq!(hit.original_byte_range.end().get(), 4);
+                    assert_eq!(hit.matched_text, "ß");
+                    assert_eq!(hit.multiplicity, 1);
+                }
+                if cap >= 2 {
+                    assert_ne!(result.matches[0].occurrence_id, result.matches[1].occurrence_id);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn folded_overlaps_are_not_deduplicated_by_contributing_source_range() {
+        let (file, rev, generation) = test_file_and_revision();
+        let options = QueryOptions::new(generation).with_mode(SearchMode::DecodedText {
+            case_sensitive: false, normalization: UnicodeNormalization::CaseFold,
+        });
+        let capture = make_capture(file, rev, "ßß".as_bytes());
+        let result = DirectSourceScanner::scan_complete_capture(&capture, "sss", &options).unwrap();
+        assert_eq!(result.match_count(), 2);
+        assert_eq!(result.matches[0].original_byte_range, result.matches[1].original_byte_range);
+        assert_ne!(result.matches[0].occurrence_id, result.matches[1].occurrence_id);
+        assert!(result.matches.iter().all(|hit| hit.matched_text == "ßß" && hit.multiplicity == 1));
     }
 }
