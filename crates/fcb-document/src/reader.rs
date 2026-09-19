@@ -6,7 +6,7 @@
 //! upstream synchronous call is not preemptible; cancellation brackets it.
 //! No link, image, include, executable, filesystem or network access occurs.
 
-use std::{mem::size_of, sync::Arc};
+use std::{borrow::Cow, mem::size_of, sync::Arc};
 use fcb_core::{ByteLength, ByteOffset, ByteRange, DocumentGeneration, DocumentId,
     ResourceAllocationId, ResourceBudget, ResourceLease};
 use fcb_source::CompleteCapture;
@@ -90,16 +90,17 @@ impl From<DocumentError> for DocumentReadError {
     }
 }
 
-/// One immutable source and a completed logical layout. Source ownership remains
-/// with the host; this separate lease covers preparation and retained output.
+/// One immutable source and a completed logical layout. Borrowed construction
+/// leaves source ownership with the host; into_owned admits an independent pin.
 /// A viewport never reparses, rereads, clones the document, or changes identity.
 pub struct DocumentReader<'capture> {
-    capture: &'capture CompleteCapture,
+    capture: Cow<'capture, CompleteCapture>,
     session: DocumentSession,
     output: HeadlessDocumentOutput,
     source_base: usize,
     options: DocumentReadOptions,
     _lease: ResourceLease,
+    _source_lease: Option<ResourceLease>,
 }
 impl<'capture> DocumentReader<'capture> {
     pub fn prepare(capture: &'capture CompleteCapture, id: DocumentId,
@@ -137,11 +138,30 @@ impl<'capture> DocumentReader<'capture> {
             DocumentBudgets { max_blocks: options.max_blocks, max_bytes: options.max_source_bytes,
                 max_lines: options.max_flow_lines, max_items: options.max_flow_items })?;
         if canceled() { return Err(DocumentReadError::Canceled); }
-        let reader = Self { capture, session, output, source_base, options, _lease: lease };
+        let reader = Self { capture: Cow::Borrowed(capture), session, output, source_base, options,
+            _lease: lease, _source_lease: None };
         reader.validate_output(&mut canceled)?;
         Ok(reader)
     }
-    pub fn capture(&self) -> &'capture CompleteCapture { self.capture }
+
+    /// Transfer a prepared layout into independent ownership without reparsing,
+    /// rehashing, copying source bytes, or constructing a self-referential value.
+    /// CompleteCapture::clone shares immutable backing. Charge that backing for
+    /// the owned reader's whole lifetime even if the original host pin goes away.
+    /// The returned capture object is new; validate_delivery still requires the
+    /// exact object returned by capture(), not merely equal IDs or a digest.
+    pub fn into_owned(self, budget: &ResourceBudget, allocation: ResourceAllocationId)
+        -> Result<DocumentReader<'static>, DocumentReadError> {
+        let charge = self.capture.bytes().len().checked_add(size_of::<CompleteCapture>() + 64)
+            .ok_or(DocumentReadError::ResourceDenied)?;
+        let source_lease = budget.try_reserve_managed(self.capture.request().file().owner(), allocation,
+            ByteLength::new(charge as u64)).map_err(|_| DocumentReadError::ResourceDenied)?;
+        Ok(DocumentReader { capture: Cow::Owned(self.capture.into_owned()), session: self.session,
+            output: self.output, source_base: self.source_base, options: self.options,
+            _lease: self._lease, _source_lease: Some(source_lease) })
+    }
+
+    pub fn capture(&self) -> &CompleteCapture { self.capture.as_ref() }
     pub fn generation(&self) -> DocumentGeneration { self.session.generation() }
     pub fn options(&self) -> DocumentReadOptions { self.options }
     pub fn source_base(&self) -> usize { self.source_base }
@@ -153,7 +173,7 @@ impl<'capture> DocumentReader<'capture> {
     /// result to another capture object. No content hash serves as authority.
     pub fn validate_delivery(&self, capture: &CompleteCapture, generation: DocumentGeneration)
         -> Result<(), DocumentReadError> {
-        if !std::ptr::eq(self.capture, capture) { return Err(DocumentReadError::StaleCapture); }
+        if !std::ptr::eq(self.capture.as_ref(), capture) { return Err(DocumentReadError::StaleCapture); }
         if generation != self.generation() { return Err(DocumentReadError::StaleGeneration); }
         Ok(())
     }
@@ -178,6 +198,31 @@ impl<'capture> DocumentReader<'capture> {
         let end = first.saturating_add(count).min(self.total_lines());
         Ok(DocumentWindow { reader: self, first, end })
     }
+
+    /// Navigate from original source to the FIRST logical row of its enclosing
+    /// upstream-mapped source region. This is a block-level correspondence, not
+    /// an exact glyph/column or a claim that all source bytes are rendered.
+    /// Unmapped syntax, BOM bytes and interior UTF-8 offsets are refused. Source
+    /// EOF maps to the valid empty document window. Work is bounded by flow rows.
+    pub fn window_at_source(&self, original: ByteOffset, count: usize)
+        -> Result<DocumentWindow<'_, 'capture>, DocumentReadError> {
+        if count == 0 || count > MAX_DOCUMENT_WINDOW_LINES { return Err(DocumentReadError::InvalidRange); }
+        let offset = usize::try_from(original.get()).map_err(|_| DocumentReadError::InvalidRange)?;
+        let bytes = self.capture.bytes();
+        if offset < self.source_base || offset > bytes.len()
+            || !std::str::from_utf8(bytes).map_err(|_| DocumentReadError::InvalidUtf8)?.is_char_boundary(offset) {
+            return Err(DocumentReadError::InvalidRange);
+        }
+        if offset == bytes.len() { return self.window(self.total_lines(), count); }
+        for line in &self.output.lines {
+            let range = self.original_span(line.source_span)?;
+            if range.start().get() <= original.get() && original.get() < range.end().get() {
+                return self.window(line.line_index, count);
+            }
+        }
+        Err(DocumentReadError::InvalidRange)
+    }
+
     /// Resolve an upstream canonical heading identity, never cached geometry.
     /// The caller supplies the literal slug without URL decoding or a leading #.
     pub fn heading(&self, slug: &str) -> Result<&HeadingSourceAnchor, DocumentReadError> {
