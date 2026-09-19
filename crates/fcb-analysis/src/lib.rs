@@ -14,6 +14,8 @@ pub mod inspector;
 pub mod outline;
 /// Bounded navigation candidates with validated original-source coordinates.
 pub mod symbols;
+/// Exact whole-token occurrences, explicitly not compiler reference resolution.
+pub mod references;
 
 pub use comparison::{CaptureComparison, ComparisonError, ComparisonLimits, ComparisonQuality,
     ComparisonRelation, ComparisonStats, Correspondence, CorrespondenceKind};
