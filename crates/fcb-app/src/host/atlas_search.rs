@@ -376,7 +376,7 @@ fn encode_page(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot, star
     let end = start.saturating_add(limit).min(snapshot.hits.len());
     for (i, &hit) in snapshot.hits[start..end].iter().enumerate() {
         check(canceled)?;
-        if i != 0 { out.literal(",")?; }
+        if i > 0 { out.literal(",")?; }
         out.literal("{\"hit_id\":")?; out.integer(hit.id)?;
         encode_hit(out, atlas, hit)?; out.literal("}")?;
     }
@@ -385,7 +385,7 @@ fn encode_page(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot, star
     out.literal(",\"diagnostics\":[")?;
     for (i, diagnostic) in snapshot.diagnostics.iter().enumerate() {
         check(canceled)?;
-        if i != 0 { out.literal(",")?; }
+        if i > 0 { out.literal(",")?; }
         out.literal("{\"file_id\":")?; out.integer(diagnostic.file.get())?;
         out.literal(",\"reason\":")?; out.quoted(diagnostic.reason)?; out.literal("}")?;
     }
@@ -415,4 +415,49 @@ fn copy_text(text: &str) -> Result<String, AtlasSearchError> {
     let mut copy = String::new(); copy.try_reserve_exact(text.len()).map_err(|_| AppError::Admission)?;
     if copy.capacity() > text.len() { return Err(AppError::Admission.into()); }
     copy.push_str(text); Ok(copy)
+}
+
+/// A repository lookup failure is distinct from a receiving-desk refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AtlasDeskError {
+    Search(AtlasSearchError),
+    Desk(super::desk::DeskSessionError),
+}
+impl std::fmt::Display for AtlasDeskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self { Self::Search(e) => write!(f, "{e}"), Self::Desk(e) => write!(f, "{e}") }
+    }
+}
+impl std::error::Error for AtlasDeskError {}
+impl From<AtlasSearchError> for AtlasDeskError { fn from(e: AtlasSearchError) -> Self { Self::Search(e) } }
+impl From<super::desk::DeskSessionError> for AtlasDeskError {
+    fn from(e: super::desk::DeskSessionError) -> Self { Self::Desk(e) }
+}
+impl RetainedAtlasSearch {
+    /// Activate an exact finished OR provisional occurrence in a persistent
+    /// reading desk, without creating a throwaway reader or reopening a path.
+    /// Grant/query validation precedes transfer and participates in the desk's
+    /// final cancellation gate. On acceptance, the desk independently owns the
+    /// permitted copy; clearing/replacing this query cannot revoke bytes already
+    /// returned. Future transfers still require a valid atlas grant and hit.
+    /// The returned receipt is not native presentation or response delivery.
+    pub fn open_desk(&self, atlas: &AtlasSession, desk: &mut super::desk::DeskSession,
+        expected: u64, attempt: u64, generation: u64, id: u64,
+        mut canceled: impl FnMut() -> bool) -> Result<super::desk::imports::DeskImport, AtlasDeskError> {
+        self.validate(atlas)?; check(&mut canceled)?;
+        let hit = self.hit(atlas, generation, id)?;
+        let snapshot = self.snapshot(generation)?;
+        let source = &snapshot.files.get(hit.source_slot).ok_or(AtlasSearchError::MissingHit)?.capture;
+        if source.request().file() != hit.file || source.request().revision() != hit.revision {
+            return Err(AtlasSearchError::WrongAtlas.into());
+        }
+        let entry = atlas.atlas().catalog().entry(hit.file).ok_or(AtlasSearchError::WrongAtlas)?;
+        let label = entry.path().raw().display_escaped().to_string();
+        let origin = super::desk::imports::ImportedSourceId { file: hit.file, revision: hit.revision };
+        // No fallible work after desk publication: later JSON/transport failures
+        // must report the accepted desk revision, never pretend it rolled back.
+        Ok(desk.import_source(expected, attempt, origin, &label, source.bytes(),
+            hit.original_range.start().get(), Some(hit.original_range),
+            &mut || canceled() || atlas.validate_active().is_err())?)
+    }
 }
