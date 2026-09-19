@@ -5,22 +5,24 @@
 //! are bounded TAB-separated UTF-8 with an LF terminator; native paths can use
 //! hex. Output is one complete versioned JSON object per request. No shell,
 //! source writes, implicit source stdin, asynchronous runtime or GUI is started.
+//! Checkpoint files are created only by an explicit save with a disclosure cap.
 
 use std::{ffi::OsString, io::{self, BufReader, Read, Write}, path::{Path, PathBuf}};
 use fcb::{ByteLength, ByteOffset, ByteRange};
 use fcb::search::{LineNumber, ReadingTarget, ReadingWindowOptions, ResourceBudget};
 use crate::{EXIT_OK, EXIT_ERROR, EXIT_PARTIAL, EXIT_CANCELED, owner, allocation};
 use crate::host::{HostResponse, desk::{DeskSession, DeskSessionError, DeskLimits, DeskCommand, DeskError}};
+use crate::host::desk::persistence::{CheckpointIoError, CheckpointSaveEffect};
 use crate::output::Output;
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const MAX_REQUESTS: u64 = 65_536;
 const MAX_FRAME_CALLS: usize = MAX_FRAME_BYTES * 2;
 const HELP: &str = "fcb desk --stdio\n\
-Retain up to 8 reading panes with exact captures, history and session bookmarks.\n\
-Input: EXPECTED_REV<TAB>COMMAND<TAB>ARG...<LF>. All numbers are unsigned decimal.\n\
+Retain up to 8 reading panes with exact captures, history and bookmarks.\n\
+Input: EXPECTED_REV<TAB>COMMAND<TAB>ARG...<LF>. Counters are unsigned decimal.\n\
 Start at revision 0; use accepted_revision from each response for the next request.\n\
-Mutations use the response request number as their new revision; reads do not.\n\
+Mutations use the response request number as their new revision; reads/save do not.\n\
 Every response is one fcb.desk-stdio/1 JSON object with result or error.\n\
 Commands (arguments separated by literal TABs, not spaces):\n\
   state | quit | back | forward | escape | clear-history\n\
@@ -28,30 +30,43 @@ Commands (arguments separated by literal TABs, not spaces):\n\
   view PANE | read PANE OFFSET BYTES LINES | line PANE LINE\n\
   focus PANE | pin PANE | unpin PANE | duplicate PANE | close PANE\n\
   scroll PANE OFFSET | select PANE START END | copy PANE\n\
+  arrange PANE X Y WIDTH HEIGHT (finite logical coordinates)\n\
   find PANE QUERY_GEN LIMIT SCAN_BYTES TEXT\n\
   find-text-hex PANE QUERY_GEN LIMIT SCAN_BYTES UTF8_TEXT_HEX\n\
   hit PANE QUERY_GEN ZERO_BASED_HIT | clear-query QUERY_GEN\n\
   bookmark PANE LABEL | recall BOOKMARK | forget BOOKMARK\n\
+  save NEW_CHECKPOINT MAX_SOURCE_BYTES | save-hex NEW_PATH_HEX MAX_SOURCE_BYTES\n\
+  restore CHECKPOINT | restore-hex PATH_HEX\n\
 Copy returns original bytes as hex; it does not write the clipboard.\n\
 open reads one regular file (max 4 MiB), never a directory or implicit stdin.\n\
 Later operations use retained bytes even after a live file changes.\n\
 UTF-8/BOM UTF-16 windows use the shared reader. Search is exact literal text.\n\
-State and bookmarks are session-only; quitting releases them, not a disk save.\n\
+Save includes ALL retained sources and personal labels, unencrypted, up to the\n\
+explicit source-byte disclosure cap. Existing files are NEVER overwritten.\n\
+Restore replaces the desk only after validation, without reopening source paths.\n\
+Restored pane/bookmark/source IDs are fresh; read them from the returned state.\n\
+Search results are not restored. No autosave: quitting releases unsaved changes.\n\
 No quotes/escapes/shell expansion. Hex permits tabs, newlines and non-UTF-8 paths.\n\
 Frames need LF; partial EOF, overlong frames and output failures stop the session.\n\
+A save receipt reports filesystem effects even on failure. Inspect any created\n\
+destination before retrying; keep earlier checkpoints. Transport is not rollback.\n\
 Ordinary command errors preserve the session; responses expose accepted state.\n\
 ";
 
 #[derive(Debug)]
-enum Failure { Command(DeskSessionError), Protocol(&'static str), Io, Canceled }
+enum Failure { Command(DeskSessionError), Checkpoint(CheckpointIoError), Protocol(&'static str), Io, Canceled }
 impl From<DeskSessionError> for Failure { fn from(e: DeskSessionError) -> Self { Self::Command(e) } }
 impl From<DeskError> for Failure { fn from(e: DeskError) -> Self { Self::Command(e.into()) } }
+impl From<CheckpointIoError> for Failure { fn from(e: CheckpointIoError) -> Self { Self::Checkpoint(e) } }
 impl Failure {
     fn code(&self) -> String {
-        match self { Self::Command(e) => e.to_string(), Self::Protocol(code) => (*code).into(),
+        match self { Self::Command(e) => e.to_string(), Self::Checkpoint(e) => e.code(), Self::Protocol(code) => (*code).into(),
             Self::Io => "DESK_INPUT_IO".into(), Self::Canceled => "DESK_CANCELED".into() }
     }
-    fn canceled(&self) -> bool { matches!(self, Self::Canceled) || matches!(self, Self::Command(e) if e.is_canceled()) }
+    fn canceled(&self) -> bool {
+        match self { Self::Canceled => true, Self::Command(e) => e.is_canceled(),
+            Self::Checkpoint(e) => e.is_canceled(), _ => false }
+    }
 }
 
 pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut impl Write,
@@ -84,9 +99,10 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
         let read = read_frame(&mut input, &mut frame, &mut canceled);
         if matches!(read, Ok(false)) { return aggregate; }
         let fatal = read.is_err();
+        let mut effect = CheckpointSaveEffect::None;
         let result = read.and_then(|_| {
             let text = std::str::from_utf8(&frame).map_err(|_| Failure::Protocol("DESK_FRAME_UTF8"))?;
-            execute(&mut session, request, text, &mut canceled)
+            execute(&mut session, request, text, &mut canceled, &mut effect)
         });
         let (exit, quit) = match &result {
             Ok((reply, quit)) => (reply.exit_code(), *quit),
@@ -100,25 +116,28 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
             output.literal(",\"exit_code\":")?; output.integer(exit as u64)?;
             output.literal(",\"accepted_revision\":")?; output.integer(session.model().revision())?;
             output.literal(",\"last_attempt\":")?; output.integer(session.model().last_attempt())?;
+            output.literal(",\"effect\":")?; output.quoted(effect.code())?;
             output.literal(",\"accepted_query_generation\":")?;
             match session.accepted_query() { Some(n) => output.integer(n)?, None => output.literal("null")? }
             match &result {
                 Ok((reply, _)) => { output.literal(",\"result\":")?; output.literal(reply.as_str().trim_end())?; }
                 Err(error) => {
                     output.literal(",\"error\":{\"code\":")?; output.quoted(&error.code())?;
-                    output.literal(",\"next_action\":\"Use the accepted revision; do not replay an accepted mutation.\"}")?;
+                    output.literal(",\"next_action\":\"Use the accepted revision; inspect any created destination before retrying.\"}")?;
                 }
             }
             output.literal("}\n")
         })();
         // Once delivery starts, failure cannot be repaired by a second JSON
-        // object. Never execute the next request after a broken/truncated write.
+        // object. A save that created a file MUST retain its final effect receipt
+        // even when cancellation races delivery; transport is never rollback.
         let mut delivery_canceled = false;
         let mut stop = || {
-            let stopped = exit != EXIT_CANCELED && canceled(); delivery_canceled |= stopped; stopped
+            let stopped = effect == CheckpointSaveEffect::None && exit != EXIT_CANCELED && canceled();
+            delivery_canceled |= stopped; stopped
         };
         if encoded.is_err() || output.deliver(stdout, 4096, &mut stop).is_err() || stdout.flush().is_err() {
-            let _ = stderr.write_all(b"DESK_OUTPUT_INTERRUPTED: response incomplete; session stopped\n");
+            let _ = writeln!(stderr, "DESK_OUTPUT_INTERRUPTED: response incomplete; session stopped; effect={}", effect.code());
             return if delivery_canceled { EXIT_CANCELED } else { EXIT_ERROR };
         }
         if exit == EXIT_CANCELED { return EXIT_CANCELED; }
@@ -162,6 +181,10 @@ fn number(text: &str) -> Result<u64, Failure> {
 fn count(text: &str) -> Result<usize, Failure> {
     usize::try_from(number(text)?).map_err(|_| Failure::Protocol("DESK_INVALID_NUMBER"))
 }
+fn coordinate(text: &str) -> Result<f32, Failure> {
+    if text.len() > 64 { return Err(Failure::Protocol("DESK_INVALID_COORDINATE")); }
+    text.parse::<f32>().ok().filter(|n| n.is_finite()).ok_or(Failure::Protocol("DESK_INVALID_COORDINATE"))
+}
 fn hex(text: &str, max: usize) -> Result<Vec<u8>, Failure> {
     if text.is_empty() || text.len() % 2 != 0 || text.len() / 2 > max { return Err(Failure::Protocol("DESK_INVALID_HEX")); }
     let mut bytes = Vec::new(); bytes.try_reserve_exact(text.len() / 2).map_err(|_| Failure::Protocol("DESK_FRAME_RESOURCE"))?;
@@ -176,7 +199,7 @@ fn raw_path(text: &str) -> Result<PathBuf, Failure> {
     #[cfg(not(unix))] { let _ = text; Err(Failure::Protocol("DESK_NATIVE_PATH_UNSUPPORTED")) }
 }
 fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
-    canceled: &mut impl FnMut() -> bool) -> Result<(HostResponse, bool), Failure> {
+    canceled: &mut impl FnMut() -> bool, effect: &mut CheckpointSaveEffect) -> Result<(HostResponse, bool), Failure> {
     // Fixed field array: a hostile frame cannot allocate an unbounded token vector.
     let mut fields = [""; 8]; let mut used = 0;
     for field in frame.split('\t') {
@@ -192,6 +215,16 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
         ("state" | "quit", []) => return Ok((session.state(&mut *canceled)?, command == "quit")),
         ("open", [path]) => { session.open_file(expected, attempt, Path::new(path), &mut *canceled)?; None }
         ("open-hex", [path]) => { session.open_file(expected, attempt, &raw_path(path)?, &mut *canceled)?; None }
+        ("save" | "save-hex", [path, limit]) => {
+            let path = if command == "save-hex" { raw_path(path)? } else { PathBuf::from(*path) };
+            let outcome = session.save_checkpoint(expected, &path, number(limit)?, &mut *canceled);
+            *effect = outcome.effect();
+            return Ok((session.checkpoint_save_response(&outcome)?, false));
+        }
+        ("restore" | "restore-hex", [path]) => {
+            let path = if command == "restore-hex" { raw_path(path)? } else { PathBuf::from(*path) };
+            session.restore_checkpoint_file(expected, attempt, &path, &mut *canceled)?; None
+        }
         ("view", [p]) => return Ok((session.window(expected, pane(session, p)?, None, ReadingWindowOptions::default(), &mut *canceled)?, false)),
         ("read", [p, offset, bytes, lines]) => return Ok((session.window(expected, pane(session, p)?,
             Some(ReadingTarget::Byte(ByteOffset::new(number(offset)?))),
@@ -220,6 +253,8 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
             let selected = ByteRange::new(ByteOffset::new(start), ByteOffset::new(end)).map_err(|_| Failure::Protocol("DESK_INVALID_RANGE"))?;
             Some(DeskCommand::Navigate { pane: pane(session, p)?, offset: start, selection: Some(selected) })
         }
+        ("arrange", [p, x, y, width, height]) => Some(DeskCommand::Arrange { pane: pane(session, p)?,
+            position: (coordinate(x)?, coordinate(y)?), size: (coordinate(width)?, coordinate(height)?) }),
         ("bookmark", [p, label]) => Some(DeskCommand::Bookmark { pane: pane(session, p)?, label: (*label).to_owned() }),
         ("recall", [id]) => Some(DeskCommand::RecallBookmark(number(id)?)),
         ("forget", [id]) => Some(DeskCommand::ForgetBookmark(number(id)?)),
