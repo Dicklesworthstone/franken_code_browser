@@ -2,7 +2,8 @@
 
 //! Source-symbol navigation through the supported facade. Reuses fcb-analysis
 //! and the ordinary reader, without source lookup, parser duplication or runtime.
-//! Name lookup returns declaration candidates, not semantic definition resolution.
+//! Name lookup returns declaration candidates; reference lookup returns whole-token
+//! text candidates. Neither route claims compiler name or reference resolution.
 
 pub use fcb_analysis::symbols::{CapturedSymbols, SymbolCandidate, SymbolError, SymbolLanguage,
     SymbolNameMode, MAX_SYMBOL_ITEMS, MAX_SYMBOL_SOURCE_BYTES};
@@ -120,5 +121,167 @@ mod tests {
         assert_eq!(symbols.encoding(), DetectedEncoding::Utf16Le);
         let reader = view.source_reader(super::super::ReaderLimits::default(), &budget, ResourceAllocationId::new(2).unwrap()).unwrap();
         assert!(matches!(reader.seek_symbol(&symbols, 1, generation), Err(SymbolNavigationError::EncodingMismatch)));
+    }
+}
+
+// Reference occurrences share the source navigation surface, but never inherit
+// the outline extractor's declaration kinds or imply compiler-proven bindings.
+pub use fcb_analysis::references::{CapturedReferences, ReferenceCandidate, ReferenceError,
+    MAX_REFERENCE_ITEMS, MAX_REFERENCE_NAME_BYTES, MAX_REFERENCE_SOURCE_BYTES};
+
+#[derive(Clone, Copy, Debug)]
+pub struct ReferenceOptions {
+    pub generation: QueryGeneration,
+    pub encoding: Option<DetectedEncoding>,
+    pub max_items: usize,
+}
+impl ReferenceOptions {
+    pub fn new(generation: QueryGeneration) -> Self {
+        Self { generation, encoding: None, max_items: MAX_REFERENCE_ITEMS }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceNavigationError {
+    Reference(ReferenceError), Reader(ReaderError), EncodingMismatch,
+}
+impl std::fmt::Display for ReferenceNavigationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reference(error) => write!(f, "{error}"),
+            Self::Reader(error) => write!(f, "{error}"),
+            Self::EncodingMismatch => f.write_str("REFERENCE_READER_ENCODING_MISMATCH"),
+        }
+    }
+}
+impl std::error::Error for ReferenceNavigationError {}
+impl From<ReferenceError> for ReferenceNavigationError {
+    fn from(error: ReferenceError) -> Self { Self::Reference(error) }
+}
+impl From<ReaderError> for ReferenceNavigationError {
+    fn from(error: ReaderError) -> Self { Self::Reader(error) }
+}
+
+impl BrowserView {
+    /// Find exact whole-token text candidates, including comments/literals, in
+    /// the retained observation. No filesystem or language-server execution.
+    pub fn references(&self, name: &str, options: ReferenceOptions, budget: &ResourceBudget,
+        allocation: ResourceAllocationId, canceled: impl FnMut() -> bool) -> Result<CapturedReferences<'_>, ReferenceError> {
+        source_references(self.source(), name, options, budget, allocation, canceled)
+    }
+}
+impl PreparedSearchCapture {
+    pub fn references(&self, name: &str, options: ReferenceOptions, budget: &ResourceBudget,
+        allocation: ResourceAllocationId, canceled: impl FnMut() -> bool) -> Result<CapturedReferences<'_>, ReferenceError> {
+        source_references(self.source(), name, options, budget, allocation, canceled)
+    }
+}
+fn source_references<'a>(source: &'a SourceCapture, name: &str, options: ReferenceOptions,
+    budget: &ResourceBudget, allocation: ResourceAllocationId,
+    canceled: impl FnMut() -> bool) -> Result<CapturedReferences<'a>, ReferenceError> {
+    let request = CaptureRequest::new(source.file(), source.revision()).map_err(|_| ReferenceError::OwnerMismatch)?;
+    CapturedReferences::build(source.bytes(), request, options.generation, name,
+        options.encoding, options.max_items, budget, allocation, canceled)
+}
+impl<'a> SourceReader<'a> {
+    /// Activate a retained occurrence through the ordinary source reader. A
+    /// changed source, foreign owner, superseded query, or incompatible decoder
+    /// is refused before the byte range can become a reading selection.
+    pub fn seek_reference(&self, references: &CapturedReferences<'_>, id: u64,
+        generation: QueryGeneration) -> Result<ReadingSeek<'a>, ReferenceNavigationError> {
+        let source = self.source();
+        references.validate_source(source.bytes(), source.file(), source.revision(), generation)?;
+        if !encoding_compatible(references.encoding(), self.encoding()) {
+            return Err(ReferenceNavigationError::EncodingMismatch);
+        }
+        let candidate = references.candidate(id).ok_or(ReferenceError::NotFound)?;
+        Ok(self.seek(ReadingTarget::Range(candidate.original_range()), generation)?)
+    }
+}
+#[cfg(feature = "snapshot")]
+impl super::paged_snapshot::PagedCapture {
+    /// Search this already-verified archive member, without consulting its old
+    /// live root. The returned occurrences borrow the retained member bytes.
+    pub fn references(&self, name: &str, options: ReferenceOptions, budget: &ResourceBudget,
+        allocation: ResourceAllocationId, canceled: impl FnMut() -> bool) -> Result<CapturedReferences<'_>, ReferenceError> {
+        let request = CaptureRequest::new(self.file(), self.revision()).map_err(|_| ReferenceError::OwnerMismatch)?;
+        CapturedReferences::build(self.bytes(), request, options.generation, name,
+            options.encoding, options.max_items, budget, allocation, canceled)
+    }
+    pub fn reference_target(&self, references: &CapturedReferences<'_>, id: u64,
+        generation: QueryGeneration) -> Result<ReadingTarget, ReferenceNavigationError> {
+        references.validate_source(self.bytes(), self.file(), self.revision(), generation)?;
+        let encoding = fcb_source::detect_encoding(&self.bytes()[..self.bytes().len().min(3)]);
+        if !encoding_compatible(references.encoding(), encoding) {
+            return Err(ReferenceNavigationError::EncodingMismatch);
+        }
+        let candidate = references.candidate(id).ok_or(ReferenceError::NotFound)?;
+        Ok(ReadingTarget::Range(candidate.original_range()))
+    }
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+    use crate::{ArenaOwnerId, BrowserSession, ByteLength, FileId, SourceRevision};
+    fn owner() -> ArenaOwnerId { ArenaOwnerId::new(886).unwrap() }
+    fn generation() -> QueryGeneration { QueryGeneration::new(owner(), 1).unwrap() }
+    fn view(bytes: Vec<u8>) -> BrowserView {
+        let source = SourceCapture::from_bytes(owner(), FileId::new(owner(), 1).unwrap(),
+            SourceRevision::new(owner(), 1).unwrap(), "source.rs", bytes).unwrap();
+        BrowserSession::new(owner()).open_capture(source).unwrap()
+    }
+    fn budget() -> ResourceBudget { ResourceBudget::new(owner(), ByteLength::new(64 * 1024 * 1024)).unwrap() }
+    #[test]
+    fn retained_references_activate_exact_reader_ranges() {
+        let view = view(b"foo foobar\nfoo".to_vec());
+        let budget = budget();
+        let references = view.references("foo", ReferenceOptions::new(generation()), &budget,
+            ResourceAllocationId::new(1).unwrap(), || false).unwrap();
+        assert_eq!(references.candidates().len(), 2);
+        assert_eq!(references.source_bytes(2).unwrap(), b"foo");
+        assert_eq!(references.candidates()[1].original_range().start().get(), 11);
+        let reader = view.source_reader(super::super::ReaderLimits::default(), &budget,
+            ResourceAllocationId::new(2).unwrap()).unwrap();
+        assert!(reader.seek_reference(&references, 2, generation()).is_ok());
+        assert!(matches!(reader.seek_reference(&references, 0, generation()),
+            Err(ReferenceNavigationError::Reference(ReferenceError::NotFound))));
+        assert!(matches!(reader.seek_reference(&references, 1, QueryGeneration::new(owner(), 2).unwrap()),
+            Err(ReferenceNavigationError::Reference(ReferenceError::StaleQuery))));
+    }
+    #[test]
+    fn changed_bytes_with_reused_source_ids_cannot_receive_old_reference() {
+        let old = view(b"foo".to_vec());
+        let current = view(b"bar".to_vec());
+        let budget = budget();
+        let references = old.references("foo", ReferenceOptions::new(generation()), &budget,
+            ResourceAllocationId::new(1).unwrap(), || false).unwrap();
+        let reader = current.source_reader(super::super::ReaderLimits::default(), &budget,
+            ResourceAllocationId::new(2).unwrap()).unwrap();
+        assert!(matches!(reader.seek_reference(&references, 1, generation()),
+            Err(ReferenceNavigationError::Reference(ReferenceError::StaleSource))));
+    }
+    #[test]
+    fn declared_bomless_utf16_reference_requires_compatible_reader() {
+        let bytes: Vec<u8> = "foo foo".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let view = view(bytes);
+        let budget = budget();
+        let mut options = ReferenceOptions::new(generation());
+        options.encoding = Some(DetectedEncoding::Utf16Le);
+        let references = view.references("foo", options, &budget,
+            ResourceAllocationId::new(1).unwrap(), || false).unwrap();
+        assert_eq!(references.candidates().len(), 2);
+        let reader = view.source_reader(super::super::ReaderLimits::default(), &budget,
+            ResourceAllocationId::new(2).unwrap()).unwrap();
+        assert!(matches!(reader.seek_reference(&references, 1, generation()), Err(ReferenceNavigationError::EncodingMismatch)));
+    }
+    #[test]
+    fn facade_owns_query_name_and_propagates_cancellation() {
+        let view = view(b"foo".to_vec());
+        let budget = budget();
+        let references = view.references(&String::from("foo"), ReferenceOptions::new(generation()), &budget,
+            ResourceAllocationId::new(1).unwrap(), || false).unwrap();
+        assert_eq!(references.name(), "foo");
+        assert!(matches!(view.references("foo", ReferenceOptions::new(generation()), &budget,
+            ResourceAllocationId::new(2).unwrap(), || true), Err(ReferenceError::Canceled)));
     }
 }
