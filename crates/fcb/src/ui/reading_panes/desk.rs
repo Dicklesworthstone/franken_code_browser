@@ -207,6 +207,17 @@ impl ReadingDesk {
         let at = self.location(pane, expected)?;
         source(&self.state, at.file, at.revision)
     }
+    /// Borrow an exact retained capture, including one referenced only by closed
+    /// pane history or bookmarks. This is not an identity-to-path reopen route.
+    /// A host retaining a clone beyond this borrow owns its separate accounting.
+    pub fn retained_capture(&self, expected: u64, file: FileId, revision: SourceRevision)
+        -> Result<&SourceCapture, DeskError> {
+        self.validate(expected)?;
+        if file.owner() != self.owner || revision.owner() != self.owner {
+            return Err(DeskError::OwnerMismatch);
+        }
+        source(&self.state, file, revision)
+    }
     /// External hosts use the ordinary SourceReader/search/document APIs on this
     /// exact view. The clone shares bytes; its ownership can outlive this desk.
     pub fn view(&self, pane: DeskPaneId, expected: u64,

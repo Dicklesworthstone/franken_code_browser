@@ -77,6 +77,7 @@ pub struct DeskSession {
     query: Option<AcceptedQuery>,
     last_query_attempt: u64,
     initial_source_bytes_read: u64,
+    imports: [Option<imports::ImportLink>; 64],
     budget: ResourceBudget,
     _lease: ResourceLease,
 }
@@ -90,7 +91,7 @@ impl DeskSession {
             ByteLength::new((size_of::<Self>() + 256 * 1024) as u64)).map_err(|_| AppError::Admission)?;
         let desk = ReadingDesk::new(owner, limits, &budget, allocation(2)?)?;
         Ok(Self { desk, next_source: 1, next_allocation: 3, query: None,
-            last_query_attempt: 0, initial_source_bytes_read: 0, budget, _lease: lease })
+            last_query_attempt: 0, initial_source_bytes_read: 0, imports: [None; 64], budget, _lease: lease })
     }
     pub fn model(&self) -> &ReadingDesk { &self.desk }
     pub fn accepted_query(&self) -> Option<u64> { self.query.as_ref().map(|q| q.generation) }
@@ -366,3 +367,5 @@ fn location_fields(out: &mut Output, at: DeskLocation) -> Result<(), OutputError
 
 /// Explicit, create-only source-bearing checkpoint files and offline restore.
 pub mod persistence;
+/// Bounded cross-owner source transfer with exact identity receipts.
+pub mod imports;
