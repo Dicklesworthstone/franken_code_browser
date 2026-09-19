@@ -1,9 +1,14 @@
 #![forbid(unsafe_code)]
 
-//! Borrowed serialization surface for the production ephemeral index. This
-//! exports the actual completed segment, not a second gram builder or matcher.
-//! A persistence host must bind it to source/manifest digests, retain a trusted
-//! artifact identity, and preserve uncovered members when reopening it.
+//! Export surfaces for the production ephemeral index. Segment images borrow
+//! the actual completed segments for persistence. Owned transfer pins source
+//! and moves those same segments for repeated, scoped in-memory queries.
+//! A persistence host must bind images to source/manifest digests, retain a
+//! trusted artifact identity, and preserve uncovered members when reopening.
+
+#[path = "owned.rs"]
+mod owned;
+pub use owned::{OwnedEphemeralIndex, SourceRetentionLimits};
 
 use super::{EphemeralIndex, SegmentCoverage};
 use fcb_core::{FileId, SourceRevision};
