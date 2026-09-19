@@ -9,6 +9,9 @@
 //! its next query, or its eventual destruction. All work is worker
 //! work, not an input/paint callback. No root authority is saved in a checkpoint.
 
+mod work;
+pub use work::RepositoryWorkState;
+
 use std::{mem::size_of, path::Path};
 use super::{DeskSession, DeskSessionError, DeskChange, DeskError,
     ArenaOwnerId, FileId, SourceRevision, ByteRange,
@@ -20,7 +23,7 @@ use crate::host::atlas_search::{RetainedAtlasSearch, AtlasSearchError, AtlasSear
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeskRepositoryError {
     Desk(DeskSessionError), Atlas(AtlasSessionError), Search(AtlasSearchError),
-    WrongDesk, Canceled,
+    WrongDesk, StaleStep, Canceled,
 }
 impl std::fmt::Display for DeskRepositoryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -28,6 +31,7 @@ impl std::fmt::Display for DeskRepositoryError {
             Self::Desk(e) => write!(f, "{e}"), Self::Atlas(e) => write!(f, "{e}"),
             Self::Search(e) => write!(f, "{e}"),
             Self::WrongDesk => f.write_str("DESK_REPOSITORY_WRONG_DESK"),
+            Self::StaleStep => f.write_str("DESK_REPOSITORY_STALE_STEP"),
             Self::Canceled => f.write_str("DESK_REPOSITORY_CANCELED"),
         }
     }
