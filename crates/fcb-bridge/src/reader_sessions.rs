@@ -9,7 +9,8 @@
 use std::{mem::size_of, path::Path, sync::{Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}};
 use fcb_app::host::{HostError, HostResponse};
-use fcb_app::host::reader::{ReaderSession, ReaderSessionError};
+use fcb_app::host::reader::{ReaderSession, ReaderSessionError, ReaderOutlineOptions};
+use fcb::search::{SymbolError, SymbolNameMode};
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
 
 pub(super) const MAX_READER_SESSIONS: usize = 8;
@@ -38,7 +39,8 @@ impl std::fmt::Display for AccessError {
 impl AccessError {
     pub(super) fn canceled(self) -> bool {
         match self {
-            Self::Canceled | Self::Closed | Self::Reader(ReaderSessionError::Canceled) => true,
+            Self::Canceled | Self::Closed | Self::Reader(ReaderSessionError::Canceled)
+                | Self::Reader(ReaderSessionError::Symbol(SymbolError::Canceled)) => true,
             Self::Reader(ReaderSessionError::Host(HostError::App(e)) | ReaderSessionError::App(e)) => e.is_canceled(),
             Self::Reader(ReaderSessionError::View(e)) => fcb_app::AppError::View(e).is_canceled(),
             _ => false,
@@ -71,6 +73,11 @@ pub(super) enum Command<'a> {
     Hit { generation: u64, index: usize, context: usize },
     CopyRange { start: u64, end: u64 },
     CopyHit { generation: u64, index: usize },
+    Outline { generation: u64, options: ReaderOutlineOptions },
+    Symbols { generation: u64, needle: &'a str, mode: SymbolNameMode, start: usize, limit: usize },
+    Symbol { generation: u64, id: u64, context: usize },
+    CopySymbol { generation: u64, id: u64, whole_declaration: bool },
+    ClearOutline { generation: u64 },
 }
 
 struct Permit(Arc<AtomicUsize>);
@@ -181,6 +188,11 @@ impl ReaderSessions {
             Command::Hit { generation, index, context } => reader.hit_window(generation, index, context, &mut stop),
             Command::CopyRange { start, end } => reader.copy_range(start, end, &mut stop),
             Command::CopyHit { generation, index } => reader.copy_hit(generation, index, &mut stop),
+            Command::Outline { generation, options } => reader.prepare_outline(generation, options, &mut stop),
+            Command::Symbols { generation, needle, mode, start, limit } => reader.symbol_page(generation, needle, mode, start, limit, &mut stop),
+            Command::Symbol { generation, id, context } => reader.symbol_window(generation, id, context, &mut stop),
+            Command::CopySymbol { generation, id, whole_declaration } => reader.copy_symbol(generation, id, whole_declaration, &mut stop),
+            Command::ClearOutline { generation } => reader.clear_outline(generation, &mut stop),
         };
         cell.validate(epoch)?;
         result.map_err(AccessError::from)
@@ -231,3 +243,6 @@ fn allocate_handle(next: &AtomicU64) -> Result<u64, AccessError> {
 #[cfg(all(test, unix))]
 #[path = "reader_sessions_tests.rs"]
 mod tests;
+#[cfg(all(test, unix))]
+#[path = "reader_outline_sessions_tests.rs"]
+mod outline_tests;

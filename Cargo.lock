@@ -37,6 +37,7 @@ dependencies = [
 name = "fcb-bridge"
 version = "0.1.0"
 dependencies = [
+ "fcb",
  "fcb-app",
  "fcb-core",
  "fcb-map",
