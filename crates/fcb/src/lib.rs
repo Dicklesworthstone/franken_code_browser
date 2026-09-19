@@ -47,6 +47,10 @@ pub use fcb_analysis as analysis;
 #[cfg(feature = "markdown")]
 pub use fcb_document as document;
 
+/// Explicit immutable artifact envelopes and owned persistence primitives.
+#[cfg(feature = "snapshot")]
+pub use fcb_store as store;
+
 /// A capability whose implementation can be selected additively by a host.
 ///
 /// The facade itself remains usable with no Cargo features.  In-memory source

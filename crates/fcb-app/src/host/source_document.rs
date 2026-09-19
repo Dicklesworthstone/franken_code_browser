@@ -10,6 +10,10 @@ use super::{HostError, HostResponse, MAX_HOST_TEXT_BYTES};
 
 pub fn read(path: &Path, mut canceled: impl FnMut() -> bool) -> Result<HostResponse, HostError> {
     let source = super::read_text(path, MAX_HOST_TEXT_BYTES, &mut canceled)?;
+    render(path, &source, canceled)
+}
+
+pub(super) fn render(path: &Path, source: &super::HostText, mut canceled: impl FnMut() -> bool) -> Result<HostResponse, HostError> {
     let budget = ResourceBudget::new(owner(), ByteLength::new(MANAGED_BYTES)).map_err(|_| AppError::Admission)?;
     let syntax = source_highlight(source.as_str(), path.extension().and_then(|s| s.to_str()).unwrap_or(""),
         &budget, allocation(95), owner()).map_err(|error| match error {

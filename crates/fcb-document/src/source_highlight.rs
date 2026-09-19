@@ -31,8 +31,7 @@ pub fn source_highlight(text: &str, language: &str, budget: &ResourceBudget,
         .ok_or(SourceHighlightError::Admission)?;
     let lease = budget.try_reserve_managed(owner, allocation, ByteLength::new(charge as u64))
         .map_err(|_| SourceHighlightError::Admission)?;
-    let language = franken_markdown::LanguageId::from_query(language)
-        .map_or("plain", |id| id.canonical_name());
+    let language = canonical_language(language);
     let supported = highlight::is_supported(language);
     let mut spans = Vec::new();
     spans.try_reserve_exact(capacity).map_err(|_| SourceHighlightError::Admission)?;
@@ -60,4 +59,9 @@ fn role(kind: Tok) -> &'static str {
     match kind { Tok::Plain => "plain", Tok::Keyword => "keyword", Tok::Type => "type",
         Tok::Func => "function", Tok::Str => "string", Tok::Number => "number",
         Tok::Comment => "comment", Tok::Operator => "operator", Tok::Punct => "punctuation" }
+}
+
+/// Canonical language selection shared by source rendering and cache identity.
+pub fn canonical_language(query: &str) -> &'static str {
+    franken_markdown::LanguageId::from_query(query).map_or("plain", |id| id.canonical_name())
 }

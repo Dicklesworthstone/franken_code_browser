@@ -222,3 +222,6 @@ impl Write for Sink {
 
 /// Exact source and upstream lexical roles for native attributed text.
 pub mod source_document;
+
+/// Explicit bounded disk/RAM source and native artifact cache.
+pub mod source_cache;
