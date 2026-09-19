@@ -3,14 +3,16 @@
 //! Repository-wide discovery/search composed with the source-backed reading desk.
 //!
 //! Discovery and queries use the existing atlas/catalog/capture/search engines.
-//! Activation uses the shared desk import API under the receiving desk's budget;
-//! it NEVER opens a path. Repeated hits share their imported immutable capture.
-//! Bookmarks/history/pins own their sources independently of this repository,
-//! its next query, or its eventual destruction. All work is worker
-//! work, not an input/paint callback. No root authority is saved in a checkpoint.
+//! Content-hit activation uses the shared desk import API without reopening a
+//! path. Filename lookup is metadata-only; path-result opening explicitly makes
+//! a NEW source capture. Bookmarks/history/pins own their sources independently
+//! of this repository, its next query, or its eventual destruction. All work is
+//! worker work, not an input/paint callback. Checkpoints retain no root authority.
 
 mod work;
 pub use work::RepositoryWorkState;
+mod paths;
+pub use paths::RepositoryPathOpen;
 
 use std::{mem::size_of, path::Path};
 use super::{DeskSession, DeskSessionError, DeskChange, DeskError,
@@ -19,17 +21,18 @@ use super::{DeskSession, DeskSessionError, DeskChange, DeskError,
 use crate::{AppError, EXIT_OK};
 use crate::host::atlas_session::{AtlasSession, AtlasSessionError, AtlasSessionOptions};
 use crate::host::atlas_search::{RetainedAtlasSearch, AtlasSearchError, AtlasSearchOptions, AtlasDeskError};
+use crate::host::atlas_paths::{RetainedAtlasPaths, AtlasPathError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeskRepositoryError {
-    Desk(DeskSessionError), Atlas(AtlasSessionError), Search(AtlasSearchError),
+    Desk(DeskSessionError), Atlas(AtlasSessionError), Search(AtlasSearchError), Path(AtlasPathError),
     WrongDesk, StaleStep, Canceled,
 }
 impl std::fmt::Display for DeskRepositoryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Desk(e) => write!(f, "{e}"), Self::Atlas(e) => write!(f, "{e}"),
-            Self::Search(e) => write!(f, "{e}"),
+            Self::Search(e) => write!(f, "{e}"), Self::Path(e) => write!(f, "{e}"),
             Self::WrongDesk => f.write_str("DESK_REPOSITORY_WRONG_DESK"),
             Self::StaleStep => f.write_str("DESK_REPOSITORY_STALE_STEP"),
             Self::Canceled => f.write_str("DESK_REPOSITORY_CANCELED"),
@@ -42,6 +45,7 @@ impl From<DeskError> for DeskRepositoryError { fn from(e: DeskError) -> Self { S
 impl From<AppError> for DeskRepositoryError { fn from(e: AppError) -> Self { Self::Desk(e.into()) } }
 impl From<AtlasSessionError> for DeskRepositoryError { fn from(e: AtlasSessionError) -> Self { Self::Atlas(e) } }
 impl From<AtlasSearchError> for DeskRepositoryError { fn from(e: AtlasSearchError) -> Self { Self::Search(e) } }
+impl From<AtlasPathError> for DeskRepositoryError { fn from(e: AtlasPathError) -> Self { Self::Path(e) } }
 impl From<AtlasDeskError> for DeskRepositoryError {
     fn from(e: AtlasDeskError) -> Self {
         match e { AtlasDeskError::Search(e) => Self::Search(e), AtlasDeskError::Desk(e) => Self::Desk(e) }
@@ -81,6 +85,7 @@ pub struct RepositoryOpen {
 pub struct DeskRepository {
     atlas: AtlasSession,
     search: RetainedAtlasSearch,
+    paths: RetainedAtlasPaths,
     desk_owner: Option<ArenaOwnerId>,
     _lease: ResourceLease,
 }
@@ -95,8 +100,9 @@ impl DeskRepository {
             ByteLength::new(size_of::<Self>() as u64)).map_err(|_| AppError::Admission)?;
         let atlas = AtlasSession::open(owner, root, options, &mut canceled)?;
         let search = RetainedAtlasSearch::new(&atlas)?;
+        let paths = RetainedAtlasPaths::new(&atlas)?;
         check(&mut canceled)?;
-        Ok(Self { atlas, search, desk_owner: None, _lease: lease })
+        Ok(Self { atlas, search, paths, desk_owner: None, _lease: lease })
     }
     pub fn owner(&self) -> ArenaOwnerId { self.atlas.atlas().catalog().id().owner() }
     pub fn accepted_generation(&self) -> Option<u64> { self.search.accepted_generation() }
