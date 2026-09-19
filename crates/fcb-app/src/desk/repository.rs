@@ -7,7 +7,7 @@
 
 use super::{Failure, DeskSession, HostResponse, PathBuf, number, count, hex, raw_path};
 use crate::host::{atlas_session::AtlasSessionOptions, atlas_search::{AtlasSearchOptions, AtlasIndexOptions},
-    desk::repository::DeskRepository};
+    atlas_paths::{AtlasPathOptions, PathCase, PathMatchMode}, desk::repository::DeskRepository};
 use crate::output::{Output, OutputError};
 use crate::{EXIT_OK, EXIT_PARTIAL};
 pub(super) use crate::host::desk::repository::DeskRepositoryError;
@@ -35,7 +35,20 @@ canceled replacement work. Explicit cancel targets only the matching generation.
 Running replies retain exit_code=3 and search_complete=false; they do not make\n\
 a later complete session exit partial. Terminal quota/coverage failures do.\n\
 Quit/EOF with uncompleted work exits 3; finish, cancel, or detach explicitly.\n\
-No query, index, or root permission is added to a desk checkpoint.\n";
+No query, index, or root permission is added to a desk checkpoint.\n\
+\nFind files without searching their contents:\n\
+  repo-paths TOKEN PATH_GEN exact|prefix|fuzzy sensitive|unicode-lowercase LIMIT TEXT\n\
+  repo-paths-hex TOKEN PATH_GEN MODE CASE LIMIT NATIVE_QUERY_HEX\n\
+  repo-path-page TOKEN PATH_GEN OFFSET LIMIT\n\
+  repo-path-select TOKEN PATH_GEN FILE_ID | repo-path-open TOKEN PATH_GEN FILE_ID\n\
+  repo-path-clear TOKEN NEW_PATH_GEN\n\
+Path queries have their own increasing generations, separate from text/index work.\n\
+Use file_id from the path response, not a row number or displayed path label.\n\
+Lookup, paging and selection read no source payloads and do not advance text work.\n\
+repo-path-open explicitly captures current regular-file bytes (desk limit 4 MiB)\n\
+and changes the desk revision. Unlike repo-hit, it does not claim old searched bytes.\n\
+For documentation, find README.md, open its returned file_id, then doc-prepare.\n\
+Raw-path hex queries preserve native names; unicode-lowercase is not full folding.\n";
 
 pub(super) struct RepositoryCommands {
     current: Option<(u64, DeskRepository)>,
@@ -57,7 +70,8 @@ impl RepositoryCommands {
         let work = self.current.as_ref().map(|(_, r)| r.work_state());
         for (key, value) in [("repository_pending_query_generation", work.and_then(|w| w.pending_query)),
             ("repository_index_generation", work.and_then(|w| w.accepted_index)),
-            ("repository_pending_index_generation", work.and_then(|w| w.pending_index))] {
+            ("repository_pending_index_generation", work.and_then(|w| w.pending_index)),
+            ("repository_path_generation", self.current.as_ref().and_then(|(_, r)| r.path_generation()))] {
             out.literal(",")?; out.quoted(key)?; out.literal(":")?;
             match value { Some(n) => out.integer(n)?, None => out.literal("null")? }
         }
@@ -85,6 +99,30 @@ impl RepositoryCommands {
             }
             ("repo-info", [token]) => Ok(self.get(number(token)?)?.info(&mut *canceled)?),
             ("repo-work", [token]) => Ok(desk.repository_work_response(self.get(number(token)?)?, &mut *canceled)?),
+            ("repo-paths" | "repo-paths-hex", [token, generation, mode, case, limit, text]) => {
+                let options = AtlasPathOptions {
+                    mode: match *mode { "exact" => PathMatchMode::Exact, "prefix" => PathMatchMode::Prefix,
+                        "fuzzy" => PathMatchMode::Fuzzy, _ => return Err(Failure::Protocol("DESK_PATH_MODE")) },
+                    case: match *case { "sensitive" => PathCase::Sensitive, "unicode-lowercase" => PathCase::UnicodeLowercase,
+                        _ => return Err(Failure::Protocol("DESK_PATH_CASE")) },
+                    max_results: count(limit)?,
+                };
+                let decoded;
+                let needle = if command == "repo-paths-hex" { decoded = hex(text, 256)?; decoded.as_slice() }
+                    else { text.as_bytes() };
+                Ok(self.get(number(token)?)?.find_paths(number(generation)?, needle, options, &mut *canceled)?)
+            }
+            ("repo-path-page", [token, generation, offset, limit]) =>
+                Ok(self.get(number(token)?)?.path_page(number(generation)?, count(offset)?, count(limit)?, &mut *canceled)?),
+            ("repo-path-select" | "repo-path-open", [token, generation, file]) => {
+                let repo = self.get(number(token)?)?;
+                let file = fcb::FileId::new(repo.owner(), number(file)?).map_err(|_| Failure::Protocol("DESK_PATH_FILE_ID"))?;
+                if command == "repo-path-select" { return Ok(repo.select_path(number(generation)?, file, &mut *canceled)?); }
+                let opened = repo.open_path_hit(desk, expected, attempt, number(generation)?, file, &mut *canceled)?;
+                Ok(desk.repository_path_open_response(&opened)?)
+            }
+            ("repo-path-clear", [token, generation]) =>
+                Ok(self.get(number(token)?)?.clear_paths(number(generation)?, &mut *canceled)?),
             ("repo-find" | "repo-find-text-hex" | "repo-begin" | "repo-begin-text-hex", [token, generation, limit, bytes, text]) => {
                 let decoded;
                 let needle = if command.ends_with("text-hex") {

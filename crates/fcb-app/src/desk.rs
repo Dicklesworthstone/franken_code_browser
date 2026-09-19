@@ -60,8 +60,9 @@ Repository tokens come from responses; every root replacement gets a new token.\
 Repository query generations are separate from pane-local query generations.\n\
 repo-open freezes up to 4096 catalog entries; repo-find explicitly reads sources\n\
 (up to 1 MiB each). Coverage and truncation remain explicit in query responses.\n\
-repo-hit uses retained bytes and changes the desk revision; other repo commands\n\
-do not. Detaching/replacing the root preserves already opened desk captures.\n\
+repo-hit uses retained bytes; repo-path-open explicitly captures current bytes.\n\
+Both change the desk revision. Other repo commands do not. Detaching/replacing\n\
+the root preserves already opened desk captures.\n\
 Save includes activated desk captures, not all search hits or a live root grant.\n\
 No quotes/escapes/shell expansion. Hex permits tabs, newlines and non-UTF-8 paths.\n\
 Frames need LF; partial EOF, overlong frames and output failures stop the session.\n\
