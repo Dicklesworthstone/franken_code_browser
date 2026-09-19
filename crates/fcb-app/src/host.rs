@@ -226,3 +226,6 @@ pub mod source_document;
 
 /// Explicit bounded disk/RAM source and native artifact cache.
 pub mod source_cache;
+
+/// Source-backed pinned reading, history, bookmarks, search and copying.
+pub mod desk;
