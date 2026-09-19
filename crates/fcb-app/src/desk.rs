@@ -88,7 +88,9 @@ impl Failure {
 pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut impl Write,
     stderr: &mut impl Write, mut canceled: impl FnMut() -> bool) -> u8 {
     if arguments.is_empty() || (arguments.len() == 1 && (arguments[0] == "--help" || arguments[0] == "-h")) {
-        return if stdout.write_all(HELP.as_bytes()).is_ok() && stdout.flush().is_ok() { EXIT_OK } else { EXIT_ERROR };
+        return if stdout.write_all(HELP.as_bytes()).is_ok()
+            && stdout.write_all(repository::WORK_HELP.as_bytes()).is_ok()
+            && stdout.flush().is_ok() { EXIT_OK } else { EXIT_ERROR };
     }
     if arguments.len() != 1 || arguments[0] != "--stdio" {
         let _ = stderr.write_all(b"DESK_ARGUMENTS: use fcb desk --stdio or fcb desk --help\n"); return EXIT_ERROR;
@@ -113,8 +115,9 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
     let mut repository = RepositoryCommands::new();
     let mut aggregate = EXIT_OK;
     for request in 1..=MAX_REQUESTS {
+        repository.start_request();
         let read = read_frame(&mut input, &mut frame, &mut canceled);
-        if matches!(read, Ok(false)) { return aggregate; }
+        if matches!(read, Ok(false)) { return repository.session_exit(aggregate); }
         let fatal = read.is_err();
         let mut effect = CheckpointSaveEffect::None;
         let result = read.and_then(|_| {
@@ -125,8 +128,9 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
             Ok((reply, quit)) => (reply.exit_code(), *quit),
             Err(error) => (if error.canceled() { EXIT_CANCELED } else { EXIT_ERROR }, false),
         };
+        let exit = if quit { repository.session_exit(exit) } else { exit };
         if exit == EXIT_ERROR { aggregate = EXIT_ERROR; }
-        else if exit == EXIT_PARTIAL && aggregate == EXIT_OK { aggregate = EXIT_PARTIAL; }
+        else if exit == EXIT_PARTIAL && aggregate == EXIT_OK && !repository.is_progress_reply() { aggregate = EXIT_PARTIAL; }
         output.clear();
         let encoded = (|| {
             output.literal("{\"schema\":\"fcb.desk-stdio/1\",\"request\":")?; output.integer(request)?;
@@ -140,6 +144,7 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
             match repository.token() { Some(n) => output.integer(n)?, None => output.literal("null")? }
             output.literal(",\"repository_query_generation\":")?;
             match repository.query() { Some(n) => output.integer(n)?, None => output.literal("null")? }
+            repository.encode_work(&mut output)?;
             match &result {
                 Ok((reply, _)) => { output.literal(",\"result\":")?; output.literal(reply.as_str().trim_end())?; }
                 Err(error) => {
@@ -163,7 +168,7 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
         }
         if exit == EXIT_CANCELED { return EXIT_CANCELED; }
         if fatal { return EXIT_ERROR; }
-        if quit { return aggregate; }
+        if quit { return repository.session_exit(aggregate); }
     }
     let _ = stderr.write_all(b"DESK_REQUEST_LIMIT: session stopped\n"); EXIT_PARTIAL
 }
