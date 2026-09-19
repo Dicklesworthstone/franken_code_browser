@@ -107,7 +107,7 @@ impl SourceCache {
         self.stats.lexer_calls = self.stats.lexer_calls.saturating_add(1);
         let response = source_document::render(path, &source, &mut canceled)?;
         if canceled() { return Err(AppError::Canceled.into()); }
-        if self.put("source", key, response.as_str().as_bytes(), MAX_RESPONSE_BYTES).is_err() {
+        if self.put("source", key, response.as_str().as_bytes(), MAX_RESPONSE_BYTES, false).is_err() {
             self.stats.write_refusals = self.stats.write_refusals.saturating_add(1);
         }
         Ok((response, key))
@@ -117,7 +117,14 @@ impl SourceCache {
         self.get("native", key, MAX_NATIVE_BYTES)
     }
     pub fn put_native(&mut self, key: Sha256Digest, bytes: &[u8]) -> Result<(), CacheError> {
-        self.put("native", key, bytes, MAX_NATIVE_BYTES)
+        self.put("native", key, bytes, MAX_NATIVE_BYTES, false)
+    }
+    /// Explicit replacement after the native consumer rejects a checksummed
+    /// artifact's platform semantics. This never replaces a source artifact.
+    /// Existing borrowed Arcs keep their original bytes. Failed admission or
+    /// publication leaves the incumbent available; no eager deletion occurs.
+    pub fn repair_native(&mut self, key: Sha256Digest, bytes: &[u8]) -> Result<(), CacheError> {
+        self.put("native", key, bytes, MAX_NATIVE_BYTES, true)
     }
     fn validate(&self) -> Result<(), CacheError> {
         let meta = fs::symlink_metadata(&self.root).map_err(|_| CacheError::Root)?;
@@ -170,11 +177,13 @@ impl SourceCache {
         }
         self.hot_bytes += bytes.len(); self.hot.push_back(Hot { domain, key, bytes });
     }
-    fn put(&mut self, domain: &'static str, key: Sha256Digest, bytes: &[u8], limit: usize) -> Result<(), CacheError> {
+    fn put(&mut self, domain: &'static str, key: Sha256Digest, bytes: &[u8], limit: usize, replace_rejected: bool) -> Result<(), CacheError> {
         if bytes.len() > limit { return Err(CacheError::Limit); }
         self.validate()?;
-        if let Some(previous) = self.get(domain, key, limit)? {
-            return if previous.as_ref() == bytes { Ok(()) } else { Err(CacheError::Conflict) };
+        if !replace_rejected {
+            if let Some(previous) = self.get(domain, key, limit)? {
+                return if previous.as_ref() == bytes { Ok(()) } else { Err(CacheError::Conflict) };
+            }
         }
         self.scan()?;
         let mut out = EnvelopeWriter::new(SCHEMA);
@@ -193,6 +202,11 @@ impl SourceCache {
         file.sync_all().map_err(|_| CacheError::Io)?;
         self.validate()?; regular_or_absent(&destination)?;
         fs::rename(&temporary, &destination).map_err(|_| CacheError::Io)?;
+        // Publication has succeeded. Retire only this key's hot reference even
+        // if the subsequent bookkeeping scan fails; never serve the old value.
+        if let Some(index) = self.hot.iter().position(|h| h.domain == domain && h.key == key) {
+            if let Some(old) = self.hot.remove(index) { self.hot_bytes -= old.bytes.len(); }
+        }
         self.scan()?;
         self.stats.writes = self.stats.writes.saturating_add(1);
         self.remember(domain, key, Arc::from(bytes)); Ok(())

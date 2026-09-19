@@ -74,17 +74,32 @@ pub unsafe extern "C" fn fcb_source_cache_get(handle: u64, key_hex: *const c_cha
 /// permitted for zero length). Buffer is borrowed and copied before return.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fcb_source_cache_put(handle: u64, key_hex: *const c_char, bytes: *const u8, len: u64) -> bool {
+    unsafe { store_native(handle, key_hex, bytes, len, false) }
+}
+/// Replace a native artifact only after platform-semantic decoding rejected it.
+/// Resource-pressure refusals alone must not trigger repair. Source records are
+/// outside this API's namespace and remain immutable.
+/// # Safety
+/// Same borrowed key/buffer contract as fcb_source_cache_put.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_source_cache_repair(handle: u64, key_hex: *const c_char, bytes: *const u8, len: u64) -> bool {
+    unsafe { store_native(handle, key_hex, bytes, len, true) }
+}
+unsafe fn store_native(handle: u64, key_hex: *const c_char, bytes: *const u8, len: u64, repair: bool) -> bool {
     std::panic::catch_unwind(|| {
         let length = usize::try_from(len).ok()?;
         if length > MAX_NATIVE_BYTES || (length != 0 && bytes.is_null()) { return None; }
         let key = Sha256Digest::from_hex(unsafe { cstr(key_hex) }?).ok()?;
-        // ubs:ignore -- FFI contract grants readable bytes; null and 64MiB bound checked above.
+        // FFI contract grants readable bytes; null and 64MiB bound checked above.
         let bytes = if length == 0 { &[] } else { unsafe { std::slice::from_raw_parts(bytes, length) } };
         let cache = cache(handle)?;
-        cache.lock().ok()?.put_native(key, bytes).ok()?;
+        let mut cache = cache.lock().ok()?;
+        if repair { cache.repair_native(key, bytes).ok()?; }
+        else { cache.put_native(key, bytes).ok()?; }
         Some(())
     }).ok().flatten().is_some()
 }
+
 /// # Safety
 /// bytes/len must be the exact still-owned pair returned by get; call once.
 #[unsafe(no_mangle)]

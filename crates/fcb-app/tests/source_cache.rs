@@ -114,3 +114,36 @@ fn language_is_part_of_identity_and_empty_native_artifact_is_a_hit() {
     cache.put_native(key, b"").unwrap();
     assert_eq!(cache.get_native(key).unwrap().unwrap().len(), 0);
 }
+
+#[test]
+fn explicit_native_repair_preserves_old_arc_and_publishes_new_disk_bytes() {
+    let (root, source) = fixture();
+    let key = Sha256::digest(b"native semantic identity");
+    let mut cache = SourceCache::open(&root, CacheLimits::default()).unwrap();
+    let (source_before, source_key) = cache.source(&source, || false).unwrap();
+    cache.put_native(key, b"old font table").unwrap();
+    let old = cache.get_native(key).unwrap().unwrap();
+    assert_eq!(cache.put_native(key, b"new font table"), Err(CacheError::Conflict));
+    cache.repair_native(key, b"new font table").unwrap();
+    assert_eq!(old.as_ref(), b"old font table");
+    assert_eq!(cache.get_native(key).unwrap().unwrap().as_ref(), b"new font table");
+    // Repairing a native artifact with the same digest cannot alter source data.
+    cache.repair_native(source_key, b"native under equal key").unwrap();
+    assert_eq!(cache.source(&source, || false).unwrap().0.as_str(), source_before.as_str());
+    drop(cache);
+    let mut disk = SourceCache::open(&root, CacheLimits::default()).unwrap();
+    assert_eq!(disk.get_native(key).unwrap().unwrap().as_ref(), b"new font table");
+}
+
+#[test]
+fn failed_repair_admission_leaves_incumbent_intact() {
+    let (root, _) = fixture();
+    let key = Sha256::digest(b"one entry");
+    let mut cache = SourceCache::open(&root, CacheLimits { ram_bytes: 1024, disk_bytes: 10000, entries: 1 }).unwrap();
+    cache.put_native(key, b"old").unwrap();
+    assert_eq!(cache.repair_native(key, b"new"), Err(CacheError::Limit));
+    assert_eq!(cache.get_native(key).unwrap().unwrap().as_ref(), b"old");
+    drop(cache);
+    let mut disk = SourceCache::open(&root, CacheLimits::default()).unwrap();
+    assert_eq!(disk.get_native(key).unwrap().unwrap().as_ref(), b"old");
+}
