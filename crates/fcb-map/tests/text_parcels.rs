@@ -217,7 +217,11 @@ fn unequal_source_areas_choose_minimum_area_weighted_golden_distortion() {
         }).sum()
     }
     let mut exposes_equal_vote_regression = false;
-    for weights in [[1.0, 7.0, 1000.0], [1000.0, 1.0, 7.0], [7.0, 1000.0, 1.0], [1.0, 10.0, 100.0]] {
+    // The modest 1:1:5 imbalance at aspect 0.7 distinguishes the objectives:
+    // equal votes spend distortion on the dominant leaf (weighted cost ~1.218),
+    // while area weighting yields ~0.603. Extreme imbalances alone need not
+    // distinguish them: the enclosing rectangle can dominate both decisions.
+    for weights in [[1.0, 7.0, 1000.0], [1000.0, 1.0, 7.0], [7.0, 1000.0, 1.0], [1.0, 10.0, 100.0], [1.0, 1.0, 5.0]] {
         for aspect in [0.25, 0.7, 1.0, 1.9, 4.0] {
             let total: f64 = weights.iter().sum();
             let width = (total * aspect).sqrt();
