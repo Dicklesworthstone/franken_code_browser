@@ -58,12 +58,13 @@ pub(super) struct AcceptedOutline {
     _lease: ResourceLease,
 }
 
-/// These identities are deliberately disjoint. A symbol ID is not a text-search
-/// occurrence, even when the two independent generation counters are equal.
+/// Search occurrences, outline symbols and document selections have disjoint
+/// identities, even when their independent generation counters are equal.
 #[derive(Clone, Copy)]
 pub(super) enum SelectionIdentity {
     Search(u64),
     Outline { generation: u64, symbol_id: u64, line: u64 },
+    Document { generation: u64, rendered_start: u64, rendered_end: u64 },
 }
 impl SelectionIdentity {
     pub(super) fn encode(self, out: &mut Output) -> Result<(), OutputError> {
@@ -76,6 +77,12 @@ impl SelectionIdentity {
                 out.literal(",\"symbol_id\":")?; out.integer(symbol_id)?;
                 out.literal(",\"declaration_line\":")?; out.integer(line)?;
                 out.literal(",\"selection_namespace\":\"outline\",\"evidence_level\":\"heuristic-outline-candidate\",\"semantic_resolution\":false")?;
+            }
+            Self::Document { generation, rendered_start, rendered_end } => {
+                out.literal("\"document_generation\":")?; out.integer(generation)?;
+                out.literal(",\"selection_namespace\":\"document\",\"source_mapping\":\"enclosing-regions-not-glyph-exact\",\"rendered_utf8_range\":{\"start\":")?;
+                out.integer(rendered_start)?; out.literal(",\"end\":")?; out.integer(rendered_end)?;
+                out.literal("}")?;
             }
         }
         Ok(())

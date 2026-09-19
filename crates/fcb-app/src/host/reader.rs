@@ -2,12 +2,14 @@
 
 //! A retained native-host reading session over ONE immutable source capture.
 //! Only `open` performs filesystem I/O. Windows, physical-line navigation,
-//! literal search, structural candidates and exact copies use retained bytes.
+//! search, outlines, Markdown previews and exact copies use retained bytes.
 //! No self-referential index, new matcher, decoder, runtime or native UI exists
 //! here. Calls are bounded synchronous worker operations, not redraw callbacks.
 
 mod outline;
+mod document;
 pub use outline::{ReaderOutlineOptions, MAX_READER_SYMBOL_PAGE, MAX_READER_SYMBOL_QUERY_BYTES};
+pub use document::{DocumentCopyMode, ReaderDocumentOptions, MAX_READER_DOCUMENT_PAGE};
 use outline::{AcceptedOutline, SelectionIdentity};
 
 use std::{mem::size_of, path::{Path, PathBuf}, sync::Arc};
@@ -33,6 +35,7 @@ pub enum ReaderSessionError {
     View(ExtentViewError), Lines(LineWindowError), InvalidLimits, InvalidRange,
     StaleQuery, MissingHit, MissingLine, Canceled, IdentityExhausted,
     Symbol(SymbolError), MissingOutline, UnsupportedOutlineLanguage,
+    Document(fcb::document::reader::DocumentReadError), MissingDocument,
 }
 impl std::fmt::Display for ReaderSessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -40,7 +43,8 @@ impl std::fmt::Display for ReaderSessionError {
             Self::Host(e) => write!(f, "{e}"), Self::App(e) => write!(f, "{e}"),
             Self::Source(e) => write!(f, "{e}"), Self::Stream(e) => write!(f, "{e}"),
             Self::View(e) => write!(f, "{e}"), Self::Lines(e) => write!(f, "{e}"),
-            Self::Symbol(e) => write!(f, "{e}"),
+            Self::Symbol(e) => write!(f, "{e}"), Self::Document(e) => write!(f, "{e}"),
+            Self::MissingDocument => f.write_str("READER_SESSION_NO_DOCUMENT"),
             Self::MissingOutline => f.write_str("READER_SESSION_NO_OUTLINE"),
             Self::UnsupportedOutlineLanguage => f.write_str("READER_SESSION_OUTLINE_LANGUAGE_UNSUPPORTED"),
             Self::InvalidLimits => f.write_str("READER_SESSION_INVALID_LIMITS"),
@@ -84,6 +88,8 @@ pub struct ReaderSession {
     last_query_attempt: u64,
     outline: Option<AcceptedOutline>,
     last_outline_attempt: u64,
+    document: Option<fcb::document::reader::DocumentReader<'static>>,
+    last_document_attempt: u64,
     next_allocation: u64,
     budget: ResourceBudget,
     _source_lease: ResourceLease,
@@ -122,7 +128,7 @@ impl ReaderSession {
         check(&mut canceled)?;
         Ok(Self { capture, path: path.to_path_buf(), encoding, source_bytes_read: 0, read_calls: 0,
             file_observation: false, query: None, last_query_attempt: 0,
-            outline: None, last_outline_attempt: 0, next_allocation: 2,
+            outline: None, last_outline_attempt: 0, document: None, last_document_attempt: 0, next_allocation: 2,
             budget, _source_lease: lease })
     }
     pub fn capture(&self) -> &CompleteCapture { &self.capture }
@@ -143,6 +149,8 @@ impl ReaderSession {
         if let Some(generation) = self.accepted_generation() { out.integer(generation)?; } else { out.literal("null")?; }
         out.literal(",\"accepted_outline_generation\":")?;
         if let Some(generation) = self.outline_generation() { out.integer(generation)?; } else { out.literal("null")?; }
+        out.literal(",\"accepted_document_generation\":")?;
+        if let Some(generation) = self.document_generation() { out.integer(generation)?; } else { out.literal("null")?; }
         out.literal("}\n")?;
         self.finish_output(out, EXIT_OK, &mut canceled)
     }
