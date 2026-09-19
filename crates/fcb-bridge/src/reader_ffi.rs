@@ -114,6 +114,8 @@ pub extern "C" fn fcb_reader_close(handle: u64) -> u8 {
 
 #[path = "reader_outline_ffi.rs"]
 mod outline;
+#[path = "reader_document_ffi.rs"]
+mod document;
 
 #[cfg(test)]
 #[path = "reader_ffi_tests.rs"]

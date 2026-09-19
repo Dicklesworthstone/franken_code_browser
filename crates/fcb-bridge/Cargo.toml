@@ -14,7 +14,7 @@ name = "fcb_bridge"
 crate-type = ["staticlib"]
 
 [dependencies]
-fcb = { path = "../fcb", default-features = false, features = ["search", "analysis"] }
+fcb = { path = "../fcb", default-features = false, features = ["search", "analysis", "markdown"] }
 fcb-app = { path = "../fcb-app" }
 fcb-core = { path = "../fcb-core" }
 fcb-map = { path = "../fcb-map" }
