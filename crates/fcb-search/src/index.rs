@@ -319,39 +319,43 @@ impl<'a> EphemeralIndex<'a> {
     ) -> Result<bool, IndexError> {
         self.validate_options(options)?;
         let segment = self.segments.get(document_index).ok_or(IndexError::InvalidManifest)?;
-        let needle = query.primary_needle.as_bytes();
-        if needle.is_empty() { return Err(QueryError::EmptyNeedle.into()); }
-        if needle.len() < 3 || !self.compatible(segment, options) { return Ok(true); }
-        let keys = &self.grams[segment.start..segment.start + segment.len];
-        let last = needle.len() - 3;
-        for offset in [0, last / 2, last] {
-            if keys.binary_search(&gram(&needle[offset..offset + 3])).is_err() { return Ok(false); }
-        }
-        Ok(true)
+        may_match_segment(segment, &self.grams, query, options)
     }
 
     pub(crate) fn uses_fallback(&self, document_index: usize, options: &QueryOptions, needle_len: usize) -> bool {
-        needle_len < 3 || !self.compatible(&self.segments[document_index], options)
+        needle_len < 3 || !compatible_segment(&self.segments[document_index], options)
     }
 
     pub(crate) fn validate_options(&self, options: &QueryOptions) -> Result<(), IndexError> {
         if options.generation.owner() != self.manifest.id.owner { return Err(IndexError::OwnerMismatch); }
         Ok(())
     }
-
-    fn compatible(&self, segment: &Segment, options: &QueryOptions) -> bool {
-        if segment.coverage != SegmentCoverage::Indexed { return false; }
-        match options.mode {
-            SearchMode::RawBytes => true,
-            SearchMode::DecodedText { case_sensitive: true, normalization: UnicodeNormalization::Exact } => {
-                segment.utf8 && matches!(options.declared_encoding,
-                    None | Some(DetectedEncoding::Utf8 { .. }))
-            }
-            _ => false,
-        }
-    }
 }
 
+// Both borrowed and owning query routes use these same prepared-segment probes.
+// This is a negative certificate only; the existing exact verifier owns hits.
+fn may_match_segment(segment: &Segment, grams: &[u32], query: &ParsedQuery,
+    options: &QueryOptions) -> Result<bool, IndexError> {
+    let needle = query.primary_needle.as_bytes();
+    if needle.is_empty() { return Err(QueryError::EmptyNeedle.into()); }
+    if needle.len() < 3 || !compatible_segment(segment, options) { return Ok(true); }
+    let keys = &grams[segment.start..segment.start + segment.len];
+    let last = needle.len() - 3;
+    for offset in [0, last / 2, last] {
+        if keys.binary_search(&gram(&needle[offset..offset + 3])).is_err() { return Ok(false); }
+    }
+    Ok(true)
+}
+fn compatible_segment(segment: &Segment, options: &QueryOptions) -> bool {
+    if segment.coverage != SegmentCoverage::Indexed { return false; }
+    match options.mode {
+        SearchMode::RawBytes => true,
+        SearchMode::DecodedText { case_sensitive: true, normalization: UnicodeNormalization::Exact } => {
+            segment.utf8 && matches!(options.declared_encoding, None | Some(DetectedEncoding::Utf8 { .. }))
+        }
+        _ => false,
+    }
+}
 fn source_refusal(size: usize, limits: IndexLimits) -> Option<UncoveredReason> {
     if size > limits.max_source_bytes_per_file { return Some(UncoveredReason::SourceLimit); }
     if size.saturating_sub(2) > limits.max_scratch_bytes / size_of::<u32>() {

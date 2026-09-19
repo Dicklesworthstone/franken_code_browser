@@ -1,16 +1,17 @@
 #![forbid(unsafe_code)]
 
 //! Owning transfer of prepared segments AND their complete captured universe.
-//! Repeated queries borrow those same segments through a scoped view. The view
-//! allocates only bounded document descriptors, never copies source or postings,
-//! hashes source, reparses paths, or rebuilds an index. No self-reference or leak.
+//! Scoped borrowed views support existing consumers. Movable query cursors read
+//! one descriptor directly by ordinal, without rebuilding the descriptor array.
+//! Source and postings are shared/retained, never copied or rebuilt by a step.
 
-use std::mem::{size_of, take};
+use std::{mem::{size_of, take}, sync::Arc};
 use fcb_core::{ByteLength, FileId, ResourceAllocationId, ResourceBudget, ResourceLease};
 use fcb_source::CompleteCapture;
 use super::super::{EphemeralIndex, IndexError, IndexStatistics, MembershipState,
-    SearchManifest, SearchManifestId, Segment};
-use crate::SearchDocument;
+    SearchManifest, SearchManifestId, Segment, compatible_segment, may_match_segment};
+use crate::{SearchDocument, ParsedQuery, QueryOptions};
+use crate::indexed_query::QuerySource;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourceRetentionLimits {
@@ -39,6 +40,9 @@ pub struct OwnedEphemeralIndex {
     grams: Vec<u32>,
     statistics: IndexStatistics,
     source_bytes: u64,
+    // Private allocation identity survives moves and cannot alias a replacement
+    // while any cursor still holds it, even when a host reused numeric IDs.
+    query_identity: Arc<()>,
     _source_lease: ResourceLease,
     _index_lease: ResourceLease,
 }
@@ -70,7 +74,7 @@ impl EphemeralIndex<'_> {
         let metadata = manifest.documents.len().checked_mul(size_of::<OwnedDocument>() + 32)
             .and_then(|n| manifest.unavailable.len().checked_mul(size_of::<FileId>()).and_then(|m| n.checked_add(m)))
             .and_then(|n| n.checked_add(path_bytes))
-            .and_then(|n| n.checked_add(size_of::<OwnedEphemeralIndex>()))
+            .and_then(|n| n.checked_add(size_of::<OwnedEphemeralIndex>() + 64))
             .ok_or(IndexError::LimitExceeded)?;
         let charge = source_bytes.checked_add(metadata as u64).ok_or(IndexError::LimitExceeded)?;
         let source_lease = budget.try_reserve_managed(manifest.id.owner(), allocation, ByteLength::new(charge))
@@ -89,7 +93,7 @@ impl EphemeralIndex<'_> {
         check(&mut canceled)?;
         Ok(OwnedEphemeralIndex { id: manifest.id, membership: manifest.membership,
             documents, unavailable, segments: self.segments, grams: self.grams,
-            statistics: self.statistics, source_bytes,
+            statistics: self.statistics, source_bytes, query_identity: Arc::new(()),
             _source_lease: source_lease, _index_lease: self._lease })
     }
 }
@@ -104,6 +108,7 @@ impl OwnedEphemeralIndex {
         self.documents.binary_search_by_key(&file, |doc| doc.file)
             .ok().map(|i| &self.documents[i].capture)
     }
+    pub(crate) fn query_identity(&self) -> &Arc<()> { &self.query_identity }
 
     /// Use the existing indexed-query, segment-export and exact-verification
     /// APIs. The callback's result cannot borrow the temporary descriptor view.
@@ -124,8 +129,6 @@ impl OwnedEphemeralIndex {
             check(&mut canceled)?;
             documents.push(SearchDocument::new(doc.file, &doc.path, &doc.capture));
         }
-        // Exact copies of a previously validated manifest, not caller-supplied
-        // metadata. No source identity or coverage state changes during transfer.
         let manifest = SearchManifest { id: self.id, documents: &documents,
             unavailable: &self.unavailable, membership: self.membership };
         let view = EphemeralIndex { manifest, segments: take(&mut self.segments),
@@ -136,6 +139,23 @@ impl OwnedEphemeralIndex {
         drop(restore);
         check(&mut canceled)?;
         Ok(result)
+    }
+}
+impl QuerySource for OwnedEphemeralIndex {
+    fn id(&self) -> SearchManifestId { self.id }
+    fn membership(&self) -> MembershipState { self.membership }
+    fn count(&self) -> usize { self.documents.len() }
+    fn document(&self, ordinal: usize) -> SearchDocument<'_> {
+        let doc = &self.documents[ordinal];
+        SearchDocument::new(doc.file, &doc.path, &doc.capture)
+    }
+    fn may_match(&self, ordinal: usize, query: &ParsedQuery, options: &QueryOptions) -> Result<bool, IndexError> {
+        if options.generation.owner() != self.id.owner() { return Err(IndexError::OwnerMismatch); }
+        let segment = self.segments.get(ordinal).ok_or(IndexError::InvalidManifest)?;
+        may_match_segment(segment, &self.grams, query, options)
+    }
+    fn fallback(&self, ordinal: usize, options: &QueryOptions, needle: usize) -> bool {
+        needle < 3 || !compatible_segment(&self.segments[ordinal], options)
     }
 }
 struct Restore<'slot, 'source> {
