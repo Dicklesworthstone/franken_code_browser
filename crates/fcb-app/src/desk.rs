@@ -11,6 +11,8 @@ mod repository;
 use repository::RepositoryCommands;
 mod document;
 use document::DocumentCommands;
+mod comparison;
+use comparison::ComparisonCommands;
 
 use std::{ffi::OsString, io::{self, BufReader, Read, Write}, path::{Path, PathBuf}};
 use fcb::{ByteLength, ByteOffset, ByteRange};
@@ -73,22 +75,23 @@ Ordinary command errors preserve the session; responses expose accepted state.\n
 
 #[derive(Debug)]
 enum Failure { Command(DeskSessionError), Checkpoint(CheckpointIoError), Repository(repository::DeskRepositoryError),
-    Document(document::DeskDocumentError), Protocol(&'static str), Io, Canceled }
+    Document(document::DeskDocumentError), Comparison(comparison::DeskComparisonError), Protocol(&'static str), Io, Canceled }
 impl From<DeskSessionError> for Failure { fn from(e: DeskSessionError) -> Self { Self::Command(e) } }
 impl From<DeskError> for Failure { fn from(e: DeskError) -> Self { Self::Command(e.into()) } }
 impl From<CheckpointIoError> for Failure { fn from(e: CheckpointIoError) -> Self { Self::Checkpoint(e) } }
 impl From<repository::DeskRepositoryError> for Failure { fn from(e: repository::DeskRepositoryError) -> Self { Self::Repository(e) } }
 impl From<document::DeskDocumentError> for Failure { fn from(e: document::DeskDocumentError) -> Self { Self::Document(e) } }
+impl From<comparison::DeskComparisonError> for Failure { fn from(e: comparison::DeskComparisonError) -> Self { Self::Comparison(e) } }
 impl Failure {
     fn code(&self) -> String {
         match self { Self::Command(e) => e.to_string(), Self::Checkpoint(e) => e.code(), Self::Repository(e) => e.to_string(),
-            Self::Document(e) => e.to_string(), Self::Protocol(code) => (*code).into(),
+            Self::Document(e) => e.to_string(), Self::Comparison(e) => e.to_string(), Self::Protocol(code) => (*code).into(),
             Self::Io => "DESK_INPUT_IO".into(), Self::Canceled => "DESK_CANCELED".into() }
     }
     fn canceled(&self) -> bool {
         match self { Self::Canceled => true, Self::Command(e) => e.is_canceled(),
             Self::Checkpoint(e) => e.is_canceled(), Self::Repository(e) => e.is_canceled(),
-            Self::Document(e) => e.is_canceled(), _ => false }
+            Self::Document(e) => e.is_canceled(), Self::Comparison(e) => e.is_canceled(), _ => false }
     }
 }
 
@@ -98,6 +101,7 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
         return if stdout.write_all(HELP.as_bytes()).is_ok()
             && stdout.write_all(repository::WORK_HELP.as_bytes()).is_ok()
             && stdout.write_all(document::DOCUMENT_HELP.as_bytes()).is_ok()
+            && stdout.write_all(comparison::COMPARISON_HELP.as_bytes()).is_ok()
             && stdout.flush().is_ok() { EXIT_OK } else { EXIT_ERROR };
     }
     if arguments.len() != 1 || arguments[0] != "--stdio" {
@@ -112,7 +116,8 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
         Ok(b) => b, Err(_) => return EXIT_ERROR,
     };
     let _frame_lease = match budget.try_reserve_managed(owner(), allocation(1),
-        ByteLength::new((4 * MAX_FRAME_BYTES + std::mem::size_of::<DocumentCommands>()) as u64)) {
+        ByteLength::new((4 * MAX_FRAME_BYTES + std::mem::size_of::<DocumentCommands>()
+            + std::mem::size_of::<ComparisonCommands>()) as u64)) {
         Ok(lease) => lease, Err(_) => return EXIT_ERROR,
     };
     let mut frame = Vec::new();
@@ -123,6 +128,7 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
     };
     let mut repository = RepositoryCommands::new();
     let mut documents = DocumentCommands::new();
+    let mut comparisons = ComparisonCommands::new();
     let mut aggregate = EXIT_OK;
     for request in 1..=MAX_REQUESTS {
         repository.start_request();
@@ -132,11 +138,12 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
         let mut effect = CheckpointSaveEffect::None;
         let result = read.and_then(|_| {
             let text = std::str::from_utf8(&frame).map_err(|_| Failure::Protocol("DESK_FRAME_UTF8"))?;
-            execute(&mut session, request, text, &mut canceled, &mut effect, &mut repository, &mut documents)
+            execute(&mut session, request, text, &mut canceled, &mut effect, &mut repository, &mut documents, &mut comparisons)
         });
         // Reconcile after ANY accepted navigation, including one whose response
         // encoding failed. Obsolete derived layouts never outlive a pane here.
         documents.retain_current(&session);
+        comparisons.retain_current(&session);
         let (exit, quit) = match &result {
             Ok((reply, quit)) => (reply.exit_code(), *quit),
             Err(error) => (if error.canceled() { EXIT_CANCELED } else { EXIT_ERROR }, false),
@@ -159,6 +166,7 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
             match repository.query() { Some(n) => output.integer(n)?, None => output.literal("null")? }
             repository.encode_work(&mut output)?;
             documents.encode_state(&mut output)?;
+            comparisons.encode_state(&mut output)?;
             match &result {
                 Ok((reply, _)) => { output.literal(",\"result\":")?; output.literal(reply.as_str().trim_end())?; }
                 Err(error) => {
@@ -240,7 +248,8 @@ fn raw_path(text: &str) -> Result<PathBuf, Failure> {
 }
 fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
     canceled: &mut impl FnMut() -> bool, effect: &mut CheckpointSaveEffect,
-    repository: &mut RepositoryCommands, documents: &mut DocumentCommands) -> Result<(HostResponse, bool), Failure> {
+    repository: &mut RepositoryCommands, documents: &mut DocumentCommands,
+    comparisons: &mut ComparisonCommands) -> Result<(HostResponse, bool), Failure> {
     // Fixed field array: a hostile frame cannot allocate an unbounded token vector.
     let mut fields = [""; 8]; let mut used = 0;
     for field in frame.split('\t') {
@@ -257,6 +266,9 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
     }
     if command.starts_with("doc-") {
         return Ok((documents.execute(session, expected, attempt, command, args, &mut *canceled)?, false));
+    }
+    if command.starts_with("compare-") {
+        return Ok((comparisons.execute(session, expected, attempt, command, args, &mut *canceled)?, false));
     }
     let change = match (command, args) {
         ("state" | "quit", []) => return Ok((session.state(&mut *canceled)?, command == "quit")),
@@ -307,7 +319,7 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
         ("forget", [id]) => Some(DeskCommand::ForgetBookmark(number(id)?)),
         ("back", []) => Some(DeskCommand::Back), ("forward", []) => Some(DeskCommand::Forward),
         ("escape", []) => Some(DeskCommand::Escape), ("clear-history", []) => Some(DeskCommand::ClearHistory),
-        _ => return Err(Failure::Protocol("DESK_COMMAND_SYNTAX")),
+        _ => Err(Failure::Protocol("DESK_COMMAND_SYNTAX"))?,
     };
     if let Some(change) = change { session.apply(expected, attempt, change, &mut *canceled)?; }
     Ok((session.state(&mut *canceled)?, false))
