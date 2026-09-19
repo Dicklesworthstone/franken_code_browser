@@ -281,7 +281,11 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
             self.stats.last_step_loaded_bytes = length;
             let request = CaptureRequest::new(file, revision).map_err(|_| PagedSearchError::OwnerMismatch)?;
             let mut options = StreamReadOptions::new(self.options.generation);
-            options.max_matches = self.options.max_matches - self.hits.len();
+            let remaining = self.options.max_matches.saturating_sub(self.hits.len());
+            // A full result table is not proof of another occurrence. Keep one
+            // bounded lookahead slot in later members; never append it to hits.
+            // Preserve the explicit zero-limit API's no-scan behavior.
+            options.max_matches = if self.options.max_matches == 0 { 0 } else { remaining.max(1) };
             options.max_bytes = length as u64;
             options.max_read_calls = fcb_store::paged_snapshot::MAX_SNAPSHOT_READ_CALLS;
             self.active = Some(ReaderSearch::new(Cursor::new(verified), request, ByteLength::new(length as u64),
@@ -299,13 +303,16 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
         match report.state() {
             StreamReadState::Complete | StreamReadState::Truncated => {
                 self.stats.files_searched += 1;
-                self.matches_seen += report.matches_seen();
-                for hit in report.hits() {
+                let remaining = self.options.max_matches.saturating_sub(self.hits.len());
+                self.matches_seen += report.matches_seen().min(remaining as u64 + 1);
+                for hit in report.hits().iter().take(remaining) {
                     self.hits.push(PagedHit { ordinal: verified.ordinal(), file: report.request().file(),
                         revision: report.request().revision(), generation: self.options.generation,
                         range: hit.original_range(), archive: verified.archive_digest(), source: verified.source_digest() });
                 }
-                if report.state() == StreamReadState::Truncated { self.state = PagedQueryState::Truncated; }
+                if report.state() == StreamReadState::Truncated || report.matches_seen() > remaining as u64 {
+                    self.state = PagedQueryState::Truncated;
+                }
             }
             StreamReadState::UnsupportedText => {
                 // All text results from an unsupported member are discarded,
