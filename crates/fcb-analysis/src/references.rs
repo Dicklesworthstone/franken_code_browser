@@ -93,7 +93,7 @@ impl<'source> CapturedReferences<'source> {
         if request.range().is_some() { return Err(ReferenceError::InvalidEvidence); }
         if source.len() > MAX_REFERENCE_SOURCE_BYTES { return Err(ReferenceError::SourceLimit); }
         if max_items > MAX_REFERENCE_ITEMS { return Err(ReferenceError::InvalidLimits); }
-        validate_name(name)?;
+        validate_reference_name(name)?;
         if canceled() { return Err(ReferenceError::Canceled); }
         // Covers decoder spans (including old/new Vec capacity overlap), decoded
         // text, result storage and the retained name before any owned allocation.
@@ -196,7 +196,8 @@ fn token_scalar(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '$')
         || (!c.is_ascii() && !c.is_whitespace() && !c.is_control())
 }
-fn validate_name(name: &str) -> Result<(), ReferenceError> {
+/// Validate the exact query token without reading source or allocating memory.
+pub fn validate_reference_name(name: &str) -> Result<(), ReferenceError> {
     if name.is_empty() || name.len() > MAX_REFERENCE_NAME_BYTES
         || !name.chars().all(token_scalar) || name.as_bytes()[0].is_ascii_digit() {
         return Err(ReferenceError::InvalidName);

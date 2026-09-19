@@ -127,7 +127,7 @@ mod tests {
 // Reference occurrences share the source navigation surface, but never inherit
 // the outline extractor's declaration kinds or imply compiler-proven bindings.
 pub use fcb_analysis::references::{CapturedReferences, ReferenceCandidate, ReferenceError,
-    MAX_REFERENCE_ITEMS, MAX_REFERENCE_NAME_BYTES, MAX_REFERENCE_SOURCE_BYTES};
+    MAX_REFERENCE_ITEMS, MAX_REFERENCE_NAME_BYTES, MAX_REFERENCE_SOURCE_BYTES, validate_reference_name};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ReferenceOptions {

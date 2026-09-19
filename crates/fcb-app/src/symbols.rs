@@ -2,7 +2,7 @@
 
 //! Explicit source-symbol candidate navigation, not compiler name resolution.
 //! Reuses the analysis, bounded discovery, extent capture and paged archive
-//! engines. One file and one outline reside at a time; no parser, runtime, shell,
+//! engines. One file and one candidate collection reside at a time; no parser, runtime, shell,
 //! Git, language server, source execution or remote lookup is introduced.
 
 use std::{ffi::OsString, fs, io::Write, mem::size_of, path::{Path, PathBuf}};
@@ -11,7 +11,7 @@ use fcb::source::CancelFlag;
 use fcb::search::{CaptureRequest, DetectedEncoding, ExtentConsistency, ExtentReadState,
     ExtentStepBudget, FileRangeReader, ObservedExtent, RawPath, ResourceBudget, RootId, SearchManifestId};
 use fcb::search::symbols::{CapturedSymbols, SymbolError, SymbolLanguage, SymbolNameMode,
-    MAX_SYMBOL_ITEMS, MAX_SYMBOL_SOURCE_BYTES};
+    MAX_SYMBOL_ITEMS, MAX_SYMBOL_SOURCE_BYTES, MAX_REFERENCE_SOURCE_BYTES, validate_reference_name};
 use fcb::search::paged_snapshot::{PagedMemberData, PagedSnapshot};
 use fcb::search::snapshot::SnapshotLimits;
 use fcb::search::workspace::{RootGrant, WorkspaceCatalog, WorkspaceLimits, WorkspaceStage};
@@ -22,17 +22,24 @@ use crate::args::{decimal, MAX_ARGUMENTS, MAX_ARGUMENT_BYTES, MAX_SINGLE_ARGUMEN
 use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
 use crate::{input, workspace};
 
+mod references;
+
 const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_READ_CALLS: u64 = 131_072;
 const MAX_NOTICES: usize = 64;
 const HELP: &str = "fcb symbols FILE [--name TEXT] [--match exact|prefix|contains] [--json]\n\
 fcb symbols ROOT --workspace [--name TEXT] [--json]\n\
 fcb symbols SAVED.fcbs --snapshot [--member PATH | --member-hex HEX] [--name TEXT] [--json]\n\
+Reference candidates: add --references --name IDENTIFIER to any scope above.\n\
 Options: --language rust|python|javascript|typescript|go|cpp\n\
          --encoding utf8|utf16le|utf16be --limit N --max-files N --max-bytes N\n\
          --include-excluded (workspace only)\n\
 Lists declaration candidates from bounded outline recognition, NOT compiler definitions.\n\
 Default name matching is exact and case-sensitive. Omit --name to list the outline.\n\
+--references searches exact whole tokens in all admitted text files (512 KiB/file).\n\
+Comments and string literals participate; these are NOT compiler-resolved references.\n\
+ASCII letters/digits/_/$ and conservative non-ASCII runs form reference tokens.\n\
+--match prefix/contains is incompatible with --references; --language only labels it.\n\
 No source execution, language server, network, live-root lookup for archives, or writes.\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +50,7 @@ struct Settings {
     source: Option<PathBuf>, scope: Scope, name: Option<String>, mode: SymbolNameMode,
     language: Option<SymbolLanguage>, encoding: Option<DetectedEncoding>, member: Option<RawPath>,
     limit: usize, max_files: usize, max_bytes: u64, include_excluded: bool, json: bool, help: bool,
+    references: bool,
 }
 #[derive(Debug)]
 struct Failure { code: String, canceled: bool }
@@ -76,7 +84,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
     }
     let mut settings = Settings { source: None, scope: Scope::File, name: None, mode: SymbolNameMode::Exact,
         language: None, encoding: None, member: None, limit: 100, max_files: 4096, max_bytes: 8 * 1024 * 1024,
-        include_excluded: false, json: false, help: args.is_empty() };
+        include_excluded: false, json: false, help: args.is_empty(), references: false };
     let mut seen = 0u32;
     let mut cursor = 0;
     let mut positional = false;
@@ -89,13 +97,14 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 "--json" => 1, "--workspace" | "--snapshot" => 2, "--name" => 4, "--match" => 8,
                 "--language" => 16, "--encoding" => 32, "--member" | "--member-hex" => 64,
                 "--limit" => 128, "--max-files" => 256, "--max-bytes" => 512,
-                "--include-excluded" => 1024, "--help" | "-h" => 2048,
+                "--include-excluded" => 1024, "--help" | "-h" => 2048, "--references" => 4096,
                 _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")),
             };
             if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
             seen |= bit;
             match flag {
                 "--json" => { settings.json = true; continue; }
+                "--references" => { settings.references = true; continue; }
                 "--workspace" => { settings.scope = Scope::Workspace; continue; }
                 "--snapshot" => { settings.scope = Scope::Snapshot; continue; }
                 "--include-excluded" => { settings.include_excluded = true; continue; }
@@ -141,6 +150,11 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
         || (settings.include_excluded && settings.scope != Scope::Workspace)
         || (seen & 8 != 0 && settings.name.is_none()) {
         return Err(Failure::new("CLI_INCOMPATIBLE_OPTIONS"));
+    }
+    if settings.references {
+        if settings.mode != SymbolNameMode::Exact { return Err(Failure::new("CLI_INCOMPATIBLE_OPTIONS")); }
+        let name = settings.name.as_deref().ok_or_else(|| Failure::new("REFERENCE_INVALID_NAME"))?;
+        validate_reference_name(name).map_err(|error| Failure::new(error.code()))?;
     }
     Ok(settings)
 }
@@ -192,6 +206,9 @@ pub(crate) fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl 
     exit
 }
 
+#[derive(Clone, Copy, Debug)]
+enum AnalysisRoute { Outline(SymbolLanguage), References(Option<SymbolLanguage>) }
+
 struct Notice { file: FileId, path: RawPath, code: &'static str }
 #[derive(Default)]
 struct Stats {
@@ -214,15 +231,18 @@ impl RunState {
         if self.notices.len() == MAX_NOTICES || path.len() > 16_384 { self.stats.notices_omitted += 1; return; }
         self.notices.push(Notice { file, path: RawPath::from_bytes(path), code });
     }
-    fn admit(&mut self, settings: &Settings, file: FileId, path: &[u8], size: u64) -> Option<SymbolLanguage> {
-        let Some(language) = settings.language.or_else(|| SymbolLanguage::from_path(path)) else {
-            self.stats.unsupported += 1; self.notice(file, path, "SYMBOL_UNSUPPORTED_LANGUAGE"); return None;
-        };
-        let reason = if size > MAX_SYMBOL_SOURCE_BYTES as u64 { Some("SYMBOL_SOURCE_LIMIT") }
+    fn admit(&mut self, settings: &Settings, file: FileId, path: &[u8], size: u64) -> Option<AnalysisRoute> {
+        let language = settings.language.or_else(|| SymbolLanguage::from_path(path));
+        let route = if settings.references { AnalysisRoute::References(language) }
+            else if let Some(language) = language { AnalysisRoute::Outline(language) }
+            else { self.stats.unsupported += 1; self.notice(file, path, "SYMBOL_UNSUPPORTED_LANGUAGE"); return None; };
+        let (max_source, limit_code) = if settings.references { (MAX_REFERENCE_SOURCE_BYTES, "REFERENCE_SOURCE_LIMIT") }
+            else { (MAX_SYMBOL_SOURCE_BYTES, "SYMBOL_SOURCE_LIMIT") };
+        let reason = if size > max_source as u64 { Some(limit_code) }
             else if size > settings.max_bytes.saturating_sub(self.stats.read_bytes) { Some("SYMBOL_TOTAL_SOURCE_LIMIT") }
             else if self.stats.read_calls >= MAX_READ_CALLS { Some("SYMBOL_READ_CALL_LIMIT") } else { None };
         if let Some(reason) = reason { self.stats.refused += 1; self.notice(file, path, reason); return None; }
-        Some(language)
+        Some(route)
     }
 }
 fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBudget,
@@ -237,14 +257,22 @@ fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBudget,
     if settings.json {
         out.literal("{\"schema\":")?; out.quoted(SCHEMA)?;
         out.literal(",\"status\":\"ok\",\"command\":\"symbols\",\"scope\":")?; out.quoted(settings.scope.name())?;
-        out.literal(",\"identity_scope\":\"response-local-file-and-outline\",\"evidence\":\"heuristic-outline-candidate\",\"compiler_resolved\":false,\"symbol_inventory_complete\":false,\"line_coordinates\":\"lf-delimited-decoded-lines\",\"live_roots_accessed\":")?;
+        if settings.references {
+            out.literal(",\"operation\":\"references\",\"identity_scope\":\"response-local-file-and-occurrence\",\"evidence\":\"whole-token-text-candidate\",\"compiler_resolved\":false,\"reference_inventory_complete\":false,\"token_policy\":\"conservative-unicode-whole-token-v1\",\"comments_and_literals_included\":true,\"language_policy\":\"all-admitted-text-files\",\"line_coordinates\":\"lf-delimited-decoded-lines\",\"live_roots_accessed\":")?;
+        } else {
+            out.literal(",\"identity_scope\":\"response-local-file-and-outline\",\"evidence\":\"heuristic-outline-candidate\",\"compiler_resolved\":false,\"symbol_inventory_complete\":false,\"line_coordinates\":\"lf-delimited-decoded-lines\",\"live_roots_accessed\":")?;
+        }
         out.boolean(settings.scope != Scope::Snapshot)?;
         out.literal(",\"name_query\":")?;
         match &settings.name { Some(name) => out.quoted(name)?, None => out.literal("null")? }
         out.literal(",\"name_match\":")?;
         out.quoted(match settings.mode { SymbolNameMode::Exact => "exact", SymbolNameMode::Prefix => "prefix", SymbolNameMode::Contains => "contains" })?;
         out.literal(",\"candidates\":[")?;
-    } else { out.literal("Declaration candidates only; not compiler definitions or a complete symbol inventory.\n")?; }
+    } else {
+        out.literal(if settings.references {
+            "Whole-token text candidates, including comments/literals; NOT compiler-resolved references.\n"
+        } else { "Declaration candidates only; not compiler definitions or a complete symbol inventory.\n" })?;
+    }
     let source = settings.source.as_deref().ok_or_else(|| Failure::new("CLI_MISSING_SOURCE"))?;
     let discovery_complete = match settings.scope {
         Scope::File => {
@@ -378,9 +406,14 @@ fn saved_workspace(settings: &Settings, source: &Path, state: &mut RunState, out
     Ok(archive.directory().discovery_complete())
 }
 #[allow(clippy::too_many_arguments)]
-fn analyze(settings: &Settings, request: CaptureRequest, path: &[u8], language: SymbolLanguage,
+fn analyze(settings: &Settings, request: CaptureRequest, path: &[u8], route: AnalysisRoute,
     bytes: &[u8], state: &mut RunState, out: &mut Output, budget: &ResourceBudget,
     canceled: &mut impl FnMut() -> bool) -> Result<(), Failure> {
+    let language = match route {
+        AnalysisRoute::Outline(language) => language,
+        AnalysisRoute::References(language) => return references::analyze(settings, request, path,
+            language, bytes, state, out, budget, canceled),
+    };
     let symbols = match CapturedSymbols::build(bytes, request, generation(), language, settings.encoding,
         MAX_SYMBOL_ITEMS, budget, allocation(204), &mut *canceled) {
         Ok(symbols) => symbols,
@@ -433,6 +466,10 @@ fn finish(settings: &Settings, discovery_complete: bool, state: RunState, out: &
         out.literal(",\"discovery_complete\":")?; out.boolean(discovery_complete)?;
         out.literal(",\"processing_complete\":")?; out.boolean(processing_complete)?;
         out.literal(",\"listing_truncated\":")?; out.boolean(truncated)?;
+        if settings.references {
+            out.literal(",\"text_candidates_complete\":")?; out.boolean(processing_complete && !truncated)?;
+            out.literal(",\"candidate_count_complete\":")?; out.boolean(processing_complete)?;
+        }
         out.literal(",\"stats\":{")?;
         for (i, (name, value)) in [("known_files", stats.known as u64), ("visited_files", stats.visited as u64),
             ("analyzed_files", stats.analyzed as u64), ("unsupported_language_files", stats.unsupported as u64),
@@ -457,7 +494,8 @@ fn finish(settings: &Settings, discovery_complete: bool, state: RunState, out: &
         }
         out.literal(if processing_complete && !truncated { "Candidate processing finished.\n" } else { "PARTIAL candidate processing or listing.\n" })?;
         out.literal("Matching candidates seen: ")?; out.literal(&stats.matches.to_string())?;
-        out.literal(". Absence is not proof that no compiler definition exists.\n")?;
+        out.literal(if settings.references { ". These are text candidates, not compiler bindings.\n" }
+            else { ". Absence is not proof that no compiler definition exists.\n" })?;
     }
     Ok(if !processing_complete || truncated { EXIT_PARTIAL } else if stats.matches == 0 { EXIT_NO_MATCH } else { EXIT_OK })
 }
