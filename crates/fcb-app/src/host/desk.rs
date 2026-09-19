@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 //! Persistent, source-backed reading workflow for native and headless hosts.
-//! Only open_file reads a live path. Adoption, reading, finding, copying,
+//! Only open_file reads a live source path. Explicit checkpoint operations read
+//! or create a selected saved artifact. Adoption, reading, finding, copying,
 //! pinning, bookmarks and history use the SAME retained source bytes.
 //! No runtime, clipboard write, source write or native presentation is created.
 //! All calls, including final destruction, belong on the host's worker.
@@ -68,7 +69,7 @@ struct AcceptedQuery {
 /// Semantic mutation returns a typed acceptance receipt. Encoding/delivery is
 /// separate: a failed response write cannot roll back an accepted operation.
 /// Hosts recover current state with state(), not a retry with a reused attempt.
-/// Bookmarks and history live only for this session; there is no disk restore.
+/// Checkpoint save/restore is explicit; no session is automatically persisted.
 pub struct DeskSession {
     desk: ReadingDesk,
     next_source: u64,
@@ -140,7 +141,7 @@ impl DeskSession {
     pub fn state(&mut self, mut canceled: impl FnMut() -> bool) -> Result<HostResponse, DeskSessionError> {
         check(&mut canceled)?;
         let mut out = self.output("state")?;
-        out.literal(",\"persistence\":\"session-only\",\"initial_source_bytes_read\":")?;
+        out.literal(",\"persistence\":\"explicit-checkpoint\",\"autosave\":false,\"initial_source_bytes_read\":")?;
         out.integer(self.initial_source_bytes_read)?;
         out.literal(",\"retained_sources\":")?; out.integer(self.desk.retained_source_count() as u64)?;
         out.literal(",\"retained_source_bytes\":")?; out.integer(self.desk.retained_source_bytes())?;
@@ -158,6 +159,10 @@ impl DeskSession {
             out.literal("{\"pane\":")?; out.integer(pane.id)?;
             out.literal(",\"label\":")?; out.quoted(&pane.path)?;
             out.literal(",\"pinned\":")?; out.boolean(pane.is_pinned)?;
+            out.literal(",\"position\":{\"x\":")?; out.quoted(&pane.position.0.to_string())?;
+            out.literal(",\"y\":")?; out.quoted(&pane.position.1.to_string())?;
+            out.literal("},\"size\":{\"width\":")?; out.quoted(&pane.size.0.to_string())?;
+            out.literal(",\"height\":")?; out.quoted(&pane.size.1.to_string())?; out.literal("}")?;
             location_fields(&mut out, at)?; out.literal("}")?;
         }
         out.literal("],\"history_cursor\":")?; optional(&mut out, self.desk.history_cursor().map(|i| i as u64))?;
@@ -358,3 +363,6 @@ fn location_fields(out: &mut Output, at: DeskLocation) -> Result<(), OutputError
     out.literal(",\"selection\":")?;
     match at.selection { Some(r) => out.range(r), None => out.literal("null") }
 }
+
+/// Explicit, create-only source-bearing checkpoint files and offline restore.
+pub mod persistence;
