@@ -3,6 +3,9 @@
 //! A retained OS file lock excludes cooperating writers. Checks reject static
 //! symlinks; this does not claim hostile same-user ancestor-race confinement.
 //! Sources are still read on every request: metadata does not prove freshness.
+//! Artifact publication guarantees atomic visibility, not power-loss durability.
+//! Rebuildable entries deliberately avoid per-artifact durable flushes; a lost
+//! or corrupt entry after power loss is a miss, never a change to source files.
 use std::{collections::VecDeque, fs::{self, File, OpenOptions}, io::{Read, Write},
     path::{Component, Path, PathBuf}, sync::Arc};
 use fcb::{ByteLength, document::source_highlight::canonical_language};
@@ -201,7 +204,11 @@ impl SourceCache {
         // Count before writing so failures cannot silently reset accounting.
         self.entries += 1; self.disk_bytes += encoded.len() as u64;
         file.write_all(&encoded).map_err(|_| CacheError::Io)?;
-        file.sync_all().map_err(|_| CacheError::Io)?;
+        // These are disposable derived artifacts, not authoritative user data.
+        // Close before rename for atomic reader visibility, without forcing a
+        // per-entry disk flush (F_FULLFSYNC on macOS). Power loss can discard or
+        // corrupt a cache entry; envelope validation then triggers recomputation.
+        drop(file);
         self.validate()?; regular_or_absent(&destination)?;
         fs::rename(&temporary, &destination).map_err(|_| CacheError::Io)?;
         // Publication has succeeded. Retire only this key's hot reference even

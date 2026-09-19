@@ -167,3 +167,42 @@ fn cache_objects_are_private_and_insecure_existing_root_is_not_chmodded() {
     assert!(matches!(SourceCache::open(&root, CacheLimits::default()), Err(CacheError::Root)));
     assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o755);
 }
+
+#[test]
+fn concurrent_readers_observe_complete_envelopes_during_native_republication() {
+    use std::sync::{Arc, atomic::AtomicBool};
+    use fcb::store::{EnvelopeReader, EnvelopeSchema, EnvelopeLimits, UnknownPolicy};
+    let (root, _) = fixture();
+    let key = Sha256::digest(b"publication identity");
+    let mut cache = SourceCache::open(&root, CacheLimits::default()).unwrap();
+    let first = vec![17u8; 16 * 1024];
+    let second = vec![93u8; 16 * 1024];
+    cache.put_native(key, &first).unwrap();
+    let path = root.join(format!("native-{}.bin", key.to_hex()));
+    let done = Arc::new(AtomicBool::new(false));
+    let finished = Arc::clone(&done);
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let reading = Arc::clone(&barrier);
+    let reader = std::thread::spawn(move || {
+        let mut reads = 0;
+        loop {
+            let raw = fs::read(&path).unwrap();
+            let mut envelope = EnvelopeReader::open(&raw, EnvelopeSchema::new(0x53434348, 1, 0),
+                EnvelopeLimits::default(), UnknownPolicy::Strict).unwrap();
+            assert_eq!(envelope.get_str().unwrap(), "native");
+            assert_eq!(envelope.get_bytes().unwrap(), key.as_bytes());
+            let payload = envelope.get_bytes().unwrap();
+            assert_eq!(payload.len(), 16 * 1024);
+            assert!(payload.iter().all(|b| *b == 17) || payload.iter().all(|b| *b == 93));
+            envelope.finish().unwrap();
+            reads += 1;
+            if reads == 1 { reading.wait(); continue; }
+            if finished.load(Ordering::Acquire) { break; }
+        }
+        reads
+    });
+    barrier.wait();
+    for i in 0..32 { cache.repair_native(key, if i % 2 == 0 { &second } else { &first }).unwrap(); }
+    done.store(true, Ordering::Release);
+    assert!(reader.join().unwrap() >= 2);
+}
