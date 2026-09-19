@@ -88,6 +88,23 @@ impl LineWindowScanner {
     pub const fn is_finished(&self) -> bool { self.finished }
     pub const fn reached_eof(&self) -> bool { self.eof }
 
+    /// Reuse a pending cursor for a strictly later line in the SAME immutable
+    /// byte sequence and encoding. Decoder carry and a pending CR survive.
+    /// A current/earlier line cannot be recovered without its start offset;
+    /// callers must choose an earlier checkpoint or restart from zero.
+    pub fn retarget(&self, first: LineNumber, count: u64) -> Result<Self, LineWindowError> {
+        if self.finished || self.eof || first.get() <= self.line {
+            return Err(LineWindowError::InvalidWindow);
+        }
+        let mut next = Self::new(first, count, self.encoding)?;
+        next.offset = self.offset;
+        next.line = self.line;
+        next.active_line = self.active_line;
+        next.pending_cr = self.pending_cr;
+        next.half_unit = self.half_unit;
+        Ok(next)
+    }
+
     /// With a split UTF-16 unit this can precede this step's input by one byte.
     /// A streaming consumer retains one carry byte until this offset is known.
     pub fn selected_start(&self) -> Option<ByteOffset> { self.start.map(ByteOffset::new) }
@@ -172,6 +189,46 @@ impl LineWindowScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retargeted_checkpoints_match_zero_origin_across_decoder_boundaries() {
+        let text = "\u{feff}one\r\n🦀two\rthree\nlast";
+        for encoding in [utf8(), DetectedEncoding::Utf16Le, DetectedEncoding::Utf16Be] {
+            let bytes = if encoding.is_utf16() {
+                text.encode_utf16().flat_map(|unit| if encoding == DetectedEncoding::Utf16Le {
+                    unit.to_le_bytes()
+                } else { unit.to_be_bytes() }).collect::<Vec<_>>()
+            } else { text.as_bytes().to_vec() };
+            // Every byte boundary includes split CRLF and split UTF-16 units.
+            for boundary in 0..bytes.len() {
+                let mut checkpoint = LineWindowScanner::new(LineNumber::new(99).unwrap(), 1, encoding).unwrap();
+                checkpoint.step(ByteOffset::new(0), &bytes, boundary).unwrap();
+                for first in checkpoint.lines_seen() + 1..=5 {
+                    let mut resumed = checkpoint.retarget(LineNumber::new(first).unwrap(), 2).unwrap();
+                    while !resumed.is_finished() && resumed.bytes_scanned() < bytes.len() as u64 {
+                        let at = resumed.bytes_scanned() as usize;
+                        resumed.step(ByteOffset::new(at as u64), &bytes[at..], 1).unwrap();
+                    }
+                    if !resumed.is_finished() { resumed.finish().unwrap(); }
+                    assert_eq!(resumed.status(), locate(&bytes, first, 2, encoding, 1),
+                        "encoding={encoding:?}, boundary={boundary}, first={first}");
+                }
+                if checkpoint.lines_seen() > 0 {
+                    assert!(checkpoint.retarget(LineNumber::new(checkpoint.lines_seen()).unwrap(), 1).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completed_checkpoint_cannot_be_retargeted() {
+        let mut scan = LineWindowScanner::new(LineNumber::new(1).unwrap(), 1, utf8()).unwrap();
+        scan.step(ByteOffset::new(0), b"one\nsecond", 100).unwrap();
+        assert!(scan.retarget(LineNumber::new(2).unwrap(), 1).is_err());
+        let mut eof = LineWindowScanner::new(LineNumber::new(9).unwrap(), 1, utf8()).unwrap();
+        eof.finish().unwrap();
+        assert!(eof.retarget(LineNumber::new(10).unwrap(), 1).is_err());
+    }
+
     fn utf8() -> DetectedEncoding { DetectedEncoding::Utf8 { has_bom: false } }
     fn locate(bytes: &[u8], first: u64, count: u64, encoding: DetectedEncoding, step: usize) -> LineWindowStatus {
         let mut scan = LineWindowScanner::new(LineNumber::new(first).unwrap(), count, encoding).unwrap();

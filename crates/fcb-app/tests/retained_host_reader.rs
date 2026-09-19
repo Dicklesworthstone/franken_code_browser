@@ -20,6 +20,29 @@ fn file(bytes: &[u8]) -> PathBuf {
 fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
 
 #[test]
+fn far_line_navigation_reuses_bounded_capture_checkpoints() {
+    for utf16 in [false, true] {
+        let text = "abcdef\r\n".repeat(200_000);
+        let bytes = if utf16 {
+            std::iter::once(0xfeff_u16).chain(text.encode_utf16())
+                .flat_map(u16::to_le_bytes).collect::<Vec<_>>()
+        } else { text.into_bytes() };
+        let mut reader = source(&bytes);
+        let mut cold_checks = 0;
+        let cold = reader.read_lines(190_000, 2, 100, || { cold_checks += 1; false }).unwrap();
+        let mut warm_checks = 0;
+        let warm = reader.read_lines(190_000, 2, 100, || { warm_checks += 1; false }).unwrap();
+        assert_eq!(cold.as_str(), warm.as_str(), "same captured source and coordinates");
+        assert!(cold_checks > warm_checks + 15, "cold={cold_checks}, warm={warm_checks}");
+        let backward = reader.read_lines(2, 1, 100, || false).unwrap();
+        assert!(backward.as_str().contains("abcdef\\r\\n"));
+        assert_eq!(reader.read_lines(190_001, 1, 100, || true).err(), Some(ReaderSessionError::Canceled));
+        let next = reader.read_lines(190_001, 1, 100, || false).unwrap();
+        assert!(next.as_str().contains("abcdef\\r\\n"));
+    }
+}
+
+#[test]
 fn live_replacement_cannot_change_search_context_or_exact_copy() {
     let path = file(b"before needle after\r\n");
     let mut reader = ReaderSession::open(owner(8802), &path, 4096, || false).unwrap();

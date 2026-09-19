@@ -28,6 +28,8 @@ pub const MAX_READER_WINDOW_BYTES: usize = 256 * 1024;
 pub const MAX_READER_MATCHES: usize = 4096;
 pub const MAX_READER_NEEDLE_BYTES: usize = 1024;
 pub const MAX_READER_CONTEXT_BYTES: usize = 16 * 1024;
+const LINE_SCAN_STEP: usize = 64 * 1024;
+const LINE_CHECKPOINTS: usize = MAX_HOST_TEXT_BYTES / LINE_SCAN_STEP + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReaderSessionError {
@@ -81,6 +83,9 @@ pub struct ReaderSession {
     capture: CompleteCapture,
     path: PathBuf,
     encoding: DetectedEncoding,
+    // Fixed capacity is charged by size_of::<Self> before session allocation.
+    // Checkpoints reference only this immutable capture, never a live path.
+    line_checkpoints: [Option<LineWindowScanner>; LINE_CHECKPOINTS],
     source_bytes_read: u64,
     read_calls: u64,
     file_observation: bool,
@@ -126,7 +131,8 @@ impl ReaderSession {
         let capture = CompleteCapture::new(request, ByteLength::new(bytes.len() as u64), Arc::from(bytes))?;
         let encoding = detect_encoding(&bytes[..bytes.len().min(3)]);
         check(&mut canceled)?;
-        Ok(Self { capture, path: path.to_path_buf(), encoding, source_bytes_read: 0, read_calls: 0,
+        Ok(Self { capture, path: path.to_path_buf(), encoding,
+            line_checkpoints: std::array::from_fn(|_| None), source_bytes_read: 0, read_calls: 0,
             file_observation: false, query: None, last_query_attempt: 0,
             outline: None, last_outline_attempt: 0, document: None, last_document_attempt: 0, next_allocation: 2,
             budget, _source_lease: lease })
@@ -167,16 +173,26 @@ impl ReaderSession {
 
     /// Physical CR/LF/CRLF source lines, not editor rows: empty source has no
     /// physical line and a final terminator adds no phantom row. This bounded
-    /// worker scan does not retain a per-line table or imply a native layout.
+    /// worker scan retains bounded coarse checkpoints, not a per-line table,
+    /// and does not imply a native layout.
     pub fn read_lines(&mut self, first: u64, count: u64, max_bytes: usize,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
         window_limit(max_bytes)?;
         if count == 0 || count > 1024 { return Err(ReaderSessionError::InvalidLimits); }
-        let mut scan = LineWindowScanner::new(LineNumber::new(first)?, count, self.encoding)?;
+        let first_line = LineNumber::new(first)?;
+        let mut scan = self.line_checkpoints.iter().flatten()
+            .filter(|cursor| cursor.lines_seen() < first)
+            .max_by_key(|cursor| cursor.bytes_scanned())
+            .map(|cursor| cursor.retarget(first_line, count))
+            .unwrap_or_else(|| LineWindowScanner::new(first_line, count, self.encoding))?;
         while !scan.is_finished() && scan.bytes_scanned() < self.length() {
             check(&mut canceled)?;
             let at = scan.bytes_scanned() as usize; // Bounded capture length.
-            scan.step(ByteOffset::new(at as u64), &self.capture.bytes()[at..], 64 * 1024)?;
+            scan.step(ByteOffset::new(at as u64), &self.capture.bytes()[at..], LINE_SCAN_STEP)?;
+            if !scan.is_finished() && scan.lines_seen() < first {
+                let slot = scan.bytes_scanned() as usize / LINE_SCAN_STEP;
+                self.line_checkpoints[slot] = Some(scan.clone());
+            }
         }
         check(&mut canceled)?;
         if !scan.is_finished() { scan.finish()?; }
