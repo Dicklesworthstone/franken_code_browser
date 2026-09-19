@@ -89,18 +89,21 @@ fn candidates(count: usize) -> Vec<usize> {
     cuts
 }
 
-fn estimate(width: f64, height: f64, count: usize) -> f64 {
+fn estimate(width: f64, height: f64, count: usize, area: f64) -> f64 {
     // A group can subdivide further: estimate equal-area rows instead of
     // mistaking its enclosing directory's aspect for every descendant's aspect.
     (1..=count.min(16)).map(|columns| {
         let rows = count as f64 / columns as f64;
         shape_cost(width / columns as f64, height / rows)
-    }).fold(f64::INFINITY, f64::min) * count as f64
+    }).fold(f64::INFINITY, f64::min) * area
 }
 
 fn choose(weights: &[f64], width: f64, height: f64, depth: u8) -> (f64, usize, bool) {
-    if weights.len() == 1 { return (shape_cost(width, height), 0, true); }
-    if depth == 0 { return (estimate(width, height, weights.len()), 0, true); }
+    // Minimize distortion of source area, not a vote per filename. Otherwise
+    // many tiny siblings can sacrifice a large file to an extremely thin strip.
+    // Squared log-aspect error penalizes the tail without a corpus-specific cap.
+    if weights.len() == 1 { return (weights[0] * shape_cost(width, height), 0, true); }
+    if depth == 0 { return (estimate(width, height, weights.len(), weights.iter().sum()), 0, true); }
     // Local prefix/suffix sums avoid subtracting a tiny tail from a huge total.
     let mut prefix = vec![0.0; weights.len() + 1];
     let mut suffix = vec![0.0; weights.len() + 1];

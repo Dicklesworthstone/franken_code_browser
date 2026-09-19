@@ -185,3 +185,51 @@ fn alternating_weight_hierarchy_preserves_full_area_and_directory_unions() {
         assert_eq!(rects, pack_text_parcels(&reversed, aspect).unwrap().into_iter().rev().collect::<Vec<_>>());
     }
 }
+
+#[test]
+fn unequal_source_areas_choose_minimum_area_weighted_golden_distortion() {
+    // Exhaust all ordered guillotine layouts for three leaves independently of
+    // production's bounded lookahead and candidate-cut implementation.
+    fn layouts(weights: &[f64], width: f64, height: f64) -> Vec<Vec<(f64, f64)>> {
+        if weights.len() == 1 { return vec![vec![(width, height)]]; }
+        let total: f64 = weights.iter().sum();
+        let mut result = Vec::new();
+        for cut in 1..weights.len() {
+            let fraction = weights[..cut].iter().sum::<f64>() / total;
+            for vertical in [false, true] {
+                let (aw, ah, bw, bh) = if vertical {
+                    (width * fraction, height, width * (1.0 - fraction), height)
+                } else { (width, height * fraction, width, height * (1.0 - fraction)) };
+                for a in layouts(&weights[..cut], aw, ah) {
+                    for b in layouts(&weights[cut..], bw, bh) {
+                        let mut combined = a.clone(); combined.extend(b); result.push(combined);
+                    }
+                }
+            }
+        }
+        result
+    }
+    fn cost(shapes: &[(f64, f64)], weights: &[f64]) -> f64 {
+        let phi = (1.0 + 5.0_f64.sqrt()) / 2.0;
+        shapes.iter().zip(weights).map(|(&(w, h), area)| {
+            let ratio = w.max(h) / w.min(h);
+            area * (ratio / phi).ln().powi(2)
+        }).sum()
+    }
+    let mut exposes_equal_vote_regression = false;
+    for weights in [[1.0, 7.0, 1000.0], [1000.0, 1.0, 7.0], [7.0, 1000.0, 1.0], [1.0, 10.0, 100.0]] {
+        for aspect in [0.25, 0.7, 1.0, 1.9, 4.0] {
+            let total: f64 = weights.iter().sum();
+            let width = (total * aspect).sqrt();
+            let options = layouts(&weights, width, total / width);
+            let optimum = options.iter().map(|s| cost(s, &weights)).fold(f64::INFINITY, f64::min);
+            let equal_vote = options.iter().min_by(|a, b| cost(a, &[1.0; 3]).total_cmp(&cost(b, &[1.0; 3]))).unwrap();
+            exposes_equal_vote_regression |= cost(equal_vote, &weights) > optimum * 1.01;
+            let inputs = [file(b"a", weights[0]), file(b"b", weights[1]), file(b"c", weights[2])];
+            let rectangles = check_partition(&inputs, aspect, 1e-10);
+            let shapes: Vec<_> = rectangles.iter().map(|r| (r.size().width(), r.size().height())).collect();
+            close(cost(&shapes, &weights), optimum, 1e-10);
+        }
+    }
+    assert!(exposes_equal_vote_regression, "fixture must distinguish area weighting from the original one-file-one-vote objective");
+}
