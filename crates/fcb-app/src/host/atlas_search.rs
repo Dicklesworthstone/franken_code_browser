@@ -298,7 +298,9 @@ impl RetainedAtlasSearch {
         let info = reader.info(&mut stop)?;
         let start = hit.original_range.start().get().saturating_sub(132);
         let end = hit.original_range.end().get().saturating_add(132).min(source.bytes().len() as u64);
-        let window = reader.read_window(start, (end - start) as usize, &mut stop)?;
+        // The decoder's minimum allowance is four bytes, not a minimum source
+        // length. read_window clips to the actual capture without padding it.
+        let window = reader.read_window(start, ((end - start) as usize).max(4), &mut stop)?;
         out.literal(",\"query_generation\":")?; out.integer(generation)?;
         out.literal(",\"search_in_progress\":")?; out.boolean(snapshot.stop_reason.is_none())?;
         if let Some(usage) = snapshot.index_usage { usage.encode(&mut out)?; }

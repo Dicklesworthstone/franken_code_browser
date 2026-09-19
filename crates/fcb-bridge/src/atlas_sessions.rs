@@ -15,6 +15,9 @@ use super::reader_sessions::{self, ReaderSessions};
 #[path = "atlas_path_sessions.rs"]
 mod paths;
 pub(super) use paths::PathCommand;
+#[path = "atlas_index_sessions.rs"]
+mod index;
+pub(super) use index::IndexCommand;
 
 pub(super) const MAX_ATLAS_SESSIONS: usize = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -67,7 +67,8 @@ pub extern "C" fn fcb_atlas_search_overlay(handle: u64, generation: u64) -> *mut
     reply(|| answer(handle, |atlases| atlases.execute(handle, Command::SearchOverlay { generation }, || false)))
 }
 /// Release finished and pending query captures on a worker. Independently opened
-/// readers retain their bytes. This consumes a fresh query generation.
+/// readers and an explicitly prepared reusable index retain their own bytes.
+/// This consumes a fresh query generation.
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_atlas_search_clear(handle: u64, generation: u64) -> *mut c_char {
     reply(|| answer(handle, |atlases| atlases.execute(handle, Command::SearchClear { generation }, || false)))
@@ -90,6 +91,9 @@ pub extern "C" fn fcb_atlas_search_open_reader(handle: u64, reader: u64, generat
         atlases.open_search_reader(handle, readers, reader, generation, hit, || false)
     }))
 }
+
+#[path = "atlas_index_ffi.rs"]
+mod index;
 
 #[cfg(all(test, unix))]
 #[path = "atlas_search_ffi_tests.rs"]
