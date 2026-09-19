@@ -375,3 +375,6 @@ pub mod repository;
 
 /// Source-linked Markdown preview and split reading on retained desk panes.
 pub mod document;
+
+/// Exact bounded comparison of two retained panes and source-range navigation.
+pub mod comparison;
