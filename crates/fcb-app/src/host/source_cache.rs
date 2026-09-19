@@ -52,6 +52,7 @@ impl SourceCache {
             || limits.ram_bytes > MAX_RAM_BYTES || limits.disk_bytes > MAX_DISK_BYTES
             || limits.entries == 0 || limits.entries > MAX_ENTRIES { return Err(CacheError::Limit); }
         ensure_directories(root)?;
+        require_private(&fs::symlink_metadata(root).map_err(|_| CacheError::Root)?)?;
         let root = fs::canonicalize(root).map_err(|_| CacheError::Root)?;
         let marker = format!("{MARKER}\n{}\n", root.to_str().ok_or(CacheError::Root)?).into_bytes();
         let marker_path = root.join("owner");
@@ -61,7 +62,7 @@ impl SourceCache {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if fs::read_dir(&root).map_err(|_| CacheError::Root)?.next().is_some() { return Err(CacheError::Root); }
-                let mut file = OpenOptions::new().write(true).create_new(true).open(&marker_path).map_err(|_| CacheError::Root)?;
+                let mut file = private_options().write(true).create_new(true).open(&marker_path).map_err(|_| CacheError::Root)?;
                 file.write_all(&marker).map_err(|_| CacheError::Io)?;
                 file.sync_all().map_err(|_| CacheError::Io)?;
             }
@@ -69,7 +70,7 @@ impl SourceCache {
         }
         let lock_path = root.join("lock");
         regular_or_absent(&lock_path)?;
-        let lock = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(lock_path).map_err(|_| CacheError::Root)?;
+        let lock = private_options().read(true).write(true).create(true).truncate(false).open(lock_path).map_err(|_| CacheError::Root)?;
         lock.try_lock().map_err(|_| CacheError::Busy)?;
         let budget = ResourceBudget::new(owner(), ByteLength::new(512 * 1024 * 1024)).map_err(|_| CacheError::Admission)?;
         // Retained hot bytes plus bounded encoder/read/response overlap. The
@@ -128,6 +129,7 @@ impl SourceCache {
     }
     fn validate(&self) -> Result<(), CacheError> {
         let meta = fs::symlink_metadata(&self.root).map_err(|_| CacheError::Root)?;
+        require_private(&meta)?;
         if !meta.is_dir() || meta.file_type().is_symlink()
             || bounded_read(&self.root.join("owner"), 32 * 1024)? != self.marker { return Err(CacheError::Root); }
         Ok(())
@@ -195,7 +197,7 @@ impl SourceCache {
         regular_or_absent(&destination)?;
         self.next_temp = self.next_temp.checked_add(1).ok_or(CacheError::Limit)?;
         let temporary = self.root.join(format!("pending-{}-{}", std::process::id(), self.next_temp));
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary).map_err(|_| CacheError::Io)?;
+        let mut file = private_options().write(true).create_new(true).open(&temporary).map_err(|_| CacheError::Io)?;
         // Count before writing so failures cannot silently reset accounting.
         self.entries += 1; self.disk_bytes += encoded.len() as u64;
         file.write_all(&encoded).map_err(|_| CacheError::Io)?;
@@ -223,7 +225,7 @@ fn decode(raw: &[u8], domain: &str, key: Sha256Digest, limit: usize) -> Result<V
 }
 fn regular_or_absent(path: &Path) -> Result<(), CacheError> {
     match fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => Ok(()),
+        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => require_private(&meta),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         _ => Err(CacheError::Root),
     }
@@ -243,9 +245,29 @@ fn ensure_directories(root: &Path) -> Result<(), CacheError> {
         match component { Component::RootDir | Component::Normal(_) => current.push(component.as_os_str()), _ => return Err(CacheError::Root) }
         match fs::symlink_metadata(&current) {
             Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {},
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&current).map_err(|_| CacheError::Root)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut builder = fs::DirBuilder::new();
+                #[cfg(unix)] { use std::os::unix::fs::DirBuilderExt; builder.mode(0o700); }
+                builder.create(&current).map_err(|_| CacheError::Root)?;
+            },
             _ => return Err(CacheError::Root),
         }
     }
+    Ok(())
+}
+
+// Newly created cache objects are private even under a permissive process
+// umask. Existing caller-owned ancestors are neither chmodded nor adopted.
+fn private_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+    options
+}
+fn require_private(meta: &fs::Metadata) -> Result<(), CacheError> {
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o077 != 0 { return Err(CacheError::Root); }
+    }
+    #[cfg(not(unix))] let _ = meta;
     Ok(())
 }

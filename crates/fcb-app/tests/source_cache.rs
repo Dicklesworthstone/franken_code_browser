@@ -147,3 +147,23 @@ fn failed_repair_admission_leaves_incumbent_intact() {
     let mut disk = SourceCache::open(&root, CacheLimits::default()).unwrap();
     assert_eq!(disk.get_native(key).unwrap().unwrap().as_ref(), b"old");
 }
+
+#[cfg(unix)]
+#[test]
+fn cache_objects_are_private_and_insecure_existing_root_is_not_chmodded() {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, source) = fixture();
+    let parent = root.parent().unwrap();
+    let parent_mode = fs::metadata(parent).unwrap().permissions().mode();
+    let mut cache = SourceCache::open(&root, CacheLimits::default()).unwrap();
+    cache.source(&source, || false).unwrap();
+    assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
+    for entry in fs::read_dir(&root).unwrap() {
+        assert_eq!(entry.unwrap().metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    assert_eq!(fs::metadata(parent).unwrap().permissions().mode(), parent_mode);
+    drop(cache);
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(matches!(SourceCache::open(&root, CacheLimits::default()), Err(CacheError::Root)));
+    assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o755);
+}
