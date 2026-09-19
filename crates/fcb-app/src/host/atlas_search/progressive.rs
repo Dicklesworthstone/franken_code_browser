@@ -12,13 +12,13 @@ use fcb::search::{CaptureRequest, QueryGeneration, ReaderSearch, StreamReadOptio
     StreamReadState, StreamReadStep, StreamingNeedle};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AtlasSearchStop { AllFilesExamined, FileLimit, SourceByteLimit, MatchLimit }
+pub enum AtlasSearchStop { AllFilesExamined, FileLimit, SourceByteLimit, MatchLimit, VerificationByteLimit }
 impl AtlasSearchStop {
     pub const fn code(self) -> &'static str {
         match self {
             Self::AllFilesExamined => "all-files-examined",
             Self::FileLimit => "file-limit", Self::SourceByteLimit => "source-byte-limit",
-            Self::MatchLimit => "match-limit",
+            Self::MatchLimit => "match-limit", Self::VerificationByteLimit => "verification-byte-limit",
         }
     }
 }
@@ -140,7 +140,7 @@ impl RetainedAtlasSearch {
             examined: 0, scanned: 0, unavailable: 0, pending: atlas.atlas().catalog().entries().len(),
             matches_seen: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0,
             truncated: false, complete: false, stop_reason: None, step_count: 0,
-            last_step_files: 0, last_step_bytes: 0, last_step_calls: 0, _lease: lease };
+            last_step_files: 0, last_step_bytes: 0, last_step_calls: 0, index_usage: None, _lease: lease };
         let pattern = StreamingNeedle::text(self.manifest.owner(), needle, &self.budget, pattern_id)
             .map_err(AppError::from)?;
         self.validate(atlas)?; check(canceled)?;

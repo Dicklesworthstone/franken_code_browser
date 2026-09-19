@@ -4,18 +4,22 @@
 //! worker work over its frozen catalog, not a camera callback or a new walk.
 //! The existing capture and exact-text engines own I/O, decoding and matching.
 //! Matching files remain captured until successful replacement or explicit clear;
-//! result activation never reopens a live path. Both synchronous and resumable
-//! queries use the same bounded direct-scan pipeline. Neither is a persistent
-//! index or an atomic cross-file filesystem snapshot.
+//! result activation never reopens a live path. Synchronous and resumable live
+//! queries share a direct-scan pipeline. Explicitly prepared ephemeral indexes
+//! instead reuse captured sources across queries. Neither is a persistent index
+//! or an atomic cross-file filesystem snapshot.
 
 mod progressive;
 pub use progressive::{AtlasSearchProgress, AtlasSearchStop};
 use progressive::SearchWork;
+mod indexed;
+pub use indexed::{AtlasIndexOptions, MAX_ATLAS_INDEX_GRAMS};
+use indexed::{IndexQueryUsage, RetainedIndex};
 
 use std::{mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, ByteRange, FileId, SourceRevision};
 use fcb::map::{AtlasNodeId, LayoutRevision};
-use fcb::search::{CompleteCapture, ResourceAllocationId, ResourceBudget, SearchManifestId};
+use fcb::search::{CompleteCapture, IndexError, ResourceAllocationId, ResourceBudget, SearchManifestId};
 use fcb_core::ResourceLease;
 use fcb::search::workspace::RootGrant;
 use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES};
@@ -58,15 +62,15 @@ impl AtlasSearchOptions {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AtlasSearchError {
-    App(AppError), Atlas(AtlasSessionError), Reader(ReaderSessionError),
+    App(AppError), Atlas(AtlasSessionError), Reader(ReaderSessionError), Index(IndexError),
     InvalidLimits, WrongAtlas, StaleQuery, MissingQuery, MissingHit, Canceled,
-    IdentityExhausted,
+    IdentityExhausted, MissingIndex, StaleIndex,
 }
 impl std::fmt::Display for AtlasSearchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::App(e) => write!(f, "{e}"), Self::Atlas(e) => write!(f, "{e}"),
-            Self::Reader(e) => write!(f, "{e}"),
+            Self::Reader(e) => write!(f, "{e}"), Self::Index(e) => write!(f, "{e}"),
             other => f.write_str(match other {
                 Self::InvalidLimits => "ATLAS_SEARCH_INVALID_LIMITS",
                 Self::WrongAtlas => "ATLAS_SEARCH_WRONG_ATLAS",
@@ -75,6 +79,8 @@ impl std::fmt::Display for AtlasSearchError {
                 Self::MissingHit => "ATLAS_SEARCH_NO_HIT",
                 Self::Canceled => "ATLAS_SEARCH_CANCELED",
                 Self::IdentityExhausted => "ATLAS_SEARCH_IDENTITY_EXHAUSTED",
+                Self::MissingIndex => "ATLAS_SEARCH_NO_INDEX",
+                Self::StaleIndex => "ATLAS_SEARCH_STALE_INDEX",
                 _ => unreachable!(),
             }),
         }
@@ -120,6 +126,7 @@ struct Snapshot {
     last_step_files: usize,
     last_step_bytes: u64,
     last_step_calls: u64,
+    index_usage: Option<IndexQueryUsage>,
     _lease: ResourceLease,
 }
 impl Snapshot {
@@ -134,7 +141,8 @@ impl Snapshot {
 /// One atlas, one finished query and at most one resumable replacement. A host
 /// can page/open the running query's exact captured hits, or keep displaying the
 /// finished query until replacement succeeds. Canceling/failing a replacement
-/// retires its progress, not the finished query. No thread or runtime is created.
+/// retires its progress, not the finished query. A separately prepared index
+/// retains its complete captured membership for subsequent explicit queries.
 /// Source work and destruction belong on a worker, including cancel_pending.
 /// Managed reservations do not account for unrelated host/native allocations.
 pub struct RetainedAtlasSearch {
@@ -145,6 +153,7 @@ pub struct RetainedAtlasSearch {
     next_allocation: u64,
     accepted: Option<Snapshot>,
     pending: Option<SearchWork>,
+    index: Option<RetainedIndex>,
     budget: ResourceBudget,
     _metadata_lease: ResourceLease,
 }
@@ -160,7 +169,7 @@ impl RetainedAtlasSearch {
             ByteLength::new((2 * grant.root_path().len() + size_of::<Self>()) as u64))
             .map_err(|_| AppError::Admission)?;
         Ok(Self { manifest, grant: grant.clone(), layout: atlas.atlas().layout().revision(), last_attempt: 0,
-            next_allocation: 100, accepted: None, pending: None, budget, _metadata_lease: metadata_lease })
+            next_allocation: 100, accepted: None, pending: None, index: None, budget, _metadata_lease: metadata_lease })
     }
     pub fn accepted_generation(&self) -> Option<u64> { self.accepted.as_ref().map(|q| q.generation) }
     /// Bytes retained by the finished query. Pending progress is reported by progress().
@@ -249,6 +258,7 @@ impl RetainedAtlasSearch {
         self.finish(atlas, out, partial, &mut canceled)
     }
 
+    /// Clear results, not the explicitly prepared reusable index.
     pub fn clear(&mut self, atlas: &AtlasSession, generation: u64,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         self.validate(atlas)?; self.attempt(generation)?; check(&mut canceled)?;
@@ -291,6 +301,7 @@ impl RetainedAtlasSearch {
         let window = reader.read_window(start, (end - start) as usize, &mut stop)?;
         out.literal(",\"query_generation\":")?; out.integer(generation)?;
         out.literal(",\"search_in_progress\":")?; out.boolean(snapshot.stop_reason.is_none())?;
+        if let Some(usage) = snapshot.index_usage { usage.encode(&mut out)?; }
         out.literal(",\"hit_id\":")?; out.integer(hit.id)?;
         encode_hit(&mut out, atlas, hit)?;
         out.literal(",\"source_observation\":\"retained-search-capture\",\"source_reopened\":false,\"reader_owner\":")?;
@@ -331,6 +342,9 @@ impl RetainedAtlasSearch {
 fn summary(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot) -> Result<(), AtlasSearchError> {
     out.literal(",\"query_generation\":")?; out.integer(snapshot.generation)?;
     out.literal(",\"needle\":")?; out.quoted(&snapshot.needle)?;
+    out.literal(",\"search_strategy\":")?;
+    out.quoted(if snapshot.index_usage.is_some() { "retained-ephemeral-index" } else { "live-capture-scan" })?;
+    if let Some(usage) = snapshot.index_usage { usage.encode(out)?; }
     out.literal(",\"mode\":\"exact-decoded-literal\",\"source_observation\":\"per-file-captures-not-atomic-workspace\",\"discovery_complete\":")?;
     out.boolean(atlas.atlas().discovery_complete())?;
     out.literal(",\"search_in_progress\":")?; out.boolean(snapshot.stop_reason.is_none())?;
