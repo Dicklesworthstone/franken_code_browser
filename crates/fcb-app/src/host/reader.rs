@@ -2,15 +2,19 @@
 
 //! A retained native-host reading session over ONE immutable source capture.
 //! Only `open` performs filesystem I/O. Windows, physical-line navigation,
-//! literal search and exact copies subsequently consume the same retained bytes.
+//! literal search, structural candidates and exact copies use retained bytes.
 //! No self-referential index, new matcher, decoder, runtime or native UI exists
 //! here. Calls are bounded synchronous worker operations, not redraw callbacks.
+
+mod outline;
+pub use outline::{ReaderOutlineOptions, MAX_READER_SYMBOL_PAGE, MAX_READER_SYMBOL_QUERY_BYTES};
+use outline::{AcceptedOutline, SelectionIdentity};
 
 use std::{mem::size_of, path::{Path, PathBuf}, sync::Arc};
 use fcb::{ArenaOwnerId, BrowserSession, ByteLength, ByteOffset, ByteRange, FileId, SourceRevision};
 use fcb::search::{CaptureRequest, CompleteCapture, DetectedEncoding, ExtentViewError,
     ObservedExtent, QueryGeneration, ReaderSearch, ResourceAllocationId, ResourceBudget,
-    StreamReadError, StreamReadOptions, StreamReadState, StreamReadStep, StreamingHit, StreamingNeedle};
+    StreamReadError, StreamReadOptions, StreamReadState, StreamReadStep, StreamingHit, StreamingNeedle, SymbolError};
 use fcb::source::{SourceError, detect_encoding};
 use fcb::source::line_index::{LineNumber, LineWindowError, LineWindowScanner, LineWindowStatus};
 use fcb_core::ResourceLease;
@@ -28,6 +32,7 @@ pub enum ReaderSessionError {
     Host(HostError), App(AppError), Source(SourceError), Stream(StreamReadError),
     View(ExtentViewError), Lines(LineWindowError), InvalidLimits, InvalidRange,
     StaleQuery, MissingHit, MissingLine, Canceled, IdentityExhausted,
+    Symbol(SymbolError), MissingOutline, UnsupportedOutlineLanguage,
 }
 impl std::fmt::Display for ReaderSessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -35,6 +40,9 @@ impl std::fmt::Display for ReaderSessionError {
             Self::Host(e) => write!(f, "{e}"), Self::App(e) => write!(f, "{e}"),
             Self::Source(e) => write!(f, "{e}"), Self::Stream(e) => write!(f, "{e}"),
             Self::View(e) => write!(f, "{e}"), Self::Lines(e) => write!(f, "{e}"),
+            Self::Symbol(e) => write!(f, "{e}"),
+            Self::MissingOutline => f.write_str("READER_SESSION_NO_OUTLINE"),
+            Self::UnsupportedOutlineLanguage => f.write_str("READER_SESSION_OUTLINE_LANGUAGE_UNSUPPORTED"),
             Self::InvalidLimits => f.write_str("READER_SESSION_INVALID_LIMITS"),
             Self::InvalidRange => f.write_str("READER_SESSION_INVALID_RANGE"),
             Self::StaleQuery => f.write_str("READER_SESSION_STALE_QUERY"),
@@ -52,6 +60,7 @@ impl From<SourceError> for ReaderSessionError { fn from(e: SourceError) -> Self 
 impl From<StreamReadError> for ReaderSessionError { fn from(e: StreamReadError) -> Self { Self::Stream(e) } }
 impl From<ExtentViewError> for ReaderSessionError { fn from(e: ExtentViewError) -> Self { Self::View(e) } }
 impl From<LineWindowError> for ReaderSessionError { fn from(e: LineWindowError) -> Self { Self::Lines(e) } }
+impl From<SymbolError> for ReaderSessionError { fn from(e: SymbolError) -> Self { Self::Symbol(e) } }
 impl From<OutputError> for ReaderSessionError { fn from(e: OutputError) -> Self { Self::App(e.into()) } }
 
 struct AcceptedQuery {
@@ -73,6 +82,8 @@ pub struct ReaderSession {
     file_observation: bool,
     query: Option<AcceptedQuery>,
     last_query_attempt: u64,
+    outline: Option<AcceptedOutline>,
+    last_outline_attempt: u64,
     next_allocation: u64,
     budget: ResourceBudget,
     _source_lease: ResourceLease,
@@ -110,7 +121,8 @@ impl ReaderSession {
         let encoding = detect_encoding(&bytes[..bytes.len().min(3)]);
         check(&mut canceled)?;
         Ok(Self { capture, path: path.to_path_buf(), encoding, source_bytes_read: 0, read_calls: 0,
-            file_observation: false, query: None, last_query_attempt: 0, next_allocation: 2,
+            file_observation: false, query: None, last_query_attempt: 0,
+            outline: None, last_outline_attempt: 0, next_allocation: 2,
             budget, _source_lease: lease })
     }
     pub fn capture(&self) -> &CompleteCapture { &self.capture }
@@ -129,6 +141,8 @@ impl ReaderSession {
         out.literal(",\"initial_read_calls\":")?; out.integer(self.read_calls)?;
         out.literal(",\"accepted_query_generation\":")?;
         if let Some(generation) = self.accepted_generation() { out.integer(generation)?; } else { out.literal("null")?; }
+        out.literal(",\"accepted_outline_generation\":")?;
+        if let Some(generation) = self.outline_generation() { out.integer(generation)?; } else { out.literal("null")?; }
         out.literal("}\n")?;
         self.finish_output(out, EXIT_OK, &mut canceled)
     }
@@ -233,12 +247,12 @@ impl ReaderSession {
         // Padding keeps the entire scalar/CRLF match inside the decoded window.
         let requested = range(selected.start().get().saturating_sub(context as u64 + 4),
             selected.end().get().saturating_add(context as u64 + 4).min(self.length()))?;
-        self.window("hit", requested, MAX_READER_WINDOW_BYTES, Some((generation, selected)), None, &mut canceled)
+        self.window("hit", requested, MAX_READER_WINDOW_BYTES, Some((SelectionIdentity::Search(generation), selected)), None, &mut canceled)
     }
     pub fn copy_hit(&mut self, generation: u64, position: usize, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, ReaderSessionError> {
         let selected = self.hit_range(generation, position)?;
-        self.copy("copy-hit", selected, Some(generation), &mut canceled)
+        self.copy("copy-hit", selected, Some(SelectionIdentity::Search(generation)), &mut canceled)
     }
     /// Exact raw-byte export data, NOT a clipboard write. Non-scalar selections,
     /// NUL and malformed bytes remain representable as original hex. Oversized
@@ -247,15 +261,15 @@ impl ReaderSession {
         -> Result<HostResponse, ReaderSessionError> {
         self.copy("copy-range", range(start, end)?, None, &mut canceled)
     }
-    fn copy(&mut self, command: &str, selected: ByteRange, generation: Option<u64>,
+    fn copy(&mut self, command: &str, selected: ByteRange, identity: Option<SelectionIdentity>,
         canceled: &mut impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
         check(canceled)?;
         if selected.end().get() > self.length() || selected.len().get() > MAX_READER_WINDOW_BYTES as u64 {
             return Err(ReaderSessionError::InvalidRange);
         }
         let mut out = self.output(command)?;
-        out.literal(",\"query_generation\":")?;
-        if let Some(generation) = generation { out.integer(generation)?; } else { out.literal("null")?; }
+        out.literal(",")?;
+        if let Some(identity) = identity { identity.encode(&mut out)?; } else { out.literal("\"query_generation\":null")?; }
         out.literal(",\"copy_domain\":\"original-bytes\",\"original_range\":")?; out.range(selected)?;
         out.literal(",\"original_hex\":")?;
         out.hex(&self.capture.bytes()[selected.start().get() as usize..selected.end().get() as usize])?;
@@ -263,7 +277,7 @@ impl ReaderSession {
         self.finish_output(out, EXIT_OK, canceled)
     }
     fn window(&mut self, command: &str, requested: ByteRange, max_bytes: usize,
-        selected: Option<(u64, ByteRange)>, first_line: Option<u64>, canceled: &mut impl FnMut() -> bool)
+        selected: Option<(SelectionIdentity, ByteRange)>, first_line: Option<u64>, canceled: &mut impl FnMut() -> bool)
         -> Result<HostResponse, ReaderSessionError> {
         check(canceled)?;
         let [extent_id, decode_id] = self.allocations()?;
@@ -293,14 +307,14 @@ impl ReaderSession {
         out.literal(",\"next_offset\":")?;
         if let Some(offset) = text.next_offset() { out.integer(offset.get())?; } else { out.literal("null")?; }
         out.literal(",\"selection\":")?;
-        if let Some((generation, range)) = selected {
+        if let Some((identity, range)) = selected {
             let decoded = text.source_to_text(range)?;
             let resolved = text.text_selection(decoded)?;
             let original = &self.capture.bytes()[range.start().get() as usize..range.end().get() as usize];
             if resolved.original_range != range || resolved.original_bytes != original {
                 return Err(ReaderSessionError::InvalidRange);
             }
-            out.literal("{\"query_generation\":")?; out.integer(generation)?;
+            out.literal("{")?; identity.encode(&mut out)?;
             out.literal(",\"original_range\":")?; out.range(range)?;
             out.literal(",\"window_utf8_range\":{\"start\":")?; out.integer(decoded.start().get())?;
             out.literal(",\"end\":")?; out.integer(decoded.end().get())?;

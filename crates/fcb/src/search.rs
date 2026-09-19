@@ -28,6 +28,9 @@ pub mod file_search;
 /// Bounded outline candidates and exact retained-source activation.
 #[cfg(feature = "analysis")]
 pub mod symbols;
+#[cfg(feature = "analysis")]
+pub use symbols::{CapturedSymbols, SymbolCandidate, SymbolError, SymbolLanguage,
+    SymbolNameMode, MAX_SYMBOL_ITEMS, MAX_SYMBOL_SOURCE_BYTES};
 /// Explicit source snapshot exports and offline restoration; no implicit I/O.
 #[cfg(feature = "snapshot")]
 pub mod snapshot;
