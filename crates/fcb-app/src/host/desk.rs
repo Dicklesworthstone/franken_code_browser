@@ -378,3 +378,6 @@ pub mod document;
 
 /// Exact bounded comparison of two retained panes and source-range navigation.
 pub mod comparison;
+
+/// Declaration outlines and reference-candidate navigation on exact desk sources.
+pub mod code;
