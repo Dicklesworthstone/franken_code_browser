@@ -430,3 +430,6 @@ fn copy_text(text: &str) -> Result<String, SavedRepositoryError> {
     if copy.capacity() > text.len() { return Err(AppError::Admission.into()); }
     copy.push_str(text); Ok(copy)
 }
+
+/// Verified saved members and search hits transferred into persistent readers.
+pub mod desk;
