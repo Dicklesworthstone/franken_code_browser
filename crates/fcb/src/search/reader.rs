@@ -333,3 +333,6 @@ pub(super) fn read_unit(bytes: &[u8], encoding: DetectedEncoding, offset: usize)
         _ => u16::from(bytes[offset]),
     }
 }
+
+/// Owned sparse indexing and far-jump continuations using this same reader.
+pub mod retained;
