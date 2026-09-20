@@ -3,7 +3,8 @@
 mod support;
 use support::{parse, Json};
 use fcb::{ArenaOwnerId, ByteOffset, ByteRange, FileId, SourceCapture, SourceRevision};
-use fcb::search::{ResourceAllocationId, SymbolError, ReferenceError, MAX_SYMBOL_SOURCE_BYTES};
+use fcb::search::{ResourceAllocationId, SymbolError, MAX_SYMBOL_SOURCE_BYTES};
+use fcb::search::symbols::ReferenceError;
 use fcb_app::{EXIT_OK, EXIT_PARTIAL};
 use fcb_app::host::{HostResponse, desk::{DeskSession, DeskLimits, DeskCommand, DeskPaneId,
     code::{DeskOutline, DeskOutlineOptions, DeskReferences, DeskCodeError, SymbolNameMode, SymbolLanguage},
@@ -20,7 +21,8 @@ fn apply(d: &mut DeskSession, command: DeskCommand) {
     d.apply(d.model().revision(), d.model().last_attempt() + 1, command, || false).unwrap();
 }
 fn outline(d: &mut DeskSession, pane: DeskPaneId, generation: u64) -> DeskOutline {
-    DeskOutline::prepare(d, d.model().revision(), pane, generation, Default::default(), || false).unwrap()
+    let expected = d.model().revision();
+    DeskOutline::prepare(d, expected, pane, generation, Default::default(), || false).unwrap()
 }
 fn symbol(o: &DeskOutline, d: &DeskSession, name: &str) -> u64 {
     o.candidates(d, d.model().revision(), o.generation()).unwrap().iter().find(|s| s.name() == name).unwrap().id()
@@ -85,9 +87,9 @@ fn capped_outline_filter_never_reports_exhaustive_absence() {
 #[test]
 fn reference_caps_distinguish_exact_count_lookahead_and_zero_limit() {
     let mut d = session(); let p = adopt(&mut d, 1, 1, "text", b"foo foobar foo");
-    for (gen, cap, complete, retained, counted) in [(1, 2, true, 2, 2), (2, 1, false, 1, 2), (3, 0, false, 0, 1)] {
-        let r = DeskReferences::prepare(&mut d, 1, p, gen, "foo", cap, || false).unwrap();
-        let out = r.page(&mut d, 1, gen, 0, 10, || false).unwrap(); let j = json(&out);
+    for (generation, cap, complete, retained, counted) in [(1, 2, true, 2, 2), (2, 1, false, 1, 2), (3, 0, false, 0, 1)] {
+        let r = DeskReferences::prepare(&mut d, 1, p, generation, "foo", cap, || false).unwrap();
+        let out = r.page(&mut d, 1, generation, 0, 10, || false).unwrap(); let j = json(&out);
         assert_eq!(j.get("search_complete").flag(), complete); assert_eq!(j.get("count_complete").flag(), complete);
         assert_eq!(j.get("retained_references").number(), retained); assert_eq!(j.get("matches_counted").number(), counted);
         assert_eq!(out.exit_code(), if complete { EXIT_OK } else { EXIT_PARTIAL });

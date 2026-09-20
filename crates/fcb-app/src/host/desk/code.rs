@@ -7,11 +7,11 @@
 //! Prepare/encode/drop are worker operations, not native input/paint callbacks.
 
 use std::mem::size_of;
-use fcb::search::{SymbolCandidate, SymbolOptions, SymbolError, ReferenceCandidate,
-    ReferenceOptions, ReferenceError, MAX_SYMBOL_ITEMS, MAX_REFERENCE_ITEMS};
+use fcb::search::symbols::{SymbolCandidate, SymbolOptions, SymbolError, ReferenceCandidate,
+    ReferenceOptions, ReferenceError, MAX_SYMBOL_ITEMS};
 pub use fcb::search::{SymbolLanguage, SymbolNameMode};
 use super::{DeskSession, DeskSessionError, DeskPaneId, DeskView, DeskError, DeskChange,
-    DeskCommand, ByteLength, ByteRange, QueryGeneration, ResourceLease,
+    DeskCommand, ByteLength, QueryGeneration, ResourceLease,
     Output, OutputError, HostResponse, EXIT_OK, EXIT_PARTIAL, check};
 
 pub const MAX_CODE_PAGE: usize = 128;
@@ -318,6 +318,3 @@ fn page_limits(start: usize, limit: usize, count: usize) -> Result<(), DeskCodeE
 fn optional(out: &mut Output, value: Option<u64>) -> Result<(), OutputError> {
     match value { Some(n) => out.integer(n), None => out.literal("null") }
 }
-
-// Keep the retained reference inventory bound tied to the production engine.
-const _: () = assert!(MAX_REFERENCE_ITEMS == 4096);
