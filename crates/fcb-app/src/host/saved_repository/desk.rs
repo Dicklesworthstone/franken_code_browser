@@ -4,13 +4,11 @@
 //! Archive labels confer no live filesystem authority. A selected member is
 //! reverified on each import; accepted desk captures survive archive detachment,
 //! corruption, query replacement and checkpoint restoration independently.
-//! All loading, copying, hashing and destruction are bounded worker operations.
+//! All loading, copying and destruction are bounded worker operations.
 
-use std::{mem::size_of, sync::Arc};
 use fcb::ByteRange;
-use fcb::search::{CaptureRequest, CompleteCapture};
 use crate::host::desk::{DeskSession, DeskSessionError, DeskError,
-    imports::{DeskImport, ImportOrigin}};
+    imports::{DeskImport, ImportedSourceId}};
 use super::{SavedRepositorySession, SavedRepositoryError, PagedCapture, PagedHit,
     PagedMemberData, PagedSearchError, PagedSnapshotError, FileId, SourceRevision, ByteLength,
     RawPath, Sha256Digest, HostResponse, OutputError, AppError, check};
@@ -79,7 +77,7 @@ impl SavedRepositorySession {
         if length as u64 > desk.model().limits().source_bytes || member.path.len() > 16_384 {
             return Err(DeskError::InvalidLocation.into());
         }
-        let [load_id, pin_id, adapter_id] = self.allocations()?;
+        let [load_id, pin_id, label_id] = self.allocations()?;
         let before = self.archive.load_stats();
         let capture = if let Some((_, hit)) = selected {
             PagedCapture::open_hit(&mut self.archive, hit, hit.generation(), &self.budget, [load_id, pin_id], &mut *canceled)?
@@ -91,26 +89,21 @@ impl SavedRepositorySession {
         };
         let after = self.archive.load_stats();
         let path = self.archive.directory().member(ordinal).ok_or(SavedRepositoryError::MissingHit)?.path;
-        // PagedCapture deliberately does not expose an uncharged cloneable
-        // source handle. Admit a temporary complete-capture copy for the shared
-        // import API. That API separately charges its receiving desk copy and
-        // avoids copying again when the exact origin is already retained.
-        let charge = capture.bytes().len() + path.len() + size_of::<CompleteCapture>() + 256;
-        let _adapter = self.budget.try_reserve_managed(self.owner(), adapter_id, ByteLength::new(charge as u64))
-            .map_err(|_| AppError::Admission)?;
-        let request = CaptureRequest::new(capture.file(), capture.revision()).map_err(|_| SavedRepositoryError::InvalidLimits)?;
-        let complete = CompleteCapture::new(request, ByteLength::new(capture.bytes().len() as u64), Arc::from(capture.bytes()))
-            .map_err(|_| SavedRepositoryError::InvalidLimits)?;
+        // Borrow verified bytes under PagedCapture's lease. The shared receiving
+        // import route admits its own copy, or reuses existing exact bytes. Only
+        // bounded native-path/display scratch is needed here; no capture clone.
+        let _label = self.budget.try_reserve_managed(self.owner(), label_id,
+            ByteLength::new((16 * path.len() + 512) as u64)).map_err(|_| AppError::Admission)?;
+        let label = RawPath::from_bytes(path).display_escaped().to_string();
         let selection = selected.map(|(_, hit)| hit.original_range());
-        // This namespace is the immutable ARCHIVE SESSION, not the query. Two
-        // queries or direct member navigation therefore reuse the same capture.
-        // Hosts must supply a fresh owner for every independently opened session.
-        let origin = ImportOrigin { owner: self.owner(), generation: 1, domain: 0x5341_5645,
-            file: capture.file(), revision: capture.revision() };
+        // The archive session has immutable member IDs, independent of query
+        // generation. Hosts must give each independently opened session a fresh
+        // owner. Repeated hits and direct member navigation reuse that identity.
+        let origin = ImportedSourceId { file: capture.file(), revision: capture.revision() };
         let query = selected.map(|(id, hit)| (hit.generation().get(), id));
         let archive = self.archive_digest(); let source_digest = capture.source_digest();
         check(canceled)?;
-        let imported = desk.import_capture(expected, attempt, origin, &complete, &RawPath::from_bytes(path),
+        let imported = desk.import_source(expected, attempt, origin, &label, capture.bytes(),
             selection.map_or(0, |r| r.start().get()), selection, &mut *canceled)?;
         // No fallible work or cancellation gate after the accepted transaction.
         Ok(SavedDeskOpen { imported, archive, member: ordinal, source_digest, query, selection,
@@ -122,7 +115,7 @@ impl SavedRepositorySession {
     /// Metadata comes from the receipt; no archive/source load is performed.
     pub fn desk_open_response(&mut self, desk: &DeskSession, opened: &SavedDeskOpen)
         -> Result<HostResponse, SavedDeskError> {
-        if opened.archive != self.archive_digest() || opened.imported.origin.owner != self.owner()
+        if opened.archive != self.archive_digest() || opened.imported.origin.file.owner() != self.owner()
             || opened.imported.file.owner() != desk.model().owner()
             || opened.imported.change.revision != desk.model().revision() { return Err(DeskError::StaleRevision.into()); }
         let mut out = self.output("open-desk")?;
