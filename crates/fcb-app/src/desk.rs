@@ -17,6 +17,8 @@ mod saved;
 use saved::SavedCommands;
 mod code;
 use code::CodeCommands;
+mod reading;
+use reading::ReadingCommands;
 
 use std::{ffi::OsString, io::{self, BufReader, Read, Write}, path::{Path, PathBuf}};
 use fcb::{ByteLength, ByteOffset, ByteRange};
@@ -80,7 +82,7 @@ Ordinary command errors preserve the session; responses expose accepted state.\n
 #[derive(Debug)]
 enum Failure { Command(DeskSessionError), Checkpoint(CheckpointIoError), Repository(repository::DeskRepositoryError),
     Document(document::DeskDocumentError), Comparison(comparison::DeskComparisonError),
-    Saved(saved::SavedDeskError), Code(code::DeskCodeError), Protocol(&'static str), Io, Canceled }
+    Saved(saved::SavedDeskError), Code(code::DeskCodeError), Reading(reading::DeskReadingError), Protocol(&'static str), Io, Canceled }
 impl From<DeskSessionError> for Failure { fn from(e: DeskSessionError) -> Self { Self::Command(e) } }
 impl From<DeskError> for Failure { fn from(e: DeskError) -> Self { Self::Command(e.into()) } }
 impl From<CheckpointIoError> for Failure { fn from(e: CheckpointIoError) -> Self { Self::Checkpoint(e) } }
@@ -89,18 +91,19 @@ impl From<document::DeskDocumentError> for Failure { fn from(e: document::DeskDo
 impl From<comparison::DeskComparisonError> for Failure { fn from(e: comparison::DeskComparisonError) -> Self { Self::Comparison(e) } }
 impl From<saved::SavedDeskError> for Failure { fn from(e: saved::SavedDeskError) -> Self { Self::Saved(e) } }
 impl From<code::DeskCodeError> for Failure { fn from(e: code::DeskCodeError) -> Self { Self::Code(e) } }
+impl From<reading::DeskReadingError> for Failure { fn from(e: reading::DeskReadingError) -> Self { Self::Reading(e) } }
 impl Failure {
     fn code(&self) -> String {
         match self { Self::Command(e) => e.to_string(), Self::Checkpoint(e) => e.code(), Self::Repository(e) => e.to_string(),
             Self::Document(e) => e.to_string(), Self::Comparison(e) => e.to_string(),
-            Self::Saved(e) => e.to_string(), Self::Code(e) => e.to_string(), Self::Protocol(code) => (*code).into(),
+            Self::Saved(e) => e.to_string(), Self::Code(e) => e.to_string(), Self::Reading(e) => e.to_string(), Self::Protocol(code) => (*code).into(),
             Self::Io => "DESK_INPUT_IO".into(), Self::Canceled => "DESK_CANCELED".into() }
     }
     fn canceled(&self) -> bool {
         match self { Self::Canceled => true, Self::Command(e) => e.is_canceled(),
             Self::Checkpoint(e) => e.is_canceled(), Self::Repository(e) => e.is_canceled(),
             Self::Document(e) => e.is_canceled(), Self::Comparison(e) => e.is_canceled(),
-            Self::Saved(e) => e.is_canceled(), Self::Code(e) => e.is_canceled(), _ => false }
+            Self::Saved(e) => e.is_canceled(), Self::Code(e) => e.is_canceled(), Self::Reading(e) => e.is_canceled(), _ => false }
     }
 }
 
@@ -113,6 +116,7 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
             && stdout.write_all(comparison::COMPARISON_HELP.as_bytes()).is_ok()
             && stdout.write_all(saved::SAVED_HELP.as_bytes()).is_ok()
             && stdout.write_all(code::CODE_HELP.as_bytes()).is_ok()
+            && stdout.write_all(reading::READING_HELP.as_bytes()).is_ok()
             && stdout.flush().is_ok() { EXIT_OK } else { EXIT_ERROR };
     }
     if arguments.len() != 1 || arguments[0] != "--stdio" {
@@ -129,7 +133,7 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
     let _frame_lease = match budget.try_reserve_managed(owner(), allocation(1),
         ByteLength::new((4 * MAX_FRAME_BYTES + std::mem::size_of::<DocumentCommands>()
             + std::mem::size_of::<ComparisonCommands>() + std::mem::size_of::<SavedCommands>()
-            + std::mem::size_of::<CodeCommands>()) as u64)) {
+            + std::mem::size_of::<CodeCommands>() + std::mem::size_of::<ReadingCommands>()) as u64)) {
         Ok(lease) => lease, Err(_) => return EXIT_ERROR,
     };
     let mut frame = Vec::new();
@@ -143,30 +147,34 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
     let mut comparisons = ComparisonCommands::new();
     let mut saved = SavedCommands::new();
     let mut code = CodeCommands::new();
+    let mut readers = ReadingCommands::new();
     let mut aggregate = EXIT_OK;
     for request in 1..=MAX_REQUESTS {
         repository.start_request();
+        readers.start_request();
         let read = read_frame(&mut input, &mut frame, &mut canceled);
-        if matches!(read, Ok(false)) { return repository.session_exit(aggregate); }
+        if matches!(read, Ok(false)) { return repository.session_exit(readers.session_exit(aggregate)); }
         let fatal = read.is_err();
         let mut effect = CheckpointSaveEffect::None;
         let result = read.and_then(|_| {
             let text = std::str::from_utf8(&frame).map_err(|_| Failure::Protocol("DESK_FRAME_UTF8"))?;
             execute(&mut session, request, text, &mut canceled, &mut effect, &mut repository,
-                &mut documents, &mut comparisons, &mut saved, &mut code)
+                &mut documents, &mut comparisons, &mut saved, &mut code, &mut readers)
         });
         // Reconcile after ANY accepted navigation, including one whose response
         // encoding failed. Obsolete derived state never outlives a pane here.
         documents.retain_current(&session);
         comparisons.retain_current(&session);
         code.retain_current(&session);
+        readers.retain_current(&session);
         let (exit, quit) = match &result {
             Ok((reply, quit)) => (reply.exit_code(), *quit),
             Err(error) => (if error.canceled() { EXIT_CANCELED } else { EXIT_ERROR }, false),
         };
-        let exit = if quit { repository.session_exit(exit) } else { exit };
+        let exit = if quit { repository.session_exit(readers.session_exit(exit)) } else { exit };
         if exit == EXIT_ERROR { aggregate = EXIT_ERROR; }
-        else if exit == EXIT_PARTIAL && aggregate == EXIT_OK && !repository.is_progress_reply() { aggregate = EXIT_PARTIAL; }
+        else if exit == EXIT_PARTIAL && aggregate == EXIT_OK && !repository.is_progress_reply()
+            && !readers.is_progress_reply() { aggregate = EXIT_PARTIAL; }
         output.clear();
         let encoded = (|| {
             output.literal("{\"schema\":\"fcb.desk-stdio/1\",\"request\":")?; output.integer(request)?;
@@ -185,6 +193,7 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
             comparisons.encode_state(&mut output)?;
             saved.encode_state(&mut output)?;
             code.encode_state(&mut output)?;
+            readers.encode_state(&mut output)?;
             match &result {
                 Ok((reply, _)) => { output.literal(",\"result\":")?; output.literal(reply.as_str().trim_end())?; }
                 Err(error) => {
@@ -208,7 +217,7 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
         }
         if exit == EXIT_CANCELED { return EXIT_CANCELED; }
         if fatal { return EXIT_ERROR; }
-        if quit { return repository.session_exit(aggregate); }
+        if quit { return repository.session_exit(readers.session_exit(aggregate)); }
     }
     let _ = stderr.write_all(b"DESK_REQUEST_LIMIT: session stopped\n"); EXIT_PARTIAL
 }
@@ -268,7 +277,7 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
     canceled: &mut impl FnMut() -> bool, effect: &mut CheckpointSaveEffect,
     repository: &mut RepositoryCommands, documents: &mut DocumentCommands,
     comparisons: &mut ComparisonCommands, saved: &mut SavedCommands,
-    code: &mut CodeCommands) -> Result<(HostResponse, bool), Failure> {
+    code: &mut CodeCommands, readers: &mut ReadingCommands) -> Result<(HostResponse, bool), Failure> {
     // Fixed field array: a hostile frame cannot allocate an unbounded token vector.
     let mut fields = [""; 8]; let mut used = 0;
     for field in frame.split('\t') {
@@ -294,6 +303,9 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
     }
     if command.starts_with("code-") {
         return Ok((code.execute(session, expected, attempt, command, args, &mut *canceled)?, false));
+    }
+    if command.starts_with("reader-") {
+        return Ok((readers.execute(session, expected, attempt, command, args, &mut *canceled)?, false));
     }
     let change = match (command, args) {
         ("state" | "quit", []) => return Ok((session.state(&mut *canceled)?, command == "quit")),
