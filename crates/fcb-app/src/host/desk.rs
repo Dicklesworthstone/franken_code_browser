@@ -381,3 +381,6 @@ pub mod comparison;
 
 /// Declaration outlines and reference-candidate navigation on exact desk sources.
 pub mod code;
+
+/// Retained sparse indexes and explicit resumable line/range navigation.
+pub mod reading;
