@@ -76,6 +76,54 @@ fn c_cancel_and_close_do_not_free_already_returned_strings() {
 }
 
 #[test]
+fn c_atlas_scope_filters_display_and_labels_responses() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let root = std::env::temp_dir().join(format!("fcb-atlas-scope-ffi-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a.rs"), b"rust\n").unwrap();
+    fs::write(root.join("b.md"), b"markdown\n").unwrap();
+    let fixture = Fixture(root);
+    let a = {
+        let handle = fcb_atlas_create(); assert_ne!(handle, 0);
+        let croot = CString::new(fixture.0.to_str().unwrap()).unwrap();
+        let reply = take(unsafe { fcb_atlas_open(handle, croot.as_ptr(), 100) });
+        assert!(reply.contains("\"catalogued_files\":\"2\""), "{reply}"); handle
+    };
+    // Invalid scope names and malformed custom lists are explicit refusals.
+    let bogus = CString::new("bogus").unwrap();
+    assert!(take(unsafe { fcb_atlas_scope(a, 1, bogus.as_ptr(), std::ptr::null()) })
+        .contains("ATLAS_HANDLE_INVALID_ARGUMENT"));
+    let empty = CString::new("extensions").unwrap();
+    let blank = CString::new("").unwrap();
+    assert!(take(unsafe { fcb_atlas_scope(a, 1, empty.as_ptr(), blank.as_ptr()) })
+        .contains("ATLAS_HANDLE_INVALID_ARGUMENT"));
+
+    let rust = CString::new("rust").unwrap();
+    let scoped = take(unsafe { fcb_atlas_scope(a, 2, rust.as_ptr(), std::ptr::null()) });
+    assert!(scoped.contains("\"catalogued_files\":\"1\""), "{scoped}");
+    assert!(scoped.contains("\"scope\":{\"kind\":\"extensions\",\"extensions\":[\"rs\"]}"));
+    assert!(scoped.contains("\"workspace_files\":\"2\""));
+    // Restoring All reuses the retained original layout revision, while the
+    // scoped plan reported a fresh, distinct revision.
+    let original = take(fcb_atlas_info(a));
+    let all = CString::new("all").unwrap();
+    let restored = take(unsafe { fcb_atlas_scope(a, 3, all.as_ptr(), std::ptr::null()) });
+    assert!(restored.contains("\"catalogued_files\":\"2\""));
+    let after = take(fcb_atlas_info(a));
+    let revision = |text: &str| text[text.find("\"layout_revision\":").unwrap()
+        + "\"layout_revision\":".len()..].split(',').next().unwrap().to_string();
+    assert_eq!(revision(&after), revision(&original));
+    assert_ne!(revision(&scoped), revision(&original));
+
+    // Custom extension lists parse exactly; case folds are applied.
+    let custom = CString::new("extensions").unwrap();
+    let list = CString::new("MD,TXT").unwrap();
+    let mixed = take(unsafe { fcb_atlas_scope(a, 4, custom.as_ptr(), list.as_ptr()) });
+    assert!(mixed.contains("\"extensions\":[\"md\",\"txt\"]"), "{mixed}");
+    assert_eq!(fcb_atlas_close(a), 1);
+}
+
+#[test]
 fn c_atlas_function_types_match_header() {
     let _: extern "C" fn() -> u64 = fcb_atlas_create;
     let _: unsafe extern "C" fn(u64, *const c_char, u64) -> *mut c_char = fcb_atlas_open;
@@ -88,6 +136,7 @@ fn c_atlas_function_types_match_header() {
     let _: extern "C" fn(u64, u64, f64, f64, f64) -> *mut c_char = fcb_atlas_resize;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_atlas_present;
     let _: extern "C" fn(u64, u64, u64, f64, f64) -> *mut c_char = fcb_atlas_pick;
+    let _: unsafe extern "C" fn(u64, u64, *const c_char, *const c_char) -> *mut c_char = fcb_atlas_scope;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_atlas_children;
     let _: extern "C" fn(u64, u64, u64, u64, f64, f64, u64) -> *mut c_char = fcb_atlas_open_reader;
     let _: extern "C" fn(u64) -> u8 = fcb_atlas_cancel;

@@ -4,7 +4,8 @@
 //! returning geometry. Hosts acknowledge the plan actually displayed before pick.
 
 use std::{ffi::c_char, path::Path, sync::OnceLock};
-use fcb_app::host::{HostResponse, atlas_session::{AtlasAction, AtlasSessionOptions}};
+use fcb_app::host::{HostResponse, atlas_session::{AtlasAction, AtlasExtensionScope, AtlasScope,
+    AtlasSession, AtlasSessionOptions}};
 use fcb_core::Point2D;
 use super::{cstr, reply, string_out};
 use super::atlas_sessions::{AccessError, AtlasSessions, Command};
@@ -92,6 +93,37 @@ pub extern "C" fn fcb_atlas_open_reader(handle: u64, reader: u64, frame: u64, di
     reply(|| answer(handle, |atlases| {
         let readers = super::reader_ffi::registry().ok_or(super::reader_sessions::AccessError::UnknownHandle)?;
         atlases.open_reader(handle, readers, reader, frame, display, point(x, y)?, number(max_source_bytes)?, || false)
+    }))
+}
+
+/// Apply an explicit file-type display scope to the session's atlas:
+/// `scope` is "all", "markdown", "python", "rust", or "extensions". For
+/// "extensions", `extensions` is a comma-separated custom list (for example
+/// "md,toml"; ASCII case-insensitive, 1..16 tokens of 1..16 bytes). The next
+/// plan may repack geometry from the frozen catalog on this worker; camera
+/// ticks never repack and no source is read or parsed for any scope change.
+/// Restoring "all" reuses the retained original layout, so earlier All-frame
+/// geometry stays valid. Returning JSON carries the active scope identity.
+/// # Safety
+/// scope/extensions are null or readable NUL-terminated UTF-8 stable until
+/// return. Returned strings must be freed once by this library's
+/// fcb_free_string. Worker only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_scope(handle: u64, generation: u64,
+    scope: *const c_char, extensions: *const c_char) -> *mut c_char {
+    reply(|| answer(handle, |atlases| {
+        let name = unsafe { cstr(scope) }.ok_or(AccessError::InvalidArgument)?;
+        let scope = match name {
+            "extensions" => {
+                let list = unsafe { cstr(extensions) }.ok_or(AccessError::InvalidArgument)?;
+                let parsed = AtlasExtensionScope::from_extensions(
+                    list.split(',').map(|token| token.as_bytes()))
+                    .map_err(|_| AccessError::InvalidArgument)?;
+                AtlasScope::Extensions(parsed)
+            }
+            other => AtlasSession::preset_scope(other).ok_or(AccessError::InvalidArgument)?,
+        };
+        atlases.execute(handle, Command::Scope { generation, scope }, || false)
     }))
 }
 #[unsafe(no_mangle)]

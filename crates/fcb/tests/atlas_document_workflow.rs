@@ -35,7 +35,7 @@ fn atlas_hit_opens_old_markdown_after_live_replacement_and_revocation_blocks_new
         catalog.step(&cancel).unwrap();
     }
     assert!(catalog.discovery_complete());
-    let atlas = WorkspaceAtlas::build(&catalog, LayoutRevision::new(owner, 1).unwrap(),
+    let atlas = WorkspaceAtlas::build(&catalog, &fcb::map::workspace::AtlasScope::All, LayoutRevision::new(owner, 1).unwrap(),
         Size2D::new(1024.0, 768.0).unwrap(), LayoutOptions::modest(), WorkspaceAtlasLimits::default(),
         &budget, allocation(2), || false).unwrap();
     let before = atlas.layout().clone();

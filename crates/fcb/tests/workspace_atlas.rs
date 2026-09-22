@@ -130,14 +130,14 @@ fn admission_counts_ancestors_and_rejects_cancellation_before_publication() {
     for limits in [WorkspaceAtlasLimits { max_nodes: 3, ..WorkspaceAtlasLimits::default() },
         WorkspaceAtlasLimits { max_depth: 2, ..WorkspaceAtlasLimits::default() },
         WorkspaceAtlasLimits { max_total_path_bytes: 8, ..WorkspaceAtlasLimits::default() }] {
-        assert!(matches!(WorkspaceAtlas::build(&catalog, revision(2), Size2D::new(100.0, 100.0).unwrap(),
+        assert!(matches!(WorkspaceAtlas::build(&catalog, &fcb::map::workspace::AtlasScope::All, revision(2), Size2D::new(100.0, 100.0).unwrap(),
             LayoutOptions::modest(), limits, &budget, allocation(2), || false), Err(WorkspaceAtlasError::InvalidLimits)));
     }
-    assert!(matches!(WorkspaceAtlas::build(&catalog, revision(2), Size2D::new(100.0, 100.0).unwrap(),
+    assert!(matches!(WorkspaceAtlas::build(&catalog, &fcb::map::workspace::AtlasScope::All, revision(2), Size2D::new(100.0, 100.0).unwrap(),
         LayoutOptions::modest(), WorkspaceAtlasLimits::default(), &budget, allocation(2), || true),
         Err(WorkspaceAtlasError::Atlas(AtlasError::Canceled))));
     let tiny = ResourceBudget::new(owner(), ByteLength::new(1)).unwrap();
-    assert!(matches!(WorkspaceAtlas::build(&catalog, revision(2), Size2D::new(100.0, 100.0).unwrap(),
+    assert!(matches!(WorkspaceAtlas::build(&catalog, &fcb::map::workspace::AtlasScope::All, revision(2), Size2D::new(100.0, 100.0).unwrap(),
         LayoutOptions::modest(), WorkspaceAtlasLimits::default(), &tiny, allocation(2), || false),
         Err(WorkspaceAtlasError::Atlas(AtlasError::ResourceDenied))));
     assert_eq!(build(&catalog, &budget, 2).file_count(), 1);

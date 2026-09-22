@@ -27,7 +27,7 @@ impl RetainedWorkspaceAtlas {
     pub fn build(catalog: WorkspaceCatalog, revision: LayoutRevision,
         world: Size2D, options: LayoutOptions, limits: WorkspaceAtlasLimits,
         budget: &ResourceBudget, allocations: [ResourceAllocationId; 2],
-        mut canceled: impl FnMut() -> bool) -> Result<Self, WorkspaceAtlasError> {
+        canceled: impl FnMut() -> bool) -> Result<Self, WorkspaceAtlasError> {
         Self::build_shared(Arc::new(catalog), &AtlasScope::All, revision, world,
             options, limits, budget, allocations, canceled)
     }
@@ -39,7 +39,7 @@ impl RetainedWorkspaceAtlas {
     pub fn build_scoped(catalog: Arc<WorkspaceCatalog>, scope: &AtlasScope, revision: LayoutRevision,
         world: Size2D, options: LayoutOptions, limits: WorkspaceAtlasLimits,
         budget: &ResourceBudget, allocations: [ResourceAllocationId; 2],
-        mut canceled: impl FnMut() -> bool) -> Result<Self, WorkspaceAtlasError> {
+        canceled: impl FnMut() -> bool) -> Result<Self, WorkspaceAtlasError> {
         if scope.is_all() { return Err(WorkspaceAtlasError::InvalidLimits); }
         Self::build_shared(catalog, scope, revision, world, options, limits,
             budget, allocations, canceled)

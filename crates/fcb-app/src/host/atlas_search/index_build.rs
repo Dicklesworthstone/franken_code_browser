@@ -198,7 +198,7 @@ impl RetainedAtlasSearch {
         let candidate = RetainedIndex { generation, engine, diagnostics, examined, pending,
             read_bytes: io.bytes, read_calls: io.calls, stop, build_steps: steps,
             last_build_files: last_files, last_build_bytes: last_bytes, last_build_calls: last_calls, _lease: lease };
-        let mut out = self.output(command)?;
+        let mut out = self.output(atlas, command)?;
         encode_index(&mut out, atlas, &candidate)?;
         let partial = !capture_complete(atlas, &candidate) || candidate.engine.statistics().uncovered_files != 0;
         let response = self.finish(atlas, out, partial, canceled)?;
@@ -214,7 +214,7 @@ impl RetainedAtlasSearch {
     fn encode_build_progress(&mut self, atlas: &AtlasSession, p: AtlasIndexBuildProgress,
         command: &str, canceled: &mut impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         check(canceled)?;
-        let mut out = self.output(command)?;
+        let mut out = self.output(atlas, command)?;
         out.literal(",\"index_generation\":")?; out.integer(p.generation)?;
         out.literal(",\"accepted_index_generation\":")?;
         if let Some(generation) = self.index_generation() { out.integer(generation)?; } else { out.literal("null")?; }

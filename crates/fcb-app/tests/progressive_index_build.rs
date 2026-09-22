@@ -6,7 +6,7 @@ use std::{fs, path::PathBuf, sync::atomic::{AtomicU64, Ordering}};
 use fcb::ArenaOwnerId;
 use fcb_app::host::atlas_search::{AtlasIndexOptions, AtlasSearchOptions, AtlasSearchError,
     AtlasSearchStop, RetainedAtlasSearch};
-use fcb_app::host::atlas_session::{AtlasAction, AtlasSession, AtlasSessionOptions};
+use fcb_app::host::atlas_session::{AtlasSession, AtlasSessionOptions};
 
 struct Fixture(PathBuf);
 impl Fixture {

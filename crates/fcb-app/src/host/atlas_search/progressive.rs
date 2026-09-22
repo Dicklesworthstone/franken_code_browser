@@ -145,7 +145,7 @@ impl RetainedAtlasSearch {
 
     pub(super) fn work_response(&mut self, atlas: &AtlasSession, work: &SearchWork,
         command: &str, canceled: &mut impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
-        let mut out = self.output(command)?;
+        let mut out = self.output(atlas, command)?;
         encode_page(&mut out, atlas, &work.snapshot, 0, 64, canceled)?;
         self.finish(atlas, out, !work.snapshot.complete, canceled)
     }

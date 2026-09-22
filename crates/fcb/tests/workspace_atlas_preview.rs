@@ -48,7 +48,7 @@ fn capture<'a>(catalog: &'a WorkspaceCatalog, root: &Path, budget: &ResourceBudg
     assert!(captures.finished()); captures
 }
 fn atlas<'a>(catalog: &'a WorkspaceCatalog, budget: &ResourceBudget) -> WorkspaceAtlas<'a> {
-    WorkspaceAtlas::build(catalog, LayoutRevision::new(owner(), 1).unwrap(), Size2D::new(1024.0, 768.0).unwrap(),
+    WorkspaceAtlas::build(catalog, &fcb::map::workspace::AtlasScope::All, LayoutRevision::new(owner(), 1).unwrap(), Size2D::new(1024.0, 768.0).unwrap(),
         LayoutOptions::modest(), WorkspaceAtlasLimits::default(), budget, allocation(20), || false).unwrap()
 }
 fn utf16(text: &str, little: bool) -> Vec<u8> {

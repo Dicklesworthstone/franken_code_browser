@@ -64,7 +64,7 @@ impl AtlasSearchOptions {
 pub enum AtlasSearchError {
     App(AppError), Atlas(AtlasSessionError), Reader(ReaderSessionError), Index(IndexError),
     InvalidLimits, WrongAtlas, StaleQuery, MissingQuery, MissingHit, Canceled,
-    IdentityExhausted, MissingIndex, StaleIndex,
+    IdentityExhausted, MissingIndex, StaleIndex, OutOfScope,
 }
 impl std::fmt::Display for AtlasSearchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -81,6 +81,7 @@ impl std::fmt::Display for AtlasSearchError {
                 Self::IdentityExhausted => "ATLAS_SEARCH_IDENTITY_EXHAUSTED",
                 Self::MissingIndex => "ATLAS_SEARCH_NO_INDEX",
                 Self::StaleIndex => "ATLAS_SEARCH_STALE_INDEX",
+                Self::OutOfScope => "ATLAS_SEARCH_HIT_OUT_OF_SCOPE",
                 _ => unreachable!(),
             }),
         }
@@ -232,7 +233,7 @@ impl RetainedAtlasSearch {
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         self.validate(atlas)?; check(&mut canceled)?;
         if !(1..=MAX_ATLAS_SEARCH_PAGE).contains(&limit) { return Err(AtlasSearchError::InvalidLimits); }
-        let mut out = self.output("page")?;
+        let mut out = self.output(atlas, "page")?;
         let snapshot = self.snapshot(generation)?;
         if start > snapshot.hits.len() { return Err(AtlasSearchError::InvalidLimits); }
         encode_page(&mut out, atlas, snapshot, start, limit, &mut canceled)?;
@@ -245,19 +246,27 @@ impl RetainedAtlasSearch {
     pub fn overlay(&mut self, atlas: &AtlasSession, generation: u64,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         self.validate(atlas)?; check(&mut canceled)?;
-        let mut out = self.output("overlay")?;
+        let mut out = self.output(atlas, "overlay")?;
         let snapshot = self.snapshot(generation)?;
         summary(&mut out, atlas, snapshot)?;
-        out.literal(",\"count_basis\":\"retained-hits\",\"files\":[")?;
-        for (i, file) in snapshot.files.iter().enumerate() {
+        out.literal(",\"count_basis\":")?;
+        out.quoted(if atlas.scope().is_all() { "retained-hits" } else { "workspace-wide-retained-hits" })?;
+        out.literal(",\"files\":[")?;
+        // Displayed files follow the active scope; every count above remains
+        // workspace-wide over the base layout the query was run against.
+        let mut displayed_files = 0usize;
+        for file in snapshot.files.iter() {
             check(&mut canceled)?;
-            if i != 0 { out.literal(",")?; }
+            if !atlas.scope_matches_file(file.capture.request().file()) { continue; }
+            if displayed_files != 0 { out.literal(",")?; }
             out.literal("{\"node\":")?; out.integer(file.node.ordinal() as u64)?;
             out.literal(",\"file_id\":")?; out.integer(file.capture.request().file().get())?;
             out.literal(",\"retained_occurrences\":")?; out.integer(file.hits as u64)?;
             out.literal("}")?;
+            displayed_files += 1;
         }
-        out.literal("]}\n")?;
+        out.literal("],\"displayed_files\":")?; out.integer(displayed_files as u64)?;
+        out.literal("}\n")?;
         let partial = !snapshot.complete;
         self.finish(atlas, out, partial, &mut canceled)
     }
@@ -266,7 +275,7 @@ impl RetainedAtlasSearch {
     pub fn clear(&mut self, atlas: &AtlasSession, generation: u64,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         self.validate(atlas)?; self.attempt(generation)?; check(&mut canceled)?;
-        let mut out = self.output("clear")?;
+        let mut out = self.output(atlas, "clear")?;
         out.literal(",\"query_generation\":")?; out.integer(generation)?;
         out.literal(",\"retained_hits\":\"0\"}\n")?;
         let response = self.finish(atlas, out, false, &mut canceled)?;
@@ -275,11 +284,15 @@ impl RetainedAtlasSearch {
     }
 
     /// Prepare a camera plan for a finished or running query's exact occurrence.
+    /// The hit's workspace file is resolved into the ACTIVE display layout, so
+    /// a focused occurrence is always the displayed file. A hit whose file is
+    /// outside the active scope has no displayed node and is refused.
     /// Old picking stays authoritative until the new plan is acknowledged.
     pub fn focus_hit(&self, atlas: &mut AtlasSession, generation: u64, id: u64,
         plan_generation: u64, canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         let hit = self.hit(atlas, generation, id)?;
-        Ok(atlas.prepare(plan_generation, AtlasAction::Focus(hit.node.ordinal()), canceled)?)
+        let node = atlas.focus_target_for_file(hit.file).ok_or(AtlasSearchError::OutOfScope)?;
+        Ok(atlas.prepare(plan_generation, AtlasAction::Focus(node.ordinal()), canceled)?)
     }
 
     /// Copy the retained WHOLE matching capture into an independently owned
@@ -292,7 +305,7 @@ impl RetainedAtlasSearch {
         self.validate(atlas)?; check(&mut canceled)?;
         if reader_owner == self.manifest.owner() { return Err(AtlasSearchError::WrongAtlas); }
         let hit = self.hit(atlas, generation, id)?;
-        let mut out = self.output("open-reader")?;
+        let mut out = self.output(atlas, "open-reader")?;
         let snapshot = self.snapshot(generation)?;
         let source = &snapshot.files[hit.source_slot].capture;
         let entry = atlas.atlas().catalog().entry(hit.file).ok_or(AtlasSearchError::WrongAtlas)?;
@@ -323,13 +336,16 @@ impl RetainedAtlasSearch {
         self.next_allocation = value.checked_add(1).ok_or(AtlasSearchError::IdentityExhausted)?;
         ResourceAllocationId::new(value).map_err(|_| AtlasSearchError::IdentityExhausted)
     }
-    fn output(&mut self, command: &str) -> Result<Output, AtlasSearchError> {
+    fn output(&mut self, atlas: &AtlasSession, command: &str) -> Result<Output, AtlasSearchError> {
         let id = self.next_id()?;
         let mut out = Output::new(self.manifest.owner(), MAX_RESPONSE_BYTES, &self.budget, id)?;
         out.literal("{\"schema\":\"fcb.atlas-search/1\",\"status\":\"ok\",\"command\":")?; out.quoted(command)?;
         out.literal(",\"owner\":")?; out.integer(self.manifest.owner().get())?;
         out.literal(",\"source_manifest\":")?; out.integer(self.manifest.revision())?;
         out.literal(",\"layout_revision\":")?; out.integer(self.layout.get())?;
+        // Queries run workspace-wide against the retained base layout; the
+        // scope label names the display filter applied to encoded result rows.
+        atlas.encode_scope(&mut out).map_err(AtlasSearchError::from)?;
         Ok(out)
     }
     fn finish(&mut self, atlas: &AtlasSession, out: Output, partial: bool,
@@ -372,16 +388,32 @@ fn summary(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot) -> Resul
 fn encode_page(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot, start: usize,
     limit: usize, canceled: &mut impl FnMut() -> bool) -> Result<(), AtlasSearchError> {
     summary(out, atlas, snapshot)?;
+    // Displayed rows follow the active scope; hit IDs stay workspace-stable
+    // and every summary count remains workspace-wide. Both passes are
+    // metadata-only catalog lookups; no source is read or parsed here.
+    let displayed_total = snapshot.hits.iter()
+        .filter(|hit| atlas.scope_matches_file(hit.file)).count();
+    let window_end = start.saturating_add(limit).min(displayed_total);
+    out.literal(",\"displayed_hits\":")?; out.integer(displayed_total as u64)?;
+    if !atlas.scope().is_all() {
+        out.literal(",\"row_filter\":\"active-scope\",\"count_basis\":\"workspace-wide-retained-hits\"")?;
+    }
     out.literal(",\"hits\":[")?;
-    let end = start.saturating_add(limit).min(snapshot.hits.len());
-    for (i, &hit) in snapshot.hits[start..end].iter().enumerate() {
+    let mut displayed = 0usize;
+    let mut emitted = 0usize;
+    for &hit in snapshot.hits.iter() {
         check(canceled)?;
-        if i > 0 { out.literal(",")?; }
-        out.literal("{\"hit_id\":")?; out.integer(hit.id)?;
-        encode_hit(out, atlas, hit)?; out.literal("}")?;
+        if !atlas.scope_matches_file(hit.file) { continue; }
+        if displayed >= start && displayed < window_end {
+            if emitted > 0 { out.literal(",")?; }
+            out.literal("{\"hit_id\":")?; out.integer(hit.id)?;
+            encode_hit(out, atlas, hit)?; out.literal("}")?;
+            emitted += 1;
+        }
+        displayed += 1;
     }
     out.literal("],\"next_offset\":")?;
-    if end < snapshot.hits.len() { out.integer(end as u64)?; } else { out.literal("null")?; }
+    if window_end < displayed_total { out.integer(window_end as u64)?; } else { out.literal("null")?; }
     out.literal(",\"diagnostics\":[")?;
     for (i, diagnostic) in snapshot.diagnostics.iter().enumerate() {
         check(canceled)?;

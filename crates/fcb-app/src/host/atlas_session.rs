@@ -10,6 +10,7 @@ use fcb::{ArenaOwnerId, ByteLength, CameraGeneration, DisplayGeneration, Display
     FileId, Point2D, Rect2D, Size2D};
 use fcb::map::{AtlasDetail, AtlasError, AtlasHit, AtlasNodeId, Camera2D, CameraError,
     DisplayColorConfig, LayoutOptions, LayoutRevision, LodThresholds, VisibleLimits,
+    VisiblePlan, VisibleQuery, VisibleState};
 use fcb::map::workspace::{WorkspaceAtlasError, WorkspaceAtlasLimits};
 use fcb::map::workspace::retained::RetainedWorkspaceAtlas;
 use fcb::search::{QueryGeneration, RawPath, ResourceAllocationId, ResourceBudget, RootId, SearchManifestId};
@@ -275,7 +276,13 @@ impl AtlasSession {
             scope_changed = self.change_scope(next, &mut canceled)?;
         }
         let mut out = self.output("plan")?;
-        let index = self.view().index()?;
+        // Field-scoped borrow: `index` shares the active atlas field only, so
+        // unrelated session fields (history, display generation) stay mutable.
+        let active = match &self.scoped {
+            Some((scope, atlas)) if *scope == self.scope => atlas,
+            _ => &self.atlas,
+        };
+        let index = active.index()?;
         let old = self.position;
         let mut next = old;
         let mut selected = self.selected;
@@ -317,18 +324,6 @@ impl AtlasSession {
             next.camera = index.focus_camera(next.focus, camera_id, old.camera.display(), 12.0)?;
             selected = None;
             self.history.clear();
-        }
-            }
-            AtlasAction::Back => {
-                next = *self.history.last().ok_or(AtlasSessionError::EmptyHistory)?;
-                next.camera = next.camera.with_display(old.camera.display())?;
-                pop = true;
-            }
-            AtlasAction::Resize { width, height, scale } => {
-                let dg = self.last_display_generation.checked_add(1).ok_or(AtlasSessionError::IdentityExhausted)?;
-                self.last_display_generation = dg;
-                next.camera = old.camera.with_display(display(self.owner(), dg, width, height, scale)?)?;
-            }
         }
         // History restores transforms, not old camera identities.
         next.camera = Camera2D::new(camera_id, next.camera.display(),

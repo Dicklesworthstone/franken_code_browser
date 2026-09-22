@@ -6,7 +6,8 @@
 
 use std::{mem::size_of, path::Path, sync::{Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}};
-use fcb_app::host::{HostResponse, atlas_session::{AtlasAction, AtlasSession, AtlasSessionError, AtlasSessionOptions},
+use fcb_app::host::{HostResponse, atlas_session::{AtlasAction, AtlasScope,
+    AtlasSession, AtlasSessionError, AtlasSessionOptions},
     atlas_search::{AtlasSearchError, AtlasSearchOptions, RetainedAtlasSearch},
     atlas_paths::{AtlasPathError, RetainedAtlasPaths}};
 use fcb_core::{ArenaOwnerId, ByteLength, Point2D, ResourceAllocationId, ResourceBudget, ResourceLease};
@@ -74,6 +75,7 @@ pub(super) enum Command<'a> {
     SearchOverlay { generation: u64 },
     SearchClear { generation: u64 },
     SearchFocus { generation: u64, hit: u64, plan_generation: u64 },
+    Scope { generation: u64, scope: AtlasScope },
 }
 struct Session { atlas: AtlasSession, search: RetainedAtlasSearch, paths: RetainedAtlasPaths, operation_epoch: u64 }
 impl Session {
@@ -184,6 +186,7 @@ impl AtlasSessions {
             Command::SearchOverlay { generation } => session.search.overlay(&session.atlas, generation, &mut stop).map_err(AccessError::from),
             Command::SearchClear { generation } => session.search.clear(&session.atlas, generation, &mut stop).map_err(AccessError::from),
             Command::SearchFocus { generation, hit, plan_generation } => session.search.focus_hit(&mut session.atlas, generation, hit, plan_generation, &mut stop).map_err(AccessError::from),
+            Command::Scope { generation, scope } => session.atlas.prepare(generation, AtlasAction::Scope(scope), &mut stop).map_err(AccessError::from),
         };
         if let Err(error) = cell.validate(epoch) {
             session.search.cancel_pending();

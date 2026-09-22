@@ -65,6 +65,21 @@ char *fcb_atlas_children(uint64_t handle, uint64_t parent, uint64_t start, uint6
 char *fcb_atlas_open_reader(uint64_t handle, uint64_t reader, uint64_t frame,
     uint64_t display, double x, double y, uint64_t max_source_bytes);
 
+/* Explicit file-type display scope: "all", "markdown", "python", "rust", or
+ * "extensions" with a comma-separated custom list in extensions (for example
+ * "md,toml"; ASCII case-insensitive; 1..16 tokens of 1..16 bytes; no dots or
+ * separators inside a token). The NEXT plan may repack geometry from the
+ * frozen catalog on this worker; pan/zoom never repack, and no source is read
+ * or parsed for any scope change. Restoring "all" reuses the retained original
+ * layout, so earlier All-frame geometry and node identity stay valid. A scope
+ * change resets focus/history/selection to the new layout's root. Search and
+ * path queries remain workspace-wide; their responses label the scope, and
+ * paging/overlay encode only in-scope rows while counts stay workspace-wide.
+ * Focus of a retained hit whose file is out of scope is refused.
+ */
+char *fcb_atlas_scope(uint64_t handle, uint64_t generation,
+    const char *scope, const char *extensions);
+
 /* Return 1 if changed/removed, 0 if unknown/busy. Cancellation advances an epoch
  * without locking source work. Close invalidates the atlas while active calls
  * retain admission until drained. It does not close independent readers or free

@@ -39,6 +39,7 @@ impl Default for AtlasPathOptions {
 pub enum AtlasPathError {
     App(AppError), Atlas(AtlasSessionError), Reader(ReaderSessionError),
     WrongAtlas, StaleQuery, MissingQuery, MissingHit, Canceled, IdentityExhausted,
+    OutOfScope,
 }
 impl std::fmt::Display for AtlasPathError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -51,6 +52,7 @@ impl std::fmt::Display for AtlasPathError {
             Self::MissingHit => f.write_str("ATLAS_PATH_NO_HIT"),
             Self::Canceled => f.write_str("ATLAS_PATH_CANCELED"),
             Self::IdentityExhausted => f.write_str("ATLAS_PATH_IDENTITY_EXHAUSTED"),
+            Self::OutOfScope => f.write_str("ATLAS_PATH_HIT_OUT_OF_SCOPE"),
         }
     }
 }
@@ -229,10 +231,14 @@ impl RetainedAtlasPaths {
         self.accepted = None; // Keep the prepared keys for the next query.
         Ok(response)
     }
+    /// The workspace-wide hit is resolved into the ACTIVE display layout, so
+    /// a focused path hit is always the displayed file. A hit whose file is
+    /// outside the active scope has no displayed node and is refused.
     pub fn focus_hit(&self, atlas: &mut AtlasSession, generation: u64, file: FileId,
         plan_generation: u64, canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasPathError> {
         let hit = self.hit(atlas, generation, file)?;
-        Ok(atlas.prepare(plan_generation, AtlasAction::Focus(hit.node.ordinal()), canceled)?)
+        let node = atlas.focus_target_for_file(hit.file).ok_or(AtlasPathError::OutOfScope)?;
+        Ok(atlas.prepare(plan_generation, AtlasAction::Focus(node.ordinal()), canceled)?)
     }
     /// A path hit never claimed to capture source. Open its currently authorized
     /// native path, refusing symlinks under the SAME application policy as atlas

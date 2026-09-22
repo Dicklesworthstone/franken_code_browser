@@ -242,7 +242,7 @@ impl RetainedAtlasSearch {
     pub fn index_info(&mut self, atlas: &AtlasSession, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
         self.validate(atlas)?; check(&mut canceled)?;
-        let mut out = self.output("index-info")?;
+        let mut out = self.output(atlas, "index-info")?;
         let index = self.index.as_ref().ok_or(AtlasSearchError::MissingIndex)?;
         encode_index(&mut out, atlas, index)?;
         let partial = !capture_complete(atlas, index) || index.engine.statistics().uncovered_files != 0;
@@ -253,7 +253,7 @@ impl RetainedAtlasSearch {
         self.validate(atlas)?; self.attempt(generation)?;
         self.building = None;
         check(&mut canceled)?;
-        let mut out = self.output("index-clear")?;
+        let mut out = self.output(atlas, "index-clear")?;
         out.literal(",\"generation\":")?; out.integer(generation)?;
         out.literal(",\"index_generation\":null,\"indexed_source_bytes\":\"0\"}\n")?;
         let response = self.finish(atlas, out, false, &mut canceled)?;
