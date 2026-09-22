@@ -43,7 +43,7 @@ impl Fixture {
 }
 impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
 fn atlas<'a>(catalog: &'a WorkspaceCatalog, budget: &ResourceBudget, alloc: u64) -> WorkspaceAtlas<'a> {
-    WorkspaceAtlas::build(catalog, LayoutRevision::new(owner(), 1).unwrap(), Size2D::new(1024.0, 768.0).unwrap(),
+    WorkspaceAtlas::build(catalog, &fcb::map::workspace::AtlasScope::All, LayoutRevision::new(owner(), 1).unwrap(), Size2D::new(1024.0, 768.0).unwrap(),
         LayoutOptions::modest(), WorkspaceAtlasLimits::default(), budget, allocation(alloc), || false).unwrap()
 }
 fn run<'a, 'c>(atlas: &'a WorkspaceAtlas<'c>, literal: &str, limits: AtlasStreamLimits,

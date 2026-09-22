@@ -10,7 +10,6 @@ use fcb::{ArenaOwnerId, ByteLength, CameraGeneration, DisplayGeneration, Display
     FileId, Point2D, Rect2D, Size2D};
 use fcb::map::{AtlasDetail, AtlasError, AtlasHit, AtlasNodeId, Camera2D, CameraError,
     DisplayColorConfig, LayoutOptions, LayoutRevision, LodThresholds, VisibleLimits,
-    VisiblePlan, VisibleQuery, VisibleState};
 use fcb::map::workspace::{WorkspaceAtlasError, WorkspaceAtlasLimits};
 use fcb::map::workspace::retained::RetainedWorkspaceAtlas;
 use fcb::search::{QueryGeneration, RawPath, ResourceAllocationId, ResourceBudget, RootId, SearchManifestId};
@@ -76,6 +75,11 @@ pub enum AtlasAction {
     Focus(u32),
     Back,
     Resize { width: f64, height: f64, scale: f64 },
+    /// Explicit file-type display scope. An accepted change may repack
+    /// geometry from the frozen shared catalog on the worker; camera ticks
+    /// never repack and never read or parse source. Restoring All reuses the
+    /// retained base layout, so earlier All-frame geometry stays valid.
+    Scope(AtlasScope),
 }
 #[derive(Clone, Copy)]
 struct Position { focus: AtlasNodeId, camera: Camera2D }
@@ -92,9 +96,11 @@ struct AtlasReadTarget {
 impl AtlasReadTarget {
     fn path(&self) -> &Path { &self.path }
 }
-
 pub struct AtlasSession {
     atlas: RetainedWorkspaceAtlas,
+    scoped: Option<(AtlasScope, RetainedWorkspaceAtlas)>,
+    scope: AtlasScope,
+    next_layout: u64,
     position: Position,
     selected: Option<AtlasNodeId>,
     history: Vec<Position>,
@@ -148,11 +154,100 @@ impl AtlasSession {
         history.try_reserve_exact(MAX_ATLAS_HISTORY).map_err(|_| AppError::Admission)?;
         if history.capacity() > MAX_ATLAS_HISTORY { return Err(AppError::Admission.into()); }
         check(&mut canceled)?;
-        Ok(Self { atlas, position: Position { focus, camera }, selected: None, history, pending: None,
+        Ok(Self { atlas, scoped: None, scope: AtlasScope::All, next_layout: 2,
+            position: Position { focus, camera }, selected: None, history, pending: None,
             presented: None, frame: None, last_attempt: 0, last_display_generation: 1, next_allocation: 10,
             visible: options.visible, budget, _lease: lease })
     }
+    /// The workspace-wide (All) atlas: the identity/search lane bound. Search
+    /// and path queries validate against this layout so an explicit scope
+    /// change never retires retained workspace-wide results or re-reads source.
     pub fn atlas(&self) -> &RetainedWorkspaceAtlas { &self.atlas }
+    /// The atlas whose geometry the displayed frame describes: the All layout,
+    /// or the retained scope layout while an extension scope is active.
+    pub fn view(&self) -> &RetainedWorkspaceAtlas {
+        if let Some((scope, atlas)) = &self.scoped {
+            if *scope == self.scope { return atlas; }
+        }
+        &self.atlas
+    }
+    pub fn scope(&self) -> &AtlasScope { &self.scope }
+    /// Displayed node of a workspace file in the ACTIVE layout, for focusing
+    /// workspace-wide hits without re-reading source. Out-of-scope files have
+    /// no displayed node.
+    pub fn focus_target_for_file(&self, file: FileId) -> Option<AtlasNodeId> {
+        self.view().node_for_file(file).ok()
+    }
+    /// Metadata-only scope membership for a workspace file: catalog path
+    /// lookup and extension comparison. Never reads or parses source bytes.
+    pub fn scope_matches_file(&self, file: FileId) -> bool {
+        match self.atlas.catalog().entry(file) {
+            Some(entry) => self.scope.matches_path(entry.path().as_bytes()),
+            None => false,
+        }
+    }
+    /// Wire identity of the active scope plus the workspace-wide file count.
+    /// Extension tokens were validated UTF-8 at construction.
+    pub fn encode_scope(&self, out: &mut Output) -> Result<(), AtlasSessionError> {
+        out.literal(",\"scope\":")?;
+        match &self.scope {
+            AtlasScope::All => out.literal("\"all\"")?,
+            AtlasScope::Extensions(extensions) => {
+                out.literal("{\"kind\":\"extensions\",\"extensions\":[")?;
+                for (i, token) in extensions.extensions().enumerate() {
+                    if i != 0 { out.literal(",")?; }
+                    out.quoted(std::str::from_utf8(token).unwrap_or(""))?;
+                }
+                out.literal("]}")?;
+            }
+        }
+        out.literal(",\"workspace_files\":")?;
+        out.integer(self.atlas.file_count() as u64)?;
+        Ok(())
+    }
+    /// Named scope presets are pure extension sets; product naming lives at
+    /// the host boundary, not in the layout engine.
+    pub fn preset_scope(name: &str) -> Option<AtlasScope> {
+        match name {
+            "all" => Some(AtlasScope::All),
+            "markdown" => Some(extension_scope(&["md"])?),
+            "python" => Some(extension_scope(&["py"])?),
+            "rust" => Some(extension_scope(&["rs"])?),
+            _ => None,
+        }
+    }
+    /// Switch the display scope. All is always served by the retained base
+    /// layout, so returning to it is a cache hit by construction. One
+    /// alternative scope layout is retained, so alternating between two
+    /// extension scopes rebuilds the evicted one. Every rebuild mints a fresh
+    /// layout revision; node identity is never reused across layouts.
+    /// Reuse captured documents only: discovery is frozen, no source is read.
+    fn change_scope(&mut self, next: AtlasScope, canceled: &mut impl FnMut() -> bool)
+        -> Result<bool, AtlasSessionError> {
+        if next == self.scope { return Ok(false); }
+        if next.is_all() {
+            self.scope = AtlasScope::All;
+            return Ok(true);
+        }
+        let cached = self.scoped.as_ref().is_some_and(|(scope, _)| *scope == next);
+        if !cached {
+            let revision = LayoutRevision::new(self.owner(), self.next_layout)
+                .map_err(|_| AtlasSessionError::IdentityExhausted)?;
+            self.next_layout = self.next_layout.checked_add(1)
+                .ok_or(AtlasSessionError::IdentityExhausted)?;
+            let layout_alloc = self.next_id()?;
+            let index_alloc = self.next_id()?;
+            let catalog = self.atlas.catalog_shared();
+            let world = Size2D::new(4096.0, 4096.0).map_err(|_| AtlasSessionError::InvalidLimits)?;
+            let scoped = RetainedWorkspaceAtlas::build_scoped(catalog, &next, revision, world,
+                LayoutOptions::modest(), WorkspaceAtlasLimits::default(), &self.budget,
+                [layout_alloc, index_alloc],
+                &mut || canceled() || self.atlas.validate_active().is_err())?;
+            self.scoped = Some((next, scoped));
+        }
+        self.scope = next;
+        Ok(true)
+    }
     pub fn validate_active(&self) -> Result<(), AtlasSessionError> { Ok(self.atlas.validate_active()?) }
     pub fn pending_plan(&self) -> Option<&VisiblePlan> { self.pending.as_ref() }
     pub fn presented_plan(&self) -> Option<&VisiblePlan> { self.presented.as_ref() }
@@ -171,14 +266,23 @@ impl AtlasSession {
         let camera_id = camera_generation(self.owner(), generation.checked_add(1)
             .ok_or(AtlasSessionError::IdentityExhausted)?)?;
         let plan_allocation = self.next_id()?;
+        // An explicit scope change may repack from the frozen shared catalog
+        // BEFORE the response header is encoded, so this plan always describes
+        // the scope it displays. A failed change consumes its generation and
+        // preserves the previous scope, camera, history and selection.
+        let mut scope_changed = false;
+        if let AtlasAction::Scope(next) = action {
+            scope_changed = self.change_scope(next, &mut canceled)?;
+        }
         let mut out = self.output("plan")?;
-        let index = self.atlas.index()?;
+        let index = self.view().index()?;
         let old = self.position;
         let mut next = old;
         let mut selected = self.selected;
         let mut push = false;
         let mut pop = false;
         match action {
+            AtlasAction::Scope(_) => {},
             AtlasAction::View => {},
             AtlasAction::Pan(delta) => next.camera = old.camera.pan(delta)?,
             AtlasAction::Zoom { anchor, factor } => next.camera = old.camera.zoom_at(anchor, factor)?,
@@ -191,7 +295,29 @@ impl AtlasSession {
                 }
                 next.focus = node;
                 next.camera = index.focus_camera(node, camera_id, old.camera.display(), 12.0)?;
-                if self.atlas.file(node).is_ok() { selected = Some(node); }
+                if self.view().file(node).is_ok() { selected = Some(node); }
+            }
+            AtlasAction::Back => {
+                next = *self.history.last().ok_or(AtlasSessionError::EmptyHistory)?;
+                next.camera = next.camera.with_display(old.camera.display())?;
+                pop = true;
+            }
+            AtlasAction::Resize { width, height, scale } => {
+                let dg = self.last_display_generation.checked_add(1).ok_or(AtlasSessionError::IdentityExhausted)?;
+                self.last_display_generation = dg;
+                next.camera = old.camera.with_display(display(self.owner(), dg, width, height, scale)?)?;
+            }
+        }
+        if scope_changed {
+            // History entries and selection identify nodes of the PREVIOUS
+            // layout revision; carrying them across a repack would alias a
+            // different file. A scope change is an explicit navigation reset
+            // to the new layout's root.
+            next.focus = index.root_node();
+            next.camera = index.focus_camera(next.focus, camera_id, old.camera.display(), 12.0)?;
+            selected = None;
+            self.history.clear();
+        }
             }
             AtlasAction::Back => {
                 next = *self.history.last().ok_or(AtlasSessionError::EmptyHistory)?;
@@ -297,11 +423,11 @@ impl AtlasSession {
     fn reader_target(&self, frame: u64, actual_display: u64, point: Point2D) -> Result<AtlasReadTarget, AtlasSessionError> {
         let hit = self.hit(frame, actual_display, point)?.ok_or(AtlasSessionError::NoFile)?;
         if hit.detail() != AtlasDetail::File { return Err(AtlasSessionError::NoFile); }
-        let entry = self.atlas.entry(hit.node())?;
-        let root = self.atlas.catalog().grant().root_path().to_path_buf();
+        let entry = self.view().entry(hit.node())?;
+        let root = self.view().catalog().grant().root_path().to_path_buf();
         let path = workspace::checked_source_path(&root, entry.path()).map_err(|_| AppError::SourceChanged)?;
         self.validate_active()?;
-        Ok(AtlasReadTarget { node: hit.node(), file: self.atlas.file(hit.node())?, frame, display: actual_display, path })
+        Ok(AtlasReadTarget { node: hit.node(), file: self.view().file(hit.node())?, frame, display: actual_display, path })
     }
     /// Safe host composition of acknowledged file selection and retained source.
     /// Reader ownership is distinct from atlas metadata identity and is reported
@@ -327,7 +453,7 @@ impl AtlasSession {
             || self.presented.as_ref().map(|p| p.camera().display().generation().get()) != Some(target.display) {
             return Err(AtlasSessionError::StaleFrame);
         }
-        if self.atlas.file(target.node)? != target.file { return Err(AtlasSessionError::NoFile); }
+        if self.view().file(target.node)? != target.file { return Err(AtlasSessionError::NoFile); }
         let mut out = self.output("open-reader")?;
         out.literal(",\"frame\":")?; out.integer(target.frame)?;
         out.literal(",\"selected_node\":")?; self.node_json(&mut out, target.node)?;
@@ -344,9 +470,9 @@ impl AtlasSession {
     pub fn children(&mut self, parent: u32, start: usize, limit: usize, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSessionError> {
         self.validate_active()?; check(&mut canceled)?;
-        if limit == 0 || limit > 1024 || start > self.atlas.layout().nodes().len() { return Err(AtlasSessionError::InvalidLimits); }
+        if limit == 0 || limit > 1024 || start > self.view().layout().nodes().len() { return Err(AtlasSessionError::InvalidLimits); }
         let mut out = self.output("children")?;
-        let index = self.atlas.index()?;
+        let index = self.view().index()?;
         let parent = AtlasNodeId::new(index.root(), index.revision(), parent);
         let mut children = index.children(parent)?.skip(start);
         out.literal(",\"parent\":")?; self.node_json(&mut out, parent)?;
@@ -387,9 +513,10 @@ impl AtlasSession {
         let mut out = Output::new(self.owner(), MAX_RESPONSE_BYTES, &self.budget, id)?;
         out.literal("{\"schema\":\"fcb.atlas-session/1\",\"status\":\"ok\",\"command\":")?; out.quoted(command)?;
         out.literal(",\"owner\":")?; out.integer(self.owner().get())?;
-        out.literal(",\"layout_revision\":")?; out.integer(self.atlas.layout().revision().get())?;
-        out.literal(",\"discovery_complete\":")?; out.boolean(self.atlas.discovery_complete())?;
-        out.literal(",\"catalogued_files\":")?; out.integer(self.atlas.file_count() as u64)?;
+        out.literal(",\"layout_revision\":")?; out.integer(self.view().layout().revision().get())?;
+        out.literal(",\"discovery_complete\":")?; out.boolean(self.view().discovery_complete())?;
+        out.literal(",\"catalogued_files\":")?; out.integer(self.view().file_count() as u64)?;
+        self.encode_scope(&mut out)?;
         out.literal(",\"retention\":\"frozen-catalog-and-spatial-index\"")?;
         Ok(out)
     }
@@ -421,16 +548,24 @@ impl AtlasSession {
         out.literal("}")?; Ok(())
     }
     fn node_json(&self, out: &mut Output, key: AtlasNodeId) -> Result<(), AtlasSessionError> {
-        let index = self.atlas.index()?;
+        let index = self.view().index()?;
         let node = index.node(key)?;
         out.literal("{\"ordinal\":")?; out.integer(u64::from(key.ordinal()))?;
         out.literal(",\"path\":")?; out.path(&RawPath::from_bytes(node.path()).to_path_buf())?;
         out.literal(",\"file_id\":")?;
-        match self.atlas.file(key) { Ok(file) => out.integer(file.get())?, Err(_) => out.literal("null")? }
+        match self.view().file(key) { Ok(file) => out.integer(file.get())?, Err(_) => out.literal("null")? }
         out.literal(",\"kind\":")?; out.quoted(match node.kind() {
             fcb::map::NodeKind::File => "file", fcb::map::NodeKind::Directory => "directory", fcb::map::NodeKind::Placeholder => "placeholder" })?;
         out.literal("}")?; Ok(())
     }
+}
+
+/// Re-exported for host FFI marshaling; the scope type is engine vocabulary
+/// and directly usable inside this module.
+pub use fcb::map::workspace::{AtlasExtensionScope, AtlasScope, AtlasScopeError};
+fn extension_scope(tokens: &[&str]) -> Option<AtlasScope> {
+    AtlasExtensionScope::from_extensions(tokens.iter().map(|token| token.as_bytes()))
+        .ok().map(AtlasScope::Extensions)
 }
 fn allocation(value: u64) -> Result<ResourceAllocationId, AtlasSessionError> {
     ResourceAllocationId::new(value).map_err(|_| AtlasSessionError::IdentityExhausted)

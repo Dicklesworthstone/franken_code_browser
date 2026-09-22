@@ -8,7 +8,7 @@
 use std::{fs, path::Path};
 use fcb::{ByteLength, ByteOffset, SourceRevision};
 use fcb::map::{LayoutOptions, LayoutRevision, Size2D};
-use fcb::map::workspace::{WorkspaceAtlas, WorkspaceAtlasError, WorkspaceAtlasLimits};
+use fcb::map::workspace::{AtlasScope, WorkspaceAtlas, WorkspaceAtlasError, WorkspaceAtlasLimits};
 use fcb::search::{CaptureRequest, RawPath, ResourceBudget, RootId, SearchManifestId};
 use fcb::search::workspace::{RootGrant, WorkspaceCatalog, WorkspaceError, WorkspaceLimits, WorkspaceStage};
 use fcb::source::{CancelFlag, DetectedEncoding, SourceError};
@@ -95,7 +95,7 @@ pub fn prepare(root: &Path, options: LegacyAtlasOptions, mut canceled: impl FnMu
         if canceled() { return Err(AppError::Canceled.into()); }
         std::str::from_utf8(entry.path().as_bytes()).map_err(|_| HostAtlasError::NonUtf8Path)?;
     }
-    let atlas = WorkspaceAtlas::build(&catalog, LayoutRevision::new(owner(), 1).map_err(|_| AppError::InvalidRange)?,
+    let atlas = WorkspaceAtlas::build(&catalog, &AtlasScope::All, LayoutRevision::new(owner(), 1).map_err(|_| AppError::InvalidRange)?,
         Size2D::new(WORLD, WORLD).map_err(|_| AppError::InvalidRange)?, LayoutOptions::modest(),
         WorkspaceAtlasLimits::default(), &budget, allocation(60), &mut canceled)?;
     let index = atlas.index(&budget, allocation(61), &mut canceled)?;

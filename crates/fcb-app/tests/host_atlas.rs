@@ -38,7 +38,7 @@ fn native_world_rectangles_are_exactly_the_shared_atlas_not_parent_local_or_roun
     let mut catalog = WorkspaceCatalog::open(grant, SearchManifestId::new(owner, 1).unwrap(), FileId::new(owner, 1).unwrap(),
         WorkspaceLimits::default(), false, &budget, allocation(1)).unwrap();
     while catalog.stage() == WorkspaceStage::Discovering { catalog.step(&CancelFlag::new()).unwrap(); }
-    let retained = WorkspaceAtlas::build(&catalog, LayoutRevision::new(owner, 1).unwrap(), Size2D::new(4096.0, 4096.0).unwrap(),
+    let retained = WorkspaceAtlas::build(&catalog, &fcb::map::workspace::AtlasScope::All, LayoutRevision::new(owner, 1).unwrap(), Size2D::new(4096.0, 4096.0).unwrap(),
         LayoutOptions::modest(), WorkspaceAtlasLimits::default(), &budget, allocation(2), || false).unwrap();
     let index = retained.index(&budget, allocation(3), || false).unwrap();
     for name in ["src/deep/a.rs", "src/deep/b.rs", "top.rs"] {

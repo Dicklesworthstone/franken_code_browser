@@ -38,7 +38,7 @@ fn catalog(path: &PathBuf, budget: &ResourceBudget, max_files: usize) -> Workspa
     assert_eq!(catalog.stage(), WorkspaceStage::Ready); catalog
 }
 fn build<'a>(catalog: &'a WorkspaceCatalog, budget: &ResourceBudget, id: u64) -> WorkspaceAtlas<'a> {
-    WorkspaceAtlas::build(catalog, revision(id), Size2D::new(1024.0, 768.0).unwrap(),
+    WorkspaceAtlas::build(catalog, &fcb::map::workspace::AtlasScope::All, revision(id), Size2D::new(1024.0, 768.0).unwrap(),
         LayoutOptions::modest(), WorkspaceAtlasLimits::default(), budget, allocation(id), || false).unwrap()
 }
 

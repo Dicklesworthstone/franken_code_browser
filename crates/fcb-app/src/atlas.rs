@@ -13,7 +13,7 @@ use std::{ffi::OsString, fs, io::Write, path::{Component, Path, PathBuf}};
 use fcb::{ByteLength, CameraGeneration, DisplayGeneration, DisplayMetrics, Point2D, Rect2D, Size2D};
 use fcb::map::{AtlasDetail, AtlasError, AtlasIndex, AtlasNodeId, Camera2D, CameraError,
     DisplayColorConfig, LayoutOptions, LayoutRevision, LodThresholds, VisibleLimits, VisibleQuery, VisibleState};
-use fcb::map::workspace::{WorkspaceAtlas, WorkspaceAtlasError, WorkspaceAtlasLimits};
+use fcb::map::workspace::{AtlasScope, WorkspaceAtlas, WorkspaceAtlasError, WorkspaceAtlasLimits};
 use fcb::map::workspace::text_search::{WorkspaceTextError, WorkspaceTextSource};
 use fcb::map::workspace::text_preview::{AtlasTextPreviewError, AtlasTextPreviewOptions};
 use fcb::map::workspace::stream_search::{AtlasStreamError, MAX_ATLAS_STREAM_CALLS};
@@ -357,7 +357,7 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
         catalog.step(&cancel)?;
     }
     let size = Size2D::new(options.width, options.height).map_err(|_| AppError::InvalidRange)?;
-    let atlas = WorkspaceAtlas::build(&catalog, LayoutRevision::new(owner(), 1).map_err(|_| AppError::InvalidRange)?,
+    let atlas = WorkspaceAtlas::build(&catalog, &AtlasScope::All, LayoutRevision::new(owner(), 1).map_err(|_| AppError::InvalidRange)?,
         size, LayoutOptions::modest(), WorkspaceAtlasLimits::default(), budget, allocation(60), &mut *canceled)?;
     let index = atlas.index(budget, allocation(61), &mut *canceled)?;
     let focus = match options.focus.as_deref() {

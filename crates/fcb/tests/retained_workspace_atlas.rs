@@ -46,7 +46,7 @@ fn build(catalog: WorkspaceCatalog, budget: &ResourceBudget) -> RetainedWorkspac
 fn real_catalog_bindings_and_layout_survive_moving_the_owner() {
     let fixture = Fixture::new(); let budget = budget(); let catalog = fixture.catalog(&budget, 8);
     let expected = {
-        let atlas = WorkspaceAtlas::build(&catalog, LayoutRevision::new(owner(), 1).unwrap(),
+        let atlas = WorkspaceAtlas::build(&catalog, &fcb::map::workspace::AtlasScope::All, LayoutRevision::new(owner(), 1).unwrap(),
             Size2D::new(4096.0, 4096.0).unwrap(), LayoutOptions::modest(), WorkspaceAtlasLimits::default(),
             &budget, allocation(2), || false).unwrap();
         let index = atlas.index(&budget, allocation(3), || false).unwrap();
