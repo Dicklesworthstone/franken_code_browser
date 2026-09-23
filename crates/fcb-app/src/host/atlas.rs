@@ -29,7 +29,7 @@ pub struct LegacyAtlasOptions {
 }
 impl Default for LegacyAtlasOptions {
     fn default() -> Self {
-        Self { max_files: 20_000, max_profile_file_bytes: 64 * 1024,
+        Self { max_files: 32_768, max_profile_file_bytes: 64 * 1024,
             max_profile_source_bytes: 16 * 1024 * 1024, max_profile_rows: MAX_PROFILE_ROWS }
     }
 }
@@ -61,7 +61,7 @@ impl std::error::Error for HostAtlasError {}
 /// host::atlas_plan for reversible native paths and partial discovery instead.
 pub fn prepare(root: &Path, options: LegacyAtlasOptions, mut canceled: impl FnMut() -> bool)
     -> Result<HostResponse, HostAtlasError> {
-    if options.max_files == 0 || options.max_files > 20_000
+    if options.max_files == 0 || options.max_files > 32_768
         || options.max_profile_file_bytes > 256 * 1024
         || options.max_profile_source_bytes > 64 * 1024 * 1024
         || options.max_profile_rows > MAX_PROFILE_ROWS { return Err(HostAtlasError::InvalidLimits); }
