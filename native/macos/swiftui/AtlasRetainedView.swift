@@ -3,6 +3,37 @@ import SwiftUI
 import QuartzCore
 import CoreText
 
+private struct AtlasTransitionDraw {
+    let tile: AtlasTextTile
+    let rect: CGRect
+    let contentScale: Double
+    let clipped: CGRect
+    let rows: Range<Int>
+}
+
+/// Render immutable source rows into a private context. The live camera and
+/// layer tree never enter this worker; publication checks its generation.
+private func renderAtlasTransition(canvas: CGRect, width: Int, height: Int,
+                                   background: CGColor, draws: [AtlasTransitionDraw]) -> CGImage? {
+    guard let bitmap = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+        bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+    bitmap.translateBy(x: 0, y: Double(height))
+    bitmap.scaleBy(x: Double(width) / canvas.width, y: -Double(height) / canvas.height)
+    bitmap.translateBy(x: -canvas.minX, y: -canvas.minY)
+    for draw in draws {
+        bitmap.saveGState()
+        bitmap.clip(to: draw.clipped)
+        bitmap.setFillColor(background)
+        bitmap.fill(draw.clipped)
+        bitmap.translateBy(x: draw.rect.minX, y: draw.rect.minY)
+        bitmap.scaleBy(x: draw.contentScale, y: draw.contentScale)
+        draw.tile.draw(in: bitmap, visibleRows: draw.rows)
+        bitmap.restoreGState()
+    }
+    return bitmap.makeImage()
+}
+
 /// The native view owns image residence. Source capture and shaping remain in
 /// AtlasDocument; camera updates only move the retained world and query detail.
 struct AtlasRetainedView: NSViewRepresentable {
@@ -119,6 +150,9 @@ final class AtlasRetainedSurface: NSView {
     private let transition = CALayer()
     private var transitionImage: CGImage?
     private var transitionTiles: [Int] = []
+    private let transitionWorker = DispatchQueue(label: "fcb.atlas.transition", qos: .userInitiated)
+    private var transitionGeneration: UInt64 = 0
+    private var transitionInFlight = false
     static let transitionByteLimit = 384 * 1024 * 1024
     private var matchLayers: [CALayer] = []
     private var matchRows: [CGRect] = []
@@ -127,7 +161,9 @@ final class AtlasRetainedSurface: NSView {
     private var spatial: [Cell: [Int]] = [:]
     private var largeTiles: [Int] = []
     private var outlines: [String: CALayer] = [:]
+    private var outlineGutters: [String: Double] = [:]
     private var directories: [String: CAShapeLayer] = [:]
+    private var directoryGutters: [String: Double] = [:]
     private var revision: UUID?
     private var patches: [PatchKey: Patch] = [:]
     private var pending: [Request] = []
@@ -285,6 +321,7 @@ final class AtlasRetainedSurface: NSView {
                 offset: CGPoint, selectedPath: String?, hitPaths: Set<String>, matchRows: [CGRect]) {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         if revision != nextRevision {
+            transitionGeneration &+= 1
             stopClock()
             world.sublayers = nil
             clearTransition()
@@ -294,7 +331,9 @@ final class AtlasRetainedSurface: NSView {
             pendingCaptions.removeAll(keepingCapacity: true); metrics.captionBytes = 0
             tiles = next; revision = nextRevision
             overview.removeAll(keepingCapacity: true); spatial.removeAll(keepingCapacity: true)
-            outlines.removeAll(keepingCapacity: true); directories.removeAll(keepingCapacity: true); largeTiles.removeAll(keepingCapacity: true)
+            outlines.removeAll(keepingCapacity: true); outlineGutters.removeAll(keepingCapacity: true)
+            directories.removeAll(keepingCapacity: true); directoryGutters.removeAll(keepingCapacity: true)
+            largeTiles.removeAll(keepingCapacity: true)
             for highlight in matchLayers { highlight.removeFromSuperlayer() }
             matchLayers.removeAll(keepingCapacity: true); self.matchRows = []
             patches.removeAll(keepingCapacity: true); pending.removeAll(keepingCapacity: true)
@@ -308,10 +347,14 @@ final class AtlasRetainedSurface: NSView {
                 image.contentsGravity = .resize
                 image.minificationFilter = .linear
                 image.magnificationFilter = .linear
+                if let parcel = tile.parcelRect {
+                    let gutter = Self.contentGutter(tile.rect, inside: parcel)
+                    outlineGutters[tile.path] = min(outlineGutters[tile.path] ?? gutter, gutter)
+                }
                 if tile.parcelFirst, let parcel = tile.parcelRect {
                     let outline = CALayer()
                     outline.frame = parcel; outline.zPosition = 2
-                    outline.borderWidth = 0.85 / scale
+                    outline.borderWidth = 0
                     outline.borderColor = Self.outlineColor(tile.path)
                     world.addSublayer(outline); outlines[tile.path] = outline
                 }
@@ -337,9 +380,11 @@ final class AtlasRetainedSurface: NSView {
             var directoryRects: [String: CGRect] = [:]
             for tile in tiles where tile.parcelFirst {
                 guard let parcel = tile.parcelRect else { continue }
+                let gutter = outlineGutters[tile.path] ?? 0
                 var directory = (tile.path as NSString).deletingLastPathComponent
                 while !directory.isEmpty && directory != "." && directory != "/" {
                     directoryRects[directory] = directoryRects[directory].map { $0.union(parcel) } ?? parcel
+                    directoryGutters[directory] = min(directoryGutters[directory] ?? gutter, gutter)
                     directory = (directory as NSString).deletingLastPathComponent
                 }
             }
@@ -349,6 +394,7 @@ final class AtlasRetainedSurface: NSView {
                 boundary.frame = rect; boundary.zPosition = 2.2
                 boundary.strokeColor = Self.directoryColor(path)
                 boundary.fillColor = nil
+                boundary.lineJoin = .round
                 world.addSublayer(boundary); directories[path] = boundary
             }
             metrics.installs += 1
@@ -375,7 +421,8 @@ final class AtlasRetainedSurface: NSView {
             selected = selectedPath; hits = hitPaths
             for (path, outline) in outlines {
                 let marked = path == selectedPath || hitPaths.contains(path)
-                outline.borderWidth = (marked ? 1.5 : 0.85) / scale
+                outline.borderWidth = Self.safeStrokeWidth(marked ? 1.5 : 0.85,
+                    scale: scale, gutter: outlineGutters[path] ?? 0)
                 outline.borderColor = marked ? (path == selectedPath ? NSColor.yellow : NSColor.orange).cgColor
                     : Self.outlineColor(path)
             }
@@ -402,6 +449,7 @@ final class AtlasRetainedSurface: NSView {
         }
         let strokesChanged = lastViewport.isNull || desired != lastDesiredPixelsPerWorld || lastLevel == Int.min
         lastViewport = viewport; lastLevel = level; lastDesiredPixelsPerWorld = desired
+        transitionGeneration &+= 1
         serial &+= 1
         pending.removeAll(keepingCapacity: true); required.removeAll(keepingCapacity: true)
         visibleRequired.removeAll(keepingCapacity: true)
@@ -432,7 +480,9 @@ final class AtlasRetainedSurface: NSView {
         for index in visible {
             let tile = tiles[index]
             if bordered.insert(tile.path).inserted, let outline = outlines[tile.path] {
-                outline.borderWidth = (tile.path == selected || hits.contains(tile.path) ? 1.5 : 0.85) / scale
+                outline.borderWidth = Self.safeStrokeWidth(
+                    tile.path == selected || hits.contains(tile.path) ? 1.5 : 0.85,
+                    scale: scale, gutter: outlineGutters[tile.path] ?? 0)
             }
         }
         for (path, boundary) in directories {
@@ -442,13 +492,18 @@ final class AtlasRetainedSurface: NSView {
             // when a pure pan leaves the zoom and stroke density unchanged.
             if !hidden && (strokesChanged || boundary.isHidden) {
                 let depth = path.split(separator: "/").count
-                // Separate coincident ancestor/child edges by a few screen pixels;
-                // drawing all borders on the same edge hides the outer directory.
+                let gutter = directoryGutters[path] ?? 0
+                let width = Self.safeStrokeWidth(depth <= 2 ? 2.0 : 1.25,
+                    scale: scale, gutter: gutter)
+                // Directory bounds are unions of file parcels. A screen-space
+                // inset grows into source text during zoom-out; keep the entire
+                // stroke inside the actual text-free parcel gutter instead.
                 let inset = min((1 + Double(depth) * 1.75) / scale,
-                                min(boundary.frame.width, boundary.frame.height) * 0.25)
+                    max(0, gutter - width),
+                    min(boundary.frame.width, boundary.frame.height) * 0.25)
                 boundary.path = CGPath(rect: CGRect(origin: .zero, size: boundary.frame.size)
                     .insetBy(dx: inset, dy: inset), transform: nil)
-                boundary.lineWidth = (depth <= 2 ? 2.0 : 1.25) / scale
+                boundary.lineWidth = width
             }
             boundary.isHidden = hidden
         }
@@ -546,6 +601,7 @@ final class AtlasRetainedSurface: NSView {
     }
 
     private func clearTransition() {
+        transitionGeneration &+= 1
         transition.isHidden = true
         transition.contents = nil
         transitionImage = nil
@@ -617,31 +673,50 @@ final class AtlasRetainedSurface: NSView {
             clearTransition(); metrics.transitionFailures += 1; return
         }
         let width = Int(physicalWidth), height = Int(physicalHeight)
-        guard let bitmap = CGContext(data: nil, width: width, height: height,
-            bitsPerComponent: 8, bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
-            clearTransition(); metrics.transitionFailures += 1; return
-        }
-        bitmap.translateBy(x: 0, y: Double(height))
-        bitmap.scaleBy(x: Double(width) / canvas.width, y: -Double(height) / canvas.height)
-        bitmap.translateBy(x: -canvas.minX, y: -canvas.minY)
-        for index in missing {
+        let background = Monokai.background.cgColor
+        let draws = missing.map { index -> AtlasTransitionDraw in
             let tile = tiles[index]
             let clipped = tile.rect.intersection(canvas)
-            bitmap.saveGState()
-            bitmap.clip(to: clipped)
-            bitmap.setFillColor(Monokai.background.cgColor)
-            bitmap.fill(clipped)
-            bitmap.translateBy(x: tile.rect.minX, y: tile.rect.minY)
-            bitmap.scaleBy(x: tile.contentScale, y: tile.contentScale)
             let first = max(0, min(tile.lineCount,
                 Int(floor(((clipped.minY - tile.rect.minY) / tile.contentScale - 38) / AtlasTextTile.lineHeight))))
             let end = max(first, min(tile.lineCount,
                 Int(ceil(((clipped.maxY - tile.rect.minY) / tile.contentScale + 16) / AtlasTextTile.lineHeight))))
-            tile.draw(in: bitmap, visibleRows: first..<end)
-            bitmap.restoreGState()
+            return AtlasTransitionDraw(tile: tile, rect: tile.rect, contentScale: tile.contentScale,
+                                       clipped: clipped, rows: first..<end)
         }
-        guard let image = bitmap.makeImage() else {
+        if metal != nil && window != nil {
+            guard !transitionInFlight else { return }
+            transitionInFlight = true
+            let generation = transitionGeneration
+            let paintedTiles = missing
+            transitionWorker.async { [weak self] in
+                let image = renderAtlasTransition(canvas: canvas, width: width, height: height,
+                                                  background: background, draws: draws)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.transitionInFlight = false
+                    guard self.transitionGeneration == generation else {
+                        self.lastLevel = Int.min
+                        self.refreshDetail()
+                        return
+                    }
+                    guard let image else { self.metrics.transitionFailures += 1; return }
+                    CATransaction.begin(); CATransaction.setDisableActions(true)
+                    self.transition.frame = canvas
+                    self.transition.contents = image
+                    self.transition.contentsGravity = .resize
+                    self.transition.isHidden = false
+                    CATransaction.commit()
+                    self.transitionImage = image; self.transitionTiles = paintedTiles
+                    self.metrics.transitionRasters += 1
+                    self.metrics.transitionBytes = width * height * 4
+                    self.metrics.transitionSeconds += CACurrentMediaTime() - start
+                }
+            }
+            return
+        }
+        guard let image = renderAtlasTransition(canvas: canvas, width: width, height: height,
+                                                background: background, draws: draws) else {
             clearTransition(); metrics.transitionFailures += 1; return
         }
         transition.frame = canvas
@@ -656,6 +731,17 @@ final class AtlasRetainedSurface: NSView {
 
     private static func outlineColor(_ path: String) -> CGColor {
         directoryColor((path as NSString).deletingLastPathComponent).copy(alpha: 0.65) ?? NSColor.gray.cgColor
+    }
+
+    private static func contentGutter(_ content: CGRect, inside parcel: CGRect) -> Double {
+        guard [content.minX, content.minY, content.maxX, content.maxY,
+               parcel.minX, parcel.minY, parcel.maxX, parcel.maxY].allSatisfy(\.isFinite) else { return 0 }
+        return max(0, min(content.minX - parcel.minX, content.minY - parcel.minY,
+                          parcel.maxX - content.maxX, parcel.maxY - content.maxY))
+    }
+
+    private static func safeStrokeWidth(_ screenPoints: Double, scale: Double, gutter: Double) -> Double {
+        max(0, min(screenPoints / scale, gutter * 0.75))
     }
 
     private static func directoryColor(_ path: String) -> CGColor {

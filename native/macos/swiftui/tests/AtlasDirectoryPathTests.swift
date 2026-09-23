@@ -11,7 +11,7 @@ import QuartzCore
         guard let document = AtlasDocument(path: "root/nested/leaf/file.swift", capture: capture),
               let tile = document.tiles.first else { preconditionFailure("source fixture") }
         let parcel = CGRect(x: 0, y: 0, width: 500, height: 300)
-        tile.rect = parcel; tile.parcelRect = parcel; tile.parcelFirst = true
+        tile.rect = parcel.insetBy(dx: 5, dy: 5); tile.parcelRect = parcel; tile.parcelFirst = true
         let surface = AtlasRetainedSurface(metalEnabled: false)
         surface.frame = CGRect(x: 0, y: 0, width: 200, height: 100)
         let revision = UUID()
@@ -32,15 +32,23 @@ import QuartzCore
             precondition(layers.count == 3, "three real directory ancestors")
             for (index, layer) in layers.enumerated() {
                 let depth = index + 1
-                let inset = min((1 + Double(depth) * 1.75) / scale, 75)
+                let width = min((depth <= 2 ? 2.0 : 1.25) / scale, 3.75)
+                let inset = min((1 + Double(depth) * 1.75) / scale, 5 - width, 75)
                 let expected = CGPath(rect: CGRect(x: inset, y: inset,
                     width: 500 - 2 * inset, height: 300 - 2 * inset), transform: nil)
                 precondition(!layer.isHidden && layer.path == expected,
                              "visible directory must restore current-scale ancestor geometry")
-                precondition(layer.lineWidth == (depth <= 2 ? 2.0 : 1.25) / scale)
+                precondition(layer.lineWidth == width)
+                precondition(inset + width <= 5, "directory stroke must stay outside source text")
                 precondition(layer.strokeColor != nil)
                 checks += 1
             }
+            let fileBorders = shapes(surface.layer!).filter { $0.zPosition == 2 }
+            precondition(fileBorders.isEmpty, "file outlines are retained border layers, not stroked paths")
+            let fileOutline = (surface.layer!.sublayers ?? []).flatMap { $0.sublayers ?? [] }
+                .first { $0.zPosition == 2 && !($0 is CAShapeLayer) }
+            precondition(fileOutline != nil && fileOutline!.borderWidth < 5,
+                         "file border must stay inside its text-free parcel gutter")
         }
         update(1, CGPoint(x: -4000, y: -4000))
         precondition(boundaries().count == 3 && boundaries().allSatisfy { $0.isHidden && $0.path == nil },
