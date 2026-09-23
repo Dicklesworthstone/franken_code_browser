@@ -229,20 +229,24 @@ ATTACHED=1
 app="$MOUNT/FrankenCodeBrowser.app"
 [[ -d "$app/Contents/MacOS" && ! -L "$app" ]] || { err 'The DMG has no app bundle'; exit 1; }
 bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")
+app_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
 bundle_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")
 [[ "$bundle_id" = "$BUNDLE_ID" ]] || { err 'Unexpected app bundle identifier'; exit 1; }
 codesign --verify --deep --strict "$app" || { err 'App signature is invalid'; exit 1; }
 team=$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')
 [[ "$team" = "$TEAM_ID" ]] || { err 'App is not signed by the expected developer'; exit 1; }
 spctl --assess --type execute "$app" || { err 'Gatekeeper rejected the app'; exit 1; }
-ok "Apple Developer ID and Gatekeeper verified (build $bundle_version)"
+ok "Apple Developer ID and Gatekeeper verified (version $app_version, build $bundle_version)"
 
 destination="$DEST/FrankenCodeBrowser.app"
 if [[ -e "$destination" && $FORCE -eq 0 ]]; then
     installed_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' \
         "$destination/Contents/Info.plist" 2>/dev/null || true)
-    if [[ "$installed_version" = "$bundle_version" ]] && codesign --verify --deep --strict "$destination"; then
-        ok "Already installed: $destination (build $bundle_version)"
+    installed_short_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+        "$destination/Contents/Info.plist" 2>/dev/null || true)
+    if [[ "$installed_version" = "$bundle_version" && "$installed_short_version" = "$app_version" ]] \
+        && codesign --verify --deep --strict "$destination"; then
+        ok "Already installed: $destination (version $app_version, build $bundle_version)"
         exit 0
     fi
     err "An app already exists at $destination; use --force to preserve it as a backup and upgrade"
@@ -266,5 +270,5 @@ fi
 codesign --verify --deep --strict "$destination"
 ok "Installed: $destination"
 [[ -z "$BACKUP" ]] || info "Previous app preserved at: $BACKUP"
-draw_box "Installed FrankenCodeBrowser $bundle_version" "Open it from Applications or run: open '$destination'" \
+draw_box "Installed FrankenCodeBrowser $app_version" "Open it from Applications or run: open '$destination'" \
     "To uninstall, move $destination to Trash."
