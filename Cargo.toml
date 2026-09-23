@@ -16,5 +16,6 @@ members = [
     "crates/fcb-render",
     "crates/fcb-ui",
     "crates/fcb-bridge",
+    "native/macos",
 ]
 exclude = ["probes/headless_consumer"]

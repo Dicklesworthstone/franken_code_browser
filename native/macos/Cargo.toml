@@ -1,0 +1,21 @@
+[package]
+name = "franken-macos"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[features]
+# Explicit application packaging; ordinary library builds need no Swift SDK.
+swiftui-app = []
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "main-thread-qualification"
+path = "src/bin/main_thread_qualification.rs"
+
+[[bin]]
+name = "fcb-window"
+path = "src/bin/fcb_window.rs"
