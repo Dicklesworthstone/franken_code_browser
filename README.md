@@ -1,10 +1,12 @@
 <div align="center">
 
-# FrankenCodeBrowser (`fcb`)
+<h1><img src="native/macos/swiftui/Resources/AppIcon.png" alt="FrankenCodeBrowser icon" width="64"> FrankenCodeBrowser <code>fcb</code></h1>
 
 **A spatial source browser with a Rust engine and a native Metal app for Apple Silicon.**
 
 Explore the repository. Zoom into exact source. Search without losing your place.
+
+Initial idea and visual inspiration: [Rik Arends (@rikarends)](https://x.com/rikarends?lang=en).
 
 [![Status](https://img.shields.io/badge/status-developer%20preview-d29922)](#what-exists-today)
 [![Target](https://img.shields.io/badge/target-Apple%20Silicon-555555)](#platform-and-distribution)
@@ -13,11 +15,27 @@ Explore the repository. Zoom into exact source. Search without losing your place
 
 </div>
 
+## Install on Mac
+
+For Apple Silicon Macs running macOS 14 or later, [download the notarized DMG](https://github.com/Dicklesworthstone/franken_code_browser/releases/latest/download/FrankenCodeBrowser-macos-arm64.dmg), open it, and drag `FrankenCodeBrowser.app` to Applications. Or install with either command:
+
+```sh
+brew install --cask dicklesworthstone/tap/franken-code-browser
+```
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_code_browser/main/scripts/install.sh | bash
+```
+
+The shell installer downloads the current release and its SHA-256 sidecar, verifies the signed app and Gatekeeper assessment, and installs to `~/Applications`. It preserves an existing installation; use `--force` when you want to replace it and keep a dated backup. Run `bash scripts/install.sh --help` from a clone for version pinning, alternate destinations, and offline installation. The [release page](https://github.com/Dicklesworthstone/franken_code_browser/releases) has the checksum and release notes.
+
+Open FrankenCodeBrowser, choose a project folder, drag to pan, and scroll to zoom. Use `⌘F` to search exact text, click a file to read it, or choose a file-type filter from the toolbar (Markdown, Python, Rust, or custom extensions).
+
 > [!IMPORTANT]
 > This repository contains the Rust engine, C ABI bridge, headless `fcb` source tools, and the
 > SwiftUI/Metal app under [`native/macos/`](native/macos/). A single checkout can build the app and
-> a drag-to-Applications DMG. A local Developer ID-signed DMG has been notarized; no download or
-> Mac App Store version has shipped.
+> a drag-to-Applications DMG. A Developer ID-signed, notarized DMG is available as a public
+> developer-preview release. No Mac App Store version has shipped.
 > The [implementation status](IMPLEMENTATION_STATUS.md) document is a dated September 14
 > snapshot; code and current qualification evidence take precedence where it has gone stale.
 
@@ -39,7 +57,7 @@ development.
 |---|---|
 | Rust engine and bridge | Workspace discovery, exact source captures, layout, search, saved-repository and reader services, plus a C ABI for the native shell. |
 | Headless `fcb` binary | Explicit file/workspace inspection, bounded reading and exact text/byte search with versioned JSON. Bare `fcb` and human `fcb open` still report that the GUI launcher is unavailable in this binary. |
-| Native app | [`native/macos/`](native/macos/) contains a SwiftUI shell with dense text parcels, directory outlines, Monokai-inspired color, Metal glyph presentation, camera gestures, search, reader and local prepared-text cache. It is a developer preview, not a published installer. |
+| Native app | [`native/macos/`](native/macos/) contains a SwiftUI shell with dense text parcels, directory outlines, Monokai-inspired color, Metal glyph presentation, camera gestures, exact-text search with a match count, file-type filters, a source reader and local prepared-text cache. A notarized developer-preview DMG is available. |
 | Future work | Full Markdown reading, complete native accessibility/IME, code-city mode, release-grade smoothness, clean-machine distribution qualification and App Store sandbox qualification remain open. |
 
 The core interaction is deliberately continuous:
@@ -113,24 +131,25 @@ exception for sibling dependencies. See [DEPENDENCY_CONSTITUTION.md](DEPENDENCY_
 
 ## Platform and distribution
 
-The first GUI targets late-model Apple Silicon Macs, particularly M4/M5 configurations with at
-least 24 GB of unified memory. Headless library components must also work on supported non-Mac
-test hosts without Apple frameworks. Native Windows, Linux, iOS and browser UIs are not initial
-release commitments.
+The published GUI build requires an Apple Silicon Mac running macOS 14 or later. Larger projects
+benefit from more unified memory; the original performance plan uses late-model M4/M5 Macs with at
+least 24 GB for its target workload, but that is not an installation requirement. Headless library
+components must also work on supported non-Mac test hosts without Apple frameworks. Native Windows,
+Linux, iOS and browser UIs are not initial release commitments.
 
 The headless `fcb` executable exists in source, and the native app links this engine.
-The current source revision has a fresh physical-Mac app build and a local Developer ID-signed,
-notarized drag-to-Applications DMG. Public distribution still needs quarantined first-launch and
-clean-machine qualification, plus a published release and checksum. A Mac App Store build needs
+Version 0.1.0 has a physical-Mac app build and a public Developer ID-signed, notarized
+drag-to-Applications DMG with a checksum sidecar. Quarantined first-launch and
+clean-machine qualification remain open. A Mac App Store build needs
 separate distribution signing and sandboxed project access; it cannot be made by renaming or
 uploading the DMG.
 
-The standalone runtime can still be distributed inside a disk image or installer for offline
-notarization support. A self-contained executable and a bare downloadable file are different
-packaging choices; each launch route needs qualification.
+The release DMG bundles the native app. Its code signature, notarization ticket, checksum and
+local Gatekeeper assessment have been checked; offline first launch from a quarantined download
+remains part of clean-machine qualification.
 
-No downloadable release is available yet. The native app currently targets macOS 14+ on Apple
-Silicon; the full clean-machine installation matrix remains unverified.
+The native app currently targets macOS 14+ on Apple Silicon; the full clean-machine installation
+matrix remains unverified.
 
 ## Build and install the Mac app
 
@@ -218,8 +237,8 @@ corpus, source revision and cache state. See plan §21 and
 The plan defines 97 work packages and eight product gates, G0–G7. Substantial source, search,
 cache, native renderer and UI work has landed since the last dated implementation-status snapshot.
 Gate and release claims still need the specified independent verification, native usability, clean
-dependency closure and distribution evidence. The immediate release work is to make the native
-source publicly buildable, qualify sustained zoom on physical Macs, and produce a notarized DMG.
+dependency closure and distribution evidence. The immediate work is to qualify sustained zoom on
+physical Macs and the published DMG's first launch on clean machines.
 
 | Read | For |
 |---|---|
@@ -235,8 +254,9 @@ source publicly buildable, qualify sustained zoom on physical Macs, and produce 
 
 ## Limitations and common questions
 
-**Can I run it now?** You can build both the headless `fcb` source tools and the SwiftUI/Metal app
-from this checkout. There is no public, notarized installer yet.
+**Can I run it now?** Yes. Install the notarized Mac developer preview using the DMG, Homebrew, or
+shell installer above. You can also build the headless `fcb` source tools and SwiftUI/Metal app from
+this checkout.
 
 **Is it an IDE?** The planned product focuses on reading and navigation. It does not need to
 execute source, compile projects or run language servers to open a directory.

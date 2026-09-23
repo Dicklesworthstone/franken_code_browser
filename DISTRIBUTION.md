@@ -11,10 +11,12 @@ The native source is a developer preview. A Developer ID-signed DMG and a Mac Ap
 - [x] Built commit `3d8cece9ec98` from this checkout on the physical `mac-mini-old`, installed and opened it on `~/projects/asupersync`, and observed the 20,619-file atlas. This is a native launch check, not the clean-machine distribution matrix.
 - [x] The authenticated `asc` API-key route submitted the local `FrankenCodeBrowser-0.1.0-3d8cece9ec98-notarized-macos-arm64.dmg`. Apple returned **Accepted** (submission `42ff7bad-9507-41a8-8261-79e269e3a1c4`); stapling and ticket validation succeeded. SHA-256: `34aa86c0a86a15909937087554af860eb6722efa035623bc8456fd9ed25a1e39`.
 - [x] The staged app passed `codesign --verify --deep --strict` and local `spctl --assess --type execute` reported `Notarized Developer ID`. The image also passed `hdiutil verify`.
+- [x] Rebuilt source commit `4286f92` from this checkout and produced the final `FrankenCodeBrowser-macos-arm64.dmg`. Apple accepted notarization submission `dd298bb5-5c27-41ff-8864-8ab6bb9bdf0e`; stapler validation and `hdiutil verify` passed. SHA-256: `698293fc864d984fda3deea37769abd84adcc7fd44a9dbffd6bd9bc214244b76`.
+- [x] Published [v0.1.0](https://github.com/Dicklesworthstone/franken_code_browser/releases/tag/v0.1.0) with the final DMG and matching `.sha256` sidecar. The installer fetched them through the public latest-release URL and installed into an isolated destination after checksum, code-signature, Team ID, and Gatekeeper checks.
+- [x] Published the [Homebrew cask](https://github.com/Dicklesworthstone/homebrew-tap/blob/main/Casks/franken-code-browser.rb); `brew style --cask`, `brew audit --cask --strict`, and `brew fetch --cask` passed against the release.
 - [ ] Check the final DMG as a quarantined download on a clean Mac, including online/offline first launch and drag-to-Applications installation. Local signing/notarization checks do not prove that matrix.
-- [ ] Publish the verified DMG and checksum as a GitHub Release.
 
-`--local-test` is only for checking the drag-and-drop image. It deliberately does not claim notarization. The signed/notarized artifact above remains local; there is no public release download yet.
+`--local-test` is only for checking the drag-and-drop image. It deliberately does not claim notarization. The earlier `3d8cece9ec98` image remains a historical local artifact; the `4286f92` image and checksum above are the published release.
 
 ## Mac App Store
 

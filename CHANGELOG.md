@@ -1,10 +1,26 @@
 # Changelog
 
-This record is based on the repository's Git history and checked-in Beads exports through
-2026-09-22. There are no version tags or GitHub Releases. These are source milestones, not a
-claim that the complete product or a signed app has shipped.
+This record is based on the repository's Git history, checked-in Beads exports, and the published
+release. Version 0.1.0 is a developer preview, not a claim that all product gates are complete.
+Scope window: September 12–23, 2026.
 
-## Unreleased — source browser and one-repo Mac app (September 14–22, 2026)
+## Version Timeline
+
+| Date | Milestone | Distribution |
+|---|---|---|
+| September 23, 2026 | [v0.1.0](https://github.com/Dicklesworthstone/franken_code_browser/releases/tag/v0.1.0) | Public notarized Mac developer preview |
+| September 14–22, 2026 | One-repo source browser and Mac app | Source milestones; local test builds |
+| September 12–13, 2026 | Documentation bootstrap | No binary release |
+
+## v0.1.0 — notarized Mac developer preview (September 23, 2026)
+
+### Delivered capability
+
+- Published the [first GitHub release](https://github.com/Dicklesworthstone/franken_code_browser/releases/tag/v0.1.0) with a Developer ID-signed, Apple-notarized and stapled drag-to-Applications DMG and its SHA-256 sidecar. The release image's SHA-256 is `698293fc864d984fda3deea37769abd84adcc7fd44a9dbffd6bd9bc214244b76`.
+- Added a verified one-line shell installer and a [Homebrew cask](https://github.com/Dicklesworthstone/homebrew-tap/blob/main/Casks/franken-code-browser.rb) for Apple Silicon Macs running macOS 14 or later. The cask passed `brew style`, strict audit, and fetch against the published artifact; the online installer passed an isolated install test.
+- The release does not yet establish clean-machine first-launch, sustained smooth zoom, or Mac App Store qualification. See [distribution status](DISTRIBUTION.md).
+
+## Earlier source milestones — one-repo Mac app (September 14–22, 2026)
 
 ### Engine and headless source tools
 
@@ -31,17 +47,17 @@ claim that the complete product or a signed app has shipped.
   zoom/pan, captured-source search highlighting and retained Metal glyph presentation. The latest
   performance campaign also records unresolved display-delivery stutter; fast GPU draw timings
   alone do not establish smooth zoom. See [current distribution gates](DISTRIBUTION.md).
-- Built commit `3d8cece9ec98` on a physical Mac, opened the Asupersync repository, and produced a
+- Built [commit `3d8cece9ec98`](https://github.com/Dicklesworthstone/franken_code_browser/commit/3d8cece9ec98) on a physical Mac, opened the Asupersync repository, and produced a
   local Developer ID-signed DMG. Apple accepted its notarization, the ticket was stapled and
   validated, and the staged app passed local Gatekeeper assessment. The packager now supports the
   authenticated `asc` API-key route as well as `notarytool`; the exact artifact and remaining
   qualification work are recorded in [distribution status](DISTRIBUTION.md).
 
-### Release state
+### Distribution state at that milestone
 
-- The signed/notarized DMG is local, with no GitHub Release download yet. Quarantined clean-machine
-  installation remains unqualified. There is no App Store upload or App Review submission; that
-  route still needs sandboxed project access and separate Mac distribution signing.
+- A signed/notarized DMG was built locally before the public v0.1.0 release. Quarantined
+  clean-machine installation remained unqualified. There was no App Store upload or App Review
+  submission; that route still needs sandboxed project access and separate Mac distribution signing.
 
 ## Historical bootstrap — September 12–13, 2026
 
