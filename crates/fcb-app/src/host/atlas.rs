@@ -13,12 +13,13 @@ use fcb::search::{CaptureRequest, RawPath, ResourceBudget, RootId, SearchManifes
 use fcb::search::workspace::{RootGrant, WorkspaceCatalog, WorkspaceError, WorkspaceLimits, WorkspaceStage};
 use fcb::source::{CancelFlag, DetectedEncoding, SourceError};
 use fcb::source::line_index::{LineNumber, LineWindowScanner, LineWindowStatus};
-use crate::{AppError, MANAGED_BYTES, allocation, file_id, input, owner, workspace};
-use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
+use crate::{AppError, allocation, file_id, input, owner, workspace};
+use crate::output::{Output, OutputError, MAX_ENCODED_BYTES};
 use super::{HostError, HostResponse};
 
 const WORLD: f64 = 4096.0;
 const MAX_PROFILE_ROWS: usize = 4000;
+const ATLAS_MANAGED_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LegacyAtlasOptions {
@@ -66,10 +67,10 @@ pub fn prepare(root: &Path, options: LegacyAtlasOptions, mut canceled: impl FnMu
         || options.max_profile_source_bytes > 64 * 1024 * 1024
         || options.max_profile_rows > MAX_PROFILE_ROWS { return Err(HostAtlasError::InvalidLimits); }
     if canceled() { return Err(AppError::Canceled.into()); }
-    let budget = ResourceBudget::new(owner(), ByteLength::new(MANAGED_BYTES)).map_err(|_| AppError::Admission)?;
+    let budget = ResourceBudget::new(owner(), ByteLength::new(ATLAS_MANAGED_BYTES)).map_err(|_| AppError::Admission)?;
     // Covers compatibility String + native handoff + source/profile temporary
     // overlap. The catalog, layout, spatial index and encoder lease separately.
-    let charge = 3 * MAX_RESPONSE_BYTES + 8 * options.max_profile_file_bytes
+    let charge = 3 * MAX_ENCODED_BYTES + 8 * options.max_profile_file_bytes
         + MAX_PROFILE_ROWS * 64 + 256 * 1024;
     let lease = budget.try_reserve_managed(owner(), allocation(94), ByteLength::new(charge as u64))
         .map_err(|_| AppError::Admission)?;
@@ -99,7 +100,7 @@ pub fn prepare(root: &Path, options: LegacyAtlasOptions, mut canceled: impl FnMu
         Size2D::new(WORLD, WORLD).map_err(|_| AppError::InvalidRange)?, LayoutOptions::modest(),
         WorkspaceAtlasLimits::default(), &budget, allocation(60), &mut canceled)?;
     let index = atlas.index(&budget, allocation(61), &mut canceled)?;
-    let mut out = Output::new(owner(), MAX_RESPONSE_BYTES, &budget, allocation(1))?;
+    let mut out = Output::new(owner(), MAX_ENCODED_BYTES, &budget, allocation(1))?;
     out.literal("{\"schema\":\"fcb.host-atlas/1\",\"identity_scope\":\"response-local\",\"native_presented\":false,\"discovery_complete\":true,\"policy\":")?;
     out.quoted(catalog.policy_name())?;
     out.literal(",\"metric\":")?; out.quoted(atlas.layout().options().metric().name())?;

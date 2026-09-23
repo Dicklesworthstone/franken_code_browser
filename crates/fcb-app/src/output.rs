@@ -10,6 +10,7 @@ use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, R
 use fcb::source::RawPath;
 
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_ENCODED_BYTES: usize = 16 * 1024 * 1024;
 const PATH_SCRATCH_BYTES: usize = 256 * 1024;
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -34,7 +35,7 @@ pub struct Output {
 impl Output {
     pub fn new(owner: ArenaOwnerId, limit: usize, budget: &ResourceBudget,
         allocation: ResourceAllocationId) -> Result<Self, OutputError> {
-        if limit == 0 || limit > MAX_RESPONSE_BYTES { return Err(OutputError::Limit); }
+        if limit == 0 || limit > MAX_ENCODED_BYTES { return Err(OutputError::Limit); }
         let charged = limit + PATH_SCRATCH_BYTES + size_of::<Self>();
         let lease = budget.try_reserve_managed(owner, allocation, ByteLength::new(charged as u64))
             .map_err(|_| OutputError::Allocation)?;

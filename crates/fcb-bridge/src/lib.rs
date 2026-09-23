@@ -109,7 +109,14 @@ pub unsafe extern "C" fn fcb_atlas_plan(root: *const c_char) -> *mut c_char {
 pub unsafe extern "C" fn fcb_atlas_layout(root: *const c_char) -> *mut c_char {
     reply(|| {
         let root = unsafe { cstr(root) }?;
-        let result = host::atlas::prepare(Path::new(root), host::atlas::LegacyAtlasOptions::default(), || false).ok()?;
+        // The native shell shapes source from fcb_source_document. Its atlas
+        // route needs file geometry, not a second line-profile scan and the
+        // large profile payload that scan would add for broad repositories.
+        let options = host::atlas::LegacyAtlasOptions {
+            max_profile_source_bytes: 0,
+            ..Default::default()
+        };
+        let result = host::atlas::prepare(Path::new(root), options, || false).ok()?;
         string_out(result.as_str())
     })
 }

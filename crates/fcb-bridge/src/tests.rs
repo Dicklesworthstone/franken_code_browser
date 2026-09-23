@@ -70,7 +70,7 @@ fn structured_readers_reuse_exact_source_decoding_and_keep_error_json() {
     assert!(invalid.ends_with('\n'));
 }
 #[test]
-fn legacy_and_versioned_atlas_routes_share_native_policy_and_expose_real_profiles() {
+fn native_atlas_geometry_avoids_unused_profiles_and_shares_discovery_policy() {
     let root = root(); let path = native(&root);
     fs::create_dir_all(root.join("src/deep")).unwrap(); fs::create_dir(root.join("target")).unwrap();
     fs::write(root.join("src/deep/main.rs"), b"one\r\ntwo\rthree\n").unwrap();
@@ -78,8 +78,8 @@ fn legacy_and_versioned_atlas_routes_share_native_policy_and_expose_real_profile
     let legacy = take(unsafe { fcb_atlas_layout(path.as_ptr()) }).unwrap();
     assert!(legacy.contains("\"world\":{\"w\":4096,\"h\":4096}"));
     assert!(legacy.contains("\"path\":\"src/deep/main.rs\""));
-    assert!(legacy.contains("\"source_lines\":\"3\""));
-    assert!(legacy.contains("\"n\":3,"));
+    assert!(legacy.contains("\"profile_state\":\"disabled\""));
+    assert!(legacy.contains("\"n\":0,"));
     assert!(!legacy.contains("excluded.rs"));
     let plan = take(unsafe { fcb_atlas_plan(path.as_ptr()) }).unwrap();
     assert!(plan.contains("fcb.atlas/1"));
