@@ -16,7 +16,8 @@ Explore the repository. Zoom into exact source. Search without losing your place
 > [!IMPORTANT]
 > This repository contains the Rust engine, C ABI bridge, headless `fcb` source tools, and the
 > SwiftUI/Metal app under [`native/macos/`](native/macos/). A single checkout can build the app and
-> a drag-to-Applications DMG. Neither a notarized download nor a Mac App Store version has shipped.
+> a drag-to-Applications DMG. A local Developer ID-signed DMG has been notarized; no download or
+> Mac App Store version has shipped.
 > The [implementation status](IMPLEMENTATION_STATUS.md) document is a dated September 14
 > snapshot; code and current qualification evidence take precedence where it has gone stale.
 
@@ -39,7 +40,7 @@ development.
 | Rust engine and bridge | Workspace discovery, exact source captures, layout, search, saved-repository and reader services, plus a C ABI for the native shell. |
 | Headless `fcb` binary | Explicit file/workspace inspection, bounded reading and exact text/byte search with versioned JSON. Bare `fcb` and human `fcb open` still report that the GUI launcher is unavailable in this binary. |
 | Native app | [`native/macos/`](native/macos/) contains a SwiftUI shell with dense text parcels, directory outlines, Monokai-inspired color, Metal glyph presentation, camera gestures, search, reader and local prepared-text cache. It is a developer preview, not a published installer. |
-| Future work | Full Markdown reading, complete native accessibility/IME, code-city mode, release-grade smoothness, signed/notarized distribution and App Store sandbox qualification remain open. |
+| Future work | Full Markdown reading, complete native accessibility/IME, code-city mode, release-grade smoothness, clean-machine distribution qualification and App Store sandbox qualification remain open. |
 
 The core interaction is deliberately continuous:
 
@@ -118,10 +119,11 @@ test hosts without Apple frameworks. Native Windows, Linux, iOS and browser UIs 
 release commitments.
 
 The headless `fcb` executable exists in source, and the native app links this engine.
-The current native bundle is a local development build. Public distribution still needs a
-source-matched release build, Developer ID signing, notarization, Gatekeeper checks and a
-drag-to-Applications DMG. A Mac App Store build needs separate distribution signing and sandboxed
-project access; it cannot be made by renaming or uploading the DMG.
+The current source revision has a fresh physical-Mac app build and a local Developer ID-signed,
+notarized drag-to-Applications DMG. Public distribution still needs quarantined first-launch and
+clean-machine qualification, plus a published release and checksum. A Mac App Store build needs
+separate distribution signing and sandboxed project access; it cannot be made by renaming or
+uploading the DMG.
 
 The standalone runtime can still be distributed inside a disk image or installer for offline
 notarization support. A self-contained executable and a bare downloadable file are different
@@ -157,10 +159,19 @@ To make a **local-test** drag-to-Applications disk image from that same app:
 ```
 
 Mount the DMG and drag `FrankenCodeBrowser.app` onto its `Applications` alias. `--local-test` does
-not notarize the image. A public download needs a Developer ID identity and a configured Apple
-notarytool Keychain profile instead; the package script then waits for acceptance and staples the
-ticket. See [distribution status](DISTRIBUTION.md). The App Store needs a separate sandboxed,
-distribution-signed build.
+not notarize the image. For a signed image, set `DEVELOPER_ID` to the exact Developer ID Application
+identity reported by `security find-identity -v -p codesigning`, then use either an authenticated
+`asc` CLI or a `notarytool` Keychain profile:
+
+```sh
+./scripts/package_macos_dmg.sh --app "$APP" \
+  --output "$PWD/dist/FrankenCodeBrowser-notarized.dmg" \
+  --identity "$DEVELOPER_ID" --notary-asc
+```
+
+Use `--notary-profile PROFILE` instead of `--notary-asc` for `notarytool`. The script waits for
+Apple's acceptance and staples the ticket. See [distribution status](DISTRIBUTION.md) for the
+remaining release checks. The App Store needs a separate sandboxed, distribution-signed build.
 
 ## Build and inspect the headless tools
 

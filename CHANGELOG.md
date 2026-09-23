@@ -25,18 +25,23 @@ claim that the complete product or a signed app has shipped.
 
 - Integrated the SwiftUI/Metal app and typed Apple object facade under `native/macos/` so the
   engine and app build from this one repository. Root scripts now build the app, install a local
-  copy, and make a drag-to-Applications test DMG. This source migration preserves the former local
-  `franken_macos` checkout as a history archive; it does not constitute a notarized release.
+  copy, and make a drag-to-Applications DMG. This source migration preserves the former local
+  `franken_macos` checkout as a history archive.
 - The native code includes text-filled source parcels, directory strokes, Monokai-inspired colors,
   zoom/pan, captured-source search highlighting and retained Metal glyph presentation. The latest
   performance campaign also records unresolved display-delivery stutter; fast GPU draw timings
   alone do not establish smooth zoom. See [current distribution gates](DISTRIBUTION.md).
+- Built commit `3d8cece9ec98` on a physical Mac, opened the Asupersync repository, and produced a
+  local Developer ID-signed DMG. Apple accepted its notarization, the ticket was stapled and
+  validated, and the staged app passed local Gatekeeper assessment. The packager now supports the
+  authenticated `asc` API-key route as well as `notarytool`; the exact artifact and remaining
+  qualification work are recorded in [distribution status](DISTRIBUTION.md).
 
 ### Release state
 
-- No signed/notarized public DMG, App Store upload or App Review submission exists. The app needs
-  a source-matched release build, sustained native qualification and separate sandboxed App Store
-  packaging before those claims are possible.
+- The signed/notarized DMG is local, with no GitHub Release download yet. Quarantined clean-machine
+  installation remains unqualified. There is no App Store upload or App Review submission; that
+  route still needs sandboxed project access and separate Mac distribution signing.
 
 ## Historical bootstrap — September 12–13, 2026
 
