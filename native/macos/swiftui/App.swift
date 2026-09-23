@@ -562,10 +562,19 @@ struct ContentView: View {
         }
         projectCache?.beginRefresh()
         var documents: [String: AtlasDocument] = [:]
-        var remainingBytes = 64 * 1024 * 1024
+        // Keep the eager working set proportional to RAM. Capture source before
+        // generated evidence so a broad repository does not spend the entire
+        // first-open budget on its first alphabetic artifact directory.
+        var remainingBytes = Int(min(UInt64(512 * 1024 * 1024),
+            max(UInt64(64 * 1024 * 1024), ProcessInfo.processInfo.physicalMemory / 128)))
         var tiles: [AtlasTextTile] = []
-        for file in files {
-            guard file.bytes <= remainingBytes else { continue }
+        let captureOrder = files.sorted { left, right in
+            let leftRank = Self.captureRank(left.path)
+            let rightRank = Self.captureRank(right.path)
+            return leftRank == rightRank ? left.path < right.path : leftRank < rightRank
+        }
+        for file in captureOrder {
+            guard file.bytes <= remainingBytes, file.bytes <= 4 * 1024 * 1024 else { continue }
             let prepared: AtlasDocument?
             if let projectCache {
                 prepared = projectCache.document(path: file.path) { Engine.sourceCapture(root: root, path: file.path) }
@@ -613,6 +622,16 @@ struct ContentView: View {
         } else {
             status = "\(files.count) files laid out. Scroll to zoom, drag to pan, click a file. Source loaded for \(atlasDocuments.count) files."
         }
+    }
+
+    private static func captureRank(_ path: String) -> Int {
+        let name = (path as NSString).lastPathComponent
+        let ext = (name as NSString).pathExtension.lowercased()
+        if ["rs", "swift", "py", "go", "c", "h", "cpp", "hpp", "m", "mm", "js", "jsx", "ts", "tsx", "java", "kt", "sh", "bash", "zig"].contains(ext) { return 0 }
+        if ["md", "mdx", "rst", "txt"].contains(ext) { return 1 }
+        if ["toml", "yaml", "yml", "xml", "html", "css", "sql"].contains(ext) { return 2 }
+        if path.hasPrefix(".beads/") || path.hasPrefix("artifacts/") || path.hasPrefix(".rch-out/") { return 4 }
+        return 3
     }
 
     private func applyFileScope() {
