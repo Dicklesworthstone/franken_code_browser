@@ -63,9 +63,9 @@ research ledger as historical evidence, not a live dependency lockfile.
   invent a successful toolchain pin before those checks exist.
 - All authoritative FCB source, analysis, search, layout, UI-state, and render-planning crates use
   `#![forbid(unsafe_code)]`.
-- The proposed first-party `franken-macos` bridge is the sole new application-side native unsafe
+- The first-party `franken-macos` bridge under `native/macos/` is the sole new application-side native unsafe
   exception: minimal audited Apple ABI, object ownership, callbacks and thread/device lifetimes.
-  It lives in its own `franken_macos` repository; neither FCB nor FrankenMarkdown hosts it.
+  It lives in this repository so the app builds from one checkout; FrankenMarkdown does not host it.
   It owns no parser, search engine, or product policy. Inherited unsafe boundaries, including a
   selected storage VFS, need their own inventory and qualification.
 - Shipping dependencies are std/toolchain libraries, FCB, Asupersync, FrankenMarkdown, and explicitly

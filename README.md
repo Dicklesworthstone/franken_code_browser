@@ -2,11 +2,11 @@
 
 # FrankenCodeBrowser (`fcb`)
 
-**A spatial source browser for Apple Silicon, designed as a native Metal application and an embeddable Rust library.**
+**A spatial source browser with a Rust engine and a native Metal app for Apple Silicon.**
 
 Explore the repository. Zoom into exact source. Search without losing your place.
 
-[![Status](https://img.shields.io/badge/status-foundations%20landing-d29922)](IMPLEMENTATION_STATUS.md)
+[![Status](https://img.shields.io/badge/status-developer%20preview-d29922)](#what-exists-today)
 [![Target](https://img.shields.io/badge/target-Apple%20Silicon-555555)](#platform-and-distribution)
 [![Design](https://img.shields.io/badge/design-Rust%20%2B%20Metal-b7410e)](ARCHITECTURE.md)
 [![License](https://img.shields.io/badge/license-MIT%20%2B%20rider-blue)](LICENSE)
@@ -14,37 +14,32 @@ Explore the repository. Zoom into exact source. Search without losing your place
 </div>
 
 > [!IMPORTANT]
-> This repository contains the comprehensive design and project documentation plus the first
-> foundation crates (typed core, inert facade, runtime/source seams, test-support tooling) with
-> batch-verified test suites. There is no application, executable, installer, or benchmark result
-> yet: the atlas, source reader, search, Markdown integration and native renderer described below
-> remain unimplemented. Features and commands below describe the planned product. See
-> [implementation status](IMPLEMENTATION_STATUS.md) for the exact boundary.
+> This repository contains the Rust engine, C ABI bridge, headless `fcb` source tools, and the
+> SwiftUI/Metal app under [`native/macos/`](native/macos/). A single checkout can build the app and
+> a drag-to-Applications DMG. Neither a notarized download nor a Mac App Store version has shipped.
+> The [implementation status](IMPLEMENTATION_STATUS.md) document is a dated September 14
+> snapshot; code and current qualification evidence take precedence where it has gone stale.
 
 ## Why a spatial source browser?
 
 A file tree tells you how a project is organized, but following search hits and opening tabs can
-make it difficult to remember where you are. FrankenCodeBrowser's planned repository atlas gives
+make it difficult to remember where you are. FrankenCodeBrowser's repository atlas gives
 directories and files stable places. Zooming reveals structure and then readable source; selecting
 a file opens a crisp reading lens without losing its location on the map.
 
-The atlas, source reader, Markdown preview, search results and relationship inspector share one
-versioned source model. A search hit names captured bytes. A bookmark retains its source anchor.
-A link follows an identified range rather than an approximate rectangle.
+The Rust engine identifies source captures, layout, and search results separately. A search hit
+names captured bytes, so native navigation can reject a stale or mismatched match instead of
+highlighting an approximate rectangle. Broader Markdown and relationship workflows remain under
+development.
 
-## Planned experience
+## What exists today
 
-| Task | Intended behavior |
+| Surface | Current state |
 |---|---|
-| Get oriented | Open a real directory and explore a progressively populated 2D atlas before full indexing finishes. |
-| Read precisely | Zoom into syntax-highlighted source or open a frontal reading lens with selection, copying, line navigation and wrapping. |
-| Keep context | Pin multiple readers, follow history and bookmarks, and return to stable directory neighborhoods. |
-| Search a large tree | Receive progressive path/text/heading results with exact source jumps and explicit coverage. |
-| Read documentation | View native Markdown with source/preview/split, tables, code, mathematics and qualified diagrams/images. |
-| Inspect relationships | Follow imports, documentation links and selected structural facts with their evidence level visible. |
-| Explore a code city | Tilt and extrude the same map using a named metric, then return to flat reading without losing selection. |
-| Share selected context | Assemble bounded reading trails and explicitly export source-evidence packs with provenance and omissions. |
-| Embed the engine | Use headless source/search/map components or attach native views to host-owned resources. |
+| Rust engine and bridge | Workspace discovery, exact source captures, layout, search, saved-repository and reader services, plus a C ABI for the native shell. |
+| Headless `fcb` binary | Explicit file/workspace inspection, bounded reading and exact text/byte search with versioned JSON. Bare `fcb` and human `fcb open` still report that the GUI launcher is unavailable in this binary. |
+| Native app | [`native/macos/`](native/macos/) contains a SwiftUI shell with dense text parcels, directory outlines, Monokai-inspired color, Metal glyph presentation, camera gestures, search, reader and local prepared-text cache. It is a developer preview, not a published installer. |
+| Future work | Full Markdown reading, complete native accessibility/IME, code-city mode, release-grade smoothness, signed/notarized distribution and App Store sandbox qualification remain open. |
 
 The core interaction is deliberately continuous:
 
@@ -54,45 +49,32 @@ Open a repository → explore its atlas → select a file → read exact source
                             └── search / links / history ──┘
 ```
 
-This is a read-only browsing product. Editing, builds, debuggers, terminals and compiler execution
-are outside the initial release. Optional editor handoff must be an explicit action.
+The browsing product does not execute project code to open a directory. Editing, builds,
+debuggers and terminals are outside its initial release scope.
 
 ## How the design stays responsive
 
-The renderer retains source geometry, layout and resource identities. Camera movement changes
-projection and visibility; it does not parse files or rebuild the whole repository. Distant
-directories aggregate into bounded detail levels, while a selected file gets a readable lens.
+The engine retains source captures, indexes and layout identities; the native app also caches
+prepared text and retains Metal glyph resources. Camera movement projects existing geometry rather
+than reparsing files on every frame. Source and search operations have explicit admission limits,
+partial-result states and identity checks.
 
-Background discovery, analysis and search run under Asupersync scopes with bounded work and
-generation checks. A stale search batch cannot replace the current query. CPU retirement and GPU
-completion retain their own capacity so resource cleanup can continue under pressure.
-
-Large files use immutable captures, chunked access and sparse line indexes. General text shaping
-keeps the context needed for bidi and graphemes; pathological input can report context pending or
-offer an explicit logical/escaped view while exact byte access remains available.
-
-These are engineering contracts to implement and measure. Choosing Rust or Metal alone does not
-establish latency, memory bounds or text quality.
+This is still a performance campaign, not a finished 120 Hz claim. Physical-Mac traces show that
+frame delivery and continuous zoom can stutter even when individual GPU draws are fast. See the
+[release qualification plan](LOCAL_QUALIFICATION_AND_RELEASE.md) for the proof needed before a
+shipping smoothness claim.
 
 ## One library, one application
 
 ```text
-Headless Rust consumer    Host-owned native view    Standalone fcb executable
-          │                       │                         │
-          └───────────────────────┼─────────────────────────┘
-                                  ▼
-                         public fcb library
-                                  │
-             source / search / analysis / map / UI model
-                        │                     │
-             FrankenMarkdown output     immutable FramePlan
-                 flow + source maps     + interaction snapshot
-                        └─────────────────────┤
-                                      native Metal adapter
-                                              │
-                                safe franken-macos boundary
-
-             optional Asupersync integration / FrankenSQLite store
+franken_code_browser (one public repository)
+  ├── fcb library and source / search / map / UI-model crates
+  ├── fcb-app: headless `fcb` command-line source tools
+  ├── fcb-bridge: C ABI for the native host
+  └── native/macos
+       ├── SwiftUI project picker, atlas, reader and search
+       ├── retained Metal glyph rendering and camera presentation
+       └── franken-macos crate: typed AppKit / Metal ownership facade
 ```
 
 The default library is intended to be inert: construction creates no window, runtime, thread,
@@ -100,9 +82,10 @@ database, filesystem scan or process-global handler. Hosts grant providers and e
 or delegate runtime, storage and rendering resources. Closing one view must leave its host and
 other browser instances operational.
 
-The planned `fcb-app` package produces the actual `fcb` executable using the public library.
-The proposed component boundaries and consumer profiles are in [ARCHITECTURE.md](ARCHITECTURE.md).
-Names and APIs are not yet published contracts.
+`fcb-app` now produces the headless `fcb` executable using the public library; it does not launch
+the native GUI. The native app consumes `fcb-bridge` from the same workspace. The longer-term component and
+consumer design is in [ARCHITECTURE.md](ARCHITECTURE.md), a design summary written before these
+integrations landed.
 
 ## Shared components and ownership
 
@@ -120,7 +103,8 @@ Names and APIs are not yet published contracts.
 
 Reusable improvements land in their owner repositories and are consumed through committed public
 APIs. `fcb-document` remains a thin integration layer; it does not implement a private Markdown
-engine. The native Metal renderer and proposed `franken-macos` bridge require real new work.
+engine. The first-party `franken-macos` crate and Metal renderer now live in this checkout;
+the full upstream dependency and release graph still needs qualification.
 
 The shipping graph must satisfy a strict first-party dependency rule, including transitive edges.
 The plan identifies upstream factoring still needed to achieve it. There is no blanket third-party
@@ -133,41 +117,77 @@ least 24 GB of unified memory. Headless library components must also work on sup
 test hosts without Apple frameworks. Native Windows, Linux, iOS and browser UIs are not initial
 release commitments.
 
-Planned distribution includes a real standalone `fcb` binary with required embedded assets and
-an optional signed/notarized `.app` using the same engine. Neither route should require a companion
-application, a development checkout, Node, Python, a WebView or a downloaded model.
+The headless `fcb` executable exists in source, and the native app links this engine.
+The current native bundle is a local development build. Public distribution still needs a
+source-matched release build, Developer ID signing, notarization, Gatekeeper checks and a
+drag-to-Applications DMG. A Mac App Store build needs separate distribution signing and sandboxed
+project access; it cannot be made by renaming or uploading the DMG.
 
 The standalone runtime can still be distributed inside a disk image or installer for offline
 notarization support. A self-contained executable and a bare downloadable file are different
 packaging choices; each launch route needs qualification.
 
-No distribution is available yet. The Rust 2024 dated nightly, minimum macOS version and exact
-SDK are foundation qualification decisions, not verified installation requirements today.
+No downloadable release is available yet. The native app currently targets macOS 14+ on Apple
+Silicon; the full clean-machine installation matrix remains unverified.
 
-## Inspect the project today
+## Build and install the Mac app
+
+On macOS 14+ with Xcode command-line tools and Rust installed, clone this **one repository** and run:
+
+```sh
+git clone https://github.com/Dicklesworthstone/franken_code_browser.git
+cd franken_code_browser
+./scripts/install_macos_app.sh --build
+```
+
+This builds the Rust bridge and SwiftUI/Metal shell from the same checkout, then copies the app to
+`~/Applications/FrankenCodeBrowser.app`. It preserves any existing installation. To build without
+installing, or to inspect the app first:
+
+```sh
+APP="$(./scripts/build_macos_app.sh)"
+open "$APP"
+```
+
+To make a **local-test** drag-to-Applications disk image from that same app:
+
+```sh
+./scripts/package_macos_dmg.sh --app "$APP" \
+  --output "$PWD/dist/FrankenCodeBrowser-local-test.dmg" --local-test
+```
+
+Mount the DMG and drag `FrankenCodeBrowser.app` onto its `Applications` alias. `--local-test` does
+not notarize the image. A public download needs a Developer ID identity and a configured Apple
+notarytool Keychain profile instead; the package script then waits for acceptance and staples the
+ticket. See [distribution status](DISTRIBUTION.md). The App Store needs a separate sandboxed,
+distribution-signed build.
+
+## Build and inspect the headless tools
 
 ```bash
 git clone https://github.com/Dicklesworthstone/franken_code_browser.git
 cd franken_code_browser
-less README.md
-less COMPREHENSIVE_PLAN_FOR_FRANKEN_CODE_BROWSER.md
+cargo build --locked -p fcb-app
+cargo run --locked -p fcb-app -- --help
+cargo run --locked -p fcb-app -- inspect . --workspace --json
+cargo run --locked -p fcb-app -- search . --workspace --text 'Metal' --json
 ```
 
-There is no `cargo build` or installation command at this stage. The plan's proposed CLI includes:
+The command-line app provides bounded source tools. For example:
 
 ```text
-fcb /path/to/repository
-fcb open /path/to/file.rs --line 120
-fcb search /path/to/repository --text "cancel" --json --limit 50
-fcb inspect /path/to/repository --json
+fcb inspect /path/to/repository --workspace --json
+fcb read /path/to/file.rs --offset 0 --bytes 65536 --json
+fcb search /path/to/repository --workspace --text "cancel" --json --limit 50
 fcb capabilities --json
 fcb doctor --json
-fcb trail export TRAIL_ID --format markdown --out /path/to/context.md
 ```
 
-These commands are specifications, not runnable examples. The intended machine interface shares
-the library's services, emits versioned JSON on stdout and diagnostics on stderr, and distinguishes
-incomplete, canceled, unavailable and failed results. `doctor` is read-only by default.
+Those source commands are implemented in `fcb-app`; native GUI launch, `trail export`, and several
+planned commands are not. See the [CLI reference](crates/fcb-app/README.md) for supported flags,
+scope limits, output schema and qualification boundaries. `doctor` is a static capability report,
+not a benchmark or repair command. On this development machine, Cargo builds use the configured
+remote-compilation lane and require disk-pressure preflight.
 
 ## Performance objectives
 
@@ -175,18 +195,20 @@ The plan sets initial objectives for a qualified standard workload: roughly 100,
 10 million lines, with bounded visible detail. It includes 120 Hz presentation goals, warm path
 search results within 30 ms at p95, and a 3 GiB managed-resource target with a 6 GiB admission guard.
 
-**None of these numbers has been measured in FCB.** Managed bytes are not total process footprint.
-Stress qualification includes approximately one million files and 10–20 GiB of source, as well as
+These are **targets, not achieved product SLOs**. Native GPU and frame-delivery experiments exist,
+but no complete standard-workload qualification establishes the targets. Managed bytes are not
+total process footprint. Stress qualification includes approximately one million files and 10–20 GiB of source, as well as
 huge lines, malformed text and changing repositories. Every result must name its hardware, display,
 corpus, source revision and cache state. See plan §21 and
 [LOCAL_QUALIFICATION_AND_RELEASE.md](LOCAL_QUALIFICATION_AND_RELEASE.md).
 
 ## Roadmap and documentation
 
-The plan defines 97 work packages and eight product gates, G0–G7. The next step is G0: qualify
-dependency and native boundaries, inert embedding, resource ownership, initial accessibility,
-and upstream Markdown contracts. The first complete user loop then opens a real tree and lets the
-user navigate, read and copy real source. All gates remain pending.
+The plan defines 97 work packages and eight product gates, G0–G7. Substantial source, search,
+cache, native renderer and UI work has landed since the last dated implementation-status snapshot.
+Gate and release claims still need the specified independent verification, native usability, clean
+dependency closure and distribution evidence. The immediate release work is to make the native
+source publicly buildable, qualify sustained zoom on physical Macs, and produce a notarized DMG.
 
 | Read | For |
 |---|---|
@@ -195,15 +217,15 @@ user navigate, read and copy real source. All gates remain pending.
 | [Architecture](ARCHITECTURE.md) | Component boundaries, identity and lifecycle design |
 | [Dependency constitution](DEPENDENCY_CONSTITUTION.md) | Allowed closure and upstream ownership |
 | [Roadmap](ROADMAP.md) | Product milestones and initial implementation order |
-| [Implementation status](IMPLEMENTATION_STATUS.md) | What exists and what remains unimplemented |
+| [Implementation status](IMPLEMENTATION_STATUS.md) | Historical September 14 snapshot; newer code and receipts supersede it |
 | [Qualification and release](LOCAL_QUALIFICATION_AND_RELEASE.md) | Semantic, native, performance and packaging evidence |
 | [Security](SECURITY.md) / [Privacy](PRIVACY.md) | Root authority, untrusted source and export handling |
 | [Changelog](CHANGELOG.md) | Durable repository changes |
 
 ## Limitations and common questions
 
-**Can I run it now?** No. This is the design/bootstrap stage. A missing executable or Cargo
-manifest is expected; the repository does not yet contain an installation path.
+**Can I run it now?** You can build both the headless `fcb` source tools and the SwiftUI/Metal app
+from this checkout. There is no public, notarized installer yet.
 
 **Is it an IDE?** The planned product focuses on reading and navigation. It does not need to
 execute source, compile projects or run language servers to open a directory.
@@ -214,8 +236,9 @@ resolved relationships and heuristics have separate evidence levels. A highlight
 **Will Markdown use a browser?** No. The design consumes native, renderer-neutral output from
 FrankenMarkdown. Required flow and provenance extensions must land there first.
 
-**Will source leave my machine?** The design has no default telemetry, uploads or network fetching.
-Exports are explicit. These are required behaviors, not security guarantees of an existing app.
+**Will source leave my machine?** The product contract forbids default telemetry and source
+uploads. Review [privacy](PRIVACY.md) and the actual selected host/build before relying on a
+specific distribution's privacy properties.
 
 **Where should I report a problem?** Use the repository's issue templates for design defects and,
 once implemented, reproducible bugs. Include the exact revision and expected behavior. Keep private

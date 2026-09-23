@@ -32,7 +32,7 @@ there is no web browser engine in the application.
 | `fcb-store` | Optional FrankenSQLite actor, schema and manifests | Paint-time database queries |
 | `fcb-app` | CLI and Mac composition; binary named `fcb` | Private engine functionality unavailable to hosts |
 | `fcb-conformance` | Fixtures, external consumers, replay, native qualification | Shipping runtime dependencies |
-| `franken-macos` | Audited safe Apple system boundary, in its own `franken_macos` repository | FCB/FMD semantics or arbitrary pointer escape |
+| `franken-macos` | Audited safe Apple system boundary in `native/macos/` of this repository | FCB/FMD semantics or arbitrary pointer escape |
 
 Create components when a real slice needs them. The table does not require thirteen empty crates.
 Independently useful crates may be published; internal implementation modules need not be packages.

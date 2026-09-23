@@ -1,5 +1,17 @@
 # Implementation status
 
+**Current integration note (September 22, 2026):** This file's detailed table below is a
+historical September 14 snapshot. Since then the workspace has gained a headless `fcb` binary,
+substantial source/search/map/cache/reader and bridge code, and a SwiftUI/Metal app imported under
+`native/macos/` in the same repository. `scripts/build_macos_app.sh` and
+`scripts/package_macos_dmg.sh` provide a single-checkout build and local DMG path. A fresh build
+of the combined checkout has **not** been run: the development machine's disk-pressure preflight is
+critical. No notarized download, App Store submission, or complete product-gate qualification is
+claimed. See [README](README.md) and [distribution status](DISTRIBUTION.md) for the current user
+path; retain the older rows below as dated evidence rather than current absence claims.
+
+---
+
 **Snapshot: September 14, 2026. Stage: foundation crates landed and batch-verified; no product gates passed.**
 
 This inventory describes this repository. Sibling capabilities and the plan's source-review

@@ -33,8 +33,8 @@ HarfBuzz, FreeType, or C/C++/Objective-C support libraries hidden behind a Rust 
 
 ## Unsafe boundary
 
-Authoritative FCB crates forbid unsafe code. The proposed `franken-macos` system bridge lives in its
-own first-party repository, consumed by FCB and FrankenMarkdown's optional Mac adapter, and may contain
+Authoritative FCB crates forbid unsafe code. The `franken-macos` system bridge lives in
+`native/macos/` of this repository, consumed by FCB and FrankenMarkdown's optional Mac adapter, and may contain
 only the minimum audited ABI implementation behind safe owned APIs. Record SDK signatures,
 retained/borrowed ownership, nullability, integer widths, thread affinity, callbacks, reentrancy,
 panic/exception boundaries and GPU resource lifetimes. A safe function name is not a soundness proof.

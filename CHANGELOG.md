@@ -1,6 +1,44 @@
 # Changelog
 
-## Unreleased
+This record is based on the repository's Git history and checked-in Beads exports through
+2026-09-22. There are no version tags or GitHub Releases. These are source milestones, not a
+claim that the complete product or a signed app has shipped.
+
+## Unreleased — source browser and one-repo Mac app (September 14–22, 2026)
+
+### Engine and headless source tools
+
+- Landed bounded root discovery, immutable source captures, encoding maps, source search and
+  retained layout primitives. Representative commits: [root grants](https://github.com/Dicklesworthstone/franken_code_browser/commit/b8eebd7),
+  [exact search](https://github.com/Dicklesworthstone/franken_code_browser/commit/502fd61),
+  [retained parcel layout](https://github.com/Dicklesworthstone/franken_code_browser/commit/187c845).
+- Added the `fcb` headless CLI for explicit file/workspace inspection, bounded reading and search;
+  later source workflows include whole-file streaming, saved repositories and persistent reading
+  desks. See [CLI reference](crates/fcb-app/README.md) and
+  [desk sessions](https://github.com/Dicklesworthstone/franken_code_browser/commit/389aa2b).
+- Exposed retained atlas, source, search and cache services over the `fcb-bridge` C ABI for a native
+  host. See [atlas navigation](https://github.com/Dicklesworthstone/franken_code_browser/commit/0c93a66),
+  [indexed query bridge](https://github.com/Dicklesworthstone/franken_code_browser/commit/6e23eb8),
+  and [native artifact cache](https://github.com/Dicklesworthstone/franken_code_browser/commit/dd86f8a).
+
+### Mac atlas and performance
+
+- Integrated the SwiftUI/Metal app and typed Apple object facade under `native/macos/` so the
+  engine and app build from this one repository. Root scripts now build the app, install a local
+  copy, and make a drag-to-Applications test DMG. This source migration preserves the former local
+  `franken_macos` checkout as a history archive; it does not constitute a notarized release.
+- The native code includes text-filled source parcels, directory strokes, Monokai-inspired colors,
+  zoom/pan, captured-source search highlighting and retained Metal glyph presentation. The latest
+  performance campaign also records unresolved display-delivery stutter; fast GPU draw timings
+  alone do not establish smooth zoom. See [current distribution gates](DISTRIBUTION.md).
+
+### Release state
+
+- No signed/notarized public DMG, App Store upload or App Review submission exists. The app needs
+  a source-matched release build, sustained native qualification and separate sandboxed App Store
+  packaging before those claims are possible.
+
+## Historical bootstrap — September 12–13, 2026
 
 ### Added
 
@@ -11,7 +49,8 @@
 - License matching the owner's example repositories, issue templates and repository text/ignore
   configuration.
 
-This is a documentation bootstrap. No executable, library implementation or release is claimed.
+At this historical point the repository was a documentation bootstrap. Later implementation is
+recorded above; no binary release is claimed.
 
 ### Corrected
 
