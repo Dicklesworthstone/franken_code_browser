@@ -35,7 +35,8 @@ Open FrankenCodeBrowser, choose a project folder, drag to pan, and scroll to zoo
 > This repository contains the Rust engine, C ABI bridge, headless `fcb` source tools, and the
 > SwiftUI/Metal app under [`native/macos/`](native/macos/). A single checkout can build the app and
 > a drag-to-Applications DMG. A Developer ID-signed, notarized DMG is available as a public
-> developer-preview release. No Mac App Store version has shipped.
+> developer-preview release. A separate sandboxed Mac App Store build has been prepared, but no
+> Mac App Store version has shipped.
 > The [implementation status](IMPLEMENTATION_STATUS.md) document is a dated September 14
 > snapshot; code and current qualification evidence take precedence where it has gone stale.
 
@@ -58,7 +59,7 @@ development.
 | Rust engine and bridge | Workspace discovery, exact source captures, layout, search, saved-repository and reader services, plus a C ABI for the native shell. |
 | Headless `fcb` binary | Explicit file/workspace inspection, bounded reading and exact text/byte search with versioned JSON. Bare `fcb` and human `fcb open` still report that the GUI launcher is unavailable in this binary. |
 | Native app | [`native/macos/`](native/macos/) contains a SwiftUI shell with dense text parcels, directory outlines, Monokai-inspired color, Metal glyph presentation, camera gestures, exact-text search with a match count, file-type filters, a source reader and local prepared-text cache. A notarized developer-preview DMG is available. |
-| Future work | Full Markdown reading, complete native accessibility/IME, code-city mode, release-grade smoothness, clean-machine distribution qualification and App Store sandbox qualification remain open. |
+| Future work | Full Markdown reading, complete native accessibility/IME, code-city mode, release-grade smoothness, clean-machine distribution qualification and App Store review remain open. |
 
 The core interaction is deliberately continuous:
 
@@ -140,9 +141,9 @@ Linux, iOS and browser UIs are not initial release commitments.
 The headless `fcb` executable exists in source, and the native app links this engine.
 Version 0.1.0 has a physical-Mac app build and a public Developer ID-signed, notarized
 drag-to-Applications DMG with a checksum sidecar. Quarantined first-launch and
-clean-machine qualification remain open. A Mac App Store build needs
-separate distribution signing and sandboxed project access; it cannot be made by renaming or
-uploading the DMG.
+clean-machine qualification remain open. A separate sandboxed and distribution-signed Mac App
+Store upload candidate has been built; it has not yet been submitted to App Review. It cannot be
+made by renaming or uploading the DMG.
 
 The release DMG bundles the native app. Its code signature, notarization ticket, checksum and
 local Gatekeeper assessment have been checked; offline first launch from a quarantined download
@@ -190,7 +191,8 @@ identity reported by `security find-identity -v -p codesigning`, then use either
 
 Use `--notary-profile PROFILE` instead of `--notary-asc` for `notarytool`. The script waits for
 Apple's acceptance and staples the ticket. See [distribution status](DISTRIBUTION.md) for the
-remaining release checks. The App Store needs a separate sandboxed, distribution-signed build.
+remaining release checks. The separate App Store build and its remaining submission steps are
+recorded there as well.
 
 ## Build and inspect the headless tools
 

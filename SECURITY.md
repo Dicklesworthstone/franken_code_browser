@@ -1,8 +1,8 @@
 # Security
 
-FrankenCodeBrowser is currently a design-stage repository with no supported executable release.
-The following are required implementation boundaries from plan §§8, 14, 19 and 22, not a security
-certification of an existing application.
+FrankenCodeBrowser 0.1.0 has a native developer-preview release. The boundaries below are
+requirements from plan §§8, 14, 19 and 22, not a certification that every planned control has
+already been implemented. The Mac App Store build is a separate sandboxed distribution candidate.
 
 ## Report a security concern
 

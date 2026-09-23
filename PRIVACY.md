@@ -1,9 +1,33 @@
 # Privacy and source handling
 
-This document states the planned behavior of FrankenCodeBrowser. There is no running application
-or implemented privacy control to certify yet. Plan §§17, 19 and 22 define the full contract.
+FrankenCodeBrowser 0.1.0 is a local source browser for macOS. This page describes its current
+native-app behavior. Plan §§17, 19 and 22 set broader design goals that are not all implemented.
 
-## Local by default
+## Current native app
+
+- You choose a local project folder. The app reads source files beneath it to build the atlas,
+  show syntax-highlighted text, open a file in the reader, and search captured source.
+- The Mac App Store build uses the App Sandbox and a read-only folder grant. It keeps a
+  security-scoped bookmark on this Mac so it can reopen a recently selected project. A saved path
+  alone is not treated as permission. The direct-download build uses its own local recent-folder
+  preference and is separately signed and notarized.
+- Prepared source and image data can be cached in the user's private macOS Caches directory to
+  speed later openings. Those derived files may contain text from selected source files. Recent
+  folder bookmarks and preferences are stored locally in the app's user defaults. The App Store
+  build's container holds its own cache and preferences.
+- The native app has no account, advertising, analytics, or source-upload feature. The App Store
+  build requests no network-client entitlement. Opening a project does not run its code or fetch
+  remote resources. Apple and macOS may separately process App Store purchases, downloads, crash
+  reports, and system diagnostics under Apple's own policies.
+- Removing the app may leave its local cache and preferences on the Mac. They can be inspected or
+  removed through Finder in the app's container or user Library; removing the cache means it will
+  be rebuilt when a project is opened again.
+
+For questions about this policy, use the [project issue tracker](https://github.com/Dicklesworthstone/franken_code_browser/issues)
+or the developer's [contact page](https://www.jeffreyemanuel.com/contact). Do not include private
+source, credentials, or personal paths in a public issue.
+
+## Longer-term privacy requirements
 
 The application must not upload source, send telemetry, download a model or fetch document assets
 from the network by default. Opening a root grants bounded read access to that root. A symlink,
