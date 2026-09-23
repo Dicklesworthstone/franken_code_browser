@@ -65,6 +65,17 @@ fn complete_discovery_is_sorted_and_default_exclusions_are_not_deletions() {
 }
 
 #[test]
+fn broad_repository_directory_fanout_remains_complete() {
+    let tree = Tree::new();
+    for i in 0..128 { tree.file(format!("crate-{i:03}/src/lib.rs"), b"pub fn example() {}\n"); }
+    let budget = budget();
+    let catalog = catalog(&tree, WorkspaceLimits::default(), false, &budget);
+    assert!(catalog.discovery_complete());
+    assert_eq!(catalog.aggregate().queue_refused, 0);
+    assert_eq!(catalog.entries().len(), 128);
+}
+
+#[test]
 fn workspace_index_matches_exact_utf8_and_utf16_captures_after_live_replacement() {
     let tree = Tree::new(); tree.file("a.rs", b"banana"); tree.file("b.rs", b"unrelated");
     let mut utf16 = vec![0xff, 0xfe];

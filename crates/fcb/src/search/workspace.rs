@@ -135,7 +135,10 @@ impl WorkspaceCatalog {
         let lease = budget.try_reserve_managed(grant.owner(), allocation, ByteLength::new(charge as u64))
             .map_err(|_| WorkspaceError::ResourceDenied)?;
         let entries = reserve(limits.max_files)?;
-        let discovery_limits = DiscoveryLimits::new(1, 32, MAX_WORKSPACE_PATH_BYTES as u32, 64, 16 * 1024, 64)?;
+        // A repository with more than 64 sibling directories is ordinary, not
+        // an incomplete workspace. Keep the queue bounded while allowing the
+        // catalog to finish broad trees such as Asupersync.
+        let discovery_limits = DiscoveryLimits::new(1, 32, MAX_WORKSPACE_PATH_BYTES as u32, 64, 16 * 1024, 4096)?;
         let ignore = if include_excluded { IgnoreMatcher::include_all() } else { IgnoreMatcher::product_defaults() };
         let discovery = BoundedDiscovery::open_metadata_only(grant.clone(), SymlinkPolicy::DisallowAll, discovery_limits, ignore)?;
         Ok(Self { grant, id, first_file, limits, include_excluded, discovery: Some(discovery),
