@@ -14,11 +14,10 @@ path = "src/lib.rs"
 fcb-core = { path = "../fcb-core" }
 fcb-document = { path = "../fcb-document" }
 fcb-source = { path = "../fcb-source" }
-franken_markdown = { path = "../../../franken_markdown", default-features = false }
+franken_markdown = { git = "https://github.com/Dicklesworthstone/franken_markdown.git", rev = "d6fbd1d5c191b36f4474f7bfd7d544c208c4b9df", default-features = false }
 
 [dev-dependencies]
 fcb-test-support = { path = "../fcb-test-support" }
 
 [lints]
 rust.missing_debug_implementations = "deny"
-
