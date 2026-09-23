@@ -8,7 +8,7 @@
 # requires an admitted native macOS execution lane; do not bypass the configured Cargo shim.
 #
 # Exact invocation from the repository toplevel:
-#   ./scripts/e2e/fcb_003.sh
+#   ./native/macos/scripts/e2e/fcb_003.sh
 #
 # The campaign exercises both layers together:
 #   1. Unit & oracle test suites (cargo test --lib + cargo test --test ownership_kernel)

@@ -1,6 +1,6 @@
 #!/bin/bash
 # FCB-003.V production verification scenario: First-party macOS object/ABI
-# ownership kernel in the separate `franken_macos` repository.
+# ownership kernel in this repository's `native/macos` workspace member.
 #
 # Supported route (documented invocation):
 #   scripts/e2e/fcb_003.sh [cargo-test-args...]
@@ -27,10 +27,7 @@ echo "[fcb-003] run id: $RUN_ID"
 
 # 1. Upstream extension ledger verification
 echo "[fcb-003] checking upstream extension ledger..."
-EXTRA_REPOS=()
-if [ -d "/Users/jemanuel/projects/franken_macos" ]; then
-    EXTRA_REPOS+=(--repo "franken_macos=/Users/jemanuel/projects/franken_macos")
-fi
+EXTRA_REPOS=(--repo "franken_code_browser=$REPO_ROOT")
 if [ -d "/Users/jemanuel/projects/franken_manim" ]; then
     EXTRA_REPOS+=(--repo "franken_manim=/Users/jemanuel/projects/franken_manim")
 fi

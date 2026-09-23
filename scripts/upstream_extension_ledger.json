@@ -33,8 +33,8 @@
       "qualification": "implemented"
     },
     {
-      "owner": "franken_macos",
-      "origin": "https://github.com/Dicklesworthstone/franken_macos",
+      "owner": "franken_code_browser",
+      "origin": "https://github.com/Dicklesworthstone/franken_code_browser",
       "extension": "franken-macos-ownership-kernel",
       "public_api": [
         "franken_macos::MainThreadToken",
@@ -46,7 +46,7 @@
         "franken_macos::callbacks::InstanceId"
       ],
       "source": {
-        "commit": "8c94d49bd817d0fa30e2a005f9ded3ea96b1b94b"
+        "commit": "915d5966c5bfd559feff4da4bb1ae10caaf197b0"
       },
       "features": [
         "std"
@@ -56,7 +56,7 @@
         "removed_packages": []
       },
       "upstream_tests": [
-        "scripts/e2e/fcb_003.sh"
+        "native/macos/scripts/e2e/fcb_003.sh"
       ],
       "fcb_consumer": {
         "route": "crates/fcb/tests/fcb_003_production.rs",

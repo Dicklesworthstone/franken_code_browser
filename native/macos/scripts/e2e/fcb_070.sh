@@ -13,7 +13,7 @@
 # requires an admitted native macOS execution lane; do not bypass the configured Cargo shim.
 #
 # Exact invocation from the repository toplevel:
-#   ./scripts/e2e/fcb_070.sh
+#   ./native/macos/scripts/e2e/fcb_070.sh
 set -eu
 cd "$(dirname "$0")/../.."
 echo "=== FCB-070.V campaign: host-owned view binding + lifecycle isolation ==="

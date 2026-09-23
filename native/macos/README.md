@@ -5,10 +5,11 @@ This directory contains the SwiftUI/Metal FrankenCodeBrowser app and the narrow 
 From the repository root on macOS 14+:
 
 ```sh
-APP="$(./scripts/build_macos_app.sh)"
-open "$APP"
-./scripts/install_macos_app.sh "$APP"
+./scripts/install_macos_app.sh --build
 ```
+
+To inspect a built app before installation, run `APP="$(./scripts/build_macos_app.sh)"`,
+then `open "$APP"` and `./scripts/install_macos_app.sh "$APP"` if desired.
 
 For a local drag-to-Applications test image:
 

@@ -1,5 +1,5 @@
 //! FCB-003.V production verification scenario: First-party macOS object/ABI
-//! ownership kernel in the separate `franken_macos` repository.
+//! ownership kernel in this repository's `native/macos` workspace member.
 //!
 //! Required verification cases (each individually selectable via cargo test filter):
 //! 1. `native_retain_release_accounting_and_lifecycle_invariants` — retain/release counters,
@@ -534,8 +534,8 @@ fn upstream_extension_ledger_and_origin_conformance() {
 
     // Basic JSON structure validation
     assert!(content.contains("\"schema\": \"fcb.extension-ledger.v1\""));
-    assert!(content.contains("\"owner\": \"franken_macos\""));
-    assert!(content.contains("\"origin\": \"https://github.com/Dicklesworthstone/franken_macos\""));
+    assert!(content.contains("\"owner\": \"franken_code_browser\""));
+    assert!(content.contains("\"origin\": \"https://github.com/Dicklesworthstone/franken_code_browser\""));
     assert!(content.contains("\"extension\": \"franken-macos-ownership-kernel\""));
 
     // Public API surface declarations
@@ -555,7 +555,7 @@ fn upstream_extension_ledger_and_origin_conformance() {
     record_receipt(
         "upstream_extension_ledger_and_origin_conformance",
         Effect::Succeeded,
-        "franken_macos verified against upstream extension ledger with exact origin and public API",
+        "franken-macos verified against this repository's extension ledger with exact origin and public API",
     );
 }
 

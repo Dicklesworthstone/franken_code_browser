@@ -8,7 +8,7 @@
 # requires an admitted native macOS execution lane; do not bypass the configured Cargo shim.
 #
 # Exact invocation from the repository toplevel:
-#   ./scripts/e2e/fcb_005.sh
+#   ./native/macos/scripts/e2e/fcb_005.sh
 #
 # The campaign runs both test targets together (A owned buffers/leases,
 # B bounded submission/terminal ownership) and fails if either fails.

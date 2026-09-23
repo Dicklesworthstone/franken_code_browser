@@ -50,7 +50,6 @@ ALLOWED_ORIGINS = (
     "https://github.com/Dicklesworthstone/asupersync",
     "https://github.com/Dicklesworthstone/coding_agent_session_search",
     "https://github.com/Dicklesworthstone/franken_code_browser",
-    "https://github.com/Dicklesworthstone/franken_macos",
     "https://github.com/Dicklesworthstone/franken_markdown",
     "https://github.com/Dicklesworthstone/franken_manim",
     "https://github.com/Dicklesworthstone/franken_networkx",
