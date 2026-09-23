@@ -181,8 +181,10 @@ impl<'layout> AtlasIndex<'layout> {
             if depth > limits.max_depth { return Err(AtlasError::InvalidLimits); }
             let bounds = node.parent_local();
             let parent_size = layout.nodes()[parent].parent_local().size();
-            // Layout's row arithmetic can leave a few ulps at a shared edge.
-            let tolerance = parent_size.width().max(parent_size.height()).max(1.0) * f64::EPSILON * 32.0;
+            // Deep row packing can accumulate slightly more than 32 ulps at
+            // a shared edge. Keep the geometric check, with enough rounding
+            // allowance for a large real repository's nested partitions.
+            let tolerance = parent_size.width().max(parent_size.height()).max(1.0) * f64::EPSILON * 64.0;
             if bounds.min_x() < -tolerance || bounds.min_y() < -tolerance
                 || bounds.max_x() > parent_size.width() + tolerance
                 || bounds.max_y() > parent_size.height() + tolerance { return Err(AtlasError::InvalidHierarchy); }
@@ -337,6 +339,34 @@ mod tests {
     }
     fn budget() -> ResourceBudget { ResourceBudget::new(owner(), ByteLength::new(16 * 1024 * 1024)).unwrap() }
     fn allocation(id: u64) -> ResourceAllocationId { ResourceAllocationId::new(id).unwrap() }
+    #[test]
+    fn accepts_row_roundoff_but_rejects_real_parent_overflow() {
+        // A real broad workspace produced this parent/child pair. Its child
+        // crosses the parent's edge by just over the former 32-ulp allowance.
+        let parent = Rect2D::from_xywh(0.0, 0.0, 39.37030487349686, 32.111679210119405).unwrap();
+        let child = Rect2D::from_xywh(0.0, 17.963473784670896, 14.50241754705726,
+            14.148205425448793).unwrap();
+        let mut layout = PartitionLayout {
+            owner: owner(), root: RootId::new(owner(), 1).unwrap(),
+            revision: LayoutRevision::new(owner(), 1).unwrap(),
+            options: LayoutOptions::modest(), world: parent,
+            nodes: vec![
+                LaidOutNode { path: vec![], kind: NodeKind::Directory, parent_local: parent,
+                    weight: 1.0, slack: None },
+                LaidOutNode { path: b"deep.rs".to_vec(), kind: NodeKind::File,
+                    parent_local: child, weight: 1.0, slack: None },
+            ],
+        };
+        assert!(child.max_y() > parent.size().height());
+        let budget = budget();
+        assert!(AtlasIndex::build(&layout, AtlasBuildLimits::default(), &budget,
+            allocation(1), || false).is_ok());
+
+        layout.nodes[1].parent_local = Rect2D::from_xywh(0.0, 17.963473784670896,
+            14.50241754705726, 14.148206425448793).unwrap();
+        assert!(matches!(AtlasIndex::build(&layout, AtlasBuildLimits::default(), &budget,
+            allocation(2), || false), Err(AtlasError::InvalidHierarchy)));
+    }
     #[test]
     fn retains_raw_paths_parent_relations_and_exact_layout() {
         let layout = layout(1);
