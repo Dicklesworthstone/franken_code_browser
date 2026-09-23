@@ -15,7 +15,11 @@ SWIFT_TARGET="${FCB_SWIFT_TARGET:-$(uname -m)-apple-macosx14.0}"
 [ ! -e "$APP" ] || { echo "app output already exists: $APP" >&2; exit 2; }
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp swiftui/Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-xcrun swiftc -O -target "$SWIFT_TARGET" -parse-as-library swiftui/AtlasCamera.swift swiftui/AtlasSource.swift swiftui/AtlasSearch.swift swiftui/AtlasMatch.swift swiftui/AtlasDocument.swift swiftui/AtlasPreparedText.swift swiftui/AtlasProjectCache.swift swiftui/AtlasMetalRasterRenderer.swift swiftui/AtlasMetalGlyphRenderer.swift swiftui/AtlasMetalPresentation.swift swiftui/AtlasRetainedView.swift swiftui/AtlasParcelLayout.swift swiftui/App.swift "$BRIDGE" \
+set -- -O -target "$SWIFT_TARGET" -parse-as-library
+if [ "${FCB_APP_STORE:-0}" = 1 ]; then
+    set -- "$@" -D FCB_APP_STORE
+fi
+xcrun swiftc "$@" swiftui/AtlasCamera.swift swiftui/AtlasSource.swift swiftui/AtlasSearch.swift swiftui/AtlasMatch.swift swiftui/AtlasDocument.swift swiftui/AtlasPreparedText.swift swiftui/AtlasProjectCache.swift swiftui/AppStoreRootAccess.swift swiftui/AtlasMetalRasterRenderer.swift swiftui/AtlasMetalGlyphRenderer.swift swiftui/AtlasMetalPresentation.swift swiftui/AtlasRetainedView.swift swiftui/AtlasParcelLayout.swift swiftui/App.swift "$BRIDGE" \
     -framework SwiftUI -framework AppKit \
     -o "$APP/Contents/MacOS/FrankenCodeBrowser"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -31,12 +35,20 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundleVersion</key><string>2</string>
+    <key>NSHumanReadableCopyright</key><string>Copyright © 2026 Jeffrey Emanuel</string>
+    <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+    <key>ITSAppUsesNonExemptEncryption</key><false/>
     <key>NSHighResolutionCapable</key><true/>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSPrincipalClass</key><string>NSApplication</string>
 </dict>
 </plist>
 PLIST
-codesign --force --sign - "$APP"
+if [ "${FCB_APP_STORE:-0}" = 1 ]; then
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleVersion 3' "$APP/Contents/Info.plist"
+    codesign --force --sign - --entitlements swiftui/AppStore.entitlements "$APP"
+else
+    codesign --force --sign - "$APP"
+fi
 echo "bundle ready: $APP"
 echo "launch with:  open $APP"

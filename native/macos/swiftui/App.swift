@@ -115,14 +115,20 @@ enum Engine {
     static let maxRecents = 6
 
     static var recents: [String] {
+#if FCB_APP_STORE
+        AppStoreRootAccess.recents
+#else
         UserDefaults.standard.stringArray(forKey: recentsKey) ?? []
+#endif
     }
 
+#if !FCB_APP_STORE
     static func remember(root: String) {
         var roots = recents.filter { $0 != root }
         roots.insert(root, at: 0)
         UserDefaults.standard.set(Array(roots.prefix(maxRecents)), forKey: recentsKey)
     }
+#endif
 
     static func plan(root: String) -> String {
         bridgeCall { fcb_atlas_plan(root) }
@@ -206,8 +212,13 @@ extension AtlasCamera {
 // MARK: - Content
 
 struct ContentView: View {
+#if FCB_APP_STORE
+    @State private var root = ""
+    @State private var rootAccess: AppStoreRootAccess?
+#else
     @State private var root = UserDefaults.standard.string(forKey: "fcb.root")
         ?? Engine.defaultRoot
+#endif
     @State private var query = ""
     @FocusState private var searchFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -277,7 +288,12 @@ struct ContentView: View {
             .help("Show or hide the selectable source reader")
         }
         .onAppear {
+#if FCB_APP_STORE
+            if let recent = Engine.recents.first { restoreProject(recent) }
+            else { chooseProject() }
+#else
             if root.isEmpty { chooseProject() } else { loadAtlas() }
+#endif
         }
         .onChange(of: query) { _, _ in clearSearch() }
         .onChange(of: fileScope) { _, value in
@@ -389,7 +405,11 @@ struct ContentView: View {
             Button("Choose Folder…") { chooseProject() }
             if !Engine.recents.isEmpty { Divider() }
             ForEach(Engine.recents, id: \.self) { recent in
+#if FCB_APP_STORE
+                Button(recent) { restoreProject(recent) }
+#else
                 Button(recent) { setRoot(recent) }
+#endif
             }
         } label: {
             HStack(spacing: 6) {
@@ -547,6 +567,7 @@ struct ContentView: View {
     // MARK: Actions
 
     private func loadAtlas() {
+#if !FCB_APP_STORE
         if let argRoot = CommandLine.arguments.dropFirst().first,
             FileManager.default.fileExists(atPath: argRoot)
         {
@@ -554,6 +575,12 @@ struct ContentView: View {
             UserDefaults.standard.set(argRoot, forKey: "fcb.root")
             Engine.remember(root: argRoot)
         }
+#else
+        guard rootAccess?.url.path == root else {
+            status = "Choose a project folder to grant read access."
+            return
+        }
+#endif
         files = Engine.atlas(root: root)
         if projectCache?.root != root {
             projectCache = AtlasProjectCache.defaultDirectory(root: root).map {
@@ -732,6 +759,26 @@ struct ContentView: View {
         }
     }
 
+#if FCB_APP_STORE
+    private func activateProject(_ access: AppStoreRootAccess) {
+        rootAccess = access
+        root = access.url.path
+        clearSearch()
+        searchTitle = "Search project"
+        searchSummary = "Enter text to search the project."
+        selectedPath = nil
+        loadAtlas()
+        if fileScope != .all { applyFileScope() }
+    }
+
+    private func restoreProject(_ path: String) {
+        guard let access = AppStoreRootAccess.restore(path) else {
+            status = "Saved project access is unavailable. Choose the folder again to restore it."
+            return
+        }
+        activateProject(access)
+    }
+#else
     private func setRoot(_ newRoot: String) {
         root = newRoot
         UserDefaults.standard.set(newRoot, forKey: "fcb.root")
@@ -743,6 +790,7 @@ struct ContentView: View {
         loadAtlas()
         if fileScope != .all { applyFileScope() }
     }
+#endif
 
     private func chooseProject() {
         let panel = NSOpenPanel()
@@ -753,7 +801,15 @@ struct ContentView: View {
         panel.message = "Choose the project root to lay out and browse"
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
+#if FCB_APP_STORE
+            guard let access = AppStoreRootAccess.select(url) else {
+                status = "Could not retain read access to this folder. Choose it again."
+                return
+            }
+            activateProject(access)
+#else
             setRoot(url.path)
+#endif
         }
     }
 }
