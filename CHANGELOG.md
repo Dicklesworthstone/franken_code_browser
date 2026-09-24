@@ -23,6 +23,9 @@ Scope window: September 12–23, 2026.
 - Apple processed build 0.1.0 (3) as App Store eligible. Submitted it for App Review as submission
   `e1417f93-9886-4507-b396-c8595321cb59`; the confirmed state is **Waiting for Review**.
   This is not App Store approval or a public Mac App Store release.
+- Corrected the provisioning-profile entitlement mismatch reported for TestFlight on build 3.
+  Apple processed replacement build 0.1.0 (4) as valid and ready for internal beta testing.
+  The existing App Review submission remains queued on build 3 with no blocking issue.
 
 ## v0.1.0 — notarized Mac developer preview (September 23, 2026)
 

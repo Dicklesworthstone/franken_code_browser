@@ -57,7 +57,7 @@ import plistlib
 import sys
 
 source, destination, bundle_id = sys.argv[1:]
-profile = plistlib.load(sys.stdin.buffer)["Entitlements"]
+profile = plistlib.loads(sys.stdin.buffer.read())["Entitlements"]
 app_id = profile["com.apple.application-identifier"]
 team_id = profile["com.apple.developer.team-identifier"]
 if app_id != f"{team_id}.{bundle_id}":
@@ -80,7 +80,7 @@ import sys
 
 with open(sys.argv[1], "rb") as expected_file:
     expected = plistlib.load(expected_file)
-actual = plistlib.load(sys.stdin.buffer)
+actual = plistlib.loads(sys.stdin.buffer.read())
 if actual != expected:
     raise SystemExit("signed entitlements do not match the selected profile")
 ' "$signed_entitlements"
