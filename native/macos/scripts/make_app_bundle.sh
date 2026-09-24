@@ -45,7 +45,11 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 if [ "${FCB_APP_STORE:-0}" = 1 ]; then
-    /usr/libexec/PlistBuddy -c 'Set :CFBundleVersion 3' "$APP/Contents/Info.plist"
+    app_store_build_number=${FCB_APP_STORE_BUILD_NUMBER:-4}
+    case "$app_store_build_number" in
+        ''|*[!0-9]*|0) echo 'FCB_APP_STORE_BUILD_NUMBER must be a positive integer' >&2; exit 2 ;;
+    esac
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $app_store_build_number" "$APP/Contents/Info.plist"
     codesign --force --sign - --entitlements swiftui/AppStore.entitlements "$APP"
 else
     codesign --force --sign - "$APP"
