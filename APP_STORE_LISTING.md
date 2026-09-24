@@ -1,7 +1,7 @@
 # Mac App Store listing — FrankenCodeBrowser 0.1.0
 
-This copy describes the sandboxed Mac build. It is source for the App Store Connect listing,
-not evidence that Apple has accepted or published the app.
+This copy describes the sandboxed Mac build and was used for the App Store Connect listing.
+Version 0.1.0 is waiting for App Review; this is not evidence of approval or publication.
 
 | Field | Value |
 |---|---|

@@ -12,15 +12,17 @@ Scope window: September 12–23, 2026.
 | September 14–22, 2026 | One-repo source browser and Mac app | Source milestones; local test builds |
 | September 12–13, 2026 | Documentation bootstrap | No binary release |
 
-## Unreleased — Mac App Store submission candidate
+## Mac App Store review submission — September 23, 2026
 
 - Added a separate sandboxed Mac build with read-only project selection and persistent
   security-scoped bookmarks. A physical-Mac test selected a project, reopened it after quitting,
   and searched its source.
 - Registered the Mac bundle ID, created Mac distribution signing assets, and built a signed
-  installer package for App Store Connect. Captured a real Mac screenshot and drafted listing
-  metadata. The app record, upload, privacy and review forms, and App Review submission remain
-  open; this is not an App Store release.
+  installer package for App Store Connect. Captured a real Mac screenshot and completed the listing,
+  privacy, age rating, free pricing, worldwide availability, and review information.
+- Apple processed build 0.1.0 (3) as App Store eligible. Submitted it for App Review as submission
+  `e1417f93-9886-4507-b396-c8595321cb59`; the confirmed state is **Waiting for Review**.
+  This is not App Store approval or a public Mac App Store release.
 
 ## v0.1.0 — notarized Mac developer preview (September 23, 2026)
 
