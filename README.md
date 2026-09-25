@@ -34,8 +34,9 @@ Open FrankenCodeBrowser, choose a project folder, drag to pan, and scroll to zoo
 > [!IMPORTANT]
 > This repository contains the Rust engine, C ABI bridge, headless `fcb` source tools, and the
 > SwiftUI/Metal app under [`native/macos/`](native/macos/). A single checkout can build the app and
-> a drag-to-Applications DMG. A Developer ID-signed, notarized DMG is available as a public
-> developer-preview release. A separate sandboxed Mac App Store build was submitted for review
+> a drag-to-Applications DMG. A notarized, stapled DMG containing the Developer ID-signed app is
+> available as a public developer-preview release (the v0.1.0 disk image itself is unsigned; see
+> [#1](https://github.com/Dicklesworthstone/franken_code_browser/issues/1)). A separate sandboxed Mac App Store build was submitted for review
 > on September 23, 2026; no Mac App Store version has shipped yet.
 > The [implementation status](IMPLEMENTATION_STATUS.md) document is a dated September 14
 > snapshot; code and current qualification evidence take precedence where it has gone stale.
@@ -139,14 +140,15 @@ components must also work on supported non-Mac test hosts without Apple framewor
 Linux, iOS and browser UIs are not initial release commitments.
 
 The headless `fcb` executable exists in source, and the native app links this engine.
-Version 0.1.0 has a physical-Mac app build and a public Developer ID-signed, notarized
-drag-to-Applications DMG with a checksum sidecar. Quarantined first-launch and
+Version 0.1.0 has a physical-Mac app build and a public notarized, stapled
+drag-to-Applications DMG with a checksum sidecar. The app inside is Developer ID-signed and
+notarized; the v0.1.0 disk image itself carries no code signature. Quarantined first-launch and
 clean-machine qualification remain open. A separate sandboxed and distribution-signed Mac App
 Store build, version 0.1.0 (3), was submitted to App Review on September 23, 2026 and is waiting
 for Apple's decision. It cannot be made by renaming or uploading the DMG.
 
-The release DMG bundles the native app. Its code signature, notarization ticket, checksum and
-local Gatekeeper assessment have been checked; offline first launch from a quarantined download
+The release DMG bundles the native app. The app's code signature, the image's notarization ticket,
+the checksum and the app's local Gatekeeper assessment have been checked; offline first launch from a quarantined download
 remains part of clean-machine qualification.
 
 The native app currently targets macOS 14+ on Apple Silicon; the full clean-machine installation
@@ -189,8 +191,11 @@ identity reported by `security find-identity -v -p codesigning`, then use either
   --identity "$DEVELOPER_ID" --notary-asc
 ```
 
-Use `--notary-profile PROFILE` instead of `--notary-asc` for `notarytool`. The script waits for
-Apple's acceptance and staples the ticket. See [distribution status](DISTRIBUTION.md) for the
+Use `--notary-profile PROFILE` instead of `--notary-asc` for `notarytool`. The script signs the
+app and then the disk image with that identity, waits for Apple's acceptance, staples the ticket,
+and finally runs `scripts/verify_macos_dmg.sh`, which fails unless both the image and the app are
+Developer ID-signed, notarized and accepted by Gatekeeper. Run that verifier on the exact file
+again before uploading it to a release. See [distribution status](DISTRIBUTION.md) for the
 remaining release checks. The separate App Store build and review status are recorded there as
 well.
 

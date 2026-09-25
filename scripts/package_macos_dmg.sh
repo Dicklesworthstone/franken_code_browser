@@ -10,6 +10,8 @@ Usage: scripts/package_macos_dmg.sh --app APP --output ABSOLUTE_PATH.dmg [--iden
 --notary-profile submits the DMG to Apple, waits for acceptance, and staples it.
 --notary-asc uses the authenticated asc CLI for the same notarization flow.
 --local-test creates an unnotarized test image; do not publish it as an installer.
+--identity signs the staged app and then the disk image itself with that Developer ID.
+Public images must pass scripts/verify_macos_dmg.sh, which this script runs last.
 The output and its .staging sibling must not already exist.
 USAGE
 }
@@ -70,6 +72,13 @@ fi
 codesign --verify --deep --strict --verbose=2 "$staging/FrankenCodeBrowser.app"
 hdiutil create -volname FrankenCodeBrowser -srcfolder "$staging" -format UDZO -imagekey zlib-level=9 "$output"
 hdiutil verify "$output"
+if [ -n "$identity" ]; then
+    # Apple signs every nested container: the image itself gets the Developer ID
+    # signature before the outermost container is notarized and stapled.
+    bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$staging/FrankenCodeBrowser.app/Contents/Info.plist")
+    codesign --timestamp --sign "$identity" --identifier "$bundle_id.dmg" "$output"
+    codesign --verify --strict --verbose=2 "$output"
+fi
 
 if [ "$local_test" -eq 0 ]; then
     if [ "$asc_notary" -eq 1 ]; then
@@ -91,7 +100,18 @@ if status != "Accepted":
     fi
     xcrun stapler staple "$output"
     xcrun stapler validate "$output"
-    echo 'Notarized DMG ready for Gatekeeper qualification.'
+    # Fail closed: an image that is not Developer ID-signed, notarized and
+    # stapled (container and app) must never leave this script as publishable.
+    "$(dirname "$0")/verify_macos_dmg.sh" "$output" || {
+        rejected=${output%.dmg}.REJECTED.dmg
+        if [ ! -e "$rejected" ] && mv "$output" "$rejected"; then
+            echo "REFUSING: the image failed release verification and was renamed to $rejected; do not publish it." >&2
+        else
+            echo "REFUSING: $output failed release verification; do not publish it." >&2
+        fi
+        exit 1
+    }
+    echo 'Signed, notarized DMG ready for Gatekeeper qualification.'
 else
     echo 'LOCAL TEST ONLY: this DMG is not notarized or ready for public distribution.' >&2
 fi

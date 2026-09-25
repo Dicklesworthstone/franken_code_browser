@@ -31,7 +31,7 @@ Scope window: September 12–23, 2026.
 
 ### Delivered capability
 
-- Published the [first GitHub release](https://github.com/Dicklesworthstone/franken_code_browser/releases/tag/v0.1.0) with a Developer ID-signed, Apple-notarized and stapled drag-to-Applications DMG and its SHA-256 sidecar. The release image's SHA-256 is `698293fc864d984fda3deea37769abd84adcc7fd44a9dbffd6bd9bc214244b76`.
+- Published the [first GitHub release](https://github.com/Dicklesworthstone/franken_code_browser/releases/tag/v0.1.0) with an Apple-notarized and stapled drag-to-Applications DMG and its SHA-256 sidecar. The app inside is Developer ID-signed; the disk image itself was not code-signed, although the original release notes said it was ([#1](https://github.com/Dicklesworthstone/franken_code_browser/issues/1)). The release image's SHA-256 is `698293fc864d984fda3deea37769abd84adcc7fd44a9dbffd6bd9bc214244b76`.
 - Added a verified one-line shell installer and a [Homebrew cask](https://github.com/Dicklesworthstone/homebrew-tap/blob/main/Casks/franken-code-browser.rb) for Apple Silicon Macs running macOS 14 or later. The cask passed `brew style`, strict audit, and fetch against the published artifact; the online installer passed an isolated install test.
 - The release does not yet establish clean-machine first-launch, sustained smooth zoom, or Mac App Store qualification. See [distribution status](DISTRIBUTION.md).
 
