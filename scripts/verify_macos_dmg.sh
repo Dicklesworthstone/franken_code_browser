@@ -78,8 +78,8 @@ else
 fi
 
 # 3. Gatekeeper assessment of the image.
-assessment=$(spctl -a -t open --context context:primary-signature -v "$dmg" 2>&1)
-if [ "$?" -eq 0 ] && printf '%s\n' "$assessment" | grep -q '^source=Notarized Developer ID$'; then
+if assessment=$(spctl -a -t open --context context:primary-signature -v "$dmg" 2>&1) \
+    && printf '%s\n' "$assessment" | grep -q '^source=Notarized Developer ID$'; then
     pass 'Gatekeeper accepts the image as Notarized Developer ID'
 else
     fail "Gatekeeper does not accept the image as Notarized Developer ID: $(printf '%s' "$assessment" | tr '\n' ' ')"
@@ -124,8 +124,8 @@ else
     if [ -n "$team" ] && [ -n "$app_team" ] && [ "$app_team" != "$team" ]; then
         fail "app Team ID $app_team does not match expected $team"
     fi
-    app_assessment=$(spctl -a -t execute -v "$app" 2>&1)
-    if [ "$?" -eq 0 ] && printf '%s\n' "$app_assessment" | grep -q '^source=Notarized Developer ID$'; then
+    if app_assessment=$(spctl -a -t execute -v "$app" 2>&1) \
+        && printf '%s\n' "$app_assessment" | grep -q '^source=Notarized Developer ID$'; then
         pass 'Gatekeeper accepts the app as Notarized Developer ID'
     else
         fail "Gatekeeper does not accept the app as Notarized Developer ID: $(printf '%s' "$app_assessment" | tr '\n' ' ')"
