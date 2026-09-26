@@ -1,6 +1,6 @@
 import Foundation
 
-struct SearchHit: Identifiable, Hashable {
+struct SearchHit: Identifiable, Hashable, Sendable {
     let id: Int
     /// Escaped presentation label is never used as a filesystem path.
     let path: String
@@ -13,10 +13,13 @@ struct SearchHit: Identifiable, Hashable {
     var folder: String { (path as NSString).deletingLastPathComponent }
 }
 
-enum AtlasSearchError: Error {
-    case unavailable, invalidResponse
+enum AtlasSearchError: Error, Sendable {
+    case unavailable, invalidResponse, canceled, invalidRequest, identityExhausted
     var message: String {
         switch self {
+        case .canceled: return "Search canceled. In-flight reads may finish, but their results will not be shown."
+        case .invalidRequest: return "Choose a project and enter 1–1024 UTF-8 bytes of search text without NUL characters."
+        case .identityExhausted: return "This search session exhausted its request identities. Reopen the window before searching again."
         case .unavailable: return "Search unavailable. The project could not be read or the search exceeded its limits."
         case .invalidResponse: return "Search response could not be read. Results are unavailable, not an empty match set."
         }
@@ -24,7 +27,7 @@ enum AtlasSearchError: Error {
 }
 
 /// Adapts the shared engine's search envelope, without another search engine.
-struct AtlasSearchReport {
+struct AtlasSearchReport: Sendable {
     let hits: [SearchHit]
     let complete: Bool
     let truncated: Bool
