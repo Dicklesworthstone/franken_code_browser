@@ -226,6 +226,43 @@ import CoreText
         let changed = second.document(path: "file.rs", fallback: { nil })!
         precondition(second.rebuilt == 1 && changed.source.text == "fn other() {}\n")
     }
+    static func workerPreparedCache() throws {
+        let base = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
+            .appendingPathComponent("fcb-worker-prepared-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: false)
+        let source = base.appendingPathComponent("file.rs")
+        try Data("fn worker() {}\n".utf8).write(to: source)
+        let disk = base.appendingPathComponent("cache").path
+        let token = AtlasSearchCancellation()
+        var cache: AtlasProjectCache? = AtlasProjectCache(root: base.path, cacheDirectory: disk)
+        precondition(cache!.sourceHandle != 0)
+        cache!.beginRefresh()
+        let packet = try AtlasProjectWorker.source(path: source.path,
+            handle: cache!.sourceHandle, cancellation: token)!
+        let key = cache!.preparedKey(path: "file.rs", sourceKey: packet.key)!
+        let missing = try AtlasProjectWorker.artifact(handle: cache!.sourceHandle,
+            key: key, limit: AtlasBinaryWriter.limit, cancellation: token)
+        precondition(missing == nil)
+        let first = cache!.document(path: "file.rs", packet: packet, artifact: nil)!
+        precondition(first.source.text == "fn worker() {}\n" && cache!.rebuilt == 1)
+        for tile in first.tiles { tile.prepareRaster(pixelBudget: 8192) }
+        cache!.finishRefresh(documents: ["file.rs": first])
+        precondition(cache!.saved == 1)
+        cache!.beginRefresh()
+        let hot = cache!.document(path: "file.rs", packet: packet, artifact: nil)!
+        precondition(cache!.ramHits == 1 && hot.tiles[0] === first.tiles[0])
+        cache = nil
+        let reopened = AtlasProjectCache(root: base.path, cacheDirectory: disk)
+        reopened.beginRefresh()
+        let coldPacket = try AtlasProjectWorker.source(path: source.path,
+            handle: reopened.sourceHandle, cancellation: token)!
+        let coldKey = reopened.preparedKey(path: "file.rs", sourceKey: coldPacket.key)!
+        let artifact = try AtlasProjectWorker.artifact(handle: reopened.sourceHandle,
+            key: coldKey, limit: AtlasBinaryWriter.limit, cancellation: token)
+        let cold = reopened.document(path: "file.rs", packet: coldPacket, artifact: artifact)!
+        precondition(reopened.diskHits == 1 && reopened.rebuilt == 0)
+        precondition(cold.source.text == first.source.text)
+    }
     static func overviewCache() throws {
         let base = URL(fileURLWithPath: "/private/tmp", isDirectory: true).appendingPathComponent("fcb-overview-cache-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: false)
@@ -339,6 +376,7 @@ import CoreText
         try fontFingerprintSurvivesShaping()
         try sharedFontSeedVariants()
         try realCache()
+        try workerPreparedCache()
 
         let fonts = AtlasPreparedFonts()
         let key = String(repeating: "a", count: 64)

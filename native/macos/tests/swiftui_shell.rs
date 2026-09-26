@@ -124,6 +124,10 @@ fn production_swift_camera_source_and_shell() {
                 "swiftui/AtlasSource.swift",
                 "swiftui/AtlasDocument.swift",
                 "swiftui/AtlasPreparedText.swift",
+                "swiftui/AtlasSearch.swift",
+                "swiftui/AtlasSearchCoordinator.swift",
+                "swiftui/AtlasProjectIO.swift",
+                "swiftui/AtlasProjectWorker.swift",
                 "swiftui/AtlasProjectCache.swift",
                 "swiftui/tests/AtlasPreparedTextTests.swift",
             ])
@@ -133,17 +137,59 @@ fn production_swift_camera_source_and_shell() {
     );
     checked(&mut Command::new(prepared_test));
 
+    let project_io_test = scratch.join("AtlasProjectIO");
+    checked(
+        Command::new("xcrun")
+            .current_dir(&root)
+            .args([
+                "swiftc",
+                "-parse-as-library",
+                "swiftui/AtlasSearch.swift",
+                "swiftui/AtlasSearchCoordinator.swift",
+                "swiftui/AtlasProjectIO.swift",
+                "swiftui/tests/AtlasProjectIOTests.swift",
+                "-o",
+            ])
+            .arg(&project_io_test),
+    );
+    checked(&mut Command::new(project_io_test));
+
+    let project_worker_test = scratch.join("AtlasProjectWorker");
+    checked(
+        Command::new("xcrun")
+            .current_dir(&root)
+            .args([
+                "swiftc",
+                "-parse-as-library",
+                "swiftui/AtlasSearch.swift",
+                "swiftui/AtlasSearchCoordinator.swift",
+                "swiftui/AtlasProjectIO.swift",
+                "swiftui/AtlasProjectWorker.swift",
+                "swiftui/tests/AtlasProjectWorkerTests.swift",
+            ])
+            .arg(&bridge)
+            .arg("-o")
+            .arg(&project_worker_test),
+    );
+    checked(&mut Command::new(project_worker_test));
+
     checked(Command::new("xcrun").current_dir(&root).args([
         "swiftc",
         "-typecheck",
         "-parse-as-library",
         "swiftui/AtlasCamera.swift",
         "swiftui/AtlasSource.swift",
+        "swiftui/AtlasSourceReader.swift",
         "swiftui/AtlasSearch.swift",
+        "swiftui/AtlasSearchCoordinator.swift",
+        "swiftui/AtlasSearchWorker.swift",
+        "swiftui/AtlasProjectIO.swift",
+        "swiftui/AtlasProjectWorker.swift",
         "swiftui/AtlasMatch.swift",
         "swiftui/AtlasDocument.swift",
         "swiftui/AtlasPreparedText.swift",
         "swiftui/AtlasProjectCache.swift",
+        "swiftui/AppStoreRootAccess.swift",
         "swiftui/AtlasParcelLayout.swift",
         "swiftui/AtlasMetalRasterRenderer.swift",
         "swiftui/AtlasMetalGlyphRenderer.swift",

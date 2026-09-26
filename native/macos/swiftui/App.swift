@@ -235,6 +235,8 @@ extension AtlasCamera {
     @State private var loadProgress = ""
     @State private var loadGeneration = UUID()
     @State private var loadTask: Task<Void, Never>?
+    @State private var projectIO = AtlasProjectIO()
+    @State private var loadCancellation: AtlasSearchCancellation?
     @State private var showsReader = false
     @State private var hits: [SearchHit] = []
     @State private var selectedHit: SearchHit.ID?
@@ -620,8 +622,12 @@ extension AtlasCamera {
 
     private func requestAtlasLoad() {
         loadTask?.cancel()
+        loadCancellation?.cancel()
+        projectIO.cancel()
         loadGeneration = UUID()
         let generation = loadGeneration
+        let cancellation = AtlasSearchCancellation()
+        loadCancellation = cancellation
 #if !FCB_APP_STORE
         if let argRoot = CommandLine.arguments.dropFirst().first,
             FileManager.default.fileExists(atPath: argRoot)
@@ -632,8 +638,11 @@ extension AtlasCamera {
         }
 #endif
         let requestedRoot = root
+        let accessLease: AnyObject?
 #if FCB_APP_STORE
-        let accessLease = rootAccess
+        accessLease = rootAccess
+#else
+        accessLease = nil
 #endif
         files = []
         displayedFiles = []
@@ -642,28 +651,30 @@ extension AtlasCamera {
         loadingProject = true
         loadProgress = "Discovering files…"
         loadTask = Task {
-#if FCB_APP_STORE
-            // Retain the security-scoped grant until this load stops using Rust.
-            defer { withExtendedLifetime(accessLease) {} }
-#endif
-            await loadAtlas(root: requestedRoot, generation: generation)
+            await loadAtlas(root: requestedRoot, generation: generation,
+                cancellation: cancellation, accessLease: accessLease)
         }
     }
 
     private func cancelAtlasLoad() {
         loadTask?.cancel()
+        loadCancellation?.cancel()
+        projectIO.cancel()
         loadTask = nil
+        loadCancellation = nil
         loadGeneration = UUID()
         loadingProject = false
         loadProgress = ""
         status = "Project loading canceled. Choose a folder to try again."
     }
 
-    private func loadAtlas(root requestedRoot: String, generation: UUID) async {
+    private func loadAtlas(root requestedRoot: String, generation: UUID,
+        cancellation: AtlasSearchCancellation, accessLease: AnyObject?) async {
         defer {
             if loadGeneration == generation {
                 loadingProject = false
                 loadTask = nil
+                loadCancellation = nil
             }
         }
         // A refresh changes the accepted atlas even when the path is unchanged.
@@ -674,8 +685,25 @@ extension AtlasCamera {
             return
         }
 #endif
-        let atlasFiles = Engine.atlas(root: requestedRoot)
+        let catalog: [AtlasProjectFile]
+        do {
+            catalog = try await projectIO.perform(cancellation: cancellation,
+                keepingAlive: accessLease.map { [$0] } ?? []) {
+                try AtlasProjectWorker.catalog(root: requestedRoot, cancellation: cancellation)
+            }
+        } catch {
+            if !cancellation.isCanceled, loadGeneration == generation {
+                status = "Could not discover this project (\(error)). Choose another folder or retry."
+            }
+            return
+        }
         guard !Task.isCancelled, loadGeneration == generation else { return }
+        let atlasFiles = catalog.map { file in
+            AtlasFile(path: file.path, x: file.x, y: file.y, w: file.w, h: file.h,
+                bytes: file.bytes, lineCount: file.lineCount,
+                sourceLineCount: file.sourceLineCount, profileState: file.profileState,
+                profile: file.profile, avgColor: AtlasFile.averageColor(profile: file.profile))
+        }
         files = atlasFiles
         loadProgress = "Preparing source previews for \(atlasFiles.count) files…"
         await Task.yield()
@@ -702,11 +730,35 @@ extension AtlasCamera {
         for (index, file) in captureOrder.enumerated() {
             guard !Task.isCancelled, loadGeneration == generation else { return }
             guard file.bytes <= remainingBytes, file.bytes <= 4 * 1024 * 1024 else { continue }
+            let fullPath = (requestedRoot as NSString).appendingPathComponent(file.path)
+            let handle = cache?.sourceHandle ?? 0
+            var leases = accessLease.map { [$0] } ?? []
+            if let cache { leases.append(cache) }
+            let packet: AtlasProjectSourcePacket?
+            do {
+                packet = try await projectIO.perform(cancellation: cancellation, keepingAlive: leases) {
+                    try AtlasProjectWorker.source(path: fullPath, handle: handle, cancellation: cancellation)
+                }
+            } catch AtlasProjectIOError.canceled { return }
+            catch { continue }
+            guard !Task.isCancelled, loadGeneration == generation, let packet else { continue }
+            let artifact: Data?
+            if let key = cache?.preparedKey(path: file.path, sourceKey: packet.key) {
+                do {
+                    artifact = try await projectIO.perform(cancellation: cancellation, keepingAlive: leases) {
+                        try AtlasProjectWorker.artifact(handle: handle, key: key,
+                            limit: AtlasBinaryWriter.limit, cancellation: cancellation)
+                    }
+                } catch AtlasProjectIOError.canceled { return }
+                catch { continue }
+            } else { artifact = nil }
+            guard !Task.isCancelled, loadGeneration == generation else { return }
             let prepared: AtlasDocument?
             if let cache {
-                prepared = cache.document(path: file.path) { Engine.sourceCapture(root: requestedRoot, path: file.path) }
+                prepared = cache.document(path: file.path, packet: packet, artifact: artifact)
             } else {
-                prepared = Engine.sourceCapture(root: requestedRoot, path: file.path).flatMap { AtlasDocument(path: file.path, capture: $0) }
+                prepared = (try? JSONDecoder().decode(AtlasHighlightCapture.self, from: packet.json))
+                    .flatMap { AtlasDocument(path: file.path, capture: $0) }
             }
             guard let document = prepared,
                   document.source.text.utf8.count <= remainingBytes,
@@ -716,8 +768,8 @@ extension AtlasCamera {
             tiles.append(contentsOf: document.tiles)
             if index.isMultiple(of: 8) {
                 loadProgress = "Prepared \(index + 1) of \(captureOrder.count) files…"
-                await Task.yield()
             }
+            await Task.yield()
         }
         guard !Task.isCancelled, loadGeneration == generation else { return }
         loadProgress = "Laying out the atlas…"
@@ -754,10 +806,7 @@ extension AtlasCamera {
         selectedSource = nil
         sourceError = nil
         if atlasFiles.isEmpty {
-            let planJSON = Engine.plan(root: requestedRoot)
-            status = planJSON.count > 2
-                ? "Atlas unavailable for this root — the engine's bounded discovery refused it (\(planJSON.count)-byte plan). Pick a smaller subdirectory."
-                : "No atlas for \(requestedRoot): empty, unreadable, or beyond walk bounds."
+            status = "No files found in \(requestedRoot). Choose a different project folder."
         } else if textTiles.isEmpty {
             status = "Source text layout unavailable. \(atlasDocuments.count) files captured."
         } else {

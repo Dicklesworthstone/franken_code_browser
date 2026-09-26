@@ -111,6 +111,66 @@ final class AtlasProjectCache {
         remainingRuns = max(0, min(1024 * 1024, runLimit)); remainingArtifactBytes = 512 * 1024 * 1024
     }
 
+    /// The handle is borrowed only while this owner is retained by the project
+    /// load and its worker lease. Project source/cache reads happen off-main.
+    var sourceHandle: UInt64 { handle }
+
+    func preparedKey(path: String, sourceKey: [UInt8]?) -> String? {
+        guard handle != 0, let sourceKey, sourceKey.count == 32 else { return nil }
+        var hash = SHA256()
+        hash.update(data: Data(sourceKey))
+        hash.update(data: Data((Self.layoutVersion + "\u{0}" + environment + "\u{0}" + path + "\u{0}"
+            + ProcessInfo.processInfo.operatingSystemVersionString + "\u{0}"
+            + (CTFontCopyPostScriptName(NSFont.monospacedSystemFont(ofSize: 13, weight: .regular) as CTFont) as String)).utf8))
+        return hash.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Consumes immutable bytes fetched by AtlasProjectIO. Font shaping and
+    /// bitmap ownership stay on the main actor, exactly as in the legacy path.
+    func document(path: String, packet: AtlasProjectSourcePacket, artifact: Data?) -> AtlasDocument? {
+        if handle == 0 {
+            guard let capture = try? JSONDecoder().decode(AtlasHighlightCapture.self, from: packet.json),
+                  let document = AtlasDocument(path: path, capture: capture,
+                    glyphLimit: remainingGlyphs, runLimit: remainingRuns), admit(document) else { return nil }
+            rebuilt += 1
+            return document
+        }
+        guard let key = preparedKey(path: path, sourceKey: packet.key) else { return nil }
+        if keys[path] == key, let document = hot[path] {
+            guard admit(document) else { return nil }
+            ramHits += 1
+            return document
+        }
+        if let artifact {
+            guard artifact.count <= min(AtlasBinaryWriter.limit, remainingArtifactBytes) else { return nil }
+            do {
+                let document = try AtlasDocumentArchive.decode(artifact, path: path, key: key,
+                    fonts: fonts, glyphLimit: remainingGlyphs, pixelLimit: remainingPixels,
+                    runLimit: remainingRuns, onColorLineRestore: { self.reshapedColorLines += 1 })
+                remainingArtifactBytes -= artifact.count
+                guard admit(document) else { return nil }
+                diskHits += 1
+                persisted.insert(key)
+                hot[path] = document; keys[path] = key
+                return document
+            } catch AtlasPreparationError.limit {
+                return nil
+            } catch {
+                rejected.insert(key)
+                let reason = String(describing: error)
+                if rejectionReasons[reason] != nil || rejectionReasons.count < 16 {
+                    rejectionReasons[reason, default: 0] += 1
+                } else { rejectionReasons["other", default: 0] += 1 }
+            }
+        }
+        guard let capture = try? JSONDecoder().decode(AtlasHighlightCapture.self, from: packet.json),
+              let document = AtlasDocument(path: path, capture: capture,
+                glyphLimit: remainingGlyphs, runLimit: remainingRuns), admit(document) else { return nil }
+        rebuilt += 1
+        hot[path] = document; keys[path] = key
+        return document
+    }
+
     func document(path: String, fallback: () -> AtlasHighlightCapture?) -> AtlasDocument? {
         guard handle != 0 else {
             guard let capture = fallback(), let document = AtlasDocument(path: path, capture: capture,

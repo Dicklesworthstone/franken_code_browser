@@ -19,7 +19,7 @@ set -- -O -target "$SWIFT_TARGET" -parse-as-library
 if [ "${FCB_APP_STORE:-0}" = 1 ]; then
     set -- "$@" -D FCB_APP_STORE
 fi
-xcrun swiftc "$@" swiftui/AtlasCamera.swift swiftui/AtlasSource.swift swiftui/AtlasSourceReader.swift swiftui/AtlasSearch.swift swiftui/AtlasSearchCoordinator.swift swiftui/AtlasSearchWorker.swift swiftui/AtlasMatch.swift swiftui/AtlasDocument.swift swiftui/AtlasPreparedText.swift swiftui/AtlasProjectCache.swift swiftui/AppStoreRootAccess.swift swiftui/AtlasMetalRasterRenderer.swift swiftui/AtlasMetalGlyphRenderer.swift swiftui/AtlasMetalPresentation.swift swiftui/AtlasRetainedView.swift swiftui/AtlasParcelLayout.swift swiftui/App.swift "$BRIDGE" \
+xcrun swiftc "$@" swiftui/AtlasCamera.swift swiftui/AtlasSource.swift swiftui/AtlasSourceReader.swift swiftui/AtlasSearch.swift swiftui/AtlasSearchCoordinator.swift swiftui/AtlasSearchWorker.swift swiftui/AtlasProjectIO.swift swiftui/AtlasProjectWorker.swift swiftui/AtlasMatch.swift swiftui/AtlasDocument.swift swiftui/AtlasPreparedText.swift swiftui/AtlasProjectCache.swift swiftui/AppStoreRootAccess.swift swiftui/AtlasMetalRasterRenderer.swift swiftui/AtlasMetalGlyphRenderer.swift swiftui/AtlasMetalPresentation.swift swiftui/AtlasRetainedView.swift swiftui/AtlasParcelLayout.swift swiftui/App.swift "$BRIDGE" \
     -framework SwiftUI -framework AppKit \
     -o "$APP/Contents/MacOS/FrankenCodeBrowser"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
