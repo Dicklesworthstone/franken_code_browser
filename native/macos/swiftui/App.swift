@@ -211,7 +211,7 @@ extension AtlasCamera {
 
 // MARK: - Content
 
-struct ContentView: View {
+@MainActor struct ContentView: View {
 #if FCB_APP_STORE
     @State private var root = ""
     @State private var rootAccess: AppStoreRootAccess?
@@ -223,6 +223,9 @@ struct ContentView: View {
     @FocusState private var searchFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var searchReport: AtlasSearchReport?
+    @State private var searchPending = false
+    // Created only on explicit submission, not on every SwiftUI view rebuild.
+    @State private var searchCoordinator: AtlasSearchCoordinator?
     @State private var resolvedMatches: [SearchHit.ID: AtlasMatch] = [:]
     @State private var searchRows: [CGRect] = []
     @State private var searchPaths: Set<String> = []
@@ -295,6 +298,11 @@ struct ContentView: View {
             if root.isEmpty { chooseProject() } else { loadAtlas() }
 #endif
         }
+        .onDisappear {
+            searchCoordinator?.cancel()
+            searchCoordinator = nil
+            searchPending = false
+        }
         .onChange(of: query) { _, _ in clearSearch() }
         .onChange(of: fileScope) { _, value in
             if value == .custom { showsSidebar = true }
@@ -340,7 +348,7 @@ struct ContentView: View {
                     .onSubmit(runSearch)
                     .onExitCommand { query = ""; clearSearch() }
                 Button("Search") { runSearch() }
-                    .disabled(query.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(root.isEmpty || query.trimmingCharacters(in: .whitespaces).isEmpty)
                 if !query.isEmpty {
                     Button { query = ""; clearSearch() } label: { Image(systemName: "xmark.circle.fill") }
                         .buttonStyle(.plain)
@@ -349,6 +357,17 @@ struct ContentView: View {
             }
             .padding(.horizontal, 10)
             .padding(.top, 10)
+            if searchPending {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                        .accessibilityLabel("Searching project")
+                    Text("Searching…").font(.caption)
+                    Spacer()
+                    Button("Cancel", action: cancelSearch)
+                }
+                .padding(.horizontal, 10)
+                .padding(.top, 6)
+            }
             if fileScope == .custom {
                 TextField("Extensions: md, py, rs…", text: $customExtensions)
                     .textFieldStyle(.roundedBorder).padding(.horizontal, 10)
@@ -567,6 +586,8 @@ struct ContentView: View {
     // MARK: Actions
 
     private func loadAtlas() {
+        // A refresh changes the accepted atlas even when the path is unchanged.
+        clearSearch()
 #if !FCB_APP_STORE
         if let argRoot = CommandLine.arguments.dropFirst().first,
             FileManager.default.fileExists(atPath: argRoot)
@@ -679,6 +700,8 @@ struct ContentView: View {
     }
 
     private func clearSearch() {
+        searchCoordinator?.cancel()
+        searchPending = false
         hits = []; selectedHit = nil; selectedMatch = nil
         searchReport = nil; resolvedMatches = [:]; searchRows = []; searchPaths = []
         overlayLimited = false
@@ -722,24 +745,65 @@ struct ContentView: View {
     }
 
     private func runSearch() {
-        let trimmed = query.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return }
-        selectedHit = nil
-        selectedMatch = nil
-        do {
-            let report = try Engine.search(root: root, query: trimmed)
-            prepareSearchOverlay(report)
-            searchReport = report
-            hits = report.hits.filter { $0.sourcePath.map { fileScope.includes($0, custom: customExtensions) } ?? (fileScope == .all) }
-            status = report.summary
-            searchSummary = report.summary
-            searchTitle = report.complete ? "No matches" : "Partial search"
-        } catch {
+        let requestedText = query
+        let trimmed = requestedText.trimmingCharacters(in: .whitespaces)
+        let requestedRoot = root
+        guard !trimmed.isEmpty, !requestedRoot.isEmpty else { return }
+#if FCB_APP_STORE
+        guard let access = rootAccess, access.url.path == requestedRoot else {
             clearSearch()
+            status = "Choose the project folder again to grant read access."
+            searchSummary = status
+            searchTitle = "Project access unavailable"
+            return
+        }
+        let accessLease: AnyObject? = access
+#else
+        let accessLease: AnyObject? = nil
+#endif
+        do {
+            try AtlasSearchCoordinator.validate(root: requestedRoot, query: trimmed)
+            clearSearch()
+            searchPending = true
+            searchTitle = "Searching project"
+            searchSummary = "Searching captured source text. You can navigate the atlas or cancel."
+            status = searchSummary
+            let coordinator = searchCoordinator ?? AtlasSearchCoordinator(work: AtlasNativeSearch.run)
+            searchCoordinator = coordinator
+            try coordinator.submit(root: requestedRoot, query: trimmed, accessLease: accessLease) { result in
+                // Generation rejection happens in the coordinator. These checks
+                // also cover SwiftUI state changes before onChange has run.
+                guard root == requestedRoot, query == requestedText else { return }
+                searchPending = false
+                switch result {
+                case .success(let report):
+                    prepareSearchOverlay(report)
+                    searchReport = report
+                    hits = report.hits.filter { $0.sourcePath.map { fileScope.includes($0, custom: customExtensions) } ?? (fileScope == .all) }
+                    status = report.summary
+                    searchSummary = report.summary
+                    searchTitle = report.complete ? "No matches" : "Partial search"
+                case .failure(let error):
+                    status = error.message
+                    searchSummary = status
+                    if case .canceled = error { searchTitle = "Search canceled" }
+                    else { searchTitle = "Search unavailable" }
+                }
+            }
+        } catch {
+            searchPending = false
             status = (error as? AtlasSearchError)?.message ?? "Search failed. Results are unavailable."
             searchSummary = status
             searchTitle = "Search unavailable"
         }
+    }
+
+    private func cancelSearch() {
+        searchCoordinator?.cancel()
+        searchPending = false
+        searchTitle = "Search canceled"
+        searchSummary = AtlasSearchError.canceled.message
+        status = searchSummary
     }
 
     private func openFile(_ path: String) {
