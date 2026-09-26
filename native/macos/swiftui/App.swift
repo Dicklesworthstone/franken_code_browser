@@ -315,6 +315,7 @@ extension AtlasCamera {
                 return
             }
             openFile(path)
+            showsReader = true
             if sourceError == nil {
                 if let match = resolvedMatches[hit.id] {
                     selectedMatch = match
@@ -571,16 +572,28 @@ extension AtlasCamera {
                 .background(.bar)
                 Divider()
             }
-            ScrollView {
-                Text(selectedPath.flatMap { atlasDocuments[$0]?.styledSource }
-                    ?? AttributedString(sourceError ?? fileText))
-                .font(.system(size: 12, design: .monospaced))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .topLeading)
-                .padding(10)
+            if let source = selectedSource, sourceError == nil {
+                AtlasSourceReader(source: source, navigation: focusRequest,
+                    selection: selectedMatch.map { AtlasReaderSelection(source: source, range: $0.sourceRange) }) {
+                    if let document = atlasDocuments[source.path] {
+                        return AtlasDocument.style(document.capture)
+                    }
+                    return NSAttributedString(string: source.text, attributes: [
+                        .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
+                        .foregroundColor: Monokai.color("plain")
+                    ])
+                }
+            } else {
+                ScrollView {
+                    Text(sourceError ?? fileText)
+                        .font(.system(size: 12, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                        .padding(10)
+                }
             }
-            .background(Color(red: 0.153, green: 0.157, blue: 0.133))
         }
+        .background(Color(red: 0.153, green: 0.157, blue: 0.133))
     }
 
     // MARK: Actions
