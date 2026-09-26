@@ -138,3 +138,6 @@ mod tests {
         unsafe { fcb_source_cache_free(std::ptr::null_mut(), 0); }
     }
 }
+
+/// Native project-loading worker services, sharing the existing cache owner.
+mod project;
