@@ -18,6 +18,8 @@ mod text_layout_ffi;
 mod source_cache_ffi;
 mod saved_sessions;
 mod saved_ffi;
+mod search_ffi;
+pub use search_ffi::{fcb_search_workspace_cancelable, SearchCancellationCallback};
 
 use std::{ffi::{c_char, CStr, CString}, panic::{catch_unwind, UnwindSafe}, path::Path};
 use fcb_app::host;
