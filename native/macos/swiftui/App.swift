@@ -230,7 +230,11 @@ extension AtlasCamera {
     @State private var searchRows: [CGRect] = []
     @State private var searchPaths: Set<String> = []
     @State private var overlayLimited = false
-    @State private var showsSidebar = false
+    @State private var showsSidebar = true
+    @State private var loadingProject = false
+    @State private var loadProgress = ""
+    @State private var loadGeneration = UUID()
+    @State private var loadTask: Task<Void, Never>?
     @State private var showsReader = false
     @State private var hits: [SearchHit] = []
     @State private var selectedHit: SearchHit.ID?
@@ -293,12 +297,14 @@ extension AtlasCamera {
         .onAppear {
 #if FCB_APP_STORE
             if let recent = Engine.recents.first { restoreProject(recent) }
-            else { chooseProject() }
+            else { status = "Choose a project folder to begin exploring its source." }
 #else
-            if root.isEmpty { chooseProject() } else { loadAtlas() }
+            if !root.isEmpty { requestAtlasLoad() }
 #endif
         }
         .onDisappear {
+            loadTask?.cancel()
+            loadTask = nil
             searchCoordinator?.cancel()
             searchCoordinator = nil
             searchPending = false
@@ -348,7 +354,7 @@ extension AtlasCamera {
                     .onSubmit(runSearch)
                     .onExitCommand { query = ""; clearSearch() }
                 Button("Search") { runSearch() }
-                    .disabled(root.isEmpty || query.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(loadingProject || root.isEmpty || query.trimmingCharacters(in: .whitespaces).isEmpty)
                 if !query.isEmpty {
                     Button { query = ""; clearSearch() } label: { Image(systemName: "xmark.circle.fill") }
                         .buttonStyle(.plain)
@@ -435,10 +441,10 @@ extension AtlasCamera {
                 Image(systemName: "folder.fill")
                     .foregroundStyle(Color.accentColor)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text((root as NSString).lastPathComponent)
+                    Text(root.isEmpty ? "No project selected" : (root as NSString).lastPathComponent)
                         .font(.system(size: 13, weight: .semibold))
                         .lineLimit(1)
-                    Text("\(files.count) files · \(root)")
+                    Text(root.isEmpty ? "Choose a folder to begin" : "\(files.count) files · \(root)")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -472,12 +478,26 @@ extension AtlasCamera {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
                 if textTiles.isEmpty {
-                    ContentUnavailableView {
-                        Label("No atlas", systemImage: "map")
-                    } description: {
-                        Text(status)
+                    if loadingProject {
+                        VStack(spacing: 16) {
+                            ProgressView("Opening \((root as NSString).lastPathComponent)…")
+                            Text(loadProgress)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                            Button("Cancel Loading", action: cancelAtlasLoad)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        ContentUnavailableView {
+                            Label("No atlas", systemImage: "map")
+                        } description: {
+                            Text(status)
+                        } actions: {
+                            Button("Choose Project Folder…", action: chooseProject)
+                                .buttonStyle(.borderedProminent)
+                        }
+                        .frame(maxHeight: .infinity)
                     }
-                    .frame(maxHeight: .infinity)
                 } else {
                     AtlasCanvas(
                         revision: atlasRevision,
@@ -585,9 +605,10 @@ extension AtlasCamera {
 
     // MARK: Actions
 
-    private func loadAtlas() {
-        // A refresh changes the accepted atlas even when the path is unchanged.
-        clearSearch()
+    private func requestAtlasLoad() {
+        loadTask?.cancel()
+        loadGeneration = UUID()
+        let generation = loadGeneration
 #if !FCB_APP_STORE
         if let argRoot = CommandLine.arguments.dropFirst().first,
             FileManager.default.fileExists(atPath: argRoot)
@@ -596,19 +617,63 @@ extension AtlasCamera {
             UserDefaults.standard.set(argRoot, forKey: "fcb.root")
             Engine.remember(root: argRoot)
         }
-#else
-        guard rootAccess?.url.path == root else {
+#endif
+        let requestedRoot = root
+#if FCB_APP_STORE
+        let accessLease = rootAccess
+#endif
+        files = []
+        displayedFiles = []
+        atlasDocuments = [:]
+        textTiles = []
+        loadingProject = true
+        loadProgress = "Discovering files…"
+        loadTask = Task {
+#if FCB_APP_STORE
+            // Retain the security-scoped grant until this load stops using Rust.
+            defer { withExtendedLifetime(accessLease) {} }
+#endif
+            await loadAtlas(root: requestedRoot, generation: generation)
+        }
+    }
+
+    private func cancelAtlasLoad() {
+        loadTask?.cancel()
+        loadTask = nil
+        loadGeneration = UUID()
+        loadingProject = false
+        loadProgress = ""
+        status = "Project loading canceled. Choose a folder to try again."
+    }
+
+    private func loadAtlas(root requestedRoot: String, generation: UUID) async {
+        defer {
+            if loadGeneration == generation {
+                loadingProject = false
+                loadTask = nil
+            }
+        }
+        // A refresh changes the accepted atlas even when the path is unchanged.
+        clearSearch()
+#if FCB_APP_STORE
+        guard rootAccess?.url.path == requestedRoot else {
             status = "Choose a project folder to grant read access."
             return
         }
 #endif
-        files = Engine.atlas(root: root)
-        if projectCache?.root != root {
-            projectCache = AtlasProjectCache.defaultDirectory(root: root).map {
-                AtlasProjectCache(root: root, cacheDirectory: $0)
+        let atlasFiles = Engine.atlas(root: requestedRoot)
+        guard !Task.isCancelled, loadGeneration == generation else { return }
+        files = atlasFiles
+        loadProgress = "Preparing source previews for \(atlasFiles.count) files…"
+        await Task.yield()
+        guard !Task.isCancelled, loadGeneration == generation else { return }
+        if projectCache?.root != requestedRoot {
+            projectCache = AtlasProjectCache.defaultDirectory(root: requestedRoot).map {
+                AtlasProjectCache(root: requestedRoot, cacheDirectory: $0)
             }
         }
-        projectCache?.beginRefresh()
+        let cache = projectCache
+        cache?.beginRefresh()
         var documents: [String: AtlasDocument] = [:]
         // Keep the eager working set proportional to RAM. Capture source before
         // generated evidence so a broad repository does not spend the entire
@@ -616,18 +681,19 @@ extension AtlasCamera {
         var remainingBytes = Int(min(UInt64(512 * 1024 * 1024),
             max(UInt64(64 * 1024 * 1024), ProcessInfo.processInfo.physicalMemory / 128)))
         var tiles: [AtlasTextTile] = []
-        let captureOrder = files.sorted { left, right in
+        let captureOrder = atlasFiles.sorted { left, right in
             let leftRank = Self.captureRank(left.path)
             let rightRank = Self.captureRank(right.path)
             return leftRank == rightRank ? left.path < right.path : leftRank < rightRank
         }
-        for file in captureOrder {
+        for (index, file) in captureOrder.enumerated() {
+            guard !Task.isCancelled, loadGeneration == generation else { return }
             guard file.bytes <= remainingBytes, file.bytes <= 4 * 1024 * 1024 else { continue }
             let prepared: AtlasDocument?
-            if let projectCache {
-                prepared = projectCache.document(path: file.path) { Engine.sourceCapture(root: root, path: file.path) }
+            if let cache {
+                prepared = cache.document(path: file.path) { Engine.sourceCapture(root: requestedRoot, path: file.path) }
             } else {
-                prepared = Engine.sourceCapture(root: root, path: file.path).flatMap { AtlasDocument(path: file.path, capture: $0) }
+                prepared = Engine.sourceCapture(root: requestedRoot, path: file.path).flatMap { AtlasDocument(path: file.path, capture: $0) }
             }
             guard let document = prepared,
                   document.source.text.utf8.count <= remainingBytes,
@@ -635,14 +701,28 @@ extension AtlasCamera {
             remainingBytes -= document.source.text.utf8.count
             documents[file.path] = document
             tiles.append(contentsOf: document.tiles)
+            if index.isMultiple(of: 8) {
+                loadProgress = "Prepared \(index + 1) of \(captureOrder.count) files…"
+                await Task.yield()
+            }
         }
+        guard !Task.isCancelled, loadGeneration == generation else { return }
+        loadProgress = "Laying out the atlas…"
+        await Task.yield()
+        guard !Task.isCancelled, loadGeneration == generation else { return }
         atlasDocuments = documents
-        displayedFiles = files
+        displayedFiles = atlasFiles
         if let bounds = Engine.placeTextTiles(tiles), let displayTiles = AtlasParcelLayout.reflow(documents) {
-            projectCache?.finishRefresh(documents: documents)
-            projectCache?.prepareOverview(documents: documents)
+            loadProgress = "Finishing source previews…"
+            await Task.yield()
+            guard !Task.isCancelled, loadGeneration == generation else { return }
+            cache?.finishRefresh(documents: documents)
+            await Task.yield()
+            guard !Task.isCancelled, loadGeneration == generation else { return }
+            cache?.prepareOverview(documents: documents)
+            guard !Task.isCancelled, loadGeneration == generation else { return }
             // A disabled disk cache still renders complete balanced columns.
-            if projectCache == nil {
+            if cache == nil {
                 let budget = max(1, 64 * 1024 * 1024 / max(1, displayTiles.count))
                 for tile in displayTiles { tile.prepareRaster(pixelBudget: budget) }
             }
@@ -660,16 +740,17 @@ extension AtlasCamera {
         fileText = ""
         selectedSource = nil
         sourceError = nil
-        if files.isEmpty {
-            let planJSON = Engine.plan(root: root)
+        if atlasFiles.isEmpty {
+            let planJSON = Engine.plan(root: requestedRoot)
             status = planJSON.count > 2
                 ? "Atlas unavailable for this root — the engine's bounded discovery refused it (\(planJSON.count)-byte plan). Pick a smaller subdirectory."
-                : "No atlas for \(root): empty, unreadable, or beyond walk bounds."
+                : "No atlas for \(requestedRoot): empty, unreadable, or beyond walk bounds."
         } else if textTiles.isEmpty {
             status = "Source text layout unavailable. \(atlasDocuments.count) files captured."
         } else {
-            status = "\(files.count) files laid out. Scroll to zoom, drag to pan, click a file. Source loaded for \(atlasDocuments.count) files."
+            status = "\(atlasFiles.count) files laid out. Scroll to zoom, drag to pan, click a file. Source loaded for \(atlasDocuments.count) files."
         }
+        if fileScope != .all { applyFileScope() }
     }
 
     private static func captureRank(_ path: String) -> Int {
@@ -831,8 +912,7 @@ extension AtlasCamera {
         searchTitle = "Search project"
         searchSummary = "Enter text to search the project."
         selectedPath = nil
-        loadAtlas()
-        if fileScope != .all { applyFileScope() }
+        requestAtlasLoad()
     }
 
     private func restoreProject(_ path: String) {
@@ -851,8 +931,7 @@ extension AtlasCamera {
         searchTitle = "Search project"
         searchSummary = "Enter text to search the project."
         selectedPath = nil
-        loadAtlas()
-        if fileScope != .all { applyFileScope() }
+        requestAtlasLoad()
     }
 #endif
 
