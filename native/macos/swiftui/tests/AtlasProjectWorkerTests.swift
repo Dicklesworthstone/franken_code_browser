@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// Link with the actual fcb bridge. Source/cache calls are production operations;
 /// neither these checks nor the queue tests qualify a physical Mac window.
@@ -7,9 +8,14 @@ import Foundation
 @main struct AtlasProjectWorkerTests {
     private struct SourceDocument: Decodable { let text: String }
     static func main() throws {
-        // Rust cache confinement rejects symlink ancestors; /var on macOS is
-        // a symlink to /private/var, so use the canonical temporary directory.
-        let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+        // Rust cache confinement rejects symlink ancestors; Foundation's URL
+        // helper does not resolve macOS /var here, so canonicalize with realpath.
+        let temp = FileManager.default.temporaryDirectory.path
+        guard let canonicalTemp = temp.withCString({ realpath($0, nil) }) else {
+            preconditionFailure("temporary directory could not be canonicalized")
+        }
+        defer { free(canonicalTemp) }
+        let root = URL(fileURLWithPath: String(cString: canonicalTemp))
             .appendingPathComponent("fcb-project-worker-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         let source = root.appendingPathComponent("source.rs")
