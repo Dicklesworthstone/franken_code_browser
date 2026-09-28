@@ -7,7 +7,10 @@ import Foundation
 @main struct AtlasProjectWorkerTests {
     private struct SourceDocument: Decodable { let text: String }
     static func main() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("fcb-project-worker-\(UUID().uuidString)")
+        // Rust cache confinement rejects symlink ancestors; /var on macOS is
+        // a symlink to /private/var, so use the canonical temporary directory.
+        let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent("fcb-project-worker-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         let source = root.appendingPathComponent("source.rs")
         let original = "\u{feff}fn main() { /* 😀 */ }\r\n"
