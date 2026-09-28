@@ -5,6 +5,7 @@ import Foundation
 @_silgen_name("fcb_source_cache_open") private func openCache(_ path: UnsafePointer<CChar>) -> UInt64
 @_silgen_name("fcb_source_cache_close") private func closeCache(_ handle: UInt64) -> Bool
 @main struct AtlasProjectWorkerTests {
+    private struct SourceDocument: Decodable { let text: String }
     static func main() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("fcb-project-worker-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
@@ -17,8 +18,8 @@ import Foundation
         precondition(catalog[0].bytes == original.utf8.count && catalog[0].profile.isEmpty)
         precondition(catalog[0].profileState == "disabled")
         let packet = try AtlasProjectWorker.source(path: source.path, cancellation: token)!
-        let object = try JSONSerialization.jsonObject(with: packet.json) as! [String: Any]
-        precondition((object["text"] as! String).utf8.elementsEqual(original.utf8))
+        let document = try JSONDecoder().decode(SourceDocument.self, from: packet.json)
+        precondition(document.text.utf8.elementsEqual(original.utf8))
         precondition(packet.key == nil)
         let cachePath = root.appendingPathComponent("cache").path
         let handle = cachePath.withCString { openCache($0) }; precondition(handle != 0)
@@ -31,8 +32,8 @@ import Foundation
         precondition(missing == nil)
         let empty = root.appendingPathComponent("empty.rs"); try Data().write(to: empty)
         let emptyPacket = try AtlasProjectWorker.source(path: empty.path, cancellation: token)!
-        let emptyObject = try JSONSerialization.jsonObject(with: emptyPacket.json) as! [String: Any]
-        precondition((emptyObject["text"] as! String).isEmpty)
+        let emptyDocument = try JSONDecoder().decode(SourceDocument.self, from: emptyPacket.json)
+        precondition(emptyDocument.text.isEmpty)
         token.cancel()
         do { _ = try AtlasProjectWorker.catalog(root: root.path, cancellation: token); preconditionFailure("canceled catalog accepted") }
         catch AtlasProjectIOError.canceled { }
