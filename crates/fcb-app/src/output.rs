@@ -54,13 +54,25 @@ impl Output {
     }
     pub(crate) fn quoted(&mut self, text: &str) -> Result<(), OutputError> {
         self.append(b"\"")?;
-        for byte in text.bytes() {
+        let input = text.as_bytes();
+        let mut index = 0;
+        while index < input.len() {
+            // Foundation's JSONSerialization silently drops a literal U+FEFF
+            // from source text. Escape it on the wire so native readers get
+            // the exact original UTF-8 bytes after decoding.
+            if input.get(index..index + 3) == Some(&[0xef, 0xbb, 0xbf]) {
+                self.append(b"\\ufeff")?;
+                index += 3;
+                continue;
+            }
+            let byte = input[index];
             match byte {
                 b'"' => self.append(b"\\\"")?, b'\\' => self.append(b"\\\\")?,
                 b'\n' => self.append(b"\\n")?, b'\r' => self.append(b"\\r")?, b'\t' => self.append(b"\\t")?,
                 0..=31 => self.append(&[b'\\', b'u', b'0', b'0', HEX[(byte >> 4) as usize], HEX[(byte & 15) as usize]])?,
                 _ => self.append(&[byte])?,
             }
+            index += 1;
         }
         self.append(b"\"")
     }
@@ -162,6 +174,12 @@ mod tests {
             out.clear(); out.quoted(&ch.to_string()).unwrap();
             assert!(std::str::from_utf8(out.as_bytes()).is_ok());
         }
+    }
+    #[test]
+    fn json_escapes_bom_so_native_decoders_preserve_exact_source() {
+        let mut out = output(128);
+        out.quoted("\u{feff}first\u{feff}last").unwrap();
+        assert_eq!(out.as_bytes(), b"\"\\ufefffirst\\ufefflast\"");
     }
     #[test]
     fn decimal_wire_fields_preserve_adjacent_large_ids() {
