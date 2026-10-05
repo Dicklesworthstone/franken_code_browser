@@ -52,6 +52,43 @@ final class AtlasSource {
         return String(line).replacingOccurrences(of: "\t", with: "        ")
     }
 
+    /// Map nonempty original UTF-8 ranges without depending on shaped rows or
+    /// grapheme boundaries. Capture proof belongs to the caller; this method
+    /// only converts offsets in this immutable text, never a fresh file read.
+    func utf16Range(byteStart: UInt64, byteEnd: UInt64) -> NSRange? {
+        utf16Ranges(byteRanges: [(byteStart, byteEnd)])[0]
+    }
+
+    /// Convert a bounded batch in one byte scan. Invalid ranges are refused
+    /// individually and preserve result ordering; no prefix strings or complete
+    /// byte-to-character table are allocated. EOF is a valid scalar boundary.
+    func utf16Ranges(byteRanges: [(UInt64, UInt64)]) -> [NSRange?] {
+        guard byteRanges.count <= 4096 else { return byteRanges.map { _ in nil } }
+        let bytes = text.utf8
+        let byteCount = UInt64(bytes.count)
+        let endpoints = Set(byteRanges.filter { $0.0 < $0.1 && $0.1 <= byteCount }
+            .flatMap { [$0.0, $0.1] }).sorted()
+        guard !endpoints.isEmpty else { return byteRanges.map { _ in nil } }
+        var positions: [UInt64: Int] = [:]
+        var next = 0, utf16 = 0
+        var offset: UInt64 = 0
+        for byte in bytes {
+            if next == endpoints.count { break }
+            if endpoints[next] == offset {
+                if byte & 0xC0 != 0x80 { positions[offset] = utf16 }
+                next += 1
+            }
+            if byte & 0xC0 != 0x80 { utf16 += byte >= 0xF0 ? 2 : 1 }
+            offset += 1
+        }
+        if offset == byteCount { positions[offset] = utf16 }
+        return byteRanges.map { start, end in
+            guard start < end, end <= byteCount,
+                  let a = positions[start], let b = positions[end], a < b else { return nil }
+            return NSRange(location: a, length: b - a)
+        }
+    }
+
     /// Pure geometric range calculation, independent of source length.
     func visibleLines(top: Double, lineHeight: Double, viewportHeight: Double) -> Range<Int> {
         guard lineHeight >= 6 else { return 0..<0 }

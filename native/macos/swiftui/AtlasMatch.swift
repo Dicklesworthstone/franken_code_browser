@@ -14,71 +14,48 @@ struct AtlasMatch {
     /// per-occurrence refusal are identical to resolving each range separately.
     static func resolveBatch(document: AtlasDocument, ranges: [(UInt64, UInt64)],
                              expectedSHA256: String, expectedByteCount: UInt64) -> [AtlasMatch?] {
-        guard ranges.count <= 4096 else { return ranges.map { _ in nil } }
-        let text = document.source.text
-        let bytes = text.utf8
-        guard expectedByteCount == UInt64(bytes.count),
-              expectedSHA256.utf8.count == 64,
-              expectedSHA256.utf8.allSatisfy({ (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }),
-              document.capture.text.utf8.elementsEqual(bytes),
-              SHA256.hash(data: Data(bytes)).map({ String(format: "%02x", $0) }).joined() == expectedSHA256.lowercased()
+        guard ranges.count <= 4096,
+              document.capture.text.utf8.elementsEqual(document.source.text.utf8),
+              verifies(source: document.source, expectedSHA256: expectedSHA256,
+                       expectedByteCount: expectedByteCount)
         else { return ranges.map { _ in nil } }
-        let endpoints = Set(ranges.flatMap { [$0.0, $0.1] }).sorted()
-        var positions: [UInt64: Int] = [:]
-        var next = 0, utf16 = 0
-        var offset: UInt64 = 0
-        for byte in bytes {
-            while next < endpoints.count && endpoints[next] < offset { next += 1 }
-            if next == endpoints.count { break }
-            if endpoints[next] == offset {
-                if byte & 0xC0 != 0x80 { positions[offset] = utf16 }
-                next += 1
-            }
-            if byte & 0xC0 != 0x80 { utf16 += byte >= 0xF0 ? 2 : 1 }
-            offset += 1
+        let length = document.source.text.utf16.count
+        return document.source.utf16Ranges(byteRanges: ranges).map { range in
+            guard let range else { return nil }
+            return geometry(document: document, match: range, sourceLength: length)
         }
-        if offset == expectedByteCount { positions[offset] = utf16 }
-        let length = text.utf16.count
-        return ranges.map { a, b in
-            guard a < b, b <= expectedByteCount, let start = positions[a], let end = positions[b], start < end else { return nil }
-            return geometry(document: document, match: NSRange(location: start, length: end - start), sourceLength: length)
-        }
+    }
+
+    /// An exact native-reader target does not require atlas geometry. A file can
+    /// be absent from the eager atlas, or a match can span more overlay rows than
+    /// we admit, without invalidating its independently verified source offsets.
+    /// AppKit still decides whether it can select the exact UTF-16 range.
+    static func resolveSourceRange(source: AtlasSource, byteStart: UInt64, byteEnd: UInt64,
+                                   expectedSHA256: String, expectedByteCount: UInt64) -> NSRange? {
+        guard byteStart < byteEnd, byteEnd <= expectedByteCount,
+              verifies(source: source, expectedSHA256: expectedSHA256,
+                       expectedByteCount: expectedByteCount) else { return nil }
+        return source.utf16Range(byteStart: byteStart, byteEnd: byteEnd)
     }
 
     static func resolve(document: AtlasDocument, byteStart: UInt64, byteEnd: UInt64,
                         expectedSHA256: String, expectedByteCount: UInt64) -> AtlasMatch? {
-        let text = document.source.text
-        let bytes = text.utf8
-        guard byteStart < byteEnd, byteEnd <= expectedByteCount,
-              expectedByteCount == UInt64(bytes.count),
-              expectedSHA256.utf8.count == 64,
-              expectedSHA256.utf8.allSatisfy({ (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }),
-              document.capture.text.utf8.elementsEqual(bytes) else { return nil }
-        let digest = SHA256.hash(data: Data(bytes)).map { String(format: "%02x", $0) }.joined()
-        guard digest == expectedSHA256.lowercased() else { return nil }
+        guard document.capture.text.utf8.elementsEqual(document.source.text.utf8),
+              let range = resolveSourceRange(source: document.source, byteStart: byteStart,
+                  byteEnd: byteEnd, expectedSHA256: expectedSHA256,
+                  expectedByteCount: expectedByteCount) else { return nil }
+        return geometry(document: document, match: range, sourceLength: document.source.text.utf16.count)
+    }
 
-        // Count UTF16 units directly, accepting scalar boundaries (including a
-        // boundary within a combining sequence), without allocating two prefixes.
-        var offset: UInt64 = 0, utf16 = 0
-        var start: Int?, end: Int?
-        for byte in bytes {
-            let continuation = byte & 0xC0 == 0x80
-            if offset == byteStart {
-                guard !continuation else { return nil }
-                start = utf16
-            }
-            if offset == byteEnd {
-                guard !continuation else { return nil }
-                end = utf16
-                break
-            }
-            if !continuation { utf16 += byte >= 0xF0 ? 2 : 1 }
-            offset += 1
-        }
-        if byteEnd == expectedByteCount { end = utf16 }
-        guard let start, let end, start < end else { return nil }
-        let match = NSRange(location: start, length: end - start)
-        return geometry(document: document, match: match, sourceLength: text.utf16.count)
+    private static func verifies(source: AtlasSource, expectedSHA256: String,
+                                 expectedByteCount: UInt64) -> Bool {
+        let bytes = source.text.utf8
+        guard expectedByteCount == UInt64(bytes.count),
+              expectedSHA256.utf8.count == 64,
+              expectedSHA256.utf8.allSatisfy({ (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) })
+        else { return false }
+        let digest = SHA256.hash(data: Data(bytes)).map { String(format: "%02x", $0) }.joined()
+        return digest == expectedSHA256.lowercased()
     }
 
     private static func geometry(document: AtlasDocument, match: NSRange, sourceLength: Int) -> AtlasMatch? {
