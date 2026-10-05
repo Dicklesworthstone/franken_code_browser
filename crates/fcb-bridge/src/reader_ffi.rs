@@ -112,6 +112,9 @@ pub extern "C" fn fcb_reader_close(handle: u64) -> u8 {
     std::panic::catch_unwind(|| u8::from(READERS.get().is_some_and(|readers| readers.close(handle).is_ok()))).unwrap_or(0)
 }
 
+#[path = "reader_supplied_ffi.rs"]
+mod supplied;
+
 #[path = "reader_outline_ffi.rs"]
 mod outline;
 #[path = "reader_document_ffi.rs"]
