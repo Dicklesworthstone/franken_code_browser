@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Bounded exact decoded-text scans. Decoding and provenance are supplied by
+//! Bounded decoded-text scans, including the declared normalization modes. Decoding and provenance are supplied by
 //! fcb-source; this adapter retains only a decoding window and the mapping spans
 //! needed by a needle that crosses windows. It never stitches a whole capture.
 
@@ -9,12 +9,13 @@ use std::{borrow::Cow, collections::VecDeque};
 use fcb_core::{ByteOffset, ByteRange, DecodedUtf8Offset, DecodedUtf8Range, FileId, SourceRevision};
 use fcb_source::{CaptureEncodingMap, DetectedEncoding, MappingSpan, SpanKind, detect_encoding};
 
+use crate::normalized::{NormalizedCursor, SourceScalar};
 use crate::stream::{ByteSearchCursor, MAX_STREAM_BATCH_HITS, MAX_STREAM_STEP_BYTES};
 use crate::{QueryError, QueryOptions, SearchCoverage, SearchMatch, SearchResult};
 
 const WINDOW_BYTES: usize = 16_384;
 
-pub(crate) fn scan_exact_chunks<'a>(
+pub(crate) fn scan_text_chunks<'a>(
     chunks: impl IntoIterator<Item = Result<&'a [u8], QueryError>>,
     total_bytes: u64,
     file_id: FileId,
@@ -23,8 +24,9 @@ pub(crate) fn scan_exact_chunks<'a>(
     options: &QueryOptions,
     mut canceled: impl FnMut() -> bool,
 ) -> Result<SearchResult, QueryError> {
-    let mut scan = ExactScan {
+    let mut scan = TextScan {
         cursor: ByteSearchCursor::new(query.as_bytes())?,
+        normalized: NormalizedCursor::new(query, options.mode)?,
         query,
         options,
         file_id,
@@ -69,7 +71,7 @@ pub(crate) fn scan_exact_chunks<'a>(
             }
             let available = byte_limit.saturating_sub(scan.result.scanned_bytes);
             if available == 0 {
-                if scan.process(&mut staging, false)? {
+                if scan.process(&mut staging, false, &mut canceled)? {
                     return Ok(scan.result);
                 }
                 scan.result.coverage = SearchCoverage::BudgetExhausted {
@@ -82,7 +84,7 @@ pub(crate) fn scan_exact_chunks<'a>(
             staging.extend_from_slice(&remaining[..take]);
             remaining = &remaining[take..];
             scan.result.scanned_bytes += take as u64;
-            if staging.len() == WINDOW_BYTES && scan.process(&mut staging, false)? {
+            if staging.len() == WINDOW_BYTES && scan.process(&mut staging, false, &mut canceled)? {
                 return Ok(scan.result);
             }
         }
@@ -90,12 +92,13 @@ pub(crate) fn scan_exact_chunks<'a>(
     if declared_bytes != total_bytes {
         return Err(QueryError::InvalidRange);
     }
-    scan.process(&mut staging, true)?;
+    scan.process(&mut staging, true, &mut canceled)?;
     Ok(scan.result)
 }
 
-struct ExactScan<'a> {
+struct TextScan<'a> {
     cursor: ByteSearchCursor<'a>,
+    normalized: Option<NormalizedCursor>,
     query: &'a str,
     options: &'a QueryOptions,
     file_id: FileId,
@@ -110,9 +113,10 @@ struct ExactScan<'a> {
     result: SearchResult,
 }
 
-impl ExactScan<'_> {
+impl TextScan<'_> {
     /// Return true for a terminal result (proven truncation or unavailable text).
-    fn process(&mut self, staging: &mut Vec<u8>, eof: bool) -> Result<bool, QueryError> {
+    fn process(&mut self, staging: &mut Vec<u8>, eof: bool,
+        canceled: &mut impl FnMut() -> bool) -> Result<bool, QueryError> {
         // A budget ending inside a BOM is incomplete, not an unsupported file.
         if staging.is_empty() {
             return Ok(false);
@@ -184,16 +188,75 @@ impl ExactScan<'_> {
             .ok_or(QueryError::InvalidRange)?;
         self.decoded_offset = self.decoded_offset.checked_add(decoded.len() as u64)
             .ok_or(QueryError::InvalidRange)?;
-        let mut remaining = decoded.as_bytes();
-        while !remaining.is_empty() {
-            let hit_budget = self.options.max_matches.saturating_sub(self.result.matches.len())
-                .saturating_add(1).min(MAX_STREAM_BATCH_HITS);
-            let batch = self.cursor.step(remaining, MAX_STREAM_STEP_BYTES, hit_budget)?;
-            remaining = &remaining[batch.consumed..];
-            for hit in batch.hits {
-                let start = self.original_offset(hit.start)?;
-                let end = self.original_offset(hit.end)?;
-                if !self.options.cross_chunk && self.crosses_source_chunk(start, end) {
+        if self.normalized.is_some() {
+            if self.process_normalized(&decoded, canceled)? { return Ok(true); }
+        } else {
+            let mut remaining = decoded.as_bytes();
+            while !remaining.is_empty() {
+                let hit_budget = self.options.max_matches.saturating_sub(self.result.matches.len())
+                    .saturating_add(1).min(MAX_STREAM_BATCH_HITS);
+                let batch = self.cursor.step(remaining, MAX_STREAM_STEP_BYTES, hit_budget)?;
+                remaining = &remaining[batch.consumed..];
+                for hit in batch.hits {
+                    let start = self.original_offset(hit.start)?;
+                    let end = self.original_offset(hit.end)?;
+                    if !self.options.cross_chunk && self.crosses_source_chunk(start, end) {
+                        continue;
+                    }
+                    self.result.total_matches_counted = self.result.total_matches_counted
+                        .checked_add(1).ok_or(QueryError::LimitExceeded)?;
+                    if self.result.matches.len() == self.options.max_matches {
+                        self.result.coverage = SearchCoverage::TruncatedAtLimit {
+                            max_matches: self.options.max_matches,
+                        };
+                        return Ok(true);
+                    }
+                    self.result.matches.try_reserve(1).map_err(|_| QueryError::LimitExceeded)?;
+                    self.result.matches.push(SearchMatch {
+                        occurrence_id: self.result.total_matches_counted as u64,
+                        file_id: self.file_id,
+                        revision: self.revision,
+                        decoded_range: Some(DecodedUtf8Range::new(
+                            DecodedUtf8Offset::new(hit.start), DecodedUtf8Offset::new(hit.end),
+                        ).map_err(|_| QueryError::InvalidRange)?),
+                        original_byte_range: ByteRange::new(ByteOffset::new(start), ByteOffset::new(end))
+                            .map_err(|_| QueryError::InvalidRange)?,
+                        matched_text: self.query.to_owned(),
+                        multiplicity: 1,
+                    });
+                }
+                self.prune();
+            }
+        }
+        // Empty decoded windows (for example a BOM) still allow retirement.
+        self.prune();
+        let retained = staging.len() - process_len;
+        staging.copy_within(process_len.., 0);
+        staging.truncate(retained);
+        Ok(false)
+    }
+
+    fn process_normalized(&mut self, decoded: &str,
+        canceled: &mut impl FnMut() -> bool) -> Result<bool, QueryError> {
+        let base = self.decoded_offset.checked_sub(decoded.len() as u64)
+            .ok_or(QueryError::InvalidRange)?;
+        for (ordinal, (offset, ch)) in decoded.char_indices().enumerate() {
+            if ordinal % 256 == 0 && canceled() {
+                self.result.coverage = SearchCoverage::CanceledEarly;
+                return Ok(true);
+            }
+            let start = base.checked_add(offset as u64).ok_or(QueryError::InvalidRange)?;
+            let end = start.checked_add(ch.len_utf8() as u64).ok_or(QueryError::InvalidRange)?;
+            let scalar = SourceScalar { ch, raw_start: self.original_offset(start)?,
+                raw_end: self.original_offset(end)?, decoded_start: start, decoded_end: end };
+            let units = self.normalized.as_ref().ok_or(QueryError::InvalidRange)?.units(ch);
+            for unit in units {
+                let Some(hit) = self.normalized.as_mut().ok_or(QueryError::InvalidRange)?.push(unit, scalar) else {
+                    continue;
+                };
+                // Scope is evaluated before the hit limit. Disallowed cross-chunk
+                // candidates must not hide later eligible occurrences.
+                if !self.options.cross_chunk && self.crosses_source_chunk(hit.raw_start, hit.raw_end) {
                     continue;
                 }
                 self.result.total_matches_counted = self.result.total_matches_counted
@@ -204,27 +267,21 @@ impl ExactScan<'_> {
                     };
                     return Ok(true);
                 }
+                let matched_text = self.normalized.as_ref().ok_or(QueryError::InvalidRange)?.matched_text()?;
                 self.result.matches.try_reserve(1).map_err(|_| QueryError::LimitExceeded)?;
                 self.result.matches.push(SearchMatch {
-                    occurrence_id: self.result.total_matches_counted as u64,
-                    file_id: self.file_id,
-                    revision: self.revision,
+                    occurrence_id: u64::try_from(self.result.total_matches_counted)
+                        .map_err(|_| QueryError::LimitExceeded)?,
+                    file_id: self.file_id, revision: self.revision,
                     decoded_range: Some(DecodedUtf8Range::new(
-                        DecodedUtf8Offset::new(hit.start), DecodedUtf8Offset::new(hit.end),
+                        DecodedUtf8Offset::new(hit.decoded_start), DecodedUtf8Offset::new(hit.decoded_end),
                     ).map_err(|_| QueryError::InvalidRange)?),
-                    original_byte_range: ByteRange::new(ByteOffset::new(start), ByteOffset::new(end))
+                    original_byte_range: ByteRange::new(ByteOffset::new(hit.raw_start), ByteOffset::new(hit.raw_end))
                         .map_err(|_| QueryError::InvalidRange)?,
-                    matched_text: self.query.to_owned(),
-                    multiplicity: 1,
+                    matched_text, multiplicity: 1,
                 });
             }
-            self.prune();
         }
-        // Empty decoded windows (for example a BOM) still allow retirement.
-        self.prune();
-        let retained = staging.len() - process_len;
-        staging.copy_within(process_len.., 0);
-        staging.truncate(retained);
         Ok(false)
     }
 
@@ -235,11 +292,18 @@ impl ExactScan<'_> {
     }
 
     fn prune(&mut self) {
-        let keep_from = self.cursor.scanned_bytes().saturating_sub(self.query.len() as u64);
-        while self.spans.front().is_some_and(|span| span.decoded_end() <= keep_from) {
-            self.spans.pop_front();
-        }
-        let raw_from = self.spans.front().map_or(self.raw_offset, |span| span.raw_start);
+        let raw_from = if let Some(cursor) = &self.normalized {
+            // The normalized ring owns the provenance it needs across windows;
+            // decoding maps can be retired immediately, source boundaries cannot.
+            self.spans.clear();
+            cursor.oldest_raw_start().unwrap_or(self.raw_offset)
+        } else {
+            let keep_from = self.cursor.scanned_bytes().saturating_sub(self.query.len() as u64);
+            while self.spans.front().is_some_and(|span| span.decoded_end() <= keep_from) {
+                self.spans.pop_front();
+            }
+            self.spans.front().map_or(self.raw_offset, |span| span.raw_start)
+        };
         while self.chunk_ends.front().is_some_and(|end| *end <= raw_from) {
             self.chunk_ends.pop_front();
         }
@@ -309,7 +373,7 @@ mod tests {
         let owner = ArenaOwnerId::new(1).unwrap();
         let mut options = QueryOptions::new(QueryGeneration::new(owner, 1).unwrap());
         options.max_bytes_scanned = budget;
-        scan_exact_chunks(bytes.chunks(chunk).map(Ok), bytes.len() as u64,
+        scan_text_chunks(bytes.chunks(chunk).map(Ok), bytes.len() as u64,
             FileId::new(owner, 1).unwrap(), SourceRevision::new(owner, 1).unwrap(),
             needle, &options, || false).unwrap()
     }
@@ -408,12 +472,44 @@ mod tests {
         let owner = ArenaOwnerId::new(1).unwrap();
         let mut options = QueryOptions::new(QueryGeneration::new(owner, 1).unwrap());
         options.cross_chunk = false;
-        let result = scan_exact_chunks(b"abababa".chunks(2).map(Ok), 7,
+        let result = scan_text_chunks(b"abababa".chunks(2).map(Ok), 7,
             FileId::new(owner, 1).unwrap(), SourceRevision::new(owner, 1).unwrap(),
             "aba", &options, || false).unwrap();
         assert!(result.matches.is_empty());
         assert!(result.is_complete());
         assert_eq!(result.scanned_bytes, 7);
+    }
+
+    #[test]
+    fn normalized_decoder_matches_independent_whole_capture_oracle() {
+        use crate::{SearchMode, UnicodeNormalization};
+        let owner = ArenaOwnerId::new(81).unwrap();
+        let file = FileId::new(owner, 1).unwrap();
+        let revision = SourceRevision::new(owner, 1).unwrap();
+        let text = "Straße ßßS Ée\u{0301} Kk İi\u{0307} 🙂É🙂";
+        let mut little = vec![0xFF, 0xFE];
+        let mut big = vec![0xFE, 0xFF];
+        for unit in text.encode_utf16() {
+            little.extend_from_slice(&unit.to_le_bytes());
+            big.extend_from_slice(&unit.to_be_bytes());
+        }
+        for bytes in [text.as_bytes().to_vec(), little, big] {
+            for normalization in [UnicodeNormalization::Exact, UnicodeNormalization::CaseFold, UnicodeNormalization::Canonical] {
+                for case_sensitive in [false, true] {
+                    if normalization == UnicodeNormalization::Exact && case_sensitive { continue; }
+                    let options = QueryOptions::new(QueryGeneration::new(owner, 1).unwrap())
+                        .with_mode(SearchMode::DecodedText { case_sensitive, normalization });
+                    for query in ["strasse", "s", "sss", "é", "e", "\u{0301}", "k", "İ", "i\u{0307}", "🙂é", "absent"] {
+                        let expected = crate::scan_normalized(&bytes, file, revision, query, &options).unwrap();
+                        for chunk in [1, 2, 3, bytes.len()] {
+                            let actual = scan_text_chunks(bytes.chunks(chunk).map(Ok), bytes.len() as u64,
+                                file, revision, query, &options, || false).unwrap();
+                            assert_eq!(actual, expected, "{normalization:?}, sensitive={case_sensitive}, query={query:?}, chunk={chunk}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
 }

@@ -2,13 +2,14 @@
 
 //! Exact decoded-text and byte search over immutable source captures.
 //!
-//! Default exact searches use bounded decoding windows and an overlapping,
-//! incremental matcher. They do not concatenate chunked captures or materialize
-//! an unbounded intermediate hit list. Normalized search retains the existing
-//! normalization repertoire under explicit admission limits; it is not a claim
-//! of a newly qualified complete Unicode normalization implementation.
+//! Decoded searches use bounded windows and overlapping incremental matchers,
+//! including case-insensitive and normalized modes. They do not concatenate
+//! chunked captures or build source-sized transformed strings. Normalized search
+//! retains the existing, explicitly limited repertoire; this is not a claim of
+//! a newly qualified complete Unicode normalization implementation.
 
 mod capture;
+mod normalized;
 pub mod index;
 pub mod indexed_query;
 pub mod oracle;
@@ -25,8 +26,12 @@ pub use indexed_query::{IndexedQuery, IndexedQueryState, IndexedSearchReport};
 pub use oracle::{OracleMismatchError, ReferenceScanOracle, SearchDocument};
 pub use query::{LangFilterKind, ParsedQuery, PathFilterKind, MAX_QUERY_LEN, MAX_QUERY_TOKENS};
 
-use fcb_core::{ByteRange, DecodedUtf8Offset, DecodedUtf8Range, FileId, QueryGeneration, SourceRevision};
-use fcb_source::{CaptureEncodingMap, ChunkedCapture, CompleteCapture, DetectedEncoding, SpanKind, detect_encoding};
+use fcb_core::{ByteRange, DecodedUtf8Range, FileId, QueryGeneration, SourceRevision};
+use fcb_source::{ChunkedCapture, CompleteCapture, DetectedEncoding};
+#[cfg(test)]
+use fcb_core::DecodedUtf8Offset;
+#[cfg(test)]
+use fcb_source::{CaptureEncodingMap, SpanKind, detect_encoding};
 
 /// Stable machine-query errors; unsupported query modes are never reinterpreted.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -160,8 +165,9 @@ impl SearchResult {
     pub fn is_empty(&self) -> bool { self.matches.is_empty() }
 }
 
-/// The compatibility normalization algorithms are admitted only for small
-/// scopes. Exact text and raw-byte scans have no whole-capture size ceiling.
+/// Legacy whole-capture normalization thresholds, retained for API compatibility
+/// and the independent test oracle. Production decoded scans now stream and do
+/// not impose these source-size or source-times-needle ceilings.
 pub const MAX_NORMALIZED_SCAN_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_NORMALIZED_SCAN_WORK: u64 = 16 * 1024 * 1024;
 
@@ -179,7 +185,7 @@ impl DirectSourceScanner {
     /// hits retain their source revision; cancellation never claims completeness.
     pub fn scan_complete_capture_with_cancel(
         capture: &CompleteCapture, query: &str, options: &QueryOptions,
-        mut canceled: impl FnMut() -> bool,
+        canceled: impl FnMut() -> bool,
     ) -> Result<SearchResult, QueryError> {
         validate_needle(query.as_bytes())?;
         let bytes = capture.bytes();
@@ -190,16 +196,10 @@ impl DirectSourceScanner {
                 std::iter::once(Ok(bytes)), bytes.len() as u64, file, revision,
                 query.as_bytes(), options, canceled,
             ),
-            SearchMode::DecodedText { case_sensitive: true, normalization: UnicodeNormalization::Exact } => {
-                text::scan_exact_chunks(std::iter::once(Ok(bytes)), bytes.len() as u64,
-                    file, revision, query, options, canceled)
-            }
-            SearchMode::DecodedText { .. } => {
-                if canceled() { return Ok(SearchResult::empty(SearchCoverage::CanceledEarly)); }
-                let mut result = scan_normalized(bytes, file, revision, query, options)?;
-                if canceled() { result.coverage = SearchCoverage::CanceledEarly; }
-                Ok(result)
-            }
+            SearchMode::DecodedText { .. } => text::scan_text_chunks(
+                std::iter::once(Ok(bytes)), bytes.len() as u64,
+                file, revision, query, options, canceled,
+            ),
         }
     }
 
@@ -211,7 +211,7 @@ impl DirectSourceScanner {
 
     pub fn scan_chunked_capture_with_cancel(
         capture: &ChunkedCapture, query: &str, options: &QueryOptions,
-        mut canceled: impl FnMut() -> bool,
+        canceled: impl FnMut() -> bool,
     ) -> Result<SearchResult, QueryError> {
         validate_needle(query.as_bytes())?;
         let file = capture.request().file();
@@ -224,50 +224,9 @@ impl DirectSourceScanner {
             SearchMode::RawBytes => capture::scan_raw_chunks(
                 chunks, total, file, revision, query.as_bytes(), options, canceled,
             ),
-            SearchMode::DecodedText { case_sensitive: true, normalization: UnicodeNormalization::Exact } => {
-                text::scan_exact_chunks(chunks, total, file, revision, query, options, canceled)
-            }
-            SearchMode::DecodedText { .. } => {
-                if canceled() { return Ok(SearchResult::empty(SearchCoverage::CanceledEarly)); }
-                if options.max_matches == 0 && total > 0 {
-                    return Ok(SearchResult::empty(SearchCoverage::TruncatedAtLimit { max_matches: 0 }));
-                }
-                if options.max_bytes_scanned.is_some_and(|limit| limit < total) {
-                    return Ok(SearchResult::empty(SearchCoverage::BudgetExhausted { bytes_scanned: 0 }));
-                }
-                admit_normalized(total, query.len())?;
-                // Legacy normalized matching is whole-scope but strictly
-                // admitted before allocating. The default exact route above
-                // does not take this path.
-                let size = usize::try_from(total).map_err(|_| QueryError::LimitExceeded)?;
-                let mut stitched = Vec::new();
-                stitched.try_reserve_exact(size).map_err(|_| QueryError::LimitExceeded)?;
-                for chunk in chunks {
-                    for part in chunk?.chunks(stream::MAX_STREAM_STEP_BYTES) {
-                        if canceled() {
-                            let mut result = SearchResult::empty(SearchCoverage::CanceledEarly);
-                            result.scanned_bytes = stitched.len() as u64;
-                            return Ok(result);
-                        }
-                        stitched.extend_from_slice(part);
-                    }
-                }
-                let mut result = scan_normalized(&stitched, file, revision, query, options)?;
-                if !options.cross_chunk {
-                    // Preserve original source-chunk scope for normalized hits
-                    // as well, without treating work quanta as chunk boundaries.
-                    let chunk_bytes = capture.chunk_size().as_u64();
-                    result.matches.retain(|hit| {
-                        hit.original_byte_range.start().get() / chunk_bytes
-                            == (hit.original_byte_range.end().get() - 1) / chunk_bytes
-                    });
-                    // A cap reached before filtering is still conservative
-                    // partial coverage, not an exhaustive negative result.
-                    result.total_matches_counted = result.matches.len();
-                }
-                if canceled() { result.coverage = SearchCoverage::CanceledEarly; }
-                Ok(result)
-            }
+            SearchMode::DecodedText { .. } => text::scan_text_chunks(
+                chunks, total, file, revision, query, options, canceled,
+            ),
         }
     }
 
@@ -286,6 +245,7 @@ fn validate_needle(needle: &[u8]) -> Result<(), QueryError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn admit_normalized(bytes: u64, needle: usize) -> Result<(), QueryError> {
     if bytes > MAX_NORMALIZED_SCAN_BYTES as u64
         || bytes.checked_mul(needle as u64).is_none_or(|work| work > MAX_NORMALIZED_SCAN_WORK) {
@@ -294,6 +254,7 @@ fn admit_normalized(bytes: u64, needle: usize) -> Result<(), QueryError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn scan_normalized(
     bytes: &[u8], file_id: FileId, revision: SourceRevision, query: &str, options: &QueryOptions,
 ) -> Result<SearchResult, QueryError> {
@@ -345,14 +306,17 @@ fn scan_normalized(
     Ok(result)
 }
 
+#[cfg(test)]
 struct NormalizedHit { start: usize, end: usize, multiplicity: usize }
 
+#[cfg(test)]
 fn find_case_insensitive_substrings(
     haystack: &str, needle: &str, limit: usize,
 ) -> Result<Vec<NormalizedHit>, QueryError> {
     find_lowered_substrings(haystack, needle, limit, false)
 }
 
+#[cfg(test)]
 fn find_unicode_folded_substrings(
     haystack: &str, needle: &str, limit: usize,
 ) -> Result<Vec<NormalizedHit>, QueryError> {
@@ -363,6 +327,7 @@ fn find_unicode_folded_substrings(
 /// source slices of needle.len() bytes loses matches when lowercasing changes
 /// UTF-8 length. Expansions retain one provenance entry per transformed scalar;
 /// two occurrences inside one source scalar must not collapse into one hit.
+#[cfg(test)]
 fn lowered_with_spans(s: &str, fold_eszett: bool) -> Result<Vec<DecomposedChar>, QueryError> {
     let mut out = Vec::new();
     for (orig_start, ch) in s.char_indices() {
@@ -382,6 +347,7 @@ fn lowered_with_spans(s: &str, fold_eszett: bool) -> Result<Vec<DecomposedChar>,
     Ok(out)
 }
 
+#[cfg(test)]
 fn find_lowered_substrings(
     haystack: &str, needle: &str, limit: usize, fold_eszett: bool,
 ) -> Result<Vec<NormalizedHit>, QueryError> {
@@ -480,8 +446,10 @@ fn canonical_decompose_char(c: char) -> Option<&'static [char]> {
     }
 }
 
+#[cfg(test)]
 struct DecomposedChar { ch: char, orig_start: usize, orig_end: usize }
 
+#[cfg(test)]
 fn decompose_with_spans(s: &str) -> Vec<DecomposedChar> {
     let mut out = Vec::new();
     for (byte_idx, ch) in s.char_indices() {
@@ -493,6 +461,7 @@ fn decompose_with_spans(s: &str) -> Vec<DecomposedChar> {
     out
 }
 
+#[cfg(test)]
 fn decompose_chars(s: &str) -> Vec<char> {
     let mut out = Vec::new();
     for ch in s.chars() {
@@ -502,6 +471,7 @@ fn decompose_chars(s: &str) -> Vec<char> {
     out
 }
 
+#[cfg(test)]
 fn find_canonical_equivalent_substrings(
     haystack: &str, needle: &str, case_sensitive: bool, limit: usize,
 ) -> Vec<NormalizedHit> {
