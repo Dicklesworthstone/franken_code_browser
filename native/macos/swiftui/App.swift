@@ -249,6 +249,10 @@ extension AtlasCamera {
     @State private var selectedPath: String?
     @State private var fileText = ""
     @State private var selectedSource: AtlasSource?
+    @State private var selectedReaderSelection: AtlasReaderSelection?
+    @State private var sourceIO = AtlasProjectIO()
+    @State private var sourceTask: Task<Void, Never>?
+    @State private var sourceCancellation: AtlasSearchCancellation?
     @State private var atlasDocuments: [String: AtlasDocument] = [:]
     @State private var projectCache: AtlasProjectCache?
     @State private var textTiles: [AtlasTextTile] = []
@@ -305,6 +309,7 @@ extension AtlasCamera {
 #endif
         }
         .onDisappear {
+            cancelSourceLoad()
             loadTask?.cancel()
             loadTask = nil
             searchCoordinator?.cancel()
@@ -322,17 +327,8 @@ extension AtlasCamera {
                 status = "This filename cannot be opened by the UTF-8 reader. The search result is retained."
                 return
             }
-            openFile(path)
+            openFile(path, hit: hit)
             showsReader = true
-            if sourceError == nil {
-                if let match = resolvedMatches[hit.id] {
-                    selectedMatch = match
-                    searchRows = Array((match.rowRects + searchRows.filter { !match.rowRects.contains($0) }).prefix(256))
-                    status = "Matching source rows highlighted in the captured file."
-                } else {
-                    status = "Opened file beginning. Exact match location unavailable: the capture changed or its offsets cannot be mapped."
-                }
-            }
         }
     }
 
@@ -596,7 +592,7 @@ extension AtlasCamera {
             }
             if let source = selectedSource, sourceError == nil {
                 AtlasSourceReader(source: source, navigation: focusRequest,
-                    selection: selectedMatch.map { AtlasReaderSelection(source: source, range: $0.sourceRange) }) {
+                    selection: selectedReaderSelection) {
                     if let document = atlasDocuments[source.path] {
                         return AtlasDocument.style(document.capture)
                     }
@@ -621,6 +617,13 @@ extension AtlasCamera {
     // MARK: Actions
 
     private func requestAtlasLoad() {
+        cancelSourceLoad()
+        clearSearch()
+        selectedPath = nil
+        selectedSource = nil
+        selectedMatch = nil
+        sourceError = nil
+        fileText = ""
         loadTask?.cancel()
         loadCancellation?.cancel()
         projectIO.cancel()
@@ -802,6 +805,7 @@ extension AtlasCamera {
         }
         selectedPath = nil
         selectedMatch = nil
+        selectedReaderSelection = nil
         fileText = ""
         selectedSource = nil
         sourceError = nil
@@ -826,6 +830,7 @@ extension AtlasCamera {
     }
 
     private func applyFileScope() {
+        cancelSourceLoad()
         clearSearch()
         selectedPath = nil; selectedSource = nil; selectedMatch = nil
         let scoped = files.filter { fileScope.includes($0.path, custom: customExtensions) }
@@ -846,6 +851,7 @@ extension AtlasCamera {
         searchCoordinator?.cancel()
         searchPending = false
         hits = []; selectedHit = nil; selectedMatch = nil
+        selectedReaderSelection = nil
         searchReport = nil; resolvedMatches = [:]; searchRows = []; searchPaths = []
         overlayLimited = false
         searchTitle = "Search project"
@@ -949,21 +955,107 @@ extension AtlasCamera {
         status = searchSummary
     }
 
-    private func openFile(_ path: String) {
+    private func cancelSourceLoad() {
+        sourceTask?.cancel()
+        sourceCancellation?.cancel()
+        sourceIO.cancel()
+        sourceTask = nil
+        sourceCancellation = nil
+    }
+
+    private func openFile(_ path: String, hit: SearchHit? = nil) {
+        cancelSourceLoad()
         selectedMatch = nil
+        selectedReaderSelection = nil
         selectedPath = path
+        selectedSource = nil
+        sourceError = nil
         focusRequest = UUID()
-        if let text = atlasDocuments[path]?.source.text ?? Engine.read(root: root, path: path) {
-            fileText = text
-            selectedSource = atlasDocuments[path]?.source ?? AtlasSource(path: path, text: text)
-            sourceError = nil
-            status = "Opened \(path). Zoom into its parcel to read the captured source."
-        } else {
-            fileText = ""
-            selectedSource = nil
-            sourceError = "Source unavailable: this reader accepts UTF-8 files up to 4 MiB, without embedded NUL. The file may also have changed or become inaccessible."
-            status = sourceError ?? "Source unavailable"
+        if let source = atlasDocuments[path]?.source {
+            presentSource(source, hit: hit)
+            return
         }
+
+        // Only captured value buffers cross the bounded native I/O queue.
+        // A newer open replaces the waiting request without overlapping reads.
+        let requestedRoot = root
+        let navigation = focusRequest
+        let generation = loadGeneration
+        let cancellation = AtlasSearchCancellation()
+        sourceCancellation = cancellation
+        fileText = "Opening source…"
+        status = "Opening \(path)…"
+        let leases: [AnyObject]
+#if FCB_APP_STORE
+        guard let access = rootAccess, access.url.path == requestedRoot else {
+            sourceCancellation = nil
+            sourceUnavailable()
+            return
+        }
+        leases = [access]
+#else
+        leases = []
+#endif
+        sourceTask = Task {
+            defer {
+                if focusRequest == navigation {
+                    sourceTask = nil
+                    sourceCancellation = nil
+                }
+            }
+            do {
+                let text = try await sourceIO.perform(cancellation: cancellation, keepingAlive: leases) {
+                    Engine.read(root: requestedRoot, path: path)
+                }
+                guard !Task.isCancelled, !cancellation.isCanceled,
+                      focusRequest == navigation, loadGeneration == generation,
+                      root == requestedRoot, selectedPath == path else { return }
+                if let text {
+                    presentSource(AtlasSource(path: path, text: text), hit: hit)
+                } else { sourceUnavailable() }
+            } catch {
+                guard !Task.isCancelled, !cancellation.isCanceled,
+                      focusRequest == navigation, loadGeneration == generation,
+                      root == requestedRoot, selectedPath == path else { return }
+                sourceUnavailable()
+            }
+        }
+    }
+
+    private func presentSource(_ source: AtlasSource, hit: SearchHit?) {
+        fileText = source.text
+        selectedSource = source
+        sourceError = nil
+        status = "Opened \(source.path). Zoom into its parcel to read the captured source."
+        // Clearing/replacing search while a source read is pending must not
+        // resurrect that search's selection when the I/O completion arrives.
+        guard let hit, selectedHit == hit.id, hit.sourcePath == source.path,
+              hits.contains(where: { $0.id == hit.id }) else { return }
+        guard let digest = hit.captureSHA256, let count = hit.captureByteLength,
+              let range = AtlasMatch.resolveSourceRange(source: source, byteStart: hit.start,
+                  byteEnd: hit.end, expectedSHA256: digest, expectedByteCount: count) else {
+            status = "Opened file beginning. Exact match location unavailable: the capture changed or its offsets cannot be mapped."
+            return
+        }
+        // Bind the target to the source actually installed, even when no eager
+        // document or admissible overlay geometry exists for this search hit.
+        selectedReaderSelection = AtlasReaderSelection(source: source, range: range)
+        if let match = resolvedMatches[hit.id], match.sourceRange == range {
+            selectedMatch = match
+            searchRows = Array((match.rowRects + searchRows.filter { !match.rowRects.contains($0) }).prefix(256))
+            status = "Matching source rows highlighted in the captured file."
+        } else {
+            status = "Exact match located in captured source; atlas highlighting is unavailable."
+        }
+    }
+
+    private func sourceUnavailable() {
+        fileText = ""
+        selectedSource = nil
+        selectedReaderSelection = nil
+        selectedMatch = nil
+        sourceError = "Source unavailable: this reader accepts UTF-8 files up to 4 MiB, without embedded NUL. The file may also have changed or become inaccessible."
+        status = sourceError ?? "Source unavailable"
     }
 
 #if FCB_APP_STORE
