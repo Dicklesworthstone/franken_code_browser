@@ -223,6 +223,7 @@ extension AtlasCamera {
     @FocusState private var searchFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var searchReport: AtlasSearchReport?
+    @State private var searchPresentation: AtlasSearchPresentation?
     @State private var searchPending = false
     // Created only on explicit submission, not on every SwiftUI view rebuild.
     @State private var searchCoordinator: AtlasSearchCoordinator?
@@ -239,7 +240,7 @@ extension AtlasCamera {
     @State private var loadCancellation: AtlasSearchCancellation?
     @State private var showsReader = false
     @State private var hits: [SearchHit] = []
-    @State private var selectedHit: SearchHit.ID?
+    @State private var selectedHit: AtlasSearchRowID?
     @State private var searchTitle = "Search project"
     @State private var searchSummary = "Enter text to search the project."
     @State private var files: [AtlasFile] = []
@@ -253,6 +254,7 @@ extension AtlasCamera {
     @State private var sourceIO = AtlasProjectIO()
     @State private var sourceTask: Task<Void, Never>?
     @State private var sourceCancellation: AtlasSearchCancellation?
+    @State private var sourceSearchRow: AtlasSearchRowID?
     @State private var atlasDocuments: [String: AtlasDocument] = [:]
     @State private var projectCache: AtlasProjectCache?
     @State private var textTiles: [AtlasTextTile] = []
@@ -267,6 +269,15 @@ extension AtlasCamera {
         camera.fillsViewport = true
         return camera
     }()
+
+    private var searchContext: AtlasSearchContext {
+        AtlasSearchContext(root: root, query: query, loadGeneration: loadGeneration,
+            atlasRevision: atlasRevision, scope: fileScope.rawValue, customExtensions: customExtensions)
+    }
+
+    private var searchIsCurrent: Bool {
+        !loadingProject && searchPresentation?.isCurrent(in: searchContext) == true
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -311,23 +322,38 @@ extension AtlasCamera {
         .onDisappear {
             cancelSourceLoad()
             loadTask?.cancel()
+            loadCancellation?.cancel()
+            projectIO.cancel()
+            loadGeneration = UUID()
             loadTask = nil
-            searchCoordinator?.cancel()
+            loadCancellation = nil
+            loadingProject = false
+            clearSearch()
             searchCoordinator = nil
-            searchPending = false
         }
-        .onChange(of: query) { _, _ in clearSearch() }
+        .onChange(of: Array(query.utf8)) { _, _ in clearSearch() }
+        .onChange(of: Array(customExtensions.utf8)) { _, _ in
+            if fileScope == .custom { clearSearch() }
+        }
         .onChange(of: fileScope) { _, value in
             if value == .custom { showsSidebar = true }
             applyFileScope()
         }
         .onChange(of: selectedHit) { _, selected in
-            guard let hit = hits.first(where: { $0.id == selected }) else { return }
-            guard let path = hit.sourcePath else {
-                status = "This filename cannot be opened by the UTF-8 reader. The search result is retained."
+            guard let selected else { return }
+            // Admit this report's immutable witness, not a reusable integer.
+            // Exact source verification happens before installing the reader;
+            // missing atlas geometry must not disable on-demand navigation.
+            guard !loadingProject,
+                  let hit = searchPresentation?.captureCandidate(for: selected, in: searchContext),
+                  let path = hit.sourcePath else {
+                selectedHit = nil
+                selectedMatch = nil
+                selectedReaderSelection = nil
+                status = (searchPresentation?.availability(for: selected, in: searchContext) ?? .stale).message
                 return
             }
-            openFile(path, hit: hit)
+            openFile(path, searchRow: selected, exactMatch: true)
             showsReader = true
         }
     }
@@ -353,7 +379,7 @@ extension AtlasCamera {
                     .onSubmit(runSearch)
                     .onExitCommand { query = ""; clearSearch() }
                 Button("Search") { runSearch() }
-                    .disabled(loadingProject || root.isEmpty || query.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(loadingProject || root.isEmpty || query.isEmpty)
                 if !query.isEmpty {
                     Button { query = ""; clearSearch() } label: { Image(systemName: "xmark.circle.fill") }
                         .buttonStyle(.plain)
@@ -412,13 +438,22 @@ extension AtlasCamera {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 10)
-                List(selection: $selectedHit) {
-                    ForEach(hits) { hit in
-                        HitRow(hit: hit, isSameFile: selectedPath == hit.sourcePath)
-                            .tag(hit.id)
+                if let presentation = searchPresentation {
+                    List(selection: $selectedHit) {
+                        ForEach(hits) { hit in
+                            let row = presentation.rowID(for: hit.id)
+                            let availability = presentation.availability(for: row, in: searchContext)
+                            let canOpenFile = presentation.filePath(for: row, in: searchContext) != nil
+                            HitRow(hit: hit, isSameFile: selectedPath == hit.sourcePath,
+                                availability: availability,
+                                openFile: canOpenFile ? { openSearchFile(row) } : nil)
+                                .tag(row)
+                                .disabled(!availability.allowsActivation && !canOpenFile)
+                        }
                     }
+                    .id(presentation.id)
+                    .listStyle(.sidebar)
                 }
-                .listStyle(.sidebar)
             }
             footer
         }
@@ -501,15 +536,15 @@ extension AtlasCamera {
                     AtlasCanvas(
                         revision: atlasRevision,
                         focusRequest: focusRequest,
-                        selectedMatch: selectedMatch,
-                        searchRows: searchRows,
+                        selectedMatch: searchIsCurrent ? selectedMatch : nil,
+                        searchRows: searchIsCurrent ? searchRows : [],
                         scopeLabel: fileScope == .custom ? customExtensions : fileScope.rawValue,
                         files: displayedFiles,
                         camera: camera,
-                        hitPaths: searchPaths,
+                        hitPaths: searchIsCurrent ? searchPaths : [],
                         selectedPath: selectedPath,
                         contentBounds: contentBounds,
-                        onSelect: { openFile($0.path) },
+                        onSelect: { selectedHit = nil; openFile($0.path) },
                         tiles: textTiles
                     )
                     .id(atlasRevision)
@@ -592,8 +627,10 @@ extension AtlasCamera {
             }
             if let source = selectedSource, sourceError == nil {
                 AtlasSourceReader(source: source, navigation: focusRequest,
-                    selection: selectedReaderSelection) {
-                    if let document = atlasDocuments[source.path] {
+                    selection: searchIsCurrent ? selectedReaderSelection : nil) {
+                    if let document = atlasDocuments[source.path],
+                       document.source.path.utf8.elementsEqual(source.path.utf8),
+                       document.source.text.utf8.elementsEqual(source.text.utf8) {
                         return AtlasDocument.style(document.capture)
                     }
                     return NSAttributedString(string: source.text, attributes: [
@@ -647,6 +684,11 @@ extension AtlasCamera {
 #else
         accessLease = nil
 #endif
+        // The old reader/search state was invalidated synchronously above.
+        // Even a failed or canceled refresh must retire its frame identity.
+        showsReader = false
+        focusRequest = UUID()
+        atlasRevision = UUID()
         files = []
         displayedFiles = []
         atlasDocuments = [:]
@@ -673,6 +715,8 @@ extension AtlasCamera {
 
     private func loadAtlas(root requestedRoot: String, generation: UUID,
         cancellation: AtlasSearchCancellation, accessLease: AnyObject?) async {
+        guard !Task.isCancelled, !cancellation.isCanceled,
+              loadGeneration == generation, root.utf8.elementsEqual(requestedRoot.utf8) else { return }
         defer {
             if loadGeneration == generation {
                 loadingProject = false
@@ -680,10 +724,8 @@ extension AtlasCamera {
                 loadCancellation = nil
             }
         }
-        // A refresh changes the accepted atlas even when the path is unchanged.
-        clearSearch()
 #if FCB_APP_STORE
-        guard rootAccess?.url.path == requestedRoot else {
+        guard rootAccess?.url.path.utf8.elementsEqual(requestedRoot.utf8) == true else {
             status = "Choose a project folder to grant read access."
             return
         }
@@ -848,24 +890,37 @@ extension AtlasCamera {
     }
 
     private func clearSearch() {
+        if sourceSearchRow != nil {
+            cancelSourceLoad()
+            if selectedSource == nil {
+                selectedPath = nil
+                fileText = ""
+                sourceError = nil
+            }
+        }
         searchCoordinator?.cancel()
         searchPending = false
         hits = []; selectedHit = nil; selectedMatch = nil
         selectedReaderSelection = nil
-        searchReport = nil; resolvedMatches = [:]; searchRows = []; searchPaths = []
+        searchReport = nil; searchPresentation = nil
+        resolvedMatches = [:]; searchRows = []; searchPaths = []
         overlayLimited = false
         searchTitle = "Search project"
         searchSummary = "Enter text to search the project."
         status = "\(displayedFiles.count) of \(files.count) files shown. Search cleared."
     }
 
-    private func prepareSearchOverlay(_ report: AtlasSearchReport) {
+    private func prepareSearchOverlay(_ report: AtlasSearchReport, context: AtlasSearchContext) {
         var matches: [SearchHit.ID: AtlasMatch] = [:]
         let grouped = Dictionary(grouping: report.hits.compactMap { hit in
             hit.sourcePath.map { ($0, hit) }
-        }, by: { $0.0 })
-        for path in grouped.keys.sorted() {
-            guard fileScope.includes(path, custom: customExtensions), let document = atlasDocuments[path], let entries = grouped[path] else { continue }
+        }, by: { Array($0.0.utf8) })
+        for pathBytes in grouped.keys.sorted(by: { $0.lexicographicallyPrecedes($1) }) {
+            guard let path = String(bytes: pathBytes, encoding: .utf8),
+                  fileScope.includes(path, custom: customExtensions),
+                  let document = atlasDocuments[path],
+                  document.source.path.utf8.elementsEqual(pathBytes),
+                  let entries = grouped[pathBytes] else { continue }
             // A single workspace query names one capture per file. Reject any
             // inconsistent identity rather than borrowing another hit's proof.
             guard let first = entries.first?.1, let digest = first.captureSHA256,
@@ -889,17 +944,19 @@ extension AtlasCamera {
             }
         }
         resolvedMatches = matches; searchRows = rows
+        searchPresentation = AtlasSearchPresentation(context: context, hits: report.hits,
+            verifiedHitIDs: Set(matches.keys))
         searchPaths = Set(report.hits.compactMap(\.sourcePath))
         overlayLimited = limited
     }
 
     private func runSearch() {
         let requestedText = query
-        let trimmed = requestedText.trimmingCharacters(in: .whitespaces)
         let requestedRoot = root
-        guard !trimmed.isEmpty, !requestedRoot.isEmpty else { return }
+        guard !loadingProject, !requestedText.isEmpty, !requestedRoot.isEmpty else { return }
+        let requestedContext = searchContext
 #if FCB_APP_STORE
-        guard let access = rootAccess, access.url.path == requestedRoot else {
+        guard let access = rootAccess, access.url.path.utf8.elementsEqual(requestedRoot.utf8) else {
             clearSearch()
             status = "Choose the project folder again to grant read access."
             searchSummary = status
@@ -911,7 +968,7 @@ extension AtlasCamera {
         let accessLease: AnyObject? = nil
 #endif
         do {
-            try AtlasSearchCoordinator.validate(root: requestedRoot, query: trimmed)
+            let input = try AtlasSearchInput(root: requestedRoot, query: requestedText)
             clearSearch()
             searchPending = true
             searchTitle = "Searching project"
@@ -919,14 +976,14 @@ extension AtlasCamera {
             status = searchSummary
             let coordinator = searchCoordinator ?? AtlasSearchCoordinator(work: AtlasNativeSearch.run)
             searchCoordinator = coordinator
-            try coordinator.submit(root: requestedRoot, query: trimmed, accessLease: accessLease) { result in
+            try coordinator.submit(input: input, accessLease: accessLease) { result in
                 // Generation rejection happens in the coordinator. These checks
                 // also cover SwiftUI state changes before onChange has run.
-                guard root == requestedRoot, query == requestedText else { return }
+                guard !loadingProject, requestedContext.matches(searchContext) else { return }
                 searchPending = false
                 switch result {
                 case .success(let report):
-                    prepareSearchOverlay(report)
+                    prepareSearchOverlay(report, context: requestedContext)
                     searchReport = report
                     hits = report.hits.filter { $0.sourcePath.map { fileScope.includes($0, custom: customExtensions) } ?? (fileScope == .all) }
                     status = report.summary
@@ -955,29 +1012,56 @@ extension AtlasCamera {
         status = searchSummary
     }
 
+    private func openSearchFile(_ row: AtlasSearchRowID) {
+        guard !loadingProject,
+              let path = searchPresentation?.filePath(for: row, in: searchContext) else {
+            status = AtlasSearchHitAvailability.stale.message
+            return
+        }
+        selectedHit = nil
+        openFile(path, searchRow: row)
+        showsReader = true
+    }
+
     private func cancelSourceLoad() {
         sourceTask?.cancel()
         sourceCancellation?.cancel()
         sourceIO.cancel()
         sourceTask = nil
         sourceCancellation = nil
+        sourceSearchRow = nil
     }
 
-    private func openFile(_ path: String, hit: SearchHit? = nil) {
+    private func acceptsSource(_ path: String, searchRow: AtlasSearchRowID?, exactMatch: Bool) -> Bool {
+        guard let row = searchRow else { return true }
+        guard !loadingProject,
+              let presentation = searchPresentation,
+              let sourcePath = presentation.filePath(for: row, in: searchContext),
+              sourcePath.utf8.elementsEqual(path.utf8) else { return false }
+        return !exactMatch || (selectedHit == row
+            && presentation.captureCandidate(for: row, in: searchContext) != nil)
+    }
+
+    private func openFile(_ path: String, searchRow: AtlasSearchRowID? = nil, exactMatch: Bool = false) {
+        guard acceptsSource(path, searchRow: searchRow, exactMatch: exactMatch) else { return }
         cancelSourceLoad()
+        sourceSearchRow = searchRow
         selectedMatch = nil
         selectedReaderSelection = nil
         selectedPath = path
         selectedSource = nil
         sourceError = nil
+        fileText = ""
         focusRequest = UUID()
-        if let source = atlasDocuments[path]?.source {
-            presentSource(source, hit: hit)
+        // String-keyed lookup may return a canonically equivalent filename.
+        // Such a document cannot lend this request its source or capture proof.
+        if let source = atlasDocuments[path]?.source, source.path.utf8.elementsEqual(path.utf8) {
+            presentSource(source, searchRow: searchRow, exactMatch: exactMatch)
             return
         }
 
-        // Only captured value buffers cross the bounded native I/O queue.
-        // A newer open replaces the waiting request without overlapping reads.
+        // Preserve the bounded native queue and root lease for on-demand reads.
+        // Revalidate the report as well as the project before any publication.
         let requestedRoot = root
         let navigation = focusRequest
         let generation = loadGeneration
@@ -987,7 +1071,7 @@ extension AtlasCamera {
         status = "Opening \(path)…"
         let leases: [AnyObject]
 #if FCB_APP_STORE
-        guard let access = rootAccess, access.url.path == requestedRoot else {
+        guard let access = rootAccess, access.url.path.utf8.elementsEqual(requestedRoot.utf8) else {
             sourceCancellation = nil
             sourceUnavailable()
             return
@@ -1001,6 +1085,7 @@ extension AtlasCamera {
                 if focusRequest == navigation {
                     sourceTask = nil
                     sourceCancellation = nil
+                    sourceSearchRow = nil
                 }
             }
             do {
@@ -1009,37 +1094,58 @@ extension AtlasCamera {
                 }
                 guard !Task.isCancelled, !cancellation.isCanceled,
                       focusRequest == navigation, loadGeneration == generation,
-                      root == requestedRoot, selectedPath == path else { return }
+                      root.utf8.elementsEqual(requestedRoot.utf8),
+                      selectedPath?.utf8.elementsEqual(path.utf8) == true,
+                      acceptsSource(path, searchRow: searchRow, exactMatch: exactMatch) else { return }
                 if let text {
-                    presentSource(AtlasSource(path: path, text: text), hit: hit)
+                    presentSource(AtlasSource(path: path, text: text), searchRow: searchRow, exactMatch: exactMatch)
                 } else { sourceUnavailable() }
             } catch {
                 guard !Task.isCancelled, !cancellation.isCanceled,
                       focusRequest == navigation, loadGeneration == generation,
-                      root == requestedRoot, selectedPath == path else { return }
+                      root.utf8.elementsEqual(requestedRoot.utf8),
+                      selectedPath?.utf8.elementsEqual(path.utf8) == true,
+                      acceptsSource(path, searchRow: searchRow, exactMatch: exactMatch) else { return }
                 sourceUnavailable()
             }
         }
     }
 
-    private func presentSource(_ source: AtlasSource, hit: SearchHit?) {
+    private func presentSource(_ source: AtlasSource, searchRow: AtlasSearchRowID?, exactMatch: Bool) {
+        guard acceptsSource(source.path, searchRow: searchRow, exactMatch: exactMatch) else { return }
+        let hit: SearchHit?
+        let range: NSRange?
+        if exactMatch {
+            guard let row = searchRow,
+                  let candidate = searchPresentation?.captureCandidate(for: row, in: searchContext),
+                  let digest = candidate.captureSHA256, let count = candidate.captureByteLength,
+                  let verified = AtlasMatch.resolveSourceRange(source: source, byteStart: candidate.start,
+                      byteEnd: candidate.end, expectedSHA256: digest, expectedByteCount: count) else {
+                // An exact-hit request must not silently become a file-start
+                // navigation. The separate Open file action remains available.
+                sourceUnavailable()
+                sourceError = "Exact match unavailable: the source capture changed or its offsets cannot be mapped. Search again, or use Open file without match navigation."
+                status = sourceError ?? "Exact match unavailable"
+                return
+            }
+            hit = candidate
+            range = verified
+        } else {
+            hit = nil
+            range = nil
+        }
         fileText = source.text
         selectedSource = source
         sourceError = nil
-        status = "Opened \(source.path). Zoom into its parcel to read the captured source."
-        // Clearing/replacing search while a source read is pending must not
-        // resurrect that search's selection when the I/O completion arrives.
-        guard let hit, selectedHit == hit.id, hit.sourcePath == source.path,
-              hits.contains(where: { $0.id == hit.id }) else { return }
-        guard let digest = hit.captureSHA256, let count = hit.captureByteLength,
-              let range = AtlasMatch.resolveSourceRange(source: source, byteStart: hit.start,
-                  byteEnd: hit.end, expectedSHA256: digest, expectedByteCount: count) else {
-            status = "Opened file beginning. Exact match location unavailable: the capture changed or its offsets cannot be mapped."
+        selectedReaderSelection = range.map { AtlasReaderSelection(source: source, range: $0) }
+        guard let hit, let range else {
+            status = searchRow == nil
+                ? "Opened \(source.path). Zoom into its parcel to read the captured source."
+                : "Opened \(source.path) without match navigation. No exact search location was used."
             return
         }
-        // Bind the target to the source actually installed, even when no eager
-        // document or admissible overlay geometry exists for this search hit.
-        selectedReaderSelection = AtlasReaderSelection(source: source, range: range)
+        // Reader verification is independent of the overlay's row budget and
+        // eager capture membership. Only verified geometry adds atlas bands.
         if let match = resolvedMatches[hit.id], match.sourceRange == range {
             selectedMatch = match
             searchRows = Array((match.rowRects + searchRows.filter { !match.rowRects.contains($0) }).prefix(256))
@@ -1250,6 +1356,8 @@ struct AtlasCanvas: View {
 struct HitRow: View {
     let hit: SearchHit
     let isSameFile: Bool
+    let availability: AtlasSearchHitAvailability
+    let openFile: (() -> Void)?
 
     var body: some View {
         HStack(spacing: 8) {
@@ -1264,13 +1372,25 @@ struct HitRow: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                if !availability.label.isEmpty {
+                    Text(availability.label).font(.caption2).foregroundStyle(.secondary)
+                }
             }
             Spacer()
-            Text("b\(hit.start)")
-                .font(.system(size: 10.5, design: .monospaced))
-                .foregroundStyle(.tertiary)
+            if let openFile {
+                Button("Open file", action: openFile)
+                    .buttonStyle(.borderless)
+                    .help("Read the file without using unverified match coordinates")
+                    .accessibilityLabel("Open \(hit.fileName) without match navigation")
+            } else {
+                Text("b\(hit.start)")
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
         }
         .padding(.vertical, 1)
+        .help(availability.message)
+        .accessibilityHint(availability.message)
     }
 }
 
