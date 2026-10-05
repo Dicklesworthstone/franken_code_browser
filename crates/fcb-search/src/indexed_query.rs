@@ -10,7 +10,7 @@ use fcb_core::{ByteLength, FileId, QueryGeneration, ResourceAllocationId, Resour
 use crate::index::{EphemeralIndex, IndexError, MembershipState, SearchManifestId};
 use crate::index::export::OwnedEphemeralIndex;
 use crate::{LangFilterKind, ParsedQuery, PathFilterKind, QueryOptions, ReferenceScanOracle,
-    SearchCoverage, SearchDocument, SearchMatch, SearchMode, SearchResult, UnicodeNormalization};
+    SearchCoverage, SearchDocument, SearchMatch, SearchResult};
 
 pub const MAX_QUERY_STEP_DOCUMENTS: usize = 256;
 /// Includes retained AST vector/string capacities, not just their lengths.
@@ -108,19 +108,17 @@ impl<'source> Execution<'source> {
         if options.generation.owner() != index.id().owner() { return Err(IndexError::OwnerMismatch); }
         ReferenceScanOracle::scan_collection(&[], query, &options)?;
         let mut hit_capacity = 0usize;
-        let mut largest_capture = 0usize;
         for ordinal in 0..index.count() {
             if canceled() { return Err(IndexError::Canceled); }
             let doc = index.document(ordinal);
             hit_capacity = hit_capacity.saturating_add(doc.capture.bytes().len()).min(options.max_matches);
-            largest_capture = largest_capture.max(doc.capture.bytes().len());
         }
-        let text_capacity_per_hit = match options.mode {
-            SearchMode::RawBytes | SearchMode::DecodedText {
-                case_sensitive: true, normalization: UnicodeNormalization::Exact,
-            } => query.primary_needle.len(),
-            _ => largest_capture.checked_mul(3).ok_or(IndexError::LimitExceeded)?,
-        };
+        // Charge only the possible original text of one occurrence, including
+        // complete contributing scalars inside normalization expansions. A large
+        // unrelated capture must not inflate every retained hit's reservation.
+        let text_capacity_per_hit = crate::normalized::matched_text_capacity(
+            &query.primary_needle, options.mode,
+        )?;
         let retained = output_bytes(hit_capacity, index.count(), text_capacity_per_hit)?;
         let unavailable_bytes = match &unavailable {
             Cow::Owned(ids) => ids.capacity().checked_mul(size_of::<FileId>()).ok_or(IndexError::LimitExceeded)?,

@@ -35,6 +35,18 @@ enum Transform {
 }
 
 impl Transform {
+    fn for_mode(mode: SearchMode) -> Option<Self> {
+        Some(match mode {
+            SearchMode::RawBytes | SearchMode::DecodedText {
+                case_sensitive: true, normalization: UnicodeNormalization::Exact,
+            } => return None,
+            SearchMode::DecodedText { normalization: UnicodeNormalization::CaseFold, .. } => Transform::Fold,
+            SearchMode::DecodedText { normalization: UnicodeNormalization::Canonical, case_sensitive } =>
+                Transform::Canonical { case_sensitive },
+            SearchMode::DecodedText { .. } => Transform::Lower,
+        })
+    }
+
     fn units(self, ch: char) -> Units {
         match self {
             Self::Fold if matches!(ch, 'ß' | 'ẞ') => Units::Expansion(&['s', 's']),
@@ -80,6 +92,24 @@ impl Iterator for Units {
     }
 }
 
+/// Bound original UTF-8 text retained for one match before result allocation.
+/// Every contributing source scalar produces at least one matching unit, and
+/// occupies at most four UTF-8 bytes. Partial expansions still contribute the
+/// complete source scalar, so query byte length alone is not a sound bound.
+/// This depends only on the declared query, never on the largest source file.
+pub(crate) fn matched_text_capacity(query: &str, mode: SearchMode) -> Result<usize, QueryError> {
+    crate::validate_needle(query.as_bytes())?;
+    let Some(transform) = Transform::for_mode(mode) else { return Ok(query.len()); };
+    let mut units = 0usize;
+    for _ in query.chars().flat_map(|ch| transform.units(ch)) {
+        units = units.checked_add(1).ok_or(QueryError::LimitExceeded)?;
+        if units > crate::stream::MAX_STREAM_NEEDLE_BYTES * 3 {
+            return Err(QueryError::NeedleTooLong);
+        }
+    }
+    units.checked_mul(4).ok_or(QueryError::LimitExceeded)
+}
+
 /// KMP over transformed scalar units. The failure table and source ring are
 /// O(transformed needle length); no source-sized normalized string is built.
 pub(super) struct NormalizedCursor {
@@ -92,15 +122,7 @@ pub(super) struct NormalizedCursor {
 
 impl NormalizedCursor {
     pub fn new(query: &str, mode: SearchMode) -> Result<Option<Self>, QueryError> {
-        let transform = match mode {
-            SearchMode::RawBytes | SearchMode::DecodedText {
-                case_sensitive: true, normalization: UnicodeNormalization::Exact,
-            } => return Ok(None),
-            SearchMode::DecodedText { normalization: UnicodeNormalization::CaseFold, .. } => Transform::Fold,
-            SearchMode::DecodedText { normalization: UnicodeNormalization::Canonical, case_sensitive } =>
-                Transform::Canonical { case_sensitive },
-            SearchMode::DecodedText { .. } => Transform::Lower,
-        };
+        let Some(transform) = Transform::for_mode(mode) else { return Ok(None); };
         crate::validate_needle(query.as_bytes())?;
         let mut needle = Vec::new();
         // Bound transformed query storage independently of toolchain expansion
@@ -234,4 +256,25 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn output_admission_covers_full_contributing_scalars_not_query_bytes() {
+        let lower = SearchMode::DecodedText { case_sensitive: false, normalization: UnicodeNormalization::Exact };
+        let fold = SearchMode::DecodedText { case_sensitive: false, normalization: UnicodeNormalization::CaseFold };
+        let canonical = SearchMode::DecodedText { case_sensitive: false, normalization: UnicodeNormalization::Canonical };
+        assert_eq!(matched_text_capacity("k", SearchMode::default()), Ok(1));
+        assert_eq!(matched_text_capacity("k", SearchMode::RawBytes), Ok(1));
+        assert_eq!(matched_text_capacity("k", lower), Ok(4));
+        assert_eq!(matched_text_capacity("ß", fold), Ok(8));
+        assert_eq!(matched_text_capacity("é", canonical), Ok(8));
+        for mode in [lower, fold, canonical] {
+            for query in ["k", "s", "ss", "e", "é", "İ", "i\u{0307}", "🙂"] {
+                let bound = matched_text_capacity(query, mode).unwrap();
+                for (_, _, text) in run("Kk ßß ée\u{0301} İi\u{0307} 🙂", query, mode) {
+                    assert!(text.capacity() <= bound, "{mode:?}: {query:?} -> {text:?}");
+                }
+            }
+        }
+        assert_eq!(matched_text_capacity("", lower), Err(QueryError::EmptyNeedle));
+    }
+
 }

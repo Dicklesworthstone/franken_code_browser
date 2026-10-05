@@ -193,7 +193,22 @@ fn existing_normalized_modes_keep_occurrence_multiplicity_and_source_ranges() {
         let result = index.search(&query, options, &budget, allocation(2), || false).unwrap();
         assert_eq!(result.fallback_attempts(), 1);
         ReferenceScanOracle::verify_oracle_match(result.capture_results(), &oracle).unwrap();
-        if needle == "s" { assert!(result.capture_results().matches.iter().any(|hit| hit.multiplicity == 2)); }
+        if needle == "s" {
+            // Distinct normalized occurrences may share contributing source
+            // bytes; preserve their identities rather than coalescing the hits.
+            let hits = &result.capture_results().matches;
+            assert_eq!(result.capture_results().match_count(), 3);
+            assert_eq!(hits.len(), 3);
+            assert_eq!(hits.iter().map(|hit| hit.matched_text.as_str()).collect::<Vec<_>>(), ["S", "ß", "ß"]);
+            assert!(hits.iter().all(|hit| hit.multiplicity == 1));
+            assert_eq!(hits[0].original_byte_range.start().get(), 0);
+            assert_eq!(hits[0].original_byte_range.end().get(), 1);
+            assert_eq!(hits[1].original_byte_range.start().get(), 4);
+            assert_eq!(hits[1].original_byte_range.end().get(), 6);
+            assert_eq!(hits[1].original_byte_range, hits[2].original_byte_range);
+            assert_eq!(hits[1].decoded_range, hits[2].decoded_range);
+            assert_ne!(hits[1].occurrence_id, hits[2].occurrence_id);
+        }
         if needle == "café" { assert_eq!(result.capture_results().matches.len(), 2); }
     }
 }
