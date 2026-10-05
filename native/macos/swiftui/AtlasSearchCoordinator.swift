@@ -71,22 +71,25 @@ private final class AtlasSearchRequest: @unchecked Sendable {
     }
 
     nonisolated static func validate(root: String, query: String) throws {
-        guard !root.isEmpty, root.utf8.count <= 16_384, !root.utf8.contains(0),
-              !query.isEmpty, query.utf8.count <= 1_024, !query.utf8.contains(0) else {
-            throw AtlasSearchError.invalidRequest
-        }
+        _ = try AtlasSearchInput(root: root, query: query)
     }
 
     /// Validation/exhaustion fails before disturbing accepted or active work.
     @discardableResult
     func submit(root: String, query: String, accessLease: AnyObject? = nil,
                 completion: @escaping Completion) throws -> UInt64 {
+        try submit(input: AtlasSearchInput(root: root, query: query),
+            accessLease: accessLease, completion: completion)
+    }
+
+    @discardableResult
+    func submit(input: AtlasSearchInput, accessLease: AnyObject? = nil,
+                completion: @escaping Completion) throws -> UInt64 {
         precondition(Thread.isMainThread)
-        try Self.validate(root: root, query: query)
         let (generation, exhausted) = lastGeneration.addingReportingOverflow(1)
         guard !exhausted else { throw AtlasSearchError.identityExhausted }
         lastGeneration = generation
-        let request = AtlasSearchRequest(generation: generation, root: root, query: query,
+        let request = AtlasSearchRequest(generation: generation, root: input.root, query: input.query,
                               accessLease: accessLease, completion: completion)
         latest = generation
         active?.cancellation.cancel()

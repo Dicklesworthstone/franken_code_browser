@@ -126,6 +126,139 @@ struct AtlasSearchReport: Sendable {
     private struct FileRecord: Decodable { let file_id: String }
 }
 
+/// Validated, immutable input to the literal-search bridge. Admission does
+/// not trim whitespace or normalize Unicode: those bytes are the query.
+struct AtlasSearchInput: Sendable {
+    let root: String
+    let query: String
+
+    init(root: String, query: String) throws {
+        guard !root.isEmpty, root.utf8.count <= 16_384, !root.utf8.contains(0),
+              !query.isEmpty, query.utf8.count <= 1_024, !query.utf8.contains(0) else {
+            throw AtlasSearchError.invalidRequest
+        }
+        self.root = root
+        self.query = query
+    }
+}
+
+/// Identity of the visible source/search context, not just the project path.
+/// Compare UTF-8 bytes: Swift String equality considers canonically equivalent
+/// spellings equal, but exact search and Unix filenames must not do so.
+struct AtlasSearchContext: Sendable {
+    let root: String
+    let query: String
+    let loadGeneration: UUID
+    let atlasRevision: UUID
+    let scope: String
+    let customExtensions: String
+
+    func matches(_ other: Self) -> Bool {
+        loadGeneration == other.loadGeneration && atlasRevision == other.atlasRevision
+            && root.utf8.elementsEqual(other.root.utf8)
+            && query.utf8.elementsEqual(other.query.utf8)
+            && scope.utf8.elementsEqual(other.scope.utf8)
+            && customExtensions.utf8.elementsEqual(other.customExtensions.utf8)
+    }
+}
+
+/// Hit indices are only unique within one report. A delayed List selection
+/// must not turn row 0 of an old report into row 0 of a new one.
+struct AtlasSearchRowID: Hashable, Sendable {
+    let report: UUID
+    let hit: SearchHit.ID
+}
+
+enum AtlasSearchHitAvailability: Sendable {
+    case ready, requiresVerification, stale, unavailable, unsupportedPath
+
+    var allowsActivation: Bool {
+        switch self {
+        case .ready, .requiresVerification: return true
+        case .stale, .unavailable, .unsupportedPath: return false
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .ready: return ""
+        case .requiresVerification: return "Verify source on open"
+        case .stale: return "Search again — results changed"
+        case .unavailable: return "Exact location unavailable"
+        case .unsupportedPath: return "Filename cannot be opened"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .ready: return "Open the verified match in the captured source."
+        case .requiresVerification: return "Read the source and verify its capture before selecting this match. Atlas highlighting is not required."
+        case .stale: return "The project, capture, filter, or query changed. Search again before opening this result."
+        case .unavailable: return "The captured source could not verify this match. The result is retained, but exact navigation is disabled. Use Open file to read it without match navigation."
+        case .unsupportedPath: return "This filename cannot be opened by the UTF-8 reader. The search result is retained."
+        }
+    }
+}
+
+/// Report/context admission shared by rows and their activation handler.
+/// A capture candidate authorizes verification, not an exact jump. AtlasMatch
+/// must still verify the installed source, independently of overlay geometry.
+struct AtlasSearchPresentation: Sendable {
+    let id = UUID()
+    private let context: AtlasSearchContext
+    private let hits: [SearchHit.ID: SearchHit]
+    private let verifiedHitIDs: Set<SearchHit.ID>
+
+    init(context: AtlasSearchContext, hits: [SearchHit], verifiedHitIDs: Set<SearchHit.ID>) {
+        self.context = context
+        // The decoder emits unique indices. Fail closed rather than trapping
+        // or choosing one witness if another producer supplies duplicate IDs.
+        self.hits = Dictionary(grouping: hits, by: \.id).compactMapValues {
+            $0.count == 1 ? $0.first : nil
+        }
+        self.verifiedHitIDs = verifiedHitIDs
+    }
+
+    func rowID(for hit: SearchHit.ID) -> AtlasSearchRowID {
+        AtlasSearchRowID(report: id, hit: hit)
+    }
+
+    func isCurrent(in current: AtlasSearchContext) -> Bool { context.matches(current) }
+
+    func availability(for row: AtlasSearchRowID, in current: AtlasSearchContext) -> AtlasSearchHitAvailability {
+        guard row.report == id, isCurrent(in: current) else { return .stale }
+        guard let hit = hits[row.hit] else { return .unavailable }
+        guard hit.sourcePath != nil else { return .unsupportedPath }
+        guard captureCandidate(for: row, in: current) != nil else { return .unavailable }
+        return verifiedHitIDs.contains(hit.id) ? .ready : .requiresVerification
+    }
+
+    /// Previously verified candidates only; never promotes a missing overlay
+    /// to capture proof. The reader can use captureCandidate to verify on open.
+    func hit(for row: AtlasSearchRowID, in current: AtlasSearchContext) -> SearchHit? {
+        guard verifiedHitIDs.contains(row.hit) else { return nil }
+        return captureCandidate(for: row, in: current)
+    }
+
+    /// Return the immutable witness for a current row. This does NOT establish
+    /// that currently available source bytes agree with the search capture.
+    func captureCandidate(for row: AtlasSearchRowID, in current: AtlasSearchContext) -> SearchHit? {
+        guard row.report == id, isCurrent(in: current), let hit = hits[row.hit],
+              hit.sourcePath != nil, let digest = hit.captureSHA256,
+              digest.utf8.count == 64,
+              digest.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+              let count = hit.captureByteLength, hit.start < hit.end, hit.end <= count else { return nil }
+        return hit
+    }
+
+    /// Explicit file opening is distinct from an exact-hit jump. It still
+    /// needs the current report/root, but does not borrow an unverified range.
+    func filePath(for row: AtlasSearchRowID, in current: AtlasSearchContext) -> String? {
+        guard row.report == id, isCurrent(in: current) else { return nil }
+        return hits[row.hit]?.sourcePath
+    }
+}
+
 /// Filename scope over the already captured atlas; no source reads or parsing.
 enum AtlasFileScope: String, CaseIterable, Identifiable {
     case all = "All files", markdown = "Markdown", python = "Python", rust = "Rust", custom = "Extension…"
