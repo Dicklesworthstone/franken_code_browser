@@ -89,9 +89,10 @@ struct AtlasReaderSelection {
         let changed = installedSource !== source
         if changed {
             // Same bound as the complete-source native opening route. Never
-            // publish a prefix under a whole-source label.
+            // publish a prefix under a whole-source label, or retain another
+            // capture under the replacement source's surrounding UI.
             guard source.text.utf8.count <= 4 * 1024 * 1024 else {
-                return refuse("Source exceeds this native reader's 4 MiB limit.")
+                return refuseSource("Source exceeds this native reader's 4 MiB limit.")
             }
             let styled = styledSource()
             let exact = styled.string.utf8.elementsEqual(source.text.utf8)
@@ -132,6 +133,21 @@ struct AtlasReaderSelection {
         }
         textView.scrollRangeToVisible(selection.range)
         return true
+    }
+
+    /// Refusing a replacement capture revokes the old presentation as well.
+    /// Selection-only refusals below intentionally retain the current source;
+    /// source-admission failures must not leave it available to read or copy.
+    private func refuseSource(_ message: String) -> Bool {
+        textView.textStorage?.setAttributedString(NSAttributedString(string: ""))
+        textView.setSelectedRange(NSRange(location: 0, length: 0))
+        textView.scrollRangeToVisible(NSRange(location: 0, length: 0))
+        textView.setAccessibilityLabel("Read-only source unavailable")
+        installedSource = nil
+        lastNavigation = nil
+        lastTargetSource = nil
+        lastRange = nil
+        return refuse(message)
     }
 
     private func refuse(_ message: String) -> Bool {
