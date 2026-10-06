@@ -9,12 +9,17 @@ import AppKit
     let root: String
     let path: String
     let accessLease: AnyObject?
-    @State private var model = AtlasPagedReaderModel(transport: .native)
+    @State private var model = AtlasPagedReaderModel(transport: .native, search: .native)
     @State private var copyNotice = ""
 
     var body: some View {
         VStack(spacing: 4) {
             controls
+            findControls
+            if model.findIsCurrent, let report = model.findReport {
+                Text(report.summary).font(.caption2).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10)
+            }
             if let page = model.page {
                 HStack {
                     Text("Bytes \(page.start)..<\(page.end) / \(page.identity.capturedBytes) · \(page.identity.encoding)")
@@ -28,7 +33,8 @@ import AppKit
                 .padding(.horizontal, 10)
             }
             if let source = model.source {
-                AtlasSourceReader(source: source, navigation: model.navigation, selection: nil) {
+                AtlasSourceReader(source: source, navigation: model.navigation,
+                    selection: model.nativeSelectionRange.map { AtlasReaderSelection(source: source, range: $0) }) {
                     NSAttributedString(string: source.text, attributes: [
                         .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
                         .foregroundColor: NSColor.textColor
@@ -53,6 +59,7 @@ import AppKit
         .onAppear(perform: open)
         .onDisappear { model.close(); copyNotice = "" }
         .onChange(of: model.navigation) { _, _ in copyNotice = "" }
+        .onChange(of: Array(model.fileQuery.utf8)) { _, _ in copyNotice = "" }
     }
 
     private var controls: some View {
@@ -79,6 +86,26 @@ import AppKit
         }
         .controlSize(.small)
         .padding(.horizontal, 10).padding(.top, 4)
+    }
+
+    private var findControls: some View {
+        HStack(spacing: 6) {
+            TextField("Find in retained file…", text: $model.fileQuery)
+                .textFieldStyle(.roundedBorder).onSubmit(model.find)
+                .accessibilityLabel("Exact text to find in this retained file")
+            Button("Find", action: model.find).disabled(!model.canFind || model.fileQuery.isEmpty)
+            Button("Previous hit") { model.moveHit(backwards: true) }.disabled(!model.canMoveHit)
+            Button("Next hit") { model.moveHit(backwards: false) }.disabled(!model.canMoveHit)
+            if let hex = model.matchHex {
+                Button("Copy hit hex") {
+                    NSPasteboard.general.clearContents()
+                    copyNotice = NSPasteboard.general.setString(hex, forType: .string)
+                        ? "Copied the matched original bytes as hex." : "Clipboard write failed."
+                }
+                .help("Copy the verified retained hit's original bytes, independently of native glyph selection")
+            }
+        }
+        .controlSize(.small).padding(.horizontal, 10)
     }
 
     private func open() {

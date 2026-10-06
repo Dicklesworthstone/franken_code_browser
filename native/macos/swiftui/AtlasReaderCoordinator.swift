@@ -63,13 +63,20 @@ private final class AtlasReaderSession: @unchecked Sendable {
 /// source handle nor its grant can retire before the active foreign call ends.
 @MainActor final class AtlasReaderCoordinator {
     private let transport: AtlasReaderTransport
+    private let searchTransport: AtlasReaderSearchTransport?
+    private var acceptedFind: AtlasReaderFindReport?
+    private var lastFindGeneration: UInt64 = 0
     private let io = AtlasProjectIO()
     private var session: AtlasReaderSession?
     private var info: AtlasReaderInfo?
     private var cancellation: AtlasSearchCancellation?
     private var operation = UUID()
 
-    init(transport: AtlasReaderTransport) { self.transport = transport }
+    init(transport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil) {
+        self.transport = transport
+        self.searchTransport = search
+    }
+    var supportsFind: Bool { searchTransport != nil }
 
     deinit {
         cancellation?.cancel()
@@ -111,6 +118,11 @@ private final class AtlasReaderSession: @unchecked Sendable {
         guard let session, let info else { throw AtlasReaderError.unavailable }
         // Reject invalid navigation before canceling an admitted operation.
         try request.validate(capturedBytes: info.identity.capturedBytes)
+        if case .hit(let target) = request {
+            guard searchTransport != nil, let acceptedFind,
+                  acceptedFind.target(at: Int(target.index)) == target else { throw AtlasReaderError.invalidInput }
+        }
+        let search = searchTransport
         cancel()
         let ticket = UUID()
         operation = ticket
@@ -124,6 +136,9 @@ private final class AtlasReaderSession: @unchecked Sendable {
                     json = session.transport.window(session.handle, offset, bytes)
                 case .lines(let first, let count, let bytes):
                     json = session.transport.lines(session.handle, first, count, bytes)
+                case .hit(let target):
+                    guard let search else { throw AtlasReaderError.unavailable }
+                    json = search.hit(session.handle, target.generation, target.index, AtlasReaderHitTarget.contextBytes)
                 }
                 return try AtlasReaderPage.decode(json, info: info, request: request)
             }
@@ -136,6 +151,41 @@ private final class AtlasReaderSession: @unchecked Sendable {
         }
     }
 
+    /// Search the retained source, not the current disk file or only the visible
+    /// page. Attempts consume generations even when canceled or refused later.
+    func find(_ needle: String) async throws -> AtlasReaderFindReport {
+        guard let session, let info, let search = searchTransport else { throw AtlasReaderError.unavailable }
+        try AtlasReaderFindReport.validateNeedle(needle)
+        let (generation, overflow) = lastFindGeneration.addingReportingOverflow(1)
+        guard !overflow else { throw AtlasReaderError.unavailable }
+        lastFindGeneration = generation
+        acceptedFind = nil
+        cancel()
+        let ticket = UUID()
+        operation = ticket
+        let flag = AtlasSearchCancellation()
+        cancellation = flag
+        do {
+            let report = try await io.perform(cancellation: flag, keepingAlive: [session]) {
+                try AtlasReaderFindReport.decode(
+                    search.find(session.handle, generation, needle, AtlasReaderFindReport.maxHits, info.identity.capturedBytes),
+                    info: info, generation: generation, needle: needle)
+            }
+            guard self.session === session, operation == ticket, !flag.isCanceled else { throw AtlasReaderError.canceled }
+            acceptedFind = report
+            cancellation = nil
+            return report
+        } catch {
+            if self.session === session, operation == ticket { cancellation = nil }
+            throw Self.readerError(error)
+        }
+    }
+
+    /// Revoke native activation authority without evicting captured source or
+    /// interrupting unrelated byte/line navigation. The host cancels active
+    /// query work separately when editing its query context.
+    func clearFind() { acceptedFind = nil }
+
     func cancel() {
         operation = UUID()
         cancellation?.cancel()
@@ -147,6 +197,8 @@ private final class AtlasReaderSession: @unchecked Sendable {
     func close() {
         cancel()
         info = nil
+        acceptedFind = nil
+        lastFindGeneration = 0
         session = nil
     }
 
