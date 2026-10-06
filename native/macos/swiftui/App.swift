@@ -57,6 +57,8 @@ struct AtlasFile: Identifiable, Hashable {
     /// Packed per-line profile: [length_frac, class] × lineCount.
     let profile: [UInt8]
     var id: String { path }
+    /// List identity uses Unix bytes, not Swift canonical-equivalent equality.
+    var rawPathKey: [UInt8] { Array(path.utf8) }
 
     var fileName: String { (path as NSString).lastPathComponent }
     var previewCoverage: String {
@@ -239,6 +241,7 @@ extension AtlasCamera {
     @State private var projectIO = AtlasProjectIO()
     @State private var loadCancellation: AtlasSearchCancellation?
     @State private var showsReader = false
+    @State private var usesPagedReader = false
     @State private var hits: [SearchHit] = []
     @State private var selectedHit: AtlasSearchRowID?
     @State private var searchTitle = "Search project"
@@ -441,7 +444,31 @@ extension AtlasCamera {
                         .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 10)
                 }
             }
-            if hits.isEmpty {
+            if query.isEmpty && !loadingProject && !displayedFiles.isEmpty {
+                // Catalog membership, not an eager source/Metal tile, makes a
+                // file discoverable. UTF-16 and unprepared files remain usable.
+                List {
+                    Section("Project files · \(displayedFiles.count)") {
+                        ForEach(displayedFiles, id: \.rawPathKey) { file in
+                            Button {
+                                selectedHit = nil
+                                openFile(file.path)
+                                showsReader = true
+                            } label: {
+                                Text(String(reflecting: file.path))
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .lineLimit(2)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Open " + String(reflecting: file.path))
+                            .help("Read the file even when its atlas preview is unavailable")
+                        }
+                    }
+                }
+                .listStyle(.sidebar)
+            } else if hits.isEmpty {
                 ContentUnavailableView {
                     Label(searchTitle, systemImage: "magnifyingglass")
                 } description: {
@@ -566,7 +593,7 @@ extension AtlasCamera {
                     .id(atlasRevision)
                 }
                 if selectedPath != nil && showsReader {
-                    sourcePane.frame(height: 240)
+                    sourcePane.frame(height: usesPagedReader ? 320 : 240)
                 }
             }
             .frame(maxWidth: .infinity)
@@ -635,13 +662,33 @@ extension AtlasCamera {
                     Text("\(fileHits.count) match\(fileHits.count == 1 ? "" : "es") in file")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
+                    if !usesPagedReader {
+                        Button("Read pages") { openPagedFile(path) }
+                            .help("Open a new retained capture for byte and line navigation, without using search-match coordinates")
+                    }
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
                 .background(.bar)
                 Divider()
             }
-            if let source = selectedSource, sourceError == nil {
+            if usesPagedReader, let path = selectedPath {
+                if !loadingProject, acceptsSource(path, searchRow: sourceSearchRow, exactMatch: false) {
+#if FCB_APP_STORE
+                    if let access = rootAccess, access.url.path.utf8.elementsEqual(root.utf8) {
+                        AtlasPagedSourceView(root: root, path: path, accessLease: access)
+                            .id(focusRequest)
+                    } else {
+                        Text("Choose the project folder again to grant read access.")
+                    }
+#else
+                    AtlasPagedSourceView(root: root, path: path, accessLease: nil)
+                        .id(focusRequest)
+#endif
+                } else {
+                    Text("This source origin changed. Open the file again from the current project.")
+                }
+            } else if let source = selectedSource, sourceError == nil {
                 AtlasSourceReader(source: source, navigation: focusRequest,
                     selection: searchIsCurrent ? selectedReaderSelection : nil) {
                     if let document = atlasDocuments[source.path],
@@ -1053,6 +1100,24 @@ extension AtlasCamera {
         }
     }
 
+    /// Explicitly leave exact-hit/whole-source mode. The paged view owns a NEW
+    /// capture and never receives the old source's ranges or atlas identity.
+    private func openPagedFile(_ path: String) {
+        guard !loadingProject, selectedPath?.utf8.elementsEqual(path.utf8) == true,
+              acceptsSource(path, searchRow: sourceSearchRow, exactMatch: false) else { return }
+        cancelSourceLoad()
+        selectedHit = nil
+        selectedMatch = nil
+        selectedReaderSelection = nil
+        selectedSource = nil
+        sourceError = nil
+        fileText = ""
+        usesPagedReader = true
+        showsReader = true
+        focusRequest = UUID()
+        status = "Opening a new retained capture for byte and line navigation. No search-match coordinates are used."
+    }
+
     private func openSearchFile(_ row: AtlasSearchRowID) {
         guard !loadingProject,
               let path = searchPresentation?.filePath(for: row, in: searchContext) else {
@@ -1086,6 +1151,7 @@ extension AtlasCamera {
     private func openFile(_ path: String, searchRow: AtlasSearchRowID? = nil, exactMatch: Bool = false) {
         guard acceptsSource(path, searchRow: searchRow, exactMatch: exactMatch) else { return }
         cancelSourceLoad()
+        usesPagedReader = false
         sourceSearchRow = searchRow
         selectedMatch = nil
         selectedReaderSelection = nil
@@ -1098,6 +1164,15 @@ extension AtlasCamera {
         // Such a document cannot lend this request its source or capture proof.
         if let source = atlasDocuments[path]?.source, source.path.utf8.elementsEqual(path.utf8) {
             presentSource(source, searchRow: searchRow, exactMatch: exactMatch)
+            return
+        }
+
+        // File-only activation can use decoded pages, including UTF-16/NUL,
+        // without inventing an exact search location in a different capture.
+        if !exactMatch {
+            usesPagedReader = true
+            showsReader = true
+            status = "Opening retained source pages without search-match navigation."
             return
         }
 

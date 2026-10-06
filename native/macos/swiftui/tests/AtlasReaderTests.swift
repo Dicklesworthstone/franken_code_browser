@@ -2,7 +2,8 @@
 // models, cancellation primitive and AtlasProjectIO; no Apple UI or C bridge.
 // swiftc -swift-version 6 -warnings-as-errors AtlasSearch.swift \
 //   AtlasSearchCoordinator.swift AtlasProjectIO.swift AtlasReader.swift \
-//   AtlasReaderCoordinator.swift tests/AtlasReaderTests.swift -o /tmp/fcb-reader-tests
+//   AtlasReaderCoordinator.swift AtlasSource.swift AtlasPagedReaderModel.swift \
+//   tests/AtlasReaderTests.swift -o /tmp/fcb-reader-tests
 import Foundation
 import Dispatch
 
@@ -86,6 +87,10 @@ private final class Driver: @unchecked Sendable {
         }, lines: { [self] owner, first, _, _ in
             precondition(!Thread.isMainThread)
             record("lines:\(owner):\(first)")
+            if first == 999 {
+                return json(["schema": "fcb.reader-session/1", "owner": String(owner), "status": "error",
+                             "error": ["code": "READER_SESSION_MISSING_LINE"]])
+            }
             return json(window(owner: owner, start: 5, end: 9, command: "lines", first: first))
         }, cancel: { [self] owner in record("cancel:\(owner)"); return true }, close: { [self] owner in
             lock.lock(); defer { lock.unlock() }
@@ -272,6 +277,58 @@ private final class Driver: @unchecked Sendable {
             wait("closed capture did not drain") { stopped && driver.snapshot.closed == 1 && weakLease == nil }
             check(!driver.snapshot.calls.contains("window:2:0"), "canceled open continued into source presentation")
             check(driver.snapshot.attempts == 3 && !driver.snapshot.closeOnMain, "close contention/lane handling")
+        }
+
+        // The actual observable presentation model commits history only after
+        // accepted navigation, preserves pages on errors, and clears on close.
+        do {
+            let driver = Driver()
+            let model = AtlasPagedReaderModel(transport: driver.transport)
+            model.open(root: "/project", path: "file", accessLease: nil)
+            wait("model failed to open") { !model.busy && model.page != nil }
+            check(model.source?.text == "zero\none\ntwo\n" && !model.canGoBack, "initial model source")
+            model.lineInput = "2"; model.goToLine()
+            wait("model line navigation") { !model.busy && model.page?.firstPhysicalLine == 2 }
+            let accepted = model.source
+            check(model.canGoBack && model.canGoNext, "line page navigation controls")
+            model.lineInput = "999"; model.goToLine()
+            wait("model missing-line refusal") { !model.busy }
+            check(model.source === accepted && model.page?.start == 5 && model.canGoBack,
+                  "failed line request replaced source/history")
+            check(model.notice.contains("READER_SESSION_MISSING_LINE"), "missing-line error hidden")
+            model.next()
+            wait("model next") { !model.busy && model.page?.start == 9 }
+            check(model.source?.text == "two\n" && !model.canGoNext, "EOF page")
+            model.back()
+            wait("model back to physical lines") { !model.busy && model.page?.firstPhysicalLine == 2 }
+            check(model.page?.end == 9, "Back widened the previous line request into a byte window")
+            model.back()
+            wait("model back to beginning") { !model.busy && model.page?.start == 0 }
+            check(!model.canGoBack, "failed request polluted navigation history")
+            let original = model.source
+            model.offsetInput = "18446744073709551615"; model.goToByte()
+            check(model.source === original && !model.busy, "wide invalid offset revoked source")
+            model.close()
+            check(model.page == nil && model.source == nil && !model.canGoBack, "close retained visible source")
+            wait("model handle did not retire") { driver.snapshot.closed == 1 }
+        }
+
+        // Window/view revocation is synchronous even while native work remains
+        // active. A later completion cannot reinstall closed-reader content.
+        do {
+            let driver = Driver()
+            let model = AtlasPagedReaderModel(transport: driver.transport)
+            model.open(root: "/project", path: "file", accessLease: nil)
+            wait("model revocation open") { !model.busy && model.page != nil }
+            driver.blockWindow()
+            model.offsetInput = "5"; model.goToByte()
+            wait("model active page") { driver.entered.wait(timeout: .now()) == .success }
+            model.close()
+            check(model.page == nil && model.source == nil && !model.busy, "old page visible after revocation")
+            driver.gate.signal()
+            wait("model revoked work did not drain") { driver.snapshot.closed == 1 }
+            pump()
+            check(model.page == nil && model.source == nil, "stale page republished after close")
         }
         print("PASS: \(assertions) retained-reader decoder, paging, cancellation and lifetime checks")
     }
