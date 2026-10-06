@@ -225,7 +225,7 @@ extension AtlasCamera {
     @State private var searchReport: AtlasSearchReport?
     @State private var searchPresentation: AtlasSearchPresentation?
     @State private var searchPending = false
-    // Created only on explicit submission, not on every SwiftUI view rebuild.
+    // Created on the first search request, not on every SwiftUI view rebuild.
     @State private var searchCoordinator: AtlasSearchCoordinator?
     @State private var resolvedMatches: [SearchHit.ID: AtlasMatch] = [:]
     @State private var searchRows: [CGRect] = []
@@ -310,6 +310,18 @@ extension AtlasCamera {
             }
             .disabled(selectedPath == nil)
             .help("Show or hide the selectable source reader")
+            Button { moveSearchResult(backwards: true) } label: {
+                Label("Previous Match", systemImage: "arrow.up")
+            }
+            .keyboardShortcut("g", modifiers: [.command, .shift])
+            .disabled(!searchIsCurrent || hits.isEmpty)
+            .help("Previous search match (⇧⌘G)")
+            Button { moveSearchResult(backwards: false) } label: {
+                Label("Next Match", systemImage: "arrow.down")
+            }
+            .keyboardShortcut("g", modifiers: .command)
+            .disabled(!searchIsCurrent || hits.isEmpty)
+            .help("Next search match (⌘G)")
         }
         .onAppear {
 #if FCB_APP_STORE
@@ -331,7 +343,11 @@ extension AtlasCamera {
             clearSearch()
             searchCoordinator = nil
         }
-        .onChange(of: Array(query.utf8)) { _, _ in clearSearch() }
+        .onChange(of: Array(query.utf8)) { _, _ in
+            // Revoke old rows immediately, including empty or invalid edits.
+            clearSearch()
+            runSearch(debounce: true)
+        }
         .onChange(of: Array(customExtensions.utf8)) { _, _ in
             if fileScope == .custom { clearSearch() }
         }
@@ -859,6 +875,10 @@ extension AtlasCamera {
             status = "\(atlasFiles.count) files laid out. Scroll to zoom, drag to pan, click a file. Source loaded for \(atlasDocuments.count) files."
         }
         if fileScope != .all { applyFileScope() }
+        // A query edited during loading, or kept while switching projects,
+        // belongs to this successful capture, never to a canceled/failed load.
+        loadingProject = false
+        if !query.isEmpty { runSearch(debounce: true) }
     }
 
     private static func captureRank(_ path: String) -> Int {
@@ -887,6 +907,7 @@ extension AtlasCamera {
         displayedFiles = scoped
         atlasRevision = UUID()
         status = "\(scoped.count) of \(files.count) files · \(fileScope.rawValue). Search still covers the workspace."
+        if !loadingProject && !query.isEmpty { runSearch(debounce: true) }
     }
 
     private func clearSearch() {
@@ -950,7 +971,9 @@ extension AtlasCamera {
         overlayLimited = limited
     }
 
-    private func runSearch() {
+    private func runSearch() { runSearch(debounce: false) }
+
+    private func runSearch(debounce: Bool) {
         let requestedText = query
         let requestedRoot = root
         guard !loadingProject, !requestedText.isEmpty, !requestedRoot.isEmpty else { return }
@@ -976,7 +999,7 @@ extension AtlasCamera {
             status = searchSummary
             let coordinator = searchCoordinator ?? AtlasSearchCoordinator(work: AtlasNativeSearch.run)
             searchCoordinator = coordinator
-            try coordinator.submit(input: input, accessLease: accessLease) { result in
+            try coordinator.submit(input: input, accessLease: accessLease, debounce: debounce) { result in
                 // Generation rejection happens in the coordinator. These checks
                 // also cover SwiftUI state changes before onChange has run.
                 guard !loadingProject, requestedContext.matches(searchContext) else { return }
@@ -1010,6 +1033,24 @@ extension AtlasCamera {
         searchTitle = "Search canceled"
         searchSummary = AtlasSearchError.canceled.message
         status = searchSummary
+    }
+
+    private func moveSearchResult(backwards: Bool) {
+        guard !loadingProject, let presentation = searchPresentation,
+              let row = presentation.adjacentRow(in: hits.map(\.id), after: selectedHit,
+                  backwards: backwards, context: searchContext),
+              let path = presentation.captureCandidate(for: row, in: searchContext)?.sourcePath else {
+            status = "No navigable matches in the current search and file filter."
+            return
+        }
+        showsReader = true
+        if selectedHit == row {
+            // A single remaining match still responds to explicit navigation.
+            openFile(path, searchRow: row, exactMatch: true)
+        } else {
+            // The same guarded activation path as a clicked result row.
+            selectedHit = row
+        }
     }
 
     private func openSearchFile(_ row: AtlasSearchRowID) {

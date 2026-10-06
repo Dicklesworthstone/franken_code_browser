@@ -243,8 +243,31 @@ struct AtlasSearchPresentation: Sendable {
     /// Return the immutable witness for a current row. This does NOT establish
     /// that currently available source bytes agree with the search capture.
     func captureCandidate(for row: AtlasSearchRowID, in current: AtlasSearchContext) -> SearchHit? {
-        guard row.report == id, isCurrent(in: current), let hit = hits[row.hit],
-              hit.sourcePath != nil, let digest = hit.captureSHA256,
+        guard row.report == id, isCurrent(in: current) else { return nil }
+        return capturedHit(row.hit)
+    }
+
+    /// Next/previous exact-navigation candidate in the caller's visible order.
+    /// Filtered-out, unavailable and ambiguous rows are never activated. A row
+    /// from another report does not lend its integer ID to the new selection.
+    /// This only chooses a witness; opening still verifies the source capture.
+    func adjacentRow(in orderedHitIDs: [SearchHit.ID], after currentRow: AtlasSearchRowID?,
+                     backwards: Bool, context current: AtlasSearchContext) -> AtlasSearchRowID? {
+        guard isCurrent(in: current), !orderedHitIDs.isEmpty else { return nil }
+        let selectedIndex = currentRow.flatMap { row in
+            row.report == id ? orderedHitIDs.firstIndex(of: row.hit) : nil
+        }
+        var index = selectedIndex ?? (backwards ? 0 : orderedHitIDs.count - 1)
+        for _ in orderedHitIDs.indices {
+            if backwards { index = index == 0 ? orderedHitIDs.count - 1 : index - 1 }
+            else { index = index == orderedHitIDs.count - 1 ? 0 : index + 1 }
+            if capturedHit(orderedHitIDs[index]) != nil { return rowID(for: orderedHitIDs[index]) }
+        }
+        return nil
+    }
+
+    private func capturedHit(_ hitID: SearchHit.ID) -> SearchHit? {
+        guard let hit = hits[hitID], hit.sourcePath != nil, let digest = hit.captureSHA256,
               digest.utf8.count == 64,
               digest.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
               let count = hit.captureByteLength, hit.start < hit.end, hit.end <= count else { return nil }
