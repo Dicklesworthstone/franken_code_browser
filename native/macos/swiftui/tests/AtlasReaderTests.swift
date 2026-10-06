@@ -1,7 +1,7 @@
 // Portable production decoder/coordinator tests. Link the existing search
 // models, cancellation primitive and AtlasProjectIO; no Apple UI or C bridge.
 // swiftc -swift-version 6 -warnings-as-errors AtlasSearch.swift \
-//   AtlasSearchCoordinator.swift AtlasProjectIO.swift AtlasReader.swift AtlasReaderSearch.swift \
+//   AtlasSearchCoordinator.swift AtlasProjectIO.swift AtlasReader.swift AtlasReaderSearch.swift AtlasReaderOutline.swift \
 //   AtlasReaderCoordinator.swift AtlasSource.swift AtlasPagedReaderModel.swift \
 //   tests/AtlasReaderTests.swift -o /tmp/fcb-reader-tests
 import Foundation

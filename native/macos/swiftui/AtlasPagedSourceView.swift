@@ -9,13 +9,26 @@ import AppKit
     let root: String
     let path: String
     let accessLease: AnyObject?
-    @State private var model = AtlasPagedReaderModel(transport: .native, search: .native)
+    @State private var model = AtlasPagedReaderModel(transport: .native, search: .native, outline: .native)
     @State private var copyNotice = ""
+    @State private var showsOutline = false
 
     var body: some View {
         VStack(spacing: 4) {
             controls
             findControls
+            if let label = model.symbolSelectionLabel {
+                HStack {
+                    Text(label).font(.caption2).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Copy symbol hex") {
+                        guard let hex = model.symbolHex else { return }
+                        NSPasteboard.general.clearContents()
+                        copyNotice = NSPasteboard.general.setString(hex, forType: .string)
+                            ? "Copied the selected candidate's original bytes as hex." : "Clipboard write failed."
+                    }
+                }.padding(.horizontal, 10)
+            }
             if model.findIsCurrent, let report = model.findReport {
                 Text(report.summary).font(.caption2).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10)
@@ -94,10 +107,14 @@ import AppKit
                 .textFieldStyle(.roundedBorder).onSubmit(model.find)
                 .accessibilityLabel("Exact text to find in this retained file")
             Button("Find", action: model.find).disabled(!model.canFind || model.fileQuery.isEmpty)
+            Button("Outline") { showsOutline = true }
+                .disabled(!model.canBuildOutline)
+                .popover(isPresented: $showsOutline) { AtlasOutlineBrowser(model: model) }
             Button("Previous hit") { model.moveHit(backwards: true) }.disabled(!model.canMoveHit)
             Button("Next hit") { model.moveHit(backwards: false) }.disabled(!model.canMoveHit)
-            if let hex = model.matchHex {
+            if model.matchHex != nil {
                 Button("Copy hit hex") {
+                    guard let hex = model.matchHex else { return }
                     NSPasteboard.general.clearContents()
                     copyNotice = NSPasteboard.general.setString(hex, forType: .string)
                         ? "Copied the matched original bytes as hex." : "Clipboard write failed."
