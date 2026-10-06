@@ -65,6 +65,9 @@ private final class AtlasReaderSession: @unchecked Sendable {
     private let transport: AtlasReaderTransport
     private let searchTransport: AtlasReaderSearchTransport?
     private let outlineTransport: AtlasReaderOutlineTransport?
+    private let documentTransport: AtlasReaderDocumentTransport?
+    private let documentState = AtlasReaderDocumentState()
+    private var activeDocumentJob: AtlasReaderDocumentJob?
     private var outlineInventory: AtlasOutlineInventory?
     private var acceptedOutline: AtlasOutlinePage?
     private var lastOutlineGeneration: UInt64 = 0
@@ -77,13 +80,16 @@ private final class AtlasReaderSession: @unchecked Sendable {
     private var operation = UUID()
 
     init(transport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
-         outline: AtlasReaderOutlineTransport? = nil) {
+         outline: AtlasReaderOutlineTransport? = nil,
+         document: AtlasReaderDocumentTransport? = nil) {
         self.transport = transport
         self.searchTransport = search
         self.outlineTransport = outline
+        self.documentTransport = document
     }
     var supportsFind: Bool { searchTransport != nil }
     var supportsOutline: Bool { outlineTransport != nil }
+    var supportsDocument: Bool { documentTransport != nil }
 
     deinit {
         cancellation?.cancel()
@@ -265,6 +271,51 @@ private final class AtlasReaderSession: @unchecked Sendable {
         }
     }
 
+    /// Document parsing, paging, provenance and copy share the retained source
+    /// handle and its bounded I/O lane. The optional capability stays inert for
+    /// source-only hosts. Admission precedes cancellation so invalid requests
+    /// cannot interrupt valid work or discard the currently accepted document.
+    func document(_ request: AtlasReaderDocumentRequest) async throws -> AtlasReaderDocumentResult {
+        guard let session, let info, let document = documentTransport else {
+            throw AtlasReaderError.unavailable
+        }
+        let job = try documentState.admit(request, info: info)
+        cancel()
+        activeDocumentJob = job
+        let ticket = UUID()
+        operation = ticket
+        let flag = AtlasSearchCancellation()
+        cancellation = flag
+        do {
+            let result = try await io.perform(cancellation: flag, keepingAlive: [session]) {
+                try job.execute(document)
+            }
+            guard self.session === session, operation == ticket, !flag.isCanceled else {
+                throw AtlasReaderError.canceled
+            }
+            // A reflow, replacement, or independently revoked page cannot lend
+            // its authority to a delayed source/copy/heading response.
+            try documentState.accept(result, job: job)
+            activeDocumentJob = nil
+            cancellation = nil
+            return result
+        } catch {
+            documentState.abandon(job)
+            if self.session === session, operation == ticket {
+                activeDocumentJob = nil
+                cancellation = nil
+            }
+            throw Self.readerError(error)
+        }
+    }
+
+    /// Retire preview authority synchronously before scheduling a reflow. This
+    /// never resets the document generation or borrows search/outline authority.
+    func revokeDocument() {
+        if activeDocumentJob != nil { cancel() }
+        documentState.revoke()
+    }
+
     /// Revoke native rows, not source/search state or the bounded Rust index.
     func revokeOutlinePage() { acceptedOutline = nil }
     func resetOutline() { acceptedOutline = nil; outlineInventory = nil }
@@ -275,6 +326,8 @@ private final class AtlasReaderSession: @unchecked Sendable {
     func clearFind() { acceptedFind = nil }
 
     func cancel() {
+        if let job = activeDocumentJob { documentState.abandon(job) }
+        activeDocumentJob = nil
         operation = UUID()
         cancellation?.cancel()
         cancellation = nil
@@ -289,6 +342,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
         lastFindGeneration = 0
         resetOutline()
         lastOutlineGeneration = 0
+        documentState.close()
         session = nil
     }
 
