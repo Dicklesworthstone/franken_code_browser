@@ -47,10 +47,11 @@ enum AtlasReaderRequest: Equatable, Sendable {
     case window(offset: UInt64, bytes: UInt64)
     case lines(first: UInt64, count: UInt64, bytes: UInt64)
     case hit(AtlasReaderHitTarget)
+    case symbol(AtlasOutlineTarget)
 
     static var firstPage: Self { .window(offset: 0, bytes: AtlasReaderLimits.pageBytes) }
-    var command: String { switch self { case .window: return "window"; case .lines: return "lines"; case .hit: return "hit" } }
-    var byteLimit: UInt64 { switch self { case .window(_, let bytes), .lines(_, _, let bytes): return bytes; case .hit: return AtlasReaderLimits.maximumPageBytes } }
+    var command: String { switch self { case .window: return "window"; case .lines: return "lines"; case .hit: return "hit"; case .symbol: return "symbol" } }
+    var byteLimit: UInt64 { switch self { case .window(_, let bytes), .lines(_, _, let bytes): return bytes; case .hit, .symbol: return AtlasReaderLimits.maximumPageBytes } }
 
     func validate(capturedBytes: UInt64) throws {
         guard (4...AtlasReaderLimits.maximumPageBytes).contains(byteLimit) else {
@@ -67,6 +68,15 @@ enum AtlasReaderRequest: Equatable, Sendable {
                   target.start < target.end, target.end <= capturedBytes,
                   target.end - target.start <= 2048,
                   AtlasReaderWire.validHex(target.originalHex, bytes: target.end - target.start) else {
+                throw AtlasReaderError.invalidInput
+            }
+        case .symbol(let target):
+            let selected = target.symbol.selectedRange
+            guard target.generation > 0, target.symbol.id > 0,
+                  target.symbol.id <= AtlasOutlinePage.maxItems,
+                  target.identity.capturedBytes == capturedBytes,
+                  selected.start < selected.end, selected.end <= capturedBytes,
+                  selected.length <= AtlasOutlinePage.sourceLimit else {
                 throw AtlasReaderError.invalidInput
             }
         }
@@ -133,6 +143,7 @@ struct AtlasReaderPage: Sendable {
     let boundariesAdjusted: Bool
     let hasReplacements: Bool
     let selection: AtlasReaderHitSelection?
+    let symbolSelection: AtlasReaderSymbolSelection?
     var nextOffset: UInt64? { end < identity.capturedBytes ? end : nil }
 
     static func decode(_ json: String?, info: AtlasReaderInfo, request: AtlasReaderRequest) throws -> Self {
@@ -174,6 +185,7 @@ struct AtlasReaderPage: Sendable {
                 return value
             }
             var selection: AtlasReaderHitSelection?
+            var symbolSelection: AtlasReaderSymbolSelection?
             switch request {
             case .window(let offset, let bytes):
                 guard wire.selection == nil, firstLine == nil, requested.start == offset,
@@ -188,9 +200,11 @@ struct AtlasReaderPage: Sendable {
                       requested.start == target.start - min(padding, target.start),
                       requested.end == target.end + min(padding, identity.capturedBytes - target.end),
                       let selected = wire.selection,
-                      AtlasReaderWire.integer(selected.query_generation) == target.generation,
+                      selected.query_generation.flatMap(AtlasReaderWire.integer) == target.generation,
                       selected.selection_namespace == nil, selected.outline_generation == nil,
-                      selected.document_generation == nil else { throw AtlasReaderError.invalidResponse }
+                      selected.document_generation == nil, selected.symbol_id == nil,
+                      selected.declaration_line == nil, selected.evidence_level == nil,
+                      selected.semantic_resolution == nil else { throw AtlasReaderError.invalidResponse }
                 let raw = try selected.original_range.values()
                 let utf8 = try selected.window_utf8_range.values()
                 guard raw.start == target.start, raw.end == target.end,
@@ -208,11 +222,41 @@ struct AtlasReaderPage: Sendable {
                     throw AtlasReaderError.invalidResponse
                 }
                 selection = AtlasReaderHitSelection(target: target, utf8Start: utf8.start, utf8End: utf8.end)
+            case .symbol(let target):
+                let expected = target.symbol.selectedRange
+                let padding = AtlasOutlineTarget.contextBytes + 4
+                guard target.identity.matches(identity), firstLine == nil, !wire.range_limited,
+                      requested.start == expected.start - min(padding, expected.start),
+                      requested.end == expected.end + min(padding, identity.capturedBytes - expected.end),
+                      let selected = wire.selection, selected.query_generation == nil,
+                      selected.document_generation == nil, selected.selection_namespace == "outline",
+                      selected.outline_generation.flatMap(AtlasReaderWire.integer) == target.generation,
+                      selected.symbol_id.flatMap(AtlasReaderWire.integer) == target.symbol.id,
+                      selected.declaration_line.flatMap(AtlasReaderWire.integer) == target.symbol.line,
+                      selected.evidence_level == "heuristic-outline-candidate",
+                      selected.semantic_resolution == false else { throw AtlasReaderError.invalidResponse }
+                let raw = try selected.original_range.admit(length: identity.capturedBytes)
+                let utf8 = try selected.window_utf8_range.admit(length: UInt64(wire.text.utf8.count))
+                guard raw == expected, raw.start >= visible.start, raw.end <= visible.end,
+                      AtlasReaderWire.validHex(selected.original_hex, bytes: raw.length) else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                let sourceHex = Array(wire.original_hex.utf8)
+                let hexStart = Int((raw.start - visible.start) * 2)
+                let hexEnd = Int((raw.end - visible.start) * 2)
+                let decoded = Array(wire.text.utf8)[Int(utf8.start)..<Int(utf8.end)]
+                guard sourceHex[hexStart..<hexEnd].elementsEqual(selected.original_hex.utf8),
+                      String(bytes: decoded, encoding: .utf8) != nil,
+                      target.symbol.nameRange == nil || decoded.elementsEqual(target.symbol.name.utf8) else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                symbolSelection = AtlasReaderSymbolSelection(target: target, utf8Start: utf8.start,
+                    utf8End: utf8.end, originalHex: selected.original_hex)
             }
             return Self(identity: identity, start: visible.start, end: visible.end,
                 text: wire.text, originalHex: wire.original_hex, firstPhysicalLine: firstLine,
                 rangeLimited: wire.range_limited, boundariesAdjusted: wire.boundaries_adjusted,
-                hasReplacements: wire.has_replacements, selection: selection)
+                hasReplacements: wire.has_replacements, selection: selection, symbolSelection: symbolSelection)
         } catch let error as AtlasReaderError { throw error }
         catch { throw AtlasReaderError.invalidResponse }
     }
@@ -223,13 +267,16 @@ struct AtlasReaderPage: Sendable {
         let requested_original_range, visible_range: AtlasReaderWire.Range
         let range_limited, boundaries_adjusted, has_replacements: Bool
         let first_physical_line, next_offset: String?
-        // Only a matching accepted hit request admits a search selection.
-        // Byte/line pages and other selection namespaces cannot borrow it.
+        // A matching accepted search or outline request admits its own namespace.
+        // Byte/line pages cannot borrow either selection authority.
         let selection: Selection?
         struct Selection: Decodable {
-            let query_generation, original_hex: String
+            let original_hex: String
+            let query_generation: String?
             let original_range, window_utf8_range: AtlasReaderWire.Range
             let selection_namespace, outline_generation, document_generation: String?
+            let symbol_id, declaration_line, evidence_level: String?
+            let semantic_resolution: Bool?
         }
         enum CodingKeys: CodingKey {
             case text_kind, text, original_hex, requested_original_range, visible_range,
