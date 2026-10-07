@@ -60,9 +60,50 @@ private final class AtlasSearchDebounceTimer: @unchecked Sendable {
     deinit { source.cancel() }
 }
 
+/// One latest immutable progress report and at most one queued main callback.
+/// A slow main thread cannot accumulate a report-sized DispatchQueue backlog.
+/// Closing on the worker retires pending progress before terminal delivery.
+private final class AtlasSearchProgressMailbox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var latest: AtlasSearchReport?
+    private var scheduled = false
+    private var closed = false
+    private let deliver: @MainActor (AtlasSearchReport) -> Void
+
+    init(deliver: @escaping @MainActor (AtlasSearchReport) -> Void) { self.deliver = deliver }
+
+    func offer(_ report: AtlasSearchReport) {
+        guard report.isInProgress else { return }
+        lock.lock()
+        guard !closed else { lock.unlock(); return }
+        latest = report
+        let enqueue = !scheduled
+        scheduled = true
+        lock.unlock()
+        if enqueue { DispatchQueue.main.async { self.drain() } }
+    }
+
+    func close() {
+        lock.lock()
+        closed = true
+        latest = nil
+        lock.unlock()
+    }
+
+    @MainActor private func drain() {
+        lock.lock()
+        let report = closed ? nil : latest
+        latest = nil
+        scheduled = false
+        lock.unlock()
+        // Never call client code under the lock: delivery can cancel or replace.
+        if let report { deliver(report) }
+    }
+}
+
 /// Native-host scheduling of the existing synchronous Rust search call. This
 /// is not another search engine or Rust executor. State is confined to the main
-/// actor; the only cross-thread mutation is the locked cancellation flag.
+/// actor; cancellation and the single-slot progress mailbox are independently locked.
 ///
 /// At most ONE bridge call is in flight and ONE newest request is waiting. A
 /// cancel invalidates delivery immediately but keeps the active slot and its
@@ -72,17 +113,21 @@ private final class AtlasSearchDebounceTimer: @unchecked Sendable {
 /// period expires. Explicit submission bypasses that delay.
 @MainActor final class AtlasSearchCoordinator {
     typealias Work = @Sendable (String, String, AtlasSearchCancellation) throws -> AtlasSearchReport
+    typealias ProgressiveWork = @Sendable (String, String, AtlasSearchCancellation, @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport
     typealias Completion = @MainActor (Result<AtlasSearchReport, AtlasSearchError>) -> Void
 
     private let worker = DispatchQueue(label: "dev.frankencode.browser.search", qos: .userInitiated)
-    private let work: Work
+    private let work: ProgressiveWork
     private var active: AtlasSearchRequest?
     private var pending: AtlasSearchRequest?
     private var latest: UInt64?
     private var lastGeneration: UInt64 = 0
     private var debounceTimer: AtlasSearchDebounceTimer?
 
-    init(work: @escaping Work) { self.work = work }
+    init(work: @escaping Work) {
+        self.work = { root, query, cancellation, _ in try work(root, query, cancellation) }
+    }
+    init(progressiveWork: @escaping ProgressiveWork) { self.work = progressiveWork }
 
     deinit {
         // The worker retains its own Request, not this coordinator. Destruction
@@ -152,20 +197,27 @@ private final class AtlasSearchDebounceTimer: @unchecked Sendable {
         precondition(Thread.isMainThread && active == nil)
         active = request
         let work = self.work
+        let mailbox = AtlasSearchProgressMailbox { [weak self, weak request] report in
+            guard let self, let request, self.active === request,
+                  self.latest == request.generation, !request.cancellation.isCanceled else { return }
+            request.completion(.success(report))
+        }
         worker.async { [weak self, request] in
             let result: Result<AtlasSearchReport, AtlasSearchError>
             do {
                 if request.cancellation.isCanceled { throw AtlasSearchError.canceled }
                 let report = try withExtendedLifetime(request.accessLease) {
-                    try work(request.root, request.query, request.cancellation)
+                    try work(request.root, request.query, request.cancellation, mailbox.offer)
                 }
                 if request.cancellation.isCanceled { throw AtlasSearchError.canceled }
+                guard !report.isInProgress else { throw AtlasSearchError.invalidResponse }
                 result = .success(report)
             } catch let error as AtlasSearchError {
                 result = .failure(error)
             } catch {
                 result = .failure(.unavailable)
             }
+            mailbox.close()
             DispatchQueue.main.async { [weak self, request] in
                 self?.finish(request, result: result)
             }

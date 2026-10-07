@@ -26,6 +26,13 @@ enum AtlasSearchError: Error, Sendable {
     }
 }
 
+/// Progress is separate from completeness: a terminal query may be partial.
+struct AtlasSearchProgress: Sendable {
+    let isRunning: Bool
+    let examinedFiles: Int
+    let cataloguedFiles: Int
+}
+
 /// Adapts the shared engine's search envelope, without another search engine.
 struct AtlasSearchReport: Sendable {
     let hits: [SearchHit]
@@ -34,9 +41,16 @@ struct AtlasSearchReport: Sendable {
     let unavailableFiles: Int
     let unsupportedFiles: Int
     let matchesSeen: UInt64
+    var progress: AtlasSearchProgress? = nil
+    /// One identity for an append-only stream; legacy one-shot reports use nil.
+    var streamID: UUID? = nil
+    var isInProgress: Bool { progress?.isRunning == true }
 
     var summary: String {
         let count = hits.count
+        if let progress, progress.isRunning {
+            return "Searching: \(count) exact matches found; \(progress.examinedFiles) of \(progress.cataloguedFiles) catalogued files examined. Results are provisional."
+        }
         if complete {
             return count == 0 ? "No exact matches in the captured project."
                 : "\(count) exact match\(count == 1 ? "" : "es") in the captured project."
@@ -204,12 +218,13 @@ enum AtlasSearchHitAvailability: Sendable {
 /// A capture candidate authorizes verification, not an exact jump. AtlasMatch
 /// must still verify the installed source, independently of overlay geometry.
 struct AtlasSearchPresentation: Sendable {
-    let id = UUID()
+    let id: UUID
     private let context: AtlasSearchContext
     private let hits: [SearchHit.ID: SearchHit]
     private let verifiedHitIDs: Set<SearchHit.ID>
 
-    init(context: AtlasSearchContext, hits: [SearchHit], verifiedHitIDs: Set<SearchHit.ID>) {
+    init(context: AtlasSearchContext, hits: [SearchHit], verifiedHitIDs: Set<SearchHit.ID>, id: UUID = UUID()) {
+        self.id = id
         self.context = context
         // The decoder emits unique indices. Fail closed rather than trapping
         // or choosing one witness if another producer supplies duplicate IDs.
