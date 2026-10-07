@@ -30,15 +30,17 @@ private final class AtlasSearchRequest: @unchecked Sendable {
     let notBefore: DispatchTime
     let cancellation = AtlasSearchCancellation()
     let accessLease: AnyObject?
+    let work: AtlasSearchCoordinator.CapturedWork?
     let completion: @MainActor (Result<AtlasSearchReport, AtlasSearchError>) -> Void
 
     init(generation: UInt64, root: String, query: String, notBefore: DispatchTime,
-         accessLease: AnyObject?, completion: @escaping @MainActor (Result<AtlasSearchReport, AtlasSearchError>) -> Void) {
+         accessLease: AnyObject?, work: AtlasSearchCoordinator.CapturedWork?, completion: @escaping @MainActor (Result<AtlasSearchReport, AtlasSearchError>) -> Void) {
         self.generation = generation
         self.root = root
         self.query = query
         self.notBefore = notBefore
         self.accessLease = accessLease
+        self.work = work
         self.completion = completion
     }
 }
@@ -149,21 +151,21 @@ private final class AtlasSearchProgressMailbox: @unchecked Sendable {
     /// Validation/exhaustion fails before disturbing accepted or active work.
     @discardableResult
     func submit(root: String, query: String, accessLease: AnyObject? = nil,
-                debounce: Bool = false, completion: @escaping Completion) throws -> UInt64 {
+                debounce: Bool = false, using work: CapturedWork? = nil, completion: @escaping Completion) throws -> UInt64 {
         try submit(input: AtlasSearchInput(root: root, query: query),
-            accessLease: accessLease, debounce: debounce, completion: completion)
+            accessLease: accessLease, debounce: debounce, using: work, completion: completion)
     }
 
     @discardableResult
     func submit(input: AtlasSearchInput, accessLease: AnyObject? = nil,
-                debounce: Bool = false, completion: @escaping Completion) throws -> UInt64 {
+                debounce: Bool = false, using work: CapturedWork? = nil, completion: @escaping Completion) throws -> UInt64 {
         precondition(Thread.isMainThread)
         let (generation, exhausted) = lastGeneration.addingReportingOverflow(1)
         guard !exhausted else { throw AtlasSearchError.identityExhausted }
         lastGeneration = generation
         let deadline = debounce ? DispatchTime.now() + .milliseconds(150) : DispatchTime.now()
         let request = AtlasSearchRequest(generation: generation, root: input.root, query: input.query,
-                              notBefore: deadline, accessLease: accessLease, completion: completion)
+                              notBefore: deadline, accessLease: accessLease, work: work, completion: completion)
         latest = generation
         active?.cancellation.cancel()
         pending?.cancellation.cancel()
@@ -202,7 +204,7 @@ private final class AtlasSearchProgressMailbox: @unchecked Sendable {
     private func start(_ request: AtlasSearchRequest) {
         precondition(Thread.isMainThread && active == nil)
         active = request
-        let work = self.work
+        let work = request.work ?? self.work
         let mailbox = AtlasSearchProgressMailbox { [weak self, weak request] report in
             guard let self, let request, self.active === request,
                   self.latest == request.generation, !request.cancellation.isCanceled else { return }

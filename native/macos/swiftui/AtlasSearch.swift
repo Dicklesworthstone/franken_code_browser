@@ -46,9 +46,16 @@ struct AtlasSearchReport: Sendable {
     var streamID: UUID? = nil
     /// Optional immutable-source capability; legacy one-shot reports have none.
     var capture: AtlasSearchCapture? = nil
+    var indexStatus: AtlasSearchIndexStatus? = nil
     var isInProgress: Bool { progress?.isRunning == true }
 
     var summary: String {
+        if indexStatus?.building == true, let progress {
+            return "Preparing captured index: \(progress.examinedFiles) of \(progress.cataloguedFiles) catalogued files examined. Query results are not ready yet."
+        }
+        return resultSummary + (indexStatus == nil ? "" : " Captured index; Refresh to include file edits.")
+    }
+    private var resultSummary: String {
         let count = hits.count
         if let progress, progress.isRunning {
             return "Searching: \(count) exact matches found; \(progress.examinedFiles) of \(progress.cataloguedFiles) catalogued files examined. Results are provisional."
@@ -334,4 +341,17 @@ struct AtlasSearchCapturedHit: Sendable {
 struct AtlasSearchCapture: Sendable {
     let retainAccess: @Sendable (AtlasSearchAccessLease) -> Void
     let target: @Sendable (SearchHit) -> AtlasSearchCapturedHit?
+}
+
+/// Index construction and query verification are distinct work. In captured
+/// mode the source universe is frozen until explicit refresh, never silently
+/// presented as a fresh observation of the working tree.
+struct AtlasSearchIndexStatus: Sendable {
+    let building: Bool
+    let reused: Bool
+    let capturedFiles: Int
+    let capturedBytes: UInt64
+    let skippedFiles: Int
+    let verifiedFiles: Int
+    let verificationBytes: UInt64
 }
