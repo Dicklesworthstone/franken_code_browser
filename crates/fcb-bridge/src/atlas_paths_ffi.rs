@@ -63,6 +63,30 @@ pub extern "C" fn fcb_atlas_file_clear(handle: u64, generation: u64) -> *mut c_c
     reply(|| answer(handle, |atlases| atlases.execute_paths(handle, PathCommand::Clear { generation }, || false)))
 }
 
+/// The same retained path query with cooperative cancellation during key
+/// preparation and ranking. Null means cancellation/refusal, never zero matches.
+/// # Safety
+/// query is null or NUL-terminated UTF-8 stable until return. poll/context must
+/// remain valid until return; poll must be nonblocking, not unwind or reenter
+/// this session. No callback escapes the call. Free non-null responses exactly
+/// once with fcb_free_string. Caller retains the root grant until return.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_find_files_cancelable(handle: u64, generation: u64,
+    query: *const c_char, max_results: u64, mode: u8, case_mode: u8,
+    poll: Option<crate::search_ffi::SearchCancellationCallback>, context: *mut std::ffi::c_void) -> *mut c_char {
+    reply(|| {
+        let canceled = || poll.is_some_and(|poll| unsafe { poll(context) != 0 });
+        if canceled() { return None; }
+        let needle = unsafe { cstr(query) }?;
+        if needle.is_empty() || needle.len() > MAX_ATLAS_PATH_QUERY { return None; }
+        let response = super::ATLASES.get()?.execute_paths(handle, PathCommand::Find {
+            generation, needle: needle.as_bytes(), options: options(max_results, mode, case_mode).ok()?,
+        }, canceled).ok()?;
+        if canceled() { return None; }
+        crate::string_out(response.as_str())
+    })
+}
+
 #[cfg(test)]
 #[path = "atlas_paths_ffi_tests.rs"]
 mod tests;

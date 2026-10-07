@@ -36,6 +36,16 @@ extern "C" {
 char *fcb_atlas_find_files(uint64_t handle, uint64_t generation, const char *query,
     uint64_t max_results, uint8_t mode, uint8_t case_mode);
 
+/* Same query with cooperative polling during key preparation and ranking.
+ * poll/context remain valid until return; poll must not block, unwind or reenter
+ * this session. No callback is retained. Nonzero cancels; NULL poll continues.
+ * Keep native root grants alive until return. Null result means cancellation
+ * or refusal, NOT an empty successful result. Free non-null results as above.
+ */
+char *fcb_atlas_find_files_cancelable(uint64_t handle, uint64_t generation, const char *query,
+    uint64_t max_results, uint8_t mode, uint8_t case_mode,
+    int32_t (*poll)(void *context), void *context);
+
 /* start is zero-based; limit 1..128. Use returned file_id, never row position,
  * for selection/activation. The selection object can name a still-matching file
  * pinned outside a replacement's top-k. A nonmatching selection becomes null.

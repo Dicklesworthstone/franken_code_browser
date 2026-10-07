@@ -4,13 +4,15 @@ use super::*;
 #[test]
 fn file_finder_c_signatures_and_header_names_agree() {
     let _: unsafe extern "C" fn(u64, u64, *const c_char, u64, u8, u8) -> *mut c_char = fcb_atlas_find_files;
+    let _: unsafe extern "C" fn(u64, u64, *const c_char, u64, u8, u8,
+        Option<crate::search_ffi::SearchCancellationCallback>, *mut std::ffi::c_void) -> *mut c_char = fcb_atlas_find_files_cancelable;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_atlas_file_results;
     let _: extern "C" fn(u64, u64, u64) -> *mut c_char = fcb_atlas_file_select;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_atlas_file_focus;
     let _: extern "C" fn(u64, u64, u64, u64, u64) -> *mut c_char = fcb_atlas_file_open_reader;
     let _: extern "C" fn(u64, u64) -> *mut c_char = fcb_atlas_file_clear;
     let header = include_str!("../include/fcb_atlas_paths.h");
-    for name in ["fcb_atlas_find_files(", "fcb_atlas_file_results(", "fcb_atlas_file_select(",
+    for name in ["fcb_atlas_find_files(", "fcb_atlas_find_files_cancelable(", "fcb_atlas_file_results(", "fcb_atlas_file_select(",
         "fcb_atlas_file_focus(", "fcb_atlas_file_open_reader(", "fcb_atlas_file_clear("] {
         assert_eq!(header.matches(name).count(), 1, "{name}");
     }
@@ -40,5 +42,26 @@ fn unknown_handle_c_responses_are_owned_strings_and_never_source_grants() {
         let text = unsafe { CStr::from_ptr(pointer) }.to_str().unwrap();
         assert!(text.contains("\"status\":\"error\""), "{text}");
         unsafe { crate::fcb_free_string(pointer) };
+    }
+}
+
+#[test]
+fn cancelable_file_query_polls_before_inputs_and_refuses_unknown_handles() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    unsafe extern "C" fn cancel(context: *mut std::ffi::c_void) -> i32 {
+        let polls = unsafe { &*context.cast::<AtomicUsize>() };
+        polls.fetch_add(1, Ordering::Relaxed);
+        1
+    }
+    let polls = AtomicUsize::new(0);
+    let context = std::ptr::from_ref(&polls).cast_mut().cast();
+    let result = unsafe { fcb_atlas_find_files_cancelable(0, 1, std::ptr::null(),
+        100, 0, 0, Some(cancel), context) };
+    assert!(result.is_null());
+    assert_eq!(polls.load(Ordering::Relaxed), 1);
+    let query = std::ffi::CString::new("src").unwrap();
+    for (mode, case_mode) in [(0, 0), (3, 0), (0, 2)] {
+        assert!(unsafe { fcb_atlas_find_files_cancelable(0, 2, query.as_ptr(), 100,
+            mode, case_mode, None, std::ptr::null_mut()) }.is_null());
     }
 }
