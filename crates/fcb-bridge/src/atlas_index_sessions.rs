@@ -46,6 +46,33 @@ impl AtlasSessions {
         }
         result.map_err(AccessError::from)
     }
+
+    /// The same destination admission and atlas -> reader lock order as search
+    /// activation. Index/file/revision identify SOURCE, not a reusable query row.
+    pub(crate) fn open_index_reader(&self, handle: u64, readers: &ReaderSessions,
+        reader_handle: u64, index_generation: u64, file: u64, revision: u64,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        let cell = self.get(handle)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let mut state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        let session = state.as_mut().ok_or(AccessError::NotOpen)?;
+        session.synchronize(epoch);
+        let owner = ArenaOwnerId::new(handle).map_err(|_| AccessError::InvalidArgument)?;
+        let file = fcb_core::FileId::new(owner, file).map_err(|_| AccessError::InvalidArgument)?;
+        let revision = fcb_core::SourceRevision::new(owner, revision).map_err(|_| AccessError::InvalidArgument)?;
+        let mut stop = || cell.validate(epoch).is_err() || canceled();
+        let result = readers.initialize_prepared(reader_handle,
+            |reader_owner, reader_stop| session.search.open_index_reader(&session.atlas,
+                reader_owner, index_generation, file, revision, reader_stop).map_err(AccessError::from),
+            &mut stop);
+        if let Err(error) = cell.validate(epoch) {
+            session.search.cancel_pending();
+            session.search.cancel_index_build();
+            return Err(error);
+        }
+        result
+    }
 }
 
 #[cfg(all(test, unix))]

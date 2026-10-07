@@ -6,6 +6,8 @@
 
 #[path = "index_build.rs"]
 mod build;
+#[path = "index_source.rs"]
+mod source;
 pub use build::AtlasIndexBuildProgress;
 pub(super) use build::IndexBuildWork;
 

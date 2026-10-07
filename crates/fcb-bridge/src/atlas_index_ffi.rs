@@ -90,3 +90,6 @@ mod tests;
 #[cfg(test)]
 #[path = "atlas_index_build_ffi_tests.rs"]
 mod build_tests;
+
+#[path = "atlas_index_source_ffi.rs"]
+mod source;
