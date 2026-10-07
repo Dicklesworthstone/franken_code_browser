@@ -145,3 +145,45 @@ mod paths;
 #[cfg(all(test, unix))]
 #[path = "atlas_ffi_tests.rs"]
 mod tests;
+
+/// Discover through the same retained atlas service with cooperative polling.
+/// Null means cancellation, failed admission or another error, never an empty
+/// workspace. Close the handle on a worker even when this call returns null.
+/// # Safety
+/// root is null or readable NUL-terminated UTF-8 stable until return. poll and
+/// its context must remain valid until return; poll must not unwind or reenter
+/// this session. No callback is retained or invoked after return. A non-null
+/// response must be freed once by fcb_free_string. This cannot abort a syscall.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_open_cancelable(handle: u64, root: *const c_char,
+    max_files: u64, poll: Option<super::search_ffi::SearchCancellationCallback>,
+    context: *mut std::ffi::c_void) -> *mut c_char {
+    reply(|| {
+        let canceled = || poll.is_some_and(|poll| unsafe { poll(context) != 0 });
+        if canceled() { return None; }
+        let root = unsafe { cstr(root) }?;
+        let response = ATLASES.get()?.open(handle, Path::new(root),
+            AtlasSessionOptions { max_files: number(max_files).ok()?, ..Default::default() }, canceled).ok()?;
+        if canceled() { return None; }
+        string_out(response.as_str())
+    })
+}
+
+/// Advance the existing one-file search pipeline with cooperative polling.
+/// Cancellation is checked inside capture, verification, hashing and encoding,
+/// not only between native calls. Null is not a successful empty search page.
+/// # Safety
+/// poll/context follow fcb_atlas_open_cancelable's lifetime and non-reentrancy
+/// contract. The returned string must be freed once with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_search_step_cancelable(handle: u64, generation: u64,
+    poll: Option<super::search_ffi::SearchCancellationCallback>,
+    context: *mut std::ffi::c_void) -> *mut c_char {
+    reply(|| {
+        let canceled = || poll.is_some_and(|poll| unsafe { poll(context) != 0 });
+        if canceled() { return None; }
+        let response = ATLASES.get()?.execute(handle, Command::SearchStep { generation }, canceled).ok()?;
+        if canceled() { return None; }
+        string_out(response.as_str())
+    })
+}
