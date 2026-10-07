@@ -44,6 +44,8 @@ struct AtlasSearchReport: Sendable {
     var progress: AtlasSearchProgress? = nil
     /// One identity for an append-only stream; legacy one-shot reports use nil.
     var streamID: UUID? = nil
+    /// Optional immutable-source capability; legacy one-shot reports have none.
+    var capture: AtlasSearchCapture? = nil
     var isInProgress: Bool { progress?.isRunning == true }
 
     var summary: String {
@@ -315,4 +317,21 @@ enum AtlasFileScope: String, CaseIterable, Identifiable {
             return allowed.contains(ext)
         }
     }
+}
+
+/// Immutable grant reference, attached by the request owner before delivery.
+/// Retention confers no authority to paths outside that request's root.
+final class AtlasSearchAccessLease: @unchecked Sendable {
+    let reference: AnyObject?
+    init(_ reference: AnyObject?) { self.reference = reference }
+}
+struct AtlasSearchCapturedHit: Sendable {
+    let id = UUID()
+    let root, path, needle: String
+    let start, end, capturedBytes: UInt64
+    let openReader: @Sendable (UInt64) throws -> String
+}
+struct AtlasSearchCapture: Sendable {
+    let retainAccess: @Sendable (AtlasSearchAccessLease) -> Void
+    let target: @Sendable (SearchHit) -> AtlasSearchCapturedHit?
 }
