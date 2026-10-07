@@ -114,10 +114,11 @@ private final class AtlasSearchProgressMailbox: @unchecked Sendable {
 @MainActor final class AtlasSearchCoordinator {
     typealias Work = @Sendable (String, String, AtlasSearchCancellation) throws -> AtlasSearchReport
     typealias ProgressiveWork = @Sendable (String, String, AtlasSearchCancellation, @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport
+    typealias CapturedWork = @Sendable (String, String, AtlasSearchCancellation, AtlasSearchAccessLease, @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport
     typealias Completion = @MainActor (Result<AtlasSearchReport, AtlasSearchError>) -> Void
 
     private let worker = DispatchQueue(label: "dev.frankencode.browser.search", qos: .userInitiated)
-    private let work: ProgressiveWork
+    private let work: CapturedWork
     private var active: AtlasSearchRequest?
     private var pending: AtlasSearchRequest?
     private var latest: UInt64?
@@ -125,9 +126,14 @@ private final class AtlasSearchProgressMailbox: @unchecked Sendable {
     private var debounceTimer: AtlasSearchDebounceTimer?
 
     init(work: @escaping Work) {
-        self.work = { root, query, cancellation, _ in try work(root, query, cancellation) }
+        self.work = { root, query, cancellation, _, _ in try work(root, query, cancellation) }
     }
-    init(progressiveWork: @escaping ProgressiveWork) { self.work = progressiveWork }
+    init(progressiveWork: @escaping ProgressiveWork) {
+        self.work = { root, query, cancellation, _, publish in
+            try progressiveWork(root, query, cancellation, publish)
+        }
+    }
+    init(capturedWork: @escaping CapturedWork) { self.work = capturedWork }
 
     deinit {
         // The worker retains its own Request, not this coordinator. Destruction
@@ -207,7 +213,7 @@ private final class AtlasSearchProgressMailbox: @unchecked Sendable {
             do {
                 if request.cancellation.isCanceled { throw AtlasSearchError.canceled }
                 let report = try withExtendedLifetime(request.accessLease) {
-                    try work(request.root, request.query, request.cancellation, mailbox.offer)
+                    try work(request.root, request.query, request.cancellation, AtlasSearchAccessLease(request.accessLease), mailbox.offer)
                 }
                 if request.cancellation.isCanceled { throw AtlasSearchError.canceled }
                 guard !report.isInProgress else { throw AtlasSearchError.invalidResponse }

@@ -13,6 +13,8 @@ private func stepSearch(_ handle: UInt64, _ generation: UInt64,
     _ poll: SearchPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_search_page")
 private func pageSearch(_ handle: UInt64, _ generation: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_search_open_reader")
+private func importSearchReader(_ atlas: UInt64, _ reader: UInt64, _ generation: UInt64, _ hit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_close") private func closeSearchAtlas(_ handle: UInt64) -> UInt8
 @_silgen_name("fcb_free_string") private func releaseSearchString(_ pointer: UnsafeMutablePointer<CChar>?)
 
@@ -29,11 +31,23 @@ enum AtlasNativeSearch {
 
     static func runProgressive(root: String, query: String, cancellation: AtlasSearchCancellation,
         progress: @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport {
+        try runWithAccess(root: root, query: query, cancellation: cancellation,
+            access: AtlasSearchAccessLease(nil), progress: progress)
+    }
+
+    /// The request's grant is retained before any foreign work, including early
+    /// failures. Finished/provisional reports pin the actual source session.
+    static func runWithAccess(root: String, query: String, cancellation: AtlasSearchCancellation,
+        access: AtlasSearchAccessLease, progress: @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport {
         try AtlasSearchCoordinator.validate(root: root, query: query)
         if cancellation.isCanceled { throw AtlasSearchError.canceled }
         let handle = createSearchAtlas()
         guard handle != 0 else { throw AtlasSearchError.unavailable }
-        defer { _ = closeSearchAtlas(handle) }
+        let owner = try AtlasSearchCaptureOwner(handle: handle,
+            close: { closeSearchAtlas($0) != 0 }, retirementFailed: {
+                FileHandle.standardError.write(Data("ATLAS_SEARCH_RETIREMENT_FAILED\n".utf8))
+            })
+        owner.retainAccess(access)
         let poll: SearchPoll = { context in
             guard let context else { return 1 }
             return Unmanaged<AtlasSearchCancellation>.fromOpaque(context).takeUnretainedValue().isCanceled ? 1 : 0
@@ -41,11 +55,11 @@ enum AtlasNativeSearch {
         return try withExtendedLifetime(cancellation) {
             let context = Unmanaged.passUnretained(cancellation).toOpaque()
             let opened: SearchOpen = try read(root.withCString {
-                openSearchAtlas(handle, $0, 4096, poll, context)
+                rootPointer in owner.call { openSearchAtlas($0, rootPointer, 4096, poll, context) }
             }, cancellation)
             guard opened.status == "ok" else { throw AtlasSearchError.unavailable }
             var page: SearchPage = try read(query.withCString {
-                beginSearch(handle, 1, $0, 1000, 4096, 1024 * 1024, 32 * 1024 * 1024)
+                queryPointer in owner.call { beginSearch($0, 1, queryPointer, 1000, 4096, 1024 * 1024, 32 * 1024 * 1024) }
             }, cancellation)
             var stream = SearchStream(query: query)
             var lastPublished: TimeInterval? = nil
@@ -55,10 +69,10 @@ enum AtlasNativeSearch {
                 try stream.append(page, start: 0, limit: 64)
                 while stream.count < stream.retained {
                     let offset = stream.count
-                    let tail: SearchPage = try read(pageSearch(handle, 1, UInt64(offset), 128), cancellation)
+                    let tail: SearchPage = try read(owner.call { pageSearch($0, 1, UInt64(offset), 128) }, cancellation)
                     try stream.append(tail, start: offset, limit: 128)
                 }
-                let report = try stream.report()
+                let report = try stream.report(owner: owner, root: root)
                 if cancellation.isCanceled { throw AtlasSearchError.canceled }
                 if !report.isInProgress { return report }
                 let now = ProcessInfo.processInfo.systemUptime
@@ -71,9 +85,21 @@ enum AtlasNativeSearch {
                     publishedHits = stream.count
                 }
                 if cancellation.isCanceled { throw AtlasSearchError.canceled }
-                page = try read(stepSearch(handle, 1, poll, context), cancellation)
+                page = try read(owner.call { stepSearch($0, 1, poll, context) }, cancellation)
             }
         }
+    }
+
+    fileprivate static func importReader(atlas: UInt64, reader: UInt64, generation: UInt64, hit: UInt64) throws -> String {
+        let pointer = importSearchReader(atlas, reader, generation, hit)
+        defer { releaseSearchString(pointer) }
+        guard let pointer else { throw AtlasSearchError.unavailable }
+        let length = strnlen(pointer, 4 * 1024 * 1024 + 1)
+        guard length <= 4 * 1024 * 1024,
+              let json = String(data: Data(bytes: pointer, count: length), encoding: .utf8) else {
+            throw AtlasSearchError.invalidResponse
+        }
+        return json
     }
 
     private static func read<T: Decodable>(_ pointer: UnsafeMutablePointer<CChar>?,
@@ -180,12 +206,21 @@ private struct SearchStream {
         }
     }
 
-    func report() throws -> AtlasSearchReport {
-        guard let state, hits.count == state.retained else { throw invalid() }
+    func report(owner: AtlasSearchCaptureOwner, root: String) throws -> AtlasSearchReport {
+        guard let state, let identity, hits.count == state.retained, hits.count == wireHits.count else { throw invalid() }
+        let source = try AtlasSearchCaptureIdentity(owner: number(identity[0]), manifest: number(identity[1]),
+            layout: number(identity[2]), generation: number(identity[3]))
+        let witnesses = try zip(hits, wireHits).map { hit, wire in
+            AtlasSearchCaptureWitness(hit: hit, file: try number(wire.file_id),
+                revision: try number(wire.source_revision), pathHex: wire.path.hex)
+        }
+        let capture = hits.isEmpty ? nil : AtlasSearchCaptureFactory.make(owner: owner,
+            identity: source, root: root, needle: query, witnesses: witnesses,
+            importReader: AtlasNativeSearch.importReader)
         return AtlasSearchReport(hits: hits, complete: state.complete, truncated: state.truncated,
             unavailableFiles: state.unavailable, unsupportedFiles: 0, matchesSeen: state.matches,
             progress: AtlasSearchProgress(isRunning: state.running, examinedFiles: state.examined,
-                cataloguedFiles: state.catalogued), streamID: id)
+                cataloguedFiles: state.catalogued), streamID: id, capture: capture)
     }
 
     private func validated(_ page: SearchPage) throws -> SearchState {
