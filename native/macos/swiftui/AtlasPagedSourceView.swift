@@ -9,10 +9,18 @@ import AppKit
     let root: String
     let path: String
     let accessLease: AnyObject?
-    @State private var model = AtlasPagedReaderModel(transport: .native, search: .native, outline: .native, document: .native)
+    @State private var model: AtlasPagedReaderModel
     @State private var copyNotice = ""
     @State private var showsOutline = false
     @State private var showsDocument = false
+
+    init(root: String, path: String, accessLease: AnyObject?, captured: AtlasSearchCapturedHit? = nil) {
+        self.root = root
+        self.path = path
+        self.accessLease = accessLease
+        _model = State(initialValue: AtlasPagedReaderModel(transport: .native, search: .native,
+            outline: .native, document: .native, captured: captured))
+    }
 
     var body: some View {
         VStack(spacing: 4) {

@@ -242,6 +242,7 @@ extension AtlasCamera {
     @State private var loadCancellation: AtlasSearchCancellation?
     @State private var showsReader = false
     @State private var usesPagedReader = false
+    @State private var capturedReaderTarget: AtlasSearchCapturedHit?
     @State private var hits: [SearchHit] = []
     @State private var selectedHit: AtlasSearchRowID?
     @State private var searchTitle = "Search project"
@@ -335,6 +336,7 @@ extension AtlasCamera {
 #endif
         }
         .onDisappear {
+            capturedReaderTarget = nil
             cancelSourceLoad()
             loadTask?.cancel()
             loadCancellation?.cancel()
@@ -676,13 +678,13 @@ extension AtlasCamera {
                 if !loadingProject, acceptsSource(path, searchRow: sourceSearchRow, exactMatch: false) {
 #if FCB_APP_STORE
                     if let access = rootAccess, access.url.path.utf8.elementsEqual(root.utf8) {
-                        AtlasPagedSourceView(root: root, path: path, accessLease: access)
+                        AtlasPagedSourceView(root: root, path: path, accessLease: access, captured: capturedReaderTarget)
                             .id(focusRequest)
                     } else {
                         Text("Choose the project folder again to grant read access.")
                     }
 #else
-                    AtlasPagedSourceView(root: root, path: path, accessLease: nil)
+                    AtlasPagedSourceView(root: root, path: path, accessLease: nil, captured: capturedReaderTarget)
                         .id(focusRequest)
 #endif
                 } else {
@@ -717,6 +719,7 @@ extension AtlasCamera {
     // MARK: Actions
 
     private func requestAtlasLoad() {
+        capturedReaderTarget = nil
         cancelSourceLoad()
         clearSearch()
         selectedPath = nil
@@ -939,6 +942,7 @@ extension AtlasCamera {
     }
 
     private func applyFileScope() {
+        capturedReaderTarget = nil
         cancelSourceLoad()
         clearSearch()
         selectedPath = nil; selectedSource = nil; selectedMatch = nil
@@ -1050,7 +1054,7 @@ extension AtlasCamera {
             searchTitle = "Searching project"
             searchSummary = "Searching captured source text. You can navigate the atlas or cancel."
             status = searchSummary
-            let coordinator = searchCoordinator ?? AtlasSearchCoordinator(progressiveWork: AtlasNativeSearch.runProgressive)
+            let coordinator = searchCoordinator ?? AtlasSearchCoordinator(capturedWork: AtlasNativeSearch.runWithAccess)
             searchCoordinator = coordinator
             try coordinator.submit(input: input, accessLease: accessLease, debounce: debounce) { result in
                 // Generation rejection happens in the coordinator. These checks
@@ -1112,6 +1116,7 @@ extension AtlasCamera {
     private func openPagedFile(_ path: String) {
         guard !loadingProject, selectedPath?.utf8.elementsEqual(path.utf8) == true,
               acceptsSource(path, searchRow: sourceSearchRow, exactMatch: false) else { return }
+        capturedReaderTarget = nil
         cancelSourceLoad()
         selectedHit = nil
         selectedMatch = nil
@@ -1157,6 +1162,7 @@ extension AtlasCamera {
 
     private func openFile(_ path: String, searchRow: AtlasSearchRowID? = nil, exactMatch: Bool = false) {
         guard acceptsSource(path, searchRow: searchRow, exactMatch: exactMatch) else { return }
+        capturedReaderTarget = nil
         cancelSourceLoad()
         usesPagedReader = false
         sourceSearchRow = searchRow
@@ -1167,6 +1173,27 @@ extension AtlasCamera {
         sourceError = nil
         fileText = ""
         focusRequest = UUID()
+        if exactMatch, let capture = searchReport?.capture {
+            guard let row = searchRow,
+                  let hit = searchPresentation?.captureCandidate(for: row, in: searchContext),
+                  let target = capture.target(hit), target.root.utf8.elementsEqual(root.utf8),
+                  target.path.utf8.elementsEqual(path.utf8), target.needle.utf8.elementsEqual(query.utf8) else {
+                sourceUnavailable()
+                sourceError = "The retained search capture could not authorize this match. Search again, or explicitly open the current file."
+                status = sourceError ?? "Retained match unavailable"
+                return
+            }
+            capturedReaderTarget = target
+            usesPagedReader = true
+            showsReader = true
+            // The current row authorizes this transfer. The independent reader
+            // may then survive query edits/clear, but not a new project or view.
+            // No live-file fallback and no atlas geometry used as source proof.
+            sourceSearchRow = nil
+            selectedMatch = resolvedMatches[hit.id]
+            status = "Opening the exact retained search capture without rereading the live file."
+            return
+        }
         // String-keyed lookup may return a canonically equivalent filename.
         // Such a document cannot lend this request its source or capture proof.
         if let source = atlasDocuments[path]?.source, source.path.utf8.elementsEqual(path.utf8) {

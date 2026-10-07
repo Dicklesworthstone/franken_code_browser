@@ -2,8 +2,8 @@ import Foundation
 import Observation
 
 /// Presentation state for one independently opened retained capture. It never
-/// accepts workspace hit coordinates or promotes a page into atlas capture
-/// evidence. Only committed navigation changes the current page/history.
+/// treats workspace coordinates as native positions or promotes a page into
+/// atlas capture evidence. Only committed navigation changes the current page/history.
 @Observable @MainActor final class AtlasPagedReaderModel {
     let documentPreview: AtlasDocumentPreviewModel
     private(set) var page: AtlasReaderPage?
@@ -42,14 +42,17 @@ import Observation
     }
     private var history: [AtlasReaderRequest] = []
     private var currentRequest: AtlasReaderRequest?
+    @ObservationIgnored private let capturedTarget: AtlasSearchCapturedHit?
     @ObservationIgnored private let coordinator: AtlasReaderCoordinator
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var operation = UUID()
 
     init(transport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
          outline: AtlasReaderOutlineTransport? = nil,
-         document: AtlasReaderDocumentTransport? = nil) {
-        let coordinator = AtlasReaderCoordinator(transport: transport, search: search,
+         document: AtlasReaderDocumentTransport? = nil,
+         captured: AtlasSearchCapturedHit? = nil) {
+        capturedTarget = captured
+        let coordinator = AtlasReaderCoordinator(transport: captured.map { transport.importing($0) } ?? transport, search: search,
             outline: outline, document: document)
         self.coordinator = coordinator
         documentPreview = AtlasDocumentPreviewModel(supported: document != nil,
@@ -96,6 +99,7 @@ import Observation
     var coverage: String {
         guard let page else { return "Retained capture limit: \(AtlasReaderLimits.captureBytes / 1024 / 1024) MiB. Oversized sources are refused, not truncated." }
         var messages = ["Logical page; layout is local to this window."]
+        if capturedTarget != nil { messages.append("Source imported from the retained workspace search; no live-file reread.") }
         if let label = symbolSelectionLabel { messages.append("\(label); heuristic candidate, not semantic resolution.") }
         if matchHex != nil { messages.append("Selection belongs to this retained file query, not a workspace search capture.") }
         if page.rangeLimited { messages.append("Requested lines exceed the page byte limit. Next continues through the retained bytes.") }
@@ -107,17 +111,47 @@ import Observation
     func open(root: String, path: String, accessLease: AnyObject?) {
         close()
         let input: AtlasReaderInput
-        do { input = try AtlasReaderInput(root: root, path: path) }
-        catch { notice = AtlasReaderError.invalidInput.message; return }
-        let ticket = begin()
-        notice = "Capturing source for bounded page navigation…"
+        do {
+            if let target = capturedTarget {
+                guard target.root.utf8.elementsEqual(root.utf8), target.path.utf8.elementsEqual(path.utf8),
+                      coordinator.supportsFind else { throw AtlasReaderError.invalidInput }
+                input = try AtlasReaderInput(captured: target)
+                fileQuery = target.needle
+            } else {
+                input = try AtlasReaderInput(root: root, path: path)
+            }
+        } catch { notice = AtlasReaderError.invalidInput.message; return }
+        let ticket = begin(query: capturedTarget != nil)
+        notice = capturedTarget == nil ? "Capturing source for bounded page navigation…"
+            : "Opening the exact retained search capture…"
         task = Task {
             do {
-                let page = try await coordinator.open(input: input, accessLease: accessLease)
+                let opened = try await coordinator.open(input: input, accessLease: accessLease)
                 guard operation == ticket, !Task.isCancelled else { return }
-                install(page, request: .firstPage)
-                finish(ticket)
-            } catch { fail(error, ticket: ticket) }
+                if let target = capturedTarget {
+                    // The imported file gets its own reader/query identities.
+                    // Reuse the shared exact matcher and hit decoder to locate
+                    // THIS occurrence; never publish an approximate first page.
+                    let selected = try await AtlasCapturedReader.activate(target, identity: opened.identity,
+                        find: { try await coordinator.find($0) },
+                        read: { try await coordinator.read(.hit($0)) })
+                    guard operation == ticket, !Task.isCancelled else { return }
+                    findReport = selected.report
+                    selectedHitIndex = selected.index
+                    install(selected.page, request: .hit(selected.target))
+                    finish(ticket)
+                    notice = "Opened the exact search capture without rereading the live file."
+                } else {
+                    install(opened, request: .firstPage)
+                    finish(ticket)
+                }
+            } catch {
+                // Failed initial activation has no publishable page. Retire
+                // its independently imported reader rather than retaining a
+                // hidden capture or falling back to current disk contents.
+                if operation == ticket, page == nil { coordinator.close() }
+                fail(error, ticket: ticket)
+            }
         }
     }
 
