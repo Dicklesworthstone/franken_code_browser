@@ -19,6 +19,8 @@ struct AtlasIndexedSearchTransport: Sendable {
 /// one-active/one-newest search coordinator. A concurrent caller is refused,
 /// never added to an unbounded queue. Construction is inert. Replace this owner
 /// on refresh/root-grant changes: selected sources pin the old immutable index.
+/// Completed preparation steps survive query edits; an uncertain foreign step
+/// retires the private builder. No partial index is advertised as queryable.
 final class AtlasIndexedSearch: @unchecked Sendable {
     private final class Session {
         let owner: AtlasSearchCaptureOwner
@@ -31,9 +33,26 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             lastGeneration = basis.index
         }
     }
+    /// Only the last validated receipt is resumable. The actual source bytes
+    /// and builder remain in Rust, bounded by the existing per-index quotas.
+    private final class Preparation {
+        let owner: AtlasSearchCaptureOwner
+        let root: String
+        let grant: ObjectIdentifier?
+        let handle, layout: UInt64
+        let files: Int
+        let discovery: Bool
+        var page: AtlasIndexBuildPage
+        init(owner: AtlasSearchCaptureOwner, root: String, grant: ObjectIdentifier?, handle: UInt64,
+             layout: UInt64, files: Int, discovery: Bool, page: AtlasIndexBuildPage) {
+            self.owner = owner; self.root = root; self.grant = grant; self.handle = handle
+            self.layout = layout; self.files = files; self.discovery = discovery; self.page = page
+        }
+    }
     private let transport: AtlasIndexedSearchTransport
     private let serial = NSLock()
     private var cached: Session?
+    private var preparing: Preparation?
     init(transport: AtlasIndexedSearchTransport) { self.transport = transport }
 
     func run(root: String, query: String, cancellation: AtlasSearchCancellation,
@@ -47,9 +66,10 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             let reused = cached.map { $0.root.utf8.elementsEqual(root.utf8) && $0.grant == grant } == true
             if !reused {
                 cached = nil
-                let fresh = try build(root: root, access: access, cancellation: cancellation, progress: progress)
-                try check(cancellation)
-                cached = fresh
+                // Publish a successfully finished index before the next cancel
+                // gate. Cancellation can suppress query delivery, not make an
+                // acknowledged complete source universe need another capture.
+                cached = try build(root: root, access: access, cancellation: cancellation, progress: progress)
             }
             guard let session = cached else { throw AtlasSearchError.unavailable }
             let (generation, overflow) = session.lastGeneration.addingReportingOverflow(1)
@@ -100,8 +120,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
         }
     }
 
-    private func build(root: String, access: AtlasSearchAccessLease, cancellation: AtlasSearchCancellation,
-                       progress: @Sendable (AtlasSearchReport) -> Void) throws -> Session {
+    private func beginBuild(root: String, access: AtlasSearchAccessLease,
+                            cancellation: AtlasSearchCancellation) throws -> Preparation {
         let handle = transport.create()
         let owner = try AtlasSearchCaptureOwner(handle: handle, close: transport.close, retirementFailed: transport.retirementFailed)
         owner.retainAccess(access)
@@ -113,38 +133,67 @@ final class AtlasIndexedSearch: @unchecked Sendable {
         guard layout > 0, try opened.text("scope") == "all", try opened.number("workspace_files") == UInt64(files),
               try opened.text("retention") == "frozen-catalog-and-spatial-index" else { throw AtlasIndexWire.invalid() }
         try check(cancellation)
-        var page = try AtlasIndexBuildPage(owner.call { try transport.indexBegin($0, 1) },
+        let page = try AtlasIndexBuildPage(owner.call { try transport.indexBegin($0, 1) },
             owner: handle, layout: layout, files: files, discovery: discovery, command: "index-begin")
         guard page.steps == 0, page.examined == 0, page.bytes == 0, page.readBytes == 0, page.running else { throw AtlasIndexWire.invalid() }
+        return Preparation(owner: owner, root: root, grant: access.reference.map(ObjectIdentifier.init),
+            handle: handle, layout: layout, files: files, discovery: discovery, page: page)
+    }
+
+    private func build(root: String, access: AtlasSearchAccessLease, cancellation: AtlasSearchCancellation,
+                       progress: @Sendable (AtlasSearchReport) -> Void) throws -> Session {
+        let grant = access.reference.map(ObjectIdentifier.init)
+        if preparing.map({ $0.root.utf8.elementsEqual(root.utf8) && $0.grant == grant }) != true {
+            preparing = nil
+            preparing = try beginBuild(root: root, access: access, cancellation: cancellation)
+        }
+        guard let preparation = preparing else { throw AtlasSearchError.unavailable }
+        // A replacement request gets a new report stream, even when it resumes
+        // the same builder. Old-query row/selection authority is never reused.
         let stream = UUID()
         var lastPublished = -Double.infinity
-        while page.running {
+        while preparation.page.running {
             try check(cancellation)
+            let page = preparation.page
             let now = ProcessInfo.processInfo.systemUptime
             if now - lastPublished >= 0.1 {
                 progress(AtlasSearchReport(hits: [], complete: false, truncated: false,
                     unavailableFiles: page.unavailable, unsupportedFiles: 0, matchesSeen: 0,
-                    progress: AtlasSearchProgress(isRunning: true, examinedFiles: page.examined, cataloguedFiles: files),
+                    progress: AtlasSearchProgress(isRunning: true, examinedFiles: page.examined, cataloguedFiles: preparation.files),
                     streamID: stream, indexStatus: AtlasSearchIndexStatus(building: true, reused: false,
                         capturedFiles: page.captured, capturedBytes: page.bytes, skippedFiles: 0, verifiedFiles: 0, verificationBytes: 0)))
                 lastPublished = now
             }
+            // Cancellation here leaves the last acknowledged Rust step intact.
+            // It does not call atlas_cancel, whose epoch would retire the build.
             try check(cancellation)
-            let next = try AtlasIndexBuildPage(owner.call { try transport.indexStep($0, 1, cancellation) },
-                owner: handle, layout: layout, files: files, discovery: discovery, command: "index-step")
-            guard next.manifest == page.manifest, next.steps == page.steps + 1,
-                  next.examined >= page.examined, next.examined <= page.examined + 1,
-                  next.captured >= page.captured, next.unavailable >= page.unavailable,
-                  next.indexed >= page.indexed, next.uncovered >= page.uncovered,
-                  next.bytes >= page.bytes, next.readBytes >= page.readBytes else { throw AtlasIndexWire.invalid() }
-            page = next
+            do {
+                let next = try AtlasIndexBuildPage(preparation.owner.call { try transport.indexStep($0, 1, cancellation) },
+                    owner: preparation.handle, layout: preparation.layout, files: preparation.files,
+                    discovery: preparation.discovery, command: "index-step")
+                guard next.manifest == page.manifest, next.steps == page.steps + 1,
+                      next.examined >= page.examined, next.examined <= page.examined + 1,
+                      next.captured >= page.captured, next.unavailable >= page.unavailable,
+                      next.indexed >= page.indexed, next.uncovered >= page.uncovered,
+                      next.bytes >= page.bytes, next.readBytes >= page.readBytes else { throw AtlasIndexWire.invalid() }
+                // An intact validated receipt establishes the completed step,
+                // even if cancellation raced its return. Save before polling.
+                preparation.page = next
+            } catch {
+                // A canceled/error/malformed foreign response cannot prove how
+                // far Rust advanced. Retire it; never resume guessed progress.
+                preparing = nil
+                throw error
+            }
         }
-        try check(cancellation)
+        let page = preparation.page
         guard let captureManifest = page.captureManifest else { throw AtlasIndexWire.invalid() }
-        let basis = AtlasIndexedBasis(owner: handle, manifest: page.manifest, layout: layout, index: 1,
-            captureManifest: captureManifest, files: files, capturedFiles: page.captured,
-            unavailable: page.unavailable, pending: page.pending, sourceBytes: page.bytes, discoveryComplete: discovery)
-        return Session(owner: owner, root: root, grant: access.reference.map(ObjectIdentifier.init), basis: basis)
+        let basis = AtlasIndexedBasis(owner: preparation.handle, manifest: page.manifest, layout: preparation.layout, index: 1,
+            captureManifest: captureManifest, files: preparation.files, capturedFiles: page.captured,
+            unavailable: page.unavailable, pending: page.pending, sourceBytes: page.bytes, discoveryComplete: preparation.discovery)
+        let session = Session(owner: preparation.owner, root: root, grant: grant, basis: basis)
+        preparing = nil
+        return session
     }
     private func check(_ flag: AtlasSearchCancellation) throws { if flag.isCanceled { throw AtlasSearchError.canceled } }
 }

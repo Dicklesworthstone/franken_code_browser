@@ -9,6 +9,9 @@ set -- "$src/AtlasSearch.swift" "$src/AtlasSearchCapture.swift" "$src/AtlasSearc
 swiftc -swift-version 6 -warnings-as-errors "$@" \
     "$src/tests/AtlasIndexedSearchFixture.swift" "$src/tests/AtlasIndexedSearchTests.swift" -o "$out/worker"
 "$out/worker"
+swiftc -swift-version 6 -warnings-as-errors "$@" \
+    "$src/tests/AtlasIndexedSearchFixture.swift" "$src/tests/AtlasIndexedResumeTests.swift" -o "$out/resume"
+"$out/resume"
 clang -std=gnu11 -Wall -Wextra -Werror -c "$src/tests/AtlasIndexedBridgeFixtures.c" -o "$out/fixture.o"
 swiftc -swift-version 6 -warnings-as-errors "$@" "$src/AtlasIndexedSearchBridge.swift" \
     "$src/tests/AtlasIndexedBridgeTests.swift" "$out/fixture.o" -o "$out/bridge"
