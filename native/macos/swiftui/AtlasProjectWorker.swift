@@ -1,6 +1,8 @@
 import Foundation
 
 private typealias ProjectPoll = @convention(c) (UnsafeMutableRawPointer?) -> Int32
+@_silgen_name("fcb_project_catalog_cancelable") private func projectMetadata(
+    _ root: UnsafePointer<CChar>, _ maxFiles: UInt64, _ poll: ProjectPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_layout_cancelable") private func projectCatalog(
     _ root: UnsafePointer<CChar>, _ poll: ProjectPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_source_document_cancelable") private func projectSource(
@@ -42,6 +44,24 @@ enum AtlasProjectWorker {
     private static func validate(_ path: String) throws {
         if path.isEmpty || path.utf8.count > 16_384 || path.utf8.contains(0) { throw AtlasProjectIOError.invalidRequest }
     }
+    /// Versioned metadata route: partial membership and unsupported native names
+    /// remain explicit. No legacy path-only response is accepted as this report.
+    static func catalogReport(root: String, cancellation: AtlasSearchCancellation) throws -> AtlasProjectCatalog {
+        try validate(root); try check(cancellation)
+        let pointer = withExtendedLifetime(cancellation) {
+            root.withCString { projectMetadata($0, UInt64(AtlasProjectCatalog.maximumFiles), poll,
+                Unmanaged.passUnretained(cancellation).toOpaque()) }
+        }
+        defer { projectFreeString(pointer) }
+        try check(cancellation)
+        guard let pointer else { throw AtlasProjectIOError.unavailable }
+        let length = strnlen(pointer, AtlasProjectCatalog.maximumResponseBytes + 1)
+        guard length <= AtlasProjectCatalog.maximumResponseBytes else { throw AtlasProjectIOError.limit }
+        let report = try AtlasProjectCatalog.decode(Data(bytes: pointer, count: length))
+        try check(cancellation)
+        return report
+    }
+
     static func catalog(root: String, cancellation: AtlasSearchCancellation) throws -> [AtlasProjectFile] {
         try validate(root); try check(cancellation)
         let pointer = withExtendedLifetime(cancellation) {

@@ -74,3 +74,36 @@ pub unsafe extern "C" fn fcb_source_document_cached_cancelable(handle: u64,
 
 #[cfg(all(test, unix))]
 mod tests;
+
+/// Partial-aware project metadata, before source previews. Original native
+/// paths stay reversible and no source payload is read. Null is failure, never
+/// an empty catalog; a non-null report uses fcb.project-catalog/1.
+/// # Safety
+/// root/poll/context follow the call-scoped lifetime contract above. Free the
+/// returned non-null string exactly once with fcb_free_string. Worker only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_project_catalog_cancelable(root: *const c_char,
+    max_files: u64, poll: Option<SearchCancellationCallback>, context: *mut c_void) -> *mut c_char {
+    reply(|| {
+        let canceled = || poll.is_some_and(|p| unsafe { p(context) != 0 });
+        if canceled() { return None; }
+        let root = unsafe { cstr(root) }?;
+        let max_files = usize::try_from(max_files).ok()?;
+        let result = host::atlas::prepare_catalog(Path::new(root), max_files, canceled).ok()?;
+        if canceled() { return None; }
+        string_out(result.as_str())
+    })
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    #[test]
+    fn catalog_abi_and_null_admission() {
+        let _: unsafe extern "C" fn(*const c_char, u64, Option<SearchCancellationCallback>, *mut c_void)
+            -> *mut c_char = fcb_project_catalog_cancelable;
+        let header = include_str!("../../include/fcb_project_catalog.h");
+        assert_eq!(header.matches("fcb_project_catalog_cancelable(").count(), 1);
+        assert!(unsafe { fcb_project_catalog_cancelable(std::ptr::null(), 20_000, None, std::ptr::null_mut()) }.is_null());
+    }
+}

@@ -248,3 +248,7 @@ mod tests {
         assert_eq!(limited.lines, 3); assert_eq!(limited.rows(), 1); assert_eq!(limited.packed, vec![85, 0]);
     }
 }
+
+#[path = "project_catalog.rs"]
+mod project_catalog;
+pub use project_catalog::prepare as prepare_catalog;
