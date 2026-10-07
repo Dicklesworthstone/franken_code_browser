@@ -234,6 +234,7 @@ extension AtlasCamera {
     @State private var searchPaths: Set<String> = []
     @State private var overlayLimited = false
     @State private var showsSidebar = true
+    @State private var showsFileFinder = false
     @State private var loadingProject = false
     @State private var loadProgress = ""
     @State private var loadGeneration = UUID()
@@ -301,6 +302,12 @@ extension AtlasCamera {
             }
             .keyboardShortcut("f", modifiers: .command)
             .help("Show search and projects (⌘F)")
+            Button { showsFileFinder = true } label: {
+                Label("Quick Open", systemImage: "doc.text.magnifyingglass")
+            }
+            .keyboardShortcut("p", modifiers: .command)
+            .disabled(root.isEmpty || loadingProject)
+            .help("Find project files by filename or path (⌘P)")
             Menu {
                 Picker("Files shown", selection: $fileScope) {
                     ForEach(AtlasFileScope.allCases) { scope in Text(scope.rawValue).tag(scope) }
@@ -327,6 +334,7 @@ extension AtlasCamera {
             .disabled(!searchIsCurrent || hits.isEmpty)
             .help("Next search match (⌘G)")
         }
+        .sheet(isPresented: $showsFileFinder) { fileFinderSheet }
         .onAppear {
 #if FCB_APP_STORE
             if let recent = Engine.recents.first { restoreProject(recent) }
@@ -336,6 +344,7 @@ extension AtlasCamera {
 #endif
         }
         .onDisappear {
+            showsFileFinder = false
             capturedReaderTarget = nil
             cancelSourceLoad()
             loadTask?.cancel()
@@ -377,6 +386,40 @@ extension AtlasCamera {
             openFile(path, searchRow: selected, exactMatch: true)
             showsReader = true
         }
+    }
+
+    // Quick Open is workspace-wide filename navigation. Its frozen catalog
+    // and query identities do not borrow source-search or displayed-tile IDs.
+    @ViewBuilder private var fileFinderSheet: some View {
+#if FCB_APP_STORE
+        if let access = rootAccess, access.url.path.utf8.elementsEqual(root.utf8) {
+            fileFinder(accessLease: access)
+        } else {
+            Text("Choose the project folder again to grant read access.").padding(20)
+        }
+#else
+        fileFinder(accessLease: nil)
+#endif
+    }
+
+    private func fileFinder(accessLease: AnyObject?) -> some View {
+        let requestedRoot = root
+        let generation = loadGeneration
+        return AtlasQuickOpenView(root: requestedRoot, accessLease: accessLease) { choice in
+            guard showsFileFinder, !loadingProject, loadGeneration == generation,
+                  root.utf8.elementsEqual(requestedRoot.utf8),
+                  choice.root.utf8.elementsEqual(requestedRoot.utf8) else { return }
+#if FCB_APP_STORE
+            guard rootAccess?.url.path.utf8.elementsEqual(requestedRoot.utf8) == true else { return }
+#endif
+            showsFileFinder = false
+            selectedHit = nil
+            // Filename selection authorizes a normal file open, never an exact
+            // content-search jump. Unprepared files remain readable on demand.
+            openFile(choice.path)
+            showsReader = true
+        }
+        .id(generation)
     }
 
     // MARK: Sidebar
@@ -719,6 +762,7 @@ extension AtlasCamera {
     // MARK: Actions
 
     private func requestAtlasLoad() {
+        showsFileFinder = false
         capturedReaderTarget = nil
         cancelSourceLoad()
         clearSearch()
