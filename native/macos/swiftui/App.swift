@@ -229,6 +229,8 @@ extension AtlasCamera {
     @State private var searchPending = false
     // Created on the first search request, not on every SwiftUI view rebuild.
     @State private var searchCoordinator: AtlasSearchCoordinator?
+    @State private var workspaceSearch: AtlasWorkspaceSearch?
+    @State private var useCapturedIndex = false
     @State private var resolvedMatches: [SearchHit.ID: AtlasMatch] = [:]
     @State private var searchRows: [CGRect] = []
     @State private var searchPaths: Set<String> = []
@@ -281,7 +283,8 @@ extension AtlasCamera {
     }
 
     private var searchIsCurrent: Bool {
-        !loadingProject && searchPresentation?.isCurrent(in: searchContext) == true
+        !loadingProject && (searchReport?.indexStatus != nil) == useCapturedIndex
+            && searchPresentation?.isCurrent(in: searchContext) == true
     }
 
     var body: some View {
@@ -356,6 +359,13 @@ extension AtlasCamera {
             loadingProject = false
             clearSearch()
             searchCoordinator = nil
+            workspaceSearch?.refresh()
+            workspaceSearch = nil
+        }
+        .onChange(of: useCapturedIndex) { _, indexed in
+            clearSearch()
+            workspaceSearch?.configure(indexed: indexed)
+            runSearch(debounce: true)
         }
         .onChange(of: Array(query.utf8)) { _, _ in
             // Revoke old rows immediately, including empty or invalid edits.
@@ -374,7 +384,7 @@ extension AtlasCamera {
             // Admit this report's immutable witness, not a reusable integer.
             // Exact source verification happens before installing the reader;
             // missing atlas geometry must not disable on-demand navigation.
-            guard !loadingProject,
+            guard searchIsCurrent,
                   let hit = searchPresentation?.captureCandidate(for: selected, in: searchContext),
                   let path = hit.sourcePath else {
                 selectedHit = nil
@@ -452,11 +462,32 @@ extension AtlasCamera {
             }
             .padding(.horizontal, 10)
             .padding(.top, 10)
+            HStack {
+                Toggle("Captured index", isOn: $useCapturedIndex)
+                    .toggleStyle(.checkbox)
+                    .disabled(loadingProject)
+                    .help("Capture once and reuse the Rust index. Live search remains the default.")
+                Spacer()
+                Button("Refresh", action: refreshCapturedSearch)
+                    .disabled(!useCapturedIndex || loadingProject || root.isEmpty)
+                    .help("Capture current files into a new index without changing an already opened reader")
+            }
+            .font(.caption).padding(.horizontal, 10).padding(.top, 6)
+            if useCapturedIndex {
+                Text("Per-file snapshot: later queries do not check disk. Refresh to include edits. Limits: 4096 files, 1 MiB per file, 32 MiB total.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .padding(.horizontal, 10).padding(.top, 4)
+                if let index = searchReport?.indexStatus, !index.building {
+                    Text("\(index.reused ? "Reused" : "Prepared") index · \(index.capturedFiles) captures · \(index.capturedBytes) source bytes. This query verified \(index.verifiedFiles) files and skipped \(index.skippedFiles) by index.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                        .padding(.horizontal, 10).padding(.top, 4)
+                }
+            }
             if searchPending {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
                         .accessibilityLabel("Searching project")
-                    Text("Searching…").font(.caption)
+                    Text(searchReport?.indexStatus?.building == true ? "Preparing index…" : "Searching…").font(.caption)
                     Spacer()
                     Button("Cancel", action: cancelSearch)
                 }
@@ -472,14 +503,15 @@ extension AtlasCamera {
                 .padding(.horizontal, 10)
                 .padding(.top, 10)
             Group {
-                let count = searchReport?.matchesSeen ?? 0
+                let preparing = searchReport?.indexStatus?.building == true
+                let count = preparing ? UInt64(searchReport?.indexStatus?.capturedFiles ?? 0) : (searchReport?.matchesSeen ?? 0)
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text(count, format: .number)
                         .font(.system(size: 30, weight: .semibold, design: .rounded))
                         .monospacedDigit()
                         .contentTransition(.numericText())
                         .animation(reduceMotion ? nil : .spring(response: 0.38, dampingFraction: 0.82), value: count)
-                    Text(searchReport.map { $0.complete ? "workspace matches" : "workspace matches · partial" } ?? "ready to search")
+                    Text(preparing ? "files captured" : (searchReport.map { $0.complete ? "workspace matches" : "workspace matches · partial" } ?? "ready to search"))
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
                 }
@@ -762,6 +794,7 @@ extension AtlasCamera {
     // MARK: Actions
 
     private func requestAtlasLoad() {
+        workspaceSearch?.refresh()
         showsFileFinder = false
         capturedReaderTarget = nil
         cancelSourceLoad()
@@ -1100,10 +1133,16 @@ extension AtlasCamera {
             status = searchSummary
             let coordinator = searchCoordinator ?? AtlasSearchCoordinator(capturedWork: AtlasNativeSearch.runWithAccess)
             searchCoordinator = coordinator
-            try coordinator.submit(input: input, accessLease: accessLease, debounce: debounce) { result in
+            let service = workspaceSearch ?? AtlasWorkspaceSearch(live: AtlasNativeSearch.runWithAccess,
+                makeIndex: { AtlasIndexedSearch(transport: .native) })
+            workspaceSearch = service
+            let choice = service.selection(indexed: useCapturedIndex)
+            try coordinator.submit(input: input, accessLease: accessLease, debounce: debounce, using: choice.work) { result in
                 // Generation rejection happens in the coordinator. These checks
                 // also cover SwiftUI state changes before onChange has run.
-                guard !loadingProject, requestedContext.matches(searchContext) else { return }
+                guard !loadingProject, requestedContext.matches(searchContext),
+                      workspaceSearch === service, service.accepts(choice),
+                      choice.indexed == useCapturedIndex else { return }
                 searchPending = false
                 switch result {
                 case .success(let report):
@@ -1113,7 +1152,8 @@ extension AtlasCamera {
                     hits = report.hits.filter { $0.sourcePath.map { fileScope.includes($0, custom: customExtensions) } ?? (fileScope == .all) }
                     status = report.summary
                     searchSummary = report.summary
-                    searchTitle = report.isInProgress ? "Searching project" : (report.complete ? "No matches" : "Partial search")
+                    searchTitle = report.indexStatus?.building == true ? "Preparing captured index"
+                        : (report.isInProgress ? "Searching project" : (report.complete ? "No matches" : "Partial search"))
                 case .failure(let error):
                     status = error.message
                     searchSummary = status
@@ -1129,6 +1169,16 @@ extension AtlasCamera {
         }
     }
 
+    private func refreshCapturedSearch() {
+        guard useCapturedIndex, !loadingProject, !root.isEmpty else { return }
+        clearSearch()
+        workspaceSearch?.refresh()
+        if query.isEmpty {
+            searchSummary = "Captured index cleared. Enter text to capture current files; an opened reader keeps its original bytes."
+            status = searchSummary
+        } else { runSearch() }
+    }
+
     private func cancelSearch() {
         searchCoordinator?.cancel()
         searchPending = false
@@ -1138,7 +1188,7 @@ extension AtlasCamera {
     }
 
     private func moveSearchResult(backwards: Bool) {
-        guard !loadingProject, let presentation = searchPresentation,
+        guard searchIsCurrent, let presentation = searchPresentation,
               let row = presentation.adjacentRow(in: hits.map(\.id), after: selectedHit,
                   backwards: backwards, context: searchContext),
               let path = presentation.captureCandidate(for: row, in: searchContext)?.sourcePath else {
@@ -1175,7 +1225,7 @@ extension AtlasCamera {
     }
 
     private func openSearchFile(_ row: AtlasSearchRowID) {
-        guard !loadingProject,
+        guard searchIsCurrent,
               let path = searchPresentation?.filePath(for: row, in: searchContext) else {
             status = AtlasSearchHitAvailability.stale.message
             return
@@ -1196,7 +1246,7 @@ extension AtlasCamera {
 
     private func acceptsSource(_ path: String, searchRow: AtlasSearchRowID?, exactMatch: Bool) -> Bool {
         guard let row = searchRow else { return true }
-        guard !loadingProject,
+        guard searchIsCurrent,
               let presentation = searchPresentation,
               let sourcePath = presentation.filePath(for: row, in: searchContext),
               sourcePath.utf8.elementsEqual(path.utf8) else { return false }
