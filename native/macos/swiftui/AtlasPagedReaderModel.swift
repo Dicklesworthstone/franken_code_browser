@@ -5,6 +5,7 @@ import Observation
 /// accepts workspace hit coordinates or promotes a page into atlas capture
 /// evidence. Only committed navigation changes the current page/history.
 @Observable @MainActor final class AtlasPagedReaderModel {
+    let documentPreview: AtlasDocumentPreviewModel
     private(set) var page: AtlasReaderPage?
     /// Presentation-only UTF-8 of this logical window, not original file bytes.
     /// Never inserted into the atlas/source capture tables or searched as a file.
@@ -46,8 +47,14 @@ import Observation
     @ObservationIgnored private var operation = UUID()
 
     init(transport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
-         outline: AtlasReaderOutlineTransport? = nil) {
-        coordinator = AtlasReaderCoordinator(transport: transport, search: search, outline: outline)
+         outline: AtlasReaderOutlineTransport? = nil,
+         document: AtlasReaderDocumentTransport? = nil) {
+        let coordinator = AtlasReaderCoordinator(transport: transport, search: search,
+            outline: outline, document: document)
+        self.coordinator = coordinator
+        documentPreview = AtlasDocumentPreviewModel(supported: document != nil,
+            execute: { try await coordinator.document($0) },
+            cancel: { coordinator.cancel() }, revoke: { coordinator.revokeDocument() })
     }
     deinit { task?.cancel() }
 
@@ -247,6 +254,7 @@ import Observation
     /// Explicit cancellation keeps a successfully installed page. Cancellation
     /// during initial capture instead releases its handle after work drains.
     func cancel() {
+        documentPreview.cancel(silent: true)
         operation = UUID()
         task?.cancel(); task = nil
         coordinator.cancel()
@@ -257,6 +265,7 @@ import Observation
         notice = page == nil ? "Source opening canceled." : "Navigation canceled. The current retained page is unchanged."
     }
     func close() {
+        documentPreview.close()
         operation = UUID()
         task?.cancel(); task = nil
         coordinator.close()
@@ -295,6 +304,7 @@ import Observation
         }
     }
     private func begin(query: Bool = false, outline: Bool = false) -> UUID {
+        documentPreview.cancel(silent: true)
         task?.cancel()
         coordinator.cancel()
         operation = UUID()
@@ -312,6 +322,7 @@ import Observation
         default: currentRequest = request
         }
         self.page = page
+        documentPreview.bind(identity: page.identity, sourceOffset: page.start)
         let source = AtlasSource(path: page.identity.displayPath, text: page.text)
         self.source = source
         selectedRange = page.selection.flatMap { source.utf16Range(byteStart: $0.utf8Start, byteEnd: $0.utf8End) }

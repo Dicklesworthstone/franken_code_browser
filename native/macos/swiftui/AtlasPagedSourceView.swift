@@ -9,9 +9,10 @@ import AppKit
     let root: String
     let path: String
     let accessLease: AnyObject?
-    @State private var model = AtlasPagedReaderModel(transport: .native, search: .native, outline: .native)
+    @State private var model = AtlasPagedReaderModel(transport: .native, search: .native, outline: .native, document: .native)
     @State private var copyNotice = ""
     @State private var showsOutline = false
+    @State private var showsDocument = false
 
     var body: some View {
         VStack(spacing: 4) {
@@ -69,6 +70,9 @@ import AppKit
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 10).padding(.bottom, 4)
         }
+        .sheet(isPresented: $showsDocument) {
+            AtlasDocumentPreviewView(model: model.documentPreview)
+        }
         .onAppear(perform: open)
         .onDisappear { model.close(); copyNotice = "" }
         .onChange(of: model.navigation) { _, _ in copyNotice = "" }
@@ -110,6 +114,12 @@ import AppKit
             Button("Outline") { showsOutline = true }
                 .disabled(!model.canBuildOutline)
                 .popover(isPresented: $showsOutline) { AtlasOutlineBrowser(model: model) }
+            Button("Markdown") {
+                showsDocument = true
+                if !model.documentPreview.authorized { model.documentPreview.prepare() }
+            }
+            .disabled(model.page == nil || model.busy)
+            .help("Preview the same retained capture with headings and source mapping; UTF-8 sources up to 64 KiB")
             Button("Previous hit") { model.moveHit(backwards: true) }.disabled(!model.canMoveHit)
             Button("Next hit") { model.moveHit(backwards: false) }.disabled(!model.canMoveHit)
             if model.matchHex != nil {
