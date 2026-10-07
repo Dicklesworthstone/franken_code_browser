@@ -979,7 +979,10 @@ extension AtlasCamera {
     }
 
     private func prepareSearchOverlay(_ report: AtlasSearchReport, context: AtlasSearchContext) {
-        var matches: [SearchHit.ID: AtlasMatch] = [:]
+        // Only a validated append-only stream in the same immutable atlas may
+        // reuse geometry. New queries/scopes/captures start from no proof.
+        let sameStream = report.streamID != nil && report.streamID == searchPresentation?.id
+        var matches: [SearchHit.ID: AtlasMatch] = sameStream && searchIsCurrent ? resolvedMatches : [:]
         let grouped = Dictionary(grouping: report.hits.compactMap { hit in
             hit.sourcePath.map { ($0, hit) }
         }, by: { Array($0.0.utf8) })
@@ -993,7 +996,10 @@ extension AtlasCamera {
             // inconsistent identity rather than borrowing another hit's proof.
             guard let first = entries.first?.1, let digest = first.captureSHA256,
                   let count = first.captureByteLength else { continue }
-            let valid = entries.map(\.1).filter { $0.captureSHA256 == digest && $0.captureByteLength == count }
+            let valid = entries.map(\.1).filter {
+                matches[$0.id] == nil && $0.captureSHA256 == digest && $0.captureByteLength == count
+            }
+            guard !valid.isEmpty else { continue }
             let resolved = ProcessInfo.processInfo.environment["FCB_BATCH_MATCHES"] == "0"
                 ? valid.map { AtlasMatch.resolve(document: document, byteStart: $0.start, byteEnd: $0.end,
                     expectedSHA256: digest, expectedByteCount: count) }
@@ -1013,7 +1019,7 @@ extension AtlasCamera {
         }
         resolvedMatches = matches; searchRows = rows
         searchPresentation = AtlasSearchPresentation(context: context, hits: report.hits,
-            verifiedHitIDs: Set(matches.keys))
+            verifiedHitIDs: Set(matches.keys), id: report.streamID ?? UUID())
         searchPaths = Set(report.hits.compactMap(\.sourcePath))
         overlayLimited = limited
     }
@@ -1044,7 +1050,7 @@ extension AtlasCamera {
             searchTitle = "Searching project"
             searchSummary = "Searching captured source text. You can navigate the atlas or cancel."
             status = searchSummary
-            let coordinator = searchCoordinator ?? AtlasSearchCoordinator(work: AtlasNativeSearch.run)
+            let coordinator = searchCoordinator ?? AtlasSearchCoordinator(progressiveWork: AtlasNativeSearch.runProgressive)
             searchCoordinator = coordinator
             try coordinator.submit(input: input, accessLease: accessLease, debounce: debounce) { result in
                 // Generation rejection happens in the coordinator. These checks
@@ -1053,12 +1059,13 @@ extension AtlasCamera {
                 searchPending = false
                 switch result {
                 case .success(let report):
+                    searchPending = report.isInProgress
                     prepareSearchOverlay(report, context: requestedContext)
                     searchReport = report
                     hits = report.hits.filter { $0.sourcePath.map { fileScope.includes($0, custom: customExtensions) } ?? (fileScope == .all) }
                     status = report.summary
                     searchSummary = report.summary
-                    searchTitle = report.complete ? "No matches" : "Partial search"
+                    searchTitle = report.isInProgress ? "Searching project" : (report.complete ? "No matches" : "Partial search")
                 case .failure(let error):
                     status = error.message
                     searchSummary = status
