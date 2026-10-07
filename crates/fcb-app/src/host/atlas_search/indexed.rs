@@ -228,7 +228,9 @@ impl RetainedAtlasSearch {
                     return Err(AtlasSearchError::WrongAtlas);
                 }
                 candidate.retained_bytes += source.bytes().len();
-                candidate.files.push(RetainedFile { capture: source.clone(), node, hits: 0 });
+                let witness = CaptureWitness::new(source.bytes(),
+                    &mut || canceled() || atlas.validate_active().is_err())?;
+                candidate.files.push(RetainedFile { capture: source.clone(), node, hits: 0, witness });
             }
             let source_slot = candidate.files.len() - 1;
             candidate.files[source_slot].hits += 1;

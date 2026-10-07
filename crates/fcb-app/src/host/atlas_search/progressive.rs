@@ -227,7 +227,9 @@ impl RetainedAtlasSearch {
         let hits = candidate.hits.len() - before_hits;
         if hits != 0 {
             candidate.retained_bytes += capture.bytes().len();
-            candidate.files.push(RetainedFile { capture, node, hits });
+            let witness = CaptureWitness::new(capture.bytes(),
+                &mut || canceled() || atlas.validate_active().is_err())?;
+            candidate.files.push(RetainedFile { capture, node, hits, witness });
         }
         Ok(())
     }

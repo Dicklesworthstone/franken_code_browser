@@ -9,6 +9,8 @@
 //! instead reuse captured sources across queries. Neither is a persistent index
 //! or an atomic cross-file filesystem snapshot.
 
+mod capture_witness;
+use capture_witness::CaptureWitness;
 mod progressive;
 pub use progressive::{AtlasSearchProgress, AtlasSearchStop};
 use progressive::SearchWork;
@@ -104,7 +106,7 @@ pub struct AtlasSearchHit {
     pub original_range: ByteRange,
     source_slot: usize,
 }
-struct RetainedFile { capture: CompleteCapture, node: AtlasNodeId, hits: usize }
+struct RetainedFile { capture: CompleteCapture, node: AtlasNodeId, hits: usize, witness: CaptureWitness }
 struct Unavailable { file: FileId, reason: &'static str }
 struct Snapshot {
     generation: u64,
@@ -321,7 +323,7 @@ impl RetainedAtlasSearch {
         out.literal(",\"query_generation\":")?; out.integer(generation)?;
         out.literal(",\"search_in_progress\":")?; out.boolean(snapshot.stop_reason.is_none())?;
         out.literal(",\"hit_id\":")?; out.integer(hit.id)?;
-        encode_hit(&mut out, atlas, hit)?;
+        encode_hit(&mut out, atlas, snapshot, hit)?;
         out.literal(",\"source_observation\":\"retained-search-capture\",\"source_reopened\":false,\"reader_owner\":")?;
         out.integer(reader_owner.get())?;
         out.literal(",\"reader\":")?; out.literal(info.as_str())?;
@@ -407,7 +409,7 @@ fn encode_page(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot, star
         if displayed >= start && displayed < window_end {
             if emitted > 0 { out.literal(",")?; }
             out.literal("{\"hit_id\":")?; out.integer(hit.id)?;
-            encode_hit(out, atlas, hit)?; out.literal("}")?;
+            encode_hit(out, atlas, snapshot, hit)?; out.literal("}")?;
             emitted += 1;
         }
         displayed += 1;
@@ -426,7 +428,15 @@ fn encode_page(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot, star
     out.literal("}\n")?;
     Ok(())
 }
-fn encode_hit(out: &mut Output, atlas: &AtlasSession, hit: AtlasSearchHit) -> Result<(), AtlasSearchError> {
+fn encode_hit(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot,
+    hit: AtlasSearchHit) -> Result<(), AtlasSearchError> {
+    let source = snapshot.files.get(hit.source_slot).ok_or(AtlasSearchError::MissingHit)?;
+    if source.capture.request().file() != hit.file || source.capture.request().revision() != hit.revision
+        || source.witness.byte_length() != source.capture.bytes().len() as u64
+        || hit.original_range.is_empty() || hit.original_range.end().get() > source.witness.byte_length() {
+        return Err(AtlasSearchError::WrongAtlas);
+    }
+    source.witness.encode(out)?;
     out.literal(",\"node\":")?; out.integer(hit.node.ordinal() as u64)?;
     out.literal(",\"file_id\":")?; out.integer(hit.file.get())?;
     out.literal(",\"source_revision\":")?; out.integer(hit.revision.get())?;
