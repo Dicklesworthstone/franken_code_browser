@@ -21,6 +21,13 @@ The native source is a developer preview. A Developer ID-signed DMG and a Mac Ap
 
 ## Mac App Store
 
+As of October 9, 2026, version 0.1.0 is publicly listed on the
+[Mac App Store](https://apps.apple.com/us/app/frankencodebrowser/id6815480105).
+Apple's [public catalog](https://itunes.apple.com/lookup?id=6815480105&country=us)
+records an October 3, 2026 release. It does not identify the build number or source revision,
+and public availability does not close independent native, clean-machine or performance
+qualification. The entries below preserve the earlier signing and submission history.
+
 - [x] Added a separate `FCB_APP_STORE=1` build with App Sandbox, user-selected read-only access, and app-scoped security bookmarks. A native launch selected the SwiftUI test folder, loaded 19 files, quit, reopened the project from its bookmark, and searched its source. The distribution-signed app also launched and read a selected Asupersync checkout (19,478 atlas files). This is a physical-Mac functional check, not a clean-machine or App Review result.
 - [x] Registered Bundle ID `dev.frankencode.browser` with Apple; created Mac App Distribution and Mac Installer Distribution certificates, imported matching private keys into the local Keychain, and created Mac App Store provisioning profile `YC8HX93AMG`. The signing material stays outside Git.
 - [x] Built a distribution-signed, sandboxed `FrankenCodeBrowser.app` and signed upload package with `scripts/package_macos_app_store.sh`. `codesign --verify --deep --strict`, `pkgutil --check-signature`, and package expansion passed. The uploaded package is `dist/FrankenCodeBrowser-AppStore-0.1.0-3-upload.pkg` (SHA-256 `be25d980a1071e0df4fcbe39cd4e1a29b78529d8a45c8524b15b21e7e59cb4f6`). It is not a public download.
@@ -29,8 +36,9 @@ The native source is a developer preview. A Developer ID-signed DMG and a Mac Ap
 - [x] Completed the Developer Tools listing, screenshot, published no-data-collected privacy label, 4+ age rating, Free price, availability in 175 countries or regions, content-rights declaration, and review contact/instructions. The signed build declares no non-exempt encryption. `asc validate` reported zero blocking errors. Its sole warning was an empty What's New field that Apple refuses to edit for this first version.
 - [x] Submitted version 0.1.0 for App Review on September 23, 2026 (September 24 UTC). Submission `e1417f93-9886-4507-b396-c8595321cb59` and version state both reported **WAITING_FOR_REVIEW**. This is submission evidence, not approval or public availability.
 - [x] Apple accepted build 3 for App Store review but reported `ITMS-90886`: its signed app omitted the application identifier present in its provisioning profile, so that build was ineligible for TestFlight. The packaging script now derives and verifies the application and team identifiers from the selected profile. Uploaded corrected build 0.1.0 (4), ID `9eb8397a-9ac5-4ede-a235-7a7be07d4617`, in `dist/FrankenCodeBrowser-AppStore-0.1.0-4-upload.pkg` (SHA-256 `dcca1d99f3f8c9bc55fa8603cbf6eb21f1a2e12b3216a90015440bae98780492`). Its signed entitlements match the profile, `codesign --verify --deep --strict` and `pkgutil --check-signature` passed, and Apple reports the build `VALID`, `APP_STORE_ELIGIBLE`, and `READY_FOR_BETA_TESTING` internally. Build 4 contains the same executable code as build 3; their Mach-O UUID is `5B403270-58F9-3DC2-9B33-AA33CF0DEA25`.
-- [x] Left the existing App Review submission on build 3 in **WAITING_FOR_REVIEW** with no blocking issues. Replacing its attached build requires removing the submission from review and losing its queue position; the reported issue concerns TestFlight eligibility, so the queued App Store review remains active.
-- [ ] Record Apple's review outcome and address any review feedback. TestFlight or an equivalent clean-machine distribution check remains open; the native launch checks above do not prove it.
+- [x] Left the existing App Review submission on build 3 in **WAITING_FOR_REVIEW** with no blocking issues. Replacing its attached build requires removing the submission from review and losing its queue position; the reported issue concerns TestFlight eligibility, so the queued App Store review was left active at that checkpoint.
+- [x] Record public App Store availability of version 0.1.0 on October 3, 2026.
+- [ ] Complete the remaining independent native and TestFlight or equivalent clean-machine distribution checks; public availability and the historical launch checks above do not prove them.
 
 Build the separate sandboxed app with `FCB_APP_STORE=1 ./scripts/build_macos_app.sh --output /absolute/new/path.app`, then use `scripts/package_macos_app_store.sh --help` for the signing inputs. The direct-download DMG remains a separate Developer ID route.
 

@@ -37,7 +37,10 @@ Open FrankenCodeBrowser, choose a project folder, drag to pan, and scroll to zoo
 > a drag-to-Applications DMG. A notarized, stapled DMG containing the Developer ID-signed app is
 > available as a public developer-preview release (the v0.1.0 disk image itself is unsigned; see
 > [#1](https://github.com/Dicklesworthstone/franken_code_browser/issues/1)). A separate sandboxed Mac App Store build was submitted for review
-> on September 23, 2026; no Mac App Store version has shipped yet.
+> on September 23, 2026. Version 0.1.0 is now available on the
+> [Mac App Store](https://apps.apple.com/us/app/frankencodebrowser/id6815480105),
+> whose public listing records an October 3, 2026 release. Availability does not establish
+> current-source native or performance qualification.
 > The [implementation status](IMPLEMENTATION_STATUS.md) document is a dated September 14
 > snapshot; code and current qualification evidence take precedence where it has gone stale.
 
@@ -60,7 +63,7 @@ development.
 | Rust engine and bridge | Workspace discovery, exact source captures, layout, search, saved-repository and reader services, plus a C ABI for the native shell. |
 | Headless `fcb` binary | Explicit file/workspace inspection, bounded reading and exact text/byte search with versioned JSON. Bare `fcb` and human `fcb open` still report that the GUI launcher is unavailable in this binary. |
 | Native app | [`native/macos/`](native/macos/) contains a SwiftUI shell with dense text parcels, directory outlines, Monokai-inspired color, Metal glyph presentation, camera gestures, exact-text search with a match count, file-type filters, a source reader and local prepared-text cache. A notarized developer-preview DMG is available. |
-| Future work | Full Markdown reading, complete native accessibility/IME, code-city mode, release-grade smoothness, clean-machine distribution qualification and App Store approval remain open. |
+| Future work | Full Markdown reading, complete native accessibility/IME, code-city mode, release-grade smoothness, clean-machine distribution qualification and independent native verification remain open. |
 
 The core interaction is deliberately continuous:
 
@@ -144,8 +147,10 @@ Version 0.1.0 has a physical-Mac app build and a public notarized, stapled
 drag-to-Applications DMG with a checksum sidecar. The app inside is Developer ID-signed and
 notarized; the v0.1.0 disk image itself carries no code signature. Quarantined first-launch and
 clean-machine qualification remain open. A separate sandboxed and distribution-signed Mac App
-Store build, version 0.1.0 (3), was submitted to App Review on September 23, 2026 and is waiting
-for Apple's decision. It cannot be made by renaming or uploading the DMG.
+Store version 0.1.0 is publicly available from the
+[Mac App Store](https://apps.apple.com/us/app/frankencodebrowser/id6815480105), with an
+October 3, 2026 release date. The public listing does not identify its build number or
+source revision. This separate distribution cannot be made by renaming or uploading the DMG.
 
 The release DMG bundles the native app. The app's code signature, the image's notarization ticket,
 the checksum and the app's local Gatekeeper assessment have been checked; offline first launch from a quarantined download
