@@ -45,9 +45,14 @@ pub struct ReferenceScanOracle;
 
 impl ReferenceScanOracle {
     pub fn matches_path_filters(path: &str, filters: &[PathFilterKind]) -> bool {
-        filters.iter().all(|filter| match filter {
-            PathFilterKind::Include(pattern) => Self::path_matches(path, pattern),
-            PathFilterKind::Exclude(pattern) => !Self::path_matches(path, pattern),
+        filters.iter().all(|filter| {
+            let (pattern, include) = match filter {
+                PathFilterKind::Include(pattern) => (pattern, true),
+                PathFilterKind::Exclude(pattern) => (pattern, false),
+            };
+            // Fail closed even for callers using this predicate directly.
+            !pattern.is_empty() && pattern.len() <= crate::MAX_QUERY_LEN
+                && path_matches(path, pattern) == include
         })
     }
 
@@ -229,16 +234,6 @@ impl ReferenceScanOracle {
         Ok(())
     }
 
-    fn path_matches(path: &str, pattern: &str) -> bool {
-        if let Some(suffix) = pattern.strip_prefix('*') {
-            path.ends_with(suffix)
-        } else if pattern.ends_with('/') {
-            path.starts_with(pattern) || path.contains(pattern)
-        } else {
-            path.contains(pattern)
-        }
-    }
-
     fn lang_matches(ext: &str, lang: &str) -> bool {
         let lang = lang.to_lowercase();
         match lang.as_str() {
@@ -251,6 +246,93 @@ impl ReferenceScanOracle {
             "markdown" | "md" => ext == "md" || ext == "markdown",
             other => ext == other,
         }
+    }
+}
+
+/// Match only the documented wildcard subset. Non-glob filters keep their
+/// existing substring semantics; slash-free globs match the final component.
+/// `*` and `?` do not cross `/`; a whole-component `**` can cross directories,
+/// and `**/` includes zero directories. Backslashes/brackets/braces are literal.
+fn path_matches(path: &str, pattern: &str) -> bool {
+    if pattern.is_empty() || pattern.len() > crate::MAX_QUERY_LEN {
+        return false;
+    }
+    if !pattern.contains(['*', '?']) {
+        return path.contains(pattern);
+    }
+    let path = if pattern.contains('/') {
+        path
+    } else {
+        path.rsplit('/').next().unwrap_or(path)
+    };
+    // Common extension filters should not pay for the general state machine.
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        if !suffix.contains(['*', '?', '/']) {
+            return path.ends_with(suffix);
+        }
+    }
+
+    // NFA simulation: bounded stack storage and O(path scalars * pattern bytes)
+    // work, with no recursion, backtracking or per-candidate heap allocation.
+    // Positions are UTF-8 boundaries, so `?` consumes a scalar, not one byte.
+    let mut active = [false; crate::MAX_QUERY_LEN + 1];
+    active[0] = true;
+    close_glob_states(pattern, &mut active, true);
+    for ch in path.chars() {
+        let mut next_active = [false; crate::MAX_QUERY_LEN + 1];
+        let mut offset = 0;
+        while offset < pattern.len() {
+            let (token, next) = glob_token(pattern, offset);
+            if active[offset] {
+                match token {
+                    GlobToken::Literal(expected) if ch == expected => next_active[next] = true,
+                    GlobToken::One if ch != '/' => next_active[next] = true,
+                    GlobToken::Star if ch != '/' => next_active[offset] = true,
+                    GlobToken::Any | GlobToken::Directories => next_active[offset] = true,
+                    _ => {}
+                }
+            }
+            offset = next;
+        }
+        close_glob_states(pattern, &mut next_active, ch == '/');
+        active = next_active;
+    }
+    active[pattern.len()]
+}
+
+#[derive(Clone, Copy)]
+enum GlobToken { Literal(char), One, Star, Any, Directories }
+
+fn glob_token(pattern: &str, offset: usize) -> (GlobToken, usize) {
+    let ch = pattern[offset..].chars().next().expect("offset is before pattern end");
+    if ch == '?' {
+        return (GlobToken::One, offset + 1);
+    }
+    if ch != '*' {
+        return (GlobToken::Literal(ch), offset + ch.len_utf8());
+    }
+    let bytes = pattern.as_bytes();
+    let mut end = offset + 1;
+    while end < bytes.len() && bytes[end] == b'*' { end += 1; }
+    let component_start = offset == 0 || bytes[offset - 1] == b'/';
+    if end - offset >= 2 && component_start {
+        if end == bytes.len() { return (GlobToken::Any, end); }
+        if bytes[end] == b'/' { return (GlobToken::Directories, end + 1); }
+    }
+    (GlobToken::Star, end)
+}
+
+fn close_glob_states(pattern: &str, active: &mut [bool; crate::MAX_QUERY_LEN + 1],
+    component_start: bool)
+{
+    let mut offset = 0;
+    while offset < pattern.len() {
+        let (token, next) = glob_token(pattern, offset);
+        if active[offset] && (matches!(token, GlobToken::Star | GlobToken::Any)
+            || (matches!(token, GlobToken::Directories) && component_start)) {
+            active[next] = true;
+        }
+        offset = next;
     }
 }
 
@@ -290,6 +372,16 @@ fn validate_query(query: &ParsedQuery) -> Result<(), QueryError> {
     if terms > crate::MAX_QUERY_TOKENS { return Err(QueryError::LimitExceeded); }
     for term in query.conjunction_terms.iter().chain(&query.exclusion_terms) {
         crate::validate_needle(term.as_bytes())?;
+    }
+    let paths = query.path_filters.iter().map(|filter| match filter {
+        PathFilterKind::Include(value) | PathFilterKind::Exclude(value) => value,
+    });
+    let languages = query.lang_filters.iter().map(|filter| match filter {
+        LangFilterKind::Include(value) | LangFilterKind::Exclude(value) => value,
+    });
+    for value in paths.chain(languages) {
+        if value.is_empty() { return Err(QueryError::SyntaxError); }
+        if value.len() > crate::MAX_QUERY_LEN { return Err(QueryError::NeedleTooLong); }
     }
     Ok(())
 }
@@ -420,5 +512,166 @@ mod tests {
         let mut wrong = result.clone();
         wrong.matches[0].occurrence_id += 1;
         assert!(ReferenceScanOracle::verify_oracle_match(&wrong, &result).is_err());
+    }
+
+    #[test]
+    fn glob_filters_respect_directory_boundaries_and_recursive_components() {
+        for (path, pattern, expected) in [
+            ("src/main.rs", "*.rs", true),
+            ("src/main.rs.bak", "*.rs", false),
+            ("src/main.rs", "src/*.rs", true),
+            ("src/nested/main.rs", "src/*.rs", false),
+            ("src/main.rs", "src/**/*.rs", true),
+            ("src/a/b/main.rs", "src/**/*.rs", true),
+            ("other/src/main.rs", "src/**/*.rs", false),
+            ("main.rs", "**/*.rs", true),
+            ("a/b/main.rs", "**/*.rs", true),
+            ("generated/out.rs", "**/generated/**", true),
+            ("src/generated/out.rs", "**/generated/**", true),
+            ("src/not_generated/out.rs", "**/generated/**", false),
+            ("src/generatedish/out.rs", "**/generated/**", false),
+            ("foo", "**/foo", true),
+            ("a/foo", "**/foo", true),
+            ("afoo", "**/foo", false),
+            ("src/afoo", "src/**/foo", false),
+            ("src/foo", "src/**/**/foo", true),
+            ("src/a/b/foo", "src/**/**/foo", true),
+            ("src/a/bfoo", "src/**/**/foo", false),
+        ] {
+            assert_eq!(path_matches(path, pattern), expected, "{pattern:?} on {path:?}");
+        }
+    }
+
+    #[test]
+    fn wildcard_units_are_unicode_scalars_and_native_backslashes_are_literal() {
+        for (path, pattern, expected) in [
+            ("src/é.rs", "src/?.rs", true),
+            ("src/資料.rs", "src/?.rs", false),
+            ("src/資料.rs", "src/??.rs", true),
+            ("src/e\u{301}.rs", "src/?.rs", false),
+            ("src/e\u{301}.rs", "src/??.rs", true),
+            ("src/a/b.rs", "src/???.rs", false),
+            (r"src/a\b.rs", r"src/a\?.rs", true),
+            ("src/a/b.rs", r"src/a\?.rs", false),
+            ("src/[a]/b.rs", "src/[a]/?.rs", true),
+        ] {
+            assert_eq!(path_matches(path, pattern), expected, "{pattern:?} on {path:?}");
+        }
+    }
+
+    #[test]
+    fn plain_path_filters_keep_substring_semantics() {
+        assert!(path_matches("packages/tool/src/main.rs", "src/"));
+        assert!(path_matches("packages/tool/src/main.rs", "tool"));
+        assert!(!path_matches("packages/tool/src/main.rs", "tests/"));
+        assert!(!path_matches("packages/tool/src/main.rs", "SRC/"));
+    }
+
+    #[test]
+    fn quoted_glob_scope_excludes_files_before_spending_the_byte_budget() {
+        let captures: Vec<_> = (1..=5).map(|id| capture(id, b"needle")).collect();
+        let paths = [
+            "Sources/My App/lib.rs", "Sources/My App/nested/mod.rs",
+            "Sources/My App/generated/output.rs", "Sources/My App/readme.md",
+            "Other App/lib.rs",
+        ];
+        let docs: Vec<_> = captures.iter().zip(paths).map(|(capture, path)|
+            SearchDocument::new(capture.request().file(), path, capture)).collect();
+        let query = ParsedQuery::parse(
+            r#"needle path:"Sources/My App/**/*.rs" -path:**/generated/**"#,
+        ).unwrap();
+        let mut options = options();
+        options.max_bytes_scanned = Some(12);
+        let result = ReferenceScanOracle::scan_collection(&docs, &query, &options).unwrap();
+        assert!(result.is_complete());
+        assert_eq!(result.scanned_bytes, 12);
+        assert_eq!(result.match_count(), 2);
+        assert_eq!(result.matches.iter().map(|hit| hit.file_id).collect::<Vec<_>>(),
+            [captures[0].request().file(), captures[1].request().file()]);
+    }
+
+    #[test]
+    fn manually_constructed_filters_cannot_bypass_parser_bounds() {
+        for value in [String::new(), "*".repeat(crate::MAX_QUERY_LEN + 1)] {
+            let expected = if value.is_empty() { QueryError::SyntaxError } else { QueryError::NeedleTooLong };
+            for filter in [PathFilterKind::Include(value.clone()), PathFilterKind::Exclude(value.clone())] {
+                let mut query = ParsedQuery::parse("needle").unwrap();
+                query.path_filters.push(filter);
+                assert_eq!(ReferenceScanOracle::scan_collection(&[], &query, &options()), Err(expected));
+                assert!(!ReferenceScanOracle::matches_path_filters("src/main.rs", &query.path_filters));
+            }
+            let mut query = ParsedQuery::parse("needle").unwrap();
+            query.lang_filters.push(LangFilterKind::Exclude(value));
+            assert_eq!(ReferenceScanOracle::scan_collection(&[], &query, &options()), Err(expected));
+        }
+    }
+
+    #[test]
+    fn repeated_wildcard_prefixes_do_not_require_backtracking() {
+        let pattern = format!("{}*b", "*a".repeat(crate::MAX_QUERY_LEN / 2 - 1));
+        assert_eq!(pattern.len(), crate::MAX_QUERY_LEN);
+        assert!(!path_matches(&"a".repeat(1024), &pattern));
+        assert!(path_matches(&format!("{}b", "a".repeat(1024)), &pattern));
+    }
+
+    /// Deliberately separate component-recursive oracle, only for tiny cases.
+    /// Production must not use this exponential reference implementation.
+    fn reference_component(text: &[char], pattern: &[char]) -> bool {
+        match pattern.split_first() {
+            None => text.is_empty(),
+            Some((&'*', rest)) => reference_component(text, rest)
+                || (!text.is_empty() && reference_component(&text[1..], pattern)),
+            Some((&ch, rest)) => !text.is_empty() && (ch == '?' || ch == text[0])
+                && reference_component(&text[1..], rest),
+        }
+    }
+
+    fn reference_components(path: &[&str], pattern: &[&str]) -> bool {
+        let Some((&part, rest)) = pattern.split_first() else { return path.is_empty(); };
+        if part.len() >= 2 && part.bytes().all(|ch| ch == b'*') {
+            reference_components(path, rest)
+                || (!path.is_empty() && reference_components(&path[1..], pattern))
+        } else {
+            !path.is_empty() && (rest.is_empty() || path.len() > 1)
+                && reference_component(&path[0].chars().collect::<Vec<_>>(), &part.chars().collect::<Vec<_>>())
+                && reference_components(&path[1..], rest)
+        }
+    }
+
+    fn reference_path(path: &str, pattern: &str) -> bool {
+        if pattern.is_empty() { return false; }
+        if !pattern.contains(['*', '?']) { return path.contains(pattern); }
+        let path = if pattern.contains('/') { path } else { path.rsplit('/').next().unwrap_or(path) };
+        reference_components(&path.split('/').collect::<Vec<_>>(), &pattern.split('/').collect::<Vec<_>>())
+    }
+
+    fn small_words(alphabet: &[char], depth: usize) -> Vec<String> {
+        let mut words = vec![String::new()];
+        let mut level = vec![String::new()];
+        for _ in 0..depth {
+            let mut next = Vec::new();
+            for prefix in &level {
+                for &ch in alphabet {
+                    let mut word = prefix.clone();
+                    word.push(ch);
+                    next.push(word);
+                }
+            }
+            words.extend(next.iter().cloned());
+            level = next;
+        }
+        words
+    }
+
+    #[test]
+    fn bounded_glob_machine_agrees_with_independent_component_oracle() {
+        let paths = small_words(&['a', 'b', '/', 'é'], 4);
+        let patterns = small_words(&['a', '/', '*', '?', 'é'], 4);
+        for pattern in &patterns {
+            for path in &paths {
+                assert_eq!(path_matches(path, pattern), reference_path(path, pattern),
+                    "{pattern:?} on {path:?}");
+            }
+        }
     }
 }
