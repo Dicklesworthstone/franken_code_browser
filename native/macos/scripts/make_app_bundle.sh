@@ -44,6 +44,14 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+# Versioned launcher contract. A sandboxed app deliberately does not promise to
+# turn a CLI path into a root grant. Markers are zero-byte regular files, included
+# in the resource seal, and consumed by the binary-only native launcher.
+if [ "${FCB_APP_STORE:-0}" = 1 ]; then
+    : > "$APP/Contents/Resources/fcb-launch-picker-v1"
+else
+    : > "$APP/Contents/Resources/fcb-launch-project-v1"
+fi
 if [ "${FCB_APP_STORE:-0}" = 1 ]; then
     app_store_build_number=${FCB_APP_STORE_BUILD_NUMBER:-4}
     case "$app_store_build_number" in
