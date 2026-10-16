@@ -57,7 +57,7 @@ enum AtlasProjectWorker {
         guard let pointer else { throw AtlasProjectIOError.unavailable }
         let length = strnlen(pointer, AtlasProjectCatalog.maximumResponseBytes + 1)
         guard length <= AtlasProjectCatalog.maximumResponseBytes else { throw AtlasProjectIOError.limit }
-        let report = try AtlasProjectCatalog.decode(Data(bytes: pointer, count: length))
+        let report = try AtlasProjectCatalog.decode(Data(bytes: pointer, count: length), requestedRoot: root)
         try check(cancellation)
         return report
     }

@@ -15,6 +15,13 @@ struct AtlasProjectCatalog: Sendable {
     let entries: [Entry]
     let discoveryComplete: Bool
     let policy: String
+    /// Supplied by the requesting worker, NOT decoded from the response. This
+    /// correlates startup selection with a catalog; it is not a native grant.
+    let requestedRoot: String?
+    init(entries: [Entry], discoveryComplete: Bool, policy: String, requestedRoot: String? = nil) {
+        self.entries = entries; self.discoveryComplete = discoveryComplete
+        self.policy = policy; self.requestedRoot = requestedRoot
+    }
     var openableCount: Int { entries.reduce(0) { $0 + ($1.sourcePath == nil ? 0 : 1) } }
     var summary: String {
         let unavailable = entries.count - openableCount
@@ -26,7 +33,7 @@ struct AtlasProjectCatalog: Sendable {
     static let maximumFiles = 20_000
     static let maximumResponseBytes = 16 * 1024 * 1024
 
-    static func decode(_ data: Data) throws -> Self {
+    static func decode(_ data: Data, requestedRoot: String? = nil) throws -> Self {
         guard data.count <= maximumResponseBytes else { throw DecodeError.invalidResponse }
         do {
             let wire = try JSONDecoder().decode(Wire.self, from: data)
@@ -58,7 +65,8 @@ struct AtlasProjectCatalog: Sendable {
                     sourcePath: String(bytes: raw, encoding: .utf8), observedBytes: bytes,
                     x: file.x, y: file.y, width: file.w, height: file.h))
             }
-            return Self(entries: entries, discoveryComplete: wire.discovery_complete, policy: wire.policy)
+            return Self(entries: entries, discoveryComplete: wire.discovery_complete,
+                policy: wire.policy, requestedRoot: requestedRoot)
         } catch let error as DecodeError { throw error }
         catch { throw DecodeError.invalidResponse }
     }
@@ -110,4 +118,105 @@ struct AtlasProjectCatalog: Sendable {
     private struct World: Decodable { let w, h: Double }
     private struct File: Decodable { let file_id, observed_bytes: String; let path: NativePath; let x, y, w, h: Double }
     private struct NativePath: Decodable { let encoding, hex, display: String }
+}
+
+/// One launch's explicit filename selection, not a persisted preference or an
+/// exact source anchor. Resolving it does no I/O and uses raw Unix path identity.
+/// The first catalog presentation consumes it, including failure, so refresh,
+/// another window or a project replacement cannot replay an old startup action.
+struct AtlasStartupFileRequest {
+    enum Outcome: Equatable {
+        case none, open(UInt64), invalid, differentRoot, grantRequired, filtered, unavailable
+        case notCatalogued(partial: Bool)
+        var message: String? {
+            switch self {
+            case .none, .open: return nil
+            case .invalid: return "The startup file request is invalid; no file was opened."
+            case .differentRoot: return "The startup project changed; choose the file from this project's catalog."
+            case .grantRequired: return "This build requires the native folder picker; command-line filenames do not grant access."
+            case .filtered: return "The startup file is hidden by the current filter. Change the filter and select it explicitly."
+            case .unavailable: return "The startup filename cannot be opened by this UTF-8 reader."
+            case .notCatalogued(let partial):
+                return partial ? "The startup file was not in the partial catalog. It may be unseen or excluded; refresh or choose a narrower project."
+                    : "The startup file was not in the admitted catalog. It may have changed or been excluded by discovery policy."
+            }
+        }
+    }
+    private enum Pending { case none, invalid, file(root: String, bytes: [UInt8]) }
+    private var pending: Pending
+
+    init(arguments: [String]) { pending = Self.parse(arguments) }
+
+    mutating func consume(catalog: AtlasProjectCatalog, visibleEntries: [AtlasProjectCatalog.Entry],
+        permitsProjectArguments: Bool = true) -> Outcome {
+        let request = pending
+        pending = .none
+        switch request {
+        case .none: return .none
+        case .invalid: return .invalid
+        case .file(let root, let bytes):
+            guard permitsProjectArguments else { return .grantRequired }
+            guard catalog.requestedRoot?.utf8.elementsEqual(root.utf8) == true else { return .differentRoot }
+            guard let entry = catalog.entries.first(where: { $0.rawPath == bytes }) else {
+                return .notCatalogued(partial: !catalog.discoveryComplete)
+            }
+            guard entry.sourcePath?.utf8.elementsEqual(bytes) == true else { return .unavailable }
+            guard visibleEntries.contains(where: { $0.id == entry.id && $0.rawPath == bytes }) else { return .filtered }
+            return .open(entry.id)
+        }
+    }
+
+    private static func parse(_ arguments: [String]) -> Pending {
+        // Never read UserDefaults: a saved filename cannot authorize startup.
+        guard arguments.dropFirst().contains("-fcb.file-hex") else { return .none }
+        guard arguments.count <= 64 else { return .invalid }
+        var total = 0
+        for argument in arguments.dropFirst() {
+            let count = argument.utf8.count
+            guard count <= 32_768, count <= 65_536 - total else { return .invalid }
+            total += count
+        }
+        var root: String?, hex: String?
+        var i = 1
+        while i < arguments.count {
+            let key = arguments[i]; i += 1
+            if key != "-fcb.root" && key != "-fcb.file-hex" { continue }
+            guard i < arguments.count else { return .invalid }
+            let value = arguments[i]; i += 1
+            if key == "-fcb.root" {
+                guard root == nil else { return .invalid }; root = value
+            } else {
+                guard hex == nil else { return .invalid }; hex = value
+            }
+        }
+        guard let root, root.hasPrefix("/"), root.utf8.count <= 16_384, !root.utf8.contains(0),
+              let hex, !hex.isEmpty, hex.utf8.count.isMultiple(of: 2) else { return .invalid }
+        func nibble(_ byte: UInt8) -> UInt8? {
+            switch byte { case 48...57: return byte - 48; case 97...102: return byte - 87; default: return nil }
+        }
+        var raw: [UInt8] = []; raw.reserveCapacity(hex.utf8.count / 2)
+        var digits = hex.utf8.makeIterator()
+        while let high = digits.next() {
+            guard let low = digits.next(), let h = nibble(high), let l = nibble(low) else { return .invalid }
+            raw.append(h * 16 + l)
+        }
+        // The CLI selects a file's immediate parent as its project. Accept only
+        // one native component, never traversal, absolute paths or lossy UTF-8.
+        guard !raw.contains(0), !raw.contains(47), raw != [46], raw != [46, 46],
+              String(bytes: raw, encoding: .utf8) != nil else { return .invalid }
+        return .file(root: root, bytes: raw)
+    }
+}
+
+/// Application-only, main-actor serialization of the process's single startup
+/// action. Pure request state above is independently testable without a window.
+@MainActor enum AtlasFileStartup {
+    private static var pending = AtlasStartupFileRequest(arguments: ProcessInfo.processInfo.arguments)
+    static func consume(catalog: AtlasProjectCatalog, visibleEntries: [AtlasProjectCatalog.Entry]) -> AtlasStartupFileRequest.Outcome {
+#if FCB_APP_STORE
+        return pending.consume(catalog: catalog, visibleEntries: visibleEntries, permitsProjectArguments: false)
+#else
+        return pending.consume(catalog: catalog, visibleEntries: visibleEntries)
+#endif
+    }
 }
