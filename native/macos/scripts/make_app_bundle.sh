@@ -66,6 +66,7 @@ if [ "${FCB_APP_STORE:-0}" = 1 ]; then
     : > "$APP/Contents/Resources/fcb-launch-picker-v1"
 else
     : > "$APP/Contents/Resources/fcb-launch-project-v1"
+    : > "$APP/Contents/Resources/fcb-launch-file-v1"
 fi
 if [ "${FCB_APP_STORE:-0}" = 1 ]; then
     app_store_build_number=${FCB_APP_STORE_BUILD_NUMBER:-4}

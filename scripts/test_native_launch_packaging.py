@@ -47,7 +47,12 @@ elif name == "xcrun":
 elif name == "ditto":
     shutil.copytree(args[0], args[1], dirs_exist_ok=True)
 elif name == "codesign":
-    assert pathlib.Path(args[-1]).exists(), args
+    destination = pathlib.Path(args[-1])
+    assert destination.exists(), args
+    if destination.is_dir():
+        resources = destination / "Contents/Resources"
+        if (resources / "fcb-launch-project-v1").exists():
+            assert (resources / "fcb-launch-file-v1").read_bytes() == b"", "file marker must precede signing"
 elif name != "sbh":
     raise SystemExit("unexpected fixture tool " + name)
 '''
@@ -118,6 +123,7 @@ class NativeLaunchPackaging(unittest.TestCase):
         self.assertEqual(copied.read_bytes(), original.read_bytes())
         self.assertTrue(copied.stat().st_mode & 0o111)
         self.assertEqual((self.app / "Contents/Resources/fcb-launch-project-v1").read_bytes(), b"")
+        self.assertEqual((self.app / "Contents/Resources/fcb-launch-file-v1").read_bytes(), b"")
         self.assertFalse((self.app / "Contents/Resources/fcb-launch-picker-v1").exists())
         signs = [args for name, args in self.calls() if name == "codesign"]
         self.assertEqual(signs, [["--force", "--sign", "-", str(copied)],
@@ -145,6 +151,22 @@ class NativeLaunchPackaging(unittest.TestCase):
         self.assertTrue((self.app / "Contents/MacOS/FrankenCodeBrowser").exists())
         self.assertFalse((self.app / "Contents/MacOS/fcb").exists())
         self.assertTrue((self.app / "Contents/Resources/fcb-launch-project-v1").exists())
+        self.assertEqual((self.app / "Contents/Resources/fcb-launch-file-v1").read_bytes(), b"")
+
+    def test_sandbox_staging_never_advertises_cli_file_access(self) -> None:
+        # Deliberately stop at the build-number guard before platform PlistBuddy.
+        # This qualifies staged marker/CLI isolation, NOT a successful Store build.
+        result = self.bundle(FCB_CLI_BIN=str(self.cli), FCB_APP_STORE="1", FCB_APP_STORE_BUILD_NUMBER="0")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("FCB_APP_STORE_BUILD_NUMBER", result.stderr)
+        resources = self.app / "Contents/Resources"
+        self.assertEqual((resources / "fcb-launch-picker-v1").read_bytes(), b"")
+        self.assertFalse((resources / "fcb-launch-project-v1").exists())
+        self.assertFalse((resources / "fcb-launch-file-v1").exists())
+        self.assertFalse((self.app / "Contents/MacOS/fcb").exists())
+        compiler = next(args for name, args in self.calls() if name == "xcrun")
+        self.assertIn("FCB_APP_STORE", compiler)
+        self.assertFalse(any(name == "codesign" for name, _ in self.calls()))
 
     def test_existing_output_is_not_modified(self) -> None:
         self.app.mkdir()

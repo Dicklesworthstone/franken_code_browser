@@ -51,11 +51,50 @@ picker/security-scoped access flow.
 `--json`, `read`, `search`, `desk` and other machine commands retain their headless
 routes. The reusable `fcb_app::run` service does not start native applications;
 this handoff belongs only to the macOS executable. Other platforms remain
-headless. Native activation of an individual file is **not connected yet**;
-`fcb open FILE` reports that limitation instead of silently opening the wrong
-scope. Use `fcb read FILE`, `fcb open FILE --json`, or open its parent project and
-select it in the native catalog. Non-UTF-8 project names are refused by the
-UTF-8 native startup path rather than being lossily rewritten.
+headless. Non-UTF-8 project and filename arguments are refused by the UTF-8
+native startup path rather than being lossily rewritten.
+
+### Opening a source file
+
+```sh
+"$APP/Contents/MacOS/fcb" open /absolute/path/to/src/main.rs
+"$APP/Contents/MacOS/fcb" open -- -notes.rs
+```
+
+A regular-file request opens its **immediate parent directory** as the project
+and selects that filename once the metadata catalog is ready. It does not walk
+ancestors looking for a repository root, prepare all source previews, or execute
+anything from the project. Parent-directory metadata discovery is part of this
+native operation; use `read FILE` or `open FILE --json` for a file-only headless
+read without that discovery.
+
+The filename is passed as a bounded hex encoding of its original UTF-8 bytes.
+The native endpoint accepts it only against the requesting worker's matching
+root and the exact raw filename in that catalog, then invokes the same checked
+reader action as a row click. Quoting, spaces, tabs, newlines and native
+backslashes do not turn into command syntax. Unicode-equivalent but byte-distinct
+filenames are not interchanged. A filename is a request for a **new capture**,
+not an exact anchor into bytes observed by the launcher.
+
+Discovery exclusions, catalog limits and normal reader admission still apply.
+An excluded, filtered or uncatalogued file produces a visible limitation rather
+than opening another row or declaring an unseen file absent. A known file in a
+partial catalog remains openable. The first catalog presentation consumes the
+startup request, including failure; project replacement or refresh cannot replay
+it. It is never persisted as a filename preference.
+
+File requests require the additional `fcb-launch-file-v1` bundle marker. Rebuild
+older bundles; the launcher refuses a file request instead of silently dropping
+its selection. Project-only older bundles retain their directory-launch behavior.
+App Store builds do not advertise this marker and independently refuse argv file
+activation: use the native folder picker and catalog there.
+
+The Foundation-only endpoint regressions are in
+`tests/AtlasStartupFileRegressionTests.swift`, compiled together with
+`swiftui/AtlasProjectCatalog.swift` in the configured qualification lane. Rust
+launcher tests remain in `crates/fcb-app/src/native_launch.rs`. Neither these
+unexecuted suites nor portable packaging checks qualify native file activation
+on a physical Mac.
 
 `CLI_NATIVE_LAUNCH_SUBMITTED` means Launch Services accepted the handoff, **not**
 that project discovery finished or a frame was presented. A canceled/timed-out

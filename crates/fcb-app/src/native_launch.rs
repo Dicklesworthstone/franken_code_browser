@@ -5,10 +5,11 @@
 //! or start Launch Services. No shell, repository executable, PATH lookup,
 //! default application, or implicit stdin is involved.
 
-use std::{ffi::OsString, path::{Path, PathBuf}};
+use std::{ffi::{OsStr, OsString}, path::{Path, PathBuf}};
 use fcb_app::args::{self, Command, MAX_SINGLE_ARGUMENT};
 
 const PROJECT_MARKER: &str = "Contents/Resources/fcb-launch-project-v1";
+const FILE_MARKER: &str = "Contents/Resources/fcb-launch-file-v1";
 const PICKER_MARKER: &str = "Contents/Resources/fcb-launch-picker-v1";
 const NATIVE_EXECUTABLE: &str = "Contents/MacOS/FrankenCodeBrowser";
 
@@ -35,12 +36,12 @@ impl Failure {
     }
     fn message(self) -> &'static str {
         match self {
-            Self::Options => "GUI launch accepts only a project directory; use read or open --json for reader options.",
-            Self::Path => "Native launch needs a bounded, NUL-free UTF-8 project path and an absolute .app bundle path.",
-            Self::Source => "The selected project directory could not be inspected.",
-            Self::File => "Native file activation is not connected yet. Use fcb read FILE, or launch its parent directory and choose the file.",
-            Self::Special => "A native project must be a directory, not a device, pipe or socket.",
-            Self::Symlink => "The selected final project component is a symbolic link.",
+            Self::Options => "GUI launch accepts a project directory or regular file; use read or open --json for reader options.",
+            Self::Path => "Native launch needs a bounded, NUL-free UTF-8 source path and an absolute .app bundle path.",
+            Self::Source => "The selected source or its parent directory could not be inspected.",
+            Self::File => "This app does not support native file startup. Rebuild it with scripts/build_macos_app.sh, or use fcb read FILE.",
+            Self::Special => "Native opening accepts directories or regular files, never devices, pipes or sockets.",
+            Self::Symlink => "The selected final source or project component is a symbolic link.",
             Self::Bundle => "The selected app lacks a valid launcher contract or executable. Rebuild it with scripts/build_macos_app.sh.",
             Self::MissingBundle => "Install a current FrankenCodeBrowser.app, or set FCB_APP_BUNDLE to its absolute .app path.",
             Self::RootGrant => "This sandboxed build needs its native folder picker. Launch without a project argument and grant access there.",
@@ -51,7 +52,7 @@ impl Failure {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BundleMode { ProjectArgument, NativePicker }
+enum BundleMode { ProjectArgument, ProjectAndFileArgument, NativePicker }
 
 /// None means the existing headless parser/service owns the request, including
 /// all malformed requests and machine-readable output. Never reinterpret them.
@@ -122,10 +123,11 @@ fn choose_bundle(
     inspect(&path).map(|mode| (path, mode))
 }
 
-fn marker_mode(project: bool, picker: bool) -> Result<BundleMode, Failure> {
-    match (project, picker) {
-        (true, false) => Ok(BundleMode::ProjectArgument),
-        (false, true) => Ok(BundleMode::NativePicker),
+fn marker_mode(project: bool, picker: bool, file: bool) -> Result<BundleMode, Failure> {
+    match (project, picker, file) {
+        (true, false, false) => Ok(BundleMode::ProjectArgument),
+        (true, false, true) => Ok(BundleMode::ProjectAndFileArgument),
+        (false, true, false) => Ok(BundleMode::NativePicker),
         _ => Err(Failure::Bundle),
     }
 }
@@ -136,7 +138,7 @@ fn open_arguments(bundle: &Path, mode: BundleMode, root: Option<&Path>)
     if !bundle_path(bundle) { return Err(Failure::Path); }
     let mut arguments = Vec::with_capacity(6);
     if let Some(root) = root {
-        if mode != BundleMode::ProjectArgument { return Err(Failure::RootGrant); }
+        if mode == BundleMode::NativePicker { return Err(Failure::RootGrant); }
         if !root.is_absolute() || !bounded_path(root) || root.to_str().is_none() { return Err(Failure::Path); }
         // Existing instances do not receive argv again. Each explicit project
         // gets its own native process rather than silently opening the old root.
@@ -149,6 +151,48 @@ fn open_arguments(bundle: &Path, mode: BundleMode, root: Option<&Path>)
         arguments.push("--args".into()); arguments.push("-fcb.root".into());
         arguments.push(root.as_os_str().to_owned());
     }
+    Ok(arguments)
+}
+
+/// A filename request opens only its immediate parent as the metadata project.
+/// Never search ancestors for a VCS root or canonicalize away native path bytes.
+fn file_target(path: &Path) -> Result<(PathBuf, OsString), Failure> {
+    if !path.is_absolute() || !bounded_path(path) || path.to_str().is_none() {
+        return Err(Failure::Path);
+    }
+    let root = path.parent().ok_or(Failure::Path)?;
+    let name = path.file_name().ok_or(Failure::Path)?;
+    if !root.is_absolute() || !bounded_path(root) { return Err(Failure::Path); }
+    Ok((root.to_owned(), name.to_owned()))
+}
+
+/// A single reversible UTF-8 Unix component. Hex keeps leading dashes, quotes,
+/// tabs/newlines and backslashes out of the native startup argument syntax.
+fn filename_hex(name: &OsStr) -> Result<String, Failure> {
+    let text = name.to_str().ok_or(Failure::Path)?;
+    let bytes = text.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_SINGLE_ARGUMENT || bytes.contains(&0)
+        || bytes.contains(&b'/') || bytes == b"." || bytes == b".." {
+        return Err(Failure::Path);
+    }
+    let mut hex = String::new();
+    hex.try_reserve_exact(bytes.len() * 2).map_err(|_| Failure::Path)?;
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    for &byte in bytes {
+        hex.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        hex.push(char::from(DIGITS[usize::from(byte & 15)]));
+    }
+    Ok(hex)
+}
+
+fn open_file_arguments(bundle: &Path, mode: BundleMode, root: &Path, name: &OsStr)
+    -> Result<Vec<OsString>, Failure>
+{
+    let mut arguments = open_arguments(bundle, mode, Some(root))?;
+    // Project-only older bundles must not silently discard the filename.
+    if mode != BundleMode::ProjectAndFileArgument { return Err(Failure::File); }
+    arguments.push("-fcb.file-hex".into());
+    arguments.push(filename_hex(name)?.into());
     Ok(arguments)
 }
 
@@ -193,25 +237,35 @@ mod native {
         // source-sized file. This is a compatibility contract, not code signing.
         let marker = |name: &str| fs::symlink_metadata(path.join(name))
             .is_ok_and(|entry| entry.is_file() && entry.len() == 0);
-        marker_mode(marker(PROJECT_MARKER), marker(PICKER_MARKER))
+        marker_mode(marker(PROJECT_MARKER), marker(PICKER_MARKER), marker(FILE_MARKER))
     }
 
     fn prepare(path: Option<&Path>) -> Result<Vec<OsString>, Failure> {
-        let root = path.map(|path| {
+        let target = path.map(|path| {
             let cwd = if path.is_absolute() { PathBuf::from("/") }
                 else { std::env::current_dir().map_err(|_| Failure::Source)? };
             let path = project_path(path, &cwd)?;
             let metadata = fs::symlink_metadata(&path).map_err(|_| Failure::Source)?;
             if metadata.file_type().is_symlink() { return Err(Failure::Symlink); }
-            if metadata.is_file() { return Err(Failure::File); }
+            if metadata.is_file() {
+                let (root, name) = file_target(&path)?;
+                let parent = fs::symlink_metadata(&root).map_err(|_| Failure::Source)?;
+                if parent.file_type().is_symlink() { return Err(Failure::Symlink); }
+                if !parent.is_dir() { return Err(Failure::Source); }
+                return Ok((root, Some(name)));
+            }
             if !metadata.is_dir() { return Err(Failure::Special); }
-            Ok(path)
+            Ok((path, None))
         }).transpose()?;
         let explicit = std::env::var_os("FCB_APP_BUNDLE").map(PathBuf::from);
         let executable = std::env::current_exe().ok();
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let (bundle, mode) = choose_bundle(explicit.as_deref(), executable.as_deref(), home.as_deref(), inspect_bundle)?;
-        open_arguments(&bundle, mode, root.as_deref())
+        match target {
+            Some((root, Some(name))) => open_file_arguments(&bundle, mode, &root, &name),
+            Some((root, None)) => open_arguments(&bundle, mode, Some(&root)),
+            None => open_arguments(&bundle, mode, None),
+        }
     }
 
     pub(crate) fn run(arguments: &[OsString], stdout: &mut impl Write, stderr: &mut impl Write,
@@ -344,10 +398,10 @@ mod tests {
     }
     #[test]
     fn bundle_markers_distinguish_direct_access_from_sandbox_grants() {
-        assert_eq!(marker_mode(true, false), Ok(BundleMode::ProjectArgument));
-        assert_eq!(marker_mode(false, true), Ok(BundleMode::NativePicker));
-        assert_eq!(marker_mode(false, false), Err(Failure::Bundle));
-        assert_eq!(marker_mode(true, true), Err(Failure::Bundle));
+        assert_eq!(marker_mode(true, false, false), Ok(BundleMode::ProjectArgument));
+        assert_eq!(marker_mode(false, true, false), Ok(BundleMode::NativePicker));
+        assert_eq!(marker_mode(false, false, false), Err(Failure::Bundle));
+        assert_eq!(marker_mode(true, true, false), Err(Failure::Bundle));
         assert_eq!(open_arguments(Path::new("/App.app"), BundleMode::NativePicker, Some(Path::new("/repo"))),
             Err(Failure::RootGrant));
         assert!(open_arguments(Path::new("/App.app"), BundleMode::NativePicker, None).is_ok());
@@ -376,4 +430,70 @@ mod tests {
             || false, || false, || {}), Handoff::Accepted);
         assert_eq!(count, 3);
     }
+    #[test]
+    fn file_opening_uses_the_immediate_parent_not_a_guessed_repository_root() {
+        let path = project_path(Path::new("src/main.rs"), Path::new("/work/project")).unwrap();
+        assert_eq!(file_target(&path).unwrap(), (PathBuf::from("/work/project/src"), OsString::from("main.rs")));
+        assert_eq!(file_target(Path::new("/main.rs")).unwrap(), (PathBuf::from("/"), OsString::from("main.rs")));
+        assert_eq!(file_target(Path::new("relative.rs")), Err(Failure::Path));
+        assert_eq!(file_target(Path::new("/")), Err(Failure::Path));
+        assert_eq!(file_target(Path::new("/work/..")), Err(Failure::Path));
+    }
+    #[test]
+    fn file_launch_preserves_the_exact_native_name_as_one_hex_argument() {
+        let (root, name) = file_target(Path::new("/work/My Project/é.rs")).unwrap();
+        let arguments = open_file_arguments(Path::new("/My App.app"), BundleMode::ProjectAndFileArgument, &root, &name).unwrap();
+        assert_eq!(arguments, args(&["-n", "-a", "/My App.app", "--args", "-fcb.root",
+            "/work/My Project", "-fcb.file-hex", "c3a92e7273"]));
+        assert_ne!(filename_hex(OsStr::new("é.rs")).unwrap(), filename_hex(OsStr::new("e\u{301}.rs")).unwrap());
+    }
+    #[test]
+    fn quoted_control_and_flag_shaped_filenames_never_become_arguments() {
+        for (name, expected) in [("-fcb.root", "2d6663622e726f6f74"), ("a b", "612062"),
+            ("a\nb", "610a62"), ("a\tb", "610962"), ("a\\b", "615c62"), ("a\"b", "612262")] {
+            assert_eq!(filename_hex(OsStr::new(name)).unwrap(), expected);
+            let arguments = open_file_arguments(Path::new("/App.app"), BundleMode::ProjectAndFileArgument,
+                Path::new("/repo"), OsStr::new(name)).unwrap();
+            assert_eq!(arguments.len(), 8);
+            assert_eq!(arguments[7], OsStr::new(expected));
+        }
+    }
+    #[test]
+    fn file_markers_are_additive_but_cannot_cross_the_sandbox_boundary() {
+        for project in [false, true] { for picker in [false, true] { for file in [false, true] {
+            let expected = match (project, picker, file) {
+                (true, false, false) => Ok(BundleMode::ProjectArgument),
+                (true, false, true) => Ok(BundleMode::ProjectAndFileArgument),
+                (false, true, false) => Ok(BundleMode::NativePicker),
+                _ => Err(Failure::Bundle),
+            };
+            assert_eq!(marker_mode(project, picker, file), expected);
+        } } }
+        assert!(open_arguments(Path::new("/App.app"), BundleMode::ProjectAndFileArgument, None).is_ok());
+        assert!(open_arguments(Path::new("/App.app"), BundleMode::ProjectAndFileArgument, Some(Path::new("/repo"))).is_ok());
+    }
+    #[test]
+    fn old_bundles_and_sandboxed_bundles_do_not_silently_drop_file_selection() {
+        assert_eq!(open_file_arguments(Path::new("/App.app"), BundleMode::ProjectArgument,
+            Path::new("/repo"), OsStr::new("main.rs")), Err(Failure::File));
+        assert_eq!(open_file_arguments(Path::new("/App.app"), BundleMode::NativePicker,
+            Path::new("/repo"), OsStr::new("main.rs")), Err(Failure::RootGrant));
+    }
+    #[test]
+    fn file_argument_validation_rejects_traversal_and_preserves_size_limits() {
+        for name in ["", ".", "..", "a/b", "/absolute", "a\0b"] {
+            assert_eq!(filename_hex(OsStr::new(name)), Err(Failure::Path));
+        }
+        assert_eq!(filename_hex(OsStr::new(&"x".repeat(MAX_SINGLE_ARGUMENT))).unwrap().len(), MAX_SINGLE_ARGUMENT * 2);
+        assert_eq!(filename_hex(OsStr::new(&"x".repeat(MAX_SINGLE_ARGUMENT + 1))), Err(Failure::Path));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_file_names_are_never_lossily_retargeted() {
+        use std::os::unix::ffi::OsStringExt;
+        let name = OsString::from_vec(vec![0xff]);
+        assert_eq!(filename_hex(&name), Err(Failure::Path));
+        assert_eq!(file_target(&Path::new("/repo").join(name)), Err(Failure::Path));
+    }
+
 }

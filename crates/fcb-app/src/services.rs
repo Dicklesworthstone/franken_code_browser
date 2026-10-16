@@ -55,10 +55,11 @@ Whole-file workspace mode accepts raw bytes and explicit text encoding.\n\
 IDs are response-local. Decoded offsets are window-local UTF-8, not file bytes.\n\
 Human source output escapes terminal controls; JSON retains logical text.\n\
 Exit: 0 complete, 1 complete no-match, 2 error, 3 partial/truncated, 130 canceled.\n\
-Native macOS executable: fcb [ROOT] or fcb open ROOT launches a compatible app.\n\
+Native macOS executable: fcb [PATH] or fcb open PATH launches a compatible app.\n\
 Direct app builds include Contents/MacOS/fcb; FCB_APP_BUNDLE selects an app path.\n\
 ROOT authorizes native discovery; reader options require read or open --json.\n\
-Individual native file activation is not connected; use read FILE or open FILE --json.\n\
+A regular FILE opens its parent project and selects its catalog entry once.\n\
+Discovery, exclusion and reader limits still apply; no ancestor/VCS-root scan.\n\
 Launch success means submitted, not project-ready. In-process services and other\n\
 platforms remain headless; sandboxed apps require their native folder picker.\n\
 All new CLI routes are implemented-unqualified; native product gates remain open.\n";
