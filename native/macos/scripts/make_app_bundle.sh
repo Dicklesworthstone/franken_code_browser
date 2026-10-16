@@ -12,7 +12,15 @@ BRIDGE="${FCB_BRIDGE_LIB:-../../target/$HOST_TARGET/release/libfcb_bridge.a}"
 APP="${FCB_APP_OUTPUT:-target/FrankenCodeBrowser.app}"
 SWIFT_TARGET="${FCB_SWIFT_TARGET:-$(uname -m)-apple-macosx14.0}"
 [ -f "$BRIDGE" ] || { echo "missing fcb-bridge archive: $BRIDGE" >&2; exit 2; }
-[ ! -e "$APP" ] || { echo "app output already exists: $APP" >&2; exit 2; }
+[ ! -e "$APP" ] && [ ! -L "$APP" ] || { echo "app output already exists: $APP" >&2; exit 2; }
+# An explicitly supplied CLI must be usable before creating any destination.
+# App Store builds deliberately omit the unsandboxed command-line executable.
+CLI=${FCB_CLI_BIN:-}
+if [ "${FCB_APP_STORE:-0}" = 1 ]; then CLI=''; fi
+if [ -n "$CLI" ]; then
+    case "$CLI" in /*) ;; *) echo 'FCB_CLI_BIN must be an absolute executable path' >&2; exit 2 ;; esac
+    [ -f "$CLI" ] && [ -x "$CLI" ] || { echo "missing executable fcb CLI: $CLI" >&2; exit 2; }
+fi
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp swiftui/Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 set -- -O -target "$SWIFT_TARGET" -parse-as-library
@@ -44,6 +52,13 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+# Copy and sign nested executable code before sealing the enclosing bundle.
+# Never install a wrapper which depends on the checkout or an ambient PATH tool.
+if [ -n "$CLI" ]; then
+    cp "$CLI" "$APP/Contents/MacOS/fcb"
+    chmod 755 "$APP/Contents/MacOS/fcb"
+    codesign --force --sign - "$APP/Contents/MacOS/fcb"
+fi
 # Versioned launcher contract. A sandboxed app deliberately does not promise to
 # turn a CLI path into a root grant. Markers are zero-byte regular files, included
 # in the resource seal, and consumed by the binary-only native launcher.

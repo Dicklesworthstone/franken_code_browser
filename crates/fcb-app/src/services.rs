@@ -49,13 +49,18 @@ File-window options: --offset DECIMAL --bytes DECIMAL --limit DECIMAL\n\
 File defaults: offset 0, 65536 visible source bytes, 100 stored matches.\n\
 Limits: 262144 visible bytes, 4096 stored matches, 8 MiB response.\n\
 Far-offset text requires --encoding; --raw-hex searches original bytes.\n\
-No directory is scanned without --workspace. Indexed workspace mode does not\n\
+Headless directory scans require --workspace. Indexed workspace mode does not\n\
 accept stdin, window offsets, raw-byte queries or an encoding override.\n\
 Whole-file workspace mode accepts raw bytes and explicit text encoding.\n\
 IDs are response-local. Decoded offsets are window-local UTF-8, not file bytes.\n\
 Human source output escapes terminal controls; JSON retains logical text.\n\
 Exit: 0 complete, 1 complete no-match, 2 error, 3 partial/truncated, 130 canceled.\n\
-Bare fcb and human open reserve the native GUI route, currently unavailable.\n\
+Native macOS executable: fcb [ROOT] or fcb open ROOT launches a compatible app.\n\
+Direct app builds include Contents/MacOS/fcb; FCB_APP_BUNDLE selects an app path.\n\
+ROOT authorizes native discovery; reader options require read or open --json.\n\
+Individual native file activation is not connected; use read FILE or open FILE --json.\n\
+Launch success means submitted, not project-ready. In-process services and other\n\
+platforms remain headless; sandboxed apps require their native folder picker.\n\
 All new CLI routes are implemented-unqualified; native product gates remain open.\n";
 
 pub(crate) fn help(json: bool, out: &mut Output) -> Result<u8, AppError> {
@@ -69,6 +74,7 @@ pub(crate) fn capabilities(args: &Arguments, out: &mut Output) -> Result<u8, App
     let command = if diagnostic { "doctor" } else { "capabilities" };
     let implemented = "implemented-unqualified";
     let file_state = if input::NATIVE_FILE_SUPPORTED { implemented } else { "unavailable" };
+    let launch_state = if cfg!(target_os = "macos") { implemented } else { "unavailable" };
     let rows = [
         ("bounded-stdin-reading", implemented, "Explicit input only; EOF required within byte cap."),
         ("named-file-range-reading", file_state, "One regular file; no full-file capture prerequisite."),
@@ -77,6 +83,7 @@ pub(crate) fn capabilities(args: &Arguments, out: &mut Output) -> Result<u8, App
         ("exact-window-byte-search", implemented, "Existing overlapping byte matcher; scope explicit."),
         ("lossless-json-output", implemented, "One bounded document; decimal-string integers and Unix path hex."),
         ("native-gui", "unavailable", "AppKit/Metal composition is not implemented in this binary."),
+        ("native-app-launch", launch_state, "Binary-only handoff to a compatible installed app; no installation probe or in-process renderer. Native readiness is not established."),
         ("workspace-cli-search", file_state, "Explicit discovery, native paths, indexed captures or whole-file streaming; --respect-ignores separately admits bounded repository rules."),
         ("persistent-cli-index", "unavailable", "No store is opened or implicitly created."),
         ("markdown-preview", "unavailable", "No integrated upstream document renderer in this lane."),

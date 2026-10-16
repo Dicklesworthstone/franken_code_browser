@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build the Rust bridge and SwiftUI/Metal app from this single checkout.
+# Build the Rust bridge, CLI and SwiftUI/Metal app from this single checkout.
 set -eu
 
 usage() {
@@ -37,17 +37,19 @@ if [ -z "$output" ]; then
     output="$root/dist/FrankenCodeBrowser-$revision-$stamp.app"
 fi
 case "$output" in /*.app) ;; *) echo 'output must be an absolute .app path' >&2; exit 2 ;; esac
-[ ! -e "$output" ] || { echo "app output already exists: $output" >&2; exit 2; }
+[ ! -e "$output" ] && [ ! -L "$output" ] || { echo "app output already exists: $output" >&2; exit 2; }
 [ -d "$(dirname "$output")" ] || mkdir -p "$(dirname "$output")"
 
 if [ "$profile" = release ]; then
-    cargo build --locked --release -p fcb-bridge --target "$target" >&2
+    cargo build --locked --release -p fcb-bridge -p fcb-app --target "$target" >&2
 else
-    cargo build --locked -p fcb-bridge --target "$target" >&2
+    cargo build --locked -p fcb-bridge -p fcb-app --target "$target" >&2
 fi
 bridge="$target_dir/$target/$profile/libfcb_bridge.a"
+cli="$target_dir/$target/$profile/fcb"
 [ -f "$bridge" ] || { echo "bridge archive missing after build: $bridge" >&2; exit 1; }
-FCB_BRIDGE_LIB="$bridge" FCB_APP_OUTPUT="$output" FCB_SWIFT_TARGET="$swift_target" \
+[ -f "$cli" ] && [ -x "$cli" ] || { echo "fcb CLI missing after build: $cli" >&2; exit 1; }
+FCB_BRIDGE_LIB="$bridge" FCB_CLI_BIN="$cli" FCB_APP_OUTPUT="$output" FCB_SWIFT_TARGET="$swift_target" \
     "$root/native/macos/scripts/make_app_bundle.sh" >&2
 codesign --verify --deep --strict "$output"
 printf '%s\n' "$output"
