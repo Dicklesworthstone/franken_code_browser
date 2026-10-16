@@ -19,7 +19,7 @@ import Observation
     var lineInput = "1"
     private var identity: AtlasReaderIdentity?
     private var sourceOffset: UInt64 = 0
-    private var history: [UInt64] = []
+    private var history = AtlasNavigationHistory<UInt64>()
     private var headingHistory: [UInt64] = []
     @ObservationIgnored private let supported: Bool
     @ObservationIgnored private let execute: Execute
@@ -48,7 +48,8 @@ import Observation
     }
     var canPrepare: Bool { unavailableReason == nil }
     var canNavigate: Bool { authorized && page != nil && !busy }
-    var canBack: Bool { canNavigate && !history.isEmpty }
+    var canBack: Bool { canNavigate && history.canBack }
+    var canForward: Bool { canNavigate && history.canForward }
     var canNext: Bool { canNavigate && page?.next != nil }
     var canHeadingsBack: Bool { canNavigate && !headingHistory.isEmpty }
     var canHeadingsNext: Bool { canNavigate && headings?.next != nil }
@@ -88,14 +89,21 @@ import Observation
                   page.inventory.matches(headings.inventory) else { throw AtlasReaderError.invalidResponse }
             model.page = page
             model.headings = headings
-            model.history = []; model.headingHistory = []
+            model.history.reset(to: page.first); model.headingHistory = []
             model.lineInput = String(page.first + 1)
             model.authorized = true
         }
     }
 
     func next() { if let next = page?.next { navigate(first: next) } }
-    func back() { if let first = history.last { navigate(first: first, goingBack: true) } }
+    func back() {
+        guard canBack, let move = history.back() else { return }
+        navigate(.window(first: move.target), historyMove: move)
+    }
+    func forward() {
+        guard canForward, let move = history.forward() else { return }
+        navigate(.window(first: move.target), historyMove: move)
+    }
     func goToLine() {
         guard let line = Self.number(lineInput), line > 0, let page,
               line - 1 < page.inventory.totalLines else {
@@ -187,24 +195,24 @@ import Observation
         cancel(silent: true)
         revoke()
         identity = nil; page = nil; headings = nil; source = nil
-        authorized = false; history = []; headingHistory = []
+        authorized = false; history.reset(); headingHistory = []
         sourceOffset = 0; lineInput = "1"; notice = ""
     }
 
-    private func navigate(first: UInt64, goingBack: Bool = false) {
+    private func navigate(first: UInt64) {
         guard let page, first < page.inventory.totalLines else { return }
-        navigate(.window(first: first), goingBack: goingBack)
+        navigate(.window(first: first))
     }
-    private func navigate(_ request: AtlasReaderDocumentRequest, goingBack: Bool = false) {
+    private func navigate(_ request: AtlasReaderDocumentRequest,
+                          historyMove: AtlasNavigationHistory<UInt64>.Move? = nil) {
         guard canNavigate, let previous = page else { return }
+        // Heading/source requests resolve their flow row in the shared engine;
+        // only that accepted row, never the transient target, enters history.
+        let move = historyMove ?? history.visit(previous.first)
         perform(request, notice: "Reading retained Markdown…") { model, result in
-            guard case .page(let page) = result, page.inventory.matches(previous.inventory) else {
+            guard case .page(let page) = result, page.inventory.matches(previous.inventory),
+                  model.history.commit(move, resolved: page.first) else {
                 throw AtlasReaderError.invalidResponse
-            }
-            if goingBack { _ = model.history.popLast() }
-            else if page.first != previous.first {
-                model.history.append(previous.first)
-                if model.history.count > 128 { model.history.removeFirst() }
             }
             model.page = page
             model.source = nil

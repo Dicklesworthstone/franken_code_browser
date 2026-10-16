@@ -106,8 +106,10 @@ import AppKit
         HStack(spacing: 6) {
             Button("Back", action: model.back).disabled(!model.canGoBack)
                 .help("Return to the previous retained byte window")
-            Button("Next", action: model.next).disabled(!model.canGoNext)
-                .help("Continue after this page without reopening the file")
+            Button("Forward", action: model.forward).disabled(!model.canGoForward)
+                .help("Revisit the retained window left by Back; this does not restore an expired search selection")
+            Button("Next page", action: model.next).disabled(!model.canGoNext)
+                .help("Continue after this page without reopening the file; distinct from navigation history")
             TextField("Byte offset", text: $model.offsetInput)
                 .frame(width: 88).textFieldStyle(.roundedBorder)
                 .accessibilityLabel("Original byte offset, zero based")

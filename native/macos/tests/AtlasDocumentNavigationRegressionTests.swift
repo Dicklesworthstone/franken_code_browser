@@ -1,8 +1,8 @@
 import Foundation
 
-// Foundation-only model regressions. Compile with the production AtlasReader,
-// AtlasReaderSearch, AtlasReaderOutline, AtlasReaderDocument and
-// AtlasDocumentPreviewModel sources in the configured qualification lane.
+// Foundation-only model regressions. Compile with AtlasNavigationHistory and
+// the production AtlasReader, AtlasReaderSearch, AtlasReaderOutline,
+// AtlasReaderDocument and AtlasDocumentPreviewModel in the qualification lane.
 // The injected operation stands in for the worker, not for the model under test.
 @main @MainActor struct AtlasDocumentNavigationRegressionTests {
     static func require(_ condition: @autoclosure () -> Bool, _ message: String) {
@@ -60,7 +60,7 @@ import Foundation
             switch request {
             case .prepare(let width):
                 generation += 1
-                let page = page(width: width)
+                let page = self.page(width: width)
                 return .prepared(page, .init(id: UUID(), inventory: page.inventory, first: 0, rows: [], next: nil))
             case .source(let target):
                 sourceRequests += 1

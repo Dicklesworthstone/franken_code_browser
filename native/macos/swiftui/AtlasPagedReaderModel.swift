@@ -40,8 +40,8 @@ import Observation
     var outlineLanguage: AtlasOutlineLanguage = .automatic {
         didSet { if oldValue != outlineLanguage { clearOutlineFilter(reset: true) } }
     }
-    private var history: [AtlasReaderRequest] = []
-    private var currentRequest: AtlasReaderRequest?
+    private typealias SourceHistory = AtlasNavigationHistory<AtlasReaderRequest>
+    private var history = SourceHistory()
     @ObservationIgnored private let capturedTarget: AtlasSearchCapturedHit?
     @ObservationIgnored private let coordinator: AtlasReaderCoordinator
     @ObservationIgnored private var task: Task<Void, Never>?
@@ -61,7 +61,8 @@ import Observation
     }
     deinit { task?.cancel() }
 
-    var canGoBack: Bool { !history.isEmpty && !busy }
+    var canGoBack: Bool { history.canBack && !busy }
+    var canGoForward: Bool { history.canForward && !busy }
     var canGoNext: Bool { page?.nextOffset != nil && !busy }
     var canFind: Bool { page != nil && coordinator.supportsFind }
     var findIsCurrent: Bool { findReport?.needle.utf8.elementsEqual(fileQuery.utf8) == true }
@@ -160,8 +161,12 @@ import Observation
         navigate(.window(offset: offset, bytes: AtlasReaderLimits.pageBytes))
     }
     func back() {
-        guard let request = history.last else { return }
-        navigate(request, goingBack: true)
+        guard canGoBack, let move = history.back() else { return }
+        navigate(move.target, historyMove: move)
+    }
+    func forward() {
+        guard canGoForward, let move = history.forward() else { return }
+        navigate(move.target, historyMove: move)
     }
     func goToByte() {
         guard let offset = Self.number(offsetInput) else { notice = AtlasReaderError.invalidInput.message; return }
@@ -303,7 +308,7 @@ import Observation
         operation = UUID()
         task?.cancel(); task = nil
         coordinator.close()
-        page = nil; source = nil; history = []; currentRequest = nil
+        page = nil; source = nil; history.reset()
         findReport = nil; selectedHitIndex = nil; selectedRange = nil
         queryWork = false; outlineWork = false
         fileQuery = ""
@@ -314,10 +319,11 @@ import Observation
         navigation = UUID()
     }
 
-    private func navigate(_ request: AtlasReaderRequest, goingBack: Bool = false, hitIndex: Int? = nil) {
-        guard let previous = page, let previousRequest = currentRequest else { return }
+    private func navigate(_ request: AtlasReaderRequest, historyMove: SourceHistory.Move? = nil, hitIndex: Int? = nil) {
+        guard let previous = page else { return }
         do { try request.validate(capturedBytes: previous.identity.capturedBytes) }
         catch { notice = AtlasReaderError.invalidInput.message; return }
+        let move = historyMove ?? history.visit(request)
         let isSymbol: Bool
         if case .symbol = request { isSymbol = true } else { isSymbol = false }
         let ticket = begin(query: hitIndex != nil, outline: isSymbol)
@@ -326,12 +332,7 @@ import Observation
             do {
                 let next = try await coordinator.read(request)
                 guard operation == ticket, !Task.isCancelled else { return }
-                if goingBack { _ = history.popLast() }
-                else if request != previousRequest {
-                    history.append(previousRequest)
-                    if history.count > 128 { history.removeFirst(history.count - 128) }
-                }
-                install(next, request: request)
+                guard install(next, request: request, moving: move) else { throw AtlasReaderError.invalidResponse }
                 if let hitIndex { selectedHitIndex = hitIndex }
                 finish(ticket)
             } catch { fail(error, ticket: ticket) }
@@ -347,13 +348,20 @@ import Observation
         outlineWork = outline
         return operation
     }
-    private func install(_ page: AtlasReaderPage, request: AtlasReaderRequest) {
-        // History restores the source page, never a now-replaced query's hit.
-        // An explicit Back does not silently regain old exact-hit authority.
+    @discardableResult private func install(_ page: AtlasReaderPage, request: AtlasReaderRequest,
+                                           moving: SourceHistory.Move? = nil) -> Bool {
+        // Both directions restore plain source pages, never an old query's hit
+        // or outline target. Exact selection/copy authority must be re-earned.
+        let position: AtlasReaderRequest
         switch request {
         case .hit, .symbol:
-            currentRequest = .window(offset: page.start, bytes: max(4, min(AtlasReaderLimits.maximumPageBytes, page.end - page.start)))
-        default: currentRequest = request
+            position = .window(offset: page.start, bytes: max(4, min(AtlasReaderLimits.maximumPageBytes, page.end - page.start)))
+        default: position = request
+        }
+        if let moving {
+            guard history.commit(moving, resolved: position) else { return false }
+        } else {
+            history.reset(to: position)
         }
         self.page = page
         documentPreview.bind(identity: page.identity, sourceOffset: page.start)
@@ -365,6 +373,7 @@ import Observation
         offsetInput = String(page.start)
         if let line = page.firstPhysicalLine { lineInput = String(line) }
         notice = ""
+        return true
     }
     private func finish(_ ticket: UUID) {
         guard operation == ticket else { return }

@@ -81,6 +81,8 @@ import AppKit
     private var flowControls: some View {
         HStack(spacing: 6) {
             Button("Back", action: model.back).disabled(!model.canBack)
+            Button("Forward", action: model.forward).disabled(!model.canForward)
+                .help("Revisit the document page left by Back, within this prepared generation")
             Button("Next page", action: model.next).disabled(!model.canNext)
             TextField("Flow row", text: $model.lineInput)
                 .frame(width: 70).textFieldStyle(.roundedBorder)
