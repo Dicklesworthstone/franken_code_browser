@@ -7,6 +7,7 @@ import Observation
 @Observable @MainActor final class AtlasDocumentPreviewModel {
     typealias Execute = @MainActor (AtlasReaderDocumentRequest) async throws -> AtlasReaderDocumentResult
     typealias Clipboard = @MainActor (String) -> Bool
+    typealias SourceNavigation = @MainActor (AtlasReaderDocumentTarget) -> Void
 
     private(set) var page: AtlasReaderDocumentPage?
     private(set) var headings: AtlasReaderDocumentHeadings?
@@ -116,13 +117,38 @@ import Observation
     func nextHeadings() { if let next = headings?.next { loadHeadings(first: next) } }
     func previousHeadings() { if let first = headingHistory.last { loadHeadings(first: first, goingBack: true) } }
 
-    func showSource(_ target: AtlasReaderDocumentTarget) {
+    func showSource(_ target: AtlasReaderDocumentTarget, navigate: SourceNavigation? = nil) {
         guard allows(target) else { return }
-        perform(.source(target), notice: "Locating enclosing captured Markdown…") { model, result in
+        // Deliver only after perform has committed the response and released its
+        // busy/task state. The host may synchronously start source navigation,
+        // cancel this preview, close its sheet or replace the whole reader.
+        perform(.source(target), notice: "Locating enclosing captured Markdown…", then: { model in
+            guard let identity = model.identity,
+                  model.sourceOffset(for: target, reader: identity) != nil else { return }
+            navigate?(target)
+        }) { model, result in
             guard case .source(let source) = result, source.target == target,
-                  model.page?.target(at: target.line.id) == target else { throw AtlasReaderError.invalidResponse }
+                  model.page?.target(at: target.line.id) == target,
+                  source.enclosingOriginal == target.line.enclosingOriginal,
+                  source.enclosingOriginal.valid(upTo: target.inventory.identity.capturedBytes, nonempty: true) else {
+                throw AtlasReaderError.invalidResponse
+            }
             model.source = source
         }
+    }
+
+    /// Resolve a CURRENT mapped row for the CURRENT retained reader, never a
+    /// filename reopen or an offset into rendered text. A context response alone
+    /// is insufficient after reflow/page replacement. The result is an enclosing
+    /// region's original start, not an invented glyph-exact selection.
+    func sourceOffset(for target: AtlasReaderDocumentTarget, reader: AtlasReaderIdentity) -> UInt64? {
+        guard allows(target), identity?.matches(reader) == true,
+              target.inventory.identity.matches(reader),
+              let source, source.target == target,
+              let region = target.line.enclosingOriginal,
+              source.enclosingOriginal == region,
+              region.valid(upTo: reader.capturedBytes, nonempty: true) else { return nil }
+        return region.start
     }
 
     /// Clipboard access occurs only in the explicit UI action's synchronous
@@ -200,6 +226,7 @@ import Observation
         }
     }
     private func perform(_ request: AtlasReaderDocumentRequest, notice: String,
+                         then: (@MainActor (AtlasDocumentPreviewModel) -> Void)? = nil,
                          accept: @escaping @MainActor (AtlasDocumentPreviewModel, AtlasReaderDocumentResult) throws -> Void) {
         guard let identity else { return }
         cancel(silent: true)
@@ -215,7 +242,11 @@ import Observation
                       self.identity?.matches(identity) == true else { return }
                 self.notice = ""
                 try accept(self, result)
-                if self.operation == ticket { self.busy = false; self.task = nil }
+                if self.operation == ticket {
+                    self.busy = false; self.task = nil
+                    then?(self)
+                    // No mutation after calling the reentrant host callback.
+                }
             } catch {
                 guard let self, self.operation == ticket, !Task.isCancelled else { return }
                 self.notice = (error as? AtlasReaderError)?.message ?? AtlasReaderError.unavailable.message

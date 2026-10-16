@@ -6,7 +6,11 @@ import AppKit
 /// invents no heading slugs and grants no network or external-link access.
 @MainActor struct AtlasDocumentPreviewView: View {
     @Bindable var model: AtlasDocumentPreviewModel
+    var embedded = false
+    var openSource: AtlasDocumentPreviewModel.SourceNavigation?
+    var closePreview: (() -> Void)?
     @Environment(\.dismiss) private var dismiss
+    @State private var showsHeadings = false
     @State private var shownSource: AtlasSource?
     @State private var sourceSelection: AtlasReaderSelection?
     @State private var sourceNavigation = UUID()
@@ -16,7 +20,9 @@ import AppKit
             toolbar
             Divider()
             HSplitView {
-                headingBrowser.frame(minWidth: 160, idealWidth: 220, maxWidth: 320)
+                if !embedded || showsHeadings {
+                    headingBrowser.frame(minWidth: 160, idealWidth: 220, maxWidth: 320)
+                }
                 VStack(spacing: 0) {
                     flowControls
                     Divider()
@@ -26,7 +32,7 @@ import AppKit
                         sourceContext(source, text: shownSource).frame(minHeight: 150, idealHeight: 200, maxHeight: 280)
                     }
                 }
-                .frame(minWidth: 520, maxWidth: .infinity, maxHeight: .infinity)
+                .frame(minWidth: embedded ? 440 : 520, maxWidth: .infinity, maxHeight: .infinity)
             }
             Divider()
             VStack(alignment: .leading, spacing: 4) {
@@ -36,7 +42,8 @@ import AppKit
             .font(.caption).textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading).padding(10)
         }
-        .frame(minWidth: 850, idealWidth: 1040, minHeight: 580, idealHeight: 760)
+        .frame(minWidth: embedded ? 480 : 850, idealWidth: embedded ? 560 : 1040,
+            minHeight: embedded ? 300 : 580, idealHeight: 760)
         .onChange(of: model.source?.target, initial: true) { _, _ in installSourceContext() }
         .onDisappear { model.cancel(silent: true) }
     }
@@ -44,8 +51,11 @@ import AppKit
     private var toolbar: some View {
         HStack(spacing: 10) {
             Label("Markdown preview", systemImage: "doc.richtext").font(.headline)
-            Text("Logical flow").font(.caption).foregroundStyle(.secondary)
+            if !embedded { Text("Logical flow").font(.caption).foregroundStyle(.secondary) }
             Spacer()
+            if embedded {
+                Button(showsHeadings ? "Hide headings" : "Headings") { showsHeadings.toggle() }
+            }
             TextField("Columns", text: $model.widthInput)
                 .frame(width: 64).textFieldStyle(.roundedBorder)
                 .accessibilityLabel("Markdown preview width in columns")
@@ -57,8 +67,13 @@ import AppKit
                 ProgressView().controlSize(.small).accessibilityLabel("Processing retained Markdown")
                 Button("Cancel") { model.cancel() }
             }
-            Button("Done") { model.cancel(silent: true); dismiss() }
-                .keyboardShortcut(.cancelAction)
+            if embedded {
+                Button("Hide") { model.cancel(silent: true); closePreview?() }
+                    .accessibilityLabel("Hide the split Markdown preview; keep the source reader open")
+            } else {
+                Button("Done") { model.cancel(silent: true); dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
         }
         .padding(10)
     }
@@ -97,21 +112,24 @@ import AppKit
                                 .fixedSize(horizontal: true, vertical: true)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                             if let target = page.target(at: line.id) {
-                                Button { model.showSource(target) } label: {
+                                Button { model.showSource(target, navigate: embedded ? openSource : nil) } label: {
                                     Image(systemName: "doc.text.magnifyingglass")
                                 }
                                 .buttonStyle(.borderless)
                                 .disabled(!model.allows(target))
                                 .accessibilityLabel("Show enclosing Markdown for flow row \(line.id + 1)")
-                                .help("Show the enclosing original Markdown region; this is not a glyph-exact source span")
+                                .help("Show the enclosing original Markdown region; in split mode also navigate the retained source reader")
                                 Menu {
+                                    if let openSource {
+                                        Button("Open in source reader") { model.showSource(target, navigate: openSource) }
+                                    }
                                     Button("Copy rendered row") { copy(target, mode: .renderedText) }
                                     Button("Copy enclosing Markdown hex") { copy(target, mode: .enclosingMarkdown) }
                                 } label: { Image(systemName: "doc.on.doc") }
                                 .menuStyle(.borderlessButton)
                                 .fixedSize()
                                 .disabled(!model.allows(target))
-                                .accessibilityLabel("Copy flow row \(line.id + 1)")
+                                .accessibilityLabel("Copy or open flow row \(line.id + 1)")
                             } else {
                                 Text("Unmapped").font(.caption2).foregroundStyle(.secondary)
                                     .help("This synthetic flow row has no original source region to activate")
@@ -174,6 +192,11 @@ import AppKit
                 Text("Enclosing original Markdown · bytes \(source.enclosingOriginal.start)..<\(source.enclosingOriginal.end)")
                     .font(.system(size: 11, design: .monospaced))
                 Spacer()
+                if let openSource {
+                    Button("Open in source reader") { openSource(source.target) }
+                        .disabled(!model.allows(source.target))
+                        .help("Navigate within this same capture; do not reopen the live file")
+                }
                 Button("Copy region hex") { copy(source.target, mode: .enclosingMarkdown) }
                     .disabled(!model.allows(source.target))
             }

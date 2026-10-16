@@ -13,6 +13,7 @@ import AppKit
     @State private var copyNotice = ""
     @State private var showsOutline = false
     @State private var showsDocument = false
+    @State private var showsSplitPreview = false
 
     init(root: String, path: String, accessLease: AnyObject?, captured: AtlasSearchCapturedHit? = nil) {
         self.root = root
@@ -26,6 +27,27 @@ import AppKit
         VStack(spacing: 4) {
             controls
             findControls
+            HSplitView {
+                // This child retains its structural identity when the preview
+                // is inserted or removed: toggling does not reopen the source.
+                sourcePane.frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
+                if showsSplitPreview {
+                    AtlasDocumentPreviewView(model: model.documentPreview, embedded: true,
+                        openSource: openPreviewSource, closePreview: { showsSplitPreview = false })
+                }
+            }
+        }
+        .sheet(isPresented: $showsDocument) {
+            AtlasDocumentPreviewView(model: model.documentPreview, openSource: openPreviewSource)
+        }
+        .onAppear(perform: open)
+        .onDisappear { model.close(); copyNotice = "" }
+        .onChange(of: model.navigation) { _, _ in copyNotice = "" }
+        .onChange(of: Array(model.fileQuery.utf8)) { _, _ in copyNotice = "" }
+    }
+
+    private var sourcePane: some View {
+        VStack(spacing: 4) {
             if let label = model.symbolSelectionLabel {
                 HStack {
                     Text(label).font(.caption2).foregroundStyle(.secondary)
@@ -78,13 +100,6 @@ import AppKit
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 10).padding(.bottom, 4)
         }
-        .sheet(isPresented: $showsDocument) {
-            AtlasDocumentPreviewView(model: model.documentPreview)
-        }
-        .onAppear(perform: open)
-        .onDisappear { model.close(); copyNotice = "" }
-        .onChange(of: model.navigation) { _, _ in copyNotice = "" }
-        .onChange(of: Array(model.fileQuery.utf8)) { _, _ in copyNotice = "" }
     }
 
     private var controls: some View {
@@ -124,10 +139,17 @@ import AppKit
                 .popover(isPresented: $showsOutline) { AtlasOutlineBrowser(model: model) }
             Button("Markdown") {
                 showsDocument = true
-                if !model.documentPreview.authorized { model.documentPreview.prepare() }
+                preparePreview()
             }
-            .disabled(model.page == nil || model.busy)
+            .disabled(model.page == nil || model.busy || showsSplitPreview)
             .help("Preview the same retained capture with headings and source mapping; UTF-8 sources up to 64 KiB")
+            Button(showsSplitPreview ? "Hide preview" : "Split preview") {
+                showsSplitPreview.toggle()
+                if showsSplitPreview { preparePreview() }
+                else { model.documentPreview.cancel(silent: true) }
+            }
+            .disabled(model.page == nil || model.busy || showsDocument)
+            .help("Read source and Markdown side by side from one retained capture; each pane scrolls independently")
             Button("Previous hit") { model.moveHit(backwards: true) }.disabled(!model.canMoveHit)
             Button("Next hit") { model.moveHit(backwards: false) }.disabled(!model.canMoveHit)
             if model.matchHex != nil {
@@ -143,6 +165,19 @@ import AppKit
         .controlSize(.small).padding(.horizontal, 10)
     }
 
+    private func preparePreview() {
+        if !model.documentPreview.authorized { model.documentPreview.prepare() }
+    }
+    private func openPreviewSource(_ target: AtlasReaderDocumentTarget) {
+        // Resolve against both current models at activation, not a captured
+        // filename or cached byte offset. The existing reader history/worker
+        // owns the transaction, cancellation and source admission.
+        guard !model.busy, let identity = model.page?.identity,
+              let offset = model.documentPreview.sourceOffset(for: target, reader: identity) else { return }
+        model.offsetInput = String(offset)
+        model.goToByte()
+        showsDocument = false
+    }
     private func open() {
         copyNotice = ""
         model.open(root: root, path: path, accessLease: accessLease)
