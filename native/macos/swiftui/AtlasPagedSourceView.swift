@@ -121,8 +121,13 @@ import AppKit
                 .onSubmit(model.goToLine)
             Button("Go line", action: model.goToLine).disabled(model.page == nil)
             Spacer()
+            Button("Refresh from disk", action: model.refreshFromDisk)
+                .disabled(!model.canRefresh)
+                .help("Explicitly recapture this project file. Success starts a new capture at the first page and clears old exact targets/history; failure keeps the retained source.")
+                .accessibilityLabel("Refresh retained source from the current disk file")
             if model.busy {
-                ProgressView().controlSize(.small).accessibilityLabel("Reading source page")
+                ProgressView().controlSize(.small)
+                    .accessibilityLabel(model.isRefreshing ? "Refreshing source capture" : "Reading source page")
                 Button("Cancel", action: model.cancel)
             }
         }

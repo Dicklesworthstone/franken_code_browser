@@ -12,6 +12,8 @@ import Observation
     private(set) var source: AtlasSource?
     private(set) var navigation = UUID()
     private(set) var busy = false
+    private(set) var isRefreshing = false
+    private(set) var refreshedFromDisk = false
     private(set) var notice = ""
     var offsetInput = "0"
     var lineInput = "1"
@@ -43,6 +45,9 @@ import Observation
     private typealias SourceHistory = AtlasNavigationHistory<AtlasReaderRequest>
     private var history = SourceHistory()
     @ObservationIgnored private let capturedTarget: AtlasSearchCapturedHit?
+    @ObservationIgnored private let liveTransport: AtlasReaderTransport
+    @ObservationIgnored private var refreshInput: AtlasReaderInput?
+    @ObservationIgnored private var refreshAccessLease: AnyObject?
     @ObservationIgnored private let coordinator: AtlasReaderCoordinator
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var operation = UUID()
@@ -52,6 +57,7 @@ import Observation
          document: AtlasReaderDocumentTransport? = nil,
          captured: AtlasSearchCapturedHit? = nil) {
         capturedTarget = captured
+        liveTransport = transport
         let coordinator = AtlasReaderCoordinator(transport: captured.map { transport.importing($0) } ?? transport, search: search,
             outline: outline, document: document)
         self.coordinator = coordinator
@@ -64,6 +70,7 @@ import Observation
     var canGoBack: Bool { history.canBack && !busy }
     var canGoForward: Bool { history.canForward && !busy }
     var canGoNext: Bool { page?.nextOffset != nil && !busy }
+    var canRefresh: Bool { page != nil && refreshInput != nil && !busy && !documentPreview.busy }
     var canFind: Bool { page != nil && coordinator.supportsFind }
     var findIsCurrent: Bool { findReport?.needle.utf8.elementsEqual(fileQuery.utf8) == true }
     var canMoveHit: Bool { findIsCurrent && findReport?.hits.isEmpty == false && !busy }
@@ -100,7 +107,11 @@ import Observation
     var coverage: String {
         guard let page else { return "Retained capture limit: \(AtlasReaderLimits.captureBytes / 1024 / 1024) MiB. Oversized sources are refused, not truncated." }
         var messages = ["Logical page; layout is local to this window."]
-        if capturedTarget != nil { messages.append("Source imported from the retained workspace search; no live-file reread.") }
+        if refreshedFromDisk {
+            messages.append("Explicitly refreshed disk capture; older search, outline and preview targets were retired. File observation is not an atomic filesystem snapshot.")
+        } else if capturedTarget != nil {
+            messages.append("Source imported from the retained workspace search; no live-file reread.")
+        }
         if let label = symbolSelectionLabel { messages.append("\(label); heuristic candidate, not semantic resolution.") }
         if matchHex != nil { messages.append("Selection belongs to this retained file query, not a workspace search capture.") }
         if page.rangeLimited { messages.append("Requested lines exceed the page byte limit. Next continues through the retained bytes.") }
@@ -113,14 +124,19 @@ import Observation
         close()
         let input: AtlasReaderInput
         do {
+            let liveInput = try AtlasReaderInput(root: root, path: path)
             if let target = capturedTarget {
                 guard target.root.utf8.elementsEqual(root.utf8), target.path.utf8.elementsEqual(path.utf8),
                       coordinator.supportsFind else { throw AtlasReaderError.invalidInput }
                 input = try AtlasReaderInput(captured: target)
                 fileQuery = target.needle
             } else {
-                input = try AtlasReaderInput(root: root, path: path)
+                input = liveInput
             }
+            // Remember only the explicitly opened project/path and its current
+            // lease. Captured metadata alone never grants a refresh destination.
+            refreshInput = liveInput
+            refreshAccessLease = accessLease
         } catch { notice = AtlasReaderError.invalidInput.message; return }
         let ticket = begin(query: capturedTarget != nil)
         notice = capturedTarget == nil ? "Capturing source for bounded page navigation…"
@@ -150,8 +166,46 @@ import Observation
                 // Failed initial activation has no publishable page. Retire
                 // its independently imported reader rather than retaining a
                 // hidden capture or falling back to current disk contents.
-                if operation == ticket, page == nil { coordinator.close() }
+                if operation == ticket, page == nil {
+                    coordinator.close()
+                    refreshInput = nil; refreshAccessLease = nil
+                }
                 fail(error, ticket: ticket)
+            }
+        }
+    }
+
+    /// Explicit user intent to observe the current disk file. Keep the accepted
+    /// page, query, outline, preview and history until a candidate's first page
+    /// validates. Changed bytes begin a fresh history rather than silently
+    /// resolving any old exact anchor against a different capture.
+    func refreshFromDisk() {
+        guard canRefresh, let input = refreshInput else { return }
+        let accessLease = refreshAccessLease
+        let ticket = begin()
+        isRefreshing = true
+        notice = "Capturing current disk bytes… The retained source remains unchanged until refresh succeeds."
+        task = Task {
+            do {
+                let replacement = try await coordinator.stageOpen(input: input,
+                    accessLease: accessLease, using: liveTransport)
+                guard operation == ticket, !Task.isCancelled else { return }
+                // No await between session commit and presentation install.
+                // Source navigation, cancellation and close all revoke both
+                // operation tickets before a suspended refresh can return.
+                let next = try coordinator.commitOpen(replacement)
+                clearFileSearch()
+                clearOutlineFilter(reset: true)
+                documentPreview.close()
+                lineInput = "1"
+                install(next, request: .firstPage)
+                refreshedFromDisk = true
+                finish(ticket)
+                notice = "Refreshed from disk at the first page. Previous exact targets and navigation history were cleared; rerun Find, Outline or Markdown for this capture."
+            } catch {
+                guard operation == ticket, !Task.isCancelled else { return }
+                fail(error, ticket: ticket)
+                notice = "Refresh failed. The previous retained source is unchanged. " + notice
             }
         }
     }
@@ -293,21 +347,28 @@ import Observation
     /// Explicit cancellation keeps a successfully installed page. Cancellation
     /// during initial capture instead releases its handle after work drains.
     func cancel() {
+        let wasRefreshing = isRefreshing
         documentPreview.cancel(silent: true)
         operation = UUID()
         task?.cancel(); task = nil
         coordinator.cancel()
-        if page == nil { coordinator.close() }
-        busy = false
+        if page == nil {
+            coordinator.close()
+            refreshInput = nil; refreshAccessLease = nil
+        }
+        busy = false; isRefreshing = false
         queryWork = false
         outlineWork = false
-        notice = page == nil ? "Source opening canceled." : "Navigation canceled. The current retained page is unchanged."
+        notice = wasRefreshing ? "Refresh canceled. The previous retained source is unchanged."
+            : (page == nil ? "Source opening canceled." : "Navigation canceled. The current retained page is unchanged.")
     }
     func close() {
         documentPreview.close()
         operation = UUID()
         task?.cancel(); task = nil
         coordinator.close()
+        refreshInput = nil; refreshAccessLease = nil
+        isRefreshing = false; refreshedFromDisk = false
         page = nil; source = nil; history.reset()
         findReport = nil; selectedHitIndex = nil; selectedRange = nil
         queryWork = false; outlineWork = false
@@ -344,6 +405,7 @@ import Observation
         coordinator.cancel()
         operation = UUID()
         busy = true
+        isRefreshing = false
         queryWork = query
         outlineWork = outline
         return operation
@@ -377,7 +439,7 @@ import Observation
     }
     private func finish(_ ticket: UUID) {
         guard operation == ticket else { return }
-        busy = false; task = nil; queryWork = false; outlineWork = false
+        busy = false; isRefreshing = false; task = nil; queryWork = false; outlineWork = false
     }
     private func fail(_ error: Error, ticket: UUID) {
         guard operation == ticket, !Task.isCancelled else { return }
