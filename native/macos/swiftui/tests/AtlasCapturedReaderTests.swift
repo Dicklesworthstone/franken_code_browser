@@ -57,7 +57,11 @@ private final class Calls: @unchecked Sendable {
             window: { _, _, _ in calls.add("window"); return "window" },
             lines: { _, _, _, _ in calls.add("lines"); return "lines" },
             cancel: { _ in calls.add("cancel"); return true }, close: { _ in calls.add("close"); return true },
-            retirementFailed: { calls.add("failed") })
+            retirementFailed: { calls.add("failed") },
+            fork: { source, destination in
+                precondition(source == 100 && destination == 101)
+                calls.add("fork"); return "independent captured info"
+            })
         let target = AtlasSearchCapturedHit(root: "/repo", path: "src.rs", needle: "x", start: 10, end: 12,
             capturedBytes: 20, openReader: { handle in
                 precondition(handle == 100); calls.add("import"); return "exact captured info"
@@ -69,6 +73,8 @@ private final class Calls: @unchecked Sendable {
         check(calls.get("live-open") == 0 && calls.get("import") == 1, "No live open on success or label refusal")
         check(transport.window(100, 0, 4) == "window" && transport.lines(100, 1, 1, 4) == "lines", "Later reads use unchanged retained-reader operations")
         check(transport.cancel(100) && transport.close(100), "Reader cancellation/retirement remains independent")
+        check(transport.fork?(100, 101) == "independent captured info" && calls.get("fork") == 1,
+              "Captured-search transport lost independent pin capability")
         let failure = AtlasSearchCapturedHit(root: "/repo", path: "src.rs", needle: "x", start: 10, end: 12,
             capturedBytes: 20, openReader: { _ in throw AtlasSearchError.invalidResponse })
         check(base.importing(failure).open(100, "src.rs", 20) == nil && calls.get("live-open") == 0,

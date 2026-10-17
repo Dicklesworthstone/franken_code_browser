@@ -12,6 +12,8 @@ private func fcb_reader_lines(_ handle: UInt64, _ first: UInt64, _ count: UInt64
 private func fcb_reader_cancel(_ handle: UInt64) -> UInt8
 @_silgen_name("fcb_reader_close")
 private func fcb_reader_close(_ handle: UInt64) -> UInt8
+@_silgen_name("fcb_reader_fork")
+private func fcb_reader_fork(_ source: UInt64, _ destination: UInt64) -> UnsafeMutablePointer<CChar>?
 
 extension AtlasReaderTransport {
     static let native = Self(
@@ -28,7 +30,7 @@ extension AtlasReaderTransport {
             // Rust registry retains its capacity charge; failure is not success.
             let message = Data("FCB_READER_RETIREMENT_UNAVAILABLE\n".utf8)
             try? FileHandle.standardError.write(contentsOf: message)
-        })
+        }, fork: { take(fcb_reader_fork($0, $1)) })
 
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
         guard let pointer else { return nil }

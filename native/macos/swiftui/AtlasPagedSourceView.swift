@@ -9,18 +9,33 @@ import AppKit
     let root: String
     let path: String
     let accessLease: AnyObject?
+    private let ownsModel: Bool
+    private let pin: ((AtlasPagedReaderModel) -> Void)?
+    private let canPin: Bool
     @State private var model: AtlasPagedReaderModel
     @State private var copyNotice = ""
     @State private var showsOutline = false
     @State private var showsDocument = false
     @State private var showsSplitPreview = false
 
-    init(root: String, path: String, accessLease: AnyObject?, captured: AtlasSearchCapturedHit? = nil) {
+    init(root: String, path: String, accessLease: AnyObject?, captured: AtlasSearchCapturedHit? = nil,
+         canPin: Bool = false, pin: ((AtlasPagedReaderModel) -> Void)? = nil) {
         self.root = root
         self.path = path
         self.accessLease = accessLease
+        ownsModel = true
+        self.canPin = canPin
+        self.pin = pin
         _model = State(initialValue: AtlasPagedReaderModel(transport: .native, search: .native,
             outline: .native, document: .native, captured: captured))
+    }
+
+    /// A pin is already open and owned by the enclosing native workspace.
+    /// Temporary tab/view disappearance neither reopens nor closes its capture.
+    init(model: AtlasPagedReaderModel) {
+        root = ""; path = ""; accessLease = nil
+        ownsModel = false; canPin = false; pin = nil
+        _model = State(initialValue: model)
     }
 
     var body: some View {
@@ -40,8 +55,8 @@ import AppKit
         .sheet(isPresented: $showsDocument) {
             AtlasDocumentPreviewView(model: model.documentPreview, openSource: openPreviewSource)
         }
-        .onAppear(perform: open)
-        .onDisappear { model.close(); copyNotice = "" }
+        .onAppear { if ownsModel { open() } }
+        .onDisappear { if ownsModel { model.close() }; copyNotice = "" }
         .onChange(of: model.navigation) { _, _ in copyNotice = "" }
         .onChange(of: Array(model.fileQuery.utf8)) { _, _ in copyNotice = "" }
     }
@@ -87,7 +102,7 @@ import AppKit
             } else {
                 VStack(spacing: 8) {
                     Text(model.busy ? "Opening retained source…" : "Retained source unavailable")
-                    if !model.busy { Button("Retry opening", action: open) }
+                    if !model.busy && ownsModel { Button("Retry opening", action: open) }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -103,73 +118,84 @@ import AppKit
     }
 
     private var controls: some View {
-        HStack(spacing: 6) {
-            Button("Back", action: model.back).disabled(!model.canGoBack)
-                .help("Return to the previous retained byte window")
-            Button("Forward", action: model.forward).disabled(!model.canGoForward)
-                .help("Revisit the retained window left by Back; this does not restore an expired search selection")
-            Button("Next page", action: model.next).disabled(!model.canGoNext)
-                .help("Continue after this page without reopening the file; distinct from navigation history")
-            TextField("Byte offset", text: $model.offsetInput)
-                .frame(width: 88).textFieldStyle(.roundedBorder)
-                .accessibilityLabel("Original byte offset, zero based")
-                .onSubmit(model.goToByte)
-            Button("Go byte", action: model.goToByte).disabled(model.page == nil)
-            TextField("Line", text: $model.lineInput)
-                .frame(width: 64).textFieldStyle(.roundedBorder)
-                .accessibilityLabel("Physical source line, one based")
-                .onSubmit(model.goToLine)
-            Button("Go line", action: model.goToLine).disabled(model.page == nil)
-            Spacer()
-            Button("Refresh from disk", action: model.refreshFromDisk)
-                .disabled(!model.canRefresh)
-                .help("Explicitly recapture this project file. Success starts a new capture at the first page and clears old exact targets/history; failure keeps the retained source.")
-                .accessibilityLabel("Refresh retained source from the current disk file")
-            if model.busy {
-                ProgressView().controlSize(.small)
-                    .accessibilityLabel(model.isRefreshing ? "Refreshing source capture" : "Reading source page")
-                Button("Cancel", action: model.cancel)
+        ScrollView(.horizontal) {
+            HStack(spacing: 6) {
+                if let pin {
+                    Button { pin(model) } label: { Label("Pin source", systemImage: "pin") }
+                        .disabled(!canPin || !model.canPin)
+                        .keyboardShortcut("p", modifiers: [.command, .shift])
+                        .help("Keep this exact retained source beside other files (⇧⌘P); pinning never rereads the disk file")
+                }
+                Button("Back", action: model.back).disabled(!model.canGoBack)
+                    .help("Return to the previous retained byte window")
+                Button("Forward", action: model.forward).disabled(!model.canGoForward)
+                    .help("Revisit the retained window left by Back; this does not restore an expired search selection")
+                Button("Next page", action: model.next).disabled(!model.canGoNext)
+                    .help("Continue after this page without reopening the file; distinct from navigation history")
+                TextField("Byte offset", text: $model.offsetInput)
+                    .frame(width: 88).textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("Original byte offset, zero based")
+                    .onSubmit(model.goToByte)
+                Button("Go byte", action: model.goToByte).disabled(model.page == nil)
+                TextField("Line", text: $model.lineInput)
+                    .frame(width: 64).textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("Physical source line, one based")
+                    .onSubmit(model.goToLine)
+                Button("Go line", action: model.goToLine).disabled(model.page == nil)
+                Spacer()
+                Button("Refresh from disk", action: model.refreshFromDisk)
+                    .disabled(!model.canRefresh)
+                    .help("Explicitly recapture this project file. Success starts a new capture at the first page and clears old exact targets/history; failure keeps the retained source.")
+                    .accessibilityLabel("Refresh retained source from the current disk file")
+                if model.busy {
+                    ProgressView().controlSize(.small)
+                        .accessibilityLabel(model.isRefreshing ? "Refreshing source capture" : "Reading source page")
+                    Button("Cancel", action: model.cancel)
+                }
             }
-        }
-        .controlSize(.small)
-        .padding(.horizontal, 10).padding(.top, 4)
+            .controlSize(.small)
+            .padding(.horizontal, 10).padding(.top, 4)
+        }.frame(height: 36)
     }
 
     private var findControls: some View {
-        HStack(spacing: 6) {
-            TextField("Find in retained file…", text: $model.fileQuery)
-                .textFieldStyle(.roundedBorder).onSubmit(model.find)
-                .accessibilityLabel("Exact text to find in this retained file")
-            Button("Find", action: model.find).disabled(!model.canFind || model.fileQuery.isEmpty)
-            Button("Outline") { showsOutline = true }
-                .disabled(!model.canBuildOutline)
-                .popover(isPresented: $showsOutline) { AtlasOutlineBrowser(model: model) }
-            Button("Markdown") {
-                showsDocument = true
-                preparePreview()
-            }
-            .disabled(model.page == nil || model.busy || showsSplitPreview)
-            .help("Preview the same retained capture with headings and source mapping; UTF-8 sources up to 64 KiB")
-            Button(showsSplitPreview ? "Hide preview" : "Split preview") {
-                showsSplitPreview.toggle()
-                if showsSplitPreview { preparePreview() }
-                else { model.documentPreview.cancel(silent: true) }
-            }
-            .disabled(model.page == nil || model.busy || showsDocument)
-            .help("Read source and Markdown side by side from one retained capture; each pane scrolls independently")
-            Button("Previous hit") { model.moveHit(backwards: true) }.disabled(!model.canMoveHit)
-            Button("Next hit") { model.moveHit(backwards: false) }.disabled(!model.canMoveHit)
-            if model.matchHex != nil {
-                Button("Copy hit hex") {
-                    guard let hex = model.matchHex else { return }
-                    NSPasteboard.general.clearContents()
-                    copyNotice = NSPasteboard.general.setString(hex, forType: .string)
-                        ? "Copied the matched original bytes as hex." : "Clipboard write failed."
+        ScrollView(.horizontal) {
+            HStack(spacing: 6) {
+                TextField("Find in retained file…", text: $model.fileQuery)
+                    .frame(width: 190)
+                    .textFieldStyle(.roundedBorder).onSubmit(model.find)
+                    .accessibilityLabel("Exact text to find in this retained file")
+                Button("Find", action: model.find).disabled(!model.canFind || model.fileQuery.isEmpty)
+                Button("Outline") { showsOutline = true }
+                    .disabled(!model.canBuildOutline)
+                    .popover(isPresented: $showsOutline) { AtlasOutlineBrowser(model: model) }
+                Button("Markdown") {
+                    showsDocument = true
+                    preparePreview()
                 }
-                .help("Copy the verified retained hit's original bytes, independently of native glyph selection")
+                .disabled(model.page == nil || model.busy || showsSplitPreview)
+                .help("Preview the same retained capture with headings and source mapping; UTF-8 sources up to 64 KiB")
+                Button(showsSplitPreview ? "Hide preview" : "Split preview") {
+                    showsSplitPreview.toggle()
+                    if showsSplitPreview { preparePreview() }
+                    else { model.documentPreview.cancel(silent: true) }
+                }
+                .disabled(model.page == nil || model.busy || showsDocument)
+                .help("Read source and Markdown side by side from one retained capture; each pane scrolls independently")
+                Button("Previous hit") { model.moveHit(backwards: true) }.disabled(!model.canMoveHit)
+                Button("Next hit") { model.moveHit(backwards: false) }.disabled(!model.canMoveHit)
+                if model.matchHex != nil {
+                    Button("Copy hit hex") {
+                        guard let hex = model.matchHex else { return }
+                        NSPasteboard.general.clearContents()
+                        copyNotice = NSPasteboard.general.setString(hex, forType: .string)
+                            ? "Copied the matched original bytes as hex." : "Clipboard write failed."
+                    }
+                    .help("Copy the verified retained hit's original bytes, independently of native glyph selection")
+                }
             }
-        }
-        .controlSize(.small).padding(.horizontal, 10)
+            .controlSize(.small).padding(.horizontal, 10)
+        }.frame(height: 32)
     }
 
     private func preparePreview() {

@@ -247,6 +247,9 @@ extension AtlasCamera {
     @State private var showsReader = false
     @State private var usesPagedReader = false
     @State private var capturedReaderTarget: AtlasSearchCapturedHit?
+    @State private var pinnedReaders = AtlasPinnedReaders<AtlasPagedReaderModel>(
+        canFork: { $0.canPin }, fork: { try await $0.fork() }, retire: { $0.close() },
+        failureMessage: { ($0 as? AtlasReaderError)?.message ?? "The source could not be pinned." })
     @State private var hits: [SearchHit] = []
     @State private var selectedHit: AtlasSearchRowID?
     @State private var searchTitle = "Search project"
@@ -356,6 +359,7 @@ extension AtlasCamera {
 #endif
         }
         .onDisappear {
+            pinnedReaders.closeAll()
             showsFileFinder = false
             capturedReaderTarget = nil
             cancelSourceLoad()
@@ -680,13 +684,22 @@ extension AtlasCamera {
                     )
                     .id(atlasRevision)
                 }
-                if selectedPath != nil && showsReader {
-                    sourcePane.frame(height: usesPagedReader ? 320 : 240)
+                if (selectedPath != nil && showsReader) || !pinnedReaders.entries.isEmpty || pinnedReaders.busy {
+                    Divider()
+                    HSplitView {
+                        if selectedPath != nil && showsReader {
+                            sourcePane.frame(minWidth: 320)
+                        }
+                        if !pinnedReaders.entries.isEmpty || pinnedReaders.busy {
+                            AtlasPinnedReadersView(readers: pinnedReaders).frame(minWidth: 320)
+                        }
+                    }
+                    .frame(height: (!pinnedReaders.entries.isEmpty || pinnedReaders.busy) ? 380 : (usesPagedReader ? 320 : 240))
                 }
             }
             .frame(maxWidth: .infinity)
 
-            if selectedPath != nil && showsReader {
+            if selectedPath != nil && showsReader && pinnedReaders.entries.isEmpty && !pinnedReaders.busy {
                 Divider()
                 inspector.frame(width: 264)
             }
@@ -794,13 +807,15 @@ extension AtlasCamera {
                 if !loadingProject, acceptsSource(path, searchRow: sourceSearchRow, exactMatch: false) {
 #if FCB_APP_STORE
                     if let access = rootAccess, access.url.path.utf8.elementsEqual(root.utf8) {
-                        AtlasPagedSourceView(root: root, path: path, accessLease: access, captured: capturedReaderTarget)
+                        AtlasPagedSourceView(root: root, path: path, accessLease: access, captured: capturedReaderTarget,
+                            canPin: pinnedReaders.canAdd, pin: pinSource)
                             .id(focusRequest)
                     } else {
                         Text("Choose the project folder again to grant read access.")
                     }
 #else
-                    AtlasPagedSourceView(root: root, path: path, accessLease: nil, captured: capturedReaderTarget)
+                    AtlasPagedSourceView(root: root, path: path, accessLease: nil, captured: capturedReaderTarget,
+                        canPin: pinnedReaders.canAdd, pin: pinSource)
                         .id(focusRequest)
 #endif
                 } else {
@@ -834,6 +849,21 @@ extension AtlasCamera {
 
     // MARK: Actions
 
+    private func pinSource(_ reader: AtlasPagedReaderModel) {
+        guard !loadingProject, let path = selectedPath, let page = reader.page, reader.canPin,
+              let input = try? AtlasReaderInput(root: root, path: path) else { return }
+        let isLiveLabel = page.identity.pathBytes.elementsEqual(input.fullPath.utf8)
+        let isCapturedLabel = capturedReaderTarget.map {
+            $0.root.utf8.elementsEqual(root.utf8) && $0.path.utf8.elementsEqual(path.utf8)
+                && page.identity.pathBytes.elementsEqual($0.path.utf8)
+        } ?? false
+        guard isLiveLabel || isCapturedLabel else { return }
+#if FCB_APP_STORE
+        guard rootAccess?.url.path.utf8.elementsEqual(root.utf8) == true else { return }
+#endif
+        pinnedReaders.pin(reader, root: root, label: page.identity.displayPath)
+    }
+
     /// Project opening performs only the bounded metadata operation. Text
     /// capture/highlighting/raster preparation is an explicit subsequent action.
     private func requestAtlasLoad() {
@@ -864,6 +894,7 @@ extension AtlasCamera {
 #endif
         let requestedRoot = root
         let accessLease: AnyObject?
+        pinnedReaders.bind(root: requestedRoot)
 #if FCB_APP_STORE
         accessLease = rootAccess
 #else
@@ -1504,6 +1535,9 @@ extension AtlasCamera {
 
 #if FCB_APP_STORE
     private func activateProject(_ access: AppStoreRootAccess) {
+        // Replacing the native grant revokes this window's pin deliveries even
+        // when the newly authorized folder happens to have the same path.
+        pinnedReaders.closeAll()
         rootAccess = access
         root = access.url.path
         clearSearch()

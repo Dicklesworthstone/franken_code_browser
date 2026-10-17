@@ -12,6 +12,22 @@ struct AtlasReaderTransport: Sendable {
     let cancel: @Sendable (UInt64) -> Bool
     let close: @Sendable (UInt64) -> Bool
     let retirementFailed: @Sendable () -> Void
+    /// Optional retained-byte transfer. It initializes an empty destination;
+    /// it never opens a pathname or grants source/query authority by itself.
+    let fork: (@Sendable (UInt64, UInt64) -> String?)?
+
+    init(create: @escaping @Sendable () -> UInt64,
+         open: @escaping @Sendable (UInt64, String, UInt64) -> String?,
+         window: @escaping @Sendable (UInt64, UInt64, UInt64) -> String?,
+         lines: @escaping @Sendable (UInt64, UInt64, UInt64, UInt64) -> String?,
+         cancel: @escaping @Sendable (UInt64) -> Bool,
+         close: @escaping @Sendable (UInt64) -> Bool,
+         retirementFailed: @escaping @Sendable () -> Void,
+         fork: (@Sendable (UInt64, UInt64) -> String?)? = nil) {
+        self.create = create; self.open = open; self.window = window; self.lines = lines
+        self.cancel = cancel; self.close = close; self.retirementFailed = retirementFailed
+        self.fork = fork
+    }
 }
 
 /// An owner-local, single-use proposal, not a source page or a granted handle.
@@ -43,6 +59,16 @@ private final class AtlasReaderSession: @unchecked Sendable {
         self.handle = handle
         self.transport = transport
         access = AtlasReaderAccessLease(accessLease)
+    }
+
+    /// Share the native grant lifetime, not the source reader or mutable state.
+    /// The forked Rust capture has its own bounded allocation and retirement.
+    init(transport: AtlasReaderTransport, sharingAccessFrom source: AtlasReaderSession) throws {
+        let handle = transport.create()
+        guard handle != 0 else { throw AtlasReaderError.unavailable }
+        self.handle = handle
+        self.transport = transport
+        access = source.access
     }
 
     func cancel() { _ = transport.cancel(handle) }
@@ -99,6 +125,77 @@ private final class AtlasReaderSession: @unchecked Sendable {
     var supportsFind: Bool { searchTransport != nil }
     var supportsOutline: Bool { outlineTransport != nil }
     var supportsDocument: Bool { documentTransport != nil }
+    var canFork: Bool { session?.transport.fork != nil && info != nil }
+
+    /// Initialize this empty coordinator from another reader's exact capture.
+    /// Only the new reader's queue and cancellation state are touched. Foreign
+    /// work retains both sessions and their native access lease through drain.
+    /// Source replacement/close during the copy revokes delivery, even when a
+    /// canceled foreign operation managed to initialize its destination.
+    func fork(from parent: AtlasReaderCoordinator, page original: AtlasReaderPage) async throws -> AtlasReaderPage {
+        try Task.checkCancellation()
+        guard session == nil, pendingSession == nil, info == nil,
+              let source = parent.session, let sourceInfo = parent.info,
+              sourceInfo.identity.matches(original.identity), let fork = source.transport.fork,
+              original.start <= original.end, original.end <= sourceInfo.identity.capturedBytes,
+              AtlasReaderWire.validHex(original.originalHex, bytes: original.end - original.start),
+              let path = String(bytes: sourceInfo.identity.pathBytes, encoding: .utf8) else {
+            throw AtlasReaderError.unavailable
+        }
+        let request = AtlasReaderRequest.window(offset: original.start,
+            bytes: max(4, min(AtlasReaderLimits.maximumPageBytes, original.end - original.start)))
+        try request.validate(capturedBytes: sourceInfo.identity.capturedBytes)
+        let next = try AtlasReaderSession(transport: transport, sharingAccessFrom: source)
+        pendingSession = next
+        let ticket = UUID()
+        operation = ticket
+        let flag = AtlasSearchCancellation()
+        cancellation = flag
+        do {
+            let result = try await io.perform(cancellation: flag, keepingAlive: [source, next]) {
+                let copiedInfo = try AtlasReaderInfo.decode(fork(source.handle, next.handle),
+                    handle: next.handle, path: path)
+                guard !flag.isCanceled,
+                      copiedInfo.identity.owner != sourceInfo.identity.owner,
+                      copiedInfo.identity.capturedBytes == sourceInfo.identity.capturedBytes,
+                      copiedInfo.identity.encoding == sourceInfo.identity.encoding,
+                      copiedInfo.identity.pathBytes == sourceInfo.identity.pathBytes,
+                      copiedInfo.origin == "host-supplied" else { throw AtlasReaderError.invalidResponse }
+                let copiedPage = try AtlasReaderPage.decode(
+                    next.transport.window(next.handle, original.start, request.byteLimit),
+                    info: copiedInfo, request: request)
+                // The independent identity cannot authorize replacement bytes
+                // for a page the user already saw. Compare the shared original
+                // extent, never its decoded or visually selected text.
+                guard copiedPage.start == original.start else { throw AtlasReaderError.invalidResponse }
+                let overlap = Int(min(copiedPage.end, original.end) - original.start) * 2
+                guard copiedPage.originalHex.utf8.prefix(overlap)
+                    .elementsEqual(original.originalHex.utf8.prefix(overlap)) else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                return (copiedInfo, copiedPage)
+            }
+            try Task.checkCancellation()
+            guard pendingSession === next, operation == ticket, !flag.isCanceled,
+                  parent.session === source, parent.info?.identity.matches(sourceInfo.identity) == true else {
+                throw AtlasReaderError.canceled
+            }
+            session = next
+            info = result.0
+            pendingSession = nil
+            cancellation = nil
+            operation = UUID()
+            return result.1
+        } catch {
+            if pendingSession === next, operation == ticket {
+                next.cancel()
+                pendingSession = nil
+                cancellation = nil
+                operation = UUID()
+            }
+            throw Self.readerError(error)
+        }
+    }
 
     deinit {
         cancellation?.cancel()

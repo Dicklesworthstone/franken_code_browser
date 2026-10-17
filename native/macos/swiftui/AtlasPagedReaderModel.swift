@@ -14,6 +14,7 @@ import Observation
     private(set) var busy = false
     private(set) var isRefreshing = false
     private(set) var refreshedFromDisk = false
+    private(set) var pinning = false
     private(set) var notice = ""
     var offsetInput = "0"
     var lineInput = "1"
@@ -46,11 +47,17 @@ import Observation
     private var history = SourceHistory()
     @ObservationIgnored private let capturedTarget: AtlasSearchCapturedHit?
     @ObservationIgnored private let liveTransport: AtlasReaderTransport
+    @ObservationIgnored private let searchTransport: AtlasReaderSearchTransport?
+    @ObservationIgnored private let outlineTransport: AtlasReaderOutlineTransport?
+    @ObservationIgnored private let documentTransport: AtlasReaderDocumentTransport?
     @ObservationIgnored private var refreshInput: AtlasReaderInput?
     @ObservationIgnored private var refreshAccessLease: AnyObject?
     @ObservationIgnored private let coordinator: AtlasReaderCoordinator
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var operation = UUID()
+    @ObservationIgnored private var pinOperation: UUID?
+    @ObservationIgnored private var pendingPin: AtlasPagedReaderModel?
+    private var forkedCapture = false
 
     init(transport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
          outline: AtlasReaderOutlineTransport? = nil,
@@ -58,6 +65,9 @@ import Observation
          captured: AtlasSearchCapturedHit? = nil) {
         capturedTarget = captured
         liveTransport = transport
+        searchTransport = search
+        outlineTransport = outline
+        documentTransport = document
         let coordinator = AtlasReaderCoordinator(transport: captured.map { transport.importing($0) } ?? transport, search: search,
             outline: outline, document: document)
         self.coordinator = coordinator
@@ -71,6 +81,7 @@ import Observation
     var canGoForward: Bool { history.canForward && !busy }
     var canGoNext: Bool { page?.nextOffset != nil && !busy }
     var canRefresh: Bool { page != nil && refreshInput != nil && !busy && !documentPreview.busy }
+    var canPin: Bool { page != nil && !busy && !pinning && !documentPreview.busy && coordinator.canFork }
     var canFind: Bool { page != nil && coordinator.supportsFind }
     var findIsCurrent: Bool { findReport?.needle.utf8.elementsEqual(fileQuery.utf8) == true }
     var canMoveHit: Bool { findIsCurrent && findReport?.hits.isEmpty == false && !busy }
@@ -109,6 +120,8 @@ import Observation
         var messages = ["Logical page; layout is local to this window."]
         if refreshedFromDisk {
             messages.append("Explicitly refreshed disk capture; older search, outline and preview targets were retired. File observation is not an atomic filesystem snapshot.")
+        } else if forkedCapture {
+            messages.append("Pinned exact retained bytes; no live-file reread. Search, outline, preview and navigation belong to this reader independently.")
         } else if capturedTarget != nil {
             messages.append("Source imported from the retained workspace search; no live-file reread.")
         }
@@ -118,6 +131,48 @@ import Observation
         if page.boundariesAdjusted { messages.append("Page boundaries adjusted to complete source scalars or CRLF.") }
         if page.hasReplacements { messages.append("Display contains replacement characters. Original hex preserves the captured bytes.") }
         return messages.joined(separator: " ")
+    }
+
+    /// Pin the accepted source window into an independently owned reader. This
+    /// does not navigate, cancel a query, or replace any state in the parent.
+    /// The returned model is ready to display: its host must not call open()
+    /// again. No parent hit/outline/document IDs cross to the fresh reader.
+    func fork() async throws -> AtlasPagedReaderModel {
+        try Task.checkCancellation()
+        guard canPin, let original = page else { throw AtlasReaderError.unavailable }
+        let ticket = UUID()
+        let sourceNavigation = navigation
+        let allowedRefresh = refreshInput
+        let accessLease = refreshAccessLease
+        let child = AtlasPagedReaderModel(transport: liveTransport, search: searchTransport,
+            outline: outlineTransport, document: documentTransport)
+        pinOperation = ticket
+        pendingPin = child
+        pinning = true
+        defer {
+            if pinOperation == ticket {
+                pendingPin = nil
+                pinOperation = nil
+                pinning = false
+            }
+        }
+        do {
+            let copied = try await child.coordinator.fork(from: coordinator, page: original)
+            try Task.checkCancellation()
+            guard pinOperation == ticket, navigation == sourceNavigation,
+                  page?.identity.matches(original.identity) == true else { throw AtlasReaderError.canceled }
+            child.refreshInput = allowedRefresh
+            child.refreshAccessLease = accessLease
+            child.forkedCapture = true
+            child.install(copied, request: .window(offset: copied.start,
+                bytes: max(4, min(AtlasReaderLimits.maximumPageBytes, copied.end - copied.start))))
+            child.notice = "Pinned the exact captured source at this byte window. Find, Outline and Markdown use independent selections."
+            return child
+        } catch {
+            child.close()
+            if error is CancellationError { throw AtlasReaderError.canceled }
+            throw error
+        }
     }
 
     func open(root: String, path: String, accessLease: AnyObject?) {
@@ -347,6 +402,7 @@ import Observation
     /// Explicit cancellation keeps a successfully installed page. Cancellation
     /// during initial capture instead releases its handle after work drains.
     func cancel() {
+        cancelPin()
         let wasRefreshing = isRefreshing
         documentPreview.cancel(silent: true)
         operation = UUID()
@@ -363,12 +419,13 @@ import Observation
             : (page == nil ? "Source opening canceled." : "Navigation canceled. The current retained page is unchanged.")
     }
     func close() {
+        cancelPin()
         documentPreview.close()
         operation = UUID()
         task?.cancel(); task = nil
         coordinator.close()
         refreshInput = nil; refreshAccessLease = nil
-        isRefreshing = false; refreshedFromDisk = false
+        isRefreshing = false; refreshedFromDisk = false; forkedCapture = false
         page = nil; source = nil; history.reset()
         findReport = nil; selectedHitIndex = nil; selectedRange = nil
         queryWork = false; outlineWork = false
@@ -378,6 +435,14 @@ import Observation
         busy = false; notice = ""
         offsetInput = "0"; lineInput = "1"
         navigation = UUID()
+    }
+
+    private func cancelPin() {
+        pinOperation = nil
+        let child = pendingPin
+        pendingPin = nil
+        pinning = false
+        child?.close()
     }
 
     private func navigate(_ request: AtlasReaderRequest, historyMove: SourceHistory.Move? = nil, hitIndex: Int? = nil) {
@@ -400,6 +465,7 @@ import Observation
         }
     }
     private func begin(query: Bool = false, outline: Bool = false) -> UUID {
+        cancelPin()
         documentPreview.cancel(silent: true)
         task?.cancel()
         coordinator.cancel()
