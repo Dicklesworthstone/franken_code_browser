@@ -26,6 +26,16 @@ pub unsafe extern "C" fn fcb_reader_open_bytes(handle: u64, label: *const c_char
     }))
 }
 
+/// Populate an empty destination from the exact retained source reader. The
+/// destination has its own owner, query state and charged bounded byte copy;
+/// no pointers, path arguments, disk reads or parent query IDs cross this ABI.
+/// Errors are addressed to destination, like every reader initialization reply.
+/// Release the returned non-null string once with fcb_free_string.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_reader_fork(source: u64, destination: u64) -> *mut c_char {
+    reply(|| answer(destination, |readers| readers.fork(source, destination, || false)))
+}
+
 // Shared by the C entry point and isolated-registry production tests. No second
 // registry or test-only source implementation is used by the shipping route.
 unsafe fn open_in(readers: &ReaderSessions, handle: u64, label: *const c_char,

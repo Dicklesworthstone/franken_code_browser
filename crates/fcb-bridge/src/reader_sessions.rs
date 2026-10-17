@@ -183,6 +183,24 @@ impl ReaderSessions {
         cell.validate(epoch)?;
         result
     }
+    /// Fork immutable source into an already admitted empty destination. Both
+    /// handles use the existing eight-slot bound, including retiring cells.
+    /// Source and destination locks use try_lock; reciprocal calls cannot wait
+    /// on each other. The registry lock is never held during the bounded copy.
+    /// No query authority, native path argument, or filesystem read is involved.
+    pub(super) fn fork(&self, source: u64, destination: u64, mut canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AccessError> {
+        if source == destination { return Err(AccessError::InvalidArgument); }
+        let cell = self.get(source)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        let reader = state.as_ref().ok_or(AccessError::NotOpen)?;
+        let result = self.initialize(destination, |owner, stop| reader.fork(owner, stop),
+            || cell.validate(epoch).is_err() || canceled());
+        cell.validate(epoch)?;
+        result
+    }
     pub(super) fn execute(&self, handle: u64, command: Command<'_>,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
         let cell = self.get(handle)?;
@@ -268,3 +286,6 @@ mod outline_tests;
 #[cfg(all(test, unix))]
 #[path = "reader_document_sessions_tests.rs"]
 mod document_tests;
+#[cfg(all(test, unix))]
+#[path = "reader_fork_tests.rs"]
+mod fork_tests;

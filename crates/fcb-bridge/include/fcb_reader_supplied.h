@@ -27,6 +27,20 @@ extern "C" {
 char *fcb_reader_open_bytes(uint64_t handle, const char *label,
     const uint8_t *bytes, uint64_t length);
 
+/* HOST-WORKER: fork an open source into a distinct empty destination returned
+ * by fcb_reader_create. Copies the retained bytes and exact native path through
+ * ordinary bounded source admission; never reads a live file. Both handles
+ * count against FCB_READER_MAX_SESSIONS, including in-flight retirement.
+ * Success returns destination's info envelope with host-supplied origin, zero
+ * source reads, and no inherited query/outline/document selection authority.
+ * Closing, canceling, navigating or querying one successful fork does not alter
+ * another. Busy, unknown, unopened source and already-open destination refuse;
+ * neither source nor an already-open destination is replaced. Cancel/close can
+ * suppress a reply after initialization commits, as for ordinary open: inspect
+ * info or close a discarded destination. Free non-null JSON with fcb_free_string.
+ */
+char *fcb_reader_fork(uint64_t source, uint64_t destination);
+
 #ifdef __cplusplus
 }
 #endif

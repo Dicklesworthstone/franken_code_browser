@@ -137,6 +137,16 @@ impl ReaderSession {
             outline: None, last_outline_attempt: 0, document: None, last_document_attempt: 0, next_allocation: 2,
             budget, _source_lease: lease })
     }
+    /// Fork the exact retained bytes and native path into a fresh owner. This
+    /// is a bounded, independently charged copy, NOT another file observation.
+    /// Query hits, outlines, document selections and line checkpoints are not
+    /// transferred; the destination earns its own authority through normal calls.
+    /// Dropping either session cannot release the other's capture or budget.
+    pub fn fork(&self, owner: ArenaOwnerId, canceled: impl FnMut() -> bool)
+        -> Result<Self, ReaderSessionError> {
+        if owner == self.owner() { return Err(ReaderSessionError::InvalidLimits); }
+        Self::from_bytes(owner, &self.path, self.capture.bytes(), canceled)
+    }
     pub fn capture(&self) -> &CompleteCapture { &self.capture }
     pub fn accepted_generation(&self) -> Option<u64> { self.query.as_ref().map(|q| q.generation) }
     pub fn hit_range(&self, generation: u64, position: usize) -> Result<ByteRange, ReaderSessionError> {
