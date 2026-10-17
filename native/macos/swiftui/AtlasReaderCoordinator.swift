@@ -14,6 +14,13 @@ struct AtlasReaderTransport: Sendable {
     let retirementFailed: @Sendable () -> Void
 }
 
+/// An owner-local, single-use proposal, not a source page or a granted handle.
+/// Only commitOpen can publish its validated capture. Cancellation, another
+/// operation, or closing the coordinator revokes it synchronously.
+struct AtlasReaderReplacement: Sendable {
+    fileprivate let id: UUID
+}
+
 /// This reference is retained, never operated on, by background work. It may
 /// hold the native security-scoped root grant for the entire capture lifetime.
 private final class AtlasReaderAccessLease: @unchecked Sendable {
@@ -58,9 +65,9 @@ private final class AtlasReaderSession: @unchecked Sendable {
     }
 }
 
-/// One retained capture and the existing one-active/one-newest native I/O lane.
-/// A replacement or close invalidates delivery immediately, but neither the
-/// source handle nor its grant can retire before the active foreign call ends.
+/// One accepted capture plus at most one newest replacement proposal in the
+/// existing one-active/one-newest I/O lane. In-flight foreign calls retain their
+/// own handles/grants through drain; the Rust registry bounds total admission.
 @MainActor final class AtlasReaderCoordinator {
     private let transport: AtlasReaderTransport
     private let searchTransport: AtlasReaderSearchTransport?
@@ -76,6 +83,8 @@ private final class AtlasReaderSession: @unchecked Sendable {
     private let io = AtlasProjectIO()
     private var session: AtlasReaderSession?
     private var info: AtlasReaderInfo?
+    private var pendingSession: AtlasReaderSession?
+    private var stagedCapture: (id: UUID, info: AtlasReaderInfo, page: AtlasReaderPage)?
     private var cancellation: AtlasSearchCancellation?
     private var operation = UUID()
 
@@ -94,14 +103,35 @@ private final class AtlasReaderSession: @unchecked Sendable {
     deinit {
         cancellation?.cancel()
         session?.cancel()
+        pendingSession?.cancel()
     }
 
+    /// Convenience for callers with no separate presentation transaction. An
+    /// unsuccessful replacement preserves the previous accepted reader.
     func open(input: AtlasReaderInput, accessLease: AnyObject? = nil) async throws -> AtlasReaderPage {
-        // Empty-handle admission is small and performs no filesystem work.
-        // A refused replacement does not destroy an already admitted capture.
-        let next = try AtlasReaderSession(transport: transport, accessLease: accessLease)
-        close()
-        session = next
+        let replacement = try await stageOpen(input: input, accessLease: accessLease)
+        do {
+            try Task.checkCancellation()
+            return try commitOpen(replacement)
+        } catch {
+            if operation == replacement.id { cancel() }
+            throw Self.readerError(error)
+        }
+    }
+
+    /// Capture and validate the first page without replacing the accepted
+    /// source, query, outline or document. A native model checks its own task
+    /// ticket after awaiting this, then commits and installs without suspending.
+    /// An explicit live refresh can supply the original live transport instead
+    /// of a search-capture-only adapter; this never happens as a fallback.
+    func stageOpen(input: AtlasReaderInput, accessLease: AnyObject? = nil,
+                   using replacementTransport: AtlasReaderTransport? = nil) async throws -> AtlasReaderReplacement {
+        try Task.checkCancellation()
+        // Empty-handle admission performs no filesystem work. A refused new
+        // handle must not interrupt an already admitted operation or capture.
+        let next = try AtlasReaderSession(transport: replacementTransport ?? transport, accessLease: accessLease)
+        cancel()
+        pendingSession = next
         let ticket = UUID()
         operation = ticket
         let flag = AtlasSearchCancellation()
@@ -117,14 +147,45 @@ private final class AtlasReaderSession: @unchecked Sendable {
                     next.transport.window(next.handle, 0, request.byteLimit), info: info, request: request)
                 return (info, page)
             }
-            guard session === next, operation == ticket, !flag.isCanceled else { throw AtlasReaderError.canceled }
-            info = result.0
+            guard pendingSession === next, operation == ticket, !flag.isCanceled,
+                  !Task.isCancelled else { throw AtlasReaderError.canceled }
+            stagedCapture = (ticket, result.0, result.1)
             cancellation = nil
-            return result.1
+            return AtlasReaderReplacement(id: ticket)
         } catch {
-            if session === next, operation == ticket { close() }
+            // A late failed attempt cannot discard a newer proposal or the
+            // accepted capture. The worker's lease controls actual retirement.
+            if pendingSession === next, operation == ticket {
+                next.cancel()
+                pendingSession = nil
+                stagedCapture = nil
+                cancellation = nil
+                operation = UUID()
+            }
             throw Self.readerError(error)
         }
+    }
+
+    /// No await and no host callbacks: the caller can install the returned page
+    /// in the same main-actor turn. A proposal contains no publishable source,
+    /// and replay or delivery to another coordinator cannot replace its reader.
+    func commitOpen(_ replacement: AtlasReaderReplacement) throws -> AtlasReaderPage {
+        guard let staged = stagedCapture, let next = pendingSession,
+              staged.id == replacement.id, operation == replacement.id else {
+            throw AtlasReaderError.canceled
+        }
+        session = next
+        info = staged.info
+        pendingSession = nil
+        stagedCapture = nil
+        cancellation = nil
+        acceptedFind = nil
+        resetOutline()
+        documentState.close()
+        // Query targets can escape the current capture. Keep their generation
+        // counters monotonic for this coordinator instead of recycling one.
+        operation = UUID()
+        return staged.page
     }
 
     func read(_ request: AtlasReaderRequest) async throws -> AtlasReaderPage {
@@ -331,7 +392,10 @@ private final class AtlasReaderSession: @unchecked Sendable {
         operation = UUID()
         cancellation?.cancel()
         cancellation = nil
-        session?.cancel()
+        if let pendingSession { pendingSession.cancel() }
+        else { session?.cancel() }
+        pendingSession = nil
+        stagedCapture = nil
         io.cancel()
     }
 
@@ -339,9 +403,9 @@ private final class AtlasReaderSession: @unchecked Sendable {
         cancel()
         info = nil
         acceptedFind = nil
-        lastFindGeneration = 0
         resetOutline()
-        lastOutlineGeneration = 0
+        // Counters belong to this coordinator, not a capture. Old query
+        // targets must not become current after close/open of identical bytes.
         documentState.close()
         session = nil
     }
