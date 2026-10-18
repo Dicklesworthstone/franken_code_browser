@@ -74,6 +74,29 @@ char *fcb_atlas_search_scoped(uint64_t handle, uint64_t generation, const char *
 char *fcb_atlas_search_begin_scoped(uint64_t handle, uint64_t generation, const char *needle,
     const char *extensions, const char *filenames, uint64_t max_matches,
     uint64_t max_files, uint64_t max_file_bytes, uint64_t max_source_bytes);
+
+/* Path scope INTERSECTS the existing file-type selection before every source,
+ * file and match quota. path_kind: 0 workspace, 1 directory, 2 exact file.
+ * Workspace requires null/empty path. Directory/file require a nonempty relative
+ * UTF-8 path <=4096 bytes with no NUL, leading/trailing slash, repeated slash,
+ * or "." / ".." component. The directory path excludes a trailing slash and
+ * selects descendants at a slash boundary ("src" excludes "src-old/file.rs").
+ * Case and Unicode bytes are not normalized. Backslash is an ordinary Unix
+ * filename byte. Matching never resolves a path or expands the atlas grant.
+ * The strings may be freed after this call. begin performs no source I/O.
+ * JSON scope_path_kind is "workspace", "directory" or "file"; scope_path is
+ * the exact input string, scope_path_hex its original UTF-8 bytes in lowercase
+ * hex. Legacy entrypoints emit workspace + empty path. search_scope still
+ * identifies the file-type component. Validate BOTH components on every reply.
+ * Invalid inputs do not replace a running/accepted query. A valid new request
+ * uses a fresh generation; changing selection elsewhere cannot change its scope.
+ */
+char *fcb_atlas_search_path_scoped(uint64_t handle, uint64_t generation, const char *needle,
+    const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
+    uint64_t max_matches, uint64_t max_files, uint64_t max_file_bytes, uint64_t max_source_bytes);
+char *fcb_atlas_search_begin_path_scoped(uint64_t handle, uint64_t generation, const char *needle,
+    const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
+    uint64_t max_matches, uint64_t max_files, uint64_t max_file_bytes, uint64_t max_source_bytes);
 char *fcb_atlas_search_step(uint64_t handle, uint64_t generation);
 
 /* Pages contain <=limit (1..128) rows. next_offset is a zero-based continuation,

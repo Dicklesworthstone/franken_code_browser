@@ -132,22 +132,39 @@ private final class LiveCalls: @unchecked Sendable {
         }
         do {
             let f = IndexedFixture(), scope = try AtlasFileScope.rust.searchScope()
-            f.configure { c in c.scopedEligible = 1; c.scopedCaptured = 1; c.scopedUnavailable = 0 }
+            let directory = try AtlasSearchPathScope(kind: .directory, path: "src")
+            f.configure { c in c.pathHex = "7372632f612e7273"; c.scopedEligible = 1; c.scopedCaptured = 1; c.scopedUnavailable = 0 }
             let service = AtlasWorkspaceSearch(scopedLive: { input, flag, _, _ in
                 if flag.isCanceled { throw AtlasSearchError.canceled }
-                precondition(input.fileScope == scope)
+                precondition(input.fileScope == scope && input.pathScope == directory)
                 return AtlasSearchReport(hits: [], complete: true, truncated: false,
-                    unavailableFiles: 0, unsupportedFiles: 0, matchesSeen: 0, fileScope: input.fileScope)
+                    unavailableFiles: 0, unsupportedFiles: 0, matchesSeen: 0, fileScope: input.fileScope, pathScope: input.pathScope)
             }, makeIndex: { AtlasIndexedSearch(transport: f.transport) })
-            let input = try AtlasSearchInput(root: "/repo", query: "x", fileScope: scope)
+            let input = try AtlasSearchInput(root: "/repo", query: "x", fileScope: scope, pathScope: directory)
             let live = service.selection(indexed: false)
             let scanned = try live.scopedWork(input, AtlasSearchCancellation(), AtlasSearchAccessLease(nil), { _ in })
-            check(scanned.fileScope == scope && f.count("create:") == 0, "Frozen input reaches chosen live worker")
+            check(scanned.fileScope == scope && scanned.pathScope == directory && f.count("create:") == 0,
+                "Frozen file-type and location input reaches the chosen live worker")
             let indexed = service.selection(indexed: true)
             let captured = try indexed.scopedWork(input, AtlasSearchCancellation(), AtlasSearchAccessLease(nil), { _ in })
-            check(captured.fileScope == scope && captured.indexStatus != nil && captured.excludedFiles == 1,
+            check(captured.fileScope == scope && captured.pathScope == directory && captured.indexStatus != nil && captured.excludedFiles == 1,
                 "Captured mode retains requested scope without silently selecting live work")
             check(!service.accepts(live) && service.accepts(indexed), "Mode authority remains separate from input scope")
+        }
+        do {
+            let f = IndexedFixture(), live = LiveCalls()
+            let service = AtlasWorkspaceSearch(live: live.work, makeIndex: { AtlasIndexedSearch(transport: f.transport) })
+            let choice = service.selection(indexed: false)
+            let selected = try AtlasSearchInput(root: "/repo", query: "x",
+                pathScope: AtlasSearchPathScope(kind: .file, path: "src/a.rs"))
+            do {
+                _ = try choice.scopedWork(selected, AtlasSearchCancellation(), AtlasSearchAccessLease(nil), { _ in })
+                preconditionFailure("Legacy live routing widened an exact-file query")
+            } catch AtlasSearchError.invalidPathScope { checks += 1 }
+            check(live.calls == 0 && f.count("create:") == 0 && service.accepts(choice),
+                "Unsupported path scope rejects before side effects and preserves mode selection")
+            let permitted = try run(choice)
+            check(permitted.complete && live.calls == 1, "Legacy live routing still permits workspace input")
         }
         print("AtlasWorkspaceSearchTests: \(checks) checks passed")
     }

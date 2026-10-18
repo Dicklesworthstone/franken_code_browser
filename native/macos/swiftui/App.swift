@@ -257,6 +257,8 @@ extension AtlasCamera {
     @State private var files: [AtlasFile] = []
     @State private var fileScope: AtlasFileScope = .all
     @State private var customExtensions = ""
+    @State private var searchPathKind: AtlasSearchPathScope.Kind = .workspace
+    @State private var searchPathInput = ""
     @State private var displayedFiles: [AtlasFile] = []
     @State private var selectedPath: String?
     @State private var fileText = ""
@@ -286,7 +288,23 @@ extension AtlasCamera {
 
     private var searchContext: AtlasSearchContext {
         AtlasSearchContext(root: root, query: query, loadGeneration: loadGeneration,
-            atlasRevision: atlasRevision, scope: fileScope.rawValue, customExtensions: customExtensions)
+            atlasRevision: atlasRevision, scope: fileScope.rawValue, customExtensions: customExtensions,
+            pathKind: searchPathKind.rawValue, path: searchPathKind == .workspace ? "" : searchPathInput)
+    }
+
+    // Observe byte-distinct edits without duplicating an arbitrarily large
+    // paste. Every value longer than the admitted path bound is invalid.
+    private var searchPathEditKey: [UInt8] { Array(searchPathInput.utf8.prefix(4097)) }
+
+    private var openFileSearchPath: String? {
+        guard let path = selectedPath else { return nil }
+        switch searchPathKind {
+        case .workspace: return nil
+        case .file: return path
+        case .directory:
+            guard let slash = path.lastIndex(of: "/") else { return nil }
+            return String(path[..<slash])
+        }
     }
 
     private var searchIsCurrent: Bool {
@@ -391,6 +409,16 @@ extension AtlasCamera {
         .onChange(of: Array(customExtensions.utf8)) { _, _ in
             if fileScope == .custom { clearSearch() }
         }
+        .onChange(of: searchPathKind) { _, _ in
+            clearSearch()
+            runSearch(debounce: true)
+        }
+        .onChange(of: searchPathEditKey) { _, _ in
+            if searchPathKind != .workspace {
+                clearSearch()
+                runSearch(debounce: true)
+            }
+        }
         .onChange(of: fileScope) { _, value in
             if value == .custom { showsSidebar = true }
             applyFileScope()
@@ -450,6 +478,38 @@ extension AtlasCamera {
 
     // MARK: Sidebar
 
+    private var searchLocationControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Picker("Search location", selection: $searchPathKind) {
+                ForEach(AtlasSearchPathScope.Kind.allCases) { kind in
+                    Text(kind.label).tag(kind)
+                }
+            }
+            .pickerStyle(.segmented)
+            .accessibilityLabel("Search location")
+            .help("Search the workspace, a folder and its descendants, or one exact file; file-type filters also apply")
+            if searchPathKind != .workspace {
+                TextField(searchPathKind == .file ? "Relative file path, e.g. src/main.rs"
+                    : "Relative folder path, e.g. src", text: $searchPathInput)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.caption, design: .monospaced))
+                    .accessibilityLabel(searchPathKind == .file ? "Exact project-relative file path"
+                        : "Project-relative search folder")
+                    .onSubmit(runSearch)
+                Button(searchPathKind == .file ? "Use open file" : "Use open file's folder") {
+                    if let path = openFileSearchPath { searchPathInput = path }
+                }
+                .disabled(openFileSearchPath == nil)
+                .help(searchPathKind == .file ? "Copy the open file's path into this search"
+                    : "Copy its containing folder. Choose Workspace for a file at the project root.")
+                Text("Search stays in this \(searchPathKind.label.lowercased()) when you open another file.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .disabled(loadingProject || root.isEmpty)
+        .padding(.horizontal, 10).padding(.top, 8)
+    }
+
     private var sidebar: some View {
         VStack(spacing: 0) {
             HStack {
@@ -478,6 +538,7 @@ extension AtlasCamera {
             }
             .padding(.horizontal, 10)
             .padding(.top, 10)
+            searchLocationControls
             HStack {
                 Toggle("Captured index", isOn: $useCapturedIndex)
                     .toggleStyle(.checkbox)
@@ -522,7 +583,9 @@ extension AtlasCamera {
                 let preparing = searchReport?.indexStatus?.building == true
                 let count = preparing ? UInt64(searchReport?.indexStatus?.capturedFiles ?? 0) : (searchReport?.matchesSeen ?? 0)
                 let countLabel = searchReport.map { report in
-                    (report.fileScope.isAll ? "workspace matches" : "matches in selected types")
+                    (report.isWorkspaceScope ? "workspace matches"
+                        : (report.pathScope.isWorkspace ? "matches in selected types"
+                            : "matches in selected " + report.pathScope.kind.label.lowercased()))
                         + (report.complete ? "" : (report.isInProgress ? " · searching" : " · partial"))
                 } ?? "ready to search"
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -888,6 +951,8 @@ extension AtlasCamera {
         loadCancellation?.cancel()
         projectIO.cancel()
         let ticket = projectOpening.begin()
+        searchPathKind = .workspace
+        searchPathInput = ""
         let cancellation = AtlasSearchCancellation()
         loadCancellation = cancellation
 #if !FCB_APP_STORE
@@ -1258,13 +1323,17 @@ extension AtlasCamera {
 #endif
         do {
             let input = try AtlasSearchInput(root: requestedRoot, query: requestedText,
-                fileScope: fileScope.searchScope(custom: customExtensions))
+                fileScope: fileScope.searchScope(custom: customExtensions),
+                pathScope: AtlasSearchPathScope(kind: searchPathKind,
+                    path: searchPathKind == .workspace ? "" : searchPathInput))
             clearSearch()
             searchPending = true
             searchTitle = "Searching project"
-            searchSummary = input.fileScope.isAll
+            searchSummary = input.isWorkspaceScope
                 ? "Searching captured source text. You can navigate the atlas or cancel."
-                : "Searching selected file types. Excluded files do not consume the query's scan or result limits."
+                : (input.pathScope.isWorkspace
+                    ? "Searching selected file types. Excluded files do not consume the query's scan or result limits."
+                    : "Searching \(input.pathScope.kind.label.lowercased()) \(String(reflecting: input.pathScope.path))\(input.fileScope.isAll ? "." : " within selected file types.") Excluded files do not consume the query's scan or result limits.")
             status = searchSummary
             let coordinator = searchCoordinator ?? AtlasSearchCoordinator(scopedWork: AtlasNativeSearch.runScoped)
             searchCoordinator = coordinator

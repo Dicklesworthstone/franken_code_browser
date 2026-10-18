@@ -22,7 +22,7 @@ import Foundation
 
     init(live: @escaping Work, makeIndex: @escaping @MainActor () -> AtlasIndexedSearch) {
         self.live = { input, flag, access, publish in
-            guard input.fileScope.isAll else { throw AtlasSearchError.invalidScope }
+            try input.requireLegacyScope()
             return try live(input.root, input.query, flag, access, publish)
         }
         self.makeIndex = makeIndex

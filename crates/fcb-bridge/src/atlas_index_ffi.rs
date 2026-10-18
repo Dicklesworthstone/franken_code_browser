@@ -5,7 +5,7 @@
 use std::ffi::c_char;
 use fcb_app::host::atlas_search::{AtlasIndexOptions, MAX_ATLAS_SEARCH_NEEDLE_BYTES};
 use crate::atlas_sessions::IndexCommand;
-use super::{answer, cstr, number, parse_scope, reply, AccessError};
+use super::{answer, cstr, number, parse_path_scope, reply, AccessError};
 
 /// Capture and index the frozen catalog to completion on a host worker.
 /// Uses the same one-file pipeline as index_begin/index_step, without yielding.
@@ -93,13 +93,44 @@ pub unsafe extern "C" fn fcb_atlas_search_indexed_begin_scoped(handle: u64, gene
     unsafe { submit(handle, generation, index_generation, needle, extensions, filenames,
         max_matches, max_scan_bytes, true) }
 }
+
+/// Query retained captures within the exact path and file-type intersection.
+/// The existing index is reused; excluded files spend no verification or match
+/// quota. Selected catalog members absent from the index still remain partial.
+/// # Safety
+/// Same pointer/list/path limits and ownership as fcb_atlas_search_path_scoped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_search_indexed_path_scoped(handle: u64, generation: u64, index_generation: u64,
+    needle: *const c_char, extensions: *const c_char, filenames: *const c_char,
+    path_kind: u64, path: *const c_char, max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
+    unsafe { submit_with_path(handle, generation, index_generation, needle, extensions, filenames,
+        path_kind, path, max_matches, max_scan_bytes, false) }
+}
+
+/// Admit the same retained path/type query; resume with the existing search_step.
+/// Input strings are copied at admission and need not remain alive afterward.
+/// # Safety
+/// Same pointer/list/path and returned-string contract as indexed_path_scoped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_search_indexed_begin_path_scoped(handle: u64, generation: u64, index_generation: u64,
+    needle: *const c_char, extensions: *const c_char, filenames: *const c_char,
+    path_kind: u64, path: *const c_char, max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
+    unsafe { submit_with_path(handle, generation, index_generation, needle, extensions, filenames,
+        path_kind, path, max_matches, max_scan_bytes, true) }
+}
 unsafe fn submit(handle: u64, generation: u64, index_generation: u64, needle: *const c_char,
     extensions: *const c_char, filenames: *const c_char,
+    max_matches: u64, max_scan_bytes: u64, progressive: bool) -> *mut c_char {
+    unsafe { submit_with_path(handle, generation, index_generation, needle, extensions, filenames,
+        0, std::ptr::null(), max_matches, max_scan_bytes, progressive) }
+}
+unsafe fn submit_with_path(handle: u64, generation: u64, index_generation: u64, needle: *const c_char,
+    extensions: *const c_char, filenames: *const c_char, path_kind: u64, path: *const c_char,
     max_matches: u64, max_scan_bytes: u64, progressive: bool) -> *mut c_char {
     reply(|| answer(handle, |atlases| {
         let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
         if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES { return Err(AccessError::InvalidArgument); }
-        let scope = unsafe { parse_scope(extensions, filenames) }?;
+        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?;
         let max_matches = number(max_matches)?;
         let command = match (scope.is_all(), progressive) {
             (true, true) => IndexCommand::Begin { generation, index_generation, needle, max_matches, max_scan_bytes },

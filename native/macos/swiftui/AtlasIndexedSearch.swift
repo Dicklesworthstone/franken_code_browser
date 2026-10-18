@@ -15,6 +15,7 @@ struct AtlasIndexedSearchTransport: Sendable {
     let retirementFailed: @Sendable () -> Void
     /// Absent only for legacy transports, which may serve all-files requests.
     var scopedQueryBegin: (@Sendable (UInt64, UInt64, UInt64, String, AtlasSearchFileScope) throws -> String?)? = nil
+    var pathScopedQueryBegin: (@Sendable (UInt64, UInt64, UInt64, String, AtlasSearchFileScope, AtlasSearchPathScope) throws -> String?)? = nil
 }
 
 /// An explicit captured-index session. The app serializes run() on its existing
@@ -65,8 +66,12 @@ final class AtlasIndexedSearch: @unchecked Sendable {
 
     func runScoped(input: AtlasSearchInput, cancellation: AtlasSearchCancellation,
                    access: AtlasSearchAccessLease, progress: @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport {
-        let root = input.root, query = input.query, scope = input.fileScope
-        guard scope.isAll || transport.scopedQueryBegin != nil else { throw AtlasSearchError.invalidScope }
+        let root = input.root, query = input.query, scope = input.fileScope, pathScope = input.pathScope
+        if pathScope.isWorkspace {
+            guard scope.isAll || transport.scopedQueryBegin != nil else { throw AtlasSearchError.invalidScope }
+        } else {
+            guard transport.pathScopedQueryBegin != nil else { throw AtlasSearchError.invalidPathScope }
+        }
         try check(cancellation)
         guard serial.try() else { throw AtlasSearchError.unavailable }
         defer { serial.unlock() }
@@ -78,7 +83,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                 // Publish a successfully finished index before the next cancel
                 // gate. Cancellation can suppress query delivery, not make an
                 // acknowledged complete source universe need another capture.
-                cached = try build(root: root, scope: scope, access: access, cancellation: cancellation, progress: progress)
+                cached = try build(root: root, scope: scope, pathScope: pathScope,
+                    access: access, cancellation: cancellation, progress: progress)
             }
             guard let session = cached else { throw AtlasSearchError.unavailable }
             let (generation, overflow) = session.lastGeneration.addingReportingOverflow(1)
@@ -87,12 +93,16 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             let basis = session.basis, owner = session.owner
             try check(cancellation)
             let began = try owner.call { handle -> String? in
+                if !pathScope.isWorkspace {
+                    guard let scoped = transport.pathScopedQueryBegin else { throw AtlasSearchError.invalidPathScope }
+                    return try scoped(handle, generation, basis.index, query, scope, pathScope)
+                }
                 if scope.isAll { return try transport.queryBegin(handle, generation, basis.index, query) }
                 guard let scoped = transport.scopedQueryBegin else { throw AtlasSearchError.invalidScope }
                 return try scoped(handle, generation, basis.index, query, scope)
             }
             var page = try AtlasIndexedQueryPage(began,
-                basis: basis, generation: generation, needle: query, scope: scope, command: "begin-indexed")
+                basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope, command: "begin-indexed")
             var result = AtlasIndexedAccumulator()
             var lastPublished = -Double.infinity
             var publishedHits = 0
@@ -103,7 +113,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     try check(cancellation)
                     let start = result.hits.count
                     let tail = try AtlasIndexedQueryPage(owner.call { try transport.page($0, generation, UInt64(start), 128) },
-                        basis: basis, generation: generation, needle: query, scope: scope, command: "page")
+                        basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope, command: "page")
                     try result.append(tail, start: start, limit: 128)
                 }
                 let state = page.state
@@ -117,7 +127,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     indexStatus: AtlasSearchIndexStatus(building: false, reused: reused,
                         capturedFiles: basis.capturedFiles, capturedBytes: basis.sourceBytes,
                         skippedFiles: state.skipped, verifiedFiles: state.scanned, verificationBytes: state.verificationBytes),
-                    fileScope: scope, excludedFiles: basis.files - state.eligible)
+                    fileScope: scope, excludedFiles: basis.files - state.eligible, pathScope: pathScope)
                 try check(cancellation)
                 if !state.running { return report }
                 let now = ProcessInfo.processInfo.systemUptime
@@ -126,7 +136,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                 }
                 try check(cancellation)
                 page = try AtlasIndexedQueryPage(owner.call { try transport.queryStep($0, generation, cancellation) },
-                    basis: basis, generation: generation, needle: query, scope: scope, command: "step")
+                    basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope, command: "step")
             }
         } catch {
             if cancellation.isCanceled { throw AtlasSearchError.canceled }
@@ -155,7 +165,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             handle: handle, layout: layout, files: files, discovery: discovery, page: page)
     }
 
-    private func build(root: String, scope: AtlasSearchFileScope, access: AtlasSearchAccessLease, cancellation: AtlasSearchCancellation,
+    private func build(root: String, scope: AtlasSearchFileScope, pathScope: AtlasSearchPathScope,
+                       access: AtlasSearchAccessLease, cancellation: AtlasSearchCancellation,
                        progress: @Sendable (AtlasSearchReport) -> Void) throws -> Session {
         let grant = access.reference.map(ObjectIdentifier.init)
         if preparing.map({ $0.root.utf8.elementsEqual(root.utf8) && $0.grant == grant }) != true {
@@ -177,7 +188,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     progress: AtlasSearchProgress(isRunning: true, examinedFiles: page.examined, cataloguedFiles: preparation.files),
                     streamID: stream, indexStatus: AtlasSearchIndexStatus(building: true, reused: false,
                         capturedFiles: page.captured, capturedBytes: page.bytes, skippedFiles: 0, verifiedFiles: 0, verificationBytes: 0),
-                    fileScope: scope))
+                    fileScope: scope, pathScope: pathScope))
                 lastPublished = now
             }
             // Cancellation here leaves the last acknowledged Rust step intact.

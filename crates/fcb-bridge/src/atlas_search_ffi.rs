@@ -3,7 +3,8 @@
 //! C surface for captured repository results attached to existing atlas handles.
 //! No source policy, matcher, worker pool or alternate reader lives in this bridge.
 use std::ffi::c_char;
-use fcb_app::host::atlas_search::{AtlasSearchOptions, AtlasSearchScope, MAX_ATLAS_SEARCH_NEEDLE_BYTES};
+use fcb_app::host::atlas_search::{AtlasSearchOptions, AtlasSearchScope, AtlasSearchPathKind,
+    MAX_ATLAS_SEARCH_NEEDLE_BYTES};
 use super::{answer, cstr, number, reply, AccessError, Command};
 
 /// Search the frozen atlas catalog to its terminal state and return first-page
@@ -57,6 +58,34 @@ pub unsafe extern "C" fn fcb_atlas_search_begin_scoped(handle: u64, generation: 
         max_matches, max_files, max_file_bytes, max_source_bytes, true) }
 }
 
+/// Search a frozen directory or exact-file intersection with the file types.
+/// path_kind is 0=workspace, 1=directory, 2=file. Paths use exact UTF-8 native
+/// bytes, <=4096 bytes, relative components without empty, dot or dotdot parts.
+/// Directory paths omit a trailing slash; matching includes its descendants.
+/// Workspace requires a null/empty path. This predicate never grants access.
+/// # Safety
+/// Every non-null string is readable NUL-terminated UTF-8 until return. Existing
+/// scoped-list limits, worker restriction and returned-string ownership apply.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_search_path_scoped(handle: u64, generation: u64, needle: *const c_char,
+    extensions: *const c_char, filenames: *const c_char, path_kind: u64, path: *const c_char,
+    max_matches: u64, max_files: u64, max_file_bytes: u64, max_source_bytes: u64) -> *mut c_char {
+    unsafe { submit_with_path(handle, generation, needle, extensions, filenames, path_kind, path,
+        max_matches, max_files, max_file_bytes, max_source_bytes, false) }
+}
+
+/// Admit the same immutable path/type intersection without source I/O. The
+/// ordinary search_step/page/overlay/activation routes retain its exact scope.
+/// # Safety
+/// Same pointer, path/list, worker and returned-string contract as path_scoped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_search_begin_path_scoped(handle: u64, generation: u64, needle: *const c_char,
+    extensions: *const c_char, filenames: *const c_char, path_kind: u64, path: *const c_char,
+    max_matches: u64, max_files: u64, max_file_bytes: u64, max_source_bytes: u64) -> *mut c_char {
+    unsafe { submit_with_path(handle, generation, needle, extensions, filenames, path_kind, path,
+        max_matches, max_files, max_file_bytes, max_source_bytes, true) }
+}
+
 unsafe fn parse_scope(extensions: *const c_char, filenames: *const c_char) -> Result<AtlasSearchScope, AccessError> {
     let extensions = if extensions.is_null() { None }
         else { Some(unsafe { cstr(extensions) }.ok_or(AccessError::InvalidArgument)?) };
@@ -65,15 +94,32 @@ unsafe fn parse_scope(extensions: *const c_char, filenames: *const c_char) -> Re
     AtlasSearchScope::from_csv(extensions, filenames).map_err(AccessError::from)
 }
 
+unsafe fn parse_path_scope(extensions: *const c_char, filenames: *const c_char,
+    path_kind: u64, path: *const c_char) -> Result<AtlasSearchScope, AccessError> {
+    let kind = match path_kind { 0 => AtlasSearchPathKind::Workspace,
+        1 => AtlasSearchPathKind::Directory, 2 => AtlasSearchPathKind::File,
+        _ => return Err(AccessError::InvalidArgument) };
+    let path = if path.is_null() { "" }
+        else { unsafe { cstr(path) }.ok_or(AccessError::InvalidArgument)? };
+    unsafe { parse_scope(extensions, filenames) }?.with_path(kind, path).map_err(AccessError::from)
+}
+
 // Marshaling only: both public entrypoints use the same safe application engine.
 unsafe fn submit(handle: u64, generation: u64, needle: *const c_char,
     extensions: *const c_char, filenames: *const c_char,
     max_matches: u64, max_files: u64, max_file_bytes: u64, max_source_bytes: u64,
     progressive: bool) -> *mut c_char {
+    unsafe { submit_with_path(handle, generation, needle, extensions, filenames, 0, std::ptr::null(),
+        max_matches, max_files, max_file_bytes, max_source_bytes, progressive) }
+}
+unsafe fn submit_with_path(handle: u64, generation: u64, needle: *const c_char,
+    extensions: *const c_char, filenames: *const c_char, path_kind: u64, path: *const c_char,
+    max_matches: u64, max_files: u64, max_file_bytes: u64, max_source_bytes: u64,
+    progressive: bool) -> *mut c_char {
     reply(|| answer(handle, |atlases| {
         let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
         if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES { return Err(AccessError::InvalidArgument); }
-        let scope = unsafe { parse_scope(extensions, filenames) }?;
+        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?;
         let options = AtlasSearchOptions { max_matches: number(max_matches)?, max_files: number(max_files)?,
             max_file_bytes: number(max_file_bytes)?, max_source_bytes: number(max_source_bytes)? };
         let command = match (scope.is_all(), progressive) {

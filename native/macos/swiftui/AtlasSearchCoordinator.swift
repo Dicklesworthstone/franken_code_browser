@@ -129,14 +129,14 @@ private final class AtlasSearchProgressMailbox: @unchecked Sendable {
 
     init(work: @escaping Work) {
         self.work = { input, cancellation, _, _ in
-            guard input.fileScope.isAll else { throw AtlasSearchError.invalidScope }
+            try input.requireLegacyScope()
             return try work(input.root, input.query, cancellation)
         }
         supportsFileScopes = false
     }
     init(progressiveWork: @escaping ProgressiveWork) {
         self.work = { input, cancellation, _, publish in
-            guard input.fileScope.isAll else { throw AtlasSearchError.invalidScope }
+            try input.requireLegacyScope()
             return try progressiveWork(input.root, input.query, cancellation, publish)
         }
         supportsFileScopes = false
@@ -152,7 +152,7 @@ private final class AtlasSearchProgressMailbox: @unchecked Sendable {
 
     nonisolated private static func adapt(_ work: @escaping CapturedWork) -> ScopedWork {
         { input, flag, access, publish in
-            guard input.fileScope.isAll else { throw AtlasSearchError.invalidScope }
+            try input.requireLegacyScope()
             return try work(input.root, input.query, flag, access, publish)
         }
     }
@@ -179,7 +179,7 @@ private final class AtlasSearchProgressMailbox: @unchecked Sendable {
     @discardableResult
     func submit(input: AtlasSearchInput, accessLease: AnyObject? = nil,
                 debounce: Bool = false, using work: CapturedWork? = nil, completion: @escaping Completion) throws -> UInt64 {
-        guard input.fileScope.isAll else { throw AtlasSearchError.invalidScope }
+        try input.requireLegacyScope()
         return try submitScoped(input: input, accessLease: accessLease, debounce: debounce,
             using: work.map(Self.adapt), completion: completion)
     }
@@ -190,7 +190,7 @@ private final class AtlasSearchProgressMailbox: @unchecked Sendable {
     func submitScoped(input: AtlasSearchInput, accessLease: AnyObject? = nil,
                       debounce: Bool = false, using work: ScopedWork? = nil, completion: @escaping Completion) throws -> UInt64 {
         precondition(Thread.isMainThread)
-        guard input.fileScope.isAll || work != nil || supportsFileScopes else { throw AtlasSearchError.invalidScope }
+        if work == nil && !supportsFileScopes { try input.requireLegacyScope() }
         let (generation, exhausted) = lastGeneration.addingReportingOverflow(1)
         guard !exhausted else { throw AtlasSearchError.identityExhausted }
         lastGeneration = generation
@@ -247,12 +247,13 @@ private final class AtlasSearchProgressMailbox: @unchecked Sendable {
                 if request.cancellation.isCanceled { throw AtlasSearchError.canceled }
                 let report = try withExtendedLifetime(request.accessLease) {
                     try work(request.input, request.cancellation, AtlasSearchAccessLease(request.accessLease)) { report in
-                        guard report.fileScope == request.input.fileScope else { return }
+                        guard report.fileScope == request.input.fileScope, report.pathScope == request.input.pathScope else { return }
                         mailbox.offer(report)
                     }
                 }
                 if request.cancellation.isCanceled { throw AtlasSearchError.canceled }
-                guard !report.isInProgress, report.fileScope == request.input.fileScope else { throw AtlasSearchError.invalidResponse }
+                guard !report.isInProgress, report.fileScope == request.input.fileScope,
+                      report.pathScope == request.input.pathScope else { throw AtlasSearchError.invalidResponse }
                 result = .success(report)
             } catch let error as AtlasSearchError {
                 result = .failure(error)

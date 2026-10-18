@@ -78,7 +78,7 @@ struct AtlasIndexedHit: Decodable, Sendable, Equatable {
     let hit: SearchHit
     let file, revision: UInt64
     let pathHex: String
-    let fileNameBytes: [UInt8]
+    let rawPathBytes: [UInt8]
 
     init(from decoder: Decoder) throws {
         let wire = try AtlasIndexWire(from: decoder)
@@ -106,7 +106,7 @@ struct AtlasIndexedHit: Decodable, Sendable, Equatable {
               !raw.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
                   $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46])
               }) else { throw AtlasIndexWire.invalid() }
-        fileNameBytes = Array(raw.split(separator: 47).last!)
+        rawPathBytes = raw
         hit = SearchHit(id: Int(ordinal - 1), path: display, sourcePath: String(bytes: raw, encoding: .utf8),
             start: start, end: end, captureSHA256: digest, captureByteLength: bytes)
     }
@@ -136,13 +136,15 @@ struct AtlasIndexedQueryPage {
     let next: UInt64?
 
     init(_ json: String?, basis: AtlasIndexedBasis, generation: UInt64, needle: String,
-         scope: AtlasSearchFileScope = .all, command: String) throws {
+         scope: AtlasSearchFileScope = .all, pathScope: AtlasSearchPathScope = .workspace, command: String) throws {
         let w = try AtlasIndexWire.decode(json)
         try basis.validate(w, command: command)
         let kind = try w.optionalText("search_scope")
+        try pathScope.validateEcho(kind: w.optionalText("scope_path_kind"),
+            path: w.optionalText("scope_path"), hex: w.optionalText("scope_path_hex"))
         let eligible = try scope.eligibleFiles(kind: kind, extensions: w.optionalText("scope_extensions"),
             filenames: w.optionalText("scope_filenames"), eligible: w.optionalText("eligible_files"),
-            excluded: w.optionalText("excluded_files"), catalogued: basis.files)
+            excluded: w.optionalText("excluded_files"), catalogued: basis.files, pathScoped: !pathScope.isWorkspace)
         let captured, captureUnavailable: Int
         if kind == nil {
             captured = basis.capturedFiles; captureUnavailable = basis.unavailable
@@ -151,7 +153,7 @@ struct AtlasIndexedQueryPage {
             captureUnavailable = try w.count("scoped_capture_unavailable_files", upTo: min(basis.unavailable, eligible))
         }
         guard captured + captureUnavailable <= eligible,
-              !scope.isAll || (captured == basis.capturedFiles && captureUnavailable == basis.unavailable) else {
+              !scope.isAll || !pathScope.isWorkspace || (captured == basis.capturedFiles && captureUnavailable == basis.unavailable) else {
             throw AtlasIndexWire.invalid()
         }
         let examined = try w.count("examined_files", upTo: eligible)
@@ -186,7 +188,9 @@ struct AtlasIndexedQueryPage {
                   matches == UInt64(retained) else { throw AtlasIndexWire.invalid() }
         }
         hits = try w.rows("hits", limit: command == "page" ? 128 : 64)
-        guard hits.allSatisfy({ scope.admitsRawPath($0.fileNameBytes) }) else { throw AtlasIndexWire.invalid() }
+        guard hits.allSatisfy({ scope.admitsRawPath($0.rawPathBytes) && pathScope.admitsRawPath($0.rawPathBytes) }) else {
+            throw AtlasIndexWire.invalid()
+        }
         next = try w.optionalNumber("next_offset")
         state = AtlasIndexedQueryState(eligible: eligible, captured: captured, captureUnavailable: captureUnavailable,
             examined: examined, scanned: scanned, unavailable: unavailable,
@@ -236,7 +240,7 @@ struct AtlasIndexedAccumulator {
                           previous.hit.captureSHA256 == row.hit.captureSHA256,
                           previous.hit.captureByteLength == row.hit.captureByteLength else { throw AtlasIndexWire.invalid() }
                 }
-                let charge = row.pathHex.utf8.count + row.fileNameBytes.count
+                let charge = row.pathHex.utf8.count + row.rawPathBytes.count
                     + 2 * row.hit.path.utf8.count + (row.hit.sourcePath?.utf8.count ?? 0) + 512
                 guard charge <= 8 * 1024 * 1024 - textBytes else { throw AtlasIndexWire.invalid() }
                 textBytes += charge; byFile[row.file] = row; hits.append(row)

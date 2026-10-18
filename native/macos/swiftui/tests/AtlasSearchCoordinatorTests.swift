@@ -58,9 +58,10 @@ private final class Lease {}
         try partialAndEmptyReportsRemainDistinct()
         try workerCancellationFinishesLatestRequest()
         try scopeReplacementKeepsOnlyNewestInput()
+        try pathScopeReplacementKeepsOnlyNewestInput()
         try legacyWorkersRejectScopedAdmission()
         try wrongScopeCannotPublish()
-        print("AtlasSearchCoordinator: 13 worker, cancellation, publication, scope and grant-lifetime scenarios passed")
+        print("AtlasSearchCoordinator: 14 worker, cancellation, publication, scope and grant-lifetime scenarios passed")
     }
     static func workRunsOffMainAndCompletesOnMain() throws {
         let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
@@ -278,6 +279,12 @@ private final class Lease {}
             try coordinator.submitScoped(input: input) { _ in preconditionFailure("Scope silently widened") }
             preconditionFailure("Legacy worker admitted a scoped request")
         } catch AtlasSearchError.invalidScope {}
+        let pathInput = try AtlasSearchInput(root: "/project", query: "valid",
+            pathScope: AtlasSearchPathScope(kind: .directory, path: "src"))
+        do {
+            try coordinator.submitScoped(input: pathInput) { _ in preconditionFailure("Location silently widened") }
+            preconditionFailure("Legacy worker admitted a location-scoped request")
+        } catch AtlasSearchError.invalidPathScope {}
         precondition(!trace.snapshot.1[0].isCanceled, "Rejected scope canceled an accepted request")
         release.signal(); pump { completed }
     }
@@ -298,6 +305,56 @@ private final class Lease {}
             }
         }
         pump { failed }; precondition(!delivered, "Mismatched scope progress became visible")
+        let expected = try AtlasSearchPathScope(kind: .directory, path: "cafe\u{301}")
+        let wrong = try AtlasSearchPathScope(kind: .directory, path: "café")
+        let pathCoordinator = AtlasSearchCoordinator(scopedWork: { _, _, _, publish in
+            var answer = report("wrong path"); answer.pathScope = wrong
+            var provisional = answer
+            provisional.progress = AtlasSearchProgress(isRunning: true, examinedFiles: 1, cataloguedFiles: 1)
+            publish(provisional)
+            return answer
+        })
+        var pathFailed = false, pathDelivered = false
+        try pathCoordinator.submitScoped(input: AtlasSearchInput(root: "/project", query: "x", pathScope: expected)) {
+            switch $0 {
+            case .failure(.invalidResponse): pathFailed = true
+            case .success: pathDelivered = true
+            default: preconditionFailure("Wrong error for mismatched native location")
+            }
+        }
+        pump { pathFailed }; precondition(!pathDelivered, "Unicode-equivalent scope borrowed another request's authority")
+    }
+
+    static func pathScopeReplacementKeepsOnlyNewestInput() throws {
+        let pairs = [
+            (try AtlasSearchPathScope(kind: .directory, path: "src"), try AtlasSearchPathScope(kind: .file, path: "src/a.rs")),
+            (try AtlasSearchPathScope(kind: .directory, path: "café"), try AtlasSearchPathScope(kind: .directory, path: "cafe\u{301}"))
+        ]
+        for (old, newest) in pairs {
+            let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), trace = Trace()
+            let coordinator = AtlasSearchCoordinator(scopedWork: { input, flag, _, publish in
+                trace.enter(input.pathScope.pathHex, flag); defer { trace.leave() }
+                if input.pathScope == old { entered.signal(); wait(release) }
+                var answer = report(input.pathScope.path); answer.pathScope = input.pathScope
+                var provisional = answer
+                provisional.progress = AtlasSearchProgress(isRunning: true, examinedFiles: 0, cataloguedFiles: 1)
+                publish(provisional)
+                return answer
+            })
+            var delivered: [AtlasSearchPathScope] = [], finished = false
+            try coordinator.submitScoped(input: AtlasSearchInput(root: "/project", query: "same", pathScope: old)) {
+                delivered.append(success($0).pathScope)
+            }
+            wait(entered)
+            try coordinator.submitScoped(input: AtlasSearchInput(root: "/project", query: "same", pathScope: newest)) {
+                let answer = success($0); delivered.append(answer.pathScope); finished = !answer.isInProgress
+            }
+            precondition(trace.snapshot.1[0].isCanceled, "Location replacement failed to retire the old request")
+            release.signal(); pump { finished }
+            precondition(!delivered.isEmpty && delivered.allSatisfy { $0 == newest }, "Obsolete location repainted new results")
+            precondition(trace.snapshot.0 == [old.pathHex, newest.pathHex] && trace.snapshot.2 == 1,
+                "Bounded queue did not keep frozen location identities")
+        }
     }
 
 }

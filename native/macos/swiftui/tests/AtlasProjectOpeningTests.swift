@@ -121,6 +121,12 @@ import Foundation
             check(old.matchesSourceRequest(new), "An in-flight source search survives optional preview publication")
             check(!old.matches(new), "Old overlay/frame authority still rejected after layout change")
             check(old.matchesSourceRequest(old) && old.matches(old), "Unchanged source and display remain compatible")
+            var folder = old; folder.pathKind = "directory"; folder.path = "src/café"
+            var otherFolder = folder; otherFolder.path = "src/cafe\u{301}"
+            var file = folder; file.pathKind = "file"
+            check(!old.matchesSourceRequest(folder) && !old.matches(folder), "Changing from workspace to a folder revokes source and overlay authority")
+            check(!folder.matchesSourceRequest(otherFolder) && !folder.matches(otherFolder), "Location changes compare native bytes, including Unicode equivalents")
+            check(!folder.matchesSourceRequest(file) && !folder.matches(file), "Folder and exact-file queries with identical path bytes remain distinct")
             for changed in [context(project: UUID(), atlas: newAtlas), context(project: project, root: "/other"),
                             context(project: project, query: "new"), context(project: project, scope: "Rust"),
                             context(project: project, extensions: "rs")] {

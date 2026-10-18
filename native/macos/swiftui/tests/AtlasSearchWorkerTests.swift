@@ -99,6 +99,68 @@ private func freeLegacySearch(_ text: UnsafeMutablePointer<CChar>?)
             "Scope must precede candidate, byte and hit limits")
         precondition(selected!.progress?.cataloguedFiles == 2 && selected!.excludedFiles == 2,
             "Scoped coverage denominator included excluded files")
-        print("AtlasSearchWorker: production off-main search, UTF-16, exact captures, scoped limits, negatives and cancellation checks passed")
+        broad = nil; selected = nil; observed = nil
+
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("scoped/nested"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("scoped2"), withIntermediateDirectories: false)
+        try Data(String(repeating: "path-needle\n", count: 1001).utf8)
+            .write(to: root.appendingPathComponent("a_path_noise.txt"))
+        try Data(String(repeating: "path-needle\n", count: 1001).utf8)
+            .write(to: root.appendingPathComponent("scoped2/noise.rs"))
+        try Data(String(repeating: "file-needle\n", count: 1001).utf8)
+            .write(to: root.appendingPathComponent("scoped/a_excluded.rs"))
+        try Data("path-needle\nfile-needle\n".utf8).write(to: root.appendingPathComponent("scoped/z_included.rs"))
+        try Data("path-needle\n".utf8).write(to: root.appendingPathComponent("scoped/nested/child.py"))
+        let directory = try AtlasSearchPathScope(kind: .directory, path: "scoped")
+        let file = try AtlasSearchPathScope(kind: .file, path: "scoped/z_included.rs")
+        func execute(_ input: AtlasSearchInput) throws -> AtlasSearchReport {
+            var answer: AtlasSearchReport?
+            try scopedCoordinator.submitScoped(input: input) { result in
+                do {
+                    let report = try result.get()
+                    if !report.isInProgress { answer = report }
+                } catch { preconditionFailure("Production path-scope search failed: \(error)") }
+            }
+            pump { answer != nil }
+            return answer!
+        }
+        do {
+            let control = try execute(AtlasSearchInput(root: root.path, query: "path-needle"))
+            precondition(control.truncated && control.hits.count == 1000
+                && control.hits.allSatisfy { $0.sourcePath == "a_path_noise.txt" },
+                "Directory regression must first demonstrate workspace quota starvation")
+        }
+        do {
+            let result = try execute(AtlasSearchInput(root: root.path, query: "path-needle", pathScope: directory))
+            precondition(result.complete && !result.truncated && result.matchesSeen == 2
+                && Set(result.hits.compactMap(\.sourcePath)) == ["scoped/z_included.rs", "scoped/nested/child.py"],
+                "Directory scope must reject sibling prefixes before consuming the match limit")
+            precondition(result.progress?.cataloguedFiles == 3 && result.excludedFiles == 6,
+                "Directory coverage includes descendants, not prefix siblings or outside files")
+        }
+        do {
+            let control = try execute(AtlasSearchInput(root: root.path, query: "file-needle", pathScope: directory))
+            precondition(control.truncated && control.hits.count == 1000
+                && control.hits.allSatisfy { $0.sourcePath == "scoped/a_excluded.rs" },
+                "Exact-file regression must demonstrate starvation by an earlier sibling in the same folder")
+        }
+        do {
+            let result = try execute(AtlasSearchInput(root: root.path, query: "file-needle", pathScope: file))
+            precondition(result.complete && !result.truncated && result.hits.count == 1
+                && result.hits[0].sourcePath == "scoped/z_included.rs" && result.matchesSeen == 1,
+                "Exact-file scope must precede candidate, byte and hit limits")
+            precondition(result.progress?.cataloguedFiles == 1 && result.excludedFiles == 8)
+        }
+        do {
+            let result = try execute(AtlasSearchInput(root: root.path, query: "path-needle", fileScope: scope, pathScope: directory))
+            precondition(result.complete && result.hits.count == 1 && result.hits[0].sourcePath == "scoped/z_included.rs"
+                && result.progress?.cataloguedFiles == 2 && result.excludedFiles == 7,
+                "File-type and location predicates must intersect before traversal")
+            let absent = try execute(AtlasSearchInput(root: root.path, query: "path-needle",
+                pathScope: AtlasSearchPathScope(kind: .file, path: "scoped/missing.rs")))
+            precondition(absent.complete && absent.hits.isEmpty && absent.excludedFiles == 9
+                && absent.progress?.cataloguedFiles == 0, "Missing exact file must never widen to its directory")
+        }
+        print("AtlasSearchWorker: production off-main search, UTF-16, captures, file-type/file/folder limits, negatives and cancellation checks passed")
     }
 }

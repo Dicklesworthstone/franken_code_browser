@@ -45,6 +45,18 @@ char *fcb_atlas_search_indexed_begin_scoped(uint64_t h, uint64_t g, uint64_t ind
     else assert(g == 46 && !extensions[0] && !filenames[0]);
     return fcb_atlas_search_indexed_begin(h, 44, index, needle, hits, bytes);
 }
+char *fcb_atlas_search_indexed_begin_path_scoped(uint64_t h, uint64_t g, uint64_t index, const char *needle,
+                                               const char *extensions, const char *filenames,
+                                               uint64_t path_kind, const char *path, uint64_t hits, uint64_t bytes) {
+    if (g == 47) {
+        assert(path_kind == 1 && path && !strcmp(path, "src"));
+        assert(!extensions && !filenames);
+    } else {
+        assert(g == 48 && path_kind == 2 && path && !strcmp(path, "src/exact.rs"));
+        assert(extensions && !strcmp(extensions, "rs") && filenames && !filenames[0]);
+    }
+    return fcb_atlas_search_indexed_begin(h, 44, index, needle, hits, bytes);
+}
 char *fcb_atlas_search_step_cancelable(uint64_t h, uint64_t g, int32_t (*poll)(void *), void *ctx) {
     assert(h == handle && g == 44); ++calls; poll_now(poll, ctx); return result();
 }

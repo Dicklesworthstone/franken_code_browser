@@ -25,6 +25,7 @@ final class IndexedFixture: @unchecked Sendable {
         var generation: UInt64 = 1
         var needle = ""
         var scope: AtlasSearchFileScope = .all
+        var pathScope: AtlasSearchPathScope = .workspace
     }
     private let lock = NSLock()
     private var config = Configuration()
@@ -65,12 +66,16 @@ final class IndexedFixture: @unchecked Sendable {
         }, retirementFailed: { self.record("retirement-failed") }, scopedQueryBegin: { h, g, index, needle, scope in
             precondition(index == 1 && !scope.isAll)
             return try self.response("query-begin", h, generation: g, needle: needle, scope: scope)
+        }, pathScopedQueryBegin: { h, g, index, needle, scope, pathScope in
+            precondition(index == 1 && !pathScope.isWorkspace)
+            return try self.response("query-begin", h, generation: g, needle: needle, scope: scope, pathScope: pathScope)
         })
     }
 
     private func response(_ phase: String, _ h: UInt64, generation: UInt64 = 1,
                           needle: String = "", start: Int = 0, reader: UInt64 = 100,
                           scope: AtlasSearchFileScope = .all,
+                          pathScope: AtlasSearchPathScope = .workspace,
                           cancellation: AtlasSearchCancellation? = nil) throws -> String? {
         lock.lock(); let block = blocked; lock.unlock()
         block?(phase)
@@ -82,7 +87,9 @@ final class IndexedFixture: @unchecked Sendable {
         if phase == "query-begin" {
             precondition(generation > s.generation)
             s.generation = generation; s.needle = needle; s.queryStep = 0; s.scope = scope
+            s.pathScope = pathScope
             events.append("query-scope:\(scope.wireKind):\(scope.extensions ?? ""):\(scope.filenames ?? "")")
+            events.append("query-path:\(pathScope.kind.rawValue):\(pathScope.pathHex)")
         }
         if phase == "query-step" || phase == "page" { precondition(s.generation == generation) }
         if phase == "query-step" { s.queryStep += 1 }
@@ -123,7 +130,7 @@ final class IndexedFixture: @unchecked Sendable {
                     "additional_source_bytes_read": "0", "native_presented": false]]
             value.merge(fields, uniquingKeysWith: { _, n in n })
         } else {
-            let scoped = !s.scope.isAll
+            let scoped = !s.scope.isAll || !s.pathScope.isWorkspace
             let eligible = scoped ? c.scopedEligible ?? c.files : c.files
             let available = scoped ? c.scopedCaptured ?? captured : captured
             let unavailable = scoped ? c.scopedUnavailable ?? c.unavailable : c.unavailable
@@ -164,6 +171,9 @@ final class IndexedFixture: @unchecked Sendable {
                 value["excluded_files"] = String(c.files - eligible)
                 value["eligible_captured_files"] = String(available)
                 value["scoped_capture_unavailable_files"] = String(unavailable)
+                value["scope_path_kind"] = s.pathScope.kind.rawValue
+                value["scope_path"] = s.pathScope.path
+                value["scope_path_hex"] = s.pathScope.pathHex
             }
         }
         value = mutation(phase, value)

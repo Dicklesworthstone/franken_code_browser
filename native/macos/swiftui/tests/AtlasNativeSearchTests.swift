@@ -6,7 +6,8 @@ import Foundation
 @_silgen_name("fixture_count") private func fixtureCount(_ key: UInt32) -> UInt32
 @_silgen_name("fixture_cancel_step") private func cancelStep()
 @_silgen_name("fixture_refuse_create") private func refuseCreate()
-@_silgen_name("fixture_expect_scope") private func expectScope(_ extensions: UnsafePointer<CChar>, _ filenames: UnsafePointer<CChar>)
+@_silgen_name("fixture_expect_scope") private func expectScope(_ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?)
+@_silgen_name("fixture_expect_path") private func expectPath(_ kind: UInt64, _ path: UnsafePointer<CChar>)
 @_cdecl("fixture_mark_canceled") public func markCanceled(_ context: UnsafeMutableRawPointer?) {
     guard let context else { preconditionFailure("Missing callback lifetime") }
     Unmanaged<AtlasSearchCancellation>.fromOpaque(context).takeUnretainedValue().cancel()
@@ -67,7 +68,8 @@ private final class Reports: @unchecked Sendable {
         try install(4, importReply())
     }
     private static func scopedPage(_ command: String, scope: AtlasSearchFileScope, step: Int,
-                                   eligible: Int, total: Int = 0, running: Bool = true) -> [String: Any] {
+                                   eligible: Int, total: Int = 0, running: Bool = true,
+                                   pathScope: AtlasSearchPathScope = .workspace, hitPath: String? = nil) -> [String: Any] {
         var value = page(command, step: step, total: total, running: running, complete: !running)
         value["search_scope"] = scope.wireKind
         value["scope_extensions"] = scope.extensions ?? ""
@@ -75,18 +77,26 @@ private final class Reports: @unchecked Sendable {
         value["eligible_files"] = String(eligible); value["excluded_files"] = String(2 - eligible)
         value["examined_files"] = String(min(step, eligible)); value["scanned_files"] = String(min(step, eligible))
         value["pending_files"] = String(max(0, eligible - step))
+        if !pathScope.isWorkspace {
+            value["scope_path_kind"] = pathScope.kind.rawValue
+            value["scope_path"] = pathScope.path; value["scope_path_hex"] = pathScope.pathHex
+        }
+        if let hitPath, total > 0 { value["hits"] = (1...min(total, 64)).map { hit($0, path: hitPath) } }
         return value
     }
-    private static func setupScoped(_ scope: AtlasSearchFileScope, eligible: Int = 1) throws {
+    private static func setupScoped(_ scope: AtlasSearchFileScope, eligible: Int = 1,
+                                    pathScope: AtlasSearchPathScope = .workspace, hitPath: String? = nil) throws {
         resetFixture()
-        scope.withCStrings { expectScope($0!, $1!) }
+        scope.withCStrings { expectScope($0, $1) }
+        if !pathScope.isWorkspace { pathScope.withCString { expectPath($0, $1!) } }
         try install(0, ["status": "ok"])
-        try install(1, scopedPage("begin", scope: scope, step: 0, eligible: eligible))
+        try install(1, scopedPage("begin", scope: scope, step: 0, eligible: eligible, pathScope: pathScope))
         try install(2, scopedPage("step", scope: scope, step: 1, eligible: eligible,
-            total: eligible == 0 ? 0 : 1, running: false))
+            total: eligible == 0 ? 0 : 1, running: false, pathScope: pathScope, hitPath: hitPath))
     }
-    private static func runScoped(_ scope: AtlasSearchFileScope) throws -> AtlasSearchReport {
-        try AtlasNativeSearch.runScoped(input: AtlasSearchInput(root: "/project", query: "x", fileScope: scope),
+    private static func runScoped(_ scope: AtlasSearchFileScope,
+                                  pathScope: AtlasSearchPathScope = .workspace) throws -> AtlasSearchReport {
+        try AtlasNativeSearch.runScoped(input: AtlasSearchInput(root: "/project", query: "x", fileScope: scope, pathScope: pathScope),
             cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
     }
     // Last-owner retirement is intentionally asynchronous. Fixture counters are
@@ -267,6 +277,68 @@ private final class Reports: @unchecked Sendable {
             retired()
             check(fixtureCount(6) == fixtureCount(7), "Scope rejection releases every C allocation")
         }
+        let directory = try AtlasSearchPathScope(kind: .directory, path: "src")
+        let file = try AtlasSearchPathScope(kind: .file, path: "src/a.rs")
+        for pathScope in [directory, file] {
+            try setupScoped(.all, pathScope: pathScope, hitPath: "7372632f612e7273")
+            var result: AtlasSearchReport? = try runScoped(.all, pathScope: pathScope)
+            check(result!.complete && result!.hits.count == 1 && result!.hits[0].sourcePath == "src/a.rs"
+                && result!.pathScope == pathScope, "Exact requested location survives the C worker")
+            check(result!.progress?.cataloguedFiles == 1 && result!.excludedFiles == 1,
+                "Path-only scope uses eligible coverage even when all extensions are included")
+            check(fixtureCount(10) == 1 && fixtureCount(9) == 0, "Location scope uses its dedicated C admission")
+            result = nil; retired()
+        }
+        try setupScoped(rustScope, pathScope: directory, hitPath: "7372632fff2e7273")
+        var rawChild: AtlasSearchReport? = try runScoped(rustScope, pathScope: directory)
+        check(rawChild!.hits.count == 1 && rawChild!.hits[0].sourcePath == nil
+            && rawChild!.capture?.target(rawChild!.hits[0]) == nil,
+            "An opaque descendant is searchable without a fabricated Unicode opener")
+        rawChild = nil; retired()
+        try setupScoped(.all, eligible: 0, pathScope: file)
+        let noFile = try runScoped(.all, pathScope: file)
+        check(noFile.complete && noFile.hits.isEmpty && noFile.excludedFiles == 2
+            && noFile.pathScope == file, "An absent exact file remains an empty scope")
+        retired()
+        for defect in ["missing", "kind", "path", "hex", "sibling-prefix", "outside-root", "range"] {
+            try setupScoped(.all, pathScope: directory, hitPath: "7372632f612e7273")
+            var bad = scopedPage("step", scope: .all, step: 1, eligible: 1, total: 1, running: false,
+                pathScope: directory, hitPath: "7372632f612e7273")
+            if defect == "missing" {
+                for key in ["scope_path_kind", "scope_path", "scope_path_hex"] { bad.removeValue(forKey: key) }
+            } else if defect == "kind" { bad["scope_path_kind"] = "file" }
+            else if defect == "path" { bad["scope_path"] = "src2" }
+            else if defect == "hex" { bad["scope_path_hex"] = "00" }
+            else if defect == "sibling-prefix" { bad["hits"] = [hit(1, path: "737263322f612e7273")] }
+            else if defect == "outside-root" { bad["hits"] = [hit(1, path: "7372632f2e2e2f612e7273")] }
+            else {
+                var row = hit(1, path: "7372632f612e7273")
+                row["original_range"] = ["start": "0", "end": "1001"]; bad["hits"] = [row]
+            }
+            try install(2, bad)
+            do { _ = try runScoped(.all, pathScope: directory); preconditionFailure("Path-scope defect accepted: \(defect)") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+            retired()
+            check(fixtureCount(6) == fixtureCount(7), "Path rejection releases every C allocation")
+        }
+        let composed = try AtlasSearchPathScope(kind: .directory, path: "café")
+        let decomposed = try AtlasSearchPathScope(kind: .directory, path: "cafe\u{301}")
+        for defect in ["echo", "row"] {
+            try setupScoped(.all, pathScope: composed, hitPath: composed.pathHex + "2f612e7273")
+            var bad = scopedPage("step", scope: .all, step: 1, eligible: 1, total: 1, running: false,
+                pathScope: composed, hitPath: composed.pathHex + "2f612e7273")
+            if defect == "echo" { bad["scope_path"] = decomposed.path }
+            else { bad["hits"] = [hit(1, path: decomposed.pathHex + "2f612e7273")] }
+            try install(2, bad)
+            do { _ = try runScoped(.all, pathScope: composed); preconditionFailure("Normalized path scope accepted") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+            retired()
+        }
+        try setupScoped(.all, pathScope: directory, hitPath: "7372632f612e7273"); cancelStep()
+        do { _ = try runScoped(.all, pathScope: directory); preconditionFailure("Path-scoped cancellation ignored") }
+        catch AtlasSearchError.canceled { checks += 1 }
+        retired()
+        check(fixtureCount(6) == fixtureCount(7), "Racing path-scoped cancellation releases every C allocation")
         resetFixture()
         print("AtlasNativeSearchTests: \(checks) checks passed")
     }

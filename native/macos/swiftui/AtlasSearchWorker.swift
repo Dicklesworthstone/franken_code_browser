@@ -12,6 +12,11 @@ private func beginSearch(_ handle: UInt64, _ generation: UInt64, _ query: Unsafe
 private func beginScopedSearch(_ handle: UInt64, _ generation: UInt64, _ query: UnsafePointer<CChar>?,
     _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
     _ maxMatches: UInt64, _ maxFiles: UInt64, _ maxFileBytes: UInt64, _ maxSourceBytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_search_begin_path_scoped")
+private func beginPathScopedSearch(_ handle: UInt64, _ generation: UInt64, _ query: UnsafePointer<CChar>?,
+    _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
+    _ pathKind: UInt64, _ path: UnsafePointer<CChar>?,
+    _ maxMatches: UInt64, _ maxFiles: UInt64, _ maxFileBytes: UInt64, _ maxSourceBytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_search_step_cancelable")
 private func stepSearch(_ handle: UInt64, _ generation: UInt64,
     _ poll: SearchPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
@@ -49,7 +54,7 @@ enum AtlasNativeSearch {
 
     static func runScoped(input: AtlasSearchInput, cancellation: AtlasSearchCancellation,
         access: AtlasSearchAccessLease, progress: @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport {
-        let root = input.root, query = input.query, scope = input.fileScope
+        let root = input.root, query = input.query, scope = input.fileScope, pathScope = input.pathScope
         if cancellation.isCanceled { throw AtlasSearchError.canceled }
         let handle = createSearchAtlas()
         guard handle != 0 else { throw AtlasSearchError.unavailable }
@@ -70,14 +75,20 @@ enum AtlasNativeSearch {
             guard opened.status == "ok" else { throw AtlasSearchError.unavailable }
             var page: SearchPage = try read(query.withCString {
                 queryPointer in scope.withCStrings { extensions, filenames in
-                    owner.call {
-                        scope.isAll
-                            ? beginSearch($0, 1, queryPointer, 1000, 4096, 1024 * 1024, 32 * 1024 * 1024)
-                            : beginScopedSearch($0, 1, queryPointer, extensions, filenames, 1000, 4096, 1024 * 1024, 32 * 1024 * 1024)
+                    pathScope.withCString { kind, path in
+                        owner.call { handle in
+                            if !pathScope.isWorkspace {
+                                return beginPathScopedSearch(handle, 1, queryPointer, extensions, filenames,
+                                    kind, path, 1000, 4096, 1024 * 1024, 32 * 1024 * 1024)
+                            }
+                            return scope.isAll
+                                ? beginSearch(handle, 1, queryPointer, 1000, 4096, 1024 * 1024, 32 * 1024 * 1024)
+                                : beginScopedSearch(handle, 1, queryPointer, extensions, filenames, 1000, 4096, 1024 * 1024, 32 * 1024 * 1024)
+                        }
                     }
                 }
             }, cancellation)
-            var stream = SearchStream(query: query, scope: scope)
+            var stream = SearchStream(query: query, scope: scope, pathScope: pathScope)
             var lastPublished: TimeInterval? = nil
             var publishedHits = 0
             while true {
@@ -144,6 +155,7 @@ private struct SearchPage: Decodable {
     let stop_reason: String?
     let catalogued_files, examined_files, scanned_files, unavailable_files, pending_files: String
     let search_scope, scope_extensions, scope_filenames, eligible_files, excluded_files: String?
+    let scope_path_kind, scope_path, scope_path_hex: String?
     let matches_seen, retained_hits, displayed_hits, step_count: String
     let hits: [SearchWireHit]
     let next_offset: String?
@@ -163,6 +175,7 @@ private struct SearchWirePath: Decodable, Equatable { let encoding, hex, display
 private struct SearchStream {
     let query: String
     let scope: AtlasSearchFileScope
+    let pathScope: AtlasSearchPathScope
     let id = UUID()
     private var identity: [String]?
     private var state: SearchState?
@@ -170,7 +183,9 @@ private struct SearchStream {
     private var hits: [SearchHit] = []
     private var files: [String: SearchWireHit] = [:]
     private var retainedTextBytes = 0
-    init(query: String, scope: AtlasSearchFileScope) { self.query = query; self.scope = scope }
+    init(query: String, scope: AtlasSearchFileScope, pathScope: AtlasSearchPathScope) {
+        self.query = query; self.scope = scope; self.pathScope = pathScope
+    }
     var count: Int { hits.count }
     var retained: Int { state?.retained ?? 0 }
 
@@ -240,7 +255,7 @@ private struct SearchStream {
             unavailableFiles: state.unavailable, unsupportedFiles: 0, matchesSeen: state.matches,
             progress: AtlasSearchProgress(isRunning: state.running, examinedFiles: state.examined,
                 cataloguedFiles: state.eligible), streamID: id, capture: capture,
-            fileScope: scope, excludedFiles: state.catalogued - state.eligible)
+            fileScope: scope, excludedFiles: state.catalogued - state.eligible, pathScope: pathScope)
     }
 
     private func validated(_ page: SearchPage) throws -> SearchState {
@@ -255,8 +270,10 @@ private struct SearchStream {
             guard identity == [page.owner, page.source_manifest, page.layout_revision, page.query_generation] else { throw invalid() }
         }
         let catalogued = try count(page.catalogued_files, max: 4096)
+        try pathScope.validateEcho(kind: page.scope_path_kind, path: page.scope_path, hex: page.scope_path_hex)
         let eligible = try scope.eligibleFiles(kind: page.search_scope, extensions: page.scope_extensions,
-            filenames: page.scope_filenames, eligible: page.eligible_files, excluded: page.excluded_files, catalogued: catalogued)
+            filenames: page.scope_filenames, eligible: page.eligible_files, excluded: page.excluded_files,
+            catalogued: catalogued, pathScoped: !pathScope.isWorkspace)
         let examined = try count(page.examined_files, max: eligible)
         let scanned = try count(page.scanned_files, max: examined)
         let unavailable = try count(page.unavailable_files, max: examined)
@@ -302,7 +319,7 @@ private struct SearchStream {
         guard !raw.contains(0), raw.first != 47,
               !raw.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
                   $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46])
-              }), scope.admitsRawPath(raw) else { throw invalid() }
+              }), scope.admitsRawPath(raw), pathScope.admitsRawPath(raw) else { throw invalid() }
         return SearchHit(id: position, path: wire.path.display, sourcePath: String(bytes: raw, encoding: .utf8),
             start: start, end: end, captureSHA256: wire.capture_sha256, captureByteLength: length)
     }

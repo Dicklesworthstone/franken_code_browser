@@ -7,9 +7,12 @@
 
 static char *responses[5][8]; // open, begin, step, page, captured reader import
 static unsigned cursors[5];
-static _Atomic unsigned counts[10]; // create/open/begin/step/page/close/alloc/free/import/scoped-begin
+static _Atomic unsigned counts[11]; // create/open/begin/step/page/close/alloc/free/import/scoped-begin/path-begin
 static int cancel_step, refuse_create;
 static char expected_extensions[1025], expected_filenames[1025];
+static int expected_all;
+static uint64_t expected_path_kind;
+static char expected_path[4097];
 extern void fixture_mark_canceled(void *);
 
 void fixture_reset(void) {
@@ -17,18 +20,31 @@ void fixture_reset(void) {
         for (unsigned j = 0; j < 8; ++j) { free(responses[i][j]); responses[i][j] = NULL; }
         cursors[i] = 0;
     }
-    for (unsigned i = 0; i < 10; ++i) atomic_store(&counts[i], 0);
+    for (unsigned i = 0; i < 11; ++i) atomic_store(&counts[i], 0);
     expected_extensions[0] = expected_filenames[0] = 0;
+    expected_all = 1; expected_path_kind = 0; expected_path[0] = 0;
     cancel_step = refuse_create = 0;
 }
 void fixture_set(unsigned kind, unsigned index, const char *text) {
     assert(kind < 5 && index < 8);
     free(responses[kind][index]); responses[kind][index] = strdup(text);
 }
-unsigned fixture_count(unsigned key) { assert(key < 10); return atomic_load(&counts[key]); }
+unsigned fixture_count(unsigned key) { assert(key < 11); return atomic_load(&counts[key]); }
 void fixture_expect_scope(const char *extensions, const char *filenames) {
+    if (!extensions || !filenames) {
+        assert(!extensions && !filenames); expected_all = 1; return;
+    }
     assert(extensions && filenames && strlen(extensions) <= 1024 && strlen(filenames) <= 1024);
+    expected_all = 0;
     strcpy(expected_extensions, extensions); strcpy(expected_filenames, filenames);
+}
+void fixture_expect_path(uint64_t kind, const char *path) {
+    assert(kind >= 1 && kind <= 2 && path && strlen(path) <= 4096);
+    expected_path_kind = kind; strcpy(expected_path, path);
+}
+static void check_scope(const char *extensions, const char *filenames) {
+    if (expected_all) { assert(!extensions && !filenames); }
+    else { assert(extensions && filenames && !strcmp(extensions, expected_extensions) && !strcmp(filenames, expected_filenames)); }
 }
 void fixture_cancel_step(void) { cancel_step = 1; }
 void fixture_refuse_create(void) { refuse_create = 1; }
@@ -55,8 +71,17 @@ char *fcb_atlas_search_begin(uint64_t handle, uint64_t generation, const char *q
 char *fcb_atlas_search_begin_scoped(uint64_t handle, uint64_t generation, const char *query,
                                   const char *extensions, const char *filenames,
                                   uint64_t matches, uint64_t files, uint64_t file_bytes, uint64_t source_bytes) {
-    assert(extensions && filenames && !strcmp(extensions, expected_extensions) && !strcmp(filenames, expected_filenames));
+    check_scope(extensions, filenames);
     ++counts[9];
+    return fcb_atlas_search_begin(handle, generation, query, matches, files, file_bytes, source_bytes);
+}
+char *fcb_atlas_search_begin_path_scoped(uint64_t handle, uint64_t generation, const char *query,
+                                       const char *extensions, const char *filenames,
+                                       uint64_t path_kind, const char *path,
+                                       uint64_t matches, uint64_t files, uint64_t file_bytes, uint64_t source_bytes) {
+    check_scope(extensions, filenames);
+    assert(path_kind == expected_path_kind && path && !strcmp(path, expected_path));
+    ++counts[10];
     return fcb_atlas_search_begin(handle, generation, query, matches, files, file_bytes, source_bytes);
 }
 char *fcb_atlas_search_step_cancelable(uint64_t handle, uint64_t generation,

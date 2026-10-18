@@ -25,6 +25,11 @@ import Foundation
         check(try t.scopedQueryBegin!(h, 45, 1, "exact text", AtlasFileScope.rust.searchScope()) != nil)
         check(try t.scopedQueryBegin!(h, 46, 1, "exact text", AtlasSearchFileScope(extensions: [])) != nil)
         check(live() == 0 && calls() == 10)
+        check(try t.pathScopedQueryBegin!(h, 47, 1, "exact text", .all,
+            AtlasSearchPathScope(kind: .directory, path: "src")) != nil)
+        check(try t.pathScopedQueryBegin!(h, 48, 1, "exact text", AtlasSearchFileScope(extensions: ["rs"]),
+            AtlasSearchPathScope(kind: .file, path: "src/exact.rs")) != nil)
+        check(live() == 0 && calls() == 12)
         mode(1); check(try t.indexBegin(h, 1) == nil && live() == 0)
         for bad: Int32 in [2, 3] {
             mode(bad)

@@ -180,6 +180,60 @@ import Foundation
         let scopedReport = AtlasSearchReport(hits: [], complete: true, truncated: false,
             unavailableFiles: 0, unsupportedFiles: 0, matchesSeen: 0, fileScope: rustScope, excludedFiles: 4)
         check(scopedReport.summary.contains("selected file types") && scopedReport.summary.contains("4 catalogued files outside"), "Scoped no-match cannot claim a project-wide negative")
+        let folder = try AtlasSearchPathScope(kind: .directory, path: "src/core")
+        let exactFile = try AtlasSearchPathScope(kind: .file, path: "src/core/lib.rs")
+        check(folder.admitsRawPath(Array("src/core/lib.rs".utf8))
+            && folder.admitsRawPath(Array("src/core/nested/a.py".utf8)), "Directory scope admits descendants")
+        for path in ["src/core", "src/core.rs", "src/core2/lib.rs", "src/cores/lib.rs", "src/Core/lib.rs"] {
+            check(!folder.admitsRawPath(Array(path.utf8)), "Directory scope stops at a native path-component boundary")
+        }
+        check(exactFile.admitsRawPath(Array("src/core/lib.rs".utf8)), "Exact file scope admits its native path")
+        for path in ["src/core/lib.rs.bak", "src/core/lib.rs/child", "src/core/LIB.rs"] {
+            check(!exactFile.admitsRawPath(Array(path.utf8)), "File scope is exact and case-sensitive")
+        }
+        check(folder.admitsRawPath(Array("src/core/".utf8) + [255, 46, 114, 115]),
+            "A raw non-UTF8 child remains part of an explicitly named directory")
+        let composed = try AtlasSearchPathScope(kind: .directory, path: "src/café")
+        let decomposed = try AtlasSearchPathScope(kind: .directory, path: "src/cafe\u{301}")
+        check(composed != decomposed && composed.pathHex != decomposed.pathHex, "Canonical Unicode equivalents name different source scopes")
+        check(!composed.admitsRawPath(Array("src/cafe\u{301}/lib.rs".utf8)), "Path scope does not normalize native filenames")
+        folder.withCString { kind, path in
+            check(kind == 1 && String(cString: path!) == "src/core", "Directory kind and frozen path reach C intact")
+        }
+        exactFile.withCString { kind, path in
+            check(kind == 2 && String(cString: path!) == "src/core/lib.rs", "Exact file kind reaches C intact")
+        }
+        AtlasSearchPathScope.workspace.withCString { kind, path in
+            check(kind == 0 && path == nil, "Workspace keeps an explicit empty path")
+        }
+        for invalid in ["", "/src", "src/", "src//core", ".", "..", "src/./core", "src/../core", "src\0core", String(repeating: "a", count: 4097)] {
+            for kind in [AtlasSearchPathScope.Kind.directory, .file] {
+                do { _ = try AtlasSearchPathScope(kind: kind, path: invalid); preconditionFailure("Invalid relative scope admitted") }
+                catch AtlasSearchError.invalidPathScope { checks += 1 }
+            }
+        }
+        _ = try AtlasSearchPathScope(kind: .file, path: String(repeating: "a", count: 4096))
+        do { _ = try AtlasSearchPathScope(kind: .workspace, path: "src"); preconditionFailure("Workspace accepted a hidden path restriction") }
+        catch AtlasSearchError.invalidPathScope { checks += 1 }
+        try folder.validateEcho(kind: "directory", path: folder.path, hex: folder.pathHex)
+        try AtlasSearchPathScope.workspace.validateEcho(kind: nil, path: nil, hex: nil)
+        let wrongEchoes: [(String?, String?, String?)] = [(nil, nil, nil), ("directory", "src/core2", folder.pathHex),
+            ("file", folder.path, folder.pathHex), ("directory", folder.path, ""), ("directory", folder.path, nil)]
+        for (kind, path, hex) in wrongEchoes {
+            do { try folder.validateEcho(kind: kind, path: path, hex: hex); preconditionFailure("Wrong path-scope receipt accepted") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        do { try composed.validateEcho(kind: "directory", path: decomposed.path, hex: composed.pathHex)
+            preconditionFailure("Unicode-equivalent receipt changed the native scope")
+        } catch AtlasSearchError.invalidResponse { checks += 1 }
+        let pathInput = try AtlasSearchInput(root: "/project", query: "needle", pathScope: exactFile)
+        check(pathInput.pathScope == exactFile && !pathInput.isWorkspaceScope, "Location is frozen in the source query")
+        do { try pathInput.requireLegacyScope(); preconditionFailure("Legacy search silently widened a path scope") }
+        catch AtlasSearchError.invalidPathScope { checks += 1 }
+        let pathReport = AtlasSearchReport(hits: [], complete: true, truncated: false,
+            unavailableFiles: 0, unsupportedFiles: 0, matchesSeen: 0, pathScope: exactFile)
+        check(pathReport.summary.contains("selected file") && pathReport.summary.contains("src/core/lib.rs"),
+            "A file-scoped negative describes only that file")
         print("AtlasSearch: \(checks) coverage, path and offset checks passed")
     }
 }

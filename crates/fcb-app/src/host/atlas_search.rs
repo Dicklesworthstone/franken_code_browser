@@ -18,8 +18,8 @@ mod indexed;
 pub use indexed::{AtlasIndexOptions, AtlasIndexBuildProgress, MAX_ATLAS_INDEX_GRAMS};
 use indexed::{IndexQueryUsage, RetainedIndex, IndexBuildWork};
 mod scope;
-pub use scope::{AtlasSearchScope, MAX_SEARCH_SCOPE_TOKENS, MAX_SEARCH_SCOPE_TOKEN_BYTES,
-    MAX_SEARCH_SCOPE_LIST_BYTES};
+pub use scope::{AtlasSearchScope, AtlasSearchPathKind, MAX_SEARCH_SCOPE_TOKENS, MAX_SEARCH_SCOPE_TOKEN_BYTES,
+    MAX_SEARCH_SCOPE_LIST_BYTES, MAX_SEARCH_SCOPE_PATH_BYTES};
 
 use std::{mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, ByteRange, FileId, SourceRevision};

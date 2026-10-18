@@ -14,12 +14,13 @@ struct SearchHit: Identifiable, Hashable, Sendable {
 }
 
 enum AtlasSearchError: Error, Sendable {
-    case unavailable, invalidResponse, canceled, invalidRequest, invalidScope, identityExhausted
+    case unavailable, invalidResponse, canceled, invalidRequest, invalidScope, invalidPathScope, identityExhausted
     var message: String {
         switch self {
         case .canceled: return "Search canceled. In-flight reads may finish, but their results will not be shown."
         case .invalidRequest: return "Choose a project and enter 1–1024 UTF-8 bytes of search text without NUL characters."
         case .invalidScope: return "Choose up to 32 file extensions using letters, digits, +, - or _. Separate extensions with commas or spaces."
+        case .invalidPathScope: return "Enter a project-relative file or folder path of 1–4096 UTF-8 bytes. Do not use leading/trailing slashes, empty components, or '.'/'..' components."
         case .identityExhausted: return "This search session exhausted its request identities. Reopen the window before searching again."
         case .unavailable: return "Search unavailable. The project could not be read or the search exceeded its limits."
         case .invalidResponse: return "Search response could not be read. Results are unavailable, not an empty match set."
@@ -50,24 +51,27 @@ struct AtlasSearchReport: Sendable {
     var indexStatus: AtlasSearchIndexStatus? = nil
     var fileScope: AtlasSearchFileScope = .all
     var excludedFiles: Int = 0
+    var pathScope: AtlasSearchPathScope = .workspace
     var isInProgress: Bool { progress?.isRunning == true }
+    var isWorkspaceScope: Bool { fileScope.isAll && pathScope.isWorkspace }
 
     var summary: String {
         if indexStatus?.building == true, let progress {
             return "Preparing captured index: \(progress.examinedFiles) of \(progress.cataloguedFiles) catalogued files examined. Query results are not ready yet."
         }
         return resultSummary
-            + (fileScope.isAll ? "" : " \(excludedFiles) catalogued files outside this scope.")
+            + (isWorkspaceScope ? "" : " \(excludedFiles) catalogued files outside this scope.")
             + (indexStatus == nil ? "" : " Captured index; Refresh to include file edits.")
     }
     private var resultSummary: String {
         let count = hits.count
         if let progress, progress.isRunning {
-            let membership = fileScope.isAll ? "catalogued" : "eligible"
+            let membership = isWorkspaceScope ? "catalogued" : "eligible"
             return "Searching: \(count) exact matches found; \(progress.examinedFiles) of \(progress.cataloguedFiles) \(membership) files examined. Results are provisional."
         }
         if complete {
-            let scope = fileScope.isAll ? "captured project" : "selected file types"
+            let scope = pathScope.isWorkspace ? (fileScope.isAll ? "captured project" : "selected file types")
+                : "selected \(pathScope.kind == .file ? "file" : "folder") \(String(reflecting: pathScope.path))"
             return count == 0 ? "No exact matches in the \(scope)."
                 : "\(count) exact match\(count == 1 ? "" : "es") in the \(scope)."
         }
@@ -75,7 +79,7 @@ struct AtlasSearchReport: Sendable {
         if truncated { reasons.append("result limit reached") }
         if unavailableFiles > 0 { reasons.append("\(unavailableFiles) unavailable files") }
         if unsupportedFiles > 0 { reasons.append("\(unsupportedFiles) unsupported text files") }
-        if reasons.isEmpty { reasons.append(fileScope.isAll ? "project coverage incomplete" : "scope coverage incomplete") }
+        if reasons.isEmpty { reasons.append(isWorkspaceScope ? "project coverage incomplete" : "scope coverage incomplete") }
         return "Partial search: \(count) matches shown; \(reasons.joined(separator: ", ")). More matches may exist."
     }
 
@@ -162,8 +166,11 @@ struct AtlasSearchInput: Sendable {
     let root: String
     let query: String
     let fileScope: AtlasSearchFileScope
+    let pathScope: AtlasSearchPathScope
+    var isWorkspaceScope: Bool { fileScope.isAll && pathScope.isWorkspace }
 
-    init(root: String, query: String, fileScope: AtlasSearchFileScope = .all) throws {
+    init(root: String, query: String, fileScope: AtlasSearchFileScope = .all,
+         pathScope: AtlasSearchPathScope = .workspace) throws {
         guard !root.isEmpty, root.utf8.count <= 16_384, !root.utf8.contains(0),
               !query.isEmpty, query.utf8.count <= 1_024, !query.utf8.contains(0) else {
             throw AtlasSearchError.invalidRequest
@@ -171,6 +178,68 @@ struct AtlasSearchInput: Sendable {
         self.root = root
         self.query = query
         self.fileScope = fileScope
+        self.pathScope = pathScope
+    }
+    func requireLegacyScope() throws {
+        guard pathScope.isWorkspace else { throw AtlasSearchError.invalidPathScope }
+        guard fileScope.isAll else { throw AtlasSearchError.invalidScope }
+    }
+}
+
+/// Exact relative location within the frozen catalog. This narrows a query;
+/// it never confers a new root grant, follows a live selection or normalizes a
+/// native pathname. Directory prefixes end at a slash, not an arbitrary byte.
+struct AtlasSearchPathScope: Equatable, Sendable {
+    enum Kind: String, CaseIterable, Identifiable, Sendable {
+        case workspace, directory, file
+        var id: String { rawValue }
+        var label: String { switch self { case .workspace: return "Workspace"; case .directory: return "Folder"; case .file: return "File" } }
+        var code: UInt64 { switch self { case .workspace: return 0; case .directory: return 1; case .file: return 2 } }
+    }
+    let kind: Kind
+    let path: String
+    let pathHex: String
+    static let workspace = Self()
+    var isWorkspace: Bool { kind == .workspace }
+
+    private init() { kind = .workspace; path = ""; pathHex = "" }
+    init(kind: Kind, path: String) throws {
+        guard path.utf8.count <= 4096,
+              (kind == .workspace ? path.isEmpty : !path.isEmpty) else {
+            throw AtlasSearchError.invalidPathScope
+        }
+        let raw = Array(path.utf8)
+        if kind != .workspace {
+            guard !raw.contains(0),
+                  !raw.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
+                      $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46])
+                  }) else { throw AtlasSearchError.invalidPathScope }
+        }
+        self.kind = kind
+        self.path = path
+        let digits = Array("0123456789abcdef".utf8)
+        pathHex = String(decoding: raw.flatMap { [digits[Int($0 >> 4)], digits[Int($0 & 15)]] }, as: UTF8.self)
+    }
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.kind == rhs.kind && lhs.path.utf8.elementsEqual(rhs.path.utf8)
+    }
+    func withCString<Result>(_ body: (UInt64, UnsafePointer<CChar>?) throws -> Result) rethrows -> Result {
+        if isWorkspace { return try body(0, nil) }
+        return try path.withCString { try body(kind.code, $0) }
+    }
+    func admitsRawPath(_ raw: [UInt8]) -> Bool {
+        if isWorkspace { return true }
+        let prefix = Array(path.utf8)
+        if kind == .file { return raw == prefix }
+        return raw.count > prefix.count && raw.starts(with: prefix) && raw[prefix.count] == 47
+    }
+    func validateEcho(kind: String?, path: String?, hex: String?) throws {
+        if kind == nil && path == nil && hex == nil {
+            guard isWorkspace else { throw AtlasSearchError.invalidResponse }
+            return
+        }
+        guard kind == self.kind.rawValue, let path, path.utf8.elementsEqual(self.path.utf8),
+              hex == pathHex else { throw AtlasSearchError.invalidResponse }
     }
 }
 
@@ -236,16 +305,17 @@ struct AtlasSearchFileScope: Equatable, Sendable {
     /// Legacy all-files envelopes may omit this additive scope metadata. A
     /// scoped request requires the exact echoed predicate on every page.
     func eligibleFiles(kind: String?, extensions: String?, filenames: String?,
-                       eligible: String?, excluded: String?, catalogued: Int) throws -> Int {
+                       eligible: String?, excluded: String?, catalogued: Int,
+                       pathScoped: Bool = false) throws -> Int {
         if kind == nil && extensions == nil && filenames == nil && eligible == nil && excluded == nil {
-            guard isAll else { throw AtlasSearchError.invalidResponse }
+            guard isAll && !pathScoped else { throw AtlasSearchError.invalidResponse }
             return catalogued
         }
         guard kind == wireKind, extensions == (self.extensions ?? ""), filenames == (self.filenames ?? ""),
               let eligible, let included = UInt64(eligible), String(included) == eligible,
               let excluded, let omitted = UInt64(excluded), String(omitted) == excluded,
               included <= UInt64(catalogued), omitted == UInt64(catalogued) - included,
-              !isAll || omitted == 0 else { throw AtlasSearchError.invalidResponse }
+              !isAll || pathScoped || omitted == 0 else { throw AtlasSearchError.invalidResponse }
         return Int(included)
     }
 }
@@ -260,6 +330,8 @@ struct AtlasSearchContext: Sendable {
     let atlasRevision: UUID
     let scope: String
     let customExtensions: String
+    var pathKind: String = "workspace"
+    var path: String = ""
 
     func matches(_ other: Self) -> Bool {
         loadGeneration == other.loadGeneration && atlasRevision == other.atlasRevision
@@ -267,6 +339,8 @@ struct AtlasSearchContext: Sendable {
             && query.utf8.elementsEqual(other.query.utf8)
             && scope.utf8.elementsEqual(other.scope.utf8)
             && customExtensions.utf8.elementsEqual(other.customExtensions.utf8)
+            && pathKind.utf8.elementsEqual(other.pathKind.utf8)
+            && path.utf8.elementsEqual(other.path.utf8)
     }
 }
 

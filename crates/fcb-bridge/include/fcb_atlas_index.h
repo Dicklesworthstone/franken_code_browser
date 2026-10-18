@@ -104,6 +104,22 @@ char *fcb_atlas_search_indexed_begin_scoped(uint64_t handle, uint64_t generation
     uint64_t index_generation, const char *needle, const char *extensions,
     const char *filenames, uint64_t max_matches, uint64_t max_scan_bytes);
 
+/* Same path-kind/input/echo contract as fcb_atlas_search_path_scoped. Intersect
+ * the selected directory/exact file with types BEFORE gram candidates, captured
+ * verification bytes and hit quotas. The index and original capture identities
+ * remain unchanged. A selected catalog member omitted by index build limits is
+ * pending, not an empty successful result. Excluded omissions do not prevent a
+ * complete query. No live recapture or index rebuild occurs when scope changes.
+ */
+char *fcb_atlas_search_indexed_path_scoped(uint64_t handle, uint64_t generation,
+    uint64_t index_generation, const char *needle, const char *extensions,
+    const char *filenames, uint64_t path_kind, const char *path,
+    uint64_t max_matches, uint64_t max_scan_bytes);
+char *fcb_atlas_search_indexed_begin_path_scoped(uint64_t handle, uint64_t generation,
+    uint64_t index_generation, const char *needle, const char *extensions,
+    const char *filenames, uint64_t path_kind, const char *path,
+    uint64_t max_matches, uint64_t max_scan_bytes);
+
 /* Clear index and builder, not completed result captures or opened readers.
  * Result-clear leaves index/build state intact. Atlas cancellation invalidates
  * provisional query AND build state; accepted state is not rolled back. A late

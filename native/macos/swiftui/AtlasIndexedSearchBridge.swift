@@ -15,6 +15,9 @@ private typealias IndexPoll = @convention(c) (UnsafeMutableRawPointer?) -> Int32
     _ hits: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_search_step_cancelable") private func indexedQueryStep(_ h: UInt64, _ g: UInt64,
     _ poll: IndexPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_search_indexed_begin_path_scoped") private func indexedPathScopedQueryBegin(_ h: UInt64, _ g: UInt64, _ index: UInt64,
+    _ text: UnsafePointer<CChar>?, _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
+    _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ hits: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_search_page") private func indexedPage(_ h: UInt64, _ g: UInt64,
     _ start: UInt64, _ count: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_index_open_reader") private func indexedReader(_ h: UInt64, _ reader: UInt64,
@@ -36,6 +39,15 @@ extension AtlasIndexedSearchTransport {
         try query.withCString { text in
             try scope.withCStrings { extensions, filenames in
                 try take(indexedScopedQueryBegin(h, g, index, text, extensions, filenames, 1000, 32 * 1024 * 1024))
+            }
+        }
+    }, pathScopedQueryBegin: { h, g, index, query, scope, pathScope in
+        try query.withCString { text in
+            try scope.withCStrings { extensions, filenames in
+                try pathScope.withCString { kind, path in
+                    try take(indexedPathScopedQueryBegin(h, g, index, text, extensions, filenames,
+                        kind, path, 1000, 32 * 1024 * 1024))
+                }
             }
         }
     })

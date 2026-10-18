@@ -14,8 +14,9 @@ import Dispatch
         try worker.run(root: root, query: query, cancellation: flag, access: AtlasSearchAccessLease(access), progress: reports.offer)
     }
     @MainActor private static func scoped(_ worker: AtlasIndexedSearch, scope: AtlasSearchFileScope,
+                                         pathScope: AtlasSearchPathScope = .workspace,
                                          flag: AtlasSearchCancellation = AtlasSearchCancellation()) throws -> AtlasSearchReport {
-        try worker.runScoped(input: AtlasSearchInput(root: "/repo", query: "x", fileScope: scope),
+        try worker.runScoped(input: AtlasSearchInput(root: "/repo", query: "x", fileScope: scope, pathScope: pathScope),
             cancellation: flag, access: AtlasSearchAccessLease(nil), progress: { _ in })
     }
     @MainActor private static func wait(_ condition: () -> Bool) {
@@ -293,6 +294,127 @@ import Dispatch
             do { _ = try scoped(w, scope: rustScope, flag: flag); preconditionFailure("Canceled scope admitted") }
             catch AtlasSearchError.canceled { checks += 1 }
             check(f.count("create:") == 0, "Scoped pre-cancellation performs no capture")
+        }
+        let directory = try AtlasSearchPathScope(kind: .directory, path: "src")
+        let file = try AtlasSearchPathScope(kind: .file, path: "src/a.rs")
+        do {
+            let f = IndexedFixture()
+            f.configure { c in c.pathHex = "7372632f612e7273"; c.scopedEligible = 1; c.scopedCaptured = 1; c.scopedUnavailable = 0 }
+            let w = AtlasIndexedSearch(transport: f.transport)
+            let folder = try scoped(w, scope: .all, pathScope: directory)
+            check(folder.complete && folder.pathScope == directory && folder.hits.count == 2
+                && folder.progress?.cataloguedFiles == 1 && folder.excludedFiles == 1,
+                "Path-only index query verifies its selected capture population")
+            let selected = folder.capture!.target(folder.hits[0])!
+            let exact = try scoped(w, scope: rustScope, pathScope: file)
+            check(exact.complete && exact.pathScope == file && exact.fileScope == rustScope
+                && exact.streamID != folder.streamID && exact.indexStatus?.reused == true,
+                "Location changes freeze a fresh query while reusing the accepted index")
+            let broad = try run(w)
+            check(broad.pathScope.isWorkspace && broad.progress?.cataloguedFiles == 2 && broad.indexStatus?.reused == true,
+                "Returning to workspace widens candidates without rebuilding captures")
+            check(f.count("create:") == 1 && f.count("open:") == 1 && f.count("build-step:") == 2,
+                "Folder/file/extension query changes do not reread the repository")
+            check(f.trace.contains("query-path:directory:737263") && f.trace.contains("query-path:file:7372632f612e7273"),
+                "The transport receives exact frozen location bytes")
+            _ = try selected.openReader(100)
+            check(f.count("source:") == 1, "A selected old hit keeps its capture after path-scope replacement")
+            let flag = AtlasSearchCancellation()
+            f.block { phase in if phase == "query-step" { flag.cancel() } }
+            do { _ = try scoped(w, scope: .all, pathScope: file, flag: flag); preconditionFailure("Path-scoped query cancellation ignored") }
+            catch AtlasSearchError.canceled { checks += 1 }
+            f.block(nil)
+            let retried = try scoped(w, scope: .all, pathScope: directory)
+            check(retried.indexStatus?.reused == true && f.count("create:") == 1,
+                "Canceling a file query preserves captured sources for the next folder query")
+        }
+        for mode in 0..<3 {
+            let f = IndexedFixture()
+            f.configure { c in
+                c.pathHex = "7372632f612e7273"; c.files = 3; c.scopedCaptured = 1
+                if mode == 0 { c.unavailable = 1; c.scopedEligible = 1; c.scopedUnavailable = 0 }
+                if mode == 1 { c.unavailable = 1; c.scopedEligible = 2; c.scopedUnavailable = 1 }
+                if mode == 2 { c.pending = 1; c.scopedEligible = 2; c.scopedUnavailable = 0 }
+            }
+            let w = AtlasIndexedSearch(transport: f.transport), result = try scoped(w, scope: .all, pathScope: directory)
+            check(result.pathScope == directory && result.complete == (mode == 0),
+                "Only excluded failures leave selected-directory coverage complete")
+            check(result.progress?.cataloguedFiles == (mode == 0 ? 1 : 2),
+                "Selected missing/unreadable files remain in the path-scope denominator")
+        }
+        do {
+            let f = IndexedFixture()
+            f.configure { c in c.scopedEligible = 0; c.scopedCaptured = 0; c.scopedUnavailable = 0; c.scopedHitCount = 0 }
+            let w = AtlasIndexedSearch(transport: f.transport)
+            let empty = try scoped(w, scope: .all, pathScope: file)
+            check(empty.complete && empty.hits.isEmpty && empty.progress?.cataloguedFiles == 0
+                && empty.excludedFiles == 2 && empty.indexStatus?.verificationBytes == 0,
+                "An exact path absent from the index remains a complete empty selection")
+        }
+        do {
+            let f = IndexedFixture()
+            f.configure { $0.pathHex = "7372632fff2e7273" }
+            let w = AtlasIndexedSearch(transport: f.transport)
+            let raw = try scoped(w, scope: .all, pathScope: directory)
+            check(raw.hits.count == 2 && raw.hits[0].sourcePath == nil && raw.capture?.target(raw.hits[0]) == nil,
+                "A non-UTF8 directory descendant retains searchable bytes without a fabricated opener")
+        }
+        do {
+            let f = IndexedFixture()
+            var transport = f.transport; transport.pathScopedQueryBegin = nil
+            let w = AtlasIndexedSearch(transport: transport)
+            do { _ = try scoped(w, scope: .all, pathScope: directory); preconditionFailure("Legacy index widened path scope") }
+            catch AtlasSearchError.invalidPathScope { checks += 1 }
+            check(f.count("create:") == 0, "Unsupported location rejects before source capture")
+            let permitted = try run(w)
+            check(permitted.complete, "Legacy workspace query remains usable")
+        }
+        for phase in ["query-begin", "query-step", "page"] {
+            let defects = ["missing", "kind", "path", "hex"] + (phase == "query-begin" ? [] : ["sibling-prefix"])
+            for defect in defects {
+                let f = IndexedFixture()
+                f.configure { c in c.pathHex = "7372632f612e7273"; c.hitCount = 70; c.scopedEligible = 1; c.scopedCaptured = 1; c.scopedUnavailable = 0 }
+                f.patch { received, object in
+                    var value = object
+                    if received == phase {
+                        if defect == "missing" {
+                            for key in ["scope_path_kind", "scope_path", "scope_path_hex"] { value.removeValue(forKey: key) }
+                        } else if defect == "kind" { value["scope_path_kind"] = "file" }
+                        else if defect == "path" { value["scope_path"] = "src2" }
+                        else if defect == "hex" { value["scope_path_hex"] = "00" }
+                        else {
+                            var rows = value["hits"] as! [[String: Any]]
+                            rows[0]["path"] = ["encoding": "unix-bytes", "hex": "737263322f612e7273", "display": "src/a.rs"]
+                            value["hits"] = rows
+                        }
+                    }
+                    return value
+                }
+                let w = AtlasIndexedSearch(transport: f.transport)
+                do { _ = try scoped(w, scope: .all, pathScope: directory); preconditionFailure("Corrupt path \(phase)/\(defect) admitted") }
+                catch AtlasSearchError.invalidResponse { checks += 1 }
+            }
+        }
+        let composed = try AtlasSearchPathScope(kind: .directory, path: "café")
+        let decomposed = try AtlasSearchPathScope(kind: .directory, path: "cafe\u{301}")
+        for defect in ["echo", "row"] {
+            let f = IndexedFixture()
+            f.configure { $0.pathHex = composed.pathHex + "2f612e7273" }
+            f.patch { phase, object in
+                var value = object
+                if phase == "query-step" {
+                    if defect == "echo" { value["scope_path"] = decomposed.path }
+                    else {
+                        var rows = value["hits"] as! [[String: Any]]
+                        rows[0]["path"] = ["encoding": "unix-bytes", "hex": decomposed.pathHex + "2f612e7273", "display": "café/a.rs"]
+                        value["hits"] = rows
+                    }
+                }
+                return value
+            }
+            let w = AtlasIndexedSearch(transport: f.transport)
+            do { _ = try scoped(w, scope: .all, pathScope: composed); preconditionFailure("Normalized index path accepted") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
         }
         print("AtlasIndexedSearchTests: \(checks) checks passed")
     }

@@ -82,5 +82,7 @@ extension AtlasSearchContext {
             && query.utf8.elementsEqual(other.query.utf8)
             && scope.utf8.elementsEqual(other.scope.utf8)
             && customExtensions.utf8.elementsEqual(other.customExtensions.utf8)
+            && pathKind.utf8.elementsEqual(other.pathKind.utf8)
+            && path.utf8.elementsEqual(other.path.utf8)
     }
 }
