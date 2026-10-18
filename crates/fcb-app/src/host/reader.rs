@@ -8,6 +8,8 @@
 
 mod outline;
 pub(crate) mod document;
+#[cfg(test)]
+mod shared_tests;
 pub use outline::{ReaderOutlineOptions, MAX_READER_SYMBOL_PAGE, MAX_READER_SYMBOL_QUERY_BYTES};
 pub use document::{DocumentCopyMode, ReaderDocumentOptions, MAX_READER_DOCUMENT_PAGE};
 use outline::{AcceptedOutline, SelectionIdentity};
@@ -97,7 +99,10 @@ pub struct ReaderSession {
     last_document_attempt: u64,
     next_allocation: u64,
     budget: ResourceBudget,
+    // Forks retain the SAME source reservation, even after its originating
+    // budget handle/session closes. Private reader state is charged separately.
     _source_lease: ResourceLease,
+    _state_lease: ResourceLease,
 }
 impl ReaderSession {
     /// Admit a complete regular-file observation, including arbitrary bytes.
@@ -122,30 +127,56 @@ impl ReaderSession {
         if bytes.len() > MAX_HOST_TEXT_BYTES || path.as_os_str().is_empty()
             || path.as_os_str().len() > 16_384 { return Err(ReaderSessionError::InvalidLimits); }
         let budget = ResourceBudget::new(owner, ByteLength::new(MANAGED_BYTES)).map_err(|_| AppError::Admission)?;
-        let charge = bytes.len().checked_mul(2).and_then(|n| n.checked_add(256 * 1024 + size_of::<Self>()))
+        // Preserve the conservative copy/overlap envelope once per supplied
+        // source, not once per pin. Every reader separately admits private state
+        // and path/checkpoint capacity before either allocation is constructed.
+        let charge = bytes.len().checked_mul(2).and_then(|n| n.checked_add(64))
             .ok_or(AppError::Admission)?;
-        let lease = budget.try_reserve_managed(owner, ResourceAllocationId::new(1).map_err(|_| AppError::Admission)?,
+        let source_lease = budget.try_reserve_managed(owner, ResourceAllocationId::new(1).map_err(|_| AppError::Admission)?,
             ByteLength::new(charge as u64)).map_err(|_| AppError::Admission)?;
+        let state_lease = Self::reserve_state(owner, &budget)?;
         let request = CaptureRequest::new(FileId::new(owner, 1).map_err(|_| ReaderSessionError::IdentityExhausted)?,
             SourceRevision::new(owner, 1).map_err(|_| ReaderSessionError::IdentityExhausted)?)?;
         let capture = CompleteCapture::new(request, ByteLength::new(bytes.len() as u64), Arc::from(bytes))?;
         let encoding = detect_encoding(&bytes[..bytes.len().min(3)]);
+        let session = Self::retained(capture, path, encoding, budget, source_lease, state_lease);
         check(&mut canceled)?;
-        Ok(Self { capture, path: path.to_path_buf(), encoding,
+        Ok(session)
+    }
+    fn reserve_state(owner: ArenaOwnerId, budget: &ResourceBudget) -> Result<ResourceLease, ReaderSessionError> {
+        let charge = (256 * 1024_usize).checked_add(size_of::<Self>()).ok_or(AppError::Admission)?;
+        budget.try_reserve_managed(owner, ResourceAllocationId::new(2).map_err(|_| AppError::Admission)?,
+            ByteLength::new(charge as u64)).map_err(|_| AppError::Admission.into())
+    }
+    fn retained(capture: CompleteCapture, path: &Path, encoding: DetectedEncoding,
+        budget: ResourceBudget, source_lease: ResourceLease, state_lease: ResourceLease) -> Self {
+        Self { capture, path: path.to_path_buf(), encoding,
             line_checkpoints: std::array::from_fn(|_| None), source_bytes_read: 0, read_calls: 0,
             file_observation: false, query: None, last_query_attempt: 0,
-            outline: None, last_outline_attempt: 0, document: None, last_document_attempt: 0, next_allocation: 2,
-            budget, _source_lease: lease })
+            outline: None, last_outline_attempt: 0, document: None, last_document_attempt: 0, next_allocation: 3,
+            budget, _source_lease: source_lease, _state_lease: state_lease }
     }
     /// Fork the exact retained bytes and native path into a fresh owner. This
-    /// is a bounded, independently charged copy, NOT another file observation.
+    /// explicitly shares immutable backing and its accounting lease without
+    /// copying or rehashing source bytes. It is not another file observation.
+    /// The new owner admits only its own state and subsequent work allocations.
     /// Query hits, outlines, document selections and line checkpoints are not
     /// transferred; the destination earns its own authority through normal calls.
-    /// Dropping either session cannot release the other's capture or budget.
-    pub fn fork(&self, owner: ArenaOwnerId, canceled: impl FnMut() -> bool)
+    /// The source reservation remains charged until the last retaining reader closes;
+    /// dropping either session releases only its own private state and work.
+    pub fn fork(&self, owner: ArenaOwnerId, mut canceled: impl FnMut() -> bool)
         -> Result<Self, ReaderSessionError> {
         if owner == self.owner() { return Err(ReaderSessionError::InvalidLimits); }
-        Self::from_bytes(owner, &self.path, self.capture.bytes(), canceled)
+        check(&mut canceled)?;
+        let budget = ResourceBudget::new(owner, ByteLength::new(MANAGED_BYTES)).map_err(|_| AppError::Admission)?;
+        let state_lease = Self::reserve_state(owner, &budget)?;
+        let request = CaptureRequest::new(FileId::new(owner, 1).map_err(|_| ReaderSessionError::IdentityExhausted)?,
+            SourceRevision::new(owner, 1).map_err(|_| ReaderSessionError::IdentityExhausted)?)?;
+        let capture = self.capture.share_with_request(request)?;
+        let session = Self::retained(capture, &self.path, self.encoding, budget,
+            self._source_lease.clone(), state_lease);
+        check(&mut canceled)?;
+        Ok(session)
     }
     pub fn capture(&self) -> &CompleteCapture { &self.capture }
     pub fn accepted_generation(&self) -> Option<u64> { self.query.as_ref().map(|q| q.generation) }

@@ -28,9 +28,11 @@ char *fcb_reader_open_bytes(uint64_t handle, const char *label,
     const uint8_t *bytes, uint64_t length);
 
 /* HOST-WORKER: fork an open source into a distinct empty destination returned
- * by fcb_reader_create. Copies the retained bytes and exact native path through
- * ordinary bounded source admission; never reads a live file. Both handles
- * count against FCB_READER_MAX_SESSIONS, including in-flight retirement.
+ * by fcb_reader_create. Shares the immutable source backing and its reservation;
+ * copies only the bounded native path and admits private reader state. It never
+ * reads a live file, copies the source buffer, or recomputes its digest. The
+ * source reservation survives until the last retaining reader closes. Both count
+ * against FCB_READER_MAX_SESSIONS, including in-flight retirement.
  * Success returns destination's info envelope with host-supplied origin, zero
  * source reads, and no inherited query/outline/document selection authority.
  * Closing, canceling, navigating or querying one successful fork does not alter

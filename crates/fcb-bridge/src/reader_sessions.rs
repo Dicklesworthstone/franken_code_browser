@@ -186,7 +186,8 @@ impl ReaderSessions {
     /// Fork immutable source into an already admitted empty destination. Both
     /// handles use the existing eight-slot bound, including retiring cells.
     /// Source and destination locks use try_lock; reciprocal calls cannot wait
-    /// on each other. The registry lock is never held during the bounded copy.
+    /// on each other. The registry lock is never held during source sharing or
+    /// private reader-state admission. Forks neither copy nor rehash source bytes.
     /// No query authority, native path argument, or filesystem read is involved.
     pub(super) fn fork(&self, source: u64, destination: u64, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AccessError> {

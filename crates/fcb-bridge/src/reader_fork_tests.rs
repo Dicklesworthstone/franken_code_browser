@@ -17,6 +17,15 @@ fn fork_owns_exact_bytes_after_source_close_and_has_independent_query_authority(
     sessions.supply(source, b"alpha beta alpha").unwrap();
     find(&sessions, source, 9, "alpha");
     let info = sessions.fork(source, child, || false).unwrap();
+    {
+        let source_cell = sessions.get(source).unwrap();
+        let child_cell = sessions.get(child).unwrap();
+        let source_state = source_cell.state.lock().unwrap();
+        let child_state = child_cell.state.lock().unwrap();
+        assert!(std::ptr::eq(source_state.as_ref().unwrap().capture().bytes().as_ptr(),
+            child_state.as_ref().unwrap().capture().bytes().as_ptr()),
+            "the production registry must share source storage across reader handles");
+    }
     assert!(info.as_str().contains(&format!("\"owner\":\"{child}\"")));
     for field in ["accepted_query_generation", "accepted_outline_generation", "accepted_document_generation"] {
         assert!(info.as_str().contains(&format!("\"{field}\":null")));
@@ -102,7 +111,7 @@ fn canceled_fork_is_retryable_and_never_revokes_parent_hits() {
     let sessions = ReaderSessions::new();
     let source = sessions.create().unwrap(); let child = sessions.create().unwrap();
     sessions.supply(source, b"needle").unwrap(); find(&sessions, source, 1, "needle");
-    // Refuse before copying, after copying, and during info marshaling.
+    // Refuse before sharing, after private-state admission, and during info marshaling.
     for cancel_at in 1..=3 {
         let mut polls = 0;
         assert!(sessions.fork(source, child, || { polls += 1; polls == cancel_at })

@@ -292,6 +292,26 @@ impl CompleteCapture {
         &self.bytes
     }
 
+    /// Explicitly share this immutable observation under another validated
+    /// source identity. The backing and its already computed digest are shared
+    /// without copying or scanning source bytes. The observed range must stay
+    /// identical: rebinding cannot turn a captured subset into a whole file.
+    ///
+    /// The host supplies the new identity and retains any accounting capability
+    /// for as long as the shared backing is live. This does not establish a new
+    /// file observation, root grant, or implicit cache domain between hosts.
+    pub fn share_with_request(&self, request: CaptureRequest) -> Result<Self, SourceError> {
+        if request.range() != self.request.range() {
+            return Err(SourceError::InvalidRange);
+        }
+        Ok(Self {
+            request,
+            bytes: Arc::clone(&self.bytes),
+            declared_length: self.declared_length,
+            digest: self.digest,
+        })
+    }
+
     /// Checked range read. Availability still depends on the provider's
     /// declared [`RangeReadSupport`]; this method never manufactures data
     /// outside the observed sequence.

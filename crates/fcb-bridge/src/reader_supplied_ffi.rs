@@ -27,7 +27,8 @@ pub unsafe extern "C" fn fcb_reader_open_bytes(handle: u64, label: *const c_char
 }
 
 /// Populate an empty destination from the exact retained source reader. The
-/// destination has its own owner, query state and charged bounded byte copy;
+/// destination has its own owner, query state and state reservation while the
+/// immutable source backing and its reservation are explicitly shared;
 /// no pointers, path arguments, disk reads or parent query IDs cross this ABI.
 /// Errors are addressed to destination, like every reader initialization reply.
 /// Release the returned non-null string once with fcb_free_string.
