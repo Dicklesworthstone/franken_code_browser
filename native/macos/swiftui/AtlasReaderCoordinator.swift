@@ -5,6 +5,13 @@ import Dispatch
 /// invokes the retained Rust reader; tests exercise this coordinator and the
 /// production bounded I/O queue without linking Apple frameworks or Rust.
 struct AtlasReaderTransport: Sendable {
+    /// The native boundary hashes the same immutable buffer it submits to Rust.
+    /// The response's independently computed capture digest must match before
+    /// the supplied reader may publish a page. No live-file fallback exists.
+    struct SuppliedResponse: Sendable {
+        let json: String?
+        let sha256: String
+    }
     let create: @Sendable () -> UInt64
     let open: @Sendable (UInt64, String, UInt64) -> String?
     let window: @Sendable (UInt64, UInt64, UInt64) -> String?
@@ -15,6 +22,7 @@ struct AtlasReaderTransport: Sendable {
     /// Optional retained-byte transfer. It initializes an empty destination;
     /// it never opens a pathname or grants source/query authority by itself.
     let fork: (@Sendable (UInt64, UInt64) -> String?)?
+    let openBytes: (@Sendable (UInt64, String, Data) -> SuppliedResponse?)?
 
     init(create: @escaping @Sendable () -> UInt64,
          open: @escaping @Sendable (UInt64, String, UInt64) -> String?,
@@ -23,10 +31,12 @@ struct AtlasReaderTransport: Sendable {
          cancel: @escaping @Sendable (UInt64) -> Bool,
          close: @escaping @Sendable (UInt64) -> Bool,
          retirementFailed: @escaping @Sendable () -> Void,
-         fork: (@Sendable (UInt64, UInt64) -> String?)? = nil) {
+         fork: (@Sendable (UInt64, UInt64) -> String?)? = nil,
+         openBytes: (@Sendable (UInt64, String, Data) -> SuppliedResponse?)? = nil) {
         self.create = create; self.open = open; self.window = window; self.lines = lines
         self.cancel = cancel; self.close = close; self.retirementFailed = retirementFailed
         self.fork = fork
+        self.openBytes = openBytes
     }
 }
 
@@ -62,7 +72,8 @@ private final class AtlasReaderSession: @unchecked Sendable {
     }
 
     /// Share the native grant lifetime, not the source reader or mutable state.
-    /// The forked Rust capture has its own bounded allocation and retirement.
+    /// Rust shares immutable source backing and its reservation; each fork
+    /// admits and retires its private reader state independently.
     init(transport: AtlasReaderTransport, sharingAccessFrom source: AtlasReaderSession) throws {
         let handle = transport.create()
         guard handle != 0 else { throw AtlasReaderError.unavailable }
@@ -130,7 +141,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
     /// Initialize this empty coordinator from another reader's exact capture.
     /// Only the new reader's queue and cancellation state are touched. Foreign
     /// work retains both sessions and their native access lease through drain.
-    /// Source replacement/close during the copy revokes delivery, even when a
+    /// Source replacement/close during the fork revokes delivery, even when a
     /// canceled foreign operation managed to initialize its destination.
     func fork(from parent: AtlasReaderCoordinator, page original: AtlasReaderPage) async throws -> AtlasReaderPage {
         try Task.checkCancellation()

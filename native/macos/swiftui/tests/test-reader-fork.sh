@@ -13,7 +13,7 @@ swiftc "$@" -swift-version 6 -warnings-as-errors \
     "$src/AtlasSearchCoordinator.swift" "$src/AtlasProjectIO.swift" \
     "$src/AtlasReader.swift" "$src/AtlasReaderSearch.swift" \
     "$src/AtlasReaderOutline.swift" "$src/AtlasReaderDocument.swift" \
-    "$src/AtlasReaderCoordinator.swift" "$src/AtlasCapturedReader.swift" \
+    "$src/AtlasReaderCoordinator.swift" "$src/AtlasCapturedReader.swift" "$src/AtlasSuppliedReader.swift" \
     "$src/AtlasNavigationHistory.swift" "$src/AtlasSource.swift" \
     "$src/AtlasDocumentPreviewModel.swift" "$src/AtlasPagedReaderModel.swift" \
     "$src/tests/AtlasReaderForkTests.swift" -o "$out/reader-fork-tests"

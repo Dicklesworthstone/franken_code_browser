@@ -15,6 +15,7 @@ fn supplied_capture_is_owned_and_its_nonexistent_label_never_opens_a_file() {
     assert!(info.as_str().contains("\"capture_origin\":\"host-supplied\""));
     assert!(info.as_str().contains("\"initial_source_bytes_read\":\"0\""));
     assert!(info.as_str().contains("\"initial_read_calls\":\"0\""));
+    assert!(info.as_str().contains("\"capture_sha256\":\"2677448b6884843c39eb5759e7bdaebad02d7c6d63a7e41965ee1c05d64688c1\""));
     bytes.fill(b'x');
     let copied = readers.execute(handle, Command::CopyRange { start: 0, end: original.len() as u64 }, || false).unwrap();
     let expected: String = original.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -38,7 +39,8 @@ fn raw_supplied_bytes_preserve_bom_nul_and_malformed_sequences() {
     let handle = readers.create().unwrap();
     let label = CString::new("raw-source").unwrap();
     let bytes = [0xef, 0xbb, 0xbf, 0, 0xff, b'\n'];
-    unsafe { open_in(&readers, handle, label.as_ptr(), bytes.as_ptr(), bytes.len() as u64, || false) }.unwrap();
+    let info = unsafe { open_in(&readers, handle, label.as_ptr(), bytes.as_ptr(), bytes.len() as u64, || false) }.unwrap();
+    assert!(info.as_str().contains("\"capture_sha256\":\"78bbeacf18d1adf759d4127d349b347f3733513ead85ddfab928a903ffbd323c\""));
     let copied = readers.execute(handle, Command::CopyRange { start: 0, end: 6 }, || false).unwrap();
     assert!(copied.as_str().contains("\"original_hex\":\"efbbbf00ff0a\""));
     readers.close(handle).unwrap();
@@ -53,6 +55,7 @@ fn empty_null_buffer_is_a_real_capture_but_nonempty_null_is_refused() {
         1, || false) }, Err(AccessError::InvalidArgument)));
     let info = unsafe { open_in(&readers, handle, label.as_ptr(), std::ptr::null(), 0, || false) }.unwrap();
     assert!(info.as_str().contains("\"captured_bytes\":\"0\""));
+    assert!(info.as_str().contains("\"capture_sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\""));
     let copied = readers.execute(handle, Command::CopyRange { start: 0, end: 0 }, || false).unwrap();
     assert!(copied.as_str().contains("\"original_hex\":\"\""));
     readers.close(handle).unwrap();

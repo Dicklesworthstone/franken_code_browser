@@ -22,7 +22,9 @@ extern "C" {
  * open handle cannot replace its source. Close/cancel rules and fcb_free_string
  * ownership are exactly those in fcb_reader_sessions.h. Inspect non-null JSON:
  * status=error is not success. Successful info reports host-supplied origin and
- * zero initial source reads; integers use canonical decimal strings.
+ * zero initial source reads; integers use canonical decimal strings. Before
+ * native activation, compare its captured_bytes, raw label and capture_sha256
+ * to the exact supplied buffer, plus empty query/outline/document generations.
  */
 char *fcb_reader_open_bytes(uint64_t handle, const char *label,
     const uint8_t *bytes, uint64_t length);

@@ -19,7 +19,7 @@ extension AtlasReaderTransport {
             guard path.utf8.elementsEqual(target.path.utf8) else { return nil }
             return try? target.openReader(handle)
         }, window: window, lines: lines, cancel: cancel, close: close,
-        retirementFailed: retirementFailed, fork: fork)
+        retirementFailed: retirementFailed, fork: fork, openBytes: openBytes)
     }
 }
 

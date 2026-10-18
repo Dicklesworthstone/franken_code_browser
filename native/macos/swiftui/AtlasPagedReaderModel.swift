@@ -46,6 +46,7 @@ import Observation
     private typealias SourceHistory = AtlasNavigationHistory<AtlasReaderRequest>
     private var history = SourceHistory()
     @ObservationIgnored private let capturedTarget: AtlasSearchCapturedHit?
+    @ObservationIgnored private let suppliedSource: AtlasSuppliedReaderSource?
     @ObservationIgnored private let liveTransport: AtlasReaderTransport
     @ObservationIgnored private let searchTransport: AtlasReaderSearchTransport?
     @ObservationIgnored private let outlineTransport: AtlasReaderOutlineTransport?
@@ -62,13 +63,17 @@ import Observation
     init(transport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
          outline: AtlasReaderOutlineTransport? = nil,
          document: AtlasReaderDocumentTransport? = nil,
-         captured: AtlasSearchCapturedHit? = nil) {
+         captured: AtlasSearchCapturedHit? = nil,
+         supplied: AtlasSuppliedReaderSource? = nil) {
         capturedTarget = captured
+        suppliedSource = supplied
         liveTransport = transport
         searchTransport = search
         outlineTransport = outline
         documentTransport = document
-        let coordinator = AtlasReaderCoordinator(transport: captured.map { transport.importing($0) } ?? transport, search: search,
+        let initialTransport = captured.map { transport.importing($0) }
+            ?? supplied.map { transport.importing($0) } ?? transport
+        let coordinator = AtlasReaderCoordinator(transport: initialTransport, search: search,
             outline: outline, document: document)
         self.coordinator = coordinator
         documentPreview = AtlasDocumentPreviewModel(supported: document != nil,
@@ -124,6 +129,8 @@ import Observation
             messages.append("Pinned exact retained bytes; no live-file reread. Search, outline, preview and navigation belong to this reader independently.")
         } else if capturedTarget != nil {
             messages.append("Source imported from the retained workspace search; no live-file reread.")
+        } else if suppliedSource != nil {
+            messages.append("Source imported from the complete text already displayed; no live-file reread. Refresh from disk explicitly opens current bytes.")
         }
         if let label = symbolSelectionLabel { messages.append("\(label); heuristic candidate, not semantic resolution.") }
         if matchHex != nil { messages.append("Selection belongs to this retained file query, not a workspace search capture.") }
@@ -179,12 +186,17 @@ import Observation
         close()
         let input: AtlasReaderInput
         do {
+            guard capturedTarget == nil || suppliedSource == nil else { throw AtlasReaderError.invalidInput }
             let liveInput = try AtlasReaderInput(root: root, path: path)
             if let target = capturedTarget {
                 guard target.root.utf8.elementsEqual(root.utf8), target.path.utf8.elementsEqual(path.utf8),
                       coordinator.supportsFind else { throw AtlasReaderError.invalidInput }
                 input = try AtlasReaderInput(captured: target)
                 fileQuery = target.needle
+            } else if let supplied = suppliedSource {
+                guard supplied.matches(root: root, path: path) else { throw AtlasReaderError.invalidInput }
+                guard liveTransport.openBytes != nil else { throw AtlasReaderError.unavailable }
+                input = supplied.input
             } else {
                 input = liveInput
             }
@@ -192,10 +204,12 @@ import Observation
             // lease. Captured metadata alone never grants a refresh destination.
             refreshInput = liveInput
             refreshAccessLease = accessLease
-        } catch { notice = AtlasReaderError.invalidInput.message; return }
+        } catch let error as AtlasReaderError { notice = error.message; return }
+        catch { notice = AtlasReaderError.invalidInput.message; return }
         let ticket = begin(query: capturedTarget != nil)
-        notice = capturedTarget == nil ? "Capturing source for bounded page navigation…"
-            : "Opening the exact retained search capture…"
+        notice = capturedTarget != nil ? "Opening the exact retained search capture…"
+            : suppliedSource != nil ? "Opening the complete source already displayed…"
+            : "Capturing source for bounded page navigation…"
         task = Task {
             do {
                 let opened = try await coordinator.open(input: input, accessLease: accessLease)
@@ -216,6 +230,9 @@ import Observation
                 } else {
                     install(opened, request: .firstPage)
                     finish(ticket)
+                    if suppliedSource != nil {
+                        notice = "Opened the exact displayed source without rereading the live file."
+                    }
                 }
             } catch {
                 // Failed initial activation has no publishable page. Retire

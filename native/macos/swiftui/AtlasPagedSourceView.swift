@@ -19,6 +19,7 @@ import AppKit
     @State private var showsSplitPreview = false
 
     init(root: String, path: String, accessLease: AnyObject?, captured: AtlasSearchCapturedHit? = nil,
+         supplied: AtlasSuppliedReaderSource? = nil,
          canPin: Bool = false, pin: ((AtlasPagedReaderModel) -> Void)? = nil) {
         self.root = root
         self.path = path
@@ -27,7 +28,7 @@ import AppKit
         self.canPin = canPin
         self.pin = pin
         _model = State(initialValue: AtlasPagedReaderModel(transport: .native, search: .native,
-            outline: .native, document: .native, captured: captured))
+            outline: .native, document: .native, captured: captured, supplied: supplied))
     }
 
     /// A pin is already open and owned by the enclosing native workspace.

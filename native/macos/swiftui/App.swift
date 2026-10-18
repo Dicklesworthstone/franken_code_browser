@@ -247,6 +247,7 @@ extension AtlasCamera {
     @State private var showsReader = false
     @State private var usesPagedReader = false
     @State private var capturedReaderTarget: AtlasSearchCapturedHit?
+    @State private var suppliedReaderTarget: AtlasSuppliedReaderSource?
     @State private var pinnedReaders = AtlasPinnedReaders<AtlasPagedReaderModel>(
         canFork: { $0.canPin }, fork: { try await $0.fork() }, retire: { $0.close() },
         failureMessage: { ($0 as? AtlasReaderError)?.message ?? "The source could not be pinned." })
@@ -380,6 +381,7 @@ extension AtlasCamera {
             pinnedReaders.closeAll()
             showsFileFinder = false
             capturedReaderTarget = nil
+            suppliedReaderTarget = nil
             cancelSourceLoad()
             loadTask?.cancel()
             loadCancellation?.cancel()
@@ -865,7 +867,8 @@ extension AtlasCamera {
                         .foregroundStyle(.secondary)
                     if !usesPagedReader {
                         Button("Read pages") { openPagedFile(path) }
-                            .help("Open a new retained capture for byte and line navigation, without using search-match coordinates")
+                            .help(selectedSource == nil ? "Capture the current file for byte and line navigation"
+                                : "Read the already captured bytes with paging, Find and Outline. Refresh from disk explicitly to load edits.")
                     }
                 }
                 .padding(.horizontal, 12)
@@ -878,14 +881,14 @@ extension AtlasCamera {
 #if FCB_APP_STORE
                     if let access = rootAccess, access.url.path.utf8.elementsEqual(root.utf8) {
                         AtlasPagedSourceView(root: root, path: path, accessLease: access, captured: capturedReaderTarget,
-                            canPin: pinnedReaders.canAdd, pin: pinSource)
+                            supplied: suppliedReaderTarget, canPin: pinnedReaders.canAdd, pin: pinSource)
                             .id(focusRequest)
                     } else {
                         Text("Choose the project folder again to grant read access.")
                     }
 #else
                     AtlasPagedSourceView(root: root, path: path, accessLease: nil, captured: capturedReaderTarget,
-                        canPin: pinnedReaders.canAdd, pin: pinSource)
+                        supplied: suppliedReaderTarget, canPin: pinnedReaders.canAdd, pin: pinSource)
                         .id(focusRequest)
 #endif
                 } else {
@@ -940,6 +943,7 @@ extension AtlasCamera {
         workspaceSearch?.refresh()
         showsFileFinder = false
         capturedReaderTarget = nil
+        suppliedReaderTarget = nil
         cancelSourceLoad()
         clearSearch()
         selectedPath = nil
@@ -1217,6 +1221,7 @@ extension AtlasCamera {
 
     private func applyFileScope() {
         capturedReaderTarget = nil
+        suppliedReaderTarget = nil
         cancelSourceLoad()
         clearSearch()
         selectedPath = nil; selectedSource = nil; selectedMatch = nil
@@ -1409,12 +1414,27 @@ extension AtlasCamera {
         }
     }
 
-    /// Explicitly leave exact-hit/whole-source mode. The paged view owns a NEW
-    /// capture and never receives the old source's ranges or atlas identity.
+    /// Give the paged reader the displayed immutable bytes when available.
+    /// It owns fresh reader state and never inherits atlas/search coordinates.
+    /// Only an explicit later Refresh from disk can replace this source.
     private func openPagedFile(_ path: String) {
         guard !loadingProject, selectedPath?.utf8.elementsEqual(path.utf8) == true,
               acceptsSource(path, searchRow: sourceSearchRow, exactMatch: false) else { return }
+        let supplied: AtlasSuppliedReaderSource?
+        do {
+            if let source = selectedSource {
+                guard source.path.utf8.elementsEqual(path.utf8) else {
+                    status = "The displayed capture belongs to a different file. Open the intended source again."
+                    return
+                }
+                supplied = try AtlasSuppliedReaderSource(root: root, path: path, text: source.text)
+            } else { supplied = nil }
+        } catch {
+            status = (error as? AtlasReaderError)?.message ?? "The displayed source could not be opened as retained pages."
+            return
+        }
         capturedReaderTarget = nil
+        suppliedReaderTarget = supplied
         cancelSourceLoad()
         selectedHit = nil
         selectedMatch = nil
@@ -1425,7 +1445,8 @@ extension AtlasCamera {
         usesPagedReader = true
         showsReader = true
         focusRequest = UUID()
-        status = "Opening a new retained capture for byte and line navigation. No search-match coordinates are used."
+        status = supplied == nil ? "Capturing the current file for byte and line navigation."
+            : "Opening pages from the displayed capture. Use Refresh from disk to load later file edits."
     }
 
     private func openSearchFile(_ row: AtlasSearchRowID) {
@@ -1461,6 +1482,7 @@ extension AtlasCamera {
     private func openFile(_ path: String, searchRow: AtlasSearchRowID? = nil, exactMatch: Bool = false) {
         guard acceptsSource(path, searchRow: searchRow, exactMatch: exactMatch) else { return }
         capturedReaderTarget = nil
+        suppliedReaderTarget = nil
         cancelSourceLoad()
         usesPagedReader = false
         sourceSearchRow = searchRow

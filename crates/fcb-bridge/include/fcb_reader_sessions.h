@@ -32,6 +32,9 @@ extern "C" {
  *
  * Responses use fcb.reader-session/1. status=error, search_complete, range_limited
  * and boundaries_adjusted must be inspected; non-null alone is not success.
+ * Info includes capture_sha256: lowercase SHA-256 of the complete original
+ * bytes, computed once at capture admission and retained across forks. The
+ * digest is an integrity witness, not a file ID or an access grant.
  * Unwinding service panics return NULL. Aborts cannot be recovered here.
  * All source, search, copy and close operations belong on a worker, not redraw.
  * cancel never waits on source/query work; concurrent operations on the same

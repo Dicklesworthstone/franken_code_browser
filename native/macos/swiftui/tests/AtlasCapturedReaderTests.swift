@@ -61,6 +61,9 @@ private final class Calls: @unchecked Sendable {
             fork: { source, destination in
                 precondition(source == 100 && destination == 101)
                 calls.add("fork"); return "independent captured info"
+            }, openBytes: { _, label, bytes in
+                precondition(label == "supplied" && bytes == Data("abc".utf8))
+                calls.add("supplied"); return .init(json: "supplied info", sha256: "fixture digest")
             })
         let target = AtlasSearchCapturedHit(root: "/repo", path: "src.rs", needle: "x", start: 10, end: 12,
             capturedBytes: 20, openReader: { handle in
@@ -75,6 +78,8 @@ private final class Calls: @unchecked Sendable {
         check(transport.cancel(100) && transport.close(100), "Reader cancellation/retirement remains independent")
         check(transport.fork?(100, 101) == "independent captured info" && calls.get("fork") == 1,
               "Captured-search transport lost independent pin capability")
+        check(transport.openBytes?(101, "supplied", Data("abc".utf8))?.json == "supplied info"
+              && calls.get("supplied") == 1, "Captured-search transport lost supplied-byte capability")
         let failure = AtlasSearchCapturedHit(root: "/repo", path: "src.rs", needle: "x", start: 10, end: 12,
             capturedBytes: 20, openReader: { _ in throw AtlasSearchError.invalidResponse })
         check(base.importing(failure).open(100, "src.rs", 20) == nil && calls.get("live-open") == 0,

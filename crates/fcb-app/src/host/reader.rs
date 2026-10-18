@@ -21,6 +21,7 @@ use fcb::search::{CaptureRequest, CompleteCapture, DetectedEncoding, ExtentViewE
     StreamReadError, StreamReadOptions, StreamReadState, StreamReadStep, StreamingHit, StreamingNeedle, SymbolError};
 use fcb::source::{SourceError, detect_encoding};
 use fcb::source::line_index::{LineNumber, LineWindowError, LineWindowScanner, LineWindowStatus};
+use fcb::store::{Sha256, Sha256Digest};
 use fcb_core::ResourceLease;
 use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES};
 use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
@@ -83,6 +84,9 @@ struct AcceptedQuery {
 /// after handoff remain the native host's separately owned storage.
 pub struct ReaderSession {
     capture: CompleteCapture,
+    // Computed once over the supplied original bytes, then copied with shared
+    // capture backing. Info/forks never rehash a retained source.
+    capture_sha256: Sha256Digest,
     path: PathBuf,
     encoding: DetectedEncoding,
     // Fixed capacity is charged by size_of::<Self> before session allocation.
@@ -137,9 +141,10 @@ impl ReaderSession {
         let state_lease = Self::reserve_state(owner, &budget)?;
         let request = CaptureRequest::new(FileId::new(owner, 1).map_err(|_| ReaderSessionError::IdentityExhausted)?,
             SourceRevision::new(owner, 1).map_err(|_| ReaderSessionError::IdentityExhausted)?)?;
+        let capture_sha256 = source_sha256(bytes, &mut canceled)?;
         let capture = CompleteCapture::new(request, ByteLength::new(bytes.len() as u64), Arc::from(bytes))?;
         let encoding = detect_encoding(&bytes[..bytes.len().min(3)]);
-        let session = Self::retained(capture, path, encoding, budget, source_lease, state_lease);
+        let session = Self::retained(capture, capture_sha256, path, encoding, budget, source_lease, state_lease);
         check(&mut canceled)?;
         Ok(session)
     }
@@ -148,9 +153,9 @@ impl ReaderSession {
         budget.try_reserve_managed(owner, ResourceAllocationId::new(2).map_err(|_| AppError::Admission)?,
             ByteLength::new(charge as u64)).map_err(|_| AppError::Admission.into())
     }
-    fn retained(capture: CompleteCapture, path: &Path, encoding: DetectedEncoding,
+    fn retained(capture: CompleteCapture, capture_sha256: Sha256Digest, path: &Path, encoding: DetectedEncoding,
         budget: ResourceBudget, source_lease: ResourceLease, state_lease: ResourceLease) -> Self {
-        Self { capture, path: path.to_path_buf(), encoding,
+        Self { capture, capture_sha256, path: path.to_path_buf(), encoding,
             line_checkpoints: std::array::from_fn(|_| None), source_bytes_read: 0, read_calls: 0,
             file_observation: false, query: None, last_query_attempt: 0,
             outline: None, last_outline_attempt: 0, document: None, last_document_attempt: 0, next_allocation: 3,
@@ -173,7 +178,7 @@ impl ReaderSession {
         let request = CaptureRequest::new(FileId::new(owner, 1).map_err(|_| ReaderSessionError::IdentityExhausted)?,
             SourceRevision::new(owner, 1).map_err(|_| ReaderSessionError::IdentityExhausted)?)?;
         let capture = self.capture.share_with_request(request)?;
-        let session = Self::retained(capture, &self.path, self.encoding, budget,
+        let session = Self::retained(capture, self.capture_sha256, &self.path, self.encoding, budget,
             self._source_lease.clone(), state_lease);
         check(&mut canceled)?;
         Ok(session)
@@ -190,6 +195,7 @@ impl ReaderSession {
         let mut out = self.output("info")?;
         out.literal(",\"capture_origin\":")?;
         out.quoted(if self.file_observation { "regular-file-observation-not-atomic" } else { "host-supplied" })?;
+        out.literal(",\"capture_sha256\":")?; out.quoted(&self.capture_sha256.to_hex())?;
         out.literal(",\"initial_source_bytes_read\":")?; out.integer(self.source_bytes_read)?;
         out.literal(",\"initial_read_calls\":")?; out.integer(self.read_calls)?;
         out.literal(",\"accepted_query_generation\":")?;
@@ -428,6 +434,18 @@ impl ReaderSession {
 fn range(start: u64, end: u64) -> Result<ByteRange, ReaderSessionError> {
     ByteRange::new(ByteOffset::new(start), ByteOffset::new(end)).map_err(|_| ReaderSessionError::InvalidRange)
 }
+fn source_sha256(bytes: &[u8], canceled: &mut impl FnMut() -> bool)
+    -> Result<Sha256Digest, ReaderSessionError> {
+    check(canceled)?;
+    let mut hash = Sha256::new();
+    for chunk in bytes.chunks(64 * 1024) {
+        check(canceled)?;
+        hash.update(chunk);
+    }
+    check(canceled)?;
+    Ok(hash.finalize())
+}
+
 fn window_limit(bytes: usize) -> Result<(), ReaderSessionError> {
     if !(4..=MAX_READER_WINDOW_BYTES).contains(&bytes) { Err(ReaderSessionError::InvalidLimits) } else { Ok(()) }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 @_silgen_name("fcb_reader_create")
 private func fcb_reader_create() -> UInt64
@@ -14,6 +15,9 @@ private func fcb_reader_cancel(_ handle: UInt64) -> UInt8
 private func fcb_reader_close(_ handle: UInt64) -> UInt8
 @_silgen_name("fcb_reader_fork")
 private func fcb_reader_fork(_ source: UInt64, _ destination: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_reader_open_bytes")
+private func fcb_reader_open_bytes(_ handle: UInt64, _ label: UnsafePointer<CChar>?,
+    _ bytes: UnsafePointer<UInt8>?, _ length: UInt64) -> UnsafeMutablePointer<CChar>?
 
 extension AtlasReaderTransport {
     static let native = Self(
@@ -30,7 +34,22 @@ extension AtlasReaderTransport {
             // Rust registry retains its capacity charge; failure is not success.
             let message = Data("FCB_READER_RETIREMENT_UNAVAILABLE\n".utf8)
             try? FileHandle.standardError.write(contentsOf: message)
-        }, fork: { take(fcb_reader_fork($0, $1)) })
+        }, fork: { take(fcb_reader_fork($0, $1)) },
+        openBytes: { handle, label, bytes in
+            guard bytes.count <= Int(AtlasReaderLimits.captureBytes),
+                  !label.isEmpty, label.utf8.count <= 16_384, !label.utf8.contains(0) else { return nil }
+            // Invoked only by the coordinator's bounded worker queue. The
+            // original UTF-8 (including BOM, NUL and normalization form) stays
+            // alive until both native hashing and Rust's owned copy finish.
+            let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+            let json = label.withCString { path in
+                bytes.withUnsafeBytes { raw in
+                    take(fcb_reader_open_bytes(handle, path, raw.bindMemory(to: UInt8.self).baseAddress,
+                        UInt64(bytes.count)))
+                }
+            }
+            return SuppliedResponse(json: json, sha256: digest)
+        })
 
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
         guard let pointer else { return nil }
