@@ -12,6 +12,11 @@ final class IndexedFixture: @unchecked Sendable {
         var pathHex = "612e7273"
         var digest = String(repeating: "a", count: 64)
         var encoding = "utf8"
+        // Explicit scripted scope receipts; this fixture does no file matching.
+        var scopedEligible: Int? = nil
+        var scopedCaptured: Int? = nil
+        var scopedUnavailable: Int? = nil
+        var scopedHitCount: Int? = nil
     }
     private struct Session {
         let config: Configuration
@@ -19,6 +24,7 @@ final class IndexedFixture: @unchecked Sendable {
         var queryStep = 0
         var generation: UInt64 = 1
         var needle = ""
+        var scope: AtlasSearchFileScope = .all
     }
     private let lock = NSLock()
     private var config = Configuration()
@@ -56,11 +62,15 @@ final class IndexedFixture: @unchecked Sendable {
             self.lock.lock(); defer { self.lock.unlock() }
             precondition(self.sessions.removeValue(forKey: h) != nil)
             self.events.append("close:\(h)"); return true
-        }, retirementFailed: { self.record("retirement-failed") })
+        }, retirementFailed: { self.record("retirement-failed") }, scopedQueryBegin: { h, g, index, needle, scope in
+            precondition(index == 1 && !scope.isAll)
+            return try self.response("query-begin", h, generation: g, needle: needle, scope: scope)
+        })
     }
 
     private func response(_ phase: String, _ h: UInt64, generation: UInt64 = 1,
                           needle: String = "", start: Int = 0, reader: UInt64 = 100,
+                          scope: AtlasSearchFileScope = .all,
                           cancellation: AtlasSearchCancellation? = nil) throws -> String? {
         lock.lock(); let block = blocked; lock.unlock()
         block?(phase)
@@ -69,7 +79,11 @@ final class IndexedFixture: @unchecked Sendable {
         guard var s = sessions[h] else { preconditionFailure("Use after close") }
         events.append("\(phase):\(h):\(generation)")
         if phase == "build-step" { s.buildStep += 1 }
-        if phase == "query-begin" { precondition(generation > s.generation); s.generation = generation; s.needle = needle; s.queryStep = 0 }
+        if phase == "query-begin" {
+            precondition(generation > s.generation)
+            s.generation = generation; s.needle = needle; s.queryStep = 0; s.scope = scope
+            events.append("query-scope:\(scope.wireKind):\(scope.extensions ?? ""):\(scope.filenames ?? "")")
+        }
         if phase == "query-step" || phase == "page" { precondition(s.generation == generation) }
         if phase == "query-step" { s.queryStep += 1 }
         sessions[h] = s
@@ -109,9 +123,15 @@ final class IndexedFixture: @unchecked Sendable {
                     "additional_source_bytes_read": "0", "native_presented": false]]
             value.merge(fields, uniquingKeysWith: { _, n in n })
         } else {
-            let examined = min(s.queryStep, captured), scanned = min(1, examined), skipped = max(0, examined - scanned)
-            let running = phase == "query-begin" || examined < captured
-            let count = examined > 0 ? c.hitCount : 0
+            let scoped = !s.scope.isAll
+            let eligible = scoped ? c.scopedEligible ?? c.files : c.files
+            let available = scoped ? c.scopedCaptured ?? captured : captured
+            let unavailable = scoped ? c.scopedUnavailable ?? c.unavailable : c.unavailable
+            let pending = eligible - available - unavailable
+            precondition(eligible <= c.files && available <= captured && unavailable <= c.unavailable && pending >= 0)
+            let examined = min(s.queryStep, available), scanned = min(1, examined), skipped = max(0, examined - scanned)
+            let running = phase == "query-begin" || examined < available
+            let count = examined > 0 ? (scoped ? c.scopedHitCount ?? c.hitCount : c.hitCount) : 0
             let first = phase == "page" ? start : 0, end = min(count, first + (phase == "page" ? 128 : 64))
             var rows: [[String: Any]] = []
             if first < end {
@@ -127,15 +147,24 @@ final class IndexedFixture: @unchecked Sendable {
                 "capture_manifest": "2", "query_generation": String(generation), "needle": s.needle,
                 "mode": "exact-decoded-literal", "search_strategy": "retained-ephemeral-index",
                 "catalogued_files": String(c.files), "discovery_complete": c.discovery,
-                "examined_files": String(examined + c.unavailable), "scanned_files": String(scanned), "verified_files": String(scanned),
+                "examined_files": String(examined + unavailable), "scanned_files": String(scanned), "verified_files": String(scanned),
                 "skipped_by_index": String(skipped), "fallback_files": String(c.fallback ? scanned : 0),
-                "unavailable_files": String(c.unavailable), "pending_files": String(c.files - examined - c.unavailable),
+                "unavailable_files": String(unavailable), "pending_files": String(eligible - examined - unavailable),
                 "retained_hits": String(count), "displayed_hits": String(count), "matches_seen": String(count), "step_count": String(s.queryStep),
                 "verification_source_bytes": String(scanned == 0 ? 0 : min(4096, totalBytes)), "source_bytes_read": "0", "read_calls": "0",
-                "search_in_progress": running, "search_complete": !running && c.pending == 0 && c.unavailable == 0 && c.discovery,
-                "truncated": false, "stop_reason": running ? NSNull() : (c.pending > 0 ? "source-byte-limit" : "all-files-examined"),
+                "search_in_progress": running, "search_complete": !running && pending == 0 && unavailable == 0 && c.discovery,
+                "truncated": false, "stop_reason": running ? NSNull() : (pending > 0 ? "source-byte-limit" : "all-files-examined"),
                 "hits": rows, "next_offset": end < count ? String(end) : NSNull()]
             value.merge(fields, uniquingKeysWith: { _, n in n })
+            if scoped {
+                value["search_scope"] = s.scope.wireKind
+                value["scope_extensions"] = s.scope.extensions ?? ""
+                value["scope_filenames"] = s.scope.filenames ?? ""
+                value["eligible_files"] = String(eligible)
+                value["excluded_files"] = String(c.files - eligible)
+                value["eligible_captured_files"] = String(available)
+                value["scoped_capture_unavailable_files"] = String(unavailable)
+            }
         }
         value = mutation(phase, value)
         return String(decoding: try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]), as: UTF8.self)

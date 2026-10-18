@@ -25,19 +25,17 @@ final class AtlasSearchCancellation: @unchecked Sendable {
 /// covers the entire foreign call even if the view/coordinator is destroyed.
 private final class AtlasSearchRequest: @unchecked Sendable {
     let generation: UInt64
-    let root: String
-    let query: String
+    let input: AtlasSearchInput
     let notBefore: DispatchTime
     let cancellation = AtlasSearchCancellation()
     let accessLease: AnyObject?
-    let work: AtlasSearchCoordinator.CapturedWork?
+    let work: AtlasSearchCoordinator.ScopedWork?
     let completion: @MainActor (Result<AtlasSearchReport, AtlasSearchError>) -> Void
 
-    init(generation: UInt64, root: String, query: String, notBefore: DispatchTime,
-         accessLease: AnyObject?, work: AtlasSearchCoordinator.CapturedWork?, completion: @escaping @MainActor (Result<AtlasSearchReport, AtlasSearchError>) -> Void) {
+    init(generation: UInt64, input: AtlasSearchInput, notBefore: DispatchTime,
+         accessLease: AnyObject?, work: AtlasSearchCoordinator.ScopedWork?, completion: @escaping @MainActor (Result<AtlasSearchReport, AtlasSearchError>) -> Void) {
         self.generation = generation
-        self.root = root
-        self.query = query
+        self.input = input
         self.notBefore = notBefore
         self.accessLease = accessLease
         self.work = work
@@ -117,10 +115,12 @@ private final class AtlasSearchProgressMailbox: @unchecked Sendable {
     typealias Work = @Sendable (String, String, AtlasSearchCancellation) throws -> AtlasSearchReport
     typealias ProgressiveWork = @Sendable (String, String, AtlasSearchCancellation, @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport
     typealias CapturedWork = @Sendable (String, String, AtlasSearchCancellation, AtlasSearchAccessLease, @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport
+    typealias ScopedWork = @Sendable (AtlasSearchInput, AtlasSearchCancellation, AtlasSearchAccessLease, @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport
     typealias Completion = @MainActor (Result<AtlasSearchReport, AtlasSearchError>) -> Void
 
     private let worker = DispatchQueue(label: "dev.frankencode.browser.search", qos: .userInitiated)
-    private let work: CapturedWork
+    private let work: ScopedWork
+    private let supportsFileScopes: Bool
     private var active: AtlasSearchRequest?
     private var pending: AtlasSearchRequest?
     private var latest: UInt64?
@@ -128,14 +128,34 @@ private final class AtlasSearchProgressMailbox: @unchecked Sendable {
     private var debounceTimer: AtlasSearchDebounceTimer?
 
     init(work: @escaping Work) {
-        self.work = { root, query, cancellation, _, _ in try work(root, query, cancellation) }
+        self.work = { input, cancellation, _, _ in
+            guard input.fileScope.isAll else { throw AtlasSearchError.invalidScope }
+            return try work(input.root, input.query, cancellation)
+        }
+        supportsFileScopes = false
     }
     init(progressiveWork: @escaping ProgressiveWork) {
-        self.work = { root, query, cancellation, _, publish in
-            try progressiveWork(root, query, cancellation, publish)
+        self.work = { input, cancellation, _, publish in
+            guard input.fileScope.isAll else { throw AtlasSearchError.invalidScope }
+            return try progressiveWork(input.root, input.query, cancellation, publish)
+        }
+        supportsFileScopes = false
+    }
+    init(capturedWork: @escaping CapturedWork) {
+        self.work = Self.adapt(capturedWork)
+        supportsFileScopes = false
+    }
+    init(scopedWork: @escaping ScopedWork) {
+        self.work = scopedWork
+        supportsFileScopes = true
+    }
+
+    nonisolated private static func adapt(_ work: @escaping CapturedWork) -> ScopedWork {
+        { input, flag, access, publish in
+            guard input.fileScope.isAll else { throw AtlasSearchError.invalidScope }
+            return try work(input.root, input.query, flag, access, publish)
         }
     }
-    init(capturedWork: @escaping CapturedWork) { self.work = capturedWork }
 
     deinit {
         // The worker retains its own Request, not this coordinator. Destruction
@@ -159,12 +179,23 @@ private final class AtlasSearchProgressMailbox: @unchecked Sendable {
     @discardableResult
     func submit(input: AtlasSearchInput, accessLease: AnyObject? = nil,
                 debounce: Bool = false, using work: CapturedWork? = nil, completion: @escaping Completion) throws -> UInt64 {
+        guard input.fileScope.isAll else { throw AtlasSearchError.invalidScope }
+        return try submitScoped(input: input, accessLease: accessLease, debounce: debounce,
+            using: work.map(Self.adapt), completion: completion)
+    }
+
+    /// The scope is retained in the immutable request alongside the query. A
+    /// replacement cancels prior delivery before the new worker is admitted.
+    @discardableResult
+    func submitScoped(input: AtlasSearchInput, accessLease: AnyObject? = nil,
+                      debounce: Bool = false, using work: ScopedWork? = nil, completion: @escaping Completion) throws -> UInt64 {
         precondition(Thread.isMainThread)
+        guard input.fileScope.isAll || work != nil || supportsFileScopes else { throw AtlasSearchError.invalidScope }
         let (generation, exhausted) = lastGeneration.addingReportingOverflow(1)
         guard !exhausted else { throw AtlasSearchError.identityExhausted }
         lastGeneration = generation
         let deadline = debounce ? DispatchTime.now() + .milliseconds(150) : DispatchTime.now()
-        let request = AtlasSearchRequest(generation: generation, root: input.root, query: input.query,
+        let request = AtlasSearchRequest(generation: generation, input: input,
                               notBefore: deadline, accessLease: accessLease, work: work, completion: completion)
         latest = generation
         active?.cancellation.cancel()
@@ -215,10 +246,13 @@ private final class AtlasSearchProgressMailbox: @unchecked Sendable {
             do {
                 if request.cancellation.isCanceled { throw AtlasSearchError.canceled }
                 let report = try withExtendedLifetime(request.accessLease) {
-                    try work(request.root, request.query, request.cancellation, AtlasSearchAccessLease(request.accessLease), mailbox.offer)
+                    try work(request.input, request.cancellation, AtlasSearchAccessLease(request.accessLease)) { report in
+                        guard report.fileScope == request.input.fileScope else { return }
+                        mailbox.offer(report)
+                    }
                 }
                 if request.cancellation.isCanceled { throw AtlasSearchError.canceled }
-                guard !report.isInProgress else { throw AtlasSearchError.invalidResponse }
+                guard !report.isInProgress, report.fileScope == request.input.fileScope else { throw AtlasSearchError.invalidResponse }
                 result = .success(report)
             } catch let error as AtlasSearchError {
                 result = .failure(error)

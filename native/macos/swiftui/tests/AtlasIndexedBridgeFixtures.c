@@ -38,6 +38,13 @@ char *fcb_atlas_search_indexed_begin(uint64_t h, uint64_t g, uint64_t index, con
     assert(h == handle && g == 44 && index == 1 && !strcmp(needle, "exact text") && hits == 1000 && bytes == 32 * 1024 * 1024);
     ++calls; return result();
 }
+char *fcb_atlas_search_indexed_begin_scoped(uint64_t h, uint64_t g, uint64_t index, const char *needle,
+                                         const char *extensions, const char *filenames, uint64_t hits, uint64_t bytes) {
+    assert(extensions && filenames);
+    if (g == 45) assert(!strcmp(extensions, "rs") && !strcmp(filenames, "cargo.lock,cargo.toml,rust-toolchain,rust-toolchain.toml"));
+    else assert(g == 46 && !extensions[0] && !filenames[0]);
+    return fcb_atlas_search_indexed_begin(h, 44, index, needle, hits, bytes);
+}
 char *fcb_atlas_search_step_cancelable(uint64_t h, uint64_t g, int32_t (*poll)(void *), void *ctx) {
     assert(h == handle && g == 44); ++calls; poll_now(poll, ctx); return result();
 }

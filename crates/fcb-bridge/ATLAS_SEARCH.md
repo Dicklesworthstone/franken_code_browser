@@ -95,6 +95,33 @@ cancellation suppresses its installation receipt.
 
 ## Captures, scope, and identity
 
+`fcb_atlas_search_begin_scoped` and `fcb_atlas_search_scoped` admit an explicit
+file-type scope before consuming file, source-read or occurrence limits. The
+scope is frozen with the query generation, independently of the atlas's display
+filter. A Rust scope can include extension `rs` plus exact basenames
+`cargo.toml,cargo.lock,rust-toolchain.toml,rust-toolchain`; Python and Markdown can
+similarly include their related extensions. Excluded matches cannot fill the
+result quota and hide a later included file.
+
+Pass extension and basename CSV strings immediately after the needle argument.
+Both pointers null preserves the legacy all-files behavior. A present empty
+list is an explicit empty selection, which finishes on its first step with zero
+source I/O. Tokens match the raw final path component with ASCII case folding,
+so undecodable bytes elsewhere in a native path cannot hide an ASCII extension.
+Each list is limited to 1024 input bytes and 32 distinct tokens of 1–64 bytes.
+Extensions use ASCII letters, digits, `_`, `+`, `-` without a dot. Basenames also
+allow dots, except the complete names `.` and `..`. Invalid input is refused;
+it never broadens to all files.
+
+Every result page and overlay echoes `search_scope` (`all` or `file-types`) and
+sorted, deduplicated `scope_extensions` / `scope_filenames` CSV strings. The
+original `catalogued_files` and `workspace_files` denominators remain unchanged;
+`eligible_files + excluded_files` partitions that frozen catalog. Examined,
+scanned, unavailable, pending and occurrence counts describe the query scope.
+An excluded file is neither an unavailable file nor an unexamined eligible file.
+The legacy `scope` field remains the separate atlas display filter; applying it
+to retained rows cannot relabel or complete a different search scope.
+
 Each query reads only the frozen atlas catalog's eligible regular files under its
 root grant and application source policy. It does not repeat discovery or broaden
 exclusions. Added files require a new atlas/catalog. Files changed since metadata
@@ -134,7 +161,8 @@ acknowledged scene until a new candidate plan is explicitly presented.
 
 Production-path tests include `crates/fcb-app/tests/retained_atlas_search.rs`,
 `crates/fcb-app/tests/progressive_atlas_search.rs`, `src/atlas_search_sessions_tests.rs`,
-`src/atlas_progressive_tests.rs`, and `src/atlas_search_ffi_tests.rs`.
+`crates/fcb-app/tests/scoped_atlas_search.rs`, `src/atlas_progressive_tests.rs`,
+and `src/atlas_search_ffi_tests.rs`.
 
 For the configured independent verifier:
 

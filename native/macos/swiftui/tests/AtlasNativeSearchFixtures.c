@@ -7,8 +7,9 @@
 
 static char *responses[5][8]; // open, begin, step, page, captured reader import
 static unsigned cursors[5];
-static _Atomic unsigned counts[9]; // create/open/begin/step/page/close/alloc/free/import
+static _Atomic unsigned counts[10]; // create/open/begin/step/page/close/alloc/free/import/scoped-begin
 static int cancel_step, refuse_create;
+static char expected_extensions[1025], expected_filenames[1025];
 extern void fixture_mark_canceled(void *);
 
 void fixture_reset(void) {
@@ -16,14 +17,19 @@ void fixture_reset(void) {
         for (unsigned j = 0; j < 8; ++j) { free(responses[i][j]); responses[i][j] = NULL; }
         cursors[i] = 0;
     }
-    for (unsigned i = 0; i < 9; ++i) atomic_store(&counts[i], 0);
+    for (unsigned i = 0; i < 10; ++i) atomic_store(&counts[i], 0);
+    expected_extensions[0] = expected_filenames[0] = 0;
     cancel_step = refuse_create = 0;
 }
 void fixture_set(unsigned kind, unsigned index, const char *text) {
     assert(kind < 5 && index < 8);
     free(responses[kind][index]); responses[kind][index] = strdup(text);
 }
-unsigned fixture_count(unsigned key) { assert(key < 9); return atomic_load(&counts[key]); }
+unsigned fixture_count(unsigned key) { assert(key < 10); return atomic_load(&counts[key]); }
+void fixture_expect_scope(const char *extensions, const char *filenames) {
+    assert(extensions && filenames && strlen(extensions) <= 1024 && strlen(filenames) <= 1024);
+    strcpy(expected_extensions, extensions); strcpy(expected_filenames, filenames);
+}
 void fixture_cancel_step(void) { cancel_step = 1; }
 void fixture_refuse_create(void) { refuse_create = 1; }
 static char *next(unsigned kind) {
@@ -45,6 +51,13 @@ char *fcb_atlas_search_begin(uint64_t handle, uint64_t generation, const char *q
     assert(handle == 42 && generation == 1 && query && strlen(query));
     assert(matches == 1000 && files == 4096 && file_bytes == 1024 * 1024 && source_bytes == 32 * 1024 * 1024);
     ++counts[2]; return next(1);
+}
+char *fcb_atlas_search_begin_scoped(uint64_t handle, uint64_t generation, const char *query,
+                                  const char *extensions, const char *filenames,
+                                  uint64_t matches, uint64_t files, uint64_t file_bytes, uint64_t source_bytes) {
+    assert(extensions && filenames && !strcmp(extensions, expected_extensions) && !strcmp(filenames, expected_filenames));
+    ++counts[9];
+    return fcb_atlas_search_begin(handle, generation, query, matches, files, file_bytes, source_bytes);
 }
 char *fcb_atlas_search_step_cancelable(uint64_t handle, uint64_t generation,
                                      int32_t (*poll)(void *), void *context) {

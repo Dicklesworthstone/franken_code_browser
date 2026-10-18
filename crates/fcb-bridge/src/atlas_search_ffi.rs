@@ -3,7 +3,7 @@
 //! C surface for captured repository results attached to existing atlas handles.
 //! No source policy, matcher, worker pool or alternate reader lives in this bridge.
 use std::ffi::c_char;
-use fcb_app::host::atlas_search::{AtlasSearchOptions, MAX_ATLAS_SEARCH_NEEDLE_BYTES};
+use fcb_app::host::atlas_search::{AtlasSearchOptions, AtlasSearchScope, MAX_ATLAS_SEARCH_NEEDLE_BYTES};
 use super::{answer, cstr, number, reply, AccessError, Command};
 
 /// Search the frozen atlas catalog to its terminal state and return first-page
@@ -14,7 +14,8 @@ use super::{answer, cstr, number, reply, AccessError, Command};
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fcb_atlas_search(handle: u64, generation: u64, needle: *const c_char,
     max_matches: u64, max_files: u64, max_file_bytes: u64, max_source_bytes: u64) -> *mut c_char {
-    unsafe { submit(handle, generation, needle, max_matches, max_files, max_file_bytes, max_source_bytes, false) }
+    unsafe { submit(handle, generation, needle, std::ptr::null(), std::ptr::null(),
+        max_matches, max_files, max_file_bytes, max_source_bytes, false) }
 }
 
 /// Admit a resumable query without reading any source. Copies the bounded query
@@ -25,20 +26,62 @@ pub unsafe extern "C" fn fcb_atlas_search(handle: u64, generation: u64, needle: 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fcb_atlas_search_begin(handle: u64, generation: u64, needle: *const c_char,
     max_matches: u64, max_files: u64, max_file_bytes: u64, max_source_bytes: u64) -> *mut c_char {
-    unsafe { submit(handle, generation, needle, max_matches, max_files, max_file_bytes, max_source_bytes, true) }
+    unsafe { submit(handle, generation, needle, std::ptr::null(), std::ptr::null(),
+        max_matches, max_files, max_file_bytes, max_source_bytes, true) }
+}
+
+/// Finish a literal query restricted before source, file and occurrence quotas.
+/// Null/null lists mean all; a non-null empty list means explicit empty scope.
+/// # Safety
+/// All non-null strings must be readable NUL-terminated UTF-8 until return.
+/// Lists contain at most 1024 bytes / 32 tokens of 1..64 ASCII bytes. Extensions
+/// use alphanumerics, _, +, -; basenames also permit dots, except "." and "..".
+/// Input ownership and result freeing match fcb_atlas_search. Worker only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_search_scoped(handle: u64, generation: u64, needle: *const c_char,
+    extensions: *const c_char, filenames: *const c_char, max_matches: u64, max_files: u64,
+    max_file_bytes: u64, max_source_bytes: u64) -> *mut c_char {
+    unsafe { submit(handle, generation, needle, extensions, filenames,
+        max_matches, max_files, max_file_bytes, max_source_bytes, false) }
+}
+
+/// Admit a frozen file-type scope. Progress uses the ordinary search_step/page;
+/// scope changes consume new generations and cannot reuse narrowed candidates.
+/// # Safety
+/// Same pointer/list and returned-string contract as fcb_atlas_search_scoped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_search_begin_scoped(handle: u64, generation: u64, needle: *const c_char,
+    extensions: *const c_char, filenames: *const c_char, max_matches: u64, max_files: u64,
+    max_file_bytes: u64, max_source_bytes: u64) -> *mut c_char {
+    unsafe { submit(handle, generation, needle, extensions, filenames,
+        max_matches, max_files, max_file_bytes, max_source_bytes, true) }
+}
+
+unsafe fn parse_scope(extensions: *const c_char, filenames: *const c_char) -> Result<AtlasSearchScope, AccessError> {
+    let extensions = if extensions.is_null() { None }
+        else { Some(unsafe { cstr(extensions) }.ok_or(AccessError::InvalidArgument)?) };
+    let filenames = if filenames.is_null() { None }
+        else { Some(unsafe { cstr(filenames) }.ok_or(AccessError::InvalidArgument)?) };
+    AtlasSearchScope::from_csv(extensions, filenames).map_err(AccessError::from)
 }
 
 // Marshaling only: both public entrypoints use the same safe application engine.
 unsafe fn submit(handle: u64, generation: u64, needle: *const c_char,
+    extensions: *const c_char, filenames: *const c_char,
     max_matches: u64, max_files: u64, max_file_bytes: u64, max_source_bytes: u64,
     progressive: bool) -> *mut c_char {
     reply(|| answer(handle, |atlases| {
         let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
         if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES { return Err(AccessError::InvalidArgument); }
+        let scope = unsafe { parse_scope(extensions, filenames) }?;
         let options = AtlasSearchOptions { max_matches: number(max_matches)?, max_files: number(max_files)?,
             max_file_bytes: number(max_file_bytes)?, max_source_bytes: number(max_source_bytes)? };
-        let command = if progressive { Command::SearchBegin { generation, needle, options } }
-            else { Command::Search { generation, needle, options } };
+        let command = match (scope.is_all(), progressive) {
+            (true, true) => Command::SearchBegin { generation, needle, options },
+            (true, false) => Command::Search { generation, needle, options },
+            (false, true) => Command::SearchBeginScoped { generation, needle, scope: &scope, options },
+            (false, false) => Command::SearchScoped { generation, needle, scope: &scope, options },
+        };
         atlases.execute(handle, command, || false)
     }))
 }

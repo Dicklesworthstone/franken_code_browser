@@ -22,6 +22,9 @@ import Foundation
         check(try t.page(h, 44, 64, 128) != nil)
         check(try t.sourceReader(h, 9_007_199_254_740_999, 1, 321, 1) != nil)
         check(live() == 0 && calls() == 8)
+        check(try t.scopedQueryBegin!(h, 45, 1, "exact text", AtlasFileScope.rust.searchScope()) != nil)
+        check(try t.scopedQueryBegin!(h, 46, 1, "exact text", AtlasSearchFileScope(extensions: [])) != nil)
+        check(live() == 0 && calls() == 10)
         mode(1); check(try t.indexBegin(h, 1) == nil && live() == 0)
         for bad: Int32 in [2, 3] {
             mode(bad)

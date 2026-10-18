@@ -5,7 +5,7 @@
 use std::ffi::c_char;
 use fcb_app::host::atlas_search::{AtlasIndexOptions, MAX_ATLAS_SEARCH_NEEDLE_BYTES};
 use crate::atlas_sessions::IndexCommand;
-use super::{answer, cstr, number, reply, AccessError};
+use super::{answer, cstr, number, parse_scope, reply, AccessError};
 
 /// Capture and index the frozen catalog to completion on a host worker.
 /// Uses the same one-file pipeline as index_begin/index_step, without yielding.
@@ -54,7 +54,8 @@ pub extern "C" fn fcb_atlas_index_info(handle: u64) -> *mut c_char {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fcb_atlas_search_indexed(handle: u64, generation: u64, index_generation: u64,
     needle: *const c_char, max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
-    unsafe { submit(handle, generation, index_generation, needle, max_matches, max_scan_bytes, false) }
+    unsafe { submit(handle, generation, index_generation, needle, std::ptr::null(), std::ptr::null(),
+        max_matches, max_scan_bytes, false) }
 }
 /// Admit without verifying source. Continue with fcb_atlas_search_step on a
 /// worker; each call visits at most one captured file. All normal search result
@@ -64,16 +65,48 @@ pub unsafe extern "C" fn fcb_atlas_search_indexed(handle: u64, generation: u64, 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fcb_atlas_search_indexed_begin(handle: u64, generation: u64, index_generation: u64,
     needle: *const c_char, max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
-    unsafe { submit(handle, generation, index_generation, needle, max_matches, max_scan_bytes, true) }
+    unsafe { submit(handle, generation, index_generation, needle, std::ptr::null(), std::ptr::null(),
+        max_matches, max_scan_bytes, true) }
+}
+
+/// Finish an indexed literal query using a frozen native-path file-type scope.
+/// Filtering precedes gram candidates, exact verification and occurrence limits.
+/// # Safety
+/// Pointer/list limits and ownership match fcb_atlas_search_scoped. Null/null
+/// lists mean all; present empty lists select no files. Worker only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_search_indexed_scoped(handle: u64, generation: u64, index_generation: u64,
+    needle: *const c_char, extensions: *const c_char, filenames: *const c_char,
+    max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
+    unsafe { submit(handle, generation, index_generation, needle, extensions, filenames,
+        max_matches, max_scan_bytes, false) }
+}
+
+/// Admit a scoped indexed query without verifying source. Resume through the
+/// ordinary search step. Captures/index identity stay pinned across all steps.
+/// # Safety
+/// Same pointer/list and returned-string contract as fcb_atlas_search_indexed_scoped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_search_indexed_begin_scoped(handle: u64, generation: u64, index_generation: u64,
+    needle: *const c_char, extensions: *const c_char, filenames: *const c_char,
+    max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
+    unsafe { submit(handle, generation, index_generation, needle, extensions, filenames,
+        max_matches, max_scan_bytes, true) }
 }
 unsafe fn submit(handle: u64, generation: u64, index_generation: u64, needle: *const c_char,
+    extensions: *const c_char, filenames: *const c_char,
     max_matches: u64, max_scan_bytes: u64, progressive: bool) -> *mut c_char {
     reply(|| answer(handle, |atlases| {
         let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
         if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES { return Err(AccessError::InvalidArgument); }
+        let scope = unsafe { parse_scope(extensions, filenames) }?;
         let max_matches = number(max_matches)?;
-        let command = if progressive { IndexCommand::Begin { generation, index_generation, needle, max_matches, max_scan_bytes } }
-            else { IndexCommand::Query { generation, index_generation, needle, max_matches, max_scan_bytes } };
+        let command = match (scope.is_all(), progressive) {
+            (true, true) => IndexCommand::Begin { generation, index_generation, needle, max_matches, max_scan_bytes },
+            (true, false) => IndexCommand::Query { generation, index_generation, needle, max_matches, max_scan_bytes },
+            (false, true) => IndexCommand::BeginScoped { generation, index_generation, needle, scope: &scope, max_matches, max_scan_bytes },
+            (false, false) => IndexCommand::QueryScoped { generation, index_generation, needle, scope: &scope, max_matches, max_scan_bytes },
+        };
         atlases.execute_index(handle, command, || false)
     }))
 }

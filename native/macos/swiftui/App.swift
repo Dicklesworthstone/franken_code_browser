@@ -324,11 +324,11 @@ extension AtlasCamera {
             .disabled(!projectOpening.canBrowse)
             .help("Browse known files without waiting for text-atlas previews")
             Menu {
-                Picker("Files shown", selection: $fileScope) {
+                Picker("Files and search scope", selection: $fileScope) {
                     ForEach(AtlasFileScope.allCases) { scope in Text(scope.rawValue).tag(scope) }
                 }
             } label: { Label(fileScope.rawValue, systemImage: "line.3.horizontal.decrease.circle") }
-            .help("Filter the atlas by file type")
+            .help("Choose file types for the atlas and workspace search")
             Button {
                 showsReader.toggle()
             } label: {
@@ -379,6 +379,9 @@ extension AtlasCamera {
             clearSearch()
             workspaceSearch?.configure(indexed: indexed)
             runSearch(debounce: true)
+        }
+        .onChange(of: pinnedReaders.notice) { _, notice in
+            if !notice.isEmpty && !pinnedReaders.busy { status = notice }
         }
         .onChange(of: Array(query.utf8)) { _, _ in
             // Revoke old rows immediately, including empty or invalid edits.
@@ -518,13 +521,17 @@ extension AtlasCamera {
             Group {
                 let preparing = searchReport?.indexStatus?.building == true
                 let count = preparing ? UInt64(searchReport?.indexStatus?.capturedFiles ?? 0) : (searchReport?.matchesSeen ?? 0)
+                let countLabel = searchReport.map { report in
+                    (report.fileScope.isAll ? "workspace matches" : "matches in selected types")
+                        + (report.complete ? "" : (report.isInProgress ? " · searching" : " · partial"))
+                } ?? "ready to search"
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text(count, format: .number)
                         .font(.system(size: 30, weight: .semibold, design: .rounded))
                         .monospacedDigit()
                         .contentTransition(.numericText())
                         .animation(reduceMotion ? nil : .spring(response: 0.38, dampingFraction: 0.82), value: count)
-                    Text(preparing ? "files captured" : (searchReport.map { $0.complete ? "workspace matches" : "workspace matches · partial" } ?? "ready to search"))
+                    Text(preparing ? "files captured" : countLabel)
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
                 }
@@ -1159,7 +1166,7 @@ extension AtlasCamera {
         displayedFiles = scoped
         updateCatalogFilter()
         atlasRevision = UUID()
-        status = "\(scoped.count) of \(files.count) files · \(fileScope.rawValue). Search still covers the workspace."
+        status = "\(scoped.count) of \(files.count) files · \(fileScope.rawValue). Search uses the selected file types."
         if !loadingProject && !query.isEmpty { runSearch(debounce: true) }
     }
 
@@ -1250,19 +1257,22 @@ extension AtlasCamera {
         let accessLease: AnyObject? = nil
 #endif
         do {
-            let input = try AtlasSearchInput(root: requestedRoot, query: requestedText)
+            let input = try AtlasSearchInput(root: requestedRoot, query: requestedText,
+                fileScope: fileScope.searchScope(custom: customExtensions))
             clearSearch()
             searchPending = true
             searchTitle = "Searching project"
-            searchSummary = "Searching captured source text. You can navigate the atlas or cancel."
+            searchSummary = input.fileScope.isAll
+                ? "Searching captured source text. You can navigate the atlas or cancel."
+                : "Searching selected file types. Excluded files do not consume the query's scan or result limits."
             status = searchSummary
-            let coordinator = searchCoordinator ?? AtlasSearchCoordinator(capturedWork: AtlasNativeSearch.runWithAccess)
+            let coordinator = searchCoordinator ?? AtlasSearchCoordinator(scopedWork: AtlasNativeSearch.runScoped)
             searchCoordinator = coordinator
-            let service = workspaceSearch ?? AtlasWorkspaceSearch(live: AtlasNativeSearch.runWithAccess,
+            let service = workspaceSearch ?? AtlasWorkspaceSearch(scopedLive: AtlasNativeSearch.runScoped,
                 makeIndex: { AtlasIndexedSearch(transport: .native) })
             workspaceSearch = service
             let choice = service.selection(indexed: useCapturedIndex)
-            try coordinator.submit(input: input, accessLease: accessLease, debounce: debounce, using: choice.work) { result in
+            try coordinator.submitScoped(input: input, accessLease: accessLease, debounce: debounce, using: choice.scopedWork) { result in
                 // Generation rejection happens in the coordinator. These checks
                 // also cover SwiftUI state changes before onChange has run.
                 guard !loadingProject, requestedContext.matchesSourceRequest(searchContext),
@@ -1274,7 +1284,7 @@ extension AtlasCamera {
                     searchPending = report.isInProgress
                     prepareSearchOverlay(report, context: searchContext)
                     searchReport = report
-                    hits = report.hits.filter { $0.sourcePath.map { fileScope.includes($0, custom: customExtensions) } ?? (fileScope == .all) }
+                    hits = report.hits
                     status = report.summary
                     searchSummary = report.summary
                     searchTitle = report.indexStatus?.building == true ? "Preparing captured index"

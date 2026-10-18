@@ -40,6 +40,61 @@ fn finish(cursor: &mut OwnedIndexedQuery, index: &OwnedEphemeralIndex, batch: us
 }
 
 #[test]
+fn scoped_admission_precedes_candidates_quotas_and_freezes_selected_membership() {
+    let budget = budget();
+    let noise = b"needle ".repeat(2000);
+    let index = owned(&[("a.txt", &noise), ("z.rs", b"needle")], MembershipState::Closed,
+        &[file(3)], IndexLimits::default(), &budget, 1);
+    let enabled = std::cell::Cell::new(true);
+    let mut options = QueryOptions::new(generation(10)).with_max_matches(1);
+    options.max_bytes_scanned = Some(6);
+    let mut query = OwnedIndexedQuery::new_scoped(&index, ParsedQuery::parse("needle").unwrap(),
+        options, |candidate| enabled.get() && candidate == file(2), &budget,
+        [allocation(10), allocation(11)], || false).unwrap();
+    enabled.set(false); // The caller's predicate is not consulted during steps.
+    assert_eq!(query.report().known_files(), 1);
+    assert!(query.report().unavailable_files().is_empty());
+    assert_eq!(query.report().scan_attempts(), 0);
+    query.step(&index, 1, generation(10), || false).unwrap();
+    let report = query.report();
+    assert!(report.is_complete()); assert_eq!(report.examined_files(), 1);
+    assert_eq!(report.skipped_by_index(), 0); assert_eq!(report.scan_attempts(), 1);
+    assert_eq!(report.capture_results().scanned_bytes, 6);
+    assert_eq!(report.capture_results().matches.len(), 1);
+    assert_eq!(report.capture_results().matches[0].file_id, file(2));
+    // Negative control: the legacy whole-index query consumes its byte quota
+    // on the excluded first source and cannot reach the selected second file.
+    let mut all_options = QueryOptions::new(generation(20)).with_max_matches(1);
+    all_options.max_bytes_scanned = Some(6);
+    let mut all = OwnedIndexedQuery::new(&index, ParsedQuery::parse("needle").unwrap(), all_options,
+        &budget, [allocation(20), allocation(21)], || false).unwrap();
+    finish(&mut all, &index, 1);
+    assert!(!all.report().capture_results().matches.iter().any(|hit| hit.file_id == file(2)));
+}
+
+#[test]
+fn empty_scope_is_zero_work_and_keeps_index_instance_and_generation_checks() {
+    let budget = budget();
+    let index = owned(&[("a", b"needle")], MembershipState::Closed, &[file(2)],
+        IndexLimits::default(), &budget, 1);
+    let replacement = owned(&[("a", b"changed")], MembershipState::Closed, &[],
+        IndexLimits::default(), &budget, 3);
+    let mut query = OwnedIndexedQuery::new_scoped(&index, ParsedQuery::parse("needle").unwrap(),
+        QueryOptions::new(generation(10)), |_| false, &budget,
+        [allocation(10), allocation(11)], || false).unwrap();
+    assert_eq!(query.report().known_files(), 0); assert!(!query.report().is_terminal());
+    assert_eq!(query.step(&replacement, 1, generation(10), || false).err(), Some(IndexError::InvalidManifest));
+    query.step(&index, 1, generation(10), || false).unwrap();
+    assert!(query.report().is_complete()); assert_eq!(query.report().scan_attempts(), 0);
+    assert_eq!(query.report().capture_results().scanned_bytes, 0);
+    let mut stale = OwnedIndexedQuery::new_scoped(&index, ParsedQuery::parse("needle").unwrap(),
+        QueryOptions::new(generation(20)), |_| false, &budget,
+        [allocation(20), allocation(21)], || false).unwrap();
+    assert_eq!(stale.step(&index, 1, generation(21), || false).err(), Some(IndexError::StaleQuery));
+    assert_eq!(stale.report().state(), IndexedQueryState::Canceled);
+}
+
+#[test]
 fn one_document_steps_preserve_early_hits_and_reuse_prepared_source() {
     let budget = budget();
     let mut index = owned(&[("a.rs", b"needle a"), ("b.rs", b"nothing"), ("c.rs", b"needle c")],

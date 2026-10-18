@@ -51,6 +51,29 @@ char *fcb_atlas_search(uint64_t handle, uint64_t generation, const char *needle,
 char *fcb_atlas_search_begin(uint64_t handle, uint64_t generation, const char *needle,
     uint64_t max_matches, uint64_t max_files, uint64_t max_file_bytes,
     uint64_t max_source_bytes);
+
+/* Frozen query scope, applied BEFORE capture, file, source-byte and hit limits.
+ * Both list pointers null selects all files (legacy behavior). Any non-null list,
+ * including "", selects the union of allowed extensions and exact basenames.
+ * Both explicit empty lists select no files: begin is running, its first step
+ * finishes with zero source I/O. A new scope requires a new query generation.
+ * Lists are NUL-terminated UTF-8 stable until return, <=1024 bytes each, with
+ * <=32 distinct comma-separated tokens of 1..64 ASCII bytes. Extensions omit
+ * dots and accept [A-Za-z0-9_+-]; basenames also accept dots except "." and "..".
+ * ASCII case is ignored, duplicates removed and tokens sorted in the JSON echo.
+ * Basenames/extensions match raw native path bytes, not escaped display paths.
+ * search_scope is "all" or "file-types"; scope_extensions/scope_filenames are
+ * canonical CSV echoes. eligible_files + excluded_files = catalogued_files.
+ * workspace_files/catalogued_files retain the original catalog denominator;
+ * examined/scanned/unavailable/pending and retained hits cover query scope only.
+ * Legacy "scope" still names the independent atlas display filter.
+ */
+char *fcb_atlas_search_scoped(uint64_t handle, uint64_t generation, const char *needle,
+    const char *extensions, const char *filenames, uint64_t max_matches,
+    uint64_t max_files, uint64_t max_file_bytes, uint64_t max_source_bytes);
+char *fcb_atlas_search_begin_scoped(uint64_t handle, uint64_t generation, const char *needle,
+    const char *extensions, const char *filenames, uint64_t max_matches,
+    uint64_t max_files, uint64_t max_file_bytes, uint64_t max_source_bytes);
 char *fcb_atlas_search_step(uint64_t handle, uint64_t generation);
 
 /* Pages contain <=limit (1..128) rows. next_offset is a zero-based continuation,

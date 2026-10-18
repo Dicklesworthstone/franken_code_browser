@@ -10,6 +10,9 @@ private typealias IndexPoll = @convention(c) (UnsafeMutableRawPointer?) -> Int32
     _ poll: IndexPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_search_indexed_begin") private func indexedQueryBegin(_ h: UInt64, _ g: UInt64, _ index: UInt64,
     _ text: UnsafePointer<CChar>?, _ hits: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_search_indexed_begin_scoped") private func indexedScopedQueryBegin(_ h: UInt64, _ g: UInt64, _ index: UInt64,
+    _ text: UnsafePointer<CChar>?, _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
+    _ hits: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_search_step_cancelable") private func indexedQueryStep(_ h: UInt64, _ g: UInt64,
     _ poll: IndexPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_search_page") private func indexedPage(_ h: UInt64, _ g: UInt64,
@@ -29,6 +32,12 @@ extension AtlasIndexedSearchTransport {
     page: { try take(indexedPage($0, $1, $2, $3)) }, sourceReader: { try take(indexedReader($0, $1, $2, $3, $4)) },
     close: { indexedClose($0) != 0 }, retirementFailed: {
         FileHandle.standardError.write(Data("ATLAS_INDEX_RETIREMENT_FAILED\n".utf8))
+    }, scopedQueryBegin: { h, g, index, query, scope in
+        try query.withCString { text in
+            try scope.withCStrings { extensions, filenames in
+                try take(indexedScopedQueryBegin(h, g, index, text, extensions, filenames, 1000, 32 * 1024 * 1024))
+            }
+        }
     })
 
     private static func polling(_ flag: AtlasSearchCancellation,

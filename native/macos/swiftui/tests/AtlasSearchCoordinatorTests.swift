@@ -57,7 +57,10 @@ private final class Lease {}
         try cancellationDropsPendingRequests()
         try partialAndEmptyReportsRemainDistinct()
         try workerCancellationFinishesLatestRequest()
-        print("AtlasSearchCoordinator: 10 worker, cancellation, publication and grant-lifetime scenarios passed")
+        try scopeReplacementKeepsOnlyNewestInput()
+        try legacyWorkersRejectScopedAdmission()
+        try wrongScopeCannotPublish()
+        print("AtlasSearchCoordinator: 13 worker, cancellation, publication, scope and grant-lifetime scenarios passed")
     }
     static func workRunsOffMainAndCompletesOnMain() throws {
         let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
@@ -230,6 +233,71 @@ private final class Lease {}
             else { preconditionFailure("worker cancellation published a source result") }
         }
         pump { done }
+    }
+
+    static func scopeReplacementKeepsOnlyNewestInput() throws {
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), trace = Trace()
+        let rust = try AtlasFileScope.rust.searchScope(), python = try AtlasFileScope.python.searchScope()
+        let coordinator = AtlasSearchCoordinator(scopedWork: { input, flag, _, publish in
+            let key = input.fileScope.extensions ?? "all"
+            trace.enter(key, flag); defer { trace.leave() }
+            if input.fileScope == rust { entered.signal(); wait(release) }
+            var answer = report(key); answer.fileScope = input.fileScope
+            var provisional = answer
+            provisional.progress = AtlasSearchProgress(isRunning: true, examinedFiles: 0, cataloguedFiles: 1)
+            publish(provisional)
+            return answer
+        })
+        var delivered: [AtlasSearchFileScope] = [], finished = false
+        let first = try coordinator.submitScoped(input: AtlasSearchInput(root: "/project", query: "same", fileScope: rust)) {
+            delivered.append(success($0).fileScope)
+        }
+        wait(entered)
+        let second = try coordinator.submitScoped(input: AtlasSearchInput(root: "/project", query: "same", fileScope: python)) {
+            let result = success($0)
+            delivered.append(result.fileScope)
+            finished = !result.isInProgress
+        }
+        precondition(second > first && trace.snapshot.1[0].isCanceled, "Scope change did not retire prior query generation")
+        release.signal(); pump { finished }
+        precondition(delivered.allSatisfy { $0 == python }, "Prior scope repainted new results")
+        precondition(trace.snapshot.0 == ["rs", "py,pyi,pyw"] && trace.snapshot.2 == 1, "Scope changed after request admission")
+    }
+
+    static func legacyWorkersRejectScopedAdmission() throws {
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), trace = Trace()
+        let coordinator = AtlasSearchCoordinator { _, query, flag in
+            trace.enter(query, flag); defer { trace.leave() }
+            entered.signal(); wait(release); return report(query)
+        }
+        var completed = false
+        try coordinator.submit(root: "/project", query: "valid") { _ in completed = true }
+        wait(entered)
+        let input = try AtlasSearchInput(root: "/project", query: "valid", fileScope: AtlasFileScope.rust.searchScope())
+        do {
+            try coordinator.submitScoped(input: input) { _ in preconditionFailure("Scope silently widened") }
+            preconditionFailure("Legacy worker admitted a scoped request")
+        } catch AtlasSearchError.invalidScope {}
+        precondition(!trace.snapshot.1[0].isCanceled, "Rejected scope canceled an accepted request")
+        release.signal(); pump { completed }
+    }
+
+    static func wrongScopeCannotPublish() throws {
+        let coordinator = AtlasSearchCoordinator(scopedWork: { _, _, _, publish in
+            var wrong = report("wrong")
+            wrong.progress = AtlasSearchProgress(isRunning: true, examinedFiles: 1, cataloguedFiles: 1)
+            publish(wrong)
+            return report("wrong")
+        })
+        var failed = false, delivered = false
+        try coordinator.submitScoped(input: AtlasSearchInput(root: "/project", query: "x", fileScope: AtlasFileScope.rust.searchScope())) {
+            switch $0 {
+            case .failure(.invalidResponse): failed = true
+            case .success: delivered = true
+            default: preconditionFailure("Wrong error for mismatched scope")
+            }
+        }
+        pump { failed }; precondition(!delivered, "Mismatched scope progress became visible")
     }
 
 }

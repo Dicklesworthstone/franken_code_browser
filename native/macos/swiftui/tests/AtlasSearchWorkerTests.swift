@@ -71,6 +71,34 @@ private func freeLegacySearch(_ text: UnsafeMutablePointer<CChar>?)
                 preconditionFailure("invalid C-string input accepted")
             } catch AtlasSearchError.invalidRequest {}
         }
-        print("AtlasSearchWorker: production off-main search, UTF-16, exact captures, negatives and cancellation checks passed")
+        // A post-filter over a capped all-files result loses the allowed file.
+        // This independent control demonstrates that the fixture detects that
+        // exact defect before exercising the production scoped request route.
+        try Data(String(repeating: "scope-needle\n", count: 1001).utf8)
+            .write(to: root.appendingPathComponent("a_excluded.txt"))
+        try Data("scope-needle\n".utf8).write(to: root.appendingPathComponent("z_included.rs"))
+        let scopedCoordinator = AtlasSearchCoordinator(scopedWork: AtlasNativeSearch.runScoped)
+        var broad: AtlasSearchReport?
+        try scopedCoordinator.submitScoped(input: AtlasSearchInput(root: root.path, query: "scope-needle")) {
+            if let result = try? $0.get(), !result.isInProgress { broad = result }
+        }
+        pump { broad != nil }
+        precondition(broad!.truncated && broad!.hits.count == 1000
+            && broad!.hits.allSatisfy { $0.path == "a_excluded.txt" }, "Control no longer exercises capped excluded results")
+        let scope = try AtlasFileScope.rust.searchScope()
+        var selected: AtlasSearchReport?
+        try scopedCoordinator.submitScoped(input: AtlasSearchInput(root: root.path, query: "scope-needle", fileScope: scope)) {
+            do {
+                let result = try $0.get()
+                if !result.isInProgress { selected = result }
+            } catch { preconditionFailure("Scoped search failed: \(error)") }
+        }
+        pump { selected != nil }
+        precondition(selected!.complete && !selected!.truncated && selected!.hits.count == 1
+            && selected!.hits[0].path == "z_included.rs" && selected!.matchesSeen == 1,
+            "Scope must precede candidate, byte and hit limits")
+        precondition(selected!.progress?.cataloguedFiles == 2 && selected!.excludedFiles == 2,
+            "Scoped coverage denominator included excluded files")
+        print("AtlasSearchWorker: production off-main search, UTF-16, exact captures, scoped limits, negatives and cancellation checks passed")
     }
 }

@@ -3,7 +3,7 @@
 //! Progressive exact verification over immutable prepared source universes.
 //! Borrowed and independently movable queries share the same execution state
 //! machine. A step admits bounded documents, not a fixed-duration UI callback.
-//! No filesystem calls, runtime, or repository-sized candidate list is created.
+//! No filesystem calls, runtime, or per-step candidate-universe allocation occurs.
 
 use std::{borrow::Cow, mem::size_of, sync::Arc};
 use fcb_core::{ByteLength, FileId, QueryGeneration, ResourceAllocationId, ResourceBudget, ResourceLease};
@@ -95,6 +95,9 @@ impl QuerySource for EphemeralIndex<'_> {
 /// source universe by public code; the wrappers enforce borrow or instance pins.
 struct Execution<'source> {
     options: QueryOptions,
+    /// Optional admission-time projection of captured ordinals. Scope exclusion
+    /// precedes gram selection, verification work, occurrence and byte quotas.
+    selected_documents: Option<Vec<usize>>,
     next_document: usize,
     hit_capacity: usize,
     text_capacity_per_hit: usize,
@@ -102,14 +105,16 @@ struct Execution<'source> {
 }
 impl<'source> Execution<'source> {
     fn new(index: &impl QuerySource, query: &ParsedQuery, options: QueryOptions,
-        unavailable: Cow<'source, [FileId]>, budget: &ResourceBudget,
+        unavailable: Cow<'source, [FileId]>, selected_documents: Option<Vec<usize>>, budget: &ResourceBudget,
         allocation: ResourceAllocationId, mut canceled: impl FnMut() -> bool)
         -> Result<Self, IndexError> {
         if options.generation.owner() != index.id().owner() { return Err(IndexError::OwnerMismatch); }
         ReferenceScanOracle::scan_collection(&[], query, &options)?;
+        let document_count = selected_documents.as_ref().map_or(index.count(), Vec::len);
         let mut hit_capacity = 0usize;
-        for ordinal in 0..index.count() {
+        for selected in 0..document_count {
             if canceled() { return Err(IndexError::Canceled); }
+            let ordinal = selected_documents.as_ref().map_or(selected, |ordinals| ordinals[selected]);
             let doc = index.document(ordinal);
             hit_capacity = hit_capacity.saturating_add(doc.capture.bytes().len()).min(options.max_matches);
         }
@@ -119,7 +124,7 @@ impl<'source> Execution<'source> {
         let text_capacity_per_hit = crate::normalized::matched_text_capacity(
             &query.primary_needle, options.mode,
         )?;
-        let retained = output_bytes(hit_capacity, index.count(), text_capacity_per_hit)?;
+        let retained = output_bytes(hit_capacity, document_count, text_capacity_per_hit)?;
         let unavailable_bytes = match &unavailable {
             Cow::Owned(ids) => ids.capacity().checked_mul(size_of::<FileId>()).ok_or(IndexError::LimitExceeded)?,
             Cow::Borrowed(_) => 0,
@@ -130,13 +135,13 @@ impl<'source> Execution<'source> {
             .map_err(|_| IndexError::ResourceDenied)?;
         let mut results = SearchResult::empty(SearchCoverage::Exhaustive);
         results.matches.try_reserve_exact(hit_capacity).map_err(|_| IndexError::AllocationFailed)?;
-        results.unsupported_files.try_reserve_exact(index.count()).map_err(|_| IndexError::AllocationFailed)?;
-        if results.matches.capacity() > hit_capacity || results.unsupported_files.capacity() > index.count() {
+        results.unsupported_files.try_reserve_exact(document_count).map_err(|_| IndexError::AllocationFailed)?;
+        if results.matches.capacity() > hit_capacity || results.unsupported_files.capacity() > document_count {
             return Err(IndexError::ResourceDenied);
         }
         if canceled() { return Err(IndexError::Canceled); }
-        let known_files = index.count().checked_add(unavailable.len()).ok_or(IndexError::LimitExceeded)?;
-        Ok(Self { options: options.clone(), next_document: 0, hit_capacity, text_capacity_per_hit,
+        let known_files = document_count.checked_add(unavailable.len()).ok_or(IndexError::LimitExceeded)?;
+        Ok(Self { options: options.clone(), selected_documents, next_document: 0, hit_capacity, text_capacity_per_hit,
             report: IndexedSearchReport { manifest: index.id(), generation: options.generation,
                 membership: index.membership(), unavailable, known_files, examined_files: 0,
                 skipped_by_index: 0, excluded_by_path: 0, scan_attempts: 0, fallback_attempts: 0,
@@ -148,15 +153,20 @@ impl<'source> Execution<'source> {
             self.report.results.coverage = SearchCoverage::CanceledEarly;
         }
     }
+    fn document_count(&self, index: &impl QuerySource) -> usize {
+        self.selected_documents.as_ref().map_or(index.count(), Vec::len)
+    }
     fn step(&mut self, index: &impl QuerySource, query: &ParsedQuery, document_budget: usize,
         active_generation: QueryGeneration, mut canceled: impl FnMut() -> bool) -> Result<(), IndexError> {
         if active_generation != self.options.generation { self.cancel(); return Err(IndexError::StaleQuery); }
         if canceled() { self.cancel(); }
         if self.report.is_terminal() || document_budget == 0 { return Ok(()); }
-        let end = self.next_document.saturating_add(document_budget.min(MAX_QUERY_STEP_DOCUMENTS)).min(index.count());
+        let document_count = self.document_count(index);
+        let end = self.next_document.saturating_add(document_budget.min(MAX_QUERY_STEP_DOCUMENTS)).min(document_count);
         while self.next_document < end {
             if canceled() { self.cancel(); break; }
-            let ordinal = self.next_document;
+            let ordinal = self.selected_documents.as_ref()
+                .map_or(self.next_document, |ordinals| ordinals[self.next_document]);
             // A panic during a child verifier must not leave a partially consumed
             // candidate resumable. Ordinary success explicitly restores Running.
             self.report.state = IndexedQueryState::Failed;
@@ -171,7 +181,7 @@ impl<'source> Execution<'source> {
             if self.report.is_terminal() { break; }
         }
         if canceled() { self.cancel(); }
-        if self.report.state == IndexedQueryState::Running && self.next_document == index.count() {
+        if self.report.state == IndexedQueryState::Running && self.next_document == document_count {
             self.report.state = IndexedQueryState::Finished;
         }
         Ok(())
@@ -202,7 +212,7 @@ impl<'source> Execution<'source> {
         let take = remaining.min(child.matches.len());
         if take > self.hit_capacity.saturating_sub(retained)
             || child.matches.iter().take(take).any(|hit| hit.matched_text.capacity() > self.text_capacity_per_hit)
-            || child.unsupported_files.len() > index.count().saturating_sub(self.report.results.unsupported_files.len()) {
+            || child.unsupported_files.len() > self.document_count(index).saturating_sub(self.report.results.unsupported_files.len()) {
             return Err(IndexError::ResourceDenied);
         }
         self.report.results.scanned_bytes = scanned;
@@ -233,7 +243,7 @@ impl<'index, 'source, 'query> IndexedQuery<'index, 'source, 'query> {
         options: QueryOptions, budget: &ResourceBudget, allocation: ResourceAllocationId)
         -> Result<Self, IndexError> {
         let execution = Execution::new(index, query, options, Cow::Borrowed(index.manifest().unavailable()),
-            budget, allocation, || false)?;
+            None, budget, allocation, || false)?;
         Ok(Self { index, query, execution })
     }
     pub fn report(&self) -> &IndexedSearchReport<'source> { &self.execution.report }
@@ -270,14 +280,35 @@ impl OwnedIndexedQuery {
     /// determines retention admission. No source scan occurs during admission.
     pub fn new(index: &OwnedEphemeralIndex, query: ParsedQuery, options: QueryOptions,
         budget: &ResourceBudget, allocations: [ResourceAllocationId; 2],
-        mut canceled: impl FnMut() -> bool) -> Result<Self, IndexError> {
+        canceled: impl FnMut() -> bool) -> Result<Self, IndexError> {
+        Self::new_filtered(index, query, options, None, budget, allocations, canceled)
+    }
+
+    /// Freeze explicit file eligibility before candidate or occurrence limits.
+    /// The caller's metadata-only predicate is used during admission and is not
+    /// retained or invoked by steps. Empty selection is a valid zero-source
+    /// query. Captured ordinals and unavailable IDs share the same selection.
+    /// This does not discover or admit files missing from the supplied index;
+    /// its original membership state remains authoritative for completeness.
+    pub fn new_scoped(index: &OwnedEphemeralIndex, query: ParsedQuery, options: QueryOptions,
+        mut includes_file: impl FnMut(FileId) -> bool, budget: &ResourceBudget,
+        allocations: [ResourceAllocationId; 2], canceled: impl FnMut() -> bool) -> Result<Self, IndexError> {
+        Self::new_filtered(index, query, options, Some(&mut includes_file), budget, allocations, canceled)
+    }
+
+    fn new_filtered(index: &OwnedEphemeralIndex, query: ParsedQuery, options: QueryOptions,
+        mut includes_file: Option<&mut dyn FnMut(FileId) -> bool>, budget: &ResourceBudget,
+        allocations: [ResourceAllocationId; 2], mut canceled: impl FnMut() -> bool) -> Result<Self, IndexError> {
         if allocations[0] == allocations[1] { return Err(IndexError::InvalidManifest); }
         if canceled() { return Err(IndexError::Canceled); }
         if options.generation.owner() != index.id().owner() { return Err(IndexError::OwnerMismatch); }
         ReferenceScanOracle::scan_collection(&[], &query, &options)?;
         let ast = query_bytes(&query)?;
         if ast > MAX_OWNED_QUERY_BYTES { return Err(IndexError::LimitExceeded); }
+        let selection_capacity = if includes_file.is_some() { index.count() } else { 0 };
+        let selection_bytes = selection_capacity.checked_mul(size_of::<usize>()).ok_or(IndexError::LimitExceeded)?;
         let bytes = index.unavailable_files().len().checked_mul(size_of::<FileId>())
+            .and_then(|n| n.checked_add(selection_bytes))
             .and_then(|n| n.checked_add(ast + size_of::<Self>() + 64)).ok_or(IndexError::LimitExceeded)?;
         let lease = budget.try_reserve_managed(index.id().owner(), allocations[0], ByteLength::new(bytes as u64))
             .map_err(|_| IndexError::ResourceDenied)?;
@@ -286,9 +317,19 @@ impl OwnedIndexedQuery {
         if unavailable.capacity() > index.unavailable_files().len() { return Err(IndexError::ResourceDenied); }
         for &file in index.unavailable_files() {
             if canceled() { return Err(IndexError::Canceled); }
-            unavailable.push(file);
+            if includes_file.as_mut().is_none_or(|include| include(file)) { unavailable.push(file); }
         }
-        let execution = Execution::new(index, &query, options, Cow::Owned(unavailable), budget,
+        let selected_documents = if let Some(include) = includes_file {
+            let mut ordinals = Vec::new();
+            ordinals.try_reserve_exact(selection_capacity).map_err(|_| IndexError::AllocationFailed)?;
+            if ordinals.capacity() > selection_capacity { return Err(IndexError::ResourceDenied); }
+            for ordinal in 0..index.count() {
+                if canceled() { return Err(IndexError::Canceled); }
+                if include(index.document(ordinal).file_id) { ordinals.push(ordinal); }
+            }
+            Some(ordinals)
+        } else { None };
+        let execution = Execution::new(index, &query, options, Cow::Owned(unavailable), selected_documents, budget,
             allocations[1], &mut canceled)?;
         Ok(Self { identity: Arc::clone(index.query_identity()), query, execution, _query_lease: lease })
     }

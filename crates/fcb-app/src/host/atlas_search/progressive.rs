@@ -31,6 +31,8 @@ pub struct AtlasSearchProgress {
     pub stop_reason: Option<AtlasSearchStop>,
     pub complete: bool,
     pub truncated: bool,
+    pub eligible_files: usize,
+    pub excluded_files: usize,
     pub examined_files: usize,
     pub scanned_files: usize,
     pub unavailable_files: usize,
@@ -73,6 +75,7 @@ impl RetainedAtlasSearch {
         let q = self.snapshot(generation)?;
         Ok(AtlasSearchProgress { generation: q.generation, stop_reason: q.stop_reason,
             complete: q.complete, truncated: q.truncated, examined_files: q.examined,
+            eligible_files: q.eligible_files, excluded_files: atlas.atlas().file_count() - q.eligible_files,
             scanned_files: q.scanned, unavailable_files: q.unavailable, pending_files: q.pending,
             retained_hits: q.hits.len(), matches_seen: q.matches_seen, retained_source_bytes: q.retained_bytes,
             source_bytes_read: q.source_bytes_read, read_calls: q.read_calls,
@@ -84,9 +87,17 @@ impl RetainedAtlasSearch {
     pub fn cancel_pending(&mut self) -> bool { self.pending.take().is_some() }
 
     pub fn begin(&mut self, atlas: &AtlasSession, generation: u64, needle: &str,
-        options: AtlasSearchOptions, mut canceled: impl FnMut() -> bool)
+        options: AtlasSearchOptions, canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
-        let work = self.prepare_work(atlas, generation, needle, options, &mut canceled)?;
+        self.begin_scoped(atlas, generation, needle, AtlasSearchScope::all(), options, canceled)
+    }
+
+    /// Admit only selected catalog members, independently of display filtering.
+    /// Explicit empty scope is valid and finishes on its first zero-I/O step.
+    pub fn begin_scoped(&mut self, atlas: &AtlasSession, generation: u64, needle: &str,
+        scope: AtlasSearchScope, options: AtlasSearchOptions, mut canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AtlasSearchError> {
+        let work = self.prepare_work(atlas, generation, needle, scope, options, &mut canceled)?;
         let response = self.work_response(atlas, &work, "begin", &mut canceled)?;
         self.pending = Some(work);
         Ok(response)
@@ -115,7 +126,7 @@ impl RetainedAtlasSearch {
     }
 
     pub(super) fn prepare_work(&mut self, atlas: &AtlasSession, generation: u64,
-        needle: &str, options: AtlasSearchOptions, canceled: &mut impl FnMut() -> bool)
+        needle: &str, scope: AtlasSearchScope, options: AtlasSearchOptions, canceled: &mut impl FnMut() -> bool)
         -> Result<SearchWork, AtlasSearchError> {
         self.validate(atlas)?; self.attempt(generation)?;
         options.validate()?;
@@ -123,16 +134,22 @@ impl RetainedAtlasSearch {
             return Err(AtlasSearchError::InvalidLimits);
         }
         check(canceled)?;
+        let eligible_files = scope.eligible_count(atlas, canceled)?;
+        let scope_bytes = if scope.is_all() { 0 } else {
+            eligible_files.checked_mul(size_of::<FileId>()).ok_or(AppError::Admission)?
+        };
         let [state_id, pattern_id, scan_id] = [self.next_id()?, self.next_id()?, self.next_id()?];
         let capacity = options.max_matches.min(options.max_files);
         let charge = 2 * options.max_source_bytes + capacity * (size_of::<RetainedFile>() + 64)
             + options.max_matches * size_of::<AtlasSearchHit>()
             + MAX_DIAGNOSTICS * size_of::<Unavailable>() + needle.len() + size_of::<SearchWork>();
+        let charge = charge.checked_add(scope_bytes).ok_or(AppError::Admission)?;
         let lease = self.budget.try_reserve_managed(self.manifest.owner(), state_id, ByteLength::new(charge as u64))
             .map_err(|_| AppError::Admission)?;
         let snapshot = Snapshot { generation, needle: copy_text(needle)?, files: reserve(capacity)?,
+            scope, scope_files: scope.freeze(atlas, eligible_files, canceled)?, eligible_files,
             hits: reserve(options.max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?,
-            examined: 0, scanned: 0, unavailable: 0, pending: atlas.atlas().catalog().entries().len(),
+            examined: 0, scanned: 0, unavailable: 0, pending: eligible_files,
             matches_seen: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0,
             truncated: false, complete: false, stop_reason: None, step_count: 0,
             last_step_files: 0, last_step_bytes: 0, last_step_calls: 0, index_usage: None, _lease: lease };
@@ -176,9 +193,11 @@ impl RetainedAtlasSearch {
     fn scan_one_file(&self, atlas: &AtlasSession, candidate: &mut Snapshot, work: &mut LiveWork,
         canceled: &mut impl FnMut() -> bool) -> Result<(), AtlasSearchError> {
         let catalog = atlas.atlas().catalog();
-        let ordinal = candidate.examined;
-        let entry = catalog.entries().get(ordinal).ok_or(AtlasSearchError::WrongAtlas)?;
-        let file = catalog.file_id(ordinal).ok_or(AtlasSearchError::WrongAtlas)?;
+        let file = match &candidate.scope_files {
+            Some(files) => files.get(candidate.examined).copied(),
+            None => catalog.file_id(candidate.examined),
+        }.ok_or(AtlasSearchError::WrongAtlas)?;
+        let entry = catalog.entry(file).ok_or(AtlasSearchError::WrongAtlas)?;
         candidate.examined += 1;
         if entry.observed_bytes() > work.options.max_file_bytes as u64 {
             candidate.unavailable(file, "FILE_BYTE_LIMIT"); return Ok(());
@@ -235,7 +254,7 @@ impl RetainedAtlasSearch {
     }
 }
 fn update_coverage(atlas: &AtlasSession, q: &mut Snapshot, work: &LiveWork) {
-    q.pending = atlas.atlas().catalog().entries().len() - q.examined;
+    q.pending = q.eligible_files - q.examined;
     q.source_bytes_read = work.io.bytes;
     q.read_calls = work.io.calls;
     q.stop_reason = if q.pending == 0 {

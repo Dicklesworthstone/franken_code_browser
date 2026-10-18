@@ -109,6 +109,10 @@ fn c_begin_owns_query_text_but_defers_source_and_finishes_unavailable_coverage()
 fn c_search_signatures_and_header_declarations_agree() {
     let _: unsafe extern "C" fn(u64, u64, *const c_char, u64, u64, u64, u64) -> *mut c_char = fcb_atlas_search;
     let _: unsafe extern "C" fn(u64, u64, *const c_char, u64, u64, u64, u64) -> *mut c_char = fcb_atlas_search_begin;
+    let _: unsafe extern "C" fn(u64, u64, *const c_char, *const c_char, *const c_char, u64, u64, u64, u64)
+        -> *mut c_char = fcb_atlas_search_scoped;
+    let _: unsafe extern "C" fn(u64, u64, *const c_char, *const c_char, *const c_char, u64, u64, u64, u64)
+        -> *mut c_char = fcb_atlas_search_begin_scoped;
     let _: extern "C" fn(u64, u64) -> *mut c_char = fcb_atlas_search_step;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_atlas_search_page;
     let _: extern "C" fn(u64, u64) -> *mut c_char = fcb_atlas_search_overlay;
@@ -117,8 +121,62 @@ fn c_search_signatures_and_header_declarations_agree() {
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_atlas_search_open_reader;
     let header = include_str!("../include/fcb_atlas_search.h");
     for function in ["fcb_atlas_search(", "fcb_atlas_search_begin(", "fcb_atlas_search_step(",
+        "fcb_atlas_search_scoped(", "fcb_atlas_search_begin_scoped(",
         "fcb_atlas_search_page(", "fcb_atlas_search_overlay(", "fcb_atlas_search_clear(",
         "fcb_atlas_search_focus(", "fcb_atlas_search_open_reader("] {
         assert_eq!(header.matches(function).count(), 1, "{function}");
     }
+}
+
+#[test]
+fn c_scoped_live_and_indexed_search_freeze_lists_before_hit_and_source_limits() {
+    use super::index::{fcb_atlas_index_prepare, fcb_atlas_search_indexed_begin_scoped,
+        fcb_atlas_search_indexed_scoped};
+    let _guard = SEARCH_FFI_LOCK.lock().unwrap();
+    let root = std::env::temp_dir().join(format!("fcb-scope-ffi-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a.txt"), b"needle ".repeat(2000)).unwrap();
+    fs::write(root.join("z.rs"), b"needle").unwrap();
+    let root_c = CString::new(root.to_str().unwrap()).unwrap();
+    let needle = CString::new("needle").unwrap();
+    let atlas = fcb_atlas_create(); assert_ne!(atlas, 0);
+    assert!(take(unsafe { fcb_atlas_open(atlas, root_c.as_ptr(), 100) }).contains("\"status\":\"ok\""));
+    let old = take(unsafe { fcb_atlas_search(atlas, 1, needle.as_ptr(), 1, 1, 32768, 65536) });
+    assert!(old.contains("a.txt")); assert!(!old.contains("z.rs"));
+    {
+        let invalid = CString::new(".rs").unwrap();
+        let rejected = take(unsafe { fcb_atlas_search_begin_scoped(atlas, 2, needle.as_ptr(),
+            invalid.as_ptr(), std::ptr::null(), 1, 1, 32768, 65536) });
+        assert!(rejected.contains("INVALID_SCOPE"));
+        let scope = CString::new("RS,rs").unwrap();
+        let begin = take(unsafe { fcb_atlas_search_begin_scoped(atlas, 2, needle.as_ptr(),
+            scope.as_ptr(), std::ptr::null(), 1, 1, 32768, 65536) });
+        assert!(begin.contains("\"scope_extensions\":\"rs\""));
+        assert!(begin.contains("\"source_bytes_read\":\"0\""));
+    }
+    let live = take(fcb_atlas_search_step(atlas, 2));
+    assert!(live.contains("\"search_complete\":true"), "{live}");
+    assert!(live.contains("z.rs")); assert!(!live.contains("a.txt"));
+    assert!(live.contains("\"eligible_files\":\"1\""));
+    assert!(live.contains("\"excluded_files\":\"1\""));
+    assert!(take(fcb_atlas_index_prepare(atlas, 3, 100, 32768, 65536, 65536)).contains("\"capture_complete\":true"));
+    {
+        let scope = CString::new("rs").unwrap();
+        let begin = take(unsafe { fcb_atlas_search_indexed_begin_scoped(atlas, 4, 3,
+            needle.as_ptr(), scope.as_ptr(), std::ptr::null(), 1, 6) });
+        assert!(begin.contains("\"eligible_captured_files\":\"1\""));
+        assert!(begin.contains("\"verification_source_bytes\":\"0\""));
+    }
+    let indexed = take(fcb_atlas_search_step(atlas, 4));
+    assert!(indexed.contains("\"search_complete\":true"), "{indexed}");
+    assert!(indexed.contains("z.rs")); assert!(!indexed.contains("a.txt"));
+    assert!(indexed.contains("\"verification_source_bytes\":\"6\""));
+    let empty = CString::new("").unwrap();
+    let none = take(unsafe { fcb_atlas_search_indexed_scoped(atlas, 5, 3,
+        needle.as_ptr(), empty.as_ptr(), std::ptr::null(), 1, 0) });
+    assert!(none.contains("\"search_complete\":true"));
+    assert!(none.contains("\"eligible_files\":\"0\""));
+    assert!(none.contains("\"retained_hits\":\"0\""));
+    assert_eq!(fcb_atlas_close(atlas), 1);
 }

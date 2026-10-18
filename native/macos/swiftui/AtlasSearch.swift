@@ -14,11 +14,12 @@ struct SearchHit: Identifiable, Hashable, Sendable {
 }
 
 enum AtlasSearchError: Error, Sendable {
-    case unavailable, invalidResponse, canceled, invalidRequest, identityExhausted
+    case unavailable, invalidResponse, canceled, invalidRequest, invalidScope, identityExhausted
     var message: String {
         switch self {
         case .canceled: return "Search canceled. In-flight reads may finish, but their results will not be shown."
         case .invalidRequest: return "Choose a project and enter 1–1024 UTF-8 bytes of search text without NUL characters."
+        case .invalidScope: return "Choose up to 32 file extensions using letters, digits, +, - or _. Separate extensions with commas or spaces."
         case .identityExhausted: return "This search session exhausted its request identities. Reopen the window before searching again."
         case .unavailable: return "Search unavailable. The project could not be read or the search exceeded its limits."
         case .invalidResponse: return "Search response could not be read. Results are unavailable, not an empty match set."
@@ -47,28 +48,34 @@ struct AtlasSearchReport: Sendable {
     /// Optional immutable-source capability; legacy one-shot reports have none.
     var capture: AtlasSearchCapture? = nil
     var indexStatus: AtlasSearchIndexStatus? = nil
+    var fileScope: AtlasSearchFileScope = .all
+    var excludedFiles: Int = 0
     var isInProgress: Bool { progress?.isRunning == true }
 
     var summary: String {
         if indexStatus?.building == true, let progress {
             return "Preparing captured index: \(progress.examinedFiles) of \(progress.cataloguedFiles) catalogued files examined. Query results are not ready yet."
         }
-        return resultSummary + (indexStatus == nil ? "" : " Captured index; Refresh to include file edits.")
+        return resultSummary
+            + (fileScope.isAll ? "" : " \(excludedFiles) catalogued files outside this scope.")
+            + (indexStatus == nil ? "" : " Captured index; Refresh to include file edits.")
     }
     private var resultSummary: String {
         let count = hits.count
         if let progress, progress.isRunning {
-            return "Searching: \(count) exact matches found; \(progress.examinedFiles) of \(progress.cataloguedFiles) catalogued files examined. Results are provisional."
+            let membership = fileScope.isAll ? "catalogued" : "eligible"
+            return "Searching: \(count) exact matches found; \(progress.examinedFiles) of \(progress.cataloguedFiles) \(membership) files examined. Results are provisional."
         }
         if complete {
-            return count == 0 ? "No exact matches in the captured project."
-                : "\(count) exact match\(count == 1 ? "" : "es") in the captured project."
+            let scope = fileScope.isAll ? "captured project" : "selected file types"
+            return count == 0 ? "No exact matches in the \(scope)."
+                : "\(count) exact match\(count == 1 ? "" : "es") in the \(scope)."
         }
         var reasons: [String] = []
         if truncated { reasons.append("result limit reached") }
         if unavailableFiles > 0 { reasons.append("\(unavailableFiles) unavailable files") }
         if unsupportedFiles > 0 { reasons.append("\(unsupportedFiles) unsupported text files") }
-        if reasons.isEmpty { reasons.append("project coverage incomplete") }
+        if reasons.isEmpty { reasons.append(fileScope.isAll ? "project coverage incomplete" : "scope coverage incomplete") }
         return "Partial search: \(count) matches shown; \(reasons.joined(separator: ", ")). More matches may exist."
     }
 
@@ -154,14 +161,92 @@ struct AtlasSearchReport: Sendable {
 struct AtlasSearchInput: Sendable {
     let root: String
     let query: String
+    let fileScope: AtlasSearchFileScope
 
-    init(root: String, query: String) throws {
+    init(root: String, query: String, fileScope: AtlasSearchFileScope = .all) throws {
         guard !root.isEmpty, root.utf8.count <= 16_384, !root.utf8.contains(0),
               !query.isEmpty, query.utf8.count <= 1_024, !query.utf8.contains(0) else {
             throw AtlasSearchError.invalidRequest
         }
         self.root = root
         self.query = query
+        self.fileScope = fileScope
+    }
+}
+
+/// Frozen admission scope shared by live and captured-index queries. These are
+/// bounded ASCII filename keys, never a glob, path grant or Unicode text query.
+/// Empty included lists deliberately select no files; they never mean "all".
+struct AtlasSearchFileScope: Equatable, Sendable {
+    let extensions: String?
+    let filenames: String?
+    static let all = Self(extensions: nil, filenames: nil)
+    var isAll: Bool { extensions == nil && filenames == nil }
+    var wireKind: String { isAll ? "all" : "file-types" }
+
+    private init(extensions: String?, filenames: String?) {
+        self.extensions = extensions; self.filenames = filenames
+    }
+
+    init(extensions: [String], filenames: [String] = []) throws {
+        self.extensions = try Self.canonical(extensions, filenames: false)
+        self.filenames = try Self.canonical(filenames, filenames: true)
+    }
+
+    private static func canonical(_ values: [String], filenames: Bool) throws -> String {
+        guard values.count <= 32 else { throw AtlasSearchError.invalidScope }
+        var keys: [String] = []
+        for value in values {
+            let raw = value.utf8
+            guard !raw.isEmpty, raw.count <= 64 else { throw AtlasSearchError.invalidScope }
+            let lowered = raw.map { (65...90).contains($0) ? $0 + 32 : $0 }
+            guard lowered.allSatisfy({
+                (97...122).contains($0) || (48...57).contains($0)
+                    || $0 == 43 || $0 == 45 || $0 == 95 || (filenames && $0 == 46)
+            }), !filenames || (lowered != [46] && lowered != [46, 46]) else {
+                throw AtlasSearchError.invalidScope
+            }
+            keys.append(String(decoding: lowered, as: UTF8.self))
+        }
+        let joined = Set(keys).sorted().joined(separator: ",")
+        guard joined.utf8.count <= 1024 else { throw AtlasSearchError.invalidScope }
+        return joined
+    }
+
+    /// Both non-null pointers remain borrowed only for the synchronous call.
+    /// A non-null empty pair retains the distinction from the legacy all scope.
+    func withCStrings<Result>(_ body: (UnsafePointer<CChar>?, UnsafePointer<CChar>?) throws -> Result) rethrows -> Result {
+        guard let extensions, let filenames else { return try body(nil, nil) }
+        return try extensions.withCString { ext in
+            try filenames.withCString { names in try body(ext, names) }
+        }
+    }
+
+    /// Validate a returned row against the admitted predicate without treating
+    /// its escaped label or a lossy UTF-8 conversion as a native filename.
+    func admitsRawPath(_ raw: [UInt8]) -> Bool {
+        guard let extensions, let filenames else { return true }
+        guard let last = raw.split(separator: 47).last else { return false }
+        let name = last.map { (65...90).contains($0) ? $0 + 32 : $0 }
+        if filenames.split(separator: ",").contains(where: { $0.utf8.elementsEqual(name) }) { return true }
+        guard let dot = name.lastIndex(of: 46), dot > 0, dot + 1 < name.count else { return false }
+        return extensions.split(separator: ",").contains { $0.utf8.elementsEqual(name[(dot + 1)...]) }
+    }
+
+    /// Legacy all-files envelopes may omit this additive scope metadata. A
+    /// scoped request requires the exact echoed predicate on every page.
+    func eligibleFiles(kind: String?, extensions: String?, filenames: String?,
+                       eligible: String?, excluded: String?, catalogued: Int) throws -> Int {
+        if kind == nil && extensions == nil && filenames == nil && eligible == nil && excluded == nil {
+            guard isAll else { throw AtlasSearchError.invalidResponse }
+            return catalogued
+        }
+        guard kind == wireKind, extensions == (self.extensions ?? ""), filenames == (self.filenames ?? ""),
+              let eligible, let included = UInt64(eligible), String(included) == eligible,
+              let excluded, let omitted = UInt64(excluded), String(omitted) == excluded,
+              included <= UInt64(catalogued), omitted == UInt64(catalogued) - included,
+              !isAll || omitted == 0 else { throw AtlasSearchError.invalidResponse }
+        return Int(included)
     }
 }
 
@@ -306,23 +391,30 @@ struct AtlasSearchPresentation: Sendable {
     }
 }
 
-/// Filename scope over the already captured atlas; no source reads or parsing.
+/// File-type selection shared by atlas membership and search admission.
 enum AtlasFileScope: String, CaseIterable, Identifiable {
     case all = "All files", markdown = "Markdown", python = "Python", rust = "Rust", custom = "Extension…"
     var id: String { rawValue }
-    func includes(_ path: String, custom: String = "") -> Bool {
-        let name = (path as NSString).lastPathComponent.lowercased()
-        let ext = (name as NSString).pathExtension
+    func searchScope(custom: String = "") throws -> AtlasSearchFileScope {
         switch self {
-        case .all: return true
-        case .markdown: return ["md", "markdown", "mdown"].contains(ext)
-        case .python: return ["py", "pyi", "pyw"].contains(ext)
-        case .rust: return ext == "rs" || name == "cargo.toml" || name == "cargo.lock" || name == "rust-toolchain.toml" || name == "rust-toolchain"
+        case .all: return .all
+        case .markdown: return try AtlasSearchFileScope(extensions: ["md", "markdown", "mdown"])
+        case .python: return try AtlasSearchFileScope(extensions: ["py", "pyi", "pyw"])
+        case .rust:
+            return try AtlasSearchFileScope(extensions: ["rs"],
+                filenames: ["cargo.toml", "cargo.lock", "rust-toolchain.toml", "rust-toolchain"])
         case .custom:
-            let allowed = custom.lowercased().split { $0 == "," || $0.isWhitespace }
-                .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: ".")) }.filter { !$0.isEmpty }
-            return allowed.contains(ext)
+            guard custom.utf8.count <= 1024 else { throw AtlasSearchError.invalidScope }
+            let tokens = custom.split { $0 == "," || $0.isWhitespace }
+                .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: ".")) }
+            return try AtlasSearchFileScope(extensions: tokens)
         }
+    }
+    func includes(_ path: String, custom: String = "") -> Bool {
+        // Displayed membership uses the same bounded ASCII predicate as the
+        // engine request. Unicode folding must not admit files search excludes.
+        guard let scope = try? searchScope(custom: custom) else { return false }
+        return scope.admitsRawPath(Array(path.utf8))
     }
 }
 

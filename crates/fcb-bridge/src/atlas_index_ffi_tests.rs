@@ -15,9 +15,14 @@ fn all_five_index_entrypoint_types_and_header_declarations_agree() {
     let _: extern "C" fn(u64, u64) -> *mut c_char = fcb_atlas_index_clear;
     let _: unsafe extern "C" fn(u64, u64, u64, *const c_char, u64, u64) -> *mut c_char = fcb_atlas_search_indexed;
     let _: unsafe extern "C" fn(u64, u64, u64, *const c_char, u64, u64) -> *mut c_char = fcb_atlas_search_indexed_begin;
+    let _: unsafe extern "C" fn(u64, u64, u64, *const c_char, *const c_char, *const c_char, u64, u64)
+        -> *mut c_char = fcb_atlas_search_indexed_scoped;
+    let _: unsafe extern "C" fn(u64, u64, u64, *const c_char, *const c_char, *const c_char, u64, u64)
+        -> *mut c_char = fcb_atlas_search_indexed_begin_scoped;
     let header = include_str!("../include/fcb_atlas_index.h");
     for name in ["fcb_atlas_index_prepare(", "fcb_atlas_index_info(",
-        "fcb_atlas_index_clear(", "fcb_atlas_search_indexed(", "fcb_atlas_search_indexed_begin("] {
+        "fcb_atlas_index_clear(", "fcb_atlas_search_indexed(", "fcb_atlas_search_indexed_begin(",
+        "fcb_atlas_search_indexed_scoped(", "fcb_atlas_search_indexed_begin_scoped("] {
         assert_eq!(header.matches(name).count(), 1, "{name}");
     }
 }

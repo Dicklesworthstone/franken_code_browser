@@ -6,6 +6,7 @@ import Foundation
 @_silgen_name("fixture_count") private func fixtureCount(_ key: UInt32) -> UInt32
 @_silgen_name("fixture_cancel_step") private func cancelStep()
 @_silgen_name("fixture_refuse_create") private func refuseCreate()
+@_silgen_name("fixture_expect_scope") private func expectScope(_ extensions: UnsafePointer<CChar>, _ filenames: UnsafePointer<CChar>)
 @_cdecl("fixture_mark_canceled") public func markCanceled(_ context: UnsafeMutableRawPointer?) {
     guard let context else { preconditionFailure("Missing callback lifetime") }
     Unmanaged<AtlasSearchCancellation>.fromOpaque(context).takeUnretainedValue().cancel()
@@ -64,6 +65,29 @@ private final class Reports: @unchecked Sendable {
         try install(3, page("page", step: 1, total: 70, start: 64))
         try install(2, page("step", step: 2, total: 70, running: false, complete: true), index: 1)
         try install(4, importReply())
+    }
+    private static func scopedPage(_ command: String, scope: AtlasSearchFileScope, step: Int,
+                                   eligible: Int, total: Int = 0, running: Bool = true) -> [String: Any] {
+        var value = page(command, step: step, total: total, running: running, complete: !running)
+        value["search_scope"] = scope.wireKind
+        value["scope_extensions"] = scope.extensions ?? ""
+        value["scope_filenames"] = scope.filenames ?? ""
+        value["eligible_files"] = String(eligible); value["excluded_files"] = String(2 - eligible)
+        value["examined_files"] = String(min(step, eligible)); value["scanned_files"] = String(min(step, eligible))
+        value["pending_files"] = String(max(0, eligible - step))
+        return value
+    }
+    private static func setupScoped(_ scope: AtlasSearchFileScope, eligible: Int = 1) throws {
+        resetFixture()
+        scope.withCStrings { expectScope($0!, $1!) }
+        try install(0, ["status": "ok"])
+        try install(1, scopedPage("begin", scope: scope, step: 0, eligible: eligible))
+        try install(2, scopedPage("step", scope: scope, step: 1, eligible: eligible,
+            total: eligible == 0 ? 0 : 1, running: false))
+    }
+    private static func runScoped(_ scope: AtlasSearchFileScope) throws -> AtlasSearchReport {
+        try AtlasNativeSearch.runScoped(input: AtlasSearchInput(root: "/project", query: "x", fileScope: scope),
+            cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
     }
     // Last-owner retirement is intentionally asynchronous. Fixture counters are
     // atomic; never reset them until the previous session has actually closed.
@@ -214,6 +238,35 @@ private final class Reports: @unchecked Sendable {
         check(raw!.hits[0].captureSHA256 != nil, "Raw-name row retains its source witness")
         check(raw!.capture?.target(raw!.hits[0]) == nil, "Unsupported native path does not acquire a false text-path opener")
         raw = nil; retired()
+        let rustScope = try AtlasFileScope.rust.searchScope()
+        try setupScoped(rustScope)
+        var scoped: AtlasSearchReport? = try runScoped(rustScope)
+        check(scoped!.complete && scoped!.hits.count == 1 && scoped!.fileScope == rustScope, "Scoped native route returns only admitted witnesses")
+        check(scoped!.progress?.cataloguedFiles == 1 && scoped!.excludedFiles == 1, "Progress denominator is eligible files")
+        check(fixtureCount(9) == 1 && fixtureCount(3) == 1, "Scoped C admission receives both canonical lists")
+        scoped = nil; retired()
+        let emptyScope = try AtlasSearchFileScope(extensions: [])
+        try setupScoped(emptyScope, eligible: 0)
+        let empty = try runScoped(emptyScope)
+        check(empty.complete && empty.hits.isEmpty && empty.progress?.examinedFiles == 0
+            && empty.progress?.cataloguedFiles == 0 && empty.excludedFiles == 2, "Explicit empty scope completes without widening")
+        retired()
+        for defect in ["missing", "predicate", "denominator", "excluded-hit"] {
+            try setupScoped(rustScope)
+            if defect == "missing" {
+                try install(1, page("begin", step: 0))
+            } else {
+                var bad = scopedPage("step", scope: rustScope, step: 1, eligible: 1, total: 1, running: false)
+                if defect == "predicate" { bad["scope_extensions"] = "py" }
+                if defect == "denominator" { bad["excluded_files"] = "0" }
+                if defect == "excluded-hit" { bad["hits"] = [hit(1, path: "612e747874")] }
+                try install(2, bad)
+            }
+            do { _ = try runScoped(rustScope); preconditionFailure("Accepted scoped defect: \(defect)") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+            retired()
+            check(fixtureCount(6) == fixtureCount(7), "Scope rejection releases every C allocation")
+        }
         resetFixture()
         print("AtlasNativeSearchTests: \(checks) checks passed")
     }

@@ -8,7 +8,7 @@ use std::{mem::size_of, path::Path, sync::{Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}};
 use fcb_app::host::{HostResponse, atlas_session::{AtlasAction, AtlasScope,
     AtlasSession, AtlasSessionError, AtlasSessionOptions},
-    atlas_search::{AtlasSearchError, AtlasSearchOptions, RetainedAtlasSearch},
+    atlas_search::{AtlasSearchError, AtlasSearchOptions, AtlasSearchScope, RetainedAtlasSearch},
     atlas_paths::{AtlasPathError, RetainedAtlasPaths}};
 use fcb_core::{ArenaOwnerId, ByteLength, Point2D, ResourceAllocationId, ResourceBudget, ResourceLease};
 use super::reader_sessions::{self, ReaderSessions};
@@ -70,6 +70,8 @@ pub(super) enum Command<'a> {
     Children { parent: u32, start: usize, limit: usize },
     Search { generation: u64, needle: &'a str, options: AtlasSearchOptions },
     SearchBegin { generation: u64, needle: &'a str, options: AtlasSearchOptions },
+    SearchScoped { generation: u64, needle: &'a str, scope: &'a AtlasSearchScope, options: AtlasSearchOptions },
+    SearchBeginScoped { generation: u64, needle: &'a str, scope: &'a AtlasSearchScope, options: AtlasSearchOptions },
     SearchStep { generation: u64 },
     SearchPage { generation: u64, start: usize, limit: usize },
     SearchOverlay { generation: u64 },
@@ -181,6 +183,8 @@ impl AtlasSessions {
             Command::Children { parent, start, limit } => session.atlas.children(parent, start, limit, &mut stop).map_err(AccessError::from),
             Command::Search { generation, needle, options } => session.search.search(&session.atlas, generation, needle, options, &mut stop).map_err(AccessError::from),
             Command::SearchBegin { generation, needle, options } => session.search.begin(&session.atlas, generation, needle, options, &mut stop).map_err(AccessError::from),
+            Command::SearchScoped { generation, needle, scope, options } => session.search.search_scoped(&session.atlas, generation, needle, *scope, options, &mut stop).map_err(AccessError::from),
+            Command::SearchBeginScoped { generation, needle, scope, options } => session.search.begin_scoped(&session.atlas, generation, needle, *scope, options, &mut stop).map_err(AccessError::from),
             Command::SearchStep { generation } => session.search.step(&session.atlas, generation, &mut stop).map_err(AccessError::from),
             Command::SearchPage { generation, start, limit } => session.search.page(&session.atlas, generation, start, limit, &mut stop).map_err(AccessError::from),
             Command::SearchOverlay { generation } => session.search.overlay(&session.atlas, generation, &mut stop).map_err(AccessError::from),

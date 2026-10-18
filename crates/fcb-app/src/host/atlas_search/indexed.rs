@@ -72,12 +72,16 @@ pub(super) struct IndexQueryUsage {
     verified: usize,
     fallback: usize,
     scanned_bytes: u64,
+    eligible_captured: usize,
+    capture_unavailable: usize,
 }
 impl IndexQueryUsage {
     pub(super) fn encode(self, out: &mut Output) -> Result<(), AtlasSearchError> {
         out.literal(",\"index_generation\":")?; out.integer(self.generation)?;
         out.literal(",\"capture_manifest\":")?; out.integer(self.manifest)?;
         for (key, value) in [("skipped_by_index", self.skipped as u64),
+            ("eligible_captured_files", self.eligible_captured as u64),
+            ("scoped_capture_unavailable_files", self.capture_unavailable as u64),
             ("verified_files", self.verified as u64), ("fallback_files", self.fallback as u64),
             ("verification_source_bytes", self.scanned_bytes)] {
             out.literal(",")?; out.quoted(key)?; out.literal(":")?; out.integer(value)?;
@@ -113,10 +117,19 @@ impl RetainedAtlasSearch {
     /// Compatibility worker call: finish the SAME one-file cursor used by
     /// begin_indexed/step, publishing only its terminal response.
     pub fn search_indexed(&mut self, atlas: &AtlasSession, generation: u64, index_generation: u64,
-        needle: &str, max_matches: usize, max_scan_bytes: u64, mut canceled: impl FnMut() -> bool)
+        needle: &str, max_matches: usize, max_scan_bytes: u64, canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
+        self.search_indexed_scoped(atlas, generation, index_generation, needle, AtlasSearchScope::all(),
+            max_matches, max_scan_bytes, canceled)
+    }
+
+    /// Query a frozen file selection over the same retained source universe.
+    /// Excluded files never consume gram, verification or occurrence quotas.
+    pub fn search_indexed_scoped(&mut self, atlas: &AtlasSession, generation: u64, index_generation: u64,
+        needle: &str, scope: AtlasSearchScope, max_matches: usize, max_scan_bytes: u64,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         let mut work = self.prepare_indexed_work(atlas, generation, index_generation, needle,
-            max_matches, max_scan_bytes, &mut canceled)?;
+            scope, max_matches, max_scan_bytes, &mut canceled)?;
         while work.snapshot.stop_reason.is_none() { self.advance_work(atlas, &mut work, &mut canceled)?; }
         let response = self.work_response(atlas, &work, "search-indexed", &mut canceled)?;
         self.accepted = Some(work.snapshot);
@@ -128,17 +141,27 @@ impl RetainedAtlasSearch {
     /// Call the ordinary step method to continue. Early pages/overlays/activation
     /// use this generation and exact captures, not live bytes or ranked offsets.
     pub fn begin_indexed(&mut self, atlas: &AtlasSession, generation: u64, index_generation: u64,
-        needle: &str, max_matches: usize, max_scan_bytes: u64, mut canceled: impl FnMut() -> bool)
+        needle: &str, max_matches: usize, max_scan_bytes: u64, canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
+        self.begin_indexed_scoped(atlas, generation, index_generation, needle, AtlasSearchScope::all(),
+            max_matches, max_scan_bytes, canceled)
+    }
+
+    /// Scope is evaluated at admission against the original native-path catalog,
+    /// then retained as file IDs. Changing it starts a new query generation.
+    pub fn begin_indexed_scoped(&mut self, atlas: &AtlasSession, generation: u64, index_generation: u64,
+        needle: &str, scope: AtlasSearchScope, max_matches: usize, max_scan_bytes: u64,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         let work = self.prepare_indexed_work(atlas, generation, index_generation, needle,
-            max_matches, max_scan_bytes, &mut canceled)?;
+            scope, max_matches, max_scan_bytes, &mut canceled)?;
         let response = self.work_response(atlas, &work, "begin-indexed", &mut canceled)?;
         self.pending = Some(work);
         Ok(response)
     }
 
     fn prepare_indexed_work(&mut self, atlas: &AtlasSession, generation: u64, index_generation: u64,
-        needle: &str, max_matches: usize, max_scan_bytes: u64, canceled: &mut impl FnMut() -> bool)
+        needle: &str, scope: AtlasSearchScope, max_matches: usize, max_scan_bytes: u64,
+        canceled: &mut impl FnMut() -> bool)
         -> Result<SearchWork, AtlasSearchError> {
         self.validate(atlas)?; self.attempt(generation)?; check(canceled)?;
         if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES
@@ -148,32 +171,49 @@ impl RetainedAtlasSearch {
         let owner = self.manifest.owner();
         let retained = self.index.as_ref().ok_or(AtlasSearchError::MissingIndex)?;
         if retained.generation != index_generation { return Err(AtlasSearchError::StaleIndex); }
+        let eligible_files = scope.eligible_count(atlas, canceled)?;
+        let scope_bytes = if scope.is_all() { 0 } else {
+            eligible_files.checked_mul(size_of::<FileId>()).ok_or(AppError::Admission)?
+        };
         let capacity = retained.engine.captured_files().min(max_matches);
         let charge = retained.engine.source_bytes() + (2 * 1024 * 1024
             + capacity * (size_of::<RetainedFile>() + 64) + max_matches * size_of::<AtlasSearchHit>()
             + MAX_DIAGNOSTICS * size_of::<Unavailable>() + 3 * needle.len() + size_of::<SearchWork>()) as u64;
+        let charge = charge.checked_add(scope_bytes as u64).ok_or(AppError::Admission)?;
         let lease = self.budget.try_reserve_managed(owner, state_id, ByteLength::new(charge))
             .map_err(|_| AppError::Admission)?;
+        let scope_files = scope.freeze(atlas, eligible_files, canceled)?;
         let parsed = ParsedQuery { primary_needle: copy_text(needle)?, raw_query: copy_text(needle)?,
             is_phrase: true, conjunction_terms: Vec::new(), exclusion_terms: Vec::new(),
             path_filters: Vec::new(), lang_filters: Vec::new() };
         let qgen = QueryGeneration::new(owner, generation).map_err(|_| AtlasSearchError::IdentityExhausted)?;
         let mut options = QueryOptions::new(qgen);
         options.max_matches = max_matches; options.max_bytes_scanned = Some(max_scan_bytes);
-        let query = OwnedIndexedQuery::new(&retained.engine, parsed, options, &self.budget,
-            [ast_id, query_id], || canceled() || atlas.validate_active().is_err())?;
-        let unavailable = retained.engine.unavailable_files().len();
-        let pending = atlas.atlas().file_count().checked_sub(unavailable).ok_or(AtlasSearchError::WrongAtlas)?;
+        let query = if scope.is_all() {
+            OwnedIndexedQuery::new(&retained.engine, parsed, options, &self.budget,
+                [ast_id, query_id], || canceled() || atlas.validate_active().is_err())?
+        } else {
+            OwnedIndexedQuery::new_scoped(&retained.engine, parsed, options,
+                |file| scope::includes_file(&scope_files, file), &self.budget,
+                [ast_id, query_id], || canceled() || atlas.validate_active().is_err())?
+        };
+        let unavailable = query.report().unavailable_files().len();
+        let eligible_captured = query.report().known_files() - unavailable;
+        let pending = eligible_files.checked_sub(unavailable).ok_or(AtlasSearchError::WrongAtlas)?;
         let mut snapshot = Snapshot { generation, needle: copy_text(needle)?, files: reserve(capacity)?,
+            scope, scope_files, eligible_files,
             hits: reserve(max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?, examined: unavailable, scanned: 0,
             unavailable, pending, matches_seen: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0,
             truncated: false, complete: false, stop_reason: None, step_count: 0,
             last_step_files: 0, last_step_bytes: 0, last_step_calls: 0,
             index_usage: Some(IndexQueryUsage { generation: index_generation, manifest: retained.engine.id().revision(),
-                skipped: 0, verified: 0, fallback: 0, scanned_bytes: 0 }), _lease: lease };
+                skipped: 0, verified: 0, fallback: 0, scanned_bytes: 0,
+                eligible_captured, capture_unavailable: unavailable }), _lease: lease };
         for diagnostic in &retained.diagnostics {
             check(canceled)?;
-            snapshot.diagnostics.push(Unavailable { file: diagnostic.file, reason: diagnostic.reason });
+            if scope::includes_file(&snapshot.scope_files, diagnostic.file) {
+                snapshot.diagnostics.push(Unavailable { file: diagnostic.file, reason: diagnostic.reason });
+            }
         }
         self.validate(atlas)?; check(canceled)?;
         Ok(SearchWork { snapshot, execution: SearchExecution::Indexed(IndexedWork {
@@ -195,26 +235,35 @@ impl RetainedAtlasSearch {
         self.validate(atlas)?; check(canceled)?;
         let results = report.capture_results();
         candidate.examined = report.examined_files() + report.unavailable_files().len();
-        candidate.pending = atlas.atlas().file_count().checked_sub(candidate.examined).ok_or(AtlasSearchError::WrongAtlas)?;
+        candidate.pending = candidate.eligible_files.checked_sub(candidate.examined).ok_or(AtlasSearchError::WrongAtlas)?;
         candidate.scanned = report.scan_attempts();
         candidate.matches_seen = results.total_matches_counted as u64;
         candidate.truncated = matches!(results.coverage, SearchCoverage::TruncatedAtLimit { .. });
-        candidate.complete = report.is_complete() && candidate.pending == 0;
         candidate.stop_reason = if report.state() == IndexedQueryState::Running { None } else {
             Some(match results.coverage {
                 SearchCoverage::TruncatedAtLimit { .. } => AtlasSearchStop::MatchLimit,
                 SearchCoverage::BudgetExhausted { .. } => AtlasSearchStop::VerificationByteLimit,
                 SearchCoverage::CanceledEarly => return Err(AtlasSearchError::Canceled),
-                SearchCoverage::Exhaustive => retained.stop,
+                SearchCoverage::Exhaustive => if candidate.pending == 0 {
+                    AtlasSearchStop::AllFilesExamined
+                } else { retained.stop },
             })
         };
         candidate.index_usage = Some(IndexQueryUsage { generation: work.index_generation,
             manifest: report.manifest().revision(), skipped: report.skipped_by_index(),
-            verified: report.scan_attempts(), fallback: report.fallback_attempts(), scanned_bytes: results.scanned_bytes });
+            verified: report.scan_attempts(), fallback: report.fallback_attempts(), scanned_bytes: results.scanned_bytes,
+            eligible_captured: report.known_files() - report.unavailable_files().len(),
+            capture_unavailable: report.unavailable_files().len() });
         for &file in &results.unsupported_files[work.unsupported_seen..] {
             check(canceled)?; candidate.unavailable(file, "UNSUPPORTED_TEXT");
         }
         work.unsupported_seen = results.unsupported_files.len();
+        // A closed original catalog can prove a selected scope exhaustive even
+        // when the retained index omitted only excluded files. Selected files
+        // absent from that index remain pending; unavailable is never exclusion.
+        candidate.complete = report.state() == IndexedQueryState::Finished
+            && matches!(results.coverage, SearchCoverage::Exhaustive)
+            && atlas.atlas().discovery_complete() && candidate.pending == 0 && candidate.unavailable == 0;
         // Only newly verified hits acquire presentation/source pins. Earlier
         // pages are never recopied or renumbered when another file finishes.
         for hit in &results.matches[candidate.hits.len()..] {

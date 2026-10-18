@@ -17,6 +17,9 @@ use progressive::SearchWork;
 mod indexed;
 pub use indexed::{AtlasIndexOptions, AtlasIndexBuildProgress, MAX_ATLAS_INDEX_GRAMS};
 use indexed::{IndexQueryUsage, RetainedIndex, IndexBuildWork};
+mod scope;
+pub use scope::{AtlasSearchScope, MAX_SEARCH_SCOPE_TOKENS, MAX_SEARCH_SCOPE_TOKEN_BYTES,
+    MAX_SEARCH_SCOPE_LIST_BYTES};
 
 use std::{mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, ByteRange, FileId, SourceRevision};
@@ -65,7 +68,7 @@ impl AtlasSearchOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AtlasSearchError {
     App(AppError), Atlas(AtlasSessionError), Reader(ReaderSessionError), Index(IndexError),
-    InvalidLimits, WrongAtlas, StaleQuery, MissingQuery, MissingHit, Canceled,
+    InvalidLimits, InvalidScope, WrongAtlas, StaleQuery, MissingQuery, MissingHit, Canceled,
     IdentityExhausted, MissingIndex, StaleIndex, OutOfScope,
 }
 impl std::fmt::Display for AtlasSearchError {
@@ -75,6 +78,7 @@ impl std::fmt::Display for AtlasSearchError {
             Self::Reader(e) => write!(f, "{e}"), Self::Index(e) => write!(f, "{e}"),
             other => f.write_str(match other {
                 Self::InvalidLimits => "ATLAS_SEARCH_INVALID_LIMITS",
+                Self::InvalidScope => "ATLAS_SEARCH_INVALID_SCOPE",
                 Self::WrongAtlas => "ATLAS_SEARCH_WRONG_ATLAS",
                 Self::StaleQuery => "ATLAS_SEARCH_STALE_QUERY",
                 Self::MissingQuery => "ATLAS_SEARCH_NO_QUERY",
@@ -111,6 +115,9 @@ struct Unavailable { file: FileId, reason: &'static str }
 struct Snapshot {
     generation: u64,
     needle: String,
+    scope: AtlasSearchScope,
+    scope_files: Option<Vec<FileId>>,
+    eligible_files: usize,
     files: Vec<RetainedFile>,
     hits: Vec<AtlasSearchHit>,
     diagnostics: Vec<Unavailable>,
@@ -217,9 +224,17 @@ impl RetainedAtlasSearch {
     /// terminal state without exposing intermediate progress. Use begin/step for
     /// interleaving camera, paging, activation and cancellation between files.
     pub fn search(&mut self, atlas: &AtlasSession, generation: u64, needle: &str,
-        options: AtlasSearchOptions, mut canceled: impl FnMut() -> bool)
+        options: AtlasSearchOptions, canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
-        let mut work = self.prepare_work(atlas, generation, needle, options, &mut canceled)?;
+        self.search_scoped(atlas, generation, needle, AtlasSearchScope::all(), options, canceled)
+    }
+
+    /// Scope is frozen before capture/file/match budgets are consumed. A later
+    /// scope selection requires a fresh query generation, even for the same text.
+    pub fn search_scoped(&mut self, atlas: &AtlasSession, generation: u64, needle: &str,
+        scope: AtlasSearchScope, options: AtlasSearchOptions, mut canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AtlasSearchError> {
+        let mut work = self.prepare_work(atlas, generation, needle, scope, options, &mut canceled)?;
         while work.snapshot.stop_reason.is_none() {
             self.advance_work(atlas, &mut work, &mut canceled)?;
         }
@@ -252,10 +267,11 @@ impl RetainedAtlasSearch {
         let snapshot = self.snapshot(generation)?;
         summary(&mut out, atlas, snapshot)?;
         out.literal(",\"count_basis\":")?;
-        out.quoted(if atlas.scope().is_all() { "retained-hits" } else { "workspace-wide-retained-hits" })?;
+        out.quoted(if !snapshot.scope.is_all() { "query-scope-retained-hits" }
+            else if atlas.scope().is_all() { "retained-hits" } else { "workspace-wide-retained-hits" })?;
         out.literal(",\"files\":[")?;
-        // Displayed files follow the active scope; every count above remains
-        // workspace-wide over the base layout the query was run against.
+        // Displayed files follow the active display filter. Summary counts
+        // describe the independent frozen query scope over the base catalog.
         let mut displayed_files = 0usize;
         for file in snapshot.files.iter() {
             check(&mut canceled)?;
@@ -345,8 +361,8 @@ impl RetainedAtlasSearch {
         out.literal(",\"owner\":")?; out.integer(self.manifest.owner().get())?;
         out.literal(",\"source_manifest\":")?; out.integer(self.manifest.revision())?;
         out.literal(",\"layout_revision\":")?; out.integer(self.layout.get())?;
-        // Queries run workspace-wide against the retained base layout; the
-        // scope label names the display filter applied to encoded result rows.
+        // The legacy scope label names the display filter for encoded rows.
+        // Search summaries separately echo the immutable query admission scope.
         atlas.encode_scope(&mut out).map_err(AtlasSearchError::from)?;
         Ok(out)
     }
@@ -365,6 +381,7 @@ impl RetainedAtlasSearch {
 fn summary(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot) -> Result<(), AtlasSearchError> {
     out.literal(",\"query_generation\":")?; out.integer(snapshot.generation)?;
     out.literal(",\"needle\":")?; out.quoted(&snapshot.needle)?;
+    snapshot.scope.encode(out)?;
     out.literal(",\"search_strategy\":")?;
     out.quoted(if snapshot.index_usage.is_some() { "retained-ephemeral-index" } else { "live-capture-scan" })?;
     if let Some(usage) = snapshot.index_usage { usage.encode(out)?; }
@@ -376,6 +393,8 @@ fn summary(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot) -> Resul
     out.literal(",\"search_complete\":")?; out.boolean(snapshot.complete)?;
     out.literal(",\"truncated\":")?; out.boolean(snapshot.truncated)?;
     for (key, value) in [("catalogued_files", atlas.atlas().file_count() as u64),
+        ("eligible_files", snapshot.eligible_files as u64),
+        ("excluded_files", (atlas.atlas().file_count() - snapshot.eligible_files) as u64),
         ("examined_files", snapshot.examined as u64), ("scanned_files", snapshot.scanned as u64),
         ("unavailable_files", snapshot.unavailable as u64), ("pending_files", snapshot.pending as u64),
         ("matches_seen", snapshot.matches_seen), ("retained_hits", snapshot.hits.len() as u64),
@@ -390,15 +409,17 @@ fn summary(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot) -> Resul
 fn encode_page(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot, start: usize,
     limit: usize, canceled: &mut impl FnMut() -> bool) -> Result<(), AtlasSearchError> {
     summary(out, atlas, snapshot)?;
-    // Displayed rows follow the active scope; hit IDs stay workspace-stable
-    // and every summary count remains workspace-wide. Both passes are
+    // Displayed rows follow the active display scope; hit IDs remain stable
+    // and summary counts describe the frozen query scope. Both passes are
     // metadata-only catalog lookups; no source is read or parsed here.
     let displayed_total = snapshot.hits.iter()
         .filter(|hit| atlas.scope_matches_file(hit.file)).count();
     let window_end = start.saturating_add(limit).min(displayed_total);
     out.literal(",\"displayed_hits\":")?; out.integer(displayed_total as u64)?;
     if !atlas.scope().is_all() {
-        out.literal(",\"row_filter\":\"active-scope\",\"count_basis\":\"workspace-wide-retained-hits\"")?;
+        out.literal(",\"row_filter\":\"active-scope\",\"count_basis\":")?;
+        out.quoted(if snapshot.scope.is_all() { "workspace-wide-retained-hits" }
+            else { "query-scope-retained-hits" })?;
     }
     out.literal(",\"hits\":[")?;
     let mut displayed = 0usize;

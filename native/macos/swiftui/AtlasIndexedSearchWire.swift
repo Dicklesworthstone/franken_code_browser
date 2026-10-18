@@ -78,6 +78,7 @@ struct AtlasIndexedHit: Decodable, Sendable, Equatable {
     let hit: SearchHit
     let file, revision: UInt64
     let pathHex: String
+    let fileNameBytes: [UInt8]
 
     init(from decoder: Decoder) throws {
         let wire = try AtlasIndexWire(from: decoder)
@@ -105,6 +106,7 @@ struct AtlasIndexedHit: Decodable, Sendable, Equatable {
               !raw.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
                   $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46])
               }) else { throw AtlasIndexWire.invalid() }
+        fileNameBytes = Array(raw.split(separator: 47).last!)
         hit = SearchHit(id: Int(ordinal - 1), path: display, sourcePath: String(bytes: raw, encoding: .utf8),
             start: start, end: end, captureSHA256: digest, captureByteLength: bytes)
     }
@@ -122,6 +124,7 @@ struct AtlasIndexedHit: Decodable, Sendable, Equatable {
 }
 
 struct AtlasIndexedQueryState: Equatable {
+    let eligible, captured, captureUnavailable: Int
     let examined, scanned, unavailable, pending, retained, step, skipped, fallback: Int
     let matches, verificationBytes: UInt64
     let running, complete, truncated: Bool
@@ -132,16 +135,32 @@ struct AtlasIndexedQueryPage {
     let hits: [AtlasIndexedHit]
     let next: UInt64?
 
-    init(_ json: String?, basis: AtlasIndexedBasis, generation: UInt64, needle: String, command: String) throws {
+    init(_ json: String?, basis: AtlasIndexedBasis, generation: UInt64, needle: String,
+         scope: AtlasSearchFileScope = .all, command: String) throws {
         let w = try AtlasIndexWire.decode(json)
         try basis.validate(w, command: command)
-        let examined = try w.count("examined_files", upTo: basis.files)
-        let scanned = try w.count("scanned_files", upTo: basis.capturedFiles)
-        let unavailable = try w.count("unavailable_files", upTo: basis.files)
-        let pending = try w.count("pending_files", upTo: basis.files)
+        let kind = try w.optionalText("search_scope")
+        let eligible = try scope.eligibleFiles(kind: kind, extensions: w.optionalText("scope_extensions"),
+            filenames: w.optionalText("scope_filenames"), eligible: w.optionalText("eligible_files"),
+            excluded: w.optionalText("excluded_files"), catalogued: basis.files)
+        let captured, captureUnavailable: Int
+        if kind == nil {
+            captured = basis.capturedFiles; captureUnavailable = basis.unavailable
+        } else {
+            captured = try w.count("eligible_captured_files", upTo: min(basis.capturedFiles, eligible))
+            captureUnavailable = try w.count("scoped_capture_unavailable_files", upTo: min(basis.unavailable, eligible))
+        }
+        guard captured + captureUnavailable <= eligible,
+              !scope.isAll || (captured == basis.capturedFiles && captureUnavailable == basis.unavailable) else {
+            throw AtlasIndexWire.invalid()
+        }
+        let examined = try w.count("examined_files", upTo: eligible)
+        let scanned = try w.count("scanned_files", upTo: captured)
+        let unavailable = try w.count("unavailable_files", upTo: eligible)
+        let pending = try w.count("pending_files", upTo: eligible)
         let retained = try w.count("retained_hits", upTo: 1000)
         let step = try w.count("step_count", upTo: 4097)
-        let skipped = try w.count("skipped_by_index", upTo: basis.capturedFiles)
+        let skipped = try w.count("skipped_by_index", upTo: captured)
         let fallback = try w.count("fallback_files", upTo: scanned)
         let matches = try w.number("matches_seen"), verification = try w.number("verification_source_bytes")
         let running = try w.flag("search_in_progress"), complete = try w.flag("search_complete")
@@ -153,8 +172,9 @@ struct AtlasIndexedQueryPage {
               try w.number("catalogued_files") == UInt64(basis.files),
               try w.number("displayed_hits") == UInt64(retained), try w.number("verified_files") == UInt64(scanned),
               try w.number("source_bytes_read") == 0, try w.number("read_calls") == 0,
-              examined == scanned + skipped + basis.unavailable, pending == basis.files - examined,
-              unavailable >= basis.unavailable, unavailable <= basis.unavailable + scanned,
+              scanned + skipped <= captured,
+              examined == scanned + skipped + captureUnavailable, pending == eligible - examined,
+              unavailable >= captureUnavailable, unavailable <= captureUnavailable + scanned,
               verification <= basis.sourceBytes, matches >= UInt64(retained), running == (stop == nil) else {
             throw AtlasIndexWire.invalid()
         }
@@ -166,8 +186,10 @@ struct AtlasIndexedQueryPage {
                   matches == UInt64(retained) else { throw AtlasIndexWire.invalid() }
         }
         hits = try w.rows("hits", limit: command == "page" ? 128 : 64)
+        guard hits.allSatisfy({ scope.admitsRawPath($0.fileNameBytes) }) else { throw AtlasIndexWire.invalid() }
         next = try w.optionalNumber("next_offset")
-        state = AtlasIndexedQueryState(examined: examined, scanned: scanned, unavailable: unavailable,
+        state = AtlasIndexedQueryState(eligible: eligible, captured: captured, captureUnavailable: captureUnavailable,
+            examined: examined, scanned: scanned, unavailable: unavailable,
             pending: pending, retained: retained, step: step, skipped: skipped, fallback: fallback,
             matches: matches, verificationBytes: verification, running: running, complete: complete,
             truncated: truncated, stop: stop)
@@ -185,13 +207,14 @@ struct AtlasIndexedAccumulator {
     mutating func head(_ page: AtlasIndexedQueryPage, basis: AtlasIndexedBasis) throws {
         let n = page.state
         if let p = state {
-            guard p.running, n.step == p.step + 1, n.examined >= p.examined, n.examined <= p.examined + 1,
+            guard p.running, n.eligible == p.eligible, n.captured == p.captured, n.captureUnavailable == p.captureUnavailable,
+                  n.step == p.step + 1, n.examined >= p.examined, n.examined <= p.examined + 1,
                   n.scanned >= p.scanned, n.skipped >= p.skipped, n.fallback >= p.fallback,
                   n.unavailable >= p.unavailable, n.retained >= p.retained, n.matches >= p.matches,
                   n.verificationBytes >= p.verificationBytes else { throw AtlasIndexWire.invalid() }
         } else {
             guard n.running, n.step == 0, n.retained == 0, n.matches == 0,
-                  n.examined == basis.unavailable, n.scanned == 0, n.skipped == 0,
+                  n.examined == n.captureUnavailable, n.scanned == 0, n.skipped == 0,
                   n.verificationBytes == 0 else { throw AtlasIndexWire.invalid() }
         }
         state = n
@@ -213,7 +236,8 @@ struct AtlasIndexedAccumulator {
                           previous.hit.captureSHA256 == row.hit.captureSHA256,
                           previous.hit.captureByteLength == row.hit.captureByteLength else { throw AtlasIndexWire.invalid() }
                 }
-                let charge = row.pathHex.utf8.count + 2 * row.hit.path.utf8.count + (row.hit.sourcePath?.utf8.count ?? 0) + 512
+                let charge = row.pathHex.utf8.count + row.fileNameBytes.count
+                    + 2 * row.hit.path.utf8.count + (row.hit.sourcePath?.utf8.count ?? 0) + 512
                 guard charge <= 8 * 1024 * 1024 - textBytes else { throw AtlasIndexWire.invalid() }
                 textBytes += charge; byFile[row.file] = row; hits.append(row)
             }

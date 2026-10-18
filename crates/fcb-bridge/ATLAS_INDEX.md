@@ -95,6 +95,26 @@ remain independently owned and must be freed exactly once with fcb_free_string.
 
 ## Scope, limits and verification
 
+The additive `fcb_atlas_search_indexed_begin_scoped` and
+`fcb_atlas_search_indexed_scoped` use the same extension/basename lists as the
+live scoped search API. The original native-path catalog selects file IDs at
+admission, and the owned query cursor retains the selected captured ordinals
+under a resource reservation. Its steps visit only that projection, before gram
+selection, exact verification and hit limits. Scope changes require a new query
+generation; actual index identity and stale-generation checks remain in force.
+The selected IDs and query scope are never rebuilt from live paths during steps.
+
+`eligible_captured_files` counts selected retained documents;
+`scoped_capture_unavailable_files` counts selected failures from index capture.
+Verification can additionally discover unsupported selected text, reflected in
+`unavailable_files`. Original catalog entries absent because index preparation
+hit a quota remain `pending_files` when selected. They cannot become an empty,
+complete result. Conversely, a closed catalog permits a complete selected query
+when every selected entry was captured and exhausted, even if only excluded
+entries exceeded the index build limits. No indexed query silently substitutes a
+fresh live capture. Original workspace counts remain separate from the frozen
+query's `eligible_files` and `excluded_files`.
+
 The catalog stays frozen: rebuilding an index does not discover new filenames.
 Reopen/reconcile the atlas for changed membership. Per-file observations are not
 an atomic filesystem snapshot, Git history or watcher qualification. This is a

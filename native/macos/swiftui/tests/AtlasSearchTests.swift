@@ -97,6 +97,89 @@ import Foundation
         precondition(AtlasFileScope.custom.includes("a.SWIFT", custom: ".md, .SWIFT"))
         precondition(!AtlasFileScope.custom.includes("README", custom: "... ,"))
         precondition(AtlasFileScope.all.includes("README"))
+        let rustScope = try AtlasFileScope.rust.searchScope()
+        check(rustScope.extensions == "rs"
+            && rustScope.filenames == "cargo.lock,cargo.toml,rust-toolchain,rust-toolchain.toml", "Rust scope retains configuration filenames")
+        let customScope = try AtlasFileScope.custom.searchScope(custom: " .MD, rs\t.swift, RS ")
+        check(customScope.extensions == "md,rs,swift" && customScope.filenames == "", "File keys are bounded, sorted, deduplicated ASCII")
+        let emptyScope = try AtlasFileScope.custom.searchScope(custom: " , \t")
+        check(!emptyScope.isAll && emptyScope.extensions == "", "Empty scope does not widen to every file")
+        AtlasSearchFileScope.all.withCStrings { ext, names in
+            check(ext == nil && names == nil, "Legacy all-files pointers remain null")
+        }
+        emptyScope.withCStrings { ext, names in
+            check(ext != nil && names != nil && ext!.pointee == 0 && names!.pointee == 0, "Empty filter crosses C as a non-null empty pair")
+        }
+        rustScope.withCStrings { ext, names in
+            check(String(cString: ext!) == "rs" && String(cString: names!) == rustScope.filenames, "Borrowed C scope matches frozen keys")
+        }
+        let scopedInput = try AtlasSearchInput(root: "/project", query: "needle", fileScope: rustScope)
+        check(scopedInput.fileScope == rustScope && scopedInput.query == "needle", "Scope is part of immutable admitted input")
+        for path in ["src/LIB.RS", "nested/Cargo.toml", "rust-toolchain"] {
+            check(rustScope.admitsRawPath(Array(path.utf8)), "Allowed raw filename admitted")
+        }
+        for path in ["lib.rs.bak", "src/rs/file.py", ".rs", "file.rs.", "Cargo.toml.backup"] {
+            check(!rustScope.admitsRawPath(Array(path.utf8)), "Extension is the final native component suffix")
+        }
+        check(rustScope.admitsRawPath([255, 46, 82, 83]), "Non-UTF8 basename retains its ASCII extension")
+        check(!emptyScope.admitsRawPath(Array("lib.rs".utf8)), "Empty scope excludes real files")
+        let displayCases: [(AtlasFileScope, String, String, Bool)] = [
+            (.all, "", "README", true), (.markdown, "", "docs/README.MD", true),
+            (.markdown, "", ".md", false), (.markdown, "", ".notes.MD", true),
+            (.python, "", "typing.PYI", true), (.python, "", "src/py/file.rs", false),
+            (.rust, "", "nested/CARGO.TOML", true), (.rust, "", "rust-toolchain", true),
+            (.rust, "", "file.rs.", false), (.custom, "k", "file.K", true),
+            (.custom, "k", "file.K", false), (.custom, "md, .SWIFT", "file.SWIFT", true),
+            (.custom, "", "file.swift", false)
+        ]
+        for (selection, custom, path, included) in displayCases {
+            let scope = try selection.searchScope(custom: custom)
+            check(selection.includes(path, custom: custom) == included,
+                  "Displayed file-type membership follows the native filename predicate")
+            check(selection.includes(path, custom: custom) == scope.admitsRawPath(Array(path.utf8)),
+                  "Atlas and query agree on the same raw filename bytes")
+        }
+        for custom in ["K", "k,?", ".", String(repeating: "k", count: 1025),
+                       (0..<33).map { "k\($0)" }.joined(separator: ",")] {
+            check(!AtlasFileScope.custom.includes("file.k", custom: custom),
+                  "Invalid custom scope cannot grant display-only membership")
+        }
+        let thirtyTwo = try AtlasSearchFileScope(extensions: (0..<32).map { "e\($0)" })
+        check(thirtyTwo.extensions?.split(separator: ",").count == 32, "Maximum token count admitted")
+        let longest = try AtlasSearchFileScope(extensions: [String(repeating: "a", count: 64)])
+        check(longest.extensions?.utf8.count == 64, "Maximum token length admitted")
+        for values in [[""], [".rs"], ["a/b"], ["a\\b"], ["rs,py"], ["K"], ["a\0b"],
+                       [String(repeating: "a", count: 65)], (0..<33).map { "e\($0)" },
+                       (0..<16).map { String(repeating: "a", count: 62) + String(format: "%02d", $0) }] {
+            do { _ = try AtlasSearchFileScope(extensions: values); preconditionFailure("Invalid scope admitted") }
+            catch AtlasSearchError.invalidScope { checks += 1 }
+        }
+        for filename in [".", "..", "../Cargo.toml", "space name"] {
+            do { _ = try AtlasSearchFileScope(extensions: [], filenames: [filename]); preconditionFailure("Invalid filename key admitted") }
+            catch AtlasSearchError.invalidScope { checks += 1 }
+        }
+        let eligible = try rustScope.eligibleFiles(kind: "file-types", extensions: "rs", filenames: rustScope.filenames,
+            eligible: "1", excluded: "4095", catalogued: 4096)
+        check(eligible == 1, "Eligible denominator excludes other file types")
+        let legacyEligible = try AtlasSearchFileScope.all.eligibleFiles(kind: nil, extensions: nil,
+            filenames: nil, eligible: nil, excluded: nil, catalogued: 2)
+        check(legacyEligible == 2, "Legacy response remains all files")
+        for (kind, extensions, count, excluded) in [("all", "", "1", "1"), ("file-types", "py", "1", "1"),
+            ("file-types", "rs", "01", "1"), ("file-types", "rs", "3", "0"), ("file-types", "rs", "1", "0")] {
+            do {
+                _ = try rustScope.eligibleFiles(kind: kind, extensions: extensions, filenames: rustScope.filenames,
+                    eligible: count, excluded: excluded, catalogued: 2)
+                preconditionFailure("Foreign or contradictory scope admitted")
+            } catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        do {
+            _ = try rustScope.eligibleFiles(kind: nil, extensions: nil, filenames: nil,
+                eligible: nil, excluded: nil, catalogued: 2)
+            preconditionFailure("Scoped query accepted a legacy all-files envelope")
+        } catch AtlasSearchError.invalidResponse { checks += 1 }
+        let scopedReport = AtlasSearchReport(hits: [], complete: true, truncated: false,
+            unavailableFiles: 0, unsupportedFiles: 0, matchesSeen: 0, fileScope: rustScope, excludedFiles: 4)
+        check(scopedReport.summary.contains("selected file types") && scopedReport.summary.contains("4 catalogued files outside"), "Scoped no-match cannot claim a project-wide negative")
         print("AtlasSearch: \(checks) coverage, path and offset checks passed")
     }
 }

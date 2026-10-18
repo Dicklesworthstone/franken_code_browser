@@ -6,19 +6,29 @@ import Foundation
 @MainActor final class AtlasWorkspaceSearch {
     typealias Work = @Sendable (String, String, AtlasSearchCancellation, AtlasSearchAccessLease,
                                @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport
+    typealias ScopedWork = @Sendable (AtlasSearchInput, AtlasSearchCancellation, AtlasSearchAccessLease,
+                                     @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport
     struct Choice: Sendable {
         fileprivate let revision: UUID
         let indexed: Bool
         let work: Work
+        let scopedWork: ScopedWork
     }
-    private let live: Work
+    private let live: ScopedWork
     private let makeIndex: @MainActor () -> AtlasIndexedSearch
     private var index: AtlasIndexedSearch?
     private var indexed = false
     private var revision = UUID()
 
     init(live: @escaping Work, makeIndex: @escaping @MainActor () -> AtlasIndexedSearch) {
-        self.live = live
+        self.live = { input, flag, access, publish in
+            guard input.fileScope.isAll else { throw AtlasSearchError.invalidScope }
+            return try live(input.root, input.query, flag, access, publish)
+        }
+        self.makeIndex = makeIndex
+    }
+    init(scopedLive: @escaping ScopedWork, makeIndex: @escaping @MainActor () -> AtlasIndexedSearch) {
+        self.live = scopedLive
         self.makeIndex = makeIndex
     }
 
@@ -38,13 +48,16 @@ import Foundation
     /// already admitted query midway through capture or verification.
     func selection(indexed: Bool) -> Choice {
         configure(indexed: indexed)
-        let work: Work
+        let scopedWork: ScopedWork
         if indexed {
             let worker = index ?? makeIndex()
             index = worker
-            work = worker.run
-        } else { work = live }
-        return Choice(revision: revision, indexed: indexed, work: work)
+            scopedWork = worker.runScoped
+        } else { scopedWork = live }
+        let work: Work = { root, query, flag, access, publish in
+            try scopedWork(AtlasSearchInput(root: root, query: query), flag, access, publish)
+        }
+        return Choice(revision: revision, indexed: indexed, work: work, scopedWork: scopedWork)
     }
     func accepts(_ choice: Choice) -> Bool {
         choice.revision == revision && choice.indexed == indexed

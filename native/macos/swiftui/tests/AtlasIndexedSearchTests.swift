@@ -13,6 +13,11 @@ import Dispatch
                                       reports: IndexReports = IndexReports()) throws -> AtlasSearchReport {
         try worker.run(root: root, query: query, cancellation: flag, access: AtlasSearchAccessLease(access), progress: reports.offer)
     }
+    @MainActor private static func scoped(_ worker: AtlasIndexedSearch, scope: AtlasSearchFileScope,
+                                         flag: AtlasSearchCancellation = AtlasSearchCancellation()) throws -> AtlasSearchReport {
+        try worker.runScoped(input: AtlasSearchInput(root: "/repo", query: "x", fileScope: scope),
+            cancellation: flag, access: AtlasSearchAccessLease(nil), progress: { _ in })
+    }
     @MainActor private static func wait(_ condition: () -> Bool) {
         let deadline = Date().addingTimeInterval(5)
         while !condition() && Date() < deadline { Thread.sleep(forTimeInterval: 0.001) }
@@ -207,6 +212,87 @@ import Dispatch
             }
             do { _ = try run(w); preconditionFailure("Changed repeated source witness accepted") }
             catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        let rustScope = try AtlasFileScope.rust.searchScope()
+        do {
+            let f = IndexedFixture()
+            f.configure { c in c.scopedEligible = 1; c.scopedCaptured = 1; c.scopedUnavailable = 0 }
+            let w = AtlasIndexedSearch(transport: f.transport)
+            let first = try scoped(w, scope: rustScope)
+            check(first.complete && first.fileScope == rustScope && first.hits.count == 2, "Indexed query admits its frozen file scope")
+            check(first.progress?.cataloguedFiles == 1 && first.excludedFiles == 1, "Indexed progress uses eligible membership")
+            let onlyRS = try AtlasSearchFileScope(extensions: ["rs"])
+            let second = try scoped(w, scope: onlyRS)
+            check(second.fileScope == onlyRS && second.streamID != first.streamID && second.indexStatus?.reused == true,
+                "Scope change creates a query generation without changing captured bytes")
+            check(f.count("create:") == 1 && f.count("build-step:") == 2 && f.count("query-step:") == 2,
+                "Scope changes do not rebuild the index or silently fall back to live discovery")
+            let all = try run(w)
+            check(all.fileScope.isAll && all.progress?.cataloguedFiles == 2 && all.indexStatus?.reused == true,
+                "Widening a scope recomputes candidates against the same index")
+            let selected = first.capture!.target(first.hits[0])!
+            _ = try selected.openReader(100)
+            check(f.count("source:") == 1, "Scope replacement leaves selected old capture usable")
+        }
+        for mode in 0..<3 {
+            let f = IndexedFixture()
+            f.configure { c in
+                c.files = 3; c.scopedCaptured = 1
+                if mode == 0 { c.unavailable = 1; c.scopedEligible = 1; c.scopedUnavailable = 0 }
+                if mode == 1 { c.unavailable = 1; c.scopedEligible = 2; c.scopedUnavailable = 1 }
+                if mode == 2 { c.pending = 1; c.scopedEligible = 2; c.scopedUnavailable = 0 }
+            }
+            let w = AtlasIndexedSearch(transport: f.transport), r = try scoped(w, scope: rustScope)
+            if mode == 0 {
+                check(r.complete && r.unavailableFiles == 0 && r.excludedFiles == 2, "Failures outside requested scope do not falsify selected completeness")
+            } else {
+                check(!r.complete && r.progress?.cataloguedFiles == 2, "Uncaptured or unavailable selected files remain explicit partial coverage")
+            }
+        }
+        do {
+            let f = IndexedFixture()
+            f.configure { c in c.scopedEligible = 0; c.scopedCaptured = 0; c.scopedUnavailable = 0; c.scopedHitCount = 0 }
+            let w = AtlasIndexedSearch(transport: f.transport)
+            let r = try scoped(w, scope: AtlasSearchFileScope(extensions: []))
+            check(r.complete && r.hits.isEmpty && r.excludedFiles == 2 && r.progress?.cataloguedFiles == 0
+                && r.indexStatus?.verificationBytes == 0, "Empty included scope never verifies or exposes every indexed file")
+        }
+        do {
+            let f = IndexedFixture()
+            var transport = f.transport; transport.scopedQueryBegin = nil
+            let w = AtlasIndexedSearch(transport: transport)
+            do { _ = try scoped(w, scope: rustScope); preconditionFailure("Legacy transport widened scope") }
+            catch AtlasSearchError.invalidScope { checks += 1 }
+            check(f.count("create:") == 0, "Unsupported scope refuses before any source capture")
+            let permitted = try run(w)
+            check(permitted.complete, "Legacy all-files route still succeeds")
+        }
+        for defect in ["search_scope", "scope_extensions", "eligible_files", "excluded_files", "eligible_captured_files", "scoped_capture_unavailable_files", "excluded-hit"] {
+            let f = IndexedFixture()
+            f.configure { c in c.scopedEligible = 1; c.scopedCaptured = 1; c.scopedUnavailable = 0 }
+            f.patch { phase, object in
+                var o = object
+                if phase == "query-step" {
+                    if defect == "search_scope" { o[defect] = "all" }
+                    else if defect == "scope_extensions" { o[defect] = "py" }
+                    else if defect == "excluded-hit" {
+                        var rows = o["hits"] as! [[String: Any]]
+                        rows[0]["path"] = ["encoding": "unix-bytes", "hex": "612e747874", "display": "a.rs"]
+                        o["hits"] = rows
+                    } else { o[defect] = "3" }
+                }
+                return o
+            }
+            let w = AtlasIndexedSearch(transport: f.transport)
+            do { _ = try scoped(w, scope: rustScope); preconditionFailure("Malformed scope accepted: \(defect)") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        do {
+            let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport), flag = AtlasSearchCancellation()
+            flag.cancel()
+            do { _ = try scoped(w, scope: rustScope, flag: flag); preconditionFailure("Canceled scope admitted") }
+            catch AtlasSearchError.canceled { checks += 1 }
+            check(f.count("create:") == 0, "Scoped pre-cancellation performs no capture")
         }
         print("AtlasIndexedSearchTests: \(checks) checks passed")
     }

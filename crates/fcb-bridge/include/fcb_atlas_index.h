@@ -87,6 +87,23 @@ char *fcb_atlas_search_indexed_begin(uint64_t handle, uint64_t generation,
     uint64_t index_generation, const char *needle, uint64_t max_matches,
     uint64_t max_scan_bytes);
 
+/* The same immutable query scope and list contract as search_scoped. Exclusion
+ * happens before gram candidates, exact verification and occurrence quotas.
+ * Reuses the accepted index; never silently rereads live files. Resume the begin
+ * form with search_step. eligible_captured_files and
+ * scoped_capture_unavailable_files describe selected retained membership.
+ * unavailable_files additionally includes unsupported selected verification.
+ * Selected catalog entries missing because of index build limits remain pending.
+ * A closed catalog with every selected file verified can complete even when the
+ * index omitted only excluded files. No scope change broadens the source grant.
+ */
+char *fcb_atlas_search_indexed_scoped(uint64_t handle, uint64_t generation,
+    uint64_t index_generation, const char *needle, const char *extensions,
+    const char *filenames, uint64_t max_matches, uint64_t max_scan_bytes);
+char *fcb_atlas_search_indexed_begin_scoped(uint64_t handle, uint64_t generation,
+    uint64_t index_generation, const char *needle, const char *extensions,
+    const char *filenames, uint64_t max_matches, uint64_t max_scan_bytes);
+
 /* Clear index and builder, not completed result captures or opened readers.
  * Result-clear leaves index/build state intact. Atlas cancellation invalidates
  * provisional query AND build state; accepted state is not rolled back. A late
