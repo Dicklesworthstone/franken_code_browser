@@ -17,20 +17,28 @@ use crate::{AppError, SCHEMA, MANAGED_BYTES, EXIT_OK, EXIT_ERROR, EXIT_PARTIAL, 
 use crate::args::{decimal, MAX_ARGUMENTS, MAX_ARGUMENT_BYTES, MAX_SINGLE_ARGUMENT};
 use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
 
+mod export;
+
 const HELP: &str = "fcb trail add ARCHIVE --member NAME --start N --end N --output NEW_TRAIL [--note TEXT] [--json]\n\
   Append without overwriting: add ... --from EXISTING_TRAIL --output NEW_TRAIL\n\
   Native names: --member-hex HEX instead of --member NAME; optional --title for a new trail.\n\
 fcb trail inspect TRAIL [--limit N] [--json]\n\
 fcb trail read TRAIL --archive ARCHIVE [--item N] [--bytes N] [--lines N] [--raw] [--json]\n\
+fcb trail export TRAIL --archive ARCHIVE --output NEW_PACK [--format json] [--json]\n\
+  Optional: --limit N --max-source-bytes N --max-output-bytes N --max-output-chars N\n\
+  Defaults: 128 entries, 32 MiB member verification, 4 MiB output, 4 Mi Unicode scalars.\n\
+  Exports original selected bytes as lossless hex with provenance and explicit omissions.\n\
+  JSON packs contain selected source and user notes without redaction; only NEW_PACK is written.\n\
 Items are one-based. Ranges are half-open original bytes, never text columns.\n\
 Trails contain user notes and source references, not source payloads or access grants.\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Mode { Help, Add, Inspect, Read }
+enum Mode { Help, Add, Inspect, Read, Export }
 struct Settings {
     mode: Mode, source: Option<PathBuf>, archive: Option<PathBuf>, previous: Option<PathBuf>, output: Option<PathBuf>,
     member: Option<Vec<u8>>, start: Option<u64>, end: Option<u64>, note: String, title: String,
     item: usize, limit: usize, bytes: usize, lines: usize, raw: bool, json: bool,
+    export_source_bytes: u64, export_bytes: usize, export_characters: usize,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Effect { None, Created, Written, Synced }
@@ -53,7 +61,8 @@ impl From<AppError> for Failure { fn from(e: AppError) -> Self { fail(e) } }
 
 fn takes_value(arg: &str) -> bool {
     matches!(arg, "--member" | "--member-hex" | "--start" | "--end" | "--note" | "--title" | "--from"
-        | "--output" | "--archive" | "--item" | "--limit" | "--bytes" | "--lines")
+        | "--output" | "--archive" | "--item" | "--limit" | "--bytes" | "--lines" | "--format"
+        | "--max-source-bytes" | "--max-output-bytes" | "--max-output-chars")
 }
 fn wants_json(args: &[OsString]) -> bool {
     let mut i = 0;
@@ -75,11 +84,14 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
     let mode = match args.first().and_then(|arg| arg.to_str()) {
         None | Some("help" | "--help" | "-h") => Mode::Help,
         Some("add") => Mode::Add, Some("inspect") => Mode::Inspect, Some("read") => Mode::Read,
+        Some("export") => Mode::Export,
         _ => return Err(Failure::new("TRAIL_UNKNOWN_COMMAND")),
     };
     let mut s = Settings { mode, source: None, archive: None, previous: None, output: None, member: None,
         start: None, end: None, note: String::new(), title: "Reading trail".to_owned(),
-        item: 1, limit: 100, bytes: 64 * 1024, lines: 100, raw: false, json: false };
+        item: 1, limit: if mode == Mode::Export { 128 } else { 100 }, bytes: 64 * 1024, lines: 100,
+        raw: false, json: false, export_source_bytes: 32 * 1024 * 1024,
+        export_bytes: 4 * 1024 * 1024, export_characters: 4 * 1024 * 1024 };
     let mut seen = 0u32; let mut positional = false; let mut i = usize::from(!args.is_empty());
     while i < args.len() {
         let arg = &args[i]; i += 1;
@@ -89,7 +101,9 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 "--json" => 1, "--member" | "--member-hex" => 2, "--start" => 4, "--end" => 8,
                 "--note" => 16, "--title" => 32, "--from" => 64, "--output" => 128,
                 "--archive" => 256, "--item" => 512, "--limit" => 1024, "--bytes" => 2048,
-                "--lines" => 4096, "--raw" => 8192, _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")),
+                "--lines" => 4096, "--raw" => 8192, "--format" => 16384,
+                "--max-source-bytes" => 32768, "--max-output-bytes" => 65536,
+                "--max-output-chars" => 131072, _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")),
             };
             if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
             seen |= bit;
@@ -115,6 +129,10 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 if value.len() > 256 { return Err(Failure::new("TRAIL_TITLE_LIMIT")); }
                 s.title = value.to_owned(); continue;
             }
+            if option == "--format" {
+                if value != "json" { return Err(Failure::new("TRAIL_EXPORT_UNSUPPORTED_FORMAT")); }
+                continue;
+            }
             let n = decimal(value).map_err(fail)?;
             match option {
                 "--start" => s.start = Some(n), "--end" => s.end = Some(n),
@@ -122,6 +140,9 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 "--limit" if n <= 1024 => s.limit = n as usize,
                 "--bytes" if (4..=256 * 1024).contains(&n) => s.bytes = n as usize,
                 "--lines" if (1..=4096).contains(&n) => s.lines = n as usize,
+                "--max-source-bytes" if n <= fcb::search::trail::MAX_TRAIL_EXPORT_SOURCE_BYTES => s.export_source_bytes = n,
+                "--max-output-bytes" if (1..=crate::output::MAX_ENCODED_BYTES as u64).contains(&n) => s.export_bytes = n as usize,
+                "--max-output-chars" if (1..=crate::output::MAX_ENCODED_BYTES as u64).contains(&n) => s.export_characters = n as usize,
                 _ => return Err(Failure::new("CLI_ARGUMENT_LIMIT")),
             }
         } else {
@@ -137,6 +158,8 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
         Mode::Inspect => s.source.is_some() && seen & !(1 | 1024) == 0,
         Mode::Read => s.source.is_some() && s.archive.is_some() && seen & !(1 | 256 | 512 | 2048 | 4096 | 8192) == 0
             && !(s.raw && seen & 4096 != 0),
+        Mode::Export => s.source.is_some() && s.archive.is_some() && s.output.is_some()
+            && seen & !(1 | 128 | 256 | 1024 | 16384 | 32768 | 65536 | 131072) == 0,
     };
     if !valid { return Err(Failure::new("CLI_INCOMPATIBLE_OPTIONS")); }
     Ok(s)
@@ -236,6 +259,7 @@ fn execute(s: &Settings, out: &mut Output, budget: &ResourceBudget, effect: &mut
     }
     let loaded = load_trail(source, budget, canceled)?;
     let view = TrailView::open(&loaded.bytes, &mut *canceled)?;
+    if s.mode == Mode::Export { return export::run(s, view, out, budget, effect, canceled); }
     if s.mode == Mode::Inspect {
         if s.json {
             begin(out, "trail-inspect")?; metadata(out, view)?;
@@ -368,6 +392,8 @@ mod tests {
         assert!(!wants_json(&args(&["add", "a", "--member", "--json"])));
         assert!(wants_json(&args(&["add", "a", "--note", "--json", "--json"])));
         assert!(!wants_json(&args(&["inspect", "--", "--json"])));
+        assert!(!wants_json(&args(&["export", "a", "--format", "--json"])));
+        assert!(!wants_json(&args(&["export", "a", "--max-output-bytes", "--json"])));
     }
     #[test]
     fn explicit_ranges_and_destinations_required_and_no_silent_option_ignoring() {
@@ -377,5 +403,11 @@ mod tests {
         assert!(parse(&args(&["read", "a", "--archive", "b", "--item", "0"])).is_err());
         let valid = parse(&args(&["add", "a", "--member-hex", "ff", "--start", "0", "--end", "0", "--output", "new"])).unwrap();
         assert_eq!(valid.member, Some(vec![255]));
+        assert!(parse(&args(&["export", "a", "--archive", "b"])).is_err());
+        assert!(parse(&args(&["export", "a", "--archive", "b", "--output", "new", "--format", "markdown"])).is_err());
+        assert!(parse(&args(&["export", "a", "--archive", "b", "--output", "new", "--item", "1"])).is_err());
+        assert!(parse(&args(&["export", "a", "--archive", "b", "--output", "new", "--max-output-chars", "0"])).is_err());
+        assert!(parse(&args(&["export", "a", "--archive", "b", "--output", "new", "--format", "json", "--format", "json"])).is_err());
+        assert!(parse(&args(&["export", "a", "--archive", "b", "--output", "new", "--max-source-bytes", "0", "--limit", "0"])).is_ok());
     }
 }

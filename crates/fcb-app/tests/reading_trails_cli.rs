@@ -36,6 +36,11 @@ impl Fixture {
         vec!["trail".into(), "read".into(), self.trail().into_os_string(), "--archive".into(), archive.as_os_str().to_owned(), "--json".into()]
     }
     fn inspect(&self) -> Vec<OsString> { vec!["trail".into(), "inspect".into(), self.trail().into_os_string(), "--json".into()] }
+    fn export(&self, archive: &PathBuf, destination: &PathBuf) -> Vec<OsString> {
+        vec!["trail".into(), "export".into(), self.trail().into_os_string(), "--archive".into(),
+            archive.as_os_str().to_owned(), "--output".into(), destination.as_os_str().to_owned(),
+            "--format".into(), "json".into(), "--json".into()]
+    }
 }
 impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
 struct NeverRead;
@@ -177,4 +182,159 @@ fn actual_binary_follows_a_saved_trail_and_rejects_corruption() {
     let rejected = Command::new(env!("CARGO_BIN_EXE_fcb")).args(f.read(&archive)).output().unwrap();
     assert_eq!(rejected.status.code(), Some(EXIT_ERROR as i32));
     assert_eq!(parse(&rejected.stdout).unwrap().get("status").text(), "error");
+}
+
+#[test]
+fn exported_pack_preserves_original_bytes_native_path_and_full_provenance() {
+    let f = Fixture::new();
+    let archive = f.archive("raw.fcbs", &[255, b'.', b'r', b's'], b"\xff\xfea\0\x00\xd8z\0");
+    let mut add = f.add(&archive, 3, 7);
+    add[3] = "--member-hex".into(); add[4] = "ff2e7273".into();
+    add[10] = "用户 note 😀\n\u{001b}[2J".into();
+    let (exit, trail) = invoke(&add, || false); assert_eq!(exit, EXIT_OK);
+    let destination = f.0.join("evidence.json");
+    let (exit, receipt) = invoke(&f.export(&archive, &destination), || false);
+    assert_eq!(exit, EXIT_OK); assert!(receipt.get("complete").flag());
+    assert!(receipt.get("contains_source_payloads").flag()); assert!(!receipt.get("redacted").flag());
+    let bytes = fs::read(&destination).unwrap(); let text = std::str::from_utf8(&bytes).unwrap();
+    assert_eq!(receipt.get("export_bytes").number(), bytes.len() as u64);
+    assert_eq!(receipt.get("export_characters").number(), text.chars().count() as u64);
+    assert!(bytes.len() > text.chars().count(), "counts must distinguish non-ASCII metadata bytes from scalars");
+    let pack = parse(&bytes).unwrap();
+    assert_eq!(pack.get("schema").text(), "fcb.trail-source-pack/1");
+    assert_eq!(pack.get("trail_digest").text(), trail.get("trail_digest").text());
+    assert_eq!(pack.get("source_representation").text(), "original-bytes-lowercase-hex");
+    assert!(!pack.get("live_roots_accessed").flag()); assert!(!pack.get("payload_truncated").flag());
+    let row = &pack.get("entries").array()[0];
+    assert_eq!(row.get("selected_original_hex").text(), "0000d87a");
+    assert_eq!(row.get("readiness").text(), "digest-verified");
+    let selection = row.get("selection");
+    assert_eq!(selection.get("path").get("hex").text(), "ff2e7273");
+    assert_eq!(selection.get("rationale").text(), "用户 note 😀\n\u{001b}[2J");
+    assert_eq!(selection.get("original_range").get("start").number(), 3);
+    assert_eq!(selection.get("original_range").get("end").number(), 7);
+    assert_eq!(selection.get("source_length").number(), 8);
+    assert_eq!(selection.get("archive_digest").text(), pack.get("archive").get("digest").text());
+    assert_eq!(pack.get("coverage").get("source_bytes_read").number(), 8);
+}
+
+#[test]
+fn export_wrong_archive_and_source_limit_produce_visible_partial_evidence() {
+    let f = Fixture::new(); let archive = f.archive("old.fcbs", b"a.rs", b"banana");
+    assert_eq!(invoke(&f.add(&archive, 1, 4), || false).0, EXIT_OK);
+    let changed = f.archive("new.fcbs", b"a.rs", b"edited");
+    let wrong = f.0.join("wrong.json");
+    let (exit, receipt) = invoke(&f.export(&changed, &wrong), || false);
+    assert_eq!(exit, EXIT_PARTIAL); assert!(!receipt.get("complete").flag());
+    let pack = parse(&fs::read(&wrong).unwrap()).unwrap();
+    let row = &pack.get("entries").array()[0];
+    assert_eq!(row.get("reason").text(), "TRAIL_OTHER_ARCHIVE");
+    assert!(matches!(row.get("selected_original_hex"), Json::Null));
+    assert_eq!(pack.get("coverage").get("source_bytes_read").number(), 0);
+    let limited = f.0.join("source-limited.json"); let mut args = f.export(&archive, &limited);
+    args.extend(["--max-source-bytes".into(), "5".into()]);
+    assert_eq!(invoke(&args, || false).0, EXIT_PARTIAL);
+    let pack = parse(&fs::read(&limited).unwrap()).unwrap();
+    assert_eq!(pack.get("entries").array()[0].get("reason").text(), "TRAIL_EXPORT_SOURCE_BYTE_LIMIT");
+    assert_eq!(pack.get("coverage").get("source_bytes_read").number(), 0);
+    let correct = f.0.join("correct.json");
+    assert_eq!(invoke(&f.export(&archive, &correct), || false).0, EXIT_OK);
+    assert_eq!(parse(&fs::read(correct).unwrap()).unwrap().get("entries").array()[0].get("selected_original_hex").text(), "616e61");
+}
+
+#[test]
+fn export_byte_and_scalar_limits_include_metadata_and_omit_whole_payloads() {
+    let f = Fixture::new(); let payload = vec![b'x'; 8000];
+    let archive = f.archive("large.fcbs", b"a.rs", &payload);
+    assert_eq!(invoke(&f.add(&archive, 0, payload.len() as u64), || false).0, EXIT_OK);
+    for (name, option, reason) in [("bytes.json", "--max-output-bytes", "TRAIL_EXPORT_OUTPUT_BYTE_LIMIT"),
+        ("characters.json", "--max-output-chars", "TRAIL_EXPORT_OUTPUT_CHARACTER_LIMIT")] {
+        let destination = f.0.join(name); let mut args = f.export(&archive, &destination);
+        args.extend([option.into(), "8192".into()]);
+        let (exit, receipt) = invoke(&args, || false); assert_eq!(exit, EXIT_PARTIAL);
+        let bytes = fs::read(&destination).unwrap(); let text = std::str::from_utf8(&bytes).unwrap();
+        if option == "--max-output-bytes" { assert!(bytes.len() <= 8192); }
+        else { assert!(text.chars().count() <= 8192); }
+        assert_eq!(receipt.get("export_bytes").number(), bytes.len() as u64);
+        let pack = parse(&bytes).unwrap(); let row = &pack.get("entries").array()[0];
+        assert_eq!(row.get("reason").text(), reason);
+        assert!(matches!(row.get("selected_original_hex"), Json::Null));
+        assert_eq!(row.get("selection").get("rationale").text(), "User reasoning, not a compiler fact");
+        assert_eq!(pack.get("coverage").get("source_bytes_read").number(), 0,
+            "cannot spend member-load work on a payload that cannot be exported");
+    }
+    let rejected = f.0.join("too-small.json"); let mut args = f.export(&archive, &rejected);
+    args.extend(["--max-output-bytes".into(), "64".into()]);
+    let (exit, receipt) = invoke(&args, || false); assert_eq!(exit, EXIT_ERROR);
+    assert_eq!(receipt.get("effect").text(), "none"); assert!(!rejected.exists());
+}
+
+#[test]
+fn zero_export_entry_limit_preserves_an_explicit_omitted_tail_without_payload_reads() {
+    let f = Fixture::new(); let archive = f.archive("a.fcbs", b"a.rs", b"abc");
+    assert_eq!(invoke(&f.add(&archive, 0, 3), || false).0, EXIT_OK);
+    let destination = f.0.join("limited.json"); let mut args = f.export(&archive, &destination);
+    args.extend(["--limit".into(), "0".into()]);
+    let (exit, receipt) = invoke(&args, || false); assert_eq!(exit, EXIT_PARTIAL);
+    assert!(!receipt.get("contains_source_payloads").flag());
+    let pack = parse(&fs::read(destination).unwrap()).unwrap();
+    assert!(pack.get("entries").array().is_empty());
+    assert_eq!(pack.get("omitted_tail").get("first_item").number(), 1);
+    assert_eq!(pack.get("omitted_tail").get("count").number(), 1);
+    assert_eq!(pack.get("coverage").get("source_bytes_read").number(), 0);
+}
+
+#[test]
+fn export_never_overwrites_and_cancellation_preserves_the_reported_file_effect() {
+    let f = Fixture::new(); let archive = f.archive("a.fcbs", b"a.rs", b"abc");
+    assert_eq!(invoke(&f.add(&archive, 0, 3), || false).0, EXIT_OK);
+    let existing = f.0.join("existing.json"); fs::write(&existing, b"user state").unwrap();
+    let (exit, receipt) = invoke(&f.export(&archive, &existing), || false);
+    assert_eq!(exit, EXIT_ERROR); assert_eq!(receipt.get("error").get("code").text(), "TRAIL_DESTINATION_EXISTS");
+    assert_eq!(fs::read(&existing).unwrap(), b"user state"); assert_eq!(receipt.get("effect").text(), "none");
+    let untouched = f.0.join("untouched.json");
+    let (exit, receipt) = invoke(&f.export(&archive, &untouched), || true);
+    assert_eq!(exit, EXIT_CANCELED); assert_eq!(receipt.get("effect").text(), "none"); assert!(!untouched.exists());
+    let created = f.0.join("created.json");
+    let (exit, receipt) = invoke(&f.export(&archive, &created), || created.exists());
+    assert_eq!(exit, EXIT_CANCELED); assert_eq!(receipt.get("effect").text(), "destination-created-incomplete");
+    assert_eq!(fs::metadata(&created).unwrap().len(), 0);
+    let written = f.0.join("written.json");
+    let (exit, receipt) = invoke(&f.export(&archive, &written), || fs::metadata(&written).is_ok_and(|m| m.len() > 0));
+    assert_eq!(exit, EXIT_CANCELED); assert_eq!(receipt.get("effect").text(), "complete-file-sync-unconfirmed");
+    let pack = parse(&fs::read(&written).unwrap()).unwrap(); assert!(pack.get("complete").flag());
+}
+
+#[test]
+fn lost_export_receipt_does_not_destroy_the_written_source_pack() {
+    struct Broken;
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { Err(io::ErrorKind::BrokenPipe.into()) }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+    let f = Fixture::new(); let archive = f.archive("a.fcbs", b"a.rs", b"abc");
+    assert_eq!(invoke(&f.add(&archive, 0, 3), || false).0, EXIT_OK);
+    let destination = f.0.join("retained.json"); let mut errors = Vec::new();
+    assert_eq!(run(&f.export(&archive, &destination), &mut NeverRead, &mut Broken, &mut errors, || false), EXIT_ERROR);
+    assert!(String::from_utf8(errors).unwrap().contains("effect=complete-file-sync-requested"));
+    let pack = parse(&fs::read(destination).unwrap()).unwrap(); assert!(pack.get("complete").flag());
+    assert_eq!(pack.get("entries").array()[0].get("selected_original_hex").text(), "616263");
+}
+
+#[test]
+fn actual_binary_exports_saved_evidence_and_rejects_bad_format_and_corrupt_archive() {
+    let f = Fixture::new(); let archive = f.archive("a.fcbs", b"a.rs", b"banana");
+    assert_eq!(invoke(&f.add(&archive, 3, 6), || false).0, EXIT_OK);
+    let destination = f.0.join("binary.json");
+    let exported = Command::new(env!("CARGO_BIN_EXE_fcb")).args(f.export(&archive, &destination)).output().unwrap();
+    assert_eq!(exported.status.code(), Some(EXIT_OK as i32));
+    assert_eq!(parse(&fs::read(destination).unwrap()).unwrap().get("entries").array()[0].get("selected_original_hex").text(), "616e61");
+    let unsupported = f.0.join("not-markdown.md"); let mut args = f.export(&archive, &unsupported);
+    args[8] = "markdown".into(); let (exit, receipt) = invoke(&args, || false);
+    assert_eq!(exit, EXIT_ERROR); assert_eq!(receipt.get("error").get("code").text(), "TRAIL_EXPORT_UNSUPPORTED_FORMAT");
+    assert!(!unsupported.exists());
+    let mut bytes = fs::read(&archive).unwrap(); bytes[40] ^= 1; fs::write(&archive, bytes).unwrap();
+    let rejected = f.0.join("corrupt.json");
+    let (exit, receipt) = invoke(&f.export(&archive, &rejected), || false); assert_eq!(exit, EXIT_ERROR);
+    assert_eq!(receipt.get("effect").text(), "none"); assert!(!rejected.exists());
 }

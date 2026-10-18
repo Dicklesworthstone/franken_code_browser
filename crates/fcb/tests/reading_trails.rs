@@ -150,3 +150,159 @@ fn canceled_pin_and_append_release_only_candidate_reservations() {
         || budget.accounting().reserved().get() > before), Err(TrailError::Canceled)));
     assert_eq!(budget.accounting().reserved().get(), before);
 }
+
+#[test]
+fn export_cursor_preserves_raw_selections_repeated_visits_and_bounded_residency() {
+    use fcb::search::trail::{TrailExportCursor, TrailExportLimits, TrailExportOutcome};
+    let budget = budget(); let bytes = b"\xff\xfea\0\x00\xd8z\0";
+    let mut archive = archive(bytes, b"src/\xff.rs", &budget, 2);
+    let selection = pin_selection(&mut archive, b"src/\xff.rs", range(3, 7), "inside a UTF-16 unit", &budget, allocation(3), || false).unwrap();
+    let saved = TrailBytes::encode(owner(), "raw evidence", None, &[selection, selection], &budget, allocation(4), || false).unwrap();
+    let view = TrailView::open(saved.bytes(), || false).unwrap();
+    let baseline = budget.accounting().reserved().get();
+    let mut cursor = TrailExportCursor::new(view, generation(8), FileId::new(owner(), 90).unwrap(),
+        SourceRevision::new(owner(), 100).unwrap(), TrailExportLimits::default()).unwrap();
+    for ordinal in 0..2 {
+        let item = cursor.next(&mut archive, &budget, [allocation(5), allocation(6)], || false).unwrap().unwrap();
+        assert_eq!(item.target.ordinal(), ordinal);
+        assert_eq!(item.target.entry().path, b"src/\xff.rs");
+        assert_eq!(item.target.entry().rationale, "inside a UTF-16 unit");
+        let TrailExportOutcome::Verified(capture) = item.outcome else { panic!("selection must verify") };
+        assert_eq!(capture.selected_bytes(), &bytes[3..7]);
+        drop(capture);
+        assert_eq!(budget.accounting().reserved().get(), baseline);
+    }
+    assert!(cursor.next(&mut archive, &budget, [allocation(5), allocation(6)], || false).unwrap().is_none());
+    let stats = cursor.stats(); assert!(stats.complete());
+    assert_eq!(stats.verification_bytes_admitted, (bytes.len() * 2) as u64);
+    assert_eq!(stats.source_bytes_read, (bytes.len() * 2) as u64);
+    assert_eq!(stats.selected_bytes, 8);
+}
+
+#[test]
+fn export_omits_oversized_payload_before_io_and_still_admits_later_small_selection() {
+    use fcb::search::trail::{TrailExportCursor, TrailExportLimits, TrailExportOutcome};
+    let budget = budget(); let mut archive = archive(b"abcdefgh", b"a", &budget, 2);
+    let large = pin_selection(&mut archive, b"a", range(0, 8), "large", &budget, allocation(3), || false).unwrap();
+    let small = TrailEntry { range: range(2, 3), rationale: "small", ..large };
+    let saved = TrailBytes::encode(owner(), "priority", None, &[large, small, small], &budget, allocation(4), || false).unwrap();
+    let view = TrailView::open(saved.bytes(), || false).unwrap();
+    let mut cursor = TrailExportCursor::new(view, generation(1), FileId::new(owner(), 1).unwrap(),
+        SourceRevision::new(owner(), 1).unwrap(), TrailExportLimits {
+            max_entries: 2, max_source_bytes: 8, max_selected_bytes: 1 }).unwrap();
+    let before = archive.load_stats();
+    let first = cursor.next(&mut archive, &budget, [allocation(5), allocation(6)], || false).unwrap().unwrap();
+    assert!(matches!(first.outcome, TrailExportOutcome::SelectionByteLimit));
+    assert_eq!(archive.load_stats(), before, "output-ineligible payloads must not consume source work");
+    let second = cursor.next(&mut archive, &budget, [allocation(5), allocation(6)], || false).unwrap().unwrap();
+    let TrailExportOutcome::Verified(capture) = second.outcome else { panic!("later small selection must survive") };
+    assert_eq!(capture.selected_bytes(), b"c"); drop(capture);
+    assert!(cursor.next(&mut archive, &budget, [allocation(5), allocation(6)], || false).unwrap().is_none());
+    let stats = cursor.stats(); assert!(!stats.complete());
+    assert_eq!(stats.omitted_selection_limit, 1); assert_eq!(stats.omitted_entry_limit, 1);
+    assert_eq!(stats.verification_bytes_admitted, 8); assert_eq!(stats.selected_bytes, 1);
+}
+
+#[test]
+fn export_source_budget_charges_whole_members_including_repeated_visits() {
+    use fcb::search::trail::{TrailExportCursor, TrailExportLimits, TrailExportOutcome};
+    let budget = budget(); let mut archive = archive(b"abcdef", b"a", &budget, 2);
+    let entry = pin_selection(&mut archive, b"a", range(0, 1), "point", &budget, allocation(3), || false).unwrap();
+    let saved = TrailBytes::encode(owner(), "repeat", None, &[entry, entry], &budget, allocation(4), || false).unwrap();
+    let view = TrailView::open(saved.bytes(), || false).unwrap();
+    let mut cursor = TrailExportCursor::new(view, generation(1), FileId::new(owner(), 1).unwrap(),
+        SourceRevision::new(owner(), 1).unwrap(), TrailExportLimits {
+            max_entries: 2, max_source_bytes: 6, max_selected_bytes: 2 }).unwrap();
+    let first = cursor.next(&mut archive, &budget, [allocation(5), allocation(6)], || false).unwrap().unwrap();
+    assert!(matches!(&first.outcome, TrailExportOutcome::Verified(_))); drop(first);
+    let before = archive.load_stats();
+    let second = cursor.next(&mut archive, &budget, [allocation(5), allocation(6)], || false).unwrap().unwrap();
+    assert!(matches!(second.outcome, TrailExportOutcome::SourceByteLimit));
+    assert_eq!(archive.load_stats(), before); assert_eq!(cursor.stats().omitted_source_limit, 1);
+}
+
+#[test]
+fn export_wrong_archive_and_forged_source_digest_stay_unavailable_without_source_reads() {
+    use fcb::search::trail::{TrailExportCursor, TrailExportLimits, TrailExportOutcome};
+    let budget = budget(); let mut a = archive(b"abc", b"a", &budget, 2);
+    let good = pin_selection(&mut a, b"a", range(0, 3), "verified", &budget, allocation(3), || false).unwrap();
+    let wrong_archive = TrailEntry { archive: fcb::search::trail::Sha256Digest::new([0; 32]), ..good };
+    let wrong_source = TrailEntry { source: fcb::search::trail::Sha256Digest::new([0; 32]), ..good };
+    let saved = TrailBytes::encode(owner(), "identity controls", None, &[wrong_archive, wrong_source, good], &budget, allocation(4), || false).unwrap();
+    let view = TrailView::open(saved.bytes(), || false).unwrap();
+    let mut cursor = TrailExportCursor::new(view, generation(1), FileId::new(owner(), 1).unwrap(),
+        SourceRevision::new(owner(), 1).unwrap(), TrailExportLimits::default()).unwrap();
+    let before = a.load_stats();
+    let first = cursor.next(&mut a, &budget, [allocation(5), allocation(6)], || false).unwrap().unwrap();
+    assert!(matches!(first.outcome, TrailExportOutcome::Unavailable(TrailReadError::OtherArchive)));
+    let second = cursor.next(&mut a, &budget, [allocation(5), allocation(6)], || false).unwrap().unwrap();
+    assert!(matches!(second.outcome, TrailExportOutcome::Unavailable(TrailReadError::ChangedSource)));
+    assert_eq!(a.load_stats(), before);
+    let third = cursor.next(&mut a, &budget, [allocation(5), allocation(6)], || false).unwrap().unwrap();
+    let TrailExportOutcome::Verified(capture) = third.outcome else { panic!("near-identical authorized control must succeed") };
+    assert_eq!(capture.selected_bytes(), b"abc"); assert_eq!(cursor.stats().unavailable_entries, 2);
+}
+
+#[test]
+fn canceled_export_is_terminal_and_releases_candidate_capacity() {
+    use fcb::search::trail::{TrailExportCursor, TrailExportLimits};
+    let budget = budget(); let mut a = archive(b"abc", b"a", &budget, 2);
+    let entry = pin_selection(&mut a, b"a", range(0, 3), "keep", &budget, allocation(3), || false).unwrap();
+    let saved = TrailBytes::encode(owner(), "cancel", None, &[entry], &budget, allocation(4), || false).unwrap();
+    let view = TrailView::open(saved.bytes(), || false).unwrap();
+    let mut cursor = TrailExportCursor::new(view, generation(1), FileId::new(owner(), 1).unwrap(),
+        SourceRevision::new(owner(), 1).unwrap(), TrailExportLimits::default()).unwrap();
+    let baseline = budget.accounting().reserved().get();
+    assert!(cursor.next(&mut a, &budget, [allocation(5), allocation(6)],
+        || budget.accounting().reserved().get() > baseline).is_err());
+    assert_eq!(budget.accounting().reserved().get(), baseline);
+    assert!(!cursor.stats().complete()); assert!(cursor.stats().interrupted);
+    assert!(matches!(cursor.next(&mut a, &budget, [allocation(5), allocation(6)], || false), Err(TrailReadError::StaleDelivery)));
+    assert!(matches!(TrailExportCursor::new(view, generation(1), FileId::new(owner(), 1).unwrap(),
+        SourceRevision::new(owner(), 1).unwrap(), TrailExportLimits { max_entries: MAX_TRAIL_ITEMS + 1,
+            ..TrailExportLimits::default() }), Err(TrailReadError::Format(TrailError::Limit))));
+}
+
+#[test]
+fn export_reverifies_mutated_archive_payload_and_counts_failed_verification_work() {
+    use std::{io::{self, Read, Seek, SeekFrom}, sync::{Arc, Mutex}};
+    use fcb::search::trail::{TrailExportCursor, TrailExportLimits, TrailExportOutcome};
+    use fcb::search::paged_snapshot::{PagedMemberData, PagedSearchError, PagedSnapshotError};
+    struct SharedInput(Arc<Mutex<Cursor<Vec<u8>>>>);
+    impl Read for SharedInput {
+        fn read(&mut self, into: &mut [u8]) -> io::Result<usize> { self.0.lock().unwrap().read(into) }
+    }
+    impl Seek for SharedInput {
+        fn seek(&mut self, to: SeekFrom) -> io::Result<u64> { self.0.lock().unwrap().seek(to) }
+    }
+    let budget = budget();
+    let encoded = SnapshotBytes::encode(owner(), true, "mutation-control", &[SnapshotEntry {
+        path: b"a", observed_bytes: 3, data: SnapshotData::Captured(b"abc") }],
+        SnapshotLimits::default(), &budget, allocation(1), || false).unwrap();
+    let backing = Arc::new(Mutex::new(Cursor::new(encoded.bytes().to_vec())));
+    let mut archive = PagedSnapshot::open(SharedInput(backing.clone()), owner(), SnapshotLimits::default(),
+        &budget, allocation(2), || false).unwrap();
+    let selection = pin_selection(&mut archive, b"a", range(0, 3), "original capture", &budget, allocation(3), || false).unwrap();
+    let saved = TrailBytes::encode(owner(), "mutation control", None, &[selection], &budget, allocation(4), || false).unwrap();
+    let view = TrailView::open(saved.bytes(), || false).unwrap();
+    let PagedMemberData::Captured { archive_offset, .. } = archive.directory().member(0).unwrap().data else { panic!("captured fixture") };
+    backing.lock().unwrap().get_mut()[archive_offset as usize + 1] = b'X';
+    let mut cursor = TrailExportCursor::new(view, generation(1), FileId::new(owner(), 1).unwrap(),
+        SourceRevision::new(owner(), 1).unwrap(), TrailExportLimits::default()).unwrap();
+    let baseline = budget.accounting().reserved().get();
+    let item = cursor.next(&mut archive, &budget, [allocation(5), allocation(6)], || false).unwrap().unwrap();
+    assert!(matches!(item.outcome, TrailExportOutcome::Unavailable(TrailReadError::Capture(
+        PagedSearchError::Archive(PagedSnapshotError::Changed)))));
+    assert_eq!(budget.accounting().reserved().get(), baseline);
+    assert_eq!(cursor.stats().verification_bytes_admitted, 3);
+    assert_eq!(cursor.stats().source_bytes_read, 3);
+    assert_eq!(cursor.stats().selected_bytes, 0); assert!(!cursor.stats().complete());
+    // Restoring the actual bytes succeeds under a fresh export attempt. The
+    // same path and trusted directory alone did not authorize changed content.
+    backing.lock().unwrap().get_mut()[archive_offset as usize + 1] = b'b';
+    let mut fresh = TrailExportCursor::new(view, generation(2), FileId::new(owner(), 2).unwrap(),
+        SourceRevision::new(owner(), 2).unwrap(), TrailExportLimits::default()).unwrap();
+    let item = fresh.next(&mut archive, &budget, [allocation(5), allocation(6)], || false).unwrap().unwrap();
+    let TrailExportOutcome::Verified(capture) = item.outcome else { panic!("restored exact bytes should verify") };
+    assert_eq!(capture.selected_bytes(), b"abc"); assert!(fresh.stats().complete());
+}

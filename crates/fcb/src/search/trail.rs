@@ -10,6 +10,10 @@ use super::paged_snapshot::{PagedCapture, PagedReader, PagedSearchError, PagedSn
 use super::{ReaderError, ReaderLimits};
 pub use fcb_store::{Sha256Digest, trail::{TrailBytes, TrailEntry, TrailError, TrailView, MAX_TRAIL_BYTES, MAX_TRAIL_ITEMS}};
 
+pub mod export;
+pub use export::{TrailExportCursor, TrailExportItem, TrailExportLimits, TrailExportOutcome,
+    TrailExportStats, MAX_TRAIL_EXPORT_SOURCE_BYTES};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrailReadError {
     Format(TrailError), Archive(PagedSnapshotError), Capture(PagedSearchError),
