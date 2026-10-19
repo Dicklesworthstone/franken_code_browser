@@ -1,9 +1,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use super::*;
-use crate::reader_ffi::{fcb_reader_create, fcb_reader_copy_range, fcb_reader_close, fcb_reader_info};
-use std::{ffi::{CStr, CString}, fs, path::PathBuf, sync::{Mutex, atomic::{AtomicU64, Ordering}}};
-static TEST_LOCK: Mutex<()> = Mutex::new(());
+use crate::reader_ffi::{fcb_reader_create, fcb_reader_copy_range, fcb_reader_close, fcb_reader_info, FFI_TEST_LOCK};
+use std::{ffi::{CStr, CString}, fs, path::PathBuf, sync::atomic::{AtomicU64, Ordering}};
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
@@ -28,7 +27,7 @@ fn take(pointer: *mut c_char) -> String {
 
 #[test]
 fn c_atlas_reader_journey_uses_retained_map_and_original_captured_bytes() {
-    let _guard = TEST_LOCK.lock().unwrap(); let fixture = Fixture::new(); let a = fixture.open();
+    let _guard = FFI_TEST_LOCK.lock().unwrap(); let fixture = Fixture::new(); let a = fixture.open();
     assert!(take(fcb_atlas_view(a, 1)).contains("\"native_presented\":false"));
     assert!(take(fcb_atlas_pick(a, 1, 1, 512.0, 384.0)).contains("ATLAS_SESSION_NOT_PRESENTED"));
     assert!(take(fcb_atlas_present(a, 1, 1, 1)).contains("host-declared-not-observed"));
@@ -49,7 +48,7 @@ fn c_atlas_reader_journey_uses_retained_map_and_original_captured_bytes() {
 
 #[test]
 fn c_invalid_inputs_and_wrong_handle_kinds_are_explicit_errors() {
-    let _guard = TEST_LOCK.lock().unwrap(); let fixture = Fixture::new();
+    let _guard = FFI_TEST_LOCK.lock().unwrap(); let fixture = Fixture::new();
     let a = fcb_atlas_create(); assert_ne!(a, 0);
     assert!(take(unsafe { fcb_atlas_open(a, std::ptr::null(), 100) }).contains("ATLAS_HANDLE_INVALID_ARGUMENT"));
     assert!(take(fcb_atlas_info(a)).contains("ATLAS_HANDLE_NOT_OPEN"));
@@ -66,7 +65,7 @@ fn c_invalid_inputs_and_wrong_handle_kinds_are_explicit_errors() {
 
 #[test]
 fn c_cancel_and_close_do_not_free_already_returned_strings() {
-    let _guard = TEST_LOCK.lock().unwrap(); let fixture = Fixture::new(); let a = fixture.open();
+    let _guard = FFI_TEST_LOCK.lock().unwrap(); let fixture = Fixture::new(); let a = fixture.open();
     assert_eq!(fcb_atlas_cancel(a), 1);
     let pointer = fcb_atlas_view(a, 1);
     assert_eq!(fcb_atlas_close(a), 1);
@@ -77,7 +76,7 @@ fn c_cancel_and_close_do_not_free_already_returned_strings() {
 
 #[test]
 fn c_atlas_scope_filters_display_and_labels_responses() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
     let root = std::env::temp_dir().join(format!("fcb-atlas-scope-ffi-{}", std::process::id()));
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("a.rs"), b"rust\n").unwrap();

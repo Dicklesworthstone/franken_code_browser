@@ -1,12 +1,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 use super::*;
 use crate::atlas_ffi::{fcb_atlas_create, fcb_atlas_open, fcb_atlas_close, fcb_atlas_present, fcb_atlas_info, fcb_atlas_cancel};
-use crate::reader_ffi::{fcb_reader_create, fcb_reader_copy_range, fcb_reader_close, fcb_reader_info};
-use std::{ffi::{CStr, CString}, fs, sync::Mutex};
-
-// Tests sharing process-global C registries use one search handle at a time.
-// Independent registry concurrency and admission are tested in atlas_progressive_tests.
-static SEARCH_FFI_LOCK: Mutex<()> = Mutex::new(());
+use crate::reader_ffi::{fcb_reader_create, fcb_reader_copy_range, fcb_reader_close, fcb_reader_info, FFI_TEST_LOCK};
+use std::{ffi::{CStr, CString}, fs};
 fn take(pointer: *mut c_char) -> String {
     assert!(!pointer.is_null());
     let text = unsafe { CStr::from_ptr(pointer) }.to_str().unwrap().to_owned();
@@ -15,7 +11,7 @@ fn take(pointer: *mut c_char) -> String {
 
 #[test]
 fn c_repository_search_paging_overlay_focus_and_retained_reader_workflow() {
-    let _guard = SEARCH_FFI_LOCK.lock().unwrap();
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
     let root = std::env::temp_dir().join(format!("fcb-search-ffi-{}-{}", std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     fs::create_dir_all(&root).unwrap(); fs::write(root.join("a.rs"), "needle ".repeat(80)).unwrap();
@@ -56,7 +52,7 @@ fn c_repository_search_paging_overlay_focus_and_retained_reader_workflow() {
 
 #[test]
 fn c_progressive_search_activates_first_hit_then_cancel_restores_finished_generation() {
-    let _guard = SEARCH_FFI_LOCK.lock().unwrap();
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
     let root = std::env::temp_dir().join(format!("fcb-step-ffi-{}-{}", std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     fs::create_dir_all(&root).unwrap();
@@ -84,7 +80,7 @@ fn c_progressive_search_activates_first_hit_then_cancel_restores_finished_genera
 
 #[test]
 fn c_begin_owns_query_text_but_defers_source_and_finishes_unavailable_coverage() {
-    let _guard = SEARCH_FFI_LOCK.lock().unwrap();
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
     let root = std::env::temp_dir().join(format!("fcb-step-text-ffi-{}-{}", std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     fs::create_dir_all(&root).unwrap();
@@ -137,7 +133,7 @@ fn c_search_signatures_and_header_declarations_agree() {
 fn c_scoped_live_and_indexed_search_freeze_lists_before_hit_and_source_limits() {
     use super::index::{fcb_atlas_index_prepare, fcb_atlas_search_indexed_begin_scoped,
         fcb_atlas_search_indexed_scoped};
-    let _guard = SEARCH_FFI_LOCK.lock().unwrap();
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
     let root = std::env::temp_dir().join(format!("fcb-scope-ffi-{}-{}", std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     fs::create_dir_all(&root).unwrap();
@@ -189,7 +185,7 @@ fn c_scoped_live_and_indexed_search_freeze_lists_before_hit_and_source_limits() 
 #[test]
 fn c_structure_query_reuses_progress_and_exact_reader_import_without_text_fallback() {
     use super::structure::fcb_atlas_structure_begin;
-    let _guard = SEARCH_FFI_LOCK.lock().unwrap();
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
     let root = std::env::temp_dir().join(format!("fcb-structure-ffi-{}-{}", std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     fs::create_dir_all(root.join("docs")).unwrap();
@@ -228,7 +224,7 @@ fn c_structure_query_reuses_progress_and_exact_reader_import_without_text_fallba
 fn c_path_scope_freezes_exact_components_and_rejects_invalid_replacements_before_admission() {
     use super::index::{fcb_atlas_index_prepare, fcb_atlas_search_indexed_begin_path_scoped,
         fcb_atlas_search_indexed_path_scoped};
-    let _guard = SEARCH_FFI_LOCK.lock().unwrap();
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
     let root = std::env::temp_dir().join(format!("fcb-path-scope-ffi-{}-{}", std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     for directory in ["dir", "dir-old"] { fs::create_dir_all(root.join(directory)).unwrap(); }

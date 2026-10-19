@@ -31,8 +31,9 @@ fn wire_modes_are_explicit_and_unknown_values_are_not_reinterpreted() {
 
 #[test]
 fn unknown_handle_c_responses_are_owned_strings_and_never_source_grants() {
-    // No global session slots are occupied, so this test cannot interfere with
-    // concurrent FFI lifecycle tests exercising the process-wide capacity limit.
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
+    // Unknown handles consume no slots but still briefly borrow the global
+    // registry; share the lifecycle suites' guard to avoid try_lock contention.
     use std::ffi::CStr;
     for pointer in [unsafe { fcb_atlas_find_files(0, 1, std::ptr::null(), 100, 0, 0) },
         fcb_atlas_file_results(0, 1, 0, 10), fcb_atlas_file_select(0, 1, 1),
@@ -47,6 +48,7 @@ fn unknown_handle_c_responses_are_owned_strings_and_never_source_grants() {
 
 #[test]
 fn cancelable_file_query_polls_before_inputs_and_refuses_unknown_handles() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
     use std::sync::atomic::{AtomicUsize, Ordering};
     unsafe extern "C" fn cancel(context: *mut std::ffi::c_void) -> i32 {
         let polls = unsafe { &*context.cast::<AtomicUsize>() };

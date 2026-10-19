@@ -36,6 +36,7 @@ fn copy_modes_are_explicit_not_truthy_boolean_aliases() {
 
 #[test]
 fn unknown_handles_null_slugs_and_wide_offsets_return_owned_error_strings() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
     // No global handle capacity is consumed by these marshaling checks. Positive
     // source/layout workflows exercise the actual registry in document sessions.
     let slug = CString::new("heading").unwrap();

@@ -34,6 +34,7 @@ fn all_five_index_entrypoint_types_and_header_declarations_agree() {
 
 #[test]
 fn unknown_index_handles_return_bounded_independently_owned_error_strings() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
     let first = fcb_atlas_index_info(u64::MAX);
     let second = fcb_atlas_index_clear(u64::MAX, 1);
     for pointer in [first, second, fcb_atlas_index_prepare(u64::MAX, 1, 100, 1024, 65536, 1024)] {
@@ -45,6 +46,7 @@ fn unknown_index_handles_return_bounded_independently_owned_error_strings() {
 
 #[test]
 fn null_and_valid_foreign_queries_on_unknown_handles_never_produce_success_or_source_payloads() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
     // Registry workflows exercise successful admission/step/activation without
     // competing for process-global C handle capacity during parallel tests.
     for call in [fcb_atlas_search_indexed, fcb_atlas_search_indexed_begin] {

@@ -1,9 +1,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 use super::*;
 use crate::reader_ffi::{fcb_reader_create, fcb_reader_open, fcb_reader_info,
-    fcb_reader_find, fcb_reader_copy_hit, fcb_reader_close};
-use std::{ffi::{CStr, CString}, fs, sync::{Mutex, atomic::{AtomicU64, Ordering}}};
-static TEST_LOCK: Mutex<()> = Mutex::new(());
+    fcb_reader_find, fcb_reader_copy_hit, fcb_reader_close, FFI_TEST_LOCK};
+use std::{ffi::{CStr, CString}, fs, sync::atomic::{AtomicU64, Ordering}};
 
 fn take(pointer: *mut c_char) -> String {
     assert!(!pointer.is_null());
@@ -22,7 +21,7 @@ fn source(bytes: &[u8]) -> (std::path::PathBuf, u64) {
 
 #[test]
 fn c_outline_find_symbol_copy_clear_and_stale_generations_use_real_source() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
     let (path, r) = source(b"fn first() {}\nfn second() {}\n");
     fs::write(&path, b"fn replacement() {}\n").unwrap();
     let out = take(unsafe { fcb_reader_outline(r, 1, std::ptr::null(), 4096) });
@@ -53,7 +52,7 @@ fn c_outline_find_symbol_copy_clear_and_stale_generations_use_real_source() {
 
 #[test]
 fn c_utf16_outline_and_lossless_copy_do_not_relabel_original_offsets() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
     let bytes: Vec<u8> = "\u{feff}// 🦀\r\nfn target() {}\r\n".encode_utf16().flat_map(u16::to_le_bytes).collect();
     let (_, r) = source(&bytes);
     let language = CString::new("rust").unwrap();

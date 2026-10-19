@@ -10,6 +10,14 @@ use super::{cstr, reply, string_out};
 use super::reader_sessions::{AccessError, Command, ReaderSessions};
 
 static READERS: OnceLock<ReaderSessions> = OnceLock::new();
+/// The exported reader, atlas, saved-source and desk APIs share connected
+/// process-global registries. Their C tests acquire this once before ANY
+/// exported registry call, including unknown-handle probes (which still take
+/// the production try_lock). One outer lock avoids cross-suite capacity races
+/// and lock-order cycles; helpers and callbacks never acquire it again.
+/// Independent-registry concurrency tests do not use this test-only guard.
+#[cfg(test)]
+pub(super) static FFI_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 // Atlas activation targets this exact registry, never an independent reader table.
 pub(super) fn registry() -> Option<&'static ReaderSessions> { READERS.get() }
 fn answer(handle: u64, work: impl FnOnce(&ReaderSessions) -> Result<HostResponse, AccessError>) -> Option<*mut c_char> {
@@ -119,6 +127,8 @@ mod supplied;
 mod outline;
 #[path = "reader_document_ffi.rs"]
 mod document;
+#[path = "reader_comparison_ffi.rs"]
+mod comparison;
 
 #[cfg(test)]
 #[path = "reader_ffi_tests.rs"]

@@ -40,6 +40,7 @@ fn pins_are_exactly_32_bytes_of_hex_and_never_decoded_by_utf8_slicing() {
 
 #[test]
 fn unknown_handles_return_independently_owned_bounded_errors_without_source_leakage() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
     let needle = CString::new("private fixture phrase").unwrap();
     let first = fcb_saved_info(u64::MAX);
     let second = unsafe { fcb_saved_search(u64::MAX, 1, needle.as_ptr(), 10) };
@@ -54,6 +55,7 @@ fn unknown_handles_return_independently_owned_bounded_errors_without_source_leak
 #[test]
 #[cfg(unix)]
 fn actual_c_open_search_paging_clear_and_close_preserve_returned_string_ownership() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
     use fcb::{ArenaOwnerId, ByteLength};
     use fcb::search::{ResourceAllocationId, ResourceBudget, snapshot::{SnapshotBytes, SnapshotEntry, SnapshotData}};
     let root = std::env::temp_dir().join(format!("fcb-saved-c-{}-{}", std::process::id(),

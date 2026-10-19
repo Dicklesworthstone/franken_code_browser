@@ -10,7 +10,7 @@ use std::{mem::size_of, path::Path, sync::{Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}};
 use fcb_app::host::{HostError, HostResponse};
 use fcb_app::host::reader::{ReaderSession, ReaderSessionError, ReaderOutlineOptions,
-    ReaderDocumentOptions, DocumentCopyMode};
+    ReaderDocumentOptions, DocumentCopyMode, ReaderComparisonLimits};
 use fcb::search::{SymbolError, SymbolNameMode};
 use fcb::document::reader::DocumentReadError;
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
@@ -44,6 +44,7 @@ impl AccessError {
             Self::Canceled | Self::Closed | Self::Reader(ReaderSessionError::Canceled)
                 | Self::Reader(ReaderSessionError::Symbol(SymbolError::Canceled))
                 | Self::Reader(ReaderSessionError::Document(DocumentReadError::Canceled)) => true,
+            Self::Reader(ReaderSessionError::Comparison(fcb::analysis::comparison::ComparisonError::Canceled)) => true,
             Self::Reader(ReaderSessionError::Host(HostError::App(e)) | ReaderSessionError::App(e)) => e.is_canceled(),
             Self::Reader(ReaderSessionError::View(e)) => fcb_app::AppError::View(e).is_canceled(),
             _ => false,
@@ -142,6 +143,52 @@ impl ReaderSessions {
     fn get(&self, handle: u64) -> Result<Arc<Cell>, AccessError> {
         let cells = lock(&self.cells)?;
         cells.iter().flatten().find(|cell| cell.id == handle).cloned().ok_or(AccessError::UnknownHandle)
+    }
+    /// Explicitly borrow an exact retained source for another host service.
+    /// The original cell and its admission survive the callback. The registry
+    /// lock never encloses source work; closure/cancellation revoke delivery.
+    /// A callback that publishes external state must reconcile its own outcome
+    /// if authority changes after that publication and before this call returns.
+    pub(super) fn with_retained<T, E: From<AccessError>>(&self, handle: u64,
+        work: impl FnOnce(&ReaderSession, &mut dyn FnMut() -> bool) -> Result<T, E>,
+        mut canceled: impl FnMut() -> bool) -> Result<T, E> {
+        let cell = self.get(handle)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        if canceled() { return Err(AccessError::Canceled.into()); }
+        let reader = state.as_ref().ok_or(AccessError::NotOpen)?;
+        let result = work(reader, &mut || cell.validate(epoch).is_err() || canceled());
+        cell.validate(epoch)?;
+        if canceled() { return Err(AccessError::Canceled.into()); }
+        result
+    }
+    /// Borrow both reader cells without waiting on either. Different owner
+    /// handles explicitly authorize the host comparison adapter's private
+    /// source transfer; no generic same-owner analysis check is bypassed.
+    /// Reciprocal calls return Busy rather than deadlocking. Closing/canceling
+    /// either source aborts refinement and prevents delayed publication.
+    pub(super) fn compare(&self, before: u64, after: u64, generation: u64,
+        limits: ReaderComparisonLimits, mut canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AccessError> {
+        if before == after { return Err(AccessError::InvalidArgument); }
+        let before_cell = self.get(before)?;
+        let after_cell = self.get(after)?;
+        let before_epoch = before_cell.epoch.load(Ordering::Acquire);
+        let after_epoch = after_cell.epoch.load(Ordering::Acquire);
+        let mut before_state = lock(&before_cell.state)?;
+        let after_state = lock(&after_cell.state)?;
+        before_cell.validate(before_epoch)?;
+        after_cell.validate(after_epoch)?;
+        let before_reader = before_state.as_mut().ok_or(AccessError::NotOpen)?;
+        let after_reader = after_state.as_ref().ok_or(AccessError::NotOpen)?;
+        let owner = ArenaOwnerId::new(fresh_handle()?).map_err(|_| AccessError::IdentityExhausted)?;
+        let result = before_reader.compare_retained(after_reader, owner, generation, limits,
+            || before_cell.validate(before_epoch).is_err()
+                || after_cell.validate(after_epoch).is_err() || canceled());
+        before_cell.validate(before_epoch)?;
+        after_cell.validate(after_epoch)?;
+        result.map_err(AccessError::from)
     }
     pub(super) fn open(&self, handle: u64, path: &Path, limit: usize,
         canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
@@ -290,3 +337,6 @@ mod document_tests;
 #[cfg(all(test, unix))]
 #[path = "reader_fork_tests.rs"]
 mod fork_tests;
+#[cfg(all(test, unix))]
+#[path = "reader_comparison_sessions_tests.rs"]
+mod comparison_tests;

@@ -7,11 +7,13 @@
 //! here. Calls are bounded synchronous worker operations, not redraw callbacks.
 
 mod outline;
+mod comparison;
 pub(crate) mod document;
 #[cfg(test)]
 mod shared_tests;
 pub use outline::{ReaderOutlineOptions, MAX_READER_SYMBOL_PAGE, MAX_READER_SYMBOL_QUERY_BYTES};
 pub use document::{DocumentCopyMode, ReaderDocumentOptions, MAX_READER_DOCUMENT_PAGE};
+pub use comparison::ReaderComparisonLimits;
 use outline::{AcceptedOutline, SelectionIdentity};
 
 use std::{mem::size_of, path::{Path, PathBuf}, sync::Arc};
@@ -41,6 +43,7 @@ pub enum ReaderSessionError {
     StaleQuery, MissingHit, MissingLine, Canceled, IdentityExhausted,
     Symbol(SymbolError), MissingOutline, UnsupportedOutlineLanguage,
     Document(fcb::document::reader::DocumentReadError), MissingDocument,
+    Comparison(fcb::analysis::comparison::ComparisonError),
 }
 impl std::fmt::Display for ReaderSessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -49,6 +52,7 @@ impl std::fmt::Display for ReaderSessionError {
             Self::Source(e) => write!(f, "{e}"), Self::Stream(e) => write!(f, "{e}"),
             Self::View(e) => write!(f, "{e}"), Self::Lines(e) => write!(f, "{e}"),
             Self::Symbol(e) => write!(f, "{e}"), Self::Document(e) => write!(f, "{e}"),
+            Self::Comparison(e) => write!(f, "{e}"),
             Self::MissingDocument => f.write_str("READER_SESSION_NO_DOCUMENT"),
             Self::MissingOutline => f.write_str("READER_SESSION_NO_OUTLINE"),
             Self::UnsupportedOutlineLanguage => f.write_str("READER_SESSION_OUTLINE_LANGUAGE_UNSUPPORTED"),
@@ -70,6 +74,9 @@ impl From<StreamReadError> for ReaderSessionError { fn from(e: StreamReadError) 
 impl From<ExtentViewError> for ReaderSessionError { fn from(e: ExtentViewError) -> Self { Self::View(e) } }
 impl From<LineWindowError> for ReaderSessionError { fn from(e: LineWindowError) -> Self { Self::Lines(e) } }
 impl From<SymbolError> for ReaderSessionError { fn from(e: SymbolError) -> Self { Self::Symbol(e) } }
+impl From<fcb::analysis::comparison::ComparisonError> for ReaderSessionError {
+    fn from(e: fcb::analysis::comparison::ComparisonError) -> Self { Self::Comparison(e) }
+}
 impl From<OutputError> for ReaderSessionError { fn from(e: OutputError) -> Self { Self::App(e.into()) } }
 
 struct AcceptedQuery {
@@ -101,6 +108,7 @@ pub struct ReaderSession {
     last_outline_attempt: u64,
     document: Option<fcb::document::reader::DocumentReader<'static>>,
     last_document_attempt: u64,
+    last_comparison_attempt: u64,
     next_allocation: u64,
     budget: ResourceBudget,
     // Forks retain the SAME source reservation, even after its originating
@@ -158,7 +166,8 @@ impl ReaderSession {
         Self { capture, capture_sha256, path: path.to_path_buf(), encoding,
             line_checkpoints: std::array::from_fn(|_| None), source_bytes_read: 0, read_calls: 0,
             file_observation: false, query: None, last_query_attempt: 0,
-            outline: None, last_outline_attempt: 0, document: None, last_document_attempt: 0, next_allocation: 3,
+            outline: None, last_outline_attempt: 0, document: None, last_document_attempt: 0,
+            last_comparison_attempt: 0, next_allocation: 3,
             budget, _source_lease: source_lease, _state_lease: state_lease }
     }
     /// Fork the exact retained bytes and native path into a fresh owner. This
@@ -184,6 +193,8 @@ impl ReaderSession {
         Ok(session)
     }
     pub fn capture(&self) -> &CompleteCapture { &self.capture }
+    /// Display/provenance label only; it does not confer live filesystem access.
+    pub fn path(&self) -> &Path { &self.path }
     pub fn accepted_generation(&self) -> Option<u64> { self.query.as_ref().map(|q| q.generation) }
     pub fn hit_range(&self, generation: u64, position: usize) -> Result<ByteRange, ReaderSessionError> {
         let query = self.query.as_ref().ok_or(ReaderSessionError::MissingHit)?;

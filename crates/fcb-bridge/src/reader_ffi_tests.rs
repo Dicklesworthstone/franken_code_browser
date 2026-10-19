@@ -2,11 +2,7 @@
 #![cfg(unix)]
 
 use super::*;
-use std::{ffi::{CStr, CString}, fs, sync::{Mutex, atomic::{AtomicU64, Ordering}}, time::{SystemTime, UNIX_EPOCH}};
-
-// Serialize only these tests' use of the one C registry; ordinary registry
-// consumer tests have independent, intentionally concurrent registry owners.
-static TEST_LOCK: Mutex<()> = Mutex::new(());
+use std::{ffi::{CStr, CString}, fs, sync::atomic::{AtomicU64, Ordering}, time::{SystemTime, UNIX_EPOCH}};
 fn take(pointer: *mut c_char) -> String {
     assert!(!pointer.is_null(), "expected a complete JSON or error handoff");
     let text = unsafe { CStr::from_ptr(pointer) }.to_str().unwrap().to_owned();
@@ -30,7 +26,7 @@ fn open(path: &CString) -> u64 {
 
 #[test]
 fn c_open_find_hit_copy_stays_on_the_original_source_after_disk_changes() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
     let (path, cpath) = file(b"before needle after\r\n");
     let handle = open(&cpath);
     fs::write(&path, b"different working tree").unwrap();
@@ -50,7 +46,7 @@ fn c_open_find_hit_copy_stays_on_the_original_source_after_disk_changes() {
 
 #[test]
 fn c_windows_accept_utf16_and_preserve_embedded_nul_as_json() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
     let utf16: Vec<u8> = "\u{feff}first\r\n🦀 needle\n".encode_utf16().flat_map(u16::to_le_bytes).collect();
     let (_, path) = file(&utf16); let handle = open(&path);
     let lines = take(fcb_reader_lines(handle, 2, 1, 1024));
@@ -64,7 +60,7 @@ fn c_windows_accept_utf16_and_preserve_embedded_nul_as_json() {
 
 #[test]
 fn c_generation_validation_never_selects_a_different_querys_row() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
     let (_, path) = file(b"aaa bbb"); let handle = open(&path);
     let a = CString::new("aaa").unwrap(); let b = CString::new("bbb").unwrap();
     take(unsafe { fcb_reader_find(handle, 1, a.as_ptr(), 10, 100) });
@@ -76,7 +72,7 @@ fn c_generation_validation_never_selects_a_different_querys_row() {
 
 #[test]
 fn c_null_unknown_and_wide_integer_inputs_return_errors_without_panicking() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
     let handle = fcb_reader_create(); assert_ne!(handle, 0);
     assert!(take(unsafe { fcb_reader_open(handle, std::ptr::null(), 100) }).contains("READER_HANDLE_INVALID_ARGUMENT"));
     assert!(take(fcb_reader_info(handle)).contains("READER_HANDLE_NOT_OPEN"));
@@ -90,7 +86,7 @@ fn c_null_unknown_and_wide_integer_inputs_return_errors_without_panicking() {
 
 #[test]
 fn c_cancellation_keeps_the_capture_available_and_strings_outlive_close() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
     let (_, path) = file(b"retained"); let handle = open(&path);
     assert_eq!(fcb_reader_cancel(handle), 1);
     let pointer = fcb_reader_window(handle, 0, 100);

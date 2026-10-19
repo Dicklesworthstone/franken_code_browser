@@ -21,6 +21,7 @@ fn index_construction_function_types_and_header_declarations_agree() {
 
 #[test]
 fn unknown_or_wide_construction_requests_return_independently_owned_errors() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
     // No shared global slots are consumed; real success/lifecycle tests use
     // independent production registries rather than a second simulated engine.
     let responses = [fcb_atlas_index_begin(u64::MAX, 1, 10, 1024, 65536, 1000),
