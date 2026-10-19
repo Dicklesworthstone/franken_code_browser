@@ -61,6 +61,33 @@ char *fcb_saved_results(uint64_t handle, uint64_t generation,
     uint64_t start, uint64_t limit);
 char *fcb_saved_clear_results(uint64_t handle, uint64_t generation);
 
+/* Captured Markdown documentation links and reverse backlinks. This separate
+ * relationship generation is independent of text-query and posting-index
+ * generations. Prepare/clear attempts must increase; failed replacements keep
+ * the last accepted projection. Calls run synchronously on a host worker.
+ *
+ * max_links is 1..4096. max_source_bytes bounds aggregate Markdown member reads
+ * up to 32 MiB; each admitted Markdown member is at most 256 KiB. Inspect
+ * relationships_complete and all omission counters: missing/unsupported or
+ * source-limited documents cannot prove the absence of backlinks. Uses the
+ * pinned first-party Markdown parser and archive-relative destination resolver.
+ * Evidence spans cover the exact whole captured Markdown document. The pinned
+ * parser's block positions are not used as navigation evidence. Link destinations are data; no URL fetch, live source lookup or command
+ * execution occurs. Accepted projections retain metadata, not source payloads.
+ *
+ * direction 0 = all links (member MUST be 0), 1 = outgoing links from member,
+ * 2 = incoming backlinks to member. Member ordinals and filtered page starts are
+ * zero-based; link IDs are one-based. Page limit is 1..128. Missing, unavailable,
+ * external and unresolved destinations remain explicit on link rows. Matching
+ * is exact: there is no case folding, extension inference or directory fallback.
+ * Result pagination does not read archived member payloads.
+ */
+char *fcb_saved_prepare_relationships(uint64_t handle, uint64_t generation,
+    uint64_t max_links, uint64_t max_source_bytes);
+char *fcb_saved_relationships(uint64_t handle, uint64_t generation,
+    uint64_t direction, uint64_t member, uint64_t start, uint64_t limit);
+char *fcb_saved_clear_relationships(uint64_t handle, uint64_t generation);
+
 /* Existing EMPTY destination from fcb_reader_create. Admission precedes member
  * I/O. hit IDs are one-based and qualified by the accepted query generation;
  * member ordinals are zero-based. Reads verify the saved member digest again;
@@ -73,6 +100,16 @@ char *fcb_saved_open_hit_reader(uint64_t handle, uint64_t reader,
     uint64_t generation, uint64_t hit);
 char *fcb_saved_open_member_reader(uint64_t handle, uint64_t reader,
     uint64_t member);
+
+/* Same destination admission and lifetime rules as member/hit reader open.
+ * side 0 opens the whole original source document; side 1 opens a captured target at
+ * byte zero. URL fragments are explicitly unresolved, never silently treated
+ * as proven heading/line anchors. A target must resolve to a captured archive
+ * member; external, missing or unavailable destinations cannot open.
+ * The selected saved member is verified again before reader publication.
+ */
+char *fcb_saved_open_relationship_reader(uint64_t handle, uint64_t reader,
+    uint64_t generation, uint64_t link_id, uint64_t side);
 
 /* Cooperative cancel changes the operation epoch without waiting on source.
  * Close removes authority and cancels work, but does not close delivered readers

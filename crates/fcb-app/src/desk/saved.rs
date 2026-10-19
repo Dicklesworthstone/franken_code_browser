@@ -9,6 +9,7 @@ use crate::output::OutputError;
 use crate::host::saved_repository::{SavedRepositorySession, SavedRepositoryError, SnapshotLimits, Sha256Digest};
 pub(super) use crate::host::saved_repository::desk::SavedDeskError;
 use crate::host::saved_repository::desk::{SavedExpression, SavedExpressionOptions};
+use crate::host::saved_repository::relationships::{SavedRelationshipError, RelationshipDirection, RelationshipSide};
 use fcb::search::expression::ExpressionError;
 
 pub(super) const SAVED_HELP: &str = "\nOffline FCBS repositories (not FCBK reading-desk checkpoints):\n\
@@ -27,6 +28,24 @@ pub(super) const SAVED_HELP: &str = "\nOffline FCBS repositories (not FCBK readi
   saved-expression-page TOKEN EXPR_GEN OFFSET COUNT\n\
   saved-expression-hit TOKEN EXPR_GEN HIT_ID\n\
   saved-expression-clear TOKEN EXPR_GEN\n\
+  saved-links-build TOKEN REL_GEN MAX_LINKS MAX_SOURCE_BYTES\n\
+  saved-links-page TOKEN REL_GEN OFFSET COUNT\n\
+  saved-links-from TOKEN REL_GEN MEMBER OFFSET COUNT\n\
+  saved-backlinks TOKEN REL_GEN MEMBER OFFSET COUNT\n\
+  saved-link-source TOKEN REL_GEN LINK_ID | saved-link-target TOKEN REL_GEN LINK_ID\n\
+  saved-links-clear TOKEN NEW_REL_GEN\n\
+Documentation links use the pinned Markdown parser and exact archive-member\n\
+resolution. Link evidence is the whole original captured Markdown document,\n\
+not a parser block position or inline token. Build scans at most MAX_SOURCE_BYTES of Markdown (up to 32 MiB,\n\
+256 KiB per document), retaining at most 1..4096 links. Read completeness and\n\
+omission counters: partial coverage is not proof that a file has no backlinks.\n\
+REL_GEN is independent of text/index/expression generations; build/clear\n\
+attempts strictly increase. Failed replacement keeps the accepted projection.\n\
+Link pages are metadata-only; COUNT is 1..128. Member ordinals are zero-based,\n\
+link IDs one-based. Only exact captured targets can open. Target navigation\n\
+starts at byte zero; any URL fragment remains explicitly unresolved. External\n\
+links never fetch URLs or open live paths. Link source/target imports change\n\
+the desk revision and retain exact saved bytes; other link commands do not.\n\
 Expressions reuse the first-party 1024-byte/64-token query grammar: one primary\n\
 word or quoted phrase, further required terms, -excluded terms, path: and lang:\n\
 filters (including -path: and -lang:). Matching is case-sensitive. Predicates\n\
@@ -59,6 +78,9 @@ No saved archive handle, index or live-root permission enters a desk checkpoint.
 impl From<SavedRepositoryError> for Failure {
     fn from(error: SavedRepositoryError) -> Self { Self::Saved(SavedDeskError::Saved(error)) }
 }
+impl From<SavedRelationshipError> for Failure {
+    fn from(error: SavedRelationshipError) -> Self { Self::Saved(error.into()) }
+}
 pub(super) struct SavedCommands {
     current: Option<(u64, SavedRepositorySession)>,
     expression: Option<SavedExpression>,
@@ -71,6 +93,7 @@ impl SavedCommands {
             ("saved_owner", self.current.as_ref().map(|(_, s)| s.owner().get())),
             ("saved_query_generation", self.current.as_ref().and_then(|(_, s)| s.accepted_generation())),
             ("saved_index_generation", self.current.as_ref().and_then(|(_, s)| s.index_generation())),
+            ("saved_relationship_generation", self.current.as_ref().and_then(|(_, s)| s.relationship_generation())),
             ("saved_expression_generation", self.expression.as_ref().map(SavedExpression::generation)),
             ("last_saved_expression_attempt", self.current.as_ref().map(|_| self.last_expression_attempt))] {
             out.literal(",")?; out.quoted(key)?; out.literal(":")?;
@@ -109,6 +132,26 @@ impl SavedCommands {
             }
             ("saved-info", [token]) => Ok(self.get(number(token)?)?.info(&mut *canceled)?),
             ("saved-members", [token, first, limit]) => Ok(self.get(number(token)?)?.members(count(first)?, count(limit)?, &mut *canceled)?),
+            ("saved-links-build", [token, generation, limit, bytes]) =>
+                Ok(self.get(number(token)?)?.prepare_relationships(number(generation)?, count(limit)?, number(bytes)?, &mut *canceled)?),
+            ("saved-links-page", [token, generation, first, limit]) =>
+                Ok(self.get(number(token)?)?.relationship_page(number(generation)?, None, RelationshipDirection::All,
+                    count(first)?, count(limit)?, &mut *canceled)?),
+            ("saved-links-from" | "saved-backlinks", [token, generation, member, first, limit]) => {
+                let direction = if command == "saved-links-from" { RelationshipDirection::Outgoing }
+                    else { RelationshipDirection::Incoming };
+                Ok(self.get(number(token)?)?.relationship_page(number(generation)?, Some(count(member)?), direction,
+                    count(first)?, count(limit)?, &mut *canceled)?)
+            }
+            ("saved-link-source" | "saved-link-target", [token, generation, link]) => {
+                let side = if command == "saved-link-source" { RelationshipSide::Evidence } else { RelationshipSide::Target };
+                let saved = self.get(number(token)?)?;
+                let opened = saved.open_relationship_desk(desk, expected, attempt,
+                    number(generation)?, number(link)?, side, &mut *canceled)?;
+                Ok(saved.desk_open_response(desk, &opened)?)
+            }
+            ("saved-links-clear", [token, generation]) =>
+                Ok(self.get(number(token)?)?.clear_relationships(number(generation)?, &mut *canceled)?),
             ("saved-find" | "saved-find-text-hex", [token, generation, limit, text]) => {
                 let decoded;
                 let needle = if command == "saved-find-text-hex" {

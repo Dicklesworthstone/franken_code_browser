@@ -11,14 +11,16 @@ use crate::host::desk::{DeskSession, DeskSessionError, DeskError,
     imports::{DeskImport, ImportedSourceId}};
 use super::{SavedRepositorySession, SavedRepositoryError, PagedCapture, PagedHit,
     PagedMemberData, PagedSearchError, PagedSnapshotError, FileId, SourceRevision, ByteLength,
-    RawPath, Sha256Digest, HostResponse, OutputError, AppError, check};
+    RawPath, Sha256Digest, HostResponse, OutputError, AppError, check,
+    relationships::{RelationshipSide, SavedRelationshipError, fragment_label}};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SavedDeskError { Saved(SavedRepositoryError), Desk(DeskSessionError), Expression(expression::ExpressionError) }
+pub enum SavedDeskError { Saved(SavedRepositoryError), Desk(DeskSessionError),
+    Expression(expression::ExpressionError), Relationship(SavedRelationshipError) }
 impl std::fmt::Display for SavedDeskError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self { Self::Saved(e) => write!(f, "{e}"), Self::Desk(e) => write!(f, "{e}"),
-            Self::Expression(e) => write!(f, "{e}") }
+            Self::Expression(e) => write!(f, "{e}"), Self::Relationship(e) => write!(f, "{e}") }
     }
 }
 impl std::error::Error for SavedDeskError {}
@@ -29,6 +31,9 @@ impl From<PagedSearchError> for SavedDeskError { fn from(e: PagedSearchError) ->
 impl From<PagedSnapshotError> for SavedDeskError { fn from(e: PagedSnapshotError) -> Self { Self::Saved(e.into()) } }
 impl From<OutputError> for SavedDeskError { fn from(e: OutputError) -> Self { Self::Saved(e.into()) } }
 impl From<AppError> for SavedDeskError { fn from(e: AppError) -> Self { Self::Saved(e.into()) } }
+impl From<SavedRelationshipError> for SavedDeskError {
+    fn from(e: SavedRelationshipError) -> Self { Self::Relationship(e) }
+}
 impl From<expression::ExpressionError> for SavedDeskError {
     fn from(e: expression::ExpressionError) -> Self { Self::Expression(e) }
 }
@@ -36,7 +41,7 @@ impl SavedDeskError {
     pub fn is_canceled(self) -> bool { match self { Self::Saved(e) => e.is_canceled(), Self::Desk(e) => e.is_canceled(),
         Self::Expression(expression::ExpressionError::Canceled) => true,
         Self::Expression(expression::ExpressionError::Search(e)) => SavedRepositoryError::Query(e).is_canceled(),
-        Self::Expression(_) => false,
+        Self::Expression(_) => false, Self::Relationship(e) => e.is_canceled(),
     } }
 }
 
@@ -50,6 +55,7 @@ pub struct SavedDeskOpen {
     source_digest: Sha256Digest,
     query: Option<(u64, u64)>,
     expression: Option<(u64, u64)>,
+    relationship: Option<(u64, u64, RelationshipSide, bool)>,
     selection: Option<ByteRange>,
     member_bytes_read: u64,
     member_read_calls: u64,
@@ -72,6 +78,29 @@ impl SavedRepositorySession {
             .ok_or(SavedRepositoryError::MissingHit)?;
         let hit = *self.accepted(generation)?.report.hits().get(position).ok_or(SavedRepositoryError::MissingHit)?;
         self.open_desk(desk, expected, attempt, hit.ordinal(), Some((hit_id, hit)), &mut canceled)
+    }
+
+    /// Follow the complete original Markdown evidence or its exact captured member into
+    /// normal Desk history. Preparation validates both endpoints before archive
+    /// I/O; the common import transaction preserves previous place on failure.
+    /// Unqualified fragments are retained as unresolved receipt metadata while
+    /// a target-side navigation explicitly selects the captured file's start.
+    pub fn open_relationship_desk(&mut self, desk: &mut DeskSession, expected: u64,
+        attempt: u64, generation: u64, link_id: u64, side: RelationshipSide,
+        mut canceled: impl FnMut() -> bool) -> Result<SavedDeskOpen, SavedDeskError> {
+        validate_desk(desk, expected, attempt)?;
+        check(&mut canceled)?;
+        let target = self.relationship_target(generation, link_id, side)?;
+        self.validate_desk_member(desk, expected, attempt, target.member, &mut canceled)?;
+        let before = self.archive.load_stats();
+        let capture = self.load_relationship_target(target, &mut canceled)?;
+        let after = self.archive.load_stats();
+        let mut opened = self.import_desk_capture(desk, expected, attempt, target.member,
+            &capture, target.selection, None,
+            (after.bytes_read - before.bytes_read, after.read_calls - before.read_calls), &mut canceled)?;
+        // Infallible metadata after accepted navigation, never another action.
+        opened.relationship = Some((generation, link_id, side, target.fragment_unresolved));
+        Ok(opened)
     }
     fn open_desk(&mut self, desk: &mut DeskSession, expected: u64, attempt: u64,
         ordinal: usize, selected: Option<(u64, PagedHit)>, canceled: &mut impl FnMut() -> bool)
@@ -128,7 +157,8 @@ impl SavedRepositorySession {
         let imported = desk.import_source(expected, attempt, origin, &label, capture.bytes(),
             selection.map_or(0, |r| r.start().get()), selection, &mut *canceled)?;
         // No fallible work or cancellation gate after the accepted transaction.
-        Ok(SavedDeskOpen { imported, archive, member: ordinal, source_digest, query, expression: None, selection,
+        Ok(SavedDeskOpen { imported, archive, member: ordinal, source_digest, query, expression: None,
+            relationship: None, selection,
             member_bytes_read: io.0, member_read_calls: io.1 })
     }
 
@@ -157,8 +187,15 @@ impl SavedRepositorySession {
         out.literal(",\"hit_id\":")?; super::optional(&mut out, opened.query.map(|q| q.1))?;
         out.literal(",\"expression_generation\":")?; super::optional(&mut out, opened.expression.map(|q| q.0))?;
         out.literal(",\"expression_hit_id\":")?; super::optional(&mut out, opened.expression.map(|q| q.1))?;
+        out.literal(",\"relationship_generation\":")?; super::optional(&mut out, opened.relationship.map(|r| r.0))?;
+        out.literal(",\"relationship_link_id\":")?; super::optional(&mut out, opened.relationship.map(|r| r.1))?;
+        out.literal(",\"relationship_side\":")?;
+        match opened.relationship { Some((_, _, side, _)) => out.quoted(side.name())?, None => out.literal("null")? }
+        out.literal(",\"fragment_resolution\":")?;
+        match opened.relationship { Some((_, _, _, unresolved)) => out.quoted(fragment_label(unresolved))?, None => out.literal("null")? }
         out.literal(",\"selection_namespace\":")?;
-        out.quoted(if opened.expression.is_some() { "saved-expression" } else if opened.query.is_some() { "saved-literal" } else { "saved-member" })?;
+        out.quoted(if opened.relationship.is_some() { "saved-relationship" } else if opened.expression.is_some() {
+            "saved-expression" } else if opened.query.is_some() { "saved-literal" } else { "saved-member" })?;
         out.literal(",\"selection\":")?;
         match opened.selection { Some(r) => out.range(r)?, None => out.literal("null")? }
         out.literal("}\n")?;

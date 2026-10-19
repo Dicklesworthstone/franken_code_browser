@@ -8,6 +8,7 @@ use std::{mem::size_of, path::Path, sync::{Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}};
 use fcb_app::host::{HostResponse, saved_repository::{SavedRepositorySession, SavedRepositoryError,
     SnapshotLimits, Sha256Digest}};
+use fcb_app::host::saved_repository::relationships::{SavedRelationshipError, RelationshipDirection, RelationshipSide};
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
 use super::reader_sessions::{self, ReaderSessions};
 
@@ -15,9 +16,10 @@ pub(super) const MAX_SAVED_SESSIONS: usize = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AccessError {
     Unknown, NotOpen, AlreadyOpen, Busy, Capacity, Canceled, Closed, Poisoned,
-    InvalidArgument, Saved(SavedRepositoryError), Reader(reader_sessions::AccessError),
+    InvalidArgument, Saved(SavedRepositoryError), Relationship(SavedRelationshipError), Reader(reader_sessions::AccessError),
 }
 impl From<SavedRepositoryError> for AccessError { fn from(e: SavedRepositoryError) -> Self { Self::Saved(e) } }
+impl From<SavedRelationshipError> for AccessError { fn from(e: SavedRelationshipError) -> Self { Self::Relationship(e) } }
 impl From<reader_sessions::AccessError> for AccessError { fn from(e: reader_sessions::AccessError) -> Self { Self::Reader(e) } }
 impl std::fmt::Display for AccessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -27,7 +29,8 @@ impl std::fmt::Display for AccessError {
             Self::Capacity => "SAVED_HANDLE_CAPACITY", Self::Canceled => "SAVED_HANDLE_CANCELED",
             Self::Closed => "SAVED_HANDLE_CLOSED", Self::Poisoned => "SAVED_HANDLE_POISONED",
             Self::InvalidArgument => "SAVED_HANDLE_INVALID_ARGUMENT",
-            Self::Saved(e) => return write!(f, "{e}"), Self::Reader(e) => return write!(f, "{e}"),
+            Self::Saved(e) => return write!(f, "{e}"), Self::Relationship(e) => return write!(f, "{e}"),
+            Self::Reader(e) => return write!(f, "{e}"),
         })
     }
 }
@@ -36,6 +39,7 @@ impl AccessError {
         match self {
             Self::Canceled | Self::Closed => true,
             Self::Saved(error) => error.is_canceled(), Self::Reader(error) => error.canceled(),
+            Self::Relationship(error) => error.is_canceled(),
             _ => false,
         }
     }
@@ -63,9 +67,15 @@ pub(super) enum Command<'a> {
     Search { generation: u64, needle: &'a str, limit: usize },
     Results { generation: u64, start: usize, limit: usize },
     Clear { generation: u64 },
+    PrepareRelationships { generation: u64, max_links: usize, max_source_bytes: u64 },
+    Relationships { generation: u64, member: Option<usize>, direction: RelationshipDirection, start: usize, limit: usize },
+    ClearRelationships { generation: u64 },
 }
 #[derive(Clone, Copy)]
-pub(super) enum Selection { Hit { generation: u64, id: u64 }, Member(usize) }
+pub(super) enum Selection {
+    Hit { generation: u64, id: u64 }, Member(usize),
+    Relationship { generation: u64, id: u64, side: RelationshipSide },
+}
 
 struct Permit(Arc<AtomicUsize>);
 impl Drop for Permit { fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); } }
@@ -139,19 +149,25 @@ impl SavedSessions {
         cell.validate(epoch)?;
         let session = state.as_mut().ok_or(AccessError::NotOpen)?;
         let mut stop = || cell.validate(epoch).is_err() || canceled();
-        let result = match command {
-            Command::Info => session.info(&mut stop),
-            Command::Members { start, limit } => session.members(start, limit, &mut stop),
-            Command::AttachIndex { generation, path, pin } => session.attach_index(generation, path, pin, &mut stop),
-            Command::DetachIndex { generation } => session.detach_index(generation, &mut stop),
-            Command::Search { generation, needle, limit } => session.search(generation, needle, limit, &mut stop),
-            Command::Results { generation, start, limit } => session.results(generation, start, limit, &mut stop),
-            Command::Clear { generation } => session.clear_results(generation, &mut stop),
+        let result: Result<HostResponse, AccessError> = match command {
+            Command::PrepareRelationships { generation, max_links, max_source_bytes } =>
+                session.prepare_relationships(generation, max_links, max_source_bytes, &mut stop).map_err(AccessError::from),
+            Command::Relationships { generation, member, direction, start, limit } =>
+                session.relationship_page(generation, member, direction, start, limit, &mut stop).map_err(AccessError::from),
+            Command::ClearRelationships { generation } =>
+                session.clear_relationships(generation, &mut stop).map_err(AccessError::from),
+            Command::Info => session.info(&mut stop).map_err(AccessError::from),
+            Command::Members { start, limit } => session.members(start, limit, &mut stop).map_err(AccessError::from),
+            Command::AttachIndex { generation, path, pin } => session.attach_index(generation, path, pin, &mut stop).map_err(AccessError::from),
+            Command::DetachIndex { generation } => session.detach_index(generation, &mut stop).map_err(AccessError::from),
+            Command::Search { generation, needle, limit } => session.search(generation, needle, limit, &mut stop).map_err(AccessError::from),
+            Command::Results { generation, start, limit } => session.results(generation, start, limit, &mut stop).map_err(AccessError::from),
+            Command::Clear { generation } => session.clear_results(generation, &mut stop).map_err(AccessError::from),
         };
         // Acceptance precedes delivery. Late cancellation can suppress output,
         // not roll back state. Info/results reconcile the known handle.
         cell.validate(epoch)?;
-        result.map_err(AccessError::from)
+        result
     }
     /// Lock saved source before destination, both nonblocking. The existing
     /// reader registry admits an empty handle BEFORE any member read occurs.
@@ -167,9 +183,11 @@ impl SavedSessions {
         let mut stop = || cell.validate(epoch).is_err() || canceled();
         let result = readers.initialize_prepared(reader, |owner, reader_stop| {
             match selection {
-                Selection::Hit { generation, id } => session.open_hit_reader(owner, generation, id, reader_stop),
-                Selection::Member(ordinal) => session.open_member_reader(owner, ordinal, reader_stop),
-            }.map_err(AccessError::from)
+                Selection::Hit { generation, id } => session.open_hit_reader(owner, generation, id, reader_stop).map_err(AccessError::from),
+                Selection::Member(ordinal) => session.open_member_reader(owner, ordinal, reader_stop).map_err(AccessError::from),
+                Selection::Relationship { generation, id, side } =>
+                    session.open_relationship_reader(owner, generation, id, side, reader_stop).map_err(AccessError::from),
+            }
         }, &mut stop);
         cell.validate(epoch)?;
         result
@@ -202,3 +220,7 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, AccessError> {
 #[cfg(all(test, unix))]
 #[path = "saved_sessions_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "saved_relationships_sessions_tests.rs"]
+mod relationships_tests;

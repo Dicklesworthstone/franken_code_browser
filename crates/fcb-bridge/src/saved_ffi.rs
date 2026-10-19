@@ -4,6 +4,7 @@
 //! fcb-app; reader activation targets the existing shared reader registry.
 use std::{ffi::c_char, path::Path, sync::OnceLock};
 use fcb_app::host::{HostResponse, saved_repository::{Sha256Digest, SnapshotLimits}};
+use fcb_app::host::saved_repository::relationships::{RelationshipDirection, RelationshipSide};
 use super::{cstr, reply, string_out};
 use super::saved_sessions::{AccessError, Command, SavedSessions, Selection};
 
@@ -93,6 +94,34 @@ pub extern "C" fn fcb_saved_results(handle: u64, generation: u64, start: u64, li
 pub extern "C" fn fcb_saved_clear_results(handle: u64, generation: u64) -> *mut c_char {
     reply(|| answer(handle, |sessions| sessions.execute(handle, Command::Clear { generation }, || false)))
 }
+/// Build a bounded Markdown-document-link projection from this opened archive.
+/// Evidence is the exact whole captured document; parser block spans are not used.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_saved_prepare_relationships(handle: u64, generation: u64,
+    max_links: u64, max_source_bytes: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| sessions.execute(handle,
+        Command::PrepareRelationships { generation, max_links: number(max_links)?, max_source_bytes }, || false)))
+}
+/// direction: 0 = all (member must be zero), 1 = outgoing, 2 = incoming.
+/// Filtered member ordinals are zero-based. No archive member payload is read.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_saved_relationships(handle: u64, generation: u64, direction: u64,
+    member: u64, start: u64, limit: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| {
+        let (direction, member) = match direction {
+            0 if member == 0 => (RelationshipDirection::All, None),
+            1 => (RelationshipDirection::Outgoing, Some(number(member)?)),
+            2 => (RelationshipDirection::Incoming, Some(number(member)?)),
+            _ => return Err(AccessError::InvalidArgument),
+        };
+        sessions.execute(handle, Command::Relationships { generation, member, direction,
+            start: number(start)?, limit: number(limit)? }, || false)
+    }))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_saved_clear_relationships(handle: u64, generation: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| sessions.execute(handle, Command::ClearRelationships { generation }, || false)))
+}
 /// Existing EMPTY reader destination. Source is reverified from the open archive,
 /// never its original live path. An independently delivered reader keeps bytes.
 #[unsafe(no_mangle)]
@@ -107,6 +136,19 @@ pub extern "C" fn fcb_saved_open_member_reader(handle: u64, reader: u64, member:
     reply(|| answer(handle, |sessions| {
         let readers = crate::reader_ffi::registry().ok_or(crate::reader_sessions::AccessError::UnknownHandle)?;
         sessions.open_reader(handle, readers, reader, Selection::Member(number(member)?), || false)
+    }))
+}
+/// Open evidence (side 0) or the captured linked member (side 1) in an EMPTY
+/// reader. Target navigation explicitly starts at file byte zero; any fragment
+/// remains declared unresolved in the receipt. Never opens a live path or URL.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_saved_open_relationship_reader(handle: u64, reader: u64,
+    generation: u64, link_id: u64, side: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| {
+        let side = match side { 0 => RelationshipSide::Evidence, 1 => RelationshipSide::Target,
+            _ => return Err(AccessError::InvalidArgument) };
+        let readers = crate::reader_ffi::registry().ok_or(crate::reader_sessions::AccessError::UnknownHandle)?;
+        sessions.open_reader(handle, readers, reader, Selection::Relationship { generation, id: link_id, side }, || false)
     }))
 }
 /// Nonblocking cooperative cancellation of the current operation. Accepted
@@ -125,3 +167,7 @@ pub extern "C" fn fcb_saved_close(handle: u64) -> u8 {
 #[cfg(test)]
 #[path = "saved_ffi_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "saved_relationships_ffi_tests.rs"]
+mod relationships_tests;

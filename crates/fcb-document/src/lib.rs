@@ -26,6 +26,10 @@ pub mod publication;
 pub mod session;
 /// Bounded captured-document reading, heading navigation and explicit copy domains.
 pub mod reader;
+/// Original capture identities for upstream Markdown links and document evidence.
+pub mod links;
+pub use links::{CapturedDocumentLinks, DocumentLink, DocumentLinkError,
+    resolve_document_destination};
 
 pub use gallery::{
     BackingScale, CharacterBoundary, ContrastOracle, FractionalOffset, GalleryCaret,

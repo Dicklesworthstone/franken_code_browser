@@ -87,9 +87,11 @@ pub struct SavedRepositorySession {
     archive: PagedSnapshot<File>,
     index: Option<AcceptedIndex>,
     query: Option<AcceptedQuery>,
+    relationships: Option<relationships::AcceptedRelationships>,
     path: PathBuf,
     last_query_attempt: u64,
     last_index_attempt: u64,
+    last_relationship_attempt: u64,
     next_allocation: u64,
     budget: ResourceBudget,
     _lease: ResourceLease,
@@ -113,8 +115,8 @@ impl SavedRepositorySession {
         if metadata.len() > limits.max_document_bytes as u64 { return Err(SavedRepositoryError::InvalidLimits); }
         let archive = PagedSnapshot::open(file, owner, limits, &budget, allocation(2)?, &mut canceled)?;
         check(&mut canceled)?;
-        Ok(Self { archive, index: None, query: None, path, last_query_attempt: 0,
-            last_index_attempt: 0, next_allocation: 3, budget, _lease: lease })
+        Ok(Self { archive, index: None, query: None, relationships: None, path, last_query_attempt: 0,
+            last_index_attempt: 0, last_relationship_attempt: 0, next_allocation: 3, budget, _lease: lease })
     }
     pub fn owner(&self) -> ArenaOwnerId { self.archive.directory().owner() }
     pub fn archive_digest(&self) -> Sha256Digest { self.archive.directory().digest() }
@@ -127,6 +129,7 @@ impl SavedRepositorySession {
         out.literal(",\"archive_path\":")?; out.path(&self.path)?;
         out.literal(",\"accepted_query_generation\":")?; optional(&mut out, self.accepted_generation())?;
         out.literal(",\"accepted_index_generation\":")?; optional(&mut out, self.index_generation())?;
+        out.literal(",\"accepted_relationship_generation\":")?; optional(&mut out, self.relationship_generation())?;
         let directory = self.archive.directory();
         out.literal(",\"initial_archive_bytes_read\":")?; out.integer(directory.validation_stats().bytes_read)?;
         out.literal(",\"directory_reserved_bytes\":")?; out.integer(directory.retained_charge() as u64)?;
@@ -433,3 +436,7 @@ fn copy_text(text: &str) -> Result<String, SavedRepositoryError> {
 
 /// Verified saved members and search hits transferred into persistent readers.
 pub mod desk;
+
+/// Parsed Markdown links and reverse backlinks in the closed saved manifest.
+pub mod relationships;
+pub use relationships::{RelationshipDirection, RelationshipSide, SavedRelationshipError};
