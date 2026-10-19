@@ -20,6 +20,10 @@ use indexed::{IndexQueryUsage, RetainedIndex, IndexBuildWork};
 mod scope;
 pub use scope::{AtlasSearchScope, AtlasSearchPathKind, MAX_SEARCH_SCOPE_TOKENS, MAX_SEARCH_SCOPE_TOKEN_BYTES,
     MAX_SEARCH_SCOPE_LIST_BYTES, MAX_SEARCH_SCOPE_PATH_BYTES};
+mod structure;
+pub use structure::{AtlasStructureMode, AtlasStructureOptions, MAX_ATLAS_STRUCTURE_METADATA_BYTES,
+    MAX_ATLAS_STRUCTURE_NAME_BYTES};
+use structure::{StructureQuery, StructureRow};
 
 use std::{mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, ByteRange, FileId, SourceRevision};
@@ -115,6 +119,8 @@ struct Unavailable { file: FileId, reason: &'static str }
 struct Snapshot {
     generation: u64,
     needle: String,
+    structure: Option<StructureQuery>,
+    structure_rows: Vec<StructureRow>,
     scope: AtlasSearchScope,
     scope_files: Option<Vec<FileId>>,
     eligible_files: usize,
@@ -383,9 +389,12 @@ fn summary(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot) -> Resul
     out.literal(",\"needle\":")?; out.quoted(&snapshot.needle)?;
     snapshot.scope.encode(out)?;
     out.literal(",\"search_strategy\":")?;
-    out.quoted(if snapshot.index_usage.is_some() { "retained-ephemeral-index" } else { "live-capture-scan" })?;
+    out.quoted(if snapshot.structure.is_some() { "live-structure-scan" }
+        else if snapshot.index_usage.is_some() { "retained-ephemeral-index" } else { "live-capture-scan" })?;
     if let Some(usage) = snapshot.index_usage { usage.encode(out)?; }
-    out.literal(",\"mode\":\"exact-decoded-literal\",\"source_observation\":\"per-file-captures-not-atomic-workspace\",\"discovery_complete\":")?;
+    if let Some(structure) = &snapshot.structure { structure.encode(out)?; }
+    else { out.literal(",\"mode\":\"exact-decoded-literal\"")?; }
+    out.literal(",\"source_observation\":\"per-file-captures-not-atomic-workspace\",\"discovery_complete\":")?;
     out.boolean(atlas.atlas().discovery_complete())?;
     out.literal(",\"search_in_progress\":")?; out.boolean(snapshot.stop_reason.is_none())?;
     out.literal(",\"stop_reason\":")?;
@@ -464,6 +473,11 @@ fn encode_hit(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot,
     out.literal(",\"original_range\":")?; out.range(hit.original_range)?;
     out.literal(",\"path\":")?;
     out.path(&atlas.atlas().catalog().entry(hit.file).ok_or(AtlasSearchError::WrongAtlas)?.path().raw().to_path_buf())?;
+    if snapshot.structure.is_some() {
+        let position = hit.id.checked_sub(1).and_then(|id| usize::try_from(id).ok())
+            .ok_or(AtlasSearchError::MissingHit)?;
+        snapshot.structure_rows.get(position).ok_or(AtlasSearchError::MissingHit)?.encode(out)?;
+    }
     Ok(())
 }
 fn check(canceled: &mut impl FnMut() -> bool) -> Result<(), AtlasSearchError> {

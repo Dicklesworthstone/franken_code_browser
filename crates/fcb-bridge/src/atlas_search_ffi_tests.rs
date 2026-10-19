@@ -187,6 +187,44 @@ fn c_scoped_live_and_indexed_search_freeze_lists_before_hit_and_source_limits() 
 }
 
 #[test]
+fn c_structure_query_reuses_progress_and_exact_reader_import_without_text_fallback() {
+    use super::structure::fcb_atlas_structure_begin;
+    let _guard = SEARCH_FFI_LOCK.lock().unwrap();
+    let root = std::env::temp_dir().join(format!("fcb-structure-ffi-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(root.join("outside.md"), b"# Start!\n").unwrap();
+    fs::write(root.join("docs/README.md"), b"# Start!\n\n# Start!\n").unwrap();
+    let root_c = CString::new(root.to_str().unwrap()).unwrap();
+    let atlas = fcb_atlas_create(); assert_ne!(atlas, 0);
+    assert!(take(unsafe { fcb_atlas_open(atlas, root_c.as_ptr(), 100) }).contains("\"status\":\"ok\""));
+    let needle = CString::new("Start!").unwrap(); let path = CString::new("docs").unwrap();
+    for (mode, name_mode) in [(0, 0), (3, 0), (2, 3)] {
+        let rejected = take(unsafe { fcb_atlas_structure_begin(atlas, 1, mode, name_mode,
+            needle.as_ptr(), std::ptr::null(), std::ptr::null(), 1, path.as_ptr(), 10, 10, 65536, 65536) });
+        assert!(rejected.contains("INVALID_ARGUMENT"));
+    }
+    let begin = take(unsafe { fcb_atlas_structure_begin(atlas, 1, 2, 0, needle.as_ptr(),
+        std::ptr::null(), std::ptr::null(), 1, path.as_ptr(), 10, 10, 65536, 65536) });
+    assert!(begin.contains("\"source_bytes_read\":\"0\""));
+    assert!(begin.contains("\"eligible_files\":\"1\""));
+    let result = take(fcb_atlas_search_step(atlas, 1));
+    assert!(result.contains("\"search_complete\":true"), "{result}");
+    assert!(result.contains("\"retained_hits\":\"2\""));
+    assert!(result.contains("\"heading_slug\":\"start-2\""));
+    assert!(!result.contains("outside.md"));
+    fs::write(root.join("docs/README.md"), b"live replacement").unwrap();
+    let reader = fcb_reader_create(); assert_ne!(reader, 0);
+    let receipt = take(fcb_atlas_search_open_reader(atlas, reader, 1, 2));
+    assert!(receipt.contains("\"source_reopened\":false"));
+    assert!(receipt.contains("\"heading_slug\":\"start-2\""));
+    assert!(take(fcb_atlas_search_clear(atlas, 2)).contains("\"retained_hits\":\"0\""));
+    assert_eq!(fcb_atlas_close(atlas), 1);
+    assert!(take(fcb_reader_copy_range(reader, 0, 8)).contains("2320537461727421"));
+    assert_eq!(fcb_reader_close(reader), 1);
+}
+
+#[test]
 fn c_path_scope_freezes_exact_components_and_rejects_invalid_replacements_before_admission() {
     use super::index::{fcb_atlas_index_prepare, fcb_atlas_search_indexed_begin_path_scoped,
         fcb_atlas_search_indexed_path_scoped};

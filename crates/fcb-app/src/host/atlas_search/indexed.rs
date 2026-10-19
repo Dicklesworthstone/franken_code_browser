@@ -200,7 +200,8 @@ impl RetainedAtlasSearch {
         let unavailable = query.report().unavailable_files().len();
         let eligible_captured = query.report().known_files() - unavailable;
         let pending = eligible_files.checked_sub(unavailable).ok_or(AtlasSearchError::WrongAtlas)?;
-        let mut snapshot = Snapshot { generation, needle: copy_text(needle)?, files: reserve(capacity)?,
+        let mut snapshot = Snapshot { generation, needle: copy_text(needle)?, structure: None,
+            structure_rows: Vec::new(), files: reserve(capacity)?,
             scope, scope_files, eligible_files,
             hits: reserve(max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?, examined: unavailable, scanned: 0,
             unavailable, pending, matches_seen: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0,

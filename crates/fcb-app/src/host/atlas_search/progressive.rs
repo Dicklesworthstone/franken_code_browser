@@ -56,7 +56,7 @@ pub(super) struct SearchWork {
     pub(super) snapshot: Snapshot,
     pub(super) execution: SearchExecution,
 }
-pub(super) enum SearchExecution { Live(LiveWork), Indexed(IndexedWork) }
+pub(super) enum SearchExecution { Live(LiveWork), Indexed(IndexedWork), Structure(super::structure::StructureWork) }
 pub(super) struct LiveWork {
     pattern: StreamingNeedle,
     options: AtlasSearchOptions,
@@ -146,7 +146,8 @@ impl RetainedAtlasSearch {
         let charge = charge.checked_add(scope_bytes).ok_or(AppError::Admission)?;
         let lease = self.budget.try_reserve_managed(self.manifest.owner(), state_id, ByteLength::new(charge as u64))
             .map_err(|_| AppError::Admission)?;
-        let snapshot = Snapshot { generation, needle: copy_text(needle)?, files: reserve(capacity)?,
+        let snapshot = Snapshot { generation, needle: copy_text(needle)?, structure: None,
+            structure_rows: Vec::new(), files: reserve(capacity)?,
             scope, scope_files: scope.freeze(atlas, eligible_files, canceled)?, eligible_files,
             hits: reserve(options.max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?,
             examined: 0, scanned: 0, unavailable: 0, pending: eligible_files,
@@ -181,6 +182,7 @@ impl RetainedAtlasSearch {
                 update_coverage(atlas, snapshot, live);
             }
             SearchExecution::Indexed(indexed) => self.advance_indexed_work(atlas, snapshot, indexed, canceled)?,
+            SearchExecution::Structure(structure) => self.advance_structure_work(atlas, snapshot, structure, canceled)?,
         }
         self.validate(atlas)?; check(canceled)?;
         snapshot.step_count = snapshot.step_count.checked_add(1).ok_or(AtlasSearchError::IdentityExhausted)?;
