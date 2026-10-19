@@ -6,6 +6,10 @@ import Foundation
 @_silgen_name("fcb_desk_open") private func fcb_desk_open(_ h: UInt64, _ revision: UInt64, _ attempt: UInt64, _ path: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_apply") private func fcb_desk_apply(_ h: UInt64, _ revision: UInt64, _ attempt: UInt64, _ kind: UInt64,
     _ subject: UInt64, _ start: UInt64, _ end: UInt64, _ label: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_desk_annotate") private func fcb_desk_annotate(_ h: UInt64, _ revision: UInt64, _ attempt: UInt64,
+    _ pane: UInt64, _ label: UnsafePointer<CChar>?, _ body: UnsafePointer<UInt8>?, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_desk_edit_bookmark") private func fcb_desk_edit_bookmark(_ h: UInt64, _ revision: UInt64, _ attempt: UInt64,
+    _ bookmark: UInt64, _ label: UnsafePointer<CChar>?, _ body: UnsafePointer<UInt8>?, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_window") private func fcb_desk_window(_ h: UInt64, _ revision: UInt64, _ pane: UInt64, _ offset: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_import_reader") private func fcb_desk_import_reader(_ h: UInt64, _ revision: UInt64, _ attempt: UInt64,
     _ reader: UInt64, _ start: UInt64, _ end: UInt64) -> UnsafeMutablePointer<CChar>?
@@ -31,6 +35,24 @@ extension AtlasReadingDeskTransport {
         case .apply(let revision, let attempt, let kind, let subject, let start, let end, let label):
             guard label.utf8.count <= 256, !label.utf8.contains(0) else { return nil }
             return label.withCString { take(fcb_desk_apply(handle, revision, attempt, kind, subject, start, end, $0)) }
+        case .annotate(let revision, let attempt, let pane, let label, let body):
+            guard AtlasDeskNoteTarget.validText(label: label, body: body) else { return nil }
+            return label.withCString { labelPointer in
+                // Counted original UTF-8 preserves embedded NUL and multiline
+                // note text; only the label uses the legacy C-string contract.
+                Array(body.utf8).withUnsafeBufferPointer { bytes in
+                    take(fcb_desk_annotate(handle, revision, attempt, pane,
+                        labelPointer, bytes.baseAddress, UInt64(bytes.count)))
+                }
+            }
+        case .editBookmark(let revision, let attempt, let bookmark, let label, let body):
+            guard AtlasDeskNoteTarget.validText(label: label, body: body) else { return nil }
+            return label.withCString { labelPointer in
+                Array(body.utf8).withUnsafeBufferPointer { bytes in
+                    take(fcb_desk_edit_bookmark(handle, revision, attempt, bookmark,
+                        labelPointer, bytes.baseAddress, UInt64(bytes.count)))
+                }
+            }
         case .window(let revision, let pane, let offset):
             return take(fcb_desk_window(handle, revision, pane, offset, 64 * 1024))
         case .keep(let revision, let attempt, let reader, let start, let end):

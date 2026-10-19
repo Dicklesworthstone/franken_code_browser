@@ -19,6 +19,7 @@ private final class AtlasDeskFileAccess {
     @Environment(\.dismiss) private var dismiss
     @State private var confirmRestore = false
     @State private var panelNotice = ""
+    @State private var noteDraft: AtlasDeskNoteDraft?
     @State private var readerCapture: AtlasDeskReaderCapture?
     @State private var readerTask: Task<Void, Never>?
     @State private var pins = AtlasPinnedReaders<AtlasPagedReaderModel>(
@@ -48,18 +49,19 @@ private final class AtlasDeskFileAccess {
                 Spacer()
                 Button("Reload state", action: model.reload).disabled(!model.canOperate)
             }
-            Text("Checkpoints contain all retained source bytes and personal labels, unencrypted. Source files are read only. Save explicitly before closing the app.")
+            Text("Checkpoints contain all retained source bytes, personal labels and full note text, unencrypted. Source files are read only. Save explicitly before closing the app.")
                 .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(16).frame(minWidth: 900, idealWidth: 1150, minHeight: 600, idealHeight: 740)
         .onAppear { model.start() }
         .sheet(item: $readerCapture) { capture in AtlasDeskReaderView(desk: model, capture: capture, pins: pins) }
+        .sheet(item: $noteDraft) { draft in AtlasDeskNoteEditor(model: model, draft: draft) }
         .onDisappear { readerTask?.cancel(); readerCapture?.reader.close(); pins.closeAll() }
         .alert("Replace this reading desk?", isPresented: $confirmRestore) {
             Button("Choose checkpoint…", action: chooseCheckpoint)
             Button("Cancel", role: .cancel) { }
         } message: {
-            Text("Opening a checkpoint replaces the current \(model.state?.panes.count ?? 0) panes and \(model.state?.bookmarks.count ?? 0) bookmarks after validation. Save a new checkpoint first if you want to preserve this arrangement.")
+            Text("Opening a checkpoint replaces the current \(model.state?.panes.count ?? 0) panes and \(model.state?.bookmarks.count ?? 0) bookmarks and notes after validation. Save a new checkpoint first if you want to preserve their text and arrangement.")
         }
     }
 
@@ -97,23 +99,45 @@ private final class AtlasDeskFileAccess {
                 }.frame(minHeight: 100)
             }
             Divider()
-            Text("Named bookmarks").font(.headline)
+            HStack {
+                Text("Bookmarks and notes").font(.headline)
+                Spacer()
+                Text("\(model.state?.bookmarks.count ?? 0) / 32").font(.caption).foregroundStyle(.secondary)
+            }
             TextField("Why keep this location?", text: $model.bookmarkLabel)
                 .onSubmit { model.bookmark() }.disabled(!model.canOperate || model.state?.active == nil)
             Button("Bookmark current range", action: model.bookmark)
-                .disabled(!model.canOperate || model.state?.active == nil || model.bookmarkLabel.isEmpty || model.bookmarkLabel.utf8.count > 256)
+                .disabled(!model.canOperate || model.state?.active == nil || model.bookmarkLabel.isEmpty
+                    || model.bookmarkLabel.utf8.count > 256 || model.bookmarkLabel.utf8.contains(0)
+                    || (model.state?.bookmarks.count ?? 32) >= 32)
+            Button("Add note to current range…") {
+                guard let state = model.state, let pane = state.active else { return }
+                panelNotice = ""; noteDraft = AtlasDeskNoteDraft(state: state, pane: pane, label: model.bookmarkLabel)
+            }.disabled(!model.canOperate || model.state?.active == nil || (model.state?.bookmarks.count ?? 32) >= 32)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
                     ForEach(model.state?.bookmarks ?? []) { bookmark in
-                        HStack(alignment: .top) {
-                            Button { model.apply(kind: 4, subject: bookmark.id) } label: {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(bookmark.label).lineLimit(3)
-                                    Text("Byte \(bookmark.location.offset)").font(.caption2).foregroundStyle(.secondary)
-                                }.frame(maxWidth: .infinity, alignment: .leading)
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(alignment: .top) {
+                                Button { model.apply(kind: 4, subject: bookmark.id) } label: {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(bookmark.label).lineLimit(3)
+                                        Text("Byte \(bookmark.location.offset)\(bookmark.body.isEmpty ? "" : " · note")")
+                                            .font(.caption2).foregroundStyle(.secondary)
+                                    }.frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                Button {
+                                    guard let state = model.state else { return }
+                                    panelNotice = ""; noteDraft = AtlasDeskNoteDraft(state: state, bookmark: bookmark)
+                                } label: { Image(systemName: "square.and.pencil") }
+                                .help("Edit this label and personal note without changing its source anchor")
+                                Button { model.apply(kind: 5, subject: bookmark.id) } label: { Image(systemName: "bookmark.slash") }
+                                    .help("Forget this bookmark and its note")
                             }
-                            Button { model.apply(kind: 5, subject: bookmark.id) } label: { Image(systemName: "bookmark.slash") }
-                                .help("Forget this bookmark")
+                            if !bookmark.body.isEmpty {
+                                Text(String(bookmark.body.prefix(200))).font(.caption).foregroundStyle(.secondary)
+                                    .lineLimit(3).textSelection(.enabled)
+                            }
                         }.disabled(!model.canOperate)
                     }
                 }
@@ -188,7 +212,7 @@ private final class AtlasDeskFileAccess {
     private func chooseSource() {
         let panel = NSOpenPanel()
         panel.title = "Capture a source file in the reading desk"
-        panel.message = "Capture up to 4 MiB of current file bytes. Later reads, bookmarks and saved checkpoints retain this exact capture."
+        panel.message = "Capture up to 4 MiB of current file bytes. Later reads, bookmarks, notes and saved checkpoints retain this exact capture."
         panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         guard let access = AtlasDeskFileAccess(selectedURL: url) else { panelNotice = "The selected file did not grant current read access."; return }
@@ -197,7 +221,7 @@ private final class AtlasDeskFileAccess {
     private func chooseCheckpoint() {
         let panel = NSOpenPanel()
         panel.title = "Open a saved reading desk"
-        panel.message = "Restore exact saved source bytes, bookmarks and history. Source labels in the checkpoint never grant access to working-tree files."
+        panel.message = "Restore exact saved source bytes, bookmarks, personal notes and history. Source labels in the checkpoint never grant access to working-tree files."
         panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         guard let access = AtlasDeskFileAccess(selectedURL: url) else { panelNotice = "The selected checkpoint did not grant current read access."; return }
@@ -207,7 +231,7 @@ private final class AtlasDeskFileAccess {
         let panel = NSSavePanel()
         panel.title = "Save a new reading desk checkpoint"
         panel.nameFieldStringValue = "Reading-desk.fcbdesk"
-        panel.message = "Includes all \(model.state?.retainedBytes ?? 0) retained source bytes and personal labels, unencrypted. Choose a new filename; existing checkpoints are preserved."
+        panel.message = "Includes all \(model.state?.retainedBytes ?? 0) retained source bytes, personal labels and full note text, unencrypted. Choose a new filename; existing checkpoints are preserved."
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
         guard let access = AtlasDeskFileAccess(selectedURL: url) else { panelNotice = "The selected destination did not grant current write access."; return }

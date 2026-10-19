@@ -1,11 +1,13 @@
 import Foundation
 
 enum AtlasReadingDeskError: Error, Sendable {
-    case unavailable, invalidInput, invalidResponse, canceled, engine(String)
+    case unavailable, invalidInput, invalidNote, staleNote, invalidResponse, canceled, engine(String)
     var message: String {
         switch self {
         case .unavailable: return "The reading desk could not admit this operation."
         case .invalidInput: return "Choose a valid file, byte range or bookmark label (up to 256 UTF-8 bytes)."
+        case .invalidNote: return "Use a nonempty label up to 256 UTF-8 bytes without NUL, and note text up to 16 KiB."
+        case .staleNote: return "The original source range or saved note version has changed. Your draft is preserved; reopen the current note or choose a current range before saving."
         case .invalidResponse: return "The reading desk response could not be verified. Reload its accepted state before continuing."
         case .canceled: return "The operation was canceled before its next request began."
         case .engine(let code): return "Reading desk operation unavailable (\(code))."
@@ -74,15 +76,112 @@ struct AtlasDeskPane: Decodable, Sendable, Identifiable {
 struct AtlasDeskBookmark: Decodable, Sendable, Identifiable {
     let id: UInt64
     let label: String
+    let body: String
+    let updateSequence: UInt64
     let location: AtlasDeskLocation
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(AtlasDeskNumber.self, forKey: .bookmark).value
         label = try c.decode(String.self, forKey: .label)
+        body = try c.decode(String.self, forKey: .body)
+        updateSequence = try c.decode(AtlasDeskNumber.self, forKey: .update_sequence).value
         location = try AtlasDeskLocation(from: decoder)
-        guard id > 0, !label.isEmpty, label.utf8.count <= 256 else { throw AtlasReadingDeskError.invalidResponse }
+        guard id > 0, !label.isEmpty, label.utf8.count <= 256,
+              body.utf8.count <= 16_384, updateSequence > 0 else { throw AtlasReadingDeskError.invalidResponse }
     }
-    enum CodingKeys: CodingKey { case bookmark, label }
+    enum CodingKeys: CodingKey { case bookmark, label, body, update_sequence }
+}
+
+/// An editor owns this exact source anchor and note version. Navigation,
+/// checkpoint replacement and another edit cannot silently retarget its draft.
+struct AtlasDeskNoteTarget: Sendable {
+    enum Kind: Sendable { case create(pane: UInt64), edit(bookmark: UInt64, sequence: UInt64) }
+    let owner: UInt64
+    let location: AtlasDeskLocation
+    let kind: Kind
+
+    init(state: AtlasDeskState, pane: AtlasDeskPane) {
+        owner = state.owner; location = pane.location; kind = .create(pane: pane.id)
+    }
+    init(state: AtlasDeskState, bookmark: AtlasDeskBookmark) {
+        self.init(owner: state.owner, bookmark: bookmark)
+    }
+    init(owner: UInt64, bookmark: AtlasDeskBookmark) {
+        self.owner = owner; location = bookmark.location
+        kind = .edit(bookmark: bookmark.id, sequence: bookmark.updateSequence)
+    }
+    var isNew: Bool { if case .create = kind { return true }; return false }
+    func isCurrent(in state: AtlasDeskState?) -> Bool {
+        guard let state, state.owner == owner else { return false }
+        switch kind {
+        case .create(let pane): return state.panes.first(where: { $0.id == pane })?.location == location
+        case .edit(let bookmark, let sequence):
+            guard let current = state.bookmarks.first(where: { $0.id == bookmark }) else { return false }
+            return current.location == location && current.updateSequence == sequence
+        }
+    }
+    static func validText(label: String, body: String) -> Bool {
+        !label.isEmpty && label.utf8.count <= 256 && !label.utf8.contains(0) && body.utf8.count <= 16_384
+    }
+}
+
+/// Retain the issued operation when its reply and reconciliation are both
+/// unavailable. Checking its outcome sends only a state request, never a retry.
+struct AtlasDeskNoteSubmission: Sendable {
+    let target: AtlasDeskNoteTarget
+    let attempt: UInt64
+    let baseRevision: UInt64
+    let priorBookmarks: Set<UInt64>
+    let label: String
+    let body: String
+
+    init(target: AtlasDeskNoteTarget, state: AtlasDeskState, attempt: UInt64, label: String, body: String) throws {
+        guard target.isCurrent(in: state) else { throw AtlasReadingDeskError.staleNote }
+        guard AtlasDeskNoteTarget.validText(label: label, body: body), attempt > state.lastAttempt,
+              !target.isNew || state.bookmarks.count < 32 else { throw AtlasReadingDeskError.invalidNote }
+        if case .edit(_, let sequence) = target.kind, sequence == UInt64.max { throw AtlasReadingDeskError.unavailable }
+        self.target = target; self.attempt = attempt; baseRevision = state.revision
+        priorBookmarks = Set(state.bookmarks.map(\.id)); self.label = label; self.body = body
+    }
+    var request: AtlasDeskRequest {
+        switch target.kind {
+        case .create(let pane):
+            return .annotate(revision: baseRevision, attempt: attempt, pane: pane, label: label, body: body)
+        case .edit(let bookmark, _):
+            return .editBookmark(revision: baseRevision, attempt: attempt, bookmark: bookmark, label: label, body: body)
+        }
+    }
+    func outcome(in state: AtlasDeskState) -> AtlasDeskNoteOutcome {
+        guard state.owner == target.owner, state.revision >= baseRevision else { return .unconfirmed(self) }
+        // The foreign request has drained before reconciliation. A revision
+        // below this attempt proves that this note mutation did not commit.
+        if state.revision < attempt { return .notAccepted }
+        guard state.revision == attempt, state.lastAttempt >= attempt else { return .unconfirmed(self) }
+        let mark: AtlasDeskBookmark?
+        switch target.kind {
+        case .create:
+            let added = state.bookmarks.filter { !priorBookmarks.contains($0.id) }
+            guard added.count == 1, state.bookmarks.count == priorBookmarks.count + 1,
+                  priorBookmarks.isSubset(of: Set(state.bookmarks.map(\.id))), added[0].updateSequence == 1 else {
+                return .unconfirmed(self)
+            }
+            mark = added[0]
+        case .edit(let bookmark, let sequence):
+            guard sequence < UInt64.max, Set(state.bookmarks.map(\.id)) == priorBookmarks else { return .unconfirmed(self) }
+            mark = state.bookmarks.first { $0.id == bookmark && $0.updateSequence == sequence + 1 }
+        }
+        guard let mark, mark.location == target.location,
+              mark.label.utf8.elementsEqual(label.utf8), mark.body.utf8.elementsEqual(body.utf8) else {
+            return .unconfirmed(self)
+        }
+        return .accepted(mark)
+    }
+}
+
+enum AtlasDeskNoteOutcome: Sendable {
+    case accepted(AtlasDeskBookmark)
+    case notAccepted
+    case unconfirmed(AtlasDeskNoteSubmission)
 }
 
 struct AtlasDeskState: Sendable {
@@ -282,6 +381,8 @@ enum AtlasDeskRequest: Sendable {
     case start, state
     case capture(revision: UInt64, attempt: UInt64, path: String)
     case apply(revision: UInt64, attempt: UInt64, kind: UInt64, subject: UInt64, start: UInt64, end: UInt64, label: String)
+    case annotate(revision: UInt64, attempt: UInt64, pane: UInt64, label: String, body: String)
+    case editBookmark(revision: UInt64, attempt: UInt64, bookmark: UInt64, label: String, body: String)
     case window(revision: UInt64, pane: UInt64, offset: UInt64)
     case keep(revision: UInt64, attempt: UInt64, reader: UInt64, start: UInt64, end: UInt64)
     case openReader(revision: UInt64, pane: UInt64, destination: UInt64)

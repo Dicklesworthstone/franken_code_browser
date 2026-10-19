@@ -72,7 +72,7 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
     private(set) var busy = false
     private(set) var saving = false
     private(set) var closed = false
-    private(set) var notice = "Keep exact source captures, name bookmarks, and save your reading desk."
+    private(set) var notice = "Keep exact source captures, add bookmarks and personal notes, and save your reading desk."
     private(set) var lastSave: AtlasDeskSaveReceipt?
     var bookmarkLabel = ""
     var offsetInput = "0"
@@ -121,6 +121,103 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
     func bookmark() {
         guard let pane = state?.active else { return }
         apply(kind: 3, subject: pane.id, label: bookmarkLabel)
+    }
+
+    /// Save only against the editor's original anchor/version. An entered
+    /// mutation may commit before cancellation or a lost reply, so reconciliation
+    /// decides the outcome and the caller keeps an unresolved submission.
+    func saveNote(target: AtlasDeskNoteTarget, label: String, body: String) async throws -> AtlasDeskNoteOutcome {
+        guard canOperate else { throw AtlasReadingDeskError.unavailable }
+        guard AtlasDeskNoteTarget.validText(label: label, body: body) else { throw AtlasReadingDeskError.invalidNote }
+        guard target.isCurrent(in: state) else { throw AtlasReadingDeskError.staleNote }
+        try Task.checkCancellation()
+        let cancellation = AtlasDeskCancellation()
+        operationCancellation = cancellation; busy = true
+        defer {
+            busy = false; operationCancellation = nil
+            if closed { releaseSession() }
+        }
+        do {
+            let lease = try await ensureStarted(cancellation)
+            try Task.checkCancellation()
+            guard let state, target.isCurrent(in: state) else { throw AtlasReadingDeskError.staleNote }
+            let submission = try AtlasDeskNoteSubmission(target: target, state: state,
+                attempt: nextAttempt(), label: label, body: body)
+            let transport = transport
+            do {
+                let json = try await withTaskCancellationHandler(operation: {
+                    try await io.perform(keepingAlive: [lease], cancellation: cancellation) {
+                        transport.run(lease.handle, submission.request)
+                    }
+                }, onCancel: { cancellation.cancel(); _ = transport.cancel(lease.handle) })
+                let accepted = try AtlasDeskState.decode(json, handle: lease.handle, acceptedAttempt: submission.attempt)
+                let outcome = submission.outcome(in: accepted)
+                guard case .accepted = outcome else { throw AtlasReadingDeskError.invalidResponse }
+                await installNoteState(accepted, outcome: outcome, lease: lease)
+                return outcome
+            } catch {
+                // Never repeat annotate/edit to guess whether it succeeded.
+                return await reconcileNote(submission, lease: lease)
+            }
+        } catch {
+            notice = (error as? AtlasReadingDeskError)?.message ?? "The note was not submitted. Your draft is preserved."
+            throw error
+        }
+    }
+
+    /// Resolve the exact previously issued attempt. This operation performs no
+    /// note mutation and cannot turn an ambiguous create into a duplicate note.
+    func resolveNote(_ submission: AtlasDeskNoteSubmission) async -> AtlasDeskNoteOutcome {
+        guard canOperate, let lease = session, lease.handle == submission.target.owner else {
+            notice = "The original desk session is unavailable. The note outcome remains unconfirmed; your draft is preserved."
+            return .unconfirmed(submission)
+        }
+        let cancellation = AtlasDeskCancellation()
+        operationCancellation = cancellation; busy = true
+        defer {
+            busy = false; operationCancellation = nil
+            if closed { releaseSession() }
+        }
+        let transport = transport
+        return await withTaskCancellationHandler(operation: {
+            await reconcileNote(submission, lease: lease, cancellation: cancellation)
+        }, onCancel: { cancellation.cancel(); _ = transport.cancel(lease.handle) })
+    }
+
+    private func reconcileNote(_ submission: AtlasDeskNoteSubmission, lease: AtlasDeskSessionLease,
+        cancellation: AtlasDeskCancellation? = nil) async -> AtlasDeskNoteOutcome {
+        let transport = transport
+        do {
+            let json = try await io.perform(keepingAlive: [lease], cancellation: cancellation) {
+                transport.run(lease.handle, .state)
+            }
+            let accepted = try AtlasDeskState.decode(json, handle: lease.handle)
+            let outcome = submission.outcome(in: accepted)
+            await installNoteState(accepted, outcome: outcome, lease: lease)
+            return outcome
+        } catch {
+            if !closed { state = nil; page = nil }
+            notice = "The note outcome could not be verified. Your draft is preserved. Check saved state before submitting another copy."
+            return .unconfirmed(submission)
+        }
+    }
+    private func installNoteState(_ accepted: AtlasDeskState, outcome: AtlasDeskNoteOutcome,
+        lease: AtlasDeskSessionLease) async {
+        guard !closed else { return }
+        state = accepted; page = nil
+        let message: String
+        switch outcome {
+        case .accepted:
+            message = "Saved the note on its exact captured source range. Save a new checkpoint to retain its text after closing the app."
+        case .notAccepted:
+            message = "The note change was not accepted. Your draft is preserved; review its label, text and original source range before saving again."
+        case .unconfirmed:
+            message = "The note outcome remains unconfirmed. Your draft is preserved; inspect the desk before discarding it or creating another copy."
+        }
+        // A page delivery failure must not erase an accepted personal note or
+        // invite a duplicate retry. The state receipt already proves the write.
+        do { try await loadPage(lease); notice = message }
+        catch { page = nil; notice = message + " The source page is unavailable; reload state to retry reading it." }
     }
     func goToOffset(select: Bool = false) {
         guard let pane = state?.active, let offset = Self.offset(offsetInput),

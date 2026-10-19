@@ -82,6 +82,8 @@ private final class Fixture: @unchecked Sendable {
                 return error("DESK_CHECKPOINT_INTEGRITY")
             case .openReader:
                 return error("DESK_READER_TRANSFER_NOT_IN_THIS_FIXTURE")
+            case .annotate, .editBookmark:
+                return error("DESK_NOTES_USE_DEDICATED_FIXTURE")
             case .window(let expected, let pane, let offset):
                 guard expected == revision, pane == 1, offset <= UInt64(text.utf8.count) else { return error("DESK_INVALID_LOCATION") }
                 var w = header("window")
@@ -126,7 +128,9 @@ private final class Fixture: @unchecked Sendable {
         var pane = location(position); pane["pane"] = "1"; pane["label"] = "retained.rs"; pane["pinned"] = false
         w["panes"] = captured ? [pane] : []
         w["bookmarks"] = marks.map { mark in
-            var bookmark = location(mark.2); bookmark["bookmark"] = String(mark.0); bookmark["label"] = mark.1; return bookmark
+            var bookmark = location(mark.2); bookmark["bookmark"] = String(mark.0); bookmark["label"] = mark.1
+            bookmark["body"] = ""; bookmark["update_sequence"] = "1"
+            return bookmark
         }
         return encode(w)
     }
