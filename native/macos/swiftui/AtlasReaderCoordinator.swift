@@ -150,10 +150,16 @@ private final class AtlasReaderSession: @unchecked Sendable {
     /// Its closure retains the exporting service until the foreign call drains.
     func openRetained(label: String, offset: UInt64, registryDomain: UUID,
         initialize: @escaping @Sendable (UInt64) throws -> String?) async throws -> AtlasReaderPage {
+        guard label.utf8.count <= 16_384 else { throw AtlasReaderError.invalidInput }
+        return try await openRetained(pathBytes: Array(label.utf8), offset: offset,
+            registryDomain: registryDomain, initialize: initialize)
+    }
+    func openRetained(pathBytes: [UInt8], offset: UInt64, registryDomain: UUID,
+        initialize: @escaping @Sendable (UInt64) throws -> String?) async throws -> AtlasReaderPage {
         try Task.checkCancellation()
         guard session == nil, pendingSession == nil, info == nil,
               transport.comparison?.domain == registryDomain,
-              !label.isEmpty, label.utf8.count <= 16_384,
+              !pathBytes.isEmpty, pathBytes.count <= 16_384, !pathBytes.contains(0),
               offset <= AtlasReaderLimits.captureBytes else { throw AtlasReaderError.unavailable }
         let next = try AtlasReaderSession(transport: transport, accessLease: nil)
         cancel()
@@ -164,7 +170,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
             let result = try await withTaskCancellationHandler(operation: {
                 try await io.perform(cancellation: flag, keepingAlive: [next]) {
                     let info = try AtlasReaderInfo.decodeRetainedInitialization(
-                        initialize(next.handle), handle: next.handle, label: label)
+                        initialize(next.handle), handle: next.handle, pathBytes: pathBytes)
                     guard !flag.isCanceled else { throw AtlasReaderError.canceled }
                     let request = AtlasReaderRequest.window(offset: offset, bytes: AtlasReaderLimits.pageBytes)
                     try request.validate(capturedBytes: info.identity.capturedBytes)
@@ -264,8 +270,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
               let source = parent.session, let sourceInfo = parent.info,
               sourceInfo.identity.matches(original.identity), let fork = source.transport.fork,
               original.start <= original.end, original.end <= sourceInfo.identity.capturedBytes,
-              AtlasReaderWire.validHex(original.originalHex, bytes: original.end - original.start),
-              let path = String(bytes: sourceInfo.identity.pathBytes, encoding: .utf8) else {
+              AtlasReaderWire.validHex(original.originalHex, bytes: original.end - original.start) else {
             throw AtlasReaderError.unavailable
         }
         let request = AtlasReaderRequest.window(offset: original.start,
@@ -280,7 +285,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
         do {
             let result = try await io.perform(cancellation: flag, keepingAlive: [source, next]) {
                 let copiedInfo = try AtlasReaderInfo.decode(fork(source.handle, next.handle),
-                    handle: next.handle, path: path)
+                    handle: next.handle, pathBytes: sourceInfo.identity.pathBytes)
                 guard !flag.isCanceled,
                       copiedInfo.identity.owner != sourceInfo.identity.owner,
                       copiedInfo.identity.capturedBytes == sourceInfo.identity.capturedBytes,

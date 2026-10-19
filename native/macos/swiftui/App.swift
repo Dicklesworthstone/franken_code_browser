@@ -252,6 +252,8 @@ extension AtlasCamera {
     @State private var suppliedReaderTarget: AtlasSuppliedReaderSource?
     @State private var readingDesk = AtlasReadingDeskModel(transport: .native)
     @State private var showsReadingDesk = false
+    @State private var savedRepository = AtlasSavedRepositoryModel(transport: .native)
+    @State private var showsSavedRepository = false
     @State private var pinnedReaders = AtlasPinnedReaders<AtlasPagedReaderModel>(
         canFork: { $0.canPin }, fork: { try await $0.fork() }, retire: { $0.close() },
         failureMessage: { ($0 as? AtlasReaderError)?.message ?? "The source could not be pinned." })
@@ -367,6 +369,10 @@ extension AtlasCamera {
                 Label("Reading Desk", systemImage: "books.vertical")
             }
             .help("Read retained sources, follow cross-file history, keep named bookmarks, and save or open a checkpoint")
+            Button { showsSavedRepository = true } label: {
+                Label("Saved Repository", systemImage: "archivebox")
+            }
+            .help("Read an FCBS archive, browse saved members, and follow documentation links and backlinks")
             Button { moveSearchResult(backwards: true) } label: {
                 Label("Previous Match", systemImage: "arrow.up")
             }
@@ -382,6 +388,7 @@ extension AtlasCamera {
         }
         .sheet(isPresented: $showsFileFinder) { fileFinderSheet }
         .sheet(isPresented: $showsReadingDesk) { AtlasReadingDeskView(model: readingDesk) }
+        .sheet(isPresented: $showsSavedRepository) { AtlasSavedRepositoryView(model: savedRepository, desk: readingDesk) }
         .onAppear {
 #if FCB_APP_STORE
             if let recent = Engine.recents.first { restoreProject(recent) }
@@ -391,6 +398,8 @@ extension AtlasCamera {
 #endif
         }
         .onDisappear {
+            savedRepository.close()
+            showsSavedRepository = false
             readingDesk.close()
             showsReadingDesk = false
             pinnedReaders.closeAll()

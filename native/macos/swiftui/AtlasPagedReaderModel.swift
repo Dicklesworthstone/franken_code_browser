@@ -264,13 +264,19 @@ import Observation
     /// ordinary view appearance must not call open(root:path:) afterward.
     func openRetained(label: String, offset: UInt64, registryDomain: UUID,
         initialize: @escaping @Sendable (UInt64) throws -> String?) async throws {
+        guard label.utf8.count <= 16_384 else { throw AtlasReaderError.invalidInput }
+        try await openRetained(pathBytes: Array(label.utf8), offset: offset,
+            registryDomain: registryDomain, initialize: initialize)
+    }
+    func openRetained(pathBytes: [UInt8], offset: UInt64, registryDomain: UUID,
+        initialize: @escaping @Sendable (UInt64) throws -> String?) async throws {
         guard page == nil, !busy, capturedTarget == nil, suppliedSource == nil else {
             throw AtlasReaderError.unavailable
         }
         let ticket = begin()
-        notice = "Opening the reading desk’s exact saved capture…"
+        notice = "Opening the exact retained capture…"
         do {
-            let opened = try await coordinator.openRetained(label: label, offset: offset,
+            let opened = try await coordinator.openRetained(pathBytes: pathBytes, offset: offset,
                 registryDomain: registryDomain, initialize: initialize)
             try Task.checkCancellation()
             guard operation == ticket else { throw AtlasReaderError.canceled }

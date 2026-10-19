@@ -109,11 +109,15 @@ struct AtlasReaderInfo: Sendable {
     let captureSHA256: String?
 
     static func decode(_ json: String?, handle: UInt64, path: String) throws -> Self {
+        guard path.utf8.count <= 16_384 else { throw AtlasReaderError.invalidInput }
+        return try decode(json, handle: handle, pathBytes: Array(path.utf8))
+    }
+    static func decode(_ json: String?, handle: UInt64, pathBytes: [UInt8]) throws -> Self {
         let data = try AtlasReaderWire.admit(json, handle: handle)
         do {
             let wire = try JSONDecoder().decode(Wire.self, from: data)
             let identity = try wire.header.identity(handle: handle)
-            guard wire.header.command == "info", identity.pathBytes.elementsEqual(path.utf8),
+            guard wire.header.command == "info", identity.pathBytes == pathBytes,
                   ["regular-file-observation-not-atomic", "host-supplied"].contains(wire.capture_origin) else {
                 throw AtlasReaderError.invalidResponse
             }
@@ -132,7 +136,13 @@ struct AtlasReaderInfo: Sendable {
     /// filesystem observation. Its label is provenance, including raw controls,
     /// and is never interpreted as a path to open or refresh.
     static func decodeRetainedInitialization(_ json: String?, handle: UInt64, label: String) throws -> Self {
-        let info = try decode(json, handle: handle, path: label)
+        guard label.utf8.count <= 16_384 else { throw AtlasReaderError.invalidInput }
+        return try decodeRetainedInitialization(json, handle: handle, pathBytes: Array(label.utf8))
+    }
+    /// Saved archives can retain native names that are not UTF-8. The exact
+    /// native bytes bind this capture; display strings never become open paths.
+    static func decodeRetainedInitialization(_ json: String?, handle: UInt64, pathBytes: [UInt8]) throws -> Self {
+        let info = try decode(json, handle: handle, pathBytes: pathBytes)
         guard info.origin == "host-supplied", info.captureSHA256 != nil else {
             throw AtlasReaderError.invalidResponse
         }
