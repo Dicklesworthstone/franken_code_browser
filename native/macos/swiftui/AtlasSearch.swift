@@ -9,8 +9,78 @@ struct SearchHit: Identifiable, Hashable, Sendable {
     let end: UInt64
     let captureSHA256: String?
     let captureByteLength: UInt64?
+    var structure: AtlasSearchStructure? = nil
     var fileName: String { (path as NSString).lastPathComponent }
     var folder: String { (path as NSString).deletingLastPathComponent }
+}
+
+/// These are distinct engine requests. Symbols are qualified heuristic
+/// candidates; headings come from the shared Markdown parser.
+enum AtlasSearchMode: String, CaseIterable, Identifiable, Sendable {
+    case text, symbols, headings
+    var id: String { rawValue }
+    var label: String {
+        switch self { case .text: return "Text"; case .symbols: return "Symbols"; case .headings: return "Headings" }
+    }
+    var code: UInt64 {
+        switch self { case .text: return 0; case .symbols: return 1; case .headings: return 2 }
+    }
+    var wireMode: String {
+        switch self { case .text: return "exact-decoded-literal"; case .symbols: return "symbol-name"; case .headings: return "markdown-heading" }
+    }
+    var evidence: String {
+        switch self { case .text: return "exact-decoded-literal"; case .symbols: return "heuristic-outline-candidate"; case .headings: return "fmd-heading" }
+    }
+    var resultLabel: String {
+        switch self { case .text: return "exact matches"; case .symbols: return "symbol candidates"; case .headings: return "Markdown headings" }
+    }
+    var explanation: String {
+        switch self {
+        case .text: return "Exact, case-sensitive decoded text in the admitted files."
+        case .symbols: return "Case-sensitive heuristic declaration candidates in Rust, Python, JavaScript, TypeScript, Go and C/C++. Compiler resolution and references are not claimed."
+        case .headings: return "Case-sensitive Markdown heading names from the shared parser, with canonical slugs and original source ranges."
+        }
+    }
+    var placeholder: String {
+        switch self { case .text: return "Exact text in project…"; case .symbols: return "Declaration name…"; case .headings: return "Markdown heading…" }
+    }
+}
+
+enum AtlasSearchNameMode: String, CaseIterable, Identifiable, Sendable {
+    case exact, prefix, contains
+    var id: String { rawValue }
+    var label: String {
+        switch self { case .exact: return "Exact name"; case .prefix: return "Starts with"; case .contains: return "Contains" }
+    }
+    var code: UInt64 {
+        switch self { case .exact: return 0; case .prefix: return 1; case .contains: return 2 }
+    }
+}
+
+struct AtlasSearchStructure: Hashable, Sendable {
+    let name, kind, language, evidence: String
+    let candidate: UInt64
+    let headingSlug: String?
+    let evidenceStart, evidenceEnd: UInt64
+    var mode: AtlasSearchMode { headingSlug == nil ? .symbols : .headings }
+    var label: String {
+        if let headingSlug { return "Markdown heading · #\(headingSlug)" }
+        return "\(language) · \(kind) · heuristic candidate"
+    }
+}
+
+/// These counters describe bounded extraction coverage, not compiler semantics.
+struct AtlasSearchStructureCoverage: Equatable, Sendable {
+    let fileByteLimit: UInt64
+    let unsupportedFiles, extractionLimitedFiles, metadataOmitted, metadataBytes: Int
+
+    func advances(_ previous: Self) -> Bool {
+        fileByteLimit == previous.fileByteLimit
+            && unsupportedFiles >= previous.unsupportedFiles
+            && extractionLimitedFiles >= previous.extractionLimitedFiles
+            && metadataOmitted >= previous.metadataOmitted
+            && metadataBytes >= previous.metadataBytes
+    }
 }
 
 enum AtlasSearchError: Error, Sendable {
@@ -52,6 +122,9 @@ struct AtlasSearchReport: Sendable {
     var fileScope: AtlasSearchFileScope = .all
     var excludedFiles: Int = 0
     var pathScope: AtlasSearchPathScope = .workspace
+    var mode: AtlasSearchMode = .text
+    var nameMode: AtlasSearchNameMode = .contains
+    var structureCoverage: AtlasSearchStructureCoverage? = nil
     var isInProgress: Bool { progress?.isRunning == true }
     var isWorkspaceScope: Bool { fileScope.isAll && pathScope.isWorkspace }
 
@@ -65,22 +138,36 @@ struct AtlasSearchReport: Sendable {
     }
     private var resultSummary: String {
         let count = hits.count
+        let noun: String
+        switch mode {
+        case .text: noun = count == 1 ? "exact match" : "exact matches"
+        case .symbols: noun = count == 1 ? "symbol candidate" : "symbol candidates"
+        case .headings: noun = count == 1 ? "heading" : "headings"
+        }
+        let qualification = mode == .symbols
+            ? " Heuristic declaration candidates; compiler resolution and reference completeness are not claimed." : ""
         if let progress, progress.isRunning {
             let membership = isWorkspaceScope ? "catalogued" : "eligible"
-            return "Searching: \(count) exact matches found; \(progress.examinedFiles) of \(progress.cataloguedFiles) \(membership) files examined. Results are provisional."
+            return "Searching: \(count) \(noun) found; \(progress.examinedFiles) of \(progress.cataloguedFiles) \(membership) files examined. Results are provisional." + qualification
         }
         if complete {
             let scope = pathScope.isWorkspace ? (fileScope.isAll ? "captured project" : "selected file types")
                 : "selected \(pathScope.kind == .file ? "file" : "folder") \(String(reflecting: pathScope.path))"
-            return count == 0 ? "No exact matches in the \(scope)."
-                : "\(count) exact match\(count == 1 ? "" : "es") in the \(scope)."
+            return (count == 0 ? "No \(noun) in the \(scope)." : "\(count) \(noun) in the \(scope).") + qualification
         }
         var reasons: [String] = []
         if truncated { reasons.append("result limit reached") }
-        if unavailableFiles > 0 { reasons.append("\(unavailableFiles) unavailable files") }
-        if unsupportedFiles > 0 { reasons.append("\(unsupportedFiles) unsupported text files") }
+        if let coverage = structureCoverage {
+            if unavailableFiles > 0 { reasons.append("\(unavailableFiles) files with unavailable or incomplete analysis") }
+            if coverage.unsupportedFiles > 0 { reasons.append("\(coverage.unsupportedFiles) unsupported languages within that total") }
+            if coverage.extractionLimitedFiles > 0 { reasons.append("\(coverage.extractionLimitedFiles) files reached extraction limits") }
+            if coverage.metadataOmitted > 0 { reasons.append("\(coverage.metadataOmitted) matching results omitted by metadata limits") }
+        } else {
+            if unavailableFiles > 0 { reasons.append("\(unavailableFiles) unavailable files") }
+            if unsupportedFiles > 0 { reasons.append("\(unsupportedFiles) unsupported text files") }
+        }
         if reasons.isEmpty { reasons.append(isWorkspaceScope ? "project coverage incomplete" : "scope coverage incomplete") }
-        return "Partial search: \(count) matches shown; \(reasons.joined(separator: ", ")). More matches may exist."
+        return "Partial search: \(count) \(noun) shown; \(reasons.joined(separator: ", ")). More matches may exist." + qualification
     }
 
     static func decode(_ json: String?) throws -> Self {
@@ -160,17 +247,20 @@ struct AtlasSearchReport: Sendable {
     private struct FileRecord: Decodable { let file_id: String }
 }
 
-/// Validated, immutable input to the literal-search bridge. Admission does
+/// Validated, immutable input to the admitted search mode. Admission does
 /// not trim whitespace or normalize Unicode: those bytes are the query.
 struct AtlasSearchInput: Sendable {
     let root: String
     let query: String
     let fileScope: AtlasSearchFileScope
     let pathScope: AtlasSearchPathScope
+    let mode: AtlasSearchMode
+    let nameMode: AtlasSearchNameMode
     var isWorkspaceScope: Bool { fileScope.isAll && pathScope.isWorkspace }
 
     init(root: String, query: String, fileScope: AtlasSearchFileScope = .all,
-         pathScope: AtlasSearchPathScope = .workspace) throws {
+         pathScope: AtlasSearchPathScope = .workspace,
+         mode: AtlasSearchMode = .text, nameMode: AtlasSearchNameMode = .contains) throws {
         guard !root.isEmpty, root.utf8.count <= 16_384, !root.utf8.contains(0),
               !query.isEmpty, query.utf8.count <= 1_024, !query.utf8.contains(0) else {
             throw AtlasSearchError.invalidRequest
@@ -179,8 +269,11 @@ struct AtlasSearchInput: Sendable {
         self.query = query
         self.fileScope = fileScope
         self.pathScope = pathScope
+        self.mode = mode
+        self.nameMode = mode == .text ? .contains : nameMode
     }
     func requireLegacyScope() throws {
+        guard mode == .text else { throw AtlasSearchError.invalidRequest }
         guard pathScope.isWorkspace else { throw AtlasSearchError.invalidPathScope }
         guard fileScope.isAll else { throw AtlasSearchError.invalidScope }
     }
@@ -332,9 +425,12 @@ struct AtlasSearchContext: Sendable {
     let customExtensions: String
     var pathKind: String = "workspace"
     var path: String = ""
+    var mode: AtlasSearchMode = .text
+    var nameMode: AtlasSearchNameMode = .contains
 
     func matches(_ other: Self) -> Bool {
         loadGeneration == other.loadGeneration && atlasRevision == other.atlasRevision
+            && mode == other.mode && nameMode == other.nameMode
             && root.utf8.elementsEqual(other.root.utf8)
             && query.utf8.elementsEqual(other.query.utf8)
             && scope.utf8.elementsEqual(other.scope.utf8)
@@ -503,6 +599,7 @@ struct AtlasSearchCapturedHit: Sendable {
     let root, path, needle: String
     let start, end, capturedBytes: UInt64
     let openReader: @Sendable (UInt64) throws -> String
+    var mode: AtlasSearchMode = .text
 }
 struct AtlasSearchCapture: Sendable {
     let retainAccess: @Sendable (AtlasSearchAccessLease) -> Void

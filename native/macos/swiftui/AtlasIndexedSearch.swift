@@ -66,6 +66,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
 
     func runScoped(input: AtlasSearchInput, cancellation: AtlasSearchCancellation,
                    access: AtlasSearchAccessLease, progress: @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport {
+        guard input.mode == .text else { throw AtlasSearchError.unsupportedMode }
         let root = input.root, query = input.query, scope = input.fileScope, pathScope = input.pathScope
         if pathScope.isWorkspace {
             guard scope.isAll || transport.scopedQueryBegin != nil else { throw AtlasSearchError.invalidScope }

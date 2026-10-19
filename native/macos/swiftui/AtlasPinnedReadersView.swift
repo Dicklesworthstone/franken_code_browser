@@ -4,6 +4,14 @@ import SwiftUI
 /// keeps each parent-owned model, capture, position and query alive.
 @MainActor struct AtlasPinnedReadersView: View {
     @Bindable var readers: AtlasPinnedReaders<AtlasPagedReaderModel>
+    var canKeep = false
+    var keep: ((AtlasPagedReaderModel) -> Void)? = nil
+    @State private var comparison: Pair?
+    private struct Pair: Identifiable {
+        let id = UUID()
+        let before: AtlasPinnedReaders<AtlasPagedReaderModel>.Entry
+        let after: AtlasPinnedReaders<AtlasPagedReaderModel>.Entry
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -13,6 +21,13 @@ import SwiftUI
                 Text("\(readers.entries.count)/\(AtlasPinnedReaders<AtlasPagedReaderModel>.maximumPins)")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
+                if readers.entries.count == 2 {
+                    Button {
+                        comparison = Pair(before: readers.entries[0], after: readers.entries[1])
+                    } label: { Label("Compare", systemImage: "arrow.left.arrow.right") }
+                    .disabled(readers.busy || !readers.entries.allSatisfy { $0.reader.canCompare })
+                    .help("Compare the first pin as before and the second pin as after, using their retained bytes")
+                }
                 if readers.busy {
                     ProgressView().controlSize(.small).accessibilityLabel("Pinning source")
                     Button("Cancel", action: readers.cancelPin)
@@ -46,7 +61,7 @@ import SwiftUI
             }
             Divider()
             if let entry = readers.selected {
-                AtlasPagedSourceView(model: entry.reader)
+                AtlasPagedSourceView(model: entry.reader, canKeep: canKeep, keep: keep)
                     .id(entry.id)
             } else {
                 Text(readers.busy ? "Preparing an independent retained reader…" : "Pin a retained source to read files side by side.")
@@ -60,5 +75,14 @@ import SwiftUI
             }
         }
         .background(.background)
+        .sheet(item: $comparison) { pair in
+            AtlasReaderComparisonView(beforeLabel: pair.before.label, afterLabel: pair.after.label,
+                before: pair.before.reader, after: pair.after.reader)
+        }
+        .onChange(of: readers.entries.map(\.id)) { _, ids in
+            if let comparison, !ids.contains(comparison.before.id) || !ids.contains(comparison.after.id) {
+                self.comparison = nil
+            }
+        }
     }
 }

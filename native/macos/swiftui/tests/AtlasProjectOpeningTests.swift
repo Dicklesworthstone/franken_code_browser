@@ -121,6 +121,22 @@ import Foundation
             check(old.matchesSourceRequest(new), "An in-flight source search survives optional preview publication")
             check(!old.matches(new), "Old overlay/frame authority still rejected after layout change")
             check(old.matchesSourceRequest(old) && old.matches(old), "Unchanged source and display remain compatible")
+            var symbols = old; symbols.mode = .symbols
+            var headings = old; headings.mode = .headings
+            check(!old.matchesSourceRequest(symbols) && !old.matches(symbols),
+                  "Text and declaration queries cannot share source or overlay authority")
+            check(!symbols.matchesSourceRequest(headings) && !symbols.matches(headings),
+                  "Symbols and Markdown headings remain different engine requests")
+            var exactSymbols = symbols; exactSymbols.nameMode = .exact
+            var prefixSymbols = symbols; prefixSymbols.nameMode = .prefix
+            check(!symbols.matchesSourceRequest(exactSymbols) && !symbols.matches(exactSymbols),
+                  "Contains and exact names invalidate old source results")
+            check(!prefixSymbols.matchesSourceRequest(exactSymbols) && !prefixSymbols.matches(exactSymbols),
+                  "Prefix and exact names retain distinct request identities")
+            var refreshedSymbols = context(project: project, atlas: newAtlas)
+            refreshedSymbols.mode = .symbols
+            check(symbols.matchesSourceRequest(refreshedSymbols) && !symbols.matches(refreshedSymbols),
+                  "Preview refresh preserves a structural source request without lending new overlay authority")
             var folder = old; folder.pathKind = "directory"; folder.path = "src/café"
             var otherFolder = folder; otherFolder.path = "src/cafe\u{301}"
             var file = folder; file.pathKind = "file"

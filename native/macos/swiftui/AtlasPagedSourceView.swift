@@ -12,6 +12,8 @@ import AppKit
     private let ownsModel: Bool
     private let pin: ((AtlasPagedReaderModel) -> Void)?
     private let canPin: Bool
+    private let keep: ((AtlasPagedReaderModel) -> Void)?
+    private let canKeep: Bool
     @State private var model: AtlasPagedReaderModel
     @State private var copyNotice = ""
     @State private var showsOutline = false
@@ -20,22 +22,27 @@ import AppKit
 
     init(root: String, path: String, accessLease: AnyObject?, captured: AtlasSearchCapturedHit? = nil,
          supplied: AtlasSuppliedReaderSource? = nil,
-         canPin: Bool = false, pin: ((AtlasPagedReaderModel) -> Void)? = nil) {
+         canPin: Bool = false, pin: ((AtlasPagedReaderModel) -> Void)? = nil,
+         canKeep: Bool = false, keep: ((AtlasPagedReaderModel) -> Void)? = nil) {
         self.root = root
         self.path = path
         self.accessLease = accessLease
         ownsModel = true
         self.canPin = canPin
         self.pin = pin
+        self.canKeep = canKeep
+        self.keep = keep
         _model = State(initialValue: AtlasPagedReaderModel(transport: .native, search: .native,
             outline: .native, document: .native, captured: captured, supplied: supplied))
     }
 
     /// A pin is already open and owned by the enclosing native workspace.
     /// Temporary tab/view disappearance neither reopens nor closes its capture.
-    init(model: AtlasPagedReaderModel) {
+    init(model: AtlasPagedReaderModel, canKeep: Bool = false,
+         keep: ((AtlasPagedReaderModel) -> Void)? = nil) {
         root = ""; path = ""; accessLease = nil
         ownsModel = false; canPin = false; pin = nil
+        self.canKeep = canKeep; self.keep = keep
         _model = State(initialValue: model)
     }
 
@@ -126,6 +133,11 @@ import AppKit
                         .disabled(!canPin || !model.canPin)
                         .keyboardShortcut("p", modifiers: [.command, .shift])
                         .help("Keep this exact retained source beside other files (⇧⌘P); pinning never rereads the disk file")
+                }
+                if let keep {
+                    Button { keep(model) } label: { Label("Keep in reading desk", systemImage: "books.vertical") }
+                        .disabled(!canKeep || !model.canPin)
+                        .help("Keep the entire exact source capture at this page, with bookmarks, cross-file history and explicit checkpoint saving")
                 }
                 Button("Back", action: model.back).disabled(!model.canGoBack)
                     .help("Return to the previous retained byte window")

@@ -87,6 +87,8 @@ import Observation
     var canGoNext: Bool { page?.nextOffset != nil && !busy }
     var canRefresh: Bool { page != nil && refreshInput != nil && !busy && !documentPreview.busy }
     var canPin: Bool { page != nil && !busy && !pinning && !documentPreview.busy && coordinator.canFork }
+    var canCompare: Bool { page != nil && !busy && !pinning && !documentPreview.busy && coordinator.supportsComparison }
+    var retainedRegistryDomain: UUID? { coordinator.retainedRegistryDomain }
     var canFind: Bool { page != nil && coordinator.supportsFind }
     var findIsCurrent: Bool { findReport?.needle.utf8.elementsEqual(fileQuery.utf8) == true }
     var canMoveHit: Bool { findIsCurrent && findReport?.hits.isEmpty == false && !busy }
@@ -190,9 +192,9 @@ import Observation
             let liveInput = try AtlasReaderInput(root: root, path: path)
             if let target = capturedTarget {
                 guard target.root.utf8.elementsEqual(root.utf8), target.path.utf8.elementsEqual(path.utf8),
-                      coordinator.supportsFind else { throw AtlasReaderError.invalidInput }
+                      target.mode != .text || coordinator.supportsFind else { throw AtlasReaderError.invalidInput }
                 input = try AtlasReaderInput(captured: target)
-                fileQuery = target.needle
+                fileQuery = target.mode == .text ? target.needle : ""
             } else if let supplied = suppliedSource {
                 guard supplied.matches(root: root, path: path) else { throw AtlasReaderError.invalidInput }
                 guard liveTransport.openBytes != nil else { throw AtlasReaderError.unavailable }
@@ -215,18 +217,24 @@ import Observation
                 let opened = try await coordinator.open(input: input, accessLease: accessLease)
                 guard operation == ticket, !Task.isCancelled else { return }
                 if let target = capturedTarget {
-                    // The imported file gets its own reader/query identities.
-                    // Reuse the shared exact matcher and hit decoder to locate
-                    // THIS occurrence; never publish an approximate first page.
-                    let selected = try await AtlasCapturedReader.activate(target, identity: opened.identity,
-                        find: { try await coordinator.find($0) },
-                        read: { try await coordinator.read(.hit($0)) })
-                    guard operation == ticket, !Task.isCancelled else { return }
-                    findReport = selected.report
-                    selectedHitIndex = selected.index
-                    install(selected.page, request: .hit(selected.target))
+                    if target.mode == .text {
+                        // Literal hits receive this reader's own query IDs.
+                        let selected = try await AtlasCapturedReader.activate(target, identity: opened.identity,
+                            find: { try await coordinator.find($0) },
+                            read: { try await coordinator.read(.hit($0)) })
+                        guard operation == ticket, !Task.isCancelled else { return }
+                        findReport = selected.report
+                        selectedHitIndex = selected.index
+                        install(selected.page, request: .hit(selected.target))
+                    } else {
+                        let request = try AtlasCapturedReader.structuralRequest(target, identity: opened.identity)
+                        let selected = try await coordinator.read(request)
+                        guard operation == ticket, !Task.isCancelled else { return }
+                        install(selected, request: request)
+                    }
                     finish(ticket)
-                    notice = "Opened the exact search capture without rereading the live file."
+                    notice = target.mode == .text ? "Opened the exact search capture without rereading the live file."
+                        : "Opened retained \(target.mode == .headings ? "heading" : "declaration") evidence at original bytes \(target.start)–\(target.end). No live-file reread."
                 } else {
                     install(opened, request: .firstPage)
                     finish(ticket)
@@ -301,6 +309,41 @@ import Observation
     func goToLine() {
         guard let line = Self.number(lineInput), line > 0 else { notice = AtlasReaderError.invalidInput.message; return }
         navigate(.lines(first: line, count: 64, bytes: AtlasReaderLimits.pageBytes))
+    }
+
+    /// Keep the accepted source/grant alive while another explicit native
+    /// service imports it. The receiving service owns any committed effects;
+    /// this helper only qualifies which exact retained source was supplied.
+    func withRetainedReader<Value: Sendable>(_ work: @escaping @Sendable (UInt64) throws -> Value) async throws -> Value {
+        guard !busy, !pinning, !documentPreview.busy, let original = page else { throw AtlasReaderError.unavailable }
+        let result = try await coordinator.withRetainedReader(work)
+        try Task.checkCancellation()
+        guard page?.identity.matches(original.identity) == true else { throw AtlasReaderError.canceled }
+        return result
+    }
+
+    func compare(with other: AtlasPagedReaderModel,
+                 limits: AtlasReaderComparisonLimits = .init()) async throws -> AtlasReaderComparisonReport {
+        guard canCompare, other.canCompare, self !== other, let before = page, let after = other.page else {
+            throw AtlasReaderError.unavailable
+        }
+        let report = try await coordinator.compare(with: other.coordinator, limits: limits)
+        try Task.checkCancellation()
+        guard report.matches(before: page?.identity, after: other.page?.identity),
+              page?.identity.matches(before.identity) == true,
+              other.page?.identity.matches(after.identity) == true else { throw AtlasReaderError.canceled }
+        return report
+    }
+
+    /// A comparison span is a byte anchor, not a query hit or decoded selection.
+    /// The regular reader may widen its page to complete a scalar/CRLF; its
+    /// existing page/copy UI continues to state those original-byte boundaries.
+    @discardableResult func goToComparedRange(_ range: AtlasReaderComparisonReport.Range,
+                                              identity: AtlasReaderIdentity) -> Bool {
+        guard !busy, let page, page.identity.matches(identity), range.start <= range.end,
+              range.end <= identity.capturedBytes else { return false }
+        navigate(.window(offset: range.start, bytes: AtlasReaderLimits.pageBytes))
+        return true
     }
 
     func find() {

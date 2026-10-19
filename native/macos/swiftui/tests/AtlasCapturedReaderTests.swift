@@ -14,8 +14,9 @@ private final class Calls: @unchecked Sendable {
         precondition(condition(), message); checks += 1
     }
     private static func selected(path: String = "src.rs", root: String = "/repo", needle: String = "x",
-                                 start: UInt64 = 10, end: UInt64 = 12, bytes: UInt64 = 20) -> AtlasSearchCapturedHit {
-        .init(root: root, path: path, needle: needle, start: start, end: end, capturedBytes: bytes, openReader: { _ in "captured-info" })
+                                 start: UInt64 = 10, end: UInt64 = 12, bytes: UInt64 = 20,
+                                 mode: AtlasSearchMode = .text) -> AtlasSearchCapturedHit {
+        .init(root: root, path: path, needle: needle, start: start, end: end, capturedBytes: bytes, openReader: { _ in "captured-info" }, mode: mode)
     }
     private static func identity(owner: UInt64 = 100, revision: UInt64 = 1, bytes: UInt64 = 20,
                                  path: String = "src.rs", encoding: String = "utf16le") -> AtlasReaderIdentity {
@@ -51,6 +52,48 @@ private final class Calls: @unchecked Sendable {
             do { _ = try AtlasReaderInput(captured: selected(path: path)); preconditionFailure("Invalid captured label") }
             catch AtlasReaderError.invalidInput { checks += 1 }
         }
+        // Names and heading syntax do not necessarily equal a literal source
+        // substring. Structural navigation uses the qualified retained range.
+        let heading = selected(needle: "Deploy!", start: 3, end: 18, bytes: 40, mode: .headings)
+        let headingRequest = try AtlasCapturedReader.structuralRequest(heading,
+            identity: identity(bytes: 40, encoding: "utf8"))
+        if case let .window(offset, bytes) = headingRequest {
+            check(offset == 3 && bytes >= 15, "Heading opens its original syntax range without literal re-search")
+        } else { preconditionFailure("Structural navigation must request a byte window") }
+        try headingRequest.validate(capturedBytes: 40)
+        let symbol = selected(needle: "run", start: 8, end: 14, bytes: 40, mode: .symbols)
+        let symbolRequest = try AtlasCapturedReader.structuralRequest(symbol,
+            identity: identity(bytes: 40, encoding: "utf8"))
+        if case let .window(offset, bytes) = symbolRequest {
+            check(offset == 8 && bytes >= 6, "Prefix symbol result retains the full selected name")
+        } else { preconditionFailure("Symbol navigation must request a byte window") }
+        let maximum = AtlasReaderLimits.maximumPageBytes
+        let full = selected(start: 0, end: maximum, bytes: maximum, mode: .headings)
+        let fullRequest = try AtlasCapturedReader.structuralRequest(full, identity: identity(bytes: maximum))
+        if case let .window(offset, bytes) = fullRequest {
+            check(offset == 0 && bytes == maximum, "A full admitted heading capture fits the reader window cap")
+        } else { preconditionFailure("Full-capacity heading lost its exact window") }
+        try fullRequest.validate(capturedBytes: maximum)
+        for invalid in [
+            selected(mode: .text),
+            selected(path: "other.rs", mode: .headings),
+            selected(start: 12, end: 10, mode: .symbols),
+            selected(start: 10, end: 21, mode: .headings),
+            selected(start: 0, end: maximum + 1, bytes: maximum + 1, mode: .headings)
+        ] {
+            do {
+                _ = try AtlasCapturedReader.structuralRequest(invalid,
+                    identity: identity(bytes: invalid.capturedBytes))
+                preconditionFailure("Invalid structural source range accepted")
+            } catch AtlasReaderError.invalidResponse { checks += 1 }
+        }
+        do {
+            _ = try AtlasCapturedReader.structuralRequest(selected(path: "é.rs", mode: .headings),
+                identity: identity(path: "e\u{301}.rs"))
+            preconditionFailure("Canonically equivalent paths substituted in structural activation")
+        } catch AtlasReaderError.invalidResponse { checks += 1 }
+        await refused(selected(mode: .headings))
+        await refused(selected(mode: .symbols))
         let calls = Calls()
         let base = AtlasReaderTransport(create: { calls.add("create"); return 100 },
             open: { _, _, _ in calls.add("live-open"); return "wrong live bytes" },

@@ -19,6 +19,10 @@ private func fcb_reader_fork(_ source: UInt64, _ destination: UInt64) -> UnsafeM
 private func fcb_reader_open_bytes(_ handle: UInt64, _ label: UnsafePointer<CChar>?,
     _ bytes: UnsafePointer<UInt8>?, _ length: UInt64) -> UnsafeMutablePointer<CChar>?
 
+@_silgen_name("fcb_reader_compare")
+private func fcb_reader_compare(_ before: UInt64, _ after: UInt64, _ generation: UInt64,
+    _ edits: UInt64, _ work: UInt64) -> UnsafeMutablePointer<CChar>?
+
 extension AtlasReaderTransport {
     static let native = Self(
         create: { fcb_reader_create() },
@@ -49,11 +53,16 @@ extension AtlasReaderTransport {
                 }
             }
             return SuppliedResponse(json: json, sha256: digest)
-        })
+        }, comparison: AtlasReaderComparisonTransport(domain: UUID(), compare: {
+            take(fcb_reader_compare($0, $1, $2, $3, $4))
+        }))
 
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
         guard let pointer else { return nil }
         defer { fcb_free_string(pointer) }
-        return String(cString: pointer)
+        var length = 0
+        while length <= AtlasReaderLimits.responseBytes && pointer[length] != 0 { length += 1 }
+        guard length > 0, length <= AtlasReaderLimits.responseBytes else { return nil }
+        return String(data: Data(bytes: pointer, count: length), encoding: .utf8)
     }
 }

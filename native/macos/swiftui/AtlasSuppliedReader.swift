@@ -92,6 +92,6 @@ extension AtlasReaderTransport {
         Self(create: create, open: { handle, path, limit in
             source.open(handle: handle, label: path, limit: limit, using: self)
         }, window: window, lines: lines, cancel: cancel, close: close,
-        retirementFailed: retirementFailed, fork: fork, openBytes: openBytes)
+        retirementFailed: retirementFailed, fork: fork, openBytes: openBytes, comparison: comparison)
     }
 }

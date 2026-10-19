@@ -7,12 +7,13 @@
 
 static char *responses[5][8]; // open, begin, step, page, captured reader import
 static unsigned cursors[5];
-static _Atomic unsigned counts[11]; // create/open/begin/step/page/close/alloc/free/import/scoped-begin/path-begin
+static _Atomic unsigned counts[12]; // create/open/begin/step/page/close/alloc/free/import/scoped-begin/path-begin/structure-begin
 static int cancel_step, refuse_create;
 static char expected_extensions[1025], expected_filenames[1025];
 static int expected_all;
 static uint64_t expected_path_kind;
 static char expected_path[4097];
+static uint64_t expected_mode, expected_name_mode;
 extern void fixture_mark_canceled(void *);
 
 void fixture_reset(void) {
@@ -20,16 +21,17 @@ void fixture_reset(void) {
         for (unsigned j = 0; j < 8; ++j) { free(responses[i][j]); responses[i][j] = NULL; }
         cursors[i] = 0;
     }
-    for (unsigned i = 0; i < 11; ++i) atomic_store(&counts[i], 0);
+    for (unsigned i = 0; i < 12; ++i) atomic_store(&counts[i], 0);
     expected_extensions[0] = expected_filenames[0] = 0;
     expected_all = 1; expected_path_kind = 0; expected_path[0] = 0;
     cancel_step = refuse_create = 0;
+    expected_mode = expected_name_mode = 0;
 }
 void fixture_set(unsigned kind, unsigned index, const char *text) {
     assert(kind < 5 && index < 8);
     free(responses[kind][index]); responses[kind][index] = strdup(text);
 }
-unsigned fixture_count(unsigned key) { assert(key < 11); return atomic_load(&counts[key]); }
+unsigned fixture_count(unsigned key) { assert(key < 12); return atomic_load(&counts[key]); }
 void fixture_expect_scope(const char *extensions, const char *filenames) {
     if (!extensions || !filenames) {
         assert(!extensions && !filenames); expected_all = 1; return;
@@ -41,6 +43,10 @@ void fixture_expect_scope(const char *extensions, const char *filenames) {
 void fixture_expect_path(uint64_t kind, const char *path) {
     assert(kind >= 1 && kind <= 2 && path && strlen(path) <= 4096);
     expected_path_kind = kind; strcpy(expected_path, path);
+}
+void fixture_expect_structure(uint64_t mode, uint64_t name_mode) {
+    assert(mode >= 1 && mode <= 2 && name_mode <= 2);
+    expected_mode = mode; expected_name_mode = name_mode;
 }
 static void check_scope(const char *extensions, const char *filenames) {
     if (expected_all) { assert(!extensions && !filenames); }
@@ -82,6 +88,18 @@ char *fcb_atlas_search_begin_path_scoped(uint64_t handle, uint64_t generation, c
     check_scope(extensions, filenames);
     assert(path_kind == expected_path_kind && path && !strcmp(path, expected_path));
     ++counts[10];
+    return fcb_atlas_search_begin(handle, generation, query, matches, files, file_bytes, source_bytes);
+}
+char *fcb_atlas_structure_begin(uint64_t handle, uint64_t generation, uint64_t mode, uint64_t name_mode,
+                                const char *query, const char *extensions, const char *filenames,
+                                uint64_t path_kind, const char *path,
+                                uint64_t matches, uint64_t files, uint64_t file_bytes, uint64_t source_bytes) {
+    assert(mode == expected_mode && name_mode == expected_name_mode);
+    check_scope(extensions, filenames);
+    assert(path_kind == expected_path_kind);
+    if (path_kind == 0) { assert(!path); }
+    else { assert(path && !strcmp(path, expected_path)); }
+    ++counts[11];
     return fcb_atlas_search_begin(handle, generation, query, matches, files, file_bytes, source_bytes);
 }
 char *fcb_atlas_search_step_cancelable(uint64_t handle, uint64_t generation,

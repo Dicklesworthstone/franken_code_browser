@@ -247,13 +247,15 @@ private final class AtlasSearchProgressMailbox: @unchecked Sendable {
                 if request.cancellation.isCanceled { throw AtlasSearchError.canceled }
                 let report = try withExtendedLifetime(request.accessLease) {
                     try work(request.input, request.cancellation, AtlasSearchAccessLease(request.accessLease)) { report in
-                        guard report.fileScope == request.input.fileScope, report.pathScope == request.input.pathScope else { return }
+                        guard report.fileScope == request.input.fileScope, report.pathScope == request.input.pathScope,
+                              report.mode == request.input.mode, report.nameMode == request.input.nameMode else { return }
                         mailbox.offer(report)
                     }
                 }
                 if request.cancellation.isCanceled { throw AtlasSearchError.canceled }
                 guard !report.isInProgress, report.fileScope == request.input.fileScope,
-                      report.pathScope == request.input.pathScope else { throw AtlasSearchError.invalidResponse }
+                      report.pathScope == request.input.pathScope, report.mode == request.input.mode,
+                      report.nameMode == request.input.nameMode else { throw AtlasSearchError.invalidResponse }
                 result = .success(report)
             } catch let error as AtlasSearchError {
                 result = .failure(error)

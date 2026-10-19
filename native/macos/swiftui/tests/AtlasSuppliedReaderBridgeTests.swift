@@ -47,7 +47,18 @@ import Foundation
             AtlasReaderTransport.native.openBytes?(handle, path, over)
         }.value
         precondition(oversized == nil && suppliedCalls() == 3 && suppliedLive() == 0)
+        // The production bridge must preserve all five UInt64 arguments and
+        // release the native response, including generation values above Int64.
+        guard let comparison = AtlasReaderTransport.native.comparison else {
+            fatalError("native retained comparison capability missing")
+        }
+        precondition(comparison.domain == AtlasReaderTransport.native.comparison?.domain)
+        let compared = await Task.detached {
+            comparison.compare(handle, handle - 1, UInt64.max, 512, 64 * 1024 * 1024)
+        }.value
+        precondition(compared == "{\"comparison_fixture\":true}")
+        precondition(suppliedCalls() == 4 && suppliedLive() == 0)
         precondition(AtlasReaderTransport.native.close(handle))
-        print("AtlasSuppliedReaderBridgeTests: exact raw buffer, SHA, empty capture, limits and allocation checks passed")
+        print("AtlasSuppliedReaderBridgeTests: exact raw buffer, SHA, empty capture, limits, pair arguments and allocation checks passed")
     }
 }

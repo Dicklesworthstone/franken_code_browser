@@ -104,6 +104,9 @@ struct AtlasReaderIdentity: Equatable, Sendable {
 struct AtlasReaderInfo: Sendable {
     let identity: AtlasReaderIdentity
     let origin: String
+    /// Additive retained-source witness. Legacy transports may omit it; pair
+    /// comparison requires witnesses for both captures before source transfer.
+    let captureSHA256: String?
 
     static func decode(_ json: String?, handle: UInt64, path: String) throws -> Self {
         let data = try AtlasReaderWire.admit(json, handle: handle)
@@ -114,7 +117,13 @@ struct AtlasReaderInfo: Sendable {
                   ["regular-file-observation-not-atomic", "host-supplied"].contains(wire.capture_origin) else {
                 throw AtlasReaderError.invalidResponse
             }
-            return Self(identity: identity, origin: wire.capture_origin)
+            if let digest = wire.capture_sha256 {
+                guard digest.utf8.count == 64,
+                      digest.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+                    throw AtlasReaderError.invalidResponse
+                }
+            }
+            return Self(identity: identity, origin: wire.capture_origin, captureSHA256: wire.capture_sha256)
         } catch let error as AtlasReaderError { throw error }
         catch { throw AtlasReaderError.invalidResponse }
     }
@@ -122,12 +131,14 @@ struct AtlasReaderInfo: Sendable {
     private struct Wire: Decodable {
         let header: AtlasReaderWire.Header
         let capture_origin: String
+        let capture_sha256: String?
         init(from decoder: Decoder) throws {
             header = try .init(from: decoder)
             let c = try decoder.container(keyedBy: CodingKeys.self)
             capture_origin = try c.decode(String.self, forKey: .capture_origin)
+            capture_sha256 = try c.decodeIfPresent(String.self, forKey: .capture_sha256)
         }
-        enum CodingKeys: CodingKey { case capture_origin }
+        enum CodingKeys: CodingKey { case capture_origin, capture_sha256 }
     }
 }
 

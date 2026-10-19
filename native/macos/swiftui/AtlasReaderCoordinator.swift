@@ -23,6 +23,7 @@ struct AtlasReaderTransport: Sendable {
     /// it never opens a pathname or grants source/query authority by itself.
     let fork: (@Sendable (UInt64, UInt64) -> String?)?
     let openBytes: (@Sendable (UInt64, String, Data) -> SuppliedResponse?)?
+    let comparison: AtlasReaderComparisonTransport?
 
     init(create: @escaping @Sendable () -> UInt64,
          open: @escaping @Sendable (UInt64, String, UInt64) -> String?,
@@ -32,11 +33,13 @@ struct AtlasReaderTransport: Sendable {
          close: @escaping @Sendable (UInt64) -> Bool,
          retirementFailed: @escaping @Sendable () -> Void,
          fork: (@Sendable (UInt64, UInt64) -> String?)? = nil,
-         openBytes: (@Sendable (UInt64, String, Data) -> SuppliedResponse?)? = nil) {
+         openBytes: (@Sendable (UInt64, String, Data) -> SuppliedResponse?)? = nil,
+         comparison: AtlasReaderComparisonTransport? = nil) {
         self.create = create; self.open = open; self.window = window; self.lines = lines
         self.cancel = cancel; self.close = close; self.retirementFailed = retirementFailed
         self.fork = fork
         self.openBytes = openBytes
+        self.comparison = comparison
     }
 }
 
@@ -117,6 +120,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
     private var lastOutlineGeneration: UInt64 = 0
     private var acceptedFind: AtlasReaderFindReport?
     private var lastFindGeneration: UInt64 = 0
+    private var lastComparisonGeneration: UInt64 = 0
     private let io = AtlasProjectIO()
     private var session: AtlasReaderSession?
     private var info: AtlasReaderInfo?
@@ -137,6 +141,73 @@ private final class AtlasReaderSession: @unchecked Sendable {
     var supportsOutline: Bool { outlineTransport != nil }
     var supportsDocument: Bool { documentTransport != nil }
     var canFork: Bool { session?.transport.fork != nil && info != nil }
+    var supportsComparison: Bool { session?.transport.comparison != nil && info?.captureSHA256 != nil }
+    var retainedRegistryDomain: UUID? { session?.transport.comparison?.domain }
+
+    /// Explicit transfer to another native service through the existing worker
+    /// lane. The source handle and its grant stay alive until the callback has
+    /// drained. A receiver with effects reconciles its outcome after cancellation;
+    /// loss of delivery never implies an already committed effect was rolled back.
+    func withRetainedReader<Value: Sendable>(_ work: @escaping @Sendable (UInt64) throws -> Value) async throws -> Value {
+        try Task.checkCancellation()
+        guard let source = session, let original = info else { throw AtlasReaderError.unavailable }
+        cancel()
+        let ticket = UUID(), flag = AtlasSearchCancellation()
+        operation = ticket; cancellation = flag
+        do {
+            let value = try await withTaskCancellationHandler(operation: {
+                try await io.perform(cancellation: flag, keepingAlive: [source]) { try work(source.handle) }
+            }, onCancel: { flag.cancel(); source.cancel() })
+            try Task.checkCancellation()
+            guard session === source, operation == ticket, !flag.isCanceled,
+                  info?.identity.matches(original.identity) == true else { throw AtlasReaderError.canceled }
+            cancellation = nil
+            return value
+        } catch {
+            if operation == ticket { cancellation = nil }
+            throw Self.readerError(error)
+        }
+    }
+
+    /// Both retained handles are transferred explicitly to a single compatible
+    /// registry. Analysis runs off the main actor and keeps BOTH source/grant
+    /// lifetimes through return. Replacement, closure or cancellation of either
+    /// reader rejects delivery; ordinary query/outline state is not transferred.
+    func compare(with other: AtlasReaderCoordinator,
+                 limits: AtlasReaderComparisonLimits = .init()) async throws -> AtlasReaderComparisonReport {
+        try Task.checkCancellation()
+        try limits.validate()
+        guard self !== other, let before = session, let after = other.session,
+              let beforeInfo = info, let afterInfo = other.info,
+              beforeInfo.captureSHA256 != nil, afterInfo.captureSHA256 != nil,
+              let comparison = before.transport.comparison,
+              comparison.domain == after.transport.comparison?.domain,
+              beforeInfo.identity.owner != afterInfo.identity.owner,
+              lastComparisonGeneration < UInt64.max else { throw AtlasReaderError.unavailable }
+        lastComparisonGeneration += 1
+        let generation = lastComparisonGeneration
+        cancel()
+        let ticket = UUID(), flag = AtlasSearchCancellation()
+        operation = ticket; cancellation = flag
+        do {
+            let result = try await withTaskCancellationHandler(operation: {
+                try await io.perform(cancellation: flag, keepingAlive: [before, after]) {
+                    try AtlasReaderComparisonReport.decode(comparison.compare(before.handle, after.handle,
+                        generation, limits.editDistance, limits.work), before: beforeInfo, after: afterInfo,
+                        generation: generation, limits: limits)
+                }
+            }, onCancel: { flag.cancel(); before.cancel(); after.cancel() })
+            try Task.checkCancellation()
+            guard session === before, other.session === after, operation == ticket, !flag.isCanceled,
+                  info?.identity.matches(beforeInfo.identity) == true,
+                  other.info?.identity.matches(afterInfo.identity) == true else { throw AtlasReaderError.canceled }
+            cancellation = nil
+            return result
+        } catch {
+            if operation == ticket { cancellation = nil }
+            throw Self.readerError(error)
+        }
+    }
 
     /// Initialize this empty coordinator from another reader's exact capture.
     /// Only the new reader's queue and cancellation state are touched. Foreign
@@ -171,6 +242,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
                       copiedInfo.identity.capturedBytes == sourceInfo.identity.capturedBytes,
                       copiedInfo.identity.encoding == sourceInfo.identity.encoding,
                       copiedInfo.identity.pathBytes == sourceInfo.identity.pathBytes,
+                      sourceInfo.captureSHA256 == nil || copiedInfo.captureSHA256 == sourceInfo.captureSHA256,
                       copiedInfo.origin == "host-supplied" else { throw AtlasReaderError.invalidResponse }
                 let copiedPage = try AtlasReaderPage.decode(
                     next.transport.window(next.handle, original.start, request.byteLimit),

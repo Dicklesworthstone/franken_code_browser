@@ -19,7 +19,7 @@ extension AtlasReaderTransport {
             guard path.utf8.elementsEqual(target.path.utf8) else { return nil }
             return try? target.openReader(handle)
         }, window: window, lines: lines, cancel: cancel, close: close,
-        retirementFailed: retirementFailed, fork: fork, openBytes: openBytes)
+        retirementFailed: retirementFailed, fork: fork, openBytes: openBytes, comparison: comparison)
     }
 }
 
@@ -35,13 +35,27 @@ struct AtlasCapturedReaderResult<Page: Sendable>: Sendable {
 /// second matcher. The existing hit decoder maps UTF-8/UTF-16/BOM/NUL coordinates;
 /// a workspace offset is never cast into a native text offset or a reader ID.
 enum AtlasCapturedReader {
+    /// Structural names may be prefixes or parsed heading text, so they do not
+    /// authorize a literal Find. Open the retained evidence's original range.
+    static func structuralRequest(_ selected: AtlasSearchCapturedHit,
+                                  identity: AtlasReaderIdentity) throws -> AtlasReaderRequest {
+        guard selected.mode != .text, identity.capturedBytes == selected.capturedBytes,
+              identity.pathBytes.elementsEqual(selected.path.utf8),
+              selected.start < selected.end, selected.end <= selected.capturedBytes,
+              selected.end - selected.start <= AtlasReaderLimits.maximumPageBytes else {
+            throw AtlasReaderError.invalidResponse
+        }
+        return .window(offset: selected.start,
+            bytes: max(AtlasReaderLimits.pageBytes, selected.end - selected.start))
+    }
+
     @MainActor static func activate<Page: Sendable>(
         _ selected: AtlasSearchCapturedHit, identity: AtlasReaderIdentity,
         find: @MainActor (String) async throws -> AtlasReaderFindReport,
         read: @MainActor (AtlasReaderHitTarget) async throws -> Page
     ) async throws -> AtlasCapturedReaderResult<Page> {
         try Task.checkCancellation()
-        guard identity.capturedBytes == selected.capturedBytes,
+        guard selected.mode == .text, identity.capturedBytes == selected.capturedBytes,
               identity.pathBytes.elementsEqual(selected.path.utf8),
               selected.start < selected.end, selected.end <= selected.capturedBytes else {
             throw AtlasReaderError.invalidResponse

@@ -88,7 +88,7 @@ enum AtlasSearchCaptureFactory {
                         let json = try importReader(handle, reader, identity.generation, UInt64(hit.id + 1))
                         return try validatedReader(json, receiver: reader, identity: identity, witness: witness)
                     }
-                })
+                }, mode: witness.hit.structure?.mode ?? .text)
         })
     }
 

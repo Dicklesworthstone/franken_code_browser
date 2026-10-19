@@ -8,6 +8,7 @@ import Foundation
 @_silgen_name("fixture_refuse_create") private func refuseCreate()
 @_silgen_name("fixture_expect_scope") private func expectScope(_ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?)
 @_silgen_name("fixture_expect_path") private func expectPath(_ kind: UInt64, _ path: UnsafePointer<CChar>)
+@_silgen_name("fixture_expect_structure") private func expectStructure(_ mode: UInt64, _ nameMode: UInt64)
 @_cdecl("fixture_mark_canceled") public func markCanceled(_ context: UnsafeMutableRawPointer?) {
     guard let context else { preconditionFailure("Missing callback lifetime") }
     Unmanaged<AtlasSearchCancellation>.fromOpaque(context).takeUnretainedValue().cancel()
@@ -99,6 +100,59 @@ private final class Reports: @unchecked Sendable {
         try AtlasNativeSearch.runScoped(input: AtlasSearchInput(root: "/project", query: "x", fileScope: scope, pathScope: pathScope),
             cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
     }
+    private static func structurePage(_ command: String, mode: AtlasSearchMode = .symbols,
+                                      nameMode: AtlasSearchNameMode = .contains, step: Int,
+                                      total: Int = 0, running: Bool = true, complete: Bool = false,
+                                      catalogued: Int = 1) -> [String: Any] {
+        var value = page(command, step: step, total: total, running: running,
+            complete: complete, catalogued: catalogued)
+        value["mode"] = mode.wireMode; value["search_strategy"] = "live-structure-scan"
+        value["requested_mode"] = mode.rawValue; value["realized_mode"] = mode.evidence
+        value["evidence_level"] = mode.evidence; value["semantic_complete"] = false
+        value["name_mode"] = nameMode.rawValue; value["name_case"] = "sensitive"
+        value["completeness_basis"] = "admitted-extraction-processing"
+        value["structure_file_byte_limit"] = mode == .symbols ? "65536" : "262144"
+        value["unsupported_structure_files"] = "0"; value["extraction_limited_files"] = "0"
+        value["structure_metadata_omitted"] = "0"; value["structure_metadata_bytes"] = step == 0 ? "0" : "64"
+        if total > 0 {
+            var row = hit(1, path: mode == .headings ? "524541444d452e6d64" : "612e7273")
+            if mode == .headings {
+                row["original_range"] = ["start": "0", "end": "16"]
+                row["path"] = ["encoding": "unix-bytes", "hex": "524541444d452e6d64", "display": "README.md"]
+            }
+            row["structure"] = ["name": "x", "kind": mode == .headings ? "heading" : "function",
+                "language": mode == .headings ? "markdown" : "rust", "candidate_id": "1",
+                "heading_slug": mode == .headings ? "x" : NSNull(),
+                "evidence_range": ["start": "0", "end": "16"],
+                "evidence_level": mode.evidence] as [String: Any]
+            value["hits"] = [row]
+        }
+        return value
+    }
+    private static func setupStructure(_ mode: AtlasSearchMode = .symbols,
+                                       nameMode: AtlasSearchNameMode = .contains) throws {
+        resetFixture(); expectStructure(mode.code, nameMode.code)
+        try install(0, ["status": "ok"])
+        try install(1, structurePage("begin-structure", mode: mode, nameMode: nameMode, step: 0))
+        try install(2, structurePage("step", mode: mode, nameMode: nameMode, step: 1,
+            total: 1, running: false, complete: true))
+    }
+    private static func runStructure(_ mode: AtlasSearchMode = .symbols,
+                                     nameMode: AtlasSearchNameMode = .contains,
+                                     cancellation: AtlasSearchCancellation = AtlasSearchCancellation()) throws -> AtlasSearchReport {
+        try AtlasNativeSearch.runScoped(input: AtlasSearchInput(root: "/project", query: "x",
+            mode: mode, nameMode: nameMode), cancellation: cancellation,
+            access: AtlasSearchAccessLease(nil), progress: { _ in })
+    }
+    @MainActor private static func rejectedStructure(_ label: String, mode: AtlasSearchMode = .headings,
+                                                     _ change: () throws -> Void) throws {
+        try setupStructure(mode); try change()
+        do { _ = try runStructure(mode); preconditionFailure("Accepted invalid structure response: " + label) }
+        catch AtlasSearchError.invalidResponse { checks += 1 }
+        retired()
+        check(fixtureCount(6) == fixtureCount(7), "Structural rejection releases every C allocation: " + label)
+    }
+
     // Last-owner retirement is intentionally asynchronous. Fixture counters are
     // atomic; never reset them until the previous session has actually closed.
     private static func retired() {
@@ -339,6 +393,154 @@ private final class Reports: @unchecked Sendable {
         catch AtlasSearchError.canceled { checks += 1 }
         retired()
         check(fixtureCount(6) == fixtureCount(7), "Racing path-scoped cancellation releases every C allocation")
+        // Changing from an exact/prefix name query back to literal text must
+        // normalize the inactive name control before coordinator admission.
+        for nameMode in AtlasSearchNameMode.allCases {
+            let literal = try AtlasSearchInput(root: "/project", query: "x",
+                mode: .text, nameMode: nameMode)
+            check(literal.mode == .text && literal.nameMode == .contains,
+                "Literal request must not inherit a structural name predicate")
+        }
+        for mode in [AtlasSearchMode.symbols, .headings] {
+            for nameMode in AtlasSearchNameMode.allCases {
+                try setupStructure(mode, nameMode: nameMode)
+                var report: AtlasSearchReport? = try runStructure(mode, nameMode: nameMode)
+                check(report!.complete && report!.hits.count == 1 && report!.mode == mode
+                    && report!.nameMode == nameMode && report!.structureCoverage?.unsupportedFiles == 0,
+                    "Distinct structural admission retains mode and name predicate")
+                let hit = report!.hits[0]
+                check(hit.structure?.evidence == mode.evidence
+                    && report!.capture?.target(hit)?.mode == mode,
+                    "Qualified structure evidence remains attached to retained-reader activation")
+                check(fixtureCount(11) == 1, "Structural request uses its own C entry")
+                if mode == .headings {
+                    check(hit.structure?.headingSlug == "x" && hit.start == 0 && hit.end == 16,
+                        "Heading syntax span survives independently of the shorter query")
+                } else {
+                    check(hit.structure?.headingSlug == nil && report!.summary.contains("Heuristic"),
+                        "Symbol candidates never claim compiler-level semantics")
+                }
+                report = nil; retired()
+            }
+        }
+        // Returned heading titles are JSON metadata, not C-string inputs.
+        // The shared parser can preserve NUL in a valid bounded title.
+        try setupStructure(.headings)
+        var nulHeading = structurePage("step", mode: .headings, step: 1,
+            total: 1, running: false, complete: true)
+        var nulRows = nulHeading["hits"] as! [[String: Any]]
+        var nulStructure = nulRows[0]["structure"] as! [String: Any]
+        nulStructure["name"] = "x\u{0}y"
+        nulRows[0]["structure"] = nulStructure
+        nulHeading["hits"] = nulRows
+        try install(2, nulHeading)
+        var nulReport: AtlasSearchReport? = try runStructure(.headings)
+        check(nulReport!.complete && nulReport!.hits[0].structure?.name == "x\u{0}y",
+            "Valid returned heading metadata must retain embedded NUL")
+        nulReport = nil; retired()
+        try rejectedStructure("literal admission command") {
+            try install(1, structurePage("begin", mode: .headings, step: 0))
+        }
+        for (key, badValue) in [
+            ("requested_mode", "symbols"), ("realized_mode", "compiler-symbol"),
+            ("name_mode", "prefix"), ("evidence_level", "unknown"),
+            ("name_case", "insensitive"), ("completeness_basis", "semantic-complete"),
+            ("structure_file_byte_limit", "262145"), ("unsupported_structure_files", "1"),
+            ("extraction_limited_files", "1"), ("structure_metadata_omitted", "16777217"),
+            ("structure_metadata_bytes", "8388609"), ("matches_seen", "1002")
+        ] {
+            try rejectedStructure(key) {
+                var bad = structurePage("step", mode: .headings, step: 1,
+                    total: 1, running: false, complete: true)
+                bad[key] = badValue; try install(2, bad)
+            }
+        }
+        for missing in ["unsupported_structure_files", "structure_metadata_omitted", "structure_file_byte_limit"] {
+            try rejectedStructure("missing " + missing) {
+                var bad = structurePage("step", mode: .headings, step: 1,
+                    total: 1, running: false, complete: true)
+                bad.removeValue(forKey: missing); try install(2, bad)
+            }
+        }
+        try rejectedStructure("false semantic completeness") {
+            var bad = structurePage("step", mode: .headings, step: 1,
+                total: 1, running: false, complete: true)
+            bad["semantic_complete"] = true; try install(2, bad)
+        }
+        for defect in ["missing", "range", "slug", "language", "kind", "name", "candidate", "evidence"] {
+            try rejectedStructure("hit " + defect) {
+                var bad = structurePage("step", mode: .headings, step: 1,
+                    total: 1, running: false, complete: true)
+                var rows = bad["hits"] as! [[String: Any]]
+                var structure = rows[0]["structure"] as! [String: Any]
+                switch defect {
+                case "missing": rows[0].removeValue(forKey: "structure")
+                case "range": structure["evidence_range"] = ["start": "1", "end": "16"]
+                case "slug": structure["heading_slug"] = NSNull()
+                case "language": structure["language"] = "rust"
+                case "kind": structure["kind"] = "function"
+                case "name": structure["name"] = String(repeating: "x", count: 4097)
+                case "candidate": structure["candidate_id"] = "4097"
+                default: structure["evidence_level"] = "compiler-symbol"
+                }
+                if defect != "missing" { rows[0]["structure"] = structure }
+                bad["hits"] = rows; try install(2, bad)
+            }
+        }
+        try rejected("structural metadata in literal query") {
+            var bad = page("step", step: 1, total: 1)
+            bad["requested_mode"] = "symbols"; try install(2, bad)
+        }
+        // One unsupported file and one partially extracted file can still
+        // yield a usable result, even when metadata omissions exceed 1000.
+        try setupStructure(.headings)
+        try install(1, structurePage("begin-structure", mode: .headings, step: 0, catalogued: 2))
+        var unsupported = structurePage("step", mode: .headings, step: 1, catalogued: 2)
+        unsupported["scanned_files"] = "0"; unsupported["unavailable_files"] = "1"
+        unsupported["unsupported_structure_files"] = "1"; unsupported["structure_metadata_bytes"] = "0"
+        try install(2, unsupported)
+        var losses = structurePage("step", mode: .headings, step: 2, total: 1,
+            running: false, catalogued: 2)
+        losses["scanned_files"] = "1"; losses["unavailable_files"] = "2"
+        losses["unsupported_structure_files"] = "1"; losses["extraction_limited_files"] = "1"
+        losses["structure_metadata_omitted"] = "1500"; losses["matches_seen"] = "1501"
+        try install(2, losses, index: 1)
+        var coverage: AtlasSearchReport? = try runStructure(.headings)
+        check(!coverage!.complete && coverage!.hits.count == 1 && coverage!.matchesSeen == 1501
+            && coverage!.unsupportedFiles == 1 && coverage!.structureCoverage?.extractionLimitedFiles == 1
+            && coverage!.structureCoverage?.metadataOmitted == 1500,
+            "Metadata omissions preserve the retained result rather than rejecting a large candidate count")
+        check(coverage!.summary.contains("unsupported languages")
+            && coverage!.summary.contains("extraction limits")
+            && coverage!.summary.contains("omitted by metadata limits"),
+            "Partial summary exposes each declared coverage loss")
+        coverage = nil; retired()
+        for defect in ["omissions", "bytes", "unsupported"] {
+            try setupStructure(.headings)
+            try install(1, structurePage("begin-structure", mode: .headings, step: 0, catalogued: 2))
+            var first = structurePage("step", mode: .headings, step: 1, total: 1, catalogued: 2)
+            first["unavailable_files"] = "1"; first["structure_metadata_omitted"] = "2"
+            first["matches_seen"] = "3"; first["structure_metadata_bytes"] = "128"
+            var last = structurePage("step", mode: .headings, step: 2, total: 1,
+                running: false, catalogued: 2)
+            last["unavailable_files"] = "1"; last["structure_metadata_omitted"] = "2"
+            last["matches_seen"] = "3"; last["structure_metadata_bytes"] = "128"
+            if defect == "omissions" { last["structure_metadata_omitted"] = "1" }
+            if defect == "bytes" { last["structure_metadata_bytes"] = "64" }
+            if defect == "unsupported" {
+                first = unsupported
+                last["scanned_files"] = "1"; last["unsupported_structure_files"] = "0"
+            }
+            try install(2, first); try install(2, last, index: 1)
+            do { _ = try runStructure(.headings); preconditionFailure("Coverage regression accepted: " + defect) }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+            retired()
+        }
+        try setupStructure(.symbols); cancelStep()
+        do { _ = try runStructure(.symbols); preconditionFailure("Structural cancellation ignored") }
+        catch AtlasSearchError.canceled { checks += 1 }
+        retired()
+        check(fixtureCount(6) == fixtureCount(7), "Racing structural cancellation releases every allocation")
         resetFixture()
         print("AtlasNativeSearchTests: \(checks) checks passed")
     }

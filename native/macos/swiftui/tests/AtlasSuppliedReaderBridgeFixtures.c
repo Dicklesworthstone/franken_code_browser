@@ -1,6 +1,7 @@
 /* Pointer/length/allocation fixture for the actual Swift reader bridge.
  * This is not a substitute for the Rust supplied-reader integration tests. */
 #include "../../../../crates/fcb-bridge/include/fcb_reader_supplied.h"
+#include "../../../../crates/fcb-bridge/include/fcb_reader_comparison.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,14 @@ char *fcb_reader_lines(uint64_t handle, uint64_t first, uint64_t count, uint64_t
 }
 char *fcb_reader_fork(uint64_t source, uint64_t destination) {
     (void)source; (void)destination; return NULL;
+}
+char *fcb_reader_compare(uint64_t before, uint64_t after, uint64_t generation,
+    uint64_t edits, uint64_t work) {
+    assert(before == fixture_handle && after == fixture_handle - 1);
+    assert(generation == UINT64_MAX && edits == 512 && work == UINT64_C(67108864));
+    ++calls;
+    char *result = strdup("{\"comparison_fixture\":true}");
+    assert(result); ++allocated; return result;
 }
 uint8_t fcb_reader_cancel(uint64_t handle) { assert(handle == fixture_handle); return 1; }
 uint8_t fcb_reader_close(uint64_t handle) { assert(handle == fixture_handle); return 1; }

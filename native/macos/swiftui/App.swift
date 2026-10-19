@@ -231,6 +231,8 @@ extension AtlasCamera {
     @State private var searchCoordinator: AtlasSearchCoordinator?
     @State private var workspaceSearch: AtlasWorkspaceSearch?
     @State private var useCapturedIndex = false
+    @State private var searchMode: AtlasSearchMode = .text
+    @State private var searchNameMode: AtlasSearchNameMode = .contains
     @State private var resolvedMatches: [SearchHit.ID: AtlasMatch] = [:]
     @State private var searchRows: [CGRect] = []
     @State private var searchPaths: Set<String> = []
@@ -248,6 +250,8 @@ extension AtlasCamera {
     @State private var usesPagedReader = false
     @State private var capturedReaderTarget: AtlasSearchCapturedHit?
     @State private var suppliedReaderTarget: AtlasSuppliedReaderSource?
+    @State private var readingDesk = AtlasReadingDeskModel(transport: .native)
+    @State private var showsReadingDesk = false
     @State private var pinnedReaders = AtlasPinnedReaders<AtlasPagedReaderModel>(
         canFork: { $0.canPin }, fork: { try await $0.fork() }, retire: { $0.close() },
         failureMessage: { ($0 as? AtlasReaderError)?.message ?? "The source could not be pinned." })
@@ -290,7 +294,8 @@ extension AtlasCamera {
     private var searchContext: AtlasSearchContext {
         AtlasSearchContext(root: root, query: query, loadGeneration: loadGeneration,
             atlasRevision: atlasRevision, scope: fileScope.rawValue, customExtensions: customExtensions,
-            pathKind: searchPathKind.rawValue, path: searchPathKind == .workspace ? "" : searchPathInput)
+            pathKind: searchPathKind.rawValue, path: searchPathKind == .workspace ? "" : searchPathInput,
+            mode: searchMode, nameMode: searchMode == .text ? .contains : searchNameMode)
     }
 
     // Observe byte-distinct edits without duplicating an arbitrarily large
@@ -309,9 +314,12 @@ extension AtlasCamera {
     }
 
     private var searchIsCurrent: Bool {
-        !loadingProject && (searchReport?.indexStatus != nil) == useCapturedIndex
+        !loadingProject && (searchReport?.indexStatus != nil) == wantsCapturedIndex
+            && searchReport?.mode == searchMode
             && searchPresentation?.isCurrent(in: searchContext) == true
     }
+
+    private var wantsCapturedIndex: Bool { searchMode == .text && useCapturedIndex }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -355,6 +363,10 @@ extension AtlasCamera {
             }
             .disabled(selectedPath == nil)
             .help("Show or hide the selectable source reader")
+            Button { showsReadingDesk = true } label: {
+                Label("Reading Desk", systemImage: "books.vertical")
+            }
+            .help("Read retained sources, follow cross-file history, keep named bookmarks, and save or open a checkpoint")
             Button { moveSearchResult(backwards: true) } label: {
                 Label("Previous Match", systemImage: "arrow.up")
             }
@@ -369,6 +381,7 @@ extension AtlasCamera {
             .help("Next search match (⌘G)")
         }
         .sheet(isPresented: $showsFileFinder) { fileFinderSheet }
+        .sheet(isPresented: $showsReadingDesk) { AtlasReadingDeskView(model: readingDesk) }
         .onAppear {
 #if FCB_APP_STORE
             if let recent = Engine.recents.first { restoreProject(recent) }
@@ -378,6 +391,8 @@ extension AtlasCamera {
 #endif
         }
         .onDisappear {
+            readingDesk.close()
+            showsReadingDesk = false
             pinnedReaders.closeAll()
             showsFileFinder = false
             capturedReaderTarget = nil
@@ -395,10 +410,21 @@ extension AtlasCamera {
             workspaceSearch?.refresh()
             workspaceSearch = nil
         }
-        .onChange(of: useCapturedIndex) { _, indexed in
+        .onChange(of: useCapturedIndex) { _, _ in
             clearSearch()
-            workspaceSearch?.configure(indexed: indexed)
+            workspaceSearch?.configure(indexed: wantsCapturedIndex)
             runSearch(debounce: true)
+        }
+        .onChange(of: searchMode) { _, _ in
+            clearSearch()
+            workspaceSearch?.configure(indexed: wantsCapturedIndex)
+            runSearch(debounce: true)
+        }
+        .onChange(of: searchNameMode) { _, _ in
+            if searchMode != .text {
+                clearSearch()
+                runSearch(debounce: true)
+            }
         }
         .onChange(of: pinnedReaders.notice) { _, notice in
             if !notice.isEmpty && !pinnedReaders.busy { status = notice }
@@ -524,8 +550,14 @@ extension AtlasCamera {
                 .accessibilityLabel("Hide search sidebar")
                 .help("Hide search; Command-F opens it again")
             }.padding(10)
+            Picker("Search mode", selection: $searchMode) {
+                ForEach(AtlasSearchMode.allCases) { mode in Text(mode.label).tag(mode) }
+            }
+            .pickerStyle(.segmented).padding(.horizontal, 10)
+            .accessibilityLabel("Search mode")
+            .help("Search exact text, named declaration candidates, or Markdown headings")
             HStack {
-                TextField("Exact text in project…", text: $query)
+                TextField(searchMode.placeholder, text: $query)
                     .textFieldStyle(.roundedBorder)
                     .focused($searchFocused)
                     .onSubmit(runSearch)
@@ -540,19 +572,29 @@ extension AtlasCamera {
             }
             .padding(.horizontal, 10)
             .padding(.top, 10)
+            if searchMode != .text {
+                Picker("Name matching", selection: $searchNameMode) {
+                    ForEach(AtlasSearchNameMode.allCases) { mode in Text(mode.label).tag(mode) }
+                }
+                .pickerStyle(.segmented).padding(.horizontal, 10).padding(.top, 6)
+                .accessibilityLabel("Name matching")
+                Text(searchMode.explanation)
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .padding(.horizontal, 10).padding(.top, 4)
+            }
             searchLocationControls
             HStack {
                 Toggle("Captured index", isOn: $useCapturedIndex)
                     .toggleStyle(.checkbox)
-                    .disabled(loadingProject)
+                    .disabled(loadingProject || searchMode != .text)
                     .help("Capture once and reuse the Rust index. Live search remains the default.")
                 Spacer()
                 Button("Refresh", action: refreshCapturedSearch)
-                    .disabled(!useCapturedIndex || loadingProject || root.isEmpty)
+                    .disabled(!wantsCapturedIndex || loadingProject || root.isEmpty)
                     .help("Capture current files into a new index without changing an already opened reader")
             }
             .font(.caption).padding(.horizontal, 10).padding(.top, 6)
-            if useCapturedIndex {
+            if wantsCapturedIndex {
                 Text("Per-file snapshot: later queries do not check disk. Refresh to include edits. Limits: 4096 files, 1 MiB per file, 32 MiB total.")
                     .font(.caption2).foregroundStyle(.secondary)
                     .padding(.horizontal, 10).padding(.top, 4)
@@ -585,9 +627,9 @@ extension AtlasCamera {
                 let preparing = searchReport?.indexStatus?.building == true
                 let count = preparing ? UInt64(searchReport?.indexStatus?.capturedFiles ?? 0) : (searchReport?.matchesSeen ?? 0)
                 let countLabel = searchReport.map { report in
-                    (report.isWorkspaceScope ? "workspace matches"
-                        : (report.pathScope.isWorkspace ? "matches in selected types"
-                            : "matches in selected " + report.pathScope.kind.label.lowercased()))
+                    (report.isWorkspaceScope ? report.mode.resultLabel
+                        : (report.pathScope.isWorkspace ? report.mode.resultLabel + " in selected types"
+                            : report.mode.resultLabel + " in selected " + report.pathScope.kind.label.lowercased()))
                         + (report.complete ? "" : (report.isInProgress ? " · searching" : " · partial"))
                 } ?? "ready to search"
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -763,7 +805,8 @@ extension AtlasCamera {
                             sourcePane.frame(minWidth: 320)
                         }
                         if !pinnedReaders.entries.isEmpty || pinnedReaders.busy {
-                            AtlasPinnedReadersView(readers: pinnedReaders).frame(minWidth: 320)
+                            AtlasPinnedReadersView(readers: pinnedReaders,
+                                canKeep: readingDesk.canOperate, keep: keepSource).frame(minWidth: 320)
                         }
                     }
                     .frame(height: (!pinnedReaders.entries.isEmpty || pinnedReaders.busy) ? 380 : (usesPagedReader ? 320 : 240))
@@ -881,14 +924,16 @@ extension AtlasCamera {
 #if FCB_APP_STORE
                     if let access = rootAccess, access.url.path.utf8.elementsEqual(root.utf8) {
                         AtlasPagedSourceView(root: root, path: path, accessLease: access, captured: capturedReaderTarget,
-                            supplied: suppliedReaderTarget, canPin: pinnedReaders.canAdd, pin: pinSource)
+                            supplied: suppliedReaderTarget, canPin: pinnedReaders.canAdd, pin: pinSource,
+                            canKeep: readingDesk.canOperate, keep: keepSource)
                             .id(focusRequest)
                     } else {
                         Text("Choose the project folder again to grant read access.")
                     }
 #else
                     AtlasPagedSourceView(root: root, path: path, accessLease: nil, captured: capturedReaderTarget,
-                        supplied: suppliedReaderTarget, canPin: pinnedReaders.canAdd, pin: pinSource)
+                        supplied: suppliedReaderTarget, canPin: pinnedReaders.canAdd, pin: pinSource,
+                            canKeep: readingDesk.canOperate, keep: keepSource)
                         .id(focusRequest)
 #endif
                 } else {
@@ -921,6 +966,15 @@ extension AtlasCamera {
     }
 
     // MARK: Actions
+
+    private func keepSource(_ reader: AtlasPagedReaderModel) {
+        guard readingDesk.canOperate, reader.canPin,
+              let domain = readingDesk.readerDomain, reader.retainedRegistryDomain == domain else { return }
+        // The desk owns its imported capture independently of project changes.
+        // Its receiving operation keeps the source reader alive until delivery.
+        readingDesk.keep(reader: reader)
+        showsReadingDesk = true
+    }
 
     private func pinSource(_ reader: AtlasPagedReaderModel) {
         guard !loadingProject, let path = selectedPath, let page = reader.page, reader.canPin,
@@ -1330,7 +1384,8 @@ extension AtlasCamera {
             let input = try AtlasSearchInput(root: requestedRoot, query: requestedText,
                 fileScope: fileScope.searchScope(custom: customExtensions),
                 pathScope: AtlasSearchPathScope(kind: searchPathKind,
-                    path: searchPathKind == .workspace ? "" : searchPathInput))
+                    path: searchPathKind == .workspace ? "" : searchPathInput),
+                mode: searchMode, nameMode: searchNameMode)
             clearSearch()
             searchPending = true
             searchTitle = "Searching project"
@@ -1339,19 +1394,22 @@ extension AtlasCamera {
                 : (input.pathScope.isWorkspace
                     ? "Searching selected file types. Excluded files do not consume the query's scan or result limits."
                     : "Searching \(input.pathScope.kind.label.lowercased()) \(String(reflecting: input.pathScope.path))\(input.fileScope.isAll ? "." : " within selected file types.") Excluded files do not consume the query's scan or result limits.")
+            if input.mode != .text {
+                searchSummary = "Searching \(input.mode == .symbols ? "declaration candidates" : "Markdown headings"). \(input.mode.explanation)"
+            }
             status = searchSummary
             let coordinator = searchCoordinator ?? AtlasSearchCoordinator(scopedWork: AtlasNativeSearch.runScoped)
             searchCoordinator = coordinator
             let service = workspaceSearch ?? AtlasWorkspaceSearch(scopedLive: AtlasNativeSearch.runScoped,
                 makeIndex: { AtlasIndexedSearch(transport: .native) })
             workspaceSearch = service
-            let choice = service.selection(indexed: useCapturedIndex)
+            let choice = service.selection(indexed: wantsCapturedIndex)
             try coordinator.submitScoped(input: input, accessLease: accessLease, debounce: debounce, using: choice.scopedWork) { result in
                 // Generation rejection happens in the coordinator. These checks
                 // also cover SwiftUI state changes before onChange has run.
                 guard !loadingProject, requestedContext.matchesSourceRequest(searchContext),
                       workspaceSearch === service, service.accepts(choice),
-                      choice.indexed == useCapturedIndex else { return }
+                      choice.indexed == wantsCapturedIndex else { return }
                 searchPending = false
                 switch result {
                 case .success(let report):
@@ -1379,7 +1437,7 @@ extension AtlasCamera {
     }
 
     private func refreshCapturedSearch() {
-        guard useCapturedIndex, !loadingProject, !root.isEmpty else { return }
+        guard wantsCapturedIndex, !loadingProject, !root.isEmpty else { return }
         clearSearch()
         workspaceSearch?.refresh()
         if query.isEmpty {
@@ -1497,7 +1555,8 @@ extension AtlasCamera {
             guard let row = searchRow,
                   let hit = searchPresentation?.captureCandidate(for: row, in: searchContext),
                   let target = capture.target(hit), target.root.utf8.elementsEqual(root.utf8),
-                  target.path.utf8.elementsEqual(path.utf8), target.needle.utf8.elementsEqual(query.utf8) else {
+                  target.path.utf8.elementsEqual(path.utf8), target.needle.utf8.elementsEqual(query.utf8),
+                  target.mode == searchMode else {
                 sourceUnavailable()
                 sourceError = "The retained search capture could not authorize this match. Search again, or explicitly open the current file."
                 status = sourceError ?? "Retained match unavailable"
@@ -1834,12 +1893,16 @@ struct HitRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: "doc.text")
+            Image(systemName: hit.structure.map { $0.mode == .headings ? "number" : "curlybraces" } ?? "doc.text")
                 .foregroundStyle(isSameFile ? Color.accentColor : .secondary)
             VStack(alignment: .leading, spacing: 2) {
-                Text(hit.fileName)
+                Text(hit.structure?.name ?? hit.fileName)
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(isSameFile ? Color.accentColor : .primary)
+                if let structure = hit.structure {
+                    Text(structure.label).font(.caption2).foregroundStyle(.secondary)
+                    Text(hit.fileName).font(.caption).lineLimit(1).truncationMode(.middle)
+                }
                 Text(hit.folder)
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)

@@ -8,23 +8,15 @@ swiftc -swift-version 6 -warnings-as-errors \
     "$src/AtlasSearch.swift" "$src/AtlasSearchCapture.swift" \
     "$src/tests/AtlasSearchCaptureTests.swift" -o "$out/capture-tests"
 "$out/capture-tests"
-python3 - "$src" "$out/ReaderVocabulary.swift" <<'PY'
-from pathlib import Path
-import sys
-src = Path(sys.argv[1])
-reader = (src / 'AtlasReader.swift').read_text()
-search = (src / 'AtlasReaderSearch.swift').read_text()
-coordinator = (src / 'AtlasReaderCoordinator.swift').read_text()
-# Preserve production transport/value/target logic unchanged. The activation
-# test injects typed reader results; decoder/coordinator suites remain separate.
-parts = [reader[:reader.index('enum AtlasReaderRequest:')],
-         reader[reader.index('struct AtlasReaderIdentity:'):reader.index('struct AtlasReaderInfo:')],
-         coordinator[coordinator.index('struct AtlasReaderTransport:'):coordinator.index('/// This reference')],
-         search[:search.index('    static func decode(')] + '\n}\n']
-Path(sys.argv[2]).write_text('\n'.join(parts))
-PY
+# Compile the owning reader declarations directly: structural activation now
+# returns a real reader request, and the transport carries comparison capability.
+# The typed activation fixture still does not claim C ABI or native UI coverage.
 swiftc -swift-version 6 -warnings-as-errors \
-    "$src/AtlasSearch.swift" "$out/ReaderVocabulary.swift" \
+    "$src/AtlasSearch.swift" "$src/AtlasSearchCapture.swift" \
+    "$src/AtlasSearchCoordinator.swift" "$src/AtlasProjectIO.swift" \
+    "$src/AtlasReader.swift" "$src/AtlasReaderSearch.swift" "$src/AtlasReaderComparison.swift" \
+    "$src/AtlasReaderOutline.swift" "$src/AtlasReaderDocument.swift" \
+    "$src/AtlasReaderCoordinator.swift" \
     "$src/AtlasCapturedReader.swift" "$src/tests/AtlasCapturedReaderTests.swift" \
     -o "$out/reader-tests"
 "$out/reader-tests"

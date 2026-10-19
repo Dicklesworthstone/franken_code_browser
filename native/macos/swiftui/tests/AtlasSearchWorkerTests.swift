@@ -6,6 +6,13 @@ private func legacySearch(_ root: UnsafePointer<CChar>?, _ query: UnsafePointer<
 @_silgen_name("fcb_free_string")
 private func freeLegacySearch(_ text: UnsafeMutablePointer<CChar>?)
 
+@_silgen_name("fcb_reader_create")
+private func createRetainedReader() -> UInt64
+@_silgen_name("fcb_reader_copy_range")
+private func copyRetainedRange(_ handle: UInt64, _ start: UInt64, _ end: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_reader_close")
+private func closeRetainedReader(_ handle: UInt64) -> UInt8
+
 /// Link AtlasSearch.swift, AtlasSearchCoordinator.swift, AtlasSearchWorker.swift
 /// and the real fcb-bridge static library. These tests use actual temporary
 /// sources and the production worker, not fabricated search responses. AppKit,
@@ -161,6 +168,106 @@ private func freeLegacySearch(_ text: UnsafeMutablePointer<CChar>?)
             precondition(absent.complete && absent.hits.isEmpty && absent.excludedFiles == 9
                 && absent.progress?.cataloguedFiles == 0, "Missing exact file must never widen to its directory")
         }
-        print("AtlasSearchWorker: production off-main search, UTF-16, captures, file-type/file/folder limits, negatives and cancellation checks passed")
+        // Structural requests share the production capture owner and request
+        // scheduler, while admission remains distinct from literal search.
+        let structureRoot = root.appendingPathComponent("structure")
+        try FileManager.default.createDirectory(at: structureRoot, withIntermediateDirectories: false)
+        try Data("fn run() {}\nfn runner() {}\n// run is also plain text\n".utf8)
+            .write(to: structureRoot.appendingPathComponent("source.rs"))
+        let headings = Data([0xef, 0xbb, 0xbf])
+            + Data("# Deploy!\r\n\r\nDeploy! is ordinary text too.\r\n\r\n# Deploy!\r\n".utf8)
+        try headings.write(to: structureRoot.appendingPathComponent("README.md"))
+        try Data("func run() {}\n".utf8).write(to: structureRoot.appendingPathComponent("unsupported.swift"))
+        let structureScope = try AtlasSearchPathScope(kind: .directory, path: "structure")
+        let rustOnly = try AtlasSearchFileScope(extensions: ["rs"])
+        do {
+            let result = try execute(AtlasSearchInput(root: root.path, query: "run", fileScope: rustOnly,
+                pathScope: structureScope, mode: .symbols, nameMode: .exact))
+            precondition(result.complete && result.hits.count == 1 && result.mode == .symbols,
+                "Exact symbol name must not include its prefix neighbor or ordinary comment")
+            let hit = result.hits[0]
+            precondition(hit.start == 3 && hit.end == 6 && hit.structure?.name == "run"
+                && hit.structure?.evidence == "heuristic-outline-candidate"
+                && hit.structure?.headingSlug == nil
+                && result.structureCoverage?.fileByteLimit == 65_536,
+                "Symbol carries qualified metadata and original-byte name evidence")
+            precondition(result.capture?.target(hit)?.mode == .symbols,
+                "Captured activation must retain structural mode")
+        }
+        do {
+            let result = try execute(AtlasSearchInput(root: root.path, query: "run", fileScope: rustOnly,
+                pathScope: structureScope, mode: .symbols, nameMode: .prefix))
+            precondition(result.complete && result.hits.count == 2
+                && Set(result.hits.compactMap { $0.structure?.name }) == ["run", "runner"],
+                "Prefix name request must reach the actual public symbol extractor")
+        }
+        do {
+            let swiftOnly = try AtlasSearchFileScope(extensions: ["swift"])
+            let result = try execute(AtlasSearchInput(root: root.path, query: "run", fileScope: swiftOnly,
+                pathScope: structureScope, mode: .symbols, nameMode: .exact))
+            precondition(!result.complete && result.hits.isEmpty && result.unavailableFiles == 1
+                && result.unsupportedFiles == 1 && result.structureCoverage?.unsupportedFiles == 1
+                && result.summary.contains("unsupported languages"),
+                "Unsupported extraction is an explicit partial search, not a complete negative")
+        }
+        let markdownOnly = try AtlasSearchFileScope(extensions: ["md"])
+        let headingInput = try AtlasSearchInput(root: root.path, query: "Deploy!", fileScope: markdownOnly,
+            pathScope: structureScope, mode: .headings, nameMode: .exact)
+        var retainedHeading: AtlasSearchReport?
+        try scopedCoordinator.submitScoped(input: headingInput, using: { input, flag, access, publish in
+            precondition(!Thread.isMainThread, "Structural capture and original-byte opening belong on the worker")
+            let result = try AtlasNativeSearch.runScoped(input: input, cancellation: flag,
+                access: access, progress: publish)
+            precondition(result.complete && result.hits.count == 2 && result.mode == .headings
+                && result.hits.map { $0.structure?.headingSlug } == ["deploy", "deploy-2"],
+                "Markdown query must use canonical duplicate heading slugs")
+            precondition(result.hits[0].start == 3, "Heading source range must retain the UTF-8 BOM offset")
+            let hit = result.hits[1]
+            guard let target = result.capture?.target(hit) else {
+                preconditionFailure("Heading result lost its retained capture capability")
+            }
+            precondition(target.mode == .headings && target.end - target.start > UInt64(input.query.utf8.count),
+                "Heading activation must retain syntax range rather than invent a literal-query range")
+            try Data("# Replacement on disk\n".utf8).write(to: structureRoot.appendingPathComponent("README.md"))
+            let reader = createRetainedReader()
+            precondition(reader != 0)
+            defer { precondition(closeRetainedReader(reader) == 1) }
+            let info = try target.openReader(reader)
+            precondition(info.contains("\"capture_origin\":\"host-supplied\"")
+                && info.contains("\"additional_source_bytes_read\":\"0\""),
+                "Opening a structural result must import the original capture without reopening its path")
+            guard let copied = copyRetainedRange(reader, target.start, target.end) else {
+                preconditionFailure("Retained heading bytes unavailable")
+            }
+            defer { freeLegacySearch(copied) }
+            let length = strnlen(copied, 4 * 1024 * 1024 + 1)
+            precondition(length <= 4 * 1024 * 1024)
+            guard let object = try JSONSerialization.jsonObject(with: Data(bytes: copied, count: length)) as? [String: Any] else {
+                preconditionFailure("Retained byte export did not return an object")
+            }
+            let expected = headings[Int(target.start)..<Int(target.end)]
+                .map { String(format: "%02x", $0) }.joined()
+            precondition(object["status"] as? String == "ok" && object["original_hex"] as? String == expected,
+                "A later live edit cannot replace the bytes selected by the original heading search")
+            return result
+        }) { completion in
+            do {
+                let report = try completion.get()
+                if !report.isInProgress { retainedHeading = report }
+            } catch { preconditionFailure("Production structural capture flow failed: \(error)") }
+        }
+        pump { retainedHeading != nil }
+        retainedHeading = nil
+        try Data(("# " + String(repeating: "A", count: 4097) + "\n\n# A\n").utf8)
+            .write(to: structureRoot.appendingPathComponent("README.md"))
+        do {
+            let result = try execute(AtlasSearchInput(root: root.path, query: "A", fileScope: markdownOnly,
+                pathScope: structureScope, mode: .headings, nameMode: .contains))
+            precondition(!result.complete && result.hits.count == 1 && result.matchesSeen == 2
+                && result.unavailableFiles == 1 && result.structureCoverage?.metadataOmitted == 1
+                && result.hits[0].structure?.name == "A",
+                "Metadata overflow must expose omitted candidates and keep later valid heading results")
+        }
+        print("AtlasSearchWorker: production off-main literal/symbol/heading search, retained original-byte activation, bounded scope/coverage, negatives and cancellation checks passed")
     }
 }
