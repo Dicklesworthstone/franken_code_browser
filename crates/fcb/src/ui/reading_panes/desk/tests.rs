@@ -242,3 +242,179 @@ fn closing_then_clearing_history_releases_unreferenced_sources() {
     assert_eq!(desk.retained_source_bytes(), 0);
     assert_eq!(desk.pane_id(pane.get()), Err(DeskError::MissingPane));
 }
+
+#[test]
+fn annotation_keeps_original_bytes_when_the_same_path_gets_unrelated_source() {
+    let (mut desk, _) = setup(DeskLimits::default());
+    let original = open(&mut desk, capture(1, 1, b"old exact\xff\r\n"), Some(range(0, 9)));
+    let id = command(&mut desk, DeskCommand::Annotate {
+        pane: original, label: "original evidence".into(), body: "Keep this rationale.\n\0Still personal.".into(),
+    }).created_bookmark.unwrap();
+    let at = desk.bookmarks()[0].location();
+    // The same logical path now refers to different bytes. Neither navigation
+    // nor clearing derived history is permission to move or discard the note.
+    let replacement = open(&mut desk, capture(1, 2, b"unrelated replacement"), None);
+    command(&mut desk, DeskCommand::Close(replacement));
+    command(&mut desk, DeskCommand::ClearHistory);
+    assert!(desk.panes().is_empty());
+    assert!(desk.history().is_empty());
+    assert_eq!(desk.retained_source_count(), 1);
+    assert_eq!(desk.retained_capture(desk.revision(), at.file, at.revision).unwrap().bytes(), b"old exact\xff\r\n");
+    assert_eq!(desk.bookmarks()[0].location(), at);
+    assert_eq!(desk.bookmarks()[0].body(), "Keep this rationale.\n\0Still personal.");
+    let recalled = command(&mut desk, DeskCommand::RecallBookmark(id)).active.unwrap();
+    assert_eq!(desk.selected_bytes(recalled, desk.revision()).unwrap(), b"old exact");
+    command(&mut desk, DeskCommand::Close(recalled));
+    command(&mut desk, DeskCommand::ClearHistory);
+    command(&mut desk, DeskCommand::ForgetBookmark(id));
+    assert_eq!(desk.retained_source_count(), 0);
+    assert!(desk.bookmarks().is_empty());
+}
+
+#[test]
+fn bookmark_relabel_and_note_edit_preserve_identity_anchor_and_selection() {
+    let (mut desk, _) = setup(DeskLimits::default());
+    let pane = open(&mut desk, capture(1, 1, b"one two"), Some(range(0, 3)));
+    let id = command(&mut desk, DeskCommand::Bookmark { pane, label: "first".into() }).created_bookmark.unwrap();
+    let original = desk.bookmarks()[0].location();
+    assert_eq!(desk.bookmarks()[0].body(), "");
+    assert_eq!(desk.bookmarks()[0].update_sequence(), 1);
+    command(&mut desk, DeskCommand::Navigate { pane, offset: 4, selection: Some(range(4, 7)) });
+    command(&mut desk, DeskCommand::EditBookmark {
+        bookmark: id, label: "revised label".into(), body: "Explain the original selection.\r\n".into(),
+    });
+    assert_eq!(desk.bookmarks()[0].id(), id);
+    assert_eq!(desk.bookmarks()[0].location(), original);
+    assert_eq!(desk.bookmarks()[0].label(), "revised label");
+    assert_eq!(desk.bookmarks()[0].body(), "Explain the original selection.\r\n");
+    assert_eq!(desk.bookmarks()[0].update_sequence(), 2);
+    assert_eq!(desk.selected_bytes(pane, desk.revision()).unwrap(), b"two");
+    command(&mut desk, DeskCommand::RecallBookmark(id));
+    assert_eq!(desk.selected_bytes(pane, desk.revision()).unwrap(), b"one");
+    command(&mut desk, DeskCommand::EditBookmark { bookmark: id, label: "label only".into(), body: String::new() });
+    assert_eq!(desk.bookmarks()[0].body(), "");
+    assert_eq!(desk.bookmarks()[0].update_sequence(), 3);
+}
+
+#[test]
+fn canceled_annotation_edits_and_deletes_publish_neither_text_nor_retirement() {
+    let (mut desk, _) = setup(DeskLimits::default());
+    let pane = open(&mut desk, capture(1, 1, b"source"), None);
+    let id = command(&mut desk, DeskCommand::Annotate { pane, label: "keep".into(), body: "original note".into() })
+        .created_bookmark.unwrap();
+    command(&mut desk, DeskCommand::Close(pane));
+    command(&mut desk, DeskCommand::ClearHistory);
+    let revision = desk.revision();
+    for command in [DeskCommand::EditBookmark { bookmark: id, label: "lost".into(), body: "unpublished".into() },
+        DeskCommand::ForgetBookmark(id)] {
+        let attempt = desk.last_attempt() + 1;
+        let mut calls = 0;
+        assert_eq!(desk.apply(revision, attempt, command, || { calls += 1; calls == 2 }), Err(DeskError::Canceled));
+        assert_eq!(desk.revision(), revision);
+        assert_eq!(desk.last_attempt(), attempt);
+        assert_eq!(desk.bookmarks()[0].label(), "keep");
+        assert_eq!(desk.bookmarks()[0].body(), "original note");
+        assert_eq!(desk.bookmarks()[0].update_sequence(), 1);
+        assert_eq!(desk.retained_source_count(), 1);
+        assert_eq!(desk.apply(revision, attempt, DeskCommand::ForgetBookmark(id), || false), Err(DeskError::StaleAttempt));
+    }
+    command(&mut desk, DeskCommand::EditBookmark { bookmark: id, label: "accepted".into(), body: "saved once".into() });
+    let committed = desk.revision();
+    assert_eq!(desk.apply(committed, committed, DeskCommand::EditBookmark {
+        bookmark: id, label: "replayed".into(), body: "duplicate".into(),
+    }, || false), Err(DeskError::StaleAttempt));
+    assert_eq!(desk.bookmarks()[0].body(), "saved once");
+    assert_eq!(desk.bookmarks()[0].update_sequence(), 2);
+}
+
+#[test]
+fn annotation_creation_cancellation_consumes_attempt_without_creating_a_note() {
+    let (mut desk, _) = setup(DeskLimits::default());
+    let pane = open(&mut desk, capture(1, 1, b""), None);
+    for stop in [1, 2] {
+        let attempt = desk.last_attempt() + 1;
+        let mut calls = 0;
+        assert_eq!(desk.apply(1, attempt, DeskCommand::Annotate {
+            pane, label: "empty source note".into(), body: "Pending.".into(),
+        }, || { calls += 1; calls == stop }), Err(DeskError::Canceled));
+        assert!(desk.bookmarks().is_empty());
+        assert_eq!(desk.revision(), 1);
+        assert_eq!(desk.retained_source_count(), 1);
+    }
+    let created = command(&mut desk, DeskCommand::Annotate { pane, label: "accepted".into(), body: "Empty is still evidence.".into() });
+    assert_eq!(created.created_bookmark, Some(1));
+    assert_eq!(desk.bookmarks()[0].body(), "Empty is still evidence.");
+}
+
+#[test]
+fn annotation_and_bookmark_share_count_limit_but_full_capacity_allows_editing() {
+    let (mut desk, _) = setup(DeskLimits { bookmarks: 1, ..DeskLimits::default() });
+    let pane = open(&mut desk, capture(1, 1, b"source"), None);
+    let id = command(&mut desk, DeskCommand::Bookmark { pane, label: "existing".into() }).created_bookmark.unwrap();
+    assert_eq!(desk.apply(2, 3, DeskCommand::Annotate { pane, label: "extra".into(), body: "refused".into() }, || false),
+        Err(DeskError::BookmarkLimit));
+    command(&mut desk, DeskCommand::EditBookmark { bookmark: id, label: "same slot".into(), body: "personal note".into() });
+    assert_eq!(desk.bookmarks().len(), 1);
+    assert_eq!(desk.bookmarks()[0].body(), "personal note");
+    command(&mut desk, DeskCommand::ForgetBookmark(id));
+    let next = command(&mut desk, DeskCommand::Annotate { pane, label: "new slot".into(), body: "new note".into() })
+        .created_bookmark.unwrap();
+    assert!(next > id);
+}
+
+#[test]
+fn personal_text_bounds_count_utf8_bytes_and_preserve_full_boundary_values() {
+    let (mut desk, _) = setup(DeskLimits::default());
+    let pane = open(&mut desk, capture(1, 1, b"source"), None);
+    let label = "é".repeat(MAX_BOOKMARK_LABEL_BYTES / 2);
+    let body = "😀".repeat(MAX_ANNOTATION_BODY_BYTES / 4);
+    let id = command(&mut desk, DeskCommand::Annotate { pane, label: label.clone(), body: body.clone() })
+        .created_bookmark.unwrap();
+    for (label, body, expected) in [(String::new(), body.clone(), DeskError::InvalidLabel),
+        (format!("{label}x"), body.clone(), DeskError::InvalidLabel),
+        (label.clone(), format!("{body}x"), DeskError::InvalidBody)] {
+        assert_eq!(desk.apply(2, desk.last_attempt() + 1, DeskCommand::EditBookmark { bookmark: id, label, body }, || false),
+            Err(expected));
+    }
+    assert_eq!(desk.bookmarks()[0].label(), label);
+    assert_eq!(desk.bookmarks()[0].body(), body);
+    assert_eq!(desk.bookmarks()[0].update_sequence(), 1);
+    assert_eq!(desk.revision(), 2);
+}
+
+#[test]
+fn oversized_caller_string_capacities_are_not_retained_by_annotations() {
+    let (mut desk, _) = setup(DeskLimits::default());
+    let pane = open(&mut desk, capture(1, 1, b"source"), None);
+    let mut label = String::with_capacity(1024 * 1024);
+    let mut body = String::with_capacity(1024 * 1024);
+    label.push_str("small"); body.push_str("short note\0");
+    command(&mut desk, DeskCommand::Annotate { pane, label, body });
+    assert!(desk.state.bookmarks[0].label.capacity() <= MAX_BOOKMARK_LABEL_BYTES);
+    assert!(desk.state.bookmarks[0].body.capacity() <= MAX_ANNOTATION_BODY_BYTES);
+    assert_eq!(desk.bookmarks()[0].body(), "short note\0");
+}
+
+#[test]
+fn missing_foreign_and_exhausted_note_edits_are_transactional() {
+    let (mut desk, _) = setup(DeskLimits::default());
+    let pane = open(&mut desk, capture(1, 1, b"source"), None);
+    let foreign = DeskPaneId { owner: owner(901), value: pane.get() };
+    assert_eq!(desk.apply(1, 2, DeskCommand::Annotate { pane: foreign, label: "foreign".into(), body: "no".into() }, || false),
+        Err(DeskError::OwnerMismatch));
+    assert_eq!(desk.apply(1, 3, DeskCommand::EditBookmark { bookmark: 1, label: "missing".into(), body: "no".into() }, || false),
+        Err(DeskError::MissingBookmark));
+    let id = command(&mut desk, DeskCommand::Annotate { pane, label: "keep".into(), body: "original".into() })
+        .created_bookmark.unwrap();
+    desk.state.bookmarks[0].update_sequence = u64::MAX;
+    let before = desk.revision();
+    assert_eq!(desk.apply(before, desk.last_attempt() + 1, DeskCommand::EditBookmark {
+        bookmark: id, label: "overflow".into(), body: "not published".into(),
+    }, || false), Err(DeskError::IdentityExhausted));
+    assert_eq!(desk.revision(), before);
+    assert_eq!(desk.bookmarks()[0].label(), "keep");
+    assert_eq!(desk.bookmarks()[0].body(), "original");
+    assert_eq!(desk.bookmarks()[0].update_sequence(), u64::MAX);
+    command(&mut desk, DeskCommand::RecallBookmark(id));
+    assert_eq!(desk.source(desk.active().unwrap(), desk.revision()).unwrap().bytes(), b"source");
+}

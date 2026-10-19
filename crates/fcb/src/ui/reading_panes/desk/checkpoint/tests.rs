@@ -151,7 +151,7 @@ fn checksummed_hostile_counts_versions_and_wide_lengths_are_rejected() {
         let mut bytes = saved.bytes().to_vec(); bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes()); resign(&mut bytes);
         assert!(d.restore_checkpoint(1, attempt, &bytes, alloc(3000 + attempt), || false).is_err());
     }
-    let mut bytes = saved.bytes().to_vec(); bytes[10] = 1; resign(&mut bytes);
+    let mut bytes = saved.bytes().to_vec(); bytes[10] = 2; resign(&mut bytes);
     assert_eq!(d.restore_checkpoint(1, 5, &bytes, alloc(3005), || false), Err(CheckpointError::UnsupportedVersion));
     assert_eq!(d.revision(), 1);
 }
@@ -216,4 +216,160 @@ fn stale_requests_and_identity_exhaustion_do_not_publish_a_checkpoint() {
     assert_eq!(target.restore_checkpoint(0, 1, saved.bytes(), alloc(2), || false), Err(CheckpointError::Desk(DeskError::IdentityExhausted)));
     assert_eq!(target.revision(), 0);
     assert_eq!(target.restore_checkpoint(0, 1, saved.bytes(), alloc(2), || false), Err(CheckpointError::Desk(DeskError::StaleAttempt)));
+}
+
+#[test]
+fn annotation_roundtrip_keeps_personal_text_update_sequence_and_closed_capture() {
+    let mut original = desk(700, DeskLimits::default());
+    let pane = open(&mut original, 1, 10, b"old\0\xff\r\nsource");
+    apply(&mut original, DeskCommand::Navigate { pane, offset: 3, selection: Some(range(3, 7)) });
+    let id = apply(&mut original, DeskCommand::Annotate {
+        pane, label: "why\nthis matters\0".into(), body: "My original note.\r\nWith Unicode: 😀\0".into(),
+    }).created_bookmark.unwrap();
+    apply(&mut original, DeskCommand::EditBookmark {
+        bookmark: id, label: "renamed\0".into(), body: "Edited note\r\nwith exact controls\0and Unicode 😀.".into(),
+    });
+    apply(&mut original, DeskCommand::Close(pane));
+    apply(&mut original, DeskCommand::ClearHistory);
+    let checkpoint = save(&original, 2000);
+    assert_eq!(&checkpoint.bytes()[8..12], &[1, 0, 1, 0]);
+    let mut restored = desk(701, DeskLimits::default());
+    restored.restore_checkpoint(0, 1, checkpoint.bytes(), alloc(2), || false).unwrap();
+    assert_eq!(restored.active(), None);
+    assert!(restored.history().is_empty());
+    assert_eq!(restored.retained_source_count(), 1);
+    assert_eq!(restored.bookmarks()[0].label(), "renamed\0");
+    assert_eq!(restored.bookmarks()[0].body(), "Edited note\r\nwith exact controls\0and Unicode 😀.");
+    assert_eq!(restored.bookmarks()[0].update_sequence(), 2);
+    let at = restored.bookmarks()[0].location();
+    assert_eq!(at.file.owner(), owner(701));
+    assert_eq!(at.revision.owner(), owner(701));
+    assert_eq!(at.offset, 3);
+    assert_eq!(at.selection, Some(range(3, 7)));
+    let id = restored.bookmarks()[0].id();
+    apply(&mut restored, DeskCommand::RecallBookmark(id));
+    assert_eq!(restored.selected_bytes(restored.active().unwrap(), restored.revision()).unwrap(), b"\0\xff\r\n");
+    apply(&mut restored, DeskCommand::EditBookmark { bookmark: id, label: "edited after receiving".into(), body: "Still the same evidence.".into() });
+    assert_eq!(restored.bookmarks()[0].update_sequence(), 3);
+}
+
+fn personal_checkpoint(schema: EnvelopeSchema, label: &[u8], body: &[u8], sequence: u64,
+    offset: u64) -> Vec<u8> {
+    let mut out = EnvelopeWriter::new(schema);
+    // Closed source referenced only by personal state. No saved path is opened.
+    for value in [1, 0, 0, 1, NONE, 0] { out.put_u64(value); }
+    out.put_u64(40); out.put_u64(50); out.put_str("deleted/recreated.rs"); out.put_bytes(b"old exact bytes");
+    out.put_bytes(label);
+    if schema.minor == 1 { out.put_bytes(body); out.put_u64(sequence); }
+    out.put_u64(0); out.put_u64(offset); out.put_u8(1); out.put_u64(4); out.put_u64(9); out.put_u64(0);
+    out.finish()
+}
+
+#[test]
+fn legacy_checkpoints_restore_empty_notes_then_upgrade_without_losing_bookmarks() {
+    let old = personal_checkpoint(LEGACY_SCHEMA, b"legacy\0label", b"not in old format", 99, 4);
+    let mut restored = desk(801, DeskLimits::default());
+    restored.restore_checkpoint(0, 1, &old, alloc(2), || false).unwrap();
+    assert_eq!(restored.bookmarks()[0].label(), "legacy\0label");
+    assert_eq!(restored.bookmarks()[0].body(), "");
+    assert_eq!(restored.bookmarks()[0].update_sequence(), 1);
+    let id = restored.bookmarks()[0].id();
+    apply(&mut restored, DeskCommand::EditBookmark { bookmark: id, label: "legacy kept".into(), body: "New personal note.".into() });
+    let upgraded = save(&restored, 2000);
+    // The previous production reader explicitly rejected any minor != 0.
+    // Keeping the new version marker is essential to prevent silent note loss.
+    assert_eq!(&upgraded.bytes()[8..12], &[1, 0, 1, 0]);
+    let mut target = desk(802, DeskLimits::default());
+    target.restore_checkpoint(0, 1, upgraded.bytes(), alloc(2), || false).unwrap();
+    assert_eq!(target.bookmarks()[0].body(), "New personal note.");
+    assert_eq!(target.bookmarks()[0].update_sequence(), 2);
+    let id = target.bookmarks()[0].id();
+    apply(&mut target, DeskCommand::RecallBookmark(id));
+    assert_eq!(target.selected_bytes(target.active().unwrap(), target.revision()).unwrap(), b"exact");
+}
+
+#[test]
+fn same_desk_restore_never_aliases_old_note_id_and_preserves_update_order() {
+    let mut d = desk(701, DeskLimits::default());
+    let pane = open(&mut d, 1, 10, b"evidence");
+    let old = apply(&mut d, DeskCommand::Annotate { pane, label: "first".into(), body: "original".into() })
+        .created_bookmark.unwrap();
+    apply(&mut d, DeskCommand::EditBookmark { bookmark: old, label: "second".into(), body: "revised".into() });
+    let saved = save(&d, 2000);
+    d.restore_checkpoint(d.revision(), d.last_attempt() + 1, saved.bytes(), alloc(2001), || false).unwrap();
+    let current = d.bookmarks()[0].id();
+    assert!(current > old);
+    assert_eq!(d.bookmarks()[0].update_sequence(), 2);
+    assert_eq!(d.apply(d.revision(), d.last_attempt() + 1, DeskCommand::EditBookmark {
+        bookmark: old, label: "wrong identity".into(), body: "not applied".into(),
+    }, || false), Err(DeskError::MissingBookmark));
+    assert_eq!(d.bookmarks()[0].body(), "revised");
+    apply(&mut d, DeskCommand::EditBookmark { bookmark: current, label: "third".into(), body: "current".into() });
+    assert_eq!(d.bookmarks()[0].update_sequence(), 3);
+}
+
+#[test]
+fn checksummed_invalid_notes_and_anchors_cannot_replace_personal_state() {
+    let mut d = desk(701, DeskLimits::default());
+    let pane = open(&mut d, 1, 10, b"kept");
+    apply(&mut d, DeskCommand::Annotate { pane, label: "safe".into(), body: "must survive".into() });
+    let oversized = vec![b'x'; MAX_ANNOTATION_BODY_BYTES + 1];
+    let cases = [
+        (personal_checkpoint(SCHEMA, b"", b"body", 1, 0), CheckpointError::InvalidDocument),
+        (personal_checkpoint(SCHEMA, b"label", b"\xff", 1, 0), CheckpointError::InvalidDocument),
+        (personal_checkpoint(SCHEMA, b"label", b"body", 0, 0), CheckpointError::InvalidDocument),
+        (personal_checkpoint(SCHEMA, b"label", &oversized, 1, 0), CheckpointError::Limit),
+        (personal_checkpoint(SCHEMA, b"label", b"body", 1, 99), CheckpointError::Desk(DeskError::InvalidLocation)),
+    ];
+    for (bytes, expected) in cases {
+        assert_eq!(d.restore_checkpoint(2, d.last_attempt() + 1, &bytes, alloc(2000 + d.last_attempt()), || false), Err(expected));
+        assert_eq!(d.revision(), 2);
+        assert_eq!(d.active(), Some(pane));
+        assert_eq!(d.bookmarks()[0].label(), "safe");
+        assert_eq!(d.bookmarks()[0].body(), "must survive");
+        assert_eq!(d.retained_source_count(), 1);
+    }
+}
+
+#[test]
+fn full_note_limit_roundtrip_uses_all_source_and_personal_text_without_truncation() {
+    let mut d = desk(700, DeskLimits { bookmarks: MAX_DESK_BOOKMARKS, ..DeskLimits::default() });
+    let pane = open(&mut d, 1, 1, b"source");
+    let body = "😀".repeat(MAX_ANNOTATION_BODY_BYTES / 4);
+    for _ in 0..MAX_DESK_BOOKMARKS {
+        apply(&mut d, DeskCommand::Annotate { pane, label: "é".repeat(MAX_BOOKMARK_LABEL_BYTES / 2), body: body.clone() });
+    }
+    let saved = save(&d, 2000);
+    let mut restored = desk(701, DeskLimits { bookmarks: MAX_DESK_BOOKMARKS, ..DeskLimits::default() });
+    restored.restore_checkpoint(0, 1, saved.bytes(), alloc(2), || false).unwrap();
+    assert_eq!(restored.bookmarks().len(), MAX_DESK_BOOKMARKS);
+    assert!(restored.bookmarks().iter().all(|note| note.label().len() == MAX_BOOKMARK_LABEL_BYTES
+        && note.body() == body && note.update_sequence() == 1));
+    assert_eq!(restored.retained_source_bytes(), 6);
+    let mut limited = desk(702, DeskLimits::default());
+    assert_eq!(limited.restore_checkpoint(0, 1, saved.bytes(), alloc(2), || false), Err(CheckpointError::Limit));
+    assert!(limited.bookmarks().is_empty());
+}
+
+#[test]
+fn cancellation_during_note_restore_preserves_all_previous_notes() {
+    let input = personal_checkpoint(SCHEMA, b"new label", b"new body", 8, 4);
+    let mut probe = desk(801, DeskLimits::default());
+    let mut count = 0;
+    probe.restore_checkpoint(0, 1, &input, alloc(2), || { count += 1; false }).unwrap();
+    let mut target = desk(802, DeskLimits::default());
+    let pane = open(&mut target, 1, 1, b"existing");
+    apply(&mut target, DeskCommand::Annotate { pane, label: "old label".into(), body: "old body".into() });
+    let old_id = target.bookmarks()[0].id();
+    for stop in [count - 1, count] {
+        let mut calls = 0;
+        let attempt = target.last_attempt() + 1;
+        assert_eq!(target.restore_checkpoint(2, attempt, &input, alloc(2000 + attempt), || { calls += 1; calls == stop }),
+            Err(CheckpointError::Desk(DeskError::Canceled)));
+        assert_eq!(target.revision(), 2);
+        assert_eq!(target.bookmarks()[0].id(), old_id);
+        assert_eq!(target.bookmarks()[0].body(), "old body");
+        assert_eq!(target.bookmarks()[0].update_sequence(), 1);
+        assert_eq!(target.source(pane, 2).unwrap().bytes(), b"existing");
+    }
 }

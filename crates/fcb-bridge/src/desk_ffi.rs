@@ -44,6 +44,43 @@ pub unsafe extern "C" fn fcb_desk_apply(handle: u64, expected: u64, attempt: u64
         desks.execute(handle, Command::Apply { expected, attempt, kind, subject, start, end, label }, || false)
     }))
 }
+/// # Safety
+/// label is null or readable NUL-terminated UTF-8 stable until return. For an
+/// admitted nonzero body_bytes, body addresses that many initialized readable
+/// bytes in one allocation, stable until return. A zero-length body may be null.
+/// Body text is exact UTF-8: NUL/newline are data, never terminators. No foreign
+/// borrow survives the call. Oversized lengths are rejected before dereference.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_desk_annotate(handle: u64, expected: u64, attempt: u64,
+    pane: u64, label: *const c_char, body: *const u8, body_bytes: u64) -> *mut c_char {
+    reply(|| answer(handle, |desks| {
+        let body = unsafe { note_body(body, body_bytes) }?;
+        let label = unsafe { cstr(label) }.ok_or(AccessError::InvalidArgument)?;
+        desks.execute(handle, Command::Annotate { expected, attempt, pane, label, body }, || false)
+    }))
+}
+/// Edit only personal text; the bookmark's capture and range remain unchanged.
+/// # Safety
+/// The label/body pointer contracts are identical to fcb_desk_annotate. Free
+/// every non-null response with fcb_free_string, including rejection responses.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_desk_edit_bookmark(handle: u64, expected: u64, attempt: u64,
+    bookmark: u64, label: *const c_char, body: *const u8, body_bytes: u64) -> *mut c_char {
+    reply(|| answer(handle, |desks| {
+        let body = unsafe { note_body(body, body_bytes) }?;
+        let label = unsafe { cstr(label) }.ok_or(AccessError::InvalidArgument)?;
+        desks.execute(handle, Command::EditBookmark { expected, attempt, bookmark, label, body }, || false)
+    }))
+}
+unsafe fn note_body<'a>(body: *const u8, body_bytes: u64) -> Result<&'a str, AccessError> {
+    let length = number(body_bytes)?;
+    if length > fcb::ui::reading_panes::desk::MAX_ANNOTATION_BODY_BYTES
+        || (length != 0 && body.is_null()) { return Err(AccessError::InvalidArgument); }
+    let bytes = if length == 0 { &[] } else {
+        unsafe { std::slice::from_raw_parts(body, length) }
+    };
+    std::str::from_utf8(bytes).map_err(|_| AccessError::InvalidArgument)
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_desk_window(handle: u64, expected: u64, pane: u64, offset: u64, bytes: u64) -> *mut c_char {
     reply(|| answer(handle, |desks| desks.execute(handle,
@@ -106,3 +143,7 @@ mod tests;
 #[cfg(all(test, unix))]
 #[path = "desk_reader_ffi_tests.rs"]
 mod reader_tests;
+
+#[cfg(all(test, unix))]
+#[path = "desk_annotations_ffi_tests.rs"]
+mod annotation_tests;

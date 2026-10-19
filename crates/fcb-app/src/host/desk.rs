@@ -178,6 +178,8 @@ impl DeskSession {
             if i > 0 { out.literal(",")?; }
             out.literal("{\"bookmark\":")?; out.integer(mark.id())?;
             out.literal(",\"label\":")?; out.quoted(mark.label())?;
+            out.literal(",\"body\":")?; out.quoted(mark.body())?;
+            out.literal(",\"update_sequence\":")?; out.integer(mark.update_sequence())?;
             location_fields(&mut out, mark.location())?; out.literal("}")?;
         }
         out.literal("]}\n")?;

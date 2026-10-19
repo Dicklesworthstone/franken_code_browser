@@ -8,7 +8,8 @@ use std::{mem::size_of, path::Path, sync::{Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}};
 use fcb::{ByteOffset, ByteRange};
 use fcb::search::{ReadingTarget, ReadingWindowOptions};
-use fcb_app::host::{HostResponse, desk::{DeskCommand, DeskLimits, DeskSession, DeskSessionError,
+use fcb::ui::reading_panes::desk::{MAX_ANNOTATION_BODY_BYTES, MAX_BOOKMARK_LABEL_BYTES};
+use fcb_app::host::{HostResponse, desk::{DeskCommand, DeskError, DeskLimits, DeskSession, DeskSessionError,
     imports::ImportedSourceId, persistence::CheckpointIoError, reader::DeskReaderError}};
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
 use super::reader_sessions::{self, ReaderSessions};
@@ -68,6 +69,8 @@ pub(super) enum Command<'a> {
     Open { expected: u64, attempt: u64, path: &'a Path },
     Apply { expected: u64, attempt: u64, kind: u64, subject: u64,
         start: u64, end: u64, label: &'a str },
+    Annotate { expected: u64, attempt: u64, pane: u64, label: &'a str, body: &'a str },
+    EditBookmark { expected: u64, attempt: u64, bookmark: u64, label: &'a str, body: &'a str },
     Window { expected: u64, pane: u64, offset: u64, bytes: usize },
     Restore { expected: u64, attempt: u64, path: &'a Path },
 }
@@ -151,6 +154,19 @@ impl DeskSessions {
                 Command::State => return Ok(desk.state(&mut *stop)?),
                 Command::Open { expected, attempt, path } => { desk.open_file(expected, attempt, path, &mut *stop)?; }
                 Command::Restore { expected, attempt, path } => { desk.restore_checkpoint_file(expected, attempt, path, &mut *stop)?; }
+                Command::Annotate { expected, attempt, pane, label, body } => {
+                    validate_note(label, body)?;
+                    let pane = desk.model().pane_id(pane).map_err(DeskSessionError::from)?;
+                    desk.apply(expected, attempt, DeskCommand::Annotate {
+                        pane, label: label.to_owned(), body: body.to_owned(),
+                    }, &mut *stop)?;
+                }
+                Command::EditBookmark { expected, attempt, bookmark, label, body } => {
+                    validate_note(label, body)?;
+                    desk.apply(expected, attempt, DeskCommand::EditBookmark {
+                        bookmark, label: label.to_owned(), body: body.to_owned(),
+                    }, &mut *stop)?;
+                }
                 Command::Window { expected, pane, offset, bytes } => {
                     if !(4..=64 * 1024).contains(&bytes) { return Err(AccessError::InvalidArgument); }
                     let pane = desk.model().pane_id(pane).map_err(DeskSessionError::from)?;
@@ -246,6 +262,17 @@ impl DeskSessions {
 fn range(start: u64, end: u64) -> Result<ByteRange, AccessError> {
     ByteRange::new(ByteOffset::new(start), ByteOffset::new(end)).map_err(|_| AccessError::InvalidArgument)
 }
+fn validate_note(label: &str, body: &str) -> Result<(), AccessError> {
+    // Bound caller-to-command allocation before copying. The shared desk owns
+    // exact text, stable IDs, accepted attempts and all subsequent source pins.
+    if label.is_empty() || label.len() > MAX_BOOKMARK_LABEL_BYTES {
+        return Err(DeskSessionError::from(DeskError::InvalidLabel).into());
+    }
+    if body.len() > MAX_ANNOTATION_BODY_BYTES {
+        return Err(DeskSessionError::from(DeskError::InvalidBody).into());
+    }
+    Ok(())
+}
 fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, AccessError> {
     mutex.try_lock().map_err(|e| match e { TryLockError::WouldBlock => AccessError::Busy,
         TryLockError::Poisoned(_) => AccessError::Poisoned })
@@ -258,3 +285,7 @@ mod tests;
 #[cfg(all(test, unix))]
 #[path = "desk_reader_sessions_tests.rs"]
 mod reader_tests;
+
+#[cfg(all(test, unix))]
+#[path = "desk_annotations_sessions_tests.rs"]
+mod annotation_tests;

@@ -31,6 +31,20 @@ char *fcb_desk_open(uint64_t handle, uint64_t expected, uint64_t attempt, const 
  * null is empty and accepted for commands that do not use a label. */
 char *fcb_desk_apply(uint64_t handle, uint64_t expected, uint64_t attempt,
     uint64_t kind, uint64_t subject, uint64_t start, uint64_t end, const char *label);
+/* Personal annotations share the bookmark IDs/retention/recall/forget commands.
+ * Create uses the pane's exact current capture/range. Edit preserves that anchor
+ * and ID, updating label/body and update_sequence only. Empty body is allowed.
+ * Labels are nonempty UTF-8 C strings <=256 bytes. Bodies are length-prefixed
+ * UTF-8 <=16384 bytes, including embedded NUL/newline; null is valid only when
+ * body_bytes==0. Borrowed inputs remain readable through return and are copied.
+ * Source files are never changed. Full state replies include body and canonical
+ * decimal update_sequence on every bookmark. Lost replies require state
+ * reconciliation, never replay of the same attempt. Explicit checkpoints retain
+ * note text; old checkpoints restore empty bodies without reopening live paths. */
+char *fcb_desk_annotate(uint64_t handle, uint64_t expected, uint64_t attempt,
+    uint64_t pane, const char *label, const uint8_t *body, uint64_t body_bytes);
+char *fcb_desk_edit_bookmark(uint64_t handle, uint64_t expected, uint64_t attempt,
+    uint64_t bookmark, const char *label, const uint8_t *body, uint64_t body_bytes);
 /* SourceReader logical text with original byte ranges. 4..65536 requested
  * bytes, <=1024 rows. Page text is not copied back into source storage. */
 char *fcb_desk_window(uint64_t handle, uint64_t expected, uint64_t pane,
@@ -54,7 +68,7 @@ char *fcb_desk_import_reader(uint64_t handle, uint64_t expected, uint64_t attemp
  * Saved labels never authorize fcb_reader_open or a native Refresh from disk. */
 char *fcb_desk_open_reader(uint64_t handle, uint64_t expected, uint64_t pane,
     uint64_t destination);
-/* Checkpoints contain ALL retained source and personal labels, unencrypted.
+/* Checkpoints contain ALL retained source, personal labels and notes, unencrypted.
  * User selects an explicit new destination and disclosure cap. Existing files
  * are not overwritten. Save returns effect/bytes_written even on failure: a
  * late cancel/close is never a no-effects claim. Preserve/inspect partial files.

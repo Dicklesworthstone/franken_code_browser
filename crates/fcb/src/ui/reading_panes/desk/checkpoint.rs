@@ -4,7 +4,7 @@
 //!
 //! Uses the production store envelope/checksum, not a second serializer or hash
 //! engine. Includes EACH retained capture once, including sources referenced only
-//! by closed-pane history/bookmarks. Labels are not filesystem authority. This
+//! by closed-pane history/bookmarks/annotations. Personal text is not filesystem authority. This
 //! module never opens files. Hosts must obtain consent before exporting sources.
 //! Encoding/decoding are bounded worker operations; the existing envelope's
 //! checksum pass is synchronous, with cancellation checked before and after it.
@@ -15,6 +15,12 @@ use crate::store::envelope::{EnvelopeError, EnvelopeLimits, EnvelopeReader,
 
 pub const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 const SCHEMA: EnvelopeSchema = EnvelopeSchema {
+    magic: *b"FCBK", schema_id: 0x4b53_4544, major: 1, minor: 1,
+};
+// The 1.0 record has only a label/location. Writers always emit 1.1, including
+// an empty body for ordinary bookmarks. A 1.0 reader explicitly rejects a
+// nonzero minor version rather than opening then resaving a desk without notes.
+const LEGACY_SCHEMA: EnvelopeSchema = EnvelopeSchema {
     magic: *b"FCBK", schema_id: 0x4b53_4544, major: 1, minor: 0,
 };
 const NONE: u64 = u64::MAX;
@@ -50,7 +56,7 @@ impl From<EnvelopeError> for CheckpointError {
 
 /// Owns its entire encoding reservation, including writer/finished-buffer overlap.
 /// No source is silently omitted to meet a byte budget. Contains source payloads
-/// and personal labels; an integrity digest is not encryption or authorization.
+/// and personal labels/notes; an integrity digest is not encryption or authorization.
 pub struct DeskCheckpoint { bytes: Vec<u8>, source_bytes: u64, _lease: ResourceLease }
 impl DeskCheckpoint {
     pub fn bytes(&self) -> &[u8] { &self.bytes }
@@ -73,12 +79,12 @@ impl ReadingDesk {
         let state = &self.state;
         let source_bytes = self.retained_source_bytes();
         let labels: usize = state.sources.iter().map(|s| s.capture.logical_path().len()).sum();
-        let notes: usize = state.bookmarks.iter().map(|b| b.label.len()).sum();
+        let notes: usize = state.bookmarks.iter().map(|b| b.label.len() + b.body.len()).sum();
         // A checked upper bound on the exact positional encoding, then a
         // conservative allowance for the existing writer's geometric growth.
         let bound = usize::try_from(source_bytes).ok().and_then(|n| n.checked_add(labels))
             .and_then(|n| n.checked_add(notes + FRAME_LEN + 128 + state.sources.len() * 64
-                + state.panes.len() * 128 + state.history.len() * 64 + state.bookmarks.len() * 64))
+                + state.panes.len() * 128 + state.history.len() * 64 + state.bookmarks.len() * 96))
             .ok_or(CheckpointError::Limit)?;
         if bound > MAX_CHECKPOINT_BYTES { return Err(CheckpointError::Limit); }
         let lease = self.budget.try_reserve_managed(self.owner, allocation,
@@ -104,8 +110,12 @@ impl ReadingDesk {
                 pane.scroll_offset.0, pane.scroll_offset.1] { out.put_f32(value); }
             put_location(&mut out, state, location(state, self.owner, self.id(pane.id))?)?;
         }
-        for at in &state.history { put_location(&mut out, state, *at)?; }
-        for mark in &state.bookmarks { out.put_str(&mark.label); put_location(&mut out, state, mark.location)?; }
+        for at in &state.history { check(&mut canceled)?; put_location(&mut out, state, *at)?; }
+        for mark in &state.bookmarks {
+            check(&mut canceled)?;
+            out.put_str(&mark.label); out.put_str(&mark.body); out.put_u64(mark.update_sequence);
+            put_location(&mut out, state, mark.location)?;
+        }
         check(&mut canceled)?;
         let bytes = out.finish();
         if bytes.len() > bound || bytes.capacity() > 4 * bound { return Err(CheckpointError::Limit); }
@@ -127,10 +137,14 @@ impl ReadingDesk {
         check(&mut canceled)?;
         let limits = EnvelopeLimits { max_document_bytes: MAX_CHECKPOINT_BYTES,
             max_payload_bytes: MAX_CHECKPOINT_BYTES - FRAME_LEN, max_field_bytes: MAX_CHECKPOINT_BYTES };
-        let mut input = EnvelopeReader::open(bytes, SCHEMA, limits, UnknownPolicy::Strict)?;
-        // This version accepts no extension fields or header flags. Check wide
+        let mut input = EnvelopeReader::open(bytes, LEGACY_SCHEMA, limits, UnknownPolicy::Strict)?;
+        // Accept only the two explicitly defined layouts, with no extension
+        // fields or header flags. Check wide
         // lengths BEFORE the underlying envelope's usize conversions as well.
-        if input.schema().minor != 0 || bytes[12..16] != [0, 0, 0, 0] {
+        let has_annotations = match input.schema().minor {
+            0 => false, 1 => true, _ => return Err(CheckpointError::UnsupportedVersion),
+        };
+        if bytes[12..16] != [0, 0, 0, 0] {
             return Err(CheckpointError::UnsupportedVersion);
         }
         let payload = u64::from_le_bytes(bytes[16..24].try_into().map_err(|_| CheckpointError::InvalidDocument)?);
@@ -215,17 +229,27 @@ impl ReadingDesk {
             Some(pane_map[..np].iter().find(|p| p.0 == active).ok_or(CheckpointError::InvalidDocument)?.1)
         };
         for _ in 0..nh {
+            check(&mut canceled)?;
             let (mut at, hint) = get_location(&mut input, &next, self.owner)?;
             at.preferred_pane = self.id(remap_hint(&pane_map[..np], hint));
             next.history.push(at);
         }
         for _ in 0..nb {
-            let label = get_label(&mut input, MAX_BOOKMARK_LABEL_BYTES)?.to_owned();
+            check(&mut canceled)?;
+            let label = get_label(&mut input, MAX_BOOKMARK_LABEL_BYTES)?;
+            let body = if has_annotations {
+                std::str::from_utf8(get_field(&mut input, MAX_ANNOTATION_BODY_BYTES as u64)?)
+                    .map_err(|_| CheckpointError::InvalidDocument)?
+            } else { "" };
+            let update_sequence = if has_annotations { input.get_u64()? } else { 1 };
+            if update_sequence == 0 { return Err(CheckpointError::InvalidDocument); }
+            let label = personal_text(label, MAX_BOOKMARK_LABEL_BYTES)?;
+            let body = personal_text(body, MAX_ANNOTATION_BODY_BYTES)?;
             let (mut at, hint) = get_location(&mut input, &next, self.owner)?;
             at.preferred_pane = self.id(remap_hint(&pane_map[..np], hint));
             let id = next.next_bookmark;
             next.next_bookmark = id.checked_add(1).filter(|_| id != 0).ok_or(DeskError::IdentityExhausted)?;
-            next.bookmarks.push(DeskBookmark { id, label, location: at });
+            next.bookmarks.push(DeskBookmark { id, label, body, update_sequence, location: at });
         }
         if input.remaining() != 0 { return Err(CheckpointError::InvalidDocument); }
         // Reject hidden/unreferenced source payloads, rather than silently

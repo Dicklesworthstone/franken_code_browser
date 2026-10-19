@@ -23,6 +23,7 @@ use reading::ReadingCommands;
 use std::{ffi::OsString, io::{self, BufReader, Read, Write}, path::{Path, PathBuf}};
 use fcb::{ByteLength, ByteOffset, ByteRange};
 use fcb::search::{LineNumber, ReadingTarget, ReadingWindowOptions, ResourceBudget};
+use fcb::ui::reading_panes::desk::{MAX_ANNOTATION_BODY_BYTES, MAX_BOOKMARK_LABEL_BYTES};
 use crate::{EXIT_OK, EXIT_ERROR, EXIT_PARTIAL, EXIT_CANCELED, owner, allocation};
 use crate::host::{HostResponse, desk::{DeskSession, DeskSessionError, DeskLimits, DeskCommand, DeskError}};
 use crate::host::desk::persistence::{CheckpointIoError, CheckpointSaveEffect};
@@ -32,7 +33,7 @@ const MAX_FRAME_BYTES: usize = 64 * 1024;
 const MAX_REQUESTS: u64 = 65_536;
 const MAX_FRAME_CALLS: usize = MAX_FRAME_BYTES * 2;
 const HELP: &str = "fcb desk --stdio\n\
-Retain up to 8 reading panes with exact captures, history and bookmarks.\n\
+Retain up to 8 reading panes with exact captures, history, bookmarks and notes.\n\
 Input: EXPECTED_REV<TAB>COMMAND<TAB>ARG...<LF>. Counters are unsigned decimal.\n\
 Start at revision 0; use accepted_revision from each response for the next request.\n\
 Mutations use the response request number as their new revision; reads/save do not.\n\
@@ -48,6 +49,8 @@ Commands (arguments separated by literal TABs, not spaces):\n\
   find-text-hex PANE QUERY_GEN LIMIT SCAN_BYTES UTF8_TEXT_HEX\n\
   hit PANE QUERY_GEN ZERO_BASED_HIT | clear-query QUERY_GEN\n\
   bookmark PANE LABEL | recall BOOKMARK | forget BOOKMARK\n\
+  annotate PANE LABEL BODY | annotate-hex PANE LABEL_UTF8_HEX BODY_UTF8_HEX\n\
+  edit-bookmark BOOKMARK LABEL BODY | edit-bookmark-hex BOOKMARK LABEL_UTF8_HEX BODY_UTF8_HEX\n\
   repo-open ROOT | repo-open-hex ROOT_PATH_HEX\n\
   repo-info TOKEN | repo-close TOKEN | repo-clear TOKEN QUERY_GEN\n\
   repo-find TOKEN QUERY_GEN LIMIT SCAN_BYTES TEXT\n\
@@ -59,7 +62,10 @@ Copy returns original bytes as hex; it does not write the clipboard.\n\
 open reads one regular file (max 4 MiB), never a directory or implicit stdin.\n\
 Later operations use retained bytes even after a live file changes.\n\
 UTF-8/BOM UTF-16 windows use the shared reader. Search is exact literal text.\n\
-Save includes ALL retained sources and personal labels, unencrypted, up to the\n\
+Notes use the same exact anchors as bookmarks: 256-byte labels and 16 KiB UTF-8\n\
+bodies. Empty bodies are allowed; hex accepts multiline text, tabs and NUL.\n\
+Editing changes personal text only, preserving the capture and original range.\n\
+Save includes ALL retained sources, labels and notes, unencrypted, up to the\n\
 explicit source-byte disclosure cap. Existing files are NEVER overwritten.\n\
 Restore replaces the desk only after validation, without reopening source paths.\n\
 Restored pane/bookmark/source IDs are fresh; read them from the returned state.\n\
@@ -273,6 +279,19 @@ fn raw_path(text: &str) -> Result<PathBuf, Failure> {
         Ok(PathBuf::from(OsString::from_vec(hex(text, 16_384)?))) }
     #[cfg(not(unix))] { let _ = text; Err(Failure::Protocol("DESK_NATIVE_PATH_UNSUPPORTED")) }
 }
+/// The stdio frame reservation covers the bounded decoded strings as well as
+/// the hex input. Empty fields are deliberate empty text, including when hex
+/// is selected; malformed UTF-8 is refused rather than replaced in a user note.
+fn personal_text(text: &str, max: usize, encoded: bool, limit: DeskError) -> Result<String, Failure> {
+    if encoded {
+        if text.is_empty() { return Ok(String::new()); }
+        if text.len() / 2 > max { return Err(limit.into()); }
+        String::from_utf8(hex(text, max)?).map_err(|_| Failure::Protocol("DESK_INVALID_TEXT"))
+    } else {
+        if text.len() > max { return Err(limit.into()); }
+        Ok(text.to_owned())
+    }
+}
 fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
     canceled: &mut impl FnMut() -> bool, effect: &mut CheckpointSaveEffect,
     repository: &mut RepositoryCommands, documents: &mut DocumentCommands,
@@ -352,6 +371,16 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
         ("arrange", [p, x, y, width, height]) => Some(DeskCommand::Arrange { pane: pane(session, p)?,
             position: (coordinate(x)?, coordinate(y)?), size: (coordinate(width)?, coordinate(height)?) }),
         ("bookmark", [p, label]) => Some(DeskCommand::Bookmark { pane: pane(session, p)?, label: (*label).to_owned() }),
+        ("annotate" | "annotate-hex", [p, label, body]) => Some(DeskCommand::Annotate {
+            pane: pane(session, p)?,
+            label: personal_text(label, MAX_BOOKMARK_LABEL_BYTES, command == "annotate-hex", DeskError::InvalidLabel)?,
+            body: personal_text(body, MAX_ANNOTATION_BODY_BYTES, command == "annotate-hex", DeskError::InvalidBody)?,
+        }),
+        ("edit-bookmark" | "edit-bookmark-hex", [id, label, body]) => Some(DeskCommand::EditBookmark {
+            bookmark: number(id)?,
+            label: personal_text(label, MAX_BOOKMARK_LABEL_BYTES, command == "edit-bookmark-hex", DeskError::InvalidLabel)?,
+            body: personal_text(body, MAX_ANNOTATION_BODY_BYTES, command == "edit-bookmark-hex", DeskError::InvalidBody)?,
+        }),
         ("recall", [id]) => Some(DeskCommand::RecallBookmark(number(id)?)),
         ("forget", [id]) => Some(DeskCommand::ForgetBookmark(number(id)?)),
         ("back", []) => Some(DeskCommand::Back), ("forward", []) => Some(DeskCommand::Forward),

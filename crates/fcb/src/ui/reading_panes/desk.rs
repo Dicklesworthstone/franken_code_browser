@@ -3,7 +3,8 @@
 //! Source-backed multi-reader navigation (FCB-050 / FCB-041).
 //!
 //! A pane descriptor is not source retention. This worker-side controller owns
-//! the exact captures referenced by panes, back/forward entries and bookmarks.
+//! the exact captures referenced by panes, back/forward entries and personal
+//! bookmarks/annotations. A note never grants access to its source's old path.
 //! Duplicate panes share source bytes but have independent reading positions.
 //! No path is reopened, and no capture is rebound to new bytes. All operations,
 //! including retirement/drop, belong on the host worker, not an input callback.
@@ -21,6 +22,7 @@ pub const MAX_DESK_SOURCES: usize = 64;
 pub const MAX_DESK_HISTORY: usize = 128;
 pub const MAX_DESK_BOOKMARKS: usize = 64;
 pub const MAX_BOOKMARK_LABEL_BYTES: usize = 256;
+pub const MAX_ANNOTATION_BODY_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeskLimits {
@@ -42,7 +44,7 @@ impl Default for DeskLimits {
 pub enum DeskError {
     InvalidLimits, OwnerMismatch, StaleRevision, StaleAttempt, InvalidLocation,
     MissingPane, MissingSource, MissingBookmark, NoActivePane, EmptyHistory,
-    PaneLimit, SourceLimit, RetainedByteLimit, BookmarkLimit, InvalidLabel,
+    PaneLimit, SourceLimit, RetainedByteLimit, BookmarkLimit, InvalidLabel, InvalidBody,
     IdentityConflict, IdentityExhausted, ResourceDenied, Canceled,
 }
 impl DeskError {
@@ -55,7 +57,8 @@ impl DeskError {
             Self::NoActivePane => "DESK_NO_ACTIVE_PANE", Self::EmptyHistory => "DESK_EMPTY_HISTORY",
             Self::PaneLimit => "DESK_PANE_LIMIT", Self::SourceLimit => "DESK_SOURCE_LIMIT",
             Self::RetainedByteLimit => "DESK_RETAINED_BYTE_LIMIT", Self::BookmarkLimit => "DESK_BOOKMARK_LIMIT",
-            Self::InvalidLabel => "DESK_INVALID_LABEL", Self::IdentityConflict => "DESK_IDENTITY_CONFLICT",
+            Self::InvalidLabel => "DESK_INVALID_LABEL", Self::InvalidBody => "DESK_INVALID_BODY",
+            Self::IdentityConflict => "DESK_IDENTITY_CONFLICT",
             Self::IdentityExhausted => "DESK_IDENTITY_EXHAUSTED", Self::ResourceDenied => "DESK_RESOURCE_DENIED",
             Self::Canceled => "DESK_CANCELED",
         }
@@ -84,10 +87,20 @@ pub struct DeskLocation {
     pub preferred_pane: DeskPaneId,
 }
 #[derive(Clone, Debug)]
-pub struct DeskBookmark { id: u64, label: String, location: DeskLocation }
+pub struct DeskBookmark {
+    id: u64,
+    label: String,
+    body: String,
+    /// Personal update order, independent of the receiving desk's attempt IDs.
+    update_sequence: u64,
+    location: DeskLocation,
+}
 impl DeskBookmark {
     pub const fn id(&self) -> u64 { self.id }
     pub fn label(&self) -> &str { &self.label }
+    /// Exact user-authored UTF-8. An ordinary bookmark has an empty body.
+    pub fn body(&self) -> &str { &self.body }
+    pub const fn update_sequence(&self) -> u64 { self.update_sequence }
     pub const fn location(&self) -> DeskLocation { self.location }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,7 +111,8 @@ pub struct DeskChange {
 }
 
 /// Semantic commands. Scrolling updates the current history entry rather than
-/// appending every motion tick. Bookmarks are session-owned, not disk persistence.
+/// appending every motion tick. Bookmarks and annotations retain exact captures;
+/// persistence requires an explicit checkpoint export by the host.
 pub enum DeskCommand {
     Focus(DeskPaneId),
     Navigate { pane: DeskPaneId, offset: u64, selection: Option<ByteRange> },
@@ -110,6 +124,11 @@ pub enum DeskCommand {
     Back,
     Forward,
     Bookmark { pane: DeskPaneId, label: String },
+    /// Retain the pane's exact source location with a personal note. This shares
+    /// the bookmark namespace, count limit, recall and explicit deletion route.
+    Annotate { pane: DeskPaneId, label: String, body: String },
+    /// Edit personal text without changing its capture or selected byte range.
+    EditBookmark { bookmark: u64, label: String, body: String },
     RecallBookmark(u64),
     ForgetBookmark(u64),
     ClearHistory,
@@ -117,7 +136,6 @@ pub enum DeskCommand {
 }
 
 struct RetainedSource { capture: SourceCapture, _lease: ResourceLease }
-#[derive(Clone)]
 struct State {
     revision: u64,
     panes: ReadingPaneManager,
@@ -168,7 +186,8 @@ impl ReadingDesk {
         let charge = limits.panes * (size_of::<ReadingPane>() + MAX_READING_PATH_BYTES + 128)
             + limits.sources * (size_of::<Arc<RetainedSource>>() + 128)
             + limits.history * (size_of::<DeskLocation>() + 32)
-            + limits.bookmarks * (size_of::<DeskBookmark>() + MAX_BOOKMARK_LABEL_BYTES + 64);
+            + limits.bookmarks * (size_of::<DeskBookmark>() + MAX_BOOKMARK_LABEL_BYTES
+                + MAX_ANNOTATION_BODY_BYTES + 64);
         let lease = budget.try_reserve_managed(owner, allocation,
             ByteLength::new((charge * 3 + size_of::<Self>() + 4096) as u64))
             .map_err(|_| DeskError::ResourceDenied)?;
@@ -335,13 +354,21 @@ impl ReadingDesk {
                 next.cursor = Some(target);
             }
             DeskCommand::Bookmark { pane, label } => {
-                let at = location(&next, self.owner, pane)?;
-                if label.is_empty() || label.len() > MAX_BOOKMARK_LABEL_BYTES { return Err(DeskError::InvalidLabel); }
-                if next.bookmarks.len() == self.limits.bookmarks { return Err(DeskError::BookmarkLimit); }
-                let id = next.next_bookmark;
-                next.next_bookmark = id.checked_add(1).ok_or(DeskError::IdentityExhausted)?;
-                next.bookmarks.push(DeskBookmark { id, label, location: at });
-                created = Some(id);
+                created = Some(add_bookmark(&mut next, self.owner, self.limits, pane, &label, "")?);
+            }
+            DeskCommand::Annotate { pane, label, body } => {
+                created = Some(add_bookmark(&mut next, self.owner, self.limits, pane, &label, &body)?);
+            }
+            DeskCommand::EditBookmark { bookmark, label, body } => {
+                let mark = next.bookmarks.iter_mut().find(|mark| mark.id == bookmark)
+                    .ok_or(DeskError::MissingBookmark)?;
+                validate_personal_text(&label, &body)?;
+                let sequence = mark.update_sequence.checked_add(1).ok_or(DeskError::IdentityExhausted)?;
+                // The command's caller-owned String can have an arbitrarily
+                // large spare capacity. Retain only separately admitted copies.
+                mark.label = personal_text(&label, MAX_BOOKMARK_LABEL_BYTES)?;
+                mark.body = personal_text(&body, MAX_ANNOTATION_BODY_BYTES)?;
+                mark.update_sequence = sequence;
             }
             DeskCommand::RecallBookmark(id) => {
                 let at = next.bookmarks.iter().find(|b| b.id == id).ok_or(DeskError::MissingBookmark)?.location;
@@ -381,8 +408,23 @@ impl ReadingDesk {
         if attempt == 0 || attempt <= self.last_attempt { return Err(DeskError::StaleAttempt); }
         self.last_attempt = attempt;
         check(canceled)?;
-        let mut next = self.state.clone();
+        // Source Arcs and bounded pane/history descriptors can be staged cheaply.
+        // Note bodies can occupy a MiB, so clone their text through fallible
+        // reservations within the already charged old/new generation overlap.
+        let mut next = State {
+            revision: self.state.revision, panes: self.state.panes.clone(),
+            offsets: self.state.offsets.clone(), sources: self.state.sources.clone(),
+            history: self.state.history.clone(), cursor: self.state.cursor,
+            bookmarks: Vec::new(), next_bookmark: self.state.next_bookmark,
+        };
         reserve_state(&mut next, self.limits)?;
+        for mark in &self.state.bookmarks {
+            next.bookmarks.push(DeskBookmark {
+                id: mark.id, label: personal_text(&mark.label, MAX_BOOKMARK_LABEL_BYTES)?,
+                body: personal_text(&mark.body, MAX_ANNOTATION_BODY_BYTES)?,
+                update_sequence: mark.update_sequence, location: mark.location,
+            });
+        }
         Ok(next)
     }
     fn publish(&mut self, mut next: State, attempt: u64, created_bookmark: Option<u64>,
@@ -414,7 +456,37 @@ fn reserve_state(state: &mut State, limits: DeskLimits) -> Result<(), DeskError>
     reserve(&mut state.offsets, limits.panes)?;
     reserve(&mut state.sources, limits.sources)?;
     reserve(&mut state.history, limits.history)?;
-    reserve(&mut state.bookmarks, limits.bookmarks)
+    reserve(&mut state.bookmarks, limits.bookmarks)?;
+    if state.bookmarks.iter().any(|mark| mark.label.capacity() > MAX_BOOKMARK_LABEL_BYTES
+        || mark.body.capacity() > MAX_ANNOTATION_BODY_BYTES) { return Err(DeskError::ResourceDenied); }
+    Ok(())
+}
+fn validate_personal_text(label: &str, body: &str) -> Result<(), DeskError> {
+    if label.is_empty() || label.len() > MAX_BOOKMARK_LABEL_BYTES { return Err(DeskError::InvalidLabel); }
+    if body.len() > MAX_ANNOTATION_BODY_BYTES { return Err(DeskError::InvalidBody); }
+    Ok(())
+}
+/// Copy within the precharged descriptor generations, including edit overlap.
+/// User text is neither trimmed nor decoded again: NUL and newlines are data.
+fn personal_text(text: &str, capacity_limit: usize) -> Result<String, DeskError> {
+    if text.len() > capacity_limit { return Err(DeskError::ResourceDenied); }
+    let mut owned = String::new();
+    owned.try_reserve_exact(text.len()).map_err(|_| DeskError::ResourceDenied)?;
+    if owned.capacity() > capacity_limit { return Err(DeskError::ResourceDenied); }
+    owned.push_str(text);
+    Ok(owned)
+}
+fn add_bookmark(state: &mut State, owner: ArenaOwnerId, limits: DeskLimits,
+    pane: DeskPaneId, label: &str, body: &str) -> Result<u64, DeskError> {
+    let at = location(state, owner, pane)?;
+    validate_personal_text(label, body)?;
+    if state.bookmarks.len() == limits.bookmarks { return Err(DeskError::BookmarkLimit); }
+    let id = state.next_bookmark;
+    state.next_bookmark = id.checked_add(1).filter(|_| id != 0).ok_or(DeskError::IdentityExhausted)?;
+    let label = personal_text(label, MAX_BOOKMARK_LABEL_BYTES)?;
+    let body = personal_text(body, MAX_ANNOTATION_BODY_BYTES)?;
+    state.bookmarks.push(DeskBookmark { id, label, body, update_sequence: 1, location: at });
+    Ok(id)
 }
 fn check(canceled: &mut impl FnMut() -> bool) -> Result<(), DeskError> {
     if canceled() { Err(DeskError::Canceled) } else { Ok(()) }
