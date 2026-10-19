@@ -9,7 +9,7 @@ use std::{mem::size_of, path::Path, sync::{Arc, Mutex, MutexGuard, TryLockError,
 use fcb::{ByteOffset, ByteRange};
 use fcb::search::{ReadingTarget, ReadingWindowOptions};
 use fcb_app::host::{HostResponse, desk::{DeskCommand, DeskLimits, DeskSession, DeskSessionError,
-    imports::ImportedSourceId, persistence::CheckpointIoError}};
+    imports::ImportedSourceId, persistence::CheckpointIoError, reader::DeskReaderError}};
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
 use super::reader_sessions::{self, ReaderSessions};
 
@@ -19,11 +19,12 @@ pub(super) const MAX_DESK_SESSIONS: usize = 2;
 pub(super) enum AccessError {
     Unknown, NotOpen, AlreadyOpen, Busy, Capacity, Canceled, Closed, Poisoned,
     InvalidArgument, Desk(DeskSessionError), Checkpoint(CheckpointIoError),
-    Reader(reader_sessions::AccessError),
+    Reader(reader_sessions::AccessError), ReaderTransfer(DeskReaderError),
 }
 impl From<DeskSessionError> for AccessError { fn from(e: DeskSessionError) -> Self { Self::Desk(e) } }
 impl From<CheckpointIoError> for AccessError { fn from(e: CheckpointIoError) -> Self { Self::Checkpoint(e) } }
 impl From<reader_sessions::AccessError> for AccessError { fn from(e: reader_sessions::AccessError) -> Self { Self::Reader(e) } }
+impl From<DeskReaderError> for AccessError { fn from(e: DeskReaderError) -> Self { Self::ReaderTransfer(e) } }
 impl std::fmt::Display for AccessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -33,7 +34,7 @@ impl std::fmt::Display for AccessError {
             Self::Closed => "DESK_HANDLE_CLOSED", Self::Poisoned => "DESK_HANDLE_POISONED",
             Self::InvalidArgument => "DESK_HANDLE_INVALID_ARGUMENT",
             Self::Desk(e) => return write!(f, "{e}"), Self::Checkpoint(e) => return write!(f, "{e}"),
-            Self::Reader(e) => return write!(f, "{e}"),
+            Self::Reader(e) => return write!(f, "{e}"), Self::ReaderTransfer(e) => return write!(f, "{e}"),
         })
     }
 }
@@ -42,7 +43,7 @@ impl AccessError {
         match self {
             Self::Canceled | Self::Closed => true,
             Self::Desk(e) => e.is_canceled(), Self::Checkpoint(e) => e.is_canceled(),
-            Self::Reader(e) => e.canceled(), _ => false,
+            Self::Reader(e) => e.canceled(), Self::ReaderTransfer(e) => e.is_canceled(), _ => false,
         }
     }
     pub(super) fn json(self, handle: u64) -> String {
@@ -196,6 +197,21 @@ impl DeskSessions {
             }, &mut *desk_stop)
         })
     }
+    /// Open a desk pane through the same retained reader registry used by file,
+    /// search and pinned readers. The destination must already be admitted and
+    /// empty. Source and destination cells survive the complete worker call;
+    /// both epochs revoke delivery, and try_lock avoids reciprocal-transfer
+    /// deadlock. Only a complete source-bound receipt publishes the destination.
+    pub(super) fn open_reader(&self, handle: u64, readers: &ReaderSessions,
+        expected: u64, pane: u64, destination: u64, canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AccessError> {
+        self.with_session(handle, canceled, |desk, desk_stop| {
+            let pane = desk.model().pane_id(pane).map_err(DeskSessionError::from)?;
+            readers.initialize_prepared(destination, |owner, reader_stop| -> Result<_, AccessError> {
+                Ok(desk.open_reader(expected, pane, owner, &mut *reader_stop)?)
+            }, &mut *desk_stop)
+        })
+    }
     /// Preserve the authoritative write receipt even if cancel/close races its
     /// completion. A filesystem effect is never translated into a generic
     /// canceled/no-effect result by a final registry epoch check.
@@ -238,3 +254,7 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, AccessError> {
 #[cfg(all(test, unix))]
 #[path = "desk_sessions_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "desk_reader_sessions_tests.rs"]
+mod reader_tests;

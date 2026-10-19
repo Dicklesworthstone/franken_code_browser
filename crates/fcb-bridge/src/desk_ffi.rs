@@ -57,6 +57,18 @@ pub extern "C" fn fcb_desk_import_reader(handle: u64, expected: u64, attempt: u6
         desks.import_reader(handle, readers, reader, expected, attempt, start, end, || false)
     }))
 }
+/// Open an exact retained pane into an admitted empty reader. No path argument
+/// exists: the desk's label cannot authorize a live source read. A non-null
+/// response is always desk JSON; successful receipts contain ordinary reader
+/// info under `reader`. Retire the destination if its receipt is not accepted.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_desk_open_reader(handle: u64, expected: u64, pane: u64,
+    destination: u64) -> *mut c_char {
+    reply(|| answer(handle, |desks| {
+        let readers = super::reader_ffi::registry().ok_or(AccessError::InvalidArgument)?;
+        desks.open_reader(handle, readers, expected, pane, destination, || false)
+    }))
+}
 /// # Safety
 /// path is null or readable NUL-terminated UTF-8 stable until return. The host
 /// grants the selected checkpoint, not live source paths stored inside it.
@@ -90,3 +102,7 @@ pub extern "C" fn fcb_desk_close(handle: u64) -> u8 {
 #[cfg(all(test, unix))]
 #[path = "desk_ffi_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "desk_reader_ffi_tests.rs"]
+mod reader_tests;

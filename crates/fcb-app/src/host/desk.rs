@@ -384,3 +384,6 @@ pub mod code;
 
 /// Retained sparse indexes and explicit resumable line/range navigation.
 pub mod reading;
+
+/// Explicit exact-capture transfer into an independently owned full reader.
+pub mod reader;

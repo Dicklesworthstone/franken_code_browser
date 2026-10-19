@@ -40,6 +40,20 @@ char *fcb_desk_window(uint64_t handle, uint64_t expected, uint64_t pane,
  * original range. Repeated source identities reuse the receiving capture. */
 char *fcb_desk_import_reader(uint64_t handle, uint64_t expected, uint64_t attempt,
     uint64_t reader, uint64_t start, uint64_t end);
+/* Open a retained pane in an ALREADY CREATED EMPTY fcb_reader destination.
+ * Copies <=4 MiB of exact original bytes under independent reader admission.
+ * No path lookup, disk refresh, source grant or desk mutation is involved.
+ * Success is desk/1 command "open-reader" with original pane/location/label,
+ * captured_bytes and nested "reader" containing ordinary reader-session/1 info.
+ * The nested owner is destination, capture_origin is host-supplied, initial read
+ * counters are zero and the digest covers all imported original bytes. The new
+ * reader supports the usual find/outline/Markdown/copy/fork/compare operations.
+ * Both handles may be canceled during transfer. Keep both until return; retire
+ * destination on any rejected/lost receipt (late cancellation is not rollback).
+ * After accepted handoff, destination survives source desk closure or restore.
+ * Saved labels never authorize fcb_reader_open or a native Refresh from disk. */
+char *fcb_desk_open_reader(uint64_t handle, uint64_t expected, uint64_t pane,
+    uint64_t destination);
 /* Checkpoints contain ALL retained source and personal labels, unencrypted.
  * User selects an explicit new destination and disclosure cap. Existing files
  * are not overwritten. Save returns effect/bytes_written even on failure: a
