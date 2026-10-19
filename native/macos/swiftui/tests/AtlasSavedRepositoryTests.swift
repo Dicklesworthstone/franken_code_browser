@@ -4,21 +4,34 @@ import Dispatch
 /// Only the foreign transport is injected. Production saved-archive decoding,
 /// model reconciliation, retained-reader scheduling and receipt admission run.
 /// This does not qualify the native ABI, filesystem grants or physical Mac UI.
-private final class SavedRepositoryFixture: @unchecked Sendable {
+final class SavedRepositoryFixture: @unchecked Sendable {
     struct Member: Sendable {
         let path: [UInt8]
         let display: String
         let bytes: [UInt8]?
         let digest: String?
+        let encoding: String
+        init(path: [UInt8], display: String, bytes: [UInt8]?, digest: String?, encoding: String = "utf8") {
+            self.path = path; self.display = display; self.bytes = bytes; self.digest = digest; self.encoding = encoding
+        }
+    }
+    struct QueryHit: Sendable {
+        let member: UInt64
+        let start: UInt64
+        let end: UInt64
     }
     struct Session {
         let path: String
         var generation: UInt64?
+        var queryGeneration: UInt64?
+        var needle: String?
         var readBytes: UInt64 = 0
         var readCalls: UInt64 = 0
         var refused = false
     }
     let domain = UUID()
+    let searchVectors: Bool
+    init(searchVectors: Bool = false) { self.searchVectors = searchVectors }
     let archiveDigest = String(repeating: "d", count: 64)
     let source = Array("\u{feff}---\ntitle: Saved\n---\n\n[code](src/lib.rs#L2) [again](src/lib.rs) [missing](absent.rs) [empty]()\n".utf8)
     let sourceDigest = "8591776e77fd8d9050b0a5796da773312c306092c3fc05f22dbe9413cfcff6d3"
@@ -33,21 +46,36 @@ private final class SavedRepositoryFixture: @unchecked Sendable {
     private var log: [String] = []
     private var fault: String?
     private var blocked = false
+    private var blockedSearch = false
     private var wrongPage: Set<UInt64> = []
 
     private func locked<T>(_ body: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return body() }
     var calls: [String] { locked { log } }
     func corruptNext(_ kind: String) { locked { fault = kind } }
     func blockNextHandoff() { locked { blocked = true } }
+    func blockNextSearch() { locked { blockedSearch = true } }
+    var searchUTF8: [UInt8] { Array(("é" + String(repeating: "x", count: 200) + "banana\n").utf8) }
+    var searchUTF16: [UInt8] {
+        [255, 254, 233, 0] + Array(repeating: [UInt8(120), 0], count: 200).flatMap { $0 }
+            + [98, 0, 97, 0, 110, 0, 97, 0, 110, 0, 97, 0, 10, 0]
+    }
     var members: [Member] {
         [
             Member(path: Array("README.md".utf8), display: "README.md", bytes: source, digest: sourceDigest),
-            Member(path: rawPath, display: "raw-\\xff.rs", bytes: Array("changed bytes\n".utf8),
-                digest: "7c60358cb724c1b671469c5f167cea45a4f70df4e3ac87b79340692e6f17f574"),
-            Member(path: Array("skipped.md".utf8), display: "skipped.md", bytes: [255],
-                digest: "a8100ae6aa1940d0b663bb31cd466142ebbdbd5187131b92d93818987832eb89"),
-            Member(path: Array("src/lib.rs".utf8), display: "src/lib.rs", bytes: Array("abc".utf8),
-                digest: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+            Member(path: rawPath, display: "raw-\\xff.rs",
+                bytes: searchVectors ? searchUTF8 : Array("changed bytes\n".utf8),
+                digest: searchVectors ? "ec34a752af5a6ce18bfd388bda04c6c9f60b22301b44d413c085507ca994f6cc"
+                    : "7c60358cb724c1b671469c5f167cea45a4f70df4e3ac87b79340692e6f17f574"),
+            Member(path: Array("skipped.md".utf8), display: "skipped.md",
+                bytes: searchVectors ? searchUTF16 : [255],
+                digest: searchVectors ? "0896dfbe40292ec212fa69dac19c681c8f56ba79c407cbad6817580762413ecf"
+                    : "a8100ae6aa1940d0b663bb31cd466142ebbdbd5187131b92d93818987832eb89",
+                encoding: searchVectors ? "utf16le" : "utf8"),
+            Member(path: Array("src/lib.rs".utf8), display: "src/lib.rs",
+                bytes: searchVectors ? [254, 255, 0, 97, 254, 255, 0, 98] : Array("abc".utf8),
+                digest: searchVectors ? "c71ff6c5ed08a430f34d4fcd60b2c151d57934c79a6087aa25496d9b06c65cc7"
+                    : "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                encoding: searchVectors ? "utf16be" : "utf8"),
             Member(path: Array("unavailable.md".utf8), display: "unavailable.md", bytes: nil, digest: nil)
         ]
     }
@@ -111,7 +139,7 @@ private final class SavedRepositoryFixture: @unchecked Sendable {
             "scanned_markdown_members": "1", "unavailable_markdown_members": "1",
             "unsupported_markdown_members": "1", "source_limited_members": "0", "diagnostic_markdown_members": "0",
             "retained_links": "4", "links_seen": "4", "matching_links": String(ids.count),
-            "member_bytes_read": String(source.count + 1), "member_read_calls": "2",
+            "member_bytes_read": String(source.count + members[2].bytes!.count), "member_read_calls": "2",
             "retained_source_payload_bytes": "0", "direction": direction.rawValue,
             "filter_member": member.map(String.init) as Any? ?? NSNull(),
             "links": ids[Int(start)..<Int(end)].map(linkObject),
@@ -120,18 +148,52 @@ private final class SavedRepositoryFixture: @unchecked Sendable {
         return out
     }
     func info(_ owner: UInt64, path archivePath: String = "/saved/repository.fcbs",
-        generation: UInt64? = nil, bytes: UInt64 = 0, calls: UInt64 = 0) -> [String: Any] {
+        generation: UInt64? = nil, query: UInt64? = nil, bytes: UInt64 = 0, calls: UInt64 = 0) -> [String: Any] {
         var out = header(owner, "info")
         out["archive_path"] = path(Array(archivePath.utf8), archivePath)
         out["accepted_relationship_generation"] = generation.map(String.init) as Any? ?? NSNull()
-        out["accepted_query_generation"] = NSNull(); out["accepted_index_generation"] = NSNull()
+        out["accepted_query_generation"] = query.map(String.init) as Any? ?? NSNull()
+        out["accepted_index_generation"] = NSNull()
         out["initial_archive_bytes_read"] = "2048"; out["directory_reserved_bytes"] = "4096"
         out["member_bytes_read"] = String(bytes); out["member_read_calls"] = String(calls)
         return out
     }
+    func searchHits(_ needle: String) -> [QueryHit] {
+        // Independent fixed vectors; no substitute matcher or offset inference.
+        guard searchVectors else { return [] }
+        if needle.utf8.elementsEqual("\u{feff}".utf8) { return [QueryHit(member: 3, start: 4, end: 6)] }
+        guard needle.utf8.elementsEqual("ana".utf8) else { return [] }
+        return [QueryHit(member: 1, start: 203, end: 206), QueryHit(member: 1, start: 205, end: 208),
+            QueryHit(member: 2, start: 406, end: 412), QueryHit(member: 2, start: 410, end: 416)]
+    }
+    func hitObject(_ id: UInt64, needle: String = "ana") -> [String: Any] {
+        let hit = searchHits(needle)[Int(id - 1)], member = members[Int(hit.member)]
+        return ["hit_id": String(id), "member": String(hit.member), "file_id": String(hit.member + 1),
+            "source_revision": String(hit.member + 1), "source_digest": member.digest!,
+            "path": path(member.path, member.display),
+            "original_range": ["start": String(hit.start), "end": String(hit.end)]]
+    }
+    func searchPage(_ owner: UInt64, generation: UInt64, needle: String = "ana",
+        start: UInt64 = 0, limit: UInt64 = 64, searching: Bool = false) -> [String: Any] {
+        var out = header(owner, searching ? "search" : "results")
+        let hits = searchHits(needle), end = min(UInt64(hits.count), start + limit)
+        let sourceBytes = members.compactMap(\.bytes).reduce(0) { $0 + $1.count }
+        out.merge(["query_generation": String(generation), "needle": needle,
+            "index_generation": NSNull(), "index_pin": NSNull(), "mode": "exact-decoded-literal",
+            "search_complete": false, "truncated": false, "retained_hits": String(hits.count),
+            "matches_seen": String(hits.count), "unavailable_files": "1", "unsupported_files": "0",
+            "member_bytes_read": String(sourceBytes), "member_read_calls": "4",
+            "scanned_bytes": String(sourceBytes), "peak_source_bytes": String(members.compactMap(\.bytes).map(\.count).max() ?? 0),
+            "index_eliminated_files": "0", "fallback_files": "0", "posting_entries_visited": "0",
+            "retained_source_payload_bytes": "0",
+            "hits": (start..<end).map { hitObject($0 + 1, needle: needle) },
+            "next_offset": end < UInt64(hits.count) ? String(end) as Any : NSNull()
+        ]) { _, new in new }
+        return out
+    }
     private func readerHeader(_ owner: UInt64, member: Member, command: String) -> [String: Any] {
         ["schema": "fcb.reader-session/1", "status": "ok", "command": command, "owner": String(owner),
-         "file_id": "1", "source_revision": "1", "captured_bytes": String(member.bytes!.count), "encoding": "utf8",
+         "file_id": "1", "source_revision": "1", "captured_bytes": String(member.bytes!.count), "encoding": member.encoding,
          "path": path(member.path, member.display), "capture_origin": "host-supplied", "capture_sha256": member.digest!,
          "additional_source_bytes_read": "0", "native_presented": false]
     }
@@ -144,22 +206,40 @@ private final class SavedRepositoryFixture: @unchecked Sendable {
     }
     private func window(_ owner: UInt64, member: Member, offset: UInt64, limit: UInt64) -> [String: Any] {
         let bytes = member.bytes!, end = min(UInt64(bytes.count), offset + limit)
-        let raw = bytes[Int(offset)..<Int(end)]
+        // The real extent decoder excludes a recognized file BOM from its
+        // visible range while retaining the original requested byte range.
+        // These fixed vectors otherwise use scalar-aligned window boundaries.
+        let header: UInt64
+        if member.encoding == "utf8" && bytes.starts(with: [0xef, 0xbb, 0xbf]) { header = 3 }
+        else if member.encoding == "utf16le" && bytes.starts(with: [0xff, 0xfe]) { header = 2 }
+        else if member.encoding == "utf16be" && bytes.starts(with: [0xfe, 0xff]) { header = 2 }
+        else { header = 0 }
+        let visibleStart = max(offset, header), visibleEnd = max(end, visibleStart)
+        let raw = bytes[Int(visibleStart)..<Int(visibleEnd)]
         var out = readerHeader(owner, member: member, command: "window")
         out["requested_original_range"] = ["start": String(offset), "end": String(end)]
-        out["visible_range"] = ["start": String(offset), "end": String(end)]
+        out["visible_range"] = ["start": String(visibleStart), "end": String(visibleEnd)]
         out["text_kind"] = "logical-captured-text-not-shaped"
-        // A leading BOM is source evidence, not logical document text.
-        out["text"] = String(decoding: raw.starts(with: [0xef, 0xbb, 0xbf]) ? raw.dropFirst(3) : raw, as: UTF8.self)
+        // Fixture text decoding does not derive match coordinates: every hit
+        // range and witness comes from the fixed transport vectors above.
+        if member.encoding == "utf16le" || member.encoding == "utf16be" {
+            out["text"] = String(data: Data(raw),
+                encoding: member.encoding == "utf16le" ? .utf16LittleEndian : .utf16BigEndian)!
+            out["has_replacements"] = false
+        } else {
+            out["text"] = String(decoding: raw, as: UTF8.self)
+            out["has_replacements"] = String(bytes: raw, encoding: .utf8) == nil
+        }
         out["original_hex"] = hex(raw)
-        out["range_limited"] = false; out["boundaries_adjusted"] = false
-        out["has_replacements"] = String(bytes: raw, encoding: .utf8) == nil
+        out["range_limited"] = false
+        out["boundaries_adjusted"] = visibleStart != offset || visibleEnd != end
         out["first_physical_line"] = NSNull(); out["selection"] = NSNull()
-        out["next_offset"] = end < UInt64(bytes.count) ? String(end) as Any : NSNull()
+        out["next_offset"] = visibleEnd < UInt64(bytes.count) ? String(visibleEnd) as Any : NSNull()
         return out
     }
     private func handoff(_ saved: UInt64, reader: UInt64, ordinal: UInt64,
-        generation: UInt64?, link: UInt64?, side: AtlasSavedLinkSide?) -> String? {
+        generation: UInt64?, link: UInt64?, side: AtlasSavedLinkSide?,
+        query: UInt64? = nil, hitID: UInt64? = nil) -> String? {
         let member = members[Int(ordinal)]
         guard let bytes = member.bytes else { return nil }
         readers[reader] = member
@@ -171,6 +251,15 @@ private final class SavedRepositoryFixture: @unchecked Sendable {
         out["live_source_reopened"] = false; out["member_bytes_read"] = String(bytes.count); out["member_read_calls"] = "1"
         out["selection"] = side == .evidence ? ["start": "0", "end": String(bytes.count)] as Any : NSNull()
         out["reader_owner"] = String(reader)
+        var windowStart: UInt64 = 0, windowBytes: UInt64 = 16 * 1024
+        if let query, let hitID, let needle = sessions[saved]?.needle {
+            let hit = searchHits(needle)[Int(hitID - 1)]
+            out["selection"] = ["query_generation": String(query), "hit_id": String(hitID),
+                "domain": "original-source-bytes", "original_range": ["start": String(hit.start), "end": String(hit.end)],
+                "original_hex": hex(bytes[Int(hit.start)..<Int(hit.end)])]
+            windowStart = hit.start - min(hit.start, 132)
+            windowBytes = max(4, min(UInt64(bytes.count), hit.end + 132) - windowStart)
+        }
         if let generation, let link, let side {
             out["relationship_generation"] = String(generation); out["link_id"] = String(link); out["side"] = side.rawValue
             out["offset"] = "0"; out["evidence_precision"] = "whole-captured-markdown-document"
@@ -191,11 +280,22 @@ private final class SavedRepositoryFixture: @unchecked Sendable {
             case "inherited-query": nested["accepted_query_generation"] = "1"
             case "many-read-calls": out["member_read_calls"] = "1024" // Interrupted reads can exceed source length.
             case "page-bytes": wrongPage.insert(reader)
+            case "hit-generation", "hit-id", "hit-domain", "hit-range", "hit-hex":
+                var selected = out["selection"] as! [String: Any]
+                switch fault {
+                case "hit-generation": selected["query_generation"] = String((query ?? 0) + 1)
+                case "hit-id": selected["hit_id"] = String((hitID ?? 0) + 1)
+                case "hit-domain": selected["domain"] = "decoded-text"
+                case "hit-range": selected["original_range"] = ["start": "0", "end": "3"]
+                default: selected["original_hex"] = "000000"
+                }
+                out["selection"] = selected
+            case "hit-context": windowStart = 0; windowBytes = 16 * 1024
             default: preconditionFailure("unexpected handoff fault")
             }
         }
         out["reader"] = nested
-        out["window"] = window(reader, member: member, offset: 0, limit: 16 * 1024)
+        out["window"] = window(reader, member: member, offset: windowStart, limit: windowBytes)
         return encode(out)
     }
     var savedTransport: AtlasSavedTransport {
@@ -204,8 +304,11 @@ private final class SavedRepositoryFixture: @unchecked Sendable {
         } }, run: { [self] handle, request in
             precondition(!Thread.isMainThread)
             switch request {
-            case .openMember, .openRelationship:
+            case .openMember, .openRelationship, .openHit:
                 let pause = locked { let value = blocked; blocked = false; return value }
+                if pause { entered.signal(); precondition(resume.wait(timeout: .now() + .seconds(5)) == .success) }
+            case .search:
+                let pause = locked { let value = blockedSearch; blockedSearch = false; return value }
                 if pause { entered.signal(); precondition(resume.wait(timeout: .now() + .seconds(5)) == .success) }
             default: break
             }
@@ -220,7 +323,7 @@ private final class SavedRepositoryFixture: @unchecked Sendable {
                 case .info:
                     log.append("info:\(handle)")
                     guard let session = sessions[handle], !session.refused else { return nil }
-                    return encode(info(handle, path: session.path, generation: session.generation,
+                    return encode(info(handle, path: session.path, generation: session.generation, query: session.queryGeneration,
                         bytes: session.readBytes, calls: session.readCalls))
                 case .members(let start, let limit):
                     guard sessions[handle] != nil, start <= 5 else { return nil }
@@ -238,7 +341,7 @@ private final class SavedRepositoryFixture: @unchecked Sendable {
                     log.append("prepare:\(handle):\(generation)")
                     guard var session = sessions[handle] else { return nil }
                     if fault == "build" { fault = nil; return nil }
-                    session.generation = generation; session.readBytes += UInt64(source.count + 1); session.readCalls += 2
+                    session.generation = generation; session.readBytes += UInt64(source.count + members[2].bytes!.count); session.readCalls += 2
                     sessions[handle] = session
                     return encode(relationships(handle, generation: generation, preparing: true))
                 case .relationships(let generation, let direction, let member, let start, let limit):
@@ -254,6 +357,33 @@ private final class SavedRepositoryFixture: @unchecked Sendable {
                           side == .evidence || link <= 2 else { return nil }
                     return handoff(handle, reader: reader, ordinal: side == .evidence ? 0 : 3,
                         generation: generation, link: link, side: side)
+                case .search(let generation, let needle, let matches):
+                    precondition(matches == 4096)
+                    log.append("search:\(handle):\(generation):\(needle)")
+                    guard var session = sessions[handle] else { return nil }
+                    if fault == "search" { fault = nil; return nil }
+                    session.queryGeneration = generation; session.needle = needle
+                    session.readBytes += UInt64(members.compactMap(\.bytes).reduce(0) { $0 + $1.count }); session.readCalls += 4
+                    sessions[handle] = session
+                    if fault == "search-lost" { fault = nil; return nil }
+                    return encode(searchPage(handle, generation: generation, needle: needle, searching: true))
+                case .results(let generation, let start, let limit):
+                    log.append("results:\(handle):\(generation):\(start)")
+                    guard let session = sessions[handle], session.queryGeneration == generation, let needle = session.needle else { return nil }
+                    if fault == "results" { fault = nil; return nil }
+                    return encode(searchPage(handle, generation: generation, needle: needle, start: start, limit: limit))
+                case .clearResults(let generation):
+                    log.append("clear-search:\(handle):\(generation)")
+                    sessions[handle]?.queryGeneration = nil; sessions[handle]?.needle = nil
+                    if fault == "clear-lost" { fault = nil; return nil }
+                    var out = header(handle, "clear-results")
+                    out["accepted_query_generation"] = NSNull(); out["retained_hits"] = "0"
+                    return encode(out)
+                case .openHit(let reader, let generation, let id):
+                    guard let session = sessions[handle], session.queryGeneration == generation,
+                          let needle = session.needle, id > 0, id <= UInt64(searchHits(needle).count) else { return nil }
+                    return handoff(handle, reader: reader, ordinal: searchHits(needle)[Int(id - 1)].member,
+                        generation: nil, link: nil, side: nil, query: generation, hitID: id)
                 case .clearRelationships(let generation):
                     sessions[handle]?.generation = nil
                     var out = header(handle, "relationships-clear")
@@ -279,7 +409,8 @@ private final class SavedRepositoryFixture: @unchecked Sendable {
                 var page = window(owner, member: member, offset: offset, limit: limit)
                 log.append("reader-window:\(owner):\(offset)")
                 if wrongPage.remove(owner) != nil {
-                    page["original_hex"] = String(repeating: "00", count: member.bytes!.count)
+                    let emitted = page["original_hex"] as! String
+                    page["original_hex"] = String(repeating: "00", count: emitted.utf8.count / 2)
                 }
                 return encode(page)
             }
@@ -297,6 +428,7 @@ private final class SavedRepositoryFixture: @unchecked Sendable {
     }
 }
 
+#if !FCB_SAVED_SEARCH_TESTS
 @main private enum AtlasSavedRepositoryTests {
     @MainActor private static func wait(_ message: String, _ ready: () -> Bool) async {
         for _ in 0..<2000 {
@@ -410,7 +542,8 @@ private final class SavedRepositoryFixture: @unchecked Sendable {
         let f = SavedRepositoryFixture(), model = await prepared(f)
         let info = model.info!, all = model.relationships!, source = all.links[0]
         let evidence = try await model.openLink(source, from: all, side: .evidence, readerTransport: f.readerTransport())
-        precondition(evidence.reader.page?.originalHex == f.hex(f.source))
+        precondition(evidence.reader.page?.start == 3 && evidence.reader.page?.boundariesAdjusted == true)
+        precondition(evidence.reader.page?.originalHex == f.hex(f.source.dropFirst(3)))
         precondition(evidence.evidenceLabel.contains("0..<\(f.source.count)") && !evidence.reader.canRefresh)
         let code = model.members!.items[3]
         model.selectMember(code, from: info.identity)
@@ -519,3 +652,4 @@ private final class SavedRepositoryFixture: @unchecked Sendable {
         precondition(!f.calls.contains("LIVE-OPEN") && model.closed && model.info == nil)
     }
 }
+#endif

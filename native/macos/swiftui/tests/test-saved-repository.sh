@@ -15,7 +15,8 @@ swiftc "$@" -swift-version 6 -warnings-as-errors \
     "$src/AtlasReaderCoordinator.swift" "$src/AtlasCapturedReader.swift" "$src/AtlasSuppliedReader.swift" \
     "$src/AtlasNavigationHistory.swift" "$src/AtlasSource.swift" \
     "$src/AtlasDocumentPreviewModel.swift" "$src/AtlasPagedReaderModel.swift" \
-    "$src/AtlasSavedRepository.swift" "$src/AtlasSavedRepositoryReader.swift" "$src/AtlasSavedRepositoryModel.swift" \
+    "$src/AtlasSavedRepository.swift" "$src/AtlasSavedRepositorySearch.swift" \
+    "$src/AtlasSavedRepositoryReader.swift" "$src/AtlasSavedRepositoryModel.swift" \
     "$src/tests/AtlasSavedRepositoryTests.swift" -o "$out/saved-repository-tests"
 "$out/saved-repository-tests"
 printf 'Retained test artifacts: %s\n' "$out"

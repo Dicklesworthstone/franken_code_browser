@@ -4,6 +4,10 @@ import Foundation
 @_silgen_name("fcb_saved_open") private func savedOpen(_ h: UInt64, _ path: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_info") private func savedInfo(_ h: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_members") private func savedMembers(_ h: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_search") private func savedSearch(_ h: UInt64, _ generation: UInt64, _ needle: UnsafePointer<CChar>?, _ matches: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_results") private func savedResults(_ h: UInt64, _ generation: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_clear_results") private func savedClearResults(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_open_hit_reader") private func savedHitReader(_ h: UInt64, _ reader: UInt64, _ generation: UInt64, _ hit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_prepare_relationships") private func savedPrepare(_ h: UInt64, _ generation: UInt64, _ links: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_relationships") private func savedRelationships(_ h: UInt64, _ generation: UInt64,
     _ direction: UInt64, _ member: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
@@ -23,6 +27,14 @@ extension AtlasSavedTransport {
             return path.withCString { take(savedOpen(handle, $0)) }
         case .info: return take(savedInfo(handle))
         case .members(let start, let limit): return take(savedMembers(handle, start, limit))
+        case .search(let generation, let needle, let matches):
+            guard generation > 0, AtlasSavedSearchWire.validNeedle(needle),
+                  (1...AtlasSavedSearchWire.maximumHits).contains(matches) else { return nil }
+            return needle.withCString { take(savedSearch(handle, generation, $0, matches)) }
+        case .results(let generation, let start, let limit):
+            return take(savedResults(handle, generation, start, limit))
+        case .clearResults(let generation): return take(savedClearResults(handle, generation))
+        case .openHit(let reader, let generation, let hit): return take(savedHitReader(handle, reader, generation, hit))
         case .prepareRelationships(let generation, let links, let bytes):
             return take(savedPrepare(handle, generation, links, bytes))
         case .relationships(let generation, let direction, let member, let start, let limit):

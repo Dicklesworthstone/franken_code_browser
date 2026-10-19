@@ -34,6 +34,11 @@ private final class AtlasSavedFileAccess {
     @Bindable var desk: AtlasReadingDeskModel
     @Environment(\.dismiss) private var dismiss
     @State private var panelNotice = ""
+    @State private var section: Section = .text
+    private enum Section: String, CaseIterable, Identifiable {
+        case text = "Text search", links = "Documentation links"
+        var id: String { rawValue }
+    }
     @State private var readerCapture: AtlasSavedReaderCapture?
     @State private var readerTask: Task<Void, Never>?
     @State private var pins = AtlasPinnedReaders<AtlasPagedReaderModel>(
@@ -53,13 +58,18 @@ private final class AtlasSavedFileAccess {
                 }.font(.caption)
                 HSplitView {
                     membersPane.frame(minWidth: 270, idealWidth: 320, maxWidth: 430)
-                    relationshipsPane.frame(minWidth: 620, maxWidth: .infinity, maxHeight: .infinity)
+                    VStack(alignment: .leading, spacing: 12) {
+                        Picker("Saved repository activity", selection: $section) {
+                            ForEach(Section.allCases) { Text($0.rawValue).tag($0) }
+                        }.pickerStyle(.segmented).padding(.leading, 8)
+                        if section == .text { searchPane } else { relationshipsPane }
+                    }.frame(minWidth: 620, maxWidth: .infinity, maxHeight: .infinity)
                 }
             } else {
                 VStack(spacing: 14) {
                     Image(systemName: "archivebox").font(.system(size: 42)).foregroundStyle(.secondary)
                     Text("Read a saved repository").font(.title2.weight(.semibold))
-                    Text("Choose an FCBS archive to browse its captured files, read source and Markdown, and follow documentation links and backlinks.")
+                    Text("Choose an FCBS archive to search its captured text, read source and Markdown, and follow documentation links and backlinks.")
                         .multilineTextAlignment(.center).frame(maxWidth: 540)
                     Button("Open saved repository…", action: chooseArchive).disabled(!model.canOperate)
                     Text("The archive is read only. Unavailable members remain visible, with their omission reason.")
@@ -100,7 +110,9 @@ private final class AtlasSavedFileAccess {
                     .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                 Spacer()
             }
-            Text("Source evidence is the original captured document. Link positions and URL fragments are not resolved. Member names never open working-tree paths.")
+            Text(section == .text
+                ? "Text search uses exact case-sensitive decoded literals across the saved archive. Unicode normalization and query syntax are not applied. Member names never open working-tree paths."
+                : "Documentation evidence is the original captured document. Individual link positions and URL fragments are not resolved. Member names never open working-tree paths.")
                 .font(.caption2).foregroundStyle(.secondary)
         }.frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -170,6 +182,121 @@ private final class AtlasSavedFileAccess {
                 .clipShape(RoundedRectangle(cornerRadius: 6))
         }.buttonStyle(.plain).disabled(!model.canOperate)
         .accessibilityLabel("\(member.path.display), \(member.captured ? "captured" : "unavailable")")
+    }
+    private var searchPane: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                TextField("Literal text in all captured members", text: $model.searchInput)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { panelNotice = ""; model.search() }
+                    .accessibilityLabel("Case-sensitive literal search across the saved archive")
+                Button { panelNotice = ""; model.search() } label: { Label("Search archive", systemImage: "magnifyingglass") }
+                    .disabled(!model.canOperate || !model.validSearchInput)
+                Button("Clear") { panelNotice = ""; model.clearSearch() }
+                    .disabled(!model.canOperate || (model.searchPage == nil && model.searchInput.isEmpty))
+            }
+            HStack {
+                Text("Case-sensitive decoded literal · entire saved archive · up to 4,096 retained matches")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Reload results") { panelNotice = ""; model.reloadSearchResults() }
+                    .controlSize(.small).disabled(!model.canOperate)
+            }
+            if !model.searchInput.isEmpty && !model.validSearchInput {
+                Text("The literal must contain 1–1024 UTF-8 bytes and no NUL character.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            if let page = model.searchPage {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Accepted query").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Text(page.needle).font(.body.monospaced()).lineLimit(3).textSelection(.enabled)
+                    if !model.searchIsCurrent {
+                        HStack {
+                            Text("The draft differs from these results. Submit it or restore the accepted query before opening a match.")
+                                .font(.caption).foregroundStyle(.orange)
+                            Spacer()
+                            Button("Use accepted query") { model.searchInput = page.needle; panelNotice = "" }
+                                .controlSize(.small).disabled(!model.canOperate)
+                        }
+                    }
+                }
+                searchCoverage(page)
+                Divider()
+                if page.hits.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("No retained text matches.").font(.headline)
+                        Text(page.complete
+                            ? "The accepted literal has no matches in the complete saved manifest."
+                            : "Coverage is partial. An empty result cannot establish that the literal is absent from the repository.")
+                            .foregroundStyle(.secondary)
+                    }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 10)
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 8) {
+                            ForEach(page.hits) { hit in searchHitRow(hit, in: page) }
+                        }
+                    }.id("saved-query:\(page.identity.owner):\(page.generation)").frame(maxHeight: .infinity)
+                }
+                HStack {
+                    Button("Previous matches") {
+                        model.loadSearchResults(start: page.start >= 64 ? page.start - 64 : 0, from: page)
+                    }.disabled(!model.canOperate || !model.searchIsCurrent || page.start == 0)
+                    Spacer()
+                    Text("\(page.start)..<\(page.start + UInt64(page.hits.count)) of \(page.retained) retained")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Next matches") {
+                        if let next = page.next { model.loadSearchResults(start: next, from: page) }
+                    }.disabled(!model.canOperate || !model.searchIsCurrent || page.next == nil)
+                }.controlSize(.small)
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(model.busy ? "Waiting for saved archive work…" : "Find text across your saved repository.")
+                        .font(.headline)
+                    Text("Enter an identifier, message or phrase and choose Search archive. Results name exact captured byte ranges, including supported UTF-16 source.")
+                    Text("Search reads saved source on a worker. Unavailable files, unsupported decoding and a retained-match limit are reported explicitly.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 12)
+            }
+        }.padding(.leading, 8)
+    }
+    private func searchCoverage(_ page: AtlasSavedSearchPage) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Label(page.complete ? "Complete text-search coverage" : "Partial text-search coverage",
+                    systemImage: page.complete ? "checkmark.circle" : "exclamationmark.circle")
+                    .foregroundStyle(page.complete ? Color.secondary : Color.orange)
+                Spacer()
+                Text("Query generation \(page.generation)").foregroundStyle(.secondary)
+            }.font(.caption.weight(.semibold))
+            Text(page.truncated
+                ? "\(page.retained) matches retained · at least \(page.seen) matches seen"
+                : "\(page.retained) matches retained from scanned captures")
+                .font(.caption)
+            Text("Unavailable members: \(page.unavailable) · Unsupported decoding: \(page.unsupported) · \(page.sourceBytes) source bytes read")
+                .font(.caption).foregroundStyle(.secondary)
+            if page.truncated {
+                Text("The retained-match limit stopped the search. More matches may exist, and the seen count is a lower bound.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            if !page.identity.discoveryComplete {
+                Text("Archive discovery was incomplete; files outside the saved manifest remain unknown.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+        }.textSelection(.enabled)
+    }
+    private func searchHitRow(_ hit: AtlasSavedHit, in page: AtlasSavedSearchPage) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(hit.path.display).font(.callout.weight(.semibold)).lineLimit(2).textSelection(.enabled)
+                Text("Occurrence \(hit.id) · original bytes \(hit.start)..<\(hit.end) · \(hit.end - hit.start) source bytes")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Read match") { openHit(hit, from: page) }
+                .disabled(!model.canOperate || !model.searchIsCurrent || readerTask != nil)
+        }.padding(10).frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.035)).clipShape(RoundedRectangle(cornerRadius: 7))
     }
     private var relationshipsPane: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -320,6 +447,12 @@ private final class AtlasSavedFileAccess {
                 search: .native, outline: .native, document: .native)
         }
     }
+    private func openHit(_ hit: AtlasSavedHit, from page: AtlasSavedSearchPage) {
+        launchReader {
+            try await model.openHit(hit, from: page, readerTransport: .native,
+                search: .native, outline: .native, document: .native)
+        }
+    }
     private func launchReader(_ open: @escaping @MainActor () async throws -> AtlasSavedReaderCapture) {
         guard model.canOperate, readerTask == nil else { return }
         panelNotice = ""
@@ -345,6 +478,7 @@ private final class AtlasSavedFileAccess {
     @Bindable var pins: AtlasPinnedReaders<AtlasPagedReaderModel>
     @Environment(\.dismiss) private var dismiss
     @State private var showsDesk = false
+    @State private var matchNotice = ""
     private var pinGroup: String { "saved-repository:\(capture.owner)" }
     private var canKeep: Bool {
         desk.canOperate && desk.readerDomain != nil && capture.reader.retainedRegistryDomain == desk.readerDomain
@@ -361,6 +495,7 @@ private final class AtlasSavedFileAccess {
                 Button("Reading Desk") { showsDesk = true }
                 Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
             }.controlSize(.small).padding(.horizontal, 12).padding(.top, 12)
+            if let match = capture.match { savedMatchActions(match) }
             HSplitView {
                 AtlasPagedSourceView(model: capture.reader, canPin: pins.canAdd, pin: { reader in
                     pins.pin(reader, root: pinGroup, label: capture.member.path.display)
@@ -371,7 +506,9 @@ private final class AtlasSavedFileAccess {
                         .frame(minWidth: 350, idealWidth: 480)
                 }
             }
-            Text("Keep in Desk preserves the current original-byte page. Add bookmarks or notes there and save a checkpoint to retain your reading work.")
+            Text(capture.match == nil
+                ? "Keep in Desk preserves the current original-byte page. Add bookmarks or notes there and save a checkpoint to retain your reading work."
+                : "Keep saved match preserves the exact range above. The reader toolbar's Keep in Desk preserves the current page. Add a note or bookmark and save a checkpoint in the Desk.")
                 .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 12).padding(.bottom, 8)
         }
@@ -379,6 +516,39 @@ private final class AtlasSavedFileAccess {
         .onAppear { pins.bind(root: pinGroup) }
         .sheet(isPresented: $showsDesk) { AtlasReadingDeskView(model: desk) }
         .onDisappear { capture.reader.close() }
+    }
+    private func savedMatchActions(_ match: AtlasSavedMatchEvidence) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            if case .hit(_, let needle, _) = capture.origin {
+                Text("Saved literal: \(needle)").font(.callout.monospaced()).lineLimit(2).textSelection(.enabled)
+            }
+            HStack {
+                Text("Exact saved match · \(match.end - match.start) original bytes")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                Button("Return to saved match") {
+                    capture.reader.offsetInput = String(match.contextStart); capture.reader.goToByte()
+                }.disabled(!capture.canUseMatch)
+                Button("Copy match bytes (hex)") {
+                    NSPasteboard.general.clearContents()
+                    matchNotice = NSPasteboard.general.setString(match.originalHex, forType: .string)
+                        ? "Copied the exact saved match bytes as hexadecimal." : "The pasteboard did not accept the match bytes."
+                }
+                Button("Keep saved match in Desk", action: keepSavedMatch)
+                    .disabled(!canKeep || !capture.canUseMatch)
+            }.controlSize(.small)
+            Text("Original bytes (hex): \(String(match.originalHex.prefix(256)))\(match.originalHex.count > 256 ? "…" : "")")
+                .font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(3).textSelection(.enabled)
+            if !matchNotice.isEmpty { Text(matchNotice).font(.caption).foregroundStyle(.secondary) }
+        }.padding(.horizontal, 12)
+    }
+    private func keepSavedMatch() {
+        guard canKeep, capture.canUseMatch, let match = capture.match,
+              let domain = capture.reader.retainedRegistryDomain, domain == desk.readerDomain else { return }
+        desk.keepCapture(start: match.start, end: match.end, sourceDomain: domain) { work in
+            try await capture.withMatchReader(work)
+        }
+        showsDesk = true
     }
     private func keep(_ reader: AtlasPagedReaderModel) {
         guard canKeep, reader.canPin, reader.retainedRegistryDomain == desk.readerDomain else { return }

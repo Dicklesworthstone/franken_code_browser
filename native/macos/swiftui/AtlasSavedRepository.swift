@@ -108,6 +108,7 @@ struct AtlasSavedInfo: Sendable {
     let identity: AtlasSavedIdentity
     let path: AtlasSavedPath
     let relationshipGeneration: UInt64?
+    let queryGeneration: UInt64?
     let initialArchiveBytes: UInt64
     let memberBytesRead: UInt64
     let memberReadCalls: UInt64
@@ -122,7 +123,7 @@ struct AtlasSavedInfo: Sendable {
                   !fresh || (w.relationship == nil && w.query == nil && w.index == nil &&
                     w.memberBytes.value == 0 && w.memberCalls.value == 0) else { throw AtlasSavedError.invalidResponse }
             return Self(identity: try JSONDecoder().decode(AtlasSavedIdentity.self, from: data),
-                path: w.path, relationshipGeneration: w.relationship, initialArchiveBytes: w.initial.value,
+                path: w.path, relationshipGeneration: w.relationship, queryGeneration: w.query, initialArchiveBytes: w.initial.value,
                 memberBytesRead: w.memberBytes.value, memberReadCalls: w.memberCalls.value)
         } catch let error as AtlasSavedError { throw error }
         catch { throw AtlasSavedError.invalidResponse }
@@ -361,6 +362,10 @@ struct AtlasSavedRelationships: Sendable {
 enum AtlasSavedRequest: Sendable {
     case open(path: String), info
     case members(start: UInt64, limit: UInt64)
+    case search(generation: UInt64, needle: String, matches: UInt64)
+    case results(generation: UInt64, start: UInt64, limit: UInt64)
+    case clearResults(generation: UInt64)
+    case openHit(reader: UInt64, generation: UInt64, hit: UInt64)
     case prepareRelationships(generation: UInt64, links: UInt64, bytes: UInt64)
     case relationships(generation: UInt64, direction: AtlasSavedDirection, member: UInt64?, start: UInt64, limit: UInt64)
     case clearRelationships(generation: UInt64)

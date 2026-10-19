@@ -43,10 +43,13 @@ private final class AtlasSavedSession: @unchecked Sendable {
     private(set) var relationships: AtlasSavedRelationships?
     private(set) var direction: AtlasSavedDirection = .all
     private(set) var relationshipGeneration: UInt64?
+    private(set) var searchPage: AtlasSavedSearchPage?
+    private(set) var queryGeneration: UInt64?
     private(set) var busy = false
     private(set) var closed = false
     private(set) var notice = "Open an FCBS saved repository to browse its captured members and documentation links."
     var memberOffsetInput = "0"
+    var searchInput = ""
     @ObservationIgnored private let transport: AtlasSavedTransport
     @ObservationIgnored private let io = AtlasProjectIO()
     @ObservationIgnored private var session: AtlasSavedSession?
@@ -54,10 +57,17 @@ private final class AtlasSavedSession: @unchecked Sendable {
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var cancellation: AtlasSearchCancellation?
     @ObservationIgnored private var lastRelationshipAttempt: UInt64 = 0
+    @ObservationIgnored private var lastQueryAttempt: UInt64 = 0
 
     init(transport: AtlasSavedTransport) { self.transport = transport }
     var canOperate: Bool { !busy && !closed }
     var readerDomain: UUID? { transport.readerDomain }
+    var validSearchInput: Bool { AtlasSavedSearchWire.validNeedle(searchInput) }
+    var searchIsCurrent: Bool {
+        guard let searchPage, info?.identity == searchPage.identity,
+              queryGeneration == searchPage.generation else { return false }
+        return searchInput.utf8.elementsEqual(searchPage.needle.utf8)
+    }
 
     func open(path: String, accessLease: AnyObject?) {
         guard canOperate, path.hasPrefix("/"), path.utf8.count <= 16_384, !path.utf8.contains(0) else { return }
@@ -83,7 +93,8 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 model.info = opened; model.members = page; model.selectedMember = page.items.first
                 model.relationships = nil; model.relationshipGeneration = nil; model.direction = .all
                 model.lastRelationshipAttempt = 0; model.memberOffsetInput = "0"
-                model.notice = "Opened the saved manifest. Member pages read metadata only. Build documentation links explicitly when ready."
+                model.searchPage = nil; model.queryGeneration = nil; model.lastQueryAttempt = 0; model.searchInput = ""
+                model.notice = "Opened the saved manifest. Search all captured text or build documentation links explicitly when ready."
             } catch {
                 if model.pending === candidate { model.pending = nil; candidate.cancel() }
                 throw error
@@ -184,6 +195,114 @@ private final class AtlasSavedSession: @unchecked Sendable {
         }
     }
 
+    /// Explicit submission freezes the exact UTF-8 needle. Editing the draft
+    /// never changes the label or navigation authority of an accepted query.
+    func search() {
+        guard canOperate, let info else { return }
+        if searchInput.isEmpty { clearSearch(); return }
+        guard validSearchInput else {
+            notice = "Enter 1–1024 UTF-8 bytes of literal text, without NUL. Search is case sensitive and does not normalize Unicode."; return
+        }
+        let needle = searchInput
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let generation = try model.nextQueryGeneration()
+            model.notice = "Searching decoded text across the captured archive…"
+            do {
+                let page = try AtlasSavedSearchPage.decode(await model.run(lease,
+                    .search(generation: generation, needle: needle, matches: 4096), flag: flag),
+                    identity: info.identity, generation: generation, needle: needle, start: 0, limit: 64, searching: true)
+                guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
+                model.queryGeneration = generation; model.searchPage = page
+                model.notice = page.complete ? "Search finished across the complete captured manifest."
+                    : "Search coverage is partial. Inspect unavailable files, unsupported decoding and the retained-match limit."
+            } catch {
+                let recovered = await model.reconcileSearch(lease)
+                model.notice = recovered
+                    ? "Recovered the accepted search state after an unconfirmed reply. The archive was not searched a second time."
+                    : "The accepted search could not be verified. Reload results before navigating search hits."
+            }
+        }
+    }
+    func clearSearch() {
+        guard canOperate, let info else { return }
+        searchInput = ""
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let generation = try model.nextQueryGeneration()
+            do {
+                try AtlasSavedSearchPage.decodeClear(await model.run(lease, .clearResults(generation: generation), flag: flag),
+                    identity: info.identity)
+                guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
+                model.queryGeneration = nil; model.searchPage = nil
+                model.notice = "Cleared saved text-search results. Documentation links and captured readers remain available."
+            } catch {
+                let recovered = await model.reconcileSearch(lease)
+                model.notice = recovered ? "Recovered the accepted search state after the clear request."
+                    : "The clear outcome is unconfirmed. Reload results to inspect the accepted search."
+            }
+        }
+    }
+    func loadSearchResults(start: UInt64, from page: AtlasSavedSearchPage? = nil) {
+        guard searchIsCurrent, let info, let accepted = searchPage, let generation = queryGeneration,
+              start <= accepted.retained else { return }
+        if let page {
+            guard page.identity == accepted.identity, page.generation == generation,
+                  page.needle.utf8.elementsEqual(accepted.needle.utf8) else { return }
+        }
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let next = try AtlasSavedSearchPage.decode(await model.run(lease,
+                .results(generation: generation, start: start, limit: 64), flag: flag),
+                identity: info.identity, generation: generation, needle: accepted.needle, start: start, limit: 64)
+            guard model.session === lease, !model.closed, model.queryGeneration == generation else { throw AtlasSavedError.canceled }
+            model.searchPage = next
+            model.notice = "Showing \(next.hits.count) of \(next.retained) retained matches. Result pages read metadata only."
+        }
+    }
+    func reloadSearchResults() {
+        perform { model, _ in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let recovered = await model.reconcileSearch(lease)
+            model.notice = recovered ? "Reloaded the accepted search without rescanning source."
+                : "The accepted search is unavailable. Saved members and documentation links remain available independently."
+        }
+    }
+    private func reconcileSearch(_ lease: AtlasSavedSession) async -> Bool {
+        guard !closed, session === lease, let previous = info else { return false }
+        let flag = AtlasSearchCancellation()
+        do {
+            let current = try AtlasSavedInfo.decode(await run(lease, .info, flag: flag),
+                handle: lease.handle, expectedPath: previous.path.bytes, identity: previous.identity)
+            guard !closed, session === lease else { return false }
+            info = current; queryGeneration = current.queryGeneration
+            guard let generation = current.queryGeneration else { searchPage = nil; return true }
+            lastQueryAttempt = max(lastQueryAttempt, generation)
+            if searchPage?.generation == generation && searchPage?.identity == current.identity { return true }
+            let accepted = try AtlasSavedSearchPage.decode(await run(lease,
+                .results(generation: generation, start: 0, limit: 64), flag: flag),
+                identity: current.identity, generation: generation, needle: nil, start: 0, limit: 64)
+            guard !closed, session === lease else { return false }
+            searchPage = accepted; return true
+        } catch {
+            queryGeneration = nil; searchPage = nil
+            return false
+        }
+    }
+
+    func openHit(_ hit: AtlasSavedHit, from page: AtlasSavedSearchPage, readerTransport: AtlasReaderTransport,
+        search: AtlasReaderSearchTransport? = nil, outline: AtlasReaderOutlineTransport? = nil,
+        document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasSavedReaderCapture {
+        guard searchIsCurrent, let accepted = searchPage, info?.identity == page.identity,
+              accepted.identity == page.identity, queryGeneration == page.generation, accepted.generation == page.generation,
+              accepted.start == page.start, accepted.needle.utf8.elementsEqual(page.needle.utf8),
+              page.hits.contains(where: { $0.matches(hit) }),
+              accepted.hits.contains(where: { $0.matches(hit) }) else { throw AtlasSavedError.invalidInput }
+        return try await openReader(saved: page.identity, ordinal: hit.member, expected: nil,
+            origin: .hit(generation: page.generation, needle: page.needle, hit: hit),
+            readerTransport: readerTransport, search: search, outline: outline, document: document)
+    }
+
     func openMember(_ member: AtlasSavedMember, from identity: AtlasSavedIdentity, readerTransport: AtlasReaderTransport,
         search: AtlasReaderSearchTransport? = nil, outline: AtlasReaderOutlineTransport? = nil,
         document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasSavedReaderCapture {
@@ -242,14 +361,23 @@ private final class AtlasSavedSession: @unchecked Sendable {
                         }
                     }
                 }
+                let contextStart: UInt64
+                if case .hit(_, _, let hit) = origin {
+                    guard member.id == hit.member, member.file == hit.file, member.file == hit.revision,
+                          member.path.bytes == hit.path.bytes, member.digest == hit.digest,
+                          hit.start < hit.end, hit.end <= member.observedBytes else { throw AtlasSavedError.invalidResponse }
+                    contextStart = hit.start > 132 ? hit.start - 132 : 0
+                } else { contextStart = 0 }
                 let receipt = AtlasSavedReaderReceiptBox()
-                try await reader.openRetained(pathBytes: member.path.bytes, offset: 0, registryDomain: domain) { destination in
+                try await reader.openRetained(pathBytes: member.path.bytes, offset: contextStart, registryDomain: domain) { destination in
                     guard !flag.isCanceled else { throw AtlasSavedError.canceled }
                     let request: AtlasSavedRequest
                     switch origin {
                     case .member: request = .openMember(reader: destination, member: member.id)
                     case .relationship(let generation, let link, let side):
                         request = .openRelationship(reader: destination, generation: generation, link: link.id, side: side)
+                    case .hit(let generation, _, let hit):
+                        request = .openHit(reader: destination, generation: generation, hit: hit.id)
                     }
                     return try withExtendedLifetime(lease) {
                         let accepted = try AtlasSavedReaderReceipt.decode(lease.transport.run(lease.handle, request),
@@ -262,9 +390,11 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 guard !closed, !flag.isCanceled, session === lease, self.info?.identity == info.identity else {
                     throw AtlasSavedError.canceled
                 }
-                try receipt.accepted().validateInitialPage(reader.page)
+                let accepted = try receipt.accepted()
+                try accepted.validateInitialPage(reader.page)
                 notice = "Opened the exact verified saved member. The independent reader remains usable after this archive is closed."
-                return AtlasSavedReaderCapture(reader: reader, owner: info.identity.owner, member: member, origin: origin)
+                return AtlasSavedReaderCapture(reader: reader, owner: info.identity.owner, member: member, origin: origin,
+                    match: accepted.match)
             }, onCancel: { flag.cancel(); lease.cancel() })
         } catch {
             // A lost/canceled receipt may have initialized the destination. It
@@ -293,6 +423,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     private func clearMetadata() {
         info = nil; members = nil; selectedMember = nil; relationships = nil; relationshipGeneration = nil
         direction = .all; lastRelationshipAttempt = 0; memberOffsetInput = "0"
+        searchPage = nil; queryGeneration = nil; lastQueryAttempt = 0; searchInput = ""
     }
     private func run(_ lease: AtlasSavedSession, _ request: AtlasSavedRequest,
         flag: AtlasSearchCancellation) async throws -> String? {
@@ -316,6 +447,11 @@ private final class AtlasSavedSession: @unchecked Sendable {
         let previous = max(lastRelationshipAttempt, relationshipGeneration ?? 0)
         guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
         lastRelationshipAttempt = previous + 1; return lastRelationshipAttempt
+    }
+    private func nextQueryGeneration() throws -> UInt64 {
+        let previous = max(lastQueryAttempt, queryGeneration ?? 0)
+        guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
+        lastQueryAttempt = previous + 1; return lastQueryAttempt
     }
     private static func message(_ error: Error) -> String {
         if let error = error as? AtlasSavedError { return error.message }
