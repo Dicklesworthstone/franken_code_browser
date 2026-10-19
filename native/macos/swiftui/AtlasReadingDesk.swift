@@ -284,6 +284,7 @@ enum AtlasDeskRequest: Sendable {
     case apply(revision: UInt64, attempt: UInt64, kind: UInt64, subject: UInt64, start: UInt64, end: UInt64, label: String)
     case window(revision: UInt64, pane: UInt64, offset: UInt64)
     case keep(revision: UInt64, attempt: UInt64, reader: UInt64, start: UInt64, end: UInt64)
+    case openReader(revision: UInt64, pane: UInt64, destination: UInt64)
     case restore(revision: UInt64, attempt: UInt64, path: String)
     case save(revision: UInt64, path: String, sourceBytes: UInt64)
 }

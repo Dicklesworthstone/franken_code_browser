@@ -191,6 +191,64 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
         }
     }
 
+    /// Serialize export against desk mutations and hold its source owner until
+    /// the destination reader's worker drains. The callback receives immutable
+    /// state and an initializer, never a live path or an unleased source handle.
+    func withRetainedPane<Value: Sendable>(_ paneID: UInt64, destinationDomain: UUID,
+        prepare: @MainActor (AtlasDeskState, AtlasDeskPane,
+            @escaping @Sendable (UInt64) throws -> String?) async throws -> Value) async throws -> Value {
+        guard canOperate, readerDomain == destinationDomain else { throw AtlasReadingDeskError.unavailable }
+        let cancellation = AtlasDeskCancellation()
+        operationCancellation = cancellation
+        busy = true
+        defer {
+            busy = false; operationCancellation = nil
+            if closed { releaseSession() }
+        }
+        do {
+            let lease = try await ensureStarted(cancellation)
+            guard let original = state, let pane = original.panes.first(where: { $0.id == paneID }) else {
+                throw AtlasReadingDeskError.unavailable
+            }
+            let transport = transport
+            let result = try await withTaskCancellationHandler(operation: {
+                try await prepare(original, pane) { destination in
+                    try cancellation.check()
+                    return withExtendedLifetime(lease) {
+                        transport.run(lease.handle, .openReader(revision: original.revision,
+                            pane: pane.id, destination: destination))
+                    }
+                }
+            }, onCancel: { cancellation.cancel(); _ = transport.cancel(lease.handle) })
+            try cancellation.check()
+            try Task.checkCancellation()
+            guard !closed, state?.owner == original.owner, state?.revision == original.revision,
+                  state?.panes.first(where: { $0.id == paneID })?.location == pane.location else {
+                throw AtlasReadingDeskError.canceled
+            }
+            notice = "Opened an independent reader from the desk’s exact capture. Its saved range remains unchanged until you keep a new page."
+            return result
+        } catch {
+            notice = (error as? AtlasReadingDeskError)?.message ?? "The retained source reader could not be opened."
+            throw error
+        }
+    }
+
+    /// Update only the original retained pane. A checkpoint replacement or a
+    /// closed pane cannot redirect an older reader's byte offsets into new data.
+    @discardableResult func updateRetainedLocation(owner: UInt64, pane: UInt64, file: UInt64,
+        sourceRevision: UInt64, start: UInt64, end: UInt64) -> Bool {
+        guard canOperate, let state, state.owner == owner,
+              let target = state.panes.first(where: { $0.id == pane }),
+              target.location.file == file, target.location.revision == sourceRevision,
+              start <= end, end <= 4 * 1024 * 1024 else {
+            notice = "The original retained pane is no longer current. This independent reader remains available."
+            return false
+        }
+        apply(kind: 2, subject: pane, start: start, end: end)
+        return true
+    }
+
     func cancel() {
         guard busy else { return }
         operationCancellation?.cancel()

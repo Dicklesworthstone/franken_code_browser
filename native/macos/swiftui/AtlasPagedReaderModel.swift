@@ -59,6 +59,7 @@ import Observation
     @ObservationIgnored private var pinOperation: UUID?
     @ObservationIgnored private var pendingPin: AtlasPagedReaderModel?
     private var forkedCapture = false
+    private var retainedOnly = false
 
     init(transport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
          outline: AtlasReaderOutlineTransport? = nil,
@@ -133,6 +134,8 @@ import Observation
             messages.append("Source imported from the retained workspace search; no live-file reread.")
         } else if suppliedSource != nil {
             messages.append("Source imported from the complete text already displayed; no live-file reread. Refresh from disk explicitly opens current bytes.")
+        } else if retainedOnly {
+            messages.append("Exact retained source from the reading desk. Its saved label grants no disk access; navigation, Find, Outline and Markdown use this independent capture.")
         }
         if let label = symbolSelectionLabel { messages.append("\(label); heuristic candidate, not semantic resolution.") }
         if matchHex != nil { messages.append("Selection belongs to this retained file query, not a workspace search capture.") }
@@ -173,6 +176,7 @@ import Observation
             child.refreshInput = allowedRefresh
             child.refreshAccessLease = accessLease
             child.forkedCapture = true
+            child.retainedOnly = retainedOnly
             child.install(copied, request: .window(offset: copied.start,
                 bytes: max(4, min(AtlasReaderLimits.maximumPageBytes, copied.end - copied.start))))
             child.notice = "Pinned the exact captured source at this byte window. Find, Outline and Markdown use independent selections."
@@ -252,6 +256,34 @@ import Observation
                 }
                 fail(error, ticket: ticket)
             }
+        }
+    }
+
+    /// Initialize a new model from retained service data without creating a
+    /// live-path refresh capability. The host owns the ready model on success;
+    /// ordinary view appearance must not call open(root:path:) afterward.
+    func openRetained(label: String, offset: UInt64, registryDomain: UUID,
+        initialize: @escaping @Sendable (UInt64) throws -> String?) async throws {
+        guard page == nil, !busy, capturedTarget == nil, suppliedSource == nil else {
+            throw AtlasReaderError.unavailable
+        }
+        let ticket = begin()
+        notice = "Opening the reading desk’s exact saved capture…"
+        do {
+            let opened = try await coordinator.openRetained(label: label, offset: offset,
+                registryDomain: registryDomain, initialize: initialize)
+            try Task.checkCancellation()
+            guard operation == ticket else { throw AtlasReaderError.canceled }
+            retainedOnly = true
+            install(opened, request: .window(offset: offset, bytes: AtlasReaderLimits.pageBytes))
+            finish(ticket)
+            notice = "Opened the exact retained source at its saved byte location. Keep a page in the desk explicitly to update its saved position."
+        } catch {
+            if operation == ticket {
+                coordinator.close()
+                fail(error, ticket: ticket)
+            }
+            throw error
         }
     }
 
@@ -486,6 +518,7 @@ import Observation
         coordinator.close()
         refreshInput = nil; refreshAccessLease = nil
         isRefreshing = false; refreshedFromDisk = false; forkedCapture = false
+        retainedOnly = false
         page = nil; source = nil; history.reset()
         findReport = nil; selectedHitIndex = nil; selectedRange = nil
         queryWork = false; outlineWork = false

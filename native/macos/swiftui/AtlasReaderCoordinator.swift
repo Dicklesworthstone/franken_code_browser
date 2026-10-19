@@ -144,6 +144,50 @@ private final class AtlasReaderSession: @unchecked Sendable {
     var supportsComparison: Bool { session?.transport.comparison != nil && info?.captureSHA256 != nil }
     var retainedRegistryDomain: UUID? { session?.transport.comparison?.domain }
 
+    /// Open a caller-authorized retained capture into an EMPTY destination in
+    /// the same native registry. The initializer runs in the existing reader
+    /// worker lane; it never invokes transport.open or supplies a native grant.
+    /// Its closure retains the exporting service until the foreign call drains.
+    func openRetained(label: String, offset: UInt64, registryDomain: UUID,
+        initialize: @escaping @Sendable (UInt64) throws -> String?) async throws -> AtlasReaderPage {
+        try Task.checkCancellation()
+        guard session == nil, pendingSession == nil, info == nil,
+              transport.comparison?.domain == registryDomain,
+              !label.isEmpty, label.utf8.count <= 16_384,
+              offset <= AtlasReaderLimits.captureBytes else { throw AtlasReaderError.unavailable }
+        let next = try AtlasReaderSession(transport: transport, accessLease: nil)
+        cancel()
+        pendingSession = next
+        let ticket = UUID(), flag = AtlasSearchCancellation()
+        operation = ticket; cancellation = flag
+        do {
+            let result = try await withTaskCancellationHandler(operation: {
+                try await io.perform(cancellation: flag, keepingAlive: [next]) {
+                    let info = try AtlasReaderInfo.decodeRetainedInitialization(
+                        initialize(next.handle), handle: next.handle, label: label)
+                    guard !flag.isCanceled else { throw AtlasReaderError.canceled }
+                    let request = AtlasReaderRequest.window(offset: offset, bytes: AtlasReaderLimits.pageBytes)
+                    try request.validate(capturedBytes: info.identity.capturedBytes)
+                    let page = try AtlasReaderPage.decode(
+                        next.transport.window(next.handle, offset, request.byteLimit), info: info, request: request)
+                    return (info, page)
+                }
+            }, onCancel: { flag.cancel(); next.cancel() })
+            try Task.checkCancellation()
+            guard pendingSession === next, operation == ticket, !flag.isCanceled else {
+                throw AtlasReaderError.canceled
+            }
+            session = next; info = result.0
+            pendingSession = nil; cancellation = nil; operation = UUID()
+            return result.1
+        } catch {
+            if pendingSession === next, operation == ticket {
+                next.cancel(); pendingSession = nil; cancellation = nil; operation = UUID()
+            }
+            throw Self.readerError(error)
+        }
+    }
+
     /// Explicit transfer to another native service through the existing worker
     /// lane. The source handle and its grant stay alive until the callback has
     /// drained. A receiver with effects reconciles its outcome after cancellation;

@@ -19,6 +19,11 @@ private final class AtlasDeskFileAccess {
     @Environment(\.dismiss) private var dismiss
     @State private var confirmRestore = false
     @State private var panelNotice = ""
+    @State private var readerCapture: AtlasDeskReaderCapture?
+    @State private var readerTask: Task<Void, Never>?
+    @State private var pins = AtlasPinnedReaders<AtlasPagedReaderModel>(
+        canFork: { $0.canPin }, fork: { try await $0.fork() }, retire: { $0.close() },
+        failureMessage: { ($0 as? AtlasReaderError)?.message ?? "The retained source could not be pinned." })
 
     var body: some View {
         VStack(spacing: 10) {
@@ -30,7 +35,7 @@ private final class AtlasDeskFileAccess {
                     if model.hasUnsavedContents { confirmRestore = true } else { chooseCheckpoint() }
                 }.disabled(!model.canOperate)
                 Button("Save new checkpoint…", action: saveCheckpoint).disabled(!model.canOperate || !model.hasUnsavedContents)
-                Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Done") { readerTask?.cancel(); pins.closeAll(); dismiss() }.keyboardShortcut(.cancelAction)
             }
             HSplitView {
                 sidebar.frame(minWidth: 240, idealWidth: 270, maxWidth: 360)
@@ -48,6 +53,8 @@ private final class AtlasDeskFileAccess {
         }
         .padding(16).frame(minWidth: 900, idealWidth: 1150, minHeight: 600, idealHeight: 740)
         .onAppear { model.start() }
+        .sheet(item: $readerCapture) { capture in AtlasDeskReaderView(desk: model, capture: capture, pins: pins) }
+        .onDisappear { readerTask?.cancel(); readerCapture?.reader.close(); pins.closeAll() }
         .alert("Replace this reading desk?", isPresented: $confirmRestore) {
             Button("Choose checkpoint…", action: chooseCheckpoint)
             Button("Cancel", role: .cancel) { }
@@ -117,7 +124,13 @@ private final class AtlasDeskFileAccess {
     private var reader: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let pane = model.state?.active {
-                Text(pane.label).font(.headline).lineLimit(2).textSelection(.enabled)
+                HStack {
+                    Text(pane.label).font(.headline).lineLimit(2).textSelection(.enabled)
+                    Spacer()
+                    Button("Open full reader") { openReader(pane.id) }
+                        .disabled(!model.canOperate || readerTask != nil || model.readerDomain == nil)
+                        .help("Read this exact retained capture with Find, Outline, Markdown, Split preview, copying, pinning and comparison. Saved labels never reopen disk files.")
+                }
                 HStack {
                     Text("Start byte").font(.caption)
                     TextField("0", text: $model.offsetInput).frame(width: 95).onSubmit { model.goToOffset() }
@@ -153,6 +166,24 @@ private final class AtlasDeskFileAccess {
                     description: Text("Use Keep in reading desk from a retained reader, capture a file explicitly, or open a saved checkpoint."))
             }
         }.padding(.leading, 12)
+    }
+    private func openReader(_ pane: UInt64) {
+        guard model.canOperate, readerTask == nil else { return }
+        panelNotice = ""
+        readerTask = Task {
+            do {
+                let opened = try await model.openReader(pane: pane, transport: .native,
+                    search: .native, outline: .native, document: .native)
+                if Task.isCancelled { opened.reader.close() }
+                else { readerCapture = opened }
+            } catch {
+                if !Task.isCancelled {
+                    panelNotice = (error as? AtlasReaderError)?.message
+                        ?? (error as? AtlasReadingDeskError)?.message ?? "The retained source could not be opened."
+                }
+            }
+            readerTask = nil
+        }
     }
     private func chooseSource() {
         let panel = NSOpenPanel()

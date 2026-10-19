@@ -9,6 +9,8 @@ import Foundation
 @_silgen_name("fcb_desk_window") private func fcb_desk_window(_ h: UInt64, _ revision: UInt64, _ pane: UInt64, _ offset: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_import_reader") private func fcb_desk_import_reader(_ h: UInt64, _ revision: UInt64, _ attempt: UInt64,
     _ reader: UInt64, _ start: UInt64, _ end: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_desk_open_reader") private func fcb_desk_open_reader(_ h: UInt64, _ revision: UInt64,
+    _ pane: UInt64, _ destination: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_restore") private func fcb_desk_restore(_ h: UInt64, _ revision: UInt64, _ attempt: UInt64, _ path: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_save") private func fcb_desk_save(_ h: UInt64, _ revision: UInt64, _ path: UnsafePointer<CChar>?, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_cancel") private func fcb_desk_cancel(_ h: UInt64) -> UInt8
@@ -33,6 +35,8 @@ extension AtlasReadingDeskTransport {
             return take(fcb_desk_window(handle, revision, pane, offset, 64 * 1024))
         case .keep(let revision, let attempt, let reader, let start, let end):
             return take(fcb_desk_import_reader(handle, revision, attempt, reader, start, end))
+        case .openReader(let revision, let pane, let destination):
+            return take(fcb_desk_open_reader(handle, revision, pane, destination))
         case .restore(let revision, let attempt, let path):
             guard pathAllowed(path) else { return nil }
             return path.withCString { take(fcb_desk_restore(handle, revision, attempt, $0)) }

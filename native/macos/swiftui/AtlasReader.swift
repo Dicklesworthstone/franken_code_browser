@@ -128,6 +128,40 @@ struct AtlasReaderInfo: Sendable {
         catch { throw AtlasReaderError.invalidResponse }
     }
 
+    /// A capture-only initializer cannot inherit query authority or claim a
+    /// filesystem observation. Its label is provenance, including raw controls,
+    /// and is never interpreted as a path to open or refresh.
+    static func decodeRetainedInitialization(_ json: String?, handle: UInt64, label: String) throws -> Self {
+        let info = try decode(json, handle: handle, path: label)
+        guard info.origin == "host-supplied", info.captureSHA256 != nil else {
+            throw AtlasReaderError.invalidResponse
+        }
+        let data = try AtlasReaderWire.admit(json, handle: handle)
+        do { _ = try JSONDecoder().decode(RetainedInitialization.self, from: data) }
+        catch { throw AtlasReaderError.invalidResponse }
+        return info
+    }
+
+    private struct RetainedInitialization: Decodable {
+        enum CodingKeys: CodingKey {
+            case initial_source_bytes_read, initial_read_calls,
+                 accepted_query_generation, accepted_outline_generation, accepted_document_generation
+        }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            guard try c.decode(String.self, forKey: .initial_source_bytes_read) == "0",
+                  try c.decode(String.self, forKey: .initial_read_calls) == "0" else {
+                throw AtlasReaderError.invalidResponse
+            }
+            for key in [CodingKeys.accepted_query_generation, .accepted_outline_generation,
+                        .accepted_document_generation] {
+                guard c.contains(key), try c.decodeNil(forKey: key) else {
+                    throw AtlasReaderError.invalidResponse
+                }
+            }
+        }
+    }
+
     private struct Wire: Decodable {
         let header: AtlasReaderWire.Header
         let capture_origin: String

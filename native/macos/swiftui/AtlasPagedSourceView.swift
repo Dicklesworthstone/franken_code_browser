@@ -38,10 +38,11 @@ import AppKit
 
     /// A pin is already open and owned by the enclosing native workspace.
     /// Temporary tab/view disappearance neither reopens nor closes its capture.
-    init(model: AtlasPagedReaderModel, canKeep: Bool = false,
+    init(model: AtlasPagedReaderModel, canPin: Bool = false, pin: ((AtlasPagedReaderModel) -> Void)? = nil,
+         canKeep: Bool = false,
          keep: ((AtlasPagedReaderModel) -> Void)? = nil) {
         root = ""; path = ""; accessLease = nil
-        ownsModel = false; canPin = false; pin = nil
+        ownsModel = false; self.canPin = canPin; self.pin = pin
         self.canKeep = canKeep; self.keep = keep
         _model = State(initialValue: model)
     }

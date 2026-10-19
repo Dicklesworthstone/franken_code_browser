@@ -80,6 +80,8 @@ private final class Fixture: @unchecked Sendable {
                 return state()
             case .restore:
                 return error("DESK_CHECKPOINT_INTEGRITY")
+            case .openReader:
+                return error("DESK_READER_TRANSFER_NOT_IN_THIS_FIXTURE")
             case .window(let expected, let pane, let offset):
                 guard expected == revision, pane == 1, offset <= UInt64(text.utf8.count) else { return error("DESK_INVALID_LOCATION") }
                 var w = header("window")
