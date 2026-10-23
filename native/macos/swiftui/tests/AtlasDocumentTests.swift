@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import AppKit
 
 @main struct AtlasDocumentTests {
     static func capture(_ text: String, role: String = "plain") -> AtlasHighlightCapture {
@@ -24,6 +25,7 @@ import CoreGraphics
         return result
     }
     static func main() {
+        sharedReaderStylesPreserveExactText()
         let source = "fn visible_without_selection() {\n    let value = 123;\n}\n"
         let glyphs = pixels(source)
         let blank = pixels("\n\n\n")
@@ -58,5 +60,37 @@ import CoreGraphics
             runs: [.init(start: "1", length: "2", role: "keyword")])
         precondition(AtlasDocument(path: "bad", capture: bad) == nil, "invalid highlight ranges refuse")
         print("AtlasDocument: actual glyph, whitespace, late-line and bounded raster checks passed")
+    }
+
+    static func sharedReaderStylesPreserveExactText() {
+        let chunks: [(String, String)] = [
+            ("\u{feff}/*😀 e\u{301}\r\n*/", "comment"), ("\t", "plain"),
+            ("fn", "keyword"), (" ", "plain"), ("call", "function"), ("(", "punctuation"),
+            ("Foo", "type"), (")", "punctuation"), ("=", "operator"),
+            ("42", "number"), ("\"s\"", "string"), ("\0\r", "plain")
+        ]
+        let text = chunks.map { $0.0 }.joined()
+        var cursor = 0
+        let runs = chunks.map { chunk -> (NSRange, String) in
+            defer { cursor += chunk.0.utf16.count }
+            return (NSRange(location: cursor, length: chunk.0.utf16.count), chunk.1)
+        }
+        let full = AtlasHighlightCapture(schema: "fcb.source-document/1", text: text,
+            runs: runs.map { .init(start: String($0.0.location), length: String($0.0.length), role: $0.1) })
+        let wholeStyle = AtlasDocument.style(full)
+        let pageStyle = AtlasDocument.style(text: text, runs: runs)
+        precondition(pageStyle.string.utf8.elementsEqual(text.utf8), "page styling changed source bytes")
+        precondition(pageStyle.isEqual(to: wholeStyle), "whole-source and page readers disagree on shared styling")
+        for (range, role) in runs {
+            precondition(pageStyle.attribute(.foregroundColor, at: range.location, effectiveRange: nil) as? NSColor
+                == Monokai.color(role), "page token did not use the shared Monokai role")
+        }
+        let plain = AtlasDocument.style(text: text, runs: [])
+        precondition(plain.string.utf8.elementsEqual(text.utf8), "plain fallback changed source bytes")
+        precondition(plain.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor == Monokai.color("plain"),
+                     "plain fallback did not retain the reader palette")
+        let paragraph = pageStyle.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        precondition(paragraph?.defaultTabInterval == 8 * 7.83, "page tabs diverged from whole-source reader")
+        precondition(AtlasDocument.style(text: "", runs: []).length == 0, "empty page acquired decoration")
     }
 }

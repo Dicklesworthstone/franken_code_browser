@@ -14,8 +14,9 @@ import Foundation
         partialComposedCharactersAreNotExpanded()
         duplicateReadersKeepIndependentSelections()
         styleMismatchCannotRewriteSource()
+        themedReaderKeepsSelectionAndInstalledStyles()
         emptyAndOversizedSourcesHaveDistinctOutcomes()
-        print("AtlasSourceReader: 9 native selection and source-identity scenarios passed")
+        print("AtlasSourceReader: 10 native selection, presentation and source-identity scenarios passed")
     }
     static func present(_ reader: AtlasSourceReaderController, _ source: AtlasSource,
                         _ range: NSRange?, navigation: UUID = UUID()) -> Bool {
@@ -113,10 +114,43 @@ import Foundation
     static func styleMismatchCannotRewriteSource() {
         let source = AtlasSource(path: "canonical", text: "e\u{301}\r\n")
         let reader = AtlasSourceReaderController()
-        precondition(reader.update(source: source, navigation: UUID(), selection: nil) {
+        precondition(reader.update(source: source, navigation: UUID(), selection: nil,
+            backgroundColor: .black, foregroundColor: .white) {
             NSAttributedString(string: "é\n")
         })
         precondition(reader.textView.string.utf8.elementsEqual(source.text.utf8))
+        precondition(reader.textView.backgroundColor == .black && reader.scrollView.backgroundColor == .black)
+        precondition(reader.textView.textStorage?.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor == .white,
+                     "exact-text fallback lost the admitted foreground color")
+    }
+    static func themedReaderKeepsSelectionAndInstalledStyles() {
+        let source = AtlasSource(path: "page.rs", text: "fn call() { /*😀*/ }\r\n")
+        let reader = AtlasSourceReaderController(), navigation = UUID()
+        let selected = (source.text as NSString).range(of: "😀")
+        var installations = 0
+        func update() {
+            precondition(reader.update(source: source, navigation: navigation, selection: nil,
+                backgroundColor: .black, foregroundColor: .white) {
+                installations += 1
+                let styled = NSMutableAttributedString(string: source.text, attributes: [
+                    .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
+                    .foregroundColor: NSColor.white
+                ])
+                styled.addAttribute(.foregroundColor, value: NSColor.systemPink, range: NSRange(location: 0, length: 2))
+                return styled
+            })
+        }
+        update()
+        reader.textView.setSelectedRange(selected)
+        for _ in 0..<20 { update() }
+        precondition(installations == 1 && reader.textView.selectedRange() == selected,
+                     "presentation updates reinstalled source or disturbed manual selection")
+        precondition((reader.textView.string as NSString).substring(with: selected) == "😀",
+                     "selection/copy no longer addresses exact source")
+        precondition(reader.textView.string.utf8.elementsEqual(source.text.utf8))
+        precondition(reader.textView.backgroundColor == .black && reader.scrollView.backgroundColor == .black)
+        precondition(reader.textView.textStorage?.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor == .systemPink,
+                     "presentation colors replaced token attributes")
     }
     static func emptyAndOversizedSourcesHaveDistinctOutcomes() {
         let source = AtlasSource(path: "empty", text: "")

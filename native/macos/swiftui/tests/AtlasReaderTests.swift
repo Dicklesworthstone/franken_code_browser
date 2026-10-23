@@ -40,6 +40,13 @@ private func window(owner: UInt64 = 2, path: String = "/project/file", raw: [UIn
     wire["selection"] = NSNull()
     return wire
 }
+private func highlight(_ runs: [(Int, Int, String)] = [], state: String = "highlighted",
+                       language: String = "rust") -> [String: Any] {
+    ["state": state, "language": language, "coordinate_space": "window-utf16",
+     "source_context": "complete-capture", "runs": runs.map {
+         ["start": String($0.0), "length": String($0.1), "role": $0.2]
+     }]
+}
 
 private final class Lease {}
 private final class Driver: @unchecked Sendable {
@@ -83,7 +90,10 @@ private final class Driver: @unchecked Sendable {
         }, window: { [self] owner, offset, bytes in
             precondition(!Thread.isMainThread)
             record("window:\(owner):\(offset)"); pause(open: false)
-            return json(window(owner: owner, start: offset, end: min(13, offset + bytes)))
+            var wire = window(owner: owner, start: offset, end: min(13, offset + bytes))
+            let text = wire["text"] as! String
+            wire["highlight"] = highlight(text.isEmpty ? [] : [(0, text.utf16.count, "comment")])
+            return json(wire)
         }, lines: { [self] owner, first, _, _ in
             precondition(!Thread.isMainThread)
             record("lines:\(owner):\(first)")
@@ -119,6 +129,118 @@ private final class Driver: @unchecked Sendable {
         var satisfied = condition()
         while !satisfied, Date() < deadline { pump(); satisfied = condition() }
         check(satisfied, message)
+    }
+    @MainActor private static func retainedHighlighting() throws {
+        let chunks: [(String, String)] = [
+            ("/*😀 e\u{301}\r\n*/", "comment"), (" ", "plain"), ("let", "keyword"),
+            (" n", "plain"), (":", "punctuation"), (" ", "plain"), ("Foo", "type"),
+            (" ", "plain"), ("=", "operator"), (" ", "plain"), ("call", "function"),
+            ("(", "punctuation"), ("42", "number"), (", ", "plain"), ("\"s\"", "string"),
+            (");", "punctuation"), ("\u{feff}\0", "plain")
+        ]
+        let text = chunks.map { $0.0 }.joined()
+        var cursor = 0
+        let runs = chunks.map { chunk -> (Int, Int, String) in
+            defer { cursor += chunk.0.utf16.count }
+            return (cursor, chunk.0.utf16.count, chunk.1)
+        }
+        let raw: [UInt8] = [0xef, 0xbb, 0xbf] + Array(text.utf8)
+        let info = try AtlasReaderInfo.decode(json(header(length: UInt64(raw.count))), handle: 2, path: "/project/file")
+        let base = window(raw: raw, text: text)
+        func decode(_ metadata: [String: Any]) throws -> AtlasReaderPage {
+            var wire = base; wire["highlight"] = metadata
+            return try AtlasReaderPage.decode(json(wire), info: info, request: .firstPage)
+        }
+        let page = try decode(highlight(runs))
+        check(page.highlight?.state == .highlighted && page.highlight?.language == "rust", "highlight status/language lost")
+        check(page.text.utf8.elementsEqual(text.utf8) && page.originalHex == hex(raw),
+              "highlighting rewrote BOM, CRLF, NUL, embedded FEFF, emoji or decomposed source")
+        check(page.highlight?.runs.map(\.range) == runs.map { NSRange(location: $0.0, length: $0.1) },
+              "page-local UTF-16 spans changed")
+        check(Set(page.highlight!.runs.map(\.role)) == Set(AtlasReaderHighlight.Role.allCases), "shared token roles lost")
+        let legacy = try AtlasReaderPage.decode(json(base), info: info, request: .firstPage)
+        var nullable = base; nullable["highlight"] = NSNull()
+        let nullPage = try AtlasReaderPage.decode(json(nullable), info: info, request: .firstPage)
+        check(legacy.highlight == nil && nullPage.highlight == nil, "legacy plain pages rejected")
+        for state in AtlasReaderHighlight.State.allCases where state != .highlighted {
+            let fallback = try decode(highlight(state: state.rawValue, language: state == .plain ? "plain" : "rust"))
+            check(fallback.highlight?.state == state && fallback.highlight?.runs.isEmpty == true
+                && fallback.text.utf8.elementsEqual(text.utf8) && fallback.originalHex == hex(raw),
+                  "fallback state lost exact readable/copyable source: \(state)")
+            check(fallback.highlight?.summary.hasPrefix("Plain text;") == true, "fallback reason hidden")
+            rejects("fallback smuggled token runs") { _ = try decode(highlight(runs, state: state.rawValue)) }
+        }
+        for (key, value) in [("state", "unknown"), ("coordinate_space", "source-utf8"),
+                             ("source_context", "page-only"), ("language", "plain"),
+                             ("language", ""), ("language", "rust\n"),
+                             ("language", String(repeating: "a", count: 65))] {
+            var bad = highlight(runs); bad[key] = value
+            rejects("unverified highlight metadata accepted: \(key)") { _ = try decode(bad) }
+        }
+        for malformed in [[], [(1, text.utf16.count - 1, "plain")], [(0, 0, "plain")],
+                          [(0, text.utf16.count + 1, "plain")], [(0, text.utf16.count - 1, "plain")],
+                          [(0, text.utf16.count, "func")], [(0, 1, "plain"), (0, text.utf16.count - 1, "plain")]] {
+            rejects("gapped, overlapping, truncated, empty or unknown-role highlight accepted") {
+                _ = try decode(highlight(malformed))
+            }
+        }
+        for (start, length) in [("00", "1"), ("0", "01"), ("-1", "1"),
+                                ("0", "18446744073709551615")] {
+            var bad = highlight(); bad["runs"] = [["start": start, "length": length, "role": "plain"]]
+            rejects("noncanonical or overflowing highlight coordinate accepted") { _ = try decode(bad) }
+        }
+        var surrogate = highlight([(0, 3, "comment"), (3, text.utf16.count - 3, "plain")])
+        rejects("surrogate-splitting highlight accepted") { _ = try decode(surrogate) }
+        // Splitting a combining sequence does not change the source and is not
+        // a surrogate violation; syntax roles need not be grapheme boundaries.
+        let combining = (text as NSString).range(of: "e\u{301}").location + 1
+        surrogate = highlight([(0, combining, "comment"), (combining, text.utf16.count - combining, "plain")])
+        let composed = try decode(surrogate)
+        check(composed.text.utf8.elementsEqual(text.utf8), "highlighting normalized a composed character")
+        var foreign = base; foreign["highlight"] = highlight(runs); foreign["source_revision"] = "2"
+        rejects("valid highlights bypassed source identity") { _ = try AtlasReaderPage.decode(json(foreign), info: info, request: .firstPage) }
+
+        func standalone(_ source: String, raw: [UInt8]? = nil, encoding: String = "utf8",
+                        replacements: Bool = false, metadata: [String: Any]) throws -> AtlasReaderPage {
+            let bytes = raw ?? Array(source.utf8)
+            let identity = try AtlasReaderInfo.decode(json(header(length: UInt64(bytes.count), encoding: encoding)),
+                handle: 2, path: "/project/file")
+            var wire = window(raw: bytes, encoding: encoding, text: source)
+            wire["has_replacements"] = replacements; wire["highlight"] = metadata
+            return try AtlasReaderPage.decode(json(wire), info: identity, request: .firstPage)
+        }
+        let empty = try standalone("", metadata: highlight())
+        check(empty.highlight?.state == .highlighted && empty.highlight?.runs.isEmpty == true, "empty highlighted source fabricated tokens")
+        let genuineReplacement = try standalone("�", metadata: highlight([(0, 1, "string")]))
+        check(!genuineReplacement.hasReplacements && genuineReplacement.highlight?.state == .highlighted,
+              "genuine U+FFFD confused with decoding replacement")
+        for (source, bytes, encoding, replacements) in [("�", [UInt8(255)], "utf8", true),
+                                                        ("a", [UInt8(255), 254, 97, 0], "utf16le", false)] {
+            rejects("unsupported decoded source claimed exact UTF-8 highlighting") {
+                _ = try standalone(source, raw: bytes, encoding: encoding, replacements: replacements,
+                    metadata: highlight([(0, 1, "plain")]))
+            }
+            let fallback = try standalone(source, raw: bytes, encoding: encoding, replacements: replacements,
+                metadata: highlight(state: "unsupported_encoding"))
+            check(fallback.text == source && fallback.originalHex == hex(bytes), "encoding fallback changed capture")
+        }
+        let inner = "inside😀\r\n"
+        let complete = Array(("/*xx\n" + inner + "*/\n").utf8)
+        let innerInfo = try AtlasReaderInfo.decode(json(header(length: UInt64(complete.count))), handle: 2, path: "/project/file")
+        var innerWire = window(raw: complete, start: 5, end: UInt64(5 + inner.utf8.count))
+        innerWire["highlight"] = highlight([(0, inner.utf16.count, "comment")])
+        let innerPage = try AtlasReaderPage.decode(json(innerWire), info: innerInfo,
+            request: .window(offset: 5, bytes: UInt64(inner.utf8.count)))
+        check(innerPage.start == 5 && innerPage.highlight?.runs.first?.range.location == 0
+            && innerPage.highlight?.runs.first?.role == .comment, "page offset replaced shared lexical context")
+        let maximum = AtlasReaderHighlight.maximumRuns
+        let bounded = try standalone(String(repeating: "x", count: maximum),
+            metadata: highlight((0..<maximum).map { ($0, 1, "plain") }))
+        check(bounded.highlight?.runs.count == maximum, "maximum admitted run count refused")
+        rejects("oversized highlight array admitted") {
+            _ = try standalone(String(repeating: "x", count: maximum + 1),
+                metadata: highlight((0...maximum).map { ($0, 1, "plain") }))
+        }
     }
     @MainActor static func main() throws {
         // Lexical admission never trims/normalizes native identities or treats
@@ -192,6 +314,7 @@ private final class Driver: @unchecked Sendable {
         let replacementInfo = try AtlasReaderInfo.decode(json(header(length: 1)), handle: 2, path: input.fullPath)
         let repaired = try AtlasReaderPage.decode(json(replacement), info: replacementInfo, request: .firstPage)
         check(repaired.hasReplacements && repaired.originalHex == "ff", "replacement destroyed exact-byte copy")
+        try retainedHighlighting()
         let engineError = json(["schema": "fcb.reader-session/1", "owner": "2", "status": "error", "error": ["code": "READER_SESSION_MISSING_LINE"]])
         do {
             _ = try AtlasReaderPage.decode(engineError, info: info, request: .firstPage)
@@ -209,6 +332,8 @@ private final class Driver: @unchecked Sendable {
                 do {
                     let page = try await coordinator.open(input: input)
                     check(page.end == 13, "initial retained page")
+                    check(page.highlight?.runs.first?.range == NSRange(location: 0, length: 13),
+                          "worker/coordinator discarded accepted complete-capture highlight metadata")
                     let line = try await coordinator.read(.lines(first: 2, count: 1, bytes: 64))
                     check(line.text == "one\n", "retained line navigation")
                     do { _ = try await coordinator.read(.window(offset: UInt64.max, bytes: 64)); fatalError("bad offset admitted") }

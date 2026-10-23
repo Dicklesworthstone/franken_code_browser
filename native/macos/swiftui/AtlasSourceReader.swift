@@ -15,13 +15,16 @@ struct AtlasReaderSelection {
     let source: AtlasSource
     let navigation: UUID
     let selection: AtlasReaderSelection?
+    var backgroundColor: NSColor = .textBackgroundColor
+    var foregroundColor: NSColor = .textColor
     let styledSource: () -> NSAttributedString
 
     func makeCoordinator() -> AtlasSourceReaderController { AtlasSourceReaderController() }
     func makeNSView(context: Context) -> NSStackView { context.coordinator.view }
     func updateNSView(_ view: NSStackView, context: Context) {
         context.coordinator.update(source: source, navigation: navigation,
-                                   selection: selection, styledSource: styledSource)
+            selection: selection, backgroundColor: backgroundColor,
+            foregroundColor: foregroundColor, styledSource: styledSource)
     }
 }
 
@@ -84,8 +87,12 @@ struct AtlasReaderSelection {
 
     @discardableResult
     func update(source: AtlasSource, navigation: UUID, selection: AtlasReaderSelection?,
+                backgroundColor: NSColor = .textBackgroundColor, foregroundColor: NSColor = .textColor,
                 styledSource: () -> NSAttributedString) -> Bool {
         precondition(Thread.isMainThread)
+        if textView.backgroundColor != backgroundColor { textView.backgroundColor = backgroundColor }
+        if scrollView.backgroundColor != backgroundColor { scrollView.backgroundColor = backgroundColor }
+        textView.insertionPointColor = foregroundColor
         let changed = installedSource !== source
         if changed {
             // Same bound as the complete-source native opening route. Never
@@ -98,7 +105,7 @@ struct AtlasReaderSelection {
             let exact = styled.string.utf8.elementsEqual(source.text.utf8)
             let content = exact ? styled : NSAttributedString(string: source.text, attributes: [
                 .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
-                .foregroundColor: NSColor.textColor
+                .foregroundColor: foregroundColor
             ])
             textView.textStorage?.setAttributedString(content)
             installedSource = source

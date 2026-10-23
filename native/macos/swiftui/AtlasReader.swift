@@ -186,6 +186,112 @@ struct AtlasReaderInfo: Sendable {
     }
 }
 
+/// Styling is derived by the shared lexer from the complete retained capture,
+/// then clipped by the engine to this exact decoded page. Native code never
+/// starts a lexer at a page boundary or treats UTF-16 offsets as source bytes.
+struct AtlasReaderHighlight: Sendable {
+    static let maximumRuns = 8192
+
+    enum State: String, Decodable, Sendable, CaseIterable {
+        case highlighted, plain
+        case unsupportedEncoding = "unsupported_encoding"
+        case sourceLimit = "source_limit"
+        case admissionDenied = "admission_denied"
+        case invalidSpans = "invalid_spans"
+        case pageLimit = "page_limit"
+    }
+    enum Role: String, Sendable, CaseIterable, Hashable {
+        case plain, keyword, type, function, string, number, comment, `operator`, punctuation
+    }
+    struct Run: Equatable, Sendable {
+        let range: NSRange
+        let role: Role
+    }
+
+    let state: State
+    let language: String
+    let runs: [Run]
+
+    private init(state: State, language: String, runs: [Run]) {
+        self.state = state; self.language = language; self.runs = runs
+    }
+
+    var summary: String {
+        switch state {
+        case .highlighted: return "Syntax highlighting: \(language)."
+        case .plain: return "Plain text; syntax highlighting is unavailable for this language."
+        case .unsupportedEncoding: return "Plain text; syntax highlighting is unavailable for this source encoding."
+        case .sourceLimit: return "Plain text; source exceeds the syntax highlighting limit."
+        case .admissionDenied: return "Plain text; syntax highlighting memory is unavailable."
+        case .invalidSpans: return "Plain text; syntax highlighting could not be verified."
+        case .pageLimit: return "Plain text; this page exceeds the syntax highlighting detail limit."
+        }
+    }
+
+    struct Wire: Decodable {
+        let state: State
+        let language: String
+        private let runs: [Run]
+        private struct Run: Decodable { let start, length, role: String }
+        private enum CodingKeys: CodingKey { case state, language, coordinate_space, source_context, runs }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            state = try c.decode(State.self, forKey: .state)
+            language = try c.decode(String.self, forKey: .language)
+            guard !language.isEmpty, language.utf8.count <= 64,
+                  language.utf8.allSatisfy({ (97...122).contains($0) || (48...57).contains($0)
+                      || [35, 43, 45, 46, 95].contains($0) }),
+                  try c.decode(String.self, forKey: .coordinate_space) == "window-utf16",
+                  try c.decode(String.self, forKey: .source_context) == "complete-capture" else {
+                throw AtlasReaderError.invalidResponse
+            }
+            var array = try c.nestedUnkeyedContainer(forKey: .runs)
+            guard array.count.map({ $0 <= AtlasReaderHighlight.maximumRuns }) ?? true else {
+                throw AtlasReaderError.invalidResponse
+            }
+            var admitted: [Run] = []
+            admitted.reserveCapacity(array.count ?? 0)
+            while !array.isAtEnd {
+                guard admitted.count < AtlasReaderHighlight.maximumRuns else { throw AtlasReaderError.invalidResponse }
+                admitted.append(try array.decode(Run.self))
+            }
+            runs = admitted
+        }
+
+        func validated(text: String, encoding: String, hasReplacements: Bool) throws -> AtlasReaderHighlight {
+            guard state == .highlighted else {
+                guard runs.isEmpty else { throw AtlasReaderError.invalidResponse }
+                return AtlasReaderHighlight(state: state, language: language, runs: [])
+            }
+            guard encoding == "utf8", !hasReplacements, language != "plain" else {
+                throw AtlasReaderError.invalidResponse
+            }
+            let source = text as NSString
+            var cursor = 0
+            var admitted: [AtlasReaderHighlight.Run] = []
+            admitted.reserveCapacity(runs.count)
+            for run in runs {
+                guard let start = AtlasReaderWire.integer(run.start), start == UInt64(cursor),
+                      let length = AtlasReaderWire.integer(run.length), length > 0,
+                      length <= UInt64(source.length - cursor), let role = Role(rawValue: run.role) else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                let end = cursor + Int(length)
+                // A token may split a composed character, but never a UTF-16
+                // surrogate pair. NSString indexing keeps this check linear.
+                guard end == source.length || !(0xDC00...0xDFFF).contains(source.character(at: end)) else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                admitted.append(.init(range: NSRange(location: cursor, length: Int(length)), role: role))
+                cursor = end
+            }
+            guard cursor == source.length else { throw AtlasReaderError.invalidResponse }
+            return AtlasReaderHighlight(state: state, language: language, runs: admitted)
+        }
+    }
+}
+
 struct AtlasReaderPage: Sendable {
     let identity: AtlasReaderIdentity
     let start: UInt64
@@ -197,6 +303,8 @@ struct AtlasReaderPage: Sendable {
     let rangeLimited: Bool
     let boundariesAdjusted: Bool
     let hasReplacements: Bool
+    /// Absent in older transports. Missing metadata is an ordinary plain page.
+    let highlight: AtlasReaderHighlight?
     let selection: AtlasReaderHitSelection?
     let symbolSelection: AtlasReaderSymbolSelection?
     var nextOffset: UInt64? { end < identity.capturedBytes ? end : nil }
@@ -308,10 +416,13 @@ struct AtlasReaderPage: Sendable {
                 symbolSelection = AtlasReaderSymbolSelection(target: target, utf8Start: utf8.start,
                     utf8End: utf8.end, originalHex: selected.original_hex)
             }
+            let highlight = try wire.highlight?.validated(text: wire.text, encoding: identity.encoding,
+                                                         hasReplacements: wire.has_replacements)
             return Self(identity: identity, start: visible.start, end: visible.end,
                 text: wire.text, originalHex: wire.original_hex, firstPhysicalLine: firstLine,
                 rangeLimited: wire.range_limited, boundariesAdjusted: wire.boundaries_adjusted,
-                hasReplacements: wire.has_replacements, selection: selection, symbolSelection: symbolSelection)
+                hasReplacements: wire.has_replacements, highlight: highlight,
+                selection: selection, symbolSelection: symbolSelection)
         } catch let error as AtlasReaderError { throw error }
         catch { throw AtlasReaderError.invalidResponse }
     }
@@ -322,6 +433,7 @@ struct AtlasReaderPage: Sendable {
         let requested_original_range, visible_range: AtlasReaderWire.Range
         let range_limited, boundaries_adjusted, has_replacements: Bool
         let first_physical_line, next_offset: String?
+        let highlight: AtlasReaderHighlight.Wire?
         // A matching accepted search or outline request admits its own namespace.
         // Byte/line pages cannot borrow either selection authority.
         let selection: Selection?
@@ -335,7 +447,7 @@ struct AtlasReaderPage: Sendable {
         }
         enum CodingKeys: CodingKey {
             case text_kind, text, original_hex, requested_original_range, visible_range,
-                 range_limited, boundaries_adjusted, has_replacements, first_physical_line, next_offset, selection
+                 range_limited, boundaries_adjusted, has_replacements, first_physical_line, next_offset, selection, highlight
         }
         init(from decoder: Decoder) throws {
             header = try .init(from: decoder)
@@ -351,6 +463,7 @@ struct AtlasReaderPage: Sendable {
             first_physical_line = try c.decodeIfPresent(String.self, forKey: .first_physical_line)
             next_offset = try c.decodeIfPresent(String.self, forKey: .next_offset)
             selection = try c.decodeIfPresent(Selection.self, forKey: .selection)
+            highlight = try c.decodeIfPresent(AtlasReaderHighlight.Wire.self, forKey: .highlight)
         }
     }
 }

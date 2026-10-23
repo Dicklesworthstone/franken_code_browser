@@ -101,12 +101,18 @@ import AppKit
                 .padding(.horizontal, 10)
             }
             if let source = model.source {
+                // Equal page text can have different lexical context. Retain
+                // the accepted page/source pair for this presentation update.
+                let page = model.page
                 AtlasSourceReader(source: source, navigation: model.navigation,
-                    selection: model.nativeSelectionRange.map { AtlasReaderSelection(source: source, range: $0) }) {
-                    NSAttributedString(string: source.text, attributes: [
-                        .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
-                        .foregroundColor: NSColor.textColor
-                    ])
+                    selection: model.nativeSelectionRange.map { AtlasReaderSelection(source: source, range: $0) },
+                    backgroundColor: Monokai.background, foregroundColor: Monokai.color("plain")) {
+                    if let page, page.text.utf8.elementsEqual(source.text.utf8),
+                       let highlight = page.highlight {
+                        return AtlasDocument.style(text: source.text,
+                            runs: highlight.runs.map { ($0.range, $0.role.rawValue) })
+                    }
+                    return AtlasDocument.style(text: source.text, runs: [])
                 }
             } else {
                 VStack(spacing: 8) {

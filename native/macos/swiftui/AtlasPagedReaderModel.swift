@@ -126,6 +126,7 @@ import Observation
     var coverage: String {
         guard let page else { return "Retained capture limit: \(AtlasReaderLimits.captureBytes / 1024 / 1024) MiB. Oversized sources are refused, not truncated." }
         var messages = ["Logical page; layout is local to this window."]
+        if let highlight = page.highlight { messages.append(highlight.summary) }
         if refreshedFromDisk {
             messages.append("Explicitly refreshed disk capture; older search, outline and preview targets were retired. File observation is not an atomic filesystem snapshot.")
         } else if forkedCapture {

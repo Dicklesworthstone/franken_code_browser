@@ -153,14 +153,21 @@ final class AtlasDocument {
     lazy var styledSource: AttributedString = AttributedString(AtlasDocument.style(capture))
 
     static func style(_ capture: AtlasHighlightCapture) -> NSMutableAttributedString {
+        style(text: capture.text, runs: capture.validatedRuns() ?? [])
+    }
+
+    /// Both whole-source and retained-page readers use these presentation
+    /// attributes. Callers supply already validated, page-local UTF-16 runs;
+    /// styling never tokenizes, normalizes, decorates, or reads the source.
+    static func style(text: String, runs: [(NSRange, String)]) -> NSMutableAttributedString {
         let paragraph = NSMutableParagraphStyle()
         paragraph.defaultTabInterval = 8 * 7.83
-        let styled = NSMutableAttributedString(string: capture.text, attributes: [
+        let styled = NSMutableAttributedString(string: text, attributes: [
             .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
             .paragraphStyle: paragraph,
             .foregroundColor: Monokai.color("plain")
         ])
-        for (range, role) in capture.validatedRuns() ?? [] {
+        for (range, role) in runs {
             styled.addAttribute(.foregroundColor, value: Monokai.color(role), range: range)
         }
         return styled
