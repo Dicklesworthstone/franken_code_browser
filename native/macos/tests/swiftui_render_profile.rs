@@ -38,6 +38,7 @@ fn profile_native_rendering() {
                 "swiftui/AtlasMetalGlyphRenderer.swift",
                 "swiftui/AtlasMetalPresentation.swift",
                 "swiftui/AtlasRetainedView.swift",
+                "swiftui/AtlasProjectCatalog.swift",
                 "swiftui/AtlasParcelLayout.swift",
                 "swiftui/tests/AtlasMetalRasterTests.swift",
                 "swiftui/tests/AtlasMetalImageOracle.swift",

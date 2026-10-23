@@ -30,6 +30,17 @@ import CoreGraphics
         precondition(receipt.worldPoint(at: tap, revision: revision) == nil)
         receipt.record(revision: replacement, scale: .nan, offset: .zero)
         precondition(receipt.worldPoint(at: tap, revision: replacement) == nil, "invalid receipt fails closed")
+        let resident = UUID(), nextResident = UUID()
+        receipt.record(revision: revision, scale: 2, offset: CGPoint(x: 100, y: 200), contentRevision: resident)
+        precondition(receipt.worldPoint(at: tap, revision: revision, contentRevision: resident) == visiblePoint,
+                     "resident content uses its accepted camera without changing the layout")
+        precondition(receipt.worldPoint(at: tap, revision: revision, contentRevision: nextResident) == nil,
+                     "pending content cannot borrow the last presented tile frame")
+        precondition(receipt.worldPoint(at: tap, revision: revision) == nil,
+                     "a legacy caller cannot erase the accepted content identity")
+        receipt.record(revision: revision, scale: 2, offset: CGPoint(x: 100, y: 200), contentRevision: nextResident)
+        precondition(receipt.worldPoint(at: tap, revision: revision, contentRevision: resident) == nil)
+        precondition(receipt.worldPoint(at: tap, revision: revision, contentRevision: nextResident) == visiblePoint)
         let size = CGSize(width: 800, height: 600)
         let c = AtlasCamera()
         // The pointer may start anywhere; translation never contains its origin.

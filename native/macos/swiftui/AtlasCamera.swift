@@ -6,19 +6,22 @@ import Observation
 /// frame must not schedule another SwiftUI render. Input targets visible pixels.
 final class AtlasPresentedFrame {
     private var revision: UUID?
+    private var contentRevision: UUID?
     private var scale = 1.0
     private var offset = CGPoint.zero
 
-    func record(revision: UUID, scale: Double, offset: CGPoint) {
+    func record(revision: UUID, scale: Double, offset: CGPoint, contentRevision: UUID? = nil) {
         guard scale.isFinite, scale > 0, offset.x.isFinite, offset.y.isFinite else {
             self.revision = nil
             return
         }
-        self.revision = revision; self.scale = scale; self.offset = offset
+        self.revision = revision; self.contentRevision = contentRevision
+        self.scale = scale; self.offset = offset
     }
 
-    func worldPoint(at point: CGPoint, revision: UUID) -> CGPoint? {
-        guard self.revision == revision, point.x.isFinite, point.y.isFinite else { return nil }
+    func worldPoint(at point: CGPoint, revision: UUID, contentRevision: UUID? = nil) -> CGPoint? {
+        guard self.revision == revision, self.contentRevision == contentRevision,
+              point.x.isFinite, point.y.isFinite else { return nil }
         let world = CGPoint(x: (point.x - offset.x) / scale, y: (point.y - offset.y) / scale)
         return world.x.isFinite && world.y.isFinite ? world : nil
     }

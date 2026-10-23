@@ -84,6 +84,7 @@ import CoreText
 
         heightAwarePartitions()
         balancedRows()
+        fixedMetadataResidency()
         let documents = [document("src/a.rs", 170), document("src/feature/b.rs", 1050),
                          document("docs/guide.md", 50), document("README.md", 1)]
         let tiles = documents.flatMap(\.tiles)
@@ -179,5 +180,73 @@ import CoreText
         let rows = warm.flatMap { $0.preparedLines! }
         precondition(rows.map(\.sourceRange) == preparedTiles.flatMap { $0.preparedLines! }.map(\.sourceRange),
                      "prepared source rows remain complete and ordered")
+    }
+
+    static func fixedMetadataResidency() {
+        let source = document("src/late-file.rs", 257)
+        let firstParcel = CGRect(x: 100, y: 200, width: 700, height: 900)
+        let old = AtlasParcelLayout.reflow(source, inside: firstParcel)!
+        let oldRects = old.map(\.rect), oldRanges = old.map(\.sourceRange)
+        let archiveRects = source.tiles.map(\.rect)
+        let replacement = AtlasDocument(source: source.source, capture: source.capture, tiles: source.tiles)
+        let secondParcel = CGRect(x: 12, y: 34, width: 300, height: 1200)
+        let next = AtlasParcelLayout.reflow(replacement, inside: secondParcel)!
+        precondition(old.map(\.rect) == oldRects && old.map(\.sourceRange) == oldRanges,
+                     "worker placement must not mutate tiles retained by an accepted frame")
+        precondition(source.displayTiles?.map(\.rect) == oldRects && source.tiles.map(\.rect) == archiveRects)
+        precondition(next.allSatisfy { tile in old.allSatisfy { $0 !== tile } && contained(tile.rect, in: secondParcel) })
+        precondition(next.reduce(0) { $0 + $1.sourceRange.length } == source.source.text.utf16.count)
+        let prepared = source.tiles.map { tile in
+            AtlasTextTile(path: tile.path,
+                preparedLines: tile.lines.map { AtlasPreparedLine($0, source: source.source.text)! },
+                header: AtlasPreparedLine(tile.header!)!, sourceRange: tile.sourceRange)
+        }
+        let warm = AtlasDocument(source: source.source, capture: source.capture, tiles: prepared)
+        let warmDisplay = AtlasParcelLayout.reflow(warm, inside: secondParcel)!
+        precondition(warmDisplay.map(\.rect) == next.map(\.rect) && warmDisplay.map(\.sourceRange) == next.map(\.sourceRange))
+        precondition(AtlasParcelLayout.reflow(replacement, inside: .zero) == nil)
+        precondition(replacement.displayTiles?.map(\.rect) == next.map(\.rect), "failed placement leaves its candidate intact")
+        let empty = AtlasDocument(path: "empty", capture: AtlasHighlightCapture(schema: "fcb.source-document/1", text: "", runs: []))!
+        precondition(AtlasParcelLayout.reflow(empty, inside: firstParcel)?.isEmpty == true,
+                     "an empty capture succeeds; its metadata parcel supplies the visible file")
+
+        func entry(_ id: UInt64, _ bytes: [UInt8], _ length: UInt64) -> AtlasProjectCatalog.Entry {
+            .init(id: id, rawPath: bytes, displayPath: String(decoding: bytes, as: UTF8.self),
+                sourcePath: String(bytes: bytes, encoding: .utf8), observedBytes: length,
+                x: 0, y: 0, width: 1, height: 1)
+        }
+        let entries = [entry(1, Array("src/é.rs".utf8), 0),
+            entry(2, Array("src/e\u{301}.rs".utf8), 12), entry(3, [115, 114, 99, 47, 255, 46, 114, 115], .max)]
+        let compact = AtlasParcelLayout.compact(entries)!
+        let again = AtlasParcelLayout.compact(Array(entries.reversed()))!
+        precondition(compact.map(\.id) == again.map(\.id) && compact.map(\.rawPath) == again.map(\.rawPath))
+        precondition(compact.count == 3 && compact.contains { $0.sourcePath == nil },
+                     "raw and canonically equivalent filenames keep distinct metadata parcels")
+        for (index, item) in compact.enumerated() {
+            let rect = CGRect(x: item.x, y: item.y, width: item.width, height: item.height)
+            let replay = again[index]
+            precondition(rect == CGRect(x: replay.x, y: replay.y, width: replay.width, height: replay.height))
+            precondition(rect.width > 0 && rect.height > 0)
+            for previous in compact[..<index] {
+                let overlap = rect.intersection(CGRect(x: previous.x, y: previous.y, width: previous.width, height: previous.height))
+                precondition(overlap.isNull || overlap.width <= 1e-7 || overlap.height <= 1e-7)
+            }
+        }
+        precondition(AtlasParcelLayout.compact([])?.isEmpty == true)
+        precondition(AtlasParcelLayout.compact(entries, aspect: .nan) == nil)
+        precondition(AtlasParcelLayout.compact([entries[0], entries[0]]) == nil)
+        let percentPaths = [entry(4, Array("src/%ff.rs".utf8), 1),
+            entry(5, [115, 114, 99, 47, 255, 46, 114, 115], 1),
+            entry(6, Array("src/%ff%2e%72%73".utf8), 1)]
+        precondition(AtlasParcelLayout.compact(percentPaths)?.count == 3,
+                     "literal percent sequences cannot collide with encoded invalid-byte components")
+        precondition(AtlasParcelLayout.compact([entry(7, Array(repeating: 97, count: 16_385), 1)]) == nil)
+        let large = (0..<20_000).map { index in
+            entry(UInt64(index + 1), Array("workspace/src/components/feature_with_descriptive_directory_name/file-\(index).rs".utf8), 1)
+        }
+        let rawBytes = large.reduce(0) { $0 + $1.rawPath.count }
+        precondition(rawBytes <= 2 * 1024 * 1024 && rawBytes * 2 > 2 * 1024 * 1024)
+        precondition(AtlasParcelLayout.compact(large)?.count == large.count,
+                     "ordinary UTF8 metadata paths retain the shared layout's existing 2MiB admission")
     }
 }

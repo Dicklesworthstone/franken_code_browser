@@ -2,7 +2,11 @@
 //! adapters. A native Cargo target gives RCH an honest platform requirement.
 #![cfg(target_os = "macos")]
 
-use std::{path::PathBuf, process::Command};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn checked(command: &mut Command) {
     eprintln!("native Swift command: {command:?}");
@@ -14,6 +18,23 @@ fn checked(command: &mut Command) {
         "native Swift command failed: {}",
         output.status
     );
+}
+
+// The shell typecheck consumes exactly the production bundle's source list.
+// A stale hand-maintained subset can miss the source/reader ownership route.
+fn app_sources(root: &Path) -> Vec<String> {
+    let script = std::fs::read_to_string(root.join("scripts/make_app_bundle.sh"))
+        .expect("read production source registration");
+    let sources: Vec<String> = script
+        .split_whitespace()
+        .filter(|token| token.starts_with("swiftui/") && token.ends_with(".swift"))
+        .map(str::to_owned)
+        .collect();
+    assert!(!sources.is_empty() && sources.len() <= 128);
+    assert_eq!(sources.iter().collect::<BTreeSet<_>>().len(), sources.len());
+    assert!(sources.iter().all(|source| root.join(source).is_file()));
+    assert!(sources.iter().any(|source| source == "swiftui/App.swift"));
+    sources
 }
 
 #[test]
@@ -33,7 +54,7 @@ fn production_swift_camera_source_and_shell() {
         checked(
             Command::new("xcrun")
                 .current_dir(&root)
-                .args(["swiftc", "-parse-as-library"])
+                .args(["swiftc", "-parse-as-library", "swiftui/AtlasNavigationHistory.swift"])
                 .arg(format!("swiftui/{name}.swift"))
                 .arg(format!("swiftui/tests/{name}Tests.swift"))
                 .arg("-o")
@@ -88,6 +109,7 @@ fn production_swift_camera_source_and_shell() {
                 "swiftui/AtlasSource.swift",
                 "swiftui/AtlasDocument.swift",
                 "swiftui/AtlasPreparedText.swift",
+                "swiftui/AtlasProjectCatalog.swift",
                 "swiftui/AtlasParcelLayout.swift",
                 "swiftui/tests/AtlasParcelLayoutTests.swift",
             ])
@@ -127,6 +149,7 @@ fn production_swift_camera_source_and_shell() {
                 "swiftui/AtlasSearch.swift",
                 "swiftui/AtlasSearchCoordinator.swift",
                 "swiftui/AtlasProjectIO.swift",
+                "swiftui/AtlasProjectCatalog.swift",
                 "swiftui/AtlasProjectWorker.swift",
                 "swiftui/AtlasProjectCache.swift",
                 "swiftui/tests/AtlasPreparedTextTests.swift",
@@ -164,6 +187,7 @@ fn production_swift_camera_source_and_shell() {
                 "swiftui/AtlasSearch.swift",
                 "swiftui/AtlasSearchCoordinator.swift",
                 "swiftui/AtlasProjectIO.swift",
+                "swiftui/AtlasProjectCatalog.swift",
                 "swiftui/AtlasProjectWorker.swift",
                 "swiftui/tests/AtlasProjectWorkerTests.swift",
             ])
@@ -173,31 +197,36 @@ fn production_swift_camera_source_and_shell() {
     );
     checked(&mut Command::new(project_worker_test));
 
-    checked(Command::new("xcrun").current_dir(&root).args([
-        "swiftc",
-        "-typecheck",
-        "-parse-as-library",
-        "swiftui/AtlasCamera.swift",
-        "swiftui/AtlasNavigationHistory.swift",
-        "swiftui/AtlasSource.swift",
-        "swiftui/AtlasSourceReader.swift",
-        "swiftui/AtlasSearch.swift",
-        "swiftui/AtlasSearchCoordinator.swift",
-        "swiftui/AtlasSearchWorker.swift",
-        "swiftui/AtlasProjectIO.swift",
-        "swiftui/AtlasProjectWorker.swift",
-        "swiftui/AtlasMatch.swift",
-        "swiftui/AtlasDocument.swift",
-        "swiftui/AtlasPreparedText.swift",
-        "swiftui/AtlasProjectCache.swift",
-        "swiftui/AppStoreRootAccess.swift",
-        "swiftui/AtlasParcelLayout.swift",
-        "swiftui/AtlasMetalRasterRenderer.swift",
-        "swiftui/AtlasMetalGlyphRenderer.swift",
-        "swiftui/AtlasMetalPresentation.swift",
-        "swiftui/AtlasRetainedView.swift",
-        "swiftui/App.swift",
-    ]));
+    let metadata_surface_test = scratch.join("AtlasDirectoryPathTests");
+    checked(
+        Command::new("xcrun")
+            .current_dir(&root)
+            .args([
+                "swiftc",
+                "-parse-as-library",
+                "swiftui/AtlasSource.swift",
+                "swiftui/AtlasMatch.swift",
+                "swiftui/AtlasDocument.swift",
+                "swiftui/AtlasPreparedText.swift",
+                "swiftui/AtlasProjectCatalog.swift",
+                "swiftui/AtlasMetalRasterRenderer.swift",
+                "swiftui/AtlasMetalGlyphRenderer.swift",
+                "swiftui/AtlasMetalPresentation.swift",
+                "swiftui/AtlasRetainedView.swift",
+                "swiftui/tests/AtlasDirectoryPathTests.swift",
+            ])
+            .arg(&bridge)
+            .arg("-o")
+            .arg(&metadata_surface_test),
+    );
+    checked(&mut Command::new(metadata_surface_test));
+
+    checked(
+        Command::new("xcrun")
+            .current_dir(&root)
+            .args(["swiftc", "-typecheck", "-parse-as-library"])
+            .args(app_sources(&root)),
+    );
 }
 
 #[test]

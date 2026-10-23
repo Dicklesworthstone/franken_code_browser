@@ -270,6 +270,29 @@ import Metal
         precondition(surface.gpuCoveredTiles.isEmpty && metal.coveredTiles.isEmpty && metal.maximumInFlight<=2)
         precondition(coherentGPUFrames == acceptedBeforeDetach, "Detach cannot accept a stale GPU receipt")
         surface.onPresentedFrame = nil
+        // Residency publishes content independently of layout. Detaching after
+        // a replacement request but before its drawable completes must replay
+        // that newer request, even if SwiftUI's coordinator still matches the
+        // same window and therefore supplies no further updateNSView call.
+        window.contentView = surface
+        let stableLayout = UUID(), firstContent = UUID(), pendingContent = UUID()
+        surface.update(tiles: [tile], revision: stableLayout, scale: scale,
+            offset: CGPoint(x: 14, y: 9), selectedPath: nil, hitPaths: [], contentRevision: firstContent)
+        wait("First resident generation accepted") { surface.presentedContentIdentity?.content == firstContent && !metal.hasWork }
+        surface.update(tiles: [tile], revision: stableLayout, scale: scale,
+            offset: CGPoint(x: 21, y: 11), selectedPath: nil, hitPaths: [], contentRevision: pendingContent)
+        precondition(surface.hasRequestedScene(revision: stableLayout, contentRevision: pendingContent))
+        precondition(surface.presentedContentIdentity?.content == firstContent,
+                     "replacement fixture must still await its GPU frame")
+        window.contentView = nil
+        window.contentView = surface
+        wait("Newest requested content survives detach and reattach") {
+            surface.presentedContentIdentity?.layout == stableLayout &&
+            surface.presentedContentIdentity?.content == pendingContent && !metal.hasWork
+        }
+        precondition(surface.hasRequestedScene(revision: stableLayout, contentRevision: pendingContent))
+        precondition(surface.presentedMetalCamera?.scale == scale && surface.presentedMetalCamera?.offset == CGPoint(x: 21, y: 11))
+        window.contentView = nil
         window.close()
         try output(["coherent_gpu_frames":coherentGPUFrames,"final_camera_exact":true,"phase":"raster-lifecycle-complete","revision_retired":true,"image_identity_fallback":true,
             "resize_backing_detach":true,"maximum_in_flight":metal.maximumInFlight,"failures":metal.failures])

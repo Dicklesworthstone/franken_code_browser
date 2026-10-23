@@ -45,11 +45,15 @@ struct AtlasRetainedView: NSViewRepresentable {
     let hitPaths: Set<String>
     var matchRows: [CGRect] = []
     var onPresentedFrame: ((UUID, Double, CGPoint) -> Void)? = nil
+    var metadata: [AtlasProjectCatalog.Entry] = []
+    var contentRevision: UUID? = nil
+    var onPresentedContent: ((UUID, UUID, Double, CGPoint) -> Void)? = nil
 
     @MainActor final class Coordinator {
         private var sourceTiles: [AtlasTextTile] = []
         private var sourceMutationEpoch: UInt64 = 0
         private var revision: UUID?
+        private var contentRevision: UUID?
         private var scale = 0.0
         private var offset = CGPoint.zero
         private var selectedPath: String?
@@ -64,8 +68,11 @@ struct AtlasRetainedView: NSViewRepresentable {
             guard let window = view.window, view.metal != nil,
                   view.bounds.width > 0, view.bounds.height > 0,
                   self.window === window,
-                  revision == input.revision, scale == input.scale, offset == input.offset,
-                  selectedPath == input.selectedPath, hitPaths == input.hitPaths,
+                  revision == input.revision, contentRevision == input.contentRevision,
+                  view.hasRequestedScene(revision: input.revision, contentRevision: input.contentRevision),
+                  scale == input.scale, offset == input.offset,
+                  selectedPath.map({ Array($0.utf8) }) == input.selectedPath.map({ Array($0.utf8) }),
+                  hitPaths == input.hitPaths,
                   matchRows == input.matchRows, size == view.bounds.size,
                   backing == Double(window.backingScaleFactor),
                   metalFailures == (view.metal?.failures ?? 0),
@@ -78,6 +85,7 @@ struct AtlasRetainedView: NSViewRepresentable {
 
         func record(_ input: AtlasRetainedView, view: AtlasRetainedSurface) {
             revision = input.revision; scale = input.scale; offset = input.offset
+            contentRevision = input.contentRevision
             selectedPath = input.selectedPath; hitPaths = input.hitPaths
             matchRows = input.matchRows; size = view.bounds.size
             backing = view.window.map { Double($0.backingScaleFactor) } ?? 0
@@ -92,10 +100,12 @@ struct AtlasRetainedView: NSViewRepresentable {
     func makeNSView(context: Context) -> AtlasRetainedSurface { AtlasRetainedSurface() }
     func updateNSView(_ view: AtlasRetainedSurface, context: Context) {
         view.onPresentedFrame = onPresentedFrame
+        view.onPresentedContent = onPresentedContent
         if context.coordinator.matches(self, view: view) { return }
         context.coordinator.record(self, view: view)
         view.update(tiles: tiles, revision: revision, scale: scale, offset: offset,
-                    selectedPath: selectedPath, hitPaths: hitPaths, matchRows: matchRows)
+                    selectedPath: selectedPath, hitPaths: hitPaths, matchRows: matchRows,
+                    metadata: metadata, contentRevision: contentRevision)
     }
     static func dismantleNSView(_ view: AtlasRetainedSurface, coordinator: Coordinator) { view.stopClock() }
 }
@@ -103,6 +113,9 @@ struct AtlasRetainedView: NSViewRepresentable {
 /// Counters are inspectable by native regression/profiling programs, not source logs.
 struct AtlasRetainedMetrics {
     var installs = 0, overviewAssignments = 0, transformUpdates = 0
+    var metadataInstalls = 0, metadataParcels = 0
+    var metadataCaptionVisits = 0, metadataMarkerBuilds = 0
+    var contentNotificationsScheduled = 0, contentNotificationsDelivered = 0
     var detailRasters = 0, detailHits = 0, detailEvictions = 0, detailFailures = 0
     var detailBytes = 0, peakDetailBytes = 0, detailPasses = 0
     var requestedPatches = 0, admissionLimitedQueries = 0
@@ -116,6 +129,26 @@ struct AtlasRetainedMetrics {
 }
 
 final class AtlasRetainedSurface: NSView {
+    private struct SceneIdentity: Equatable { let layout: UUID; let content: UUID? }
+    private struct SceneSnapshot {
+        let identity: SceneIdentity
+        let renderRevision: UUID
+        let metadata: [AtlasProjectCatalog.Entry]
+    }
+    private struct SceneInput {
+        let scene: SceneSnapshot
+        let tiles: [AtlasTextTile]
+        let scale: Double
+        let offset: CGPoint
+        let selectedPath: String?
+        let hitPaths: Set<String>
+        let matchRows: [CGRect]
+    }
+    private struct ContentReceipt {
+        let scene: SceneSnapshot
+        let scale: Double
+        let offset: CGPoint
+    }
     private struct PatchKey: Hashable { let tile: Int; let level: Int; let x: Int; let y: Int }
     private struct Patch { let layer: CALayer; let image: CGImage; let rect: CGRect; let bytes: Int; var used: UInt64 }
     private struct Request { let key: PatchKey; let rect: CGRect }
@@ -130,14 +163,39 @@ final class AtlasRetainedSurface: NSView {
     static let maximumResidentPatches = 4096
     static let captionByteLimit = 512 * 1024 * 1024
     static let maximumVisibleCaptions = 4096
+    static let maximumMetadataCaptionVisits = 8192
     private var captions: [CaptionKey: Caption] = [:]
     private var captionFrames: [CaptionKey: CGRect] = [:]
     private var pendingCaptions: [CaptionKey] = []
     private let world = CALayer()
+    // Metadata is below the transparent GPU surface; placing its fills above
+    // Metal would obscure correctly accepted glyphs. Source overlays stay in
+    // `world`, above Metal, with their existing compositor ordering.
+    private let metadataWorld = CALayer()
+    private let metadataBackground = CAShapeLayer()
+    private let metadataSelection = CAShapeLayer()
+    private let metadataHits = CAShapeLayer()
+    private var metadataRevision: UUID?
+    private var metadataParcels: [String: CGRect] = [:]
+    private var metadataLabels: [String: String] = [:]
+    private var metadataPathKeys: [[UInt8]: String] = [:]
+    private var metadataSpatial: [Cell: [String]] = [:]
+    private var largeMetadata: [String] = []
+    private var metadataCaptionOrder: [String] = []
+    private var metadataMarkerRevision: UUID?
+    private var metadataSelectionGutter = 0.0, metadataHitsGutter = 0.0
+    private var metadataDirectoryRects: [String: CGRect] = [:]
+    private var metadataDirectoryGutters: [String: Double] = [:]
+    private var requestedScene: SceneSnapshot?
+    private var presentedScene: SceneSnapshot?
+    private var latestInput: SceneInput?
+    private var pendingContentReceipt: ContentReceipt?
+    private var contentNotificationScheduled = false
     private let metalEnabled: Bool
     private(set) var metal: AtlasMetalPresentation?
     private var metalCoveredTiles: Set<Int> = []
     var onPresentedFrame: ((UUID, Double, CGPoint) -> Void)?
+    var onPresentedContent: ((UUID, UUID, Double, CGPoint) -> Void)?
     var metalScene: AtlasMetalGlyphRenderer? { metal?.scene }
     var gpuCoveredTiles: Set<Int> { metalCoveredTiles }
     var gpuGlyphTiles: Set<Int> { metal?.coveredGlyphTiles ?? [] }
@@ -145,7 +203,16 @@ final class AtlasRetainedSurface: NSView {
     var metalSubmissions: Int { metal?.submissions ?? 0 }
     var metalPresentations: Int { metal?.presentations ?? 0 }
     var presentedMetalCamera: (revision: UUID, scale: Double, offset: CGPoint)? {
-        metal?.acceptedFrame.map { ($0.revision, $0.scale, $0.offset) }
+        guard let frame = metal?.acceptedFrame, let scene = presentedScene,
+              scene.renderRevision == frame.revision else { return nil }
+        return (scene.identity.layout, frame.scale, frame.offset)
+    }
+    var presentedContentIdentity: (layout: UUID, content: UUID)? {
+        presentedScene.map { ($0.identity.layout, $0.identity.content ?? $0.identity.layout) }
+    }
+    var hasPendingContentNotification: Bool { contentNotificationScheduled }
+    func hasRequestedScene(revision: UUID, contentRevision: UUID?) -> Bool {
+        requestedScene?.identity == SceneIdentity(layout: revision, content: contentRevision)
     }
     private let transition = CALayer()
     private var transitionImage: CGImage?
@@ -214,6 +281,9 @@ final class AtlasRetainedSurface: NSView {
             $0.value.strokeColor != nil && $0.value.lineWidth > 0 }.keys)
     }
     var retainedMatchRects: [CGRect] { matchLayers.map(\.frame) }
+    var retainedMetadataRects: [String: CGRect] { metadataParcels }
+    var retainedMetadataPath: CGPath? { metadataBackground.path }
+    var retainedMetadataSelectionPath: CGPath? { metadataSelection.path }
     override var isFlipped: Bool { true }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
@@ -224,6 +294,16 @@ final class AtlasRetainedSurface: NSView {
         wantsLayer = true
         layer?.masksToBounds = true
         layer?.backgroundColor = Monokai.background.cgColor
+        metadataWorld.anchorPoint = .zero; metadataWorld.position = .zero
+        metadataWorld.zPosition = -1
+        metadataBackground.fillColor = NSColor(srgbRed: 0.13, green: 0.16, blue: 0.18, alpha: 1).cgColor
+        metadataBackground.strokeColor = nil
+        metadataWorld.addSublayer(metadataBackground)
+        layer?.addSublayer(metadataWorld)
+        metadataSelection.fillColor = nil; metadataSelection.strokeColor = NSColor.yellow.cgColor
+        metadataSelection.zPosition = 2.1
+        metadataHits.fillColor = nil; metadataHits.strokeColor = NSColor.orange.cgColor
+        metadataHits.zPosition = 2.1
         world.anchorPoint = .zero
         world.position = .zero
         if metalEnabled {
@@ -231,7 +311,8 @@ final class AtlasRetainedSurface: NSView {
             if let metal {
                 layer?.addSublayer(metal.layer)
                 metal.accept = { [weak self] frame, covered in
-                    guard let self else { return }
+                    guard let self, let scene = self.requestedScene,
+                          scene.renderRevision == frame.revision else { return }
                     if self.metalCoveredTiles != covered {
                         self.lastLevel = Int.min
                         if !covered.isDisjoint(with: self.transitionTiles) { self.clearTransition() }
@@ -239,7 +320,7 @@ final class AtlasRetainedSurface: NSView {
                     self.metalCoveredTiles = covered
                     self.applyFrame(tiles: frame.tiles, revision: frame.revision, scale: frame.scale,
                         offset: frame.offset, selectedPath: frame.selectedPath,
-                        hitPaths: frame.hitPaths, matchRows: frame.matchRows)
+                        hitPaths: frame.hitPaths, matchRows: frame.matchRows, scene: scene)
                 }
             }
         }
@@ -267,14 +348,20 @@ final class AtlasRetainedSurface: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if window == nil {
+            pendingContentReceipt = nil
             metal?.invalidatePresentation()
             metalCoveredTiles = []; lastLevel = Int.min
             refreshDetail(); stopClock()
         } else {
             setBackingScale(Double(window?.backingScaleFactor ?? 1))
-            if let revision {
-                update(tiles: tiles, revision: revision, scale: scale, offset: offset,
-                    selectedPath: selected, hitPaths: hits, matchRows: matchRows)
+            // A newer resident set may have been requested without reaching a
+            // drawable before detach. Replay that newest input, not the older
+            // accepted tiles, so the same SwiftUI coordinator cannot strand it.
+            if let input = latestInput {
+                update(tiles: input.tiles, revision: input.scene.identity.layout,
+                    scale: input.scale, offset: input.offset, selectedPath: input.selectedPath,
+                    hitPaths: input.hitPaths, matchRows: input.matchRows,
+                    metadata: input.scene.metadata, contentRevision: input.scene.identity.content)
             }
             refreshDetail(); startClock()
         }
@@ -296,11 +383,20 @@ final class AtlasRetainedSurface: NSView {
     }
 
     func update(tiles next: [AtlasTextTile], revision nextRevision: UUID, scale: Double,
-                offset: CGPoint, selectedPath: String?, hitPaths: Set<String>, matchRows: [CGRect] = []) {
+                offset: CGPoint, selectedPath: String?, hitPaths: Set<String>, matchRows: [CGRect] = [],
+                metadata: [AtlasProjectCatalog.Entry] = [], contentRevision: UUID? = nil) {
         guard scale.isFinite, scale > 0, offset.x.isFinite, offset.y.isFinite else { return }
+        let identity = SceneIdentity(layout: nextRevision, content: contentRevision)
+        if requestedScene?.identity != identity {
+            requestedScene = SceneSnapshot(identity: identity,
+                renderRevision: contentRevision == nil ? nextRevision : UUID(), metadata: metadata)
+        }
+        guard let scene = requestedScene else { return }
+        latestInput = SceneInput(scene: scene, tiles: next, scale: scale, offset: offset,
+            selectedPath: selectedPath, hitPaths: hitPaths, matchRows: matchRows)
         if let metal, window != nil, bounds.width > 0, bounds.height > 0 {
-            metal.prepare(tiles: next, revision: nextRevision)
-            metal.request(.init(tiles: next, revision: nextRevision, scale: scale, offset: offset,
+            metal.prepare(tiles: next, revision: scene.renderRevision)
+            metal.request(.init(tiles: next, revision: scene.renderRevision, scale: scale, offset: offset,
                 selectedPath: selectedPath, hitPaths: hitPaths, matchRows: matchRows,
                 size: bounds.size, backing: backingScale))
             startClock()
@@ -309,8 +405,8 @@ final class AtlasRetainedSurface: NSView {
         metal?.invalidatePresentation()
         if !metalCoveredTiles.isEmpty { lastLevel = Int.min }
         metalCoveredTiles = []
-        applyFrame(tiles: next, revision: nextRevision, scale: scale, offset: offset,
-                   selectedPath: selectedPath, hitPaths: hitPaths, matchRows: matchRows)
+        applyFrame(tiles: next, revision: scene.renderRevision, scale: scale, offset: offset,
+                   selectedPath: selectedPath, hitPaths: hitPaths, matchRows: matchRows, scene: scene)
     }
 
     func advanceMetalFrame() {
@@ -318,14 +414,18 @@ final class AtlasRetainedSurface: NSView {
     }
 
     private func applyFrame(tiles next: [AtlasTextTile], revision nextRevision: UUID, scale: Double,
-                offset: CGPoint, selectedPath: String?, hitPaths: Set<String>, matchRows: [CGRect]) {
+                offset: CGPoint, selectedPath: String?, hitPaths: Set<String>, matchRows: [CGRect], scene: SceneSnapshot) {
         CATransaction.begin(); CATransaction.setDisableActions(true)
+        if metadataRevision != scene.identity.layout { installMetadata(scene) }
         if revision != nextRevision {
             transitionGeneration &+= 1
             stopClock()
             world.sublayers = nil
             clearTransition()
             world.addSublayer(transition)
+            if !metadataParcels.isEmpty {
+                world.addSublayer(metadataHits); world.addSublayer(metadataSelection)
+            }
             for caption in captions.values { caption.layer.removeFromSuperlayer() }
             captions.removeAll(keepingCapacity: true); captionFrames.removeAll(keepingCapacity: true)
             pendingCaptions.removeAll(keepingCapacity: true); metrics.captionBytes = 0
@@ -377,8 +477,9 @@ final class AtlasRetainedSurface: NSView {
             // The Rust treemap packs each directory contiguously. The union of
             // its descendant leaf parcels recovers its exact directory rectangle;
             // this is a projection of that layout, not a second layout algorithm.
-            var directoryRects: [String: CGRect] = [:]
-            for tile in tiles where tile.parcelFirst {
+            var directoryRects = metadataDirectoryRects
+            directoryGutters = metadataDirectoryGutters
+            for tile in tiles where tile.parcelFirst && metadataParcels.isEmpty {
                 guard let parcel = tile.parcelRect else { continue }
                 let gutter = outlineGutters[tile.path] ?? 0
                 var directory = (tile.path as NSString).deletingLastPathComponent
@@ -400,7 +501,8 @@ final class AtlasRetainedSurface: NSView {
             metrics.installs += 1
         }
         self.scale = scale; self.offset = offset
-        world.setAffineTransform(CGAffineTransform(a: scale, b: 0, c: 0, d: scale, tx: offset.x, ty: offset.y))
+        let transform = CGAffineTransform(a: scale, b: 0, c: 0, d: scale, tx: offset.x, ty: offset.y)
+        world.setAffineTransform(transform); metadataWorld.setAffineTransform(transform)
         metrics.transformUpdates += 1
         // Small retained bands move with the same world transform as source.
         // No source lookup or rasterization occurs on camera ticks.
@@ -417,7 +519,10 @@ final class AtlasRetainedSurface: NSView {
                 world.addSublayer(highlight); matchLayers.append(highlight)
             }
         }
-        if selected != selectedPath || hits != hitPaths {
+        let selectedBytes = selected.map { Array($0.utf8) }
+        let nextSelectedBytes = selectedPath.map { Array($0.utf8) }
+        let markersChanged = selectedBytes != nextSelectedBytes || hits != hitPaths
+        if markersChanged {
             selected = selectedPath; hits = hitPaths
             for (path, outline) in outlines {
                 let marked = path == selectedPath || hitPaths.contains(path)
@@ -427,9 +532,163 @@ final class AtlasRetainedSurface: NSView {
                     : Self.outlineColor(path)
             }
         }
+        refreshMetadataMarkers(changed: markersChanged)
+        presentedScene = scene
         CATransaction.commit()
         refreshDetail()
-        onPresentedFrame?(nextRevision, scale, offset)
+        onPresentedFrame?(scene.identity.layout, scale, offset)
+        enqueueContentReceipt(scene: scene, scale: scale, offset: offset)
+    }
+
+    /// SwiftUI's updateNSView can synchronously take the CPU acceptance path.
+    /// Observable residency changes therefore receive a deferred receipt. One
+    /// slot and one scheduled drain coalesce camera ticks; no per-frame Task or
+    /// source-work queue can accumulate. A replacement revokes obsolete work.
+    private func enqueueContentReceipt(scene: SceneSnapshot, scale: Double, offset: CGPoint) {
+        guard onPresentedContent != nil else { return }
+        pendingContentReceipt = ContentReceipt(scene: scene, scale: scale, offset: offset)
+        guard !contentNotificationScheduled else { return }
+        contentNotificationScheduled = true; metrics.contentNotificationsScheduled += 1
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.contentNotificationScheduled = false
+            guard let receipt = self.pendingContentReceipt else { return }
+            self.pendingContentReceipt = nil
+            guard self.requestedScene?.renderRevision == receipt.scene.renderRevision,
+                  self.presentedScene?.renderRevision == receipt.scene.renderRevision,
+                  self.scale == receipt.scale, self.offset == receipt.offset else { return }
+            self.metrics.contentNotificationsDelivered += 1
+            self.onPresentedContent?(receipt.scene.identity.layout,
+                receipt.scene.identity.content ?? receipt.scene.identity.layout,
+                receipt.scale, receipt.offset)
+        }
+    }
+
+    /// One geometry publication contains every admitted file, including empty,
+    /// unavailable and not-yet-captured sources. A single retained path avoids
+    /// manufacturing thousands of source tiles, CTLines or per-file layers.
+    private func installMetadata(_ scene: SceneSnapshot) {
+        metadataRevision = scene.identity.layout
+        metadataParcels.removeAll(keepingCapacity: true); metadataLabels.removeAll(keepingCapacity: true)
+        metadataPathKeys.removeAll(keepingCapacity: true)
+        metadataSpatial.removeAll(keepingCapacity: true); largeMetadata.removeAll(keepingCapacity: true)
+        metadataCaptionOrder.removeAll(keepingCapacity: true)
+        metadataDirectoryRects.removeAll(keepingCapacity: true)
+        metadataDirectoryGutters.removeAll(keepingCapacity: true)
+        let path = CGMutablePath()
+        var bounds = CGRect.null
+        if scene.metadata.count <= AtlasProjectCatalog.maximumFiles {
+            for entry in scene.metadata {
+                let rect = CGRect(x: entry.x, y: entry.y, width: entry.width, height: entry.height)
+                guard rect.width > 0, rect.height > 0,
+                      [rect.minX, rect.minY, rect.maxX, rect.maxY].allSatisfy({ $0.isFinite && abs($0) < 1e12 }) else { continue }
+                // Swift String equality folds canonically equivalent spellings.
+                // Every parcel instead uses its distinct response-local ID;
+                // selection lookup below compares the actual native bytes.
+                let key = "\0raw:\(entry.id)"
+                guard metadataParcels[key] == nil else { continue }
+                metadataParcels[key] = rect; metadataLabels[key] = entry.displayPath
+                metadataPathKeys[entry.rawPath] = key
+                let gutter = min(5.0, min(rect.width, rect.height) * 0.02)
+                path.addRect(rect.insetBy(dx: gutter * 0.25, dy: gutter * 0.25))
+                bounds = bounds.union(rect)
+                if ceil(rect.width / 1024 + 1) * ceil(rect.height / 1024 + 1) > 64 {
+                    largeMetadata.append(key)
+                } else {
+                    for y in Int(floor(rect.minY / 1024))...Int(floor(rect.maxY / 1024)) {
+                        for x in Int(floor(rect.minX / 1024))...Int(floor(rect.maxX / 1024)) {
+                            metadataSpatial[Cell(x: x, y: y), default: []].append(key)
+                        }
+                    }
+                }
+                // Metadata annotations are bounded independently of source.
+                // File geometry remains complete even when deep directory
+                // labels fall outside this small retained annotation set.
+                let components = (entry.sourcePath ?? entry.displayPath).split(separator: "/")
+                if components.count > 1 {
+                    for depth in 1...min(4, components.count - 1) {
+                        let directory = components.prefix(depth).joined(separator: "/")
+                        if let previous = metadataDirectoryRects[directory] {
+                            metadataDirectoryRects[directory] = previous.union(rect)
+                            metadataDirectoryGutters[directory] = min(metadataDirectoryGutters[directory] ?? gutter, gutter)
+                        } else if metadataDirectoryRects.count < 4096 {
+                            metadataDirectoryRects[directory] = rect
+                            metadataDirectoryGutters[directory] = gutter
+                        }
+                    }
+                }
+            }
+        }
+        func captionPriority(_ key: String) -> Double {
+            guard let rect = metadataParcels[key] else { return 0 }
+            return min(rect.width / 48, rect.height / 24)
+        }
+        func earlier(_ lhs: String, _ rhs: String) -> Bool {
+            let a = captionPriority(lhs), b = captionPriority(rhs)
+            return a == b ? lhs < rhs : a > b
+        }
+        metadataCaptionOrder = metadataParcels.keys.sorted(by: earlier)
+        largeMetadata.sort(by: earlier)
+        for cell in Array(metadataSpatial.keys) { metadataSpatial[cell]?.sort(by: earlier) }
+        metadataBackground.path = path
+        metadataBackground.frame = bounds.isNull ? .zero : CGRect(x: 0, y: 0,
+            width: max(0, bounds.maxX), height: max(0, bounds.maxY))
+        metadataWorld.isHidden = metadataParcels.isEmpty
+        metrics.metadataInstalls += 1; metrics.metadataParcels = metadataParcels.count
+    }
+
+    private func visibleMetadata(in viewport: CGRect) -> [String] {
+        var result: [String] = [], seen = Set<String>(), inspected = 0
+        func consider(_ keys: [String]) {
+            for key in keys {
+                guard inspected < Self.maximumMetadataCaptionVisits else { break }
+                inspected += 1
+                guard let rect = metadataParcels[key] else { continue }
+                // Lists are largest-label-first. Once a parcel is too small,
+                // the remainder cannot carry a filename at this zoom level.
+                if rect.width * scale < 48 || rect.height * scale < 24 { break }
+                if seen.insert(key).inserted, rect.intersects(viewport) { result.append(key) }
+            }
+        }
+        if let selected, let key = metadataPathKeys[Array(selected.utf8)] { consider([key]) }
+        let cells = ceil(viewport.width / 1024 + 1) * ceil(viewport.height / 1024 + 1)
+        if cells > Double(min(4096, metadataParcels.count)) {
+            consider(metadataCaptionOrder)
+        } else {
+            consider(largeMetadata)
+            for y in Int(floor(viewport.minY / 1024))...Int(floor(viewport.maxY / 1024)) {
+                guard inspected < Self.maximumMetadataCaptionVisits else { break }
+                for x in Int(floor(viewport.minX / 1024))...Int(floor(viewport.maxX / 1024)) {
+                    guard inspected < Self.maximumMetadataCaptionVisits else { break }
+                    consider(metadataSpatial[Cell(x: x, y: y)] ?? [])
+                }
+            }
+        }
+        metrics.metadataCaptionVisits = inspected
+        return result
+    }
+
+    private func refreshMetadataMarkers(changed: Bool) {
+        guard !metadataParcels.isEmpty else { return }
+        func rebuild(_ layer: CAShapeLayer, paths: [String]) -> Double {
+            let parcels = paths.compactMap { path in
+                metadataPathKeys[Array(path.utf8)].flatMap { metadataParcels[$0] }
+            }
+            guard let gutter = parcels.map({ min(5.0, min($0.width, $0.height) * 0.02) }).min() else {
+                layer.path = nil; layer.isHidden = true; return 0
+            }
+            let path = CGMutablePath()
+            for parcel in parcels { path.addRect(parcel.insetBy(dx: gutter * 0.5, dy: gutter * 0.5)) }
+            layer.path = path; layer.isHidden = false
+            return gutter
+        }
+        if changed || metadataMarkerRevision != metadataRevision {
+            metadataSelectionGutter = rebuild(metadataSelection, paths: selected.map { [$0] } ?? [])
+            metadataHitsGutter = rebuild(metadataHits, paths: Array(hits.prefix(4096)))
+            metadataMarkerRevision = metadataRevision; metrics.metadataMarkerBuilds += 1
+        }
+        metadataSelection.lineWidth = Self.safeStrokeWidth(1.5, scale: scale, gutter: metadataSelectionGutter)
+        metadataHits.lineWidth = Self.safeStrokeWidth(1.5, scale: scale, gutter: metadataHitsGutter)
     }
 
     private func refreshDetail() {
@@ -754,8 +1013,10 @@ final class AtlasRetainedSurface: NSView {
     private func refreshCaptions() {
         captionFrames.removeAll(keepingCapacity: true); pendingCaptions.removeAll(keepingCapacity: true)
         let backing = max(1, min(4, Int(ceil(backingScale))))
-        for (path, outline) in outlines {
-            let parcel = outline.frame
+        let parcels: [(String, CGRect)] = metadataParcels.isEmpty
+            ? outlines.map { ($0.key, $0.value.frame) }
+            : visibleMetadata(in: lastViewport).compactMap { path in metadataParcels[path].map { (path, $0) } }
+        for (path, parcel) in parcels {
             let key = CaptionKey(path: path, backing: backing)
             guard captionFrames[key] == nil else { continue }
             let screen = CGRect(x: parcel.minX * scale + offset.x, y: parcel.minY * scale + offset.y,
@@ -790,7 +1051,8 @@ final class AtlasRetainedSurface: NSView {
     private func prepareCaption() {
         let key = pendingCaptions.removeFirst()
         guard let frame = captionFrames[key] else { return }
-        let line = CTLineCreateWithAttributedString(NSAttributedString(string: (key.path as NSString).lastPathComponent,
+        let label = metadataLabels[key.path] ?? key.path
+        let line = CTLineCreateWithAttributedString(NSAttributedString(string: (label as NSString).lastPathComponent,
             attributes: [.font: NSFont.monospacedSystemFont(ofSize: 13, weight: .medium), .foregroundColor: NSColor.white]))
         let logicalWidth = min(320, max(1, ceil(CTLineGetTypographicBounds(line, nil, nil, nil)) + 12))
         let width = Int(logicalWidth) * key.backing, height = 22 * key.backing
