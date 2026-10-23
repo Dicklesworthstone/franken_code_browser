@@ -30,4 +30,23 @@ swiftc "$@" -swift-version 6 -warnings-as-errors "$out/Cancellation.swift" \
     "$src/AtlasProjectIO.swift" "$src/AtlasFileFinder.swift" "$src/AtlasQuickOpenModel.swift" \
     "$src/tests/AtlasFileFinderFixture.swift" "$src/tests/AtlasQuickOpenTests.swift" -o "$out/panel-tests"
 "$out/panel-tests"
+
+# The progressive route uses production retained-reader admission and scheduling.
+# These injected transports/C symbols do not qualify the Rust engine or AppKit.
+compile_progressive() {
+    swiftc "$@" -swift-version 6 -warnings-as-errors \
+        "$src/AtlasSearch.swift" "$src/AtlasSearchCapture.swift" "$src/AtlasSearchCoordinator.swift" "$src/AtlasProjectIO.swift" \
+        "$src/AtlasReader.swift" "$src/AtlasReaderSearch.swift" "$src/AtlasReaderComparison.swift" \
+        "$src/AtlasReaderOutline.swift" "$src/AtlasReaderDocument.swift" "$src/AtlasReaderCoordinator.swift" \
+        "$src/AtlasCapturedReader.swift" "$src/AtlasSuppliedReader.swift" "$src/AtlasNavigationHistory.swift" \
+        "$src/AtlasSource.swift" "$src/AtlasDocumentPreviewModel.swift" "$src/AtlasPagedReaderModel.swift" \
+        "$src/AtlasFileFinder.swift" "$src/AtlasProgressiveFileFinder.swift"
+}
+compile_progressive "$@" "$src/tests/AtlasProgressiveFileFinderTests.swift" -o "$out/progressive-panel-tests"
+"$out/progressive-panel-tests"
+clang -std=gnu11 -Wall -Wextra -Werror \
+    -c "$src/tests/AtlasProgressiveFileFinderBridgeFixtures.c" -o "$out/progressive-bridge-fixtures.o"
+compile_progressive "$@" "$src/AtlasProgressiveFileFinderBridge.swift" \
+    "$src/tests/AtlasProgressiveFileFinderBridgeTests.swift" "$out/progressive-bridge-fixtures.o" -o "$out/progressive-bridge-tests"
+"$out/progressive-bridge-tests"
 printf 'Retained test artifacts: %s\n' "$out"

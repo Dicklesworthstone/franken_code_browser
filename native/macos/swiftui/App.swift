@@ -252,6 +252,7 @@ extension AtlasCamera {
     @State private var usesPagedReader = false
     @State private var capturedReaderTarget: AtlasSearchCapturedHit?
     @State private var suppliedReaderTarget: AtlasSuppliedReaderSource?
+    @State private var finderReaderCapture: AtlasProgressiveFileCapture?
     @State private var readingDesk = AtlasReadingDeskModel(transport: .native)
     @State private var showsReadingDesk = false
     @State private var savedRepository = AtlasSavedRepositoryModel(transport: .native)
@@ -365,7 +366,7 @@ extension AtlasCamera {
             } label: {
                 Label("Source Reader", systemImage: "doc.text")
             }
-            .disabled(selectedPath == nil)
+            .disabled(selectedPath == nil && finderReaderCapture == nil)
             .help("Show or hide the selectable source reader")
             Button { showsReadingDesk = true } label: {
                 Label("Reading Desk", systemImage: "books.vertical")
@@ -400,6 +401,7 @@ extension AtlasCamera {
 #endif
         }
         .onDisappear {
+            closeFinderReader()
             projectBrowser.close()
             savedRepository.close()
             showsSavedRepository = false
@@ -493,8 +495,8 @@ extension AtlasCamera {
         }
     }
 
-    // Quick Open is workspace-wide filename navigation. Its frozen catalog
-    // and query identities do not borrow source-search or displayed-tile IDs.
+    // Quick Open owns a progressive query independently of the atlas and
+    // content search. Its selected row hands over an already captured reader.
     @ViewBuilder private var fileFinderSheet: some View {
 #if FCB_APP_STORE
         if let access = rootAccess, access.url.path.utf8.elementsEqual(root.utf8) {
@@ -510,19 +512,32 @@ extension AtlasCamera {
     private func fileFinder(accessLease: AnyObject?) -> some View {
         let requestedRoot = root
         let generation = loadGeneration
-        return AtlasQuickOpenView(root: requestedRoot, accessLease: accessLease) { choice in
+        return AtlasProgressiveQuickOpenView(root: requestedRoot, accessLease: accessLease) { capture in
             guard showsFileFinder, !loadingProject, loadGeneration == generation,
                   root.utf8.elementsEqual(requestedRoot.utf8),
-                  choice.root.utf8.elementsEqual(requestedRoot.utf8) else { return }
+                  capture.root.utf8.elementsEqual(requestedRoot.utf8),
+                  capture.reader.page?.identity.pathBytes == capture.file.rawPath else {
+                capture.reader.close(); return
+            }
 #if FCB_APP_STORE
-            guard rootAccess?.url.path.utf8.elementsEqual(requestedRoot.utf8) == true else { return }
+            guard rootAccess?.url.path.utf8.elementsEqual(requestedRoot.utf8) == true else {
+                capture.reader.close(); return
+            }
 #endif
+            closeFinderReader()
+            cancelSourceLoad()
+            capturedReaderTarget = nil; suppliedReaderTarget = nil
+            selectedHit = nil; selectedMatch = nil; selectedReaderSelection = nil
+            selectedSource = nil; sourceError = nil; fileText = ""
+            // UTF-8 is optional presentation/navigation metadata. Neither this
+            // value nor the escaped label is used to reopen the selected file.
+            selectedPath = capture.file.path
+            finderReaderCapture = capture
+            usesPagedReader = true
+            focusRequest = UUID()
             showsFileFinder = false
-            selectedHit = nil
-            // Filename selection authorizes a normal file open, never an exact
-            // content-search jump. Unprepared files remain readable on demand.
-            openFile(choice.path)
             showsReader = true
+            status = "Opened a new source capture from the selected filename. The retained reader stays available after search closes."
         }
         .id(generation)
     }
@@ -821,10 +836,10 @@ extension AtlasCamera {
                     )
                     .id(atlasRevision)
                 }
-                if (selectedPath != nil && showsReader) || !pinnedReaders.entries.isEmpty || pinnedReaders.busy {
+                if ((selectedPath != nil || finderReaderCapture != nil) && showsReader) || !pinnedReaders.entries.isEmpty || pinnedReaders.busy {
                     Divider()
                     HSplitView {
-                        if selectedPath != nil && showsReader {
+                        if (selectedPath != nil || finderReaderCapture != nil) && showsReader {
                             sourcePane.frame(minWidth: 320)
                         }
                         if !pinnedReaders.entries.isEmpty || pinnedReaders.busy {
@@ -837,7 +852,7 @@ extension AtlasCamera {
             }
             .frame(maxWidth: .infinity)
 
-            if selectedPath != nil && showsReader && pinnedReaders.entries.isEmpty && !pinnedReaders.busy {
+            if selectedPath != nil && finderReaderCapture == nil && showsReader && pinnedReaders.entries.isEmpty && !pinnedReaders.busy {
                 Divider()
                 inspector.frame(width: 264)
             }
@@ -937,20 +952,24 @@ extension AtlasCamera {
 
     private var sourcePane: some View {
         VStack(spacing: 0) {
-            if let path = selectedPath {
+            if let label = finderReaderCapture?.file.display ?? selectedPath {
                 HStack(spacing: 8) {
                     Image(systemName: "doc.text")
                         .foregroundStyle(.secondary)
-                    Text(path)
+                    Text(verbatim: label)
                         .font(.system(size: 11.5, design: .monospaced))
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer()
-                    let fileHits = hits.filter { $0.sourcePath == path }
-                    Text("\(fileHits.count) match\(fileHits.count == 1 ? "" : "es") in file")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                    if !usesPagedReader {
+                    if finderReaderCapture != nil {
+                        Text("Retained source capture").font(.caption).foregroundStyle(.secondary)
+                    } else if let path = selectedPath {
+                        let fileHits = hits.filter { $0.sourcePath == path }
+                        Text("\(fileHits.count) match\(fileHits.count == 1 ? "" : "es") in file")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    if !usesPagedReader, let path = selectedPath {
                         Button("Read pages") { openPagedFile(path) }
                             .help(selectedSource == nil ? "Capture the current file for byte and line navigation"
                                 : "Read the already captured bytes with paging, Find and Outline. Refresh from disk explicitly to load edits.")
@@ -961,7 +980,11 @@ extension AtlasCamera {
                 .background(.bar)
                 Divider()
             }
-            if usesPagedReader, let path = selectedPath {
+            if let capture = finderReaderCapture {
+                AtlasPagedSourceView(model: capture.reader, canPin: pinnedReaders.canAdd, pin: pinSource,
+                    canKeep: readingDesk.canOperate, keep: keepSource)
+                    .id(capture.id)
+            } else if usesPagedReader, let path = selectedPath {
                 if !loadingProject, acceptsSource(path, searchRow: sourceSearchRow, exactMatch: false) {
 #if FCB_APP_STORE
                     if let access = rootAccess, access.url.path.utf8.elementsEqual(root.utf8) {
@@ -1019,6 +1042,12 @@ extension AtlasCamera {
     }
 
     private func pinSource(_ reader: AtlasPagedReaderModel) {
+        if let capture = finderReaderCapture, capture.reader === reader, reader.canPin,
+           capture.root.utf8.elementsEqual(root.utf8),
+           reader.page?.identity.pathBytes == capture.file.rawPath {
+            pinnedReaders.pin(reader, root: root, label: capture.file.display)
+            return
+        }
         guard !loadingProject, let path = selectedPath, let page = reader.page, reader.canPin,
               let input = try? AtlasReaderInput(root: root, path: path) else { return }
         let isLiveLabel = page.identity.pathBytes.elementsEqual(input.fullPath.utf8)
@@ -1033,6 +1062,11 @@ extension AtlasCamera {
         pinnedReaders.pin(reader, root: root, label: page.identity.displayPath)
     }
 
+    private func closeFinderReader() {
+        finderReaderCapture?.reader.close()
+        finderReaderCapture = nil
+    }
+
     /// Revoke old camera coordinates when publishing a layout, before a
     /// queued action from the previous SwiftUI canvas can run.
     private func renewAtlasRevision() {
@@ -1044,6 +1078,7 @@ extension AtlasCamera {
     /// Project opening performs only the bounded metadata operation. Text
     /// capture/highlighting/raster preparation is an explicit subsequent action.
     private func requestAtlasLoad() {
+        closeFinderReader()
         workspaceSearch?.refresh()
         projectBrowser.close()
         projectBrowser = AtlasProjectBrowserModel(transport: .native)
@@ -1384,6 +1419,7 @@ extension AtlasCamera {
     }
 
     private func applyFileScope() {
+        closeFinderReader()
         capturedReaderTarget = nil
         suppliedReaderTarget = nil
         cancelSourceLoad()
@@ -1649,6 +1685,7 @@ extension AtlasCamera {
 
     private func openFile(_ path: String, searchRow: AtlasSearchRowID? = nil, exactMatch: Bool = false) {
         guard acceptsSource(path, searchRow: searchRow, exactMatch: exactMatch) else { return }
+        closeFinderReader()
         capturedReaderTarget = nil
         suppliedReaderTarget = nil
         cancelSourceLoad()

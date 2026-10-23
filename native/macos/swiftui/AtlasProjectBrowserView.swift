@@ -108,7 +108,7 @@ import SwiftUI
             Divider()
             Text(readerNotice.isEmpty ? model.notice : readerNotice)
                 .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-            Text("Browsing can continue beyond 20,000 files. Text atlas and Quick Open retain their separate 20,000-file limits; workspace search reports its own coverage.")
+            Text("Browsing and Quick Open can continue beyond 20,000 files. Text-atlas preparation retains its separate 20,000-file limit; workspace search reports its own coverage.")
                 .font(.caption2).foregroundStyle(.secondary)
         }.padding(12).frame(maxWidth: .infinity, maxHeight: .infinity)
         .sheet(item: $capture) { capture in
