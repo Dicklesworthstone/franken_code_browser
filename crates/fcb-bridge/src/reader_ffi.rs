@@ -133,3 +133,7 @@ mod comparison;
 #[cfg(test)]
 #[path = "reader_ffi_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "reader_highlight_ffi_tests.rs"]
+mod highlight_tests;

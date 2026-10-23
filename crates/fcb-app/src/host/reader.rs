@@ -8,6 +8,7 @@
 
 mod outline;
 mod comparison;
+mod highlight;
 pub(crate) mod document;
 #[cfg(test)]
 mod shared_tests;
@@ -96,6 +97,9 @@ pub struct ReaderSession {
     capture_sha256: Sha256Digest,
     path: PathBuf,
     encoding: DetectedEncoding,
+    // Immutable lexical roles over this complete capture, prepared at most once
+    // on a worker. Page navigation only clips these source-associated roles.
+    highlight: Option<highlight::CaptureHighlight>,
     // Fixed capacity is charged by size_of::<Self> before session allocation.
     // Checkpoints reference only this immutable capture, never a live path.
     line_checkpoints: [Option<LineWindowScanner>; LINE_CHECKPOINTS],
@@ -163,7 +167,7 @@ impl ReaderSession {
     }
     fn retained(capture: CompleteCapture, capture_sha256: Sha256Digest, path: &Path, encoding: DetectedEncoding,
         budget: ResourceBudget, source_lease: ResourceLease, state_lease: ResourceLease) -> Self {
-        Self { capture, capture_sha256, path: path.to_path_buf(), encoding,
+        Self { capture, capture_sha256, path: path.to_path_buf(), encoding, highlight: None,
             line_checkpoints: std::array::from_fn(|_| None), source_bytes_read: 0, read_calls: 0,
             file_observation: false, query: None, last_query_attempt: 0,
             outline: None, last_outline_attempt: 0, document: None, last_document_attempt: 0,
@@ -187,8 +191,9 @@ impl ReaderSession {
         let request = CaptureRequest::new(FileId::new(owner, 1).map_err(|_| ReaderSessionError::IdentityExhausted)?,
             SourceRevision::new(owner, 1).map_err(|_| ReaderSessionError::IdentityExhausted)?)?;
         let capture = self.capture.share_with_request(request)?;
-        let session = Self::retained(capture, self.capture_sha256, &self.path, self.encoding, budget,
+        let mut session = Self::retained(capture, self.capture_sha256, &self.path, self.encoding, budget,
             self._source_lease.clone(), state_lease);
+        session.highlight = self.highlight.clone();
         check(&mut canceled)?;
         Ok(session)
     }
@@ -362,6 +367,7 @@ impl ReaderSession {
         selected: Option<(SelectionIdentity, ByteRange)>, first_line: Option<u64>, canceled: &mut impl FnMut() -> bool)
         -> Result<HostResponse, ReaderSessionError> {
         check(canceled)?;
+        self.prepare_highlight(canceled)?;
         let [extent_id, decode_id] = self.allocations()?;
         let end = requested.start().get().saturating_add(max_bytes as u64).min(requested.end().get());
         let visible = range(requested.start().get(), end)?;
@@ -402,6 +408,7 @@ impl ReaderSession {
             out.literal(",\"end\":")?; out.integer(decoded.end().get())?;
             out.literal("},\"original_hex\":")?; out.hex(original)?; out.literal("}")?;
         } else { out.literal("null")?; }
+        self.encode_highlight(&mut out, text.range(), text.text(), text.has_replacements(), canceled)?;
         out.literal("}\n")?;
         self.finish_output(out, if limited { EXIT_PARTIAL } else { EXIT_OK }, canceled)
     }

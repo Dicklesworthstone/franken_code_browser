@@ -46,6 +46,11 @@ char *fcb_reader_info(uint64_t handle);
 
 /* Original-byte windows: 4 <= bytes <= MAX_WINDOW_BYTES. Text uses the shared
  * UTF-8/BOM-UTF-16 decoder with exact raw hex and explicit replacement flags.
+ * The additive highlight object carries capture-derived, page-local UTF-16
+ * token runs (at most 8192) or an explicit plain-text fallback. Validate the
+ * enclosing owner/capture and full run coverage before styling; token offsets
+ * are NOT original-byte copy positions. Lexing uses the complete retained
+ * capture once, never an arbitrary page as a new file. No C ABI change.
  * This is logical text, NOT measured/shaped native font or bidi geometry. */
 char *fcb_reader_window(uint64_t handle, uint64_t offset, uint64_t bytes);
 

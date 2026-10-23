@@ -79,6 +79,55 @@ partial-scalar selections, NUL and malformed source. It does not claim decoded
 clipboard text. No operation publishes a native clipboard or writes a source
 file. The host chooses any subsequent external action explicitly.
 
+## Capture-correct syntax in source pages
+
+Source-window responses (`window`, `lines`, hit previews and other services that
+return the same source window) now include an additive `highlight` object. This
+does not change C function signatures or the `fcb.reader-session/1` envelope.
+Older hosts may ignore it; native hosts validate it before styling a page.
+
+```json
+{
+  "state": "highlighted",
+  "language": "rust",
+  "coordinate_space": "window-utf16",
+  "source_context": "complete-capture",
+  "runs": [{"start": "0", "length": "9", "role": "comment"}]
+}
+```
+
+Offsets and lengths are canonical decimal strings in **the returned page's
+UTF-16 text**, not original-byte positions or offsets in the whole file. A
+highlighted page has contiguous positive-length runs covering its complete
+text; an empty highlighted page has no runs. Roles are `plain`, `keyword`,
+`type`, `function`, `string`, `number`, `comment`, `operator`, and `punctuation`.
+Consumers must still match the surrounding capture identity and validate all
+ranges, scalar boundaries and the 8192-run page limit before applying colors.
+Styling neither rewrites source nor authorizes a different copy/selection range.
+
+The first source page prepares and retains lexical classes from the complete
+immutable UTF-8 capture through `fcb-document`'s existing FrankenMarkdown
+adapter. Later pages reuse that preparation and clip it to the actual decoded
+window. A page starting inside a multiline comment or string therefore retains
+its preceding context. No page substring is passed to the lexer as an independent
+file. Only an initial UTF-8 BOM is omitted from lexical input; CR/LF/CRLF,
+supplementary characters, interior BOM characters and NUL remain source data.
+
+Preparation is bounded synchronous worker work over at most 4 MiB, with managed
+allocation admission and cancellation checks before and after the upstream
+whole-capture call. That call is not a resumable or interruptible lexer. Cached
+classes and sparse coordinate checkpoints belong to this immutable capture;
+forks can share prepared classes while retaining independent reader and query state.
+Repainting or changing a palette requires no new classification.
+
+Optional syntax cannot make otherwise admitted source unreadable. Unsupported
+languages use `plain`; UTF-16 and malformed UTF-8 use `unsupported_encoding` in
+this integration. `source_limit`, `admission_denied`, `invalid_spans` and
+`page_limit` report bounded fallback conditions. Every fallback has empty `runs`
+and leaves the exact source window, search selection and raw copy unchanged.
+The shared decoder still reads UTF-16 normally. Lexical colors remain lexical
+evidence and do not establish compiler semantics or qualification of a language.
+
 ## Cancellation, concurrency, admission
 
 All source/query work remains synchronous on the calling host worker. The
