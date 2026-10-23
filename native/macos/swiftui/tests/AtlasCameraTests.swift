@@ -244,6 +244,170 @@ import CoreGraphics
         precondition(resizedFlight.offsetX + project.width * resizedFlight.scale >= enlarged.width &&
                      resizedFlight.offsetY + project.height * resizedFlight.scale >= enlarged.height)
         precondition(resizedFlight.contentBounds == project)
+        navigationHistory()
         print("AtlasCamera: \(count) numeric assertions plus lifecycle checks passed")
+    }
+
+    static func navigationHistory() {
+        let size = CGSize(width: 800, height: 600)
+        let project = CGRect(x: 0, y: 0, width: 10000, height: 10000)
+        let a = CGRect(x: 4200, y: 3100, width: 200, height: 400)
+        let b = CGRect(x: 1200, y: 1400, width: 200, height: 200)
+        let c = CGRect(x: 6200, y: 5400, width: 300, height: 200)
+        let revision = UUID()
+        func camera(reduced: Bool = true) -> AtlasCamera {
+            let result = AtlasCamera(); result.reducedMotion = reduced
+            result.bindNavigation(to: revision)
+            precondition(result.fit(bounds: project, viewport: size))
+            return result
+        }
+        func position(_ camera: AtlasCamera, _ viewport: CGSize) -> (scale: Double, center: CGPoint) {
+            (camera.scale, camera.worldPoint(at: CGPoint(x: viewport.width / 2, y: viewport.height / 2)))
+        }
+        func same(_ camera: AtlasCamera, _ expected: (scale: Double, center: CGPoint),
+                  _ viewport: CGSize, _ label: String) {
+            let actual = position(camera, viewport)
+            near(actual.scale, expected.scale, "\(label) scale")
+            near(actual.center.x, expected.center.x, "\(label) world center x")
+            near(actual.center.y, expected.center.y, "\(label) world center y")
+        }
+        func settle(_ camera: AtlasCamera, _ viewport: CGSize) {
+            for i in 0...900 { camera.tick(now: 2000 + Double(i) / 120, viewport: viewport) }
+            precondition(!camera.isAnimating, "history flight must settle and stop redraw")
+        }
+        let history = camera()
+        let initial = position(history, size)
+        precondition(!history.canGoBack(revision: revision) && !history.canGoForward(revision: revision))
+        precondition(history.navigateFocus(bounds: a, viewport: size, revision: revision))
+        let atA = position(history, size)
+        for _ in 0..<20 { precondition(history.navigateFocus(bounds: a, viewport: size, revision: revision)) }
+        precondition(history.retainedNavigationCount == 1, "repeated focus flooded history")
+        precondition(history.navigateFocus(bounds: b, viewport: size, revision: revision))
+        let atB = position(history, size)
+        precondition(history.goBack(viewport: size, revision: revision))
+        same(history, atA, size, "Back returns to A")
+        precondition(!history.isAnimating, "reduced-motion history must restore directly")
+        precondition(history.goForward(viewport: size, revision: revision))
+        same(history, atB, size, "Forward returns to B")
+        precondition(history.goBack(viewport: size, revision: revision))
+        precondition(history.navigateFocus(bounds: c, viewport: size, revision: revision))
+        let atC = position(history, size)
+        precondition(!history.canGoForward(revision: revision), "new focus did not discard old Forward branch")
+        precondition(history.goBack(viewport: size, revision: revision)); same(history, atA, size, "branch keeps A")
+        precondition(history.goBack(viewport: size, revision: revision)); same(history, initial, size, "branch keeps project")
+        precondition(!history.goBack(viewport: size, revision: revision), "Back escaped oldest entry")
+        precondition(history.navigateFit(bounds: project, viewport: size, revision: revision))
+        precondition(history.retainedNavigationCount == 2 && history.canGoForward(revision: revision),
+                     "fitting the current project view added a duplicate or discarded Forward")
+        precondition(history.goForward(viewport: size, revision: revision)); same(history, atA, size, "branch Forward A")
+        precondition(history.goForward(viewport: size, revision: revision)); same(history, atC, size, "branch Forward C")
+        precondition(!history.goForward(viewport: size, revision: revision))
+        precondition(history.navigateFit(bounds: project, viewport: size, revision: revision))
+        same(history, initial, size, "explicit Fit atlas")
+        precondition(history.goBack(viewport: size, revision: revision)); same(history, atC, size, "Fit is reversible")
+
+        let explored = camera()
+        explored.navigateFocus(bounds: a, viewport: size, revision: revision)
+        explored.navigateFocus(bounds: b, viewport: size, revision: revision)
+        for _ in 0..<100 {
+            explored.scroll(dx: 1, dy: -2)
+            explored.steerWheelZoom(delta: 0.1, precise: true, at: CGPoint(x: 250, y: 170))
+        }
+        explored.drag(translation: .zero, now: 1)
+        explored.drag(translation: CGSize(width: 20, height: 30), now: 1.05)
+        explored.endPan(now: 2)
+        let resized = CGSize(width: 1100, height: 900)
+        explored.updateViewport(resized)
+        let manual = position(explored, resized)
+        precondition(explored.retainedNavigationCount == 2, "pan, zoom or resize flooded history")
+        precondition(explored.goBack(viewport: resized, revision: revision))
+        same(explored, atA, resized, "resized Back preserves saved world center")
+        precondition(explored.goForward(viewport: resized, revision: revision))
+        same(explored, manual, resized, "Forward restores the manually explored view")
+
+        let dense = camera(); dense.fillsViewport = true
+        dense.fit(bounds: CGRect(x: 0, y: 0, width: 1000, height: 1000), viewport: size)
+        dense.navigateFocus(bounds: CGRect(x: 0, y: 0, width: 100, height: 100), viewport: size, revision: revision)
+        dense.navigateFocus(bounds: CGRect(x: 400, y: 500, width: 400, height: 300), viewport: size, revision: revision)
+        let enlarged = CGSize(width: 6000, height: 4000)
+        dense.updateViewport(enlarged)
+        precondition(dense.goBack(viewport: enlarged, revision: revision))
+        precondition(dense.scale >= 6 && dense.offsetX <= 0 && dense.offsetY <= 0,
+                     "history restore ignored the resized viewport's minimum scale")
+        precondition(dense.offsetX + 1000 * dense.scale >= enlarged.width &&
+                     dense.offsetY + 1000 * dense.scale >= enlarged.height,
+                     "restoring an edge location exposed space outside the atlas")
+
+        let invalid = camera()
+        invalid.navigateFocus(bounds: a, viewport: size, revision: revision)
+        let before = position(invalid, size), retained = invalid.retainedNavigationCount
+        for bounds in [CGRect.zero, CGRect(x: Double.nan, y: 0, width: 1, height: 1),
+                       CGRect(x: Double.greatestFiniteMagnitude, y: 0, width: Double.greatestFiniteMagnitude, height: 1)] {
+            precondition(!invalid.navigateFocus(bounds: bounds, viewport: size, revision: revision))
+            precondition(!invalid.navigateFit(bounds: bounds, viewport: size, revision: revision))
+        }
+        for viewport in [CGSize.zero, CGSize(width: Double.infinity, height: 600)] {
+            precondition(!invalid.goBack(viewport: viewport, revision: revision))
+            precondition(!invalid.navigateFocus(bounds: b, viewport: viewport, revision: revision))
+        }
+        same(invalid, before, size, "invalid navigation is atomic")
+        precondition(invalid.retainedNavigationCount == retained && invalid.canGoBack(revision: revision))
+        let replacement = UUID()
+        invalid.bindNavigation(to: replacement)
+        precondition(invalid.retainedNavigationCount == 0 && !invalid.canGoBack(revision: revision)
+            && !invalid.canGoForward(revision: replacement), "layout replacement retained stale locations")
+        precondition(!invalid.goBack(viewport: size, revision: revision))
+        precondition(!invalid.navigateFocus(bounds: b, viewport: size, revision: revision))
+        precondition(!invalid.navigateFit(bounds: project, viewport: size, revision: revision))
+        same(invalid, before, size, "stale atlas callback cannot move the new layout")
+        precondition(invalid.navigateFocus(bounds: b, viewport: size, revision: replacement))
+        invalid.bindNavigation(to: replacement)
+        precondition(invalid.retainedNavigationCount == 1, "rebinding the same layout erased history")
+        let oldGesture = camera()
+        oldGesture.drag(translation: CGSize(width: 100, height: 40), now: 1)
+        oldGesture.bindNavigation(to: replacement)
+        precondition(!oldGesture.isDragging && !oldGesture.isAnimating, "layout replacement retained an old gesture")
+        let rebasedX = oldGesture.offsetX
+        oldGesture.drag(translation: CGSize(width: 3, height: 0), now: 2)
+        near(oldGesture.offsetX, rebasedX + 3, "new layout starts a fresh drag translation")
+        oldGesture.endPan(now: 3)
+
+        let animated = camera(reduced: false)
+        animated.navigateFocus(bounds: a, viewport: size, revision: revision)
+        animated.navigateFocus(bounds: b, viewport: size, revision: revision)
+        precondition(animated.retainedNavigationCount == 2, "in-flight retargeting lost intentional endpoints")
+        precondition(animated.goBack(viewport: size, revision: revision))
+        settle(animated, size); same(animated, atA, size, "Back interrupts a flight at its semantic endpoint")
+        precondition(animated.goForward(viewport: size, revision: revision))
+        animated.tick(now: 1000, viewport: size); animated.tick(now: 1000.05, viewport: size)
+        animated.scroll(dx: 7, dy: 9)
+        let interrupted = position(animated, size)
+        settle(animated, size); same(animated, interrupted, size, "direct input cancels history flight")
+        precondition(animated.goBack(viewport: size, revision: revision)); settle(animated, size)
+        precondition(animated.goForward(viewport: size, revision: revision)); settle(animated, size)
+        same(animated, interrupted, size, "Forward restores the interrupted view")
+        animated.drag(translation: .zero, now: 3000)
+        animated.drag(translation: CGSize(width: 10, height: 0), now: 3000.01)
+        let dragX = animated.offsetX
+        precondition(animated.goBack(viewport: size, revision: revision))
+        animated.drag(translation: CGSize(width: 12, height: 0), now: 3000.02)
+        animated.tick(now: 3000.03, viewport: size)
+        near(animated.offsetX, dragX + 2, "continued drag cancels keyboard history without duplicating translation")
+        animated.endPan(now: 3001)
+        precondition(!animated.isAnimating)
+
+        let bounded = camera()
+        for index in 0..<150 {
+            precondition(bounded.navigateFocus(bounds: CGRect(x: Double(index) * 30, y: Double(index) * 11, width: 80, height: 80),
+                viewport: size, revision: revision))
+        }
+        precondition(bounded.retainedNavigationCount == 128, "history exceeded its shared bound")
+        for _ in 0..<128 { precondition(bounded.goBack(viewport: size, revision: revision)) }
+        precondition(!bounded.goBack(viewport: size, revision: revision) && bounded.retainedNavigationCount == 128)
+        for _ in 0..<128 { precondition(bounded.goForward(viewport: size, revision: revision)) }
+        precondition(!bounded.goForward(viewport: size, revision: revision) && bounded.retainedNavigationCount == 128)
+        let independent = camera()
+        precondition(!independent.canGoBack(revision: revision) && independent.retainedNavigationCount == 0,
+                     "another camera borrowed history from the same layout UUID")
     }
 }

@@ -178,6 +178,7 @@ fn production_swift_camera_source_and_shell() {
         "-typecheck",
         "-parse-as-library",
         "swiftui/AtlasCamera.swift",
+        "swiftui/AtlasNavigationHistory.swift",
         "swiftui/AtlasSource.swift",
         "swiftui/AtlasSourceReader.swift",
         "swiftui/AtlasSearch.swift",

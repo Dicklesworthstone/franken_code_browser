@@ -1000,6 +1000,14 @@ extension AtlasCamera {
         pinnedReaders.pin(reader, root: root, label: page.identity.displayPath)
     }
 
+    /// Revoke old camera coordinates when publishing a layout, before a
+    /// queued action from the previous SwiftUI canvas can run.
+    private func renewAtlasRevision() {
+        let revision = UUID()
+        camera.bindNavigation(to: revision)
+        atlasRevision = revision
+    }
+
     /// Project opening performs only the bounded metadata operation. Text
     /// capture/highlighting/raster preparation is an explicit subsequent action.
     private func requestAtlasLoad() {
@@ -1042,7 +1050,7 @@ extension AtlasCamera {
         showsReader = false
         showsCatalog = true
         focusRequest = UUID()
-        atlasRevision = UUID()
+        renewAtlasRevision()
         files = []
         displayedFiles = []
         catalogEntries = []
@@ -1252,7 +1260,7 @@ extension AtlasCamera {
         atlasDocuments = documents
         displayedFiles = scopedFiles
         textTiles = display
-        atlasRevision = UUID()
+        renewAtlasRevision()
         if let bounds { contentBounds = bounds; camera.contentBounds = bounds }
         projectOpening.finishPreviews(ticket, available: true)
         loadTask = nil; loadCancellation = nil; loadProgress = ""
@@ -1298,7 +1306,7 @@ extension AtlasCamera {
         } else { textTiles = [] }
         displayedFiles = scoped
         updateCatalogFilter()
-        atlasRevision = UUID()
+        renewAtlasRevision()
         status = "\(scoped.count) of \(files.count) files · \(fileScope.rawValue). Search uses the selected file types."
         if !loadingProject && !query.isEmpty { runSearch(debounce: true) }
     }
@@ -1791,6 +1799,7 @@ struct AtlasCanvas: View {
                         presentedFrame.record(revision: revision, scale: scale, offset: offset)
                     })
                 .onChange(of: timeline.date) { _, _ in
+                    guard camera.acceptsNavigation(revision: revision) else { return }
                     camera.tick(now: ProcessInfo.processInfo.systemUptime, viewport: size)
                 }
             }
@@ -1802,23 +1811,26 @@ struct AtlasCanvas: View {
                         state = value.translation
                     }
                     .onChanged { value in
+                        guard camera.acceptsNavigation(revision: revision) else { return }
                         camera.drag(location: value.location, start: value.startLocation,
                                     now: ProcessInfo.processInfo.systemUptime)
                     }
                     .onEnded { _ in
+                        guard camera.acceptsNavigation(revision: revision) else { return }
                         camera.endPan(now: ProcessInfo.processInfo.systemUptime)
                     }
             )
             .simultaneousGesture(
                 SpatialTapGesture(count: 2)
                     .onEnded { value in
+                        guard camera.acceptsNavigation(revision: revision) else { return }
                         camera.steerZoom(by: 2.2, at: value.location)
                     }
             )
             .simultaneousGesture(
                 SpatialTapGesture()
                     .onEnded { value in
-                        guard dragDelta == .zero,
+                        guard camera.acceptsNavigation(revision: revision), dragDelta == .zero,
                               let point = presentedFrame.worldPoint(at: value.location, revision: revision),
                               let tile = tiles.last(where: { ($0.parcelRect ?? $0.rect).contains(point) }),
                               let file = files.first(where: { $0.path == tile.path }) else {
@@ -1829,8 +1841,10 @@ struct AtlasCanvas: View {
             )
             .overlay {
                 AtlasInputOverlay(onZoom: { factor, point, immediate in
+                    guard camera.acceptsNavigation(revision: revision) else { return }
                     camera.steerZoom(by: factor, at: point, immediate: immediate)
                 }, onWheel: { delta, point, precise in
+                    guard camera.acceptsNavigation(revision: revision) else { return }
                     camera.steerWheelZoom(delta: delta, precise: precise, at: point)
                 })
             }
@@ -1838,12 +1852,17 @@ struct AtlasCanvas: View {
                 camera.reducedMotion = reduceMotion
             }
             .onChange(of: reduceMotion) { _, value in camera.reducedMotion = value }
+            .onChange(of: revision, initial: true) { _, value in
+                guard camera.acceptsNavigation(revision: value) else { return }
+                initialFitPending = !camera.fit(bounds: contentBounds, viewport: size)
+            }
             .onChange(of: focusRequest) { _, _ in
                 guard let path = selectedPath, let first = tiles.first(where: { $0.path == path }) else { return }
-                camera.focus(bounds: selectedMatch?.focusRect ?? first.rect, viewport: size)
+                camera.navigateFocus(bounds: selectedMatch?.focusRect ?? first.rect, viewport: size, revision: revision)
             }
             .onChange(of: size, initial: true) { _, newSize in
                 viewport = newSize
+                guard camera.acceptsNavigation(revision: revision) else { return }
                 camera.updateViewport(newSize)
                 // onAppear can precede the first usable GeometryReader size.
                 // Retry until fit succeeds, then leave navigation under user control.
@@ -1854,6 +1873,23 @@ struct AtlasCanvas: View {
             .overlay(alignment: .bottomLeading) {
                 HStack(spacing: 8) {
                     Button {
+                        camera.goBack(viewport: viewport, revision: revision)
+                    } label: {
+                        Label("Atlas Back", systemImage: "chevron.backward")
+                    }
+                    .disabled(!camera.canGoBack(revision: revision))
+                    .keyboardShortcut("[", modifiers: .command)
+                    .help("Return to the previous atlas location (⌘[)")
+                    Button {
+                        camera.goForward(viewport: viewport, revision: revision)
+                    } label: {
+                        Label("Atlas Forward", systemImage: "chevron.forward")
+                    }
+                    .disabled(!camera.canGoForward(revision: revision))
+                    .keyboardShortcut("]", modifiers: .command)
+                    .help("Revisit the next atlas location (⌘])")
+                    Button {
+                        guard camera.acceptsNavigation(revision: revision) else { return }
                         camera.steerZoom(by: 1 / 1.6, at: CGPoint(x: viewport.width / 2, y: viewport.height / 2))
                     } label: {
                         Image(systemName: "minus.magnifyingglass")
@@ -1862,12 +1898,13 @@ struct AtlasCanvas: View {
                         .font(.system(size: 11, design: .monospaced))
                         .monospacedDigit()
                     Button {
+                        guard camera.acceptsNavigation(revision: revision) else { return }
                         camera.steerZoom(by: 1.6, at: CGPoint(x: viewport.width / 2, y: viewport.height / 2))
                     } label: {
                         Image(systemName: "plus.magnifyingglass")
                     }
                     Button {
-                        camera.fit(bounds: contentBounds, viewport: viewport)
+                        camera.navigateFit(bounds: contentBounds, viewport: viewport, revision: revision)
                     } label: {
                         Image(systemName: "arrow.down.right.and.arrow.up.left")
                     }

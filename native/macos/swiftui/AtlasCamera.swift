@@ -27,6 +27,14 @@ final class AtlasPresentedFrame {
 /// Screen-space interaction state. Native momentum is applied directly; only
 /// pointer drags generate our own glide. No I/O or content work belongs here.
 @Observable final class AtlasCamera {
+    /// World centers survive viewport resizing; pixel offsets do not. These
+    /// positions belong only to the bound atlas layout, never to source bytes.
+    private struct Location: Equatable {
+        let center: CGPoint
+        let scale: Double
+    }
+    private var navigationRevision: UUID?
+    private var navigationHistory = AtlasNavigationHistory<Location>()
     var scale: Double = 0.2
     var offsetX: Double = 0
     var offsetY: Double = 0
@@ -49,6 +57,114 @@ final class AtlasPresentedFrame {
         focusCenter != nil || anchorActive || (!isDragging && hypot(panVelocity.x, panVelocity.y) > 1)
     }
 
+    var retainedNavigationCount: Int { navigationHistory.retainedCount }
+    func acceptsNavigation(revision: UUID) -> Bool { navigationRevision == revision }
+    func canGoBack(revision: UUID) -> Bool {
+        navigationRevision == revision && navigationHistory.canBack
+    }
+    func canGoForward(revision: UUID) -> Bool {
+        navigationRevision == revision && navigationHistory.canForward
+    }
+
+    /// Reflow or project/scope replacement retires the coordinate domain. An
+    /// old view's queued button action cannot navigate the replacement atlas.
+    func bindNavigation(to revision: UUID) {
+        guard navigationRevision != revision else { return }
+        stopMotion()
+        isDragging = false
+        lastTranslation = .zero
+        lastDragTime = nil
+        navigationRevision = revision
+        navigationHistory.reset()
+    }
+
+    @discardableResult
+    func navigateFocus(bounds: CGRect, viewport: CGSize, revision: UUID) -> Bool {
+        guard navigationRevision == revision, let origin = navigationLocation(viewport: viewport),
+              focus(bounds: bounds, viewport: viewport),
+              let target = navigationLocation(viewport: viewport) else { return false }
+        recordNavigation(from: origin, to: target)
+        return true
+    }
+
+    @discardableResult
+    func navigateFit(bounds: CGRect, viewport: CGSize, revision: UUID) -> Bool {
+        guard navigationRevision == revision, let origin = navigationLocation(viewport: viewport),
+              fit(bounds: bounds, viewport: viewport),
+              let target = navigationLocation(viewport: viewport) else { return false }
+        recordNavigation(from: origin, to: target)
+        return true
+    }
+
+    @discardableResult
+    func goBack(viewport: CGSize, revision: UUID) -> Bool {
+        navigateHistory(back: true, viewport: viewport, revision: revision)
+    }
+    @discardableResult
+    func goForward(viewport: CGSize, revision: UUID) -> Bool {
+        navigateHistory(back: false, viewport: viewport, revision: revision)
+    }
+
+    private func navigationLocation(viewport: CGSize) -> Location? {
+        guard viewport.width.isFinite, viewport.height.isFinite, viewport.width > 1, viewport.height > 1 else { return nil }
+        // A second explicit action during a flight remembers the intended
+        // endpoint. Direct input cancels focusCenter and resumes from the view
+        // actually reached, rather than adding each animation/gesture frame.
+        let center = focusCenter ?? worldPoint(at: CGPoint(x: viewport.width / 2, y: viewport.height / 2))
+        let value = focusCenter == nil ? scale : targetScale
+        guard center.x.isFinite, center.y.isFinite, value.isFinite, value > 0 else { return nil }
+        return Location(center: center, scale: value)
+    }
+
+    private func recordNavigation(from origin: Location, to target: Location) {
+        // Floating-point inversion at a settled endpoint can differ by a
+        // fraction of a pixel. Repeating the same focus must not add a step.
+        if abs(log(origin.scale / target.scale)) < 1e-10,
+           hypot(origin.center.x - target.center.x, origin.center.y - target.center.y) * target.scale < 1e-6 {
+            navigationHistory.replaceCurrent(target)
+            return
+        }
+        navigationHistory.replaceCurrent(origin)
+        let move = navigationHistory.visit(target)
+        navigationHistory.commit(move, resolved: target)
+    }
+
+    private func navigateHistory(back: Bool, viewport: CGSize, revision: UUID) -> Bool {
+        guard navigationRevision == revision,
+              let origin = navigationLocation(viewport: viewport),
+              let proposal = back ? navigationHistory.back() : navigationHistory.forward() else { return false }
+        var destination = proposal.target
+        if fillsViewport {
+            guard contentBounds.width > 0, contentBounds.height > 0 else { return false }
+            let scale = max(destination.scale, max(viewport.width / contentBounds.width, viewport.height / contentBounds.height))
+            guard scale.isFinite, scale > 0 else { return false }
+            let halfWidth = viewport.width / (2 * scale), halfHeight = viewport.height / (2 * scale)
+            destination = Location(center: CGPoint(
+                x: min(contentBounds.maxX - halfWidth, max(contentBounds.minX + halfWidth, destination.center.x)),
+                y: min(contentBounds.maxY - halfHeight, max(contentBounds.minY + halfHeight, destination.center.y))), scale: scale)
+        }
+        guard destination.center.x.isFinite, destination.center.y.isFinite,
+              (viewport.width / 2 - destination.center.x * destination.scale).isFinite,
+              (viewport.height / 2 - destination.center.y * destination.scale).isFinite else { return false }
+        // Refreshing current preserves the latest manually explored view for
+        // the return journey without creating a history entry for every pan.
+        navigationHistory.replaceCurrent(origin)
+        guard let move = back ? navigationHistory.back() : navigationHistory.forward(),
+              navigationHistory.commit(move, resolved: destination) else { return false }
+        stopMotion()
+        viewportSize = viewport
+        targetScale = destination.scale
+        focusCenter = destination.center
+        if reducedMotion {
+            scale = targetScale
+            offsetX = viewport.width / 2 - destination.center.x * scale
+            offsetY = viewport.height / 2 - destination.center.y * scale
+            focusCenter = nil
+            constrainToContent()
+        }
+        return true
+    }
+
     func stopMotion() {
         targetScale = scale
         focusCenter = nil
@@ -61,17 +177,22 @@ final class AtlasPresentedFrame {
     func fit(bounds: CGRect, viewport: CGSize) -> Bool {
         guard bounds.minX.isFinite, bounds.minY.isFinite,
               bounds.width.isFinite, bounds.height.isFinite,
+              bounds.maxX.isFinite, bounds.maxY.isFinite, bounds.midX.isFinite, bounds.midY.isFinite,
               viewport.width.isFinite, viewport.height.isFinite,
               bounds.width > 0, bounds.height > 0, viewport.width > 1, viewport.height > 1 else { return false }
+        let horizontal = viewport.width / bounds.width
+        let vertical = viewport.height / bounds.height
+        let fittedScale: Double = max(0.000001, fillsViewport ? max(horizontal, vertical) : min(horizontal, vertical) * 0.96)
+        let x = viewport.width / 2 - bounds.midX * fittedScale
+        let y = viewport.height / 2 - bounds.midY * fittedScale
+        guard fittedScale.isFinite, x.isFinite, y.isFinite else { return false }
         stopMotion()
         contentBounds = bounds
         viewportSize = viewport
-        let horizontal = viewport.width / bounds.width
-        let vertical = viewport.height / bounds.height
-        scale = max(0.000001, fillsViewport ? max(horizontal, vertical) : min(horizontal, vertical) * 0.96)
+        scale = fittedScale
         targetScale = scale
-        offsetX = viewport.width / 2 - bounds.midX * scale
-        offsetY = viewport.height / 2 - bounds.midY * scale
+        offsetX = x
+        offsetY = y
         return true
     }
 
@@ -81,20 +202,25 @@ final class AtlasPresentedFrame {
     func focus(bounds: CGRect, viewport: CGSize) -> Bool {
         guard bounds.minX.isFinite, bounds.minY.isFinite,
               bounds.width.isFinite, bounds.height.isFinite,
+              bounds.maxX.isFinite, bounds.maxY.isFinite, bounds.midX.isFinite, bounds.midY.isFinite,
               bounds.width > 0, bounds.height > 0,
               viewport.width.isFinite, viewport.height.isFinite,
               viewport.width > 1, viewport.height > 1 else { return false }
-        stopMotion()
-        viewportSize = viewport
-        targetScale = max(minimumScale, min(4096,
+        let fittedScale = max(minimumScale(viewport: viewport), min(4096,
             min(viewport.width / bounds.width, viewport.height / bounds.height) * 0.88))
         var destination = CGPoint(x: bounds.midX, y: bounds.midY)
         if fillsViewport {
-            let halfWidth = viewport.width / (2 * targetScale)
-            let halfHeight = viewport.height / (2 * targetScale)
+            let halfWidth = viewport.width / (2 * fittedScale)
+            let halfHeight = viewport.height / (2 * fittedScale)
             destination.x = min(contentBounds.maxX - halfWidth, max(contentBounds.minX + halfWidth, destination.x))
             destination.y = min(contentBounds.maxY - halfHeight, max(contentBounds.minY + halfHeight, destination.y))
         }
+        guard fittedScale.isFinite, destination.x.isFinite, destination.y.isFinite,
+              (viewport.width / 2 - destination.x * fittedScale).isFinite,
+              (viewport.height / 2 - destination.y * fittedScale).isFinite else { return false }
+        stopMotion()
+        viewportSize = viewport
+        targetScale = fittedScale
         focusCenter = destination
         if reducedMotion {
             scale = targetScale
@@ -107,8 +233,12 @@ final class AtlasPresentedFrame {
     }
 
     private var minimumScale: Double {
+        minimumScale(viewport: viewportSize)
+    }
+
+    private func minimumScale(viewport: CGSize) -> Double {
         guard fillsViewport, contentBounds.width > 0, contentBounds.height > 0 else { return 0.000001 }
-        return max(0.000001, max(viewportSize.width / contentBounds.width, viewportSize.height / contentBounds.height))
+        return max(0.000001, max(viewport.width / contentBounds.width, viewport.height / contentBounds.height))
     }
 
     func updateViewport(_ size: CGSize) {
@@ -196,6 +326,9 @@ final class AtlasPresentedFrame {
     /// translation is cumulative from the gesture origin, never a location.
     func drag(translation: CGSize, now: Double) {
         guard translation.width.isFinite, translation.height.isFinite, now.isFinite else { return }
+        // A keyboard history action can begin while a mouse button remains
+        // down. Its next delta resumes that drag and cancels the flight.
+        if focusCenter != nil || anchorActive { stopMotion() }
         if !isDragging {
             stopMotion()
             isDragging = true

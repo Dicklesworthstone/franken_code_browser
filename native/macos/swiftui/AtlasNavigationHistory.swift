@@ -1,9 +1,9 @@
 import Foundation
 
-/// Bounded, transactional navigation shared by the retained source and Markdown
-/// readers. Proposing a move does not mutate history: failed/canceled I/O leaves
+/// Bounded, transactional navigation shared by source/Markdown readers and the
+/// atlas camera. Proposing a move does not mutate history: failed/canceled I/O leaves
 /// both directions intact. Only a successfully published destination is recorded.
-/// Owners store capture-relative anchors, never handles, pages or source payload.
+/// Owners store source/layout-relative anchors, never handles, pages or source payload.
 struct AtlasNavigationHistory<Position: Equatable> {
     enum Direction { case visit, back, forward }
     struct Move {
@@ -31,6 +31,15 @@ struct AtlasNavigationHistory<Position: Equatable> {
     }
     func forward() -> Move? {
         following.last.map { Move(target: $0, revision: revision, direction: .forward) }
+    }
+
+    /// Refresh an existing location's presentation state without adding a
+    /// navigation step or discarding Forward. The camera uses this only at an
+    /// explicit navigation action, after direct pan/zoom has changed its view.
+    mutating func replaceCurrent(_ position: Position) {
+        guard current != position else { return }
+        current = position
+        revision = UUID()
     }
 
     /// `resolved` can differ from the request: a search/symbol activation must be

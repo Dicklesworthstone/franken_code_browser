@@ -13,6 +13,7 @@ fn main() {
         "swiftui/Resources/AppIcon.icns",
         "swiftui/App.swift",
         "swiftui/AtlasCamera.swift",
+        "swiftui/AtlasNavigationHistory.swift",
         "swiftui/AtlasSource.swift",
         "swiftui/AtlasSearch.swift",
         "swiftui/AtlasMatch.swift",
