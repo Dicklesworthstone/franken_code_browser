@@ -4,6 +4,13 @@ enum AtlasSavedReaderOrigin: Sendable {
     case member
     case relationship(generation: UInt64, link: AtlasSavedLink, side: AtlasSavedLinkSide)
     case hit(generation: UInt64, needle: String, hit: AtlasSavedHit)
+    case expressionHit(generation: UInt64, expression: String, primaryNeedle: String, hit: AtlasSavedHit)
+    var searchHit: AtlasSavedHit? {
+        switch self {
+        case .hit(_, _, let hit), .expressionHit(_, _, _, let hit): return hit
+        case .member, .relationship: return nil
+        }
+    }
 }
 
 /// Original-byte evidence for one accepted saved-search occurrence. It does not
@@ -54,6 +61,7 @@ struct AtlasSavedReaderReceipt: Sendable {
         switch origin {
         case .member, .hit: command = "open-reader"
         case .relationship: command = "relationships-open-reader"
+        case .expressionHit: command = "expression-open-reader"
         }
         let data = try AtlasSavedWire.admit(json, handle: saved.owner, command: command, identity: saved)
         struct Common: Decodable {
@@ -80,6 +88,15 @@ struct AtlasSavedReaderReceipt: Sendable {
             }
             let request: AtlasReaderRequest
             let match: AtlasSavedMatchEvidence?
+            let selectionGeneration: String
+            if case .expressionHit(let generation, let expression, let primary, _) = origin {
+                guard AtlasSavedSearchWire.validNeedle(expression),
+                      object["selection_namespace"] as? String == "saved-expression",
+                      (object["expression_generation"] as? String).flatMap(AtlasReaderWire.integer) == generation,
+                      let acceptedPrimary = object["primary_needle"] as? String,
+                      acceptedPrimary.utf8.elementsEqual(primary.utf8) else { throw AtlasSavedError.invalidResponse }
+                selectionGeneration = "expression_generation"
+            } else { selectionGeneration = "query_generation" }
             switch origin {
             case .member:
                 guard object["selection"] is NSNull,
@@ -114,13 +131,13 @@ struct AtlasSavedReaderReceipt: Sendable {
                     }
                 }
                 request = .window(offset: 0, bytes: 16 * 1024); match = nil
-            case .hit(let generation, let needle, let hit):
+            case .hit(let generation, let needle, let hit), .expressionHit(let generation, _, let needle, let hit):
                 guard generation > 0, member.id == hit.member, member.file == hit.file, member.file == hit.revision,
                       member.path.bytes == hit.path.bytes, member.digest == hit.digest,
                       hit.start < hit.end, hit.end <= member.observedBytes, hit.end - hit.start <= 2048,
                       (object["reader_owner"] as? String).flatMap(AtlasReaderWire.integer) == destination,
                       let selected = object["selection"] as? [String: Any],
-                      (selected["query_generation"] as? String).flatMap(AtlasReaderWire.integer) == generation,
+                      (selected[selectionGeneration] as? String).flatMap(AtlasReaderWire.integer) == generation,
                       (selected["hit_id"] as? String).flatMap(AtlasReaderWire.integer) == hit.id,
                       selected["domain"] as? String == "original-source-bytes",
                       let range = selected["original_range"] as? [String: Any],
@@ -197,6 +214,8 @@ final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
                 : "Captured target opened at byte 0."
         case .hit(let generation, _, let hit):
             return "Saved search \(generation), occurrence \(hit.id) · exact original bytes \(hit.start)..<\(hit.end)"
+        case .expressionHit(let generation, _, _, let hit):
+            return "Saved expression \(generation), occurrence \(hit.id) · exact original bytes \(hit.start)..<\(hit.end)"
         }
     }
     var canUseMatch: Bool {

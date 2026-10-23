@@ -109,6 +109,11 @@ struct AtlasSavedInfo: Sendable {
     let path: AtlasSavedPath
     let relationshipGeneration: UInt64?
     let queryGeneration: UInt64?
+    let expressionGeneration: UInt64?
+    let lastExpressionAttempt: UInt64
+    /// Legacy transports can still serve literal queries. An omitted field
+    /// cannot establish that an expression clear or failed attempt succeeded.
+    let expressionStateKnown: Bool
     let initialArchiveBytes: UInt64
     let memberBytesRead: UInt64
     let memberReadCalls: UInt64
@@ -120,10 +125,13 @@ struct AtlasSavedInfo: Sendable {
             let w = try JSONDecoder().decode(Wire.self, from: data)
             guard w.path.bytes == expectedPath, w.path.bytes.first == 47,
                   w.initial.value <= 80 * 1024 * 1024,
-                  !fresh || (w.relationship == nil && w.query == nil && w.index == nil &&
+                  !fresh || (w.relationship == nil && w.query == nil && w.index == nil && w.expression == nil &&
+                    w.expressionAttempt == 0 &&
                     w.memberBytes.value == 0 && w.memberCalls.value == 0) else { throw AtlasSavedError.invalidResponse }
             return Self(identity: try JSONDecoder().decode(AtlasSavedIdentity.self, from: data),
-                path: w.path, relationshipGeneration: w.relationship, queryGeneration: w.query, initialArchiveBytes: w.initial.value,
+                path: w.path, relationshipGeneration: w.relationship, queryGeneration: w.query,
+                expressionGeneration: w.expression, lastExpressionAttempt: w.expressionAttempt,
+                expressionStateKnown: w.expressionKnown, initialArchiveBytes: w.initial.value,
                 memberBytesRead: w.memberBytes.value, memberReadCalls: w.memberCalls.value)
         } catch let error as AtlasSavedError { throw error }
         catch { throw AtlasSavedError.invalidResponse }
@@ -131,9 +139,13 @@ struct AtlasSavedInfo: Sendable {
     private struct Wire: Decodable {
         let path: AtlasSavedPath
         let relationship, query, index: UInt64?
+        let expression: UInt64?
+        let expressionAttempt: UInt64
+        let expressionKnown: Bool
         let initial, memberBytes, memberCalls: AtlasSavedNumber
         enum CodingKeys: CodingKey {
             case archive_path, accepted_relationship_generation, accepted_query_generation, accepted_index_generation,
+                 accepted_expression_generation, last_expression_attempt,
                  initial_archive_bytes_read, member_bytes_read, member_read_calls
         }
         init(from decoder: Decoder) throws {
@@ -147,6 +159,15 @@ struct AtlasSavedInfo: Sendable {
             path = try c.decode(AtlasSavedPath.self, forKey: .archive_path)
             relationship = try generation(.accepted_relationship_generation)
             query = try generation(.accepted_query_generation); index = try generation(.accepted_index_generation)
+            expressionKnown = c.contains(.accepted_expression_generation) && c.contains(.last_expression_attempt)
+            guard c.contains(.accepted_expression_generation) == c.contains(.last_expression_attempt) else {
+                throw AtlasSavedError.invalidResponse
+            }
+            if expressionKnown {
+                expression = try generation(.accepted_expression_generation)
+                expressionAttempt = try c.decode(AtlasSavedNumber.self, forKey: .last_expression_attempt).value
+            } else { expression = nil; expressionAttempt = 0 }
+            guard expression == nil || expression! <= expressionAttempt else { throw AtlasSavedError.invalidResponse }
             initial = try c.decode(AtlasSavedNumber.self, forKey: .initial_archive_bytes_read)
             memberBytes = try c.decode(AtlasSavedNumber.self, forKey: .member_bytes_read)
             memberCalls = try c.decode(AtlasSavedNumber.self, forKey: .member_read_calls)
@@ -366,6 +387,10 @@ enum AtlasSavedRequest: Sendable {
     case results(generation: UInt64, start: UInt64, limit: UInt64)
     case clearResults(generation: UInt64)
     case openHit(reader: UInt64, generation: UInt64, hit: UInt64)
+    case expressionSearch(generation: UInt64, query: String, matches: UInt64, scanBytes: UInt64)
+    case expressionResults(generation: UInt64, start: UInt64, limit: UInt64)
+    case clearExpression(generation: UInt64)
+    case openExpressionHit(reader: UInt64, generation: UInt64, hit: UInt64)
     case prepareRelationships(generation: UInt64, links: UInt64, bytes: UInt64)
     case relationships(generation: UInt64, direction: AtlasSavedDirection, member: UInt64?, start: UInt64, limit: UInt64)
     case clearRelationships(generation: UInt64)

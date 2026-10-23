@@ -25,6 +25,14 @@ import Dispatch
         precondition(model.queryGeneration == 1 && model.searchPage?.hits.count == 4)
         return model
     }
+    @MainActor private static func preparedExpression(_ fixture: SavedRepositoryFixture) async -> AtlasSavedRepositoryModel {
+        let model = await prepared(fixture)
+        model.searchMode = .expression; model.searchInput = "ana +banana -unsafe"; model.search()
+        await wait("saved expression did not finish") { !model.busy }
+        precondition(model.expressionGeneration == 1 && model.expressionPage?.hits.count == 4)
+        precondition(model.queryGeneration == 1 && model.relationshipGeneration == 1)
+        return model
+    }
     private static func rejected(_ message: String, _ operation: () throws -> Void) {
         do { try operation(); preconditionFailure(message) } catch { }
     }
@@ -39,7 +47,11 @@ import Dispatch
         await canceledSearchKeepsAcceptedQueriesAndRelationships()
         await invalidMetadataAndHitReceiptsNeverPublishReaders()
         await closeDuringHitHandoffDrainsAndRetires()
-        print("Saved decoded search, UTF-8/UTF-16 original matches, frozen identity, recovery and cancellation regressions passed.")
+        try expressionCoverageAndNamespaceContracts()
+        try await scopedExpressionsKeepExactReadersAndIndependentModes()
+        await expressionRecoveryCancellationAndArchiveReplacement()
+        await forgedExpressionReceiptsAndLateReadersRetire()
+        print("Saved literal and expression search, scoped coverage, UTF-8/UTF-16 matches, independent generations, recovery and cancellation regressions passed.")
     }
 
     private static func exactPageAndPartialCoverageContracts() throws {
@@ -285,5 +297,209 @@ import Dispatch
             f.calls.contains("reader-close:100") && f.calls.contains("saved-close:40")
         }
         precondition(model.closed && model.info == nil && model.queryGeneration == nil && !f.calls.contains("LIVE-OPEN"))
+    }
+
+    private static func expressionCoverageAndNamespaceContracts() throws {
+        let f = SavedRepositoryFixture(searchVectors: true), archivePath = Array("/saved/repository.fcbs".utf8)
+        let info = try AtlasSavedInfo.decode(f.encode(f.info(40)), handle: 40, expectedPath: archivePath, fresh: true)
+        func decode(_ object: [String: Any], query: String = "ana +banana -unsafe") throws -> AtlasSavedExpressionPage {
+            try AtlasSavedExpressionPage.decode(f.encode(object), identity: info.identity,
+                generation: 1, expression: query, start: 0, limit: 64)
+        }
+        let full = try decode(f.expressionPage(40, generation: 1))
+        precondition(full.state == "complete" && !full.complete && full.unavailable == 1)
+        precondition(full.required == 1 && full.excluded == 1 && full.primaryNeedle == "ana")
+        precondition(full.scannedBytes > full.sourceBytes, "predicate work was confused with unique payload I/O")
+        let scoped = try decode(f.expressionPage(40, generation: 1, query: "ana path:raw"), query: "ana path:raw")
+        precondition(scoped.complete && scoped.scopeFiles == 1 && scoped.filteredFiles == 4 && scoped.hits.count == 2)
+
+        var limited = f.expressionPage(40, generation: 1)
+        limited["state"] = "work-limit"; limited["max_scan_bytes"] = limited["scanned_bytes"]
+        limited["retained_hits"] = "2"; limited["matches_seen"] = "2"
+        limited["hits"] = Array((limited["hits"] as! [[String: Any]]).prefix(2))
+        let earlier = try decode(limited)
+        precondition(!earlier.complete && !earlier.truncated && earlier.hits.count == 2 && earlier.seen == 2)
+        var zero = limited
+        zero["max_scan_bytes"] = "0"; zero["scanned_bytes"] = "0"; zero["hits"] = [[String: Any]]()
+        zero["retained_hits"] = "0"; zero["matches_seen"] = "0"; zero["members_loaded"] = "0"
+        zero["member_bytes_read"] = "0"; zero["loaded_bytes"] = "0"
+        zero["peak_source_bytes"] = "0"; zero["member_read_calls"] = "0"
+        zero["predicate_scans"] = "0"; zero["predicate_rejections"] = "0"; zero["primary_scans"] = "0"
+        let empty = try decode(zero)
+        precondition(empty.state == "work-limit" && !empty.complete && empty.hits.isEmpty && empty.sourceBytes == 0)
+        var truncated = limited
+        truncated["state"] = "truncated"; truncated["truncated"] = true; truncated["matches_seen"] = "3"
+        let capped = try decode(truncated)
+        precondition(capped.truncated && capped.seen == 3 && !capped.complete)
+
+        for field in ["selection_namespace", "expression_generation", "predicate_scope", "index_used",
+                      "complete", "matches_seen_exact", "scanned_bytes", "metadata_excluded", "required_terms",
+                      "retained_source_payload_bytes", "primary_needle", "next_offset", "member_read_calls"] {
+            var bad = f.expressionPage(40, generation: 1)
+            switch field {
+            case "selection_namespace": bad[field] = "saved-literal"
+            case "expression_generation": bad[field] = "2"
+            case "predicate_scope": bad[field] = "visible-window"
+            case "index_used", "complete", "matches_seen_exact": bad[field] = true
+            case "scanned_bytes": bad[field] = "67108865"
+            case "metadata_excluded", "retained_source_payload_bytes": bad[field] = "1"
+            case "required_terms": bad[field] = "64"
+            case "primary_needle": bad[field] = ""
+            case "member_read_calls": bad[field] = "04"
+            default: bad.removeValue(forKey: field)
+            }
+            rejected("forged expression coverage accepted: \(field)") { _ = try decode(bad) }
+        }
+        var differentBytes = f.expressionPage(40, generation: 1)
+        differentBytes["expression"] = "e\u{301}"
+        rejected("canonical string equality rebound an expression") { _ = try decode(differentBytes, query: "é") }
+        var tooMany = f.expressionPage(40, generation: 1)
+        tooMany["hits"] = Array(repeating: f.hitObject(1), count: 129)
+        rejected("expression decoder admitted an oversized page") { _ = try decode(tooMany) }
+        var clear = f.header(40, "expression-clear")
+        clear["selection_namespace"] = "saved-expression"; clear["expression_generation"] = "2"
+        clear["accepted_expression_generation"] = NSNull(); clear["retained_hits"] = "0"
+        try AtlasSavedExpressionPage.decodeClear(f.encode(clear), identity: info.identity, generation: 2)
+        rejected("a clear receipt from a different attempt was accepted") {
+            try AtlasSavedExpressionPage.decodeClear(f.encode(clear), identity: info.identity, generation: 3)
+        }
+        clear.removeValue(forKey: "accepted_expression_generation")
+        rejected("omitted expression authority became a successful clear") {
+            try AtlasSavedExpressionPage.decodeClear(f.encode(clear), identity: info.identity, generation: 2)
+        }
+        var legacy = f.info(40)
+        legacy.removeValue(forKey: "accepted_expression_generation"); legacy.removeValue(forKey: "last_expression_attempt")
+        let old = try AtlasSavedInfo.decode(f.encode(legacy), handle: 40, expectedPath: archivePath, fresh: true)
+        precondition(!old.expressionStateKnown && old.expressionGeneration == nil)
+        legacy["accepted_expression_generation"] = NSNull()
+        rejected("half-present expression recovery metadata was accepted") {
+            _ = try AtlasSavedInfo.decode(f.encode(legacy), handle: 40, expectedPath: archivePath)
+        }
+        rejected("an accepted expression beyond its attempted generation was accepted") {
+            _ = try AtlasSavedInfo.decode(f.encode(f.info(40, expression: 2, expressionAttempt: 1)),
+                handle: 40, expectedPath: archivePath)
+        }
+    }
+
+    @MainActor private static func scopedExpressionsKeepExactReadersAndIndependentModes() async throws {
+        let f = SavedRepositoryFixture(searchVectors: true), model = await preparedExpression(f)
+        let expression = model.expressionPage!, literal = model.searchPage!
+        precondition(expression.generation == literal.generation && expression.hits[0].matches(literal.hits[0]))
+        model.searchMode = .literal; model.searchInput = "ana"
+        precondition(model.searchIsCurrent && !model.expressionIsCurrent)
+        await refused("literal mode authorized an expression occurrence with equal numeric IDs") {
+            _ = try await model.openExpressionHit(expression.hits[0], from: expression, readerTransport: f.readerTransport())
+        }
+        model.searchMode = .expression; model.searchInput = expression.expression
+        await refused("expression mode authorized a literal occurrence with equal numeric IDs") {
+            _ = try await model.openHit(literal.hits[0], from: literal, readerTransport: f.readerTransport())
+        }
+        let utf8 = try await model.openExpressionHit(expression.hits[0], from: expression, readerTransport: f.readerTransport())
+        let utf16 = try await model.openExpressionHit(expression.hits[3], from: expression, readerTransport: f.readerTransport())
+        precondition(utf8.match?.start == 203 && utf8.match?.end == 206 && utf8.match?.originalHex == "616e61")
+        precondition(utf16.match?.start == 410 && utf16.match?.end == 416 && utf16.match?.originalHex == "61006e006100")
+        precondition(utf16.reader.page?.start == 278 && utf16.reader.page?.identity.encoding == "utf16le")
+        guard case .expressionHit(let generation, let query, let primary, _) = utf16.origin else {
+            preconditionFailure("expression reader lost its accepted predicate provenance")
+        }
+        precondition(generation == 1 && query == expression.expression && primary == "ana")
+        model.searchInput = "ana path:raw"
+        await refused("an edited expression left old occurrences actionable") {
+            _ = try await model.openExpressionHit(expression.hits[0], from: expression, readerTransport: f.readerTransport())
+        }
+        model.search(); await wait("scoped expression did not finish") { !model.busy }
+        precondition(model.expressionGeneration == 2 && model.expressionPage?.complete == true)
+        await refused("an old expression generation rebound to equal scoped occurrences") {
+            _ = try await model.openExpressionHit(expression.hits[0], from: expression, readerTransport: f.readerTransport())
+        }
+        let scoped = model.expressionPage!
+        f.corruptNext("expression-results-primary"); model.loadExpressionResults(start: 1, from: scoped)
+        await wait("changed primary page did not finish") { !model.busy }
+        precondition(model.expressionPage?.start == 0 && model.expressionPage?.primaryNeedle == "ana")
+        model.loadExpressionResults(start: 1, from: scoped)
+        await wait("scoped pagination did not finish") { !model.busy }
+        precondition(model.expressionPage?.hits.map(\.id) == [2])
+        await refused("a row outside the current expression page reached reader admission") {
+            _ = try await model.openExpressionHit(scoped.hits[0], from: scoped, readerTransport: f.readerTransport())
+        }
+        model.clearSearch(); await wait("expression clear did not finish") { !model.busy }
+        precondition(model.expressionPage == nil && model.expressionGeneration == nil)
+        precondition(model.queryGeneration == 1 && model.searchPage?.hits.count == 4 && model.relationshipGeneration == 1)
+        model.closeArchive()
+        precondition(utf8.canUseMatch && utf16.canUseMatch)
+        let reader = try await utf16.withMatchReader { $0 }
+        precondition(reader == utf16.match?.identity.owner)
+        utf16.reader.offsetInput = "406"; utf16.reader.goToByte()
+        await wait("expression reader did not navigate after archive close") { !utf16.reader.busy }
+        precondition(utf16.reader.page?.originalHex == f.hex(f.searchUTF16[406...]) && utf16.canUseMatch)
+        precondition(!f.calls.contains("LIVE-OPEN"))
+        utf8.reader.close(); utf16.reader.close(); model.close()
+    }
+
+    @MainActor private static func expressionRecoveryCancellationAndArchiveReplacement() async {
+        let f = SavedRepositoryFixture(searchVectors: true), model = await preparedExpression(f)
+        let accepted = model.expressionPage!
+        model.searchInput = "\"unterminated"; f.corruptNext("expression"); model.search()
+        await wait("syntax refusal did not recover accepted expression") { !model.busy }
+        precondition(model.expressionGeneration == 1 && model.expressionPage?.expression == accepted.expression)
+        precondition(model.info?.lastExpressionAttempt == 2 && model.notice.contains("QUERY_SYNTAX_ERROR"))
+        precondition(!model.expressionIsCurrent && model.queryGeneration == 1 && model.relationshipGeneration == 1)
+        model.searchInput = accepted.expression; f.corruptNext("expression-lost"); model.search()
+        await wait("lost accepted expression reply did not recover") { !model.busy }
+        precondition(model.expressionGeneration == 3 && model.expressionPage?.generation == 3)
+        precondition(f.calls.filter { $0 == "expression:40:3:\(accepted.expression)" }.count == 1)
+        precondition(f.calls.contains("expression-results:40:3:0"))
+        f.corruptNext("expression"); f.blockNextSearch(); model.search()
+        await wait("expression did not enter cancelable worker") { f.entered.wait(timeout: .now()) == .success }
+        model.cancel(); precondition(model.busy && model.expressionGeneration == 3)
+        f.resume.signal(); await wait("canceled expression did not drain") { !model.busy }
+        precondition(model.expressionGeneration == 3 && model.info?.lastExpressionAttempt == 4)
+        f.corruptNext("expression-clear-lost"); model.clearSearch()
+        await wait("unconfirmed expression clear did not reconcile") { !model.busy }
+        precondition(model.expressionGeneration == nil && model.expressionPage == nil && model.info?.lastExpressionAttempt == 5)
+        precondition(model.queryGeneration == 1 && model.relationshipGeneration == 1)
+        precondition(f.calls.filter { $0 == "expression-clear:40:5" }.count == 1)
+        model.searchInput = accepted.expression; model.search()
+        await wait("expression after clear did not finish") { !model.busy }
+        precondition(model.expressionGeneration == 6)
+        let oldArchive = model.expressionPage!
+        model.open(path: "/saved/equal-archive.fcbs", accessLease: nil)
+        await wait("replacement expression archive did not open") { !model.busy }
+        precondition(model.expressionPage == nil && model.expressionGeneration == nil && model.queryGeneration == nil)
+        model.searchInput = accepted.expression; model.search()
+        await wait("expression in new archive did not finish") { !model.busy }
+        precondition(model.expressionGeneration == 1 && model.info?.identity.owner == 41)
+        await refused("same-digest archive replacement rebound an old expression occurrence") {
+            _ = try await model.openExpressionHit(oldArchive.hits[0], from: oldArchive, readerTransport: f.readerTransport())
+        }
+        precondition(!f.calls.contains(where: { $0.hasPrefix("reader-create:") }))
+        model.close()
+    }
+
+    @MainActor private static func forgedExpressionReceiptsAndLateReadersRetire() async {
+        for fault in ["expression-namespace", "expression-generation", "expression-primary", "expression-selection",
+                      "hit-id", "hit-range", "hit-hex", "digest", "lost"] {
+            let f = SavedRepositoryFixture(searchVectors: true), model = await preparedExpression(f)
+            let page = model.expressionPage!
+            f.corruptNext(fault)
+            await refused("forged expression receipt published a reader: \(fault)") {
+                _ = try await model.openExpressionHit(page.hits[0], from: page, readerTransport: f.readerTransport())
+            }
+            await wait("rejected expression reader did not retire: \(fault)") { f.calls.contains("reader-close:100") }
+            precondition(model.expressionGeneration == 1 && model.queryGeneration == 1 && model.relationshipGeneration == 1)
+            precondition(f.calls.filter { $0 == "expression-open:40:1:1" }.count == 1 && !f.calls.contains("LIVE-OPEN"))
+            model.close()
+        }
+        let f = SavedRepositoryFixture(searchVectors: true), model = await preparedExpression(f), page = model.expressionPage!
+        f.blockNextHandoff()
+        let pending = Task { try await model.openExpressionHit(page.hits[2], from: page, readerTransport: f.readerTransport()) }
+        await wait("expression reader handoff did not enter") { f.entered.wait(timeout: .now()) == .success }
+        model.close(); precondition(!f.calls.contains("saved-close:40"))
+        f.resume.signal()
+        await refused("late expression reader appeared after closing its archive") { _ = try await pending.value }
+        await wait("closed expression archive and late reader did not retire") {
+            f.calls.contains("saved-close:40") && f.calls.contains("reader-close:100")
+        }
+        precondition(model.expressionGeneration == nil && model.expressionPage == nil && !f.calls.contains("LIVE-OPEN"))
     }
 }

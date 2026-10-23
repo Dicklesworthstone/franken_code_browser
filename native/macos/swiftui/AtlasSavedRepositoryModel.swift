@@ -45,11 +45,14 @@ private final class AtlasSavedSession: @unchecked Sendable {
     private(set) var relationshipGeneration: UInt64?
     private(set) var searchPage: AtlasSavedSearchPage?
     private(set) var queryGeneration: UInt64?
+    private(set) var expressionPage: AtlasSavedExpressionPage?
+    private(set) var expressionGeneration: UInt64?
     private(set) var busy = false
     private(set) var closed = false
     private(set) var notice = "Open an FCBS saved repository to browse its captured members and documentation links."
     var memberOffsetInput = "0"
     var searchInput = ""
+    var searchMode: AtlasSavedSearchMode = .literal
     @ObservationIgnored private let transport: AtlasSavedTransport
     @ObservationIgnored private let io = AtlasProjectIO()
     @ObservationIgnored private var session: AtlasSavedSession?
@@ -58,15 +61,21 @@ private final class AtlasSavedSession: @unchecked Sendable {
     @ObservationIgnored private var cancellation: AtlasSearchCancellation?
     @ObservationIgnored private var lastRelationshipAttempt: UInt64 = 0
     @ObservationIgnored private var lastQueryAttempt: UInt64 = 0
+    @ObservationIgnored private var lastExpressionAttempt: UInt64 = 0
 
     init(transport: AtlasSavedTransport) { self.transport = transport }
     var canOperate: Bool { !busy && !closed }
     var readerDomain: UUID? { transport.readerDomain }
     var validSearchInput: Bool { AtlasSavedSearchWire.validNeedle(searchInput) }
     var searchIsCurrent: Bool {
-        guard let searchPage, info?.identity == searchPage.identity,
+        guard searchMode == .literal, let searchPage, info?.identity == searchPage.identity,
               queryGeneration == searchPage.generation else { return false }
         return searchInput.utf8.elementsEqual(searchPage.needle.utf8)
+    }
+    var expressionIsCurrent: Bool {
+        guard searchMode == .expression, let expressionPage, info?.identity == expressionPage.identity,
+              expressionGeneration == expressionPage.generation else { return false }
+        return searchInput.utf8.elementsEqual(expressionPage.expression.utf8)
     }
 
     func open(path: String, accessLease: AnyObject?) {
@@ -94,6 +103,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 model.relationships = nil; model.relationshipGeneration = nil; model.direction = .all
                 model.lastRelationshipAttempt = 0; model.memberOffsetInput = "0"
                 model.searchPage = nil; model.queryGeneration = nil; model.lastQueryAttempt = 0; model.searchInput = ""
+                model.expressionPage = nil; model.expressionGeneration = nil; model.lastExpressionAttempt = 0
                 model.notice = "Opened the saved manifest. Search all captured text or build documentation links explicitly when ready."
             } catch {
                 if model.pending === candidate { model.pending = nil; candidate.cancel() }
@@ -198,6 +208,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     /// Explicit submission freezes the exact UTF-8 needle. Editing the draft
     /// never changes the label or navigation authority of an accepted query.
     func search() {
+        if searchMode == .expression { searchExpression(); return }
         guard canOperate, let info else { return }
         if searchInput.isEmpty { clearSearch(); return }
         guard validSearchInput else {
@@ -225,6 +236,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         }
     }
     func clearSearch() {
+        if searchMode == .expression { clearExpression(); return }
         guard canOperate, let info else { return }
         searchInput = ""
         perform { model, flag in
@@ -261,6 +273,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         }
     }
     func reloadSearchResults() {
+        if searchMode == .expression { reloadExpressionResults(); return }
         perform { model, _ in
             guard let lease = model.session else { throw AtlasSavedError.unavailable }
             let recovered = await model.reconcileSearch(lease)
@@ -288,6 +301,113 @@ private final class AtlasSavedSession: @unchecked Sendable {
             queryGeneration = nil; searchPage = nil
             return false
         }
+    }
+
+    private func searchExpression() {
+        guard canOperate, let info else { return }
+        if searchInput.isEmpty { clearExpression(); return }
+        guard validSearchInput else {
+            notice = "Enter 1–1024 UTF-8 bytes of expression syntax without NUL. The first positive term names matches."; return
+        }
+        let query = searchInput
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let generation = try model.nextExpressionGeneration()
+            model.notice = "Checking required and excluded terms across captured members…"
+            do {
+                let page = try AtlasSavedExpressionPage.decode(await model.run(lease,
+                    .expressionSearch(generation: generation, query: query, matches: 4096,
+                        scanBytes: AtlasSavedSearchWire.maximumSourceBytes), flag: flag),
+                    identity: info.identity, generation: generation, expression: query, start: 0, limit: 64)
+                guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
+                model.expressionGeneration = generation; model.expressionPage = page
+                model.notice = page.complete ? "Expression search finished over the captured scope."
+                    : "Expression coverage is partial. Inspect source availability, work budget and retained-match limits."
+            } catch {
+                let failure = Self.message(error)
+                let recovered = await model.reconcileExpression(lease)
+                model.notice = recovered
+                    ? "\(failure) Reloaded the accepted expression without repeating its scan."
+                    : "\(failure) The accepted expression could not be verified; reload results before opening matches."
+            }
+        }
+    }
+    private func clearExpression() {
+        guard canOperate, let info else { return }
+        searchInput = ""
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let generation = try model.nextExpressionGeneration()
+            do {
+                try AtlasSavedExpressionPage.decodeClear(await model.run(lease, .clearExpression(generation: generation), flag: flag),
+                    identity: info.identity, generation: generation)
+                guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
+                model.expressionPage = nil; model.expressionGeneration = nil
+                model.notice = "Cleared expression results. Literal results, documentation links and captured readers remain available."
+            } catch {
+                let recovered = await model.reconcileExpression(lease)
+                model.notice = recovered ? "Reloaded the accepted expression state after the clear request."
+                    : "The expression clear outcome is unconfirmed. Reload results to inspect it."
+            }
+        }
+    }
+    func loadExpressionResults(start: UInt64, from page: AtlasSavedExpressionPage) {
+        guard expressionIsCurrent, let accepted = expressionPage, page.identity == accepted.identity,
+              page.generation == accepted.generation, page.start == accepted.start,
+              page.expression.utf8.elementsEqual(accepted.expression.utf8),
+              page.primaryNeedle.utf8.elementsEqual(accepted.primaryNeedle.utf8), start <= accepted.retained else { return }
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let next = try AtlasSavedExpressionPage.decode(await model.run(lease,
+                .expressionResults(generation: page.generation, start: start, limit: 64), flag: flag),
+                identity: page.identity, generation: page.generation, expression: page.expression, start: start, limit: 64)
+            guard model.session === lease, !model.closed, model.expressionGeneration == page.generation,
+                  next.primaryNeedle.utf8.elementsEqual(page.primaryNeedle.utf8) else { throw AtlasSavedError.canceled }
+            model.expressionPage = next
+            model.notice = "Showing \(next.hits.count) of \(next.retained) retained expression matches. Pagination reads metadata only."
+        }
+    }
+    private func reloadExpressionResults() {
+        perform { model, _ in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let recovered = await model.reconcileExpression(lease)
+            model.notice = recovered ? "Reloaded the accepted expression without rescanning source."
+                : "Expression state is unavailable. Literal results and documentation links remain independent."
+        }
+    }
+    private func reconcileExpression(_ lease: AtlasSavedSession) async -> Bool {
+        guard !closed, session === lease, let previous = info else { return false }
+        let flag = AtlasSearchCancellation()
+        do {
+            let current = try AtlasSavedInfo.decode(await run(lease, .info, flag: flag), handle: lease.handle,
+                expectedPath: previous.path.bytes, identity: previous.identity)
+            guard !closed, session === lease, current.expressionStateKnown else { throw AtlasSavedError.invalidResponse }
+            info = current; expressionGeneration = current.expressionGeneration
+            lastExpressionAttempt = max(lastExpressionAttempt, current.lastExpressionAttempt)
+            guard let generation = current.expressionGeneration else { expressionPage = nil; return true }
+            if expressionPage?.generation == generation && expressionPage?.identity == current.identity { return true }
+            let page = try AtlasSavedExpressionPage.decode(await run(lease,
+                .expressionResults(generation: generation, start: 0, limit: 64), flag: flag),
+                identity: current.identity, generation: generation, expression: nil, start: 0, limit: 64)
+            guard !closed, session === lease else { throw AtlasSavedError.canceled }
+            expressionPage = page; return true
+        } catch {
+            expressionGeneration = nil; expressionPage = nil; return false
+        }
+    }
+    func openExpressionHit(_ hit: AtlasSavedHit, from page: AtlasSavedExpressionPage, readerTransport: AtlasReaderTransport,
+        search: AtlasReaderSearchTransport? = nil, outline: AtlasReaderOutlineTransport? = nil,
+        document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasSavedReaderCapture {
+        guard expressionIsCurrent, let accepted = expressionPage, info?.identity == page.identity,
+              accepted.identity == page.identity, expressionGeneration == page.generation, accepted.generation == page.generation,
+              accepted.start == page.start, accepted.expression.utf8.elementsEqual(page.expression.utf8),
+              accepted.primaryNeedle.utf8.elementsEqual(page.primaryNeedle.utf8),
+              page.hits.contains(where: { $0.matches(hit) }), accepted.hits.contains(where: { $0.matches(hit) }) else {
+            throw AtlasSavedError.invalidInput
+        }
+        return try await openReader(saved: page.identity, ordinal: hit.member, expected: nil,
+            origin: .expressionHit(generation: page.generation, expression: page.expression, primaryNeedle: page.primaryNeedle, hit: hit),
+            readerTransport: readerTransport, search: search, outline: outline, document: document)
     }
 
     func openHit(_ hit: AtlasSavedHit, from page: AtlasSavedSearchPage, readerTransport: AtlasReaderTransport,
@@ -362,7 +482,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                     }
                 }
                 let contextStart: UInt64
-                if case .hit(_, _, let hit) = origin {
+                if let hit = origin.searchHit {
                     guard member.id == hit.member, member.file == hit.file, member.file == hit.revision,
                           member.path.bytes == hit.path.bytes, member.digest == hit.digest,
                           hit.start < hit.end, hit.end <= member.observedBytes else { throw AtlasSavedError.invalidResponse }
@@ -378,6 +498,8 @@ private final class AtlasSavedSession: @unchecked Sendable {
                         request = .openRelationship(reader: destination, generation: generation, link: link.id, side: side)
                     case .hit(let generation, _, let hit):
                         request = .openHit(reader: destination, generation: generation, hit: hit.id)
+                    case .expressionHit(let generation, _, _, let hit):
+                        request = .openExpressionHit(reader: destination, generation: generation, hit: hit.id)
                     }
                     return try withExtendedLifetime(lease) {
                         let accepted = try AtlasSavedReaderReceipt.decode(lease.transport.run(lease.handle, request),
@@ -424,6 +546,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         info = nil; members = nil; selectedMember = nil; relationships = nil; relationshipGeneration = nil
         direction = .all; lastRelationshipAttempt = 0; memberOffsetInput = "0"
         searchPage = nil; queryGeneration = nil; lastQueryAttempt = 0; searchInput = ""
+        expressionPage = nil; expressionGeneration = nil; lastExpressionAttempt = 0
     }
     private func run(_ lease: AtlasSavedSession, _ request: AtlasSavedRequest,
         flag: AtlasSearchCancellation) async throws -> String? {
@@ -452,6 +575,11 @@ private final class AtlasSavedSession: @unchecked Sendable {
         let previous = max(lastQueryAttempt, queryGeneration ?? 0)
         guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
         lastQueryAttempt = previous + 1; return lastQueryAttempt
+    }
+    private func nextExpressionGeneration() throws -> UInt64 {
+        let previous = max(lastExpressionAttempt, max(expressionGeneration ?? 0, info?.lastExpressionAttempt ?? 0))
+        guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
+        lastExpressionAttempt = previous + 1; return lastExpressionAttempt
     }
     private static func message(_ error: Error) -> String {
         if let error = error as? AtlasSavedError { return error.message }

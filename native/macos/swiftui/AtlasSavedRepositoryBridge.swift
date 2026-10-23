@@ -8,6 +8,10 @@ import Foundation
 @_silgen_name("fcb_saved_results") private func savedResults(_ h: UInt64, _ generation: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_clear_results") private func savedClearResults(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_open_hit_reader") private func savedHitReader(_ h: UInt64, _ reader: UInt64, _ generation: UInt64, _ hit: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_expression_search") private func savedExpressionSearch(_ h: UInt64, _ generation: UInt64, _ query: UnsafePointer<CChar>?, _ matches: UInt64, _ scanBytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_expression_results") private func savedExpressionResults(_ h: UInt64, _ generation: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_clear_expression") private func savedClearExpression(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_open_expression_hit_reader") private func savedExpressionReader(_ h: UInt64, _ reader: UInt64, _ generation: UInt64, _ hit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_prepare_relationships") private func savedPrepare(_ h: UInt64, _ generation: UInt64, _ links: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_relationships") private func savedRelationships(_ h: UInt64, _ generation: UInt64,
     _ direction: UInt64, _ member: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
@@ -35,6 +39,16 @@ extension AtlasSavedTransport {
             return take(savedResults(handle, generation, start, limit))
         case .clearResults(let generation): return take(savedClearResults(handle, generation))
         case .openHit(let reader, let generation, let hit): return take(savedHitReader(handle, reader, generation, hit))
+        case .expressionSearch(let generation, let query, let matches, let bytes):
+            guard generation > 0, AtlasSavedSearchWire.validNeedle(query),
+                  (1...AtlasSavedSearchWire.maximumHits).contains(matches),
+                  bytes <= AtlasSavedSearchWire.maximumSourceBytes else { return nil }
+            return query.withCString { take(savedExpressionSearch(handle, generation, $0, matches, bytes)) }
+        case .expressionResults(let generation, let start, let limit):
+            return take(savedExpressionResults(handle, generation, start, limit))
+        case .clearExpression(let generation): return take(savedClearExpression(handle, generation))
+        case .openExpressionHit(let reader, let generation, let hit):
+            return take(savedExpressionReader(handle, reader, generation, hit))
         case .prepareRelationships(let generation, let links, let bytes):
             return take(savedPrepare(handle, generation, links, bytes))
         case .relationships(let generation, let direction, let member, let start, let limit):

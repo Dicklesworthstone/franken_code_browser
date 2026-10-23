@@ -25,6 +25,9 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         var generation: UInt64?
         var queryGeneration: UInt64?
         var needle: String?
+        var expressionGeneration: UInt64?
+        var expression: String?
+        var expressionAttempt: UInt64 = 0
         var readBytes: UInt64 = 0
         var readCalls: UInt64 = 0
         var refused = false
@@ -148,12 +151,15 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         return out
     }
     func info(_ owner: UInt64, path archivePath: String = "/saved/repository.fcbs",
-        generation: UInt64? = nil, query: UInt64? = nil, bytes: UInt64 = 0, calls: UInt64 = 0) -> [String: Any] {
+        generation: UInt64? = nil, query: UInt64? = nil, bytes: UInt64 = 0, calls: UInt64 = 0,
+        expression: UInt64? = nil, expressionAttempt: UInt64 = 0) -> [String: Any] {
         var out = header(owner, "info")
         out["archive_path"] = path(Array(archivePath.utf8), archivePath)
         out["accepted_relationship_generation"] = generation.map(String.init) as Any? ?? NSNull()
         out["accepted_query_generation"] = query.map(String.init) as Any? ?? NSNull()
         out["accepted_index_generation"] = NSNull()
+        out["accepted_expression_generation"] = expression.map(String.init) as Any? ?? NSNull()
+        out["last_expression_attempt"] = String(expressionAttempt)
         out["initial_archive_bytes_read"] = "2048"; out["directory_reserved_bytes"] = "4096"
         out["member_bytes_read"] = String(bytes); out["member_read_calls"] = String(calls)
         return out
@@ -189,6 +195,33 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             "hits": (start..<end).map { hitObject($0 + 1, needle: needle) },
             "next_offset": end < UInt64(hits.count) ? String(end) as Any : NSNull()
         ]) { _, new in new }
+        return out
+    }
+    func expressionPage(_ owner: UInt64, generation: UInt64, query: String = "ana +banana -unsafe",
+        start: UInt64 = 0, limit: UInt64 = 64) -> [String: Any] {
+        // Fixed protocol vectors. The production Rust tests own grammar and
+        // predicate evaluation; this fixture does not implement either.
+        let filtered = query == "ana path:raw"
+        let count: UInt64 = filtered ? 2 : 4
+        let sourceBytes = filtered ? members[1].bytes!.count : members.compactMap(\.bytes).reduce(0) { $0 + $1.count }
+        let end = min(count, start + limit)
+        var out = header(owner, "expression")
+        out.merge([
+            "selection_namespace": "saved-expression", "expression_generation": String(generation),
+            "expression": query, "primary_needle": "ana", "predicate_scope": "whole-captured-member",
+            "case_sensitive": true, "index_used": false, "index_policy": "direct-verified-member-scan",
+            "state": "complete", "complete": filtered, "matches_seen_exact": filtered, "truncated": false,
+            "required_terms": filtered ? "0" : "1", "excluded_terms": filtered ? "0" : "1",
+            "max_hits": "4096", "max_scan_bytes": "67108864", "retained_hits": String(count), "matches_seen": String(count),
+            "metadata_examined": "5", "scope_files": filtered ? "1" : "5", "metadata_excluded": filtered ? "4" : "0",
+            "unavailable_files": filtered ? "0" : "1", "unsupported_files": "0", "members_loaded": filtered ? "1" : "4",
+            "member_bytes_read": String(sourceBytes), "member_read_calls": filtered ? "1" : "4",
+            "loaded_bytes": String(sourceBytes), "peak_source_bytes": String(filtered ? sourceBytes : members.compactMap(\.bytes).map(\.count).max()!),
+            "predicate_scans": filtered ? "0" : "8", "predicate_rejections": filtered ? "0" : "2",
+            "primary_scans": filtered ? "1" : "2", "scanned_bytes": String(filtered ? sourceBytes : sourceBytes * 2 + searchUTF8.count + searchUTF16.count),
+            "retained_source_payload_bytes": "0", "hits": (start..<end).map { hitObject($0 + 1) },
+            "next_offset": end < count ? String(end) as Any : NSNull()
+        ]) { _, next in next }
         return out
     }
     private func readerHeader(_ owner: UInt64, member: Member, command: String) -> [String: Any] {
@@ -239,7 +272,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     }
     private func handoff(_ saved: UInt64, reader: UInt64, ordinal: UInt64,
         generation: UInt64?, link: UInt64?, side: AtlasSavedLinkSide?,
-        query: UInt64? = nil, hitID: UInt64? = nil) -> String? {
+        query: UInt64? = nil, hitID: UInt64? = nil, expression: UInt64? = nil) -> String? {
         let member = members[Int(ordinal)]
         guard let bytes = member.bytes else { return nil }
         readers[reader] = member
@@ -255,6 +288,17 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         if let query, let hitID, let needle = sessions[saved]?.needle {
             let hit = searchHits(needle)[Int(hitID - 1)]
             out["selection"] = ["query_generation": String(query), "hit_id": String(hitID),
+                "domain": "original-source-bytes", "original_range": ["start": String(hit.start), "end": String(hit.end)],
+                "original_hex": hex(bytes[Int(hit.start)..<Int(hit.end)])]
+            windowStart = hit.start - min(hit.start, 132)
+            windowBytes = max(4, min(UInt64(bytes.count), hit.end + 132) - windowStart)
+        }
+        if let expression, let hitID {
+            let hit = searchHits("ana")[Int(hitID - 1)]
+            out["command"] = "expression-open-reader"
+            out["selection_namespace"] = "saved-expression"; out["expression_generation"] = String(expression)
+            out["primary_needle"] = "ana"
+            out["selection"] = ["expression_generation": String(expression), "hit_id": String(hitID),
                 "domain": "original-source-bytes", "original_range": ["start": String(hit.start), "end": String(hit.end)],
                 "original_hex": hex(bytes[Int(hit.start)..<Int(hit.end)])]
             windowStart = hit.start - min(hit.start, 132)
@@ -280,6 +324,13 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             case "inherited-query": nested["accepted_query_generation"] = "1"
             case "many-read-calls": out["member_read_calls"] = "1024" // Interrupted reads can exceed source length.
             case "page-bytes": wrongPage.insert(reader)
+            case "expression-namespace": out["selection_namespace"] = "saved-literal"
+            case "expression-generation": out["expression_generation"] = String((expression ?? 0) + 1)
+            case "expression-primary": out["primary_needle"] = "banana"
+            case "expression-selection":
+                var selected = out["selection"] as! [String: Any]
+                selected["query_generation"] = selected.removeValue(forKey: "expression_generation")
+                out["selection"] = selected
             case "hit-generation", "hit-id", "hit-domain", "hit-range", "hit-hex":
                 var selected = out["selection"] as! [String: Any]
                 switch fault {
@@ -304,10 +355,10 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         } }, run: { [self] handle, request in
             precondition(!Thread.isMainThread)
             switch request {
-            case .openMember, .openRelationship, .openHit:
+            case .openMember, .openRelationship, .openHit, .openExpressionHit:
                 let pause = locked { let value = blocked; blocked = false; return value }
                 if pause { entered.signal(); precondition(resume.wait(timeout: .now() + .seconds(5)) == .success) }
-            case .search:
+            case .search, .expressionSearch:
                 let pause = locked { let value = blockedSearch; blockedSearch = false; return value }
                 if pause { entered.signal(); precondition(resume.wait(timeout: .now() + .seconds(5)) == .success) }
             default: break
@@ -324,7 +375,8 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                     log.append("info:\(handle)")
                     guard let session = sessions[handle], !session.refused else { return nil }
                     return encode(info(handle, path: session.path, generation: session.generation, query: session.queryGeneration,
-                        bytes: session.readBytes, calls: session.readCalls))
+                        bytes: session.readBytes, calls: session.readCalls, expression: session.expressionGeneration,
+                        expressionAttempt: session.expressionAttempt))
                 case .members(let start, let limit):
                     guard sessions[handle] != nil, start <= 5 else { return nil }
                     log.append("members:\(handle):\(start):\(limit)")
@@ -384,6 +436,44 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                           let needle = session.needle, id > 0, id <= UInt64(searchHits(needle).count) else { return nil }
                     return handoff(handle, reader: reader, ordinal: searchHits(needle)[Int(id - 1)].member,
                         generation: nil, link: nil, side: nil, query: generation, hitID: id)
+                case .expressionSearch(let generation, let query, let matches, let bytes):
+                    precondition(matches == 4096 && bytes == AtlasSavedSearchWire.maximumSourceBytes)
+                    log.append("expression:\(handle):\(generation):\(query)")
+                    guard var session = sessions[handle], generation > session.expressionAttempt else { return nil }
+                    session.expressionAttempt = generation
+                    if fault == "expression" {
+                        fault = nil; sessions[handle] = session
+                        return encode(["schema": "fcb.saved-repository/1", "owner": String(handle), "status": "error",
+                            "error": ["code": "QUERY_SYNTAX_ERROR"]])
+                    }
+                    session.expressionGeneration = generation; session.expression = query
+                    session.readBytes += UInt64(members.compactMap(\.bytes).reduce(0) { $0 + $1.count }); session.readCalls += 4
+                    sessions[handle] = session
+                    if fault == "expression-lost" { fault = nil; return nil }
+                    return encode(expressionPage(handle, generation: generation, query: query))
+                case .expressionResults(let generation, let start, let limit):
+                    log.append("expression-results:\(handle):\(generation):\(start)")
+                    guard let session = sessions[handle], session.expressionGeneration == generation,
+                          let query = session.expression else { return nil }
+                    if fault == "expression-results" { fault = nil; return nil }
+                    var page = expressionPage(handle, generation: generation, query: query, start: start, limit: limit)
+                    if fault == "expression-results-primary" { fault = nil; page["primary_needle"] = "banana" }
+                    return encode(page)
+                case .clearExpression(let generation):
+                    guard var session = sessions[handle], generation > session.expressionAttempt else { return nil }
+                    session.expressionAttempt = generation; session.expressionGeneration = nil; session.expression = nil
+                    sessions[handle] = session; log.append("expression-clear:\(handle):\(generation)")
+                    if fault == "expression-clear-lost" { fault = nil; return nil }
+                    var out = header(handle, "expression-clear")
+                    out["selection_namespace"] = "saved-expression"; out["expression_generation"] = String(generation)
+                    out["accepted_expression_generation"] = NSNull(); out["retained_hits"] = "0"
+                    return encode(out)
+                case .openExpressionHit(let reader, let generation, let id):
+                    guard let session = sessions[handle], session.expressionGeneration == generation,
+                          let query = session.expression, id > 0, id <= (query == "ana path:raw" ? 2 : 4) else { return nil }
+                    log.append("expression-open:\(handle):\(generation):\(id)")
+                    return handoff(handle, reader: reader, ordinal: searchHits("ana")[Int(id - 1)].member,
+                        generation: nil, link: nil, side: nil, hitID: id, expression: generation)
                 case .clearRelationships(let generation):
                     sessions[handle]?.generation = nil
                     var out = header(handle, "relationships-clear")

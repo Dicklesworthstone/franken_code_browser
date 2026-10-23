@@ -111,7 +111,9 @@ private final class AtlasSavedFileAccess {
                 Spacer()
             }
             Text(section == .text
-                ? "Text search uses exact case-sensitive decoded literals across the saved archive. Unicode normalization and query syntax are not applied. Member names never open working-tree paths."
+                ? (model.searchMode == .literal
+                    ? "Literal search is case sensitive and does not interpret query syntax or normalize Unicode. Member names never open working-tree paths."
+                    : "Expression terms are exact and case sensitive. Required/excluded terms apply across each complete captured member; results identify primary-term occurrences. Member names never open working-tree paths.")
                 : "Documentation evidence is the original captured document. Individual link positions and URL fragments are not resolved. Member names never open working-tree paths.")
                 .font(.caption2).foregroundStyle(.secondary)
         }.frame(maxWidth: .infinity, alignment: .leading)
@@ -184,6 +186,14 @@ private final class AtlasSavedFileAccess {
         .accessibilityLabel("\(member.path.display), \(member.captured ? "captured" : "unavailable")")
     }
     private var searchPane: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Picker("Saved search mode", selection: $model.searchMode) {
+                ForEach(AtlasSavedSearchMode.allCases) { mode in Text(mode.label).tag(mode) }
+            }.pickerStyle(.segmented).disabled(!model.canOperate).padding(.leading, 8)
+            if model.searchMode == .literal { literalSearchPane } else { expressionSearchPane }
+        }
+    }
+    private var literalSearchPane: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 TextField("Literal text in all captured members", text: $model.searchInput)
@@ -259,6 +269,121 @@ private final class AtlasSavedFileAccess {
                 }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 12)
             }
         }.padding(.leading, 8)
+    }
+    private var expressionSearchPane: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                TextField("\"exact phrase\" required -excluded path:src/ lang:rust", text: $model.searchInput)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { panelNotice = ""; model.search() }
+                    .accessibilityLabel("Expression search with required terms, exclusions, path and language filters")
+                Button { panelNotice = ""; model.search() } label: { Label("Search archive", systemImage: "magnifyingglass") }
+                    .disabled(!model.canOperate || !model.validSearchInput)
+                Button("Clear") { panelNotice = ""; model.clearSearch() }
+                    .disabled(!model.canOperate || (model.expressionPage == nil && model.searchInput.isEmpty))
+            }
+            Text("The first positive term names matches. Other terms must appear in the same captured member; -terms must be absent. Quote phrases and paths containing spaces. Use path:, -path:, lang: or -lang: to filter members.")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Text("Case sensitive · 64 terms and filters maximum · up to 4,096 matches · 64 MiB matching-work budget")
+                    .font(.caption2).foregroundStyle(.secondary)
+                Spacer()
+                Button("Reload results") { panelNotice = ""; model.reloadSearchResults() }
+                    .controlSize(.small).disabled(!model.canOperate)
+            }
+            if !model.searchInput.isEmpty && !model.validSearchInput {
+                Text("The expression must contain 1–1024 UTF-8 bytes and no NUL character.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            if let page = model.expressionPage {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Accepted expression").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Text(page.expression).font(.body.monospaced()).lineLimit(3).textSelection(.enabled)
+                    Text("Primary occurrence: \(page.primaryNeedle) · \(page.required) required · \(page.excluded) excluded terms")
+                        .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    if !model.expressionIsCurrent {
+                        HStack {
+                            Text("The draft differs from these results. Submit it or restore the accepted expression before opening a match.")
+                                .font(.caption).foregroundStyle(.orange)
+                            Spacer()
+                            Button("Use accepted expression") { model.searchInput = page.expression; panelNotice = "" }
+                                .controlSize(.small).disabled(!model.canOperate)
+                        }
+                    }
+                }
+                expressionCoverage(page)
+                Divider()
+                if page.hits.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("No retained expression matches.").font(.headline)
+                        Text(page.complete ? "The accepted expression has no matches in the complete captured scope."
+                            : "Coverage is partial. An empty result does not establish that the expression has no matches.")
+                            .foregroundStyle(.secondary)
+                    }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 10)
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 8) {
+                            ForEach(page.hits) { hit in
+                                HStack(alignment: .top, spacing: 10) {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(hit.path.display).font(.callout.weight(.semibold)).lineLimit(2).textSelection(.enabled)
+                                        Text("Occurrence \(hit.id) · original bytes \(hit.start)..<\(hit.end)")
+                                            .font(.caption).foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Button("Read match") { openExpressionHit(hit, from: page) }
+                                        .disabled(!model.canOperate || !model.expressionIsCurrent || readerTask != nil)
+                                }.padding(10).frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Color.primary.opacity(0.035)).clipShape(RoundedRectangle(cornerRadius: 7))
+                            }
+                        }
+                    }.id("saved-expression:\(page.identity.owner):\(page.generation)").frame(maxHeight: .infinity)
+                }
+                HStack {
+                    Button("Previous matches") {
+                        model.loadExpressionResults(start: page.start >= 64 ? page.start - 64 : 0, from: page)
+                    }.disabled(!model.canOperate || !model.expressionIsCurrent || page.start == 0)
+                    Spacer()
+                    Text("\(page.start)..<\(page.start + UInt64(page.hits.count)) of \(page.retained) retained")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Next matches") {
+                        if let next = page.next { model.loadExpressionResults(start: next, from: page) }
+                    }.disabled(!model.canOperate || !model.expressionIsCurrent || page.next == nil)
+                }.controlSize(.small)
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(model.busy ? "Waiting for saved archive work…" : "Combine source terms with member filters.").font(.headline)
+                    Text("Example: \"pub fn\" Result -unsafe path:src/ lang:rust").font(.callout.monospaced()).textSelection(.enabled)
+                    Text("Finds each ‘pub fn’ occurrence in Rust members under src/ that also contain ‘Result’ and do not contain ‘unsafe’. Literal mode treats the entire input as one exact phrase.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 12)
+            }
+        }.padding(.leading, 8)
+    }
+    private func expressionCoverage(_ page: AtlasSavedExpressionPage) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label(page.complete ? "Complete expression coverage" : "Partial expression coverage",
+                systemImage: page.complete ? "checkmark.circle" : "exclamationmark.circle")
+                .font(.caption.weight(.semibold)).foregroundStyle(page.complete ? Color.secondary : Color.orange)
+            Text("\(page.retained) matches retained · \(page.scopeFiles) members in scope · \(page.filteredFiles) filtered by path/language")
+                .font(.caption)
+            Text("Unavailable: \(page.unavailable) · Unsupported decoding: \(page.unsupported) · Predicate rejections: \(page.predicateRejections)")
+                .font(.caption).foregroundStyle(.secondary)
+            Text("\(page.sourceBytes) source bytes read · \(page.scannedBytes) / \(page.scanLimit) matching bytes processed")
+                .font(.caption).foregroundStyle(.secondary)
+            if page.state == "work-limit" {
+                Text("The matching-work budget was exhausted. Earlier matches remain valid; more may exist. Narrow path or language filters and search again.")
+                    .font(.caption).foregroundStyle(.orange)
+            } else if page.truncated {
+                Text("At least \(page.seen) matches were seen. The retained-match limit stopped the search.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            if !page.identity.discoveryComplete {
+                Text("Archive discovery was incomplete; files outside the saved manifest remain unknown.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+        }.textSelection(.enabled)
     }
     private func searchCoverage(_ page: AtlasSavedSearchPage) -> some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -453,6 +578,12 @@ private final class AtlasSavedFileAccess {
                 search: .native, outline: .native, document: .native)
         }
     }
+    private func openExpressionHit(_ hit: AtlasSavedHit, from page: AtlasSavedExpressionPage) {
+        launchReader {
+            try await model.openExpressionHit(hit, from: page, readerTransport: .native,
+                search: .native, outline: .native, document: .native)
+        }
+    }
     private func launchReader(_ open: @escaping @MainActor () async throws -> AtlasSavedReaderCapture) {
         guard model.canOperate, readerTask == nil else { return }
         panelNotice = ""
@@ -521,6 +652,9 @@ private final class AtlasSavedFileAccess {
         VStack(alignment: .leading, spacing: 5) {
             if case .hit(_, let needle, _) = capture.origin {
                 Text("Saved literal: \(needle)").font(.callout.monospaced()).lineLimit(2).textSelection(.enabled)
+            } else if case .expressionHit(_, let expression, let primary, _) = capture.origin {
+                Text("Saved expression: \(expression)").font(.callout.monospaced()).lineLimit(2).textSelection(.enabled)
+                Text("Primary occurrence: \(primary)").font(.caption.monospaced()).lineLimit(2).textSelection(.enabled)
             }
             HStack {
                 Text("Exact saved match · \(match.end - match.start) original bytes")
