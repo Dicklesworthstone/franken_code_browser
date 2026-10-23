@@ -260,3 +260,46 @@ fn offscreen_metal_glyph_quality() {
     );
     checked(&mut Command::new(metal_test));
 }
+
+#[test]
+fn viewport_source_residency() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    checked(
+        Command::new("/bin/sh")
+            .current_dir(&root)
+            .arg("swiftui/tests/test-viewport-residency.sh"),
+    );
+}
+
+#[test]
+fn source_lifetime_through_metal_completion() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = std::env::temp_dir().join(format!(
+        "fcb-metal-source-lifetime-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&scratch).expect("new private native lifetime test folder");
+    let binary = scratch.join("AtlasNativeFlightLifetimeTests");
+    checked(
+        Command::new("xcrun")
+            .current_dir(&root)
+            .args([
+                "swiftc",
+                "-parse-as-library",
+                "swiftui/AtlasSource.swift",
+                "swiftui/AtlasDocument.swift",
+                "swiftui/AtlasPreparedText.swift",
+                "swiftui/AtlasMetalRasterRenderer.swift",
+                "swiftui/AtlasMetalGlyphRenderer.swift",
+                "swiftui/AtlasMetalPresentation.swift",
+                "swiftui/tests/AtlasNativeFlightLifetimeTests.swift",
+            ])
+            .arg("-o")
+            .arg(&binary),
+    );
+    checked(&mut Command::new(binary));
+}

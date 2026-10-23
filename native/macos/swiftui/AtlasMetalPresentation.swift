@@ -386,6 +386,24 @@ import os
         advance(size: frame.size, backing: frame.backing)
     }
 
+    /// A window may destroy its presentation owner while a submitted command
+    /// still runs. Keep source lifetime credits on the command itself, rather
+    /// than relying on the owner's Flight array or its weak completion callback.
+    /// The existing two-flight admission also bounds these completion holders.
+    /// Native leases contain storage only and have no reference to this owner.
+    @discardableResult static func retainSourceLifetimes(of tiles: [AtlasTextTile],
+                                                        through command: MTLCommandBuffer) -> Int {
+        var seen = Set<ObjectIdentifier>(), leases: [AtlasNativeRetirement.Lease] = []
+        for tile in tiles {
+            if let lease = tile.nativeResidencyOwner, seen.insert(ObjectIdentifier(lease)).inserted {
+                leases.append(lease)
+            }
+        }
+        guard !leases.isEmpty else { return 0 }
+        command.addCompletedHandler { [leases] _ in withExtendedLifetime(leases) {} }
+        return leases.count
+    }
+
     /// Core Animation supplies an available drawable. There is no blocking
     /// nextDrawable call, and accepting a frame does not consume an extra tick.
     private func display(drawable: CAMetalDrawable, deadline: Double, targetPresentation: Double) {
@@ -424,6 +442,7 @@ import os
             let delivery = recordPresentationTiming ? DeliverySample(serial: request.serial,
                 callbackTime: callbackTime, deadline: deadline, targetPresentation: targetPresentation,
                 encodedTime: CACurrentMediaTime()) : nil
+            Self.retainSourceLifetimes(of: request.frame.tiles, through: command)
             flights.append(Flight(request: request, scene: scene, raster: rasterScene, command: command, drawable: drawable, delivery: delivery))
             maximumInFlight = max(maximumInFlight, flights.count)
             if scheduledPresentationEnabled {

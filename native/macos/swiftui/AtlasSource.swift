@@ -6,6 +6,9 @@ import Foundation
 final class AtlasSource {
     let path: String
     let text: String
+    // Optional native preview lifetime credit. Assigned before publication;
+    // selected source readers keep its storage charged after atlas eviction.
+    var nativeResidencyOwner: AnyObject?
     var lines: [Range<String.Index>] { lineMetadata.ranges }
     private var lineBytes: [Int] { lineMetadata.bytes }
     var maxDisplayColumns: Int { lineMetadata.columns }

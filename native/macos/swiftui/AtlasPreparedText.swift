@@ -69,6 +69,12 @@ struct AtlasPreparedLine {
     var hasColorGlyphs: Bool { runs.contains { CTFontGetSymbolicTraits($0.font).contains(.traitColorGlyphs) } }
 
     init?(_ line: CTLine, source: String = "") {
+        self.init(line, source: source as NSString)
+    }
+
+    /// A preparation worker can bridge a complete immutable source once and
+    /// share it across every row, instead of bridging it again for every run.
+    init?(_ line: CTLine, source: NSString) {
         var result: [AtlasPreparedRun] = []
         for run in CTLineGetGlyphRuns(line) as! [CTRun] {
             let attributes = CTRunGetAttributes(run) as NSDictionary
@@ -90,7 +96,7 @@ struct AtlasPreparedLine {
             CTRunGetGlyphs(run, CFRange(location: 0, length: 0), &glyphs)
             CTRunGetPositions(run, CFRange(location: 0, length: 0), &positions)
             let range = CTRunGetStringRange(run)
-            let text = source as NSString
+            let text = source
             let seed: String
             if range.location >= 0, range.length >= 0,
                range.location <= text.length, range.length <= text.length - range.location {

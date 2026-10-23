@@ -237,6 +237,7 @@ extension AtlasCamera {
     @State private var searchRows: [CGRect] = []
     @State private var searchPaths: Set<String> = []
     @State private var overlayLimited = false
+    @State private var overlayContentRevision: UUID?
     @State private var showsSidebar = true
     @State private var showsFileFinder = false
     @State private var projectOpening = AtlasProjectOpening()
@@ -278,9 +279,15 @@ extension AtlasCamera {
     @State private var sourceTask: Task<Void, Never>?
     @State private var sourceCancellation: AtlasSearchCancellation?
     @State private var sourceSearchRow: AtlasSearchRowID?
-    @State private var atlasDocuments: [String: AtlasDocument] = [:]
+    @State private var atlasResidency = AtlasViewportResidency()
+    @State private var atlasEntries: [AtlasProjectCatalog.Entry] = []
+    @State private var atlasScopeLabel = "All"
+    @State private var atlasLayoutRequest = UUID()
+    @State private var atlasLayoutIO = AtlasProjectIO()
+    @State private var atlasLayoutTask: Task<Void, Never>?
+    @State private var atlasLayoutCancellation: AtlasSearchCancellation?
+    @State private var atlasLayoutPending = false
     @State private var projectCache: AtlasProjectCache?
-    @State private var textTiles: [AtlasTextTile] = []
     @State private var atlasRevision = UUID()
     @State private var focusRequest = UUID()
     @State private var selectedMatch: AtlasMatch?
@@ -295,6 +302,12 @@ extension AtlasCamera {
 
     private var loadingProject: Bool { projectOpening.isDiscovering }
     private var loadGeneration: UUID { projectOpening.projectID }
+    private var atlasDocuments: [String: AtlasDocument] { atlasResidency.documents }
+    private var textTiles: [AtlasTextTile] { atlasResidency.tiles }
+    private var hasMetadataAtlas: Bool {
+        atlasResidency.isInstalled && atlasResidency.layoutRevision == atlasRevision
+            && atlasResidency.root.utf8.elementsEqual(root.utf8)
+    }
 
     private var searchContext: AtlasSearchContext {
         AtlasSearchContext(root: root, query: query, loadGeneration: loadGeneration,
@@ -325,6 +338,9 @@ extension AtlasCamera {
     }
 
     private var wantsCapturedIndex: Bool { searchMode == .text && useCapturedIndex }
+    private var overlayIsCurrent: Bool {
+        searchIsCurrent && overlayContentRevision == atlasResidency.contentRevision
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -401,6 +417,7 @@ extension AtlasCamera {
 #endif
         }
         .onDisappear {
+            closeAtlasResidency()
             closeFinderReader()
             projectBrowser.close()
             savedRepository.close()
@@ -423,6 +440,14 @@ extension AtlasCamera {
             searchCoordinator = nil
             workspaceSearch?.refresh()
             workspaceSearch = nil
+        }
+        .onChange(of: showsCatalog) { _, showing in
+            if showing { atlasResidency.suspend() }
+            // Returning creates a new native surface whose accepted frame
+            // supplies fresh viewport demand; hidden views do no enrichment.
+        }
+        .onChange(of: atlasResidency.contentRevision) { _, _ in
+            refreshResidentSearchOverlay()
         }
         .onChange(of: useCapturedIndex) { _, _ in
             clearSearch()
@@ -796,9 +821,9 @@ extension AtlasCamera {
     private var atlasScreen: some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
-                if (showsCatalog || textTiles.isEmpty), !projectBrowser.root.isEmpty {
+                if (showsCatalog || !hasMetadataAtlas), !projectBrowser.root.isEmpty {
                     progressiveProjectView
-                } else if textTiles.isEmpty {
+                } else if !hasMetadataAtlas {
                     if loadingProject {
                         VStack(spacing: 16) {
                             ProgressView("Opening \((root as NSString).lastPathComponent)…")
@@ -822,16 +847,28 @@ extension AtlasCamera {
                 } else {
                     AtlasCanvas(
                         revision: atlasRevision,
+                        contentRevision: atlasResidency.contentRevision,
                         focusRequest: focusRequest,
-                        selectedMatch: searchIsCurrent ? selectedMatch : nil,
-                        searchRows: searchIsCurrent ? searchRows : [],
-                        scopeLabel: fileScope == .custom ? customExtensions : fileScope.rawValue,
+                        selectedMatch: overlayIsCurrent ? selectedMatch : nil,
+                        searchRows: overlayIsCurrent ? searchRows : [],
+                        scopeLabel: atlasScopeLabel,
                         files: displayedFiles,
+                        metadata: atlasEntries,
                         camera: camera,
-                        hitPaths: searchIsCurrent ? searchPaths : [],
+                        hitPaths: overlayIsCurrent ? searchPaths : [],
                         selectedPath: selectedPath,
                         contentBounds: contentBounds,
-                        onSelect: { selectedHit = nil; openFile($0.path) },
+                        onSelect: { entry in
+                            guard !atlasLayoutPending, let path = entry.sourcePath,
+                                  fileScope.includes(path, custom: customExtensions) else {
+                                status = "This filename is available through Project Files or Quick Open."
+                                return
+                            }
+                            selectedHit = nil; openFile(path); showsReader = true
+                        },
+                        onViewport: updateAtlasViewport,
+                        residencySummary: atlasLayoutPending ? "Preparing the selected file scope…" : atlasResidency.summary,
+                        retryPreviews: atlasResidency.retryUnavailable,
                         tiles: textTiles
                     )
                     .id(atlasRevision)
@@ -863,7 +900,7 @@ extension AtlasCamera {
         let project = loadGeneration
         return AtlasProjectCatalogView(catalog: catalog, entries: catalogEntries,
             preparing: projectOpening.isPreparing, canPrepare: projectOpening.canPrepare,
-            hasAtlas: !textTiles.isEmpty, progress: loadProgress,
+            hasAtlas: hasMetadataAtlas, progress: loadProgress,
             build: requestAtlasPreviews, cancel: cancelAtlasLoad, refresh: requestAtlasLoad,
             showAtlas: { showsCatalog = false }) { id in
                 openCatalogFile(id, project: project)
@@ -1078,6 +1115,7 @@ extension AtlasCamera {
     /// Project opening performs only the bounded metadata operation. Text
     /// capture/highlighting/raster preparation is an explicit subsequent action.
     private func requestAtlasLoad() {
+        closeAtlasResidency()
         closeFinderReader()
         workspaceSearch?.refresh()
         projectBrowser.close()
@@ -1125,8 +1163,6 @@ extension AtlasCamera {
         files = []
         displayedFiles = []
         catalogEntries = []
-        atlasDocuments = [:]
-        textTiles = []
         loadProgress = "Discovering the first file page…"
         let browser = projectBrowser
         loadTask = Task {
@@ -1139,6 +1175,10 @@ extension AtlasCamera {
         loadTask?.cancel()
         loadCancellation?.cancel()
         projectIO.cancel()
+        atlasLayoutRequest = UUID()
+        atlasLayoutTask?.cancel(); atlasLayoutTask = nil
+        atlasLayoutCancellation?.cancel(); atlasLayoutCancellation = nil
+        atlasLayoutIO.cancel(); atlasLayoutPending = false
         loadTask = nil
         loadCancellation = nil
         projectOpening.cancel()
@@ -1256,7 +1296,7 @@ extension AtlasCamera {
         // the user opened while preparation ran. Show text atlas is explicit.
         showsCatalog = true
         loadProgress = projectOpening.catalog == nil ? "Collecting the bounded text-atlas catalog…"
-            : "Preparing source previews for \(files.count) openable files…"
+            : "Preparing the file atlas…"
         loadTask = Task {
             await prepareAtlas(root: requestedRoot, ticket: ticket,
                 cancellation: cancellation, accessLease: accessLease)
@@ -1270,7 +1310,7 @@ extension AtlasCamera {
         defer {
             if projectOpening.accepts(ticket) {
                 projectOpening.fail(ticket)
-                loadTask = nil; loadCancellation = nil
+                loadTask = nil; loadCancellation = nil; loadProgress = ""
             }
         }
         if projectOpening.catalog == nil {
@@ -1279,143 +1319,139 @@ extension AtlasCamera {
                     cancellation: cancellation, accessLease: accessLease)
             } catch {
                 if !cancellation.isCanceled, projectOpening.accepts(ticket) {
-                    status = "Text-atlas membership could not be prepared. Progressive file browsing remains available."
+                    status = "Atlas membership could not be prepared. Project Files remains available."
                 }
                 return
             }
         }
-        loadProgress = "Preparing source previews for \(files.count) openable files…"
-        let atlasFiles = files
-        await Task.yield()
-        guard !Task.isCancelled, projectOpening.accepts(ticket) else { return }
+        guard !cancellation.isCanceled, projectOpening.accepts(ticket) else { return }
+        // This cache owner supplies only Rust's highlighted-source cache. Its
+        // legacy hot document table never owns the viewport's evicted sources.
         if projectCache?.root.utf8.elementsEqual(requestedRoot.utf8) != true {
             projectCache = AtlasProjectCache.defaultDirectory(root: requestedRoot).map {
                 AtlasProjectCache(root: requestedRoot, cacheDirectory: $0)
             }
         }
-        let cache = projectCache
-        cache?.beginRefresh()
-        var documents: [String: AtlasDocument] = [:]
-        // Keep the eager working set proportional to RAM. Capture source before
-        // generated evidence so a broad repository does not spend the entire
-        // first-open budget on its first alphabetic artifact directory.
-        var remainingBytes = Int(min(UInt64(512 * 1024 * 1024),
-            max(UInt64(64 * 1024 * 1024), ProcessInfo.processInfo.physicalMemory / 128)))
-        var tiles: [AtlasTextTile] = []
-        let captureOrder = atlasFiles.sorted { left, right in
-            let leftRank = Self.captureRank(left.path)
-            let rightRank = Self.captureRank(right.path)
-            return leftRank == rightRank ? left.path < right.path : leftRank < rightRank
-        }
-        for (index, file) in captureOrder.enumerated() {
-            guard !Task.isCancelled, projectOpening.accepts(ticket) else { return }
-            guard file.bytes <= remainingBytes, file.bytes <= 4 * 1024 * 1024 else { continue }
-            if let existing = documents[file.path], !existing.source.path.utf8.elementsEqual(file.path.utf8) {
-                continue // Filename stays in catalog; this preview table cannot hold both spellings.
-            }
-            let fullPath = (requestedRoot as NSString).appendingPathComponent(file.path)
-            let handle = cache?.sourceHandle ?? 0
-            var leases = accessLease.map { [$0] } ?? []
-            if let cache { leases.append(cache) }
-            let packet: AtlasProjectSourcePacket?
-            do {
-                packet = try await projectIO.perform(cancellation: cancellation, keepingAlive: leases) {
-                    try AtlasProjectWorker.source(path: fullPath, handle: handle, cancellation: cancellation)
-                }
-            } catch AtlasProjectIOError.canceled { return }
-            catch { continue }
-            guard !Task.isCancelled, projectOpening.accepts(ticket), let packet else { continue }
-            let artifact: Data?
-            if let key = cache?.preparedKey(path: file.path, sourceKey: packet.key) {
-                do {
-                    artifact = try await projectIO.perform(cancellation: cancellation, keepingAlive: leases) {
-                        try AtlasProjectWorker.artifact(handle: handle, key: key,
-                            limit: AtlasBinaryWriter.limit, cancellation: cancellation)
-                    }
-                } catch AtlasProjectIOError.canceled { return }
-                catch { continue }
-            } else { artifact = nil }
-            guard !Task.isCancelled, projectOpening.accepts(ticket) else { return }
-            let prepared: AtlasDocument?
-            if let cache {
-                prepared = cache.document(path: file.path, packet: packet, artifact: artifact)
-            } else {
-                prepared = (try? JSONDecoder().decode(AtlasHighlightCapture.self, from: packet.json))
-                    .flatMap { AtlasDocument(path: file.path, capture: $0) }
-            }
-            guard let document = prepared, document.source.path.utf8.elementsEqual(file.path.utf8),
-                  document.source.text.utf8.count <= remainingBytes,
-                  document.tiles.count <= 65536 - tiles.count else { continue }
-            remainingBytes -= document.source.text.utf8.count
-            documents[file.path] = document
-            tiles.append(contentsOf: document.tiles)
-            if index.isMultiple(of: 8) {
-                loadProgress = "Prepared \(index + 1) of \(captureOrder.count) files…"
-            }
-            await Task.yield()
-        }
-        guard !Task.isCancelled, !cancellation.isCanceled, projectOpening.accepts(ticket) else { return }
-        loadProgress = "Laying out the atlas…"
-        await Task.yield()
-        guard !Task.isCancelled, projectOpening.accepts(ticket) else { return }
-        guard Engine.placeTextTiles(tiles) != nil, AtlasParcelLayout.reflow(documents) != nil else {
-            status = "Text layout unavailable. The file catalog and source reader remain available."
-            return
-        }
-        loadProgress = "Finishing source previews…"
-        await Task.yield()
-        guard !Task.isCancelled, projectOpening.accepts(ticket) else { return }
-        cache?.finishRefresh(documents: documents)
-        await Task.yield()
-        guard !Task.isCancelled, projectOpening.accepts(ticket) else { return }
-        cache?.prepareOverview(documents: documents)
-        guard !Task.isCancelled, !cancellation.isCanceled, projectOpening.accepts(ticket) else { return }
-
-        // Choose the CURRENT scope after the asynchronous preparation. From
-        // here to publication there is no suspension that could mix its layout
-        // with a later filter. This is the existing bounded native layout path,
-        // not a claim of resumable shaping or measured frame-time qualification.
-        let scopedFiles = files.filter { fileScope.includes($0.path, custom: customExtensions) }
-        let scopedDocuments = documents.filter { fileScope.includes($0.value.source.path, custom: customExtensions) }
-        let scopedTiles = scopedDocuments.values.flatMap(\.tiles)
-        let bounds = Engine.placeTextTiles(scopedTiles)
-        let display = bounds.flatMap { _ in AtlasParcelLayout.reflow(scopedDocuments) } ?? []
-        let budget = max(1, 64 * 1024 * 1024 / max(1, display.count))
-        for tile in display where tile.raster == nil { tile.prepareRaster(pixelBudget: budget) }
-
-        let previousContext = searchContext
-        let hadCurrentSearch = searchIsCurrent
-        atlasDocuments = documents
-        displayedFiles = scopedFiles
-        textTiles = display
-        renewAtlasRevision()
-        if let bounds { contentBounds = bounds; camera.contentBounds = bounds }
+        let request = UUID()
+        atlasLayoutRequest = request
+        atlasLayoutPending = true
+        loadProgress = "Laying out file metadata…"
+        let installed = await installAtlasScope(root: requestedRoot, project: ticket.project,
+            request: request, cancellation: cancellation, accessLease: accessLease, preservingCaptures: false)
+        guard projectOpening.accepts(ticket), atlasLayoutRequest == request else { return }
+        atlasLayoutPending = false
+        guard installed else { return }
         projectOpening.finishPreviews(ticket, available: true)
         loadTask = nil; loadCancellation = nil; loadProgress = ""
-        // Optional geometry never revokes a captured reader, restarts a query,
-        // or lends old coordinates to a new frame. Rebuild overlay proofs while
-        // retaining report/row identities; pending searches rebind on delivery.
-        if hadCurrentSearch, previousContext.matchesSourceRequest(searchContext), let report = searchReport {
-            prepareSearchOverlay(report, context: searchContext)
-            selectedMatch = selectedHit.flatMap { row in
-                searchPresentation?.captureCandidate(for: row, in: searchContext) == nil ? nil : resolvedMatches[row.hit]
-            }
-        } else {
-            selectedMatch = nil; resolvedMatches = [:]; searchRows = []; searchPaths = []
-        }
+        // Source is admitted only after a visible native frame requests it.
+        // Publishing metadata never dismisses the user's independent reader.
         if !searchPending {
-            status = "Text atlas prepared for \(documents.count) of \(files.count) openable files. Catalog and reader selections are unchanged."
+            status = "Atlas ready for \(atlasEntries.count) known files. Source previews load as you navigate."
         }
     }
 
-    private static func captureRank(_ path: String) -> Int {
-        let name = (path as NSString).lastPathComponent
-        let ext = (name as NSString).pathExtension.lowercased()
-        if ["rs", "swift", "py", "go", "c", "h", "cpp", "hpp", "m", "mm", "js", "jsx", "ts", "tsx", "java", "kt", "sh", "bash", "zig"].contains(ext) { return 0 }
-        if ["md", "mdx", "rst", "txt"].contains(ext) { return 1 }
-        if ["toml", "yaml", "yml", "xml", "html", "css", "sql"].contains(ext) { return 2 }
-        if path.hasPrefix(".beads/") || path.hasPrefix("artifacts/") || path.hasPrefix(".rch-out/") { return 4 }
-        return 3
+    /// An explicit scope transaction may compact metadata on the worker. Source
+    /// arrival and eviction never call this method or alter parcel geometry.
+    private func installAtlasScope(root requestedRoot: String, project: UUID, request: UUID,
+        cancellation: AtlasSearchCancellation, accessLease: AnyObject?, preservingCaptures: Bool) async -> Bool {
+        guard let catalog = projectOpening.catalog else { return false }
+        let requestedScope = fileScope, requestedExtensions = Array(customExtensions.utf8)
+        let scopeLabel = fileScope == .custom ? customExtensions : fileScope.rawValue
+        let entries = catalog.entries.filter { entry in
+            entry.sourcePath.map { fileScope.includes($0, custom: customExtensions) } ?? (fileScope == .all)
+        }
+        let compacted: [AtlasProjectCatalog.Entry]
+        do {
+            compacted = try await atlasLayoutIO.perform(cancellation: cancellation,
+                keepingAlive: accessLease.map { [$0] } ?? []) {
+                guard !cancellation.isCanceled else { throw AtlasProjectIOError.canceled }
+                guard let placed = AtlasParcelLayout.compact(entries) else { throw AtlasProjectIOError.invalidResponse }
+                guard !cancellation.isCanceled else { throw AtlasProjectIOError.canceled }
+                return placed
+            }
+        } catch {
+            if !cancellation.isCanceled, atlasLayoutRequest == request, loadGeneration == project {
+                status = "The atlas layout is unavailable. Project Files and source readers remain available."
+            }
+            return false
+        }
+        guard !Task.isCancelled, !cancellation.isCanceled, loadGeneration == project,
+              atlasLayoutRequest == request, root.utf8.elementsEqual(requestedRoot.utf8),
+              fileScope == requestedScope, Array(customExtensions.utf8) == requestedExtensions else { return false }
+#if FCB_APP_STORE
+        guard rootAccess?.url.path.utf8.elementsEqual(requestedRoot.utf8) == true else { return false }
+#endif
+        let revision = UUID()
+        let hadCurrentSearch = searchIsCurrent
+        guard atlasResidency.install(root: requestedRoot, entries: compacted, layoutRevision: revision,
+            accessLease: accessLease, sourceCacheHandle: projectCache?.sourceHandle ?? 0,
+            cacheLease: projectCache, preservingCaptures: preservingCaptures) else {
+            status = "Atlas metadata could not be admitted. Project Files remains available."
+            return false
+        }
+        atlasEntries = compacted
+        atlasScopeLabel = scopeLabel
+        displayedFiles = files.filter { fileScope.includes($0.path, custom: customExtensions) }
+        let bounds = compacted.reduce(CGRect.null) { result, entry in
+            result.union(CGRect(x: entry.x, y: entry.y, width: entry.width, height: entry.height))
+        }
+        contentBounds = bounds.isNull || bounds.isEmpty ? CGRect(x: 0, y: 0, width: 4096, height: 4096) : bounds
+        camera.contentBounds = contentBounds
+        camera.bindNavigation(to: revision)
+        atlasRevision = revision
+        updateCatalogFilter()
+        refreshResidentSearchOverlay(rebindingCurrentReport: hadCurrentSearch)
+        return true
+    }
+
+    private func requestAtlasScopeLayout() {
+        atlasLayoutTask?.cancel(); atlasLayoutCancellation?.cancel(); atlasLayoutIO.cancel()
+        atlasResidency.suspend()
+        let request = UUID(), project = loadGeneration, requestedRoot = root
+        let cancellation = AtlasSearchCancellation()
+        atlasLayoutRequest = request; atlasLayoutCancellation = cancellation; atlasLayoutPending = true
+#if FCB_APP_STORE
+        let accessLease: AnyObject? = rootAccess
+#else
+        let accessLease: AnyObject? = nil
+#endif
+        atlasLayoutTask = Task {
+            let installed = await installAtlasScope(root: requestedRoot, project: project, request: request,
+                cancellation: cancellation, accessLease: accessLease, preservingCaptures: true)
+            guard atlasLayoutRequest == request else { return }
+            atlasLayoutTask = nil; atlasLayoutCancellation = nil; atlasLayoutPending = false
+            if installed, !searchPending {
+                status = "\(atlasEntries.count) known files · \(atlasScopeLabel). Source loads for the visible area."
+            }
+        }
+    }
+
+    private func updateAtlasViewport(_ world: CGRect, scale: Double) {
+        guard !showsCatalog, !atlasLayoutPending, hasMetadataAtlas else { return }
+        atlasResidency.updateViewport(world, scale: scale, selectedPath: selectedPath)
+    }
+
+    private func refreshResidentSearchOverlay(rebindingCurrentReport: Bool = false) {
+        // Even a same-query stream must revalidate every geometry proof after
+        // a source replacement or eviction. Query identity and readers survive.
+        let canRebind = rebindingCurrentReport || searchIsCurrent
+        let reportID = searchPresentation?.id
+        overlayContentRevision = nil
+        resolvedMatches = [:]; searchRows = []; searchPaths = []; selectedMatch = nil
+        guard let report = searchReport, (report.indexStatus != nil) == wantsCapturedIndex,
+              report.mode == searchMode, !loadingProject, canRebind else { return }
+        prepareSearchOverlay(report, context: searchContext, retainingReportID: reportID)
+        selectedMatch = selectedHit.flatMap { row in
+            searchPresentation?.captureCandidate(for: row, in: searchContext) == nil ? nil : resolvedMatches[row.hit]
+        }
+    }
+
+    private func closeAtlasResidency() {
+        atlasLayoutRequest = UUID()
+        atlasLayoutTask?.cancel(); atlasLayoutTask = nil
+        atlasLayoutCancellation?.cancel(); atlasLayoutCancellation = nil
+        atlasLayoutIO.cancel(); atlasLayoutPending = false
+        atlasResidency.close(); atlasEntries = []
     }
 
     private func applyFileScope() {
@@ -1425,18 +1461,17 @@ extension AtlasCamera {
         cancelSourceLoad()
         clearSearch()
         selectedPath = nil; selectedSource = nil; selectedMatch = nil
-        let scoped = files.filter { fileScope.includes($0.path, custom: customExtensions) }
-        let documents = atlasDocuments.filter { fileScope.includes($0.value.source.path, custom: customExtensions) }
-        let tiles = documents.values.flatMap(\.tiles)
-        if let bounds = Engine.placeTextTiles(tiles), let display = AtlasParcelLayout.reflow(documents) {
-            let budget = max(1, 64 * 1024 * 1024 / max(1, display.count))
-            for tile in display where tile.raster == nil { tile.prepareRaster(pixelBudget: budget) }
-            textTiles = display; contentBounds = bounds; camera.contentBounds = bounds
-        } else { textTiles = [] }
-        displayedFiles = scoped
         updateCatalogFilter()
-        renewAtlasRevision()
-        status = "\(scoped.count) of \(files.count) files · \(fileScope.rawValue). Search uses the selected file types."
+        if hasMetadataAtlas {
+            requestAtlasScopeLayout()
+            status = "Preparing \(fileScope.rawValue) scope. Search uses the selected file types."
+        } else if projectOpening.isPreparing, projectOpening.catalog != nil {
+            // Coalesce a scope edit while the initial metadata layout runs.
+            cancelAtlasLoad()
+            requestAtlasPreviews()
+        } else {
+            status = "\(fileScope.rawValue) scope. Project Files and search use the selected file types."
+        }
         if !loadingProject && !query.isEmpty { runSearch(debounce: true) }
     }
 
@@ -1455,13 +1490,15 @@ extension AtlasCamera {
         selectedReaderSelection = nil
         searchReport = nil; searchPresentation = nil
         resolvedMatches = [:]; searchRows = []; searchPaths = []
+        overlayContentRevision = nil
         overlayLimited = false
         searchTitle = "Search project"
         searchSummary = "Enter text to search the project."
         status = "\(displayedFiles.count) of \(files.count) files shown. Search cleared."
     }
 
-    private func prepareSearchOverlay(_ report: AtlasSearchReport, context: AtlasSearchContext) {
+    private func prepareSearchOverlay(_ report: AtlasSearchReport, context: AtlasSearchContext,
+        retainingReportID: UUID? = nil) {
         // Only a validated append-only stream in the same immutable atlas may
         // reuse geometry. New queries/scopes/captures start from no proof.
         let sameStream = report.streamID != nil && report.streamID == searchPresentation?.id
@@ -1501,8 +1538,9 @@ extension AtlasCamera {
             }
         }
         resolvedMatches = matches; searchRows = rows
+        overlayContentRevision = atlasResidency.contentRevision
         searchPresentation = AtlasSearchPresentation(context: context, hits: report.hits,
-            verifiedHitIDs: Set(matches.keys), id: report.streamID ?? UUID())
+            verifiedHitIDs: Set(matches.keys), id: report.streamID ?? retainingReportID ?? UUID())
         searchPaths = Set(report.hits.compactMap(\.sourcePath))
         overlayLimited = limited
     }
@@ -1900,16 +1938,21 @@ extension AtlasCamera {
 
 struct AtlasCanvas: View {
     let revision: UUID
+    let contentRevision: UUID
     let focusRequest: UUID
     let selectedMatch: AtlasMatch?
     let searchRows: [CGRect]
     let scopeLabel: String
     let files: [AtlasFile]
+    let metadata: [AtlasProjectCatalog.Entry]
     let camera: AtlasCamera
     let hitPaths: Set<String>
     let selectedPath: String?
     let contentBounds: CGRect
-    let onSelect: (AtlasFile) -> Void
+    let onSelect: (AtlasProjectCatalog.Entry) -> Void
+    let onViewport: (CGRect, Double) -> Void
+    let residencySummary: String
+    let retryPreviews: () -> Void
     let tiles: [AtlasTextTile]
 
     @GestureState private var dragDelta: CGSize = .zero
@@ -1925,8 +1968,13 @@ struct AtlasCanvas: View {
                 AtlasRetainedView(tiles: tiles, revision: revision, scale: camera.scale,
                     offset: CGPoint(x: camera.offsetX, y: camera.offsetY),
                     selectedPath: selectedPath, hitPaths: hitPaths, matchRows: searchRows.isEmpty ? (selectedMatch?.rowRects ?? []) : searchRows,
-                    onPresentedFrame: { revision, scale, offset in
-                        presentedFrame.record(revision: revision, scale: scale, offset: offset)
+                    metadata: metadata, contentRevision: contentRevision,
+                    onPresentedContent: { acceptedLayout, acceptedContent, scale, offset in
+                        guard acceptedLayout == revision, acceptedContent == contentRevision,
+                              camera.acceptsNavigation(revision: revision) else { return }
+                        presentedFrame.record(revision: revision, scale: scale, offset: offset,
+                            contentRevision: contentRevision)
+                        requestVisibleSource(in: size)
                     })
                 .onChange(of: timeline.date) { _, _ in
                     guard camera.acceptsNavigation(revision: revision) else { return }
@@ -1961,9 +2009,11 @@ struct AtlasCanvas: View {
                 SpatialTapGesture()
                     .onEnded { value in
                         guard camera.acceptsNavigation(revision: revision), dragDelta == .zero,
-                              let point = presentedFrame.worldPoint(at: value.location, revision: revision),
-                              let tile = tiles.last(where: { ($0.parcelRect ?? $0.rect).contains(point) }),
-                              let file = files.first(where: { $0.path == tile.path }) else {
+                              let point = presentedFrame.worldPoint(at: value.location, revision: revision,
+                                  contentRevision: contentRevision),
+                              let file = metadata.last(where: {
+                                  CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height).contains(point)
+                              }) else {
                             return
                         }
                         onSelect(file)
@@ -1987,9 +2037,12 @@ struct AtlasCanvas: View {
                 initialFitPending = !camera.fit(bounds: contentBounds, viewport: size)
             }
             .onChange(of: focusRequest) { _, _ in
-                guard let path = selectedPath, let first = tiles.first(where: { $0.path == path }) else { return }
-                camera.navigateFocus(bounds: selectedMatch?.focusRect ?? first.rect, viewport: size, revision: revision)
+                guard let path = selectedPath,
+                      let file = metadata.first(where: { $0.rawPath.elementsEqual(path.utf8) }) else { return }
+                let parcel = CGRect(x: file.x, y: file.y, width: file.width, height: file.height)
+                camera.navigateFocus(bounds: selectedMatch?.focusRect ?? parcel, viewport: size, revision: revision)
             }
+            .onChange(of: selectedPath.map { Array($0.utf8) }) { _, _ in requestVisibleSource(in: size) }
             .onChange(of: size, initial: true) { _, newSize in
                 viewport = newSize
                 guard camera.acceptsNavigation(revision: revision) else { return }
@@ -2046,17 +2099,36 @@ struct AtlasCanvas: View {
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
             }
             .overlay(alignment: .bottomTrailing) {
-                Text("\(files.count) files · \(scopeLabel)")
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .padding(6)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
-                    .padding(10)
+                VStack(alignment: .trailing, spacing: 4) {
+                    Text("\(metadata.count) known files · \(scopeLabel)")
+                        .font(.system(size: 11, design: .monospaced))
+                    Text(residencySummary).font(.caption).lineLimit(2)
+                    Button("Retry previews") {
+                        guard camera.acceptsNavigation(revision: revision) else { return }
+                        retryPreviews()
+                        requestVisibleSource(in: size)
+                    }.font(.caption)
+                }
+                .foregroundStyle(.secondary)
+                .padding(6)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+                .padding(10)
             }
         }
     }
 
-
+    /// Only the accepted display transform supplies demand. This callback
+    /// records bounded scheduling input; source reads and shaping run later.
+    private func requestVisibleSource(in size: CGSize) {
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0,
+              let origin = presentedFrame.worldPoint(at: .zero, revision: revision, contentRevision: contentRevision),
+              let end = presentedFrame.worldPoint(at: CGPoint(x: size.width, y: size.height),
+                  revision: revision, contentRevision: contentRevision), end.x > origin.x, end.y > origin.y else { return }
+        let world = CGRect(x: origin.x, y: origin.y, width: end.x - origin.x, height: end.y - origin.y)
+        let scale = size.width / world.width
+        guard scale.isFinite, scale > 0 else { return }
+        onViewport(world, scale)
+    }
 }
 
 // MARK: - Hit row

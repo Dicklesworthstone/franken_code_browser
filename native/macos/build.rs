@@ -21,6 +21,8 @@ fn main() {
         "swiftui/AtlasPreparedText.swift",
         "swiftui/AtlasProjectCache.swift",
         "swiftui/AtlasProjectCatalog.swift",
+        "swiftui/AtlasViewportWorker.swift",
+        "swiftui/AtlasViewportResidency.swift",
         "swiftui/AtlasProjectOpening.swift",
         "swiftui/AtlasProjectBrowser.swift",
         "swiftui/AtlasProjectBrowserBridge.swift",

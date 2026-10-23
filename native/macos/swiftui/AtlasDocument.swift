@@ -2,6 +2,117 @@ import SwiftUI
 import AppKit
 import CoreText
 import os
+import Dispatch
+
+/// Every native preview reserves a finite lifetime slot and byte allowance
+/// before preparation. Its payload remains charged after model eviction, while
+/// an accepted frame, GPU flight, or selected source still owns the lease.
+/// Final release uses that already reserved slot; a single coalesced drain
+/// destroys payloads off-main before returning admission credit.
+final class AtlasNativeRetirement: @unchecked Sendable {
+    private final class Payload: @unchecked Sendable {
+        let value: Any
+        init(_ value: Any) { self.value = value }
+    }
+    final class Lease: @unchecked Sendable {
+        private let pool: AtlasNativeRetirement
+        private let slot: Int
+        private var payload: Payload?
+        fileprivate init(pool: AtlasNativeRetirement, slot: Int) { self.pool = pool; self.slot = slot }
+
+        /// Called once by the private preparation worker before publication.
+        /// The payload must contain storage values, never an object that itself
+        /// owns this lease. Shrinking preserves admission until final release.
+        func publish(storage: Any, bytes: Int) -> Bool {
+            guard payload == nil, pool.shrink(slot: slot, bytes: bytes) else { return false }
+            payload = Payload(storage)
+            return true
+        }
+        deinit { pool.enqueue(slot: slot, payload: payload) }
+    }
+
+    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "dev.frankencode.browser.native-retirement", qos: .utility)
+    private let maximumBytes: Int
+    private var free: [Int]
+    private var charges: [Int: Int] = [:]
+    private var pending: [(Int, Payload?)] = []
+    private var ready: [(Int, Payload?)] = []
+    private var handoffScheduled = false
+    private var draining = false
+    private var bytes = 0
+    private var wake: (@Sendable () -> Void)?
+
+    init(maximumSlots: Int, maximumBytes: Int) {
+        precondition(maximumSlots > 0 && maximumSlots <= 520 && maximumBytes > 0)
+        self.maximumBytes = maximumBytes; free = Array(0..<maximumSlots)
+        pending.reserveCapacity(maximumSlots)
+        ready.reserveCapacity(maximumSlots)
+    }
+    var reservedBytes: Int { lock.lock(); defer { lock.unlock() }; return bytes }
+    var reservedSlots: Int { lock.lock(); defer { lock.unlock() }; return charges.count }
+    func onAvailability(_ callback: @escaping @Sendable () -> Void) {
+        lock.lock(); wake = callback; lock.unlock()
+    }
+    func reserve(bytes requested: Int) -> Lease? {
+        lock.lock(); defer { lock.unlock() }
+        guard requested > 0, requested <= maximumBytes - bytes, let slot = free.popLast() else { return nil }
+        charges[slot] = requested; bytes += requested
+        return Lease(pool: self, slot: slot)
+    }
+    private func shrink(slot: Int, bytes actual: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let old = charges[slot], actual >= 0, actual <= old else { return false }
+        charges[slot] = actual; bytes -= old - actual
+        return true
+    }
+    private func enqueue(slot: Int, payload: Payload?) {
+        lock.lock()
+        precondition(charges[slot] != nil)
+        pending.append((slot, payload))
+        let start = !handoffScheduled
+        handoffScheduled = true
+        lock.unlock()
+        if start {
+            // Let any main-thread owner finish its stored-property teardown
+            // before releasing the payload's final shared array references.
+            // This is one coalesced handoff, not one closure per tile or job.
+            DispatchQueue.main.async { [self] in promote() }
+        }
+    }
+    private func promote() {
+        lock.lock()
+        ready.append(contentsOf: pending); pending.removeAll(keepingCapacity: true)
+        handoffScheduled = false
+        let start = !draining && !ready.isEmpty
+        if start { draining = true }
+        lock.unlock()
+        if start { queue.async { [self] in drain() } }
+    }
+    private func drain() {
+        while true {
+            lock.lock()
+            guard !ready.isEmpty else {
+                draining = false
+                let callback = wake
+                lock.unlock()
+                callback?()
+                return
+            }
+            let slot = ready[ready.count - 1].0
+            var payload = ready.removeLast().1
+            lock.unlock()
+            // Force final storage release here, before making the reservation
+            // reusable. Nested leases may enqueue into their own reserved slots.
+            withExtendedLifetime(payload) {}
+            payload = nil
+            lock.lock()
+            if let charge = charges.removeValue(forKey: slot) { bytes -= charge }
+            free.append(slot)
+            lock.unlock()
+        }
+    }
+}
 
 enum Monokai {
     static let background = NSColor(srgbRed: 0x16 / 255.0, green: 0x1A / 255.0, blue: 0x1D / 255.0, alpha: 1)
@@ -61,6 +172,9 @@ final class AtlasTextTile {
     var parcelFirst = false { didSet { noteRenderMutation() } }
     var contentScale: Double { rect.width / Self.width }
     var raster: CGImage? { didSet { noteRenderMutation() } }
+    // Set only during private preparation. A retained frame owns this credit
+    // for as long as it can draw the tile, independently of the model's LRU.
+    var nativeResidencyOwner: AtlasNativeRetirement.Lease?
     var lineCount: Int { preparedLines?.count ?? lines.count }
     var height: Double { 22 + Double(lineCount) * Self.lineHeight }
 
@@ -126,6 +240,7 @@ final class AtlasDocument {
     var displayTiles: [AtlasTextTile]?
     var renderTiles: [AtlasTextTile] { displayTiles ?? tiles }
     let restoredColorLineCount: Int
+    var nativeResidencyOwner: AtlasNativeRetirement.Lease?
     lazy var preparationCounts: (glyphs: Int, runs: Int) = {
         var glyphs = 0, runs = 0
         for tile in tiles {
@@ -181,9 +296,9 @@ final class AtlasDocument {
     }
 
     init?(path: String, capture: AtlasHighlightCapture, glyphLimit: Int = 16 * 1024 * 1024,
-          runLimit: Int = 1024 * 1024) {
-        guard glyphLimit >= 0, runLimit >= 0, capture.text.utf16.count <= glyphLimit,
-              capture.validatedRuns() != nil else { return nil }
+          runLimit: Int = 1024 * 1024, tileLimit: Int = Int.max, canceled: () -> Bool = { false }) {
+        guard glyphLimit >= 0, runLimit >= 0, tileLimit >= 0, capture.text.utf16.count <= glyphLimit,
+              capture.validatedRuns() != nil, !canceled() else { return nil }
         self.capture = capture
         restoredColorLineCount = 0
         source = AtlasSource(path: path, text: capture.text)
@@ -195,6 +310,9 @@ final class AtlasDocument {
         var start = 0
         var remainingGlyphs = glyphLimit, remainingRuns = runLimit
         while offset < styled.length {
+            // Newline-heavy captures can have many rows with few glyphs.
+            // Refuse before shaping another tile, never return a text prefix.
+            guard result.count < tileLimit, !canceled() else { return nil }
             let count = CTTypesetterSuggestLineBreak(typesetter, offset, AtlasTextTile.width - 8)
             guard count > 0, count <= styled.length - offset else { return nil }
             let line = CTTypesetterCreateLine(typesetter, CFRange(location: offset, length: count))
