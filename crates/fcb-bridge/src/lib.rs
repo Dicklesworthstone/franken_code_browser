@@ -20,6 +20,8 @@ mod text_layout_ffi;
 mod source_cache_ffi;
 mod saved_sessions;
 mod saved_ffi;
+mod catalog_sessions;
+mod catalog_ffi;
 mod search_ffi;
 pub use search_ffi::{fcb_search_workspace_cancelable, SearchCancellationCallback};
 

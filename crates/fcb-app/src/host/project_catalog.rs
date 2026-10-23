@@ -9,7 +9,7 @@ use std::path::Path;
 use fcb::ByteLength;
 use fcb::search::ResourceBudget;
 use crate::{AppError, allocation, owner};
-use crate::output::{Output, MAX_ENCODED_BYTES};
+use crate::output::{Output, MAX_ENCODED_BYTES, OUTPUT_OVERHEAD_BYTES};
 use super::super::{HostResponse, atlas_session::{AtlasSession, AtlasSessionError, AtlasSessionOptions}};
 
 /// Response-local IDs do not authorize later source access. Paths are reversible
@@ -23,8 +23,9 @@ pub fn prepare(root: &Path, max_files: usize, mut canceled: impl FnMut() -> bool
         AtlasSessionOptions { max_files, ..Default::default() }, &mut canceled)?;
     let catalog = atlas.atlas().catalog();
     let index = atlas.atlas().index()?;
-    // Reserve response/native-copy overlap independently from retained geometry.
-    let budget = ResourceBudget::new(owner(), ByteLength::new((4 * MAX_ENCODED_BYTES + 4096) as u64))
+    // Admit both response/native-copy overlap and the encoder's path scratch.
+    // Reserving only four payloads leaves no capacity for Output's own overhead.
+    let budget = ResourceBudget::new(owner(), ByteLength::new((4 * MAX_ENCODED_BYTES + 4096 + OUTPUT_OVERHEAD_BYTES) as u64))
         .map_err(|_| AppError::Admission)?;
     let lease = budget.try_reserve_managed(owner(), allocation(94),
         ByteLength::new((3 * MAX_ENCODED_BYTES + 4096) as u64)).map_err(|_| AppError::Admission)?;
