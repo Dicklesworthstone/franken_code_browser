@@ -61,6 +61,44 @@ char *fcb_saved_results(uint64_t handle, uint64_t generation,
     uint64_t start, uint64_t limit);
 char *fcb_saved_clear_results(uint64_t handle, uint64_t generation);
 
+/* Explicit saved-source expressions using the shared query grammar:
+ * phrases, required terms, -excluded terms, path:/-path: and lang:/-lang: filters.
+ * Text predicates apply to the WHOLE captured member, case-sensitively; result
+ * rows identify exact occurrences of the first positive term. Query <=1024
+ * UTF-8 bytes /64 tokens; regex is not supported. query must remain readable,
+ * NUL-terminated UTF-8 until return. Invalid syntax returns a structured error.
+ *
+ * max_hits 0..4096 (zero probes existence). max_scan_bytes bounds aggregate
+ * matching work, including each predicate scan over already loaded bytes.
+ * Search uses verified archive members directly; an attached literal posting
+ * index is neither used nor detached. Only bounded witness metadata is retained.
+ * Inspect complete/state, discovery completeness and omission counters: a
+ * work limit or unavailable/unsupported source cannot prove absence.
+ *
+ * Expression generations are independent of literal/index/relationship state.
+ * Every admitted search/clear attempt must increase, even after failure or
+ * cancellation; a failed replacement preserves the last accepted expression.
+ * info exposes accepted_expression_generation (nullable) and
+ * last_expression_attempt for recovery after a lost or late response.
+ * First page has at most 64 rows; subsequent pages use the accepted generation,
+ * start >= 0 and limit 1..128 without rescanning source. The selection namespace
+ * is saved-expression; never reinterpret these hit IDs as literal query IDs.
+ */
+char *fcb_saved_expression_search(uint64_t handle, uint64_t generation,
+    const char *query, uint64_t max_hits, uint64_t max_scan_bytes);
+char *fcb_saved_expression_results(uint64_t handle, uint64_t generation,
+    uint64_t start, uint64_t limit);
+char *fcb_saved_clear_expression(uint64_t handle, uint64_t generation);
+
+/* Same EMPTY-reader admission/lifetime rules as literal activation. Revalidates
+ * the full member digest that established the expression predicates, then
+ * returns expression-open-reader with exact original selection evidence.
+ * Receipt and selection use expression_generation, never query_generation.
+ * The resulting retained reader survives query replacement/archive closure.
+ */
+char *fcb_saved_open_expression_hit_reader(uint64_t handle, uint64_t reader,
+    uint64_t generation, uint64_t hit);
+
 /* Captured Markdown documentation links and reverse backlinks. This separate
  * relationship generation is independent of text-query and posting-index
  * generations. Prepare/clear attempts must increase; failed replacements keep

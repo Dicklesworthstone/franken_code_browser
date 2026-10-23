@@ -19,13 +19,18 @@ fn entrypoint_types_and_header_declarations_agree() {
     let _: unsafe extern "C" fn(u64, u64, *const c_char, u64) -> *mut c_char = fcb_saved_search;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_saved_results;
     let _: extern "C" fn(u64, u64) -> *mut c_char = fcb_saved_clear_results;
+    let _: unsafe extern "C" fn(u64, u64, *const c_char, u64, u64) -> *mut c_char = fcb_saved_expression_search;
+    let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_saved_expression_results;
+    let _: extern "C" fn(u64, u64) -> *mut c_char = fcb_saved_clear_expression;
+    let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_saved_open_expression_hit_reader;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_saved_open_hit_reader;
     let _: extern "C" fn(u64, u64, u64) -> *mut c_char = fcb_saved_open_member_reader;
     let _: extern "C" fn(u64) -> u8 = fcb_saved_cancel;
     let _: extern "C" fn(u64) -> u8 = fcb_saved_close;
     let header = include_str!("../include/fcb_saved_repository.h");
     for name in ["create", "open", "info", "members", "attach_index", "detach_index", "search", "results",
-        "clear_results", "open_hit_reader", "open_member_reader", "cancel", "close"] {
+        "clear_results", "expression_search", "expression_results", "clear_expression", "open_expression_hit_reader",
+        "open_hit_reader", "open_member_reader", "cancel", "close"] {
         assert_eq!(header.matches(&format!("fcb_saved_{name}(")).count(), 1, "{name}");
     }
 }

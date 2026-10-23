@@ -94,6 +94,42 @@ pub extern "C" fn fcb_saved_results(handle: u64, generation: u64, start: u64, li
 pub extern "C" fn fcb_saved_clear_results(handle: u64, generation: u64) -> *mut c_char {
     reply(|| answer(handle, |sessions| sessions.execute(handle, Command::Clear { generation }, || false)))
 }
+
+/// Existing whole-member expression grammar, retaining exact occurrence witnesses.
+/// Expression attempts and accepted rows are independent of literal queries.
+/// # Safety
+/// query is null or readable NUL-terminated UTF-8 stable until return. No
+/// foreign pointer is retained; release the response with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_saved_expression_search(handle: u64, generation: u64,
+    query: *const c_char, max_hits: u64, max_scan_bytes: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| {
+        let query = unsafe { cstr(query) }.ok_or(AccessError::InvalidArgument)?;
+        sessions.execute(handle, Command::ExpressionSearch { generation, query,
+            max_hits: number(max_hits)?, max_scan_bytes }, || false)
+    }))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_saved_expression_results(handle: u64, generation: u64,
+    start: u64, limit: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| sessions.execute(handle,
+        Command::ExpressionResults { generation, start: number(start)?, limit: number(limit)? }, || false)))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_saved_clear_expression(handle: u64, generation: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| sessions.execute(handle, Command::ClearExpression { generation }, || false)))
+}
+
+/// Reverify the selected expression member before installing an EMPTY reader.
+/// Literal hit IDs cannot activate this separately qualified selection namespace.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_saved_open_expression_hit_reader(handle: u64, reader: u64,
+    generation: u64, hit: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| {
+        let readers = crate::reader_ffi::registry().ok_or(crate::reader_sessions::AccessError::UnknownHandle)?;
+        sessions.open_reader(handle, readers, reader, Selection::ExpressionHit { generation, id: hit }, || false)
+    }))
+}
 /// Build a bounded Markdown-document-link projection from this opened archive.
 /// Evidence is the exact whole captured document; parser block spans are not used.
 #[unsafe(no_mangle)]
@@ -171,3 +207,7 @@ mod tests;
 #[cfg(all(test, unix))]
 #[path = "saved_relationships_ffi_tests.rs"]
 mod relationships_tests;
+
+#[cfg(all(test, unix))]
+#[path = "saved_expression_ffi_tests.rs"]
+mod expression_tests;

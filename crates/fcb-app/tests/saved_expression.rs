@@ -185,3 +185,168 @@ fn invalid_grammar_oversized_queries_and_case_sensitive_negatives_remain_explici
     assert!(json(&result.page(&mut s, 1, 0, 10, || false).unwrap()).get("case_sensitive").flag());
     let _ = fs::metadata(&f.path).unwrap(); // The archive remains available after all refusals.
 }
+
+#[test]
+fn retained_expression_attempts_recover_without_replacing_literal_results_or_readers() {
+    let f = Fixture::new(&[entry(b"source.rs", b"needle required needle forbidden")], true);
+    let mut s = f.open(66201);
+    let (index, pin) = f.index();
+    s.attach_index(1, &index, pin, || false).unwrap();
+    s.search(1, "forbidden", 10, || false).unwrap();
+    let first = s.expression_search(1, "needle required", 10, 10000, || false).unwrap();
+    assert_eq!(json(&first).get("expression_generation").number(), 1);
+    assert_eq!(json(&first).get("retained_hits").number(), 2);
+    let (mut reader, opened) = s.open_expression_hit_reader(owner(66202), 1, 2, || false).unwrap();
+    let receipt = json(&opened);
+    assert_eq!(receipt.get("command").text(), "expression-open-reader");
+    assert_eq!(receipt.get("selection_namespace").text(), "saved-expression");
+    assert_eq!(receipt.get("expression_generation").number(), 1);
+    assert_eq!(receipt.get("primary_needle").text(), "needle");
+    assert_eq!(receipt.get("selection").get("hit_id").number(), 2);
+    assert_eq!(receipt.get("selection").get("expression_generation").number(), 1);
+    assert_eq!(receipt.get("selection").get("original_range").get("start").number(), 16);
+    assert_eq!(receipt.get("selection").get("original_hex").text(), "6e6565646c65");
+    assert_eq!(receipt.get("reader").get("capture_origin").text(), "host-supplied");
+    assert_eq!(receipt.get("reader").get("initial_read_calls").number(), 0);
+    assert!(!receipt.get("live_source_reopened").flag());
+
+    let reads = json(&s.info(|| false).unwrap()).get("member_read_calls").number();
+    let page = json(&s.expression_results(1, 1, 1, || false).unwrap());
+    assert_eq!(page.get("hits").array()[0].get("hit_id").number(), 2);
+    assert_eq!(json(&s.info(|| false).unwrap()).get("member_read_calls").number(), reads);
+    assert!(s.expression_search(2, "regex:needle", 10, 10000, || false).is_err());
+    assert_eq!(s.last_expression_attempt(), 2);
+    assert!(s.expression_search(2, "needle", 10, 10000, || false).is_err());
+    assert!(matches!(s.expression_search(3, "forbidden", 10, 10000, || true), Err(e) if e.is_canceled()));
+    let recovery = json(&s.info(|| false).unwrap());
+    assert_eq!(recovery.get("accepted_expression_generation").number(), 1);
+    assert_eq!(recovery.get("last_expression_attempt").number(), 3);
+    assert_eq!(s.accepted_generation(), Some(1));
+    assert_eq!(s.index_generation(), Some(1));
+    assert_eq!(json(&s.results(1, 0, 10, || false).unwrap()).get("retained_hits").number(), 1);
+    assert!(matches!(s.clear_expression(4, || true), Err(e) if e.is_canceled()));
+    assert_eq!(s.accepted_expression_generation(), Some(1));
+    let cleared = json(&s.clear_expression(5, || false).unwrap());
+    assert_eq!(cleared.get("command").text(), "expression-clear");
+    assert_eq!(cleared.get("accepted_expression_generation"), &Json::Null);
+    assert_eq!(s.accepted_expression_generation(), None);
+    assert_eq!(s.last_expression_attempt(), 5);
+    assert!(s.expression_results(1, 0, 10, || false).is_err());
+    assert!(s.open_expression_hit_reader(owner(66203), 1, 1, || false).is_err());
+    assert_eq!(s.accepted_generation(), Some(1));
+    drop(s);
+    assert_eq!(reader.capture().bytes(), b"needle required needle forbidden");
+    assert_eq!(json(&reader.copy_range(16, 22, || false).unwrap()).get("original_hex").text(), "6e6565646c65");
+}
+
+#[test]
+fn expression_reader_witnesses_preserve_utf16_overlaps_and_raw_archived_labels() {
+    for big_endian in [false, true] {
+        let mut bytes = if big_endian { vec![0xfe, 0xff] } else { vec![0xff, 0xfe] };
+        for unit in "🦀 banana\r\nrequired \u{feff}".encode_utf16() {
+            bytes.extend(if big_endian { unit.to_be_bytes() } else { unit.to_le_bytes() });
+        }
+        let f = Fixture::new(&[entry(b"raw-\xff.rs", &bytes)], true);
+        let mut s = f.open(66301);
+        let result = query(&mut s, 9, "ana required lang:rs");
+        assert_eq!(result.retained_hits(), 2);
+        for (id, start, end) in [(1, 10, 16), (2, 14, 20)] {
+            let (mut reader, response) = result.open_hit_reader(&mut s, owner(66301 + id), 9, id, || false).unwrap();
+            let opened = json(&response);
+            assert_eq!(reader.capture().bytes(), bytes);
+            assert_eq!(opened.get("selection").get("original_range").get("start").number(), start);
+            assert_eq!(opened.get("selection").get("original_range").get("end").number(), end);
+            let expected = if big_endian { "0061006e0061" } else { "61006e006100" };
+            assert_eq!(opened.get("selection").get("original_hex").text(), expected);
+            assert_eq!(json(&reader.copy_range(start, end, || false).unwrap()).get("original_hex").text(), expected);
+            assert_eq!(opened.get("reader").get("path").get("hex").text(), "7261772dff2e7273");
+            assert!(opened.get("window").get("text").text().contains("🦀 banana\r\nrequired \u{feff}"));
+            assert_eq!(opened.get("source_digest"), opened.get("reader").get("capture_sha256"));
+        }
+    }
+}
+
+#[test]
+fn expression_reader_rejects_foreign_stale_or_damaged_predicate_evidence() {
+    let mut source = b"needle\n".to_vec(); source.extend(vec![b'x'; 20 * 1024]); source.extend_from_slice(b"required");
+    let f = Fixture::new(&[entry(b"a.rs", &source)], true);
+    let mut s = f.open(66401);
+    let query = query(&mut s, 1, "needle required -forbidden");
+    let mut other = f.open(66402);
+    assert!(query.open_hit_reader(&mut other, owner(66403), 1, 1, || false).is_err());
+    let reads = json(&s.info(|| false).unwrap()).get("member_read_calls").number();
+    assert!(query.open_hit_reader(&mut s, owner(66401), 1, 1, || false).is_err());
+    assert!(query.open_hit_reader(&mut s, owner(66403), 2, 1, || false).is_err());
+    for id in [0, 2, u64::MAX] {
+        assert!(query.open_hit_reader(&mut s, owner(66403), 1, id, || false).is_err());
+    }
+    assert_eq!(json(&s.info(|| false).unwrap()).get("member_read_calls").number(), reads);
+    let (reader, _) = query.open_hit_reader(&mut s, owner(66403), 1, 1, || false).unwrap();
+    let at = f.bytes.windows(source.len()).position(|bytes| bytes == source).unwrap();
+    let mut file = OpenOptions::new().write(true).open(&f.path).unwrap();
+    file.seek(SeekFrom::Start((at + source.len() - 8) as u64)).unwrap();
+    file.write_all(b"REQUIRED").unwrap(); file.flush().unwrap();
+    // The primary occurrence is unchanged. Revalidating only its context
+    // would wrongly reuse the now-invalid whole-member predicate proof.
+    assert!(query.open_hit_reader(&mut s, owner(66404), 1, 1, || false).is_err());
+    assert_eq!(reader.capture().bytes(), source);
+    assert_eq!(query.retained_hits(), 1);
+}
+
+#[test]
+fn every_retained_expression_publication_and_reader_cancellation_preserves_old_state() {
+    let f = Fixture::new(&[entry(b"a.rs", b"old new required")], true);
+    let mut s = f.open(66501);
+    s.expression_search(1, "old required", 10, 10000, || false).unwrap();
+    let (reader, _) = s.open_expression_hit_reader(owner(66502), 1, 1, || false).unwrap();
+    let mut counter = f.open(66503);
+    counter.expression_search(1, "old required", 10, 10000, || false).unwrap();
+    let mut polls = 0;
+    counter.expression_search(2, "new required", 10, 10000, || { polls += 1; false }).unwrap();
+    for stop in 1..=polls {
+        let mut at = 0;
+        let attempt = stop as u64 + 1;
+        assert!(matches!(s.expression_search(attempt, "new required", 10, 10000,
+            || { at += 1; at == stop }), Err(e) if e.is_canceled()), "replacement checkpoint {stop}");
+        assert_eq!(s.last_expression_attempt(), attempt);
+        assert_eq!(s.accepted_expression_generation(), Some(1));
+        assert_eq!(json(&s.expression_results(1, 0, 10, || false).unwrap()).get("primary_needle").text(), "old");
+    }
+    let mut clear_polls = 0;
+    counter.clear_expression(3, || { clear_polls += 1; false }).unwrap();
+    for stop in 1..=clear_polls {
+        let attempt = s.last_expression_attempt() + 1;
+        let mut at = 0;
+        assert!(matches!(s.clear_expression(attempt, || { at += 1; at == stop }), Err(e) if e.is_canceled()),
+            "clear checkpoint {stop}");
+        assert_eq!(s.accepted_expression_generation(), Some(1));
+    }
+    let mut open_polls = 0;
+    drop(s.open_expression_hit_reader(owner(66504), 1, 1, || { open_polls += 1; false }).unwrap());
+    for stop in 1..=open_polls {
+        let mut at = 0;
+        assert!(matches!(s.open_expression_hit_reader(owner(66600 + stop as u64), 1, 1,
+            || { at += 1; at == stop }), Err(e) if e.is_canceled()), "open checkpoint {stop}");
+        assert_eq!(s.accepted_expression_generation(), Some(1));
+        assert_eq!(reader.capture().bytes(), b"old new required");
+    }
+    let (later, _) = s.open_expression_hit_reader(owner(66701), 1, 1, || false).unwrap();
+    assert_eq!(later.capture().bytes(), reader.capture().bytes());
+}
+
+#[test]
+fn retained_partial_expression_rows_still_open_only_their_verified_witnesses() {
+    let mut large = b"needle\n".to_vec(); large.extend(vec![b'x'; 32 * 1024]); large.extend_from_slice(b"required");
+    let f = Fixture::new(&[entry(b"a.rs", b"needle required"), entry(b"b.rs", &large)], true);
+    let mut s = f.open(66801);
+    let response = s.expression_search(1, "needle required", 10, 4096, || false).unwrap();
+    assert_eq!(response.exit_code(), EXIT_PARTIAL);
+    let page = json(&response);
+    assert_eq!(page.get("state").text(), "work-limit");
+    assert_eq!(page.get("retained_hits").number(), 1);
+    assert!(!page.get("matches_seen_exact").flag());
+    let (reader, opened) = s.open_expression_hit_reader(owner(66802), 1, 1, || false).unwrap();
+    assert_eq!(reader.capture().bytes(), b"needle required");
+    assert_eq!(json(&opened).get("selection_namespace").text(), "saved-expression");
+    assert!(s.open_expression_hit_reader(owner(66803), 1, 2, || false).is_err());
+}

@@ -87,9 +87,11 @@ pub struct SavedRepositorySession {
     archive: PagedSnapshot<File>,
     index: Option<AcceptedIndex>,
     query: Option<AcceptedQuery>,
+    expression: Option<desk::SavedExpression>,
     relationships: Option<relationships::AcceptedRelationships>,
     path: PathBuf,
     last_query_attempt: u64,
+    last_expression_attempt: u64,
     last_index_attempt: u64,
     last_relationship_attempt: u64,
     next_allocation: u64,
@@ -115,7 +117,8 @@ impl SavedRepositorySession {
         if metadata.len() > limits.max_document_bytes as u64 { return Err(SavedRepositoryError::InvalidLimits); }
         let archive = PagedSnapshot::open(file, owner, limits, &budget, allocation(2)?, &mut canceled)?;
         check(&mut canceled)?;
-        Ok(Self { archive, index: None, query: None, relationships: None, path, last_query_attempt: 0,
+        Ok(Self { archive, index: None, query: None, expression: None, relationships: None, path, last_query_attempt: 0,
+            last_expression_attempt: 0,
             last_index_attempt: 0, last_relationship_attempt: 0, next_allocation: 3, budget, _lease: lease })
     }
     pub fn owner(&self) -> ArenaOwnerId { self.archive.directory().owner() }
@@ -128,6 +131,8 @@ impl SavedRepositorySession {
         let mut out = self.output("info")?;
         out.literal(",\"archive_path\":")?; out.path(&self.path)?;
         out.literal(",\"accepted_query_generation\":")?; optional(&mut out, self.accepted_generation())?;
+        out.literal(",\"accepted_expression_generation\":")?; optional(&mut out, self.accepted_expression_generation())?;
+        out.literal(",\"last_expression_attempt\":")?; out.integer(self.last_expression_attempt())?;
         out.literal(",\"accepted_index_generation\":")?; optional(&mut out, self.index_generation())?;
         out.literal(",\"accepted_relationship_generation\":")?; optional(&mut out, self.relationship_generation())?;
         let directory = self.archive.directory();
