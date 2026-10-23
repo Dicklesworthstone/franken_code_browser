@@ -26,6 +26,42 @@ import Foundation
         let metadata = try catalog()
         do {
             var opening = AtlasProjectOpening()
+            let first = opening.begin()
+            check(opening.acceptProgressive(for: first), "First progressive page admits a usable project")
+            check(opening.canBrowse && opening.canPrepare && !opening.isDiscovering && opening.catalog == nil,
+                  "Progressive startup does not require the legacy full catalog")
+            check(!opening.acceptProgressive(for: first), "Duplicate first-page delivery cannot rebind the project")
+            let preview = opening.beginPreviews()!
+            check(opening.canBrowse && opening.isPreparing, "Explicit legacy atlas collection keeps browsing usable")
+            check(!opening.acceptPreviewCatalog(metadata, for: first), "Startup ticket cannot publish optional atlas membership")
+            check(opening.acceptPreviewCatalog(metadata, for: preview), "Explicit preview ticket admits bounded atlas metadata")
+            check(opening.file(1, in: first.project)?.sourcePath == "a.rs", "Legacy startup/atlas selection retains its own member proof")
+            opening.cancel()
+            check(opening.canBrowse && opening.canPrepare && opening.projectID == first.project,
+                  "Canceling optional atlas collection preserves the progressive project")
+            check(!opening.acceptPreviewCatalog(metadata, for: preview), "Canceled atlas metadata cannot arrive late")
+            let replacement = opening.begin()
+            check(!opening.canBrowse && !opening.acceptProgressive(for: first), "Old first-page delivery cannot populate another root")
+            check(opening.acceptProgressive(for: replacement), "An empty first batch can still establish resumable browsing")
+            opening.close()
+            check(!opening.canBrowse && !opening.canPrepare, "Closing also revokes progressive availability")
+        }
+        do {
+            var opening = AtlasProjectOpening()
+            let ticket = opening.begin()
+            check(!opening.recoverProgressive(in: ticket.project), "Recovery cannot race an active opening attempt")
+            opening.fail(ticket)
+            check(!opening.recoverProgressive(in: UUID()), "A foreign recovered browser cannot make this project ready")
+            check(opening.recoverProgressive(in: ticket.project), "Manual first-page recovery restores readiness after an initial lost reply")
+            check(opening.canBrowse && opening.canPrepare && !opening.isDiscovering,
+                  "Recovered first page enables the same project actions as initial success")
+            let replacement = opening.begin(); opening.fail(replacement)
+            check(!opening.recoverProgressive(in: ticket.project), "A stale recovered browser cannot revive a replaced project")
+            opening.close()
+            check(!opening.recoverProgressive(in: replacement.project), "A closed project rejects manual late recovery")
+        }
+        do {
+            var opening = AtlasProjectOpening()
             check(!opening.canBrowse && !opening.canPrepare && !opening.isDiscovering, "Construction is inert")
             check(opening.beginPreviews() == nil, "No source preview without a known catalog")
             let first = opening.begin()

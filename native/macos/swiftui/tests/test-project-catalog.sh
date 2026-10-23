@@ -35,3 +35,13 @@ PY
 swiftc -swift-version 6 -warnings-as-errors "$out/Context.swift" "$src/AtlasProjectCatalog.swift" \
     "$src/AtlasProjectOpening.swift" "$src/tests/AtlasProjectOpeningTests.swift" -o "$out/opening"
 "$out/opening"
+set --
+if [ "$(uname -s)" = Linux ]; then set -- -static-stdlib; fi
+swiftc "$@" -swift-version 6 -warnings-as-errors \
+    "$src/AtlasSearch.swift" "$src/AtlasSearchCapture.swift" "$src/AtlasSearchCoordinator.swift" "$src/AtlasProjectIO.swift" \
+    "$src/AtlasReader.swift" "$src/AtlasReaderSearch.swift" "$src/AtlasReaderComparison.swift" \
+    "$src/AtlasReaderOutline.swift" "$src/AtlasReaderDocument.swift" "$src/AtlasReaderCoordinator.swift" \
+    "$src/AtlasCapturedReader.swift" "$src/AtlasSuppliedReader.swift" "$src/AtlasNavigationHistory.swift" \
+    "$src/AtlasSource.swift" "$src/AtlasDocumentPreviewModel.swift" "$src/AtlasPagedReaderModel.swift" \
+    "$src/AtlasProjectBrowser.swift" "$src/tests/AtlasProjectBrowserTests.swift" -o "$out/progressive-browser"
+"$out/progressive-browser"

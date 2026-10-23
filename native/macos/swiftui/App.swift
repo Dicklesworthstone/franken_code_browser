@@ -240,6 +240,8 @@ extension AtlasCamera {
     @State private var showsSidebar = true
     @State private var showsFileFinder = false
     @State private var projectOpening = AtlasProjectOpening()
+    @State private var projectBrowser = AtlasProjectBrowserModel(transport: .native)
+    @State private var browserProject = UUID()
     @State private var showsCatalog = true
     @State private var catalogEntries: [AtlasProjectCatalog.Entry] = []
     @State private var loadProgress = ""
@@ -398,6 +400,7 @@ extension AtlasCamera {
 #endif
         }
         .onDisappear {
+            projectBrowser.close()
             savedRepository.close()
             showsSavedRepository = false
             readingDesk.close()
@@ -437,6 +440,17 @@ extension AtlasCamera {
         }
         .onChange(of: pinnedReaders.notice) { _, notice in
             if !notice.isEmpty && !pinnedReaders.busy { status = notice }
+        }
+        .onChange(of: projectBrowser.info?.owner) { _, _ in
+            // Manual recovery after a lost initial response can publish rows
+            // after the original opening task failed. Only this exact current
+            // project/browser/root may make source search and previews ready.
+            guard !projectOpening.isDiscovering, projectBrowser.currentPage, !projectBrowser.closed,
+                  projectBrowser.root.utf8.elementsEqual(root.utf8),
+                  projectOpening.recoverProgressive(in: browserProject) else { return }
+            status = projectBrowser.notice
+            if !query.isEmpty { runSearch(debounce: true) }
+            if AtlasFileStartup.needsCatalog { requestStartupCatalog() }
         }
         .onChange(of: Array(query.utf8)) { _, _ in
             // Revoke old rows immediately, including empty or invalid edits.
@@ -734,7 +748,7 @@ extension AtlasCamera {
                     Text(root.isEmpty ? "No project selected" : (root as NSString).lastPathComponent)
                         .font(.system(size: 13, weight: .semibold))
                         .lineLimit(1)
-                    Text(root.isEmpty ? "Choose a folder to begin" : "\(files.count) files · \(root)")
+                    Text(root.isEmpty ? "Choose a folder to begin" : "\(projectBrowser.info?.discovered ?? 0) files discovered · \(root)")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -767,8 +781,8 @@ extension AtlasCamera {
     private var atlasScreen: some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
-                if (showsCatalog || textTiles.isEmpty), let catalog = projectOpening.catalog {
-                    catalogView(catalog)
+                if (showsCatalog || textTiles.isEmpty), !projectBrowser.root.isEmpty {
+                    progressiveProjectView
                 } else if textTiles.isEmpty {
                     if loadingProject {
                         VStack(spacing: 16) {
@@ -837,17 +851,36 @@ extension AtlasCamera {
             hasAtlas: !textTiles.isEmpty, progress: loadProgress,
             build: requestAtlasPreviews, cancel: cancelAtlasLoad, refresh: requestAtlasLoad,
             showAtlas: { showsCatalog = false }) { id in
-                guard !loadingProject, let entry = projectOpening.file(id, in: project),
-                      let path = entry.sourcePath,
-                      fileScope.includes(path, custom: customExtensions) else { return }
-#if FCB_APP_STORE
-                guard rootAccess?.url.path.utf8.elementsEqual(root.utf8) == true else { return }
-#endif
-                selectedHit = nil
-                openFile(path)
-                showsReader = true
+                openCatalogFile(id, project: project)
             }
             .id(project)
+    }
+
+    private var progressiveProjectView: some View {
+        let visible = projectBrowser.page?.files.filter { file in
+            String(bytes: file.rawPath, encoding: .utf8).map { fileScope.includes($0, custom: customExtensions) }
+                ?? (fileScope == .all)
+        } ?? []
+        return AtlasProjectBrowserView(model: projectBrowser, entries: visible,
+            scopeLabel: fileScope == .custom ? customExtensions : fileScope.rawValue,
+            preparing: projectOpening.isPreparing, canPrepare: projectOpening.canPrepare,
+            hasAtlas: !textTiles.isEmpty, progress: loadProgress,
+            build: requestAtlasPreviews, cancelPreviews: cancelAtlasLoad, refresh: requestAtlasLoad,
+            showAtlas: { showsCatalog = false }, canKeep: readingDesk.canOperate, keep: { reader in
+                // Keep the capture without replacing the file reader's sheet.
+                // The Reading Desk toolbar opens the independently kept source.
+                readingDesk.keep(reader: reader)
+            })
+            .id(loadGeneration)
+    }
+
+    private func openCatalogFile(_ id: UInt64, project: UUID) {
+        guard !loadingProject, let entry = projectOpening.file(id, in: project),
+              let path = entry.sourcePath, fileScope.includes(path, custom: customExtensions) else { return }
+#if FCB_APP_STORE
+        guard rootAccess?.url.path.utf8.elementsEqual(root.utf8) == true else { return }
+#endif
+        selectedHit = nil; openFile(path); showsReader = true
     }
 
     private func updateCatalogFilter() {
@@ -1012,6 +1045,8 @@ extension AtlasCamera {
     /// capture/highlighting/raster preparation is an explicit subsequent action.
     private func requestAtlasLoad() {
         workspaceSearch?.refresh()
+        projectBrowser.close()
+        projectBrowser = AtlasProjectBrowserModel(transport: .native)
         showsFileFinder = false
         capturedReaderTarget = nil
         suppliedReaderTarget = nil
@@ -1026,6 +1061,7 @@ extension AtlasCamera {
         loadCancellation?.cancel()
         projectIO.cancel()
         let ticket = projectOpening.begin()
+        browserProject = ticket.project
         searchPathKind = .workspace
         searchPathInput = ""
         let cancellation = AtlasSearchCancellation()
@@ -1056,9 +1092,10 @@ extension AtlasCamera {
         catalogEntries = []
         atlasDocuments = [:]
         textTiles = []
-        loadProgress = "Discovering files…"
+        loadProgress = "Discovering the first file page…"
+        let browser = projectBrowser
         loadTask = Task {
-            await loadCatalog(root: requestedRoot, ticket: ticket,
+            await loadProgressiveProject(browser, root: requestedRoot, ticket: ticket,
                 cancellation: cancellation, accessLease: accessLease)
         }
     }
@@ -1076,7 +1113,7 @@ extension AtlasCamera {
             : "Project opening canceled. Choose a folder to try again."
     }
 
-    private func loadCatalog(root requestedRoot: String, ticket: AtlasProjectOpening.Ticket,
+    private func loadProgressiveProject(_ browser: AtlasProjectBrowserModel, root requestedRoot: String, ticket: AtlasProjectOpening.Ticket,
         cancellation: AtlasSearchCancellation, accessLease: AnyObject?) async {
         guard !Task.isCancelled, !cancellation.isCanceled, projectOpening.accepts(ticket),
               root.utf8.elementsEqual(requestedRoot.utf8) else { return }
@@ -1092,12 +1129,8 @@ extension AtlasCamera {
             return
         }
 #endif
-        let catalog: AtlasProjectCatalog
         do {
-            catalog = try await projectIO.perform(cancellation: cancellation,
-                keepingAlive: accessLease.map { [$0] } ?? []) {
-                try AtlasProjectWorker.catalogReport(root: requestedRoot, cancellation: cancellation)
-            }
+            try await browser.open(root: requestedRoot, accessLease: accessLease)
         } catch {
             if !cancellation.isCanceled, projectOpening.accepts(ticket) {
                 status = "Could not discover this project (\(error)). Choose another folder or retry."
@@ -1105,7 +1138,26 @@ extension AtlasCamera {
             return
         }
         guard !Task.isCancelled, !cancellation.isCanceled, projectOpening.accepts(ticket),
-              root.utf8.elementsEqual(requestedRoot.utf8) else { return }
+              projectBrowser === browser, root.utf8.elementsEqual(requestedRoot.utf8), browser.info != nil,
+              projectOpening.acceptProgressive(for: ticket) else { return }
+        loadTask = nil; loadCancellation = nil; loadProgress = ""
+        status = browser.notice
+        if !query.isEmpty { runSearch(debounce: true) }
+        // A CLI-selected filename is consumed once against the established
+        // bounded catalog contract. This compatibility work starts only AFTER
+        // the progressive file page is usable and never gates normal startup.
+        if AtlasFileStartup.needsCatalog { requestStartupCatalog() }
+    }
+
+    private func loadPreviewCatalog(root requestedRoot: String, ticket: AtlasProjectOpening.Ticket,
+        cancellation: AtlasSearchCancellation, accessLease: AnyObject?) async throws {
+        let catalog = try await projectIO.perform(cancellation: cancellation,
+            keepingAlive: accessLease.map { [$0] } ?? []) {
+            try AtlasProjectWorker.catalogReport(root: requestedRoot, cancellation: cancellation)
+        }
+        guard !Task.isCancelled, !cancellation.isCanceled, projectOpening.accepts(ticket),
+              root.utf8.elementsEqual(requestedRoot.utf8),
+              projectOpening.acceptPreviewCatalog(catalog, for: ticket) else { throw AtlasProjectIOError.canceled }
         // AtlasFile's legacy byte field is presentation-only. The catalog above
         // keeps full UInt64 observations, including values above native Int.max.
         files = catalog.entries.compactMap { entry in
@@ -1114,13 +1166,39 @@ extension AtlasCamera {
                 bytes: Int(clamping: entry.observedBytes), lineCount: 0, sourceLineCount: nil,
                 profileState: "disabled", profile: [], avgColor: AtlasFile.averageColor(profile: []))
         }
-        guard projectOpening.acceptCatalog(catalog, for: ticket) else { return }
         displayedFiles = files.filter { fileScope.includes($0.path, custom: customExtensions) }
         updateCatalogFilter()
-        loadTask = nil; loadCancellation = nil; loadProgress = ""
-        status = catalog.summary
-        // Membership, not text-atlas preparation, enables file reading/search.
-        if !query.isEmpty { runSearch(debounce: true) }
+    }
+
+    private func requestStartupCatalog() {
+        guard AtlasFileStartup.needsCatalog, let ticket = projectOpening.beginPreviews() else { return }
+        let requestedRoot = root, cancellation = AtlasSearchCancellation()
+        loadCancellation = cancellation; loadProgress = "Locating the requested startup file…"
+#if FCB_APP_STORE
+        let accessLease: AnyObject? = rootAccess
+#else
+        let accessLease: AnyObject? = nil
+#endif
+        loadTask = Task {
+            defer {
+                if projectOpening.accepts(ticket) {
+                    projectOpening.finishPreviews(ticket, available: false)
+                    loadTask = nil; loadCancellation = nil; loadProgress = ""
+                }
+            }
+            do {
+                try await loadPreviewCatalog(root: requestedRoot, ticket: ticket,
+                    cancellation: cancellation, accessLease: accessLease)
+                guard let catalog = projectOpening.catalog, projectOpening.accepts(ticket) else { return }
+                let outcome = AtlasFileStartup.consume(catalog: catalog, visibleEntries: catalogEntries)
+                if case .open(let id) = outcome { openCatalogFile(id, project: ticket.project) }
+                else if let message = outcome.message { status = message }
+            } catch {
+                if !cancellation.isCanceled, projectOpening.accepts(ticket) {
+                    status = "The startup file could not be located. Project pages remain available."
+                }
+            }
+        }
     }
 
     private func requestAtlasPreviews() {
@@ -1139,8 +1217,11 @@ extension AtlasCamera {
         let requestedRoot = root
         let cancellation = AtlasSearchCancellation()
         loadCancellation = cancellation
-        showsCatalog = false // Until tiles exist, the live catalog remains the fallback.
-        loadProgress = "Preparing source previews for \(files.count) openable files…"
+        // Publishing optional atlas tiles must not dismiss a file reader that
+        // the user opened while preparation ran. Show text atlas is explicit.
+        showsCatalog = true
+        loadProgress = projectOpening.catalog == nil ? "Collecting the bounded text-atlas catalog…"
+            : "Preparing source previews for \(files.count) openable files…"
         loadTask = Task {
             await prepareAtlas(root: requestedRoot, ticket: ticket,
                 cancellation: cancellation, accessLease: accessLease)
@@ -1157,6 +1238,18 @@ extension AtlasCamera {
                 loadTask = nil; loadCancellation = nil
             }
         }
+        if projectOpening.catalog == nil {
+            do {
+                try await loadPreviewCatalog(root: requestedRoot, ticket: ticket,
+                    cancellation: cancellation, accessLease: accessLease)
+            } catch {
+                if !cancellation.isCanceled, projectOpening.accepts(ticket) {
+                    status = "Text-atlas membership could not be prepared. Progressive file browsing remains available."
+                }
+                return
+            }
+        }
+        loadProgress = "Preparing source previews for \(files.count) openable files…"
         let atlasFiles = files
         await Task.yield()
         guard !Task.isCancelled, projectOpening.accepts(ticket) else { return }

@@ -146,6 +146,7 @@ struct AtlasStartupFileRequest {
     private var pending: Pending
 
     init(arguments: [String]) { pending = Self.parse(arguments) }
+    var needsCatalog: Bool { if case .none = pending { return false }; return true }
 
     mutating func consume(catalog: AtlasProjectCatalog, visibleEntries: [AtlasProjectCatalog.Entry],
         permitsProjectArguments: Bool = true) -> Outcome {
@@ -212,6 +213,7 @@ struct AtlasStartupFileRequest {
 /// action. Pure request state above is independently testable without a window.
 @MainActor enum AtlasFileStartup {
     private static var pending = AtlasStartupFileRequest(arguments: ProcessInfo.processInfo.arguments)
+    static var needsCatalog: Bool { pending.needsCatalog }
     static func consume(catalog: AtlasProjectCatalog, visibleEntries: [AtlasProjectCatalog.Entry]) -> AtlasStartupFileRequest.Outcome {
 #if FCB_APP_STORE
         return pending.consume(catalog: catalog, visibleEntries: visibleEntries, permitsProjectArguments: false)

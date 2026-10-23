@@ -13,14 +13,15 @@ struct AtlasProjectOpening {
     private var phase = Phase.idle
     private var active: Ticket?
     private var hasOpenableFiles = false
+    private var progressiveReady = false
     private(set) var projectID = UUID()
     private(set) var catalog: AtlasProjectCatalog?
     private(set) var hasAtlas = false
 
     var isDiscovering: Bool { phase == .discovering }
     var isPreparing: Bool { phase == .preparing }
-    var canBrowse: Bool { catalog != nil }
-    var canPrepare: Bool { phase == .ready && hasOpenableFiles && !hasAtlas }
+    var canBrowse: Bool { progressiveReady || catalog != nil }
+    var canPrepare: Bool { phase == .ready && !hasAtlas && (catalog == nil ? progressiveReady : hasOpenableFiles) }
 
     mutating func begin() -> Ticket {
         close()
@@ -29,6 +30,20 @@ struct AtlasProjectOpening {
         return ticket
     }
     func accepts(_ ticket: Ticket) -> Bool { active == ticket && ticket.project == projectID }
+    /// First-page discovery makes browsing/search usable even when that batch
+    /// contains only directories. Optional atlas membership is collected later.
+    @discardableResult mutating func acceptProgressive(for ticket: Ticket) -> Bool {
+        guard accepts(ticket), phase == .discovering else { return false }
+        progressiveReady = true; active = nil; phase = .ready
+        return true
+    }
+    /// A consumed initial page may be recovered only after the opening attempt
+    /// failed. The host also binds the current browser instance and raw root.
+    @discardableResult mutating func recoverProgressive(in project: UUID) -> Bool {
+        guard project == projectID, phase == .idle, !canBrowse else { return false }
+        progressiveReady = true; phase = .ready
+        return true
+    }
     @discardableResult mutating func acceptCatalog(_ report: AtlasProjectCatalog, for ticket: Ticket) -> Bool {
         guard accepts(ticket), phase == .discovering else { return false }
         catalog = report
@@ -41,6 +56,11 @@ struct AtlasProjectOpening {
         let ticket = Ticket(project: projectID, attempt: UUID())
         active = ticket; phase = .preparing
         return ticket
+    }
+    @discardableResult mutating func acceptPreviewCatalog(_ report: AtlasProjectCatalog, for ticket: Ticket) -> Bool {
+        guard accepts(ticket), phase == .preparing, progressiveReady, !hasAtlas else { return false }
+        catalog = report; hasOpenableFiles = report.entries.contains { $0.sourcePath != nil }
+        return true
     }
     @discardableResult mutating func finishPreviews(_ ticket: Ticket, available: Bool) -> Bool {
         guard accepts(ticket), phase == .preparing else { return false }
@@ -55,12 +75,12 @@ struct AtlasProjectOpening {
     }
     mutating func cancel() {
         active = nil
-        phase = catalog == nil ? .idle : .ready
+        phase = canBrowse ? .ready : .idle
     }
     mutating func close() {
         projectID = UUID()
         active = nil; phase = .idle; catalog = nil
-        hasAtlas = false; hasOpenableFiles = false
+        hasAtlas = false; hasOpenableFiles = false; progressiveReady = false
     }
     /// Resolve the selected member of this exact catalog, never the same row
     /// number in a replacement project. Non-UTF-8 members remain known entries;
