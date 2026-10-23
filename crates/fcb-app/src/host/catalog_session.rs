@@ -11,6 +11,9 @@
 //! N+1 after a lost reply. Cancellation is polled between bounded walker calls,
 //! never claimed to interrupt one filesystem operation. Stop pauses the cursor.
 
+#[path = "file_finder_session.rs"]
+pub mod finder;
+
 use std::{collections::VecDeque, fs, mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, FileId};
 use fcb::search::{ResourceAllocationId, ResourceBudget, RootId};
@@ -220,21 +223,9 @@ impl CatalogSession {
         let entry = self.pages[index].files.iter().find(|entry| entry.id == file).ok_or(CatalogSessionError::MissingFile)?;
         if max_source_bytes == 0 || max_source_bytes > MAX_HOST_TEXT_BYTES { return Err(CatalogSessionError::InvalidLimits); }
         let relative = entry.path.clone();
-        check(&mut canceled)?; self.validate_active()?;
-        let root = self.grant.root_path().to_path_buf();
-        let path = workspace::checked_source_path(&root, &relative)?;
+        let (reader, info, window, source_bytes, source_calls) =
+            self.capture_reader(reader_owner, &relative, max_source_bytes, &mut canceled)?;
         let label = relative.raw().to_path_buf();
-        let (reader, info, window, source_bytes, source_calls) = {
-            let mut stop = || canceled() || self.validate_active().is_err();
-            // Retain a relative raw label for the native supplied-source reader;
-            // actual filesystem observation and counters stay in this receipt.
-            let raw = super::read_bytes(&path, max_source_bytes, &mut stop).map_err(ReaderSessionError::from)?;
-            let mut reader = ReaderSession::from_bytes(reader_owner, &label, &raw.bytes, &mut stop)?;
-            let info = reader.info(&mut stop)?;
-            let window = reader.read_window(0, FIRST_WINDOW_BYTES, &mut stop)?;
-            (reader, info, window, raw.bytes.len() as u64, raw.read_calls)
-        };
-        self.validate_active()?; check(&mut canceled)?;
         let mut out = self.output("open-reader")?;
         out.literal(",\"page_id\":")?; out.integer(page_id)?;
         out.literal(",\"file_id\":")?; out.integer(file.get())?;
@@ -248,6 +239,31 @@ impl CatalogSession {
         out.literal("}\n")?;
         let response = self.finish(out, &mut canceled)?;
         Ok((reader, response))
+    }
+
+    /// Shared capture seam for retained metadata selections. Callers establish
+    /// owner/page/query authority before entering this filesystem operation.
+    fn capture_reader(&self, reader_owner: ArenaOwnerId, relative: &NormalizedPath,
+        max_source_bytes: usize, canceled: &mut impl FnMut() -> bool)
+        -> Result<(ReaderSession, HostResponse, HostResponse, u64, u64), CatalogSessionError> {
+        if reader_owner == self.owner() { return Err(CatalogSessionError::ForeignOwner); }
+        if max_source_bytes == 0 || max_source_bytes > MAX_HOST_TEXT_BYTES { return Err(CatalogSessionError::InvalidLimits); }
+        check(canceled)?; self.validate_active()?;
+        let root = self.grant.root_path().to_path_buf();
+        let path = workspace::checked_source_path(&root, relative)?;
+        let label = relative.raw().to_path_buf();
+        let (reader, info, window, source_bytes, source_calls) = {
+            let mut stop = || canceled() || self.validate_active().is_err();
+            // Retain a relative raw label for the native supplied-source reader;
+            // actual filesystem observation and counters stay in this receipt.
+            let raw = super::read_bytes(&path, max_source_bytes, &mut stop).map_err(ReaderSessionError::from)?;
+            let mut reader = ReaderSession::from_bytes(reader_owner, &label, &raw.bytes, &mut stop)?;
+            let info = reader.info(&mut stop)?;
+            let window = reader.read_window(0, FIRST_WINDOW_BYTES, &mut stop)?;
+            (reader, info, window, raw.bytes.len() as u64, raw.read_calls)
+        };
+        self.validate_active()?; check(canceled)?;
+        Ok((reader, info, window, source_bytes, source_calls))
     }
 
     fn page_index(&self, id: u64) -> Result<usize, CatalogSessionError> {

@@ -22,6 +22,8 @@ mod saved_sessions;
 mod saved_ffi;
 mod catalog_sessions;
 mod catalog_ffi;
+mod file_finder_sessions;
+mod file_finder_ffi;
 mod search_ffi;
 pub use search_ffi::{fcb_search_workspace_cancelable, SearchCancellationCallback};
 

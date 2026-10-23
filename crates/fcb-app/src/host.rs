@@ -13,6 +13,7 @@ pub mod atlas_search;
 pub mod atlas_paths;
 pub mod saved_repository;
 pub mod catalog_session;
+pub use catalog_session::finder as file_finder_session;
 
 use std::{ffi::OsString, io::{self, Read, Write}, mem::size_of, path::Path};
 use fcb::{ByteLength, ByteOffset, ByteRange, SourceRevision};
