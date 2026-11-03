@@ -63,7 +63,8 @@ Scope window: September 12–23, 2026.
   performance campaign also records unresolved display-delivery stutter; fast GPU draw timings
   alone do not establish smooth zoom. See [current distribution gates](DISTRIBUTION.md).
 - Built [commit `3d8cece9ec98`](https://github.com/Dicklesworthstone/franken_code_browser/commit/3d8cece9ec98) on a physical Mac, opened the Asupersync repository, and produced a
-  local Developer ID-signed DMG. Apple accepted its notarization, the ticket was stapled and
+  local DMG containing the Developer ID-signed app; like the v0.1.0 image, the disk image itself
+  was not code-signed ([#1](https://github.com/Dicklesworthstone/franken_code_browser/issues/1)). Apple accepted its notarization, the ticket was stapled and
   validated, and the staged app passed local Gatekeeper assessment. The packager now supports the
   authenticated `asc` API-key route as well as `notarytool`; the exact artifact and remaining
   qualification work are recorded in [distribution status](DISTRIBUTION.md).
