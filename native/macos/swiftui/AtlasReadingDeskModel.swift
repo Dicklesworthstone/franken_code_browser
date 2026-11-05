@@ -71,9 +71,11 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
     private(set) var page: AtlasDeskPage?
     private(set) var busy = false
     private(set) var saving = false
+    private(set) var exporting = false
     private(set) var closed = false
     private(set) var notice = "Keep exact source captures, add bookmarks and personal notes, and save your reading desk."
     private(set) var lastSave: AtlasDeskSaveReceipt?
+    private(set) var lastExport: AtlasDeskSourcePackReceipt?
     var bookmarkLabel = ""
     var offsetInput = "0"
     var selectionEndInput = "0"
@@ -304,6 +306,34 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
         }
     }
 
+    /// The destination grant and exact disclosure review survive until the
+    /// worker's terminal receipt. Neither cancellation nor a missing reply can
+    /// automatically retry an export that may already have written a file.
+    func exportSourcePack(_ target: AtlasDeskSourcePackTarget, limits: AtlasDeskSourcePackLimits,
+        path: String, accessLease: AnyObject?) {
+        guard canOperate, Self.validPath(path), limits.isValid else { return }
+        guard target.isCurrent(in: state) else { notice = AtlasReadingDeskError.staleExport.message; return }
+        saving = true; exporting = true; lastExport = nil
+        perform(accessLease: accessLease) { model, access, cancellation in
+            let lease = try await model.ensureStarted(cancellation)
+            guard target.isCurrent(in: model.state) else {
+                model.notice = AtlasReadingDeskError.staleExport.message; return
+            }
+            let transport = model.transport
+            let request = AtlasDeskRequest.exportSourcePack(revision: target.state.revision, path: path, limits: limits)
+            let json = try await model.io.perform(keepingAlive: [lease] + access, cancellation: cancellation) {
+                transport.run(lease.handle, request)
+            }
+            do {
+                let receipt = try AtlasDeskSourcePackReceipt.decode(json, target: target, limits: limits)
+                model.lastExport = receipt; model.notice = receipt.message
+            } catch {
+                model.notice = "The export outcome could not be verified. The destination may contain a complete or partial source pack. Inspect it before retrying and choose a new filename."
+                throw error
+            }
+        }
+    }
+
     /// Existing reader integration supplies a validated handle and retains that
     /// reader's native grant throughout the callback. The desk owns its copied
     /// source after acceptance; subsequent operations never use the source path.
@@ -402,8 +432,9 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
         guard busy else { return }
         operationCancellation?.cancel()
         if let session { _ = transport.cancel(session.handle) }
-        notice = saving ? "Cancel requested. Waiting for the checkpoint’s actual write outcome."
-            : "Cancel requested. Reconciling the desk’s accepted state."
+        notice = exporting ? "Cancel requested. Waiting for the source pack’s actual write outcome."
+            : saving ? "Cancel requested. Waiting for the checkpoint’s actual write outcome."
+                : "Cancel requested. Reconciling the desk’s accepted state."
     }
     /// Window teardown revokes admission immediately. The in-flight task keeps
     /// handles and grants until return; even a save still delivers its receipt.
@@ -447,12 +478,13 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
             do { try await work(self, accessLease.map { [$0] } ?? [], cancellation) }
             catch {
                 if let error = error as? AtlasReadingDeskError, case .canceled = error {
-                    notice = saving ? "Save canceled before the checkpoint write began. No destination was created."
-                        : error.message
+                    notice = exporting ? "Export canceled before the source-pack request began. No destination was created."
+                        : saving ? "Save canceled before the checkpoint write began. No destination was created."
+                            : error.message
                 } else if !saving { notice = (error as? AtlasReadingDeskError)?.message ?? "The reading desk operation could not finish. Reload its accepted state before continuing." }
                 else if !notice.contains("outcome") { notice = "The save outcome is unavailable. Inspect the selected destination before retrying; a partial or complete file may exist." }
             }
-            busy = false; saving = false; task = nil; operationCancellation = nil
+            busy = false; saving = false; exporting = false; task = nil; operationCancellation = nil
             if closed { releaseSession() }
         }
     }

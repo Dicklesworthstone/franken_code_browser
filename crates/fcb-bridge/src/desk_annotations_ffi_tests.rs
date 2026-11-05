@@ -80,3 +80,36 @@ fn apply_abi_reattaches_to_verified_retained_bytes_without_reopening_the_path() 
     assert_eq!(number(&ok(fcb_desk_state(desk)), "model_revision"), 6);
     assert_eq!(fcb_desk_close(desk), 1);
 }
+
+#[test]
+fn export_abi_keeps_exact_bookmarked_bytes_and_full_nul_note_after_source_is_gone() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
+    let desk = fcb_desk_create(); assert_ne!(desk, 0); ok(fcb_desk_start(desk));
+    let root = std::env::temp_dir().join(format!("fcb-desk-export-abi-{}-{desk}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let source = root.join("source.rs"); fs::write(&source, b"A\xff\0Zprivate").unwrap();
+    let source_path = CString::new(source.as_os_str().as_encoded_bytes()).unwrap();
+    let opened = ok(unsafe { fcb_desk_open(desk, 0, 1, source_path.as_ptr()) }); let pane = number(&opened, "pane");
+    ok(unsafe { fcb_desk_apply(desk, 1, 2, 2, pane, 1, 4, std::ptr::null()) });
+    let label = CString::new("Reason").unwrap(); let body = "é\0keep full tail".as_bytes();
+    ok(unsafe { fcb_desk_annotate(desk, 2, 3, pane, label.as_ptr(), body.as_ptr(), body.len() as u64) });
+    ok(unsafe { fcb_desk_apply(desk, 3, 4, 8, pane, 0, 0, std::ptr::null()) });
+    fs::rename(&source, root.join("moved.rs")).unwrap();
+    let destination = root.join("source-pack.json"); let path = CString::new(destination.as_os_str().as_encoded_bytes()).unwrap();
+    let receipt = ok(unsafe { fcb_desk_export(desk, 4, path.as_ptr(), 3, 65536, 65536) });
+    assert!(receipt.contains("\"command\":\"export\""));
+    assert_eq!(number(&receipt, "bytes_written"), fs::metadata(&destination).unwrap().len());
+    let pack = fs::read_to_string(&destination).unwrap();
+    assert!(pack.contains("\"selected_original_hex\":\"ff005a\""));
+    assert!(pack.contains("\"body\":\"é\\u0000keep full tail\""));
+    assert!(!pack.contains("private"));
+    let retry = consume(unsafe { fcb_desk_export(desk, 4, path.as_ptr(), 3, 65536, 65536) });
+    assert!(retry.contains("DESK_SAVE_DESTINATION_EXISTS")); assert_eq!(fs::read_to_string(&destination).unwrap(), pack);
+    let invalid = root.join("invalid-budget.json"); let path = CString::new(invalid.as_os_str().as_encoded_bytes()).unwrap();
+    let rejected = consume(unsafe { fcb_desk_export(desk, 4, path.as_ptr(), 3, u64::MAX, 65536) });
+    assert!(rejected.contains("\"status\":\"error\"")); assert!(!invalid.exists());
+    let rejected = consume(unsafe { fcb_desk_export(desk, 4, std::ptr::null(), 3, 65536, 65536) });
+    assert!(rejected.contains("DESK_HANDLE_INVALID_ARGUMENT"));
+    assert_eq!(number(&ok(fcb_desk_state(desk)), "model_revision"), 4);
+    assert_eq!(fcb_desk_close(desk), 1);
+}

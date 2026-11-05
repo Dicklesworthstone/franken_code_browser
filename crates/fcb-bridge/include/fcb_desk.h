@@ -82,6 +82,19 @@ char *fcb_desk_open_reader(uint64_t handle, uint64_t expected, uint64_t pane,
  * reopening. Invalid/canceled restore keeps the prior desk state. */
 char *fcb_desk_save(uint64_t handle, uint64_t expected, const char *path, uint64_t max_source_bytes);
 char *fcb_desk_restore(uint64_t handle, uint64_t expected, uint64_t attempt, const char *path);
+/* Explicit bounded JSON source pack of ALL bookmark labels/notes and whole
+ * saved selections, encoded reversibly as original-byte hex. No live reads or
+ * inferred selection from a caret. Missing selections and budget omissions are
+ * reported per entry; metadata refusal creates no file. Source limit includes
+ * repeated selections; output bytes/scalars cover the complete escaped JSON.
+ * output_bytes and output_scalars must each be in 1..16777216. Choose a NEW file
+ * and review unredacted source, labels and notes before calling. No overwrite.
+ * Returns command "export" with effect, bytes_written, digest, budgets and
+ * coverage even after late cancel/close. Status "ok" proves publication, while
+ * complete describes selection coverage independently. A lost response is an
+ * uncertain effect: inspect the destination, never automatically replay. */
+char *fcb_desk_export(uint64_t handle, uint64_t expected, const char *path,
+    uint64_t source_bytes, uint64_t output_bytes, uint64_t output_scalars);
 uint8_t fcb_desk_cancel(uint64_t handle);
 uint8_t fcb_desk_close(uint64_t handle);
 

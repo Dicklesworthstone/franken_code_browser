@@ -133,3 +133,27 @@ fn canceled_write_returns_effect_receipt_instead_of_erasing_filesystem_outcome()
     assert!(receipt.as_str().contains("\"effect\":\"destination-created-incomplete\""));
     assert!(receipt.as_str().contains("DESK_CHECKPOINT_CANCELED"));
 }
+
+#[test]
+fn export_cancel_and_close_deliver_actual_write_effect_without_epoch_erasure() {
+    for close in [false, true] {
+        let root = directory(); let destination = root.join("interrupted-export.json");
+        let desks = DeskSessions::new(); let desk = desks.create().unwrap(); desks.start(desk, || false).unwrap();
+        let mut revoked = false;
+        let receipt = desks.export(desk, 0, &destination,
+            fcb_app::host::desk::export::DeskSourcePackLimits::default(), || {
+                if destination.exists() && !revoked {
+                    if close { desks.close(desk).unwrap(); } else { desks.cancel(desk).unwrap(); }
+                    revoked = true;
+                }
+                revoked
+            }).unwrap();
+        assert!(revoked && destination.exists());
+        assert!(receipt.as_str().contains("\"command\":\"export\""));
+        assert!(receipt.as_str().contains("\"status\":\"error\""));
+        assert!(receipt.as_str().contains("\"effect\":\"destination-created-incomplete\""));
+        assert_eq!(field(receipt.as_str(), "bytes_written"), fs::metadata(&destination).unwrap().len());
+        assert_eq!(field(receipt.as_str(), "bytes_written"), 0);
+        if !close { desks.close(desk).unwrap(); }
+    }
+}

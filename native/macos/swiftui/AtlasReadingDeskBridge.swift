@@ -17,6 +17,8 @@ import Foundation
     _ pane: UInt64, _ destination: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_restore") private func fcb_desk_restore(_ h: UInt64, _ revision: UInt64, _ attempt: UInt64, _ path: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_save") private func fcb_desk_save(_ h: UInt64, _ revision: UInt64, _ path: UnsafePointer<CChar>?, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_desk_export") private func fcb_desk_export(_ h: UInt64, _ revision: UInt64, _ path: UnsafePointer<CChar>?,
+    _ sourceBytes: UInt64, _ outputBytes: UInt64, _ outputScalars: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_cancel") private func fcb_desk_cancel(_ h: UInt64) -> UInt8
 @_silgen_name("fcb_desk_close") private func fcb_desk_close(_ h: UInt64) -> UInt8
 @_silgen_name("fcb_free_string") private func deskFreeString(_ pointer: UnsafeMutablePointer<CChar>?)
@@ -65,6 +67,10 @@ extension AtlasReadingDeskTransport {
         case .save(let revision, let path, let bytes):
             guard pathAllowed(path) else { return nil }
             return path.withCString { take(fcb_desk_save(handle, revision, $0, bytes)) }
+        case .exportSourcePack(let revision, let path, let limits):
+            guard pathAllowed(path), limits.isValid else { return nil }
+            return path.withCString { take(fcb_desk_export(handle, revision, $0,
+                limits.sourceBytes, limits.outputBytes, limits.outputScalars)) }
         }
     }, cancel: { fcb_desk_cancel($0) == 1 }, close: { fcb_desk_close($0) == 1 }, retirementFailed: {
         try? FileHandle.standardError.write(contentsOf: Data("FCB_DESK_RETIREMENT_UNAVAILABLE\n".utf8))

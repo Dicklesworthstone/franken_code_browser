@@ -13,12 +13,15 @@ private final class Fixture: @unchecked Sendable {
     private var mutations = 0
     private var starts = 0
     private var saves = 0
+    private var exports = 0
     private var closes = 0
     private var lostMutationResponse = false
     private var canceledSave = false
+    private var canceledExport = false
+    private var lostExportResponse = false
     private var openedGate: DispatchSemaphore?
     private var enteredGate: DispatchSemaphore?
-    private enum Gate: Equatable { case start, capture, save }
+    private enum Gate: Equatable { case start, capture, save, export }
     private var gatedRequest: Gate?
     private(set) var owner: UInt64 = 44
     let readerDomain = UUID()
@@ -30,15 +33,19 @@ private final class Fixture: @unchecked Sendable {
     }
     func loseNextMutationReply() { locked { lostMutationResponse = true } }
     func returnCanceledSave() { locked { canceledSave = true } }
+    func returnCanceledExport() { locked { canceledExport = true } }
+    func loseNextExportReply() { locked { lostExportResponse = true } }
     func gateNextStart(entered: DispatchSemaphore, resume: DispatchSemaphore) { gate(.start, entered, resume) }
     func gateNextCapture(entered: DispatchSemaphore, resume: DispatchSemaphore) { gate(.capture, entered, resume) }
     func gateNextSave(entered: DispatchSemaphore, resume: DispatchSemaphore) { gate(.save, entered, resume) }
+    func gateNextExport(entered: DispatchSemaphore, resume: DispatchSemaphore) { gate(.export, entered, resume) }
     private func gate(_ request: Gate, _ entered: DispatchSemaphore, _ resume: DispatchSemaphore) {
         locked { gatedRequest = request; enteredGate = entered; openedGate = resume }
     }
     var mutationCount: Int { locked { mutations } }
     var startCount: Int { locked { starts } }
     var saveCount: Int { locked { saves } }
+    var exportCount: Int { locked { exports } }
     var closeCount: Int { locked { closes } }
     private func locked<T>(_ body: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return body() }
     private func response(_ handle: UInt64, _ request: AtlasDeskRequest) -> String? {
@@ -47,6 +54,7 @@ private final class Fixture: @unchecked Sendable {
         case .start: kind = .start
         case .capture: kind = .capture
         case .save: kind = .save
+        case .exportSourcePack: kind = .export
         default: kind = nil
         }
         let gates = locked { () -> (DispatchSemaphore?, DispatchSemaphore?) in
@@ -105,6 +113,29 @@ private final class Fixture: @unchecked Sendable {
                 w["contains_source_payloads"] = true; w["contains_personal_labels"] = true
                 w["encrypted"] = false; w["overwritten"] = false
                 w["error"] = canceledSave ? ["code": "DESK_CHECKPOINT_CANCELED"] : NSNull()
+                return encode(w)
+            case .exportSourcePack(let expected, _, let limits):
+                precondition(expected == revision)
+                exports += 1
+                if lostExportResponse { lostExportResponse = false; return nil }
+                let exported = selected == nil ? 0 : marks.count
+                let selectedBytes = selected.map { ($0.1 - $0.0) * UInt64(exported) } ?? 0
+                var w = header("export")
+                w["pack_schema"] = "fcb.desk-source-pack/1"
+                w["status"] = canceledExport ? "error" : "ok"
+                w["effect"] = canceledExport ? "destination-created-incomplete" : "complete-file-and-parent-sync-requested"
+                w["bytes_written"] = canceledExport ? "8" : "256"
+                w["export_bytes"] = "256"; w["export_scalars"] = "256"
+                w["export_digest"] = String(repeating: "b", count: 64)
+                w["budgets"] = ["source_bytes": String(limits.sourceBytes), "output_bytes": String(limits.outputBytes), "output_scalars": String(limits.outputScalars)]
+                w["coverage"] = ["total_bookmarks": String(marks.count), "exported_selections": String(exported),
+                    "omitted_no_selection": String(marks.count - exported), "omitted_source_limit": "0", "omitted_output_limit": "0", "selected_original_bytes": String(selectedBytes)]
+                w["complete"] = exported == marks.count
+                w["contains_source_payloads"] = selectedBytes > 0
+                w["contains_personal_labels"] = true; w["contains_user_text"] = true
+                w["encrypted"] = false; w["redacted"] = false; w["overwritten"] = false
+                w["live_roots_accessed"] = false; w["power_loss_qualified"] = false
+                w["error"] = canceledExport ? ["code": "DESK_CHECKPOINT_CANCELED"] : NSNull()
                 return encode(w)
             }
         }
@@ -173,6 +204,7 @@ private final class Grant {
         precondition(model.state == nil && !model.busy)
         model.close()
         await cancellationAdmission()
+        await exportLifecycle()
         let desk = AtlasReadingDeskModel(transport: fixture.transport)
         desk.capture(path: "/chosen/source.rs", accessLease: nil); await idle(desk)
         precondition(desk.state?.retainedSources == 1 && desk.page?.text == fixture.text)
@@ -232,7 +264,7 @@ private final class Grant {
         precondition(flag.value == 1 && gated.closeCount == 1)
 
         try wireNegativeControls()
-        print("Reading desk wire, exact-source model, lost-reply reconciliation, canceled-save receipts and grant drain tests passed")
+        print("Reading desk wire, exact-source model, lost replies, save/export receipts and grant drain tests passed")
     }
 
     @MainActor static func cancellationAdmission() async {
@@ -278,6 +310,51 @@ private final class Grant {
         subject.close()
     }
 
+    @MainActor static func exportLifecycle() async {
+        let fixture = Fixture()
+        let desk = AtlasReadingDeskModel(transport: fixture.transport)
+        desk.capture(path: "/chosen/source.rs", accessLease: nil); await idle(desk)
+        desk.bookmarkLabel = "Preserve all notes"; desk.bookmark(); await idle(desk)
+        let reviewed = AtlasDeskSourcePackTarget(state: desk.state!)
+        let limits = AtlasDeskSourcePackLimits(sourceBytes: 65536)
+        desk.exportSourcePack(reviewed, limits: limits, path: "/chosen/evidence.json", accessLease: nil)
+        await idle(desk)
+        precondition(fixture.exportCount == 1 && desk.lastExport?.succeeded == true)
+        precondition(desk.lastExport?.complete == false && desk.lastExport?.omittedNoSelection == 1)
+        precondition(desk.notice.contains("All labels and full notes are included"))
+
+        fixture.loseNextExportReply()
+        desk.exportSourcePack(reviewed, limits: limits, path: "/chosen/lost-reply.json", accessLease: nil)
+        await idle(desk)
+        precondition(fixture.exportCount == 2 && desk.lastExport == nil)
+        precondition(desk.notice.contains("outcome could not be verified"), "lost receipt must never replay a filesystem write")
+
+        desk.bookmarkLabel = "New note since review"; desk.bookmark(); await idle(desk)
+        desk.exportSourcePack(reviewed, limits: limits, path: "/chosen/stale-review.json", accessLease: nil)
+        precondition(!desk.busy && fixture.exportCount == 2 && desk.notice.contains("changed after export review"))
+        let current = AtlasDeskSourcePackTarget(state: desk.state!)
+        desk.exportSourcePack(current, limits: limits, path: "/chosen/queued-cancel.json", accessLease: nil)
+        desk.cancel(); await idle(desk)
+        precondition(fixture.exportCount == 2 && desk.lastExport == nil && desk.notice.contains("No destination was created"))
+
+        fixture.returnCanceledExport()
+        let entered = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
+        fixture.gateNextExport(entered: entered, resume: resume)
+        let flag = Flag(); var grant: Grant? = Grant(flag)
+        desk.exportSourcePack(current, limits: limits, path: "/chosen/partial.json", accessLease: grant)
+        grant = nil; await Self.entered(entered)
+        desk.close()
+        precondition(flag.value == 0 && fixture.closeCount == 0)
+        resume.signal(); await idle(desk)
+        precondition(desk.lastExport?.written == 8 && desk.lastExport?.succeeded == false)
+        precondition(desk.notice.contains("8 bytes written") && fixture.exportCount == 3)
+        for _ in 0..<1000 {
+            if flag.value == 1 && fixture.closeCount == 1 { break }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        precondition(flag.value == 1 && fixture.closeCount == 1)
+    }
+
     static func wireNegativeControls() throws {
         let f = Fixture(), transport = f.transport
         let json = transport.run(f.owner, .start)!
@@ -313,5 +390,29 @@ private final class Grant {
         invalid["effect"] = "none"; rejectsSave(invalid)
         invalid["effect"] = "destination-created-incomplete"; rejectsSave(invalid)
         invalid["effect"] = "complete-file-sync-unconfirmed"; invalid["bytes_written"] = "8"; rejectsSave(invalid)
+
+        let target = AtlasDeskSourcePackTarget(state: savedState)
+        let limits = AtlasDeskSourcePackLimits(sourceBytes: 65536)
+        let exportJSON = transport.run(f.owner, .exportSourcePack(revision: 1, path: "/chosen/evidence.json", limits: limits))!
+        let exported = try JSONSerialization.jsonObject(with: Data(exportJSON.utf8)) as! [String: Any]
+        let acceptedExport = try AtlasDeskSourcePackReceipt.decode(exportJSON, target: target, limits: limits)
+        precondition(acceptedExport.succeeded)
+        func rejectsExport(_ object: [String: Any]) {
+            let text = String(decoding: try! JSONSerialization.data(withJSONObject: object), as: UTF8.self)
+            do { _ = try AtlasDeskSourcePackReceipt.decode(text, target: target, limits: limits); fatalError("contradictory export receipt accepted") }
+            catch { }
+        }
+        invalid = exported; invalid["model_revision"] = "2"; rejectsExport(invalid)
+        invalid = exported; invalid["export_digest"] = NSNull(); rejectsExport(invalid)
+        invalid = exported; invalid["bytes_written"] = "257"; rejectsExport(invalid)
+        invalid = exported; invalid["export_scalars"] = "257"; rejectsExport(invalid)
+        invalid = exported; invalid["complete"] = false; rejectsExport(invalid)
+        invalid = exported; invalid["contains_source_payloads"] = true; rejectsExport(invalid)
+        invalid = exported; invalid["live_roots_accessed"] = true; rejectsExport(invalid)
+        invalid = exported; invalid["budgets"] = ["source_bytes": "65537", "output_bytes": "16777216", "output_scalars": "16777216"]; rejectsExport(invalid)
+        invalid = exported; invalid["coverage"] = ["total_bookmarks": "0", "exported_selections": "18446744073709551615",
+            "omitted_no_selection": "0", "omitted_source_limit": "0", "omitted_output_limit": "0", "selected_original_bytes": "0"]; rejectsExport(invalid)
+        invalid = exported; invalid["effect"] = "destination-created-incomplete"; rejectsExport(invalid)
+        invalid["status"] = "error"; invalid["error"] = ["code": "DESK_CHECKPOINT_CANCELED"]; rejectsExport(invalid)
     }
 }

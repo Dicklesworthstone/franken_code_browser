@@ -132,6 +132,24 @@ pub unsafe extern "C" fn fcb_desk_save(handle: u64, expected: u64, path: *const 
         desks.save(handle, expected, Path::new(path), max_source_bytes, || false)
     }))
 }
+/// Export retained bookmarked selections and full notes to a NEW JSON file.
+/// Limits cover original source bytes (including repeats), serialized UTF-8
+/// bytes and Unicode scalars in that JSON. No source path is reopened.
+/// # Safety
+/// path is null or readable NUL-terminated UTF-8 stable until return. Explicit
+/// user consent grants the destination and disclosure ceilings. Free every
+/// non-null response once, including errors with actual partial-write effects.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_desk_export(handle: u64, expected: u64, path: *const c_char,
+    source_bytes: u64, output_bytes: u64, output_scalars: u64) -> *mut c_char {
+    reply(|| answer(handle, |desks| {
+        let path = unsafe { cstr(path) }.ok_or(AccessError::InvalidArgument)?;
+        let limits = fcb_app::host::desk::export::DeskSourcePackLimits {
+            source_bytes, output_bytes: number(output_bytes)?, output_scalars: number(output_scalars)?,
+        };
+        desks.export(handle, expected, Path::new(path), limits, || false)
+    }))
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_desk_cancel(handle: u64) -> u8 {
     std::panic::catch_unwind(|| u8::from(DESKS.get().is_some_and(|desks| desks.cancel(handle).is_ok()))).unwrap_or(0)

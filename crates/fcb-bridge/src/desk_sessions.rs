@@ -247,6 +247,20 @@ impl DeskSessions {
             || cell.validate(epoch).is_err() || canceled());
         Ok(desk.checkpoint_save_response(&outcome)?)
     }
+    /// Export is a write operation too: retain its exact terminal receipt when
+    /// cancellation or close races publication, without a final epoch filter.
+    pub(super) fn export(&self, handle: u64, expected: u64, path: &Path,
+        limits: fcb_app::host::desk::export::DeskSourcePackLimits,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        let cell = self.get(handle)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let mut state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        let desk = state.as_mut().ok_or(AccessError::NotOpen)?;
+        let outcome = desk.export_source_pack(expected, path, limits,
+            || cell.validate(epoch).is_err() || canceled());
+        Ok(desk.source_pack_response(&outcome)?)
+    }
     pub(super) fn cancel(&self, handle: u64) -> Result<(), AccessError> {
         let cell = self.get(handle)?;
         if cell.epoch.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1)).is_err() {

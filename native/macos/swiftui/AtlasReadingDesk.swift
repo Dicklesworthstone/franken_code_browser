@@ -1,7 +1,7 @@
 import Foundation
 
 enum AtlasReadingDeskError: Error, Sendable {
-    case unavailable, invalidInput, invalidNote, staleNote, staleReattachment, invalidResponse, canceled, engine(String)
+    case unavailable, invalidInput, invalidNote, staleNote, staleReattachment, staleExport, invalidResponse, canceled, engine(String)
     var message: String {
         switch self {
         case .unavailable: return "The reading desk could not admit this operation."
@@ -9,6 +9,7 @@ enum AtlasReadingDeskError: Error, Sendable {
         case .invalidNote: return "Use a nonempty label up to 256 UTF-8 bytes without NUL, and note text up to 16 KiB."
         case .staleNote: return "The original source range or saved note version has changed. Your draft is preserved; reopen the current note or choose a current range before saving."
         case .staleReattachment: return "The saved note or selected destination changed after confirmation. Select the current range and review the reattachment again."
+        case .staleExport: return "The reading desk changed after export review. Review the current bookmarks, notes and source budget before exporting again. No export request was sent."
         case .invalidResponse: return "The reading desk response could not be verified. Reload its accepted state before continuing."
         case .canceled: return "The operation was canceled before its next request began."
         case .engine(let code): return "Reading desk operation unavailable (\(code))."
@@ -405,6 +406,127 @@ struct AtlasDeskSaveReceipt: Sendable {
     }
 }
 
+/// A native save-panel review grants disclosure of this exact accepted desk,
+/// not whichever bookmarks happen to be present after an asynchronous change.
+struct AtlasDeskSourcePackTarget: Sendable {
+    let state: AtlasDeskState
+    func isCurrent(in current: AtlasDeskState?) -> Bool {
+        current?.owner == state.owner && current?.revision == state.revision && current?.lastAttempt == state.lastAttempt
+    }
+    var selectionCount: Int { state.bookmarks.filter { $0.location.selection != nil }.count }
+}
+
+struct AtlasDeskSourcePackLimits: Sendable, Equatable {
+    let sourceBytes: UInt64
+    var outputBytes: UInt64 = 16 * 1024 * 1024
+    var outputScalars: UInt64 = 16 * 1024 * 1024
+    var isValid: Bool {
+        outputBytes > 0 && outputBytes <= 16 * 1024 * 1024 && outputScalars > 0 && outputScalars <= 16 * 1024 * 1024
+    }
+}
+
+struct AtlasDeskSourcePackReceipt: Sendable {
+    let effect: String
+    let written, exportBytes, exportScalars, selectedBytes: UInt64
+    let exported, omittedNoSelection, omittedSourceLimit, omittedOutputLimit: UInt64
+    let digest: String?
+    let errorCode: String?
+    let succeeded, complete: Bool
+
+    var message: String {
+        if succeeded {
+            let coverage = complete ? "All bookmarked selections are included."
+                : "Omitted: \(omittedNoSelection) without a saved selection, \(omittedSourceLimit) over the source budget and \(omittedOutputLimit) over the JSON budget. All labels and full notes are included."
+            return "Exported \(exported) selections (\(selectedBytes) original bytes). \(written) JSON bytes written; file and parent synchronization completed. \(coverage)"
+        }
+        if effect == "none" { return "No export destination was created (\(errorCode ?? "unavailable")). Review the budget and choose a new filename." }
+        let stage: String
+        switch effect {
+        case "destination-created-incomplete": stage = "The destination contains an incomplete source pack."
+        case "complete-file-sync-unconfirmed": stage = "The complete pack was written; file synchronization was not confirmed."
+        case "complete-file-sync-requested": stage = "The complete pack was written and file synchronization completed; parent synchronization was not confirmed."
+        default: stage = "The export outcome requires inspection."
+        }
+        return "\(written) bytes written. \(stage) Inspect the destination before retrying and use a new filename (\(errorCode ?? "unavailable"))."
+    }
+
+    static func decode(_ json: String?, target: AtlasDeskSourcePackTarget, limits: AtlasDeskSourcePackLimits) throws -> Self {
+        let state = target.state
+        let data = try AtlasDeskWire.admit(json, handle: state.owner, command: "export", allowWriteError: true)
+        do {
+            let w = try JSONDecoder().decode(Wire.self, from: data), c = w.coverage
+            let counts = [c.exported_selections.value, c.omitted_no_selection.value,
+                c.omitted_source_limit.value, c.omitted_output_limit.value]
+            let total = UInt64(state.bookmarks.count)
+            guard limits.isValid, w.pack_schema == "fcb.desk-source-pack/1",
+                  w.model_revision.value == state.revision, w.last_attempt.value == state.lastAttempt,
+                  w.budgets.source_bytes.value == limits.sourceBytes,
+                  w.budgets.output_bytes.value == limits.outputBytes, w.budgets.output_scalars.value == limits.outputScalars,
+                  w.bytes_written.value <= w.export_bytes.value, w.export_bytes.value <= limits.outputBytes,
+                  w.export_scalars.value <= limits.outputScalars, w.export_scalars.value <= w.export_bytes.value,
+                  c.total_bookmarks.value == total, counts.allSatisfy({ $0 <= total }),
+                  c.selected_original_bytes.value <= limits.sourceBytes,
+                  w.contains_source_payloads == (c.selected_original_bytes.value > 0),
+                  w.contains_personal_labels, w.contains_user_text, !w.redacted, !w.encrypted,
+                  !w.overwritten, !w.live_roots_accessed, !w.native_presented, !w.power_loss_qualified,
+                  w.error == nil || (!w.error!.code.isEmpty && w.error!.code.utf8.count <= 512),
+                  (w.status == "ok") == (w.error == nil),
+                  (w.export_bytes.value == 0) == (w.export_digest == nil),
+                  w.export_digest == nil || (w.export_digest!.utf8.count == 64 &&
+                    w.export_digest!.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) })) else {
+                throw AtlasReadingDeskError.invalidResponse
+            }
+            if w.export_bytes.value > 0 {
+                let selected = state.bookmarks.compactMap { $0.location.selection }
+                let selectedBytes = selected.reduce(UInt64(0)) { $0 + $1.end - $1.start }
+                guard counts.reduce(0, +) == total, w.export_scalars.value > 0,
+                      c.omitted_no_selection.value == total - UInt64(selected.count),
+                      c.exported_selections.value <= UInt64(selected.count),
+                      c.selected_original_bytes.value <= selectedBytes,
+                      c.selected_original_bytes.value <= w.export_bytes.value / 2,
+                      w.complete == (c.exported_selections.value == total) else { throw AtlasReadingDeskError.invalidResponse }
+            } else {
+                guard counts.allSatisfy({ $0 == 0 }), c.selected_original_bytes.value == 0,
+                      w.export_scalars.value == 0, !w.complete else { throw AtlasReadingDeskError.invalidResponse }
+            }
+            switch w.effect {
+            case "none":
+                guard w.bytes_written.value == 0, w.error != nil else { throw AtlasReadingDeskError.invalidResponse }
+            case "destination-created-incomplete":
+                guard w.export_bytes.value > 0, w.bytes_written.value < w.export_bytes.value,
+                      w.error != nil else { throw AtlasReadingDeskError.invalidResponse }
+            case "complete-file-sync-unconfirmed", "complete-file-sync-requested":
+                guard w.export_bytes.value > 0, w.bytes_written.value == w.export_bytes.value,
+                      w.error != nil else { throw AtlasReadingDeskError.invalidResponse }
+            case "complete-file-and-parent-sync-requested":
+                guard w.export_bytes.value > 0, w.bytes_written.value == w.export_bytes.value,
+                      w.error == nil else { throw AtlasReadingDeskError.invalidResponse }
+            default: throw AtlasReadingDeskError.invalidResponse
+            }
+            return Self(effect: w.effect, written: w.bytes_written.value, exportBytes: w.export_bytes.value,
+                exportScalars: w.export_scalars.value, selectedBytes: c.selected_original_bytes.value,
+                exported: c.exported_selections.value, omittedNoSelection: c.omitted_no_selection.value,
+                omittedSourceLimit: c.omitted_source_limit.value, omittedOutputLimit: c.omitted_output_limit.value,
+                digest: w.export_digest, errorCode: w.error?.code, succeeded: w.status == "ok", complete: w.complete)
+        } catch let error as AtlasReadingDeskError { throw error }
+        catch { throw AtlasReadingDeskError.invalidResponse }
+    }
+    private struct Wire: Decodable {
+        let model_revision, last_attempt, bytes_written, export_bytes, export_scalars: AtlasDeskNumber
+        let status, effect, pack_schema: String
+        let export_digest: String?
+        let budgets: Budgets
+        let coverage: Coverage
+        let complete, contains_source_payloads, contains_personal_labels, contains_user_text: Bool
+        let redacted, encrypted, overwritten, live_roots_accessed, native_presented, power_loss_qualified: Bool
+        let error: AtlasDeskWire.Failure?
+    }
+    private struct Budgets: Decodable { let source_bytes, output_bytes, output_scalars: AtlasDeskNumber }
+    private struct Coverage: Decodable {
+        let total_bookmarks, exported_selections, omitted_no_selection, omitted_source_limit, omitted_output_limit, selected_original_bytes: AtlasDeskNumber
+    }
+}
+
 enum AtlasDeskWire {
     static let maximumResponseBytes = 4 * 1024 * 1024
     struct Failure: Decodable { let code: String }
@@ -423,7 +545,7 @@ enum AtlasDeskWire {
         guard handle > 0, header.schema == "fcb.reading-desk/1", header.owner.value == handle,
               ["ok", "error"].contains(header.status) else { throw AtlasReadingDeskError.invalidResponse }
         guard header.status != "ok" || header.error == nil else { throw AtlasReadingDeskError.invalidResponse }
-        if header.status == "error", !(allowWriteError && header.command == "save") {
+        if header.status == "error", !(allowWriteError && header.command == command && ["save", "export"].contains(command)) {
             guard let code = header.error?.code, !code.isEmpty, code.utf8.count <= 512 else { throw AtlasReadingDeskError.invalidResponse }
             throw AtlasReadingDeskError.engine(code)
         }
@@ -443,6 +565,7 @@ enum AtlasDeskRequest: Sendable {
     case openReader(revision: UInt64, pane: UInt64, destination: UInt64)
     case restore(revision: UInt64, attempt: UInt64, path: String)
     case save(revision: UInt64, path: String, sourceBytes: UInt64)
+    case exportSourcePack(revision: UInt64, path: String, limits: AtlasDeskSourcePackLimits)
 }
 
 struct AtlasReadingDeskTransport: Sendable {

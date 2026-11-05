@@ -64,12 +64,12 @@ impl CheckpointSaveEffect {
 /// NOT rollback. No method deletes or overwrites an incomplete destination.
 #[derive(Clone, Copy, Debug)]
 pub struct CheckpointSave {
-    effect: CheckpointSaveEffect,
-    bytes_written: u64,
-    document_bytes: u64,
-    source_bytes: u64,
-    digest: Option<Sha256Digest>,
-    error: Option<CheckpointIoError>,
+    pub(super) effect: CheckpointSaveEffect,
+    pub(super) bytes_written: u64,
+    pub(super) document_bytes: u64,
+    pub(super) source_bytes: u64,
+    pub(super) digest: Option<Sha256Digest>,
+    pub(super) error: Option<CheckpointIoError>,
 }
 impl CheckpointSave {
     pub const fn effect(&self) -> CheckpointSaveEffect { self.effect }
@@ -101,24 +101,7 @@ impl DeskSession {
             let checkpoint = self.desk.checkpoint(expected, allocation, &mut canceled)?;
             outcome.document_bytes = checkpoint.bytes().len() as u64;
             outcome.digest = Some(checkpoint.digest());
-            let parent = File::open(destination.parent().ok_or(CheckpointIoError::InvalidPath)?)
-                .map_err(|_| CheckpointIoError::Io)?;
-            if !parent.metadata().map_err(|_| CheckpointIoError::Io)?.is_dir() { return Err(CheckpointIoError::InvalidPath); }
-            stop(&mut canceled)?;
-            let mut options = OpenOptions::new(); options.write(true).create_new(true);
-            #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
-            let mut file = options.open(&destination).map_err(|e| if e.kind() == io::ErrorKind::AlreadyExists {
-                CheckpointIoError::DestinationExists
-            } else { CheckpointIoError::Io })?;
-            outcome.effect = CheckpointSaveEffect::Created;
-            write_payload(&mut file, checkpoint.bytes(), &mut outcome, &mut canceled)?;
-            stop(&mut canceled)?;
-            file.sync_all().map_err(|_| CheckpointIoError::Io)?;
-            outcome.effect = CheckpointSaveEffect::FileSynced;
-            stop(&mut canceled)?;
-            parent.sync_all().map_err(|_| CheckpointIoError::Io)?;
-            outcome.effect = CheckpointSaveEffect::DirectorySynced;
-            Ok(())
+            publish_new_payload(&destination, checkpoint.bytes(), &mut outcome, &mut canceled)
         })();
         outcome.error = result.err();
         outcome
@@ -180,10 +163,34 @@ impl DeskSession {
 fn stop(canceled: &mut impl FnMut() -> bool) -> Result<(), CheckpointIoError> {
     if canceled() { Err(CheckpointIoError::Canceled) } else { Ok(()) }
 }
-fn checked_path(path: &Path) -> Result<PathBuf, CheckpointIoError> {
+pub(super) fn checked_path(path: &Path) -> Result<PathBuf, CheckpointIoError> {
     if path.as_os_str().is_empty() || path.as_os_str().len() > 16_384 { return Err(CheckpointIoError::InvalidPath); }
     if !input::NATIVE_FILE_SUPPORTED { return Err(AppError::UnsupportedPlatform.into()); }
     Ok(input::absolute(path)?)
+}
+/// Shared create-only publication for checkpoints and explicitly requested
+/// source packs. Only actual writes advance the receipt; cancellation never
+/// deletes a destination or turns a partial effect into an alleged rollback.
+pub(super) fn publish_new_payload(destination: &Path, bytes: &[u8], outcome: &mut CheckpointSave,
+    canceled: &mut impl FnMut() -> bool) -> Result<(), CheckpointIoError> {
+    let parent = File::open(destination.parent().ok_or(CheckpointIoError::InvalidPath)?)
+        .map_err(|_| CheckpointIoError::Io)?;
+    if !parent.metadata().map_err(|_| CheckpointIoError::Io)?.is_dir() { return Err(CheckpointIoError::InvalidPath); }
+    stop(canceled)?;
+    let mut options = OpenOptions::new(); options.write(true).create_new(true);
+    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+    let mut file = options.open(destination).map_err(|e| if e.kind() == io::ErrorKind::AlreadyExists {
+        CheckpointIoError::DestinationExists
+    } else { CheckpointIoError::Io })?;
+    outcome.effect = CheckpointSaveEffect::Created;
+    write_payload(&mut file, bytes, outcome, canceled)?;
+    stop(canceled)?;
+    file.sync_all().map_err(|_| CheckpointIoError::Io)?;
+    outcome.effect = CheckpointSaveEffect::FileSynced;
+    stop(canceled)?;
+    parent.sync_all().map_err(|_| CheckpointIoError::Io)?;
+    outcome.effect = CheckpointSaveEffect::DirectorySynced;
+    Ok(())
 }
 fn write_payload(writer: &mut impl Write, bytes: &[u8], outcome: &mut CheckpointSave,
     canceled: &mut impl FnMut() -> bool) -> Result<(), CheckpointIoError> {

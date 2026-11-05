@@ -369,6 +369,8 @@ fn location_fields(out: &mut Output, at: DeskLocation) -> Result<(), OutputError
 
 /// Explicit, create-only source-bearing checkpoint files and offline restore.
 pub mod persistence;
+/// Explicit, bounded exports of bookmarked source selections and personal notes.
+pub mod export;
 /// Bounded cross-owner source transfer with exact identity receipts.
 pub mod imports;
 
