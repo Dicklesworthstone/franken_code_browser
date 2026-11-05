@@ -34,6 +34,11 @@ pub unsafe extern "C" fn fcb_desk_open(handle: u64, expected: u64, attempt: u64,
         desks.execute(handle, Command::Open { expected, attempt, path: Path::new(path) }, || false)
     }))
 }
+/// Apply a semantic desk command. Kind 12 deliberately reattaches a bookmark:
+/// subject is its ID, start is the target pane ID, and end is the expected
+/// bookmark update sequence. The expected model revision binds both locations.
+/// Both original-byte selections must be nonempty and identical; personal text
+/// is preserved. Failed response delivery requires state reconciliation.
 /// # Safety
 /// label is null (empty) or readable NUL-terminated UTF-8 stable until return.
 #[unsafe(no_mangle)]

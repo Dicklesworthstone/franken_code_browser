@@ -418,3 +418,176 @@ fn missing_foreign_and_exhausted_note_edits_are_transactional() {
     command(&mut desk, DeskCommand::RecallBookmark(id));
     assert_eq!(desk.source(desk.active().unwrap(), desk.revision()).unwrap().bytes(), b"source");
 }
+
+
+#[test]
+fn deliberate_reattachment_preserves_personal_text_and_uses_exact_selected_bytes() {
+    let (mut desk, _) = setup(DeskLimits::default());
+    let old = open(&mut desk, capture(1, 1, b"prefix \xff\0\r\n suffix"), Some(range(7, 11)));
+    let bookmark = command(&mut desk, DeskCommand::Annotate {
+        pane: old, label: "My evidence".into(), body: "Keep my words.\r\n\0No normalization.".into(),
+    }).created_bookmark.unwrap();
+    let original = desk.bookmarks()[0].location();
+    // Opening replacement bytes at the same logical path does not move a note.
+    let target = open(&mut desk, capture(1, 2, b"moved \xff\0\r\n elsewhere"), Some(range(6, 10)));
+    command(&mut desk, DeskCommand::ClearHistory);
+    let selected = desk.location(target, desk.revision()).unwrap();
+    let history = desk.history().to_vec();
+    assert_eq!(desk.bookmarks()[0].location(), original);
+    assert_eq!(desk.retained_source_count(), 2);
+    command(&mut desk, DeskCommand::ReattachBookmark {
+        bookmark, expected_update_sequence: 1, pane: target,
+    });
+    let mark = &desk.bookmarks()[0];
+    assert_eq!(mark.id(), bookmark);
+    assert_eq!(mark.location(), selected);
+    assert_eq!(mark.label(), "My evidence");
+    assert_eq!(mark.body(), "Keep my words.\r\n\0No normalization.");
+    assert_eq!(mark.update_sequence(), 2);
+    assert_eq!(desk.history(), history.as_slice());
+    assert_eq!(desk.active(), Some(target));
+    // Old evidence retires only after the explicit mapping, when nothing else pins it.
+    assert_eq!(desk.retained_source_count(), 1);
+    command(&mut desk, DeskCommand::RecallBookmark(bookmark));
+    assert_eq!(desk.selected_bytes(desk.active().unwrap(), desk.revision()).unwrap(), b"\xff\0\r\n");
+    assert_eq!(desk.source(desk.active().unwrap(), desk.revision()).unwrap().revision(), selected.revision);
+}
+
+#[test]
+fn reattachment_uses_the_chosen_occurrence_instead_of_searching_for_equal_text() {
+    let (mut desk, _) = setup(DeskLimits::default());
+    let pane = open(&mut desk, capture(1, 1, b"same__same"), Some(range(0, 4)));
+    let bookmark = command(&mut desk, DeskCommand::Bookmark { pane, label: "second occurrence".into() })
+        .created_bookmark.unwrap();
+    command(&mut desk, DeskCommand::Navigate { pane, offset: 6, selection: Some(range(6, 10)) });
+    command(&mut desk, DeskCommand::ReattachBookmark { bookmark, expected_update_sequence: 1, pane });
+    assert_eq!(desk.bookmarks()[0].location().selection, Some(range(6, 10)));
+    assert_eq!(desk.bookmarks()[0].location().offset, 6);
+    assert_eq!(desk.bookmarks()[0].body(), "");
+    assert_eq!(desk.bookmarks()[0].update_sequence(), 2);
+}
+
+#[test]
+fn changed_missing_and_empty_reattachment_selections_leave_the_original_note() {
+    for (old_selection, bytes, selection, error) in [
+        (Some(range(0, 5)), b"SAVED".as_slice(), Some(range(0, 5)), DeskError::SelectionMismatch),
+        (Some(range(0, 5)), b"saved!".as_slice(), Some(range(0, 6)), DeskError::SelectionMismatch),
+        (Some(range(0, 5)), b"saved".as_slice(), None, DeskError::InvalidLocation),
+        (Some(range(0, 5)), b"saved".as_slice(), Some(range(0, 0)), DeskError::InvalidLocation),
+        (None, b"saved".as_slice(), Some(range(0, 5)), DeskError::InvalidLocation),
+        (Some(range(0, 0)), b"saved".as_slice(), Some(range(0, 5)), DeskError::InvalidLocation),
+    ] {
+        let (mut desk, _) = setup(DeskLimits::default());
+        let old = open(&mut desk, capture(1, 1, b"saved"), old_selection);
+        let bookmark = command(&mut desk, DeskCommand::Annotate {
+            pane: old, label: "Keep".into(), body: "Original evidence.".into(),
+        }).created_bookmark.unwrap();
+        let original = desk.bookmarks()[0].location();
+        let pane = open(&mut desk, capture(1, 2, bytes), selection);
+        command(&mut desk, DeskCommand::ClearHistory);
+        let revision = desk.revision();
+        assert_eq!(desk.apply(revision, desk.last_attempt() + 1, DeskCommand::ReattachBookmark {
+            bookmark, expected_update_sequence: 1, pane,
+        }, || false), Err(error));
+        assert_eq!(desk.revision(), revision);
+        assert_eq!(desk.bookmarks()[0].location(), original);
+        assert_eq!(desk.bookmarks()[0].body(), "Original evidence.");
+        assert_eq!(desk.bookmarks()[0].update_sequence(), 1);
+        assert_eq!(desk.retained_source_count(), 2);
+    }
+}
+
+#[test]
+fn stale_reattachment_intent_cannot_move_a_note_or_replay_an_accepted_mapping() {
+    let (mut desk, _) = setup(DeskLimits::default());
+    let old = open(&mut desk, capture(1, 1, b"exact"), Some(range(0, 5)));
+    let bookmark = command(&mut desk, DeskCommand::Annotate {
+        pane: old, label: "Before".into(), body: "Before editing.".into(),
+    }).created_bookmark.unwrap();
+    let original = desk.bookmarks()[0].location();
+    let pane = open(&mut desk, capture(2, 2, b"xexact"), Some(range(1, 6)));
+    let prompt_revision = desk.revision();
+    command(&mut desk, DeskCommand::EditBookmark {
+        bookmark, label: "Current".into(), body: "The newer personal text.".into(),
+    });
+    let revision = desk.revision();
+    let attempt = desk.last_attempt() + 1;
+    assert_eq!(desk.apply(prompt_revision, attempt, DeskCommand::ReattachBookmark {
+        bookmark, expected_update_sequence: 1, pane,
+    }, || false), Err(DeskError::StaleRevision));
+    assert_eq!(desk.apply(revision, attempt, DeskCommand::ReattachBookmark {
+        bookmark, expected_update_sequence: 1, pane,
+    }, || false), Err(DeskError::StaleBookmark));
+    assert_eq!(desk.bookmarks()[0].location(), original);
+    assert_eq!(desk.bookmarks()[0].update_sequence(), 2);
+    command(&mut desk, DeskCommand::ReattachBookmark { bookmark, expected_update_sequence: 2, pane });
+    let accepted = desk.revision();
+    let mapped = desk.bookmarks()[0].location();
+    assert_eq!(desk.apply(accepted, accepted, DeskCommand::ReattachBookmark {
+        bookmark, expected_update_sequence: 2, pane,
+    }, || false), Err(DeskError::StaleAttempt));
+    assert_eq!(desk.apply(accepted, accepted + 1, DeskCommand::ReattachBookmark {
+        bookmark, expected_update_sequence: 2, pane,
+    }, || false), Err(DeskError::StaleBookmark));
+    assert_eq!(desk.bookmarks()[0].location(), mapped);
+    assert_eq!(desk.bookmarks()[0].body(), "The newer personal text.");
+    assert_eq!(desk.bookmarks()[0].update_sequence(), 3);
+}
+
+#[test]
+fn canceled_reattachment_keeps_old_evidence_through_comparison_and_publication() {
+    let (mut desk, _) = setup(DeskLimits::default());
+    let bytes = vec![b'x'; 40_000];
+    let old = open(&mut desk, capture(1, 1, &bytes), Some(range(0, bytes.len() as u64)));
+    let bookmark = command(&mut desk, DeskCommand::Annotate {
+        pane: old, label: "Keep".into(), body: "Never lose this.".into(),
+    }).created_bookmark.unwrap();
+    let original = desk.bookmarks()[0].location();
+    let pane = open(&mut desk, capture(2, 2, &bytes), Some(range(0, bytes.len() as u64)));
+    command(&mut desk, DeskCommand::ClearHistory);
+    let revision = desk.revision();
+    // Includes cancellation partway through a large comparison and at publication.
+    for stop in [1, 2, 3, 5] {
+        let attempt = desk.last_attempt() + 1;
+        let mut checks = 0;
+        assert_eq!(desk.apply(revision, attempt, DeskCommand::ReattachBookmark {
+            bookmark, expected_update_sequence: 1, pane,
+        }, || { checks += 1; checks == stop }), Err(DeskError::Canceled));
+        assert_eq!(desk.revision(), revision);
+        assert_eq!(desk.last_attempt(), attempt);
+        assert_eq!(desk.bookmarks()[0].location(), original);
+        assert_eq!(desk.bookmarks()[0].body(), "Never lose this.");
+        assert_eq!(desk.bookmarks()[0].update_sequence(), 1);
+        assert_eq!(desk.retained_source_count(), 2);
+    }
+    command(&mut desk, DeskCommand::ReattachBookmark { bookmark, expected_update_sequence: 1, pane });
+    assert_eq!(desk.bookmarks()[0].update_sequence(), 2);
+    assert_eq!(desk.retained_source_count(), 1);
+}
+
+#[test]
+fn missing_foreign_and_exhausted_reattachments_are_transactional() {
+    let (mut desk, _) = setup(DeskLimits::default());
+    let pane = open(&mut desk, capture(1, 1, b"exact"), Some(range(0, 5)));
+    let bookmark = command(&mut desk, DeskCommand::Bookmark { pane, label: "Keep".into() })
+        .created_bookmark.unwrap();
+    let original = desk.bookmarks()[0].location();
+    let foreign = DeskPaneId { owner: owner(901), value: pane.get() };
+    for (id, target, error) in [
+        (bookmark + 1, pane, DeskError::MissingBookmark),
+        (bookmark, foreign, DeskError::OwnerMismatch),
+        (bookmark, DeskPaneId { owner: owner(900), value: 99 }, DeskError::MissingPane),
+    ] {
+        assert_eq!(desk.apply(2, desk.last_attempt() + 1, DeskCommand::ReattachBookmark {
+            bookmark: id, expected_update_sequence: 1, pane: target,
+        }, || false), Err(error));
+        assert_eq!(desk.bookmarks()[0].location(), original);
+    }
+    desk.state.bookmarks[0].update_sequence = u64::MAX;
+    assert_eq!(desk.apply(2, desk.last_attempt() + 1, DeskCommand::ReattachBookmark {
+        bookmark, expected_update_sequence: u64::MAX, pane,
+    }, || false), Err(DeskError::IdentityExhausted));
+    assert_eq!(desk.bookmarks()[0].location(), original);
+    assert_eq!(desk.bookmarks()[0].update_sequence(), u64::MAX);
+    assert_eq!(desk.revision(), 2);
+}

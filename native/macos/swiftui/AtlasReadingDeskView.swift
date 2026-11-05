@@ -20,6 +20,7 @@ private final class AtlasDeskFileAccess {
     @State private var confirmRestore = false
     @State private var panelNotice = ""
     @State private var noteDraft: AtlasDeskNoteDraft?
+    @State private var reattachment: AtlasDeskReattachment?
     @State private var readerCapture: AtlasDeskReaderCapture?
     @State private var readerTask: Task<Void, Never>?
     @State private var pins = AtlasPinnedReaders<AtlasPagedReaderModel>(
@@ -56,7 +57,15 @@ private final class AtlasDeskFileAccess {
         .onAppear { model.start() }
         .sheet(item: $readerCapture) { capture in AtlasDeskReaderView(desk: model, capture: capture, pins: pins) }
         .sheet(item: $noteDraft) { draft in AtlasDeskNoteEditor(model: model, draft: draft) }
-        .onDisappear { readerTask?.cancel(); readerCapture?.reader.close(); pins.closeAll() }
+        .onDisappear { reattachment = nil; readerTask?.cancel(); readerCapture?.reader.close(); pins.closeAll() }
+        .alert("Reattach this saved note?", isPresented: Binding(
+            get: { reattachment != nil }, set: { if !$0 { reattachment = nil } }), presenting: reattachment) { target in
+            Button("Reattach note") { panelNotice = ""; model.reattachBookmark(target) }
+                .disabled(!model.canOperate || !target.isCurrent(in: model.state))
+            Button("Cancel", role: .cancel) { }
+        } message: { target in
+            Text("Move “\(target.bookmark.label)” from \(rangeDescription(target.bookmark.location)) to \(rangeDescription(target.pane.location)) in “\(target.pane.label)”? The original bytes must match exactly. Its label and note text will be preserved.")
+        }
         .alert("Replace this reading desk?", isPresented: $confirmRestore) {
             Button("Choose checkpoint…", action: chooseCheckpoint)
             Button("Cancel", role: .cancel) { }
@@ -134,6 +143,12 @@ private final class AtlasDeskFileAccess {
                                 Button { model.apply(kind: 5, subject: bookmark.id) } label: { Image(systemName: "bookmark.slash") }
                                     .help("Forget this bookmark and its note")
                             }
+                            Button("Reattach to selected range…") {
+                                panelNotice = ""; reattachment = reattachmentTarget(bookmark)
+                            }
+                            .font(.caption)
+                            .disabled(reattachmentTarget(bookmark) == nil)
+                            .help("Select a nonempty range of the same length in a retained source. Reattachment compares original bytes before moving the note.")
                             if !bookmark.body.isEmpty {
                                 Text(String(bookmark.body.prefix(200))).font(.caption).foregroundStyle(.secondary)
                                     .lineLimit(3).textSelection(.enabled)
@@ -190,6 +205,14 @@ private final class AtlasDeskFileAccess {
                     description: Text("Use Keep in reading desk from a retained reader, capture a file explicitly, or open a saved checkpoint."))
             }
         }.padding(.leading, 12)
+    }
+    private func reattachmentTarget(_ bookmark: AtlasDeskBookmark) -> AtlasDeskReattachment? {
+        guard let state = model.state, let pane = state.active else { return nil }
+        return AtlasDeskReattachment(state: state, bookmark: bookmark, pane: pane)
+    }
+    private func rangeDescription(_ location: AtlasDeskLocation) -> String {
+        let range = location.selection.map { "bytes \($0.start)..<\($0.end)" } ?? "byte \(location.offset)"
+        return "\(range) (capture \(location.file), revision \(location.revision))"
     }
     private func openReader(_ pane: UInt64) {
         guard model.canOperate, readerTask == nil else { return }

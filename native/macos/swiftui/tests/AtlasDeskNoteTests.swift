@@ -8,9 +8,9 @@ private final class NoteFixture: @unchecked Sendable {
         var label: String
         var body: String
         var sequence: UInt64
-        let file: UInt64
-        let offset: UInt64
-        let selection: (UInt64, UInt64)?
+        var file: UInt64
+        var offset: UInt64
+        var selection: (UInt64, UInt64)?
     }
     private let lock = NSLock()
     let owner: UInt64 = 55
@@ -23,6 +23,7 @@ private final class NoteFixture: @unchecked Sendable {
     private var selection: (UInt64, UInt64)? = (2, 7)
     private var marks: [Mark] = []
     private var nextBookmark: UInt64 = 1
+    private var reattachmentRequests = 0
     private var noteRequests = 0
     private var acceptedNotes = 0
     private var stateReads = 0
@@ -40,6 +41,7 @@ private final class NoteFixture: @unchecked Sendable {
             retirementFailed: { fatalError("note desk retirement refused") })
     }
     var requestCount: Int { locked { noteRequests } }
+    var reattachmentCount: Int { locked { reattachmentRequests } }
     var acceptedCount: Int { locked { acceptedNotes } }
     var stateCount: Int { locked { stateReads } }
     var closeCount: Int { locked { closes } }
@@ -49,6 +51,9 @@ private final class NoteFixture: @unchecked Sendable {
     func failNextPage() { locked { failPage = true } }
     func gateNextNote(entered: DispatchSemaphore, resume: DispatchSemaphore) {
         locked { enteredGate = entered; resumeGate = resume }
+    }
+    func selectOtherCapture(start: UInt64 = 2, end: UInt64 = 7) {
+        locked { revision += 1; lastAttempt = revision; file += 1; offset = start; selection = (start, end) }
     }
     func movePane() { locked { revision += 1; lastAttempt = revision; offset = 10; selection = nil } }
     func replaceDesk() {
@@ -66,7 +71,10 @@ private final class NoteFixture: @unchecked Sendable {
     private func locked<Value>(_ work: () -> Value) -> Value { lock.lock(); defer { lock.unlock() }; return work() }
     private func response(_ handle: UInt64, _ request: AtlasDeskRequest) -> String? {
         let isNote: Bool
-        switch request { case .annotate, .editBookmark: isNote = true; default: isNote = false }
+        switch request {
+        case .annotate, .editBookmark, .apply(_, _, 12, _, _, _, _): isNote = true
+        default: isNote = false
+        }
         let gates = locked { () -> (DispatchSemaphore?, DispatchSemaphore?) in
             guard isNote else { return (nil, nil) }
             let gates = (enteredGate, resumeGate); enteredGate = nil; resumeGate = nil; return gates
@@ -100,6 +108,7 @@ private final class NoteFixture: @unchecked Sendable {
                 revision = attempt; acceptedNotes += 1
                 return noteReply()
             case .apply(let expected, let attempt, let kind, let subject, let start, let end, let label):
+                if kind == 12 { reattachmentRequests += 1 }
                 guard admit(expected, attempt) else { return error("DESK_STALE_ATTEMPT") }
                 switch kind {
                 case 1: offset = start; selection = nil
@@ -111,6 +120,19 @@ private final class NoteFixture: @unchecked Sendable {
                     guard let mark = marks.first(where: { $0.id == subject }) else { return error("DESK_INVALID_BOOKMARK") }
                     file = mark.file; offset = mark.offset; selection = mark.selection
                 case 5: marks.removeAll { $0.id == subject }
+                case 12:
+                    if rejectMutation { rejectMutation = false; return error("DESK_CANCELED") }
+                    guard start == pane, let index = marks.firstIndex(where: { $0.id == subject }),
+                          marks[index].sequence == end, end < UInt64.max else { return error("DESK_STALE_BOOKMARK") }
+                    guard let old = marks[index].selection, let selected = selection,
+                          old.0 < old.1, selected.0 < selected.1 else { return error("DESK_INVALID_LOCATION") }
+                    let bytes = Array(source.utf8)
+                    guard bytes[Int(old.0)..<Int(old.1)].elementsEqual(bytes[Int(selected.0)..<Int(selected.1)]) else {
+                        return error("DESK_SELECTION_MISMATCH")
+                    }
+                    marks[index].file = file; marks[index].offset = offset; marks[index].selection = selection
+                    marks[index].sequence += 1; revision = attempt
+                    return noteReply()
                 default: return error("DESK_UNSUPPORTED_FIXTURE_COMMAND")
                 }
                 revision = attempt; return encode(state())
@@ -197,6 +219,8 @@ private final class NoteFixture: @unchecked Sendable {
         await lostOutcomes()
         await staleAndChangedDrafts()
         await canceledDelivery()
+        await reattachmentOutcomes()
+        await reattachmentGuardsAndCancellation()
         print("Desk note decoding, exact anchors, edit sequences, preserved drafts, lost replies and cancellation source fixtures passed")
     }
 
@@ -326,6 +350,81 @@ private final class NoteFixture: @unchecked Sendable {
                 }
                 precondition(fixture.closeCount == 1)
             } else { precondition(model.state?.bookmarks.count == 1); model.close() }
+        }
+    }
+
+
+    @MainActor static func reattachmentOutcomes() async {
+        for lostReads in [-1, 0, 1] {
+            let fixture = NoteFixture()
+            fixture.seedBookmark(label: "Café", body: "Original e\u{301}\u{0} note")
+            fixture.selectOtherCapture()
+            let model = await started(fixture), before = model.state!.bookmarks[0]
+            let target = AtlasDeskReattachment(state: model.state!, bookmark: before, pane: model.state!.active!)!
+            if lostReads >= 0 { fixture.loseNextReply(stateFailures: lostReads) }
+            if lostReads == -1 { fixture.failNextPage() }
+            model.reattachBookmark(target); await idle(model)
+            precondition(fixture.reattachmentCount == 1, "a lost reply must never replay reattachment")
+            if lostReads == 1 {
+                precondition(model.state == nil && model.notice.contains("could not be verified"))
+                model.reattachBookmark(target)
+                precondition(fixture.reattachmentCount == 1, "an unverified state cannot authorize a retry")
+                model.reload(); await idle(model)
+            } else {
+                precondition(model.notice.contains("Reattached the saved note"))
+                if lostReads == -1 {
+                    precondition(model.page == nil && model.notice.contains("source page is unavailable"))
+                }
+            }
+            let saved = model.state!.bookmarks[0]
+            precondition(saved.id == before.id && saved.updateSequence == before.updateSequence + 1)
+            precondition(saved.location == target.pane.location && saved.location != before.location)
+            precondition(saved.label.utf8.elementsEqual(before.label.utf8) && saved.body.utf8.elementsEqual(before.body.utf8))
+            precondition(!target.isCurrent(in: model.state))
+            precondition(AtlasDeskReattachment(state: model.state!, bookmark: saved, pane: model.state!.active!) == nil)
+            model.apply(kind: 4, subject: saved.id); await idle(model)
+            precondition(model.state?.active?.location == target.pane.location, "recall uses the accepted destination")
+            model.close()
+        }
+        let changed = NoteFixture(); changed.seedBookmark(body: "Do not move me")
+        changed.selectOtherCapture(start: 3, end: 8)
+        let model = await started(changed), original = model.state!.bookmarks[0]
+        let target = AtlasDeskReattachment(state: model.state!, bookmark: original, pane: model.state!.active!)!
+        model.reattachBookmark(target); await idle(model)
+        precondition(changed.reattachmentCount == 1 && model.notice.contains("not accepted"))
+        precondition(model.state?.bookmarks[0].location == original.location && model.state?.bookmarks[0].updateSequence == 1)
+        model.close()
+    }
+
+    @MainActor static func reattachmentGuardsAndCancellation() async {
+        for changedNote in [false, true] {
+            let fixture = NoteFixture(); fixture.seedBookmark(body: "Preserve original")
+            fixture.selectOtherCapture()
+            let model = await started(fixture)
+            let target = AtlasDeskReattachment(state: model.state!, bookmark: model.state!.bookmarks[0], pane: model.state!.active!)!
+            if changedNote { fixture.changeNoteElsewhere() } else { fixture.movePane() }
+            model.reload(); await idle(model)
+            model.reattachBookmark(target); await idle(model)
+            precondition(fixture.reattachmentCount == 0 && model.notice.contains("changed after confirmation"))
+            model.close()
+        }
+        let fixture = NoteFixture(); fixture.seedBookmark(body: "Canceled delivery")
+        fixture.selectOtherCapture()
+        let model = await started(fixture)
+        let target = AtlasDeskReattachment(state: model.state!, bookmark: model.state!.bookmarks[0], pane: model.state!.active!)!
+        let gate = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
+        fixture.loseNextReply(); fixture.gateNextNote(entered: gate, resume: resume)
+        model.reattachBookmark(target); await entered(gate); model.cancel(); resume.signal(); await idle(model)
+        precondition(fixture.reattachmentCount == 1 && model.state?.bookmarks[0].location == target.pane.location)
+        precondition(model.notice.contains("Reattached the saved note"), "entered cancellation must reconcile the actual accepted mapping")
+        model.close()
+
+        for sequence in [UInt64(1), UInt64.max] {
+            let invalid = NoteFixture(); invalid.seedBookmark(sequence: sequence)
+            invalid.selectOtherCapture(start: 2, end: sequence == 1 ? 2 : 7)
+            let desk = await started(invalid)
+            precondition(AtlasDeskReattachment(state: desk.state!, bookmark: desk.state!.bookmarks[0], pane: desk.state!.active!) == nil)
+            precondition(invalid.reattachmentCount == 0); desk.close()
         }
     }
 

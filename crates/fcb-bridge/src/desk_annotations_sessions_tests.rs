@@ -82,3 +82,74 @@ fn note_admission_errors_do_not_remove_prior_notes_or_capture_bytes() {
     assert_eq!(number(state.as_str(), "retained_source_bytes"), 12);
     assert!(state.as_str().contains("\"update_sequence\":\"1\""));
 }
+
+
+#[test]
+fn native_apply_kind_twelve_maps_only_the_explicit_captured_selection() {
+    let (desks, handle, pane) = populated();
+    let added = desks.execute(handle, Command::Annotate { expected: 1, attempt: 2,
+        pane, label: "Evidence", body: "Preserve rationale\0exactly." }, || false).unwrap();
+    let bookmark = number(added.as_str(), "bookmark");
+    let target = desks.with_session(handle, || false, |desk, stop| {
+        let owner = desk.model().owner();
+        let source = SourceCapture::from_bytes(owner, FileId::new(owner, 2).unwrap(),
+            SourceRevision::new(owner, 2).unwrap(), "chosen.rs", b"prefix exact".to_vec()).unwrap();
+        Ok(desk.adopt(2, 3, source, 7, Some(range(7, 12)?), &mut *stop)?.active.unwrap().get())
+    }).unwrap();
+    let mapped = desks.execute(handle, Command::Apply { expected: 3, attempt: 4, kind: 12,
+        subject: bookmark, start: target, end: 1, label: "" }, || false).unwrap();
+    assert_eq!(number(mapped.as_str(), "model_revision"), 4);
+    assert!(mapped.as_str().contains("\"body\":\"Preserve rationale\\u0000exactly.\""));
+    assert!(mapped.as_str().contains("\"update_sequence\":\"2\""));
+    assert!(mapped.as_str().contains("\"initial_source_bytes_read\":\"0\""));
+    desks.with_session(handle, || false, |desk, _| {
+        let mark = &desk.model().bookmarks()[0];
+        assert_eq!(mark.id(), bookmark);
+        assert_eq!(mark.location().selection, Some(range(7, 12)?));
+        assert_eq!(mark.location().revision.get(), 2);
+        assert_eq!(mark.body(), "Preserve rationale\0exactly.");
+        Ok(())
+    }).unwrap();
+    assert!(matches!(desks.execute(handle, Command::Apply { expected: 4, attempt: 5, kind: 12,
+        subject: bookmark, start: target, end: 1, label: "" }, || false),
+        Err(AccessError::Desk(DeskSessionError::Desk(DeskError::StaleBookmark)))));
+    let state = desks.execute(handle, Command::State, || false).unwrap();
+    assert_eq!(number(state.as_str(), "model_revision"), 4);
+    assert_eq!(number(state.as_str(), "last_attempt"), 5);
+    assert!(state.as_str().contains("\"update_sequence\":\"2\""));
+}
+
+#[test]
+fn lost_reattachment_delivery_keeps_one_committed_mapping_for_reconciliation() {
+    let (desks, handle, pane) = populated();
+    desks.execute(handle, Command::Annotate { expected: 1, attempt: 2,
+        pane, label: "Keep", body: "Saved once" }, || false).unwrap();
+    let target = desks.with_session(handle, || false, |desk, stop| {
+        let owner = desk.model().owner();
+        let source = SourceCapture::from_bytes(owner, FileId::new(owner, 2).unwrap(),
+            SourceRevision::new(owner, 2).unwrap(), "new.rs", b"new exact".to_vec()).unwrap();
+        Ok(desk.adopt(2, 3, source, 4, Some(range(4, 9)?), &mut *stop)?.active.unwrap())
+    }).unwrap();
+    let lost = desks.with_session(handle, || false, |desk, _| {
+        desk.apply(3, 4, DeskCommand::ReattachBookmark {
+            bookmark: 1, expected_update_sequence: 1, pane: target,
+        }, || false)?;
+        desks.cancel(handle)?;
+        Ok(desk.state(|| false)?)
+    });
+    assert!(matches!(lost, Err(AccessError::Canceled)));
+    let recovered = desks.execute(handle, Command::State, || false).unwrap();
+    assert_eq!(number(recovered.as_str(), "model_revision"), 4);
+    assert_eq!(number(recovered.as_str(), "last_attempt"), 4);
+    assert!(recovered.as_str().contains("\"update_sequence\":\"2\""));
+    assert!(matches!(desks.execute(handle, Command::Apply { expected: 4, attempt: 4, kind: 12,
+        subject: 1, start: target.get(), end: 1, label: "" }, || false),
+        Err(AccessError::Desk(DeskSessionError::Desk(DeskError::StaleAttempt)))));
+    desks.with_session(handle, || false, |desk, _| {
+        let mark = &desk.model().bookmarks()[0];
+        assert_eq!(mark.location().selection, Some(range(4, 9)?));
+        assert_eq!(mark.body(), "Saved once");
+        assert_eq!(mark.update_sequence(), 2);
+        Ok(())
+    }).unwrap();
+}

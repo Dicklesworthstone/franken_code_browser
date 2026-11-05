@@ -46,3 +46,37 @@ fn note_abi_keeps_embedded_nuls_and_refuses_bad_lengths_or_utf8_before_mutation(
     assert_eq!(ok(fcb_desk_state(desk)).matches("\"bookmark\":").count(), 1);
     assert_eq!(fcb_desk_close(desk), 1);
 }
+
+
+#[test]
+fn apply_abi_reattaches_to_verified_retained_bytes_without_reopening_the_path() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
+    let desk = fcb_desk_create(); assert_ne!(desk, 0); ok(fcb_desk_start(desk));
+    let root = std::env::temp_dir().join(format!("fcb-desk-reattach-abi-{}-{desk}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let source = root.join("source.rs"); fs::write(&source, b"old exact").unwrap();
+    let path = CString::new(source.as_os_str().as_encoded_bytes()).unwrap();
+    let opened = ok(unsafe { fcb_desk_open(desk, 0, 1, path.as_ptr()) });
+    let pane = number(&opened, "pane");
+    ok(unsafe { fcb_desk_apply(desk, 1, 2, 2, pane, 4, 9, std::ptr::null()) });
+    let label = CString::new("My reason").unwrap(); let body = b"Keep this note\0exactly.";
+    let annotated = ok(unsafe { fcb_desk_annotate(desk, 2, 3, pane,
+        label.as_ptr(), body.as_ptr(), body.len() as u64) });
+    let bookmark = number(&annotated, "bookmark");
+    fs::write(&source, b"new prefix exact").unwrap();
+    let target = ok(unsafe { fcb_desk_open(desk, 3, 4, path.as_ptr()) });
+    let pane = number(&target, "pane");
+    ok(unsafe { fcb_desk_apply(desk, 4, 5, 2, pane, 11, 16, std::ptr::null()) });
+    fs::write(&source, b"unrelated live replacement").unwrap();
+    let mapped = ok(unsafe { fcb_desk_apply(desk, 5, 6, 12, bookmark, pane, 1, std::ptr::null()) });
+    assert_eq!(number(&mapped, "model_revision"), 6);
+    assert!(mapped.contains("\"body\":\"Keep this note\\u0000exactly.\""));
+    assert!(mapped.contains("\"update_sequence\":\"2\""));
+    let page = ok(fcb_desk_window(desk, 6, pane, 0, 64));
+    assert!(page.contains("\"selection\":{\"start\":\"11\",\"end\":\"16\"}"));
+    assert!(page.contains("\"text\":\"new prefix exact\""));
+    let stale = consume(unsafe { fcb_desk_apply(desk, 6, 7, 12, bookmark, pane, 1, std::ptr::null()) });
+    assert!(stale.contains("DESK_STALE_BOOKMARK"));
+    assert_eq!(number(&ok(fcb_desk_state(desk)), "model_revision"), 6);
+    assert_eq!(fcb_desk_close(desk), 1);
+}

@@ -373,3 +373,39 @@ fn cancellation_during_note_restore_preserves_all_previous_notes() {
         assert_eq!(target.source(pane, 2).unwrap().bytes(), b"existing");
     }
 }
+
+
+#[test]
+fn reattached_annotation_checkpoint_keeps_the_chosen_capture_and_personal_sequence() {
+    let mut original = desk(700, DeskLimits::default());
+    let old = open(&mut original, 10, 20, b"old exact bytes");
+    apply(&mut original, DeskCommand::Navigate { pane: old, offset: 4, selection: Some(range(4, 9)) });
+    let bookmark = apply(&mut original, DeskCommand::Annotate {
+        pane: old, label: "User label".into(), body: "Original rationale.\n\0".into(),
+    }).created_bookmark.unwrap();
+    let target = open(&mut original, 10, 21, b"new prefix exact bytes");
+    apply(&mut original, DeskCommand::Navigate { pane: target, offset: 11, selection: Some(range(11, 16)) });
+    apply(&mut original, DeskCommand::ClearHistory);
+    apply(&mut original, DeskCommand::ReattachBookmark {
+        bookmark, expected_update_sequence: 1, pane: target,
+    });
+    apply(&mut original, DeskCommand::Close(target));
+    apply(&mut original, DeskCommand::ClearHistory);
+    assert_eq!(original.retained_source_count(), 1);
+    let checkpoint = save(&original, 2000);
+    let mut restored = desk(701, DeskLimits::default());
+    restored.restore_checkpoint(0, 1, checkpoint.bytes(), alloc(2001), || false).unwrap();
+    let mark = &restored.bookmarks()[0];
+    assert_eq!(mark.label(), "User label");
+    assert_eq!(mark.body(), "Original rationale.\n\0");
+    assert_eq!(mark.update_sequence(), 2);
+    assert_eq!(mark.location().selection, Some(range(11, 16)));
+    assert_eq!(mark.location().offset, 11);
+    assert_eq!(mark.location().file.owner(), restored.owner());
+    let bookmark = mark.id();
+    apply(&mut restored, DeskCommand::RecallBookmark(bookmark));
+    let pane = restored.active().unwrap();
+    assert_eq!(restored.selected_bytes(pane, restored.revision()).unwrap(), b"exact");
+    assert_eq!(restored.source(pane, restored.revision()).unwrap().bytes(), b"new prefix exact bytes");
+    assert_eq!(restored.retained_source_count(), 1);
+}

@@ -188,6 +188,11 @@ impl DeskSessions {
                         7 => DeskCommand::Pin { pane: pane()?, pinned: false },
                         8 => DeskCommand::Close(pane()?), 9 => DeskCommand::Back, 10 => DeskCommand::Forward,
                         11 => DeskCommand::ClearHistory,
+                        // This explicit mapping uses two independently captured ranges.
+                        // A note sequence is not a byte endpoint for this command.
+                        12 => DeskCommand::ReattachBookmark { bookmark: subject,
+                            pane: desk.model().pane_id(start).map_err(DeskSessionError::from)?,
+                            expected_update_sequence: end },
                         _ => return Err(AccessError::InvalidArgument),
                     };
                     desk.apply(expected, attempt, command, &mut *stop)?;

@@ -123,6 +123,58 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
         apply(kind: 3, subject: pane.id, label: bookmarkLabel)
     }
 
+
+    /// Submit the confirmed source mapping once. A lost reply triggers only a
+    /// state read, so it cannot move the note twice or consume another version.
+    func reattachBookmark(_ target: AtlasDeskReattachment) {
+        guard target.isCurrent(in: state) else {
+            notice = AtlasReadingDeskError.staleReattachment.message; return
+        }
+        perform { model, _, cancellation in
+            let lease = try await model.ensureStarted(cancellation)
+            guard target.isCurrent(in: model.state) else { throw AtlasReadingDeskError.staleReattachment }
+            let attempt = try model.nextAttempt(), request = target.request(attempt: attempt)
+            let transport = model.transport
+            let accepted: AtlasDeskState
+            do {
+                let json = try await model.io.perform(keepingAlive: [lease], cancellation: cancellation) {
+                    transport.run(lease.handle, request)
+                }
+                let receipt = try AtlasDeskState.decode(json, handle: lease.handle, acceptedAttempt: attempt)
+                guard case .accepted = target.outcome(in: receipt, attempt: attempt) else {
+                    throw AtlasReadingDeskError.invalidResponse
+                }
+                accepted = receipt
+            } catch {
+                do {
+                    let json = try await model.io.perform(keepingAlive: [lease]) {
+                        transport.run(lease.handle, .state)
+                    }
+                    accepted = try AtlasDeskState.decode(json, handle: lease.handle)
+                } catch {
+                    if !model.closed { model.state = nil; model.page = nil }
+                    model.notice = "The reattachment outcome could not be verified. Reload state to inspect the saved note before choosing another destination."
+                    return
+                }
+            }
+            guard !model.closed else { return }
+            model.state = accepted; model.page = nil
+            let message: String
+            switch target.outcome(in: accepted, attempt: attempt) {
+            case .accepted:
+                message = "Reattached the saved note to the selected range after comparing its original bytes. Its label and text are preserved. Save a new checkpoint to retain this change."
+            case .notAccepted:
+                message = "Reattachment was not accepted. The saved note is unchanged; select a nonempty range with identical bytes and review the destination again."
+            case .unconfirmed:
+                message = "The reattachment outcome remains unconfirmed. Inspect the saved note and its source range before choosing another destination."
+            }
+            // A page failure cannot turn a verified mapping into a failed
+            // mutation or erase its accepted state.
+            do { try await model.loadPage(lease); model.notice = message }
+            catch { model.page = nil; model.notice = message + " The source page is unavailable; reload state to retry reading it." }
+        }
+    }
+
     /// Save only against the editor's original anchor/version. An entered
     /// mutation may commit before cancellation or a lost reply, so reconciliation
     /// decides the outcome and the caller keeps an unresolved submission.

@@ -43,7 +43,7 @@ impl Default for DeskLimits {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeskError {
     InvalidLimits, OwnerMismatch, StaleRevision, StaleAttempt, InvalidLocation,
-    MissingPane, MissingSource, MissingBookmark, NoActivePane, EmptyHistory,
+    MissingPane, MissingSource, MissingBookmark, StaleBookmark, SelectionMismatch, NoActivePane, EmptyHistory,
     PaneLimit, SourceLimit, RetainedByteLimit, BookmarkLimit, InvalidLabel, InvalidBody,
     IdentityConflict, IdentityExhausted, ResourceDenied, Canceled,
 }
@@ -54,6 +54,7 @@ impl DeskError {
             Self::StaleRevision => "DESK_STALE_REVISION", Self::StaleAttempt => "DESK_STALE_ATTEMPT",
             Self::InvalidLocation => "DESK_INVALID_LOCATION", Self::MissingPane => "DESK_MISSING_PANE",
             Self::MissingSource => "DESK_MISSING_SOURCE", Self::MissingBookmark => "DESK_MISSING_BOOKMARK",
+            Self::StaleBookmark => "DESK_STALE_BOOKMARK", Self::SelectionMismatch => "DESK_SELECTION_MISMATCH",
             Self::NoActivePane => "DESK_NO_ACTIVE_PANE", Self::EmptyHistory => "DESK_EMPTY_HISTORY",
             Self::PaneLimit => "DESK_PANE_LIMIT", Self::SourceLimit => "DESK_SOURCE_LIMIT",
             Self::RetainedByteLimit => "DESK_RETAINED_BYTE_LIMIT", Self::BookmarkLimit => "DESK_BOOKMARK_LIMIT",
@@ -129,6 +130,13 @@ pub enum DeskCommand {
     Annotate { pane: DeskPaneId, label: String, body: String },
     /// Edit personal text without changing its capture or selected byte range.
     EditBookmark { bookmark: u64, label: String, body: String },
+    /// Deliberately move a personal anchor to the target pane's selected range.
+    /// The expected desk revision binds both captured locations; the sequence
+    /// also guards against a stale note card. Both selections must be nonempty
+    /// and byte-identical. The host authorizes this specific correspondence:
+    /// equal bytes do not establish file continuity or an automatic rename.
+    /// Keep personal text and bookmark identity; increment its update sequence.
+    ReattachBookmark { bookmark: u64, expected_update_sequence: u64, pane: DeskPaneId },
     RecallBookmark(u64),
     ForgetBookmark(u64),
     ClearHistory,
@@ -370,6 +378,18 @@ impl ReadingDesk {
                 mark.body = personal_text(&body, MAX_ANNOTATION_BODY_BYTES)?;
                 mark.update_sequence = sequence;
             }
+            DeskCommand::ReattachBookmark { bookmark, expected_update_sequence, pane } => {
+                let index = next.bookmarks.iter().position(|mark| mark.id == bookmark)
+                    .ok_or(DeskError::MissingBookmark)?;
+                let mark = &next.bookmarks[index];
+                if mark.update_sequence != expected_update_sequence { return Err(DeskError::StaleBookmark); }
+                let sequence = mark.update_sequence.checked_add(1).ok_or(DeskError::IdentityExhausted)?;
+                let target = location(&next, self.owner, pane)?;
+                verify_reattachment(&next, mark.location, target, &mut canceled)?;
+                let mark = &mut next.bookmarks[index];
+                mark.location = target;
+                mark.update_sequence = sequence;
+            }
             DeskCommand::RecallBookmark(id) => {
                 let at = next.bookmarks.iter().find(|b| b.id == id).ok_or(DeskError::MissingBookmark)?.location;
                 let at = open_location(&mut next, self.owner, self.limits, at, false)?;
@@ -487,6 +507,26 @@ fn add_bookmark(state: &mut State, owner: ArenaOwnerId, limits: DeskLimits,
     let body = personal_text(body, MAX_ANNOTATION_BODY_BYTES)?;
     state.bookmarks.push(DeskBookmark { id, label, body, update_sequence: 1, location: at });
     Ok(id)
+}
+/// Compare the two explicitly selected original-byte ranges without allocating
+/// decoded text, guessing a path mapping, or scanning for a convenient match.
+/// Long selections check cancellation between bounded comparison chunks.
+fn verify_reattachment(state: &State, original: DeskLocation, target: DeskLocation,
+    canceled: &mut impl FnMut() -> bool) -> Result<(), DeskError> {
+    let old = selection_bytes(state, original)?;
+    let new = selection_bytes(state, target)?;
+    if old.is_empty() || new.is_empty() { return Err(DeskError::InvalidLocation); }
+    if old.len() != new.len() { return Err(DeskError::SelectionMismatch); }
+    for (before, after) in old.chunks(16 * 1024).zip(new.chunks(16 * 1024)) {
+        check(canceled)?;
+        if before != after { return Err(DeskError::SelectionMismatch); }
+    }
+    Ok(())
+}
+fn selection_bytes(state: &State, at: DeskLocation) -> Result<&[u8], DeskError> {
+    let selected = at.selection.ok_or(DeskError::InvalidLocation)?;
+    let (start, end) = selected.as_usize_bounds().map_err(|_| DeskError::InvalidLocation)?;
+    source(state, at.file, at.revision)?.bytes().get(start..end).ok_or(DeskError::InvalidLocation)
 }
 fn check(canceled: &mut impl FnMut() -> bool) -> Result<(), DeskError> {
     if canceled() { Err(DeskError::Canceled) } else { Ok(()) }

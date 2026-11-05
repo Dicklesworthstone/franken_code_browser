@@ -26,7 +26,13 @@ char *fcb_desk_state(uint64_t handle);
 char *fcb_desk_open(uint64_t handle, uint64_t expected, uint64_t attempt, const char *path);
 /* kind: 0 focus pane; 1 navigate pane/start; 2 select pane/[start,end);
  * 3 bookmark pane/label; 4 recall bookmark; 5 forget bookmark; 6 pin pane;
- * 7 unpin pane; 8 close pane; 9 back; 10 forward; 11 clear history.
+ * 7 unpin pane; 8 close pane; 9 back; 10 forward; 11 clear history;
+ * 12 deliberately reattach bookmark: subject=bookmark, start=target pane,
+ * end=expected bookmark update_sequence. The current model_revision binds both
+ * captured locations. Both selections must be nonempty and byte-identical.
+ * This explicit correspondence preserves label/body/ID, increments the note
+ * sequence, and grants no file continuity or live-path access. Stale or
+ * mismatching selections leave the original note and anchor unchanged.
  * subject is pane or bookmark as appropriate. Label is <=256 UTF-8 bytes;
  * null is empty and accepted for commands that do not use a label. */
 char *fcb_desk_apply(uint64_t handle, uint64_t expected, uint64_t attempt,

@@ -1,13 +1,14 @@
 import Foundation
 
 enum AtlasReadingDeskError: Error, Sendable {
-    case unavailable, invalidInput, invalidNote, staleNote, invalidResponse, canceled, engine(String)
+    case unavailable, invalidInput, invalidNote, staleNote, staleReattachment, invalidResponse, canceled, engine(String)
     var message: String {
         switch self {
         case .unavailable: return "The reading desk could not admit this operation."
         case .invalidInput: return "Choose a valid file, byte range or bookmark label (up to 256 UTF-8 bytes)."
         case .invalidNote: return "Use a nonempty label up to 256 UTF-8 bytes without NUL, and note text up to 16 KiB."
         case .staleNote: return "The original source range or saved note version has changed. Your draft is preserved; reopen the current note or choose a current range before saving."
+        case .staleReattachment: return "The saved note or selected destination changed after confirmation. Select the current range and review the reattachment again."
         case .invalidResponse: return "The reading desk response could not be verified. Reload its accepted state before continuing."
         case .canceled: return "The operation was canceled before its next request began."
         case .engine(let code): return "Reading desk operation unavailable (\(code))."
@@ -182,6 +183,60 @@ enum AtlasDeskNoteOutcome: Sendable {
     case accepted(AtlasDeskBookmark)
     case notAccepted
     case unconfirmed(AtlasDeskNoteSubmission)
+}
+
+
+/// A deliberate destination freezes both the note version and the selected
+/// captured range. The engine compares original bytes; matching lengths here
+/// only make a useful candidate and never establish source identity.
+struct AtlasDeskReattachment: Sendable {
+    let owner: UInt64
+    let baseRevision: UInt64
+    let bookmark: AtlasDeskBookmark
+    let pane: AtlasDeskPane
+    let priorBookmarks: Set<UInt64>
+
+    init?(state: AtlasDeskState, bookmark: AtlasDeskBookmark, pane: AtlasDeskPane) {
+        guard let old = bookmark.location.selection, let selected = pane.location.selection,
+              old.start < old.end, selected.start < selected.end,
+              old.end - old.start == selected.end - selected.start,
+              bookmark.updateSequence < UInt64.max, bookmark.location != pane.location else { return nil }
+        owner = state.owner; baseRevision = state.revision
+        self.bookmark = bookmark; self.pane = pane
+        priorBookmarks = Set(state.bookmarks.map(\.id))
+        guard isCurrent(in: state) else { return nil }
+    }
+    func isCurrent(in state: AtlasDeskState?) -> Bool {
+        guard let state, state.owner == owner, state.revision == baseRevision,
+              state.activePane == pane.id,
+              state.panes.first(where: { $0.id == pane.id })?.location == pane.location,
+              let current = state.bookmarks.first(where: { $0.id == bookmark.id }) else { return false }
+        return current.location == bookmark.location && current.updateSequence == bookmark.updateSequence
+            && current.label.utf8.elementsEqual(bookmark.label.utf8)
+            && current.body.utf8.elementsEqual(bookmark.body.utf8)
+    }
+    func request(attempt: UInt64) -> AtlasDeskRequest {
+        .apply(revision: baseRevision, attempt: attempt, kind: 12, subject: bookmark.id,
+            start: pane.id, end: bookmark.updateSequence, label: "")
+    }
+    func outcome(in state: AtlasDeskState, attempt: UInt64) -> AtlasDeskReattachmentOutcome {
+        guard state.owner == owner, state.revision >= baseRevision, attempt > baseRevision else { return .unconfirmed }
+        // Called only after the mutation has drained. A lower accepted revision
+        // proves nonacceptance; an advanced or unrelated state is not a receipt.
+        if state.revision < attempt { return .notAccepted }
+        guard state.revision == attempt, state.lastAttempt >= attempt,
+              Set(state.bookmarks.map(\.id)) == priorBookmarks,
+              let current = state.bookmarks.first(where: { $0.id == bookmark.id }),
+              current.updateSequence == bookmark.updateSequence + 1,
+              current.location == pane.location,
+              current.label.utf8.elementsEqual(bookmark.label.utf8),
+              current.body.utf8.elementsEqual(bookmark.body.utf8) else { return .unconfirmed }
+        return .accepted
+    }
+}
+
+enum AtlasDeskReattachmentOutcome: Sendable {
+    case accepted, notAccepted, unconfirmed
 }
 
 struct AtlasDeskState: Sendable {
