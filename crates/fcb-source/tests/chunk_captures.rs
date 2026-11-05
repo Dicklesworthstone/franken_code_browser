@@ -13,6 +13,7 @@
 //!    never silently substitutes live file bytes or newer revisions.
 
 use std::fs;
+use std::io::{self, Read};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -259,4 +260,79 @@ fn negative_control_evicted_capture_never_reads_live_source() {
     // Querying rev_new returns its own distinct bytes
     let new_res = store.resolve_anchor(f, rev_new, range(0, 9)).unwrap();
     assert_eq!(new_res.bytes(), b"NEW_MUTAT");
+}
+
+#[test]
+fn cancellation_stops_short_reads_interruptions_and_eof_before_publication() {
+    struct CancelingReader<'a> {
+        cancel: &'a CancelFlag,
+        outcome: u8,
+        calls: usize,
+    }
+    impl Read for CancelingReader<'_> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            self.calls += 1;
+            assert_eq!(self.calls, 1, "a canceled source must not be read again");
+            self.cancel.cancel();
+            match self.outcome {
+                0 => { output[0] = b'x'; Ok(1) }
+                1 => Err(io::ErrorKind::Interrupted.into()),
+                _ => Ok(0),
+            }
+        }
+    }
+    let config = ChunkedReaderConfig {
+        chunk_size: ChunkSize::bounded(16).unwrap(),
+        max_payload_bytes: ByteLength::new(64),
+    };
+    for outcome in 0..3 {
+        let cancel = CancelFlag::new();
+        let mut reader = CancelingReader { cancel: &cancel, outcome, calls: 0 };
+        assert_eq!(
+            SafeChunkReader::read_from_reader(request(110, 1, 1), &mut reader, config, None, &cancel),
+            Err(SourceError::Canceled),
+        );
+        assert_eq!(reader.calls, 1);
+    }
+}
+
+#[test]
+fn repeated_interruptions_have_a_finite_retry_bound_without_cancellation() {
+    struct InterruptedReader { calls: usize }
+    impl Read for InterruptedReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            self.calls += 1;
+            assert!(self.calls <= 64, "interrupted source spun without a retry bound");
+            Err(io::ErrorKind::Interrupted.into())
+        }
+    }
+    let mut reader = InterruptedReader { calls: 0 };
+    let result = SafeChunkReader::read_from_reader(
+        request(111, 1, 1), &mut reader, ChunkedReaderConfig::default(), None, &CancelFlag::new(),
+    );
+    assert_eq!(result, Err(SourceError::RootUnavailable));
+    assert!(reader.calls <= 33);
+}
+
+#[test]
+fn interrupted_retry_budget_resets_after_each_successful_short_read() {
+    struct InterruptedBursts { at: usize, interruptions: usize }
+    impl Read for InterruptedBursts {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.at == 3 { return Ok(0); }
+            if self.interruptions < 32 {
+                self.interruptions += 1;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.interruptions = 0;
+            output[0] = b"abc"[self.at];
+            self.at += 1;
+            Ok(1)
+        }
+    }
+    let mut reader = InterruptedBursts { at: 0, interruptions: 0 };
+    let capture = SafeChunkReader::read_from_reader(
+        request(112, 1, 1), &mut reader, ChunkedReaderConfig::default(), Some(3), &CancelFlag::new(),
+    ).unwrap();
+    assert_eq!(capture.range_read(range(0, 3)).unwrap().bytes(), b"abc");
 }

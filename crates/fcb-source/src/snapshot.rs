@@ -15,6 +15,7 @@
 //! returns an explicit stale/diverged result; opening current source is deliberate.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
@@ -186,9 +187,10 @@ pub struct BoundedRetryReader;
 impl BoundedRetryReader {
     /// Read a file with bounded retries on concurrent modification.
     ///
-    /// If after `policy.max_retries` attempts the file is still changing, does NOT
-    /// invent an atomic snapshot. Publishes an `ObservedSnapshot` marked
-    /// `DivergedDuringRead` containing the bytes actually observed in the last attempt.
+    /// Each attempt opens once: its before/after metadata and source bytes
+    /// describe that same file descriptor, even if the path is replaced.
+    /// After the last retry, a complete changing observation is published as
+    /// `DivergedDuringRead`, never as an invented atomic snapshot.
     pub fn read_file_with_retry(
         request: CaptureRequest,
         path: &Path,
@@ -197,97 +199,72 @@ impl BoundedRetryReader {
         cancel: &CancelFlag,
     ) -> Result<ObservedSnapshot, SourceError> {
         let mut retries: u32 = 0;
-
         loop {
             if cancel.is_canceled() {
                 return Err(SourceError::Canceled);
             }
-
-            let file = safe_open_regular_file(path)?;
-            let stat_before = file.metadata().map_err(|_| SourceError::RootUnavailable)?;
-
-            if !stat_before.is_file() {
-                return Err(SourceError::SpecialObject);
-            }
-
-            let initial_len = stat_before.len();
-            if initial_len > config.max_payload_bytes.get() {
-                return Err(SourceError::PayloadTooLarge);
-            }
-
-            let initial_mtime = stat_before
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_micros() as u64);
-
-            let read_outcome = SafeChunkReader::read_file(request, path, config, cancel);
-
-            let file_after = safe_open_regular_file(path)?;
-            let stat_after = file_after.metadata().map_err(|_| SourceError::RootUnavailable)?;
-            let final_len = stat_after.len();
-            let final_mtime = stat_after
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_micros() as u64);
-
-            let changed = initial_len != final_len || initial_mtime != final_mtime;
-
-            match read_outcome {
-                Ok(chunked_capture) if !changed => {
-                    // Clean settled read!
-                    let meta = FileObservationMetadata {
-                        initial_len,
-                        final_len,
-                        initial_modified_micros: initial_mtime,
-                        final_modified_micros: final_mtime,
-                        retries_attempted: retries,
-                        consistency: ObservedSnapshotConsistency::VerifiedMatch,
-                    };
-                    return ObservedSnapshot::new(
-                        request.file(),
-                        request.revision(),
-                        SnapshotBacking::Complete(chunked_capture),
-                        meta,
-                    );
-                }
-                Ok(chunked_capture) => {
-                    // Read succeeded but file modified concurrently
-                    if retries < policy.max_retries {
-                        retries += 1;
-                        continue;
+            let mut file = safe_open_regular_file(path)?;
+            match Self::observe_open_file(request, &mut file, config, retries, cancel) {
+                Ok(snapshot) => {
+                    if snapshot.is_settled() || retries >= policy.max_retries {
+                        return Ok(snapshot);
                     }
-
-                    // Retries exhausted: publish truthful diverged observation
-                    let meta = FileObservationMetadata {
-                        initial_len,
-                        final_len,
-                        initial_modified_micros: initial_mtime,
-                        final_modified_micros: final_mtime,
-                        retries_attempted: retries,
-                        consistency: ObservedSnapshotConsistency::DivergedDuringRead,
-                    };
-                    return ObservedSnapshot::new(
-                        request.file(),
-                        request.revision(),
-                        SnapshotBacking::Complete(chunked_capture),
-                        meta,
-                    );
                 }
-                Err(SourceError::ConcurrentModification) => {
-                    if retries < policy.max_retries {
-                        retries += 1;
-                        continue;
-                    }
-
-                    // Retries exhausted and cannot form complete capture:
-                    // Return typed concurrent modification error without inventing data.
-                    return Err(SourceError::ConcurrentModification);
-                }
-                Err(e) => return Err(e),
+                Err(SourceError::ConcurrentModification) if retries < policy.max_retries => {}
+                Err(error) => return Err(error),
             }
+            retries += 1;
         }
+    }
+
+    /// One observation of a freshly opened handle. No path is available here:
+    /// metadata cannot accidentally describe a replacement at the old name.
+    fn observe_open_file(
+        request: CaptureRequest,
+        file: &mut File,
+        config: ChunkedReaderConfig,
+        retries: u32,
+        cancel: &CancelFlag,
+    ) -> Result<ObservedSnapshot, SourceError> {
+        if cancel.is_canceled() {
+            return Err(SourceError::Canceled);
+        }
+        let stat_before = file.metadata().map_err(|_| SourceError::RootUnavailable)?;
+        if !stat_before.is_file() {
+            return Err(SourceError::SpecialObject);
+        }
+        let initial_len = stat_before.len();
+        if initial_len > config.max_payload_bytes.get() {
+            return Err(SourceError::PayloadTooLarge);
+        }
+        let initial_modified = stat_before.modified().ok();
+        let capture = SafeChunkReader::read_from_reader(request, file, config, Some(initial_len), cancel)?;
+        let stat_after = file.metadata().map_err(|_| SourceError::RootUnavailable)?;
+        if cancel.is_canceled() {
+            return Err(SourceError::Canceled);
+        }
+        let final_len = stat_after.len();
+        let final_modified = stat_after.modified().ok();
+        // Compare the full timestamp precision; microseconds are only the
+        // externally reported representation, not the change detector.
+        let changed = initial_len != final_len || initial_modified != final_modified;
+        let micros = |time: Option<std::time::SystemTime>| {
+            time.and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_micros() as u64)
+        };
+        let metadata = FileObservationMetadata {
+            initial_len,
+            final_len,
+            initial_modified_micros: micros(initial_modified),
+            final_modified_micros: micros(final_modified),
+            retries_attempted: retries,
+            consistency: if changed {
+                ObservedSnapshotConsistency::DivergedDuringRead
+            } else {
+                ObservedSnapshotConsistency::VerifiedMatch
+            },
+        };
+        ObservedSnapshot::new(request.file(), request.revision(), SnapshotBacking::Complete(capture), metadata)
     }
 }
 
@@ -718,5 +695,33 @@ mod tests {
             consistency: ObservedSnapshotConsistency::DivergedDuringRead,
         };
         assert!(!diverged_meta.is_settled());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_observed_attempt_keeps_metadata_and_bytes_on_the_opened_object() {
+        let nanos = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("fcb-opened-snapshot-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("source.txt");
+        let original = b"original";
+        std::fs::write(&path, original).unwrap();
+        let mut opened = safe_open_regular_file(&path).unwrap();
+        // An atomic-save replacement changes the path while the admitted
+        // descriptor still identifies the original source object.
+        std::fs::rename(&path, directory.join("retired.txt")).unwrap();
+        std::fs::write(&path, b"replacement with a different length").unwrap();
+        let owner = owner(5);
+        let request = CaptureRequest::new(file(owner, 1), revision(owner, 1)).unwrap();
+        let snapshot = BoundedRetryReader::observe_open_file(
+            request, &mut opened, ChunkedReaderConfig::default(), 0, &CancelFlag::new(),
+        ).unwrap();
+        assert_eq!(snapshot.range_read(range(0, original.len() as u64)).unwrap().bytes(), original);
+        assert_eq!(snapshot.metadata().initial_len, original.len() as u64);
+        assert_eq!(snapshot.metadata().final_len, original.len() as u64);
+        assert!(snapshot.is_settled());
+        assert_ne!(std::fs::metadata(&path).unwrap().len(), snapshot.metadata().final_len);
+        drop(opened);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

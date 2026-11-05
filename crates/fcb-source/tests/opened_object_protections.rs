@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fcb_core::{ArenaOwnerId, ByteLength, FileId, RootId, SourceRevision};
-use fcb_source::chunk::ChunkedReaderConfig;
+use fcb_source::chunk::{ChunkedReaderConfig, SafeChunkReader};
 use fcb_source::confined::{safe_open_regular_file, ConfinedSourceReader, SymlinkPolicy};
 use fcb_source::discovery::{BoundedDiscovery, DiscoveryKind, DiscoveryLimits};
 use fcb_source::path::{NormalizedPath, RawPath};
@@ -596,4 +596,27 @@ fn test_negative_control_oracle_alias_hop_budget() {
         oracle_res.is_err(),
         "Negative control oracle must detect unrecorded alias budget bypass!"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_chunk_reader_rejects_fifo_without_waiting_for_a_writer() {
+    let dir = TempTestDir::new("chunk_fifo");
+    let fifo_path = dir.path().join("no-writer.pipe");
+    let status = std::process::Command::new("mkfifo").arg(&fifo_path).status().expect("mkfifo");
+    assert!(status.success(), "FIFO fixture must be created");
+    let request = CaptureRequest::new(test_file_id(206, 1), test_revision(206, 1)).unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = SafeChunkReader::read_file(
+            request, &fifo_path, ChunkedReaderConfig::default(), &CancelFlag::new(),
+        );
+        let _ = sender.send(result);
+    });
+    // A regression to blocking File::open must fail this test, not hang the
+    // entire verification process indefinitely on an absent FIFO writer.
+    let result = receiver.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("chunk reader blocked opening a FIFO without a writer");
+    worker.join().unwrap();
+    assert_eq!(result, Err(SourceError::SpecialObject));
 }

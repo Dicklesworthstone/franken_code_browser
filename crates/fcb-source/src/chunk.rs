@@ -17,13 +17,13 @@
 //! Evicted old captures never silently re-read live mutable source.
 
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
 use fcb_core::{ArenaOwnerId, ByteLength, ByteOffset, ByteRange, FileId, SourceRevision};
 
+use crate::confined::safe_open_regular_file;
 use crate::{CancelFlag, CaptureRequest, ObservationDigest, SourceError};
 
 /// Permitted chunk size selected from a bounded candidate set per FCB-011 §10.1.
@@ -439,7 +439,9 @@ impl Default for ChunkedReaderConfig {
 pub struct SafeChunkReader;
 
 impl SafeChunkReader {
-    /// Read chunk by chunk from a reader without mmap.
+    /// Read chunk by chunk from a reader without mmap. Cancellation is checked
+    /// around every read, including short reads and interrupted attempts.
+    /// At most 32 consecutive interrupted calls are retried without progress.
     pub fn read_from_reader<R: Read>(
         request: CaptureRequest,
         reader: &mut R,
@@ -471,15 +473,27 @@ impl SafeChunkReader {
                 return Err(SourceError::Canceled);
             }
 
-            // Fill buffer up to chunk_size_bytes, handling short reads
+            // Fill the bounded chunk, but never let short reads or repeated
+            // EINTR prevent cancellation or retry indefinitely without progress.
             let mut chunk_filled = 0;
+            let mut interruptions = 0;
             while chunk_filled < chunk_size_bytes {
-                match reader.read(&mut temp_buf[chunk_filled..]) {
+                if cancel.is_canceled() {
+                    return Err(SourceError::Canceled);
+                }
+                let result = reader.read(&mut temp_buf[chunk_filled..]);
+                if cancel.is_canceled() {
+                    return Err(SourceError::Canceled);
+                }
+                match result {
                     Ok(0) => break, // EOF reached
                     Ok(n) => {
                         chunk_filled += n;
+                        interruptions = 0;
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted && interruptions < 32 => {
+                        interruptions += 1;
+                    }
                     Err(_) => return Err(SourceError::RootUnavailable),
                 }
             }
@@ -523,12 +537,16 @@ impl SafeChunkReader {
             return Err(SourceError::ConcurrentModification);
         }
 
-        ChunkedCapture::new(
+        let capture = ChunkedCapture::new(
             request,
             ByteLength::new(total_read),
             config.chunk_size,
             chunks,
-        )
+        )?;
+        if cancel.is_canceled() {
+            return Err(SourceError::Canceled);
+        }
+        Ok(capture)
     }
 
     /// Read an authoritative working-tree file safely using owned chunk buffers.
@@ -546,7 +564,7 @@ impl SafeChunkReader {
             return Err(SourceError::Canceled);
         }
 
-        let mut file = File::open(path).map_err(|_| SourceError::RootUnavailable)?;
+        let mut file = safe_open_regular_file(path)?;
         let stat_before = file.metadata().map_err(|_| SourceError::RootUnavailable)?;
 
         if !stat_before.is_file() {
@@ -578,6 +596,9 @@ impl SafeChunkReader {
             && before_mtime != after_mtime
         {
             return Err(SourceError::ConcurrentModification);
+        }
+        if cancel.is_canceled() {
+            return Err(SourceError::Canceled);
         }
 
         Ok(capture)
