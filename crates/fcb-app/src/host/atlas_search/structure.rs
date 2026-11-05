@@ -107,6 +107,7 @@ impl StructureRow {
 pub(super) struct StructureWork {
     options: AtlasStructureOptions,
     extract_id: ResourceAllocationId,
+    qualification_id: ResourceAllocationId,
     io: workspace::IoCounts,
 }
 
@@ -139,6 +140,7 @@ impl RetainedAtlasSearch {
                 + needle.len() + size_of::<SearchWork>() + scope_bytes)).ok_or(AppError::Admission)?;
         let state_id = self.next_id()?;
         let extract_id = self.next_id()?;
+        let qualification_id = self.next_id()?;
         let lease = self.budget.try_reserve_managed(self.manifest.owner(), state_id, ByteLength::new(charge as u64))
             .map_err(|_| AppError::Admission)?;
         let snapshot = Snapshot { generation, needle: copy_text(needle)?,
@@ -153,7 +155,7 @@ impl RetainedAtlasSearch {
             truncated: false, complete: false, stop_reason: None, step_count: 0,
             last_step_files: 0, last_step_bytes: 0, last_step_calls: 0, index_usage: None, _lease: lease };
         let work = SearchWork { snapshot, execution: SearchExecution::Structure(StructureWork {
-            options, extract_id, io: workspace::IoCounts::default() }) };
+            options, extract_id, qualification_id, io: workspace::IoCounts::default() }) };
         let response = self.work_response(atlas, &work, "begin-structure", &mut canceled)?;
         self.validate(atlas)?; check(&mut canceled)?;
         self.pending = Some(work);
@@ -244,6 +246,24 @@ impl RetainedAtlasSearch {
                     Err(DocumentReadError::Canceled) => return Err(AtlasSearchError::Canceled),
                     Err(error) => { candidate.unavailable(file, error.code()); return Ok(()); }
                 };
+                // A rendered heading is not yet source-coordinate evidence.
+                // Qualify the whole target before retaining any result row;
+                // otherwise a shifted earlier block can point a later heading
+                // at unrelated bytes even when its range is within the capture.
+                let qualified = document.qualify_heading_source_ranges(&self.budget, work.qualification_id,
+                    || canceled() || atlas.validate_active().is_err());
+                self.validate(atlas)?; check(canceled)?;
+                if let Err(error) = qualified {
+                    if error == DocumentReadError::Canceled { return Err(AtlasSearchError::Canceled); }
+                    let query = candidate.structure.as_mut().ok_or(AtlasSearchError::WrongAtlas)?;
+                    match error {
+                        DocumentReadError::EngineBudget | DocumentReadError::ResourceDenied
+                            | DocumentReadError::SourceLimit => query.extraction_limited_files += 1,
+                        _ => query.unsupported_files += 1,
+                    }
+                    candidate.unavailable(file, error.code());
+                    return Ok(());
+                }
                 candidate.scanned += 1;
                 for (ordinal, heading) in document.headings().iter().enumerate() {
                     check(canceled)?;

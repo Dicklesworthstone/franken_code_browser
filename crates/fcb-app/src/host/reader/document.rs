@@ -87,7 +87,7 @@ impl ReaderSession {
     pub fn document_at_heading(&mut self, generation: u64, slug: &str, count: usize,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
         page_limit(count)?; check(&mut canceled)?;
-        self.document_snapshot(generation)?;
+        self.qualify_document_source_actions(generation, &mut canceled)?;
         let mut out = self.output("document-heading")?;
         let document = self.document_snapshot(generation)?;
         let first = document.window_at_heading(slug, count)?.first_index();
@@ -106,7 +106,7 @@ impl ReaderSession {
     pub fn document_at_source(&mut self, generation: u64, offset: u64, count: usize,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
         page_limit(count)?; check(&mut canceled)?;
-        self.document_snapshot(generation)?;
+        self.qualify_document_source_actions(generation, &mut canceled)?;
         let mut out = self.output("document-from-source")?;
         let document = self.document_snapshot(generation)?;
         let first = document.window_at_source(ByteOffset::new(offset), count)?.first_index();
@@ -127,6 +127,7 @@ impl ReaderSession {
         if context > MAX_READER_CONTEXT_BYTES { return Err(ReaderSessionError::InvalidLimits); }
         check(&mut canceled)?;
         rendered_limit(start, end)?;
+        self.qualify_document_source_actions(generation, &mut canceled)?;
         let selected = self.document_snapshot(generation)?.selection(TextSelectionRange::new(start, end))?
             .enclosing_original_range;
         if selected.is_empty() { return Err(DocumentReadError::InvalidRange.into()); }
@@ -143,7 +144,10 @@ impl ReaderSession {
     pub fn copy_document_selection(&mut self, generation: u64, start: usize, end: usize,
         mode: DocumentCopyMode, mut canceled: impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
         check(&mut canceled)?; rendered_limit(start, end)?;
-        self.document_snapshot(generation)?;
+        // Both wire modes advertise enclosing_original_range. Neither may
+        // publish that authority before qualification, even when only rendered
+        // text is copied. Ordinary rendered windows remain independently usable.
+        self.qualify_document_source_actions(generation, &mut canceled)?;
         let mut out = self.output("document-copy")?;
         let document = self.document_snapshot(generation)?;
         let selection = document.selection(TextSelectionRange::new(start, end))?;
@@ -183,6 +187,17 @@ impl ReaderSession {
             return Err(DocumentReadError::StaleGeneration.into());
         }
         self.last_document_attempt = generation;
+        Ok(())
+    }
+    /// Explicit source-coordinate actions, never rendering/page requests, pay
+    /// for bounded provenance qualification on the existing host worker. Keep
+    /// the retained preview, source, query and generation unchanged on refusal.
+    fn qualify_document_source_actions(&mut self, generation: u64,
+        canceled: &mut impl FnMut() -> bool) -> Result<(), ReaderSessionError> {
+        self.document_snapshot(generation)?;
+        let [qualification_id] = self.allocations()?;
+        self.document_snapshot(generation)?.qualify_heading_source_ranges(
+            &self.budget, qualification_id, canceled)?;
         Ok(())
     }
     fn document_snapshot(&self, generation: u64) -> Result<&DocumentReader<'static>, ReaderSessionError> {

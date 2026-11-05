@@ -78,6 +78,25 @@ fn explicit_heading_navigation_and_missing_targets_have_distinct_results() {
 }
 
 #[test]
+fn captured_atlas_heading_refusal_preserves_render_only_and_exact_source_search() {
+    let source = b"---\ntitle: metadata\n---\n\n# Target\n\nneedle body\n";
+    let root = root(source);
+    let (exit, rendered) = invoke(&root, &["--markdown-hit", "0"]);
+    assert_eq!(exit, EXIT_OK, "{rendered}");
+    assert!(rendered.contains("\"document_schema\":\"fcb.document/1\""));
+    assert!(rendered.contains("Target") && rendered.contains("needle body"));
+    let (exit, refused) = invoke(&root, &["--markdown-hit", "0", "--markdown-heading", "target"]);
+    assert_eq!(exit, EXIT_ERROR, "{refused}");
+    assert!(refused.contains("DOCUMENT_READ_INVALID_PROVENANCE"));
+    assert_eq!(refused.matches("\"schema\"").count(), 1);
+    assert!(!refused.contains("\"parcels\"") && !refused.contains("\"document_preview\""));
+    let (exit, source_result) = invoke(&root, &["--preview-hit", "0"]);
+    assert_eq!(exit, EXIT_OK, "{source_result}");
+    assert!(source_result.contains("\"selected_original_hex\":\"6e6565646c65\""));
+    assert_eq!(fs::read(root.join("docs/README.md")).unwrap(), source);
+}
+
+#[test]
 fn unsupported_utf16_document_is_not_silently_redecoded_or_opened_as_live_utf8() {
     let mut bytes = vec![0xff, 0xfe];
     for unit in "# Title\n\nneedle\n".encode_utf16() { bytes.extend_from_slice(&unit.to_le_bytes()); }

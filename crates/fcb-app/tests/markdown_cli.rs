@@ -59,6 +59,29 @@ fn heading_jumps_and_pages_do_not_claim_the_entire_document_is_visible() {
 }
 
 #[test]
+fn unqualified_heading_and_copy_actions_refuse_without_disabling_rendered_cli_reading() {
+    let source = b"---\ntitle: metadata\n---\n\n# Target\n\nretained body\n";
+    let path = file(source);
+    let (exit, rendered, err) = invoke(&arguments(&path, &["--json"]));
+    assert_eq!(exit, EXIT_OK, "{rendered} {err}");
+    assert!(err.is_empty() && rendered.contains("Target") && rendered.contains("retained body"));
+    for options in [
+        vec!["--json", "--heading", "target"],
+        vec!["--json", "--copy-start", "0", "--copy-end", "6"],
+    ] {
+        let (exit, refused, err) = invoke(&arguments(&path, &options));
+        assert_eq!(exit, EXIT_ERROR, "{refused} {err}");
+        assert!(err.is_empty() && refused.contains("DOCUMENT_READ_INVALID_PROVENANCE"));
+        assert_eq!(refused.matches("\"schema\"").count(), 1);
+        assert!(!refused.contains("enclosing_original_hex") && !refused.contains("\"document\":"));
+    }
+    let (exit, out, err) = invoke(&arguments(&path, &["--heading", "target"]));
+    assert_eq!(exit, EXIT_ERROR);
+    assert!(out.is_empty() && err.contains("DOCUMENT_READ_INVALID_PROVENANCE"));
+    assert_eq!(fs::read(path).unwrap(), source);
+}
+
+#[test]
 fn utf8_bom_is_preserved_in_source_and_not_mistaken_for_heading_syntax() {
     let path = file("\u{feff}# Café 😀\n\nUseful text.\n".as_bytes());
     let (exit, out, _) = invoke(&arguments(&path, &["--json"]));

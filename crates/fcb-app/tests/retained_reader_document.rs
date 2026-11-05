@@ -32,6 +32,66 @@ fn selected(reader: &ReaderSession, needle: &str) -> (usize, usize, Vec<u8>) {
     (start, end, selection.enclosing_original_bytes.to_vec())
 }
 
+// Locate only rendered text; tests of refused source mapping must not obtain
+// their input by first trusting that same unqualified mapping.
+fn rendered_span(reader: &ReaderSession, needle: &str) -> (usize, usize) {
+    let owner = reader.capture().request().file().owner();
+    let budget = ResourceBudget::new(owner, ByteLength::new(128 * 1024 * 1024)).unwrap();
+    let document = DocumentReader::prepare(reader.capture(), DocumentId::new(owner, 1).unwrap(),
+        DocumentGeneration::new(owner, 1).unwrap(), ReaderDocumentOptions::default(),
+        &budget, ResourceAllocationId::new(1).unwrap(), || false).unwrap();
+    let start = document.rendered_text().find(needle).unwrap();
+    (start, start + needle.len())
+}
+
+#[test]
+fn unqualified_source_coordinates_refuse_actions_without_disabling_rendered_reading() {
+    let bytes = b"---\ntitle: metadata\n---\n\n# Target\n\nactual body\n";
+    let mut reader = reader(bytes);
+    let (start, end) = rendered_span(&reader, "Target");
+    let original = bytes.windows(8).position(|part| part == b"# Target").unwrap() as u64;
+    reader.prepare_document(1, Default::default(), || false).unwrap();
+    reader.search(1, "actual", 10, 1024, || false).unwrap();
+    let refused = Some(ReaderSessionError::Document(DocumentReadError::InvalidOutput));
+    assert_eq!(reader.document_at_heading(1, "target", 4, || false).err(), refused);
+    assert_eq!(reader.document_at_source(1, original, 4, || false).err(), refused);
+    assert_eq!(reader.document_selection_source(1, start, end, 64, || false).err(), refused);
+    // The current copy wire includes an original range in both domains.
+    for mode in [DocumentCopyMode::RenderedText, DocumentCopyMode::EnclosingMarkdown] {
+        assert_eq!(reader.copy_document_selection(1, start, end, mode, || false).err(), refused);
+    }
+    let page = reader.document_window(1, 0, 64, || false).unwrap();
+    assert!(page.as_str().contains("Target") && page.as_str().contains("actual body"));
+    assert_eq!(reader.document_generation(), Some(1));
+    assert_eq!(reader.capture().bytes(), bytes);
+    assert!(reader.copy_range(0, bytes.len() as u64, || false).unwrap().as_str().contains(&hex(bytes)));
+    assert!(reader.copy_hit(1, 0, || false).is_ok());
+}
+
+#[test]
+fn cancellation_during_source_qualification_keeps_the_previous_document() {
+    let mut reader = reader(b"# Target\n\nretained body\n");
+    reader.prepare_document(1, Default::default(), || false).unwrap();
+    let mut polls = 0;
+    let error = reader.copy_document_selection(1, 0, 6, DocumentCopyMode::EnclosingMarkdown,
+        || { polls += 1; polls == 2 }).err();
+    assert_eq!(error, Some(ReaderSessionError::Document(DocumentReadError::Canceled)));
+    assert_eq!(reader.document_generation(), Some(1));
+    assert!(reader.document_window(1, 0, 64, || false).unwrap().as_str().contains("retained body"));
+    assert!(reader.document_at_heading(1, "target", 4, || false).is_ok());
+}
+
+#[test]
+fn ambiguous_canonical_heading_does_not_choose_the_first_source_range() {
+    let mut reader = reader(b"# Same\n\n# Same\n\n# Same-2\n");
+    reader.prepare_document(1, Default::default(), || false).unwrap();
+    assert_eq!(reader.document_at_heading(1, "same-2", 4, || false).err(),
+        Some(ReaderSessionError::Document(DocumentReadError::InvalidOutput)));
+    assert_eq!(reader.document_generation(), Some(1));
+    assert!(reader.document_window(1, 0, 64, || false).unwrap().as_str().contains("Same-2"));
+    assert!(reader.document_at_heading(1, "same", 4, || false).is_ok());
+}
+
 #[test]
 fn prepare_and_heading_navigation_render_the_retained_source_without_native_claims() {
     let mut reader = reader(b"# Overview\n\nA **bold** introduction.\n\n## Details\n\nMore text.\n");

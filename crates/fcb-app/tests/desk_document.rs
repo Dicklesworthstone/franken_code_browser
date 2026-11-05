@@ -35,6 +35,63 @@ fn span(document: &DeskDocument, s: &DeskSession, needle: &str) -> (usize, usize
 }
 
 #[test]
+fn unqualified_source_actions_preserve_desk_selection_history_and_rendered_pages() {
+    let bytes = b"---\ntitle: metadata\n---\n\n# Target\n\nactual body\n";
+    let mut s = desk(); let pane = adopt(&mut s, 1, bytes);
+    apply(&mut s, DeskCommand::Navigate { pane, offset: 0,
+        selection: Some(ByteRange::new(ByteOffset::new(0), ByteOffset::new(3)).unwrap()) });
+    let doc = prepare(&mut s, pane, 1);
+    let (start, end) = span(&doc, &s, "Target");
+    let before = s.model().location(pane, 2).unwrap();
+    let history = s.model().history().len();
+    let original = bytes.windows(8).position(|part| part == b"# Target").unwrap() as u64;
+    let refused = Some(DeskDocumentError::Document(DocumentReadError::InvalidOutput));
+    assert_eq!(doc.seek_heading(&mut s, 2, 3, 1, "target", || false).err(), refused);
+    assert_eq!(doc.select_source(&mut s, 2, 3, 1, start, end, || false).err(), refused);
+    assert_eq!(doc.at_source(&mut s, 2, 1, original, 4, || false).err(), refused);
+    assert_eq!(doc.split(&mut s, 2, 1, original, 4, || false).err(), refused);
+    for mode in [DocumentCopyMode::RenderedText, DocumentCopyMode::EnclosingMarkdown] {
+        assert_eq!(doc.copy(&mut s, 2, 1, start, end, mode, || false).err(), refused);
+    }
+    assert_eq!(s.model().revision(), 2); assert_eq!(s.model().last_attempt(), 2);
+    assert_eq!(s.model().history().len(), history);
+    assert_eq!(s.model().location(pane, 2).unwrap(), before);
+    assert_eq!(s.model().selected_bytes(pane, 2).unwrap(), b"---");
+    assert_eq!(s.model().source(pane, 2).unwrap().bytes(), bytes);
+    let page = doc.window(&mut s, 2, 1, 0, 64, || false).unwrap();
+    assert!(page.as_str().contains("Target") && page.as_str().contains("actual body"));
+}
+
+#[test]
+fn source_qualification_cancellation_does_not_consume_a_desk_navigation_attempt() {
+    let mut s = desk(); let pane = adopt(&mut s, 1, b"# Target\n\nretained body\n");
+    let doc = prepare(&mut s, pane, 1); let (start, end) = span(&doc, &s, "Target");
+    let before = s.model().location(pane, 1).unwrap();
+    let mut polls = 0;
+    let result = doc.select_source(&mut s, 1, 2, 1, start, end, || { polls += 1; polls == 2 });
+    assert_eq!(result.err(), Some(DeskDocumentError::Document(DocumentReadError::Canceled)));
+    assert_eq!(s.model().revision(), 1); assert_eq!(s.model().last_attempt(), 1);
+    assert_eq!(s.model().location(pane, 1).unwrap(), before);
+    assert_eq!(s.model().history().len(), 1);
+    assert!(doc.window(&mut s, 1, 1, 0, 64, || false).is_ok());
+    doc.seek_heading(&mut s, 1, 2, 1, "target", || false).unwrap();
+    assert_eq!(s.model().revision(), 2);
+}
+
+#[test]
+fn ambiguous_heading_never_mutates_the_desk_or_selects_the_first_match() {
+    let mut s = desk(); let pane = adopt(&mut s, 1, b"# Same\n\n# Same\n\n# Same-2\n");
+    let doc = prepare(&mut s, pane, 1);
+    let before = s.model().location(pane, 1).unwrap();
+    assert_eq!(doc.seek_heading(&mut s, 1, 2, 1, "same-2", || false).err(),
+        Some(DeskDocumentError::Document(DocumentReadError::InvalidOutput)));
+    assert_eq!(s.model().revision(), 1); assert_eq!(s.model().last_attempt(), 1);
+    assert_eq!(s.model().location(pane, 1).unwrap(), before);
+    assert_eq!(s.model().history().len(), 1);
+    assert!(doc.window(&mut s, 1, 1, 0, 64, || false).unwrap().as_str().contains("Same-2"));
+}
+
+#[test]
 fn preparation_shares_exact_backing_and_pages_without_changing_the_desk() {
     let mut s = desk(); let pane = adopt(&mut s, 1, b"# Title\n\nHello **world**.\n");
     let doc = prepare(&mut s, pane, 1);

@@ -158,8 +158,9 @@ impl DeskDocument {
     pub fn at_source(&self, desk: &mut DeskSession, expected: u64, generation: u64,
         offset: u64, count: usize, mut canceled: impl FnMut() -> bool) -> Result<HostResponse, DeskDocumentError> {
         page_limit(count)?;
-        let document = self.layout(desk, expected, generation)?;
         check(&mut canceled)?;
+        self.qualify_source_actions(desk, expected, generation, &mut canceled)?;
+        let document = self.layout(desk, expected, generation)?;
         let first = document.window_at_source(ByteOffset::new(offset), count)?.first_index();
         let mut out = self.output(desk, "doc-sync")?;
         wire::summary(&mut out, document)?;
@@ -194,6 +195,7 @@ impl DeskDocument {
         -> Result<DeskChange, DeskDocumentError> {
         desk.validate_mutation(expected, attempt)?;
         rendered_limit(start, end)?; check(&mut canceled)?;
+        self.qualify_source_actions(desk, expected, generation, &mut canceled)?;
         let range = self.layout(desk, expected, generation)?.selection(TextSelectionRange::new(start, end))?
             .enclosing_original_range;
         if range.is_empty() { return Err(DocumentReadError::InvalidRange.into()); }
@@ -204,6 +206,7 @@ impl DeskDocument {
         generation: u64, slug: &str, mut canceled: impl FnMut() -> bool) -> Result<DeskChange, DeskDocumentError> {
         desk.validate_mutation(expected, attempt)?;
         check(&mut canceled)?;
+        self.qualify_source_actions(desk, expected, generation, &mut canceled)?;
         let document = self.layout(desk, expected, generation)?;
         let range = document.original_span(document.heading(slug)?.source_span)?;
         if range.is_empty() { return Err(DocumentReadError::InvalidRange.into()); }
@@ -214,6 +217,9 @@ impl DeskDocument {
         start: usize, end: usize, mode: DocumentCopyMode, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, DeskDocumentError> {
         rendered_limit(start, end)?; check(&mut canceled)?;
+        // The existing copy response carries an original range in both modes.
+        // Do not publish it as verified evidence from an unqualified source map.
+        self.qualify_source_actions(desk, expected, generation, &mut canceled)?;
         let selection = self.layout(desk, expected, generation)?.selection(TextSelectionRange::new(start, end))?;
         if selection.enclosing_original_bytes.len() > MAX_DESK_COPY_BYTES {
             return Err(DocumentReadError::InvalidLimits.into());
@@ -230,6 +236,17 @@ impl DeskDocument {
         }
         out.literal("}\n")?;
         Ok(desk.finish(out, EXIT_OK, &mut canceled)?)
+    }
+    /// Qualification runs before any desk navigation transaction. Failure or
+    /// cancellation leaves selection, history, revision and source bytes intact;
+    /// unqualified documents still support ordinary rendered windows.
+    fn qualify_source_actions(&self, desk: &mut DeskSession, expected: u64,
+        generation: u64, canceled: &mut impl FnMut() -> bool) -> Result<(), DeskDocumentError> {
+        self.layout(desk, expected, generation)?;
+        let [qualification_id] = desk.ids()?;
+        self.layout(desk, expected, generation)?.qualify_heading_source_ranges(
+            &desk.budget, qualification_id, canceled)?;
+        Ok(())
     }
     fn output(&self, desk: &mut DeskSession, command: &str) -> Result<Output, DeskDocumentError> {
         let mut out = desk.output(command)?;

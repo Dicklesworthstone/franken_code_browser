@@ -50,6 +50,52 @@ fn count(json: &str, name: &str, expected: u64) {
 }
 
 #[test]
+fn unqualified_heading_files_report_partial_coverage_and_never_publish_source_rows() {
+    let qualified = b"# Target\n\nactual source\n";
+    let fixture = Fixture::new(&[("a-unqualified.md", b"---\ntitle: metadata\n---\n\n# Hidden\n"),
+        ("b-qualified.md", qualified)]);
+    let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+    search.begin_structure(&atlas, 1, "e", AtlasSearchScope::all(), options(AtlasStructureMode::Headings), || false).unwrap();
+    let page = finish(&mut search, &atlas, 1);
+    count(&page, "retained_hits", 1); count(&page, "matches_seen", 1);
+    count(&page, "unsupported_structure_files", 1); count(&page, "extraction_limited_files", 0);
+    count(&page, "unavailable_files", 1); count(&page, "pending_files", 0);
+    assert!(page.contains("DOCUMENT_READ_INVALID_PROVENANCE"));
+    assert!(page.contains("\"search_complete\":false"));
+    let (reader, _) = search.open_reader(&atlas, ArenaOwnerId::new(31605).unwrap(), 1, 1, || false).unwrap();
+    assert_eq!(reader.capture().bytes(), qualified);
+    // A needle present only in the unqualified document is unknown, not a
+    // successful empty heading inventory for all searched project files.
+    search.begin_structure(&atlas, 2, "Hidden", AtlasSearchScope::all(), options(AtlasStructureMode::Headings), || false).unwrap();
+    let absent = finish(&mut search, &atlas, 2);
+    count(&absent, "retained_hits", 0); count(&absent, "unsupported_structure_files", 1);
+    assert!(absent.contains("\"search_complete\":false"));
+    assert!(search.hit(&atlas, 2, 1).is_err());
+}
+
+#[test]
+fn heading_qualification_cancellation_preserves_the_previous_literal_query() {
+    let bytes = (0..40).map(|index| format!("# Target{index}\n\nbody\n\n")).collect::<String>();
+    let fixture = Fixture::new(&[("README.md", bytes.as_bytes())]);
+    let atlas = fixture.open();
+    let mut probe = RetainedAtlasSearch::new(&atlas).unwrap();
+    probe.begin_structure(&atlas, 1, "Target", AtlasSearchScope::all(), options(AtlasStructureMode::Headings), || false).unwrap();
+    let mut polls = 0;
+    probe.step(&atlas, 1, || { polls += 1; false }).unwrap();
+    assert!(polls > 100, "exercise the bounded whole-document qualification work");
+    let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+    search.search(&atlas, 1, "Target", options(AtlasStructureMode::Headings).limits, || false).unwrap();
+    let old = search.hit(&atlas, 1, 1).unwrap();
+    search.begin_structure(&atlas, 2, "Target", AtlasSearchScope::all(), options(AtlasStructureMode::Headings), || false).unwrap();
+    let mut observed = 0;
+    assert_eq!(search.step(&atlas, 2, || { observed += 1; observed == polls / 2 }).err(), Some(AtlasSearchError::Canceled));
+    assert_eq!(search.hit(&atlas, 1, 1).unwrap(), old);
+    let page = search.page(&atlas, 1, 0, 128, || false).unwrap();
+    assert!(page.as_str().contains("\"mode\":\"exact-decoded-literal\""));
+    assert!(!page.as_str().contains("unsupported_structure_files"));
+}
+
+#[test]
 fn symbol_mode_extracts_names_and_exact_activation_survives_live_replacement() {
     let source = b"fn run() {}\nfn runner() {}\n// run is also ordinary text\n";
     let fixture = Fixture::new(&[("src/main.rs", source)]);

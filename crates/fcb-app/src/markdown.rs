@@ -219,6 +219,12 @@ pub(crate) fn write_capture(capture: &CompleteCapture, options: &ViewOptions, js
     let generation = DocumentGeneration::new(owner, 1).map_err(|_| AppError::InvalidRange)?;
     let reader = DocumentReader::prepare(capture, DocumentId::new(owner, 1).map_err(|_| AppError::InvalidRange)?,
         generation, options.read, budget, allocation(81), &mut *canceled)?;
+    // The shared CLI path must apply the same source-coordinate admission as
+    // native Reader/Desk actions. Render-only windows remain available when
+    // upstream provenance cannot qualify an exact heading or enclosing copy.
+    if options.heading.is_some() || options.copy.is_some() {
+        reader.qualify_heading_source_ranges(budget, allocation(83), &mut *canceled)?;
+    }
     let window = match options.heading.as_deref() {
         Some(slug) => reader.window_at_heading(slug, options.lines)?, None => reader.window(options.first, options.lines)?,
     };
