@@ -245,8 +245,26 @@ pub(crate) fn encode_window(out: &mut Output, document: &DocumentReader<'_>, fir
         out.literal(",\"rendered_utf8_range\":{\"start\":")?; out.integer(line.rendered_range.start as u64)?;
         out.literal(",\"end\":")?; out.integer(line.rendered_range.end as u64)?;
         out.literal("},\"enclosing_original_range\":")?;
-        let original = document.original_span(line.source_span)?;
-        if original.is_empty() { out.literal("null")?; } else { out.range(original)?; }
+        if line.rendered_text.is_empty() || line.source_span.start == line.source_span.end {
+            out.literal("null")?;
+        } else {
+            // Native row actions select the displayed UTF-8 prefix, excluding
+            // trimmed layout padding. Publish the SAME enclosing block as that
+            // selection, not the narrower inline envelope in line.source_span.
+            let end = line.rendered_range.start.checked_add(line.rendered_text.len())
+                .ok_or(DocumentReadError::InvalidOutput)?;
+            if end > line.rendered_range.end { return Err(DocumentReadError::InvalidOutput.into()); }
+            match document.selection(TextSelectionRange::new(line.rendered_range.start, end)) {
+                Ok(selection) if !selection.enclosing_original_range.is_empty() => {
+                    out.range(selection.enclosing_original_range)?;
+                }
+                // Source mapping is optional for readable flow. An unmappable
+                // row receives no source-action target; do not substitute its
+                // inline span or disable ordinary document paging.
+                Ok(_) | Err(DocumentReadError::InvalidRange | DocumentReadError::InvalidOutput) => out.literal("null")?,
+                Err(error) => return Err(error.into()),
+            }
+        }
         out.literal("}")?;
     }
     out.literal("],\"next_flow_line\":")?;

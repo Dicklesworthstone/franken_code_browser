@@ -302,6 +302,36 @@ import Foundation
             for _ in 0..<128 { m.back(); await wait { !m.busy } }
             check(!m.canBack && m.page?.first == 2, "Flow history retains at most 128 locations")
         }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            let page = m.page!, target = page.target(at: 0)!
+            var navigations = 0
+            f.held = true
+            m.showSource(target, navigate: { _ in navigations += 1 })
+            await wait { f.pending.count == 1 }
+            // This current-capture slice is internally coherent, but names
+            // only "hi" while the row advertised the enclosing "# hi" block.
+            // The production model must retain its exact region equality gate.
+            let differentRegion = AtlasReaderDocumentSource(target: target,
+                visible: .init(start: 3, end: 8), text: "# hi\n", originalHex: "232068690a",
+                enclosingOriginal: .init(start: 5, end: 7),
+                selectionUTF8: .init(start: 2, end: 4), selectedHex: "6869")
+            f.release(replacement: .source(differentRegion)); await wait { !m.busy }
+            check(navigations == 0 && m.source == nil && m.sourceOffset(for: target, reader: f.identity) == nil,
+                  "A different enclosing region cannot reach source navigation")
+            check(m.page?.id == page.id && m.authorized && m.notice == AtlasReaderError.invalidResponse.message,
+                  "Rejected source correspondence leaves rendered reading available")
+            m.showSource(target, navigate: { received in
+                check(received == target, "Source callback retains its exact current row target")
+                navigations += 1
+            })
+            await wait { f.pending.count == 1 }
+            f.release(); await wait { !m.busy }
+            check(navigations == 1 && m.source?.enclosingOriginal == target.line.enclosingOriginal
+                  && m.sourceOffset(for: target, reader: f.identity) == 3,
+                  "The matching enclosing-block receipt enables source navigation")
+        }
         print("AtlasDocumentPreviewTests: \(checks) checks passed")
     }
 }

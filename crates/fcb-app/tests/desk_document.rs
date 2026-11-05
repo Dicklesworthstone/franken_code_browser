@@ -35,6 +35,38 @@ fn span(document: &DeskDocument, s: &DeskSession, needle: &str) -> (usize, usize
 }
 
 #[test]
+fn desk_preview_heading_and_wrapped_rows_match_the_actual_source_selection() {
+    let bytes = "\u{feff}# Café **Guide**\r\n\r\nA **bold** paragraph with enough words to wrap across several rows.\r\n".as_bytes();
+    let mut s = desk(); let pane = adopt(&mut s, 1, bytes);
+    let doc = DeskDocument::prepare(&mut s, 1, pane, 1,
+        DeskDocumentOptions { width_columns: 10, ..Default::default() }, || false).unwrap();
+    let page = json(&doc.overview(&mut s, 1, 1, || false).unwrap());
+    let mut heading_rows = 0; let mut paragraph_rows = 0;
+    for row in page.get("flow_lines").array() {
+        let text = row.get("text").text();
+        if text.is_empty() { assert_eq!(row.get("enclosing_original_range"), &Json::Null); continue; }
+        let start = row.get("rendered_utf8_range").get("start").number() as usize;
+        let end = start + text.len();
+        let expected = s.model().revision();
+        let copy = json(&doc.copy(&mut s, expected, 1, start, end, DocumentCopyMode::EnclosingMarkdown, || false).unwrap());
+        let original = row.get("enclosing_original_range");
+        assert_eq!(copy.get("enclosing_original_range"), original);
+        let range = ByteRange::new(ByteOffset::new(original.get("start").number()),
+            ByteOffset::new(original.get("end").number())).unwrap();
+        let attempt = s.model().last_attempt() + 1;
+        doc.select_source(&mut s, expected, attempt, 1, start, end, || false).unwrap();
+        let revision = s.model().revision();
+        assert_eq!(s.model().location(pane, revision).unwrap().selection, Some(range));
+        let selected = s.model().selected_bytes(pane, revision).unwrap();
+        assert!(range.start().get() >= 3);
+        if selected.starts_with("# Café **Guide**".as_bytes()) { heading_rows += 1; }
+        else { assert!(selected.starts_with(b"A **bold** paragraph")); paragraph_rows += 1; }
+        assert_eq!(s.model().source(pane, revision).unwrap().bytes(), bytes);
+    }
+    assert!(heading_rows > 0 && paragraph_rows > 1);
+}
+
+#[test]
 fn unqualified_source_actions_preserve_desk_selection_history_and_rendered_pages() {
     let bytes = b"---\ntitle: metadata\n---\n\n# Target\n\nactual body\n";
     let mut s = desk(); let pane = adopt(&mut s, 1, bytes);

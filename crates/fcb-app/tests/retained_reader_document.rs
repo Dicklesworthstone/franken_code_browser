@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod support;
+use support::{Json, parse};
 use std::path::Path;
 use fcb::{ArenaOwnerId, ByteLength};
 use fcb::document::{TextSelectionRange, reader::{DocumentReader, DocumentReadError}};
@@ -42,6 +44,52 @@ fn rendered_span(reader: &ReaderSession, needle: &str) -> (usize, usize) {
         &budget, ResourceAllocationId::new(1).unwrap(), || false).unwrap();
     let start = document.rendered_text().find(needle).unwrap();
     (start, start + needle.len())
+}
+
+#[test]
+fn preview_rows_advertise_the_same_enclosing_markdown_as_their_source_and_copy_actions() {
+    let bytes = "\u{feff}# Café **Guide**\r\n\r\nA **bold** paragraph with enough words to wrap across several rows.\r\n".as_bytes();
+    for width in [100, 10] {
+        let mut reader = reader(bytes);
+        let prepared = reader.prepare_document(1, ReaderDocumentOptions { width_columns: width,
+            ..Default::default() }, || false).unwrap();
+        let page = parse(prepared.as_str().as_bytes()).unwrap();
+        let mut heading_rows = 0; let mut paragraph_rows = 0;
+        for row in page.get("flow_lines").array() {
+            let text = row.get("text").text();
+            if text.is_empty() {
+                assert_eq!(row.get("enclosing_original_range"), &Json::Null); continue;
+            }
+            let rendered = row.get("rendered_utf8_range");
+            let start = rendered.get("start").number() as usize;
+            // Exactly AtlasReaderDocumentTarget.rendered: UTF-8 bytes of the
+            // visible text, not the padded range or a UTF-16 character count.
+            let end = start + text.len();
+            assert!(end <= rendered.get("end").number() as usize);
+            let source = reader.document_selection_source(1, start, end, 64, || false).unwrap();
+            let source = parse(source.as_str().as_bytes()).unwrap();
+            let original = row.get("enclosing_original_range");
+            assert_eq!(source.get("selection").get("original_range"), original);
+            let a = original.get("start").number() as usize;
+            let b = original.get("end").number() as usize;
+            assert!(a >= 3, "BOM is an encoding header, not Markdown syntax");
+            let selected = &bytes[a..b];
+            if selected.starts_with("# Café **Guide**".as_bytes()) { heading_rows += 1; }
+            else { assert!(selected.starts_with(b"A **bold** paragraph")); paragraph_rows += 1; }
+            for mode in [DocumentCopyMode::RenderedText, DocumentCopyMode::EnclosingMarkdown] {
+                let copy = reader.copy_document_selection(1, start, end, mode, || false).unwrap();
+                let copy = parse(copy.as_str().as_bytes()).unwrap();
+                assert_eq!(copy.get("enclosing_original_range"), original);
+                match mode {
+                    DocumentCopyMode::RenderedText => assert_eq!(copy.get("text").text(), text),
+                    DocumentCopyMode::EnclosingMarkdown => assert_eq!(copy.get("original_hex").text(), hex(selected)),
+                }
+            }
+        }
+        assert!(heading_rows > 0 && paragraph_rows > 0);
+        if width == 10 { assert!(paragraph_rows > 1, "wrapped rows retain their shared whole-block source region"); }
+        assert_eq!(reader.capture().bytes(), bytes);
+    }
 }
 
 #[test]
