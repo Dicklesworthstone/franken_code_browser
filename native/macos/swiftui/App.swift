@@ -217,6 +217,10 @@ extension AtlasCamera {
 #if FCB_APP_STORE
     @State private var root = ""
     @State private var rootAccess: AppStoreRootAccess?
+    @State private var rootAccessLoader = AtlasRootAccessLoader<AppStoreRootAccess> {
+        try AppStoreRootAccess.resolve($0, cancellation: $1)
+    }
+    @State private var appStoreStartupConsumed = false
 #else
     @State private var root = ""
     @State private var projectStartup = AtlasProjectStartup()
@@ -410,8 +414,12 @@ extension AtlasCamera {
         .sheet(isPresented: $showsSavedRepository) { AtlasSavedRepositoryView(model: savedRepository, desk: readingDesk) }
         .onAppear {
 #if FCB_APP_STORE
-            if let recent = Engine.recents.first { restoreProject(recent) }
-            else { status = "Choose a project folder to begin exploring its source." }
+            if rootAccess != nil { requestAtlasLoad() }
+            else if !appStoreStartupConsumed {
+                appStoreStartupConsumed = true
+                if let recent = Engine.recents.first { restoreProject(recent) }
+                else { status = "Choose a project folder to begin exploring its source." }
+            }
 #else
             if !projectStartup.consumed,
                let selection = projectStartup.consume(arguments: CommandLine.arguments,
@@ -434,6 +442,9 @@ extension AtlasCamera {
 #endif
         }
         .onDisappear {
+#if FCB_APP_STORE
+            rootAccessLoader.cancel()
+#endif
             closeAtlasResidency()
             closeFinderReader()
             projectBrowser.close()
@@ -835,9 +846,29 @@ extension AtlasCamera {
 
     // MARK: Atlas screen
 
+    @ViewBuilder private var rootAccessProgress: some View {
+#if FCB_APP_STORE
+        if rootAccessLoader.isLoading {
+            HStack(spacing: 10) {
+                ProgressView().controlSize(.small)
+                Text("Opening project access…").font(.callout)
+                Spacer()
+                Button("Cancel") {
+                    rootAccessLoader.cancel()
+                    status = "Project access request canceled. Choose a folder when you are ready."
+                }
+                Button("Choose another folder…", action: chooseProject)
+            }.padding(10).background(.bar)
+        }
+#else
+        EmptyView()
+#endif
+    }
+
     private var atlasScreen: some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
+                rootAccessProgress
                 if (showsCatalog || !hasMetadataAtlas), !projectBrowser.root.isEmpty {
                     progressiveProjectView
                 } else if !hasMetadataAtlas {
@@ -1891,6 +1922,7 @@ extension AtlasCamera {
         // Replacing the native grant revokes this window's pin deliveries even
         // when the newly authorized folder happens to have the same path.
         pinnedReaders.closeAll()
+        access.remember()
         rootAccess = access
         root = access.url.path
         clearSearch()
@@ -1901,11 +1933,25 @@ extension AtlasCamera {
     }
 
     private func restoreProject(_ path: String) {
-        guard let access = AppStoreRootAccess.restore(path) else {
+        guard let request = AppStoreRootAccess.restorationRequest(path) else {
+            rootAccessLoader.cancel()
             status = "Saved project access is unavailable. Choose the folder again to restore it."
             return
         }
-        activateProject(access)
+        requestRootAccess(request)
+    }
+
+    private func requestRootAccess(_ request: AtlasRootAccessRequest, ifCurrent ticket: UUID? = nil,
+        keepingAlive leases: [AnyObject] = []) {
+        if let ticket, !rootAccessLoader.accepts(ticket) { return }
+        status = "Opening project access…"
+        rootAccessLoader.open(request, ifCurrent: ticket, keepingAlive: leases) { result in
+            switch result {
+            case .success(let access): activateProject(access)
+            case .failure:
+                status = "Project access is unavailable. Reconnect the volume if needed, then choose the folder again."
+            }
+        }
     }
 #else
     private func setRoot(_ newRoot: String) {
@@ -1927,14 +1973,21 @@ extension AtlasCamera {
         panel.allowsMultipleSelection = false
         panel.directoryURL = root.isEmpty ? FileManager.default.homeDirectoryForCurrentUser : URL(fileURLWithPath: root)
         panel.message = "Choose the project root to lay out and browse"
+#if FCB_APP_STORE
+        // A late panel callback cannot reopen a closed window or replace a
+        // newer choice. Its adopted native grant still drains exactly once.
+        let accessIntent = rootAccessLoader.cancel()
+#endif
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
 #if FCB_APP_STORE
-            guard let access = AppStoreRootAccess.select(url) else {
+            let selection = AppStoreRootAccess.selectionRequest(url)
+            guard rootAccessLoader.accepts(accessIntent) else { return }
+            guard let (request, selectionLease) = selection else {
                 status = "Could not retain read access to this folder. Choose it again."
                 return
             }
-            activateProject(access)
+            requestRootAccess(request, ifCurrent: accessIntent, keepingAlive: [selectionLease])
 #else
             setRoot(url.path)
 #endif
