@@ -8,7 +8,7 @@
 //! 2. Truthful publication of DivergedDuringRead when file changes across retries.
 //! 3. Pinned snapshot backing prevents eviction; unpinning allows eviction.
 //! 4. Anchor resolution resolves against pinned backing.
-//! 5. Anchor resolution succeeds against live file if exact digest matches.
+//! 5. Evicted backing stays stale even when a live observation digest matches.
 //! 6. Negative control oracle: anchor resolution strictly refuses to substitute
 //!    diverged live bytes when old snapshot was evicted, returning StaleOrDiverged.
 
@@ -153,7 +153,7 @@ fn snapshot_pin_lifecycle_guards_and_releases_backing() {
 }
 
 #[test]
-fn anchor_resolution_matches_live_when_digest_is_identical() {
+fn anchor_resolution_requires_backing_even_when_live_digest_is_identical() {
     let o = owner(203);
     let f = file_id(o, 20);
     let rev_old = revision(o, 1);
@@ -196,13 +196,11 @@ fn anchor_resolution_matches_live_when_digest_is_identical() {
     )
     .unwrap();
 
-    match resolution {
-        AnchorResolution::VerifiedLiveMatch(exact) => {
-            assert_eq!(exact.bytes(), b"identical");
-            assert_eq!(exact.revision(), rev_new);
-        }
-        _ => panic!("expected VerifiedLiveMatch"),
-    }
+    assert_eq!(resolution, AnchorResolution::StaleOrDiverged {
+        old_revision: rev_old,
+        old_digest: expected_old_digest,
+        current_digest: Some(expected_old_digest),
+    });
 }
 
 #[test]
@@ -313,4 +311,160 @@ fn extent_capture_distinguishes_observations_from_holes() {
         snapshot.range_read(range(0, 5)),
         Err(SourceError::CaptureUnavailable)
     );
+}
+
+fn retained_snapshot(req: CaptureRequest, payload: &[u8]) -> ObservedSnapshot {
+    let chunk = SourceChunk::new(0, range(0, payload.len() as u64), Arc::from(payload)).unwrap();
+    let capture = ChunkedCapture::new(
+        req,
+        ByteLength::new(payload.len() as u64),
+        ChunkSize::bounded(payload.len()).unwrap(),
+        vec![chunk],
+    ).unwrap();
+    let metadata = FileObservationMetadata {
+        initial_len: payload.len() as u64,
+        final_len: payload.len() as u64,
+        initial_modified_micros: None,
+        final_modified_micros: None,
+        retries_attempted: 0,
+        consistency: ObservedSnapshotConsistency::VerifiedMatch,
+    };
+    ObservedSnapshot::new(req.file(), req.revision(), SnapshotBacking::Complete(capture), metadata).unwrap()
+}
+
+#[test]
+fn snapshot_identity_must_match_complete_or_extent_backing() {
+    let req = request(210, 1, 1);
+    let original = retained_snapshot(req, b"original");
+    let extent = ExtentCapture::new(
+        req,
+        vec![ObservedRange::new(range(0, 8), b"original").unwrap()],
+        vec![],
+        Some(ByteLength::new(8)),
+    ).unwrap();
+    for backing in [original.backing().clone(), SnapshotBacking::Extent(extent)] {
+        for (claimed, expected) in [
+            (request(211, 1, 1), SourceError::ForeignOwner),
+            (request(210, 2, 1), SourceError::MetadataMismatch),
+            (request(210, 1, 2), SourceError::MetadataMismatch),
+        ] {
+            assert_eq!(
+                ObservedSnapshot::new(claimed.file(), claimed.revision(), backing.clone(), *original.metadata()),
+                Err(expected),
+            );
+        }
+    }
+}
+
+#[test]
+fn foreign_requested_identity_cannot_fall_through_to_live_resolution() {
+    let req = request(212, 1, 1);
+    let foreign = request(213, 1, 1);
+    let live = retained_snapshot(foreign, b"same bytes");
+    let store = PinnedSnapshotStore::new(req.file().owner());
+
+    assert_eq!(
+        AnchorResolver::resolve(&store, foreign.file(), foreign.revision(),
+            range(0, 4), live.digest(), Some(&live)),
+        Err(SourceError::ForeignOwner),
+    );
+    assert_eq!(
+        AnchorResolver::resolve(&store, req.file(), foreign.revision(),
+            range(0, 4), live.digest(), None),
+        Err(SourceError::ForeignOwner),
+    );
+}
+
+#[test]
+fn live_candidate_must_name_the_requested_file_and_owner() {
+    let req = request(214, 1, 1);
+    let original = retained_snapshot(req, b"same bytes");
+    let store = PinnedSnapshotStore::new(req.file().owner());
+    for (candidate_request, expected) in [
+        (request(214, 2, 2), SourceError::MetadataMismatch),
+        (request(215, 1, 2), SourceError::ForeignOwner),
+    ] {
+        let live = retained_snapshot(candidate_request, b"same bytes");
+        assert_eq!(live.digest(), original.digest());
+        assert_eq!(
+            AnchorResolver::resolve(&store, req.file(), req.revision(),
+                range(0, 4), original.digest(), Some(&live)),
+            Err(expected),
+        );
+    }
+}
+
+#[test]
+fn retained_anchor_preserves_identity_and_refuses_conflicting_evidence() {
+    let req = request(216, 1, 1);
+    let original = retained_snapshot(req, b"original bytes");
+    let digest = original.digest();
+    let current = retained_snapshot(request(216, 1, 2), b"changed bytes!");
+    let mut store = PinnedSnapshotStore::new(req.file().owner());
+    store.insert(original).unwrap();
+
+    let exact = match AnchorResolver::resolve(&store, req.file(), req.revision(),
+        range(0, 8), digest, Some(&current)).unwrap() {
+        AnchorResolution::ExactPinned(exact) => exact,
+        other => panic!("expected retained original capture, got {other:?}"),
+    };
+    assert_eq!(exact.bytes(), b"original");
+    assert_eq!(exact.revision(), req.revision());
+    assert_eq!(
+        AnchorResolver::resolve(&store, req.file(), req.revision(),
+            range(0, 8), current.digest(), Some(&current)),
+        Err(SourceError::MetadataMismatch),
+    );
+}
+
+#[test]
+fn releasing_a_pin_copy_cannot_release_another_live_pin() {
+    let req = request(217, 1, 1);
+    let mut store = PinnedSnapshotStore::new(req.file().owner());
+    store.insert(retained_snapshot(req, b"pinned bytes")).unwrap();
+    let first = store.pin(req.file(), req.revision()).unwrap();
+    let first_copy = first.clone();
+    let second = store.pin(req.file(), req.revision()).unwrap();
+    assert_ne!(first.id(), second.id());
+    assert_eq!(store.pin_count(req.file(), req.revision()), 2);
+
+    assert!(store.unpin(&first_copy));
+    assert!(!store.unpin(&first));
+    assert_eq!(store.pin_count(req.file(), req.revision()), 1);
+    assert_eq!(store.evict(req.file(), req.revision()), Err(SourceError::PinActive));
+    assert_eq!(store.get(req.file(), req.revision()).unwrap().range_read(range(0, 6)).unwrap().bytes(), b"pinned");
+
+    assert!(store.unpin(&second));
+    assert!(!store.unpin(&second));
+    assert_eq!(store.evict(req.file(), req.revision()), Ok(true));
+}
+
+#[test]
+fn pin_tokens_do_not_authorize_other_stores_or_clones() {
+    let req = request(218, 1, 1);
+    let snapshot = retained_snapshot(req, b"shared immutable bytes");
+    let mut first = PinnedSnapshotStore::new(req.file().owner());
+    let mut second = PinnedSnapshotStore::new(req.file().owner());
+    first.insert(snapshot.clone()).unwrap();
+    second.insert(snapshot).unwrap();
+    let first_pin = first.pin(req.file(), req.revision()).unwrap();
+    let second_pin = second.pin(req.file(), req.revision()).unwrap();
+
+    assert!(!second.unpin(&first_pin));
+    assert!(!first.unpin(&second_pin));
+    assert_eq!(second.pin_count(req.file(), req.revision()), 1);
+    assert_eq!(second.evict(req.file(), req.revision()), Err(SourceError::PinActive));
+
+    let mut cloned = first.clone();
+    assert_eq!(cloned.pin_count(req.file(), req.revision()), 0);
+    assert!(!cloned.unpin(&first_pin));
+    let clone_pin = cloned.pin(req.file(), req.revision()).unwrap();
+    assert!(!cloned.unpin(&first_pin));
+    assert!(!first.unpin(&clone_pin));
+    assert_eq!(cloned.evict(req.file(), req.revision()), Err(SourceError::PinActive));
+    assert!(cloned.unpin(&clone_pin));
+    assert_eq!(cloned.evict(req.file(), req.revision()), Ok(true));
+    assert_eq!(first.evict(req.file(), req.revision()), Err(SourceError::PinActive));
+    assert!(first.unpin(&first_pin));
+    assert!(second.unpin(&second_pin));
 }

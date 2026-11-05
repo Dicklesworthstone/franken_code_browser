@@ -9,12 +9,12 @@
 //! snapshot. We never claim an invented atomic snapshot.
 //!
 //! An in-memory owned snapshot is immutable. Old captures can be pinned to keep their
-//! backing alive. When an old capture has been evicted, an anchor resolves only if its
-//! immutable backing remains or new live bytes verify as the exact same capture digest.
-//! Otherwise, an explicit stale/diverged result is returned with an action to open the
-//! current source; an old search hit is NEVER silently resolved against different live bytes.
+//! backing alive. An anchor resolves only against its retained immutable backing.
+//! An observation digest is a non-cryptographic change detector, not evidence that
+//! newly read bytes are the old capture. Once backing is unavailable, resolution
+//! returns an explicit stale/diverged result; opening current source is deliberate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
@@ -116,8 +116,18 @@ impl ObservedSnapshot {
         backing: SnapshotBacking,
         metadata: FileObservationMetadata,
     ) -> Result<Self, SourceError> {
-        if file.owner() != revision.owner() {
+        let request = match &backing {
+            SnapshotBacking::Complete(capture) => capture.request(),
+            SnapshotBacking::Extent(capture) => capture.request(),
+        };
+        if file.owner() != revision.owner()
+            || request.file().owner() != file.owner()
+            || request.revision().owner() != revision.owner()
+        {
             return Err(SourceError::ForeignOwner);
+        }
+        if request.file() != file || request.revision() != revision {
+            return Err(SourceError::MetadataMismatch);
         }
         let digest = backing.digest();
         Ok(Self {
@@ -287,7 +297,8 @@ static NEXT_PIN_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SnapshotPinId(u64);
 
-/// An active pin holding a snapshot's backing in memory.
+/// An active pin holding a snapshot's backing in its issuing store.
+/// Cloning a token does not acquire another pin; any copy can release it once.
 #[derive(Clone, Debug)]
 pub struct SnapshotPin {
     id: SnapshotPinId,
@@ -310,11 +321,23 @@ impl SnapshotPin {
 }
 
 /// Store of retained snapshots supporting snapshot pins and safe eviction.
-#[derive(Clone, Debug)]
+/// A clone retains the immutable snapshots but starts with no issued pins:
+/// callers must explicitly pin within that new store.
+#[derive(Debug)]
 pub struct PinnedSnapshotStore {
     owner: ArenaOwnerId,
     snapshots: BTreeMap<(FileId, SourceRevision), ObservedSnapshot>,
-    active_pins: BTreeMap<(FileId, SourceRevision), u32>,
+    active_pins: BTreeMap<(FileId, SourceRevision), BTreeSet<SnapshotPinId>>,
+}
+
+impl Clone for PinnedSnapshotStore {
+    fn clone(&self) -> Self {
+        Self {
+            owner: self.owner,
+            snapshots: self.snapshots.clone(),
+            active_pins: BTreeMap::new(),
+        }
+    }
 }
 
 impl PinnedSnapshotStore {
@@ -373,10 +396,16 @@ impl PinnedSnapshotStore {
             return Err(SourceError::CaptureUnavailable);
         }
 
-        let count = self.active_pins.entry(key).or_insert(0);
-        *count = count.saturating_add(1);
-
-        let pin_id = SnapshotPinId(NEXT_PIN_ID.fetch_add(1, Ordering::Relaxed));
+        if self.active_pins.get(&key).is_some_and(|pins| pins.len() >= u32::MAX as usize) {
+            return Err(SourceError::IdentityExhausted);
+        }
+        // Unique token IDs never wrap or transfer authority between stores,
+        // even when both stores use the same owner, file and revision.
+        let pin_id = SnapshotPinId(
+            NEXT_PIN_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+                .map_err(|_| SourceError::IdentityExhausted)?,
+        );
+        self.active_pins.entry(key).or_default().insert(pin_id);
         Ok(SnapshotPin {
             id: pin_id,
             file,
@@ -384,24 +413,26 @@ impl PinnedSnapshotStore {
         })
     }
 
-    /// Release an active pin.
+    /// Release this issued token once. Unknown, already released and foreign
+    /// tokens leave every other active pin untouched.
     pub fn unpin(&mut self, pin: &SnapshotPin) -> bool {
         let key = (pin.file(), pin.revision());
-        if let Some(count) = self.active_pins.get_mut(&key) {
-            if *count > 1 {
-                *count -= 1;
-                return true;
-            } else {
-                self.active_pins.remove(&key);
-                return true;
+        if let Some(pins) = self.active_pins.get_mut(&key) {
+            if !pins.remove(&pin.id()) {
+                return false;
             }
+            if pins.is_empty() {
+                self.active_pins.remove(&key);
+            }
+            return true;
         }
         false
     }
 
     /// Returns the number of active pins on a snapshot revision.
     pub fn pin_count(&self, file: FileId, revision: SourceRevision) -> u32 {
-        self.active_pins.get(&(file, revision)).copied().unwrap_or(0)
+        // Admission checks the u32 bound before inserting another token.
+        self.active_pins.get(&(file, revision)).map_or(0, |pins| pins.len() as u32)
     }
 
     /// Evict a snapshot revision from the store.
@@ -413,7 +444,7 @@ impl PinnedSnapshotStore {
         }
 
         let key = (file, revision);
-        if self.active_pins.get(&key).copied().unwrap_or(0) > 0 {
+        if self.active_pins.contains_key(&key) {
             return Err(SourceError::PinActive);
         }
 
@@ -426,10 +457,11 @@ impl PinnedSnapshotStore {
 pub enum AnchorResolution {
     /// Resolved against immutable pinned or retained backing in memory.
     ExactPinned(ExactRangeResult),
-    /// Old snapshot was evicted, but live source was re-read and its observation digest
-    /// matched the old capture digest exactly.
+    /// Reserved for callers with independent exact-byte verification.
+    /// The digest-only `AnchorResolver::resolve` API never emits this variant.
     VerifiedLiveMatch(ExactRangeResult),
-    /// Old capture was evicted and current live bytes have a different digest.
+    /// Old capture backing is unavailable. Matching observation digests alone
+    /// cannot verify equality, so this also covers equal-digest live candidates.
     /// Never substitutes live bytes under the old revision identity!
     StaleOrDiverged {
         old_revision: SourceRevision,
@@ -444,11 +476,10 @@ pub struct AnchorResolver;
 impl AnchorResolver {
     /// Resolve an anchor range for a given file and revision.
     ///
-    /// 1. If the snapshot is retained/pinned in `store`, serves the exact bytes.
-    /// 2. If the snapshot was evicted, checks `live_candidate`.
-    ///    - If `live_candidate.digest() == expected_old_digest`: returns `VerifiedLiveMatch`.
-    ///    - If `live_candidate.digest() != expected_old_digest`: returns `StaleOrDiverged`.
-    /// 3. If no live candidate is available: returns `StaleOrDiverged`.
+    /// Retained backing is authoritative only for its exact owner/file/revision.
+    /// A live candidate must name the same file in the same owner domain, but
+    /// matching its non-cryptographic observation digest cannot establish byte
+    /// equality after eviction. Such candidates remain explicitly stale.
     pub fn resolve(
         store: &PinnedSnapshotStore,
         file: FileId,
@@ -457,32 +488,30 @@ impl AnchorResolver {
         expected_old_digest: ObservationDigest,
         live_candidate: Option<&ObservedSnapshot>,
     ) -> Result<AnchorResolution, SourceError> {
-        if let Ok(retained) = store.get(file, revision) {
-            let res = retained.range_read(range)?;
-            return Ok(AnchorResolution::ExactPinned(res));
+        match store.get(file, revision) {
+            Ok(retained) => {
+                if retained.digest() != expected_old_digest {
+                    return Err(SourceError::MetadataMismatch);
+                }
+                return Ok(AnchorResolution::ExactPinned(retained.range_read(range)?));
+            }
+            Err(SourceError::CaptureUnavailable) => {}
+            Err(error) => return Err(error),
         }
 
-        // Old capture was evicted
-        match live_candidate {
-            Some(live) if live.digest() == expected_old_digest => {
-                // Verified exact match
-                let res = live.range_read(range)?;
-                Ok(AnchorResolution::VerifiedLiveMatch(res))
+        if let Some(live) = live_candidate {
+            if live.file().owner() != store.owner() || live.revision().owner() != store.owner() {
+                return Err(SourceError::ForeignOwner);
             }
-            Some(live) => {
-                // Diverged! Refuse silent substitution
-                Ok(AnchorResolution::StaleOrDiverged {
-                    old_revision: revision,
-                    old_digest: expected_old_digest,
-                    current_digest: Some(live.digest()),
-                })
+            if live.file() != file {
+                return Err(SourceError::MetadataMismatch);
             }
-            None => Ok(AnchorResolution::StaleOrDiverged {
-                old_revision: revision,
-                old_digest: expected_old_digest,
-                current_digest: None,
-            }),
         }
+        Ok(AnchorResolution::StaleOrDiverged {
+            old_revision: revision,
+            old_digest: expected_old_digest,
+            current_digest: live_candidate.map(ObservedSnapshot::digest),
+        })
     }
 }
 
@@ -602,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn anchor_resolution_matches_live_when_digest_identical() {
+    fn anchor_resolution_requires_backing_even_when_live_digest_matches() {
         let o = owner(3);
         let f = file(o, 30);
         let r = revision(o, 1);
@@ -621,12 +650,11 @@ mod tests {
         )
         .unwrap();
 
-        match res {
-            AnchorResolution::VerifiedLiveMatch(exact) => {
-                assert_eq!(exact.bytes(), b"same");
-            }
-            _ => assert_eq!(true, false, "expected VerifiedLiveMatch"),
-        }
+        assert_eq!(res, AnchorResolution::StaleOrDiverged {
+            old_revision: r,
+            old_digest: expected_digest,
+            current_digest: Some(expected_digest),
+        });
     }
 
     #[test]

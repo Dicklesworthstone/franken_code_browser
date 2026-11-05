@@ -1,12 +1,10 @@
 //! Old-capture anchor resolution against immutable captures (FCB-082.A).
 //!
 //! When a source file is captured, text anchors (byte offsets) are recorded.
-//! When the file changes, those anchors become stale unless either:
-//! 1. The original capture is retained (retained backing), or
-//! 2. The current bytes at the anchor offsets are byte-verified equal.
-//!
-//! Otherwise, the anchor is stale and the caller must explicitly choose to
-//! open the current version. No false visual-exact claims are made.
+//! They remain usable through retained immutable backing. Once that backing is
+//! evicted, a non-cryptographic digest cannot prove equality with current bytes;
+//! this legacy digest-only API reports stale even when the digest matches.
+//! The caller must explicitly choose to open the current version.
 //!
 //! §10.7, §10.9: Unicode's bidi and grapheme algorithms operate on their defined context,
 //! not arbitrary byte tiles. For pathological lines whose required context exceeds the active
@@ -35,8 +33,8 @@ impl OldAnchor {
 pub enum OldAnchorResolution {
     /// The original capture is retained; the anchor is valid as-is.
     Retained,
-    /// The original capture was evicted, but the current bytes at this
-    /// anchor's offset are byte-verified equal to the recorded digest.
+    /// Reserved for callers with independent exact-byte verification.
+    /// The digest-only `resolve_old_anchor` API never emits this variant.
     ByteVerified,
     /// The anchor is stale: neither retained backing nor byte-verified
     /// equality. The caller must deliberately open the current version.
@@ -157,28 +155,24 @@ impl LineContextProperties {
 ///
 /// # Returns
 /// - `Retained` if the capture backing is retained (anchor is valid)
-/// - `ByteVerified` if the current bytes hash to the recorded digest
-/// - `Stale` otherwise
+/// - `Stale` if the backing is evicted, even when the digest matches
+///
+/// This compatibility helper has no retained byte witness or capture identity
+/// capability with which to prove a live candidate equal. Digest equality is
+/// only a change detector and never authorizes opening live bytes as historical.
 pub fn resolve_old_anchor(
     _anchor: &OldAnchor,
     backing: CaptureBacking,
-    current_bytes: &[u8],
-    recorded_digest: u64,
+    _current_bytes: &[u8],
+    _recorded_digest: u64,
 ) -> OldAnchorResolution {
     match backing {
         CaptureBacking::Retained => OldAnchorResolution::Retained,
-        CaptureBacking::Evicted => {
-            let current_digest = fnv1a(current_bytes);
-            if current_digest == recorded_digest {
-                OldAnchorResolution::ByteVerified
-            } else {
-                OldAnchorResolution::Stale
-            }
-        }
+        CaptureBacking::Evicted => OldAnchorResolution::Stale,
     }
 }
 
-/// Compute the FNV-1a digest used for byte verification.
+/// Compute a non-cryptographic change detector, never proof of byte equality.
 pub fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xCBF2_9CE4_8422_2325;
     for byte in bytes {
@@ -219,9 +213,13 @@ pub struct AnchorResolutionResult {
 
 impl AnchorResolutionResult {
     /// The default action and visual readiness for a given resolution.
+    /// Retained authority opens the historical capture, never the live file.
     pub const fn with_default_action(resolution: OldAnchorResolution) -> Self {
         let (action, visual_readiness) = match resolution {
-            OldAnchorResolution::Retained | OldAnchorResolution::ByteVerified => {
+            OldAnchorResolution::Retained => {
+                (OpenCurrentAction::OpenHistorical, VisualContextReadiness::ExactVisual)
+            }
+            OldAnchorResolution::ByteVerified => {
                 (OpenCurrentAction::OpenCurrent, VisualContextReadiness::ExactVisual)
             }
             OldAnchorResolution::Stale => {
@@ -244,9 +242,8 @@ impl AnchorResolutionResult {
     /// Construct resolution result accounting for line context properties.
     pub fn with_context(resolution: OldAnchorResolution, context: &LineContextProperties) -> Self {
         let action = match resolution {
-            OldAnchorResolution::Retained | OldAnchorResolution::ByteVerified => {
-                OpenCurrentAction::OpenCurrent
-            }
+            OldAnchorResolution::Retained => OpenCurrentAction::OpenHistorical,
+            OldAnchorResolution::ByteVerified => OpenCurrentAction::OpenCurrent,
             OldAnchorResolution::Stale => OpenCurrentAction::Dismiss,
         };
         let visual_readiness = match resolution {
@@ -282,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn evicted_backing_byte_verifies_matching_digest() {
+    fn evicted_backing_stays_stale_with_matching_digest() {
         let anchor = OldAnchor { offset: 0, revision: 2 };
         let data = b"the actual bytes";
         let digest = fnv1a(data);
@@ -292,9 +289,9 @@ mod tests {
             data,
             digest,
         );
-        assert_eq!(result, OldAnchorResolution::ByteVerified);
-        assert!(result.is_usable());
-        assert_eq!(result.code(), "BYTE_VERIFIED");
+        assert_eq!(result, OldAnchorResolution::Stale);
+        assert!(!result.is_usable());
+        assert_eq!(result.code(), "STALE");
     }
 
     #[test]
@@ -322,13 +319,13 @@ mod tests {
     }
 
     #[test]
-    fn retained_resolution_defaults_to_open_current() {
+    fn retained_resolution_defaults_to_open_historical() {
         let result = AnchorResolutionResult::with_default_action(
             OldAnchorResolution::Retained,
         );
-        assert_eq!(result.action, OpenCurrentAction::OpenCurrent);
+        assert_eq!(result.action, OpenCurrentAction::OpenHistorical);
         assert_eq!(result.visual_readiness, VisualContextReadiness::ExactVisual);
-        assert_eq!(result.action.code(), "OPEN_CURRENT");
+        assert_eq!(result.action.code(), "OPEN_HISTORICAL");
     }
 
     #[test]
@@ -342,7 +339,7 @@ mod tests {
         assert_eq!(ctx.assess_readiness(), VisualContextReadiness::ContextPending);
 
         let res = AnchorResolutionResult::with_context(OldAnchorResolution::Retained, &ctx);
-        assert_eq!(res.action, OpenCurrentAction::OpenCurrent);
+        assert_eq!(res.action, OpenCurrentAction::OpenHistorical);
         assert_eq!(res.visual_readiness, VisualContextReadiness::ContextPending);
         assert!(!res.visual_readiness.is_exact());
     }

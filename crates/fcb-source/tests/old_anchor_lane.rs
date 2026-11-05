@@ -3,7 +3,7 @@
 //!
 //! Required cases:
 //! 1. `retained_backing_resolves_immediately` — Retained backing pins anchor without reading live bytes.
-//! 2. `byte_verified_matching_digest` — Evicted capture re-verifies matching bytes and succeeds.
+//! 2. `matching_digest_without_backing_is_stale` — A matching digest does not authorize live bytes.
 //! 3. `diverged_live_bytes_never_substituted` — Diverged live bytes return Stale, never substituted.
 //! 4. `huge_500mb_line_boundary` — 500MB line handled with checked bounds; context pending, no false visual claim.
 //! 5. `bidi_paragraph_context_bounds` — Pathological bidi paragraph exceeding budget marks context pending.
@@ -73,28 +73,28 @@ fn test_retained_backing_resolves_immediately() {
     assert_eq!(result.code(), "RETAINED");
 
     let full_result = AnchorResolutionResult::with_default_action(result);
-    assert_eq!(full_result.action, OpenCurrentAction::OpenCurrent);
+    assert_eq!(full_result.action, OpenCurrentAction::OpenHistorical);
     assert_eq!(full_result.visual_readiness, VisualContextReadiness::ExactVisual);
 
     record_receipt("retained_backing", Effect::Succeeded, "retained backing resolves without live byte dependence");
 }
 
 #[test]
-fn test_byte_verified_matching_digest() {
+fn test_matching_digest_without_backing_is_stale() {
     let content = b"fn main() { println!(\"hello\"); }";
     let digest = fnv1a(content);
     let anchor = OldAnchor::new(12, 1);
 
     let result = resolve_old_anchor(&anchor, CaptureBacking::Evicted, content, digest);
-    assert_eq!(result, OldAnchorResolution::ByteVerified);
-    assert!(result.is_usable());
-    assert_eq!(result.code(), "BYTE_VERIFIED");
+    assert_eq!(result, OldAnchorResolution::Stale);
+    assert!(!result.is_usable());
+    assert_eq!(result.code(), "STALE");
 
     let full_result = AnchorResolutionResult::with_default_action(result);
-    assert_eq!(full_result.action, OpenCurrentAction::OpenCurrent);
-    assert!(full_result.visual_readiness.is_exact());
+    assert_eq!(full_result.action, OpenCurrentAction::Dismiss);
+    assert!(!full_result.visual_readiness.is_exact());
 
-    record_receipt("byte_verified", Effect::Succeeded, "evicted backing re-verifies matching live bytes");
+    record_receipt("digest_only_stale", Effect::Succeeded, "matching digest does not prove live bytes equal an evicted capture");
 }
 
 #[test]
@@ -135,7 +135,7 @@ fn test_500mb_huge_line_boundary() {
     assert_eq!(ctx.assess_readiness(), VisualContextReadiness::ContextPending);
 
     let full_res = AnchorResolutionResult::with_context(result, &ctx);
-    assert_eq!(full_res.action, OpenCurrentAction::OpenCurrent);
+    assert_eq!(full_res.action, OpenCurrentAction::OpenHistorical);
     assert_eq!(full_res.visual_readiness, VisualContextReadiness::ContextPending);
     assert!(!full_res.visual_readiness.is_exact(), "must not claim false visual-exactness on 500MB line");
 

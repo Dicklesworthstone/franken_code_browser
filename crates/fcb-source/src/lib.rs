@@ -597,6 +597,8 @@ pub enum SourceError {
     StaleCapture,
     /// Eviction was refused because the snapshot backing is actively pinned.
     PinActive,
+    /// An identity or active-pin counter cannot advance without reuse or overflow.
+    IdentityExhausted,
     /// A native unsigned sentinel value (such as NSNotFound) was passed as an offset.
     NativeSentinel,
     /// An offset fell in the interior of a multi-byte UTF-8 character.
@@ -633,6 +635,7 @@ impl SourceError {
             Self::ChunkOutOfBounds => "SOURCE_CHUNK_OUT_OF_BOUNDS",
             Self::StaleCapture => "SOURCE_STALE_CAPTURE",
             Self::PinActive => "SOURCE_PIN_ACTIVE",
+            Self::IdentityExhausted => "SOURCE_IDENTITY_EXHAUSTED",
             Self::NativeSentinel => "SOURCE_NATIVE_SENTINEL",
             Self::InvalidUtf8Boundary => "SOURCE_INVALID_UTF8_BOUNDARY",
             Self::InvalidUtf16 => "SOURCE_INVALID_UTF16",
