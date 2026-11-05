@@ -91,6 +91,65 @@ struct AtlasProjectOpening {
     }
 }
 
+/// Resolve a window's initial project exactly once. Later picker/recents changes
+/// and refreshes own their root independently of the process's launch arguments.
+/// This is lexical admission only: existence, file kind and grants are checked by
+/// the asynchronous project opener, never by filesystem I/O on the main actor.
+struct AtlasProjectStartup {
+    enum Selection {
+        case open(root: String, remember: Bool)
+        case chooseProject
+        case invalidRoot
+    }
+
+    private(set) var consumed = false
+
+    /// Named -fcb.root overrides are the native_launch.rs protocol and remain
+    /// per-launch (NSArgumentDomain), without changing persistent preferences.
+    /// The legacy first positional project retains its existing remember policy.
+    mutating func consume(arguments: [String], restoredRoot: String) -> Selection? {
+        guard !consumed else { return nil }
+        consumed = true
+        guard arguments.count <= 64 else { return .invalidRoot }
+        var total = 0
+        for argument in arguments.dropFirst() {
+            let count = argument.utf8.count
+            guard count <= 32_768, count <= 65_536 - total else { return .invalidRoot }
+            total += count
+        }
+
+        var namedRoot: String?
+        var index = 1
+        while index < arguments.count {
+            let argument = arguments[index]; index += 1
+            if argument == "-fcb.root" {
+                guard namedRoot == nil, index < arguments.count else { return .invalidRoot }
+                let value = arguments[index]; index += 1
+                guard Self.validRoot(value) else { return .invalidRoot }
+                namedRoot = value
+            } else if argument == "-fcb.file-hex" {
+                // Filename decoding and capture authority belong exclusively to
+                // AtlasStartupFileRequest. Its value is never a project path.
+                guard index < arguments.count else { return .invalidRoot }
+                index += 1
+            }
+        }
+        if let namedRoot { return .open(root: namedRoot, remember: false) }
+        if let first = arguments.dropFirst().first, !first.hasPrefix("-") {
+            guard Self.validRoot(first) else { return .invalidRoot }
+            return .open(root: first, remember: true)
+        }
+        // Unknown options and their values are not positional project roots.
+        guard !restoredRoot.isEmpty else { return .chooseProject }
+        guard Self.validRoot(restoredRoot) else { return .invalidRoot }
+        return .open(root: restoredRoot, remember: false)
+    }
+
+    private static func validRoot(_ root: String) -> Bool {
+        root.hasPrefix("/") && root.utf8.count <= 16_384 && !root.utf8.contains(0)
+    }
+}
+
 extension AtlasSearchContext {
     /// Content queries do not depend on an optional preview's geometry. Admit
     /// source results across preview publication ONLY under the same project,

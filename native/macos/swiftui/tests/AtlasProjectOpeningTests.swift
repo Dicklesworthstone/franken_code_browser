@@ -7,6 +7,14 @@ import Foundation
     @MainActor private static func check(_ value: @autoclosure () -> Bool, _ label: String) {
         precondition(value(), label); checks += 1
     }
+    private static func opens(_ selection: AtlasProjectStartup.Selection?, root: String, remember: Bool = false) -> Bool {
+        guard case .open(let selected, let shouldRemember)? = selection else { return false }
+        return selected.utf8.elementsEqual(root.utf8) && shouldRemember == remember
+    }
+    private static func rejects(_ selection: AtlasProjectStartup.Selection?) -> Bool {
+        if case .invalidRoot? = selection { return true }
+        return false
+    }
     private static func catalog(paths: [String] = ["612e7273"], complete: Bool = true) throws -> AtlasProjectCatalog {
         let entries: [[String: Any]] = paths.enumerated().map { i, path in
             ["file_id": String(i + 1), "observed_bytes": "64", "path": ["encoding": "unix-bytes", "hex": path, "display": "escaped"],
@@ -24,6 +32,85 @@ import Foundation
     }
     @MainActor static func main() throws {
         let metadata = try catalog()
+        do {
+            var startup = AtlasProjectStartup()
+            check(!startup.consumed, "Startup construction reads no defaults or process arguments")
+            check(opens(startup.consume(arguments: ["fcb", "/first-launch"], restoredRoot: ""),
+                        root: "/first-launch", remember: true),
+                  "An explicit positional project opens on a fresh install before any saved root exists")
+            check(startup.consumed, "Initial project selection is consumed by this window")
+            var currentRoot = "/picked-later"
+            if case .open(let replayed, _)? = startup.consume(arguments: ["fcb", "/first-launch"], restoredRoot: "/first-launch") {
+                currentRoot = replayed
+            }
+            check(currentRoot == "/picked-later", "Reappearance and refresh cannot overwrite a later picker or recents choice")
+            var anotherWindow = AtlasProjectStartup()
+            check(opens(anotherWindow.consume(arguments: ["fcb", "/other-window"], restoredRoot: ""),
+                        root: "/other-window", remember: true),
+                  "One window consuming startup does not consume another window's initial selection")
+        }
+        do {
+            for arguments in [
+                ["fcb", "-fcb.root", "/native"],
+                ["fcb", "-fcb.root", "/native", "-fcb.file-hex", "2d66696c652e7273"],
+                ["fcb", "-fcb.file-hex", "2d66696c652e7273", "-fcb.root", "/native"],
+                ["fcb", "-NSDocumentRevisionsDebugMode", "YES", "-fcb.root", "/native"],
+                ["fcb", "/legacy", "-fcb.root", "/native"],
+            ] {
+                var startup = AtlasProjectStartup()
+                check(opens(startup.consume(arguments: arguments, restoredRoot: "/saved"), root: "/native"),
+                      "The named launcher protocol takes precedence and does not persist a per-launch override")
+            }
+            for arguments in [["fcb"], ["fcb", "-unknown", "/not-a-project"],
+                              ["fcb", "-fcb.file-hex", "2d66696c652e7273"]] {
+                var startup = AtlasProjectStartup()
+                check(opens(startup.consume(arguments: arguments, restoredRoot: "/saved"), root: "/saved"),
+                      "Unknown options and filename-hex values are never inferred to be project directories")
+            }
+            var empty = AtlasProjectStartup()
+            if case .chooseProject? = empty.consume(arguments: ["fcb", "-unknown", "/not-a-project"], restoredRoot: "") {
+                check(true, "A fresh window without a project opens the chooser")
+            } else { check(false, "Unknown options must not turn their values into a project") }
+        }
+        do {
+            for root in ["", "relative/path", "-flag", "/nul\u{0}root", "/" + String(repeating: "x", count: 16_384)] {
+                var startup = AtlasProjectStartup()
+                check(rejects(startup.consume(arguments: ["fcb", "-fcb.root", root], restoredRoot: "/saved")),
+                      "An invalid explicit root cannot silently fall back to a different saved project")
+            }
+            for arguments in [["fcb", "-fcb.root"], ["fcb", "-fcb.root", "/a", "-fcb.root", "/b"],
+                              ["fcb", "-fcb.file-hex"], ["fcb", "relative/path"]] {
+                var startup = AtlasProjectStartup()
+                check(rejects(startup.consume(arguments: arguments, restoredRoot: "/saved")),
+                      "Malformed or ambiguous startup roots are rejected before opening")
+            }
+            var saved = AtlasProjectStartup()
+            check(rejects(saved.consume(arguments: ["fcb"], restoredRoot: "relative/path")),
+                  "A malformed saved path is not treated as a current project grant")
+            var failed = AtlasProjectStartup()
+            _ = failed.consume(arguments: ["fcb", "-fcb.root"], restoredRoot: "")
+            if case nil = failed.consume(arguments: ["fcb", "/later"], restoredRoot: "") {
+                check(true, "Invalid initial input is consumed; a later explicit picker action owns recovery")
+            } else { check(false, "Invalid startup input must not become a repeated launch request") }
+        }
+        do {
+            let maximumRoot = "/" + String(repeating: "x", count: 16_383)
+            let decomposed = "/repo/cafe\u{301}/../source"
+            for root in [maximumRoot, decomposed, "/not-inspected-at-startup"] {
+                var startup = AtlasProjectStartup()
+                check(opens(startup.consume(arguments: ["fcb", "-fcb.root", root], restoredRoot: ""), root: root),
+                      "Admitted root bytes stay exact; filesystem validation belongs to the asynchronous opener")
+            }
+            for arguments in [
+                ["fcb"] + Array(repeating: "-unknown", count: 64),
+                ["fcb", "-" + String(repeating: "x", count: 32_768)],
+                ["fcb", "-" + String(repeating: "x", count: 32_767), "-" + String(repeating: "x", count: 32_767), "-x"],
+            ] {
+                var startup = AtlasProjectStartup()
+                check(rejects(startup.consume(arguments: arguments, restoredRoot: "/saved")),
+                      "Startup parsing bounds argument count, per-argument bytes and total bytes")
+            }
+        }
         do {
             var opening = AtlasProjectOpening()
             let first = opening.begin()

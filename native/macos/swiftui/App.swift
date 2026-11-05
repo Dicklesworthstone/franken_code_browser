@@ -218,8 +218,8 @@ extension AtlasCamera {
     @State private var root = ""
     @State private var rootAccess: AppStoreRootAccess?
 #else
-    @State private var root = UserDefaults.standard.string(forKey: "fcb.root")
-        ?? Engine.defaultRoot
+    @State private var root = ""
+    @State private var projectStartup = AtlasProjectStartup()
 #endif
     @State private var query = ""
     @FocusState private var searchFocused: Bool
@@ -413,6 +413,23 @@ extension AtlasCamera {
             if let recent = Engine.recents.first { restoreProject(recent) }
             else { status = "Choose a project folder to begin exploring its source." }
 #else
+            if !projectStartup.consumed,
+               let selection = projectStartup.consume(arguments: CommandLine.arguments,
+                restoredRoot: UserDefaults.standard.string(forKey: "fcb.root") ?? Engine.defaultRoot) {
+                switch selection {
+                case .open(let initialRoot, let remember):
+                    root = initialRoot
+                    if remember {
+                        UserDefaults.standard.set(initialRoot, forKey: "fcb.root")
+                        Engine.remember(root: initialRoot)
+                    }
+                case .chooseProject:
+                    root = ""
+                case .invalidRoot:
+                    root = ""
+                    status = "The startup project path is invalid. Choose a project folder to begin."
+                }
+            }
             if !root.isEmpty { requestAtlasLoad() }
 #endif
         }
@@ -1139,15 +1156,6 @@ extension AtlasCamera {
         searchPathInput = ""
         let cancellation = AtlasSearchCancellation()
         loadCancellation = cancellation
-#if !FCB_APP_STORE
-        if let argRoot = CommandLine.arguments.dropFirst().first,
-            FileManager.default.fileExists(atPath: argRoot)
-        {
-            root = argRoot
-            UserDefaults.standard.set(argRoot, forKey: "fcb.root")
-            Engine.remember(root: argRoot)
-        }
-#endif
         let requestedRoot = root
         let accessLease: AnyObject?
         pinnedReaders.bind(root: requestedRoot)
