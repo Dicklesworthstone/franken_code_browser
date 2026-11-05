@@ -487,6 +487,9 @@ private final class AtlasSavedSession: @unchecked Sendable {
                           member.path.bytes == hit.path.bytes, member.digest == hit.digest,
                           hit.start < hit.end, hit.end <= member.observedBytes else { throw AtlasSavedError.invalidResponse }
                     contextStart = hit.start > 132 ? hit.start - 132 : 0
+                } else if case .relationship(_, let link, .target) = origin, let range = link.targetRange {
+                    guard range.end <= member.observedBytes else { throw AtlasSavedError.invalidResponse }
+                    contextStart = range.contextStart
                 } else { contextStart = 0 }
                 let receipt = AtlasSavedReaderReceiptBox()
                 try await reader.openRetained(pathBytes: member.path.bytes, offset: contextStart, registryDomain: domain) { destination in

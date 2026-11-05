@@ -215,7 +215,7 @@ fn check(canceled: &mut impl FnMut() -> bool) -> Result<(), DocumentLinkError> {
 // Reference destinations AND titles are cloned once per use before our output
 // limits apply. Count only possible uses for conservative allocation admission;
 // this is not Markdown parsing, and false-positive syntax only reduces admission.
-fn parse_workspace(source: &[u8]) -> Result<usize, DocumentLinkError> {
+pub(crate) fn parse_workspace(source: &[u8]) -> Result<usize, DocumentLinkError> {
     let ordinary = source.len().checked_mul(512).ok_or(DocumentLinkError::ComplexityLimit)?;
     let reference_overlap = if source.windows(2).any(|bytes| bytes == b"]:") {
         let uses = source.iter().filter(|&&byte| byte == b'[').count();

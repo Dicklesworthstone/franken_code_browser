@@ -57,7 +57,8 @@ fn captured_links_and_reverse_backlinks_use_exact_manifest_members_and_occurrenc
     assert_eq!(result.get("scanned_markdown_members").number(), 2);
     assert_eq!(result.get("retained_links").number(), 10);
     assert_eq!(result.get("links_seen").number(), 10);
-    assert_eq!(result.get("member_bytes_read").number(), (readme.len() + guide.len()) as u64);
+    // Both fragments into README share one additional, bounded heading pass.
+    assert_eq!(result.get("member_bytes_read").number(), (2 * readme.len() + guide.len()) as u64);
     assert_eq!(result.get("retained_source_payload_bytes").number(), 0);
     let links = result.get("links").array();
     for (index, link) in links.iter().enumerate() {
@@ -71,7 +72,7 @@ fn captured_links_and_reverse_backlinks_use_exact_manifest_members_and_occurrenc
     assert_eq!(links[0].get("target_member").number(), 2);
     assert_eq!(links[0].get("target_path").get("hex").text(), hex(b"src/a b.rs"));
     assert_eq!(links[0].get("target_suffix").text(), "#L2");
-    assert_eq!(links[0].get("fragment_resolution").text(), "unresolved");
+    assert_eq!(links[0].get("fragment_resolution").text(), "unsupported");
     assert_eq!(links[0].get("source_digest").text(), Sha256::digest(readme).to_hex());
     assert_eq!(links[1].get("target_member").number(), 2);
     assert_eq!(links[1].get("source_link_id").number(), 2);
@@ -81,7 +82,9 @@ fn captured_links_and_reverse_backlinks_use_exact_manifest_members_and_occurrenc
         assert_eq!(links[index].get("resolution").text(), status);
     }
     assert_eq!(links[7].get("target_member").number(), 0);
-    assert_eq!(links[7].get("fragment_resolution").text(), "unresolved");
+    assert_eq!(links[7].get("fragment_resolution").text(), "resolved");
+    assert_eq!(links[7].get("fragment_slug").text(), "overview");
+    assert_eq!(links[7].get("target_range").get("start").number(), 0);
 
     let before = reads(&mut saved);
     let first = json(&saved.relationship_page(7, Some(2), Direction::Incoming, 0, 2, || false).unwrap());
@@ -125,7 +128,7 @@ fn reader_navigation_keeps_original_bom_frontmatter_and_malformed_target_bytes_a
     assert_eq!(receipt.get("source_digest").text(), Sha256::digest(code).to_hex());
     assert_eq!(receipt.get("offset").number(), 0);
     assert_eq!(receipt.get("selection"), &Json::Null);
-    assert_eq!(receipt.get("fragment_resolution").text(), "unresolved");
+    assert_eq!(receipt.get("fragment_resolution").text(), "unsupported");
     assert_eq!(receipt.get("reader").get("capture_sha256").text(), Sha256::digest(code).to_hex());
     assert_eq!(receipt.get("member_bytes_read").number(), code.len() as u64);
     assert_ne!(evidence.capture().request().file().owner(), target.capture().request().file().owner());
@@ -303,7 +306,7 @@ fn relationship_desk_navigation_enters_normal_history_and_refused_actions_keep_o
     assert_eq!(desk.model().source(active, 2).unwrap().bytes(), code);
     let receipt = json(&saved.desk_open_response(&desk, &target).unwrap());
     assert_eq!(receipt.get("relationship_side").text(), "target");
-    assert_eq!(receipt.get("fragment_resolution").text(), "unresolved");
+    assert_eq!(receipt.get("fragment_resolution").text(), "unsupported");
     drop(saved);
     fs::rename(&f.path, f.root.join("moved.fcbs")).unwrap();
     desk.apply(2, 3, DeskCommand::Back, || false).unwrap();
@@ -330,4 +333,158 @@ fn hostile_reference_amplification_is_explicit_partial_coverage_while_other_docu
     assert!(!result.get("relationships_complete").flag());
     let (mut reader, _) = saved.open_relationship_reader(owner(56202), 1, 1, Side::Target, || false).unwrap();
     assert_eq!(copy_all(&mut reader).get("original_hex").text(), hex(b"captured code"));
+}
+
+#[test]
+fn encoded_canonical_headings_open_exact_bom_crlf_ranges_in_readers_and_desk() {
+    let source = b"# Local\n\n[guide](docs/guide.md#caf-%64etails) [query](docs/guide.md?view=source#caf-%64etails) [self](#local)\n";
+    let guide = format!("\u{feff}{}\r\n\r\n## Café Details\r\n\r\nBody.\r\n", "x".repeat(200));
+    let f = Fixture::new(&[entry(b"README.md", source), entry(b"docs/guide.md", guide.as_bytes())], true);
+    let mut saved = f.open(56201);
+    let result = prepare(&mut saved, 1);
+    let links = result.get("links").array();
+    let range = links[0].get("target_range");
+    let start = range.get("start").number(); let end = range.get("end").number();
+    assert_eq!(links[0].get("fragment_resolution").text(), "resolved");
+    assert_eq!(links[0].get("fragment_slug").text(), "caf-details");
+    assert_eq!(start, 207); // Three BOM bytes, 200 ASCII bytes, two CRLFs.
+    assert_eq!(guide[start as usize..end as usize].trim_end(), "## Café Details");
+    assert_eq!(links[1].get("target_range"), range);
+    assert_eq!(links[1].get("target_suffix").text(), "?view=source#caf-%64etails");
+    assert_eq!(links[2].get("fragment_resolution").text(), "resolved");
+    assert_eq!(links[2].get("target_range").get("start").number(), 0);
+    // Repeated references never reread a target per occurrence; both source
+    // members have one extraction pass and one shared heading pass.
+    assert_eq!(result.get("member_bytes_read").number(), 2 * (source.len() + guide.len()) as u64);
+    let before = reads(&mut saved);
+    saved.relationship_page(1, Some(1), Direction::Incoming, 0, 64, || false).unwrap();
+    assert_eq!(reads(&mut saved), before);
+
+    let (mut reader, response) = saved.open_relationship_reader(owner(56202), 1, 1, Side::Target, || false).unwrap();
+    let receipt = json(&response);
+    assert_eq!(receipt.get("offset").number(), start);
+    assert_eq!(receipt.get("selection"), range);
+    assert_eq!(receipt.get("target_range"), range);
+    assert_eq!(receipt.get("fragment_slug").text(), "caf-details");
+    assert_eq!(receipt.get("window").get("visible_range").get("start").number(), start - 128);
+    assert_eq!(receipt.get("source_digest").text(), Sha256::digest(guide.as_bytes()).to_hex());
+    let (mut evidence, response) = saved.open_relationship_reader(owner(56203), 1, 1, Side::Evidence, || false).unwrap();
+    whole(json(&response).get("selection"), source);
+    assert_eq!(copy_all(&mut evidence).get("original_hex").text(), hex(source));
+    let mut desk = DeskSession::new(owner(56204), DeskLimits::default()).unwrap();
+    let opened = saved.open_relationship_desk(&mut desk, 0, 1, 1, 1, Side::Target, || false).unwrap();
+    let pane = opened.imported.change.active.unwrap();
+    assert_eq!(desk.model().selected_bytes(pane, 1).unwrap(), &guide.as_bytes()[start as usize..end as usize]);
+    assert_eq!(json(&saved.desk_open_response(&desk, &opened).unwrap()).get("fragment_resolution").text(), "resolved");
+
+    prepare(&mut saved, 2);
+    let before = reads(&mut saved);
+    assert_eq!(saved.open_relationship_reader(owner(56205), 1, 1, Side::Target, || false).err(), Some(Error::StaleGeneration));
+    assert_eq!(reads(&mut saved), before);
+    drop(saved);
+    fs::rename(&f.path, f.root.join("moved-heading.fcbs")).unwrap();
+    assert_eq!(json(&reader.copy_range(start, end, || false).unwrap()).get("original_hex").text(),
+        hex(&guide.as_bytes()[start as usize..end as usize]));
+    assert_eq!(desk.model().selected_bytes(pane, 1).unwrap(), &guide.as_bytes()[start as usize..end as usize]);
+    assert!(!f.root.join("docs/guide.md").exists());
+}
+
+#[test]
+fn fragment_outcomes_never_confuse_captured_files_with_qualified_headings() {
+    let source = b"[ok](guide.md#repeat) [collision](guide.md#repeat-2) [missing](guide.md#absent) \
+        [once](guide.md#%2572epeat) [case](guide.md#Repeat) [plus](guide.md#repeat+two) \
+        [invalid](guide.md#%ff) [zero](guide.md#%00) [top](guide.md#) \
+        [code](code.rs#L2) [missing-file](absent.md#repeat) [blocked](blocked.md#repeat)\n";
+    // Upstream counts repeated bases independently. The repeated "Repeat"
+    // suffix and the explicit "Repeat-2" heading collide; selecting the first
+    // would falsely claim a unique destination.
+    let guide = b"# Repeat\n\n# Repeat\n\n# Repeat-2\n\n";
+    let f = Fixture::new(&[entry(b"README.md", source), entry(b"guide.md", guide), entry(b"code.rs", b"code\n"),
+        SnapshotEntry { path: b"blocked.md", observed_bytes: 12, data: SnapshotData::Unavailable("READ_DENIED") }], true);
+    let mut saved = f.open(56201);
+    let result = prepare(&mut saved, 1);
+    let links = result.get("links").array();
+    assert_eq!(links.len(), 12);
+    for (index, expected) in ["resolved", "ambiguous", "missing-heading", "missing-heading", "missing-heading",
+        "missing-heading", "invalid", "invalid", "document-start", "unsupported", "unresolved", "unresolved"].iter().enumerate() {
+        assert_eq!(links[index].get("fragment_resolution").text(), *expected, "link {}", index + 1);
+        if index > 0 { assert_eq!(links[index].get("target_range"), &Json::Null); }
+    }
+    assert_eq!(links[3].get("fragment_slug").text(), "%72epeat");
+    assert_eq!(links[5].get("fragment_slug").text(), "repeat+two");
+    assert_eq!(links[10].get("resolution").text(), "missing");
+    assert_eq!(links[11].get("resolution").text(), "unavailable");
+    for id in 2..=10 {
+        let (_, response) = saved.open_relationship_reader(owner(56300 + id), 1, id, Side::Target, || false).unwrap();
+        let receipt = json(&response);
+        assert_eq!(receipt.get("offset").number(), 0);
+        assert_eq!(receipt.get("selection"), &Json::Null);
+        assert_eq!(receipt.get("fragment_resolution"), links[(id - 1) as usize].get("fragment_resolution"));
+    }
+}
+
+#[test]
+fn heading_source_and_flow_limits_are_not_reported_as_missing_destinations() {
+    let source = b"[heading](guide.md#last)";
+    let guide = b"# Last\n";
+    let f = Fixture::new(&[entry(b"README.md", source), entry(b"guide.md", guide)], true);
+    let mut saved = f.open(56201);
+    let cap = (source.len() + guide.len()) as u64;
+    let result = json(&saved.prepare_relationships(1, 64, cap, || false).unwrap());
+    assert!(result.get("relationships_complete").flag()); // Link extraction completed; heading qualification did not.
+    assert_eq!(result.get("member_bytes_read").number(), cap);
+    assert_eq!(result.get("links").array()[0].get("resolution").text(), "captured");
+    assert_eq!(result.get("links").array()[0].get("fragment_resolution").text(), "limited");
+    let result = prepare(&mut saved, 2);
+    assert_eq!(result.get("links").array()[0].get("fragment_resolution").text(), "resolved");
+    let full = format!("{}# Last\n", "paragraph\n\n".repeat(4100));
+    let f = Fixture::new(&[entry(b"README.md", source), entry(b"guide.md", full.as_bytes())], true);
+    let mut saved = f.open(56202);
+    let result = prepare(&mut saved, 1);
+    assert_eq!(result.get("links").array()[0].get("fragment_resolution").text(), "limited");
+    assert_eq!(result.get("links").array()[0].get("target_range"), &Json::Null);
+    let amplified = format!("[r]: x \"{}\"\n\n{}", "x".repeat(128 * 1024), "[r]\n".repeat(30_000));
+    let f = Fixture::new(&[entry(b"README.md", source), entry(b"guide.md", amplified.as_bytes())], true);
+    let mut saved = f.open(56203);
+    let result = prepare(&mut saved, 1);
+    assert_eq!(result.get("unsupported_markdown_members").number(), 1);
+    assert_eq!(result.get("links").array()[0].get("fragment_resolution").text(), "limited");
+    assert_eq!(result.get("links").array()[0].get("target_range"), &Json::Null);
+}
+
+#[test]
+fn upstream_span_mismatches_and_missing_nested_heading_catalogs_keep_explicit_file_fallback() {
+    let source = b"[target](guide.md#target)";
+    let unsupported = [
+        "\u{feff}---\ntitle: Guide\n---\n\n# Target\n",
+        "> target\ntarget\n\n# target\n",
+        "p\n    target\n\n# target\n",
+        "$$\n# target\n$$\n\n# target\n",
+        "Term\n: first\n\nTarget\n: second\n\n# Target\n",
+        "> # target\n",
+    ];
+    for (case, guide) in unsupported.iter().enumerate() {
+        let f = Fixture::new(&[entry(b"README.md", source), entry(b"guide.md", guide.as_bytes())], true);
+        let mut saved = f.open(56201 + case as u64 * 2);
+        let result = prepare(&mut saved, 1);
+        let link = &result.get("links").array()[0];
+        assert_eq!(link.get("resolution").text(), "captured", "case {case}");
+        assert_eq!(link.get("fragment_resolution").text(), "unsupported", "case {case}");
+        assert_eq!(link.get("target_range"), &Json::Null);
+        let (mut reader, response) = saved.open_relationship_reader(owner(56202 + case as u64 * 2),
+            1, 1, Side::Target, || false).unwrap();
+        assert_eq!(json(&response).get("offset").number(), 0);
+        assert_eq!(json(&response).get("selection"), &Json::Null);
+        assert_eq!(copy_all(&mut reader).get("original_hex").text(), hex(guide.as_bytes()));
+    }
+    // A real fenced block and ordinary list remain supported. The fake heading
+    // inside the fence must not displace the actual following heading's range.
+    let guide = b"```text\n# target\n```\n\n- ordinary list\n\n# Target\n";
+    let f = Fixture::new(&[entry(b"README.md", source), entry(b"guide.md", guide)], true);
+    let mut saved = f.open(56301);
+    let result = prepare(&mut saved, 1);
+    let link = &result.get("links").array()[0];
+    assert_eq!(link.get("fragment_resolution").text(), "resolved");
+    let start = link.get("target_range").get("start").number() as usize;
+    assert_eq!(&guide[start..], b"# Target\n");
 }

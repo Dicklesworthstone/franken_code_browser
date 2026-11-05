@@ -241,6 +241,31 @@ enum AtlasSavedDirection: String, CaseIterable, Identifiable, Sendable {
 }
 enum AtlasSavedLinkSide: String, Sendable { case evidence, target; var code: UInt64 { self == .evidence ? 0 : 1 } }
 
+enum AtlasSavedFragmentResolution: String, Decodable, Sendable {
+    case none, resolved, ambiguous, limited, unsupported, invalid, unresolved
+    case documentStart = "document-start"
+    case missingHeading = "missing-heading"
+}
+
+struct AtlasSavedHeadingRange: Decodable, Sendable, Equatable {
+    let start: UInt64
+    let end: UInt64
+    var contextStart: UInt64 { start > 128 ? start - 128 : 0 }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        start = try c.decode(AtlasSavedNumber.self, forKey: .start).value
+        end = try c.decode(AtlasSavedNumber.self, forKey: .end).value
+        guard start < end, end <= AtlasSavedWire.documentBytes else { throw AtlasSavedError.invalidResponse }
+    }
+    static func matches(_ value: Any?, expected: Self?) -> Bool {
+        guard let expected else { return value is NSNull }
+        guard let range = value as? [String: Any] else { return false }
+        return (range["start"] as? String).flatMap(AtlasReaderWire.integer) == expected.start &&
+            (range["end"] as? String).flatMap(AtlasReaderWire.integer) == expected.end
+    }
+    private enum CodingKeys: CodingKey { case start, end }
+}
+
 struct AtlasSavedLink: Decodable, Sendable, Identifiable {
     let id: UInt64
     let sourceMember: UInt64
@@ -254,8 +279,26 @@ struct AtlasSavedLink: Decodable, Sendable, Identifiable {
     let targetMember: UInt64?
     let targetPath: AtlasSavedPath?
     let suffix: String
-    let fragmentUnresolved: Bool
+    let fragmentResolution: AtlasSavedFragmentResolution
+    let fragmentSlug: String?
+    let targetRange: AtlasSavedHeadingRange?
+    var fragmentUnresolved: Bool { ![.none, .documentStart, .resolved].contains(fragmentResolution) }
     var canOpenTarget: Bool { resolution == "captured" }
+    var targetNavigationDescription: String {
+        switch fragmentResolution {
+        case .none: return "Captured target opens at byte 0."
+        case .documentStart: return "Empty URL fragment selects the captured document's start."
+        case .resolved:
+            guard let targetRange, let fragmentSlug else { return "Captured heading unavailable." }
+            return "Captured heading #\(fragmentSlug) · original bytes \(targetRange.start)..<\(targetRange.end)"
+        case .missingHeading: return "The requested heading is absent from the captured document. The target opens at byte 0."
+        case .ambiguous: return "Multiple captured headings have this identity. The target opens at byte 0."
+        case .limited: return "Heading resolution reached a source or document limit. The target opens at byte 0."
+        case .unsupported: return "This captured target has no supported Markdown heading navigation. It opens at byte 0."
+        case .invalid: return "The URL fragment is invalid. A captured target opens at byte 0."
+        case .unresolved: return "The URL fragment is unresolved; no heading destination is established."
+        }
+    }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(AtlasSavedNumber.self, forKey: .link_id).value
@@ -272,8 +315,10 @@ struct AtlasSavedLink: Decodable, Sendable, Identifiable {
         targetMember = try c.decodeIfPresent(AtlasSavedNumber.self, forKey: .target_member)?.value
         targetPath = try c.decodeIfPresent(AtlasSavedPath.self, forKey: .target_path)
         suffix = try c.decode(String.self, forKey: .target_suffix)
-        let fragment = try c.decode(String.self, forKey: .fragment_resolution)
-        fragmentUnresolved = fragment == "unresolved"
+        fragmentResolution = try c.decode(AtlasSavedFragmentResolution.self, forKey: .fragment_resolution)
+        guard c.contains(.fragment_slug), c.contains(.target_range) else { throw AtlasSavedError.invalidResponse }
+        fragmentSlug = try c.decodeIfPresent(String.self, forKey: .fragment_slug)
+        targetRange = try c.decodeIfPresent(AtlasSavedHeadingRange.self, forKey: .target_range)
         let occurrence = try c.decode(AtlasSavedNumber.self, forKey: .source_link_id).value
         _ = try c.decode(AtlasSavedNumber.self, forKey: .block_index) // Parser ordering only, never a coordinate.
         guard (1...4096).contains(id), sourceMember < 65_536, sourceFile == sourceMember + 1,
@@ -281,7 +326,7 @@ struct AtlasSavedLink: Decodable, Sendable, Identifiable {
               range.start == 0, evidenceEnd > 0, evidenceEnd <= AtlasSavedWire.documentBytes,
               (1...131_072).contains(occurrence), destination.utf8.count <= 4096,
               suffix.utf8.count <= destination.utf8.count,
-              ["none", "unresolved"].contains(fragment), fragmentUnresolved == suffix.contains("#"),
+              (fragmentResolution != .none) == suffix.contains("#"),
               ["captured", "unavailable", "missing", "external", "unresolved"].contains(resolution) else {
             throw AtlasSavedError.invalidResponse
         }
@@ -295,17 +340,48 @@ struct AtlasSavedLink: Decodable, Sendable, Identifiable {
         } else {
             guard targetMember == nil, targetPath == nil else { throw AtlasSavedError.invalidResponse }
         }
+        if let fragmentSlug {
+            guard !fragmentSlug.isEmpty, fragmentSlug.utf8.count <= 4096,
+                  fragmentSlug.unicodeScalars.allSatisfy({ $0.value >= 32 && !(127...159).contains($0.value) }) else {
+                throw AtlasSavedError.invalidResponse
+            }
+        }
+        switch fragmentResolution {
+        case .none, .invalid:
+            guard fragmentSlug == nil, targetRange == nil else { throw AtlasSavedError.invalidResponse }
+        case .documentStart:
+            guard resolution == "captured", fragmentSlug == nil, targetRange == nil,
+                  let mark = suffix.firstIndex(of: "#"), suffix.index(after: mark) == suffix.endIndex else {
+                throw AtlasSavedError.invalidResponse
+            }
+        case .resolved:
+            guard resolution == "captured", fragmentSlug != nil, let targetRange,
+                  targetMember != sourceMember || targetRange.end <= evidenceEnd else { throw AtlasSavedError.invalidResponse }
+        case .missingHeading, .ambiguous, .limited, .unsupported:
+            guard resolution == "captured", fragmentSlug != nil, targetRange == nil else { throw AtlasSavedError.invalidResponse }
+        case .unresolved:
+            guard resolution != "captured", targetRange == nil else { throw AtlasSavedError.invalidResponse }
+        }
     }
     func matches(_ other: Self) -> Bool {
-        id == other.id && sourceMember == other.sourceMember && sourceDigest == other.sourceDigest &&
+        let sameSlug: Bool
+        switch (fragmentSlug, other.fragmentSlug) {
+        case (.none, .none): sameSlug = true
+        case (.some(let lhs), .some(let rhs)): sameSlug = lhs.utf8.elementsEqual(rhs.utf8)
+        default: sameSlug = false
+        }
+        return id == other.id && sourceMember == other.sourceMember && sourceDigest == other.sourceDigest &&
             sourcePath.bytes == other.sourcePath.bytes && evidenceEnd == other.evidenceEnd &&
             destination.utf8.elementsEqual(other.destination.utf8) && resolution == other.resolution &&
             targetMember == other.targetMember && targetPath?.bytes == other.targetPath?.bytes &&
-            suffix.utf8.elementsEqual(other.suffix.utf8) && fragmentUnresolved == other.fragmentUnresolved
+            suffix.utf8.elementsEqual(other.suffix.utf8) && fragmentResolution == other.fragmentResolution &&
+            sameSlug &&
+            targetRange == other.targetRange
     }
     enum CodingKeys: CodingKey {
         case link_id, source_member, source_file_id, source_revision, source_digest, source_path, evidence_range,
-             destination, resolution, target_member, target_path, target_suffix, fragment_resolution, source_link_id, block_index
+             destination, resolution, target_member, target_path, target_suffix, fragment_resolution,
+             fragment_slug, target_range, source_link_id, block_index
     }
 }
 

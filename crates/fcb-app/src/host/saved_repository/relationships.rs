@@ -20,6 +20,10 @@ use super::{ArenaOwnerId, AppError, ByteLength, FileId, HostResponse, Output,
     RawPath, ReaderSession, ReaderSessionError, ResourceLease, SavedRepositoryError,
     SavedRepositorySession, Sha256Digest, SourceRevision, MAX_SAVED_PAGE, check, copy_text, optional};
 
+mod fragments;
+pub(super) use fragments::FragmentResolution;
+use fragments::{encode_fragment, prepare_fragment};
+
 pub const MAX_SAVED_RELATIONSHIPS: usize = MAX_DOCUMENT_LINKS;
 pub const MAX_RELATIONSHIP_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -81,7 +85,7 @@ struct Link {
     source_member: usize, source_link_id: u64, block_index: usize,
     evidence: ByteRange, source_digest: Sha256Digest, destination: String,
     resolution: Resolution, target_member: Option<usize>, target_digest: Option<Sha256Digest>,
-    suffix: String, _text_lease: ResourceLease,
+    suffix: String, fragment: FragmentResolution, fragment_slug: Option<String>, _text_lease: ResourceLease,
 }
 impl Link {
     fn matches(&self, member: Option<usize>, direction: RelationshipDirection) -> bool {
@@ -93,7 +97,6 @@ impl Link {
             _ => false,
         }
     }
-    fn fragment_unresolved(&self) -> bool { self.suffix.contains('#') }
 }
 pub(super) struct AcceptedRelationships {
     generation: u64, owner: ArenaOwnerId, archive: Sha256Digest, links: Vec<Link>,
@@ -107,7 +110,7 @@ pub(super) struct AcceptedRelationships {
 #[derive(Clone, Copy)]
 pub(super) struct RelationshipTarget {
     pub member: usize, pub file: FileId, pub revision: SourceRevision,
-    pub digest: Sha256Digest, pub selection: Option<ByteRange>, pub fragment_unresolved: bool,
+    pub digest: Sha256Digest, pub selection: Option<ByteRange>, pub fragment: FragmentResolution,
 }
 
 impl SavedRepositorySession {
@@ -198,12 +201,14 @@ impl SavedRepositorySession {
                 let destination = copy_text(link.destination())?;
                 let (resolution, target_member, target_digest, suffix) = self.resolve_relationship(&path, ordinal, &destination)?;
                 if suffix.capacity() > destination.len() { return Err(AppError::Admission.into()); }
+                let (fragment, fragment_slug) = prepare_fragment(resolution, &suffix)?;
                 candidate.links.push(Link { source_member: ordinal, source_link_id: link.id(),
                     block_index: link.block_index(), evidence: link.original_document_range(),
                     source_digest: digest, destination, resolution, target_member, target_digest,
-                    suffix, _text_lease: text_lease });
+                    suffix, fragment, fragment_slug, _text_lease: text_lease });
             }
         }
+        self.qualify_relationship_fragments(&mut candidate, max_source_bytes, &mut admitted_source_bytes, &mut canceled)?;
         let after = self.archive.load_stats();
         candidate.source_bytes = after.bytes_read - before.bytes_read;
         candidate.read_calls = after.read_calls - before.read_calls;
@@ -272,8 +277,9 @@ impl SavedRepositorySession {
         out.integer(offset)?;
         out.literal(",\"selection\":")?;
         match target.selection { Some(range) => out.range(range)?, None => out.literal("null")? }
-        out.literal(",\"evidence_precision\":\"whole-captured-markdown-document\",\"fragment_resolution\":")?;
-        out.quoted(fragment_label(target.fragment_unresolved))?;
+        out.literal(",\"evidence_precision\":\"whole-captured-markdown-document\"")?;
+        let link = &self.accepted_relationships(generation)?.links[(link_id - 1) as usize];
+        encode_fragment(&mut out, link)?;
         out.literal(",\"member_bytes_read\":")?; out.integer(after.bytes_read - before.bytes_read)?;
         out.literal(",\"member_read_calls\":")?; out.integer(after.read_calls - before.read_calls)?;
         out.literal(",\"reader\":")?; out.literal(info.as_str().trim_end())?;
@@ -298,7 +304,7 @@ impl SavedRepositorySession {
             RelationshipSide::Evidence => (link.source_member, link.source_digest, Some(link.evidence)),
             RelationshipSide::Target => match link.resolution {
                 Resolution::Captured => (link.target_member.ok_or(SavedRelationshipError::UnresolvedTarget)?,
-                    link.target_digest.ok_or(SavedRelationshipError::UnresolvedTarget)?, None),
+                    link.target_digest.ok_or(SavedRelationshipError::UnresolvedTarget)?, link.fragment.range()),
                 Resolution::Unavailable => return Err(SavedRelationshipError::TargetUnavailable),
                 _ => return Err(SavedRelationshipError::UnresolvedTarget),
             },
@@ -306,7 +312,7 @@ impl SavedRepositorySession {
         let value = member_id(member)?;
         let file = FileId::new(self.owner(), value).map_err(|_| SavedRepositoryError::IdentityExhausted)?;
         let revision = SourceRevision::new(self.owner(), value).map_err(|_| SavedRepositoryError::IdentityExhausted)?;
-        Ok(RelationshipTarget { member, file, revision, digest, selection, fragment_unresolved: link.fragment_unresolved() })
+        Ok(RelationshipTarget { member, file, revision, digest, selection, fragment: link.fragment })
     }
     pub(super) fn load_relationship_target(&mut self, target: RelationshipTarget,
         canceled: &mut impl FnMut() -> bool) -> Result<PagedCapture, SavedRelationshipError> {
@@ -391,7 +397,7 @@ impl SavedRepositorySession {
             out.path(&RawPath::from_bytes(target.path).to_path_buf())?;
         } else { out.literal("null")?; }
         out.literal(",\"target_suffix\":")?; out.quoted(&link.suffix)?;
-        out.literal(",\"fragment_resolution\":")?; out.quoted(fragment_label(link.fragment_unresolved()))?;
+        encode_fragment(out, link)?;
         out.literal("}")?;
         Ok(())
     }
@@ -420,4 +426,3 @@ fn external(destination: &str) -> bool {
             && scheme.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
     })
 }
-pub(super) const fn fragment_label(unresolved: bool) -> &'static str { if unresolved { "unresolved" } else { "none" } }

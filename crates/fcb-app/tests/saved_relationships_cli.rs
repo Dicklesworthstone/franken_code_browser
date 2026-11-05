@@ -52,7 +52,7 @@ fn source_to_document_to_source_navigation_can_be_annotated_and_saved_without_li
     assert_eq!(result(&rows[3]).get("selection").get("start").number(), 0);
     assert_eq!(result(&rows[3]).get("selection").get("end").number(), DOC.len() as u64);
     assert_eq!(result(&rows[4]).get("original_hex").text(), hex(DOC));
-    assert_eq!(result(&rows[7]).get("fragment_resolution").text(), "unresolved");
+    assert_eq!(result(&rows[7]).get("fragment_resolution").text(), "unsupported");
     assert_eq!(result(&rows[7]).get("selection"), &Json::Null);
     assert_eq!(result(&rows[8]).get("text").text(), std::str::from_utf8(SOURCE).unwrap());
     assert_eq!(rows[9].get("saved_relationship_generation"), &Json::Null);

@@ -109,13 +109,19 @@ struct AtlasSavedReaderReceipt: Sendable {
                       (object["link_id"] as? String).flatMap(AtlasReaderWire.integer) == link.id,
                       object["side"] as? String == side.rawValue,
                       object["evidence_precision"] as? String == AtlasSavedWire.evidencePrecision,
-                      object["fragment_resolution"] as? String == (link.fragmentUnresolved ? "unresolved" : "none"),
-                      object["offset"] as? String == "0",
+                      object["fragment_resolution"] as? String == link.fragmentResolution.rawValue,
+                      AtlasSavedHeadingRange.matches(object["target_range"], expected: link.targetRange),
+                      (object["offset"] as? String).flatMap(AtlasReaderWire.integer) ==
+                        (side == .target ? link.targetRange?.start ?? 0 : 0),
                       (object["member_bytes_read"] as? String).flatMap(AtlasReaderWire.integer) == member.observedBytes,
                       let callsText = object["member_read_calls"] as? String, let calls = AtlasReaderWire.integer(callsText),
                       (member.observedBytes == 0 && calls == 0) || (member.observedBytes > 0 && calls > 0 && calls <= 1_048_576) else {
                     throw AtlasSavedError.invalidResponse
                 }
+                if let slug = link.fragmentSlug {
+                    guard let accepted = object["fragment_slug"] as? String,
+                          accepted.utf8.elementsEqual(slug.utf8) else { throw AtlasSavedError.invalidResponse }
+                } else if !(object["fragment_slug"] is NSNull) { throw AtlasSavedError.invalidResponse }
                 if side == .evidence {
                     guard member.id == link.sourceMember, member.path.bytes == link.sourcePath.bytes,
                           member.digest == link.sourceDigest, member.observedBytes == link.evidenceEnd,
@@ -126,11 +132,14 @@ struct AtlasSavedReaderReceipt: Sendable {
                     }
                 } else {
                     guard link.canOpenTarget, member.id == link.targetMember,
-                          member.path.bytes == link.targetPath?.bytes, object["selection"] is NSNull else {
+                          member.path.bytes == link.targetPath?.bytes,
+                          link.targetRange == nil || link.targetRange!.end <= member.observedBytes,
+                          AtlasSavedHeadingRange.matches(object["selection"], expected: link.targetRange) else {
                         throw AtlasSavedError.invalidResponse
                     }
                 }
-                request = .window(offset: 0, bytes: 16 * 1024); match = nil
+                request = .window(offset: side == .target ? link.targetRange?.contextStart ?? 0 : 0, bytes: 16 * 1024)
+                match = nil
             case .hit(let generation, let needle, let hit), .expressionHit(let generation, _, let needle, let hit):
                 guard generation > 0, member.id == hit.member, member.file == hit.file, member.file == hit.revision,
                       member.path.bytes == hit.path.bytes, member.digest == hit.digest,
@@ -209,9 +218,7 @@ final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
         case .relationship(_, _, .evidence):
             return "Captured document evidence: original bytes 0..<\(member.observedBytes). Individual link positions are not established."
         case .relationship(_, let link, .target):
-            return link.fragmentUnresolved
-                ? "Captured target opened at byte 0. Its URL fragment is unresolved."
-                : "Captured target opened at byte 0."
+            return link.targetNavigationDescription
         case .hit(let generation, _, let hit):
             return "Saved search \(generation), occurrence \(hit.id) · exact original bytes \(hit.start)..<\(hit.end)"
         case .expressionHit(let generation, _, _, let hit):

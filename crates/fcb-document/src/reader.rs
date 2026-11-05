@@ -14,6 +14,8 @@ use crate::{DocumentBudgets, DocumentError, DocumentFlowLine, DocumentSession,
     DocumentViewConstraints, HeadlessDocumentOutput, HeadingSourceAnchor,
     SourceSpan, TextSelectionRange};
 
+mod heading_provenance;
+
 pub const MAX_DOCUMENT_SOURCE_BYTES: usize = 256 * 1024;
 pub const MAX_DOCUMENT_WINDOW_LINES: usize = 1024;
 
@@ -116,7 +118,10 @@ impl<'capture> DocumentReader<'capture> {
         std::str::from_utf8(bytes).map_err(|_| DocumentReadError::InvalidUtf8)?;
         // Reserve before the parser/session/semantic-fixture allocations. This
         // conservative managed envelope is not an OS process-footprint bound.
-        let charge = bytes.len().checked_mul(512)
+        // Share the existing reference-amplification admission policy with link
+        // extraction. A bounded source can still expand into an oversized AST.
+        let parse_charge = crate::links::parse_workspace(bytes).map_err(|_| DocumentReadError::EngineBudget)?;
+        let charge = Some(parse_charge)
             .and_then(|n| n.checked_add(options.max_flow_lines * 256))
             .and_then(|n| n.checked_add(options.max_flow_items * 512))
             .and_then(|n| n.checked_add(1024 * 1024 + size_of::<Self>()))
@@ -227,7 +232,10 @@ impl<'capture> DocumentReader<'capture> {
     /// The caller supplies the literal slug without URL decoding or a leading #.
     pub fn heading(&self, slug: &str) -> Result<&HeadingSourceAnchor, DocumentReadError> {
         if slug.is_empty() || slug.len() > 4096 { return Err(DocumentReadError::HeadingNotFound); }
-        self.headings().iter().find(|heading| heading.slug == slug).ok_or(DocumentReadError::HeadingNotFound)
+        let mut matches = self.headings().iter().filter(|heading| heading.slug == slug);
+        let heading = matches.next().ok_or(DocumentReadError::HeadingNotFound)?;
+        if matches.next().is_some() { return Err(DocumentReadError::InvalidOutput); }
+        Ok(heading)
     }
     pub fn window_at_heading(&self, slug: &str, count: usize)
         -> Result<DocumentWindow<'_, 'capture>, DocumentReadError> {

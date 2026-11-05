@@ -364,7 +364,7 @@ pub fn decode_uri_path(uri: &str) -> Result<NormalizedPath, SourceError> {
     }
 
     // Percent-decode bytes
-    let decoded_bytes = percent_decode(path_str.as_bytes())?;
+    let decoded_bytes = decode_uri_component_bytes(path_str, path_str.len())?;
 
     // Refuse embedded nulls
     if decoded_bytes.contains(&0) {
@@ -375,9 +375,17 @@ pub fn decode_uri_path(uri: &str) -> Result<NormalizedPath, SourceError> {
     NormalizedPath::new(RawPath::from_bytes(decoded_bytes))
 }
 
-/// Percent-decodes a byte sequence once.
-fn percent_decode(input: &[u8]) -> Result<Vec<u8>, SourceError> {
-    let mut out = Vec::with_capacity(input.len());
+/// Decode one URI component exactly once, after admitting its encoded length.
+/// This is byte decoding only: `+` remains literal, and no path normalization,
+/// UTF-8 conversion, filesystem authority or component-specific meaning is
+/// inferred. Callers must validate decoded bytes for their destination domain.
+pub fn decode_uri_component_bytes(component: &str, max_encoded_bytes: usize)
+    -> Result<Vec<u8>, SourceError> {
+    if component.len() > max_encoded_bytes { return Err(SourceError::PayloadTooLarge); }
+    let input = component.as_bytes();
+    let mut out = Vec::new();
+    out.try_reserve_exact(input.len()).map_err(|_| SourceError::PayloadTooLarge)?;
+    if out.capacity() > input.len() { return Err(SourceError::PayloadTooLarge); }
     let mut i = 0;
     while i < input.len() {
         if input[i] == b'%' {
@@ -408,6 +416,17 @@ fn hex_val(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uri_components_decode_once_without_path_or_form_semantics() {
+        assert_eq!(decode_uri_component_bytes("caf%C3%A9+one", 32).unwrap(), "café+one".as_bytes());
+        assert_eq!(decode_uri_component_bytes("%252e%252e/%ff%00", 32).unwrap(), b"%2e%2e/\xff\0");
+        assert_eq!(decode_uri_component_bytes("%41", 2), Err(SourceError::PayloadTooLarge));
+        for malformed in ["%", "%1", "%gg", "a%2X"] {
+            assert_eq!(decode_uri_component_bytes(malformed, 32), Err(SourceError::EncodingError));
+        }
+        assert_eq!(decode_uri_component_bytes("", 0).unwrap(), b"");
+    }
 
     #[test]
     fn raw_path_preserves_bytes_and_case() {

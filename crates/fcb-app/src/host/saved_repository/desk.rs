@@ -12,7 +12,7 @@ use crate::host::desk::{DeskSession, DeskSessionError, DeskError,
 use super::{SavedRepositorySession, SavedRepositoryError, PagedCapture, PagedHit,
     PagedMemberData, PagedSearchError, PagedSnapshotError, FileId, SourceRevision, ByteLength,
     RawPath, Sha256Digest, HostResponse, OutputError, AppError, check,
-    relationships::{RelationshipSide, SavedRelationshipError, fragment_label}};
+    relationships::{RelationshipSide, SavedRelationshipError, FragmentResolution}};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SavedDeskError { Saved(SavedRepositoryError), Desk(DeskSessionError),
@@ -55,7 +55,7 @@ pub struct SavedDeskOpen {
     source_digest: Sha256Digest,
     query: Option<(u64, u64)>,
     expression: Option<(u64, u64)>,
-    relationship: Option<(u64, u64, RelationshipSide, bool)>,
+    relationship: Option<(u64, u64, RelationshipSide, FragmentResolution)>,
     selection: Option<ByteRange>,
     member_bytes_read: u64,
     member_read_calls: u64,
@@ -83,8 +83,8 @@ impl SavedRepositorySession {
     /// Follow the complete original Markdown evidence or its exact captured member into
     /// normal Desk history. Preparation validates both endpoints before archive
     /// I/O; the common import transaction preserves previous place on failure.
-    /// Unqualified fragments are retained as unresolved receipt metadata while
-    /// a target-side navigation explicitly selects the captured file's start.
+    /// Qualified headings select their exact original source range. Other
+    /// fragments retain their explicit resolution state and open the file start.
     pub fn open_relationship_desk(&mut self, desk: &mut DeskSession, expected: u64,
         attempt: u64, generation: u64, link_id: u64, side: RelationshipSide,
         mut canceled: impl FnMut() -> bool) -> Result<SavedDeskOpen, SavedDeskError> {
@@ -99,7 +99,7 @@ impl SavedRepositorySession {
             &capture, target.selection, None,
             (after.bytes_read - before.bytes_read, after.read_calls - before.read_calls), &mut canceled)?;
         // Infallible metadata after accepted navigation, never another action.
-        opened.relationship = Some((generation, link_id, side, target.fragment_unresolved));
+        opened.relationship = Some((generation, link_id, side, target.fragment));
         Ok(opened)
     }
     fn open_desk(&mut self, desk: &mut DeskSession, expected: u64, attempt: u64,
@@ -192,7 +192,7 @@ impl SavedRepositorySession {
         out.literal(",\"relationship_side\":")?;
         match opened.relationship { Some((_, _, side, _)) => out.quoted(side.name())?, None => out.literal("null")? }
         out.literal(",\"fragment_resolution\":")?;
-        match opened.relationship { Some((_, _, _, unresolved)) => out.quoted(fragment_label(unresolved))?, None => out.literal("null")? }
+        match opened.relationship { Some((_, _, _, fragment)) => out.quoted(fragment.name())?, None => out.literal("null")? }
         out.literal(",\"selection_namespace\":")?;
         out.quoted(if opened.relationship.is_some() { "saved-relationship" } else if opened.expression.is_some() {
             "saved-expression" } else if opened.query.is_some() { "saved-literal" } else { "saved-member" })?;

@@ -34,10 +34,20 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     }
     let domain = UUID()
     let searchVectors: Bool
-    init(searchVectors: Bool = false) { self.searchVectors = searchVectors }
+    let headingVectors: Bool
+    init(searchVectors: Bool = false, headingVectors: Bool = false) {
+        self.searchVectors = searchVectors; self.headingVectors = headingVectors
+    }
     let archiveDigest = String(repeating: "d", count: 64)
-    let source = Array("\u{feff}---\ntitle: Saved\n---\n\n[code](src/lib.rs#L2) [again](src/lib.rs) [missing](absent.rs) [empty]()\n".utf8)
-    let sourceDigest = "8591776e77fd8d9050b0a5796da773312c306092c3fc05f22dbe9413cfcff6d3"
+    var source: [UInt8] {
+        Array((headingVectors
+            ? "\u{feff}---\ntitle: Saved\n---\n\n[guide](docs/guide.md#caf-%64etails) [again](docs/guide.md) [missing](absent.rs) [empty]()\n"
+            : "\u{feff}---\ntitle: Saved\n---\n\n[code](src/lib.rs#L2) [again](src/lib.rs) [missing](absent.rs) [empty]()\n").utf8)
+    }
+    var sourceDigest: String { headingVectors
+        ? "9359955440643a4a2294506051b4cd66f7009333234a8e3f85392495ec5a9a0f"
+        : "8591776e77fd8d9050b0a5796da773312c306092c3fc05f22dbe9413cfcff6d3" }
+    var headingBytes: [UInt8] { Array(("\u{feff}" + String(repeating: "x", count: 200) + "\r\n\r\n## Café Details\r\n\r\nBody.\r\n").utf8) }
     let rawPath = Array("raw-".utf8) + [UInt8(255)] + Array(".rs".utf8)
     let entered = DispatchSemaphore(value: 0)
     let resume = DispatchSemaphore(value: 0)
@@ -74,10 +84,12 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                 digest: searchVectors ? "0896dfbe40292ec212fa69dac19c681c8f56ba79c407cbad6817580762413ecf"
                     : "a8100ae6aa1940d0b663bb31cd466142ebbdbd5187131b92d93818987832eb89",
                 encoding: searchVectors ? "utf16le" : "utf8"),
-            Member(path: Array("src/lib.rs".utf8), display: "src/lib.rs",
-                bytes: searchVectors ? [254, 255, 0, 97, 254, 255, 0, 98] : Array("abc".utf8),
-                digest: searchVectors ? "c71ff6c5ed08a430f34d4fcd60b2c151d57934c79a6087aa25496d9b06c65cc7"
-                    : "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            Member(path: Array((headingVectors ? "docs/guide.md" : "src/lib.rs").utf8),
+                display: headingVectors ? "docs/guide.md" : "src/lib.rs",
+                bytes: headingVectors ? headingBytes : (searchVectors ? [254, 255, 0, 97, 254, 255, 0, 98] : Array("abc".utf8)),
+                digest: headingVectors ? "764c4fad3f4ed654c16f17da7c527d4213539d68ca1f13a944eab08c7dd456c9"
+                    : (searchVectors ? "c71ff6c5ed08a430f34d4fcd60b2c151d57934c79a6087aa25496d9b06c65cc7"
+                    : "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
                 encoding: searchVectors ? "utf16be" : "utf8"),
             Member(path: Array("unavailable.md".utf8), display: "unavailable.md", bytes: nil, digest: nil)
         ]
@@ -111,7 +123,9 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         return out
     }
     func linkObject(_ id: UInt64) -> [String: Any] {
-        let destination = [1: "src/lib.rs#L2", 2: "src/lib.rs", 3: "absent.rs", 4: ""][Int(id)]!
+        let target = headingVectors ? "docs/guide.md" : "src/lib.rs"
+        let suffix = headingVectors ? "#caf-%64etails" : "#L2"
+        let destination = [1: target + suffix, 2: target, 3: "absent.rs", 4: ""][Int(id)]!
         let captured = id <= 2
         return ["link_id": String(id), "source_member": "0", "source_file_id": "1",
             "source_revision": "1", "source_digest": sourceDigest,
@@ -120,8 +134,11 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             "block_index": "0", "source_link_id": String(id), "destination": destination,
             "resolution": captured ? "captured" : (id == 3 ? "missing" : "unresolved"),
             "target_member": captured ? "3" as Any : NSNull(),
-            "target_path": captured ? path(Array("src/lib.rs".utf8), "src/lib.rs") as Any : NSNull(),
-            "target_suffix": id == 1 ? "#L2" : "", "fragment_resolution": id == 1 ? "unresolved" : "none"]
+            "target_path": captured ? path(Array(target.utf8), target) as Any : NSNull(),
+            "target_suffix": id == 1 ? suffix : "",
+            "fragment_resolution": id == 1 ? (headingVectors ? "resolved" : "unsupported") : "none",
+            "fragment_slug": id == 1 ? (headingVectors ? "caf-details" : "L2") as Any : NSNull(),
+            "target_range": id == 1 && headingVectors ? ["start": "207", "end": "223"] as Any : NSNull()]
     }
     func relationships(_ owner: UInt64, generation: UInt64, direction: AtlasSavedDirection = .all,
         member: UInt64? = nil, start: UInt64 = 0, limit: UInt64 = 64, preparing: Bool = false) -> [String: Any] {
@@ -138,11 +155,12 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             "evidence_precision": "whole-captured-markdown-document", "resolver": "fmd-exact-member-v1",
             "extractor": "franken-markdown-d6fbd1d5/document-evidence-v1",
             "completeness_scope": "parsed-document-links-in-saved-manifest",
-            "relationships_complete": false, "truncated": false, "markdown_members": "3",
-            "scanned_markdown_members": "1", "unavailable_markdown_members": "1",
+            "relationships_complete": false, "truncated": false, "markdown_members": headingVectors ? "4" : "3",
+            "scanned_markdown_members": headingVectors ? "2" : "1", "unavailable_markdown_members": "1",
             "unsupported_markdown_members": "1", "source_limited_members": "0", "diagnostic_markdown_members": "0",
             "retained_links": "4", "links_seen": "4", "matching_links": String(ids.count),
-            "member_bytes_read": String(source.count + members[2].bytes!.count), "member_read_calls": "2",
+            "member_bytes_read": String(source.count + members[2].bytes!.count + (headingVectors ? 2 * headingBytes.count : 0)),
+            "member_read_calls": headingVectors ? "4" : "2",
             "retained_source_payload_bytes": "0", "direction": direction.rawValue,
             "filter_member": member.map(String.init) as Any? ?? NSNull(),
             "links": ids[Int(start)..<Int(end)].map(linkObject),
@@ -307,7 +325,12 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         if let generation, let link, let side {
             out["relationship_generation"] = String(generation); out["link_id"] = String(link); out["side"] = side.rawValue
             out["offset"] = "0"; out["evidence_precision"] = "whole-captured-markdown-document"
-            out["fragment_resolution"] = link == 1 ? "unresolved" : "none"
+            let accepted = linkObject(link)
+            for field in ["fragment_resolution", "fragment_slug", "target_range"] { out[field] = accepted[field] }
+            if headingVectors && link == 1 && side == .target {
+                out["offset"] = "207"; out["selection"] = accepted["target_range"]
+                windowStart = 79
+            }
         }
         if let fault {
             self.fault = nil
@@ -317,6 +340,10 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             case "archive": out["archive_digest"] = String(repeating: "e", count: 64)
             case "generation": out["relationship_generation"] = String((generation ?? 0) + 1)
             case "selection": out["selection"] = ["start": "1", "end": String(bytes.count)]
+            case "heading-range": out["target_range"] = ["start": "208", "end": "223"]
+            case "heading-offset": out["offset"] = "0"
+            case "heading-slug": out["fragment_slug"] = "caf-other"
+            case "heading-resolution": out["fragment_resolution"] = "missing-heading"
             case "digest": out["source_digest"] = String(repeating: "e", count: 64)
             case "live": out["live_source_reopened"] = true
             case "nested-owner": nested["owner"] = "999"
@@ -550,6 +577,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     @MainActor static func main() async throws {
         try decoderContracts()
         try await actualModelNavigationAndIndependentReaders()
+        try await capturedHeadingNavigationAndFrozenReceipts()
         await failedReplacementAndGenerationRecovery()
         await staleRowsAndForeignRegistryCannotTriggerHandoff()
         await invalidMetadataAndReceiptsRetireDestinations()
@@ -620,6 +648,27 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                 _ = try JSONDecoder().decode(AtlasSavedLink.self, from: Data(f.encode(bad).utf8))
             }
         }
+        let headings = SavedRepositoryFixture(headingVectors: true)
+        for field in ["missing-range", "empty-range", "oversized-range", "missing-slug", "control-slug", "unqualified-range"] {
+            var bad = headings.linkObject(1)
+            switch field {
+            case "missing-range": bad["target_range"] = NSNull()
+            case "empty-range": bad["target_range"] = ["start": "207", "end": "207"]
+            case "oversized-range": bad["target_range"] = ["start": "207", "end": "262145"]
+            case "missing-slug": bad["fragment_slug"] = NSNull()
+            case "control-slug": bad["fragment_slug"] = "caf\0details"
+            default: bad["fragment_resolution"] = "missing-heading"
+            }
+            rejected("invalid qualified heading metadata accepted: \(field)") {
+                _ = try JSONDecoder().decode(AtlasSavedLink.self, from: Data(headings.encode(bad).utf8))
+            }
+        }
+        for state in ["missing-heading", "ambiguous", "limited", "unsupported"] {
+            var outcome = headings.linkObject(1)
+            outcome["fragment_resolution"] = state; outcome["target_range"] = NSNull()
+            let unresolved = try JSONDecoder().decode(AtlasSavedLink.self, from: Data(headings.encode(outcome).utf8))
+            precondition(unresolved.canOpenTarget && unresolved.fragmentUnresolved && unresolved.targetRange == nil)
+        }
         var rawMismatch = f.info(40)
         rawMismatch["archive_path"] = f.path(Array("/saved/other.fcbs".utf8), "/saved/repository.fcbs")
         rejected("display path rebound exact archive bytes") {
@@ -644,7 +693,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         f.corruptNext("many-read-calls")
         let target = try await model.openLink(incoming.links[0], from: incoming, side: .target, readerTransport: f.readerTransport())
         precondition(target.reader.page?.originalHex == "616263" && target.reader.page?.start == 0)
-        precondition(target.evidenceLabel.contains("unresolved") && !target.reader.canRefresh)
+        precondition(target.evidenceLabel.contains("no supported Markdown heading") && !target.reader.canRefresh)
         let raw = try await model.openMember(model.members!.items[1], from: info.identity, readerTransport: f.readerTransport())
         precondition(raw.reader.page?.identity.pathBytes == f.rawPath)
         precondition(raw.reader.page?.originalHex == f.hex("changed bytes\n".utf8))
@@ -657,6 +706,45 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         precondition(!f.calls.contains("LIVE-OPEN"))
         await wait("archive did not retire independently") { f.calls.contains("saved-close:40") }
         evidence.reader.close(); target.reader.close(); raw.reader.close(); model.close()
+    }
+
+    @MainActor private static func capturedHeadingNavigationAndFrozenReceipts() async throws {
+        let f = SavedRepositoryFixture(headingVectors: true), model = await prepared(f)
+        let page = model.relationships!, link = page.links[0]
+        precondition(link.fragmentResolution == .resolved && link.fragmentSlug == "caf-details")
+        precondition(link.suffix == "#caf-%64etails" && link.targetRange?.start == 207 && !link.fragmentUnresolved)
+        var changed = f.linkObject(1)
+        changed["target_range"] = ["start": "208", "end": "223"]
+        let forged = try JSONDecoder().decode(AtlasSavedLink.self, from: Data(f.encode(changed).utf8))
+        await refused("a changed heading range rebound the accepted link") {
+            _ = try await model.openLink(forged, from: page, side: .target, readerTransport: f.readerTransport())
+        }
+        precondition(!f.calls.contains(where: { $0.hasPrefix("reader-create:") }))
+        let opened = try await model.openLink(link, from: page, side: .target, readerTransport: f.readerTransport())
+        precondition(opened.reader.page?.start == 79 && f.calls.contains("reader-window:100:79"))
+        precondition(opened.reader.page?.originalHex == f.hex(f.headingBytes.dropFirst(79)))
+        precondition(opened.evidenceLabel.contains("#caf-details") && opened.evidenceLabel.contains("207..<223"))
+        model.prepareRelationships(); await wait("heading projection did not advance") { !model.busy }
+        await refused("an old qualified heading survived generation replacement") {
+            _ = try await model.openLink(link, from: page, side: .target, readerTransport: f.readerTransport())
+        }
+        model.closeArchive()
+        opened.reader.offsetInput = "207"; opened.reader.goToByte()
+        await wait("captured heading reader lost its independent source") { !opened.reader.busy }
+        precondition(opened.reader.page?.originalHex == f.hex(f.headingBytes.dropFirst(207)))
+        precondition(!f.calls.contains("LIVE-OPEN"))
+        opened.reader.close(); model.close()
+
+        for fault in ["heading-range", "heading-offset", "heading-slug", "heading-resolution", "selection"] {
+            let f = SavedRepositoryFixture(headingVectors: true), model = await prepared(f), page = model.relationships!
+            f.corruptNext(fault)
+            await refused("a changed heading receipt was accepted: \(fault)") {
+                _ = try await model.openLink(page.links[0], from: page, side: .target, readerTransport: f.readerTransport())
+            }
+            await wait("rejected heading reader did not retire") { f.calls.contains("reader-close:100") }
+            precondition(f.calls.filter { $0 == "handoff:100" }.count == 1)
+            model.close()
+        }
     }
 
     @MainActor private static func failedReplacementAndGenerationRecovery() async {

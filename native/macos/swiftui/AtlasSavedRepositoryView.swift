@@ -114,7 +114,7 @@ private final class AtlasSavedFileAccess {
                 ? (model.searchMode == .literal
                     ? "Literal search is case sensitive and does not interpret query syntax or normalize Unicode. Member names never open working-tree paths."
                     : "Expression terms are exact and case sensitive. Required/excluded terms apply across each complete captured member; results identify primary-term occurrences. Member names never open working-tree paths.")
-                : "Documentation evidence is the original captured document. Individual link positions and URL fragments are not resolved. Member names never open working-tree paths.")
+                : "Documentation evidence is the original captured document. Qualified Markdown headings open their captured source range; unresolved destinations show why. Member names never open working-tree paths.")
                 .font(.caption2).foregroundStyle(.secondary)
         }.frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -523,15 +523,15 @@ private final class AtlasSavedFileAccess {
                     Text(target.display).font(.caption).lineLimit(2).textSelection(.enabled)
                 }
             }
-            if link.fragmentUnresolved {
-                Text("URL fragment unresolved. A captured target opens at the start of its file.")
+            if link.fragmentResolution != .none {
+                Text(link.targetNavigationDescription)
                     .font(.caption).foregroundStyle(.secondary)
             }
             HStack {
                 Text("Captured document evidence").font(.caption2).foregroundStyle(.secondary)
                 Spacer()
                 Button("Read source document") { openLink(link, from: page, side: .evidence) }
-                Button("Read captured target") { openLink(link, from: page, side: .target) }
+                Button(link.targetRange == nil ? "Read captured target" : "Read captured heading") { openLink(link, from: page, side: .target) }
                     .disabled(!link.canOpenTarget)
             }.controlSize(.small).disabled(!model.canOperate || readerTask != nil)
         }.padding(10).frame(maxWidth: .infinity, alignment: .leading)
