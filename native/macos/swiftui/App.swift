@@ -246,6 +246,7 @@ extension AtlasCamera {
     @State private var showsFileFinder = false
     @State private var projectOpening = AtlasProjectOpening()
     @State private var projectBrowser = AtlasProjectBrowserModel(transport: .native)
+    @State private var projectChanges = AtlasProjectChanges(makeDriver: { AtlasNativeProjectChangeDriver() })
     @State private var browserProject = UUID()
     @State private var showsCatalog = true
     @State private var catalogEntries: [AtlasProjectCatalog.Entry] = []
@@ -445,6 +446,7 @@ extension AtlasCamera {
 #if FCB_APP_STORE
             rootAccessLoader.cancel()
 #endif
+            projectChanges.close()
             closeAtlasResidency()
             closeFinderReader()
             projectBrowser.close()
@@ -506,6 +508,12 @@ extension AtlasCamera {
             status = projectBrowser.notice
             if !query.isEmpty { runSearch(debounce: true) }
             if AtlasFileStartup.needsCatalog { requestStartupCatalog() }
+        }
+        .onChange(of: projectChangeDiscoveryKey) { _, _ in
+            guard !projectBrowser.closed, projectBrowser.root.utf8.elementsEqual(root.utf8),
+                  projectOpening.projectID == browserProject, let info = projectBrowser.info else { return }
+            projectChanges.reportDiscovery(project: browserProject, complete: info.complete,
+                more: info.more, omissions: info.omissionCount)
         }
         .onChange(of: Array(query.utf8)) { _, _ in
             // Revoke old rows immediately, including empty or invalid edits.
@@ -846,6 +854,31 @@ extension AtlasCamera {
 
     // MARK: Atlas screen
 
+    /// Only this window's current browser may acknowledge a complete scan.
+    /// First pages and paused/partial discovery cannot clear change notices.
+    private var projectChangeDiscoveryKey: String {
+        guard let info = projectBrowser.info else { return browserProject.uuidString }
+        return "\(browserProject):\(info.owner):\(info.latest):\(info.complete):\(info.more):\(info.omissionCount)"
+    }
+
+    @ViewBuilder private var projectChangeNotice: some View {
+        if let notice = projectChanges.notice {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "exclamationmark.arrow.triangle.2.circlepath")
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(notice).font(.callout)
+                    Text("Pinned and kept captures remain unchanged.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity, alignment: .leading)
+                Button("Refresh project", action: requestAtlasLoad).disabled(loadingProject)
+                if projectChanges.needsFolderSelection {
+                    Button("Choose folder…", action: chooseProject)
+                }
+            }.padding(10).background(.bar)
+        }
+    }
+
     @ViewBuilder private var rootAccessProgress: some View {
 #if FCB_APP_STORE
         if rootAccessLoader.isLoading {
@@ -869,6 +902,7 @@ extension AtlasCamera {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
                 rootAccessProgress
+                projectChangeNotice
                 if (showsCatalog || !hasMetadataAtlas), !projectBrowser.root.isEmpty {
                     progressiveProjectView
                 } else if !hasMetadataAtlas {
@@ -1192,9 +1226,16 @@ extension AtlasCamera {
         pinnedReaders.bind(root: requestedRoot)
 #if FCB_APP_STORE
         accessLease = rootAccess
+        if rootAccess?.url.path.utf8.elementsEqual(requestedRoot.utf8) == true {
+            projectChanges.bind(root: requestedRoot, accessLease: accessLease)
+        } else {
+            projectChanges.close()
+        }
 #else
         accessLease = nil
+        projectChanges.bind(root: requestedRoot, accessLease: nil)
 #endif
+        projectChanges.beginDiscovery(project: ticket.project)
         showsReader = false
         showsCatalog = true
         focusRequest = UUID()
@@ -1211,6 +1252,7 @@ extension AtlasCamera {
     }
 
     private func cancelAtlasLoad() {
+        if projectOpening.isDiscovering { projectChanges.cancelDiscovery(project: browserProject) }
         loadTask?.cancel()
         loadCancellation?.cancel()
         projectIO.cancel()
@@ -1233,6 +1275,7 @@ extension AtlasCamera {
               root.utf8.elementsEqual(requestedRoot.utf8) else { return }
         defer {
             if projectOpening.accepts(ticket) {
+                projectChanges.cancelDiscovery(project: ticket.project)
                 projectOpening.fail(ticket)
                 loadTask = nil; loadCancellation = nil
             }
@@ -1921,6 +1964,7 @@ extension AtlasCamera {
     private func activateProject(_ access: AppStoreRootAccess) {
         // Replacing the native grant revokes this window's pin deliveries even
         // when the newly authorized folder happens to have the same path.
+        projectChanges.close()
         pinnedReaders.closeAll()
         access.remember()
         rootAccess = access
@@ -1955,6 +1999,7 @@ extension AtlasCamera {
     }
 #else
     private func setRoot(_ newRoot: String) {
+        projectChanges.close()
         root = newRoot
         UserDefaults.standard.set(newRoot, forKey: "fcb.root")
         Engine.remember(root: newRoot)
