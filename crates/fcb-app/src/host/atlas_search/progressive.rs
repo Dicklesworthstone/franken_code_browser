@@ -223,6 +223,9 @@ impl RetainedAtlasSearch {
         let before_hits = candidate.hits.len();
         {
             let mut scan_options = StreamReadOptions::new(qgen);
+            // Once storage is full, zero slots still allow the shared scanner
+            // to prove no match or observe one unstored occurrence. The probe
+            // cannot append hits or retain another source capture below.
             scan_options.max_matches = work.options.max_matches - before_hits;
             scan_options.max_bytes = capture.bytes().len() as u64;
             let mut scan = ReaderSearch::new(capture.bytes(), *capture.request(),
@@ -261,8 +264,9 @@ fn update_coverage(atlas: &AtlasSession, q: &mut Snapshot, work: &LiveWork) {
     q.read_calls = work.io.calls;
     q.stop_reason = if q.pending == 0 {
         Some(if q.truncated { AtlasSearchStop::MatchLimit } else { AtlasSearchStop::AllFilesExamined })
-    } else if q.hits.len() == work.options.max_matches {
-        q.truncated = true; Some(AtlasSearchStop::MatchLimit)
+    } else if q.truncated {
+        // Filling the retained rows alone does not prove omitted occurrences.
+        Some(AtlasSearchStop::MatchLimit)
     } else if q.examined == work.options.max_files {
         Some(AtlasSearchStop::FileLimit)
     } else if work.io.bytes >= work.options.max_source_bytes as u64 {

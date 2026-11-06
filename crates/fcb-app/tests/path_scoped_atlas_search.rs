@@ -92,6 +92,42 @@ fn directory_type_intersection_precedes_live_and_indexed_quotas() {
 }
 
 #[test]
+fn exact_hit_cap_lookahead_stays_in_the_frozen_directory_type_scope() {
+    let fixture = Fixture::new(&[("a-outside.rs", b"needle needle"), ("src/a.rs", b"needle"),
+        ("src/b.rs", b"quiet"), ("src/c.txt", b"needle"), ("z-outside.rs", b"needle")]);
+    let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+    let selected = AtlasSearchScope::from_csv(Some("rs"), None).unwrap()
+        .with_path(Kind::Directory, "src").unwrap();
+    search.begin_scoped(&atlas, 1, "needle", selected, AtlasSearchOptions {
+        max_matches: 1, max_files: 2, max_source_bytes: 11, ..options()
+    }, || false).unwrap();
+    search.step(&atlas, 1, || false).unwrap();
+    let live_hit = search.hit(&atlas, 1, 1).unwrap();
+    let pending = search.progress(&atlas, 1).unwrap();
+    assert!(pending.is_running()); assert!(!pending.truncated);
+    assert_eq!((pending.eligible_files, pending.excluded_files, pending.pending_files), (2, 3, 1));
+    assert_eq!((pending.matches_seen, pending.retained_hits), (1, 1));
+    search.step(&atlas, 1, || false).unwrap();
+    let live = search.progress(&atlas, 1).unwrap();
+    assert!(live.complete); assert!(!live.truncated);
+    assert_eq!(live.stop_reason, Some(AtlasSearchStop::AllFilesExamined));
+    assert_eq!((live.examined_files, live.scanned_files, live.unavailable_files, live.pending_files), (2, 2, 0, 0));
+    assert_eq!(live.source_bytes_read, 11); assert_eq!(live.retained_source_bytes, 6);
+    assert_eq!((live.matches_seen, live.retained_hits), (1, 1));
+    assert_eq!(search.hit(&atlas, 1, 1).unwrap(), live_hit);
+    // The live and indexed routes agree even though excluded files have enough
+    // matches to exhaust the result budget before or after the selected files.
+    search.prepare_index(&atlas, 2, index_options(), || false).unwrap();
+    search.search_indexed_scoped(&atlas, 3, 2, "needle", selected, 1, 11, || false).unwrap();
+    let indexed = search.progress(&atlas, 3).unwrap();
+    assert!(indexed.complete); assert!(!indexed.truncated);
+    assert_eq!((indexed.matches_seen, indexed.retained_hits), (live.matches_seen, live.retained_hits));
+    assert_eq!((indexed.eligible_files, indexed.excluded_files), (2, 3));
+    let indexed_hit = search.hit(&atlas, 3, 1).unwrap();
+    assert_eq!(indexed_hit.file, live_hit.file); assert_eq!(indexed_hit.original_range, live_hit.original_range);
+}
+
+#[test]
 fn exact_file_scope_is_not_a_basename_or_prefix_and_does_not_silently_widen() {
     let fixture = Fixture::new(&[("dir/file.rs", b"needle"), ("dir/file.rs.bak", b"needle needle"),
         ("dir/nested/file.rs", b"needle"), ("elsewhere/file.rs", b"needle")]);

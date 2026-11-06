@@ -111,8 +111,11 @@ fn finished_query_survives_canceled_replacement_and_opened_progress_reader_survi
     let f = fixture(); let atlas = f.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
     search.search(&atlas, 1, "nothing", options(), || false).unwrap();
     let previous = search.page(&atlas, 1, 0, 100, || false).unwrap();
-    search.begin(&atlas, 2, "needle", options(), || false).unwrap();
+    search.begin(&atlas, 2, "needle", AtlasSearchOptions { max_matches: 1, ..options() }, || false).unwrap();
     search.step(&atlas, 2, || false).unwrap();
+    let probing = search.progress(&atlas, 2).unwrap();
+    assert!(probing.is_running()); assert!(!probing.truncated);
+    assert_eq!((probing.matches_seen, probing.retained_hits, probing.pending_files), (1, 1, 2));
     let (reader, _) = search.open_reader(&atlas, owner(8402), 2, 1, || false).unwrap();
     assert_eq!(search.accepted_generation(), Some(1));
     assert!(matches!(search.step(&atlas, 2, || true), Err(AtlasSearchError::Canceled)));
@@ -194,8 +197,10 @@ fn utf16_overlapping_hits_are_usable_before_repository_scan_finishes() {
     for unit in "α ababa\r\n".encode_utf16() { raw.extend_from_slice(&unit.to_le_bytes()); }
     let f = Fixture::new(&[("a.rs", &raw), ("b.rs", b"unsearched")]);
     let atlas = f.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
-    search.begin(&atlas, 1, "aba", options(), || false).unwrap(); search.step(&atlas, 1, || false).unwrap();
+    search.begin(&atlas, 1, "aba", AtlasSearchOptions { max_matches: 2, ..options() }, || false).unwrap();
+    search.step(&atlas, 1, || false).unwrap();
     assert!(search.progress(&atlas, 1).unwrap().is_running());
+    assert!(!search.progress(&atlas, 1).unwrap().truncated);
     for (id, start) in [(1, 6), (2, 10)] {
         let hit = search.hit(&atlas, 1, id).unwrap();
         assert_eq!(hit.original_range.start().get(), start);
@@ -209,19 +214,107 @@ fn utf16_overlapping_hits_are_usable_before_repository_scan_finishes() {
 }
 
 #[test]
-fn quotas_have_terminal_reasons_and_never_claim_complete_coverage() {
+fn exact_hit_cap_completes_after_nonmatching_files_without_retaining_more_source() {
+    let f = Fixture::new(&[("a.rs", b"needle"), ("b.rs", b"quiet"), ("c.rs", b"clear")]);
+    let atlas = f.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+    search.begin(&atlas, 1, "needle", AtlasSearchOptions { max_matches: 1, ..options() }, || false).unwrap();
+    assert_eq!(search.step(&atlas, 1, || false).unwrap().exit_code(), EXIT_PARTIAL);
+    let first = search.hit(&atlas, 1, 1).unwrap();
+    let full = search.progress(&atlas, 1).unwrap();
+    assert!(full.is_running()); assert!(!full.truncated); assert!(!full.complete);
+    assert_eq!((full.matches_seen, full.retained_hits, full.pending_files), (1, 1, 2));
+    assert_eq!(full.retained_source_bytes, 6);
+    fs::write(f.0.join("a.rs"), b"changed after capture").unwrap();
+    for examined in 2..=3 {
+        let response = search.step(&atlas, 1, || false).unwrap();
+        let p = search.progress(&atlas, 1).unwrap();
+        assert_eq!(p.examined_files, examined); assert_eq!(p.scanned_files, examined);
+        assert_eq!(p.pending_files, 3 - examined); assert_eq!(p.last_step_files, 1);
+        assert_eq!(p.last_step_source_bytes, 5); assert_eq!(p.source_bytes_read, 6 + 5 * (examined as u64 - 1));
+        assert_eq!(p.retained_source_bytes, 6); assert_eq!((p.matches_seen, p.retained_hits), (1, 1));
+        assert_eq!(p.unavailable_files, 0); assert!(!p.truncated);
+        assert_eq!(search.hit(&atlas, 1, 1).unwrap(), first);
+        assert_eq!(response.exit_code(), if examined == 3 { EXIT_OK } else { EXIT_PARTIAL });
+    }
+    let complete = search.progress(&atlas, 1).unwrap();
+    assert!(complete.complete); assert_eq!(complete.stop_reason, Some(AtlasSearchStop::AllFilesExamined));
+    assert_eq!(search.accepted_generation(), Some(1)); assert_eq!(search.pending_generation(), None);
+    let (reader, _) = search.open_reader(&atlas, owner(8402), 1, 1, || false).unwrap();
+    assert_eq!(reader.capture().bytes(), b"needle");
+    let page = search.page(&atlas, 1, 0, 100, || false).unwrap();
+    assert!(page.as_str().contains("\"search_complete\":true"));
+    assert!(page.as_str().contains("\"truncated\":false"));
+    assert!(page.as_str().contains("\"matches_seen\":\"1\""));
+}
+
+#[test]
+fn later_extra_match_stops_at_one_unstored_occurrence_and_keeps_original_hits() {
+    let mut utf16 = vec![0xff, 0xfe];
+    for unit in "needle needle needle".encode_utf16() { utf16.extend_from_slice(&unit.to_le_bytes()); }
+    for overflow in [b"needle needle needle" as &[u8], utf16.as_slice()] {
+        let f = Fixture::new(&[("a.rs", b"needle"), ("b.rs", b"no hit"),
+            ("c.rs", overflow), ("d.rs", b"needle")]);
+        let atlas = f.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+        search.begin(&atlas, 1, "needle", AtlasSearchOptions { max_matches: 1, ..options() }, || false).unwrap();
+        search.step(&atlas, 1, || false).unwrap();
+        let first = search.hit(&atlas, 1, 1).unwrap();
+        search.step(&atlas, 1, || false).unwrap();
+        let pending = search.progress(&atlas, 1).unwrap();
+        assert!(pending.is_running()); assert!(!pending.truncated);
+        assert_eq!((pending.matches_seen, pending.retained_hits, pending.pending_files), (1, 1, 2));
+        assert_eq!(search.step(&atlas, 1, || false).unwrap().exit_code(), EXIT_PARTIAL);
+        let p = search.progress(&atlas, 1).unwrap();
+        assert_eq!(p.stop_reason, Some(AtlasSearchStop::MatchLimit)); assert!(p.truncated); assert!(!p.complete);
+        assert_eq!((p.examined_files, p.scanned_files, p.pending_files, p.unavailable_files), (3, 3, 1, 0));
+        assert_eq!((p.matches_seen, p.retained_hits), (2, 1)); assert_eq!(p.retained_source_bytes, 6);
+        assert_eq!(p.source_bytes_read, 12 + overflow.len() as u64);
+        assert_eq!(p.last_step_files, 1); assert_eq!(p.last_step_source_bytes, overflow.len() as u64);
+        assert_eq!(search.hit(&atlas, 1, 1).unwrap(), first);
+        assert!(matches!(search.hit(&atlas, 1, 2), Err(AtlasSearchError::MissingHit)));
+        let page = search.page(&atlas, 1, 0, 100, || false).unwrap();
+        assert!(page.as_str().contains("\"matches_seen\":\"2\""));
+        assert!(page.as_str().contains("\"retained_hits\":\"1\""));
+        // A terminal retry must not inspect the fourth file or retain the probe.
+        search.step(&atlas, 1, || false).unwrap();
+        assert_eq!(search.progress(&atlas, 1).unwrap(), p);
+    }
+}
+
+#[test]
+fn unavailable_lookahead_sources_stay_partial_without_inventing_truncation() {
+    let f = Fixture::new(&[("a.rs", b"needle"), ("b.rs", b"gone"), ("c.rs", b"\xff"),
+        ("d.rs", b"too big"), ("e.rs", b"quiet")]);
+    let atlas = f.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+    search.begin(&atlas, 1, "needle", AtlasSearchOptions { max_matches: 1, max_file_bytes: 6,
+        ..options() }, || false).unwrap();
+    search.step(&atlas, 1, || false).unwrap();
+    let first = search.hit(&atlas, 1, 1).unwrap();
+    fs::rename(f.0.join("b.rs"), f.0.join("moved.rs")).unwrap();
+    finish(&mut search, &atlas, 1);
+    let p = search.progress(&atlas, 1).unwrap();
+    assert_eq!(p.stop_reason, Some(AtlasSearchStop::AllFilesExamined));
+    assert!(!p.complete); assert!(!p.truncated);
+    assert_eq!((p.examined_files, p.scanned_files, p.unavailable_files, p.pending_files), (5, 3, 3, 0));
+    assert_eq!((p.matches_seen, p.retained_hits), (1, 1)); assert_eq!(p.retained_source_bytes, 6);
+    assert_eq!(p.source_bytes_read, 12); assert_eq!(search.hit(&atlas, 1, 1).unwrap(), first);
+    assert_eq!(search.page(&atlas, 1, 0, 100, || false).unwrap().exit_code(), EXIT_PARTIAL);
+}
+
+#[test]
+fn work_quotas_stop_lookahead_without_claiming_complete_coverage_or_truncation() {
     let f = Fixture::new(&[("a.rs", b"needle"), ("b.rs", b"needle"), ("c.rs", b"needle")]);
     let atlas = f.open();
     for (limits, expected) in [
-        (AtlasSearchOptions { max_files: 1, ..options() }, AtlasSearchStop::FileLimit),
-        (AtlasSearchOptions { max_source_bytes: 6, ..options() }, AtlasSearchStop::SourceByteLimit),
-        (AtlasSearchOptions { max_matches: 1, ..options() }, AtlasSearchStop::MatchLimit),
+        (AtlasSearchOptions { max_files: 1, max_matches: 1, ..options() }, AtlasSearchStop::FileLimit),
+        (AtlasSearchOptions { max_source_bytes: 6, max_matches: 1, ..options() }, AtlasSearchStop::SourceByteLimit),
     ] {
         let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
         search.begin(&atlas, 1, "needle", limits, || false).unwrap();
         search.step(&atlas, 1, || false).unwrap();
         let p = search.progress(&atlas, 1).unwrap();
         assert_eq!(p.stop_reason, Some(expected)); assert!(!p.complete);
+        assert!(!p.truncated); assert_eq!((p.matches_seen, p.retained_hits), (1, 1));
+        assert_eq!(p.retained_source_bytes, 6); assert_eq!(p.unavailable_files, 0);
         assert_eq!(p.examined_files, 1); assert_eq!(p.pending_files, 2); assert_eq!(p.source_bytes_read, 6);
     }
 }
