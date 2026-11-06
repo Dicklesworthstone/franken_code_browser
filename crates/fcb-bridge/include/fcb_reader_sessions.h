@@ -64,6 +64,19 @@ char *fcb_reader_window(uint64_t handle, uint64_t offset, uint64_t bytes);
  * Oversized lines return a range_limited window, not a full-line claim. */
 char *fcb_reader_lines(uint64_t handle, uint64_t first, uint64_t count, uint64_t max_bytes);
 
+/* Exact one-based physical line and logical column. column_kind is 1 for
+ * Unicode scalars, 2 for UTF-16 code units, or 3 for decoded UTF-8 bytes.
+ * Tabs count as one logical unit; these are not visual or grapheme columns.
+ * Leading BOM and line terminators are excluded. The content-end caret is
+ * valid; missing lines, past-end columns and interior scalar/surrogate offsets
+ * fail without clamping. max_bytes has the same bounds as a byte window.
+ * The capture-bound page has command "position", selection null and a position
+ * receipt containing line, column, column_kind, original_offset and
+ * window_utf8_offset. Integer fields are canonical decimal strings. The
+ * receipt proves a logical source position, not a native shaped caret. */
+char *fcb_reader_position(uint64_t handle, uint64_t line, uint64_t column,
+    uint64_t column_kind, uint64_t max_bytes);
+
 /* Exact case-sensitive literal matching. Generations must strictly increase
  * across attempts, including canceled scans. Retained rows are indexed from 0.
  * needle is nonempty UTF-8, at most MAX_NEEDLE_BYTES. The allowance includes

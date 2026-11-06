@@ -13,6 +13,7 @@
 mod outline;
 mod comparison;
 mod highlight;
+mod position;
 pub(crate) mod document;
 mod document_links;
 #[cfg(test)]
@@ -20,6 +21,7 @@ mod shared_tests;
 pub use outline::{ReaderOutlineOptions, MAX_READER_SYMBOL_PAGE, MAX_READER_SYMBOL_QUERY_BYTES};
 pub use document::{DocumentCopyMode, ReaderDocumentOptions, MAX_READER_DOCUMENT_PAGE};
 pub use comparison::ReaderComparisonLimits;
+pub use position::ReaderColumnKind;
 use outline::{AcceptedOutline, SelectionIdentity};
 
 use std::{mem::size_of, path::{Path, PathBuf}, sync::Arc};
@@ -53,7 +55,7 @@ const LINE_CHECKPOINTS: usize = MAX_READER_SOURCE_BYTES / LINE_SCAN_STEP + 1;
 pub enum ReaderSessionError {
     Host(HostError), App(AppError), Source(SourceError), Stream(StreamReadError),
     View(ExtentViewError), Lines(LineWindowError), InvalidLimits, InvalidRange,
-    StaleQuery, MissingHit, MissingLine, Canceled, IdentityExhausted,
+    StaleQuery, MissingHit, MissingLine, MissingColumn, Canceled, IdentityExhausted,
     Symbol(SymbolError), MissingOutline, UnsupportedOutlineLanguage,
     Document(fcb::document::reader::DocumentReadError), MissingDocument,
     DocumentLinks(fcb::document::links::DocumentLinkError), MissingDocumentLinks, MissingDocumentLink,
@@ -78,6 +80,7 @@ impl std::fmt::Display for ReaderSessionError {
             Self::StaleQuery => f.write_str("READER_SESSION_STALE_QUERY"),
             Self::MissingHit => f.write_str("READER_SESSION_MISSING_HIT"),
             Self::MissingLine => f.write_str("READER_SESSION_MISSING_LINE"),
+            Self::MissingColumn => f.write_str("READER_SESSION_MISSING_COLUMN"),
             Self::Canceled => f.write_str("READER_SESSION_CANCELED"),
             Self::IdentityExhausted => f.write_str("READER_SESSION_IDENTITY_EXHAUSTED"),
         }
@@ -100,6 +103,12 @@ struct AcceptedQuery {
     generation: u64,
     hits: Vec<StreamingHit>,
     _lease: ResourceLease,
+}
+
+#[derive(Clone, Copy)]
+enum WindowTarget {
+    Selection(SelectionIdentity, ByteRange),
+    Position(position::ReaderPosition),
 }
 
 /// The host supplies a fresh, non-reused owner for each session. No method swaps
@@ -389,6 +398,12 @@ impl ReaderSession {
     fn window(&mut self, command: &str, requested: ByteRange, max_bytes: usize,
         selected: Option<(SelectionIdentity, ByteRange)>, first_line: Option<u64>, canceled: &mut impl FnMut() -> bool)
         -> Result<HostResponse, ReaderSessionError> {
+        let target = selected.map(|(identity, range)| WindowTarget::Selection(identity, range));
+        self.window_with_target(command, requested, max_bytes, target, first_line, canceled)
+    }
+    fn window_with_target(&mut self, command: &str, requested: ByteRange, max_bytes: usize,
+        target: Option<WindowTarget>, first_line: Option<u64>, canceled: &mut impl FnMut() -> bool)
+        -> Result<HostResponse, ReaderSessionError> {
         check(canceled)?;
         self.prepare_highlight(canceled)?;
         let [extent_id, decode_id] = self.allocations()?;
@@ -418,7 +433,7 @@ impl ReaderSession {
         out.literal(",\"next_offset\":")?;
         if let Some(offset) = text.next_offset() { out.integer(offset.get())?; } else { out.literal("null")?; }
         out.literal(",\"selection\":")?;
-        if let Some((identity, range)) = selected {
+        if let Some(WindowTarget::Selection(identity, range)) = target {
             let decoded = text.source_to_text(range)?;
             let resolved = text.text_selection(decoded)?;
             let original = &self.capture.bytes()[range.start().get() as usize..range.end().get() as usize];
@@ -431,6 +446,10 @@ impl ReaderSession {
             out.literal(",\"end\":")?; out.integer(decoded.end().get())?;
             out.literal("},\"original_hex\":")?; out.hex(original)?; out.literal("}")?;
         } else { out.literal("null")?; }
+        if let Some(WindowTarget::Position(position)) = target {
+            out.literal(",\"position\":")?;
+            position.encode(&mut out, &text)?;
+        }
         self.encode_highlight(&mut out, text.range(), text.text(), text.has_replacements(), canceled)?;
         out.literal("}\n")?;
         self.finish_output(out, if limited { EXIT_PARTIAL } else { EXIT_OK }, canceled)

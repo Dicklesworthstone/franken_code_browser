@@ -70,6 +70,25 @@ pub extern "C" fn fcb_reader_lines(handle: u64, first: u64, count: u64, max_byte
         Command::Lines { first, count, bytes: number(max_bytes)? }, || false)))
 }
 
+/// Exact one-based physical line and explicitly typed logical column. A column
+/// counts Unicode scalars (1), UTF-16 code units (2), or decoded UTF-8 bytes (3).
+/// Invalid unit boundaries fail instead of rounding to another source position.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_reader_position(handle: u64, line: u64, column: u64,
+    column_kind: u64, max_bytes: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| {
+        use fcb_app::host::reader::ReaderColumnKind;
+        let kind = match column_kind {
+            1 => ReaderColumnKind::UnicodeScalar,
+            2 => ReaderColumnKind::Utf16CodeUnit,
+            3 => ReaderColumnKind::DecodedUtf8Byte,
+            _ => return Err(AccessError::InvalidArgument),
+        };
+        readers.execute(handle, Command::Position { line, column, kind,
+            bytes: number(max_bytes)? }, || false)
+    }))
+}
+
 /// Exact case-sensitive literal search over retained bytes. generation must
 /// increase for each attempted query; old generations cannot select new hits.
 /// # Safety

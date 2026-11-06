@@ -111,6 +111,52 @@ fn c_generation_validation_never_selects_a_different_querys_row() {
 }
 
 #[test]
+fn c_typed_positions_keep_utf16_coordinates_on_the_retained_capture() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let bytes: Vec<u8> = "\u{feff}x\r\nA🦀e\u{301}\tZ\r\n"
+        .encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let (path, cpath) = file(&bytes);
+    let handle = open(&cpath);
+    fs::write(&path, b"a changed live file").unwrap();
+    for (kind, column, label) in [(1, 3, "unicode_scalar"),
+        (2, 4, "utf16_code_unit"), (3, 6, "decoded_utf8_byte")] {
+        let page = take(fcb_reader_position(handle, 2, column, kind, 64));
+        assert!(page.contains("\"command\":\"position\""), "{page}");
+        assert!(page.contains("\"selection\":null"), "a position must not grant query authority");
+        assert!(page.contains(&format!("\"column_kind\":\"{label}\"")));
+        assert!(page.contains(&format!("\"column\":\"{column}\"")));
+        assert!(page.contains("\"original_offset\":\"14\""), "{page}");
+        assert!(page.contains("\"encoding\":\"utf16le\""));
+        assert!(page.contains("\"additional_source_bytes_read\":\"0\""));
+    }
+    let end = take(fcb_reader_position(handle, 2, 7, 1, 64));
+    assert!(end.contains("\"original_offset\":\"22\""), "{end}");
+    for (line, column, kind) in [(2, 3, 2), (2, 3, 3), (2, 8, 1),
+        (3, 1, 1), (0, 1, 1), (1, 0, 1), (1, 1, 0), (1, 1, u64::MAX)] {
+        let refused = take(fcb_reader_position(handle, line, column, kind, 64));
+        assert!(refused.contains("\"status\":\"error\""), "{refused}");
+    }
+    assert!(take(fcb_reader_window(handle, 0, 64)).contains("A🦀e"));
+    assert_eq!(fcb_reader_close(handle), 1);
+}
+
+#[test]
+fn c_typed_position_reaches_a_far_column_with_a_bounded_page() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let mut bytes = vec![b'x'; 120_000];
+    bytes.extend_from_slice("🦀tail\n".as_bytes());
+    let (_, path) = file(&bytes);
+    let handle = open(&path);
+    let page = take(fcb_reader_position(handle, 1, 120_002, 1, 256));
+    assert!(page.contains("\"status\":\"ok\""), "{page}");
+    assert!(page.contains("\"original_offset\":\"120004\""), "{page}");
+    assert!(page.contains("tail"));
+    assert!(page.len() < 12 * 1024, "far navigation leaked an unbounded source transfer");
+    assert_eq!(fcb_reader_close(handle), 1);
+    assert!(take(fcb_reader_position(handle, 1, 1, 1, 256)).contains("READER_HANDLE_UNKNOWN"));
+}
+
+#[test]
 fn c_null_unknown_and_wide_integer_inputs_return_errors_without_panicking() {
     let _guard = FFI_TEST_LOCK.lock().unwrap();
     let handle = fcb_reader_create(); assert_ne!(handle, 0);
@@ -143,6 +189,7 @@ fn c_symbol_function_types_match_the_public_header() {
     let _: extern "C" fn(u64) -> *mut c_char = fcb_reader_info;
     let _: extern "C" fn(u64, u64, u64) -> *mut c_char = fcb_reader_window;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_reader_lines;
+    let _: extern "C" fn(u64, u64, u64, u64, u64) -> *mut c_char = fcb_reader_position;
     let _: unsafe extern "C" fn(u64, u64, *const c_char, u64, u64) -> *mut c_char = fcb_reader_find;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_reader_hit;
     let _: extern "C" fn(u64, u64, u64) -> *mut c_char = fcb_reader_copy_range;
