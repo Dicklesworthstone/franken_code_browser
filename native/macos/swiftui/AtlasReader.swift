@@ -21,7 +21,7 @@ enum AtlasReaderError: Error, Sendable {
 
     var message: String {
         switch self {
-        case .invalidInput: return "Choose a valid project file, byte offset, or one-based line number."
+        case .invalidInput: return "Choose a valid project file, byte offset, or one-based line and column."
         case .unavailable: return "The retained reader could not admit this source. No empty or partial capture was substituted."
         case .invalidResponse: return "The reader response could not be verified. The previous capture has not been replaced."
         case .canceled: return "Reader operation canceled. In-flight work may still be draining."
@@ -47,19 +47,33 @@ struct AtlasReaderInput: Sendable {
     }
 }
 
+/// Logical source units, never visual columns or an inferred tab width. The
+/// shared reader resolves these coordinates against its immutable capture.
 enum AtlasReaderColumnKind: String, CaseIterable, Identifiable, Sendable {
     case unicodeScalar = "Unicode scalar"
     case utf16CodeUnit = "UTF-16 unit"
     case decodedUtf8Byte = "Decoded UTF-8 byte"
+
     var id: Self { self }
-    var abi: UInt64 { switch self { case .unicodeScalar: 1; case .utf16CodeUnit: 2; case .decodedUtf8Byte: 3 } }
-    var wire: String { switch self { case .unicodeScalar: "unicode_scalar"; case .utf16CodeUnit: "utf16_code_unit"; case .decodedUtf8Byte: "decoded_utf8_byte" } }
+    var abi: UInt64 {
+        switch self { case .unicodeScalar: 1; case .utf16CodeUnit: 2; case .decodedUtf8Byte: 3 }
+    }
+    var wire: String {
+        switch self {
+        case .unicodeScalar: "unicode_scalar"
+        case .utf16CodeUnit: "utf16_code_unit"
+        case .decodedUtf8Byte: "decoded_utf8_byte"
+        }
+    }
+    var label: String {
+        switch self {
+        case .unicodeScalar: "Unicode scalar"
+        case .utf16CodeUnit: "UTF-16 code unit"
+        case .decodedUtf8Byte: "Decoded UTF-8 byte"
+        }
+    }
 }
-struct AtlasReaderPosition: Equatable, Sendable {
-    let line, column: UInt64
-    let kind: AtlasReaderColumnKind
-    let originalOffset, windowUtf8Offset: UInt64
-}
+
 enum AtlasReaderRequest: Equatable, Sendable {
     case window(offset: UInt64, bytes: UInt64)
     case lines(first: UInt64, count: UInt64, bytes: UInt64)
@@ -68,8 +82,13 @@ enum AtlasReaderRequest: Equatable, Sendable {
     case symbol(AtlasOutlineTarget)
 
     static var firstPage: Self { .window(offset: 0, bytes: AtlasReaderLimits.pageBytes) }
-    var command: String { switch self { case .window: "window"; case .lines: "lines"; case .position: "position"; case .hit: "hit"; case .symbol: "symbol" } }
-    var byteLimit: UInt64 { switch self { case .window(_, let bytes), .lines(_, _, let bytes), .position(_, _, _, let bytes): bytes; case .hit, .symbol: AtlasReaderLimits.maximumPageBytes } }
+    var command: String { switch self { case .window: return "window"; case .lines: return "lines"; case .position: return "position"; case .hit: return "hit"; case .symbol: return "symbol" } }
+    var byteLimit: UInt64 {
+        switch self {
+        case .window(_, let bytes), .lines(_, _, let bytes), .position(_, _, _, let bytes): return bytes
+        case .hit, .symbol: return AtlasReaderLimits.maximumPageBytes
+        }
+    }
 
     func validate(capturedBytes: UInt64) throws {
         guard (4...AtlasReaderLimits.maximumPageBytes).contains(byteLimit) else {
@@ -312,6 +331,111 @@ struct AtlasReaderHighlight: Sendable {
     }
 }
 
+/// An engine-resolved logical caret in this page's exact captured source. The
+/// AppKit conversion below does not interpret columns or original encodings:
+/// it converts the already verified window UTF-8 offset to UTF-16, once.
+struct AtlasReaderPosition: Equatable, Sendable {
+    enum CaretLimitation: Equatable, Sendable {
+        case composedCharacter, unverifiedDecodedOffset
+        var message: String {
+            switch self {
+            case .composedCharacter:
+                "The exact logical position is inside a composed character. A native caret is unavailable there; the location has not been rounded."
+            case .unverifiedDecodedOffset:
+                "A native caret is unavailable because replacement text prevents verifying its exact original-byte location. The engine's logical position and original bytes are retained."
+            }
+        }
+    }
+    let line: UInt64
+    let column: UInt64
+    let kind: AtlasReaderColumnKind
+    let originalOffset: UInt64
+    let windowUtf8Offset: UInt64
+    let windowUTF16Offset: Int
+    let requestedBytes: UInt64
+    /// A logical scalar boundary can lie inside a composed character. Keep the
+    /// exact logical target, but never round the native caret to another byte.
+    let nativeCaretRange: NSRange?
+    let caretLimitation: CaretLimitation?
+
+    var request: AtlasReaderRequest {
+        .position(line: line, column: column, kind: kind, bytes: requestedBytes)
+    }
+    var summary: String {
+        "Line \(line), \(kind.label.lowercased()) column \(column) · original byte \(originalOffset)"
+    }
+
+    static func caret(in text: String, atUTF8 target: UInt64) -> (offset: Int, range: NSRange?)? {
+        var offset: UInt64 = 0
+        var units = 0
+        for byte in text.utf8 {
+            if offset == target {
+                guard byte & 0xC0 != 0x80 else { return nil }
+                return nativeCaret(in: text, utf16: units)
+            }
+            if byte & 0xC0 != 0x80 { units += byte >= 0xF0 ? 2 : 1 }
+            offset += 1
+        }
+        guard offset == target else { return nil }
+        return nativeCaret(in: text, utf16: units)
+    }
+
+    private static func nativeCaret(in text: String, utf16: Int) -> (offset: Int, range: NSRange?) {
+        let native = text as NSString
+        let available = utf16 == 0 || utf16 == native.length
+            || native.rangeOfComposedCharacterSequence(at: utf16).location == utf16
+        return (utf16, available ? NSRange(location: utf16, length: 0) : nil)
+    }
+
+    /// Correlate the two wire coordinates by reverse encoding only. Logical
+    /// column resolution and malformed-input decoding remain in the engine.
+    /// A replacement-containing page can still prove a caret using an exact
+    /// prefix or suffix; otherwise it retains a logical position without an
+    /// unproved native caret. Every buffer is bounded by reader-page admission.
+    static func verifiesSourceOffset(text: String, utf8Offset: UInt64, utf16Offset: Int,
+        originalHex: String, visibleStart: UInt64, originalOffset: UInt64,
+        encoding: String, hasReplacements: Bool) throws -> Bool {
+        let encoded: Data
+        let prefixBytes: Int
+        switch encoding {
+        case "utf8": encoded = Data(text.utf8); prefixBytes = Int(utf8Offset)
+        case "utf16le", "utf16be":
+            guard let bytes = text.data(using: encoding == "utf16le" ? .utf16LittleEndian : .utf16BigEndian) else {
+                throw AtlasReaderError.invalidResponse
+            }
+            encoded = bytes; prefixBytes = utf16Offset * 2
+        default: throw AtlasReaderError.invalidResponse
+        }
+        let hex = Array(originalHex.utf8)
+        let count = hex.count / 2
+        // The shared extent decoder already excludes the capture-leading BOM
+        // from both visible_range and original_hex. A U+FEFF in this text is
+        // ordinary content and must participate in the exact round trip.
+        guard originalOffset >= visibleStart, originalOffset - visibleStart <= UInt64(count),
+              prefixBytes >= 0, prefixBytes <= encoded.count else { throw AtlasReaderError.invalidResponse }
+        let rawOffset = Int(originalOffset - visibleStart)
+        func nibble(_ value: UInt8) -> UInt8 { value <= 57 ? value - 48 : value - 87 }
+        func matches<Bytes: Collection>(_ bytes: Bytes, at start: Int) -> Bool where Bytes.Element == UInt8 {
+            guard start >= 0, start <= count, bytes.count <= count - start else { return false }
+            for (index, byte) in bytes.enumerated() {
+                let at = (start + index) * 2
+                if nibble(hex[at]) * 16 + nibble(hex[at + 1]) != byte { return false }
+            }
+            return true
+        }
+        if !hasReplacements {
+            guard encoded.count == count, matches(encoded, at: 0),
+                  rawOffset == prefixBytes else { throw AtlasReaderError.invalidResponse }
+            return true
+        }
+        let prefixProvesOffset = rawOffset == prefixBytes
+            && matches(encoded.prefix(prefixBytes), at: 0)
+        let suffix = encoded.dropFirst(prefixBytes)
+        let suffixProvesOffset = count - rawOffset == suffix.count && matches(suffix, at: rawOffset)
+        return prefixProvesOffset || suffixProvesOffset
+    }
+}
+
 struct AtlasReaderPage: Sendable {
     let identity: AtlasReaderIdentity
     let start: UInt64
@@ -329,6 +453,18 @@ struct AtlasReaderPage: Sendable {
     let symbolSelection: AtlasReaderSymbolSelection?
     let position: AtlasReaderPosition?
     var nextOffset: UInt64? { end < identity.capturedBytes ? end : nil }
+
+    init(identity: AtlasReaderIdentity, start: UInt64, end: UInt64, text: String,
+         originalHex: String, firstPhysicalLine: UInt64?, rangeLimited: Bool,
+         boundariesAdjusted: Bool, hasReplacements: Bool, highlight: AtlasReaderHighlight?,
+         selection: AtlasReaderHitSelection?, symbolSelection: AtlasReaderSymbolSelection?,
+         position: AtlasReaderPosition? = nil) {
+        self.identity = identity; self.start = start; self.end = end; self.text = text
+        self.originalHex = originalHex; self.firstPhysicalLine = firstPhysicalLine
+        self.rangeLimited = rangeLimited; self.boundariesAdjusted = boundariesAdjusted
+        self.hasReplacements = hasReplacements; self.highlight = highlight
+        self.selection = selection; self.symbolSelection = symbolSelection; self.position = position
+    }
 
     static func decode(_ json: String?, info: AtlasReaderInfo, request: AtlasReaderRequest) throws -> Self {
         try request.validate(capturedBytes: info.identity.capturedBytes)
@@ -373,26 +509,45 @@ struct AtlasReaderPage: Sendable {
             var position: AtlasReaderPosition?
             switch request {
             case .window(let offset, let bytes):
-                guard wire.selection == nil, firstLine == nil, requested.start == offset,
+                guard wire.selection == nil, wire.position == nil, firstLine == nil, requested.start == offset,
                       requested.end == offset + min(bytes, identity.capturedBytes - offset) else {
                     throw AtlasReaderError.invalidResponse
                 }
             case .lines(let first, _, _):
                 guard wire.selection == nil, wire.position == nil, firstLine == first else { throw AtlasReaderError.invalidResponse }
-            case .position(let line, let column, let kind, _):
-                guard wire.selection == nil, firstLine == nil, let p = wire.position,
-                      AtlasReaderWire.integer(p.line) == line,
-                      AtlasReaderWire.integer(p.column) == column,
-                      p.column_kind == kind.wire,
-                      let original = AtlasReaderWire.integer(p.original_offset), original <= identity.capturedBytes,
-                      let local = AtlasReaderWire.integer(p.window_utf8_offset), local <= UInt64(wire.text.utf8.count) else {
+            case .position(let line, let column, let kind, let bytes):
+                guard wire.selectionIsNull, firstLine == nil, !wire.range_limited,
+                      identity.encoding != "unsupported", let resolved = wire.position,
+                      AtlasReaderWire.integer(resolved.line) == line,
+                      AtlasReaderWire.integer(resolved.column) == column,
+                      resolved.column_kind == kind.wire,
+                      let originalOffset = AtlasReaderWire.integer(resolved.original_offset),
+                      originalOffset >= visible.start, originalOffset <= visible.end,
+                      let utf8Offset = AtlasReaderWire.integer(resolved.window_utf8_offset),
+                      let caret = AtlasReaderPosition.caret(in: wire.text, atUTF8: utf8Offset) else {
                     throw AtlasReaderError.invalidResponse
                 }
+                // Reserve four bytes after the target, even in the minimum
+                // window, then permit only the existing scalar/CRLF adjustment.
+                let before = (bytes - 4) / 2
+                let start = originalOffset - min(originalOffset, before)
+                guard requested.start == start,
+                      requested.end == start + min(bytes, identity.capturedBytes - start) else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                let verified = try AtlasReaderPosition.verifiesSourceOffset(text: wire.text,
+                    utf8Offset: utf8Offset, utf16Offset: caret.offset,
+                    originalHex: wire.original_hex, visibleStart: visible.start, originalOffset: originalOffset,
+                    encoding: identity.encoding, hasReplacements: wire.has_replacements)
+                let limitation: AtlasReaderPosition.CaretLimitation? = !verified ? .unverifiedDecodedOffset
+                    : (caret.range == nil ? .composedCharacter : nil)
                 position = AtlasReaderPosition(line: line, column: column, kind: kind,
-                    originalOffset: original, windowUtf8Offset: local)
+                    originalOffset: originalOffset, windowUtf8Offset: utf8Offset,
+                    windowUTF16Offset: caret.offset, requestedBytes: bytes,
+                    nativeCaretRange: verified ? caret.range : nil, caretLimitation: limitation)
             case .hit(let target):
                 let padding = AtlasReaderHitTarget.contextBytes + 4
-                guard firstLine == nil, !wire.range_limited,
+                guard wire.position == nil, firstLine == nil, !wire.range_limited,
                       requested.start == target.start - min(padding, target.start),
                       requested.end == target.end + min(padding, identity.capturedBytes - target.end),
                       let selected = wire.selection,
@@ -421,7 +576,7 @@ struct AtlasReaderPage: Sendable {
             case .symbol(let target):
                 let expected = target.symbol.selectedRange
                 let padding = AtlasOutlineTarget.contextBytes + 4
-                guard target.identity.matches(identity), firstLine == nil, !wire.range_limited,
+                guard wire.position == nil, target.identity.matches(identity), firstLine == nil, !wire.range_limited,
                       requested.start == expected.start - min(padding, expected.start),
                       requested.end == expected.end + min(padding, identity.capturedBytes - expected.end),
                       let selected = wire.selection, selected.query_generation == nil,
@@ -470,6 +625,7 @@ struct AtlasReaderPage: Sendable {
         // A matching accepted search or outline request admits its own namespace.
         // Byte/line pages cannot borrow either selection authority.
         let selection: Selection?
+        let selectionIsNull: Bool
         let position: Position?
         struct Position: Decodable {
             let line, column, column_kind, original_offset, window_utf8_offset: String
@@ -484,7 +640,7 @@ struct AtlasReaderPage: Sendable {
         }
         enum CodingKeys: CodingKey {
             case text_kind, text, original_hex, requested_original_range, visible_range,
-                 range_limited, boundaries_adjusted, has_replacements, first_physical_line, next_offset, selection, position, highlight
+                 range_limited, boundaries_adjusted, has_replacements, first_physical_line, next_offset, selection, highlight, position
         }
         init(from decoder: Decoder) throws {
             header = try .init(from: decoder)
@@ -500,6 +656,8 @@ struct AtlasReaderPage: Sendable {
             first_physical_line = try c.decodeIfPresent(String.self, forKey: .first_physical_line)
             next_offset = try c.decodeIfPresent(String.self, forKey: .next_offset)
             selection = try c.decodeIfPresent(Selection.self, forKey: .selection)
+            if c.contains(.selection) { selectionIsNull = try c.decodeNil(forKey: .selection) }
+            else { selectionIsNull = false }
             position = try c.decodeIfPresent(Position.self, forKey: .position)
             highlight = try c.decodeIfPresent(AtlasReaderHighlight.Wire.self, forKey: .highlight)
         }

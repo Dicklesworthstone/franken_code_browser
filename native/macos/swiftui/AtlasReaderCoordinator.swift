@@ -38,11 +38,11 @@ struct AtlasReaderTransport: Sendable {
          openBytes: (@Sendable (UInt64, String, Data) -> SuppliedResponse?)? = nil,
          comparison: AtlasReaderComparisonTransport? = nil) {
         self.create = create; self.open = open; self.window = window; self.lines = lines
-        self.position = position
         self.cancel = cancel; self.close = close; self.retirementFailed = retirementFailed
         self.fork = fork
         self.openBytes = openBytes
         self.comparison = comparison
+        self.position = position
     }
 }
 
@@ -157,6 +157,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
     var supportsFind: Bool { searchTransport != nil }
     var supportsOutline: Bool { outlineTransport != nil }
     var supportsDocument: Bool { documentTransport != nil }
+    var supportsPosition: Bool { (session?.transport ?? transport).position != nil }
     var canFork: Bool { session?.transport.fork != nil && info != nil }
     var supportsComparison: Bool {
         guard let info else { return false }
@@ -326,8 +327,9 @@ private final class AtlasReaderSession: @unchecked Sendable {
               AtlasReaderWire.validHex(original.originalHex, bytes: original.end - original.start) else {
             throw AtlasReaderError.unavailable
         }
-        let request = AtlasReaderRequest.window(offset: original.start,
+        let request = original.position?.request ?? AtlasReaderRequest.window(offset: original.start,
             bytes: max(4, min(AtlasReaderLimits.maximumPageBytes, original.end - original.start)))
+        guard original.position == nil || transport.position != nil else { throw AtlasReaderError.unavailable }
         try request.validate(capturedBytes: sourceInfo.identity.capturedBytes)
         let next = try AtlasReaderSession(transport: transport, sharingAccessFrom: source)
         pendingSession = next
@@ -346,9 +348,14 @@ private final class AtlasReaderSession: @unchecked Sendable {
                       copiedInfo.identity.pathBytes == sourceInfo.identity.pathBytes,
                       sourceInfo.captureSHA256 == nil || copiedInfo.captureSHA256 == sourceInfo.captureSHA256,
                       copiedInfo.origin == "host-supplied" else { throw AtlasReaderError.invalidResponse }
-                let copiedPage = try AtlasReaderPage.decode(
-                    next.transport.window(next.handle, original.start, request.byteLimit),
-                    info: copiedInfo, request: request)
+                let json: String?
+                if let position = original.position {
+                    guard let resolve = next.transport.position else { throw AtlasReaderError.unavailable }
+                    json = resolve(next.handle, position.line, position.column, position.kind.abi, request.byteLimit)
+                } else {
+                    json = next.transport.window(next.handle, original.start, request.byteLimit)
+                }
+                let copiedPage = try AtlasReaderPage.decode(json, info: copiedInfo, request: request)
                 // The independent identity cannot authorize replacement bytes
                 // for a page the user already saw. Compare the shared original
                 // extent, never its decoded or visually selected text.
@@ -357,6 +364,14 @@ private final class AtlasReaderSession: @unchecked Sendable {
                 guard copiedPage.originalHex.utf8.prefix(overlap)
                     .elementsEqual(original.originalHex.utf8.prefix(overlap)) else {
                     throw AtlasReaderError.invalidResponse
+                }
+                if let position = original.position {
+                    guard copiedPage.end == original.end,
+                          copiedPage.position?.originalOffset == position.originalOffset,
+                          copiedPage.position?.windowUtf8Offset == position.windowUtf8Offset,
+                          copiedPage.text.utf8.elementsEqual(original.text.utf8) else {
+                        throw AtlasReaderError.invalidResponse
+                    }
                 }
                 return (copiedInfo, copiedPage)
             }
@@ -475,6 +490,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
         // Reject invalid navigation before canceling an admitted operation.
         try request.validate(capturedBytes: info.identity.capturedBytes)
         try validateSelection(request)
+        if case .position = request, session.transport.position == nil { throw AtlasReaderError.unavailable }
         let outline = outlineTransport
         let search = searchTransport
         cancel()
@@ -502,7 +518,8 @@ private final class AtlasReaderSession: @unchecked Sendable {
                 }
                 return try AtlasReaderPage.decode(json, info: info, request: request)
             }
-            guard self.session === session, operation == ticket, !flag.isCanceled else { throw AtlasReaderError.canceled }
+            guard self.session === session, operation == ticket, !flag.isCanceled,
+                  !Task.isCancelled else { throw AtlasReaderError.canceled }
             // A host may revoke rows while foreign work is draining without
             // canceling unrelated source work. Recheck authority at delivery.
             try validateSelection(request)

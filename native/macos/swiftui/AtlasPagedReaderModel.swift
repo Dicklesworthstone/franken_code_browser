@@ -17,9 +17,15 @@ import Observation
     private(set) var pinning = false
     private(set) var notice = ""
     var offsetInput = "0"
-    var lineInput = "1"
-    var columnInput = "1"
-    var columnKind: AtlasReaderColumnKind = .unicodeScalar
+    var lineInput = "1" {
+        didSet { if positionWork && !oldValue.utf8.elementsEqual(lineInput.utf8) { cancel() } }
+    }
+    var columnInput = "1" {
+        didSet { if positionWork && !oldValue.utf8.elementsEqual(columnInput.utf8) { cancel() } }
+    }
+    var columnKind: AtlasReaderColumnKind = .unicodeScalar {
+        didSet { if positionWork && oldValue != columnKind { cancel() } }
+    }
     var fileQuery = "" {
         didSet {
             // Revoke synchronously with the edit, not in a later SwiftUI
@@ -32,6 +38,7 @@ import Observation
     private var selectedRange: NSRange?
     @ObservationIgnored private var queryWork = false
     @ObservationIgnored private var outlineWork = false
+    @ObservationIgnored private var positionWork = false
     private(set) var outlinePage: AtlasOutlinePage?
     private(set) var hasOutline = false
     private(set) var outlineRowsAuthorized = false
@@ -97,9 +104,11 @@ import Observation
     var canCompare: Bool { page != nil && !busy && !pinning && !documentPreview.busy && coordinator.supportsComparison }
     var retainedRegistryDomain: UUID? { coordinator.retainedRegistryDomain }
     var canFind: Bool { page != nil && coordinator.supportsFind }
+    var canGoToPosition: Bool { page != nil && coordinator.supportsPosition }
     var findIsCurrent: Bool { findReport?.needle.utf8.elementsEqual(fileQuery.utf8) == true }
     var canMoveHit: Bool { findIsCurrent && findReport?.hits.isEmpty == false && !busy }
     var nativeSelectionRange: NSRange? {
+        if let position = page?.position { return position.nativeCaretRange }
         if findIsCurrent, page?.selection?.target.generation == findReport?.generation,
            page?.selection != nil { return selectedRange }
         if outlineIsCurrent, let selection = page?.symbolSelection,
@@ -152,6 +161,7 @@ import Observation
         if page.rangeLimited { messages.append("Requested lines exceed the page byte limit. Next continues through the retained bytes.") }
         if page.boundariesAdjusted { messages.append("Page boundaries adjusted to complete source scalars or CRLF.") }
         if page.hasReplacements { messages.append("Display contains replacement characters. Original hex preserves the captured bytes.") }
+        if let limitation = page.position?.caretLimitation { messages.append(limitation.message) }
         return messages.joined(separator: " ")
     }
 
@@ -187,9 +197,11 @@ import Observation
             child.refreshAccessLease = accessLease
             child.forkedCapture = true
             child.retainedOnly = retainedOnly
-            child.install(copied, request: .window(offset: copied.start,
+            child.install(copied, request: copied.position?.request ?? .window(offset: copied.start,
                 bytes: max(4, min(AtlasReaderLimits.maximumPageBytes, copied.end - copied.start))))
-            child.notice = "Pinned the exact captured source at this byte window. Find, Outline and Markdown use independent selections."
+            child.notice = copied.position == nil
+                ? "Pinned the exact captured source at this byte window. Find, Outline and Markdown use independent selections."
+                : "Pinned the exact captured source at this logical position. Find, Outline and Markdown use independent selections."
             return child
         } catch {
             child.close()
@@ -344,6 +356,7 @@ import Observation
                 clearOutlineFilter(reset: true)
                 documentPreview.close()
                 lineInput = "1"
+                columnInput = "1"
                 install(next, request: .firstPage)
                 refreshedFromDisk = true
                 finish(ticket)
@@ -377,9 +390,11 @@ import Observation
         navigate(.lines(first: line, count: 64, bytes: AtlasReaderLimits.pageBytes))
     }
     func goToPosition() {
+        guard canGoToPosition else { notice = AtlasReaderError.unavailable.message; return }
         guard let line = Self.number(lineInput), line > 0,
               let column = Self.number(columnInput), column > 0 else {
-            notice = AtlasReaderError.invalidInput.message; return
+            notice = AtlasReaderError.invalidInput.message
+            return
         }
         navigate(.position(line: line, column: column, kind: columnKind, bytes: AtlasReaderLimits.pageBytes))
     }
@@ -548,6 +563,7 @@ import Observation
         busy = false; isRefreshing = false
         queryWork = false
         outlineWork = false
+        positionWork = false
         notice = wasRefreshing ? "Refresh canceled. The previous retained source is unchanged."
             : (page == nil ? "Source opening canceled." : "Navigation canceled. The current retained page is unchanged.")
     }
@@ -562,7 +578,7 @@ import Observation
         retainedOnly = false
         page = nil; source = nil; history.reset()
         findReport = nil; selectedHitIndex = nil; selectedRange = nil
-        queryWork = false; outlineWork = false
+        queryWork = false; outlineWork = false; positionWork = false
         fileQuery = ""
         outlinePage = nil; hasOutline = false; outlineRowsAuthorized = false
         outlineHistory = []; outlineNeedle = ""; outlineMode = .contains; outlineLanguage = .automatic
@@ -586,7 +602,9 @@ import Observation
         let move = historyMove ?? history.visit(request)
         let isSymbol: Bool
         if case .symbol = request { isSymbol = true } else { isSymbol = false }
-        let ticket = begin(query: hitIndex != nil, outline: isSymbol)
+        let isPosition: Bool
+        if case .position = request { isPosition = true } else { isPosition = false }
+        let ticket = begin(query: hitIndex != nil, outline: isSymbol, position: isPosition)
         notice = "Reading retained source…"
         task = Task {
             do {
@@ -598,7 +616,7 @@ import Observation
             } catch { fail(error, ticket: ticket) }
         }
     }
-    private func begin(query: Bool = false, outline: Bool = false) -> UUID {
+    private func begin(query: Bool = false, outline: Bool = false, position: Bool = false) -> UUID {
         cancelPin()
         documentPreview.cancel(silent: true)
         task?.cancel()
@@ -608,6 +626,7 @@ import Observation
         isRefreshing = false
         queryWork = query
         outlineWork = outline
+        positionWork = position
         return operation
     }
     @discardableResult private func install(_ page: AtlasReaderPage, request: AtlasReaderRequest,
@@ -625,6 +644,9 @@ import Observation
         } else {
             history.reset(to: position)
         }
+        // Input updates below describe this accepted navigation; they must not
+        // revoke it as though the user edited a still-pending location request.
+        positionWork = false
         self.page = page
         documentPreview.bind(identity: page.identity, sourceOffset: page.start)
         let source = AtlasSource(path: page.identity.displayPath, text: page.text)
@@ -633,21 +655,17 @@ import Observation
             ?? page.symbolSelection.flatMap { source.utf16Range(byteStart: $0.utf8Start, byteEnd: $0.utf8End) }
         navigation = UUID()
         offsetInput = String(page.start)
-        if let exact = page.position {
-            lineInput = String(exact.line)
-            columnInput = String(exact.column)
-            columnKind = exact.kind
-        } else if let line = page.firstPhysicalLine {
-            lineInput = String(line)
-        }
-        notice = page.position.map {
-            "Resolved line \($0.line), column \($0.column) (\($0.kind.rawValue)) to original byte \($0.originalOffset)."
-        } ?? ""
+        if let position = page.position {
+            lineInput = String(position.line)
+            columnInput = String(position.column)
+            columnKind = position.kind
+        } else if let line = page.firstPhysicalLine { lineInput = String(line) }
+        notice = ""
         return true
     }
     private func finish(_ ticket: UUID) {
         guard operation == ticket else { return }
-        busy = false; isRefreshing = false; task = nil; queryWork = false; outlineWork = false
+        busy = false; isRefreshing = false; task = nil; queryWork = false; outlineWork = false; positionWork = false
     }
     private func fail(_ error: Error, ticket: UUID) {
         guard operation == ticket, !Task.isCancelled else { return }

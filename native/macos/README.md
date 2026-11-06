@@ -172,6 +172,30 @@ including retained and pinned pages. Native layout, scrolling, and copy
 regressions are included for the configured macOS verification lane;
 physical-Mac execution remains pending.
 
+## Exact source locations
+
+The paged reader's **Line**, **Column**, and column-unit controls resolve a
+one-based location in the retained source. Choose **Unicode scalar**,
+**UTF-16 code unit**, or **Decoded UTF-8 byte**, then use **Go location**. These
+are logical columns: tabs count as one unit, and columns do not describe visual
+width or bidirectional display order. A leading encoding BOM and CR/LF/CRLF
+terminators are excluded. The caret after the last content character is valid;
+a trailing line terminator does not create another physical line.
+
+The shared Rust decoder resolves the position in bounded chunks and returns a
+small page around it, including columns far beyond the first 64 KiB of a giant
+line. Invalid columns and offsets inside a UTF-8 scalar or UTF-16 surrogate pair
+are rejected. Failed or canceled navigation preserves the accepted page. Back,
+Forward, and pinning retain the exact location and capture identity; editing the
+location during a pending request revokes that request.
+
+The position label reports the requested coordinate unit and exact original
+byte offset. When AppKit cannot represent an exact logical position, such as a
+boundary inside a composed character, the reader retains the logical location
+and reports that the native caret is unavailable. It does not round the target.
+Source, bridge, and native regression cases are included; executable Rust/Swift
+and physical-Mac qualification remain pending.
+
 ## Local test image
 
 For a local drag-to-Applications test image:

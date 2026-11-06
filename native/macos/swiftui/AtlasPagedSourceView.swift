@@ -123,6 +123,12 @@ import AppKit
                         .accessibilityLabel("Copy original page bytes as hexadecimal")
                 }
                 .padding(.horizontal, 10)
+                if let position = page.position {
+                    Text(position.summary)
+                        .font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10)
+                        .accessibilityLabel("Exact logical source position: " + position.summary)
+                }
             }
             if let source = model.source {
                 // Equal page text can have different lexical context. Retain
@@ -195,15 +201,19 @@ import AppKit
                     .onSubmit(model.goToLine)
                 Button("Go line", action: model.goToLine).disabled(model.page == nil)
                 TextField("Column", text: $model.columnInput)
-                    .frame(width: 64).textFieldStyle(.roundedBorder)
+                    .frame(width: 68).textFieldStyle(.roundedBorder)
                     .accessibilityLabel("Logical source column, one based")
                     .onSubmit(model.goToPosition)
-                Picker("Column units", selection: $model.columnKind) {
-                    ForEach(AtlasReaderColumnKind.allCases) { kind in Text(kind.rawValue).tag(kind) }
+                    .disabled(!model.canGoToPosition)
+                Picker("Column unit", selection: $model.columnKind) {
+                    ForEach(AtlasReaderColumnKind.allCases) { Text($0.label).tag($0) }
                 }
-                .labelsHidden().frame(width: 126)
-                Button("Go line:column", action: model.goToPosition).disabled(model.page == nil)
-                    .help("Resolve an exact retained-capture caret. Columns count the selected logical unit, not visual cells or grapheme clusters.")
+                .labelsHidden().frame(width: 170)
+                .accessibilityLabel("Logical column unit")
+                .disabled(!model.canGoToPosition)
+                Button("Go location", action: model.goToPosition)
+                    .disabled(!model.canGoToPosition)
+                    .help("Jump to the one-based line and column in this retained source. Columns use the selected logical unit; tabs are not expanded and visual order is not inferred.")
                 Menu("Display") {
                     Toggle("Line numbers", isOn: $showsLineNumbers)
                     Toggle("Visible whitespace", isOn: $showsWhitespace)

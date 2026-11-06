@@ -34,6 +34,14 @@ char *fcb_reader_window(uint64_t handle, uint64_t offset, uint64_t length) {
 char *fcb_reader_lines(uint64_t handle, uint64_t first, uint64_t count, uint64_t length) {
     (void)handle; (void)first; (void)count; (void)length; return NULL;
 }
+char *fcb_reader_position(uint64_t handle, uint64_t line, uint64_t column,
+    uint64_t kind, uint64_t length) {
+    assert(handle == fixture_handle && line == UINT64_MAX && column == UINT64_MAX - 1);
+    assert(kind >= 1 && kind <= 3 && length == UINT64_C(262144));
+    ++calls;
+    char *result = strdup("{\"position_fixture\":true}");
+    assert(result); ++allocated; return result;
+}
 char *fcb_reader_fork(uint64_t source, uint64_t destination) {
     (void)source; (void)destination; return NULL;
 }

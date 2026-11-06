@@ -60,7 +60,18 @@ import Foundation
         }.value
         precondition(compared == "{\"comparison_fixture\":true}")
         precondition(suppliedCalls() == 4 && suppliedLive() == 0)
+        guard let position = AtlasReaderTransport.native.position else {
+            fatalError("native retained position capability missing")
+        }
+        for kind in AtlasReaderColumnKind.allCases {
+            let located = await Task.detached {
+                position(handle, UInt64.max, UInt64.max - 1, kind.abi, AtlasReaderLimits.maximumPageBytes)
+            }.value
+            precondition(located == "{\"position_fixture\":true}" && suppliedLive() == 0,
+                         "position arguments or response ownership changed at the native boundary")
+        }
+        precondition(suppliedCalls() == 7)
         precondition(AtlasReaderTransport.native.close(handle))
-        print("AtlasSuppliedReaderBridgeTests: exact raw buffer, SHA, empty capture, limits, pair arguments and allocation checks passed")
+        print("AtlasSuppliedReaderBridgeTests: exact raw buffer, SHA, empty capture, limits, pair/position arguments and allocation checks passed")
     }
 }

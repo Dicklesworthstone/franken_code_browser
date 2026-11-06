@@ -91,7 +91,7 @@ extension AtlasReaderTransport {
     func importing(_ source: AtlasSuppliedReaderSource) -> Self {
         Self(create: create, open: { handle, path, limit in
             source.open(handle: handle, label: path, limit: limit, using: self)
-        }, window: window, lines: lines, cancel: cancel, close: close,
+        }, window: window, lines: lines, position: position, cancel: cancel, close: close,
         retirementFailed: retirementFailed, fork: fork, openBytes: openBytes, comparison: comparison)
     }
 }
