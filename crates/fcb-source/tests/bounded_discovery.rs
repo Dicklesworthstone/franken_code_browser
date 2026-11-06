@@ -168,11 +168,11 @@ fn depth_limit_lists_the_boundary_directory_but_does_not_walk_it() {
     assert!(paths.contains(&"a/b"));
     assert!(!paths.iter().any(|path| path.contains("secret")));
     assert!(discovery.aggregate().depth_limited >= 1);
-    assert!(discovery.is_complete());
+    assert_eq!(discovery.status(), ScanStatus::Incomplete { reason: IncompleteReason::TraversalLimited });
 }
 
 #[test]
-fn path_byte_limit_skips_overlong_names_without_failing_the_scan() {
+fn path_byte_limit_continues_with_explicit_incomplete_coverage() {
     let dir = TempTestDir::new("pathlen");
     write_file(dir.path(), "ok.txt", b"ok");
     write_file(dir.path(), "this_name_is_too_long.txt", b"nope");
@@ -185,6 +185,7 @@ fn path_byte_limit_skips_overlong_names_without_failing_the_scan() {
     let paths: Vec<&str> = observed.iter().map(|(path, _, _)| path.as_str()).collect();
     assert_eq!(paths, ["ok.txt"]);
     assert!(discovery.aggregate().path_limited >= 1);
+    assert_eq!(discovery.status(), ScanStatus::Incomplete { reason: IncompleteReason::TraversalLimited });
 }
 
 #[test]
@@ -401,6 +402,8 @@ fn symlink_is_published_and_not_followed_when_disallowed() {
             .iter()
             .any(|(path, _, _)| path.starts_with("link/"))
     );
+    assert_eq!(discovery.aggregate().excluded, 1, "disallowed link traversal is an explicit policy exclusion");
+    assert!(discovery.is_complete(), "the policy-scoped namespace was enumerated");
 }
 
 #[test]

@@ -17,7 +17,9 @@
 //! its original source evidence. Never attach an old note to an unrelated new file
 //! simply because a path was recycled.
 
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
+use std::ops::Bound;
 
 use fcb_core::{ArenaOwnerId, FileId, SourceRevision};
 
@@ -169,6 +171,8 @@ pub enum ReconciliationIncompleteReason {
     PermissionDenied,
     RootUnavailable,
     RulePolicyUnavailable,
+    EnumerationUnavailable,
+    TraversalLimited,
 }
 
 impl From<IncompleteReason> for ReconciliationIncompleteReason {
@@ -179,6 +183,8 @@ impl From<IncompleteReason> for ReconciliationIncompleteReason {
             IncompleteReason::QueueSaturated => Self::QueueSaturated,
             IncompleteReason::RootUnavailable => Self::RootUnavailable,
             IncompleteReason::RulePolicyUnavailable => Self::RulePolicyUnavailable,
+            IncompleteReason::EnumerationUnavailable => Self::EnumerationUnavailable,
+            IncompleteReason::TraversalLimited => Self::TraversalLimited,
         }
     }
 }
@@ -286,13 +292,29 @@ impl ReconciliationReport {
     }
 }
 
+// NormalizedPath orders by its authoritative raw bytes. Borrowing those bytes
+// permits component-prefix lookups without rebuilding paths, allocating parent
+// strings, or normalizing native backslashes and non-UTF8 names a second time.
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+struct ObservedPath(NormalizedPath);
+
+impl Borrow<[u8]> for ObservedPath {
+    fn borrow(&self) -> &[u8] { self.0.as_bytes() }
+}
+
+struct ReconciliationObservation {
+    entry: ObservedEntry,
+    excluded_subtree: bool,
+}
+
 /// Manages a reconciliation pass over a directory.
 pub struct ReconciliationPass {
     directory: Option<NormalizedPath>,
     epoch: ScanEpoch,
     start_hint_sequence: u64,
     known_entries: BTreeMap<NormalizedPath, KnownEntry>,
-    observed_entries: BTreeMap<NormalizedPath, ObservedEntry>,
+    observed_entries: BTreeMap<ObservedPath, ReconciliationObservation>,
+    root_excluded: bool,
     status: ReconciliationStatus,
 }
 
@@ -309,6 +331,7 @@ impl ReconciliationPass {
             start_hint_sequence: dirty_tracker.current_sequence(),
             known_entries,
             observed_entries: BTreeMap::new(),
+            root_excluded: false,
             status: ReconciliationStatus::InProgress,
         }
     }
@@ -334,20 +357,47 @@ impl ReconciliationPass {
         digest: Option<ObservationDigest>,
     ) {
         self.observed_entries.insert(
-            path,
-            ObservedEntry::new(kind, len, inode, digest),
+            ObservedPath(path),
+            ReconciliationObservation {
+                entry: ObservedEntry::new(kind, len, inode, digest),
+                excluded_subtree: false,
+            },
         );
     }
 
     /// Record observations from a `DiscoveryEntry`.
     pub fn record_discovery_entry(&mut self, entry: &DiscoveryEntry) {
-        self.record_observation(
-            entry.path().clone(),
-            entry.kind(),
-            entry.observed_len(),
-            None,
-            None,
+        self.observed_entries.insert(
+            ObservedPath(entry.path().clone()),
+            ReconciliationObservation {
+                entry: ObservedEntry::new(entry.kind(), entry.observed_len(), None, None),
+                excluded_subtree: entry.is_excluded()
+                    && matches!(entry.kind(), DiscoveryKind::Directory | DiscoveryKind::Symlink),
+            },
         );
+    }
+
+    fn is_excluded_by_observation(&self, bytes: &[u8]) -> bool {
+        if self.root_excluded { return true; }
+        if self.observed_entries.get(bytes).is_some_and(|entry| entry.excluded_subtree) {
+            return true;
+        }
+        bytes.iter().enumerate().any(|(index, byte)| {
+            *byte == b'/' && self.observed_entries.get(&bytes[..index])
+                .is_some_and(|entry| entry.excluded_subtree)
+        })
+    }
+
+    fn exclusion_affects_hint(&self, hint: &DirtyHint) -> bool {
+        let bytes = hint.path.as_bytes();
+        if self.is_excluded_by_observation(bytes) { return true; }
+        if !hint.is_directory { return false; }
+        // A directory hint also covers exclusions beneath that directory. Keep
+        // it pending because a policy-limited pass did not reconcile that work.
+        self.observed_entries.range::<[u8], _>((Bound::Included(bytes), Bound::Unbounded))
+            .take_while(|(path, _)| path.0.as_bytes().starts_with(bytes))
+            .any(|(path, entry)| entry.excluded_subtree
+                && path.0.as_bytes().get(bytes.len()) == Some(&b'/'))
     }
 
     /// Finish the reconciliation pass with an explicit status.
@@ -377,7 +427,9 @@ impl ReconciliationPass {
         };
 
         // Categorize observed entries
-        for (path, observed) in &self.observed_entries {
+        for (path, observation) in &self.observed_entries {
+            let path = &path.0;
+            let observed = &observation.entry;
             if let Some(known) = self.known_entries.get(path) {
                 let is_modified = known.kind != observed.kind
                     || known.len != observed.len
@@ -408,10 +460,12 @@ impl ReconciliationPass {
         }
 
         for path in self.known_entries.keys() {
-            if !self.observed_entries.contains_key(path) {
+            if !self.observed_entries.contains_key(path.as_bytes()) {
                 // §8.6: Absence becomes deletion evidence ONLY when scan completed
                 // successfully and NO intervening dirty hints arrived.
-                if completed && !intervening_hints {
+                // Explicit exclusions can make a policy-scoped scan complete,
+                // but never establish absence inside the excluded subtree.
+                if completed && !intervening_hints && !self.is_excluded_by_observation(path.as_bytes()) {
                     report.tombstoned.push(path.clone());
                 } else {
                     report.preserved_unseen.push(path.clone());
@@ -419,10 +473,14 @@ impl ReconciliationPass {
             }
         }
 
-        // If completed without intervening hints, clear reconciled dirty hints
+        // Clear only covered hints. Excluded subtrees retain their prior state
+        // and pending reconciliation work, even after policy-scoped completion.
         if completed && !intervening_hints {
-            dirty_tracker
-                .clear_directory_hints(self.directory.as_ref(), self.start_hint_sequence);
+            dirty_tracker.hints.retain(|hint| {
+                hint.sequence > self.start_hint_sequence
+                    || self.directory.as_ref().is_some_and(|dir| !hint.affects(dir))
+                    || self.exclusion_affects_hint(hint)
+            });
         }
 
         report
@@ -476,14 +534,19 @@ impl ReconciliationPass {
             }
         }
 
-        let terminal_status = match discovery.status() {
-            ScanStatus::Completed { epoch } => ReconciliationStatus::Completed { epoch },
-            ScanStatus::Incomplete { reason } => ReconciliationStatus::Incomplete {
-                reason: reason.into(),
-            },
-            ScanStatus::InProgress => ReconciliationStatus::Incomplete {
-                reason: ReconciliationIncompleteReason::BudgetExhausted,
-            },
+        pass.root_excluded = discovery.root_is_excluded();
+        let terminal_status = if cancel.is_canceled() {
+            ReconciliationStatus::Incomplete { reason: ReconciliationIncompleteReason::Canceled }
+        } else {
+            match discovery.status() {
+                ScanStatus::Completed { epoch } => ReconciliationStatus::Completed { epoch },
+                ScanStatus::Incomplete { reason } => ReconciliationStatus::Incomplete {
+                    reason: reason.into(),
+                },
+                ScanStatus::InProgress => ReconciliationStatus::Incomplete {
+                    reason: ReconciliationIncompleteReason::BudgetExhausted,
+                },
+            }
         };
 
         Ok(pass.finish(terminal_status, dirty_tracker))

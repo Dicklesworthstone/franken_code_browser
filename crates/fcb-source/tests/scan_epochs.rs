@@ -26,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fcb_core::{ArenaOwnerId, FileId, RootId, SourceRevision};
 use fcb_source::confined::SymlinkPolicy;
 use fcb_source::discovery::{
-    BoundedDiscovery, DiscoveryKind, DiscoveryLimits, ScanEpoch,
+    BoundedDiscovery, DiscoveryKind, DiscoveryLimits, IncompleteReason, ScanEpoch, ScanStatus,
 };
 use fcb_source::old_anchor::{fnv1a, OldAnchor};
 use fcb_source::path::{NormalizedPath, RawPath};
@@ -36,7 +36,7 @@ use fcb_source::reconciliation::{
     ReconciliationPass, ReconciliationReport, ReconciliationStatus, SourceAnnotation,
 };
 use fcb_source::root::RootGrant;
-use fcb_source::{CancelFlag, ObservationDigest};
+use fcb_source::{CancelFlag, IgnoreMatcher, ObservationDigest, SourceError};
 
 struct TempTestDir {
     path: PathBuf,
@@ -624,7 +624,7 @@ fn test_symlink_loop_traversal_cycle_reporting() {
 
     // Create a cycle: sub/loop -> dir.path()
     let loop_path = dir.path().join("sub/loop");
-    let _ = std::os::unix::fs::symlink(dir.path(), &loop_path);
+    std::os::unix::fs::symlink(dir.path(), &loop_path).unwrap();
 
     let grant = RootGrant::new(test_root_id(10, 1), dir.path());
     let limits = DiscoveryLimits::new(2, 10, 256, 32, 4096, 64).unwrap();
@@ -641,8 +641,8 @@ fn test_symlink_loop_traversal_cycle_reporting() {
         }
     }
 
-    // Traversal must complete without infinite loop
-    assert!(discovery.is_complete());
+    // Traversal terminates, but the unexpanded cycle is not complete coverage.
+    assert_eq!(discovery.status(), ScanStatus::Incomplete { reason: IncompleteReason::TraversalLimited });
     // The cycle link must be reported as Cycle or Symlink without infinite descent
     let has_cycle = entries.iter().any(|(_, k)| *k == DiscoveryKind::Cycle)
         || discovery.aggregate().cycles > 0;
@@ -854,4 +854,310 @@ fn test_end_to_end_discovery_reconciliation_workflow() {
     assert_eq!(tombstoned_strs, vec!["file2.txt"]);
     assert!(report2.preserved_unseen.is_empty());
     assert!(report2.is_honest_and_complete());
+}
+
+fn metadata_discovery(
+    root: &Path,
+    limits: DiscoveryLimits,
+    ignore: IgnoreMatcher,
+    symlinks: SymlinkPolicy,
+) -> BoundedDiscovery {
+    BoundedDiscovery::open_metadata_only(
+        RootGrant::new(test_root_id(83, 1), root), symlinks, limits, ignore,
+    ).unwrap()
+}
+
+/// Establish prior file identities from a real, complete discovery. The tests
+/// below exercise absence decisions for those files through the production
+/// discovery/reconciliation adapter, not an injected terminal status.
+fn known_files(root: &Path, symlinks: SymlinkPolicy) -> BTreeMap<NormalizedPath, KnownEntry> {
+    let mut discovery = metadata_discovery(root, DiscoveryLimits::modest(), IgnoreMatcher::include_all(), symlinks);
+    let mut known = BTreeMap::new();
+    while let Some(batch) = discovery.next_batch(&CancelFlag::new()).unwrap() {
+        for entry in batch.entries() {
+            if entry.kind() == DiscoveryKind::File && !entry.is_excluded() {
+                let id = u64::try_from(known.len()).unwrap() + 1;
+                known.insert(entry.path().clone(), KnownEntry::new(
+                    FileId::new(test_owner_id(83), id).unwrap(),
+                    SourceRevision::new(test_owner_id(83), 1).unwrap(),
+                    entry.kind(), entry.observed_len(), None, None,
+                ));
+            }
+        }
+        if !batch.more() { break; }
+    }
+    assert!(discovery.is_complete(), "the prior namespace must actually be known");
+    known
+}
+
+#[test]
+fn depth_and_path_limits_preserve_known_files_after_draining_the_work_queue() {
+    for (label, hidden, limits) in [
+        ("depth_coverage", "a/b/hidden.rs", DiscoveryLimits::new(1, 2, 256, 1, 4096, 16).unwrap()),
+        ("path_coverage", "overlong_name.rs", DiscoveryLimits::new(1, 8, 8, 1, 4096, 16).unwrap()),
+    ] {
+        let dir = TempTestDir::new(label);
+        write_test_file(dir.path(), "ok.rs", b"kept");
+        write_test_file(dir.path(), hidden, b"old capture");
+        let known = known_files(dir.path(), SymlinkPolicy::DisallowAll);
+        let mut discovery = metadata_discovery(dir.path(), limits, IgnoreMatcher::include_all(), SymlinkPolicy::DisallowAll);
+        let mut hints = DirtyHintTracker::new();
+        hints.record_hint(NormalizedPath::new(hidden).unwrap(), false);
+        let report = ReconciliationPass::reconcile_from_discovery(
+            &mut discovery, &CancelFlag::new(), &mut hints, known,
+        ).unwrap();
+
+        assert_eq!(report.status.incomplete_reason(), Some(ReconciliationIncompleteReason::TraversalLimited));
+        assert!(!discovery.is_complete());
+        assert!(report.tombstoned.is_empty());
+        assert_eq!(report.preserved_unseen, [NormalizedPath::new(hidden).unwrap()]);
+        assert!(report.retained.contains(&NormalizedPath::new("ok.rs").unwrap()));
+        assert_eq!(hints.pending_count(), 1, "missing coverage must not clear the old dirty hint");
+        assert!(report.is_honest_and_complete());
+    }
+}
+
+#[test]
+fn missing_or_replaced_queued_directory_does_not_hide_other_accessible_work() {
+    for replace_with_file in [false, true] {
+        let dir = TempTestDir::new("queued_directory");
+        let held = TempTestDir::new("queued_directory_moved");
+        write_test_file(dir.path(), "left/file.rs", b"left");
+        write_test_file(dir.path(), "right/file.rs", b"right");
+        let known = known_files(dir.path(), SymlinkPolicy::DisallowAll);
+        let limits = DiscoveryLimits::new(1, 8, 256, 1, 4096, 16).unwrap();
+        let mut discovery = metadata_discovery(dir.path(), limits, IgnoreMatcher::include_all(), SymlinkPolicy::DisallowAll);
+        let cancel = CancelFlag::new();
+        let first = discovery.next_batch(&cancel).unwrap().unwrap();
+        assert_eq!(first.entries().len(), 1);
+        assert_eq!(first.entries()[0].kind(), DiscoveryKind::Directory);
+        assert!(first.more());
+        let queued = first.entries()[0].path().clone();
+        let missing_file = queued.join_segment(b"file.rs").unwrap();
+        // The first page has published only a directory. Its files are still
+        // queued, so no known file observation is lost by starting the adapter
+        // here. Moving it aside deterministically reproduces the open failure.
+        fs::rename(dir.path().join(queued.raw().to_path_buf()), held.path().join("moved")).unwrap();
+        if replace_with_file {
+            fs::write(dir.path().join(queued.raw().to_path_buf()), b"replacement").unwrap();
+        }
+        let mut hints = DirtyHintTracker::new();
+        let report = ReconciliationPass::reconcile_from_discovery(
+            &mut discovery, &cancel, &mut hints, known.clone(),
+        ).unwrap();
+
+        assert_eq!(report.status.incomplete_reason(), Some(ReconciliationIncompleteReason::EnumerationUnavailable));
+        assert!(discovery.aggregate().unavailable > 0);
+        assert_eq!(report.preserved_unseen, [missing_file.clone()]);
+        assert!(report.tombstoned.is_empty());
+        assert_eq!(report.retained.len(), 1, "the accessible sibling must still be enumerated");
+
+        // A fresh successful pass can establish the actual absence. The fix
+        // must preserve deletion reconciliation when there is complete evidence.
+        let mut complete = metadata_discovery(dir.path(), limits, IgnoreMatcher::include_all(), SymlinkPolicy::DisallowAll);
+        let report = ReconciliationPass::reconcile_from_discovery(
+            &mut complete, &cancel, &mut hints, known,
+        ).unwrap();
+        assert!(report.status.is_completed());
+        assert_eq!(report.tombstoned, [missing_file]);
+        assert!(report.preserved_unseen.is_empty());
+        assert_eq!(report.retained.len(), 1);
+    }
+}
+
+#[test]
+fn excluded_subtree_preserves_files_and_dirty_ancestors_without_protecting_similar_names() {
+    let dir = TempTestDir::new("excluded_reconcile");
+    let held = TempTestDir::new("excluded_reconcile_moved");
+    write_test_file(dir.path(), "src/build/inside.rs", b"excluded");
+    write_test_file(dir.path(), "src/builder/gone.rs", b"absent");
+    write_test_file(dir.path(), "ok.rs", b"kept");
+    let known = known_files(dir.path(), SymlinkPolicy::DisallowAll);
+    fs::rename(dir.path().join("src/builder/gone.rs"), held.path().join("gone.rs")).unwrap();
+    let hidden = NormalizedPath::new("src/build/inside.rs").unwrap();
+    let absent = NormalizedPath::new("src/builder/gone.rs").unwrap();
+    let ancestor = NormalizedPath::new("src").unwrap();
+    let mut hints = DirtyHintTracker::new();
+    hints.record_hint(hidden.clone(), false);
+    hints.record_hint(ancestor.clone(), true);
+    hints.record_hint(absent.clone(), false);
+    hints.record_hint(NormalizedPath::new("ok.rs").unwrap(), false);
+    let mut ignore = IgnoreMatcher::include_all();
+    ignore.add_scope_rule("src/build/");
+    let mut discovery = metadata_discovery(dir.path(), DiscoveryLimits::modest(), ignore, SymlinkPolicy::DisallowAll);
+    let report = ReconciliationPass::reconcile_from_discovery(
+        &mut discovery, &CancelFlag::new(), &mut hints, known,
+    ).unwrap();
+
+    assert!(report.status.is_completed(), "a deliberate exclusion is not an enumeration failure");
+    assert_eq!(report.preserved_unseen, [hidden.clone()]);
+    assert_eq!(report.tombstoned, [absent]);
+    assert!(report.retained.contains(&NormalizedPath::new("ok.rs").unwrap()));
+    assert_eq!(hints.all_hints().iter().map(|hint| hint.path()).collect::<Vec<_>>(), [&hidden, &ancestor]);
+}
+
+#[cfg(unix)]
+#[test]
+fn exclusion_prefixes_preserve_native_bytes_without_reinterpreting_backslashes() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempTestDir::new("raw_excluded_reconcile");
+    let held = TempTestDir::new("raw_excluded_reconcile_moved");
+    let raw_name = b"build\\\xff";
+    let native = Path::new(OsStr::from_bytes(raw_name));
+    fs::create_dir(dir.path().join(native)).unwrap();
+    fs::write(dir.path().join(native).join("keep.rs"), b"hidden").unwrap();
+    write_test_file(dir.path(), "build/gone.rs", b"absent");
+    let known = known_files(dir.path(), SymlinkPolicy::DisallowAll);
+    fs::rename(dir.path().join("build/gone.rs"), held.path().join("gone.rs")).unwrap();
+    let mut discovery = metadata_discovery(dir.path(), DiscoveryLimits::modest(), IgnoreMatcher::include_all(), SymlinkPolicy::DisallowAll);
+    // The owned directory identity is usable even when its name is not UTF-8.
+    discovery.register_own_artifact_path(&dir.path().join(native)).unwrap();
+    let hidden = NormalizedPath::from_dirent_name(raw_name).unwrap().join_segment(b"keep.rs").unwrap();
+    let report = ReconciliationPass::reconcile_from_discovery(
+        &mut discovery, &CancelFlag::new(), &mut DirtyHintTracker::new(), known,
+    ).unwrap();
+    assert!(report.status.is_completed());
+    assert_eq!(report.preserved_unseen, [hidden]);
+    assert_eq!(report.tombstoned, [NormalizedPath::new("build/gone.rs").unwrap()]);
+}
+
+#[test]
+fn excluded_root_preserves_its_entire_known_namespace_and_dirty_hints() {
+    let dir = TempTestDir::new("excluded_root");
+    write_test_file(dir.path(), "nested/keep.rs", b"keep");
+    let known = known_files(dir.path(), SymlinkPolicy::DisallowAll);
+    let hidden = NormalizedPath::new("nested/keep.rs").unwrap();
+    let mut hints = DirtyHintTracker::new();
+    hints.record_hint(hidden.clone(), false);
+    let mut discovery = metadata_discovery(dir.path(), DiscoveryLimits::modest(), IgnoreMatcher::include_all(), SymlinkPolicy::DisallowAll);
+    discovery.register_own_artifact_path(dir.path()).unwrap();
+    let report = ReconciliationPass::reconcile_from_discovery(
+        &mut discovery, &CancelFlag::new(), &mut hints, known,
+    ).unwrap();
+    assert!(discovery.root_is_excluded());
+    assert!(report.status.is_completed());
+    assert_eq!(report.preserved_unseen, [hidden]);
+    assert!(report.tombstoned.is_empty());
+    assert_eq!(hints.pending_count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn identity_exclusion_through_an_alias_preserves_symlink_kind_and_descendants() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempTestDir::new("excluded_alias");
+    let raw_name = b"owned\xff";
+    let owned = dir.path().join(OsStr::from_bytes(raw_name));
+    fs::create_dir(&owned).unwrap();
+    fs::write(owned.join("keep.rs"), b"keep").unwrap();
+    std::os::unix::fs::symlink(&owned, dir.path().join("alias")).unwrap();
+    let known = known_files(dir.path(), SymlinkPolicy::AllowWithinRoot);
+    assert_eq!(known.len(), 2, "both namespace paths must be established first");
+    let mut discovery = metadata_discovery(dir.path(), DiscoveryLimits::modest(), IgnoreMatcher::include_all(), SymlinkPolicy::AllowWithinRoot);
+    // Non-UTF8 registration cannot add a basename exclusion. Only the opened
+    // directory identity can establish that the alias is an owned artifact.
+    discovery.register_own_artifact_path(&owned).unwrap();
+    let mut hints = DirtyHintTracker::new();
+    let mut pass = ReconciliationPass::new(None, discovery.scan_epoch(), &hints, known);
+    let mut alias_observations = Vec::new();
+    while let Some(batch) = discovery.next_batch(&CancelFlag::new()).unwrap() {
+        for entry in batch.entries() {
+            if entry.path().as_bytes() == b"alias" {
+                alias_observations.push((entry.kind(), entry.is_excluded()));
+            }
+            pass.record_discovery_entry(entry);
+        }
+        if !batch.more() { break; }
+    }
+    assert!(discovery.is_complete());
+    assert_eq!(alias_observations.last(), Some(&(DiscoveryKind::Symlink, true)));
+    assert_eq!(discovery.aggregate().symlinks, 1, "replacement metadata must not count a second namespace entry");
+    let report = pass.finish(ReconciliationStatus::Completed { epoch: discovery.scan_epoch() }, &mut hints);
+    assert_eq!(report.preserved_unseen, [
+        NormalizedPath::new("alias/keep.rs").unwrap(),
+        NormalizedPath::from_dirent_name(raw_name).unwrap().join_segment(b"keep.rs").unwrap(),
+    ]);
+    assert!(report.tombstoned.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn disallowed_symlink_preserves_prior_descendants_until_a_followed_scan_establishes_absence() {
+    let dir = TempTestDir::new("symlink_policy_reconcile");
+    let held = TempTestDir::new("symlink_policy_reconcile_moved");
+    write_test_file(dir.path(), "real/keep.rs", b"keep");
+    write_test_file(dir.path(), "gone.rs", b"absent");
+    std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("alias")).unwrap();
+    let mut known = known_files(dir.path(), SymlinkPolicy::AllowWithinRoot);
+    let alias_file = NormalizedPath::new("alias/keep.rs").unwrap();
+    let real_file = NormalizedPath::new("real/keep.rs").unwrap();
+    let absent = NormalizedPath::new("gone.rs").unwrap();
+    assert_eq!(known.len(), 3);
+    assert!(known.contains_key(&alias_file));
+    fs::rename(dir.path().join("gone.rs"), held.path().join("gone.rs")).unwrap();
+    let alias = NormalizedPath::new("alias").unwrap();
+    let mut hints = DirtyHintTracker::new();
+    hints.record_hint(alias_file.clone(), false);
+    hints.record_hint(alias.clone(), true);
+    hints.record_hint(absent.clone(), false);
+    hints.record_hint(real_file.clone(), false);
+
+    let mut disallowed = metadata_discovery(dir.path(), DiscoveryLimits::modest(), IgnoreMatcher::include_all(), SymlinkPolicy::DisallowAll);
+    let report = ReconciliationPass::reconcile_from_discovery(
+        &mut disallowed, &CancelFlag::new(), &mut hints, known.clone(),
+    ).unwrap();
+    assert!(report.status.is_completed());
+    assert_eq!(disallowed.aggregate().excluded, 1);
+    assert_eq!(report.preserved_unseen, [alias_file.clone()]);
+    assert_eq!(report.tombstoned, [absent.clone()]);
+    assert_eq!(report.retained, [real_file.clone()]);
+    assert_eq!(hints.all_hints().iter().map(|hint| hint.path()).collect::<Vec<_>>(), [&alias_file, &alias]);
+
+    // Re-enabling traversal gives actual absence evidence for the alias, too.
+    // A blanket rule that preserves every symlink would fail this control.
+    known.remove(&absent);
+    fs::rename(dir.path().join("real/keep.rs"), held.path().join("keep.rs")).unwrap();
+    let mut allowed = metadata_discovery(dir.path(), DiscoveryLimits::modest(), IgnoreMatcher::include_all(), SymlinkPolicy::AllowWithinRoot);
+    let report = ReconciliationPass::reconcile_from_discovery(
+        &mut allowed, &CancelFlag::new(), &mut hints, known,
+    ).unwrap();
+    assert!(report.status.is_completed());
+    assert_eq!(allowed.aggregate().excluded, 0);
+    assert_eq!(report.tombstoned, [alias_file, real_file]);
+    assert!(report.preserved_unseen.is_empty());
+    assert_eq!(hints.pending_count(), 0);
+}
+
+#[test]
+fn canceled_and_revoked_discovery_keep_prior_pages_and_preserve_unseen_files() {
+    for revoke in [false, true] {
+        let dir = TempTestDir::new("interrupted_reconcile");
+        write_test_file(dir.path(), "one.rs", b"one");
+        write_test_file(dir.path(), "two.rs", b"two");
+        let known = known_files(dir.path(), SymlinkPolicy::DisallowAll);
+        let grant = RootGrant::new(test_root_id(83, 1), dir.path());
+        let limits = DiscoveryLimits::new(1, 8, 256, 1, 4096, 16).unwrap();
+        let mut discovery = BoundedDiscovery::open_metadata_only(
+            grant.clone(), SymlinkPolicy::DisallowAll, limits, IgnoreMatcher::include_all(),
+        ).unwrap();
+        let cancel = CancelFlag::new();
+        let mut hints = DirtyHintTracker::new();
+        let mut pass = ReconciliationPass::new(None, discovery.scan_epoch(), &hints, known);
+        let first = discovery.next_batch(&cancel).unwrap().unwrap();
+        assert_eq!(first.entries().len(), 1);
+        pass.record_discovery_entry(&first.entries()[0]);
+        if revoke { grant.revoke(); } else { cancel.cancel(); }
+        assert_eq!(discovery.next_batch(&cancel).unwrap_err(),
+            if revoke { SourceError::GrantRevoked } else { SourceError::Canceled });
+        let reason = match discovery.status() {
+            ScanStatus::Incomplete { reason } => ReconciliationIncompleteReason::from(reason),
+            other => panic!("interrupted discovery claimed {other:?}"),
+        };
+        let report = pass.finish(ReconciliationStatus::Incomplete { reason }, &mut hints);
+        assert_eq!(report.retained, [first.entries()[0].path().clone()]);
+        assert_eq!(report.preserved_unseen.len(), 1);
+        assert!(report.tombstoned.is_empty());
+    }
 }

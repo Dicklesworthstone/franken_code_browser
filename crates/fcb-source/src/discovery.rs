@@ -111,6 +111,8 @@ impl DiscoveryEntry {
     pub fn depth(&self) -> u32 { self.depth }
     pub fn observed_len(&self) -> Option<u64> { self.observed_len }
     pub fn scan_epoch(&self) -> ScanEpoch { self.scan_epoch }
+    /// Withheld from source traversal, while retaining the namespace entry.
+    /// This includes symlinks whose traversal is disallowed by the root policy.
     pub fn is_excluded(&self) -> bool { self.excluded }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,7 +131,18 @@ pub struct DiscoveryPeaks {
     pub open_descriptors: u32, pub queue_entries: u32, pub batch_entries: u32, pub batch_bytes: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IncompleteReason { Canceled, GrantRevoked, QueueSaturated, RootUnavailable, RulePolicyUnavailable }
+pub enum IncompleteReason {
+    Canceled,
+    GrantRevoked,
+    QueueSaturated,
+    RootUnavailable,
+    RulePolicyUnavailable,
+    /// An entry or queued directory could not be observed or fully enumerated.
+    EnumerationUnavailable,
+    /// Depth, path, or cycle/alias admission withheld part of the namespace.
+    /// The aggregate retains the individual limitation counts.
+    TraversalLimited,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScanStatus { InProgress, Completed { epoch: ScanEpoch }, Incomplete { reason: IncompleteReason } }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,7 +157,10 @@ impl DiscoveryBatch {
     pub fn more(&self) -> bool { self.more }
     pub fn scan_epoch(&self) -> ScanEpoch { self.scan_epoch }
 }
-struct PendingDir { rel: Option<NormalizedPath>, depth: u32, alias_hops: u32, ancestry: Vec<DirectoryId> }
+struct PendingDir {
+    rel: Option<NormalizedPath>, kind: DiscoveryKind, depth: u32,
+    alias_hops: u32, ancestry: Vec<DirectoryId>,
+}
 struct OpenDir {
     rel: Option<NormalizedPath>, depth: u32, alias_hops: u32, ancestry: Vec<DirectoryId>,
     resolved: PathBuf, iter: ReadDir, children_emitted: u64, split_across_batches: bool,
@@ -166,6 +182,7 @@ pub struct BoundedDiscovery {
     peaks: DiscoveryPeaks,
     status: ScanStatus,
     queue_saturated: bool,
+    root_excluded: bool,
 }
 impl fmt::Debug for BoundedDiscovery {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -214,8 +231,9 @@ impl BoundedDiscovery {
             own_exclusions: OwnArtifactExclusion::default_product(), read_rule_files: true,
             repository_rules: None, pending: VecDeque::new(), open: VecDeque::new(), epoch: ScanEpoch(1),
             next_stable_generation: 1, aggregate: DiscoveryAggregate::default(), peaks: DiscoveryPeaks::default(),
-            status: ScanStatus::InProgress, queue_saturated: false };
-        session.pending.push_back(PendingDir { rel: None, depth: 0, alias_hops: 0, ancestry: Vec::new() });
+            status: ScanStatus::InProgress, queue_saturated: false, root_excluded: false };
+        session.pending.push_back(PendingDir { rel: None, kind: DiscoveryKind::Directory,
+            depth: 0, alias_hops: 0, ancestry: Vec::new() });
         session.note_queue_peak();
         Ok(session)
     }
@@ -231,6 +249,9 @@ impl BoundedDiscovery {
     pub fn ignore(&self) -> &IgnoreMatcher { &self.ignore }
     pub fn ignore_mut(&mut self) -> &mut IgnoreMatcher { &mut self.ignore }
     pub fn is_complete(&self) -> bool { matches!(self.status, ScanStatus::Completed { .. }) }
+    /// The entire granted root was withheld as an owned artifact. This is a
+    /// deliberate policy boundary, not evidence that its previous entries are absent.
+    pub fn root_is_excluded(&self) -> bool { self.root_excluded }
 
     /// A page can be empty with more=true. Rejected names and empty directories
     /// consume traversal transitions independently of output; at most four
@@ -278,7 +299,7 @@ impl BoundedDiscovery {
                 && let Some(pending) = self.pending.pop_front() {
                 match self.open_pending(pending, cancel) {
                     OpenResult::Opened => {},
-                    OpenResult::SkippedCycle(entry) => {
+                    OpenResult::SkippedEntry(entry) => {
                         batch_bytes = batch_bytes.saturating_add(entry.path.as_bytes().len() as u64);
                         entries.push(entry);
                     }
@@ -288,7 +309,11 @@ impl BoundedDiscovery {
             }
             break;
         }
-        if entries.is_empty() && self.queue_empty() { self.finalize_status(); return Ok(None); }
+        if entries.is_empty() && self.queue_empty() {
+            self.ensure_runnable(cancel)?;
+            self.finalize_status();
+            return Ok(None);
+        }
         entries.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
         self.peaks.batch_entries = self.peaks.batch_entries.max(entries.len() as u32);
         self.peaks.batch_bytes = self.peaks.batch_bytes.max(batch_bytes);
@@ -297,6 +322,11 @@ impl BoundedDiscovery {
             self.next_stable_generation = self.next_stable_generation.saturating_add(1);
             PublicationState::Stable { generation }
         } else { PublicationState::Provisional };
+        // Preserve observations already made, but never turn a late interruption
+        // into successful coverage merely because the final queue was drained.
+        if let Err(error) = self.ensure_runnable(cancel) {
+            if entries.is_empty() { return Err(error); }
+        }
         let more = !self.queue_empty();
         if !more { self.finalize_status(); }
         Ok(Some(DiscoveryBatch { entries, aggregate: self.aggregate, publication, more, scan_epoch: self.epoch }))
@@ -324,13 +354,24 @@ impl BoundedDiscovery {
     }
     fn finalize_status(&mut self) {
         if matches!(self.status, ScanStatus::Incomplete { .. } | ScanStatus::Completed { .. }) { return; }
-        if self.queue_saturated {
-            self.status = ScanStatus::Incomplete { reason: IncompleteReason::QueueSaturated };
-        } else if self.queue_empty() {
-            self.status = if self.repository_rules.as_ref().is_some_and(|rules| !rules.stats().is_complete()) {
-                ScanStatus::Incomplete { reason: IncompleteReason::RulePolicyUnavailable }
-            } else { ScanStatus::Completed { epoch: self.epoch } };
-        }
+        if !self.queue_empty() { return; }
+        // Missing evidence accumulates while accessible directories keep
+        // producing pages. Exhausting the work queue does not repair a failed
+        // enumeration or an admission limit. Deliberate exclusions are separate.
+        let reason = if self.queue_saturated {
+            Some(IncompleteReason::QueueSaturated)
+        } else if self.repository_rules.as_ref().is_some_and(|rules| !rules.stats().is_complete()) {
+            Some(IncompleteReason::RulePolicyUnavailable)
+        } else if self.aggregate.unavailable != 0 {
+            Some(IncompleteReason::EnumerationUnavailable)
+        } else if self.aggregate.depth_limited != 0 || self.aggregate.path_limited != 0
+            || self.aggregate.cycles != 0 {
+            Some(IncompleteReason::TraversalLimited)
+        } else { None };
+        self.status = match reason {
+            Some(reason) => ScanStatus::Incomplete { reason },
+            None => ScanStatus::Completed { epoch: self.epoch },
+        };
     }
     fn open_pending(&mut self, pending: PendingDir, cancel: &CancelFlag) -> OpenResult {
         let canonical_root = match self.reader.canonical_root_path() {
@@ -347,7 +388,7 @@ impl BoundedDiscovery {
                 Ok(path) => path,
                 Err(SourceError::TraversalCycle) => {
                     if let Some(rel) = pending.rel {
-                        return OpenResult::SkippedCycle(self.push_kind(rel, DiscoveryKind::Cycle, pending.depth, None, false));
+                        return OpenResult::SkippedEntry(self.push_kind(rel, DiscoveryKind::Cycle, pending.depth, None, false));
                     }
                     self.aggregate.cycles = self.aggregate.cycles.saturating_add(1);
                     return OpenResult::SkippedUnavailable;
@@ -360,7 +401,11 @@ impl BoundedDiscovery {
             Err(_) => { self.aggregate.unavailable = self.aggregate.unavailable.saturating_add(1); return OpenResult::SkippedUnavailable; }
         };
         if validate_not_special(&meta).is_err() {
-            self.aggregate.special = self.aggregate.special.saturating_add(1); return OpenResult::SkippedUnavailable;
+            self.aggregate.special = self.aggregate.special.saturating_add(1);
+            // This was queued as a directory; observing a replacement special
+            // object did not enumerate the descendants previously beneath it.
+            self.aggregate.unavailable = self.aggregate.unavailable.saturating_add(1);
+            return OpenResult::SkippedUnavailable;
         }
         if !meta.is_dir() { self.aggregate.unavailable = self.aggregate.unavailable.saturating_add(1); return OpenResult::SkippedUnavailable; }
         let dir_id = match DirectoryId::from_path(&resolved) {
@@ -368,11 +413,19 @@ impl BoundedDiscovery {
             Err(_) => { self.aggregate.unavailable = self.aggregate.unavailable.saturating_add(1); return OpenResult::SkippedUnavailable; }
         };
         if self.own_exclusions.is_excluded(&resolved, Some(dir_id)) {
-            self.aggregate.excluded = self.aggregate.excluded.saturating_add(1); return OpenResult::SkippedUnavailable;
+            self.aggregate.excluded = self.aggregate.excluded.saturating_add(1);
+            if let Some(path) = pending.rel {
+                // Replace the earlier directory observation with its newly
+                // established exclusion, without counting the directory twice.
+                return OpenResult::SkippedEntry(DiscoveryEntry { path, kind: pending.kind,
+                    depth: pending.depth, observed_len: None, scan_epoch: self.epoch, excluded: true });
+            }
+            self.root_excluded = true;
+            return OpenResult::SkippedUnavailable;
         }
         if pending.ancestry.contains(&dir_id) {
             if let Some(rel) = pending.rel {
-                return OpenResult::SkippedCycle(self.push_kind(rel, DiscoveryKind::Cycle, pending.depth, None, false));
+                return OpenResult::SkippedEntry(self.push_kind(rel, DiscoveryKind::Cycle, pending.depth, None, false));
             }
             self.aggregate.cycles = self.aggregate.cycles.saturating_add(1); return OpenResult::SkippedUnavailable;
         }
@@ -433,7 +486,7 @@ impl BoundedDiscovery {
             Ok(path) => path,
             Err(_) => { self.aggregate.path_limited = self.aggregate.path_limited.saturating_add(1); return None; }
         };
-        if child_path.as_bytes().len() as u32 > self.limits.max_path_bytes {
+        if child_path.as_bytes().len() > self.limits.max_path_bytes as usize {
             self.aggregate.path_limited = self.aggregate.path_limited.saturating_add(1); return None;
         }
         let depth = open.depth.saturating_add(1);
@@ -446,7 +499,11 @@ impl BoundedDiscovery {
         }
         let file_type = meta.file_type();
         if file_type.is_symlink() {
-            let excluded = self.classify_exclusion(&child_path, false) || self.own_exclusions.is_excluded(child_fs_path, None);
+            // Refusing to follow a link is a policy boundary, not evidence that
+            // descendants captured under an earlier allowed policy disappeared.
+            let excluded = self.classify_exclusion(&child_path, false)
+                || self.own_exclusions.is_excluded(child_fs_path, None)
+                || self.reader.symlink_policy() == SymlinkPolicy::DisallowAll;
             if !excluded { self.maybe_follow_symlink_dir(open, &child_path, depth, child_fs_path); }
             return Some(self.push_kind(child_path, DiscoveryKind::Symlink, depth, None, excluded));
         }
@@ -463,23 +520,30 @@ impl BoundedDiscovery {
     }
     fn maybe_follow_symlink_dir(&mut self, open: &OpenSnapshot, child_path: &NormalizedPath, depth: u32, child_fs_path: &Path) {
         if self.reader.symlink_policy() != SymlinkPolicy::AllowWithinRoot { return; }
-        let target = match fs::metadata(child_fs_path) { Ok(meta) => meta, Err(_) => return };
+        let target = match fs::metadata(child_fs_path) {
+            Ok(meta) => meta,
+            Err(_) => {
+                self.aggregate.unavailable = self.aggregate.unavailable.saturating_add(1);
+                return;
+            }
+        };
         if target.is_dir() {
             let next_alias = open.alias_hops.saturating_add(1);
             if next_alias > self.limits.max_alias_hops { self.aggregate.cycles = self.aggregate.cycles.saturating_add(1); return; }
-            self.maybe_enqueue_dir_with_alias(open, child_path.clone(), depth, next_alias);
+            self.maybe_enqueue_dir_with_alias(open, child_path.clone(), DiscoveryKind::Symlink, depth, next_alias);
         }
     }
     fn maybe_enqueue_dir(&mut self, open: &OpenSnapshot, child_path: NormalizedPath, depth: u32) {
-        self.maybe_enqueue_dir_with_alias(open, child_path, depth, open.alias_hops);
+        self.maybe_enqueue_dir_with_alias(open, child_path, DiscoveryKind::Directory, depth, open.alias_hops);
     }
-    fn maybe_enqueue_dir_with_alias(&mut self, open: &OpenSnapshot, child_path: NormalizedPath, depth: u32, alias_hops: u32) {
+    fn maybe_enqueue_dir_with_alias(&mut self, open: &OpenSnapshot, child_path: NormalizedPath,
+        kind: DiscoveryKind, depth: u32, alias_hops: u32) {
         if depth >= self.limits.max_depth { self.aggregate.depth_limited = self.aggregate.depth_limited.saturating_add(1); return; }
         let queued = (self.pending.len() + self.open.len()) as u32;
         if queued >= self.limits.max_queue_entries {
             self.queue_saturated = true; self.aggregate.queue_refused = self.aggregate.queue_refused.saturating_add(1); return;
         }
-        self.pending.push_back(PendingDir { rel: Some(child_path), depth, alias_hops, ancestry: open.ancestry.clone() });
+        self.pending.push_back(PendingDir { rel: Some(child_path), kind, depth, alias_hops, ancestry: open.ancestry.clone() });
         self.note_queue_peak();
     }
     fn classify_exclusion(&mut self, path: &NormalizedPath, is_dir: bool) -> bool {
@@ -519,7 +583,7 @@ impl BoundedDiscovery {
         self.peaks.queue_entries = self.peaks.queue_entries.max((self.pending.len() + self.open.len()) as u32);
     }
 }
-enum OpenResult { Opened, SkippedCycle(DiscoveryEntry), SkippedUnavailable }
+enum OpenResult { Opened, SkippedEntry(DiscoveryEntry), SkippedUnavailable }
 enum Advance { FinishedUnsplit, Continue }
 struct OpenSnapshot { rel: Option<NormalizedPath>, depth: u32, alias_hops: u32, ancestry: Vec<DirectoryId>, resolved: PathBuf }
 fn child_relative(parent: Option<&NormalizedPath>, name: &[u8]) -> Result<NormalizedPath, SourceError> {
