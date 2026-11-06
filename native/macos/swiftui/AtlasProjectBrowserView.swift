@@ -175,9 +175,11 @@ import SwiftUI
                         }
                         Text("New capture of the linked file. The originating capture is retained on the left.")
                             .font(.caption).foregroundStyle(.secondary)
-                        if !linked.unappliedFragment.isEmpty {
-                            Text(verbatim: "Opened at the beginning; the linked heading has not been applied: " + linked.unappliedFragment)
-                                .font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                        if linked.fragment.status != .none {
+                            Text(verbatim: linked.fragment.navigationDescription)
+                                .font(.caption)
+                                .foregroundStyle(linked.fragment.isFallback ? Color.orange : Color.secondary)
+                                .textSelection(.enabled)
                         }
                         AtlasPagedSourceView(model: linked.reader, canKeep: canKeep, keep: keep,
                             openLocalLink: navigation(from: linked))

@@ -97,7 +97,9 @@ fn actual_c_catalog_link_transfer_keeps_origin_and_target_after_catalog_closure(
     let _guard = FFI_TEST_LOCK.lock().unwrap();
     let root = root();
     fs::write(root.join("README.md"), b"# Origin\n\n[Next](next.md#details)\n").unwrap();
-    fs::write(root.join("next.md"), b"# Details\n\nLinked capture.\n").unwrap();
+    let bytes = b"\xef\xbb\xbfIntro.\r\n\r\n# Details\r\n\r\nLinked capture.\r\n";
+    let heading = bytes.windows(b"# Details".len()).position(|part| part == b"# Details").unwrap() as u64;
+    fs::write(root.join("next.md"), bytes).unwrap();
     let handle = fcb_catalog_create(); assert_ne!(handle, 0);
     let croot = CString::new(root.to_str().unwrap()).unwrap();
     let page = take(unsafe { fcb_catalog_open(handle, croot.as_ptr()) });
@@ -116,9 +118,11 @@ fn actual_c_catalog_link_transfer_keeps_origin_and_target_after_catalog_closure(
     fs::write(root.join("next.md"), b"new live target").unwrap();
     let receipt = take(receipt_pointer);
     assert!(receipt.contains("\"source_observation\":\"new-capture-after-document-link\""), "{receipt}");
-    assert!(receipt.contains("\"fragment_status\":\"not-applied\""), "{receipt}");
+    assert!(receipt.contains("\"fragment_status\":\"resolved\""), "{receipt}");
+    assert!(receipt.contains(&format!("\"initial_original_offset\":\"{heading}\"")), "{receipt}");
     assert!(receipt.contains("Linked capture."), "{receipt}");
     assert!(take(fcb_reader_copy_range(origin, 0, 8)).contains("\"original_hex\":\"23204f726967696e\""));
-    assert!(take(fcb_reader_copy_range(target, 0, 9)).contains("\"original_hex\":\"232044657461696c73\""));
+    assert!(take(fcb_reader_copy_range(target, heading, heading + 9)).contains("\"original_hex\":\"232044657461696c73\""));
+    assert!(take(fcb_reader_document(target, 1, 80, 64 * 1024, 8192, 8192, 4096)).contains("\"status\":\"ok\""));
     assert_eq!(fcb_reader_close(target), 1); assert_eq!(fcb_reader_close(origin), 1);
 }

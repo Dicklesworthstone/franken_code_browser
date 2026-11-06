@@ -70,12 +70,23 @@ import AppKit
             }
         }
         .sheet(isPresented: $showsDocument) {
-            AtlasDocumentPreviewView(model: model.documentPreview, openSource: openPreviewSource, openLocalLink: openLocalLink)
+            AtlasDocumentPreviewView(model: model.documentPreview, openSource: openPreviewSource, openLocalLink: modalLocalNavigation)
         }
         .onAppear { if ownsModel { open() } }
         .onDisappear { if ownsModel { model.close() }; copyNotice = "" }
         .onChange(of: model.navigation) { _, _ in copyNotice = "" }
         .onChange(of: Array(model.fileQuery.utf8)) { _, _ in copyNotice = "" }
+    }
+
+    private var modalLocalNavigation: AtlasDocumentPreviewModel.LocalNavigation? {
+        guard let openLocalLink else { return nil }
+        return { target in
+            // The preview invokes this after its worker drains. Dismiss the
+            // overlay so the project host's linked reader/progress is visible;
+            // accepted preview state stays available in the originating reader.
+            showsDocument = false
+            openLocalLink(target)
+        }
     }
 
     private var sourcePane: some View {

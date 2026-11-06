@@ -8,7 +8,9 @@
 
 pub use fcb::document::reader::DocumentReadOptions as ReaderDocumentOptions;
 use fcb::document::{TextSelectionRange, reader::{DocumentReader, DocumentReadError}};
+use fcb::source::RawPath;
 use fcb_core::{DocumentGeneration, DocumentId};
+use crate::host::document_fragment::{self, FragmentResolution, QualifiedDocumentFragments};
 use super::{check, range, ByteOffset, HostResponse, Output, ReaderSession,
     ReaderSessionError, SelectionIdentity, EXIT_OK, MAX_READER_CONTEXT_BYTES, MAX_READER_WINDOW_BYTES};
 
@@ -26,6 +28,34 @@ impl From<DocumentReadError> for ReaderSessionError {
 }
 
 impl ReaderSession {
+    /// Temporary source qualification for a separately authorized link open.
+    /// It neither consumes a preview attempt nor publishes document/link state.
+    pub(in crate::host) fn resolve_document_fragment(&mut self, suffix: &str,
+        mut canceled: impl FnMut() -> bool)
+        -> Result<(FragmentResolution, Option<String>), ReaderSessionError> {
+        check(&mut canceled)?;
+        let (mut resolution, slug) = document_fragment::prepare_fragment(true, suffix)?;
+        if let Some(slug) = slug.as_deref() {
+            if !document_fragment::markdown(RawPath::from_path(&self.path).as_bytes()) {
+                resolution = FragmentResolution::Unsupported;
+            } else {
+                let [layout_id, provenance_id] = self.allocations()?;
+                // This private document ID is separate from the accepted
+                // preview's ID. Its generation never reaches native state.
+                let id = DocumentId::new(self.owner(), layout_id.get())
+                    .map_err(|_| ReaderSessionError::IdentityExhausted)?;
+                let generation = DocumentGeneration::new(self.owner(), 1)
+                    .map_err(|_| ReaderSessionError::IdentityExhausted)?;
+                let qualified = QualifiedDocumentFragments::prepare(&self.capture, id, generation,
+                    &self.budget, [layout_id, provenance_id], &mut canceled)
+                    .map_err(fragment_error)?;
+                resolution = qualified.resolve(slug, &mut canceled).map_err(fragment_error)?;
+            }
+        }
+        check(&mut canceled)?;
+        Ok((resolution, slug))
+    }
+
     pub fn document_generation(&self) -> Option<u64> {
         self.document.as_ref().map(|document| document.generation().get())
     }
@@ -214,6 +244,11 @@ impl ReaderSession {
         }
         Ok(document)
     }
+}
+
+fn fragment_error(error: DocumentReadError) -> ReaderSessionError {
+    match error { DocumentReadError::Canceled => ReaderSessionError::Canceled,
+        other => ReaderSessionError::Document(other) }
 }
 
 fn page_limit(count: usize) -> Result<(), ReaderSessionError> {

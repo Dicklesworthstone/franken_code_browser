@@ -87,9 +87,20 @@ and catalog cancellation epochs cover the transfer, and target admission precede
 source I/O. The native host preserves the originating reader in one pane and
 accepts the target in another; a failed transfer leaves both visible captures
 unchanged. The target's catalog receipt permits further local links. Cross-file
-fragments are currently explicit `not-applied` outcomes: the target opens at its
-beginning, without claiming that a heading was found. Existing root/path and leaf
-no-follow checks apply; this does not add descriptor-relative ancestor confinement.
+fragments resolve through the shared canonical heading catalog and its complete
+source-provenance qualification. A resolved heading supplies an original-byte
+`target_range`; `initial_original_offset` and the initial source window begin at
+that range's start, including any UTF-8 BOM translation. The native reader's
+initial history entry uses that same selected location.
+
+Qualification uses a temporary borrowed document over the new capture, bounded
+to 256 KiB `.md`/`.markdown` inputs and existing flow/item/block caps. It does not
+consume or retain a preview generation: native document preparation can still
+begin at generation 1. Empty `#` means document start. Missing, ambiguous, limited,
+unsupported and invalid fragments remain explicit outcomes with a readable target
+at byte zero; incomplete heading provenance never becomes a false missing result.
+Existing root/path and leaf no-follow checks apply; this does not add
+descriptor-relative ancestor confinement.
 
 ## Reflow, cancellation and ownership
 

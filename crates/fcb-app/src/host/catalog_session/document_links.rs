@@ -12,7 +12,7 @@ use fcb::document::resolve_document_destination;
 use fcb::source::{CaptureRequest, NormalizedPath};
 use fcb::store::Sha256Digest;
 use super::{CatalogSession, CatalogSessionError, HostResponse, ReaderSession,
-    MAX_READER_SOURCE_BYTES, check};
+    FIRST_WINDOW_BYTES, MAX_READER_SOURCE_BYTES, check};
 
 pub const MAX_CATALOG_READER_RECEIPTS: usize = 8;
 
@@ -95,8 +95,8 @@ impl CatalogSession {
     /// epochs with this catalog's active grant for the entire operation.
     ///
     /// A successful target is a new file observation, not a historical capture
-    /// of the link destination. Fragments remain explicitly not applied here;
-    /// the first source window starts at zero without claiming a heading match.
+    /// of the link destination. Bounded Markdown fragments use qualified
+    /// canonical heading ranges; other outcomes explicitly start at zero.
     pub fn open_document_link(&mut self, origin: &ReaderSession, reader_owner: ArenaOwnerId,
         selection: CatalogDocumentLinkSelection, max_source_bytes: usize,
         canceled: impl FnMut() -> bool)
@@ -138,8 +138,14 @@ impl CatalogSession {
             .ok_or(CatalogSessionError::UnsupportedDocumentLink)?;
         let target = self.link_target(path.as_bytes(), &mut canceled)?;
         self.validate_active()?; check(&mut canceled)?;
-        let (reader, info, window, source_bytes, source_calls) =
+        let (mut reader, info, initial_window, source_bytes, source_calls) =
             self.capture_reader(reader_owner, &target.path, max_source_bytes, &mut canceled)?;
+        let (fragment_resolution, fragment_slug) = reader.resolve_document_fragment(&suffix, &mut canceled)?;
+        let initial_original_offset = fragment_resolution.range().map(|range| range.start().get()).unwrap_or(0);
+        let window = if initial_original_offset == 0 { initial_window } else {
+            drop(initial_window);
+            reader.read_window(initial_original_offset, FIRST_WINDOW_BYTES, &mut canceled)?
+        };
         // Explicitly revalidate both authorities after acquisition. The source
         // reader is immutable under this borrow, and the bridge's cancellation
         // closure also covers its close/replacement epoch.
@@ -164,9 +170,14 @@ impl CatalogSession {
         out.literal(",\"destination_suffix\":")?; out.quoted(&suffix)?;
         let fragment = suffix.find('#').map(|start| &suffix[start..]).unwrap_or("");
         out.literal(",\"fragment_status\":")?;
-        out.quoted(if fragment.is_empty() { "none" } else { "not-applied" })?;
+        out.quoted(fragment_resolution.name())?;
         out.literal(",\"fragment_suffix\":")?; out.quoted(fragment)?;
-        out.literal(",\"initial_original_offset\":\"0\",\"reader\":")?; out.literal(info.as_str())?;
+        out.literal(",\"fragment_slug\":")?;
+        match &fragment_slug { Some(slug) => out.quoted(slug)?, None => out.literal("null")? }
+        out.literal(",\"target_range\":")?;
+        match fragment_resolution.range() { Some(range) => out.range(range)?, None => out.literal("null")? }
+        out.literal(",\"initial_original_offset\":")?; out.integer(initial_original_offset)?;
+        out.literal(",\"reader\":")?; out.literal(info.as_str())?;
         out.literal(",\"window\":")?; out.literal(window.as_str())?; out.literal("}\n")?;
         let response = self.finish(out, &mut canceled)?;
         self.validate_active()?;

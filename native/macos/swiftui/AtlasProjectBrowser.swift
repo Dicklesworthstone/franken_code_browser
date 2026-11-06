@@ -238,10 +238,104 @@ struct AtlasProjectBrowserTransport: Sendable {
     let readerDomain: UUID?
 }
 
+enum AtlasProjectBrowserFragmentStatus: String, Decodable, Sendable {
+    case none, documentStart = "document-start", resolved, missingHeading = "missing-heading"
+    case ambiguous, limited, unsupported, invalid, notApplied = "not-applied"
+}
+
+/// The service qualifies headings against the newly captured target. Swift
+/// validates its bounded result without decoding URLs or deriving source spans.
+struct AtlasProjectBrowserFragment: Sendable {
+    let status: AtlasProjectBrowserFragmentStatus
+    let slug: String?
+    let suffix: String
+    let targetRange: AtlasDocumentByteRange?
+    let initialOriginalOffset: UInt64
+
+    static let none = Self(status: .none, slug: nil, suffix: "", targetRange: nil, initialOriginalOffset: 0)
+    var isFallback: Bool { ![.none, .documentStart, .resolved].contains(status) }
+    var navigationDescription: String {
+        switch status {
+        case .none: "Opened at the beginning of the captured file."
+        case .documentStart: "The empty link fragment selects the captured document's beginning."
+        case .resolved: "Opened at heading #\(slug ?? "") in this capture."
+        case .missingHeading: "The requested heading is absent from this captured document. Opened at the beginning."
+        case .ambiguous: "Multiple captured headings share this identity. Opened at the beginning."
+        case .limited: "Heading navigation reached a document or memory limit. Opened at the beginning."
+        case .unsupported: "The heading's source position could not be verified in this capture. Opened at the beginning."
+        case .invalid: "The link fragment is invalid. Opened at the beginning."
+        case .notApplied: "The link fragment was not applied. Opened at the beginning."
+        }
+    }
+
+    fileprivate static func decode(_ data: Data, suffix expected: String, identity: AtlasReaderIdentity) throws -> Self {
+        let wire = try JSONDecoder().decode(Wire.self, from: data)
+        guard wire.suffix.utf8.elementsEqual(expected.utf8),
+              wire.suffix.utf8.count <= AtlasReaderDocumentLimits.destinationBytes else {
+            throw AtlasProjectBrowserError.invalidResponse
+        }
+        if let slug = wire.slug {
+            guard !slug.isEmpty, slug.utf8.count <= AtlasReaderDocumentLimits.destinationBytes,
+                  slug.unicodeScalars.allSatisfy({ $0.value >= 32 && !(127...159).contains($0.value) }) else {
+                throw AtlasProjectBrowserError.invalidResponse
+            }
+        }
+        switch wire.status {
+        case .none:
+            guard expected.isEmpty, wire.slug == nil else { throw AtlasProjectBrowserError.invalidResponse }
+        case .documentStart:
+            guard expected == "#", wire.slug == nil else { throw AtlasProjectBrowserError.invalidResponse }
+        case .resolved, .missingHeading, .ambiguous, .limited, .unsupported:
+            guard expected.hasPrefix("#"), expected.utf8.count > 1, wire.slug != nil else {
+                throw AtlasProjectBrowserError.invalidResponse
+            }
+        case .invalid:
+            guard expected.hasPrefix("#"), expected.utf8.count > 1, wire.slug == nil else {
+                throw AtlasProjectBrowserError.invalidResponse
+            }
+        case .notApplied:
+            guard expected.hasPrefix("#"), wire.slug == nil else { throw AtlasProjectBrowserError.invalidResponse }
+        }
+        if wire.status == .resolved {
+            guard identity.encoding == "utf8", identity.capturedBytes <= 256 * 1024,
+                  let range = wire.targetRange, range.valid(upTo: identity.capturedBytes, nonempty: true),
+                  wire.offset == range.start else { throw AtlasProjectBrowserError.invalidResponse }
+        } else {
+            guard wire.targetRange == nil, wire.offset == 0 else { throw AtlasProjectBrowserError.invalidResponse }
+        }
+        return Self(status: wire.status, slug: wire.slug, suffix: wire.suffix,
+            targetRange: wire.targetRange, initialOriginalOffset: wire.offset)
+    }
+    private struct Wire: Decodable {
+        let status: AtlasProjectBrowserFragmentStatus
+        let slug: String?
+        let suffix: String
+        let targetRange: AtlasDocumentByteRange?
+        let offset: UInt64
+        private enum CodingKeys: CodingKey {
+            case fragment_status, fragment_slug, fragment_suffix, target_range, initial_original_offset
+        }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            status = try c.decode(AtlasProjectBrowserFragmentStatus.self, forKey: .fragment_status)
+            // Legacy inert receipts had neither optional field. They cannot
+            // acquire a source range or a nonzero position through omission.
+            guard status == .notApplied || (c.contains(.fragment_slug) && c.contains(.target_range)) else {
+                throw AtlasProjectBrowserError.invalidResponse
+            }
+            slug = try c.decodeIfPresent(String.self, forKey: .fragment_slug)
+            suffix = try c.decode(String.self, forKey: .fragment_suffix)
+            targetRange = try c.decodeIfPresent(AtlasDocumentByteRange.self, forKey: .target_range)
+            offset = try c.decode(AtlasCatalogNumber.self, forKey: .initial_original_offset).value
+        }
+    }
+}
+
 private struct AtlasProjectBrowserReceipt: Sendable {
     let readerJSON: String
     let info: AtlasReaderInfo
     let window: AtlasReaderPage
+    let initialOriginalOffset: UInt64
     static func decode(_ json: String?, owner: UInt64, page: UInt64, file: AtlasProjectBrowserFile,
         destination: UInt64) throws -> Self {
         let data = try AtlasProjectBrowserWire.admit(json, owner: owner, command: "open-reader")
@@ -265,7 +359,7 @@ private struct AtlasProjectBrowserReceipt: Sendable {
         catch { throw AtlasProjectBrowserError.invalidResponse }
     }
     static func capture(_ data: Data, destination: UInt64, file: AtlasProjectBrowserFile,
-        bytes: UInt64, calls: UInt64) throws -> Self {
+        bytes: UInt64, calls: UInt64, initialOriginalOffset: UInt64 = 0) throws -> Self {
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let nested = object["reader"] as? [String: Any], let window = object["window"] as? [String: Any] else {
             throw AtlasProjectBrowserError.invalidResponse
@@ -280,8 +374,9 @@ private struct AtlasProjectBrowserReceipt: Sendable {
             throw AtlasProjectBrowserError.invalidResponse
         }
         // Earlier observedBytes is metadata, not a capture/digest promise.
-        let first = try AtlasReaderPage.decode(encoded(window), info: reader, request: .window(offset: 0, bytes: 16_384))
-        return Self(readerJSON: readerJSON, info: reader, window: first)
+        let first = try AtlasReaderPage.decode(encoded(window), info: reader,
+            request: .window(offset: initialOriginalOffset, bytes: 16_384))
+        return Self(readerJSON: readerJSON, info: reader, window: first, initialOriginalOffset: initialOriginalOffset)
     }
     func validate(_ page: AtlasReaderPage?) throws {
         guard let page, page.identity.matches(window.identity), page.start == window.start else {
@@ -319,7 +414,7 @@ private struct AtlasProjectBrowserLinkReceipt: Sendable {
     let capture: AtlasProjectBrowserReceipt
     let file: AtlasProjectBrowserFile
     let page: UInt64
-    let fragment: String
+    let fragment: AtlasProjectBrowserFragment
     static func decode(_ json: String?, source: AtlasProjectBrowserLinkOrigin,
         target: AtlasReaderDocumentLinkTarget, destination: UInt64) throws -> Self {
         let data = try AtlasProjectBrowserWire.admit(json, owner: source.catalog, command: "open-document-link")
@@ -328,7 +423,7 @@ private struct AtlasProjectBrowserLinkReceipt: Sendable {
             struct Wire: Decodable {
                 let source_page_id, source_file_id, source_reader_owner, document_generation, link_id: AtlasCatalogNumber
                 let target_page_id, reader_owner, source_bytes_read, source_read_calls, initial_original_offset: AtlasCatalogNumber
-                let source_capture_sha256, source_observation, destination, destination_suffix, fragment_status, fragment_suffix: String
+                let source_capture_sha256, source_observation, destination, destination_suffix: String
                 let target_file: AtlasProjectBrowserFile
             }
             let w = try JSONDecoder().decode(Wire.self, from: data)
@@ -341,16 +436,16 @@ private struct AtlasProjectBrowserLinkReceipt: Sendable {
                   w.document_generation.value == target.inventory.generation, w.link_id.value == target.link.id,
                   w.destination.utf8.elementsEqual(target.link.destination.utf8),
                   w.destination_suffix.utf8.count <= AtlasReaderDocumentLimits.destinationBytes,
-                  w.fragment_suffix.utf8.elementsEqual(fragment.utf8),
-                  w.fragment_status == (fragment.isEmpty ? "none" : "not-applied"),
-                  w.initial_original_offset.value == 0, w.target_file.id <= current.discovered,
+                  w.target_file.id <= current.discovered,
                   destination > 0, destination != source.catalog, destination != source.identity.owner,
                   w.reader_owner.value == destination, w.source_observation == "new-capture-after-document-link" else {
                 throw AtlasProjectBrowserError.invalidResponse
             }
-            return Self(capture: try AtlasProjectBrowserReceipt.capture(data, destination: destination, file: w.target_file,
-                bytes: w.source_bytes_read.value, calls: w.source_read_calls.value),
-                file: w.target_file, page: w.target_page_id.value, fragment: fragment)
+            let capture = try AtlasProjectBrowserReceipt.capture(data, destination: destination, file: w.target_file,
+                bytes: w.source_bytes_read.value, calls: w.source_read_calls.value,
+                initialOriginalOffset: w.initial_original_offset.value)
+            let qualified = try AtlasProjectBrowserFragment.decode(data, suffix: fragment, identity: capture.info.identity)
+            return Self(capture: capture, file: w.target_file, page: w.target_page_id.value, fragment: qualified)
         } catch let error as AtlasProjectBrowserError { throw error }
         catch { throw AtlasProjectBrowserError.invalidResponse }
     }
@@ -376,11 +471,12 @@ private final class AtlasProjectBrowserLinkReceiptBox: @unchecked Sendable {
     let catalogOwner: UInt64
     let pageID: UInt64
     let captureSHA256: String
-    let unappliedFragment: String
+    let fragment: AtlasProjectBrowserFragment
+    var unappliedFragment: String { fragment.isFallback ? fragment.suffix : "" }
     init(file: AtlasProjectBrowserFile, reader: AtlasPagedReaderModel, catalogOwner: UInt64,
-        pageID: UInt64, captureSHA256: String, unappliedFragment: String = "") {
+        pageID: UInt64, captureSHA256: String, fragment: AtlasProjectBrowserFragment = .none) {
         self.file = file; self.reader = reader; self.catalogOwner = catalogOwner
-        self.pageID = pageID; self.captureSHA256 = captureSHA256; self.unappliedFragment = unappliedFragment
+        self.pageID = pageID; self.captureSHA256 = captureSHA256; self.fragment = fragment
     }
 }
 
@@ -559,7 +655,7 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
         do {
             return try await withTaskCancellationHandler(operation: {
                 let receipt = AtlasProjectBrowserLinkReceiptBox()
-                try await reader.openRetained(offset: 0, registryDomain: domain) { destination in
+                try await reader.openRetained(registryDomain: domain) { destination in
                     guard !flag.isCanceled else { throw AtlasProjectBrowserError.canceled }
                     return try withExtendedLifetime(lease) {
                         let admitted = try AtlasProjectBrowserLinkReceipt.decode(lease.transport.run(lease.owner,
@@ -567,7 +663,8 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
                                 file: source.file, generation: target.inventory.generation, link: target.link.id,
                                 bytes: AtlasReaderLimits.captureBytes)), source: source, target: target, destination: destination)
                         try receipt.set(admitted)
-                        return admitted.capture.info
+                        return AtlasReaderRetainedInitialization(info: admitted.capture.info,
+                            initialOriginalOffset: admitted.capture.initialOriginalOffset)
                     }
                 }
                 try Task.checkCancellation()
@@ -579,7 +676,7 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
                 guard let digest = accepted.capture.info.captureSHA256 else { throw AtlasProjectBrowserError.invalidResponse }
                 notice = "Opened the linked project file as a new capture. The originating reader remains available."
                 return AtlasProjectBrowserCapture(file: accepted.file, reader: reader, catalogOwner: lease.owner,
-                    pageID: accepted.page, captureSHA256: digest, unappliedFragment: accepted.fragment)
+                    pageID: accepted.page, captureSHA256: digest, fragment: accepted.fragment)
             }, onCancel: { flag.cancel(); lease.cancel() })
         } catch {
             reader.close()

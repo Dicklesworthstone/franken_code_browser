@@ -8,14 +8,21 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
     let domain = UUID(), entered = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
     let source = Array("captured\n".utf8)
     let digest = "af9f5d825b4a9e493a23ea438db355287c4320107eb98c3542879fef26b82628"
+    let headingSource = Array("preface\n\n## Details\n\nTarget.\n".utf8)
+    let headingDigest = "12e28cc36046d8f48dd90d5364790e2d5d591c7c9b1658dcd636125a631bd59d"
     let emptyFirst: Bool
+    let fragmentStatus: String
     private let lock = NSLock()
     private var sessions: [UInt64: Session] = [:], readers: [UInt64: [UInt8]] = [:]
     private var documents: [UInt64: (generation: UInt64, width: UInt64)] = [:]
     private var nextOwner: UInt64 = 40, nextReader: UInt64 = 100
     private var fault: String?, blocked = false
     private var log: [String] = []
-    init(emptyFirst: Bool = false) { self.emptyFirst = emptyFirst }
+    init(emptyFirst: Bool = false, fragmentStatus: String = "unsupported") {
+        precondition(["none", "document-start", "resolved", "missing-heading", "ambiguous",
+            "limited", "unsupported", "invalid"].contains(fragmentStatus))
+        self.emptyFirst = emptyFirst; self.fragmentStatus = fragmentStatus
+    }
     private func locked<T>(_ work: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return work() }
     var calls: [String] { locked { log } }
     func corrupt(_ value: String) { locked { fault = value } }
@@ -27,7 +34,35 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
     func path(_ bytes: [UInt8]) -> [String: Any] {
         ["encoding": "unix-bytes", "hex": hex(bytes), "display": String(bytes: bytes, encoding: .utf8) ?? "\\xff.rs"]
     }
-    func raw(_ page: UInt64) -> [UInt8] { page == 2 ? [255, 46, 114, 115] : Array("src/p\(page).rs".utf8) }
+    func raw(_ page: UInt64) -> [UInt8] {
+        if page == 2 { return [255, 46, 114, 115] }
+        if page == 3 && fragmentStatus != "unsupported" { return Array("src/guide.md".utf8) }
+        return Array("src/p\(page).rs".utf8)
+    }
+    private func sourceBytes(for raw: [UInt8]) -> [UInt8] {
+        fragmentStatus == "resolved" && raw == self.raw(3) ? headingSource : source
+    }
+    private func captureDigest(for raw: [UInt8]) -> String {
+        fragmentStatus == "resolved" && raw == self.raw(3) ? headingDigest : digest
+    }
+    private var fragmentSuffix: String {
+        switch fragmentStatus {
+        case "none": return ""
+        case "document-start": return "#"
+        case "missing-heading": return "#absent"
+        case "ambiguous": return "#repeat-2"
+        case "invalid": return "#%ff"
+        default: return "#details"
+        }
+    }
+    private var fragmentSlug: String? {
+        switch fragmentStatus {
+        case "none", "document-start", "invalid": return nil
+        case "missing-heading": return "absent"
+        case "ambiguous": return "repeat-2"
+        default: return "details"
+        }
+    }
     func row(_ page: UInt64) -> [String: Any] {
         ["file_id": String(page - (emptyFirst ? 1 : 0)), "path": path(raw(page)), "observed_bytes": "4096"]
     }
@@ -57,8 +92,8 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
     }
     private func readerHeader(_ owner: UInt64, raw: [UInt8], command: String) -> [String: Any] {
         ["schema": "fcb.reader-session/1", "status": "ok", "command": command, "owner": String(owner),
-            "file_id": "1", "source_revision": "1", "captured_bytes": String(source.count), "encoding": "utf8",
-            "path": path(raw), "capture_origin": "host-supplied", "capture_sha256": digest,
+            "file_id": "1", "source_revision": "1", "captured_bytes": String(sourceBytes(for: raw).count), "encoding": "utf8",
+            "path": path(raw), "capture_origin": "host-supplied", "capture_sha256": captureDigest(for: raw),
             "additional_source_bytes_read": "0", "native_presented": false]
     }
     private func readerInfo(_ owner: UInt64, raw: [UInt8]) -> [String: Any] {
@@ -69,6 +104,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         return out
     }
     private func window(_ owner: UInt64, raw: [UInt8], start: UInt64, limit: UInt64) -> [String: Any] {
+        let source = sourceBytes(for: raw)
         let end = min(UInt64(source.count), start + limit), bytes = source[Int(start)..<Int(end)]
         var out = readerHeader(owner, raw: raw, command: "window")
         out["requested_original_range"] = ["start": String(start), "end": String(end)]
@@ -79,7 +115,9 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         out["next_offset"] = end < UInt64(source.count) ? String(end) as Any : NSNull()
         return out
     }
-    private func documentDestination(_ raw: [UInt8]) -> String { raw == self.raw(3) ? "p1.rs" : "p3.rs#details" }
+    private func documentDestination(_ raw: [UInt8]) -> String {
+        raw == self.raw(3) ? "p1.rs" : (fragmentStatus == "unsupported" ? "p3.rs" : "guide.md") + fragmentSuffix
+    }
     /// Bounded logical output at the injected boundary. The sample capture is
     /// unchanged; neither the fixture nor native model implements a Markdown
     /// parser. Rust's real parser/receipt integration has its separate tests.
@@ -103,12 +141,12 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
                 out["first_flow_line"] = "0"; out["next_flow_line"] = NSNull(); out["whole_document_visible"] = true
                 out["flow_lines"] = [["flow_line": "0", "text": "captured",
                     "rendered_utf8_range": ["start": "0", "end": "8"],
-                    "enclosing_original_range": ["start": "0", "end": "9"]] as [String: Any]]
+                    "enclosing_original_range": ["start": "0", "end": String(sourceBytes(for: raw).count)]] as [String: Any]]
                 out["headings"] = [] as [String]; out["next_heading"] = NSNull()
             } else {
                 let destination = documentDestination(raw)
                 let link: [String: Any] = ["link_id": "1", "block_index": "0",
-                    "evidence_range": ["start": "0", "end": "9"], "destination": destination,
+                    "evidence_range": ["start": "0", "end": String(sourceBytes(for: raw).count)], "destination": destination,
                     "destination_display": destination, "kind": "local-reference", "fragment_slug": NSNull()]
                 out["links_ready"] = true; out["links_complete"] = true; out["links_truncated"] = false
                 out["links_seen"] = "1"; out["retained_links"] = "1"; out["parser_diagnostics"] = "0"
@@ -186,7 +224,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
                         var out = header(owner, command: "open-reader", latest: session.latest, paused: session.paused)
                         out["page_id"] = String(pageID); out["file_id"] = String(file); out["path"] = path(raw)
                         out["reader_owner"] = String(reader); out["source_observation"] = "new-capture-after-metadata-selection"
-                        out["source_bytes_read"] = String(source.count); out["source_read_calls"] = "1"
+                        out["source_bytes_read"] = String(sourceBytes(for: raw).count); out["source_read_calls"] = "1"
                         var nested = readerInfo(reader, raw: raw)
                         if let fault {
                             self.fault = nil
@@ -217,20 +255,26 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
                                 "error": ["code": "CATALOG_SESSION_LINK_TARGET_NOT_RETAINED"]])
                         }
                         let targetRaw = self.raw(targetPage), destinationText = documentDestination(raw)
-                        let suffix = targetPage == 3 ? "#details" : ""
+                        let suffix = targetPage == 3 ? fragmentSuffix : ""
+                        let status = targetPage == 3 ? fragmentStatus : "none"
+                        let slug = targetPage == 3 ? fragmentSlug : nil
+                        let offset: UInt64 = status == "resolved" ? 9 : 0
+                        let targetBytes = sourceBytes(for: targetRaw)
                         readers[destination] = targetRaw
                         var out = header(owner, command: "open-document-link", latest: session.latest, paused: session.paused)
                         out["source_page_id"] = String(pageID); out["source_file_id"] = String(file)
-                        out["source_reader_owner"] = String(origin); out["source_capture_sha256"] = digest
+                        out["source_reader_owner"] = String(origin); out["source_capture_sha256"] = captureDigest(for: raw)
                         out["document_generation"] = String(generation); out["link_id"] = String(link)
                         out["target_page_id"] = String(targetPage); out["target_file"] = row(targetPage)
                         out["reader_owner"] = String(destination); out["source_observation"] = "new-capture-after-document-link"
-                        out["source_bytes_read"] = String(source.count); out["source_read_calls"] = "1"
+                        out["source_bytes_read"] = String(targetBytes.count); out["source_read_calls"] = "1"
                         out["destination"] = destinationText; out["destination_suffix"] = suffix
-                        out["fragment_status"] = suffix.isEmpty ? "none" : "not-applied"
-                        out["fragment_suffix"] = suffix; out["initial_original_offset"] = "0"
+                        out["fragment_status"] = status
+                        out["fragment_slug"] = slug.map { $0 as Any } ?? NSNull()
+                        out["target_range"] = status == "resolved" ? ["start": "9", "end": "20"] as Any : NSNull()
+                        out["fragment_suffix"] = suffix; out["initial_original_offset"] = String(offset)
                         var nested = readerInfo(destination, raw: targetRaw)
-                        var first = window(destination, raw: targetRaw, start: 0, limit: 16_384)
+                        var first = window(destination, raw: targetRaw, start: offset, limit: 16_384)
                         if let fault {
                             self.fault = nil
                             switch fault {
@@ -251,16 +295,27 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
                             case "link-reader-owner": out["reader_owner"] = String(destination + 99)
                             case "link-reader-path": nested["path"] = path(Array("other.rs".utf8))
                             case "link-reader-generation": nested["accepted_document_generation"] = "1"
-                            case "link-source-bytes": out["source_bytes_read"] = String(source.count + 1)
+                            case "link-source-bytes": out["source_bytes_read"] = String(targetBytes.count + 1)
                             case "link-observation": out["source_observation"] = "metadata-snapshot"
                             case "link-fragment": out["fragment_suffix"] = "#invented"
                             case "link-fragment-resolved": out["fragment_status"] = "resolved"
-                            case "link-fragment-offset": out["initial_original_offset"] = "1"
+                            case "link-fragment-offset":
+                                out["initial_original_offset"] = "1"
+                                first = window(destination, raw: targetRaw, start: 1, limit: 16_384)
+                            case "link-fragment-slug": out["fragment_slug"] = NSNull()
+                            case "link-fragment-fields":
+                                out.removeValue(forKey: "fragment_slug"); out.removeValue(forKey: "target_range")
+                            case "link-fragment-empty-range": out["target_range"] = ["start": "9", "end": "9"]
+                            case "link-fragment-outside": out["target_range"] = ["start": "9", "end": String(targetBytes.count + 1)]
+                            case "link-fragment-fallback-range": out["fragment_status"] = "unsupported"
+                            case "link-fragment-unknown": out["fragment_status"] = "invented"
+                            case "link-window-zero": first = window(destination, raw: targetRaw, start: 0, limit: 16_384)
                             case "link-window":
                                 // Valid reader/window metadata with different
                                 // original bytes must fail the second-window
                                 // round trip after destination initialization.
-                                first["text"] = "tampered\n"; first["original_hex"] = hex("tampered\n".utf8)
+                                let tampered = Array(repeating: UInt8(120), count: targetBytes.count - Int(offset))
+                                first["text"] = String(decoding: tampered, as: UTF8.self); first["original_hex"] = hex(tampered)
                             default: preconditionFailure("unknown link receipt fault")
                             }
                         }
@@ -285,6 +340,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
             window: { [self] owner, start, limit in locked {
                 guard let raw = readers[owner] else { return nil }
                 log.append("reader-window:\(owner)")
+                log.append("reader-window-offset:\(owner):\(start)")
                 return json(window(owner, raw: raw, start: start, limit: limit))
             } }, lines: { _, _, _, _ in nil },
             cancel: { [self] owner in locked { log.append("reader-cancel:\(owner)") }; return true },
@@ -320,6 +376,9 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         try await forgedDocumentLinkReceiptsAreRefused()
         try await unobservedLinkTargetRemainsRecoverable()
         try await staleAndInterruptedDocumentLinksRetireOnlyCandidates()
+        try await qualifiedHeadingOffsetStartsReaderAndHistoryAtCapturedAnchor()
+        try await typedFragmentFallbacksKeepReadableTargets()
+        try await malformedQualifiedHeadingReceiptsNeverPublishTargets()
         print("Progressive project pages, recovery, raw-file capture, captured document-link proofs, independent targets and grant-lifetime regressions passed.")
     }
     private static func boundedWireAndCoverage() throws {
@@ -463,6 +522,10 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         var forwarded: AtlasReaderDocumentLinkTarget?
         origin.reader.documentPreview.openLink(local, openLocal: { target in
             precondition(!origin.reader.documentPreview.busy)
+            // Dismissing the source preview after activation drains must leave
+            // the accepted captured link available to the project callback.
+            origin.reader.documentPreview.cancel(silent: true)
+            precondition(origin.reader.documentPreview.allows(target))
             forwarded = target
         })
         await wait("local activation did not reach its explicit project callback") { forwarded != nil }
@@ -473,6 +536,8 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         precondition(target.file.rawPath == f.raw(3) && target.file.observedBytes == 4096)
         precondition(target.reader.page?.identity.capturedBytes == 9 && target.captureSHA256 == f.digest)
         precondition(target.unappliedFragment == "#details" && target.reader.page?.start == 0)
+        precondition(target.fragment.status == .unsupported && target.fragment.slug == "details"
+            && target.fragment.targetRange == nil && target.fragment.initialOriginalOffset == 0)
         precondition(target.reader.page?.identity.owner == 101 && target.reader.page?.text == "captured\n")
         precondition(origin.reader.page?.identity.matches(original.identity) == true
             && origin.reader.page?.originalHex == original.originalHex && origin.reader.page?.start == original.start)
@@ -592,6 +657,74 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
             await wait("late target candidate did not retire after \(interruption)") { f.calls.contains("reader-close:101") }
             precondition(origin.reader.page?.identity.matches(original.identity) == true
                 && origin.reader.page?.originalHex == original.originalHex && origin.reader.canPin)
+            precondition(!f.calls.contains("reader-close:100") && !f.calls.contains("LABEL-OPEN"))
+            origin.reader.close(); model.close()
+        }
+    }
+    @MainActor private static func qualifiedHeadingOffsetStartsReaderAndHistoryAtCapturedAnchor() async throws {
+        let f = ProjectBrowserFixture(fragmentStatus: "resolved")
+        let (model, origin, local) = try await linkEnvironment(f)
+        let original = origin.reader.page!
+        let target = try await model.openDocumentLink(local, from: origin,
+            readerTransport: f.readerTransport, document: f.documentTransport)
+        precondition(target.fragment.status == .resolved && target.fragment.slug == "details")
+        precondition(target.fragment.targetRange == AtlasDocumentByteRange(start: 9, end: 20))
+        precondition(target.fragment.initialOriginalOffset == 9 && !target.fragment.isFallback
+            && target.unappliedFragment.isEmpty)
+        precondition(target.reader.page?.start == 9 && target.reader.page?.text == "## Details\n\nTarget.\n")
+        precondition(target.reader.page?.originalHex == f.hex(f.headingSource.dropFirst(9))
+            && target.captureSHA256 == f.headingDigest)
+        precondition(f.calls.contains("reader-window-offset:101:9")
+            && !f.calls.contains("reader-window-offset:101:0"))
+        precondition(!target.reader.canGoBack && !target.reader.canGoForward && target.reader.offsetInput == "9")
+        target.reader.offsetInput = "0"; target.reader.goToByte()
+        await wait("explicit source navigation did not leave the heading") { !target.reader.busy }
+        precondition(target.reader.page?.start == 0 && target.reader.canGoBack)
+        target.reader.back()
+        await wait("Back did not restore the service-selected heading anchor") { !target.reader.busy }
+        precondition(target.reader.page?.start == 9 && target.reader.canGoForward && !target.reader.canGoBack)
+        target.reader.forward()
+        await wait("Forward did not restore the explicit source page") { !target.reader.busy }
+        precondition(target.reader.page?.start == 0 && target.reader.canGoBack)
+        target.reader.back(); await wait("second Back did not return to the heading") { !target.reader.busy }
+        let link = await prepareLink(target.reader)
+        precondition(link.inventory.generation == 1 && f.calls.contains("document-prepare:101:1"))
+        precondition(target.reader.page?.start == 9 && target.reader.documentPreview.canNavigate)
+        precondition(origin.reader.page?.identity.matches(original.identity) == true
+            && origin.reader.page?.originalHex == original.originalHex && !f.calls.contains("LABEL-OPEN"))
+        target.reader.close(); origin.reader.close(); model.close()
+    }
+    @MainActor private static func typedFragmentFallbacksKeepReadableTargets() async throws {
+        for status in ["none", "document-start", "missing-heading", "ambiguous", "limited", "unsupported", "invalid"] {
+            let f = ProjectBrowserFixture(fragmentStatus: status)
+            let (model, origin, local) = try await linkEnvironment(f)
+            let target = try await model.openDocumentLink(local, from: origin,
+                readerTransport: f.readerTransport, document: f.documentTransport)
+            precondition(target.fragment.status.rawValue == status && target.fragment.targetRange == nil)
+            precondition(target.fragment.initialOriginalOffset == 0 && target.reader.page?.start == 0
+                && target.reader.page?.text == "captured\n")
+            let hasSlug = !["none", "document-start", "invalid"].contains(status)
+            precondition((target.fragment.slug != nil) == hasSlug)
+            precondition(target.fragment.isFallback == !["none", "document-start"].contains(status))
+            precondition(!target.fragment.navigationDescription.isEmpty && origin.reader.documentPreview.allows(local))
+            target.reader.close(); origin.reader.close(); model.close()
+        }
+    }
+    @MainActor private static func malformedQualifiedHeadingReceiptsNeverPublishTargets() async throws {
+        for fault in ["link-fragment-slug", "link-fragment-fields", "link-fragment-empty-range",
+                      "link-fragment-outside", "link-fragment-offset", "link-fragment-fallback-range",
+                      "link-fragment-unknown", "link-window-zero", "link-window"] {
+            let f = ProjectBrowserFixture(fragmentStatus: "resolved")
+            let (model, origin, local) = try await linkEnvironment(f)
+            let original = origin.reader.page!
+            f.corrupt(fault)
+            await refuse("malformed nonzero heading target was published: \(fault)") {
+                _ = try await model.openDocumentLink(local, from: origin,
+                    readerTransport: f.readerTransport, document: f.documentTransport)
+            }
+            await wait("invalid heading candidate did not retire: \(fault)") { f.calls.contains("reader-close:101") }
+            precondition(origin.reader.page?.identity.matches(original.identity) == true
+                && origin.reader.page?.originalHex == original.originalHex && origin.reader.documentPreview.allows(local))
             precondition(!f.calls.contains("reader-close:100") && !f.calls.contains("LABEL-OPEN"))
             origin.reader.close(); model.close()
         }

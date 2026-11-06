@@ -100,7 +100,9 @@ fn relative_links_keep_original_document_and_open_independent_current_targets() 
     assert!(receipt.get("source_read_calls").number() > 0);
     assert_eq!(receipt.get("destination").text(), "../src/a%20b.md?plain=1#details");
     assert_eq!(receipt.get("destination_suffix").text(), "?plain=1#details");
-    assert_eq!(receipt.get("fragment_status").text(), "not-applied");
+    assert_eq!(receipt.get("fragment_status").text(), "missing-heading");
+    assert_eq!(receipt.get("fragment_slug").text(), "details");
+    assert_eq!(receipt.get("target_range"), &Json::Null);
     assert_eq!(receipt.get("fragment_suffix").text(), "#details");
     assert_eq!(receipt.get("initial_original_offset").number(), 0);
     assert_eq!(target.capture().bytes(), current_target);
@@ -208,10 +210,200 @@ fn uri_path_components_are_decoded_once_and_unfragmented_targets_start_at_zero()
         let receipt = json(&receipt);
         assert_eq!(path(receipt.get("target_file")), expected);
         assert_eq!(receipt.get("fragment_status").text(), "none");
+        assert_eq!(receipt.get("fragment_slug"), &Json::Null);
+        assert_eq!(receipt.get("target_range"), &Json::Null);
         assert_eq!(receipt.get("fragment_suffix").text(), "");
         assert_eq!(receipt.get("initial_original_offset").number(), 0);
         assert_eq!(reader.capture().bytes(), bytes);
     }
+}
+
+#[test]
+fn canonical_heading_links_select_original_bom_crlf_offsets_without_consuming_preview_generation() {
+    let root = new_root(); fs::create_dir(root.join("docs")).unwrap();
+    let source = b"# Local\n\n[guide](docs/guide.MARKDOWN#caf-%64etails) [query](docs/guide.MARKDOWN?view=source#caf-%64etails)\n";
+    let guide = format!("\u{feff}{}\r\n\r\n## Café Details\r\n\r\nBody.\r\n", "x".repeat(200));
+    fs::write(root.join("README.md"), source).unwrap(); fs::write(root.join("docs/guide.MARKDOWN"), &guide).unwrap();
+    let (mut catalog, found) = catalog(&root, 75101);
+    let source_row = row(&found, "README.md"); let origin = open(&mut catalog, &source_row, 75102);
+    let mut first_range: Option<Json> = None;
+    for id in 1..=2 {
+        let (mut reader, response) = catalog.open_document_link(&origin, owner(75102 + id),
+            selection(&source_row, 1, id), 4096, || false).unwrap();
+        let receipt = json(&response);
+        let range = receipt.get("target_range");
+        let start = range.get("start").number(); let end = range.get("end").number();
+        assert_eq!(receipt.get("fragment_status").text(), "resolved");
+        assert_eq!(receipt.get("fragment_slug").text(), "caf-details");
+        assert_eq!(start, 207); // UTF-8 BOM, 200 ASCII bytes, then two CRLFs.
+        assert_eq!(guide[start as usize..end as usize].trim_end(), "## Café Details");
+        assert_eq!(receipt.get("initial_original_offset").number(), start);
+        assert_eq!(receipt.get("window").get("requested_original_range").get("start").number(), start);
+        assert_eq!(receipt.get("window").get("visible_range").get("start").number(), start);
+        assert_eq!(receipt.get("source_bytes_read").number(), guide.len() as u64);
+        assert_eq!(receipt.get("reader").get("accepted_document_generation"), &Json::Null);
+        assert_eq!(reader.document_generation(), None);
+        assert_eq!(reader.document_links_generation(), None);
+        if let Some(first) = &first_range { assert_eq!(range, first); }
+        else { first_range = Some(range.clone()); }
+        if id == 2 {
+            assert_eq!(receipt.get("destination_suffix").text(), "?view=source#caf-%64etails");
+            fs::write(root.join("docs/guide.MARKDOWN"), b"# Replacement\n").unwrap();
+        }
+        // Qualification is temporary derived work over this new capture. It
+        // consumes neither the reader's first preview attempt nor live bytes.
+        let prepared = reader.prepare_document(1, ReaderDocumentOptions::default(), || false).unwrap();
+        assert_eq!(json(&prepared).get("document_generation").number(), 1);
+        assert_eq!(json(&reader.copy_range(start, end, || false).unwrap()).get("original_hex").text(),
+            hex(&guide.as_bytes()[start as usize..end as usize]));
+        assert_eq!(reader.capture().bytes(), guide.as_bytes());
+        assert_eq!(origin.capture().bytes(), source);
+    }
+}
+
+#[test]
+fn canonical_collisions_missing_and_invalid_fragments_remain_distinct_from_file_capture() {
+    let root = new_root();
+    let source = b"[ok](guide.md#repeat) [collision](guide.md#repeat-2) [missing](guide.md#absent) \
+        [once](guide.md#%2572epeat) [case](guide.md#Repeat) [plus](guide.md#repeat+two) \
+        [invalid](guide.md#%ff) [zero](guide.md#%00) [top](guide.md#) \
+        [code](code.rs#L2) [code-top](code.rs#) [query](guide.md?plain=1) [plain](guide.md)\n";
+    let guide = b"# Repeat\n\n# Repeat\n\n# Repeat-2\n\n";
+    fs::write(root.join("README.md"), source).unwrap(); fs::write(root.join("guide.md"), guide).unwrap();
+    fs::write(root.join("code.rs"), b"first\nsecond\n").unwrap();
+    let (mut catalog, found) = catalog(&root, 75201);
+    let source_row = row(&found, "README.md"); let origin = open(&mut catalog, &source_row, 75202);
+    let expected = [
+        ("resolved", Some("repeat")), ("ambiguous", Some("repeat-2")),
+        ("missing-heading", Some("absent")), ("missing-heading", Some("%72epeat")),
+        ("missing-heading", Some("Repeat")), ("missing-heading", Some("repeat+two")),
+        ("invalid", None), ("invalid", None), ("document-start", None),
+        ("unsupported", Some("L2")), ("document-start", None), ("none", None), ("none", None),
+    ];
+    for (index, (status, slug)) in expected.iter().enumerate() {
+        let id = index as u64 + 1;
+        let (reader, response) = catalog.open_document_link(&origin, owner(75300 + id),
+            selection(&source_row, 1, id), 4096, || false).unwrap();
+        let receipt = json(&response);
+        assert_eq!(receipt.get("fragment_status").text(), *status, "occurrence {id}");
+        match slug {
+            Some(slug) => assert_eq!(receipt.get("fragment_slug").text(), *slug),
+            None => assert_eq!(receipt.get("fragment_slug"), &Json::Null),
+        }
+        assert_eq!(receipt.get("initial_original_offset").number(), 0);
+        assert_eq!(receipt.get("window").get("visible_range").get("start").number(), 0);
+        if *status == "resolved" {
+            let range = receipt.get("target_range");
+            assert_eq!(range.get("start").number(), 0);
+            assert_eq!(std::str::from_utf8(&guide[..range.get("end").number() as usize]).unwrap().trim_end(), "# Repeat");
+        } else { assert_eq!(receipt.get("target_range"), &Json::Null); }
+        assert_eq!(reader.document_generation(), None);
+        assert_eq!(receipt.get("reader").get("accepted_document_generation"), &Json::Null);
+        if id == 10 || id == 11 { assert_eq!(reader.capture().bytes(), b"first\nsecond\n"); }
+        else { assert_eq!(reader.capture().bytes(), guide); }
+    }
+    assert_eq!(origin.capture().bytes(), source);
+}
+
+#[test]
+fn complete_heading_provenance_is_required_before_claiming_a_missing_heading() {
+    let cases = [
+        "\u{feff}---\ntitle: Guide\n---\n\n# Target\n",
+        "> target\ntarget\n\n# target\n",
+        "p\n    target\n\n# target\n",
+        "$$\n# target\n$$\n\n# target\n",
+        "Term\n: first\n\nTarget\n: second\n\n# Target\n",
+        "> # target\n",
+    ];
+    for (index, guide) in cases.iter().enumerate() {
+        let root = new_root();
+        fs::write(root.join("README.md"), b"[target](guide.md#absent)\n").unwrap();
+        fs::write(root.join("guide.md"), guide).unwrap();
+        let (mut catalog, found) = catalog(&root, 75400 + index as u64 * 3);
+        let source = row(&found, "README.md");
+        let origin = open(&mut catalog, &source, 75401 + index as u64 * 3);
+        let (mut reader, response) = catalog.open_document_link(&origin, owner(75402 + index as u64 * 3),
+            selection(&source, 1, 1), 4096, || false).unwrap();
+        let receipt = json(&response);
+        assert_eq!(receipt.get("fragment_status").text(), "unsupported", "case {index}");
+        assert_eq!(receipt.get("fragment_slug").text(), "absent");
+        assert_eq!(receipt.get("target_range"), &Json::Null);
+        assert_eq!(receipt.get("initial_original_offset").number(), 0);
+        assert_eq!(json(&reader.copy_range(0, guide.len() as u64, || false).unwrap()).get("original_hex").text(),
+            hex(guide.as_bytes()));
+    }
+    // A qualified fence/list document remains a positive control: source that
+    // merely looks like a heading inside code must not steal the actual anchor.
+    let root = new_root();
+    let guide = b"```text\n# target\n```\n\n- ordinary list\n\n# Target\n";
+    fs::write(root.join("README.md"), b"[target](guide.md#target)\n").unwrap();
+    fs::write(root.join("guide.md"), guide).unwrap();
+    let (mut catalog, found) = catalog(&root, 75430);
+    let source = row(&found, "README.md"); let origin = open(&mut catalog, &source, 75431);
+    let (_, response) = catalog.open_document_link(&origin, owner(75432), selection(&source, 1, 1), 4096, || false).unwrap();
+    let receipt = json(&response);
+    assert_eq!(receipt.get("fragment_status").text(), "resolved");
+    assert_eq!(&guide[receipt.get("initial_original_offset").number() as usize..], b"# Target\n");
+}
+
+#[test]
+fn target_source_flow_and_parser_limits_keep_captured_reading_available() {
+    let oversized = vec![b'x'; 256 * 1024 + 1];
+    let flow_limited = format!("{}# Last\n", "paragraph\n\n".repeat(4100)).into_bytes();
+    let amplified = format!("[r]: x \"{}\"\n\n{}", "x".repeat(128 * 1024), "[r]\n".repeat(30_000)).into_bytes();
+    for (index, guide) in [oversized, flow_limited, amplified].into_iter().enumerate() {
+        let root = new_root();
+        fs::write(root.join("README.md"), b"[target](guide.md#last)\n").unwrap();
+        fs::write(root.join("guide.md"), &guide).unwrap();
+        let (mut catalog, found) = catalog(&root, 75500 + index as u64 * 3);
+        let source = row(&found, "README.md"); let origin = open(&mut catalog, &source, 75501 + index as u64 * 3);
+        let (reader, response) = catalog.open_document_link(&origin, owner(75502 + index as u64 * 3),
+            selection(&source, 1, 1), 1024 * 1024, || false).unwrap();
+        let receipt = json(&response);
+        assert_eq!(receipt.get("fragment_status").text(), "limited", "case {index}");
+        assert_eq!(receipt.get("fragment_slug").text(), "last");
+        assert_eq!(receipt.get("target_range"), &Json::Null);
+        assert_eq!(receipt.get("initial_original_offset").number(), 0);
+        assert_eq!(receipt.get("source_bytes_read").number(), guide.len() as u64);
+        assert_eq!(receipt.get("window").get("visible_range").get("start").number(), 0);
+        assert_eq!(reader.capture().bytes(), guide.as_slice());
+        assert_eq!(reader.document_generation(), None);
+    }
+}
+
+#[test]
+fn cancellation_inside_heading_qualification_remains_canceled_and_does_not_accept_a_receipt() {
+    let root = new_root();
+    let source = b"[plain](guide.md) [heading](guide.md#target)\n";
+    let mut guide = String::new();
+    for index in 0..256 { guide.push_str(&format!("# Heading {index}\n\n")); }
+    guide.push_str("# Target\n\n[back](README.md)\n");
+    fs::write(root.join("README.md"), source).unwrap(); fs::write(root.join("guide.md"), &guide).unwrap();
+    let (mut catalog, found) = catalog(&root, 75601);
+    let source_row = row(&found, "README.md"); let target_row = row(&found, "guide.md");
+    let origin = open(&mut catalog, &source_row, 75602);
+    let mut plain_polls = 0;
+    catalog.open_document_link(&origin, owner(75603), selection(&source_row, 1, 1), 64 * 1024,
+        || { plain_polls += 1; false }).unwrap();
+    let mut heading_polls = 0;
+    let (_, response) = catalog.open_document_link(&origin, owner(75604), selection(&source_row, 1, 2), 64 * 1024,
+        || { heading_polls += 1; false }).unwrap();
+    assert_eq!(json(&response).get("fragment_status").text(), "resolved");
+    assert!(heading_polls > plain_polls + 100);
+    // Derive the cancellation point from this input's successful work. The
+    // large isolated-heading qualification dominates the extra polls; no fixed
+    // implementation-specific poll number or parser substitute is required.
+    let cancel_at = plain_polls + (heading_polls - plain_polls) / 2;
+    let mut polls = 0;
+    let error = catalog.open_document_link(&origin, owner(75605), selection(&source_row, 1, 2), 64 * 1024,
+        || { polls += 1; polls == cancel_at }).err().unwrap();
+    assert!(error.is_canceled(), "nested document cancellation lost its classification: {error}");
+    assert!(polls >= cancel_at);
+    let mut unaccepted = ReaderSession::from_bytes(owner(75605), Path::new("guide.md"), guide.as_bytes(), || false).unwrap();
+    prepare(&mut unaccepted);
+    assert!(matches!(catalog.open_document_link(&unaccepted, owner(75606), selection(&target_row, 1, 1), 4096, || false),
+        Err(CatalogSessionError::StaleReaderReceipt)));
+    assert_eq!(origin.capture().bytes(), source);
 }
 
 #[test]

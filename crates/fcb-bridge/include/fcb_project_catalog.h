@@ -93,8 +93,16 @@ char *fcb_catalog_open_reader(uint64_t handle, uint64_t reader,
  * after acceptance; max_source_bytes: 1..32 MiB. Existing path/leaf policy
  * applies, with the same confinement limits as open_reader above.
  * A target outside retained metadata is unavailable, not known absent. The
- * receipt names the exact target row and both captures. Cross-file fragments
- * are explicitly reported as not-applied; the initial source offset is zero.
+ * receipt names the exact target row and both captures. A target #fragment is
+ * decoded once and matched to a uniquely qualified canonical Markdown heading.
+ * Fragment qualification is bounded to 256 KiB .md/.markdown captures and the
+ * shared document flow limits; it does not consume a reader preview generation.
+ * fragment_status is none/document-start/resolved/missing-heading/ambiguous/
+ * limited/unsupported/invalid. Only resolved supplies a nonempty target_range
+ * and begins the receipt window at its original-byte start (including BOM).
+ * Other outcomes keep a readable target at byte zero with explicit status;
+ * incomplete or unsupported heading provenance is never reported as missing.
+ * fragment_slug is the once-decoded identity or null, never a native slug.
  */
 char *fcb_catalog_open_document_link(uint64_t handle, uint64_t origin,
     uint64_t destination, uint64_t source_page, uint64_t source_file,

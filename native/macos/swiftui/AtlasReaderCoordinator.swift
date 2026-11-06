@@ -50,6 +50,20 @@ struct AtlasReaderReplacement: Sendable {
     fileprivate let id: UUID
 }
 
+/// A separately authorized service may resolve both the captured file and its
+/// initial source position. Neither value is derived from a display label.
+struct AtlasReaderRetainedInitialization: Sendable {
+    let info: AtlasReaderInfo
+    let initialOriginalOffset: UInt64
+}
+
+/// Keep the validated request with its page so initial navigation history uses
+/// the selected position even when decoding adjusts visible byte boundaries.
+struct AtlasReaderRetainedPage: Sendable {
+    let page: AtlasReaderPage
+    let request: AtlasReaderRequest
+}
+
 /// This reference is retained, never operated on, by background work. It may
 /// hold the native security-scoped root grant for the entire capture lifetime.
 private final class AtlasReaderAccessLease: @unchecked Sendable {
@@ -173,9 +187,17 @@ private final class AtlasReaderSession: @unchecked Sendable {
     func openRetained(offset: UInt64, registryDomain: UUID,
         initialize: @escaping @Sendable (UInt64) throws -> AtlasReaderInfo) async throws -> AtlasReaderPage {
         try Task.checkCancellation()
+        guard offset <= AtlasReaderLimits.captureBytes else { throw AtlasReaderError.unavailable }
+        let opened = try await openRetained(registryDomain: registryDomain) { handle in
+            AtlasReaderRetainedInitialization(info: try initialize(handle), initialOriginalOffset: offset)
+        }
+        return opened.page
+    }
+    func openRetained(registryDomain: UUID,
+        initialize: @escaping @Sendable (UInt64) throws -> AtlasReaderRetainedInitialization) async throws -> AtlasReaderRetainedPage {
+        try Task.checkCancellation()
         guard session == nil, pendingSession == nil, info == nil,
-              transport.comparison?.domain == registryDomain,
-              offset <= AtlasReaderLimits.captureBytes else { throw AtlasReaderError.unavailable }
+              transport.comparison?.domain == registryDomain else { throw AtlasReaderError.unavailable }
         let next = try AtlasReaderSession(transport: transport, accessLease: nil)
         cancel()
         pendingSession = next
@@ -184,11 +206,13 @@ private final class AtlasReaderSession: @unchecked Sendable {
         do {
             let result = try await withTaskCancellationHandler(operation: {
                 try await io.perform(cancellation: flag, keepingAlive: [next]) {
-                    let info = try initialize(next.handle)
+                    let initialization = try initialize(next.handle)
+                    let info = initialization.info, offset = initialization.initialOriginalOffset
                     guard info.identity.owner == next.handle, info.origin == "host-supplied",
                           info.captureSHA256 != nil, !info.identity.pathBytes.isEmpty,
                           info.identity.pathBytes.count <= 16_384, !info.identity.pathBytes.contains(0),
-                          info.identity.capturedBytes <= AtlasReaderLimits.captureBytes else {
+                          info.identity.capturedBytes <= AtlasReaderLimits.captureBytes,
+                          offset <= info.identity.capturedBytes else {
                         throw AtlasReaderError.invalidResponse
                     }
                     guard !flag.isCanceled else { throw AtlasReaderError.canceled }
@@ -196,7 +220,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
                     try request.validate(capturedBytes: info.identity.capturedBytes)
                     let page = try AtlasReaderPage.decode(
                         next.transport.window(next.handle, offset, request.byteLimit), info: info, request: request)
-                    return (info, page)
+                    return (info, AtlasReaderRetainedPage(page: page, request: request))
                 }
             }, onCancel: { flag.cancel(); next.cancel() })
             try Task.checkCancellation()

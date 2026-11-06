@@ -6,52 +6,19 @@
 
 use std::{mem::size_of, sync::Arc};
 use fcb_core::{DocumentGeneration, DocumentId};
-use fcb::document::reader::{DocumentReadError, DocumentReadOptions, DocumentReader};
-use fcb::source::{CompleteCapture, SourceError, path::decode_uri_component_bytes};
-use super::{AcceptedRelationships, AppError, ByteLength, ByteRange, CaptureRequest,
-    FileId, Link, MAX_DOCUMENT_LINK_DESTINATION_BYTES, MAX_DOCUMENT_LINK_SOURCE_BYTES,
+use fcb::document::reader::DocumentReadError;
+use fcb::source::CompleteCapture;
+use crate::host::document_fragment::{self, QualifiedDocumentFragments};
+pub(in crate::host::saved_repository) use crate::host::document_fragment::FragmentResolution;
+use super::{AcceptedRelationships, AppError, ByteLength, CaptureRequest,
+    FileId, Link, MAX_DOCUMENT_LINK_SOURCE_BYTES,
     Output, OutputError, PagedCapture, PagedMemberData, ReaderSessionError, Resolution,
     SavedRelationshipError, SavedRepositoryError, SavedRepositorySession, SourceRevision,
     check, markdown, member_id};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::host::saved_repository) enum FragmentResolution {
-    None, DocumentStart, Resolved(ByteRange), MissingHeading, Ambiguous,
-    Limited, Unsupported, Invalid, Unresolved,
-}
-impl FragmentResolution {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::None => "none", Self::DocumentStart => "document-start",
-            Self::Resolved(_) => "resolved", Self::MissingHeading => "missing-heading",
-            Self::Ambiguous => "ambiguous", Self::Limited => "limited",
-            Self::Unsupported => "unsupported", Self::Invalid => "invalid", Self::Unresolved => "unresolved",
-        }
-    }
-    pub const fn range(self) -> Option<ByteRange> {
-        match self { Self::Resolved(range) => Some(range), _ => None }
-    }
-}
-
 pub(super) fn prepare_fragment(resolution: Resolution, suffix: &str)
     -> Result<(FragmentResolution, Option<String>), SavedRelationshipError> {
-    let Some((_, encoded)) = suffix.split_once('#') else { return Ok((FragmentResolution::None, None)); };
-    if encoded.is_empty() {
-        return Ok((if resolution == Resolution::Captured { FragmentResolution::DocumentStart }
-            else { FragmentResolution::Unresolved }, None));
-    }
-    let bytes = match decode_uri_component_bytes(encoded, MAX_DOCUMENT_LINK_DESTINATION_BYTES) {
-        Ok(bytes) => bytes,
-        Err(SourceError::PayloadTooLarge) => return Err(AppError::Admission.into()),
-        Err(_) => return Ok((FragmentResolution::Invalid, None)),
-    };
-    let slug = match String::from_utf8(bytes) {
-        Ok(slug) if !slug.chars().any(char::is_control) => slug,
-        _ => return Ok((FragmentResolution::Invalid, None)),
-    };
-    // This is only the decoded identity requested by the URL, never a slug
-    // synthesized from a heading title. Qualification happens below.
-    Ok((FragmentResolution::Unresolved, Some(slug)))
+    Ok(document_fragment::prepare_fragment(resolution == Resolution::Captured, suffix)?)
 }
 
 pub(super) fn encode_fragment(out: &mut Output, link: &Link) -> Result<(), OutputError> {
@@ -133,48 +100,21 @@ impl SavedRepositorySession {
         let request = CaptureRequest::new(file, revision).map_err(|_| AppError::InvalidRange)?;
         let complete = CompleteCapture::new(request, ByteLength::new(length as u64), Arc::from(capture.bytes()))
             .map_err(|_| AppError::InvalidRange)?;
-        let options = DocumentReadOptions { max_source_bytes: MAX_DOCUMENT_LINK_SOURCE_BYTES, ..DocumentReadOptions::default() };
-        let reader = match DocumentReader::prepare(&complete, id, generation, options, &self.budget, layout_id, &mut *canceled) {
-            Ok(reader) => reader,
-            Err(DocumentReadError::SourceLimit | DocumentReadError::EngineBudget | DocumentReadError::ResourceDenied) => {
-                set_resolution(candidate, links, FragmentResolution::Limited); return Ok(());
-            }
-            Err(DocumentReadError::InvalidUtf8 | DocumentReadError::InvalidOutput | DocumentReadError::EngineFailure) => {
-                set_resolution(candidate, links, FragmentResolution::Unsupported); return Ok(());
-            }
-            Err(DocumentReadError::Canceled) => return Err(SavedRepositoryError::Canceled.into()),
-            Err(error) => return Err(ReaderSessionError::Document(error).into()),
-        };
-        match reader.qualify_heading_source_ranges(&self.budget, provenance_id, &mut *canceled) {
-            Ok(()) => (),
-            Err(DocumentReadError::EngineBudget | DocumentReadError::ResourceDenied) => {
-                set_resolution(candidate, links, FragmentResolution::Limited); return Ok(());
-            }
-            Err(DocumentReadError::InvalidOutput) => {
-                set_resolution(candidate, links, FragmentResolution::Unsupported); return Ok(());
-            }
-            Err(DocumentReadError::Canceled) => return Err(SavedRepositoryError::Canceled.into()),
-            Err(error) => return Err(ReaderSessionError::Document(error).into()),
-        }
+        let qualified = QualifiedDocumentFragments::prepare(&complete, id, generation,
+            &self.budget, [layout_id, provenance_id], &mut *canceled).map_err(fragment_error)?;
         for &id in links {
             check(canceled)?;
             let link = &mut candidate.links[id];
             let slug = link.fragment_slug.as_deref().ok_or(SavedRelationshipError::UnresolvedTarget)?;
-            // The upstream identity is authoritative, including its duplicate
-            // suffixes. Refuse a collision instead of picking the first heading.
-            let mut matches = reader.headings().iter().filter(|heading| heading.slug == slug);
-            link.fragment = match (matches.next(), matches.next()) {
-                (None, _) => FragmentResolution::MissingHeading,
-                (Some(_), Some(_)) => FragmentResolution::Ambiguous,
-                (Some(heading), None) => {
-                    let range = reader.original_span(heading.source_span).map_err(ReaderSessionError::Document)?;
-                    if range.start() == range.end() { FragmentResolution::Unsupported }
-                    else { FragmentResolution::Resolved(range) }
-                }
-            };
+            link.fragment = qualified.resolve(slug, &mut *canceled).map_err(fragment_error)?;
         }
         Ok(())
     }
+}
+
+fn fragment_error(error: DocumentReadError) -> SavedRelationshipError {
+    match error { DocumentReadError::Canceled => SavedRepositoryError::Canceled.into(),
+        other => ReaderSessionError::Document(other).into() }
 }
 
 fn set_resolution(candidate: &mut AcceptedRelationships, links: &[usize], resolution: FragmentResolution) {

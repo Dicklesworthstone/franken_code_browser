@@ -15,6 +15,7 @@ use fcb::document::links::{CapturedDocumentLinks, DocumentLinkError,
     MAX_DOCUMENT_LINK_DESTINATION_BYTES, MAX_DOCUMENT_LINK_SOURCE_BYTES,
     MAX_DOCUMENT_LINKS, resolve_document_destination};
 use fcb::search::CaptureRequest;
+use crate::host::document_fragment::markdown;
 use super::{ArenaOwnerId, AppError, ByteLength, FileId, HostResponse, Output,
     OutputError, PagedCapture, PagedMemberData, PagedSearchError, QueryGeneration,
     RawPath, ReaderSession, ReaderSessionError, ResourceLease, SavedRepositoryError,
@@ -410,11 +411,6 @@ fn relationship_attempt(last: &mut u64, next: u64) -> Result<(), SavedRelationsh
 fn member_id(ordinal: usize) -> Result<u64, SavedRelationshipError> {
     u64::try_from(ordinal).ok().and_then(|n| n.checked_add(1))
         .ok_or(SavedRepositoryError::IdentityExhausted.into())
-}
-fn markdown(path: &[u8]) -> bool {
-    let name = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
-    let extension = name.iter().rposition(|&b| b == b'.').map(|i| &name[i + 1..]).unwrap_or(&[]);
-    extension.eq_ignore_ascii_case(b"md") || extension.eq_ignore_ascii_case(b"markdown")
 }
 fn valid_source_path(path: &str) -> bool {
     !path.is_empty() && path.len() <= 16_384 && !path.contains('\\')

@@ -155,7 +155,9 @@ fn supplied_reader(readers: &ReaderSessions, handle: u64, label: &str, bytes: &[
 fn catalog_link_transfer_admits_destination_first_and_keeps_both_captures_independent() {
     let root = root();
     fs::write(root.join("README.md"), b"# Origin\n\n[Next](next.md#details)\n").unwrap();
-    fs::write(root.join("next.md"), b"# Details\n\nTarget before replacement.\n").unwrap();
+    let target_bytes = b"Intro.\r\n\r\n# Details\r\n\r\nTarget before replacement.\r\n";
+    let heading = target_bytes.windows(b"# Details".len()).position(|bytes| bytes == b"# Details").unwrap() as u64;
+    fs::write(root.join("next.md"), target_bytes).unwrap();
     let catalogs = CatalogSessions::new(); let handle = opened(&catalogs, &root);
     let page = catalogs.execute(handle, Command::Page { page: 1 }, || false).unwrap();
     let source_file = named_file(page.as_str(), b"README.md");
@@ -168,8 +170,15 @@ fn catalog_link_transfer_admits_destination_first_and_keeps_both_captures_indepe
     fs::write(root.join("README.md"), b"[Changed](unobserved.md)").unwrap();
     let receipt = catalogs.open_document_link(handle, &readers, origin, destination, 1, source_file, 1, 1, 4096, || false).unwrap();
     assert!(receipt.as_str().contains("\"command\":\"open-document-link\""));
-    assert!(receipt.as_str().contains("\"fragment_status\":\"not-applied\""));
+    assert!(receipt.as_str().contains("\"fragment_status\":\"resolved\""));
+    assert!(receipt.as_str().contains("\"fragment_slug\":\"details\""));
+    assert_eq!(number(receipt.as_str(), "initial_original_offset"), heading);
     assert!(receipt.as_str().contains("Target before replacement."));
+    // Fragment qualification is temporary: the target's first normal preview
+    // still owns generation 1, independently of the originating document.
+    assert!(readers.execute(destination, ReaderCommand::Info, || false).unwrap().as_str()
+        .contains("\"accepted_document_generation\":null"));
+    readers.execute(destination, ReaderCommand::Document { generation: 1, options: Default::default() }, || false).unwrap();
     fs::rename(root.join("next.md"), root.join("moved.md")).unwrap();
     assert!(matches!(catalogs.open_document_link(handle, &readers, origin, destination,
         1, source_file, 1, u64::MAX, 4096, || false), Err(AccessError::Reader(ReaderError::AlreadyOpen))));

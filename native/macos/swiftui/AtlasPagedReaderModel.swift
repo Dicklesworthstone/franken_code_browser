@@ -289,18 +289,25 @@ import Observation
     /// This permits logical link resolution without opening a caller-made path.
     func openRetained(offset: UInt64, registryDomain: UUID,
         initialize: @escaping @Sendable (UInt64) throws -> AtlasReaderInfo) async throws {
+        try Task.checkCancellation()
+        guard offset <= AtlasReaderLimits.captureBytes else { throw AtlasReaderError.unavailable }
+        try await openRetained(registryDomain: registryDomain) { handle in
+            AtlasReaderRetainedInitialization(info: try initialize(handle), initialOriginalOffset: offset)
+        }
+    }
+    func openRetained(registryDomain: UUID,
+        initialize: @escaping @Sendable (UInt64) throws -> AtlasReaderRetainedInitialization) async throws {
         guard page == nil, !busy, capturedTarget == nil, suppliedSource == nil else {
             throw AtlasReaderError.unavailable
         }
         let ticket = begin()
         notice = "Opening the exact retained capture…"
         do {
-            let opened = try await coordinator.openRetained(offset: offset,
-                registryDomain: registryDomain, initialize: initialize)
+            let opened = try await coordinator.openRetained(registryDomain: registryDomain, initialize: initialize)
             try Task.checkCancellation()
             guard operation == ticket else { throw AtlasReaderError.canceled }
             retainedOnly = true
-            install(opened, request: .window(offset: offset, bytes: AtlasReaderLimits.pageBytes))
+            install(opened.page, request: opened.request)
             finish(ticket)
             notice = "Opened the exact retained source at its saved byte location. Keep a page in the desk explicitly to update its saved position."
         } catch {
