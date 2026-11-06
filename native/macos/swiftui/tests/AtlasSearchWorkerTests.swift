@@ -42,9 +42,19 @@ private func closeRetainedReader(_ handle: UInt64) -> UInt8
             defer { freeLegacySearch(raw) }
             guard let raw else { preconditionFailure("legacy control failed") }
             let control = try AtlasSearchReport.decode(String(cString: raw))
-            precondition(actual.hits == control.hits && actual.complete == control.complete
+            // The legacy envelope has no preview or actual-spelling fields;
+            // compare its occurrence witnesses independently of that additive
+            // metadata, which receives its own production assertions below.
+            let comparable = actual.hits.map { hit in
+                var value = hit; value.excerpt = nil; value.actualText = nil; return value
+            }
+            precondition(comparable == control.hits && actual.complete == control.complete
                 && actual.truncated == control.truncated && actual.matchesSeen == control.matchesSeen,
                 "cancelable route changed source or coverage semantics")
+            precondition(actual.hits.allSatisfy {
+                AtlasSearchText.accepts(actualText: $0.actualText, needle: query, caseSensitive: true)
+                    && $0.excerpt?.matchesSourceText(query) == true
+            }, "The progressive worker must preserve exact matched spelling and captured excerpts")
             return actual
         }
         var observed: AtlasSearchReport?
@@ -106,6 +116,9 @@ private func closeRetainedReader(_ handle: UInt64) -> UInt8
             "Scope must precede candidate, byte and hit limits")
         precondition(selected!.progress?.cataloguedFiles == 2 && selected!.excludedFiles == 2,
             "Scoped coverage denominator included excluded files")
+        precondition(selected!.hits[0].excerpt?.matchesSourceText("scope-needle") == true
+            && selected!.hits[0].excerpt?.text == "scope-needle\n",
+            "The production live worker must decode captured context and its exact highlight")
         broad = nil; selected = nil; observed = nil
 
         try FileManager.default.createDirectory(at: root.appendingPathComponent("scoped/nested"), withIntermediateDirectories: true)
@@ -130,6 +143,20 @@ private func closeRetainedReader(_ handle: UInt64) -> UInt8
             }
             pump { answer != nil }
             return answer!
+        }
+        do {
+            let result = try execute(AtlasSearchInput(root: root.path, query: "needle",
+                pathScope: AtlasSearchPathScope(kind: .file, path: "utf16.txt")))
+            let excerpt = result.hits.first?.excerpt
+            precondition(result.hits.count == 1 && excerpt?.text == unicode
+                && excerpt?.originalStart == 2 && excerpt?.matchStart == 0 && excerpt?.matchEnd == 6,
+                "UTF16 context uses captured original bounds and independent decoded UTF8 highlight offsets")
+            let repeated = try execute(AtlasSearchInput(root: root.path, query: "needle",
+                pathScope: AtlasSearchPathScope(kind: .file, path: "source.rs")))
+            precondition(repeated.hits.count == 2 && repeated.hits[0].excerpt?.matchStart == 0
+                && repeated.hits[1].excerpt?.matchStart == 13
+                && repeated.hits.allSatisfy { $0.excerpt?.matchesSourceText("needle") == true },
+                "Same-file repeated text is highlighted at its own captured occurrence")
         }
         do {
             let control = try execute(AtlasSearchInput(root: root.path, query: "path-needle"))
@@ -222,6 +249,9 @@ private func closeRetainedReader(_ handle: UInt64) -> UInt8
                 && result.hits.map { $0.structure?.headingSlug } == ["deploy", "deploy-2"],
                 "Markdown query must use canonical duplicate heading slugs")
             precondition(result.hits[0].start == 3, "Heading source range must retain the UTF-8 BOM offset")
+            precondition(result.hits.allSatisfy { $0.excerpt != nil }
+                && result.hits[0].excerpt?.originalStart == 3,
+                "Structural previews retain source syntax and omit only the actual encoding BOM")
             let hit = result.hits[1]
             guard let target = result.capture?.target(hit) else {
                 preconditionFailure("Heading result lost its retained capture capability")
@@ -268,6 +298,15 @@ private func closeRetainedReader(_ handle: UInt64) -> UInt8
                 && result.hits[0].structure?.name == "A",
                 "Metadata overflow must expose omitted candidates and keep later valid heading results")
         }
-        print("AtlasSearchWorker: production off-main literal/symbol/heading search, retained original-byte activation, bounded scope/coverage, negatives and cancellation checks passed")
+        try Data(String(repeating: "K", count: 2023).utf8)
+            .write(to: root.appendingPathComponent("dense.txt"))
+        let dense = try execute(AtlasSearchInput(root: root.path, query: String(repeating: "k", count: 1024),
+            pathScope: AtlasSearchPathScope(kind: .file, path: "dense.txt"), caseSensitive: false))
+        precondition(dense.complete && dense.hits.count == 1000 && dense.hits.first?.excerpt != nil
+            && dense.hits.last?.excerpt == nil && dense.hits.last?.actualText?.utf8.count == 3072,
+            "Preview retention must not fail a valid 1000-hit result with longer original Unicode spelling")
+        precondition(dense.capture?.target(dense.hits.last!) != nil,
+            "An omitted preview cannot revoke the exact retained-source occurrence")
+        print("AtlasSearchWorker: production off-main search, bounded captured excerpts, exact activation, scope/coverage, negatives and cancellation checks passed")
     }
 }

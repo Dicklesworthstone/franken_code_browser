@@ -31,7 +31,85 @@ import Dispatch
         do { _ = try run(w); preconditionFailure("Accepted bad \(phase).\(key)") }
         catch AtlasSearchError.invalidResponse { checks += 1 }
     }
+    private static func withExcerpts(_ original: [String: Any], text: String = "x context") -> [String: Any] {
+        var value = original
+        if let rows = original["hits"] as? [[String: Any]] {
+            value["hits"] = rows.map { originalRow in
+                var row = originalRow
+                let range = row["original_range"] as! [String: String]
+                let start = UInt64(range["start"]!)!
+                row["excerpt"] = ["text": text,
+                    "original_range": ["start": String(start), "end": String(start + UInt64(text.utf8.count))],
+                    "match_utf8_range": ["start": "0", "end": "1"],
+                    "has_replacements": false, "clipped_start": start != 0, "clipped_end": true] as [String: Any]
+                return row
+            }
+        }
+        return value
+    }
     @MainActor static func main() throws {
+        do {
+            let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport)
+            f.configure { $0.hitCount = 70 }
+            f.patch { _, original in withExcerpts(original) }
+            let report = try run(w)
+            check(report.hits.count == 70 && report.hits.allSatisfy { $0.excerpt?.matched == "x" },
+                "Captured excerpts survive progressive delivery and the extra result page")
+            check(report.hits[1].excerpt?.originalStart == 2 && report.hits[1].start == 2,
+                "Repeated text in one file retains distinct occurrence coordinates")
+            var withoutPreview = report.hits[0]; withoutPreview.excerpt = nil
+            check(report.capture?.target(withoutPreview) != nil,
+                "Optional presentation context does not grant or revoke exact hit activation")
+        }
+        for defect in ["changed-context", "wrong-highlight"] {
+            let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport)
+            f.patch { phase, original in
+                let changed = phase == "query-step" && original["step_count"] as? String == "2"
+                return withExcerpts(original, text: changed ? (defect == "changed-context" ? "x altered" : "y context") : "x context")
+            }
+            do { _ = try run(w); preconditionFailure("Inconsistent indexed excerpt accepted: " + defect) }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        do {
+            let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport)
+            f.patch { _, original in
+                original["step_count"] as? String == "2" ? original : withExcerpts(original)
+            }
+            let report = try run(w)
+            check(report.complete && report.hits.allSatisfy { $0.excerpt != nil },
+                "Output-limited repeated pages may omit context without invalidating accepted results")
+        }
+        do {
+            let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport)
+            let spelling = String(repeating: "K", count: 1024)
+            f.configure { $0.hitCount = 1000; $0.insensitiveText = spelling
+                $0.insensitiveRangeBytes = 2048; $0.encoding = "utf16le" }
+            f.patch { _, original in
+                var value = original
+                if let rows = original["hits"] as? [[String: Any]] {
+                    value["hits"] = rows.map { originalRow in
+                        var row = originalRow
+                        let range = row["original_range"] as! [String: String]
+                        let start = UInt64(range["start"]!)!, end = UInt64(range["end"]!)!
+                        row["excerpt"] = ["text": spelling + " context",
+                            "original_range": ["start": String(start), "end": String(end + 16)],
+                            "match_utf8_range": ["start": "0", "end": "3072"],
+                            "has_replacements": false, "clipped_start": start != 0,
+                            "clipped_end": true] as [String: Any]
+                        return row
+                    }
+                }
+                return value
+            }
+            let report = try run(w, query: String(repeating: "k", count: 1024), caseSensitive: false)
+            check(report.complete && report.hits.count == 1000 && report.hits.first?.excerpt != nil
+                && report.hits.last?.excerpt == nil,
+                "Optional excerpt retention cannot starve a full page set of valid long-spelling witnesses")
+            check(report.capture?.target(report.hits.last!)?.needle.utf8.elementsEqual(spelling.utf8) == true,
+                "A result without retained preview still activates its exact original spelling")
+            check(report.hits.compactMap(\.excerpt).reduce(0) { $0 + $1.retainedByteCount + 256 }
+                <= AtlasSearchRetention.excerptBytes, "Indexed previews stay within their separate fixed allowance")
+        }
         do {
             let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport), reports = IndexReports()
             f.configure { $0.hitCount = 70 }

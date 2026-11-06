@@ -26,6 +26,9 @@ pub use structure::{AtlasStructureMode, AtlasStructureOptions, MAX_ATLAS_STRUCTU
 use structure::{StructureQuery, StructureRow};
 mod text_matching;
 use text_matching::{matched_text_capacity, retained_text_bytes};
+mod excerpt;
+use excerpt::Excerpts;
+pub use excerpt::{MAX_ATLAS_EXCERPT_SOURCE_BYTES, MAX_ATLAS_EXCERPT_TEXT_BYTES};
 
 use std::{mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, ByteRange, FileId, SourceRevision};
@@ -133,7 +136,8 @@ struct Snapshot {
     hits: Vec<AtlasSearchHit>,
     // Unicode lowercase hits retain their original decoded spelling by stable
     // occurrence ordinal. Exact text reuses needle; structural rows use their
-    // own metadata. No source decoding or string creation is needed by paging.
+    // own metadata. Retained spelling also verifies optional source context
+    // without repeating the query or inventing another matching engine.
     matched_texts: Vec<String>,
     matched_text_capacity: usize,
     diagnostics: Vec<Unavailable>,
@@ -259,17 +263,20 @@ impl RetainedAtlasSearch {
         Ok(response)
     }
 
-    /// Paging never reads a source or recomputes a query. Running-query pages
-    /// are explicitly provisional; next_offset=null means end of currently
-    /// retained rows, not proof that no later step can append another hit.
+    /// Paging uses retained captures, including bounded decoded excerpts, and
+    /// never reopens a live path or recomputes a query. Running-query pages are
+    /// explicitly provisional; next_offset=null means end of currently retained
+    /// rows, not proof that no later step can append another hit.
     pub fn page(&mut self, atlas: &AtlasSession, generation: u64, start: usize, limit: usize,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         self.validate(atlas)?; check(&mut canceled)?;
         if !(1..=MAX_ATLAS_SEARCH_PAGE).contains(&limit) { return Err(AtlasSearchError::InvalidLimits); }
         let mut out = self.output(atlas, "page")?;
+        let allocations = self.excerpt_ids(limit)?;
         let snapshot = self.snapshot(generation)?;
         if start > snapshot.hits.len() { return Err(AtlasSearchError::InvalidLimits); }
-        encode_page(&mut out, atlas, snapshot, start, limit, &mut canceled)?;
+        let mut excerpts = Excerpts::new(&self.budget, allocations);
+        encode_page(&mut out, atlas, snapshot, start, limit, &mut excerpts, &mut canceled)?;
         let partial = !snapshot.complete;
         self.finish(atlas, out, partial, &mut canceled)
     }
@@ -340,6 +347,7 @@ impl RetainedAtlasSearch {
         if reader_owner == self.manifest.owner() { return Err(AtlasSearchError::WrongAtlas); }
         let hit = self.hit(atlas, generation, id)?;
         let mut out = self.output(atlas, "open-reader")?;
+        let allocations = self.excerpt_ids(1)?;
         let snapshot = self.snapshot(generation)?;
         let source = &snapshot.files[hit.source_slot].capture;
         let entry = atlas.atlas().catalog().entry(hit.file).ok_or(AtlasSearchError::WrongAtlas)?;
@@ -360,11 +368,24 @@ impl RetainedAtlasSearch {
         out.integer(reader_owner.get())?;
         out.literal(",\"reader\":")?; out.literal(info.as_str())?;
         out.literal(",\"window\":")?; out.literal(window.as_str())?;
+        let mut excerpts = Excerpts::new(&self.budget, allocations);
+        excerpts.admit_extra(out.remaining_bytes().saturating_sub(2));
+        encode_excerpt(&mut out, snapshot, hit, &mut excerpts, &mut canceled)?;
         out.literal("}\n")?;
         let response = self.finish(atlas, out, false, &mut canceled)?;
         Ok((reader, response))
     }
 
+    /// Reserve non-reused identity slots before borrowing the retained query.
+    /// Unused optional excerpt allocations remain skipped, never recycled.
+    fn excerpt_ids(&mut self, max_hits: usize) -> Result<std::ops::Range<u64>, AtlasSearchError> {
+        let count = u64::try_from(max_hits).ok().and_then(|n| n.checked_mul(2))
+            .ok_or(AtlasSearchError::IdentityExhausted)?;
+        let first = self.next_allocation;
+        let next = first.checked_add(count).ok_or(AtlasSearchError::IdentityExhausted)?;
+        self.next_allocation = next;
+        Ok(first..next)
+    }
     fn next_id(&mut self) -> Result<ResourceAllocationId, AtlasSearchError> {
         let value = self.next_allocation;
         self.next_allocation = value.checked_add(1).ok_or(AtlasSearchError::IdentityExhausted)?;
@@ -430,11 +451,24 @@ fn summary(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot) -> Resul
     Ok(())
 }
 fn encode_page(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot, start: usize,
-    limit: usize, canceled: &mut impl FnMut() -> bool) -> Result<(), AtlasSearchError> {
+    limit: usize, excerpts: &mut Excerpts<'_>, canceled: &mut impl FnMut() -> bool)
+    -> Result<(), AtlasSearchError> {
+    // Size the complete required envelope before admitting optional context.
+    // This pass performs only metadata encoding; the bounded decoder runs once
+    // per returned row on the second pass. Existing capacity covers both passes.
+    let checkpoint = out.checkpoint();
+    encode_page_body(out, atlas, snapshot, start, limit, None, canceled)?;
+    excerpts.admit_extra(out.remaining_bytes());
+    out.restore(checkpoint)?;
+    encode_page_body(out, atlas, snapshot, start, limit, Some(excerpts), canceled)
+}
+fn encode_page_body(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot, start: usize,
+    limit: usize, mut excerpts: Option<&mut Excerpts<'_>>, canceled: &mut impl FnMut() -> bool)
+    -> Result<(), AtlasSearchError> {
     summary(out, atlas, snapshot)?;
     // Displayed rows follow the active display scope; hit IDs remain stable
-    // and summary counts describe the frozen query scope. Both passes are
-    // metadata-only catalog lookups; no source is read or parsed here.
+    // and summary counts describe the frozen query scope. Finding displayed
+    // membership uses only the catalog; context decoding is bounded per row.
     let displayed_total = snapshot.hits.iter()
         .filter(|hit| atlas.scope_matches_file(hit.file)).count();
     let window_end = start.saturating_add(limit).min(displayed_total);
@@ -453,7 +487,11 @@ fn encode_page(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot, star
         if displayed >= start && displayed < window_end {
             if emitted > 0 { out.literal(",")?; }
             out.literal("{\"hit_id\":")?; out.integer(hit.id)?;
-            encode_hit(out, atlas, snapshot, hit)?; out.literal("}")?;
+            encode_hit(out, atlas, snapshot, hit)?;
+            if let Some(excerpts) = excerpts.as_deref_mut() {
+                encode_excerpt(out, snapshot, hit, excerpts, canceled)?;
+            }
+            out.literal("}")?;
             emitted += 1;
         }
         displayed += 1;
@@ -491,19 +529,27 @@ fn encode_hit(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot,
         let position = hit.id.checked_sub(1).and_then(|id| usize::try_from(id).ok())
             .ok_or(AtlasSearchError::MissingHit)?;
         snapshot.structure_rows.get(position).ok_or(AtlasSearchError::MissingHit)?.encode(out)?;
-    } else {
-        let matched = if snapshot.scope.case_sensitive() { snapshot.needle.as_str() } else {
-            let position = hit.id.checked_sub(1).and_then(|id| usize::try_from(id).ok())
-                .ok_or(AtlasSearchError::MissingHit)?;
-            let text = snapshot.matched_texts.get(position).ok_or(AtlasSearchError::MissingHit)?;
-            if text.is_empty() || text.capacity() > snapshot.matched_text_capacity {
-                return Err(AtlasSearchError::WrongAtlas);
-            }
-            text.as_str()
-        };
+    } else if let Some(matched) = matched_text(snapshot, hit)? {
         out.literal(",\"matched_text\":")?; out.quoted(matched)?;
     }
     Ok(())
+}
+fn matched_text(snapshot: &Snapshot, hit: AtlasSearchHit) -> Result<Option<&str>, AtlasSearchError> {
+    if snapshot.structure.is_some() { return Ok(None); }
+    if snapshot.scope.case_sensitive() { return Ok(Some(&snapshot.needle)); }
+    let position = hit.id.checked_sub(1).and_then(|id| usize::try_from(id).ok())
+        .ok_or(AtlasSearchError::MissingHit)?;
+    let text = snapshot.matched_texts.get(position).ok_or(AtlasSearchError::MissingHit)?;
+    if text.is_empty() || text.capacity() > snapshot.matched_text_capacity {
+        return Err(AtlasSearchError::WrongAtlas);
+    }
+    Ok(Some(text))
+}
+fn encode_excerpt(out: &mut Output, snapshot: &Snapshot, hit: AtlasSearchHit,
+    excerpts: &mut Excerpts<'_>, canceled: &mut impl FnMut() -> bool) -> Result<(), AtlasSearchError> {
+    let source = snapshot.files.get(hit.source_slot).ok_or(AtlasSearchError::MissingHit)?;
+    excerpts.field(out, &source.capture, snapshot.generation, hit.original_range,
+        matched_text(snapshot, hit)?, canceled)
 }
 fn check(canceled: &mut impl FnMut() -> bool) -> Result<(), AtlasSearchError> {
     if canceled() { Err(AtlasSearchError::Canceled) } else { Ok(()) }

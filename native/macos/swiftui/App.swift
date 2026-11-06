@@ -2318,6 +2318,16 @@ struct HitRow: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                if let excerpt = hit.excerpt {
+                    (Text(verbatim: excerpt.leading).foregroundColor(.secondary)
+                        + Text(verbatim: excerpt.matched).bold().foregroundColor(.primary)
+                        + Text(verbatim: excerpt.trailing).foregroundColor(.secondary))
+                        .font(.system(size: 11, design: .monospaced))
+                        .lineLimit(3)
+                        .help(excerpt.hasReplacements
+                            ? "Captured source context includes decoding replacements."
+                            : "Captured source context; line breaks are shown as ↵ and tabs as ⇥.")
+                }
                 if !availability.label.isEmpty {
                     Text(availability.label).font(.caption2).foregroundStyle(.secondary)
                 }

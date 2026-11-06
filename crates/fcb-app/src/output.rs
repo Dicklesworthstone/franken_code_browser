@@ -47,6 +47,19 @@ impl Output {
     }
     pub fn as_bytes(&self) -> &[u8] { &self.bytes }
     pub fn clear(&mut self) { self.bytes.clear(); }
+    /// A private encoding checkpoint retains the already admitted capacity.
+    /// Restoring a valid UTF-8 prefix also works after a failed append left an
+    /// incomplete field or scalar in the candidate document.
+    pub(crate) fn checkpoint(&self) -> usize { self.bytes.len() }
+    pub(crate) fn remaining_bytes(&self) -> usize { self.limit - self.bytes.len() }
+    pub(crate) fn restore(&mut self, checkpoint: usize) -> Result<(), OutputError> {
+        if checkpoint > self.bytes.len()
+            || std::str::from_utf8(&self.bytes[..checkpoint]).is_err() {
+            return Err(OutputError::Limit);
+        }
+        self.bytes.truncate(checkpoint);
+        Ok(())
+    }
     pub(crate) fn literal(&mut self, text: &str) -> Result<(), OutputError> { self.append(text.as_bytes()) }
     fn append(&mut self, bytes: &[u8]) -> Result<(), OutputError> {
         if bytes.len() > self.limit - self.bytes.len() { return Err(OutputError::Limit); }
@@ -188,6 +201,33 @@ mod tests {
         assert_eq!(out.literal("5"), Err(OutputError::Limit));
         assert_eq!(out.as_bytes(), b"1234");
         out.clear(); out.literal("ok").unwrap();
+    }
+    #[test]
+    fn checkpoints_preserve_prefix_capacity_and_reject_split_scalars() {
+        let mut out = output(12);
+        out.literal("a😀b").unwrap();
+        assert_eq!(out.checkpoint(), 6);
+        assert_eq!(out.remaining_bytes(), 6);
+        assert_eq!(out.restore(2), Err(OutputError::Limit));
+        assert_eq!(out.as_bytes(), "a😀b".as_bytes());
+        assert_eq!(out.restore(7), Err(OutputError::Limit));
+        assert_eq!(out.as_bytes(), "a😀b".as_bytes());
+        out.restore(1).unwrap();
+        assert_eq!(out.remaining_bytes(), 11);
+        out.literal("12345678901").unwrap();
+        assert_eq!(out.remaining_bytes(), 0);
+    }
+    #[test]
+    fn checkpoint_restores_a_candidate_after_partial_utf8_output_failure() {
+        let mut out = output(5);
+        out.literal("a").unwrap();
+        let checkpoint = out.checkpoint();
+        assert_eq!(out.quoted("😀"), Err(OutputError::Limit));
+        assert!(std::str::from_utf8(out.as_bytes()).is_err());
+        out.restore(checkpoint).unwrap();
+        assert_eq!(out.as_bytes(), b"a");
+        assert_eq!(out.remaining_bytes(), 4);
+        out.literal("1234").unwrap();
     }
     struct Slow { bytes: Vec<u8>, stop: usize }
     impl Write for Slow {

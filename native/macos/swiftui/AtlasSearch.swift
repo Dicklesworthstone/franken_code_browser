@@ -13,8 +13,110 @@ struct SearchHit: Identifiable, Hashable, Sendable {
     /// Engine-supplied source spelling. This authorizes an exact retained-file
     /// Find after a case-insensitive workspace query; it is never normalized.
     var actualText: String? = nil
+    /// Bounded presentation from this hit's retained capture. Navigation still
+    /// uses the occurrence identity and original range, never this preview.
+    var excerpt: AtlasSearchExcerpt? = nil
     var fileName: String { (path as NSString).lastPathComponent }
     var folder: String { (path as NSString).deletingLastPathComponent }
+}
+
+struct AtlasSearchExcerpt: Hashable, Sendable {
+    static let maximumBytes = 8192
+    let text: String
+    let originalStart, originalEnd, matchStart, matchEnd: UInt64
+    let hasReplacements, clippedStart, clippedEnd: Bool
+    /// Prepared on the worker so drawing a row never scans source context.
+    let leading, matched, trailing: String
+    let retainedByteCount: Int
+
+    fileprivate init(text: String, originalStart: UInt64, originalEnd: UInt64,
+                     matchStart: UInt64, matchEnd: UInt64, before: String,
+                     match: String, after: String, hasReplacements: Bool,
+                     clippedStart: Bool, clippedEnd: Bool) {
+        self.text = text; self.originalStart = originalStart; self.originalEnd = originalEnd
+        self.matchStart = matchStart; self.matchEnd = matchEnd
+        self.hasReplacements = hasReplacements; self.clippedStart = clippedStart; self.clippedEnd = clippedEnd
+        func lineBreaks(_ value: String) -> String {
+            value.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+        }
+        func visible(_ value: String) -> String {
+            lineBreaks(value).replacingOccurrences(of: "\n", with: " ↵ ")
+                .replacingOccurrences(of: "\t", with: "⇥").replacingOccurrences(of: "\0", with: "␀")
+        }
+        let prefixLine = lineBreaks(before).components(separatedBy: "\n").last ?? ""
+        let suffixLine = lineBreaks(after).components(separatedBy: "\n").first ?? ""
+        let prefix = String(prefixLine.suffix(48)), suffix = String(suffixLine.prefix(80))
+        let middle = String(match.prefix(256))
+        leading = (clippedStart || !prefix.utf8.elementsEqual(before.utf8) ? "…" : "") + visible(prefix)
+        matched = visible(middle) + (middle.utf8.elementsEqual(match.utf8) ? "" : "…")
+        trailing = visible(suffix) + (clippedEnd || !suffix.utf8.elementsEqual(after.utf8) ? "…" : "")
+        retainedByteCount = text.utf8.count + leading.utf8.count + matched.utf8.count + trailing.utf8.count
+    }
+    static func == (a: Self, b: Self) -> Bool {
+        a.originalStart == b.originalStart && a.originalEnd == b.originalEnd
+            && a.matchStart == b.matchStart && a.matchEnd == b.matchEnd
+            && a.hasReplacements == b.hasReplacements && a.clippedStart == b.clippedStart
+            && a.clippedEnd == b.clippedEnd && a.text.utf8.elementsEqual(b.text.utf8)
+    }
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(originalStart); hasher.combine(originalEnd)
+        hasher.combine(matchStart); hasher.combine(matchEnd)
+        hasher.combine(hasReplacements); hasher.combine(clippedStart); hasher.combine(clippedEnd)
+        for byte in text.utf8 { hasher.combine(byte) }
+    }
+    func matchesSourceText(_ sourceText: String) -> Bool {
+        text.utf8.dropFirst(Int(matchStart)).prefix(Int(matchEnd - matchStart))
+            .elementsEqual(sourceText.utf8)
+    }
+}
+
+/// Mandatory occurrence witnesses retain their existing allowance. Optional
+/// preview text has its own fixed allowance so it can never starve exact hits.
+/// These are retained-text bounds, not a total or peak process-memory claim.
+enum AtlasSearchRetention {
+    static let witnessBytes = 8 * 1024 * 1024
+    static let excerptBytes = 2 * 1024 * 1024
+}
+
+/// The shared Rust decoder proves original-byte mappings. Native validation
+/// checks the bounded receipt and exact spelling without inventing a decoder.
+struct AtlasSearchExcerptWire: Decodable, Equatable {
+    struct Range: Decodable, Equatable { let start, end: String }
+    let text: String
+    let original_range, match_utf8_range: Range
+    let has_replacements, clipped_start, clipped_end: Bool
+
+    func validated(hitStart: UInt64, hitEnd: UInt64, capturedBytes: UInt64,
+                   actualText: String?) throws -> AtlasSearchExcerpt {
+        func number(_ text: String) throws -> UInt64 {
+            guard let value = UInt64(text), String(value) == text else { throw AtlasSearchError.invalidResponse }
+            return value
+        }
+        let start = try number(original_range.start), end = try number(original_range.end)
+        let lower = try number(match_utf8_range.start), upper = try number(match_utf8_range.end)
+        let count = text.utf8.count
+        guard start <= hitStart, hitStart < hitEnd, hitEnd <= end, end <= capturedBytes,
+              end - start <= UInt64(AtlasSearchExcerpt.maximumBytes),
+              count <= AtlasSearchExcerpt.maximumBytes, lower < upper, upper <= UInt64(count),
+              (clipped_start ? start > 0 : start <= 3), clipped_end == (end < capturedBytes) else {
+            throw AtlasSearchError.invalidResponse
+        }
+        let bytes = Array(text.utf8), from = Int(lower), to = Int(upper)
+        guard let before = String(bytes: bytes[..<from], encoding: .utf8),
+              let match = String(bytes: bytes[from..<to], encoding: .utf8),
+              let after = String(bytes: bytes[to...], encoding: .utf8),
+              actualText == nil || match.utf8.elementsEqual(actualText!.utf8) else {
+            throw AtlasSearchError.invalidResponse
+        }
+        return AtlasSearchExcerpt(text: text, originalStart: start, originalEnd: end,
+            matchStart: lower, matchEnd: upper, before: before, match: match, after: after,
+            hasReplacements: has_replacements, clippedStart: clipped_start, clippedEnd: clipped_end)
+    }
+    static func == (a: Self, b: Self) -> Bool {
+        a.original_range == b.original_range && a.match_utf8_range == b.match_utf8_range
+            && a.has_replacements == b.has_replacements && a.clipped_start == b.clipped_start
+            && a.clipped_end == b.clipped_end && a.text.utf8.elementsEqual(b.text.utf8)
+    }
 }
 
 /// Search boundary checks only. Matching and Unicode lowercase policy remain

@@ -134,6 +134,18 @@ preserves its original bytes. Workspace queries remain limited to 1024 UTF-8
 bytes; the retained reader accepts up to 4096 bytes so that a short lowercase
 query can activate a longer original Unicode spelling.
 
+Search rows also show bounded source context from the same retained capture,
+with the exact matched span emphasized. This applies to live and captured-index
+text search and to symbol and Markdown-heading results. Compact rows mark line
+breaks with `↵`, tabs with `⇥`, and omitted context with `…`; they retain the
+original source spelling and byte ranges for navigation. Excerpts use at most
+8192 original bytes and 8192 decoded UTF-8 bytes. An unavailable or unrepresentable
+excerpt leaves the exact result usable, and no excerpt rereads the live path.
+Native accumulation preserves the existing 8 MiB allowance for mandatory hit
+witnesses and admits up to 2 MiB of optional excerpt text and prepared fragments.
+Excerpts that do not fit are omitted while the exact hits remain available;
+these retained-text limits do not describe total or peak process memory.
+
 The host, actual C-boundary, and native transport regression suites cover both
 case choices, retained-index reuse, stale responses, spelling validation,
 capture replacement, and Unicode source navigation. These are code-first

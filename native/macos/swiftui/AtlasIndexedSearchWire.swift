@@ -76,7 +76,7 @@ struct AtlasIndexedBasis: Sendable, Equatable {
 }
 
 struct AtlasIndexedHit: Decodable, Sendable, Equatable {
-    let hit: SearchHit
+    var hit: SearchHit
     let file, revision: UInt64
     let pathHex: String
     let rawPathBytes: [UInt8]
@@ -110,15 +110,25 @@ struct AtlasIndexedHit: Decodable, Sendable, Equatable {
                   $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46])
               }) else { throw AtlasIndexWire.invalid() }
         rawPathBytes = raw
+        let excerpt = try wire.fields.decodeIfPresent(AtlasSearchExcerptWire.self,
+            forKey: AtlasIndexWire.Key("excerpt"))?.validated(hitStart: start, hitEnd: end,
+                capturedBytes: bytes, actualText: actualText)
         hit = SearchHit(id: Int(ordinal - 1), path: display, sourcePath: String(bytes: raw, encoding: .utf8),
-            start: start, end: end, captureSHA256: digest, captureByteLength: bytes, actualText: actualText)
+            start: start, end: end, captureSHA256: digest, captureByteLength: bytes,
+            actualText: actualText, excerpt: excerpt)
     }
     static func == (a: Self, b: Self) -> Bool {
-        a.file == b.file && a.revision == b.revision && a.pathHex == b.pathHex && a.hit.id == b.hit.id
-            && a.hit.start == b.hit.start && a.hit.end == b.hit.end
-            && a.hit.captureSHA256 == b.hit.captureSHA256 && a.hit.captureByteLength == b.hit.captureByteLength
-            && a.hit.path.utf8.elementsEqual(b.hit.path.utf8)
-            && AtlasSearchText.sameActualText(a.hit.actualText, b.hit.actualText)
+        a.sameWitness(as: b) && a.hit.excerpt == b.hit.excerpt
+    }
+    private func sameWitness(as other: Self) -> Bool {
+        file == other.file && revision == other.revision && pathHex == other.pathHex && hit.id == other.hit.id
+            && hit.start == other.hit.start && hit.end == other.hit.end
+            && hit.captureSHA256 == other.hit.captureSHA256 && hit.captureByteLength == other.hit.captureByteLength
+            && hit.path.utf8.elementsEqual(other.hit.path.utf8)
+            && AtlasSearchText.sameActualText(hit.actualText, other.hit.actualText)
+    }
+    func repeats(_ old: Self) -> Bool {
+        sameWitness(as: old) && (hit.excerpt == nil || old.hit.excerpt == nil || hit.excerpt == old.hit.excerpt)
     }
     func matches(_ other: SearchHit) -> Bool {
         hit.id == other.id && hit.start == other.start && hit.end == other.end
@@ -197,7 +207,8 @@ struct AtlasIndexedQueryPage {
         }
         hits = try w.rows("hits", limit: command == "page" ? 128 : 64)
         guard hits.allSatisfy({ scope.admitsRawPath($0.rawPathBytes) && pathScope.admitsRawPath($0.rawPathBytes)
-            && AtlasSearchText.accepts(actualText: $0.hit.actualText, needle: needle, caseSensitive: caseSensitive) }) else {
+            && AtlasSearchText.accepts(actualText: $0.hit.actualText, needle: needle, caseSensitive: caseSensitive)
+            && ($0.hit.excerpt?.matchesSourceText($0.hit.actualText ?? needle) != false) }) else {
             throw AtlasIndexWire.invalid()
         }
         next = try w.optionalNumber("next_offset")
@@ -216,6 +227,7 @@ struct AtlasIndexedAccumulator {
     private(set) var hits: [AtlasIndexedHit] = []
     private var byFile: [UInt64: AtlasIndexedHit] = [:]
     private var textBytes = 0
+    private var excerptBytes = 0
     let id = UUID()
     mutating func head(_ page: AtlasIndexedQueryPage, basis: AtlasIndexedBasis) throws {
         let n = page.state
@@ -241,7 +253,7 @@ struct AtlasIndexedAccumulator {
             let at = start + offset
             guard row.hit.id == at else { throw AtlasIndexWire.invalid() }
             if at < hits.count {
-                guard row == hits[at] else { throw AtlasIndexWire.invalid() }
+                guard row.repeats(hits[at]) else { throw AtlasIndexWire.invalid() }
             } else {
                 guard at == hits.count, hits.count < 1000 else { throw AtlasIndexWire.invalid() }
                 if let previous = byFile[row.file] {
@@ -252,8 +264,14 @@ struct AtlasIndexedAccumulator {
                 let charge = row.pathHex.utf8.count + row.rawPathBytes.count
                     + 2 * row.hit.path.utf8.count + (row.hit.sourcePath?.utf8.count ?? 0)
                     + 2 * (row.hit.actualText?.utf8.count ?? 0) + 512
-                guard charge <= 8 * 1024 * 1024 - textBytes else { throw AtlasIndexWire.invalid() }
-                textBytes += charge; byFile[row.file] = row; hits.append(row)
+                guard charge <= AtlasSearchRetention.witnessBytes - textBytes else { throw AtlasIndexWire.invalid() }
+                var admitted = row
+                if let excerpt = row.hit.excerpt {
+                    let charge = excerpt.retainedByteCount + 256
+                    if charge <= AtlasSearchRetention.excerptBytes - excerptBytes { excerptBytes += charge }
+                    else { admitted.hit.excerpt = nil }
+                }
+                textBytes += charge; byFile[row.file] = admitted; hits.append(admitted)
             }
         }
     }

@@ -191,6 +191,14 @@ private struct SearchWireHit: Decodable, Equatable {
     let path: SearchWirePath
     let structure: SearchWireStructure?
     let matched_text: String?
+    var excerpt: AtlasSearchExcerptWire?
+    func repeats(_ old: Self) -> Bool {
+        hit_id == old.hit_id && file_id == old.file_id && source_revision == old.source_revision
+            && capture_sha256 == old.capture_sha256 && capture_byte_length == old.capture_byte_length
+            && original_range == old.original_range && path == old.path && structure == old.structure
+            && AtlasSearchText.sameActualText(matched_text, old.matched_text)
+            && (excerpt == nil || old.excerpt == nil || excerpt == old.excerpt)
+    }
 }
 private struct SearchWireStructure: Decodable, Equatable {
     let name, kind, language, candidate_id, evidence_level: String
@@ -218,6 +226,7 @@ private struct SearchStream {
     private var hits: [SearchHit] = []
     private var files: [String: SearchWireHit] = [:]
     private var retainedTextBytes = 0
+    private var retainedExcerptBytes = 0
     init(query: String, scope: AtlasSearchFileScope, pathScope: AtlasSearchPathScope,
          mode: AtlasSearchMode, nameMode: AtlasSearchNameMode, caseSensitive: Bool = true) {
         self.query = query; self.scope = scope; self.pathScope = pathScope
@@ -266,12 +275,14 @@ private struct SearchStream {
             let position = start + offset
             guard try number(wire.hit_id) == UInt64(position + 1) else { throw invalid() }
             if position < hits.count {
-                guard wire == wireHits[position],
-                      AtlasSearchText.sameActualText(wire.matched_text, wireHits[position].matched_text) else { throw invalid() }
+                // Output admission may omit optional context on one response.
+                // If both previews are present, their captured bytes must agree.
+                guard wire.repeats(wireHits[position]) else { throw invalid() }
                 continue
             }
             guard position == hits.count, hits.count < 1000 else { throw invalid() }
-            let hit = try decode(wire, position: position)
+            var hit = try decode(wire, position: position)
+            var retainedWire = wire
             if let previous = files[wire.file_id] {
                 guard wire.source_revision == previous.source_revision, wire.path.hex == previous.path.hex,
                       wire.capture_sha256 == previous.capture_sha256,
@@ -279,10 +290,18 @@ private struct SearchStream {
             }
             let charge = wire.path.hex.utf8.count + 2 * wire.path.display.utf8.count
                 + (hit.sourcePath?.utf8.count ?? 0) + 2 * (hit.actualText?.utf8.count ?? 0) + 512
-            guard charge <= 8 * 1024 * 1024 - retainedTextBytes else { throw invalid() }
+            guard charge <= AtlasSearchRetention.witnessBytes - retainedTextBytes else { throw invalid() }
             retainedTextBytes += charge
-            files[wire.file_id] = wire
-            wireHits.append(wire)
+            if let excerpt = hit.excerpt {
+                let previewCharge = excerpt.retainedByteCount + (wire.excerpt?.text.utf8.count ?? 0) + 256
+                if previewCharge <= AtlasSearchRetention.excerptBytes - retainedExcerptBytes {
+                    retainedExcerptBytes += previewCharge
+                } else {
+                    hit.excerpt = nil; retainedWire.excerpt = nil
+                }
+            }
+            files[wire.file_id] = retainedWire
+            wireHits.append(retainedWire)
             hits.append(hit)
         }
     }
@@ -441,7 +460,9 @@ private struct SearchStream {
         }
         return SearchHit(id: position, path: wire.path.display, sourcePath: String(bytes: raw, encoding: .utf8),
             start: start, end: end, captureSHA256: wire.capture_sha256, captureByteLength: length,
-            structure: structure, actualText: wire.matched_text)
+            structure: structure, actualText: wire.matched_text,
+            excerpt: try wire.excerpt?.validated(hitStart: start, hitEnd: end,
+                capturedBytes: length, actualText: mode == .text ? (wire.matched_text ?? query) : nil))
     }
     private func invalid() -> AtlasSearchError { .invalidResponse }
     private func number(_ text: String) throws -> UInt64 {

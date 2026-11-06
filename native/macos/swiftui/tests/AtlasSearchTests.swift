@@ -254,6 +254,73 @@ import Foundation
         }
         check(AtlasSearchText.validActualText(String(repeating: "x", count: 4096)), "Maximum source spelling is admitted")
         check(!AtlasSearchText.sameActualText("é", "e\u{301}"), "Source-spelling identity compares encoded bytes")
+        // Excerpts are exact bounded context receipts, separate from the
+        // original-byte occurrence used to activate a captured reader.
+        func excerpt(_ text: String = "before needle after", start: String = "0", end: String = "19",
+                     lower: String = "7", upper: String = "13", clippedStart: Bool = false,
+                     clippedEnd: Bool = false) -> [String: Any] {
+            ["text": text, "original_range": ["start": start, "end": end],
+             "match_utf8_range": ["start": lower, "end": upper],
+             "has_replacements": false, "clipped_start": clippedStart, "clipped_end": clippedEnd]
+        }
+        func excerptWire(_ fields: [String: Any]) throws -> AtlasSearchExcerptWire {
+            try JSONDecoder().decode(AtlasSearchExcerptWire.self,
+                from: JSONSerialization.data(withJSONObject: fields))
+        }
+        let context = try excerptWire(excerpt()).validated(hitStart: 7, hitEnd: 13,
+            capturedBytes: 19, actualText: "needle")
+        check(context.leading == "before " && context.matched == "needle" && context.trailing == " after",
+            "Source context is segmented at the engine's exact decoded match range")
+        let encodedContext = try excerptWire(excerpt("A🦀 needle", start: "2", end: "22",
+            lower: "6", upper: "12")).validated(hitStart: 10, hitEnd: 22, capturedBytes: 22, actualText: "needle")
+        check(encodedContext.originalStart == 2 && encodedContext.matchStart == 6 && encodedContext.matched == "needle",
+            "UTF16 original bytes and preview UTF8 offsets remain separate domains; BOM is metadata")
+        let multiline = try excerptWire(excerpt("intro\r\n\tNeedle\r\n🦀 tail", end: "25", lower: "8", upper: "20"))
+            .validated(hitStart: 8, hitEnd: 20, capturedBytes: 25, actualText: "Needle\r\n🦀")
+        check(multiline.leading == "…⇥" && multiline.matched == "Needle ↵ 🦀" && multiline.trailing == " tail",
+            "Compact rows keep the highlighted multiline match visible and mark hidden context")
+        check(multiline.text.utf8.elementsEqual("intro\r\n\tNeedle\r\n🦀 tail".utf8),
+            "Compact presentation never rewrites retained source spelling")
+        let decomposedContext = try excerptWire(excerpt("e\u{301}", end: "3", lower: "0", upper: "3"))
+            .validated(hitStart: 0, hitEnd: 3, capturedBytes: 3, actualText: "e\u{301}")
+        check(decomposedContext.matched.utf8.elementsEqual("e\u{301}".utf8), "Combining source spelling stays exact")
+        do {
+            _ = try excerptWire(excerpt("e\u{301}", end: "3", lower: "0", upper: "3"))
+                .validated(hitStart: 0, hitEnd: 3, capturedBytes: 3, actualText: "é")
+            preconditionFailure("Preview normalized the actual source spelling")
+        } catch AtlasSearchError.invalidResponse { checks += 1 }
+        var malformedContexts = [
+            excerpt(start: "8"), excerpt(end: "20"), excerpt(lower: "13", upper: "7"),
+            excerpt(lower: "7", upper: "7"), excerpt(lower: "07"), excerpt(upper: "18446744073709551616"),
+            excerpt("before 🦀 after", end: "17", lower: "8", upper: "10"),
+            excerpt(clippedStart: true), excerpt(clippedEnd: true),
+            excerpt(String(repeating: "x", count: 8193), end: "8193", lower: "0", upper: "1")]
+        var wrongSpelling = excerpt(); wrongSpelling["text"] = "before Needle after"; malformedContexts.append(wrongSpelling)
+        var missingRange = excerpt(); missingRange.removeValue(forKey: "match_utf8_range"); malformedContexts.append(missingRange)
+        for malformed in malformedContexts {
+            do {
+                _ = try excerptWire(malformed).validated(hitStart: 7, hitEnd: 13, capturedBytes: 19, actualText: "needle")
+                preconditionFailure("Malformed or mismatched source excerpt admitted")
+            } catch { checks += 1 }
+        }
+        var replacement = excerpt(); replacement["has_replacements"] = true
+        let replacementContext = try excerptWire(replacement).validated(hitStart: 7, hitEnd: 13,
+            capturedBytes: 19, actualText: "needle")
+        check(replacementContext.hasReplacements, "Malformed context keeps the engine's replacement qualification")
+        let longestContext = try excerptWire(excerpt(String(repeating: "x", count: 8192), end: "8192",
+            lower: "0", upper: "1")).validated(hitStart: 0, hitEnd: 1, capturedBytes: 8192, actualText: "x")
+        check(longestContext.text.utf8.count == 8192 && longestContext.matched == "x",
+            "Maximum context is admitted while its compact presentation remains bounded")
+        for (text, end) in [(String(repeating: "x", count: 8193), "8193"), ("x", "8193")] {
+            do {
+                _ = try excerptWire(excerpt(text, end: end, lower: "0", upper: "1"))
+                    .validated(hitStart: 0, hitEnd: 1, capturedBytes: 8193, actualText: "x")
+                preconditionFailure("Decoded or original excerpt allowance was widened")
+            } catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        let repeatedA = try excerptWire(excerpt("é x", lower: "3", upper: "4"))
+        let repeatedB = try excerptWire(excerpt("e\u{301} x", lower: "3", upper: "4"))
+        check(repeatedA != repeatedB, "Repeated-page identity compares source bytes even for canonically equivalent text")
         var wrongCase = envelope(); wrongCase["case_sensitive"] = false; rejects(wrongCase)
         var trueCase = envelope(); trueCase["case_sensitive"] = true
         let explicitSensitive = try decode(trueCase)
