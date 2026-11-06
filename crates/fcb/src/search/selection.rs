@@ -19,8 +19,15 @@
 
 use std::io::Write;
 use fcb_core::{ByteOffset, ByteRange, FileId, QueryGeneration, SourceRevision};
+use fcb_source::{CaptureEncodingMap, DetectedEncoding, SpanKind, StatefulChunkDecoder, detect_encoding};
 use crate::SourceCapture;
 use super::reader::ReaderError;
+
+// Decoder maps are scratch, separate from the admitted clipboard payload. Never
+// construct a per-scalar map for an entire large selection or source capture.
+const CLIPBOARD_DECODE_CHUNK_BYTES: usize = 4 * 1024;
+const MAX_EXPORT_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_INTERRUPTED_EXPORT_WRITES: usize = 16;
 
 /// Caret visual affinity for boundary or ambiguous positions (e.g. line wraps, bidi transitions).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +110,11 @@ impl SourceSelection {
         }
         if self.generation != generation {
             return Err(ClipboardError::StaleGeneration);
+        }
+        if self.start.byte_offset != self.byte_range.start()
+            || self.end.byte_offset != self.byte_range.end()
+        {
+            return Err(ClipboardError::InvalidRange);
         }
         Ok(())
     }
@@ -187,7 +199,8 @@ pub enum ClipboardFlavor {
 /// Bounded limits for clipboard operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClipboardLimits {
-    /// Maximum bytes permitted for clipboard publication (e.g. 4 MiB).
+    /// Maximum aggregate payload bytes across raw, Unicode, and provenance
+    /// flavors (e.g. 4 MiB), excluding fixed-size decoder scratch.
     pub max_clipboard_bytes: usize,
 }
 
@@ -247,8 +260,17 @@ pub struct StagedClipboardData {
 impl StagedClipboardData {
     /// Stage a selection into multi-flavor clipboard representations.
     ///
-    /// Refuses with [`ClipboardError::BudgetExceeded`] if size exceeds `limits.max_clipboard_bytes`.
-    /// Preserves exact bytes (including BOM, CRLF, malformed bytes).
+    /// Measures every flavor before allocating the final payload and refuses
+    /// with [`ClipboardError::BudgetExceeded`] if their aggregate exceeds the
+    /// limit. Decoding uses bounded scratch and cooperative cancellation.
+    ///
+    /// Raw bytes preserve BOM, CRLF, and malformed sequences. Unicode uses the
+    /// capture's BOM-declared encoding, omitting only a BOM at capture offset 0.
+    /// UTF-16 selections must start on the capture's two-byte code-unit grid;
+    /// odd starts return [`ClipboardError::InvalidRange`]. A selected partial
+    /// scalar or incomplete final unit becomes an explicit replacement without
+    /// borrowing excluded bytes. Arbitrary raw ranges remain exportable through
+    /// [`StreamedFileExport`].
     pub fn stage(
         selection: &SourceSelection,
         capture: &SourceCapture,
@@ -265,48 +287,70 @@ impl StagedClipboardData {
             .byte_range
             .as_usize_bounds()
             .map_err(|_| ClipboardError::InvalidRange)?;
-        let byte_len = end.checked_sub(start).ok_or(ClipboardError::InvalidRange)?;
-
-        if byte_len > limits.max_clipboard_bytes {
-            return Err(ClipboardError::BudgetExceeded {
-                requested_bytes: byte_len,
-                max_budget_bytes: limits.max_clipboard_bytes,
-            });
+        let bytes = capture.bytes();
+        let slice = bytes.get(start..end).ok_or(ClipboardError::InvalidRange)?;
+        let byte_len = slice.len();
+        let encoding = detect_encoding(&bytes[..bytes.len().min(3)]);
+        if encoding.is_utf16() && start % 2 != 0 {
+            return Err(ClipboardError::InvalidRange);
         }
-
-        let slice = capture
-            .bytes()
-            .get(start..end)
-            .ok_or(ClipboardError::InvalidRange)?;
-        let exact_bytes = slice.to_vec();
-
-        // Check for malformed UTF-8 and decode safely
-        let (plain_text, has_replacements) = match std::str::from_utf8(slice) {
-            Ok(valid) => (valid.to_string(), false),
-            Err(_) => {
-                // Fallback decode preserving lossless replacement markers
-                (String::from_utf8_lossy(slice).into_owned(), true)
-            }
+        let over_budget = |requested_bytes| ClipboardError::BudgetExceeded {
+            requested_bytes,
+            max_budget_bytes: limits.max_clipboard_bytes,
         };
 
-        let provenance = format!(
-            "File: {}\nRevision: {}\nLines: {}-{}\nRange: {}..{}\n",
-            capture.logical_path(),
-            selection.revision.get(),
-            selection.start.line,
-            selection.end.line,
-            start,
-            end
-        );
-
-        let total_staged_bytes = exact_bytes.len() + plain_text.len() + provenance.len();
-        if total_staged_bytes > limits.max_clipboard_bytes * 3 {
-            return Err(ClipboardError::BudgetExceeded {
-                requested_bytes: total_staged_bytes,
-                max_budget_bytes: limits.max_clipboard_bytes,
-            });
+        if byte_len > limits.max_clipboard_bytes {
+            return Err(over_budget(byte_len));
         }
 
+        let mut provenance_size = ClipboardByteCounter(0);
+        write_selection_provenance(&mut provenance_size, selection, capture, start, end)
+            .map_err(|_| over_budget(usize::MAX))?;
+        let raw_and_provenance_bytes = byte_len.checked_add(provenance_size.0)
+            .ok_or_else(|| over_budget(usize::MAX))?;
+        if raw_and_provenance_bytes > limits.max_clipboard_bytes {
+            return Err(over_budget(raw_and_provenance_bytes));
+        }
+
+        let raw_offset = selection.byte_range.start().get();
+        let mut decoded_bytes = 0usize;
+        let mut has_replacements = false;
+        decode_selection_chunks(slice, encoding, raw_offset, &canceled, |map| {
+            decoded_bytes = decoded_bytes.checked_add(map.decoded_text().len())
+                .ok_or_else(|| over_budget(usize::MAX))?;
+            has_replacements |= map.spans().iter()
+                .any(|span| span.kind == SpanKind::ReplacementMalformed);
+            Ok(())
+        })?;
+        let total_staged_bytes = raw_and_provenance_bytes.checked_add(decoded_bytes)
+            .ok_or_else(|| over_budget(usize::MAX))?;
+        if total_staged_bytes > limits.max_clipboard_bytes {
+            return Err(over_budget(total_staged_bytes));
+        }
+        if canceled() {
+            return Err(ClipboardError::Canceled);
+        }
+
+        // The capture is immutable, so replaying the admitted decode has the
+        // same exact length without retaining maps between passes.
+        let mut plain_text = String::new();
+        plain_text.try_reserve_exact(decoded_bytes).map_err(|_| ClipboardError::PublicationFailed)?;
+        let mut exact_bytes = Vec::new();
+        exact_bytes.try_reserve_exact(byte_len).map_err(|_| ClipboardError::PublicationFailed)?;
+        let mut provenance = String::new();
+        provenance.try_reserve_exact(provenance_size.0).map_err(|_| ClipboardError::PublicationFailed)?;
+        decode_selection_chunks(slice, encoding, raw_offset, &canceled, |map| {
+            plain_text.push_str(map.decoded_text());
+            Ok(())
+        })?;
+        for chunk in slice.chunks(CLIPBOARD_DECODE_CHUNK_BYTES) {
+            if canceled() {
+                return Err(ClipboardError::Canceled);
+            }
+            exact_bytes.extend_from_slice(chunk);
+        }
+        write_selection_provenance(&mut provenance, selection, capture, start, end)
+            .map_err(|_| ClipboardError::PublicationFailed)?;
         if canceled() {
             return Err(ClipboardError::Canceled);
         }
@@ -319,6 +363,53 @@ impl StagedClipboardData {
             total_staged_bytes,
         })
     }
+}
+
+struct ClipboardByteCounter(usize);
+
+impl std::fmt::Write for ClipboardByteCounter {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.0 = self.0.checked_add(value.len()).ok_or(std::fmt::Error)?;
+        Ok(())
+    }
+}
+
+fn write_selection_provenance(
+    output: &mut impl std::fmt::Write,
+    selection: &SourceSelection,
+    capture: &SourceCapture,
+    start: usize,
+    end: usize,
+) -> std::fmt::Result {
+    std::fmt::write(output, format_args!(
+        "File: {}\nRevision: {}\nLines: {}-{}\nRange: {}..{}\n",
+        capture.logical_path(), selection.revision.get(),
+        selection.start.line, selection.end.line, start, end,
+    ))
+}
+
+fn decode_selection_chunks(
+    bytes: &[u8],
+    encoding: DetectedEncoding,
+    raw_offset: u64,
+    canceled: &impl Fn() -> bool,
+    mut accept: impl FnMut(&CaptureEncodingMap) -> Result<(), ClipboardError>,
+) -> Result<(), ClipboardError> {
+    let mut decoder = StatefulChunkDecoder::with_raw_offset(encoding, raw_offset);
+    for chunk in bytes.chunks(CLIPBOARD_DECODE_CHUNK_BYTES) {
+        if canceled() {
+            return Err(ClipboardError::Canceled);
+        }
+        let map = decoder.decode_chunk(chunk).map_err(|_| ClipboardError::PublicationFailed)?;
+        accept(&map)?;
+    }
+    if canceled() {
+        return Err(ClipboardError::Canceled);
+    }
+    if let Some(map) = decoder.finish().map_err(|_| ClipboardError::PublicationFailed)? {
+        accept(&map)?;
+    }
+    Ok(())
 }
 
 /// Simulated native OS clipboard with generation tracking and atomic publication.
@@ -407,6 +498,8 @@ impl NativeClipboard {
 /// Options governing streamed file export.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StreamedExportOptions {
+    /// Requested bytes per write, clamped to 1..=64 KiB. Zero uses one-byte
+    /// writes; very large values do not create an unbounded write request.
     pub chunk_size: usize,
 }
 
@@ -429,8 +522,18 @@ pub enum ExportOutcome {
 pub struct StreamedFileExport;
 
 impl StreamedFileExport {
-    /// Stream exact captured source bytes directly to a writer in bounded chunks without
-    /// allocating a monolithic buffer.
+    /// Stream exact captured source bytes directly to a writer in bounded chunks
+    /// without allocating a monolithic buffer. The entire selected range is
+    /// validated before invoking the writer.
+    ///
+    /// Cancellation is checked before every write attempt and before flushing,
+    /// including for an empty selection. Short writes count toward the reported
+    /// canceled prefix. Sixteen consecutive interrupted writes are refused as
+    /// [`ClipboardError::PublicationFailed`] rather than retried indefinitely;
+    /// a blocking writer call itself cannot be interrupted by this API.
+    ///
+    /// A canceled or failed operation can leave an already-written prefix in
+    /// this caller-owned writer; it does not promise destination rollback.
     pub fn stream_to_writer<W: Write>(
         selection: &SourceSelection,
         capture: &SourceCapture,
@@ -445,31 +548,41 @@ impl StreamedFileExport {
             .byte_range
             .as_usize_bounds()
             .map_err(|_| ClipboardError::InvalidRange)?;
-        let total_bytes = end.saturating_sub(start);
-
-        let bytes = capture.bytes();
-        let chunk_size = options.chunk_size.max(1024);
-        let mut offset = start;
+        let bytes = capture.bytes().get(start..end).ok_or(ClipboardError::InvalidRange)?;
+        let total_bytes = bytes.len();
+        let chunk_size = options.chunk_size.clamp(1, MAX_EXPORT_CHUNK_BYTES);
         let mut written = 0;
+        let mut interrupted = 0;
 
-        while offset < end {
-            if canceled() {
-                return Ok(ExportOutcome::Canceled { bytes_written: written });
+        for chunk in bytes.chunks(chunk_size) {
+            let mut pending = chunk;
+            while !pending.is_empty() {
+                if canceled() {
+                    return Ok(ExportOutcome::Canceled { bytes_written: written });
+                }
+                match writer.write(pending) {
+                    Ok(0) => return Err(ClipboardError::PublicationFailed),
+                    Ok(count) if count <= pending.len() => {
+                        written += count;
+                        pending = &pending[count..];
+                        interrupted = 0;
+                    }
+                    Ok(_) => return Err(ClipboardError::PublicationFailed),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                        interrupted += 1;
+                        if interrupted >= MAX_INTERRUPTED_EXPORT_WRITES {
+                            return Err(ClipboardError::PublicationFailed);
+                        }
+                    }
+                    Err(_) => return Err(ClipboardError::PublicationFailed),
+                }
             }
-
-            let next_chunk_end = (offset + chunk_size).min(end);
-            let chunk = bytes.get(offset..next_chunk_end).ok_or(ClipboardError::InvalidRange)?;
-
-            writer.write_all(chunk).map_err(|_| ClipboardError::PublicationFailed)?;
-            written += chunk.len();
-            offset = next_chunk_end;
         }
-
-        writer.flush().map_err(|_| ClipboardError::PublicationFailed)?;
 
         if canceled() {
             return Ok(ExportOutcome::Canceled { bytes_written: written });
         }
+        writer.flush().map_err(|_| ClipboardError::PublicationFailed)?;
 
         Ok(ExportOutcome::Completed { total_bytes })
     }

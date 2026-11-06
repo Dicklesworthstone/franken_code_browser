@@ -1230,11 +1230,23 @@ pub struct StatefulChunkDecoder {
 
 impl StatefulChunkDecoder {
     pub fn new(encoding: DetectedEncoding) -> Self {
+        Self::with_raw_offset(encoding, 0)
+    }
+
+    /// Start a selected span at its absolute offset in the original capture.
+    /// Only raw offsets use this base; decoded, UTF-16, and scalar positions
+    /// start at zero. A BOM is recognized only at capture offset zero.
+    ///
+    /// This starts a new decoded domain, not a restored parser state. The caller
+    /// supplies the capture's encoding and must align UTF-16 input to its
+    /// original code-unit grid. Excluded bytes are not recovered to complete a
+    /// scalar; partial selected scalars use the decoder's replacement semantics.
+    pub fn with_raw_offset(encoding: DetectedEncoding, raw_offset: u64) -> Self {
         Self {
             encoding,
             pending_bytes: [0u8; 4],
             pending_len: 0,
-            current_raw_offset: 0,
+            current_raw_offset: raw_offset,
             current_decoded_offset: 0,
             current_utf16_offset: 0,
             current_scalar_offset: 0,
