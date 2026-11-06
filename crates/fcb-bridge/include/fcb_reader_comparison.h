@@ -7,6 +7,8 @@
 extern "C" {
 #endif
 
+#define FCB_READER_MAX_COMPARISON_SOURCE_BYTES UINT64_C(4194304)
+
 /* Explicit comparison of two different retained reader handles in this loaded
  * library. Both source captures and their byte reservations survive the call;
  * no pathname is reopened and no query or selection is transferred. Invoke on
@@ -15,8 +17,10 @@ extern "C" {
  *
  * generation must strictly increase across admitted attempts on before_handle,
  * including canceled attempts. max_edit_distance <= 512; max_work <= 67108864.
- * Each source remains bounded by FCB_READER_MAX_SOURCE_BYTES. Zero work/edit
- * allowances are valid and can produce explicit unresolved regions.
+ * Each compared source is bounded by FCB_READER_MAX_COMPARISON_SOURCE_BYTES
+ * (4 MiB), independently of live-file capture admission. Larger readers remain
+ * readable/pinnable but are refused here. Zero work/edit allowances are valid
+ * and can produce explicit unresolved regions.
  *
  * fcb.reader-session/1 command=compare returns BOTH original owner/file/revision,
  * raw native path, capture length, encoding and SHA-256 receipts. comparison_owner

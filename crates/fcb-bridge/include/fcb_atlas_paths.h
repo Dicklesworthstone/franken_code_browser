@@ -58,7 +58,7 @@ char *fcb_atlas_file_focus(uint64_t handle, uint64_t generation, uint64_t file,
 
 /* reader must be an EMPTY fcb_reader_create handle. This is the only path-finder
  * operation that reads source: a NEW capture after metadata-only path selection,
- * not bytes searched earlier. max_source_bytes: 1..4194304. Existing reader
+ * not bytes searched earlier. max_source_bytes: 1..33554432 (32 MiB). Existing reader
  * admission and symlink/special-file policy apply; arbitrary paths are not input.
  * Use ordinary reader calls afterward. Clearing or closing the atlas leaves the
  * reader independently owned. Cancel either handle to abort current work; late

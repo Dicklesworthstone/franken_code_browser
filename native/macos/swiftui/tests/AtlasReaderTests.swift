@@ -130,6 +130,67 @@ private final class Driver: @unchecked Sendable {
         while !satisfied, Date() < deadline { pump(); satisfied = condition() }
         check(satisfied, message)
     }
+    @MainActor private static func largeCaptureBoundaries() throws {
+        check(AtlasReaderLimits.captureBytes == 32 * 1024 * 1024, "live capture ceiling")
+        check(AtlasReaderLimits.transferBytes == 4 * 1024 * 1024
+            && AtlasReaderLimits.comparisonBytes == 4 * 1024 * 1024,
+              "optional whole-source operations inherited the live capture ceiling")
+        check(AtlasReaderLimits.maximumPageBytes == 256 * 1024
+            && AtlasReaderLimits.responseBytes == 4 * 1024 * 1024, "page/handoff limits grew with source size")
+        let path = "/project/file", length = AtlasReaderLimits.captureBytes
+        for count in [AtlasReaderLimits.transferBytes + 1, length] {
+            let info = try AtlasReaderInfo.decode(json(header(length: count)), handle: 2, path: path)
+            check(info.identity.capturedBytes == count, "admitted large source metadata was refused/truncated")
+        }
+        rejects("larger-than-admitted source metadata accepted") {
+            _ = try AtlasReaderInfo.decode(json(header(length: length + 1)), handle: 2, path: path)
+        }
+        let info = try AtlasReaderInfo.decode(json(header(length: length)), handle: 2, path: path)
+        let start: UInt64 = 8 * 1024 * 1024 + 3
+        let text = "xxxxneedle\n"
+        func pageWire(_ text: String, start: UInt64, command: String = "window", first: UInt64? = nil) -> [String: Any] {
+            var wire = window(raw: Array(text.utf8), command: command, first: first)
+            let end = start + UInt64(text.utf8.count)
+            wire["captured_bytes"] = String(length)
+            wire["requested_original_range"] = ["start": String(start), "end": String(end)]
+            wire["visible_range"] = ["start": String(start), "end": String(end)]
+            wire["next_offset"] = String(end)
+            return wire
+        }
+        let page = try AtlasReaderPage.decode(json(pageWire(text, start: start)), info: info,
+            request: .window(offset: start, bytes: UInt64(text.utf8.count)))
+        check(page.start == start && page.nextOffset == start + UInt64(text.utf8.count)
+            && page.text.utf8.elementsEqual(text.utf8), "far byte page lost original coordinates or source")
+        let line = try AtlasReaderPage.decode(json(pageWire(text, start: start, command: "lines", first: 900_001)),
+            info: info, request: .lines(first: 900_001, count: 1, bytes: 64))
+        check(line.start == start && line.firstPhysicalLine == 900_001, "far physical-line response was narrowed")
+        rejects("large capture widened native page admission") {
+            try AtlasReaderRequest.window(offset: start, bytes: AtlasReaderLimits.maximumPageBytes + 1)
+                .validate(capturedBytes: length)
+        }
+        var report = header(length: length, command: "find")
+        report["query_generation"] = "1"; report["mode"] = "exact-decoded-literal"
+        report["needle"] = "needle"; report["state"] = "complete-observed-input"
+        report["search_complete"] = true; report["scanned_bytes"] = String(length)
+        report["matches_seen"] = "1"; report["retained_hits"] = "1"
+        report["literal_original_hex"] = hex("needle".utf8); report["unsupported_at"] = NSNull()
+        report["hits"] = [["hit_index": "0", "occurrence_id": "1",
+            "original_range": ["start": String(start + 4), "end": String(start + 10)]]]
+        let found = try AtlasReaderFindReport.decode(json(report), info: info, generation: 1, needle: "needle")
+        guard let target = found.target(at: 0) else { fatalError("large-source result lost its exact target") }
+        check(found.complete && target.start == start + 4, "full large-source find response was lost")
+        let padding = AtlasReaderHitTarget.contextBytes + 4
+        let context = String(repeating: "x", count: Int(padding)) + "needle\n"
+            + String(repeating: "x", count: Int(padding - 1))
+        var hit = pageWire(context, start: target.start - padding, command: "hit")
+        hit["selection"] = ["query_generation": "1",
+            "original_range": ["start": String(target.start), "end": String(target.end)],
+            "window_utf8_range": ["start": String(padding), "end": String(padding + 6)],
+            "original_hex": hex("needle".utf8)]
+        let selected = try AtlasReaderPage.decode(json(hit), info: info, request: .hit(target))
+        check(selected.selection?.target == target && selected.selection?.utf8Start == padding,
+              "far original hit was confused with a page-local text offset")
+    }
     @MainActor private static func retainedHighlighting() throws {
         let chunks: [(String, String)] = [
             ("/*😀 e\u{301}\r\n*/", "comment"), (" ", "plain"), ("let", "keyword"),
@@ -243,6 +304,7 @@ private final class Driver: @unchecked Sendable {
         }
     }
     @MainActor static func main() throws {
+        try largeCaptureBoundaries()
         // Lexical admission never trims/normalizes native identities or treats
         // catalog display labels as authority for an escaping relative path.
         let input = try AtlasReaderInput(root: "/project", path: "file")

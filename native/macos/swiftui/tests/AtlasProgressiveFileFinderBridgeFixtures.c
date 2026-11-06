@@ -48,7 +48,7 @@ char *fcb_file_finder_stop(uint64_t handle, uint64_t generation) {
 char *fcb_file_finder_open_reader(uint64_t handle, uint64_t reader, uint64_t generation,
                                 uint64_t revision, uint64_t file, uint64_t max_source_bytes) {
     assert(handle == HANDLE && reader == 999 && generation == GENERATION && revision == REVISION);
-    assert(file == 20001 && max_source_bytes == 4194304); return answer("reader");
+    assert(file == 20001 && max_source_bytes == 33554432); return answer("reader");
 }
 uint8_t fcb_file_finder_cancel(uint64_t handle) { assert(handle == HANDLE); return 1; }
 uint8_t fcb_file_finder_close(uint64_t handle) { assert(handle == HANDLE); return 1; }

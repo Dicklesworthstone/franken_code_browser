@@ -73,6 +73,8 @@ struct AtlasReaderComparisonReport: Sendable {
                        generation: UInt64, limits: AtlasReaderComparisonLimits) throws -> Self {
         try limits.validate()
         guard generation > 0, before.identity.owner != after.identity.owner,
+              before.identity.capturedBytes <= AtlasReaderLimits.comparisonBytes,
+              after.identity.capturedBytes <= AtlasReaderLimits.comparisonBytes,
               let beforeDigest = before.captureSHA256, let afterDigest = after.captureSHA256 else {
             throw AtlasReaderError.invalidResponse
         }
@@ -86,7 +88,7 @@ struct AtlasReaderComparisonReport: Sendable {
                   analysisOwner != before.identity.owner, analysisOwner != after.identity.owner,
                   wire.coordinate_domain == "original-bytes-may-split-text",
                   wire.alignment_semantics == "deterministic-not-identity-proof", !wire.source_reopened,
-                  AtlasReaderWire.integer(wire.max_source_bytes) == AtlasReaderLimits.captureBytes,
+                  AtlasReaderWire.integer(wire.max_source_bytes) == AtlasReaderLimits.comparisonBytes,
                   AtlasReaderWire.integer(wire.max_edit_distance) == limits.editDistance,
                   AtlasReaderWire.integer(wire.max_work) == limits.work,
                   let work = AtlasReaderWire.integer(wire.work_units), work <= limits.work,

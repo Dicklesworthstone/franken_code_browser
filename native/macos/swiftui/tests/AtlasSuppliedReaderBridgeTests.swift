@@ -42,7 +42,9 @@ import Foundation
             }.value
             precondition(invalid == nil, "invalid label crossed the native boundary")
         }
-        let over = Data(repeating: 0, count: Int(AtlasReaderLimits.captureBytes) + 1)
+        precondition(AtlasReaderLimits.transferBytes == 4 * 1024 * 1024
+            && AtlasReaderLimits.transferBytes < AtlasReaderLimits.captureBytes)
+        let over = Data(repeating: 0, count: Int(AtlasReaderLimits.transferBytes) + 1)
         let oversized = await Task.detached {
             AtlasReaderTransport.native.openBytes?(handle, path, over)
         }.value

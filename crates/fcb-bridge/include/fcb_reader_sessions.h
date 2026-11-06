@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define FCB_READER_MAX_SOURCE_BYTES UINT64_C(4194304)
+#define FCB_READER_MAX_SOURCE_BYTES UINT64_C(33554432)
 #define FCB_READER_MAX_WINDOW_BYTES UINT64_C(262144)
 #define FCB_READER_MAX_CONTEXT_BYTES UINT64_C(16384)
 #define FCB_READER_MAX_MATCHES UINT64_C(4096)
@@ -18,6 +18,10 @@ extern "C" {
  * open captures one complete regular file on the calling host worker. A loaded
  * handle never reopens or replaces that source, even after working-tree edits.
  * Failed initialization can be retried while the handle remains empty.
+ * max_source_bytes is 1..32 MiB; larger files are refused without publishing
+ * a prefix. This retains a bounded complete capture, not out-of-core storage.
+ * Legacy whole-text and supplied-buffer transfers remain capped at 4 MiB;
+ * comparison, desk, outline and document services retain their own limits.
  *
  * Handles are opaque integers, not pointers. Never reuse a handle after close
  * or move it between processes/loaded library instances. JSON's owner is this

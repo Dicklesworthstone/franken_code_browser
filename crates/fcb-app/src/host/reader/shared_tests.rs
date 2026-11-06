@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use super::*;
+use crate::host::MAX_HOST_TEXT_BYTES;
 
 fn owner(value: u64) -> ArenaOwnerId { ArenaOwnerId::new(value).unwrap() }
 fn source(value: u64, bytes: &[u8]) -> ReaderSession {
@@ -9,7 +10,7 @@ fn source(value: u64, bytes: &[u8]) -> ReaderSession {
 
 #[test]
 fn forks_share_source_accounting_and_release_private_state_independently() {
-    let bytes = vec![b'a'; MAX_HOST_TEXT_BYTES];
+    let bytes = vec![b'a'; MAX_HOST_TEXT_BYTES + 64 * 1024];
     let parent = source(9301, &bytes);
     let original_budget = parent.budget.clone();
     let source_reservation = parent._source_lease.info();
@@ -56,7 +57,7 @@ fn forks_share_source_accounting_and_release_private_state_independently() {
 #[test]
 fn pin_state_cost_is_independent_of_source_size_and_equal_supplies_stay_independent() {
     let small = source(9311, b"small");
-    let large = source(9312, &vec![b'l'; MAX_HOST_TEXT_BYTES]);
+    let large = source(9312, &vec![b'l'; MAX_HOST_TEXT_BYTES + 64 * 1024]);
     let small_pin = small.fork(owner(9313), || false).unwrap();
     let large_pin = large.fork(owner(9314), || false).unwrap();
     assert_eq!(small_pin.budget.accounting().reserved(), large_pin.budget.accounting().reserved());

@@ -18,10 +18,13 @@ Creation returns zero on admission/identity failure. The empty handle already
 exists during capture, so another native thread can cancel or close that work.
 
 A successful open pins a complete regular-file observation, up to an explicitly
-supplied allowance of 4 MiB. It uses the SAME bounded file reader as the existing
-legacy text service, including regular-object checks, read-call limits, and
-before/after metadata comparisons. NUL, malformed text and BOM-marked UTF-16 are
-retained as original bytes rather than being forced into a text-only C string.
+supplied allowance of 32 MiB. It shares regular-object checks, read-call limits,
+and before/after metadata comparisons with the existing bounded file reader.
+The legacy whole-text and foreign supplied-buffer routes retain their separate
+4 MiB limits. This is a bounded complete capture, not out-of-core storage;
+oversized sources are refused without publishing a prefix. NUL, malformed text
+and BOM-marked UTF-16 are retained as original bytes rather than being forced
+into a text-only C string.
 Metadata agreement is not an atomic snapshot guarantee or qualified confinement
 against hostile ancestor replacement. Hosts still own current native grants.
 
@@ -156,10 +159,13 @@ the table lock and belongs on a worker. Poisoned sessions can still be canceled
 and closed without poisoning other sessions.
 
 Source, query, decoder, registry and response admissions are separate. Each
-reader has a 256 MiB managed accounting domain; source capture is at most 4 MiB,
+reader has a 256 MiB managed accounting domain; source capture is at most 32 MiB,
 and output is privately encoded within 8 MiB. Existing returned safe-Rust
 responses keep their own leases. Native strings after handoff are separately
 host-owned and must be freed; these admissions are NOT a total-process RSS cap.
+Pins share immutable source backing and its reservation. Comparison and
+reading-desk transfer still admit at most 4 MiB per source; larger readers keep
+paging, line navigation, Find, exact bounded copies and pinning available.
 
 ## Native handoff and verification
 
@@ -175,7 +181,7 @@ mutate a returned allocation, free it with a foreign allocator, or use a closed
 handle as a different session. Cancellation/revocation cannot retract bytes
 already delivered to an external consumer.
 
-Tests: `fcb-app/tests/retained_host_reader.rs`,
+Tests: `fcb-app/tests/retained_host_reader.rs`, `fcb-app/tests/retained_large_reader.rs`,
 `fcb-bridge/src/reader_sessions_tests.rs`, and `reader_ffi_tests.rs`.
 These include live source replacement, both UTF-16 byte orders, BOM/CRLF and
 supplementary characters, lossless raw copy, query replacement, simultaneous

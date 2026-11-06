@@ -71,7 +71,7 @@ char *fcb_catalog_stop(uint64_t handle);
  * version of earlier metadata. An existing EMPTY reader destination is required
  * and admitted before path resolution or source I/O. The selected raw path is
  * resolved by the engine; no caller path string is accepted. Stale/evicted rows
- * fail before source access. max_source_bytes: 1..4 MiB; oversize files refuse.
+ * fail before source access. max_source_bytes: 1..32 MiB; oversize files refuse.
  * Receipt includes new-capture-after-metadata-selection, reader metadata and
  * its first byte window. Continue with fcb_reader_* operations afterward.
  * Uses existing path checks and leaf no-follow policy, not a race-safe sandbox.

@@ -13,7 +13,7 @@ enum AtlasDeskReaderTransfer {
             guard wire.model_revision.value == state.revision, wire.last_attempt.value == state.lastAttempt,
                   wire.pane.value == pane.id, location == pane.location,
                   wire.label.utf8.elementsEqual(pane.label.utf8),
-                  wire.captured_bytes.value <= AtlasReaderLimits.captureBytes,
+                  wire.captured_bytes.value <= AtlasReaderLimits.transferBytes,
                   wire.captured_bytes.value <= state.retainedBytes,
                   location.offset <= wire.captured_bytes.value,
                   location.selection == nil || location.selection!.end <= wire.captured_bytes.value,
@@ -101,10 +101,10 @@ extension AtlasReadingDeskModel {
     /// or supplied capture. Source replacement while the desk starts revokes
     /// this intent; it cannot silently import the replacement capture instead.
     func keep(reader: AtlasPagedReaderModel) {
-        guard canOperate, reader.canPin, let original = reader.page,
+        guard canOperate, reader.canKeep, let original = reader.page,
               let expectedDomain = readerDomain, reader.retainedRegistryDomain == expectedDomain else { return }
         keepCapture(start: original.start, end: original.end, sourceDomain: expectedDomain) { work in
-            guard let current = reader.page, current.identity.matches(original.identity), reader.canPin,
+            guard let current = reader.page, current.identity.matches(original.identity), reader.canKeep,
                   reader.retainedRegistryDomain == expectedDomain else {
                 throw AtlasReadingDeskError.unavailable
             }

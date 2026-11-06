@@ -141,7 +141,11 @@ private final class AtlasReaderSession: @unchecked Sendable {
     var supportsOutline: Bool { outlineTransport != nil }
     var supportsDocument: Bool { documentTransport != nil }
     var canFork: Bool { session?.transport.fork != nil && info != nil }
-    var supportsComparison: Bool { session?.transport.comparison != nil && info?.captureSHA256 != nil }
+    var supportsComparison: Bool {
+        guard let info else { return false }
+        return session?.transport.comparison != nil && info.captureSHA256 != nil
+            && info.identity.capturedBytes <= AtlasReaderLimits.comparisonBytes
+    }
     var retainedRegistryDomain: UUID? { session?.transport.comparison?.domain }
 
     /// Open a caller-authorized retained capture into an EMPTY destination in
@@ -229,6 +233,8 @@ private final class AtlasReaderSession: @unchecked Sendable {
         try limits.validate()
         guard self !== other, let before = session, let after = other.session,
               let beforeInfo = info, let afterInfo = other.info,
+              beforeInfo.identity.capturedBytes <= AtlasReaderLimits.comparisonBytes,
+              afterInfo.identity.capturedBytes <= AtlasReaderLimits.comparisonBytes,
               beforeInfo.captureSHA256 != nil, afterInfo.captureSHA256 != nil,
               let comparison = before.transport.comparison,
               comparison.domain == after.transport.comparison?.domain,

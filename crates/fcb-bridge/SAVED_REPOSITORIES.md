@@ -91,7 +91,8 @@ are bounded and redacted rather than including queries or source payloads.
 The C open route uses existing defaults: 65,536 members, 1 MiB per captured
 member, 64 MiB captured source, 80 MiB archive, 2,048 bytes per raw relative path.
 The Rust host accepts explicit SnapshotLimits, with member size additionally
-bounded by the existing 4 MiB retained-reader ceiling. Queries retain at most
+bounded by this service's independent 4 MiB member ceiling. The larger live-file
+reader allowance does not widen archive admission. Queries retain at most
 4,096 hits; pages contain 1..128 rows and literal needles at most 1,024 UTF-8
 bytes. Source, metadata, old/new state and response buffers keep distinct leases.
 Managed reservations do not claim measured RSS, zero-copy handoff or speedup.

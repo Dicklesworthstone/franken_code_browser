@@ -23,7 +23,7 @@ use crate::{AppError, EXIT_OK, EXIT_PARTIAL};
 use crate::output::{Output, OutputError};
 use super::{CatalogSession, CatalogSessionError, MAX_CATALOG_PAGE_ENTRIES,
     MAX_CATALOG_PAGE_PATH_BYTES, MAX_CATALOG_PATH_BYTES};
-use super::super::{HostResponse, MAX_HOST_TEXT_BYTES, reader::ReaderSession};
+use super::super::{HostResponse, reader::{ReaderSession, MAX_READER_SOURCE_BYTES}};
 
 pub const MAX_FILE_FINDER_QUERY_BYTES: usize = fcb::search::paths::MAX_PATH_QUERY_BYTES;
 pub const MAX_FILE_FINDER_RESULTS: usize = 256;
@@ -183,7 +183,7 @@ impl FileFinderSession {
         if file.owner() != self.owner() || reader_owner == self.owner() { return Err(FileFinderSessionError::ForeignOwner); }
         self.validate_revision(generation, revision)?;
         let index = self.hits.iter().position(|hit| hit.file == file).ok_or(FileFinderSessionError::MissingHit)?;
-        if max_source_bytes == 0 || max_source_bytes > MAX_HOST_TEXT_BYTES { return Err(FileFinderSessionError::InvalidLimits); }
+        if max_source_bytes == 0 || max_source_bytes > MAX_READER_SOURCE_BYTES { return Err(FileFinderSessionError::InvalidLimits); }
         let relative = self.hits[index].path.clone();
         let (reader, info, window, source_bytes, source_calls) =
             self.catalog.capture_reader(reader_owner, &relative, max_source_bytes, &mut canceled)?;

@@ -25,6 +25,46 @@ fn open(path: &CString) -> u64 {
 }
 
 #[test]
+fn c_large_file_capture_pages_finds_and_forks_without_widening_foreign_transfers() {
+    use fcb_app::host::{MAX_HOST_TEXT_BYTES, reader::MAX_READER_SOURCE_BYTES};
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    assert_eq!(MAX_HOST_TEXT_BYTES, 4 * 1024 * 1024);
+    assert_eq!(MAX_READER_SOURCE_BYTES, 32 * 1024 * 1024);
+    let mut bytes = vec![b'x'; MAX_HOST_TEXT_BYTES + 16];
+    bytes.extend_from_slice(b"\r\nneedle\r\n");
+    let start = (bytes.len() - 8) as u64;
+    let (path, cpath) = file(&bytes);
+    let handle = fcb_reader_create(); assert_ne!(handle, 0);
+    assert!(take(unsafe { fcb_reader_open(handle, cpath.as_ptr(), MAX_READER_SOURCE_BYTES as u64 + 1) })
+        .contains("\"status\":\"error\""));
+    assert!(take(fcb_reader_info(handle)).contains("READER_HANDLE_NOT_OPEN"));
+    let info = take(unsafe { fcb_reader_open(handle, cpath.as_ptr(), MAX_READER_SOURCE_BYTES as u64) });
+    assert!(info.contains("\"status\":\"ok\""));
+    assert!(info.contains(&format!("\"captured_bytes\":\"{}\"", bytes.len())));
+    fs::write(&path, b"replacement").unwrap();
+    let line = take(fcb_reader_lines(handle, 2, 1, 64));
+    assert!(line.contains("\"text\":\"needle\\r\\n\""));
+    assert!(line.len() < 4096, "the whole source escaped through a bounded page");
+    let needle = CString::new("needle").unwrap();
+    let found = take(unsafe { fcb_reader_find(handle, 1, needle.as_ptr(), 1, bytes.len() as u64) });
+    assert!(found.contains("\"search_complete\":true"));
+    assert!(found.contains(&format!("\"original_range\":{{\"start\":\"{start}\",\"end\":\"{}\"}}", start + 6)));
+    assert!(take(fcb_reader_copy_hit(handle, 1, 0)).contains("\"original_hex\":\"6e6565646c65\""));
+    let pin = fcb_reader_create(); assert_ne!(pin, 0);
+    // A live-reader allowance is not permission to copy a bigger foreign buffer.
+    assert!(take(unsafe { supplied::fcb_reader_open_bytes(pin, cpath.as_ptr(),
+        bytes.as_ptr(), bytes.len() as u64) }).contains("READER_HANDLE_INVALID_ARGUMENT"));
+    assert!(take(fcb_reader_info(pin)).contains("READER_HANDLE_NOT_OPEN"));
+    assert!(take(supplied::fcb_reader_fork(handle, pin)).contains("\"status\":\"ok\""));
+    assert!(take(comparison::fcb_reader_compare(handle, pin, 1, 256, 1_000_000)).contains("COMPARISON_LIMIT"));
+    assert_eq!(fcb_reader_close(handle), 1);
+    let retained = take(fcb_reader_window(pin, start, 64));
+    assert!(retained.contains("\"text\":\"needle\\r\\n\""));
+    assert!(retained.contains("\"additional_source_bytes_read\":\"0\""));
+    assert_eq!(fcb_reader_close(pin), 1);
+}
+
+#[test]
 fn c_open_find_hit_copy_stays_on_the_original_source_after_disk_changes() {
     let _guard = FFI_TEST_LOCK.lock().unwrap();
     let (path, cpath) = file(b"before needle after\r\n");

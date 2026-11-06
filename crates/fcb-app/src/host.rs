@@ -68,15 +68,26 @@ pub fn read_text(path: &Path, max_bytes: usize, canceled: impl FnMut() -> bool)
 
 struct HostBytes { bytes: Vec<u8>, read_calls: u64, _lease: ResourceLease }
 
+/// The legacy text and reading-desk routes keep their own
+/// smaller full-buffer ceiling even when a retained file reader admits more.
+fn read_bytes(path: &Path, max_bytes: usize, canceled: impl FnMut() -> bool)
+    -> Result<HostBytes, HostError> {
+    read_bytes_with_limit(path, max_bytes, MAX_HOST_TEXT_BYTES, canceled)
+}
+
 /// Read the WHOLE named regular file, or fail. Admission happens before source
 /// allocation/I/O. Independently bounded extents are copied in original order
 /// without per-chunk text decoding, so scalar boundaries need not align with
 /// chunk boundaries. A final length/mtime comparison covers the whole operation;
 /// this identifies an observed sequence, not an atomic filesystem snapshot.
 /// Symlink/special-file policy is the same as the ordinary application reader.
-fn read_bytes(path: &Path, max_bytes: usize, mut canceled: impl FnMut() -> bool)
+/// The owning service supplies its fixed admission ceiling independently from
+/// the caller's requested limit. Legacy strings and retained reader captures
+/// share the read guarantees without sharing a payload-size policy.
+fn read_bytes_with_limit(path: &Path, max_bytes: usize, admission_limit: usize,
+    mut canceled: impl FnMut() -> bool)
     -> Result<HostBytes, HostError> {
-    if max_bytes == 0 || max_bytes > MAX_HOST_TEXT_BYTES { return Err(AppError::InputLimit.into()); }
+    if max_bytes == 0 || max_bytes > admission_limit { return Err(AppError::InputLimit.into()); }
     if canceled() { return Err(AppError::Canceled.into()); }
     let budget = ResourceBudget::new(owner(), ByteLength::new(MANAGED_BYTES)).map_err(|_| AppError::Admission)?;
     // Original result + native handoff or retained capture overlap + path scratch.
@@ -105,7 +116,7 @@ fn read_bytes(path: &Path, max_bytes: usize, mut canceled: impl FnMut() -> bool)
         let request = CaptureRequest::new(file_id(), SourceRevision::new(owner(), revision)
             .map_err(|_| AppError::InvalidRange)?).and_then(|r| r.with_range(range))
             .map_err(|_| AppError::InvalidRange)?;
-        revision += 1; // At most four admitted extents, never user-sized iteration.
+        revision += 1; // Bounded by the owning service's fixed admission ceiling.
         let mut read = reader.begin(request, &budget, allocation(91)).map_err(AppError::from)?;
         let remaining_calls = MAX_HOST_READ_CALLS - calls;
         while read.state() == ExtentReadState::Pending {

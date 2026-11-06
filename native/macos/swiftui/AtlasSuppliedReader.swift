@@ -26,7 +26,7 @@ struct AtlasSuppliedReaderSource: Sendable {
     /// lossless for the full UTF-8 captures accepted by the atlas/text routes,
     /// including BOM, embedded NUL, CRLF and decomposed Unicode.
     private func bytes(limit: UInt64) throws -> Data {
-        let maximum = Int(min(limit, AtlasReaderLimits.captureBytes))
+        let maximum = Int(min(limit, AtlasReaderLimits.transferBytes))
         guard text.utf8.prefix(maximum + 1).count <= maximum else {
             throw AtlasReaderError.unavailable
         }

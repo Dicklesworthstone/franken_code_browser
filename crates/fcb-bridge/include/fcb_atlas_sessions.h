@@ -56,7 +56,7 @@ char *fcb_atlas_children(uint64_t handle, uint64_t parent, uint64_t start, uint6
 /* Explicit source action on the ACKNOWLEDGED frame; aggregate hits are refused.
  * reader is an already-created EMPTY fcb_reader_create handle. Its admission
  * and operation lock are acquired before capture. Uses the existing bounded
- * regular-file reader, up to 4 MiB. On success all fcb_reader_* methods operate
+ * regular-file reader, up to 32 MiB. On success all fcb_reader_* methods operate
  * on that retained source, without reopening the path. This is a new source
  * observation after metadata selection, not bytes pinned by atlas discovery.
  * Late cancellation/handoff failure can follow reader installation; reconcile

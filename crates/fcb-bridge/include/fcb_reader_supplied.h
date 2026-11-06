@@ -5,6 +5,8 @@
 extern "C" {
 #endif
 
+#define FCB_READER_MAX_SUPPLIED_BYTES UINT64_C(4194304)
+
 /* HOST-WORKER operation on an empty fcb_reader_create handle. The engine owns
  * a bounded copy before returning. It never opens or canonicalizes label and
  * performs no filesystem or network I/O. A label is metadata, not a root grant.
@@ -14,7 +16,8 @@ extern "C" {
  * label: nonempty NUL-terminated UTF-8, at most 16384 bytes (null is refused).
  * bytes: readable initialized storage of length bytes, stable until return;
  *        need not be UTF-8 or NUL-terminated. Null is permitted only for length 0.
- * length: 0..FCB_READER_MAX_SOURCE_BYTES. Over-limit values are refused before
+ * length: 0..FCB_READER_MAX_SUPPLIED_BYTES (4 MiB), independently of live-file
+ *         capture admission. Over-limit values are refused before
  *         either pointer is dereferenced. Invalid/dangling admitted pointers
  *         remain caller errors, not a safe-input validation feature.
  *

@@ -5,7 +5,11 @@ import Foundation
 /// capture. Plain pages carry no search authority; only an explicitly bound
 /// retained-file hit admits its own selection, never a workspace hit's identity.
 enum AtlasReaderLimits {
-    static let captureBytes: UInt64 = 4 * 1024 * 1024
+    // Live file opening retains one bounded complete observation. Optional
+    // source transfers and comparisons keep their independent smaller caps.
+    static let captureBytes: UInt64 = 32 * 1024 * 1024
+    static let transferBytes: UInt64 = 4 * 1024 * 1024
+    static let comparisonBytes: UInt64 = 4 * 1024 * 1024
     static let pageBytes: UInt64 = 64 * 1024
     static let maximumPageBytes: UInt64 = 256 * 1024
     static let responseBytes = 4 * 1024 * 1024

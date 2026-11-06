@@ -36,7 +36,8 @@ pub extern "C" fn fcb_reader_create() -> u64 {
     std::panic::catch_unwind(|| READERS.get_or_init(ReaderSessions::new).create().unwrap_or(0)).unwrap_or(0)
 }
 
-/// Capture once, retaining exact bytes. A loaded handle cannot be reopened.
+/// Capture once, retaining up to 32 MiB of exact bytes. A loaded handle cannot
+/// be reopened. Window, transfer, analysis and copy limits remain independent.
 /// # Safety
 /// path is null or readable NUL-terminated UTF-8, stable until return. Returned
 /// non-null JSON is released exactly once with this library's fcb_free_string.

@@ -24,7 +24,7 @@ use fcb::source::ignore::IgnoreMatcher;
 use fcb_core::ResourceLease;
 use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES, input, workspace};
 use crate::output::{Output, OutputError};
-use super::{HostError, HostResponse, MAX_HOST_TEXT_BYTES, reader::{ReaderSession, ReaderSessionError}};
+use super::{HostError, HostResponse, reader::{ReaderSession, ReaderSessionError, MAX_READER_SOURCE_BYTES}};
 
 pub const MAX_CATALOG_PAGE_ENTRIES: usize = 256;
 pub const MAX_CATALOG_PATH_BYTES: usize = 2048;
@@ -221,7 +221,7 @@ impl CatalogSession {
         if file.owner() != self.owner() || reader_owner == self.owner() { return Err(CatalogSessionError::ForeignOwner); }
         let index = self.page_index(page_id)?;
         let entry = self.pages[index].files.iter().find(|entry| entry.id == file).ok_or(CatalogSessionError::MissingFile)?;
-        if max_source_bytes == 0 || max_source_bytes > MAX_HOST_TEXT_BYTES { return Err(CatalogSessionError::InvalidLimits); }
+        if max_source_bytes == 0 || max_source_bytes > MAX_READER_SOURCE_BYTES { return Err(CatalogSessionError::InvalidLimits); }
         let relative = entry.path.clone();
         let (reader, info, window, source_bytes, source_calls) =
             self.capture_reader(reader_owner, &relative, max_source_bytes, &mut canceled)?;
@@ -247,7 +247,7 @@ impl CatalogSession {
         max_source_bytes: usize, canceled: &mut impl FnMut() -> bool)
         -> Result<(ReaderSession, HostResponse, HostResponse, u64, u64), CatalogSessionError> {
         if reader_owner == self.owner() { return Err(CatalogSessionError::ForeignOwner); }
-        if max_source_bytes == 0 || max_source_bytes > MAX_HOST_TEXT_BYTES { return Err(CatalogSessionError::InvalidLimits); }
+        if max_source_bytes == 0 || max_source_bytes > MAX_READER_SOURCE_BYTES { return Err(CatalogSessionError::InvalidLimits); }
         check(canceled)?; self.validate_active()?;
         let root = self.grant.root_path().to_path_buf();
         let path = workspace::checked_source_path(&root, relative)?;
@@ -256,7 +256,8 @@ impl CatalogSession {
             let mut stop = || canceled() || self.validate_active().is_err();
             // Retain a relative raw label for the native supplied-source reader;
             // actual filesystem observation and counters stay in this receipt.
-            let raw = super::read_bytes(&path, max_source_bytes, &mut stop).map_err(ReaderSessionError::from)?;
+            let raw = super::read_bytes_with_limit(&path, max_source_bytes, MAX_READER_SOURCE_BYTES,
+                &mut stop).map_err(ReaderSessionError::from)?;
             let mut reader = ReaderSession::from_bytes(reader_owner, &label, &raw.bytes, &mut stop)?;
             let info = reader.info(&mut stop)?;
             let window = reader.read_window(0, FIRST_WINDOW_BYTES, &mut stop)?;

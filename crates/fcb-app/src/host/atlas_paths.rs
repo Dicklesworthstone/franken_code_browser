@@ -17,8 +17,8 @@ use fcb::search::workspace::RootGrant;
 use fcb_core::ResourceLease;
 use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES, workspace};
 use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
-use super::{HostResponse, MAX_HOST_TEXT_BYTES, atlas_session::{AtlasAction, AtlasSession, AtlasSessionError},
-    reader::{ReaderSession, ReaderSessionError}};
+use super::{HostResponse, atlas_session::{AtlasAction, AtlasSession, AtlasSessionError},
+    reader::{ReaderSession, ReaderSessionError, MAX_READER_SOURCE_BYTES}};
 
 pub const MAX_ATLAS_PATH_RESULTS: usize = 4096;
 pub const MAX_ATLAS_PATH_QUERY: usize = 256;
@@ -249,7 +249,7 @@ impl RetainedAtlasPaths {
         -> Result<(ReaderSession, HostResponse), AtlasPathError> {
         let hit = self.hit(atlas, generation, file)?; check(&mut canceled)?;
         if reader_owner == self.manifest.owner() { return Err(AtlasPathError::WrongAtlas); }
-        if !(1..=MAX_HOST_TEXT_BYTES).contains(&max_bytes) { return Err(AppError::InputLimit.into()); }
+        if !(1..=MAX_READER_SOURCE_BYTES).contains(&max_bytes) { return Err(AppError::InputLimit.into()); }
         let mut out = self.output("open-reader", true)?;
         let entry = atlas.atlas().catalog().entry(file).ok_or(AtlasPathError::MissingHit)?;
         let root = self.grant.root_path().to_path_buf();

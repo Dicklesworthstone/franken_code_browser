@@ -89,7 +89,8 @@ is usable but remains explicit; no refresh or live reconciliation is implied.
 The C viewport defaults to 1024 parcels/32768 visits. Safe Rust options admit
 up to 4096 parcels/131072 visits. Responses fit the existing 8 MiB cap. Each
 atlas has a 256 MiB managed accounting domain, not a process-footprint guarantee.
-Reader capture remains separately admitted up to 4 MiB.
+Reader capture remains separately admitted up to 32 MiB. Opening a source keeps
+the complete observed bytes; subsequent reader windows remain at most 256 KiB.
 
 All operations are synchronous worker services, including JSON encoding and
 final large-object destruction. Do not call these operations directly in input

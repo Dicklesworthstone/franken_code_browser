@@ -235,6 +235,31 @@ private final class Driver: @unchecked Sendable {
             unsupported.close()
         }
 
+        // Large retained sources still pin and navigate without gaining a
+        // larger reading-desk transfer allowance. Only page payloads cross UI.
+        do {
+            let tail = Int(AtlasReaderLimits.transferBytes) + 16
+            let driver = Driver(bytes: Array(repeating: 120, count: tail) + Array("needle\n".utf8))
+            let parent = opened(driver)
+            check(parent.canPin && parent.canFind && !parent.canKeep,
+                  "large capture lost reading/pinning or acquired desk transfer")
+            check(parent.coverage.contains("4 MiB"), "smaller optional-operation cap was hidden")
+            parent.offsetInput = String(tail); parent.goToByte()
+            wait("far large-source page did not open") { !parent.busy }
+            check(parent.page?.text == "needle\n", "far source navigation was truncated at legacy cap")
+            let child = pin(parent)
+            check(child.page?.text == "needle\n" && child.canPin && !child.canKeep,
+                  "large pin lost capture eligibility or widened desk transfer")
+            driver.setLive("replacement"); parent.close()
+            wait("large source parent did not retire") { driver.log.contains("close:1") }
+            child.offsetInput = String(tail + 1); child.goToByte()
+            wait("large pin failed after parent closure") { !child.busy }
+            check(child.page?.text == "eedle\n"
+                && driver.log.filter({ $0.hasPrefix("open:") }).count == 1,
+                  "large pin reopened or substituted current disk bytes")
+            child.close()
+        }
+
         // Pin at a nonzero window, with independent navigation and a root lease
         // that survives closing the source pane. An explicit child refresh is
         // the only operation that reads changed live bytes.
@@ -242,6 +267,7 @@ private final class Driver: @unchecked Sendable {
             let driver = Driver()
             var lease: Lease? = Lease(); weak var weakLease = lease
             let parent = opened(driver, lease: lease)
+            check(parent.canKeep, "small retained capture lost reading-desk eligibility")
             lease = nil
             parent.offsetInput = "5"; parent.goToByte()
             wait("parent navigation") { !parent.busy }

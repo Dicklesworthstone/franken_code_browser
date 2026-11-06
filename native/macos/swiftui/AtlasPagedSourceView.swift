@@ -145,8 +145,8 @@ import AppKit
                 }
                 if let keep {
                     Button { keep(model) } label: { Label("Keep in reading desk", systemImage: "books.vertical") }
-                        .disabled(!canKeep || !model.canPin)
-                        .help("Keep the entire exact source capture at this page, with bookmarks, cross-file history and explicit checkpoint saving")
+                        .disabled(!canKeep || !model.canKeep)
+                        .help("Keep the entire exact source capture, up to 4 MiB, at this page with bookmarks, cross-file history and explicit checkpoint saving")
                 }
                 Button("Back", action: model.back).disabled(!model.canGoBack)
                     .help("Return to the previous retained byte window")

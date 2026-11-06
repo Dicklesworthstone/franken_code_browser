@@ -84,7 +84,10 @@ import Foundation
         ambiguous.open(root: "/project", path: "é.md", accessLease: nil)
         check(ambiguous.page == nil && both.snapshot.next == 1, "two capture origins were silently prioritized")
         let tooLarge = Fixture()
-        let over = try source(String(repeating: "x", count: Int(AtlasReaderLimits.captureBytes) + 1))
+        check(AtlasReaderLimits.transferBytes == 4 * 1024 * 1024
+            && AtlasReaderLimits.transferBytes < AtlasReaderLimits.captureBytes,
+              "full-buffer transfer inherited the larger live capture allowance")
+        let over = try source(String(repeating: "x", count: Int(AtlasReaderLimits.transferBytes) + 1))
         let oversized = AtlasPagedReaderModel(transport: tooLarge.transport(), supplied: over)
         oversized.open(root: "/project", path: "é.md", accessLease: nil)
         try await wait { !oversized.busy }

@@ -40,7 +40,7 @@ extension AtlasReaderTransport {
             try? FileHandle.standardError.write(contentsOf: message)
         }, fork: { take(fcb_reader_fork($0, $1)) },
         openBytes: { handle, label, bytes in
-            guard bytes.count <= Int(AtlasReaderLimits.captureBytes),
+            guard bytes.count <= Int(AtlasReaderLimits.transferBytes),
                   !label.isEmpty, label.utf8.count <= 16_384, !label.utf8.contains(0) else { return nil }
             // Invoked only by the coordinator's bounded worker queue. The
             // original UTF-8 (including BOM, NUL and normalization form) stays

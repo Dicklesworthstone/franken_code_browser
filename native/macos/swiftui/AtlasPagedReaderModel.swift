@@ -88,6 +88,10 @@ import Observation
     var canGoNext: Bool { page?.nextOffset != nil && !busy }
     var canRefresh: Bool { page != nil && refreshInput != nil && !busy && !documentPreview.busy }
     var canPin: Bool { page != nil && !busy && !pinning && !documentPreview.busy && coordinator.canFork }
+    var canKeep: Bool {
+        guard canPin, let page else { return false }
+        return page.identity.capturedBytes <= AtlasReaderLimits.transferBytes
+    }
     var canCompare: Bool { page != nil && !busy && !pinning && !documentPreview.busy && coordinator.supportsComparison }
     var retainedRegistryDomain: UUID? { coordinator.retainedRegistryDomain }
     var canFind: Bool { page != nil && coordinator.supportsFind }
@@ -126,6 +130,9 @@ import Observation
     var coverage: String {
         guard let page else { return "Retained capture limit: \(AtlasReaderLimits.captureBytes / 1024 / 1024) MiB. Oversized sources are refused, not truncated." }
         var messages = ["Logical page; layout is local to this window."]
+        if page.identity.capturedBytes > AtlasReaderLimits.transferBytes {
+            messages.append("Comparison and reading-desk transfer are limited to 4 MiB per source. Paging, Find and pinning use this retained capture.")
+        }
         if let highlight = page.highlight { messages.append(highlight.summary) }
         if refreshedFromDisk {
             messages.append("Explicitly refreshed disk capture; older search, outline and preview targets were retired. File observation is not an atomic filesystem snapshot.")

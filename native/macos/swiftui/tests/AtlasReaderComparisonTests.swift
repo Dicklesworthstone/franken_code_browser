@@ -48,10 +48,12 @@ private final class Driver: @unchecked Sendable {
     private var blocked = false
     private var limited = false
     private var corruption: String?
+    private let sourceBytes: [UInt8]?
     let domain = UUID()
     let entered = DispatchSemaphore(value: 0)
     let gate = DispatchSemaphore(value: 0)
 
+    init(bytes: [UInt8]? = nil) { sourceBytes = bytes }
     var log: [String] { lock.lock(); defer { lock.unlock() }; return calls }
     func blockCompare() { lock.lock(); blocked = true; lock.unlock() }
     func limitCompare() { lock.lock(); limited = true; lock.unlock() }
@@ -65,7 +67,7 @@ private final class Driver: @unchecked Sendable {
         precondition(!Thread.isMainThread)
         lock.lock(); defer { lock.unlock() }
         let capture = Capture(path: path,
-            bytes: Array((path.hasSuffix("/after") ? "new after" : "old before").utf8),
+            bytes: sourceBytes ?? Array((path.hasSuffix("/after") ? "new after" : "old before").utf8),
             digest: String(repeating: owner % 2 == 1 ? "a" : "b", count: 64))
         captures[owner] = capture; calls.append("open:\(owner):\(path)")
         return json(capture.header(owner, "info"))
@@ -118,7 +120,7 @@ private final class Driver: @unchecked Sendable {
         out["source_reopened"] = false
         out["coordinate_domain"] = "original-bytes-may-split-text"
         out["alignment_semantics"] = "deterministic-not-identity-proof"
-        out["max_source_bytes"] = String(AtlasReaderLimits.captureBytes)
+        out["max_source_bytes"] = String(AtlasReaderLimits.comparisonBytes)
         out["max_edit_distance"] = String(edits); out["max_work"] = String(work)
         out["work_units"] = String(incomplete ? work : min(32, work))
         out["edit_distance"] = incomplete ? NSNull() as Any : "13"
@@ -212,6 +214,20 @@ private final class Driver: @unchecked Sendable {
     }
 
     static func main() {
+        for count in [AtlasReaderLimits.comparisonBytes, AtlasReaderLimits.comparisonBytes + 1] {
+            let driver = Driver(bytes: Array(repeating: 120, count: Int(count)))
+            let before = opened(driver, path: "before"), after = opened(driver, path: "after")
+            check(before.canCompare == (count <= AtlasReaderLimits.comparisonBytes),
+                  "comparison eligibility followed the larger live capture limit")
+            if count > AtlasReaderLimits.comparisonBytes {
+                let calls = driver.log
+                refused(before, after)
+                check(driver.log == calls, "oversized comparison reached the foreign operation")
+                check(before.page?.identity.capturedBytes == count && after.page?.identity.capturedBytes == count,
+                      "comparison refusal discarded a readable source")
+            }
+            before.close(); after.close()
+        }
         do {
             let driver = Driver()
             let inert = AtlasPagedReaderModel(transport: driver.transport())

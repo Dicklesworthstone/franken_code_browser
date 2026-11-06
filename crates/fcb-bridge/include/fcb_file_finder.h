@@ -54,7 +54,7 @@ char *fcb_file_finder_stop(uint64_t handle, uint64_t generation);
  * The destination must be an already-created EMPTY reader. Source access is
  * admitted only after destination and query/revision/file checks. The resulting
  * independent reader survives finder closure and preserves its exact capture.
- * max_source_bytes: 1..4194304; larger files refuse rather than truncate.
+ * max_source_bytes: 1..33554432 (32 MiB); larger files refuse rather than truncate.
  */
 char *fcb_file_finder_open_reader(uint64_t handle, uint64_t reader,
     uint64_t generation, uint64_t revision, uint64_t file, uint64_t max_source_bytes);

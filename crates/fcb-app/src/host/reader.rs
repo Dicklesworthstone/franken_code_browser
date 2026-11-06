@@ -3,6 +3,10 @@
 //! A retained native-host reading session over ONE immutable source capture.
 //! Only `open` performs filesystem I/O. Windows, physical-line navigation,
 //! search, outlines, Markdown previews and exact copies use retained bytes.
+//! Live opening and safe supplied captures admit at most 32 MiB in full; this
+//! is not out-of-core storage. Windows/copies remain at most 256 KiB, while
+//! foreign supplied buffers, comparison, desk and document services keep their
+//! own independent limits. Forks share captured backing and its reservation.
 //! No self-referential index, new matcher, decoder, runtime or native UI exists
 //! here. Calls are bounded synchronous worker operations, not redraw callbacks.
 
@@ -28,14 +32,18 @@ use fcb::store::{Sha256, Sha256Digest};
 use fcb_core::ResourceLease;
 use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES};
 use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
-use super::{HostError, HostResponse, MAX_HOST_TEXT_BYTES};
+use super::{HostError, HostResponse};
 
+/// Complete immutable observations, not out-of-core reading. This is separate
+/// from the legacy whole-text/foreign supplied-buffer limit; larger captures
+/// still return bounded windows and do not widen optional analysis/desk limits.
+pub const MAX_READER_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_READER_WINDOW_BYTES: usize = 256 * 1024;
 pub const MAX_READER_MATCHES: usize = 4096;
 pub const MAX_READER_NEEDLE_BYTES: usize = 1024;
 pub const MAX_READER_CONTEXT_BYTES: usize = 16 * 1024;
 const LINE_SCAN_STEP: usize = 64 * 1024;
-const LINE_CHECKPOINTS: usize = MAX_HOST_TEXT_BYTES / LINE_SCAN_STEP + 1;
+const LINE_CHECKPOINTS: usize = MAX_READER_SOURCE_BYTES / LINE_SCAN_STEP + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReaderSessionError {
@@ -123,10 +131,11 @@ pub struct ReaderSession {
 impl ReaderSession {
     /// Admit a complete regular-file observation, including arbitrary bytes.
     /// The legacy read_text service uses the SAME bounded byte reader but has
-    /// stricter UTF-8/NUL requirements for its text-only C return value.
+    /// stricter UTF-8/NUL requirements and its own smaller payload limit for
+    /// the text-only C return value. No prefix is substituted on admission failure.
     pub fn open(owner: ArenaOwnerId, path: &Path, max_source_bytes: usize,
         mut canceled: impl FnMut() -> bool) -> Result<Self, ReaderSessionError> {
-        let raw = super::read_bytes(path, max_source_bytes, &mut canceled)?;
+        let raw = super::read_bytes_with_limit(path, max_source_bytes, MAX_READER_SOURCE_BYTES, &mut canceled)?;
         let mut session = Self::from_bytes(owner, path, &raw.bytes, &mut canceled)?;
         session.source_bytes_read = raw.bytes.len() as u64;
         session.read_calls = raw.read_calls;
@@ -140,7 +149,7 @@ impl ReaderSession {
     pub fn from_bytes(owner: ArenaOwnerId, path: &Path, bytes: &[u8],
         mut canceled: impl FnMut() -> bool) -> Result<Self, ReaderSessionError> {
         check(&mut canceled)?;
-        if bytes.len() > MAX_HOST_TEXT_BYTES || path.as_os_str().is_empty()
+        if bytes.len() > MAX_READER_SOURCE_BYTES || path.as_os_str().is_empty()
             || path.as_os_str().len() > 16_384 { return Err(ReaderSessionError::InvalidLimits); }
         let budget = ResourceBudget::new(owner, ByteLength::new(MANAGED_BYTES)).map_err(|_| AppError::Admission)?;
         // Preserve the conservative copy/overlap envelope once per supplied
