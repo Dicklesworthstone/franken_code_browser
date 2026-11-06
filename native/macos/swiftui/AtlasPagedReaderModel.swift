@@ -278,13 +278,24 @@ import Observation
     }
     func openRetained(pathBytes: [UInt8], offset: UInt64, registryDomain: UUID,
         initialize: @escaping @Sendable (UInt64) throws -> String?) async throws {
+        guard !pathBytes.isEmpty, pathBytes.count <= 16_384, !pathBytes.contains(0) else {
+            throw AtlasReaderError.invalidInput
+        }
+        try await openRetained(offset: offset, registryDomain: registryDomain) { handle in
+            try AtlasReaderInfo.decodeRetainedInitialization(initialize(handle), handle: handle, pathBytes: pathBytes)
+        }
+    }
+    /// Adopt source identity returned by a separately authorized shared service.
+    /// This permits logical link resolution without opening a caller-made path.
+    func openRetained(offset: UInt64, registryDomain: UUID,
+        initialize: @escaping @Sendable (UInt64) throws -> AtlasReaderInfo) async throws {
         guard page == nil, !busy, capturedTarget == nil, suppliedSource == nil else {
             throw AtlasReaderError.unavailable
         }
         let ticket = begin()
         notice = "Opening the exact retained capture…"
         do {
-            let opened = try await coordinator.openRetained(pathBytes: pathBytes, offset: offset,
+            let opened = try await coordinator.openRetained(offset: offset,
                 registryDomain: registryDomain, initialize: initialize)
             try Task.checkCancellation()
             guard operation == ticket else { throw AtlasReaderError.canceled }

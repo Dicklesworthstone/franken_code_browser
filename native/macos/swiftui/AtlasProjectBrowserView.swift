@@ -112,17 +112,9 @@ import SwiftUI
                 .font(.caption2).foregroundStyle(.secondary)
         }.padding(12).frame(maxWidth: .infinity, maxHeight: .infinity)
         .sheet(item: $capture) { capture in
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Text(verbatim: capture.file.display).font(.headline).textSelection(.enabled)
-                    Spacer()
-                    Button("Done") { capture.reader.close(); self.capture = nil }.keyboardShortcut(.cancelAction)
-                }
-                Text("New source capture from the selected file. The directory size was an earlier metadata observation.")
-                    .font(.caption).foregroundStyle(.secondary)
-                AtlasPagedSourceView(model: capture.reader, canKeep: canKeep, keep: keep)
-            }.padding(14).frame(minWidth: 850, idealWidth: 1100, minHeight: 600, idealHeight: 760)
-                .onDisappear { capture.reader.close() }
+            AtlasProjectCaptureView(model: model, origin: capture, canKeep: canKeep, keep: keep) {
+                capture.reader.close(); self.capture = nil
+            }
         }
         .onDisappear { readerTask?.cancel(); capture?.reader.close(); capture = nil }
     }
@@ -141,5 +133,92 @@ import SwiftUI
                     ?? (error as? AtlasReaderError)?.message ?? "The selected file could not be opened."
             }
         }
+    }
+}
+
+/// Keep one originating capture and one linked reader. A new target replaces
+/// only the previous linked reader after acceptance; failed navigation leaves
+/// both visible captures intact. Closing the target returns to the exact origin.
+@MainActor private struct AtlasProjectCaptureView: View {
+    @Bindable var model: AtlasProjectBrowserModel
+    let origin: AtlasProjectBrowserCapture
+    let canKeep: Bool
+    let keep: (AtlasPagedReaderModel) -> Void
+    let done: () -> Void
+    @State private var linked: AtlasProjectBrowserCapture?
+    @State private var task: Task<Void, Never>?
+    @State private var operation = UUID()
+    @State private var notice = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(verbatim: origin.file.display).font(.headline).textSelection(.enabled)
+                Spacer()
+                if task != nil {
+                    ProgressView().controlSize(.small)
+                    Button("Stop opening link") { task?.cancel() }
+                }
+                Button("Done", action: done).keyboardShortcut(.cancelAction)
+            }
+            Text("The originating capture stays open while you follow links to files in the current project pages.")
+                .font(.caption).foregroundStyle(.secondary)
+            HSplitView {
+                AtlasPagedSourceView(model: origin.reader, canKeep: canKeep, keep: keep,
+                    openLocalLink: navigation(from: origin)).id(origin.id).frame(minWidth: 400)
+                if let linked {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text(verbatim: linked.file.display).font(.headline).textSelection(.enabled)
+                            Spacer()
+                            Button("Close linked file") { closeLinked() }
+                        }
+                        Text("New capture of the linked file. The originating capture is retained on the left.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        if !linked.unappliedFragment.isEmpty {
+                            Text(verbatim: "Opened at the beginning; the linked heading has not been applied: " + linked.unappliedFragment)
+                                .font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                        }
+                        AtlasPagedSourceView(model: linked.reader, canKeep: canKeep, keep: keep,
+                            openLocalLink: navigation(from: linked))
+                    }.id(linked.id).frame(minWidth: 400)
+                }
+            }
+            if !notice.isEmpty { Text(notice).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
+        }.padding(14).frame(minWidth: 850, idealWidth: linked == nil ? 1100 : 1400, minHeight: 600, idealHeight: 760)
+            .onDisappear {
+                operation = UUID(); task?.cancel(); task = nil
+                linked?.reader.close(); linked = nil; origin.reader.close()
+            }
+    }
+    private func navigation(from source: AtlasProjectBrowserCapture) -> AtlasDocumentPreviewModel.LocalNavigation? {
+        guard task == nil, !model.closed else { return nil }
+        return { target in open(target, from: source) }
+    }
+    private func open(_ target: AtlasReaderDocumentLinkTarget, from source: AtlasProjectBrowserCapture) {
+        guard task == nil else { return }
+        let ticket = UUID(); operation = ticket
+        notice = "Opening the linked file from retained project metadata…"
+        task = Task {
+            defer { if operation == ticket { task = nil } }
+            do {
+                let candidate = try await model.openDocumentLink(target, from: source, readerTransport: .native,
+                    search: .native, outline: .native, document: .native)
+                guard operation == ticket, !Task.isCancelled else { candidate.reader.close(); return }
+                let previous = linked
+                linked = candidate
+                previous?.reader.close()
+                notice = "Linked capture ready. Close it to return to the originating document."
+            } catch {
+                guard operation == ticket else { return }
+                notice = (error as? AtlasProjectBrowserError)?.message
+                    ?? (error as? AtlasReaderError)?.message ?? "The linked file could not be opened."
+            }
+        }
+    }
+    private func closeLinked() {
+        operation = UUID(); task?.cancel(); task = nil
+        linked?.reader.close(); linked = nil
+        notice = "Returned to the retained originating document."
     }
 }

@@ -11,7 +11,18 @@ enum AtlasProjectBrowserError: Error, Sendable {
         case .invalidResponse: return "The project page could not be verified. Reload the latest page before opening files."
         case .stale: return "This file page is no longer retained. Choose a file from a current page."
         case .canceled: return "Project work stopped. An entered discovery batch may still be finishing."
-        case .engine(let code): return "Project operation unavailable (\(code))."
+        case .engine(let code):
+            switch code {
+            case "CATALOG_SESSION_LINK_TARGET_NOT_RETAINED":
+                return "The linked file is outside the retained project pages. Continue discovery to locate it; this does not mean the file is missing."
+            case "CATALOG_SESSION_STALE_READER_RECEIPT", "CATALOG_SESSION_READER_RECEIPT_MISMATCH":
+                return "This capture can no longer open new project links. Reopen its file from Project Files; the retained capture stays readable."
+            case "CATALOG_SESSION_STALE_PAGE":
+                return "The source project page is no longer retained. Reopen the file from a current page to follow its links."
+            case "CATALOG_SESSION_UNSUPPORTED_DOCUMENT_LINK":
+                return "This link cannot be opened as a local project file."
+            default: return "Project operation unavailable (\(code))."
+            }
         }
     }
 }
@@ -215,6 +226,8 @@ enum AtlasProjectBrowserWire {
 enum AtlasProjectBrowserRequest: Sendable {
     case open(String), info, page(UInt64), advance(after: UInt64), stop
     case openReader(reader: UInt64, page: UInt64, file: UInt64, bytes: UInt64)
+    case openDocumentLink(origin: UInt64, destination: UInt64, page: UInt64, file: UInt64,
+                          generation: UInt64, link: UInt64, bytes: UInt64)
 }
 struct AtlasProjectBrowserTransport: Sendable {
     let create: @Sendable () -> UInt64
@@ -227,6 +240,7 @@ struct AtlasProjectBrowserTransport: Sendable {
 
 private struct AtlasProjectBrowserReceipt: Sendable {
     let readerJSON: String
+    let info: AtlasReaderInfo
     let window: AtlasReaderPage
     static func decode(_ json: String?, owner: UInt64, page: UInt64, file: AtlasProjectBrowserFile,
         destination: UInt64) throws -> Self {
@@ -242,27 +256,32 @@ private struct AtlasProjectBrowserReceipt: Sendable {
             guard current.retains(page), selected.page_id.value == page, selected.file_id.value == file.id,
                   selected.path.raw == file.rawPath, destination > 0, destination != owner,
                   selected.reader_owner.value == destination,
-                  selected.source_observation == "new-capture-after-metadata-selection",
-                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let nested = object["reader"] as? [String: Any], let window = object["window"] as? [String: Any] else {
+                  selected.source_observation == "new-capture-after-metadata-selection" else {
                 throw AtlasProjectBrowserError.invalidResponse
             }
-            func encoded(_ value: [String: Any]) throws -> String {
-                String(decoding: try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]), as: UTF8.self)
-            }
-            let readerJSON = try encoded(nested)
-            let reader = try AtlasReaderInfo.decodeRetainedInitialization(readerJSON, handle: destination, pathBytes: file.rawPath)
-            let bytes = selected.source_bytes_read.value, calls = selected.source_read_calls.value
-            guard bytes == reader.identity.capturedBytes, bytes <= AtlasReaderLimits.captureBytes,
-                  (bytes == 0 && calls == 0) || (bytes > 0 && calls > 0 && calls <= 1_048_576) else {
-                throw AtlasProjectBrowserError.invalidResponse
-            }
-            // Directory metadata predates this explicitly requested capture;
-            // observedBytes is not a source snapshot or digest promise.
-            let first = try AtlasReaderPage.decode(encoded(window), info: reader, request: .window(offset: 0, bytes: 16_384))
-            return Self(readerJSON: readerJSON, window: first)
+            return try capture(data, destination: destination, file: file,
+                bytes: selected.source_bytes_read.value, calls: selected.source_read_calls.value)
         } catch let error as AtlasProjectBrowserError { throw error }
         catch { throw AtlasProjectBrowserError.invalidResponse }
+    }
+    static func capture(_ data: Data, destination: UInt64, file: AtlasProjectBrowserFile,
+        bytes: UInt64, calls: UInt64) throws -> Self {
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let nested = object["reader"] as? [String: Any], let window = object["window"] as? [String: Any] else {
+            throw AtlasProjectBrowserError.invalidResponse
+        }
+        func encoded(_ value: [String: Any]) throws -> String {
+            String(decoding: try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]), as: UTF8.self)
+        }
+        let readerJSON = try encoded(nested)
+        let reader = try AtlasReaderInfo.decodeRetainedInitialization(readerJSON, handle: destination, pathBytes: file.rawPath)
+        guard bytes == reader.identity.capturedBytes, bytes <= AtlasReaderLimits.captureBytes,
+              (bytes == 0 && calls == 0) || (bytes > 0 && calls > 0 && calls <= 1_048_576) else {
+            throw AtlasProjectBrowserError.invalidResponse
+        }
+        // Earlier observedBytes is metadata, not a capture/digest promise.
+        let first = try AtlasReaderPage.decode(encoded(window), info: reader, request: .window(offset: 0, bytes: 16_384))
+        return Self(readerJSON: readerJSON, info: reader, window: first)
     }
     func validate(_ page: AtlasReaderPage?) throws {
         guard let page, page.identity.matches(window.identity), page.start == window.start else {
@@ -288,11 +307,81 @@ private final class AtlasProjectBrowserReceiptBox: @unchecked Sendable {
         return receipt
     }
 }
+
+private struct AtlasProjectBrowserLinkOrigin: Sendable {
+    let catalog: UInt64
+    let page: UInt64
+    let file: UInt64
+    let identity: AtlasReaderIdentity
+    let digest: String
+}
+private struct AtlasProjectBrowserLinkReceipt: Sendable {
+    let capture: AtlasProjectBrowserReceipt
+    let file: AtlasProjectBrowserFile
+    let page: UInt64
+    let fragment: String
+    static func decode(_ json: String?, source: AtlasProjectBrowserLinkOrigin,
+        target: AtlasReaderDocumentLinkTarget, destination: UInt64) throws -> Self {
+        let data = try AtlasProjectBrowserWire.admit(json, owner: source.catalog, command: "open-document-link")
+        do {
+            let current = try AtlasProjectBrowserInfo.decode(data, owner: source.catalog)
+            struct Wire: Decodable {
+                let source_page_id, source_file_id, source_reader_owner, document_generation, link_id: AtlasCatalogNumber
+                let target_page_id, reader_owner, source_bytes_read, source_read_calls, initial_original_offset: AtlasCatalogNumber
+                let source_capture_sha256, source_observation, destination, destination_suffix, fragment_status, fragment_suffix: String
+                let target_file: AtlasProjectBrowserFile
+            }
+            let w = try JSONDecoder().decode(Wire.self, from: data)
+            let fragment = w.destination_suffix.firstIndex(of: "#").map { String(w.destination_suffix[$0...]) } ?? ""
+            guard current.retains(source.page), current.retains(w.target_page_id.value),
+                  w.source_page_id.value == source.page, w.source_file_id.value == source.file,
+                  w.source_reader_owner.value == source.identity.owner,
+                  w.source_capture_sha256.utf8.elementsEqual(source.digest.utf8),
+                  target.inventory.identity.matches(source.identity), target.link.kind == .local,
+                  w.document_generation.value == target.inventory.generation, w.link_id.value == target.link.id,
+                  w.destination.utf8.elementsEqual(target.link.destination.utf8),
+                  w.destination_suffix.utf8.count <= AtlasReaderDocumentLimits.destinationBytes,
+                  w.fragment_suffix.utf8.elementsEqual(fragment.utf8),
+                  w.fragment_status == (fragment.isEmpty ? "none" : "not-applied"),
+                  w.initial_original_offset.value == 0, w.target_file.id <= current.discovered,
+                  destination > 0, destination != source.catalog, destination != source.identity.owner,
+                  w.reader_owner.value == destination, w.source_observation == "new-capture-after-document-link" else {
+                throw AtlasProjectBrowserError.invalidResponse
+            }
+            return Self(capture: try AtlasProjectBrowserReceipt.capture(data, destination: destination, file: w.target_file,
+                bytes: w.source_bytes_read.value, calls: w.source_read_calls.value),
+                file: w.target_file, page: w.target_page_id.value, fragment: fragment)
+        } catch let error as AtlasProjectBrowserError { throw error }
+        catch { throw AtlasProjectBrowserError.invalidResponse }
+    }
+}
+private final class AtlasProjectBrowserLinkReceiptBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var receipt: AtlasProjectBrowserLinkReceipt?
+    func set(_ value: AtlasProjectBrowserLinkReceipt) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard receipt == nil else { throw AtlasProjectBrowserError.invalidResponse }
+        receipt = value
+    }
+    func accepted() throws -> AtlasProjectBrowserLinkReceipt {
+        lock.lock(); defer { lock.unlock() }
+        guard let receipt else { throw AtlasProjectBrowserError.invalidResponse }
+        return receipt
+    }
+}
 @MainActor final class AtlasProjectBrowserCapture: Identifiable {
     let id = UUID()
     let file: AtlasProjectBrowserFile
     let reader: AtlasPagedReaderModel
-    init(file: AtlasProjectBrowserFile, reader: AtlasPagedReaderModel) { self.file = file; self.reader = reader }
+    let catalogOwner: UInt64
+    let pageID: UInt64
+    let captureSHA256: String
+    let unappliedFragment: String
+    init(file: AtlasProjectBrowserFile, reader: AtlasPagedReaderModel, catalogOwner: UInt64,
+        pageID: UInt64, captureSHA256: String, unappliedFragment: String = "") {
+        self.file = file; self.reader = reader; self.catalogOwner = catalogOwner
+        self.pageID = pageID; self.captureSHA256 = captureSHA256; self.unappliedFragment = unappliedFragment
+    }
 }
 
 private final class AtlasProjectBrowserAccess: @unchecked Sendable {
@@ -439,12 +528,63 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
                 }
                 try Task.checkCancellation()
                 guard !closed, !flag.isCanceled, session === lease else { throw AtlasProjectBrowserError.canceled }
-                try receipt.accepted().validate(reader.page)
+                let accepted = try receipt.accepted()
+                try accepted.validate(reader.page)
+                guard let digest = accepted.info.captureSHA256 else { throw AtlasProjectBrowserError.invalidResponse }
                 notice = "Opened a new source capture from the selected file. Its reader survives page eviction and project closure."
-                return AtlasProjectBrowserCapture(file: file, reader: reader)
+                return AtlasProjectBrowserCapture(file: file, reader: reader, catalogOwner: lease.owner,
+                    pageID: page.id, captureSHA256: digest)
             }, onCancel: { flag.cancel(); lease.cancel() })
         } catch {
-            reader.close(); notice = Self.message(error); throw error
+            reader.close()
+            let failure: Error = closed || flag.isCanceled || Task.isCancelled ? AtlasProjectBrowserError.canceled : error
+            notice = Self.message(failure); throw failure
+        }
+    }
+    func openDocumentLink(_ target: AtlasReaderDocumentLinkTarget, from origin: AtlasProjectBrowserCapture,
+        readerTransport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
+        outline: AtlasReaderOutlineTransport? = nil, document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasProjectBrowserCapture {
+        guard canOperate, let lease = session, let info, let domain = transport.readerDomain,
+              readerTransport.comparison?.domain == domain, origin.reader.retainedRegistryDomain == domain,
+              origin.catalogOwner == lease.owner, info.owner == lease.owner, info.retains(origin.pageID),
+              target.link.kind == .local, origin.reader.documentPreview.allows(target),
+              let identity = origin.reader.page?.identity, identity.matches(target.inventory.identity),
+              identity.pathBytes == origin.file.rawPath else { throw AtlasProjectBrowserError.stale }
+        try Task.checkCancellation()
+        let source = AtlasProjectBrowserLinkOrigin(catalog: lease.owner, page: origin.pageID,
+            file: origin.file.id, identity: identity, digest: origin.captureSHA256)
+        let flag = AtlasSearchCancellation(); self.flag = flag; busy = true
+        let reader = AtlasPagedReaderModel(transport: readerTransport, search: search, outline: outline, document: document)
+        defer { finish() }
+        do {
+            return try await withTaskCancellationHandler(operation: {
+                let receipt = AtlasProjectBrowserLinkReceiptBox()
+                try await reader.openRetained(offset: 0, registryDomain: domain) { destination in
+                    guard !flag.isCanceled else { throw AtlasProjectBrowserError.canceled }
+                    return try withExtendedLifetime(lease) {
+                        let admitted = try AtlasProjectBrowserLinkReceipt.decode(lease.transport.run(lease.owner,
+                            .openDocumentLink(origin: source.identity.owner, destination: destination, page: source.page,
+                                file: source.file, generation: target.inventory.generation, link: target.link.id,
+                                bytes: AtlasReaderLimits.captureBytes)), source: source, target: target, destination: destination)
+                        try receipt.set(admitted)
+                        return admitted.capture.info
+                    }
+                }
+                try Task.checkCancellation()
+                guard !closed, !flag.isCanceled, session === lease,
+                      origin.reader.page?.identity.matches(identity) == true,
+                      origin.reader.documentPreview.allows(target) else { throw AtlasProjectBrowserError.canceled }
+                let accepted = try receipt.accepted()
+                try accepted.capture.validate(reader.page)
+                guard let digest = accepted.capture.info.captureSHA256 else { throw AtlasProjectBrowserError.invalidResponse }
+                notice = "Opened the linked project file as a new capture. The originating reader remains available."
+                return AtlasProjectBrowserCapture(file: accepted.file, reader: reader, catalogOwner: lease.owner,
+                    pageID: accepted.page, captureSHA256: digest, unappliedFragment: accepted.fragment)
+            }, onCancel: { flag.cancel(); lease.cancel() })
+        } catch {
+            reader.close()
+            let failure: Error = closed || flag.isCanceled || Task.isCancelled ? AtlasProjectBrowserError.canceled : error
+            notice = Self.message(failure); throw failure
         }
     }
     func close() {

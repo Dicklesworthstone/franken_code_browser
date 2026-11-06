@@ -127,7 +127,7 @@ mod supplied;
 #[path = "reader_outline_ffi.rs"]
 mod outline;
 #[path = "reader_document_ffi.rs"]
-mod document;
+pub(super) mod document;
 #[path = "reader_comparison_ffi.rs"]
 mod comparison;
 

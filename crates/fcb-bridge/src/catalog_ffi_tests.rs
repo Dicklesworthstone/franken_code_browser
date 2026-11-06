@@ -2,6 +2,7 @@
 
 use super::*;
 use super::super::reader_ffi::{fcb_reader_create, fcb_reader_copy_range, fcb_reader_close, FFI_TEST_LOCK};
+use super::super::reader_ffi::document::{fcb_reader_document, fcb_reader_document_links_prepare};
 use std::{ffi::{CStr, CString, OsString}, fs, os::unix::ffi::OsStringExt,
     sync::atomic::{AtomicU64, Ordering}};
 
@@ -51,7 +52,8 @@ fn c_catalog_errors_are_bounded_and_empty_complete_is_not_failed_open() {
     let _guard = FFI_TEST_LOCK.lock().unwrap();
     for pointer in [fcb_catalog_info(u64::MAX), fcb_catalog_page(u64::MAX, 1),
         fcb_catalog_advance(u64::MAX, 1), fcb_catalog_stop(u64::MAX),
-        fcb_catalog_open_reader(u64::MAX, u64::MAX, 1, 1, 1024)] {
+        fcb_catalog_open_reader(u64::MAX, u64::MAX, 1, 1, 1024),
+        fcb_catalog_open_document_link(u64::MAX, 1, 2, 1, 1, 1, 1, 1024)] {
         let text = take(pointer); assert!(text.len() < 4096);
         assert!(text.contains("\"status\":\"error\""));
     }
@@ -79,11 +81,44 @@ fn c_catalog_signatures_match_the_public_header() {
     let _: extern "C" fn(u64, u64) -> *mut c_char = fcb_catalog_advance;
     let _: extern "C" fn(u64) -> *mut c_char = fcb_catalog_stop;
     let _: extern "C" fn(u64, u64, u64, u64, u64) -> *mut c_char = fcb_catalog_open_reader;
+    let _: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> *mut c_char = fcb_catalog_open_document_link;
     let _: extern "C" fn(u64) -> u8 = fcb_catalog_cancel;
     let _: extern "C" fn(u64) -> u8 = fcb_catalog_close;
     let header = include_str!("../include/fcb_project_catalog.h");
     for symbol in ["fcb_catalog_create", "fcb_catalog_open", "fcb_catalog_info", "fcb_catalog_page",
-        "fcb_catalog_advance", "fcb_catalog_stop", "fcb_catalog_open_reader", "fcb_catalog_cancel", "fcb_catalog_close"] {
+        "fcb_catalog_advance", "fcb_catalog_stop", "fcb_catalog_open_reader", "fcb_catalog_open_document_link",
+        "fcb_catalog_cancel", "fcb_catalog_close"] {
         assert_eq!(header.matches(&format!("{symbol}(")).count(), 1, "{symbol}");
     }
+}
+
+#[test]
+fn actual_c_catalog_link_transfer_keeps_origin_and_target_after_catalog_closure() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let root = root();
+    fs::write(root.join("README.md"), b"# Origin\n\n[Next](next.md#details)\n").unwrap();
+    fs::write(root.join("next.md"), b"# Details\n\nLinked capture.\n").unwrap();
+    let handle = fcb_catalog_create(); assert_ne!(handle, 0);
+    let croot = CString::new(root.to_str().unwrap()).unwrap();
+    let page = take(unsafe { fcb_catalog_open(handle, croot.as_ptr()) });
+    let source = page.split("\"file_id\":\"").skip(1).find_map(|row| {
+        row.contains("\"hex\":\"524541444d452e6d64\"")
+            .then(|| row.split('"').next().unwrap().parse::<u64>().unwrap())
+    }).unwrap();
+    let origin = fcb_reader_create(); let target = fcb_reader_create();
+    assert_ne!(origin, 0); assert_ne!(target, 0);
+    assert!(take(fcb_catalog_open_reader(handle, origin, 1, source, 4096)).contains("\"status\":\"ok\""));
+    assert!(take(fcb_reader_document(origin, 1, 80, 64 * 1024, 8192, 8192, 4096)).contains("\"status\":\"ok\""));
+    assert!(take(fcb_reader_document_links_prepare(origin, 1, 16)).contains("\"retained_links\":\"1\""));
+    fs::write(root.join("README.md"), b"[Changed](unobserved.md)").unwrap();
+    let receipt_pointer = fcb_catalog_open_document_link(handle, origin, target, 1, source, 1, 1, 4096);
+    assert_eq!(fcb_catalog_close(handle), 1);
+    fs::write(root.join("next.md"), b"new live target").unwrap();
+    let receipt = take(receipt_pointer);
+    assert!(receipt.contains("\"source_observation\":\"new-capture-after-document-link\""), "{receipt}");
+    assert!(receipt.contains("\"fragment_status\":\"not-applied\""), "{receipt}");
+    assert!(receipt.contains("Linked capture."), "{receipt}");
+    assert!(take(fcb_reader_copy_range(origin, 0, 8)).contains("\"original_hex\":\"23204f726967696e\""));
+    assert!(take(fcb_reader_copy_range(target, 0, 9)).contains("\"original_hex\":\"232044657461696c73\""));
+    assert_eq!(fcb_reader_close(target), 1); assert_eq!(fcb_reader_close(origin), 1);
 }

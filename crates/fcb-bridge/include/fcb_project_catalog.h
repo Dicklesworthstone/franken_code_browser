@@ -79,6 +79,27 @@ char *fcb_catalog_stop(uint64_t handle);
 char *fcb_catalog_open_reader(uint64_t handle, uint64_t reader,
     uint64_t page, uint64_t file, uint64_t max_source_bytes);
 
+/* Follow an inventoried local document link from a catalog-issued reader.
+ * origin must still be open with the exact captured bytes, current document
+ * generation and retained link occurrence. source_page/source_file must match
+ * its catalog-issued receipt and a retained source row. The shared Markdown
+ * resolver supplies the logical candidate; it must match a file in the four
+ * retained metadata pages before capture. No caller path or URI is accepted.
+ * At most eight capture receipts are retained by each catalog; eviction or a
+ * closed catalog revokes new link activation, not the existing source bytes.
+ * An EMPTY destination is admitted before target resolution/I/O; origin and
+ * destination must differ. The origin remains unchanged. Cancellation checks
+ * include all three handles. The target is a NEW capture and is independent
+ * after acceptance; max_source_bytes: 1..32 MiB. Existing path/leaf policy
+ * applies, with the same confinement limits as open_reader above.
+ * A target outside retained metadata is unavailable, not known absent. The
+ * receipt names the exact target row and both captures. Cross-file fragments
+ * are explicitly reported as not-applied; the initial source offset is zero.
+ */
+char *fcb_catalog_open_document_link(uint64_t handle, uint64_t origin,
+    uint64_t destination, uint64_t source_page, uint64_t source_file,
+    uint64_t document_generation, uint64_t link_id, uint64_t max_source_bytes);
+
 uint8_t fcb_catalog_cancel(uint64_t handle);
 uint8_t fcb_catalog_close(uint64_t handle);
 

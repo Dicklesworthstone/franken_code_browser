@@ -13,6 +13,8 @@
 
 #[path = "file_finder_session.rs"]
 pub mod finder;
+mod document_links;
+pub use document_links::{CatalogDocumentLinkSelection, CatalogReaderAcceptance, MAX_CATALOG_READER_RECEIPTS};
 
 use std::{collections::VecDeque, fs, mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, FileId};
@@ -48,6 +50,8 @@ const FIRST_WINDOW_BYTES: usize = 16 * 1024;
 pub enum CatalogSessionError {
     App(AppError), Source(SourceError), Reader(ReaderSessionError),
     InvalidLimits, ForeignOwner, StalePage, MissingFile, NoMorePages,
+    StaleReaderReceipt, ReaderReceiptMismatch, UnsupportedDocumentLink,
+    LinkTargetNotRetained, AmbiguousLinkTarget,
     Canceled, IdentityExhausted,
 }
 impl CatalogSessionError {
@@ -71,6 +75,11 @@ impl std::fmt::Display for CatalogSessionError {
             Self::StalePage => f.write_str("CATALOG_SESSION_STALE_PAGE"),
             Self::MissingFile => f.write_str("CATALOG_SESSION_MISSING_FILE"),
             Self::NoMorePages => f.write_str("CATALOG_SESSION_NO_MORE_PAGES"),
+            Self::StaleReaderReceipt => f.write_str("CATALOG_SESSION_STALE_READER_RECEIPT"),
+            Self::ReaderReceiptMismatch => f.write_str("CATALOG_SESSION_READER_RECEIPT_MISMATCH"),
+            Self::UnsupportedDocumentLink => f.write_str("CATALOG_SESSION_UNSUPPORTED_DOCUMENT_LINK"),
+            Self::LinkTargetNotRetained => f.write_str("CATALOG_SESSION_LINK_TARGET_NOT_RETAINED"),
+            Self::AmbiguousLinkTarget => f.write_str("CATALOG_SESSION_AMBIGUOUS_LINK_TARGET"),
             Self::Canceled => f.write_str("CATALOG_SESSION_CANCELED"),
             Self::IdentityExhausted => f.write_str("CATALOG_SESSION_IDENTITY_EXHAUSTED"),
         }
@@ -95,6 +104,7 @@ pub struct CatalogSession {
     catalogued_files: u64,
     complete: bool,
     paused: bool,
+    reader_receipts: document_links::CatalogReaderReceipts,
     next_allocation: u64,
     budget: ResourceBudget,
     _lease: ResourceLease,
@@ -129,7 +139,8 @@ impl CatalogSession {
         pages.try_reserve_exact(MAX_CATALOG_RETAINED_PAGES).map_err(|_| AppError::Admission)?;
         if pages.capacity() > MAX_CATALOG_RETAINED_PAGES { return Err(AppError::Admission.into()); }
         let mut session = Self { grant, root_identity, discovery: Some(discovery), aggregate: DiscoveryAggregate::default(),
-            pages, latest_page: 0, catalogued_files: 0, complete: false, paused: false, next_allocation: 2, budget, _lease: lease };
+            pages, latest_page: 0, catalogued_files: 0, complete: false, paused: false,
+            reader_receipts: document_links::CatalogReaderReceipts::default(), next_allocation: 2, budget, _lease: lease };
         session.consume_page(&mut canceled)?;
         session.validate_active()?;
         check(&mut canceled)?;
@@ -216,8 +227,20 @@ impl CatalogSession {
     /// no-follow/nonblocking opened-object checks as ReaderSession::open.
     /// Stale/foreign selections fail before ANY path metadata or source read.
     pub fn open_reader(&mut self, reader_owner: ArenaOwnerId, page_id: u64, file: FileId,
-        max_source_bytes: usize, mut canceled: impl FnMut() -> bool)
+        max_source_bytes: usize, canceled: impl FnMut() -> bool)
         -> Result<(ReaderSession, HostResponse), CatalogSessionError> {
+        let (reader, response, acceptance) = self.prepare_reader_capture(reader_owner,
+            page_id, file, max_source_bytes, canceled)?;
+        acceptance.accept();
+        Ok((reader, response))
+    }
+
+    /// Prepare the same capture without publishing its receipt. A receiving
+    /// registry consumes the opaque acceptance only after installing the reader;
+    /// dropping it preserves all previously accepted catalog receipts.
+    pub fn prepare_reader_capture(&mut self, reader_owner: ArenaOwnerId, page_id: u64,
+        file: FileId, max_source_bytes: usize, mut canceled: impl FnMut() -> bool)
+        -> Result<(ReaderSession, HostResponse, CatalogReaderAcceptance<'_>), CatalogSessionError> {
         if file.owner() != self.owner() || reader_owner == self.owner() { return Err(CatalogSessionError::ForeignOwner); }
         let index = self.page_index(page_id)?;
         let entry = self.pages[index].files.iter().find(|entry| entry.id == file).ok_or(CatalogSessionError::MissingFile)?;
@@ -238,7 +261,9 @@ impl CatalogSession {
         out.literal(",\"window\":")?; out.literal(window.as_str())?;
         out.literal("}\n")?;
         let response = self.finish(out, &mut canceled)?;
-        Ok((reader, response))
+        self.validate_active()?;
+        let acceptance = self.reader_acceptance(page_id, file, &reader);
+        Ok((reader, response, acceptance))
     }
 
     /// Shared capture seam for retained metadata selections. Callers establish

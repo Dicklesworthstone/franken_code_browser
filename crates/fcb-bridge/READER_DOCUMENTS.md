@@ -73,6 +73,24 @@ they do not open a URI or turn a reader path label into a filesystem grant.
 Successful document replacement/clear invalidates the inventory. Failed or
 canceled link preparation preserves the previous accepted inventory.
 
+For readers originally opened by Project Files, `fcb_catalog_open_document_link`
+provides the separately authorized local-file route. It binds the original
+catalog page/file receipt to the reader owner, exact capture request and SHA-256,
+then resolves the retained occurrence through FrankenMarkdown. The resolved raw
+path must match a file in the catalog's current four metadata pages. This route
+does not extend discovery or treat missing retained metadata as filesystem absence.
+Catalogs retain at most eight capture receipts; eviction disables new link
+activation while existing captured bytes remain readable.
+
+The target opens as a new capture in an empty destination reader. Source, target
+and catalog cancellation epochs cover the transfer, and target admission precedes
+source I/O. The native host preserves the originating reader in one pane and
+accepts the target in another; a failed transfer leaves both visible captures
+unchanged. The target's catalog receipt permits further local links. Cross-file
+fragments are currently explicit `not-applied` outcomes: the target opens at its
+beginning, without claiming that a heading was found. Existing root/path and leaf
+no-follow checks apply; this does not add descriptor-relative ancestor confinement.
+
 ## Reflow, cancellation and ownership
 
 Preparing again at a new width is explicit worker-side reflow. It currently

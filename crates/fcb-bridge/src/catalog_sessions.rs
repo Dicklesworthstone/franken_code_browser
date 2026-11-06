@@ -6,7 +6,7 @@
 
 use std::{mem::size_of, path::Path, sync::{Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}};
-use fcb_app::host::{HostResponse, catalog_session::{CatalogSession, CatalogSessionError}};
+use fcb_app::host::{HostResponse, catalog_session::{CatalogDocumentLinkSelection, CatalogSession, CatalogSessionError}};
 use fcb_core::{ArenaOwnerId, ByteLength, FileId, ResourceAllocationId, ResourceBudget, ResourceLease};
 use super::reader_sessions::{self, ReaderSessions};
 
@@ -153,8 +153,39 @@ impl CatalogSessions {
         let session = state.as_mut().ok_or(AccessError::NotOpen)?;
         let file = FileId::new(session.owner(), file).map_err(|_| AccessError::InvalidArgument)?;
         let mut stop = || cell.validate(epoch).is_err() || canceled();
-        let result = readers.initialize_prepared(reader, |owner, reader_stop| {
-            session.open_reader(owner, page, file, max_source_bytes, reader_stop).map_err(AccessError::from)
+        let result = readers.initialize_prepared_with_acceptance(reader, move |owner, reader_stop| {
+            let session = session;
+            let (candidate, reply, acceptance) = session.prepare_reader_capture(owner, page,
+                file, max_source_bytes, reader_stop).map_err(AccessError::from)?;
+            Ok::<_, AccessError>((candidate, reply, move || acceptance.accept()))
+        }, &mut stop);
+        cell.validate(epoch)?;
+        result
+    }
+    /// Keep the catalog grant, originating capture and empty destination alive
+    /// through acceptance. All three state locks are nonblocking. No arbitrary
+    /// destination string or label-derived root reaches source capture.
+    pub(super) fn open_document_link(&self, handle: u64, readers: &ReaderSessions,
+        origin: u64, destination: u64, source_page: u64, source_file: u64,
+        document_generation: u64, link_id: u64, max_source_bytes: usize,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        if origin == destination { return Err(AccessError::InvalidArgument); }
+        let cell = self.get(handle)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let mut state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        let session = state.as_mut().ok_or(AccessError::NotOpen)?;
+        let source_file = FileId::new(session.owner(), source_file).map_err(|_| AccessError::InvalidArgument)?;
+        let selection = CatalogDocumentLinkSelection { source_page, source_file, document_generation, link_id };
+        let mut stop = || cell.validate(epoch).is_err() || canceled();
+        let result = readers.with_retained(origin, move |source, origin_stop| {
+            let session = session;
+            readers.initialize_prepared_with_acceptance(destination, move |owner, destination_stop| {
+                let session = session;
+                let (candidate, reply, acceptance) = session.prepare_document_link_capture(source,
+                    owner, selection, max_source_bytes, destination_stop).map_err(AccessError::from)?;
+                Ok::<_, AccessError>((candidate, reply, move || acceptance.accept()))
+            }, origin_stop)
         }, &mut stop);
         cell.validate(epoch)?;
         result

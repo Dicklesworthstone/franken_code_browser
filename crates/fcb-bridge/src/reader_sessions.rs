@@ -212,6 +212,18 @@ impl ReaderSessions {
     /// the same cancellation/close/owner rules apply as ordinary reader open.
     pub(super) fn initialize_prepared<E: From<AccessError>>(&self, handle: u64,
         build: impl FnOnce(ArenaOwnerId, &mut dyn FnMut() -> bool) -> Result<(ReaderSession, HostResponse), E>,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, E> {
+        self.initialize_prepared_with_acceptance(handle, |owner, stop| {
+            let (candidate, reply) = build(owner, stop)?;
+            Ok::<_, E>((candidate, reply, || {}))
+        }, canceled)
+    }
+    /// Coordinate external capture authority with destination acceptance. The
+    /// one-shot callback runs immediately after installation, without a fallible
+    /// operation or cancellation poll between them. Rejected candidates drop
+    /// their staged authority; accepted late-canceled readers keep their receipt.
+    pub(super) fn initialize_prepared_with_acceptance<E: From<AccessError>, F: FnOnce()>(&self, handle: u64,
+        build: impl FnOnce(ArenaOwnerId, &mut dyn FnMut() -> bool) -> Result<(ReaderSession, HostResponse, F), E>,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, E> {
         let cell = self.get(handle)?;
         let epoch = cell.epoch.load(Ordering::Acquire);
@@ -220,12 +232,13 @@ impl ReaderSessions {
         if state.is_some() { return Err(AccessError::AlreadyOpen.into()); }
         let mut stop = || cell.validate(epoch).is_err() || canceled();
         let result = (|| {
-            let (candidate, reply) = build(ArenaOwnerId::new(handle).map_err(|_| AccessError::IdentityExhausted)?, &mut stop)?;
+            let (candidate, reply, accept) = build(ArenaOwnerId::new(handle).map_err(|_| AccessError::IdentityExhausted)?, &mut stop)?;
             if candidate.capture().request().file().owner().get() != handle {
                 return Err(AccessError::InvalidArgument.into());
             }
             if stop() { return Err(AccessError::Canceled.into()); }
             *state = Some(candidate);
+            accept();
             Ok(reply)
         })();
         // A close/revocation during work suppresses newly returned output. A

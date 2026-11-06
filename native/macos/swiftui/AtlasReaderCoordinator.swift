@@ -160,10 +160,21 @@ private final class AtlasReaderSession: @unchecked Sendable {
     }
     func openRetained(pathBytes: [UInt8], offset: UInt64, registryDomain: UUID,
         initialize: @escaping @Sendable (UInt64) throws -> String?) async throws -> AtlasReaderPage {
+        guard !pathBytes.isEmpty, pathBytes.count <= 16_384, !pathBytes.contains(0) else {
+            throw AtlasReaderError.unavailable
+        }
+        return try await openRetained(offset: offset, registryDomain: registryDomain) { handle in
+            try AtlasReaderInfo.decodeRetainedInitialization(initialize(handle), handle: handle, pathBytes: pathBytes)
+        }
+    }
+    /// The exporting service may resolve the target path during the same
+    /// atomic transfer that opens it. Its typed initializer must validate the
+    /// complete receipt before returning source identity, never a display label.
+    func openRetained(offset: UInt64, registryDomain: UUID,
+        initialize: @escaping @Sendable (UInt64) throws -> AtlasReaderInfo) async throws -> AtlasReaderPage {
         try Task.checkCancellation()
         guard session == nil, pendingSession == nil, info == nil,
               transport.comparison?.domain == registryDomain,
-              !pathBytes.isEmpty, pathBytes.count <= 16_384, !pathBytes.contains(0),
               offset <= AtlasReaderLimits.captureBytes else { throw AtlasReaderError.unavailable }
         let next = try AtlasReaderSession(transport: transport, accessLease: nil)
         cancel()
@@ -173,8 +184,13 @@ private final class AtlasReaderSession: @unchecked Sendable {
         do {
             let result = try await withTaskCancellationHandler(operation: {
                 try await io.perform(cancellation: flag, keepingAlive: [next]) {
-                    let info = try AtlasReaderInfo.decodeRetainedInitialization(
-                        initialize(next.handle), handle: next.handle, pathBytes: pathBytes)
+                    let info = try initialize(next.handle)
+                    guard info.identity.owner == next.handle, info.origin == "host-supplied",
+                          info.captureSHA256 != nil, !info.identity.pathBytes.isEmpty,
+                          info.identity.pathBytes.count <= 16_384, !info.identity.pathBytes.contains(0),
+                          info.identity.capturedBytes <= AtlasReaderLimits.captureBytes else {
+                        throw AtlasReaderError.invalidResponse
+                    }
                     guard !flag.isCanceled else { throw AtlasReaderError.canceled }
                     let request = AtlasReaderRequest.window(offset: offset, bytes: AtlasReaderLimits.pageBytes)
                     try request.validate(capturedBytes: info.identity.capturedBytes)
@@ -194,7 +210,11 @@ private final class AtlasReaderSession: @unchecked Sendable {
             if pendingSession === next, operation == ticket {
                 next.cancel(); pendingSession = nil; cancellation = nil; operation = UUID()
             }
-            throw Self.readerError(error)
+            // A separately authorized exporter can report a precise failure
+            // (for example, a local target outside retained project metadata).
+            // Preserve that result instead of relabeling it as reader capacity.
+            if Task.isCancelled || flag.isCanceled { throw AtlasReaderError.canceled }
+            throw error
         }
     }
 

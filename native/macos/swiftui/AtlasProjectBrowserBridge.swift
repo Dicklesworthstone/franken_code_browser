@@ -8,6 +8,9 @@ import Foundation
 @_silgen_name("fcb_catalog_stop") private func catalogStop(_ handle: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_catalog_open_reader") private func catalogReader(_ handle: UInt64, _ reader: UInt64,
     _ page: UInt64, _ file: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_catalog_open_document_link") private func catalogDocumentLink(_ handle: UInt64,
+    _ origin: UInt64, _ destination: UInt64, _ page: UInt64, _ file: UInt64,
+    _ generation: UInt64, _ link: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_catalog_cancel") private func catalogCancel(_ handle: UInt64) -> UInt8
 @_silgen_name("fcb_catalog_close") private func catalogClose(_ handle: UInt64) -> UInt8
 @_silgen_name("fcb_free_string") private func catalogFree(_ pointer: UnsafeMutablePointer<CChar>?)
@@ -24,6 +27,8 @@ extension AtlasProjectBrowserTransport {
         case .stop: return take(catalogStop(handle))
         case .openReader(let reader, let page, let file, let bytes):
             return take(catalogReader(handle, reader, page, file, bytes))
+        case .openDocumentLink(let origin, let destination, let page, let file, let generation, let link, let bytes):
+            return take(catalogDocumentLink(handle, origin, destination, page, file, generation, link, bytes))
         }
     }, cancel: { catalogCancel($0) == 1 }, close: { catalogClose($0) == 1 }, retirementFailed: {
         try? FileHandle.standardError.write(contentsOf: Data("FCB_CATALOG_RETIREMENT_UNAVAILABLE\n".utf8))

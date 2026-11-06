@@ -59,6 +59,18 @@ pub extern "C" fn fcb_catalog_open_reader(handle: u64, reader: u64, page: u64, f
         catalogs.open_reader(handle, readers, reader, page, file, number(max_source_bytes)?, || false)
     }))
 }
+/// Follow a parsed local reference from an exact catalog-issued capture into
+/// an EMPTY independent reader. The shared host resolves retained membership.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_catalog_open_document_link(handle: u64, origin: u64, destination: u64,
+    source_page: u64, source_file: u64, document_generation: u64, link_id: u64,
+    max_source_bytes: u64) -> *mut c_char {
+    reply(|| answer(handle, |catalogs| {
+        let readers = super::reader_ffi::registry().ok_or(super::reader_sessions::AccessError::UnknownHandle)?;
+        catalogs.open_document_link(handle, readers, origin, destination, source_page, source_file,
+            document_generation, link_id, number(max_source_bytes)?, || false)
+    }))
+}
 /// Nonblocking epoch cancellation; consumed pages remain recoverable via info.
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_catalog_cancel(handle: u64) -> u8 {

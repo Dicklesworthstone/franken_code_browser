@@ -11,6 +11,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
     let emptyFirst: Bool
     private let lock = NSLock()
     private var sessions: [UInt64: Session] = [:], readers: [UInt64: [UInt8]] = [:]
+    private var documents: [UInt64: (generation: UInt64, width: UInt64)] = [:]
     private var nextOwner: UInt64 = 40, nextReader: UInt64 = 100
     private var fault: String?, blocked = false
     private var log: [String] = []
@@ -78,18 +79,80 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         out["next_offset"] = end < UInt64(source.count) ? String(end) as Any : NSNull()
         return out
     }
+    private func documentDestination(_ raw: [UInt8]) -> String { raw == self.raw(3) ? "p1.rs" : "p3.rs#details" }
+    /// Bounded logical output at the injected boundary. The sample capture is
+    /// unchanged; neither the fixture nor native model implements a Markdown
+    /// parser. Rust's real parser/receipt integration has its separate tests.
+    private func document(_ owner: UInt64, command: String, generation: UInt64,
+        width newWidth: UInt64? = nil, first: UInt64 = 0) -> String? {
+        precondition(!Thread.isMainThread)
+        return locked {
+            guard let raw = readers[owner] else { return nil }
+            if let newWidth { documents[owner] = (generation, newWidth) }
+            guard let accepted = documents[owner], accepted.generation == generation else { return nil }
+            log.append("\(command):\(owner):\(generation)")
+            var out = readerHeader(owner, raw: raw, command: command)
+            out["document_generation"] = String(generation); out["document_ready"] = true
+            out["layout_complete"] = true; out["native_shaped"] = false
+            out["rendering"] = "logical-frankenmarkdown-flow"
+            out["source_mapping"] = "enclosing-regions-not-glyph-exact"
+            out["width_columns"] = String(accepted.width); out["parser_source_base"] = "0"
+            out["total_flow_lines"] = "1"; out["total_headings"] = "0"; out["rendered_utf8_bytes"] = "8"
+            if command == "document-prepare" || command == "document-window" {
+                precondition(first == 0)
+                out["first_flow_line"] = "0"; out["next_flow_line"] = NSNull(); out["whole_document_visible"] = true
+                out["flow_lines"] = [["flow_line": "0", "text": "captured",
+                    "rendered_utf8_range": ["start": "0", "end": "8"],
+                    "enclosing_original_range": ["start": "0", "end": "9"]] as [String: Any]]
+                out["headings"] = [] as [String]; out["next_heading"] = NSNull()
+            } else {
+                let destination = documentDestination(raw)
+                let link: [String: Any] = ["link_id": "1", "block_index": "0",
+                    "evidence_range": ["start": "0", "end": "9"], "destination": destination,
+                    "destination_display": destination, "kind": "local-reference", "fragment_slug": NSNull()]
+                out["links_ready"] = true; out["links_complete"] = true; out["links_truncated"] = false
+                out["links_seen"] = "1"; out["retained_links"] = "1"; out["parser_diagnostics"] = "0"
+                out["evidence_precision"] = "whole-captured-markdown-document"
+                if command == "document-link" {
+                    out["link"] = link; out["activated"] = false
+                } else {
+                    precondition(first == 0)
+                    out["first_link"] = "0"; out["links"] = [link]; out["next_link"] = NSNull()
+                }
+            }
+            return json(out)
+        }
+    }
+    var documentTransport: AtlasReaderDocumentTransport {
+        .init(prepare: { [self] owner, generation, width in
+            document(owner, command: "document-prepare", generation: generation, width: width)
+        }, window: { [self] owner, generation, first, count in
+            precondition(count == 64)
+            return document(owner, command: "document-window", generation: generation, first: first)
+        }, headings: { _, _, _, _ in nil }, heading: { _, _, _, _ in nil },
+        fromSource: { _, _, _, _ in nil }, source: { _, _, _, _, _ in nil }, copy: { _, _, _, _, _ in nil },
+        prepareLinks: { [self] owner, generation, limit in
+            precondition(limit == 4096)
+            return document(owner, command: "document-links-prepare", generation: generation)
+        }, links: { [self] owner, generation, first, count in
+            precondition(count == 64)
+            return document(owner, command: "document-links", generation: generation, first: first)
+        }, link: { [self] owner, generation, id, count in
+            precondition(id == 1 && count == 64)
+            return document(owner, command: "document-link", generation: generation)
+        })
+    }
     var transport: AtlasProjectBrowserTransport {
         AtlasProjectBrowserTransport(create: { [self] in locked { let id = nextOwner; nextOwner += 1; return id } },
             run: { [self] owner, request in
                 precondition(!Thread.isMainThread)
+                let delay: Bool
                 switch request {
-                case .advance, .openReader:
-                    if locked({ let value = blocked; blocked = false; return value }) {
-                        entered.signal(); precondition(resume.wait(timeout: .now() + .seconds(5)) == .success)
-                    }
-                default: break
+                case .advance, .openReader, .openDocumentLink:
+                    delay = locked { let value = blocked; blocked = false; return value }
+                default: delay = false
                 }
-                return locked {
+                let response: String? = locked {
                     switch request {
                     case .open:
                         sessions[owner] = Session(); log.append("open:\(owner)")
@@ -140,8 +203,78 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
                         }
                         out["reader"] = nested; out["window"] = window(reader, raw: raw, start: 0, limit: 16_384)
                         return json(out)
+                    case .openDocumentLink(let origin, let destination, let pageID, let file, let generation, let link, let bytes):
+                        guard let session = sessions[owner], let raw = readers[origin],
+                              let document = documents[origin], document.generation == generation,
+                              pageID > 0, pageID <= session.latest, session.latest - pageID < 4,
+                              file == pageID - (emptyFirst ? 1 : 0), raw == self.raw(pageID),
+                              link == 1, bytes == AtlasReaderLimits.captureBytes, readers[destination] == nil else { return nil }
+                        log.append("link:\(owner):\(origin):\(destination):\(pageID):\(file):\(generation):\(link)")
+                        let targetPage: UInt64 = raw == self.raw(3) ? 1 : 3
+                        guard targetPage <= session.latest, session.latest - targetPage < 4 else {
+                            return json(["schema": "fcb.project-catalog-session/1", "status": "error",
+                                "owner": String(owner), "exit_code": "2",
+                                "error": ["code": "CATALOG_SESSION_LINK_TARGET_NOT_RETAINED"]])
+                        }
+                        let targetRaw = self.raw(targetPage), destinationText = documentDestination(raw)
+                        let suffix = targetPage == 3 ? "#details" : ""
+                        readers[destination] = targetRaw
+                        var out = header(owner, command: "open-document-link", latest: session.latest, paused: session.paused)
+                        out["source_page_id"] = String(pageID); out["source_file_id"] = String(file)
+                        out["source_reader_owner"] = String(origin); out["source_capture_sha256"] = digest
+                        out["document_generation"] = String(generation); out["link_id"] = String(link)
+                        out["target_page_id"] = String(targetPage); out["target_file"] = row(targetPage)
+                        out["reader_owner"] = String(destination); out["source_observation"] = "new-capture-after-document-link"
+                        out["source_bytes_read"] = String(source.count); out["source_read_calls"] = "1"
+                        out["destination"] = destinationText; out["destination_suffix"] = suffix
+                        out["fragment_status"] = suffix.isEmpty ? "none" : "not-applied"
+                        out["fragment_suffix"] = suffix; out["initial_original_offset"] = "0"
+                        var nested = readerInfo(destination, raw: targetRaw)
+                        var first = window(destination, raw: targetRaw, start: 0, limit: 16_384)
+                        if let fault {
+                            self.fault = nil
+                            switch fault {
+                            case "link-lost": return nil
+                            case "link-catalog": out["owner"] = String(owner + 1)
+                            case "link-source-sha": out["source_capture_sha256"] = String(repeating: "0", count: 64)
+                            case "link-source-owner": out["source_reader_owner"] = String(origin + 99)
+                            case "link-source-page": out["source_page_id"] = String(pageID + 1)
+                            case "link-source-file": out["source_file_id"] = String(file + 1)
+                            case "link-generation": out["document_generation"] = String(generation + 1)
+                            case "link-id": out["link_id"] = String(link + 1)
+                            case "link-destination": out["destination"] = "other.rs"
+                            case "link-target-page": out["target_page_id"] = String(session.latest + 1)
+                            case "link-target-file":
+                                var target = row(targetPage); target["file_id"] = String(session.latest + 1); out["target_file"] = target
+                            case "link-target-path":
+                                var target = row(targetPage); target["path"] = path(Array("other.rs".utf8)); out["target_file"] = target
+                            case "link-reader-owner": out["reader_owner"] = String(destination + 99)
+                            case "link-reader-path": nested["path"] = path(Array("other.rs".utf8))
+                            case "link-reader-generation": nested["accepted_document_generation"] = "1"
+                            case "link-source-bytes": out["source_bytes_read"] = String(source.count + 1)
+                            case "link-observation": out["source_observation"] = "metadata-snapshot"
+                            case "link-fragment": out["fragment_suffix"] = "#invented"
+                            case "link-fragment-resolved": out["fragment_status"] = "resolved"
+                            case "link-fragment-offset": out["initial_original_offset"] = "1"
+                            case "link-window":
+                                // Valid reader/window metadata with different
+                                // original bytes must fail the second-window
+                                // round trip after destination initialization.
+                                first["text"] = "tampered\n"; first["original_hex"] = hex("tampered\n".utf8)
+                            default: preconditionFailure("unknown link receipt fault")
+                            }
+                        }
+                        out["reader"] = nested; out["window"] = first
+                        return json(out)
                     }
                 }
+                // Hold an already accepted foreign result, not the model's
+                // validation. This exercises late delivery after cancellation
+                // or reflow while the candidate reader really exists.
+                if delay {
+                    entered.signal(); precondition(resume.wait(timeout: .now() + .seconds(5)) == .success)
+                }
+                return response
             }, cancel: { [self] owner in locked { log.append("cancel:\(owner)") }; return true },
             close: { [self] owner in locked { sessions.removeValue(forKey: owner); log.append("close:\(owner)") }; return true },
             retirementFailed: { fatalError("catalog retirement failed") }, readerDomain: domain)
@@ -151,10 +284,19 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
             open: { [self] _, _, _ in locked { log.append("LABEL-OPEN") }; return nil },
             window: { [self] owner, start, limit in locked {
                 guard let raw = readers[owner] else { return nil }
+                log.append("reader-window:\(owner)")
                 return json(window(owner, raw: raw, start: start, limit: limit))
-            } }, lines: { _, _, _, _ in nil }, cancel: { _ in true },
-            close: { [self] owner in locked { readers.removeValue(forKey: owner); log.append("reader-close:\(owner)") }; return true },
-            retirementFailed: { fatalError("reader retirement failed") }, comparison: .init(domain: domain, compare: { _, _, _, _, _ in nil }))
+            } }, lines: { _, _, _, _ in nil },
+            cancel: { [self] owner in locked { log.append("reader-cancel:\(owner)") }; return true },
+            close: { [self] owner in locked {
+                readers.removeValue(forKey: owner); documents.removeValue(forKey: owner); log.append("reader-close:\(owner)")
+            }; return true },
+            retirementFailed: { fatalError("reader retirement failed") },
+            fork: { [self] origin, destination in locked {
+                guard let raw = readers[origin], readers[destination] == nil else { return nil }
+                readers[destination] = raw; log.append("reader-fork:\(origin):\(destination)")
+                return json(readerInfo(destination, raw: raw))
+            } }, comparison: .init(domain: domain, compare: { _, _, _, _, _ in nil }))
     }
 }
 
@@ -174,7 +316,11 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         try await emptyPagesLostRepliesPauseAndEviction()
         try await exactRawFileCaptureAndForgedReceipts()
         try await closeDrainsGrantAndLateCapture()
-        print("Progressive project pages, beyond-20k admission, recovery, pause/eviction, raw-file capture and grant-lifetime regressions passed.")
+        try await capturedDocumentLinkOpensIndependentChain()
+        try await forgedDocumentLinkReceiptsAreRefused()
+        try await unobservedLinkTargetRemainsRecoverable()
+        try await staleAndInterruptedDocumentLinksRetireOnlyCandidates()
+        print("Progressive project pages, recovery, raw-file capture, captured document-link proofs, independent targets and grant-lifetime regressions passed.")
     }
     private static func boundedWireAndCoverage() throws {
         let f = ProjectBrowserFixture()
@@ -284,5 +430,170 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         await refuse("closed project published a late reader") { _ = try await pending.value }
         await wait("closed project/capture failed to retire") { f.calls.contains("close:40") && f.calls.contains("reader-close:100") && observed == nil }
         precondition(model.info == nil && model.page == nil && !f.calls.contains("LABEL-OPEN"))
+    }
+    @MainActor private static func prepareLink(_ reader: AtlasPagedReaderModel) async -> AtlasReaderDocumentLinkTarget {
+        let preview = reader.documentPreview
+        preview.prepare()
+        await wait("logical document preparation did not finish") { !preview.busy }
+        precondition(preview.canNavigate && preview.page?.lines.count == 1)
+        preview.prepareLinks()
+        await wait("captured link preparation did not finish") { !preview.busy }
+        let target = preview.links!.target(id: 1)!
+        precondition(preview.allows(target) && target.link.kind == .local)
+        return target
+    }
+    @MainActor private static func linkEnvironment(_ f: ProjectBrowserFixture, retainTarget: Bool = true)
+        async throws -> (AtlasProjectBrowserModel, AtlasProjectBrowserCapture, AtlasReaderDocumentLinkTarget) {
+        let model = AtlasProjectBrowserModel(transport: f.transport)
+        try await model.open(root: "/repo", accessLease: nil)
+        let page = model.page!
+        let origin = try await model.openFile(page.files[0], from: page,
+            readerTransport: f.readerTransport, document: f.documentTransport)
+        if retainTarget {
+            for _ in 0..<2 { model.advance(); await wait("target metadata was not observed") { !model.busy } }
+            precondition(model.info?.latest == 3 && model.info?.retains(origin.pageID) == true)
+        }
+        return (model, origin, await prepareLink(origin.reader))
+    }
+    @MainActor private static func capturedDocumentLinkOpensIndependentChain() async throws {
+        let f = ProjectBrowserFixture()
+        let (model, origin, local) = try await linkEnvironment(f)
+        let original = origin.reader.page!, previewID = origin.reader.documentPreview.page!.id
+        let sourceReads = f.calls.filter { $0 == "reader-window:100" }.count
+        var forwarded: AtlasReaderDocumentLinkTarget?
+        origin.reader.documentPreview.openLink(local, openLocal: { target in
+            precondition(!origin.reader.documentPreview.busy)
+            forwarded = target
+        })
+        await wait("local activation did not reach its explicit project callback") { forwarded != nil }
+        precondition(forwarded == local && f.calls.contains("document-link:100:1"))
+        let target = try await model.openDocumentLink(forwarded!, from: origin,
+            readerTransport: f.readerTransport, document: f.documentTransport)
+        precondition(target.catalogOwner == origin.catalogOwner && target.pageID == 3 && target.file.id == 3)
+        precondition(target.file.rawPath == f.raw(3) && target.file.observedBytes == 4096)
+        precondition(target.reader.page?.identity.capturedBytes == 9 && target.captureSHA256 == f.digest)
+        precondition(target.unappliedFragment == "#details" && target.reader.page?.start == 0)
+        precondition(target.reader.page?.identity.owner == 101 && target.reader.page?.text == "captured\n")
+        precondition(origin.reader.page?.identity.matches(original.identity) == true
+            && origin.reader.page?.originalHex == original.originalHex && origin.reader.page?.start == original.start)
+        precondition(origin.reader.documentPreview.page?.id == previewID && origin.reader.documentPreview.allows(local))
+        precondition(f.calls.filter { $0 == "reader-window:100" }.count == sourceReads)
+        precondition(!f.calls.contains("reader-close:100") && !f.calls.contains("LABEL-OPEN"))
+
+        let back = await prepareLink(target.reader)
+        let second = try await model.openDocumentLink(back, from: target,
+            readerTransport: f.readerTransport, document: f.documentTransport)
+        precondition(second.catalogOwner == origin.catalogOwner && second.pageID == 1 && second.file.id == origin.file.id)
+        precondition(second.reader.page?.identity.pathBytes == origin.file.rawPath
+            && second.reader.page?.identity.owner == 102 && second.unappliedFragment.isEmpty)
+        precondition(f.calls.contains("link:40:101:102:3:3:1:1"))
+        // Closing independent targets is the return path; no original filename
+        // is reopened and the origin's capture/preview position remains exact.
+        second.reader.close(); target.reader.close()
+        await wait("independent targets did not retire") {
+            f.calls.contains("reader-close:101") && f.calls.contains("reader-close:102")
+        }
+        precondition(origin.reader.canPin && origin.reader.page?.originalHex == original.originalHex)
+        precondition(origin.reader.documentPreview.page?.id == previewID && !f.calls.contains("reader-close:100"))
+        origin.reader.close(); model.close()
+    }
+    @MainActor private static func forgedDocumentLinkReceiptsAreRefused() async throws {
+        for fault in ["link-catalog", "link-source-sha", "link-source-owner", "link-source-page", "link-source-file",
+                      "link-generation", "link-id", "link-destination", "link-target-page", "link-target-file",
+                      "link-target-path", "link-reader-owner", "link-reader-path", "link-reader-generation",
+                      "link-source-bytes", "link-observation", "link-fragment", "link-fragment-resolved",
+                      "link-fragment-offset", "link-window", "link-lost"] {
+            let f = ProjectBrowserFixture()
+            let (model, origin, local) = try await linkEnvironment(f)
+            let original = origin.reader.page!
+            f.corrupt(fault)
+            await refuse("forged local-link capture was published: \(fault)") {
+                _ = try await model.openDocumentLink(local, from: origin,
+                    readerTransport: f.readerTransport, document: f.documentTransport)
+            }
+            await wait("rejected local-link candidate failed to retire: \(fault)") { f.calls.contains("reader-close:101") }
+            precondition(f.calls.filter { $0 == "link:40:100:101:1:1:1:1" }.count == 1)
+            precondition(origin.reader.page?.identity.matches(original.identity) == true
+                && origin.reader.page?.originalHex == original.originalHex && origin.reader.documentPreview.allows(local))
+            precondition(!model.busy && !model.closed && !f.calls.contains("reader-close:100") && !f.calls.contains("LABEL-OPEN"))
+            origin.reader.close(); model.close()
+        }
+    }
+    @MainActor private static func unobservedLinkTargetRemainsRecoverable() async throws {
+        let f = ProjectBrowserFixture()
+        let (model, origin, local) = try await linkEnvironment(f, retainTarget: false)
+        do {
+            _ = try await model.openDocumentLink(local, from: origin,
+                readerTransport: f.readerTransport, document: f.documentTransport)
+            preconditionFailure("an unobserved destination was opened")
+        } catch {
+            guard let error = error as? AtlasProjectBrowserError,
+                  case .engine(let code) = error, code == "CATALOG_SESSION_LINK_TARGET_NOT_RETAINED" else {
+                preconditionFailure("membership failure lost its exporting service error: \(error)")
+            }
+        }
+        precondition(model.notice.contains("outside the retained project pages")
+            && model.notice.contains("does not mean the file is missing"))
+        await wait("unobserved destination's empty reader did not retire") { f.calls.contains("reader-close:101") }
+        precondition(origin.reader.documentPreview.allows(local) && !f.calls.contains("LABEL-OPEN"))
+        for _ in 0..<2 { model.advance(); await wait("additional metadata discovery did not finish") { !model.busy } }
+        let target = try await model.openDocumentLink(local, from: origin,
+            readerTransport: f.readerTransport, document: f.documentTransport)
+        precondition(target.pageID == 3 && target.reader.page?.identity.owner == 102
+            && origin.reader.page?.identity.owner == 100)
+        target.reader.close(); origin.reader.close(); model.close()
+    }
+    @MainActor private static func staleAndInterruptedDocumentLinksRetireOnlyCandidates() async throws {
+        do {
+            let f = ProjectBrowserFixture()
+            let (model, origin, old) = try await linkEnvironment(f)
+            origin.reader.documentPreview.prepareLinks()
+            await wait("link-list replacement did not finish") { !origin.reader.documentPreview.busy }
+            precondition(!origin.reader.documentPreview.allows(old))
+            let allocations = f.calls.filter { $0.hasPrefix("reader-create:") }.count
+            await refuse("old link-page token created a destination") {
+                _ = try await model.openDocumentLink(old, from: origin,
+                    readerTransport: f.readerTransport, document: f.documentTransport)
+            }
+            precondition(f.calls.filter { $0.hasPrefix("reader-create:") }.count == allocations
+                && !f.calls.contains(where: { $0.hasPrefix("link:") }))
+            origin.reader.close(); model.close()
+        }
+        for interruption in ["cancel", "reflow", "project-close"] {
+            let f = ProjectBrowserFixture()
+            let (model, origin, local) = try await linkEnvironment(f)
+            let original = origin.reader.page!
+            f.blockNext()
+            let pending = Task {
+                try await model.openDocumentLink(local, from: origin,
+                    readerTransport: f.readerTransport, document: f.documentTransport)
+            }
+            await wait("local target transfer did not enter") { f.entered.wait(timeout: .now()) == .success }
+            precondition(f.calls.contains("link:40:100:101:1:1:1:1") && !f.calls.contains("reader-close:101"))
+            switch interruption {
+            case "cancel": pending.cancel()
+            case "reflow":
+                origin.reader.documentPreview.prepare()
+                await wait("origin reflow did not finish during delayed target delivery") {
+                    !origin.reader.documentPreview.busy && origin.reader.documentPreview.page?.inventory.generation == 2
+                }
+                precondition(!origin.reader.documentPreview.allows(local))
+            default: model.close()
+            }
+            f.resume.signal()
+            do {
+                _ = try await pending.value
+                preconditionFailure("stale/canceled target was published after \(interruption)")
+            } catch {
+                guard let error = error as? AtlasProjectBrowserError, case .canceled = error else {
+                    preconditionFailure("interrupted transfer lost cancellation priority: \(error)")
+                }
+            }
+            await wait("late target candidate did not retire after \(interruption)") { f.calls.contains("reader-close:101") }
+            precondition(origin.reader.page?.identity.matches(original.identity) == true
+                && origin.reader.page?.originalHex == original.originalHex && origin.reader.canPin)
+            precondition(!f.calls.contains("reader-close:100") && !f.calls.contains("LABEL-OPEN"))
+            origin.reader.close(); model.close()
+        }
     }
 }
