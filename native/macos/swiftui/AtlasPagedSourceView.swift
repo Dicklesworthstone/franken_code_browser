@@ -19,6 +19,7 @@ import AppKit
     @State private var showsOutline = false
     @State private var showsDocument = false
     @State private var showsSplitPreview = false
+    @State private var wrapsLines = false
 
     init(root: String, path: String, accessLease: AnyObject?, captured: AtlasSearchCapturedHit? = nil,
          supplied: AtlasSuppliedReaderSource? = nil,
@@ -106,6 +107,7 @@ import AppKit
                 let page = model.page
                 AtlasSourceReader(source: source, navigation: model.navigation,
                     selection: model.nativeSelectionRange.map { AtlasReaderSelection(source: source, range: $0) },
+                    wrapsLines: wrapsLines,
                     backgroundColor: Monokai.background, foregroundColor: Monokai.color("plain")) {
                     if let page, page.text.utf8.elementsEqual(source.text.utf8),
                        let highlight = page.highlight {
@@ -162,6 +164,10 @@ import AppKit
                     .accessibilityLabel("Physical source line, one based")
                     .onSubmit(model.goToLine)
                 Button("Go line", action: model.goToLine).disabled(model.page == nil)
+                Toggle("Wrap lines", isOn: $wrapsLines)
+                    .toggleStyle(.checkbox)
+                    .disabled(model.source == nil)
+                    .help("Wrap this reader at its width; turn off to scroll long source lines horizontally. Source and selection stay unchanged.")
                 Spacer()
                 Button("Refresh from disk", action: model.refreshFromDisk)
                     .disabled(!model.canRefresh)

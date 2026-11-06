@@ -280,6 +280,7 @@ extension AtlasCamera {
     @State private var fileText = ""
     @State private var selectedSource: AtlasSource?
     @State private var selectedReaderSelection: AtlasReaderSelection?
+    @State private var wrapsSourceLines = false
     @State private var sourceIO = AtlasProjectIO()
     @State private var sourceTask: Task<Void, Never>?
     @State private var sourceCancellation: AtlasSearchCancellation?
@@ -1090,6 +1091,11 @@ extension AtlasCamera {
                             .foregroundStyle(.secondary)
                     }
                     if !usesPagedReader, let path = selectedPath {
+                        if finderReaderCapture == nil, selectedSource != nil, sourceError == nil {
+                            Toggle("Wrap lines", isOn: $wrapsSourceLines)
+                                .toggleStyle(.checkbox).controlSize(.small)
+                                .help("Wrap this reader at its width; turn off to scroll long source lines horizontally. Source and selection stay unchanged.")
+                        }
                         Button("Read pages") { openPagedFile(path) }
                             .help(selectedSource == nil ? "Capture the current file for byte and line navigation"
                                 : "Read the already captured bytes with paging, Find and Outline. Refresh from disk explicitly to load edits.")
@@ -1126,7 +1132,7 @@ extension AtlasCamera {
                 }
             } else if let source = selectedSource, sourceError == nil {
                 AtlasSourceReader(source: source, navigation: focusRequest,
-                    selection: searchIsCurrent ? selectedReaderSelection : nil) {
+                    selection: searchIsCurrent ? selectedReaderSelection : nil, wrapsLines: wrapsSourceLines) {
                     if let document = atlasDocuments[source.path],
                        document.source.path.utf8.elementsEqual(source.path.utf8),
                        document.source.text.utf8.elementsEqual(source.text.utf8) {

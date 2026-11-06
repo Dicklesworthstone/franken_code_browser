@@ -15,6 +15,7 @@ struct AtlasReaderSelection {
     let source: AtlasSource
     let navigation: UUID
     let selection: AtlasReaderSelection?
+    var wrapsLines = false
     var backgroundColor: NSColor = .textBackgroundColor
     var foregroundColor: NSColor = .textColor
     let styledSource: () -> NSAttributedString
@@ -23,7 +24,7 @@ struct AtlasReaderSelection {
     func makeNSView(context: Context) -> NSStackView { context.coordinator.view }
     func updateNSView(_ view: NSStackView, context: Context) {
         context.coordinator.update(source: source, navigation: navigation,
-            selection: selection, backgroundColor: backgroundColor,
+            selection: selection, wrapsLines: wrapsLines, backgroundColor: backgroundColor,
             foregroundColor: foregroundColor, styledSource: styledSource)
     }
 }
@@ -41,6 +42,16 @@ struct AtlasReaderSelection {
     private var lastTargetSource: AtlasSource?
     private var lastRange: NSRange?
     private var lastAccepted = true
+    private var wrapsLines = false
+    // The native route already admits at most 4 MiB of source (and smaller
+    // retained pages). This is AppKit's finite unconstrained layout dimension,
+    // not a document frame size or a claim of giant-line virtualization.
+    private static let layoutExtent = CGFloat(Float.greatestFiniteMagnitude)
+
+    private struct ViewportAnchor {
+        let character: Int
+        let offset: NSPoint
+    }
 
     init() {
         scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 640, height: 220))
@@ -53,7 +64,7 @@ struct AtlasReaderSelection {
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.widthAnchor.constraint(equalTo: view.widthAnchor).isActive = true
         scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = false
+        scrollView.hasHorizontalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
         textView.isEditable = false
@@ -68,14 +79,13 @@ struct AtlasReaderSelection {
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = false
-        textView.autoresizingMask = [.width]
+        textView.isHorizontallyResizable = true
+        textView.autoresizingMask = [.width, .height]
         textView.minSize = .zero
-        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
-                                  height: CGFloat.greatestFiniteMagnitude)
+        textView.maxSize = NSSize(width: Self.layoutExtent, height: Self.layoutExtent)
         textView.textContainerInset = NSSize(width: 8, height: 8)
-        textView.textContainer?.containerSize = NSSize(width: 624, height: CGFloat.greatestFiniteMagnitude)
-        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(width: Self.layoutExtent, height: Self.layoutExtent)
+        textView.textContainer?.widthTracksTextView = false
         textView.layoutManager?.allowsNonContiguousLayout = true
         textView.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
         textView.setAccessibilityLabel("Read-only source")
@@ -87,6 +97,7 @@ struct AtlasReaderSelection {
 
     @discardableResult
     func update(source: AtlasSource, navigation: UUID, selection: AtlasReaderSelection?,
+                wrapsLines: Bool = false,
                 backgroundColor: NSColor = .textBackgroundColor, foregroundColor: NSColor = .textColor,
                 styledSource: () -> NSAttributedString) -> Bool {
         precondition(Thread.isMainThread)
@@ -101,6 +112,9 @@ struct AtlasReaderSelection {
             guard source.text.utf8.count <= 4 * 1024 * 1024 else {
                 return refuseSource("Source exceeds this native reader's 4 MiB limit.")
             }
+        }
+        setWrapping(wrapsLines, preservingPosition: !changed)
+        if changed {
             let styled = styledSource()
             let exact = styled.string.utf8.elementsEqual(source.text.utf8)
             let content = exact ? styled : NSAttributedString(string: source.text, attributes: [
@@ -140,6 +154,66 @@ struct AtlasReaderSelection {
         }
         textView.scrollRangeToVisible(selection.range)
         return true
+    }
+
+    /// Wrapping is presentation state of this reader, not a source/navigation
+    /// request. Do not reinstall text, set selection, or replay a search target.
+    /// Reflow keeps the character at the viewport's leading edge in view instead
+    /// of preserving a scroll percentage over a newly shaped document height.
+    private func setWrapping(_ wrapsLines: Bool, preservingPosition: Bool) {
+        guard self.wrapsLines != wrapsLines else { return }
+        let anchor = preservingPosition ? viewportAnchor() : nil
+        self.wrapsLines = wrapsLines
+        let container = textView.textContainer
+        container?.widthTracksTextView = false
+        scrollView.hasHorizontalScroller = !wrapsLines
+        textView.isHorizontallyResizable = !wrapsLines
+        textView.autoresizingMask = wrapsLines ? [.width] : [.width, .height]
+        if wrapsLines {
+            let width = max(1, scrollView.contentSize.width)
+            textView.setFrameSize(NSSize(width: width, height: textView.frame.height))
+            container?.containerSize = NSSize(
+                width: max(1, width - 2 * textView.textContainerInset.width), height: Self.layoutExtent)
+            container?.widthTracksTextView = true
+        } else {
+            container?.containerSize = NSSize(width: Self.layoutExtent, height: Self.layoutExtent)
+        }
+        if let anchor { restoreViewport(anchor) }
+    }
+
+    private func viewportAnchor() -> ViewportAnchor? {
+        let visible = textView.visibleRect
+        let origin = textView.textContainerOrigin
+        let point = NSPoint(x: max(visible.minX, origin.x), y: max(visible.minY, origin.y))
+        let character = textView.characterIndexForInsertion(at: point)
+        guard let location = location(of: character) else { return nil }
+        return ViewportAnchor(character: character,
+            offset: NSPoint(x: visible.minX - location.x, y: visible.minY - location.y))
+    }
+
+    private func restoreViewport(_ anchor: ViewportAnchor) {
+        // AppKit lays out the anchor and updates its scrollable document extent.
+        // This does not change the user's selected ranges or first responder.
+        textView.scrollRangeToVisible(NSRange(location: anchor.character, length: 0))
+        guard let location = location(of: anchor.character) else { return }
+        let clip = scrollView.contentView
+        var bounds = clip.bounds
+        bounds.origin = NSPoint(x: wrapsLines ? 0 : location.x + anchor.offset.x,
+            y: location.y + anchor.offset.y)
+        clip.scroll(to: clip.constrainBoundsRect(bounds).origin)
+        scrollView.reflectScrolledClipView(clip)
+    }
+
+    private func location(of character: Int) -> NSPoint? {
+        guard let storage = textView.textStorage, character >= 0, character < storage.length,
+              let layout = textView.layoutManager else { return nil }
+        let glyph = layout.glyphIndexForCharacter(at: character)
+        guard glyph < layout.numberOfGlyphs else { return nil }
+        let fragment = layout.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+        let position = layout.location(forGlyphAt: glyph)
+        let origin = textView.textContainerOrigin
+        let location = NSPoint(x: origin.x + fragment.minX + position.x, y: origin.y + fragment.minY)
+        return location.x.isFinite && location.y.isFinite ? location : nil
     }
 
     /// Refusing a replacement capture revokes the old presentation as well.
