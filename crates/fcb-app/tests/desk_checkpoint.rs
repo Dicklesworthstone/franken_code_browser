@@ -181,3 +181,74 @@ fn canceled_restore_keeps_search_results_and_original_reader_usable() {
     s.activate_hit(1, 3, pane, 1, 0, || false).unwrap();
     assert_eq!(json(&s.copy_selection(3, pane, || false).unwrap()).get("original_hex").text(), "6e6565646c65");
 }
+
+#[test]
+fn delayed_save_receipt_never_marks_newer_notes_or_attempts_as_persisted() {
+    let root = fixture(); let source = root.join("a.rs"); let checkpoint = root.join("before-note.fcbk");
+    fs::write(&source, b"exact saved source").unwrap();
+    let mut s = session(112); let pane = open(&mut s, &source);
+    let saved = s.save_checkpoint(1, &checkpoint, 1024, || false);
+    assert_eq!(saved.error(), None);
+    assert_eq!(saved.owner(), s.model().owner());
+    assert_eq!(saved.model_revision(), 1); assert_eq!(saved.last_attempt(), 1);
+
+    // A failed mutation consumes an attempt without changing the accepted desk.
+    assert!(matches!(s.apply(1, 2, DeskCommand::ForgetBookmark(u64::MAX), || false),
+        Err(DeskSessionError::Desk(DeskError::MissingBookmark))));
+    let after_attempt = json(&s.checkpoint_save_response(&saved).unwrap());
+    assert_eq!(after_attempt.get("last_attempt").number(), 1);
+    apply(&mut s, DeskCommand::Annotate { pane, label: "unsaved note".into(), body: "new personal work".into() });
+    assert_eq!(s.model().revision(), 3);
+
+    let receipt = json(&s.checkpoint_save_response(&saved).unwrap());
+    assert_eq!(receipt.get("owner").number(), 112);
+    assert_eq!(receipt.get("model_revision").number(), 1);
+    assert_eq!(receipt.get("last_attempt").number(), 1);
+    assert_eq!(receipt.get("status").text(), "ok");
+    assert_eq!(receipt.get("checkpoint_bytes").number(), fs::metadata(&checkpoint).unwrap().len());
+
+    // Independent reopening proves what the receipt actually saved: exact
+    // captured bytes, with none of the later annotation claimed as durable.
+    let mut reopened = session(113);
+    let restored = reopened.restore_checkpoint_file(0, 1, &checkpoint, || false).unwrap().active.unwrap();
+    assert_eq!(text(&mut reopened, restored), "exact saved source");
+    assert!(reopened.model().bookmarks().is_empty());
+    assert_eq!(s.model().bookmarks()[0].body(), "new personal work");
+}
+
+#[test]
+fn save_receipts_cannot_be_relabelled_as_another_desks_state() {
+    let root = fixture(); let checkpoint = root.join("original.fcbk");
+    let mut original = session(114);
+    let saved = original.save_checkpoint(0, &checkpoint, 0, || false);
+    assert_eq!(saved.error(), None);
+    let mut other = session(115);
+    assert!(matches!(other.checkpoint_save_response(&saved),
+        Err(DeskSessionError::Desk(DeskError::OwnerMismatch))));
+    assert_eq!(other.model().revision(), 0);
+    assert_eq!(other.model().last_attempt(), 0);
+    assert_eq!(json(&original.checkpoint_save_response(&saved).unwrap()).get("owner").number(), 114);
+}
+
+#[test]
+fn delayed_canceled_save_retains_its_original_identity_and_actual_file_effect() {
+    let root = fixture(); let source = root.join("a.rs"); let checkpoint = root.join("partial.fcbk");
+    fs::write(&source, b"source").unwrap();
+    let mut s = session(116); let pane = open(&mut s, &source);
+    let saved = s.save_checkpoint(1, &checkpoint, 1024, || checkpoint.exists());
+    assert_eq!(saved.exit_code(), EXIT_CANCELED);
+    assert_eq!(saved.effect(), CheckpointSaveEffect::Created);
+    apply(&mut s, DeskCommand::Bookmark { pane, label: "later bookmark".into() });
+
+    let response = s.checkpoint_save_response(&saved).unwrap();
+    assert_eq!(response.exit_code(), EXIT_CANCELED);
+    let receipt = json(&response);
+    assert_eq!(receipt.get("model_revision").number(), 1);
+    assert_eq!(receipt.get("last_attempt").number(), 1);
+    assert_eq!(receipt.get("status").text(), "error");
+    assert_eq!(receipt.get("effect").text(), "destination-created-incomplete");
+    assert_eq!(receipt.get("bytes_written").number(), 0);
+    assert_eq!(fs::metadata(&checkpoint).unwrap().len(), 0);
+    assert_eq!(s.model().revision(), 2);
+    assert_eq!(s.model().bookmarks().len(), 1);
+}

@@ -9,7 +9,7 @@
 //! inside a checkpoint confer no filesystem capability.
 
 use std::{fs::{File, OpenOptions}, io::{self, Read, Write}, path::{Path, PathBuf}};
-use super::{DeskSession, DeskSessionError, DeskChange, DeskError, HostResponse,
+use super::{ArenaOwnerId, DeskSession, DeskSessionError, DeskChange, DeskError, HostResponse,
     Output, ByteLength, ResourceBudget, ResourceAllocationId, ResourceLease};
 use fcb::ui::reading_panes::desk::checkpoint::{CheckpointError, MAX_CHECKPOINT_BYTES};
 use fcb::store::envelope::Sha256Digest;
@@ -64,6 +64,9 @@ impl CheckpointSaveEffect {
 /// NOT rollback. No method deletes or overwrites an incomplete destination.
 #[derive(Clone, Copy, Debug)]
 pub struct CheckpointSave {
+    pub(super) owner: ArenaOwnerId,
+    pub(super) revision: u64,
+    pub(super) last_attempt: u64,
     pub(super) effect: CheckpointSaveEffect,
     pub(super) bytes_written: u64,
     pub(super) document_bytes: u64,
@@ -72,6 +75,9 @@ pub struct CheckpointSave {
     pub(super) error: Option<CheckpointIoError>,
 }
 impl CheckpointSave {
+    pub const fn owner(&self) -> ArenaOwnerId { self.owner }
+    pub const fn model_revision(&self) -> u64 { self.revision }
+    pub const fn last_attempt(&self) -> u64 { self.last_attempt }
     pub const fn effect(&self) -> CheckpointSaveEffect { self.effect }
     pub const fn bytes_written(&self) -> u64 { self.bytes_written }
     pub const fn document_bytes(&self) -> u64 { self.document_bytes }
@@ -90,7 +96,9 @@ impl DeskSession {
     /// not change the model revision, history, selection or accepted query.
     pub fn save_checkpoint(&mut self, expected: u64, destination: &Path, max_source_bytes: u64,
         mut canceled: impl FnMut() -> bool) -> CheckpointSave {
-        let mut outcome = CheckpointSave { effect: CheckpointSaveEffect::None, bytes_written: 0,
+        let mut outcome = CheckpointSave {
+            owner: self.desk.owner(), revision: self.desk.revision(), last_attempt: self.desk.last_attempt(),
+            effect: CheckpointSaveEffect::None, bytes_written: 0,
             document_bytes: 0, source_bytes: self.desk.retained_source_bytes(), digest: None, error: None };
         let result = (|| -> Result<(), CheckpointIoError> {
             if expected != self.desk.revision() { return Err(DeskSessionError::Desk(DeskError::StaleRevision).into()); }
@@ -135,14 +143,18 @@ impl DeskSession {
     /// Encode the already-final write receipt. This deliberately has no cancel
     /// callback. A native host receives the typed outcome even if encoding or
     /// its later transport fails; filesystem effects cannot be rolled back.
+    /// The receipt names the state observed by save_checkpoint, even if the desk
+    /// has since changed. A delayed save response must never mark newer personal
+    /// state as persisted, and a different desk cannot adopt this receipt.
     pub fn checkpoint_save_response(&mut self, saved: &CheckpointSave) -> Result<HostResponse, DeskSessionError> {
+        if saved.owner != self.desk.owner() { return Err(DeskError::OwnerMismatch.into()); }
         let id = self.next_id()?;
         let mut out = Output::new(self.desk.owner(), 16 * 1024, &self.budget, id)?;
         out.literal("{\"schema\":\"fcb.reading-desk/1\",\"command\":\"save\",\"status\":")?;
         out.quoted(if saved.error.is_none() { "ok" } else { "error" })?;
-        out.literal(",\"owner\":")?; out.integer(self.desk.owner().get())?;
-        out.literal(",\"model_revision\":")?; out.integer(self.desk.revision())?;
-        out.literal(",\"last_attempt\":")?; out.integer(self.desk.last_attempt())?;
+        out.literal(",\"owner\":")?; out.integer(saved.owner.get())?;
+        out.literal(",\"model_revision\":")?; out.integer(saved.revision)?;
+        out.literal(",\"last_attempt\":")?; out.integer(saved.last_attempt)?;
         out.literal(",\"effect\":")?; out.quoted(saved.effect.code())?;
         out.literal(",\"bytes_written\":")?; out.integer(saved.bytes_written)?;
         out.literal(",\"checkpoint_bytes\":")?; out.integer(saved.document_bytes)?;
@@ -255,7 +267,8 @@ fn load_checkpoint(path: &Path, owner: fcb::ArenaOwnerId, budget: &ResourceBudge
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn outcome() -> CheckpointSave { CheckpointSave { effect: CheckpointSaveEffect::Created,
+    fn outcome() -> CheckpointSave { CheckpointSave {
+        owner: ArenaOwnerId::new(1).unwrap(), revision: 0, last_attempt: 0, effect: CheckpointSaveEffect::Created,
         bytes_written: 0, document_bytes: 10, source_bytes: 10, digest: None, error: None } }
     #[test]
     fn short_write_then_error_reports_only_actual_written_prefix() {

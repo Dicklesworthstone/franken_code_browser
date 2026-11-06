@@ -79,7 +79,9 @@ impl DeskSession {
         limits: DeskSourcePackLimits, mut canceled: impl FnMut() -> bool) -> DeskSourcePackExport {
         let mut outcome = DeskSourcePackExport {
             owner: self.desk.owner(), revision: self.desk.revision(), last_attempt: self.desk.last_attempt(),
-            write: CheckpointSave { effect: CheckpointSaveEffect::None, bytes_written: 0,
+            write: CheckpointSave {
+                owner: self.desk.owner(), revision: self.desk.revision(), last_attempt: self.desk.last_attempt(),
+                effect: CheckpointSaveEffect::None, bytes_written: 0,
                 document_bytes: 0, source_bytes: 0, digest: None, error: None },
             limits, coverage: DeskSourcePackCoverage {
                 total_bookmarks: self.desk.bookmarks().len() as u64, ..Default::default()
