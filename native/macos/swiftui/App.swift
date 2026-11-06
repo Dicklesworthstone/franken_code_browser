@@ -283,6 +283,8 @@ extension AtlasCamera {
     @State private var selectedSource: AtlasSource?
     @State private var selectedReaderSelection: AtlasReaderSelection?
     @State private var wrapsSourceLines = false
+    @State private var showsSourceLineNumbers = true
+    @State private var showsSourceWhitespace = false
     @State private var sourceIO = AtlasProjectIO()
     @State private var sourceTask: Task<Void, Never>?
     @State private var sourceCancellation: AtlasSearchCancellation?
@@ -1131,9 +1133,13 @@ extension AtlasCamera {
                     }
                     if !usesPagedReader, let path = selectedPath {
                         if finderReaderCapture == nil, selectedSource != nil, sourceError == nil {
-                            Toggle("Wrap lines", isOn: $wrapsSourceLines)
-                                .toggleStyle(.checkbox).controlSize(.small)
-                                .help("Wrap this reader at its width; turn off to scroll long source lines horizontally. Source and selection stay unchanged.")
+                            Menu("Display") {
+                                Toggle("Line numbers", isOn: $showsSourceLineNumbers)
+                                Toggle("Visible whitespace", isOn: $showsSourceWhitespace)
+                                Toggle("Wrap lines", isOn: $wrapsSourceLines)
+                            }
+                            .menuStyle(.borderlessButton).fixedSize().controlSize(.small)
+                            .help("Show physical source lines and whitespace, or wrap long lines. These display choices preserve source text and selection.")
                         }
                         Button("Read pages") { openPagedFile(path) }
                             .help(selectedSource == nil ? "Capture the current file for byte and line navigation"
@@ -1171,7 +1177,9 @@ extension AtlasCamera {
                 }
             } else if let source = selectedSource, sourceError == nil {
                 AtlasSourceReader(source: source, navigation: focusRequest,
-                    selection: searchIsCurrent ? selectedReaderSelection : nil, wrapsLines: wrapsSourceLines) {
+                    selection: searchIsCurrent ? selectedReaderSelection : nil, wrapsLines: wrapsSourceLines,
+                    showsLineNumbers: showsSourceLineNumbers, showsWhitespace: showsSourceWhitespace,
+                    firstPhysicalLine: 1) {
                     if let document = atlasDocuments[source.path],
                        document.source.path.utf8.elementsEqual(source.path.utf8),
                        document.source.text.utf8.elementsEqual(source.text.utf8) {

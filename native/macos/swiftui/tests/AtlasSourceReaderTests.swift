@@ -2,6 +2,8 @@ import AppKit
 import Foundation
 
 /// Compile with AtlasSource.swift and AtlasSourceReader.swift on a native Mac.
+/// Invoke the Swift 6 warnings-as-errors build through strict RCH at the source
+/// revision under review. These scenarios do not qualify hardware presentation.
 /// No clipboard write, source I/O, search, simulator, or release claim occurs.
 @MainActor @main struct AtlasSourceReaderTests {
     static func main() {
@@ -20,7 +22,15 @@ import Foundation
         wrappingReflowsWithoutReplacingSourceOrSelection()
         readersKeepIndependentWrappingAndScroll()
         wrappingCannotReviveStaleNavigation()
-        print("AtlasSourceReader: 14 native selection, layout, scrolling and source-identity scenarios passed")
+        physicalLineMetadataPreservesTerminatorsAndUTF16()
+        lineBasesAreExplicitAndOverflowSafe()
+        rulerUsesPhysicalStartsAcrossWrapping()
+        horizontalScrollKeepsShortAndBlankLineLabels()
+        readingGuideTogglesPreserveSourceSelectionStylesAndViewport()
+        emptyAndTerminatedSourcesDoNotNumberExtraLayoutLine()
+        replacementSourcesRetireOldLineMetadata()
+        largeLineMetadataStaysCachedDuringPresentation()
+        print("AtlasSourceReader: 22 native selection, layout, reading-guide and source-identity scenarios passed")
     }
     static func present(_ reader: AtlasSourceReaderController, _ source: AtlasSource,
                         _ range: NSRange?, navigation: UUID = UUID()) -> Bool {
@@ -166,6 +176,8 @@ import Foundation
             preconditionFailure("oversized source reached styling")
         })
         precondition(reader.textView.string.isEmpty && !reader.notice.isHidden)
+        precondition(reader.lineRuler.lineIndex == nil && reader.lineRuler.visibleLabels().isEmpty,
+                     "source refusal retained stale line metadata")
     }
 
     /// Hidden native windows give the real scroll/clip/document views a finite
@@ -319,6 +331,256 @@ import Foundation
                 selection: stale, wrapsLines: wrapped) { preconditionFailure("source must stay installed") })
             precondition(reader.textView.selectedRange() == manual && !reader.notice.isHidden)
             precondition(reader.textView.string.utf8.elementsEqual(current.text.utf8))
+        }
+    }
+
+    static func physicalLineMetadataPreservesTerminatorsAndUTF16() {
+        let cases: [(String, [UInt32])] = [
+            ("", []), ("\n", [0]), ("\r", [0]), ("\r\n", [0]),
+            ("a\n", [0]), ("a\r\n", [0]), ("\n\n", [0, 1]),
+            ("\r\r\n\n", [0, 1, 3]), ("a\r\nb\rc\nd", [0, 3, 5, 7]),
+            ("😀\r\ne\u{301}\nאב\rz", [0, 4, 7, 10]),
+            ("\u{85}\u{2028}\u{2029}text", [0])
+        ]
+        for (text, expected) in cases {
+            guard let index = AtlasReaderLineIndex(text: text) else {
+                preconditionFailure("a bounded source failed line admission")
+            }
+            precondition(index.starts == expected, "physical starts disagree with CR/LF/CRLF source semantics")
+            precondition(index.utf16Length == (text as NSString).length)
+            precondition(AtlasSource(path: "lines", text: text).lines.count == expected.count,
+                         "the reader gutter disagrees with the retained source's physical line contract")
+            for (line, start) in expected.enumerated() {
+                precondition(index.line(containing: Int(start)) == line)
+            }
+            precondition(index.line(containing: -1) == nil)
+            precondition(index.line(containing: index.utf16Length) == nil,
+                         "the native EOF insertion point became a source line")
+        }
+        let crlf = AtlasReaderLineIndex(text: "a\r\nb")!
+        precondition(crlf.line(containing: 1) == 0 && crlf.line(containing: 2) == 0,
+                     "CRLF was split into two physical lines")
+    }
+
+    static func lineBasesAreExplicitAndOverflowSafe() {
+        let source = AtlasSource(path: "window.rs", text: "one\r\ntwo\nthree")
+        let reader = AtlasSourceReaderController(), window = host(reader), navigation = UUID()
+        defer { window.close() }
+        func update(_ base: UInt64?) {
+            precondition(reader.update(source: source, navigation: navigation, selection: nil,
+                showsLineNumbers: true, firstPhysicalLine: base) {
+                NSAttributedString(string: source.text, attributes: [
+                    .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+                ])
+            })
+            _ = layout(reader)
+        }
+        update(97)
+        let installed = reader.lineRuler.lineIndex
+        let manual = (source.text as NSString).range(of: "two")
+        reader.textView.setSelectedRange(manual)
+        let cases: [(UInt64?, [String])] = [
+            (97, ["97", "98", "99"]),
+            (nil, ["+1", "+2", "+3"]),
+            (0, ["+1", "+2", "+3"]),
+            (UInt64.max, [String(UInt64.max), "?", "?"])
+        ]
+        for (base, expected) in cases {
+            update(base)
+            precondition(reader.lineRuler.visibleLabels().map(\.text) == expected,
+                         "unknown or overflowing page bases produced misleading line numbers")
+            precondition(reader.lineRuler.lineIndex === installed,
+                         "a page-base change rescanned the immutable source")
+            precondition(reader.textView.selectedRange() == manual)
+        }
+        precondition(reader.lineRuler.ruleThickness > 100,
+                     "an overflowing last number hid the valid first 20-digit line")
+        let ordinary = AtlasSourceReaderController()
+        precondition(present(ordinary, source, nil))
+        precondition(!ordinary.scrollView.rulersVisible && ordinary.lineRuler.firstPhysicalLine == nil,
+                     "a source fragment caller accidentally claimed an absolute line base")
+    }
+
+    static func rulerUsesPhysicalStartsAcrossWrapping() {
+        let source = AtlasSource(path: "long.rs",
+            text: String(repeating: "word ", count: 350) + "\r\nshort\n😀last")
+        let reader = AtlasSourceReaderController(), window = host(reader), navigation = UUID()
+        defer { window.close() }
+        func update(_ wrapped: Bool) {
+            precondition(reader.update(source: source, navigation: navigation, selection: nil,
+                wrapsLines: wrapped, showsLineNumbers: true, firstPhysicalLine: 42) {
+                NSAttributedString(string: source.text, attributes: [
+                    .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+                ])
+            })
+            _ = layout(reader)
+        }
+        update(false)
+        let installed = reader.lineRuler.lineIndex
+        precondition(reader.lineRuler.visibleLabels().map(\.text) == ["42", "43", "44"])
+        update(true)
+        precondition(reader.lineRuler.visibleLabels().filter { $0.physicalLine == 0 }.count == 1,
+                     "wrapped fragments received duplicate physical line numbers")
+        let continuation = NSRange(location: 1400, length: 1)
+        reader.textView.scrollRangeToVisible(continuation)
+        precondition(reader.textView.visibleRect.minY > rect(reader, NSRange(location: 0, length: 1)).maxY)
+        precondition(reader.lineRuler.visibleLabels().allSatisfy { $0.physicalLine != 0 },
+                     "a scrolled wrapped continuation was relabeled as a physical start")
+        let next = (source.text as NSString).range(of: "short")
+        reader.textView.scrollRangeToVisible(next)
+        let labels = reader.lineRuler.visibleLabels()
+        guard let label = labels.first(where: { $0.physicalLine == 1 }) else {
+            preconditionFailure("the next visible physical source line has no gutter label")
+        }
+        let (manager, _) = layout(reader)
+        let fragment = manager.lineFragmentRect(
+            forGlyphAt: manager.glyphIndexForCharacter(at: next.location), effectiveRange: nil)
+        let expected = reader.lineRuler.convert(NSPoint(x: reader.textView.textContainerOrigin.x,
+            y: reader.textView.textContainerOrigin.y + fragment.minY), from: reader.textView)
+        precondition(label.text == "43" && abs(label.frame.minY - expected.y) < 1)
+        precondition(reader.lineRuler.lineIndex === installed)
+        precondition(reader.textView.string.utf8.elementsEqual(source.text.utf8))
+    }
+
+    static func horizontalScrollKeepsShortAndBlankLineLabels() {
+        let source = AtlasSource(path: "horizontal.rs",
+            text: "short\n" + String(repeating: "wide ", count: 200) + "target\r\n\r\nlast")
+        let reader = AtlasSourceReaderController(), window = host(reader)
+        defer { window.close() }
+        precondition(reader.update(source: source, navigation: UUID(), selection: nil,
+            showsLineNumbers: true, firstPhysicalLine: 800) {
+            NSAttributedString(string: source.text, attributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+            ])
+        })
+        _ = layout(reader)
+        reader.textView.scrollRangeToVisible((source.text as NSString).range(of: "target"))
+        precondition(reader.scrollView.contentView.bounds.minX > 0)
+        precondition(reader.lineRuler.visibleLabels().map(\.text) == ["800", "801", "802", "803"],
+                     "horizontal scrolling hid short or blank physical line labels")
+    }
+
+    static func readingGuideTogglesPreserveSourceSelectionStylesAndViewport() {
+        let source = AtlasSource(path: "guides.rs", text: (0..<80).map {
+            "row \($0):\t" + String(repeating: "word ", count: 30) + "😀 e\u{301} אב\r\n"
+        }.joined())
+        let reader = AtlasSourceReaderController(), window = host(reader), navigation = UUID()
+        defer { window.close() }
+        let oldTarget = AtlasReaderSelection(source: source, range: NSRange(location: 0, length: 3))
+        let manual = (source.text as NSString).range(of: "😀 e\u{301} אב")
+        let middle = (source.text as NSString).range(of: "row 40:")
+        var installations = 0
+        func update(_ numbers: Bool, _ whitespace: Bool) {
+            precondition(reader.update(source: source, navigation: navigation, selection: oldTarget,
+                showsLineNumbers: numbers, showsWhitespace: whitespace, firstPhysicalLine: 1) {
+                installations += 1
+                let styled = NSMutableAttributedString(string: source.text, attributes: [
+                    .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+                ])
+                styled.addAttribute(.foregroundColor, value: NSColor.systemPink, range: oldTarget.range)
+                return styled
+            })
+        }
+        update(false, false)
+        reader.textView.setSelectedRange(manual)
+        let selected = reader.textView.selectedRanges
+        let middleRect = rect(reader, middle)
+        let clip = reader.scrollView.contentView
+        var bounds = clip.bounds
+        bounds.origin = NSPoint(x: 0, y: middleRect.minY)
+        clip.scroll(to: clip.constrainBoundsRect(bounds).origin)
+        reader.scrollView.reflectScrolledClipView(clip)
+        let originalY = reader.textView.visibleRect.minY
+        let installed = reader.lineRuler.lineIndex
+        let responder = window.firstResponder
+        precondition(originalY > 0)
+        for (numbers, whitespace) in [(true, false), (true, true), (false, true), (false, false), (true, true)] {
+            update(numbers, whitespace)
+            _ = layout(reader)
+            precondition(reader.scrollView.rulersVisible == numbers)
+            precondition(reader.textView.layoutManager?.showsInvisibleCharacters == whitespace)
+            precondition(reader.textView.selectedRanges == selected && installations == 1,
+                         "reading guides reinstalled source or replayed an old search selection")
+            precondition(reader.lineRuler.lineIndex === installed,
+                         "presentation updates rebuilt physical line metadata")
+            precondition(reader.textView.string.utf8.elementsEqual(source.text.utf8))
+            precondition((reader.textView.string as NSString).substring(with: manual) == "😀 e\u{301} אב")
+            precondition(reader.textView.textStorage?.attribute(.foregroundColor, at: 0,
+                effectiveRange: nil) as? NSColor == .systemPink)
+            precondition(abs(reader.textView.visibleRect.minY - originalY) < 2
+                && rect(reader, middle).intersects(reader.textView.visibleRect),
+                "a display toggle moved away from the visible source")
+            precondition(window.firstResponder === responder, "reading guides stole native focus")
+        }
+    }
+
+    static func emptyAndTerminatedSourcesDoNotNumberExtraLayoutLine() {
+        let reader = AtlasSourceReaderController(), window = host(reader)
+        defer { window.close() }
+        for (text, count) in [("", 0), ("\n", 1), ("\r", 1), ("\r\n", 1),
+                              ("a\n", 1), ("a\r\n", 1), ("\n\n", 2), ("\r\n\r\n", 2)] {
+            let source = AtlasSource(path: "ending", text: text)
+            precondition(reader.update(source: source, navigation: UUID(), selection: nil,
+                showsLineNumbers: true, firstPhysicalLine: 1) {
+                NSAttributedString(string: source.text, attributes: [
+                    .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+                ])
+            })
+            _ = layout(reader)
+            precondition(reader.lineRuler.visibleLabels().map(\.physicalLine) == Array(0..<count),
+                         "AppKit's extra EOF layout fragment became a numbered source line")
+        }
+    }
+
+    static func replacementSourcesRetireOldLineMetadata() {
+        let old = AtlasSource(path: "same.rs", text: "one\ntwo\nthree")
+        let current = AtlasSource(path: "same.rs", text: "replacement")
+        let reader = AtlasSourceReaderController(), window = host(reader), navigation = UUID()
+        defer { window.close() }
+        func update(_ source: AtlasSource, _ selection: AtlasReaderSelection? = nil) -> Bool {
+            reader.update(source: source, navigation: navigation, selection: selection,
+                showsLineNumbers: true, firstPhysicalLine: 300) {
+                NSAttributedString(string: source.text, attributes: [
+                    .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+                ])
+            }
+        }
+        precondition(update(old))
+        let oldLines = reader.lineRuler.lineIndex
+        precondition(update(current))
+        _ = layout(reader)
+        precondition(reader.lineRuler.lineIndex !== oldLines)
+        precondition(reader.lineRuler.visibleLabels().map(\.text) == ["300"])
+        let currentLines = reader.lineRuler.lineIndex
+        precondition(!update(current, AtlasReaderSelection(source: old, range: NSRange(location: 0, length: 3))))
+        precondition(reader.lineRuler.lineIndex === currentLines
+            && reader.lineRuler.visibleLabels().map(\.text) == ["300"],
+            "a stale target revived old source line metadata")
+    }
+
+    static func largeLineMetadataStaysCachedDuringPresentation() {
+        let source = AtlasSource(path: "many-lines", text: String(repeating: "\n", count: 65_536))
+        let reader = AtlasSourceReaderController(), window = host(reader), navigation = UUID()
+        defer { window.close() }
+        var installations = 0
+        func update(_ whitespace: Bool) {
+            precondition(reader.update(source: source, navigation: navigation, selection: nil,
+                showsLineNumbers: true, showsWhitespace: whitespace, firstPhysicalLine: 1) {
+                installations += 1
+                return NSAttributedString(string: source.text, attributes: [
+                    .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+                ])
+            })
+        }
+        update(false)
+        guard let installed = reader.lineRuler.lineIndex else { preconditionFailure("missing line cache") }
+        precondition(installed.starts.count == 65_536 && installed.utf16Length == 65_536)
+        for whitespace in [true, false, true, false] {
+            update(whitespace)
+            let labels = reader.lineRuler.visibleLabels()
+            precondition(!labels.isEmpty && labels.count <= AtlasReaderLineRuler.maximumVisibleLabels)
+            precondition(reader.lineRuler.lineIndex === installed && installations == 1,
+                         "scroll-time presentation rebuilt a newline-heavy capture")
         }
     }
 }

@@ -139,6 +139,27 @@ case choices, retained-index reuse, stale responses, spelling validation,
 capture replacement, and Unicode source navigation. These are code-first
 additions; executable Rust/Swift and physical-Mac qualification remain pending.
 
+## Source reader display
+
+The source reader's **Display** menu provides independent **Line numbers**,
+**Visible whitespace**, and **Wrap lines** controls. Line numbers are on by default.
+Wrapping changes visual rows; the gutter continues to identify physical source
+lines, treating CR, LF, and CRLF as source line endings. Whitespace markers use
+AppKit's display support without inserting characters into the captured text.
+
+Paged reading uses the engine's qualified starting line when available. For a
+byte or search-hit page whose absolute line is unknown, the gutter uses explicit
+page-relative labels (`+1`, `+2`, …) and the reader identifies them as **Page
+lines (+)**. It does not present those labels as file coordinates. Display
+changes preserve source identity, manual selection, and the viewport anchor;
+ordinary text copy and the separate original-byte hex actions keep their
+existing semantics.
+
+These controls apply within the source reader's existing admission bounds,
+including retained and pinned pages. Native layout, scrolling, and copy
+regressions are included for the configured macOS verification lane;
+physical-Mac execution remains pending.
+
 ## Local test image
 
 For a local drag-to-Applications test image:

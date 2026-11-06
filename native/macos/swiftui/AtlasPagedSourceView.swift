@@ -21,6 +21,8 @@ import AppKit
     @State private var showsDocument = false
     @State private var showsSplitPreview = false
     @State private var wrapsLines = false
+    @State private var showsLineNumbers = true
+    @State private var showsWhitespace = false
 
     init(root: String, path: String, accessLease: AnyObject?, captured: AtlasSearchCapturedHit? = nil,
          supplied: AtlasSuppliedReaderSource? = nil,
@@ -98,7 +100,12 @@ import AppKit
                 HStack {
                     Text("Bytes \(page.start)..<\(page.end) / \(page.identity.capturedBytes) · \(page.identity.encoding)")
                         .font(.system(size: 10.5, design: .monospaced))
-                    if let line = page.firstPhysicalLine { Text("from line \(line)").font(.caption) }
+                    if let line = physicalLineBase(page) {
+                        Text("from line \(line)").font(.caption)
+                    } else if showsLineNumbers && !page.text.isEmpty {
+                        Text("Page lines (+)").font(.caption)
+                            .help("The gutter counts lines within this page. Use Go line to request a known physical file line.")
+                    }
                     Spacer()
                     Button("Copy original hex") { copyHex() }
                         .help("Copy this page's original captured bytes as lossless hexadecimal, not decoded text or a search selection")
@@ -112,7 +119,8 @@ import AppKit
                 let page = model.page
                 AtlasSourceReader(source: source, navigation: model.navigation,
                     selection: model.nativeSelectionRange.map { AtlasReaderSelection(source: source, range: $0) },
-                    wrapsLines: wrapsLines,
+                    wrapsLines: wrapsLines, showsLineNumbers: showsLineNumbers,
+                    showsWhitespace: showsWhitespace, firstPhysicalLine: physicalLineBase(page),
                     backgroundColor: Monokai.background, foregroundColor: Monokai.color("plain")) {
                     if let page, page.text.utf8.elementsEqual(source.text.utf8),
                        let highlight = page.highlight {
@@ -137,6 +145,12 @@ import AppKit
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 10).padding(.bottom, 4)
         }
+    }
+
+    private func physicalLineBase(_ page: AtlasReaderPage?) -> UInt64? {
+        guard let page, !page.text.isEmpty else { return nil }
+        if let line = page.firstPhysicalLine, line > 0 { return line }
+        return page.start == 0 ? 1 : nil
     }
 
     private var controls: some View {
@@ -169,10 +183,13 @@ import AppKit
                     .accessibilityLabel("Physical source line, one based")
                     .onSubmit(model.goToLine)
                 Button("Go line", action: model.goToLine).disabled(model.page == nil)
-                Toggle("Wrap lines", isOn: $wrapsLines)
-                    .toggleStyle(.checkbox)
-                    .disabled(model.source == nil)
-                    .help("Wrap this reader at its width; turn off to scroll long source lines horizontally. Source and selection stay unchanged.")
+                Menu("Display") {
+                    Toggle("Line numbers", isOn: $showsLineNumbers)
+                    Toggle("Visible whitespace", isOn: $showsWhitespace)
+                    Toggle("Wrap lines", isOn: $wrapsLines)
+                }
+                .disabled(model.source == nil)
+                .help("Show line numbers or whitespace, or wrap long lines. These display choices preserve the captured source and selection.")
                 Spacer()
                 Button("Refresh from disk", action: model.refreshFromDisk)
                     .disabled(!model.canRefresh)
