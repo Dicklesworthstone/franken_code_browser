@@ -14,6 +14,7 @@ import AppKit
     private let canPin: Bool
     private let keep: ((AtlasPagedReaderModel) -> Void)?
     private let canKeep: Bool
+    private let openLocalLink: AtlasDocumentPreviewModel.LocalNavigation?
     @State private var model: AtlasPagedReaderModel
     @State private var copyNotice = ""
     @State private var showsOutline = false
@@ -24,7 +25,8 @@ import AppKit
     init(root: String, path: String, accessLease: AnyObject?, captured: AtlasSearchCapturedHit? = nil,
          supplied: AtlasSuppliedReaderSource? = nil,
          canPin: Bool = false, pin: ((AtlasPagedReaderModel) -> Void)? = nil,
-         canKeep: Bool = false, keep: ((AtlasPagedReaderModel) -> Void)? = nil) {
+         canKeep: Bool = false, keep: ((AtlasPagedReaderModel) -> Void)? = nil,
+         openLocalLink: AtlasDocumentPreviewModel.LocalNavigation? = nil) {
         self.root = root
         self.path = path
         self.accessLease = accessLease
@@ -33,6 +35,7 @@ import AppKit
         self.pin = pin
         self.canKeep = canKeep
         self.keep = keep
+        self.openLocalLink = openLocalLink
         _model = State(initialValue: AtlasPagedReaderModel(transport: .native, search: .native,
             outline: .native, document: .native, captured: captured, supplied: supplied))
     }
@@ -41,10 +44,12 @@ import AppKit
     /// Temporary tab/view disappearance neither reopens nor closes its capture.
     init(model: AtlasPagedReaderModel, canPin: Bool = false, pin: ((AtlasPagedReaderModel) -> Void)? = nil,
          canKeep: Bool = false,
-         keep: ((AtlasPagedReaderModel) -> Void)? = nil) {
+         keep: ((AtlasPagedReaderModel) -> Void)? = nil,
+         openLocalLink: AtlasDocumentPreviewModel.LocalNavigation? = nil) {
         root = ""; path = ""; accessLease = nil
         ownsModel = false; self.canPin = canPin; self.pin = pin
         self.canKeep = canKeep; self.keep = keep
+        self.openLocalLink = openLocalLink
         _model = State(initialValue: model)
     }
 
@@ -58,12 +63,12 @@ import AppKit
                 sourcePane.frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
                 if showsSplitPreview {
                     AtlasDocumentPreviewView(model: model.documentPreview, embedded: true,
-                        openSource: openPreviewSource, closePreview: { showsSplitPreview = false })
+                        openSource: openPreviewSource, openLocalLink: openLocalLink, closePreview: { showsSplitPreview = false })
                 }
             }
         }
         .sheet(isPresented: $showsDocument) {
-            AtlasDocumentPreviewView(model: model.documentPreview, openSource: openPreviewSource)
+            AtlasDocumentPreviewView(model: model.documentPreview, openSource: openPreviewSource, openLocalLink: openLocalLink)
         }
         .onAppear { if ownsModel { open() } }
         .onDisappear { if ownsModel { model.close() }; copyNotice = "" }

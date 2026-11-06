@@ -3,7 +3,8 @@
 //! Markdown preview on the SAME immutable source as reader/search/outline.
 //! FrankenMarkdown owns parsing, logical flow, headings and selection mapping.
 //! This module owns publication, bounded responses and navigation composition.
-//! It never opens paths, activates links, fetches assets or starts a runtime.
+//! The link adapter navigates only this retained document. Neither module
+//! opens paths, fetches assets or starts a runtime.
 
 pub use fcb::document::reader::DocumentReadOptions as ReaderDocumentOptions;
 use fcb::document::{TextSelectionRange, reader::{DocumentReader, DocumentReadError}};
@@ -53,6 +54,7 @@ impl ReaderSession {
         let response = self.finish_output(out, EXIT_OK, &mut canceled)?;
         check(&mut canceled)?;
         self.document = Some(candidate); // Old layout destruction is worker work.
+        self.document_links = None;
         Ok(response)
     }
 
@@ -180,6 +182,7 @@ impl ReaderSession {
         let response = self.finish_output(out, EXIT_OK, &mut canceled)?;
         check(&mut canceled)?;
         self.document = None;
+        self.document_links = None;
         Ok(response)
     }
     fn document_attempt(&mut self, generation: u64) -> Result<(), ReaderSessionError> {
@@ -192,7 +195,7 @@ impl ReaderSession {
     /// Explicit source-coordinate actions, never rendering/page requests, pay
     /// for bounded provenance qualification on the existing host worker. Keep
     /// the retained preview, source, query and generation unchanged on refusal.
-    fn qualify_document_source_actions(&mut self, generation: u64,
+    pub(super) fn qualify_document_source_actions(&mut self, generation: u64,
         canceled: &mut impl FnMut() -> bool) -> Result<(), ReaderSessionError> {
         self.document_snapshot(generation)?;
         let [qualification_id] = self.allocations()?;
@@ -200,7 +203,7 @@ impl ReaderSession {
             &self.budget, qualification_id, canceled)?;
         Ok(())
     }
-    fn document_snapshot(&self, generation: u64) -> Result<&DocumentReader<'static>, ReaderSessionError> {
+    pub(super) fn document_snapshot(&self, generation: u64) -> Result<&DocumentReader<'static>, ReaderSessionError> {
         let document = self.document.as_ref().ok_or(ReaderSessionError::MissingDocument)?;
         if document.generation().get() != generation { return Err(DocumentReadError::StaleGeneration.into()); }
         // The owned layout pins the SAME immutable backing; it must never name

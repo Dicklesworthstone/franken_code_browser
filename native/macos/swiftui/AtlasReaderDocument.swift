@@ -1,7 +1,7 @@
 import Foundation
 
 /// The native host consumes FrankenMarkdown's logical flow. It never parses
-/// Markdown, invents heading slugs, fetches assets, or follows document links.
+/// Markdown, invents heading slugs, or grants access to local/external destinations.
 struct AtlasReaderDocumentTransport: Sendable {
     let prepare: @Sendable (UInt64, UInt64, UInt64) -> String?
     let window: @Sendable (UInt64, UInt64, UInt64, UInt64) -> String?
@@ -10,6 +10,10 @@ struct AtlasReaderDocumentTransport: Sendable {
     let fromSource: @Sendable (UInt64, UInt64, UInt64, UInt64) -> String?
     let source: @Sendable (UInt64, UInt64, UInt64, UInt64, UInt64) -> String?
     let copy: @Sendable (UInt64, UInt64, UInt64, UInt64, UInt8) -> String?
+    // Optional for embedders and existing source-only fixture transports.
+    var prepareLinks: (@Sendable (UInt64, UInt64, UInt64) -> String?)? = nil
+    var links: (@Sendable (UInt64, UInt64, UInt64, UInt64) -> String?)? = nil
+    var link: (@Sendable (UInt64, UInt64, UInt64, UInt64) -> String?)? = nil
 }
 
 enum AtlasReaderDocumentLimits {
@@ -21,6 +25,8 @@ enum AtlasReaderDocumentLimits {
     static let pageLines: UInt64 = 64
     static let context: UInt64 = 2048
     static let pageTextBytes: UInt64 = 256 * 1024
+    static let links: UInt64 = 4096
+    static let destinationBytes = 4096
 }
 
 struct AtlasDocumentByteRange: Equatable, Sendable, Decodable {
@@ -127,6 +133,61 @@ struct AtlasReaderDocumentHeadings: Sendable {
     }
 }
 
+/// These are engine classifications, not permission to open a filesystem path
+/// or external URL. Occurrence IDs are local to this exact document generation.
+enum AtlasReaderDocumentLinkKind: String, Sendable, Decodable {
+    case heading = "same-document-heading", start = "same-document-start"
+    case local = "local-reference", external, unsupported
+    var navigatesWithinCapture: Bool { self == .heading || self == .start }
+}
+struct AtlasReaderDocumentLink: Identifiable, Sendable, Equatable {
+    let id: UInt64
+    let blockIndex: UInt64
+    let evidence: AtlasDocumentByteRange
+    let destination: String
+    let display: String
+    let kind: AtlasReaderDocumentLinkKind
+    let fragment: String?
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.id == rhs.id && lhs.blockIndex == rhs.blockIndex && lhs.evidence == rhs.evidence
+            && lhs.destination.utf8.elementsEqual(rhs.destination.utf8)
+            && lhs.display.utf8.elementsEqual(rhs.display.utf8) && lhs.kind == rhs.kind
+            && lhs.fragment.map({ Data($0.utf8) }) == rhs.fragment.map({ Data($0.utf8) })
+    }
+}
+struct AtlasReaderDocumentLinkTarget: Sendable, Equatable {
+    let inventory: AtlasReaderDocumentInventory
+    let pageID: UUID
+    let link: AtlasReaderDocumentLink
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.inventory.matches(rhs.inventory) && lhs.pageID == rhs.pageID && lhs.link == rhs.link
+    }
+}
+struct AtlasReaderDocumentLinks: Sendable {
+    let id: UUID
+    let inventory: AtlasReaderDocumentInventory
+    let first: UInt64
+    let rows: [AtlasReaderDocumentLink]
+    let next: UInt64?
+    let total: UInt64
+    let seen: UInt64
+    let diagnostics: UInt64
+    let truncated: Bool
+    let complete: Bool
+    func target(id: UInt64) -> AtlasReaderDocumentLinkTarget? {
+        rows.first(where: { $0.id == id }).map { .init(inventory: inventory, pageID: self.id, link: $0) }
+    }
+    func matchesInventory(_ other: Self) -> Bool {
+        inventory.matches(other.inventory) && total == other.total && seen == other.seen
+            && diagnostics == other.diagnostics && truncated == other.truncated && complete == other.complete
+    }
+}
+struct AtlasReaderDocumentLinkActivation: Sendable {
+    let target: AtlasReaderDocumentLinkTarget
+    // A missing page is a verified classification with no navigation effect.
+    let page: AtlasReaderDocumentPage?
+}
+
 enum AtlasReaderDocumentCopyMode: UInt8, Sendable { case renderedText = 0, enclosingMarkdown = 1 }
 struct AtlasReaderDocumentCopy: Sendable {
     let target: AtlasReaderDocumentTarget
@@ -152,6 +213,9 @@ enum AtlasReaderDocumentRequest: Sendable {
     case fromSource(offset: UInt64)
     case source(AtlasReaderDocumentTarget)
     case copy(AtlasReaderDocumentTarget, AtlasReaderDocumentCopyMode)
+    case prepareLinks
+    case links(first: UInt64)
+    case link(AtlasReaderDocumentLinkTarget)
     var command: String {
         switch self {
         case .prepare: "document-prepare"
@@ -161,6 +225,9 @@ enum AtlasReaderDocumentRequest: Sendable {
         case .fromSource: "document-from-source"
         case .source: "document-source"
         case .copy: "document-copy"
+        case .prepareLinks: "document-links-prepare"
+        case .links: "document-links"
+        case .link: "document-link"
         }
     }
 }
@@ -171,6 +238,8 @@ enum AtlasReaderDocumentResult: Sendable {
     case headings(AtlasReaderDocumentHeadings)
     case source(AtlasReaderDocumentSource)
     case copy(AtlasReaderDocumentCopy)
+    case links(AtlasReaderDocumentLinks)
+    case link(AtlasReaderDocumentLinkActivation)
 }
 
 /// Immutable worker descriptor. Only native marshaling and validation happen
@@ -195,6 +264,15 @@ struct AtlasReaderDocumentJob: Sendable {
             json = transport.source(handle, generation, target.rendered.start, target.rendered.end, AtlasReaderDocumentLimits.context)
         case .copy(let target, let mode):
             json = transport.copy(handle, generation, target.rendered.start, target.rendered.end, mode.rawValue)
+        case .prepareLinks:
+            guard let prepare = transport.prepareLinks else { throw AtlasReaderError.unavailable }
+            json = prepare(handle, generation, AtlasReaderDocumentLimits.links)
+        case .links(let first):
+            guard let links = transport.links else { throw AtlasReaderError.unavailable }
+            json = links(handle, generation, first, count)
+        case .link(let target):
+            guard let link = transport.link else { throw AtlasReaderError.unavailable }
+            json = link(handle, generation, target.link.id, count)
         }
         return try decode(json)
     }
@@ -236,6 +314,9 @@ struct AtlasReaderDocumentJob: Sendable {
             case .fromSource(let offset):
                 guard try wire.number("original_anchor") == offset else { throw AtlasReaderError.invalidResponse }
                 return .page(try wire.page(basis))
+            case .prepareLinks: return .links(try wire.links(basis, first: 0))
+            case .links(let first): return .links(try wire.links(basis, first: first))
+            case .link(let target): return .link(try wire.link(basis, target: target))
             case .source, .copy: throw AtlasReaderError.invalidResponse
             }
         } catch let error as AtlasReaderError { throw error }
@@ -251,6 +332,7 @@ struct AtlasReaderDocumentJob: Sendable {
     private(set) var inventory: AtlasReaderDocumentInventory?
     private(set) var page: AtlasReaderDocumentPage?
     private(set) var headings: AtlasReaderDocumentHeadings?
+    private(set) var links: AtlasReaderDocumentLinks?
 
     func admit(_ request: AtlasReaderDocumentRequest, info: AtlasReaderInfo) throws -> AtlasReaderDocumentJob {
         let next: UInt64
@@ -274,7 +356,11 @@ struct AtlasReaderDocumentJob: Sendable {
                 guard offset >= inventory.sourceBase, offset <= info.identity.capturedBytes else { throw AtlasReaderError.invalidInput }
             case .source(let target), .copy(let target, _):
                 guard page?.target(at: target.line.id) == target else { throw AtlasReaderError.invalidInput }
-            case .prepare: break
+            case .links(let first):
+                guard let links, first <= links.total else { throw AtlasReaderError.invalidInput }
+            case .link(let target):
+                guard links?.target(id: target.link.id) == target else { throw AtlasReaderError.invalidInput }
+            case .prepareLinks, .prepare: break
             }
         }
         if case .prepare = request {
@@ -282,6 +368,11 @@ struct AtlasReaderDocumentJob: Sendable {
             // A foreign reflow may succeed before a canceled/invalid response.
             // Retire native authority now; an old visible preview is read-only.
             revoke()
+        }
+        if case .prepareLinks = request {
+            // Foreign parsing may commit before its delivery is canceled.
+            // Retire the prior link-list token before entering that operation.
+            links = nil
         }
         let job = AtlasReaderDocumentJob(id: UUID(), info: info, generation: next, inventory: inventory, request: request)
         active = job.id
@@ -295,6 +386,12 @@ struct AtlasReaderDocumentJob: Sendable {
         case .prepared(let page, let headings): inventory = page.inventory; self.page = page; self.headings = headings
         case .page(let page): self.page = page
         case .headings(let headings): self.headings = headings
+        case .links(let links):
+            if let previous = self.links, !previous.matchesInventory(links) { throw AtlasReaderError.invalidResponse }
+            self.links = links
+        case .link(let activation):
+            guard links?.target(id: activation.target.link.id) == activation.target else { throw AtlasReaderError.canceled }
+            if let page = activation.page { self.page = page }
         case .source(let source):
             guard page?.target(at: source.target.line.id) == source.target else { throw AtlasReaderError.canceled }
         case .copy(let copy):
@@ -303,7 +400,7 @@ struct AtlasReaderDocumentJob: Sendable {
         active = nil
     }
     func abandon(_ job: AtlasReaderDocumentJob) { if active == job.id { active = nil } }
-    func revoke() { active = nil; inventory = nil; page = nil; headings = nil }
+    func revoke() { active = nil; inventory = nil; page = nil; headings = nil; links = nil }
     func close() { revoke(); generation = 0 }
 }
 
@@ -423,6 +520,84 @@ private struct AtlasReaderDocumentWire: Decodable {
             return .init(slug: row.slug, title: row.title, renderedOffset: offset, original: row.original_range)
         }
         return .init(id: UUID(), inventory: inventory, first: first, rows: headings, next: next)
+    }
+    private struct LinkRow: Decodable {
+        let link_id, block_index, destination, destination_display: String
+        let evidence_range: AtlasDocumentByteRange
+        let kind: AtlasReaderDocumentLinkKind
+        let fragment_slug: String?
+        func value(inventory: AtlasReaderDocumentInventory) throws -> AtlasReaderDocumentLink {
+            guard let id = AtlasReaderWire.integer(link_id), id > 0,
+                  let block = AtlasReaderWire.integer(block_index), block < 131_072,
+                  evidence_range == AtlasDocumentByteRange(start: 0, end: inventory.identity.capturedBytes),
+                  destination.utf8.count <= AtlasReaderDocumentLimits.destinationBytes,
+                  destination_display.utf8.count <= AtlasReaderDocumentLimits.destinationBytes * 8 else {
+                throw AtlasReaderError.invalidResponse
+            }
+            if let fragment_slug {
+                guard !fragment_slug.isEmpty,
+                      fragment_slug.utf8.count <= AtlasReaderDocumentLimits.destinationBytes,
+                      !fragment_slug.utf8.contains(0) else { throw AtlasReaderError.invalidResponse }
+            }
+            guard kind != .heading || fragment_slug != nil else { throw AtlasReaderError.invalidResponse }
+            return .init(id: id, blockIndex: block, evidence: evidence_range,
+                destination: destination, display: destination_display, kind: kind, fragment: fragment_slug)
+        }
+    }
+    private func linkSummary() throws -> (total: UInt64, seen: UInt64, diagnostics: UInt64, truncated: Bool, complete: Bool) {
+        guard try flag("links_ready"), try text("evidence_precision") == "whole-captured-markdown-document" else {
+            throw AtlasReaderError.invalidResponse
+        }
+        let total = try number("retained_links"), seen = try number("links_seen")
+        let diagnostics = try number("parser_diagnostics"), truncated = try flag("links_truncated")
+        let complete = try flag("links_complete")
+        guard total <= AtlasReaderDocumentLimits.links, total <= seen, seen <= 131_072,
+              diagnostics <= 131_072, !complete || (!truncated && total == seen && diagnostics == 0) else {
+            throw AtlasReaderError.invalidResponse
+        }
+        return (total, seen, diagnostics, truncated, complete)
+    }
+    func links(_ inventory: AtlasReaderDocumentInventory, first: UInt64) throws -> AtlasReaderDocumentLinks {
+        let summary = try linkSummary()
+        guard try number("first_link") == first else { throw AtlasReaderError.invalidResponse }
+        let wire: [LinkRow] = try array("links")
+        let next = try next("next_link", first: first, count: wire.count, total: summary.total)
+        var prior: UInt64 = 0
+        let rows = try wire.map { row -> AtlasReaderDocumentLink in
+            let link = try row.value(inventory: inventory)
+            guard link.id > prior, link.id <= summary.seen else { throw AtlasReaderError.invalidResponse }
+            prior = link.id
+            return link
+        }
+        return .init(id: UUID(), inventory: inventory, first: first, rows: rows, next: next,
+            total: summary.total, seen: summary.seen, diagnostics: summary.diagnostics,
+            truncated: summary.truncated, complete: summary.complete)
+    }
+    func link(_ inventory: AtlasReaderDocumentInventory,
+              target: AtlasReaderDocumentLinkTarget) throws -> AtlasReaderDocumentLinkActivation {
+        let summary = try linkSummary()
+        let row = try fields.decode(LinkRow.self, forKey: Key("link")).value(inventory: inventory)
+        guard target.inventory.matches(inventory), row == target.link, row.id <= summary.seen else {
+            throw AtlasReaderError.invalidResponse
+        }
+        let activated = try flag("activated")
+        guard activated == row.kind.navigatesWithinCapture else { throw AtlasReaderError.invalidResponse }
+        guard activated else {
+            guard try absent(["flow_lines", "first_flow_line", "next_flow_line", "whole_document_visible",
+                              "heading_slug", "heading_original_range"]) else { throw AtlasReaderError.invalidResponse }
+            return .init(target: target, page: nil)
+        }
+        let page = try self.page(inventory, expectedFirst: row.kind == .start ? 0 : nil)
+        if row.kind == .heading {
+            guard let fragment = row.fragment, try text("heading_slug").utf8.elementsEqual(fragment.utf8),
+                  try range("heading_original_range").valid(upTo: inventory.identity.capturedBytes, nonempty: true),
+                  try range("heading_original_range").start >= inventory.sourceBase else {
+                throw AtlasReaderError.invalidResponse
+            }
+        } else if try !absent(["heading_slug", "heading_original_range"]) {
+            throw AtlasReaderError.invalidResponse
+        }
+        return .init(target: target, page: page)
     }
     func selection(_ target: AtlasReaderDocumentTarget) throws {
         guard try number("document_generation") == target.inventory.generation,

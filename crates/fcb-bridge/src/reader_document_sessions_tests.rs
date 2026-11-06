@@ -166,3 +166,28 @@ fn retained_document_registry_is_send_sync_and_can_run_on_host_owned_workers() {
     readers.close(handle).unwrap();
     assert!(response.as_str().contains("Worker"));
 }
+
+#[test]
+fn link_inventory_cancellation_preserves_the_accepted_generation_and_reader_capture() {
+    let readers = ReaderSessions::new(); let handle = readers.create().unwrap();
+    readers.supply(handle, b"# Kept\n\n[Jump](#kept) [Local](other.md)\n").unwrap();
+    prepare(&readers, handle, 1);
+    readers.execute(handle, Command::DocumentLinksPrepare { generation: 1, max_links: 16 }, || false).unwrap();
+    let before = readers.execute(handle, Command::DocumentLinks { generation: 1, first: 0, count: 16 }, || false).unwrap();
+    let mut polled = false;
+    let canceled = readers.execute(handle, Command::DocumentLinksPrepare { generation: 1, max_links: 1 }, || {
+        if !polled { polled = true; readers.cancel(handle).unwrap(); }
+        false
+    });
+    assert!(canceled.err().unwrap().canceled());
+    let after = readers.execute(handle, Command::DocumentLinks { generation: 1, first: 0, count: 16 }, || false).unwrap();
+    assert_eq!(before.as_str(), after.as_str());
+    let activated = readers.execute(handle, Command::DocumentLink { generation: 1, id: 1, count: 4 }, || false).unwrap();
+    assert!(activated.as_str().contains("\"activated\":true"));
+    prepare(&readers, handle, 2);
+    assert!(readers.execute(handle, Command::DocumentLink { generation: 1, id: 1, count: 4 }, || false).is_err());
+    assert!(readers.execute(handle, Command::DocumentLinks { generation: 2, first: 0, count: 4 }, || false).is_err());
+    assert!(readers.execute(handle, Command::CopyRange { start: 0, end: 6 }, || false).unwrap().as_str()
+        .contains("\"original_hex\":\"23204b657074\""));
+    readers.close(handle).unwrap();
+}

@@ -51,6 +51,48 @@ private enum Fixture {
         out["next_heading"] = headingEnd < headings ? String(headingEnd) as Any : NSNull()
         return out
     }
+    static func linkRow(_ id: UInt64) -> [String: Any] {
+        let kind: String, destination: String, fragment: Any
+        switch id {
+        case 2: kind = "same-document-start"; destination = "#"; fragment = NSNull()
+        case 3: kind = "local-reference"; destination = "src/main.rs"; fragment = NSNull()
+        case 4: kind = "external"; destination = "https://example.invalid"; fragment = NSNull()
+        case 5: kind = "unsupported"; destination = "javascript:alert(1)"; fragment = NSNull()
+        default: kind = "same-document-heading"; destination = "#caf%C3%A9"; fragment = "café"
+        }
+        return ["link_id": String(id), "block_index": "0", "evidence_range": range(0, UInt64(raw.count)),
+            "destination": destination, "destination_display": destination, "kind": kind, "fragment_slug": fragment]
+    }
+    static func links(command: String = "document-links-prepare", first: UInt64 = 0,
+                      total: UInt64 = 70) -> [String: Any] {
+        var out = page(command: command)
+        for key in ["first_flow_line", "flow_lines", "next_flow_line", "whole_document_visible", "headings", "next_heading"] {
+            out.removeValue(forKey: key)
+        }
+        out["links_ready"] = true; out["links_complete"] = true
+        out["links_seen"] = String(total); out["retained_links"] = String(total)
+        out["links_truncated"] = false; out["parser_diagnostics"] = "0"
+        out["evidence_precision"] = "whole-captured-markdown-document"
+        out["first_link"] = String(first)
+        let end = min(first + 64, total)
+        out["links"] = (first..<end).map { linkRow($0 + 1) }
+        out["next_link"] = end < total ? String(end) as Any : NSNull()
+        return out
+    }
+    static func activation(_ target: AtlasReaderDocumentLinkTarget) -> [String: Any] {
+        var out = links(command: "document-link")
+        for key in ["first_link", "links", "next_link"] { out.removeValue(forKey: key) }
+        out["link"] = linkRow(target.link.id)
+        out["activated"] = target.link.kind.navigatesWithinCapture
+        if target.link.kind.navigatesWithinCapture {
+            let flow = page(command: "document-link")
+            for key in ["first_flow_line", "flow_lines", "next_flow_line", "whole_document_visible"] { out[key] = flow[key] }
+            if target.link.kind == .heading {
+                out["heading_slug"] = "café"; out["heading_original_range"] = range(3, 11)
+            }
+        }
+        return out
+    }
     static func selection(_ target: AtlasReaderDocumentTarget) -> [String: Any] {
         ["document_generation": String(target.inventory.generation), "selection_namespace": "document",
          "source_mapping": "enclosing-regions-not-glyph-exact",
@@ -242,6 +284,96 @@ private enum Fixture {
             _ = try fresh.decode(Fixture.json(["schema": "fcb.reader-session/1", "owner": "7", "status": "error",
                 "error": ["code": "DOCUMENT_READ_SOURCE_LIMIT"]]))
         }
+        try documentLinks()
         print("PASS: \(checks) document decoding, paging, copy domains, source mapping and stale-authority checks")
+    }
+
+    @MainActor static func documentLinks() throws {
+        let info = try AtlasReaderInfo.decode(Fixture.json(Fixture.header("info")), handle: 7, path: Fixture.path)
+        let state = AtlasReaderDocumentState()
+        rejects("links acquired an unprepared document") { _ = try state.admit(.prepareLinks, info: info) }
+        let preparation = try state.admit(.prepare(width: 100), info: info)
+        try state.accept(try preparation.decode(Fixture.json(Fixture.page())), job: preparation)
+        let sourcePage = state.page!
+        let job = try state.admit(.prepareLinks, info: info)
+        let response = try job.decode(Fixture.json(Fixture.links()))
+        try state.accept(response, job: job)
+        let links = state.links!, target = links.target(id: 1)!
+        check(links.rows.count == 64 && links.next == 64 && links.total == 70 && links.complete,
+              "link inventory must page without claiming extraction is truncated")
+        check(links.target(id: 6)?.link.destination == target.link.destination
+              && links.target(id: 6)?.link.id != target.link.id, "equal destinations lost occurrence identity")
+        check(target.link.evidence == AtlasDocumentByteRange(start: 0, end: info.identity.capturedBytes),
+              "link evidence was fabricated as an inline range")
+        check(state.page?.id == sourcePage.id, "link parsing replaced the displayed flow")
+        for (key, value) in [("document_generation", "2"), ("retained_links", "4097"), ("links_seen", "69"),
+            ("first_link", "1"), ("evidence_precision", "inline-range"), ("parser_diagnostics", "00")] {
+            var invalid = Fixture.links(); invalid[key] = value
+            rejects("invalid link summary \(key)") { _ = try job.decode(Fixture.json(invalid)) }
+        }
+        for (key, value) in [("link_id", "01"), ("block_index", "18446744073709551615"),
+            ("fragment_slug", ""), ("kind", "guaranteed-local"), ("destination", String(repeating: "a", count: 4097))] {
+            var invalid = Fixture.links(), rows = invalid["links"] as! [[String: Any]]
+            rows[0][key] = value; invalid["links"] = rows
+            rejects("invalid link row \(key)") { _ = try job.decode(Fixture.json(invalid)) }
+        }
+        var inline = Fixture.links(), rows = inline["links"] as! [[String: Any]]
+        rows[0]["evidence_range"] = Fixture.range(3, 11); inline["links"] = rows
+        rejects("invented inline evidence") { _ = try job.decode(Fixture.json(inline)) }
+        var duplicate = Fixture.links(); rows = duplicate["links"] as! [[String: Any]]
+        rows[1] = rows[0]; duplicate["links"] = rows
+        rejects("duplicated occurrence ID") { _ = try job.decode(Fixture.json(duplicate)) }
+        var oversized = Fixture.links(); rows = oversized["links"] as! [[String: Any]]
+        rows.append(Fixture.linkRow(65)); oversized["links"] = rows
+        rejects("oversized link page") { _ = try job.decode(Fixture.json(oversized)) }
+        var partial = Fixture.links(); partial["links_seen"] = "71"; partial["links_truncated"] = true
+        partial["links_complete"] = false; partial["parser_diagnostics"] = "1"
+        if case .links(let values) = try job.decode(Fixture.json(partial)) {
+            check(!values.complete && values.truncated && values.diagnostics == 1 && values.seen == 71,
+                  "partial link coverage was lost")
+        } else { preconditionFailure("links were not decoded") }
+        var gapped = Fixture.links(total: 1)
+        gapped["links"] = [Fixture.linkRow(2)]; gapped["links_seen"] = "2"
+        gapped["links_truncated"] = true; gapped["links_complete"] = false
+        if case .links(let values) = try job.decode(Fixture.json(gapped)) {
+            check(values.first == 0 && values.rows.first?.id == 2 && values.total == 1 && values.next == nil,
+                  "omitted oversized destination rebound occurrence ID to retained row offset")
+        } else { preconditionFailure("gapped occurrences were not decoded") }
+        var falseComplete = Fixture.links(); falseComplete["parser_diagnostics"] = "1"
+        rejects("diagnostic inventory claimed complete") { _ = try job.decode(Fixture.json(falseComplete)) }
+        let activation = try state.admit(.link(target), info: info)
+        let active = try activation.decode(Fixture.json(Fixture.activation(target)))
+        try state.accept(active, job: activation)
+        check(state.page?.id != sourcePage.id && state.page?.inventory.matches(sourcePage.inventory) == true,
+              "same-document link did not retain source identity")
+        var changed = Fixture.activation(target), row = changed["link"] as! [String: Any]
+        row["fragment_slug"] = "cafe\u{301}"; changed["link"] = row
+        rejects("canonical-equivalent fragment substituted") { _ = try activation.decode(Fixture.json(changed)) }
+        changed = Fixture.activation(target); changed["heading_slug"] = "other"
+        rejects("activation resolved a different heading") { _ = try activation.decode(Fixture.json(changed)) }
+        let accepted = state.page!
+        for id: UInt64 in [3, 4, 5] {
+            let inert = links.target(id: id)!, request = try state.admit(.link(inert), info: info)
+            try state.accept(try request.decode(Fixture.json(Fixture.activation(inert))), job: request)
+            check(state.page?.id == accepted.id, "inert destination changed the current document")
+            var forged = Fixture.activation(inert); forged["activated"] = true
+            rejects("local/external destination forged navigation") { _ = try request.decode(Fixture.json(forged)) }
+            forged = Fixture.activation(inert); forged["flow_lines"] = []
+            rejects("inert activation supplied a hidden replacement page") { _ = try request.decode(Fixture.json(forged)) }
+        }
+        let next = try state.admit(.links(first: 64), info: info)
+        try state.accept(try next.decode(Fixture.json(Fixture.links(command: "document-links", first: 64))), job: next)
+        check(state.links?.rows.count == 6 && state.links?.next == nil, "final link page was miscounted")
+        rejects("old list row revived after pagination") { _ = try state.admit(.link(target), info: info) }
+        let last = state.links!.target(id: 65)!
+        _ = try state.admit(.prepareLinks, info: info)
+        rejects("repreparation retained old link authority") { _ = try state.admit(.link(last), info: info) }
+        let reload = try state.admit(.prepareLinks, info: info)
+        try state.accept(try reload.decode(Fixture.json(Fixture.links())), job: reload)
+        let delayed = try state.admit(.link(state.links!.target(id: 1)!), info: info)
+        let delayedResponse = try delayed.decode(Fixture.json(Fixture.activation(target)))
+        _ = try state.admit(.prepare(width: 80), info: info)
+        check(state.links == nil, "reflow retained stale link inventory")
+        rejects("delayed link published after reflow") { try state.accept(delayedResponse, job: delayed) }
     }
 }

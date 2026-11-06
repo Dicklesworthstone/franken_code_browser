@@ -95,6 +95,54 @@ import Foundation
         check(!plain.supportsDocument, "source-only host acquired document capability")
         await rejected { _ = try await plain.document(.prepare(width: 100)) }
         plain.close()
+        try await documentLinks(input)
         print("\(checks) retained-document coordinator checks passed")
+    }
+
+    @MainActor static func documentLinks(_ input: AtlasReaderInput) async throws {
+        let wire = DocumentBoundary(owner: 10)
+        let coordinator = AtlasReaderCoordinator(transport: wire.reader, document: wire.document)
+        _ = try await coordinator.open(input: input)
+        _ = try await coordinator.document(.prepare(width: 100))
+        guard case .links(let links) = try await coordinator.document(.prepareLinks) else { fatalError() }
+        let heading = links.target(id: 1)!, local = links.target(id: 2)!
+        guard case .link(let activated) = try await coordinator.document(.link(heading)) else { fatalError() }
+        check(activated.page?.first == 64 && activated.target == heading, "link did not navigate retained flow")
+        guard case .link(let inert) = try await coordinator.document(.link(local)) else { fatalError() }
+        check(inert.page == nil && inert.target == local, "local reference acquired implicit file authority")
+        guard case .links(let last) = try await coordinator.document(.links(first: 64)) else { fatalError() }
+        check(last.rows.count == 6 && last.next == nil, "link final page dropped or claimed continuation")
+        let calls = wire.snapshot.calls
+        await rejected { _ = try await coordinator.document(.link(heading)) }
+        check(wire.snapshot.calls == calls, "stale link list token reached the foreign worker")
+        let latest = last.target(id: 65)!
+        let cancelGate = wire.blockNext("document-link")
+        let canceled = Task { try await coordinator.document(.link(latest)) }
+        try await until { cancelGate.hasEntered }
+        coordinator.cancel()
+        cancelGate.release()
+        await rejected { _ = try await canceled.value }
+        _ = try await coordinator.document(.link(latest))
+        let closeGate = wire.blockNext("document-links")
+        let closing = Task { try await coordinator.document(.links(first: 0)) }
+        try await until { closeGate.hasEntered }
+        coordinator.close()
+        check(wire.snapshot.closes == 0, "reader lease released while link worker was active")
+        closeGate.release()
+        await rejected { _ = try await closing.value }
+        try await until { wire.snapshot.closes == 1 }
+        check(wire.snapshot.opens == 1 && wire.snapshot.peak == 1, "link operations reopened or overlapped retained source")
+
+        let legacyWire = DocumentBoundary(owner: 11)
+        var legacyTransport = legacyWire.document
+        legacyTransport.prepareLinks = nil; legacyTransport.links = nil; legacyTransport.link = nil
+        let legacy = AtlasReaderCoordinator(transport: legacyWire.reader, document: legacyTransport)
+        _ = try await legacy.open(input: input)
+        _ = try await legacy.document(.prepare(width: 100))
+        let before = legacyWire.snapshot.calls
+        await rejected { _ = try await legacy.document(.prepareLinks) }
+        check(legacyWire.snapshot.calls == before, "legacy transport faked a link operation")
+        _ = try await legacy.document(.window(first: 0))
+        legacy.close()
     }
 }

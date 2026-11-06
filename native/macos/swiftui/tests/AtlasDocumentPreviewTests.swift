@@ -55,8 +55,38 @@ import Foundation
         case .copy(let target, let mode):
             return .copy(.init(target: target, enclosingOriginal: .init(start: 3, end: 7),
                 mode: mode, value: mode == .renderedText ? target.line.text : "23206869"))
+        case .prepareLinks: return .links(links(first: 0))
+        case .links(let first): return .links(links(first: first))
+        case .link(let target):
+            return .link(.init(target: target, page: target.link.kind.navigatesWithinCapture
+                ? page(first: target.link.kind == .start ? 0 : 256) : nil))
         case .prepare: throw AtlasReaderError.invalidInput
         }
+    }
+    func links(first: UInt64) -> AtlasReaderDocumentLinks {
+        let inventory = inventory!, total: UInt64 = 130, end = min(total, first + 64)
+        let rows = (first..<end).map { index -> AtlasReaderDocumentLink in
+            let kind: AtlasReaderDocumentLinkKind
+            switch index {
+            case 1: kind = .start
+            case 2: kind = .local
+            case 3: kind = .external
+            case 4: kind = .unsupported
+            default: kind = .heading
+            }
+            let destination: String
+            switch kind {
+            case .heading: destination = "#heading"
+            case .start: destination = "#"
+            case .local: destination = "guide.md#setup"
+            case .external: destination = "https://example.invalid"
+            case .unsupported: destination = "javascript:alert(1)"
+            }
+            return .init(id: index + 1, blockIndex: 0, evidence: .init(start: 0, end: identity.capturedBytes),
+                destination: destination, display: destination, kind: kind, fragment: kind == .heading ? "heading" : nil)
+        }
+        return .init(id: UUID(), inventory: inventory, first: first, rows: rows, next: end < total ? end : nil,
+            total: total, seen: total, diagnostics: 0, truncated: false, complete: true)
     }
     func page(first: UInt64) -> AtlasReaderDocumentPage {
         let inventory = inventory!
@@ -332,6 +362,116 @@ import Foundation
                   && m.sourceOffset(for: target, reader: f.identity) == 3,
                   "The matching enclosing-block receipt enables source navigation")
         }
+        await documentLinks()
         print("AtlasDocumentPreviewTests: \(checks) checks passed")
+    }
+
+    @MainActor private static func documentLinks() async {
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            let page = m.page!
+            m.prepareLinks(); await wait { !m.busy }
+            check(m.links?.rows.count == 64 && m.page?.id == page.id && m.canLinksNext,
+                  "Loading links does not replace the flow or claim full list visibility")
+            check(m.linkCoverage.contains("130 parsed occurrences") && m.linkCoverage.contains("not an inline span"),
+                  "Link evidence and completeness are explicit")
+            let old = m.links!.target(id: 1)!
+            m.nextLinks(); await wait { !m.busy }
+            check(m.links?.first == 64 && m.canLinksBack, "Link occurrences have independent pagination")
+            let calls = f.requests.count
+            m.openLink(old)
+            check(f.requests.count == calls, "A stale link-list row reached the worker")
+            m.nextLinks(); await wait { !m.busy }
+            check(m.links?.rows.count == 2 && !m.canLinksNext, "Short final link page remains complete")
+            m.previousLinks(); await wait { !m.busy }
+            m.previousLinks(); await wait { !m.busy }
+            check(m.links?.first == 0 && !m.allows(old), "Back does not resurrect an old link-page token")
+            let heading = m.links!.target(id: 1)!
+            m.openLink(heading); await wait { !m.busy }
+            check(m.page?.first == 256 && m.canBack, "Parsed heading activation enters navigation history")
+            m.back(); await wait { !m.busy }
+            check(m.page?.first == 0 && m.canForward, "Back restores the page before a heading link")
+            m.forward(); await wait { !m.busy }
+            let start = m.links!.target(id: 2)!
+            m.openLink(start); await wait { !m.busy }
+            check(m.page?.first == 0 && m.canBack, "The document-start link navigates without a heading slug")
+            m.widthInput = "80"; m.prepare(); await wait { !m.busy }
+            check(m.links == nil && !m.allows(heading), "Reflow revokes link targets together with rendered rows")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            m.prepareLinks(); await wait { !m.busy }
+            let before = m.page!, target = m.links!.target(id: 1)!
+            f.failure = .engine("DOCUMENT_HEADING_MISSING")
+            m.openLink(target); await wait { !m.busy }
+            check(m.page?.id == before.id && !m.canBack && m.notice.contains("DOCUMENT_HEADING_MISSING"),
+                  "A missing heading preserves the current page and history")
+            for id: UInt64 in [3, 4, 5] {
+                m.openLink(m.links!.target(id: id)!); await wait { !m.busy }
+                check(m.page?.id == before.id && !m.canBack && !m.notice.isEmpty,
+                      "Local/external/unsupported outcomes cannot open or replace source")
+            }
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            m.prepareLinks(); await wait { !m.busy }
+            let target = m.links!.target(id: 3)!
+            var navigations = 0
+            f.held = true
+            m.openLink(target, openLocal: { _ in navigations += 1 })
+            await wait { f.pending.count == 1 }
+            m.cancel(); f.release(); await settle()
+            check(navigations == 0 && !m.busy, "Canceled local-link classification delivered a later host callback")
+            m.openLink(target, openLocal: { received in
+                check(received == target && !m.busy, "Host callback lost the qualified row or ran before worker release")
+                navigations += 1
+                m.close()
+            })
+            await wait { f.pending.count == 1 }
+            f.release(); await wait { !m.busy }; await settle()
+            check(navigations == 1 && m.page == nil && m.links == nil && m.notice.isEmpty,
+                  "Reentrant local navigation republished closed preview state")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            m.prepareLinks(); await wait { !m.busy }
+            let target = m.links!.target(id: 1)!, previous = m.page!
+            f.held = true
+            m.openLink(target); await wait { f.pending.count == 1 }
+            let foreign = Fixture()
+            foreign.identity = Fixture.identity(owner: 99)
+            _ = try! foreign.response(.prepare(width: 96))
+            f.release(replacement: .link(.init(target: target, page: foreign.page(first: 256))))
+            await wait { !m.busy }
+            check(m.page?.id == previous.id && !m.canBack && m.notice == AtlasReaderError.invalidResponse.message,
+                  "A foreign capture replaced source through link activation")
+            m.openLink(target); await wait { f.pending.count == 1 }
+            m.bind(identity: Fixture.identity(owner: 2), sourceOffset: 0)
+            f.release(); await settle()
+            check(m.page == nil && m.links == nil && !m.authorized,
+                  "A delayed link revived an old capture after replacement")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            f.held = true
+            m.prepareLinks(); await wait { f.pending.count == 1 }
+            let complete = f.links(first: 0)
+            let partial = AtlasReaderDocumentLinks(id: UUID(), inventory: complete.inventory, first: 0,
+                rows: complete.rows, next: complete.next, total: complete.total, seen: 150,
+                diagnostics: 2, truncated: true, complete: false)
+            f.release(replacement: .links(partial)); await wait { !m.busy }
+            check(m.linkCoverage.contains("incomplete") && m.linkCoverage.contains("2 parser diagnostics")
+                  && m.linkCoverage.contains("omitted"), "Partial extraction was presented as complete navigation")
+            let target = m.links!.target(id: 1)!
+            m.prepareLinks(); await wait { f.pending.count == 1 }
+            check(m.links == nil && !m.allows(target), "Link reprepare left old rows active while foreign work ran")
+            m.cancel(); f.release(); await settle()
+            check(m.links == nil, "Canceled link inventory revived its prior authority")
+        }
     }
 }

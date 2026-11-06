@@ -48,6 +48,31 @@ All non-null C responses may be errors and must be inspected. Free them exactly
 once with `fcb_free_string`. Closing a reader never frees an already-returned
 string. Full-width IDs, offsets and counts use canonical decimal JSON strings.
 
+## Parsed links and exact-capture navigation
+
+After preparing a document, call `fcb_reader_document_links_prepare` with its
+accepted generation and an explicit inventory limit (0..4096). This uses the
+shared parser-backed `CapturedDocumentLinks` adapter once; retained pages and
+activation reuse the inventory without parsing or source I/O. Page it with
+`fcb_reader_document_links` (1..128 entries). `first_link`/`next_link` are zero-based
+retained row indexes; each `link_id` is a one-based parser occurrence and may have
+gaps. Never substitute a row position for that occurrence ID.
+
+Each row includes the parser-decoded destination and an escaped display label.
+Its `evidence_range` identifies the **whole captured Markdown document**; the
+upstream link inventory does not certify a link-label byte span. `block_index`
+is parser metadata, not a source coordinate. Inventory truncation and parser
+diagnostics are explicit in `links_complete`, `links_seen`, `links_truncated`
+and `parser_diagnostics`. Normal pagination does not mean incomplete coverage.
+
+`fcb_reader_document_link` activates same-document start/heading destinations.
+Heading fragments are decoded once, matched to canonical heading identity and
+qualified against retained source provenance before a flow window is published.
+External, unsupported and local-file references return an inert typed result;
+they do not open a URI or turn a reader path label into a filesystem grant.
+Successful document replacement/clear invalidates the inventory. Failed or
+canceled link preparation preserves the previous accepted inventory.
+
 ## Reflow, cancellation and ownership
 
 Preparing again at a new width is explicit worker-side reflow. It currently

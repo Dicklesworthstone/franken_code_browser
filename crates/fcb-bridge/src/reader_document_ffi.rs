@@ -28,6 +28,25 @@ pub extern "C" fn fcb_reader_document_headings(handle: u64, generation: u64, fir
     reply(|| answer(handle, |readers| readers.execute(handle,
         Command::DocumentHeadings { generation, first: number(first)?, count: number(count)? }, || false)))
 }
+/// Parse links from the same retained source on a host worker. The accepted
+/// document generation, not a path label, identifies the source of every row.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_reader_document_links_prepare(handle: u64, generation: u64, max_links: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| readers.execute(handle,
+        Command::DocumentLinksPrepare { generation, max_links: number(max_links)? }, || false)))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_reader_document_links(handle: u64, generation: u64, first: u64, count: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| readers.execute(handle,
+        Command::DocumentLinks { generation, first: number(first)?, count: number(count)? }, || false)))
+}
+/// Resolve a retained occurrence, not caller-supplied destination text. Current
+/// document anchors navigate retained bytes; other destinations remain inert.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_reader_document_link(handle: u64, generation: u64, link_id: u64, count: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| readers.execute(handle,
+        Command::DocumentLink { generation, id: link_id, count: number(count)? }, || false)))
+}
 /// # Safety
 /// slug is null or readable NUL-terminated UTF-8 stable until return. No foreign
 /// reference survives the call. Every returned string uses fcb_free_string.

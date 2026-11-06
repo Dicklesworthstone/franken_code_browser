@@ -8,9 +8,13 @@ import Observation
     typealias Execute = @MainActor (AtlasReaderDocumentRequest) async throws -> AtlasReaderDocumentResult
     typealias Clipboard = @MainActor (String) -> Bool
     typealias SourceNavigation = @MainActor (AtlasReaderDocumentTarget) -> Void
+    /// Only an enclosing host with an independently qualified project/capture
+    /// route may install this callback. Destination labels never create grants.
+    typealias LocalNavigation = @MainActor (AtlasReaderDocumentLinkTarget) -> Void
 
     private(set) var page: AtlasReaderDocumentPage?
     private(set) var headings: AtlasReaderDocumentHeadings?
+    private(set) var links: AtlasReaderDocumentLinks?
     private(set) var source: AtlasReaderDocumentSource?
     private(set) var busy = false
     private(set) var authorized = false
@@ -21,6 +25,7 @@ import Observation
     private var sourceOffset: UInt64 = 0
     private var history = AtlasNavigationHistory<UInt64>()
     private var headingHistory: [UInt64] = []
+    private var linkHistory: [UInt64] = []
     @ObservationIgnored private let supported: Bool
     @ObservationIgnored private let execute: Execute
     @ObservationIgnored private let cancelWork: @MainActor () -> Void
@@ -53,6 +58,16 @@ import Observation
     var canNext: Bool { canNavigate && page?.next != nil }
     var canHeadingsBack: Bool { canNavigate && !headingHistory.isEmpty }
     var canHeadingsNext: Bool { canNavigate && headings?.next != nil }
+    var canLinksBack: Bool { canNavigate && !linkHistory.isEmpty }
+    var canLinksNext: Bool { canNavigate && links?.next != nil }
+    var linkCoverage: String {
+        guard let links else { return "Load the links parsed from this retained Markdown capture." }
+        return "\(links.rows.count) of \(links.total) retained links shown; \(links.seen) parsed occurrences. "
+            + (links.complete ? "Link inventory complete. " : "Link inventory incomplete. ")
+            + (links.truncated ? "Some links were omitted by the admission limit. " : "")
+            + (links.diagnostics > 0 ? "\(links.diagnostics) parser diagnostics. " : "")
+            + "Evidence identifies the complete original document, not an inline span."
+    }
     var coverage: String {
         guard let page else { return unavailableReason ?? "Prepare a logical FrankenMarkdown preview from the retained source." }
         let inventory = page.inventory
@@ -82,6 +97,7 @@ import Observation
         // Keep old pixels readable but revoke their activation/copy immediately.
         authorized = false
         source = nil
+        links = nil; linkHistory = []
         revoke()
         perform(.prepare(width: width), notice: "Preparing retained Markdown…") { model, result in
             guard case .prepared(let page, let headings) = result, let identity = model.identity,
@@ -124,6 +140,54 @@ import Observation
     }
     func nextHeadings() { if let next = headings?.next { loadHeadings(first: next) } }
     func previousHeadings() { if let first = headingHistory.last { loadHeadings(first: first, goingBack: true) } }
+
+    func prepareLinks() {
+        guard canNavigate, let inventory = page?.inventory else { return }
+        links = nil; linkHistory = []
+        perform(.prepareLinks, notice: "Reading links from retained Markdown…") { model, result in
+            guard case .links(let links) = result, links.inventory.matches(inventory), links.first == 0 else {
+                throw AtlasReaderError.invalidResponse
+            }
+            model.links = links
+        }
+    }
+    func nextLinks() { if let next = links?.next { loadLinks(first: next) } }
+    func previousLinks() { if let first = linkHistory.last { loadLinks(first: first, goingBack: true) } }
+    func allows(_ target: AtlasReaderDocumentLinkTarget) -> Bool {
+        canNavigate && links?.target(id: target.link.id) == target
+    }
+    func openLink(_ target: AtlasReaderDocumentLinkTarget, openLocal: LocalNavigation? = nil) {
+        guard allows(target), let previous = page else { return }
+        let move = history.visit(previous.first)
+        perform(.link(target), notice: "Resolving retained document link…", then: { model in
+            // Recheck after the worker has drained and busy state is released.
+            // The host callback may synchronously close or replace this reader.
+            guard target.link.kind == .local, model.allows(target) else { return }
+            openLocal?(target)
+        }) { model, result in
+            guard case .link(let activation) = result, activation.target == target,
+                  model.links?.target(id: target.link.id) == target else {
+                throw AtlasReaderError.invalidResponse
+            }
+            if let page = activation.page {
+                guard target.link.kind.navigatesWithinCapture, page.inventory.matches(previous.inventory),
+                      model.history.commit(move, resolved: page.first) else { throw AtlasReaderError.invalidResponse }
+                model.page = page; model.source = nil
+                model.lineInput = String(page.first + 1)
+            } else {
+                guard !target.link.kind.navigatesWithinCapture else { throw AtlasReaderError.invalidResponse }
+                switch target.link.kind {
+                case .local:
+                    model.notice = openLocal == nil
+                        ? "This local link needs a current project capture route. No file was opened."
+                        : "The current project will resolve this retained link against its admitted files."
+                case .external: model.notice = "External destination. No browser or network request was opened."
+                case .unsupported: model.notice = "This destination is unsupported by the shared document resolver."
+                case .heading, .start: throw AtlasReaderError.invalidResponse
+                }
+            }
+        }
+    }
 
     func showSource(_ target: AtlasReaderDocumentTarget, navigate: SourceNavigation? = nil) {
         guard allows(target) else { return }
@@ -194,8 +258,8 @@ import Observation
     func close() {
         cancel(silent: true)
         revoke()
-        identity = nil; page = nil; headings = nil; source = nil
-        authorized = false; history.reset(); headingHistory = []
+        identity = nil; page = nil; headings = nil; links = nil; source = nil
+        authorized = false; history.reset(); headingHistory = []; linkHistory = []
         sourceOffset = 0; lineInput = "1"; notice = ""
     }
 
@@ -231,6 +295,20 @@ import Observation
                 if model.headingHistory.count > 128 { model.headingHistory.removeFirst() }
             }
             model.headings = headings
+        }
+    }
+    private func loadLinks(first: UInt64, goingBack: Bool = false) {
+        guard canNavigate, let previous = links, first < previous.total else { return }
+        perform(.links(first: first), notice: "Reading retained link occurrences…") { model, result in
+            guard case .links(let links) = result, links.matchesInventory(previous), links.first == first else {
+                throw AtlasReaderError.invalidResponse
+            }
+            if goingBack { _ = model.linkHistory.popLast() }
+            else if first != previous.first {
+                model.linkHistory.append(previous.first)
+                if model.linkHistory.count > 128 { model.linkHistory.removeFirst() }
+            }
+            model.links = links
         }
     }
     private func perform(_ request: AtlasReaderDocumentRequest, notice: String,

@@ -8,9 +8,11 @@ import AppKit
     @Bindable var model: AtlasDocumentPreviewModel
     var embedded = false
     var openSource: AtlasDocumentPreviewModel.SourceNavigation?
+    var openLocalLink: AtlasDocumentPreviewModel.LocalNavigation?
     var closePreview: (() -> Void)?
     @Environment(\.dismiss) private var dismiss
-    @State private var showsHeadings = false
+    @State private var showsContents = false
+    @State private var browsesLinks = false
     @State private var shownSource: AtlasSource?
     @State private var sourceSelection: AtlasReaderSelection?
     @State private var sourceNavigation = UUID()
@@ -20,8 +22,8 @@ import AppKit
             toolbar
             Divider()
             HSplitView {
-                if !embedded || showsHeadings {
-                    headingBrowser.frame(minWidth: 160, idealWidth: 220, maxWidth: 320)
+                if !embedded || showsContents {
+                    documentNavigation.frame(minWidth: 180, idealWidth: 250, maxWidth: 340)
                 }
                 VStack(spacing: 0) {
                     flowControls
@@ -54,7 +56,7 @@ import AppKit
             if !embedded { Text("Logical flow").font(.caption).foregroundStyle(.secondary) }
             Spacer()
             if embedded {
-                Button(showsHeadings ? "Hide headings" : "Headings") { showsHeadings.toggle() }
+                Button(showsContents ? "Hide contents" : "Contents") { showsContents.toggle() }
             }
             TextField("Columns", text: $model.widthInput)
                 .frame(width: 64).textFieldStyle(.roundedBorder)
@@ -153,6 +155,72 @@ import AppKit
                 if !model.busy && model.canPrepare { Button("Prepare preview", action: model.prepare) }
             }
             .padding(20).frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private var documentNavigation: some View {
+        VStack(spacing: 0) {
+            Picker("Document navigation", selection: $browsesLinks) {
+                Text("Headings").tag(false)
+                Text("Links").tag(true)
+            }
+            .pickerStyle(.segmented).padding(8)
+            if browsesLinks { linkBrowser } else { headingBrowser }
+        }
+    }
+
+    private var linkBrowser: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Links").font(.headline)
+                Spacer()
+                Button(model.links == nil ? "Load links" : "Reload", action: model.prepareLinks)
+                    .disabled(!model.canNavigate)
+                    .help("Parse link occurrences from this exact captured Markdown document")
+            }
+            .padding(.horizontal, 10)
+            HStack {
+                Button("Previous", action: model.previousLinks).disabled(!model.canLinksBack)
+                Button("Next", action: model.nextLinks).disabled(!model.canLinksNext)
+            }
+            .controlSize(.small).padding(.horizontal, 10)
+            List {
+                if let links = model.links {
+                    ForEach(links.rows) { link in
+                        if let target = links.target(id: link.id) {
+                            Button { model.openLink(target, openLocal: openLocalLink) } label: {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(verbatim: link.display.isEmpty ? "(document start)" : link.display)
+                                        .lineLimit(3).font(.system(.body, design: .monospaced))
+                                    Text("Occurrence \(link.id) · " + linkDisposition(link.kind))
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(!model.canNavigate || !(link.kind.navigatesWithinCapture
+                                || (link.kind == .local && openLocalLink != nil)))
+                            .help(linkDisposition(link.kind) + ": " + link.display)
+                        }
+                    }
+                    if links.rows.isEmpty {
+                        Text(links.complete && links.total == 0 ? "No links in this capture" : "No retained links on this page")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .listStyle(.sidebar)
+            Text(model.linkCoverage).font(.caption).foregroundStyle(.secondary)
+                .textSelection(.enabled).padding(10)
+        }
+    }
+    private func linkDisposition(_ kind: AtlasReaderDocumentLinkKind) -> String {
+        switch kind {
+        case .heading: "Go to this document's heading"
+        case .start: "Go to document start"
+        case .local: openLocalLink == nil ? "Local target needs a project capture route" : "Open admitted project target"
+        case .external: "External destination; not opened"
+        case .unsupported: "Unsupported destination"
         }
     }
 

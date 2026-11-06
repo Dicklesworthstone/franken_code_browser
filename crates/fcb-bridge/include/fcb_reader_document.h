@@ -9,7 +9,8 @@ extern "C" {
 /* Retained Markdown on an existing OPEN reader, including a captured atlas hit.
  * Every call is synchronous HOST-WORKER work. Preparation/reflow calls the shared
  * FrankenMarkdown engine; viewport/heading/copy/navigation calls reuse its output.
- * No source path is reopened, no asset is fetched, and no link is activated.
+ * No source path is reopened and no asset or external URL is fetched. Link
+ * activation below navigates only the same captured document's qualified anchors.
  * No native font shaping, glyph-exact mapping or actual presentation is claimed.
  * Returned JSON uses fcb.reader-session/1. Check status; non-null can be an error.
  * Null means panic/marshaling refusal. Free each non-null string exactly once with
@@ -43,6 +44,36 @@ char *fcb_reader_document_window(uint64_t handle, uint64_t generation,
     uint64_t first, uint64_t count);
 char *fcb_reader_document_headings(uint64_t handle, uint64_t generation,
     uint64_t first, uint64_t count);
+
+/* Prepare a bounded inventory of parsed link occurrences on the accepted
+ * document generation. max_links is 0..4096; zero retains no rows but reports
+ * observed links honestly. Parsing uses the existing captured source and shared
+ * Markdown engine on a host worker, never a native view/update callback.
+ * Failed/canceled preparation preserves the previous accepted inventory.
+ * Successful document reflow/clear invalidates the old link inventory.
+ * Returns the first <=64 retained links. Evidence covers the WHOLE original
+ * captured document, not a link token, inline hit region, or enclosing block.
+ * Destinations are parser-decoded URL text, not literal source-token bytes.
+ */
+char *fcb_reader_document_links_prepare(uint64_t handle, uint64_t generation,
+    uint64_t max_links);
+
+/* Page the retained inventory without parsing or source I/O. first is a
+ * zero-based retained-row offset, count is 1..128. Occurrence IDs are distinct
+ * from paging offsets and can have gaps when a destination exceeds its bound.
+ */
+char *fcb_reader_document_links(uint64_t handle, uint64_t generation,
+    uint64_t first, uint64_t count);
+
+/* Resolve one retained occurrence under its current document generation.
+ * count is 1..128 flow rows. Same-document fragments use canonical heading
+ * identities and the existing provenance qualification before navigation.
+ * Local/external/unsupported destinations are explicit inert outcomes; this
+ * service never obtains filesystem or network authority from a reader label.
+ * Missing/invalid/stale targets cannot silently become a jump to offset zero.
+ */
+char *fcb_reader_document_link(uint64_t handle, uint64_t generation,
+    uint64_t link_id, uint64_t count);
 
 /* slug is null or valid NUL-terminated UTF-8, stable throughout this call.
  * Null/empty/unknown or >4096-byte slugs are refused. Pass the literal canonical

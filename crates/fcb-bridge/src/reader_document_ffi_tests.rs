@@ -14,6 +14,9 @@ fn all_document_entrypoint_types_and_public_header_names_agree() {
     let _: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> *mut c_char = fcb_reader_document;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_reader_document_window;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_reader_document_headings;
+    let _: extern "C" fn(u64, u64, u64) -> *mut c_char = fcb_reader_document_links_prepare;
+    let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_reader_document_links;
+    let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_reader_document_link;
     let _: unsafe extern "C" fn(u64, u64, *const c_char, u64) -> *mut c_char = fcb_reader_document_heading;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_reader_document_from_source;
     let _: extern "C" fn(u64, u64, u64, u64, u64) -> *mut c_char = fcb_reader_document_source;
@@ -21,6 +24,7 @@ fn all_document_entrypoint_types_and_public_header_names_agree() {
     let _: extern "C" fn(u64, u64) -> *mut c_char = fcb_reader_document_clear;
     let header = include_str!("../include/fcb_reader_document.h");
     for name in ["fcb_reader_document(", "fcb_reader_document_window(", "fcb_reader_document_headings(",
+        "fcb_reader_document_links_prepare(", "fcb_reader_document_links(", "fcb_reader_document_link(",
         "fcb_reader_document_heading(", "fcb_reader_document_from_source(", "fcb_reader_document_source(",
         "fcb_reader_document_copy(", "fcb_reader_document_clear("] {
         assert_eq!(header.matches(name).count(), 1, "{name}");
@@ -44,6 +48,9 @@ fn unknown_handles_null_slugs_and_wide_offsets_return_owned_error_strings() {
         fcb_reader_document(u64::MAX, 1, 100, 65536, 8192, 8192, 4096),
         fcb_reader_document_window(u64::MAX, 1, u64::MAX, 1),
         fcb_reader_document_headings(u64::MAX, 1, 0, 1),
+        fcb_reader_document_links_prepare(u64::MAX, 1, u64::MAX),
+        fcb_reader_document_links(u64::MAX, 1, u64::MAX, 1),
+        fcb_reader_document_link(u64::MAX, 1, u64::MAX, 1),
         unsafe { fcb_reader_document_heading(u64::MAX, 1, slug.as_ptr(), 1) },
         unsafe { fcb_reader_document_heading(u64::MAX, 1, std::ptr::null(), 1) },
         fcb_reader_document_from_source(u64::MAX, 1, u64::MAX, 1),
@@ -56,4 +63,51 @@ fn unknown_handles_null_slugs_and_wide_offsets_return_owned_error_strings() {
         assert!(error.contains("\"status\":\"error\""), "{error}");
         assert!(!error.contains("\"document_ready\":true"));
     }
+}
+
+#[test]
+fn link_inventory_and_navigation_use_the_actual_c_reader_registry() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
+    struct OpenReader(u64);
+    impl Drop for OpenReader {
+        fn drop(&mut self) { crate::reader_ffi::fcb_reader_close(self.0); }
+    }
+    let handle = OpenReader(crate::reader_ffi::fcb_reader_create());
+    assert_ne!(handle.0, 0);
+    crate::reader_ffi::registry().unwrap().supply(handle.0,
+        b"# Target\n\n[Jump](#target) and [Local](docs/next.md).\n").unwrap();
+    let prepared = take(fcb_reader_document(handle.0, 1, 80, 65536, 8192, 8192, 4096));
+    assert!(prepared.contains("\"document_ready\":true"), "{prepared}");
+    let links = take(fcb_reader_document_links_prepare(handle.0, 1, 16));
+    assert!(links.contains("\"command\":\"document-links-prepare\""), "{links}");
+    assert!(links.contains("\"retained_links\":\"2\""), "{links}");
+    assert!(links.contains("\"evidence_precision\":\"whole-captured-markdown-document\""));
+    let page = take(fcb_reader_document_links(handle.0, 1, 1, 1));
+    assert!(page.contains("\"first_link\":\"1\""), "{page}");
+    assert!(page.contains("\"link_id\":\"2\""), "{page}");
+    let jump = take(fcb_reader_document_link(handle.0, 1, 1, 4));
+    assert!(jump.contains("\"activated\":true"), "{jump}");
+    assert!(jump.contains("\"heading_slug\":\"target\""), "{jump}");
+    assert!(jump.contains("\"first_flow_line\":\"0\""), "{jump}");
+    let local = take(fcb_reader_document_link(handle.0, 1, 2, 4));
+    assert!(local.contains("\"activated\":false"), "{local}");
+    assert!(local.contains("\"kind\":\"local-reference\""), "{local}");
+    assert!(!local.contains("\"first_flow_line\":"), "inert link invented a navigation window");
+    for invalid in [
+        fcb_reader_document_links(handle.0, 1, 0, 0),
+        fcb_reader_document_link(handle.0, 1, 0, 4),
+        fcb_reader_document_link(handle.0, 1, u64::MAX, 4),
+        fcb_reader_document_links_prepare(handle.0, 1, 4097),
+    ] {
+        let error = take(invalid);
+        assert!(error.contains("\"status\":\"error\""), "{error}");
+    }
+    let after_refusals = take(fcb_reader_document_link(handle.0, 1, 1, 4));
+    assert!(after_refusals.contains("\"activated\":true"), "{after_refusals}");
+    take(fcb_reader_document_clear(handle.0, 2));
+    let stale = take(fcb_reader_document_link(handle.0, 1, 1, 4));
+    assert!(stale.contains("\"status\":\"error\""), "{stale}");
+    assert!(!stale.contains("\"activated\":true"));
+    let source = take(crate::reader_ffi::fcb_reader_window(handle.0, 0, 4096));
+    assert!(source.contains("# Target"), "clearing derived links discarded retained source");
 }

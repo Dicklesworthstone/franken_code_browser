@@ -16,6 +16,13 @@ private func fcb_reader_document_source(_ handle: UInt64, _ generation: UInt64, 
 @_silgen_name("fcb_reader_document_copy")
 private func fcb_reader_document_copy(_ handle: UInt64, _ generation: UInt64, _ start: UInt64, _ end: UInt64, _ mode: UInt8) -> UnsafeMutablePointer<CChar>?
 
+@_silgen_name("fcb_reader_document_links_prepare")
+private func fcb_reader_document_links_prepare(_ handle: UInt64, _ generation: UInt64, _ maxLinks: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_reader_document_links")
+private func fcb_reader_document_links(_ handle: UInt64, _ generation: UInt64, _ first: UInt64, _ count: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_reader_document_link")
+private func fcb_reader_document_link(_ handle: UInt64, _ generation: UInt64, _ link: UInt64, _ count: UInt64) -> UnsafeMutablePointer<CChar>?
+
 extension AtlasReaderDocumentTransport {
     static let native = Self(prepare: { handle, generation, width in
         take(fcb_reader_document(handle, generation, width, AtlasReaderDocumentLimits.sourceBytes,
@@ -26,7 +33,10 @@ extension AtlasReaderDocumentTransport {
         slug.withCString { take(fcb_reader_document_heading(handle, generation, $0, count)) }
     }, fromSource: { take(fcb_reader_document_from_source($0, $1, $2, $3)) },
     source: { take(fcb_reader_document_source($0, $1, $2, $3, $4)) },
-    copy: { take(fcb_reader_document_copy($0, $1, $2, $3, $4)) })
+    copy: { take(fcb_reader_document_copy($0, $1, $2, $3, $4)) },
+    prepareLinks: { take(fcb_reader_document_links_prepare($0, $1, $2)) },
+    links: { take(fcb_reader_document_links($0, $1, $2, $3)) },
+    link: { take(fcb_reader_document_link($0, $1, $2, $3)) })
 
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
         guard let pointer else { return nil }

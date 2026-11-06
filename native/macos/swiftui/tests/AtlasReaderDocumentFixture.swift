@@ -60,6 +60,27 @@ enum DocumentWireFixture {
         out["next_heading"] = headingEnd < headingCount ? String(headingEnd) as Any : NSNull()
         return out
     }
+    static func linkRow(_ id: UInt64) -> [String: Any] {
+        ["link_id": String(id), "block_index": "0", "evidence_range": range(0, UInt64(raw.count)),
+         "destination": id == 2 ? "other.md#next" : "#caf%C3%A9",
+         "destination_display": id == 2 ? "other.md#next" : "#caf%C3%A9",
+         "kind": id == 2 ? "local-reference" : "same-document-heading",
+         "fragment_slug": id == 2 ? NSNull() : "café" as Any]
+    }
+    static func links(_ command: String, owner: UInt64, generation: UInt64, width: UInt64,
+        first: UInt64 = 0) -> [String: Any] {
+        var out = page(command, owner: owner, generation: generation, width: width)
+        for key in ["first_flow_line", "flow_lines", "next_flow_line", "whole_document_visible", "headings", "next_heading"] {
+            out.removeValue(forKey: key)
+        }
+        out["links_ready"] = true; out["links_complete"] = true; out["links_truncated"] = false
+        out["links_seen"] = "70"; out["retained_links"] = "70"; out["parser_diagnostics"] = "0"
+        out["evidence_precision"] = "whole-captured-markdown-document"
+        let end = min(first + 64, 70)
+        out["first_link"] = String(first); out["links"] = (first..<end).map { linkRow($0 + 1) }
+        out["next_link"] = end < 70 ? String(end) as Any : NSNull()
+        return out
+    }
     static func selection(generation: UInt64, start: UInt64, end: UInt64) -> [String: Any] {
         ["document_generation": String(generation), "selection_namespace": "document",
          "source_mapping": "enclosing-regions-not-glyph-exact", "rendered_utf8_range": range(start, end)]
@@ -115,6 +136,17 @@ final class DocumentBoundary: @unchecked Sendable {
             selected["window_utf8_range"] = DocumentWireFixture.range(DocumentWireFixture.start - 3, DocumentWireFixture.end - 3)
             selected["original_hex"] = DocumentWireFixture.hex(DocumentWireFixture.raw[Int(DocumentWireFixture.start)..<Int(DocumentWireFixture.end)])
             out["selection"] = selected
+        } else if command == "document-links-prepare" || command == "document-links" {
+            out = DocumentWireFixture.links(command, owner: owner, generation: generation, width: width, first: first)
+        } else if command == "document-link" {
+            out = DocumentWireFixture.links(command, owner: owner, generation: generation, width: width)
+            for key in ["first_link", "links", "next_link"] { out.removeValue(forKey: key) }
+            out["link"] = DocumentWireFixture.linkRow(start); out["activated"] = start != 2
+            if start != 2 {
+                let flow = DocumentWireFixture.page(command, owner: owner, generation: generation, width: width, first: 64)
+                for key in ["first_flow_line", "flow_lines", "next_flow_line", "whole_document_visible"] { out[key] = flow[key] }
+                out["heading_slug"] = "café"; out["heading_original_range"] = DocumentWireFixture.range(3, 11)
+            }
         } else if command == "document-copy" {
             out = DocumentWireFixture.header(command, owner: owner)
             out.merge(DocumentWireFixture.selection(generation: generation, start: start, end: end)) { _, new in new }
@@ -168,6 +200,15 @@ final class DocumentBoundary: @unchecked Sendable {
             return call("document-source", generation: generation, start: start, end: end)
         }, copy: { [self] _, generation, start, end, mode in
             call("document-copy", generation: generation, start: start, end: end, mode: mode)
+        }, prepareLinks: { [self] handle, generation, limit in
+            precondition(handle == owner && limit == 4096)
+            return call("document-links-prepare", generation: generation)
+        }, links: { [self] handle, generation, first, count in
+            precondition(handle == owner && count == 64)
+            return call("document-links", generation: generation, first: first)
+        }, link: { [self] handle, generation, id, count in
+            precondition(handle == owner && count == 64)
+            return call("document-link", generation: generation, start: id)
         })
     }
 }

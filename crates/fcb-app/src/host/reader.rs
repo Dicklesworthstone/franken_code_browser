@@ -14,6 +14,7 @@ mod outline;
 mod comparison;
 mod highlight;
 pub(crate) mod document;
+mod document_links;
 #[cfg(test)]
 mod shared_tests;
 pub use outline::{ReaderOutlineOptions, MAX_READER_SYMBOL_PAGE, MAX_READER_SYMBOL_QUERY_BYTES};
@@ -52,6 +53,7 @@ pub enum ReaderSessionError {
     StaleQuery, MissingHit, MissingLine, Canceled, IdentityExhausted,
     Symbol(SymbolError), MissingOutline, UnsupportedOutlineLanguage,
     Document(fcb::document::reader::DocumentReadError), MissingDocument,
+    DocumentLinks(fcb::document::links::DocumentLinkError), MissingDocumentLinks, MissingDocumentLink,
     Comparison(fcb::analysis::comparison::ComparisonError),
 }
 impl std::fmt::Display for ReaderSessionError {
@@ -61,8 +63,11 @@ impl std::fmt::Display for ReaderSessionError {
             Self::Source(e) => write!(f, "{e}"), Self::Stream(e) => write!(f, "{e}"),
             Self::View(e) => write!(f, "{e}"), Self::Lines(e) => write!(f, "{e}"),
             Self::Symbol(e) => write!(f, "{e}"), Self::Document(e) => write!(f, "{e}"),
+            Self::DocumentLinks(e) => write!(f, "{e}"),
             Self::Comparison(e) => write!(f, "{e}"),
             Self::MissingDocument => f.write_str("READER_SESSION_NO_DOCUMENT"),
+            Self::MissingDocumentLinks => f.write_str("READER_SESSION_NO_DOCUMENT_LINKS"),
+            Self::MissingDocumentLink => f.write_str("READER_SESSION_MISSING_DOCUMENT_LINK"),
             Self::MissingOutline => f.write_str("READER_SESSION_NO_OUTLINE"),
             Self::UnsupportedOutlineLanguage => f.write_str("READER_SESSION_OUTLINE_LANGUAGE_UNSUPPORTED"),
             Self::InvalidLimits => f.write_str("READER_SESSION_INVALID_LIMITS"),
@@ -119,6 +124,7 @@ pub struct ReaderSession {
     outline: Option<AcceptedOutline>,
     last_outline_attempt: u64,
     document: Option<fcb::document::reader::DocumentReader<'static>>,
+    document_links: Option<document_links::AcceptedDocumentLinks>,
     last_document_attempt: u64,
     last_comparison_attempt: u64,
     next_allocation: u64,
@@ -179,7 +185,7 @@ impl ReaderSession {
         Self { capture, capture_sha256, path: path.to_path_buf(), encoding, highlight: None,
             line_checkpoints: std::array::from_fn(|_| None), source_bytes_read: 0, read_calls: 0,
             file_observation: false, query: None, last_query_attempt: 0,
-            outline: None, last_outline_attempt: 0, document: None, last_document_attempt: 0,
+            outline: None, last_outline_attempt: 0, document: None, document_links: None, last_document_attempt: 0,
             last_comparison_attempt: 0, next_allocation: 3,
             budget, _source_lease: source_lease, _state_lease: state_lease }
     }
@@ -207,6 +213,9 @@ impl ReaderSession {
         Ok(session)
     }
     pub fn capture(&self) -> &CompleteCapture { &self.capture }
+    /// Digest of the retained original bytes, computed once during admission.
+    /// This identifies evidence; a caller must supply its own root authority.
+    pub fn capture_sha256(&self) -> Sha256Digest { self.capture_sha256 }
     /// Display/provenance label only; it does not confer live filesystem access.
     pub fn path(&self) -> &Path { &self.path }
     pub fn accepted_generation(&self) -> Option<u64> { self.query.as_ref().map(|q| q.generation) }
@@ -229,6 +238,8 @@ impl ReaderSession {
         if let Some(generation) = self.outline_generation() { out.integer(generation)?; } else { out.literal("null")?; }
         out.literal(",\"accepted_document_generation\":")?;
         if let Some(generation) = self.document_generation() { out.integer(generation)?; } else { out.literal("null")?; }
+        out.literal(",\"accepted_document_links_generation\":")?;
+        if let Some(generation) = self.document_links_generation() { out.integer(generation)?; } else { out.literal("null")?; }
         out.literal("}\n")?;
         self.finish_output(out, EXIT_OK, &mut canceled)
     }

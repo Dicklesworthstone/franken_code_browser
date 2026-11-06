@@ -43,7 +43,8 @@ impl AccessError {
         match self {
             Self::Canceled | Self::Closed | Self::Reader(ReaderSessionError::Canceled)
                 | Self::Reader(ReaderSessionError::Symbol(SymbolError::Canceled))
-                | Self::Reader(ReaderSessionError::Document(DocumentReadError::Canceled)) => true,
+                | Self::Reader(ReaderSessionError::Document(DocumentReadError::Canceled))
+                | Self::Reader(ReaderSessionError::DocumentLinks(fcb::document::links::DocumentLinkError::Canceled)) => true,
             Self::Reader(ReaderSessionError::Comparison(fcb::analysis::comparison::ComparisonError::Canceled)) => true,
             Self::Reader(ReaderSessionError::Host(HostError::App(e)) | ReaderSessionError::App(e)) => e.is_canceled(),
             Self::Reader(ReaderSessionError::View(e)) => fcb_app::AppError::View(e).is_canceled(),
@@ -86,6 +87,9 @@ pub(super) enum Command<'a> {
     DocumentWindow { generation: u64, first: usize, count: usize },
     DocumentHeadings { generation: u64, first: usize, count: usize },
     DocumentHeading { generation: u64, slug: &'a str, count: usize },
+    DocumentLinksPrepare { generation: u64, max_links: usize },
+    DocumentLinks { generation: u64, first: usize, count: usize },
+    DocumentLink { generation: u64, id: u64, count: usize },
     DocumentFromSource { generation: u64, offset: u64, count: usize },
     DocumentSource { generation: u64, start: usize, end: usize, context: usize },
     DocumentCopy { generation: u64, start: usize, end: usize, mode: DocumentCopyMode },
@@ -274,6 +278,9 @@ impl ReaderSessions {
             Command::DocumentWindow { generation, first, count } => reader.document_window(generation, first, count, &mut stop),
             Command::DocumentHeadings { generation, first, count } => reader.document_headings(generation, first, count, &mut stop),
             Command::DocumentHeading { generation, slug, count } => reader.document_at_heading(generation, slug, count, &mut stop),
+            Command::DocumentLinksPrepare { generation, max_links } => reader.prepare_document_links(generation, max_links, &mut stop),
+            Command::DocumentLinks { generation, first, count } => reader.document_links(generation, first, count, &mut stop),
+            Command::DocumentLink { generation, id, count } => reader.document_link(generation, id, count, &mut stop),
             Command::DocumentFromSource { generation, offset, count } => reader.document_at_source(generation, offset, count, &mut stop),
             Command::DocumentSource { generation, start, end, context } => reader.document_selection_source(generation, start, end, context, &mut stop),
             Command::DocumentCopy { generation, start, end, mode } => reader.copy_document_selection(generation, start, end, mode, &mut stop),
