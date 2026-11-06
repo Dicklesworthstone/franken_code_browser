@@ -359,8 +359,11 @@ pub fn run_split_utf16_case(seed: u64) -> SourceHostileOutcome {
         }
         let mut decoder = StatefulChunkDecoder::new(encoding);
         let map = decoder.decode_chunk(candidate).ok()?;
-        // Check if map contains ReplacementMalformed (from invalid surrogate)
-        if map.spans().iter().any(|s| s.kind == SpanKind::ReplacementMalformed) {
+        // Only real EOF can classify a retained high surrogate as malformed.
+        let tail = decoder.finish().ok()?;
+        if map.spans().iter().any(|s| s.kind == SpanKind::ReplacementMalformed)
+            || tail.as_ref().is_some_and(|tail| tail.spans().iter()
+                .any(|s| s.kind == SpanKind::ReplacementMalformed)) {
             Some("UNPAIRED_SURROGATE_OR_SPLIT")
         } else {
             None

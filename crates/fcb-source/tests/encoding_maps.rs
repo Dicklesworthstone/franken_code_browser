@@ -12,7 +12,7 @@
 //! - Intentional failing negative controls demonstrating oracle detection.
 
 use fcb_core::{
-    ByteOffset, ByteRange, DecodedUtf8Offset, DecodedUtf8Range, Utf16CodeUnitOffset,
+    ByteOffset, ByteRange, DecodedUtf8Offset, DecodedUtf8Range, ScalarIndex, Utf16CodeUnitOffset,
     NATIVE_NOT_FOUND,
 };
 use fcb_source::{
@@ -238,4 +238,178 @@ fn negative_control_oracle_detects_all_boundary_defects() {
         map.native_nsrange_to_byte_range(NATIVE_NOT_FOUND, 0),
         Err(SourceError::NativeSentinel)
     );
+}
+
+fn encode_units(text: &str, encoding: DetectedEncoding) -> Vec<u8> {
+    if encoding.is_utf8() { return text.as_bytes().to_vec(); }
+    text.encode_utf16().flat_map(|unit| if encoding == DetectedEncoding::Utf16Le {
+        unit.to_le_bytes()
+    } else { unit.to_be_bytes() }).collect()
+}
+
+fn assert_stream_equivalent(bytes: &[u8], encoding: DetectedEncoding, chunks: &[&[u8]]) {
+    let whole = CaptureEncodingMap::build_with_encoding(bytes, encoding).unwrap();
+    let mut decoder = StatefulChunkDecoder::new(encoding);
+    let mut maps = Vec::new();
+    for chunk in chunks { maps.push(decoder.decode_chunk(chunk).unwrap()); }
+    if let Some(tail) = decoder.finish().unwrap() { maps.push(tail); }
+    assert!(decoder.finish().unwrap().is_none());
+
+    let mut text = String::new();
+    let (mut raw, mut decoded, mut utf16, mut scalar) = (0, 0, 0, 0);
+    for map in maps {
+        assert_eq!(map.base_raw_offset(), raw);
+        assert_eq!(map.base_decoded_offset(), decoded);
+        assert_eq!(map.base_utf16_offset(), utf16);
+        assert_eq!(map.base_scalar_offset(), scalar);
+        for (local, ch) in map.decoded_text().char_indices() {
+            let start = DecodedUtf8Offset::new(decoded + local as u64);
+            let end = DecodedUtf8Offset::new(start.get() + ch.len_utf8() as u64);
+            let range = DecodedUtf8Range::new(start, end).unwrap();
+            let actual = map.decoded_utf8_range_to_byte_range(range).unwrap();
+            let expected = whole.decoded_utf8_range_to_byte_range(range).unwrap();
+            assert_eq!(actual, expected, "{encoding:?}: {ch:?} at {}", start.get());
+            assert_eq!(map.byte_to_decoded_utf8_offset(actual.start()).unwrap(), start);
+            assert_eq!(map.copy_unicode_text(range).unwrap(), ch.to_string());
+        }
+        text.push_str(map.decoded_text());
+        raw += map.total_raw_bytes().get();
+        decoded += map.total_decoded_bytes();
+        utf16 += map.total_utf16_units();
+        scalar += map.total_scalars();
+    }
+    assert_eq!(text, whole.decoded_text());
+    assert_eq!(raw, bytes.len() as u64);
+    assert_eq!(decoded, whole.total_decoded_bytes());
+    assert_eq!(utf16, whole.total_utf16_units());
+    assert_eq!(scalar, whole.total_scalars());
+}
+
+#[test]
+fn every_stream_boundary_preserves_surrogates_interior_bom_and_copy_ranges() {
+    for encoding in [DetectedEncoding::Utf8 { has_bom: false },
+        DetectedEncoding::Utf8 { has_bom: true }, DetectedEncoding::Utf16Le, DetectedEncoding::Utf16Be] {
+        let body = "A🦀\r\n\u{FEFF}B🙂Z";
+        let text = if encoding.bom_bytes_len() > 0 { format!("\u{FEFF}{body}") } else { body.to_owned() };
+        let bytes = encode_units(&text, encoding);
+        for split in 0..=bytes.len() {
+            assert_stream_equivalent(&bytes, encoding, &[&bytes[..split], &bytes[split..]]);
+        }
+        for width in 1..=7 {
+            let chunks: Vec<_> = bytes.chunks(width).collect();
+            assert_stream_equivalent(&bytes, encoding, &chunks);
+        }
+    }
+}
+
+#[test]
+fn utf16_high_surrogate_stays_pending_until_another_unit_or_real_eof() {
+    for encoding in [DetectedEncoding::Utf16Le, DetectedEncoding::Utf16Be] {
+        let bytes = encode_units("🦀Z", encoding);
+        for split in [2, 3] {
+            let mut decoder = StatefulChunkDecoder::new(encoding);
+            let prefix = decoder.decode_chunk(&bytes[..split]).unwrap();
+            assert_eq!(prefix.decoded_text(), "");
+            assert_eq!(prefix.total_raw_bytes().get(), 0);
+            assert_eq!(decoder.decode_chunk(&bytes[split..]).unwrap().decoded_text(), "🦀Z");
+            assert!(decoder.finish().unwrap().is_none());
+
+            let mut truncated = StatefulChunkDecoder::new(encoding);
+            truncated.decode_chunk(&bytes[..split]).unwrap();
+            let tail = truncated.finish().unwrap().unwrap();
+            assert_eq!(tail.total_raw_bytes().get(), split as u64);
+            assert_eq!(tail.decoded_text(), if split == 2 { "\u{FFFD}" } else { "\u{FFFD}\u{FFFD}" });
+            assert!(truncated.finish().unwrap().is_none());
+        }
+        let mut invalid = bytes[..2].to_vec();
+        invalid.extend_from_slice(&encode_units("Z", encoding));
+        assert_stream_equivalent(&invalid, encoding, &[&invalid[..2], &invalid[2..]]);
+        assert_eq!(CaptureEncodingMap::build_with_encoding(&invalid, encoding).unwrap().decoded_text(), "\u{FFFD}Z");
+    }
+}
+
+#[test]
+fn nonzero_windows_keep_feff_and_absolute_text_domains() {
+    let raw_base = (1_u64 << 32) + 64;
+    let decoded_base = (1_u64 << 32) + 17;
+    let utf16_base = (1_u64 << 32) + 9;
+    let scalar_base = (1_u64 << 32) + 3;
+    for encoding in [DetectedEncoding::Utf8 { has_bom: true }, DetectedEncoding::Utf16Le, DetectedEncoding::Utf16Be] {
+        let bytes = encode_units("\u{FEFF}🦀Z", encoding);
+        let map = CaptureEncodingMap::build_with_base_offset(&bytes, encoding,
+            raw_base, decoded_base, utf16_base, scalar_base).unwrap();
+        assert_eq!(map.decoded_text(), "\u{FEFF}🦀Z");
+        assert_eq!(map.byte_to_decoded_utf8_offset(ByteOffset::new(raw_base)).unwrap().get(), decoded_base);
+        assert_eq!(map.byte_to_utf16_offset(ByteOffset::new(raw_base)).unwrap().get(), utf16_base);
+        assert_eq!(map.byte_to_scalar_index(ByteOffset::new(raw_base)).unwrap().get(), scalar_base);
+        let selected = DecodedUtf8Range::new(DecodedUtf8Offset::new(decoded_base),
+            DecodedUtf8Offset::new(decoded_base + 7)).unwrap();
+        assert_eq!(map.copy_unicode_text(selected).unwrap(), "\u{FEFF}🦀");
+        let original = map.decoded_utf8_range_to_byte_range(selected).unwrap();
+        assert_eq!(original.start().get(), raw_base);
+        assert_eq!(original.len().get(), if encoding.is_utf16() { 6 } else { 7 });
+        assert_eq!(map.native_nsrange_to_byte_range(utf16_base, 3).unwrap(), original);
+        assert_eq!(map.scalar_to_byte_offset(ScalarIndex::new(scalar_base + 2)).unwrap(), original.end());
+        let before = DecodedUtf8Range::new(DecodedUtf8Offset::new(0), DecodedUtf8Offset::new(1)).unwrap();
+        assert_eq!(map.copy_unicode_text(before), Err(SourceError::RangeOutOfBounds));
+        let interior = DecodedUtf8Range::new(DecodedUtf8Offset::new(decoded_base + 1),
+            DecodedUtf8Offset::new(decoded_base + 3)).unwrap();
+        assert_eq!(map.copy_unicode_text(interior), Err(SourceError::InvalidUtf8Boundary));
+    }
+}
+
+#[test]
+fn original_bom_maps_into_declared_decoded_domains() {
+    for encoding in [DetectedEncoding::Utf8 { has_bom: true }, DetectedEncoding::Utf16Le, DetectedEncoding::Utf16Be] {
+        let bytes = encode_units("\u{FEFF}🦀Z", encoding);
+        let map = CaptureEncodingMap::build_with_base_offset(&bytes, encoding, 0, 17, 23, 31).unwrap();
+        assert_eq!(map.decoded_text(), "🦀Z");
+        for raw in 0..encoding.bom_bytes_len() {
+            assert_eq!(map.byte_to_decoded_utf8_offset(ByteOffset::new(raw)).unwrap().get(), 17);
+            assert_eq!(map.byte_to_utf16_offset(ByteOffset::new(raw)).unwrap().get(), 23);
+            assert_eq!(map.byte_to_scalar_index(ByteOffset::new(raw)).unwrap().get(), 31);
+        }
+        assert_eq!(map.decoded_utf8_to_byte_offset(DecodedUtf8Offset::new(17)).unwrap().get(), encoding.bom_bytes_len());
+    }
+}
+
+#[test]
+fn every_map_domain_rejects_overflow_without_rejecting_the_exact_limit() {
+    let samples: &[(&[u8], DetectedEncoding)] = &[
+        (b"ab", DetectedEncoding::Utf8 { has_bom: false }),
+        ("🦀".as_bytes(), DetectedEncoding::Utf8 { has_bom: false }),
+        (&[0xff], DetectedEncoding::Utf8 { has_bom: false }),
+        (&[0x3e, 0xd8, 0x80, 0xdd], DetectedEncoding::Utf16Le),
+        (&[0xd8, 0x3e, 0xdd, 0x80], DetectedEncoding::Utf16Be),
+        (&[0], DetectedEncoding::Utf16Le),
+        (&[0xff], DetectedEncoding::Unsupported),
+    ];
+    for &(bytes, encoding) in samples {
+        let original = CaptureEncodingMap::build_with_encoding(bytes, encoding).unwrap();
+        let lengths = [original.total_raw_bytes().get(), original.total_decoded_bytes(),
+            original.total_utf16_units(), original.total_scalars()];
+        for domain in 0..4 {
+            let mut bases = [0; 4];
+            bases[domain] = u64::MAX - lengths[domain] + 1;
+            assert_eq!(CaptureEncodingMap::build_with_base_offset(bytes, encoding,
+                bases[0], bases[1], bases[2], bases[3]), Err(SourceError::RangeOutOfBounds),
+                "{encoding:?}, domain {domain}");
+            bases[domain] -= 1;
+            let map = CaptureEncodingMap::build_with_base_offset(bytes, encoding,
+                bases[0], bases[1], bases[2], bases[3]).unwrap();
+            assert_eq!(map.decoded_text(), original.decoded_text());
+            assert_eq!([map.total_raw_bytes().get(), map.total_decoded_bytes(),
+                map.total_utf16_units(), map.total_scalars()], lengths);
+        }
+    }
+}
+
+#[test]
+fn unsupported_bytes_are_escaped_without_utf8_carry() {
+    let mut decoder = StatefulChunkDecoder::new(DetectedEncoding::Unsupported);
+    let first = decoder.decode_chunk(&[0xf0, 0x9f]).unwrap();
+    assert_eq!(first.decoded_text(), "\\xF0\\x9F");
+    assert_eq!(first.total_raw_bytes().get(), 2);
+    assert_eq!(decoder.decode_chunk(&[0xa6, 0x80]).unwrap().decoded_text(), "\\xA6\\x80");
+    assert!(decoder.finish().unwrap().is_none());
 }

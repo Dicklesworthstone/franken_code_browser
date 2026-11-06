@@ -167,6 +167,9 @@ impl CaptureEncodingMap {
     }
 
     /// Build the decoding map with explicit base offsets for chunked streaming or large offsets (> 2^32).
+    /// A BOM is a header only at original byte offset zero; an interior U+FEFF
+    /// remains source text even when it begins this window. Every domain's end
+    /// must fit in u64, otherwise construction returns `RangeOutOfBounds`.
     pub fn build_with_base_offset(
         raw_bytes: &[u8],
         encoding: DetectedEncoding,
@@ -175,6 +178,8 @@ impl CaptureEncodingMap {
         base_utf16: u64,
         base_scalar: u64,
     ) -> Result<Self, SourceError> {
+        base_raw.checked_add(u64::try_from(raw_bytes.len()).map_err(|_| SourceError::RangeOutOfBounds)?)
+            .ok_or(SourceError::RangeOutOfBounds)?;
         match encoding {
             DetectedEncoding::Utf8 { has_bom } => {
                 Self::build_utf8(raw_bytes, has_bom, base_raw, base_decoded, base_utf16, base_scalar)
@@ -208,7 +213,7 @@ impl CaptureEncodingMap {
         let mut sca_pos = base_scalar;
 
         let mut byte_idx = 0;
-        if has_bom && raw_bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        if base_raw == 0 && has_bom && raw_bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
             spans.push(MappingSpan {
                 raw_start: raw_pos,
                 raw_len: 3,
@@ -220,7 +225,7 @@ impl CaptureEncodingMap {
                 scalar_len: 0,
                 kind: SpanKind::BomHeader,
             });
-            raw_pos += 3;
+            raw_pos = raw_pos.checked_add(3).ok_or(SourceError::RangeOutOfBounds)?;
             byte_idx = 3;
         }
 
@@ -248,10 +253,10 @@ impl CaptureEncodingMap {
                     scalar_len: run_len,
                     kind: SpanKind::AsciiRun,
                 });
-                raw_pos += run_len;
-                dec_pos += run_len;
-                u16_pos += run_len;
-                sca_pos += run_len;
+                raw_pos = raw_pos.checked_add(run_len).ok_or(SourceError::RangeOutOfBounds)?;
+                dec_pos = dec_pos.checked_add(run_len).ok_or(SourceError::RangeOutOfBounds)?;
+                u16_pos = u16_pos.checked_add(run_len).ok_or(SourceError::RangeOutOfBounds)?;
+                sca_pos = sca_pos.checked_add(run_len).ok_or(SourceError::RangeOutOfBounds)?;
             } else {
                 // Determine sequence length and decode
                 let (seq_len, valid_char) = Self::decode_utf8_char(&raw_bytes[byte_idx..]);
@@ -279,10 +284,10 @@ impl CaptureEncodingMap {
                         scalar_len: 1,
                         kind,
                     });
-                    raw_pos += seq_len as u64;
-                    dec_pos += c_dec_len;
-                    u16_pos += c_u16_len;
-                    sca_pos += 1;
+                    raw_pos = raw_pos.checked_add(seq_len as u64).ok_or(SourceError::RangeOutOfBounds)?;
+                    dec_pos = dec_pos.checked_add(c_dec_len).ok_or(SourceError::RangeOutOfBounds)?;
+                    u16_pos = u16_pos.checked_add(c_u16_len).ok_or(SourceError::RangeOutOfBounds)?;
+                    sca_pos = sca_pos.checked_add(1).ok_or(SourceError::RangeOutOfBounds)?;
                     byte_idx += seq_len;
                 } else {
                     // Malformed sequence replaced with U+FFFD
@@ -298,10 +303,10 @@ impl CaptureEncodingMap {
                         scalar_len: 1,
                         kind: SpanKind::ReplacementMalformed,
                     });
-                    raw_pos += seq_len as u64;
-                    dec_pos += 3;
-                    u16_pos += 1;
-                    sca_pos += 1;
+                    raw_pos = raw_pos.checked_add(seq_len as u64).ok_or(SourceError::RangeOutOfBounds)?;
+                    dec_pos = dec_pos.checked_add(3).ok_or(SourceError::RangeOutOfBounds)?;
+                    u16_pos = u16_pos.checked_add(1).ok_or(SourceError::RangeOutOfBounds)?;
+                    sca_pos = sca_pos.checked_add(1).ok_or(SourceError::RangeOutOfBounds)?;
                     byte_idx += seq_len;
                 }
             }
@@ -393,7 +398,7 @@ impl CaptureEncodingMap {
 
         let mut byte_idx = 0;
         let bom = if is_le { [0xFF, 0xFE] } else { [0xFE, 0xFF] };
-        if raw_bytes.starts_with(&bom) {
+        if base_raw == 0 && raw_bytes.starts_with(&bom) {
             spans.push(MappingSpan {
                 raw_start: raw_pos,
                 raw_len: 2,
@@ -405,7 +410,7 @@ impl CaptureEncodingMap {
                 scalar_len: 0,
                 kind: SpanKind::BomHeader,
             });
-            raw_pos += 2;
+            raw_pos = raw_pos.checked_add(2).ok_or(SourceError::RangeOutOfBounds)?;
             byte_idx = 2;
         }
 
@@ -424,10 +429,10 @@ impl CaptureEncodingMap {
                     scalar_len: 1,
                     kind: SpanKind::ReplacementMalformed,
                 });
-                raw_pos += 1;
-                dec_pos += 3;
-                u16_pos += 1;
-                sca_pos += 1;
+                raw_pos = raw_pos.checked_add(1).ok_or(SourceError::RangeOutOfBounds)?;
+                dec_pos = dec_pos.checked_add(3).ok_or(SourceError::RangeOutOfBounds)?;
+                u16_pos = u16_pos.checked_add(1).ok_or(SourceError::RangeOutOfBounds)?;
+                sca_pos = sca_pos.checked_add(1).ok_or(SourceError::RangeOutOfBounds)?;
                 break;
             }
 
@@ -467,10 +472,10 @@ impl CaptureEncodingMap {
                     scalar_len: ascii_chars,
                     kind: SpanKind::AsciiRun,
                 });
-                raw_pos += raw_run_bytes;
-                dec_pos += ascii_chars;
-                u16_pos += ascii_chars;
-                sca_pos += ascii_chars;
+                raw_pos = raw_pos.checked_add(raw_run_bytes).ok_or(SourceError::RangeOutOfBounds)?;
+                dec_pos = dec_pos.checked_add(ascii_chars).ok_or(SourceError::RangeOutOfBounds)?;
+                u16_pos = u16_pos.checked_add(ascii_chars).ok_or(SourceError::RangeOutOfBounds)?;
+                sca_pos = sca_pos.checked_add(ascii_chars).ok_or(SourceError::RangeOutOfBounds)?;
             } else if (0xD800..=0xDBFF).contains(&u16_val) {
                 // High surrogate: check for low surrogate
                 if byte_idx + 3 < raw_bytes.len() {
@@ -500,10 +505,10 @@ impl CaptureEncodingMap {
                                 scalar_len: 1,
                                 kind: SpanKind::SurrogatePair,
                             });
-                            raw_pos += 4;
-                            dec_pos += enc.len() as u64;
-                            u16_pos += 2;
-                            sca_pos += 1;
+                            raw_pos = raw_pos.checked_add(4).ok_or(SourceError::RangeOutOfBounds)?;
+                            dec_pos = dec_pos.checked_add(enc.len() as u64).ok_or(SourceError::RangeOutOfBounds)?;
+                            u16_pos = u16_pos.checked_add(2).ok_or(SourceError::RangeOutOfBounds)?;
+                            sca_pos = sca_pos.checked_add(1).ok_or(SourceError::RangeOutOfBounds)?;
                             byte_idx += 4;
                             continue;
                         }
@@ -522,10 +527,10 @@ impl CaptureEncodingMap {
                     scalar_len: 1,
                     kind: SpanKind::ReplacementMalformed,
                 });
-                raw_pos += 2;
-                dec_pos += 3;
-                u16_pos += 1;
-                sca_pos += 1;
+                raw_pos = raw_pos.checked_add(2).ok_or(SourceError::RangeOutOfBounds)?;
+                dec_pos = dec_pos.checked_add(3).ok_or(SourceError::RangeOutOfBounds)?;
+                u16_pos = u16_pos.checked_add(1).ok_or(SourceError::RangeOutOfBounds)?;
+                sca_pos = sca_pos.checked_add(1).ok_or(SourceError::RangeOutOfBounds)?;
                 byte_idx += 2;
             } else if (0xDC00..=0xDFFF).contains(&u16_val) {
                 // Isolated low surrogate
@@ -541,10 +546,10 @@ impl CaptureEncodingMap {
                     scalar_len: 1,
                     kind: SpanKind::ReplacementMalformed,
                 });
-                raw_pos += 2;
-                dec_pos += 3;
-                u16_pos += 1;
-                sca_pos += 1;
+                raw_pos = raw_pos.checked_add(2).ok_or(SourceError::RangeOutOfBounds)?;
+                dec_pos = dec_pos.checked_add(3).ok_or(SourceError::RangeOutOfBounds)?;
+                u16_pos = u16_pos.checked_add(1).ok_or(SourceError::RangeOutOfBounds)?;
+                sca_pos = sca_pos.checked_add(1).ok_or(SourceError::RangeOutOfBounds)?;
                 byte_idx += 2;
             } else {
                 // Valid BMP character
@@ -564,10 +569,10 @@ impl CaptureEncodingMap {
                         scalar_len: 1,
                         kind: SpanKind::BmpMultiByte,
                     });
-                    raw_pos += 2;
-                    dec_pos += enc.len() as u64;
-                    u16_pos += 1;
-                    sca_pos += 1;
+                    raw_pos = raw_pos.checked_add(2).ok_or(SourceError::RangeOutOfBounds)?;
+                    dec_pos = dec_pos.checked_add(enc.len() as u64).ok_or(SourceError::RangeOutOfBounds)?;
+                    u16_pos = u16_pos.checked_add(1).ok_or(SourceError::RangeOutOfBounds)?;
+                    sca_pos = sca_pos.checked_add(1).ok_or(SourceError::RangeOutOfBounds)?;
                     byte_idx += 2;
                 } else {
                     decoded_text.push('\u{FFFD}');
@@ -582,10 +587,10 @@ impl CaptureEncodingMap {
                         scalar_len: 1,
                         kind: SpanKind::ReplacementMalformed,
                     });
-                    raw_pos += 2;
-                    dec_pos += 3;
-                    u16_pos += 1;
-                    sca_pos += 1;
+                    raw_pos = raw_pos.checked_add(2).ok_or(SourceError::RangeOutOfBounds)?;
+                    dec_pos = dec_pos.checked_add(3).ok_or(SourceError::RangeOutOfBounds)?;
+                    u16_pos = u16_pos.checked_add(1).ok_or(SourceError::RangeOutOfBounds)?;
+                    sca_pos = sca_pos.checked_add(1).ok_or(SourceError::RangeOutOfBounds)?;
                     byte_idx += 2;
                 }
             }
@@ -620,7 +625,8 @@ impl CaptureEncodingMap {
         base_scalar: u64,
     ) -> Result<Self, SourceError> {
         let mut spans = Vec::with_capacity(raw_bytes.len());
-        let mut decoded_text = String::with_capacity(raw_bytes.len() * 4);
+        let decoded_capacity = raw_bytes.len().checked_mul(4).ok_or(SourceError::PayloadTooLarge)?;
+        let mut decoded_text = String::with_capacity(decoded_capacity);
 
         let mut raw_pos = base_raw;
         let mut dec_pos = base_decoded;
@@ -640,10 +646,10 @@ impl CaptureEncodingMap {
                 scalar_len: 4,
                 kind: SpanKind::EscapedByte,
             });
-            raw_pos += 1;
-            dec_pos += 4;
-            u16_pos += 4;
-            sca_pos += 4;
+            raw_pos = raw_pos.checked_add(1).ok_or(SourceError::RangeOutOfBounds)?;
+            dec_pos = dec_pos.checked_add(4).ok_or(SourceError::RangeOutOfBounds)?;
+            u16_pos = u16_pos.checked_add(4).ok_or(SourceError::RangeOutOfBounds)?;
+            sca_pos = sca_pos.checked_add(4).ok_or(SourceError::RangeOutOfBounds)?;
         }
 
         Ok(Self {
@@ -781,7 +787,7 @@ impl CaptureEncodingMap {
             .ok_or(SourceError::RangeOutOfBounds)?;
 
         match span.kind {
-            SpanKind::BomHeader => Ok(DecodedUtf8Offset::new(0)),
+            SpanKind::BomHeader => Ok(DecodedUtf8Offset::new(span.decoded_start)),
             SpanKind::AsciiRun => {
                 let delta = val - span.raw_start;
                 if self.encoding.is_utf16() {
@@ -898,7 +904,7 @@ impl CaptureEncodingMap {
             .ok_or(SourceError::RangeOutOfBounds)?;
 
         match span.kind {
-            SpanKind::BomHeader => Ok(Utf16CodeUnitOffset::new(0)),
+            SpanKind::BomHeader => Ok(Utf16CodeUnitOffset::new(span.utf16_start)),
             SpanKind::AsciiRun => {
                 let delta = val - span.raw_start;
                 if self.encoding.is_utf16() {
@@ -989,7 +995,7 @@ impl CaptureEncodingMap {
             .ok_or(SourceError::RangeOutOfBounds)?;
 
         match span.kind {
-            SpanKind::BomHeader => Ok(ScalarIndex::new(0)),
+            SpanKind::BomHeader => Ok(ScalarIndex::new(span.scalar_start)),
             SpanKind::AsciiRun => {
                 let delta = val - span.raw_start;
                 if self.encoding.is_utf16() {
@@ -1106,10 +1112,13 @@ impl CaptureEncodingMap {
         raw_source.get(start..end).ok_or(SourceError::RangeOutOfBounds)
     }
 
-    /// Extract decoded Unicode text for standard clipboard copy.
+    /// Extract decoded Unicode text for standard clipboard copy. The range is
+    /// in this map's declared decoded domain, including its nonzero base.
     pub fn copy_unicode_text(&self, range: DecodedUtf8Range) -> Result<String, SourceError> {
-        let start = usize::try_from(range.start().get()).map_err(|_| SourceError::RangeOutOfBounds)?;
-        let end = usize::try_from(range.end().get()).map_err(|_| SourceError::RangeOutOfBounds)?;
+        let start = range.start().get().checked_sub(self.base_decoded_offset)
+            .and_then(|offset| usize::try_from(offset).ok()).ok_or(SourceError::RangeOutOfBounds)?;
+        let end = range.end().get().checked_sub(self.base_decoded_offset)
+            .and_then(|offset| usize::try_from(offset).ok()).ok_or(SourceError::RangeOutOfBounds)?;
         if start > self.decoded_text.len() || end > self.decoded_text.len() || start > end {
             return Err(SourceError::RangeOutOfBounds);
         }
@@ -1213,7 +1222,6 @@ pub struct StatefulChunkDecoder {
     encoding: DetectedEncoding,
     pending_bytes: [u8; 4],
     pending_len: usize,
-    seen_bom: bool,
     current_raw_offset: u64,
     current_decoded_offset: u64,
     current_utf16_offset: u64,
@@ -1226,7 +1234,6 @@ impl StatefulChunkDecoder {
             encoding,
             pending_bytes: [0u8; 4],
             pending_len: 0,
-            seen_bom: false,
             current_raw_offset: 0,
             current_decoded_offset: 0,
             current_utf16_offset: 0,
@@ -1237,10 +1244,11 @@ impl StatefulChunkDecoder {
     /// Feed a chunk of raw bytes, decoding complete characters and holding back partial
     /// boundary splits for the subsequent chunk.
     pub fn decode_chunk(&mut self, chunk: &[u8]) -> Result<CaptureEncodingMap, SourceError> {
-        let mut buffer = Vec::with_capacity(self.pending_len + chunk.len());
+        let capacity = self.pending_len.checked_add(chunk.len()).ok_or(SourceError::PayloadTooLarge)?;
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(capacity).map_err(|_| SourceError::PayloadTooLarge)?;
         buffer.extend_from_slice(&self.pending_bytes[..self.pending_len]);
         buffer.extend_from_slice(chunk);
-        self.pending_len = 0;
 
         if buffer.is_empty() {
             return CaptureEncodingMap::build_with_base_offset(
@@ -1253,17 +1261,27 @@ impl StatefulChunkDecoder {
             );
         }
 
-        let retain_len = if self.encoding.is_utf16() {
-            buffer.len() % 2
-        } else {
-            Self::find_trailing_utf8_split(&buffer)
+        let retain_len = match self.encoding {
+            DetectedEncoding::Utf16Le | DetectedEncoding::Utf16Be => {
+                let complete = buffer.len() - buffer.len() % 2;
+                let mut retain = buffer.len() - complete;
+                if complete >= 2 {
+                    let pair = [buffer[complete - 2], buffer[complete - 1]];
+                    let unit = if self.encoding == DetectedEncoding::Utf16Le {
+                        u16::from_le_bytes(pair)
+                    } else { u16::from_be_bytes(pair) };
+                    // A complete high-surrogate code unit is still only half
+                    // a scalar. Keep it with any next half-unit until the next
+                    // chunk or real EOF establishes whether it is malformed.
+                    if (0xD800..=0xDBFF).contains(&unit) { retain += 2; }
+                }
+                retain
+            }
+            DetectedEncoding::Utf8 { .. } => Self::find_trailing_utf8_split(&buffer),
+            DetectedEncoding::Unsupported => 0,
         };
 
         let process_len = buffer.len() - retain_len;
-        if retain_len > 0 {
-            self.pending_bytes[..retain_len].copy_from_slice(&buffer[process_len..]);
-            self.pending_len = retain_len;
-        }
 
         let map = CaptureEncodingMap::build_with_base_offset(
             &buffer[..process_len],
@@ -1274,10 +1292,11 @@ impl StatefulChunkDecoder {
             self.current_scalar_offset,
         )?;
 
-        self.current_raw_offset += map.total_raw_bytes;
-        self.current_decoded_offset += map.total_decoded_bytes;
-        self.current_utf16_offset += map.total_utf16_units;
-        self.current_scalar_offset += map.total_scalars;
+        self.advance(&map)?;
+        // Publish carry only after map construction and every domain succeeded.
+        // A failed call leaves the last accepted decoder state usable.
+        self.pending_bytes[..retain_len].copy_from_slice(&buffer[process_len..]);
+        self.pending_len = retain_len;
 
         Ok(map)
     }
@@ -1296,12 +1315,21 @@ impl StatefulChunkDecoder {
             self.current_utf16_offset,
             self.current_scalar_offset,
         )?;
-        self.current_raw_offset += map.total_raw_bytes;
-        self.current_decoded_offset += map.total_decoded_bytes;
-        self.current_utf16_offset += map.total_utf16_units;
-        self.current_scalar_offset += map.total_scalars;
+        self.advance(&map)?;
         self.pending_len = 0;
         Ok(Some(map))
+    }
+
+    fn advance(&mut self, map: &CaptureEncodingMap) -> Result<(), SourceError> {
+        let raw = self.current_raw_offset.checked_add(map.total_raw_bytes).ok_or(SourceError::RangeOutOfBounds)?;
+        let decoded = self.current_decoded_offset.checked_add(map.total_decoded_bytes).ok_or(SourceError::RangeOutOfBounds)?;
+        let utf16 = self.current_utf16_offset.checked_add(map.total_utf16_units).ok_or(SourceError::RangeOutOfBounds)?;
+        let scalar = self.current_scalar_offset.checked_add(map.total_scalars).ok_or(SourceError::RangeOutOfBounds)?;
+        self.current_raw_offset = raw;
+        self.current_decoded_offset = decoded;
+        self.current_utf16_offset = utf16;
+        self.current_scalar_offset = scalar;
+        Ok(())
     }
 
     fn find_trailing_utf8_split(bytes: &[u8]) -> usize {
@@ -1476,5 +1504,24 @@ mod tests {
             map.decoded_utf8_to_byte_offset(DecodedUtf8Offset::new(2)),
             Err(SourceError::InvalidUtf8Boundary)
         );
+    }
+
+    #[test]
+    fn failed_stream_map_keeps_prior_carry_and_all_offsets() {
+        for domain in 0..4 {
+            let mut decoder = StatefulChunkDecoder::new(DetectedEncoding::Utf8 { has_bom: false });
+            assert_eq!(decoder.decode_chunk(&[0xe2]).unwrap().total_raw_bytes().get(), 0);
+            match domain {
+                0 => decoder.current_raw_offset = u64::MAX,
+                1 => decoder.current_decoded_offset = u64::MAX,
+                2 => decoder.current_utf16_offset = u64::MAX,
+                _ => decoder.current_scalar_offset = u64::MAX,
+            }
+            let before = decoder.clone();
+            assert_eq!(decoder.decode_chunk(&[0x82, 0xac]), Err(SourceError::RangeOutOfBounds));
+            assert_eq!(decoder, before);
+            assert_eq!(decoder.finish(), Err(SourceError::RangeOutOfBounds));
+            assert_eq!(decoder, before);
+        }
     }
 }
