@@ -133,6 +133,15 @@ private struct AtlasViewportIndex {
     var retainedNativeBytes: Int { retirement.reservedBytes }
     var retainedNativeSlots: Int { retirement.reservedSlots }
 
+    /// Navigation can reveal a matching metadata atlas before any source is
+    /// resident. Tying this to tiles would prevent the first visible frame
+    /// from requesting source, and would hide empty or reader-only scopes.
+    /// This is layout availability, not proof of presented pixels or text.
+    func hasInstalledLayout(root: String, layoutRevision: UUID) -> Bool {
+        isInstalled && self.layoutRevision == layoutRevision
+            && self.root.utf8.elementsEqual(root.utf8)
+    }
+
     var summary: String {
         guard isInstalled else { return "Source previews are not prepared." }
         var result = "\(documents.count) resident source previews"

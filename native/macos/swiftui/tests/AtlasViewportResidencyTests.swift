@@ -86,8 +86,18 @@ private final class ReleaseProbe {
         // Metadata before the target exceeds the former eager 64MiB prefix.
         let files = (0..<80).map { entry(UInt64($0 + 1), "file-\($0).rs", x: Double($0) * 200, bytes: 2 * 1024 * 1024) }
         let layout = UUID()
+        precondition(!model.hasInstalledLayout(root: "/fixture", layoutRevision: layout))
         precondition(model.install(root: "/fixture", entries: files, layoutRevision: layout, accessLease: nil))
         precondition(model.isInstalled && model.documents.isEmpty && model.tiles.isEmpty)
+        precondition(model.hasInstalledLayout(root: "/fixture", layoutRevision: layout),
+            "Show atlas must be available before a first visible frame can request source")
+        precondition(!model.hasInstalledLayout(root: "/other", layoutRevision: layout)
+            && !model.hasInstalledLayout(root: "/fixture", layoutRevision: UUID()),
+            "metadata from another root or layout cannot authorize the atlas route")
+        model.suspend()
+        precondition(model.hasInstalledLayout(root: "/fixture", layoutRevision: layout)
+            && fixture.snapshot.paths.isEmpty,
+            "returning from Project Files must remain possible without eagerly capturing source")
         model.updateViewport(CGRect(x: 0, y: 0, width: 16_000, height: 120), scale: 0.01, selectedPath: nil)
         precondition(!model.isLoading && model.pendingCount == 0 && fixture.snapshot.paths.isEmpty,
             "a complete overview must not enqueue source for the entire catalog")
@@ -98,6 +108,8 @@ private final class ReleaseProbe {
         precondition(model.layoutRevision == layout && model.tiles.allSatisfy { $0.parcelRect == rect(target) })
         precondition(model.documents.count == 1 && model.residentCost.sourceBytes < 1024)
         model.close()
+        precondition(!model.hasInstalledLayout(root: "/fixture", layoutRevision: layout),
+            "closing the project withdraws the atlas navigation route")
         try await until { model.retainedNativeSlots == 0 }
     }
 
@@ -199,6 +211,9 @@ private final class ReleaseProbe {
         precondition(model.install(root: "/fixture", entries: [moved], layoutRevision: nextLayout,
             accessLease: nil, preservingCaptures: true))
         precondition(model.documents.isEmpty && model.tiles.isEmpty)
+        precondition(model.hasInstalledLayout(root: "/fixture", layoutRevision: nextLayout)
+            && !model.hasInstalledLayout(root: "/fixture", layoutRevision: firstLayout),
+            "a scope repack is navigable while source placement is cold, but old geometry is revoked")
         model.updateViewport(rect(moved), scale: 4, selectedPath: nil)
         try await ready(model, moved)
         precondition(fixture.snapshot.paths == ["/fixture/scope.rs"], "a scope repack reuses captured source and shaped rows")
@@ -207,9 +222,12 @@ private final class ReleaseProbe {
         precondition(oldFrame.map(\.rect) == oldRects && oldFrame.allSatisfy { $0.parcelRect == rect(original) })
         precondition(!model.tiles.contains { current in oldFrame.contains { $0 === current } },
             "a new placement cannot mutate an older accepted frame")
-        precondition(model.install(root: "/fixture", entries: [], layoutRevision: UUID(),
+        let emptyLayout = UUID()
+        precondition(model.install(root: "/fixture", entries: [], layoutRevision: emptyLayout,
             accessLease: nil, preservingCaptures: true))
         precondition(model.isInstalled && model.documents.isEmpty && model.tiles.isEmpty)
+        precondition(model.hasInstalledLayout(root: "/fixture", layoutRevision: emptyLayout),
+            "an explicitly empty file scope does not strand the user in Project Files")
         model.close()
         precondition(model.retainedNativeSlots > 0 && !oldFrame.isEmpty)
         oldFrame = []
@@ -219,12 +237,15 @@ private final class ReleaseProbe {
     static func refusalsRemainExplicitAndRetryable() async throws {
         let fixture = ViewportFixture(initiallyUnavailable: true), model = AtlasViewportResidency(transport: fixture.transport)
         let file = entry(1, "retry.rs")
-        precondition(model.install(root: "/fixture", entries: [file], layoutRevision: UUID(), accessLease: nil))
+        let layout = UUID()
+        precondition(model.install(root: "/fixture", entries: [file], layoutRevision: layout, accessLease: nil))
         model.updateViewport(rect(file), scale: 4, selectedPath: nil)
         try await until { model.previewStates[file.id] == .unavailable && !model.isLoading }
         model.updateViewport(rect(file), scale: 5, selectedPath: nil)
         precondition(fixture.snapshot.paths.count == 1 && model.documents.isEmpty,
             "an unavailable source does not create an empty capture or an automatic retry loop")
+        precondition(model.hasInstalledLayout(root: "/fixture", layoutRevision: layout),
+            "source refusal must not remove navigation to its metadata parcel")
         model.retryUnavailable()
         try await ready(model, file)
         precondition(fixture.snapshot.paths.count == 2)
@@ -252,6 +273,8 @@ private final class ReleaseProbe {
         precondition(model.previewStates[1] == .readerOnly && model.previewStates[2] == .readerOnly)
         precondition(model.documents.isEmpty && fixture.snapshot.paths.isEmpty,
             "canonically equivalent names cannot share one String-keyed source preview")
+        precondition(model.hasInstalledLayout(root: "/fixture", layoutRevision: layout),
+            "an entirely reader-only project still exposes its selectable metadata atlas")
         precondition(!model.install(root: "/other", entries: [composed, entry(1, "duplicate.rs")],
             layoutRevision: UUID(), accessLease: nil))
         precondition(model.root == "/fixture" && model.layoutRevision == layout,
@@ -261,6 +284,11 @@ private final class ReleaseProbe {
         precondition(model.install(root: "/fixture", entries: [raw], layoutRevision: UUID(), accessLease: nil))
         model.updateViewport(rect(raw), scale: 4, selectedPath: nil)
         precondition(model.previewStates[3] == .readerOnly && fixture.snapshot.paths.isEmpty)
+        let rawRootLayout = UUID()
+        precondition(model.install(root: "/cafe\u{301}", entries: [raw], layoutRevision: rawRootLayout, accessLease: nil))
+        precondition(model.hasInstalledLayout(root: "/cafe\u{301}", layoutRevision: rawRootLayout)
+            && !model.hasInstalledLayout(root: "/caf\u{e9}", layoutRevision: rawRootLayout),
+            "canonical-equivalent root strings are not interchangeable atlas authority")
         model.close()
     }
 

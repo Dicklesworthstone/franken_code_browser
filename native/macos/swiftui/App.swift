@@ -310,8 +310,7 @@ extension AtlasCamera {
     private var atlasDocuments: [String: AtlasDocument] { atlasResidency.documents }
     private var textTiles: [AtlasTextTile] { atlasResidency.tiles }
     private var hasMetadataAtlas: Bool {
-        atlasResidency.isInstalled && atlasResidency.layoutRevision == atlasRevision
-            && atlasResidency.root.utf8.elementsEqual(root.utf8)
+        atlasResidency.hasInstalledLayout(root: root, layoutRevision: atlasRevision)
     }
 
     private var searchContext: AtlasSearchContext {
@@ -998,7 +997,9 @@ extension AtlasCamera {
         return AtlasProjectBrowserView(model: projectBrowser, entries: visible,
             scopeLabel: fileScope == .custom ? customExtensions : fileScope.rawValue,
             preparing: projectOpening.isPreparing, canPrepare: projectOpening.canPrepare,
-            hasAtlas: !textTiles.isEmpty, progress: loadProgress,
+            // A cold atlas has no source tiles until its first visible frame
+            // requests them. Metadata must make Show text atlas available.
+            hasAtlas: hasMetadataAtlas, progress: loadProgress,
             build: requestAtlasPreviews, cancelPreviews: cancelAtlasLoad, refresh: requestAtlasLoad,
             showAtlas: { showsCatalog = false }, canKeep: readingDesk.canOperate, keep: { reader in
                 // Keep the capture without replacing the file reader's sheet.
