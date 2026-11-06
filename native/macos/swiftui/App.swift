@@ -237,6 +237,7 @@ extension AtlasCamera {
     @State private var useCapturedIndex = false
     @State private var searchMode: AtlasSearchMode = .text
     @State private var searchNameMode: AtlasSearchNameMode = .contains
+    @State private var searchCaseSensitive = true
     @State private var resolvedMatches: [SearchHit.ID: AtlasMatch] = [:]
     @State private var searchRows: [CGRect] = []
     @State private var searchPaths: Set<String> = []
@@ -319,7 +320,8 @@ extension AtlasCamera {
         AtlasSearchContext(root: root, query: query, loadGeneration: loadGeneration,
             atlasRevision: atlasRevision, scope: fileScope.rawValue, customExtensions: customExtensions,
             pathKind: searchPathKind.rawValue, path: searchPathKind == .workspace ? "" : searchPathInput,
-            mode: searchMode, nameMode: searchMode == .text ? .contains : searchNameMode)
+            mode: searchMode, nameMode: searchMode == .text ? .contains : searchNameMode,
+            caseSensitive: effectiveSearchCaseSensitive)
     }
 
     // Observe byte-distinct edits without duplicating an arbitrarily large
@@ -340,10 +342,12 @@ extension AtlasCamera {
     private var searchIsCurrent: Bool {
         !loadingProject && (searchReport?.indexStatus != nil) == wantsCapturedIndex
             && searchReport?.mode == searchMode
+            && searchReport?.caseSensitive == effectiveSearchCaseSensitive
             && searchPresentation?.isCurrent(in: searchContext) == true
     }
 
     private var wantsCapturedIndex: Bool { searchMode == .text && useCapturedIndex }
+    private var effectiveSearchCaseSensitive: Bool { searchMode != .text || searchCaseSensitive }
     private var overlayIsCurrent: Bool {
         searchIsCurrent && overlayContentRevision == atlasResidency.contentRevision
     }
@@ -496,6 +500,14 @@ extension AtlasCamera {
         .onChange(of: searchNameMode) { _, _ in
             if searchMode != .text {
                 clearSearch()
+                runSearch(debounce: true)
+            }
+        }
+        .onChange(of: searchCaseSensitive) { _, _ in
+            if searchMode == .text {
+                clearSearch()
+                // The captured source index is independent of query case.
+                // Keep it; only replace the query and its visible authority.
                 runSearch(debounce: true)
             }
         }
@@ -690,6 +702,14 @@ extension AtlasCamera {
             }
             .padding(.horizontal, 10)
             .padding(.top, 10)
+            if searchMode == .text {
+                Toggle("Match case", isOn: $searchCaseSensitive)
+                    .toggleStyle(.checkbox)
+                    .font(.caption)
+                    .disabled(loadingProject || root.isEmpty)
+                    .help("When off, compare using Unicode lowercase. Results retain the original source spelling and byte ranges.")
+                    .padding(.horizontal, 10).padding(.top, 6)
+            }
             if searchMode != .text {
                 Picker("Name matching", selection: $searchNameMode) {
                     ForEach(AtlasSearchNameMode.allCases) { mode in Text(mode.label).tag(mode) }
@@ -745,9 +765,9 @@ extension AtlasCamera {
                 let preparing = searchReport?.indexStatus?.building == true
                 let count = preparing ? UInt64(searchReport?.indexStatus?.capturedFiles ?? 0) : (searchReport?.matchesSeen ?? 0)
                 let countLabel = searchReport.map { report in
-                    (report.isWorkspaceScope ? report.mode.resultLabel
-                        : (report.pathScope.isWorkspace ? report.mode.resultLabel + " in selected types"
-                            : report.mode.resultLabel + " in selected " + report.pathScope.kind.label.lowercased()))
+                    (report.isWorkspaceScope ? report.resultLabel
+                        : (report.pathScope.isWorkspace ? report.resultLabel + " in selected types"
+                            : report.resultLabel + " in selected " + report.pathScope.kind.label.lowercased()))
                         + (report.complete ? "" : (report.isInProgress ? " · searching" : " · partial"))
                 } ?? "ready to search"
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -1547,7 +1567,8 @@ extension AtlasCamera {
         overlayContentRevision = nil
         resolvedMatches = [:]; searchRows = []; searchPaths = []; selectedMatch = nil
         guard let report = searchReport, (report.indexStatus != nil) == wantsCapturedIndex,
-              report.mode == searchMode, !loadingProject, canRebind else { return }
+              report.mode == searchMode, report.caseSensitive == effectiveSearchCaseSensitive,
+              !loadingProject, canRebind else { return }
         prepareSearchOverlay(report, context: searchContext, retainingReportID: reportID)
         selectedMatch = selectedHit.flatMap { row in
             searchPresentation?.captureCandidate(for: row, in: searchContext) == nil ? nil : resolvedMatches[row.hit]
@@ -1677,7 +1698,7 @@ extension AtlasCamera {
                 fileScope: fileScope.searchScope(custom: customExtensions),
                 pathScope: AtlasSearchPathScope(kind: searchPathKind,
                     path: searchPathKind == .workspace ? "" : searchPathInput),
-                mode: searchMode, nameMode: searchNameMode)
+                mode: searchMode, nameMode: searchNameMode, caseSensitive: effectiveSearchCaseSensitive)
             clearSearch()
             searchPending = true
             searchTitle = "Searching project"
@@ -1848,8 +1869,9 @@ extension AtlasCamera {
             guard let row = searchRow,
                   let hit = searchPresentation?.captureCandidate(for: row, in: searchContext),
                   let target = capture.target(hit), target.root.utf8.elementsEqual(root.utf8),
-                  target.path.utf8.elementsEqual(path.utf8), target.needle.utf8.elementsEqual(query.utf8),
-                  target.mode == searchMode else {
+                  target.path.utf8.elementsEqual(path.utf8),
+                  target.needle.utf8.elementsEqual((hit.actualText ?? query).utf8),
+                  target.mode == searchMode, target.caseSensitive == effectiveSearchCaseSensitive else {
                 sourceUnavailable()
                 sourceError = "The retained search capture could not authorize this match. Search again, or explicitly open the current file."
                 status = sourceError ?? "Retained match unavailable"

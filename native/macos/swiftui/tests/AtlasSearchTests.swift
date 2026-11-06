@@ -234,6 +234,30 @@ import Foundation
             unavailableFiles: 0, unsupportedFiles: 0, matchesSeen: 0, pathScope: exactFile)
         check(pathReport.summary.contains("selected file") && pathReport.summary.contains("src/core/lib.rs"),
             "A file-scoped negative describes only that file")
+        let insensitive = try AtlasSearchInput(root: "/project", query: "İ", caseSensitive: false)
+        check(!insensitive.caseSensitive && insensitive.query.utf8.elementsEqual("İ".utf8),
+            "Match Case changes matching policy without transforming query bytes")
+        check(scopedInput.caseSensitive, "Existing source requests remain case-sensitive")
+        do { try insensitive.requireLegacyScope(); preconditionFailure("Legacy transport silently discarded Match Case") }
+        catch AtlasSearchError.unsupportedMatching { checks += 1 }
+        for mode in [AtlasSearchMode.symbols, .headings] {
+            let input = try AtlasSearchInput(root: "/project", query: "x", mode: mode, caseSensitive: false)
+            check(input.caseSensitive, "Inactive text case preference cannot change structural name semantics")
+        }
+        check(AtlasSearchText.accepts(actualText: nil, needle: "x", caseSensitive: true),
+            "Legacy exact hits do not need an additive source-spelling field")
+        check(!AtlasSearchText.accepts(actualText: nil, needle: "x", caseSensitive: false),
+            "Insensitive hits require actual source spelling")
+        for invalid in ["", "x\0y", String(repeating: "x", count: 4097)] {
+            check(!AtlasSearchText.accepts(actualText: invalid, needle: "x", caseSensitive: false),
+                "Source-spelling metadata is bounded before retained Find admission")
+        }
+        check(AtlasSearchText.validActualText(String(repeating: "x", count: 4096)), "Maximum source spelling is admitted")
+        check(!AtlasSearchText.sameActualText("é", "e\u{301}"), "Source-spelling identity compares encoded bytes")
+        var wrongCase = envelope(); wrongCase["case_sensitive"] = false; rejects(wrongCase)
+        var trueCase = envelope(); trueCase["case_sensitive"] = true
+        let explicitSensitive = try decode(trueCase)
+        check(explicitSensitive.caseSensitive, "Explicit sensitive metadata preserves the legacy decoder contract")
         print("AtlasSearch: \(checks) coverage, path and offset checks passed")
     }
 }

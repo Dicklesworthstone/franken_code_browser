@@ -15,8 +15,9 @@ private final class Calls: @unchecked Sendable {
     }
     private static func selected(path: String = "src.rs", root: String = "/repo", needle: String = "x",
                                  start: UInt64 = 10, end: UInt64 = 12, bytes: UInt64 = 20,
-                                 mode: AtlasSearchMode = .text) -> AtlasSearchCapturedHit {
-        .init(root: root, path: path, needle: needle, start: start, end: end, capturedBytes: bytes, openReader: { _ in "captured-info" }, mode: mode)
+                                 mode: AtlasSearchMode = .text, caseSensitive: Bool = true) -> AtlasSearchCapturedHit {
+        .init(root: root, path: path, needle: needle, start: start, end: end, capturedBytes: bytes,
+            openReader: { _ in "captured-info" }, mode: mode, caseSensitive: caseSensitive)
     }
     private static func identity(owner: UInt64 = 100, revision: UInt64 = 1, bytes: UInt64 = 20,
                                  path: String = "src.rs", encoding: String = "utf16le") -> AtlasReaderIdentity {
@@ -151,6 +152,24 @@ private final class Calls: @unchecked Sendable {
                 find: { _ in report(identity: source, needle: needle, ranges: [(start, end)], hex: hex) },
                 read: { $0.originalHex })
             check(value.page == hex, "Decoder-owned witness preserved for " + encoding)
+        }
+        for (encoding, query, actualText, hex, count) in [
+            ("utf8", "foo", "FOO", "464f4f", UInt64(3)),
+            ("utf8", "k", "K", "e284aa", 3),
+            ("utf8", "i\u{307}", "İ", "c4b0", 2),
+            ("utf16le", "i\u{307}", "İ", "3001", 2),
+            ("utf16be", "i\u{307}", "İ", "0130", 2)
+        ] {
+            let source = identity(encoding: encoding)
+            let request = selected(needle: actualText, start: 2, end: 2 + count, caseSensitive: false)
+            let value = try await AtlasCapturedReader.activate(request, identity: source,
+                find: { exact in
+                    check(exact.utf8.elementsEqual(actualText.utf8) && !exact.utf8.elementsEqual(query.utf8),
+                        "Insensitive activation performs exact Find using the engine's source spelling")
+                    return report(identity: source, needle: actualText, ranges: [(2, 2 + count)], hex: hex)
+                }, read: { $0 })
+            check(value.page.start == 2 && value.page.end == 2 + count && value.page.originalHex == hex,
+                "Insensitive activation preserves original-byte evidence for " + encoding)
         }
         await refused(identity: identity(bytes: 21))
         await refused(identity: identity(path: "other.rs"))

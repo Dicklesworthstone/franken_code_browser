@@ -129,8 +129,34 @@ private final class Transport: @unchecked Sendable {
         var noHits = findPacket(needle: "absent"); noHits["state"] = "unsupported-text"; noHits["search_complete"] = false; noHits["unsupported_at"] = "0"
         let unsupported = try AtlasReaderFindReport.decode(json(noHits), info: info, generation: 1, needle: "absent")
         check(!unsupported.complete && unsupported.hits.isEmpty, "unsupported source became exhaustive no-match")
-        for invalid in ["", "a\0b", String(repeating: "a", count: 1025)] {
+        for invalid in ["", "a\0b", String(repeating: "a", count: 4097)] {
             rejects("invalid find input") { try AtlasReaderFindReport.validateNeedle(invalid) }
+        }
+        let wideNeedle = String(repeating: "K", count: 4096)
+        let wideHex = String(repeating: "4b00", count: 4096)
+        var wideInfoPacket = header("info"); wideInfoPacket["captured_bytes"] = "8194"
+        let wideInfo = try AtlasReaderInfo.decode(json(wideInfoPacket), handle: 7, path: "/project/unicode")
+        var wideFind = findPacket(needle: wideNeedle)
+        wideFind["captured_bytes"] = "8194"; wideFind["scanned_bytes"] = "8194"
+        wideFind["matches_seen"] = "1"; wideFind["retained_hits"] = "1"
+        wideFind["literal_original_hex"] = wideHex
+        wideFind["hits"] = [["hit_index": "0", "occurrence_id": "1", "original_range": ["start": "2", "end": "8194"]]]
+        let wideReport = try AtlasReaderFindReport.decode(json(wideFind), info: wideInfo, generation: 1, needle: wideNeedle)
+        let wideTarget = wideReport.target(at: 0)!
+        try AtlasReaderRequest.hit(wideTarget).validate(capturedBytes: 8194)
+        var widePagePacket = pagePacket()
+        widePagePacket["command"] = "hit"; widePagePacket["captured_bytes"] = "8194"
+        widePagePacket["requested_original_range"] = ["start": "0", "end": "8194"]
+        widePagePacket["visible_range"] = ["start": "0", "end": "8194"]
+        widePagePacket["text"] = wideNeedle; widePagePacket["original_hex"] = "fffe" + wideHex
+        widePagePacket["selection"] = ["query_generation": "1", "original_range": ["start": "2", "end": "8194"],
+            "window_utf8_range": ["start": "0", "end": "4096"], "original_hex": wideHex]
+        let widePage = try AtlasReaderPage.decode(json(widePagePacket), info: wideInfo, request: .hit(wideTarget))
+        check(widePage.selection?.target.originalHex == wideHex && widePage.selection?.utf8End == 4096,
+            "Expanded source spelling fits exact Find, original UTF-16 selection and copy at the maximum witness bound")
+        widePagePacket["text"] = String(repeating: "k", count: 4096)
+        rejects("case-changed reader spelling borrowed an original witness") {
+            _ = try AtlasReaderPage.decode(json(widePagePacket), info: wideInfo, request: .hit(wideTarget))
         }
         var unicode = findPacket(needle: "é")
         unicode["needle"] = "e\u{301}"

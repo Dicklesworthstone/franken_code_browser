@@ -6,12 +6,15 @@ import Foundation
 enum AtlasIndexedSource {
     typealias Import = @Sendable (UInt64, UInt64, UInt64, UInt64, UInt64) throws -> String?
     static func capture(owner: AtlasSearchCaptureOwner, basis: AtlasIndexedBasis, root: String,
-                        needle: String, hits: [AtlasIndexedHit], importReader: @escaping Import) -> AtlasSearchCapture {
+                        needle: String, hits: [AtlasIndexedHit], caseSensitive: Bool = true,
+                        importReader: @escaping Import) -> AtlasSearchCapture {
         AtlasSearchCapture(retainAccess: { owner.retainAccess($0) }, target: { candidate in
             guard hits.indices.contains(candidate.id), hits[candidate.id].matches(candidate),
+                  AtlasSearchText.accepts(actualText: candidate.actualText, needle: needle,
+                    caseSensitive: caseSensitive),
                   let path = candidate.sourcePath, let bytes = candidate.captureByteLength else { return nil }
             let row = hits[candidate.id]
-            return AtlasSearchCapturedHit(root: root, path: path, needle: needle,
+            return AtlasSearchCapturedHit(root: root, path: path, needle: candidate.actualText ?? needle,
                 start: candidate.start, end: candidate.end, capturedBytes: bytes, openReader: { reader in
                     guard reader > 0, reader != basis.owner else { throw AtlasSearchError.invalidRequest }
                     return try owner.call { handle in
@@ -19,7 +22,7 @@ enum AtlasIndexedSource {
                         let json = try importReader(handle, reader, basis.index, row.file, row.revision)
                         return try validate(json, reader: reader, basis: basis, row: row)
                     }
-                })
+                }, caseSensitive: caseSensitive)
         })
     }
     static func validate(_ json: String?, reader: UInt64, basis: AtlasIndexedBasis, row: AtlasIndexedHit) throws -> String {

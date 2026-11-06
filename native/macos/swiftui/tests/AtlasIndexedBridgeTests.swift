@@ -30,6 +30,12 @@ import Foundation
         check(try t.pathScopedQueryBegin!(h, 48, 1, "exact text", AtlasSearchFileScope(extensions: ["rs"]),
             AtlasSearchPathScope(kind: .file, path: "src/exact.rs")) != nil)
         check(live() == 0 && calls() == 12)
+        check(try t.matchingQueryBegin!(h, 49, 1, "exact text", .all, .workspace, false) != nil)
+        check(try t.matchingQueryBegin!(h, 50, 1, "exact text", AtlasSearchFileScope(extensions: ["rs"]),
+            AtlasSearchPathScope(kind: .file, path: "src/exact.rs"), false) != nil)
+        check(try t.matchingQueryBegin!(h, 51, 1, "exact text", .all,
+            AtlasSearchPathScope(kind: .directory, path: "src"), true) != nil)
+        check(live() == 0 && calls() == 15)
         mode(1); check(try t.indexBegin(h, 1) == nil && live() == 0)
         for bad: Int32 in [2, 3] {
             mode(bad)

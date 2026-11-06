@@ -10,8 +10,9 @@ import Dispatch
     }
     @MainActor private static func run(_ worker: AtlasIndexedSearch, query: String = "x", root: String = "/repo",
                                       access: AnyObject? = nil, flag: AtlasSearchCancellation = AtlasSearchCancellation(),
-                                      reports: IndexReports = IndexReports()) throws -> AtlasSearchReport {
-        try worker.run(root: root, query: query, cancellation: flag, access: AtlasSearchAccessLease(access), progress: reports.offer)
+                                      reports: IndexReports = IndexReports(), caseSensitive: Bool = true) throws -> AtlasSearchReport {
+        try worker.runScoped(input: AtlasSearchInput(root: root, query: query, caseSensitive: caseSensitive),
+            cancellation: flag, access: AtlasSearchAccessLease(access), progress: reports.offer)
     }
     @MainActor private static func scoped(_ worker: AtlasIndexedSearch, scope: AtlasSearchFileScope,
                                          pathScope: AtlasSearchPathScope = .workspace,
@@ -80,6 +81,87 @@ import Dispatch
             let r = try run(w)
             check(r.complete && r.hits.count == 2, "Uncovered gram segments retain fallback matches")
             check(r.indexStatus?.verifiedFiles == 1, "Fallback verification is recorded")
+        }
+        do {
+            let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport), progress = IndexReports()
+            f.configure { $0.insensitiveText = "İ"; $0.insensitiveRangeBytes = 2; $0.encoding = "utf16le" }
+            let first = try run(w, query: "i\u{307}", reports: progress, caseSensitive: false)
+            check(!first.caseSensitive && first.complete && first.hits[0].actualText == "İ"
+                && first.hits[0].end == 2, "Insensitive indexed result retains source spelling and original UTF-16 range")
+            check(progress.values.contains { $0.indexStatus?.building == true }
+                && progress.values.allSatisfy { !$0.caseSensitive },
+                "Index preparation and query progress carry the same frozen case semantics")
+            check(first.indexStatus?.skippedFiles == 0 && first.indexStatus?.verifiedFiles == 2,
+                "Insensitive fallback verification counters do not imply case-sensitive index exclusions")
+            let target = first.capture!.target(first.hits[0])!
+            check(target.needle.utf8.elementsEqual("İ".utf8) && !target.caseSensitive,
+                "Captured-index reader receives the actual spelling as an exact query")
+            _ = try run(w, query: "i\u{307}")
+            let again = try run(w, query: "i\u{307}", caseSensitive: false)
+            check(again.indexStatus?.reused == true && again.streamID != first.streamID,
+                "Toggling Match Case keeps sources and replaces only query identity")
+            check(f.count("create:") == 1 && f.count("build-begin:") == 1 && f.count("build-step:") == 2
+                && f.count("query-case:false") == 2 && f.count("query-case:true") == 1,
+                "Changing case never recaptures or rebuilds the index")
+            _ = try target.openReader(100)
+            check(f.count("source:") == 1 && f.count("open:") == 1,
+                "Original insensitive target remains importable after replacement queries without live I/O")
+            var forged = first.hits[0]; forged.actualText = "i\u{307}"
+            check(first.capture?.target(forged) == nil, "A substituted matched spelling cannot borrow the indexed range")
+        }
+        do {
+            let f = IndexedFixture(); var transport = f.transport; transport.matchingQueryBegin = nil
+            let w = AtlasIndexedSearch(transport: transport)
+            do { _ = try run(w, caseSensitive: false); preconditionFailure("Legacy transport ignored Match Case") }
+            catch AtlasSearchError.unsupportedMatching { checks += 1 }
+            check(f.count("create:") == 0, "Unsupported matching is refused before index allocation or source reads")
+        }
+        do {
+            let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport)
+            let types = try AtlasSearchFileScope(extensions: ["rs"])
+            let location = try AtlasSearchPathScope(kind: .directory, path: "src")
+            f.configure { $0.pathHex = "7372632f612e7273"; $0.scopedEligible = 1; $0.scopedCaptured = 1 }
+            let result = try w.runScoped(input: AtlasSearchInput(root: "/repo", query: "x", fileScope: types,
+                pathScope: location, caseSensitive: false), cancellation: AtlasSearchCancellation(),
+                access: AtlasSearchAccessLease(nil), progress: { _ in })
+            check(!result.caseSensitive && result.fileScope == types && result.pathScope == location
+                && result.excludedFiles == 1 && result.hits[0].sourcePath == "src/a.rs",
+                "Insensitive indexed queries preserve combined type and path predicates")
+        }
+        for defect in ["case", "missing-case", "mode", "missing-text", "empty-text", "nul-text", "oversized-text"] {
+            let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport)
+            f.patch { phase, original in
+                var value = original
+                guard phase == "query-step" else { return value }
+                if defect == "case" { value["case_sensitive"] = true }
+                else if defect == "missing-case" { value.removeValue(forKey: "case_sensitive") }
+                else if defect == "mode" { value["mode"] = "exact-decoded-literal" }
+                else {
+                    var rows = value["hits"] as! [[String: Any]]
+                    if defect == "missing-text" { rows[0].removeValue(forKey: "matched_text") }
+                    if defect == "empty-text" { rows[0]["matched_text"] = "" }
+                    if defect == "nul-text" { rows[0]["matched_text"] = "x\0y" }
+                    if defect == "oversized-text" { rows[0]["matched_text"] = String(repeating: "X", count: 4097) }
+                    value["hits"] = rows
+                }
+                return value
+            }
+            do { _ = try run(w, caseSensitive: false); preconditionFailure("Invalid indexed matching receipt: " + defect) }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        do {
+            let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport)
+            f.configure { $0.insensitiveText = "é"; $0.insensitiveRangeBytes = 2 }
+            f.patch { phase, original in
+                var value = original
+                if phase == "query-step", value["step_count"] as? String == "2" {
+                    var rows = value["hits"] as! [[String: Any]]
+                    rows[0]["matched_text"] = "e\u{301}"; value["hits"] = rows
+                }
+                return value
+            }
+            do { _ = try run(w, query: "é", caseSensitive: false); preconditionFailure("Repeated indexed witness changed spelling") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
         }
         for mode in 0..<3 {
             let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport)

@@ -35,6 +35,7 @@ struct AtlasIndexWire: Decodable {
         try fields.decodeIfPresent(String.self, forKey: Key(key)).map(Self.integer)
     }
     func optionalText(_ key: String) throws -> String? { try fields.decodeIfPresent(String.self, forKey: Key(key)) }
+    func optionalFlag(_ key: String) throws -> Bool? { try fields.decodeIfPresent(Bool.self, forKey: Key(key)) }
     func object(_ key: String) throws -> Self { try fields.decode(Self.self, forKey: Key(key)) }
     func absent(_ keys: [String]) throws -> Bool {
         for key in keys where fields.contains(Key(key)) {
@@ -88,6 +89,7 @@ struct AtlasIndexedHit: Decodable, Sendable, Equatable {
         let start = try range.number("start"), end = try range.number("end")
         let bytes = try wire.number("capture_byte_length"), digest = try wire.text("capture_sha256")
         let display = try path.text("display")
+        let actualText = try wire.optionalText("matched_text")
         pathHex = try path.text("hex")
         guard ordinal > 0, ordinal <= 1000, file > 0, revision > 0, start < end, end <= bytes,
               bytes <= 1024 * 1024, digest.utf8.count == 64,
@@ -96,6 +98,7 @@ struct AtlasIndexedHit: Decodable, Sendable, Equatable {
               !pathHex.isEmpty, pathHex.utf8.count <= 32_768, pathHex.utf8.count.isMultiple(of: 2) else {
             throw AtlasIndexWire.invalid()
         }
+        if let actualText, !AtlasSearchText.validActualText(actualText) { throw AtlasIndexWire.invalid() }
         let hex = Array(pathHex.utf8)
         func nibble(_ b: UInt8) throws -> UInt8 {
             switch b { case 48...57: return b - 48; case 97...102: return b - 87; default: throw AtlasIndexWire.invalid() }
@@ -108,18 +111,20 @@ struct AtlasIndexedHit: Decodable, Sendable, Equatable {
               }) else { throw AtlasIndexWire.invalid() }
         rawPathBytes = raw
         hit = SearchHit(id: Int(ordinal - 1), path: display, sourcePath: String(bytes: raw, encoding: .utf8),
-            start: start, end: end, captureSHA256: digest, captureByteLength: bytes)
+            start: start, end: end, captureSHA256: digest, captureByteLength: bytes, actualText: actualText)
     }
     static func == (a: Self, b: Self) -> Bool {
         a.file == b.file && a.revision == b.revision && a.pathHex == b.pathHex && a.hit.id == b.hit.id
             && a.hit.start == b.hit.start && a.hit.end == b.hit.end
             && a.hit.captureSHA256 == b.hit.captureSHA256 && a.hit.captureByteLength == b.hit.captureByteLength
             && a.hit.path.utf8.elementsEqual(b.hit.path.utf8)
+            && AtlasSearchText.sameActualText(a.hit.actualText, b.hit.actualText)
     }
     func matches(_ other: SearchHit) -> Bool {
         hit.id == other.id && hit.start == other.start && hit.end == other.end
             && hit.captureSHA256 == other.captureSHA256 && hit.captureByteLength == other.captureByteLength
             && hit.sourcePath?.utf8.elementsEqual(other.sourcePath?.utf8 ?? "".utf8) == true
+            && AtlasSearchText.sameActualText(hit.actualText, other.actualText)
     }
 }
 
@@ -136,7 +141,8 @@ struct AtlasIndexedQueryPage {
     let next: UInt64?
 
     init(_ json: String?, basis: AtlasIndexedBasis, generation: UInt64, needle: String,
-         scope: AtlasSearchFileScope = .all, pathScope: AtlasSearchPathScope = .workspace, command: String) throws {
+         scope: AtlasSearchFileScope = .all, pathScope: AtlasSearchPathScope = .workspace,
+         caseSensitive: Bool = true, command: String) throws {
         let w = try AtlasIndexWire.decode(json)
         try basis.validate(w, command: command)
         let kind = try w.optionalText("search_scope")
@@ -169,7 +175,9 @@ struct AtlasIndexedQueryPage {
         let truncated = try w.flag("truncated"), stop = try w.optionalText("stop_reason")
         guard try w.number("query_generation") == generation, generation > basis.index,
               try w.text("needle").utf8.elementsEqual(needle.utf8),
-              try w.text("mode") == "exact-decoded-literal", try w.text("search_strategy") == "retained-ephemeral-index",
+              try w.text("mode") == AtlasSearchText.wireMode(caseSensitive: caseSensitive),
+              try (w.optionalFlag("case_sensitive") ?? true) == caseSensitive,
+              try w.text("search_strategy") == "retained-ephemeral-index",
               try w.flag("discovery_complete") == basis.discoveryComplete,
               try w.number("catalogued_files") == UInt64(basis.files),
               try w.number("displayed_hits") == UInt64(retained), try w.number("verified_files") == UInt64(scanned),
@@ -188,7 +196,8 @@ struct AtlasIndexedQueryPage {
                   matches == UInt64(retained) else { throw AtlasIndexWire.invalid() }
         }
         hits = try w.rows("hits", limit: command == "page" ? 128 : 64)
-        guard hits.allSatisfy({ scope.admitsRawPath($0.rawPathBytes) && pathScope.admitsRawPath($0.rawPathBytes) }) else {
+        guard hits.allSatisfy({ scope.admitsRawPath($0.rawPathBytes) && pathScope.admitsRawPath($0.rawPathBytes)
+            && AtlasSearchText.accepts(actualText: $0.hit.actualText, needle: needle, caseSensitive: caseSensitive) }) else {
             throw AtlasIndexWire.invalid()
         }
         next = try w.optionalNumber("next_offset")
@@ -241,7 +250,8 @@ struct AtlasIndexedAccumulator {
                           previous.hit.captureByteLength == row.hit.captureByteLength else { throw AtlasIndexWire.invalid() }
                 }
                 let charge = row.pathHex.utf8.count + row.rawPathBytes.count
-                    + 2 * row.hit.path.utf8.count + (row.hit.sourcePath?.utf8.count ?? 0) + 512
+                    + 2 * row.hit.path.utf8.count + (row.hit.sourcePath?.utf8.count ?? 0)
+                    + 2 * (row.hit.actualText?.utf8.count ?? 0) + 512
                 guard charge <= 8 * 1024 * 1024 - textBytes else { throw AtlasIndexWire.invalid() }
                 textBytes += charge; byFile[row.file] = row; hits.append(row)
             }

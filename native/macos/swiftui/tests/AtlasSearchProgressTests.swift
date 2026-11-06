@@ -25,10 +25,12 @@ private final class Lease {}
         let deadline = Date().addingTimeInterval(0.03)
         while Date() < deadline { _ = RunLoop.current.run(mode: .default, before: deadline) }
     }
-    private static func report(_ count: UInt64 = 0, running: Bool = false, id: UUID? = nil) -> AtlasSearchReport {
+    private static func report(_ count: UInt64 = 0, running: Bool = false, id: UUID? = nil,
+                               caseSensitive: Bool = true) -> AtlasSearchReport {
         AtlasSearchReport(hits: [], complete: !running, truncated: false, unavailableFiles: 0,
             unsupportedFiles: 0, matchesSeen: count,
-            progress: AtlasSearchProgress(isRunning: running, examinedFiles: Int(count), cataloguedFiles: 4096), streamID: id)
+            progress: AtlasSearchProgress(isRunning: running, examinedFiles: Int(count), cataloguedFiles: 4096),
+            streamID: id, caseSensitive: caseSensitive)
     }
 
     @MainActor static func main() throws {
@@ -153,6 +155,41 @@ private final class Lease {}
         }
         do {
             let gate = Gates()
+            var successes = 0, rejected = false
+            let coordinator = AtlasSearchCoordinator(scopedWork: { input, _, _, publish in
+                precondition(!input.caseSensitive)
+                publish(report(running: true)); gate.offered.signal(); gate.finish.wait()
+                return report()
+            })
+            try coordinator.submit(input: AtlasSearchInput(root: "/project", query: "same", caseSensitive: false)) { result in
+                if case .success = result { successes += 1 }
+                if case .failure(.invalidResponse) = result { rejected = true }
+            }
+            check(gate.offered.wait(timeout: .now() + 5) == .success, "Wrong-mode progress offered")
+            settle(); check(successes == 0, "Progress with foreign case semantics is suppressed")
+            gate.finish.signal(); pump { rejected }
+            check(successes == 0, "A wrong-case terminal result cannot claim success")
+        }
+        do {
+            let gate = Gates()
+            var oldDeliveries = 0, latest: AtlasSearchReport?
+            let coordinator = AtlasSearchCoordinator(scopedWork: { input, _, _, publish in
+                if input.caseSensitive {
+                    publish(report(running: true)); gate.offered.signal(); gate.finish.wait()
+                }
+                return report(caseSensitive: input.caseSensitive)
+            })
+            try coordinator.submit(input: AtlasSearchInput(root: "/project", query: "same")) { _ in oldDeliveries += 1 }
+            check(gate.offered.wait(timeout: .now() + 5) == .success, "Sensitive query is in flight")
+            try coordinator.submit(input: AtlasSearchInput(root: "/project", query: "same", caseSensitive: false)) { result in
+                if case .success(let value) = result { latest = value }
+            }
+            gate.finish.signal(); pump { latest != nil }
+            check(oldDeliveries == 0 && latest?.caseSensitive == false,
+                "Match Case toggle cancels old progress and completion even when query bytes are unchanged")
+        }
+        do {
+            let gate = Gates()
             var lease: Lease? = Lease()
             weak var weakLease = lease
             var finished = false
@@ -214,6 +251,10 @@ private final class Lease {}
             let replacement = AtlasSearchPresentation(context: context, hits: [hit], verifiedHitIDs: [])
             check(replacement.captureCandidate(for: first.rowID(for: 0), in: context) == nil,
                   "Same query text in a new stream does not inherit old row authority")
+            var changedCase = context; changedCase.caseSensitive = false
+            check(!first.isCurrent(in: changedCase)
+                && first.captureCandidate(for: first.rowID(for: 0), in: changedCase) == nil,
+                "A changed Match Case setting invalidates rows before asynchronous replacement arrives")
         }
         print("AtlasSearchProgressTests: \(checks) checks passed")
     }

@@ -94,6 +94,28 @@ private final class Access: @unchecked Sendable {
             _ = try AtlasSearchCaptureOwner(handle: 0, close: { _ in true }, retirementFailed: {})
             preconditionFailure("Zero handle admitted")
         } catch AtlasSearchError.unavailable { checks += 1 }
+        do {
+            let spellingOwner = try AtlasSearchCaptureOwner(handle: 42, close: { _ in true }, retirementFailed: {})
+            var spellingHit = hit; spellingHit.actualText = "é"
+            let spellingWitness = AtlasSearchCaptureWitness(hit: spellingHit, file: 6, revision: 7, pathHex: witness.pathHex)
+            let spellingCapture = AtlasSearchCaptureFactory.make(owner: spellingOwner, identity: identity,
+                root: "/repo", needle: "É", witnesses: [spellingWitness], caseSensitive: false,
+                importReader: { _, _, _, _ in valid })
+            let exact = spellingCapture.target(spellingHit)
+            check(exact?.needle.utf8.elementsEqual("é".utf8) == true && exact?.caseSensitive == false,
+                "Insensitive capture authorizes an exact query of the matched source spelling")
+            var aliased = spellingHit; aliased.actualText = "e\u{301}"
+            check(spellingCapture.target(aliased) == nil,
+                "Canonical-equivalent source spelling cannot borrow the original occurrence witness")
+            let missing = AtlasSearchCaptureFactory.make(owner: spellingOwner, identity: identity,
+                root: "/repo", needle: "x", witnesses: [witness], caseSensitive: false,
+                importReader: { _, _, _, _ in valid })
+            check(missing.target(hit) == nil, "Insensitive capture without actual source spelling cannot activate")
+            let wrongExact = AtlasSearchCaptureFactory.make(owner: spellingOwner, identity: identity,
+                root: "/repo", needle: "É", witnesses: [spellingWitness],
+                importReader: { _, _, _, _ in valid })
+            check(wrongExact.target(spellingHit) == nil, "Sensitive capture cannot substitute different query spelling")
+        }
         let counts = Counts()
         var owner: AtlasSearchCaptureOwner? = try AtlasSearchCaptureOwner(handle: 42, close: { handle in
             precondition(handle == 42)

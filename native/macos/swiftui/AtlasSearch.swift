@@ -10,8 +10,35 @@ struct SearchHit: Identifiable, Hashable, Sendable {
     let captureSHA256: String?
     let captureByteLength: UInt64?
     var structure: AtlasSearchStructure? = nil
+    /// Engine-supplied source spelling. This authorizes an exact retained-file
+    /// Find after a case-insensitive workspace query; it is never normalized.
+    var actualText: String? = nil
     var fileName: String { (path as NSString).lastPathComponent }
     var folder: String { (path as NSString).deletingLastPathComponent }
+}
+
+/// Search boundary checks only. Matching and Unicode lowercase policy remain
+/// in Rust; native code retains the spelling and coordinates that Rust proved.
+enum AtlasSearchText {
+    static let maximumActualTextBytes = 4096
+    static func wireMode(caseSensitive: Bool) -> String {
+        caseSensitive ? "exact-decoded-literal" : "unicode-lowercase-literal"
+    }
+    static func validActualText(_ text: String) -> Bool {
+        !text.isEmpty && text.utf8.count <= maximumActualTextBytes && !text.utf8.contains(0)
+    }
+    static func accepts(actualText: String?, needle: String, caseSensitive: Bool) -> Bool {
+        guard let actualText else { return caseSensitive } // Legacy exact envelopes.
+        return validActualText(actualText)
+            && (!caseSensitive || actualText.utf8.elementsEqual(needle.utf8))
+    }
+    static func sameActualText(_ lhs: String?, _ rhs: String?) -> Bool {
+        switch (lhs, rhs) {
+        case (.none, .none): return true
+        case (.some(let a), .some(let b)): return a.utf8.elementsEqual(b.utf8)
+        default: return false
+        }
+    }
 }
 
 /// These are distinct engine requests. Symbols are qualified heuristic
@@ -42,7 +69,7 @@ enum AtlasSearchMode: String, CaseIterable, Identifiable, Sendable {
         }
     }
     var placeholder: String {
-        switch self { case .text: return "Exact text in project…"; case .symbols: return "Declaration name…"; case .headings: return "Markdown heading…" }
+        switch self { case .text: return "Text in project…"; case .symbols: return "Declaration name…"; case .headings: return "Markdown heading…" }
     }
 }
 
@@ -84,7 +111,7 @@ struct AtlasSearchStructureCoverage: Equatable, Sendable {
 }
 
 enum AtlasSearchError: Error, Sendable {
-    case unavailable, invalidResponse, canceled, invalidRequest, invalidScope, invalidPathScope, identityExhausted
+    case unavailable, invalidResponse, canceled, invalidRequest, invalidScope, invalidPathScope, identityExhausted, unsupportedMatching
     var message: String {
         switch self {
         case .canceled: return "Search canceled. In-flight reads may finish, but their results will not be shown."
@@ -92,6 +119,7 @@ enum AtlasSearchError: Error, Sendable {
         case .invalidScope: return "Choose up to 32 file extensions using letters, digits, +, - or _. Separate extensions with commas or spaces."
         case .invalidPathScope: return "Enter a project-relative file or folder path of 1–4096 UTF-8 bytes. Do not use leading/trailing slashes, empty components, or '.'/'..' components."
         case .identityExhausted: return "This search session exhausted its request identities. Reopen the window before searching again."
+        case .unsupportedMatching: return "This search connection does not support case-insensitive text. Turn on Match case to search."
         case .unavailable: return "Search unavailable. The project could not be read or the search exceeded its limits."
         case .invalidResponse: return "Search response could not be read. Results are unavailable, not an empty match set."
         }
@@ -125,8 +153,10 @@ struct AtlasSearchReport: Sendable {
     var mode: AtlasSearchMode = .text
     var nameMode: AtlasSearchNameMode = .contains
     var structureCoverage: AtlasSearchStructureCoverage? = nil
+    var caseSensitive: Bool = true
     var isInProgress: Bool { progress?.isRunning == true }
     var isWorkspaceScope: Bool { fileScope.isAll && pathScope.isWorkspace }
+    var resultLabel: String { mode == .text && !caseSensitive ? "case-insensitive matches" : mode.resultLabel }
 
     var summary: String {
         if indexStatus?.building == true, let progress {
@@ -140,12 +170,15 @@ struct AtlasSearchReport: Sendable {
         let count = hits.count
         let noun: String
         switch mode {
-        case .text: noun = count == 1 ? "exact match" : "exact matches"
+        case .text:
+            noun = caseSensitive ? (count == 1 ? "exact match" : "exact matches")
+                : (count == 1 ? "case-insensitive match" : "case-insensitive matches")
         case .symbols: noun = count == 1 ? "symbol candidate" : "symbol candidates"
         case .headings: noun = count == 1 ? "heading" : "headings"
         }
         let qualification = mode == .symbols
-            ? " Heuristic declaration candidates; compiler resolution and reference completeness are not claimed." : ""
+            ? " Heuristic declaration candidates; compiler resolution and reference completeness are not claimed."
+            : (mode == .text && !caseSensitive ? " Compared using Unicode lowercase; source spelling is preserved." : "")
         if let progress, progress.isRunning {
             let membership = isWorkspaceScope ? "catalogued" : "eligible"
             return "Searching: \(count) \(noun) found; \(progress.examinedFiles) of \(progress.cataloguedFiles) \(membership) files examined. Results are provisional." + qualification
@@ -177,6 +210,7 @@ struct AtlasSearchReport: Sendable {
             let wire = try JSONDecoder().decode(Wire.self, from: data)
             guard wire.schema == "fcb.cli/1", wire.status == "ok", wire.command == "search",
                   wire.scope == "workspace", wire.mode == "decoded-text-literal",
+                  wire.case_sensitive != false,
                   let matches = integer(wire.matches_seen) else { throw AtlasSearchError.invalidResponse }
             let hits = try wire.hits.enumerated().map { index, hit in
                 guard let start = integer(hit.original_range.start),
@@ -231,6 +265,7 @@ struct AtlasSearchReport: Sendable {
 
     private struct Wire: Decodable {
         let schema, status, command, scope, mode: String
+        let case_sensitive: Bool?
         let workspace_complete, discovery_complete, truncated: Bool
         let matches_seen: String
         let hits: [Hit]
@@ -256,11 +291,13 @@ struct AtlasSearchInput: Sendable {
     let pathScope: AtlasSearchPathScope
     let mode: AtlasSearchMode
     let nameMode: AtlasSearchNameMode
+    let caseSensitive: Bool
     var isWorkspaceScope: Bool { fileScope.isAll && pathScope.isWorkspace }
 
     init(root: String, query: String, fileScope: AtlasSearchFileScope = .all,
          pathScope: AtlasSearchPathScope = .workspace,
-         mode: AtlasSearchMode = .text, nameMode: AtlasSearchNameMode = .contains) throws {
+         mode: AtlasSearchMode = .text, nameMode: AtlasSearchNameMode = .contains,
+         caseSensitive: Bool = true) throws {
         guard !root.isEmpty, root.utf8.count <= 16_384, !root.utf8.contains(0),
               !query.isEmpty, query.utf8.count <= 1_024, !query.utf8.contains(0) else {
             throw AtlasSearchError.invalidRequest
@@ -271,9 +308,11 @@ struct AtlasSearchInput: Sendable {
         self.pathScope = pathScope
         self.mode = mode
         self.nameMode = mode == .text ? .contains : nameMode
+        self.caseSensitive = mode == .text ? caseSensitive : true
     }
     func requireLegacyScope() throws {
         guard mode == .text else { throw AtlasSearchError.invalidRequest }
+        guard caseSensitive else { throw AtlasSearchError.unsupportedMatching }
         guard pathScope.isWorkspace else { throw AtlasSearchError.invalidPathScope }
         guard fileScope.isAll else { throw AtlasSearchError.invalidScope }
     }
@@ -427,10 +466,11 @@ struct AtlasSearchContext: Sendable {
     var path: String = ""
     var mode: AtlasSearchMode = .text
     var nameMode: AtlasSearchNameMode = .contains
+    var caseSensitive: Bool = true
 
     func matches(_ other: Self) -> Bool {
         loadGeneration == other.loadGeneration && atlasRevision == other.atlasRevision
-            && mode == other.mode && nameMode == other.nameMode
+            && mode == other.mode && nameMode == other.nameMode && caseSensitive == other.caseSensitive
             && root.utf8.elementsEqual(other.root.utf8)
             && query.utf8.elementsEqual(other.query.utf8)
             && scope.utf8.elementsEqual(other.scope.utf8)
@@ -600,6 +640,7 @@ struct AtlasSearchCapturedHit: Sendable {
     let start, end, capturedBytes: UInt64
     let openReader: @Sendable (UInt64) throws -> String
     var mode: AtlasSearchMode = .text
+    var caseSensitive: Bool = true
 }
 struct AtlasSearchCapture: Sendable {
     let retainAccess: @Sendable (AtlasSearchAccessLease) -> Void

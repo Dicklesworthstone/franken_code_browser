@@ -244,6 +244,9 @@ import Foundation
             check(old.matchesSourceRequest(new), "An in-flight source search survives optional preview publication")
             check(!old.matches(new), "Old overlay/frame authority still rejected after layout change")
             check(old.matchesSourceRequest(old) && old.matches(old), "Unchanged source and display remain compatible")
+            var insensitive = new; insensitive.caseSensitive = false
+            check(!old.matchesSourceRequest(insensitive) && !old.matches(insensitive),
+                "Preview publication cannot rebind a result after Match Case changes")
             var symbols = old; symbols.mode = .symbols
             var headings = old; headings.mode = .headings
             check(!old.matchesSourceRequest(symbols) && !old.matches(symbols),

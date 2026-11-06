@@ -112,6 +112,33 @@ They execute the actual packaging scripts with fake compiler/signing tools and
 retain their fixture logs. They establish packaging control flow, not native
 compilation, code-signing validity, Launch Services behavior or rendering.
 
+## Workspace text search
+
+Text search starts with **Match case** enabled. Turn it off to compare Unicode
+lowercase forms across both live captures and a retained workspace index. For
+example, `needle` can find `NEEDLE`, and `k` can find the Kelvin sign `K`. This is
+literal lowercase comparison: it does not add regular expressions, accent
+folding, Unicode normalization, or full case folding (`ss` does not match `ß`).
+Symbol and Markdown-heading name search keep their existing matching controls.
+
+Changing the case choice starts a new query and rejects responses from the
+superseded choice. A retained index can serve either choice without recapturing
+its sources. When its exact-case index cannot prove a negative for the selected
+mode, the shared engine scans the retained source within the verification
+budget. Limits and unavailable files still produce explicitly partial results.
+
+Each text result retains the original matched spelling and byte range. Opening
+a result uses that spelling to verify the exact location in the same captured
+source, including UTF-16 and files changed on disk since capture. Copying a hit
+preserves its original bytes. Workspace queries remain limited to 1024 UTF-8
+bytes; the retained reader accepts up to 4096 bytes so that a short lowercase
+query can activate a longer original Unicode spelling.
+
+The host, actual C-boundary, and native transport regression suites cover both
+case choices, retained-index reuse, stale responses, spelling validation,
+capture replacement, and Unicode source navigation. These are code-first
+additions; executable Rust/Swift and physical-Mac qualification remain pending.
+
 ## Local test image
 
 For a local drag-to-Applications test image:

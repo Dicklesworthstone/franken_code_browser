@@ -16,6 +16,8 @@ struct AtlasIndexedSearchTransport: Sendable {
     /// Absent only for legacy transports, which may serve all-files requests.
     var scopedQueryBegin: (@Sendable (UInt64, UInt64, UInt64, String, AtlasSearchFileScope) throws -> String?)? = nil
     var pathScopedQueryBegin: (@Sendable (UInt64, UInt64, UInt64, String, AtlasSearchFileScope, AtlasSearchPathScope) throws -> String?)? = nil
+    /// Absent legacy transports must refuse insensitive requests before I/O.
+    var matchingQueryBegin: (@Sendable (UInt64, UInt64, UInt64, String, AtlasSearchFileScope, AtlasSearchPathScope, Bool) throws -> String?)? = nil
 }
 
 /// An explicit captured-index session. The app serializes run() on its existing
@@ -66,9 +68,11 @@ final class AtlasIndexedSearch: @unchecked Sendable {
 
     func runScoped(input: AtlasSearchInput, cancellation: AtlasSearchCancellation,
                    access: AtlasSearchAccessLease, progress: @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport {
-        guard input.mode == .text else { throw AtlasSearchError.unsupportedMode }
+        guard input.mode == .text else { throw AtlasSearchError.invalidRequest }
         let root = input.root, query = input.query, scope = input.fileScope, pathScope = input.pathScope
-        if pathScope.isWorkspace {
+        if !input.caseSensitive {
+            guard transport.matchingQueryBegin != nil else { throw AtlasSearchError.unsupportedMatching }
+        } else if pathScope.isWorkspace {
             guard scope.isAll || transport.scopedQueryBegin != nil else { throw AtlasSearchError.invalidScope }
         } else {
             guard transport.pathScopedQueryBegin != nil else { throw AtlasSearchError.invalidPathScope }
@@ -84,7 +88,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                 // Publish a successfully finished index before the next cancel
                 // gate. Cancellation can suppress query delivery, not make an
                 // acknowledged complete source universe need another capture.
-                cached = try build(root: root, scope: scope, pathScope: pathScope,
+                cached = try build(root: root, scope: scope, pathScope: pathScope, caseSensitive: input.caseSensitive,
                     access: access, cancellation: cancellation, progress: progress)
             }
             guard let session = cached else { throw AtlasSearchError.unavailable }
@@ -94,6 +98,10 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             let basis = session.basis, owner = session.owner
             try check(cancellation)
             let began = try owner.call { handle -> String? in
+                if !input.caseSensitive {
+                    guard let matching = transport.matchingQueryBegin else { throw AtlasSearchError.unsupportedMatching }
+                    return try matching(handle, generation, basis.index, query, scope, pathScope, input.caseSensitive)
+                }
                 if !pathScope.isWorkspace {
                     guard let scoped = transport.pathScopedQueryBegin else { throw AtlasSearchError.invalidPathScope }
                     return try scoped(handle, generation, basis.index, query, scope, pathScope)
@@ -103,7 +111,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                 return try scoped(handle, generation, basis.index, query, scope)
             }
             var page = try AtlasIndexedQueryPage(began,
-                basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope, command: "begin-indexed")
+                basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope,
+                caseSensitive: input.caseSensitive, command: "begin-indexed")
             var result = AtlasIndexedAccumulator()
             var lastPublished = -Double.infinity
             var publishedHits = 0
@@ -114,12 +123,14 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     try check(cancellation)
                     let start = result.hits.count
                     let tail = try AtlasIndexedQueryPage(owner.call { try transport.page($0, generation, UInt64(start), 128) },
-                        basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope, command: "page")
+                        basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope,
+                        caseSensitive: input.caseSensitive, command: "page")
                     try result.append(tail, start: start, limit: 128)
                 }
                 let state = page.state
                 let capture = result.hits.isEmpty ? nil : AtlasIndexedSource.capture(owner: owner, basis: basis,
-                    root: root, needle: query, hits: result.hits, importReader: transport.sourceReader)
+                    root: root, needle: query, hits: result.hits, caseSensitive: input.caseSensitive,
+                    importReader: transport.sourceReader)
                 let report = AtlasSearchReport(hits: result.hits.map(\.hit), complete: state.complete,
                     truncated: state.truncated, unavailableFiles: state.unavailable, unsupportedFiles: 0,
                     matchesSeen: state.matches,
@@ -128,7 +139,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     indexStatus: AtlasSearchIndexStatus(building: false, reused: reused,
                         capturedFiles: basis.capturedFiles, capturedBytes: basis.sourceBytes,
                         skippedFiles: state.skipped, verifiedFiles: state.scanned, verificationBytes: state.verificationBytes),
-                    fileScope: scope, excludedFiles: basis.files - state.eligible, pathScope: pathScope)
+                    fileScope: scope, excludedFiles: basis.files - state.eligible, pathScope: pathScope,
+                    caseSensitive: input.caseSensitive)
                 try check(cancellation)
                 if !state.running { return report }
                 let now = ProcessInfo.processInfo.systemUptime
@@ -137,7 +149,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                 }
                 try check(cancellation)
                 page = try AtlasIndexedQueryPage(owner.call { try transport.queryStep($0, generation, cancellation) },
-                    basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope, command: "step")
+                    basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope,
+                    caseSensitive: input.caseSensitive, command: "step")
             }
         } catch {
             if cancellation.isCanceled { throw AtlasSearchError.canceled }
@@ -166,7 +179,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             handle: handle, layout: layout, files: files, discovery: discovery, page: page)
     }
 
-    private func build(root: String, scope: AtlasSearchFileScope, pathScope: AtlasSearchPathScope,
+    private func build(root: String, scope: AtlasSearchFileScope, pathScope: AtlasSearchPathScope, caseSensitive: Bool,
                        access: AtlasSearchAccessLease, cancellation: AtlasSearchCancellation,
                        progress: @Sendable (AtlasSearchReport) -> Void) throws -> Session {
         let grant = access.reference.map(ObjectIdentifier.init)
@@ -189,7 +202,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     progress: AtlasSearchProgress(isRunning: true, examinedFiles: page.examined, cataloguedFiles: preparation.files),
                     streamID: stream, indexStatus: AtlasSearchIndexStatus(building: true, reused: false,
                         capturedFiles: page.captured, capturedBytes: page.bytes, skippedFiles: 0, verifiedFiles: 0, verificationBytes: 0),
-                    fileScope: scope, pathScope: pathScope))
+                    fileScope: scope, pathScope: pathScope, caseSensitive: caseSensitive))
                 lastPublished = now
             }
             // Cancellation here leaves the last acknowledged Rust step intact.

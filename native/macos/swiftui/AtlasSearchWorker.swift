@@ -17,6 +17,11 @@ private func beginPathScopedSearch(_ handle: UInt64, _ generation: UInt64, _ que
     _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
     _ pathKind: UInt64, _ path: UnsafePointer<CChar>?,
     _ maxMatches: UInt64, _ maxFiles: UInt64, _ maxFileBytes: UInt64, _ maxSourceBytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_search_begin_matching")
+private func beginMatchingSearch(_ handle: UInt64, _ generation: UInt64, _ query: UnsafePointer<CChar>?,
+    _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
+    _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ caseSensitive: UInt64,
+    _ maxMatches: UInt64, _ maxFiles: UInt64, _ maxFileBytes: UInt64, _ maxSourceBytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_structure_begin")
 private func beginStructureSearch(_ handle: UInt64, _ generation: UInt64, _ mode: UInt64, _ nameMode: UInt64,
     _ query: UnsafePointer<CChar>?, _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
@@ -87,6 +92,10 @@ enum AtlasNativeSearch {
                                     queryPointer, extensions, filenames, kind, path,
                                     1000, 4096, 1024 * 1024, 32 * 1024 * 1024)
                             }
+                            if !input.caseSensitive {
+                                return beginMatchingSearch(handle, 1, queryPointer, extensions, filenames,
+                                    kind, path, 0, 1000, 4096, 1024 * 1024, 32 * 1024 * 1024)
+                            }
                             if !pathScope.isWorkspace {
                                 return beginPathScopedSearch(handle, 1, queryPointer, extensions, filenames,
                                     kind, path, 1000, 4096, 1024 * 1024, 32 * 1024 * 1024)
@@ -99,7 +108,7 @@ enum AtlasNativeSearch {
                 }
             }, cancellation)
             var stream = SearchStream(query: query, scope: scope, pathScope: pathScope,
-                mode: input.mode, nameMode: input.nameMode)
+                mode: input.mode, nameMode: input.nameMode, caseSensitive: input.caseSensitive)
             var lastPublished: TimeInterval? = nil
             var publishedHits = 0
             while true {
@@ -162,6 +171,7 @@ private struct SearchOpen: Decodable { let status: String }
 private struct SearchPage: Decodable {
     let schema, status, command, owner, source_manifest, layout_revision, query_generation: String
     let needle, mode, search_strategy: String
+    let case_sensitive: Bool?
     let requested_mode, realized_mode, name_mode, name_case, evidence_level, completeness_basis: String?
     let semantic_complete: Bool?
     let structure_file_byte_limit, unsupported_structure_files, extraction_limited_files: String?
@@ -180,6 +190,7 @@ private struct SearchWireHit: Decodable, Equatable {
     let original_range: SearchWireRange
     let path: SearchWirePath
     let structure: SearchWireStructure?
+    let matched_text: String?
 }
 private struct SearchWireStructure: Decodable, Equatable {
     let name, kind, language, candidate_id, evidence_level: String
@@ -199,6 +210,7 @@ private struct SearchStream {
     let pathScope: AtlasSearchPathScope
     let mode: AtlasSearchMode
     let nameMode: AtlasSearchNameMode
+    let caseSensitive: Bool
     let id = UUID()
     private var identity: [String]?
     private var state: SearchState?
@@ -207,9 +219,10 @@ private struct SearchStream {
     private var files: [String: SearchWireHit] = [:]
     private var retainedTextBytes = 0
     init(query: String, scope: AtlasSearchFileScope, pathScope: AtlasSearchPathScope,
-         mode: AtlasSearchMode, nameMode: AtlasSearchNameMode) {
+         mode: AtlasSearchMode, nameMode: AtlasSearchNameMode, caseSensitive: Bool = true) {
         self.query = query; self.scope = scope; self.pathScope = pathScope
         self.mode = mode; self.nameMode = nameMode
+        self.caseSensitive = caseSensitive
     }
     var count: Int { hits.count }
     var retained: Int { state?.retained ?? 0 }
@@ -253,7 +266,8 @@ private struct SearchStream {
             let position = start + offset
             guard try number(wire.hit_id) == UInt64(position + 1) else { throw invalid() }
             if position < hits.count {
-                guard wire == wireHits[position] else { throw invalid() }
+                guard wire == wireHits[position],
+                      AtlasSearchText.sameActualText(wire.matched_text, wireHits[position].matched_text) else { throw invalid() }
                 continue
             }
             guard position == hits.count, hits.count < 1000 else { throw invalid() }
@@ -264,7 +278,7 @@ private struct SearchStream {
                       wire.capture_byte_length == previous.capture_byte_length else { throw invalid() }
             }
             let charge = wire.path.hex.utf8.count + 2 * wire.path.display.utf8.count
-                + (hit.sourcePath?.utf8.count ?? 0) + 512
+                + (hit.sourcePath?.utf8.count ?? 0) + 2 * (hit.actualText?.utf8.count ?? 0) + 512
             guard charge <= 8 * 1024 * 1024 - retainedTextBytes else { throw invalid() }
             retainedTextBytes += charge
             files[wire.file_id] = wire
@@ -283,19 +297,21 @@ private struct SearchStream {
         }
         let capture = hits.isEmpty ? nil : AtlasSearchCaptureFactory.make(owner: owner,
             identity: source, root: root, needle: query, witnesses: witnesses,
-            importReader: AtlasNativeSearch.importReader)
+            caseSensitive: caseSensitive, importReader: AtlasNativeSearch.importReader)
         return AtlasSearchReport(hits: hits, complete: state.complete, truncated: state.truncated,
             unavailableFiles: state.unavailable, unsupportedFiles: state.structureCoverage?.unsupportedFiles ?? 0, matchesSeen: state.matches,
             progress: AtlasSearchProgress(isRunning: state.running, examinedFiles: state.examined,
                 cataloguedFiles: state.eligible), streamID: id, capture: capture,
             fileScope: scope, excludedFiles: state.catalogued - state.eligible, pathScope: pathScope,
-            mode: mode, nameMode: nameMode, structureCoverage: state.structureCoverage)
+            mode: mode, nameMode: nameMode, structureCoverage: state.structureCoverage,
+            caseSensitive: caseSensitive)
     }
 
     private func validated(_ page: SearchPage) throws -> SearchState {
         guard page.schema == "fcb.atlas-search/1", page.status == "ok",
               [mode == .text ? "begin" : "begin-structure", "step", "page"].contains(page.command),
-              page.mode == mode.wireMode,
+              page.mode == (mode == .text ? AtlasSearchText.wireMode(caseSensitive: caseSensitive) : mode.wireMode),
+              (page.case_sensitive ?? true) == caseSensitive,
               page.search_strategy == (mode == .text ? "live-capture-scan" : "live-structure-scan"),
               page.needle.utf8.elementsEqual(query.utf8), try number(page.query_generation) == 1 else { throw invalid() }
         for key in [page.owner, page.source_manifest, page.layout_revision] {
@@ -394,10 +410,12 @@ private struct SearchStream {
               }), scope.admitsRawPath(raw), pathScope.admitsRawPath(raw) else { throw invalid() }
         let structure: AtlasSearchStructure?
         if mode == .text {
-            guard wire.structure == nil else { throw invalid() }
+            guard wire.structure == nil,
+                  AtlasSearchText.accepts(actualText: wire.matched_text, needle: query,
+                    caseSensitive: caseSensitive) else { throw invalid() }
             structure = nil
         } else {
-            guard let value = wire.structure,
+            guard wire.matched_text == nil, let value = wire.structure,
                   !value.name.isEmpty, value.name.utf8.count <= 4096,
                   !value.kind.isEmpty, value.kind.utf8.count <= 64, !value.kind.utf8.contains(0),
                   !value.language.isEmpty, value.language.utf8.count <= 64,
@@ -423,7 +441,7 @@ private struct SearchStream {
         }
         return SearchHit(id: position, path: wire.path.display, sourcePath: String(bytes: raw, encoding: .utf8),
             start: start, end: end, captureSHA256: wire.capture_sha256, captureByteLength: length,
-            structure: structure)
+            structure: structure, actualText: wire.matched_text)
     }
     private func invalid() -> AtlasSearchError { .invalidResponse }
     private func number(_ text: String) throws -> UInt64 {

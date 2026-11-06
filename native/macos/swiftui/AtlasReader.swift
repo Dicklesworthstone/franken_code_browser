@@ -70,7 +70,7 @@ enum AtlasReaderRequest: Equatable, Sendable {
             try AtlasReaderFindReport.validateNeedle(target.needle)
             guard target.generation > 0, target.index < AtlasReaderFindReport.maxHits,
                   target.start < target.end, target.end <= capturedBytes,
-                  target.end - target.start <= 2048,
+                  target.end - target.start <= AtlasReaderFindReport.maximumWitnessBytes,
                   AtlasReaderWire.validHex(target.originalHex, bytes: target.end - target.start) else {
                 throw AtlasReaderError.invalidInput
             }

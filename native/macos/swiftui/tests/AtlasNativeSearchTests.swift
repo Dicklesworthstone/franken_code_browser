@@ -100,6 +100,45 @@ private final class Reports: @unchecked Sendable {
         try AtlasNativeSearch.runScoped(input: AtlasSearchInput(root: "/project", query: "x", fileScope: scope, pathScope: pathScope),
             cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
     }
+    private static func matchingPage(_ command: String, step: Int, total: Int = 0, running: Bool = true,
+                                     needle: String = "x", actualText: String = "X",
+                                     scope: AtlasSearchFileScope = .all,
+                                     pathScope: AtlasSearchPathScope = .workspace) -> [String: Any] {
+        let eligible = scope.isAll && pathScope.isWorkspace ? 2 : 1
+        let path = pathScope.isWorkspace ? "612e7273" : "7372632f612e7273"
+        var value = scopedPage(command, scope: scope, step: step, eligible: eligible, total: total,
+            running: running, pathScope: pathScope, hitPath: path)
+        value["case_sensitive"] = false; value["mode"] = "unicode-lowercase-literal"; value["needle"] = needle
+        if total > 0 {
+            var row = hit(1, path: path)
+            row["matched_text"] = actualText
+            row["original_range"] = ["start": "0", "end": String(actualText.utf8.count)]
+            value["hits"] = [row]
+        }
+        return value
+    }
+    private static func setupMatching(needle: String = "x", actualText: String = "X",
+                                      scope: AtlasSearchFileScope = .all,
+                                      pathScope: AtlasSearchPathScope = .workspace) throws {
+        resetFixture(); scope.withCStrings { expectScope($0, $1) }
+        if !pathScope.isWorkspace { pathScope.withCString { expectPath($0, $1!) } }
+        let extraStep = scope.isAll && pathScope.isWorkspace
+        try install(0, ["status": "ok"])
+        try install(1, matchingPage("begin", step: 0, needle: needle, actualText: actualText,
+            scope: scope, pathScope: pathScope))
+        try install(2, matchingPage("step", step: 1, total: 1, running: extraStep,
+            needle: needle, actualText: actualText, scope: scope, pathScope: pathScope))
+        if extraStep {
+            try install(2, matchingPage("step", step: 2, total: 1, running: false,
+                needle: needle, actualText: actualText, scope: scope, pathScope: pathScope), index: 1)
+        }
+    }
+    private static func runMatching(needle: String = "x", scope: AtlasSearchFileScope = .all,
+                                    pathScope: AtlasSearchPathScope = .workspace) throws -> AtlasSearchReport {
+        try AtlasNativeSearch.runScoped(input: AtlasSearchInput(root: "/project", query: needle,
+            fileScope: scope, pathScope: pathScope, caseSensitive: false),
+            cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
+    }
     private static func structurePage(_ command: String, mode: AtlasSearchMode = .symbols,
                                       nameMode: AtlasSearchNameMode = .contains, step: Int,
                                       total: Int = 0, running: Bool = true, complete: Bool = false,
@@ -393,6 +432,66 @@ private final class Reports: @unchecked Sendable {
         catch AtlasSearchError.canceled { checks += 1 }
         retired()
         check(fixtureCount(6) == fixtureCount(7), "Racing path-scoped cancellation releases every C allocation")
+        for (needle, actualText) in [("x", "X"), ("i\u{307}", "İ"), ("k", "K")] {
+            try setupMatching(needle: needle, actualText: actualText)
+            var result: AtlasSearchReport? = try runMatching(needle: needle)
+            check(result!.complete && !result!.caseSensitive && result!.hits.count == 1
+                && result!.hits[0].actualText?.utf8.elementsEqual(actualText.utf8) == true,
+                "Case-insensitive receipt retains the engine's actual Unicode spelling")
+            check(result!.hits[0].end == UInt64(actualText.utf8.count),
+                "Source spans do not inherit the transformed query's byte length")
+            check(result!.capture?.target(result!.hits[0])?.needle.utf8.elementsEqual(actualText.utf8) == true
+                && result!.capture?.target(result!.hits[0])?.caseSensitive == false,
+                "Retained reader receives exact source spelling instead of the insensitive query")
+            check(fixtureCount(12) == 1 && fixtureCount(9) == 0 && fixtureCount(10) == 0,
+                "Insensitive request uses matching admission with all scope fields")
+            check(result!.summary.contains("case-insensitive") && result!.summary.contains("Unicode lowercase"),
+                "Results disclose their matching semantics")
+            result = nil; retired()
+        }
+        try setupMatching(scope: rustScope, pathScope: directory)
+        var locationMatch: AtlasSearchReport? = try runMatching(scope: rustScope, pathScope: directory)
+        check(locationMatch!.fileScope == rustScope && locationMatch!.pathScope == directory
+            && !locationMatch!.caseSensitive && locationMatch!.excludedFiles == 1,
+            "Match case combines with exact location and file-type restrictions")
+        locationMatch = nil; retired()
+        for defect in ["missing-case", "case", "mode", "missing-text", "empty-text", "nul-text", "oversized-text"] {
+            try setupMatching()
+            var bad = matchingPage("step", step: 1, total: 1)
+            if defect == "missing-case" { bad.removeValue(forKey: "case_sensitive") }
+            else if defect == "case" { bad["case_sensitive"] = true }
+            else if defect == "mode" { bad["mode"] = "exact-decoded-literal" }
+            else {
+                var rows = bad["hits"] as! [[String: Any]]
+                if defect == "missing-text" { rows[0].removeValue(forKey: "matched_text") }
+                if defect == "empty-text" { rows[0]["matched_text"] = "" }
+                if defect == "nul-text" { rows[0]["matched_text"] = "x\0y" }
+                if defect == "oversized-text" { rows[0]["matched_text"] = String(repeating: "X", count: 4097) }
+                bad["hits"] = rows
+            }
+            try install(2, bad)
+            do { _ = try runMatching(); preconditionFailure("Invalid matching receipt accepted: " + defect) }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+            retired()
+            check(fixtureCount(6) == fixtureCount(7), "Matching refusal releases every C response")
+        }
+        try setupMatching(needle: "é", actualText: "é")
+        var changedSpelling = matchingPage("step", step: 2, total: 1, running: false, needle: "é", actualText: "é")
+        var changedRows = changedSpelling["hits"] as! [[String: Any]]
+        changedRows[0]["matched_text"] = "e\u{301}"; changedSpelling["hits"] = changedRows
+        try install(2, changedSpelling, index: 1)
+        do { _ = try runMatching(needle: "é"); preconditionFailure("Canonical alias changed a repeated hit witness") }
+        catch AtlasSearchError.invalidResponse { checks += 1 }
+        retired()
+        try rejected("case receipt contradicts sensitive request") {
+            var bad = page("step", step: 1, total: 70); bad["case_sensitive"] = false
+            try install(2, bad)
+        }
+        try rejected("sensitive spelling contradicts literal query") {
+            var bad = page("step", step: 1, total: 70)
+            var rows = bad["hits"] as! [[String: Any]]; rows[0]["matched_text"] = "X"; bad["hits"] = rows
+            try install(2, bad)
+        }
         // Changing from an exact/prefix name query back to literal text must
         // normalize the inactive name control before coordinator admission.
         for nameMode in AtlasSearchNameMode.allCases {

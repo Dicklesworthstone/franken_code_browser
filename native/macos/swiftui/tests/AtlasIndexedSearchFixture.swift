@@ -12,6 +12,8 @@ final class IndexedFixture: @unchecked Sendable {
         var pathHex = "612e7273"
         var digest = String(repeating: "a", count: 64)
         var encoding = "utf8"
+        var insensitiveText = "X"
+        var insensitiveRangeBytes = 1
         // Explicit scripted scope receipts; this fixture does no file matching.
         var scopedEligible: Int? = nil
         var scopedCaptured: Int? = nil
@@ -26,6 +28,7 @@ final class IndexedFixture: @unchecked Sendable {
         var needle = ""
         var scope: AtlasSearchFileScope = .all
         var pathScope: AtlasSearchPathScope = .workspace
+        var caseSensitive = true
     }
     private let lock = NSLock()
     private var config = Configuration()
@@ -69,6 +72,10 @@ final class IndexedFixture: @unchecked Sendable {
         }, pathScopedQueryBegin: { h, g, index, needle, scope, pathScope in
             precondition(index == 1 && !pathScope.isWorkspace)
             return try self.response("query-begin", h, generation: g, needle: needle, scope: scope, pathScope: pathScope)
+        }, matchingQueryBegin: { h, g, index, needle, scope, pathScope, caseSensitive in
+            precondition(index == 1)
+            return try self.response("query-begin", h, generation: g, needle: needle, scope: scope,
+                pathScope: pathScope, caseSensitive: caseSensitive)
         })
     }
 
@@ -76,6 +83,7 @@ final class IndexedFixture: @unchecked Sendable {
                           needle: String = "", start: Int = 0, reader: UInt64 = 100,
                           scope: AtlasSearchFileScope = .all,
                           pathScope: AtlasSearchPathScope = .workspace,
+                          caseSensitive: Bool = true,
                           cancellation: AtlasSearchCancellation? = nil) throws -> String? {
         lock.lock(); let block = blocked; lock.unlock()
         block?(phase)
@@ -88,8 +96,10 @@ final class IndexedFixture: @unchecked Sendable {
             precondition(generation > s.generation)
             s.generation = generation; s.needle = needle; s.queryStep = 0; s.scope = scope
             s.pathScope = pathScope
+            s.caseSensitive = caseSensitive
             events.append("query-scope:\(scope.wireKind):\(scope.extensions ?? ""):\(scope.filenames ?? "")")
             events.append("query-path:\(pathScope.kind.rawValue):\(pathScope.pathHex)")
+            events.append("query-case:\(caseSensitive)")
         }
         if phase == "query-step" || phase == "page" { precondition(s.generation == generation) }
         if phase == "query-step" { s.queryStep += 1 }
@@ -136,26 +146,30 @@ final class IndexedFixture: @unchecked Sendable {
             let unavailable = scoped ? c.scopedUnavailable ?? c.unavailable : c.unavailable
             let pending = eligible - available - unavailable
             precondition(eligible <= c.files && available <= captured && unavailable <= c.unavailable && pending >= 0)
-            let examined = min(s.queryStep, available), scanned = min(1, examined), skipped = max(0, examined - scanned)
+            let examined = min(s.queryStep, available)
+            let scanned = s.caseSensitive ? min(1, examined) : examined, skipped = max(0, examined - scanned)
             let running = phase == "query-begin" || examined < available
             let count = examined > 0 ? (scoped ? c.scopedHitCount ?? c.hitCount : c.hitCount) : 0
             let first = phase == "page" ? start : 0, end = min(count, first + (phase == "page" ? 128 : 64))
             var rows: [[String: Any]] = []
             if first < end {
                 for n in first..<end {
-                    let range: [String: String] = ["start": String(n * 2), "end": String(n * 2 + 1)]
+                    let range: [String: String] = ["start": String(n * 2),
+                        "end": String(n * 2 + (s.caseSensitive ? 1 : c.insensitiveRangeBytes))]
                     let path: [String: String] = ["encoding": "unix-bytes", "hex": c.pathHex, "display": "a.rs"]
-                    let row: [String: Any] = ["hit_id": String(n + 1), "file_id": "1", "source_revision": "1",
+                    var row: [String: Any] = ["hit_id": String(n + 1), "file_id": "1", "source_revision": "1",
                         "capture_sha256": c.digest, "capture_byte_length": "4096", "original_range": range, "path": path]
+                    if !s.caseSensitive { row["matched_text"] = c.insensitiveText }
                     rows.append(row)
                 }
             }
             let fields: [String: Any] = ["command": phase == "query-begin" ? "begin-indexed" : (phase == "page" ? "page" : "step"),
                 "capture_manifest": "2", "query_generation": String(generation), "needle": s.needle,
-                "mode": "exact-decoded-literal", "search_strategy": "retained-ephemeral-index",
+                "mode": s.caseSensitive ? "exact-decoded-literal" : "unicode-lowercase-literal",
+                "case_sensitive": s.caseSensitive, "search_strategy": "retained-ephemeral-index",
                 "catalogued_files": String(c.files), "discovery_complete": c.discovery,
                 "examined_files": String(examined + unavailable), "scanned_files": String(scanned), "verified_files": String(scanned),
-                "skipped_by_index": String(skipped), "fallback_files": String(c.fallback ? scanned : 0),
+                "skipped_by_index": String(skipped), "fallback_files": String(c.fallback || !s.caseSensitive ? scanned : 0),
                 "unavailable_files": String(unavailable), "pending_files": String(eligible - examined - unavailable),
                 "retained_hits": String(count), "displayed_hits": String(count), "matches_seen": String(count), "step_count": String(s.queryStep),
                 "verification_source_bytes": String(scanned == 0 ? 0 : min(4096, totalBytes)), "source_bytes_read": "0", "read_calls": "0",

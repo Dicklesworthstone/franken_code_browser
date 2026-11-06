@@ -69,7 +69,7 @@ enum AtlasSearchCaptureFactory {
 
     static func make(owner: AtlasSearchCaptureOwner, identity: AtlasSearchCaptureIdentity,
                      root: String, needle: String, witnesses: [AtlasSearchCaptureWitness],
-                     importReader: @escaping Import) -> AtlasSearchCapture {
+                     caseSensitive: Bool = true, importReader: @escaping Import) -> AtlasSearchCapture {
         AtlasSearchCapture(retainAccess: { owner.retainAccess($0) }, target: { hit in
             guard hit.id >= 0, hit.id < witnesses.count else { return nil }
             let witness = witnesses[hit.id]
@@ -79,8 +79,15 @@ enum AtlasSearchCaptureFactory {
                   witness.hit.start == hit.start, witness.hit.end == hit.end,
                   witness.hit.captureSHA256 == hit.captureSHA256,
                   witness.hit.captureByteLength == hit.captureByteLength,
+                  AtlasSearchText.sameActualText(witness.hit.actualText, hit.actualText),
                   let path = hit.sourcePath, hit.start < hit.end else { return nil }
-            return AtlasSearchCapturedHit(root: root, path: path, needle: needle,
+            let mode = witness.hit.structure?.mode ?? .text
+            guard mode != .text || AtlasSearchText.accepts(actualText: hit.actualText,
+                needle: needle, caseSensitive: caseSensitive) else { return nil }
+            // The exact reader proves the source spelling at the selected
+            // original-byte range, even when the workspace query ignored case.
+            let exactNeedle = mode == .text ? (hit.actualText ?? needle) : needle
+            return AtlasSearchCapturedHit(root: root, path: path, needle: exactNeedle,
                 start: hit.start, end: hit.end, capturedBytes: hit.captureByteLength ?? 0,
                 openReader: { reader in
                     guard reader > 0 else { throw AtlasSearchError.invalidRequest }
@@ -88,7 +95,7 @@ enum AtlasSearchCaptureFactory {
                         let json = try importReader(handle, reader, identity.generation, UInt64(hit.id + 1))
                         return try validatedReader(json, receiver: reader, identity: identity, witness: witness)
                     }
-                }, mode: witness.hit.structure?.mode ?? .text)
+                }, mode: mode, caseSensitive: caseSensitive)
         })
     }
 

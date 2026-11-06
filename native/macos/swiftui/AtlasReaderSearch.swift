@@ -32,6 +32,10 @@ struct AtlasReaderHitSelection: Sendable {
 
 struct AtlasReaderFindReport: Sendable {
     static let maxHits: UInt64 = 4096
+    /// Workspace matches can carry a longer original spelling after Unicode
+    /// lowercase comparison. Find still verifies that spelling exactly.
+    static let maximumNeedleBytes = 4096
+    static let maximumWitnessBytes: UInt64 = 8192
     let identity: AtlasReaderIdentity
     let generation: UInt64
     let needle: String
@@ -48,7 +52,7 @@ struct AtlasReaderFindReport: Sendable {
     }
 
     static func validateNeedle(_ needle: String) throws {
-        guard !needle.isEmpty, needle.utf8.count <= 1024, !needle.utf8.contains(0) else {
+        guard !needle.isEmpty, needle.utf8.count <= maximumNeedleBytes, !needle.utf8.contains(0) else {
             throw AtlasReaderError.invalidInput
         }
     }
@@ -101,7 +105,7 @@ struct AtlasReaderFindReport: Sendable {
                 // Exact UTF-16 can use twice the UTF-8 query byte count. This is
                 // a marshaling bound, not a second source-encoding algorithm.
                 witnessBytes = UInt64(hex.utf8.count / 2)
-                guard retained > 0, witnessBytes > 0, witnessBytes <= 2048,
+                guard retained > 0, witnessBytes > 0, witnessBytes <= maximumWitnessBytes,
                       AtlasReaderWire.validHex(hex, bytes: witnessBytes) else { throw AtlasReaderError.invalidResponse }
             } else {
                 guard retained == 0 else { throw AtlasReaderError.invalidResponse }
