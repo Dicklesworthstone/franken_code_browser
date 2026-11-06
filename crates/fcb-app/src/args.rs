@@ -4,7 +4,7 @@
 //! traversal and repository rule-file reads each require explicit switches.
 
 use std::{ffi::OsString, path::PathBuf};
-use fcb::search::{ParsedQuery, QueryError};
+use fcb::search::{ParsedQuery, QueryError, QueryGeneration, QueryOptions, SearchMode, UnicodeNormalization};
 
 pub const MAX_ARGUMENTS: usize = 64;
 pub const MAX_ARGUMENT_BYTES: usize = 65_536;
@@ -26,7 +26,7 @@ pub struct Arguments {
     pub needle: Option<Needle>, pub workspace: bool, pub include_excluded: bool,
     pub respect_ignores: bool,
     pub max_files: usize, pub max_file_bytes: usize, pub max_total_bytes: usize,
-    pub whole_file: bool, pub max_scan_bytes: u64,
+    pub whole_file: bool, pub max_scan_bytes: u64, pub ignore_case: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArgumentError { Limit, UnknownCommand, UnknownOption, DuplicateOption, MissingValue,
@@ -76,7 +76,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         stdin: false, offset: 0, bytes: 64 * 1024, limit: 100, encoding: Encoding::Auto, needle: None,
         workspace: false, include_excluded: false, respect_ignores: false, max_files: 4096,
         max_file_bytes: 1024 * 1024, max_total_bytes: 32 * 1024 * 1024,
-        whole_file: false, max_scan_bytes: 256 * 1024 * 1024 };
+        whole_file: false, max_scan_bytes: 256 * 1024 * 1024, ignore_case: false };
     if args.is_empty() { return Ok(parsed); }
     let mut start = 1;
     parsed.command = match args[0].to_str() {
@@ -105,7 +105,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
                 "--workspace" => 256, "--include-excluded" => 512, "--max-files" => 1024,
                 "--max-file-bytes" => 2048, "--max-total-bytes" => 4096, "--path" => 8192,
                 "--whole-file" => 16384, "--max-scan-bytes" => 32768, "--respect-ignores" => 65536,
-                "--query" => 131072,
+                "--query" => 131072, "--ignore-case" => 262144,
                 _ => return Err(ArgumentError::UnknownOption),
             };
             if seen & bit != 0 { return Err(ArgumentError::DuplicateOption); }
@@ -116,6 +116,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
             if option == "--include-excluded" { parsed.include_excluded = true; continue; }
             if option == "--respect-ignores" { parsed.respect_ignores = true; continue; }
             if option == "--whole-file" { parsed.whole_file = true; continue; }
+            if option == "--ignore-case" { parsed.ignore_case = true; continue; }
             let value = args.get(cursor).ok_or(ArgumentError::MissingValue)?; cursor += 1;
             let value = value.to_str().ok_or(ArgumentError::MissingValue)?;
             match option {
@@ -172,6 +173,10 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
     }
     if parsed.stdin && parsed.file.is_some() { return Err(ArgumentError::MultipleSources); }
     if parsed.respect_ignores && (!parsed.workspace || parsed.include_excluded) { return Err(ArgumentError::IncompatibleOptions); }
+    if parsed.ignore_case && (parsed.command != Command::Search || !parsed.workspace || parsed.whole_file
+        || !matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Query(_)))) {
+        return Err(ArgumentError::IncompatibleOptions);
+    }
     if parsed.whole_file {
         if parsed.command != Command::Search || parsed.stdin || seen & (4 | 8 | 2048 | 4096 | 8192) != 0 {
             return Err(ArgumentError::IncompatibleOptions);
@@ -182,7 +187,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         if !parsed.workspace && seen & (512 | 1024) != 0 { return Err(ArgumentError::IncompatibleOptions); }
         return Ok(parsed);
     }
-    if seen & 32768 != 0 && !(parsed.workspace && matches!(parsed.needle, Some(Needle::Query(_)))) {
+    if seen & 32768 != 0 && !(parsed.workspace && matches!(parsed.needle, Some(Needle::Text(_) | Needle::Query(_)))) {
         return Err(ArgumentError::IncompatibleOptions);
     }
     if parsed.workspace {
@@ -221,6 +226,19 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         }
     }
     Ok(parsed)
+}
+
+impl Arguments {
+    /// Use one declared text mode for anchor, conjunction and exclusion scans.
+    /// The existing index detects this mode and falls back when its exact-byte
+    /// negative certificates cannot cover case-insensitive comparisons.
+    pub(crate) fn text_query_options(&self, generation: QueryGeneration) -> QueryOptions {
+        let mut options = QueryOptions::new(generation).with_max_matches(self.limit.max(1));
+        options.mode = SearchMode::DecodedText { case_sensitive: !self.ignore_case,
+            normalization: UnicodeNormalization::Exact };
+        options.max_bytes_scanned = Some(self.max_scan_bytes);
+        options
+    }
 }
 
 pub fn decimal(text: &str) -> Result<u64, ArgumentError> {
@@ -359,4 +377,24 @@ mod tests {
             assert!(parse(&args(&input)).is_err(), "{input:?}");
         }
     }
+    #[test]
+    fn case_insensitive_search_is_explicit_and_limited_to_captured_workspace_text() {
+        for kind in ["--text", "--query"] {
+            let options = parse(&args(&["search", "root", "--workspace", kind, "ÄPFEL", "--ignore-case",
+                "--max-scan-bytes", "123"])).unwrap();
+            assert!(options.ignore_case); assert_eq!(options.max_scan_bytes, 123);
+        }
+        let literal = parse(&args(&["search", "root", "--workspace", "--text", "--ignore-case"])).unwrap();
+        assert!(!literal.ignore_case);
+        assert_eq!(literal.needle, Some(Needle::Text("--ignore-case".to_owned())));
+        for input in [vec!["search", "file", "--text", "x", "--ignore-case"],
+            vec!["search", "root", "--workspace", "--whole-file", "--text", "x", "--ignore-case"],
+            vec!["search", "root", "--workspace", "--path", "x", "--ignore-case"],
+            vec!["inspect", "root", "--workspace", "--ignore-case"],
+            vec!["search", "root", "--workspace", "--text", "x", "--ignore-case", "--ignore-case"],
+            vec!["search", "root", "--workspace", "--path", "x", "--max-scan-bytes", "8"]] {
+            assert!(parse(&args(&input)).is_err(), "{input:?}");
+        }
+    }
+
 }

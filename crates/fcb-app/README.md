@@ -139,9 +139,21 @@ native bytes; escaped display labels are not source identities.
 Without `--whole-file`, `search ROOT --workspace --text TEXT` captures admitted
 complete files, forms a search manifest, builds the existing ephemeral trigram
 index, and verifies candidate hits against retained exact source. Text is a
-**case-sensitive literal**, including spaces and strings resembling query
-syntax. Each file uses the existing UTF-8/BOM-marked UTF-16 decoder. Unsupported
+**case-sensitive literal** by default, including spaces and strings resembling
+query syntax. `--ignore-case` selects the existing Unicode lowercase comparison
+for live captured-workspace `--text` and `--query` searches. Original source text,
+UTF-8/UTF-16 byte ranges and capture digests remain attached to each hit; exact
+trigram negatives are bypassed when they cannot cover the selected case mode.
+This does not enable canonical normalization or the separate case-fold expansion
+repertoire. Each file uses the existing UTF-8/BOM-marked UTF-16 decoder. Unsupported
 exact decoding is reported separately, not as a successful no-match result.
+
+`--max-scan-bytes` independently bounds literal or expression verification work;
+the default is 256 MiB and the maximum is 1 TiB. It does not replace source-capture
+or filesystem-read limits. A limited scan returns partial coverage, with
+`work_limited` and `scanned_input_bytes` in JSON. `--limit 0` still probes for one
+qualified hit: absence can be complete, while an existing hit yields a truncated
+response with no hit rows. JSON declares `case_sensitive` for both text routes.
 
 The workspace default policy is explicitly named
 `product-defaults/no-rule-files-v1`: common build/dependency/VCS directories and

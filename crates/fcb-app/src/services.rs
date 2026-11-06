@@ -23,11 +23,15 @@ const HELP: &str = "FrankenCodeBrowser — bounded headless source tools\n\n\
   fcb search --stdin --text TEXT [--json]\n\n\
 Explicit workspace scope:\n\
   fcb inspect ROOT --workspace [--json]\n\
-  fcb search ROOT --workspace --text TEXT [--json]\n\
+  fcb search ROOT --workspace --text TEXT [--ignore-case] [--json]\n\
+  fcb search ROOT --workspace --query EXPRESSION [--ignore-case] [--json]\n\
   fcb search ROOT --workspace --path QUERY [--json]\n\
   --max-files N --max-file-bytes N --max-total-bytes N\n\
   --respect-ignores OR --include-excluded (explicit, incompatible scopes)\n\
 Indexed-capture defaults: 4096 files, 1 MiB/file, 32 MiB captured source.\n\
+--ignore-case uses existing Unicode lowercase text comparison for --text/--query;\n\
+metadata path/type filters keep their own semantics. --max-scan-bytes separately\n\
+bounds verification work; a zero --limit probes existence without emitting rows.\n\
 Default discovery uses static product exclusions, without rule-file reads.\n\
 --respect-ignores separately authorizes bounded nested .gitignore/.fcbignore\n\
 reads. Unknown/unsupported policies withhold affected source and report partial\n\

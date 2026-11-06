@@ -236,3 +236,26 @@ fn actual_binary_executes_live_and_saved_expression_search_after_root_move() {
     let result = parse(&offline.stdout).unwrap(); assert_eq!(starts(&result), [1, 3]);
     assert!(!result.get("live_roots_accessed").flag());
 }
+
+#[test]
+fn insensitive_expression_uses_one_mode_for_anchor_required_and_excluded_terms() {
+    let fixture = Fixture::new();
+    fixture.file("src/a.rs", "ÄPFEL REQUIRED".as_bytes());
+    fixture.file("src/b.rs", &utf16("ÄPFEL REQUIRED FORBIDDEN"));
+    fixture.file("src/c.rs", "ÄPFEL unrelated".as_bytes());
+    fixture.file("elsewhere/d.rs", "ÄPFEL REQUIRED".as_bytes());
+    let query = "äpfel required -forbidden path:src/ lang:rust";
+    let (exit, exact) = invoke(&fixture.live(query), || false);
+    assert_eq!(exit, EXIT_NO_MATCH); assert!(exact.get("case_sensitive").flag());
+    let mut args = fixture.live(query); args.push("--ignore-case".into());
+    let (exit, result) = invoke(&args, || false);
+    assert_eq!(exit, EXIT_OK, "{result:?}");
+    assert!(result.get("workspace_complete").flag()); assert!(!result.get("case_sensitive").flag());
+    assert_eq!(result.get("matches_seen").number(), 1);
+    assert_eq!(result.get("metadata_excluded_files").number(), 1);
+    let hit = &result.get("hits").array()[0];
+    assert_eq!(hit.get("path").get("hex").text(), "7372632f612e7273");
+    assert_eq!(hit.get("matched_text").text(), "ÄPFEL");
+    assert_eq!(hit.get("original_range").get("start").number(), 0);
+    assert_eq!(hit.get("original_range").get("end").number(), 6);
+}

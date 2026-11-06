@@ -58,8 +58,7 @@ pub(super) fn execute(args: &Arguments, query: &ParsedQuery, catalog: &Workspace
     let manifest = SearchManifest::new(original.id(), &documents, &unavailable, original.membership(),
         ManifestLimits { max_files: count, max_path_bytes: 16_384 })?;
     let index = EphemeralIndex::build(manifest, IndexLimits::default(), budget, allocation(36), &mut *canceled)?;
-    let mut options = QueryOptions::new(generation()).with_max_matches(args.limit.max(1));
-    options.max_bytes_scanned = Some(args.max_scan_bytes);
+    let options = args.text_query_options(generation());
     let report = index.search(query, options, budget, allocation(37), &mut *canceled)?;
     if canceled() { return Err(AppError::Canceled); }
     catalog.validate_active()?;
@@ -73,6 +72,7 @@ pub(super) fn execute(args: &Arguments, query: &ParsedQuery, catalog: &Workspace
     if args.json {
         common(out, "search", catalog, root)?;
         out.literal(",\"mode\":\"decoded-text-expression\",\"expression\":")?; out.quoted(&query.raw_query)?;
+        out.literal(",\"case_sensitive\":")?; out.boolean(!args.ignore_case)?;
         out.literal(",\"predicate_scope\":\"same-complete-capture\",\"path_filter_domain\":\"utf8-or-escaped-search-key\",\"scope_files\":")?;
         out.integer(scope_files as u64)?;
         out.literal(",\"metadata_excluded_files\":")?; out.integer((count - scope_files) as u64)?;
@@ -117,6 +117,7 @@ pub(super) fn execute(args: &Arguments, query: &ParsedQuery, catalog: &Workspace
         out.literal(if complete { "Complete expression search over selected workspace files\n" }
             else { "PARTIAL expression search: inspect scope, source, work and result limits\n" })?;
         out.literal("Query: ")?; out.human_text(&query.raw_query)?; out.literal("\n")?;
+        if args.ignore_case { out.literal("Text case: Unicode lowercase comparison\n")?; }
         for hit in result.matches.iter().take(args.limit) {
             if canceled() { return Err(AppError::Canceled); }
             out.path(&catalog.entry(hit.file_id).ok_or(AppError::InvalidRange)?.path().raw().to_path_buf())?;

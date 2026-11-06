@@ -43,8 +43,14 @@ bytes and 64 tokens. The first positive term or quoted phrase supplies the
 returned occurrence ranges. Additional positive terms are document-wide AND
 predicates; `+term` is also accepted. `-term` and `-"quoted phrase"` exclude a file
 when that text occurs anywhere in that same capture. Quoted phrases support
-escaped quotes and backslashes. Every text comparison is case-sensitive exact
-decoded matching, not a compiler symbol or whole-word match.
+escaped quotes and backslashes. Text comparisons are case-sensitive decoded
+matching by default. Live captured-workspace expressions accept `--ignore-case`,
+which applies the existing Unicode lowercase comparison to primary, required and
+excluded text together. Metadata path/type filters keep their existing semantics.
+The result declares `case_sensitive`, and hits retain the original source spelling
+and complete contributing source byte ranges. Snapshot expressions retain their
+existing case-sensitive semantics. Neither route implies compiler symbols or
+whole-word matching.
 
 Positive predicates may occur on different lines, but never in different files.
 Predicate occurrences do not multiply the primary hits. Overlapping primary

@@ -16,7 +16,7 @@ use fcb::source::path::NormalizedPath;
 use fcb::search::{CaptureRequest, CompleteCapture, ExtentConsistency, ExtentReadState,
     ExtentStepBudget, FileRangeReader, IndexLimits, ParsedQuery, PathEntry, PathIndex,
     PathIndexLimits, PathSearch, PathSearchOptions, RawPath, ResourceBudget, RootId,
-    QueryOptions, SearchCoverage, SearchManifestId};
+    SearchCoverage, SearchManifestId};
 use fcb::search::workspace::{RootGrant, RuleLimits, WorkspaceCatalog, WorkspaceCaptures,
     WorkspaceLimits, WorkspaceStage};
 use crate::{AppError, EXIT_OK, EXIT_NO_MATCH, EXIT_PARTIAL, SCHEMA, allocation,
@@ -183,11 +183,17 @@ fn text(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str,
     let query = ParsedQuery { primary_needle: needle.to_owned(), is_phrase: true,
         conjunction_terms: Vec::new(), exclusion_terms: Vec::new(), path_filters: Vec::new(),
         lang_filters: Vec::new(), raw_query: needle.to_owned() };
-    let options = QueryOptions::new(generation()).with_max_matches(args.limit);
+    let options = args.text_query_options(generation());
     let report = index.search(&query, options, budget, allocation(37), &mut *canceled)?;
     if canceled() { return Err(AppError::Canceled); }
     let result = report.capture_results();
-    let truncated = matches!(result.coverage, SearchCoverage::TruncatedAtLimit { .. });
+    // A zero row limit still needs a one-hit probe to distinguish a complete
+    // negative from a matching source with no retained display rows.
+    let truncated = (args.limit == 0 && result.total_matches_counted > 0)
+        || matches!(result.coverage, SearchCoverage::TruncatedAtLimit { .. });
+    let complete = report.is_complete() && !truncated;
+    let matches_seen = if args.limit == 0 { result.total_matches_counted.min(1) }
+        else { result.total_matches_counted };
     if args.json {
         // One digest slot per admitted catalog entry; only matched captures are hashed.
         // Keep the reservation alive through serialization and never reopen live paths.
@@ -202,16 +208,20 @@ fn text(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str,
         if digests.capacity() > count { return Err(AppError::Admission); }
         digests.resize(count, None);
         common(out, "search", catalog, root)?;
-        out.literal(",\"mode\":\"decoded-text-literal\",\"workspace_complete\":")?; out.boolean(report.is_complete())?;
+        out.literal(",\"mode\":\"decoded-text-literal\",\"case_sensitive\":")?; out.boolean(!args.ignore_case)?;
+        out.literal(",\"workspace_complete\":")?; out.boolean(complete)?;
         out.literal(",\"truncated\":")?; out.boolean(truncated)?;
+        out.literal(",\"work_limited\":")?; out.boolean(matches!(result.coverage, SearchCoverage::BudgetExhausted { .. }))?;
+        out.literal(",\"max_scan_bytes\":")?; out.integer(args.max_scan_bytes)?;
+        out.literal(",\"scanned_input_bytes\":")?; out.integer(result.scanned_bytes)?;
         out.literal(",\"payload_bytes_read\":")?; out.integer(io.bytes)?;
         out.literal(",\"read_calls\":")?; out.integer(io.calls)?;
         out.literal(",\"captured_bytes\":")?; out.integer(captures.captured_bytes() as u64)?;
         out.literal(",\"index_skipped_files\":")?; out.integer(report.skipped_by_index() as u64)?;
         out.literal(",\"fallback_scans\":")?; out.integer(report.fallback_attempts() as u64)?;
-        out.literal(",\"matches_seen\":")?; out.integer(result.total_matches_counted as u64)?;
+        out.literal(",\"matches_seen\":")?; out.integer(matches_seen as u64)?;
         out.literal(",\"hits\":[")?;
-        for (i, hit) in result.matches.iter().enumerate() {
+        for (i, hit) in result.matches.iter().take(args.limit).enumerate() {
             if canceled() { return Err(AppError::Canceled); }
             if i > 0 { out.literal(",")?; }
             out.literal("{\"file_id\":")?; out.integer(hit.file_id.get())?;
@@ -257,8 +267,9 @@ fn text(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str,
         }
         out.literal("]}\n")?;
     } else {
-        out.literal(if report.is_complete() { "Complete captured-workspace search\n" } else { "PARTIAL workspace search\n" })?;
-        for hit in &result.matches {
+        out.literal(if complete { "Complete captured-workspace search\n" } else { "PARTIAL workspace search\n" })?;
+        if args.ignore_case { out.literal("Text case: Unicode lowercase comparison\n")?; }
+        for hit in result.matches.iter().take(args.limit) {
             out.path(&catalog.entry(hit.file_id).ok_or(AppError::InvalidRange)?.path().raw().to_path_buf())?;
             out.literal(" bytes ")?; out.literal(&hit.original_byte_range.start().get().to_string())?;
             out.literal("..")?; out.literal(&hit.original_byte_range.end().get().to_string())?; out.literal("\n")?;
@@ -268,7 +279,7 @@ fn text(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str,
         out.literal("; unsupported text files: ")?; out.literal(&result.unsupported_files.len().to_string())?; out.literal("\n")?;
     }
     catalog.validate_active()?;
-    Ok(if !report.is_complete() { EXIT_PARTIAL } else if result.matches.is_empty() { EXIT_NO_MATCH } else { EXIT_OK })
+    Ok(if !complete { EXIT_PARTIAL } else if matches_seen == 0 { EXIT_NO_MATCH } else { EXIT_OK })
 }
 
 fn file_record(out: &mut Output, catalog: &WorkspaceCatalog, file: fcb::FileId) -> Result<(), AppError> {

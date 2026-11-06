@@ -228,3 +228,60 @@ fn text_hit_identity_covers_the_entire_capture_not_only_matching_bytes() {
     assert_eq!(before.get("payload_bytes_read").number(), first.len() as u64);
     assert_eq!(after.get("payload_bytes_read").number(), second.len() as u64);
 }
+
+#[test]
+fn insensitive_literals_preserve_original_unicode_spans_across_encodings() {
+    use std::os::unix::ffi::OsStrExt;
+    let tree = Tree::new();
+    let source = "prefix ÄPFEL suffix";
+    tree.file("a.rs", source.as_bytes());
+    tree.file("b.rs", &utf16(source, true));
+    tree.file("c.rs", &utf16(source, false));
+    let (exit, exact) = run(&tree, "search", &["--text", "äpfel"]);
+    assert_eq!(exit, EXIT_NO_MATCH); assert!(exact.get("case_sensitive").flag());
+    assert!(exact.get("hits").array().is_empty(), "negative control must remain case sensitive");
+    let (exit, result) = run(&tree, "search", &["--text", "äpfel", "--ignore-case"]);
+    assert_eq!(exit, EXIT_OK, "{result:?}");
+    assert!(result.get("workspace_complete").flag()); assert!(!result.get("case_sensitive").flag());
+    assert_eq!(result.get("matches_seen").number(), 3);
+    assert_eq!(result.get("index_skipped_files").number(), 0, "exact grams cannot prove an insensitive negative");
+    assert_eq!(result.get("fallback_scans").number(), 3);
+    for hit in result.get("hits").array() {
+        let path = unhex(hit.get("path").get("hex").text());
+        let bytes = fs::read(tree.0.join(OsStr::from_bytes(&path))).unwrap();
+        let start = hit.get("original_range").get("start").number() as usize;
+        let end = hit.get("original_range").get("end").number() as usize;
+        let selected = &bytes[start..end];
+        let expected = if path == b"a.rs" { "ÄPFEL".as_bytes().to_vec() }
+            else { utf16("ÄPFEL", path == b"b.rs")[2..].to_vec() };
+        assert_eq!(selected, expected);
+        assert_eq!(hit.get("matched_text").text(), "ÄPFEL");
+        assert_eq!(hit.get("capture_sha256").text(), fcb::store::Sha256::digest(&bytes).to_hex());
+    }
+}
+
+#[test]
+fn zero_literal_limit_probes_for_existence_without_emitting_rows() {
+    let tree = Tree::new(); tree.file("a.rs", b"alpha");
+    let (exit, absent) = run(&tree, "search", &["--text", "z", "--limit", "0"]);
+    assert_eq!(exit, EXIT_NO_MATCH, "{absent:?}");
+    assert!(absent.get("workspace_complete").flag()); assert!(!absent.get("truncated").flag());
+    assert_eq!(absent.get("matches_seen").number(), 0); assert!(absent.get("hits").array().is_empty());
+    let (exit, present) = run(&tree, "search", &["--text", "a", "--limit", "0"]);
+    assert_eq!(exit, EXIT_PARTIAL, "{present:?}");
+    assert!(!present.get("workspace_complete").flag()); assert!(present.get("truncated").flag());
+    assert_eq!(present.get("matches_seen").number(), 1); assert!(present.get("hits").array().is_empty());
+}
+
+#[test]
+fn literal_verification_budget_cannot_be_reported_as_complete_absence() {
+    let tree = Tree::new(); tree.file("a.rs", b"prefix needle suffix");
+    let (exit, partial) = run(&tree, "search", &["--text", "needle", "--max-scan-bytes", "8"]);
+    assert_eq!(exit, EXIT_PARTIAL, "{partial:?}");
+    assert!(!partial.get("workspace_complete").flag()); assert!(partial.get("work_limited").flag());
+    assert_eq!(partial.get("scanned_input_bytes").number(), 8);
+    assert_eq!(partial.get("max_scan_bytes").number(), 8); assert!(partial.get("hits").array().is_empty());
+    let (exit, complete) = run(&tree, "search", &["--text", "needle", "--max-scan-bytes", "20"]);
+    assert_eq!(exit, EXIT_OK, "{complete:?}"); assert!(complete.get("workspace_complete").flag());
+    assert!(!complete.get("work_limited").flag()); assert_eq!(complete.get("matches_seen").number(), 1);
+}
