@@ -2,6 +2,30 @@ import Foundation
 import Observation
 import Dispatch
 
+/// Closing is reviewed against this exact accepted desk and these exact draft
+/// edits. A nested AppKit event loop must not turn approval for older work into
+/// permission to discard a newer note or a newly completed mutation.
+struct AtlasDeskDraftRevision: Hashable, Sendable {
+    let id: UUID
+    let revision: UUID
+}
+struct AtlasDeskCloseSnapshot: Equatable, Sendable {
+    let owner: UInt64?
+    let revision: UInt64?
+    let busy: Bool
+    let unsavedContents: Bool
+    let unverifiedChanges: Bool
+    let drafts: Set<AtlasDeskDraftRevision>
+    var requiresReview: Bool { busy || unsavedContents || unverifiedChanges || !drafts.isEmpty }
+    static let empty = Self(owner: nil, revision: nil, busy: false, unsavedContents: false,
+        unverifiedChanges: false, drafts: [])
+}
+private struct AtlasDeskCheckpointRevision: Equatable, Sendable {
+    let owner: UInt64
+    let revision: UInt64
+    init(_ state: AtlasDeskState) { owner = state.owner; revision = state.revision }
+}
+
 /// Holds a native handle until its final worker operation drains. Closing is
 /// dispatched away from the interaction thread because retained sources can be
 /// released there. Immutable closures and the handle are safe to share.
@@ -76,6 +100,10 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
     private(set) var notice = "Keep exact source captures, add bookmarks and personal notes, and save your reading desk."
     private(set) var lastSave: AtlasDeskSaveReceipt?
     private(set) var lastExport: AtlasDeskSourcePackReceipt?
+    private(set) var hasUnverifiedChanges = false
+    private var acceptedRevision: AtlasDeskCheckpointRevision?
+    private var checkpointRevision: AtlasDeskCheckpointRevision?
+    private var acceptedContents = false
     var bookmarkLabel = ""
     var offsetInput = "0"
     var selectionEndInput = "0"
@@ -85,11 +113,38 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var operationCancellation: AtlasDeskCancellation?
     @ObservationIgnored private var lastIssuedAttempt: UInt64 = 0
+    @ObservationIgnored private var noteDrafts: [UUID: @MainActor () -> UUID?] = [:]
 
     init(transport: AtlasReadingDeskTransport) { self.transport = transport }
     var canOperate: Bool { !busy && !closed }
     var readerDomain: UUID? { transport.readerDomain }
-    var hasUnsavedContents: Bool { (state?.retainedSources ?? 0) > 0 || !(state?.bookmarks.isEmpty ?? true) }
+    /// A failed attempt can advance lastAttempt without changing any personal
+    /// work. Only the accepted model revision participates in dirty tracking.
+    var hasUnsavedContents: Bool {
+        guard !closed else { return false }
+        if hasUnverifiedChanges { return true }
+        guard let acceptedRevision else { return false }
+        if let checkpointRevision { return acceptedRevision != checkpointRevision }
+        return acceptedContents
+    }
+    /// Saving another copy of an unchanged or restored checkpoint is useful,
+    /// even though that desk no longer needs a close warning.
+    var hasCheckpointContents: Bool { state.map(Self.containsContents) ?? false }
+    var canSaveCheckpoint: Bool { canOperate && state != nil && (hasCheckpointContents || hasUnsavedContents) }
+    var hasOpenNoteEditor: Bool { !noteDrafts.isEmpty }
+    var closeSnapshot: AtlasDeskCloseSnapshot {
+        guard !closed else { return .empty }
+        let drafts = Set(noteDrafts.compactMap { id, readRevision in
+            readRevision().map { AtlasDeskDraftRevision(id: id, revision: $0) }
+        })
+        return AtlasDeskCloseSnapshot(owner: acceptedRevision?.owner, revision: acceptedRevision?.revision,
+            busy: busy, unsavedContents: hasUnsavedContents, unverifiedChanges: hasUnverifiedChanges, drafts: drafts)
+    }
+    /// The editor supplies a cheap live revision, never a copy of its text.
+    /// Registration ends when the editor is explicitly dismissed or its window
+    /// has passed close review; hiding the app does not dismiss the editor.
+    func registerNoteDraft(_ id: UUID, revision: @escaping @MainActor () -> UUID?) { noteDrafts[id] = revision }
+    func unregisterNoteDraft(_ id: UUID) { noteDrafts.removeValue(forKey: id) }
 
     func start() {
         guard state == nil, canOperate else { return }
@@ -110,7 +165,8 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
     /// view confirms replacement of a nonempty desk before calling this method.
     func restore(path: String, accessLease: AnyObject?) {
         guard Self.validPath(path) else { notice = AtlasReadingDeskError.invalidInput.message; return }
-        mutate(accessLease: accessLease, success: "Opened the checkpoint’s exact saved captures and personal state. Working-tree files were not reopened.") {
+        mutate(accessLease: accessLease, restoringCheckpoint: true,
+            success: "Opened the checkpoint’s exact saved captures and personal state. Working-tree files were not reopened.") {
             state, attempt in .restore(revision: state.revision, attempt: attempt, path: path)
         }
     }
@@ -138,6 +194,7 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
             let attempt = try model.nextAttempt(), request = target.request(attempt: attempt)
             let transport = model.transport
             let accepted: AtlasDeskState
+            model.hasUnverifiedChanges = true
             do {
                 let json = try await model.io.perform(keepingAlive: [lease], cancellation: cancellation) {
                     transport.run(lease.handle, request)
@@ -154,13 +211,13 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
                     }
                     accepted = try AtlasDeskState.decode(json, handle: lease.handle)
                 } catch {
-                    if !model.closed { model.state = nil; model.page = nil }
+                    if !model.closed { model.invalidateState() }
                     model.notice = "The reattachment outcome could not be verified. Reload state to inspect the saved note before choosing another destination."
                     return
                 }
             }
             guard !model.closed else { return }
-            model.state = accepted; model.page = nil
+            model.installState(accepted); model.page = nil
             let message: String
             switch target.outcome(in: accepted, attempt: attempt) {
             case .accepted:
@@ -168,6 +225,7 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
             case .notAccepted:
                 message = "Reattachment was not accepted. The saved note is unchanged; select a nonempty range with identical bytes and review the destination again."
             case .unconfirmed:
+                model.hasUnverifiedChanges = true
                 message = "The reattachment outcome remains unconfirmed. Inspect the saved note and its source range before choosing another destination."
             }
             // A page failure cannot turn a verified mapping into a failed
@@ -198,6 +256,7 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
             let submission = try AtlasDeskNoteSubmission(target: target, state: state,
                 attempt: nextAttempt(), label: label, body: body)
             let transport = transport
+            hasUnverifiedChanges = true
             do {
                 let json = try await withTaskCancellationHandler(operation: {
                     try await io.perform(keepingAlive: [lease], cancellation: cancellation) {
@@ -250,7 +309,7 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
             await installNoteState(accepted, outcome: outcome, lease: lease)
             return outcome
         } catch {
-            if !closed { state = nil; page = nil }
+            if !closed { invalidateState() }
             notice = "The note outcome could not be verified. Your draft is preserved. Check saved state before submitting another copy."
             return .unconfirmed(submission)
         }
@@ -258,7 +317,7 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
     private func installNoteState(_ accepted: AtlasDeskState, outcome: AtlasDeskNoteOutcome,
         lease: AtlasDeskSessionLease) async {
         guard !closed else { return }
-        state = accepted; page = nil
+        installState(accepted); page = nil
         let message: String
         switch outcome {
         case .accepted:
@@ -266,6 +325,7 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
         case .notAccepted:
             message = "The note change was not accepted. Your draft is preserved; review its label, text and original source range before saving again."
         case .unconfirmed:
+            hasUnverifiedChanges = true
             message = "The note outcome remains unconfirmed. Your draft is preserved; inspect the desk before discarding it or creating another copy."
         }
         // A page delivery failure must not erase an accepted personal note or
@@ -298,6 +358,7 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
             do {
                 let receipt = try AtlasDeskSaveReceipt.decode(json, state: state)
                 model.lastSave = receipt
+                if receipt.succeeded { model.checkpointRevision = AtlasDeskCheckpointRevision(state) }
                 model.notice = receipt.message
             } catch {
                 model.notice = "The save outcome could not be verified. The selected destination may contain a complete or partial checkpoint. Inspect it before retrying and use a new filename."
@@ -346,6 +407,7 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
             guard let state = model.state else { throw AtlasReadingDeskError.unavailable }
             let attempt = try model.nextAttempt()
             let transport = model.transport
+            model.hasUnverifiedChanges = true
             do {
                 let json = try await source { reader in
                     try cancellation.check()
@@ -359,7 +421,7 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
                       target.selection?.start == start, target.selection?.end == end else {
                     throw AtlasReadingDeskError.invalidResponse
                 }
-                model.state = accepted
+                model.installState(accepted)
                 model.page = nil
                 try await model.loadPage(lease)
                 model.notice = "Kept the exact captured page in the reading desk. Name a bookmark to keep this location in your saved desk."
@@ -445,18 +507,20 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
         else { releaseSession() }
     }
 
-    private func mutate(accessLease: AnyObject? = nil, success: String? = nil,
+    private func mutate(accessLease: AnyObject? = nil, restoringCheckpoint: Bool = false, success: String? = nil,
         _ request: @escaping @MainActor (AtlasDeskState, UInt64) -> AtlasDeskRequest) {
         perform(accessLease: accessLease) { model, access, cancellation in
             let lease = try await model.ensureStarted(cancellation)
             guard let state = model.state else { throw AtlasReadingDeskError.unavailable }
             let attempt = try model.nextAttempt()
             let request = request(state, attempt), transport = model.transport
+            model.hasUnverifiedChanges = true
             do {
                 let json = try await model.io.perform(keepingAlive: [lease] + access, cancellation: cancellation) {
                     transport.run(lease.handle, request)
                 }
-                model.state = try AtlasDeskState.decode(json, handle: lease.handle, acceptedAttempt: attempt)
+                let accepted = try AtlasDeskState.decode(json, handle: lease.handle, acceptedAttempt: attempt)
+                model.installState(accepted, fromCheckpoint: restoringCheckpoint)
                 model.page = nil
                 try await model.loadPage(lease)
                 model.notice = success ?? "Reading desk updated. Save a new checkpoint to retain this state after closing the app."
@@ -464,6 +528,12 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
                 // State may have committed before a delivery/encoding/cancel
                 // error. Never replay the operation to guess its outcome.
                 try? await model.reconcile(lease)
+                // An accepted revision equal to this restore's unique attempt
+                // proves its outcome even when the initial reply was lost.
+                if restoringCheckpoint, let accepted = model.state,
+                   accepted.revision == attempt, accepted.lastAttempt == attempt {
+                    model.checkpointRevision = AtlasDeskCheckpointRevision(accepted)
+                }
                 throw error
             }
         }
@@ -497,7 +567,7 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
         else { lease = try AtlasDeskSessionLease(transport: transport); session = lease }
         let transport = transport
         let json = try await io.perform(keepingAlive: [lease], cancellation: cancellation) { transport.run(lease.handle, .start) }
-        do { state = try AtlasDeskState.decode(json, handle: lease.handle) }
+        do { installState(try AtlasDeskState.decode(json, handle: lease.handle)) }
         catch {
             // Start may already have accepted before a response was lost.
             do { try await reconcile(lease) }
@@ -511,15 +581,18 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
         guard !closed else { throw AtlasReadingDeskError.unavailable }
         let transport = transport
         let json = try await io.perform(keepingAlive: [lease]) { transport.run(lease.handle, .state) }
+        let accepted: AtlasDeskState
         do {
-            state = try AtlasDeskState.decode(json, handle: lease.handle)
-            page = nil
-            try await loadPage(lease)
+            accepted = try AtlasDeskState.decode(json, handle: lease.handle)
         } catch {
             // An unverified revision must not authorize the next mutation.
-            state = nil; page = nil
+            invalidateState()
             throw error
         }
+        installState(accepted); page = nil
+        // Page delivery is not the mutation receipt. Keep verified personal
+        // state and its persistence baseline if only this read fails.
+        try await loadPage(lease)
     }
     private func loadPage(_ lease: AtlasDeskSessionLease) async throws {
         guard !closed else { throw AtlasReadingDeskError.unavailable }
@@ -537,7 +610,19 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
         lastIssuedAttempt = current + 1
         return lastIssuedAttempt
     }
-    private func releaseSession() { page = nil; state = nil; session = nil }
+    private func installState(_ accepted: AtlasDeskState, fromCheckpoint: Bool = false) {
+        let version = AtlasDeskCheckpointRevision(accepted)
+        let contents = Self.containsContents(accepted)
+        if fromCheckpoint || (acceptedRevision == nil && !contents) { checkpointRevision = version }
+        state = accepted; acceptedRevision = version; acceptedContents = contents; hasUnverifiedChanges = false
+    }
+    private func invalidateState() {
+        state = nil; page = nil; hasUnverifiedChanges = true
+    }
+    private static func containsContents(_ state: AtlasDeskState) -> Bool {
+        state.retainedSources > 0 || !state.panes.isEmpty || !state.bookmarks.isEmpty || state.canBack || state.canForward
+    }
+    private func releaseSession() { page = nil; state = nil; session = nil; noteDrafts.removeAll() }
     private static func validPath(_ path: String) -> Bool {
         path.hasPrefix("/") && path.utf8.count <= 16_384 && !path.utf8.contains(0)
     }

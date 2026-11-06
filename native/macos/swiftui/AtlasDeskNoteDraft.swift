@@ -6,11 +6,27 @@ import Observation
 @Observable @MainActor final class AtlasDeskNoteDraft: Identifiable {
     let id = UUID()
     private(set) var target: AtlasDeskNoteTarget
-    var label: String
-    var body: String
+    var label: String {
+        didSet { if !label.utf8.elementsEqual(oldValue.utf8) { closeRevision = UUID() } }
+    }
+    var body: String {
+        didSet { if !body.utf8.elementsEqual(oldValue.utf8) { closeRevision = UUID() } }
+    }
     private(set) var saving = false
     private(set) var pending: AtlasDeskNoteSubmission?
     private(set) var message = ""
+    private var acceptedLabel = ""
+    private var acceptedBody = ""
+    private var closeRevision = UUID()
+
+    /// An unchanged existing note needs no extra prompt. Comparison uses the
+    /// original UTF-8, including canonically equivalent but distinct edits.
+    var hasUnsavedChanges: Bool {
+        saving || pending != nil || (target.isNew
+            ? !label.isEmpty || !body.isEmpty
+            : !label.utf8.elementsEqual(acceptedLabel.utf8) || !body.utf8.elementsEqual(acceptedBody.utf8))
+    }
+    var closeProtectionRevision: UUID? { hasUnsavedChanges ? closeRevision : nil }
 
     init(state: AtlasDeskState, pane: AtlasDeskPane, label: String = "") {
         target = AtlasDeskNoteTarget(state: state, pane: pane)
@@ -19,6 +35,7 @@ import Observation
     init(state: AtlasDeskState, bookmark: AtlasDeskBookmark) {
         target = AtlasDeskNoteTarget(state: state, bookmark: bookmark)
         label = bookmark.label; body = bookmark.body
+        acceptedLabel = bookmark.label; acceptedBody = bookmark.body
     }
 
     func validation(in model: AtlasReadingDeskModel) -> String? {
@@ -58,10 +75,12 @@ import Observation
         return finish(await model.resolveNote(pending), model: model)
     }
     private func finish(_ outcome: AtlasDeskNoteOutcome, model: AtlasReadingDeskModel) -> Bool {
+        closeRevision = UUID()
         switch outcome {
         case .accepted(let bookmark):
             pending = nil
             target = AtlasDeskNoteTarget(owner: target.owner, bookmark: bookmark)
+            acceptedLabel = bookmark.label; acceptedBody = bookmark.body
             // Even a programmatic edit during delivery cannot discard newer
             // draft text. Its next explicit save edits this accepted note.
             guard label.utf8.elementsEqual(bookmark.label.utf8), body.utf8.elementsEqual(bookmark.body.utf8) else {

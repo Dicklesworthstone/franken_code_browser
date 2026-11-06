@@ -16,7 +16,20 @@ private final class Fixture: @unchecked Sendable {
     private var exports = 0
     private var closes = 0
     private var lostMutationResponse = false
+    private var failedStateReads = 0
+    private var failedPageReads = 0
+    private var rejectedMutation = false
     private var canceledSave = false
+    private var lostSaveResponse = false
+    private var wrongSaveRevision = false
+    private var acceptedRestore = false
+    private struct Checkpoint {
+        let captured: Bool
+        let position: UInt64
+        let selected: (UInt64, UInt64)?
+        let marks: [(UInt64, String, UInt64)]
+    }
+    private var checkpoint: Checkpoint?
     private var canceledExport = false
     private var lostExportResponse = false
     private var openedGate: DispatchSemaphore?
@@ -31,8 +44,14 @@ private final class Fixture: @unchecked Sendable {
             cancel: { _ in true }, close: { [self] _ in locked { closes += 1 }; return true },
             retirementFailed: { fatalError("retirement refused") }, readerDomain: readerDomain)
     }
-    func loseNextMutationReply() { locked { lostMutationResponse = true } }
+    func loseNextMutationReply(stateFailures: Int = 0) { locked { lostMutationResponse = true; failedStateReads = stateFailures } }
+    func rejectNextMutation() { locked { rejectedMutation = true } }
+    func failNextPages(_ count: Int) { locked { failedPageReads = count } }
     func returnCanceledSave() { locked { canceledSave = true } }
+    func returnSuccessfulSave() { locked { canceledSave = false } }
+    func loseNextSaveReply() { locked { lostSaveResponse = true } }
+    func returnWrongSaveRevision() { locked { wrongSaveRevision = true } }
+    func acceptNextRestore() { locked { acceptedRestore = true } }
     func returnCanceledExport() { locked { canceledExport = true } }
     func loseNextExportReply() { locked { lostExportResponse = true } }
     func gateNextStart(entered: DispatchSemaphore, resume: DispatchSemaphore) { gate(.start, entered, resume) }
@@ -68,7 +87,9 @@ private final class Fixture: @unchecked Sendable {
             precondition(handle == owner)
             switch request {
             case .start: starts += 1; return state()
-            case .state: return state()
+            case .state:
+                if failedStateReads > 0 { failedStateReads -= 1; return nil }
+                return state()
             case .capture(let expected, let attempt, _):
                 guard expected == revision, attempt > lastAttempt else { return error("DESK_STALE_ATTEMPT") }
                 revision = attempt; lastAttempt = attempt; captured = true; position = 0; selected = nil; mutations += 1
@@ -81,19 +102,29 @@ private final class Fixture: @unchecked Sendable {
                 return state()
             case .apply(let expected, let attempt, let kind, _, let start, _, let label):
                 guard expected == revision, attempt > lastAttempt else { return error("DESK_STALE_ATTEMPT") }
-                revision = attempt; lastAttempt = attempt; mutations += 1
+                lastAttempt = attempt
+                if rejectedMutation { rejectedMutation = false; return error("DESK_CANCELED") }
+                revision = attempt; mutations += 1
                 if kind == 3 { marks.append((UInt64(marks.count + 1), label, position)) }
                 if kind == 1 { position = start }
                 if lostMutationResponse { lostMutationResponse = false; return nil }
                 return state()
-            case .restore:
-                return error("DESK_CHECKPOINT_INTEGRITY")
+            case .restore(let expected, let attempt, _):
+                guard expected == revision, attempt > lastAttempt else { return error("DESK_STALE_ATTEMPT") }
+                lastAttempt = attempt
+                guard acceptedRestore, let checkpoint else { return error("DESK_CHECKPOINT_INTEGRITY") }
+                acceptedRestore = false; revision = attempt; mutations += 1
+                captured = checkpoint.captured; position = checkpoint.position
+                selected = checkpoint.selected; marks = checkpoint.marks
+                if lostMutationResponse { lostMutationResponse = false; return nil }
+                return state()
             case .openReader:
                 return error("DESK_READER_TRANSFER_NOT_IN_THIS_FIXTURE")
             case .annotate, .editBookmark:
                 return error("DESK_NOTES_USE_DEDICATED_FIXTURE")
             case .window(let expected, let pane, let offset):
                 guard expected == revision, pane == 1, offset <= UInt64(text.utf8.count) else { return error("DESK_INVALID_LOCATION") }
+                if failedPageReads > 0 { failedPageReads -= 1; return nil }
                 var w = header("window")
                 w.merge(location(position)) { _, new in new }
                 w["pane"] = "1"; w["original_range"] = ["start": String(offset), "end": String(text.utf8.count)]
@@ -105,7 +136,12 @@ private final class Fixture: @unchecked Sendable {
             case .save(let expected, _, let bytes):
                 precondition(expected == revision && bytes == (captured ? UInt64(text.utf8.count) : 0))
                 saves += 1
+                if !canceledSave {
+                    checkpoint = Checkpoint(captured: captured, position: position, selected: selected, marks: marks)
+                }
+                if lostSaveResponse { lostSaveResponse = false; return nil }
                 var w = header("save")
+                if wrongSaveRevision { wrongSaveRevision = false; w["model_revision"] = String(revision + 1) }
                 w["status"] = canceledSave ? "error" : "ok"
                 w["effect"] = canceledSave ? "destination-created-incomplete" : "complete-file-and-parent-sync-requested"
                 w["bytes_written"] = canceledSave ? "8" : "256"; w["checkpoint_bytes"] = "256"
@@ -205,6 +241,7 @@ private final class Grant {
         model.close()
         await cancellationAdmission()
         await exportLifecycle()
+        await checkpointTracking()
         let desk = AtlasReadingDeskModel(transport: fixture.transport)
         desk.capture(path: "/chosen/source.rs", accessLease: nil); await idle(desk)
         precondition(desk.state?.retainedSources == 1 && desk.page?.text == fixture.text)
@@ -320,6 +357,7 @@ private final class Grant {
         desk.exportSourcePack(reviewed, limits: limits, path: "/chosen/evidence.json", accessLease: nil)
         await idle(desk)
         precondition(fixture.exportCount == 1 && desk.lastExport?.succeeded == true)
+        precondition(desk.hasUnsavedContents, "a source pack export is not a saved reading desk checkpoint")
         precondition(desk.lastExport?.complete == false && desk.lastExport?.omittedNoSelection == 1)
         precondition(desk.notice.contains("All labels and full notes are included"))
 
@@ -355,6 +393,68 @@ private final class Grant {
         precondition(flag.value == 1 && fixture.closeCount == 1)
     }
 
+    @MainActor static func checkpointTracking() async {
+        let fixture = Fixture(), desk = AtlasReadingDeskModel(transport: fixture.transport)
+        precondition(!desk.closeSnapshot.requiresReview && !desk.canSaveCheckpoint)
+        desk.start(); await idle(desk)
+        precondition(!desk.hasUnsavedContents && !desk.hasCheckpointContents)
+        desk.capture(path: "/chosen/source.rs", accessLease: nil); await idle(desk)
+        precondition(desk.hasUnsavedContents && desk.closeSnapshot.requiresReview)
+        desk.save(path: "/chosen/first.fcbdesk", accessLease: nil); await idle(desk)
+        let firstSaved = desk.state!.revision
+        precondition(desk.lastSave?.succeeded == true && !desk.hasUnsavedContents)
+        precondition(!desk.closeSnapshot.requiresReview && desk.hasCheckpointContents && desk.canSaveCheckpoint,
+            "a clean saved desk remains available for Save new checkpoint")
+
+        fixture.rejectNextMutation()
+        desk.apply(kind: 1, subject: 1, start: 1); await idle(desk)
+        precondition(desk.state?.revision == firstSaved && desk.state!.lastAttempt > firstSaved)
+        precondition(!desk.hasUnsavedContents, "an attempt-only failure must not dirty saved content")
+        desk.apply(kind: 1, subject: 1, start: 2); await idle(desk)
+        precondition(desk.hasUnsavedContents, "accepted reading locations are part of the checkpoint")
+
+        fixture.returnCanceledSave()
+        desk.save(path: "/chosen/partial.fcbdesk", accessLease: nil); await idle(desk)
+        precondition(desk.lastSave?.succeeded == false && desk.hasUnsavedContents)
+        fixture.returnSuccessfulSave(); fixture.loseNextSaveReply()
+        desk.save(path: "/chosen/missing-receipt.fcbdesk", accessLease: nil); await idle(desk)
+        precondition(desk.lastSave == nil && desk.hasUnsavedContents,
+            "a possibly written checkpoint is not a verified persistence baseline")
+        fixture.returnWrongSaveRevision()
+        desk.save(path: "/chosen/wrong-revision.fcbdesk", accessLease: nil); await idle(desk)
+        precondition(desk.lastSave == nil && desk.hasUnsavedContents,
+            "a success receipt for another revision must not permit closing")
+
+        let entered = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
+        fixture.gateNextSave(entered: entered, resume: resume)
+        desk.save(path: "/chosen/complete.fcbdesk", accessLease: nil)
+        await Self.entered(entered)
+        precondition(desk.closeSnapshot.busy && desk.closeSnapshot.requiresReview)
+        desk.cancel(); resume.signal(); await idle(desk)
+        precondition(desk.lastSave?.succeeded == true && !desk.hasUnsavedContents,
+            "cancellation after an entered successful write cannot erase its terminal receipt")
+
+        desk.bookmarkLabel = "Work after checkpoint"; desk.bookmark(); await idle(desk)
+        precondition(desk.hasUnsavedContents && desk.state?.bookmarks.count == 1)
+        fixture.acceptNextRestore(); fixture.loseNextMutationReply()
+        desk.restore(path: "/chosen/complete.fcbdesk", accessLease: nil); await idle(desk)
+        precondition(desk.state?.bookmarks.isEmpty == true && !desk.hasUnsavedContents,
+            "a reconciled accepted restore establishes its own clean revision")
+        precondition(desk.canSaveCheckpoint)
+
+        desk.bookmarkLabel = "Unknown outcome"; fixture.loseNextMutationReply(stateFailures: 1)
+        desk.bookmark(); await idle(desk)
+        precondition(desk.state == nil && desk.hasUnverifiedChanges && desk.closeSnapshot.requiresReview,
+            "losing state delivery must not make possibly committed personal work look empty")
+        desk.reload(); await idle(desk)
+        precondition(desk.state?.bookmarks.count == 1 && !desk.hasUnverifiedChanges && desk.hasUnsavedContents)
+        fixture.acceptNextRestore(); fixture.failNextPages(2)
+        desk.restore(path: "/chosen/complete.fcbdesk", accessLease: nil); await idle(desk)
+        precondition(desk.state != nil && desk.page == nil && !desk.hasUnverifiedChanges && !desk.hasUnsavedContents,
+            "a missing source page must not invalidate the verified checkpoint restore")
+        desk.close()
+    }
+
     static func wireNegativeControls() throws {
         let f = Fixture(), transport = f.transport
         let json = transport.run(f.owner, .start)!
@@ -385,6 +485,9 @@ private final class Grant {
             catch { }
         }
         var invalid = saved; invalid["checkpoint_digest"] = NSNull(); rejectsSave(invalid)
+        invalid = saved; invalid["owner"] = "45"; rejectsSave(invalid)
+        invalid = saved; invalid["model_revision"] = "0"; rejectsSave(invalid)
+        invalid = saved; invalid["last_attempt"] = "0"; rejectsSave(invalid)
         invalid = saved; invalid["checkpoint_digest"] = NSNull(); invalid["checkpoint_bytes"] = "0"; invalid["bytes_written"] = "0"; rejectsSave(invalid)
         invalid = saved; invalid["status"] = "error"; invalid["error"] = ["code": "DESK_CHECKPOINT_IO"]; rejectsSave(invalid)
         invalid["effect"] = "none"; rejectsSave(invalid)

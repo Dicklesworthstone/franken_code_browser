@@ -261,6 +261,7 @@ extension AtlasCamera {
     @State private var finderReaderCapture: AtlasProgressiveFileCapture?
     @State private var readingDesk = AtlasReadingDeskModel(transport: .native)
     @State private var showsReadingDesk = false
+    @State private var reviewDeskAfterSheetDismissal = false
     @State private var savedRepository = AtlasSavedRepositoryModel(transport: .native)
     @State private var showsSavedRepository = false
     @State private var pinnedReaders = AtlasPinnedReaders<AtlasPagedReaderModel>(
@@ -356,6 +357,7 @@ extension AtlasCamera {
             }
         }
         .frame(minWidth: 1180, minHeight: 740)
+        .background(AtlasDeskCloseProtection(model: readingDesk, review: reviewReadingDeskBeforeClosing))
         .toolbar {
             Button {
                 showsSidebar = true
@@ -410,9 +412,11 @@ extension AtlasCamera {
             .disabled(!searchIsCurrent || hits.isEmpty)
             .help("Next search match (⌘G)")
         }
-        .sheet(isPresented: $showsFileFinder) { fileFinderSheet }
+        .sheet(isPresented: $showsFileFinder, onDismiss: finishReadingDeskReview) { fileFinderSheet }
         .sheet(isPresented: $showsReadingDesk) { AtlasReadingDeskView(model: readingDesk) }
-        .sheet(isPresented: $showsSavedRepository) { AtlasSavedRepositoryView(model: savedRepository, desk: readingDesk) }
+        .sheet(isPresented: $showsSavedRepository, onDismiss: finishReadingDeskReview) {
+            AtlasSavedRepositoryView(model: savedRepository, desk: readingDesk)
+        }
         .onAppear {
 #if FCB_APP_STORE
             if rootAccess != nil { requestAtlasLoad() }
@@ -554,6 +558,21 @@ extension AtlasCamera {
             openFile(path, searchRow: selected, exactMatch: true)
             showsReader = true
         }
+    }
+
+    private func reviewReadingDeskBeforeClosing() {
+        guard !readingDesk.closed, !showsReadingDesk else { return }
+        if showsFileFinder || showsSavedRepository {
+            // Wait for the other sheet's actual dismissal before presenting
+            // the desk. An active note editor is preserved by the close guard.
+            reviewDeskAfterSheetDismissal = true
+            showsFileFinder = false; showsSavedRepository = false
+        } else { showsReadingDesk = true }
+    }
+    private func finishReadingDeskReview() {
+        guard reviewDeskAfterSheetDismissal else { return }
+        reviewDeskAfterSheetDismissal = false
+        if !readingDesk.closed { showsReadingDesk = true }
     }
 
     // Quick Open owns a progressive query independently of the atlas and
@@ -2339,7 +2358,8 @@ struct AtlasInputOverlay: NSViewRepresentable {
 // MARK: - App
 
 @main
-struct FrankenCodeBrowserApp: App {
+@MainActor struct FrankenCodeBrowserApp: App {
+    @NSApplicationDelegateAdaptor(AtlasDeskApplicationDelegate.self) private var applicationDelegate
     var body: some Scene {
         WindowGroup("FrankenCodeBrowser") {
             ContentView()

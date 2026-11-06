@@ -69,7 +69,13 @@ import AppKit
             }
         }.padding(20).frame(minWidth: 560, idealWidth: 680, minHeight: 560)
         .interactiveDismissDisabled()
-        .onDisappear { if draft.saving { model.cancel() } }
+        .onAppear {
+            model.registerNoteDraft(draft.id) { [weak draft] in draft?.closeProtectionRevision }
+        }
+        .onDisappear {
+            model.unregisterNoteDraft(draft.id)
+            if draft.saving { model.cancel() }
+        }
     }
     private func submit(check: Bool) {
         guard command == nil else { return }

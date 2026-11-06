@@ -36,7 +36,7 @@ private final class AtlasDeskFileAccess {
                 Button("Open checkpoint…") {
                     if model.hasUnsavedContents { confirmRestore = true } else { chooseCheckpoint() }
                 }.disabled(!model.canOperate)
-                Button("Save new checkpoint…", action: saveCheckpoint).disabled(!model.canOperate || !model.hasUnsavedContents)
+                Button("Save new checkpoint…", action: saveCheckpoint).disabled(!model.canSaveCheckpoint)
                 Menu("Export source pack…") {
                     Button("Up to 64 KiB of selected source…") { exportSourcePack(sourceBytes: 64 * 1024) }
                     Button("Up to 1 MiB of selected source…") { exportSourcePack(sourceBytes: 1024 * 1024) }

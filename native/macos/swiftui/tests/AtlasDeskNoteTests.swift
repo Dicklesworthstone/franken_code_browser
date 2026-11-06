@@ -218,6 +218,7 @@ private final class NoteFixture: @unchecked Sendable {
         await createEditRecall()
         await lostOutcomes()
         await staleAndChangedDrafts()
+        await draftCloseProtection()
         await canceledDelivery()
         await reattachmentOutcomes()
         await reattachmentGuardsAndCancellation()
@@ -229,6 +230,7 @@ private final class NoteFixture: @unchecked Sendable {
         let original = model.state!.active!.location, draft = newDraft(model), body = draft.body
         let created = await draft.save(in: model)
         precondition(created && fixture.acceptedCount == 1)
+        precondition(!draft.hasUnsavedChanges, "accepted text is no longer an unsubmitted draft")
         let mark = model.state!.bookmarks[0]
         precondition(mark.location == original && mark.updateSequence == 1 && mark.body.utf8.elementsEqual(body.utf8))
         precondition(!draft.target.isNew, "an accepted create must become an edit, not another create")
@@ -274,6 +276,7 @@ private final class NoteFixture: @unchecked Sendable {
             precondition(fixture.requestCount == 1 && fixture.acceptedCount == 1)
             if lostState {
                 precondition(!saved && draft.pending != nil && model.state == nil)
+                precondition(draft.hasUnsavedChanges && model.hasUnverifiedChanges && model.closeSnapshot.requiresReview)
                 precondition(draft.body.utf8.elementsEqual(originalBody.utf8) && !draft.canSave(in: model))
                 let retry = await draft.save(in: model)
                 precondition(!retry && fixture.requestCount == 1, "unconfirmed notes must never replay a create")
@@ -321,9 +324,45 @@ private final class NoteFixture: @unchecked Sendable {
         resume.signal()
         let dismissed = await first.value
         precondition(!dismissed && !changingDraft.target.isNew && changingDraft.body == "A newer draft arrived during delivery")
+        precondition(changingDraft.hasUnsavedChanges, "accepting an older submission cannot clear a newer draft")
         let second = await changingDraft.save(in: changingModel)
         precondition(second && changingModel.state?.bookmarks.count == 1 && changingModel.state?.bookmarks[0].updateSequence == 2)
+        precondition(!changingDraft.hasUnsavedChanges)
         changingModel.close()
+    }
+
+    @MainActor static func draftCloseProtection() async {
+        let fixture = NoteFixture(); fixture.seedBookmark(label: "Existing label", body: "e\u{301}")
+        let model = await started(fixture)
+        let draft = AtlasDeskNoteDraft(state: model.state!, bookmark: model.state!.bookmarks[0])
+        model.registerNoteDraft(draft.id) { [weak draft] in draft?.closeProtectionRevision }
+        precondition(model.hasOpenNoteEditor && model.closeSnapshot.drafts.isEmpty && !draft.hasUnsavedChanges,
+            "opening an unchanged note is not a new unsaved edit")
+        draft.body = "é"
+        precondition(draft.hasUnsavedChanges && model.closeSnapshot.drafts.count == 1,
+            "canonical-equivalent but byte-distinct personal text is still an edit")
+        let reviewed = model.closeSnapshot
+        draft.body += " A later thought."
+        precondition(model.closeSnapshot != reviewed,
+            "live editor changes invalidate close approval without changing the desk revision")
+        draft.body = "e\u{301}"
+        precondition(!draft.hasUnsavedChanges && model.closeSnapshot.drafts.isEmpty)
+        draft.label = "A new reason"
+        precondition(draft.hasUnsavedChanges && model.closeSnapshot.drafts.count == 1)
+        let accepted = await draft.save(in: model)
+        precondition(accepted && !draft.hasUnsavedChanges && model.closeSnapshot.drafts.isEmpty)
+        precondition(model.hasUnsavedContents, "keeping a draft in the desk still requires a checkpoint")
+        model.unregisterNoteDraft(draft.id)
+        precondition(!model.hasOpenNoteEditor)
+
+        let blank = AtlasDeskNoteDraft(state: model.state!, pane: model.state!.active!)
+        precondition(!blank.hasUnsavedChanges)
+        model.registerNoteDraft(blank.id) { [weak blank] in blank?.closeProtectionRevision }
+        blank.body = "An unfinished thought without a label"
+        precondition(!blank.canSave(in: model) && blank.hasUnsavedChanges && model.closeSnapshot.drafts.count == 1,
+            "validation failure must not hide unique draft text from close protection")
+        model.unregisterNoteDraft(blank.id)
+        model.close()
     }
 
     @MainActor static func canceledDelivery() async {
