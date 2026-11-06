@@ -24,6 +24,8 @@ mod structure;
 pub use structure::{AtlasStructureMode, AtlasStructureOptions, MAX_ATLAS_STRUCTURE_METADATA_BYTES,
     MAX_ATLAS_STRUCTURE_NAME_BYTES};
 use structure::{StructureQuery, StructureRow};
+mod text_matching;
+use text_matching::{matched_text_capacity, retained_text_bytes};
 
 use std::{mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, ByteRange, FileId, SourceRevision};
@@ -40,6 +42,9 @@ pub const MAX_ATLAS_SEARCH_HITS: usize = 4096;
 pub const MAX_ATLAS_SEARCH_FILES: usize = 4096;
 pub const MAX_ATLAS_SEARCH_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_ATLAS_SEARCH_NEEDLE_BYTES: usize = 1024;
+/// Original decoded spelling can be wider than the lowercased query. This
+/// bound also permits an exact reader Find on the retained matching spelling.
+pub const MAX_ATLAS_SEARCH_MATCHED_TEXT_BYTES: usize = 4 * MAX_ATLAS_SEARCH_NEEDLE_BYTES;
 pub const MAX_ATLAS_SEARCH_PAGE: usize = 128;
 const MAX_DIAGNOSTICS: usize = 128;
 
@@ -126,6 +131,11 @@ struct Snapshot {
     eligible_files: usize,
     files: Vec<RetainedFile>,
     hits: Vec<AtlasSearchHit>,
+    // Unicode lowercase hits retain their original decoded spelling by stable
+    // occurrence ordinal. Exact text reuses needle; structural rows use their
+    // own metadata. No source decoding or string creation is needed by paging.
+    matched_texts: Vec<String>,
+    matched_text_capacity: usize,
     diagnostics: Vec<Unavailable>,
     examined: usize,
     scanned: usize,
@@ -393,7 +403,11 @@ fn summary(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot) -> Resul
         else if snapshot.index_usage.is_some() { "retained-ephemeral-index" } else { "live-capture-scan" })?;
     if let Some(usage) = snapshot.index_usage { usage.encode(out)?; }
     if let Some(structure) = &snapshot.structure { structure.encode(out)?; }
-    else { out.literal(",\"mode\":\"exact-decoded-literal\"")?; }
+    else {
+        out.literal(",\"mode\":")?;
+        out.quoted(if snapshot.scope.case_sensitive() { "exact-decoded-literal" }
+            else { "unicode-lowercase-literal" })?;
+    }
     out.literal(",\"source_observation\":\"per-file-captures-not-atomic-workspace\",\"discovery_complete\":")?;
     out.boolean(atlas.atlas().discovery_complete())?;
     out.literal(",\"search_in_progress\":")?; out.boolean(snapshot.stop_reason.is_none())?;
@@ -477,6 +491,17 @@ fn encode_hit(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot,
         let position = hit.id.checked_sub(1).and_then(|id| usize::try_from(id).ok())
             .ok_or(AtlasSearchError::MissingHit)?;
         snapshot.structure_rows.get(position).ok_or(AtlasSearchError::MissingHit)?.encode(out)?;
+    } else {
+        let matched = if snapshot.scope.case_sensitive() { snapshot.needle.as_str() } else {
+            let position = hit.id.checked_sub(1).and_then(|id| usize::try_from(id).ok())
+                .ok_or(AtlasSearchError::MissingHit)?;
+            let text = snapshot.matched_texts.get(position).ok_or(AtlasSearchError::MissingHit)?;
+            if text.is_empty() || text.capacity() > snapshot.matched_text_capacity {
+                return Err(AtlasSearchError::WrongAtlas);
+            }
+            text.as_str()
+        };
+        out.literal(",\"matched_text\":")?; out.quoted(matched)?;
     }
     Ok(())
 }

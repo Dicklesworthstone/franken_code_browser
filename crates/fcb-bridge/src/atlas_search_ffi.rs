@@ -86,6 +86,29 @@ pub unsafe extern "C" fn fcb_atlas_search_begin_path_scoped(handle: u64, generat
         max_matches, max_files, max_file_bytes, max_source_bytes, true) }
 }
 
+/// Admit a literal query with frozen case semantics, path and file-type scope.
+/// case_sensitive is 1 for exact spelling or 0 for Unicode lowercase matching;
+/// other values are invalid. This is not full Unicode case folding or canonical
+/// normalization. Resume through the ordinary step/page/activation operations.
+/// # Safety
+/// Same pointer/list/path and returned-string contract as begin_path_scoped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_search_begin_matching(handle: u64, generation: u64, needle: *const c_char,
+    extensions: *const c_char, filenames: *const c_char, path_kind: u64, path: *const c_char,
+    case_sensitive: u64, max_matches: u64, max_files: u64, max_file_bytes: u64,
+    max_source_bytes: u64) -> *mut c_char {
+    unsafe { submit_matching(handle, generation, needle, extensions, filenames, path_kind, path,
+        case_sensitive, max_matches, max_files, max_file_bytes, max_source_bytes, true) }
+}
+
+fn parse_case_sensitive(value: u64) -> Result<bool, AccessError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(AccessError::InvalidArgument),
+    }
+}
+
 unsafe fn parse_scope(extensions: *const c_char, filenames: *const c_char) -> Result<AtlasSearchScope, AccessError> {
     let extensions = if extensions.is_null() { None }
         else { Some(unsafe { cstr(extensions) }.ok_or(AccessError::InvalidArgument)?) };
@@ -116,13 +139,24 @@ unsafe fn submit_with_path(handle: u64, generation: u64, needle: *const c_char,
     extensions: *const c_char, filenames: *const c_char, path_kind: u64, path: *const c_char,
     max_matches: u64, max_files: u64, max_file_bytes: u64, max_source_bytes: u64,
     progressive: bool) -> *mut c_char {
+    unsafe { submit_matching(handle, generation, needle, extensions, filenames, path_kind, path,
+        1, max_matches, max_files, max_file_bytes, max_source_bytes, progressive) }
+}
+unsafe fn submit_matching(handle: u64, generation: u64, needle: *const c_char,
+    extensions: *const c_char, filenames: *const c_char, path_kind: u64, path: *const c_char,
+    case_sensitive: u64, max_matches: u64, max_files: u64, max_file_bytes: u64,
+    max_source_bytes: u64, progressive: bool) -> *mut c_char {
     reply(|| answer(handle, |atlases| {
+        let case_sensitive = parse_case_sensitive(case_sensitive)?;
         let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
         if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES { return Err(AccessError::InvalidArgument); }
-        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?;
+        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?
+            .with_case_sensitive(case_sensitive);
         let options = AtlasSearchOptions { max_matches: number(max_matches)?, max_files: number(max_files)?,
             max_file_bytes: number(max_file_bytes)?, max_source_bytes: number(max_source_bytes)? };
-        let command = match (scope.is_all(), progressive) {
+        // The compatibility variants construct their own exact-case scope.
+        // Broad membership must not discard an insensitive query's semantics.
+        let command = match (scope.is_all() && case_sensitive, progressive) {
             (true, true) => Command::SearchBegin { generation, needle, options },
             (true, false) => Command::Search { generation, needle, options },
             (false, true) => Command::SearchBeginScoped { generation, needle, scope: &scope, options },
@@ -189,3 +223,7 @@ mod structure;
 #[cfg(all(test, unix))]
 #[path = "atlas_search_ffi_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "atlas_case_ffi_tests.rs"]
+mod case_tests;

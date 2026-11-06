@@ -119,7 +119,11 @@ impl RetainedAtlasSearch {
     pub fn begin_structure(&mut self, atlas: &AtlasSession, generation: u64, needle: &str,
         scope: AtlasSearchScope, mut options: AtlasStructureOptions,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
-        self.validate(atlas)?; self.attempt(generation)?;
+        self.validate(atlas)?;
+        // The text-only lowercase option cannot silently change or mislabel
+        // the existing case-sensitive symbol/heading-name contract.
+        if !scope.case_sensitive() { return Err(AtlasSearchError::InvalidScope); }
+        self.attempt(generation)?;
         options.limits.validate()?;
         if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES {
             return Err(AtlasSearchError::InvalidLimits);
@@ -150,6 +154,7 @@ impl RetainedAtlasSearch {
             structure_rows: reserve(options.limits.max_matches)?, files: reserve(capacity)?,
             scope, scope_files: scope.freeze(atlas, eligible_files, &mut canceled)?, eligible_files,
             hits: reserve(options.limits.max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?,
+            matched_texts: Vec::new(), matched_text_capacity: 0,
             examined: 0, scanned: 0, unavailable: 0, pending: eligible_files,
             matches_seen: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0,
             truncated: false, complete: false, stop_reason: None, step_count: 0,

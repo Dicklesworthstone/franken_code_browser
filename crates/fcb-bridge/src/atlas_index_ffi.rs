@@ -5,7 +5,7 @@
 use std::ffi::c_char;
 use fcb_app::host::atlas_search::{AtlasIndexOptions, MAX_ATLAS_SEARCH_NEEDLE_BYTES};
 use crate::atlas_sessions::IndexCommand;
-use super::{answer, cstr, number, parse_path_scope, reply, AccessError};
+use super::{answer, cstr, number, parse_case_sensitive, parse_path_scope, reply, AccessError};
 
 /// Capture and index the frozen catalog to completion on a host worker.
 /// Uses the same one-file pipeline as index_begin/index_step, without yielding.
@@ -118,6 +118,21 @@ pub unsafe extern "C" fn fcb_atlas_search_indexed_begin_path_scoped(handle: u64,
     unsafe { submit_with_path(handle, generation, index_generation, needle, extensions, filenames,
         path_kind, path, max_matches, max_scan_bytes, true) }
 }
+
+/// Admit a retained-index literal query with frozen case and path/type scope.
+/// case_sensitive is 1 for exact spelling or 0 for Unicode lowercase matching.
+/// The source index is reused, while incompatible gram negatives are bypassed
+/// by the shared verifier. No source path is reopened by this query.
+/// # Safety
+/// Same pointer/list/path and returned-string contract as indexed_path_scoped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_search_indexed_begin_matching(handle: u64, generation: u64, index_generation: u64,
+    needle: *const c_char, extensions: *const c_char, filenames: *const c_char,
+    path_kind: u64, path: *const c_char, case_sensitive: u64,
+    max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
+    unsafe { submit_matching(handle, generation, index_generation, needle, extensions, filenames,
+        path_kind, path, case_sensitive, max_matches, max_scan_bytes, true) }
+}
 unsafe fn submit(handle: u64, generation: u64, index_generation: u64, needle: *const c_char,
     extensions: *const c_char, filenames: *const c_char,
     max_matches: u64, max_scan_bytes: u64, progressive: bool) -> *mut c_char {
@@ -127,12 +142,20 @@ unsafe fn submit(handle: u64, generation: u64, index_generation: u64, needle: *c
 unsafe fn submit_with_path(handle: u64, generation: u64, index_generation: u64, needle: *const c_char,
     extensions: *const c_char, filenames: *const c_char, path_kind: u64, path: *const c_char,
     max_matches: u64, max_scan_bytes: u64, progressive: bool) -> *mut c_char {
+    unsafe { submit_matching(handle, generation, index_generation, needle, extensions, filenames,
+        path_kind, path, 1, max_matches, max_scan_bytes, progressive) }
+}
+unsafe fn submit_matching(handle: u64, generation: u64, index_generation: u64, needle: *const c_char,
+    extensions: *const c_char, filenames: *const c_char, path_kind: u64, path: *const c_char,
+    case_sensitive: u64, max_matches: u64, max_scan_bytes: u64, progressive: bool) -> *mut c_char {
     reply(|| answer(handle, |atlases| {
+        let case_sensitive = parse_case_sensitive(case_sensitive)?;
         let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
         if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES { return Err(AccessError::InvalidArgument); }
-        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?;
+        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?
+            .with_case_sensitive(case_sensitive);
         let max_matches = number(max_matches)?;
-        let command = match (scope.is_all(), progressive) {
+        let command = match (scope.is_all() && case_sensitive, progressive) {
             (true, true) => IndexCommand::Begin { generation, index_generation, needle, max_matches, max_scan_bytes },
             (true, false) => IndexCommand::Query { generation, index_generation, needle, max_matches, max_scan_bytes },
             (false, true) => IndexCommand::BeginScoped { generation, index_generation, needle, scope: &scope, max_matches, max_scan_bytes },

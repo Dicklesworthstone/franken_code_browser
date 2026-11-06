@@ -120,6 +120,16 @@ char *fcb_atlas_search_indexed_begin_path_scoped(uint64_t handle, uint64_t gener
     const char *filenames, uint64_t path_kind, const char *path,
     uint64_t max_matches, uint64_t max_scan_bytes);
 
+/* Frozen case choice: 1 exact spelling, 0 Unicode lowercase comparison. Invalid
+ * values preserve accepted/pending work. All scope and matched_text contracts
+ * match fcb_atlas_search_begin_matching. Captures are reused across case changes;
+ * incompatible exact-case gram exclusions cannot remove candidates from an
+ * insensitive query. Verification retains the same source-byte budget. */
+char *fcb_atlas_search_indexed_begin_matching(uint64_t handle, uint64_t generation,
+    uint64_t index_generation, const char *needle, const char *extensions,
+    const char *filenames, uint64_t path_kind, const char *path,
+    uint64_t case_sensitive, uint64_t max_matches, uint64_t max_scan_bytes);
+
 /* Clear index and builder, not completed result captures or opened readers.
  * Result-clear leaves index/build state intact. Atlas cancellation invalidates
  * provisional query AND build state; accepted state is not rolled back. A late

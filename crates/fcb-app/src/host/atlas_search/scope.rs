@@ -137,16 +137,26 @@ pub struct AtlasSearchScope {
     extensions: Tokens,
     filenames: Tokens,
     path: PathScope,
+    case_sensitive: bool,
 }
 impl Default for AtlasSearchScope { fn default() -> Self { Self::all() } }
 impl AtlasSearchScope {
     pub const fn all() -> Self { Self { all: true, extensions: Tokens::EMPTY,
-        filenames: Tokens::EMPTY, path: PathScope::WORKSPACE } }
+        filenames: Tokens::EMPTY, path: PathScope::WORKSPACE, case_sensitive: true } }
+    /// Text matching is part of the frozen query, independent of file membership.
+    /// False selects the shared engine's Unicode lowercase literal semantics;
+    /// it does not normalize paths, grant access, or change structural name search.
+    pub const fn with_case_sensitive(mut self, case_sensitive: bool) -> Self {
+        self.case_sensitive = case_sensitive;
+        self
+    }
+    pub const fn case_sensitive(&self) -> bool { self.case_sensitive }
     pub const fn is_all(&self) -> bool { self.all && matches!(self.path.kind, AtlasSearchPathKind::Workspace) }
     pub fn from_csv(extensions: Option<&str>, filenames: Option<&str>) -> Result<Self, AtlasSearchError> {
         if extensions.is_none() && filenames.is_none() { return Ok(Self::all()); }
         Ok(Self { all: false, extensions: Tokens::parse(extensions.unwrap_or(""), false)?,
-            filenames: Tokens::parse(filenames.unwrap_or(""), true)?, path: PathScope::WORKSPACE })
+            filenames: Tokens::parse(filenames.unwrap_or(""), true)?, path: PathScope::WORKSPACE,
+            case_sensitive: true })
     }
     /// Freeze a validated UTF-8 relative path without Unicode/case normalization
     /// or filesystem I/O. Directory paths omit their trailing separator and
@@ -169,6 +179,7 @@ impl AtlasSearchScope {
         out.literal(",\"scope_extensions\":")?; self.extensions.encode(out)?;
         out.literal(",\"scope_filenames\":")?; self.filenames.encode(out)?;
         self.path.encode(out)?;
+        out.literal(",\"case_sensitive\":")?; out.boolean(self.case_sensitive)?;
         Ok(())
     }
     pub(super) fn eligible_count(&self, atlas: &AtlasSession, canceled: &mut impl FnMut() -> bool)

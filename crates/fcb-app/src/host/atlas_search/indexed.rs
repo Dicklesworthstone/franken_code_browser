@@ -13,7 +13,8 @@ pub(super) use build::IndexBuildWork;
 
 use std::mem::size_of;
 use fcb::search::{CaptureRequest, IndexError, IndexLimits, IndexedQueryState,
-    MembershipState, ParsedQuery, QueryError, QueryGeneration, QueryOptions, SearchCoverage};
+    MembershipState, ParsedQuery, QueryError, QueryGeneration, QueryOptions, SearchCoverage,
+    SearchMode, UnicodeNormalization};
 use fcb::search::index::export::{OwnedEphemeralIndex, SourceRetentionLimits};
 use fcb::search::indexed_query::OwnedIndexedQuery;
 use crate::workspace;
@@ -176,10 +177,15 @@ impl RetainedAtlasSearch {
             eligible_files.checked_mul(size_of::<FileId>()).ok_or(AppError::Admission)?
         };
         let capacity = retained.engine.captured_files().min(max_matches);
-        let charge = retained.engine.source_bytes() + (2 * 1024 * 1024
+        let text_capacity = matched_text_capacity(needle, &scope)?;
+        let scratch = if scope.case_sensitive() { 2 * 1024 * 1024 }
+            else { text_matching::LOWERCASE_SCAN_SCRATCH_BYTES };
+        let charge = retained.engine.source_bytes() + (scratch
             + capacity * (size_of::<RetainedFile>() + 64) + max_matches * size_of::<AtlasSearchHit>()
             + MAX_DIAGNOSTICS * size_of::<Unavailable>() + 3 * needle.len() + size_of::<SearchWork>()) as u64;
         let charge = charge.checked_add(scope_bytes as u64).ok_or(AppError::Admission)?;
+        let charge = charge.checked_add(retained_text_bytes(max_matches, text_capacity)? as u64)
+            .ok_or(AppError::Admission)?;
         let lease = self.budget.try_reserve_managed(owner, state_id, ByteLength::new(charge))
             .map_err(|_| AppError::Admission)?;
         let scope_files = scope.freeze(atlas, eligible_files, canceled)?;
@@ -187,7 +193,9 @@ impl RetainedAtlasSearch {
             is_phrase: true, conjunction_terms: Vec::new(), exclusion_terms: Vec::new(),
             path_filters: Vec::new(), lang_filters: Vec::new() };
         let qgen = QueryGeneration::new(owner, generation).map_err(|_| AtlasSearchError::IdentityExhausted)?;
-        let mut options = QueryOptions::new(qgen);
+        let mut options = QueryOptions::new(qgen).with_mode(SearchMode::DecodedText {
+            case_sensitive: scope.case_sensitive(), normalization: UnicodeNormalization::Exact,
+        });
         options.max_matches = max_matches; options.max_bytes_scanned = Some(max_scan_bytes);
         let query = if scope.is_all() {
             OwnedIndexedQuery::new(&retained.engine, parsed, options, &self.budget,
@@ -204,6 +212,8 @@ impl RetainedAtlasSearch {
             structure_rows: Vec::new(), files: reserve(capacity)?,
             scope, scope_files, eligible_files,
             hits: reserve(max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?, examined: unavailable, scanned: 0,
+            matched_texts: reserve(if scope.case_sensitive() { 0 } else { max_matches })?,
+            matched_text_capacity: text_capacity,
             unavailable, pending, matches_seen: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0,
             truncated: false, complete: false, stop_reason: None, step_count: 0,
             last_step_files: 0, last_step_bytes: 0, last_step_calls: 0,
@@ -285,6 +295,12 @@ impl RetainedAtlasSearch {
                 candidate.files.push(RetainedFile { capture: source.clone(), node, hits: 0, witness });
             }
             let source_slot = candidate.files.len() - 1;
+            if !candidate.scope.case_sensitive() {
+                if hit.matched_text.is_empty() || hit.matched_text.len() > candidate.matched_text_capacity {
+                    return Err(AtlasSearchError::WrongAtlas);
+                }
+                candidate.matched_texts.push(copy_text(&hit.matched_text)?);
+            }
             candidate.files[source_slot].hits += 1;
             candidate.hits.push(AtlasSearchHit { id: candidate.hits.len() as u64 + 1,
                 node, file: hit.file_id, revision: hit.revision,

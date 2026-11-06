@@ -7,8 +7,9 @@
 
 use super::*;
 use crate::workspace;
-use fcb::search::{CaptureRequest, QueryGeneration, ReaderSearch, StreamReadOptions,
-    StreamReadState, StreamReadStep, StreamingNeedle};
+use fcb::search::{CaptureRequest, DirectSourceScanner, QueryError, QueryGeneration, QueryOptions,
+    ReaderSearch, SearchCoverage, SearchMode, StreamReadOptions, StreamReadState, StreamReadStep,
+    StreamingNeedle, UnicodeNormalization};
 use super::indexed::IndexedWork;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,7 +59,9 @@ pub(super) struct SearchWork {
 }
 pub(super) enum SearchExecution { Live(LiveWork), Indexed(IndexedWork), Structure(super::structure::StructureWork) }
 pub(super) struct LiveWork {
-    pattern: StreamingNeedle,
+    // Exact mode keeps the original incremental scanner. Lowercase matching is
+    // delegated to DirectSourceScanner over the same bounded complete capture.
+    pattern: Option<StreamingNeedle>,
     options: AtlasSearchOptions,
     scan_id: ResourceAllocationId,
     io: workspace::IoCounts,
@@ -140,22 +143,29 @@ impl RetainedAtlasSearch {
         };
         let [state_id, pattern_id, scan_id] = [self.next_id()?, self.next_id()?, self.next_id()?];
         let capacity = options.max_matches.min(options.max_files);
+        let text_capacity = matched_text_capacity(needle, &scope)?;
         let charge = 2 * options.max_source_bytes + capacity * (size_of::<RetainedFile>() + 64)
             + options.max_matches * size_of::<AtlasSearchHit>()
             + MAX_DIAGNOSTICS * size_of::<Unavailable>() + needle.len() + size_of::<SearchWork>();
         let charge = charge.checked_add(scope_bytes).ok_or(AppError::Admission)?;
+        let charge = charge.checked_add(retained_text_bytes(options.max_matches, text_capacity)?)
+            .ok_or(AppError::Admission)?;
         let lease = self.budget.try_reserve_managed(self.manifest.owner(), state_id, ByteLength::new(charge as u64))
             .map_err(|_| AppError::Admission)?;
         let snapshot = Snapshot { generation, needle: copy_text(needle)?, structure: None,
             structure_rows: Vec::new(), files: reserve(capacity)?,
             scope, scope_files: scope.freeze(atlas, eligible_files, canceled)?, eligible_files,
             hits: reserve(options.max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?,
+            matched_texts: reserve(if scope.case_sensitive() { 0 } else { options.max_matches })?,
+            matched_text_capacity: text_capacity,
             examined: 0, scanned: 0, unavailable: 0, pending: eligible_files,
             matches_seen: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0,
             truncated: false, complete: false, stop_reason: None, step_count: 0,
             last_step_files: 0, last_step_bytes: 0, last_step_calls: 0, index_usage: None, _lease: lease };
-        let pattern = StreamingNeedle::text(self.manifest.owner(), needle, &self.budget, pattern_id)
-            .map_err(AppError::from)?;
+        let pattern = if scope.case_sensitive() {
+            Some(StreamingNeedle::text(self.manifest.owner(), needle, &self.budget, pattern_id)
+                .map_err(AppError::from)?)
+        } else { None };
         self.validate(atlas)?; check(canceled)?;
         Ok(SearchWork { snapshot, execution: SearchExecution::Live(LiveWork {
             pattern, options, scan_id, io: workspace::IoCounts::default() }) })
@@ -221,7 +231,7 @@ impl RetainedAtlasSearch {
         };
         let node = atlas.atlas().node_for_file(file).map_err(AtlasSessionError::from)?;
         let before_hits = candidate.hits.len();
-        {
+        if let Some(pattern) = &work.pattern {
             let mut scan_options = StreamReadOptions::new(qgen);
             // Once storage is full, zero slots still allow the shared scanner
             // to prove no match or observe one unstored occurrence. The probe
@@ -229,7 +239,7 @@ impl RetainedAtlasSearch {
             scan_options.max_matches = work.options.max_matches - before_hits;
             scan_options.max_bytes = capture.bytes().len() as u64;
             let mut scan = ReaderSearch::new(capture.bytes(), *capture.request(),
-                ByteLength::new(capture.bytes().len() as u64), &work.pattern, scan_options,
+                ByteLength::new(capture.bytes().len() as u64), pattern, scan_options,
                 &self.budget, work.scan_id).map_err(AppError::from)?;
             while scan.state() == StreamReadState::Pending {
                 scan.step(StreamReadStep::default(), qgen,
@@ -246,6 +256,55 @@ impl RetainedAtlasSearch {
             for hit in report.hits() {
                 candidate.hits.push(AtlasSearchHit { id: candidate.hits.len() as u64 + 1,
                     file, revision, node, original_range: hit.original_range(), source_slot: candidate.files.len() });
+            }
+        } else {
+            let remaining = work.options.max_matches - before_hits;
+            let mut scan_options = QueryOptions::new(qgen).with_mode(SearchMode::DecodedText {
+                case_sensitive: false, normalization: UnicodeNormalization::Exact,
+            });
+            // The shared normalized scanner treats zero as an immediate limit.
+            // A one-hit probe still distinguishes no later match from an
+            // omitted occurrence once the retained snapshot is exactly full.
+            scan_options.max_matches = remaining.max(1);
+            scan_options.max_bytes_scanned = Some(capture.bytes().len() as u64);
+            let scratch = text_matching::scan_scratch_bytes(scan_options.max_matches,
+                candidate.matched_text_capacity)?;
+            let _scan_lease = self.budget.try_reserve_managed(self.manifest.owner(), work.scan_id,
+                ByteLength::new(scratch as u64)).map_err(|_| AppError::Admission)?;
+            let scanned = DirectSourceScanner::scan_complete_capture_with_cancel(&capture,
+                &candidate.needle, &scan_options, || canceled() || atlas.validate_active().is_err());
+            self.validate(atlas)?; check(canceled)?;
+            let report = match scanned {
+                Ok(report) => report,
+                Err(QueryError::UnsupportedEncoding) => {
+                    candidate.scanned += 1;
+                    candidate.unavailable(file, "unsupported-text");
+                    return Ok(());
+                }
+                Err(error) => return Err(IndexError::from(error).into()),
+            };
+            if report.coverage == SearchCoverage::CanceledEarly { return Err(AtlasSearchError::Canceled); }
+            candidate.scanned += 1;
+            let counted = report.total_matches_counted.min(remaining + 1);
+            candidate.matches_seen += counted as u64;
+            if counted > remaining || matches!(report.coverage, SearchCoverage::TruncatedAtLimit { .. }) {
+                candidate.truncated = true;
+            }
+            if !report.unsupported_files.is_empty() {
+                candidate.unavailable(file, "unsupported-text");
+            } else if matches!(report.coverage, SearchCoverage::BudgetExhausted { .. }) {
+                candidate.unavailable(file, "verification-byte-limit");
+            }
+            for hit in report.matches.into_iter().take(remaining) {
+                check(canceled)?;
+                if hit.file_id != file || hit.revision != revision || hit.original_byte_range.is_empty()
+                    || hit.original_byte_range.end().get() > capture.bytes().len() as u64
+                    || hit.matched_text.is_empty() || hit.matched_text.capacity() > candidate.matched_text_capacity {
+                    return Err(AtlasSearchError::WrongAtlas);
+                }
+                candidate.matched_texts.push(hit.matched_text);
+                candidate.hits.push(AtlasSearchHit { id: candidate.hits.len() as u64 + 1,
+                    file, revision, node, original_range: hit.original_byte_range, source_slot: candidate.files.len() });
             }
         }
         let hits = candidate.hits.len() - before_hits;

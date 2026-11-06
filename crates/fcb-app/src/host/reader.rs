@@ -41,7 +41,10 @@ use super::{HostError, HostResponse};
 pub const MAX_READER_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_READER_WINDOW_BYTES: usize = 256 * 1024;
 pub const MAX_READER_MATCHES: usize = 4096;
-pub const MAX_READER_NEEDLE_BYTES: usize = 1024;
+// Workspace queries admit 1024 UTF-8 bytes, but their actual source spelling
+// can be wider after lowercase comparison (for example, Kelvin sign vs "k").
+// Retained-reader activation searches that original spelling exactly.
+pub const MAX_READER_NEEDLE_BYTES: usize = 4096;
 pub const MAX_READER_CONTEXT_BYTES: usize = 16 * 1024;
 const LINE_SCAN_STEP: usize = 64 * 1024;
 const LINE_CHECKPOINTS: usize = MAX_READER_SOURCE_BYTES / LINE_SCAN_STEP + 1;

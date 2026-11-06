@@ -11,6 +11,7 @@ extern "C" {
 #define FCB_READER_MAX_WINDOW_BYTES UINT64_C(262144)
 #define FCB_READER_MAX_CONTEXT_BYTES UINT64_C(16384)
 #define FCB_READER_MAX_MATCHES UINT64_C(4096)
+#define FCB_READER_MAX_NEEDLE_BYTES UINT64_C(4096)
 
 /*
  * Retained SINGLE-FILE reader sessions; no runtime or worker is created.
@@ -65,6 +66,8 @@ char *fcb_reader_lines(uint64_t handle, uint64_t first, uint64_t count, uint64_t
 
 /* Exact case-sensitive literal matching. Generations must strictly increase
  * across attempts, including canceled scans. Retained rows are indexed from 0.
+ * needle is nonempty UTF-8, at most MAX_NEEDLE_BYTES. The allowance includes
+ * original spellings of case-insensitive workspace hits; Find remains exact.
  * max_matches <= MAX_MATCHES; zero is bounded lookahead, not exhaustive counting.
  * max_scan_bytes is original input work over the already captured source. */
 char *fcb_reader_find(uint64_t handle, uint64_t generation, const char *needle,

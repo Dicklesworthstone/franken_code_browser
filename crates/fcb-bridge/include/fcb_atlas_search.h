@@ -97,6 +97,23 @@ char *fcb_atlas_search_path_scoped(uint64_t handle, uint64_t generation, const c
 char *fcb_atlas_search_begin_path_scoped(uint64_t handle, uint64_t generation, const char *needle,
     const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
     uint64_t max_matches, uint64_t max_files, uint64_t max_file_bytes, uint64_t max_source_bytes);
+
+/* Matching semantics are frozen with the query. case_sensitive: 1 exact source
+ * spelling (the legacy default), 0 Unicode lowercase comparison; all other
+ * values fail before replacing any query. This does not enable full Unicode
+ * case folding, canonical normalization or regex. Path/type semantics remain
+ * unchanged. Begin performs no source I/O; use the same step/page operations.
+ * Every query page echoes case_sensitive and mode: "exact-decoded-literal" or
+ * "unicode-lowercase-literal". Validate these before accepting delayed output.
+ * Text hits include matched_text: the ORIGINAL decoded source spelling at the
+ * original_range, <=4096 UTF-8 bytes. It is neither normalized query text nor
+ * permission to open a live path. Captured-reader hosts can use this spelling
+ * with exact fcb_reader_find to establish the selected retained occurrence.
+ */
+char *fcb_atlas_search_begin_matching(uint64_t handle, uint64_t generation, const char *needle,
+    const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
+    uint64_t case_sensitive, uint64_t max_matches, uint64_t max_files,
+    uint64_t max_file_bytes, uint64_t max_source_bytes);
 char *fcb_atlas_search_step(uint64_t handle, uint64_t generation);
 
 /* Pages contain <=limit (1..128) rows. next_offset is a zero-based continuation,
