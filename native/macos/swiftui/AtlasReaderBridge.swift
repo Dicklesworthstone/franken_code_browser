@@ -9,6 +9,9 @@ private func fcb_reader_open(_ handle: UInt64, _ path: UnsafePointer<CChar>?, _ 
 private func fcb_reader_window(_ handle: UInt64, _ offset: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_reader_lines")
 private func fcb_reader_lines(_ handle: UInt64, _ first: UInt64, _ count: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_reader_position")
+private func fcb_reader_position(_ handle: UInt64, _ line: UInt64, _ column: UInt64,
+    _ columnKind: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_reader_cancel")
 private func fcb_reader_cancel(_ handle: UInt64) -> UInt8
 @_silgen_name("fcb_reader_close")
@@ -31,6 +34,7 @@ extension AtlasReaderTransport {
         },
         window: { take(fcb_reader_window($0, $1, $2)) },
         lines: { take(fcb_reader_lines($0, $1, $2, $3)) },
+        position: { take(fcb_reader_position($0, $1, $2, $3, $4)) },
         cancel: { fcb_reader_cancel($0) == 1 },
         close: { fcb_reader_close($0) == 1 },
         retirementFailed: {

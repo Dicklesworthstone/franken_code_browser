@@ -47,15 +47,29 @@ struct AtlasReaderInput: Sendable {
     }
 }
 
+enum AtlasReaderColumnKind: String, CaseIterable, Identifiable, Sendable {
+    case unicodeScalar = "Unicode scalar"
+    case utf16CodeUnit = "UTF-16 unit"
+    case decodedUtf8Byte = "Decoded UTF-8 byte"
+    var id: Self { self }
+    var abi: UInt64 { switch self { case .unicodeScalar: 1; case .utf16CodeUnit: 2; case .decodedUtf8Byte: 3 } }
+    var wire: String { switch self { case .unicodeScalar: "unicode_scalar"; case .utf16CodeUnit: "utf16_code_unit"; case .decodedUtf8Byte: "decoded_utf8_byte" } }
+}
+struct AtlasReaderPosition: Equatable, Sendable {
+    let line, column: UInt64
+    let kind: AtlasReaderColumnKind
+    let originalOffset, windowUtf8Offset: UInt64
+}
 enum AtlasReaderRequest: Equatable, Sendable {
     case window(offset: UInt64, bytes: UInt64)
     case lines(first: UInt64, count: UInt64, bytes: UInt64)
+    case position(line: UInt64, column: UInt64, kind: AtlasReaderColumnKind, bytes: UInt64)
     case hit(AtlasReaderHitTarget)
     case symbol(AtlasOutlineTarget)
 
     static var firstPage: Self { .window(offset: 0, bytes: AtlasReaderLimits.pageBytes) }
-    var command: String { switch self { case .window: return "window"; case .lines: return "lines"; case .hit: return "hit"; case .symbol: return "symbol" } }
-    var byteLimit: UInt64 { switch self { case .window(_, let bytes), .lines(_, _, let bytes): return bytes; case .hit, .symbol: return AtlasReaderLimits.maximumPageBytes } }
+    var command: String { switch self { case .window: "window"; case .lines: "lines"; case .position: "position"; case .hit: "hit"; case .symbol: "symbol" } }
+    var byteLimit: UInt64 { switch self { case .window(_, let bytes), .lines(_, _, let bytes), .position(_, _, _, let bytes): bytes; case .hit, .symbol: AtlasReaderLimits.maximumPageBytes } }
 
     func validate(capturedBytes: UInt64) throws {
         guard (4...AtlasReaderLimits.maximumPageBytes).contains(byteLimit) else {
@@ -66,6 +80,8 @@ enum AtlasReaderRequest: Equatable, Sendable {
             guard offset <= capturedBytes else { throw AtlasReaderError.invalidInput }
         case .lines(let first, let count, _):
             guard first > 0, (1...1024).contains(count) else { throw AtlasReaderError.invalidInput }
+        case .position(let line, let column, _, _):
+            guard line > 0, column > 0 else { throw AtlasReaderError.invalidInput }
         case .hit(let target):
             try AtlasReaderFindReport.validateNeedle(target.needle)
             guard target.generation > 0, target.index < AtlasReaderFindReport.maxHits,
@@ -311,6 +327,7 @@ struct AtlasReaderPage: Sendable {
     let highlight: AtlasReaderHighlight?
     let selection: AtlasReaderHitSelection?
     let symbolSelection: AtlasReaderSymbolSelection?
+    let position: AtlasReaderPosition?
     var nextOffset: UInt64? { end < identity.capturedBytes ? end : nil }
 
     static func decode(_ json: String?, info: AtlasReaderInfo, request: AtlasReaderRequest) throws -> Self {
@@ -353,6 +370,7 @@ struct AtlasReaderPage: Sendable {
             }
             var selection: AtlasReaderHitSelection?
             var symbolSelection: AtlasReaderSymbolSelection?
+            var position: AtlasReaderPosition?
             switch request {
             case .window(let offset, let bytes):
                 guard wire.selection == nil, firstLine == nil, requested.start == offset,
@@ -360,7 +378,18 @@ struct AtlasReaderPage: Sendable {
                     throw AtlasReaderError.invalidResponse
                 }
             case .lines(let first, _, _):
-                guard wire.selection == nil, firstLine == first else { throw AtlasReaderError.invalidResponse }
+                guard wire.selection == nil, wire.position == nil, firstLine == first else { throw AtlasReaderError.invalidResponse }
+            case .position(let line, let column, let kind, _):
+                guard wire.selection == nil, firstLine == nil, let p = wire.position,
+                      AtlasReaderWire.integer(p.line) == line,
+                      AtlasReaderWire.integer(p.column) == column,
+                      p.column_kind == kind.wire,
+                      let original = AtlasReaderWire.integer(p.original_offset), original <= identity.capturedBytes,
+                      let local = AtlasReaderWire.integer(p.window_utf8_offset), local <= UInt64(wire.text.utf8.count) else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                position = AtlasReaderPosition(line: line, column: column, kind: kind,
+                    originalOffset: original, windowUtf8Offset: local)
             case .hit(let target):
                 let padding = AtlasReaderHitTarget.contextBytes + 4
                 guard firstLine == nil, !wire.range_limited,
@@ -426,7 +455,7 @@ struct AtlasReaderPage: Sendable {
                 text: wire.text, originalHex: wire.original_hex, firstPhysicalLine: firstLine,
                 rangeLimited: wire.range_limited, boundariesAdjusted: wire.boundaries_adjusted,
                 hasReplacements: wire.has_replacements, highlight: highlight,
-                selection: selection, symbolSelection: symbolSelection)
+                selection: selection, symbolSelection: symbolSelection, position: position)
         } catch let error as AtlasReaderError { throw error }
         catch { throw AtlasReaderError.invalidResponse }
     }
@@ -441,6 +470,10 @@ struct AtlasReaderPage: Sendable {
         // A matching accepted search or outline request admits its own namespace.
         // Byte/line pages cannot borrow either selection authority.
         let selection: Selection?
+        let position: Position?
+        struct Position: Decodable {
+            let line, column, column_kind, original_offset, window_utf8_offset: String
+        }
         struct Selection: Decodable {
             let original_hex: String
             let query_generation: String?
@@ -451,7 +484,7 @@ struct AtlasReaderPage: Sendable {
         }
         enum CodingKeys: CodingKey {
             case text_kind, text, original_hex, requested_original_range, visible_range,
-                 range_limited, boundaries_adjusted, has_replacements, first_physical_line, next_offset, selection, highlight
+                 range_limited, boundaries_adjusted, has_replacements, first_physical_line, next_offset, selection, position, highlight
         }
         init(from decoder: Decoder) throws {
             header = try .init(from: decoder)
@@ -467,6 +500,7 @@ struct AtlasReaderPage: Sendable {
             first_physical_line = try c.decodeIfPresent(String.self, forKey: .first_physical_line)
             next_offset = try c.decodeIfPresent(String.self, forKey: .next_offset)
             selection = try c.decodeIfPresent(Selection.self, forKey: .selection)
+            position = try c.decodeIfPresent(Position.self, forKey: .position)
             highlight = try c.decodeIfPresent(AtlasReaderHighlight.Wire.self, forKey: .highlight)
         }
     }

@@ -194,6 +194,16 @@ import AppKit
                     .accessibilityLabel("Physical source line, one based")
                     .onSubmit(model.goToLine)
                 Button("Go line", action: model.goToLine).disabled(model.page == nil)
+                TextField("Column", text: $model.columnInput)
+                    .frame(width: 64).textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("Logical source column, one based")
+                    .onSubmit(model.goToPosition)
+                Picker("Column units", selection: $model.columnKind) {
+                    ForEach(AtlasReaderColumnKind.allCases) { kind in Text(kind.rawValue).tag(kind) }
+                }
+                .labelsHidden().frame(width: 126)
+                Button("Go line:column", action: model.goToPosition).disabled(model.page == nil)
+                    .help("Resolve an exact retained-capture caret. Columns count the selected logical unit, not visual cells or grapheme clusters.")
                 Menu("Display") {
                     Toggle("Line numbers", isOn: $showsLineNumbers)
                     Toggle("Visible whitespace", isOn: $showsWhitespace)

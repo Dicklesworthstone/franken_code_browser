@@ -16,6 +16,7 @@ struct AtlasReaderTransport: Sendable {
     let open: @Sendable (UInt64, String, UInt64) -> String?
     let window: @Sendable (UInt64, UInt64, UInt64) -> String?
     let lines: @Sendable (UInt64, UInt64, UInt64, UInt64) -> String?
+    let position: (@Sendable (UInt64, UInt64, UInt64, UInt64, UInt64) -> String?)?
     let cancel: @Sendable (UInt64) -> Bool
     let close: @Sendable (UInt64) -> Bool
     let retirementFailed: @Sendable () -> Void
@@ -29,6 +30,7 @@ struct AtlasReaderTransport: Sendable {
          open: @escaping @Sendable (UInt64, String, UInt64) -> String?,
          window: @escaping @Sendable (UInt64, UInt64, UInt64) -> String?,
          lines: @escaping @Sendable (UInt64, UInt64, UInt64, UInt64) -> String?,
+         position: (@Sendable (UInt64, UInt64, UInt64, UInt64, UInt64) -> String?)? = nil,
          cancel: @escaping @Sendable (UInt64) -> Bool,
          close: @escaping @Sendable (UInt64) -> Bool,
          retirementFailed: @escaping @Sendable () -> Void,
@@ -36,6 +38,7 @@ struct AtlasReaderTransport: Sendable {
          openBytes: (@Sendable (UInt64, String, Data) -> SuppliedResponse?)? = nil,
          comparison: AtlasReaderComparisonTransport? = nil) {
         self.create = create; self.open = open; self.window = window; self.lines = lines
+        self.position = position
         self.cancel = cancel; self.close = close; self.retirementFailed = retirementFailed
         self.fork = fork
         self.openBytes = openBytes
@@ -487,6 +490,9 @@ private final class AtlasReaderSession: @unchecked Sendable {
                     json = session.transport.window(session.handle, offset, bytes)
                 case .lines(let first, let count, let bytes):
                     json = session.transport.lines(session.handle, first, count, bytes)
+                case .position(let line, let column, let kind, let bytes):
+                    guard let position = session.transport.position else { throw AtlasReaderError.unavailable }
+                    json = position(session.handle, line, column, kind.abi, bytes)
                 case .hit(let target):
                     guard let search else { throw AtlasReaderError.unavailable }
                     json = search.hit(session.handle, target.generation, target.index, AtlasReaderHitTarget.contextBytes)

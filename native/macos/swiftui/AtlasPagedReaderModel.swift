@@ -18,6 +18,8 @@ import Observation
     private(set) var notice = ""
     var offsetInput = "0"
     var lineInput = "1"
+    var columnInput = "1"
+    var columnKind: AtlasReaderColumnKind = .unicodeScalar
     var fileQuery = "" {
         didSet {
             // Revoke synchronously with the edit, not in a later SwiftUI
@@ -374,6 +376,13 @@ import Observation
         guard let line = Self.number(lineInput), line > 0 else { notice = AtlasReaderError.invalidInput.message; return }
         navigate(.lines(first: line, count: 64, bytes: AtlasReaderLimits.pageBytes))
     }
+    func goToPosition() {
+        guard let line = Self.number(lineInput), line > 0,
+              let column = Self.number(columnInput), column > 0 else {
+            notice = AtlasReaderError.invalidInput.message; return
+        }
+        navigate(.position(line: line, column: column, kind: columnKind, bytes: AtlasReaderLimits.pageBytes))
+    }
 
     /// Keep the accepted source/grant alive while another explicit native
     /// service imports it. The receiving service owns any committed effects;
@@ -558,7 +567,7 @@ import Observation
         outlinePage = nil; hasOutline = false; outlineRowsAuthorized = false
         outlineHistory = []; outlineNeedle = ""; outlineMode = .contains; outlineLanguage = .automatic
         busy = false; notice = ""
-        offsetInput = "0"; lineInput = "1"
+        offsetInput = "0"; lineInput = "1"; columnInput = "1"; columnKind = .unicodeScalar
         navigation = UUID()
     }
 
@@ -624,8 +633,16 @@ import Observation
             ?? page.symbolSelection.flatMap { source.utf16Range(byteStart: $0.utf8Start, byteEnd: $0.utf8End) }
         navigation = UUID()
         offsetInput = String(page.start)
-        if let line = page.firstPhysicalLine { lineInput = String(line) }
-        notice = ""
+        if let exact = page.position {
+            lineInput = String(exact.line)
+            columnInput = String(exact.column)
+            columnKind = exact.kind
+        } else if let line = page.firstPhysicalLine {
+            lineInput = String(line)
+        }
+        notice = page.position.map {
+            "Resolved line \($0.line), column \($0.column) (\($0.kind.rawValue)) to original byte \($0.originalOffset)."
+        } ?? ""
         return true
     }
     private func finish(_ ticket: UUID) {
