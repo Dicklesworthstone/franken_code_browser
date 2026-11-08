@@ -265,6 +265,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     @State private var capturedReaderTarget: AtlasSearchCapturedHit?
     @State private var suppliedReaderTarget: AtlasSuppliedReaderSource?
     @State private var finderReaderCapture: AtlasProgressiveFileCapture?
+    @State private var observedReader: AtlasObservedReaderPresentation?
     @State private var readingDesk = AtlasReadingDeskModel(transport: .native)
     @State private var showsReadingDesk = false
     @State private var reviewDeskAfterSheetDismissal = false
@@ -343,6 +344,18 @@ private struct AtlasFrozenViewportSearch: Sendable {
         return AtlasSnapshotExportSource(root: root, project: browserProject,
             browserOwner: accepted.owner, access: nil)
 #endif
+    }
+
+    private var selectedObservedSource: AtlasObservedReaderSource? {
+        guard let authority = snapshotExportSource,
+              let raw = finderReaderCapture?.file.rawPath ?? selectedPath.map({ Array($0.utf8) }),
+              let input = try? AtlasObservedReaderInput(root: authority.root, relativePath: raw) else { return nil }
+        return AtlasObservedReaderSource(input: input, project: authority.identity.project, access: authority.access)
+    }
+
+    private func closeObservedReader() {
+        observedReader?.close()
+        observedReader = nil
     }
 
     private var searchContext: AtlasSearchContext {
@@ -464,6 +477,9 @@ private struct AtlasFrozenViewportSearch: Sendable {
             AtlasSavedRepositoryView(model: savedRepository, desk: readingDesk, exporter: snapshotExport,
                 currentSource: { snapshotExportSource })
         }
+        .sheet(item: $observedReader, onDismiss: finishReadingDeskReview) { presentation in
+            AtlasObservedReaderView(presentation: presentation).id(presentation.id)
+        }
         .onAppear {
 #if FCB_APP_STORE
             if rootAccess != nil { requestAtlasLoad() }
@@ -503,6 +519,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
             projectBrowser.close()
             savedRepository.close()
             snapshotExport.cancel()
+            closeObservedReader()
             showsSavedRepository = false
             readingDesk.close()
             showsReadingDesk = false
@@ -529,7 +546,10 @@ private struct AtlasFrozenViewportSearch: Sendable {
             // Returning creates a new native surface whose accepted frame
             // supplies fresh viewport demand; hidden views do no enrichment.
         }
-        .onChange(of: snapshotExportSource?.identity) { _, _ in snapshotExport.cancel() }
+        .onChange(of: snapshotExportSource?.identity) { _, _ in
+            snapshotExport.cancel()
+            closeObservedReader()
+        }
         .onChange(of: atlasResidency.contentRevision) { _, _ in
             refreshResidentSearchOverlay()
         }
@@ -624,11 +644,11 @@ private struct AtlasFrozenViewportSearch: Sendable {
 
     private func reviewReadingDeskBeforeClosing() {
         guard !readingDesk.closed, !showsReadingDesk else { return }
-        if showsFileFinder || showsSavedRepository {
+        if showsFileFinder || showsSavedRepository || observedReader != nil {
             // Wait for the other sheet's actual dismissal before presenting
             // the desk. An active note editor is preserved by the close guard.
             reviewDeskAfterSheetDismissal = true
-            showsFileFinder = false; showsSavedRepository = false
+            showsFileFinder = false; showsSavedRepository = false; closeObservedReader()
         } else { showsReadingDesk = true }
     }
     private func finishReadingDeskReview() {
@@ -654,7 +674,17 @@ private struct AtlasFrozenViewportSearch: Sendable {
     private func fileFinder(accessLease: AnyObject?) -> some View {
         let requestedRoot = root
         let generation = loadGeneration
-        return AtlasProgressiveQuickOpenView(root: requestedRoot, accessLease: accessLease) { capture in
+        return AtlasProgressiveQuickOpenView(root: requestedRoot, project: generation, accessLease: accessLease,
+            canObserveCurrentProject: {
+                guard showsFileFinder, !loadingProject, loadGeneration == generation,
+                      root.utf8.elementsEqual(requestedRoot.utf8) else { return false }
+#if FCB_APP_STORE
+                guard !rootAccessLoader.isLoading,
+                      rootAccess.map(ObjectIdentifier.init) == accessLease.map(ObjectIdentifier.init),
+                      rootAccess?.url.path.utf8.elementsEqual(requestedRoot.utf8) == true else { return false }
+#endif
+                return true
+            }) { capture in
             guard showsFileFinder, !loadingProject, loadGeneration == generation,
                   root.utf8.elementsEqual(requestedRoot.utf8),
                   capture.root.utf8.elementsEqual(requestedRoot.utf8),
@@ -1207,6 +1237,14 @@ private struct AtlasFrozenViewportSearch: Sendable {
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer()
+                    if let source = selectedObservedSource {
+                        Button("Read current ranges") {
+                            guard selectedObservedSource?.identity == source.identity else { return }
+                            closeObservedReader()
+                            observedReader = AtlasObservedReaderPresentation(source: source, transport: .native)
+                        }
+                            .help("Explicitly open the current project file in bounded observed ranges, including files larger than 32 MiB. Keep this retained source unchanged.")
+                    }
                     if finderReaderCapture != nil {
                         Text("Retained source capture").font(.caption).foregroundStyle(.secondary)
                     } else if let path = selectedPath {
@@ -1337,6 +1375,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     /// capture/highlighting/raster preparation is an explicit subsequent action.
     private func requestAtlasLoad() {
         snapshotExport.cancel()
+        closeObservedReader()
         closeAtlasResidency()
         closeFinderReader()
         workspaceSearch?.refresh()

@@ -2,9 +2,12 @@ import SwiftUI
 
 @MainActor struct AtlasProgressiveQuickOpenView: View {
     let root: String
+    let project: UUID
     let accessLease: AnyObject?
+    let canObserveCurrentProject: @MainActor () -> Bool
     let open: @MainActor (AtlasProgressiveFileCapture) -> Void
     @State private var model = AtlasProgressiveQuickOpenModel(transport: .native)
+    @State private var observedReader: AtlasObservedReaderPresentation?
     @FocusState private var queryFocused: Bool
     @Environment(\.dismiss) private var dismiss
 
@@ -90,14 +93,39 @@ import SwiftUI
                 .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
                 Button("Reload results", action: model.reload).disabled(!model.canReload)
                     .help("Recover the accepted result snapshot without advancing discovery")
+                Button("Read current ranges", action: observeSelected)
+                    .disabled(!model.canOpen || !canObserveCurrentProject())
+                    .help("Open the selected current file in bounded ranges without requiring a complete source capture")
                 Button("Open file", action: activate).disabled(!model.canOpen)
             }
         }
         .padding(16).frame(minWidth: 740, idealWidth: 860, minHeight: 480, idealHeight: 580)
         .onAppear { model.bind(root: root, accessLease: accessLease); queryFocused = true }
-        .onDisappear { model.close() }
+        .onDisappear { closeObservedReader(); model.close() }
+        .onChange(of: project) { _, _ in closeObservedReader(); model.close(); dismiss() }
+        .onChange(of: Array(root.utf8)) { _, _ in closeObservedReader(); model.close(); dismiss() }
+        .onChange(of: accessLease.map(ObjectIdentifier.init)) { _, _ in
+            closeObservedReader(); model.close(); dismiss()
+        }
+        .onChange(of: canObserveCurrentProject()) { _, allowed in
+            if !allowed { closeObservedReader() }
+        }
+        .sheet(item: $observedReader) { presentation in
+            AtlasObservedReaderView(presentation: presentation).id(presentation.id)
+        }
     }
     private func activate() {
         model.openSelected(readerTransport: .native, search: .native, outline: .native, document: .native, deliver: open)
     }
+    private func observeSelected() {
+        guard canObserveCurrentProject(), model.canOpen, model.root.utf8.elementsEqual(root.utf8),
+              let selected = model.selected, let row = model.report?.row(selected),
+              let input = try? AtlasObservedReaderInput(root: root, relativePath: row.rawPath) else { return }
+        // A current filename result and the host's current project grant
+        // authorize a new observation, never an exact old content anchor.
+        closeObservedReader()
+        let source = AtlasObservedReaderSource(input: input, project: project, access: accessLease)
+        observedReader = AtlasObservedReaderPresentation(source: source, transport: .native)
+    }
+    private func closeObservedReader() { observedReader?.close(); observedReader = nil }
 }
