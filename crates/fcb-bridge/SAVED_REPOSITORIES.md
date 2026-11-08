@@ -6,6 +6,43 @@ repository, not a reopened live root or another atlas. The safe implementation
 is `fcb_app::host::saved_repository::SavedRepositorySession`; the bridge owns
 only handles, cancellation and pointer conversion.
 
+## Create a saved repository
+
+`fcb_app::host::snapshot_export::save_repository` and
+`include/fcb_snapshot_export.h` expose the existing `fcb snapshot save` writer
+to a native or embedded host. The host chooses a worker, retains current root
+read authority, and supplies a separately selected output destination. No
+subprocess, duplicate capture walker, archive encoder, or runtime is introduced.
+
+The native profile captures up to 20,000 known files, 1 MiB per file and 64 MiB
+total source, with bounded `.gitignore`/`.fcbignore` handling enabled. The safe
+adapter permits the existing writer's limits through explicit options. A quota
+or unavailable source yields an archive with explicit missing member payloads;
+incomplete discovery remains incomplete after saving. This is a collection of
+per-file observations, not an atomic working-tree or Git snapshot.
+
+The writer validates the archive before creating the destination with exclusive
+create semantics and owner-private initial permissions. Existing files are
+never overwritten or removed. Exported original source and member names are
+plaintext; saving requires an explicit destination/action. Opening the result
+later uses the normal saved repository validation and browsing routes below.
+
+Every delivered `fcb.cli/1` receipt includes an authoritative `effect`, including
+errors or cancellation: `none`, `destination-created-incomplete`,
+`complete-file-sync-unconfirmed`, or `complete-file-sync-requested`. A successful
+save additionally carries the exact destination, archive digest, member counts,
+captured bytes and discovery status. Existing shared error receipts instead
+carry `status: "error"`, `complete: false`, and the snapshot error object; they
+are associated with the already admitted request's destination.
+
+Retain both native grants and callback context until the worker returns. Do not
+discard an entered write's receipt because cancellation arrived later, and do
+not automatically retry a missing/malformed receipt. An interrupted destination
+is preserved for explicit inspection. Synchronization was requested only when
+the effect says so; power-loss durability remains unqualified. Host/FFI
+regressions are in `host_snapshot_export.rs` and `snapshot_export_ffi_tests.rs`;
+their execution and native hardware qualification remain pending.
+
 ## Open, search, read
 
 Reserve with `fcb_saved_create`, then call `fcb_saved_open` on a host worker.

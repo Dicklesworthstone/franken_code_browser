@@ -2,7 +2,8 @@
 
 //! Safe application services for native shells. These are explicit worker
 //! operations, never redraw/input callbacks. No runtime, implicit stdin,
-//! source write, network request or native presentation is created here.
+//! implicit source write, network request or native presentation is created here.
+//! Source-containing exports require a separate explicit destination/action.
 //! Structured services use the same dispatcher/JSON as the CLI. Legacy text
 //! handoff is an exact bounded UTF-8 observation, not a lossy/truncated preview.
 
@@ -12,6 +13,7 @@ pub mod atlas_session;
 pub mod atlas_search;
 pub mod atlas_paths;
 pub mod saved_repository;
+pub mod snapshot_export;
 pub mod catalog_session;
 mod document_fragment;
 pub use catalog_session::finder as file_finder_session;

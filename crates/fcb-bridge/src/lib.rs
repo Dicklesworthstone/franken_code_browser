@@ -25,6 +25,7 @@ mod catalog_ffi;
 mod file_finder_sessions;
 mod file_finder_ffi;
 mod search_ffi;
+mod snapshot_export_ffi;
 pub use search_ffi::{fcb_search_workspace_cancelable, SearchCancellationCallback};
 
 use std::{ffi::{c_char, CStr, CString}, panic::{catch_unwind, UnwindSafe}, path::Path};

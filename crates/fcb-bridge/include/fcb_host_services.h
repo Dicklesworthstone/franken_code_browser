@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "fcb_reader_sessions.h"
 #include "fcb_atlas_sessions.h"
+#include "fcb_snapshot_export.h"
 
 #ifdef __cplusplus
 extern "C" {
