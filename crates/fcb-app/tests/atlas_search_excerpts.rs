@@ -172,7 +172,7 @@ fn captured_index_context_uses_retained_bytes_and_same_exact_mapping_as_live_sea
     let source = "old context KNeedLE\nsecond line";
     let mut f = Fixture::new(&[("source.rs", source.as_bytes())]);
     let scope = AtlasSearchScope::all().with_case_sensitive(false);
-    let live = json(&f.search.search_scoped(&f.atlas, 1, "kneedle", scope, options(), || false).unwrap());
+    let live = json(&f.search.search_scoped(&f.atlas, 1, "kneedle", scope.clone(), options(), || false).unwrap());
     let expected = live.get("hits").array()[0].get("excerpt").clone();
     f.search.prepare_index(&f.atlas, 2, index_options(), || false).unwrap();
     fs::write(f.root.join("source.rs"), b"changed after index preparation").unwrap();

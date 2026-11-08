@@ -88,7 +88,7 @@ fn explicit_empty_is_distinct_from_all_and_finishes_without_source_work() {
     let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
     let empty = AtlasSearchScope::from_csv(Some(""), None).unwrap();
     assert!(!empty.is_all()); assert!(AtlasSearchScope::from_csv(None, None).unwrap().is_all());
-    search.begin_scoped(&atlas, 1, "needle", empty, live_options(), || false).unwrap();
+    search.begin_scoped(&atlas, 1, "needle", empty.clone(), live_options(), || false).unwrap();
     assert!(search.progress(&atlas, 1).unwrap().is_running());
     finish(&mut search, &atlas, 1);
     let live = search.progress(&atlas, 1).unwrap();
@@ -117,7 +117,7 @@ fn extensions_and_basenames_use_raw_native_component_and_ascii_case() {
     fs::write(fixture.0.join(OsString::from_vec(b"raw-\xff.RS".to_vec())), b"needle").unwrap();
     let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
     let options = AtlasSearchOptions { max_matches: 10, max_files: 10, ..live_options() };
-    search.search_scoped(&atlas, 1, "needle", scope, options, || false).unwrap();
+    search.search_scoped(&atlas, 1, "needle", scope.clone(), options, || false).unwrap();
     let live_files = [search.hit(&atlas, 1, 1).unwrap().file, search.hit(&atlas, 1, 2).unwrap().file];
     search.prepare_index(&atlas, 2, index_options(), || false).unwrap();
     search.search_indexed_scoped(&atlas, 3, 2, "needle", scope, 10, 100, || false).unwrap();
@@ -169,7 +169,7 @@ fn changing_scope_rejects_stale_work_and_keeps_old_accepted_capture_on_cancellat
     let old = search.hit(&atlas, 2, 1).unwrap();
     let python = AtlasSearchScope::from_csv(Some("py,pyi,pyw"), None).unwrap();
     search.begin_indexed_scoped(&atlas, 3, 1, "needle", rust_scope(), 10, 100, || false).unwrap();
-    search.begin_indexed_scoped(&atlas, 4, 1, "needle", python, 10, 100, || false).unwrap();
+    search.begin_indexed_scoped(&atlas, 4, 1, "needle", python.clone(), 10, 100, || false).unwrap();
     assert_eq!(search.step(&atlas, 3, || false).err(), Some(AtlasSearchError::StaleQuery));
     assert_eq!(search.pending_generation(), Some(4));
     assert_eq!(search.step(&atlas, 4, || true).err(), Some(AtlasSearchError::Canceled));

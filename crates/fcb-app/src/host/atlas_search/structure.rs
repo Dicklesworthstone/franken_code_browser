@@ -130,7 +130,7 @@ impl RetainedAtlasSearch {
         }
         check(&mut canceled)?;
         options.limits.max_file_bytes = options.limits.max_file_bytes.min(options.mode.source_limit());
-        let eligible_files = scope.eligible_count(atlas, &mut canceled)?;
+        let (eligible_files, scope_region) = scope.admission_counts(atlas, &mut canceled)?;
         let scope_bytes = if scope.is_all() { 0 } else {
             eligible_files.checked_mul(size_of::<FileId>()).ok_or(AppError::Admission)?
         };
@@ -147,12 +147,13 @@ impl RetainedAtlasSearch {
         let qualification_id = self.next_id()?;
         let lease = self.budget.try_reserve_managed(self.manifest.owner(), state_id, ByteLength::new(charge as u64))
             .map_err(|_| AppError::Admission)?;
+        let scope_files = scope.freeze(atlas, eligible_files, &mut canceled)?;
         let snapshot = Snapshot { generation, needle: copy_text(needle)?,
             structure: Some(StructureQuery { mode: options.mode, name_mode: options.name_mode,
                 source_limit: options.limits.max_file_bytes, metadata_bytes: 0, metadata_omitted: 0,
                 unsupported_files: 0, extraction_limited_files: 0 }),
             structure_rows: reserve(options.limits.max_matches)?, files: reserve(capacity)?,
-            scope, scope_files: scope.freeze(atlas, eligible_files, &mut canceled)?, eligible_files,
+            scope, scope_files, scope_region, eligible_files,
             hits: reserve(options.limits.max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?,
             matched_texts: Vec::new(), matched_text_capacity: 0,
             examined: 0, scanned: 0, unavailable: 0, pending: eligible_files,
@@ -349,5 +350,5 @@ fn update_coverage(atlas: &AtlasSession, query: &mut Snapshot, work: &StructureW
     else if work.io.bytes >= work.options.limits.max_source_bytes as u64 { Some(AtlasSearchStop::SourceByteLimit) }
     else { None };
     query.complete = query.stop_reason.is_some() && atlas.atlas().discovery_complete()
-        && query.pending == 0 && query.unavailable == 0 && !query.truncated;
+        && query.scope_region.is_none_or(|region| region.missing == 0) && query.pending == 0 && query.unavailable == 0 && !query.truncated;
 }

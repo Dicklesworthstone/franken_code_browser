@@ -232,7 +232,7 @@ fn lowercase_file_and_directory_scope_admission_precedes_work_and_hit_limits() {
         .with_path(AtlasSearchPathKind::Directory, "src").unwrap().with_case_sensitive(false);
     assert!(!scope.is_all()); assert!(!scope.case_sensitive());
     assert!(scope.includes_path(b"src/z.rs")); assert!(!scope.includes_path(b"src-old/z.rs"));
-    let result = f.search.search_scoped(&f.atlas, 1, "needle", scope,
+    let result = f.search.search_scoped(&f.atlas, 1, "needle", scope.clone(),
         AtlasSearchOptions { max_matches: 1, max_files: 1, max_source_bytes: 6, ..options() }, || false).unwrap();
     assert_eq!(result.exit_code(), EXIT_OK);
     let result = json(&result);

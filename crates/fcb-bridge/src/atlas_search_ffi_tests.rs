@@ -298,3 +298,84 @@ fn c_path_scope_freezes_exact_components_and_rejects_invalid_replacements_before
     assert!(retained.contains("\"retained_hits\":\"1\""));
     assert_eq!(fcb_atlas_close(atlas), 1);
 }
+
+#[test]
+fn c_visible_scope_owns_raw_membership_and_preserves_partial_indexed_coverage() {
+    use super::index::{fcb_atlas_index_prepare, fcb_atlas_search_indexed_begin_path_scoped};
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let root = std::env::temp_dir().join(format!("fcb-visible-scope-ffi-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a-outside.rs"), b"needle ".repeat(20)).unwrap();
+    fs::write(root.join("z.rs"), b"needle").unwrap();
+    let root_c = CString::new(root.to_str().unwrap()).unwrap();
+    let needle = CString::new("needle").unwrap();
+    let atlas = fcb_atlas_create(); assert_ne!(atlas, 0);
+    assert!(take(unsafe { fcb_atlas_open(atlas, root_c.as_ptr(), 100) }).contains("\"status\":\"ok\""));
+    {
+        let types = CString::new("rs").unwrap();
+        let region = CString::new("7a2e7273").unwrap(); // Exact raw z.rs.
+        let begin = take(unsafe { fcb_atlas_search_begin_path_scoped(atlas, 1, needle.as_ptr(),
+            types.as_ptr(), std::ptr::null(), 3, region.as_ptr(), 1, 1, 1024, 6) });
+        assert!(begin.contains("\"scope_path_kind\":\"visible\""), "{begin}");
+        assert!(begin.contains("\"scope_region_files\":\"1\""));
+        assert!(begin.contains("\"scope_region_path_bytes\":\"4\""));
+        assert!(begin.contains("\"source_bytes_read\":\"0\""));
+        // The foreign scope and type buffers end here, before source capture.
+    }
+    let malformed = CString::new("7A2e7273").unwrap(); // Noncanonical uppercase hex.
+    let rejected = take(unsafe { fcb_atlas_search_begin_path_scoped(atlas, 2, needle.as_ptr(),
+        std::ptr::null(), std::ptr::null(), 3, malformed.as_ptr(), 1, 1, 1024, 6) });
+    assert!(rejected.contains("INVALID_SCOPE"), "{rejected}");
+    let live = take(fcb_atlas_search_step(atlas, 1));
+    assert!(live.contains("\"search_complete\":true"), "{live}");
+    assert!(live.contains("\"eligible_files\":\"1\""));
+    assert!(live.contains("\"excluded_files\":\"1\""));
+    assert!(live.contains("\"scope_region_catalogued_files\":\"1\""));
+    assert!(live.contains("\"scope_region_missing_files\":\"0\""));
+    assert!(live.contains("\"source_bytes_read\":\"6\""));
+    assert!(live.contains("\"retained_hits\":\"1\""));
+    assert!(live.contains("z.rs")); assert!(!live.contains("a-outside.rs"));
+    // Malformed parsing never consumed generation 2 or displaced generation 1.
+    assert!(take(fcb_atlas_index_prepare(atlas, 2, 100, 1024, 4096, 65536))
+        .contains("\"capture_complete\":true"));
+    {
+        let region = CString::new("6d697373696e672e7273,7a2e7273").unwrap(); // missing.rs,z.rs.
+        let begin = take(unsafe { fcb_atlas_search_indexed_begin_path_scoped(atlas, 3, 2,
+            needle.as_ptr(), std::ptr::null(), std::ptr::null(), 3, region.as_ptr(), 1, 6) });
+        assert!(begin.contains("\"scope_region_files\":\"2\""), "{begin}");
+        assert!(begin.contains("\"scope_region_missing_files\":\"1\""));
+        assert!(begin.contains("\"verification_source_bytes\":\"0\""));
+    }
+    fs::write(root.join("z.rs"), b"changed on disk").unwrap();
+    let indexed = take(fcb_atlas_search_step(atlas, 3));
+    assert!(indexed.contains("\"search_in_progress\":false"), "{indexed}");
+    assert!(indexed.contains("\"search_complete\":false"));
+    assert!(indexed.contains("\"scope_region_catalogued_files\":\"1\""));
+    assert!(indexed.contains("\"scope_region_missing_files\":\"1\""));
+    assert!(indexed.contains("\"retained_hits\":\"1\""));
+    assert!(indexed.contains("\"verification_source_bytes\":\"6\""));
+    assert!(indexed.contains("\"source_bytes_read\":\"0\""));
+    let reader = fcb_reader_create(); assert_ne!(reader, 0);
+    assert!(take(fcb_atlas_search_open_reader(atlas, reader, 3, 1))
+        .contains("\"source_reopened\":false"));
+    // A null visible manifest means zero files. The same null pointer with
+    // workspace kind remains the explicit broad query, never an empty alias.
+    let empty = take(unsafe { fcb_atlas_search_path_scoped(atlas, 4, needle.as_ptr(),
+        std::ptr::null(), std::ptr::null(), 3, std::ptr::null(), 100, 100, 1024, 4096) });
+    assert!(empty.contains("\"scope_path_kind\":\"visible\""));
+    assert!(empty.contains("\"scope_region_files\":\"0\""));
+    assert!(empty.contains("\"eligible_files\":\"0\""));
+    assert!(empty.contains("\"retained_hits\":\"0\""));
+    assert!(empty.contains("\"source_bytes_read\":\"0\""));
+    assert!(empty.contains("\"search_complete\":true"));
+    let workspace = take(unsafe { fcb_atlas_search_path_scoped(atlas, 5, needle.as_ptr(),
+        std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 100, 100, 1024, 4096) });
+    assert!(workspace.contains("\"scope_path_kind\":\"workspace\""));
+    assert!(workspace.contains("\"eligible_files\":\"2\""));
+    assert!(workspace.contains("\"retained_hits\":\"20\""));
+    assert!(workspace.contains("\"search_complete\":true"));
+    assert_eq!(fcb_atlas_close(atlas), 1);
+    assert!(take(fcb_reader_copy_range(reader, 0, 6)).contains("6e6565646c65"));
+    assert_eq!(fcb_reader_close(reader), 1);
+}

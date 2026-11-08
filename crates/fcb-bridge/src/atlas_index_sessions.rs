@@ -40,9 +40,9 @@ impl AtlasSessions {
             IndexCommand::Begin { generation, index_generation, needle, max_matches, max_scan_bytes } =>
                 session.search.begin_indexed(&session.atlas, generation, index_generation, needle, max_matches, max_scan_bytes, &mut stop),
             IndexCommand::QueryScoped { generation, index_generation, needle, scope, max_matches, max_scan_bytes } =>
-                session.search.search_indexed_scoped(&session.atlas, generation, index_generation, needle, *scope, max_matches, max_scan_bytes, &mut stop),
+                session.search.search_indexed_scoped(&session.atlas, generation, index_generation, needle, scope.clone(), max_matches, max_scan_bytes, &mut stop),
             IndexCommand::BeginScoped { generation, index_generation, needle, scope, max_matches, max_scan_bytes } =>
-                session.search.begin_indexed_scoped(&session.atlas, generation, index_generation, needle, *scope, max_matches, max_scan_bytes, &mut stop),
+                session.search.begin_indexed_scoped(&session.atlas, generation, index_generation, needle, scope.clone(), max_matches, max_scan_bytes, &mut stop),
             IndexCommand::Clear { generation } => session.search.clear_index(&session.atlas, generation, &mut stop),
         };
         // Epoch cancellation invalidates both paused work kinds. A terminal

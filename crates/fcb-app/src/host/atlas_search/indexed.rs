@@ -172,7 +172,7 @@ impl RetainedAtlasSearch {
         let owner = self.manifest.owner();
         let retained = self.index.as_ref().ok_or(AtlasSearchError::MissingIndex)?;
         if retained.generation != index_generation { return Err(AtlasSearchError::StaleIndex); }
-        let eligible_files = scope.eligible_count(atlas, canceled)?;
+        let (eligible_files, scope_region) = scope.admission_counts(atlas, canceled)?;
         let scope_bytes = if scope.is_all() { 0 } else {
             eligible_files.checked_mul(size_of::<FileId>()).ok_or(AppError::Admission)?
         };
@@ -208,11 +208,12 @@ impl RetainedAtlasSearch {
         let unavailable = query.report().unavailable_files().len();
         let eligible_captured = query.report().known_files() - unavailable;
         let pending = eligible_files.checked_sub(unavailable).ok_or(AtlasSearchError::WrongAtlas)?;
+        let case_sensitive = scope.case_sensitive();
         let mut snapshot = Snapshot { generation, needle: copy_text(needle)?, structure: None,
             structure_rows: Vec::new(), files: reserve(capacity)?,
-            scope, scope_files, eligible_files,
+            scope, scope_files, scope_region, eligible_files,
             hits: reserve(max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?, examined: unavailable, scanned: 0,
-            matched_texts: reserve(if scope.case_sensitive() { 0 } else { max_matches })?,
+            matched_texts: reserve(if case_sensitive { 0 } else { max_matches })?,
             matched_text_capacity: text_capacity,
             unavailable, pending, matches_seen: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0,
             truncated: false, complete: false, stop_reason: None, step_count: 0,
@@ -274,7 +275,8 @@ impl RetainedAtlasSearch {
         // absent from that index remain pending; unavailable is never exclusion.
         candidate.complete = report.state() == IndexedQueryState::Finished
             && matches!(results.coverage, SearchCoverage::Exhaustive)
-            && atlas.atlas().discovery_complete() && candidate.pending == 0 && candidate.unavailable == 0;
+            && atlas.atlas().discovery_complete() && candidate.scope_region.is_none_or(|region| region.missing == 0)
+            && candidate.pending == 0 && candidate.unavailable == 0;
         // Only newly verified hits acquire presentation/source pins. Earlier
         // pages are never recopied or renumbered when another file finishes.
         for hit in &results.matches[candidate.hits.len()..] {

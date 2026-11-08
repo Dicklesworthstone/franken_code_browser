@@ -19,7 +19,7 @@ pub use indexed::{AtlasIndexOptions, AtlasIndexBuildProgress, MAX_ATLAS_INDEX_GR
 use indexed::{IndexQueryUsage, RetainedIndex, IndexBuildWork};
 mod scope;
 pub use scope::{AtlasSearchScope, AtlasSearchPathKind, MAX_SEARCH_SCOPE_TOKENS, MAX_SEARCH_SCOPE_TOKEN_BYTES,
-    MAX_SEARCH_SCOPE_LIST_BYTES, MAX_SEARCH_SCOPE_PATH_BYTES};
+    MAX_SEARCH_SCOPE_LIST_BYTES, MAX_SEARCH_SCOPE_PATH_BYTES, MAX_SEARCH_REGION_FILES, MAX_SEARCH_REGION_WIRE_BYTES};
 mod structure;
 pub use structure::{AtlasStructureMode, AtlasStructureOptions, MAX_ATLAS_STRUCTURE_METADATA_BYTES,
     MAX_ATLAS_STRUCTURE_NAME_BYTES};
@@ -131,6 +131,7 @@ struct Snapshot {
     structure_rows: Vec<StructureRow>,
     scope: AtlasSearchScope,
     scope_files: Option<Vec<FileId>>,
+    scope_region: Option<scope::RegionCoverage>,
     eligible_files: usize,
     files: Vec<RetainedFile>,
     hits: Vec<AtlasSearchHit>,
@@ -419,6 +420,10 @@ fn summary(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot) -> Resul
     out.literal(",\"query_generation\":")?; out.integer(snapshot.generation)?;
     out.literal(",\"needle\":")?; out.quoted(&snapshot.needle)?;
     snapshot.scope.encode(out)?;
+    if let Some(region) = snapshot.scope_region {
+        out.literal(",\"scope_region_catalogued_files\":")?; out.integer(region.catalogued as u64)?;
+        out.literal(",\"scope_region_missing_files\":")?; out.integer(region.missing as u64)?;
+    }
     out.literal(",\"search_strategy\":")?;
     out.quoted(if snapshot.structure.is_some() { "live-structure-scan" }
         else if snapshot.index_usage.is_some() { "retained-ephemeral-index" } else { "live-capture-scan" })?;

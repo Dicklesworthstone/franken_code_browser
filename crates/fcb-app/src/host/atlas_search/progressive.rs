@@ -34,6 +34,11 @@ pub struct AtlasSearchProgress {
     pub truncated: bool,
     pub eligible_files: usize,
     pub excluded_files: usize,
+    /// Frozen requested-region membership, independent of file-type filtering.
+    /// None means this query did not request a visible-region manifest.
+    pub scope_region_files: Option<usize>,
+    pub scope_region_catalogued_files: Option<usize>,
+    pub scope_region_missing_files: Option<usize>,
     pub examined_files: usize,
     pub scanned_files: usize,
     pub unavailable_files: usize,
@@ -79,6 +84,9 @@ impl RetainedAtlasSearch {
         Ok(AtlasSearchProgress { generation: q.generation, stop_reason: q.stop_reason,
             complete: q.complete, truncated: q.truncated, examined_files: q.examined,
             eligible_files: q.eligible_files, excluded_files: atlas.atlas().file_count() - q.eligible_files,
+            scope_region_files: q.scope.region_files(),
+            scope_region_catalogued_files: q.scope_region.map(|region| region.catalogued),
+            scope_region_missing_files: q.scope_region.map(|region| region.missing),
             scanned_files: q.scanned, unavailable_files: q.unavailable, pending_files: q.pending,
             retained_hits: q.hits.len(), matches_seen: q.matches_seen, retained_source_bytes: q.retained_bytes,
             source_bytes_read: q.source_bytes_read, read_calls: q.read_calls,
@@ -137,7 +145,7 @@ impl RetainedAtlasSearch {
             return Err(AtlasSearchError::InvalidLimits);
         }
         check(canceled)?;
-        let eligible_files = scope.eligible_count(atlas, canceled)?;
+        let (eligible_files, scope_region) = scope.admission_counts(atlas, canceled)?;
         let scope_bytes = if scope.is_all() { 0 } else {
             eligible_files.checked_mul(size_of::<FileId>()).ok_or(AppError::Admission)?
         };
@@ -152,17 +160,19 @@ impl RetainedAtlasSearch {
             .ok_or(AppError::Admission)?;
         let lease = self.budget.try_reserve_managed(self.manifest.owner(), state_id, ByteLength::new(charge as u64))
             .map_err(|_| AppError::Admission)?;
+        let scope_files = scope.freeze(atlas, eligible_files, canceled)?;
+        let case_sensitive = scope.case_sensitive();
         let snapshot = Snapshot { generation, needle: copy_text(needle)?, structure: None,
             structure_rows: Vec::new(), files: reserve(capacity)?,
-            scope, scope_files: scope.freeze(atlas, eligible_files, canceled)?, eligible_files,
+            scope, scope_files, scope_region, eligible_files,
             hits: reserve(options.max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?,
-            matched_texts: reserve(if scope.case_sensitive() { 0 } else { options.max_matches })?,
+            matched_texts: reserve(if case_sensitive { 0 } else { options.max_matches })?,
             matched_text_capacity: text_capacity,
             examined: 0, scanned: 0, unavailable: 0, pending: eligible_files,
             matches_seen: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0,
             truncated: false, complete: false, stop_reason: None, step_count: 0,
             last_step_files: 0, last_step_bytes: 0, last_step_calls: 0, index_usage: None, _lease: lease };
-        let pattern = if scope.case_sensitive() {
+        let pattern = if case_sensitive {
             Some(StreamingNeedle::text(self.manifest.owner(), needle, &self.budget, pattern_id)
                 .map_err(AppError::from)?)
         } else { None };
@@ -334,5 +344,5 @@ fn update_coverage(atlas: &AtlasSession, q: &mut Snapshot, work: &LiveWork) {
         Some(AtlasSearchStop::SourceByteLimit)
     } else { None };
     q.complete = q.stop_reason.is_some() && atlas.atlas().discovery_complete()
-        && q.pending == 0 && q.unavailable == 0 && !q.truncated;
+        && q.scope_region.is_none_or(|region| region.missing == 0) && q.pending == 0 && q.unavailable == 0 && !q.truncated;
 }

@@ -66,7 +66,7 @@ fn directory_type_intersection_precedes_live_and_indexed_quotas() {
     let outside = search.hit(&atlas, 1, 1).unwrap().file;
     let selected = AtlasSearchScope::from_csv(Some("RS"), None).unwrap()
         .with_path(Kind::Directory, "src").unwrap();
-    let begin = search.begin_scoped(&atlas, 2, "needle", selected,
+    let begin = search.begin_scoped(&atlas, 2, "needle", selected.clone(),
         AtlasSearchOptions { max_matches: 1, max_files: 1, max_source_bytes: 6, ..options() }, || false).unwrap();
     count(begin.as_str(), "source_bytes_read", 0); count(begin.as_str(), "eligible_files", 1);
     count(begin.as_str(), "excluded_files", 3);
@@ -98,7 +98,7 @@ fn exact_hit_cap_lookahead_stays_in_the_frozen_directory_type_scope() {
     let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
     let selected = AtlasSearchScope::from_csv(Some("rs"), None).unwrap()
         .with_path(Kind::Directory, "src").unwrap();
-    search.begin_scoped(&atlas, 1, "needle", selected, AtlasSearchOptions {
+    search.begin_scoped(&atlas, 1, "needle", selected.clone(), AtlasSearchOptions {
         max_matches: 1, max_files: 2, max_source_bytes: 11, ..options()
     }, || false).unwrap();
     search.step(&atlas, 1, || false).unwrap();
@@ -134,7 +134,7 @@ fn exact_file_scope_is_not_a_basename_or_prefix_and_does_not_silently_widen() {
     let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
     let selected = scope(Kind::File, "dir/file.rs");
     assert!(!selected.is_all());
-    let live = search.search_scoped(&atlas, 1, "needle", selected, options(), || false).unwrap();
+    let live = search.search_scoped(&atlas, 1, "needle", selected.clone(), options(), || false).unwrap();
     count(live.as_str(), "eligible_files", 1); count(live.as_str(), "retained_hits", 1);
     assert!(live.as_str().contains("\"search_scope\":\"all\""));
     assert!(live.as_str().contains("\"scope_path_kind\":\"file\""));
@@ -169,7 +169,7 @@ fn directory_membership_preserves_component_case_unicode_and_native_filename_byt
     let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
     let selected = AtlasSearchScope::from_csv(Some("rs"), None).unwrap()
         .with_path(Kind::Directory, "src").unwrap();
-    search.search_scoped(&atlas, 1, "needle", selected, options(), || false).unwrap();
+    search.search_scoped(&atlas, 1, "needle", selected.clone(), options(), || false).unwrap();
     assert_eq!(search.progress(&atlas, 1).unwrap().retained_hits, 2);
     search.prepare_index(&atlas, 2, index_options(), || false).unwrap();
     search.search_indexed_scoped(&atlas, 3, 2, "needle", selected, 10, 12, || false).unwrap();
@@ -203,10 +203,10 @@ fn scope_replacement_and_cancellation_do_not_retarget_accepted_captures() {
     let fixture = Fixture::new(&[("a/source.rs", b"needle original"), ("b/source.rs", b"needle other")]);
     let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
     let first = scope(Kind::Directory, "a"); let next = scope(Kind::Directory, "b");
-    search.search_scoped(&atlas, 1, "needle", first, options(), || false).unwrap();
+    search.search_scoped(&atlas, 1, "needle", first.clone(), options(), || false).unwrap();
     let old = search.hit(&atlas, 1, 1).unwrap();
     search.begin_scoped(&atlas, 2, "needle", first, options(), || false).unwrap();
-    search.begin_scoped(&atlas, 3, "needle", next, options(), || false).unwrap();
+    search.begin_scoped(&atlas, 3, "needle", next.clone(), options(), || false).unwrap();
     assert_eq!(search.step(&atlas, 2, || false).err(), Some(AtlasSearchError::StaleQuery));
     assert_eq!(search.pending_generation(), Some(3));
     assert_eq!(search.step(&atlas, 3, || true).err(), Some(AtlasSearchError::Canceled));

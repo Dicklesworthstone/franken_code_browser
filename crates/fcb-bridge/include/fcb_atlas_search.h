@@ -76,7 +76,9 @@ char *fcb_atlas_search_begin_scoped(uint64_t handle, uint64_t generation, const 
     uint64_t max_files, uint64_t max_file_bytes, uint64_t max_source_bytes);
 
 /* Path scope INTERSECTS the existing file-type selection before every source,
- * file and match quota. path_kind: 0 workspace, 1 directory, 2 exact file.
+ * file and match quota. path_kind: 0 workspace, 1 directory, 2 exact file,
+ * 3 frozen visible files. The same contract applies to indexed and structural
+ * entrypoints; a visible region selects whole files, not source byte windows.
  * Workspace requires null/empty path. Directory/file require a nonempty relative
  * UTF-8 path <=4096 bytes with no NUL, leading/trailing slash, repeated slash,
  * or "." / ".." component. The directory path excludes a trailing slash and
@@ -84,10 +86,27 @@ char *fcb_atlas_search_begin_scoped(uint64_t handle, uint64_t generation, const 
  * Case and Unicode bytes are not normalized. Backslash is an ordinary Unix
  * filename byte. Matching never resolves a path or expands the atlas grant.
  * The strings may be freed after this call. begin performs no source I/O.
- * JSON scope_path_kind is "workspace", "directory" or "file"; scope_path is
+ * Visible requires a canonical lowercase hex CSV of exact raw relative Unix
+ * path bytes, sorted lexicographically with no duplicates. Null/empty CSV is
+ * an explicit EMPTY visible region; it never means workspace. At most 20000
+ * paths, 1048576 encoded bytes including commas, 4096 decoded bytes per path.
+ * Each decoded path follows the same component rules above but need not be
+ * UTF-8. Display labels, response-local file IDs and preview residency must not
+ * be substituted for exact paths. This manifest is host-declared membership;
+ * it does not prove a native frame was displayed or expand the root grant.
+ * JSON scope_path_kind is "workspace", "directory", "file" or "visible"; for
+ * the first three, scope_path is
  * the exact input string, scope_path_hex its original UTF-8 bytes in lowercase
  * hex. Legacy entrypoints emit workspace + empty path. search_scope still
- * identifies the file-type component. Validate BOTH components on every reply.
+ * identifies the file-type component. Visible emits empty scope_path and
+ * scope_path_hex, plus scope_region_sha256 (SHA-256 of the canonical input CSV),
+ * scope_region_files and scope_region_path_bytes (sum of decoded path lengths).
+ * scope_region_catalogued_files + scope_region_missing_files equals the
+ * requested region count, independently of file-type filters. Missing requested
+ * files force incomplete coverage. Existing eligible/excluded counts describe
+ * the search catalog, which may differ from the host's display catalog. These
+ * region fields are absent for other path kinds. Validate the frozen digest,
+ * counts and BOTH scope components on every reply, including repeated pages.
  * Invalid inputs do not replace a running/accepted query. A valid new request
  * uses a fresh generation; changing selection elsewhere cannot change its scope.
  */

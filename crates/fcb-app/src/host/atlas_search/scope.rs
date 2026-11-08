@@ -5,6 +5,15 @@
 //! otherwise valid ASCII extension. No source is opened while selecting files.
 
 use super::*;
+use std::sync::Arc;
+mod region;
+pub use region::{MAX_SEARCH_REGION_FILES, MAX_SEARCH_REGION_WIRE_BYTES};
+use region::VisibleRegion;
+
+/// Membership counts use the entire requested region, independently of the
+/// file-type predicate. Unknown requested paths never become successful misses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct RegionCoverage { pub catalogued: usize, pub missing: usize }
 
 pub const MAX_SEARCH_SCOPE_TOKENS: usize = 32;
 pub const MAX_SEARCH_SCOPE_TOKEN_BYTES: usize = 64;
@@ -14,10 +23,10 @@ pub const MAX_SEARCH_SCOPE_PATH_BYTES: usize = 4096;
 /// Path predicates narrow the existing authorized catalog; they never resolve
 /// a path, create a grant, or normalize two distinct native filenames together.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AtlasSearchPathKind { Workspace, Directory, File }
+pub enum AtlasSearchPathKind { Workspace, Directory, File, Visible }
 impl AtlasSearchPathKind {
     pub const fn name(self) -> &'static str {
-        match self { Self::Workspace => "workspace", Self::Directory => "directory", Self::File => "file" }
+        match self { Self::Workspace => "workspace", Self::Directory => "directory", Self::File => "file", Self::Visible => "visible" }
     }
 }
 
@@ -34,7 +43,7 @@ impl PathScope {
     const WORKSPACE: Self = Self { kind: AtlasSearchPathKind::Workspace, length: 0,
         bytes: [0; MAX_SEARCH_SCOPE_PATH_BYTES] };
     fn parse(kind: AtlasSearchPathKind, path: &str) -> Result<Self, AtlasSearchError> {
-        if path.len() > MAX_SEARCH_SCOPE_PATH_BYTES || path.as_bytes().contains(&0) {
+        if kind == AtlasSearchPathKind::Visible || path.len() > MAX_SEARCH_SCOPE_PATH_BYTES || path.as_bytes().contains(&0) {
             return Err(AtlasSearchError::InvalidScope);
         }
         if kind == AtlasSearchPathKind::Workspace {
@@ -54,7 +63,7 @@ impl PathScope {
     fn path(&self) -> &[u8] { &self.bytes[..self.length] }
     fn includes(&self, candidate: &[u8]) -> bool {
         match self.kind {
-            AtlasSearchPathKind::Workspace => true,
+            AtlasSearchPathKind::Workspace | AtlasSearchPathKind::Visible => true,
             AtlasSearchPathKind::File => candidate == self.path(),
             AtlasSearchPathKind::Directory => candidate.starts_with(self.path())
                 && candidate.get(self.length) == Some(&b'/'),
@@ -130,19 +139,22 @@ impl Tokens {
 /// present list, even empty, selects the union of its extensions and basenames.
 /// Extensions omit the dot; ASCII case is ignored. Scope never grants access to
 /// a file outside the atlas's original frozen catalog. An optional directory or
-/// exact-file predicate intersects these types before any source/query quota.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// exact-file or host-declared visible-region predicate intersects these types
+/// before any source/query quota. Region storage is immutable and separately
+/// admitted; cloning a scope shares that storage without recopying path bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AtlasSearchScope {
     all: bool,
     extensions: Tokens,
     filenames: Tokens,
     path: PathScope,
+    region: Option<Arc<VisibleRegion>>,
     case_sensitive: bool,
 }
 impl Default for AtlasSearchScope { fn default() -> Self { Self::all() } }
 impl AtlasSearchScope {
     pub const fn all() -> Self { Self { all: true, extensions: Tokens::EMPTY,
-        filenames: Tokens::EMPTY, path: PathScope::WORKSPACE, case_sensitive: true } }
+        filenames: Tokens::EMPTY, path: PathScope::WORKSPACE, region: None, case_sensitive: true } }
     /// Text matching is part of the frozen query, independent of file membership.
     /// False selects the shared engine's Unicode lowercase literal semantics;
     /// it does not normalize paths, grant access, or change structural name search.
@@ -156,18 +168,32 @@ impl AtlasSearchScope {
         if extensions.is_none() && filenames.is_none() { return Ok(Self::all()); }
         Ok(Self { all: false, extensions: Tokens::parse(extensions.unwrap_or(""), false)?,
             filenames: Tokens::parse(filenames.unwrap_or(""), true)?, path: PathScope::WORKSPACE,
-            case_sensitive: true })
+            region: None, case_sensitive: true })
     }
     /// Freeze a validated UTF-8 relative path without Unicode/case normalization
     /// or filesystem I/O. Directory paths omit their trailing separator and
     /// match descendants at a component boundary. Empty path means workspace
     /// only; no missing or invalid path broadens a directory/file request.
+    /// Visible instead accepts a canonical lowercase hex CSV of exact raw
+    /// paths, sorted and unique. Empty CSV is an explicit empty visible region.
+    /// Its bounded immutable allocation is leased before decoding and shared by
+    /// cloned scopes. This host-declared membership is not native frame proof.
     pub fn with_path(mut self, kind: AtlasSearchPathKind, path: &str) -> Result<Self, AtlasSearchError> {
-        self.path = PathScope::parse(kind, path)?;
+        if kind == AtlasSearchPathKind::Visible {
+            let region = VisibleRegion::parse(path)?;
+            self.path = PathScope { kind, ..PathScope::WORKSPACE };
+            self.region = Some(region);
+        } else {
+            self.path = PathScope::parse(kind, path)?;
+            self.region = None;
+        }
         Ok(self)
     }
+    /// Declared viewport membership, including paths absent from a search
+    /// catalog. This is independent of any additional file-type filtering.
+    pub fn region_files(&self) -> Option<usize> { self.region.as_ref().map(|region| region.files()) }
     pub fn includes_path(&self, path: &[u8]) -> bool {
-        if !self.path.includes(path) { return false; }
+        if !self.path.includes(path) || self.region.as_ref().is_some_and(|region| !region.includes(path)) { return false; }
         if self.all { return true; }
         let basename = path.rsplit(|&byte| byte == b'/').next().unwrap_or(path);
         if self.filenames.contains(basename) { return true; }
@@ -179,18 +205,29 @@ impl AtlasSearchScope {
         out.literal(",\"scope_extensions\":")?; self.extensions.encode(out)?;
         out.literal(",\"scope_filenames\":")?; self.filenames.encode(out)?;
         self.path.encode(out)?;
+        if let Some(region) = &self.region {
+            out.literal(",\"scope_region_sha256\":")?; out.quoted(&region.digest().to_hex())?;
+            out.literal(",\"scope_region_files\":")?; out.integer(region.files() as u64)?;
+            out.literal(",\"scope_region_path_bytes\":")?; out.integer(region.path_bytes() as u64)?;
+        }
         out.literal(",\"case_sensitive\":")?; out.boolean(self.case_sensitive)?;
         Ok(())
     }
-    pub(super) fn eligible_count(&self, atlas: &AtlasSession, canceled: &mut impl FnMut() -> bool)
-        -> Result<usize, AtlasSearchError> {
-        if self.is_all() { return Ok(atlas.atlas().file_count()); }
-        let mut count = 0;
+    pub(super) fn admission_counts(&self, atlas: &AtlasSession, canceled: &mut impl FnMut() -> bool)
+        -> Result<(usize, Option<RegionCoverage>), AtlasSearchError> {
+        if self.is_all() { return Ok((atlas.atlas().file_count(), None)); }
+        let (mut eligible, mut catalogued) = (0, 0);
         for entry in atlas.atlas().catalog().entries() {
             check(canceled)?;
-            if self.includes_path(entry.path().raw().as_bytes()) { count += 1; }
+            let path = entry.path().raw().as_bytes();
+            if self.region.as_ref().is_some_and(|region| region.includes(path)) { catalogued += 1; }
+            if self.includes_path(path) { eligible += 1; }
         }
-        Ok(count)
+        let region = self.region.as_ref().map(|region| {
+            let missing = region.files().checked_sub(catalogued).ok_or(AtlasSearchError::WrongAtlas)?;
+            Ok::<_, AtlasSearchError>(RegionCoverage { catalogued, missing })
+        }).transpose()?;
+        Ok((eligible, region))
     }
     /// Caller reserves the exact selected-ID capacity before this allocation.
     /// All retains the legacy catalog cursor without a duplicate universe vector.
@@ -214,4 +251,34 @@ impl AtlasSearchScope {
 
 pub(super) fn includes_file(files: &Option<Vec<FileId>>, file: FileId) -> bool {
     files.as_ref().is_none_or(|files| files.binary_search(&file).is_ok())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_manifest_is_exact_intersection_and_never_implicit_all() {
+        let wire = "7372632f612e5253,7372632f622e6d64";
+        let visible = AtlasSearchScope::from_csv(Some("rs"), None).unwrap()
+            .with_path(AtlasSearchPathKind::Visible, wire).unwrap();
+        assert!(!visible.is_all()); assert_eq!(visible.region_files(), Some(2));
+        assert!(visible.includes_path(b"src/a.RS"));
+        assert!(!visible.includes_path(b"src/a.rs"));
+        assert!(!visible.includes_path(b"src/b.md"));
+        assert!(!visible.includes_path(b"elsewhere.rs"));
+        let same = AtlasSearchScope::from_csv(Some("RS"), None).unwrap()
+            .with_path(AtlasSearchPathKind::Visible, wire).unwrap();
+        assert_eq!(visible, same); // Independent leases do not change identity.
+        let shared = visible.clone().with_case_sensitive(false);
+        assert!(Arc::ptr_eq(visible.region.as_ref().unwrap(), shared.region.as_ref().unwrap()));
+        assert!(shared.includes_path(b"src/a.RS")); assert!(!shared.case_sensitive());
+        let workspace = visible.with_path(AtlasSearchPathKind::Workspace, "").unwrap();
+        assert_eq!(workspace.region_files(), None); assert!(workspace.includes_path(b"elsewhere.rs"));
+        let empty = AtlasSearchScope::all().with_path(AtlasSearchPathKind::Visible, "").unwrap();
+        assert!(!empty.is_all()); assert_eq!(empty.region_files(), Some(0));
+        assert!(!empty.includes_path(b"anything.rs"));
+        assert!(empty.with_path(AtlasSearchPathKind::Workspace, "").unwrap().is_all());
+    }
 }
