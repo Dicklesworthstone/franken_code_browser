@@ -12,6 +12,8 @@
 
 mod reader_sessions;
 mod reader_ffi;
+mod observed_reader_sessions;
+mod observed_reader_ffi;
 mod desk_sessions;
 mod desk_ffi;
 mod atlas_sessions;

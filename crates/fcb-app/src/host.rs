@@ -9,6 +9,7 @@
 
 pub mod atlas;
 pub mod reader;
+pub mod observed_reader;
 pub mod atlas_session;
 pub mod atlas_search;
 pub mod atlas_paths;
