@@ -21,6 +21,48 @@ pub extern "C" fn fcb_atlas_index_begin(handle: u64, generation: u64, max_files:
     max_file_bytes: u64, max_source_bytes: u64, max_index_grams: u64) -> *mut c_char {
     prepare(handle, generation, max_files, max_file_bytes, max_source_bytes, max_index_grams, true)
 }
+
+/// Capture only the frozen path/file-type intersection, before source and file
+/// quotas. The query scope may later change without replacing these captures.
+/// # Safety
+/// Non-null strings must be readable NUL-terminated UTF-8 through this call.
+/// Scope limits and path encoding match fcb_atlas_search_path_scoped. Returned
+/// strings must be freed once with fcb_free_string. Host-worker use only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_index_prepare_scoped(handle: u64, generation: u64,
+    max_files: u64, max_file_bytes: u64, max_source_bytes: u64, max_index_grams: u64,
+    extensions: *const c_char, filenames: *const c_char, path_kind: u64,
+    path: *const c_char) -> *mut c_char {
+    unsafe { prepare_scoped(handle, generation, max_files, max_file_bytes,
+        max_source_bytes, max_index_grams, extensions, filenames, path_kind, path, false) }
+}
+
+/// Freeze scoped capture membership without reading source. The supplied
+/// strings are owned after admission; continue with the ordinary index_step.
+/// # Safety
+/// Same pointer, scope and returned-string contract as index_prepare_scoped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_index_begin_scoped(handle: u64, generation: u64,
+    max_files: u64, max_file_bytes: u64, max_source_bytes: u64, max_index_grams: u64,
+    extensions: *const c_char, filenames: *const c_char, path_kind: u64,
+    path: *const c_char) -> *mut c_char {
+    unsafe { prepare_scoped(handle, generation, max_files, max_file_bytes,
+        max_source_bytes, max_index_grams, extensions, filenames, path_kind, path, true) }
+}
+
+unsafe fn prepare_scoped(handle: u64, generation: u64, max_files: u64, max_file_bytes: u64,
+    max_source_bytes: u64, max_index_grams: u64, extensions: *const c_char,
+    filenames: *const c_char, path_kind: u64, path: *const c_char, progressive: bool) -> *mut c_char {
+    reply(|| answer(handle, |atlases| {
+        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?;
+        let options = AtlasIndexOptions { max_files: number(max_files)?, max_file_bytes: number(max_file_bytes)?,
+            max_source_bytes: number(max_source_bytes)?, max_index_grams: number(max_index_grams)? };
+        let command = if progressive { IndexCommand::PrepareBeginScoped { generation, scope: &scope, options } }
+            else { IndexCommand::PrepareScoped { generation, scope: &scope, options } };
+        atlases.execute_index(handle, command, || false)
+    }))
+}
+
 fn prepare(handle: u64, generation: u64, max_files: u64, max_file_bytes: u64,
     max_source_bytes: u64, max_index_grams: u64, progressive: bool) -> *mut c_char {
     reply(|| answer(handle, |atlases| {

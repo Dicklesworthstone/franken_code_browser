@@ -13,13 +13,14 @@ use fcb::search::{CaptureRequest, DirectSourceScanner, QueryError, QueryGenerati
 use super::indexed::IndexedWork;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AtlasSearchStop { AllFilesExamined, FileLimit, SourceByteLimit, MatchLimit, VerificationByteLimit }
+pub enum AtlasSearchStop { AllFilesExamined, FileLimit, SourceByteLimit, MatchLimit, VerificationByteLimit, CaptureScope }
 impl AtlasSearchStop {
     pub const fn code(self) -> &'static str {
         match self {
             Self::AllFilesExamined => "all-files-examined",
             Self::FileLimit => "file-limit", Self::SourceByteLimit => "source-byte-limit",
             Self::MatchLimit => "match-limit", Self::VerificationByteLimit => "verification-byte-limit",
+            Self::CaptureScope => "capture-scope",
         }
     }
 }

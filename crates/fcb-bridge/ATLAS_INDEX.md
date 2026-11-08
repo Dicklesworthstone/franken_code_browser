@@ -24,6 +24,29 @@ whole-repository scan, descriptor-array rebuild, or gram reconstruction.
 `fcb_atlas_index_prepare` remains available as a synchronous worker call that
 runs this same preparation pipeline to completion without yielding.
 
+For a selected file, directory, file type, or frozen visible region, use
+`fcb_atlas_index_begin_scoped` (or synchronous `prepare_scoped`). Its type lists
+and path payload have the same contract as `fcb_atlas_search_path_scoped`.
+The builder freezes the matching catalog IDs before spending file, source-byte,
+or gram quotas. A selected file late in the catalog can therefore use the entire
+admitted capture budget without unrelated earlier files consuming it. An empty
+selection reads nothing; it never expands to the workspace. The original calls
+continue to prepare all catalog members within their limits.
+
+Preparation pins its own scope independently of subsequent query scopes.
+`capture_search_scope`, `capture_scope_extensions`, `capture_scope_filenames`,
+`capture_scope_path_kind`, `capture_scope_path`, and `capture_scope_path_hex`
+echo that selection. Visible captures additionally carry the
+`capture_scope_region_*` digest, requested membership, byte count, catalogued
+membership, and missing membership fields. `capture_case_sensitive` is always
+true because capture membership is independent of later text matching options.
+`capture_eligible_files` and `capture_excluded_files` partition the metadata
+catalog; build `examined_files`, `pending_files`, `captured_files`, and
+`unavailable_files` describe only admitted capture membership. `catalogued_files`
+and `workspace_files` continue to describe the full catalog. Missing requested
+visible members or unfinished discovery prevent `capture_complete` even if all
+known selected files have been captured.
+
 Use `index_build_in_progress`, not `capture_complete`, to continue preparation.
 A terminal build may have pending or unavailable members, or uncovered segments.
 Per-step files/read bytes/read calls and cumulative counts are explicit.
@@ -115,6 +138,15 @@ entries exceeded the index build limits. No indexed query silently substitutes a
 fresh live capture. Original workspace counts remain separate from the frozen
 query's `eligible_files` and `excluded_files`.
 
+Changing a query's scope does not capture additional sources. If a finished
+narrow capture is queried more broadly, absent selected members remain pending
+and the terminal query reports `stop_reason: "capture-scope"`. An explicit new
+preparation can capture the new scope. Existing file/byte-limit reasons still
+identify a preparation that exhausted those limits. Each indexed result snapshot
+retains its original `capture_*` basis, including after an index replacement;
+paging an older accepted query must not substitute the new preparation's scope.
+Index-source reader receipts carry the same capture basis.
+
 The catalog stays frozen: rebuilding an index does not discover new filenames.
 Reopen/reconcile the atlas for changed membership. Per-file observations are not
 an atomic filesystem snapshot, Git history or watcher qualification. This is a
@@ -134,6 +166,9 @@ New tests: `fcb-search/tests/incremental_index_build.rs`,
 `atlas_index_build_sessions_tests.rs` / `atlas_index_build_ffi_tests.rs`.
 They exercise real engine segments, capture/query/reader workflows, one-file
 preparation, old-index availability, cancellation, failure, limits and ownership.
+`fcb-app/tests/atlas_index_capture_scope.rs` and the scoped C construction cases
+cover capture admission before quotas, late files, frozen visible membership,
+broader query coverage, explicit refresh, and old capture provenance.
 Existing owned/borrowed index, progressive query, retained-reader and registry
 suites also require independent verification after this shared-path change.
 

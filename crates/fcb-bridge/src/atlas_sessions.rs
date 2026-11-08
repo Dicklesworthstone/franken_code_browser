@@ -107,6 +107,10 @@ struct Cell {
     _lease: ResourceLease,
     _permit: Permit, // Last: source/geometry destruction precedes slot release.
 }
+// Cell embeds the session's fixed capture/query descriptors even while empty.
+// Reserve the advertised handle capacity from its actual layout, including Arc
+// bookkeeping, instead of a fixed allowance that shrinks as state grows.
+const ATLAS_CELL_CHARGE: usize = size_of::<Cell>() + 256;
 impl Cell {
     fn validate(&self, epoch: u64) -> Result<(), AccessError> {
         if self.closed.load(Ordering::Acquire) { Err(AccessError::Closed) }
@@ -124,7 +128,7 @@ impl AtlasSessions {
     pub(super) fn new() -> Self {
         Self { cells: Mutex::new(std::array::from_fn(|_| None)), live: Arc::new(AtomicUsize::new(0)),
             budget: ResourceBudget::new(ArenaOwnerId::new(1).expect("nonzero registry owner"),
-                ByteLength::new(64 * 1024)).expect("constant registry admission") }
+                ByteLength::new((MAX_ATLAS_SESSIONS * ATLAS_CELL_CHARGE) as u64)).expect("constant registry admission") }
     }
     pub(super) fn create(&self) -> Result<u64, AccessError> {
         let mut cells = lock(&self.cells)?;
@@ -137,7 +141,7 @@ impl AtlasSessions {
         let id = reader_sessions::fresh_handle()?;
         let lease = self.budget.try_reserve_managed(ArenaOwnerId::new(1).expect("nonzero registry owner"),
             ResourceAllocationId::new(id).map_err(|_| AccessError::Capacity)?,
-            ByteLength::new((size_of::<Cell>() + 256) as u64)).map_err(|_| AccessError::Capacity)?;
+            ByteLength::new(ATLAS_CELL_CHARGE as u64)).map_err(|_| AccessError::Capacity)?;
         cells[slot] = Some(Arc::new(Cell { id, closed: AtomicBool::new(false), epoch: AtomicU64::new(1),
             state: Mutex::new(None), _lease: lease, _permit: permit }));
         Ok(id)

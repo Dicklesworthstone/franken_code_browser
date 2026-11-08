@@ -31,6 +31,8 @@ pub struct AtlasIndexBuildProgress {
 pub(crate) struct IndexBuildWork {
     generation: u64,
     builder: OwnedIndexBuilder,
+    capture_scope: IndexCaptureScope,
+    scope_files: Option<Vec<FileId>>,
     options: AtlasIndexOptions,
     root: PathBuf,
     diagnostics: Vec<Unavailable>,
@@ -54,11 +56,20 @@ impl RetainedAtlasSearch {
     /// a segment. Queries may use the old accepted index between build steps.
     /// Preparation generations share the non-reusing search-attempt sequence.
     pub fn begin_index(&mut self, atlas: &AtlasSession, generation: u64,
+        options: AtlasIndexOptions, canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AtlasSearchError> {
+        self.begin_index_scoped(atlas, generation, AtlasSearchScope::all(), options, canceled)
+    }
+
+    /// Freeze capture membership before file/source/gram quotas. Admission
+    /// performs metadata work only; each step captures at most one selected ID.
+    /// A later query may narrow or broaden its scope without reopening source.
+    pub fn begin_index_scoped(&mut self, atlas: &AtlasSession, generation: u64, scope: AtlasSearchScope,
         options: AtlasIndexOptions, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
-        let work = self.prepare_index_build(atlas, generation, options, &mut canceled)?;
-        let progress = work.progress(atlas);
-        let response = self.encode_build_progress(atlas, progress, "index-begin", &mut canceled)?;
+        let work = self.prepare_index_build(atlas, generation, scope, options, &mut canceled)?;
+        let progress = work.progress();
+        let response = self.encode_build_progress(atlas, progress, &work.capture_scope, "index-begin", &mut canceled)?;
         self.building = Some(work);
         Ok(response)
     }
@@ -82,7 +93,7 @@ impl RetainedAtlasSearch {
         if let Some(stop) = self.advance_index_build(atlas, &mut work, &mut canceled)? {
             self.publish_index_build(atlas, work, stop, "index-step", &mut canceled)
         } else {
-            let response = self.encode_build_progress(atlas, work.progress(atlas), "index-step", &mut canceled)?;
+            let response = self.encode_build_progress(atlas, work.progress(), &work.capture_scope, "index-step", &mut canceled)?;
             self.building = Some(work);
             Ok(response)
         }
@@ -91,7 +102,7 @@ impl RetainedAtlasSearch {
         -> Result<AtlasIndexBuildProgress, AtlasSearchError> {
         self.validate(atlas)?;
         if let Some(work) = &self.building {
-            if work.generation == generation { return Ok(work.progress(atlas)); }
+            if work.generation == generation { return Ok(work.progress()); }
         }
         let index = self.index.as_ref().ok_or(AtlasSearchError::MissingIndex)?;
         if index.generation != generation { return Err(AtlasSearchError::StaleIndex); }
@@ -107,15 +118,27 @@ impl RetainedAtlasSearch {
     pub fn index_build_info(&mut self, atlas: &AtlasSession, generation: u64,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         let progress = self.index_build_progress(atlas, generation)?;
-        self.encode_build_progress(atlas, progress, "index-progress", &mut canceled)
+        // Output admission mutably borrows the search owner. This clone copies
+        // fixed descriptor arrays and shares the already-leased region storage.
+        let capture_scope = if let Some(work) = self.building.as_ref().filter(|work| work.generation == generation) {
+            work.capture_scope.clone()
+        } else {
+            self.index.as_ref().filter(|index| index.generation == generation)
+                .ok_or(AtlasSearchError::StaleIndex)?.capture_scope.clone()
+        };
+        self.encode_build_progress(atlas, progress, &capture_scope, "index-progress", &mut canceled)
     }
 
     pub(super) fn prepare_index_build(&mut self, atlas: &AtlasSession, generation: u64,
-        options: AtlasIndexOptions, canceled: &mut impl FnMut() -> bool)
+        scope: AtlasSearchScope, options: AtlasIndexOptions, canceled: &mut impl FnMut() -> bool)
         -> Result<IndexBuildWork, AtlasSearchError> {
         self.validate(atlas)?; self.attempt(generation)?;
         self.building = None; // New valid attempt supersedes the older builder, even if admission fails.
         options.validate()?; check(canceled)?;
+        let capture_scope = IndexCaptureScope::new(atlas, scope, canceled)?;
+        let scope_bytes = if capture_scope.scope.is_all() { 0 } else {
+            capture_scope.eligible.checked_mul(size_of::<FileId>()).ok_or(AppError::Admission)?
+        };
         let manifest_revision = generation.checked_add(self.manifest.revision())
             .ok_or(AtlasSearchError::IdentityExhausted)?;
         let manifest = SearchManifestId::new(self.manifest.owner(), manifest_revision)?;
@@ -124,16 +147,18 @@ impl RetainedAtlasSearch {
         let root_bytes = atlas.atlas().catalog().grant().root_path().len();
         let bytes = 2 * options.max_file_bytes + 256 * 1024 + 2 * root_bytes
             + MAX_DIAGNOSTICS * size_of::<Unavailable>() + size_of::<IndexBuildWork>() + size_of::<RetainedIndex>();
+        let bytes = bytes.checked_add(scope_bytes).ok_or(AppError::Admission)?;
         let lease = self.budget.try_reserve_managed(self.manifest.owner(), work_id, ByteLength::new(bytes as u64))
             .map_err(|_| AppError::Admission)?;
-        let capacity = options.max_files.min(atlas.atlas().file_count());
+        let scope_files = capture_scope.scope.freeze(atlas, capture_scope.eligible, canceled)?;
+        let capacity = options.max_files.min(capture_scope.eligible);
         let builder = OwnedIndexBuilder::new(manifest, SourceRetentionLimits {
             max_files: capacity, max_source_bytes: options.max_source_bytes as u64, max_path_bytes: 0,
         }, IndexLimits { max_source_bytes_per_file: options.max_file_bytes,
             max_source_bytes_total: options.max_source_bytes as u64, max_total_grams: options.max_index_grams,
             max_scratch_bytes: 4 * 1024 * 1024, ..Default::default() },
             &self.budget, source_id, index_id, &mut *canceled)?;
-        let work = IndexBuildWork { generation, builder, options,
+        let work = IndexBuildWork { generation, builder, capture_scope, scope_files, options,
             root: atlas.atlas().catalog().grant().root_path().to_path_buf(),
             diagnostics: reserve(MAX_DIAGNOSTICS)?, examined: 0, io: workspace::IoCounts::default(), scan_id,
             steps: 0, last_files: 0, last_bytes: 0, last_calls: 0, _lease: lease };
@@ -146,11 +171,13 @@ impl RetainedAtlasSearch {
         let before_files = work.examined;
         let before_bytes = work.io.bytes;
         let before_calls = work.io.calls;
-        if work.stop(atlas).is_none() {
+        if work.stop().is_none() {
             let catalog = atlas.atlas().catalog();
-            let ordinal = work.examined;
-            let entry = catalog.entries().get(ordinal).ok_or(AtlasSearchError::WrongAtlas)?;
-            let file = catalog.file_id(ordinal).ok_or(AtlasSearchError::WrongAtlas)?;
+            let file = match &work.scope_files {
+                Some(files) => files.get(work.examined).copied(),
+                None => catalog.file_id(work.examined),
+            }.ok_or(AtlasSearchError::WrongAtlas)?;
+            let entry = catalog.entry(file).ok_or(AtlasSearchError::WrongAtlas)?;
             let revision = SourceRevision::new(self.manifest.owner(), work.generation)
                 .map_err(|_| AtlasSearchError::IdentityExhausted)?;
             let captured = if entry.observed_bytes() > work.options.max_file_bytes as u64 {
@@ -180,22 +207,24 @@ impl RetainedAtlasSearch {
         work.last_files = work.examined - before_files;
         work.last_bytes = work.io.bytes - before_bytes;
         work.last_calls = work.io.calls - before_calls;
-        Ok(work.stop(atlas))
+        Ok(work.stop())
     }
     pub(super) fn publish_index_build(&mut self, atlas: &AtlasSession, work: IndexBuildWork,
         stop: AtlasSearchStop, command: &str, canceled: &mut impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
-        let IndexBuildWork { generation, builder, diagnostics, examined, io, root,
+        let IndexBuildWork { generation, builder, capture_scope, scope_files, diagnostics, examined, io, root,
             steps, last_files, last_bytes, last_calls, _lease: lease, .. } = work;
-        let pending = atlas.atlas().file_count().checked_sub(examined).ok_or(AtlasSearchError::WrongAtlas)?;
-        let membership = if pending == 0 && atlas.atlas().discovery_complete() {
+        let pending = capture_scope.eligible.checked_sub(examined).ok_or(AtlasSearchError::WrongAtlas)?;
+        let membership = if pending == 0 && capture_scope.all_requested_catalogued()
+            && atlas.atlas().discovery_complete() {
             MembershipState::Closed
         } else { MembershipState::Discovering };
         let engine = builder.finish(membership, &mut *canceled)?;
         drop(root);
+        drop(scope_files);
         lease.reconcile(ByteLength::new((size_of::<RetainedIndex>()
             + diagnostics.capacity() * size_of::<Unavailable>()) as u64)).map_err(|_| AppError::Admission)?;
-        let candidate = RetainedIndex { generation, engine, diagnostics, examined, pending,
+        let candidate = RetainedIndex { generation, engine, capture_scope, diagnostics, examined, pending,
             read_bytes: io.bytes, read_calls: io.calls, stop, build_steps: steps,
             last_build_files: last_files, last_build_bytes: last_bytes, last_build_calls: last_calls, _lease: lease };
         let mut out = self.output(atlas, command)?;
@@ -212,15 +241,18 @@ impl RetainedAtlasSearch {
         Ok(response)
     }
     fn encode_build_progress(&mut self, atlas: &AtlasSession, p: AtlasIndexBuildProgress,
-        command: &str, canceled: &mut impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
+        capture_scope: &IndexCaptureScope, command: &str, canceled: &mut impl FnMut() -> bool)
+        -> Result<HostResponse, AtlasSearchError> {
         check(canceled)?;
         let mut out = self.output(atlas, command)?;
+        capture_scope.encode(&mut out)?;
         out.literal(",\"index_generation\":")?; out.integer(p.generation)?;
         out.literal(",\"accepted_index_generation\":")?;
         if let Some(generation) = self.index_generation() { out.integer(generation)?; } else { out.literal("null")?; }
         out.literal(",\"index_build_in_progress\":")?; out.boolean(p.in_progress)?;
         out.literal(",\"capture_complete\":")?;
-        out.boolean(!p.in_progress && p.pending_files == 0 && p.unavailable_files == 0 && atlas.atlas().discovery_complete())?;
+        out.boolean(!p.in_progress && p.pending_files == 0 && p.unavailable_files == 0
+            && capture_scope.all_requested_catalogued() && atlas.atlas().discovery_complete())?;
         out.literal(",\"stop_reason\":")?;
         if let Some(reason) = p.stop_reason { out.quoted(reason.code())?; } else { out.literal("null")?; }
         for (key, value) in [("captured_files", p.captured_files as u64), ("unavailable_files", p.unavailable_files as u64),
@@ -233,22 +265,22 @@ impl RetainedAtlasSearch {
         }
         out.literal("}\n")?;
         let partial = p.in_progress || p.pending_files != 0 || p.unavailable_files != 0 || p.uncovered_files != 0
-            || !atlas.atlas().discovery_complete();
+            || !capture_scope.all_requested_catalogued() || !atlas.atlas().discovery_complete();
         self.finish(atlas, out, partial, canceled)
     }
 }
 impl IndexBuildWork {
-    fn stop(&self, atlas: &AtlasSession) -> Option<AtlasSearchStop> {
-        if self.examined == atlas.atlas().file_count() { Some(AtlasSearchStop::AllFilesExamined) }
+    fn stop(&self) -> Option<AtlasSearchStop> {
+        if self.examined == self.capture_scope.eligible { Some(AtlasSearchStop::AllFilesExamined) }
         else if self.examined == self.options.max_files { Some(AtlasSearchStop::FileLimit) }
         else if self.io.bytes >= self.options.max_source_bytes as u64 { Some(AtlasSearchStop::SourceByteLimit) }
         else { None }
     }
-    fn progress(&self, atlas: &AtlasSession) -> AtlasIndexBuildProgress {
+    fn progress(&self) -> AtlasIndexBuildProgress {
         let stats = self.builder.statistics();
         AtlasIndexBuildProgress { generation: self.generation, in_progress: true, stop_reason: None,
             captured_files: self.builder.captured_files(), unavailable_files: self.builder.unavailable_files(),
-            examined_files: self.examined, pending_files: atlas.atlas().file_count() - self.examined,
+            examined_files: self.examined, pending_files: self.capture_scope.eligible - self.examined,
             indexed_files: stats.indexed_files, uncovered_files: stats.uncovered_files,
             retained_source_bytes: self.builder.source_bytes(), source_bytes_read: self.io.bytes,
             read_calls: self.io.calls, steps: self.steps, last_step_files: self.last_files,

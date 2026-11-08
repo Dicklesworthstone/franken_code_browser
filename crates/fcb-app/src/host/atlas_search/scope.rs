@@ -14,6 +14,20 @@ use region::VisibleRegion;
 /// file-type predicate. Unknown requested paths never become successful misses.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct RegionCoverage { pub catalogued: usize, pub missing: usize }
+impl RegionCoverage {
+    pub(super) fn encode(&self, out: &mut Output, prefix: &str) -> Result<(), AtlasSearchError> {
+        field(out, prefix, "scope_region_catalogued_files")?; out.integer(self.catalogued as u64)?;
+        field(out, prefix, "scope_region_missing_files")?; out.integer(self.missing as u64)?;
+        Ok(())
+    }
+}
+
+// Prefixes and field names are internal schema constants, never caller input.
+// Writing them separately avoids allocating new strings for every scope echo.
+fn field(out: &mut Output, prefix: &str, name: &str) -> Result<(), AtlasSearchError> {
+    out.literal(",\"")?; out.literal(prefix)?; out.literal(name)?; out.literal("\":")?;
+    Ok(())
+}
 
 pub const MAX_SEARCH_SCOPE_TOKENS: usize = 32;
 pub const MAX_SEARCH_SCOPE_TOKEN_BYTES: usize = 64;
@@ -69,11 +83,11 @@ impl PathScope {
                 && candidate.get(self.length) == Some(&b'/'),
         }
     }
-    fn encode(&self, out: &mut Output) -> Result<(), AtlasSearchError> {
-        out.literal(",\"scope_path_kind\":")?; out.quoted(self.kind.name())?;
-        out.literal(",\"scope_path\":")?;
+    fn encode(&self, out: &mut Output, prefix: &str) -> Result<(), AtlasSearchError> {
+        field(out, prefix, "scope_path_kind")?; out.quoted(self.kind.name())?;
+        field(out, prefix, "scope_path")?;
         out.quoted(std::str::from_utf8(self.path()).map_err(|_| AtlasSearchError::InvalidScope)?)?;
-        out.literal(",\"scope_path_hex\":")?; out.hex(self.path())?;
+        field(out, prefix, "scope_path_hex")?; out.hex(self.path())?;
         Ok(())
     }
 }
@@ -201,16 +215,21 @@ impl AtlasSearchScope {
         dot != 0 && dot + 1 < basename.len() && self.extensions.contains(&basename[dot + 1..])
     }
     pub(super) fn encode(&self, out: &mut Output) -> Result<(), AtlasSearchError> {
-        out.literal(",\"search_scope\":")?; out.quoted(if self.all { "all" } else { "file-types" })?;
-        out.literal(",\"scope_extensions\":")?; self.extensions.encode(out)?;
-        out.literal(",\"scope_filenames\":")?; self.filenames.encode(out)?;
-        self.path.encode(out)?;
+        self.encode_prefixed(out, "")
+    }
+    /// Capture admission and query admission use the same validated predicate
+    /// encoding, with separate field namespaces when both appear in a receipt.
+    pub(super) fn encode_prefixed(&self, out: &mut Output, prefix: &str) -> Result<(), AtlasSearchError> {
+        field(out, prefix, "search_scope")?; out.quoted(if self.all { "all" } else { "file-types" })?;
+        field(out, prefix, "scope_extensions")?; self.extensions.encode(out)?;
+        field(out, prefix, "scope_filenames")?; self.filenames.encode(out)?;
+        self.path.encode(out, prefix)?;
         if let Some(region) = &self.region {
-            out.literal(",\"scope_region_sha256\":")?; out.quoted(&region.digest().to_hex())?;
-            out.literal(",\"scope_region_files\":")?; out.integer(region.files() as u64)?;
-            out.literal(",\"scope_region_path_bytes\":")?; out.integer(region.path_bytes() as u64)?;
+            field(out, prefix, "scope_region_sha256")?; out.quoted(&region.digest().to_hex())?;
+            field(out, prefix, "scope_region_files")?; out.integer(region.files() as u64)?;
+            field(out, prefix, "scope_region_path_bytes")?; out.integer(region.path_bytes() as u64)?;
         }
-        out.literal(",\"case_sensitive\":")?; out.boolean(self.case_sensitive)?;
+        field(out, prefix, "case_sensitive")?; out.boolean(self.case_sensitive)?;
         Ok(())
     }
     pub(super) fn admission_counts(&self, atlas: &AtlasSession, canceled: &mut impl FnMut() -> bool)

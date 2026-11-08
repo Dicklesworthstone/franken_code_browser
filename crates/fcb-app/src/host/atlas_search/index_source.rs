@@ -31,6 +31,7 @@ impl RetainedAtlasSearch {
         let witness = CaptureWitness::new(source.bytes(), &mut stop)?;
         let mut reader = ReaderSession::from_bytes(reader_owner, &label, source.bytes(), &mut stop)?;
         let info = reader.info(&mut stop)?;
+        index.capture_scope.encode(&mut out)?;
         out.literal(",\"selection_namespace\":\"index-source\",\"index_generation\":")?;
         out.integer(index.generation)?;
         out.literal(",\"capture_manifest\":")?; out.integer(index.engine.id().revision())?;

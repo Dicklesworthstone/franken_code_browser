@@ -45,9 +45,53 @@ impl AtlasIndexOptions {
         Ok(())
     }
 }
+
+/// Immutable capture membership, distinct from every later query's scope.
+/// Fixed descriptor storage is charged inside its retaining index/query; a
+/// visible manifest is shared with its own lease until its last owner retires.
+#[derive(Clone)]
+struct IndexCaptureScope {
+    scope: AtlasSearchScope,
+    eligible: usize,
+    excluded: usize,
+    region: Option<scope::RegionCoverage>,
+}
+impl IndexCaptureScope {
+    fn new(atlas: &AtlasSession, scope: AtlasSearchScope, canceled: &mut impl FnMut() -> bool)
+        -> Result<Self, AtlasSearchError> {
+        // Matching options never affect which source files are captured.
+        let scope = scope.with_case_sensitive(true);
+        let (eligible, region) = scope.admission_counts(atlas, canceled)?;
+        let excluded = atlas.atlas().file_count().checked_sub(eligible).ok_or(AtlasSearchError::WrongAtlas)?;
+        Ok(Self { scope, eligible, excluded, region })
+    }
+    fn all_requested_catalogued(&self) -> bool { self.region.is_none_or(|region| region.missing == 0) }
+    fn encode(&self, out: &mut Output) -> Result<(), AtlasSearchError> {
+        self.scope.encode_prefixed(out, "capture_")?;
+        out.literal(",\"capture_eligible_files\":")?; out.integer(self.eligible as u64)?;
+        out.literal(",\"capture_excluded_files\":")?; out.integer(self.excluded as u64)?;
+        if let Some(region) = self.region { region.encode(out, "capture_")?; }
+        Ok(())
+    }
+    fn query_members_outside(&self, atlas: &AtlasSession, query: &AtlasSearchScope,
+        canceled: &mut impl FnMut() -> bool) -> Result<usize, AtlasSearchError> {
+        check(canceled)?;
+        if self.scope.is_all() { return Ok(0); }
+        if query.is_all() { return Ok(self.excluded); }
+        let mut outside = 0;
+        for entry in atlas.atlas().catalog().entries() {
+            check(canceled)?;
+            let path = entry.path().raw().as_bytes();
+            if query.includes_path(path) && !self.scope.includes_path(path) { outside += 1; }
+        }
+        Ok(outside)
+    }
+}
+
 pub(super) struct RetainedIndex {
     generation: u64,
     engine: OwnedEphemeralIndex,
+    capture_scope: IndexCaptureScope,
     diagnostics: Vec<Unavailable>,
     examined: usize,
     pending: usize,
@@ -63,12 +107,13 @@ pub(super) struct RetainedIndex {
 pub(super) struct IndexedWork {
     query: OwnedIndexedQuery,
     index_generation: u64,
+    outside_capture_scope: usize,
     unsupported_seen: usize,
 }
-#[derive(Clone, Copy)]
 pub(super) struct IndexQueryUsage {
     generation: u64,
     manifest: u64,
+    capture_scope: IndexCaptureScope,
     skipped: usize,
     verified: usize,
     fallback: usize,
@@ -77,7 +122,8 @@ pub(super) struct IndexQueryUsage {
     capture_unavailable: usize,
 }
 impl IndexQueryUsage {
-    pub(super) fn encode(self, out: &mut Output) -> Result<(), AtlasSearchError> {
+    pub(super) fn encode(&self, out: &mut Output) -> Result<(), AtlasSearchError> {
+        self.capture_scope.encode(out)?;
         out.literal(",\"index_generation\":")?; out.integer(self.generation)?;
         out.literal(",\"capture_manifest\":")?; out.integer(self.manifest)?;
         for (key, value) in [("skipped_by_index", self.skipped as u64),
@@ -105,9 +151,17 @@ impl RetainedAtlasSearch {
     /// Compatibility worker call over the SAME one-file preparation pipeline.
     /// Use begin_index/step_index to yield between captured/indexed members.
     pub fn prepare_index(&mut self, atlas: &AtlasSession, generation: u64,
+        options: AtlasIndexOptions, canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AtlasSearchError> {
+        self.prepare_index_scoped(atlas, generation, AtlasSearchScope::all(), options, canceled)
+    }
+
+    /// Capture only the frozen type/path membership before spending any source,
+    /// file or index quota. Later queries reuse these exact bytes until rebuild.
+    pub fn prepare_index_scoped(&mut self, atlas: &AtlasSession, generation: u64, scope: AtlasSearchScope,
         options: AtlasIndexOptions, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
-        let mut work = self.prepare_index_build(atlas, generation, options, &mut canceled)?;
+        let mut work = self.prepare_index_build(atlas, generation, scope, options, &mut canceled)?;
         loop {
             if let Some(stop) = self.advance_index_build(atlas, &mut work, &mut canceled)? {
                 return self.publish_index_build(atlas, work, stop, "index-prepare", &mut canceled);
@@ -173,6 +227,7 @@ impl RetainedAtlasSearch {
         let retained = self.index.as_ref().ok_or(AtlasSearchError::MissingIndex)?;
         if retained.generation != index_generation { return Err(AtlasSearchError::StaleIndex); }
         let (eligible_files, scope_region) = scope.admission_counts(atlas, canceled)?;
+        let outside_capture_scope = retained.capture_scope.query_members_outside(atlas, &scope, canceled)?;
         let scope_bytes = if scope.is_all() { 0 } else {
             eligible_files.checked_mul(size_of::<FileId>()).ok_or(AppError::Admission)?
         };
@@ -219,6 +274,7 @@ impl RetainedAtlasSearch {
             truncated: false, complete: false, stop_reason: None, step_count: 0,
             last_step_files: 0, last_step_bytes: 0, last_step_calls: 0,
             index_usage: Some(IndexQueryUsage { generation: index_generation, manifest: retained.engine.id().revision(),
+                capture_scope: retained.capture_scope.clone(),
                 skipped: 0, verified: 0, fallback: 0, scanned_bytes: 0,
                 eligible_captured, capture_unavailable: unavailable }), _lease: lease };
         for diagnostic in &retained.diagnostics {
@@ -229,7 +285,7 @@ impl RetainedAtlasSearch {
         }
         self.validate(atlas)?; check(canceled)?;
         Ok(SearchWork { snapshot, execution: SearchExecution::Indexed(IndexedWork {
-            query, index_generation, unsupported_seen: 0 }) })
+            query, index_generation, outside_capture_scope, unsupported_seen: 0 }) })
     }
 
     pub(super) fn advance_indexed_work(&self, atlas: &AtlasSession, candidate: &mut Snapshot,
@@ -258,14 +314,23 @@ impl RetainedAtlasSearch {
                 SearchCoverage::CanceledEarly => return Err(AtlasSearchError::Canceled),
                 SearchCoverage::Exhaustive => if candidate.pending == 0 {
                     AtlasSearchStop::AllFilesExamined
+                } else if candidate.pending == work.outside_capture_scope {
+                    AtlasSearchStop::CaptureScope
                 } else { retained.stop },
             })
         };
-        candidate.index_usage = Some(IndexQueryUsage { generation: work.index_generation,
-            manifest: report.manifest().revision(), skipped: report.skipped_by_index(),
-            verified: report.scan_attempts(), fallback: report.fallback_attempts(), scanned_bytes: results.scanned_bytes,
-            eligible_captured: report.known_files() - report.unavailable_files().len(),
-            capture_unavailable: report.unavailable_files().len() });
+        // Keep the admitted capture descriptor even after a future index
+        // replacement; accepted pages must never borrow the replacement basis.
+        let usage = candidate.index_usage.as_mut().ok_or(AtlasSearchError::WrongAtlas)?;
+        if usage.generation != work.index_generation || usage.manifest != report.manifest().revision() {
+            return Err(AtlasSearchError::WrongAtlas);
+        }
+        usage.skipped = report.skipped_by_index();
+        usage.verified = report.scan_attempts();
+        usage.fallback = report.fallback_attempts();
+        usage.scanned_bytes = results.scanned_bytes;
+        usage.eligible_captured = report.known_files() - report.unavailable_files().len();
+        usage.capture_unavailable = report.unavailable_files().len();
         for &file in &results.unsupported_files[work.unsupported_seen..] {
             check(canceled)?; candidate.unavailable(file, "UNSUPPORTED_TEXT");
         }
@@ -334,10 +399,12 @@ impl RetainedAtlasSearch {
     }
 }
 fn capture_complete(atlas: &AtlasSession, index: &RetainedIndex) -> bool {
-    atlas.atlas().discovery_complete() && index.pending == 0 && index.engine.unavailable_files().is_empty()
+    atlas.atlas().discovery_complete() && index.capture_scope.all_requested_catalogued()
+        && index.pending == 0 && index.engine.unavailable_files().is_empty()
 }
 fn encode_index(out: &mut Output, atlas: &AtlasSession, index: &RetainedIndex) -> Result<(), AtlasSearchError> {
     let stats = index.engine.statistics();
+    index.capture_scope.encode(out)?;
     out.literal(",\"index_generation\":")?; out.integer(index.generation)?;
     out.literal(",\"index_build_in_progress\":false,\"build_steps\":")?; out.integer(index.build_steps)?;
     out.literal(",\"last_step_files\":")?; out.integer(index.last_build_files as u64)?;

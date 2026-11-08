@@ -39,6 +39,27 @@ char *fcb_atlas_index_begin(uint64_t handle, uint64_t generation,
     uint64_t max_files, uint64_t max_file_bytes, uint64_t max_source_bytes,
     uint64_t max_index_grams);
 
+/* Prepare the frozen file-type/path intersection before capture quotas. Type
+ * lists and path_kind use fcb_atlas_search_path_scoped: 0 workspace, 1 directory,
+ * 2 exact file, 3 canonical raw-byte hex CSV of visible files. Null/null type
+ * lists mean all; present empty lists mean none. An empty visible manifest
+ * selects zero files. Strings are copied during admission and need not survive
+ * the call. The existing begin/prepare APIs remain all/workspace operations.
+ * Build counters (examined/pending/captured/unavailable) describe admitted
+ * capture membership; catalogued_files still describes the full atlas catalog.
+ * capture_eligible_files/capture_excluded_files and capture_* scope echoes pin
+ * that preparation independently of later queries. A query outside those
+ * captures remains incomplete; only an explicit new preparation reads disk.
+ */
+char *fcb_atlas_index_prepare_scoped(uint64_t handle, uint64_t generation,
+    uint64_t max_files, uint64_t max_file_bytes, uint64_t max_source_bytes,
+    uint64_t max_index_grams, const char *extensions, const char *filenames,
+    uint64_t path_kind, const char *path);
+char *fcb_atlas_index_begin_scoped(uint64_t handle, uint64_t generation,
+    uint64_t max_files, uint64_t max_file_bytes, uint64_t max_source_bytes,
+    uint64_t max_index_grams, const char *extensions, const char *filenames,
+    uint64_t path_kind, const char *path);
+
 /* Capture AND index at most one catalog member, then return. Finalization moves
  * completed storage without a full-source scan/rebuild. Use
  * index_build_in_progress, NOT capture_complete, to decide whether to continue.

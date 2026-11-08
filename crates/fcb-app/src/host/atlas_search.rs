@@ -363,6 +363,7 @@ impl RetainedAtlasSearch {
         let window = reader.read_window(start, ((end - start) as usize).max(4), &mut stop)?;
         out.literal(",\"query_generation\":")?; out.integer(generation)?;
         out.literal(",\"search_in_progress\":")?; out.boolean(snapshot.stop_reason.is_none())?;
+        if let Some(usage) = &snapshot.index_usage { usage.encode(&mut out)?; }
         out.literal(",\"hit_id\":")?; out.integer(hit.id)?;
         encode_hit(&mut out, atlas, snapshot, hit)?;
         out.literal(",\"source_observation\":\"retained-search-capture\",\"source_reopened\":false,\"reader_owner\":")?;
@@ -402,6 +403,7 @@ impl RetainedAtlasSearch {
         // The legacy scope label names the display filter for encoded rows.
         // Search summaries separately echo the immutable query admission scope.
         atlas.encode_scope(&mut out).map_err(AtlasSearchError::from)?;
+        out.literal(",\"catalogued_files\":")?; out.integer(atlas.atlas().file_count() as u64)?;
         Ok(out)
     }
     fn finish(&mut self, atlas: &AtlasSession, out: Output, partial: bool,
@@ -420,14 +422,11 @@ fn summary(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot) -> Resul
     out.literal(",\"query_generation\":")?; out.integer(snapshot.generation)?;
     out.literal(",\"needle\":")?; out.quoted(&snapshot.needle)?;
     snapshot.scope.encode(out)?;
-    if let Some(region) = snapshot.scope_region {
-        out.literal(",\"scope_region_catalogued_files\":")?; out.integer(region.catalogued as u64)?;
-        out.literal(",\"scope_region_missing_files\":")?; out.integer(region.missing as u64)?;
-    }
+    if let Some(region) = snapshot.scope_region { region.encode(out, "")?; }
     out.literal(",\"search_strategy\":")?;
     out.quoted(if snapshot.structure.is_some() { "live-structure-scan" }
         else if snapshot.index_usage.is_some() { "retained-ephemeral-index" } else { "live-capture-scan" })?;
-    if let Some(usage) = snapshot.index_usage { usage.encode(out)?; }
+    if let Some(usage) = &snapshot.index_usage { usage.encode(out)?; }
     if let Some(structure) = &snapshot.structure { structure.encode(out)?; }
     else {
         out.literal(",\"mode\":")?;
@@ -441,8 +440,7 @@ fn summary(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot) -> Resul
     if let Some(reason) = snapshot.stop_reason { out.quoted(reason.code())?; } else { out.literal("null")?; }
     out.literal(",\"search_complete\":")?; out.boolean(snapshot.complete)?;
     out.literal(",\"truncated\":")?; out.boolean(snapshot.truncated)?;
-    for (key, value) in [("catalogued_files", atlas.atlas().file_count() as u64),
-        ("eligible_files", snapshot.eligible_files as u64),
+    for (key, value) in [("eligible_files", snapshot.eligible_files as u64),
         ("excluded_files", (atlas.atlas().file_count() - snapshot.eligible_files) as u64),
         ("examined_files", snapshot.examined as u64), ("scanned_files", snapshot.scanned as u64),
         ("unavailable_files", snapshot.unavailable as u64), ("pending_files", snapshot.pending as u64),

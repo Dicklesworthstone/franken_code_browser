@@ -8,6 +8,8 @@ use super::*;
 pub(crate) enum IndexCommand<'a> {
     Prepare { generation: u64, options: AtlasIndexOptions },
     PrepareBegin { generation: u64, options: AtlasIndexOptions },
+    PrepareScoped { generation: u64, scope: &'a AtlasSearchScope, options: AtlasIndexOptions },
+    PrepareBeginScoped { generation: u64, scope: &'a AtlasSearchScope, options: AtlasIndexOptions },
     PrepareStep { generation: u64 },
     PrepareProgress { generation: u64 },
     Info,
@@ -32,6 +34,10 @@ impl AtlasSessions {
         let result = match command {
             IndexCommand::Prepare { generation, options } => session.search.prepare_index(&session.atlas, generation, options, &mut stop),
             IndexCommand::PrepareBegin { generation, options } => session.search.begin_index(&session.atlas, generation, options, &mut stop),
+            IndexCommand::PrepareScoped { generation, scope, options } =>
+                session.search.prepare_index_scoped(&session.atlas, generation, scope.clone(), options, &mut stop),
+            IndexCommand::PrepareBeginScoped { generation, scope, options } =>
+                session.search.begin_index_scoped(&session.atlas, generation, scope.clone(), options, &mut stop),
             IndexCommand::PrepareStep { generation } => session.search.step_index(&session.atlas, generation, &mut stop),
             IndexCommand::PrepareProgress { generation } => session.search.index_build_info(&session.atlas, generation, &mut stop),
             IndexCommand::Info => session.search.index_info(&session.atlas, &mut stop),
