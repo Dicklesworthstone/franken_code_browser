@@ -791,19 +791,19 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 Toggle("Captured index", isOn: $useCapturedIndex)
                     .toggleStyle(.checkbox)
                     .disabled(loadingProject || searchMode != .text)
-                    .help("Capture once and reuse the Rust index. Live search remains the default.")
+                    .help("Capture the current file and location scope once, then search those retained bytes until Refresh.")
                 Spacer()
                 Button("Refresh", action: refreshCapturedSearch)
                     .disabled(!wantsCapturedIndex || loadingProject || root.isEmpty)
-                    .help("Capture current files into a new index without changing an already opened reader")
+                    .help("Capture the current file and location scope into a new index. Opened readers keep their original bytes.")
             }
             .font(.caption).padding(.horizontal, 10).padding(.top, 6)
             if wantsCapturedIndex {
-                Text("Per-file snapshot: later queries do not check disk. Refresh to include edits. Limits: 4096 files, 1 MiB per file, 32 MiB total.")
+                Text("The first search captures the selected scope. Later queries reuse those bytes; Refresh captures the current scope and file edits. Limits within that scope: 4096 files, 1 MiB per file, 32 MiB total.")
                     .font(.caption2).foregroundStyle(.secondary)
                     .padding(.horizontal, 10).padding(.top, 4)
                 if let index = searchReport?.indexStatus, !index.building {
-                    Text("\(index.reused ? "Reused" : "Prepared") index · \(index.capturedFiles) captures · \(index.capturedBytes) source bytes. This query verified \(index.verifiedFiles) files and skipped \(index.skippedFiles) by index.")
+                    Text("\(index.reused ? "Reused" : "Prepared") index for \(index.captureScopeDescription) · \(index.capturedFiles) of \(index.captureEligibleFiles ?? index.capturedFiles) eligible files captured · \(index.capturedBytes) source bytes. This query verified \(index.verifiedFiles) files and skipped \(index.skippedFiles) by index.")
                         .font(.caption2).foregroundStyle(.secondary)
                         .padding(.horizontal, 10).padding(.top, 4)
                 }
@@ -1932,7 +1932,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
         clearSearch()
         workspaceSearch?.refresh()
         if query.isEmpty {
-            searchSummary = "Captured index cleared. Enter text to capture current files; an opened reader keeps its original bytes."
+            searchSummary = "Captured index cleared. Enter text to capture the current file and location scope; an opened reader keeps its original bytes."
             status = searchSummary
         } else { runSearch() }
     }

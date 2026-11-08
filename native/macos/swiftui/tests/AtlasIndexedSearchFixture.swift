@@ -10,6 +10,7 @@ final class IndexedFixture: @unchecked Sendable {
         var fallback = false
         var hitCount = 2
         var pathHex = "612e7273"
+        var fileID: UInt64 = 1
         var digest = String(repeating: "a", count: 64)
         var encoding = "utf8"
         var insensitiveText = "X"
@@ -19,6 +20,11 @@ final class IndexedFixture: @unchecked Sendable {
         var scopedCaptured: Int? = nil
         var scopedUnavailable: Int? = nil
         var scopedHitCount: Int? = nil
+        var captureEligible: Int? = nil
+        var captureCaptured: Int? = nil
+        var captureUnavailable: Int? = nil
+        var captureVisibleCatalogued: Int? = nil
+        var captureVisibleMissing = 0
     }
     private struct Session {
         let config: Configuration
@@ -28,6 +34,8 @@ final class IndexedFixture: @unchecked Sendable {
         var needle = ""
         var scope: AtlasSearchFileScope = .all
         var pathScope: AtlasSearchPathScope = .workspace
+        var captureFileScope: AtlasSearchFileScope = .all
+        var capturePathScope: AtlasSearchPathScope = .workspace
         var caseSensitive = true
     }
     private let lock = NSLock()
@@ -60,8 +68,8 @@ final class IndexedFixture: @unchecked Sendable {
             precondition(limit == 128)
             return try self.response("page", h, generation: g, start: Int(start))
         }, sourceReader: { h, reader, index, file, revision in
-            precondition(index == 1 && file == 1 && revision == 1)
-            return try self.response("source", h, reader: reader)
+            precondition(index == 1 && revision == 1)
+            return try self.response("source", h, reader: reader, sourceFile: file)
         }, close: { h in
             self.lock.lock(); defer { self.lock.unlock() }
             precondition(self.sessions.removeValue(forKey: h) != nil)
@@ -76,11 +84,14 @@ final class IndexedFixture: @unchecked Sendable {
             precondition(index == 1)
             return try self.response("query-begin", h, generation: g, needle: needle, scope: scope,
                 pathScope: pathScope, caseSensitive: caseSensitive)
+        }, scopedIndexBegin: { h, g, scope, pathScope in
+            precondition(g == 1)
+            return try self.response("build-begin", h, scope: scope, pathScope: pathScope)
         })
     }
 
     private func response(_ phase: String, _ h: UInt64, generation: UInt64 = 1,
-                          needle: String = "", start: Int = 0, reader: UInt64 = 100,
+                          needle: String = "", start: Int = 0, reader: UInt64 = 100, sourceFile: UInt64 = 1,
                           scope: AtlasSearchFileScope = .all,
                           pathScope: AtlasSearchPathScope = .workspace,
                           caseSensitive: Bool = true,
@@ -91,6 +102,11 @@ final class IndexedFixture: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard var s = sessions[h] else { preconditionFailure("Use after close") }
         events.append("\(phase):\(h):\(generation)")
+        if phase == "build-begin" {
+            s.captureFileScope = scope; s.capturePathScope = pathScope
+            events.append("capture-scope:\(scope.wireKind):\(scope.extensions ?? ""):\(scope.filenames ?? "")")
+            events.append("capture-path:\(pathScope.kind.rawValue):\(pathScope.pathHex):\(pathScope.visibleIdentity ?? "")")
+        }
         if phase == "build-step" { s.buildStep += 1 }
         if phase == "query-begin" {
             precondition(generation > s.generation)
@@ -104,35 +120,63 @@ final class IndexedFixture: @unchecked Sendable {
         if phase == "query-step" || phase == "page" { precondition(s.generation == generation) }
         if phase == "query-step" { s.queryStep += 1 }
         sessions[h] = s
-        let c = s.config, captured = c.files - c.pending - c.unavailable
+        let c = s.config
+        let captureScoped = !s.captureFileScope.isAll || !s.capturePathScope.isWorkspace
+        let captureEligible = c.captureEligible ?? (captureScoped ? c.scopedEligible ?? c.files : c.files)
+        let captureUnavailable = c.captureUnavailable ?? (captureScoped ? c.scopedUnavailable ?? c.unavailable : c.unavailable)
+        let captured = c.captureCaptured ?? (captureScoped ? c.scopedCaptured ?? (captureEligible - c.pending - captureUnavailable)
+            : captureEligible - c.pending - captureUnavailable)
+        let capturePending = captureEligible - captured - captureUnavailable
+        precondition(captureEligible <= c.files && captured >= 0 && captureUnavailable >= 0 && capturePending >= 0)
         let totalBytes = captured == 0 ? 0 : 4096 + max(0, captured - 1) * 100
         var value: [String: Any] = ["schema": "fcb.atlas-search/1", "status": "ok", "owner": String(h),
-            "source_manifest": "1", "layout_revision": "3", "scope": "all", "workspace_files": String(c.files), "index_generation": "1"]
+            "source_manifest": "1", "layout_revision": "3", "scope": "all", "workspace_files": String(c.files),
+            "catalogued_files": String(c.files), "index_generation": "1"]
+        if phase != "open" {
+            value["capture_search_scope"] = s.captureFileScope.wireKind
+            value["capture_scope_extensions"] = s.captureFileScope.extensions ?? ""
+            value["capture_scope_filenames"] = s.captureFileScope.filenames ?? ""
+            value["capture_scope_path_kind"] = s.capturePathScope.kind.rawValue
+            value["capture_scope_path"] = s.capturePathScope.isVisible ? "" : s.capturePathScope.path
+            value["capture_scope_path_hex"] = s.capturePathScope.pathHex
+            value["capture_case_sensitive"] = true
+            value["capture_eligible_files"] = String(captureEligible)
+            value["capture_excluded_files"] = String(c.files - captureEligible)
+            if s.capturePathScope.isVisible {
+                value["capture_scope_region_sha256"] = s.capturePathScope.visibleIdentity
+                value["capture_scope_region_files"] = String(s.capturePathScope.visibleCount ?? 0)
+                value["capture_scope_region_path_bytes"] = String(Self.visiblePathBytes(s.capturePathScope))
+                value["capture_scope_region_catalogued_files"] = String(c.captureVisibleCatalogued ?? captureEligible)
+                value["capture_scope_region_missing_files"] = String(c.captureVisibleMissing)
+            }
+        }
         if phase == "open" {
             let fields: [String: Any] = ["schema": "fcb.atlas-session/1", "command": "info", "catalogued_files": String(c.files),
                 "discovery_complete": c.discovery, "retention": "frozen-catalog-and-spatial-index"]
             value.merge(fields, uniquingKeysWith: { _, n in n })
         } else if phase.hasPrefix("build") {
-            let examined = min(s.buildStep, c.files - c.pending)
+            let examined = min(s.buildStep, captureEligible - capturePending)
             let unavailable = max(0, examined - captured), available = examined - unavailable
             let bytes = available == 0 ? 0 : 4096 + max(0, available - 1) * 100
-            let running = phase == "build-begin" || examined < c.files - c.pending
+            let running = phase == "build-begin" || examined < captureEligible - capturePending
             let fields: [String: Any] = ["command": phase == "build-begin" ? "index-begin" : "index-step",
-                "index_build_in_progress": running, "capture_complete": !running && c.pending == 0 && c.unavailable == 0 && c.discovery,
+                "index_build_in_progress": running, "capture_complete": !running && capturePending == 0
+                    && captureUnavailable == 0 && c.captureVisibleMissing == 0 && c.discovery,
                 "captured_files": String(available), "unavailable_files": String(unavailable), "examined_files": String(examined),
-                "pending_files": String(c.files - examined), "indexed_files": String(c.fallback ? 0 : available),
+                "pending_files": String(captureEligible - examined), "indexed_files": String(c.fallback ? 0 : available),
                 "uncovered_files": String(c.fallback ? available : 0), "indexed_source_bytes": String(bytes),
                 "initial_source_bytes_read": String(bytes), "build_steps": String(s.buildStep),
-                "stop_reason": running ? NSNull() : (c.pending > 0 ? "source-byte-limit" : "all-files-examined")]
+                "stop_reason": running ? NSNull() : (capturePending > 0 ? "source-byte-limit" : "all-files-examined")]
             value.merge(fields, uniquingKeysWith: { _, n in n })
             if !running {
                 value["capture_manifest"] = "2"; value["index_kind"] = "retained-ephemeral-trigrams"
                 value["source_observation"] = "per-file-captures-not-atomic-workspace"; value["discovery_complete"] = c.discovery
             }
         } else if phase == "source" {
+            precondition(sourceFile == c.fileID)
             let path: [String: Any] = ["encoding": "unix-bytes", "hex": c.pathHex, "display": "a.rs"]
             let fields: [String: Any] = ["command": "index-open-reader", "capture_manifest": "2", "selection_namespace": "index-source",
-                "file_id": "1", "source_revision": "1", "capture_byte_length": "4096", "capture_sha256": c.digest,
+                "file_id": String(c.fileID), "source_revision": "1", "capture_byte_length": "4096", "capture_sha256": c.digest,
                 "path": path, "reader_owner": String(reader), "source_reopened": false, "source_observation": "retained-index-capture",
                 "reader": ["schema": "fcb.reader-session/1", "status": "ok", "command": "info", "owner": String(reader),
                     "file_id": "1", "source_revision": "1", "captured_bytes": "4096", "encoding": c.encoding, "path": path,
@@ -143,9 +187,9 @@ final class IndexedFixture: @unchecked Sendable {
             let scoped = !s.scope.isAll || !s.pathScope.isWorkspace
             let eligible = scoped ? c.scopedEligible ?? c.files : c.files
             let available = scoped ? c.scopedCaptured ?? captured : captured
-            let unavailable = scoped ? c.scopedUnavailable ?? c.unavailable : c.unavailable
+            let unavailable = scoped ? c.scopedUnavailable ?? captureUnavailable : captureUnavailable
             let pending = eligible - available - unavailable
-            precondition(eligible <= c.files && available <= captured && unavailable <= c.unavailable && pending >= 0)
+            precondition(eligible <= c.files && available <= captured && unavailable <= captureUnavailable && pending >= 0)
             let examined = min(s.queryStep, available)
             let scanned = s.caseSensitive ? min(1, examined) : examined, skipped = max(0, examined - scanned)
             let running = phase == "query-begin" || examined < available
@@ -157,7 +201,7 @@ final class IndexedFixture: @unchecked Sendable {
                     let range: [String: String] = ["start": String(n * 2),
                         "end": String(n * 2 + (s.caseSensitive ? 1 : c.insensitiveRangeBytes))]
                     let path: [String: String] = ["encoding": "unix-bytes", "hex": c.pathHex, "display": "a.rs"]
-                    var row: [String: Any] = ["hit_id": String(n + 1), "file_id": "1", "source_revision": "1",
+                    var row: [String: Any] = ["hit_id": String(n + 1), "file_id": String(c.fileID), "source_revision": "1",
                         "capture_sha256": c.digest, "capture_byte_length": "4096", "original_range": range, "path": path]
                     if !s.caseSensitive { row["matched_text"] = c.insensitiveText }
                     rows.append(row)
@@ -173,8 +217,10 @@ final class IndexedFixture: @unchecked Sendable {
                 "unavailable_files": String(unavailable), "pending_files": String(eligible - examined - unavailable),
                 "retained_hits": String(count), "displayed_hits": String(count), "matches_seen": String(count), "step_count": String(s.queryStep),
                 "verification_source_bytes": String(scanned == 0 ? 0 : min(4096, totalBytes)), "source_bytes_read": "0", "read_calls": "0",
-                "search_in_progress": running, "search_complete": !running && pending == 0 && unavailable == 0 && c.discovery,
-                "truncated": false, "stop_reason": running ? NSNull() : (pending > 0 ? "source-byte-limit" : "all-files-examined"),
+                "search_in_progress": running, "search_complete": !running && pending == 0 && unavailable == 0
+                    && (!s.pathScope.isVisible || c.captureVisibleMissing == 0) && c.discovery,
+                "truncated": false, "stop_reason": running ? NSNull() : (pending > 0
+                    ? (capturePending > 0 ? "source-byte-limit" : "capture-scope") : "all-files-examined"),
                 "hits": rows, "next_offset": end < count ? String(end) : NSNull()]
             value.merge(fields, uniquingKeysWith: { _, n in n })
             if scoped {
@@ -186,12 +232,23 @@ final class IndexedFixture: @unchecked Sendable {
                 value["eligible_captured_files"] = String(available)
                 value["scoped_capture_unavailable_files"] = String(unavailable)
                 value["scope_path_kind"] = s.pathScope.kind.rawValue
-                value["scope_path"] = s.pathScope.path
+                value["scope_path"] = s.pathScope.isVisible ? "" : s.pathScope.path
                 value["scope_path_hex"] = s.pathScope.pathHex
+                if s.pathScope.isVisible {
+                    value["scope_region_sha256"] = s.pathScope.visibleIdentity
+                    value["scope_region_files"] = String(s.pathScope.visibleCount ?? 0)
+                    value["scope_region_path_bytes"] = String(Self.visiblePathBytes(s.pathScope))
+                    value["scope_region_catalogued_files"] = String(c.captureVisibleCatalogued ?? eligible)
+                    value["scope_region_missing_files"] = String(c.captureVisibleMissing)
+                }
             }
         }
         value = mutation(phase, value)
         return String(decoding: try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]), as: UTF8.self)
+    }
+
+    private static func visiblePathBytes(_ scope: AtlasSearchPathScope) -> Int {
+        scope.path.split(separator: ",").reduce(0) { $0 + $1.utf8.count / 2 }
     }
 }
 

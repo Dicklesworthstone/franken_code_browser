@@ -386,7 +386,7 @@ import Dispatch
             let second = try scoped(w, scope: onlyRS)
             check(second.fileScope == onlyRS && second.streamID != first.streamID && second.indexStatus?.reused == true,
                 "Scope change creates a query generation without changing captured bytes")
-            check(f.count("create:") == 1 && f.count("build-step:") == 2 && f.count("query-step:") == 2,
+            check(f.count("create:") == 1 && f.count("build-step:") == 1 && f.count("query-step:") == 2,
                 "Scope changes do not rebuild the index or silently fall back to live discovery")
             let all = try run(w)
             check(all.fileScope.isAll && all.progress?.cataloguedFiles == 2 && all.indexStatus?.reused == true,
@@ -492,7 +492,7 @@ import Dispatch
             let broad = try run(w)
             check(broad.pathScope.isWorkspace && broad.progress?.cataloguedFiles == 2 && broad.indexStatus?.reused == true,
                 "Returning to workspace widens candidates without rebuilding captures")
-            check(f.count("create:") == 1 && f.count("open:") == 1 && f.count("build-step:") == 2,
+            check(f.count("create:") == 1 && f.count("open:") == 1 && f.count("build-step:") == 1,
                 "Folder/file/extension query changes do not reread the repository")
             check(f.trace.contains("query-path:directory:737263") && f.trace.contains("query-path:file:7372632f612e7273"),
                 "The transport receives exact frozen location bytes")
@@ -595,6 +595,189 @@ import Dispatch
             do { _ = try scoped(w, scope: .all, pathScope: composed); preconditionFailure("Normalized index path accepted") }
             catch AtlasSearchError.invalidResponse { checks += 1 }
         }
+        do {
+            let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport)
+            let late = try AtlasSearchPathScope(kind: .file, path: "zz-last.rs")
+            f.configure { c in
+                c.files = 20_000; c.fileID = 19_999; c.pathHex = "7a7a2d6c6173742e7273"
+                c.scopedEligible = 1; c.scopedCaptured = 1; c.scopedUnavailable = 0
+            }
+            let selected = try scoped(w, scope: .all, pathScope: late)
+            check(selected.complete && selected.progress?.cataloguedFiles == 1 && selected.excludedFiles == 19_999,
+                "An initial late-file scope captures its own population before the global file quota")
+            check(selected.indexStatus?.capturedFiles == 1 && selected.indexStatus?.captureEligibleFiles == 1
+                && selected.indexStatus?.capturePathScope == late && selected.indexStatus?.uncapturedFiles == 0,
+                "Capture provenance records the exact scope that admitted source work")
+            check(f.count("build-step:") == 1 && f.trace.contains("capture-path:file:7a7a2d6c6173742e7273:"),
+                "Selected capture admission reaches the scoped transport once")
+            let target = selected.capture!.target(selected.hits[0])!
+            let broad = try run(w, query: "another query")
+            check(!broad.complete && broad.progress?.cataloguedFiles == 20_000
+                && broad.indexStatus?.reused == true && broad.indexStatus?.uncapturedFiles == 19_999,
+                "Widening queries keeps the retained scope and reports the uncaptured population")
+            check(broad.summary.contains("Refresh to capture the current scope")
+                && f.count("create:") == 1 && f.count("build-step:") == 1,
+                "Broadening explains explicit Refresh without a hidden recapture or live fallback")
+            f.configure { $0.digest = String(repeating: "b", count: 64) }
+            let refreshed = AtlasIndexedSearch(transport: f.transport)
+            let fresh = try scoped(refreshed, scope: .all, pathScope: late)
+            check(fresh.complete && fresh.indexStatus?.reused == false
+                && fresh.hits[0].captureSHA256 != selected.hits[0].captureSHA256 && f.count("create:") == 2,
+                "Explicit owner replacement captures the current selected scope again")
+            _ = try target.openReader(100)
+            check(f.count("source:") == 1 && f.count("open:") == 2,
+                "The earlier late-file capture still imports after refreshed bytes replace the query")
+        }
+        do {
+            let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport)
+            let location = try AtlasSearchPathScope(kind: .directory, path: "src")
+            let flag = AtlasSearchCancellation()
+            f.configure { c in
+                c.files = 5; c.pathHex = "7372632f612e7273"
+                c.scopedEligible = 2; c.scopedCaptured = 2; c.scopedUnavailable = 0
+            }
+            f.patch { phase, value in
+                if phase == "build-step", value["build_steps"] as? String == "1" { flag.cancel() }
+                return value
+            }
+            do { _ = try scoped(w, scope: .all, pathScope: location, flag: flag); preconditionFailure("Paused build cancellation ignored") }
+            catch AtlasSearchError.canceled { checks += 1 }
+            f.patch { _, value in value }
+            let reports = IndexReports(), broad = try run(w, query: "replacement", reports: reports)
+            check(f.count("create:") == 1 && f.count("build-begin:") == 1 && f.count("build-step:") == 2,
+                "A validated preparation step survives cancellation and resumes its original scope")
+            check(!broad.complete && broad.pathScope.isWorkspace
+                && broad.indexStatus?.capturePathScope == location && broad.indexStatus?.uncapturedFiles == 3,
+                "Changed query membership does not relabel the paused capture")
+            check(reports.values.contains { $0.indexStatus?.building == true && $0.pathScope.isWorkspace
+                && $0.progress?.cataloguedFiles == 2 && $0.indexStatus?.capturePathScope == location
+                && $0.summary.contains("selected folder") },
+                "Resumed progress keeps current query authority and separately describes original capture scope")
+        }
+        do {
+            let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport)
+            f.configure { c in
+                c.pathHex = "7372632f612e7273"; c.scopedEligible = 1; c.scopedCaptured = 1; c.scopedUnavailable = 0
+            }
+            _ = try scoped(w, scope: .all, pathScope: AtlasSearchPathScope(kind: .directory, path: "src"))
+            f.patch { phase, original in
+                var value = original
+                if phase == "query-step" {
+                    var rows = value["hits"] as! [[String: Any]]
+                    rows[0]["path"] = ["encoding": "unix-bytes", "hex": "6f746865722f612e7273", "display": "other/a.rs"]
+                    value["hits"] = rows
+                }
+                return value
+            }
+            do { _ = try run(w); preconditionFailure("Broader query borrowed an uncaptured source witness") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        do {
+            let f = IndexedFixture(); var transport = f.transport; transport.scopedIndexBegin = nil
+            let worker = AtlasIndexedSearch(transport: transport)
+            do {
+                _ = try scoped(worker, scope: .all, pathScope: AtlasSearchPathScope(kind: .file, path: "a.rs"))
+                preconditionFailure("Legacy builder silently captured a global prefix")
+            } catch AtlasSearchError.invalidPathScope { checks += 1 }
+            do { _ = try scoped(worker, scope: rustScope); preconditionFailure("Legacy builder widened initial type scope") }
+            catch AtlasSearchError.invalidScope { checks += 1 }
+            check(f.count("create:") == 0, "Unsupported scoped preparation is refused before discovery or source work")
+            let permitted = try run(worker)
+            check(permitted.complete && permitted.indexStatus?.capturePathScope.isWorkspace == true,
+                "Legacy all-workspace preparation still serves its declared contract")
+        }
+        do {
+            let f = IndexedFixture(); var transport = f.transport; transport.scopedIndexBegin = nil
+            f.patch { _, original in
+                original.filter { entry in
+                    let key = entry.key
+                    return !(key == "capture_search_scope" || key.hasPrefix("capture_scope_")
+                        || key == "capture_case_sensitive" || key == "capture_eligible_files" || key == "capture_excluded_files")
+                }
+            }
+            let old = try run(AtlasIndexedSearch(transport: transport))
+            check(old.complete && old.indexStatus?.captureEligibleFiles == 2,
+                "Truly legacy all-workspace receipts remain supported without invented scoped authority")
+        }
+        for phase in ["build-begin", "build-step", "query-begin", "query-step", "page", "source"] {
+            for defect in ["missing", "filter", "path", "case", "eligible", "excluded", "catalog"] {
+                let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport)
+                f.configure { $0.hitCount = 70 }
+                f.patch { received, original in
+                    var value = original
+                    guard received == phase else { return value }
+                    switch defect {
+                    case "missing": value.removeValue(forKey: "capture_scope_path_hex")
+                    case "filter": value["capture_scope_extensions"] = "rs"
+                    case "path": value["capture_scope_path_kind"] = "directory"
+                    case "case": value["capture_case_sensitive"] = false
+                    case "eligible": value["capture_eligible_files"] = "1"
+                    case "excluded": value["capture_excluded_files"] = "1"
+                    default: value["catalogued_files"] = "1"
+                    }
+                    return value
+                }
+                do {
+                    let report = try run(w)
+                    if phase == "source" { _ = try report.capture!.target(report.hits[0])!.openReader(100) }
+                    preconditionFailure("Capture provenance corruption accepted: \(phase)/\(defect)")
+                } catch { checks += 1 }
+            }
+        }
+        #if canImport(CryptoKit)
+        do {
+            let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport)
+            let visible = try AtlasSearchPathScope(visiblePaths: [Array("zz-last.rs".utf8), [255, 46, 114, 115]])
+            f.configure { c in
+                c.files = 20_000; c.pathHex = "7a7a2d6c6173742e7273"; c.fileID = 19_999
+                c.scopedEligible = 2; c.scopedCaptured = 2; c.scopedUnavailable = 0
+            }
+            let report = try scoped(w, scope: .all, pathScope: visible)
+            check(report.complete && report.indexStatus?.capturePathScope == visible
+                && report.indexStatus?.captureEligibleFiles == 2 && f.count("build-step:") == 2,
+                "Frozen raw-byte visible membership, including non-UTF8 paths, selects capture work before quotas")
+            let emptyFixture = IndexedFixture()
+            emptyFixture.configure { c in c.scopedEligible = 0; c.scopedCaptured = 0; c.scopedUnavailable = 0; c.scopedHitCount = 0 }
+            let empty = try scoped(AtlasIndexedSearch(transport: emptyFixture.transport), scope: .all,
+                pathScope: AtlasSearchPathScope(visiblePaths: []))
+            check(empty.complete && empty.hits.isEmpty && empty.indexStatus?.capturedBytes == 0
+                && empty.indexStatus?.captureEligibleFiles == 0,
+                "An empty visible capture stays empty and never widens to the workspace")
+        }
+        for defect in ["digest", "missing", "coverage", "complete"] {
+            let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport)
+            let visible = try AtlasSearchPathScope(visiblePaths: [Array("a.rs".utf8), Array("missing.rs".utf8)])
+            f.configure { c in
+                c.scopedEligible = 1; c.scopedCaptured = 1; c.scopedUnavailable = 0
+                c.captureVisibleCatalogued = 1; c.captureVisibleMissing = 1
+            }
+            f.patch { phase, original in
+                var value = original
+                guard phase == "build-step" else { return value }
+                switch defect {
+                case "digest": value["capture_scope_region_sha256"] = String(repeating: "0", count: 64)
+                case "missing": value.removeValue(forKey: "capture_scope_region_files")
+                case "coverage": value["capture_scope_region_missing_files"] = "0"
+                default: value["capture_complete"] = true
+                }
+                return value
+            }
+            do { _ = try scoped(w, scope: .all, pathScope: visible); preconditionFailure("Corrupt visible capture accepted: " + defect) }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        do {
+            let f = IndexedFixture()
+            let visible = try AtlasSearchPathScope(visiblePaths: [Array("a.rs".utf8), Array("missing.rs".utf8)])
+            f.configure { c in
+                c.scopedEligible = 1; c.scopedCaptured = 1; c.scopedUnavailable = 0
+                c.captureVisibleCatalogued = 1; c.captureVisibleMissing = 1
+            }
+            let partial = try scoped(AtlasIndexedSearch(transport: f.transport), scope: .all, pathScope: visible)
+            check(!partial.complete && partial.hits.count == 2 && partial.visibleMissingFiles == 1
+                && partial.indexStatus?.captureMissingVisibleFiles == 1,
+                "Missing visible paths preserve useful captured results with explicit incomplete membership")
+        }
+        #endif
         print("AtlasIndexedSearchTests: \(checks) checks passed")
     }
 }

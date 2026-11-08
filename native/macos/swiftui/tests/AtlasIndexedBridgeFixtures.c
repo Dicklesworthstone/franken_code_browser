@@ -31,6 +31,24 @@ char *fcb_atlas_index_begin(uint64_t h, uint64_t g, uint64_t files, uint64_t per
     assert(h == handle && g == 1 && files == 4096 && per_file == 1024 * 1024 && bytes == 32 * 1024 * 1024 && grams == 2 * 1024 * 1024);
     ++calls; return result();
 }
+char *fcb_atlas_index_begin_scoped(uint64_t h, uint64_t g, uint64_t files, uint64_t per_file,
+                                  uint64_t bytes, uint64_t grams, const char *extensions,
+                                  const char *filenames, uint64_t path_kind, const char *path) {
+    if (g == 1 || g == 2) {
+        assert(!extensions && !filenames && path_kind == 0 && !path);
+    } else if (g == 3) {
+        assert(extensions && !strcmp(extensions, "rs") && filenames && !filenames[0]);
+        assert(path_kind == 2 && path && !strcmp(path, "zz-last.rs"));
+    } else if (g == 4) {
+        assert(extensions && !extensions[0] && filenames && !filenames[0]);
+        assert(path_kind == 1 && path && !strcmp(path, "src"));
+    } else if (g == 5) {
+        assert(!extensions && !filenames && path_kind == 3 && path && !strcmp(path, "612e7273,ff2e7273"));
+    } else {
+        assert(g == 6 && !extensions && !filenames && path_kind == 3 && path && !path[0]);
+    }
+    return fcb_atlas_index_begin(h, 1, files, per_file, bytes, grams);
+}
 char *fcb_atlas_index_step_cancelable(uint64_t h, uint64_t g, int32_t (*poll)(void *), void *ctx) {
     assert(h == handle && g == 1); ++calls; poll_now(poll, ctx); return result();
 }

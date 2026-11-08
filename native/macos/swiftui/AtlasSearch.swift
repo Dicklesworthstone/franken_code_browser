@@ -268,13 +268,16 @@ struct AtlasSearchReport: Sendable {
     var resultLabel: String { mode == .text && !caseSensitive ? "case-insensitive matches" : mode.resultLabel }
 
     var summary: String {
-        if indexStatus?.building == true, let progress {
-            return "Preparing captured index: \(progress.examinedFiles) of \(progress.cataloguedFiles) catalogued files examined. Query results are not ready yet."
+        if let indexStatus, indexStatus.building, let progress {
+            return "Preparing captured index for \(indexStatus.captureScopeDescription): \(progress.examinedFiles) of \(progress.cataloguedFiles) eligible files examined."
+                + (indexStatus.captureMissingVisibleFiles == 0 ? "" : " \(indexStatus.captureMissingVisibleFiles) requested visible files are outside this search catalog.")
+                + " Query results are not ready yet."
         }
         return resultSummary
             + (isWorkspaceScope ? "" : " \(excludedFiles) catalogued files outside this scope.")
             + (visibleMissingFiles == 0 ? "" : " \(visibleMissingFiles) requested visible files are outside this search catalog.")
             + (indexStatus == nil ? "" : " Captured index; Refresh to include file edits.")
+            + ((indexStatus?.uncapturedFiles ?? 0) == 0 ? "" : " \(indexStatus?.uncapturedFiles ?? 0) eligible files were not captured. Refresh to capture the current scope within its limits.")
     }
     private var resultSummary: String {
         let count = hits.count
@@ -861,4 +864,22 @@ struct AtlasSearchIndexStatus: Sendable {
     let skippedFiles: Int
     let verifiedFiles: Int
     let verificationBytes: UInt64
+    var captureFileScope: AtlasSearchFileScope = .all
+    var capturePathScope: AtlasSearchPathScope = .workspace
+    var captureEligibleFiles: Int? = nil
+    var captureMissingVisibleFiles: Int = 0
+    var uncapturedFiles: Int = 0
+
+    var captureScopeDescription: String {
+        let location = capturePathScope.isWorkspace ? "workspace" : capturePathScope.selectionDescription
+        guard !captureFileScope.isAll else { return location }
+        var filters: [String] = []
+        if let extensions = captureFileScope.extensions, !extensions.isEmpty {
+            filters.append("extensions " + extensions.split(separator: ",").map { ".\($0)" }.joined(separator: ", "))
+        }
+        if let filenames = captureFileScope.filenames, !filenames.isEmpty {
+            filters.append("filenames " + filenames.replacingOccurrences(of: ",", with: ", "))
+        }
+        return location + (filters.isEmpty ? " with no included file types" : " with " + filters.joined(separator: "; "))
+    }
 }

@@ -36,6 +36,18 @@ import Foundation
         check(try t.matchingQueryBegin!(h, 51, 1, "exact text", .all,
             AtlasSearchPathScope(kind: .directory, path: "src"), true) != nil)
         check(live() == 0 && calls() == 15)
+        check(try t.scopedIndexBegin!(h, 1, .all, .workspace) != nil)
+        check(try t.scopedIndexBegin!(h, 3, AtlasSearchFileScope(extensions: ["rs"]),
+            AtlasSearchPathScope(kind: .file, path: "zz-last.rs")) != nil)
+        check(try t.scopedIndexBegin!(h, 4, AtlasSearchFileScope(extensions: []),
+            AtlasSearchPathScope(kind: .directory, path: "src")) != nil)
+        check(live() == 0 && calls() == 18)
+        #if canImport(CryptoKit)
+        check(try t.scopedIndexBegin!(h, 5, .all,
+            AtlasSearchPathScope(visiblePaths: [[255, 46, 114, 115], Array("a.rs".utf8)])) != nil)
+        check(try t.scopedIndexBegin!(h, 6, .all, AtlasSearchPathScope(visiblePaths: [])) != nil)
+        check(live() == 0 && calls() == 20)
+        #endif
         mode(1); check(try t.indexBegin(h, 1) == nil && live() == 0)
         for bad: Int32 in [2, 3] {
             mode(bad)

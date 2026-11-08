@@ -59,11 +59,61 @@ struct AtlasIndexWire: Decodable {
     }
 }
 
+/// The scope admitted before source capture spends its file/byte allowance.
+/// Query scope is separate: later requests may search a narrower or broader
+/// predicate without changing this immutable source population.
+struct AtlasIndexedCaptureScope: Sendable, Equatable {
+    let fileScope: AtlasSearchFileScope
+    let pathScope: AtlasSearchPathScope
+    let eligibleFiles, excludedFiles, visibleMissingFiles: Int
+    let hasEcho: Bool
+
+    init(_ wire: AtlasIndexWire, fileScope: AtlasSearchFileScope, pathScope: AtlasSearchPathScope,
+         files: Int, requiresEcho: Bool) throws {
+        self.fileScope = fileScope; self.pathScope = pathScope
+        hasEcho = wire.fields.allKeys.contains { key in
+            key.stringValue == "capture_search_scope" || key.stringValue.hasPrefix("capture_scope_")
+                || key.stringValue == "capture_eligible_files" || key.stringValue == "capture_excluded_files"
+                || key.stringValue == "capture_case_sensitive"
+        }
+        if !hasEcho {
+            guard !requiresEcho, fileScope.isAll, pathScope.isWorkspace else { throw AtlasIndexWire.invalid() }
+            eligibleFiles = files; excludedFiles = 0; visibleMissingFiles = 0
+            return
+        }
+        guard try wire.flag("capture_case_sensitive"),
+              try wire.number("catalogued_files") == UInt64(files) else { throw AtlasIndexWire.invalid() }
+        // Read required fields, even for all/workspace. Optional legacy query
+        // echoes must not make a partially missing capture receipt acceptable.
+        eligibleFiles = try fileScope.eligibleFiles(kind: wire.text("capture_search_scope"),
+            extensions: wire.text("capture_scope_extensions"), filenames: wire.text("capture_scope_filenames"),
+            eligible: wire.text("capture_eligible_files"), excluded: wire.text("capture_excluded_files"),
+            catalogued: files, pathScoped: !pathScope.isWorkspace)
+        excludedFiles = files - eligibleFiles
+        try pathScope.validateEcho(kind: wire.text("capture_scope_path_kind"),
+            path: wire.text("capture_scope_path"), hex: wire.text("capture_scope_path_hex"),
+            regionSHA256: wire.optionalText("capture_scope_region_sha256"),
+            regionFiles: wire.optionalText("capture_scope_region_files"),
+            regionPathBytes: wire.optionalText("capture_scope_region_path_bytes"))
+        visibleMissingFiles = try pathScope.validateRegionCoverage(
+            catalogued: wire.optionalText("capture_scope_region_catalogued_files"),
+            missing: wire.optionalText("capture_scope_region_missing_files"), eligible: eligibleFiles,
+            searchCatalogFiles: files, allFileTypes: fileScope.isAll, complete: false)
+    }
+
+    func validate(_ wire: AtlasIndexWire, files: Int) throws {
+        let echoed = try Self(wire, fileScope: fileScope, pathScope: pathScope,
+            files: files, requiresEcho: hasEcho)
+        guard echoed == self else { throw AtlasIndexWire.invalid() }
+    }
+}
+
 struct AtlasIndexedBasis: Sendable, Equatable {
     let owner, manifest, layout, index, captureManifest: UInt64
     let files, capturedFiles, unavailable, pending: Int
     let sourceBytes: UInt64
     let discoveryComplete: Bool
+    let captureScope: AtlasIndexedCaptureScope
 
     func validate(_ wire: AtlasIndexWire, command: String) throws {
         try wire.header(schema: "fcb.atlas-search/1", command: command, owner: owner)
@@ -72,6 +122,7 @@ struct AtlasIndexedBasis: Sendable, Equatable {
               try wire.text("scope") == "all", try wire.number("workspace_files") == UInt64(files) else {
             throw AtlasIndexWire.invalid()
         }
+        try captureScope.validate(wire, files: files)
     }
 }
 
@@ -163,6 +214,10 @@ struct AtlasIndexedQueryPage {
         let eligible = try scope.eligibleFiles(kind: kind, extensions: w.optionalText("scope_extensions"),
             filenames: w.optionalText("scope_filenames"), eligible: w.optionalText("eligible_files"),
             excluded: w.optionalText("excluded_files"), catalogued: basis.files, pathScoped: !pathScope.isWorkspace)
+        let queriesCaptureScope = scope == basis.captureScope.fileScope && pathScope == basis.captureScope.pathScope
+        if queriesCaptureScope {
+            guard eligible == basis.captureScope.eligibleFiles else { throw AtlasIndexWire.invalid() }
+        }
         let captured, captureUnavailable: Int
         if kind == nil {
             captured = basis.capturedFiles; captureUnavailable = basis.unavailable
@@ -170,9 +225,11 @@ struct AtlasIndexedQueryPage {
             captured = try w.count("eligible_captured_files", upTo: min(basis.capturedFiles, eligible))
             captureUnavailable = try w.count("scoped_capture_unavailable_files", upTo: min(basis.unavailable, eligible))
         }
-        guard captured + captureUnavailable <= eligible,
-              !scope.isAll || !pathScope.isWorkspace || (captured == basis.capturedFiles && captureUnavailable == basis.unavailable) else {
+        guard captured + captureUnavailable <= eligible else {
             throw AtlasIndexWire.invalid()
+        }
+        if queriesCaptureScope || (scope.isAll && pathScope.isWorkspace) {
+            guard captured == basis.capturedFiles, captureUnavailable == basis.unavailable else { throw AtlasIndexWire.invalid() }
         }
         let examined = try w.count("examined_files", upTo: eligible)
         let scanned = try w.count("scanned_files", upTo: captured)
@@ -203,8 +260,11 @@ struct AtlasIndexedQueryPage {
               verification <= basis.sourceBytes, matches >= UInt64(retained), running == (stop == nil) else {
             throw AtlasIndexWire.invalid()
         }
-        if let stop, !["all-files-examined", "file-limit", "source-byte-limit", "match-limit", "verification-byte-limit"].contains(stop) {
+        if let stop, !["all-files-examined", "file-limit", "source-byte-limit", "capture-scope", "match-limit", "verification-byte-limit"].contains(stop) {
             throw AtlasIndexWire.invalid()
+        }
+        if stop == "capture-scope" {
+            guard pending > 0, basis.captureScope.excludedFiles > 0 else { throw AtlasIndexWire.invalid() }
         }
         if complete {
             guard !running, !truncated, basis.discoveryComplete, pending == 0, unavailable == 0,
@@ -212,6 +272,8 @@ struct AtlasIndexedQueryPage {
         }
         hits = try w.rows("hits", limit: command == "page" ? 128 : 64)
         guard hits.allSatisfy({ scope.admitsRawPath($0.rawPathBytes) && pathScope.admitsRawPath($0.rawPathBytes)
+            && basis.captureScope.fileScope.admitsRawPath($0.rawPathBytes)
+            && basis.captureScope.pathScope.admitsRawPath($0.rawPathBytes)
             && AtlasSearchText.accepts(actualText: $0.hit.actualText, needle: needle, caseSensitive: caseSensitive)
             && ($0.hit.excerpt?.matchesSourceText($0.hit.actualText ?? needle) != false) }) else {
             throw AtlasIndexWire.invalid()

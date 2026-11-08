@@ -6,6 +6,10 @@ private typealias IndexPoll = @convention(c) (UnsafeMutableRawPointer?) -> Int32
     _ files: UInt64, _ poll: IndexPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_index_begin") private func indexedBuildBegin(_ h: UInt64, _ g: UInt64,
     _ files: UInt64, _ fileBytes: UInt64, _ sourceBytes: UInt64, _ grams: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_index_begin_scoped") private func indexedScopedBuildBegin(_ h: UInt64, _ g: UInt64,
+    _ files: UInt64, _ fileBytes: UInt64, _ sourceBytes: UInt64, _ grams: UInt64,
+    _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
+    _ pathKind: UInt64, _ path: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_index_step_cancelable") private func indexedBuildStep(_ h: UInt64, _ g: UInt64,
     _ poll: IndexPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_search_indexed_begin") private func indexedQueryBegin(_ h: UInt64, _ g: UInt64, _ index: UInt64,
@@ -31,8 +35,8 @@ private typealias IndexPoll = @convention(c) (UnsafeMutableRawPointer?) -> Int32
 
 extension AtlasIndexedSearchTransport {
     static let native = Self(create: { indexedCreate() }, open: { h, root, flag in
-        // Keep one metadata universe across scope edits. Source capture retains
-        // its separate 4096-file/32 MiB limits and reports uncaptured members.
+        // Keep one metadata universe across scope edits. Source capture applies
+        // the initial selected scope before its 4096-file/32 MiB limits.
         try polling(flag) { poll, context in root.withCString { indexedOpen(h, $0, UInt64(AtlasSearchPathScope.maximumVisibleFiles), poll, context) } }
     }, indexBegin: { h, g in try take(indexedBuildBegin(h, g, 4096, 1024 * 1024, 32 * 1024 * 1024, 2 * 1024 * 1024)) },
     indexStep: { h, g, flag in try polling(flag) { indexedBuildStep(h, g, $0, $1) } },
@@ -63,6 +67,13 @@ extension AtlasIndexedSearchTransport {
                     try take(indexedMatchingQueryBegin(h, g, index, text, extensions, filenames,
                         kind, path, caseSensitive ? 1 : 0, 1000, 32 * 1024 * 1024))
                 }
+            }
+        }
+    }, scopedIndexBegin: { h, g, scope, pathScope in
+        try scope.withCStrings { extensions, filenames in
+            try pathScope.withCString { kind, path in
+                try take(indexedScopedBuildBegin(h, g, 4096, 1024 * 1024, 32 * 1024 * 1024,
+                    2 * 1024 * 1024, extensions, filenames, kind, path))
             }
         }
     })

@@ -18,6 +18,9 @@ struct AtlasIndexedSearchTransport: Sendable {
     var pathScopedQueryBegin: (@Sendable (UInt64, UInt64, UInt64, String, AtlasSearchFileScope, AtlasSearchPathScope) throws -> String?)? = nil
     /// Absent legacy transports must refuse insensitive requests before I/O.
     var matchingQueryBegin: (@Sendable (UInt64, UInt64, UInt64, String, AtlasSearchFileScope, AtlasSearchPathScope, Bool) throws -> String?)? = nil
+    /// Capture admission is independent from query filtering. A legacy builder
+    /// can prepare only the all-files workspace; never widen an initial scope.
+    var scopedIndexBegin: (@Sendable (UInt64, UInt64, AtlasSearchFileScope, AtlasSearchPathScope) throws -> String?)? = nil
 }
 
 /// An explicit captured-index session. The app serializes run() on its existing
@@ -138,7 +141,11 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     streamID: result.id, capture: capture,
                     indexStatus: AtlasSearchIndexStatus(building: false, reused: reused,
                         capturedFiles: basis.capturedFiles, capturedBytes: basis.sourceBytes,
-                        skippedFiles: state.skipped, verifiedFiles: state.scanned, verificationBytes: state.verificationBytes),
+                        skippedFiles: state.skipped, verifiedFiles: state.scanned, verificationBytes: state.verificationBytes,
+                        captureFileScope: basis.captureScope.fileScope, capturePathScope: basis.captureScope.pathScope,
+                        captureEligibleFiles: basis.captureScope.eligibleFiles,
+                        captureMissingVisibleFiles: basis.captureScope.visibleMissingFiles,
+                        uncapturedFiles: state.eligible - state.captured - state.captureUnavailable),
                     fileScope: scope, excludedFiles: basis.files - state.eligible, pathScope: pathScope,
                     caseSensitive: input.caseSensitive, visibleMissingFiles: state.visibleMissing)
                 try check(cancellation)
@@ -159,8 +166,13 @@ final class AtlasIndexedSearch: @unchecked Sendable {
         }
     }
 
-    private func beginBuild(root: String, access: AtlasSearchAccessLease,
+    private func beginBuild(root: String, scope: AtlasSearchFileScope, pathScope: AtlasSearchPathScope,
+                            access: AtlasSearchAccessLease,
                             cancellation: AtlasSearchCancellation) throws -> Preparation {
+        if transport.scopedIndexBegin == nil {
+            guard pathScope.isWorkspace else { throw AtlasSearchError.invalidPathScope }
+            guard scope.isAll else { throw AtlasSearchError.invalidScope }
+        }
         let handle = transport.create()
         let owner = try AtlasSearchCaptureOwner(handle: handle, close: transport.close, retirementFailed: transport.retirementFailed)
         owner.retainAccess(access)
@@ -172,8 +184,12 @@ final class AtlasIndexedSearch: @unchecked Sendable {
         guard layout > 0, try opened.text("scope") == "all", try opened.number("workspace_files") == UInt64(files),
               try opened.text("retention") == "frozen-catalog-and-spatial-index" else { throw AtlasIndexWire.invalid() }
         try check(cancellation)
-        let page = try AtlasIndexBuildPage(owner.call { try transport.indexBegin($0, 1) },
-            owner: handle, layout: layout, files: files, discovery: discovery, command: "index-begin")
+        let page = try AtlasIndexBuildPage(owner.call { handle in
+            if let scoped = transport.scopedIndexBegin { return try scoped(handle, 1, scope, pathScope) }
+            return try transport.indexBegin(handle, 1)
+        }, owner: handle, layout: layout, files: files, discovery: discovery,
+            scope: scope, pathScope: pathScope, requiresCaptureEcho: transport.scopedIndexBegin != nil,
+            command: "index-begin")
         guard page.steps == 0, page.examined == 0, page.bytes == 0, page.readBytes == 0, page.running else { throw AtlasIndexWire.invalid() }
         return Preparation(owner: owner, root: root, grant: access.reference.map(ObjectIdentifier.init),
             handle: handle, layout: layout, files: files, discovery: discovery, page: page)
@@ -185,7 +201,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
         let grant = access.reference.map(ObjectIdentifier.init)
         if preparing.map({ $0.root.utf8.elementsEqual(root.utf8) && $0.grant == grant }) != true {
             preparing = nil
-            preparing = try beginBuild(root: root, access: access, cancellation: cancellation)
+            preparing = try beginBuild(root: root, scope: scope, pathScope: pathScope,
+                access: access, cancellation: cancellation)
         }
         guard let preparation = preparing else { throw AtlasSearchError.unavailable }
         // A replacement request gets a new report stream, even when it resumes
@@ -199,9 +216,13 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             if now - lastPublished >= 0.1 {
                 progress(AtlasSearchReport(hits: [], complete: false, truncated: false,
                     unavailableFiles: page.unavailable, unsupportedFiles: 0, matchesSeen: 0,
-                    progress: AtlasSearchProgress(isRunning: true, examinedFiles: page.examined, cataloguedFiles: preparation.files),
+                    progress: AtlasSearchProgress(isRunning: true, examinedFiles: page.examined,
+                        cataloguedFiles: page.captureScope.eligibleFiles),
                     streamID: stream, indexStatus: AtlasSearchIndexStatus(building: true, reused: false,
-                        capturedFiles: page.captured, capturedBytes: page.bytes, skippedFiles: 0, verifiedFiles: 0, verificationBytes: 0),
+                        capturedFiles: page.captured, capturedBytes: page.bytes, skippedFiles: 0, verifiedFiles: 0, verificationBytes: 0,
+                        captureFileScope: page.captureScope.fileScope, capturePathScope: page.captureScope.pathScope,
+                        captureEligibleFiles: page.captureScope.eligibleFiles,
+                        captureMissingVisibleFiles: page.captureScope.visibleMissingFiles),
                     fileScope: scope, pathScope: pathScope, caseSensitive: caseSensitive))
                 lastPublished = now
             }
@@ -211,8 +232,11 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             do {
                 let next = try AtlasIndexBuildPage(preparation.owner.call { try transport.indexStep($0, 1, cancellation) },
                     owner: preparation.handle, layout: preparation.layout, files: preparation.files,
-                    discovery: preparation.discovery, command: "index-step")
-                guard next.manifest == page.manifest, next.steps == page.steps + 1,
+                    discovery: preparation.discovery, scope: page.captureScope.fileScope,
+                    pathScope: page.captureScope.pathScope, requiresCaptureEcho: page.captureScope.hasEcho,
+                    command: "index-step")
+                guard next.captureScope == page.captureScope,
+                      next.manifest == page.manifest, next.steps == page.steps + 1,
                       next.examined >= page.examined, next.examined <= page.examined + 1,
                       next.captured >= page.captured, next.unavailable >= page.unavailable,
                       next.indexed >= page.indexed, next.uncovered >= page.uncovered,
@@ -231,7 +255,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
         guard let captureManifest = page.captureManifest else { throw AtlasIndexWire.invalid() }
         let basis = AtlasIndexedBasis(owner: preparation.handle, manifest: page.manifest, layout: preparation.layout, index: 1,
             captureManifest: captureManifest, files: preparation.files, capturedFiles: page.captured,
-            unavailable: page.unavailable, pending: page.pending, sourceBytes: page.bytes, discoveryComplete: preparation.discovery)
+            unavailable: page.unavailable, pending: page.pending, sourceBytes: page.bytes,
+            discoveryComplete: preparation.discovery, captureScope: page.captureScope)
         let session = Session(owner: preparation.owner, root: root, grant: grant, basis: basis)
         preparing = nil
         return session
@@ -245,16 +270,22 @@ private struct AtlasIndexBuildPage {
     let running: Bool
     let steps, captured, unavailable, examined, pending, indexed, uncovered: Int
     let bytes, readBytes: UInt64
-    init(_ json: String?, owner: UInt64, layout: UInt64, files: Int, discovery: Bool, command: String) throws {
+    let captureScope: AtlasIndexedCaptureScope
+    init(_ json: String?, owner: UInt64, layout: UInt64, files: Int, discovery: Bool,
+         scope: AtlasSearchFileScope, pathScope: AtlasSearchPathScope, requiresCaptureEcho: Bool,
+         command: String) throws {
         let w = try AtlasIndexWire.decode(json)
         try w.header(schema: "fcb.atlas-search/1", command: command, owner: owner)
         manifest = try w.number("source_manifest")
         captureManifest = try w.optionalNumber("capture_manifest")
+        captureScope = try AtlasIndexedCaptureScope(w, fileScope: scope, pathScope: pathScope,
+            files: files, requiresEcho: requiresCaptureEcho)
+        let eligible = captureScope.eligibleFiles
         running = try w.flag("index_build_in_progress")
-        captured = try w.count("captured_files", upTo: min(files, 4096))
-        unavailable = try w.count("unavailable_files", upTo: min(files, 4096))
-        examined = try w.count("examined_files", upTo: min(files, 4096))
-        pending = try w.count("pending_files", upTo: files)
+        captured = try w.count("captured_files", upTo: min(eligible, 4096))
+        unavailable = try w.count("unavailable_files", upTo: min(eligible, 4096))
+        examined = try w.count("examined_files", upTo: min(eligible, 4096))
+        pending = try w.count("pending_files", upTo: eligible)
         indexed = try w.count("indexed_files", upTo: captured)
         uncovered = try w.count("uncovered_files", upTo: captured)
         bytes = try w.number("indexed_source_bytes"); readBytes = try w.number("initial_source_bytes_read")
@@ -262,9 +293,10 @@ private struct AtlasIndexBuildPage {
         let stop = try w.optionalText("stop_reason")
         guard manifest > 0, try w.number("layout_revision") == layout, try w.number("index_generation") == 1,
               try w.text("scope") == "all", try w.number("workspace_files") == UInt64(files),
-              captured + unavailable == examined, examined + pending == files, indexed + uncovered == captured,
+              captured + unavailable == examined, examined + pending == eligible, indexed + uncovered == captured,
               bytes <= 32 * 1024 * 1024, readBytes <= 32 * 1024 * 1024, bytes <= readBytes,
-              try w.flag("capture_complete") == (!running && pending == 0 && unavailable == 0 && discovery),
+              try w.flag("capture_complete") == (!running && pending == 0 && unavailable == 0 && discovery
+                  && captureScope.visibleMissingFiles == 0),
               running == (stop == nil) else { throw AtlasIndexWire.invalid() }
         if running {
             guard captureManifest == nil else { throw AtlasIndexWire.invalid() }
