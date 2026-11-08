@@ -11,6 +11,9 @@ import Foundation
 @_silgen_name("fcb_catalog_open_document_link") private func catalogDocumentLink(_ handle: UInt64,
     _ origin: UInt64, _ destination: UInt64, _ page: UInt64, _ file: UInt64,
     _ generation: UInt64, _ link: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_catalog_open_verified_document_link") private func catalogVerifiedDocumentLink(_ handle: UInt64,
+    _ origin: UInt64, _ destination: UInt64, _ generation: UInt64, _ link: UInt64,
+    _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_catalog_cancel") private func catalogCancel(_ handle: UInt64) -> UInt8
 @_silgen_name("fcb_catalog_close") private func catalogClose(_ handle: UInt64) -> UInt8
 @_silgen_name("fcb_free_string") private func catalogFree(_ pointer: UnsafeMutablePointer<CChar>?)
@@ -32,7 +35,10 @@ extension AtlasProjectBrowserTransport {
         }
     }, cancel: { catalogCancel($0) == 1 }, close: { catalogClose($0) == 1 }, retirementFailed: {
         try? FileHandle.standardError.write(contentsOf: Data("FCB_CATALOG_RETIREMENT_UNAVAILABLE\n".utf8))
-    }, readerDomain: AtlasReaderTransport.native.comparison?.domain)
+    }, readerDomain: AtlasReaderTransport.native.comparison?.domain,
+    verifiedDocumentLink: { handle, origin, destination, generation, link, bytes in
+        take(catalogVerifiedDocumentLink(handle, origin, destination, generation, link, bytes))
+    })
 
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
         guard let pointer else { return nil }

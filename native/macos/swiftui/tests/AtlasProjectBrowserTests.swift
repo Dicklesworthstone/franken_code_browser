@@ -350,7 +350,59 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
                 return response
             }, cancel: { [self] owner in locked { log.append("cancel:\(owner)") }; return true },
             close: { [self] owner in locked { sessions.removeValue(forKey: owner); log.append("close:\(owner)") }; return true },
-            retirementFailed: { fatalError("catalog retirement failed") }, readerDomain: domain)
+            retirementFailed: { fatalError("catalog retirement failed") }, readerDomain: domain,
+            verifiedDocumentLink: { [self] owner, origin, destination, generation, link, bytes in
+                verifiedLink(owner: owner, origin: origin, destination: destination,
+                    generation: generation, link: link, bytes: bytes)
+            })
+    }
+    /// Inject the distinct service verification receipt. Source-byte comparison
+    /// and root confinement belong to the real Rust service tests; native tests
+    /// ensure only its qualified result can publish a new target reader.
+    private func verifiedLink(owner: UInt64, origin: UInt64, destination: UInt64,
+        generation: UInt64, link: UInt64, bytes: UInt64) -> String? {
+        precondition(!Thread.isMainThread)
+        let verification: (raw: [UInt8], file: UInt64, fault: String?)? = locked {
+            guard sessions[owner] != nil, let raw = readers[origin], readers[destination] == nil,
+                  documents[origin]?.generation == generation, link == 1,
+                  bytes == AtlasReaderLimits.captureBytes else { return nil }
+            log.append("verify:\(owner):\(origin):\(destination):\(generation):\(link)")
+            let verificationFault = fault?.hasPrefix("verify-") == true ? fault : nil
+            if verificationFault != nil { fault = nil }
+            if verificationFault == "verify-origin-changed" { return (raw, 0, verificationFault) }
+            let file = nextDirectFile; nextDirectFile += 1
+            receipts[origin] = (0, file)
+            return (raw, file, verificationFault)
+        }
+        guard let verification else { return nil }
+        if verification.fault == "verify-origin-changed" {
+            return json(["schema": "fcb.project-catalog-session/1", "status": "error",
+                "owner": String(owner), "exit_code": "2",
+                "error": ["code": "CATALOG_SESSION_ORIGIN_CAPTURE_CHANGED"]])
+        }
+        guard let response = transport.run(owner, .openDocumentLink(origin: origin, destination: destination,
+            page: 0, file: verification.file, generation: generation, link: link, bytes: bytes)),
+              var out = try? JSONSerialization.jsonObject(with: Data(response.utf8)) as? [String: Any] else { return nil }
+        guard out["status"] as? String == "ok" else { return response }
+        let count = sourceBytes(for: verification.raw).count
+        out["source_authority"] = "verified-current-source"
+        out["source_verification_bytes_read"] = String(count)
+        out["source_verification_read_calls"] = count == 0 ? "0" : "1"
+        switch verification.fault {
+        case "verify-command": out["command"] = "open-verified-document-link"
+        case "verify-authority": out["source_authority"] = "retained-catalog-capture"
+        case "verify-page": out["source_page_id"] = "1"
+        case "verify-file": out["source_file_id"] = "1"
+        case "verify-digest": out["source_capture_sha256"] = String(repeating: "0", count: 64)
+        case "verify-bytes": out["source_verification_bytes_read"] = String(count + 1)
+        case "verify-calls": out["source_verification_read_calls"] = "0"
+        case "verify-call-limit": out["source_verification_read_calls"] = "1048577"
+        case "verify-fields":
+            out.removeValue(forKey: "source_verification_bytes_read"); out.removeValue(forKey: "source_verification_read_calls")
+        case nil: break
+        default: preconditionFailure("unknown verification receipt fault")
+        }
+        return json(out)
     }
     var readerTransport: AtlasReaderTransport {
         AtlasReaderTransport(create: { [self] in locked { let id = nextReader; nextReader += 1; log.append("reader-create:\(id)"); return id } },
@@ -396,6 +448,11 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         try await unobservedLinkTargetOpensWithoutDiscovery()
         try await evictedOriginAndTargetKeepCapturedLinkAuthority()
         try await forgedDirectLinkReceiptsAreRefused()
+        try await verifiedPinnedSourceOpensAndChainsWithoutDiscovery()
+        try await unqualifiedVerifiedLinksDoNotCreateCandidates()
+        try await changedVerifiedOriginKeepsRetainedReader()
+        try await forgedVerifiedLinkReceiptsAreRefused()
+        try await interruptedVerifiedLinksRetireOnlyCandidates()
         try await staleAndInterruptedDocumentLinksRetireOnlyCandidates()
         try await qualifiedHeadingOffsetStartsReaderAndHistoryAtCapturedAnchor()
         try await typedFragmentFallbacksKeepReadableTargets()
@@ -678,6 +735,156 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
                 && origin.reader.page?.originalHex == original.originalHex && origin.reader.documentPreview.allows(local))
             precondition(!f.calls.contains("reader-close:100") && !f.calls.contains("LABEL-OPEN"))
             origin.reader.close(); model.close()
+        }
+    }
+    @MainActor private static func verifiedLinkEnvironment(_ f: ProjectBrowserFixture)
+        async throws -> (AtlasProjectBrowserModel, AtlasPagedReaderModel, AtlasReaderDocumentLinkTarget) {
+        let (model, source, _) = try await linkEnvironment(f, retainTarget: false)
+        let pinned = try await source.reader.fork()
+        source.reader.close()
+        await wait("original reader did not retire before independent verification") { f.calls.contains("reader-close:100") }
+        precondition(pinned.page?.identity.owner == 101 && pinned.retainedCaptureSHA256 == f.digest)
+        precondition(model.canOpenVerifiedDocumentLinks && f.calls.contains("reader-fork:100:101"))
+        // A fork preserves the capture, not the catalog's private receipt.
+        return (model, pinned, await prepareLink(pinned))
+    }
+    @MainActor private static func verifiedPinnedSourceOpensAndChainsWithoutDiscovery() async throws {
+        let f = ProjectBrowserFixture()
+        let (model, origin, local) = try await verifiedLinkEnvironment(f)
+        let original = origin.page!, previewID = origin.documentPreview.page!.id
+        let target = try await model.openVerifiedDocumentLink(local, from: origin,
+            readerTransport: f.readerTransport, document: f.documentTransport)
+        precondition(target.pageID == 0 && target.file.id == (UInt64(1) << 63) + 1)
+        precondition(target.reader.page?.identity.owner == 102 && target.file.rawPath == f.raw(3))
+        precondition(model.info?.latest == 1 && model.info?.discovered == 1
+            && !f.calls.contains(where: { $0.hasPrefix("advance:") }))
+        precondition(f.calls.contains("verify:40:101:102:1:1")
+            && f.calls.filter { $0.hasPrefix("capture:") }.count == 1 && !f.calls.contains("LABEL-OPEN"))
+        precondition(origin.page?.identity.matches(original.identity) == true
+            && origin.page?.originalHex == original.originalHex && origin.page?.start == original.start)
+        precondition(origin.documentPreview.page?.id == previewID && origin.documentPreview.allows(local)
+            && origin.retainedCaptureSHA256 == f.digest && origin.canPin)
+        precondition(!f.calls.contains("reader-close:101") && model.notice.contains("Verified this capture"))
+
+        let back = await prepareLink(target.reader)
+        let returned = try await model.openDocumentLink(back, from: target,
+            readerTransport: f.readerTransport, document: f.documentTransport)
+        precondition(returned.pageID == 1 && returned.file.id == 1
+            && returned.reader.page?.identity.owner == 103 && returned.file.rawPath == original.identity.pathBytes)
+        precondition(f.calls.filter { $0.hasPrefix("verify:") }.count == 1)
+        returned.reader.close(); target.reader.close(); origin.close(); model.close()
+    }
+    @MainActor private static func changedVerifiedOriginKeepsRetainedReader() async throws {
+        let f = ProjectBrowserFixture()
+        let (model, origin, local) = try await verifiedLinkEnvironment(f)
+        let original = origin.page!, previewID = origin.documentPreview.page!.id
+        f.corrupt("verify-origin-changed")
+        do {
+            _ = try await model.openVerifiedDocumentLink(local, from: origin,
+                readerTransport: f.readerTransport, document: f.documentTransport)
+            preconditionFailure("a changed source authorized its old captured link")
+        } catch {
+            guard let error = error as? AtlasProjectBrowserError,
+                  case .engine(let code) = error, code == "CATALOG_SESSION_ORIGIN_CAPTURE_CHANGED" else {
+                preconditionFailure("changed source lost its qualified service error: \(error)")
+            }
+        }
+        await wait("changed-origin candidate failed to retire") { f.calls.contains("reader-close:102") }
+        precondition(model.notice.contains("differs from the retained capture") && model.notice.contains("remains readable"))
+        precondition(!f.calls.contains(where: { $0.hasPrefix("link:") }) && !f.calls.contains("reader-close:101"))
+        precondition(origin.page?.identity.matches(original.identity) == true
+            && origin.page?.originalHex == original.originalHex && origin.documentPreview.page?.id == previewID)
+        precondition(origin.documentPreview.allows(local) && origin.canPin && origin.retainedCaptureSHA256 == f.digest)
+        origin.close(); model.close()
+    }
+    @MainActor private static func unqualifiedVerifiedLinksDoNotCreateCandidates() async throws {
+        let f = ProjectBrowserFixture()
+        let (model, origin, local) = try await verifiedLinkEnvironment(f)
+        let allocations = f.calls.filter { $0.hasPrefix("reader-create:") }.count
+        let foreign = ProjectBrowserFixture()
+        await refuse("a different reader registry authorized source verification") {
+            _ = try await model.openVerifiedDocumentLink(local, from: origin,
+                readerTransport: foreign.readerTransport, document: foreign.documentTransport)
+        }
+        precondition(!foreign.calls.contains(where: { $0.hasPrefix("reader-create:") }))
+        origin.documentPreview.prepareLinks()
+        await wait("link replacement did not finish before verification") { !origin.documentPreview.busy }
+        precondition(!origin.documentPreview.allows(local))
+        await refuse("stale captured link authorized source verification") {
+            _ = try await model.openVerifiedDocumentLink(local, from: origin,
+                readerTransport: f.readerTransport, document: f.documentTransport)
+        }
+        precondition(f.calls.filter { $0.hasPrefix("reader-create:") }.count == allocations
+            && !f.calls.contains(where: { $0.hasPrefix("verify:") }))
+
+        let transport = f.transport
+        let unsupported = AtlasProjectBrowserModel(transport: .init(create: transport.create, run: transport.run,
+            cancel: transport.cancel, close: transport.close, retirementFailed: transport.retirementFailed,
+            readerDomain: transport.readerDomain))
+        try await unsupported.open(root: "/repo", accessLease: nil)
+        precondition(unsupported.canOperate && !unsupported.canOpenVerifiedDocumentLinks)
+        let current = origin.documentPreview.links!.target(id: 1)!
+        await refuse("a missing verification capability created a target") {
+            _ = try await unsupported.openVerifiedDocumentLink(current, from: origin,
+                readerTransport: f.readerTransport, document: f.documentTransport)
+        }
+        precondition(f.calls.filter { $0.hasPrefix("reader-create:") }.count == allocations)
+        unsupported.close(); origin.close(); model.close()
+    }
+    @MainActor private static func forgedVerifiedLinkReceiptsAreRefused() async throws {
+        for fault in ["verify-command", "verify-authority", "verify-page", "verify-file", "verify-digest",
+                      "verify-bytes", "verify-calls", "verify-call-limit", "verify-fields",
+                      "link-generation", "link-id", "link-destination", "link-reader-path", "link-window"] {
+            let f = ProjectBrowserFixture()
+            let (model, origin, local) = try await verifiedLinkEnvironment(f)
+            let original = origin.page!
+            f.corrupt(fault)
+            await refuse("unqualified verified-link capture was published: \(fault)") {
+                _ = try await model.openVerifiedDocumentLink(local, from: origin,
+                    readerTransport: f.readerTransport, document: f.documentTransport)
+            }
+            await wait("invalid verified-link candidate failed to retire: \(fault)") { f.calls.contains("reader-close:102") }
+            precondition(origin.page?.identity.matches(original.identity) == true
+                && origin.page?.originalHex == original.originalHex && origin.documentPreview.allows(local))
+            precondition(!model.busy && !model.closed && !f.calls.contains("reader-close:101") && !f.calls.contains("LABEL-OPEN"))
+            origin.close(); model.close()
+        }
+    }
+    @MainActor private static func interruptedVerifiedLinksRetireOnlyCandidates() async throws {
+        for interruption in ["cancel", "reflow", "project-close"] {
+            let f = ProjectBrowserFixture()
+            let (model, origin, local) = try await verifiedLinkEnvironment(f)
+            let original = origin.page!
+            f.blockNext()
+            let pending = Task {
+                try await model.openVerifiedDocumentLink(local, from: origin,
+                    readerTransport: f.readerTransport, document: f.documentTransport)
+            }
+            await wait("verified target did not enter") { f.entered.wait(timeout: .now()) == .success }
+            precondition(f.calls.contains("verify:40:101:102:1:1") && !f.calls.contains("reader-close:102"))
+            switch interruption {
+            case "cancel": pending.cancel()
+            case "reflow":
+                origin.documentPreview.prepare()
+                await wait("source reflow did not finish during verified target delivery") {
+                    !origin.documentPreview.busy && origin.documentPreview.page?.inventory.generation == 2
+                }
+            default: model.close()
+            }
+            f.resume.signal()
+            do {
+                _ = try await pending.value
+                preconditionFailure("late verified target was published after \(interruption)")
+            } catch {
+                guard let error = error as? AtlasProjectBrowserError, case .canceled = error else {
+                    preconditionFailure("verified target lost cancellation priority after \(interruption): \(error)")
+                }
+            }
+            await wait("late verified candidate failed to retire after \(interruption)") { f.calls.contains("reader-close:102") }
+            precondition(origin.page?.identity.matches(original.identity) == true
+                && origin.page?.originalHex == original.originalHex && origin.canPin)
+            precondition(!f.calls.contains("reader-close:101") && !f.calls.contains("LABEL-OPEN"))
+            origin.close(); model.close()
         }
     }
     @MainActor private static func staleAndInterruptedDocumentLinksRetireOnlyCandidates() async throws {

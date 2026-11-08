@@ -419,7 +419,7 @@ extension AtlasCamera {
             .help("Next search match (⌘G)")
         }
         .sheet(isPresented: $showsFileFinder, onDismiss: finishReadingDeskReview) { fileFinderSheet }
-        .sheet(isPresented: $showsReadingDesk) { AtlasReadingDeskView(model: readingDesk) }
+        .sheet(isPresented: $showsReadingDesk) { AtlasReadingDeskView(model: readingDesk, project: projectBrowser) }
         .sheet(isPresented: $showsSavedRepository, onDismiss: finishReadingDeskReview) {
             AtlasSavedRepositoryView(model: savedRepository, desk: readingDesk)
         }
@@ -1004,7 +1004,8 @@ extension AtlasCamera {
                         }
                         if !pinnedReaders.entries.isEmpty || pinnedReaders.busy {
                             AtlasPinnedReadersView(readers: pinnedReaders,
-                                canKeep: readingDesk.canOperate, keep: keepSource).frame(minWidth: 320)
+                                canKeep: readingDesk.canOperate, keep: keepSource,
+                                project: projectBrowser).frame(minWidth: 320)
                         }
                     }
                     .frame(height: (!pinnedReaders.entries.isEmpty || pinnedReaders.busy) ? 380 : (usesPagedReader ? 320 : 240))
@@ -1153,7 +1154,7 @@ extension AtlasCamera {
             }
             if let capture = finderReaderCapture {
                 AtlasPagedSourceView(model: capture.reader, canPin: pinnedReaders.canAdd, pin: pinSource,
-                    canKeep: readingDesk.canOperate, keep: keepSource)
+                    canKeep: readingDesk.canOperate, keep: keepSource, project: projectBrowser)
                     .id(capture.id)
             } else if usesPagedReader, let path = selectedPath {
                 if !loadingProject, acceptsSource(path, searchRow: sourceSearchRow, exactMatch: false) {
@@ -1161,7 +1162,7 @@ extension AtlasCamera {
                     if let access = rootAccess, access.url.path.utf8.elementsEqual(root.utf8) {
                         AtlasPagedSourceView(root: root, path: path, accessLease: access, captured: capturedReaderTarget,
                             supplied: suppliedReaderTarget, canPin: pinnedReaders.canAdd, pin: pinSource,
-                            canKeep: readingDesk.canOperate, keep: keepSource)
+                            canKeep: readingDesk.canOperate, keep: keepSource, project: projectBrowser)
                             .id(focusRequest)
                     } else {
                         Text("Choose the project folder again to grant read access.")
@@ -1169,7 +1170,7 @@ extension AtlasCamera {
 #else
                     AtlasPagedSourceView(root: root, path: path, accessLease: nil, captured: capturedReaderTarget,
                         supplied: suppliedReaderTarget, canPin: pinnedReaders.canAdd, pin: pinSource,
-                            canKeep: readingDesk.canOperate, keep: keepSource)
+                        canKeep: readingDesk.canOperate, keep: keepSource, project: projectBrowser)
                         .id(focusRequest)
 #endif
                 } else {

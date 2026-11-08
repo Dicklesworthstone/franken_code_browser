@@ -6,6 +6,7 @@ import SwiftUI
     @Bindable var readers: AtlasPinnedReaders<AtlasPagedReaderModel>
     var canKeep = false
     var keep: ((AtlasPagedReaderModel) -> Void)? = nil
+    var project: AtlasProjectBrowserModel? = nil
     @State private var comparison: Pair?
     private struct Pair: Identifiable {
         let id = UUID()
@@ -61,7 +62,7 @@ import SwiftUI
             }
             Divider()
             if let entry = readers.selected {
-                AtlasPagedSourceView(model: entry.reader, canKeep: canKeep, keep: keep)
+                AtlasPagedSourceView(model: entry.reader, canKeep: canKeep, keep: keep, project: project)
                     .id(entry.id)
             } else {
                 Text(readers.busy ? "Preparing an independent retained reader…" : "Pin a retained source to read files side by side.")
@@ -77,7 +78,7 @@ import SwiftUI
         .background(.background)
         .sheet(item: $comparison) { pair in
             AtlasReaderComparisonView(beforeLabel: pair.before.label, afterLabel: pair.after.label,
-                before: pair.before.reader, after: pair.after.reader)
+                before: pair.before.reader, after: pair.after.reader, project: project)
         }
         .onChange(of: readers.entries.map(\.id)) { _, ids in
             if let comparison, !ids.contains(comparison.before.id) || !ids.contains(comparison.after.id) {

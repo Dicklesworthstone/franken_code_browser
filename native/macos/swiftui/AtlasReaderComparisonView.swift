@@ -8,6 +8,7 @@ import SwiftUI
     let afterLabel: String
     @Bindable var before: AtlasPagedReaderModel
     @Bindable var after: AtlasPagedReaderModel
+    var project: AtlasProjectBrowserModel? = nil
     @State private var comparison = AtlasReaderComparisonModel()
     @Environment(\.dismiss) private var dismiss
 
@@ -69,11 +70,11 @@ import SwiftUI
             HSplitView {
                 VStack(spacing: 0) {
                     sideLabel("Before", path: beforeLabel)
-                    AtlasPagedSourceView(model: before)
+                    AtlasPagedSourceView(model: before, project: project)
                 }.frame(minWidth: 360)
                 VStack(spacing: 0) {
                     sideLabel("After", path: afterLabel)
-                    AtlasPagedSourceView(model: after)
+                    AtlasPagedSourceView(model: after, project: project)
                 }.frame(minWidth: 360)
             }
         }

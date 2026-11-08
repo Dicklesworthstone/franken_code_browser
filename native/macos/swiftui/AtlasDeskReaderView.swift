@@ -7,6 +7,7 @@ import SwiftUI
     @Bindable var desk: AtlasReadingDeskModel
     let capture: AtlasDeskReaderCapture
     @Bindable var pins: AtlasPinnedReaders<AtlasPagedReaderModel>
+    var project: AtlasProjectBrowserModel? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var updateNotice = ""
 
@@ -47,9 +48,9 @@ import SwiftUI
             HSplitView {
                 AtlasPagedSourceView(model: capture.reader, canPin: pins.canAdd, pin: { reader in
                     pins.pin(reader, root: pinGroup, label: capture.identity.displayPath)
-                }).frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
+                }, project: project).frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
                 if !pins.entries.isEmpty || pins.busy {
-                    AtlasPinnedReadersView(readers: pins).frame(minWidth: 350, idealWidth: 480)
+                    AtlasPinnedReadersView(readers: pins, project: project).frame(minWidth: 350, idealWidth: 480)
                 }
             }
             HStack {

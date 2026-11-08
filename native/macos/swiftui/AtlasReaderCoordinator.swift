@@ -165,6 +165,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
             && info.identity.capturedBytes <= AtlasReaderLimits.comparisonBytes
     }
     var retainedRegistryDomain: UUID? { session?.transport.comparison?.domain }
+    var retainedCaptureSHA256: String? { info?.captureSHA256 }
 
     /// Open a caller-authorized retained capture into an EMPTY destination in
     /// the same native registry. The initializer runs in the existing reader

@@ -103,6 +103,7 @@ import Observation
     }
     var canCompare: Bool { page != nil && !busy && !pinning && !documentPreview.busy && coordinator.supportsComparison }
     var retainedRegistryDomain: UUID? { coordinator.retainedRegistryDomain }
+    var retainedCaptureSHA256: String? { coordinator.retainedCaptureSHA256 }
     var canFind: Bool { page != nil && coordinator.supportsFind }
     var canGoToPosition: Bool { page != nil && coordinator.supportsPosition }
     var findIsCurrent: Bool { findReport?.needle.utf8.elementsEqual(fileQuery.utf8) == true }

@@ -16,6 +16,7 @@ private final class AtlasDeskFileAccess {
 
 @MainActor struct AtlasReadingDeskView: View {
     @Bindable var model: AtlasReadingDeskModel
+    var project: AtlasProjectBrowserModel? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var confirmRestore = false
     @State private var panelNotice = ""
@@ -60,7 +61,9 @@ private final class AtlasDeskFileAccess {
         }
         .padding(16).frame(minWidth: 900, idealWidth: 1150, minHeight: 600, idealHeight: 740)
         .onAppear { model.start() }
-        .sheet(item: $readerCapture) { capture in AtlasDeskReaderView(desk: model, capture: capture, pins: pins) }
+        .sheet(item: $readerCapture) { capture in
+            AtlasDeskReaderView(desk: model, capture: capture, pins: pins, project: project)
+        }
         .sheet(item: $noteDraft) { draft in AtlasDeskNoteEditor(model: model, draft: draft) }
         .onDisappear { reattachment = nil; readerTask?.cancel(); readerCapture?.reader.close(); pins.closeAll() }
         .alert("Reattach this saved note?", isPresented: Binding(

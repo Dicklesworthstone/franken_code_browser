@@ -15,6 +15,7 @@ import AppKit
     private let keep: ((AtlasPagedReaderModel) -> Void)?
     private let canKeep: Bool
     private let openLocalLink: AtlasDocumentPreviewModel.LocalNavigation?
+    private let project: AtlasProjectBrowserModel?
     @State private var model: AtlasPagedReaderModel
     @State private var copyNotice = ""
     @State private var showsOutline = false
@@ -23,12 +24,18 @@ import AppKit
     @State private var wrapsLines = false
     @State private var showsLineNumbers = true
     @State private var showsWhitespace = false
+    @State private var linked: AtlasProjectBrowserCapture?
+    @State private var showsLinked = false
+    @State private var linkNotice = ""
+    @State private var linkTask: Task<Void, Never>?
+    @State private var linkOperation = UUID()
 
     init(root: String, path: String, accessLease: AnyObject?, captured: AtlasSearchCapturedHit? = nil,
          supplied: AtlasSuppliedReaderSource? = nil,
          canPin: Bool = false, pin: ((AtlasPagedReaderModel) -> Void)? = nil,
          canKeep: Bool = false, keep: ((AtlasPagedReaderModel) -> Void)? = nil,
-         openLocalLink: AtlasDocumentPreviewModel.LocalNavigation? = nil) {
+         openLocalLink: AtlasDocumentPreviewModel.LocalNavigation? = nil,
+         project: AtlasProjectBrowserModel? = nil) {
         self.root = root
         self.path = path
         self.accessLease = accessLease
@@ -38,6 +45,7 @@ import AppKit
         self.canKeep = canKeep
         self.keep = keep
         self.openLocalLink = openLocalLink
+        self.project = project
         _model = State(initialValue: AtlasPagedReaderModel(transport: .native, search: .native,
             outline: .native, document: .native, captured: captured, supplied: supplied))
     }
@@ -47,11 +55,13 @@ import AppKit
     init(model: AtlasPagedReaderModel, canPin: Bool = false, pin: ((AtlasPagedReaderModel) -> Void)? = nil,
          canKeep: Bool = false,
          keep: ((AtlasPagedReaderModel) -> Void)? = nil,
-         openLocalLink: AtlasDocumentPreviewModel.LocalNavigation? = nil) {
+         openLocalLink: AtlasDocumentPreviewModel.LocalNavigation? = nil,
+         project: AtlasProjectBrowserModel? = nil) {
         root = ""; path = ""; accessLease = nil
         ownsModel = false; self.canPin = canPin; self.pin = pin
         self.canKeep = canKeep; self.keep = keep
         self.openLocalLink = openLocalLink
+        self.project = project
         _model = State(initialValue: model)
     }
 
@@ -59,27 +69,39 @@ import AppKit
         VStack(spacing: 4) {
             controls
             findControls
+            if !linkNotice.isEmpty {
+                HStack {
+                    Text(linkNotice).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    Spacer()
+                    if linkTask != nil {
+                        ProgressView().controlSize(.small)
+                        Button("Cancel link", action: cancelLink)
+                    }
+                }.padding(.horizontal, 10)
+            }
             HSplitView {
                 // This child retains its structural identity when the preview
                 // is inserted or removed: toggling does not reopen the source.
                 sourcePane.frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
                 if showsSplitPreview {
                     AtlasDocumentPreviewView(model: model.documentPreview, embedded: true,
-                        openSource: openPreviewSource, openLocalLink: openLocalLink, closePreview: { showsSplitPreview = false })
+                        openSource: openPreviewSource, openLocalLink: localNavigation, closePreview: { showsSplitPreview = false })
                 }
             }
         }
         .sheet(isPresented: $showsDocument) {
             AtlasDocumentPreviewView(model: model.documentPreview, openSource: openPreviewSource, openLocalLink: modalLocalNavigation)
         }
+        .sheet(isPresented: $showsLinked, onDismiss: closeLinked) { linkedReader }
         .onAppear { if ownsModel { open() } }
-        .onDisappear { if ownsModel { model.close() }; copyNotice = "" }
+        .onDisappear { closeLinked(); if ownsModel { model.close() }; copyNotice = "" }
+        .onChange(of: project?.info?.owner) { _, _ in closeLinked() }
         .onChange(of: model.navigation) { _, _ in copyNotice = "" }
         .onChange(of: Array(model.fileQuery.utf8)) { _, _ in copyNotice = "" }
     }
 
     private var modalLocalNavigation: AtlasDocumentPreviewModel.LocalNavigation? {
-        guard let openLocalLink else { return nil }
+        guard let openLocalLink = localNavigation else { return nil }
         return { target in
             // The preview invokes this after its worker drains. Dismiss the
             // overlay so the project host's linked reader/progress is visible;
@@ -87,6 +109,94 @@ import AppKit
             showsDocument = false
             openLocalLink(target)
         }
+    }
+
+    private var localNavigation: AtlasDocumentPreviewModel.LocalNavigation? {
+        openLocalLink ?? verifiedNavigation(from: model)
+    }
+
+    private func verifiedNavigation(from source: AtlasPagedReaderModel) -> AtlasDocumentPreviewModel.LocalNavigation? {
+        guard project?.canOpenVerifiedDocumentLinks == true, linkTask == nil else { return nil }
+        return { target in openLink(target, from: source) }
+    }
+
+    private func capturedNavigation(from source: AtlasProjectBrowserCapture) -> AtlasDocumentPreviewModel.LocalNavigation? {
+        guard project?.canOperate == true, linkTask == nil else { return nil }
+        return { target in openLink(target, from: source.reader, capture: source) }
+    }
+
+    /// The original reader remains mounted behind this sheet with its exact
+    /// capture, position, query and preview. Onward links replace only the
+    /// independent target after a complete, validated acceptance.
+    private var linkedReader: some View {
+        VStack(spacing: 8) {
+            HStack {
+                Label("Linked source", systemImage: "link").font(.headline)
+                Spacer()
+                if linkTask != nil {
+                    ProgressView().controlSize(.small)
+                    Button("Cancel link", action: cancelLink)
+                }
+                Button("Return to source") { showsLinked = false }
+            }
+            if let linked {
+                Text(verbatim: linked.file.display).font(.caption).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if linked.fragment.status != .none {
+                    Text(verbatim: linked.fragment.navigationDescription).font(.caption)
+                        .foregroundStyle(linked.fragment.isFallback ? Color.orange : Color.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                AtlasPagedSourceView(model: linked.reader, canKeep: canKeep, keep: keep,
+                    openLocalLink: capturedNavigation(from: linked))
+                    .id(linked.id)
+            }
+            if !linkNotice.isEmpty {
+                Text(linkNotice).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }.padding(14).frame(minWidth: 850, idealWidth: 1100, minHeight: 600, idealHeight: 760)
+    }
+
+    private func openLink(_ target: AtlasReaderDocumentLinkTarget, from source: AtlasPagedReaderModel,
+                          capture: AtlasProjectBrowserCapture? = nil) {
+        guard let project, linkTask == nil,
+              capture == nil ? project.canOpenVerifiedDocumentLinks : project.canOperate else { return }
+        let ticket = UUID(); linkOperation = ticket
+        linkNotice = capture == nil ? "Checking the originating capture and opening the linked file…"
+            : "Opening the linked file from the retained document…"
+        linkTask = Task {
+            defer { if linkOperation == ticket { linkTask = nil } }
+            do {
+                let candidate: AtlasProjectBrowserCapture
+                if let capture {
+                    candidate = try await project.openDocumentLink(target, from: capture,
+                        readerTransport: .native, search: .native, outline: .native, document: .native)
+                } else {
+                    candidate = try await project.openVerifiedDocumentLink(target, from: source,
+                        readerTransport: .native, search: .native, outline: .native, document: .native)
+                }
+                guard linkOperation == ticket, !Task.isCancelled else { candidate.reader.close(); return }
+                let previous = linked
+                linked = candidate; showsLinked = true
+                previous?.reader.close()
+                linkNotice = "Linked capture ready. Return to source restores the originating reader."
+            } catch {
+                guard linkOperation == ticket else { return }
+                linkNotice = (error as? AtlasProjectBrowserError)?.message
+                    ?? (error as? AtlasReaderError)?.message ?? "The linked file could not be opened."
+            }
+        }
+    }
+
+    private func cancelLink() {
+        linkOperation = UUID(); linkTask?.cancel(); linkTask = nil
+        linkNotice = "Link opening canceled. The retained source is unchanged."
+    }
+
+    private func closeLinked() {
+        linkOperation = UUID(); linkTask?.cancel(); linkTask = nil
+        showsLinked = false; linked?.reader.close(); linked = nil; linkNotice = ""
     }
 
     private var sourcePane: some View {
