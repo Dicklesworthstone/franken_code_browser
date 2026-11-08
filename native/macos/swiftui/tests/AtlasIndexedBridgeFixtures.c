@@ -25,7 +25,7 @@ static void poll_now(int32_t (*poll)(void *), void *ctx) {
 }
 uint64_t fcb_atlas_create(void) { ++calls; return handle; }
 char *fcb_atlas_open_cancelable(uint64_t h, const char *root, uint64_t files, int32_t (*poll)(void *), void *ctx) {
-    assert(h == handle && !strcmp(root, "/repo") && files == 4096); ++calls; poll_now(poll, ctx); return result();
+    assert(h == handle && !strcmp(root, "/repo") && files == 20000); ++calls; poll_now(poll, ctx); return result();
 }
 char *fcb_atlas_index_begin(uint64_t h, uint64_t g, uint64_t files, uint64_t per_file, uint64_t bytes, uint64_t grams) {
     assert(h == handle && g == 1 && files == 4096 && per_file == 1024 * 1024 && bytes == 32 * 1024 * 1024 && grams == 2 * 1024 * 1024);

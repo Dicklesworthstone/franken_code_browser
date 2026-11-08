@@ -79,8 +79,9 @@ enum AtlasNativeSearch {
         }
         return try withExtendedLifetime(cancellation) {
             let context = Unmanaged.passUnretained(cancellation).toOpaque()
+            let metadataLimit: UInt64 = pathScope.isVisible ? UInt64(AtlasSearchPathScope.maximumVisibleFiles) : 4096
             let opened: SearchOpen = try read(root.withCString {
-                rootPointer in owner.call { openSearchAtlas($0, rootPointer, 4096, poll, context) }
+                rootPointer in owner.call { openSearchAtlas($0, rootPointer, metadataLimit, poll, context) }
             }, cancellation)
             guard opened.status == "ok" else { throw AtlasSearchError.unavailable }
             var page: SearchPage = try read(query.withCString {
@@ -181,6 +182,8 @@ private struct SearchPage: Decodable {
     let catalogued_files, examined_files, scanned_files, unavailable_files, pending_files: String
     let search_scope, scope_extensions, scope_filenames, eligible_files, excluded_files: String?
     let scope_path_kind, scope_path, scope_path_hex: String?
+    let scope_region_sha256, scope_region_files, scope_region_path_bytes: String?
+    let scope_region_catalogued_files, scope_region_missing_files: String?
     let matches_seen, retained_hits, displayed_hits, step_count: String
     let hits: [SearchWireHit]
     let next_offset: String?
@@ -242,6 +245,7 @@ private struct SearchStream {
             guard page.command == "step", previous.running,
                   next.steps == previous.steps + 1, next.steps <= 4097,
                   next.catalogued == previous.catalogued, next.eligible == previous.eligible,
+                  next.visibleMissing == previous.visibleMissing,
                   next.discovery == previous.discovery,
                   next.examined >= previous.examined, next.examined <= previous.examined + 1,
                   next.scanned >= previous.scanned, next.unavailable >= previous.unavailable,
@@ -323,7 +327,7 @@ private struct SearchStream {
                 cataloguedFiles: state.eligible), streamID: id, capture: capture,
             fileScope: scope, excludedFiles: state.catalogued - state.eligible, pathScope: pathScope,
             mode: mode, nameMode: nameMode, structureCoverage: state.structureCoverage,
-            caseSensitive: caseSensitive)
+            caseSensitive: caseSensitive, visibleMissingFiles: state.visibleMissing)
     }
 
     private func validated(_ page: SearchPage) throws -> SearchState {
@@ -339,12 +343,18 @@ private struct SearchStream {
         if let identity {
             guard identity == [page.owner, page.source_manifest, page.layout_revision, page.query_generation] else { throw invalid() }
         }
-        let catalogued = try count(page.catalogued_files, max: 4096)
-        try pathScope.validateEcho(kind: page.scope_path_kind, path: page.scope_path, hex: page.scope_path_hex)
+        let catalogued = try count(page.catalogued_files,
+            max: pathScope.isVisible ? AtlasSearchPathScope.maximumVisibleFiles : 4096)
+        try pathScope.validateEcho(kind: page.scope_path_kind, path: page.scope_path, hex: page.scope_path_hex,
+            regionSHA256: page.scope_region_sha256, regionFiles: page.scope_region_files,
+            regionPathBytes: page.scope_region_path_bytes)
         let eligible = try scope.eligibleFiles(kind: page.search_scope, extensions: page.scope_extensions,
             filenames: page.scope_filenames, eligible: page.eligible_files, excluded: page.excluded_files,
             catalogued: catalogued, pathScoped: !pathScope.isWorkspace)
-        let examined = try count(page.examined_files, max: eligible)
+        let visibleMissing = try pathScope.validateRegionCoverage(catalogued: page.scope_region_catalogued_files,
+            missing: page.scope_region_missing_files, eligible: eligible, searchCatalogFiles: catalogued,
+            allFileTypes: scope.isAll, complete: page.search_complete)
+        let examined = try count(page.examined_files, max: min(eligible, 4096))
         let scanned = try count(page.scanned_files, max: examined)
         let unavailable = try count(page.unavailable_files, max: examined)
         let pending = try count(page.pending_files, max: eligible)
@@ -397,7 +407,8 @@ private struct SearchStream {
                       coverage.metadataOmitted == 0 else { throw invalid() }
             }
         }
-        return SearchState(catalogued: catalogued, eligible: eligible, examined: examined, scanned: scanned,
+        return SearchState(catalogued: catalogued, eligible: eligible, visibleMissing: visibleMissing,
+            examined: examined, scanned: scanned,
             unavailable: unavailable, retained: retained, matches: matches, steps: steps,
             running: page.search_in_progress, complete: page.search_complete,
             discovery: page.discovery_complete, truncated: page.truncated, stop: page.stop_reason,
@@ -476,7 +487,7 @@ private struct SearchStream {
     }
 }
 private struct SearchState: Equatable {
-    let catalogued, eligible, examined, scanned, unavailable, retained: Int
+    let catalogued, eligible, visibleMissing, examined, scanned, unavailable, retained: Int
     let matches: UInt64
     let steps: Int
     let running, complete, discovery, truncated: Bool

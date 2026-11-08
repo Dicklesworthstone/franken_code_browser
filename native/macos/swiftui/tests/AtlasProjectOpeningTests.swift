@@ -269,6 +269,18 @@ import Foundation
             check(!old.matchesSourceRequest(folder) && !old.matches(folder), "Changing from workspace to a folder revokes source and overlay authority")
             check(!folder.matchesSourceRequest(otherFolder) && !folder.matches(otherFolder), "Location changes compare native bytes, including Unicode equivalents")
             check(!folder.matchesSourceRequest(file) && !folder.matches(file), "Folder and exact-file queries with identical path bytes remain distinct")
+            var visible = old; visible.pathKind = "visible"; visible.path = UUID().uuidString
+            var refreshedVisible = new; refreshedVisible.pathKind = "visible"; refreshedVisible.path = visible.path
+            check(visible.matchesSourceRequest(visible) && visible.matches(visible),
+                  "A frozen atlas scope stays current while camera movement leaves its request unchanged")
+            check(!visible.matchesSourceRequest(refreshedVisible) && !visible.matches(refreshedVisible),
+                  "Replacing the atlas layout cannot rebind old visible-file membership")
+            var anotherView = visible; anotherView.path = UUID().uuidString
+            check(!visible.matchesSourceRequest(anotherView) && !visible.matches(anotherView),
+                  "Explicitly freezing another view revokes old results before replacement publication")
+            var workspaceWithSameLabel = visible; workspaceWithSameLabel.pathKind = "workspace"
+            check(!visible.matchesSourceRequest(workspaceWithSameLabel),
+                  "An empty or unavailable visible set cannot acquire workspace authority")
             for changed in [context(project: UUID(), atlas: newAtlas), context(project: project, root: "/other"),
                             context(project: project, query: "new"), context(project: project, scope: "Rust"),
                             context(project: project, extensions: "rs")] {

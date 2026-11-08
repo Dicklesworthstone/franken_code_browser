@@ -16,6 +16,7 @@ fn main() {
         "swiftui/AtlasNavigationHistory.swift",
         "swiftui/AtlasSource.swift",
         "swiftui/AtlasSearch.swift",
+        "swiftui/AtlasVisibleSearchScope.swift",
         "swiftui/AtlasMatch.swift",
         "swiftui/AtlasDocument.swift",
         "swiftui/AtlasPreparedText.swift",

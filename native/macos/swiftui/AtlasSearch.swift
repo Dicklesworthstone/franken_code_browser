@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(CryptoKit)
+import CryptoKit
+#endif
 
 struct SearchHit: Identifiable, Hashable, Sendable {
     let id: Int
@@ -213,11 +216,12 @@ struct AtlasSearchStructureCoverage: Equatable, Sendable {
 }
 
 enum AtlasSearchError: Error, Sendable {
-    case unavailable, invalidResponse, canceled, invalidRequest, invalidScope, invalidPathScope, identityExhausted, unsupportedMatching
+    case unavailable, invalidResponse, canceled, invalidRequest, invalidScope, invalidPathScope, invalidVisibleScope, identityExhausted, unsupportedMatching
     var message: String {
         switch self {
         case .canceled: return "Search canceled. In-flight reads may finish, but their results will not be shown."
         case .invalidRequest: return "Choose a project and enter 1–1024 UTF-8 bytes of search text without NUL characters."
+        case .invalidVisibleScope: return "This view contains too many or unsupported file paths. Zoom in, then use the current view again."
         case .invalidScope: return "Choose up to 32 file extensions using letters, digits, +, - or _. Separate extensions with commas or spaces."
         case .invalidPathScope: return "Enter a project-relative file or folder path of 1–4096 UTF-8 bytes. Do not use leading/trailing slashes, empty components, or '.'/'..' components."
         case .identityExhausted: return "This search session exhausted its request identities. Reopen the window before searching again."
@@ -256,6 +260,9 @@ struct AtlasSearchReport: Sendable {
     var nameMode: AtlasSearchNameMode = .contains
     var structureCoverage: AtlasSearchStructureCoverage? = nil
     var caseSensitive: Bool = true
+    /// Requested visible paths absent from the search service's independent
+    /// catalog. These are not excluded files or proof of an empty region.
+    var visibleMissingFiles: Int = 0
     var isInProgress: Bool { progress?.isRunning == true }
     var isWorkspaceScope: Bool { fileScope.isAll && pathScope.isWorkspace }
     var resultLabel: String { mode == .text && !caseSensitive ? "case-insensitive matches" : mode.resultLabel }
@@ -266,6 +273,7 @@ struct AtlasSearchReport: Sendable {
         }
         return resultSummary
             + (isWorkspaceScope ? "" : " \(excludedFiles) catalogued files outside this scope.")
+            + (visibleMissingFiles == 0 ? "" : " \(visibleMissingFiles) requested visible files are outside this search catalog.")
             + (indexStatus == nil ? "" : " Captured index; Refresh to include file edits.")
     }
     private var resultSummary: String {
@@ -287,7 +295,7 @@ struct AtlasSearchReport: Sendable {
         }
         if complete {
             let scope = pathScope.isWorkspace ? (fileScope.isAll ? "captured project" : "selected file types")
-                : "selected \(pathScope.kind == .file ? "file" : "folder") \(String(reflecting: pathScope.path))"
+                : pathScope.selectionDescription
             return (count == 0 ? "No \(noun) in the \(scope)." : "\(count) \(noun) in the \(scope).") + qualification
         }
         var reasons: [String] = []
@@ -425,20 +433,39 @@ struct AtlasSearchInput: Sendable {
 /// native pathname. Directory prefixes end at a slash, not an arbitrary byte.
 struct AtlasSearchPathScope: Equatable, Sendable {
     enum Kind: String, CaseIterable, Identifiable, Sendable {
-        case workspace, directory, file
+        case workspace, directory, file, visible
         var id: String { rawValue }
-        var label: String { switch self { case .workspace: return "Workspace"; case .directory: return "Folder"; case .file: return "File" } }
-        var code: UInt64 { switch self { case .workspace: return 0; case .directory: return 1; case .file: return 2 } }
+        var label: String { switch self { case .workspace: return "Workspace"; case .directory: return "Folder"; case .file: return "File"; case .visible: return "Visible atlas files" } }
+        var code: UInt64 { switch self { case .workspace: return 0; case .directory: return 1; case .file: return 2; case .visible: return 3 } }
     }
+    static let maximumVisibleFiles = 20_000
+    static let maximumVisibleWireBytes = 1_048_576
+    static let maximumVisiblePathBytes = 4096
     let kind: Kind
     let path: String
     let pathHex: String
+    private let visiblePaths: [[UInt8]]?
+    let visibleIdentity: String?
+    private let visiblePathBytes: Int
     static let workspace = Self()
     var isWorkspace: Bool { kind == .workspace }
+    var isVisible: Bool { kind == .visible }
+    var visibleCount: Int? { visiblePaths?.count }
+    var selectionDescription: String {
+        switch kind {
+        case .workspace: return "captured project"
+        case .directory: return "selected folder \(String(reflecting: path))"
+        case .file: return "selected file \(String(reflecting: path))"
+        case .visible: return "frozen atlas region (\(visibleCount ?? 0) files)"
+        }
+    }
 
-    private init() { kind = .workspace; path = ""; pathHex = "" }
+    private init() {
+        kind = .workspace; path = ""; pathHex = ""
+        visiblePaths = nil; visibleIdentity = nil; visiblePathBytes = 0
+    }
     init(kind: Kind, path: String) throws {
-        guard path.utf8.count <= 4096,
+        guard kind != .visible, path.utf8.count <= 4096,
               (kind == .workspace ? path.isEmpty : !path.isEmpty) else {
             throw AtlasSearchError.invalidPathScope
         }
@@ -451,8 +478,47 @@ struct AtlasSearchPathScope: Equatable, Sendable {
         }
         self.kind = kind
         self.path = path
+        visiblePaths = nil; visibleIdentity = nil; visiblePathBytes = 0
         let digits = Array("0123456789abcdef".utf8)
         pathHex = String(decoding: raw.flatMap { [digits[Int($0 >> 4)], digits[Int($0 & 15)]] }, as: UTF8.self)
+    }
+    /// Worker-only construction of a frozen raw-path predicate. Exact native
+    /// bytes, including undecodable names and Unix backslashes, survive intact.
+    /// The canonical hex payload is hashed once and echoed by the shared host.
+    init(visiblePaths input: [[UInt8]]) throws {
+        guard input.count <= Self.maximumVisibleFiles else { throw AtlasSearchError.invalidVisibleScope }
+        var inputBytes = 0
+        for raw in input {
+            guard !raw.isEmpty, raw.count <= Self.maximumVisiblePathBytes, !raw.contains(0),
+                  !raw.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
+                      $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46])
+                  }) else { throw AtlasSearchError.invalidVisibleScope }
+            inputBytes += 2 * raw.count + (inputBytes == 0 ? 0 : 1)
+            guard inputBytes <= Self.maximumVisibleWireBytes else { throw AtlasSearchError.invalidVisibleScope }
+        }
+        let ordered = input.sorted { $0.lexicographicallyPrecedes($1) }
+        var paths: [[UInt8]] = []; paths.reserveCapacity(ordered.count)
+        var rawBytes = 0, wireBytes = 0
+        for raw in ordered where paths.last != raw {
+            wireBytes += 2 * raw.count + (paths.isEmpty ? 0 : 1)
+            rawBytes += raw.count; paths.append(raw)
+        }
+        let digits = Array("0123456789abcdef".utf8)
+        var wire: [UInt8] = []; wire.reserveCapacity(wireBytes)
+        for (index, raw) in paths.enumerated() {
+            if index > 0 { wire.append(44) }
+            for byte in raw { wire.append(digits[Int(byte >> 4)]); wire.append(digits[Int(byte & 15)]) }
+        }
+        kind = .visible; path = String(decoding: wire, as: UTF8.self); pathHex = ""
+        visiblePaths = paths; visiblePathBytes = rawBytes
+        #if canImport(CryptoKit)
+        visibleIdentity = SHA256.hash(data: Data(wire)).map { String(format: "%02x", $0) }.joined()
+        #else
+        // The native app uses the macOS platform hash. Keep unrelated portable
+        // model fixtures usable without installing or reimplementing crypto.
+        // A host without that capability must never widen a visible request.
+        throw AtlasSearchError.unavailable
+        #endif
     }
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.kind == rhs.kind && lhs.path.utf8.elementsEqual(rhs.path.utf8)
@@ -463,17 +529,52 @@ struct AtlasSearchPathScope: Equatable, Sendable {
     }
     func admitsRawPath(_ raw: [UInt8]) -> Bool {
         if isWorkspace { return true }
+        if let visiblePaths {
+            var lower = 0, upper = visiblePaths.count
+            while lower < upper {
+                let middle = lower + (upper - lower) / 2
+                if visiblePaths[middle].lexicographicallyPrecedes(raw) { lower = middle + 1 }
+                else { upper = middle }
+            }
+            return lower < visiblePaths.count && visiblePaths[lower] == raw
+        }
         let prefix = Array(path.utf8)
         if kind == .file { return raw == prefix }
         return raw.count > prefix.count && raw.starts(with: prefix) && raw[prefix.count] == 47
     }
-    func validateEcho(kind: String?, path: String?, hex: String?) throws {
+    func validateEcho(kind: String?, path: String?, hex: String?, regionSHA256: String? = nil,
+        regionFiles: String? = nil, regionPathBytes: String? = nil) throws {
+        if isVisible {
+            guard kind == "visible", path == "", hex == "", regionSHA256 == visibleIdentity,
+                  regionFiles == String(visibleCount ?? 0), regionPathBytes == String(visiblePathBytes) else {
+                throw AtlasSearchError.invalidResponse
+            }
+            return
+        }
+        guard regionSHA256 == nil, regionFiles == nil, regionPathBytes == nil else { throw AtlasSearchError.invalidResponse }
         if kind == nil && path == nil && hex == nil {
             guard isWorkspace else { throw AtlasSearchError.invalidResponse }
             return
         }
         guard kind == self.kind.rawValue, let path, path.utf8.elementsEqual(self.path.utf8),
               hex == pathHex else { throw AtlasSearchError.invalidResponse }
+    }
+    /// Membership counts remain in their own domain: missing requested paths
+    /// must not be hidden among type exclusions or complete zero-hit results.
+    func validateRegionCoverage(catalogued: String?, missing: String?, eligible: Int,
+        searchCatalogFiles: Int, allFileTypes: Bool, complete: Bool) throws -> Int {
+        guard eligible >= 0, searchCatalogFiles >= 0 else { throw AtlasSearchError.invalidResponse }
+        guard isVisible else {
+            guard catalogued == nil, missing == nil else { throw AtlasSearchError.invalidResponse }
+            return 0
+        }
+        guard let catalogued, let known = UInt64(catalogued), String(known) == catalogued,
+              let missing, let absent = UInt64(missing), String(absent) == missing,
+              known <= UInt64(searchCatalogFiles), absent <= UInt64(visibleCount ?? 0),
+              known <= UInt64(visibleCount ?? 0), known + absent == UInt64(visibleCount ?? 0),
+              UInt64(eligible) <= known, !allFileTypes || UInt64(eligible) == known,
+              !complete || absent == 0 else { throw AtlasSearchError.invalidResponse }
+        return Int(absent)
     }
 }
 

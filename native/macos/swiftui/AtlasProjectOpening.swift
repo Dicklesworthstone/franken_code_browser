@@ -154,9 +154,12 @@ extension AtlasSearchContext {
     /// Content queries do not depend on an optional preview's geometry. Admit
     /// source results across preview publication ONLY under the same project,
     /// query and display filter; overlay proof must then be rebuilt against the
-    /// current atlas. Existing matches() remains strict for row/frame actions.
+    /// current atlas. A visible-file scope additionally belongs to the layout
+    /// that defined its frozen parcels. Existing matches() remains strict for
+    /// every row/frame action; camera movement does not change a frozen scope.
     func matchesSourceRequest(_ other: Self) -> Bool {
         loadGeneration == other.loadGeneration
+            && (pathKind != "visible" || atlasRevision == other.atlasRevision)
             && mode == other.mode && nameMode == other.nameMode && caseSensitive == other.caseSensitive
             && root.utf8.elementsEqual(other.root.utf8)
             && query.utf8.elementsEqual(other.query.utf8)

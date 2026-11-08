@@ -7,6 +7,9 @@ out=$(mktemp -d "${TMPDIR:-/tmp}/fcb-project-catalog.XXXXXX")
 swiftc -swift-version 6 -warnings-as-errors "$src/AtlasProjectCatalog.swift" \
     "$src/tests/AtlasProjectCatalogTests.swift" -o "$out/catalog"
 "$out/catalog"
+swiftc -swift-version 6 -warnings-as-errors "$src/AtlasProjectCatalog.swift" \
+    "$src/AtlasVisibleSearchScope.swift" "$src/tests/AtlasVisibleSearchScopeTests.swift" -o "$out/visible-scope"
+"$out/visible-scope"
 python3 - "$src" "$out/Support.swift" <<'PY'
 from pathlib import Path
 import sys

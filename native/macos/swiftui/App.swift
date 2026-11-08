@@ -213,6 +213,11 @@ extension AtlasCamera {
 
 // MARK: - Content
 
+private struct AtlasFrozenViewportSearch: Sendable {
+    let snapshot: AtlasVisibleSearchScope
+    let pathScope: AtlasSearchPathScope
+}
+
 @MainActor struct ContentView: View {
 #if FCB_APP_STORE
     @State private var root = ""
@@ -277,6 +282,13 @@ extension AtlasCamera {
     @State private var customExtensions = ""
     @State private var searchPathKind: AtlasSearchPathScope.Kind = .workspace
     @State private var searchPathInput = ""
+    @State private var visibleSearchView: AtlasVisibleSearchScope.View?
+    @State private var frozenVisibleSearch: AtlasFrozenViewportSearch?
+    @State private var visibleSearchIO = AtlasProjectIO()
+    @State private var visibleSearchTask: Task<Void, Never>?
+    @State private var visibleSearchCancellation: AtlasSearchCancellation?
+    @State private var visibleSearchRequest = UUID()
+    @State private var visibleSearchNotice = ""
     @State private var displayedFiles: [AtlasFile] = []
     @State private var selectedPath: String?
     @State private var fileText = ""
@@ -321,7 +333,9 @@ extension AtlasCamera {
     private var searchContext: AtlasSearchContext {
         AtlasSearchContext(root: root, query: query, loadGeneration: loadGeneration,
             atlasRevision: atlasRevision, scope: fileScope.rawValue, customExtensions: customExtensions,
-            pathKind: searchPathKind.rawValue, path: searchPathKind == .workspace ? "" : searchPathInput,
+            pathKind: searchPathKind.rawValue, path: searchPathKind == .visible
+                ? (currentVisibleSearch?.snapshot.id.uuidString ?? "")
+                : (searchPathKind == .workspace ? "" : searchPathInput),
             mode: searchMode, nameMode: searchMode == .text ? .contains : searchNameMode,
             caseSensitive: effectiveSearchCaseSensitive)
     }
@@ -330,10 +344,21 @@ extension AtlasCamera {
     // paste. Every value longer than the admitted path bound is invalid.
     private var searchPathEditKey: [UInt8] { Array(searchPathInput.utf8.prefix(4097)) }
 
+    private var currentVisibleSearch: AtlasFrozenViewportSearch? {
+        guard !atlasLayoutPending, hasMetadataAtlas, let frozenVisibleSearch,
+              frozenVisibleSearch.snapshot.view.belongs(to: root, project: loadGeneration, layout: atlasRevision) else { return nil }
+        return frozenVisibleSearch
+    }
+
+    private var canFreezeVisibleSearch: Bool {
+        !loadingProject && !showsCatalog && !atlasLayoutPending && hasMetadataAtlas && visibleSearchTask == nil
+            && visibleSearchView?.belongs(to: root, project: loadGeneration, layout: atlasRevision) == true
+    }
+
     private var openFileSearchPath: String? {
         guard let path = selectedPath else { return nil }
         switch searchPathKind {
-        case .workspace: return nil
+        case .workspace, .visible: return nil
         case .file: return path
         case .directory:
             guard let slash = path.lastIndex(of: "/") else { return nil }
@@ -483,6 +508,7 @@ extension AtlasCamera {
         }
         .onChange(of: showsCatalog) { _, showing in
             if showing { atlasResidency.suspend() }
+            visibleSearchView = nil
             // Returning creates a new native surface whose accepted frame
             // supplies fresh viewport demand; hidden views do no enrichment.
         }
@@ -543,10 +569,14 @@ extension AtlasCamera {
         }
         .onChange(of: searchPathKind) { _, _ in
             clearSearch()
-            runSearch(debounce: true)
+            if searchPathKind == .visible { freezeVisibleSearch() }
+            else {
+                cancelVisibleSearchFreeze()
+                runSearch(debounce: true)
+            }
         }
         .onChange(of: searchPathEditKey) { _, _ in
-            if searchPathKind != .workspace {
+            if searchPathKind == .directory || searchPathKind == .file {
                 clearSearch()
                 runSearch(debounce: true)
             }
@@ -647,8 +677,42 @@ extension AtlasCamera {
             }
             .pickerStyle(.segmented)
             .accessibilityLabel("Search location")
-            .help("Search the workspace, a folder and its descendants, or one exact file; file-type filters also apply")
-            if searchPathKind != .workspace {
+            .help("Search the workspace, a folder and its descendants, one exact file, or files from a frozen atlas view; file-type filters also apply")
+            if searchPathKind == .visible {
+                HStack {
+                    Button("Use current view", action: freezeVisibleSearch)
+                        .disabled(!canFreezeVisibleSearch)
+                        .accessibilityLabel("Freeze the currently displayed atlas files as the search scope")
+                    if visibleSearchTask != nil {
+                        ProgressView().controlSize(.small)
+                        Button("Cancel", action: cancelChoosingVisibleSearch)
+                    }
+                    Spacer()
+                    if showsCatalog && hasMetadataAtlas {
+                        Button("Show text atlas") { showsCatalog = false }
+                    }
+                }
+                if let frozen = currentVisibleSearch {
+                    Text("\(frozen.snapshot.count) files in the frozen atlas view")
+                        .font(.caption.weight(.semibold))
+                        .accessibilityLabel("\(frozen.snapshot.count) files in the frozen atlas search scope")
+                    if let visibleSearchView,
+                       !frozen.snapshot.view.represents(root: root, project: loadGeneration,
+                            layout: atlasRevision, viewport: visibleSearchView.viewport) {
+                        Text("The atlas view has moved. Search still uses these frozen files; use the current view to change the scope.")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                } else if visibleSearchTask == nil {
+                    Text(hasMetadataAtlas ? "Show the text atlas, then choose its current view."
+                        : "Build the text atlas to choose its visible files.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                if !visibleSearchNotice.isEmpty {
+                    Text(visibleSearchNotice).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
+                }
+                Text("Search whole files whose parcels intersect the chosen view, including files without loaded previews. Camera movement does not change the frozen scope.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            } else if searchPathKind == .directory || searchPathKind == .file {
                 TextField(searchPathKind == .file ? "Relative file path, e.g. src/main.rs"
                     : "Relative folder path, e.g. src", text: $searchPathInput)
                     .textFieldStyle(.roundedBorder)
@@ -769,7 +833,8 @@ extension AtlasCamera {
                 let countLabel = searchReport.map { report in
                     (report.isWorkspaceScope ? report.resultLabel
                         : (report.pathScope.isWorkspace ? report.resultLabel + " in selected types"
-                            : report.resultLabel + " in selected " + report.pathScope.kind.label.lowercased()))
+                            : (report.pathScope.isVisible ? report.resultLabel + " in frozen atlas files"
+                                : report.resultLabel + " in selected " + report.pathScope.kind.label.lowercased())))
                         + (report.complete ? "" : (report.isInProgress ? " · searching" : " · partial"))
                 } ?? "ready to search"
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -1244,6 +1309,7 @@ extension AtlasCamera {
     /// Revoke old camera coordinates when publishing a layout, before a
     /// queued action from the previous SwiftUI canvas can run.
     private func renewAtlasRevision() {
+        invalidateVisibleSearchScope()
         let revision = UUID()
         camera.bindNavigation(to: revision)
         atlasRevision = revision
@@ -1526,6 +1592,7 @@ extension AtlasCamera {
             status = "Atlas metadata could not be admitted. Project Files remains available."
             return false
         }
+        invalidateVisibleSearchScope()
         atlasEntries = compacted
         atlasScopeLabel = scopeLabel
         displayedFiles = files.filter { fileScope.includes($0.path, custom: customExtensions) }
@@ -1542,6 +1609,7 @@ extension AtlasCamera {
     }
 
     private func requestAtlasScopeLayout() {
+        invalidateVisibleSearchScope()
         atlasLayoutTask?.cancel(); atlasLayoutCancellation?.cancel(); atlasLayoutIO.cancel()
         atlasResidency.suspend()
         let request = UUID(), project = loadGeneration, requestedRoot = root
@@ -1565,7 +1633,84 @@ extension AtlasCamera {
 
     private func updateAtlasViewport(_ world: CGRect, scale: Double) {
         guard !showsCatalog, !atlasLayoutPending, hasMetadataAtlas else { return }
+        if let viewport = try? AtlasVisibleSearchScope.Viewport(x: Double(world.minX), y: Double(world.minY),
+            width: Double(world.width), height: Double(world.height)),
+           visibleSearchView?.represents(root: root, project: loadGeneration,
+                layout: atlasRevision, viewport: viewport) != true {
+            visibleSearchView = try? AtlasVisibleSearchScope.View(root: root,
+                project: loadGeneration, layout: atlasRevision, viewport: viewport)
+        }
         atlasResidency.updateViewport(world, scale: scale, selectedPath: selectedPath)
+    }
+
+    private func cancelVisibleSearchFreeze() {
+        visibleSearchRequest = UUID()
+        visibleSearchCancellation?.cancel(); visibleSearchCancellation = nil
+        visibleSearchTask?.cancel(); visibleSearchTask = nil
+        visibleSearchIO.cancel()
+    }
+
+    private func cancelChoosingVisibleSearch() {
+        cancelVisibleSearchFreeze()
+        visibleSearchNotice = "Choosing visible files stopped. Use the current view to try again."
+        searchTitle = "Visible scope canceled"; searchSummary = visibleSearchNotice; status = visibleSearchNotice
+    }
+
+    private func invalidateVisibleSearchScope() {
+        cancelVisibleSearchFreeze()
+        visibleSearchView = nil; frozenVisibleSearch = nil
+        if searchPathKind == .visible {
+            clearSearch()
+            visibleSearchNotice = "The atlas layout changed. Choose a new displayed view before searching its files."
+        } else { visibleSearchNotice = "" }
+    }
+
+    private func freezeVisibleSearch() {
+        guard searchPathKind == .visible else { return }
+        cancelVisibleSearchFreeze()
+        frozenVisibleSearch = nil
+        clearSearch()
+        guard canFreezeVisibleSearch, let acceptedView = visibleSearchView else {
+            visibleSearchNotice = AtlasVisibleSearchScope.Failure.invalidView.message
+            searchSummary = visibleSearchNotice; searchTitle = "Choose an atlas view"
+            return
+        }
+        let request = UUID(), cancellation = AtlasSearchCancellation(), entries = atlasEntries
+        visibleSearchRequest = request; visibleSearchCancellation = cancellation
+        visibleSearchNotice = "Choosing files from the displayed atlas view…"
+        visibleSearchTask = Task {
+            defer {
+                if visibleSearchRequest == request {
+                    visibleSearchTask = nil; visibleSearchCancellation = nil
+                }
+            }
+            do {
+                let frozen = try await visibleSearchIO.perform(cancellation: cancellation) {
+                    let snapshot = try AtlasVisibleSearchScope.capture(view: acceptedView, entries: entries,
+                        maximumFiles: AtlasSearchPathScope.maximumVisibleFiles,
+                        maximumWireBytes: AtlasSearchPathScope.maximumVisibleWireBytes,
+                        maximumPathBytes: AtlasSearchPathScope.maximumVisiblePathBytes,
+                        id: request, canceled: { cancellation.isCanceled })
+                    let pathScope = try AtlasSearchPathScope(visiblePaths: snapshot.paths)
+                    guard !cancellation.isCanceled else { throw AtlasVisibleSearchScope.Failure.canceled }
+                    return AtlasFrozenViewportSearch(snapshot: snapshot, pathScope: pathScope)
+                }
+                guard !Task.isCancelled, !cancellation.isCanceled, visibleSearchRequest == request,
+                      searchPathKind == .visible, !atlasLayoutPending, hasMetadataAtlas,
+                      acceptedView.belongs(to: root, project: loadGeneration, layout: atlasRevision) else { return }
+                frozenVisibleSearch = frozen
+                visibleSearchNotice = ""
+                if query.isEmpty {
+                    searchSummary = "Frozen \(frozen.snapshot.count) atlas files. Enter a query to search their source."
+                    status = searchSummary
+                } else { runSearch(debounce: false) }
+            } catch {
+                guard visibleSearchRequest == request, !cancellation.isCanceled, !Task.isCancelled else { return }
+                visibleSearchNotice = (error as? AtlasVisibleSearchScope.Failure)?.message
+                    ?? (error as? AtlasSearchError)?.message ?? "The visible search scope could not be prepared."
+                searchTitle = "Visible scope unavailable"; searchSummary = visibleSearchNotice; status = visibleSearchNotice
+            }
+        }
     }
 
     private func refreshResidentSearchOverlay(rebindingCurrentReport: Bool = false) {
@@ -1585,6 +1730,7 @@ extension AtlasCamera {
     }
 
     private func closeAtlasResidency() {
+        invalidateVisibleSearchScope()
         atlasLayoutRequest = UUID()
         atlasLayoutTask?.cancel(); atlasLayoutTask = nil
         atlasLayoutCancellation?.cancel(); atlasLayoutCancellation = nil
@@ -1689,6 +1835,15 @@ extension AtlasCamera {
         let requestedText = query
         let requestedRoot = root
         guard !loadingProject, !requestedText.isEmpty, !requestedRoot.isEmpty else { return }
+        let visibleScope = currentVisibleSearch
+        if searchPathKind == .visible, visibleScope == nil {
+            clearSearch()
+            searchTitle = visibleSearchTask == nil ? "Choose an atlas view" : "Choosing visible files"
+            searchSummary = visibleSearchTask == nil ? "Choose the displayed atlas view before searching its files."
+                : "Choosing files from the displayed view; the query will start when its scope is ready."
+            status = searchSummary
+            return
+        }
         let requestedContext = searchContext
 #if FCB_APP_STORE
         guard let access = rootAccess, access.url.path.utf8.elementsEqual(requestedRoot.utf8) else {
@@ -1703,21 +1858,33 @@ extension AtlasCamera {
         let accessLease: AnyObject? = nil
 #endif
         do {
+            let pathScope: AtlasSearchPathScope
+            if searchPathKind == .visible {
+                guard let visibleScope else { throw AtlasSearchError.invalidPathScope }
+                pathScope = visibleScope.pathScope
+            } else {
+                pathScope = try AtlasSearchPathScope(kind: searchPathKind,
+                    path: searchPathKind == .workspace ? "" : searchPathInput)
+            }
             let input = try AtlasSearchInput(root: requestedRoot, query: requestedText,
                 fileScope: fileScope.searchScope(custom: customExtensions),
-                pathScope: AtlasSearchPathScope(kind: searchPathKind,
-                    path: searchPathKind == .workspace ? "" : searchPathInput),
+                pathScope: pathScope,
                 mode: searchMode, nameMode: searchNameMode, caseSensitive: effectiveSearchCaseSensitive)
             clearSearch()
             searchPending = true
-            searchTitle = "Searching project"
-            searchSummary = input.isWorkspaceScope
+            searchTitle = input.pathScope.isVisible ? "Searching frozen atlas files" : "Searching project"
+            searchSummary = input.pathScope.isVisible
+                ? "Searching \(visibleScope?.snapshot.count ?? 0) files from the frozen atlas view. Moving the camera does not change this query's membership."
+                : input.isWorkspaceScope
                 ? "Searching captured source text. You can navigate the atlas or cancel."
                 : (input.pathScope.isWorkspace
                     ? "Searching selected file types. Excluded files do not consume the query's scan or result limits."
                     : "Searching \(input.pathScope.kind.label.lowercased()) \(String(reflecting: input.pathScope.path))\(input.fileScope.isAll ? "." : " within selected file types.") Excluded files do not consume the query's scan or result limits.")
             if input.mode != .text {
                 searchSummary = "Searching \(input.mode == .symbols ? "declaration candidates" : "Markdown headings"). \(input.mode.explanation)"
+                if input.pathScope.isVisible {
+                    searchSummary += " Scope: \(visibleScope?.snapshot.count ?? 0) files from the frozen atlas view."
+                }
             }
             status = searchSummary
             let coordinator = searchCoordinator ?? AtlasSearchCoordinator(scopedWork: AtlasNativeSearch.runScoped)
@@ -1742,7 +1909,9 @@ extension AtlasCamera {
                     status = report.summary
                     searchSummary = report.summary
                     searchTitle = report.indexStatus?.building == true ? "Preparing captured index"
-                        : (report.isInProgress ? "Searching project" : (report.complete ? "No matches" : "Partial search"))
+                        : (report.isInProgress
+                            ? (report.pathScope.isVisible ? "Searching frozen atlas files" : "Searching project")
+                            : (report.complete ? "No matches" : "Partial search"))
                 case .failure(let error):
                     status = error.message
                     searchSummary = status
@@ -2283,7 +2452,8 @@ struct AtlasCanvas: View {
     /// Only the accepted display transform supplies demand. This callback
     /// records bounded scheduling input; source reads and shaping run later.
     private func requestVisibleSource(in size: CGSize) {
-        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0,
+        guard camera.acceptsNavigation(revision: revision),
+              size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0,
               let origin = presentedFrame.worldPoint(at: .zero, revision: revision, contentRevision: contentRevision),
               let end = presentedFrame.worldPoint(at: CGPoint(x: size.width, y: size.height),
                   revision: revision, contentRevision: contentRevision), end.x > origin.x, end.y > origin.y else { return }

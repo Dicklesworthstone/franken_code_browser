@@ -323,7 +323,7 @@ import Dispatch
             check(f.count("create:") == 4, "Canonically equivalent root strings remain distinct byte identities")
         }
         for (phase, key, value) in [
-            ("open", "owner", "1"), ("open", "layout_revision", "0"), ("open", "catalogued_files", "4097"),
+            ("open", "owner", "1"), ("open", "layout_revision", "0"), ("open", "catalogued_files", "20001"),
             ("build-begin", "index_generation", "2"), ("build-step", "source_manifest", "2"),
             ("build-step", "captured_files", "03"), ("build-step", "indexed_source_bytes", "33554433"),
             ("query-begin", "query_generation", "1"), ("query-step", "query_generation", "99"),
@@ -394,6 +394,25 @@ import Dispatch
             let selected = first.capture!.target(first.hits[0])!
             _ = try selected.openReader(100)
             check(f.count("source:") == 1, "Scope replacement leaves selected old capture usable")
+        }
+        do {
+            let f = IndexedFixture()
+            f.configure { c in
+                c.files = 20_000; c.pending = 19_998
+                c.scopedEligible = 1; c.scopedCaptured = 1; c.scopedUnavailable = 0
+            }
+            let w = AtlasIndexedSearch(transport: f.transport)
+            let broad = try run(w)
+            check(!broad.complete && broad.progress?.cataloguedFiles == 20_000
+                && broad.progress?.examinedFiles == 2 && broad.indexStatus?.capturedFiles == 2,
+                "Wide metadata stays separate from bounded captured sources and reports incomplete coverage")
+            let selected = try scoped(w, scope: .all,
+                pathScope: AtlasSearchPathScope(kind: .file, path: "a.rs"))
+            check(selected.complete && selected.progress?.cataloguedFiles == 1
+                && selected.excludedFiles == 19_999 && selected.indexStatus?.reused == true,
+                "Narrowing the wide metadata universe searches the same retained captures")
+            check(f.count("create:") == 1 && f.count("build-step:") == 2,
+                "Scope changes never recapture a wide catalog merely to change query membership")
         }
         for mode in 0..<3 {
             let f = IndexedFixture()

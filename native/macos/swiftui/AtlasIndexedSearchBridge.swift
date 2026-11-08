@@ -31,7 +31,9 @@ private typealias IndexPoll = @convention(c) (UnsafeMutableRawPointer?) -> Int32
 
 extension AtlasIndexedSearchTransport {
     static let native = Self(create: { indexedCreate() }, open: { h, root, flag in
-        try polling(flag) { poll, context in root.withCString { indexedOpen(h, $0, 4096, poll, context) } }
+        // Keep one metadata universe across scope edits. Source capture retains
+        // its separate 4096-file/32 MiB limits and reports uncaptured members.
+        try polling(flag) { poll, context in root.withCString { indexedOpen(h, $0, UInt64(AtlasSearchPathScope.maximumVisibleFiles), poll, context) } }
     }, indexBegin: { h, g in try take(indexedBuildBegin(h, g, 4096, 1024 * 1024, 32 * 1024 * 1024, 2 * 1024 * 1024)) },
     indexStep: { h, g, flag in try polling(flag) { indexedBuildStep(h, g, $0, $1) } },
     queryBegin: { h, g, index, query in try query.withCString { try take(indexedQueryBegin(h, g, index, $0, 1000, 32 * 1024 * 1024)) } },

@@ -140,7 +140,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                         capturedFiles: basis.capturedFiles, capturedBytes: basis.sourceBytes,
                         skippedFiles: state.skipped, verifiedFiles: state.scanned, verificationBytes: state.verificationBytes),
                     fileScope: scope, excludedFiles: basis.files - state.eligible, pathScope: pathScope,
-                    caseSensitive: input.caseSensitive)
+                    caseSensitive: input.caseSensitive, visibleMissingFiles: state.visibleMissing)
                 try check(cancellation)
                 if !state.running { return report }
                 let now = ProcessInfo.processInfo.systemUptime
@@ -167,7 +167,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
         try check(cancellation)
         let opened = try AtlasIndexWire.decode(owner.call { try transport.open($0, root, cancellation) })
         try opened.header(schema: "fcb.atlas-session/1", command: "info", owner: handle)
-        let files = try opened.count("catalogued_files", upTo: 4096)
+        let files = try opened.count("catalogued_files", upTo: AtlasSearchPathScope.maximumVisibleFiles)
         let discovery = try opened.flag("discovery_complete"), layout = try opened.number("layout_revision")
         guard layout > 0, try opened.text("scope") == "all", try opened.number("workspace_files") == UInt64(files),
               try opened.text("retention") == "frozen-catalog-and-spatial-index" else { throw AtlasIndexWire.invalid() }
@@ -251,9 +251,9 @@ private struct AtlasIndexBuildPage {
         manifest = try w.number("source_manifest")
         captureManifest = try w.optionalNumber("capture_manifest")
         running = try w.flag("index_build_in_progress")
-        captured = try w.count("captured_files", upTo: files)
-        unavailable = try w.count("unavailable_files", upTo: files)
-        examined = try w.count("examined_files", upTo: files)
+        captured = try w.count("captured_files", upTo: min(files, 4096))
+        unavailable = try w.count("unavailable_files", upTo: min(files, 4096))
+        examined = try w.count("examined_files", upTo: min(files, 4096))
         pending = try w.count("pending_files", upTo: files)
         indexed = try w.count("indexed_files", upTo: captured)
         uncovered = try w.count("uncovered_files", upTo: captured)

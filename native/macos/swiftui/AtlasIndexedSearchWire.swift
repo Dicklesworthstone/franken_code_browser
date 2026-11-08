@@ -139,7 +139,7 @@ struct AtlasIndexedHit: Decodable, Sendable, Equatable {
 }
 
 struct AtlasIndexedQueryState: Equatable {
-    let eligible, captured, captureUnavailable: Int
+    let eligible, captured, captureUnavailable, visibleMissing: Int
     let examined, scanned, unavailable, pending, retained, step, skipped, fallback: Int
     let matches, verificationBytes: UInt64
     let running, complete, truncated: Bool
@@ -157,7 +157,9 @@ struct AtlasIndexedQueryPage {
         try basis.validate(w, command: command)
         let kind = try w.optionalText("search_scope")
         try pathScope.validateEcho(kind: w.optionalText("scope_path_kind"),
-            path: w.optionalText("scope_path"), hex: w.optionalText("scope_path_hex"))
+            path: w.optionalText("scope_path"), hex: w.optionalText("scope_path_hex"),
+            regionSHA256: w.optionalText("scope_region_sha256"), regionFiles: w.optionalText("scope_region_files"),
+            regionPathBytes: w.optionalText("scope_region_path_bytes"))
         let eligible = try scope.eligibleFiles(kind: kind, extensions: w.optionalText("scope_extensions"),
             filenames: w.optionalText("scope_filenames"), eligible: w.optionalText("eligible_files"),
             excluded: w.optionalText("excluded_files"), catalogued: basis.files, pathScoped: !pathScope.isWorkspace)
@@ -183,6 +185,9 @@ struct AtlasIndexedQueryPage {
         let matches = try w.number("matches_seen"), verification = try w.number("verification_source_bytes")
         let running = try w.flag("search_in_progress"), complete = try w.flag("search_complete")
         let truncated = try w.flag("truncated"), stop = try w.optionalText("stop_reason")
+        let visibleMissing = try pathScope.validateRegionCoverage(catalogued: w.optionalText("scope_region_catalogued_files"),
+            missing: w.optionalText("scope_region_missing_files"), eligible: eligible, searchCatalogFiles: basis.files,
+            allFileTypes: scope.isAll, complete: complete)
         guard try w.number("query_generation") == generation, generation > basis.index,
               try w.text("needle").utf8.elementsEqual(needle.utf8),
               try w.text("mode") == AtlasSearchText.wireMode(caseSensitive: caseSensitive),
@@ -213,6 +218,7 @@ struct AtlasIndexedQueryPage {
         }
         next = try w.optionalNumber("next_offset")
         state = AtlasIndexedQueryState(eligible: eligible, captured: captured, captureUnavailable: captureUnavailable,
+            visibleMissing: visibleMissing,
             examined: examined, scanned: scanned, unavailable: unavailable,
             pending: pending, retained: retained, step: step, skipped: skipped, fallback: fallback,
             matches: matches, verificationBytes: verification, running: running, complete: complete,
@@ -233,6 +239,7 @@ struct AtlasIndexedAccumulator {
         let n = page.state
         if let p = state {
             guard p.running, n.eligible == p.eligible, n.captured == p.captured, n.captureUnavailable == p.captureUnavailable,
+                  n.visibleMissing == p.visibleMissing,
                   n.step == p.step + 1, n.examined >= p.examined, n.examined <= p.examined + 1,
                   n.scanned >= p.scanned, n.skipped >= p.skipped, n.fallback >= p.fallback,
                   n.unavailable >= p.unavailable, n.retained >= p.retained, n.matches >= p.matches,

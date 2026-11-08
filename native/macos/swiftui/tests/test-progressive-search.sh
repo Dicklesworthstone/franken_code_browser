@@ -7,6 +7,9 @@ swiftc -swift-version 6 -warnings-as-errors \
     "$src/AtlasSearch.swift" "$src/AtlasSearchCoordinator.swift" \
     "$src/tests/AtlasSearchProgressTests.swift" -o "$tmp/coordinator"
 "$tmp/coordinator"
+swiftc -swift-version 6 -warnings-as-errors \
+    "$src/AtlasSearch.swift" "$src/tests/AtlasVisibleSearchWireTests.swift" -o "$tmp/visible-scope-wire"
+"$tmp/visible-scope-wire"
 clang -std=gnu11 -Wall -Wextra -Werror \
     -c "$src/tests/AtlasNativeSearchFixtures.c" -o "$tmp/fixture.o"
 swiftc -swift-version 6 -warnings-as-errors \
