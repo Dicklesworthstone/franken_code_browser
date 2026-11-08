@@ -272,6 +272,16 @@ fn viewport_source_residency() {
 }
 
 #[test]
+fn snapshot_export_receipts_lifetimes_and_bridge() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    checked(
+        Command::new("/bin/sh")
+            .current_dir(&root)
+            .arg("swiftui/tests/test-snapshot-export.sh"),
+    );
+}
+
+#[test]
 fn source_lifetime_through_metal_completion() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = std::env::temp_dir().join(format!(

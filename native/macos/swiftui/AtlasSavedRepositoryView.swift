@@ -1,8 +1,8 @@
 import SwiftUI
 import AppKit
 
-/// A successful native open panel already supplies selected-file access. Adopt
-/// it once, and release it only after the retained archive descriptor drains.
+/// A successful native open/save panel supplies selected-file access. Adopt it
+/// once, and release it only after the writer or archive descriptor drains.
 private final class AtlasSavedFileAccess {
     let url: URL
     init(selectedURL: URL) { url = selectedURL }
@@ -32,6 +32,8 @@ private final class AtlasSavedFileAccess {
 @MainActor struct AtlasSavedRepositoryView: View {
     @Bindable var model: AtlasSavedRepositoryModel
     @Bindable var desk: AtlasReadingDeskModel
+    @Bindable var exporter: AtlasSnapshotExportModel
+    var currentSource: @MainActor () -> AtlasSnapshotExportSource? = { nil }
     @Environment(\.dismiss) private var dismiss
     @State private var panelNotice = ""
     @State private var section: Section = .text
@@ -48,6 +50,7 @@ private final class AtlasSavedFileAccess {
     var body: some View {
         VStack(spacing: 10) {
             header
+            exportPane
             if let info = model.info {
                 HStack {
                     Text(info.path.display).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
@@ -68,7 +71,7 @@ private final class AtlasSavedFileAccess {
             } else {
                 VStack(spacing: 14) {
                     Image(systemName: "archivebox").font(.system(size: 42)).foregroundStyle(.secondary)
-                    Text("Read a saved repository").font(.title2.weight(.semibold))
+                    Text("Save and read a repository").font(.title2.weight(.semibold))
                     Text("Choose an FCBS archive to search its captured text, read source and Markdown, and follow documentation links and backlinks.")
                         .multilineTextAlignment(.center).frame(maxWidth: 540)
                     Button("Open saved repository…", action: chooseArchive).disabled(!model.canOperate)
@@ -84,7 +87,7 @@ private final class AtlasSavedFileAccess {
         }
         .onDisappear {
             readerTask?.cancel(); readerCapture?.reader.close(); pins.closeAll()
-            model.cancel()
+            model.cancel(); exporter.cancel()
         }
     }
 
@@ -95,9 +98,48 @@ private final class AtlasSavedFileAccess {
             Button("Open archive…", action: chooseArchive).disabled(!model.canOperate || readerTask != nil)
             Button("Close archive", action: model.closeArchive).disabled(!model.canOperate || model.info == nil)
             Button("Done") {
-                readerTask?.cancel(); model.cancel(); dismiss()
+                readerTask?.cancel(); model.cancel(); exporter.cancel(); dismiss()
             }.keyboardShortcut(.cancelAction)
         }
+    }
+    private var exportPane: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Button { saveCurrentProject() } label: {
+                    Label("Save current project…", systemImage: "square.and.arrow.down")
+                }
+                .disabled(exporter.busy || currentSource() == nil)
+                .help("Capture current files under the project's read grant into a new source-containing FCBS archive")
+                if exporter.busy {
+                    ProgressView().controlSize(.small)
+                    Text(exporter.cancellationRequested ? "Waiting for save outcome…" : "Capturing and saving…")
+                        .font(.caption)
+                    Button("Cancel save", action: exporter.cancel).disabled(exporter.cancellationRequested)
+                }
+                Spacer()
+                if exporter.canOpenSavedArchive {
+                    Button("Open saved archive") {
+                        panelNotice = ""
+                        exporter.openSavedArchive { path, digest, access in
+                            model.open(path: path, accessLease: access, expectedDigest: digest)
+                        }
+                    }.disabled(!model.canOperate || readerTask != nil)
+                }
+            }
+            if let request = exporter.request {
+                Text("Source: \(String(reflecting: request.root))")
+                    .font(.caption).lineLimit(2).textSelection(.enabled)
+                Text("Destination: \(String(reflecting: request.destination))")
+                    .font(.caption).lineLimit(2).textSelection(.enabled)
+            }
+            Text(exporter.notice).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            Text("Captures current on-disk observations using repository ignore rules: up to 20,000 known files, 1 MiB per file and 64 MiB of source. Source and filenames are stored as plaintext. The archive may be partial; existing files are never overwritten.")
+                .font(.caption2).foregroundStyle(.secondary)
+            if currentSource() == nil {
+                Text("Open a project to enable Save current project. Existing archives can be opened independently.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }.padding(10).background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
     }
     private var footer: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -547,6 +589,27 @@ private final class AtlasSavedFileAccess {
         }
     }
 
+    private func saveCurrentProject() {
+        guard !exporter.busy, let source = currentSource() else { return }
+        let panel = NSSavePanel()
+        panel.title = "Save the current project as an FCBS archive"
+        panel.prompt = "Save archive"
+        panel.nameFieldStringValue = "Repository.fcbs"
+        panel.message = "Captures current files from \(String(reflecting: source.root)), including plaintext source and filenames. Repository ignore rules are respected. Limits: 20,000 known files, 1 MiB per file, 64 MiB source. Omitted or unavailable files remain explicit; discovery may be incomplete. Choose a new filename."
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let access = AtlasSavedFileAccess(selectedURL: url)
+        guard currentSource()?.identity == source.identity else {
+            panelNotice = "The project or its read grant changed while choosing a destination. Review the current project and choose Save again. No export was started."
+            return
+        }
+        guard let path = access.nativePath else {
+            panelNotice = "The selected destination cannot be represented exactly by the native save interface. No export was started."
+            return
+        }
+        panelNotice = ""
+        exporter.save(source: source, destination: path, destinationAccess: access)
+    }
     private func chooseArchive() {
         guard model.canOperate, readerTask == nil else { return }
         let panel = NSOpenPanel()

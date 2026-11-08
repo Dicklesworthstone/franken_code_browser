@@ -395,9 +395,10 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                 case .open(let path):
                     log.append("open:\(handle)")
                     let refused = fault == "open"
-                    if refused { fault = nil }
+                    let lostReply = fault == "open-reply"
+                    if refused || lostReply { fault = nil }
                     sessions[handle] = Session(path: path, refused: refused)
-                    return refused ? nil : encode(info(handle, path: path))
+                    return refused || lostReply ? nil : encode(info(handle, path: path))
                 case .info:
                     log.append("info:\(handle)")
                     guard let session = sessions[handle], !session.refused else { return nil }
@@ -579,6 +580,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         try await actualModelNavigationAndIndependentReaders()
         try await capturedHeadingNavigationAndFrozenReceipts()
         await failedReplacementAndGenerationRecovery()
+        await savedExportDigestPinsReplacement()
         await staleRowsAndForeignRegistryCannotTriggerHandoff()
         await invalidMetadataAndReceiptsRetireDestinations()
         await closedArchiveRejectsLateHandoffAndDrainsItsLease()
@@ -763,6 +765,28 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         precondition(f.calls.filter { $0 == "open:41" }.count == 1 && f.calls.filter { $0 == "info:41" }.count == 1)
         await wait("failed replacement handle did not retire") { f.calls.contains("saved-close:41") }
         precondition(!f.calls.contains("saved-close:40"))
+        model.close()
+    }
+
+    @MainActor private static func savedExportDigestPinsReplacement() async {
+        let f = SavedRepositoryFixture(), model = await opened(f)
+        let original = model.info!.identity
+        let expected = String(repeating: "e", count: 64)
+        model.open(path: "/saved/export.fcbs", accessLease: nil, expectedDigest: expected)
+        await wait("mismatched exported archive did not drain") { !model.busy }
+        precondition(model.info?.identity == original && !f.calls.contains("members:41:0:64"))
+        await wait("mismatched candidate did not retire") { f.calls.contains("saved-close:41") }
+        f.corruptNext("open-reply")
+        model.open(path: "/saved/export.fcbs", accessLease: nil, expectedDigest: expected)
+        await wait("reconciled mismatch did not drain") { !model.busy }
+        precondition(model.info?.identity == original && f.calls.contains("info:42")
+            && !f.calls.contains("members:42:0:64"))
+        model.open(path: "/saved/export.fcbs", accessLease: nil, expectedDigest: f.archiveDigest)
+        await wait("matching saved digest did not open") { !model.busy }
+        precondition(model.info?.identity.owner == 43 && model.info?.identity.digest == f.archiveDigest)
+        let before = f.calls.count
+        model.open(path: "/saved/export.fcbs", accessLease: nil, expectedDigest: "invalid")
+        precondition(f.calls.count == before && !model.busy)
         model.close()
     }
 

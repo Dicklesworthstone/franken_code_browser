@@ -78,8 +78,9 @@ private final class AtlasSavedSession: @unchecked Sendable {
         return searchInput.utf8.elementsEqual(expressionPage.expression.utf8)
     }
 
-    func open(path: String, accessLease: AnyObject?) {
-        guard canOperate, path.hasPrefix("/"), path.utf8.count <= 16_384, !path.utf8.contains(0) else { return }
+    func open(path: String, accessLease: AnyObject?, expectedDigest: String? = nil) {
+        guard canOperate, path.hasPrefix("/"), path.utf8.count <= 16_384, !path.utf8.contains(0),
+              expectedDigest.map({ AtlasSavedWire.digest($0) }) != false else { return }
         perform { model, flag in
             let candidate = try AtlasSavedSession(transport: model.transport, access: accessLease)
             model.pending = candidate
@@ -94,6 +95,14 @@ private final class AtlasSavedSession: @unchecked Sendable {
                     guard !flag.isCanceled, !model.closed else { throw AtlasSavedError.canceled }
                     opened = try AtlasSavedInfo.decode(await model.run(candidate, .info, flag: flag),
                         handle: candidate.handle, expectedPath: Array(path.utf8), fresh: true)
+                }
+                if let expectedDigest, opened.identity.digest != expectedDigest {
+                    // The saved pathname may now name a different valid archive.
+                    // Keep the previous browser and never publish unrelated rows
+                    // as the result of this exact export receipt.
+                    if model.pending === candidate { model.pending = nil; candidate.cancel() }
+                    model.notice = "The selected destination now contains a different archive from the saved result. The previously opened repository is unchanged. Choose Open archive to inspect it explicitly."
+                    return
                 }
                 let page = try AtlasSavedMembers.decode(await model.run(candidate, .members(start: 0, limit: 64), flag: flag),
                     identity: opened.identity, start: 0, limit: 64)

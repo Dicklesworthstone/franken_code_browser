@@ -269,6 +269,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     @State private var showsReadingDesk = false
     @State private var reviewDeskAfterSheetDismissal = false
     @State private var savedRepository = AtlasSavedRepositoryModel(transport: .native)
+    @State private var snapshotExport = AtlasSnapshotExportModel(transport: .native)
     @State private var showsSavedRepository = false
     @State private var pinnedReaders = AtlasPinnedReaders<AtlasPagedReaderModel>(
         canFork: { $0.canPin }, fork: { try await $0.fork() }, retire: { $0.close() },
@@ -328,6 +329,20 @@ private struct AtlasFrozenViewportSearch: Sendable {
     private var textTiles: [AtlasTextTile] { atlasResidency.tiles }
     private var hasMetadataAtlas: Bool {
         atlasResidency.hasInstalledLayout(root: root, layoutRevision: atlasRevision)
+    }
+    private var snapshotExportSource: AtlasSnapshotExportSource? {
+        guard !loadingProject, projectOpening.canBrowse, browserProject == loadGeneration,
+              !root.isEmpty, projectBrowser.root.utf8.elementsEqual(root.utf8),
+              let accepted = projectBrowser.info, accepted.owner > 0 else { return nil }
+#if FCB_APP_STORE
+        guard !rootAccessLoader.isLoading, let rootAccess,
+              rootAccess.url.path.utf8.elementsEqual(root.utf8) else { return nil }
+        return AtlasSnapshotExportSource(root: root, project: browserProject,
+            browserOwner: accepted.owner, access: rootAccess)
+#else
+        return AtlasSnapshotExportSource(root: root, project: browserProject,
+            browserOwner: accepted.owner, access: nil)
+#endif
     }
 
     private var searchContext: AtlasSearchContext {
@@ -429,7 +444,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
             Button { showsSavedRepository = true } label: {
                 Label("Saved Repository", systemImage: "archivebox")
             }
-            .help("Read an FCBS archive, browse saved members, and follow documentation links and backlinks")
+            .help("Save the current project as an FCBS archive, or read saved members, documentation links and backlinks")
             Button { moveSearchResult(backwards: true) } label: {
                 Label("Previous Match", systemImage: "arrow.up")
             }
@@ -446,7 +461,8 @@ private struct AtlasFrozenViewportSearch: Sendable {
         .sheet(isPresented: $showsFileFinder, onDismiss: finishReadingDeskReview) { fileFinderSheet }
         .sheet(isPresented: $showsReadingDesk) { AtlasReadingDeskView(model: readingDesk, project: projectBrowser) }
         .sheet(isPresented: $showsSavedRepository, onDismiss: finishReadingDeskReview) {
-            AtlasSavedRepositoryView(model: savedRepository, desk: readingDesk)
+            AtlasSavedRepositoryView(model: savedRepository, desk: readingDesk, exporter: snapshotExport,
+                currentSource: { snapshotExportSource })
         }
         .onAppear {
 #if FCB_APP_STORE
@@ -486,6 +502,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
             closeFinderReader()
             projectBrowser.close()
             savedRepository.close()
+            snapshotExport.cancel()
             showsSavedRepository = false
             readingDesk.close()
             showsReadingDesk = false
@@ -512,6 +529,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
             // Returning creates a new native surface whose accepted frame
             // supplies fresh viewport demand; hidden views do no enrichment.
         }
+        .onChange(of: snapshotExportSource?.identity) { _, _ in snapshotExport.cancel() }
         .onChange(of: atlasResidency.contentRevision) { _, _ in
             refreshResidentSearchOverlay()
         }
@@ -1318,6 +1336,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     /// Project opening performs only the bounded metadata operation. Text
     /// capture/highlighting/raster preparation is an explicit subsequent action.
     private func requestAtlasLoad() {
+        snapshotExport.cancel()
         closeAtlasResidency()
         closeFinderReader()
         workspaceSearch?.refresh()
