@@ -2,22 +2,27 @@
 
 //! Explicit local navigation from a captured document under its catalog grant.
 //! A reader label never authorizes filesystem access. The catalog remembers a
-//! bounded receipt only after it has captured an observed member successfully;
+//! bounded receipt only after it has captured an authorized member successfully;
 //! activation must present that reader's exact request, digest and raw path.
-//! Targets must still be observed members of the four retained metadata pages.
-//! No implicit traversal, URI open, supplied-source fallback or new grant occurs.
+//! Source receipts outlive metadata pages. Explicit target paths use the same
+//! active root grant and no-follow capture service even before discovery reaches
+//! them. No implicit traversal, URI open, supplied-source fallback or new grant
+//! occurs; direct captures occupy a separate identity range and never add rows.
 
 use fcb::{ArenaOwnerId, FileId};
 use fcb::document::resolve_document_destination;
-use fcb::source::{CaptureRequest, NormalizedPath};
+use fcb::source::{CaptureRequest, NormalizedPath, RawPath};
 use fcb::store::Sha256Digest;
 use super::{CatalogSession, CatalogSessionError, HostResponse, ReaderSession,
-    FIRST_WINDOW_BYTES, MAX_READER_SOURCE_BYTES, check};
+    FIRST_WINDOW_BYTES, MAX_CATALOG_PATH_BYTES, MAX_READER_SOURCE_BYTES, check};
 
 pub const MAX_CATALOG_READER_RECEIPTS: usize = 8;
+/// Page zero denotes an explicit root-granted capture, never a discovery page.
+/// Its file identities cannot alias monotonically numbered metadata members.
+pub const FIRST_CATALOG_LINK_FILE_ID: u64 = 1 << 63;
 
-/// The metadata selection that produced the origin capture, plus a parser
-/// occurrence in that reader's CURRENT accepted document generation.
+/// The catalog selection or page-zero direct receipt that produced the origin
+/// capture, plus a parser occurrence in its CURRENT document generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CatalogDocumentLinkSelection {
     pub source_page: u64,
@@ -26,13 +31,28 @@ pub struct CatalogDocumentLinkSelection {
     pub link_id: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CatalogReaderReceipt {
     owner: ArenaOwnerId,
     page: u64,
     file: FileId,
     request: CaptureRequest,
     digest: Sha256Digest,
+    path: RawPath,
+}
+impl CatalogReaderReceipt {
+    fn new(page: u64, file: FileId, path: &NormalizedPath, reader: &ReaderSession)
+        -> Result<Self, CatalogSessionError> {
+        if path.as_bytes().len() > MAX_CATALOG_PATH_BYTES {
+            return Err(CatalogSessionError::InvalidLimits);
+        }
+        Ok(Self {
+            owner: reader.capture().request().file().owner(), page, file,
+            request: *reader.capture().request(), digest: reader.capture_sha256(),
+            path: path.raw().clone(),
+        })
+    }
+    fn path(&self) -> &[u8] { self.path.as_bytes() }
 }
 
 /// A completed catalog capture whose receipt has not yet been accepted by its
@@ -43,6 +63,7 @@ pub struct CatalogReaderAcceptance<'catalog> {
     catalog: &'catalog mut CatalogSession,
     origin: Option<CatalogReaderReceipt>,
     captured: CatalogReaderReceipt,
+    next_link_file: u64,
 }
 impl CatalogReaderAcceptance<'_> {
     /// Publish only after the receiving owner has installed the captured reader.
@@ -50,11 +71,13 @@ impl CatalogReaderAcceptance<'_> {
     pub fn accept(self) {
         if let Some(origin) = self.origin { self.catalog.reader_receipts.remember(origin); }
         self.catalog.reader_receipts.remember(self.captured);
+        self.catalog.next_link_file = self.next_link_file;
     }
 }
 
-/// Fixed storage is included in the catalog's original state admission. More
-/// readers never grow metadata; receipt eviction disables only link activation,
+/// The fixed receipt slots and their bounded shared raw paths are included in
+/// the catalog's original state admission. More readers never grow metadata;
+/// receipt eviction disables only link activation,
 /// not retained source reading. Successful activation refreshes its origin.
 #[derive(Default)]
 pub(super) struct CatalogReaderReceipts {
@@ -62,9 +85,9 @@ pub(super) struct CatalogReaderReceipts {
 }
 impl CatalogReaderReceipts {
     fn remember(&mut self, receipt: CatalogReaderReceipt) {
-        let position = self.recent.iter().position(|entry| entry.is_some_and(|entry| entry.owner == receipt.owner))
+        let position = self.recent.iter().position(|entry| entry.as_ref().is_some_and(|entry| entry.owner == receipt.owner))
             .unwrap_or(MAX_CATALOG_READER_RECEIPTS - 1);
-        for index in (1..=position).rev() { self.recent[index] = self.recent[index - 1]; }
+        for index in (1..=position).rev() { self.recent[index] = self.recent[index - 1].take(); }
         self.recent[0] = Some(receipt);
     }
 }
@@ -73,7 +96,13 @@ struct Target {
     page: u64,
     file: FileId,
     path: NormalizedPath,
-    observed_bytes: u64,
+    observed_bytes: Option<u64>,
+    next_link_file: u64,
+}
+impl Target {
+    fn resolution(&self) -> &'static str {
+        if self.page == 0 { "root-grant-path" } else { "retained-catalog-entry" }
+    }
 }
 
 impl CatalogSession {
@@ -81,12 +110,11 @@ impl CatalogSession {
     /// preparation. The token cannot register an arbitrary supplied reader,
     /// fork, saved member or caller-selected path as a catalog capture.
     pub(super) fn reader_acceptance<'catalog>(&'catalog mut self, page: u64,
-        file: FileId, reader: &ReaderSession) -> CatalogReaderAcceptance<'catalog> {
-        let captured = CatalogReaderReceipt {
-            owner: reader.capture().request().file().owner(), page, file,
-            request: *reader.capture().request(), digest: reader.capture_sha256(),
-        };
-        CatalogReaderAcceptance { catalog: self, origin: None, captured }
+        file: FileId, path: &NormalizedPath, reader: &ReaderSession)
+        -> Result<CatalogReaderAcceptance<'catalog>, CatalogSessionError> {
+        let captured = CatalogReaderReceipt::new(page, file, path, reader)?;
+        let next_link_file = self.next_link_file;
+        Ok(CatalogReaderAcceptance { catalog: self, origin: None, captured, next_link_file })
     }
 
     /// Open a CURRENT granted target into an independent reader. The origin
@@ -129,10 +157,7 @@ impl CatalogSession {
         // not grant this reader the receipt of a different source owner.
         let receipt = self.link_origin(origin, selection)?;
         let destination = origin.document_link_destination(selection.document_generation, selection.link_id)?;
-        let source_index = self.page_index(selection.source_page)?;
-        let source = self.pages[source_index].files.iter().find(|entry| entry.id == selection.source_file)
-            .ok_or(CatalogSessionError::MissingFile)?;
-        let source_path = std::str::from_utf8(source.path.as_bytes())
+        let source_path = std::str::from_utf8(receipt.path())
             .map_err(|_| CatalogSessionError::UnsupportedDocumentLink)?;
         let (path, suffix) = resolve_document_destination(source_path, destination)
             .ok_or(CatalogSessionError::UnsupportedDocumentLink)?;
@@ -159,10 +184,12 @@ impl CatalogSession {
             ("target_page_id", target.page), ("reader_owner", reader_owner.get())] {
             out.literal(",")?; out.quoted(key)?; out.literal(":")?; out.integer(value)?;
         }
+        out.literal(",\"source_authority\":\"retained-catalog-capture\",\"target_resolution\":")?;
+        out.quoted(target.resolution())?;
         out.literal(",\"source_capture_sha256\":")?; out.quoted(&receipt.digest.to_hex())?;
         out.literal(",\"target_file\":{\"file_id\":")?; out.integer(target.file.get())?;
         out.literal(",\"path\":")?; out.path(&target.path.raw().to_path_buf())?;
-        out.literal(",\"observed_bytes\":")?; out.integer(target.observed_bytes)?; out.literal("}")?;
+        out.literal(",\"observed_bytes\":")?; out.integer(target.observed_bytes.unwrap_or(source_bytes))?; out.literal("}")?;
         out.literal(",\"source_observation\":\"new-capture-after-document-link\",\"source_bytes_read\":")?;
         out.integer(source_bytes)?;
         out.literal(",\"source_read_calls\":")?; out.integer(source_calls)?;
@@ -184,22 +211,20 @@ impl CatalogSession {
         // Refresh the origin only when the receiving owner accepts this reader.
         // A rejected candidate must neither grant a reusable empty handle nor
         // evict a receipt belonging to an already accepted capture.
-        let mut acceptance = self.reader_acceptance(target.page, target.file, &reader);
+        let mut acceptance = self.reader_acceptance(target.page, target.file, &target.path, &reader)?;
         acceptance.origin = Some(receipt);
+        acceptance.next_link_file = target.next_link_file;
         Ok((reader, response, acceptance))
     }
 
     fn link_origin(&self, origin: &ReaderSession, selection: CatalogDocumentLinkSelection)
         -> Result<CatalogReaderReceipt, CatalogSessionError> {
-        let index = self.page_index(selection.source_page)?;
-        let entry = self.pages[index].files.iter().find(|entry| entry.id == selection.source_file)
-            .ok_or(CatalogSessionError::MissingFile)?;
         let owner = origin.capture().request().file().owner();
         let receipt = self.reader_receipts.recent.iter().flatten().find(|receipt| receipt.owner == owner)
-            .copied().ok_or(CatalogSessionError::StaleReaderReceipt)?;
+            .cloned().ok_or(CatalogSessionError::StaleReaderReceipt)?;
         if receipt.page != selection.source_page || receipt.file != selection.source_file
             || receipt.request != *origin.capture().request() || receipt.digest != origin.capture_sha256()
-            || origin.path().as_os_str() != entry.path.raw().to_path_buf().as_os_str() {
+            || origin.path().as_os_str() != receipt.path.to_path_buf().as_os_str() {
             return Err(CatalogSessionError::ReaderReceiptMismatch);
         }
         Ok(receipt)
@@ -214,9 +239,15 @@ impl CatalogSession {
                 if file.path.as_bytes() != path { continue; }
                 if target.is_some() { return Err(CatalogSessionError::AmbiguousLinkTarget); }
                 target = Some(Target { page: page.id, file: file.id,
-                    path: file.path.clone(), observed_bytes: file.observed_bytes });
+                    path: file.path.clone(), observed_bytes: Some(file.observed_bytes),
+                    next_link_file: self.next_link_file });
             }
         }
-        target.ok_or(CatalogSessionError::LinkTargetNotRetained)
+        if let Some(target) = target { return Ok(target); }
+        if path.len() > MAX_CATALOG_PATH_BYTES { return Err(CatalogSessionError::InvalidLimits); }
+        let next_link_file = self.next_link_file.checked_add(1).ok_or(CatalogSessionError::IdentityExhausted)?;
+        Ok(Target { page: 0,
+            file: FileId::new(self.owner(), self.next_link_file).map_err(|_| CatalogSessionError::IdentityExhausted)?,
+            path: NormalizedPath::new(RawPath::from_bytes(path))?, observed_bytes: None, next_link_file })
     }
 }

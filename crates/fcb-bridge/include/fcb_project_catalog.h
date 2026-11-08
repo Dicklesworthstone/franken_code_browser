@@ -82,18 +82,24 @@ char *fcb_catalog_open_reader(uint64_t handle, uint64_t reader,
 /* Follow an inventoried local document link from a catalog-issued reader.
  * origin must still be open with the exact captured bytes, current document
  * generation and retained link occurrence. source_page/source_file must match
- * its catalog-issued receipt and a retained source row. The shared Markdown
- * resolver supplies the logical candidate; it must match a file in the four
- * retained metadata pages before capture. No caller path or URI is accepted.
- * At most eight capture receipts are retained by each catalog; eviction or a
- * closed catalog revokes new link activation, not the existing source bytes.
+ * its catalog-issued receipt. That receipt retains the exact bounded raw path
+ * independently of metadata-page eviction. The shared Markdown resolver
+ * supplies the logical candidate under the active root grant; targets need not
+ * be present in the four metadata pages. No caller path or URI is accepted,
+ * and following a link does not advance discovery or scan the project.
+ * At most eight capture receipts are retained by each catalog; receipt eviction
+ * or a closed catalog revokes new link activation, not existing source bytes.
  * An EMPTY destination is admitted before target resolution/I/O; origin and
  * destination must differ. The origin remains unchanged. Cancellation checks
  * include all three handles. The target is a NEW capture and is independent
  * after acceptance; max_source_bytes: 1..32 MiB. Existing path/leaf policy
  * applies, with the same confinement limits as open_reader above.
- * A target outside retained metadata is unavailable, not known absent. The
- * receipt names the exact target row and both captures. A target #fragment is
+ * source_authority is retained-catalog-capture. target_resolution distinguishes
+ * retained-catalog-entry (current page/file) from root-grant-path (page zero,
+ * file ID >= 2^63). Page-zero identities name captures, never discovery rows.
+ * Direct identities publish only with destination acceptance and can originate
+ * further links through this same API. The receipt names both captures.
+ * A target #fragment is
  * decoded once and matched to a uniquely qualified canonical Markdown heading.
  * Fragment qualification is bounded to 256 KiB .md/.markdown captures and the
  * shared document flow limits; it does not consume a reader preview generation.

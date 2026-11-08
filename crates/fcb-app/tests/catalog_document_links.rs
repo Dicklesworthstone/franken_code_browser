@@ -7,7 +7,7 @@ use std::{fs, os::unix::fs::symlink, path::{Path, PathBuf}, sync::atomic::{Atomi
 use fcb::{ArenaOwnerId, FileId};
 use fcb::source::SourceError;
 use fcb_app::host::{HostResponse, catalog_session::{CatalogDocumentLinkSelection,
-    CatalogSession, CatalogSessionError, MAX_CATALOG_PAGE_ENTRIES, MAX_CATALOG_READER_RECEIPTS,
+    CatalogSession, CatalogSessionError, FIRST_CATALOG_LINK_FILE_ID, MAX_CATALOG_PAGE_ENTRIES, MAX_CATALOG_READER_RECEIPTS,
     MAX_CATALOG_RETAINED_PAGES, MAX_CATALOG_RESPONSE_BYTES},
     reader::{ReaderDocumentOptions, ReaderSession}};
 
@@ -85,6 +85,8 @@ fn relative_links_keep_original_document_and_open_independent_current_targets() 
     let (mut target, receipt) = catalog.open_document_link(&origin, owner(73103), selection(&source, 1, 1), 4096, || false).unwrap();
     let receipt = json(&receipt);
     assert_eq!(receipt.get("command").text(), "open-document-link");
+    assert_eq!(receipt.get("source_authority").text(), "retained-catalog-capture");
+    assert_eq!(receipt.get("target_resolution").text(), "retained-catalog-entry");
     assert_eq!(receipt.get("owner").number(), 73101);
     assert_eq!(receipt.get("source_reader_owner").number(), 73102);
     assert_eq!(receipt.get("source_page_id").number(), source.page);
@@ -180,15 +182,26 @@ fn receipt_labels_compare_raw_bytes_without_path_component_normalization() {
 }
 
 #[test]
-fn observed_membership_and_upstream_uri_policy_never_fall_back_to_live_paths() {
+fn explicit_unobserved_targets_use_the_existing_grant_and_keep_uri_policy() {
     let root = new_root();
     let bytes = b"# Guide\n\n[late](late.rs)\n\n[escape](../outside.rs)\n\n[encoded](%2e%2e/outside.rs)\n\n[web](https://example.invalid/x)\n\n[file](file:///tmp/outside.rs)\n\n[authority](//example.invalid/x)\n\n[bad](bad%zz.rs)\n\n[backslash](bad%5Cname.rs)\n";
     fs::write(root.join("README.md"), bytes).unwrap();
     let (mut catalog, found) = catalog(&root, 73301);
     let source = row(&found, "README.md"); let origin = open(&mut catalog, &source, 73302);
-    fs::write(root.join("late.rs"), b"fn not_in_the_observed_catalog() {}\n").unwrap();
-    assert!(matches!(catalog.open_document_link(&origin, owner(73303), selection(&source, 1, 1), 4096, || false),
-        Err(CatalogSessionError::LinkTargetNotRetained)));
+    let late_bytes = b"fn not_in_the_observed_catalog() {}\n";
+    fs::write(root.join("late.rs"), late_bytes).unwrap();
+    let before = json(&catalog.page(source.page, || false).unwrap());
+    let (target, response) = catalog.open_document_link(&origin, owner(73303), selection(&source, 1, 1), 4096, || false).unwrap();
+    let response = json(&response);
+    assert_eq!(target.capture().bytes(), late_bytes);
+    assert_eq!(response.get("target_resolution").text(), "root-grant-path");
+    assert_eq!(response.get("target_page_id").number(), 0);
+    assert_eq!(response.get("target_file").get("file_id").number(), FIRST_CATALOG_LINK_FILE_ID);
+    assert_eq!(response.get("target_file").get("observed_bytes").number(), late_bytes.len() as u64);
+    assert_eq!(response.get("source_bytes_read").number(), late_bytes.len() as u64);
+    for field in ["catalogued_files", "latest_page", "retained_files", "retained_path_bytes", "discovery"] {
+        assert_eq!(response.get(field), before.get(field), "link activation advanced discovery: {field}");
+    }
     for id in 2..=8 {
         assert!(matches!(catalog.open_document_link(&origin, owner(73303), selection(&source, 1, id), 4096, || false),
             Err(CatalogSessionError::UnsupportedDocumentLink)), "destination occurrence {id}");
@@ -430,8 +443,8 @@ fn receipt_retention_refreshes_active_origin_and_refuses_evicted_sources() {
 }
 
 #[test]
-fn metadata_eviction_does_not_reinterpret_a_retained_origin_path() {
-    let root = new_root(); let bytes = b"# Guide\n\n[target](target.rs)\n";
+fn metadata_eviction_keeps_exact_origin_receipts_and_chained_direct_targets() {
+    let root = new_root(); let bytes = b"# Guide\n\n[target](target.md)\n";
     let seed = root.join("file-00000.md"); fs::write(&seed, bytes).unwrap();
     let count = MAX_CATALOG_PAGE_ENTRIES * (MAX_CATALOG_RETAINED_PAGES + 1);
     for index in 1..count { fs::hard_link(&seed, root.join(format!("file-{index:05}.md"))).unwrap(); }
@@ -444,9 +457,38 @@ fn metadata_eviction_does_not_reinterpret_a_retained_origin_path() {
         page = json(&catalog.advance(page.get("page_id").number(), || false).unwrap());
     }
     assert!(page.get("first_retained_page").number() > source.page);
-    assert!(matches!(catalog.open_document_link(&origin, owner(73903), selection(&source, 1, 1), 4096, || false),
-        Err(CatalogSessionError::StalePage)));
+    let target_bytes = format!("# Target\n\n[back]({})\n", source.path);
+    fs::write(root.join("target.md"), &target_bytes).unwrap();
+    let (mut target, response) = catalog.open_document_link(&origin, owner(73903), selection(&source, 1, 1), 4096, || false).unwrap();
+    let response = json(&response);
+    assert_eq!(response.get("source_page_id").number(), source.page);
+    assert_eq!(response.get("target_resolution").text(), "root-grant-path");
+    assert_eq!(response.get("target_page_id").number(), 0);
+    assert_eq!(response.get("catalogued_files"), page.get("catalogued_files"));
+    assert_eq!(response.get("retained_pages"), page.get("retained_pages"));
+    assert_eq!(response.get("retained_files"), page.get("retained_files"));
+    let target_row = Row { page: 0,
+        file: FileId::new(catalog.owner(), response.get("target_file").get("file_id").number()).unwrap(),
+        path: "target.md".into(), observed_bytes: target_bytes.len() as u64 };
+    assert_eq!(target_row.file.get(), FIRST_CATALOG_LINK_FILE_ID);
+    assert_eq!(target.capture().bytes(), target_bytes.as_bytes());
+    prepare(&mut target);
+    let (back, back_response) = catalog.open_document_link(&target, owner(73904), selection(&target_row, 1, 1), 4096, || false).unwrap();
+    let back_response = json(&back_response);
+    assert_eq!(back_response.get("source_page_id").number(), 0);
+    assert_eq!(back_response.get("source_file_id").number(), target_row.file.get());
+    assert_eq!(back_response.get("target_page_id").number(), 0);
+    assert_eq!(back_response.get("target_file").get("file_id").number(), FIRST_CATALOG_LINK_FILE_ID + 1);
+    assert_eq!(back.capture().bytes(), bytes);
     assert_eq!(origin.capture().bytes(), bytes);
+    // Page eviction cannot make a caller-selected page or raw label authoritative.
+    let mut forged_row = source.clone(); forged_row.page = 0;
+    assert!(matches!(catalog.open_document_link(&origin, owner(73905), selection(&forged_row, 1, 1), 4096, || false),
+        Err(CatalogSessionError::ReaderReceiptMismatch)));
+    let mut relabeled = ReaderSession::from_bytes(owner(73902), Path::new("unrelated.md"), bytes, || false).unwrap();
+    prepare(&mut relabeled);
+    assert!(matches!(catalog.open_document_link(&relabeled, owner(73905), selection(&source, 1, 1), 4096, || false),
+        Err(CatalogSessionError::ReaderReceiptMismatch)));
 }
 
 #[test]
@@ -498,4 +540,46 @@ fn stale_document_generation_and_replaced_symlink_target_are_refused() {
     assert!(matches!(catalog.open_document_link(&origin, owner(74103), selection(&source, 2, 1), 4096, || false),
         Err(CatalogSessionError::Source(SourceError::SymlinkForbidden))));
     assert_eq!(origin.capture().bytes(), bytes);
+}
+
+#[test]
+fn rejected_direct_target_does_not_publish_receipts_or_consume_identity() {
+    let root = new_root();
+    fs::write(root.join("README.md"), b"# Guide\n\n[target](late.md)\n").unwrap();
+    let (mut catalog, found) = catalog(&root, 75701);
+    let source = row(&found, "README.md"); let origin = open(&mut catalog, &source, 75702);
+    fs::write(root.join("late.md"), b"# Late\n\n[back](README.md)\n").unwrap();
+    let (mut rejected, response, acceptance) = catalog.prepare_document_link_capture(&origin, owner(75703),
+        selection(&source, 1, 1), 4096, || false).unwrap();
+    let response = json(&response);
+    let target_row = Row { page: response.get("target_page_id").number(),
+        file: FileId::new(owner(75701), response.get("target_file").get("file_id").number()).unwrap(),
+        path: "late.md".into(), observed_bytes: response.get("target_file").get("observed_bytes").number() };
+    assert_eq!(target_row.page, 0);
+    assert_eq!(target_row.file.get(), FIRST_CATALOG_LINK_FILE_ID);
+    // The caller can still reject the prepared response at the installation
+    // boundary. Neither its receipt nor its identity is committed in that case.
+    drop(acceptance);
+    prepare(&mut rejected);
+    assert!(matches!(catalog.open_document_link(&rejected, owner(75704), selection(&target_row, 1, 1), 4096, || false),
+        Err(CatalogSessionError::StaleReaderReceipt)));
+    let (_, accepted) = catalog.open_document_link(&origin, owner(75705), selection(&source, 1, 1), 4096, || false).unwrap();
+    assert_eq!(json(&accepted).get("target_file").get("file_id").number(), FIRST_CATALOG_LINK_FILE_ID);
+}
+
+#[test]
+fn direct_targets_still_refuse_symlinks_and_missing_paths_without_source_receipts() {
+    let root = new_root(); let outside = new_root();
+    fs::write(root.join("README.md"), b"[target](late.md) [nested](linked/target.md) [missing](missing.md)\n").unwrap();
+    let (mut catalog, found) = catalog(&root, 75801);
+    let source = row(&found, "README.md"); let origin = open(&mut catalog, &source, 75802);
+    fs::write(outside.join("target.md"), b"# Outside\n").unwrap();
+    symlink(outside.join("target.md"), root.join("late.md")).unwrap();
+    symlink(&outside, root.join("linked")).unwrap();
+    for link_id in [1, 2] {
+        assert!(matches!(catalog.open_document_link(&origin, owner(75803), selection(&source, 1, link_id), 4096, || false),
+            Err(CatalogSessionError::Source(SourceError::SymlinkForbidden))));
+    }
+    assert!(catalog.open_document_link(&origin, owner(75803), selection(&source, 1, 3), 4096, || false).is_err());
+    assert_eq!(json(&catalog.page(source.page, || false).unwrap()).get("catalogued_files").number(), 1);
 }

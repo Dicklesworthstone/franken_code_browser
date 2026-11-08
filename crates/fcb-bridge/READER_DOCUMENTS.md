@@ -76,11 +76,21 @@ canceled link preparation preserves the previous accepted inventory.
 For readers originally opened by Project Files, `fcb_catalog_open_document_link`
 provides the separately authorized local-file route. It binds the original
 catalog page/file receipt to the reader owner, exact capture request and SHA-256,
-then resolves the retained occurrence through FrankenMarkdown. The resolved raw
-path must match a file in the catalog's current four metadata pages. This route
-does not extend discovery or treat missing retained metadata as filesystem absence.
-Catalogs retain at most eight capture receipts; eviction disables new link
-activation while existing captured bytes remain readable.
+then resolves the retained occurrence through FrankenMarkdown. The receipt keeps
+the exact bounded raw path independently of the four retained metadata pages, so
+advancing discovery does not disable links in an already opened reader. The
+resolved target uses the existing root-grant capture service even when discovery
+has not reached it. This route performs no directory scan or discovery advance.
+Catalogs retain at most eight capture receipts; receipt eviction disables new
+link activation while existing captured bytes remain readable.
+
+The response labels `source_authority` as `retained-catalog-capture` and
+`target_resolution` as `retained-catalog-entry` or `root-grant-path`. A retained
+entry uses its existing page/file identity. A direct target uses page zero and a
+file identity at least `2^63`, separate from discovery rows and counters. Its
+identity and receipt publish only when the destination accepts the capture.
+Native consumers validate these identity domains explicitly rather than treating
+a direct capture as a metadata page. Both kinds can originate further links.
 
 The target opens as a new capture in an empty destination reader. Source, target
 and catalog cancellation epochs cover the transfer, and target admission precedes

@@ -14,7 +14,7 @@
 #[path = "file_finder_session.rs"]
 pub mod finder;
 mod document_links;
-pub use document_links::{CatalogDocumentLinkSelection, CatalogReaderAcceptance, MAX_CATALOG_READER_RECEIPTS};
+pub use document_links::{CatalogDocumentLinkSelection, CatalogReaderAcceptance, FIRST_CATALOG_LINK_FILE_ID, MAX_CATALOG_READER_RECEIPTS};
 
 use std::{collections::VecDeque, fs, mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, FileId};
@@ -102,6 +102,7 @@ pub struct CatalogSession {
     pages: VecDeque<CatalogPage>,
     latest_page: u64,
     catalogued_files: u64,
+    next_link_file: u64,
     complete: bool,
     paused: bool,
     reader_receipts: document_links::CatalogReaderReceipts,
@@ -139,7 +140,7 @@ impl CatalogSession {
         pages.try_reserve_exact(MAX_CATALOG_RETAINED_PAGES).map_err(|_| AppError::Admission)?;
         if pages.capacity() > MAX_CATALOG_RETAINED_PAGES { return Err(AppError::Admission.into()); }
         let mut session = Self { grant, root_identity, discovery: Some(discovery), aggregate: DiscoveryAggregate::default(),
-            pages, latest_page: 0, catalogued_files: 0, complete: false, paused: false,
+            pages, latest_page: 0, catalogued_files: 0, next_link_file: FIRST_CATALOG_LINK_FILE_ID, complete: false, paused: false,
             reader_receipts: document_links::CatalogReaderReceipts::default(), next_allocation: 2, budget, _lease: lease };
         session.consume_page(&mut canceled)?;
         session.validate_active()?;
@@ -262,7 +263,7 @@ impl CatalogSession {
         out.literal("}\n")?;
         let response = self.finish(out, &mut canceled)?;
         self.validate_active()?;
-        let acceptance = self.reader_acceptance(page_id, file, &reader);
+        let acceptance = self.reader_acceptance(page_id, file, &relative, &reader)?;
         Ok((reader, response, acceptance))
     }
 
@@ -298,7 +299,8 @@ impl CatalogSession {
     fn consume_page(&mut self, canceled: &mut impl FnMut() -> bool) -> Result<(), CatalogSessionError> {
         check(canceled)?; self.validate_active()?;
         let id = self.latest_page.checked_add(1).ok_or(CatalogSessionError::IdentityExhausted)?;
-        self.catalogued_files.checked_add(MAX_CATALOG_PAGE_ENTRIES as u64).ok_or(CatalogSessionError::IdentityExhausted)?;
+        self.catalogued_files.checked_add(MAX_CATALOG_PAGE_ENTRIES as u64)
+            .filter(|last| *last < FIRST_CATALOG_LINK_FILE_ID).ok_or(CatalogSessionError::IdentityExhausted)?;
         let mut files = Vec::new();
         files.try_reserve_exact(MAX_CATALOG_PAGE_ENTRIES).map_err(|_| AppError::Admission)?;
         if files.capacity() > MAX_CATALOG_PAGE_ENTRIES { return Err(AppError::Admission.into()); }

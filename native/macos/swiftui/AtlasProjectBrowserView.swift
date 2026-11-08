@@ -161,7 +161,7 @@ import SwiftUI
                 }
                 Button("Done", action: done).keyboardShortcut(.cancelAction)
             }
-            Text("The originating capture stays open while you follow links to files in the current project pages.")
+            Text("The originating capture stays open while you follow links to files within this project, including files outside the retained discovery pages.")
                 .font(.caption).foregroundStyle(.secondary)
             HSplitView {
                 AtlasPagedSourceView(model: origin.reader, canKeep: canKeep, keep: keep,
@@ -200,7 +200,7 @@ import SwiftUI
     private func open(_ target: AtlasReaderDocumentLinkTarget, from source: AtlasProjectBrowserCapture) {
         guard task == nil else { return }
         let ticket = UUID(); operation = ticket
-        notice = "Opening the linked file from retained project metadata…"
+        notice = "Opening a new capture of the linked file within this project…"
         task = Task {
             defer { if operation == ticket { task = nil } }
             do {

@@ -66,6 +66,7 @@ struct Cell {
     _lease: ResourceLease,
     _permit: Permit, // Cursor/page destruction precedes capacity release.
 }
+const CATALOG_CELL_CHARGE: usize = size_of::<Cell>() + 256;
 impl Cell {
     fn validate(&self, epoch: u64) -> Result<(), AccessError> {
         if self.closed.load(Ordering::Acquire) { Err(AccessError::Closed) }
@@ -81,7 +82,8 @@ impl CatalogSessions {
     pub(super) fn new() -> Self {
         Self { cells: Mutex::new(std::array::from_fn(|_| None)), live: Arc::new(AtomicUsize::new(0)),
             budget: ResourceBudget::new(ArenaOwnerId::new(1).expect("nonzero registry owner"),
-                ByteLength::new(64 * 1024)).expect("constant registry admission") }
+                ByteLength::new((MAX_CATALOG_SESSIONS * CATALOG_CELL_CHARGE) as u64))
+                .expect("constant registry admission") }
     }
     /// Reserve an empty cancelable handle before any filesystem operation.
     /// Its identity cannot alias reader, saved repository or atlas handles.
@@ -94,7 +96,7 @@ impl CatalogSessions {
         let id = reader_sessions::fresh_handle()?;
         let lease = self.budget.try_reserve_managed(ArenaOwnerId::new(1).expect("nonzero registry owner"),
             ResourceAllocationId::new(id).map_err(|_| AccessError::Capacity)?,
-            ByteLength::new((size_of::<Cell>() + 256) as u64)).map_err(|_| AccessError::Capacity)?;
+            ByteLength::new(CATALOG_CELL_CHARGE as u64)).map_err(|_| AccessError::Capacity)?;
         cells[position] = Some(Arc::new(Cell { id, closed: AtomicBool::new(false), epoch: AtomicU64::new(1),
             state: Mutex::new(None), _lease: lease, _permit: permit }));
         Ok(id)

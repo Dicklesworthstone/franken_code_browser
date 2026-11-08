@@ -36,6 +36,12 @@ private struct AtlasCatalogNumber: Decodable {
     }
 }
 
+/// Direct link captures have receipt identities outside the discovery range.
+/// Page zero names that bounded receipt; it is never a catalog metadata page.
+private enum AtlasProjectLinkIdentity {
+    static let firstDirectFile: UInt64 = 1 << 63
+}
+
 struct AtlasProjectBrowserFile: Decodable, Sendable, Identifiable {
     let id: UInt64
     let rawPath: [UInt8]
@@ -104,6 +110,7 @@ struct AtlasProjectBrowserInfo: Sendable {
                   !w.discovery_complete || [w.discovery.unavailable.value, w.discovery.cycles.value,
                     w.discovery.path_limited.value, w.discovery.depth_limited.value, w.discovery.queue_refused.value].allSatisfy({ $0 == 0 }),
                   w.catalogued_files.value <= w.discovery.files.value,
+                  w.catalogued_files.value < AtlasProjectLinkIdentity.firstDirectFile,
                   latest > 0, first > 0, first <= latest, latest - first < 4,
                   w.retained_pages.value == latest - first + 1,
                   w.retained_files.value <= 1024, w.retained_files.value <= w.catalogued_files.value,
@@ -423,20 +430,36 @@ private struct AtlasProjectBrowserLinkReceipt: Sendable {
             struct Wire: Decodable {
                 let source_page_id, source_file_id, source_reader_owner, document_generation, link_id: AtlasCatalogNumber
                 let target_page_id, reader_owner, source_bytes_read, source_read_calls, initial_original_offset: AtlasCatalogNumber
-                let source_capture_sha256, source_observation, destination, destination_suffix: String
+                let source_capture_sha256, source_observation, source_authority, target_resolution: String
+                let destination, destination_suffix: String
                 let target_file: AtlasProjectBrowserFile
             }
             let w = try JSONDecoder().decode(Wire.self, from: data)
             let fragment = w.destination_suffix.firstIndex(of: "#").map { String(w.destination_suffix[$0...]) } ?? ""
-            guard current.retains(source.page), current.retains(w.target_page_id.value),
-                  w.source_page_id.value == source.page, w.source_file_id.value == source.file,
+            // The source receipt retains its exact capture independently of
+            // the four metadata pages. A direct target similarly has no page
+            // membership, and must use the disjoint receipt identity range.
+            switch w.target_resolution {
+            case "retained-catalog-entry":
+                guard current.retains(w.target_page_id.value), w.target_file.id <= current.discovered else {
+                    throw AtlasProjectBrowserError.invalidResponse
+                }
+            case "root-grant-path":
+                guard w.target_page_id.value == 0,
+                      w.target_file.id >= AtlasProjectLinkIdentity.firstDirectFile,
+                      w.target_file.observedBytes == w.source_bytes_read.value else {
+                    throw AtlasProjectBrowserError.invalidResponse
+                }
+            default: throw AtlasProjectBrowserError.invalidResponse
+            }
+            guard w.source_page_id.value == source.page, w.source_file_id.value == source.file,
                   w.source_reader_owner.value == source.identity.owner,
                   w.source_capture_sha256.utf8.elementsEqual(source.digest.utf8),
+                  w.source_authority == "retained-catalog-capture",
                   target.inventory.identity.matches(source.identity), target.link.kind == .local,
                   w.document_generation.value == target.inventory.generation, w.link_id.value == target.link.id,
                   w.destination.utf8.elementsEqual(target.link.destination.utf8),
                   w.destination_suffix.utf8.count <= AtlasReaderDocumentLimits.destinationBytes,
-                  w.target_file.id <= current.discovered,
                   destination > 0, destination != source.catalog, destination != source.identity.owner,
                   w.reader_owner.value == destination, w.source_observation == "new-capture-after-document-link" else {
                 throw AtlasProjectBrowserError.invalidResponse
@@ -642,7 +665,7 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
         outline: AtlasReaderOutlineTransport? = nil, document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasProjectBrowserCapture {
         guard canOperate, let lease = session, let info, let domain = transport.readerDomain,
               readerTransport.comparison?.domain == domain, origin.reader.retainedRegistryDomain == domain,
-              origin.catalogOwner == lease.owner, info.owner == lease.owner, info.retains(origin.pageID),
+              origin.catalogOwner == lease.owner, info.owner == lease.owner,
               target.link.kind == .local, origin.reader.documentPreview.allows(target),
               let identity = origin.reader.page?.identity, identity.matches(target.inventory.identity),
               identity.pathBytes == origin.file.rawPath else { throw AtlasProjectBrowserError.stale }
