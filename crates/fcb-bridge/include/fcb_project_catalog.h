@@ -114,6 +114,31 @@ char *fcb_catalog_open_document_link(uint64_t handle, uint64_t origin,
     uint64_t destination, uint64_t source_page, uint64_t source_file,
     uint64_t document_generation, uint64_t link_id, uint64_t max_source_bytes);
 
+/* Explicitly follow a local link from an independently retained reader, such
+ * as an atlas/search capture, supplied source, Quick Open result or pin. No
+ * caller destination path is accepted. The exact document generation and link
+ * occurrence are checked before filesystem access. The source label supplies
+ * only a candidate relative path (or an absolute path under the canonical root
+ * or the exact root spelling originally admitted when this project opened).
+ * The shared host verifies that candidate under the active root grant and
+ * always reads through the canonical grant, and compares its complete original
+ * bytes with the retained origin before opening
+ * the link target. A changed origin refuses with ORIGIN_CAPTURE_CHANGED; it
+ * does not replace the retained bytes. Existing path/leaf checks still apply.
+ * Destination admission and cancellation follow open_document_link above.
+ * Source verification and target capture are separately bounded by
+ * max_source_bytes (1..32 MiB); neither operation advances discovery.
+ * The response uses command open-document-link and source_authority
+ * verified-current-source, plus source_verification_bytes_read and
+ * source_verification_read_calls. source_bytes_read/source_read_calls continue
+ * to describe target acquisition only. Source receipt identities use page zero
+ * and file IDs >= 2^63; target_resolution follows the ordinary link contract.
+ * No source or target receipt publishes unless the destination is accepted.
+ */
+char *fcb_catalog_open_verified_document_link(uint64_t handle, uint64_t origin,
+    uint64_t destination, uint64_t document_generation, uint64_t link_id,
+    uint64_t max_source_bytes);
+
 uint8_t fcb_catalog_cancel(uint64_t handle);
 uint8_t fcb_catalog_close(uint64_t handle);
 

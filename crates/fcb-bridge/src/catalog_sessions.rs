@@ -192,6 +192,34 @@ impl CatalogSessions {
         cell.validate(epoch)?;
         result
     }
+    /// Admit local navigation from an independently retained reader only after
+    /// the shared host verifies its original bytes under this catalog's grant.
+    /// Destination admission precedes source verification and target I/O. The
+    /// origin, grant and destination remain cancelable through final acceptance.
+    pub(super) fn open_verified_document_link(&self, handle: u64, readers: &ReaderSessions,
+        origin: u64, destination: u64, document_generation: u64, link_id: u64,
+        max_source_bytes: usize, mut canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AccessError> {
+        if origin == destination { return Err(AccessError::InvalidArgument); }
+        let cell = self.get(handle)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let mut state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        let session = state.as_mut().ok_or(AccessError::NotOpen)?;
+        let mut stop = || cell.validate(epoch).is_err() || canceled();
+        let result = readers.with_retained(origin, move |source, origin_stop| {
+            let session = session;
+            readers.initialize_prepared_with_acceptance(destination, move |owner, destination_stop| {
+                let session = session;
+                let (candidate, reply, acceptance) = session.prepare_verified_document_link_capture(
+                    source, owner, document_generation, link_id, max_source_bytes, destination_stop)
+                    .map_err(AccessError::from)?;
+                Ok::<_, AccessError>((candidate, reply, move || acceptance.accept()))
+            }, origin_stop)
+        }, &mut stop);
+        cell.validate(epoch)?;
+        result
+    }
     pub(super) fn cancel(&self, handle: u64) -> Result<(), AccessError> {
         let cell = self.get(handle)?;
         if cell.closed.load(Ordering::Acquire) { return Err(AccessError::Closed); }

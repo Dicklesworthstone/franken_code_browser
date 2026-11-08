@@ -152,6 +152,76 @@ fn supplied_reader(readers: &ReaderSessions, handle: u64, label: &str, bytes: &[
 }
 
 #[test]
+fn verified_links_admit_destination_and_document_occurrence_before_source_access() {
+    let root = root(); let bytes = b"# Origin\n\n[Next](next.md)\n";
+    fs::write(root.join("README.md"), bytes).unwrap();
+    fs::write(root.join("next.md"), b"# Target\n").unwrap();
+    let catalogs = CatalogSessions::new(); let handle = opened(&catalogs, &root);
+    let readers = ReaderSessions::new();
+    let origin = readers.create().unwrap(); let occupied = readers.create().unwrap();
+    let destination = readers.create().unwrap();
+    supplied_reader(&readers, origin, "README.md", bytes); prepare_links(&readers, origin);
+    supplied_reader(&readers, occupied, "unrelated.md", b"already retained");
+    fs::rename(root.join("README.md"), root.join("moved.md")).unwrap();
+    assert!(matches!(catalogs.open_verified_document_link(handle, &readers, origin, occupied, 1, 1, 4096, || false),
+        Err(AccessError::Reader(ReaderError::AlreadyOpen))));
+    assert!(matches!(catalogs.open_verified_document_link(handle, &readers, origin, u64::MAX, 1, 1, 4096, || false),
+        Err(AccessError::Reader(ReaderError::UnknownHandle))));
+    assert!(matches!(catalogs.open_verified_document_link(handle, &readers, origin, origin, 1, 1, 4096, || false),
+        Err(AccessError::InvalidArgument)));
+    // A stale document fails at its retained occurrence even though its old
+    // source path is now missing. It must not attempt to infer a live link.
+    assert!(matches!(catalogs.open_verified_document_link(handle, &readers, origin, destination, 2, 1, 4096, || false),
+        Err(AccessError::Catalog(CatalogSessionError::Reader(_)))));
+    assert!(catalogs.open_verified_document_link(handle, &readers, origin, destination, 1, 1, 4096, || false).is_err());
+    assert!(matches!(readers.execute(destination, ReaderCommand::Info, || false), Err(ReaderError::NotOpen)));
+    fs::rename(root.join("moved.md"), root.join("README.md")).unwrap();
+    let receipt = catalogs.open_verified_document_link(handle, &readers, origin, destination, 1, 1, 4096, || false).unwrap();
+    assert!(receipt.as_str().contains("\"source_authority\":\"verified-current-source\""));
+    assert_eq!(number(receipt.as_str(), "source_verification_bytes_read"), bytes.len() as u64);
+    assert!(number(receipt.as_str(), "source_verification_read_calls") > 0);
+    assert_eq!(number(receipt.as_str(), "source_bytes_read"), b"# Target\n".len() as u64);
+    assert!(readers.execute(occupied, ReaderCommand::Window { offset: 0, bytes: 64 }, || false)
+        .unwrap().as_str().contains("already retained"));
+    readers.close(destination).unwrap(); readers.close(occupied).unwrap(); readers.close(origin).unwrap();
+    catalogs.close(handle).unwrap();
+}
+
+#[test]
+fn verified_links_observe_all_three_cancellation_epochs_and_allow_clean_retry() {
+    let root = root(); let bytes = b"# Origin\n\n[Next](next.md)\n";
+    fs::write(root.join("README.md"), bytes).unwrap();
+    fs::write(root.join("next.md"), b"# Target\n").unwrap();
+    let catalogs = CatalogSessions::new(); let handle = opened(&catalogs, &root);
+    let readers = ReaderSessions::new(); let origin = readers.create().unwrap();
+    supplied_reader(&readers, origin, "README.md", bytes); prepare_links(&readers, origin);
+    for canceled_owner in 0..3 {
+        let destination = readers.create().unwrap(); let mut requested = false; let mut polls = 0;
+        let result = catalogs.open_verified_document_link(handle, &readers, origin, destination, 1, 1, 4096, || {
+            polls += 1;
+            // with_retained polls once before destination admission. The next
+            // poll is inside the prepared capture with all three epochs held.
+            if polls == 2 {
+                requested = true;
+                match canceled_owner {
+                    0 => catalogs.cancel(handle).unwrap(),
+                    1 => readers.cancel(origin).unwrap(),
+                    _ => readers.cancel(destination).unwrap(),
+                }
+            }
+            false
+        });
+        assert!(requested && result.err().unwrap().canceled());
+        assert!(matches!(readers.execute(destination, ReaderCommand::Info, || false), Err(ReaderError::NotOpen)));
+        assert!(readers.execute(origin, ReaderCommand::Window { offset: 0, bytes: 4096 }, || false)
+            .unwrap().as_str().contains("[Next](next.md)"));
+        catalogs.open_verified_document_link(handle, &readers, origin, destination, 1, 1, 4096, || false).unwrap();
+        readers.close(destination).unwrap();
+    }
+    readers.close(origin).unwrap(); catalogs.close(handle).unwrap();
+}
+
+#[test]
 fn catalog_link_transfer_admits_destination_first_and_keeps_both_captures_independent() {
     let root = root();
     fs::write(root.join("README.md"), b"# Origin\n\n[Next](next.md#details)\n").unwrap();

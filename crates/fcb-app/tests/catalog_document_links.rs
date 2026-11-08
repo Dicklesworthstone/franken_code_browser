@@ -583,3 +583,210 @@ fn direct_targets_still_refuse_symlinks_and_missing_paths_without_source_receipt
     assert!(catalog.open_document_link(&origin, owner(75803), selection(&source, 1, 3), 4096, || false).is_err());
     assert_eq!(json(&catalog.page(source.page, || false).unwrap()).get("catalogued_files").number(), 1);
 }
+
+
+#[test]
+fn verified_relative_and_absolute_origins_bind_exact_labels_and_distinct_direct_receipts() {
+    for (index, absolute) in [false, true].into_iter().enumerate() {
+        let base = 75900 + index as u64 * 10;
+        let root = new_root();
+        let bytes = b"# Original\n\n[target](late.md#details)\n";
+        let target_bytes = b"# Late\n\n## Details\n\n[back](README.md)\n";
+        fs::write(root.join("README.md"), bytes).unwrap();
+        let (mut catalog, found) = catalog(&root, base + 1);
+        let source_row = row(&found, "README.md");
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let label = if absolute { canonical_root.join("README.md") } else { PathBuf::from("README.md") };
+        let mut origin = ReaderSession::from_bytes(owner(base + 2), &label, bytes, || false).unwrap();
+        prepare(&mut origin);
+        fs::write(root.join("late.md"), target_bytes).unwrap();
+        let (mut target, response, acceptance) = catalog.prepare_verified_document_link_capture(&origin,
+            owner(base + 3), 1, 1, 4096, || false).unwrap();
+        let response = json(&response);
+        assert_eq!(response.get("command").text(), "open-document-link");
+        assert_eq!(response.get("source_authority").text(), "verified-current-source");
+        assert_eq!(response.get("source_page_id").number(), 0);
+        assert_eq!(response.get("source_file_id").number(), FIRST_CATALOG_LINK_FILE_ID);
+        assert_eq!(response.get("source_capture_sha256").text(), origin.capture_sha256().to_hex());
+        assert_eq!(response.get("source_verification_bytes_read").number(), bytes.len() as u64);
+        assert!(response.get("source_verification_read_calls").number() > 0);
+        assert_eq!(response.get("target_resolution").text(), "root-grant-path");
+        assert_eq!(response.get("target_page_id").number(), 0);
+        assert_eq!(response.get("target_file").get("file_id").number(), FIRST_CATALOG_LINK_FILE_ID + 1);
+        assert_eq!(response.get("source_bytes_read").number(), target_bytes.len() as u64);
+        assert_eq!(response.get("fragment_status").text(), "resolved");
+        assert!(response.get("initial_original_offset").number() > 0);
+        assert_eq!(response.get("catalogued_files").number(), 1);
+        assert_eq!(target.capture().bytes(), target_bytes);
+        assert_eq!(origin.capture().bytes(), bytes);
+        assert_eq!(origin.document_generation(), Some(1));
+        acceptance.accept();
+        // The verified origin receives authority only for its exact raw label,
+        // including absolute labels. An equivalent label cannot impersonate it.
+        let source = Row { page: 0, file: FileId::new(owner(base + 1), FIRST_CATALOG_LINK_FILE_ID).unwrap(),
+            path: "README.md".into(), observed_bytes: bytes.len() as u64 };
+        let different_label = if absolute { PathBuf::from("README.md") } else { canonical_root.join("README.md") };
+        let mut relabeled = ReaderSession::from_bytes(owner(base + 2), &different_label, bytes, || false).unwrap();
+        prepare(&mut relabeled);
+        assert!(matches!(catalog.open_document_link(&relabeled, owner(base + 4), selection(&source, 1, 1), 4096, || false),
+            Err(CatalogSessionError::ReaderReceiptMismatch)));
+        catalog.open_document_link(&origin, owner(base + 4), selection(&source, 1, 1), 4096, || false).unwrap();
+        prepare(&mut target);
+        let target_row = Row { page: 0, file: FileId::new(owner(base + 1), FIRST_CATALOG_LINK_FILE_ID + 1).unwrap(),
+            path: "late.md".into(), observed_bytes: target_bytes.len() as u64 };
+        let (back, back_response) = catalog.open_document_link(&target, owner(base + 5), selection(&target_row, 1, 1), 4096, || false).unwrap();
+        assert_eq!(json(&back_response).get("target_file").get("file_id").number(), source_row.file.get());
+        assert_eq!(back.capture().bytes(), bytes);
+    }
+}
+
+#[test]
+fn verified_source_changes_and_caller_limit_refuse_without_receipts_or_identity_consumption() {
+    let root = new_root();
+    let bytes = b"# Original\n\n[target](target.md)\n";
+    fs::write(root.join("README.md"), bytes).unwrap();
+    fs::write(root.join("target.md"), b"# Target\n").unwrap();
+    let (mut catalog, _) = catalog(&root, 76001);
+    let mut origin = ReaderSession::from_bytes(owner(76002), Path::new("README.md"), bytes, || false).unwrap();
+    prepare(&mut origin);
+    assert!(matches!(catalog.prepare_verified_document_link_capture(&origin, owner(76003), 1, 1,
+        bytes.len() - 1, || false), Err(CatalogSessionError::InvalidLimits)));
+    let mut changed_same_length = bytes.to_vec(); changed_same_length[2] = b'X';
+    for changed in [changed_same_length, b"changed".to_vec(), vec![b'x'; bytes.len() + 1]] {
+        fs::write(root.join("README.md"), changed).unwrap();
+        let error = catalog.prepare_verified_document_link_capture(&origin, owner(76003), 1, 1, 4096, || false).err().unwrap();
+        assert_eq!(error, CatalogSessionError::OriginCaptureChanged);
+        assert_eq!(error.to_string(), "CATALOG_SESSION_ORIGIN_CAPTURE_CHANGED");
+        assert_eq!(origin.capture().bytes(), bytes);
+    }
+    fs::write(root.join("README.md"), bytes).unwrap();
+    let (_, response, acceptance) = catalog.prepare_verified_document_link_capture(&origin, owner(76003), 1, 1, 4096, || false).unwrap();
+    assert_eq!(json(&response).get("source_file_id").number(), FIRST_CATALOG_LINK_FILE_ID);
+    acceptance.accept();
+}
+
+#[test]
+fn verified_origins_refuse_path_aliases_outside_roots_and_symlinks() {
+    let root = new_root(); let outside = new_root();
+    let bytes = b"# Guide\n\n[target](target.md)\n";
+    fs::write(root.join("README.md"), bytes).unwrap(); fs::write(root.join("target.md"), b"target").unwrap();
+    fs::write(outside.join("README.md"), bytes).unwrap();
+    let (mut catalog, _) = catalog(&root, 76101);
+    let canonical_root = fs::canonicalize(&root).unwrap();
+    let labels = [outside.join("README.md"), canonical_root.join("./README.md"),
+        PathBuf::from("./README.md"), PathBuf::from("../README.md"), PathBuf::from("docs//README.md"),
+        PathBuf::from("docs\\README.md")];
+    for (index, label) in labels.into_iter().enumerate() {
+        let mut origin = ReaderSession::from_bytes(owner(76110 + index as u64), &label, bytes, || false).unwrap();
+        prepare(&mut origin);
+        assert!(matches!(catalog.prepare_verified_document_link_capture(&origin, owner(76103), 1, 1, 4096, || false),
+            Err(CatalogSessionError::Source(SourceError::PathEscape))));
+    }
+    symlink(outside.join("README.md"), root.join("linked.md")).unwrap();
+    symlink(&outside, root.join("linked")).unwrap();
+    for (index, label) in ["linked.md", "linked/README.md"].into_iter().enumerate() {
+        let mut origin = ReaderSession::from_bytes(owner(76120 + index as u64), Path::new(label), bytes, || false).unwrap();
+        prepare(&mut origin);
+        assert!(matches!(catalog.prepare_verified_document_link_capture(&origin, owner(76103), 1, 1, 4096, || false),
+            Err(CatalogSessionError::Source(SourceError::SymlinkForbidden))));
+    }
+}
+
+#[test]
+fn verified_document_occurrences_are_checked_before_root_io() {
+    let root = new_root(); let bytes = b"[target](target.md)\n";
+    fs::write(root.join("README.md"), bytes).unwrap();
+    let (mut catalog, _) = catalog(&root, 76201);
+    let mut origin = ReaderSession::from_bytes(owner(76202), Path::new("README.md"), bytes, || false).unwrap();
+    prepare(&mut origin);
+    let stale_document = origin.document_link_destination(2, 1).err().unwrap();
+    let missing_link = origin.document_link_destination(1, 99).err().unwrap();
+    catalog.grant().revoke();
+    assert!(matches!(catalog.prepare_verified_document_link_capture(&origin, owner(76203), 2, 1, 4096, || false),
+        Err(CatalogSessionError::Reader(error)) if error == stale_document));
+    assert!(matches!(catalog.prepare_verified_document_link_capture(&origin, owner(76203), 1, 99, 4096, || false),
+        Err(CatalogSessionError::Reader(error)) if error == missing_link));
+    assert!(matches!(catalog.prepare_verified_document_link_capture(&origin, owner(76203), 1, 1, 4096, || false),
+        Err(CatalogSessionError::Source(SourceError::GrantRevoked))));
+    assert_eq!(origin.capture().bytes(), bytes);
+}
+
+#[test]
+fn discarded_verified_delivery_cannot_publish_origin_or_target_authority() {
+    let root = new_root(); let bytes = b"[target](late.md)\n";
+    fs::write(root.join("README.md"), bytes).unwrap();
+    let (mut catalog, _) = catalog(&root, 76301);
+    let mut origin = ReaderSession::from_bytes(owner(76302), Path::new("README.md"), bytes, || false).unwrap();
+    prepare(&mut origin);
+    fs::write(root.join("late.md"), b"[back](README.md)\n").unwrap();
+    let (mut rejected, response, acceptance) = catalog.prepare_verified_document_link_capture(&origin,
+        owner(76303), 1, 1, 4096, || false).unwrap();
+    let response = json(&response);
+    let source = Row { page: 0, file: FileId::new(owner(76301), response.get("source_file_id").number()).unwrap(),
+        path: "README.md".into(), observed_bytes: bytes.len() as u64 };
+    let target = Row { page: 0, file: FileId::new(owner(76301), response.get("target_file").get("file_id").number()).unwrap(),
+        path: "late.md".into(), observed_bytes: 0 };
+    drop(acceptance);
+    prepare(&mut rejected);
+    for (reader, row) in [(&origin, &source), (&rejected, &target)] {
+        assert!(matches!(catalog.open_document_link(reader, owner(76304), selection(row, 1, 1), 4096, || false),
+            Err(CatalogSessionError::StaleReaderReceipt)));
+    }
+    let (_, accepted, acceptance) = catalog.prepare_verified_document_link_capture(&origin,
+        owner(76305), 1, 1, 4096, || false).unwrap();
+    let accepted = json(&accepted);
+    assert_eq!(accepted.get("source_file_id").number(), source.file.get());
+    assert_eq!(accepted.get("target_file").get("file_id").number(), target.file.get());
+    acceptance.accept();
+}
+
+
+#[test]
+fn verified_origins_accept_only_canonical_and_originally_admitted_root_spellings() {
+    let container = new_root();
+    let physical_parent = container.join("physical"); fs::create_dir(&physical_parent).unwrap();
+    let root = physical_parent.join("project"); fs::create_dir(&root).unwrap();
+    let admitted_parent = container.join("selected-parent"); symlink(&physical_parent, &admitted_parent).unwrap();
+    let admitted_root = admitted_parent.join("project");
+    let unrelated_parent = container.join("unadmitted-parent"); symlink(&physical_parent, &unrelated_parent).unwrap();
+    let bytes = b"# Guide\n\n[target](target.md)\n";
+    fs::write(root.join("README.md"), bytes).unwrap(); fs::write(root.join("target.md"), b"granted target").unwrap();
+    // The selected root itself is a directory; only an ancestor is a symlink.
+    // This is the same distinction as ordinary macOS /var and /private/var.
+    assert!(!fs::symlink_metadata(&admitted_root).unwrap().file_type().is_symlink());
+    let (mut catalog, _) = catalog(&admitted_root, 76401);
+    let canonical_root = fs::canonicalize(&root).unwrap();
+    for (index, label) in [canonical_root.join("README.md"), admitted_root.join("README.md")].into_iter().enumerate() {
+        let mut origin = ReaderSession::from_bytes(owner(76410 + index as u64), &label, bytes, || false).unwrap();
+        prepare(&mut origin);
+        let (target, response, acceptance) = catalog.prepare_verified_document_link_capture(&origin,
+            owner(76420 + index as u64), 1, 1, 4096, || false).unwrap();
+        assert_eq!(target.capture().bytes(), b"granted target");
+        assert_eq!(json(&response).get("source_verification_bytes_read").number(), bytes.len() as u64);
+        assert_eq!(origin.path().as_os_str(), label.as_os_str());
+        acceptance.accept();
+    }
+    // An admitted spelling can itself start with the canonical root. Choosing
+    // the shorter canonical prefix would incorrectly treat its symlinked root
+    // alias as a source-path component and refuse this legitimate selection.
+    symlink(canonical_root.parent().unwrap(), canonical_root.join("up")).unwrap();
+    let nested_root = canonical_root.join("up/project");
+    let mut nested_catalog = CatalogSession::open(owner(76451), &nested_root, || false).unwrap();
+    let mut nested_origin = ReaderSession::from_bytes(owner(76452), &nested_root.join("README.md"), bytes, || false).unwrap();
+    prepare(&mut nested_origin);
+    let (target, _, acceptance) = nested_catalog.prepare_verified_document_link_capture(&nested_origin,
+        owner(76453), 1, 1, 4096, || false).unwrap();
+    assert_eq!(target.capture().bytes(), b"granted target");
+    acceptance.accept();
+    // A different alias to the SAME object was never admitted by project open.
+    // Caller labels do not trigger canonicalization, and admitted prefixes do
+    // not permit newly inserted dot components or repeated separators either.
+    let labels = [unrelated_parent.join("project/README.md"), admitted_root.join("./README.md"),
+        admitted_root.join("sub/../README.md"), admitted_root.join("sub//README.md")];
+    for (index, label) in labels.into_iter().enumerate() {
+        let mut origin = ReaderSession::from_bytes(owner(76430 + index as u64), &label, bytes, || false).unwrap();
+        prepare(&mut origin);
+        assert!(matches!(catalog.prepare_verified_document_link_capture(&origin, owner(76440), 1, 1, 4096, || false),
+            Err(CatalogSessionError::Source(SourceError::PathEscape))));
+    }
+}

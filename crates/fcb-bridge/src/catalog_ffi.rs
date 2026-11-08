@@ -60,7 +60,7 @@ pub extern "C" fn fcb_catalog_open_reader(handle: u64, reader: u64, page: u64, f
     }))
 }
 /// Follow a parsed local reference from an exact catalog-issued capture into
-/// an EMPTY independent reader. The shared host resolves retained membership.
+/// an EMPTY independent reader under the catalog's existing root grant.
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_catalog_open_document_link(handle: u64, origin: u64, destination: u64,
     source_page: u64, source_file: u64, document_generation: u64, link_id: u64,
@@ -68,6 +68,20 @@ pub extern "C" fn fcb_catalog_open_document_link(handle: u64, origin: u64, desti
     reply(|| answer(handle, |catalogs| {
         let readers = super::reader_ffi::registry().ok_or(super::reader_sessions::AccessError::UnknownHandle)?;
         catalogs.open_document_link(handle, readers, origin, destination, source_page, source_file,
+            document_generation, link_id, number(max_source_bytes)?, || false)
+    }))
+}
+/// Follow an inventoried local reference from another retained reader after
+/// verifying its complete original bytes under this catalog's active root.
+/// Path labels alone never authorize the read; the host checks the root-relative
+/// path, bounded current source capture, exact bytes and document occurrence.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_catalog_open_verified_document_link(handle: u64, origin: u64,
+    destination: u64, document_generation: u64, link_id: u64,
+    max_source_bytes: u64) -> *mut c_char {
+    reply(|| answer(handle, |catalogs| {
+        let readers = super::reader_ffi::registry().ok_or(super::reader_sessions::AccessError::UnknownHandle)?;
+        catalogs.open_verified_document_link(handle, readers, origin, destination,
             document_generation, link_id, number(max_source_bytes)?, || false)
     }))
 }

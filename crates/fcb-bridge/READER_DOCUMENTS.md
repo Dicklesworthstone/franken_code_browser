@@ -92,6 +92,29 @@ identity and receipt publish only when the destination accepts the capture.
 Native consumers validate these identity domains explicitly rather than treating
 a direct capture as a metadata page. Both kinds can originate further links.
 
+Atlas, search, Quick Open, supplied-source and pinned readers can explicitly use
+`fcb_catalog_open_verified_document_link` with the existing project catalog. The
+host first checks the exact accepted document generation and parser occurrence,
+then verifies the origin's complete bytes at its root-relative candidate path
+under the active grant. An absolute source label must lie under the canonical
+project root or the exact root spelling admitted when the project opened. This
+supports native folder aliases such as macOS `/var` and `/private/var`; every
+read still uses the canonical grant, and arbitrary source labels are never
+canonicalized into authority. A label and matching digest alone do not authorize a transfer:
+the complete current source must match the retained original bytes. A changed
+origin reports `CATALOG_SESSION_ORIGIN_CAPTURE_CHANGED`, preserving the old
+reader so the user can choose whether to refresh it.
+
+This route labels `source_authority` as `verified-current-source` and reports
+`source_verification_bytes_read` and `source_verification_read_calls` separately
+from target acquisition. Both reads obey the supplied capture limit and existing
+path/no-follow checks. Verification does not advance discovery. The native host
+checks the origin's accepted digest, registry domain, capture identity and
+document inventory before accepting the independent linked reader. The main and
+pinned source views keep their originating reader and position while the target
+opens; returning closes only that target. Failed or canceled navigation preserves
+both already accepted captures. External references remain inert.
+
 The target opens as a new capture in an empty destination reader. Source, target
 and catalog cancellation epochs cover the transfer, and target admission precedes
 source I/O. The native host preserves the originating reader in one pane and

@@ -50,7 +50,7 @@ const FIRST_WINDOW_BYTES: usize = 16 * 1024;
 pub enum CatalogSessionError {
     App(AppError), Source(SourceError), Reader(ReaderSessionError),
     InvalidLimits, ForeignOwner, StalePage, MissingFile, NoMorePages,
-    StaleReaderReceipt, ReaderReceiptMismatch, UnsupportedDocumentLink,
+    StaleReaderReceipt, ReaderReceiptMismatch, OriginCaptureChanged, UnsupportedDocumentLink,
     LinkTargetNotRetained, AmbiguousLinkTarget,
     Canceled, IdentityExhausted,
 }
@@ -77,6 +77,7 @@ impl std::fmt::Display for CatalogSessionError {
             Self::NoMorePages => f.write_str("CATALOG_SESSION_NO_MORE_PAGES"),
             Self::StaleReaderReceipt => f.write_str("CATALOG_SESSION_STALE_READER_RECEIPT"),
             Self::ReaderReceiptMismatch => f.write_str("CATALOG_SESSION_READER_RECEIPT_MISMATCH"),
+            Self::OriginCaptureChanged => f.write_str("CATALOG_SESSION_ORIGIN_CAPTURE_CHANGED"),
             Self::UnsupportedDocumentLink => f.write_str("CATALOG_SESSION_UNSUPPORTED_DOCUMENT_LINK"),
             Self::LinkTargetNotRetained => f.write_str("CATALOG_SESSION_LINK_TARGET_NOT_RETAINED"),
             Self::AmbiguousLinkTarget => f.write_str("CATALOG_SESSION_AMBIGUOUS_LINK_TARGET"),
@@ -96,6 +97,9 @@ struct CatalogPage { id: u64, files: Vec<CatalogFile>, path_bytes: usize }
 
 pub struct CatalogSession {
     grant: RootGrant,
+    // Bounded exact spelling admitted at open, before canonicalization. It is
+    // a label alias only; all later acquisition uses the canonical grant.
+    requested_root: RawPath,
     root_identity: DirectoryId,
     discovery: Option<BoundedDiscovery>,
     aggregate: DiscoveryAggregate,
@@ -125,6 +129,7 @@ impl CatalogSession {
         let lease = budget.try_reserve_managed(owner, allocation(1)?,
             ByteLength::new(STATE_BYTES + size_of::<Self>() as u64)).map_err(|_| AppError::Admission)?;
         let root = input::absolute(root)?;
+        let requested_root = RawPath::from_path(&root);
         let metadata = fs::symlink_metadata(&root).map_err(|_| AppError::Io)?;
         if metadata.file_type().is_symlink() { return Err(AppError::Symlink.into()); }
         if !metadata.is_dir() { return Err(AppError::InvalidRange.into()); }
@@ -139,7 +144,7 @@ impl CatalogSession {
         let mut pages = VecDeque::new();
         pages.try_reserve_exact(MAX_CATALOG_RETAINED_PAGES).map_err(|_| AppError::Admission)?;
         if pages.capacity() > MAX_CATALOG_RETAINED_PAGES { return Err(AppError::Admission.into()); }
-        let mut session = Self { grant, root_identity, discovery: Some(discovery), aggregate: DiscoveryAggregate::default(),
+        let mut session = Self { grant, requested_root, root_identity, discovery: Some(discovery), aggregate: DiscoveryAggregate::default(),
             pages, latest_page: 0, catalogued_files: 0, next_link_file: FIRST_CATALOG_LINK_FILE_ID, complete: false, paused: false,
             reader_receipts: document_links::CatalogReaderReceipts::default(), next_allocation: 2, budget, _lease: lease };
         session.consume_page(&mut canceled)?;

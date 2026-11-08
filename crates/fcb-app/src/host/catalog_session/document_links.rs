@@ -11,9 +11,9 @@
 
 use fcb::{ArenaOwnerId, FileId};
 use fcb::document::resolve_document_destination;
-use fcb::source::{CaptureRequest, NormalizedPath, RawPath};
+use fcb::source::{CaptureRequest, NormalizedPath, RawPath, SourceError};
 use fcb::store::Sha256Digest;
-use super::{CatalogSession, CatalogSessionError, HostResponse, ReaderSession,
+use super::{AppError, CatalogSession, CatalogSessionError, HostError, HostResponse, ReaderSession, ReaderSessionError,
     FIRST_WINDOW_BYTES, MAX_CATALOG_PATH_BYTES, MAX_READER_SOURCE_BYTES, check};
 
 pub const MAX_CATALOG_READER_RECEIPTS: usize = 8;
@@ -39,6 +39,9 @@ struct CatalogReaderReceipt {
     request: CaptureRequest,
     digest: Sha256Digest,
     path: RawPath,
+    // Relative resolution and exact reader-label identity are separate. A
+    // verified ordinary reader can have an absolute label under this root.
+    label: RawPath,
 }
 impl CatalogReaderReceipt {
     fn new(page: u64, file: FileId, path: &NormalizedPath, reader: &ReaderSession)
@@ -49,10 +52,37 @@ impl CatalogReaderReceipt {
         Ok(Self {
             owner: reader.capture().request().file().owner(), page, file,
             request: *reader.capture().request(), digest: reader.capture_sha256(),
-            path: path.raw().clone(),
+            path: path.raw().clone(), label: path.raw().clone(),
         })
     }
     fn path(&self) -> &[u8] { self.path.as_bytes() }
+    fn validate(&self, origin: &ReaderSession, selection: CatalogDocumentLinkSelection)
+        -> Result<(), CatalogSessionError> {
+        if self.page != selection.source_page || self.file != selection.source_file
+            || self.request != *origin.capture().request() || self.digest != origin.capture_sha256()
+            || origin.path().as_os_str() != self.label.to_path_buf().as_os_str() {
+            return Err(CatalogSessionError::ReaderReceiptMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SourceAuthority {
+    Retained,
+    Verified { bytes_read: u64, read_calls: u64 },
+}
+impl SourceAuthority {
+    fn name(self) -> &'static str {
+        match self { Self::Retained => "retained-catalog-capture", Self::Verified { .. } => "verified-current-source" }
+    }
+}
+
+struct LinkOrigin {
+    receipt: CatalogReaderReceipt,
+    selection: CatalogDocumentLinkSelection,
+    authority: SourceAuthority,
+    next_link_file: u64,
 }
 
 /// A completed catalog capture whose receipt has not yet been accepted by its
@@ -156,27 +186,128 @@ impl CatalogSession {
         // root metadata or target read. Equal labels or equal digests alone do
         // not grant this reader the receipt of a different source owner.
         let receipt = self.link_origin(origin, selection)?;
+        let link = LinkOrigin { receipt, selection, authority: SourceAuthority::Retained,
+            next_link_file: self.next_link_file };
+        self.prepare_link_target_capture(origin, reader_owner, link, max_source_bytes, &mut canceled)
+    }
+
+    /// Establish authority for an existing supplied, search or pinned reader by
+    /// comparing its exact immutable bytes with a CURRENT observation under this
+    /// root. The label alone conveys no authority. Verification does not replace
+    /// the origin, and both receipts remain unpublished until target acceptance.
+    pub fn prepare_verified_document_link_capture<'catalog>(&'catalog mut self,
+        origin: &ReaderSession, reader_owner: ArenaOwnerId, document_generation: u64,
+        link_id: u64, max_source_bytes: usize, mut canceled: impl FnMut() -> bool)
+        -> Result<(ReaderSession, HostResponse, CatalogReaderAcceptance<'catalog>), CatalogSessionError> {
+        check(&mut canceled)?;
+        let origin_owner = origin.capture().request().file().owner();
+        if reader_owner == self.owner() || origin_owner == self.owner() || reader_owner == origin_owner {
+            return Err(CatalogSessionError::ForeignOwner);
+        }
+        if max_source_bytes == 0 || max_source_bytes > MAX_READER_SOURCE_BYTES
+            || origin.capture().bytes().len() > max_source_bytes {
+            return Err(CatalogSessionError::InvalidLimits);
+        }
+        // Reject stale parser occurrences before even root metadata is touched.
+        let destination = origin.document_link_destination(document_generation, link_id)?;
+        let root = self.grant.root_path().to_path_buf();
+        let requested_root = self.requested_root.to_path_buf();
+        let (relative, label_root) = if origin.path().is_absolute() {
+            [root.as_path(), requested_root.as_path()].into_iter().filter_map(|label_root| {
+                // Permit only the canonical root or the exact originally
+                // admitted spelling (for example /var versus /private/var).
+                // Never canonicalize a caller's label or follow its aliases.
+                // Prefer the longest approved prefix when these names overlap.
+                let clean: std::path::PathBuf = label_root.components().collect();
+                if clean.as_os_str() != label_root.as_os_str()
+                    || label_root.components().any(|part| matches!(part, std::path::Component::ParentDir | std::path::Component::CurDir)) {
+                    return None;
+                }
+                let relative = origin.path().strip_prefix(label_root).ok()?;
+                if label_root.join(relative).as_os_str() != origin.path().as_os_str() { return None; }
+                Some((relative, label_root))
+            }).max_by_key(|(_, label_root)| label_root.as_os_str().len()).ok_or(SourceError::PathEscape)?
+        } else { (origin.path(), root.as_path()) };
+        let raw_relative = RawPath::from_path(relative);
+        if raw_relative.len() > MAX_CATALOG_PATH_BYTES { return Err(CatalogSessionError::InvalidLimits); }
+        let path = NormalizedPath::new(raw_relative.clone())?;
+        // Neither external separator normalization nor Path's component-wise
+        // equality may reinterpret a native label into another filesystem name.
+        if path.as_bytes() != raw_relative.as_bytes()
+            || (origin.path().is_absolute()
+                && label_root.join(path.raw().to_path_buf()).as_os_str() != origin.path().as_os_str()) {
+            return Err(SourceError::PathEscape.into());
+        }
+        let source_path = std::str::from_utf8(path.as_bytes())
+            .map_err(|_| CatalogSessionError::UnsupportedDocumentLink)?;
+        let (destination_path, _) = resolve_document_destination(source_path, destination)
+            .ok_or(CatalogSessionError::UnsupportedDocumentLink)?;
+        if destination_path.len() > MAX_CATALOG_PATH_BYTES { return Err(CatalogSessionError::InvalidLimits); }
+        self.validate_active()?; check(&mut canceled)?;
+        let source = crate::workspace::checked_source_path(&root, &path)?;
+        let (bytes_read, read_calls) = {
+            let raw = {
+                let mut stop = || canceled() || self.validate_active().is_err();
+                // A larger current file cannot equal the retained capture. Limit
+                // acquisition to that original length; never create a second
+                // ReaderSession or keep verification bytes during target capture.
+                let result = super::super::read_bytes_with_limit(&source,
+                    origin.capture().bytes().len().max(1), MAX_READER_SOURCE_BYTES, &mut stop);
+                self.validate_active()?; check(&mut canceled)?;
+                result.map_err(|error| match error {
+                    HostError::App(AppError::InputLimit | AppError::SourceChanged) => CatalogSessionError::OriginCaptureChanged,
+                    error => CatalogSessionError::Reader(ReaderSessionError::Host(error)),
+                })?
+            };
+            if raw.bytes.len() != origin.capture().bytes().len() {
+                return Err(CatalogSessionError::OriginCaptureChanged);
+            }
+            for (current, retained) in raw.bytes.chunks(64 * 1024).zip(origin.capture().bytes().chunks(64 * 1024)) {
+                check(&mut canceled)?;
+                if current != retained { return Err(CatalogSessionError::OriginCaptureChanged); }
+            }
+            self.validate_active()?; check(&mut canceled)?;
+            (raw.bytes.len() as u64, raw.read_calls)
+        };
+        let file = FileId::new(self.owner(), self.next_link_file).map_err(|_| CatalogSessionError::IdentityExhausted)?;
+        let next_link_file = self.next_link_file.checked_add(1).ok_or(CatalogSessionError::IdentityExhausted)?;
+        let mut receipt = CatalogReaderReceipt::new(0, file, &path, origin)?;
+        receipt.label = RawPath::from_path(origin.path());
+        let selection = CatalogDocumentLinkSelection { source_page: 0, source_file: file, document_generation, link_id };
+        let link = LinkOrigin { receipt, selection, authority: SourceAuthority::Verified { bytes_read, read_calls }, next_link_file };
+        self.prepare_link_target_capture(origin, reader_owner, link, max_source_bytes, &mut canceled)
+    }
+
+    fn prepare_link_target_capture<'catalog>(&'catalog mut self, origin: &ReaderSession,
+        reader_owner: ArenaOwnerId, link: LinkOrigin, max_source_bytes: usize,
+        canceled: &mut impl FnMut() -> bool)
+        -> Result<(ReaderSession, HostResponse, CatalogReaderAcceptance<'catalog>), CatalogSessionError> {
+        let LinkOrigin { receipt, selection, authority, next_link_file } = link;
+        let origin_owner = origin.capture().request().file().owner();
         let destination = origin.document_link_destination(selection.document_generation, selection.link_id)?;
         let source_path = std::str::from_utf8(receipt.path())
             .map_err(|_| CatalogSessionError::UnsupportedDocumentLink)?;
         let (path, suffix) = resolve_document_destination(source_path, destination)
             .ok_or(CatalogSessionError::UnsupportedDocumentLink)?;
-        let target = self.link_target(path.as_bytes(), &mut canceled)?;
-        self.validate_active()?; check(&mut canceled)?;
+        let target = self.link_target(path.as_bytes(), next_link_file, canceled)?;
+        self.validate_active()?; check(canceled)?;
         let (mut reader, info, initial_window, source_bytes, source_calls) =
-            self.capture_reader(reader_owner, &target.path, max_source_bytes, &mut canceled)?;
-        let (fragment_resolution, fragment_slug) = reader.resolve_document_fragment(&suffix, &mut canceled)?;
+            self.capture_reader(reader_owner, &target.path, max_source_bytes, canceled)?;
+        let (fragment_resolution, fragment_slug) = reader.resolve_document_fragment(&suffix, &mut *canceled)?;
         let initial_original_offset = fragment_resolution.range().map(|range| range.start().get()).unwrap_or(0);
         let window = if initial_original_offset == 0 { initial_window } else {
             drop(initial_window);
-            reader.read_window(initial_original_offset, FIRST_WINDOW_BYTES, &mut canceled)?
+            reader.read_window(initial_original_offset, FIRST_WINDOW_BYTES, &mut *canceled)?
         };
         // Explicitly revalidate both authorities after acquisition. The source
         // reader is immutable under this borrow, and the bridge's cancellation
         // closure also covers its close/replacement epoch.
-        self.link_origin(origin, selection)?;
+        match authority {
+            SourceAuthority::Retained => { self.link_origin(origin, selection)?; }
+            SourceAuthority::Verified { .. } => receipt.validate(origin, selection)?,
+        }
         origin.document_link_destination(selection.document_generation, selection.link_id)?;
-        self.validate_active()?; check(&mut canceled)?;
+        self.validate_active()?; check(canceled)?;
         let mut out = self.output("open-document-link")?;
         for (key, value) in [("source_page_id", selection.source_page),
             ("source_file_id", selection.source_file.get()), ("source_reader_owner", origin_owner.get()),
@@ -184,8 +315,12 @@ impl CatalogSession {
             ("target_page_id", target.page), ("reader_owner", reader_owner.get())] {
             out.literal(",")?; out.quoted(key)?; out.literal(":")?; out.integer(value)?;
         }
-        out.literal(",\"source_authority\":\"retained-catalog-capture\",\"target_resolution\":")?;
-        out.quoted(target.resolution())?;
+        out.literal(",\"source_authority\":")?; out.quoted(authority.name())?;
+        if let SourceAuthority::Verified { bytes_read, read_calls } = authority {
+            out.literal(",\"source_verification_bytes_read\":")?; out.integer(bytes_read)?;
+            out.literal(",\"source_verification_read_calls\":")?; out.integer(read_calls)?;
+        }
+        out.literal(",\"target_resolution\":")?; out.quoted(target.resolution())?;
         out.literal(",\"source_capture_sha256\":")?; out.quoted(&receipt.digest.to_hex())?;
         out.literal(",\"target_file\":{\"file_id\":")?; out.integer(target.file.get())?;
         out.literal(",\"path\":")?; out.path(&target.path.raw().to_path_buf())?;
@@ -206,7 +341,7 @@ impl CatalogSession {
         out.literal(",\"initial_original_offset\":")?; out.integer(initial_original_offset)?;
         out.literal(",\"reader\":")?; out.literal(info.as_str())?;
         out.literal(",\"window\":")?; out.literal(window.as_str())?; out.literal("}\n")?;
-        let response = self.finish(out, &mut canceled)?;
+        let response = self.finish(out, canceled)?;
         self.validate_active()?;
         // Refresh the origin only when the receiving owner accepts this reader.
         // A rejected candidate must neither grant a reusable empty handle nor
@@ -222,15 +357,11 @@ impl CatalogSession {
         let owner = origin.capture().request().file().owner();
         let receipt = self.reader_receipts.recent.iter().flatten().find(|receipt| receipt.owner == owner)
             .cloned().ok_or(CatalogSessionError::StaleReaderReceipt)?;
-        if receipt.page != selection.source_page || receipt.file != selection.source_file
-            || receipt.request != *origin.capture().request() || receipt.digest != origin.capture_sha256()
-            || origin.path().as_os_str() != receipt.path.to_path_buf().as_os_str() {
-            return Err(CatalogSessionError::ReaderReceiptMismatch);
-        }
+        receipt.validate(origin, selection)?;
         Ok(receipt)
     }
 
-    fn link_target(&self, path: &[u8], canceled: &mut impl FnMut() -> bool)
+    fn link_target(&self, path: &[u8], next_link_file: u64, canceled: &mut impl FnMut() -> bool)
         -> Result<Target, CatalogSessionError> {
         let mut target = None;
         for page in &self.pages {
@@ -240,14 +371,14 @@ impl CatalogSession {
                 if target.is_some() { return Err(CatalogSessionError::AmbiguousLinkTarget); }
                 target = Some(Target { page: page.id, file: file.id,
                     path: file.path.clone(), observed_bytes: Some(file.observed_bytes),
-                    next_link_file: self.next_link_file });
+                    next_link_file });
             }
         }
         if let Some(target) = target { return Ok(target); }
         if path.len() > MAX_CATALOG_PATH_BYTES { return Err(CatalogSessionError::InvalidLimits); }
-        let next_link_file = self.next_link_file.checked_add(1).ok_or(CatalogSessionError::IdentityExhausted)?;
-        Ok(Target { page: 0,
-            file: FileId::new(self.owner(), self.next_link_file).map_err(|_| CatalogSessionError::IdentityExhausted)?,
+        let file = FileId::new(self.owner(), next_link_file).map_err(|_| CatalogSessionError::IdentityExhausted)?;
+        let next_link_file = next_link_file.checked_add(1).ok_or(CatalogSessionError::IdentityExhausted)?;
+        Ok(Target { page: 0, file,
             path: NormalizedPath::new(RawPath::from_bytes(path))?, observed_bytes: None, next_link_file })
     }
 }
