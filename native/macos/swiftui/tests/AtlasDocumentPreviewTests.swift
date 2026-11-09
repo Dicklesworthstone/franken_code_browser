@@ -13,6 +13,12 @@ import Foundation
     var generation: UInt64 = 0
     var identity = Fixture.identity()
     var inventory: AtlasReaderDocumentInventory?
+    var totalLines: UInt64 = 1024
+    var unmappedRows: Set<UInt64> = []
+    var lastSourceAnchor: UInt64? {
+        guard let request = requests.last, case .fromSource(let offset) = request else { return nil }
+        return offset
+    }
 
     static func identity(owner: UInt64 = 1, revision: UInt64 = 1,
                          bytes: UInt64 = 64000, encoding: String = "utf8", path: String = "/repo/readme.md") -> AtlasReaderIdentity {
@@ -36,18 +42,23 @@ import Foundation
         let (continuation, value) = pending.remove(at: index)
         continuation.resume(returning: replacement ?? value)
     }
+    func reject(_ error: AtlasReaderError, at index: Int = 0) {
+        let (continuation, _) = pending.remove(at: index)
+        continuation.resume(throwing: error)
+    }
     func response(_ request: AtlasReaderDocumentRequest) throws -> AtlasReaderDocumentResult {
         if case .prepare(let width) = request {
             generation += 1
             inventory = .init(identity: identity, generation: generation, width: width,
-                totalLines: 1024, totalHeadings: 130, renderedBytes: 16384, sourceBase: 3)
+                totalLines: totalLines, totalHeadings: 130, renderedBytes: 16384, sourceBase: 3)
             return .prepared(page(first: 0), headings(first: 0))
         }
         switch request {
         case .window(let first): return .page(page(first: first))
         case .headings(let first): return .headings(headings(first: first))
         case .heading(let target): return .page(page(first: target.heading.renderedOffset / 16))
-        case .fromSource(let offset): return .page(page(first: offset == 3 ? 0 : 128))
+        case .fromSource(let offset):
+            return .page(page(first: offset == identity.capturedBytes ? totalLines : (offset == 3 ? 0 : 128)))
         case .source(let target):
             return .source(.init(target: target, visible: .init(start: 3, end: 8), text: "# hi\n",
                 originalHex: "232068690a", enclosingOriginal: .init(start: 3, end: 7),
@@ -96,7 +107,7 @@ import Foundation
             let rendered = AtlasDocumentByteRange(start: row * 16, end: row * 16 + 15)
             let original = AtlasDocumentByteRange(start: 3 + row * 8, end: 7 + row * 8)
             lines.append(AtlasReaderDocumentLine(id: row, text: "Row \(row)",
-                rendered: rendered, enclosingOriginal: original))
+                rendered: rendered, enclosingOriginal: unmappedRows.contains(row) ? nil : original))
         }
         return .init(id: UUID(), inventory: inventory, first: first, lines: lines,
             next: end < inventory.totalLines ? end : nil, wholeDocumentVisible: first == 0 && end == inventory.totalLines)
@@ -269,6 +280,7 @@ import Foundation
             f.held = true
             m.widthInput = "80"; m.prepare(); await wait { f.pending.count == 1 }
             m.widthInput = "100"; m.prepare(); await wait { f.pending.count == 2 }
+            f.held = false
             f.release(1); await wait { !m.busy }
             let accepted = m.page!.id
             f.release(); await settle()
@@ -362,8 +374,215 @@ import Foundation
                   && m.sourceOffset(for: target, reader: f.identity) == 3,
                   "The matching enclosing-block receipt enables source navigation")
         }
+        await anchoredPreparation()
         await documentLinks()
         print("AtlasDocumentPreviewTests: \(checks) checks passed")
+    }
+
+    @MainActor private static func anchoredPreparation() async {
+        do {
+            let f = Fixture(), m = f.model()
+            m.bind(identity: f.identity, sourceOffset: 512)
+            f.held = true
+            m.prepare(); await wait { f.pending.count == 1 }
+            f.release(); await wait { f.pending.count == 1 && f.lastSourceAnchor == 512 }
+            check(m.page == nil && m.headings == nil && m.busy && !m.authorized,
+                  "Initial preparation cannot publish the first page before resolving the source reader anchor")
+            f.release(); await wait { !m.busy }
+            check(m.page?.first == 128 && m.lineInput == "129" && m.authorized && !m.canBack,
+                  "Initial preview follows the accepted source anchor without adding a spurious start-page history entry")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            f.unmappedRows = [64, 65]
+            await ready(f, m)
+            m.next(); await wait { !m.busy }
+            let previous = m.page!, headings = m.headings!, target = previous.target(at: 66)!
+            m.bind(identity: f.identity, sourceOffset: 5000)
+            f.held = true
+            m.widthInput = "80"; m.prepare(); await wait { f.pending.count == 1 }
+            f.release(); await wait { f.pending.count == 1 && f.lastSourceAnchor == 531 }
+            check(m.page?.id == previous.id && m.headings?.id == headings.id && m.lineInput == "65"
+                  && !m.authorized && !m.allows(target),
+                  "Pending restoration retains the old page and skips generated rows when selecting its source anchor")
+            f.release(); await wait { !m.busy }
+            check(m.page?.first == 128 && m.page?.inventory.width == 80 && m.lineInput == "129"
+                  && m.authorized && !m.canBack && !m.canForward,
+                  "Reflow publishes the engine-resolved block position and retires obsolete flow-row history")
+            check(!m.allows(target), "Old mapped rows cannot regain authority after source-anchored reflow")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            f.unmappedRows = Set(0..<64)
+            m.bind(identity: f.identity, sourceOffset: 2)
+            m.prepare(); await wait { !m.busy }
+            check(m.authorized && f.requests.count == 1,
+                  "An initial source start or BOM uses the known first page even when leading rows are unmapped")
+            let before = m.page!, requests = f.requests.count, revocations = f.revocations
+            m.widthInput = "80"; m.prepare()
+            check(m.page?.id == before.id && m.authorized && !m.busy && f.requests.count == requests
+                  && f.revocations == revocations && m.notice.contains("no mapped source region"),
+                  "An all-generated page refuses unanchored reflow before disturbing accepted state")
+            m.next(); await wait { !m.busy }
+            m.prepare(); await wait { !m.busy }
+            check(m.authorized && f.lastSourceAnchor == 515 && m.page?.inventory.width == 80,
+                  "Moving to a mapped preview page makes anchored reflow available")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            m.bind(identity: f.identity, sourceOffset: UInt64.max)
+            m.prepare(); await wait { !m.busy }
+            check(f.lastSourceAnchor == f.identity.capturedBytes && m.page?.first == 1024 && m.page?.lines.isEmpty == true,
+                  "A source EOF anchor is clamped to the retained capture and preserves the valid empty window")
+            m.bind(identity: f.identity, sourceOffset: 0)
+            f.totalLines = 2048
+            m.widthInput = "80"; m.prepare(); await wait { !m.busy }
+            check(f.lastSourceAnchor == f.identity.capturedBytes && m.page?.first == 2048 && m.authorized,
+                  "Reflow restores EOF using source bytes rather than the old row count or another source-pane location")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            m.next(); await wait { !m.busy }
+            let previous = m.page!, target = previous.target(at: 64)!
+            f.held = true
+            m.widthInput = "80"; m.prepare(); await wait { f.pending.count == 1 }
+            f.release(); await wait { f.pending.count == 1 && f.lastSourceAnchor == 515 }
+            m.cancel()
+            let requests = f.requests.count
+            m.copy(target, mode: .renderedText) { _ in preconditionFailure("Canceled reflow copied an old row") }
+            m.next(); m.back(); m.forward()
+            f.release(); await settle()
+            check(m.page?.id == previous.id && m.lineInput == "65" && !m.authorized && !m.busy
+                  && f.requests.count == requests,
+                  "Canceled anchor restoration preserves the accepted page and refuses its old navigation/copy authority")
+            f.held = false
+            m.bind(identity: f.identity, sourceOffset: 9000)
+            m.widthInput = "72"; m.prepare(); await wait { !m.busy }
+            check(m.authorized && f.lastSourceAnchor == 515 && m.page?.inventory.width == 72,
+                  "Retry derives its anchor from the last accepted preview even while that page is read-only")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            m.next(); await wait { !m.busy }
+            let previous = m.page!, headings = m.headings!
+            f.held = true
+            m.widthInput = "80"; m.prepare(); await wait { f.pending.count == 1 }
+            f.release(); await wait { f.pending.count == 1 && f.lastSourceAnchor == 515 }
+            f.reject(.engine("DOCUMENT_INVALID_RANGE")); await wait { !m.busy }
+            check(m.page?.id == previous.id && m.headings?.id == headings.id && m.lineInput == "65"
+                  && !m.authorized && m.notice.contains("DOCUMENT_INVALID_RANGE"),
+                  "An inaccessible source anchor reports failure without publishing the prepared start page")
+        }
+        for foreignCapture in [false, true] {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            m.next(); await wait { !m.busy }
+            let previous = m.page!
+            let foreign = Fixture()
+            foreign.identity = Fixture.identity(owner: 99)
+            foreign.generation = 1
+            _ = try! foreign.response(.prepare(width: 96))
+            f.held = true
+            m.prepare(); await wait { f.pending.count == 1 }
+            f.release(); await wait { f.pending.count == 1 && f.lastSourceAnchor == 515 }
+            f.release(replacement: .page(foreignCapture ? foreign.page(first: 128) : previous))
+            await wait { !m.busy }
+            check(m.page?.id == previous.id && m.lineInput == "65" && !m.authorized
+                  && m.notice == AtlasReaderError.invalidResponse.message,
+                  "Restoration rejects a wrong capture or old generation even when its page is otherwise coherent")
+        }
+        do {
+            let f = Fixture(), m = f.model(), foreign = Fixture()
+            foreign.identity = Fixture.identity(owner: 99)
+            let response = try! foreign.response(.prepare(width: 96))
+            m.bind(identity: f.identity, sourceOffset: 512)
+            f.held = true
+            m.prepare(); await wait { f.pending.count == 1 }
+            f.release(replacement: response); await wait { !m.busy }
+            check(m.page == nil && !m.authorized && f.requests.count == 1
+                  && m.notice == AtlasReaderError.invalidResponse.message,
+                  "A mismatched prepared capture is refused before submitting its source anchor")
+        }
+        for resolving in [false, true] {
+            let f = Fixture(), m = f.model()
+            m.bind(identity: f.identity, sourceOffset: 512)
+            f.held = true
+            m.prepare(); await wait { f.pending.count == 1 }
+            if resolving {
+                f.release(); await wait { f.pending.count == 1 && f.lastSourceAnchor == 512 }
+            }
+            let replacement = Fixture.identity(revision: 2)
+            m.bind(identity: replacement, sourceOffset: 777)
+            f.release(); await settle()
+            check(m.page == nil && m.headings == nil && !m.authorized && !m.busy
+                  && f.requests.count == (resolving ? 2 : 1),
+                  "Replacing the capture at either stage suppresses stale publication and any unstarted anchor request")
+            f.identity = replacement; f.held = false
+            m.prepare(); await wait { !m.busy }
+            check(m.authorized && m.page?.inventory.identity.revision == 2 && f.lastSourceAnchor == 777,
+                  "A replacement capture follows its own source anchor")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            m.bind(identity: f.identity, sourceOffset: 512)
+            f.held = true
+            m.prepare(); await wait { f.pending.count == 1 }
+            m.bind(identity: f.identity, sourceOffset: 9000)
+            m.prepare(); await wait { f.pending.count == 2 }
+            f.release(); await settle()
+            check(f.requests.count == 2, "A superseded initial preparation cannot start its source lookup")
+            f.release(); await wait { f.pending.count == 1 && f.lastSourceAnchor == 9000 }
+            f.release(); await wait { !m.busy }
+            check(m.authorized && m.page?.inventory.generation == 2,
+                  "A replacement initial preparation captures the current source-reader position")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            m.next(); await wait { !m.busy }
+            f.held = true
+            m.widthInput = "80"; m.prepare(); await wait { f.pending.count == 1 }
+            f.release(); await wait { f.pending.count == 1 && f.lastSourceAnchor == 515 }
+            m.bind(identity: f.identity, sourceOffset: 9000)
+            m.widthInput = "100"; m.prepare(); await wait { f.pending.count == 2 }
+            f.release(1); await wait { f.pending.count == 2 && f.lastSourceAnchor == 515 }
+            f.release(1); await wait { !m.busy }
+            let accepted = m.page!
+            f.release(); await settle()
+            check(m.authorized && m.page?.id == accepted.id && accepted.inventory.width == 100,
+                  "A late first restoration cannot replace the latest width or displace the accepted source anchor")
+        }
+        do {
+            let f = Fixture()
+            var model: AtlasDocumentPreviewModel? = f.model()
+            await ready(f, model!)
+            f.held = true
+            model!.widthInput = "80"; model!.prepare(); await wait { f.pending.count == 1 }
+            f.release(); await wait { f.pending.count == 1 && f.lastSourceAnchor == 3 }
+            weak var weakModel = model
+            model = nil
+            check(weakModel == nil, "The second-stage source lookup cannot retain a dismissed preview model")
+            f.release(); await settle()
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            m.next(); await wait { !m.busy }
+            m.next(); await wait { !m.busy }
+            m.back(); await wait { !m.busy }
+            let previous = m.page!
+            f.failure = .engine("DOCUMENT_INVALID_RANGE")
+            m.forward(); await wait { !m.busy }
+            check(m.page?.id == previous.id && m.canBack && m.canForward,
+                  "A failed navigation leaves both directions of accepted history intact")
+            f.held = true
+            m.back(); await wait { f.pending.count == 1 }
+            m.cancel(); f.release(); await settle()
+            check(m.page?.id == previous.id && m.canBack && m.canForward,
+                  "A canceled navigation leaves both directions of accepted history intact")
+        }
     }
 
     @MainActor private static func documentLinks() async {

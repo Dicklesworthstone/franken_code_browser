@@ -74,7 +74,8 @@ import Observation
         let status = authorized ? "" : "Previous preview is read-only; prepare again before navigating or copying. "
         return status + "Logical FrankenMarkdown flow, not native shaped document layout. "
             + "\(page.lines.count) of \(inventory.totalLines) flow rows shown at \(inventory.width) columns. "
-            + "Source links select enclosing Markdown regions, not glyph-exact spans. No external links or assets are fetched."
+            + "Source links select enclosing Markdown regions, not glyph-exact spans. "
+            + "Width changes return to the start of the first mapped Markdown region shown. No external links or assets are fetched."
     }
 
     /// Same-capture source paging changes only the synchronization anchor.
@@ -93,16 +94,56 @@ import Observation
             notice = "Choose a preview width from 4 to 512 columns."
             return
         }
+        guard let identity else { return }
+        let initial = page == nil
+        let anchor: UInt64
+        if let page {
+            guard page.inventory.identity.matches(identity) else {
+                notice = AtlasReaderError.invalidResponse.message
+                return
+            }
+            if page.lines.isEmpty && page.first == page.inventory.totalLines {
+                anchor = identity.capturedBytes
+            } else if let region = page.lines.lazy.compactMap(\.enclosingOriginal).first(where: {
+                $0.valid(upTo: identity.capturedBytes, nonempty: true) && $0.start >= page.inventory.sourceBase
+            }) {
+                // Generated rows have no anchor. The first mapped row restores
+                // its enclosing block, not an invented glyph/intra-block offset.
+                anchor = region.start
+            } else {
+                notice = "This preview page has no mapped source region to preserve. Use From source page or move to a mapped preview page before changing width."
+                return
+            }
+        } else {
+            anchor = sourceOffset
+        }
         // Reflow may commit in Rust before cancellation reaches its response.
         // Keep old pixels readable but revoke their activation/copy immediately.
         authorized = false
         source = nil
         links = nil; linkHistory = []
         revoke()
-        perform(.prepare(width: width), notice: "Preparing retained Markdown…") { model, result in
+        perform(.prepare(width: width), notice: "Preparing retained Markdown…", resolve: { result, execute in
+            guard case .prepared(let firstPage, let headings) = result,
+                  firstPage.inventory.identity.matches(identity), firstPage.inventory.width == width,
+                  firstPage.inventory.sourceBase <= identity.capturedBytes,
+                  firstPage.first == 0, headings.first == 0,
+                  firstPage.inventory.matches(headings.inventory) else { throw AtlasReaderError.invalidResponse }
+            let offset = min(identity.capturedBytes, max(firstPage.inventory.sourceBase, anchor))
+            // An initial request at the source start already has its page. In
+            // particular, leading unmapped syntax need not have a flow anchor.
+            if initial && offset == firstPage.inventory.sourceBase { return result }
+            let restored = try await execute(.fromSource(offset: offset))
+            guard case .page(let page) = restored, page.inventory.matches(firstPage.inventory) else {
+                throw AtlasReaderError.invalidResponse
+            }
+            return .prepared(page, headings)
+        }) { model, result in
             guard case .prepared(let page, let headings) = result, let identity = model.identity,
                   page.inventory.identity.matches(identity), page.inventory.width == width,
                   page.inventory.matches(headings.inventory) else { throw AtlasReaderError.invalidResponse }
+            // Publish only after anchor restoration succeeds. Until then the
+            // accepted page, line field and navigation history remain intact.
             model.page = page
             model.headings = headings
             model.history.reset(to: page.first); model.headingHistory = []
@@ -312,6 +353,7 @@ import Observation
         }
     }
     private func perform(_ request: AtlasReaderDocumentRequest, notice: String,
+                         resolve: (@MainActor (AtlasReaderDocumentResult, Execute) async throws -> AtlasReaderDocumentResult)? = nil,
                          then: (@MainActor (AtlasDocumentPreviewModel) -> Void)? = nil,
                          accept: @escaping @MainActor (AtlasDocumentPreviewModel, AtlasReaderDocumentResult) throws -> Void) {
         guard let identity else { return }
@@ -323,7 +365,14 @@ import Observation
         let execute = self.execute
         task = Task { [weak self] in
             do {
-                let result = try await execute(request)
+                var result = try await execute(request)
+                if let resolve {
+                    // Do not retain the model across another worker await. A
+                    // dismissed/replaced preview cannot launch a follow-up.
+                    guard self?.operation == ticket, !Task.isCancelled,
+                          self?.identity?.matches(identity) == true else { return }
+                    result = try await resolve(result, execute)
+                }
                 guard let self, self.operation == ticket, !Task.isCancelled,
                       self.identity?.matches(identity) == true else { return }
                 self.notice = ""
