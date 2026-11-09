@@ -151,6 +151,37 @@ case choices, retained-index reuse, stale responses, spelling validation,
 capture replacement, and Unicode source navigation. These are code-first
 additions; executable Rust/Swift and physical-Mac qualification remain pending.
 
+## Finding text in large files
+
+The **Observed Range Reader** can search a file without capturing its complete
+contents. Open it from the current source or Quick Open, choose UTF-8, UTF-16 LE,
+or UTF-16 BE, and enter an exact, case-sensitive literal. Search uses the same
+opened file object as byte navigation, including after that pathname is replaced.
+Reopen explicitly to observe the replacement file.
+
+Each search starts at byte zero and reads through a 16 KiB streaming buffer.
+The selected scan limit bounds source I/O; the default is 256 MiB and the maximum
+is 4 GiB. At most 256 hits and a 4096-byte UTF-8 query are admitted. Overlapping
+matches and matches split across read buffers retain exact original byte ranges,
+including UTF-16 surrogate pairs. The result reports actual bytes scanned and
+read, and distinguishes reaching the observed end from stopping at a byte,
+read-call, result, or encoding limit. A completed scan is an observation of a
+mutable file, never an atomic snapshot.
+
+Selecting a result retrieves only its retained matched text and original bytes;
+it does not reread the file. Copy preserves that matched spelling. **Read current
+context** performs a separate bounded read with a fresh observation identity and
+highlights the match only after its retained bytes agree with the new source
+bytes. If the file changed, the original match remains identifiable and the new
+context is labeled separately. Search does not invent surrounding text for an
+old match or treat unchecked source as a proven negative.
+
+Editing the query or encoding revokes old targets, cancellation leaves the reader
+usable, and stale worker replies cannot activate a different query. Searching
+does not evict the reader's eight retained byte observations. The backend, C ABI,
+and native model regression suites cover these contracts; executable Rust/Swift
+and physical-Mac qualification remain pending.
+
 ## Source reader display
 
 The source reader's **Display** menu provides independent **Line numbers**,

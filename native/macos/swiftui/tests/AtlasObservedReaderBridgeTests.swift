@@ -42,6 +42,18 @@ import Foundation
         precondition(info == expected && retained == expected && copied == expected)
         precondition(count(2) == 1 && count(4) == 1 && count(5) == 1)
         precondition(allocations() == 7 && frees() == 7)
+        guard let search = transport.search else { preconditionFailure("Native Find transport is missing") }
+        let searchRequest = try AtlasObservedReaderSearchRequest(generation: observation,
+            needle: "exact é😀", encoding: .utf8, maximumScanBytes: 1 << 32)
+        for encoding in AtlasObservedReaderEncoding.allCases {
+            let request = try AtlasObservedReaderSearchRequest(generation: observation,
+                needle: "exact é😀", encoding: encoding, maximumScanBytes: 1 << 32)
+            let result = try search.find(handle, request, AtlasSearchCancellation())
+            precondition(result == expected)
+        }
+        let hit = try search.hit(handle, observation, 255)
+        precondition(hit == expected && count(9) == 3 && count(10) == 1)
+        precondition(allocations() == 11 && frees() == 11)
 
         // Every allocating entrypoint shares the actual bounded take/free path.
         let commands: [() throws -> String?] = [
@@ -50,6 +62,8 @@ import Foundation
             { try transport.window(handle, request, AtlasSearchCancellation()) },
             { try transport.retained(handle, observation) },
             { try transport.copy(handle, observation, offset + 3, offset + 17) },
+            { try search.find(handle, searchRequest, AtlasSearchCancellation()) },
+            { try search.hit(handle, observation, 255) },
         ]
         for command in commands {
             mode(1)
@@ -70,7 +84,7 @@ import Foundation
 
         // C invokes the supplied callback with its live object context. The
         // transport frees the obsolete reply before throwing cancellation.
-        for opening in [true, false] {
+        for operation in 0..<3 {
             for lateMode: Int32 in [4, 5] {
                 mode(lateMode)
                 weak var released: AtlasSearchCancellation?
@@ -78,8 +92,11 @@ import Foundation
                 do {
                     let token = AtlasSearchCancellation(); released = token
                     do {
-                        if opening { _ = try transport.open(handle, input, token) }
-                        else { _ = try transport.window(handle, request, token) }
+                        switch operation {
+                        case 0: _ = try transport.open(handle, input, token)
+                        case 1: _ = try transport.window(handle, request, token)
+                        default: _ = try search.find(handle, searchRequest, token)
+                        }
                         preconditionFailure("Late canceled read-only delivery was not suppressed")
                     } catch AtlasObservedReaderError.canceled { }
                     precondition(token.isCanceled)
@@ -92,12 +109,14 @@ import Foundation
 
         mode(0)
         let canceled = AtlasSearchCancellation(); canceled.cancel()
-        let enteredOpen = count(1), enteredWindow = count(3), enteredPolls = count(8)
+        let enteredOpen = count(1), enteredWindow = count(3), enteredPolls = count(8), enteredFind = count(9)
         do { _ = try transport.open(handle, input, canceled); preconditionFailure("Pre-entry open cancellation ignored") }
         catch AtlasObservedReaderError.canceled { }
         do { _ = try transport.window(handle, request, canceled); preconditionFailure("Pre-entry window cancellation ignored") }
         catch AtlasObservedReaderError.canceled { }
-        precondition(count(1) == enteredOpen && count(3) == enteredWindow && count(8) == enteredPolls)
+        do { _ = try search.find(handle, searchRequest, canceled); preconditionFailure("Pre-entry Find cancellation ignored") }
+        catch AtlasObservedReaderError.canceled { }
+        precondition(count(1) == enteredOpen && count(3) == enteredWindow && count(8) == enteredPolls && count(9) == enteredFind)
         precondition(transport.cancel(handle) && transport.close(handle))
         mode(6)
         precondition(transport.create() == 0 && !transport.cancel(handle) && !transport.close(handle))

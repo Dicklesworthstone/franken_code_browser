@@ -35,6 +35,7 @@ import AppKit
             Text("Observe part of a current file, including files larger than the complete reader's 32 MiB limit. Each read is independent; the original complete reader stays unchanged.")
                 .font(.caption).foregroundStyle(.secondary)
             controls
+            searchControls
             Divider()
             if let page = model.page {
                 let observation = page.observation
@@ -54,7 +55,8 @@ import AppKit
                         .help("Copy the exact original bytes of this retained observation, not a new file read or the decoded selection")
                 }
                 if let source = model.source {
-                    AtlasSourceReader(source: source, navigation: model.navigation, selection: nil,
+                    AtlasSourceReader(source: source, navigation: model.navigation,
+                        selection: model.searchSelection.map { AtlasReaderSelection(source: source, range: $0) },
                         wrapsLines: wrapsLines, showsLineNumbers: showsLineNumbers,
                         showsWhitespace: showsWhitespace, firstPhysicalLine: page.firstPhysicalLine,
                         backgroundColor: Monokai.background, foregroundColor: Monokai.color("plain")) {
@@ -77,10 +79,12 @@ import AppKit
             }
             .font(.caption).foregroundStyle(.secondary)
         }
-        .padding(14).frame(minWidth: 880, idealWidth: 1120, minHeight: 600, idealHeight: 760)
+        .padding(14).frame(minWidth: 880, idealWidth: 1120, minHeight: 740, idealHeight: 900)
         .onAppear { presentation.start() }
         .onDisappear { presentation.close() }
         .onChange(of: model.navigation) { _, _ in copyNotice = "" }
+        .onChange(of: model.searchText) { _, _ in copyNotice = "" }
+        .onChange(of: model.encoding) { _, _ in copyNotice = "" }
     }
 
     private var controls: some View {
@@ -129,6 +133,92 @@ import AppKit
             Text("Decoding is explicit for the next observation. It does not determine the encoding of unknown file regions.")
                 .font(.caption2).foregroundStyle(.secondary)
         }
+    }
+
+    private var searchControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 7) {
+                TextField("Find exact text in the opened file", text: $model.searchText)
+                    .textFieldStyle(.roundedBorder).onSubmit(model.find)
+                    .accessibilityLabel("Exact text to find in the opened file")
+                    .help("Case-sensitive literal text, without normalization. Up to 4096 UTF-8 bytes; NUL is unsupported.")
+                Picker("Scan up to", selection: $model.searchScanBytes) {
+                    Text("16 MiB").tag(UInt64(16 * 1024 * 1024))
+                    Text("256 MiB").tag(AtlasObservedReaderSearchLimits.scanBytes)
+                    Text("1 GiB").tag(UInt64(1024 * 1024 * 1024))
+                    Text("4 GiB").tag(AtlasObservedReaderSearchLimits.maximumScanBytes)
+                }.frame(width: 185)
+                Button(model.searching ? "Restart Find" : "Find", action: model.find).disabled(!model.canSearch)
+            }
+            Text("Find starts at byte 0 using the selected decoding, with at most 256 retained matches. A scan limit or file change leaves the total count unknown.")
+                .font(.caption2).foregroundStyle(.secondary)
+            if let report = model.searchReport {
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(report.countLabel).font(.caption.bold())
+                        if !report.hits.isEmpty {
+                            ScrollView {
+                                LazyVStack(alignment: .leading, spacing: 2) {
+                                    ForEach(report.hits) { hit in
+                                        Button {
+                                            model.selectSearchHit(report.target(for: hit))
+                                        } label: {
+                                            HStack {
+                                                Image(systemName: model.selectedSearchWitness?.target == report.target(for: hit)
+                                                    ? "checkmark.circle.fill" : "text.magnifyingglass")
+                                                Text("\(hit.index + 1). bytes \(hit.range.start)..<\(hit.range.end)")
+                                                    .font(.system(.caption, design: .monospaced))
+                                            }
+                                        }
+                                        .buttonStyle(.plain).disabled(model.busy)
+                                        .help("Verify the matching literal retained by this search, without reading the file again")
+                                    }
+                                }.frame(maxWidth: .infinity, alignment: .leading)
+                            }.frame(minWidth: 230, maxHeight: 115)
+                        }
+                    }.frame(minWidth: 230, alignment: .leading)
+                    if let witness = model.selectedSearchWitness {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Verified retained literal · \(witness.encoding.label)").font(.caption.bold())
+                            ScrollView {
+                                Text(verbatim: witness.text).font(.system(.caption, design: .monospaced))
+                                    .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                            }.frame(maxHeight: 50)
+                            Text(verbatim: "Original hex: " + witness.originalHex)
+                                .font(.system(.caption2, design: .monospaced)).lineLimit(2).textSelection(.enabled)
+                            HStack {
+                                Button("Copy match") { copyWitness(hex: false) }
+                                Button("Copy match hex") { copyWitness(hex: true) }
+                                Button("Read current context", action: model.readSearchContext)
+                                    .disabled(!model.canReadSearchContext)
+                                    .help("Read a new observation around this result. Select the match only if its original bytes still agree.")
+                            }.controlSize(.small)
+                        }.frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        Text(report.hits.isEmpty
+                            ? (report.searchComplete
+                                ? "No matches in the observed input. Metadata checks did not detect a change; the scan is not an atomic snapshot."
+                                : "A partial search cannot prove that the unsearched remainder has no matches.")
+                            : "Select a result to verify its retained literal. Read current context is a separate explicit action.")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                Text(report.coverage).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
+                if let context = model.searchContext {
+                    Text(context.message).font(.caption).foregroundStyle(context.selection == nil ? .secondary : .primary)
+                }
+            }
+        }
+    }
+
+    private func copyWitness(hex: Bool) {
+        guard let witness = model.selectedSearchWitness,
+              model.searchReport?.admits(witness.target) == true, !model.closed else { return }
+        NSPasteboard.general.clearContents()
+        copyNotice = NSPasteboard.general.setString(hex ? witness.originalHex : witness.text, forType: .string)
+            ? "Copied the verified retained literal\(hex ? " as original hexadecimal bytes" : ""); no file reread."
+            : "Clipboard write failed."
     }
 
     private func copyOriginalHex() {

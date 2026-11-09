@@ -245,9 +245,12 @@ struct AtlasObservedReaderTransport: Sendable {
     let cancel: @Sendable (UInt64) -> Bool
     let close: @Sendable (UInt64) -> Bool
     let retirementFailed: @Sendable () -> Void
+    var search: AtlasObservedReaderSearchTransport? = nil
 }
 
-private enum AtlasObservedReaderWire {
+// Shared by the bounded range and search receipts. Neither admits a complete
+// capture identity or grants authority to follow a pathname again.
+enum AtlasObservedReaderWire {
     struct Number: Decodable {
         let value: UInt64
         init(from decoder: Decoder) throws {

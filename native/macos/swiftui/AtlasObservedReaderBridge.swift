@@ -13,6 +13,12 @@ private typealias ObservedReaderPoll = @convention(c) (UnsafeMutableRawPointer?)
     _ handle: UInt64, _ observation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_observed_reader_copy") private func observedReaderCopy(
     _ handle: UInt64, _ observation: UInt64, _ start: UInt64, _ end: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_observed_reader_find") private func observedReaderFind(
+    _ handle: UInt64, _ generation: UInt64, _ needle: UnsafePointer<CChar>?, _ encoding: UInt64,
+    _ maximumMatches: UInt64, _ maximumScanBytes: UInt64,
+    _ poll: ObservedReaderPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_observed_reader_search_hit") private func observedReaderSearchHit(
+    _ handle: UInt64, _ generation: UInt64, _ index: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_observed_reader_cancel") private func observedReaderCancel(_ handle: UInt64) -> UInt8
 @_silgen_name("fcb_observed_reader_close") private func observedReaderClose(_ handle: UInt64) -> UInt8
 @_silgen_name("fcb_free_string") private func observedReaderFree(_ pointer: UnsafeMutablePointer<CChar>?)
@@ -38,7 +44,15 @@ extension AtlasObservedReaderTransport {
         retained: { try observedReaderTake(observedReaderRetained($0, $1)) },
         copy: { try observedReaderTake(observedReaderCopy($0, $1, $2, $3)) },
         cancel: { observedReaderCancel($0) != 0 }, close: { observedReaderClose($0) != 0 },
-        retirementFailed: { NSLog("Observed range reader retirement could not be confirmed") })
+        retirementFailed: { NSLog("Observed range reader retirement could not be confirmed") },
+        search: .init(find: { handle, request, cancellation in
+            try observedReaderPolling(cancellation) { poll, context in
+                request.needle.withCString { needle in
+                    observedReaderFind(handle, request.generation, needle, request.encoding.abi,
+                        request.maximumMatches, request.maximumScanBytes, poll, context)
+                }
+            }
+        }, hit: { try observedReaderTake(observedReaderSearchHit($0, $1, $2)) }))
 }
 
 private func observedReaderPolling(_ cancellation: AtlasSearchCancellation,

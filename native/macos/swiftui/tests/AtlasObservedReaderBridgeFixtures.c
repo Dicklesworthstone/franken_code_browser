@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { CREATE, OPEN, INFO, WINDOW, RETAINED, COPY, CANCEL, CLOSE, POLLS, COUNTERS };
+enum { CREATE, OPEN, INFO, WINDOW, RETAINED, COPY, CANCEL, CLOSE, POLLS, FIND, HIT, COUNTERS };
 static uint32_t counts[COUNTERS], allocations, frees, encoding_bits;
 static int32_t mode;
 static char *owned;
@@ -79,6 +79,21 @@ char *fcb_observed_reader_copy(uint64_t handle, uint64_t observation, uint64_t s
     assert(handle == handle_value && observation == observation_value);
     assert(start == offset_value + 3 && end == offset_value + 17);
     ++counts[COPY]; return response();
+}
+char *fcb_observed_reader_find(uint64_t handle, uint64_t generation, const char *needle,
+    uint64_t encoding, uint64_t max_matches, uint64_t max_scan_bytes,
+    fcb_observed_reader_poll poll, void *context) {
+    assert(handle == handle_value && generation == observation_value);
+    assert(needle != NULL && strcmp(needle, "exact \xc3\xa9\xf0\x9f\x98\x80") == 0);
+    assert(encoding >= 1 && encoding <= 3);
+    assert(max_matches == 256 && max_scan_bytes == UINT64_C(4294967296));
+    ++counts[FIND]; poll_context(poll, context);
+    assert(strcmp(needle, "exact \xc3\xa9\xf0\x9f\x98\x80") == 0);
+    return response();
+}
+char *fcb_observed_reader_search_hit(uint64_t handle, uint64_t generation, uint64_t index) {
+    assert(handle == handle_value && generation == observation_value && index == 255);
+    ++counts[HIT]; return response();
 }
 uint8_t fcb_observed_reader_cancel(uint64_t handle) {
     assert(handle == handle_value); ++counts[CANCEL]; return mode == 6 ? 0 : 1;
