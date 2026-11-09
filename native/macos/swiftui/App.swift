@@ -266,6 +266,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     @State private var suppliedReaderTarget: AtlasSuppliedReaderSource?
     @State private var finderReaderCapture: AtlasProgressiveFileCapture?
     @State private var observedReader: AtlasObservedReaderPresentation?
+    @State private var workspaceStreamSearch: AtlasWorkspaceStreamPresentation?
     @State private var readingDesk = AtlasReadingDeskModel(transport: .native)
     @State private var showsReadingDesk = false
     @State private var reviewDeskAfterSheetDismissal = false
@@ -356,6 +357,21 @@ private struct AtlasFrozenViewportSearch: Sendable {
     private func closeObservedReader() {
         observedReader?.close()
         observedReader = nil
+    }
+
+    private func openWorkspaceStreamSearch() {
+        guard let authority = snapshotExportSource else { return }
+        closeWorkspaceStreamSearch()
+        let source = AtlasWorkspaceStreamSource(root: authority.root,
+            project: authority.identity.project, browserOwner: authority.identity.browserOwner,
+            access: authority.access)
+        workspaceStreamSearch = AtlasWorkspaceStreamPresentation(source: source,
+            query: query, transport: .native)
+    }
+
+    private func closeWorkspaceStreamSearch() {
+        workspaceStreamSearch?.close()
+        workspaceStreamSearch = nil
     }
 
     private var searchContext: AtlasSearchContext {
@@ -480,6 +496,13 @@ private struct AtlasFrozenViewportSearch: Sendable {
         .sheet(item: $observedReader, onDismiss: finishReadingDeskReview) { presentation in
             AtlasObservedReaderView(presentation: presentation).id(presentation.id)
         }
+        .sheet(item: $workspaceStreamSearch, onDismiss: {
+            closeWorkspaceStreamSearch()
+            finishReadingDeskReview()
+        }) { presentation in
+            AtlasWorkspaceStreamView(presentation: presentation).id(presentation.id)
+                .onDisappear { presentation.close() }
+        }
         .onAppear {
 #if FCB_APP_STORE
             if rootAccess != nil { requestAtlasLoad() }
@@ -520,6 +543,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
             savedRepository.close()
             snapshotExport.cancel()
             closeObservedReader()
+            closeWorkspaceStreamSearch()
             showsSavedRepository = false
             readingDesk.close()
             showsReadingDesk = false
@@ -549,6 +573,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
         .onChange(of: snapshotExportSource?.identity) { _, _ in
             snapshotExport.cancel()
             closeObservedReader()
+            closeWorkspaceStreamSearch()
         }
         .onChange(of: atlasResidency.contentRevision) { _, _ in
             refreshResidentSearchOverlay()
@@ -644,11 +669,12 @@ private struct AtlasFrozenViewportSearch: Sendable {
 
     private func reviewReadingDeskBeforeClosing() {
         guard !readingDesk.closed, !showsReadingDesk else { return }
-        if showsFileFinder || showsSavedRepository || observedReader != nil {
+        if showsFileFinder || showsSavedRepository || observedReader != nil || workspaceStreamSearch != nil {
             // Wait for the other sheet's actual dismissal before presenting
             // the desk. An active note editor is preserved by the close guard.
             reviewDeskAfterSheetDismissal = true
             showsFileFinder = false; showsSavedRepository = false; closeObservedReader()
+            closeWorkspaceStreamSearch()
         } else { showsReadingDesk = true }
     }
     private func finishReadingDeskReview() {
@@ -846,6 +872,12 @@ private struct AtlasFrozenViewportSearch: Sendable {
                     .help("Capture the current file and location scope into a new index. Opened readers keep their original bytes.")
             }
             .font(.caption).padding(.horizontal, 10).padding(.top, 6)
+            Button(action: openWorkspaceStreamSearch) {
+                Label("Search large project files…", systemImage: "doc.text.magnifyingglass")
+            }
+            .disabled(snapshotExportSource == nil)
+            .help("Search exact, case-sensitive text across all catalogued files with bounded streaming reads, including sources beyond the capture limits. Choose its I/O budget in the search sheet.")
+            .padding(.horizontal, 10).padding(.top, 8)
             if wantsCapturedIndex {
                 Text("The first search captures the selected scope. Later queries reuse those bytes; Refresh captures the current scope and file edits. Limits within that scope: 4096 files, 1 MiB per file, 32 MiB total.")
                     .font(.caption2).foregroundStyle(.secondary)
@@ -1376,6 +1408,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     private func requestAtlasLoad() {
         snapshotExport.cancel()
         closeObservedReader()
+        closeWorkspaceStreamSearch()
         closeAtlasResidency()
         closeFinderReader()
         workspaceSearch?.refresh()

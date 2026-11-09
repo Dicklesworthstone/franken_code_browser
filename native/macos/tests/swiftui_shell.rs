@@ -292,6 +292,16 @@ fn observed_range_reader_contracts_and_bridge() {
 }
 
 #[test]
+fn workspace_stream_search_contracts_and_bridge() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    checked(
+        Command::new("/bin/sh")
+            .current_dir(&root)
+            .arg("swiftui/tests/test-workspace-stream-search.sh"),
+    );
+}
+
+#[test]
 fn source_lifetime_through_metal_completion() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = std::env::temp_dir().join(format!(

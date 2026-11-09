@@ -151,7 +151,52 @@ case choices, retained-index reuse, stale responses, spelling validation,
 capture replacement, and Unicode source navigation. These are code-first
 additions; executable Rust/Swift and physical-Mac qualification remain pending.
 
-## Finding text in large files
+## Searching large files across a project
+
+Choose **Search large project files…** in the search sidebar to search exact,
+case-sensitive text across all files in a separately retained project catalog.
+This route streams file contents through the shared Rust matcher, including
+files beyond the ordinary search's 1 MiB per-file and 32 MiB total capture limits.
+It recognizes UTF-8 and BOM-marked UTF-16 in either byte order. Queries contain
+1–1024 UTF-8 bytes; overlapping matches keep their exact original byte ranges.
+
+Open the sheet, enter the literal, choose **256 MiB**, **1 GiB**, or **4 GiB** as
+the total source I/O budget, and press **Search**. There is no per-file capture
+ceiling. The scan admits at most 1,048,576 read calls and retains at most 256
+matches. It uses a 16 KiB input buffer and stores one encoded literal witness
+per matching file instead of retaining complete sources. Results appear when
+the bounded scan reaches a terminal outcome; **Cancel** and replacement searches
+revoke obsolete deliveries while entered work drains on the worker.
+
+The catalog admits at most 20,000 regular files, subject to separate path and
+discovery-page limits and the product's exclusions. Search covers this catalog
+independently of map zoom, display filters and the ordinary search's location
+scope. **Refresh file catalog** discovers current membership again, including
+new files. Existing queries never turn newly created or uncatalogued files into
+proven no-match results. The summary separately reports incomplete discovery,
+unexamined files, unsupported text, unavailable files, failed reads, and byte,
+call or match-limit stops. Excluded entries include pruned directories; their
+count is not an invented count of all files beneath them.
+
+Select a result to inspect its retained literal. **Copy match** copies that
+decoded spelling; **Copy original hex** copies the exact original encoded bytes.
+These actions do no source I/O and remain meaningful if the working-tree file
+changes. **Read current context** explicitly opens the current canonical pathname
+under the current project access grant, creates an independent observed reader,
+and checks the literal's original bytes before highlighting. Changed bytes are
+reported as changed; the earlier result never claims the new file's identity.
+Changing the query, refreshing the catalog, replacing the project or closing the
+sheet closes this child reader and revokes its actions synchronously.
+
+The safe host service is `fcb_app::host::atlas_stream_search`; native hosts use
+[`fcb_atlas_stream_search.h`](../../crates/fcb-bridge/include/fcb_atlas_stream_search.h)
+with existing atlas handles. The public `AtlasStreamSearch` accepts both borrowed
+and retained atlas metadata without rebuilding geometry. Added core, host, C ABI,
+native receipt, cancellation/lifetime and context-navigation cases cover this
+integration. They are code-first additions: executable Rust/Swift verification
+and physical-Mac qualification remain pending.
+
+## Finding text in one large file
 
 The **Observed Range Reader** can search a file without capturing its complete
 contents. Open it from the current source or Quick Open, choose UTF-8, UTF-16 LE,

@@ -35,6 +35,13 @@ import AppKit
                 .textSelection(.enabled).lineLimit(1).truncationMode(.middle)
             Text("Observe part of a current file, including files larger than the complete reader's 32 MiB limit. Each read is independent; the original complete reader stays unchanged.")
                 .font(.caption).foregroundStyle(.secondary)
+            if let match = origin.currentMatch {
+                Text("Current context for retained match at original bytes \(match.range.start)..<\(match.range.end). This explicitly reopens the current pathname; the earlier search retained only literal bytes.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if let verification = model.externalContext {
+                    Text(verification.message).font(.caption).foregroundStyle(.secondary)
+                }
+            }
             controls
             searchControls
             Divider()

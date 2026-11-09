@@ -14,10 +14,13 @@ struct AtlasObservedReaderSourceIdentity: Equatable, Sendable {
     let id = UUID()
     let identity: AtlasObservedReaderSourceIdentity
     let access: AnyObject?
+    let currentMatch: AtlasObservedReaderExternalMatch?
     var input: AtlasObservedReaderInput { identity.input }
-    init(input: AtlasObservedReaderInput, project: UUID, access: AnyObject?) {
+    init(input: AtlasObservedReaderInput, project: UUID, access: AnyObject?,
+         currentMatch: AtlasObservedReaderExternalMatch? = nil) {
         identity = .init(input: input, project: project, grant: access.map(ObjectIdentifier.init))
         self.access = access
+        self.currentMatch = currentMatch
     }
 }
 
@@ -150,6 +153,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     private(set) var searchReport: AtlasObservedReaderSearchReport?
     private(set) var selectedSearchWitness: AtlasObservedReaderSearchWitness?
     private(set) var searchContext: AtlasObservedReaderSearchContext?
+    private(set) var externalContext: AtlasObservedReaderSearchContext?
     private(set) var searchSelection: NSRange?
     private(set) var searching = false
     private(set) var searchAuthorized = false
@@ -244,14 +248,19 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         guard canReopen, let authority else { return }
         revokeSearch()
         let request: AtlasObservedReaderRequest
-        do { request = try AtlasObservedReaderRequest(offset: 0, bytes: pageBytes, encoding: encoding) }
+        do {
+            if let match = authority.currentMatch {
+                guard match.input == authority.input else { throw AtlasObservedReaderError.invalidInput }
+                request = try match.request(); encoding = match.encoding
+            } else { request = try AtlasObservedReaderRequest(offset: 0, bytes: pageBytes, encoding: encoding) }
+        }
         catch { notice = AtlasObservedReaderError.invalidInput.message; return }
         let candidate: AtlasObservedReaderSession
         do { candidate = try AtlasObservedReaderSession(transport: transport, access: authority.access) }
         catch { notice = message(error); return }
         let (ticket, flag) = begin("Opening the current pathname and observing its first bounded range…")
         pendingSession = candidate
-        let input = authority.input
+        let input = authority.input, currentMatch = authority.currentMatch
         task = Task {
             do {
                 let accepted = try await io.perform(cancellation: flag, keepingAlive: [candidate]) {
@@ -261,14 +270,17 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
                     let page = try AtlasObservedReaderPage.decode(
                         candidate.transport.window(candidate.handle, request, flag), handle: candidate.handle,
                         input: input, request: request)
-                    return (info, page)
+                    return (info, page, currentMatch?.verify(context: page))
                 }
                 guard accepts(ticket, flag), pendingSession === candidate else { return }
                 session = candidate; pendingSession = nil; info = accepted.0
                 history = []; historyIndex = 0; latestObservation = 0
                 install(accepted.1, append: true)
+                externalContext = accepted.2
+                if let verification = accepted.2 { searchSelection = verification.selection }
                 finish(ticket)
-                notice = "Opened a new file descriptor and retained observation \(accepted.1.observation.id). No whole-file capture was created."
+                notice = accepted.2.map { "Opened the current pathname as a new observation. " + $0.message }
+                    ?? "Opened a new file descriptor and retained observation \(accepted.1.observation.id). No whole-file capture was created."
             } catch { fail(error, ticket: ticket) }
         }
     }
@@ -499,7 +511,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
 
     private func clearSearchContext() {
         if searchSelection != nil { navigation = UUID() }
-        searchSelection = nil; searchContext = nil
+        searchSelection = nil; searchContext = nil; externalContext = nil
     }
     private func revokeSearch() {
         if searchOperation { cancelWork() }
@@ -515,7 +527,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         session = nil; pendingSession = nil; authority = nil
         info = nil; page = nil; source = nil; history = []; historyIndex = 0
         latestObservation = 0
-        searchReport = nil; searchAuthorized = false; selectedSearchWitness = nil; searchContext = nil; searchSelection = nil
+        searchReport = nil; searchAuthorized = false; selectedSearchWitness = nil; searchContext = nil; searchSelection = nil; externalContext = nil
         navigation = UUID()
     }
     private func begin(_ notice: String) -> (UUID, AtlasSearchCancellation) {

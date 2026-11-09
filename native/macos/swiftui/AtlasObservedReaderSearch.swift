@@ -290,26 +290,8 @@ struct AtlasObservedReaderSearchWitness: Sendable {
         guard page.observation.identity == target.identity, page.observation.id > target.observation,
               page.observation.request.encoding == encoding,
               page.visibleRange.contains(target.hit.range) else { return .unavailable }
-        let start = Int(target.hit.range.start - page.visibleRange.start)
-        let count = Int(target.hit.range.count), raw = Array(page.originalHex.utf8)
-        guard raw[(start * 2)..<((start + count) * 2)].elementsEqual(originalHex.utf8) else { return .changed }
-        let encoded = AtlasObservedReaderSearchRequest.originalBytes(page.text, encoding: encoding)
-        guard !page.hasReplacements, AtlasObservedReaderWire.hex(encoded) == page.originalHex else {
-            return .verified(selection: nil)
-        }
-        let candidate: NSRange?
-        if encoding == .utf8 {
-            candidate = AtlasSource(path: page.observation.identity.displayPath, text: page.text)
-                .utf16Range(byteStart: UInt64(start), byteEnd: UInt64(start + count))
-        } else {
-            candidate = start % 2 == 0 && count % 2 == 0 ? NSRange(location: start / 2, length: count / 2) : nil
-        }
-        let native = page.text as NSString
-        guard let candidate, candidate.location <= native.length,
-              candidate.length <= native.length - candidate.location,
-              native.rangeOfComposedCharacterSequences(for: candidate) == candidate,
-              native.substring(with: candidate).utf8.elementsEqual(text.utf8) else { return .verified(selection: nil) }
-        return .verified(selection: candidate)
+        return AtlasObservedReaderExternalMatch.verifyLiteral(context: page, range: target.hit.range,
+            encoding: encoding, text: text, originalHex: originalHex)
     }
 
     /// The shared engine identifies the selected scalar range even when other
@@ -333,6 +315,62 @@ struct AtlasObservedReaderSearchWitness: Sendable {
             throw AtlasObservedReaderError.invalidResponse
         }
     }
+}
+
+/// An earlier literal witness requests a new live observation, never an alias
+/// of the earlier owner or an immutable whole-file source. The caller supplies
+/// current project authority separately and revokes it with its search surface.
+struct AtlasObservedReaderExternalMatch: Sendable {
+    let input: AtlasObservedReaderInput
+    let range: AtlasObservedByteRange
+    let encoding: AtlasObservedReaderEncoding
+    let text, originalHex: String
+    init(input: AtlasObservedReaderInput, range: AtlasObservedByteRange,
+         encoding: AtlasObservedReaderEncoding, text: String, originalHex: String) throws {
+        let bytes = AtlasObservedReaderSearchRequest.originalBytes(text, encoding: encoding)
+        guard !text.isEmpty, text.utf8.count <= AtlasObservedReaderSearchLimits.needleBytes,
+              range.count == UInt64(bytes.count), range.count > 0,
+              originalHex == AtlasObservedReaderWire.hex(bytes),
+              encoding == .utf8 || range.start % 2 == 0 else { throw AtlasObservedReaderError.invalidInput }
+        self.input = input; self.range = range; self.encoding = encoding
+        self.text = text; self.originalHex = originalHex
+        _ = try request()
+    }
+    func request() throws -> AtlasObservedReaderRequest {
+        try .init(offset: range.start - min(range.start, 1024), encoding: encoding)
+    }
+    func verify(context page: AtlasObservedReaderPage) -> AtlasObservedReaderSearchContext {
+        guard page.observation.identity.path == input.absolutePath, page.findHit == nil,
+              page.observation.request.encoding == encoding else { return .unavailable }
+        return Self.verifyLiteral(context: page, range: range, encoding: encoding, text: text, originalHex: originalHex)
+    }
+    static func verifyLiteral(context page: AtlasObservedReaderPage, range: AtlasObservedByteRange,
+                              encoding: AtlasObservedReaderEncoding, text: String,
+                              originalHex: String) -> AtlasObservedReaderSearchContext {
+        guard page.visibleRange.contains(range) else { return .unavailable }
+        let start = Int(range.start - page.visibleRange.start)
+        let count = Int(range.count), raw = Array(page.originalHex.utf8)
+        guard start * 2 <= raw.count, count * 2 <= raw.count - start * 2 else { return .unavailable }
+        guard raw[(start * 2)..<((start + count) * 2)].elementsEqual(originalHex.utf8) else { return .changed }
+        let encoded = AtlasObservedReaderSearchRequest.originalBytes(page.text, encoding: encoding)
+        guard !page.hasReplacements, AtlasObservedReaderWire.hex(encoded) == page.originalHex else {
+            return .verified(selection: nil)
+        }
+        let candidate: NSRange?
+        if encoding == .utf8 {
+            candidate = AtlasSource(path: page.observation.identity.displayPath, text: page.text)
+                .utf16Range(byteStart: UInt64(start), byteEnd: UInt64(start + count))
+        } else {
+            candidate = start % 2 == 0 && count % 2 == 0 ? NSRange(location: start / 2, length: count / 2) : nil
+        }
+        let native = page.text as NSString
+        guard let candidate, candidate.location <= native.length,
+              candidate.length <= native.length - candidate.location,
+              native.rangeOfComposedCharacterSequences(for: candidate) == candidate,
+              native.substring(with: candidate).utf8.elementsEqual(text.utf8) else { return .verified(selection: nil) }
+        return .verified(selection: candidate)
+    }
+
 }
 
 enum AtlasObservedReaderSearchContext: Equatable, Sendable {

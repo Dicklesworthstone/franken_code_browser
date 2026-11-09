@@ -31,6 +31,14 @@ The shell installer downloads the current release and its SHA-256 sidecar, verif
 
 Open FrankenCodeBrowser, choose a project folder, drag to pan, and scroll to zoom. Use `⌘F` to search exact text, click a file to read it, or choose a file-type filter from the toolbar (Markdown, Python, Rust, or custom extensions).
 
+The current source also adds **Search large project files…** in the search sidebar.
+It streams exact UTF-8 or BOM-marked UTF-16 text across the project catalog beyond
+ordinary capture limits, with a selectable 256 MiB–4 GiB total I/O budget,
+explicit partial-coverage reporting, retained-match copying, and separately
+verified current-context reads. See the [native search workflow](native/macos/README.md#searching-large-files-across-a-project)
+for its catalog and result limits. This addition still requires executable and
+physical-Mac qualification; it is not a claim about an already released binary.
+
 > [!IMPORTANT]
 > This repository contains the Rust engine, C ABI bridge, headless `fcb` source tools, and the
 > SwiftUI/Metal app under [`native/macos/`](native/macos/). A single checkout can build the app and
