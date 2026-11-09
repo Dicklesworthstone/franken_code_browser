@@ -6,6 +6,7 @@ use std::{fs::{self, File}, path::PathBuf, sync::atomic::{AtomicU64, Ordering}, 
 use fcb::{ArenaOwnerId, BrowserSession, ByteLength, FileId, SourceRevision, Size2D};
 use fcb::map::{LayoutRevision, LayoutOptions, QueryGeneration, ResourceAllocationId, ResourceBudget, RootId};
 use fcb::map::workspace::{WorkspaceAtlas, WorkspaceAtlasLimits};
+use fcb::map::workspace::retained::RetainedWorkspaceAtlas;
 use fcb::map::workspace::stream_search::{AtlasStreamError, AtlasStreamFileState, AtlasStreamLimits,
     AtlasStreamReport, AtlasStreamSearch, AtlasStreamState, AtlasStreamStop};
 use fcb::search::{RawPath, SearchManifestId, StreamReadState, StreamReadStep, StreamingNeedle};
@@ -237,6 +238,90 @@ fn many_files_share_one_worker_envelope_and_do_not_retain_full_decoder_leases() 
     let report = run(&atlas, "needle", AtlasStreamLimits::default(), &budget, 10);
     assert!(report.is_complete()); assert_eq!(report.hits().len(), 64);
     assert_eq!(report.retained_witness_bytes(), 64 * 6); assert!(report.reserved_bytes() < 128 * 1024);
+}
+
+fn retained(catalog: WorkspaceCatalog, budget: &ResourceBudget) -> RetainedWorkspaceAtlas {
+    RetainedWorkspaceAtlas::build(catalog, LayoutRevision::new(owner(), 1).unwrap(),
+        Size2D::new(1024.0, 768.0).unwrap(), LayoutOptions::modest(), WorkspaceAtlasLimits::default(),
+        budget, [allocation(2), allocation(3)], || false).unwrap()
+}
+fn run_retained<'a>(atlas: &'a RetainedWorkspaceAtlas, budget: &ResourceBudget)
+    -> AtlasStreamReport<'a, 'a, RetainedWorkspaceAtlas> {
+    let needle = StreamingNeedle::text(owner(), "needle", budget, allocation(10)).unwrap();
+    let mut job = AtlasStreamSearch::new(atlas, &needle, revision(100), generation(1), AtlasStreamLimits::default(),
+        budget, [allocation(11), allocation(12)]).unwrap();
+    let root = atlas.catalog().grant().root_path().to_path_buf();
+    while job.state() == AtlasStreamState::Pending {
+        job.step(StreamReadStep::default(), generation(1), |_, path|
+            File::open(root.join(path.raw().to_path_buf())).map_err(|_| SourceError::CaptureUnavailable), || false).unwrap();
+    }
+    job.finish().unwrap()
+}
+
+#[test]
+fn retained_native_atlas_uses_the_existing_layout_and_bounded_literal_witness() {
+    let root = Fixture::new();
+    let mut source = vec![b'x'; 2 * 1024 * 1024 - 3];
+    let offset = source.len() as u64;
+    source.extend_from_slice(b"needle"); root.write("src/large.rs", &source);
+    let budget = budget(); let atlas = retained(root.catalog(&budget, 8), &budget);
+    let layout = atlas.layout().clone();
+    let before = budget.accounting().reserved().get();
+    let report = run_retained(&atlas, &budget);
+    assert!(std::ptr::eq(report.atlas(), &atlas));
+    assert!(report.is_complete());
+    assert_eq!(report.stats().bytes_read, source.len() as u64);
+    assert_eq!(report.hits()[0].original_range().start().get(), offset);
+    assert_eq!(report.retained_witness_bytes(), 6);
+    assert!(budget.accounting().reserved().get() - before < 128 * 1024);
+    assert_eq!(atlas.layout(), &layout, "stream search cannot repack native geometry");
+    root.write("src/large.rs", b"different current source");
+    let extent = report.retain_hit(0, &atlas, generation(1), &budget, allocation(20)).unwrap();
+    let view = BrowserSession::new(owner()).open_extent(extent).unwrap();
+    assert_eq!(view.raw_selection(report.hits()[0].original_range()).unwrap(), b"needle");
+    assert!(view.raw_selection(fcb::ByteRange::new(fcb::ByteOffset::new(0), fcb::ByteOffset::new(1)).unwrap()).is_err(),
+        "a retained literal does not manufacture earlier context");
+}
+
+#[test]
+fn borrowed_and_retained_filtered_layouts_are_refused_before_any_source_opens() {
+    use fcb::map::workspace::{AtlasExtensionScope, AtlasScope};
+    let root = Fixture::new(); root.write("a.rs", b"needle"); root.write("b.md", b"needle");
+    let budget = budget(); let catalog = root.catalog(&budget, 8);
+    let scope = AtlasScope::Extensions(AtlasExtensionScope::from_extensions([b"rs".as_slice()]).unwrap());
+    let needle = StreamingNeedle::text(owner(), "needle", &budget, allocation(10)).unwrap();
+    {
+        let scoped = WorkspaceAtlas::build(&catalog, &scope, LayoutRevision::new(owner(), 2).unwrap(),
+            Size2D::new(1024.0, 768.0).unwrap(), LayoutOptions::modest(), WorkspaceAtlasLimits::default(),
+            &budget, allocation(20), || false).unwrap();
+        assert_eq!(scoped.file_count(), 1);
+        assert!(matches!(AtlasStreamSearch::new(&scoped, &needle, revision(100), generation(1), AtlasStreamLimits::default(),
+            &budget, [allocation(11), allocation(12)]), Err(AtlasStreamError::InvalidLimits)));
+    }
+    let base = retained(catalog, &budget);
+    let scoped = RetainedWorkspaceAtlas::build_scoped(base.catalog_shared(), &scope,
+        LayoutRevision::new(owner(), 2).unwrap(), Size2D::new(1024.0, 768.0).unwrap(),
+        LayoutOptions::modest(), WorkspaceAtlasLimits::default(), &budget, [allocation(21), allocation(22)], || false).unwrap();
+    assert!(matches!(AtlasStreamSearch::new(&scoped, &needle, revision(100), generation(1), AtlasStreamLimits::default(),
+        &budget, [allocation(11), allocation(12)]), Err(AtlasStreamError::InvalidLimits)));
+}
+
+#[test]
+fn retained_atlas_delivery_still_checks_exact_owner_query_and_revocation() {
+    use fcb::map::workspace::{AtlasExtensionScope, AtlasScope};
+    let root = Fixture::new(); root.write("a.rs", b"needle");
+    let budget = budget(); let atlas = retained(root.catalog(&budget, 8), &budget);
+    // This different layout happens to include every file. It can be searched,
+    // but its identical file membership cannot authorize another report.
+    let scope = AtlasScope::Extensions(AtlasExtensionScope::from_extensions([b"rs".as_slice()]).unwrap());
+    let other = RetainedWorkspaceAtlas::build_scoped(atlas.catalog_shared(), &scope,
+        LayoutRevision::new(owner(), 2).unwrap(), Size2D::new(1024.0, 768.0).unwrap(),
+        LayoutOptions::modest(), WorkspaceAtlasLimits::default(), &budget, [allocation(21), allocation(22)], || false).unwrap();
+    let report = run_retained(&atlas, &budget);
+    assert!(matches!(report.select_hit(0, &other, generation(1)), Err(AtlasStreamError::WrongAtlas)));
+    assert!(matches!(report.select_hit(0, &atlas, generation(2)), Err(AtlasStreamError::StaleQuery)));
+    atlas.catalog().grant().revoke();
+    assert!(report.select_hit(0, &atlas, generation(1)).is_err());
 }
 
 #[test]

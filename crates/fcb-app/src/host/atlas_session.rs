@@ -488,6 +488,13 @@ impl AtlasSession {
     pub fn info(&mut self, mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSessionError> {
         self.validate_active()?; check(&mut canceled)?;
         let mut out = self.output("info")?;
+        // The host may have requested this root through a different absolute
+        // spelling. Bind downstream observations to the retained grant's exact
+        // canonical bytes without another filesystem lookup in native input.
+        out.literal(",\"root_path\":")?;
+        out.path(&self.atlas.catalog().grant().root_path().to_path_buf())?;
+        out.literal(",\"source_manifest\":")?;
+        out.integer(self.atlas.catalog().id().revision())?;
         self.position_json(&mut out, self.position, self.selected)?;
         out.literal(",\"history_depth\":")?; out.integer(self.history.len() as u64)?;
         out.literal(",\"pending_plan_generation\":")?; optional(&mut out, self.pending.as_ref().map(|p| p.generation().get()))?;

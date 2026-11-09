@@ -3,13 +3,13 @@
 //! Compact, capture-honest spatial results. Only literal witness bytes survive;
 //! there is no rereadable whole-file backing and no decoder-scratch lease per file.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, marker::PhantomData};
 use fcb_core::{ByteLength, ByteOffset, ByteRange, FileId, QueryGeneration,
     ResourceAllocationId, ResourceBudget, ResourceLease, SourceRevision};
 use crate::map::{AtlasNodeId, NodeKind};
 use crate::search::{CaptureRequest, DetectedEncoding, ExtentConsistency, FileSearchError,
     ObservedExtent, StreamReadState, StreamReadStats};
-use super::{AtlasStreamError, AtlasStreamLimits, AtlasStreamState, AtlasStreamStop, WorkspaceAtlas};
+use super::{AtlasStreamError, AtlasStreamLimits, AtlasStreamSource, AtlasStreamState, AtlasStreamStop, WorkspaceAtlas};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AtlasStreamFileState {
@@ -96,8 +96,8 @@ impl AtlasStreamHit {
     pub const fn original_range(&self) -> ByteRange { self.original_range }
 }
 
-pub struct AtlasStreamReport<'atlas, 'catalog> {
-    pub(super) atlas: &'atlas WorkspaceAtlas<'catalog>,
+pub struct AtlasStreamReport<'atlas, 'catalog, A: AtlasStreamSource = WorkspaceAtlas<'catalog>> {
+    pub(super) atlas: &'atlas A,
     pub(super) generation: QueryGeneration,
     pub(super) limits: AtlasStreamLimits,
     pub(super) files: Vec<AtlasStreamFile>,
@@ -109,9 +109,10 @@ pub struct AtlasStreamReport<'atlas, 'catalog> {
     pub(super) state: AtlasStreamState,
     pub(super) stop: Option<AtlasStreamStop>,
     pub(super) _lease: ResourceLease,
+    pub(super) _catalog: PhantomData<&'catalog ()>,
 }
-impl<'atlas, 'catalog> AtlasStreamReport<'atlas, 'catalog> {
-    pub fn atlas(&self) -> &'atlas WorkspaceAtlas<'catalog> { self.atlas }
+impl<'atlas, 'catalog, A: AtlasStreamSource> AtlasStreamReport<'atlas, 'catalog, A> {
+    pub fn atlas(&self) -> &'atlas A { self.atlas }
     pub const fn generation(&self) -> QueryGeneration { self.generation }
     pub const fn limits(&self) -> AtlasStreamLimits { self.limits }
     pub const fn state(&self) -> AtlasStreamState { self.state }
@@ -129,7 +130,7 @@ impl<'atlas, 'catalog> AtlasStreamReport<'atlas, 'catalog> {
         self.state == AtlasStreamState::Finished && self.stop.is_none()
             && self.atlas.discovery_complete() && self.unexamined_files() == 0 && self.stats.incomplete_files == 0
     }
-    pub fn validate_delivery(&self, atlas: &WorkspaceAtlas<'_>, generation: QueryGeneration) -> Result<(), AtlasStreamError> {
+    pub fn validate_delivery(&self, atlas: &A, generation: QueryGeneration) -> Result<(), AtlasStreamError> {
         self.atlas.validate_active()?;
         if !std::ptr::eq(self.atlas, atlas) { return Err(AtlasStreamError::WrongAtlas); }
         if self.generation != generation { return Err(AtlasStreamError::StaleQuery); }
@@ -139,7 +140,7 @@ impl<'atlas, 'catalog> AtlasStreamReport<'atlas, 'catalog> {
             _ => Ok(()),
         }
     }
-    pub fn select_hit(&self, position: usize, atlas: &WorkspaceAtlas<'_>, generation: QueryGeneration)
+    pub fn select_hit(&self, position: usize, atlas: &A, generation: QueryGeneration)
         -> Result<AtlasStreamSelection<'_>, AtlasStreamError> {
         self.validate_delivery(atlas, generation)?;
         let hit = self.hits.get(position).ok_or(AtlasStreamError::InvalidHit)?;
@@ -155,7 +156,7 @@ impl<'atlas, 'catalog> AtlasStreamReport<'atlas, 'catalog> {
     /// The native consistency remains on this report; extent backing is the
     /// verified witness. Decoding surrounding context requires a different,
     /// explicit observation and is not silently performed by this method.
-    pub fn retain_hit(&self, position: usize, atlas: &WorkspaceAtlas<'_>, generation: QueryGeneration,
+    pub fn retain_hit(&self, position: usize, atlas: &A, generation: QueryGeneration,
         budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<ObservedExtent, AtlasStreamError> {
         let selection = self.select_hit(position, atlas, generation)?;
         let request = selection.hit.request.with_range(selection.hit.original_range)

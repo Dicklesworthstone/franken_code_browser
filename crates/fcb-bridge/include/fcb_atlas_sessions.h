@@ -21,6 +21,10 @@ extern "C" {
  * max_files is 1..20000 (4096 recommended), with separate shared path/page caps.
  * Partial discovery remains usable and explicitly incomplete. Initial viewport
  * is 1024x768 points at scale 1. Resize creates a new display generation.
+ * Open/info include source_manifest and root_path as reversible canonical bytes
+ * from the retained grant. Bind later receipts to this identity and these bytes;
+ * do not reinterpret a display label
+ * or require a caller's equivalent absolute spelling to be byte-identical.
  */
 uint64_t fcb_atlas_create(void);
 char *fcb_atlas_open(uint64_t handle, const char *root, uint64_t max_files);

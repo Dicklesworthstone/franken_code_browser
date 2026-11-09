@@ -8,10 +8,12 @@
 //! decoder buffers, complete captures, or invented surrounding source.
 
 mod report;
+mod source;
+pub use source::AtlasStreamSource;
 pub use report::{AtlasStreamFile, AtlasStreamFileState, AtlasStreamHit,
     AtlasStreamReport, AtlasStreamSelection, AtlasStreamStats};
 
-use std::{fs::File, mem::size_of};
+use std::{fs::File, marker::PhantomData, mem::size_of};
 use fcb_core::{ByteLength, QueryGeneration, ResourceAllocationId, ResourceBudget, SourceRevision};
 use crate::search::{CaptureRequest, FileSearch, FileSearchError, FileSearchReport,
     StreamReadError, StreamReadOptions, StreamReadState, StreamReadStats, StreamReadStep, StreamingNeedle};
@@ -78,25 +80,27 @@ impl From<FileSearchError> for AtlasStreamError { fn from(e: FileSearchError) ->
 /// The compiled literal and worker budget outlive this job, but not its finished
 /// report. Allocate a fresh first_revision and query generation for each new
 /// observation. A pathname/length match never reuses an old source observation.
-pub struct AtlasStreamSearch<'atlas, 'catalog, 'worker> {
-    report: AtlasStreamReport<'atlas, 'catalog>,
+pub struct AtlasStreamSearch<'atlas, 'catalog, 'worker, A: AtlasStreamSource = WorkspaceAtlas<'catalog>> {
+    report: AtlasStreamReport<'atlas, 'catalog, A>,
     needle: &'worker StreamingNeedle,
     budget: &'worker ResourceBudget,
     worker_allocation: ResourceAllocationId,
     first_revision: SourceRevision,
     active: Option<FileSearch<'worker>>,
 }
-impl<'atlas, 'catalog, 'worker> AtlasStreamSearch<'atlas, 'catalog, 'worker> {
+impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 'catalog, 'worker, A> {
     /// Allocations: [compact retained report, one reusable file-search worker].
     /// Build the StreamingNeedle separately; only exact text is admitted here.
     /// UTF-8 and BOM-marked UTF-16 reuse the shared engine's encoding contract.
-    pub fn new(atlas: &'atlas WorkspaceAtlas<'catalog>, needle: &'worker StreamingNeedle,
+    /// Both borrowed and retained atlases reuse their existing catalog/layout.
+    /// A filtered display layout is not a whole-catalog search authority.
+    pub fn new(atlas: &'atlas A, needle: &'worker StreamingNeedle,
         first_revision: SourceRevision, generation: QueryGeneration, limits: AtlasStreamLimits,
         budget: &'worker ResourceBudget, allocations: [ResourceAllocationId; 2]) -> Result<Self, AtlasStreamError> {
         atlas.validate_active()?;
         let text = needle.text_value().ok_or(AtlasStreamError::InvalidLimits)?;
         let count = atlas.catalog().entries().len();
-        if text.is_empty() || text.len() > MAX_ATLAS_STREAM_NEEDLE_BYTES
+        if count != atlas.file_count() || text.is_empty() || text.len() > MAX_ATLAS_STREAM_NEEDLE_BYTES
             || limits.max_matches > MAX_ATLAS_STREAM_MATCHES || limits.max_bytes > MAX_ATLAS_STREAM_BYTES
             || limits.max_read_calls > MAX_ATLAS_STREAM_CALLS || allocations[0] == allocations[1]
             || generation.owner() != atlas.layout().owner() || first_revision.owner() != atlas.layout().owner()
@@ -112,7 +116,7 @@ impl<'atlas, 'catalog, 'worker> AtlasStreamSearch<'atlas, 'catalog, 'worker> {
             .and_then(|n| limits.max_matches.checked_mul(size_of::<AtlasStreamHit>()).and_then(|h| n.checked_add(h)))
             .and_then(|n| witness_files.checked_mul(size_of::<usize>()).and_then(|h| n.checked_add(h)))
             .and_then(|n| n.checked_add(witness_bytes))
-            .and_then(|n| n.checked_add(text.len() + size_of::<Self>() + size_of::<AtlasStreamReport<'_, '_>>()))
+            .and_then(|n| n.checked_add(text.len() + size_of::<Self>() + size_of::<AtlasStreamReport<'_, '_, A>>()))
             .ok_or(AtlasStreamError::InvalidLimits)?;
         let lease = budget.try_reserve_managed(atlas.layout().owner(), allocations[0], ByteLength::new(charge as u64))
             .map_err(|_| AtlasStreamError::ResourceDenied)?;
@@ -124,13 +128,13 @@ impl<'atlas, 'catalog, 'worker> AtlasStreamSearch<'atlas, 'catalog, 'worker> {
             hits: reserve(limits.max_matches)?, matched_files: reserve(witness_files)?,
             witnesses: reserve(witness_bytes)?, literal, stats: AtlasStreamStats::default(),
             state: if count == 0 { AtlasStreamState::Finished } else { AtlasStreamState::Pending },
-            stop: None, _lease: lease };
+            stop: None, _lease: lease, _catalog: PhantomData };
         Ok(Self { report, needle, budget, worker_allocation: allocations[1], first_revision, active: None })
     }
     pub fn state(&self) -> AtlasStreamState { self.report.state }
     /// Only finalized files contribute hit rows. Active-file I/O is already
     /// included in stats, so cancellation/failure cannot hide spent I/O.
-    pub fn report(&self) -> &AtlasStreamReport<'atlas, 'catalog> { &self.report }
+    pub fn report(&self) -> &AtlasStreamReport<'atlas, 'catalog, A> { &self.report }
     pub fn cancel(&mut self) { self.active = None; self.report.state = AtlasStreamState::Canceled; }
 
     /// Supply files using the given exact catalog path/request; callback paths
@@ -260,7 +264,7 @@ impl<'atlas, 'catalog, 'worker> AtlasStreamSearch<'atlas, 'catalog, 'worker> {
     }
     /// Only a terminal, noncanceled operation may publish a standalone report.
     /// Partial coverage is still terminal and remains explicit in is_complete().
-    pub fn finish(self) -> Result<AtlasStreamReport<'atlas, 'catalog>, AtlasStreamError> {
+    pub fn finish(self) -> Result<AtlasStreamReport<'atlas, 'catalog, A>, AtlasStreamError> {
         match self.report.state {
             AtlasStreamState::Finished => { self.report.atlas.validate_active()?; Ok(self.report) }
             AtlasStreamState::Canceled => Err(AtlasStreamError::Canceled),
