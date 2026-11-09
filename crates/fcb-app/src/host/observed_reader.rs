@@ -17,8 +17,15 @@
 //! a matching stat nor an extent digest identifies a whole immutable file.
 //! Declared encoding belongs to each observation; no earlier BOM is reused.
 //! Logical text is not qualified paragraph shaping or a global line index.
+//! Explicit bounded searches scan this same open object and retain only exact
+//! literal witnesses. Showing surrounding current bytes is a separate window
+//! observation; it cannot silently replace the bytes behind an older hit.
 
-use std::{fs, mem::size_of, path::{Path, PathBuf}};
+mod search;
+pub use search::{MAX_OBSERVED_READER_MATCHES, MAX_OBSERVED_READER_NEEDLE_BYTES,
+    MAX_OBSERVED_READER_SCAN_BYTES, MAX_OBSERVED_READER_SEARCH_CALLS};
+
+use std::{fs, mem::size_of, path::{Path, PathBuf}, sync::Arc};
 use fcb::{ArenaOwnerId, BrowserSession, ByteLength, ByteOffset, ByteRange, FileId, SourceRevision};
 use fcb::search::{CaptureRequest, DetectedEncoding, ExtentConsistency, ExtentError,
     ExtentReadState, ExtentReadStats, ExtentStepBudget, ExtentText, ExtentViewError,
@@ -57,7 +64,7 @@ impl ObservedReaderEncoding {
 pub enum ObservedReaderError {
     App(AppError), Source(SourceError), Extent(ExtentError), View(ExtentViewError),
     InvalidPath, InvalidLimits, InvalidRange, MissingObservation, ObservationChanged,
-    Canceled, IdentityExhausted,
+    StaleQuery, MissingHit, Canceled, IdentityExhausted,
 }
 impl ObservedReaderError {
     pub fn is_canceled(&self) -> bool {
@@ -80,6 +87,8 @@ impl std::fmt::Display for ObservedReaderError {
             Self::InvalidRange => f.write_str("OBSERVED_READER_INVALID_RANGE"),
             Self::MissingObservation => f.write_str("OBSERVED_READER_OBSERVATION_UNAVAILABLE"),
             Self::ObservationChanged => f.write_str("OBSERVED_READER_LENGTH_CHANGED_DURING_ADMISSION"),
+            Self::StaleQuery => f.write_str("OBSERVED_READER_STALE_QUERY"),
+            Self::MissingHit => f.write_str("OBSERVED_READER_MISSING_HIT"),
             Self::Canceled => f.write_str("OBSERVED_READER_CANCELED"),
             Self::IdentityExhausted => f.write_str("OBSERVED_READER_IDENTITY_EXHAUSTED"),
         }
@@ -109,11 +118,16 @@ struct Observation {
 /// survive; an evicted ID fails rather than rereading its old coordinates.
 pub struct ObservedReaderSession {
     reader: FileRangeReader,
+    // Duplicated from the admitted descriptor, never reopened by pathname.
+    // Positioned scan reads do not move the range reader's shared file cursor.
+    search_file: fs::File,
     path: PathBuf,
     initial_length: ByteLength,
     observations: [Option<Observation>; MAX_OBSERVED_READER_OBSERVATIONS],
     next_slot: usize,
     last_observation: u64,
+    last_query_attempt: u64,
+    query: Option<Arc<search::AcceptedSearch>>,
     next_allocation: u64,
     source_bytes_read: u64,
     read_calls: u64,
@@ -144,11 +158,13 @@ impl ObservedReaderSession {
         let path = workspace::checked_source_path(&root, &selected)?;
         check(&mut canceled)?;
         let (file, metadata) = input::open_regular(&path)?;
+        let search_file = file.try_clone().map_err(|_| AppError::Io)?;
         let file_id = FileId::new(owner, 1).map_err(|_| ObservedReaderError::IdentityExhausted)?;
         let reader = FileRangeReader::new(file_id, file)?;
         check(&mut canceled)?;
-        Ok(Self { reader, path, initial_length: ByteLength::new(metadata.len()),
+        Ok(Self { reader, search_file, path, initial_length: ByteLength::new(metadata.len()),
             observations: std::array::from_fn(|_| None), next_slot: 0, last_observation: 0,
+            last_query_attempt: 0, query: None,
             next_allocation: 2, source_bytes_read: 0, read_calls: 0, budget, _lease: lease })
     }
 

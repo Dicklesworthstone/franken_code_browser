@@ -5,7 +5,8 @@
 //! host/source services. No input pointer survives the synchronous call.
 
 use std::{ffi::{c_char, c_void}, path::Path, sync::OnceLock};
-use fcb_app::host::{HostResponse, observed_reader::ObservedReaderEncoding};
+use fcb_app::host::{HostResponse, observed_reader::{ObservedReaderEncoding,
+    MAX_OBSERVED_READER_NEEDLE_BYTES}};
 use super::{reply, string_out, SearchCancellationCallback};
 use super::observed_reader_sessions::{AccessError, Command, ObservedReaderSessions};
 
@@ -42,6 +43,12 @@ fn decode_path(hex: &str, bytes: &mut [u8; MAX_PATH_BYTES]) -> Result<usize, Acc
         bytes[index] = digit(pair[0])? * 16 + digit(pair[1])?;
     }
     Ok(hex.len() / 2)
+}
+fn decode_encoding(encoding: u64) -> Result<ObservedReaderEncoding, AccessError> {
+    match encoding {
+        1 => Ok(ObservedReaderEncoding::Utf8), 2 => Ok(ObservedReaderEncoding::Utf16Le),
+        3 => Ok(ObservedReaderEncoding::Utf16Be), _ => Err(AccessError::InvalidArgument),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -82,10 +89,7 @@ pub extern "C" fn fcb_observed_reader_info(handle: u64) -> *mut c_char {
 pub unsafe extern "C" fn fcb_observed_reader_window(handle: u64, offset: u64, bytes: u64,
     encoding: u64, poll: Option<SearchCancellationCallback>, context: *mut c_void) -> *mut c_char {
     reply(|| answer(handle, |readers| {
-        let encoding = match encoding {
-            1 => ObservedReaderEncoding::Utf8, 2 => ObservedReaderEncoding::Utf16Le,
-            3 => ObservedReaderEncoding::Utf16Be, _ => return Err(AccessError::InvalidArgument),
-        };
+        let encoding = decode_encoding(encoding)?;
         let bytes = usize::try_from(bytes).map_err(|_| AccessError::InvalidArgument)?;
         readers.execute(handle, Command::Window { offset, bytes, encoding },
             || poll.is_some_and(|poll| unsafe { poll(context) != 0 }))
@@ -102,6 +106,34 @@ pub extern "C" fn fcb_observed_reader_copy(handle: u64, observation: u64, start:
     reply(|| answer(handle, |readers| readers.execute(handle,
         Command::Copy { observation, start, end }, || false)))
 }
+
+/// Search one continuous observation of the already opened file. Only exact
+/// literal witnesses are retained, not surrounding source or a whole capture.
+/// # Safety
+/// needle is null or readable NUL-terminated UTF-8 through return. The bounded
+/// input is borrowed only for this call. If supplied, poll/context obey the
+/// same worker lifetime contract as open, including no blocking or unwinding.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_observed_reader_find(handle: u64, generation: u64,
+    needle: *const c_char, encoding: u64, max_matches: u64, max_scan_bytes: u64,
+    poll: Option<SearchCancellationCallback>, context: *mut c_void) -> *mut c_char {
+    reply(|| answer(handle, |readers| {
+        let needle = unsafe { bounded_text(needle, MAX_OBSERVED_READER_NEEDLE_BYTES) }?;
+        let encoding = decode_encoding(encoding)?;
+        let max_matches = usize::try_from(max_matches).map_err(|_| AccessError::InvalidArgument)?;
+        readers.execute(handle, Command::Find { generation, needle, encoding, max_matches, max_scan_bytes },
+            || poll.is_some_and(|poll| unsafe { poll(context) != 0 }))
+    }))
+}
+
+/// Return only the accepted query's retained matched bytes. No source I/O and
+/// no silent substitution from current file contents or another query.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_observed_reader_search_hit(handle: u64, generation: u64, position: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| {
+        let position = usize::try_from(position).map_err(|_| AccessError::InvalidArgument)?;
+        readers.execute(handle, Command::SearchHit { generation, position }, || false)
+    }))
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_observed_reader_cancel(handle: u64) -> u8 {

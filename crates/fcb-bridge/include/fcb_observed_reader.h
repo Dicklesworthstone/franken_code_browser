@@ -60,6 +60,34 @@ char *fcb_observed_reader_retained(uint64_t handle, uint64_t observation);
 char *fcb_observed_reader_copy(uint64_t handle, uint64_t observation,
     uint64_t start, uint64_t end);
 
+/* Exact case-sensitive decoded-text search from byte zero of the SAME opened
+ * file object. Runs on a worker, polling cooperatively between bounded reads.
+ * generation is nonzero and strictly increases on each valid query attempt.
+ * needle is NUL-terminated UTF-8, 1..4096 bytes; encoding has the window values.
+ * max_matches is 0..256; max_scan_bytes is 0..4294967296 (4 GiB). A separate
+ * 1048576-call bound also applies. A zero hit limit probes for one actual match;
+ * a byte/call/hit limit or unsupported decoding reports incomplete coverage.
+ *
+ * A fresh search_observation identifies the continuous observed sequence, NOT
+ * an atomic snapshot. Before/after metadata, scanned bytes, matches seen and
+ * retained hits are separate fields. One accepted query and its literal
+ * witness are retained independently of the eight window observations. Failed
+ * or canceled replacements preserve the previous accepted query under its
+ * original generation. A null/late reply does not prove state was unchanged.
+ */
+char *fcb_observed_reader_find(uint64_t handle, uint64_t generation,
+    const char *needle, uint64_t encoding, uint64_t max_matches,
+    uint64_t max_scan_bytes, fcb_observed_reader_poll poll, void *context);
+
+/* Zero-based hit_index must belong to the current accepted query generation.
+ * Returns exactly the retained literal text/bytes and original-byte range,
+ * with no source reread. Surrounding context was NOT retained. A host may
+ * explicitly request a new window and verify the witness against those new
+ * bytes; it must never label that window as the original search observation.
+ */
+char *fcb_observed_reader_search_hit(uint64_t handle, uint64_t generation,
+    uint64_t hit_index);
+
 /* Cancellation revokes in-flight delivery without waiting on source work.
  * Close removes authority immediately; its admission survives in-flight calls.
  * Returns 1 on success, 0 for unknown/busy/exhausted handles. */

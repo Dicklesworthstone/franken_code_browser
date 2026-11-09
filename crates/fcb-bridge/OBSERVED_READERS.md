@@ -53,6 +53,46 @@ context reads preserve scalar and CRLF boundaries. Returned text is explicitly
 logical observed text, not paragraph shaping or an exact global line-number
 index. Original-byte copies are distinct from decoded display text.
 
+## Find across the opened file
+
+`fcb_observed_reader_find` runs the existing `FileSearch` streaming engine over
+the same opened file object. It starts at byte zero and reads through a bounded
+16 KiB buffer. Searching a large file does not capture that whole file, populate
+the range-reader cache, create a temporary source copy, or reopen its pathname.
+The host runs the call on its worker and can cancel it through the supplied poll
+or the handle cancellation API.
+
+The request supplies a strictly increasing query generation, an exact
+case-sensitive UTF-8 literal, the declared source encoding, and byte/hit limits.
+Supported encodings are UTF-8, UTF-16LE and UTF-16BE. Matches can overlap and cross
+read boundaries. Limits are 4096 UTF-8 query bytes, 256 retained hits, 4 GiB scanned
+source bytes and 1,048,576 read calls. A host can admit a smaller operation; zero
+retained hits still probes for an actual match instead of assuming truncation.
+
+The `find` receipt separates observed input length, bytes actually read/scanned,
+matches seen, retained rows, decoder limitations and before/after metadata
+consistency. Limit exhaustion is partial coverage, not proof that no later
+match exists. `search_complete` requires both a completed scan and unchanged
+observed metadata. It never means an atomic filesystem snapshot. Each search
+spends a fresh `search_observation` from the same monotone revision domain as
+range observations, independently of its query generation.
+
+One accepted search retains only its hit coordinates and a shared exact literal
+witness. `fcb_observed_reader_search_hit` resolves a zero-based hit index under
+that accepted generation and returns the original matched bytes without I/O.
+Those bytes remain exact after edits or pathname replacement. Surrounding source
+was not retained. To inspect it, explicitly request a fresh window, identify it
+as a new observation, and compare the old literal witness with that window's
+original bytes before adding a match highlight. A changed or unavailable range
+must not receive the old match's identity.
+
+Failed/canceled replacement searches preserve the previous accepted query under
+its original generation. Once a new query is accepted, older query targets are
+unavailable. Hosts revoke obsolete visible targets immediately on query or
+encoding changes and fence late replies with their own request identity. Actual
+I/O from unsuccessful scans is still counted by `info`; its existing
+`retained_payload_bytes` field continues to describe the eight range observations.
+
 Failed/canceled observation candidates do not replace retained pages. A late
 cancellation or lost bridge reply can suppress delivery after state acceptance;
 hosts preserve their last accepted view and use retained/info operations when
@@ -60,7 +100,8 @@ reconciling. They never automatically repeat a live read under an old identity.
 
 ## Verification boundary
 
-`fcb-app/tests/observed_host_reader.rs` exercises the real source adapter;
+`fcb-app/tests/observed_host_reader.rs` and `observed_reader_search.rs` exercise
+the real source adapter and streaming search;
 `observed_reader_ffi_tests.rs` exercises the exported C route, and
 `observed_reader_sessions_tests.rs` covers capacity, cancellation, owner identity
 and draining permits. Native decoder/model/ABI fixtures supplement those paths.

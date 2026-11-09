@@ -91,3 +91,64 @@ fn cancellation_reuses_the_session_but_never_the_observation_or_handle_identity(
     readers.close(handle).unwrap();
     complete_readers.close(complete).unwrap();
 }
+
+#[test]
+fn close_during_search_revokes_results_but_retains_capacity_until_the_worker_drains() {
+    let readers = ObservedReaderSessions::new();
+    let handles: Vec<_> = (0..MAX_SESSIONS).map(|_| readers.create().unwrap()).collect();
+    let path = root();
+    let first = handles[0];
+    readers.open(first, &path, b"source.rs", || false).unwrap();
+    readers.open(handles[1], &path, b"source.rs", || false).unwrap();
+    let (entered, receive_entered) = mpsc::sync_channel(0);
+    let (release, receive_release) = mpsc::sync_channel(0);
+    std::thread::scope(|scope| {
+        let readers_ref = &readers;
+        let worker = scope.spawn(move || {
+            let mut sent = false;
+            readers_ref.execute(first, Command::Find { generation: 1, needle: "source",
+                encoding: ObservedReaderEncoding::Utf8, max_matches: 10, max_scan_bytes: 1024 }, || {
+                // Hold the direct service's cancellation hook to expose its
+                // in-flight lifetime. This is not a foreign C callback.
+                if !sent {
+                    sent = true; entered.send(()).unwrap(); receive_release.recv().unwrap();
+                }
+                false
+            })
+        });
+        receive_entered.recv().unwrap();
+        assert!(matches!(readers.execute(first, Command::Info, || false), Err(AccessError::Busy)));
+        // Work in one reader must never hold the global table or another cell.
+        assert!(readers.execute(handles[1], Command::Info, || false).is_ok());
+        readers.close(first).unwrap();
+        assert!(matches!(readers.execute(first, Command::SearchHit { generation: 1, position: 0 },
+            || false), Err(AccessError::Unknown)));
+        assert!(matches!(readers.create(), Err(AccessError::Capacity)));
+        release.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+    });
+    let replacement = readers.create().unwrap();
+    assert!(!handles.contains(&replacement));
+    readers.close(replacement).unwrap();
+    for handle in handles.into_iter().skip(1) { readers.close(handle).unwrap(); }
+    assert_eq!(readers.live.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn rejected_search_replacements_preserve_only_the_previous_query_generation() {
+    let readers = ObservedReaderSessions::new();
+    let handle = readers.create().unwrap();
+    let path = root();
+    readers.open(handle, &path, b"source.rs", || false).unwrap();
+    let query = |generation| Command::Find { generation, needle: "source",
+        encoding: ObservedReaderEncoding::Utf8, max_matches: 10, max_scan_bytes: 1024 };
+    readers.execute(handle, query(1), || false).unwrap();
+    assert!(readers.execute(handle, query(2), || true).is_err());
+    assert!(readers.execute(handle, query(2), || false).is_err());
+    assert!(readers.execute(handle, Command::SearchHit { generation: 2, position: 0 }, || false).is_err());
+    let witness = readers.execute(handle, Command::SearchHit { generation: 1, position: 0 }, || false).unwrap();
+    assert!(witness.as_str().contains("\"original_hex\":\"736f75726365\""));
+    readers.execute(handle, query(3), || false).unwrap();
+    assert!(readers.execute(handle, Command::SearchHit { generation: 1, position: 0 }, || false).is_err());
+    readers.close(handle).unwrap();
+}

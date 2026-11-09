@@ -61,11 +61,14 @@ impl AccessError {
     }
 }
 
-pub(super) enum Command {
+pub(super) enum Command<'a> {
     Info,
     Window { offset: u64, bytes: usize, encoding: ObservedReaderEncoding },
     Retained { observation: u64 },
     Copy { observation: u64, start: u64, end: u64 },
+    Find { generation: u64, needle: &'a str, encoding: ObservedReaderEncoding,
+        max_matches: usize, max_scan_bytes: u64 },
+    SearchHit { generation: u64, position: usize },
 }
 
 struct Permit(Arc<AtomicUsize>);
@@ -135,7 +138,7 @@ impl ObservedReaderSessions {
         cell.validate(epoch)?;
         Ok(response)
     }
-    pub(super) fn execute(&self, handle: u64, command: Command,
+    pub(super) fn execute(&self, handle: u64, command: Command<'_>,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
         let cell = self.get(handle)?;
         let epoch = cell.epoch.load(Ordering::Acquire);
@@ -148,6 +151,9 @@ impl ObservedReaderSessions {
             Command::Window { offset, bytes, encoding } => reader.read_window(offset, bytes, encoding, &mut stop),
             Command::Retained { observation } => reader.retained_window(observation, &mut stop),
             Command::Copy { observation, start, end } => reader.copy_range(observation, start, end, &mut stop),
+            Command::Find { generation, needle, encoding, max_matches, max_scan_bytes } =>
+                reader.search(generation, needle, encoding, max_matches, max_scan_bytes, &mut stop),
+            Command::SearchHit { generation, position } => reader.search_hit(generation, position, &mut stop),
         };
         cell.validate(epoch)?;
         result.map_err(AccessError::from)
