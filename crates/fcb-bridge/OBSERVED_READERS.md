@@ -86,6 +86,17 @@ as a new observation, and compare the old literal witness with that window's
 original bytes before adding a match highlight. A changed or unavailable range
 must not receive the old match's identity.
 
+`fcb_observed_reader_observe_hit` combines that explicit fresh-context request
+and witness verification. It takes the accepted query generation and hit index,
+a bounded amount of preceding context, and a 4–262144 byte window. The source
+adapter checks the retained literal's original bytes, decoded text and exact
+original-to-decoded range mapping before publishing or evicting any page. A
+changed or unavailable hit returns `OBSERVED_READER_SEARCH_HIT_CHANGED` and
+leaves accepted observations intact. Success creates a new range observation
+with a verified `find_hit` receipt and page-local UTF-8 selection. Retained
+navigation replays that receipt even after a later Find replaces the query;
+the page never becomes a result of the replacement query.
+
 Failed/canceled replacement searches preserve the previous accepted query under
 its original generation. Once a new query is accepted, older query targets are
 unavailable. Hosts revoke obsolete visible targets immediately on query or
@@ -100,9 +111,10 @@ reconciling. They never automatically repeat a live read under an old identity.
 
 ## Verification boundary
 
-`fcb-app/tests/observed_host_reader.rs` and `observed_reader_search.rs` exercise
-the real source adapter and streaming search;
-`observed_reader_ffi_tests.rs` exercises the exported C route, and
+`fcb-app/tests/observed_host_reader.rs`, `observed_reader_search.rs` and
+`observed_reader_hit_navigation.rs` exercise the real source adapter, streaming
+search and fresh-hit verification; `observed_reader_ffi_tests.rs` and
+`observed_reader_search_ffi_tests.rs` exercise the exported C routes, and
 `observed_reader_sessions_tests.rs` covers capacity, cancellation, owner identity
 and draining permits. Native decoder/model/ABI fixtures supplement those paths.
 The implementation is code-first, batch verification pending. Unexecuted

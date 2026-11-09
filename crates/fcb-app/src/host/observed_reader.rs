@@ -64,7 +64,7 @@ impl ObservedReaderEncoding {
 pub enum ObservedReaderError {
     App(AppError), Source(SourceError), Extent(ExtentError), View(ExtentViewError),
     InvalidPath, InvalidLimits, InvalidRange, MissingObservation, ObservationChanged,
-    StaleQuery, MissingHit, Canceled, IdentityExhausted,
+    StaleQuery, MissingHit, SearchHitChanged, Canceled, IdentityExhausted,
 }
 impl ObservedReaderError {
     pub fn is_canceled(&self) -> bool {
@@ -89,6 +89,7 @@ impl std::fmt::Display for ObservedReaderError {
             Self::ObservationChanged => f.write_str("OBSERVED_READER_LENGTH_CHANGED_DURING_ADMISSION"),
             Self::StaleQuery => f.write_str("OBSERVED_READER_STALE_QUERY"),
             Self::MissingHit => f.write_str("OBSERVED_READER_MISSING_HIT"),
+            Self::SearchHitChanged => f.write_str("OBSERVED_READER_SEARCH_HIT_CHANGED"),
             Self::Canceled => f.write_str("OBSERVED_READER_CANCELED"),
             Self::IdentityExhausted => f.write_str("OBSERVED_READER_IDENTITY_EXHAUSTED"),
         }
@@ -111,6 +112,7 @@ struct Observation {
     encoding: ObservedReaderEncoding,
     sha256: Sha256Digest,
     io: ExtentReadStats,
+    find_hit: Option<search::FindHit>,
 }
 
 /// Each session requires a fresh non-reused owner. All accepted observations
@@ -187,7 +189,9 @@ impl ObservedReaderSession {
             if position > 0 { out.literal(",")?; }
             out.integer(id)?;
         }
-        out.literal("]}\n")?;
+        out.literal("]")?;
+        search::encode_search_info(&mut out, self.query.as_deref())?;
+        out.literal("}\n")?;
         self.finish_output(out, EXIT_OK, &mut canceled)
     }
 
@@ -196,9 +200,17 @@ impl ObservedReaderSession {
     /// Scalars/CRLF may adjust the visible bounds; no prefix scan is performed.
     pub fn read_window(&mut self, offset: u64, bytes: usize, encoding: ObservedReaderEncoding,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, ObservedReaderError> {
-        self.last_observation = self.last_observation.checked_add(1).ok_or(ObservedReaderError::IdentityExhausted)?;
-        let revision = SourceRevision::new(self.owner(), self.last_observation).map_err(|_| ObservedReaderError::IdentityExhausted)?;
-        check(&mut canceled)?;
+        let revision = self.next_revision()?;
+        let candidate = self.capture_window(revision, offset, bytes, encoding, &mut canceled)?;
+        let response = self.page_response("window", &candidate, true, &mut canceled)?;
+        self.accept_observation(candidate);
+        Ok(response)
+    }
+
+    fn capture_window(&mut self, revision: SourceRevision, offset: u64, bytes: usize,
+        encoding: ObservedReaderEncoding, canceled: &mut impl FnMut() -> bool)
+        -> Result<Observation, ObservedReaderError> {
+        check(canceled)?;
         if !(4..=MAX_OBSERVED_READER_WINDOW_BYTES).contains(&bytes) { return Err(ObservedReaderError::InvalidLimits); }
         // Refuse before reading if cumulative accounting could no longer be
         // represented. Failed native reads spend these allowances too.
@@ -210,21 +222,22 @@ impl ObservedReaderSession {
         let mut request = CaptureRequest::new(self.reader.file_id(), revision)?;
         if !plan.capture.is_empty() { request = request.with_range(plan.capture)?; }
         let [read_id] = self.allocations()?;
-        let (captured, io) = capture(&mut self.reader, request, &self.budget, read_id, &mut canceled);
+        let (captured, io) = capture(&mut self.reader, request, &self.budget, read_id, canceled);
         self.source_bytes_read += io.bytes_read; // Headroom was admitted above.
         self.read_calls += io.read_calls;
         let extent = captured?;
         // Planning and the read's initial stat are distinct observations. Do
         // not encode bounds planned from a different length as though identical.
         if extent.observed_length() != length { return Err(ObservedReaderError::ObservationChanged); }
-        let sha256 = extent_sha256(extent.bytes(), &mut canceled)?;
-        let candidate = Observation { extent, plan, requested_bytes: bytes, encoding, sha256, io };
-        let response = self.page_response("window", &candidate, true, &mut canceled)?;
+        let sha256 = extent_sha256(extent.bytes(), canceled)?;
+        Ok(Observation { extent, plan, requested_bytes: bytes, encoding, sha256, io, find_hit: None })
+    }
+
+    fn accept_observation(&mut self, candidate: Observation) {
         // Publication is a single infallible move after the final delivery
         // cancellation gate. A missing foreign reply can recover by ID/info.
         self.observations[self.next_slot] = Some(candidate);
         self.next_slot = (self.next_slot + 1) % MAX_OBSERVED_READER_OBSERVATIONS;
-        Ok(response)
     }
 
     pub fn retained_window(&mut self, observation: u64, mut canceled: impl FnMut() -> bool)
@@ -252,6 +265,10 @@ impl ObservedReaderSession {
     }
 
     fn owner(&self) -> ArenaOwnerId { self.reader.file_id().owner() }
+    fn next_revision(&mut self) -> Result<SourceRevision, ObservedReaderError> {
+        self.last_observation = self.last_observation.checked_add(1).ok_or(ObservedReaderError::IdentityExhausted)?;
+        SourceRevision::new(self.owner(), self.last_observation).map_err(|_| ObservedReaderError::IdentityExhausted)
+    }
     fn observation(&self, id: u64) -> Result<&Observation, ObservedReaderError> {
         self.observations.iter().flatten().find(|page| page.extent.request().revision().get() == id)
             .ok_or(ObservedReaderError::MissingObservation)
@@ -266,6 +283,11 @@ impl ObservedReaderSession {
         check(canceled)?;
         let [decode_id, clipped_decode_id] = self.allocations()?;
         let text = decode(page, &self.budget, [decode_id, clipped_decode_id], canceled)?;
+        self.page_response_decoded(command, page, &text, new_read, canceled)
+    }
+    fn page_response_decoded(&mut self, command: &str, page: &Observation, text: &ExtentText,
+        new_read: bool, canceled: &mut impl FnMut() -> bool) -> Result<HostResponse, ObservedReaderError> {
+        check(canceled)?;
         let mut out = self.output(command)?;
         encode_observation(&mut out, page, new_read)?;
         out.literal(",\"text_kind\":\"logical-observed-text-not-shaped\",\"visible_range\":")?; out.range(text.range())?;
@@ -279,6 +301,7 @@ impl ObservedReaderSession {
         out.literal(",\"has_replacements\":")?; out.boolean(text.has_replacements())?;
         out.literal(",\"next_offset\":")?;
         if let Some(next) = text.next_offset() { out.integer(next.get())?; } else { out.literal("null")?; }
+        search::encode_find_hit(&mut out, page.find_hit)?;
         out.literal("}\n")?;
         let exit = if whole_observation(&page.extent) { EXIT_OK } else { EXIT_PARTIAL };
         self.finish_output(out, exit, canceled)

@@ -88,6 +88,19 @@ char *fcb_observed_reader_find(uint64_t handle, uint64_t generation,
 char *fcb_observed_reader_search_hit(uint64_t handle, uint64_t generation,
     uint64_t hit_index);
 
+/* Activate an accepted search hit by zero-based index. Context is freshly read
+ * from the opened descriptor and its original hit bytes must equal the retained
+ * literal witness. Changed/unavailable bytes return an error; old observations
+ * remain readable. Success returns a NEW observation plus verified find_hit
+ * provenance and page-local decoded UTF-8 selection. It never reuses the old
+ * search observation's identity. Context and window sizes are bounded by the
+ * source service; window_bytes is 4..262144 and must contain the full hit.
+ * Retained-window navigation afterward performs no file I/O.
+ */
+char *fcb_observed_reader_observe_hit(uint64_t handle, uint64_t generation,
+    uint64_t hit_index, uint64_t context_bytes, uint64_t window_bytes,
+    fcb_observed_reader_poll poll, void *context);
+
 /* Cancellation revokes in-flight delivery without waiting on source work.
  * Close removes authority immediately; its admission survives in-flight calls.
  * Returns 1 on success, 0 for unknown/busy/exhausted handles. */

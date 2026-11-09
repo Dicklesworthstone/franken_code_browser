@@ -69,6 +69,7 @@ pub(super) enum Command<'a> {
     Find { generation: u64, needle: &'a str, encoding: ObservedReaderEncoding,
         max_matches: usize, max_scan_bytes: u64 },
     SearchHit { generation: u64, position: usize },
+    ObserveHit { generation: u64, hit_index: usize, context_bytes: usize, window_bytes: usize },
 }
 
 struct Permit(Arc<AtomicUsize>);
@@ -154,6 +155,8 @@ impl ObservedReaderSessions {
             Command::Find { generation, needle, encoding, max_matches, max_scan_bytes } =>
                 reader.search(generation, needle, encoding, max_matches, max_scan_bytes, &mut stop),
             Command::SearchHit { generation, position } => reader.search_hit(generation, position, &mut stop),
+            Command::ObserveHit { generation, hit_index, context_bytes, window_bytes } =>
+                reader.observe_hit(generation, hit_index, context_bytes, window_bytes, &mut stop),
         };
         cell.validate(epoch)?;
         result.map_err(AccessError::from)

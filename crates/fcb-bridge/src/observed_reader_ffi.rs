@@ -134,6 +134,24 @@ pub extern "C" fn fcb_observed_reader_search_hit(handle: u64, generation: u64, p
         let position = usize::try_from(position).map_err(|_| AccessError::InvalidArgument)?;
         readers.execute(handle, Command::SearchHit { generation, position }, || false)
     }))
+}
+
+/// Read fresh context for a retained search hit, verify its literal witness,
+/// and publish a NEW observation only after verification. Never an old capture.
+/// # Safety
+/// poll/context obey the worker lifetime and non-reentrancy contract of open.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_observed_reader_observe_hit(handle: u64, generation: u64,
+    hit_index: u64, context_bytes: u64, window_bytes: u64,
+    poll: Option<SearchCancellationCallback>, context: *mut c_void) -> *mut c_char {
+    reply(|| answer(handle, |readers| {
+        let hit_index = usize::try_from(hit_index).map_err(|_| AccessError::InvalidArgument)?;
+        let context_bytes = usize::try_from(context_bytes).map_err(|_| AccessError::InvalidArgument)?;
+        let window_bytes = usize::try_from(window_bytes).map_err(|_| AccessError::InvalidArgument)?;
+        readers.execute(handle, Command::ObserveHit { generation, hit_index, context_bytes, window_bytes },
+            || poll.is_some_and(|poll| unsafe { poll(context) != 0 }))
+    }))
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_observed_reader_cancel(handle: u64) -> u8 {
@@ -148,3 +166,7 @@ pub extern "C" fn fcb_observed_reader_close(handle: u64) -> u8 {
 #[cfg(all(test, unix))]
 #[path = "observed_reader_ffi_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "observed_reader_search_ffi_tests.rs"]
+mod search_tests;

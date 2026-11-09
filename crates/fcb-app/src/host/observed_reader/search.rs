@@ -5,7 +5,7 @@
 //! no whole-file capture, source spool, new matcher or inferred context exists.
 
 use std::{fs::File, mem::size_of, sync::Arc};
-use fcb::{ByteLength, ByteOffset, QueryGeneration, SourceRevision};
+use fcb::{ByteLength, ByteOffset, ByteRange, QueryGeneration, SourceRevision};
 use fcb::search::{CaptureRequest, DetectedEncoding, ExtentConsistency, FileSearch,
     FileSearchReport, ResourceAllocationId, ResourceBudget, StreamReadOptions,
     StreamReadState, StreamReadStats, StreamReadStep, StreamingHit, StreamingNeedle};
@@ -14,7 +14,7 @@ use fcb_core::ResourceLease;
 use crate::{AppError, EXIT_OK, EXIT_PARTIAL};
 use crate::output::Output;
 use super::{HostResponse, ObservedReaderEncoding, ObservedReaderError,
-    ObservedReaderSession, check, extent_sha256};
+    ObservedReaderSession, MAX_OBSERVED_READER_WINDOW_BYTES, check, decode, extent_sha256};
 
 pub const MAX_OBSERVED_READER_NEEDLE_BYTES: usize = 4096;
 pub const MAX_OBSERVED_READER_MATCHES: usize = 256;
@@ -41,7 +41,28 @@ pub(super) struct AcceptedSearch {
     _lease: ResourceLease,
 }
 
+/// A verified hit selection belongs to its accepted immutable page. Replacing
+/// the current query cannot erase the provenance needed for history replay.
+#[derive(Clone, Copy)]
+pub(super) struct FindHit {
+    generation: u64,
+    search_observation: u64,
+    hit_index: usize,
+    occurrence: u64,
+    original_range: ByteRange,
+    decoded_start: u64,
+    decoded_end: u64,
+}
+
 impl ObservedReaderSession {
+    /// Native Find naming for the existing search capability. Both entry
+    /// points share one accepted query, the same limits and zero-limit probes.
+    pub fn find(&mut self, generation: u64, needle: &str, encoding: ObservedReaderEncoding,
+        max_matches: usize, max_scan_bytes: u64, canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, ObservedReaderError> {
+        self.search(generation, needle, encoding, max_matches, max_scan_bytes, canceled)
+    }
+
     /// Search the same explicitly opened file from byte zero, under independent
     /// byte/call/result limits. Exact UTF-8/UTF-16 semantics and overlapping hits
     /// come from FileSearch. Whole-file completion is an observed sequence with
@@ -119,12 +140,58 @@ impl ObservedReaderSession {
         self.finish_output(out, EXIT_OK, &mut canceled)
     }
 
+    /// Read surrounding current bytes as a NEW observation and verify the
+    /// retained literal against both original bytes and the shared decoder.
+    /// Unlike search_hit, this operation performs bounded source I/O. A changed
+    /// witness, invalid decoded selection or cancellation cannot evict history.
+    pub fn observe_hit(&mut self, generation: u64, hit_index: usize, context_bytes: usize,
+        window_bytes: usize, mut canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, ObservedReaderError> {
+        let revision = self.next_revision()?;
+        check(&mut canceled)?;
+        let query = self.query.as_ref().filter(|query| query.generation.get() == generation)
+            .ok_or(ObservedReaderError::StaleQuery)?.clone();
+        let hit = *query.hits.get(hit_index).ok_or(ObservedReaderError::MissingHit)?;
+        let witness_bytes = query.literal_bytes.len();
+        // Scalar/CRLF floors can move both visible edges. Keep eight bytes of
+        // slack so preferred context cannot clip any part of the selected hit.
+        if !(4..=MAX_OBSERVED_READER_WINDOW_BYTES).contains(&window_bytes)
+            || context_bytes > MAX_OBSERVED_READER_WINDOW_BYTES
+            || witness_bytes.checked_add(8).is_none_or(|need| need > window_bytes) {
+            return Err(ObservedReaderError::InvalidLimits);
+        }
+        let prefix = context_bytes.min(window_bytes - witness_bytes - 8) as u64;
+        let offset = hit.original_range().start().get().saturating_sub(prefix);
+        let mut candidate = self.capture_window(revision, offset, window_bytes, query.encoding, &mut canceled)?;
+        let [decode_id, clipped_decode_id] = self.allocations()?;
+        let text = decode(&candidate, &self.budget, [decode_id, clipped_decode_id], &mut canceled)?;
+        let original = hit.original_range();
+        if candidate.extent.range_bytes(original).ok() != Some(query.literal_bytes.as_slice()) {
+            return Err(ObservedReaderError::SearchHitChanged);
+        }
+        let decoded = text.source_to_text(original).map_err(|_| ObservedReaderError::SearchHitChanged)?;
+        let selection = text.text_selection(decoded).map_err(|_| ObservedReaderError::SearchHitChanged)?;
+        if selection.original_range != original || selection.original_bytes != query.literal_bytes.as_slice()
+            || selection.text != query.literal_text.as_str() || selection.contains_replacements {
+            return Err(ObservedReaderError::SearchHitChanged);
+        }
+        candidate.find_hit = Some(FindHit { generation, search_observation: query.request.revision().get(),
+            hit_index, occurrence: hit.occurrence_id(), original_range: original,
+            decoded_start: decoded.start().get(), decoded_end: decoded.end().get() });
+        let response = self.page_response_decoded("observe-hit", &candidate, &text, true, &mut canceled)?;
+        self.accept_observation(candidate);
+        Ok(response)
+    }
+
     fn search_response(&mut self, query: &AcceptedSearch, canceled: &mut impl FnMut() -> bool)
         -> Result<HostResponse, ObservedReaderError> {
         check(canceled)?;
         let mut out = self.output("find")?;
         encode_query(&mut out, query)?;
         out.literal(",\"mode\":\"exact-decoded-text\",\"case_sensitive\":true,\"literal_text\":")?;
+        out.quoted(&query.literal_text)?;
+        // Additive native aliases preserve every existing search receipt field.
+        out.literal(",\"search_kind\":\"continuous-open-file-observation\",\"needle\":")?;
         out.quoted(&query.literal_text)?;
         out.literal(",\"literal_original_hex\":")?;
         if query.hits.is_empty() { out.literal("null")?; } else { out.hex(&query.literal_bytes)?; }
@@ -133,6 +200,7 @@ impl ObservedReaderSession {
         for (key, value) in [("max_matches", query.max_matches as u64), ("max_scan_bytes", query.max_scan_bytes),
             ("max_read_calls", MAX_OBSERVED_READER_SEARCH_CALLS), ("payload_bytes_read", query.io.bytes_read),
             ("scanned_input_bytes", query.io.scanned_bytes), ("read_calls", query.io.read_calls),
+            ("source_bytes_read", query.io.bytes_read), ("scanned_bytes", query.io.scanned_bytes),
             ("peak_input_buffer_bytes", query.io.peak_buffer_bytes as u64), ("matches_seen", query.matches_seen),
             ("retained_hits", query.hits.len() as u64), ("additional_source_bytes_read", query.io.bytes_read),
             ("additional_read_calls", query.io.read_calls)] {
@@ -146,12 +214,40 @@ impl ObservedReaderSession {
             check(canceled)?;
             if index > 0 { out.literal(",")?; }
             out.literal("{\"index\":")?; out.integer(index as u64)?;
+            out.literal(",\"hit_index\":")?; out.integer(index as u64)?;
             out.literal(",\"occurrence_id\":")?; out.integer(hit.occurrence_id())?;
             out.literal(",\"original_range\":")?; out.range(hit.original_range())?; out.literal("}")?;
         }
         out.literal("]}\n")?;
         self.finish_output(out, if query.complete() { EXIT_OK } else { EXIT_PARTIAL }, canceled)
     }
+}
+
+pub(super) fn encode_find_hit(out: &mut Output, hit: Option<FindHit>) -> Result<(), ObservedReaderError> {
+    out.literal(",\"find_hit\":")?;
+    let Some(hit) = hit else { out.literal("null")?; return Ok(()); };
+    out.literal("{\"query_generation\":")?; out.integer(hit.generation)?;
+    out.literal(",\"search_observation\":")?; out.integer(hit.search_observation)?;
+    out.literal(",\"hit_index\":")?; out.integer(hit.hit_index as u64)?;
+    out.literal(",\"occurrence_id\":")?; out.integer(hit.occurrence)?;
+    out.literal(",\"original_range\":")?; out.range(hit.original_range)?;
+    out.literal(",\"decoded_utf8_range\":{\"start\":")?; out.integer(hit.decoded_start)?;
+    out.literal(",\"end\":")?; out.integer(hit.decoded_end)?;
+    out.literal("},\"witness_verified\":true,\"verification\":\"equal-original-bytes-in-new-observation\"}")?;
+    Ok(())
+}
+
+pub(super) fn encode_search_info(out: &mut Output, query: Option<&AcceptedSearch>)
+    -> Result<(), ObservedReaderError> {
+    // Accepted metadata stays unchanged across failed attempts and read-only
+    // witness activation, preserving the existing info/no-I/O contract.
+    out.literal(",\"accepted_search_generation\":")?;
+    if let Some(query) = query { out.integer(query.generation.get())?; } else { out.literal("null")?; }
+    out.literal(",\"accepted_search_observation\":")?;
+    if let Some(query) = query { out.integer(query.request.revision().get())?; } else { out.literal("null")?; }
+    out.literal(",\"retained_search_hits\":")?; out.integer(query.map_or(0, |query| query.hits.len() as u64))?;
+    out.literal(",\"retained_search_witness_bytes\":")?; out.integer(query.map_or(0, |query| query.literal_bytes.len() as u64))?;
+    Ok(())
 }
 
 impl AcceptedSearch {
