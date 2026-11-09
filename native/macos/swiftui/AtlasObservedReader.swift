@@ -160,22 +160,33 @@ struct AtlasObservedReaderPage: Sendable {
     let text, originalHex: String
     let hasReplacements: Bool
     let nextOffset: UInt64?
+    let findHit: AtlasObservedReaderHitNavigation?
+
+    var verifiedSearchSelection: NSRange? {
+        guard let findHit else { return nil }
+        return AtlasSource(path: observation.identity.displayPath, text: text)
+            .utf16Range(byteStart: findHit.decodedRange.start, byteEnd: findHit.decodedRange.end)
+    }
 
     func matches(_ other: Self) -> Bool {
         observation == other.observation && visibleRange == other.visibleRange
             && boundariesAdjusted == other.boundariesAdjusted && firstPhysicalLine == other.firstPhysicalLine
             && text.utf8.elementsEqual(other.text.utf8) && originalHex == other.originalHex
             && hasReplacements == other.hasReplacements && nextOffset == other.nextOffset
+            && findHit == other.findHit
     }
 
     static func decode(_ json: String?, handle: UInt64, input: AtlasObservedReaderInput,
-                       request: AtlasObservedReaderRequest? = nil, retained: Self? = nil) throws -> Self {
-        guard (request == nil) != (retained == nil) else { throw AtlasObservedReaderError.invalidInput }
+                       request: AtlasObservedReaderRequest? = nil, retained: Self? = nil,
+                       hit: AtlasObservedReaderSearchWitness? = nil) throws -> Self {
+        guard (request == nil) != (retained == nil), hit == nil || request != nil else {
+            throw AtlasObservedReaderError.invalidInput
+        }
         let data = try AtlasObservedReaderWire.admit(json, handle: handle)
         do {
             let header = try JSONDecoder().decode(AtlasObservedReaderWire.Header.self, from: data)
             let identity = try header.identity(handle: handle, input: input,
-                command: retained == nil ? "window" : "retained-window")
+                command: retained != nil ? "retained-window" : (hit != nil ? "observe-hit" : "window"))
             let basis = try JSONDecoder().decode(AtlasObservedReaderWire.Observation.self, from: data)
             let observation = try basis.value(identity: identity, reads: retained == nil)
             let w = try JSONDecoder().decode(Wire.self, from: data)
@@ -197,7 +208,10 @@ struct AtlasObservedReaderPage: Sendable {
             }
             let page = Self(observation: observation, visibleRange: w.visible_range,
                 boundariesAdjusted: w.boundaries_adjusted, firstPhysicalLine: first,
-                text: w.text, originalHex: w.original_hex, hasReplacements: w.has_replacements, nextOffset: next)
+                text: w.text, originalHex: w.original_hex, hasReplacements: w.has_replacements, nextOffset: next,
+                findHit: w.find_hit)
+            if let hit { try hit.validateVerifiedContext(page) }
+            else if retained == nil, w.find_hit != nil { throw AtlasObservedReaderError.invalidResponse }
             guard retained == nil || page.matches(retained!) else { throw AtlasObservedReaderError.invalidResponse }
             return page
         } catch { throw AtlasObservedReaderError.invalidResponse }
@@ -207,6 +221,7 @@ struct AtlasObservedReaderPage: Sendable {
         let visible_range: AtlasObservedByteRange
         let boundaries_adjusted, has_replacements: Bool
         let first_physical_line, next_offset: AtlasObservedReaderWire.Number?
+        let find_hit: AtlasObservedReaderHitNavigation?
     }
 }
 

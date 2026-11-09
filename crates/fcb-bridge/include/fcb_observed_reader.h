@@ -94,7 +94,8 @@ char *fcb_observed_reader_search_hit(uint64_t handle, uint64_t generation,
  * remain readable. Success returns a NEW observation plus verified find_hit
  * provenance and page-local decoded UTF-8 selection. It never reuses the old
  * search observation's identity. Context and window sizes are bounded by the
- * source service; window_bytes is 4..262144 and must contain the full hit.
+ * source service; window_bytes is 4..262144 and must contain the full hit plus
+ * eight bytes of scalar/CRLF boundary slack.
  * Retained-window navigation afterward performs no file I/O.
  */
 char *fcb_observed_reader_observe_hit(uint64_t handle, uint64_t generation,

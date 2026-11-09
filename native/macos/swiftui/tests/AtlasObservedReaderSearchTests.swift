@@ -48,6 +48,7 @@ private enum ObservedSearchFixture {
 
 private final class ObservedSearchProbe: @unchecked Sendable {
     let lifetime = ObservedReaderProbe()
+    private let verifiedNavigation: Bool
     private let lock = NSLock()
     private var inputs: [UInt64: AtlasObservedReaderInput] = [:]
     private var revisions: [UInt64: UInt64] = [:]
@@ -55,12 +56,21 @@ private final class ObservedSearchProbe: @unchecked Sendable {
     private var pages: [UInt64: [UInt64: [String: Any]]] = [:]
     private var content = "old\n"
     private var nextFindGate: ObservedReaderGate?, nextHitGate: ObservedReaderGate?, nextWindowGate: ObservedReaderGate?
+    private var nextFindReplyGate: ObservedReaderGate?
     private var findFailure = false, staleFind = false, staleWindow = false
+    private var verifiedFailure = false, malformedNeighbor = false
     private var active = 0, mostActive = 0, windows = 0, hits = 0
+    private var verifiedJumps = 0
     private var generations: [UInt64] = []
+
+    init(verifiedNavigation: Bool = false) { self.verifiedNavigation = verifiedNavigation }
 
     var transport: AtlasObservedReaderTransport {
         let base = lifetime.transport
+        let verified: (@Sendable (UInt64, AtlasObservedReaderSearchWitness, AtlasObservedReaderRequest,
+            AtlasSearchCancellation) throws -> String?)? = verifiedNavigation ? { owner, witness, request, _ in
+                try self.verifiedJump(owner, witness, request)
+            } : nil
         return .init(create: base.create,
             open: { owner, input, flag in
                 let reply = try base.open(owner, input, flag)
@@ -72,22 +82,26 @@ private final class ObservedSearchProbe: @unchecked Sendable {
             copy: { owner, observation, start, end in try self.copy(owner, observation, start, end) },
             cancel: base.cancel, close: base.close, retirementFailed: base.retirementFailed,
             search: .init(find: { owner, request, _ in try self.find(owner, request) },
-                hit: { owner, generation, index in try self.hit(owner, generation, index) }))
+                hit: { owner, generation, index in try self.hit(owner, generation, index) }, observeHit: verified))
     }
     private func recordOpen(_ owner: UInt64, _ input: AtlasObservedReaderInput) {
         lock.lock(); defer { lock.unlock() }; inputs[owner] = input; revisions[owner] = 0
     }
     func setContent(_ value: String) { lock.lock(); content = value; lock.unlock() }
     func blockFind(_ gate: ObservedReaderGate) { lock.lock(); nextFindGate = gate; lock.unlock() }
+    func blockFindReply(_ gate: ObservedReaderGate) { lock.lock(); nextFindReplyGate = gate; lock.unlock() }
     func blockHit(_ gate: ObservedReaderGate) { lock.lock(); nextHitGate = gate; lock.unlock() }
     func blockWindow(_ gate: ObservedReaderGate) { lock.lock(); nextWindowGate = gate; lock.unlock() }
     func failFind() { lock.lock(); findFailure = true; lock.unlock() }
+    func failVerifiedJump() { lock.lock(); verifiedFailure = true; lock.unlock() }
+    func useMalformedNeighbor() { lock.lock(); malformedNeighbor = true; lock.unlock() }
     func duplicateFindObservation() { lock.lock(); staleFind = true; lock.unlock() }
     func duplicateWindowObservation() { lock.lock(); staleWindow = true; lock.unlock() }
     var activeCount: Int { lock.lock(); defer { lock.unlock() }; return active }
     var maximumActive: Int { lock.lock(); defer { lock.unlock() }; return mostActive }
     var windowCount: Int { lock.lock(); defer { lock.unlock() }; return windows }
     var hitCount: Int { lock.lock(); defer { lock.unlock() }; return hits }
+    var verifiedJumpCount: Int { lock.lock(); defer { lock.unlock() }; return verifiedJumps }
     var findGenerations: [UInt64] { lock.lock(); defer { lock.unlock() }; return generations }
     private func finish() { lock.lock(); active -= 1; lock.unlock() }
     private func revision(_ owner: UInt64) -> UInt64 {
@@ -120,7 +134,8 @@ private final class ObservedSearchProbe: @unchecked Sendable {
         lock.lock()
         guard let input = inputs[owner] else { lock.unlock(); return nil }
         let id = revision(owner), fail = findFailure, stale = staleFind, gate = nextFindGate, text = content
-        findFailure = false; staleFind = false; nextFindGate = nil
+        let replyGate = nextFindReplyGate
+        findFailure = false; staleFind = false; nextFindGate = nil; nextFindReplyGate = nil
         generations.append(request.generation); active += 1; mostActive = max(mostActive, active)
         lock.unlock(); defer { finish() }; gate?.wait()
         if fail { return try ObservedReaderFixture.failure(owner, "OBSERVED_READER_SEARCH_FAILED") }
@@ -140,7 +155,52 @@ private final class ObservedSearchProbe: @unchecked Sendable {
         let report = ObservedSearchFixture.report(owner, input, request, observation: stale ? id - 1 : id,
             length: UInt64(bytes.count), offsets: offsets, state: state)
         lock.lock(); reports[owner] = report; lock.unlock()
+        replyGate?.wait()
         return try ObservedReaderFixture.encode(report)
+    }
+
+    private func verifiedJump(_ owner: UInt64, _ witness: AtlasObservedReaderSearchWitness,
+                              _ request: AtlasObservedReaderRequest) throws -> String? {
+        lock.lock()
+        guard let input = inputs[owner], let report = reports[owner],
+              report["query_generation"] as? String == String(witness.target.generation) else {
+            lock.unlock(); return try ObservedReaderFixture.failure(owner, "OBSERVED_READER_STALE_QUERY")
+        }
+        let id = revision(owner), text = content, fail = verifiedFailure, malformed = malformedNeighbor
+        verifiedFailure = false; verifiedJumps += 1
+        lock.unlock()
+        if fail { return try ObservedReaderFixture.failure(owner, "OBSERVED_READER_SEARCH_HIT_CHANGED") }
+        var bytes = AtlasObservedReaderSearchRequest.originalBytes(text, encoding: request.encoding)
+        if malformed && request.encoding == .utf8 && !bytes.isEmpty { bytes[0] = 0xff }
+        let hit = witness.target.hit.range
+        guard request.offset <= hit.start, hit.end <= UInt64(bytes.count),
+              ObservedReaderFixture.hex(Array(bytes[Int(hit.start)..<Int(hit.end)])) == witness.originalHex else {
+            return try ObservedReaderFixture.failure(owner, "OBSERVED_READER_SEARCH_HIT_CHANGED")
+        }
+        let end = Int(min(UInt64(bytes.count), request.offset + request.bytes))
+        guard hit.end <= UInt64(end) else { return try ObservedReaderFixture.failure(owner, "OBSERVED_READER_SEARCH_HIT_CHANGED") }
+        let selected = Array(bytes[Int(request.offset)..<end])
+        let encoding: String.Encoding = switch request.encoding {
+        case .utf8: .utf8
+        case .utf16le: .utf16LittleEndian
+        case .utf16be: .utf16BigEndian
+        }
+        let decoded = request.encoding == .utf8 ? String(decoding: selected, as: UTF8.self)
+            : (String(bytes: selected, encoding: encoding) ?? "")
+        let prefix = Array(bytes[Int(request.offset)..<Int(hit.start)])
+        let decodedPrefix = request.encoding == .utf8 ? String(decoding: prefix, as: UTF8.self)
+            : (String(bytes: prefix, encoding: encoding) ?? "")
+        let decodedStart = UInt64(decodedPrefix.utf8.count)
+        var page = ObservedReaderFixture.page(owner, input, id, request, length: UInt64(bytes.count),
+            text: decoded, originalHex: ObservedReaderFixture.hex(selected))
+        page["command"] = "observe-hit"; page["has_replacements"] = malformed
+        page["find_hit"] = ["query_generation": String(witness.target.generation),
+            "search_observation": String(witness.target.observation), "hit_index": String(witness.target.hit.index),
+            "occurrence_id": String(witness.target.hit.occurrence), "original_range": ObservedReaderFixture.range(hit.start, hit.end),
+            "decoded_utf8_range": ObservedReaderFixture.range(decodedStart, decodedStart + UInt64(witness.text.utf8.count)),
+            "witness_verified": true, "verification": "equal-original-bytes-in-new-observation"]
+        lock.lock(); pages[owner, default: [:]][id] = page; lock.unlock()
+        return try ObservedReaderFixture.encode(page)
     }
     private func hit(_ owner: UInt64, _ generation: UInt64, _ index: UInt64) throws -> String? {
         lock.lock()
@@ -298,6 +358,43 @@ private final class ObservedSearchProbe: @unchecked Sendable {
         precondition(changedContext == .changed)
         precondition(staleContext == .unavailable)
         precondition(replacementContext == .verified(selection: nil))
+
+        let verifiedRequest = try AtlasObservedReaderRequest(offset: 0, bytes: 16)
+        var verifiedJSON = ObservedReaderFixture.page(owner, input, 3, verifiedRequest, length: 4, text: "old\n")
+        verifiedJSON["command"] = "observe-hit"
+        let receipt: [String: Any] = ["query_generation": String(request.generation), "search_observation": "2",
+            "hit_index": "0", "occurrence_id": "1", "original_range": ObservedReaderFixture.range(0, 3),
+            "decoded_utf8_range": ObservedReaderFixture.range(0, 3), "witness_verified": true,
+            "verification": "equal-original-bytes-in-new-observation"]
+        verifiedJSON["find_hit"] = receipt
+        func decodeVerifiedPage(_ value: [String: Any]) throws -> AtlasObservedReaderPage {
+            try .decode(ObservedReaderFixture.encode(value), handle: owner, input: input,
+                request: verifiedRequest, hit: zeroWitness)
+        }
+        let verifiedPage = try decodeVerifiedPage(verifiedJSON)
+        precondition(verifiedPage.verifiedSearchSelection == NSRange(location: 0, length: 3))
+        for (key, value) in [("query_generation", "1" as Any), ("search_observation", "1" as Any),
+            ("hit_index", "1" as Any), ("decoded_utf8_range", ObservedReaderFixture.range(0, 4) as Any),
+            ("witness_verified", false as Any)] {
+            var forged = verifiedJSON, changed = receipt
+            changed[key] = value; forged["find_hit"] = changed
+            rejects("verified hit " + key) { _ = try decodeVerifiedPage(forged) }
+        }
+        var ordinary = verifiedJSON; ordinary["command"] = "window"
+        rejects("ordinary window cannot claim a verified hit") {
+            _ = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(ordinary),
+                handle: owner, input: input, request: verifiedRequest)
+        }
+        let retainedVerified = ObservedReaderFixture.retained(verifiedJSON)
+        let replay = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(retainedVerified),
+            handle: owner, input: input, retained: verifiedPage)
+        precondition(replay.matches(verifiedPage))
+        var alteredReplay = retainedVerified, alteredReceipt = receipt
+        alteredReceipt["query_generation"] = "1"; alteredReplay["find_hit"] = alteredReceipt
+        rejects("retained hit provenance changed") {
+            _ = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(alteredReplay),
+                handle: owner, input: input, retained: verifiedPage)
+        }
     }
 
     @MainActor private static func modelTests() async throws {
@@ -318,6 +415,15 @@ private final class ObservedSearchProbe: @unchecked Sendable {
         try await wait("failed replacement") { !model.busy }
         precondition(model.searchReport?.request.generation == first.request.generation)
         precondition(model.selectedSearchWitness?.target == firstTarget && model.page?.observation.id == pageID)
+        precondition(!model.canSelectSearchHit && !model.canReadSearchContext,
+            "A failed replacement cannot prove the host still owns the visible query")
+        model.readSearchContext()
+        precondition(probe.windowCount == 1 && model.searchCoverage?.contains("read-only") == true)
+        model.find()
+        try await wait("accepted replacement restores authority") { model.searchAuthorized && !model.busy }
+        let refreshed = model.searchReport!
+        model.selectSearchHit(refreshed.target(for: refreshed.hits[0]))
+        try await wait("refreshed retained literal") { model.selectedSearchWitness != nil && !model.busy }
 
         model.readSearchContext()
         try await wait("new context") { !model.busy }
@@ -418,10 +524,109 @@ private final class ObservedSearchProbe: @unchecked Sendable {
         try await wait("last owner retires") { probe.lifetime.closedCount == 2 }
     }
 
+    @MainActor private static func verifiedNavigationTests() async throws {
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.txt".utf8))
+        let probe = ObservedSearchProbe(verifiedNavigation: true)
+        probe.setContent("old\nterm\nend\n")
+        let model = AtlasObservedReaderModel(transport: probe.transport)
+        model.pageBytes = 4
+        model.open(.init(input: input, project: UUID(), access: nil))
+        try await wait("verified navigation initial page") { model.page != nil && !model.busy }
+        let initial = model.page!
+        model.searchText = "term"; model.find()
+        try await wait("verified navigation query") { model.searchReport != nil && !model.busy }
+        model.nextSearchHit()
+        try await wait("verified navigation witness") { model.selectedSearchWitness != nil && !model.busy }
+        precondition(model.canGoToVerifiedMatch)
+        model.goToVerifiedMatch()
+        try await wait("verified new context") { !model.busy }
+        let accepted = model.page!
+        precondition(accepted.findHit != nil && accepted.observation.id > model.searchReport!.observation
+            && model.searchSelection == NSRange(location: 4, length: 4) && probe.verifiedJumpCount == 1)
+        let windows = probe.windowCount
+        model.back(); try await wait("verified context back") { !model.busy }
+        precondition(model.page!.matches(initial) && model.searchSelection == nil)
+        model.forward(); try await wait("verified context forward") { !model.busy }
+        precondition(model.page!.matches(accepted) && model.searchSelection == NSRange(location: 4, length: 4)
+            && probe.windowCount == windows && probe.verifiedJumpCount == 1,
+            "History restores the accepted verified selection without a new source read")
+
+        probe.failVerifiedJump(); model.goToVerifiedMatch()
+        try await wait("failed verified jump") { !model.busy }
+        precondition(model.page!.matches(accepted) && model.searchSelection == NSRange(location: 4, length: 4)
+            && model.notice.contains("changed or disappeared"))
+        probe.setContent("old\nxxxx\nend\n"); model.goToVerifiedMatch()
+        try await wait("changed verified bytes") { !model.busy }
+        precondition(model.page!.matches(accepted) && model.selectedSearchWitness?.text == "term",
+            "Changed live bytes cannot replace accepted history or the old retained literal")
+
+        // Ordinary current-context reading intentionally remains independent:
+        // it may display the new bytes while disclosing the changed match.
+        model.readSearchContext(); try await wait("explicit changed context") { !model.busy }
+        precondition(model.page?.text == "old\nxxxx\nend\n" && model.searchContext == .changed)
+        model.back(); try await wait("recover verified history") { !model.busy }
+        precondition(model.page!.matches(accepted) && model.searchSelection == NSRange(location: 4, length: 4))
+
+        probe.setContent("old\nterm\nend\n"); probe.useMalformedNeighbor(); model.goToVerifiedMatch()
+        try await wait("verified match beside malformed bytes") { !model.busy }
+        precondition(model.page?.hasReplacements == true && model.page?.text.hasPrefix("\u{fffd}") == true
+            && model.page?.findHit?.decodedRange.start == 6
+            && model.searchSelection == NSRange(location: 4, length: 4),
+            "An exact engine receipt selects the unaffected match despite malformed neighboring bytes")
+        let earlierPage = model.page!
+        model.searchText = "end"; model.find()
+        try await wait("another query before retained history") { model.searchReport != nil && !model.busy }
+        model.nextSearchHit(); try await wait("another query witness") { model.selectedSearchWitness != nil && !model.busy }
+        model.goToVerifiedMatch(); try await wait("another query verified page") { !model.busy }
+        precondition(model.searchSelection == NSRange(location: 9, length: 3) && model.searchContext != nil)
+        model.back(); try await wait("earlier query verified page") { !model.busy }
+        precondition(model.page!.matches(earlierPage) && model.searchSelection == NSRange(location: 4, length: 4)
+            && model.selectedSearchWitness?.text == "end" && model.searchContext == nil
+            && model.verifiedPageNotice?.contains("earlier Find") == true,
+            "Historical verified selection retains its provenance without claiming the current query's context")
+        model.close(); try await wait("verified owner retirement") { probe.lifetime.closedCount == probe.lifetime.createCount }
+    }
+
+    @MainActor private static func canceledReplacementAuthorityTests() async throws {
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.txt".utf8))
+        let probe = ObservedSearchProbe(verifiedNavigation: true)
+        let model = AtlasObservedReaderModel(transport: probe.transport)
+        model.pageBytes = 4
+        model.open(.init(input: input, project: UUID(), access: nil))
+        try await wait("replacement authority opening") { model.page != nil && !model.busy }
+        model.searchText = "old"; model.find()
+        try await wait("replacement authority query") { model.searchReport != nil && !model.busy }
+        model.nextSearchHit(); try await wait("replacement authority witness") { model.selectedSearchWitness != nil && !model.busy }
+        model.goToVerifiedMatch(); try await wait("replacement authority page") { !model.busy }
+        let accepted = model.searchReport!, target = accepted.target(for: accepted.hits[0]), page = model.page!
+        let gate = ObservedReaderGate(); probe.blockFindReply(gate); model.find()
+        try await wait("host committed replacement before delivery") { gate.entered }
+        model.cancel()
+        precondition(!model.busy && !model.searchAuthorized && !model.canSelectSearchHit
+            && !model.canReadSearchContext && !model.canGoToVerifiedMatch
+            && model.searchReport?.request == accepted.request && model.page!.matches(page)
+            && model.selectedSearchWitness?.text == "old")
+        let hits = probe.hitCount, windows = probe.windowCount, verified = probe.verifiedJumpCount
+        model.selectSearchHit(target); model.nextSearchHit(); model.previousSearchHit()
+        model.readSearchContext(); model.goToVerifiedMatch()
+        precondition(probe.hitCount == hits && probe.windowCount == windows && probe.verifiedJumpCount == verified,
+            "A canceled reply cannot revive old-query hit or context actions after host replacement")
+        gate.release()
+        model.back(); try await wait("history after canceled replacement") { !model.busy }
+        model.forward(); try await wait("verified history after canceled replacement") { !model.busy }
+        precondition(model.page!.matches(page) && model.searchSelection == NSRange(location: 0, length: 3)
+            && model.searchReport?.request == accepted.request && !model.searchAuthorized)
+        model.find(); try await wait("new accepted receipt restores actions") { model.searchAuthorized && !model.busy }
+        precondition(model.searchReport?.request.generation == accepted.request.generation + 2 && model.canSelectSearchHit)
+        model.close(); try await wait("replacement authority retirement") { probe.lifetime.closedCount == probe.lifetime.createCount }
+    }
+
     @MainActor static func main() async throws {
         try wireTests()
         try await modelTests()
         try await cancellationLifetimeTests()
+        try await verifiedNavigationTests()
+        try await canceledReplacementAuthorityTests()
         print("Observed-reader exact Find wire, retained literal, fresh context, stale delivery, queue and grant lifetime fixtures passed.")
     }
 }

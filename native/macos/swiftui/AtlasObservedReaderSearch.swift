@@ -54,6 +54,8 @@ struct AtlasObservedReaderSearchRequest: Equatable, Sendable {
 struct AtlasObservedReaderSearchTransport: Sendable {
     let find: @Sendable (UInt64, AtlasObservedReaderSearchRequest, AtlasSearchCancellation) throws -> String?
     let hit: @Sendable (UInt64, UInt64, UInt64) throws -> String?
+    var observeHit: (@Sendable (UInt64, AtlasObservedReaderSearchWitness, AtlasObservedReaderRequest,
+        AtlasSearchCancellation) throws -> String?)? = nil
 }
 
 struct AtlasObservedReaderSearchHit: Equatable, Identifiable, Sendable {
@@ -68,6 +70,33 @@ struct AtlasObservedReaderSearchTarget: Equatable, Sendable {
     let identity: AtlasObservedReaderIdentity
     let generation, observation: UInt64
     let hit: AtlasObservedReaderSearchHit
+}
+
+/// This provenance belongs to a newly observed page, independently of later
+/// query replacement. Its exact decoded range remains usable in retained history.
+struct AtlasObservedReaderHitNavigation: Equatable, Sendable, Decodable {
+    let generation, searchObservation, index, occurrence: UInt64
+    let originalRange, decodedRange: AtlasObservedByteRange
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        generation = try c.decode(AtlasObservedReaderWire.Number.self, forKey: .query_generation).value
+        searchObservation = try c.decode(AtlasObservedReaderWire.Number.self, forKey: .search_observation).value
+        index = try c.decode(AtlasObservedReaderWire.Number.self, forKey: .hit_index).value
+        occurrence = try c.decode(AtlasObservedReaderWire.Number.self, forKey: .occurrence_id).value
+        originalRange = try c.decode(AtlasObservedByteRange.self, forKey: .original_range)
+        decodedRange = try c.decode(AtlasObservedByteRange.self, forKey: .decoded_utf8_range)
+        guard generation > 0, searchObservation > 0, index < AtlasObservedReaderSearchLimits.matches,
+              occurrence == index + 1, originalRange.count > 0, decodedRange.count > 0,
+              try c.decode(Bool.self, forKey: .witness_verified),
+              try c.decode(String.self, forKey: .verification) == "equal-original-bytes-in-new-observation" else {
+            throw AtlasObservedReaderError.invalidResponse
+        }
+    }
+    private enum CodingKeys: CodingKey {
+        case query_generation, search_observation, hit_index, occurrence_id, original_range,
+             decoded_utf8_range, witness_verified, verification
+    }
 }
 
 struct AtlasObservedReaderSearchReport: Sendable {
@@ -252,6 +281,12 @@ struct AtlasObservedReaderSearchWitness: Sendable {
     /// New context is a separate observation. It may only receive a selection
     /// after its own original bytes verify the retained literal at this range.
     func verify(context page: AtlasObservedReaderPage) -> AtlasObservedReaderSearchContext {
+        if page.findHit != nil {
+            do {
+                try validateVerifiedContext(page)
+                return .verified(selection: page.verifiedSearchSelection)
+            } catch { return .unavailable }
+        }
         guard page.observation.identity == target.identity, page.observation.id > target.observation,
               page.observation.request.encoding == encoding,
               page.visibleRange.contains(target.hit.range) else { return .unavailable }
@@ -275,6 +310,28 @@ struct AtlasObservedReaderSearchWitness: Sendable {
               native.rangeOfComposedCharacterSequences(for: candidate) == candidate,
               native.substring(with: candidate).utf8.elementsEqual(text.utf8) else { return .verified(selection: nil) }
         return .verified(selection: candidate)
+    }
+
+    /// The shared engine identifies the selected scalar range even when other
+    /// context contains replacement characters or the match splits a grapheme.
+    /// Validate both byte domains; do not infer this mapping from nearby text.
+    func validateVerifiedContext(_ page: AtlasObservedReaderPage) throws {
+        guard let selected = page.findHit,
+              page.observation.identity == target.identity, page.observation.id > target.observation,
+              page.observation.request.encoding == encoding,
+              selected.generation == target.generation, selected.searchObservation == target.observation,
+              selected.index == target.hit.index, selected.occurrence == target.hit.occurrence,
+              selected.originalRange == target.hit.range, page.visibleRange.contains(target.hit.range),
+              selected.decodedRange.end <= UInt64(page.text.utf8.count),
+              page.verifiedSearchSelection != nil else { throw AtlasObservedReaderError.invalidResponse }
+        let start = Int(target.hit.range.start - page.visibleRange.start) * 2
+        let count = Int(target.hit.range.count) * 2
+        let raw = Array(page.originalHex.utf8), decoded = Array(page.text.utf8)
+        guard start <= raw.count, count <= raw.count - start,
+              raw[start..<(start + count)].elementsEqual(originalHex.utf8),
+              decoded[Int(selected.decodedRange.start)..<Int(selected.decodedRange.end)].elementsEqual(text.utf8) else {
+            throw AtlasObservedReaderError.invalidResponse
+        }
     }
 }
 

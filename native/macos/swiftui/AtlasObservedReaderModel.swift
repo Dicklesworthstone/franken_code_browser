@@ -152,6 +152,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     private(set) var searchContext: AtlasObservedReaderSearchContext?
     private(set) var searchSelection: NSRange?
     private(set) var searching = false
+    private(set) var searchAuthorized = false
     var searchText = "" {
         didSet { if !oldValue.utf8.elementsEqual(searchText.utf8) { revokeSearch() } }
     }
@@ -197,7 +198,26 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
             && (try? AtlasObservedReaderSearchRequest(generation: 1, needle: searchText,
                 encoding: encoding, maximumScanBytes: searchScanBytes)) != nil
     }
-    var canReadSearchContext: Bool { !closed && !busy && session != nil && selectedSearchWitness != nil }
+    var canSelectSearchHit: Bool {
+        searchAuthorized && !closed && !busy && session != nil && !(searchReport?.hits.isEmpty ?? true)
+    }
+    var canReadSearchContext: Bool { canSelectSearchHit && selectedSearchWitness != nil }
+    var canGoToVerifiedMatch: Bool { canReadSearchContext && transport.search?.observeHit != nil }
+    var searchCoverage: String? {
+        guard let searchReport else { return nil }
+        return (searchAuthorized ? "" : "Previous Find results are read-only. Run Find again before navigating them. ") + searchReport.coverage
+    }
+    var verifiedPageNotice: String? {
+        guard let hit = page?.findHit else { return nil }
+        guard let report = searchReport, hit.generation == report.request.generation,
+              hit.searchObservation == report.observation else {
+            return "Verified match retained from an earlier Find."
+        }
+        guard selectedSearchWitness?.target.hit.index == hit.index else {
+            return "Verified match retained from another result of this Find."
+        }
+        return nil
+    }
 
     var coverage: String {
         var message = "Each range is a separate observation of the opened file object, not an immutable whole-file snapshot. Other bytes remain unknown."
@@ -346,6 +366,10 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
                 encoding: encoding, maximumScanBytes: searchScanBytes)
         } catch { notice = "Enter exact text of 1–4096 UTF-8 bytes without NUL, and choose a bounded scan limit."; return }
         lastSearchGeneration = request.generation
+        // A replacement can commit in Rust before its reply is canceled or
+        // rejected. Old literal bytes stay readable, but their query cannot
+        // lend authority to more hit actions without an accepted new receipt.
+        searchAuthorized = false
         let (ticket, flag) = begin("Searching up to \(request.maximumScanBytes) bytes of the opened file…")
         searchOperation = true; searching = true
         task = Task {
@@ -359,7 +383,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
                       searchScanBytes == request.maximumScanBytes else { return }
                 guard report.observation > latestObservation else { throw AtlasObservedReaderError.invalidResponse }
                 latestObservation = report.observation
-                searchReport = report; selectedSearchWitness = nil; clearSearchContext()
+                searchReport = report; searchAuthorized = true; selectedSearchWitness = nil; clearSearchContext()
                 finish(ticket); notice = report.countLabel + ". " + report.coverage
             } catch { fail(error, ticket: ticket) }
         }
@@ -368,7 +392,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     /// Selection fetches the retained matching literal only, with zero source
     /// reads. It never invents the surrounding page at search time.
     func selectSearchHit(_ target: AtlasObservedReaderSearchTarget) {
-        guard !closed, !busy, let report = searchReport, report.admits(target),
+        guard canSelectSearchHit, let report = searchReport, report.admits(target),
               let session, let input = authority?.input, let search = session.transport.search else { return }
         let (ticket, flag) = begin("Verifying the retained literal for result \(target.hit.index + 1)…")
         selectedSearchWitness = nil; clearSearchContext(); searchOperation = true
@@ -383,6 +407,20 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
                 notice = "Retained literal verified for original bytes \(target.hit.range.start)..<\(target.hit.range.end). No source bytes were reread."
             } catch { fail(error, ticket: ticket) }
         }
+    }
+
+    func nextSearchHit() {
+        guard canSelectSearchHit, let report = searchReport else { return }
+        let current = selectedSearchWitness.flatMap { report.admits($0.target) ? $0.target.hit.index : nil }
+        let index = current.map { ($0 + 1) % UInt64(report.hits.count) } ?? 0
+        selectSearchHit(report.target(for: report.hits[Int(index)]))
+    }
+    func previousSearchHit() {
+        guard canSelectSearchHit, let report = searchReport else { return }
+        let count = UInt64(report.hits.count)
+        let current = selectedSearchWitness.flatMap { report.admits($0.target) ? $0.target.hit.index : nil }
+        let index = current.map { ($0 + count - 1) % count } ?? (count - 1)
+        selectSearchHit(report.target(for: report.hits[Int(index)]))
     }
 
     /// This action deliberately reads new bytes and labels them as new context.
@@ -422,13 +460,50 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         }
     }
 
+    /// Only the shared engine may publish this new context after verifying
+    /// the old literal and its exact decoded range. A changed hit leaves the
+    /// accepted page/history untouched; ordinary current-context reading is
+    /// still available as its separate explicit action above.
+    func goToVerifiedMatch() {
+        guard canGoToVerifiedMatch, let witness = selectedSearchWitness,
+              searchReport?.admits(witness.target) == true,
+              let session, let input = authority?.input,
+              let observeHit = session.transport.search?.observeHit else { return }
+        let range = witness.target.hit.range, before = min(witness.target.hit.range.start, 1024)
+        let request: AtlasObservedReaderRequest
+        do {
+            request = try .init(offset: range.start - before,
+                bytes: max(pageBytes, before + range.count + AtlasObservedReaderLimits.contextBytes),
+                encoding: witness.encoding)
+        } catch { notice = AtlasObservedReaderError.invalidInput.message; return }
+        let (ticket, flag) = begin("Reading fresh context and verifying the selected match…")
+        searchOperation = true
+        task = Task {
+            do {
+                let page = try await io.perform(cancellation: flag, keepingAlive: [session]) {
+                    try AtlasObservedReaderPage.decode(observeHit(session.handle, witness, request, flag),
+                        handle: session.handle, input: input, request: request, hit: witness)
+                }
+                guard accepts(ticket, flag), self.session === session, searchAuthorized,
+                      selectedSearchWitness?.target == witness.target,
+                      searchReport?.admits(witness.target) == true else { return }
+                guard page.observation.id > max(latestObservation, witness.target.observation) else {
+                    throw AtlasObservedReaderError.invalidResponse
+                }
+                install(page, append: true)
+                finish(ticket)
+                notice = "Match verified in new observation \(page.observation.id). Its exact selection is retained with this page; Back restores earlier bytes."
+            } catch { fail(error, ticket: ticket) }
+        }
+    }
+
     private func clearSearchContext() {
         if searchSelection != nil { navigation = UUID() }
         searchSelection = nil; searchContext = nil
     }
     private func revokeSearch() {
         if searchOperation { cancelWork() }
-        searchReport = nil; selectedSearchWitness = nil; clearSearchContext()
+        searchReport = nil; searchAuthorized = false; selectedSearchWitness = nil; clearSearchContext()
     }
 
     func cancel() {
@@ -440,7 +515,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         session = nil; pendingSession = nil; authority = nil
         info = nil; page = nil; source = nil; history = []; historyIndex = 0
         latestObservation = 0
-        searchReport = nil; selectedSearchWitness = nil; searchContext = nil; searchSelection = nil
+        searchReport = nil; searchAuthorized = false; selectedSearchWitness = nil; searchContext = nil; searchSelection = nil
         navigation = UUID()
     }
     private func begin(_ notice: String) -> (UUID, AtlasSearchCancellation) {
@@ -467,7 +542,12 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     }
     private func message(_ error: Error) -> String {
         if error is CancellationError { return AtlasObservedReaderError.canceled.message }
-        if let error = error as? AtlasObservedReaderError { return error.message }
+        if let error = error as? AtlasObservedReaderError {
+            if case .engine(let code) = error, code == "OBSERVED_READER_SEARCH_HIT_CHANGED" {
+                return "The selected match changed or disappeared. The accepted page is unchanged. Run Find again, or read current context explicitly."
+            }
+            return error.message
+        }
         if let error = error as? AtlasProjectIOError, case .canceled = error { return AtlasObservedReaderError.canceled.message }
         return AtlasObservedReaderError.invalidResponse.message
     }
@@ -482,6 +562,15 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         self.page = page
         latestObservation = max(latestObservation, page.observation.id)
         source = AtlasSource(path: page.observation.identity.displayPath, text: page.text)
+        searchSelection = page.verifiedSearchSelection
+        if let hit = page.findHit, let witness = selectedSearchWitness,
+           page.observation.identity == witness.target.identity,
+           searchReport?.admits(witness.target) == true,
+           hit.generation == witness.target.generation, hit.searchObservation == witness.target.observation,
+           hit.index == witness.target.hit.index, hit.occurrence == witness.target.hit.occurrence,
+           hit.originalRange == witness.target.hit.range {
+            searchContext = .verified(selection: searchSelection)
+        }
         offsetInput = String(page.observation.request.offset)
         navigation = UUID()
     }

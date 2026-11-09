@@ -54,6 +54,34 @@ import Foundation
         let hit = try search.hit(handle, observation, 255)
         precondition(hit == expected && count(9) == 3 && count(10) == 1)
         precondition(allocations() == 11 && frees() == 11)
+        guard let observeHit = search.observeHit else { preconditionFailure("Native verified-hit transport is missing") }
+        let target = AtlasObservedReaderSearchTarget(identity: .init(owner: handle, file: 1,
+            path: input.absolutePath, displayPath: "fixture"), generation: observation, observation: 8,
+            hit: .init(index: 255, occurrence: 256,
+                range: try .init(start: offset + 1024, end: offset + 1024 + UInt64(searchRequest.needle.utf8.count))))
+        let witness = AtlasObservedReaderSearchWitness(target: target, encoding: .utf8,
+            text: searchRequest.needle, originalHex: searchRequest.originalHex, sha256: String(repeating: "a", count: 64))
+        let verifiedHit = try observeHit(handle, witness, request, AtlasSearchCancellation())
+        precondition(verifiedHit == expected && count(11) == 1 && allocations() == 12 && frees() == 12)
+        let legacy = AtlasObservedReaderSearchTransport(find: search.find, hit: search.hit)
+        precondition(legacy.observeHit == nil, "Existing search-only transports retain their optional capability boundary")
+
+        // Inconsistent requests must not cross the ABI or let the host silently
+        // reduce their prefix and return a different requested observation.
+        let invalidHitRequests = [
+            try AtlasObservedReaderRequest(offset: offset, encoding: .utf16be),
+            try AtlasObservedReaderRequest(offset: target.hit.range.start + 1),
+            try AtlasObservedReaderRequest(offset: offset, bytes: 4),
+            try AtlasObservedReaderRequest(offset: target.hit.range.start - 65536),
+        ]
+        let beforeInvalid = count(11), beforeInvalidAllocations = allocations()
+        for invalid in invalidHitRequests {
+            do {
+                _ = try observeHit(handle, witness, invalid, AtlasSearchCancellation())
+                preconditionFailure("Inconsistent verified-hit request reached the native ABI")
+            } catch AtlasObservedReaderError.invalidInput { }
+        }
+        precondition(count(11) == beforeInvalid && allocations() == beforeInvalidAllocations)
 
         // Every allocating entrypoint shares the actual bounded take/free path.
         let commands: [() throws -> String?] = [
@@ -64,6 +92,7 @@ import Foundation
             { try transport.copy(handle, observation, offset + 3, offset + 17) },
             { try search.find(handle, searchRequest, AtlasSearchCancellation()) },
             { try search.hit(handle, observation, 255) },
+            { try observeHit(handle, witness, request, AtlasSearchCancellation()) },
         ]
         for command in commands {
             mode(1)
@@ -84,7 +113,7 @@ import Foundation
 
         // C invokes the supplied callback with its live object context. The
         // transport frees the obsolete reply before throwing cancellation.
-        for operation in 0..<3 {
+        for operation in 0..<4 {
             for lateMode: Int32 in [4, 5] {
                 mode(lateMode)
                 weak var released: AtlasSearchCancellation?
@@ -95,7 +124,8 @@ import Foundation
                         switch operation {
                         case 0: _ = try transport.open(handle, input, token)
                         case 1: _ = try transport.window(handle, request, token)
-                        default: _ = try search.find(handle, searchRequest, token)
+                        case 2: _ = try search.find(handle, searchRequest, token)
+                        default: _ = try observeHit(handle, witness, request, token)
                         }
                         preconditionFailure("Late canceled read-only delivery was not suppressed")
                     } catch AtlasObservedReaderError.canceled { }
@@ -110,13 +140,17 @@ import Foundation
         mode(0)
         let canceled = AtlasSearchCancellation(); canceled.cancel()
         let enteredOpen = count(1), enteredWindow = count(3), enteredPolls = count(8), enteredFind = count(9)
+        let enteredObserveHit = count(11)
         do { _ = try transport.open(handle, input, canceled); preconditionFailure("Pre-entry open cancellation ignored") }
         catch AtlasObservedReaderError.canceled { }
         do { _ = try transport.window(handle, request, canceled); preconditionFailure("Pre-entry window cancellation ignored") }
         catch AtlasObservedReaderError.canceled { }
         do { _ = try search.find(handle, searchRequest, canceled); preconditionFailure("Pre-entry Find cancellation ignored") }
         catch AtlasObservedReaderError.canceled { }
+        do { _ = try observeHit(handle, witness, request, canceled); preconditionFailure("Pre-entry verified-hit cancellation ignored") }
+        catch AtlasObservedReaderError.canceled { }
         precondition(count(1) == enteredOpen && count(3) == enteredWindow && count(8) == enteredPolls && count(9) == enteredFind)
+        precondition(count(11) == enteredObserveHit)
         precondition(transport.cancel(handle) && transport.close(handle))
         mode(6)
         precondition(transport.create() == 0 && !transport.cancel(handle) && !transport.close(handle))

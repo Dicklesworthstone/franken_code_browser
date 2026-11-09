@@ -11,6 +11,7 @@ import AppKit
     @State private var showsLineNumbers = true
     @State private var showsWhitespace = false
     @State private var copyNotice = ""
+    @FocusState private var searchFocused: Bool
     @Environment(\.dismiss) private var dismiss
 
     init(presentation: AtlasObservedReaderPresentation) {
@@ -39,6 +40,9 @@ import AppKit
             Divider()
             if let page = model.page {
                 let observation = page.observation
+                if let notice = model.verifiedPageNotice {
+                    Text(notice).font(.caption).foregroundStyle(.secondary)
+                }
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Observation \(observation.id) · original bytes \(page.visibleRange.start)..<\(page.visibleRange.end)")
@@ -85,6 +89,10 @@ import AppKit
         .onChange(of: model.navigation) { _, _ in copyNotice = "" }
         .onChange(of: model.searchText) { _, _ in copyNotice = "" }
         .onChange(of: model.encoding) { _, _ in copyNotice = "" }
+        .background {
+            Button("Find in observed file") { searchFocused = true }
+                .keyboardShortcut("f", modifiers: .command).hidden().accessibilityHidden(true)
+        }
     }
 
     private var controls: some View {
@@ -139,7 +147,7 @@ import AppKit
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 7) {
                 TextField("Find exact text in the opened file", text: $model.searchText)
-                    .textFieldStyle(.roundedBorder).onSubmit(model.find)
+                    .textFieldStyle(.roundedBorder).focused($searchFocused).onSubmit(model.find)
                     .accessibilityLabel("Exact text to find in the opened file")
                     .help("Case-sensitive literal text, without normalization. Up to 4096 UTF-8 bytes; NUL is unsupported.")
                 Picker("Scan up to", selection: $model.searchScanBytes) {
@@ -149,6 +157,8 @@ import AppKit
                     Text("4 GiB").tag(AtlasObservedReaderSearchLimits.maximumScanBytes)
                 }.frame(width: 185)
                 Button(model.searching ? "Restart Find" : "Find", action: model.find).disabled(!model.canSearch)
+                Button("Previous match", action: model.previousSearchHit).disabled(!model.canSelectSearchHit)
+                Button("Next match", action: model.nextSearchHit).disabled(!model.canSelectSearchHit)
             }
             Text("Find starts at byte 0 using the selected decoding, with at most 256 retained matches. A scan limit or file change leaves the total count unknown.")
                 .font(.caption2).foregroundStyle(.secondary)
@@ -170,7 +180,7 @@ import AppKit
                                                     .font(.system(.caption, design: .monospaced))
                                             }
                                         }
-                                        .buttonStyle(.plain).disabled(model.busy)
+                                        .buttonStyle(.plain).disabled(!model.canSelectSearchHit)
                                         .help("Verify the matching literal retained by this search, without reading the file again")
                                     }
                                 }.frame(maxWidth: .infinity, alignment: .leading)
@@ -192,6 +202,9 @@ import AppKit
                                 Button("Read current context", action: model.readSearchContext)
                                     .disabled(!model.canReadSearchContext)
                                     .help("Read a new observation around this result. Select the match only if its original bytes still agree.")
+                                Button("Go to verified match", action: model.goToVerifiedMatch)
+                                    .disabled(!model.canGoToVerifiedMatch)
+                                    .help("Read fresh context and move only after the shared engine verifies the retained match. A changed match leaves this page intact.")
                             }.controlSize(.small)
                         }.frame(maxWidth: .infinity, alignment: .leading)
                     } else {
@@ -204,7 +217,7 @@ import AppKit
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
-                Text(report.coverage).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
+                Text(model.searchCoverage ?? report.coverage).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
                 if let context = model.searchContext {
                     Text(context.message).font(.caption).foregroundStyle(context.selection == nil ? .secondary : .primary)
                 }

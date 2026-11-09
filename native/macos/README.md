@@ -176,6 +176,22 @@ bytes. If the file changed, the original match remains identifiable and the new
 context is labeled separately. Search does not invent surrounding text for an
 old match or treat unchecked source as a proven negative.
 
+**Go to verified match** reads fresh context and asks the shared source adapter
+to verify the retained match before accepting the page. It checks original bytes,
+the decoded literal and the exact source-to-text range together. A changed or
+unavailable match leaves the accepted reader page intact. Verified selections
+remain attached to retained pages, so Back/Forward can restore the same highlight
+without source I/O even after another query replaces the active search. This
+action also handles valid matches beside malformed neighboring text through the
+shared decoder's source map. **Read current context** remains available when the
+intent is to inspect what changed.
+
+Press **Command-F** to focus Find. **Previous match** and **Next match** select
+retained results without rereading source; choose the context action explicitly.
+Restarting a valid Find revokes the previous result actions until a replacement
+reply is accepted. If cancellation races with worker acceptance, the old report
+stays readable and its controls remain disabled until another Find succeeds.
+
 Editing the query or encoding revokes old targets, cancellation leaves the reader
 usable, and stale worker replies cannot activate a different query. Searching
 does not evict the reader's eight retained byte observations. The backend, C ABI,

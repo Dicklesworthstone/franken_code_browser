@@ -88,7 +88,8 @@ must not receive the old match's identity.
 
 `fcb_observed_reader_observe_hit` combines that explicit fresh-context request
 and witness verification. It takes the accepted query generation and hit index,
-a bounded amount of preceding context, and a 4–262144 byte window. The source
+a bounded amount of preceding context, and a 4–262144 byte window large enough
+for the literal plus eight bytes of boundary slack. The source
 adapter checks the retained literal's original bytes, decoded text and exact
 original-to-decoded range mapping before publishing or evicting any page. A
 changed or unavailable hit returns `OBSERVED_READER_SEARCH_HIT_CHANGED` and

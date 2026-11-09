@@ -19,6 +19,9 @@ private typealias ObservedReaderPoll = @convention(c) (UnsafeMutableRawPointer?)
     _ poll: ObservedReaderPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_observed_reader_search_hit") private func observedReaderSearchHit(
     _ handle: UInt64, _ generation: UInt64, _ index: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_observed_reader_observe_hit") private func observedReaderObserveHit(
+    _ handle: UInt64, _ generation: UInt64, _ index: UInt64, _ contextBytes: UInt64, _ windowBytes: UInt64,
+    _ poll: ObservedReaderPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_observed_reader_cancel") private func observedReaderCancel(_ handle: UInt64) -> UInt8
 @_silgen_name("fcb_observed_reader_close") private func observedReaderClose(_ handle: UInt64) -> UInt8
 @_silgen_name("fcb_free_string") private func observedReaderFree(_ pointer: UnsafeMutablePointer<CChar>?)
@@ -52,7 +55,23 @@ extension AtlasObservedReaderTransport {
                         request.maximumMatches, request.maximumScanBytes, poll, context)
                 }
             }
-        }, hit: { try observedReaderTake(observedReaderSearchHit($0, $1, $2)) }))
+        }, hit: { try observedReaderTake(observedReaderSearchHit($0, $1, $2)) },
+        observeHit: { handle, witness, request, cancellation in
+            let target = witness.target, range = witness.target.hit.range
+            guard target.identity.owner == handle, target.generation > 0,
+                  target.hit.index < AtlasObservedReaderSearchLimits.matches,
+                  request.encoding == witness.encoding, request.offset <= range.start,
+                  range.count > 0, request.bytes >= 8, range.count <= request.bytes - 8 else {
+                throw AtlasObservedReaderError.invalidInput
+            }
+            let prefix = range.start - request.offset
+            // The host reserves eight bytes for scalar/CRLF boundary floors.
+            // Refuse a request whose desired prefix would be shortened there.
+            guard prefix <= request.bytes - range.count - 8 else { throw AtlasObservedReaderError.invalidInput }
+            return try observedReaderPolling(cancellation) { poll, context in
+                observedReaderObserveHit(handle, target.generation, target.hit.index, prefix, request.bytes, poll, context)
+            }
+        }))
 }
 
 private func observedReaderPolling(_ cancellation: AtlasSearchCancellation,
