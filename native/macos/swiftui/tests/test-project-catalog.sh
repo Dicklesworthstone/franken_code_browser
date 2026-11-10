@@ -41,7 +41,7 @@ swiftc -swift-version 6 -warnings-as-errors "$out/Context.swift" "$src/AtlasProj
 set --
 if [ "$(uname -s)" = Linux ]; then set -- -static-stdlib; fi
 swiftc "$@" -swift-version 6 -warnings-as-errors \
-    "$src/AtlasSearch.swift" "$src/AtlasSearchCapture.swift" "$src/AtlasSearchCoordinator.swift" "$src/AtlasProjectIO.swift" \
+    "$src/AtlasSearch.swift" "$src/AtlasSearchExpression.swift" "$src/AtlasSearchCapture.swift" "$src/AtlasSearchCoordinator.swift" "$src/AtlasProjectIO.swift" \
     "$src/AtlasReader.swift" "$src/AtlasReaderSearch.swift" "$src/AtlasReaderComparison.swift" \
     "$src/AtlasReaderOutline.swift" "$src/AtlasReaderReferences.swift" "$src/AtlasReaderDocument.swift" "$src/AtlasReaderCoordinator.swift" \
     "$src/AtlasCapturedReader.swift" "$src/AtlasSuppliedReader.swift" "$src/AtlasNavigationHistory.swift" \

@@ -151,6 +151,80 @@ case choices, retained-index reuse, stale responses, spelling validation,
 capture replacement, and Unicode source navigation. These are code-first
 additions; executable Rust/Swift and physical-Mac qualification remain pending.
 
+## Workspace expression search
+
+Select **Expression** in the search-mode picker to combine literal text with
+required terms, exclusions and metadata filters. For example:
+
+```text
+"pub fn" Result -unsafe path:src/ lang:rust
+```
+
+This finds occurrences of `pub fn` in admitted Rust files whose path contains
+`src/`, whose captured contents contain `Result`, and whose captured contents do
+not contain `unsafe`. Whitespace between positive terms means AND; `-term`
+means NOT. Required and excluded terms apply to the **same complete captured
+file**, so they may occur on different lines. Results select occurrences of the
+first positive term or quoted phrase. Other required terms qualify the file;
+they do not create additional result rows.
+
+| Syntax | Meaning |
+| --- | --- |
+| `needle required -excluded` | Find `needle` in files containing `required` and no `excluded`. |
+| `"exact phrase"` | Keep spaces within a literal phrase; `\"` and `\\` escape a quote or backslash. |
+| `path:src/ -path:generated/` | Include and exclude paths by substring. |
+| `path:**/*.rs` | Apply a path glob; `*` and `?` stay within a path component, while a whole `**` component can cross directories. |
+| `path:"directory with spaces/"` | Keep spaces inside a path-filter value. |
+| `lang:rust`, `type:rs`, `-lang:python` | Include or exclude a language/file extension using the shared engine's aliases. |
+
+An expression must contain a positive text term, fit within 1,024 UTF-8 bytes,
+and contain at most 64 terms and filters. A filters-only or exclusions-only
+request is refused. Regex directives are refused; OR and parentheses are not
+Boolean operators in this language. Choose **Text** when the entire input
+should be one literal. **Match case** applies to all content terms; when off,
+comparison uses Unicode lowercase with the same exact-source-spelling rules as
+ordinary text search. Path and language filters retain their own metadata
+semantics.
+
+Expression filters intersect the selected file types and **Workspace**,
+**Folder**, **File**, or frozen **Visible atlas files** location. They cannot
+widen that selection or grant access to another root. The summary separates
+files outside the selected scope from files excluded by expression metadata.
+Those metadata exclusions are decided before source reads and do not consume
+the live query's file or capture budget.
+
+Leave **Captured index** off to capture matching-scope sources during each
+query. Turn it on to prepare the current file/location scope once and run both
+Text and Expression queries against those retained bytes. Editing the
+expression or changing **Match case** reuses the prepared captures. **Refresh**
+captures current sources again. Expression filters narrow a query over the
+prepared index; they do not change which sources the index originally captured.
+Widening a query beyond that captured scope can therefore leave files
+uncaptured until Refresh. Indexed queries and result activation do no live
+source reads.
+
+Both routes retain at most 1,000 primary matches. Live capture and index
+preparation admit at most 4,096 files, 1 MiB per file and 32 MiB of aggregate
+source-read work. A prepared index additionally admits at most 2,097,152 grams;
+files without usable gram coverage use retained-source verification. Each
+expression has a separate **256 MiB verification-work budget**, shared across
+all required, excluded and primary probes. Rechecking the same capture for
+several terms spends that budget again. A limit can leave partial results even
+when every source file fits the capture limits. An unsearched suffix never
+proves that an excluded term is absent, and partial/no-proof outcomes never
+become a complete empty result.
+
+Opening a result imports its exact retained capture and verifies the primary
+match at its original byte range, including UTF-16 or a file changed on disk
+since capture. The reader's Find uses the original matched spelling rather
+than the full expression. Source excerpts, atlas highlights, cancellation and
+stale-result rejection use the existing search and reader routes.
+
+Host, C-boundary and native decoder/transport regressions accompany this
+integration. They have not been executed in this code-first session; Rust and
+Swift compilation, executable qualification and physical-Mac interaction
+verification remain pending.
+
 ## Searching large files across a project
 
 Choose **Search large project files…** in the search sidebar to search exact,

@@ -15,7 +15,11 @@ struct AtlasIndexWire: Decodable {
     static func decode(_ json: String?) throws -> Self {
         guard let json else { throw AtlasSearchError.unavailable }
         guard json.utf8.count <= 8 * 1024 * 1024, let data = json.data(using: .utf8) else { throw invalid() }
-        do { return try JSONDecoder().decode(Self.self, from: data) }
+        do {
+            if let failure = AtlasSearchExpression.queryFailure(in: data) { throw failure }
+            return try JSONDecoder().decode(Self.self, from: data)
+        }
+        catch let error as AtlasSearchError { throw error }
         catch { throw invalid() }
     }
     static func invalid() -> AtlasSearchError { .invalidResponse }
@@ -195,17 +199,20 @@ struct AtlasIndexedQueryState: Equatable {
     let matches, verificationBytes: UInt64
     let running, complete, truncated: Bool
     let stop: String?
+    let expression: AtlasSearchExpression?
 }
 struct AtlasIndexedQueryPage {
     let state: AtlasIndexedQueryState
     let hits: [AtlasIndexedHit]
     let next: UInt64?
+    var expression: AtlasSearchExpression? { state.expression }
 
     init(_ json: String?, basis: AtlasIndexedBasis, generation: UInt64, needle: String,
          scope: AtlasSearchFileScope = .all, pathScope: AtlasSearchPathScope = .workspace,
-         caseSensitive: Bool = true, command: String) throws {
+         caseSensitive: Bool = true, mode: AtlasSearchMode = .text, command: String) throws {
         let w = try AtlasIndexWire.decode(json)
         try basis.validate(w, command: command)
+        guard mode.isTextual else { throw AtlasIndexWire.invalid() }
         let kind = try w.optionalText("search_scope")
         try pathScope.validateEcho(kind: w.optionalText("scope_path_kind"),
             path: w.optionalText("scope_path"), hex: w.optionalText("scope_path_hex"),
@@ -214,21 +221,30 @@ struct AtlasIndexedQueryPage {
         let eligible = try scope.eligibleFiles(kind: kind, extensions: w.optionalText("scope_extensions"),
             filenames: w.optionalText("scope_filenames"), eligible: w.optionalText("eligible_files"),
             excluded: w.optionalText("excluded_files"), catalogued: basis.files, pathScoped: !pathScope.isWorkspace)
+        let primaryNeedle = try w.text("needle")
+        let expression = try AtlasSearchExpression.Wire(index: w).admit(mode: mode,
+            query: needle, needle: primaryNeedle, eligibleFiles: eligible)
+        let expressionExcluded = expression?.excludedFiles ?? 0
+        if expression != nil {
+            guard let explicitCase = try w.optionalFlag("case_sensitive"), explicitCase == caseSensitive else {
+                throw AtlasIndexWire.invalid()
+            }
+        }
         let queriesCaptureScope = scope == basis.captureScope.fileScope && pathScope == basis.captureScope.pathScope
         if queriesCaptureScope {
             guard eligible == basis.captureScope.eligibleFiles else { throw AtlasIndexWire.invalid() }
         }
         let captured, captureUnavailable: Int
-        if kind == nil {
+        if kind == nil && expression == nil {
             captured = basis.capturedFiles; captureUnavailable = basis.unavailable
         } else {
             captured = try w.count("eligible_captured_files", upTo: min(basis.capturedFiles, eligible))
             captureUnavailable = try w.count("scoped_capture_unavailable_files", upTo: min(basis.unavailable, eligible))
         }
-        guard captured + captureUnavailable <= eligible else {
+        guard captured + captureUnavailable <= eligible - expressionExcluded else {
             throw AtlasIndexWire.invalid()
         }
-        if queriesCaptureScope || (scope.isAll && pathScope.isWorkspace) {
+        if expression == nil && (queriesCaptureScope || (scope.isAll && pathScope.isWorkspace)) {
             guard captured == basis.capturedFiles, captureUnavailable == basis.unavailable else { throw AtlasIndexWire.invalid() }
         }
         let examined = try w.count("examined_files", upTo: eligible)
@@ -246,8 +262,8 @@ struct AtlasIndexedQueryPage {
             missing: w.optionalText("scope_region_missing_files"), eligible: eligible, searchCatalogFiles: basis.files,
             allFileTypes: scope.isAll, complete: complete)
         guard try w.number("query_generation") == generation, generation > basis.index,
-              try w.text("needle").utf8.elementsEqual(needle.utf8),
-              try w.text("mode") == AtlasSearchText.wireMode(caseSensitive: caseSensitive),
+              expression != nil || primaryNeedle.utf8.elementsEqual(needle.utf8),
+              try w.text("mode") == (mode == .expression ? "decoded-text-expression" : AtlasSearchText.wireMode(caseSensitive: caseSensitive)),
               try (w.optionalFlag("case_sensitive") ?? true) == caseSensitive,
               try w.text("search_strategy") == "retained-ephemeral-index",
               try w.flag("discovery_complete") == basis.discoveryComplete,
@@ -255,9 +271,11 @@ struct AtlasIndexedQueryPage {
               try w.number("displayed_hits") == UInt64(retained), try w.number("verified_files") == UInt64(scanned),
               try w.number("source_bytes_read") == 0, try w.number("read_calls") == 0,
               scanned + skipped <= captured,
-              examined == scanned + skipped + captureUnavailable, pending == eligible - examined,
+              examined == expressionExcluded + scanned + skipped + captureUnavailable, pending == eligible - examined,
               unavailable >= captureUnavailable, unavailable <= captureUnavailable + scanned,
-              verification <= basis.sourceBytes, matches >= UInt64(retained), running == (stop == nil) else {
+              verification <= (expression?.maxScanBytes ?? basis.sourceBytes),
+              expression == nil || expression?.scannedInputBytes == verification,
+              matches >= UInt64(retained), running == (stop == nil) else {
             throw AtlasIndexWire.invalid()
         }
         if let stop, !["all-files-examined", "file-limit", "source-byte-limit", "capture-scope", "match-limit", "verification-byte-limit"].contains(stop) {
@@ -274,8 +292,9 @@ struct AtlasIndexedQueryPage {
         guard hits.allSatisfy({ scope.admitsRawPath($0.rawPathBytes) && pathScope.admitsRawPath($0.rawPathBytes)
             && basis.captureScope.fileScope.admitsRawPath($0.rawPathBytes)
             && basis.captureScope.pathScope.admitsRawPath($0.rawPathBytes)
-            && AtlasSearchText.accepts(actualText: $0.hit.actualText, needle: needle, caseSensitive: caseSensitive)
-            && ($0.hit.excerpt?.matchesSourceText($0.hit.actualText ?? needle) != false) }) else {
+            && (expression == nil || $0.hit.actualText != nil)
+            && AtlasSearchText.accepts(actualText: $0.hit.actualText, needle: primaryNeedle, caseSensitive: caseSensitive)
+            && ($0.hit.excerpt?.matchesSourceText($0.hit.actualText ?? primaryNeedle) != false) }) else {
             throw AtlasIndexWire.invalid()
         }
         next = try w.optionalNumber("next_offset")
@@ -284,7 +303,7 @@ struct AtlasIndexedQueryPage {
             examined: examined, scanned: scanned, unavailable: unavailable,
             pending: pending, retained: retained, step: step, skipped: skipped, fallback: fallback,
             matches: matches, verificationBytes: verification, running: running, complete: complete,
-            truncated: truncated, stop: stop)
+            truncated: truncated, stop: stop, expression: expression)
     }
 }
 
@@ -306,9 +325,12 @@ struct AtlasIndexedAccumulator {
                   n.scanned >= p.scanned, n.skipped >= p.skipped, n.fallback >= p.fallback,
                   n.unavailable >= p.unavailable, n.retained >= p.retained, n.matches >= p.matches,
                   n.verificationBytes >= p.verificationBytes else { throw AtlasIndexWire.invalid() }
+            if let expression = n.expression, let previous = p.expression {
+                guard expression.advances(previous) else { throw AtlasIndexWire.invalid() }
+            } else if n.expression != nil || p.expression != nil { throw AtlasIndexWire.invalid() }
         } else {
             guard n.running, n.step == 0, n.retained == 0, n.matches == 0,
-                  n.examined == n.captureUnavailable, n.scanned == 0, n.skipped == 0,
+                  n.examined == n.captureUnavailable + (n.expression?.excludedFiles ?? 0), n.scanned == 0, n.skipped == 0,
                   n.verificationBytes == 0 else { throw AtlasIndexWire.invalid() }
         }
         state = n
@@ -343,5 +365,16 @@ struct AtlasIndexedAccumulator {
                 textBytes += charge; byFile[row.file] = admitted; hits.append(admitted)
             }
         }
+    }
+}
+
+extension AtlasSearchExpression.Wire {
+    init(index wire: AtlasIndexWire) throws {
+        try self.init(expression: wire.optionalText("expression"), primary_needle: wire.optionalText("primary_needle"),
+            query_syntax: wire.optionalText("query_syntax"), predicate_scope: wire.optionalText("predicate_scope"),
+            path_filter_domain: wire.optionalText("path_filter_domain"), max_scan_bytes: wire.optionalText("max_scan_bytes"),
+            scanned_input_bytes: wire.optionalText("scanned_input_bytes"),
+            expression_excluded_files: wire.optionalText("expression_excluded_files"),
+            expression_scope_files: wire.optionalText("expression_scope_files"))
     }
 }

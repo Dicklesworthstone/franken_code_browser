@@ -90,6 +90,20 @@ char *fcb_atlas_search_indexed_begin_matching(uint64_t h, uint64_t g, uint64_t i
     }
     return fcb_atlas_search_indexed_begin(h, 44, index, needle, hits, bytes);
 }
+char *fcb_atlas_search_indexed_begin_expression(uint64_t h, uint64_t g, uint64_t index, const char *expression,
+                                               const char *extensions, const char *filenames,
+                                               uint64_t path_kind, const char *path, uint64_t case_sensitive,
+                                               uint64_t hits, uint64_t bytes) {
+    assert(h == handle && index == 1 && expression && !strcmp(expression, "\"exact text\" required -excluded lang:rs"));
+    assert(hits == 1000 && bytes == 256 * 1024 * 1024);
+    if (g == 52) {
+        assert(case_sensitive == 1 && path_kind == 0 && !path && !extensions && !filenames);
+    } else {
+        assert(g == 53 && case_sensitive == 0 && path_kind == 1 && path && !strcmp(path, "src"));
+        assert(extensions && !strcmp(extensions, "rs") && filenames && !filenames[0]);
+    }
+    ++calls; return result();
+}
 char *fcb_atlas_search_step_cancelable(uint64_t h, uint64_t g, int32_t (*poll)(void *), void *ctx) {
     assert(h == handle && g == 44); ++calls; poll_now(poll, ctx); return result();
 }

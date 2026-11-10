@@ -7,13 +7,15 @@
 
 static char *responses[5][8]; // open, begin, step, page, captured reader import
 static unsigned cursors[5];
-static _Atomic unsigned counts[13]; // create/open/begin/step/page/close/alloc/free/import/scoped-begin/path-begin/structure-begin/matching-begin
+static _Atomic unsigned counts[14]; // create/open/begin/step/page/close/alloc/free/import/scoped-begin/path-begin/structure-begin/matching-begin/expression-begin
 static int cancel_step, refuse_create;
 static char expected_extensions[1025], expected_filenames[1025];
 static int expected_all;
 static uint64_t expected_path_kind;
 static char expected_path[4097];
 static uint64_t expected_mode, expected_name_mode;
+static char expected_expression[1025];
+static uint64_t expected_expression_case;
 extern void fixture_mark_canceled(void *);
 
 void fixture_reset(void) {
@@ -21,17 +23,18 @@ void fixture_reset(void) {
         for (unsigned j = 0; j < 8; ++j) { free(responses[i][j]); responses[i][j] = NULL; }
         cursors[i] = 0;
     }
-    for (unsigned i = 0; i < 13; ++i) atomic_store(&counts[i], 0);
+    for (unsigned i = 0; i < 14; ++i) atomic_store(&counts[i], 0);
     expected_extensions[0] = expected_filenames[0] = 0;
     expected_all = 1; expected_path_kind = 0; expected_path[0] = 0;
     cancel_step = refuse_create = 0;
     expected_mode = expected_name_mode = 0;
+    expected_expression[0] = 0; expected_expression_case = 1;
 }
 void fixture_set(unsigned kind, unsigned index, const char *text) {
     assert(kind < 5 && index < 8);
     free(responses[kind][index]); responses[kind][index] = strdup(text);
 }
-unsigned fixture_count(unsigned key) { assert(key < 13); return atomic_load(&counts[key]); }
+unsigned fixture_count(unsigned key) { assert(key < 14); return atomic_load(&counts[key]); }
 void fixture_expect_scope(const char *extensions, const char *filenames) {
     if (!extensions || !filenames) {
         assert(!extensions && !filenames); expected_all = 1; return;
@@ -41,12 +44,16 @@ void fixture_expect_scope(const char *extensions, const char *filenames) {
     strcpy(expected_extensions, extensions); strcpy(expected_filenames, filenames);
 }
 void fixture_expect_path(uint64_t kind, const char *path) {
-    assert(kind >= 1 && kind <= 2 && path && strlen(path) <= 4096);
+    assert(kind >= 1 && kind <= 3 && path && strlen(path) <= 4096);
     expected_path_kind = kind; strcpy(expected_path, path);
 }
 void fixture_expect_structure(uint64_t mode, uint64_t name_mode) {
     assert(mode >= 1 && mode <= 2 && name_mode <= 2);
     expected_mode = mode; expected_name_mode = name_mode;
+}
+void fixture_expect_expression(const char *expression, uint64_t case_sensitive) {
+    assert(expression && strlen(expression) <= 1024 && case_sensitive <= 1);
+    strcpy(expected_expression, expression); expected_expression_case = case_sensitive;
 }
 static void check_scope(const char *extensions, const char *filenames) {
     if (expected_all) { assert(!extensions && !filenames); }
@@ -63,7 +70,7 @@ static char *next(unsigned kind) {
 uint64_t fcb_atlas_create(void) { ++counts[0]; return refuse_create ? 0 : 42; }
 char *fcb_atlas_open_cancelable(uint64_t handle, const char *root, uint64_t files,
                               int32_t (*poll)(void *), void *context) {
-    assert(handle == 42 && strcmp(root, "/project") == 0 && files == 4096);
+    assert(handle == 42 && strcmp(root, "/project") == 0 && files == (expected_path_kind == 3 ? 20000 : 4096));
     assert(poll && context); ++counts[1];
     if (poll(context)) return NULL;
     return next(0);
@@ -112,6 +119,19 @@ char *fcb_atlas_search_begin_matching(uint64_t handle, uint64_t generation, cons
     else { assert(path && !strcmp(path, expected_path)); }
     ++counts[12];
     return fcb_atlas_search_begin(handle, generation, query, matches, files, file_bytes, source_bytes);
+}
+char *fcb_atlas_search_begin_expression(uint64_t handle, uint64_t generation, const char *expression,
+                                      const char *extensions, const char *filenames,
+                                      uint64_t path_kind, const char *path, uint64_t case_sensitive,
+                                      uint64_t matches, uint64_t files, uint64_t file_bytes,
+                                      uint64_t source_bytes, uint64_t scan_bytes) {
+    assert(expression && !strcmp(expression, expected_expression) && case_sensitive == expected_expression_case);
+    assert(scan_bytes == 256 * 1024 * 1024 && path_kind == expected_path_kind);
+    check_scope(extensions, filenames);
+    if (path_kind == 0) { assert(!path); }
+    else { assert(path && !strcmp(path, expected_path)); }
+    ++counts[13];
+    return fcb_atlas_search_begin(handle, generation, expression, matches, files, file_bytes, source_bytes);
 }
 char *fcb_atlas_search_step_cancelable(uint64_t handle, uint64_t generation,
                                      int32_t (*poll)(void *), void *context) {

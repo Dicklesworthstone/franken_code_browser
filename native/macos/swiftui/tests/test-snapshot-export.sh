@@ -8,13 +8,13 @@ out=$(mktemp -d "${TMPDIR:-/tmp}/fcb-snapshot-export.XXXXXX")
 set --
 if [ "$(uname -s)" = Linux ]; then set -- -static-stdlib; fi
 swiftc "$@" -swift-version 6 -warnings-as-errors \
-    "$src/AtlasSearch.swift" "$src/AtlasSearchCoordinator.swift" \
+    "$src/AtlasSearch.swift" "$src/AtlasSearchExpression.swift" "$src/AtlasSearchCoordinator.swift" \
     "$src/AtlasSnapshotExport.swift" "$src/AtlasSnapshotExportModel.swift" \
     "$src/tests/AtlasSnapshotExportTests.swift" -o "$out/model"
 "$out/model"
 clang -std=gnu11 -Wall -Wextra -Werror -c "$src/tests/AtlasSnapshotExportBridgeFixtures.c" -o "$out/fixture.o"
 swiftc "$@" -swift-version 6 -warnings-as-errors \
-    "$src/AtlasSearch.swift" "$src/AtlasSearchCoordinator.swift" \
+    "$src/AtlasSearch.swift" "$src/AtlasSearchExpression.swift" "$src/AtlasSearchCoordinator.swift" \
     "$src/AtlasSnapshotExport.swift" "$src/AtlasSnapshotExportBridge.swift" \
     "$src/tests/AtlasSnapshotExportBridgeTests.swift" "$out/fixture.o" -o "$out/bridge"
 "$out/bridge"

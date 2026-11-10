@@ -4,7 +4,7 @@ root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
 build_dir="${FCB_TEST_OUTPUT_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/fcb-search-presentation.XXXXXX")}"
 mkdir -p "$build_dir"
 swiftc -swift-version 6 -warnings-as-errors \
-  "$root/native/macos/swiftui/AtlasSearch.swift" \
+  "$root/native/macos/swiftui/AtlasSearch.swift" "$root/native/macos/swiftui/AtlasSearchExpression.swift" \
   "$root/native/macos/tests/AtlasSearchPresentationRegressionTests.swift" \
   -o "$build_dir/search-presentation-tests"
 "$build_dir/search-presentation-tests"

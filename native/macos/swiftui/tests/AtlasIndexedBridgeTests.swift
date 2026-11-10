@@ -48,6 +48,21 @@ import Foundation
         check(try t.scopedIndexBegin!(h, 6, .all, AtlasSearchPathScope(visiblePaths: [])) != nil)
         check(live() == 0 && calls() == 20)
         #endif
+        let beforeExpressions = calls()
+        let expression = "\"exact text\" required -excluded lang:rs"
+        check(try t.expressionQueryBegin!(h, 52, 1, expression, .all, .workspace, true) != nil)
+        check(try t.expressionQueryBegin!(h, 53, 1, expression, AtlasSearchFileScope(extensions: ["rs"]),
+            AtlasSearchPathScope(kind: .directory, path: "src"), false) != nil)
+        check(live() == 0 && calls() == beforeExpressions + 2)
+        mode(1); check(try t.expressionQueryBegin!(h, 52, 1, expression, .all, .workspace, true) == nil && live() == 0)
+        for bad: Int32 in [2, 3] {
+            mode(bad)
+            do {
+                _ = try t.expressionQueryBegin!(h, 52, 1, expression, .all, .workspace, true)
+                preconditionFailure("Malformed expression response accepted")
+            } catch AtlasSearchError.invalidResponse { checks += 1 }
+            check(live() == 0)
+        }
         mode(1); check(try t.indexBegin(h, 1) == nil && live() == 0)
         for bad: Int32 in [2, 3] {
             mode(bad)

@@ -40,7 +40,7 @@ enum AtlasCapturedReader {
     /// authorize a literal Find. Open the retained evidence's original range.
     static func structuralRequest(_ selected: AtlasSearchCapturedHit,
                                   identity: AtlasReaderIdentity) throws -> AtlasReaderRequest {
-        guard selected.mode != .text, identity.capturedBytes == selected.capturedBytes,
+        guard !selected.mode.isTextual, identity.capturedBytes == selected.capturedBytes,
               identity.pathBytes.elementsEqual(selected.path.utf8),
               selected.start < selected.end, selected.end <= selected.capturedBytes,
               selected.end - selected.start <= AtlasReaderLimits.maximumPageBytes else {
@@ -56,7 +56,7 @@ enum AtlasCapturedReader {
         read: @MainActor (AtlasReaderHitTarget) async throws -> Page
     ) async throws -> AtlasCapturedReaderResult<Page> {
         try Task.checkCancellation()
-        guard selected.mode == .text, identity.capturedBytes == selected.capturedBytes,
+        guard selected.mode.isTextual, identity.capturedBytes == selected.capturedBytes,
               identity.pathBytes.elementsEqual(selected.path.utf8),
               selected.start < selected.end, selected.end <= selected.capturedBytes else {
             throw AtlasReaderError.invalidResponse

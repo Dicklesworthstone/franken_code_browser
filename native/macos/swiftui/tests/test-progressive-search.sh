@@ -4,16 +4,16 @@ set -eu
 src=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/fcb-progressive-search.XXXXXX")
 swiftc -swift-version 6 -warnings-as-errors \
-    "$src/AtlasSearch.swift" "$src/AtlasSearchCoordinator.swift" \
+    "$src/AtlasSearch.swift" "$src/AtlasSearchExpression.swift" "$src/AtlasSearchCoordinator.swift" \
     "$src/tests/AtlasSearchProgressTests.swift" -o "$tmp/coordinator"
 "$tmp/coordinator"
 swiftc -swift-version 6 -warnings-as-errors \
-    "$src/AtlasSearch.swift" "$src/tests/AtlasVisibleSearchWireTests.swift" -o "$tmp/visible-scope-wire"
+    "$src/AtlasSearch.swift" "$src/AtlasSearchExpression.swift" "$src/tests/AtlasVisibleSearchWireTests.swift" -o "$tmp/visible-scope-wire"
 "$tmp/visible-scope-wire"
 clang -std=gnu11 -Wall -Wextra -Werror \
     -c "$src/tests/AtlasNativeSearchFixtures.c" -o "$tmp/fixture.o"
 swiftc -swift-version 6 -warnings-as-errors \
-    "$src/AtlasSearch.swift" "$src/AtlasSearchCapture.swift" \
+    "$src/AtlasSearch.swift" "$src/AtlasSearchExpression.swift" "$src/AtlasSearchCapture.swift" \
     "$src/AtlasSearchCoordinator.swift" "$src/AtlasSearchWorker.swift" \
     "$src/tests/AtlasNativeSearchTests.swift" "$tmp/fixture.o" -o "$tmp/worker"
 "$tmp/worker"

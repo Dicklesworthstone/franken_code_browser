@@ -15,6 +15,9 @@ final class IndexedFixture: @unchecked Sendable {
         var encoding = "utf8"
         var insensitiveText = "X"
         var insensitiveRangeBytes = 1
+        var expressionPrimary = "x"
+        var expressionExcluded = 0
+        var expressionWorkBytes: UInt64 = 8192
         // Explicit scripted scope receipts; this fixture does no file matching.
         var scopedEligible: Int? = nil
         var scopedCaptured: Int? = nil
@@ -37,6 +40,7 @@ final class IndexedFixture: @unchecked Sendable {
         var captureFileScope: AtlasSearchFileScope = .all
         var capturePathScope: AtlasSearchPathScope = .workspace
         var caseSensitive = true
+        var expression: String?
     }
     private let lock = NSLock()
     private var config = Configuration()
@@ -87,6 +91,10 @@ final class IndexedFixture: @unchecked Sendable {
         }, scopedIndexBegin: { h, g, scope, pathScope in
             precondition(g == 1)
             return try self.response("build-begin", h, scope: scope, pathScope: pathScope)
+        }, expressionQueryBegin: { h, g, index, expression, scope, pathScope, caseSensitive in
+            precondition(index == 1)
+            return try self.response("query-begin", h, generation: g, scope: scope,
+                pathScope: pathScope, caseSensitive: caseSensitive, expression: expression)
         })
     }
 
@@ -95,6 +103,7 @@ final class IndexedFixture: @unchecked Sendable {
                           scope: AtlasSearchFileScope = .all,
                           pathScope: AtlasSearchPathScope = .workspace,
                           caseSensitive: Bool = true,
+                          expression: String? = nil,
                           cancellation: AtlasSearchCancellation? = nil) throws -> String? {
         lock.lock(); let block = blocked; lock.unlock()
         block?(phase)
@@ -113,6 +122,11 @@ final class IndexedFixture: @unchecked Sendable {
             s.generation = generation; s.needle = needle; s.queryStep = 0; s.scope = scope
             s.pathScope = pathScope
             s.caseSensitive = caseSensitive
+            s.expression = expression
+            if let expression {
+                s.needle = s.config.expressionPrimary
+                events.append("query-expression:\(expression)")
+            }
             events.append("query-scope:\(scope.wireKind):\(scope.extensions ?? ""):\(scope.filenames ?? "")")
             events.append("query-path:\(pathScope.kind.rawValue):\(pathScope.pathHex)")
             events.append("query-case:\(caseSensitive)")
@@ -186,9 +200,11 @@ final class IndexedFixture: @unchecked Sendable {
         } else {
             let scoped = !s.scope.isAll || !s.pathScope.isWorkspace
             let eligible = scoped ? c.scopedEligible ?? c.files : c.files
-            let available = scoped ? c.scopedCaptured ?? captured : captured
-            let unavailable = scoped ? c.scopedUnavailable ?? captureUnavailable : captureUnavailable
-            let pending = eligible - available - unavailable
+            let expressionExcluded = s.expression == nil ? 0 : c.expressionExcluded
+            let available = max(0, (scoped ? c.scopedCaptured ?? captured : captured) - expressionExcluded)
+            let unavailable = min(scoped ? c.scopedUnavailable ?? captureUnavailable : captureUnavailable,
+                eligible - expressionExcluded - available)
+            let pending = eligible - expressionExcluded - available - unavailable
             precondition(eligible <= c.files && available <= captured && unavailable <= captureUnavailable && pending >= 0)
             let examined = min(s.queryStep, available)
             let scanned = s.caseSensitive ? min(1, examined) : examined, skipped = max(0, examined - scanned)
@@ -198,23 +214,24 @@ final class IndexedFixture: @unchecked Sendable {
             var rows: [[String: Any]] = []
             if first < end {
                 for n in first..<end {
-                    let range: [String: String] = ["start": String(n * 2),
-                        "end": String(n * 2 + (s.caseSensitive ? 1 : c.insensitiveRangeBytes))]
+                    let width = s.caseSensitive ? (s.expression == nil ? 1 : s.needle.utf8.count) : c.insensitiveRangeBytes
+                    let range: [String: String] = ["start": String(n * 2), "end": String(n * 2 + width)]
                     let path: [String: String] = ["encoding": "unix-bytes", "hex": c.pathHex, "display": "a.rs"]
                     var row: [String: Any] = ["hit_id": String(n + 1), "file_id": String(c.fileID), "source_revision": "1",
                         "capture_sha256": c.digest, "capture_byte_length": "4096", "original_range": range, "path": path]
                     if !s.caseSensitive { row["matched_text"] = c.insensitiveText }
+                    else if s.expression != nil { row["matched_text"] = s.needle }
                     rows.append(row)
                 }
             }
-            let fields: [String: Any] = ["command": phase == "query-begin" ? "begin-indexed" : (phase == "page" ? "page" : "step"),
+            let fields: [String: Any] = ["command": phase == "query-begin" ? (s.expression == nil ? "begin-indexed" : "begin-indexed-expression") : (phase == "page" ? "page" : "step"),
                 "capture_manifest": "2", "query_generation": String(generation), "needle": s.needle,
                 "mode": s.caseSensitive ? "exact-decoded-literal" : "unicode-lowercase-literal",
                 "case_sensitive": s.caseSensitive, "search_strategy": "retained-ephemeral-index",
                 "catalogued_files": String(c.files), "discovery_complete": c.discovery,
-                "examined_files": String(examined + unavailable), "scanned_files": String(scanned), "verified_files": String(scanned),
+                "examined_files": String(expressionExcluded + examined + unavailable), "scanned_files": String(scanned), "verified_files": String(scanned),
                 "skipped_by_index": String(skipped), "fallback_files": String(c.fallback || !s.caseSensitive ? scanned : 0),
-                "unavailable_files": String(unavailable), "pending_files": String(eligible - examined - unavailable),
+                "unavailable_files": String(unavailable), "pending_files": String(eligible - expressionExcluded - examined - unavailable),
                 "retained_hits": String(count), "displayed_hits": String(count), "matches_seen": String(count), "step_count": String(s.queryStep),
                 "verification_source_bytes": String(scanned == 0 ? 0 : min(4096, totalBytes)), "source_bytes_read": "0", "read_calls": "0",
                 "search_in_progress": running, "search_complete": !running && pending == 0 && unavailable == 0
@@ -223,6 +240,18 @@ final class IndexedFixture: @unchecked Sendable {
                     ? (capturePending > 0 ? "source-byte-limit" : "capture-scope") : "all-files-examined"),
                 "hits": rows, "next_offset": end < count ? String(end) : NSNull()]
             value.merge(fields, uniquingKeysWith: { _, n in n })
+            if let expression = s.expression {
+                let scannedInput = UInt64(scanned) * c.expressionWorkBytes
+                value["mode"] = "decoded-text-expression"; value["expression"] = expression
+                value["primary_needle"] = s.needle; value["query_syntax"] = "fcb-bounded-expression/1"
+                value["predicate_scope"] = "same-complete-capture"; value["path_filter_domain"] = "utf8-or-escaped-search-key"
+                value["max_scan_bytes"] = String(AtlasSearchExpression.scanLimit)
+                value["scanned_input_bytes"] = String(scannedInput); value["verification_source_bytes"] = String(scannedInput)
+                value["expression_excluded_files"] = String(expressionExcluded)
+                value["expression_scope_files"] = String(eligible - expressionExcluded)
+                value["eligible_captured_files"] = String(available)
+                value["scoped_capture_unavailable_files"] = String(unavailable)
+            }
             if scoped {
                 value["search_scope"] = s.scope.wireKind
                 value["scope_extensions"] = s.scope.extensions ?? ""

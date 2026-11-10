@@ -21,6 +21,9 @@ struct AtlasIndexedSearchTransport: Sendable {
     /// Capture admission is independent from query filtering. A legacy builder
     /// can prepare only the all-files workspace; never widen an initial scope.
     var scopedIndexBegin: (@Sendable (UInt64, UInt64, AtlasSearchFileScope, AtlasSearchPathScope) throws -> String?)? = nil
+    /// Expressions are parsed and verified by the shared engine. The source
+    /// capture scope is unchanged; syntax filters narrow only this query.
+    var expressionQueryBegin: (@Sendable (UInt64, UInt64, UInt64, String, AtlasSearchFileScope, AtlasSearchPathScope, Bool) throws -> String?)? = nil
 }
 
 /// An explicit captured-index session. The app serializes run() on its existing
@@ -71,9 +74,11 @@ final class AtlasIndexedSearch: @unchecked Sendable {
 
     func runScoped(input: AtlasSearchInput, cancellation: AtlasSearchCancellation,
                    access: AtlasSearchAccessLease, progress: @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport {
-        guard input.mode == .text else { throw AtlasSearchError.invalidRequest }
+        guard input.mode.isTextual else { throw AtlasSearchError.invalidRequest }
         let root = input.root, query = input.query, scope = input.fileScope, pathScope = input.pathScope
-        if !input.caseSensitive {
+        if input.mode == .expression {
+            guard transport.expressionQueryBegin != nil else { throw AtlasSearchError.unavailable }
+        } else if !input.caseSensitive {
             guard transport.matchingQueryBegin != nil else { throw AtlasSearchError.unsupportedMatching }
         } else if pathScope.isWorkspace {
             guard scope.isAll || transport.scopedQueryBegin != nil else { throw AtlasSearchError.invalidScope }
@@ -91,7 +96,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                 // Publish a successfully finished index before the next cancel
                 // gate. Cancellation can suppress query delivery, not make an
                 // acknowledged complete source universe need another capture.
-                cached = try build(root: root, scope: scope, pathScope: pathScope, caseSensitive: input.caseSensitive,
+                cached = try build(root: root, scope: scope, pathScope: pathScope, mode: input.mode, caseSensitive: input.caseSensitive,
                     access: access, cancellation: cancellation, progress: progress)
             }
             guard let session = cached else { throw AtlasSearchError.unavailable }
@@ -101,6 +106,10 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             let basis = session.basis, owner = session.owner
             try check(cancellation)
             let began = try owner.call { handle -> String? in
+                if input.mode == .expression {
+                    guard let expression = transport.expressionQueryBegin else { throw AtlasSearchError.unavailable }
+                    return try expression(handle, generation, basis.index, query, scope, pathScope, input.caseSensitive)
+                }
                 if !input.caseSensitive {
                     guard let matching = transport.matchingQueryBegin else { throw AtlasSearchError.unsupportedMatching }
                     return try matching(handle, generation, basis.index, query, scope, pathScope, input.caseSensitive)
@@ -115,7 +124,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             }
             var page = try AtlasIndexedQueryPage(began,
                 basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope,
-                caseSensitive: input.caseSensitive, command: "begin-indexed")
+                caseSensitive: input.caseSensitive, mode: input.mode,
+                command: input.mode == .expression ? "begin-indexed-expression" : "begin-indexed")
             var result = AtlasIndexedAccumulator()
             var lastPublished = -Double.infinity
             var publishedHits = 0
@@ -127,12 +137,13 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     let start = result.hits.count
                     let tail = try AtlasIndexedQueryPage(owner.call { try transport.page($0, generation, UInt64(start), 128) },
                         basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope,
-                        caseSensitive: input.caseSensitive, command: "page")
+                        caseSensitive: input.caseSensitive, mode: input.mode, command: "page")
                     try result.append(tail, start: start, limit: 128)
                 }
                 let state = page.state
                 let capture = result.hits.isEmpty ? nil : AtlasIndexedSource.capture(owner: owner, basis: basis,
-                    root: root, needle: query, hits: result.hits, caseSensitive: input.caseSensitive,
+                    root: root, needle: page.expression?.primaryNeedle ?? query, hits: result.hits,
+                    caseSensitive: input.caseSensitive, mode: input.mode,
                     importReader: transport.sourceReader)
                 let report = AtlasSearchReport(hits: result.hits.map(\.hit), complete: state.complete,
                     truncated: state.truncated, unavailableFiles: state.unavailable, unsupportedFiles: 0,
@@ -145,9 +156,10 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                         captureFileScope: basis.captureScope.fileScope, capturePathScope: basis.captureScope.pathScope,
                         captureEligibleFiles: basis.captureScope.eligibleFiles,
                         captureMissingVisibleFiles: basis.captureScope.visibleMissingFiles,
-                        uncapturedFiles: state.eligible - state.captured - state.captureUnavailable),
+                        uncapturedFiles: state.eligible - (state.expression?.excludedFiles ?? 0) - state.captured - state.captureUnavailable),
                     fileScope: scope, excludedFiles: basis.files - state.eligible, pathScope: pathScope,
-                    caseSensitive: input.caseSensitive, visibleMissingFiles: state.visibleMissing)
+                    mode: input.mode, caseSensitive: input.caseSensitive, visibleMissingFiles: state.visibleMissing,
+                    expression: state.expression)
                 try check(cancellation)
                 if !state.running { return report }
                 let now = ProcessInfo.processInfo.systemUptime
@@ -157,7 +169,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                 try check(cancellation)
                 page = try AtlasIndexedQueryPage(owner.call { try transport.queryStep($0, generation, cancellation) },
                     basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope,
-                    caseSensitive: input.caseSensitive, command: "step")
+                    caseSensitive: input.caseSensitive, mode: input.mode, command: "step")
             }
         } catch {
             if cancellation.isCanceled { throw AtlasSearchError.canceled }
@@ -195,7 +207,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             handle: handle, layout: layout, files: files, discovery: discovery, page: page)
     }
 
-    private func build(root: String, scope: AtlasSearchFileScope, pathScope: AtlasSearchPathScope, caseSensitive: Bool,
+    private func build(root: String, scope: AtlasSearchFileScope, pathScope: AtlasSearchPathScope,
+                       mode: AtlasSearchMode, caseSensitive: Bool,
                        access: AtlasSearchAccessLease, cancellation: AtlasSearchCancellation,
                        progress: @Sendable (AtlasSearchReport) -> Void) throws -> Session {
         let grant = access.reference.map(ObjectIdentifier.init)
@@ -223,7 +236,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                         captureFileScope: page.captureScope.fileScope, capturePathScope: page.captureScope.pathScope,
                         captureEligibleFiles: page.captureScope.eligibleFiles,
                         captureMissingVisibleFiles: page.captureScope.visibleMissingFiles),
-                    fileScope: scope, pathScope: pathScope, caseSensitive: caseSensitive))
+                    fileScope: scope, pathScope: pathScope, mode: mode, caseSensitive: caseSensitive))
                 lastPublished = now
             }
             // Cancellation here leaves the last acknowledged Rust step intact.

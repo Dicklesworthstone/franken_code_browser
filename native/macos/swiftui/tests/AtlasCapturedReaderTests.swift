@@ -77,6 +77,7 @@ private final class Calls: @unchecked Sendable {
         try fullRequest.validate(capturedBytes: maximum)
         for invalid in [
             selected(mode: .text),
+            selected(mode: .expression),
             selected(path: "other.rs", mode: .headings),
             selected(start: 12, end: 10, mode: .symbols),
             selected(start: 10, end: 21, mode: .headings),
@@ -138,6 +139,19 @@ private final class Calls: @unchecked Sendable {
         check(activated.page == "page from reader" && activated.index == 1, "Select exact later occurrence, not the first matching word")
         check(chosen?.generation == 23 && chosen?.index == 1, "Selection uses the new reader's query namespace")
         check(chosen?.start == 10 && chosen?.end == 12 && chosen?.originalHex == "7800", "Original UTF-16 byte evidence is preserved")
+        let expressionSource = identity(bytes: 64)
+        let expressionTarget = selected(needle: "pub fn", start: 30, end: 42, bytes: 64, mode: .expression)
+        let expression = try await AtlasCapturedReader.activate(expressionTarget, identity: expressionSource,
+            find: { primary in
+                check(primary == "pub fn", "Expression activation searches only the exact primary source text")
+                return report(identity: expressionSource, needle: primary, ranges: [(2, 14), (30, 42)],
+                    hex: "700075006200200066006e00")
+            }, read: { $0 })
+        check(expression.index == 1 && expression.page.generation == 23,
+            "Expression selection rebinds the later occurrence in the retained reader's namespace")
+        check(expression.page.start == 30 && expression.page.end == 42
+              && expression.page.originalHex == "700075006200200066006e00",
+            "Expression activation preserves original UTF-16 phrase bytes")
         let partial = try await AtlasCapturedReader.activate(selected(), identity: identity(),
             find: { _ in report(complete: false) }, read: { $0.index })
         check(partial.page == 1 && !partial.report.complete, "A verified retained hit is usable even when total count is partial")
@@ -161,15 +175,18 @@ private final class Calls: @unchecked Sendable {
             ("utf16be", "i\u{307}", "İ", "0130", 2)
         ] {
             let source = identity(encoding: encoding)
-            let request = selected(needle: actualText, start: 2, end: 2 + count, caseSensitive: false)
-            let value = try await AtlasCapturedReader.activate(request, identity: source,
-                find: { exact in
-                    check(exact.utf8.elementsEqual(actualText.utf8) && !exact.utf8.elementsEqual(query.utf8),
-                        "Insensitive activation performs exact Find using the engine's source spelling")
-                    return report(identity: source, needle: actualText, ranges: [(2, 2 + count)], hex: hex)
-                }, read: { $0 })
-            check(value.page.start == 2 && value.page.end == 2 + count && value.page.originalHex == hex,
-                "Insensitive activation preserves original-byte evidence for " + encoding)
+            for mode in [AtlasSearchMode.text, .expression] {
+                let request = selected(needle: actualText, start: 2, end: 2 + count,
+                    mode: mode, caseSensitive: false)
+                let value = try await AtlasCapturedReader.activate(request, identity: source,
+                    find: { exact in
+                        check(exact.utf8.elementsEqual(actualText.utf8) && !exact.utf8.elementsEqual(query.utf8),
+                            "Insensitive activation performs exact Find using the engine's source spelling")
+                        return report(identity: source, needle: actualText, ranges: [(2, 2 + count)], hex: hex)
+                    }, read: { $0 })
+                check(value.page.start == 2 && value.page.end == 2 + count && value.page.originalHex == hex,
+                    "Insensitive activation preserves original-byte evidence for " + encoding + " " + mode.rawValue)
+            }
         }
         await refused(identity: identity(bytes: 21))
         await refused(identity: identity(path: "other.rs"))

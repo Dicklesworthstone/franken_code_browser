@@ -69,7 +69,8 @@ enum AtlasSearchCaptureFactory {
 
     static func make(owner: AtlasSearchCaptureOwner, identity: AtlasSearchCaptureIdentity,
                      root: String, needle: String, witnesses: [AtlasSearchCaptureWitness],
-                     caseSensitive: Bool = true, importReader: @escaping Import) -> AtlasSearchCapture {
+                     caseSensitive: Bool = true, mode requestedMode: AtlasSearchMode? = nil,
+                     importReader: @escaping Import) -> AtlasSearchCapture {
         AtlasSearchCapture(retainAccess: { owner.retainAccess($0) }, target: { hit in
             guard hit.id >= 0, hit.id < witnesses.count else { return nil }
             let witness = witnesses[hit.id]
@@ -81,12 +82,14 @@ enum AtlasSearchCaptureFactory {
                   witness.hit.captureByteLength == hit.captureByteLength,
                   AtlasSearchText.sameActualText(witness.hit.actualText, hit.actualText),
                   let path = hit.sourcePath, hit.start < hit.end else { return nil }
-            let mode = witness.hit.structure?.mode ?? .text
-            guard mode != .text || AtlasSearchText.accepts(actualText: hit.actualText,
+            let mode = requestedMode ?? witness.hit.structure?.mode ?? .text
+            guard (mode.isTextual ? witness.hit.structure == nil : witness.hit.structure?.mode == mode),
+                  mode != .expression || hit.actualText != nil,
+                  !mode.isTextual || AtlasSearchText.accepts(actualText: hit.actualText,
                 needle: needle, caseSensitive: caseSensitive) else { return nil }
             // The exact reader proves the source spelling at the selected
             // original-byte range, even when the workspace query ignored case.
-            let exactNeedle = mode == .text ? (hit.actualText ?? needle) : needle
+            let exactNeedle = mode.isTextual ? (hit.actualText ?? needle) : needle
             return AtlasSearchCapturedHit(root: root, path: path, needle: exactNeedle,
                 start: hit.start, end: hit.end, capturedBytes: hit.captureByteLength ?? 0,
                 openReader: { reader in

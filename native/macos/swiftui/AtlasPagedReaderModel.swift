@@ -250,9 +250,9 @@ import Observation
             let liveInput = try AtlasReaderInput(root: root, path: path)
             if let target = capturedTarget {
                 guard target.root.utf8.elementsEqual(root.utf8), target.path.utf8.elementsEqual(path.utf8),
-                      target.mode != .text || coordinator.supportsFind else { throw AtlasReaderError.invalidInput }
+                      !target.mode.isTextual || coordinator.supportsFind else { throw AtlasReaderError.invalidInput }
                 input = try AtlasReaderInput(captured: target)
-                fileQuery = target.mode == .text ? target.needle : ""
+                fileQuery = target.mode.isTextual ? target.needle : ""
             } else if let supplied = suppliedSource {
                 guard supplied.matches(root: root, path: path) else { throw AtlasReaderError.invalidInput }
                 guard liveTransport.openBytes != nil else { throw AtlasReaderError.unavailable }
@@ -275,8 +275,9 @@ import Observation
                 let opened = try await coordinator.open(input: input, accessLease: accessLease)
                 guard operation == ticket, !Task.isCancelled else { return }
                 if let target = capturedTarget {
-                    if target.mode == .text {
-                        // Literal hits receive this reader's own query IDs.
+                    if target.mode.isTextual {
+                        // Literal hits and expression anchor terms receive
+                        // this reader's own exact-spelling query IDs.
                         let selected = try await AtlasCapturedReader.activate(target, identity: opened.identity,
                             find: { try await coordinator.find($0) },
                             read: { try await coordinator.read(.hit($0)) })
@@ -291,7 +292,7 @@ import Observation
                         install(selected, request: request)
                     }
                     finish(ticket)
-                    notice = target.mode == .text ? "Opened the exact search capture without rereading the live file."
+                    notice = target.mode.isTextual ? "Opened the exact search capture without rereading the live file."
                         : "Opened retained \(target.mode == .headings ? "heading" : "declaration") evidence at original bytes \(target.start)–\(target.end). No live-file reread."
                 } else {
                     install(opened, request: .firstPage)

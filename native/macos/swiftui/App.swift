@@ -380,7 +380,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
             pathKind: searchPathKind.rawValue, path: searchPathKind == .visible
                 ? (currentVisibleSearch?.snapshot.id.uuidString ?? "")
                 : (searchPathKind == .workspace ? "" : searchPathInput),
-            mode: searchMode, nameMode: searchMode == .text ? .contains : searchNameMode,
+            mode: searchMode, nameMode: searchMode.isTextual ? .contains : searchNameMode,
             caseSensitive: effectiveSearchCaseSensitive)
     }
 
@@ -417,8 +417,8 @@ private struct AtlasFrozenViewportSearch: Sendable {
             && searchPresentation?.isCurrent(in: searchContext) == true
     }
 
-    private var wantsCapturedIndex: Bool { searchMode == .text && useCapturedIndex }
-    private var effectiveSearchCaseSensitive: Bool { searchMode != .text || searchCaseSensitive }
+    private var wantsCapturedIndex: Bool { searchMode.isTextual && useCapturedIndex }
+    private var effectiveSearchCaseSensitive: Bool { !searchMode.isTextual || searchCaseSensitive }
     private var overlayIsCurrent: Bool {
         searchIsCurrent && overlayContentRevision == atlasResidency.contentRevision
     }
@@ -589,13 +589,13 @@ private struct AtlasFrozenViewportSearch: Sendable {
             runSearch(debounce: true)
         }
         .onChange(of: searchNameMode) { _, _ in
-            if searchMode != .text {
+            if !searchMode.isTextual {
                 clearSearch()
                 runSearch(debounce: true)
             }
         }
         .onChange(of: searchCaseSensitive) { _, _ in
-            if searchMode == .text {
+            if searchMode.isTextual {
                 clearSearch()
                 // The captured source index is independent of query case.
                 // Keep it; only replace the query and its visible authority.
@@ -825,7 +825,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
             }
             .pickerStyle(.segmented).padding(.horizontal, 10)
             .accessibilityLabel("Search mode")
-            .help("Search exact text, named declaration candidates, or Markdown headings")
+            .help("Search literal text, expressions with required/excluded terms and filters, declaration candidates, or Markdown headings")
             HStack {
                 TextField(searchMode.placeholder, text: $query)
                     .textFieldStyle(.roundedBorder)
@@ -842,7 +842,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
             }
             .padding(.horizontal, 10)
             .padding(.top, 10)
-            if searchMode == .text {
+            if searchMode.isTextual {
                 Toggle("Match case", isOn: $searchCaseSensitive)
                     .toggleStyle(.checkbox)
                     .font(.caption)
@@ -850,7 +850,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
                     .help("When off, compare using Unicode lowercase. Results retain the original source spelling and byte ranges.")
                     .padding(.horizontal, 10).padding(.top, 6)
             }
-            if searchMode != .text {
+            if !searchMode.isTextual {
                 Picker("Name matching", selection: $searchNameMode) {
                     ForEach(AtlasSearchNameMode.allCases) { mode in Text(mode.label).tag(mode) }
                 }
@@ -860,11 +860,21 @@ private struct AtlasFrozenViewportSearch: Sendable {
                     .font(.caption2).foregroundStyle(.secondary)
                     .padding(.horizontal, 10).padding(.top, 4)
             }
+            if searchMode == .expression {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(searchMode.explanation)
+                    Text("Example: \"pub fn\" Result -unsafe path:src/ lang:rust")
+                        .font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                    Text("Path and language filters narrow the selected location and file types. Regex is unavailable.")
+                }
+                .font(.caption2).foregroundStyle(.secondary)
+                .padding(.horizontal, 10).padding(.top, 6)
+            }
             searchLocationControls
             HStack {
                 Toggle("Captured index", isOn: $useCapturedIndex)
                     .toggleStyle(.checkbox)
-                    .disabled(loadingProject || searchMode != .text)
+                    .disabled(loadingProject || !searchMode.isTextual)
                     .help("Capture the current file and location scope once, then search those retained bytes until Refresh.")
                 Spacer()
                 Button("Refresh", action: refreshCapturedSearch)
@@ -1971,7 +1981,9 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 : (input.pathScope.isWorkspace
                     ? "Searching selected file types. Excluded files do not consume the query's scan or result limits."
                     : "Searching \(input.pathScope.kind.label.lowercased()) \(String(reflecting: input.pathScope.path))\(input.fileScope.isAll ? "." : " within selected file types.") Excluded files do not consume the query's scan or result limits.")
-            if input.mode != .text {
+            if input.mode == .expression {
+                searchSummary += " " + input.mode.explanation
+            } else if !input.mode.isTextual {
                 searchSummary = "Searching \(input.mode == .symbols ? "declaration candidates" : "Markdown headings"). \(input.mode.explanation)"
                 if input.pathScope.isVisible {
                     searchSummary += " Scope: \(visibleScope?.snapshot.count ?? 0) files from the frozen atlas view."
@@ -2139,7 +2151,8 @@ private struct AtlasFrozenViewportSearch: Sendable {
                   let hit = searchPresentation?.captureCandidate(for: row, in: searchContext),
                   let target = capture.target(hit), target.root.utf8.elementsEqual(root.utf8),
                   target.path.utf8.elementsEqual(path.utf8),
-                  target.needle.utf8.elementsEqual((hit.actualText ?? query).utf8),
+                  target.needle.utf8.elementsEqual((hit.actualText ?? searchReport?.expression?.primaryNeedle ?? query).utf8),
+                  searchMode != .expression || searchReport?.expression?.query.utf8.elementsEqual(query.utf8) == true,
                   target.mode == searchMode, target.caseSensitive == effectiveSearchCaseSensitive else {
                 sourceUnavailable()
                 sourceError = "The retained search capture could not authorize this match. Search again, or explicitly open the current file."

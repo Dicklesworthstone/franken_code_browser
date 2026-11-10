@@ -149,32 +149,34 @@ enum AtlasSearchText {
 /// These are distinct engine requests. Symbols are qualified heuristic
 /// candidates; headings come from the shared Markdown parser.
 enum AtlasSearchMode: String, CaseIterable, Identifiable, Sendable {
-    case text, symbols, headings
+    case text, expression, symbols, headings
     var id: String { rawValue }
+    var isTextual: Bool { self == .text || self == .expression }
     var label: String {
-        switch self { case .text: return "Text"; case .symbols: return "Symbols"; case .headings: return "Headings" }
+        switch self { case .text: return "Text"; case .expression: return "Expression"; case .symbols: return "Symbols"; case .headings: return "Headings" }
     }
     var code: UInt64 {
-        switch self { case .text: return 0; case .symbols: return 1; case .headings: return 2 }
+        switch self { case .text: return 0; case .symbols: return 1; case .headings: return 2; case .expression: return 3 }
     }
     var wireMode: String {
-        switch self { case .text: return "exact-decoded-literal"; case .symbols: return "symbol-name"; case .headings: return "markdown-heading" }
+        switch self { case .text: return "exact-decoded-literal"; case .expression: return "decoded-text-expression"; case .symbols: return "symbol-name"; case .headings: return "markdown-heading" }
     }
     var evidence: String {
-        switch self { case .text: return "exact-decoded-literal"; case .symbols: return "heuristic-outline-candidate"; case .headings: return "fmd-heading" }
+        switch self { case .text: return "exact-decoded-literal"; case .expression: return "decoded-text-expression"; case .symbols: return "heuristic-outline-candidate"; case .headings: return "fmd-heading" }
     }
     var resultLabel: String {
-        switch self { case .text: return "exact matches"; case .symbols: return "symbol candidates"; case .headings: return "Markdown headings" }
+        switch self { case .text: return "exact matches"; case .expression: return "expression matches"; case .symbols: return "symbol candidates"; case .headings: return "Markdown headings" }
     }
     var explanation: String {
         switch self {
         case .text: return "Exact, case-sensitive decoded text in the admitted files."
+        case .expression: return "Quoted phrases, required terms, -excluded terms, path: and lang: filters. All terms apply to the same captured file; results select the first positive term."
         case .symbols: return "Case-sensitive heuristic declaration candidates in Rust, Python, JavaScript, TypeScript, Go and C/C++. Compiler resolution and references are not claimed."
         case .headings: return "Case-sensitive Markdown heading names from the shared parser, with canonical slugs and original source ranges."
         }
     }
     var placeholder: String {
-        switch self { case .text: return "Text in project…"; case .symbols: return "Declaration name…"; case .headings: return "Markdown heading…" }
+        switch self { case .text: return "Text in project…"; case .expression: return "\"pub fn\" Result -unsafe lang:rust"; case .symbols: return "Declaration name…"; case .headings: return "Markdown heading…" }
     }
 }
 
@@ -217,6 +219,7 @@ struct AtlasSearchStructureCoverage: Equatable, Sendable {
 
 enum AtlasSearchError: Error, Sendable {
     case unavailable, invalidResponse, canceled, invalidRequest, invalidScope, invalidPathScope, invalidVisibleScope, identityExhausted, unsupportedMatching
+    case query(String)
     var message: String {
         switch self {
         case .canceled: return "Search canceled. In-flight reads may finish, but their results will not be shown."
@@ -228,6 +231,15 @@ enum AtlasSearchError: Error, Sendable {
         case .unsupportedMatching: return "This search connection does not support case-insensitive text. Turn on Match case to search."
         case .unavailable: return "Search unavailable. The project could not be read or the search exceeded its limits."
         case .invalidResponse: return "Search response could not be read. Results are unavailable, not an empty match set."
+        case .query(let code):
+            switch code {
+            case "QUERY_EMPTY": return "Include a positive search term or quoted phrase in the expression."
+            case "QUERY_SYNTAX_ERROR": return "The expression has invalid syntax. Check quoted phrases, escapes, and nonempty path: or lang: filters."
+            case "QUERY_REGEX_UNQUALIFIED": return "Regular expressions are not supported. Use literal terms, quoted phrases, exclusions, and path: or lang: filters."
+            case "QUERY_NEEDLE_TOO_LONG": return "Keep the expression within 1,024 UTF-8 bytes."
+            case "QUERY_LIMIT_EXCEEDED": return "The expression exceeds its supported limits, including at most 64 terms and filters."
+            default: return "The search expression was refused (\(code))."
+            }
         }
     }
 }
@@ -263,6 +275,7 @@ struct AtlasSearchReport: Sendable {
     /// Requested visible paths absent from the search service's independent
     /// catalog. These are not excluded files or proof of an empty region.
     var visibleMissingFiles: Int = 0
+    var expression: AtlasSearchExpression? = nil
     var isInProgress: Bool { progress?.isRunning == true }
     var isWorkspaceScope: Bool { fileScope.isAll && pathScope.isWorkspace }
     var resultLabel: String { mode == .text && !caseSensitive ? "case-insensitive matches" : mode.resultLabel }
@@ -276,6 +289,7 @@ struct AtlasSearchReport: Sendable {
         return resultSummary
             + (isWorkspaceScope ? "" : " \(excludedFiles) catalogued files outside this scope.")
             + (visibleMissingFiles == 0 ? "" : " \(visibleMissingFiles) requested visible files are outside this search catalog.")
+            + ((expression?.excludedFiles ?? 0) == 0 ? "" : " \(expression?.excludedFiles ?? 0) files excluded by expression path/language filters.")
             + (indexStatus == nil ? "" : " Captured index; Refresh to include file edits.")
             + ((indexStatus?.uncapturedFiles ?? 0) == 0 ? "" : " \(indexStatus?.uncapturedFiles ?? 0) eligible files were not captured. Refresh to capture the current scope within its limits.")
     }
@@ -286,12 +300,13 @@ struct AtlasSearchReport: Sendable {
         case .text:
             noun = caseSensitive ? (count == 1 ? "exact match" : "exact matches")
                 : (count == 1 ? "case-insensitive match" : "case-insensitive matches")
+        case .expression: noun = count == 1 ? "expression match" : "expression matches"
         case .symbols: noun = count == 1 ? "symbol candidate" : "symbol candidates"
         case .headings: noun = count == 1 ? "heading" : "headings"
         }
         let qualification = mode == .symbols
             ? " Heuristic declaration candidates; compiler resolution and reference completeness are not claimed."
-            : (mode == .text && !caseSensitive ? " Compared using Unicode lowercase; source spelling is preserved." : "")
+            : (mode.isTextual && !caseSensitive ? " Compared using Unicode lowercase; source spelling is preserved." : "")
         if let progress, progress.isRunning {
             let membership = isWorkspaceScope ? "catalogued" : "eligible"
             return "Searching: \(count) \(noun) found; \(progress.examinedFiles) of \(progress.cataloguedFiles) \(membership) files examined. Results are provisional." + qualification
@@ -420,8 +435,8 @@ struct AtlasSearchInput: Sendable {
         self.fileScope = fileScope
         self.pathScope = pathScope
         self.mode = mode
-        self.nameMode = mode == .text ? .contains : nameMode
-        self.caseSensitive = mode == .text ? caseSensitive : true
+        self.nameMode = mode.isTextual ? .contains : nameMode
+        self.caseSensitive = mode.isTextual ? caseSensitive : true
     }
     func requireLegacyScope() throws {
         guard mode == .text else { throw AtlasSearchError.invalidRequest }
