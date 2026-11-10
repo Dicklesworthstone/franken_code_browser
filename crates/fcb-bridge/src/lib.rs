@@ -18,6 +18,8 @@ mod desk_sessions;
 mod desk_ffi;
 mod atlas_sessions;
 mod atlas_ffi;
+mod city_sessions;
+mod city_ffi;
 mod text_layout_ffi;
 mod source_cache_ffi;
 mod saved_sessions;

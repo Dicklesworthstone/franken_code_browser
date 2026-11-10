@@ -10,6 +10,7 @@ dependencies = [
  "fcb-core",
  "fcb-document",
  "fcb-map",
+ "fcb-render",
  "fcb-search",
  "fcb-source",
  "fcb-store",
@@ -31,6 +32,7 @@ version = "0.1.0"
 dependencies = [
  "fcb",
  "fcb-core",
+ "fcb-render",
 ]
 
 [[package]]

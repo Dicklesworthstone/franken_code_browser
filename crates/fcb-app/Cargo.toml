@@ -12,3 +12,4 @@ path = "src/main.rs"
 [dependencies]
 fcb = { path = "../fcb", default-features = false, features = ["snapshot", "map", "markdown"] }
 fcb-core = { path = "../fcb-core" }
+fcb-render = { path = "../fcb-render" }

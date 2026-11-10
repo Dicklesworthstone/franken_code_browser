@@ -10,7 +10,7 @@ default = []
 source = ["dep:fcb-source"]
 search = ["source", "dep:fcb-search"]
 snapshot = ["search", "analysis", "dep:fcb-store"]
-map = ["dep:fcb-map"]
+map = ["dep:fcb-map", "dep:fcb-render"]
 analysis = ["dep:fcb-analysis"]
 markdown = ["dep:fcb-document"]
 view = []
@@ -24,6 +24,7 @@ fcb-source = { path = "../fcb-source", optional = true }
 fcb-search = { path = "../fcb-search", optional = true }
 fcb-store = { path = "../fcb-store", optional = true }
 fcb-map = { path = "../fcb-map", optional = true }
+fcb-render = { path = "../fcb-render", optional = true }
 fcb-analysis = { path = "../fcb-analysis", optional = true }
 fcb-document = { path = "../fcb-document", optional = true }
 

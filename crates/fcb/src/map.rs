@@ -12,6 +12,9 @@ pub mod navigation;
 pub mod workspace;
 pub use navigation::{AtlasLocation, AtlasNavigation};
 pub use fcb_map::*;
+/// Retained same-footprint City geometry, projection and CPU picking. This
+/// remains an inert Rust API: it owns no window, Metal device or source grant.
+pub use fcb_render::city;
 pub use fcb_core::{DisplayColorConfig, QueryGeneration, ResourceAllocationId,
     ResourceBudget, RootId};
 
