@@ -12,6 +12,7 @@ use fcb_app::host::{HostError, HostResponse};
 use fcb_app::host::reader::{ReaderSession, ReaderSessionError, ReaderOutlineOptions,
     ReaderDocumentOptions, DocumentCopyMode, ReaderComparisonLimits, ReaderColumnKind};
 use fcb::search::{SymbolError, SymbolNameMode};
+use fcb::search::symbols::ReferenceError;
 use fcb::document::reader::DocumentReadError;
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
 
@@ -43,6 +44,7 @@ impl AccessError {
         match self {
             Self::Canceled | Self::Closed | Self::Reader(ReaderSessionError::Canceled)
                 | Self::Reader(ReaderSessionError::Symbol(SymbolError::Canceled))
+                | Self::Reader(ReaderSessionError::Reference(ReferenceError::Canceled))
                 | Self::Reader(ReaderSessionError::Document(DocumentReadError::Canceled))
                 | Self::Reader(ReaderSessionError::DocumentLinks(fcb::document::links::DocumentLinkError::Canceled)) => true,
             Self::Reader(ReaderSessionError::Comparison(fcb::analysis::comparison::ComparisonError::Canceled)) => true,
@@ -84,6 +86,11 @@ pub(super) enum Command<'a> {
     Symbol { generation: u64, id: u64, context: usize },
     CopySymbol { generation: u64, id: u64, whole_declaration: bool },
     ClearOutline { generation: u64 },
+    References { generation: u64, name: &'a str, max_items: usize },
+    ReferencePage { generation: u64, start: usize, limit: usize },
+    Reference { generation: u64, id: u64, context: usize },
+    CopyReference { generation: u64, id: u64 },
+    ClearReferences { generation: u64 },
     Document { generation: u64, options: ReaderDocumentOptions },
     DocumentWindow { generation: u64, first: usize, count: usize },
     DocumentHeadings { generation: u64, first: usize, count: usize },
@@ -290,6 +297,11 @@ impl ReaderSessions {
             Command::Symbol { generation, id, context } => reader.symbol_window(generation, id, context, &mut stop),
             Command::CopySymbol { generation, id, whole_declaration } => reader.copy_symbol(generation, id, whole_declaration, &mut stop),
             Command::ClearOutline { generation } => reader.clear_outline(generation, &mut stop),
+            Command::References { generation, name, max_items } => reader.prepare_references(generation, name, max_items, &mut stop),
+            Command::ReferencePage { generation, start, limit } => reader.reference_page(generation, start, limit, &mut stop),
+            Command::Reference { generation, id, context } => reader.reference_window(generation, id, context, &mut stop),
+            Command::CopyReference { generation, id } => reader.copy_reference(generation, id, &mut stop),
+            Command::ClearReferences { generation } => reader.clear_references(generation, &mut stop),
             Command::Document { generation, options } => reader.prepare_document(generation, options, &mut stop),
             Command::DocumentWindow { generation, first, count } => reader.document_window(generation, first, count, &mut stop),
             Command::DocumentHeadings { generation, first, count } => reader.document_headings(generation, first, count, &mut stop),
@@ -354,6 +366,9 @@ mod tests;
 #[cfg(all(test, unix))]
 #[path = "reader_outline_sessions_tests.rs"]
 mod outline_tests;
+#[cfg(all(test, unix))]
+#[path = "reader_references_sessions_tests.rs"]
+mod references_tests;
 #[cfg(all(test, unix))]
 #[path = "reader_document_sessions_tests.rs"]
 mod document_tests;
