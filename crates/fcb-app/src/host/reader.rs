@@ -11,6 +11,7 @@
 //! here. Calls are bounded synchronous worker operations, not redraw callbacks.
 
 mod outline;
+mod references;
 mod comparison;
 mod highlight;
 mod position;
@@ -19,10 +20,13 @@ mod document_links;
 #[cfg(test)]
 mod shared_tests;
 pub use outline::{ReaderOutlineOptions, MAX_READER_SYMBOL_PAGE, MAX_READER_SYMBOL_QUERY_BYTES};
+pub use references::{MAX_READER_REFERENCE_PAGE, MAX_READER_REFERENCE_NAME_BYTES,
+    MAX_READER_REFERENCES, MAX_READER_REFERENCE_SOURCE_BYTES};
 pub use document::{DocumentCopyMode, ReaderDocumentOptions, MAX_READER_DOCUMENT_PAGE};
 pub use comparison::ReaderComparisonLimits;
 pub use position::ReaderColumnKind;
 use outline::{AcceptedOutline, SelectionIdentity};
+use references::AcceptedReferences;
 
 use std::{mem::size_of, path::{Path, PathBuf}, sync::Arc};
 use fcb::{ArenaOwnerId, BrowserSession, ByteLength, ByteOffset, ByteRange, FileId, SourceRevision};
@@ -57,6 +61,7 @@ pub enum ReaderSessionError {
     View(ExtentViewError), Lines(LineWindowError), InvalidLimits, InvalidRange,
     StaleQuery, MissingHit, MissingLine, MissingColumn, Canceled, IdentityExhausted,
     Symbol(SymbolError), MissingOutline, UnsupportedOutlineLanguage,
+    Reference(fcb::search::symbols::ReferenceError), MissingReferences,
     Document(fcb::document::reader::DocumentReadError), MissingDocument,
     DocumentLinks(fcb::document::links::DocumentLinkError), MissingDocumentLinks, MissingDocumentLink,
     Comparison(fcb::analysis::comparison::ComparisonError),
@@ -68,12 +73,14 @@ impl std::fmt::Display for ReaderSessionError {
             Self::Source(e) => write!(f, "{e}"), Self::Stream(e) => write!(f, "{e}"),
             Self::View(e) => write!(f, "{e}"), Self::Lines(e) => write!(f, "{e}"),
             Self::Symbol(e) => write!(f, "{e}"), Self::Document(e) => write!(f, "{e}"),
+            Self::Reference(e) => write!(f, "{e}"),
             Self::DocumentLinks(e) => write!(f, "{e}"),
             Self::Comparison(e) => write!(f, "{e}"),
             Self::MissingDocument => f.write_str("READER_SESSION_NO_DOCUMENT"),
             Self::MissingDocumentLinks => f.write_str("READER_SESSION_NO_DOCUMENT_LINKS"),
             Self::MissingDocumentLink => f.write_str("READER_SESSION_MISSING_DOCUMENT_LINK"),
             Self::MissingOutline => f.write_str("READER_SESSION_NO_OUTLINE"),
+            Self::MissingReferences => f.write_str("READER_SESSION_NO_REFERENCES"),
             Self::UnsupportedOutlineLanguage => f.write_str("READER_SESSION_OUTLINE_LANGUAGE_UNSUPPORTED"),
             Self::InvalidLimits => f.write_str("READER_SESSION_INVALID_LIMITS"),
             Self::InvalidRange => f.write_str("READER_SESSION_INVALID_RANGE"),
@@ -94,6 +101,9 @@ impl From<StreamReadError> for ReaderSessionError { fn from(e: StreamReadError) 
 impl From<ExtentViewError> for ReaderSessionError { fn from(e: ExtentViewError) -> Self { Self::View(e) } }
 impl From<LineWindowError> for ReaderSessionError { fn from(e: LineWindowError) -> Self { Self::Lines(e) } }
 impl From<SymbolError> for ReaderSessionError { fn from(e: SymbolError) -> Self { Self::Symbol(e) } }
+impl From<fcb::search::symbols::ReferenceError> for ReaderSessionError {
+    fn from(e: fcb::search::symbols::ReferenceError) -> Self { Self::Reference(e) }
+}
 impl From<fcb::analysis::comparison::ComparisonError> for ReaderSessionError {
     fn from(e: fcb::analysis::comparison::ComparisonError) -> Self { Self::Comparison(e) }
 }
@@ -135,6 +145,8 @@ pub struct ReaderSession {
     last_query_attempt: u64,
     outline: Option<AcceptedOutline>,
     last_outline_attempt: u64,
+    references: Option<AcceptedReferences>,
+    last_reference_attempt: u64,
     document: Option<fcb::document::reader::DocumentReader<'static>>,
     document_links: Option<document_links::AcceptedDocumentLinks>,
     last_document_attempt: u64,
@@ -197,7 +209,8 @@ impl ReaderSession {
         Self { capture, capture_sha256, path: path.to_path_buf(), encoding, highlight: None,
             line_checkpoints: std::array::from_fn(|_| None), source_bytes_read: 0, read_calls: 0,
             file_observation: false, query: None, last_query_attempt: 0,
-            outline: None, last_outline_attempt: 0, document: None, document_links: None, last_document_attempt: 0,
+            outline: None, last_outline_attempt: 0, references: None, last_reference_attempt: 0,
+            document: None, document_links: None, last_document_attempt: 0,
             last_comparison_attempt: 0, next_allocation: 3,
             budget, _source_lease: source_lease, _state_lease: state_lease }
     }
@@ -248,6 +261,9 @@ impl ReaderSession {
         if let Some(generation) = self.accepted_generation() { out.integer(generation)?; } else { out.literal("null")?; }
         out.literal(",\"accepted_outline_generation\":")?;
         if let Some(generation) = self.outline_generation() { out.integer(generation)?; } else { out.literal("null")?; }
+        out.literal(",\"accepted_reference_generation\":")?;
+        if let Some(generation) = self.reference_generation() { out.integer(generation)?; } else { out.literal("null")?; }
+        out.literal(",\"last_reference_attempt\":")?; out.integer(self.last_reference_attempt)?;
         out.literal(",\"accepted_document_generation\":")?;
         if let Some(generation) = self.document_generation() { out.integer(generation)?; } else { out.literal("null")?; }
         out.literal(",\"accepted_document_links_generation\":")?;

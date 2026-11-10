@@ -64,6 +64,7 @@ pub(super) struct AcceptedOutline {
 pub(super) enum SelectionIdentity {
     Search(u64),
     Outline { generation: u64, symbol_id: u64, line: u64 },
+    Reference { generation: u64, reference_id: u64, line: u64 },
     Document { generation: u64, rendered_start: u64, rendered_end: u64 },
 }
 impl SelectionIdentity {
@@ -77,6 +78,12 @@ impl SelectionIdentity {
                 out.literal(",\"symbol_id\":")?; out.integer(symbol_id)?;
                 out.literal(",\"declaration_line\":")?; out.integer(line)?;
                 out.literal(",\"selection_namespace\":\"outline\",\"evidence_level\":\"heuristic-outline-candidate\",\"semantic_resolution\":false")?;
+            }
+            Self::Reference { generation, reference_id, line } => {
+                out.literal("\"reference_generation\":")?; out.integer(generation)?;
+                out.literal(",\"reference_id\":")?; out.integer(reference_id)?;
+                out.literal(",\"reference_line\":")?; out.integer(line)?;
+                out.literal(",\"selection_namespace\":\"reference\",\"evidence_level\":\"whole-token-text-candidate\",\"includes_comments_and_literals\":true,\"compiler_resolved\":false")?;
             }
             Self::Document { generation, rendered_start, rendered_end } => {
                 out.literal("\"document_generation\":")?; out.integer(generation)?;
