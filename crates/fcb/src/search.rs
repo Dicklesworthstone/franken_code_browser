@@ -40,6 +40,10 @@ pub mod paged_snapshot;
 /// Document-wide expressions, resumable predicates and exact hit activation.
 #[cfg(feature = "snapshot")]
 pub mod expression;
+/// Bounded declaration, heading and identifier lookup over saved source bytes.
+/// Heading mode additionally requires the `markdown` feature.
+#[cfg(feature = "snapshot")]
+pub mod snapshot_structure;
 /// Trusted catalog publication and header/footer-only saved-observation reopening.
 #[cfg(feature = "snapshot")]
 pub mod snapshot_catalog;
