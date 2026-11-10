@@ -99,6 +99,47 @@ char *fcb_saved_clear_expression(uint64_t handle, uint64_t generation);
 char *fcb_saved_open_expression_hit_reader(uint64_t handle, uint64_t reader,
     uint64_t generation, uint64_t hit);
 
+/* Structural names in saved source: mode 1 = qualified symbol candidates,
+ * 2 = Markdown headings, 4 = whole-token identifier occurrences. name_mode
+ * 0 = exact, 1 = prefix, 2 = contains; matching is case-sensitive. Occurrences
+ * require exact mode and a valid shared-engine token name. Compiler resolution
+ * is not claimed; inspect evidence_level, realized_mode and semantic_complete.
+ * needle must be 1..1024 UTF-8 bytes and readable/NUL-terminated until return.
+ * No input pointer is retained. All extraction runs on the calling worker.
+ *
+ * max_hits is 0..4096 (zero probes existence). max_source_bytes bounds aggregate
+ * source reads, at most 64 MiB. Per-member analysis limits are 64 KiB for
+ * symbols, 256 KiB for headings and 512 KiB for occurrences, also subject to the
+ * archive's capture limits. Unsupported/unavailable sources, source-work limits
+ * and retained-result truncation remain explicit; inspect complete and counters.
+ * Search does not use or detach the optional literal posting index.
+ *
+ * A separate increasing STRUCTURE generation owns all three modes. Every
+ * admitted search/clear attempt increases it, even on failure or cancellation;
+ * failed replacement preserves accepted results. Literal, expression, index
+ * and relationship generations remain independent. info exposes nullable
+ * accepted_structure_generation and last_structure_attempt for uncertain-result
+ * recovery. First page has at most 64 rows; results pages use start >= 0 and
+ * limit 1..128 without rereading source. IDs are one-based within the accepted
+ * saved-structure namespace; never reinterpret them as another kind of hit.
+ */
+char *fcb_saved_structure_search(uint64_t handle, uint64_t generation,
+    uint64_t mode, uint64_t name_mode, const char *needle,
+    uint64_t max_hits, uint64_t max_source_bytes);
+char *fcb_saved_structure_results(uint64_t handle, uint64_t generation,
+    uint64_t start, uint64_t limit);
+char *fcb_saved_clear_structure(uint64_t handle, uint64_t generation);
+
+/* Same EMPTY-reader admission and lifetime rules as other saved selections.
+ * Revalidates the whole member digest before installing the retained reader.
+ * structure-open-reader names structure_generation, exact original-source range
+ * and extraction evidence; symbols/headings are not literal-text selections.
+ * Large selections retain the exact range with original_hex null and bounded
+ * context. A delivered reader survives structural replacement/archive closure.
+ */
+char *fcb_saved_open_structure_hit_reader(uint64_t handle, uint64_t reader,
+    uint64_t generation, uint64_t hit);
+
 /* Captured Markdown documentation links and reverse backlinks. This separate
  * relationship generation is independent of text-query and posting-index
  * generations. Prepare/clear attempts must increase; failed replacements keep

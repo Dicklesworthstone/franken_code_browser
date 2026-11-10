@@ -9,6 +9,10 @@ use super::{cstr, reply, string_out};
 use super::saved_sessions::{AccessError, Command, SavedSessions, Selection};
 
 static SAVED: OnceLock<SavedSessions> = OnceLock::new();
+
+#[path = "saved_structure_ffi.rs"]
+mod structure;
+
 fn answer(handle: u64, work: impl FnOnce(&SavedSessions) -> Result<HostResponse, AccessError>) -> Option<*mut c_char> {
     let result = match SAVED.get() { Some(sessions) => work(sessions), None => Err(AccessError::Unknown) };
     match result { Ok(response) => string_out(response.as_str()), Err(error) => string_out(&error.json(handle)) }

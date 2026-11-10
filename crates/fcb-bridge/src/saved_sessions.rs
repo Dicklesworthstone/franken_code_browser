@@ -10,6 +10,7 @@ use fcb_app::host::{HostResponse, saved_repository::{SavedRepositorySession, Sav
     SnapshotLimits, Sha256Digest}};
 use fcb_app::host::saved_repository::relationships::{SavedRelationshipError, RelationshipDirection, RelationshipSide};
 use fcb_app::host::saved_repository::desk::SavedDeskError;
+use fcb_app::host::saved_repository::structure::{StructureMode, SymbolNameMode};
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
 use super::reader_sessions::{self, ReaderSessions};
 
@@ -75,6 +76,10 @@ pub(super) enum Command<'a> {
     ExpressionSearch { generation: u64, query: &'a str, max_hits: usize, max_scan_bytes: u64 },
     ExpressionResults { generation: u64, start: usize, limit: usize },
     ClearExpression { generation: u64 },
+    StructureSearch { generation: u64, mode: StructureMode, name_mode: SymbolNameMode,
+        needle: &'a str, max_hits: usize, max_source_bytes: u64 },
+    StructureResults { generation: u64, start: usize, limit: usize },
+    ClearStructure { generation: u64 },
     PrepareRelationships { generation: u64, max_links: usize, max_source_bytes: u64 },
     Relationships { generation: u64, member: Option<usize>, direction: RelationshipDirection, start: usize, limit: usize },
     ClearRelationships { generation: u64 },
@@ -83,6 +88,7 @@ pub(super) enum Command<'a> {
 pub(super) enum Selection {
     Hit { generation: u64, id: u64 }, Member(usize),
     ExpressionHit { generation: u64, id: u64 },
+    StructureHit { generation: u64, id: u64 },
     Relationship { generation: u64, id: u64, side: RelationshipSide },
 }
 
@@ -165,6 +171,13 @@ impl SavedSessions {
                 session.expression_results(generation, start, limit, &mut stop).map_err(AccessError::from),
             Command::ClearExpression { generation } =>
                 session.clear_expression(generation, &mut stop).map_err(AccessError::from),
+            Command::StructureSearch { generation, mode, name_mode, needle, max_hits, max_source_bytes } =>
+                session.structure_search(generation, mode, name_mode, needle, max_hits, max_source_bytes,
+                    &mut stop).map_err(AccessError::from),
+            Command::StructureResults { generation, start, limit } =>
+                session.structure_results(generation, start, limit, &mut stop).map_err(AccessError::from),
+            Command::ClearStructure { generation } =>
+                session.clear_structure(generation, &mut stop).map_err(AccessError::from),
             Command::PrepareRelationships { generation, max_links, max_source_bytes } =>
                 session.prepare_relationships(generation, max_links, max_source_bytes, &mut stop).map_err(AccessError::from),
             Command::Relationships { generation, member, direction, start, limit } =>
@@ -201,6 +214,8 @@ impl SavedSessions {
                 Selection::Hit { generation, id } => session.open_hit_reader(owner, generation, id, reader_stop).map_err(AccessError::from),
                 Selection::ExpressionHit { generation, id } =>
                     session.open_expression_hit_reader(owner, generation, id, reader_stop).map_err(AccessError::from),
+                Selection::StructureHit { generation, id } =>
+                    session.open_structure_hit_reader(owner, generation, id, reader_stop).map_err(AccessError::from),
                 Selection::Member(ordinal) => session.open_member_reader(owner, ordinal, reader_stop).map_err(AccessError::from),
                 Selection::Relationship { generation, id, side } =>
                     session.open_relationship_reader(owner, generation, id, side, reader_stop).map_err(AccessError::from),
@@ -245,3 +260,7 @@ mod relationships_tests;
 #[cfg(all(test, unix))]
 #[path = "saved_expression_sessions_tests.rs"]
 mod expression_tests;
+
+#[cfg(all(test, unix))]
+#[path = "saved_structure_sessions_tests.rs"]
+mod structure_tests;

@@ -14,6 +14,7 @@ use fcb::search::paged_snapshot::{IndexedNeedle, PagedCapture, PagedHit, PagedQu
     PagedSnapshotError, PagedMemberData};
 use fcb::search::snapshot_index::SnapshotIndexError;
 use fcb::search::snapshot_index::paged::{PagedPostings, PagedPostingError};
+use fcb::search::snapshot_structure::StructureError;
 use fcb_core::ResourceLease;
 pub use fcb::search::snapshot::{SnapshotLimits, Sha256Digest};
 use crate::{AppError, input, MANAGED_BYTES, EXIT_OK, EXIT_PARTIAL};
@@ -28,7 +29,7 @@ const INDEX_CACHE_PAGES: usize = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SavedRepositoryError {
     App(AppError), Archive(PagedSnapshotError), Query(PagedSearchError),
-    Index(PagedPostingError), Reader(ReaderSessionError),
+    Index(PagedPostingError), Reader(ReaderSessionError), Structure(StructureError),
     InvalidLimits, MissingQuery, StaleQuery, MissingHit, StaleIndex,
     IdentityExhausted, Canceled,
 }
@@ -41,6 +42,7 @@ impl SavedRepositoryError {
                 | Self::Index(PagedPostingError::Index(SnapshotIndexError::Canceled))
                 | Self::Reader(ReaderSessionError::Canceled) => true,
             Self::App(error) => error.is_canceled(),
+            Self::Structure(error) => error.is_canceled(),
             Self::Reader(ReaderSessionError::Host(super::HostError::App(error))
                 | ReaderSessionError::App(error)) => error.is_canceled(),
             Self::Reader(ReaderSessionError::View(error)) => AppError::View(error).is_canceled(),
@@ -53,7 +55,7 @@ impl std::fmt::Display for SavedRepositoryError {
         match self {
             Self::App(e) => write!(f, "{e}"), Self::Archive(e) => write!(f, "{e}"),
             Self::Query(e) => write!(f, "{e}"), Self::Index(e) => write!(f, "{e}"),
-            Self::Reader(e) => write!(f, "{e}"),
+            Self::Reader(e) => write!(f, "{e}"), Self::Structure(e) => write!(f, "{e}"),
             Self::InvalidLimits => f.write_str("SAVED_SESSION_INVALID_LIMITS"),
             Self::MissingQuery => f.write_str("SAVED_SESSION_NO_QUERY"),
             Self::StaleQuery => f.write_str("SAVED_SESSION_STALE_QUERY"),
@@ -70,6 +72,7 @@ impl From<PagedSnapshotError> for SavedRepositoryError { fn from(e: PagedSnapsho
 impl From<PagedSearchError> for SavedRepositoryError { fn from(e: PagedSearchError) -> Self { Self::Query(e) } }
 impl From<PagedPostingError> for SavedRepositoryError { fn from(e: PagedPostingError) -> Self { Self::Index(e) } }
 impl From<ReaderSessionError> for SavedRepositoryError { fn from(e: ReaderSessionError) -> Self { Self::Reader(e) } }
+impl From<StructureError> for SavedRepositoryError { fn from(e: StructureError) -> Self { Self::Structure(e) } }
 impl From<OutputError> for SavedRepositoryError { fn from(e: OutputError) -> Self { Self::App(e.into()) } }
 
 struct AcceptedIndex { generation: u64, pin: Sha256Digest, pages: PagedPostings<File> }
@@ -88,10 +91,12 @@ pub struct SavedRepositorySession {
     index: Option<AcceptedIndex>,
     query: Option<AcceptedQuery>,
     expression: Option<desk::SavedExpression>,
+    structure: Option<structure::AcceptedStructure>,
     relationships: Option<relationships::AcceptedRelationships>,
     path: PathBuf,
     last_query_attempt: u64,
     last_expression_attempt: u64,
+    last_structure_attempt: u64,
     last_index_attempt: u64,
     last_relationship_attempt: u64,
     next_allocation: u64,
@@ -117,8 +122,8 @@ impl SavedRepositorySession {
         if metadata.len() > limits.max_document_bytes as u64 { return Err(SavedRepositoryError::InvalidLimits); }
         let archive = PagedSnapshot::open(file, owner, limits, &budget, allocation(2)?, &mut canceled)?;
         check(&mut canceled)?;
-        Ok(Self { archive, index: None, query: None, expression: None, relationships: None, path, last_query_attempt: 0,
-            last_expression_attempt: 0,
+        Ok(Self { archive, index: None, query: None, expression: None, structure: None, relationships: None, path, last_query_attempt: 0,
+            last_expression_attempt: 0, last_structure_attempt: 0,
             last_index_attempt: 0, last_relationship_attempt: 0, next_allocation: 3, budget, _lease: lease })
     }
     pub fn owner(&self) -> ArenaOwnerId { self.archive.directory().owner() }
@@ -133,6 +138,8 @@ impl SavedRepositorySession {
         out.literal(",\"accepted_query_generation\":")?; optional(&mut out, self.accepted_generation())?;
         out.literal(",\"accepted_expression_generation\":")?; optional(&mut out, self.accepted_expression_generation())?;
         out.literal(",\"last_expression_attempt\":")?; out.integer(self.last_expression_attempt())?;
+        out.literal(",\"accepted_structure_generation\":")?; optional(&mut out, self.accepted_structure_generation())?;
+        out.literal(",\"last_structure_attempt\":")?; out.integer(self.last_structure_attempt())?;
         out.literal(",\"accepted_index_generation\":")?; optional(&mut out, self.index_generation())?;
         out.literal(",\"accepted_relationship_generation\":")?; optional(&mut out, self.relationship_generation())?;
         let directory = self.archive.directory();
@@ -445,3 +452,6 @@ pub mod desk;
 /// Parsed Markdown links and reverse backlinks in the closed saved manifest.
 pub mod relationships;
 pub use relationships::{RelationshipDirection, RelationshipSide, SavedRelationshipError};
+
+/// Bounded symbol, Markdown heading and whole-token searches of saved members.
+pub mod structure;
