@@ -22,6 +22,8 @@ mod text_layout_ffi;
 mod source_cache_ffi;
 mod saved_sessions;
 mod saved_ffi;
+mod snapshot_comparison_sessions;
+mod snapshot_comparison_ffi;
 mod catalog_sessions;
 mod catalog_ffi;
 mod file_finder_sessions;
