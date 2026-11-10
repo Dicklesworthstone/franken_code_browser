@@ -8,32 +8,47 @@
 extern "C" {
 #endif
 
-/* Start a workspace symbol-name or Markdown-heading query. All source work
+/* Start a workspace declaration, Markdown-heading or whole-token occurrence query. All source work
  * occurs in the existing fcb_atlas_search_step[_cancelable] worker calls, one
  * file per step. Existing search_page, overlay, focus, open_reader and clear
  * retain their contracts. Activation imports the exact matching capture and
  * recorded original_range, even if the live file changes or disappears.
  *
- * mode: 1=symbol candidates, 2=Markdown headings.
+ * mode: 1=symbol candidates, 2=Markdown headings, 4=whole-token occurrences.
+ * Mode 3 is not a structural query; expression search has a separate entry point.
  * name_mode: 0=exact, 1=prefix, 2=contains; case-sensitive Unicode names/titles.
+ * Occurrences require name_mode=0 and a single shared-engine token name.
  * needle: nonempty UTF-8, <=1024 bytes, NUL-terminated. No text-search fallback.
  * extensions/filenames/path_kind/path: fcb_atlas_search_path_scoped contract.
  * Scope membership is frozen BEFORE source, file or result quotas.
  * max_matches/max_files: 1..4096; max_source_bytes: 1..32 MiB actual I/O work.
  * max_file_bytes: 1..1 MiB, intersected with the extractor's cap: 64 KiB for
- * symbols, 256 KiB for headings. Oversized/unsupported/refused files are explicit
+ * symbols, 256 KiB for headings, 512 KiB for occurrences. Oversized/unsupported/refused files are explicit
  * unavailable coverage. Symbol languages currently follow the public library's
  * Rust/Python/JS/TS/Go/C-family candidate extractor. Headings use FrankenMarkdown
  * canonical titles, duplicate-safe slugs and original-source provenance.
  *
+ * Occurrences are exact, case-sensitive decoded token matches in UTF-8 or
+ * BOM-marked UTF-16. Comments and string literals participate. ASCII letters,
+ * digits, underscore and dollar form tokens; non-ASCII non-whitespace,
+ * non-control runs stay intact conservatively. A query cannot begin with an
+ * ASCII digit. No normalization or compiler binding/reference resolution is
+ * performed; spelling and original byte ranges remain authoritative.
+ *
  * Admission returns schema fcb.atlas-search/1, command begin-structure. All
  * progress/page responses echo requested_mode, realized_mode, name_mode and
- * evidence_level. mode is symbol-name or markdown-heading. semantic_complete
+ * evidence_level. mode is symbol-name, markdown-heading or identifier-occurrence. semantic_complete
  * is always false; search_complete covers admitted extraction work, never a
- * complete compiler-definition/reference inventory. Per-hit structure metadata
- * includes name, kind, language, candidate_id, heading_slug (null for symbols),
+ * complete compiler-definition/reference inventory. Occurrence receipts also
+ * state includes_comments_and_literals=true, compiler_resolved=false,
+ * unicode_normalization=none, name_syntax=single-token-no-leading-ascii-digit,
+ * and token_policy=ascii-alphanumeric-underscore-dollar-plus-nonascii-nonwhitespace-noncontrol-v1.
+ * Per-hit structure metadata
+ * includes name, kind, language, candidate_id, heading_slug (null for symbols/occurrences),
  * evidence_range and evidence_level. candidate_id is local to its file/capture;
- * activation still uses query_generation + hit_id. Original-byte capture digest,
+ * activation still uses query_generation + hit_id. Occurrence rows have
+ * kind=identifier-occurrence, language=text, evidence_level=whole-token-text-candidate,
+ * and evidence_range equal to original_range. Original-byte capture digest,
  * length and path identity remain mandatory. Names/slugs are bounded to 4096
  * bytes each and total retained strings to 8 MiB; omissions make coverage
  * partial and are counted separately from stored rows.

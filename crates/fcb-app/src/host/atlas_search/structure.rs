@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
-//! Workspace declaration and Markdown-heading navigation. The supported public
-//! symbol/document engines own extraction; this module owns only frozen scope,
+//! Workspace declaration, Markdown-heading and identifier-occurrence navigation.
+//! The supported public symbol/document/reference engines own extraction; this module owns only frozen scope,
 //! bounded scheduling and retained-capture result publication. One step examines
 //! at most one admitted file. Legacy extraction is bounded synchronous worker
 //! work, bracketed by cancellation, rather than a fixed-duration UI callback.
@@ -10,6 +10,8 @@ use fcb::document::reader::{DocumentReadError, DocumentReadOptions, DocumentRead
     MAX_DOCUMENT_SOURCE_BYTES};
 use fcb::search::{CaptureRequest, CapturedSymbols, QueryGeneration, SymbolError,
     SymbolLanguage, SymbolNameMode, MAX_SYMBOL_ITEMS, MAX_SYMBOL_SOURCE_BYTES};
+use fcb::search::symbols::{CapturedReferences, ReferenceError, MAX_REFERENCE_ITEMS,
+    MAX_REFERENCE_SOURCE_BYTES, validate_reference_name};
 use fcb_core::{DocumentGeneration, DocumentId};
 use crate::workspace;
 use super::*;
@@ -19,22 +21,27 @@ pub const MAX_ATLAS_STRUCTURE_NAME_BYTES: usize = 4096;
 pub const MAX_ATLAS_STRUCTURE_METADATA_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AtlasStructureMode { Symbols, Headings }
+pub enum AtlasStructureMode { Symbols, Headings, Occurrences }
 impl AtlasStructureMode {
     pub const fn requested(self) -> &'static str {
-        match self { Self::Symbols => "symbols", Self::Headings => "headings" }
+        match self { Self::Symbols => "symbols", Self::Headings => "headings",
+            Self::Occurrences => "occurrences" }
     }
     pub const fn realized(self) -> &'static str {
-        match self { Self::Symbols => "heuristic-outline-candidate", Self::Headings => "fmd-heading" }
+        match self { Self::Symbols => "heuristic-outline-candidate", Self::Headings => "fmd-heading",
+            Self::Occurrences => "whole-token-text-candidate" }
     }
     pub const fn source_limit(self) -> usize {
-        match self { Self::Symbols => MAX_SYMBOL_SOURCE_BYTES, Self::Headings => MAX_DOCUMENT_SOURCE_BYTES }
+        match self { Self::Symbols => MAX_SYMBOL_SOURCE_BYTES, Self::Headings => MAX_DOCUMENT_SOURCE_BYTES,
+            Self::Occurrences => MAX_REFERENCE_SOURCE_BYTES }
     }
 }
 
 /// Query matching is exact, case-sensitive Unicode text over extracted names
-/// or upstream heading titles. Scope is frozen before source or match quotas.
-/// The file-byte limit is intersected with the owning extractor's source cap.
+/// or upstream heading titles. Occurrences require one exact whole token under
+/// the shared reference engine's declared text policy, including comments and
+/// literals. Scope is frozen before source or match quotas. The file-byte limit
+/// is intersected with the owning extractor's source cap.
 #[derive(Clone, Copy, Debug)]
 pub struct AtlasStructureOptions {
     pub mode: AtlasStructureMode,
@@ -43,7 +50,8 @@ pub struct AtlasStructureOptions {
 }
 impl AtlasStructureOptions {
     pub fn new(mode: AtlasStructureMode) -> Self {
-        Self { mode, name_mode: SymbolNameMode::Contains, limits: AtlasSearchOptions::default() }
+        Self { mode, name_mode: if mode == AtlasStructureMode::Occurrences { SymbolNameMode::Exact }
+            else { SymbolNameMode::Contains }, limits: AtlasSearchOptions::default() }
     }
 }
 
@@ -51,6 +59,7 @@ pub(super) struct StructureQuery {
     mode: AtlasStructureMode,
     name_mode: SymbolNameMode,
     source_limit: usize,
+    metadata_limit: usize,
     metadata_bytes: usize,
     metadata_omitted: usize,
     unsupported_files: usize,
@@ -60,7 +69,8 @@ impl StructureQuery {
     pub(super) fn encode(&self, out: &mut Output) -> Result<(), AtlasSearchError> {
         out.literal(",\"mode\":")?;
         out.quoted(match self.mode { AtlasStructureMode::Symbols => "symbol-name",
-            AtlasStructureMode::Headings => "markdown-heading" })?;
+            AtlasStructureMode::Headings => "markdown-heading",
+            AtlasStructureMode::Occurrences => "identifier-occurrence" })?;
         out.literal(",\"requested_mode\":")?; out.quoted(self.mode.requested())?;
         out.literal(",\"realized_mode\":")?; out.quoted(self.mode.realized())?;
         out.literal(",\"evidence_level\":")?; out.quoted(self.mode.realized())?;
@@ -70,6 +80,11 @@ impl StructureQuery {
         // Complete means all admitted extraction work finished. It never says
         // this heuristic extractor found every compiler definition/reference.
         out.literal(",\"completeness_basis\":\"admitted-extraction-processing\"")?;
+        if self.mode == AtlasStructureMode::Occurrences {
+            out.literal(",\"includes_comments_and_literals\":true,\"compiler_resolved\":false")?;
+            out.literal(",\"token_policy\":\"ascii-alphanumeric-underscore-dollar-plus-nonascii-nonwhitespace-noncontrol-v1\"")?;
+            out.literal(",\"name_syntax\":\"single-token-no-leading-ascii-digit\",\"unicode_normalization\":\"none\"")?;
+        }
         for (key, value) in [("structure_file_byte_limit", self.source_limit),
             ("unsupported_structure_files", self.unsupported_files),
             ("extraction_limited_files", self.extraction_limited_files),
@@ -112,10 +127,12 @@ pub(super) struct StructureWork {
 }
 
 impl RetainedAtlasSearch {
-    /// Admit a heading or symbol-name query against the existing atlas catalog.
+    /// Admit a heading, symbol-name or whole-token occurrence query against the
+    /// existing atlas catalog.
     /// No source reads or extraction occur until step(). Ordinary page, overlay,
     /// focus and open_reader operations work on the same retained hit identities.
-    /// Unsupported languages are explicit unavailable files, never text fallback.
+    /// Symbols/headings reject unsupported languages explicitly. Occurrences
+    /// use the declared whole-token text policy for every admitted source type.
     pub fn begin_structure(&mut self, atlas: &AtlasSession, generation: u64, needle: &str,
         scope: AtlasSearchScope, mut options: AtlasStructureOptions,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
@@ -125,6 +142,10 @@ impl RetainedAtlasSearch {
         if !scope.case_sensitive() { return Err(AtlasSearchError::InvalidScope); }
         self.attempt(generation)?;
         options.limits.validate()?;
+        if options.mode == AtlasStructureMode::Occurrences {
+            if options.name_mode != SymbolNameMode::Exact { return Err(AtlasSearchError::InvalidLimits); }
+            validate_reference_name(needle).map_err(ReaderSessionError::from)?;
+        }
         if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES {
             return Err(AtlasSearchError::InvalidLimits);
         }
@@ -135,11 +156,21 @@ impl RetainedAtlasSearch {
             eligible_files.checked_mul(size_of::<FileId>()).ok_or(AppError::Admission)?
         };
         let capacity = options.limits.max_matches.min(options.limits.max_files);
-        let charge = (2 * options.limits.max_source_bytes)
+        // Occurrence rows retain only the exact query name and no slug. One
+        // source is captured at a time, so the source budget plus one file
+        // covers retained captures and the in-flight capture copy. The extent
+        // and reference decoder keep their own separate managed reservations.
+        // Preserve the existing symbol/heading envelopes unchanged.
+        let (source_charge, metadata_limit) = if options.mode == AtlasStructureMode::Occurrences {
+            (options.limits.max_source_bytes.checked_add(options.limits.max_file_bytes)
+                .ok_or(AppError::Admission)?,
+             options.limits.max_matches.checked_mul(needle.len()).ok_or(AppError::Admission)?)
+        } else { (2 * options.limits.max_source_bytes, MAX_ATLAS_STRUCTURE_METADATA_BYTES) };
+        let charge = source_charge
             .checked_add(capacity * (size_of::<RetainedFile>() + 64))
             .and_then(|n| n.checked_add(options.limits.max_matches
                 * (size_of::<AtlasSearchHit>() + size_of::<StructureRow>())))
-            .and_then(|n| n.checked_add(MAX_ATLAS_STRUCTURE_METADATA_BYTES))
+            .and_then(|n| n.checked_add(metadata_limit))
             .and_then(|n| n.checked_add(MAX_DIAGNOSTICS * size_of::<Unavailable>()
                 + needle.len() + size_of::<SearchWork>() + scope_bytes)).ok_or(AppError::Admission)?;
         let state_id = self.next_id()?;
@@ -150,7 +181,7 @@ impl RetainedAtlasSearch {
         let scope_files = scope.freeze(atlas, eligible_files, &mut canceled)?;
         let snapshot = Snapshot { generation, needle: copy_text(needle)?, expression: None,
             structure: Some(StructureQuery { mode: options.mode, name_mode: options.name_mode,
-                source_limit: options.limits.max_file_bytes, metadata_bytes: 0, metadata_omitted: 0,
+                source_limit: options.limits.max_file_bytes, metadata_limit, metadata_bytes: 0, metadata_omitted: 0,
                 unsupported_files: 0, extraction_limited_files: 0 }),
             structure_rows: reserve(options.limits.max_matches)?, files: reserve(capacity)?,
             scope, scope_files, scope_region, eligible_files,
@@ -189,6 +220,7 @@ impl RetainedAtlasSearch {
         let supported = match work.options.mode {
             AtlasStructureMode::Symbols => language.is_some(),
             AtlasStructureMode::Headings => is_markdown(entry.path().raw().as_bytes()),
+            AtlasStructureMode::Occurrences => true,
         };
         if !supported {
             candidate.structure.as_mut().ok_or(AtlasSearchError::WrongAtlas)?.unsupported_files += 1;
@@ -239,6 +271,38 @@ impl RetainedAtlasSearch {
                     if !append_row(candidate, work, file, revision, node, capture.bytes().len(), selection,
                         symbol.original_range(), symbol.name(), symbol.kind().label(), language.name(),
                         symbol.id(), None)? { break; }
+                }
+            }
+            AtlasStructureMode::Occurrences => {
+                let generation = QueryGeneration::new(owner, candidate.generation)
+                    .map_err(|_| AtlasSearchError::IdentityExhausted)?;
+                // The shared engine counts one unstored lookahead occurrence.
+                // A zero remaining allowance still probes later files, so an
+                // exactly-full inventory can finish complete after negatives.
+                let remaining = work.options.limits.max_matches.checked_sub(candidate.hits.len())
+                    .ok_or(AtlasSearchError::WrongAtlas)?;
+                let references = match CapturedReferences::build(capture.bytes(), *capture.request(),
+                    generation, &candidate.needle, None, remaining, &self.budget, work.extract_id,
+                    || canceled() || atlas.validate_active().is_err()) {
+                    Ok(references) => references,
+                    Err(ReferenceError::Canceled) => return Err(AtlasSearchError::Canceled),
+                    // A replacement may overlap the old accepted snapshot's
+                    // reservation. Refuse it transactionally; do not replace
+                    // accepted evidence with a resource-starved partial result.
+                    Err(error @ ReferenceError::ResourceDenied) => return Err(ReaderSessionError::from(error).into()),
+                    Err(error) => { candidate.unavailable(file, error.code()); return Ok(()); }
+                };
+                candidate.scanned += 1;
+                for occurrence in references.candidates() {
+                    check(canceled)?;
+                    let selected = occurrence.original_range();
+                    if !append_row(candidate, work, file, revision, node, capture.bytes().len(), selected,
+                        selected, references.name(), "identifier-occurrence", "text", occurrence.id(), None)? { break; }
+                }
+                if references.output_limited() {
+                    candidate.matches_seen = candidate.matches_seen.checked_add(1)
+                        .ok_or(AtlasSearchError::IdentityExhausted)?;
+                    candidate.truncated = true;
                 }
             }
             AtlasStructureMode::Headings => {
@@ -313,12 +377,15 @@ fn append_row(candidate: &mut Snapshot, work: &StructureWork, file: FileId,
     }
     let query = candidate.structure.as_mut().ok_or(AtlasSearchError::WrongAtlas)?;
     let bytes = name.len().checked_add(slug.map_or(0, str::len)).ok_or(AppError::Admission)?;
+    let candidate_limit = if work.options.mode == AtlasStructureMode::Occurrences {
+        MAX_REFERENCE_ITEMS
+    } else { MAX_SYMBOL_ITEMS };
     if name.len() > MAX_ATLAS_STRUCTURE_NAME_BYTES || slug.is_some_and(|slug| slug.len() > MAX_ATLAS_STRUCTURE_NAME_BYTES)
-        || query.metadata_bytes.checked_add(bytes).is_none_or(|n| n > MAX_ATLAS_STRUCTURE_METADATA_BYTES)
+        || query.metadata_bytes.checked_add(bytes).is_none_or(|n| n > query.metadata_limit)
         || selected.is_empty() || selected.end().get() > source_bytes as u64
         || evidence.is_empty() || evidence.end().get() > source_bytes as u64
         || evidence.start() > selected.start() || evidence.end() < selected.end()
-        || candidate_id == 0 || candidate_id > MAX_SYMBOL_ITEMS as u64 {
+        || candidate_id == 0 || candidate_id > candidate_limit as u64 {
         query.metadata_omitted += 1; return Ok(true);
     }
     let row = StructureRow { name: copy_text(name)?, kind, language, candidate_id,
@@ -344,7 +411,8 @@ fn update_coverage(atlas: &AtlasSession, query: &mut Snapshot, work: &StructureW
     query.source_bytes_read = work.io.bytes; query.read_calls = work.io.calls;
     query.stop_reason = if query.pending == 0 {
         Some(if query.truncated { AtlasSearchStop::MatchLimit } else { AtlasSearchStop::AllFilesExamined })
-    } else if query.hits.len() == work.options.limits.max_matches {
+    } else if query.truncated || (work.options.mode != AtlasStructureMode::Occurrences
+        && query.hits.len() == work.options.limits.max_matches) {
         query.truncated = true; Some(AtlasSearchStop::MatchLimit)
     } else if query.examined == work.options.limits.max_files { Some(AtlasSearchStop::FileLimit) }
     else if work.io.bytes >= work.options.limits.max_source_bytes as u64 { Some(AtlasSearchStop::SourceByteLimit) }

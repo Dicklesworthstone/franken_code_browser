@@ -1,6 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//! Marshaling for workspace symbol/heading queries. The safe app service owns
+//! Marshaling for workspace declaration, heading and whole-token occurrence queries. The safe app service owns
 //! extraction, source retention, work budgets and evidence qualification.
 
 use fcb::search::SymbolNameMode;
@@ -9,8 +9,9 @@ use super::{answer, cstr, number, parse_path_scope, reply, AccessError, AtlasSea
     Command, MAX_ATLAS_SEARCH_NEEDLE_BYTES, c_char};
 
 /// Admit structural-name search over the atlas's frozen catalog. mode=1 symbols,
-/// 2 Markdown headings. name_mode=0 exact, 1 prefix, 2 contains (case-sensitive).
-/// All other modes are refused. The existing step/page/clear/open_reader calls
+/// 2 Markdown headings, 4 whole-token occurrences. name_mode=0 exact, 1 prefix,
+/// 2 contains (case-sensitive); occurrences require exact mode and a valid
+/// shared-engine token name. All other modes are refused. The existing step/page/clear/open_reader calls
 /// operate on this query, including cooperative cancellation during step.
 /// # Safety
 /// Input strings are null or readable NUL-terminated UTF-8, stable until return.
@@ -24,6 +25,7 @@ pub unsafe extern "C" fn fcb_atlas_structure_begin(handle: u64, generation: u64,
     max_matches: u64, max_files: u64, max_file_bytes: u64, max_source_bytes: u64) -> *mut c_char {
     reply(|| answer(handle, |atlases| {
         let mode = match mode { 1 => AtlasStructureMode::Symbols, 2 => AtlasStructureMode::Headings,
+            4 => AtlasStructureMode::Occurrences,
             _ => return Err(AccessError::InvalidArgument) };
         let name_mode = match name_mode { 0 => SymbolNameMode::Exact, 1 => SymbolNameMode::Prefix,
             2 => SymbolNameMode::Contains, _ => return Err(AccessError::InvalidArgument) };
