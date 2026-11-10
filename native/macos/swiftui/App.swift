@@ -274,6 +274,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     @State private var savedRepository = AtlasSavedRepositoryModel(transport: .native)
     @State private var snapshotExport = AtlasSnapshotExportModel(transport: .native)
     @State private var showsSavedRepository = false
+    @State private var showsSnapshotComparison = false
     @State private var pinnedReaders = AtlasPinnedReaders<AtlasPagedReaderModel>(
         canFork: { $0.canPin }, fork: { try await $0.fork() }, retire: { $0.close() },
         failureMessage: { ($0 as? AtlasReaderError)?.message ?? "The source could not be pinned." })
@@ -490,6 +491,10 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 Label("Saved Repository", systemImage: "archivebox")
             }
             .help("Save the current project as an FCBS archive, or read saved members, documentation links and backlinks")
+            Button { showsSnapshotComparison = true } label: {
+                Label("Compare Captures", systemImage: "arrow.left.arrow.right")
+            }
+            .help("Compare two saved project captures and open exact before/after sources")
             Button { openProjectLinks() } label: {
                 Label("Documentation", systemImage: "link")
             }
@@ -513,6 +518,9 @@ private struct AtlasFrozenViewportSearch: Sendable {
         .sheet(isPresented: $showsSavedRepository, onDismiss: finishReadingDeskReview) {
             AtlasSavedRepositoryView(model: savedRepository, desk: readingDesk, exporter: snapshotExport,
                 currentSource: { snapshotExportSource })
+        }
+        .sheet(isPresented: $showsSnapshotComparison, onDismiss: finishReadingDeskReview) {
+            AtlasSnapshotComparisonView(desk: readingDesk)
         }
         .sheet(item: $projectLinks, onDismiss: finishReadingDeskReview) { presentation in
             AtlasProjectLinksView(presentation: presentation).id(presentation.id)
@@ -571,6 +579,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
             closeWorkspaceStreamSearch()
             closeProjectLinks()
             showsSavedRepository = false
+            showsSnapshotComparison = false
             readingDesk.close()
             showsReadingDesk = false
             pinnedReaders.closeAll()
@@ -696,11 +705,11 @@ private struct AtlasFrozenViewportSearch: Sendable {
 
     private func reviewReadingDeskBeforeClosing() {
         guard !readingDesk.closed, !showsReadingDesk else { return }
-        if showsFileFinder || showsSavedRepository || observedReader != nil || workspaceStreamSearch != nil || projectLinks != nil {
+        if showsFileFinder || showsSavedRepository || showsSnapshotComparison || observedReader != nil || workspaceStreamSearch != nil || projectLinks != nil {
             // Wait for the other sheet's actual dismissal before presenting
             // the desk. An active note editor is preserved by the close guard.
             reviewDeskAfterSheetDismissal = true
-            showsFileFinder = false; showsSavedRepository = false; closeObservedReader()
+            showsFileFinder = false; showsSavedRepository = false; showsSnapshotComparison = false; closeObservedReader()
             closeWorkspaceStreamSearch()
             closeProjectLinks()
         } else { showsReadingDesk = true }

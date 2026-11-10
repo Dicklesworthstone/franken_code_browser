@@ -9,13 +9,17 @@ import SwiftUI
     @Bindable var before: AtlasPagedReaderModel
     @Bindable var after: AtlasPagedReaderModel
     var project: AtlasProjectBrowserModel? = nil
+    var title = "Compare pinned sources"
+    var roleExplanation = "Before and after are the first and second pins. Ranges use original bytes; opening a range may widen the page to complete text characters."
+    var canKeep: ((AtlasPagedReaderModel) -> Bool)? = nil
+    var keep: ((AtlasPagedReaderModel) -> Void)? = nil
     @State private var comparison = AtlasReaderComparisonModel()
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Label("Compare pinned sources", systemImage: "arrow.left.arrow.right")
+                Label(title, systemImage: "arrow.left.arrow.right")
                     .font(.headline)
                 Spacer()
                 if comparison.busy {
@@ -35,7 +39,7 @@ import SwiftUI
             }.padding(12).background(.bar)
             VStack(alignment: .leading, spacing: 5) {
                 Text(comparison.notice).font(.callout)
-                Text("Before and after are the first and second pins. Ranges use original bytes; opening a range may widen the page to complete text characters.")
+                Text(roleExplanation)
                     .font(.caption).foregroundStyle(.secondary)
                 if let report = comparison.report,
                    report.matches(before: before.page?.identity, after: after.page?.identity) {
@@ -70,11 +74,11 @@ import SwiftUI
             HSplitView {
                 VStack(spacing: 0) {
                     sideLabel("Before", path: beforeLabel)
-                    AtlasPagedSourceView(model: before, project: project)
+                    AtlasPagedSourceView(model: before, canKeep: canKeep?(before) == true, keep: keep, project: project)
                 }.frame(minWidth: 360)
                 VStack(spacing: 0) {
                     sideLabel("After", path: afterLabel)
-                    AtlasPagedSourceView(model: after, project: project)
+                    AtlasPagedSourceView(model: after, canKeep: canKeep?(after) == true, keep: keep, project: project)
                 }.frame(minWidth: 360)
             }
         }

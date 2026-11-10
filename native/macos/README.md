@@ -112,6 +112,60 @@ They execute the actual packaging scripts with fake compiler/signing tools and
 retain their fixture logs. They establish packaging control flow, not native
 compilation, code-signing validity, Launch Services behavior or rendering.
 
+## Comparing saved project captures
+
+Choose **Compare Captures** in the toolbar, or **Compare captures…** inside
+**Saved Repository**. Select a **Before** and **After** FCBS archive, then choose
+**Compare captures**. Use Saved Repository's save action to capture a project
+at different observations. The comparison opens both archives together and
+retains the accepted pair while a replacement opens or is canceled.
+
+The file list aligns exact project-relative path bytes from the two saved
+manifests. **Differences** includes changed, added, removed, one-sided and
+unavailable entries. Choose **All** or a specific classification to inspect
+the rest, including unchanged files. The header reports progress and coverage;
+previous/next navigation follows the returned page boundaries.
+
+| Classification | Evidence |
+| --- | --- |
+| Changed | Both sides captured the same exact path with different source bytes. |
+| Unchanged | Both sides captured the same exact path with equal source bytes. |
+| Added / Removed | A path occurs on one side, the capture policies agree, and the opposite manifest has complete membership. |
+| Only before / Only after | A path occurs on one side, but policy or discovery coverage cannot establish its absence from the other observation. |
+| Unavailable | A recorded path has unavailable source on one or both sides, including one-sided entries. |
+
+**Read before** and **Read after** open the selected saved member.
+**Compare file** opens both retained versions in the existing byte-comparison
+reader, where bounded change pages navigate each side's original byte ranges.
+An unavailable member stays visible with its recorded reason. A captured empty
+file remains readable. **Keep in Reading Desk** retains a source for notes,
+bookmarks and checkpoints after the comparison closes.
+
+Opening a pair verifies both archives. Classification and paging then use
+retained metadata without loading member payloads. Opening a member reads and
+reverifies its bytes through the original archive descriptor before transferring
+them to an independent reader. Replacing the archive pathname or editing the
+live project cannot silently substitute another source. A changed archive
+payload fails verification; an already opened reader retains its own capture.
+
+Each native archive is limited to 65,536 members, 80 MiB of archive bytes,
+64 MiB of captured source, 1 MiB per captured member and 2,048 bytes per member
+path. Comparison progresses in steps of up to 256 merged paths; list pages
+request 64 entries and may be shorter to respect the 4 MiB response bound.
+Two comparison owners allow an accepted pair to remain available while a new
+pair is validated. Cancellation, invalid archives and failed replacement leave
+the prior accepted comparison intact.
+
+The before/after roles are chosen explicitly. This workflow compares saved
+observations by path; it does not infer renames, Git history, logical file
+continuity or automatic annotation relocation. An incomplete capture remains
+explicitly incomplete.
+
+Rust host, registry, C-boundary and native regression fixtures accompany this
+workflow. They are code-first additions and have not been executed in this
+session. Independent Rust/Swift execution and physical-Mac qualification remain
+pending.
+
 ## Workspace text search
 
 Text search starts with **Match case** enabled. Turn it off to compare Unicode

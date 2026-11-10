@@ -3,7 +3,7 @@ import AppKit
 
 /// A successful native open/save panel supplies selected-file access. Adopt it
 /// once, and release it only after the writer or archive descriptor drains.
-private final class AtlasSavedFileAccess {
+final class AtlasSavedFileAccess {
     let url: URL
     init(selectedURL: URL) { url = selectedURL }
     var nativePath: String? {
@@ -43,6 +43,7 @@ private final class AtlasSavedFileAccess {
     }
     @State private var readerCapture: AtlasSavedReaderCapture?
     @State private var readerTask: Task<Void, Never>?
+    @State private var showsComparison = false
     @State private var pins = AtlasPinnedReaders<AtlasPagedReaderModel>(
         canFork: { $0.canPin }, fork: { try await $0.fork() }, retire: { $0.close() },
         failureMessage: { ($0 as? AtlasReaderError)?.message ?? "The saved capture could not be pinned." })
@@ -85,6 +86,7 @@ private final class AtlasSavedFileAccess {
         .sheet(item: $readerCapture) { capture in
             AtlasSavedReaderView(capture: capture, desk: desk, pins: pins)
         }
+        .sheet(isPresented: $showsComparison) { AtlasSnapshotComparisonView(desk: desk) }
         .onDisappear {
             readerTask?.cancel(); readerCapture?.reader.close(); pins.closeAll()
             model.cancel(); exporter.cancel()
@@ -97,6 +99,7 @@ private final class AtlasSavedFileAccess {
             Spacer()
             Button("Open archive…", action: chooseArchive).disabled(!model.canOperate || readerTask != nil)
             Button("Close archive", action: model.closeArchive).disabled(!model.canOperate || model.info == nil)
+            Button("Compare captures…") { showsComparison = true }.disabled(!model.canOperate || readerTask != nil)
             Button("Done") {
                 readerTask?.cancel(); model.cancel(); exporter.cancel(); dismiss()
             }.keyboardShortcut(.cancelAction)

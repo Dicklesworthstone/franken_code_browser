@@ -18,7 +18,7 @@ import Observation
     func compare(before: AtlasPagedReaderModel, after: AtlasPagedReaderModel, refine: Bool = false) {
         guard !busy, before.canCompare, after.canCompare,
               let beforeIdentity = before.page?.identity, let afterIdentity = after.page?.identity else {
-            notice = "Wait for both pinned readers to finish before comparing."
+            notice = "Wait for both retained readers to finish before comparing."
             return
         }
         task?.cancel()
@@ -55,7 +55,7 @@ import Observation
             cancel()
             report = nil
             self.sources = nil
-            notice = "A pinned source changed or closed. Compare the current retained captures to continue."
+            notice = "A retained source changed or closed. Compare the current retained captures to continue."
             return
         }
     }
