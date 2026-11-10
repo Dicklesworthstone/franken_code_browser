@@ -16,6 +16,7 @@ pub mod atlas_stream_search;
 pub mod atlas_paths;
 pub mod saved_repository;
 pub mod snapshot_export;
+pub mod snapshot_comparison;
 pub mod catalog_session;
 mod document_fragment;
 pub use catalog_session::finder as file_finder_session;
