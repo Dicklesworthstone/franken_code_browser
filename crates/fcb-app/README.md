@@ -354,3 +354,53 @@ cargo test --locked -p fcb-app --test whole_file_cli
 
 No compiled binary, execution receipt, signed artifact, native qualification or
 product gate closure is asserted by the presence of this implementation.
+
+## Search structure in a saved repository
+
+The saved structural query uses the same symbol, whole-token and qualified
+Markdown heading engines as the retained readers. It searches one explicitly
+opened FCBS archive, retaining bounded result metadata while releasing each
+member's source before loading the next one.
+
+```sh
+fcb snapshot structure saved.fcbs --mode headings --name "Getting started" --json
+fcb snapshot structure saved.fcbs --mode headings --name "Install" --name-mode prefix --json
+fcb snapshot structure saved.fcbs --mode symbols --name "load" --name-mode contains --json
+fcb snapshot structure saved.fcbs --mode occurrences --name "load_config" --json
+```
+
+All name matching is case-sensitive; the default is exact. Symbols are bounded
+heuristic declaration candidates. Headings come from FrankenMarkdown with
+qualified original-byte ranges. Occurrences are exact whole-token text
+matches, including comments and string literals; prefix/contains and
+compiler-reference claims are unavailable in that mode. UTF-8 and supported
+BOM-marked UTF-16 source retain original-byte coordinates.
+
+The scope is the whole saved archive. Member names remain reversible labels;
+the command grants no live-root access and never reads current workspace
+source. Results include the archive and source digests, member identity, exact
+selected and evidence ranges, candidate kind/language, and heading slugs where
+applicable. Use the existing `snapshot read` command with the reported member
+and byte offset to inspect source.
+
+`--limit` accepts 0–4096 (default 100); zero probes existence without retaining
+a row. `--max-source-bytes` accepts 0–67,108,864 bytes (default 64 MiB) across
+all loaded members. Per-member extraction limits remain 64 KiB for symbols,
+256 KiB for headings, and 512 KiB for occurrences. Source, extraction and
+metadata limits, unavailable members, unsupported inputs, incomplete archive
+discovery, and observed additional matches all prevent complete coverage.
+JSON reports these counts and `state`, `workspace_complete` and
+`matches_seen_exact` separately. Complete refers to processing admitted
+extraction, never complete compiler semantics. A partial zero-hit result has
+exit code 3; only a complete negative result has exit code 1.
+
+The existing opt-in `--catalog FILE --catalog-digest TRUSTED_SHA256` pair also
+works here. It skips whole-archive validation at open, validates archive
+boundaries, and verifies every loaded member before using its bytes. Unread
+body integrity remains unchecked and is reported explicitly. Omitting the
+catalog performs the ordinary full-archive validation. Structural search uses
+no substring posting index.
+
+The existing `fcb symbols SAVED.fcbs --snapshot` interface remains available
+for saved outlines and reference candidates. This unified command additionally
+provides repository-wide heading search and trusted-catalog opening.

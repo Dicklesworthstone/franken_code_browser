@@ -10,12 +10,14 @@ mod paged;
 mod index;
 mod catalog;
 mod expression;
+mod structure;
 
 use std::{ffi::OsString, fs::{self, File, OpenOptions}, io::{self, Write}, path::{Path, PathBuf}, sync::Arc};
 use fcb::{ByteLength, ByteOffset, ByteRange};
 use fcb::source::{CancelFlag, SourceError, NormalizedPath};
 use fcb::search::{CaptureRequest, CompleteCapture, ExtentConsistency, ExtentReadState, ExtentStepBudget,
-    FileRangeReader, RawPath, ResourceBudget, RootId, SearchManifestId};
+    FileRangeReader, RawPath, ResourceBudget, RootId, SearchManifestId, SymbolNameMode};
+use fcb::search::snapshot_structure::{StructureMode, MAX_STRUCTURE_SOURCE_BYTES};
 use fcb::search::workspace::{RootGrant, RuleLimits, WorkspaceCatalog, WorkspaceCaptures, WorkspaceLimits, WorkspaceStage};
 use fcb::search::snapshot::{SavedSourceError, SnapshotError, SnapshotLimits, SnapshotView, Sha256Digest,
     export_workspace, MAX_SNAPSHOT_BYTES};
@@ -30,8 +32,15 @@ const HELP: &str = "fcb snapshot save ROOT --output NEW_FILE [--json] [--respect
 fcb snapshot catalog FILE --output NEW_CATALOG [--json]\n\
 fcb snapshot inspect FILE [--json] [--limit N]\n\
 fcb snapshot search FILE (--text LITERAL | --raw-hex HEX | --query EXPRESSION) [--json] [--limit N]\n\
+fcb snapshot structure FILE --mode symbols|headings|occurrences --name TEXT [--json]\n\
 fcb snapshot read FILE (--member NAME | --member-hex HEX) [--json]\n\
 fcb snapshot index help  # Build/reopen pinned substring indexes\n\
+Structure options: --name-mode exact|prefix|contains --limit N --max-source-bytes N\n\
+Structural queries inspect the whole saved archive with case-sensitive names (default exact).\n\
+Occurrences require exact whole-token names; comments and string literals participate.\n\
+Declarations are heuristic candidates; headings have qualified original-byte ranges.\n\
+Structure limits: 4096 hits; 64 MiB aggregate source; 64/256/512 KiB per symbol/heading/occurrence file.\n\
+Zero source allowance stops before a nonempty eligible member; zero hits probes existence.\n\
 Expressions: quoted phrases, whitespace conjunctions, -excluded terms, path: and lang:/type: filters.\n\
 Expression work: --max-scan-bytes N, default 256 MiB across ALL predicate and primary scans.\n\
 --text always remains literal; expressions do not enable regex, OR, or compiler semantics.\n\
@@ -46,7 +55,7 @@ Explicit plaintext source export; no overwrite, extraction, or restored root gra
 Offline completeness describes saved observations, never the current filesystem.\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Mode { Help, Save, Catalog, Inspect, Search, Read }
+enum Mode { Help, Save, Catalog, Inspect, Search, Structure, Read }
 #[derive(Debug)]
 struct Settings {
     mode: Mode, source: Option<PathBuf>, output: Option<PathBuf>, text: Option<String>,
@@ -55,6 +64,8 @@ struct Settings {
     json: bool, limit: usize, limits: WorkspaceLimits, include_excluded: bool, respect_ignores: bool,
     catalog: Option<PathBuf>, catalog_pin: Option<Sha256Digest>,
     expression: Option<String>, max_scan_bytes: u64,
+    structure_mode: Option<StructureMode>, structure_name: Option<String>,
+    name_mode: SymbolNameMode, max_structure_source_bytes: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Effect { None, Incomplete, Written, Synced }
@@ -85,7 +96,7 @@ impl From<SavedSourceError> for Failure {
 fn takes_value(text: &str) -> bool {
     matches!(text, "--output" | "--text" | "--raw-hex" | "--limit" | "--max-files" | "--max-file-bytes" | "--max-total-bytes"
         | "--member" | "--member-hex" | "--offset" | "--line" | "--bytes" | "--lines" | "--catalog" | "--catalog-digest"
-        | "--query" | "--max-scan-bytes")
+        | "--query" | "--max-scan-bytes" | "--mode" | "--name" | "--name-mode" | "--max-source-bytes")
 }
 fn wants_json(args: &[OsString]) -> bool {
     let mut cursor = 0;
@@ -108,12 +119,15 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
         None | Some("help" | "--help" | "-h") => Mode::Help,
         Some("save") => Mode::Save, Some("catalog") => Mode::Catalog,
         Some("inspect") => Mode::Inspect, Some("search") => Mode::Search,
+        Some("structure") => Mode::Structure,
         Some("read") => Mode::Read, _ => return Err(Failure::new("SNAPSHOT_UNKNOWN_COMMAND")),
     };
     let mut settings = Settings { mode, source: None, output: None, text: None, raw_needle: None,
         member: None, offset: 0, line: None, window_bytes: 64 * 1024, lines: 100, raw: false, json: false,
         limit: 100, limits: WorkspaceLimits::default(), include_excluded: false, respect_ignores: false,
-        catalog: None, catalog_pin: None, expression: None, max_scan_bytes: 256 * 1024 * 1024 };
+        catalog: None, catalog_pin: None, expression: None, max_scan_bytes: 256 * 1024 * 1024,
+        structure_mode: None, structure_name: None, name_mode: SymbolNameMode::Exact,
+        max_structure_source_bytes: MAX_STRUCTURE_SOURCE_BYTES };
     let mut seen = 0u32;
     let mut cursor = usize::from(!args.is_empty());
     let mut positional = false;
@@ -129,6 +143,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 "--bytes" => 4096, "--lines" => 8192, "--raw" => 16384, "--raw-hex" => 32768,
                 "--catalog" => 65536, "--catalog-digest" => 131072, "--respect-ignores" => 262144,
                 "--query" => 524288, "--max-scan-bytes" => 1048576,
+                "--mode" => 2097152, "--name" => 4194304, "--name-mode" => 8388608, "--max-source-bytes" => 16777216,
                 _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")), };
             if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
             seen |= bit;
@@ -149,6 +164,24 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
             }
             let text = value.to_str().ok_or_else(|| Failure::new("CLI_INVALID_VALUE"))?;
             if option == "--catalog-digest" { settings.catalog_pin = Some(catalog::parse_pin(text)?); continue; }
+            if option == "--mode" {
+                settings.structure_mode = Some(match text {
+                    "symbols" => StructureMode::Symbols, "headings" => StructureMode::Headings,
+                    "occurrences" => StructureMode::Occurrences, _ => return Err(Failure::new("CLI_INVALID_VALUE")),
+                }); continue;
+            }
+            if option == "--name-mode" {
+                settings.name_mode = match text {
+                    "exact" => SymbolNameMode::Exact, "prefix" => SymbolNameMode::Prefix,
+                    "contains" => SymbolNameMode::Contains, _ => return Err(Failure::new("CLI_INVALID_VALUE")),
+                }; continue;
+            }
+            if option == "--name" {
+                if text.is_empty() || text.len() > 1024 || text.as_bytes().contains(&0) {
+                    return Err(Failure::new("CLI_INVALID_NEEDLE"));
+                }
+                settings.structure_name = Some(text.to_owned()); continue;
+            }
             if option == "--text" || option == "--query" {
                 if text.is_empty() || text.len() > 1024 { return Err(Failure::new("CLI_INVALID_NEEDLE")); }
                 if option == "--query" { settings.expression = Some(text.to_owned()); }
@@ -167,6 +200,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 "--max-file-bytes" if number <= 1024 * 1024 => settings.limits.max_file_bytes = number as usize,
                 "--max-total-bytes" if number <= 64 * 1024 * 1024 => settings.limits.max_source_bytes = number as usize,
                 "--max-scan-bytes" if number <= crate::args::MAX_SCAN_BYTES => settings.max_scan_bytes = number,
+                "--max-source-bytes" if number <= MAX_STRUCTURE_SOURCE_BYTES => settings.max_structure_source_bytes = number,
                 "--offset" => settings.offset = number,
                 "--line" if number > 0 => settings.line = Some(number),
                 "--bytes" if (4..=256 * 1024).contains(&number) => settings.window_bytes = number as usize,
@@ -190,12 +224,19 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
             && usize::from(settings.text.is_some()) + usize::from(settings.raw_needle.is_some()) + usize::from(settings.expression.is_some()) == 1
             && seen & !(1 | 4 | 8 | 32768 | catalog_options | 524288 | 1048576) == 0
             && (seen & 1048576 == 0 || settings.expression.is_some()),
+        Mode::Structure => settings.source.is_some() && settings.structure_mode.is_some() && settings.structure_name.is_some()
+            && seen & !(1 | 8 | catalog_options | 2097152 | 4194304 | 8388608 | 16777216) == 0
+            && (settings.structure_mode != Some(StructureMode::Occurrences) || settings.name_mode == SymbolNameMode::Exact),
         Mode::Read => settings.source.is_some() && settings.member.is_some()
             && seen & !(1 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 | catalog_options) == 0
             && seen & (1024 | 2048) != (1024 | 2048)
             && (!settings.raw || (settings.line.is_none() && seen & 8192 == 0)),
     };
     if !valid { return Err(Failure::new("CLI_INCOMPATIBLE_OPTIONS")); }
+    if settings.structure_mode == Some(StructureMode::Occurrences) {
+        let name = settings.structure_name.as_deref().ok_or_else(|| Failure::new("CLI_INVALID_NEEDLE"))?;
+        fcb::search::symbols::validate_reference_name(name).map_err(|error| Failure::new(error.code()))?;
+    }
     Ok(settings)
 }
 fn hex(text: &str, maximum: usize) -> Result<Vec<u8>, Failure> {
@@ -267,6 +308,7 @@ fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBudget, effec
     if settings.mode == Mode::Save { return save(settings, out, budget, effect, canceled); }
     if settings.mode == Mode::Catalog { return catalog::build(settings, out, budget, effect, canceled); }
     if settings.mode == Mode::Search && settings.expression.is_some() { return expression::execute(settings, out, budget, canceled); }
+    if settings.mode == Mode::Structure { return structure::execute(settings, out, budget, canceled); }
     paged::execute(settings, out, budget, canceled)
 }
 fn begin(out: &mut Output, command: &str) -> Result<(), OutputError> {
@@ -477,5 +519,28 @@ mod tests {
         }
         assert!(!wants_json(&args(&["search", "saved", "--query", "--json"])));
         assert!(!wants_json(&args(&["search", "saved", "--query", "x", "--max-scan-bytes", "--json"])));
+    }
+    #[test]
+    fn structural_modes_require_names_and_do_not_change_literal_routes() {
+        let options = parse(&args(&["structure", "saved", "--mode", "headings", "--name", "Guide",
+            "--name-mode", "prefix", "--max-source-bytes", "0", "--limit", "0"])).unwrap();
+        assert_eq!(options.mode, Mode::Structure); assert_eq!(options.structure_mode, Some(StructureMode::Headings));
+        assert_eq!(options.name_mode, SymbolNameMode::Prefix); assert_eq!(options.max_structure_source_bytes, 0);
+        assert_eq!(options.limit, 0);
+        for values in [vec!["structure", "saved", "--mode", "symbols"],
+            vec!["structure", "saved", "--name", "target"],
+            vec!["structure", "saved", "--mode", "symbols", "--name", "target", "--text", "target"],
+            vec!["structure", "saved", "--mode", "headings", "--name", "target", "--respect-ignores"],
+            vec!["structure", "saved", "--mode", "occurrences", "--name", "target", "--name-mode", "prefix"],
+            vec!["structure", "saved", "--mode", "occurrences", "--name", "module::target"],
+            vec!["structure", "saved", "--mode", "headings", "--name", "target", "--max-source-bytes", "67108865"],
+            vec!["structure", "saved", "--mode", "symbols", "--name", "target", "--name", "other"],
+            vec!["search", "saved", "--text", "target", "--name-mode", "exact"]] {
+            assert!(parse(&args(&values)).is_err());
+        }
+        assert!(!wants_json(&args(&["structure", "saved", "--mode", "headings", "--name", "--json"])));
+        assert!(!wants_json(&args(&["structure", "saved", "--mode", "--json"])));
+        assert!(!wants_json(&args(&["structure", "saved", "--name-mode", "--json"])));
+        assert!(!wants_json(&args(&["structure", "saved", "--max-source-bytes", "--json"])));
     }
 }
