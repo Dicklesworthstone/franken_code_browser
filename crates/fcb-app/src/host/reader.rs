@@ -15,6 +15,7 @@ mod references;
 mod comparison;
 mod highlight;
 mod position;
+mod selection;
 pub(crate) mod document;
 mod document_links;
 #[cfg(test)]
@@ -25,6 +26,7 @@ pub use references::{MAX_READER_REFERENCE_PAGE, MAX_READER_REFERENCE_NAME_BYTES,
 pub use document::{DocumentCopyMode, ReaderDocumentOptions, MAX_READER_DOCUMENT_PAGE};
 pub use comparison::ReaderComparisonLimits;
 pub use position::ReaderColumnKind;
+pub use selection::MAX_READER_SELECTION_WINDOW_BYTES;
 use outline::{AcceptedOutline, SelectionIdentity};
 use references::AcceptedReferences;
 

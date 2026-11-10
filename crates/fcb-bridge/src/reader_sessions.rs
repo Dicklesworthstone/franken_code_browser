@@ -80,6 +80,7 @@ pub(super) enum Command<'a> {
     Find { generation: u64, needle: &'a str, limit: usize, scan_bytes: u64 },
     Hit { generation: u64, index: usize, context: usize },
     CopyRange { start: u64, end: u64 },
+    ResolveSelection { window_start: u64, window_end: u64, utf8_start: u64, utf8_end: u64 },
     CopyHit { generation: u64, index: usize },
     Outline { generation: u64, options: ReaderOutlineOptions },
     Symbols { generation: u64, needle: &'a str, mode: SymbolNameMode, start: usize, limit: usize },
@@ -291,6 +292,8 @@ impl ReaderSessions {
             Command::Find { generation, needle, limit, scan_bytes } => reader.search(generation, needle, limit, scan_bytes, &mut stop),
             Command::Hit { generation, index, context } => reader.hit_window(generation, index, context, &mut stop),
             Command::CopyRange { start, end } => reader.copy_range(start, end, &mut stop),
+            Command::ResolveSelection { window_start, window_end, utf8_start, utf8_end } =>
+                reader.resolve_selection(window_start, window_end, utf8_start, utf8_end, &mut stop),
             Command::CopyHit { generation, index } => reader.copy_hit(generation, index, &mut stop),
             Command::Outline { generation, options } => reader.prepare_outline(generation, options, &mut stop),
             Command::Symbols { generation, needle, mode, start, limit } => reader.symbol_page(generation, needle, mode, start, limit, &mut stop),
@@ -378,3 +381,7 @@ mod fork_tests;
 #[cfg(all(test, unix))]
 #[path = "reader_comparison_sessions_tests.rs"]
 mod comparison_tests;
+
+#[cfg(all(test, unix))]
+#[path = "reader_selection_sessions_tests.rs"]
+mod selection_tests;

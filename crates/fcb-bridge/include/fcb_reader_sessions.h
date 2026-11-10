@@ -9,6 +9,7 @@ extern "C" {
 
 #define FCB_READER_MAX_SOURCE_BYTES UINT64_C(33554432)
 #define FCB_READER_MAX_WINDOW_BYTES UINT64_C(262144)
+#define FCB_READER_MAX_SELECTION_WINDOW_BYTES UINT64_C(262160)
 #define FCB_READER_MAX_CONTEXT_BYTES UINT64_C(16384)
 #define FCB_READER_MAX_MATCHES UINT64_C(4096)
 #define FCB_READER_MAX_NEEDLE_BYTES UINT64_C(4096)
@@ -92,6 +93,27 @@ char *fcb_reader_hit(uint64_t handle, uint64_t generation, uint64_t index, uint6
  * source remains lossless. A hit uses its accepted generation, never newer rows. */
 char *fcb_reader_copy_range(uint64_t handle, uint64_t start, uint64_t end);
 char *fcb_reader_copy_hit(uint64_t handle, uint64_t generation, uint64_t index);
+
+/* Resolve one nonempty native text selection within a retained reader page.
+ * window_start/end are its accepted visible ORIGINAL-byte bounds, at most
+ * MAX_SELECTION_WINDOW_BYTES; utf8_start/end are half-open DECODED UTF-8
+ * offsets in that page's logical text, not original bytes or UTF-16 units.
+ * Native hosts must first validate their grapheme/UTF-16 selection and bind the
+ * receipt to the exact presented page, source identity and navigation request.
+ * A reconstructed page must have exactly these visible bounds. Split scalars,
+ * empty/reversed/past-end ranges and selected source > MAX_WINDOW_BYTES fail.
+ * No new source I/O or query/outline/reference generation mutation occurs.
+ *
+ * Success uses command "resolve-selection", selection_namespace "native-text",
+ * window_original_range, window_utf8_range, original_range, selected decoded
+ * text, exact original_hex, and contains_replacements (selected text only).
+ * The usual owner/file_id/source_revision/path/captured_bytes/encoding identify
+ * the immutable capture; all integer coordinates are canonical decimal strings.
+ * A real U+FFFD is not a malformed replacement. Neither Unicode normalization
+ * nor line-ending normalization is applied. This returns data only: it never
+ * writes the clipboard, creates an annotation or exports a file. */
+char *fcb_reader_resolve_selection(uint64_t handle, uint64_t window_start,
+    uint64_t window_end, uint64_t utf8_start, uint64_t utf8_end);
 
 /* cancel invalidates in-flight work, leaving the capture available afterward.
  * It is cooperative, not interruption of an OS syscall or rollback of already

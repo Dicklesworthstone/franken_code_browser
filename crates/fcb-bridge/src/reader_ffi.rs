@@ -116,6 +116,16 @@ pub extern "C" fn fcb_reader_copy_range(handle: u64, start: u64, end: u64) -> *m
     reply(|| answer(handle, |readers| readers.execute(handle, Command::CopyRange { start, end }, || false)))
 }
 
+/// Resolve decoded page-local UTF-8 boundaries to exact retained source bytes.
+/// The visible page and selected source have separate fixed size limits. This
+/// does not infer native UTF-16/glyph offsets or mutate any accepted query.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_reader_resolve_selection(handle: u64, window_start: u64,
+    window_end: u64, utf8_start: u64, utf8_end: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| readers.execute(handle,
+        Command::ResolveSelection { window_start, window_end, utf8_start, utf8_end }, || false)))
+}
+
 /// Original match bytes from the accepted query and this exact capture.
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_reader_copy_hit(handle: u64, generation: u64, index: u64) -> *mut c_char {
@@ -159,3 +169,7 @@ mod tests;
 #[cfg(test)]
 #[path = "reader_highlight_ffi_tests.rs"]
 mod highlight_tests;
+
+#[cfg(test)]
+#[path = "reader_selection_ffi_tests.rs"]
+mod selection_tests;

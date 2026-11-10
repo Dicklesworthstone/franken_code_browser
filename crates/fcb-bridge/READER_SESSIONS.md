@@ -82,6 +82,41 @@ partial-scalar selections, NUL and malformed source. It does not claim decoded
 clipboard text. No operation publishes a native clipboard or writes a source
 file. The host chooses any subsequent external action explicitly.
 
+
+### Native selected text back to original bytes
+
+`fcb_reader_resolve_selection(handle, window_start, window_end, utf8_start,
+utf8_end)` resolves a nonempty selection through that same captured-source
+decoder and source map. The window bounds are the accepted page's original-byte
+`visible_range`; the selection bounds are decoded UTF-8 offsets within its
+logical text. AppKit UTF-16 offsets must be validated and converted by the host
+before calling. They are never original-byte offsets.
+
+The resolver reconstructs exactly that visible window and rejects a different
+result, a split decoded scalar, or an empty, reversed or out-of-bounds range.
+It accepts the existing page boundary allowance of 256 KiB plus 16 bytes while
+keeping the decoder request and selected original bytes within 256 KiB. A larger
+selection is refused without returning a truncated prefix. The host separately
+enforces grapheme selection and binds the reply to the source, page, navigation
+and current selection the user actually saw.
+
+The `resolve-selection` response names `selection_namespace: "native-text"`
+and carries `window_original_range`, `window_utf8_range`,
+`original_range`, selected logical `text`, lossless `original_hex`,
+and `contains_replacements` for that selection. UTF-8 and BOM-marked UTF-16
+use the shared decoder. CR/LF/CRLF, logical bidi order and Unicode spelling are
+preserved; a real U+FFFD is distinct from a malformed sequence displayed as a
+replacement character. These coordinates remain anchored to retained bytes
+after a working-tree edit. Resolution does not mutate a search, outline,
+reference or document generation, perform source I/O, publish a clipboard,
+or create a note.
+
+Production regression sources are `fcb-app/tests/retained_reader_selection.rs`,
+`fcb-bridge/src/reader_selection_sessions_tests.rs`, and
+`reader_selection_ffi_tests.rs`. They exercise retained bytes, UTF-16,
+malformed input, exact windows, cancellation and public C ownership. These
+additions are code-first; executable batch verification remains pending.
+
 ## Capture-correct syntax in source pages
 
 Source-window responses (`window`, `lines`, hit previews and other services that
