@@ -383,11 +383,23 @@ executable Rust/Swift verification and physical-Mac qualification.
 ## Searching large files across a project
 
 Choose **Search large project files…** in the search sidebar to search exact,
-case-sensitive text across all files in a separately retained project catalog.
+case-sensitive text in the sidebar's selected location and file types, using a
+separately retained project catalog. Workspace, folder, exact file and frozen
+visible-atlas selections use the same predicates as ordinary search. Rust scopes
+include `Cargo.toml`; custom extension scopes keep their exact selected keys,
+and an empty custom scope searches no files.
 This route streams file contents through the shared Rust matcher, including
 files beyond the ordinary search's 1 MiB per-file and 32 MiB total capture limits.
 It recognizes UTF-8 and BOM-marked UTF-16 in either byte order. Queries contain
 1–1024 UTF-8 bytes; overlapping matches keep their exact original byte ranges.
+
+The sheet freezes the location and file-type selection when it opens. Moving the
+camera, changing the sidebar or refreshing the sheet's catalog cannot widen that
+selection. Reopen the sheet to choose another scope. For a visible-atlas scope,
+choose the atlas view in the sidebar first. Files absent from the search catalog
+remain separately reported as missing requested files, preventing a false
+complete result. Location/type exclusions are reported separately from discovery
+policy exclusions and do not consume file-read, byte or result budgets.
 
 Open the sheet, enter the literal, choose **256 MiB**, **1 GiB**, or **4 GiB** as
 the total source I/O budget, and press **Search**. There is no per-file capture
@@ -412,9 +424,9 @@ a canceled attempt into a stopped result. Previously accepted evidence remains
 readable when retained by the surface, with obsolete actions disabled.
 
 The catalog admits at most 20,000 regular files, subject to separate path and
-discovery-page limits and the product's exclusions. Search covers this catalog
-independently of map zoom, display filters and the ordinary search's location
-scope. **Refresh file catalog** discovers current membership again, including
+discovery-page limits and the product's exclusions. Search covers the eligible
+members of this catalog under the sheet's frozen scope. **Refresh file catalog**
+discovers current membership again within the same location and type selection, including
 new files. Existing queries never turn newly created or uncatalogued files into
 proven no-match results. The summary separately reports incomplete discovery,
 unexamined files, unsupported text, unavailable files, failed reads, and byte,

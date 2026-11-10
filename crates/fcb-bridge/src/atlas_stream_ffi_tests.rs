@@ -131,15 +131,107 @@ fn c_stream_public_signatures_and_header_are_consistent() {
     let _: unsafe extern "C" fn(u64, *const c_char, u64, u64, u64,
         Option<SearchCancellationCallback>, Option<SearchCancellationCallback>,
         Option<AtlasStreamProgressCallback>, *mut c_void) -> *mut c_char = fcb_atlas_stream_search_progress;
+    let _: unsafe extern "C" fn(u64, *const c_char, u64, u64, u64,
+        *const c_char, *const c_char, u64, *const c_char,
+        Option<SearchCancellationCallback>, *mut c_void) -> *mut c_char = fcb_atlas_stream_search_scoped_cancelable;
+    let _: unsafe extern "C" fn(u64, *const c_char, u64, u64, u64,
+        *const c_char, *const c_char, u64, *const c_char,
+        Option<SearchCancellationCallback>, Option<SearchCancellationCallback>,
+        Option<AtlasStreamProgressCallback>, *mut c_void) -> *mut c_char = fcb_atlas_stream_search_scoped_progress;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_atlas_stream_search_page;
     let _: extern "C" fn(u64, u64, u64) -> *mut c_char = fcb_atlas_stream_search_hit;
     let _: extern "C" fn(u64) -> *mut c_char = fcb_atlas_stream_search_clear;
     let header = include_str!("../include/fcb_atlas_stream_search.h");
     for name in ["fcb_atlas_stream_search_cancelable(", "fcb_atlas_stream_search_progress(",
+        "fcb_atlas_stream_search_scoped_cancelable(", "fcb_atlas_stream_search_scoped_progress(",
         "fcb_atlas_stream_search_page(",
         "fcb_atlas_stream_search_hit(", "fcb_atlas_stream_search_clear("] {
         assert_eq!(header.matches(name).count(), 1, "{name}");
     }
+}
+
+#[test]
+fn c_scoped_stream_intersects_types_and_utf8_directory_before_global_limits() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("a-excluded.rs"), vec![b'x'; 1024 * 1024]).unwrap();
+    fs::create_dir_all(fixture.0.join("src/é")).unwrap();
+    fs::write(fixture.0.join("src/é/a.rs"), b"needle").unwrap();
+    fs::write(fixture.0.join("src/é/b.md"), b"needle").unwrap();
+    fs::write(fixture.0.join("src/é/c.RS"), b"needle").unwrap();
+    fs::write(fixture.0.join("src/é-other.rs"), b"needle").unwrap();
+    let handle = fixture.open();
+    let needle = CString::new("needle").unwrap(); let extensions = CString::new("RS").unwrap();
+    let path = CString::new("src/é").unwrap();
+    let result = take(unsafe { fcb_atlas_stream_search_scoped_cancelable(handle, needle.as_ptr(), 256, 12, 2,
+        extensions.as_ptr(), std::ptr::null(), 1, path.as_ptr(), None, std::ptr::null_mut()) });
+    assert!(result.contains("\"status\":\"ok\""), "{result}");
+    assert!(result.contains("\"search_complete\":true"));
+    assert_eq!(field(&result, "catalogued_files"), 5);
+    assert_eq!(field(&result, "eligible_files"), 2); assert_eq!(field(&result, "excluded_files"), 3);
+    assert_eq!(field(&result, "files_examined"), 2); assert_eq!(field(&result, "files_unexamined"), 0);
+    assert_eq!(field(&result, "payload_bytes_read"), 12); assert_eq!(field(&result, "read_calls"), 2);
+    assert_eq!(field(&result, "retained_hits"), 2);
+    let generation = field(&result, "query_generation");
+    for response in [result, take(fcb_atlas_stream_search_page(handle, generation, 0, 32)),
+        take(fcb_atlas_stream_search_hit(handle, generation, 0))] {
+        assert!(response.contains("\"search_scope\":\"file-types\""));
+        assert!(response.contains("\"scope_extensions\":\"rs\""));
+        assert!(response.contains("\"scope_path_kind\":\"directory\""));
+        assert!(response.contains("\"scope_path_hex\":\"7372632fc3a9\""));
+        assert!(response.contains("\"case_sensitive\":true"));
+        assert_eq!(field(&response, "eligible_files"), 2);
+        assert_eq!(field(&response, "excluded_files"), 3);
+    }
+    assert_eq!(fcb_atlas_close(handle), 1);
+}
+
+#[test]
+fn c_scoped_stream_bounds_foreign_scope_strings_and_preserves_explicit_empty_membership() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new(); fs::write(fixture.0.join("a.rs"), b"needle").unwrap();
+    let handle = fixture.open();
+    let previous = search(handle, "needle", 256, 4096, 4096); let generation = field(&previous, "query_generation");
+    let needle = CString::new("needle").unwrap(); let empty = CString::new("").unwrap();
+    let invalid_path = CString::new("../a.rs").unwrap(); let invalid_region = CString::new("612e7273,612e7273").unwrap();
+    let list_overflow = [b'x'; MAX_SEARCH_SCOPE_LIST_BYTES + 1];
+    let path_overflow = [b'x'; MAX_SEARCH_SCOPE_PATH_BYTES + 1];
+    let region_overflow = vec![b'1'; MAX_SEARCH_REGION_WIRE_BYTES + 1];
+    let invalid_utf8 = [255u8, 0];
+    for (extensions, filenames, kind, path) in [
+        (list_overflow.as_ptr().cast(), std::ptr::null(), 0, std::ptr::null()),
+        (std::ptr::null(), list_overflow.as_ptr().cast(), 0, std::ptr::null()),
+        (invalid_utf8.as_ptr().cast(), std::ptr::null(), 0, std::ptr::null()),
+        (std::ptr::null(), std::ptr::null(), 1, path_overflow.as_ptr().cast()),
+        (std::ptr::null(), std::ptr::null(), 1, invalid_utf8.as_ptr().cast()),
+        (std::ptr::null(), std::ptr::null(), 1, invalid_path.as_ptr()),
+        (std::ptr::null(), std::ptr::null(), 3, invalid_region.as_ptr()),
+        (std::ptr::null(), std::ptr::null(), 3, region_overflow.as_ptr().cast()),
+        (std::ptr::null(), std::ptr::null(), 1, std::ptr::null()),
+        (std::ptr::null(), std::ptr::null(), 2, std::ptr::null()),
+        (std::ptr::null(), std::ptr::null(), 3, std::ptr::null()),
+        (std::ptr::null(), std::ptr::null(), u64::MAX, std::ptr::null()),
+    ] {
+        let rejected = take(unsafe { fcb_atlas_stream_search_scoped_cancelable(handle, needle.as_ptr(), 256, 4096, 4096,
+            extensions, filenames, kind, path, None, std::ptr::null_mut()) });
+        assert!(rejected.contains("\"status\":\"error\""), "{rejected}");
+        assert!(take(fcb_atlas_stream_search_hit(handle, generation, 0)).contains("6e6565646c65"));
+    }
+    for (extensions, kind, path) in [(empty.as_ptr(), 0, std::ptr::null()),
+        (std::ptr::null(), 3, empty.as_ptr())] {
+        let response = take(unsafe { fcb_atlas_stream_search_scoped_cancelable(handle, needle.as_ptr(), 256, 4096, 4096,
+            extensions, std::ptr::null(), kind, path, None, std::ptr::null_mut()) });
+        assert!(response.contains("\"search_complete\":true"), "{response}");
+        assert_eq!(field(&response, "eligible_files"), 0); assert_eq!(field(&response, "excluded_files"), 1);
+        assert_eq!(field(&response, "payload_bytes_read"), 0); assert_eq!(field(&response, "read_calls"), 0);
+    }
+    let missing = CString::new("6d697373696e672e7273").unwrap();
+    let response = take(unsafe { fcb_atlas_stream_search_scoped_cancelable(handle, needle.as_ptr(), 256, 4096, 4096,
+        std::ptr::null(), std::ptr::null(), 3, missing.as_ptr(), None, std::ptr::null_mut()) });
+    assert!(response.contains("\"search_complete\":false"));
+    assert_eq!(field(&response, "scope_region_missing_files"), 1);
+    assert_eq!(field(&response, "eligible_files"), 0); assert_eq!(field(&response, "payload_bytes_read"), 0);
+    assert_eq!(fcb_atlas_close(handle), 1);
 }
 
 
@@ -244,6 +336,40 @@ fn c_progress_hard_cancellation_and_invalid_input_preserve_previous_inventory() 
     assert_eq!(fcb_atlas_close(handle), 1);
 }
 
+#[test]
+fn c_scoped_progress_stop_and_cancellation_echo_only_the_frozen_eligible_universe() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new(); fs::write(fixture.0.join("a-excluded.rs"), vec![b'x'; 1024 * 1024]).unwrap();
+    fs::create_dir(fixture.0.join("src")).unwrap();
+    fs::write(fixture.0.join("src/a.rs"), b"needle").unwrap();
+    fs::write(fixture.0.join("src/z.rs"), b"needle").unwrap();
+    let handle = fixture.open(); let needle = CString::new("needle").unwrap(); let path = CString::new("src").unwrap();
+    let run = |state: &mut ProgressContext| take(unsafe {
+        fcb_atlas_stream_search_scoped_progress(handle, needle.as_ptr(), 256, 4096, 4096,
+            std::ptr::null(), std::ptr::null(), 1, path.as_ptr(),
+            Some(progress_poll), Some(progress_stop), Some(progress_receive), std::ptr::from_mut(state).cast())
+    });
+    let mut state = ProgressContext::default(); let accepted = run(&mut state);
+    assert!(!state.invalid && state.stop && !state.canceled); assert_eq!(state.frames.len(), 2);
+    assert!(accepted.contains("\"stop_reason\":\"user-stopped\""));
+    assert_eq!(field(&accepted, "payload_bytes_read"), 6); assert_eq!(field(&accepted, "files_unexamined"), 1);
+    for response in state.frames.iter().chain(std::iter::once(&accepted)) {
+        assert_eq!(field(response, "eligible_files"), 2); assert_eq!(field(response, "excluded_files"), 1);
+        assert_eq!(field(response, "files_examined") + field(response, "files_unexamined"), 2);
+        assert!(response.contains("\"scope_path_kind\":\"directory\""));
+        assert!(response.contains("\"scope_path_hex\":\"737263\""));
+    }
+    let generation = field(&accepted, "query_generation");
+    let mut canceled = ProgressContext { cancel_on_match: true, ..Default::default() };
+    let rejected = run(&mut canceled);
+    assert!(!canceled.invalid && canceled.canceled); assert!(rejected.contains("ATLAS_HANDLE_CANCELED"));
+    let retained = take(fcb_atlas_stream_search_hit(handle, generation, 0));
+    assert!(retained.contains("\"original_hex\":\"6e6565646c65\""));
+    assert!(retained.contains("\"scope_path_hex\":\"737263\""));
+    assert_eq!(field(&retained, "eligible_files"), 2);
+    assert_eq!(fcb_atlas_close(handle), 1);
+}
+
 
 #[derive(Default)]
 struct OneShotCancellation {
@@ -295,5 +421,26 @@ fn c_progress_latches_one_shot_cancellation_before_callback_delivery() {
     assert_eq!(once.callbacks, 0);
     let retained = take(fcb_atlas_stream_search_page(handle, generation, 0, 1));
     assert!(retained.contains("\"status\":\"ok\""), "{retained}");
+    assert_eq!(fcb_atlas_close(handle), 1);
+}
+
+#[test]
+fn c_scoped_progress_latches_one_shot_cancellation_before_callback_delivery() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new(); fs::write(fixture.0.join("a.rs"), b"needle").unwrap();
+    let handle = fixture.open(); let needle = CString::new("needle").unwrap(); let path = CString::new("a.rs").unwrap();
+    let run = |state: &mut OneShotCancellation| take(unsafe {
+        fcb_atlas_stream_search_scoped_progress(handle, needle.as_ptr(), 256, 4096, 4096,
+            std::ptr::null(), std::ptr::null(), 2, path.as_ptr(),
+            Some(one_shot_poll), Some(one_shot_stop), Some(one_shot_receive), std::ptr::from_mut(state).cast())
+    });
+    let mut probe = OneShotCancellation::default(); let accepted = run(&mut probe);
+    assert_eq!(probe.callbacks, 1); assert!(accepted.contains("\"stop_reason\":\"user-stopped\""));
+    let generation = field(&accepted, "query_generation");
+    let mut once = OneShotCancellation { cancel_at: probe.first_delivery_poll, ..Default::default() };
+    assert!(run(&mut once).contains("ATLAS_HANDLE_CANCELED")); assert_eq!(once.callbacks, 0);
+    let previous = take(fcb_atlas_stream_search_page(handle, generation, 0, 1));
+    assert!(previous.contains("\"status\":\"ok\""));
+    assert!(previous.contains("\"scope_path_kind\":\"file\""));
     assert_eq!(fcb_atlas_close(handle), 1);
 }

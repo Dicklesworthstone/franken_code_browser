@@ -240,6 +240,109 @@ fn many_files_share_one_worker_envelope_and_do_not_retain_full_decoder_leases() 
     assert_eq!(report.retained_witness_bytes(), 64 * 6); assert!(report.reserved_bytes() < 128 * 1024);
 }
 
+#[test]
+fn scoped_projection_skips_large_and_unavailable_files_and_preserves_original_identity() {
+    let root = Fixture::new(); root.write("a-excluded.bin", &vec![b'x'; 2 * 1024 * 1024]);
+    root.write("b.rs", b"needle"); root.write("c-excluded.rs", b"needle"); root.write("z.rs", b"needle");
+    let budget = budget(); let catalog = root.catalog(&budget, 8); let atlas = atlas(&catalog, &budget, 2);
+    fs::remove_file(root.0.join("c-excluded.rs")).unwrap();
+    let needle = StreamingNeedle::text(owner(), "needle", &budget, allocation(10)).unwrap();
+    let mut selected = vec![1, 3];
+    let mut job = AtlasStreamSearch::new_scoped(&atlas, &needle, revision(100), generation(1),
+        AtlasStreamLimits { max_bytes: 12, max_read_calls: 2, ..Default::default() },
+        &selected, &budget, [allocation(11), allocation(12)]).unwrap();
+    // Membership is retained independently of mutable caller scratch.
+    selected[1] = 2;
+    assert_eq!(job.report().eligible_files(), 2); assert_eq!(job.report().excluded_files(), 2);
+    let mut opened = Vec::new();
+    while job.state() == AtlasStreamState::Pending {
+        job.step(StreamReadStep::default(), generation(1), |request, path| {
+            let expected = [1, 3][opened.len()];
+            assert_eq!(request.file(), catalog.file_id(expected).unwrap());
+            assert_eq!(request.revision(), revision(100 + expected as u64));
+            assert_eq!(path, catalog.entries()[expected].path());
+            opened.push(expected);
+            File::open(root.0.join(path.raw().to_path_buf())).map_err(|_| SourceError::CaptureUnavailable)
+        }, || false).unwrap();
+    }
+    let report = job.finish().unwrap();
+    assert_eq!(opened, [1, 3]); assert!(report.is_complete());
+    assert_eq!(report.files_examined(), 2); assert_eq!(report.unexamined_files(), 0);
+    assert_eq!(report.stats().bytes_read, 12); assert_eq!(report.stats().read_calls, 2);
+    assert_eq!(report.stats().incomplete_files, 0);
+    for (position, ordinal) in [1, 3].into_iter().enumerate() {
+        let file = catalog.file_id(ordinal).unwrap();
+        assert_eq!(report.hits()[position].file(), file);
+        assert_eq!(report.hits()[position].node(), atlas.node_for_file(file).unwrap());
+        assert_eq!(report.hits()[position].file_record(), position);
+        assert_eq!(report.select_hit(position, &atlas, generation(1)).unwrap().original_bytes(), b"needle");
+    }
+}
+
+#[test]
+fn explicit_empty_projection_is_terminal_without_source_io_even_with_zero_scan_budget() {
+    let root = Fixture::new(); root.write("a.rs", b"needle");
+    let budget = budget(); let catalog = root.catalog(&budget, 8); let atlas = atlas(&catalog, &budget, 2);
+    let needle = StreamingNeedle::text(owner(), "needle", &budget, allocation(10)).unwrap();
+    let mut job = AtlasStreamSearch::new_scoped(&atlas, &needle, revision(100), generation(1),
+        AtlasStreamLimits { max_bytes: 0, max_read_calls: 0, ..Default::default() }, &[],
+        &budget, [allocation(11), allocation(12)]).unwrap();
+    assert_eq!(job.state(), AtlasStreamState::Finished);
+    job.step(StreamReadStep::default(), generation(1), |_, _| panic!("empty scope cannot open"), || false).unwrap();
+    let report = job.finish().unwrap();
+    assert!(report.is_complete()); assert_eq!(report.eligible_files(), 0); assert_eq!(report.excluded_files(), 1);
+    assert_eq!(report.files_examined(), 0); assert_eq!(report.unexamined_files(), 0);
+    assert_eq!(report.stats().bytes_read, 0); assert_eq!(report.stats().read_calls, 0);
+    assert!(report.hits().is_empty()); assert_eq!(report.stop_reason(), None);
+}
+
+#[test]
+fn invalid_projection_and_denied_admission_do_not_leak_report_capacity() {
+    let root = Fixture::new(); root.write("a.rs", b"needle"); root.write("b.rs", b"needle");
+    let budget = budget(); let catalog = root.catalog(&budget, 8); let atlas = atlas(&catalog, &budget, 2);
+    let needle = StreamingNeedle::text(owner(), "needle", &budget, allocation(10)).unwrap();
+    let before = budget.accounting().reserved();
+    for invalid in [vec![0, 0], vec![1, 0], vec![2], vec![usize::MAX]] {
+        assert!(matches!(AtlasStreamSearch::new_scoped(&atlas, &needle, revision(100), generation(1),
+            AtlasStreamLimits::default(), &invalid, &budget, [allocation(11), allocation(12)]),
+            Err(AtlasStreamError::InvalidScope)));
+        assert_eq!(budget.accounting().reserved(), before);
+    }
+    let denied = ResourceBudget::new(owner(), ByteLength::new(1)).unwrap();
+    assert!(matches!(AtlasStreamSearch::new_scoped(&atlas, &needle, revision(100), generation(1),
+        AtlasStreamLimits::default(), &[1], &denied, [allocation(11), allocation(12)]),
+        Err(AtlasStreamError::ResourceDenied)));
+    assert_eq!(denied.accounting().reserved().get(), 0);
+}
+
+#[test]
+fn scoped_call_limit_and_cancellation_leave_only_eligible_files_unexamined() {
+    let root = Fixture::new();
+    for path in ["a.rs", "b.rs", "c.rs", "d.rs"] { root.write(path, b"needle"); }
+    let budget = budget(); let catalog = root.catalog(&budget, 8); let atlas = atlas(&catalog, &budget, 2);
+    let needle = StreamingNeedle::text(owner(), "needle", &budget, allocation(10)).unwrap();
+    let mut job = AtlasStreamSearch::new_scoped(&atlas, &needle, revision(100), generation(1),
+        AtlasStreamLimits { max_read_calls: 1, ..Default::default() }, &[1, 3],
+        &budget, [allocation(11), allocation(12)]).unwrap();
+    let mut opens = 0;
+    while job.state() == AtlasStreamState::Pending {
+        job.step(StreamReadStep::default(), generation(1), |request, path| {
+            opens += 1; assert_eq!(request.file(), catalog.file_id(1).unwrap());
+            File::open(root.0.join(path.raw().to_path_buf())).map_err(|_| SourceError::CaptureUnavailable)
+        }, || false).unwrap();
+    }
+    let report = job.finish().unwrap();
+    assert_eq!(opens, 1); assert_eq!(report.stop_reason(), Some(AtlasStreamStop::ReadCallLimit));
+    assert_eq!(report.files_examined(), 1); assert_eq!(report.unexamined_files(), 1);
+    assert_eq!(report.eligible_files(), 2); assert_eq!(report.excluded_files(), 2);
+    assert!(!report.is_complete());
+    let mut canceled = AtlasStreamSearch::new_scoped(&atlas, &needle, revision(200), generation(2),
+        AtlasStreamLimits::default(), &[3], &budget, [allocation(21), allocation(22)]).unwrap();
+    assert!(matches!(canceled.step(StreamReadStep::default(), generation(2),
+        |_, _| panic!("canceled scope cannot open"), || true), Err(AtlasStreamError::Canceled)));
+    assert_eq!(canceled.report().stats().read_calls, 0);
+}
+
 fn retained(catalog: WorkspaceCatalog, budget: &ResourceBudget) -> RetainedWorkspaceAtlas {
     RetainedWorkspaceAtlas::build(catalog, LayoutRevision::new(owner(), 1).unwrap(),
         Size2D::new(1024.0, 768.0).unwrap(), LayoutOptions::modest(), WorkspaceAtlasLimits::default(),

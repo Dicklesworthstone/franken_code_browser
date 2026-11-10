@@ -25,6 +25,25 @@ private enum StreamFixture {
          "capture_kind": "literal-witnesses-only", "source_observation": "per-file-streams-not-atomic-workspace",
          "catalogued_files": "1", "discovery_policy": "product-defaults/no-rule-files-v1", "excluded_entries": "2"]
     }
+    static func scope(_ request: AtlasWorkspaceStreamRequest, catalogued: UInt64 = 1,
+        eligible: UInt64 = 1, missing: UInt64 = 0) -> [String: Any] {
+        var value: [String: Any] = [
+            "search_scope": request.fileScope.wireKind,
+            "scope_extensions": request.fileScope.extensions ?? "",
+            "scope_filenames": request.fileScope.filenames ?? "",
+            "scope_path_kind": request.pathScope.kind.rawValue,
+            "scope_path": request.pathScope.isVisible ? "" : request.pathScope.path,
+            "scope_path_hex": request.pathScope.pathHex, "case_sensitive": true,
+            "eligible_files": String(eligible), "excluded_files": String(catalogued - eligible)]
+        if request.pathScope.isVisible {
+            value["scope_region_sha256"] = request.pathScope.visibleIdentity!
+            value["scope_region_files"] = String(request.pathScope.visibleCount!)
+            value["scope_region_path_bytes"] = String(request.pathScope.path.split(separator: ",").reduce(0) { $0 + $1.utf8.count / 2 })
+            value["scope_region_catalogued_files"] = String(UInt64(request.pathScope.visibleCount!) - missing)
+            value["scope_region_missing_files"] = String(missing)
+        }
+        return value
+    }
     static func report(_ owner: UInt64, _ generation: UInt64, _ request: AtlasWorkspaceStreamRequest,
                        count: Int = 40, encoding: AtlasObservedReaderEncoding = .utf8) -> [String: Any] {
         var value = common(owner, generation, "search")
@@ -49,6 +68,10 @@ private enum StreamFixture {
              "encoding": encoding.rawValue, "observed_length": String(length), "final_observed_length": String(length),
              "consistency": "unchanged-metadata-not-atomic", "file_state": "complete-observed-input", "file_complete": true,
              "witness_sha256": String(repeating: "b", count: 64)]
+        }
+        // Keep default receipts legacy to exercise backward compatibility.
+        if !request.fileScope.isAll || !request.pathScope.isWorkspace {
+            value.merge(scope(request), uniquingKeysWith: { _, next in next })
         }
         return value
     }
@@ -93,6 +116,10 @@ private enum StreamProgressFixture {
         value["payload_bytes_read"] = String(bytes); value["scanned_input_bytes"] = String(bytes)
         value["read_calls"] = String((bytes + 16_383) / 16_384)
         value["peak_input_buffer_bytes"] = String(min(bytes, 16_384))
+        if !request.fileScope.isAll || !request.pathScope.isWorkspace {
+            value.merge(StreamFixture.scope(request, catalogued: 2, eligible: 2),
+                uniquingKeysWith: { _, next in next })
+        }
         return value
     }
     static func progress(_ owner: UInt64, _ generation: UInt64, _ request: AtlasWorkspaceStreamRequest,
@@ -275,9 +302,11 @@ private final class StreamContextProbe: @unchecked Sendable {
 @main private enum AtlasWorkspaceStreamTests {
     static func main() async throws {
         try wireTests()
+        try scopeWireTests()
         try progressWireTests()
         try await progressModelTests()
         try await modelTests()
+        try await scopedModelTests()
         try await lifetimeTests()
         print("Workspace stream wire/model/context fixtures passed; no native presentation qualification claimed")
     }
@@ -310,6 +339,13 @@ private final class StreamContextProbe: @unchecked Sendable {
         let witness = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(witnessJSON), report: report,
             root: catalog.root, target: target)
         precondition(witness.text == "old" && witness.originalHex == "6f6c64")
+        var explicitAll = base
+        explicitAll.merge(StreamFixture.scope(request), uniquingKeysWith: { _, next in next })
+        let explicitPage = try page(StreamFixture.page(explicitAll))
+        precondition(explicitPage.summary == first.summary && explicitPage.hits == first.hits,
+            "The new all-files scope echo preserves legacy result semantics")
+        _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(StreamFixture.witness(explicitAll, index: 0)),
+            report: report, root: catalog.root, target: target)
 
         for (key, value) in [("owner", "1" as Any), ("source_manifest", "2" as Any), ("layout_revision", "2" as Any),
             ("scope", "visible" as Any), ("needle", "new" as Any), ("retained_hits", "040" as Any),
@@ -403,6 +439,108 @@ private final class StreamContextProbe: @unchecked Sendable {
             let accepted = try page(StreamFixture.page(changed))
             precondition(accepted.hits[0].finalLength == 1 && !accepted.hits[0].complete)
         }
+    }
+
+    private static func scopeWireTests() throws {
+        let owner: UInt64 = 0xfedcba9876543210
+        let types = try AtlasSearchFileScope(extensions: ["TXT"])
+        let folder = try AtlasSearchPathScope(kind: .directory, path: "src")
+        let request = try AtlasWorkspaceStreamRequest(needle: "old", fileScope: types, pathScope: folder)
+        var catalogWire = StreamFixture.catalog(owner)
+        catalogWire["catalogued_files"] = "3"; catalogWire["workspace_files"] = "3"
+        let catalog = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(catalogWire), owner: owner)
+        var base = StreamFixture.report(owner, 1, request, count: 1)
+        base["catalogued_files"] = "3"
+        base.merge(StreamFixture.scope(request, catalogued: 3, eligible: 1), uniquingKeysWith: { _, next in next })
+        func page(_ value: [String: Any], request selected: AtlasWorkspaceStreamRequest? = nil) throws -> AtlasWorkspaceStreamPage {
+            try .decode(StreamFixture.json(StreamFixture.page(value)), catalog: catalog, root: catalog.root, request: selected ?? request)
+        }
+        let accepted = try page(base)
+        precondition(accepted.summary.complete && accepted.summary.eligibleFiles == 1 && accepted.summary.excludedFiles == 2)
+        precondition(accepted.summary.examinedFiles == 1 && accepted.summary.unexaminedFiles == 0
+            && accepted.hits[0].path.contains(255), "Scoped admission preserves native filename bytes")
+        let report = try AtlasWorkspaceStreamReport(summary: accepted.summary, hits: accepted.hits)
+        let target = report.target(for: report.hits[0]), witness = StreamFixture.witness(base, index: 0)
+        _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(witness), report: report, root: catalog.root, target: target)
+        for (key, value) in [("scope_path", "src-old" as Any), ("scope_path_hex", "7372632d6f6c64" as Any),
+            ("scope_path_kind", "workspace" as Any), ("search_scope", "all" as Any),
+            ("scope_extensions", "rs" as Any), ("scope_filenames", "cargo.toml" as Any),
+            ("case_sensitive", false as Any), ("eligible_files", "01" as Any),
+            ("eligible_files", "2" as Any), ("excluded_files", "1" as Any)] {
+            var bad = base; bad[key] = value
+            rejects("scope receipt " + key) { _ = try page(bad) }
+            var badWitness = witness; badWitness[key] = value
+            rejects("scope witness " + key) {
+                _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(badWitness), report: report,
+                    root: catalog.root, target: target)
+            }
+        }
+        for key in ["scope_path", "search_scope", "eligible_files", "case_sensitive"] {
+            var bad = base; bad.removeValue(forKey: key)
+            rejects("missing scope field") { _ = try page(bad) }
+        }
+        var legacy = base
+        for key in StreamFixture.scope(request).keys { legacy.removeValue(forKey: key) }
+        rejects("legacy envelope cannot widen a selected scope") { _ = try page(legacy) }
+        for raw in [Array("src-old/file.txt".utf8), Array("src/file.rs".utf8), Array("other/file.txt".utf8)] {
+            var bad = base, rows = base["hits"] as! [[String: Any]]
+            rows[0]["path"] = StreamFixture.path(raw); bad["hits"] = rows
+            rejects("returned row outside selected scope") { _ = try page(bad) }
+        }
+        let exact = try AtlasWorkspaceStreamRequest(needle: "old", fileScope: types,
+            pathScope: .init(kind: .file, path: "src/file.txt"))
+        var exactWire = base, exactRows = base["hits"] as! [[String: Any]]
+        exactRows[0]["path"] = StreamFixture.path(Array("src/file.txt".utf8)); exactWire["hits"] = exactRows
+        exactWire.merge(StreamFixture.scope(exact, catalogued: 3, eligible: 1), uniquingKeysWith: { _, next in next })
+        let exactPage = try page(exactWire, request: exact)
+        precondition(exactPage.summary.complete)
+        exactRows[0]["path"] = StreamFixture.path(Array("src/file.txt/child.txt".utf8)); exactWire["hits"] = exactRows
+        rejects("exact file is not directory prefix") { _ = try page(exactWire, request: exact) }
+        let composed = try AtlasWorkspaceStreamRequest(needle: "old", pathScope: .init(kind: .file, path: "é.txt"))
+        let decomposed = try AtlasWorkspaceStreamRequest(needle: "old", pathScope: .init(kind: .file, path: "e\u{301}.txt"))
+        precondition(composed != decomposed, "Scope equality must preserve Unix spelling")
+
+        let noTypes = try AtlasWorkspaceStreamRequest(needle: "old", fileScope: .init(extensions: []), pathScope: folder)
+        var empty = StreamFixture.report(owner, 2, noTypes, count: 0)
+        empty["catalogued_files"] = "3"; empty["files_examined"] = "0"
+        for key in ["payload_bytes_read", "scanned_input_bytes", "read_calls", "peak_input_buffer_bytes"] { empty[key] = "0" }
+        empty.merge(StreamFixture.scope(noTypes, catalogued: 3, eligible: 0), uniquingKeysWith: { _, next in next })
+        let zero = try page(empty, request: noTypes)
+        precondition(zero.summary.complete && zero.summary.eligibleFiles == 0 && zero.summary.excludedFiles == 3
+            && zero.summary.readCalls == 0 && zero.hits.isEmpty, "An empty custom scope does no reads")
+
+        let progressiveCatalog = try AtlasWorkspaceStreamCatalog.decode(
+            StreamFixture.json(StreamProgressFixture.catalog(owner)), owner: owner)
+        let progressWire = StreamProgressFixture.progress(owner, 3, request, sequence: 1)
+        let progress = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(progressWire),
+            catalog: progressiveCatalog, request: request)
+        let terminalWire = StreamProgressFixture.report(owner, 3, request, stopped: true)
+        let terminal = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(terminalWire)),
+            catalog: progressiveCatalog, root: progressiveCatalog.root, request: request, requireTerminal: true)
+        try progress.validateTerminal(terminal)
+        precondition(terminal.summary.eligibleFiles == 2 && terminal.summary.unexaminedFiles == 1
+            && terminal.summary.stop == "user-stopped", "Stop keeps scoped finalized-file evidence")
+        var widened = progressWire; widened["scope_path_kind"] = "workspace"
+        rejects("scope change during progressive delivery") {
+            _ = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(widened),
+                catalog: progressiveCatalog, request: request)
+        }
+
+        #if canImport(CryptoKit)
+        let raw = accepted.hits[0].path
+        let visible = try AtlasWorkspaceStreamRequest(needle: "old", fileScope: types,
+            pathScope: .init(visiblePaths: [raw, Array("absent.txt".utf8)]))
+        var visibleWire = base
+        visibleWire["search_complete"] = false
+        visibleWire.merge(StreamFixture.scope(visible, catalogued: 3, eligible: 1, missing: 1),
+            uniquingKeysWith: { _, next in next })
+        let incomplete = try page(visibleWire, request: visible)
+        precondition(!incomplete.summary.complete && incomplete.summary.missingVisibleFiles == 1)
+        visibleWire["search_complete"] = true
+        rejects("missing visible member cannot be complete") { _ = try page(visibleWire, request: visible) }
+        visibleWire["search_complete"] = false; visibleWire["scope_region_sha256"] = String(repeating: "0", count: 64)
+        rejects("changed visible membership") { _ = try page(visibleWire, request: visible) }
+        #endif
     }
 
     private static func progressWireTests() throws {
@@ -661,6 +799,45 @@ private final class StreamContextProbe: @unchecked Sendable {
         try await wait("clear receipt") { !model.busy }
         precondition(model.canSearch)
         model.close(); try await wait("model owner retirement") { probe.closedCount == probe.createCount }
+    }
+
+    @MainActor private static func scopedModelTests() async throws {
+        let probe = StreamProbe(), model = AtlasWorkspaceStreamModel(transport: probe.transport, query: "old")
+        let project = UUID(), types = try AtlasSearchFileScope(extensions: ["txt"])
+        var selectedLocation = try AtlasSearchPathScope(kind: .directory, path: "src")
+        let source = AtlasWorkspaceStreamSource(root: StreamFixture.root, project: project, browserOwner: 4,
+            access: nil, fileScope: types, pathScope: selectedLocation)
+        model.open(source)
+        // Subsequent sidebar edits cannot mutate the scope of this sheet.
+        selectedLocation = .workspace
+        precondition(source.pathScope != selectedLocation && source.scopeDescription.contains("Folder:")
+            && source.scopeDescription.contains(".txt"))
+        try await wait("scoped catalog") { model.catalog != nil && !model.busy }
+        model.search(); try await wait("scoped all pages") { model.report != nil && !model.busy }
+        let first = model.report!
+        precondition(first.summary.request.fileScope == types && first.summary.request.pathScope == source.pathScope
+            && first.hits.allSatisfy { source.pathScope.admitsRawPath($0.path) && types.admitsRawPath($0.path) })
+        model.select(first.target(for: first.hits[0]))
+        try await wait("scoped witness") { model.witness != nil && !model.busy }
+        model.queryText = "new"
+        precondition(model.report == nil && model.witness == nil)
+        model.search(); try await wait("same scope new literal") { model.report != nil && !model.busy }
+        precondition(model.report?.summary.request.pathScope == source.pathScope)
+        let owner = model.catalog!.owner
+        model.refreshCatalog()
+        try await wait("scope retained after catalog refresh") { model.catalog?.owner != owner && !model.busy }
+        model.search(); try await wait("refreshed scoped results") { model.report != nil && !model.busy }
+        precondition(model.report?.summary.request.fileScope == types && model.report?.summary.request.pathScope == source.pathScope)
+
+        let gate = ObservedReaderGate(); probe.blockSearch(gate); model.search()
+        try await wait("old scope work") { gate.entered }
+        model.open(.init(root: StreamFixture.root, project: project, browserOwner: 4, access: nil))
+        gate.release()
+        try await wait("replacement scope catalog") { model.catalog != nil && !model.busy }
+        precondition(model.report == nil && model.progress == nil, "Old scope work cannot publish after replacement")
+        model.search(); try await wait("replacement workspace results") { model.report != nil && !model.busy }
+        precondition(model.report!.summary.request.fileScope.isAll && model.report!.summary.request.pathScope.isWorkspace)
+        model.close(); try await wait("scoped owners retired") { probe.closedCount == probe.createCount }
     }
 
     @MainActor private static func lifetimeTests() async throws {

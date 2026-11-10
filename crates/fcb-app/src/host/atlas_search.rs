@@ -22,6 +22,7 @@ use indexed::{IndexQueryUsage, RetainedIndex, IndexBuildWork, RelationshipSnapsh
 mod scope;
 pub use scope::{AtlasSearchScope, AtlasSearchPathKind, MAX_SEARCH_SCOPE_TOKENS, MAX_SEARCH_SCOPE_TOKEN_BYTES,
     MAX_SEARCH_SCOPE_LIST_BYTES, MAX_SEARCH_SCOPE_PATH_BYTES, MAX_SEARCH_REGION_FILES, MAX_SEARCH_REGION_WIRE_BYTES};
+pub(crate) use scope::RegionCoverage;
 mod structure;
 pub use structure::{AtlasStructureMode, AtlasStructureOptions, MAX_ATLAS_STRUCTURE_METADATA_BYTES,
     MAX_ATLAS_STRUCTURE_NAME_BYTES};

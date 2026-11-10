@@ -7,9 +7,12 @@ struct AtlasWorkspaceStreamSourceIdentity: Equatable, Sendable {
     let project: UUID
     let browserOwner: UInt64
     let grant: ObjectIdentifier?
+    let fileScope: AtlasSearchFileScope
+    let pathScope: AtlasSearchPathScope
     static func == (a: Self, b: Self) -> Bool {
         a.project == b.project && a.browserOwner == b.browserOwner && a.grant == b.grant
             && a.root.utf8.elementsEqual(b.root.utf8)
+            && a.fileScope == b.fileScope && a.pathScope == b.pathScope
     }
 }
 
@@ -17,10 +20,27 @@ struct AtlasWorkspaceStreamSourceIdentity: Equatable, Sendable {
     let identity: AtlasWorkspaceStreamSourceIdentity
     let access: AnyObject?
     var root: String { identity.root }
-    init(root: String, project: UUID, browserOwner: UInt64, access: AnyObject?) {
+    var fileScope: AtlasSearchFileScope { identity.fileScope }
+    var pathScope: AtlasSearchPathScope { identity.pathScope }
+    init(root: String, project: UUID, browserOwner: UInt64, access: AnyObject?,
+         fileScope: AtlasSearchFileScope = .all, pathScope: AtlasSearchPathScope = .workspace) {
         identity = .init(root: root, project: project, browserOwner: browserOwner,
-            grant: access.map(ObjectIdentifier.init))
+            grant: access.map(ObjectIdentifier.init), fileScope: fileScope, pathScope: pathScope)
         self.access = access
+    }
+    var scopeDescription: String {
+        let location: String
+        switch pathScope.kind {
+        case .workspace: location = "Workspace"
+        case .directory: location = "Folder: \(String(reflecting: pathScope.path))"
+        case .file: location = "File: \(String(reflecting: pathScope.path))"
+        case .visible: location = "Frozen atlas view (\(pathScope.visibleCount ?? 0) files)"
+        }
+        if fileScope.isAll { return location + " · all file types" }
+        let extensions = (fileScope.extensions ?? "").split(separator: ",").map { "." + $0 }
+        let names = (fileScope.filenames ?? "").split(separator: ",").map(String.init)
+        let keys = extensions + names
+        return location + " · " + (keys.isEmpty ? "no file types selected" : keys.joined(separator: ", "))
     }
 }
 
@@ -212,7 +232,7 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
     private(set) var opening = false
     private(set) var closed = false
     private(set) var reportAuthorized = false
-    private(set) var notice = "Open the project catalog, then explicitly search all catalogued files."
+    private(set) var notice = "Open the project catalog, then search the selected location and file types."
     var queryText: String {
         didSet { if !oldValue.utf8.elementsEqual(queryText.utf8) { revokeQuery() } }
     }
@@ -239,7 +259,12 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
 
     var canSearch: Bool {
         !closed && !opening && session != nil && catalog != nil && lastGeneration < UInt64.max
-            && (try? AtlasWorkspaceStreamRequest(needle: queryText, maximumScanBytes: scanBytes)) != nil
+            && (try? currentRequest()) != nil
+    }
+    private func currentRequest() throws -> AtlasWorkspaceStreamRequest {
+        guard let authority else { throw AtlasWorkspaceStreamError.unavailable }
+        return try .init(needle: queryText, maximumScanBytes: scanBytes,
+            fileScope: authority.fileScope, pathScope: authority.pathScope)
     }
     var canRefresh: Bool { !closed && authority != nil }
     var canStopAndKeep: Bool { !closed && busy && searching && !stopping && stopFlag != nil }
@@ -292,12 +317,12 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
     func search() {
         guard canSearch, let session, let catalog else { return }
         let request: AtlasWorkspaceStreamRequest
-        do { request = try .init(needle: queryText, maximumScanBytes: scanBytes) }
+        do { request = try currentRequest() }
         catch { notice = message(error); return }
         // A foreign call can replace the query before its reply is lost or
         // rejected. Preserve old bytes for reading, but revoke their actions.
         revokeTargets(clearEvidence: false)
-        let (ticket, flag) = begin("Searching all catalogued files, including large files…")
+        let (ticket, flag) = begin("Searching the selected location and file types, including large files…")
         searching = true
         let progressive = session.transport.progressiveSearch
         let stop = progressive == nil ? nil : AtlasWorkspaceStreamStop()
@@ -308,8 +333,7 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
                 cancellation: flag) { [weak self, weak session] progress in
                 guard let self, let session, self.busy, self.searching,
                       self.accepts(ticket, flag), self.session === session, self.catalog == catalog,
-                      request == (try? AtlasWorkspaceStreamRequest(needle: self.queryText,
-                        maximumScanBytes: self.scanBytes)) else { return }
+                      request == (try? self.currentRequest()) else { return }
                 self.progress = progress
                 if !self.stopping { self.notice = progress.countLabel }
             }
@@ -339,7 +363,7 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
                     return try AtlasWorkspaceStreamReport(summary: summary, hits: hits)
                 }
                 guard accepts(ticket, flag), self.session === session, self.catalog == catalog,
-                      request == (try? AtlasWorkspaceStreamRequest(needle: queryText, maximumScanBytes: scanBytes)) else { return }
+                      request == (try? currentRequest()) else { return }
                 guard accepted.summary.identity.generation > lastGeneration else {
                     throw AtlasWorkspaceStreamError.invalidResponse
                 }

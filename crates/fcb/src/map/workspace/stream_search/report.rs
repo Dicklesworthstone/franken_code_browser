@@ -104,6 +104,9 @@ pub struct AtlasStreamReport<'atlas, 'catalog, A: AtlasStreamSource = WorkspaceA
     pub(super) hits: Vec<AtlasStreamHit>,
     pub(super) matched_files: Vec<usize>,
     pub(super) witnesses: Vec<u8>,
+    /// None preserves the legacy whole-catalog cursor without allocating a
+    /// duplicate universe. Some(empty) is an explicit empty query scope.
+    pub(super) selected_ordinals: Option<Vec<usize>>,
     pub(super) literal: String,
     pub(super) stats: AtlasStreamStats,
     pub(super) state: AtlasStreamState,
@@ -121,9 +124,13 @@ impl<'atlas, 'catalog, A: AtlasStreamSource> AtlasStreamReport<'atlas, 'catalog,
     pub fn files(&self) -> &[AtlasStreamFile] { &self.files }
     pub fn hits(&self) -> &[AtlasStreamHit] { &self.hits }
     pub fn literal(&self) -> &str { &self.literal }
+    pub fn eligible_files(&self) -> usize {
+        self.selected_ordinals.as_ref().map_or(self.atlas.file_count(), Vec::len)
+    }
+    pub fn excluded_files(&self) -> usize { self.atlas.file_count() - self.eligible_files() }
     pub fn files_examined(&self) -> usize { self.files.len() }
     /// Includes an active file whose final result has not yet been accepted.
-    pub fn unexamined_files(&self) -> usize { self.atlas.file_count() - self.files.len() }
+    pub fn unexamined_files(&self) -> usize { self.eligible_files() - self.files.len() }
     pub fn retained_witness_bytes(&self) -> usize { self.witnesses.len() }
     pub fn reserved_bytes(&self) -> u64 { self._lease.info().bytes().get() }
     pub fn is_complete(&self) -> bool {

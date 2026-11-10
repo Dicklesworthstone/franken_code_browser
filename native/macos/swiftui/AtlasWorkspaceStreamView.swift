@@ -23,14 +23,16 @@ import AppKit
             }
             Text(verbatim: "Project: " + String(reflecting: presentation.source.root))
                 .font(.system(.caption, design: .monospaced)).textSelection(.enabled).lineLimit(2)
-            Text("Exact, case-sensitive text across all catalogued files, including large files. UTF-8 and BOM-declared UTF-16 are recognized automatically. No per-file byte cap applies; the total byte budget limits the scan.")
+            Text(verbatim: "Search scope: " + presentation.source.scopeDescription)
+                .font(.callout).textSelection(.enabled).lineLimit(3)
+            Text("Exact, case-sensitive text in the selected location and file types, including large files. UTF-8 and BOM-declared UTF-16 are recognized automatically. No per-file byte cap applies; the total byte budget limits the scan.")
                 .font(.caption).foregroundStyle(.secondary)
-            Text("Discovery uses the product's file exclusions and stops at 20,000 files. This scope is independent of the visible map, current zoom, and filters.")
+            Text("This sheet keeps the sidebar's location and file-type selection fixed. Return to the sidebar and reopen this sheet to choose another scope. Discovery uses product exclusions and stops at 20,000 files; excluded files do not consume the scan budget.")
                 .font(.caption).foregroundStyle(.secondary)
             HStack(spacing: 8) {
                 TextField("Exact text to find", text: $model.queryText).textFieldStyle(.roundedBorder)
                     .focused($queryFocused).onSubmit { if model.canSearch { model.search() } }
-                    .accessibilityLabel("Exact text to find in all catalogued files")
+                    .accessibilityLabel("Exact text to find in the selected search scope")
                 Picker("Total bytes", selection: $model.scanBytes) {
                     Text("256 MiB").tag(UInt64(256 * 1024 * 1024))
                     Text("1 GiB").tag(UInt64(1024 * 1024 * 1024))
@@ -63,8 +65,8 @@ import AppKit
             if let progress = model.progress {
                 VStack(alignment: .leading, spacing: 4) {
                     ProgressView(value: Double(progress.summary.examinedFiles),
-                        total: Double(max(1, progress.summary.cataloguedFiles)))
-                    Text("Examined \(progress.summary.examinedFiles) of \(progress.summary.cataloguedFiles) files · read \(progress.summary.payloadBytes) bytes in \(progress.summary.readCalls) calls")
+                        total: Double(max(1, progress.summary.eligibleFiles)))
+                    Text("Examined \(progress.summary.examinedFiles) of \(progress.summary.eligibleFiles) eligible files · \(progress.summary.excludedFiles) excluded · read \(progress.summary.payloadBytes) bytes in \(progress.summary.readCalls) calls")
                         .font(.caption).foregroundStyle(.secondary)
                     Text("Matches from finalized files appear below. The unfinished file contributes byte progress; its matches remain pending.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -133,7 +135,7 @@ import AppKit
                 if report.hits.isEmpty {
                     ContentUnavailableView("No retained matches", systemImage: "magnifyingglass",
                         description: Text(report.summary.complete
-                            ? "No matches were found in the observed contents of all catalogued files."
+                            ? "No matches were found in the observed contents of the eligible files in this scope."
                             : "This partial search cannot establish that the unsearched or unavailable contents have no matches."))
                 } else {
                     ScrollView {

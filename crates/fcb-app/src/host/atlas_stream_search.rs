@@ -21,6 +21,7 @@ use fcb_core::ResourceLease;
 use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES, input, workspace};
 use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
 use super::{HostResponse, atlas_session::{AtlasSession, AtlasSessionError}};
+use super::atlas_search::{AtlasSearchError, AtlasSearchScope, RegionCoverage};
 
 pub const MAX_ATLAS_STREAM_SEARCH_NEEDLE_BYTES: usize = 1024;
 pub const MAX_ATLAS_STREAM_SEARCH_HITS: usize = 256;
@@ -63,7 +64,7 @@ impl AtlasStreamSearchOptions {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AtlasStreamSearchError {
-    App(AppError), Atlas(AtlasSessionError), Stream(AtlasStreamError),
+    App(AppError), Atlas(AtlasSessionError), Stream(AtlasStreamError), Scope(AtlasSearchError),
     InvalidLimits, WrongAtlas, StaleQuery, MissingQuery, MissingHit, Canceled, IdentityExhausted,
 }
 impl std::fmt::Display for AtlasStreamSearchError {
@@ -71,6 +72,7 @@ impl std::fmt::Display for AtlasStreamSearchError {
         match self {
             Self::App(e) => write!(f, "{e}"), Self::Atlas(e) => write!(f, "{e}"),
             Self::Stream(e) => write!(f, "{e}"),
+            Self::Scope(e) => write!(f, "{e}"),
             other => f.write_str(match other {
                 Self::InvalidLimits => "ATLAS_STREAM_SEARCH_INVALID_LIMITS",
                 Self::WrongAtlas => "ATLAS_STREAM_SEARCH_WRONG_ATLAS",
@@ -88,6 +90,9 @@ impl std::error::Error for AtlasStreamSearchError {}
 impl From<AppError> for AtlasStreamSearchError { fn from(e: AppError) -> Self { Self::App(e) } }
 impl From<AtlasSessionError> for AtlasStreamSearchError { fn from(e: AtlasSessionError) -> Self { Self::Atlas(e) } }
 impl From<AtlasStreamError> for AtlasStreamSearchError { fn from(e: AtlasStreamError) -> Self { Self::Stream(e) } }
+impl From<AtlasSearchError> for AtlasStreamSearchError {
+    fn from(e: AtlasSearchError) -> Self { if e == AtlasSearchError::Canceled { Self::Canceled } else { Self::Scope(e) } }
+}
 impl From<OutputError> for AtlasStreamSearchError { fn from(e: OutputError) -> Self { Self::App(e.into()) } }
 
 #[derive(Clone, Copy)]
@@ -98,10 +103,58 @@ struct Hit {
     witness_len: usize,
     digest: Sha256Digest,
 }
+/// Reuse captured-search membership semantics and wire identity while keeping
+/// streaming observations independent of its capture limits and index state.
+struct FrozenScope {
+    predicate: AtlasSearchScope,
+    region: Option<RegionCoverage>,
+    eligible: usize,
+    excluded: usize,
+}
+impl FrozenScope {
+    fn admit(predicate: AtlasSearchScope, atlas: &AtlasSession, canceled: &mut impl FnMut() -> bool)
+        -> Result<Self, AtlasStreamSearchError> {
+        // This service promises exact decoded spelling. Never silently accept
+        // a case-insensitive descriptor and then run the exact-text engine.
+        if !predicate.case_sensitive() { return Err(AtlasSearchError::InvalidScope.into()); }
+        let (eligible, region) = predicate.admission_counts(atlas, canceled)?;
+        let excluded = atlas.atlas().file_count().checked_sub(eligible).ok_or(AtlasStreamSearchError::WrongAtlas)?;
+        Ok(Self { predicate, region, eligible, excluded })
+    }
+    fn projection(&self, atlas: &AtlasSession, budget: &ResourceBudget, id: ResourceAllocationId,
+        canceled: &mut impl FnMut() -> bool) -> Result<(Option<Vec<usize>>, Option<ResourceLease>), AtlasStreamSearchError> {
+        if self.predicate.is_all() { return Ok((None, None)); }
+        let bytes = self.eligible.checked_mul(size_of::<usize>())
+            .and_then(|n| n.checked_add(size_of::<Vec<usize>>())).ok_or(AppError::Admission)?;
+        let lease = budget.try_reserve_managed(atlas.atlas().catalog().id().owner(), id, ByteLength::new(bytes as u64))
+            .map_err(|_| AppError::Admission)?;
+        let mut ordinals = reserve(self.eligible)?;
+        for (ordinal, entry) in atlas.atlas().catalog().entries().iter().enumerate() {
+            check(canceled)?;
+            if self.predicate.includes_path(entry.path().raw().as_bytes()) {
+                if ordinals.len() == self.eligible { return Err(AtlasStreamSearchError::WrongAtlas); }
+                ordinals.push(ordinal);
+            }
+        }
+        if ordinals.len() != self.eligible { return Err(AtlasStreamSearchError::WrongAtlas); }
+        // Original order preserves file/node IDs and directory count ordering.
+        // This temporary capacity overlaps the engine's separately leased copy.
+        Ok((Some(ordinals), Some(lease)))
+    }
+    fn encode(&self, out: &mut Output) -> Result<(), AtlasStreamSearchError> {
+        self.predicate.encode(out)?;
+        if let Some(region) = self.region { region.encode(out, "")?; }
+        out.literal(",\"eligible_files\":")?; out.integer(self.eligible as u64)?;
+        out.literal(",\"excluded_files\":")?; out.integer(self.excluded as u64)?;
+        Ok(())
+    }
+    fn region_complete(&self) -> bool { self.region.is_none_or(|region| region.missing == 0) }
+}
 struct Snapshot {
     generation: u64,
     needle: String,
     options: AtlasStreamSearchOptions,
+    scope: FrozenScope,
     hits: Vec<Hit>,
     witnesses: Vec<u8>,
     diagnostics: Vec<AtlasStreamFile>,
@@ -164,7 +217,15 @@ impl RetainedAtlasStreamSearch {
     /// separate positive global limits.
     pub fn search(&mut self, atlas: &AtlasSession, needle: &str, options: AtlasStreamSearchOptions,
         canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasStreamSearchError> {
-        self.search_inner(atlas, needle, options, canceled, || false, |_| {}, false)
+        self.search_scoped(atlas, needle, options, AtlasSearchScope::all(), canceled)
+    }
+
+    /// Freeze the file-type/location intersection before any source I/O. Only
+    /// eligible catalog files consume scan limits. Empty is explicit, and
+    /// requested visible paths absent from the catalog keep coverage partial.
+    pub fn search_scoped(&mut self, atlas: &AtlasSession, needle: &str, options: AtlasStreamSearchOptions,
+        scope: AtlasSearchScope, canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasStreamSearchError> {
+        self.search_inner(atlas, needle, options, scope, canceled, || false, |_| {}, false)
     }
 
     /// Publish a bounded first-page preview while the SAME scanner continues.
@@ -177,11 +238,20 @@ impl RetainedAtlasStreamSearch {
         options: AtlasStreamSearchOptions, canceled: impl FnMut() -> bool,
         stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
         -> Result<HostResponse, AtlasStreamSearchError> {
-        self.search_inner(atlas, needle, options, canceled, stopped, progress, true)
+        self.search_scoped_with_progress(atlas, needle, options, AtlasSearchScope::all(), canceled, stopped, progress)
+    }
+
+    /// Progress, Stop-and-keep and terminal delivery retain the same scope and
+    /// eligible universe; later map/filter edits cannot change the operation.
+    pub fn search_scoped_with_progress(&mut self, atlas: &AtlasSession, needle: &str,
+        options: AtlasStreamSearchOptions, scope: AtlasSearchScope, canceled: impl FnMut() -> bool,
+        stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
+        -> Result<HostResponse, AtlasStreamSearchError> {
+        self.search_inner(atlas, needle, options, scope, canceled, stopped, progress, true)
     }
 
     fn search_inner(&mut self, atlas: &AtlasSession, needle: &str, options: AtlasStreamSearchOptions,
-        mut canceled: impl FnMut() -> bool, mut stopped: impl FnMut() -> bool,
+        scope: AtlasSearchScope, mut canceled: impl FnMut() -> bool, mut stopped: impl FnMut() -> bool,
         mut progress: impl FnMut(&HostResponse), publish_progress: bool)
         -> Result<HostResponse, AtlasStreamSearchError> {
         self.validate(atlas)?;
@@ -198,6 +268,9 @@ impl RetainedAtlasStreamSearch {
         if needle.is_empty() || needle.len() > MAX_ATLAS_STREAM_SEARCH_NEEDLE_BYTES {
             return Err(AtlasStreamSearchError::InvalidLimits);
         }
+        let scope = FrozenScope::admit(scope, atlas, &mut canceled)?;
+        let projection_id = self.next_id()?;
+        let (ordinals, projection_lease) = scope.projection(atlas, &self.budget, projection_id, &mut canceled)?;
         self.source_bytes_read.checked_add(options.max_scan_bytes).ok_or(AtlasStreamSearchError::IdentityExhausted)?;
         self.read_calls.checked_add(options.max_read_calls).ok_or(AtlasStreamSearchError::IdentityExhausted)?;
         let pattern_id = self.next_id()?;
@@ -211,12 +284,12 @@ impl RetainedAtlasStreamSearch {
             .map_err(AppError::from)?;
         let root = self.grant.root_path().to_path_buf();
         let mut tally = ProgressTally::default();
-        let (scanned, io) = scan(atlas.atlas(), &root, &pattern, first_revision, query, options,
+        let (scanned, io) = scan(atlas.atlas(), &root, &pattern, first_revision, query, options, ordinals.as_deref(),
             &self.budget, [report_id, worker_id], &mut canceled, &mut stopped, publish_progress,
             &mut |report, sequence, canceled| {
                 let ids = progress_ids.ok_or(AtlasStreamSearchError::InvalidLimits)?;
                 tally.update(report)?;
-                let response = self.progress_response(atlas, report, options, &tally, sequence, ids, canceled)?;
+                let response = self.progress_response(atlas, report, options, &scope, &tally, sequence, ids, canceled)?;
                 progress(&response);
                 Ok(())
             });
@@ -224,8 +297,10 @@ impl RetainedAtlasStreamSearch {
         // terminal cancellation/error that cannot publish a new result.
         self.source_bytes_read += io.bytes_read;
         self.read_calls += io.read_calls;
+        drop(ordinals);
+        drop(projection_lease);
         let report = scanned?;
-        let candidate = Arc::new(Snapshot::retain(&report, options, &self.budget, result_id, &mut canceled)?);
+        let candidate = Arc::new(Snapshot::retain(&report, options, scope, &self.budget, result_id, &mut canceled)?);
         drop(report);
         drop(pattern);
         let response = self.page_response(atlas, &candidate, "search", 0, MAX_ATLAS_STREAM_SEARCH_PAGE, &mut canceled)?;
@@ -250,6 +325,7 @@ impl RetainedAtlasStreamSearch {
         let snapshot = self.snapshot(generation)?.clone();
         let hit = snapshot.hits.get(position).ok_or(AtlasStreamSearchError::MissingHit)?;
         let mut out = self.output(atlas, "hit")?;
+        snapshot.scope.encode(&mut out)?;
         out.literal(",\"query_generation\":")?; out.integer(snapshot.generation)?;
         out.literal(",\"needle\":")?; out.quoted(&snapshot.needle)?;
         out.literal(",\"hit\":{")?;
@@ -324,6 +400,7 @@ impl RetainedAtlasStreamSearch {
         }
         self.validate(atlas)?; check(canceled)?;
         let mut out = self.output(atlas, command)?;
+        snapshot.scope.encode(&mut out)?;
         summary(&mut out, snapshot.summary())?;
         out.literal(",\"terminal\":true,\"selection_available\":true")?;
         let end = snapshot.hits.len().min(start + count);
@@ -350,7 +427,7 @@ impl RetainedAtlasStreamSearch {
     }
     fn progress_response(&self, atlas: &AtlasSession,
         report: &AtlasStreamReport<'_, '_, RetainedWorkspaceAtlas>, options: AtlasStreamSearchOptions,
-        tally: &ProgressTally, sequence: u64, allocations: [ResourceAllocationId; 2],
+        scope: &FrozenScope, tally: &ProgressTally, sequence: u64, allocations: [ResourceAllocationId; 2],
         canceled: &mut impl FnMut() -> bool) -> Result<HostResponse, AtlasStreamSearchError> {
         self.validate(atlas)?; check(canceled)?;
         report.validate_delivery(atlas.atlas(), report.generation())?;
@@ -358,6 +435,7 @@ impl RetainedAtlasStreamSearch {
             return Err(AtlasStreamSearchError::InvalidLimits);
         }
         let mut out = self.output_with_allocation(atlas, "progress", allocations[0])?;
+        scope.encode(&mut out)?;
         summary(&mut out, tally.summary(report, options))?;
         out.literal(",\"terminal\":false,\"selection_available\":false,\"progress_sequence\":")?;
         out.integer(sequence)?;
@@ -406,12 +484,18 @@ impl RetainedAtlasStreamSearch {
 
 fn scan<'a, C: FnMut() -> bool>(atlas: &'a RetainedWorkspaceAtlas, root: &Path, pattern: &StreamingNeedle,
     first_revision: SourceRevision, generation: QueryGeneration, options: AtlasStreamSearchOptions,
+    ordinals: Option<&[usize]>,
     budget: &ResourceBudget, allocations: [ResourceAllocationId; 2], canceled: &mut C,
     stopped: &mut impl FnMut() -> bool, publish_progress: bool,
     progress: &mut impl FnMut(&AtlasStreamReport<'a, 'a, RetainedWorkspaceAtlas>, u64, &mut C)
         -> Result<(), AtlasStreamSearchError>)
     -> (Result<AtlasStreamReport<'a, 'a, RetainedWorkspaceAtlas>, AtlasStreamSearchError>, AtlasStreamStats) {
-    let mut job = match AtlasStreamSearch::new(atlas, pattern, first_revision, generation, options.limits(), budget, allocations) {
+    let admitted = match ordinals {
+        Some(ordinals) => AtlasStreamSearch::new_scoped(atlas, pattern, first_revision, generation,
+            options.limits(), ordinals, budget, allocations),
+        None => AtlasStreamSearch::new(atlas, pattern, first_revision, generation, options.limits(), budget, allocations),
+    };
+    let mut job = match admitted {
         Ok(job) => job,
         Err(error) => return (Err(error.into()), AtlasStreamStats::default()),
     };
@@ -466,10 +550,13 @@ impl Snapshot {
             stop: self.stop, retained_hits: self.hits.len(), retained_witness_bytes: self.witnesses.len() }
     }
     fn retain(report: &AtlasStreamReport<'_, '_, RetainedWorkspaceAtlas>, options: AtlasStreamSearchOptions,
-        budget: &ResourceBudget, allocation: ResourceAllocationId, canceled: &mut impl FnMut() -> bool)
+        scope: FrozenScope, budget: &ResourceBudget, allocation: ResourceAllocationId, canceled: &mut impl FnMut() -> bool)
         -> Result<Self, AtlasStreamSearchError> {
         report.validate_delivery(report.atlas(), report.generation())?;
         check(canceled)?;
+        if scope.eligible != report.eligible_files() || scope.excluded != report.excluded_files() {
+            return Err(AtlasStreamSearchError::WrongAtlas);
+        }
         let diagnostic_count = report.stats().incomplete_files.min(MAX_DIAGNOSTICS);
         let charge = report.hits().len().checked_mul(size_of::<Hit>())
             .and_then(|n| diagnostic_count.checked_mul(size_of::<AtlasStreamFile>()).and_then(|v| n.checked_add(v)))
@@ -517,9 +604,10 @@ impl Snapshot {
             if !file.is_complete() && diagnostics.len() < diagnostic_count { diagnostics.push(file); }
         }
         check(canceled)?;
-        Ok(Self { generation: report.generation().get(), needle, options, hits, witnesses, diagnostics,
+        let complete = report.is_complete() && scope.region_complete();
+        Ok(Self { generation: report.generation().get(), needle, options, scope, hits, witnesses, diagnostics,
             examined: report.files_examined(), unexamined: report.unexamined_files(), unavailable, unsupported, failed, matching_files,
-            stats: report.stats(), discovery_complete: report.atlas().discovery_complete(), complete: report.is_complete(),
+            stats: report.stats(), discovery_complete: report.atlas().discovery_complete(), complete,
             stop: report.stop_reason(), _lease: lease })
     }
 }

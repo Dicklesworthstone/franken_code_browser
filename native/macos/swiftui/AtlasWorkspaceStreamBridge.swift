@@ -7,13 +7,17 @@ private typealias WorkspaceStreamProgress = @convention(c) (
 @_silgen_name("fcb_atlas_open_cancelable") private func workspaceStreamOpen(
     _ owner: UInt64, _ root: UnsafePointer<CChar>?, _ maximumFiles: UInt64,
     _ poll: WorkspaceStreamPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
-@_silgen_name("fcb_atlas_stream_search_cancelable") private func workspaceStreamSearch(
+@_silgen_name("fcb_atlas_stream_search_scoped_cancelable") private func workspaceStreamSearch(
     _ owner: UInt64, _ needle: UnsafePointer<CChar>?, _ maximumMatches: UInt64,
     _ maximumBytes: UInt64, _ maximumCalls: UInt64,
+    _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
+    _ pathKind: UInt64, _ path: UnsafePointer<CChar>?,
     _ poll: WorkspaceStreamPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
-@_silgen_name("fcb_atlas_stream_search_progress") private func workspaceStreamSearchProgress(
+@_silgen_name("fcb_atlas_stream_search_scoped_progress") private func workspaceStreamSearchProgress(
     _ owner: UInt64, _ needle: UnsafePointer<CChar>?, _ maximumMatches: UInt64,
-    _ maximumBytes: UInt64, _ maximumCalls: UInt64, _ poll: WorkspaceStreamPoll?,
+    _ maximumBytes: UInt64, _ maximumCalls: UInt64,
+    _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
+    _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ poll: WorkspaceStreamPoll?,
     _ stop: WorkspaceStreamPoll?, _ progress: WorkspaceStreamProgress?,
     _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_stream_search_page") private func workspaceStreamPage(
@@ -32,9 +36,13 @@ extension AtlasWorkspaceStreamTransport {
         }
     }, search: { owner, request, flag in
         try workspaceStreamPolling(flag) { poll, context in
-            request.needle.withCString {
-                workspaceStreamSearch(owner, $0, request.maximumMatches, request.maximumScanBytes,
-                    request.maximumReadCalls, poll, context)
+            request.needle.withCString { needle in
+                request.fileScope.withCStrings { extensions, filenames in
+                    request.pathScope.withCString { kind, path in
+                        workspaceStreamSearch(owner, needle, request.maximumMatches, request.maximumScanBytes,
+                            request.maximumReadCalls, extensions, filenames, kind, path, poll, context)
+                    }
+                }
             }
         }
     }, page: { try workspaceStreamTake(workspaceStreamPage($0, $1, $2, $3)) },
@@ -117,10 +125,14 @@ private func workspaceStreamProgressive(_ owner: UInt64, _ request: AtlasWorkspa
             box.progress(copied)
         }
         return try withExtendedLifetime(box) {
-            let pointer = request.needle.withCString {
-                workspaceStreamSearchProgress(owner, $0, request.maximumMatches,
-                    request.maximumScanBytes, request.maximumReadCalls, poll, stopped, receive,
-                    Unmanaged.passUnretained(box).toOpaque())
+            let pointer = request.needle.withCString { needle in
+                request.fileScope.withCStrings { extensions, filenames in
+                    request.pathScope.withCString { kind, path in
+                        workspaceStreamSearchProgress(owner, needle, request.maximumMatches,
+                            request.maximumScanBytes, request.maximumReadCalls, extensions, filenames,
+                            kind, path, poll, stopped, receive, Unmanaged.passUnretained(box).toOpaque())
+                    }
+                }
             }
             // Even malformed progress or late cancellation must release the
             // independently owned terminal reply exactly once.

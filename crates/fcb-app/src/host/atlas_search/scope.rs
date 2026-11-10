@@ -13,9 +13,9 @@ use region::VisibleRegion;
 /// Membership counts use the entire requested region, independently of the
 /// file-type predicate. Unknown requested paths never become successful misses.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct RegionCoverage { pub catalogued: usize, pub missing: usize }
+pub(crate) struct RegionCoverage { pub catalogued: usize, pub missing: usize }
 impl RegionCoverage {
-    pub(super) fn encode(&self, out: &mut Output, prefix: &str) -> Result<(), AtlasSearchError> {
+    pub(crate) fn encode(&self, out: &mut Output, prefix: &str) -> Result<(), AtlasSearchError> {
         field(out, prefix, "scope_region_catalogued_files")?; out.integer(self.catalogued as u64)?;
         field(out, prefix, "scope_region_missing_files")?; out.integer(self.missing as u64)?;
         Ok(())
@@ -214,7 +214,7 @@ impl AtlasSearchScope {
         let Some(dot) = basename.iter().rposition(|&byte| byte == b'.') else { return false; };
         dot != 0 && dot + 1 < basename.len() && self.extensions.contains(&basename[dot + 1..])
     }
-    pub(super) fn encode(&self, out: &mut Output) -> Result<(), AtlasSearchError> {
+    pub(crate) fn encode(&self, out: &mut Output) -> Result<(), AtlasSearchError> {
         self.encode_prefixed(out, "")
     }
     /// Capture admission and query admission use the same validated predicate
@@ -232,7 +232,7 @@ impl AtlasSearchScope {
         field(out, prefix, "case_sensitive")?; out.boolean(self.case_sensitive)?;
         Ok(())
     }
-    pub(super) fn admission_counts(&self, atlas: &AtlasSession, canceled: &mut impl FnMut() -> bool)
+    pub(crate) fn admission_counts(&self, atlas: &AtlasSession, canceled: &mut impl FnMut() -> bool)
         -> Result<(usize, Option<RegionCoverage>), AtlasSearchError> {
         if self.is_all() { return Ok((atlas.atlas().file_count(), None)); }
         let (mut eligible, mut catalogued) = (0, 0);

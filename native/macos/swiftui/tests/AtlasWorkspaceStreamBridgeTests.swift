@@ -2,6 +2,7 @@ import Foundation
 
 @_silgen_name("workspace_stream_fixture_reset") private func reset()
 @_silgen_name("workspace_stream_fixture_mode") private func mode(_ value: Int32)
+@_silgen_name("workspace_stream_fixture_scope") private func scope(_ value: UInt32)
 @_silgen_name("workspace_stream_fixture_count") private func count(_ kind: UInt32) -> UInt32
 @_silgen_name("workspace_stream_fixture_allocations") private func allocations() -> UInt32
 @_silgen_name("workspace_stream_fixture_frees") private func frees() -> UInt32
@@ -173,6 +174,33 @@ private final class WorkspaceProgressCopies: @unchecked Sendable {
             preconditionFailure("Canceled progressive search crossed ABI")
         } catch AtlasWorkspaceStreamError.canceled { }
         precondition(count(9) == entries && count(10) == progressCalls && allocations() == frees())
+
+        // Location and file-type predicates cross the ABI unchanged and keep
+        // their borrowed buffers alive through every synchronous callback.
+        let directory = try AtlasWorkspaceStreamRequest(needle: request.needle, maximumScanBytes: request.maximumScanBytes,
+            fileScope: .init(extensions: ["SWIFT", "rs"], filenames: ["Cargo.toml"]),
+            pathScope: .init(kind: .directory, path: "src/é"))
+        let file = try AtlasWorkspaceStreamRequest(needle: request.needle, maximumScanBytes: request.maximumScanBytes,
+            pathScope: .init(kind: .file, path: "src/main.rs"))
+        let emptyTypes = try AtlasWorkspaceStreamRequest(needle: request.needle, maximumScanBytes: request.maximumScanBytes,
+            fileScope: .init(extensions: []))
+        var scopedRequests: [(UInt32, AtlasWorkspaceStreamRequest)] = [(1, directory), (2, file), (3, emptyTypes)]
+        #if canImport(CryptoKit)
+        scopedRequests.append((4, try .init(needle: request.needle, maximumScanBytes: request.maximumScanBytes,
+            pathScope: .init(visiblePaths: [[0x73, 0x72, 0x63, 0x2f, 0xff, 0x2e, 0x72, 0x73]]))))
+        #endif
+        let scopedBefore = count(14), progressiveBefore = count(15)
+        for (selection, scoped) in scopedRequests {
+            scope(selection)
+            let direct = try transport.search(owner, scoped, AtlasSearchCancellation())
+            let stopped = AtlasWorkspaceStreamStop()
+            let streamed = try progressive(owner, scoped, AtlasSearchCancellation(), stopped) { _ in stopped.requestStop() }
+            precondition(direct == expected && streamed == expected && stopped.isRequested)
+            precondition(allocations() == frees())
+        }
+        precondition(count(14) == scopedBefore + UInt32(scopedRequests.count)
+            && count(15) == progressiveBefore + UInt32(scopedRequests.count))
+        scope(0)
         print("Workspace stream ABI ownership, progressive bytes, Stop and cancellation fixtures passed")
     }
 }

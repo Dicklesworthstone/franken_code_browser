@@ -363,10 +363,28 @@ private struct AtlasFrozenViewportSearch: Sendable {
 
     private func openWorkspaceStreamSearch() {
         guard let authority = snapshotExportSource else { return }
+        let pathScope: AtlasSearchPathScope
+        let types: AtlasSearchFileScope
+        do {
+            if searchPathKind == .visible {
+                guard let frozen = currentVisibleSearch else {
+                    status = "Choose the displayed atlas view before opening large-file search."
+                    return
+                }
+                pathScope = frozen.pathScope
+            } else {
+                pathScope = try AtlasSearchPathScope(kind: searchPathKind,
+                    path: searchPathKind == .workspace ? "" : searchPathInput)
+            }
+            types = try fileScope.searchScope(custom: customExtensions)
+        } catch {
+            status = (error as? AtlasSearchError)?.message ?? "Choose a valid search location and file types."
+            return
+        }
         closeWorkspaceStreamSearch()
         let source = AtlasWorkspaceStreamSource(root: authority.root,
             project: authority.identity.project, browserOwner: authority.identity.browserOwner,
-            access: authority.access)
+            access: authority.access, fileScope: types, pathScope: pathScope)
         workspaceStreamSearch = AtlasWorkspaceStreamPresentation(source: source,
             query: query, transport: .native)
     }
@@ -926,7 +944,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 Label("Search large project files…", systemImage: "doc.text.magnifyingglass")
             }
             .disabled(snapshotExportSource == nil)
-            .help("Search exact, case-sensitive text across all catalogued files with bounded streaming reads, including sources beyond the capture limits. Choose its I/O budget in the search sheet.")
+            .help("Search exact, case-sensitive text in the selected location and file types, including sources beyond capture limits. The sheet keeps this scope fixed and offers a total I/O budget.")
             .padding(.horizontal, 10).padding(.top, 8)
             if wantsCapturedIndex {
                 Text("The first search captures the selected scope. Later queries reuse those bytes; Refresh captures the current scope and file edits. Limits within that scope: 4096 files, 1 MiB per file, 32 MiB total.")

@@ -9,6 +9,7 @@ use super::*;
 
 pub(crate) enum StreamCommand<'a> {
     Search { needle: &'a str, options: AtlasStreamSearchOptions },
+    SearchScoped { needle: &'a str, options: AtlasStreamSearchOptions, scope: &'a AtlasSearchScope },
     Page { generation: u64, start: usize, count: usize },
     Hit { generation: u64, position: usize },
     Clear,
@@ -18,7 +19,15 @@ impl AtlasSessions {
     /// Synchronous progress holds this session's permit until the entered call
     /// drains. Other sessions and nonblocking cancellation/close remain usable.
     pub(crate) fn execute_stream_with_progress(&self, handle: u64, needle: &str,
-        options: AtlasStreamSearchOptions, mut canceled: impl FnMut() -> bool,
+        options: AtlasStreamSearchOptions, canceled: impl FnMut() -> bool,
+        stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
+        -> Result<HostResponse, AccessError> {
+        self.execute_stream_scoped_with_progress(handle, needle, options, &AtlasSearchScope::all(),
+            canceled, stopped, progress)
+    }
+
+    pub(crate) fn execute_stream_scoped_with_progress(&self, handle: u64, needle: &str,
+        options: AtlasStreamSearchOptions, scope: &AtlasSearchScope, mut canceled: impl FnMut() -> bool,
         stopped: impl FnMut() -> bool, mut progress: impl FnMut(&HostResponse))
         -> Result<HostResponse, AccessError> {
         let cell = self.get(handle)?;
@@ -27,7 +36,7 @@ impl AtlasSessions {
         cell.validate(epoch)?;
         let session = state.as_mut().ok_or(AccessError::NotOpen)?;
         session.synchronize(epoch);
-        let result = session.stream.search_with_progress(&session.atlas, needle, options,
+        let result = session.stream.search_scoped_with_progress(&session.atlas, needle, options, scope.clone(),
             || cell.validate(epoch).is_err() || canceled(), stopped, |response| {
                 if cell.validate(epoch).is_ok() { progress(response); }
             });
@@ -51,6 +60,8 @@ impl AtlasSessions {
         let result = match command {
             StreamCommand::Search { needle, options } =>
                 session.stream.search(&session.atlas, needle, options, &mut stop),
+            StreamCommand::SearchScoped { needle, options, scope } =>
+                session.stream.search_scoped(&session.atlas, needle, options, scope.clone(), &mut stop),
             StreamCommand::Page { generation, start, count } =>
                 session.stream.page(&session.atlas, generation, start, count),
             StreamCommand::Hit { generation, position } =>

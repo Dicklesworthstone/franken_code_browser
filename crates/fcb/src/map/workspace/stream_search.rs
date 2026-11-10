@@ -55,7 +55,7 @@ impl AtlasStreamStop {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum AtlasStreamError {
-    Atlas(WorkspaceAtlasError), File(FileSearchError), InvalidLimits,
+    Atlas(WorkspaceAtlasError), File(FileSearchError), InvalidLimits, InvalidScope,
     ResourceDenied, AllocationFailed, Canceled, StaleQuery, WrongAtlas, Pending, InvalidHit,
 }
 impl std::fmt::Display for AtlasStreamError {
@@ -64,6 +64,7 @@ impl std::fmt::Display for AtlasStreamError {
             Self::Atlas(e) => write!(f, "{e}"), Self::File(e) => write!(f, "{e}"),
             other => f.write_str(match other {
                 Self::InvalidLimits => "ATLAS_STREAM_INVALID_LIMITS",
+                Self::InvalidScope => "ATLAS_STREAM_INVALID_SCOPE",
                 Self::ResourceDenied => "ATLAS_STREAM_RESOURCE_DENIED",
                 Self::AllocationFailed => "ATLAS_STREAM_ALLOCATION_FAILED",
                 Self::Canceled => "ATLAS_STREAM_CANCELED", Self::StaleQuery => "ATLAS_STREAM_STALE_QUERY",
@@ -97,16 +98,43 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
     pub fn new(atlas: &'atlas A, needle: &'worker StreamingNeedle,
         first_revision: SourceRevision, generation: QueryGeneration, limits: AtlasStreamLimits,
         budget: &'worker ResourceBudget, allocations: [ResourceAllocationId; 2]) -> Result<Self, AtlasStreamError> {
+        Self::admit(atlas, needle, first_revision, generation, limits, None, budget, allocations)
+    }
+
+    /// Search an immutable, strictly increasing projection of ORIGINAL catalog
+    /// ordinals. Empty means no eligible files. Membership is copied under the
+    /// report lease before work starts; caller mutations cannot widen it. No
+    /// source callback, byte quota or read-call quota is spent on excluded files.
+    /// File IDs, node IDs and source revision offsets remain those of the base
+    /// catalog, so a display scope never becomes a replacement source authority.
+    pub fn new_scoped(atlas: &'atlas A, needle: &'worker StreamingNeedle,
+        first_revision: SourceRevision, generation: QueryGeneration, limits: AtlasStreamLimits,
+        ordinals: &[usize], budget: &'worker ResourceBudget, allocations: [ResourceAllocationId; 2])
+        -> Result<Self, AtlasStreamError> {
+        Self::admit(atlas, needle, first_revision, generation, limits, Some(ordinals), budget, allocations)
+    }
+
+    fn admit(atlas: &'atlas A, needle: &'worker StreamingNeedle,
+        first_revision: SourceRevision, generation: QueryGeneration, limits: AtlasStreamLimits,
+        ordinals: Option<&[usize]>, budget: &'worker ResourceBudget, allocations: [ResourceAllocationId; 2])
+        -> Result<Self, AtlasStreamError> {
         atlas.validate_active()?;
         let text = needle.text_value().ok_or(AtlasStreamError::InvalidLimits)?;
-        let count = atlas.catalog().entries().len();
-        if count != atlas.file_count() || text.is_empty() || text.len() > MAX_ATLAS_STREAM_NEEDLE_BYTES
+        let catalogued = atlas.catalog().entries().len();
+        if catalogued != atlas.file_count() || text.is_empty() || text.len() > MAX_ATLAS_STREAM_NEEDLE_BYTES
             || limits.max_matches > MAX_ATLAS_STREAM_MATCHES || limits.max_bytes > MAX_ATLAS_STREAM_BYTES
             || limits.max_read_calls > MAX_ATLAS_STREAM_CALLS || allocations[0] == allocations[1]
             || generation.owner() != atlas.layout().owner() || first_revision.owner() != atlas.layout().owner()
-            || first_revision.get().checked_add(count.saturating_sub(1) as u64).is_none() {
+            || first_revision.get().checked_add(catalogued.saturating_sub(1) as u64).is_none() {
             return Err(AtlasStreamError::InvalidLimits);
         }
+        if ordinals.is_some_and(|values| values.last().is_some_and(|&last| last >= catalogued)
+            || values.windows(2).any(|pair| pair[0] >= pair[1])) {
+            return Err(AtlasStreamError::InvalidScope);
+        }
+        let count = ordinals.map_or(catalogued, <[usize]>::len);
+        let projection_bytes = ordinals.map_or(0, <[usize]>::len).checked_mul(size_of::<usize>())
+            .ok_or(AtlasStreamError::InvalidLimits)?;
         let witness_files = count.min(limits.max_matches);
         // UTF-16 needs at most twice the UTF-8 literal's byte length. Store one
         // encoded witness per matched file, not a decoder lease for every file.
@@ -116,6 +144,7 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
             .and_then(|n| limits.max_matches.checked_mul(size_of::<AtlasStreamHit>()).and_then(|h| n.checked_add(h)))
             .and_then(|n| witness_files.checked_mul(size_of::<usize>()).and_then(|h| n.checked_add(h)))
             .and_then(|n| n.checked_add(witness_bytes))
+            .and_then(|n| n.checked_add(projection_bytes))
             .and_then(|n| n.checked_add(text.len() + size_of::<Self>() + size_of::<AtlasStreamReport<'_, '_, A>>()))
             .ok_or(AtlasStreamError::InvalidLimits)?;
         let lease = budget.try_reserve_managed(atlas.layout().owner(), allocations[0], ByteLength::new(charge as u64))
@@ -124,9 +153,14 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
         literal.try_reserve_exact(text.len()).map_err(|_| AtlasStreamError::AllocationFailed)?;
         if literal.capacity() > text.len() { return Err(AtlasStreamError::ResourceDenied); }
         literal.push_str(text);
+        let selected_ordinals = ordinals.map(|values| {
+            let mut selected = reserve(values.len())?;
+            selected.extend_from_slice(values);
+            Ok::<_, AtlasStreamError>(selected)
+        }).transpose()?;
         let report = AtlasStreamReport { atlas, generation, limits, files: reserve(count)?,
             hits: reserve(limits.max_matches)?, matched_files: reserve(witness_files)?,
-            witnesses: reserve(witness_bytes)?, literal, stats: AtlasStreamStats::default(),
+            witnesses: reserve(witness_bytes)?, selected_ordinals, literal, stats: AtlasStreamStats::default(),
             state: if count == 0 { AtlasStreamState::Finished } else { AtlasStreamState::Pending },
             stop: None, _lease: lease, _catalog: PhantomData };
         Ok(Self { report, needle, budget, worker_allocation: allocations[1], first_revision, active: None })
@@ -179,13 +213,14 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
     fn advance(&mut self, quantum: StreamReadStep,
         open: &mut impl FnMut(CaptureRequest, &NormalizedPath) -> Result<File, SourceError>,
         canceled: &mut impl FnMut() -> bool) -> Result<AtlasStreamState, AtlasStreamError> {
-        let ordinal = self.report.files.len();
+        let position = self.report.files.len();
         if self.active.is_none() {
-            if ordinal == self.report.atlas.file_count() { self.report.state = AtlasStreamState::Finished; return Ok(self.state()); }
+            if position == self.report.eligible_files() { self.report.state = AtlasStreamState::Finished; return Ok(self.state()); }
             let stop = if self.report.stats.bytes_read >= self.report.limits.max_bytes { Some(AtlasStreamStop::ByteLimit) }
                 else if self.report.stats.read_calls >= self.report.limits.max_read_calls { Some(AtlasStreamStop::ReadCallLimit) }
                 else { None };
             if let Some(stop) = stop { self.stop(stop); return Ok(self.state()); }
+            let ordinal = self.report.selected_ordinals.as_ref().map_or(position, |values| values[position]);
             let catalog = self.report.atlas.catalog();
             let file = catalog.file_id(ordinal).ok_or(AtlasStreamError::InvalidLimits)?;
             let revision = SourceRevision::new(file.owner(), self.first_revision.get() + ordinal as u64)
@@ -241,7 +276,7 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
     }
     fn stop(&mut self, reason: AtlasStreamStop) { self.report.stop = Some(reason); self.report.state = AtlasStreamState::Finished; }
     fn finish_if_done(&mut self) {
-        if self.report.files.len() == self.report.atlas.file_count() { self.report.state = AtlasStreamState::Finished; }
+        if self.report.files.len() == self.report.eligible_files() { self.report.state = AtlasStreamState::Finished; }
     }
     fn record_unavailable(&mut self, request: CaptureRequest, stats: StreamReadStats,
         error: FileSearchError) -> Result<(), AtlasStreamError> {

@@ -38,6 +38,36 @@ char *fcb_atlas_stream_search_cancelable(uint64_t handle, const char *needle,
     uint64_t max_matches, uint64_t max_scan_bytes, uint64_t max_read_calls,
     int32_t (*poll)(void *context), void *context);
 
+/* Additive scoped search. Legacy entry points above/below still select all
+ * catalogued files. extensions/filenames follow captured-search scope syntax:
+ * comma-separated ASCII tokens, case-insensitive; extensions omit the dot.
+ * Both NULL means all types; either present (including "") means the union
+ * of its extensions and exact basenames. Lists are at most 1024 bytes each.
+ *
+ * path_kind: 0 workspace (NULL or empty path), 1 directory, 2 exact file,
+ * 3 frozen visible region. Directory/file paths are exact UTF-8 relative paths
+ * up to 4096 bytes, without dot/repeated/leading/trailing components. Directory
+ * matching respects component boundaries. Visible path is canonical sorted,
+ * unique lowercase hex CSV of raw relative paths (up to 20000 paths and 1 MiB
+ * encoded bytes); "" is an explicitly empty region. Only workspace accepts
+ * NULL path. Invalid scope never widens membership or starts source I/O.
+ * All pointers are readable through NUL or the appropriate byte limit plus
+ * one, whichever comes first, and remain stable through the entered call.
+ *
+ * File types and location intersect BEFORE opening files or spending scan
+ * limits. catalogued_files remains the original base catalog; eligible_files
+ * + excluded_files equals it, and files_examined + files_unexamined equals
+ * eligible_files. Original file/node IDs survive. search/progress/page/hit
+ * echo search_scope, scope_extensions/filenames, scope_path_kind/path/path_hex,
+ * case_sensitive=true and both file counts. Visible receipts also echo their
+ * scope_region_sha256/files/path_bytes/catalogued_files/missing_files; missing
+ * requested paths prevent search_complete even if all admitted files finished.
+ */
+char *fcb_atlas_stream_search_scoped_cancelable(uint64_t handle, const char *needle,
+    uint64_t max_matches, uint64_t max_scan_bytes, uint64_t max_read_calls,
+    const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
+    int32_t (*poll)(void *context), void *context);
+
 /* Progressive variant of the same search. Each progress callback carries a
  * provisional first page (at most 32 finalized-file hits) with command=progress,
  * terminal=false, selection_available=false and a monotonically increasing
@@ -61,6 +91,13 @@ typedef void (*fcb_atlas_stream_progress_callback)(
     const uint8_t *json, uint64_t length, void *context);
 char *fcb_atlas_stream_search_progress(uint64_t handle, const char *needle,
     uint64_t max_matches, uint64_t max_scan_bytes, uint64_t max_read_calls,
+    int32_t (*poll)(void *context), int32_t (*stop)(void *context),
+    fcb_atlas_stream_progress_callback progress, void *context);
+
+/* Same progress/Stop/cancellation contract, with the frozen scope above. */
+char *fcb_atlas_stream_search_scoped_progress(uint64_t handle, const char *needle,
+    uint64_t max_matches, uint64_t max_scan_bytes, uint64_t max_read_calls,
+    const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
     int32_t (*poll)(void *context), int32_t (*stop)(void *context),
     fcb_atlas_stream_progress_callback progress, void *context);
 

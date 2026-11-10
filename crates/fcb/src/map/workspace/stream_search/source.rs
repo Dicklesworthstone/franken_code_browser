@@ -15,9 +15,10 @@ mod sealed {
 }
 
 /// The read-only metadata authority used by whole-file atlas search. Only
-/// library-built atlases implement this trait. Search admits complete catalog
-/// membership, including explicitly partial discovery; display-filtered
-/// membership is rejected before the source-opening callback can run.
+/// library-built atlases implement this trait. Search authority is the complete
+/// base catalog, including explicitly partial discovery; a query may select a
+/// frozen ordinal projection without changing any base identity. Display-filtered
+/// authority is rejected before the source-opening callback can run.
 pub trait AtlasStreamSource: sealed::Sealed {
     fn catalog(&self) -> &WorkspaceCatalog;
     fn layout(&self) -> &PartitionLayout;

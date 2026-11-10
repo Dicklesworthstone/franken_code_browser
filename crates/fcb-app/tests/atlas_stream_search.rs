@@ -11,6 +11,7 @@ use std::{ffi::OsStr, fs::{self, File}, io::Write, os::unix::ffi::OsStrExt,
 use fcb::ArenaOwnerId;
 use fcb_app::{EXIT_OK, EXIT_PARTIAL, host::{HostResponse,
     atlas_session::{AtlasAction, AtlasSession, AtlasSessionOptions},
+    atlas_search::{AtlasSearchError, AtlasSearchPathKind, AtlasSearchScope},
     atlas_stream_search::{AtlasStreamSearchError, AtlasStreamSearchOptions, RetainedAtlasStreamSearch,
         MAX_ATLAS_STREAM_SEARCH_HITS, MAX_ATLAS_STREAM_SEARCH_NEEDLE_BYTES,
         MAX_ATLAS_STREAM_SEARCH_PAGE, MAX_ATLAS_STREAM_SEARCH_READ_CALLS, MAX_ATLAS_STREAM_SEARCH_SCAN_BYTES}}};
@@ -133,6 +134,172 @@ fn frozen_all_catalog_scope_survives_display_filter_and_live_new_files() {
     assert_eq!(report.get("scope").text(), "catalogued-whole-files");
     assert_eq!(report.get("discovery_policy").text(), "product-defaults/no-rule-files-v1");
     assert!(report.get("excluded_entries").number() >= 1);
+}
+
+fn assert_scope_echo(actual: &Json, expected: &Json) {
+    for key in ["search_scope", "scope_extensions", "scope_filenames", "scope_path_kind", "scope_path",
+        "scope_path_hex", "case_sensitive", "eligible_files", "excluded_files", "catalogued_files"] {
+        assert_eq!(actual.get(key), expected.get(key), "scope changed in {key}");
+    }
+}
+
+#[test]
+fn file_types_intersect_directory_before_io_and_preserve_original_ids_on_page_and_hit() {
+    let fixture = Fixture::new(); fixture.write("a-excluded.bin", &vec![b'x'; 1024 * 1024]);
+    fixture.write("src/a.RS", b"needle"); fixture.write("src/Makefile", b"needle");
+    fixture.write("src/nested/b.rs", b"other"); fixture.write("src/readme.md", b"needle");
+    fixture.write("src-old/spill.rs", b"needle");
+    let mut atlas = fixture.atlas(64); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    // Neither a later display-only filter nor a disappeared excluded file can
+    // change the explicitly admitted base-catalog intersection.
+    atlas.prepare(1, AtlasAction::Scope(AtlasSession::preset_scope("rust").unwrap()), || false).unwrap();
+    fs::remove_file(fixture.0.join("src/readme.md")).unwrap();
+    let scope = AtlasSearchScope::from_csv(Some("RS"), Some("Makefile")).unwrap()
+        .with_path(AtlasSearchPathKind::Directory, "src").unwrap();
+    let options = AtlasStreamSearchOptions { max_scan_bytes: 17, max_read_calls: 3, ..opts() };
+    let response = service.search_scoped(&atlas, "needle", options, scope, || false).unwrap();
+    assert_eq!(response.exit_code(), EXIT_OK);
+    let report = json(&response);
+    assert!(report.get("search_complete").flag());
+    assert_eq!(report.get("search_scope").text(), "file-types");
+    assert_eq!(report.get("scope_extensions").text(), "rs");
+    assert_eq!(report.get("scope_filenames").text(), "makefile");
+    assert_eq!(report.get("scope_path_kind").text(), "directory");
+    assert_eq!(report.get("scope_path").text(), "src");
+    assert_eq!(report.get("scope_path_hex").text(), hex(b"src"));
+    assert!(report.get("case_sensitive").flag());
+    assert_eq!(report.get("catalogued_files").number(), 6);
+    assert_eq!(report.get("eligible_files").number(), 3); assert_eq!(report.get("excluded_files").number(), 3);
+    assert_eq!(report.get("files_examined").number(), 3); assert_eq!(report.get("files_unexamined").number(), 0);
+    assert_eq!(report.get("incomplete_files").number(), 0); assert_eq!(report.get("retained_hits").number(), 2);
+    assert_eq!(report.get("payload_bytes_read").number(), 17); assert_eq!(report.get("read_calls").number(), 3);
+    for row in report.get("hits").array() {
+        let catalog = atlas.atlas().catalog();
+        let ordinal = catalog.entries().iter().position(|entry|
+            hex(entry.path().raw().as_bytes()) == row.get("path").get("hex").text()).unwrap();
+        let file = catalog.file_id(ordinal).unwrap();
+        assert_eq!(row.get("file_id").number(), file.get());
+        assert_eq!(row.get("node_ordinal").number(), atlas.atlas().node_for_file(file).unwrap().ordinal() as u64);
+        assert_eq!(row.get("source_revision").number(), 1 + ordinal as u64);
+    }
+    let io = (service.source_bytes_read(), service.read_calls());
+    fixture.write("src/Makefile", b"changed current contents");
+    let page = json(&service.page(&atlas, 1, 0, 32).unwrap());
+    let hit = json(&service.hit(&atlas, 1, 0).unwrap());
+    assert_scope_echo(&page, &report); assert_scope_echo(&hit, &report);
+    assert_eq!(hit.get("hit").get("original_hex").text(), hex(b"needle"));
+    assert_eq!(io, (service.source_bytes_read(), service.read_calls()));
+    assert!(matches!(service.search_scoped(&atlas, "needle", opts(),
+        AtlasSearchScope::all().with_case_sensitive(false), || false),
+        Err(AtlasStreamSearchError::Scope(AtlasSearchError::InvalidScope))));
+    assert_eq!(io, (service.source_bytes_read(), service.read_calls()));
+    assert_scope_echo(&json(&service.page(&atlas, 1, 0, 32).unwrap()), &report);
+}
+
+#[test]
+fn exact_file_empty_types_and_empty_visible_region_never_broaden_to_all_files() {
+    let fixture = Fixture::new(); fixture.write("a.rs", b"needle"); fixture.write("b.md", b"needle");
+    let atlas = fixture.atlas(64); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let file = AtlasSearchScope::all().with_path(AtlasSearchPathKind::File, "b.md").unwrap();
+    let selected = json(&service.search_scoped(&atlas, "needle", opts(), file, || false).unwrap());
+    assert_eq!(selected.get("eligible_files").number(), 1); assert_eq!(selected.get("excluded_files").number(), 1);
+    assert_eq!(selected.get("hits").array()[0].get("path").get("hex").text(), hex(b"b.md"));
+    assert_eq!(service.source_bytes_read(), 6);
+    let io = (service.source_bytes_read(), service.read_calls());
+    for scope in [AtlasSearchScope::from_csv(Some(""), None).unwrap(),
+        AtlasSearchScope::all().with_path(AtlasSearchPathKind::Visible, "").unwrap()] {
+        let response = service.search_scoped(&atlas, "needle", opts(), scope, || false).unwrap();
+        assert_eq!(response.exit_code(), EXIT_OK);
+        let empty = json(&response);
+        assert_eq!(empty.get("eligible_files").number(), 0); assert_eq!(empty.get("excluded_files").number(), 2);
+        assert_eq!(empty.get("files_examined").number(), 0); assert_eq!(empty.get("files_unexamined").number(), 0);
+        assert_eq!(empty.get("payload_bytes_read").number(), 0); assert_eq!(empty.get("read_calls").number(), 0);
+        assert!(empty.get("search_complete").flag()); assert!(empty.get("hits").array().is_empty());
+        assert_eq!(io, (service.source_bytes_read(), service.read_calls()));
+    }
+    let missing = AtlasSearchScope::all().with_path(AtlasSearchPathKind::Visible, &hex(b"missing.rs")).unwrap();
+    let response = service.search_scoped(&atlas, "needle", opts(), missing, || false).unwrap();
+    assert_eq!(response.exit_code(), EXIT_PARTIAL);
+    let report = json(&response);
+    assert_eq!(report.get("eligible_files").number(), 0); assert_eq!(report.get("files_unexamined").number(), 0);
+    assert_eq!(report.get("scope_region_files").number(), 1);
+    assert_eq!(report.get("scope_region_catalogued_files").number(), 0);
+    assert_eq!(report.get("scope_region_missing_files").number(), 1);
+    assert!(!report.get("search_complete").flag()); assert_eq!(io, (service.source_bytes_read(), service.read_calls()));
+}
+
+#[test]
+fn visible_scope_keeps_raw_path_membership_and_missing_coverage_independent_of_file_types() {
+    let fixture = Fixture::new(); let raw = b"raw-\xff.rs";
+    fs::write(fixture.0.join(OsStr::from_bytes(raw)), b"needle").unwrap();
+    fixture.write("doc.md", b"needle"); fixture.write("other.rs", b"needle");
+    let atlas = fixture.atlas(64); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let mut paths = vec![hex(raw), hex(b"doc.md"), hex(b"missing.rs")]; paths.sort();
+    let wire = paths.join(",");
+    let scope = AtlasSearchScope::from_csv(Some("rs"), None).unwrap()
+        .with_path(AtlasSearchPathKind::Visible, &wire).unwrap();
+    let response = service.search_scoped(&atlas, "needle", opts(), scope, || false).unwrap();
+    let report = json(&response);
+    assert_eq!(response.exit_code(), EXIT_PARTIAL);
+    assert_eq!(report.get("scope_path_kind").text(), "visible");
+    assert_eq!(report.get("scope_region_files").number(), 3);
+    assert_eq!(report.get("scope_region_catalogued_files").number(), 2);
+    assert_eq!(report.get("scope_region_missing_files").number(), 1);
+    assert_eq!(report.get("scope_region_path_bytes").number(), (raw.len() + b"doc.md".len() + b"missing.rs".len()) as u64);
+    assert_eq!(report.get("eligible_files").number(), 1); assert_eq!(report.get("excluded_files").number(), 2);
+    assert_eq!(report.get("payload_bytes_read").number(), 6); assert_eq!(report.get("files_unexamined").number(), 0);
+    assert!(!report.get("search_complete").flag());
+    assert_eq!(report.get("hits").array()[0].get("path").get("hex").text(), hex(raw));
+    let page = json(&service.page(&atlas, 1, 0, 32).unwrap());
+    let hit = json(&service.hit(&atlas, 1, 0).unwrap());
+    for delivered in [&page, &hit] {
+        assert_scope_echo(delivered, &report);
+        for key in ["scope_region_sha256", "scope_region_files", "scope_region_path_bytes",
+            "scope_region_catalogued_files", "scope_region_missing_files"] {
+            assert_eq!(delivered.get(key), report.get(key));
+        }
+    }
+    assert_eq!(service.source_bytes_read(), 6);
+}
+
+#[test]
+fn scoped_progress_stop_and_cancellation_keep_the_frozen_eligible_universe_and_previous_result() {
+    use std::cell::Cell;
+    let fixture = Fixture::new(); fixture.write("a-excluded.rs", &vec![b'x'; 1024 * 1024]);
+    fixture.write("src/a.rs", b"needle"); fixture.write("src/z.rs", b"needle");
+    let atlas = fixture.atlas(64); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let scope = AtlasSearchScope::all().with_path(AtlasSearchPathKind::Directory, "src").unwrap();
+    let stop = Cell::new(false); let mut frames = Vec::new();
+    let response = service.search_scoped_with_progress(&atlas, "needle", opts(), scope.clone(),
+        || false, || stop.get(), |response| {
+            let frame = json(response);
+            assert_eq!(frame.get("eligible_files").number(), 2); assert_eq!(frame.get("excluded_files").number(), 1);
+            assert_eq!(frame.get("files_examined").number() + frame.get("files_unexamined").number(), 2);
+            if frame.get("retained_hits").number() == 1 { stop.set(true); }
+            frames.push(frame);
+        }).unwrap();
+    let terminal = json(&response);
+    assert!(stop.get()); assert_eq!(frames.len(), 2); assert_eq!(response.exit_code(), EXIT_PARTIAL);
+    assert_eq!(terminal.get("stop_reason").text(), "user-stopped");
+    assert_eq!(terminal.get("files_examined").number(), 1); assert_eq!(terminal.get("files_unexamined").number(), 1);
+    assert_eq!(terminal.get("payload_bytes_read").number(), 6);
+    for frame in &frames { assert_scope_echo(frame, &terminal); }
+    let accepted = service.accepted_generation().unwrap();
+    let io = (service.source_bytes_read(), service.read_calls());
+    let cancel = Cell::new(false); let mut spent = (0, 0);
+    let result = service.search_scoped_with_progress(&atlas, "needle", opts(), scope,
+        || cancel.get(), || cancel.get(), |response| {
+            let frame = json(response);
+            if frame.get("retained_hits").number() == 1 {
+                spent = (frame.get("payload_bytes_read").number(), frame.get("read_calls").number());
+                cancel.set(true);
+            }
+        });
+    assert!(matches!(result, Err(AtlasStreamSearchError::Canceled)));
+    assert_eq!(service.accepted_generation(), Some(accepted));
+    assert_eq!((service.source_bytes_read(), service.read_calls()), (io.0 + spent.0, io.1 + spent.1));
+    let retained = json(&service.page(&atlas, accepted, 0, 32).unwrap());
+    assert_scope_echo(&retained, &terminal); assert_eq!(retained.get("hits"), terminal.get("hits"));
 }
 
 #[test]

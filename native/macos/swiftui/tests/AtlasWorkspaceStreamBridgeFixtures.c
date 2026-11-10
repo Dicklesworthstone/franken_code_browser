@@ -8,9 +8,11 @@
 #include <string.h>
 
 enum { CREATE, OPEN, SEARCH, PAGE, HIT, CLEAR, CANCEL, CLOSE, POLLS,
-    PROGRESS_SEARCH, PROGRESS_CALLBACKS, STOP_POLLS, STOP_SEEN, PROGRESS_CANCELED, COUNTERS };
+    PROGRESS_SEARCH, PROGRESS_CALLBACKS, STOP_POLLS, STOP_SEEN, PROGRESS_CANCELED,
+    SCOPED_SEARCH, SCOPED_PROGRESS, COUNTERS };
 static uint32_t counts[COUNTERS], allocations, frees;
 static int32_t mode;
+static uint32_t expected_scope;
 static char *owned;
 static const uint64_t owner_value = UINT64_C(0xfedcba9876543210);
 static const uint64_t generation_value = UINT64_C(0x8000000100000007);
@@ -18,9 +20,10 @@ typedef int32_t (*workspace_fixture_poll)(void *context);
 extern void workspace_stream_fixture_cancel(void *context);
 void workspace_stream_fixture_reset(void) {
     assert(owned == NULL && allocations == frees);
-    memset(counts, 0, sizeof(counts)); allocations = frees = 0; mode = 0;
+    memset(counts, 0, sizeof(counts)); allocations = frees = 0; mode = 0; expected_scope = 0;
 }
 void workspace_stream_fixture_mode(int32_t value) { mode = value; }
+void workspace_stream_fixture_scope(uint32_t value) { expected_scope = value; }
 uint32_t workspace_stream_fixture_count(uint32_t kind) { assert(kind < COUNTERS); return counts[kind]; }
 uint32_t workspace_stream_fixture_allocations(void) { return allocations; }
 uint32_t workspace_stream_fixture_frees(void) { return frees; }
@@ -127,6 +130,53 @@ char *fcb_atlas_stream_search_progress(uint64_t owner, const char *needle, uint6
     if (stop(context) != 0) ++counts[STOP_SEEN];
     assert(strcmp(needle, "exact \xc3\xa9\xf0\x9f\x98\x80") == 0);
     return response(SEARCH);
+}
+
+static void check_scope(const char *extensions, const char *filenames, uint64_t path_kind, const char *path) {
+    switch (expected_scope) {
+    case 0:
+        assert(extensions == NULL && filenames == NULL && path_kind == 0 && path == NULL);
+        break;
+    case 1:
+        assert(extensions != NULL && strcmp(extensions, "rs,swift") == 0);
+        assert(filenames != NULL && strcmp(filenames, "cargo.toml") == 0);
+        assert(path_kind == 1 && path != NULL && strcmp(path, "src/\xc3\xa9") == 0);
+        break;
+    case 2:
+        assert(extensions == NULL && filenames == NULL);
+        assert(path_kind == 2 && path != NULL && strcmp(path, "src/main.rs") == 0);
+        break;
+    case 3:
+        assert(extensions != NULL && extensions[0] == 0 && filenames != NULL && filenames[0] == 0);
+        assert(path_kind == 0 && path == NULL);
+        break;
+    case 4:
+        assert(extensions == NULL && filenames == NULL);
+        assert(path_kind == 3 && path != NULL && strcmp(path, "7372632fff2e7273") == 0);
+        break;
+    default: assert(0 && "Unexpected scoped request");
+    }
+}
+char *fcb_atlas_stream_search_scoped_cancelable(uint64_t owner, const char *needle,
+    uint64_t maximum_matches, uint64_t maximum_bytes, uint64_t maximum_calls,
+    const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
+    workspace_fixture_poll poll, void *context) {
+    ++counts[SCOPED_SEARCH]; check_scope(extensions, filenames, path_kind, path);
+    char *result = fcb_atlas_stream_search_cancelable(owner, needle, maximum_matches,
+        maximum_bytes, maximum_calls, poll, context);
+    check_scope(extensions, filenames, path_kind, path);
+    return result;
+}
+char *fcb_atlas_stream_search_scoped_progress(uint64_t owner, const char *needle,
+    uint64_t maximum_matches, uint64_t maximum_bytes, uint64_t maximum_calls,
+    const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
+    workspace_fixture_poll poll, workspace_fixture_poll stop,
+    fcb_atlas_stream_progress_callback progress, void *context) {
+    ++counts[SCOPED_PROGRESS]; check_scope(extensions, filenames, path_kind, path);
+    char *result = fcb_atlas_stream_search_progress(owner, needle, maximum_matches,
+        maximum_bytes, maximum_calls, poll, stop, progress, context);
+    check_scope(extensions, filenames, path_kind, path);
+    return result;
 }
 
 char *fcb_atlas_stream_search_page(uint64_t owner, uint64_t generation, uint64_t start, uint64_t count) {
