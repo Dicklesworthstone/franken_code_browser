@@ -308,6 +308,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     @State private var sourceSearchRow: AtlasSearchRowID?
     @State private var atlasResidency = AtlasViewportResidency()
     @State private var atlasEntries: [AtlasProjectCatalog.Entry] = []
+    @State private var showsCity = false
     @State private var atlasScopeLabel = "All"
     @State private var atlasLayoutRequest = UUID()
     @State private var atlasLayoutIO = AtlasProjectIO()
@@ -430,7 +431,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     }
 
     private var canFreezeVisibleSearch: Bool {
-        !loadingProject && !showsCatalog && !atlasLayoutPending && hasMetadataAtlas && visibleSearchTask == nil
+        !loadingProject && !showsCatalog && !showsCity && !atlasLayoutPending && hasMetadataAtlas && visibleSearchTask == nil
             && visibleSearchView?.belongs(to: root, project: loadGeneration, layout: atlasRevision) == true
     }
 
@@ -488,6 +489,13 @@ private struct AtlasFrozenViewportSearch: Sendable {
             }
             .disabled(!projectOpening.canBrowse)
             .help("Browse known files without waiting for text-atlas previews")
+            Picker("Atlas projection", selection: $showsCity) {
+                Text("2D").tag(false)
+                Text("City").tag(true)
+            }
+            .pickerStyle(.segmented).frame(width: 110)
+            .disabled(!hasMetadataAtlas || atlasLayoutPending)
+            .help("Explore the same file footprints in 2D or as buildings sized by observed file bytes")
             Menu {
                 Picker("Files and search scope", selection: $fileScope) {
                     ForEach(AtlasFileScope.allCases) { scope in Text(scope.rawValue).tag(scope) }
@@ -701,6 +709,14 @@ private struct AtlasFrozenViewportSearch: Sendable {
         .onChange(of: fileScope) { _, value in
             if value == .custom { showsSidebar = true }
             applyFileScope()
+        }
+        .onChange(of: showsCity) { _, city in
+            camera.stopMotion()
+            if city { showsCatalog = false }
+            invalidateVisibleSearchScope()
+            if city && searchPathKind == .visible {
+                visibleSearchNotice = "Return to 2D to choose a visible-file search scope. Other search scopes remain available in City."
+            }
         }
         .onChange(of: selectedHit) { _, selected in
             guard let selected else { return }
@@ -1181,33 +1197,43 @@ private struct AtlasFrozenViewportSearch: Sendable {
                         .frame(maxHeight: .infinity)
                     }
                 } else {
-                    AtlasCanvas(
-                        revision: atlasRevision,
-                        contentRevision: atlasResidency.contentRevision,
-                        focusRequest: focusRequest,
-                        selectedMatch: overlayIsCurrent ? selectedMatch : nil,
-                        searchRows: overlayIsCurrent ? searchRows : [],
-                        scopeLabel: atlasScopeLabel,
-                        files: displayedFiles,
-                        metadata: atlasEntries,
-                        camera: camera,
-                        hitPaths: overlayIsCurrent ? searchPaths : [],
-                        selectedPath: selectedPath,
-                        contentBounds: contentBounds,
-                        onSelect: { entry in
-                            guard !atlasLayoutPending, let path = entry.sourcePath,
-                                  fileScope.includes(path, custom: customExtensions) else {
-                                status = "This filename is available through Project Files or Quick Open."
-                                return
-                            }
-                            selectedHit = nil; openFile(path); showsReader = true
-                        },
-                        onViewport: updateAtlasViewport,
-                        residencySummary: atlasLayoutPending ? "Preparing the selected file scope…" : atlasResidency.summary,
-                        retryPreviews: atlasResidency.retryUnavailable,
-                        tiles: textTiles
-                    )
-                    .id(atlasRevision)
+                    let acceptedLayout = atlasRevision
+                    ZStack {
+                        AtlasCanvas(
+                            active: !showsCity,
+                            revision: atlasRevision,
+                            contentRevision: atlasResidency.contentRevision,
+                            focusRequest: focusRequest,
+                            selectedMatch: overlayIsCurrent ? selectedMatch : nil,
+                            searchRows: overlayIsCurrent ? searchRows : [],
+                            scopeLabel: atlasScopeLabel,
+                            files: displayedFiles,
+                            metadata: atlasEntries,
+                            camera: camera,
+                            hitPaths: overlayIsCurrent ? searchPaths : [],
+                            selectedPath: selectedPath,
+                            contentBounds: contentBounds,
+                            onSelect: { entry in
+                                openAtlasEntry(entry, layout: acceptedLayout)
+                            },
+                            onViewport: updateAtlasViewport,
+                            residencySummary: atlasLayoutPending ? "Preparing the selected file scope…" : atlasResidency.summary,
+                            retryPreviews: atlasResidency.retryUnavailable,
+                            tiles: textTiles
+                        )
+                        .id(atlasRevision)
+                        .opacity(showsCity ? 0 : 1)
+                        .allowsHitTesting(!showsCity).disabled(showsCity).accessibilityHidden(showsCity)
+                        if showsCity {
+                            AtlasCityView(revision: atlasRevision, entries: atlasEntries,
+                                complete: projectOpening.catalog?.discoveryComplete ?? false,
+                                seed: AtlasCitySeed(scale: camera.scale, offsetX: camera.offsetX, offsetY: camera.offsetY),
+                                selectedPath: selectedPath, scopeLabel: atlasScopeLabel,
+                                onSelect: { openAtlasEntry($0, layout: acceptedLayout) },
+                                returnTo2D: { showsCity = false })
+                                .id(atlasRevision)
+                        }
+                    }
                 }
                 if ((selectedPath != nil || finderReaderCapture != nil) && showsReader) || !pinnedReaders.entries.isEmpty || pinnedReaders.busy {
                     Divider()
@@ -1231,6 +1257,15 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 inspector.frame(width: 264)
             }
         }
+    }
+
+    private func openAtlasEntry(_ entry: AtlasProjectCatalog.Entry, layout: UUID) {
+        guard layout == atlasRevision, hasMetadataAtlas, !atlasLayoutPending else { return }
+        guard let path = entry.sourcePath, fileScope.includes(path, custom: customExtensions) else {
+            status = "This filename is available through Project Files or Quick Open."
+            return
+        }
+        selectedHit = nil; openFile(path); showsReader = true
     }
 
     private func catalogView(_ catalog: AtlasProjectCatalog) -> some View {
@@ -1810,7 +1845,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     }
 
     private func updateAtlasViewport(_ world: CGRect, scale: Double) {
-        guard !showsCatalog, !atlasLayoutPending, hasMetadataAtlas else { return }
+        guard !showsCatalog, !showsCity, !atlasLayoutPending, hasMetadataAtlas else { return }
         if let viewport = try? AtlasVisibleSearchScope.Viewport(x: Double(world.minX), y: Double(world.minY),
             width: Double(world.width), height: Double(world.height)),
            visibleSearchView?.represents(root: root, project: loadGeneration,
@@ -2458,6 +2493,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
 // MARK: - Atlas canvas (display-link driven, text at every zoom)
 
 struct AtlasCanvas: View {
+    let active: Bool
     let revision: UUID
     let contentRevision: UUID
     let focusRequest: UUID
@@ -2485,20 +2521,20 @@ struct AtlasCanvas: View {
     var body: some View {
         GeometryReader { geometry in
             let size = geometry.size
-            TimelineView(.animation(paused: !camera.isAnimating)) { timeline in
+            TimelineView(.animation(paused: !active || !camera.isAnimating)) { timeline in
                 AtlasRetainedView(tiles: tiles, revision: revision, scale: camera.scale,
                     offset: CGPoint(x: camera.offsetX, y: camera.offsetY),
                     selectedPath: selectedPath, hitPaths: hitPaths, matchRows: searchRows.isEmpty ? (selectedMatch?.rowRects ?? []) : searchRows,
                     metadata: metadata, contentRevision: contentRevision,
                     onPresentedContent: { acceptedLayout, acceptedContent, scale, offset in
-                        guard acceptedLayout == revision, acceptedContent == contentRevision,
+                        guard active, acceptedLayout == revision, acceptedContent == contentRevision,
                               camera.acceptsNavigation(revision: revision) else { return }
                         presentedFrame.record(revision: revision, scale: scale, offset: offset,
                             contentRevision: contentRevision)
                         requestVisibleSource(in: size)
                     })
                 .onChange(of: timeline.date) { _, _ in
-                    guard camera.acceptsNavigation(revision: revision) else { return }
+                    guard active, camera.acceptsNavigation(revision: revision) else { return }
                     camera.tick(now: ProcessInfo.processInfo.systemUptime, viewport: size)
                 }
             }
@@ -2510,26 +2546,26 @@ struct AtlasCanvas: View {
                         state = value.translation
                     }
                     .onChanged { value in
-                        guard camera.acceptsNavigation(revision: revision) else { return }
+                        guard active, camera.acceptsNavigation(revision: revision) else { return }
                         camera.drag(location: value.location, start: value.startLocation,
                                     now: ProcessInfo.processInfo.systemUptime)
                     }
                     .onEnded { _ in
-                        guard camera.acceptsNavigation(revision: revision) else { return }
+                        guard active, camera.acceptsNavigation(revision: revision) else { return }
                         camera.endPan(now: ProcessInfo.processInfo.systemUptime)
                     }
             )
             .simultaneousGesture(
                 SpatialTapGesture(count: 2)
                     .onEnded { value in
-                        guard camera.acceptsNavigation(revision: revision) else { return }
+                        guard active, camera.acceptsNavigation(revision: revision) else { return }
                         camera.steerZoom(by: 2.2, at: value.location)
                     }
             )
             .simultaneousGesture(
                 SpatialTapGesture()
                     .onEnded { value in
-                        guard camera.acceptsNavigation(revision: revision), dragDelta == .zero,
+                        guard active, camera.acceptsNavigation(revision: revision), dragDelta == .zero,
                               let point = presentedFrame.worldPoint(at: value.location, revision: revision,
                                   contentRevision: contentRevision),
                               let file = metadata.last(where: {
@@ -2541,6 +2577,7 @@ struct AtlasCanvas: View {
                     }
             )
             .overlay {
+                if active {
                 AtlasInputOverlay(onZoom: { factor, point, immediate in
                     guard camera.acceptsNavigation(revision: revision) else { return }
                     camera.steerZoom(by: factor, at: point, immediate: immediate)
@@ -2548,17 +2585,18 @@ struct AtlasCanvas: View {
                     guard camera.acceptsNavigation(revision: revision) else { return }
                     camera.steerWheelZoom(delta: delta, precise: precise, at: point)
                 })
+                }
             }
             .onAppear {
                 camera.reducedMotion = reduceMotion
             }
             .onChange(of: reduceMotion) { _, value in camera.reducedMotion = value }
             .onChange(of: revision, initial: true) { _, value in
-                guard camera.acceptsNavigation(revision: value) else { return }
+                guard active, camera.acceptsNavigation(revision: value) else { return }
                 initialFitPending = !camera.fit(bounds: contentBounds, viewport: size)
             }
             .onChange(of: focusRequest) { _, _ in
-                guard let path = selectedPath,
+                guard active, let path = selectedPath,
                       let file = metadata.first(where: { $0.rawPath.elementsEqual(path.utf8) }) else { return }
                 let parcel = CGRect(x: file.x, y: file.y, width: file.width, height: file.height)
                 camera.navigateFocus(bounds: selectedMatch?.focusRect ?? parcel, viewport: size, revision: revision)
@@ -2566,13 +2604,19 @@ struct AtlasCanvas: View {
             .onChange(of: selectedPath.map { Array($0.utf8) }) { _, _ in requestVisibleSource(in: size) }
             .onChange(of: size, initial: true) { _, newSize in
                 viewport = newSize
-                guard camera.acceptsNavigation(revision: revision) else { return }
+                guard active, camera.acceptsNavigation(revision: revision) else { return }
                 camera.updateViewport(newSize)
                 // onAppear can precede the first usable GeometryReader size.
                 // Retry until fit succeeds, then leave navigation under user control.
                 if initialFitPending {
                     initialFitPending = !camera.fit(bounds: contentBounds, viewport: newSize)
                 }
+            }
+            .onChange(of: active) { _, value in
+                guard value, camera.acceptsNavigation(revision: revision) else { return }
+                camera.updateViewport(size)
+                if initialFitPending { initialFitPending = !camera.fit(bounds: contentBounds, viewport: size) }
+                requestVisibleSource(in: size)
             }
             .overlay(alignment: .bottomLeading) {
                 HStack(spacing: 8) {
@@ -2641,6 +2685,7 @@ struct AtlasCanvas: View {
     /// Only the accepted display transform supplies demand. This callback
     /// records bounded scheduling input; source reads and shaping run later.
     private func requestVisibleSource(in size: CGSize) {
+        guard active else { return }
         guard camera.acceptsNavigation(revision: revision),
               size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0,
               let origin = presentedFrame.worldPoint(at: .zero, revision: revision, contentRevision: contentRevision),

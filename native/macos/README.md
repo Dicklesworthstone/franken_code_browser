@@ -11,6 +11,61 @@ From the repository root on macOS 14+:
 To inspect a built app before installation, run `APP="$(./scripts/build_macos_app.sh)"`,
 then `open "$APP"` and `./scripts/install_macos_app.sh "$APP"` if desired.
 
+## City view
+
+After preparing a text atlas, choose **City** in the toolbar. The City uses the
+same file identities and footprints as 2D; switching projection does not repack
+the repository or read source. It starts at the current 2D neighborhood. **Fit
+City** fits all known buildings, including their elevated extents. Returning to
+**2D** preserves its camera and history, while the selected file and open reader
+remain available.
+
+Building height represents **observed file bytes**, with a logarithmic transform
+capped at **1 GiB**. Known files have a 2% minimum height, including known empty
+files; the maximum height is 12% of the atlas's larger ground dimension. Unknown
+sizes are gray flat parcels, and partial catalog membership remains explicit in
+the legend. These metadata observations are not exact source line counts or a
+claim that every project file has been discovered.
+
+| Action | Control |
+| --- | --- |
+| Pan | Drag, two-finger scroll, arrow keys, or the four pan buttons |
+| Orbit | **Option-drag**, **Option-left/right**, or the rotate buttons |
+| Tilt | **Option-up/down** or the tilt buttons; tilt is bounded to 75° |
+| Zoom | Pinch, **Command-scroll** or **Control-scroll**, or the zoom buttons |
+| Read a building | Click its visible surface; the existing frontal source reader opens |
+| Read files with the keyboard | **Read previous/next file**, or **Command-Option-[ / ]** |
+| Return | **Return to 2D** or the toolbar projection picker |
+
+Camera changes and projection switches are direct, including reduced-motion
+use. City keeps reading frontal instead of putting text on oblique faces.
+Filenames unsupported by the ordinary UTF-8 opener remain available through
+**Project Files** or **Quick Open**. Workspace, directory, file and saved-capture
+search remain available; choosing a new visible-file search scope requires 2D.
+
+The Rust scene owns the checked camera matrix and CPU hierarchical picking.
+Native code uploads canonical instances once, draws with depth32Float and
+strict less-than depth, and acknowledges a frame only after Metal's actual
+presentation callback. Camera publication, resize, layout replacement and
+closing fence activation of older pixels. A picked building is a file identity,
+not an exact text location; source activation follows the existing capture path.
+
+Native preparation, response decoding, and final retirement run off the UI
+thread. There are two globally admitted City scene lifetimes, one coalesced
+waiting gesture per scene, at most two submitted draw commands per surface,
+and bounded depth/drawable allocations. Graphics unavailability or admission
+refusal leaves **Return to 2D** and **Retry City** available. The first native
+qualification batch, including actual GPU shared-edge coverage and physical-Mac
+interaction, is pending; authored fixtures are not a rendered-product pass.
+
+The focused native regression entry point is
+[`swiftui/tests/test-city.sh`](swiftui/tests/test-city.sh). It compiles the
+production City sources and checks worker scheduling, lost-reply recovery,
+presentation/resize fences, identity, and admission using injected wire replies.
+Run it in the independent native verification lane; it does not exercise GPU
+pixels. Rust geometry, host, registry, and C ABI regressions live alongside their
+production implementations.
+
 ## CLI to native project workflow
 
 Direct-distribution builds now include the matching `fcb` executable at

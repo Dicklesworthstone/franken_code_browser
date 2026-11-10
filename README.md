@@ -87,10 +87,10 @@ development.
 
 | Surface | Current state |
 |---|---|
-| Rust engine and bridge | Workspace discovery, exact source captures, layout, search, saved-repository and reader services, plus a C ABI for the native shell. |
+| Rust engine and bridge | Workspace discovery, exact source captures, layout, search, saved-repository and reader services, retained City geometry/cameras/CPU picking, plus a C ABI for the native shell. |
 | Headless `fcb` binary | Explicit file/workspace inspection, bounded reading and exact text/byte search with versioned JSON. Bare `fcb` and human `fcb open` still report that the GUI launcher is unavailable in this binary. |
-| Native app | [`native/macos/`](native/macos/) contains a SwiftUI shell with dense text parcels, directory outlines, Monokai-inspired color, Metal glyph presentation, camera gestures, exact-text search with a match count, file-type filters, a source reader and local prepared-text cache. A notarized developer-preview DMG is available. |
-| Future work | Full Markdown reading, complete native accessibility/IME, code-city mode, release-grade smoothness, clean-machine distribution qualification and independent native verification remain open. |
+| Native app | [`native/macos/`](native/macos/) contains a SwiftUI shell with dense text parcels, directory outlines, Monokai-inspired color, Metal glyph presentation, camera gestures, exact-text search with a match count, file-type filters, a source reader and local prepared-text cache. The source also includes an optional retained Metal City view with metric heights and selection into the existing reader. A notarized developer-preview DMG is available. |
+| Future work | Full rich Markdown reading, complete native accessibility/IME, City GPU/interaction qualification, release-grade smoothness, clean-machine distribution qualification and independent native verification remain open. |
 
 The core interaction is deliberately continuous:
 
@@ -102,6 +102,15 @@ Open a repository → explore its atlas → select a file → read exact source
 
 The browsing product does not execute project code to open a directory. Editing, builds,
 debuggers and terminals are outside its initial release scope.
+
+**City uses the same map.** Its buildings retain the current file footprints and IDs;
+height is a bounded logarithmic transform of **observed file bytes**, capped at 1 GiB,
+with explicit unknown and partial-catalog counts. Camera movement does not discover
+files, read source, or rebuild the map. The native controls provide deliberate orbit,
+pan, zoom, keyboard file navigation, the existing frontal source reader, and return to
+the retained 2D camera. Picking is bound to an acknowledged displayed camera and uses
+the shared Rust hierarchy. The implementation and regression fixtures are code-first;
+independent batch verification and physical-Mac Metal qualification remain pending.
 
 ## How the design stays responsive
 
@@ -137,6 +146,14 @@ other browser instances operational.
 the native GUI. The native app consumes `fcb-bridge` from the same workspace. The longer-term component and
 consumer design is in [ARCHITECTURE.md](ARCHITECTURE.md), a design summary written before these
 integrations landed.
+
+Embedders selecting the `map` feature can use `fcb::map::city::{Scene, Record, Camera}`
+without a native window. Supply the existing owner-qualified layout, file footprints,
+metadata observations, and a resource budget; retain the resulting frame alongside the
+instance buffer actually displayed. The native host consumes the same engine through
+[`fcb_city.h`](crates/fcb-bridge/include/fcb_city.h), including presentation acknowledgment
+and stale-frame rejection. A picked file ID remains a metadata identity; the host's
+existing source grants and reader action determine whether it can be opened.
 
 ## Shared components and ownership
 
