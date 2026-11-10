@@ -7,7 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { CREATE, OPEN, SEARCH, PAGE, HIT, CLEAR, CANCEL, CLOSE, POLLS, COUNTERS };
+enum { CREATE, OPEN, SEARCH, PAGE, HIT, CLEAR, CANCEL, CLOSE, POLLS,
+    PROGRESS_SEARCH, PROGRESS_CALLBACKS, STOP_POLLS, STOP_SEEN, PROGRESS_CANCELED, COUNTERS };
 static uint32_t counts[COUNTERS], allocations, frees;
 static int32_t mode;
 static char *owned;
@@ -99,6 +100,35 @@ char *fcb_atlas_stream_search_cancelable(uint64_t owner, const char *needle, uin
     ++counts[SEARCH]; poll_context(poll, context);
     assert(strcmp(needle, "exact \xc3\xa9\xf0\x9f\x98\x80") == 0); return response(SEARCH);
 }
+char *fcb_atlas_stream_search_progress(uint64_t owner, const char *needle, uint64_t maximum_matches,
+    uint64_t maximum_bytes, uint64_t maximum_calls, workspace_fixture_poll poll,
+    workspace_fixture_poll stop, fcb_atlas_stream_progress_callback progress, void *context) {
+    assert(owner == owner_value && needle != NULL && maximum_matches == 256);
+    assert(maximum_bytes == UINT64_C(4294967296) && maximum_calls == 1048576);
+    assert(strcmp(needle, "exact \xc3\xa9\xf0\x9f\x98\x80") == 0);
+    assert(poll != NULL && stop != NULL && progress != NULL && context != NULL);
+    ++counts[PROGRESS_SEARCH]; ++counts[POLLS]; assert(poll(context) == 0);
+    ++counts[STOP_POLLS];
+    if (stop(context) != 0) { ++counts[STOP_SEEN]; return response(SEARCH); }
+    uint8_t borrowed[] = "{\"fixture\":\"workspace-progress\"}";
+    const uint8_t invalid[] = { 255 };
+    ++counts[PROGRESS_CALLBACKS];
+    if (mode == 8) progress(invalid, sizeof(invalid), context);
+    else if (mode == 9) progress(borrowed, UINT64_C(8) * 1024 * 1024 + 1, context);
+    else if (mode == 10) progress(NULL, 1, context);
+    else if (mode == 11) progress(borrowed, 0, context);
+    else progress(borrowed, sizeof(borrowed) - 1, context);
+    // A retained callback pointer would now see changed bytes. Swift must have
+    // copied exactly the supplied range before the synchronous callback returned.
+    memset(borrowed, 'x', sizeof(borrowed));
+    ++counts[POLLS];
+    if (poll(context) != 0) { ++counts[PROGRESS_CANCELED]; return response(SEARCH); }
+    ++counts[STOP_POLLS];
+    if (stop(context) != 0) ++counts[STOP_SEEN];
+    assert(strcmp(needle, "exact \xc3\xa9\xf0\x9f\x98\x80") == 0);
+    return response(SEARCH);
+}
+
 char *fcb_atlas_stream_search_page(uint64_t owner, uint64_t generation, uint64_t start, uint64_t count) {
     assert(owner == owner_value && generation == generation_value && start == 224 && count == 32);
     ++counts[PAGE]; return response(PAGE);

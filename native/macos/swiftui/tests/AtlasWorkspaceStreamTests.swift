@@ -73,6 +73,40 @@ private enum StreamFixture {
     }
 }
 
+private enum StreamProgressFixture {
+    static func catalog(_ owner: UInt64) -> [String: Any] {
+        var value = StreamFixture.catalog(owner)
+        value["catalogued_files"] = "2"; value["workspace_files"] = "2"
+        return value
+    }
+    /// The first file has finalized matches; read accounting also includes one
+    /// chunk of a second unfinished file, whose matches are deliberately absent.
+    static func report(_ owner: UInt64, _ generation: UInt64, _ request: AtlasWorkspaceStreamRequest,
+        stopped: Bool, count: Int = 40, examined: UInt64 = 1,
+        payload: UInt64 = StreamFixture.length + 16_384) -> [String: Any] {
+        var value = StreamFixture.report(owner, generation, request, count: count)
+        value["catalogued_files"] = "2"; value["terminal"] = true; value["selection_available"] = true
+        value["files_examined"] = stopped ? String(examined) : "2"
+        value["files_unexamined"] = stopped ? String(2 - examined) : "0"
+        value["search_complete"] = !stopped; value["stop_reason"] = stopped ? "user-stopped" as Any : NSNull()
+        let bytes = stopped ? payload : 2 * StreamFixture.length
+        value["payload_bytes_read"] = String(bytes); value["scanned_input_bytes"] = String(bytes)
+        value["read_calls"] = String((bytes + 16_383) / 16_384)
+        value["peak_input_buffer_bytes"] = String(min(bytes, 16_384))
+        return value
+    }
+    static func progress(_ owner: UInt64, _ generation: UInt64, _ request: AtlasWorkspaceStreamRequest,
+        sequence: UInt64, count: Int = 40, examined: UInt64 = 1,
+        payload: UInt64 = StreamFixture.length + 16_384) -> [String: Any] {
+        var value = report(owner, generation, request, stopped: true, count: count, examined: examined, payload: payload)
+        value["stop_reason"] = NSNull(); value["terminal"] = false; value["selection_available"] = false
+        value["progress_sequence"] = String(sequence)
+        value = StreamFixture.page(value)
+        value["command"] = "progress"
+        return value
+    }
+}
+
 private final class StreamProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var nextOwner: UInt64 = 100
@@ -83,6 +117,8 @@ private final class StreamProbe: @unchecked Sendable {
     private var searches = 0, hits = 0, pages = 0, active = 0, mostActive = 0, created = 0
     private var closed = Set<UInt64>(), released = Set<String>()
     private var closeAllowed = true, retirementFailures = 0
+    private var progressGate: ObservedReaderGate?, badProgress = false, burstProgress = false
+    private var stoppedRequests = 0, stoppedWithCancellation = false, cancelCalls = 0
     private func locked<T>(_ work: () throws -> T) rethrows -> T {
         lock.lock(); defer { lock.unlock() }; return try work()
     }
@@ -92,10 +128,26 @@ private final class StreamProbe: @unchecked Sendable {
             search: { owner, request, _ in try self.search(owner, request) },
             page: { owner, generation, start, count in try self.page(owner, generation, start, count) },
             hit: { owner, generation, index in try self.hit(owner, generation, index) },
-            clear: { owner in try self.clear(owner) }, cancel: { _ in true },
+            clear: { owner in try self.clear(owner) }, cancel: { _ in self.locked { self.cancelCalls += 1 }; return true },
             close: { owner in self.locked { guard self.closeAllowed else { return false }; self.closed.insert(owner); return true } },
             retirementFailed: { self.locked { self.retirementFailures += 1 } })
     }
+    var progressiveTransport: AtlasWorkspaceStreamTransport {
+        let base = transport
+        return .init(create: base.create,
+            open: { owner, _, _ in try StreamFixture.json(StreamProgressFixture.catalog(owner)) },
+            search: base.search, page: base.page, hit: base.hit, clear: base.clear,
+            cancel: base.cancel, close: base.close, retirementFailed: base.retirementFailed,
+            progressiveSearch: { owner, request, flag, stop, publish in
+                try self.progressiveSearch(owner, request, flag, stop, publish)
+            })
+    }
+    func blockProgress(_ gate: ObservedReaderGate) { locked { progressGate = gate } }
+    func poisonProgress() { locked { badProgress = true } }
+    func burstNextProgress() { locked { burstProgress = true } }
+    var stopCount: Int { locked { stoppedRequests } }
+    var stopCanceledWork: Bool { locked { stoppedWithCancellation } }
+    var cancelCount: Int { locked { cancelCalls } }
     func blockSearch(_ gate: ObservedReaderGate) { locked { searchGate = gate } }
     func blockHit(_ gate: ObservedReaderGate) { locked { hitGate = gate } }
     func blockPage(_ gate: ObservedReaderGate) { locked { pageGate = gate } }
@@ -133,6 +185,33 @@ private final class StreamProbe: @unchecked Sendable {
         var report = StreamFixture.report(owner, stale ? generation - 1 : generation, request)
         locked { reports[owner] = report }
         if fails { report["scope"] = "visible-only" } // Backend already replaced before bad delivery.
+        return try StreamFixture.json(StreamFixture.page(report))
+    }
+    private func progressiveSearch(_ owner: UInt64, _ request: AtlasWorkspaceStreamRequest,
+        _ flag: AtlasSearchCancellation, _ stop: AtlasWorkspaceStreamStop,
+        _ publish: @Sendable (String) -> Void) throws -> String {
+        enter(); defer { leave() }
+        let (gate, poisoned, burst, stale, generation) = locked {
+            let result = (progressGate, badProgress, burstProgress, staleSearch, (generations[owner] ?? 0) + 1)
+            progressGate = nil; badProgress = false; burstProgress = false; staleSearch = false
+            searches += 1; generations[owner] = result.4
+            return result
+        }
+        publish(try StreamFixture.json(StreamProgressFixture.progress(owner, generation, request,
+            sequence: 1, count: 0, examined: 0, payload: 16_384)))
+        for sequence in UInt64(2)...UInt64(burst ? 128 : 2) {
+            var progress = StreamProgressFixture.progress(owner, generation, request, sequence: sequence)
+            if poisoned { progress["scope"] = "visible-only" }
+            publish(try StreamFixture.json(progress))
+            if flag.isCanceled { throw AtlasWorkspaceStreamError.canceled }
+        }
+        gate?.wait()
+        locked {
+            if stop.isRequested { stoppedRequests += 1; stoppedWithCancellation = stoppedWithCancellation || flag.isCanceled }
+        }
+        guard !flag.isCanceled else { throw AtlasWorkspaceStreamError.canceled }
+        let report = StreamProgressFixture.report(owner, stale ? generation - 1 : generation, request, stopped: stop.isRequested)
+        locked { reports[owner] = report }
         return try StreamFixture.json(StreamFixture.page(report))
     }
     private func page(_ owner: UInt64, _ generation: UInt64, _ start: UInt64, _ count: UInt64) throws -> String {
@@ -196,6 +275,8 @@ private final class StreamContextProbe: @unchecked Sendable {
 @main private enum AtlasWorkspaceStreamTests {
     static func main() async throws {
         try wireTests()
+        try progressWireTests()
+        try await progressModelTests()
         try await modelTests()
         try await lifetimeTests()
         print("Workspace stream wire/model/context fixtures passed; no native presentation qualification claimed")
@@ -322,6 +403,198 @@ private final class StreamContextProbe: @unchecked Sendable {
             let accepted = try page(StreamFixture.page(changed))
             precondition(accepted.hits[0].finalLength == 1 && !accepted.hits[0].complete)
         }
+    }
+
+    private static func progressWireTests() throws {
+        let owner: UInt64 = 0xfedcba9876543210
+        let request = try AtlasWorkspaceStreamRequest(needle: "old")
+        let catalog = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(StreamProgressFixture.catalog(owner)), owner: owner)
+        func progress(_ object: [String: Any], previous: AtlasWorkspaceStreamProgress? = nil) throws -> AtlasWorkspaceStreamProgress {
+            try .decode(StreamFixture.json(object), catalog: catalog, request: request, previous: previous)
+        }
+        func terminal(_ object: [String: Any], required: Bool = true) throws -> AtlasWorkspaceStreamPage {
+            try .decode(StreamFixture.json(StreamFixture.page(object)), catalog: catalog, root: catalog.root,
+                request: request, requireTerminal: required)
+        }
+        let initialWire = StreamProgressFixture.progress(owner, 7, request,
+            sequence: 1, count: 0, examined: 0, payload: 16_384)
+        let initial = try progress(initialWire)
+        precondition(initial.page.hits.isEmpty && initial.summary.examinedFiles == 0 && initial.summary.payloadBytes == 16_384)
+        precondition(!initial.summary.complete && initial.summary.unexaminedFiles == 2)
+        let middleWire = StreamProgressFixture.progress(owner, 7, request, sequence: 2)
+        let middle = try progress(middleWire, previous: initial)
+        precondition(middle.page.hits.count == 32 && middle.summary.retainedHits == 40 && middle.page.next == 32)
+        precondition(middle.summary.examinedFiles == 1 && middle.summary.unexaminedFiles == 1)
+        precondition(middle.countLabel.contains("so far") && middle.coverage.contains("unfinished file"))
+        rejects("Provisional first page treated as a complete retained report") {
+            _ = try AtlasWorkspaceStreamReport(summary: middle.summary, hits: middle.page.hits)
+        }
+        rejects("Provisional callback crossed the terminal decoder") {
+            _ = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(middleWire),
+                catalog: catalog, root: catalog.root, request: request, requireTerminal: true)
+        }
+        let activeWire = StreamProgressFixture.progress(owner, 7, request,
+            sequence: 3, payload: StreamFixture.length + 32_768)
+        let active = try progress(activeWire, previous: middle)
+        precondition(active.summary.retainedHits == middle.summary.retainedHits
+            && active.summary.payloadBytes > middle.summary.payloadBytes,
+            "Active-file I/O must advance without inventing finalized matches")
+        let stoppedWire = StreamProgressFixture.report(owner, 7, request, stopped: true,
+            payload: StreamFixture.length + 32_768)
+        let stopped = try terminal(stoppedWire)
+        try active.validateTerminal(stopped)
+        precondition(stopped.summary.stop == "user-stopped" && !stopped.summary.complete && !stopped.summary.truncated)
+        let tail = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(stoppedWire, offset: 32)),
+            catalog: catalog, root: catalog.root, request: request, previous: stopped.summary, offset: 32, requireTerminal: true)
+        let stoppedReport = try AtlasWorkspaceStreamReport(summary: stopped.summary, hits: stopped.hits + tail.hits)
+        precondition(stoppedReport.hits.count == 40 && stoppedReport.summary.coverage.contains("at your request"))
+        let complete = try terminal(StreamProgressFixture.report(owner, 7, request, stopped: false))
+        try active.validateTerminal(complete)
+        precondition(complete.summary.complete, "A stop racing completed work may receive its complete terminal result")
+
+        for (key, value) in [("terminal", true as Any), ("selection_available", true as Any),
+            ("progress_sequence", "0" as Any), ("progress_sequence", "01" as Any),
+            ("command", "search" as Any), ("search_complete", true as Any), ("stop_reason", "user-stopped" as Any),
+            ("truncated", true as Any), ("scope", "visible" as Any), ("needle", "new" as Any)] {
+            var bad = middleWire; bad[key] = value
+            rejects("Invalid provisional authority \(key)") { _ = try progress(bad) }
+        }
+        for field in ["terminal", "selection_available", "progress_sequence"] {
+            var bad = middleWire; bad.removeValue(forKey: field)
+            rejects("Missing provisional field \(field)") { _ = try progress(bad) }
+        }
+        rejects("Duplicate progress sequence") { _ = try progress(middleWire, previous: middle) }
+        rejects("Reordered progress sequence") { _ = try progress(initialWire, previous: middle) }
+        var changedGeneration = activeWire
+        changedGeneration["query_generation"] = "8"; changedGeneration["last_attempt"] = "8"
+        rejects("Progress borrowed another attempted generation") { _ = try progress(changedGeneration, previous: middle) }
+        var regressedBytes = middleWire; regressedBytes["progress_sequence"] = "4"
+        rejects("Cumulative active-file I/O regressed") { _ = try progress(regressedBytes, previous: active) }
+        var regressedRows = initialWire; regressedRows["progress_sequence"] = "4"
+        rejects("Finalized-file matches disappeared") { _ = try progress(regressedRows, previous: middle) }
+        for (key, value) in [("witness_sha256", String(repeating: "c", count: 64)), ("source_revision", "9"),
+                            ("path", "")] {
+            var bad = activeWire, rows = bad["hits"] as! [[String: Any]]
+            if key == "path" { rows[0]["path"] = StreamFixture.path(Array("different.txt".utf8)) }
+            else { rows[0][key] = value }
+            bad["hits"] = rows
+            rejects("A published finalized prefix changed \(key)") { _ = try progress(bad, previous: middle) }
+        }
+        var changedPolicy = activeWire; changedPolicy["excluded_entries"] = "3"
+        rejects("Discovery coverage changed within one scan") { _ = try progress(changedPolicy, previous: middle) }
+        var missingPrefix = middleWire
+        missingPrefix["hits"] = Array((middleWire["hits"] as! [[String: Any]]).dropLast())
+        missingPrefix["page_count"] = "31"
+        rejects("Progress page silently shortened the required first32") { _ = try progress(missingPrefix) }
+        var terminalGeneration = stoppedWire
+        terminalGeneration["query_generation"] = "8"; terminalGeneration["last_attempt"] = "8"
+        let wrongTerminal = try terminal(terminalGeneration)
+        rejects("Final response replaced the progress generation") { try active.validateTerminal(wrongTerminal) }
+        let lessRead = try terminal(StreamProgressFixture.report(owner, 7, request, stopped: true))
+        rejects("Final response lost active-file I/O") { try active.validateTerminal(lessRead) }
+        var absentFlags = stoppedWire
+        absentFlags.removeValue(forKey: "terminal"); absentFlags.removeValue(forKey: "selection_available")
+        rejects("Progressive terminal omitted its authority boundary") { _ = try terminal(absentFlags) }
+        _ = try terminal(absentFlags, required: false) // Explicit legacy fallback only.
+        var oneFlag = absentFlags; oneFlag["terminal"] = true
+        rejects("Partial terminal metadata was treated as legacy") { _ = try terminal(oneFlag, required: false) }
+        var falseTerminal = stoppedWire; falseTerminal["terminal"] = false
+        rejects("Provisional state disguised as final command") { _ = try terminal(falseTerminal) }
+        let emptyStopped = try terminal(StreamProgressFixture.report(owner, 7, request,
+            stopped: true, count: 0, examined: 0, payload: 16_384))
+        precondition(emptyStopped.hits.isEmpty && !emptyStopped.summary.complete
+            && emptyStopped.summary.unexaminedFiles == 2,
+            "An early stop must not turn absence of finalized matches into a complete no-match result")
+    }
+
+    @MainActor private static func progressModelTests() async throws {
+        let probe = StreamProbe(), model = AtlasWorkspaceStreamModel(transport: probe.progressiveTransport, query: "old")
+        precondition(probe.transport.progressiveSearch == nil, "Legacy injected transports retain their optional boundary")
+        model.open(.init(root: StreamFixture.root, project: UUID(), browserOwner: 1, access: nil))
+        try await wait("progress catalog") { !model.busy && model.catalog?.files == 2 }
+        let scan = ObservedReaderGate(), paging = ObservedReaderGate()
+        probe.blockProgress(scan); probe.blockPage(paging); model.search()
+        try await wait("typed progress before scan completes") { scan.entered && model.progress?.sequence == 2 }
+        precondition(model.progress?.summary.retainedHits == 40 && model.progress?.page.hits.count == 32)
+        precondition(model.report == nil && !model.canSelect && !model.canReadCurrentContext && model.canStopAndKeep)
+        let cancelCalls = probe.cancelCount
+        model.stopAndKeep()
+        precondition(model.busy && model.stopping && !model.canStopAndKeep && probe.cancelCount == cancelCalls,
+            "Stop must retain the task, operation ticket, cancellation flag and atlas owner")
+        scan.release()
+        try await wait("stopped terminal still paging retained rows") { paging.entered }
+        precondition(model.busy && !model.canSelect && !model.reportAuthorized,
+            "Stopping does not authorize a first-page-only inventory")
+        paging.release()
+        try await wait("stopped inventory accepted") { !model.busy && model.reportAuthorized }
+        precondition(model.report?.hits.count == 40 && model.report?.summary.stop == "user-stopped")
+        precondition(model.report?.summary.unexaminedFiles == 1 && model.progress == nil && !model.stopping)
+        precondition(probe.stopCount == 1 && !probe.stopCanceledWork && model.canSelect)
+        let stopped = model.report!, target = stopped.target(for: stopped.hits[0])
+        model.select(target); try await wait("stopped retained literal selection") { !model.busy && model.witness != nil }
+        precondition(model.witness?.target == target && model.witness?.text == "old")
+
+        // The C scan has already returned a complete result, but metadata paging
+        // is still in flight. A late Stop request does not downgrade that result.
+        let completePaging = ObservedReaderGate(); probe.blockPage(completePaging); model.search()
+        try await wait("complete result metadata paging") { completePaging.entered }
+        model.stopAndKeep(); completePaging.release()
+        try await wait("stop raced complete scan") { !model.busy && model.reportAuthorized }
+        precondition(model.report?.summary.complete == true && model.report?.summary.stop == nil)
+
+        let obsolete = ObservedReaderGate(); probe.blockProgress(obsolete); model.search()
+        try await wait("obsolete progress accepted for display") { obsolete.entered && model.progress != nil }
+        model.queryText = "edited"
+        precondition(!model.busy && model.progress == nil && model.report == nil && model.witness == nil)
+        obsolete.release(); try await wait("edited progress scan drained") { probe.activeCount == 0 }
+        await Task.yield(); precondition(model.progress == nil && model.report == nil)
+
+        let queued = ObservedReaderGate(); probe.blockProgress(queued); model.search()
+        try await wait("bounded progressive worker") { queued.entered && model.progress != nil }
+        let before = probe.searchCount
+        model.search(); await Task.yield(); model.search(); await Task.yield()
+        queued.release()
+        try await wait("latest progressive replacement") { !model.busy && model.reportAuthorized }
+        precondition(probe.searchCount == before + 1 && probe.maximumActive == 1)
+        precondition(model.report?.summary.request.needle == "edited" && model.progress == nil)
+
+        let accepted = model.report!.summary.identity
+        probe.poisonProgress(); model.search()
+        try await wait("malformed progress aborts attempt") { !model.busy }
+        precondition(model.notice == AtlasWorkspaceStreamError.invalidResponse.message)
+        precondition(model.report?.summary.identity == accepted && !model.reportAuthorized && model.progress == nil)
+        probe.repeatGeneration(); model.search()
+        try await wait("terminal progress identity mismatch") { !model.busy }
+        precondition(model.report?.summary.identity == accepted && !model.canSelect)
+
+        let burst = ObservedReaderGate(); probe.burstNextProgress(); probe.blockProgress(burst); model.search()
+        try await wait("latest coalesced progress snapshot") { burst.entered && model.progress?.sequence == 128 }
+        precondition(model.progress?.page.hits.count == 32 && !model.canSelect)
+        burst.release(); try await wait("burst terminal publication") { !model.busy && model.reportAuthorized }
+        for _ in 0..<3 { await Task.yield() }
+        precondition(model.progress == nil && model.report?.summary.complete == true,
+            "Queued progress must never overwrite a terminal result")
+
+        let canceled = ObservedReaderGate(); probe.blockProgress(canceled); model.search()
+        try await wait("cancelable progressive scan") { canceled.entered && model.progress != nil }
+        let previousIdentity = model.report!.summary.identity
+        model.cancel(); precondition(!model.busy && model.progress == nil && !model.canSelect)
+        canceled.release(); try await wait("discarded progressive scan drains") { probe.activeCount == 0 }
+        await Task.yield()
+        precondition(model.report?.summary.identity == previousIdentity && !model.reportAuthorized)
+
+        model.open(.init(root: StreamFixture.root, project: UUID(), browserOwner: 2,
+            access: StreamGrant(probe, "progress-drain")))
+        try await wait("new progressive grant catalog") { !model.busy && model.catalog != nil }
+        let draining = ObservedReaderGate(); probe.blockProgress(draining); model.search()
+        try await wait("progress owner holds grant") { draining.entered && model.progress != nil }
+        model.close()
+        precondition(model.closed && model.progress == nil && !probe.hasReleased("progress-drain"))
+        draining.release()
+        try await wait("progress owner retirement after callback drain") {
+            probe.hasReleased("progress-drain") && probe.closedCount == probe.createCount
+        }
+        precondition(model.report == nil && model.progress == nil)
     }
 
     @MainActor private static func modelTests() async throws {

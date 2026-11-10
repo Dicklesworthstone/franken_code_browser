@@ -10,6 +10,13 @@ import Foundation
     Unmanaged<AtlasSearchCancellation>.fromOpaque(context).takeUnretainedValue().cancel()
 }
 
+private final class WorkspaceProgressCopies: @unchecked Sendable {
+    private let lock = NSLock()
+    private var received: [String] = []
+    func append(_ text: String) { lock.lock(); received.append(text); lock.unlock() }
+    var values: [String] { lock.lock(); defer { lock.unlock() }; return received }
+}
+
 @main private enum AtlasWorkspaceStreamBridgeTests {
     static func main() throws {
         reset()
@@ -91,6 +98,81 @@ import Foundation
         mode(6)
         precondition(transport.create() == 0 && !transport.cancel(owner) && !transport.close(owner))
         precondition(allocations() == frees())
-        print("Workspace stream ABI ownership and cancellation fixtures passed")
+        guard let progressive = transport.progressiveSearch else {
+            preconditionFailure("Native progressive transport is missing")
+        }
+        mode(0)
+        let copied = WorkspaceProgressCopies()
+        let stop = AtlasWorkspaceStreamStop(), active = AtlasSearchCancellation()
+        let stoppedBefore = count(12), beforeProgress = allocations()
+        let terminal = try progressive(owner, request, active, stop) { text in
+            copied.append(text); stop.requestStop()
+        }
+        precondition(terminal == expected && !active.isCanceled && stop.isRequested)
+        precondition(copied.values == ["{\"fixture\":\"workspace-progress\"}"])
+        precondition(count(12) == stoppedBefore + 1)
+        precondition(allocations() == beforeProgress + 1 && allocations() == frees())
+
+        let alreadyStopped = AtlasWorkspaceStreamStop(); alreadyStopped.requestStop()
+        let silent = WorkspaceProgressCopies(), callbacks = count(10)
+        _ = try progressive(owner, request, AtlasSearchCancellation(), alreadyStopped) { silent.append($0) }
+        precondition(silent.values.isEmpty && count(10) == callbacks && count(12) == stoppedBefore + 2)
+
+        // Malformed borrowed ranges must never reach the sink, and still drain
+        // and free the independently owned terminal response exactly once.
+        for malformed in [Int32(8), Int32(9), Int32(10), Int32(11)] {
+            mode(malformed)
+            let rejected = WorkspaceProgressCopies(), releasedBefore = frees(), canceledBefore = count(13)
+            do {
+                _ = try progressive(owner, request, AtlasSearchCancellation(), AtlasWorkspaceStreamStop()) {
+                    rejected.append($0)
+                }
+                preconditionFailure("Invalid borrowed progress bytes accepted")
+            } catch AtlasWorkspaceStreamError.invalidResponse { }
+            precondition(rejected.values.isEmpty && frees() == releasedBefore + 1)
+            precondition(count(13) == canceledBefore + 1 && allocations() == frees())
+        }
+        for invalidTerminal in [Int32(2), Int32(3)] {
+            mode(invalidTerminal)
+            let validProgress = WorkspaceProgressCopies(), releasedBefore = frees()
+            do {
+                _ = try progressive(owner, request, AtlasSearchCancellation(), AtlasWorkspaceStreamStop()) {
+                    validProgress.append($0)
+                }
+                preconditionFailure("Malformed terminal progressive response accepted")
+            } catch AtlasWorkspaceStreamError.invalidResponse { }
+            precondition(validProgress.values.count == 1 && frees() == releasedBefore + 1)
+            precondition(allocations() == frees())
+        }
+
+        // A sink can cancel while C still owns the call. Cancellation must
+        // suppress even a subsequently successful or absent terminal reply.
+        for terminalMode in [Int32(0), Int32(1)] {
+            mode(terminalMode)
+            weak var released: AtlasSearchCancellation?
+            let releasedBefore = frees(), canceledBefore = count(13)
+            do {
+                let live = AtlasSearchCancellation(); released = live
+                do {
+                    _ = try progressive(owner, request, live, AtlasWorkspaceStreamStop()) { _ in live.cancel() }
+                    preconditionFailure("Late progress cancellation accepted")
+                } catch AtlasWorkspaceStreamError.canceled { }
+            }
+            precondition(released == nil && count(13) == canceledBefore + 1)
+            precondition(frees() == releasedBefore + (terminalMode == 0 ? 1 : 0))
+            precondition(allocations() == frees())
+        }
+        mode(1)
+        let missing = try progressive(owner, request, AtlasSearchCancellation(), AtlasWorkspaceStreamStop()) { _ in }
+        precondition(missing == nil && allocations() == frees())
+        mode(0)
+        let canceledBeforeEntry = AtlasSearchCancellation(); canceledBeforeEntry.cancel()
+        let entries = count(9), progressCalls = count(10)
+        do {
+            _ = try progressive(owner, request, canceledBeforeEntry, AtlasWorkspaceStreamStop()) { _ in }
+            preconditionFailure("Canceled progressive search crossed ABI")
+        } catch AtlasWorkspaceStreamError.canceled { }
+        precondition(count(9) == entries && count(10) == progressCalls && allocations() == frees())
+        print("Workspace stream ABI ownership, progressive bytes, Stop and cancellation fixtures passed")
     }
 }

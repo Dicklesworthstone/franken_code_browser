@@ -36,11 +36,16 @@ import AppKit
                     Text("1 GiB").tag(UInt64(1024 * 1024 * 1024))
                     Text("4 GiB").tag(UInt64(4 * 1024 * 1024 * 1024))
                 }.frame(width: 200)
-                Button(model.busy && !model.opening ? "Restart search" : "Search", action: model.search)
+                Button(model.searching ? "Restart search" : "Search", action: model.search)
                     .disabled(!model.canSearch).keyboardShortcut(.defaultAction)
                 if model.busy {
                     ProgressView().controlSize(.small)
-                    Button("Cancel", action: model.cancel)
+                    if model.canStopAndKeep || model.stopping {
+                        Button(model.stopping ? "Stopping…" : "Stop and keep matches", action: model.stopAndKeep)
+                            .disabled(!model.canStopAndKeep)
+                            .help("Finish with matches from finalized file observations; omit matches in the unfinished file")
+                    }
+                    Button(model.searching ? "Cancel and discard" : "Cancel", action: model.cancel)
                 }
             }
             HStack {
@@ -54,6 +59,17 @@ import AppKit
                 Spacer()
                 Text("Up to 256 matches · literal text, not regular expressions")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+            if let progress = model.progress {
+                VStack(alignment: .leading, spacing: 4) {
+                    ProgressView(value: Double(progress.summary.examinedFiles),
+                        total: Double(max(1, progress.summary.cataloguedFiles)))
+                    Text("Examined \(progress.summary.examinedFiles) of \(progress.summary.cataloguedFiles) files · read \(progress.summary.payloadBytes) bytes in \(progress.summary.readCalls) calls")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("Matches from finalized files appear below. The unfinished file contributes byte progress; its matches remain pending.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
             }
             Divider()
             HSplitView {
@@ -81,11 +97,35 @@ import AppKit
     @ViewBuilder private var results: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text(model.report?.summary.countLabel ?? "Results").font(.subheadline.weight(.semibold))
+                Text(model.progress?.countLabel ?? model.report?.summary.countLabel ?? "Results")
+                    .font(.subheadline.weight(.semibold))
                 Spacer()
                 Button("Clear", action: model.clear).disabled(model.report == nil)
             }
-            if let report = model.report {
+            if let progress = model.progress {
+                Text("Preview while searching. Stop and keep matches, or wait for completion, to select a retained result.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if progress.page.hits.isEmpty {
+                    ContentUnavailableView("No finalized-file matches yet", systemImage: "magnifyingglass",
+                        description: Text("The search is still running. Unfinished and unexamined contents may contain matches."))
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 6) {
+                            ForEach(progress.page.hits) { hit in
+                                hitDescription(hit)
+                                    .frame(maxWidth: .infinity, alignment: .leading).padding(8)
+                                    .background(Color.secondary.opacity(0.06))
+                                    .clipShape(RoundedRectangle(cornerRadius: 5))
+                                    .accessibilityElement(children: .combine)
+                            }
+                        }
+                    }
+                    if progress.summary.retainedHits > UInt64(progress.page.hits.count) {
+                        Text("Showing the first \(progress.page.hits.count) matches. All \(progress.summary.retainedHits) retained matches become available when the scan stops.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            } else if let report = model.report {
                 if !model.reportAuthorized {
                     Text("Previous results are read-only. Search again to select or open them.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -100,16 +140,7 @@ import AppKit
                         LazyVStack(alignment: .leading, spacing: 6) {
                             ForEach(report.hits) { hit in
                                 Button { model.select(report.target(for: hit)) } label: {
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text(verbatim: hit.displayPath).lineLimit(2)
-                                            .font(.system(.body, design: .monospaced))
-                                        Text("Bytes \(hit.range.start)..<\(hit.range.end) · \(hit.encoding.label)")
-                                            .font(.caption).foregroundStyle(.secondary)
-                                        if !hit.complete {
-                                            Text("Partial file observation · \(hit.state) · \(hit.consistency)")
-                                                .font(.caption).foregroundStyle(.secondary)
-                                        }
-                                    }
+                                    hitDescription(hit)
                                     .frame(maxWidth: .infinity, alignment: .leading).padding(8)
                                     .background(model.witness?.target == report.target(for: hit)
                                         ? Color.accentColor.opacity(0.16) : Color.secondary.opacity(0.06))
@@ -124,10 +155,22 @@ import AppKit
             } else {
                 ContentUnavailableView(model.busy ? "Searching…" : "Search the project catalog",
                     systemImage: "doc.text.magnifyingglass",
-                    description: Text("Enter exact text and press Search. Results appear after the bounded scan completes."))
+                    description: Text("Enter exact text and press Search. Matching finalized files appear during the scan; stop and keep them when you have enough."))
             }
             Spacer(minLength: 0)
         }.padding(.trailing, 8)
+    }
+
+    private func hitDescription(_ hit: AtlasWorkspaceStreamHit) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(verbatim: hit.displayPath).lineLimit(2).font(.system(.body, design: .monospaced))
+            Text("Bytes \(hit.range.start)..<\(hit.range.end) · \(hit.encoding.label)")
+                .font(.caption).foregroundStyle(.secondary)
+            if !hit.complete {
+                Text("Partial file observation · \(hit.state) · \(hit.consistency)")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
     }
 
     @ViewBuilder private var selectedMatch: some View {

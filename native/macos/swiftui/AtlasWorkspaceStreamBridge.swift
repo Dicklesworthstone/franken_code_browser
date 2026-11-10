@@ -1,6 +1,8 @@
 import Foundation
 
 private typealias WorkspaceStreamPoll = @convention(c) (UnsafeMutableRawPointer?) -> Int32
+private typealias WorkspaceStreamProgress = @convention(c) (
+    UnsafePointer<UInt8>?, UInt64, UnsafeMutableRawPointer?) -> Void
 @_silgen_name("fcb_atlas_create") private func workspaceStreamCreate() -> UInt64
 @_silgen_name("fcb_atlas_open_cancelable") private func workspaceStreamOpen(
     _ owner: UInt64, _ root: UnsafePointer<CChar>?, _ maximumFiles: UInt64,
@@ -9,6 +11,11 @@ private typealias WorkspaceStreamPoll = @convention(c) (UnsafeMutableRawPointer?
     _ owner: UInt64, _ needle: UnsafePointer<CChar>?, _ maximumMatches: UInt64,
     _ maximumBytes: UInt64, _ maximumCalls: UInt64,
     _ poll: WorkspaceStreamPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_stream_search_progress") private func workspaceStreamSearchProgress(
+    _ owner: UInt64, _ needle: UnsafePointer<CChar>?, _ maximumMatches: UInt64,
+    _ maximumBytes: UInt64, _ maximumCalls: UInt64, _ poll: WorkspaceStreamPoll?,
+    _ stop: WorkspaceStreamPoll?, _ progress: WorkspaceStreamProgress?,
+    _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_stream_search_page") private func workspaceStreamPage(
     _ owner: UInt64, _ generation: UInt64, _ start: UInt64, _ count: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_stream_search_hit") private func workspaceStreamHit(
@@ -34,7 +41,10 @@ extension AtlasWorkspaceStreamTransport {
         hit: { try workspaceStreamTake(workspaceStreamHit($0, $1, $2)) },
         clear: { try workspaceStreamTake(workspaceStreamClear($0)) },
         cancel: { workspaceStreamCancel($0) != 0 }, close: { workspaceStreamClose($0) != 0 },
-        retirementFailed: { NSLog("Large-file workspace search retirement could not be confirmed") })
+        retirementFailed: { NSLog("Large-file workspace search retirement could not be confirmed") },
+        progressiveSearch: { owner, request, flag, stop, progress in
+            try workspaceStreamProgressive(owner, request, flag, stop, progress)
+        })
 }
 
 private func workspaceStreamPolling(_ flag: AtlasSearchCancellation,
@@ -59,4 +69,65 @@ private func workspaceStreamTake(_ pointer: UnsafeMutablePointer<CChar>?) throws
         throw AtlasWorkspaceStreamError.invalidResponse
     }
     return text
+}
+
+
+// This box is owned exclusively by the entered synchronous worker. The C ABI
+// does not retain it; only its two independently synchronized flags cross
+// threads. A callback copies its borrowed byte range before notifying Swift.
+private final class WorkspaceStreamProgressContext {
+    let cancellation: AtlasSearchCancellation
+    let stop: AtlasWorkspaceStreamStop
+    let progress: @Sendable (String) -> Void
+    var invalid = false
+
+    init(_ cancellation: AtlasSearchCancellation, _ stop: AtlasWorkspaceStreamStop,
+         _ progress: @escaping @Sendable (String) -> Void) {
+        self.cancellation = cancellation; self.stop = stop; self.progress = progress
+    }
+}
+
+private func workspaceStreamProgressive(_ owner: UInt64, _ request: AtlasWorkspaceStreamRequest,
+    _ flag: AtlasSearchCancellation, _ stop: AtlasWorkspaceStreamStop,
+    _ progress: @Sendable (String) -> Void) throws -> String? {
+    guard !flag.isCanceled else { throw AtlasWorkspaceStreamError.canceled }
+    // The sink's apparent escape into the context is bounded by the entered
+    // synchronous C call. Neither the box nor callback survives this scope.
+    return try withoutActuallyEscaping(progress) { sink in
+        let box = WorkspaceStreamProgressContext(flag, stop, sink)
+        let poll: WorkspaceStreamPoll = { context in
+            guard let context else { return 1 }
+            let box = Unmanaged<WorkspaceStreamProgressContext>.fromOpaque(context).takeUnretainedValue()
+            return box.invalid || box.cancellation.isCanceled ? 1 : 0
+        }
+        let stopped: WorkspaceStreamPoll = { context in
+            guard let context else { return 0 }
+            return Unmanaged<WorkspaceStreamProgressContext>.fromOpaque(context)
+                .takeUnretainedValue().stop.isRequested ? 1 : 0
+        }
+        let receive: WorkspaceStreamProgress = { bytes, length, context in
+            guard let context else { return }
+            let box = Unmanaged<WorkspaceStreamProgressContext>.fromOpaque(context).takeUnretainedValue()
+            guard !box.invalid, !box.cancellation.isCanceled else { return }
+            guard let bytes, length > 0,
+                  length <= UInt64(AtlasWorkspaceStreamLimits.responseBytes),
+                  let copied = String(data: Data(bytes: bytes, count: Int(length)), encoding: .utf8) else {
+                box.invalid = true; return
+            }
+            box.progress(copied)
+        }
+        return try withExtendedLifetime(box) {
+            let pointer = request.needle.withCString {
+                workspaceStreamSearchProgress(owner, $0, request.maximumMatches,
+                    request.maximumScanBytes, request.maximumReadCalls, poll, stopped, receive,
+                    Unmanaged.passUnretained(box).toOpaque())
+            }
+            // Even malformed progress or late cancellation must release the
+            // independently owned terminal reply exactly once.
+            let result = Result { try workspaceStreamTake(pointer) }
+            if box.invalid { throw AtlasWorkspaceStreamError.invalidResponse }
+            guard !flag.isCanceled else { throw AtlasWorkspaceStreamError.canceled }
+            return try result.get()
+        }
+    }
 }

@@ -238,9 +238,23 @@ Open the sheet, enter the literal, choose **256 MiB**, **1 GiB**, or **4 GiB** a
 the total source I/O budget, and press **Search**. There is no per-file capture
 ceiling. The scan admits at most 1,048,576 read calls and retains at most 256
 matches. It uses a 16 KiB input buffer and stores one encoded literal witness
-per matching file instead of retaining complete sources. Results appear when
-the bounded scan reaches a terminal outcome; **Cancel** and replacement searches
-revoke obsolete deliveries while entered work drains on the worker.
+per matching file instead of retaining complete sources. While the scan runs,
+the sheet shows cumulative byte/read progress and previews up to the first 32
+matches from finalized file observations. The unfinished file contributes I/O
+progress, but its tentative matches are withheld until its observation finishes.
+
+Choose **Stop and keep matches** to accept the finalized-file results immediately
+after the current scanner quantum drains. The unfinished file is abandoned and
+remains unexamined; bytes and read calls already spent remain counted. The
+accepted partial result makes all retained matches available for selection,
+copying and verified current-context reads. Preview rows become actionable only
+after that terminal result is accepted. If the search finishes before Stop is
+observed, its completed result is preserved.
+
+**Cancel and discard**, query edits and replacement searches revoke the current
+attempt's delivery while entered work drains on the worker. They do not convert
+a canceled attempt into a stopped result. Previously accepted evidence remains
+readable when retained by the surface, with obsolete actions disabled.
 
 The catalog admits at most 20,000 regular files, subject to separate path and
 discovery-page limits and the product's exclusions. Search covers this catalog
@@ -249,7 +263,7 @@ scope. **Refresh file catalog** discovers current membership again, including
 new files. Existing queries never turn newly created or uncatalogued files into
 proven no-match results. The summary separately reports incomplete discovery,
 unexamined files, unsupported text, unavailable files, failed reads, and byte,
-call or match-limit stops. Excluded entries include pruned directories; their
+call or match-limit stops, and user-requested stops. Excluded entries include pruned directories; their
 count is not an invented count of all files beneath them.
 
 Select a result to inspect its retained literal. **Copy match** copies that

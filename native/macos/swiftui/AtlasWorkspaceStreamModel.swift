@@ -131,9 +131,81 @@ private final class AtlasWorkspaceStreamSession: @unchecked Sendable {
     }
 }
 
+/// Decode on the existing worker, retain only the latest typed preview, and
+/// queue at most one main-actor delivery. A terminal seal closes this channel
+/// before paging or publishing the accepted retained inventory.
+private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
+    private let lock = NSLock()
+    private let catalog: AtlasWorkspaceStreamCatalog
+    private let request: AtlasWorkspaceStreamRequest
+    private let minimumGeneration: UInt64
+    private let cancellation: AtlasSearchCancellation
+    private let deliver: @MainActor (AtlasWorkspaceStreamProgress) -> Void
+    private var last: AtlasWorkspaceStreamProgress?
+    private var latest: AtlasWorkspaceStreamProgress?
+    private var scheduled = false
+    private var closed = false
+    private var faulted = false
+
+    init(catalog: AtlasWorkspaceStreamCatalog, request: AtlasWorkspaceStreamRequest,
+        minimumGeneration: UInt64, cancellation: AtlasSearchCancellation,
+        deliver: @escaping @MainActor (AtlasWorkspaceStreamProgress) -> Void) {
+        self.catalog = catalog; self.request = request; self.minimumGeneration = minimumGeneration
+        self.cancellation = cancellation; self.deliver = deliver
+    }
+    var hasFault: Bool { lock.lock(); defer { lock.unlock() }; return faulted }
+    func offer(_ json: String) {
+        lock.lock(); let accepts = !closed && !faulted; lock.unlock()
+        guard accepts, !cancellation.isCanceled else { return }
+        let progress: AtlasWorkspaceStreamProgress
+        do { progress = try .decode(json, catalog: catalog, request: request) }
+        catch { reject(); return }
+        lock.lock()
+        guard !closed, !faulted else { lock.unlock(); return }
+        do {
+            guard progress.summary.identity.generation > minimumGeneration else {
+                throw AtlasWorkspaceStreamError.invalidResponse
+            }
+            if let last { try progress.validate(after: last) }
+        } catch {
+            faulted = true; latest = nil; lock.unlock(); cancellation.cancel(); return
+        }
+        last = progress; latest = progress
+        let enqueue = !scheduled
+        scheduled = true; lock.unlock()
+        if enqueue { DispatchQueue.main.async { self.drain() } }
+    }
+    func seal(validating terminal: AtlasWorkspaceStreamPage) throws {
+        lock.lock(); defer { lock.unlock() }
+        closed = true; latest = nil
+        guard !faulted, terminal.summary.identity.generation > minimumGeneration else {
+            throw AtlasWorkspaceStreamError.invalidResponse
+        }
+        if let last { try last.validateTerminal(terminal) }
+    }
+    func close() {
+        lock.lock(); closed = true; latest = nil; lock.unlock()
+    }
+    private func reject() {
+        lock.lock()
+        guard !closed else { lock.unlock(); return }
+        faulted = true; latest = nil; lock.unlock()
+        cancellation.cancel()
+    }
+    @MainActor private func drain() {
+        lock.lock()
+        let value = closed || faulted ? nil : latest
+        latest = nil; scheduled = false; lock.unlock()
+        if let value { deliver(value) }
+    }
+}
+
 @Observable @MainActor final class AtlasWorkspaceStreamModel {
     private(set) var catalog: AtlasWorkspaceStreamCatalog?
     private(set) var report: AtlasWorkspaceStreamReport?
+    private(set) var progress: AtlasWorkspaceStreamProgress?
+    private(set) var searching = false
+    private(set) var stopping = false
     private(set) var witness: AtlasWorkspaceStreamWitness?
     private(set) var currentContext: AtlasObservedReaderPresentation?
     private(set) var busy = false
@@ -156,6 +228,8 @@ private final class AtlasWorkspaceStreamSession: @unchecked Sendable {
     @ObservationIgnored private var flag: AtlasSearchCancellation?
     @ObservationIgnored private var operation = UUID()
     @ObservationIgnored private var lastGeneration: UInt64 = 0
+    @ObservationIgnored private var stopFlag: AtlasWorkspaceStreamStop?
+    @ObservationIgnored private var progressMailbox: AtlasWorkspaceStreamProgressMailbox?
 
     init(transport: AtlasWorkspaceStreamTransport, query: String = "") {
         self.transport = transport; queryText = query
@@ -168,12 +242,14 @@ private final class AtlasWorkspaceStreamSession: @unchecked Sendable {
             && (try? AtlasWorkspaceStreamRequest(needle: queryText, maximumScanBytes: scanBytes)) != nil
     }
     var canRefresh: Bool { !closed && authority != nil }
+    var canStopAndKeep: Bool { !closed && busy && searching && !stopping && stopFlag != nil }
     var canSelect: Bool { !closed && !busy && reportAuthorized && session != nil && report != nil }
     var canReadCurrentContext: Bool {
         guard canSelect, let report, let witness else { return false }
         return report.admits(witness.target)
     }
     var coverage: String? {
+        if let progress { return progress.coverage }
         guard let report else { return nil }
         return (reportAuthorized ? "" : "Previous results are read-only. Search again before selecting or opening a result. ")
             + report.summary.coverage
@@ -222,18 +298,42 @@ private final class AtlasWorkspaceStreamSession: @unchecked Sendable {
         // rejected. Preserve old bytes for reading, but revoke their actions.
         revokeTargets(clearEvidence: false)
         let (ticket, flag) = begin("Searching all catalogued files, including large files…")
+        searching = true
+        let progressive = session.transport.progressiveSearch
+        let stop = progressive == nil ? nil : AtlasWorkspaceStreamStop()
+        stopFlag = stop
+        let mailbox: AtlasWorkspaceStreamProgressMailbox?
+        if progressive != nil {
+            mailbox = .init(catalog: catalog, request: request, minimumGeneration: lastGeneration,
+                cancellation: flag) { [weak self, weak session] progress in
+                guard let self, let session, self.busy, self.searching,
+                      self.accepts(ticket, flag), self.session === session, self.catalog == catalog,
+                      request == (try? AtlasWorkspaceStreamRequest(needle: self.queryText,
+                        maximumScanBytes: self.scanBytes)) else { return }
+                self.progress = progress
+                if !self.stopping { self.notice = progress.countLabel }
+            }
+        } else { mailbox = nil }
+        progressMailbox = mailbox
         task = Task {
             do {
                 let accepted = try await io.perform(cancellation: flag, keepingAlive: [session]) {
-                    var page = try AtlasWorkspaceStreamPage.decode(session.transport.search(session.handle, request, flag),
-                        catalog: catalog, root: catalog.root, request: request)
+                    defer { mailbox?.close() }
+                    let response: String?
+                    if let progressive, let stop, let mailbox {
+                        response = try progressive(session.handle, request, flag, stop) { mailbox.offer($0) }
+                    } else { response = try session.transport.search(session.handle, request, flag) }
+                    var page = try AtlasWorkspaceStreamPage.decode(response, catalog: catalog,
+                        root: catalog.root, request: request, requireTerminal: progressive != nil)
+                    try mailbox?.seal(validating: page)
                     let summary = page.summary
                     var hits = page.hits
                     while let next = page.next {
                         guard !flag.isCanceled else { throw AtlasWorkspaceStreamError.canceled }
                         page = try AtlasWorkspaceStreamPage.decode(session.transport.page(session.handle,
                             summary.identity.generation, next, AtlasWorkspaceStreamLimits.page),
-                            catalog: catalog, root: catalog.root, request: request, previous: summary, offset: next)
+                            catalog: catalog, root: catalog.root, request: request, previous: summary,
+                            offset: next, requireTerminal: progressive != nil)
                         hits.append(contentsOf: page.hits)
                     }
                     return try AtlasWorkspaceStreamReport(summary: summary, hits: hits)
@@ -245,9 +345,26 @@ private final class AtlasWorkspaceStreamSession: @unchecked Sendable {
                 }
                 lastGeneration = accepted.summary.identity.generation
                 report = accepted; witness = nil; reportAuthorized = true
-                finish(ticket); notice = accepted.summary.countLabel
-            } catch { fail(error, ticket: ticket) }
+                finish(ticket)
+                notice = accepted.summary.stop == "user-stopped"
+                    ? "Stopped and kept \(accepted.summary.retainedHits) matches from finalized file observations."
+                    : accepted.summary.countLabel
+            } catch {
+                // Project I/O correctly gives cancellation precedence. Keep an
+                // invalid callback's cause visible after using that flag to
+                // abort the foreign scan; no provisional rows gain authority.
+                if mailbox?.hasFault == true { fail(AtlasWorkspaceStreamError.invalidResponse, ticket: ticket) }
+                else { fail(error, ticket: ticket) }
+            }
         }
+    }
+
+    /// Stop preserves the current operation/generation. It neither cancels the
+    /// task nor revokes the ticket, and waits for the verified retained result.
+    func stopAndKeep() {
+        guard canStopAndKeep, let stopFlag else { return }
+        stopping = true; stopFlag.requestStop()
+        notice = "Stopping and keeping matches from finalized files… The unfinished file's matches will be omitted."
     }
 
     func select(_ target: AtlasWorkspaceStreamTarget) {
@@ -330,6 +447,8 @@ private final class AtlasWorkspaceStreamSession: @unchecked Sendable {
         return (ticket, flag)
     }
     private func cancelWork() {
+        progressMailbox?.close(); progressMailbox = nil; progress = nil
+        stopFlag = nil; searching = false; stopping = false
         operation = UUID(); flag?.cancel(); task?.cancel(); io.cancel()
         session?.cancel(); pendingSession?.cancel()
         task = nil; flag = nil; pendingSession = nil; busy = false; opening = false
@@ -339,6 +458,8 @@ private final class AtlasWorkspaceStreamSession: @unchecked Sendable {
     }
     private func finish(_ ticket: UUID) {
         guard operation == ticket else { return }
+        progressMailbox?.close(); progressMailbox = nil; progress = nil
+        stopFlag = nil; searching = false; stopping = false
         task = nil; flag = nil; pendingSession = nil; busy = false; opening = false
     }
     private func fail(_ error: Error, ticket: UUID) {
