@@ -51,12 +51,18 @@ import Dispatch
         try await scopedExpressionsKeepExactReadersAndIndependentModes()
         await expressionRecoveryCancellationAndArchiveReplacement()
         await forgedExpressionReceiptsAndLateReadersRetire()
+        try structureCoverageAndEvidenceContracts()
+        try await structuralModesKeepExactReadersAndIndependentState()
+        await structureRecoveryCancellationAndArchiveReplacement()
+        await forgedStructuralReceiptsAndLateReadersRetire()
+        try await largeStructuralTargetsRemainBounded()
+        try await structuralQueriesRemainIndependentOfSavedIndex()
         try indexReceiptsRequireArchiveCoverageAndTrustedPin()
         try await indexAttachmentPreservesQueriesAndRetainsGrants()
         await unknownIndexStateRetainsBothGrantsUntilReconciled()
         await damagedIndexKeepsAcceptedResultsAndCanDetach()
         await canceledAndClosedIndexAttachmentsDrainBeforeRelease()
-        print("Saved search, index attachment and coverage, UTF-8/UTF-16 matches, independent generations, grant lifetimes, recovery and cancellation regressions passed.")
+        print("Saved text and structural search, index attachment and coverage, UTF-8/UTF-16 captures, independent generations, grant lifetimes, bounded navigation and recovery regressions passed.")
     }
 
     private static func indexReceiptsRequireArchiveCoverageAndTrustedPin() throws {
@@ -680,5 +686,309 @@ import Dispatch
             f.calls.contains("saved-close:40") && f.calls.contains("reader-close:100")
         }
         precondition(model.expressionGeneration == nil && model.expressionPage == nil && !f.calls.contains("LIVE-OPEN"))
+    }
+
+    private static func structureCoverageAndEvidenceContracts() throws {
+        let f = SavedRepositoryFixture(searchVectors: true, headingVectors: true)
+        let path = Array("/saved/repository.fcbs".utf8)
+        let info = try AtlasSavedInfo.decode(f.encode(f.info(40)), handle: 40, expectedPath: path, fresh: true)
+        precondition(info.structureStateKnown && info.structureGeneration == nil && info.lastStructureAttempt == 0)
+        func decode(_ object: [String: Any], mode: AtlasSavedSearchMode = .symbols,
+            name: AtlasSearchNameMode = .contains, needle: String = "banana") throws -> AtlasSavedStructurePage {
+            try AtlasSavedStructurePage.decode(f.encode(object), identity: info.identity, generation: 1,
+                mode: mode, nameMode: name, needle: needle, start: 0, limit: 64)
+        }
+        let page = try decode(f.structurePage(40, generation: 1))
+        precondition(page.hits.count == 1 && page.hits[0].structure.name == "crate::banana")
+        precondition(page.hits[0].hit.start == 202 && page.hits[0].hit.end == 208)
+        precondition(page.hits[0].structure.evidenceEnd == 209 && page.unsupported == 3 && page.unavailable == 1)
+        precondition(!page.complete && !page.truncated && page.seen == 1 && page.loaded == 1 && page.searched == 1)
+        let heading = try decode(f.structurePage(40, generation: 1, mode: .headings, needle: "Café"),
+            mode: .headings, needle: "Café")
+        precondition(heading.hits[0].structure.headingSlug == "caf-details" && heading.hits[0].hit.start == 207)
+        let occurrences = try decode(f.structurePage(40, generation: 1, mode: .occurrences,
+            nameMode: .exact, needle: f.occurrenceNeedle), mode: .occurrences, name: .exact, needle: f.occurrenceNeedle)
+        precondition(occurrences.hits.map(\.hit.start) == [0, 2] && occurrences.hits.map(\.hit.end) == [208, 416])
+
+        var truncated = f.structurePage(40, generation: 1)
+        truncated["state"] = "truncated"; truncated["truncated"] = true; truncated["matches_seen"] = "2"
+        let capped = try decode(truncated)
+        precondition(capped.truncated)
+        var omitted = f.structurePage(40, generation: 1)
+        omitted["metadata_omitted"] = "1"; omitted["matches_seen"] = "2"
+        let boundedMetadata = try decode(omitted)
+        precondition(boundedMetadata.metadataOmitted == 1)
+        var zero = f.structurePage(40, generation: 1)
+        zero["state"] = "work-limit"; zero["max_source_bytes"] = "0"
+        zero["members_visited"] = "2"; zero["unsupported_files"] = "1"; zero["unavailable_files"] = "0"
+        zero["members_loaded"] = "0"; zero["files_searched"] = "0"
+        for field in ["loaded_bytes", "peak_source_bytes", "metadata_bytes", "member_bytes_read", "member_read_calls",
+                      "retained_hits", "matches_seen"] { zero[field] = "0" }
+        zero["hits"] = [[String: Any]]()
+        let empty = try decode(zero)
+        precondition(empty.hits.isEmpty && empty.sourceBytes == 0 && !empty.complete && empty.state == "work-limit")
+
+        for field in ["selection_namespace", "structure_generation", "mode", "requested_mode", "realized_mode",
+                      "evidence_level", "semantic_complete", "name_case", "name_mode", "scope", "completeness_basis",
+                      "index_policy", "complete", "matches_seen_exact", "members_visited", "members_loaded",
+                      "files_searched", "loaded_bytes", "metadata_bytes", "peak_source_bytes",
+                      "retained_source_payload_bytes", "next_offset", "member_read_calls"] {
+            var bad = f.structurePage(40, generation: 1)
+            switch field {
+            case "selection_namespace": bad[field] = "saved-expression"
+            case "structure_generation": bad[field] = "2"
+            case "mode": bad[field] = "markdown-heading"
+            case "requested_mode": bad[field] = "literal"
+            case "realized_mode", "evidence_level": bad[field] = "compiler-resolved"
+            case "semantic_complete", "complete", "matches_seen_exact": bad[field] = true
+            case "name_case": bad[field] = "insensitive"
+            case "name_mode": bad[field] = "prefix"
+            case "scope": bad[field] = "live-project"
+            case "completeness_basis": bad[field] = "semantic-completeness"
+            case "index_policy": bad[field] = "live-index"
+            case "members_visited": bad[field] = "6"
+            case "members_loaded": bad[field] = "5"
+            case "files_searched": bad[field] = "2"
+            case "loaded_bytes": bad[field] = "67108865"
+            case "metadata_bytes": bad[field] = "8388609"
+            case "peak_source_bytes": bad[field] = "65537"
+            case "retained_source_payload_bytes": bad[field] = "1"
+            case "member_read_calls": bad[field] = "01"
+            default: bad.removeValue(forKey: field)
+            }
+            rejected("forged structural coverage accepted: \(field)") { _ = try decode(bad) }
+        }
+        for field in ["candidate_id", "heading_slug", "evidence_level", "evidence_range", "name"] {
+            var bad = f.structurePage(40, generation: 1)
+            var hits = bad["hits"] as! [[String: Any]], witness = hits[0]["structure"] as! [String: Any]
+            switch field {
+            case "candidate_id": witness[field] = "0"
+            case "heading_slug": witness[field] = "foreign-heading"
+            case "evidence_level": witness[field] = "whole-token-text-candidate"
+            case "evidence_range": witness[field] = ["start": "203", "end": "208"]
+            default: witness[field] = String(repeating: "x", count: 4097)
+            }
+            hits[0]["structure"] = witness; bad["hits"] = hits
+            rejected("forged structural witness accepted: \(field)") { _ = try decode(bad) }
+        }
+        var wrongPolicy = f.structurePage(40, generation: 1, mode: .occurrences, nameMode: .exact, needle: f.occurrenceNeedle)
+        wrongPolicy["compiler_resolved"] = true
+        rejected("occurrences became compiler references") {
+            _ = try decode(wrongPolicy, mode: .occurrences, name: .exact, needle: f.occurrenceNeedle)
+        }
+        var tooMany = f.structurePage(40, generation: 1)
+        tooMany["hits"] = Array(repeating: f.structureHitObject(1, mode: .symbols, needle: "banana"), count: 129)
+        rejected("oversized structural page accepted") { _ = try decode(tooMany) }
+        var normalized = f.structurePage(40, generation: 1, mode: .headings, needle: "Café")
+        normalized["needle"] = "Cafe\u{301}"
+        rejected("Unicode equivalence rebound structural query bytes") { _ = try decode(normalized, mode: .headings, needle: "Café") }
+
+        var clear = f.header(40, "structure-clear")
+        clear["selection_namespace"] = "saved-structure"; clear["structure_generation"] = "2"
+        clear["accepted_structure_generation"] = NSNull(); clear["retained_hits"] = "0"
+        try AtlasSavedStructurePage.decodeClear(f.encode(clear), identity: info.identity, generation: 2)
+        rejected("foreign structural clear attempt accepted") {
+            try AtlasSavedStructurePage.decodeClear(f.encode(clear), identity: info.identity, generation: 3)
+        }
+        clear.removeValue(forKey: "accepted_structure_generation")
+        rejected("omitted structural authority became an accepted clear") {
+            try AtlasSavedStructurePage.decodeClear(f.encode(clear), identity: info.identity, generation: 2)
+        }
+        var legacy = f.info(40)
+        legacy.removeValue(forKey: "accepted_structure_generation"); legacy.removeValue(forKey: "last_structure_attempt")
+        let old = try AtlasSavedInfo.decode(f.encode(legacy), handle: 40, expectedPath: path)
+        precondition(!old.structureStateKnown && old.structureGeneration == nil)
+        legacy["accepted_structure_generation"] = NSNull()
+        rejected("half-present structural recovery state was accepted") {
+            _ = try AtlasSavedInfo.decode(f.encode(legacy), handle: 40, expectedPath: path)
+        }
+        rejected("accepted structural state exceeded its attempted generation") {
+            _ = try AtlasSavedInfo.decode(f.encode(f.info(40, structure: 2, structureAttempt: 1)), handle: 40, expectedPath: path)
+        }
+    }
+
+    @MainActor private static func preparedStructure(_ f: SavedRepositoryFixture,
+        mode: AtlasSavedSearchMode = .headings, needle: String = "Café") async -> AtlasSavedRepositoryModel {
+        let model = AtlasSavedRepositoryModel(transport: f.savedTransport)
+        model.open(path: "/saved/repository.fcbs", accessLease: nil)
+        await wait("structural archive did not open") { !model.busy }
+        model.searchMode = mode; model.searchInput = needle; model.search()
+        await wait("structural query did not finish") { !model.busy }
+        precondition(model.structureGeneration == 1 && model.structurePage?.hits.isEmpty == false)
+        return model
+    }
+
+    @MainActor private static func structuralModesKeepExactReadersAndIndependentState() async throws {
+        let f = SavedRepositoryFixture(searchVectors: true, headingVectors: true)
+        let model = await preparedExpression(f), literal = model.searchPage!, expression = model.expressionPage!
+        model.searchMode = .symbols; model.searchNameMode = .exact; model.searchInput = "crate::banana"; model.search()
+        await wait("symbol query did not finish") { !model.busy }
+        let symbols = model.structurePage!
+        precondition(symbols.generation == 1 && symbols.nameMode == .exact && model.structureIsCurrent)
+        await refused("structural mode authorized a literal row with equal numeric identities") {
+            _ = try await model.openHit(literal.hits[0], from: literal, readerTransport: f.readerTransport())
+        }
+        await refused("structural mode authorized an expression row with equal numeric identities") {
+            _ = try await model.openExpressionHit(expression.hits[0], from: expression, readerTransport: f.readerTransport())
+        }
+        let symbolReader = try await model.openStructureHit(symbols.hits[0], from: symbols, readerTransport: f.readerTransport())
+        precondition(symbolReader.match?.originalHex == "62616e616e61", "qualified names were incorrectly treated as literal source spelling")
+        precondition(symbolReader.match?.start == 202 && symbolReader.match?.end == 208)
+        model.searchNameMode = .prefix
+        precondition(!model.structureIsCurrent)
+        await refused("editing name matching left structural rows actionable") {
+            _ = try await model.openStructureHit(symbols.hits[0], from: symbols, readerTransport: f.readerTransport())
+        }
+        model.searchMode = .headings; model.searchNameMode = .contains; model.searchInput = "Café"
+        await refused("a heading draft authorized stale symbol results") {
+            _ = try await model.openStructureHit(symbols.hits[0], from: symbols, readerTransport: f.readerTransport())
+        }
+        model.search(); await wait("heading query did not finish") { !model.busy }
+        let headings = model.structurePage!
+        precondition(headings.generation == 2 && headings.hits[0].structure.headingSlug == "caf-details")
+        let headingReader = try await model.openStructureHit(headings.hits[0], from: headings, readerTransport: f.readerTransport())
+        precondition(headingReader.match?.start == 207 && headingReader.match?.end == 223)
+        precondition(headingReader.match?.originalHex == f.hex(f.headingBytes[207..<223]))
+        precondition(headingReader.reader.page?.start == 75)
+
+        model.searchMode = .occurrences; model.searchNameMode = .prefix; model.searchInput = f.occurrenceNeedle; model.search()
+        await wait("identifier occurrences did not finish") { !model.busy }
+        let occurrences = model.structurePage!
+        precondition(occurrences.generation == 3 && occurrences.nameMode == .exact && model.structureIsCurrent)
+        let utf16 = try await model.openStructureHit(occurrences.hits[1], from: occurrences, readerTransport: f.readerTransport())
+        precondition(utf16.match?.start == 2 && utf16.match?.end == 416 && utf16.reader.page?.identity.encoding == "utf16le")
+        precondition(utf16.match?.originalHex == f.hex(f.searchUTF16[2..<416]))
+        let reads = f.calls.filter { $0.hasPrefix("structure:") }.count
+        model.loadStructureResults(start: 1, from: occurrences)
+        await wait("structural metadata pagination did not finish") { !model.busy }
+        precondition(model.structurePage?.hits.map(\.id) == [2])
+        precondition(f.calls.filter { $0.hasPrefix("structure:") }.count == reads)
+        await refused("an older structural page remained actionable after pagination") {
+            _ = try await model.openStructureHit(occurrences.hits[0], from: occurrences, readerTransport: f.readerTransport())
+        }
+        model.clearSearch(); await wait("structural clear did not finish") { !model.busy }
+        precondition(model.structurePage == nil && model.structureGeneration == nil)
+        precondition(model.queryGeneration == 1 && model.expressionGeneration == 1 && model.relationshipGeneration == 1)
+        model.closeArchive()
+        precondition(symbolReader.canUseMatch && headingReader.canUseMatch && utf16.canUseMatch)
+        utf16.reader.offsetInput = "406"; utf16.reader.goToByte()
+        await wait("structural reader did not survive archive close") { !utf16.reader.busy }
+        precondition(utf16.reader.page?.originalHex == f.hex(f.searchUTF16[406...]) && !f.calls.contains("LIVE-OPEN"))
+        symbolReader.reader.close(); headingReader.reader.close(); utf16.reader.close(); model.close()
+    }
+
+    @MainActor private static func structureRecoveryCancellationAndArchiveReplacement() async {
+        let f = SavedRepositoryFixture(searchVectors: true, headingVectors: true)
+        let model = await preparedStructure(f), accepted = model.structurePage!
+        model.searchMode = .occurrences; model.searchInput = "invalid token"; f.corruptNext("structure"); model.search()
+        await wait("structural refusal did not recover") { !model.busy }
+        precondition(model.structureGeneration == 1 && model.structurePage?.mode == .headings && !model.structureIsCurrent)
+        precondition(model.info?.lastStructureAttempt == 2 && model.notice.contains("REFERENCE_INVALID_NAME"))
+        model.searchMode = .headings; model.searchInput = accepted.needle; f.corruptNext("structure-lost"); model.search()
+        await wait("lost structural acceptance did not recover") { !model.busy }
+        precondition(model.structureGeneration == 3 && model.structureIsCurrent)
+        precondition(f.calls.filter { $0.hasPrefix("structure:40:3:") }.count == 1)
+        precondition(f.calls.contains("structure-results:40:3:0"))
+        f.corruptNext("structure"); f.blockNextSearch(); model.search()
+        await wait("structural scan did not enter worker") { f.entered.wait(timeout: .now()) == .success }
+        model.cancel(); precondition(model.busy && model.structureGeneration == 3)
+        f.resume.signal(); await wait("canceled structural scan did not drain") { !model.busy }
+        precondition(model.structureGeneration == 3 && model.info?.lastStructureAttempt == 4)
+        f.corruptNext("structure-clear-lost"); model.clearSearch()
+        await wait("lost structural clear did not reconcile") { !model.busy }
+        precondition(model.structurePage == nil && model.structureGeneration == nil && model.info?.lastStructureAttempt == 5)
+        precondition(f.calls.filter { $0 == "structure-clear:40:5" }.count == 1)
+        model.searchInput = accepted.needle; model.search()
+        await wait("structural query after clear did not finish") { !model.busy }
+        precondition(model.structureGeneration == 6)
+        let old = model.structurePage!
+        model.open(path: "/saved/equal-archive.fcbs", accessLease: nil)
+        await wait("replacement structural archive did not open") { !model.busy }
+        precondition(model.structurePage == nil && model.structureGeneration == nil)
+        model.searchInput = accepted.needle; model.search()
+        await wait("new archive structural query did not finish") { !model.busy }
+        precondition(model.structureGeneration == 1 && model.info?.identity.owner == 41)
+        await refused("same-digest archive replacement rebound an old structural result") {
+            _ = try await model.openStructureHit(old.hits[0], from: old, readerTransport: f.readerTransport())
+        }
+        precondition(!f.calls.contains(where: { $0.hasPrefix("reader-create:") }))
+        model.close()
+    }
+
+    @MainActor private static func forgedStructuralReceiptsAndLateReadersRetire() async {
+        for fault in ["structure-namespace", "structure-generation", "structure-mode", "structure-name-mode",
+                      "structure-needle", "structure-witness", "structure-selection", "hit-id", "hit-domain", "hit-range",
+                      "hit-hex", "digest", "live", "page-bytes", "lost"] {
+            let f = SavedRepositoryFixture(headingVectors: true), model = await preparedStructure(f), page = model.structurePage!
+            f.corruptNext(fault)
+            await refused("forged structural receipt published a reader: \(fault)") {
+                _ = try await model.openStructureHit(page.hits[0], from: page, readerTransport: f.readerTransport())
+            }
+            await wait("rejected structural destination did not retire: \(fault)") { f.calls.contains("reader-close:100") }
+            precondition(model.structureGeneration == 1 && !f.calls.contains("LIVE-OPEN"))
+            precondition(f.calls.filter { $0 == "structure-open:40:1:1" }.count == 1)
+            model.close()
+        }
+        let f = SavedRepositoryFixture(headingVectors: true), model = await preparedStructure(f), page = model.structurePage!
+        f.blockNextHandoff()
+        let pending = Task { try await model.openStructureHit(page.hits[0], from: page, readerTransport: f.readerTransport()) }
+        await wait("structural reader did not enter") { f.entered.wait(timeout: .now()) == .success }
+        model.close(); precondition(!f.calls.contains("saved-close:40"))
+        f.resume.signal()
+        await refused("late structural reader appeared after archive close") { _ = try await pending.value }
+        await wait("late structural reader and archive did not retire") {
+            f.calls.contains("saved-close:40") && f.calls.contains("reader-close:100")
+        }
+        precondition(model.structurePage == nil && !f.calls.contains("LIVE-OPEN"))
+    }
+
+    @MainActor private static func largeStructuralTargetsRemainBounded() async throws {
+        let f = SavedRepositoryFixture(headingVectors: true, longHeading: true)
+        let model = await preparedStructure(f, needle: "A"), page = model.structurePage!
+        precondition(page.hits[0].hit.start == 0 && page.hits[0].hit.end == 3003)
+        let capture = try await model.openStructureHit(page.hits[0], from: page, readerTransport: f.readerTransport())
+        precondition(capture.match == nil && capture.reader.page?.end == 3004)
+        precondition(capture.reader.canPin)
+        f.corruptNext("structure-large-hex")
+        await refused("large structural target invented a full selection witness") {
+            _ = try await model.openStructureHit(page.hits[0], from: page, readerTransport: f.readerTransport())
+        }
+        await wait("invalid large-target destination did not retire") { f.calls.contains("reader-close:101") }
+        model.closeArchive(); precondition(capture.reader.canPin)
+        capture.reader.offsetInput = "2048"; capture.reader.goToByte()
+        await wait("large structural reader did not navigate after archive close") { !capture.reader.busy }
+        precondition(capture.reader.page?.start == 2048 && !f.calls.contains("LIVE-OPEN"))
+        capture.reader.close(); model.close()
+    }
+
+    @MainActor private static func structuralQueriesRemainIndependentOfSavedIndex() async throws {
+        let f = SavedRepositoryFixture(searchVectors: true, headingVectors: true)
+        let model = await preparedStructure(f), initial = model.structurePage!
+        model.attachIndex(path: "/saved/first.fcbd", pin: String(repeating: "a", count: 64), accessLease: nil)
+        await wait("index did not attach alongside structural query") { !model.busy }
+        precondition(model.index?.generation == 1 && model.structureGeneration == initial.generation)
+        model.searchMode = .occurrences; model.searchInput = f.occurrenceNeedle; model.search()
+        await wait("structural extraction with attached index did not finish") { !model.busy }
+        precondition(model.structureGeneration == 2 && model.structurePage?.mode == .occurrences && model.index?.generation == 1)
+
+        f.corruptNext("index-unknown")
+        model.attachIndex(path: "/saved/replacement.fcbd", pin: String(repeating: "b", count: 64), accessLease: nil)
+        await wait("unconfirmed index replacement did not finish") { !model.busy }
+        precondition(!model.indexStateKnown)
+        model.searchMode = .literal
+        precondition(!model.canSearch)
+        model.searchMode = .headings; model.searchInput = "Café"
+        precondition(model.canSearch, "independent structural extraction waited for a literal-only index")
+        model.search(); await wait("structural query was blocked by uncertain index state") { !model.busy }
+        precondition(model.structureGeneration == 3 && model.structureIsCurrent && !model.indexStateKnown)
+        model.reloadIndex(); await wait("index status did not reconcile alongside structural results") { !model.busy }
+        precondition(model.index?.generation == 2 && model.indexStateKnown && model.structureGeneration == 3)
+        model.detachIndex(); await wait("index detach did not finish") { !model.busy }
+        precondition(model.index == nil && model.structureGeneration == 3 && model.structureIsCurrent)
+        let page = model.structurePage!
+        let reader = try await model.openStructureHit(page.hits[0], from: page, readerTransport: f.readerTransport())
+        precondition(reader.match?.start == 207 && reader.match?.end == 223)
+        precondition(!f.calls.contains("LIVE-OPEN") && !f.calls.contains(where: { $0.hasPrefix("search:") }))
+        model.close(); reader.reader.close()
     }
 }

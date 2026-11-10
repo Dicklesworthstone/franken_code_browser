@@ -42,7 +42,7 @@ final class AtlasSavedFileAccess {
     @State private var panelNotice = ""
     @State private var section: Section = .text
     private enum Section: String, CaseIterable, Identifiable {
-        case text = "Text search", links = "Documentation links"
+        case text = "Search", links = "Documentation links"
         var id: String { rawValue }
     }
     @State private var readerCapture: AtlasSavedReaderCapture?
@@ -77,7 +77,7 @@ final class AtlasSavedFileAccess {
                 VStack(spacing: 14) {
                     Image(systemName: "archivebox").font(.system(size: 42)).foregroundStyle(.secondary)
                     Text("Save and read a repository").font(.title2.weight(.semibold))
-                    Text("Choose an FCBS archive to search its captured text, read source and Markdown, and follow documentation links and backlinks.")
+                    Text("Choose an FCBS archive to search captured text, symbols, headings and identifier occurrences, read source and Markdown, and follow documentation links.")
                         .multilineTextAlignment(.center).frame(maxWidth: 540)
                     Button("Open saved repository…", action: chooseArchive).disabled(!model.canOperate)
                     Text("The archive is read only. Unavailable members remain visible, with their omission reason.")
@@ -162,7 +162,9 @@ final class AtlasSavedFileAccess {
             Text(section == .text
                 ? (model.searchMode == .literal
                     ? "Literal search is case sensitive and does not interpret query syntax or normalize Unicode. Member names never open working-tree paths."
-                    : "Expression terms are exact and case sensitive. Required/excluded terms apply across each complete captured member; results identify primary-term occurrences. Member names never open working-tree paths.")
+                    : (model.searchMode == .expression
+                        ? "Expression terms are exact and case sensitive. Required/excluded terms apply across each complete captured member; results identify primary-term occurrences. Member names never open working-tree paths."
+                        : "Structural results retain the shared extractor's evidence level and original source coordinates. All searches use this saved archive; member names never open working-tree paths."))
                 : "Documentation evidence is the original captured document. Qualified Markdown headings open their captured source range; unresolved destinations show why. Member names never open working-tree paths.")
                 .font(.caption2).foregroundStyle(.secondary)
         }.frame(maxWidth: .infinity, alignment: .leading)
@@ -239,7 +241,9 @@ final class AtlasSavedFileAccess {
             Picker("Saved search mode", selection: $model.searchMode) {
                 ForEach(AtlasSavedSearchMode.allCases) { mode in Text(mode.label).tag(mode) }
             }.pickerStyle(.segmented).disabled(!model.canOperate).padding(.leading, 8)
-            if model.searchMode == .literal { literalSearchPane } else { expressionSearchPane }
+            if model.searchMode == .literal { literalSearchPane }
+            else if model.searchMode == .expression { expressionSearchPane }
+            else { structureSearchPane }
         }
     }
     private var literalSearchPane: some View {
@@ -449,6 +453,137 @@ final class AtlasSavedFileAccess {
                 }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 12)
             }
         }.padding(.leading, 8)
+    }
+    private var structureSearchPane: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                TextField(model.searchMode == .headings ? "Heading title in captured Markdown" : "Name in captured source",
+                    text: $model.searchInput)
+                    .textFieldStyle(.roundedBorder).onSubmit { panelNotice = ""; model.search() }
+                    .accessibilityLabel("\(model.searchMode.label) search across the saved archive")
+                Button { panelNotice = ""; model.search() } label: { Label("Search archive", systemImage: "magnifyingglass") }
+                    .disabled(!model.canOperate || !model.validSearchInput)
+                Button("Clear") { panelNotice = ""; model.clearSearch() }
+                    .disabled(!model.canOperate || (model.structurePage == nil && model.searchInput.isEmpty))
+            }
+            HStack {
+                if model.searchMode.supportsNameMatching {
+                    Picker("Name matching", selection: $model.searchNameMode) {
+                        ForEach(AtlasSearchNameMode.allCases) { Text($0.label).tag($0) }
+                    }.frame(maxWidth: 270).disabled(!model.canOperate)
+                } else { Text("One exact identifier token").font(.caption) }
+                Spacer()
+                Text("Case sensitive · entire saved archive").font(.caption).foregroundStyle(.secondary)
+                Button("Reload results") { panelNotice = ""; model.reloadSearchResults() }
+                    .controlSize(.small).disabled(!model.canOperate)
+            }
+            Text(structureExplanation).font(.caption).foregroundStyle(.secondary)
+            if !model.searchInput.isEmpty && !model.validSearchInput {
+                Text("Enter 1–1024 UTF-8 bytes without NUL. Occurrences require one identifier token.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            if let page = model.structurePage {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Accepted \(page.mode.label.lowercased()) query · \(page.nameMode.label.lowercased())")
+                        .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Text(page.needle).font(.body.monospaced()).lineLimit(3).textSelection(.enabled)
+                    if !model.structureIsCurrent {
+                        HStack {
+                            Text("The draft, mode or name matching differs from these results. Submit it or restore the accepted query to open a result.")
+                                .font(.caption).foregroundStyle(.orange)
+                            Spacer()
+                            Button("Use accepted query") {
+                                model.searchMode = page.mode; model.searchNameMode = page.nameMode
+                                model.searchInput = page.needle; panelNotice = ""
+                            }.controlSize(.small).disabled(!model.canOperate)
+                        }
+                    }
+                }
+                structureCoverage(page)
+                Divider()
+                if page.hits.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("No retained \(page.mode.structure?.resultLabel ?? "results").").font(.headline)
+                        Text(page.complete ? "The accepted extractor found no matching results at its stated evidence level."
+                            : "Coverage is partial. Empty results do not establish that the name is absent from the repository.")
+                            .foregroundStyle(.secondary)
+                    }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 10)
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 8) {
+                            ForEach(page.hits) { item in
+                                HStack(alignment: .top, spacing: 10) {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(item.structure.name).font(.callout.monospaced().weight(.semibold))
+                                            .lineLimit(2).textSelection(.enabled)
+                                        Text(item.hit.path.display).font(.caption).lineLimit(2).textSelection(.enabled)
+                                        Text(item.structure.label).font(.caption).foregroundStyle(.secondary)
+                                        Text("Original bytes \(item.hit.start)..<\(item.hit.end)")
+                                            .font(.caption2).foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Button("Read source") { openStructureHit(item, from: page) }
+                                        .disabled(!model.canOperate || !model.structureIsCurrent || readerTask != nil)
+                                }.padding(10).frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Color.primary.opacity(0.035)).clipShape(RoundedRectangle(cornerRadius: 7))
+                            }
+                        }
+                    }.id("saved-structure:\(page.identity.owner):\(page.generation)").frame(maxHeight: .infinity)
+                }
+                HStack {
+                    Button("Previous results") { model.loadStructureResults(start: page.start >= 64 ? page.start - 64 : 0, from: page) }
+                        .disabled(!model.canOperate || !model.structureIsCurrent || page.start == 0)
+                    Spacer()
+                    Text("\(page.start)..<\(page.start + UInt64(page.hits.count)) of \(page.retained) retained")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Next results") { if let next = page.next { model.loadStructureResults(start: next, from: page) } }
+                        .disabled(!model.canOperate || !model.structureIsCurrent || page.next == nil)
+                }.controlSize(.small)
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(model.busy ? "Waiting for saved archive work…" : "Navigate the structure of your saved repository.").font(.headline)
+                    Text("Search symbols, Markdown heading titles or exact identifier tokens. Open a result to read its verified captured source; that reader remains available after the archive closes.")
+                    Text("Up to 4,096 results and 64 MiB of aggregate source reads. Per-member limits: symbols 64 KiB, headings 256 KiB, occurrences 512 KiB. Coverage counts expose omitted and unsupported members.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 12)
+            }
+        }.padding(.leading, 8)
+    }
+    private var structureExplanation: String {
+        switch model.searchMode {
+        case .symbols:
+            return "Heuristic declarations from Rust, Python, JavaScript, TypeScript, Go and C/C++. Qualified names use the shared outline engine; results do not claim compiler resolution."
+        case .headings:
+            return "Markdown titles and duplicate-aware slugs come from FrankenMarkdown. Only qualified original source ranges can open a result."
+        case .occurrences:
+            return "Whole-token text occurrences include comments and string literals. These are spelling matches; they do not establish a semantic reference or call graph."
+        case .literal, .expression: return ""
+        }
+    }
+    private func structureCoverage(_ page: AtlasSavedStructurePage) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label(page.complete ? "Complete extraction processing" : "Partial extraction coverage",
+                systemImage: page.complete ? "checkmark.circle" : "exclamationmark.circle")
+                .font(.caption.weight(.semibold)).foregroundStyle(page.complete ? Color.secondary : Color.orange)
+            Text("\(page.retained) results retained · \(page.visited) / \(page.identity.members) members visited · \(page.searched) extracted")
+                .font(.caption)
+            Text("Unavailable: \(page.unavailable) · Unsupported language or decoding: \(page.unsupported) · Source size limit: \(page.sourceLimited)")
+                .font(.caption).foregroundStyle(.secondary)
+            Text("Extractor limits: \(page.extractionLimited) · Metadata omitted: \(page.metadataOmitted) · \(page.sourceBytes) / \(page.sourceLimit) source bytes read")
+                .font(.caption).foregroundStyle(.secondary)
+            if page.state == "work-limit" {
+                Text("The aggregate source budget stopped extraction. Earlier results remain valid; later members were not examined.")
+                    .font(.caption).foregroundStyle(.orange)
+            } else if page.truncated {
+                Text("At least \(page.seen) matches were seen. The retained-result limit stopped extraction.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            if !page.identity.discoveryComplete {
+                Text("Archive discovery was incomplete. Files outside its manifest have no search coverage.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+        }
     }
     private func expressionCoverage(_ page: AtlasSavedExpressionPage) -> some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -708,6 +843,12 @@ final class AtlasSavedFileAccess {
                 search: .native, outline: .native, document: .native)
         }
     }
+    private func openStructureHit(_ item: AtlasSavedStructureHit, from page: AtlasSavedStructurePage) {
+        launchReader {
+            try await model.openStructureHit(item, from: page, readerTransport: .native,
+                search: .native, outline: .native, document: .native)
+        }
+    }
     private func openExpressionHit(_ hit: AtlasSavedHit, from page: AtlasSavedExpressionPage) {
         launchReader {
             try await model.openExpressionHit(hit, from: page, readerTransport: .native,
@@ -757,6 +898,17 @@ final class AtlasSavedFileAccess {
                 Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
             }.controlSize(.small).padding(.horizontal, 12).padding(.top, 12)
             if let match = capture.match { savedMatchActions(match) }
+            else if case .structureHit(_, _, _, _, let item) = capture.origin {
+                HStack {
+                    Text("This result spans more than the bounded selection witness. The reader starts near its original source range.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Return to result") {
+                        capture.reader.offsetInput = String(item.hit.start > 132 ? item.hit.start - 132 : 0)
+                        capture.reader.goToByte()
+                    }.disabled(!capture.reader.canPin)
+                }.controlSize(.small).padding(.horizontal, 12)
+            }
             HSplitView {
                 AtlasPagedSourceView(model: capture.reader, canPin: pins.canAdd, pin: { reader in
                     pins.pin(reader, root: pinGroup, label: capture.member.path.display)
@@ -785,6 +937,9 @@ final class AtlasSavedFileAccess {
             } else if case .expressionHit(_, let expression, let primary, _) = capture.origin {
                 Text("Saved expression: \(expression)").font(.callout.monospaced()).lineLimit(2).textSelection(.enabled)
                 Text("Primary occurrence: \(primary)").font(.caption.monospaced()).lineLimit(2).textSelection(.enabled)
+            } else if case .structureHit(_, _, _, _, let item) = capture.origin {
+                Text(item.structure.name).font(.callout.monospaced()).lineLimit(2).textSelection(.enabled)
+                Text(item.structure.label).font(.caption).foregroundStyle(.secondary)
             }
             HStack {
                 Text("Exact saved match · \(match.end - match.start) original bytes")

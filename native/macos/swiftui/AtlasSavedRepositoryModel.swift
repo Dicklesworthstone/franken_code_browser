@@ -85,6 +85,8 @@ private final class AtlasSavedSession: @unchecked Sendable {
     private(set) var queryGeneration: UInt64?
     private(set) var expressionPage: AtlasSavedExpressionPage?
     private(set) var expressionGeneration: UInt64?
+    private(set) var structurePage: AtlasSavedStructurePage?
+    private(set) var structureGeneration: UInt64?
     private(set) var indexStateKnown = true
     private(set) var indexPath: String?
     private(set) var busy = false
@@ -93,6 +95,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     var memberOffsetInput = "0"
     var searchInput = ""
     var searchMode: AtlasSavedSearchMode = .literal
+    var searchNameMode: AtlasSearchNameMode = .contains
     var indexPinInput = ""
     @ObservationIgnored private let transport: AtlasSavedTransport
     @ObservationIgnored private let io = AtlasProjectIO()
@@ -103,6 +106,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     @ObservationIgnored private var lastRelationshipAttempt: UInt64 = 0
     @ObservationIgnored private var lastQueryAttempt: UInt64 = 0
     @ObservationIgnored private var lastExpressionAttempt: UInt64 = 0
+    @ObservationIgnored private var lastStructureAttempt: UInt64 = 0
     @ObservationIgnored private var lastIndexAttempt: UInt64 = 0
 
     init(transport: AtlasSavedTransport) { self.transport = transport }
@@ -111,7 +115,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     var validSearchInput: Bool { AtlasSavedSearchWire.validNeedle(searchInput) }
     var index: AtlasSavedIndex? { info?.index }
     var canChangeIndex: Bool { canOperate && info != nil && indexStateKnown }
-    var canSearch: Bool { canOperate && (searchMode == .expression || indexStateKnown) }
+    var canSearch: Bool { canOperate && (searchMode != .literal || indexStateKnown) }
     var searchIsCurrent: Bool {
         guard searchMode == .literal, let searchPage, info?.identity == searchPage.identity,
               queryGeneration == searchPage.generation else { return false }
@@ -121,6 +125,13 @@ private final class AtlasSavedSession: @unchecked Sendable {
         guard searchMode == .expression, let expressionPage, info?.identity == expressionPage.identity,
               expressionGeneration == expressionPage.generation else { return false }
         return searchInput.utf8.elementsEqual(expressionPage.expression.utf8)
+    }
+
+    var structureIsCurrent: Bool {
+        guard let structurePage, searchMode == structurePage.mode,
+              searchMode.effectiveNameMode(searchNameMode) == structurePage.nameMode,
+              info?.identity == structurePage.identity, structureGeneration == structurePage.generation else { return false }
+        return searchInput.utf8.elementsEqual(structurePage.needle.utf8)
     }
 
     func open(path: String, accessLease: AnyObject?, expectedDigest: String? = nil) {
@@ -158,6 +169,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 model.lastRelationshipAttempt = 0; model.memberOffsetInput = "0"
                 model.searchPage = nil; model.queryGeneration = nil; model.lastQueryAttempt = 0; model.searchInput = ""
                 model.expressionPage = nil; model.expressionGeneration = nil; model.lastExpressionAttempt = 0
+                model.structurePage = nil; model.structureGeneration = nil; model.lastStructureAttempt = 0
                 model.indexStateKnown = true; model.indexPath = nil; model.lastIndexAttempt = 0; model.indexPinInput = ""
                 model.notice = "Opened the saved manifest. Search all captured text or build documentation links explicitly when ready."
             } catch {
@@ -340,6 +352,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     /// never changes the label or navigation authority of an accepted query.
     func search() {
         if searchMode == .expression { searchExpression(); return }
+        if searchMode.structure != nil { searchStructure(); return }
         guard canSearch, let info else { return }
         if searchInput.isEmpty { clearSearch(); return }
         guard validSearchInput else {
@@ -371,6 +384,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     }
     func clearSearch() {
         if searchMode == .expression { clearExpression(); return }
+        if searchMode.structure != nil { clearStructure(); return }
         guard canOperate, let info else { return }
         searchInput = ""
         perform { model, flag in
@@ -411,6 +425,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     }
     func reloadSearchResults() {
         if searchMode == .expression { reloadExpressionResults(); return }
+        if searchMode.structure != nil { reloadStructureResults(); return }
         perform { model, _ in
             guard let lease = model.session else { throw AtlasSavedError.unavailable }
             let recovered = await model.reconcileSearch(lease)
@@ -532,6 +547,115 @@ private final class AtlasSavedSession: @unchecked Sendable {
             expressionGeneration = nil; expressionPage = nil; return false
         }
     }
+    private func searchStructure() {
+        guard canOperate, let info, searchMode.structure != nil else { return }
+        if searchInput.isEmpty { clearStructure(); return }
+        guard validSearchInput else {
+            notice = "Enter 1–1024 UTF-8 bytes without NUL. Occurrences require one exact identifier token."; return
+        }
+        let needle = searchInput, mode = searchMode, nameMode = searchMode.effectiveNameMode(searchNameMode)
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let generation = try model.nextStructureGeneration()
+            model.notice = "Extracting \(mode.label.lowercased()) from verified saved members…"
+            do {
+                let page = try AtlasSavedStructurePage.decode(await model.run(lease,
+                    .structureSearch(generation: generation, mode: mode, nameMode: nameMode, query: needle,
+                        matches: AtlasSavedSearchWire.maximumHits, sourceBytes: AtlasSavedSearchWire.maximumSourceBytes), flag: flag),
+                    identity: info.identity, generation: generation, mode: mode, nameMode: nameMode,
+                    needle: needle, start: 0, limit: 64)
+                guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
+                model.structureGeneration = generation; model.structurePage = page
+                model.notice = page.complete ? "Finished extraction across the captured manifest. Results retain their stated evidence level."
+                    : "Extraction coverage is partial. Inspect unsupported members, limits and omitted metadata."
+            } catch {
+                let failure = Self.message(error)
+                let recovered = await model.reconcileStructure(lease)
+                model.notice = recovered ? "\(failure) Reloaded accepted structural results without repeating extraction."
+                    : "\(failure) Structural state could not be verified. Reload before opening results."
+            }
+        }
+    }
+    private func clearStructure() {
+        guard canOperate, let info else { return }
+        searchInput = ""
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let generation = try model.nextStructureGeneration()
+            do {
+                try AtlasSavedStructurePage.decodeClear(await model.run(lease, .clearStructure(generation: generation), flag: flag),
+                    identity: info.identity, generation: generation)
+                guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
+                model.structurePage = nil; model.structureGeneration = nil
+                model.notice = "Cleared structural results. Text results, documentation links and independent readers remain available."
+            } catch {
+                let recovered = await model.reconcileStructure(lease)
+                model.notice = recovered ? "Reloaded structural state after the clear request."
+                    : "The structural clear outcome is unconfirmed. Reload results to inspect it."
+            }
+        }
+    }
+    func loadStructureResults(start: UInt64, from page: AtlasSavedStructurePage) {
+        guard structureIsCurrent, let accepted = structurePage, page.identity == accepted.identity,
+              page.generation == accepted.generation, page.start == accepted.start,
+              page.mode == accepted.mode, page.nameMode == accepted.nameMode,
+              page.needle.utf8.elementsEqual(accepted.needle.utf8), start <= accepted.retained else { return }
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let next = try AtlasSavedStructurePage.decode(await model.run(lease,
+                .structureResults(generation: page.generation, start: start, limit: 64), flag: flag),
+                identity: page.identity, generation: page.generation, mode: page.mode, nameMode: page.nameMode,
+                needle: page.needle, start: start, limit: 64)
+            guard model.session === lease, !model.closed, model.structureGeneration == page.generation else {
+                throw AtlasSavedError.canceled
+            }
+            model.structurePage = next
+            model.notice = "Showing \(next.hits.count) of \(next.retained) structural results. Pagination reads metadata only."
+        }
+    }
+    private func reloadStructureResults() {
+        perform { model, _ in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let recovered = await model.reconcileStructure(lease)
+            model.notice = recovered ? "Reloaded structural results without repeating extraction or reading live paths."
+                : "Structural state is unavailable. Text results and documentation links remain independent."
+        }
+    }
+    private func reconcileStructure(_ lease: AtlasSavedSession) async -> Bool {
+        guard !closed, session === lease, let previous = info else { return false }
+        let flag = AtlasSearchCancellation()
+        do {
+            let current = try AtlasSavedInfo.decode(await run(lease, .info, flag: flag), handle: lease.handle,
+                expectedPath: previous.path.bytes, identity: previous.identity)
+            guard !closed, session === lease, current.structureStateKnown else { throw AtlasSavedError.invalidResponse }
+            try acceptInfo(current, lease: lease); structureGeneration = current.structureGeneration
+            lastStructureAttempt = max(lastStructureAttempt, current.lastStructureAttempt)
+            guard let generation = current.structureGeneration else { structurePage = nil; return true }
+            if structurePage?.generation == generation && structurePage?.identity == current.identity { return true }
+            let page = try AtlasSavedStructurePage.decode(await run(lease,
+                .structureResults(generation: generation, start: 0, limit: 64), flag: flag),
+                identity: current.identity, generation: generation, mode: nil, nameMode: nil, needle: nil, start: 0, limit: 64)
+            guard !closed, session === lease else { throw AtlasSavedError.canceled }
+            structurePage = page; return true
+        } catch {
+            structureGeneration = nil; structurePage = nil; return false
+        }
+    }
+    func openStructureHit(_ item: AtlasSavedStructureHit, from page: AtlasSavedStructurePage,
+        readerTransport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
+        outline: AtlasReaderOutlineTransport? = nil, document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasSavedReaderCapture {
+        guard structureIsCurrent, let accepted = structurePage, info?.identity == page.identity,
+              accepted.identity == page.identity, structureGeneration == page.generation, accepted.generation == page.generation,
+              accepted.start == page.start, accepted.mode == page.mode, accepted.nameMode == page.nameMode,
+              accepted.needle.utf8.elementsEqual(page.needle.utf8),
+              page.hits.contains(where: { $0.matches(item) }), accepted.hits.contains(where: { $0.matches(item) }) else {
+            throw AtlasSavedError.invalidInput
+        }
+        return try await openReader(saved: page.identity, ordinal: item.hit.member, expected: nil,
+            origin: .structureHit(generation: page.generation, mode: page.mode, nameMode: page.nameMode, needle: page.needle, hit: item),
+            readerTransport: readerTransport, search: search, outline: outline, document: document)
+    }
+
     func openExpressionHit(_ hit: AtlasSavedHit, from page: AtlasSavedExpressionPage, readerTransport: AtlasReaderTransport,
         search: AtlasReaderSearchTransport? = nil, outline: AtlasReaderOutlineTransport? = nil,
         document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasSavedReaderCapture {
@@ -640,6 +764,8 @@ private final class AtlasSavedSession: @unchecked Sendable {
                         request = .openHit(reader: destination, generation: generation, hit: hit.id)
                     case .expressionHit(let generation, _, _, let hit):
                         request = .openExpressionHit(reader: destination, generation: generation, hit: hit.id)
+                    case .structureHit(let generation, _, _, _, let item):
+                        request = .openStructureHit(reader: destination, generation: generation, hit: item.id)
                     }
                     return try withExtendedLifetime(lease) {
                         let accepted = try AtlasSavedReaderReceipt.decode(lease.transport.run(lease.handle, request),
@@ -687,6 +813,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         direction = .all; lastRelationshipAttempt = 0; memberOffsetInput = "0"
         searchPage = nil; queryGeneration = nil; lastQueryAttempt = 0; searchInput = ""
         expressionPage = nil; expressionGeneration = nil; lastExpressionAttempt = 0
+        structurePage = nil; structureGeneration = nil; lastStructureAttempt = 0
         indexPath = nil; indexStateKnown = true; lastIndexAttempt = 0; indexPinInput = ""
     }
     private func run(_ lease: AtlasSavedSession, _ request: AtlasSavedRequest,
@@ -721,6 +848,11 @@ private final class AtlasSavedSession: @unchecked Sendable {
         let previous = max(lastExpressionAttempt, max(expressionGeneration ?? 0, info?.lastExpressionAttempt ?? 0))
         guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
         lastExpressionAttempt = previous + 1; return lastExpressionAttempt
+    }
+    private func nextStructureGeneration() throws -> UInt64 {
+        let previous = max(lastStructureAttempt, max(structureGeneration ?? 0, info?.lastStructureAttempt ?? 0))
+        guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
+        lastStructureAttempt = previous + 1; return lastStructureAttempt
     }
     private func nextIndexGeneration() throws -> UInt64 {
         let previous = max(lastIndexAttempt, info?.lastIndexAttempt ?? 0)

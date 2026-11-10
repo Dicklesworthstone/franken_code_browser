@@ -14,6 +14,11 @@ import Foundation
 @_silgen_name("fcb_saved_expression_results") private func savedExpressionResults(_ h: UInt64, _ generation: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_clear_expression") private func savedClearExpression(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_open_expression_hit_reader") private func savedExpressionReader(_ h: UInt64, _ reader: UInt64, _ generation: UInt64, _ hit: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_structure_search") private func savedStructureSearch(_ h: UInt64, _ generation: UInt64,
+    _ mode: UInt64, _ nameMode: UInt64, _ query: UnsafePointer<CChar>?, _ matches: UInt64, _ sourceBytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_structure_results") private func savedStructureResults(_ h: UInt64, _ generation: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_clear_structure") private func savedClearStructure(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_open_structure_hit_reader") private func savedStructureReader(_ h: UInt64, _ reader: UInt64, _ generation: UInt64, _ hit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_prepare_relationships") private func savedPrepare(_ h: UInt64, _ generation: UInt64, _ links: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_relationships") private func savedRelationships(_ h: UInt64, _ generation: UInt64,
     _ direction: UInt64, _ member: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
@@ -58,6 +63,17 @@ extension AtlasSavedTransport {
         case .clearExpression(let generation): return take(savedClearExpression(handle, generation))
         case .openExpressionHit(let reader, let generation, let hit):
             return take(savedExpressionReader(handle, reader, generation, hit))
+        case .structureSearch(let generation, let mode, let nameMode, let query, let matches, let bytes):
+            guard generation > 0, let structure = mode.structure, AtlasSavedSearchWire.validNeedle(query),
+                  mode != .occurrences || nameMode == .exact,
+                  (1...AtlasSavedSearchWire.maximumHits).contains(matches),
+                  bytes <= AtlasSavedSearchWire.maximumSourceBytes else { return nil }
+            return query.withCString { take(savedStructureSearch(handle, generation, structure.code, nameMode.code, $0, matches, bytes)) }
+        case .structureResults(let generation, let start, let limit):
+            return take(savedStructureResults(handle, generation, start, limit))
+        case .clearStructure(let generation): return take(savedClearStructure(handle, generation))
+        case .openStructureHit(let reader, let generation, let hit):
+            return take(savedStructureReader(handle, reader, generation, hit))
         case .prepareRelationships(let generation, let links, let bytes):
             return take(savedPrepare(handle, generation, links, bytes))
         case .relationships(let generation, let direction, let member, let start, let limit):

@@ -112,9 +112,59 @@ They execute the actual packaging scripts with fake compiler/signing tools and
 retain their fixture logs. They establish packaging control flow, not native
 compilation, code-signing validity, Launch Services behavior or rendering.
 
+## Searching saved repository structure
+
+Open **Saved Repository**, choose an FCBS archive, and use **Search** to select
+**Symbols**, **Headings**, or **Occurrences**. The scope is the entire opened
+saved archive. Search runs on the worker over verified captured bytes; saved
+member names are labels and never open working-tree paths.
+
+| Mode | Matching and evidence | Per-member source limit |
+| --- | --- | --- |
+| Symbols | Case-sensitive exact, prefix, or contains matching against shared outline names, including qualified names. Rust, Python, JavaScript, TypeScript, Go and C/C++ declarations are heuristic candidates. | 64 KiB |
+| Headings | Case-sensitive exact, prefix, or contains matching against FrankenMarkdown heading titles. Results retain duplicate-aware slugs and qualified original source ranges. | 256 KiB |
+| Occurrences | One exact identifier token, including spelling matches in declarations, comments and string literals. Supported UTF-8 and BOM-marked UTF-16 keep their original byte coordinates. | 512 KiB |
+
+These evidence levels remain visible in each result. Symbols and occurrences do
+not claim compiler binding or a call graph. Search preserves Unicode spelling
+without normalization. Each request accepts up to 1,024 UTF-8 query bytes,
+retains up to 4,096 results, and reads at most 64 MiB of aggregate member source.
+
+The coverage summary distinguishes unsupported language or decoding,
+unavailable captures, per-member source limits, extractor limits, omitted
+metadata, a result cap and an exhausted aggregate source budget. It reports
+how many manifest members were visited. **Complete extraction processing**
+describes the admitted extraction pass, not semantic completeness. Incomplete
+archive discovery also keeps coverage partial; empty partial results cannot
+establish that a name is absent.
+
+Choose **Read source** to reverify the selected saved member and transfer it to
+an independent retained reader. Symbol query text may be a qualified name while
+the selected source bytes contain only its local name. Heading ranges can
+include Markdown syntax. Ranges up to 2,048 bytes expose an exact original-byte
+selection witness; larger targets open a bounded 16 KiB context window and
+retain their full target range for navigation. Opened readers keep their own
+capture after the archive closes, and can be pinned or kept in the Reading Desk.
+
+Editing the query, mode or name-matching option disables actions on earlier
+rows. **Use accepted query** restores their exact accepted inputs. Pagination
+and **Reload results** read retained metadata without repeating extraction.
+Failed or canceled replacements preserve the previous accepted structural
+query when its state can be verified. Structural results have their own
+generation namespace; clearing them leaves accepted literal and expression
+results, documentation links and independent readers available.
+
+The shared engine, host and C boundary have structural-search regression cases.
+The native decoder/model/retained-reader cases are included in
+`swiftui/tests/test-saved-search.sh`, using the shared saved-repository fixture.
+They cover qualified names whose source spelling differs, headings, UTF-16
+occurrences, large target ranges, partial coverage, independent generations,
+lost replies, cancellation and stale or forged activation receipts. Executable
+Rust/Swift verification and physical-Mac qualification remain pending.
+
 ## Saved repository search indexes
 
-In **Saved Repository → Text search → Literal**, expand **Saved search index**
+In **Saved Repository → Search → Literal**, expand **Saved search index**
 to attach an existing FCBD demand-paged index to the currently opened FCBS
 archive. Paste its trusted **page-manifest SHA-256** and choose the index file.
 The engine checks the pin and exact archive binding before replacing an accepted
@@ -134,7 +184,7 @@ bounded manifest and keeps a 64 KiB page cache. Posting pages are verified when
 read, and candidate matches still verify the exact saved source. The UI shows
 indexed, uncovered and unavailable member counts. Short literals, uncovered
 members and text encodings without compatible postings retain direct scanning.
-Expression searches use their existing direct source scan.
+Expression and structural searches use their independent direct source scans.
 
 Each accepted literal result reports its own index generation, eliminated
 members, direct-scan fallbacks and postings visited. **Reload index status**

@@ -5,9 +5,12 @@ enum AtlasSavedReaderOrigin: Sendable {
     case relationship(generation: UInt64, link: AtlasSavedLink, side: AtlasSavedLinkSide)
     case hit(generation: UInt64, needle: String, hit: AtlasSavedHit)
     case expressionHit(generation: UInt64, expression: String, primaryNeedle: String, hit: AtlasSavedHit)
+    case structureHit(generation: UInt64, mode: AtlasSavedSearchMode, nameMode: AtlasSearchNameMode,
+        needle: String, hit: AtlasSavedStructureHit)
     var searchHit: AtlasSavedHit? {
         switch self {
         case .hit(_, _, let hit), .expressionHit(_, _, _, let hit): return hit
+        case .structureHit(_, _, _, _, let item): return item.hit
         case .member, .relationship: return nil
         }
     }
@@ -62,6 +65,7 @@ struct AtlasSavedReaderReceipt: Sendable {
         case .member, .hit: command = "open-reader"
         case .relationship: command = "relationships-open-reader"
         case .expressionHit: command = "expression-open-reader"
+        case .structureHit: command = "structure-open-reader"
         }
         let data = try AtlasSavedWire.admit(json, handle: saved.owner, command: command, identity: saved)
         struct Common: Decodable {
@@ -140,6 +144,53 @@ struct AtlasSavedReaderReceipt: Sendable {
                 }
                 request = .window(offset: side == .target ? link.targetRange?.contextStart ?? 0 : 0, bytes: 16 * 1024)
                 match = nil
+            case .structureHit(let generation, let mode, let nameMode, let needle, let item):
+                let hit = item.hit
+                try item.validate(mode: mode, needle: needle)
+                guard generation > 0, AtlasSavedSearchWire.validNeedle(needle),
+                      mode != .occurrences || nameMode == .exact,
+                      object["selection_namespace"] as? String == "saved-structure",
+                      (object["structure_generation"] as? String).flatMap(AtlasReaderWire.integer) == generation,
+                      object["requested_mode"] as? String == mode.rawValue,
+                      object["name_mode"] as? String == nameMode.rawValue,
+                      let acceptedNeedle = object["needle"] as? String, acceptedNeedle.utf8.elementsEqual(needle.utf8),
+                      member.id == hit.member, member.file == hit.file, member.file == hit.revision,
+                      member.path.bytes == hit.path.bytes, member.digest == hit.digest,
+                      hit.start < hit.end, hit.end <= member.observedBytes,
+                      item.structure.evidenceEnd <= member.observedBytes,
+                      (object["reader_owner"] as? String).flatMap(AtlasReaderWire.integer) == destination,
+                      let witness = object["structure"] as? [String: Any],
+                      let selected = object["selection"] as? [String: Any],
+                      (selected["structure_generation"] as? String).flatMap(AtlasReaderWire.integer) == generation,
+                      (selected["hit_id"] as? String).flatMap(AtlasReaderWire.integer) == hit.id,
+                      selected["domain"] as? String == "original-source-bytes",
+                      let range = selected["original_range"] as? [String: Any],
+                      (range["start"] as? String).flatMap(AtlasReaderWire.integer) == hit.start,
+                      (range["end"] as? String).flatMap(AtlasReaderWire.integer) == hit.end,
+                      info.identity.encoding == "utf8" || (hit.start % 2 == 0 && hit.end % 2 == 0) else {
+                    throw AtlasSavedError.invalidResponse
+                }
+                let acceptedWitness = try JSONDecoder().decode(AtlasSavedStructureWitness.self,
+                    from: JSONSerialization.data(withJSONObject: witness)).value
+                guard acceptedWitness == item.structure else { throw AtlasSavedError.invalidResponse }
+                let contextStart = hit.start > 132 ? hit.start - 132 : 0
+                if hit.end - hit.start <= 2048 {
+                    guard let originalHex = selected["original_hex"] as? String,
+                          AtlasReaderWire.validHex(originalHex, bytes: hit.end - hit.start) else {
+                        throw AtlasSavedError.invalidResponse
+                    }
+                    if mode == .occurrences {
+                        let literal = try AtlasSavedMatchEvidence.literalHex(needle, encoding: info.identity.encoding)
+                        guard literal.utf8.elementsEqual(originalHex.utf8) else { throw AtlasSavedError.invalidResponse }
+                    }
+                    let evidence = AtlasSavedMatchEvidence(identity: info.identity, start: hit.start, end: hit.end,
+                        originalHex: originalHex)
+                    request = .window(offset: contextStart, bytes: max(4, min(member.observedBytes, hit.end + 132) - contextStart))
+                    match = evidence
+                } else {
+                    guard selected["original_hex"] is NSNull else { throw AtlasSavedError.invalidResponse }
+                    request = .window(offset: contextStart, bytes: 16 * 1024); match = nil
+                }
             case .hit(let generation, let needle, let hit), .expressionHit(let generation, _, let needle, let hit):
                 guard generation > 0, member.id == hit.member, member.file == hit.file, member.file == hit.revision,
                       member.path.bytes == hit.path.bytes, member.digest == hit.digest,
@@ -223,6 +274,8 @@ final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
             return "Saved search \(generation), occurrence \(hit.id) · exact original bytes \(hit.start)..<\(hit.end)"
         case .expressionHit(let generation, _, _, let hit):
             return "Saved expression \(generation), occurrence \(hit.id) · exact original bytes \(hit.start)..<\(hit.end)"
+        case .structureHit(_, _, _, _, let item):
+            return "\(item.structure.label) · original bytes \(item.hit.start)..<\(item.hit.end)"
         }
     }
     var canUseMatch: Bool {
