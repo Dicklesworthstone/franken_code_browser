@@ -59,7 +59,7 @@ extension AtlasReaderTransport {
             return SuppliedResponse(json: json, sha256: digest)
         }, comparison: AtlasReaderComparisonTransport(domain: UUID(), compare: {
             take(fcb_reader_compare($0, $1, $2, $3, $4))
-        }), references: .native)
+        }), references: .native, textSelection: .native)
 
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
         guard let pointer else { return nil }

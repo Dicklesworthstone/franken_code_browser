@@ -13,7 +13,7 @@ set -- "$@" -swift-version 6 -warnings-as-errors \
     "$src/AtlasIndexedSearch.swift" "$src/AtlasIndexedSearchWire.swift" "$src/AtlasIndexedSource.swift" \
     "$src/AtlasReader.swift" "$src/AtlasReaderSearch.swift" "$src/AtlasReaderComparison.swift" \
     "$src/AtlasReaderOutline.swift" "$src/AtlasReaderReferences.swift" "$src/AtlasReaderDocument.swift" \
-    "$src/AtlasReaderCoordinator.swift" "$src/AtlasCapturedReader.swift" "$src/AtlasSuppliedReader.swift" \
+    "$src/AtlasReaderTextSelection.swift" "$src/AtlasReaderCoordinator.swift" "$src/AtlasCapturedReader.swift" "$src/AtlasSuppliedReader.swift" \
     "$src/AtlasNavigationHistory.swift" "$src/AtlasSource.swift" \
     "$src/AtlasDocumentPreviewModel.swift" "$src/AtlasPagedReaderModel.swift" \
     "$src/AtlasProjectLinks.swift" "$src/AtlasProjectLinksModel.swift" "$src/AtlasProjectLinksReader.swift" \

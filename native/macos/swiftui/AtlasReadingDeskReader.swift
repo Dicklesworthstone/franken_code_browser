@@ -53,25 +53,18 @@ enum AtlasDeskReaderTransfer {
     }
 
     func canUpdate(_ desk: AtlasReadingDeskModel) -> Bool {
-        guard desk.canOperate, !reader.busy, let current = reader.page,
+        guard desk.canOperate, reader.canKeep, let current = reader.page,
               current.identity.matches(identity), desk.state?.owner == owner,
               let original = desk.state?.panes.first(where: { $0.id == pane.id }) else { return false }
         return original.location.file == pane.location.file && original.location.revision == pane.location.revision
     }
 
-    /// Only Rust-authored original byte ranges may return to the desk. A native
-    /// glyph/text selection is not silently interpreted as source bytes.
+    /// User selections are resolved through the retained Rust source map.
+    /// Pending or refused native intent never silently becomes a whole page.
     @discardableResult func keepCurrentPage(in desk: AtlasReadingDeskModel) -> Bool {
-        guard canUpdate(desk), let page = reader.page else { return false }
-        let selected: (UInt64, UInt64)
-        if reader.findIsCurrent, let hit = page.selection, reader.matchHex != nil {
-            selected = (hit.target.start, hit.target.end)
-        } else if reader.outlineIsCurrent, let symbol = page.symbolSelection, reader.symbolHex != nil {
-            let range = symbol.target.symbol.selectedRange
-            selected = (range.start, range.end)
-        } else { selected = (page.start, page.end) }
+        guard canUpdate(desk), let selected = reader.rangeForReadingDesk else { return false }
         return desk.updateRetainedLocation(owner: owner, pane: pane.id, file: pane.location.file,
-            sourceRevision: pane.location.revision, start: selected.0, end: selected.1)
+            sourceRevision: pane.location.revision, start: selected.start, end: selected.end)
     }
 }
 
@@ -101,14 +94,51 @@ extension AtlasReadingDeskModel {
     /// or supplied capture. Source replacement while the desk starts revokes
     /// this intent; it cannot silently import the replacement capture instead.
     func keep(reader: AtlasPagedReaderModel) {
-        guard canOperate, reader.canKeep, let original = reader.page,
+        guard canOperate, reader.canKeep, let original = reader.page, let source = reader.source,
+              let selected = reader.rangeForReadingDesk,
               let expectedDomain = readerDomain, reader.retainedRegistryDomain == expectedDomain else { return }
-        keepCapture(start: original.start, end: original.end, sourceDomain: expectedDomain) { work in
+        let navigation = reader.navigation
+        let selectionID = reader.textSelection?.id
+        let hadNativeIntent = reader.hasTextSelectionIntent
+        keepCapture(start: selected.start, end: selected.end, sourceDomain: expectedDomain) { work in
             guard let current = reader.page, current.identity.matches(original.identity), reader.canKeep,
+                  current.start == original.start, current.end == original.end,
+                  reader.source === source, reader.navigation == navigation,
+                  reader.textSelection?.id == selectionID,
+                  reader.hasTextSelectionIntent == hadNativeIntent,
+                  let currentSelection = reader.rangeForReadingDesk,
+                  currentSelection.start == selected.start, currentSelection.end == selected.end,
                   reader.retainedRegistryDomain == expectedDomain else {
                 throw AtlasReadingDeskError.unavailable
             }
             return try await reader.withRetainedReader(work)
         }
+    }
+}
+
+
+extension AtlasPagedReaderModel {
+    /// The same exact range feeds first-time Keep and a Desk reader's location
+    /// update. Native text intent has priority over older search highlights.
+    var rangeForReadingDesk: (start: UInt64, end: UInt64)? {
+        guard let page else { return nil }
+        if hasTextSelectionIntent {
+            guard !resolvingTextSelection, let selected = textSelection,
+                  selected.identity.matches(page.identity),
+                  selected.pageStart == page.start, selected.pageEnd == page.end else { return nil }
+            return (selected.originalStart, selected.originalEnd)
+        }
+        if findIsCurrent, let hit = page.selection, matchHex != nil {
+            return (hit.target.start, hit.target.end)
+        }
+        if outlineIsCurrent, let symbol = page.symbolSelection, symbolHex != nil {
+            let selected = symbol.target.symbol.selectedRange
+            return (selected.start, selected.end)
+        }
+        if referencesAreCurrent, let occurrence = page.referenceSelection, referenceHex != nil {
+            let selected = occurrence.target.occurrence.range
+            return (selected.start, selected.end)
+        }
+        return (page.start, page.end)
     }
 }

@@ -21,6 +21,9 @@ struct AtlasReaderSelection {
     var firstPhysicalLine: UInt64? = nil
     var backgroundColor: NSColor = .textBackgroundColor
     var foregroundColor: NSColor = .textColor
+    /// Only user-driven native changes are delivered; the receiver resolves
+    /// original bytes against this immutable presentation on its bounded worker.
+    var onSelectionChange: ((AtlasSource, UUID, NSRange?) -> Void)? = nil
     let styledSource: () -> NSAttributedString
 
     func makeCoordinator() -> AtlasSourceReaderController { AtlasSourceReaderController() }
@@ -29,14 +32,15 @@ struct AtlasReaderSelection {
         context.coordinator.update(source: source, navigation: navigation,
             selection: selection, wrapsLines: wrapsLines, showsLineNumbers: showsLineNumbers,
             showsWhitespace: showsWhitespace, firstPhysicalLine: firstPhysicalLine,
-            backgroundColor: backgroundColor, foregroundColor: foregroundColor, styledSource: styledSource)
+            backgroundColor: backgroundColor, foregroundColor: foregroundColor,
+            onSelectionChange: onSelectionChange, styledSource: styledSource)
     }
 }
 
 /// Also exercised directly by the native tests. Updates never read, search,
 /// rewrite, or save source. A repeated presentation does not reset a user's
 /// manual selection or scroll position. Explicit navigation alone reveals a hit.
-@MainActor final class AtlasSourceReaderController {
+@MainActor final class AtlasSourceReaderController: NSObject, NSTextViewDelegate {
     let view: NSStackView
     let scrollView: NSScrollView
     let textView: NSTextView
@@ -47,6 +51,11 @@ struct AtlasReaderSelection {
     private var lastTargetSource: AtlasSource?
     private var lastRange: NSRange?
     private var lastAccepted = true
+    private var updatingPresentation = false
+    private var selectionCallback: ((AtlasSource, UUID, NSRange?) -> Void)?
+    private var reportedSource: AtlasSource?
+    private var reportedNavigation: UUID?
+    private var reportedRange: NSRange?
     private var wrapsLines = false
     private var showsLineNumbers = false
     private var showsWhitespace = false
@@ -60,12 +69,14 @@ struct AtlasReaderSelection {
         let offset: NSPoint
     }
 
-    init() {
+    override init() {
         scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 640, height: 220))
         textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 640, height: 220))
         lineRuler = AtlasReaderLineRuler(scrollView: scrollView, textView: textView)
         notice = NSTextField(labelWithString: "")
         view = NSStackView(views: [scrollView, notice])
+        super.init()
+        textView.delegate = self
         view.orientation = .vertical
         view.alignment = .leading
         view.spacing = 4
@@ -113,12 +124,19 @@ struct AtlasReaderSelection {
                 wrapsLines: Bool = false, showsLineNumbers: Bool = false,
                 showsWhitespace: Bool = false, firstPhysicalLine: UInt64? = nil,
                 backgroundColor: NSColor = .textBackgroundColor, foregroundColor: NSColor = .textColor,
+                onSelectionChange: ((AtlasSource, UUID, NSRange?) -> Void)? = nil,
                 styledSource: () -> NSAttributedString) -> Bool {
         precondition(Thread.isMainThread)
+        updatingPresentation = true
+        defer { updatingPresentation = false }
+        selectionCallback = onSelectionChange
         if textView.backgroundColor != backgroundColor { textView.backgroundColor = backgroundColor }
         if scrollView.backgroundColor != backgroundColor { scrollView.backgroundColor = backgroundColor }
         textView.insertionPointColor = foregroundColor
         let changed = installedSource !== source
+        if changed || lastNavigation != navigation {
+            reportedSource = nil; reportedNavigation = nil; reportedRange = nil
+        }
         var replacementLines: AtlasReaderLineIndex?
         if changed {
             // Same bound as the complete-source native opening route. Never
@@ -174,6 +192,32 @@ struct AtlasReaderSelection {
         }
         textView.scrollRangeToVisible(selection.range)
         return true
+    }
+
+    /// AppKit supplies UTF-16 coordinates in the installed text, never source
+    /// byte offsets. Keep this callback descriptor-only: source-map work and
+    /// payload materialization belong to the receiver's coalesced worker.
+    func textViewDidChangeSelection(_ notification: Notification) {
+        guard !updatingPresentation, let observed = notification.object as? NSTextView,
+              observed === textView, let source = installedSource,
+              let navigation = lastNavigation, let callback = selectionCallback else { return }
+        let ranges = textView.selectedRanges
+        let range: NSRange?
+        if ranges.count == 1 {
+            let native = ranges[0].rangeValue
+            range = native.length == 0 ? nil : native
+        } else {
+            // A noncontiguous selection is not an enclosing source range.
+            // Preserve an invalid intent so exact actions cannot fall back to
+            // saving the whole page while the user sees selected passages.
+            range = ranges.contains(where: { $0.rangeValue.length > 0 })
+                ? NSRange(location: NSNotFound, length: 1) : nil
+        }
+        guard reportedSource !== source || reportedNavigation != navigation || reportedRange != range else { return }
+        reportedSource = source
+        reportedNavigation = navigation
+        reportedRange = range
+        callback(source, navigation, range)
     }
 
     /// Wrapping is presentation state of this reader, not a source/navigation
@@ -282,6 +326,7 @@ struct AtlasReaderSelection {
         textView.scrollRangeToVisible(NSRange(location: 0, length: 0))
         textView.setAccessibilityLabel("Read-only source unavailable")
         installedSource = nil
+        reportedSource = nil; reportedNavigation = nil; reportedRange = nil
         lineRuler.install(nil)
         lastNavigation = nil
         lastTargetSource = nil

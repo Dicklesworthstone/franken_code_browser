@@ -30,7 +30,13 @@ import Foundation
         emptyAndTerminatedSourcesDoNotNumberExtraLayoutLine()
         replacementSourcesRetireOldLineMetadata()
         largeLineMetadataStaysCachedDuringPresentation()
-        print("AtlasSourceReader: 22 native selection, layout, reading-guide and source-identity scenarios passed")
+        manualSelectionReportsInstalledSourceAndNavigation()
+        clearingSelectionRevokesExactIntent()
+        programmaticPresentationDoesNotCreateSelectionIntent()
+        replacementAndSameTextPagesHaveDistinctSelectionAuthority()
+        noncontiguousSelectionCannotBecomeAnEnclosingRange()
+        separateReaderCallbacksRemainIndependent()
+        print("AtlasSourceReader: 28 native selection, layout, reading-guide and source-identity scenarios passed")
     }
     static func present(_ reader: AtlasSourceReaderController, _ source: AtlasSource,
                         _ range: NSRange?, navigation: UUID = UUID()) -> Bool {
@@ -583,4 +589,122 @@ import Foundation
                          "scroll-time presentation rebuilt a newline-heavy capture")
         }
     }
+
+    static func manualSelectionReportsInstalledSourceAndNavigation() {
+        let source = AtlasSource(path: "selection.rs", text: "a😀 e\u{301} אב\r\nlast")
+        let reader = AtlasSourceReaderController(), navigation = UUID()
+        var deliveries: [(AtlasSource, UUID, NSRange?)] = []
+        precondition(reader.update(source: source, navigation: navigation, selection: nil,
+            onSelectionChange: { deliveries.append(($0, $1, $2)) }) {
+                NSAttributedString(string: source.text)
+            })
+        precondition(deliveries.isEmpty, "installing a page must not fabricate a user selection")
+        let range = (source.text as NSString).range(of: "😀 e\u{301} אב\r\n")
+        reader.textView.setSelectedRange(range)
+        precondition(deliveries.count == 1 && deliveries[0].0 === source
+            && deliveries[0].1 == navigation && deliveries[0].2 == range,
+            "the native delegate lost the exact displayed selection authority")
+        reader.textViewDidChangeSelection(Notification(name: NSTextView.didChangeSelectionNotification,
+            object: reader.textView))
+        precondition(deliveries.count == 1, "identical drag notifications must be coalesced")
+        reader.textViewDidChangeSelection(Notification(name: NSTextView.didChangeSelectionNotification,
+            object: NSTextView()))
+        precondition(deliveries.count == 1, "another text view cannot supply this reader's selection")
+    }
+
+    static func clearingSelectionRevokesExactIntent() {
+        let source = AtlasSource(path: "selection.rs", text: "one two")
+        let reader = AtlasSourceReaderController()
+        var ranges: [NSRange?] = []
+        precondition(reader.update(source: source, navigation: UUID(), selection: nil,
+            onSelectionChange: { _, _, range in ranges.append(range) }) {
+                NSAttributedString(string: source.text)
+            })
+        reader.textView.setSelectedRange(NSRange(location: 0, length: 3))
+        reader.textView.setSelectedRange(NSRange(location: 3, length: 0))
+        precondition(ranges.count == 2 && ranges[0] == NSRange(location: 0, length: 3)
+            && ranges[1] == nil, "a caret must synchronously revoke the old text-selection intent")
+    }
+
+    static func programmaticPresentationDoesNotCreateSelectionIntent() {
+        let source = AtlasSource(path: "selection.rs", text: "one\ttwo\r\nthree")
+        let reader = AtlasSourceReaderController(), navigation = UUID()
+        let target = AtlasReaderSelection(source: source, range: NSRange(location: 0, length: 3))
+        var deliveries = 0
+        func update(_ guides: Bool, _ selection: AtlasReaderSelection?) {
+            precondition(reader.update(source: source, navigation: navigation, selection: selection,
+                wrapsLines: guides, showsLineNumbers: guides, showsWhitespace: guides,
+                onSelectionChange: { _, _, _ in deliveries += 1 }) {
+                    NSAttributedString(string: source.text)
+                })
+        }
+        update(false, target)
+        precondition(deliveries == 0)
+        let manual = NSRange(location: 4, length: 3)
+        reader.textView.setSelectedRange(manual)
+        precondition(deliveries == 1)
+        update(true, target)
+        update(false, nil)
+        precondition(deliveries == 1 && reader.textView.selectedRange() == manual,
+            "presentation controls must not replay or erase the manual selection")
+    }
+
+    static func replacementAndSameTextPagesHaveDistinctSelectionAuthority() {
+        let first = AtlasSource(path: "same.rs", text: "same bytes")
+        let replacement = AtlasSource(path: "same.rs", text: "same bytes")
+        let reader = AtlasSourceReaderController()
+        let before = UUID(), after = UUID()
+        var deliveries: [(AtlasSource, UUID, NSRange?)] = []
+        func update(_ source: AtlasSource, _ navigation: UUID) {
+            precondition(reader.update(source: source, navigation: navigation, selection: nil,
+                onSelectionChange: { deliveries.append(($0, $1, $2)) }) {
+                    NSAttributedString(string: source.text)
+                })
+        }
+        update(first, before)
+        reader.textView.setSelectedRange(NSRange(location: 0, length: 4))
+        update(replacement, after)
+        precondition(deliveries.count == 1, "source replacement must not publish old selection coordinates")
+        reader.textView.setSelectedRange(NSRange(location: 0, length: 4))
+        precondition(deliveries.count == 2 && deliveries[1].0 === replacement
+            && deliveries[1].1 == after && deliveries[0].0 !== deliveries[1].0,
+            "equal spelling does not identify a source capture or page")
+    }
+
+    static func noncontiguousSelectionCannotBecomeAnEnclosingRange() {
+        let source = AtlasSource(path: "selection.rs", text: "one two three")
+        let reader = AtlasSourceReaderController()
+        var range: NSRange?
+        precondition(reader.update(source: source, navigation: UUID(), selection: nil,
+            onSelectionChange: { _, _, value in range = value }) {
+                NSAttributedString(string: source.text)
+            })
+        reader.textView.selectedRanges = [
+            NSValue(range: NSRange(location: 0, length: 3)),
+            NSValue(range: NSRange(location: 8, length: 5))
+        ]
+        precondition(reader.textView.selectedRanges.count == 2)
+        precondition(range?.location == NSNotFound && range?.length == 1,
+            "multiple passages must remain an unavailable intent, not silently save intervening bytes")
+    }
+
+    static func separateReaderCallbacksRemainIndependent() {
+        let source = AtlasSource(path: "same.rs", text: "one two")
+        let left = AtlasSourceReaderController(), right = AtlasSourceReaderController()
+        let leftNavigation = UUID(), rightNavigation = UUID()
+        var leftRanges: [NSRange?] = [], rightRanges: [NSRange?] = []
+        precondition(left.update(source: source, navigation: leftNavigation, selection: nil,
+            onSelectionChange: { _, navigation, range in
+                precondition(navigation == leftNavigation); leftRanges.append(range)
+            }) { NSAttributedString(string: source.text) })
+        precondition(right.update(source: source, navigation: rightNavigation, selection: nil,
+            onSelectionChange: { _, navigation, range in
+                precondition(navigation == rightNavigation); rightRanges.append(range)
+            }) { NSAttributedString(string: source.text) })
+        left.textView.setSelectedRange(NSRange(location: 0, length: 3))
+        right.textView.setSelectedRange(NSRange(location: 4, length: 3))
+        precondition(leftRanges == [NSRange(location: 0, length: 3)]
+            && rightRanges == [NSRange(location: 4, length: 3)])
+    }
+
 }

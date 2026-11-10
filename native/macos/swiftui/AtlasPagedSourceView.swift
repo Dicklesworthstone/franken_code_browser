@@ -3,8 +3,8 @@ import AppKit
 
 /// Nonspatial reading of the shared engine's retained byte/line windows. The
 /// enclosing app gives each file activation a fresh view identity and revokes
-/// it when project/search origin changes. No byte coordinates are inferred from
-/// AppKit's page-local text selection; original-byte copy is explicitly hex.
+/// it when project/search origin changes. Native selections are resolved through
+/// the retained Rust source map before exact copying or Reading Desk actions.
 @MainActor struct AtlasPagedSourceView: View {
     let root: String
     let path: String
@@ -98,6 +98,7 @@ import AppKit
         .onDisappear { closeLinked(); if ownsModel { model.close() }; copyNotice = "" }
         .onChange(of: project?.info?.owner) { _, _ in closeLinked() }
         .onChange(of: model.navigation) { _, _ in copyNotice = "" }
+        .onChange(of: model.textSelection?.id) { _, _ in copyNotice = "" }
         .onChange(of: Array(model.fileQuery.utf8)) { _, _ in copyNotice = "" }
         .onChange(of: Array(model.referenceName.utf8)) { _, _ in copyNotice = "" }
     }
@@ -255,6 +256,27 @@ import AppKit
                         .accessibilityLabel("Exact logical source position: " + position.summary)
                 }
             }
+            if model.hasTextSelectionIntent {
+                HStack(spacing: 10) {
+                    if model.resolvingTextSelection { ProgressView().controlSize(.small) }
+                    Text(model.textSelectionNotice)
+                        .font(.caption2).foregroundStyle(.secondary)
+                        .lineLimit(3).textSelection(.enabled)
+                    Spacer(minLength: 4)
+                    if model.textSelection != nil {
+                        Menu("Copy selection") {
+                            Button("Copy selected text") { copySelected(.text) }
+                            Button("Copy text with location") { copySelected(.withLocation) }
+                            Button("Copy original selection as hex") { copySelected(.originalHex) }
+                        }
+                        .disabled(model.busy || model.resolvingTextSelection)
+                        .help("Copy this exact selected passage as logical text, text with capture provenance, or lossless original-byte hex. Line endings are preserved.")
+                    } else if !model.resolvingTextSelection {
+                        Button("Retry selection") { model.retryTextSelection() }
+                            .disabled(model.busy)
+                    }
+                }.padding(.horizontal, 10).controlSize(.small)
+            }
             if let source = model.source {
                 // Equal page text can have different lexical context. Retain
                 // the accepted page/source pair for this presentation update.
@@ -263,7 +285,11 @@ import AppKit
                     selection: model.nativeSelectionRange.map { AtlasReaderSelection(source: source, range: $0) },
                     wrapsLines: wrapsLines, showsLineNumbers: showsLineNumbers,
                     showsWhitespace: showsWhitespace, firstPhysicalLine: physicalLineBase(page),
-                    backgroundColor: Monokai.background, foregroundColor: Monokai.color("plain")) {
+                    backgroundColor: Monokai.background, foregroundColor: Monokai.color("plain"),
+                    onSelectionChange: { source, navigation, range in
+                        copyNotice = ""
+                        model.updateTextSelection(source: source, navigation: navigation, range: range)
+                    }) {
                     if let page, page.text.utf8.elementsEqual(source.text.utf8),
                        let highlight = page.highlight {
                         return AtlasDocument.style(text: source.text,
@@ -305,9 +331,11 @@ import AppKit
                         .help("Keep this exact retained source beside other files (⇧⌘P); pinning never rereads the disk file")
                 }
                 if let keep {
-                    Button { keep(model) } label: { Label("Keep in reading desk", systemImage: "books.vertical") }
+                    Button { keep(model) } label: {
+                        Label(model.hasTextSelectionIntent ? "Keep selected text" : "Keep in reading desk", systemImage: "books.vertical")
+                    }
                         .disabled(!canKeep || !model.canKeep)
-                        .help("Keep the entire exact source capture, up to 4 MiB, at this page with bookmarks, cross-file history and explicit checkpoint saving")
+                        .help("Keep this exact selected range or page, retaining its complete source up to 4 MiB. Add bookmarks or personal notes and save a checkpoint in the Reading Desk.")
                 }
                 Button("Back", action: model.back).disabled(!model.canGoBack)
                     .help("Return to the previous retained byte window")
@@ -431,6 +459,42 @@ import AppKit
         copyNotice = ""
         model.open(root: root, path: path, accessLease: accessLease)
     }
+    private enum SelectionCopyFormat { case text, withLocation, originalHex }
+
+    private func copySelected(_ format: SelectionCopyFormat) {
+        guard !model.busy, !model.resolvingTextSelection,
+              let selected = model.textSelection else { return }
+        let pasteboard = NSPasteboard.general
+        let expectedChange = pasteboard.changeCount
+        let value: String
+        let success: String
+        switch format {
+        case .text:
+            value = selected.text
+            success = selected.containsReplacements
+                ? "Copied selected logical text with replacement characters; original line endings are preserved."
+                : "Copied selected logical text with original line endings."
+        case .withLocation:
+            value = selected.withLocationText
+            success = "Copied selected logical text with its captured source identity, original byte range and decoding policy."
+        case .originalHex:
+            value = selected.originalHex
+            success = "Copied the selection's exact original bytes as lossless hexadecimal."
+        }
+        // Resolution is already complete. No async source work or native
+        // clipboard mutation occurs while waiting for a source-map response.
+        guard model.textSelection?.id == selected.id else { return }
+        switch AtlasReaderSelectionClipboard.publish(value, to: pasteboard, expectedChangeCount: expectedChange) {
+        case .copied: copyNotice = success
+        case .tooLarge:
+            copyNotice = "The selection exceeds the 2 MiB clipboard staging budget. Select a smaller passage; nothing was copied."
+        case .changed:
+            copyNotice = "The clipboard changed before publication. Its newer contents were preserved; copy again to replace them."
+        case .failed:
+            copyNotice = "Clipboard publication failed. Its contents may have changed; no rollback was attempted."
+        }
+    }
+
     private func copyHex() {
         guard let page = model.page else { return }
         NSPasteboard.general.clearContents()

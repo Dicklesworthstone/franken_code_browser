@@ -36,6 +36,21 @@ import Observation
     private(set) var findReport: AtlasReaderFindReport?
     private(set) var selectedHitIndex: Int?
     private var selectedRange: NSRange?
+    private(set) var textSelection: AtlasReaderTextSelection?
+    private(set) var resolvingTextSelection = false
+    private(set) var hasTextSelectionIntent = false
+    private(set) var textSelectionNotice = ""
+    private struct TextSelectionIntent {
+        let id: UUID
+        let source: AtlasSource
+        let navigation: UUID
+        let page: AtlasReaderPage
+        let range: NSRange
+    }
+    @ObservationIgnored private var textSelectionIntent: TextSelectionIntent?
+    @ObservationIgnored private var pendingTextSelection: TextSelectionIntent?
+    @ObservationIgnored private var textSelectionTask: Task<Void, Never>?
+    @ObservationIgnored private var textSelectionLoop: UUID?
     @ObservationIgnored private var queryWork = false
     @ObservationIgnored private var outlineWork = false
     @ObservationIgnored private var referenceWork = false
@@ -99,18 +114,19 @@ import Observation
             execute: { try await coordinator.document($0) },
             cancel: { coordinator.cancel() }, revoke: { coordinator.revokeDocument() })
     }
-    deinit { task?.cancel() }
+    deinit { task?.cancel(); textSelectionTask?.cancel() }
 
     var canGoBack: Bool { history.canBack && !busy }
     var canGoForward: Bool { history.canForward && !busy }
     var canGoNext: Bool { page?.nextOffset != nil && !busy }
     var canRefresh: Bool { page != nil && refreshInput != nil && !busy && !documentPreview.busy }
-    var canPin: Bool { page != nil && !busy && !pinning && !documentPreview.busy && coordinator.canFork }
+    var canPin: Bool { page != nil && !busy && !pinning && !documentPreview.busy && !resolvingTextSelection && coordinator.canFork }
     var canKeep: Bool {
         guard canPin, let page else { return false }
         return page.identity.capturedBytes <= AtlasReaderLimits.transferBytes
+            && (!hasTextSelectionIntent || textSelection != nil)
     }
-    var canCompare: Bool { page != nil && !busy && !pinning && !documentPreview.busy && coordinator.supportsComparison }
+    var canCompare: Bool { page != nil && !busy && !pinning && !documentPreview.busy && !resolvingTextSelection && coordinator.supportsComparison }
     var retainedRegistryDomain: UUID? { coordinator.retainedRegistryDomain }
     var retainedCaptureSHA256: String? { coordinator.retainedCaptureSHA256 }
     var canFind: Bool { page != nil && coordinator.supportsFind }
@@ -167,6 +183,123 @@ import Observation
     var referenceSelectionLabel: String? {
         guard referenceHex != nil, let target = page?.referenceSelection?.target else { return nil }
         return "Identifier occurrence \(target.occurrence.id) · LF line \(target.occurrence.line)"
+    }
+
+    /// Only the displayed immutable source and navigation may report native
+    /// coordinates. Selection notifications retain a small descriptor; one
+    /// draining task and one newest descriptor bound work during a drag.
+    func updateTextSelection(source: AtlasSource, navigation: UUID, range: NSRange?) {
+        guard self.source === source, self.navigation == navigation, let page else { return }
+        guard let range, range.length != 0 else {
+            clearTextSelection()
+            return
+        }
+        if let intent = textSelectionIntent, intent.source === source,
+           intent.navigation == navigation, intent.range == range,
+           textSelection != nil || resolvingTextSelection { return }
+        let intent = TextSelectionIntent(id: UUID(), source: source, navigation: navigation,
+            page: page, range: range)
+        textSelectionIntent = intent
+        hasTextSelectionIntent = true
+        textSelection = nil
+        coordinator.cancelTextSelection()
+        guard coordinator.supportsTextSelection, !pinning, !documentPreview.busy else {
+            pendingTextSelection = nil
+            resolvingTextSelection = false
+            textSelectionNotice = coordinator.supportsTextSelection
+                ? "Select again after the reader finishes its current operation."
+                : "Exact selected-source actions are unavailable for this reader."
+            return
+        }
+        pendingTextSelection = intent
+        resolvingTextSelection = true
+        textSelectionNotice = "Resolving the selection against retained source bytes…"
+        startTextSelectionWork()
+    }
+
+    /// Retry the still-displayed descriptor without depending on another
+    /// AppKit notification or reopening a live path.
+    func retryTextSelection() {
+        guard let intent = textSelectionIntent, self.source === intent.source,
+              navigation == intent.navigation, !busy, !pinning, !documentPreview.busy else { return }
+        textSelectionIntent = nil
+        updateTextSelection(source: intent.source, navigation: intent.navigation, range: intent.range)
+    }
+
+    /// A failed navigation or canceled query can leave the same native text
+    /// selected. Preserve that intent while revoking its receipt, then resolve
+    /// it again when the reader lane becomes available. Never turn it into an
+    /// implicit page-wide Keep.
+    private func suspendTextSelection() {
+        guard let intent = textSelectionIntent else { return }
+        textSelection = nil
+        pendingTextSelection = intent
+        resolvingTextSelection = true
+        textSelectionNotice = "Resolving the displayed selection after the reader operation…"
+        coordinator.cancelTextSelection()
+        textSelectionTask?.cancel()
+    }
+
+    /// Revocation is synchronous even while the prior foreign call drains.
+    /// Refused or pending text never becomes a page-wide Keep by implication.
+    private func clearTextSelection() {
+        textSelectionIntent = nil
+        pendingTextSelection = nil
+        textSelection = nil
+        hasTextSelectionIntent = false
+        resolvingTextSelection = false
+        textSelectionNotice = ""
+        coordinator.cancelTextSelection()
+        textSelectionTask?.cancel()
+    }
+
+    private func startTextSelectionWork() {
+        guard textSelectionTask == nil, pendingTextSelection != nil,
+              !busy, !pinning, !documentPreview.busy else { return }
+        let loop = UUID()
+        textSelectionLoop = loop
+        textSelectionTask = Task {
+            defer {
+                if textSelectionLoop == loop {
+                    textSelectionLoop = nil
+                    textSelectionTask = nil
+                    startTextSelectionWork()
+                }
+            }
+            while !Task.isCancelled, let intent = pendingTextSelection {
+                pendingTextSelection = nil
+                guard self.source === intent.source, navigation == intent.navigation else { continue }
+                guard !busy, !pinning, !documentPreview.busy else {
+                    if textSelectionIntent?.id == intent.id {
+                        resolvingTextSelection = false
+                        textSelectionNotice = "Select again after the reader finishes its current operation."
+                    }
+                    continue
+                }
+                do {
+                    let resolved = try await coordinator.resolveTextSelection(page: intent.page, range: intent.range)
+                    guard !Task.isCancelled, textSelectionIntent?.id == intent.id,
+                          self.source === intent.source, navigation == intent.navigation,
+                          page?.identity.matches(intent.page.identity) == true,
+                          page?.start == intent.page.start, page?.end == intent.page.end else { continue }
+                    guard !busy, !pinning, !documentPreview.busy else {
+                        resolvingTextSelection = false
+                        textSelectionNotice = "The reader changed operations before selection delivery. Retry the displayed selection."
+                        continue
+                    }
+                    textSelection = resolved
+                    resolvingTextSelection = false
+                    textSelectionNotice = resolved.summary
+                } catch {
+                    guard !Task.isCancelled, textSelectionIntent?.id == intent.id,
+                          self.source === intent.source, navigation == intent.navigation else { continue }
+                    textSelection = nil
+                    resolvingTextSelection = false
+                    textSelectionNotice = "The selected range could not be resolved exactly. Select a complete character range again. "
+                        + ((error as? AtlasReaderError)?.message ?? AtlasReaderError.unavailable.message)
+                }
+            }
+        }
     }
 
     var coverage: String {
@@ -678,6 +811,7 @@ import Observation
     /// Explicit cancellation keeps a successfully installed page. Cancellation
     /// during initial capture instead releases its handle after work drains.
     func cancel() {
+        suspendTextSelection()
         cancelPin()
         let wasRefreshing = isRefreshing
         documentPreview.cancel(silent: true)
@@ -695,8 +829,10 @@ import Observation
         positionWork = false
         notice = wasRefreshing ? "Refresh canceled. The previous retained source is unchanged."
             : (page == nil ? "Source opening canceled." : "Navigation canceled. The current retained page is unchanged.")
+        startTextSelectionWork()
     }
     func close() {
+        clearTextSelection()
         cancelPin()
         documentPreview.close()
         operation = UUID()
@@ -749,6 +885,7 @@ import Observation
         }
     }
     private func begin(query: Bool = false, outline: Bool = false, references: Bool = false, position: Bool = false) -> UUID {
+        suspendTextSelection()
         cancelPin()
         documentPreview.cancel(silent: true)
         task?.cancel()
@@ -780,6 +917,7 @@ import Observation
         // Input updates below describe this accepted navigation; they must not
         // revoke it as though the user edited a still-pending location request.
         positionWork = false
+        clearTextSelection()
         self.page = page
         documentPreview.bind(identity: page.identity, sourceOffset: page.start)
         let source = AtlasSource(path: page.identity.displayPath, text: page.text)
@@ -800,6 +938,7 @@ import Observation
     private func finish(_ ticket: UUID) {
         guard operation == ticket else { return }
         busy = false; isRefreshing = false; task = nil; queryWork = false; outlineWork = false; referenceWork = false; positionWork = false
+        startTextSelectionWork()
     }
     private func fail(_ error: Error, ticket: UUID) {
         guard operation == ticket, !Task.isCancelled else { return }

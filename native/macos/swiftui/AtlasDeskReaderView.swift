@@ -13,8 +13,9 @@ import SwiftUI
 
     private var pinGroup: String { "reading-desk:\(capture.owner)" }
     private var keepLabel: String {
-        capture.reader.matchHex != nil || capture.reader.symbolHex != nil
-            ? "Keep selected result in desk" : "Keep current page in desk"
+        if capture.reader.hasTextSelectionIntent { return "Keep selected text in desk" }
+        return capture.reader.matchHex != nil || capture.reader.symbolHex != nil
+            || capture.reader.referenceHex != nil ? "Keep selected result in desk" : "Keep current page in desk"
     }
 
     var body: some View {
@@ -41,7 +42,7 @@ import SwiftUI
                     }
                 }
                 .disabled(!capture.canUpdate(desk))
-                .help("Store this reader's exact Find or Outline result, or its full page range, in the original retained pane. Native text selection is not interpreted as original byte offsets.")
+                .help("Store the selected text's verified original-byte range, an exact Find/Outline/Occurrences result, or this page in the original retained pane. Pending selections must resolve before saving.")
                 Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
             }
             .controlSize(.small).padding(.horizontal, 12).padding(.top, 12)
@@ -54,7 +55,7 @@ import SwiftUI
                 }
             }
             HStack {
-                Text(updateNotice.isEmpty ? "The desk keeps its original selection until you explicitly keep a new reader page or result." : updateNotice)
+                Text(updateNotice.isEmpty ? "The desk keeps its original range until you explicitly keep selected text, a reader page or a result." : updateNotice)
                     .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                 Spacer()
                 if desk.busy { ProgressView().controlSize(.small) }

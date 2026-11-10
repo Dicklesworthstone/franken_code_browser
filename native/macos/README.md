@@ -483,6 +483,54 @@ including retained and pinned pages. Native layout, scrolling, and copy
 regressions are included for the configured macOS verification lane;
 physical-Mac execution remains pending.
 
+## Selected passages, copying, and notes
+
+Drag or use the keyboard to select a passage in a retained source reader. The
+reader resolves that page's native text selection through the Rust source map
+and shows its exact original-byte range. Ordinary atlas file opening now uses
+these reader tools for an already captured file without rereading its path.
+
+Use **Copy selection** to choose **Copy selected text**, **Copy text with
+location**, or **Copy original selection as hex**. Logical text preserves its
+Unicode spelling, source order and CR/LF/CRLF. Location copy adds the captured
+source identity, reversible path, original-byte range, encoding and replacement
+policy; it includes the retained capture digest when available. Hex preserves
+the original encoded bytes, including malformed sequences. A decoded replacement
+character is identified explicitly rather than being described as an original
+source byte.
+
+**Keep selected text** retains that exact passage in the Reading Desk, where
+existing bookmark and personal-note actions use the saved range. Save a desk
+checkpoint to preserve those notes and locations after closing the app. A
+reader opened from the desk can also update its saved range from selected text.
+Without a manual text selection, Keep uses the current exact Find, Outline or
+Occurrences result when available, otherwise the current page.
+
+Selection work is coalesced on the existing bounded worker. A pending or refused
+selection disables exact Keep and Copy actions; it never silently becomes a
+whole-page selection. Changing pages, replacing the capture, or closing the
+reader revokes old selection replies. Failed navigation preserves the displayed
+selection intent and resolves it again; **Retry selection** is available when
+needed. A delayed desk transfer also checks that the original selection is still
+current before importing it.
+
+Selections are confined to one displayed page and whole composed characters;
+disjoint native ranges cannot be saved as one enclosing passage. The resolver
+admits at most 256 KiB of selected original bytes, with the existing 16-byte
+allowance for adjusted page boundaries. Reading Desk transfer retains the
+complete source and remains limited to 4 MiB per capture. Each clipboard action
+admits at most 1 MiB of UTF-8 payload under a 2 MiB aggregate staging charge.
+Oversized payloads are refused intact. Payloads are staged before clipboard
+publication, with an intervening ownership-change check; a native publication
+failure is reported without claiming rollback.
+
+The production Rust/C regression sources, portable native decoder/model tests,
+AppKit selection tests, private-pasteboard tests, and desk transfer tests are
+included. The native lanes are `swiftui/tests/test-reader-text-selection.sh`
+and `swiftui/tests/test-desk-reader.sh`; the supplied-reader lane covers
+transport capability preservation. These are code-first additions awaiting
+independent strict-RCH execution and physical-Mac qualification.
+
 ## Exact source locations
 
 The paged reader's **Line**, **Column**, and column-unit controls resolve a

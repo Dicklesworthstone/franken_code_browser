@@ -1419,7 +1419,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     // MARK: Actions
 
     private func keepSource(_ reader: AtlasPagedReaderModel) {
-        guard readingDesk.canOperate, reader.canPin,
+        guard readingDesk.canOperate, reader.canKeep,
               let domain = readingDesk.readerDomain, reader.retainedRegistryDomain == domain else { return }
         // The desk owns its imported capture independently of project changes.
         // Its receiving operation keeps the source reader alive until delivery.
@@ -2223,7 +2223,15 @@ private struct AtlasFrozenViewportSearch: Sendable {
         // String-keyed lookup may return a canonically equivalent filename.
         // Such a document cannot lend this request its source or capture proof.
         if let source = atlasDocuments[path]?.source, source.path.utf8.elementsEqual(path.utf8) {
-            presentSource(source, searchRow: searchRow, exactMatch: exactMatch)
+            if exactMatch {
+                presentSource(source, searchRow: searchRow, exactMatch: true)
+            } else {
+                // Ordinary atlas activation gets the same exact-selection,
+                // notes and navigation tools as every other retained reader.
+                // Import the already displayed capture; never reread its path.
+                selectedSource = source
+                openPagedFile(path)
+            }
             return
         }
 

@@ -424,7 +424,7 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
                 model.installState(accepted)
                 model.page = nil
                 try await model.loadPage(lease)
-                model.notice = "Kept the exact captured page in the reading desk. Name a bookmark to keep this location in your saved desk."
+                model.notice = "Kept the exact captured range in the reading desk. Add a bookmark or personal note, then save a checkpoint to preserve it."
             } catch {
                 try? await model.reconcile(lease)
                 throw error

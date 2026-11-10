@@ -13,7 +13,7 @@ set -- "$@" -swift-version 6 -warnings-as-errors \
     "$src/AtlasSearchCoordinator.swift" "$src/AtlasProjectIO.swift" \
     "$src/AtlasReader.swift" "$src/AtlasReaderSearch.swift" "$src/AtlasReaderComparison.swift" \
     "$src/AtlasReaderOutline.swift" "$src/AtlasReaderReferences.swift" "$src/AtlasReaderDocument.swift" \
-    "$src/AtlasReaderCoordinator.swift" "$src/AtlasCapturedReader.swift" "$src/AtlasSuppliedReader.swift" \
+    "$src/AtlasReaderTextSelection.swift" "$src/AtlasReaderCoordinator.swift" "$src/AtlasCapturedReader.swift" "$src/AtlasSuppliedReader.swift" \
     "$src/AtlasNavigationHistory.swift" "$src/AtlasSource.swift" \
     "$src/AtlasDocumentPreviewModel.swift" "$src/AtlasPagedReaderModel.swift"
 swiftc "$@" "$src/tests/AtlasSuppliedReaderFixture.swift" "$src/tests/AtlasSuppliedReaderTests.swift" \
@@ -21,7 +21,7 @@ swiftc "$@" "$src/tests/AtlasSuppliedReaderFixture.swift" "$src/tests/AtlasSuppl
 "$out/supplied-tests"
 if [ "$(uname -s)" = Darwin ]; then
     clang -std=gnu11 -Wall -Wextra -Werror -c "$src/tests/AtlasSuppliedReaderBridgeFixtures.c" -o "$out/bridge-fixture.o"
-    swiftc "$@" "$src/AtlasReaderBridge.swift" "$src/AtlasReaderReferencesBridge.swift" \
+    swiftc "$@" "$src/AtlasReaderTextSelectionBridge.swift" "$src/AtlasReaderBridge.swift" "$src/AtlasReaderReferencesBridge.swift" \
         "$src/tests/AtlasSuppliedReaderBridgeTests.swift" \
         "$out/bridge-fixture.o" -o "$out/bridge-tests"
     "$out/bridge-tests"

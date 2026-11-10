@@ -31,6 +31,12 @@ The shell installer downloads the current release and its SHA-256 sidecar, verif
 
 Open FrankenCodeBrowser, choose a project folder, drag to pan, and scroll to zoom. Use `⌘F` to search exact text, click a file to read it, or choose a file-type filter from the toolbar (Markdown, Python, Rust, or custom extensions).
 
+Retained readers also connect dragged text selections to exact captured byte
+ranges. Use **Copy selection** for logical text, text with source provenance, or
+original-byte hex; use **Keep selected text** to add the passage to your Reading
+Desk for bookmarks and personal notes. See [selected passages, copying, and notes](native/macos/README.md#selected-passages-copying-and-notes).
+This source addition awaits executable and physical-Mac qualification.
+
 The global search sidebar also offers **Occurrences** for exact whole-token
 identifier text across the selected workspace, folder, file or visible scope.
 Results include comments and strings and open their retained source with exact

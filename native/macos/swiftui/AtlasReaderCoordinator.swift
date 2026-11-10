@@ -28,6 +28,8 @@ struct AtlasReaderTransport: Sendable {
     /// Optional whole-token occurrence service over the same retained source.
     /// Independent of outline extraction, literal Find and native presentation.
     let references: AtlasReaderReferencesTransport?
+    /// Resolves native page coordinates using the retained source decoder.
+    let textSelection: AtlasReaderTextSelectionTransport?
 
     init(create: @escaping @Sendable () -> UInt64,
          open: @escaping @Sendable (UInt64, String, UInt64) -> String?,
@@ -40,13 +42,15 @@ struct AtlasReaderTransport: Sendable {
          fork: (@Sendable (UInt64, UInt64) -> String?)? = nil,
          openBytes: (@Sendable (UInt64, String, Data) -> SuppliedResponse?)? = nil,
          comparison: AtlasReaderComparisonTransport? = nil,
-         references: AtlasReaderReferencesTransport? = nil) {
+         references: AtlasReaderReferencesTransport? = nil,
+         textSelection: AtlasReaderTextSelectionTransport? = nil) {
         self.create = create; self.open = open; self.window = window; self.lines = lines
         self.cancel = cancel; self.close = close; self.retirementFailed = retirementFailed
         self.fork = fork
         self.openBytes = openBytes
         self.comparison = comparison
         self.references = references
+        self.textSelection = textSelection
         self.position = position
     }
 }
@@ -153,6 +157,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
     private var stagedCapture: (id: UUID, info: AtlasReaderInfo, page: AtlasReaderPage)?
     private var cancellation: AtlasSearchCancellation?
     private var operation = UUID()
+    private var activeTextSelection: UUID?
 
     init(transport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
          outline: AtlasReaderOutlineTransport? = nil,
@@ -167,6 +172,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
     var supportsReferences: Bool { (session?.transport ?? transport).references != nil }
     var supportsDocument: Bool { documentTransport != nil }
     var supportsPosition: Bool { (session?.transport ?? transport).position != nil }
+    var supportsTextSelection: Bool { (session?.transport ?? transport).textSelection != nil }
     var canFork: Bool { session?.transport.fork != nil && info != nil }
     var supportsComparison: Bool {
         guard let info else { return false }
@@ -496,6 +502,47 @@ private final class AtlasReaderSession: @unchecked Sendable {
         return staged.page
     }
 
+    /// The page text and original-byte witness remain immutable while native
+    /// UTF-16 coordinates are converted and resolved on the worker. No mapping,
+    /// byte materialization or foreign call runs on the AppKit callback.
+    func resolveTextSelection(page: AtlasReaderPage, range: NSRange) async throws -> AtlasReaderTextSelection {
+        try Task.checkCancellation()
+        guard let source = session, let original = info,
+              page.identity.matches(original.identity),
+              let selection = source.transport.textSelection else { throw AtlasReaderError.unavailable }
+        cancel()
+        let ticket = UUID(), flag = AtlasSearchCancellation()
+        operation = ticket; cancellation = flag; activeTextSelection = ticket
+        do {
+            let result = try await withTaskCancellationHandler(operation: {
+                try await io.perform(cancellation: flag, keepingAlive: [source]) {
+                    let request = try AtlasReaderTextSelectionRequest(page: page, nativeRange: range)
+                    guard !flag.isCanceled else { throw AtlasReaderError.canceled }
+                    let json = selection.resolve(source.handle, page.start, page.end,
+                        request.utf8Start, request.utf8End)
+                    guard !flag.isCanceled else { throw AtlasReaderError.canceled }
+                    return try AtlasReaderTextSelection.decode(json, request: request,
+                        captureSHA256: original.captureSHA256)
+                }
+            }, onCancel: { flag.cancel(); source.cancel() })
+            try Task.checkCancellation()
+            guard session === source, operation == ticket, !flag.isCanceled,
+                  info?.identity.matches(original.identity) == true else { throw AtlasReaderError.canceled }
+            activeTextSelection = nil; cancellation = nil
+            return result
+        } catch {
+            if operation == ticket { activeTextSelection = nil; cancellation = nil }
+            throw Self.readerError(error)
+        }
+    }
+
+    /// A newer selection may cancel only its own in-flight work. It cannot
+    /// interrupt a subsequent explicit navigation, query or desk operation.
+    func cancelTextSelection() {
+        guard let activeTextSelection, activeTextSelection == operation else { return }
+        cancel()
+    }
+
     func read(_ request: AtlasReaderRequest) async throws -> AtlasReaderPage {
         guard let session, let info else { throw AtlasReaderError.unavailable }
         // Reject invalid navigation before canceling an admitted operation.
@@ -780,6 +827,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
     func clearFind() { acceptedFind = nil }
 
     func cancel() {
+        activeTextSelection = nil
         if let job = activeDocumentJob { documentState.abandon(job) }
         activeDocumentJob = nil
         operation = UUID()

@@ -130,6 +130,12 @@ private final class DeskReaderFixture: @unchecked Sendable {
                     out["has_replacements"] = false; out["reaches_eof"] = true
                     out["next_offset"] = NSNull(); out["rows"] = [["line": "1"]]
                     return encode(out)
+                case .keep(let expected, let attempt, let reader, let start, let end):
+                    guard expected == revision, attempt > revision, readers.contains(reader),
+                          start <= end, end <= UInt64(bytes.count) else { return nil }
+                    revision = attempt; offset = start; selection = (start, end)
+                    log.append("keep:\(start):\(end)")
+                    return state()
                 case .apply(let expected, let attempt, let kind, let pane, let start, let end, _):
                     guard expected == revision, attempt > revision, kind == 2, pane == 1 else { return nil }
                     revision = attempt; offset = start; selection = (start, end); log.append("update")
@@ -158,7 +164,27 @@ private final class DeskReaderFixture: @unchecked Sendable {
         fork: { [self] source, destination in locked {
             guard readers.contains(source) else { return nil }
             readers.insert(destination); log.append("fork:\(destination)"); return encode(readerInfo(destination))
-        } }, comparison: AtlasReaderComparisonTransport(domain: domain ?? self.domain, compare: { _, _, _, _, _ in nil }))
+        } }, comparison: AtlasReaderComparisonTransport(domain: domain ?? self.domain, compare: { _, _, _, _, _ in nil }),
+        textSelection: AtlasReaderTextSelectionTransport(resolve: { [self] reader, windowStart, windowEnd, first, last in
+            precondition(!Thread.isMainThread)
+            return locked {
+                guard readers.contains(reader), windowStart <= windowEnd, windowEnd <= UInt64(bytes.count),
+                      first < last, last <= windowEnd - windowStart else { return nil }
+                let start = windowStart + first, end = windowStart + last
+                let raw = bytes[Int(start)..<Int(end)]
+                guard let text = String(bytes: raw, encoding: .utf8) else { return nil }
+                var out = readerHeader(reader, "resolve-selection")
+                out["selection_namespace"] = "native-text"
+                out["window_original_range"] = ["start": String(windowStart), "end": String(windowEnd)]
+                out["window_utf8_range"] = ["start": String(first), "end": String(last)]
+                out["original_range"] = ["start": String(start), "end": String(end)]
+                out["text"] = text; out["original_hex"] = hex(raw)
+                out["contains_replacements"] = false
+                log.append("selection:\(start):\(end)")
+                return encode(out)
+            }
+        }))
+
     }
 }
 
@@ -242,6 +268,64 @@ private final class DeskReaderFixture: @unchecked Sendable {
         await wait("late initialized destination did not retire") {
             canceledFixture.calls.contains("reader-close:100") && canceledFixture.calls.contains("desk-close")
         }
-        print("Desk reader transfer, source authority, exact navigation, stale update and cancellation regressions passed.")
+        try await nativeSelectionUpdatesExactDeskRange()
+        try await firstKeepUsesSelectedRangeAndRejectsChangedIntent()
+        print("Desk reader transfer, exact native selections, source authority, navigation, stale update and cancellation regressions passed.")
     }
+
+    @MainActor private static func nativeSelectionUpdatesExactDeskRange() async throws {
+        let fixture = DeskReaderFixture(), desk = await started(fixture)
+        let capture = try await desk.openReader(pane: 1, transport: fixture.readerTransport())
+        defer { capture.reader.close(); desk.close() }
+        let reader = capture.reader
+        let range = (reader.source!.text as NSString).range(of: "exact\0bytes")
+        reader.updateTextSelection(source: reader.source!, navigation: reader.navigation, range: range)
+        precondition(reader.hasTextSelectionIntent && !capture.canUpdate(desk)
+            && !capture.keepCurrentPage(in: desk), "pending selection fell back to the full page")
+        await wait("selected text did not resolve") { reader.textSelection != nil }
+        precondition(reader.rangeForReadingDesk?.start == 16 && reader.rangeForReadingDesk?.end == 27)
+        precondition(capture.keepCurrentPage(in: desk))
+        await wait("selected desk range did not update") { !desk.busy }
+        precondition(desk.state?.active?.location.selection?.start == 16
+            && desk.state?.active?.location.selection?.end == 27,
+            "Keep stored the page instead of the selected passage")
+        let updates = fixture.calls.filter { $0 == "update" }.count
+        reader.updateTextSelection(source: reader.source!, navigation: reader.navigation,
+            range: NSRange(location: NSNotFound, length: 1))
+        await wait("invalid native range did not refuse") { !reader.resolvingTextSelection }
+        precondition(reader.hasTextSelectionIntent && reader.rangeForReadingDesk?.start == nil
+            && !capture.keepCurrentPage(in: desk))
+        precondition(fixture.calls.filter { $0 == "update" }.count == updates,
+            "a refused native selection changed the saved range")
+    }
+
+    @MainActor private static func firstKeepUsesSelectedRangeAndRejectsChangedIntent() async throws {
+        let fixture = DeskReaderFixture(), desk = await started(fixture)
+        let capture = try await desk.openReader(pane: 1, transport: fixture.readerTransport())
+        defer { capture.reader.close(); desk.close() }
+        let reader = capture.reader
+        reader.updateTextSelection(source: reader.source!, navigation: reader.navigation,
+            range: NSRange(location: 0, length: 6))
+        await wait("first Keep selection did not resolve") { reader.textSelection != nil }
+        desk.keep(reader: reader)
+        await wait("first Keep did not finish") { !desk.busy }
+        precondition(fixture.calls.contains("keep:8:14"),
+            "the ordinary Keep entry point did not import the exact selected passage")
+        precondition(desk.state?.active?.location.selection?.start == 8
+            && desk.state?.active?.location.selection?.end == 14)
+
+        let previous = desk.state!.active!.location
+        let keeps = fixture.calls.filter { $0.hasPrefix("keep:") }.count
+        desk.keep(reader: reader)
+        // Change intent before the desk's asynchronous transfer gets its turn.
+        // Equal source identity alone must not authorize the obsolete action.
+        reader.updateTextSelection(source: reader.source!, navigation: reader.navigation, range: nil)
+        await wait("obsolete Keep did not finish") { !desk.busy }
+        precondition(fixture.calls.filter { $0.hasPrefix("keep:") }.count == keeps,
+            "an obsolete selected passage crossed the retained-reader handoff")
+        precondition(desk.state!.active!.location == previous,
+            "selection revocation changed already accepted personal state")
+        precondition(!fixture.calls.contains("LIVE-OPEN"))
+    }
+
 }

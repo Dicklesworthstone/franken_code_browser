@@ -99,6 +99,6 @@ extension AtlasReaderTransport {
             source.open(handle: handle, label: path, limit: limit, using: self)
         }, window: window, lines: lines, position: position, cancel: cancel, close: close,
         retirementFailed: retirementFailed, fork: fork, openBytes: openBytes, comparison: comparison,
-        references: references)
+        references: references, textSelection: textSelection)
     }
 }

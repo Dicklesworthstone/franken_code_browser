@@ -3,6 +3,7 @@
 #include "../../../../crates/fcb-bridge/include/fcb_reader_supplied.h"
 #include "../../../../crates/fcb-bridge/include/fcb_reader_comparison.h"
 #include "../../../../crates/fcb-bridge/include/fcb_reader_references.h"
+#include "../../../../crates/fcb-bridge/include/fcb_reader_sessions.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,6 +86,12 @@ char *fcb_reader_reference(uint64_t handle, uint64_t generation,
     assert(handle == fixture_handle && generation == UINT64_MAX);
     assert(reference_id == UINT64_MAX - 3 && context_bytes == UINT64_C(2048));
     return reference_reply("{\"reference_fixture\":true}");
+}
+char *fcb_reader_resolve_selection(uint64_t handle, uint64_t window_start,
+    uint64_t window_end, uint64_t utf8_start, uint64_t utf8_end) {
+    (void)handle; (void)window_start; (void)window_end; (void)utf8_start; (void)utf8_end;
+    assert(0 && "supplied-reader fixture must not resolve a native text selection");
+    return NULL;
 }
 uint8_t fcb_reader_cancel(uint64_t handle) { assert(handle == fixture_handle); return 1; }
 uint8_t fcb_reader_close(uint64_t handle) { assert(handle == fixture_handle); return 1; }
