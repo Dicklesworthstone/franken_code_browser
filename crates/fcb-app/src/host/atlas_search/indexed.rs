@@ -11,6 +11,11 @@ mod build;
 mod source;
 pub use build::AtlasIndexBuildProgress;
 pub(super) use build::IndexBuildWork;
+#[path = "relationships.rs"]
+mod relationships;
+pub use relationships::{AtlasRelationshipDirection, AtlasRelationshipSide, MAX_ATLAS_RELATIONSHIPS,
+    MAX_ATLAS_RELATIONSHIP_PARSE_BYTES, MAX_ATLAS_RELATIONSHIP_METADATA_BYTES};
+pub(super) use relationships::{RelationshipSnapshot, RelationshipsWork};
 
 use std::mem::size_of;
 use fcb::search::{CaptureRequest, IndexError, IndexLimits, IndexedQueryState,
@@ -434,6 +439,7 @@ impl RetainedAtlasSearch {
         out.literal(",\"generation\":")?; out.integer(generation)?;
         out.literal(",\"index_generation\":null,\"indexed_source_bytes\":\"0\"}\n")?;
         let response = self.finish(atlas, out, false, &mut canceled)?;
+        self.cancel_relationships_pending();
         self.index = None;
         Ok(response)
     }

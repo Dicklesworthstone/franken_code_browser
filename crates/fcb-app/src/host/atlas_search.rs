@@ -15,8 +15,10 @@ mod progressive;
 pub use progressive::{AtlasSearchProgress, AtlasSearchStop};
 use progressive::SearchWork;
 mod indexed;
-pub use indexed::{AtlasIndexOptions, AtlasIndexBuildProgress, MAX_ATLAS_INDEX_GRAMS};
-use indexed::{IndexQueryUsage, RetainedIndex, IndexBuildWork};
+pub use indexed::{AtlasIndexOptions, AtlasIndexBuildProgress, MAX_ATLAS_INDEX_GRAMS,
+    AtlasRelationshipDirection, AtlasRelationshipSide, MAX_ATLAS_RELATIONSHIPS,
+    MAX_ATLAS_RELATIONSHIP_PARSE_BYTES, MAX_ATLAS_RELATIONSHIP_METADATA_BYTES};
+use indexed::{IndexQueryUsage, RetainedIndex, IndexBuildWork, RelationshipSnapshot, RelationshipsWork};
 mod scope;
 pub use scope::{AtlasSearchScope, AtlasSearchPathKind, MAX_SEARCH_SCOPE_TOKENS, MAX_SEARCH_SCOPE_TOKEN_BYTES,
     MAX_SEARCH_SCOPE_LIST_BYTES, MAX_SEARCH_SCOPE_PATH_BYTES, MAX_SEARCH_REGION_FILES, MAX_SEARCH_REGION_WIRE_BYTES};
@@ -83,14 +85,18 @@ impl AtlasSearchOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AtlasSearchError {
     App(AppError), Atlas(AtlasSessionError), Reader(ReaderSessionError), Index(IndexError),
+    Document(fcb::document::links::DocumentLinkError),
     InvalidLimits, InvalidScope, WrongAtlas, StaleQuery, MissingQuery, MissingHit, Canceled,
     IdentityExhausted, MissingIndex, StaleIndex, OutOfScope,
+    MissingRelationships, StaleRelationships, MissingRelationship, MissingRelationshipPath,
+    RelationshipTargetUnavailable,
 }
 impl std::fmt::Display for AtlasSearchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::App(e) => write!(f, "{e}"), Self::Atlas(e) => write!(f, "{e}"),
             Self::Reader(e) => write!(f, "{e}"), Self::Index(e) => write!(f, "{e}"),
+            Self::Document(e) => write!(f, "{e}"),
             other => f.write_str(match other {
                 Self::InvalidLimits => "ATLAS_SEARCH_INVALID_LIMITS",
                 Self::InvalidScope => "ATLAS_SEARCH_INVALID_SCOPE",
@@ -103,6 +109,11 @@ impl std::fmt::Display for AtlasSearchError {
                 Self::MissingIndex => "ATLAS_SEARCH_NO_INDEX",
                 Self::StaleIndex => "ATLAS_SEARCH_STALE_INDEX",
                 Self::OutOfScope => "ATLAS_SEARCH_HIT_OUT_OF_SCOPE",
+                Self::MissingRelationships => "ATLAS_LINKS_NOT_PREPARED",
+                Self::StaleRelationships => "ATLAS_LINKS_STALE_GENERATION",
+                Self::MissingRelationship => "ATLAS_LINKS_NOT_FOUND",
+                Self::MissingRelationshipPath => "ATLAS_LINKS_PATH_NOT_FOUND",
+                Self::RelationshipTargetUnavailable => "ATLAS_LINKS_TARGET_UNAVAILABLE",
                 _ => unreachable!(),
             }),
         }
@@ -191,6 +202,11 @@ pub struct RetainedAtlasSearch {
     pending: Option<SearchWork>,
     index: Option<RetainedIndex>,
     building: Option<IndexBuildWork>,
+    // Relationship generations are independent of text/index attempts. Their
+    // inventory still pins the exact accepted index generation and manifest.
+    relationships: Option<RelationshipSnapshot>,
+    relationships_pending: Option<RelationshipsWork>,
+    last_relationship_attempt: u64,
     budget: ResourceBudget,
     _metadata_lease: ResourceLease,
 }
@@ -207,6 +223,7 @@ impl RetainedAtlasSearch {
             .map_err(|_| AppError::Admission)?;
         Ok(Self { manifest, grant: grant.clone(), layout: atlas.atlas().layout().revision(), last_attempt: 0,
             next_allocation: 100, accepted: None, pending: None, index: None, building: None,
+            relationships: None, relationships_pending: None, last_relationship_attempt: 0,
             budget, _metadata_lease: metadata_lease })
     }
     pub fn accepted_generation(&self) -> Option<u64> { self.accepted.as_ref().map(|q| q.generation) }

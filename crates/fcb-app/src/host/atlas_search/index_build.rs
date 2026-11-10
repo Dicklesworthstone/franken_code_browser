@@ -237,6 +237,9 @@ impl RetainedAtlasSearch {
         if self.pending.as_ref().is_some_and(|work| matches!(&work.execution, SearchExecution::Indexed(_))) {
             self.pending = None;
         }
+        // Accepted relationship metadata retains its old identity and becomes
+        // explicitly stale; no old edge may resume against replacement bytes.
+        self.cancel_relationships_pending();
         self.index = Some(candidate);
         Ok(response)
     }

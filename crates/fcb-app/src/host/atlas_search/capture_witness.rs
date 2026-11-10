@@ -27,6 +27,7 @@ impl CaptureWitness {
     }
 
     pub(super) fn byte_length(&self) -> u64 { self.byte_length }
+    pub(super) fn digest(&self) -> Sha256Digest { self.digest }
 
     pub(super) fn encode(&self, out: &mut Output) -> Result<(), AtlasSearchError> {
         out.literal(",\"capture_sha256\":")?; out.quoted(&self.digest.to_hex())?;
