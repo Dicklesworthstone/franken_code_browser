@@ -56,6 +56,14 @@ import AppKit
                             .font(.system(.caption, design: .monospaced))
                         Text("File length observed before read: \(observation.observedLength) bytes · \(observation.request.encoding.label)")
                             .font(.caption).foregroundStyle(.secondary)
+                        if let lines = page.lineNavigation {
+                            Text("Physical lines \(lines.firstLine)–\(lines.lastLine) · scanned \(lines.scannedInputBytes) bytes · retained \(observation.capturedRange.count) bytes including decoding context")
+                                .font(.caption).foregroundStyle(.secondary)
+                            if lines.lastLine - lines.firstLine + 1 < lines.requestedLines {
+                                Text("The scan reached the end of the file before the full requested line count.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
                         if let finalLength = observation.finalObservedLength, finalLength != observation.observedLength {
                             Text("Length after read: \(finalLength) bytes; the file changed during this observation.")
                                 .font(.caption).foregroundStyle(.orange)
@@ -115,7 +123,7 @@ import AppKit
                 Button("Next bytes", action: model.nextRange).disabled(!model.canNext)
                     .help("Read a new observation after this byte range")
                 Button("Observe again", action: model.observeAgain).disabled(model.page == nil || model.busy)
-                    .help("Explicitly read this byte location again from the same opened file object")
+                    .help("Repeat this page's byte or physical-line request against the same opened file object")
                 Spacer()
                 Menu("Display") {
                     Toggle("Line numbers", isOn: $showsLineNumbers)
@@ -145,6 +153,27 @@ import AppKit
                     Button("Cancel", action: model.cancel)
                 }
             }
+            HStack(spacing: 7) {
+                Text("Line").font(.caption)
+                TextField("1", text: $model.lineInput).frame(width: 130)
+                    .textFieldStyle(.roundedBorder).onSubmit(model.observeLineInput)
+                    .accessibilityLabel("First physical line, starting at one")
+                Text("Lines").font(.caption)
+                TextField("20", text: $model.lineCountInput).frame(width: 60)
+                    .textFieldStyle(.roundedBorder).onSubmit(model.observeLineInput)
+                    .accessibilityLabel("Maximum complete lines to read, from one to 4096")
+                Picker("Scan up to", selection: $model.lineScanBytes) {
+                    Text("16 MiB").tag(UInt64(16 * 1024 * 1024))
+                    Text("256 MiB").tag(AtlasObservedReaderLimits.lineScanBytes)
+                    Text("1 GiB").tag(UInt64(1024 * 1024 * 1024))
+                    Text("4 GiB").tag(AtlasObservedReaderLimits.maximumLineScanBytes)
+                }.frame(width: 185)
+                Button("Go to lines", action: model.observeLineInput).disabled(!model.canReadLines)
+                    .help("Scan from the beginning of the opened file and retain the requested complete lines from that same scan. Range limits the selected bytes.")
+                Spacer()
+            }
+            Text("Line navigation uses the selected decoding and Range allowance. A scan limit preserves the accepted page; it does not mean the line is missing.")
+                .font(.caption2).foregroundStyle(.secondary)
             Text("Decoding is explicit for the next observation. It does not determine the encoding of unknown file regions.")
                 .font(.caption2).foregroundStyle(.secondary)
         }

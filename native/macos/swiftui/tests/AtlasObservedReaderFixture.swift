@@ -52,6 +52,34 @@ enum ObservedReaderFixture {
         if end < length { out["next_offset"] = String(end) }
         return out
     }
+    static func linePage(_ owner: UInt64, _ input: AtlasObservedReaderInput, _ id: UInt64,
+                         _ request: AtlasObservedReaderLineRequest, offset: UInt64,
+                         length: UInt64 = ObservedReaderFixture.length, text: String = "old\n",
+                         originalHex: String? = nil, lastLine: UInt64? = nil,
+                         readCalls: UInt64 = 1) throws -> [String: Any] {
+        let encoded = originalHex ?? Self.hex(Array(text.utf8))
+        let end = offset + UInt64(encoded.utf8.count / 2)
+        let captureStart = offset > 4 ? offset - 4 : 0, captureEnd = min(length, end + 4)
+        let bytes = try AtlasObservedReaderRequest(offset: offset, bytes: request.maximumSelectedBytes, encoding: request.encoding)
+        var out = page(owner, input, id, bytes, length: length, text: text, originalHex: encoded)
+        out["command"] = "lines"
+        out["requested_visible_range"] = range(offset, end); out["visible_range"] = range(offset, end)
+        out["requested_capture_range"] = range(captureStart, captureEnd)
+        out["captured_range"] = range(captureStart, captureEnd); out["captured_bytes"] = String(captureEnd - captureStart)
+        out["consistency"] = "host-supplied-sequence"; out["whole_file_observed"] = false
+        out["first_physical_line"] = String(request.firstLine)
+        out["next_offset"] = end < length ? String(end) as Any : NSNull()
+        out["observation_source_bytes_read"] = String(captureEnd); out["additional_source_bytes_read"] = String(captureEnd)
+        out["observation_read_calls"] = String(readCalls); out["additional_read_calls"] = String(readCalls)
+        let last = lastLine ?? request.firstLine + (request.lines - 1)
+        out["line_navigation"] = ["first_line": String(request.firstLine), "last_line": String(last),
+            "requested_first_line": String(request.firstLine), "requested_lines": String(request.lines),
+            "max_scan_bytes": String(request.maximumScanBytes), "max_selected_bytes": String(request.maximumSelectedBytes),
+            "scanned_input_bytes": String(end), "payload_bytes_read": String(captureEnd),
+            "read_calls": String(readCalls), "lines_seen": String(last),
+            "metadata_consistency": "unchanged-metadata-not-atomic"]
+        return out
+    }
     static func retained(_ page: [String: Any]) -> [String: Any] {
         var out = page; out["command"] = "retained-window"
         out["additional_source_bytes_read"] = "0"; out["additional_read_calls"] = "0"
@@ -91,8 +119,11 @@ final class ObservedReaderProbe: @unchecked Sendable {
     private var ids: [UInt64: UInt64] = [:]
     private var pages: [UInt64: [UInt64: [String: Any]]] = [:]
     private var requests: [UInt64] = []
+    private var lineRequests: [AtlasObservedReaderLineRequest] = []
     private var active = 0, mostActive = 0, creates = 0, opens = 0, copies = 0, restores = 0
     private var gates: [UInt64: ObservedReaderGate] = [:]
+    private var lineGates: [UInt64: ObservedReaderGate] = [:]
+    private var nextLineFailure: String?
     private var failureOnNextOpen = false
     private var closeAllowed = true
     private var closes: [UInt64: Int] = [:]
@@ -108,9 +139,12 @@ final class ObservedReaderProbe: @unchecked Sendable {
             window: { owner, request, _ in try self.window(owner, request) },
             retained: { owner, id in try self.restore(owner, id) },
             copy: { owner, id, start, end in try self.copy(owner, id, start, end) },
-            cancel: { _ in true }, close: { self.close($0) }, retirementFailed: { self.failedRetirement() })
+            cancel: { _ in true }, close: { self.close($0) }, retirementFailed: { self.failedRetirement() },
+            lines: { owner, request, _ in try self.lines(owner, request) })
     }
     func block(_ offset: UInt64, on gate: ObservedReaderGate) { lock.lock(); gates[offset] = gate; lock.unlock() }
+    func blockLine(_ first: UInt64, on gate: ObservedReaderGate) { lock.lock(); lineGates[first] = gate; lock.unlock() }
+    func failLine(_ code: String) { lock.lock(); nextLineFailure = code; lock.unlock() }
     func failOpen() { lock.lock(); failureOnNextOpen = true; lock.unlock() }
     func setCloseAllowed(_ value: Bool) { lock.lock(); closeAllowed = value; lock.unlock() }
     func setContent(_ value: String) { lock.lock(); content = value; lock.unlock() }
@@ -118,7 +152,9 @@ final class ObservedReaderProbe: @unchecked Sendable {
     func hasReleased(_ label: String) -> Bool { lock.lock(); defer { lock.unlock() }; return released.contains(label) }
     func evict(_ owner: UInt64, _ id: UInt64) { lock.lock(); pages[owner]?.removeValue(forKey: id); lock.unlock() }
     var windowOffsets: [UInt64] { lock.lock(); defer { lock.unlock() }; return requests }
+    var requestedLines: [AtlasObservedReaderLineRequest] { lock.lock(); defer { lock.unlock() }; return lineRequests }
     var maximumActive: Int { lock.lock(); defer { lock.unlock() }; return mostActive }
+    var activeReads: Int { lock.lock(); defer { lock.unlock() }; return active }
     var createCount: Int { lock.lock(); defer { lock.unlock() }; return creates }
     var openCount: Int { lock.lock(); defer { lock.unlock() }; return opens }
     var copyCount: Int { lock.lock(); defer { lock.unlock() }; return copies }
@@ -156,6 +192,23 @@ final class ObservedReaderProbe: @unchecked Sendable {
         gate?.wait() // Intentionally returns a valid late result even after cancellation.
         lock.lock(); defer { active -= 1; lock.unlock() }
         let page = ObservedReaderFixture.page(owner, input, id, request, text: text)
+        pages[owner, default: [:]][id] = page
+        if let keys = pages[owner]?.keys.sorted(), keys.count > 8, let first = keys.first { pages[owner]?.removeValue(forKey: first) }
+        return try ObservedReaderFixture.encode(page)
+    }
+    private func lines(_ owner: UInt64, _ request: AtlasObservedReaderLineRequest) throws -> String? {
+        lock.lock()
+        guard let input = inputs[owner] else { lock.unlock(); return nil }
+        lineRequests.append(request); active += 1; mostActive = max(mostActive, active)
+        let id = (ids[owner] ?? 0) + 1; ids[owner] = id
+        let gate = lineGates.removeValue(forKey: request.firstLine), text = content, failure = nextLineFailure
+        nextLineFailure = nil
+        lock.unlock()
+        gate?.wait() // A valid late receipt still must not publish after input edits.
+        lock.lock(); defer { active -= 1; lock.unlock() }
+        if let failure { return try ObservedReaderFixture.failure(owner, failure) }
+        let page = try ObservedReaderFixture.linePage(owner, input, id, request,
+            offset: (request.firstLine - 1) * 4, text: text)
         pages[owner, default: [:]][id] = page
         if let keys = pages[owner]?.keys.sorted(), keys.count > 8, let first = keys.first { pages[owner]?.removeValue(forKey: first) }
         return try ObservedReaderFixture.encode(page)

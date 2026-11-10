@@ -243,6 +243,44 @@ does not evict the reader's eight retained byte observations. The backend, C ABI
 and native model regression suites cover these contracts; executable Rust/Swift
 and physical-Mac qualification remain pending.
 
+## Line navigation in large files
+
+The **Observed Range Reader** also accepts a one-based **Line** and a **Lines**
+count. Choose a scan allowance and use **Go to lines** to read a physical line
+window even when the file exceeds the complete reader's 32 MiB capture limit.
+The range allowance bounds the selected source bytes; the scan allowance
+separately bounds the prefix that must be examined to find those lines.
+
+The operation starts at byte zero of the same already-opened file descriptor,
+using the selected UTF-8, UTF-16 LE, or UTF-16 BE decoding. It retains the target
+bytes during that same forward scan. It does not locate a line and then reread
+possibly changed bytes, or reuse an old line index against a mutable file.
+CR, LF, and CRLF are physical line endings; a final terminator does not create
+an extra line. Original terminators remain available through exact hex copy.
+
+Successful pages carry their observed physical line numbers and retain that
+provenance through Back/Forward without file I/O. If EOF occurs partway through
+the requested line count, the available final lines are returned. An absent
+first line, an exhausted prefix-scan allowance, an oversized selected window,
+a read-call limit, cancellation, and a detected source change have distinct
+outcomes. They preserve the accepted page; a limit never becomes a claim that
+the requested line is missing. Reduce **Lines** or increase the relevant
+allowance when a selected window does not fit. Byte navigation remains useful
+for a single line larger than the maximum retained window.
+
+Each request admits at most 4,096 lines, 256 KiB of selected source plus bounded
+decoding context, 4 GiB of scan input, and 1,048,576 read calls. The scan keeps a
+16 KiB input buffer and bounded selected bytes, without a whole-file buffer or
+one stored offset per line. Before/after metadata checks apply to the opened
+descriptor, including after a pathname replacement; they do not establish an
+atomic filesystem snapshot. **Reopen current file** explicitly follows the
+current pathname.
+
+Rust host, C-boundary, native transport, and reader-model regression cases
+cover same-scan retention, UTF-16 and CRLF boundaries, large prefixes, retained
+history, limits, stale replies, and cancellation. These are code-first changes;
+executable Rust/Swift and physical-Mac qualification remain pending.
+
 ## Source reader display
 
 The source reader's **Display** menu provides independent **Line numbers**,

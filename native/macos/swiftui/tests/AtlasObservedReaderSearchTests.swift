@@ -574,7 +574,13 @@ private final class ObservedSearchProbe: @unchecked Sendable {
             && model.searchSelection == NSRange(location: 4, length: 4),
             "An exact engine receipt selects the unaffected match despite malformed neighboring bytes")
         let earlierPage = model.page!
-        model.searchText = "end"; model.find()
+        let retainedNavigation = model.navigation
+        model.searchText = "end"
+        precondition(model.page!.matches(earlierPage) && model.searchSelection == NSRange(location: 4, length: 4)
+            && model.navigation == retainedNavigation && model.searchContext == nil && model.externalContext == nil
+            && model.searchReport == nil && !model.canGoToVerifiedMatch,
+            "Editing Find revokes query authority without erasing the independently verified page selection")
+        model.find()
         try await wait("another query before retained history") { model.searchReport != nil && !model.busy }
         model.nextSearchHit(); try await wait("another query witness") { model.selectedSearchWitness != nil && !model.busy }
         model.goToVerifiedMatch(); try await wait("another query verified page") { !model.busy }

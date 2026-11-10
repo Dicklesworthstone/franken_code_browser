@@ -28,7 +28,10 @@ import Foundation
 
     @MainActor static func main() async throws {
         try inputAndWire()
+        try lineInputAndWire()
         try await retainedNavigation()
+        try await lineNavigation()
+        try await lineEditsAndCancellation()
         try await latestAndReopen()
         try await cancellationAndGrantDrain()
         try await quarantineAndCapacity()
@@ -160,6 +163,252 @@ import Foundation
         } catch AtlasObservedReaderError.engine(let code) {
             check(code == "OBSERVED_READER_OBSERVATION_UNAVAILABLE", "Evicted history remains explicitly unavailable")
         }
+    }
+
+
+    @MainActor private static func lineInputAndWire() throws {
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.log".utf8))
+        for first in [UInt64(0)] {
+            rejectInput { _ = try AtlasObservedReaderLineRequest(firstLine: first) }
+        }
+        for count in [UInt64(0), 4097] {
+            rejectInput { _ = try AtlasObservedReaderLineRequest(firstLine: 1, lines: count) }
+        }
+        rejectInput { _ = try AtlasObservedReaderLineRequest(firstLine: UInt64.max, lines: 2) }
+        for bytes in [UInt64(0), 3, AtlasObservedReaderLimits.maximumPageBytes + 1] {
+            rejectInput { _ = try AtlasObservedReaderLineRequest(firstLine: 1, maximumSelectedBytes: bytes) }
+        }
+        for bytes in [UInt64(0), AtlasObservedReaderLimits.maximumLineScanBytes + 1] {
+            rejectInput { _ = try AtlasObservedReaderLineRequest(firstLine: 1, maximumScanBytes: bytes) }
+        }
+        let request = try AtlasObservedReaderLineRequest(firstLine: 50_001, lines: 2,
+            maximumSelectedBytes: 64, maximumScanBytes: 1 << 32)
+        let object = try ObservedReaderFixture.linePage(41, input, 2, request,
+            offset: 3 * 1024 * 1024 * 1024, text: "one\r\ntwo\n", readCalls: 200_000)
+        func decode(_ value: [String: Any]) throws -> AtlasObservedReaderPage {
+            try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(value), handle: 41, input: input, lines: request)
+        }
+        let page = try decode(object)
+        check(page.firstPhysicalLine == 50_001 && page.lineNavigation?.lastLine == 50_002
+            && page.observation.sourceBytesRead > page.observation.capturedRange.count
+            && page.observation.readCalls == 200_000 && page.visibleRange.count == 9
+            && page.observation.request.bytes == 64 && !page.observation.wholeFileObserved,
+            "Line receipts retain complete selected bytes and independent prefix I/O without a whole-file claim")
+
+        let badFields: [(String, Any)] = [
+            ("command", "window"), ("line_navigation", NSNull()), ("encoding", "utf16be"),
+            ("consistency", "unchanged-metadata-not-atomic"), ("first_physical_line", "1"),
+            ("first_physical_line", NSNull()), ("observation_source_bytes_read", "17"),
+            ("observation_read_calls", "1"), ("additional_source_bytes_read", "0"),
+            ("additional_read_calls", "0"), ("final_observed_length", NSNull()),
+            ("whole_file_observed", true), ("requested_bytes", "65"),
+            ("visible_range", ObservedReaderFixture.range(page.visibleRange.start + 1, page.visibleRange.end)),
+        ]
+        for (key, value) in badFields {
+            var bad = object; bad[key] = value
+            rejectWire { _ = try decode(bad) }
+        }
+        let receipt = object["line_navigation"] as! [String: String]
+        let badReceipt: [(String, String)] = [
+            ("first_line", "50000"), ("last_line", "50003"), ("last_line", "50001"), ("requested_first_line", "50000"),
+            ("requested_lines", "3"), ("max_scan_bytes", "4294967295"), ("max_selected_bytes", "128"),
+            ("scanned_input_bytes", "0"), ("scanned_input_bytes", "4294967296"),
+            ("payload_bytes_read", "4294967297"), ("read_calls", "0"), ("read_calls", "1048577"),
+            ("lines_seen", "50000"), ("metadata_consistency", "atomic"),
+        ]
+        for (key, value) in badReceipt {
+            var bad = object, altered = receipt; altered[key] = value; bad["line_navigation"] = altered
+            rejectWire { _ = try decode(bad) }
+        }
+        for key in receipt.keys {
+            var bad = object, altered = receipt; altered.removeValue(forKey: key); bad["line_navigation"] = altered
+            rejectWire { _ = try decode(bad) }
+        }
+        let byteRequest = try AtlasObservedReaderRequest(offset: 0, bytes: 4)
+        var ordinary = ObservedReaderFixture.page(41, input, 3, byteRequest)
+        ordinary["line_navigation"] = receipt
+        rejectWire {
+            _ = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(ordinary),
+                handle: 41, input: input, request: byteRequest)
+        }
+        let retained = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(ObservedReaderFixture.retained(object)),
+            handle: 41, input: input, retained: page)
+        check(retained.matches(page), "Retained line replay preserves the exact scan receipt without prefix I/O")
+        var altered = ObservedReaderFixture.retained(object), changed = receipt
+        changed["max_scan_bytes"] = "4294967295"; altered["line_navigation"] = changed
+        rejectWire {
+            _ = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(altered), handle: 41, input: input, retained: page)
+        }
+        var reread = ObservedReaderFixture.retained(object); reread["additional_read_calls"] = "1"
+        rejectWire {
+            _ = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(reread), handle: 41, input: input, retained: page)
+        }
+        let copied = try AtlasObservedReaderCopy.decode(ObservedReaderFixture.encode(ObservedReaderFixture.copy(object)),
+            handle: 41, input: input, page: page)
+        check(copied.originalHex == page.originalHex, "Original-byte copy preserves the same scan's line provenance")
+        var wrongCopy = ObservedReaderFixture.copy(object); wrongCopy["line_navigation"] = changed
+        rejectWire {
+            _ = try AtlasObservedReaderCopy.decode(ObservedReaderFixture.encode(wrongCopy), handle: 41, input: input, page: page)
+        }
+
+        let shortRequest = try AtlasObservedReaderLineRequest(firstLine: 2, lines: 20, maximumSelectedBytes: 64)
+        let short = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(
+            ObservedReaderFixture.linePage(41, input, 4, shortRequest, offset: 6, length: 10, text: "last", lastLine: 2)),
+            handle: 41, input: input, lines: shortRequest)
+        check(short.lineNavigation?.lastLine == 2 && short.nextOffset == nil,
+            "A resolved short final line window retains the requested maximum and actual final line")
+        let tinyRequest = try AtlasObservedReaderLineRequest(firstLine: 1, lines: 1, maximumSelectedBytes: 4)
+        let tiny = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(
+            ObservedReaderFixture.linePage(41, input, 5, tinyRequest, offset: 0, length: 1, text: "\n")),
+            handle: 41, input: input, lines: tinyRequest)
+        check(tiny.visibleRange.count == 1 && tiny.firstPhysicalLine == 1,
+            "A four-byte allowance still admits a one-byte complete line")
+
+        for encoding in AtlasObservedReaderEncoding.allCases {
+            let bom: [UInt8]
+            switch encoding {
+            case .utf8: bom = [0xef, 0xbb, 0xbf]
+            case .utf16le: bom = [0xff, 0xfe]
+            case .utf16be: bom = [0xfe, 0xff]
+            }
+            for bomOnly in [false, true] {
+                let body: [UInt8]
+                switch encoding {
+                case .utf8: body = bomOnly ? [] : [65, 10]
+                case .utf16le: body = bomOnly ? [] : [65, 0, 10, 0]
+                case .utf16be: body = bomOnly ? [] : [0, 65, 0, 10]
+                }
+                let raw = bom + body
+                let request = try AtlasObservedReaderLineRequest(firstLine: 1, lines: 1,
+                    maximumSelectedBytes: 16, encoding: encoding)
+                var value = try ObservedReaderFixture.linePage(41, input, 6, request, offset: 0,
+                    length: UInt64(raw.count), text: bomOnly ? "" : "A\n",
+                    originalHex: ObservedReaderFixture.hex(raw))
+                value["visible_range"] = ObservedReaderFixture.range(UInt64(bom.count), UInt64(raw.count))
+                value["boundaries_adjusted"] = true; value["original_hex"] = ObservedReaderFixture.hex(body)
+                let page = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(value),
+                    handle: 41, input: input, lines: request)
+                check(page.firstPhysicalLine == 1 && page.lineNavigation?.firstLine == 1
+                    && page.visibleRange.count == UInt64(body.count) && page.text == (bomOnly ? "" : "A\n"),
+                    "Scan-proven line one survives an actual leading BOM, including a BOM-only source")
+            }
+        }
+    }
+
+    @MainActor private static func lineNavigation() async throws {
+        let probe = ObservedReaderProbe()
+        let model = AtlasObservedReaderModel(transport: probe.transport)
+        model.pageBytes = 4; model.lineCountInput = "1"
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.log".utf8))
+        model.open(source(input))
+        await wait("Initial line-navigation reader never opened") { !model.busy && model.page != nil }
+        let initial = model.page!
+        model.lineInput = "50001"; model.observeLineInput()
+        await wait("Physical line request never committed") { !model.busy && model.page?.firstPhysicalLine == 50_001 }
+        let linePage = model.page!
+        check(linePage.lineNavigation?.requestedFirstLine == 50_001 && probe.openCount == 1
+            && probe.windowOffsets == [0] && probe.requestedLines.count == 1 && model.canBack,
+            "Line navigation uses the existing descriptor and publishes a separate scan-backed observation")
+        model.back()
+        await wait("Back did not restore the earlier byte observation") { !model.busy && model.page?.matches(initial) == true }
+        model.forward()
+        await wait("Forward did not restore line provenance") { !model.busy && model.page?.matches(linePage) == true }
+        let copied = await model.copyOriginalHex()
+        check(copied == linePage.originalHex && probe.requestedLines.count == 1 && probe.windowOffsets == [0],
+            "Line history and copy reuse retained bytes without another scan or byte-window read")
+        model.nextRange()
+        await wait("Byte navigation after physical lines never finished") { !model.busy && model.page?.lineNavigation == nil }
+        check(model.page?.firstPhysicalLine == nil,
+            "A later independent byte observation cannot inherit physical line proof from the previous scan")
+        model.back()
+        await wait("Line history was lost after byte navigation") { !model.busy && model.page?.matches(linePage) == true }
+
+        for (code, message) in [
+            ("OBSERVED_READER_LINE_MISSING", "reached the end"),
+            ("OBSERVED_READER_LINE_SCAN_BYTE_LIMIT", "not known to be missing"),
+            ("OBSERVED_READER_LINE_OUTPUT_BYTE_LIMIT", "Request fewer lines"),
+            ("OBSERVED_READER_LINE_READ_CALL_LIMIT", "read-call limit"),
+        ] {
+            let navigation = model.navigation
+            probe.failLine(code); model.observeLineInput()
+            await wait("Line failure never settled") { !model.busy }
+            check(model.page?.matches(linePage) == true && model.navigation == navigation && model.canForward
+                && model.notice.contains(message),
+                "Missing lines and bounded scan/output/call stops preserve accepted page, selection and history")
+        }
+        let calls = probe.requestedLines.count
+        for invalid in ["0", "01", "-1", "", "18446744073709551616"] {
+            model.lineInput = invalid; model.observeLineInput()
+            check(!model.canReadLines && !model.busy && probe.requestedLines.count == calls
+                && model.page?.matches(linePage) == true, "Invalid line text cannot cross the transport")
+        }
+        model.lineInput = "50001"
+        for invalid in ["0", "02", "4097", "18446744073709551615"] {
+            model.lineCountInput = invalid; model.observeLineInput()
+            check(!model.canReadLines && probe.requestedLines.count == calls, "Invalid line counts are refused before source work")
+        }
+        model.observeAgain()
+        await wait("Observe again did not replay the accepted line request") {
+            !model.busy && model.page?.observation.id != linePage.observation.id
+        }
+        check(probe.requestedLines.count == calls + 1 && probe.requestedLines.last?.firstLine == 50_001
+            && probe.requestedLines.last?.lines == 1 && model.lineCountInput == "1"
+            && model.page?.firstPhysicalLine == 50_001,
+            "Observe again freezes the accepted physical-line request instead of substituting its byte offset")
+        model.close()
+        await wait("Line reader did not retire") { probe.closedCount == probe.createCount }
+    }
+
+    @MainActor private static func lineEditsAndCancellation() async throws {
+        let probe = ObservedReaderProbe()
+        let model = AtlasObservedReaderModel(transport: probe.transport)
+        model.pageBytes = 4; model.lineCountInput = "1"
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.log".utf8))
+        model.open(source(input, access: ObservedReaderGrant(probe, "line-drain")))
+        await wait("Line edit reader never opened") { !model.busy && model.page != nil }
+        let accepted = model.page!
+        for field in 0..<5 {
+            let first = UInt64(10 + field), gate = ObservedReaderGate()
+            model.encoding = .utf8; model.pageBytes = 4; model.lineCountInput = "1"
+            model.lineScanBytes = AtlasObservedReaderLimits.lineScanBytes; model.lineInput = String(first)
+            probe.blockLine(first, on: gate); model.observeLineInput()
+            await wait("Pending line scan never entered") { gate.entered }
+            switch field {
+            case 0: model.lineInput = String(first + 1)
+            case 1: model.lineCountInput = "2"
+            case 2: model.encoding = .utf16le
+            case 3: model.pageBytes = 16
+            default: model.lineScanBytes = 16 * 1024 * 1024
+            }
+            check(!model.busy && model.page?.matches(accepted) == true, "Editing any frozen line request field revokes pending delivery")
+            gate.release()
+            await wait("Canceled line scan did not drain") { probe.activeReads == 0 }
+            await Task.yield()
+            check(model.page?.matches(accepted) == true && !model.canBack,
+                "A valid but obsolete line receipt cannot publish or append native history")
+        }
+
+        model.encoding = .utf8; model.pageBytes = 4; model.lineCountInput = "1"
+        let before = probe.requestedLines.count, gate = ObservedReaderGate()
+        probe.blockLine(100, on: gate); model.lineInput = "100"; model.observeLineInput()
+        await wait("Coalesced line scan never entered") { gate.entered }
+        model.lineInput = "101"; model.observeLineInput(); await Task.yield()
+        model.lineInput = "102"; model.observeLineInput(); await Task.yield()
+        gate.release()
+        await wait("Latest physical-line request never committed") { !model.busy && model.page?.firstPhysicalLine == 102 }
+        check(probe.requestedLines.dropFirst(before).map(\.firstLine) == [100, 102] && probe.maximumActive == 1,
+            "Physical-line work shares the single active/latest request queue")
+        let current = model.page!, closing = ObservedReaderGate()
+        probe.blockLine(200, on: closing); model.lineInput = "200"; model.observeLineInput()
+        await wait("Closing line scan never entered") { closing.entered }
+        model.cancel()
+        check(model.page?.matches(current) == true && !model.busy, "Explicit cancellation preserves the accepted line observation")
+        model.close()
+        check(!probe.hasReleased("line-drain") && probe.closedCount == 0,
+            "The current project grant remains alive while an entered line scan drains")
+        closing.release()
+        await wait("Line scan did not release its owner and grant") { probe.closedCount == 1 && probe.hasReleased("line-drain") }
+        check(model.page == nil && model.closed, "A line response cannot reopen a revoked presentation")
     }
 
     @MainActor private static func retainedNavigation() async throws {

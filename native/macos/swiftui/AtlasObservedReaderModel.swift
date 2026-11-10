@@ -164,10 +164,21 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         didSet { if oldValue != searchScanBytes { revokeSearch() } }
     }
     var offsetInput = "0"
-    var encoding: AtlasObservedReaderEncoding = .utf8 {
-        didSet { if oldValue != encoding { revokeSearch() } }
+    var lineInput = "1" {
+        didSet { if oldValue != lineInput { revokeLineRequest() } }
     }
-    var pageBytes: UInt64 = AtlasObservedReaderLimits.pageBytes
+    var lineCountInput = "20" {
+        didSet { if oldValue != lineCountInput { revokeLineRequest() } }
+    }
+    var lineScanBytes: UInt64 = AtlasObservedReaderLimits.lineScanBytes {
+        didSet { if oldValue != lineScanBytes { revokeLineRequest() } }
+    }
+    var encoding: AtlasObservedReaderEncoding = .utf8 {
+        didSet { if oldValue != encoding { revokeSearch(); revokeLineRequest() } }
+    }
+    var pageBytes: UInt64 = AtlasObservedReaderLimits.pageBytes {
+        didSet { if oldValue != pageBytes { revokeLineRequest() } }
+    }
     @ObservationIgnored private let transport: AtlasObservedReaderTransport
     @ObservationIgnored private let io = AtlasProjectIO()
     @ObservationIgnored private var authority: AtlasObservedReaderSource?
@@ -177,6 +188,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var operation = UUID()
     @ObservationIgnored private var searchOperation = false
+    @ObservationIgnored private var lineOperation = false
     @ObservationIgnored private var lastSearchGeneration: UInt64 = 0
     @ObservationIgnored private var latestObservation: UInt64 = 0
     private var history: [AtlasObservedReaderPage] = []
@@ -195,6 +207,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         return next > page.observation.request.offset
     }
     var canObserve: Bool { !closed && session != nil }
+    var canReadLines: Bool { canObserve && transport.lines != nil && (try? lineRequest()) != nil }
     var canReopen: Bool { !closed && authority != nil }
     var canCopy: Bool { !busy && page != nil && session != nil && !closed }
     var canSearch: Bool {
@@ -227,13 +240,16 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         var message = "Each range is a separate observation of the opened file object, not an immutable whole-file snapshot. Other bytes remain unknown."
         if let page {
             let observation = page.observation
-            if observation.consistency != "unchanged-metadata-not-atomic" {
+            if page.lineNavigation == nil && observation.consistency != "unchanged-metadata-not-atomic" {
                 message += " The file changed, ended early, or its final metadata was unavailable during this observation (\(observation.consistency))."
             }
             if page.hasReplacements { message += " Decoded text contains replacements; original hex preserves the observed bytes." }
             if page.boundariesAdjusted { message += " Visible boundaries were adjusted for source scalars or CRLF." }
         }
-        return message + " Layout and line labels are local to this range. Back/Forward and original-byte copy use retained observations without rereading. Reopen current file explicitly follows pathname replacement."
+        if page?.lineNavigation != nil {
+            message += " Physical line labels and retained bytes came from the same bounded prefix scan. Matching before/after metadata does not make the scan atomic."
+        } else { message += " Layout and line labels are local to this range." }
+        return message + " Back/Forward and original-byte copy use retained observations without rereading. Reopen current file explicitly follows pathname replacement."
     }
 
     func open(_ source: AtlasObservedReaderSource) {
@@ -301,7 +317,49 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     }
     func observeAgain() {
         guard let page else { return }
-        observe(offset: page.observation.request.offset)
+        if let lines = page.lineNavigation {
+            lineInput = String(lines.requestedFirstLine); lineCountInput = String(lines.requestedLines)
+            lineScanBytes = lines.maximumScanBytes; pageBytes = lines.maximumSelectedBytes
+            encoding = page.observation.request.encoding
+            observeLineInput()
+        } else { observe(offset: page.observation.request.offset) }
+    }
+
+    private func lineRequest() throws -> AtlasObservedReaderLineRequest {
+        guard let first = UInt64(lineInput), String(first) == lineInput,
+              let count = UInt64(lineCountInput), String(count) == lineCountInput else {
+            throw AtlasObservedReaderError.invalidInput
+        }
+        return try .init(firstLine: first, lines: count, maximumSelectedBytes: pageBytes,
+            maximumScanBytes: lineScanBytes, encoding: encoding)
+    }
+
+    /// Resolve and retain complete physical lines from one forward scan of the
+    /// existing descriptor. The host does not reread the discovered byte range.
+    /// Every request field is frozen and rechecked before native publication.
+    func observeLineInput() {
+        guard canObserve, let session, let input = authority?.input,
+              let readLines = session.transport.lines else { return }
+        let request: AtlasObservedReaderLineRequest
+        do { request = try lineRequest() }
+        catch { notice = "Enter a one-based line and 1–4096 lines, with a valid range and scan allowance."; return }
+        let (ticket, flag) = begin("Finding line \(request.firstLine) within a \(request.maximumScanBytes)-byte scan of the opened file…")
+        lineOperation = true
+        task = Task {
+            do {
+                let page = try await io.perform(cancellation: flag, keepingAlive: [session]) {
+                    try AtlasObservedReaderPage.decode(readLines(session.handle, request, flag),
+                        handle: session.handle, input: input, lines: request)
+                }
+                guard accepts(ticket, flag), self.session === session,
+                      (try? self.lineRequest()) == request else { return }
+                guard page.observation.id > latestObservation, let lines = page.lineNavigation else {
+                    throw AtlasObservedReaderError.invalidResponse
+                }
+                install(page, append: true); finish(ticket)
+                notice = "Retained physical lines \(lines.firstLine)–\(lines.lastLine) in observation \(page.observation.id). The same scan read \(lines.payloadBytesRead) bytes; earlier observations keep their original bytes."
+            } catch { fail(error, ticket: ticket) }
+        }
     }
 
     /// Latest requested window wins; one active operation and one waiting
@@ -510,12 +568,22 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     }
 
     private func clearSearchContext() {
-        if searchSelection != nil { navigation = UUID() }
-        searchSelection = nil; searchContext = nil; externalContext = nil
+        // A verified-hit page owns its selection independently of the current
+        // query. Revoking query/external context cannot invalidate that retained
+        // page receipt or make its exact highlight disappear during a failed
+        // replacement operation.
+        let retainedSelection = page?.verifiedSearchSelection
+        if searchSelection != retainedSelection { navigation = UUID() }
+        searchSelection = retainedSelection; searchContext = nil; externalContext = nil
     }
     private func revokeSearch() {
         if searchOperation { cancelWork() }
         searchReport = nil; searchAuthorized = false; selectedSearchWitness = nil; clearSearchContext()
+    }
+    private func revokeLineRequest() {
+        guard lineOperation else { return }
+        cancelWork()
+        notice = "Line request changed. The accepted observation is unchanged; the earlier scan may still be draining."
     }
 
     func cancel() {
@@ -539,14 +607,14 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     private func cancelWork() {
         operation = UUID(); flag?.cancel(); task?.cancel(); io.cancel()
         session?.cancel(); pendingSession?.cancel()
-        task = nil; flag = nil; pendingSession = nil; busy = false; searching = false; searchOperation = false
+        task = nil; flag = nil; pendingSession = nil; busy = false; searching = false; searchOperation = false; lineOperation = false
     }
     private func accepts(_ ticket: UUID, _ flag: AtlasSearchCancellation) -> Bool {
         !closed && operation == ticket && !flag.isCanceled && !Task.isCancelled
     }
     private func finish(_ ticket: UUID) {
         guard operation == ticket else { return }
-        busy = false; flag = nil; task = nil; pendingSession = nil; searching = false; searchOperation = false
+        busy = false; flag = nil; task = nil; pendingSession = nil; searching = false; searchOperation = false; lineOperation = false
     }
     private func fail(_ error: Error, ticket: UUID) {
         guard operation == ticket else { return }
@@ -555,8 +623,20 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     private func message(_ error: Error) -> String {
         if error is CancellationError { return AtlasObservedReaderError.canceled.message }
         if let error = error as? AtlasObservedReaderError {
-            if case .engine(let code) = error, code == "OBSERVED_READER_SEARCH_HIT_CHANGED" {
-                return "The selected match changed or disappeared. The accepted page is unchanged. Run Find again, or read current context explicitly."
+            if case .engine(let code) = error {
+                switch code {
+                case "OBSERVED_READER_SEARCH_HIT_CHANGED":
+                    return "The selected match changed or disappeared. The accepted page is unchanged. Run Find again, or read current context explicitly."
+                case "OBSERVED_READER_LINE_MISSING":
+                    return "The scan reached the end of the opened file before the requested line. The accepted page is unchanged."
+                case "OBSERVED_READER_LINE_SCAN_BYTE_LIMIT":
+                    return "The scan allowance ended before the requested lines and decoding context were resolved. Increase Scan up to and try again; the line is not known to be missing. The accepted page is unchanged."
+                case "OBSERVED_READER_LINE_OUTPUT_BYTE_LIMIT":
+                    return "The requested complete lines exceed the selected Range allowance. Request fewer lines or a larger Range; no truncated line replaced the accepted page."
+                case "OBSERVED_READER_LINE_READ_CALL_LIMIT":
+                    return "The scan reached its read-call limit before resolving the requested lines. The line is not known to be missing. The accepted page is unchanged."
+                default: break
+                }
             }
             return error.message
         }
@@ -565,6 +645,9 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     }
     private func install(_ page: AtlasObservedReaderPage, append: Bool) {
         clearSearchContext()
+        // Updating controls to an accepted historical request must not revoke
+        // the operation that is installing that exact immutable receipt.
+        lineOperation = false
         if append {
             if historyIndex + 1 < history.count { history.removeSubrange((historyIndex + 1)..<history.count) }
             history.append(page)
@@ -584,6 +667,10 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
             searchContext = .verified(selection: searchSelection)
         }
         offsetInput = String(page.observation.request.offset)
+        if let lines = page.lineNavigation {
+            lineInput = String(lines.requestedFirstLine); lineCountInput = String(lines.requestedLines)
+            lineScanBytes = lines.maximumScanBytes
+        }
         navigation = UUID()
     }
 }

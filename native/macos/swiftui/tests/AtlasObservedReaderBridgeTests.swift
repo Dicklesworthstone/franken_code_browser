@@ -65,6 +65,17 @@ import Foundation
         precondition(verifiedHit == expected && count(11) == 1 && allocations() == 12 && frees() == 12)
         let legacy = AtlasObservedReaderSearchTransport(find: search.find, hit: search.hit)
         precondition(legacy.observeHit == nil, "Existing search-only transports retain their optional capability boundary")
+        guard let readLines = transport.lines else { preconditionFailure("Native physical-line transport is missing") }
+        let lineRequest = try AtlasObservedReaderLineRequest(firstLine: offset, lines: 4096,
+            maximumScanBytes: 1 << 32)
+        for encoding in AtlasObservedReaderEncoding.allCases {
+            let selected = try AtlasObservedReaderLineRequest(firstLine: offset, lines: 4096,
+                maximumScanBytes: 1 << 32, encoding: encoding)
+            let result = try readLines(handle, selected, AtlasSearchCancellation())
+            precondition(result == expected)
+        }
+        precondition(count(12) == 3 && allocations() == 15 && frees() == 15,
+            "Line requests preserve UInt64 coordinates, independent byte limits and explicit decoding at the ABI")
 
         // Inconsistent requests must not cross the ABI or let the host silently
         // reduce their prefix and return a different requested observation.
@@ -93,6 +104,7 @@ import Foundation
             { try search.find(handle, searchRequest, AtlasSearchCancellation()) },
             { try search.hit(handle, observation, 255) },
             { try observeHit(handle, witness, request, AtlasSearchCancellation()) },
+            { try readLines(handle, lineRequest, AtlasSearchCancellation()) },
         ]
         for command in commands {
             mode(1)
@@ -113,7 +125,7 @@ import Foundation
 
         // C invokes the supplied callback with its live object context. The
         // transport frees the obsolete reply before throwing cancellation.
-        for operation in 0..<4 {
+        for operation in 0..<5 {
             for lateMode: Int32 in [4, 5] {
                 mode(lateMode)
                 weak var released: AtlasSearchCancellation?
@@ -125,7 +137,8 @@ import Foundation
                         case 0: _ = try transport.open(handle, input, token)
                         case 1: _ = try transport.window(handle, request, token)
                         case 2: _ = try search.find(handle, searchRequest, token)
-                        default: _ = try observeHit(handle, witness, request, token)
+                        case 3: _ = try observeHit(handle, witness, request, token)
+                        default: _ = try readLines(handle, lineRequest, token)
                         }
                         preconditionFailure("Late canceled read-only delivery was not suppressed")
                     } catch AtlasObservedReaderError.canceled { }
@@ -141,6 +154,7 @@ import Foundation
         let canceled = AtlasSearchCancellation(); canceled.cancel()
         let enteredOpen = count(1), enteredWindow = count(3), enteredPolls = count(8), enteredFind = count(9)
         let enteredObserveHit = count(11)
+        let enteredLines = count(12)
         do { _ = try transport.open(handle, input, canceled); preconditionFailure("Pre-entry open cancellation ignored") }
         catch AtlasObservedReaderError.canceled { }
         do { _ = try transport.window(handle, request, canceled); preconditionFailure("Pre-entry window cancellation ignored") }
@@ -149,8 +163,11 @@ import Foundation
         catch AtlasObservedReaderError.canceled { }
         do { _ = try observeHit(handle, witness, request, canceled); preconditionFailure("Pre-entry verified-hit cancellation ignored") }
         catch AtlasObservedReaderError.canceled { }
+        do { _ = try readLines(handle, lineRequest, canceled); preconditionFailure("Pre-entry line scan cancellation ignored") }
+        catch AtlasObservedReaderError.canceled { }
         precondition(count(1) == enteredOpen && count(3) == enteredWindow && count(8) == enteredPolls && count(9) == enteredFind)
         precondition(count(11) == enteredObserveHit)
+        precondition(count(12) == enteredLines)
         precondition(transport.cancel(handle) && transport.close(handle))
         mode(6)
         precondition(transport.create() == 0 && !transport.cancel(handle) && !transport.close(handle))

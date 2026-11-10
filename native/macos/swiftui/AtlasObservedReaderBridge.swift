@@ -11,6 +11,10 @@ private typealias ObservedReaderPoll = @convention(c) (UnsafeMutableRawPointer?)
     _ poll: ObservedReaderPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_observed_reader_retained") private func observedReaderRetained(
     _ handle: UInt64, _ observation: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_observed_reader_lines") private func observedReaderLines(
+    _ handle: UInt64, _ firstLine: UInt64, _ lines: UInt64, _ maximumBytes: UInt64,
+    _ maximumScanBytes: UInt64, _ encoding: UInt64,
+    _ poll: ObservedReaderPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_observed_reader_copy") private func observedReaderCopy(
     _ handle: UInt64, _ observation: UInt64, _ start: UInt64, _ end: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_observed_reader_find") private func observedReaderFind(
@@ -71,7 +75,12 @@ extension AtlasObservedReaderTransport {
             return try observedReaderPolling(cancellation) { poll, context in
                 observedReaderObserveHit(handle, target.generation, target.hit.index, prefix, request.bytes, poll, context)
             }
-        }))
+        }), lines: { handle, request, cancellation in
+            try observedReaderPolling(cancellation) { poll, context in
+                observedReaderLines(handle, request.firstLine, request.lines, request.maximumSelectedBytes,
+                    request.maximumScanBytes, request.encoding.abi, poll, context)
+            }
+        })
 }
 
 private func observedReaderPolling(_ cancellation: AtlasSearchCancellation,

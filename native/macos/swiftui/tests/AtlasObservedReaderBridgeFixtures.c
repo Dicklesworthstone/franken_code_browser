@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { CREATE, OPEN, INFO, WINDOW, RETAINED, COPY, CANCEL, CLOSE, POLLS, FIND, HIT, OBSERVE_HIT, COUNTERS };
+enum { CREATE, OPEN, INFO, WINDOW, RETAINED, COPY, CANCEL, CLOSE, POLLS, FIND, HIT, OBSERVE_HIT, LINES, COUNTERS };
 static uint32_t counts[COUNTERS], allocations, frees, encoding_bits;
 static int32_t mode;
 static char *owned;
@@ -70,6 +70,15 @@ char *fcb_observed_reader_window(uint64_t handle, uint64_t offset, uint64_t byte
     assert(encoding >= 1 && encoding <= 3);
     encoding_bits |= 1u << (unsigned)encoding;
     ++counts[WINDOW]; poll_context(poll, context); return response();
+}
+char *fcb_observed_reader_lines(uint64_t handle, uint64_t first_line, uint64_t lines,
+    uint64_t max_bytes, uint64_t max_scan_bytes, uint64_t encoding,
+    fcb_observed_reader_poll poll, void *context) {
+    assert(handle == handle_value && first_line == offset_value && lines == 4096);
+    assert(max_bytes == 65536 && max_scan_bytes == UINT64_C(4294967296));
+    assert(encoding >= 1 && encoding <= 3);
+    encoding_bits |= 1u << (unsigned)encoding;
+    ++counts[LINES]; poll_context(poll, context); return response();
 }
 char *fcb_observed_reader_retained(uint64_t handle, uint64_t observation) {
     assert(handle == handle_value && observation == observation_value);

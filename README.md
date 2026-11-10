@@ -39,6 +39,12 @@ verified current-context reads. See the [native search workflow](native/macos/RE
 for its catalog and result limits. This addition still requires executable and
 physical-Mac qualification; it is not a claim about an already released binary.
 
+The large-file **Observed Range Reader** now also supports bounded line-number
+navigation. It scans the opened file for the requested physical lines and keeps
+their original bytes from that same scan, with explicit scan and selection
+limits, cancellation, and retained history. See [line navigation in large files](native/macos/README.md#line-navigation-in-large-files).
+This source addition likewise awaits executable and physical-Mac qualification.
+
 > [!IMPORTANT]
 > This repository contains the Rust engine, C ABI bridge, headless `fcb` source tools, and the
 > SwiftUI/Metal app under [`native/macos/`](native/macos/). A single checkout can build the app and
