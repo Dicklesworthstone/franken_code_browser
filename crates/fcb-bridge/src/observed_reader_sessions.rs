@@ -64,6 +64,8 @@ impl AccessError {
 pub(super) enum Command<'a> {
     Info,
     Window { offset: u64, bytes: usize, encoding: ObservedReaderEncoding },
+    Lines { first_line: u64, line_count: u64, max_bytes: usize, max_scan_bytes: u64,
+        encoding: ObservedReaderEncoding },
     Retained { observation: u64 },
     Copy { observation: u64, start: u64, end: u64 },
     Find { generation: u64, needle: &'a str, encoding: ObservedReaderEncoding,
@@ -150,6 +152,8 @@ impl ObservedReaderSessions {
         let result = match command {
             Command::Info => reader.info(&mut stop),
             Command::Window { offset, bytes, encoding } => reader.read_window(offset, bytes, encoding, &mut stop),
+            Command::Lines { first_line, line_count, max_bytes, max_scan_bytes, encoding } =>
+                reader.read_lines(first_line, line_count, max_bytes, max_scan_bytes, encoding, &mut stop),
             Command::Retained { observation } => reader.retained_window(observation, &mut stop),
             Command::Copy { observation, start, end } => reader.copy_range(observation, start, end, &mut stop),
             Command::Find { generation, needle, encoding, max_matches, max_scan_bytes } =>

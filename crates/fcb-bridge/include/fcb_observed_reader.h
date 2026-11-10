@@ -10,8 +10,9 @@ extern "C" {
 /* Bounded observations of one explicitly opened regular file, including files
  * too large for a complete retained reader capture. These are synchronous
  * worker operations: never perform source I/O or final close on a redraw/input
- * callback. Opening is metadata-only. Each window reads at most 256 KiB plus
- * 16 bytes of scalar/CRLF context and receives a fresh observation identity.
+ * callback. Opening is metadata-only. A byte-window request reads at most
+ * 256 KiB plus 16 bytes of scalar/CRLF context and receives a fresh observation
+ * identity. Line requests additionally scan a separately bounded prefix.
  * Separate windows are NOT a coherent whole-file snapshot.
  *
  * Four handles, including retiring in-flight handles, are admitted per loaded
@@ -53,6 +54,27 @@ char *fcb_observed_reader_info(uint64_t handle);
  * whole-paragraph shaping, global line numbering or a new whole-file digest. */
 char *fcb_observed_reader_window(uint64_t handle, uint64_t offset,
     uint64_t bytes, uint64_t encoding, fcb_observed_reader_poll poll, void *context);
+
+/* Locate physical lines by scanning from byte zero of the SAME opened file
+ * object. Retain the selected bytes during that scan; never reread the located
+ * range or reuse line checkpoints from an earlier observation. CR, LF and CRLF
+ * terminate physical lines; a final terminator does not add a phantom line.
+ * Explicit encoding values are the same as window. No whole-file capture or
+ * per-line index is allocated.
+ *
+ * first_line is one-based; line_count is 1..4096. max_bytes is 4..262144 and
+ * bounds retained selected source, with bounded decoder context in addition.
+ * max_scan_bytes is 1..4294967296 (4 GiB); a separate read-call bound applies.
+ * Success returns command "lines", a fresh retained observation and its
+ * line_navigation provenance. Retained replay preserves that provenance
+ * without source I/O. Metadata consistency is not an atomic snapshot promise.
+ * Missing-at-EOF, scan/call/output limits, changed source and cancellation are
+ * explicit errors that leave previously accepted observations intact. A limit
+ * is never proof that the requested line does not exist.
+ */
+char *fcb_observed_reader_lines(uint64_t handle, uint64_t first_line,
+    uint64_t line_count, uint64_t max_bytes, uint64_t max_scan_bytes,
+    uint64_t encoding, fcb_observed_reader_poll poll, void *context);
 
 /* No payload reread. Both commands require an exact retained observation ID.
  * Copy returns original bytes as hex, never silently truncated or decoded. */

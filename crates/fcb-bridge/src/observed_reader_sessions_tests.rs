@@ -152,3 +152,43 @@ fn rejected_search_replacements_preserve_only_the_previous_query_generation() {
     assert!(readers.execute(handle, Command::SearchHit { generation: 1, position: 0 }, || false).is_err());
     readers.close(handle).unwrap();
 }
+
+#[test]
+fn closing_a_line_scan_revokes_delivery_and_keeps_other_readers_available() {
+    let readers = ObservedReaderSessions::new();
+    let handles: Vec<_> = (0..MAX_SESSIONS).map(|_| readers.create().unwrap()).collect();
+    let path = root();
+    let first = handles[0];
+    readers.open(first, &path, b"source.rs", || false).unwrap();
+    readers.open(handles[1], &path, b"source.rs", || false).unwrap();
+    let (entered, receive_entered) = mpsc::sync_channel(0);
+    let (release, receive_release) = mpsc::sync_channel(0);
+    std::thread::scope(|scope| {
+        let readers_ref = &readers;
+        let worker = scope.spawn(move || {
+            let mut sent = false;
+            readers_ref.execute(first, Command::Lines { first_line: 1, line_count: 1,
+                max_bytes: 64, max_scan_bytes: 1024, encoding: ObservedReaderEncoding::Utf8 }, || {
+                // Direct Rust test hook, not a blocking foreign callback.
+                if !sent {
+                    sent = true; entered.send(()).unwrap(); receive_release.recv().unwrap();
+                }
+                false
+            })
+        });
+        receive_entered.recv().unwrap();
+        assert!(matches!(readers.execute(first, Command::Info, || false), Err(AccessError::Busy)));
+        assert!(readers.execute(handles[1], Command::Info, || false).is_ok());
+        readers.close(first).unwrap();
+        assert!(matches!(readers.create(), Err(AccessError::Capacity)),
+            "a retiring line scan still owns its admitted session capacity");
+        assert!(matches!(readers.execute(first, Command::Info, || false), Err(AccessError::Unknown)));
+        release.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err(), "the closed handle must not deliver its line result");
+    });
+    let replacement = readers.create().unwrap();
+    assert!(!handles.contains(&replacement));
+    readers.close(replacement).unwrap();
+    for handle in handles.into_iter().skip(1) { readers.close(handle).unwrap(); }
+    assert_eq!(readers.live.load(Ordering::Acquire), 0);
+}

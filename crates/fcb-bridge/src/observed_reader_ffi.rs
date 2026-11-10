@@ -96,6 +96,23 @@ pub unsafe extern "C" fn fcb_observed_reader_window(handle: u64, offset: u64, by
     }))
 }
 
+/// Locate and retain a line window during one bounded forward observation of
+/// the already opened file. It never scans an old prefix and rereads the target
+/// from different live bytes. Missing and budget-limited lines remain distinct.
+/// # Safety
+/// If supplied, poll/context obey the same worker lifetime contract as open.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_observed_reader_lines(handle: u64, first_line: u64,
+    line_count: u64, max_bytes: u64, max_scan_bytes: u64, encoding: u64,
+    poll: Option<SearchCancellationCallback>, context: *mut c_void) -> *mut c_char {
+    reply(|| answer(handle, |readers| {
+        let encoding = decode_encoding(encoding)?;
+        let max_bytes = usize::try_from(max_bytes).map_err(|_| AccessError::InvalidArgument)?;
+        readers.execute(handle, Command::Lines { first_line, line_count, max_bytes, max_scan_bytes, encoding },
+            || poll.is_some_and(|poll| unsafe { poll(context) != 0 }))
+    }))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_observed_reader_retained(handle: u64, observation: u64) -> *mut c_char {
     reply(|| answer(handle, |readers| readers.execute(handle, Command::Retained { observation }, || false)))
@@ -170,3 +187,7 @@ mod tests;
 #[cfg(all(test, unix))]
 #[path = "observed_reader_search_ffi_tests.rs"]
 mod search_tests;
+
+#[cfg(all(test, unix))]
+#[path = "observed_reader_lines_ffi_tests.rs"]
+mod lines_tests;

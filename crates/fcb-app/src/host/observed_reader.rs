@@ -21,7 +21,10 @@
 //! literal witnesses. Showing surrounding current bytes is a separate window
 //! observation; it cannot silently replace the bytes behind an older hit.
 
+mod lines;
 mod search;
+pub use lines::{MAX_OBSERVED_READER_LINES, MAX_OBSERVED_READER_LINE_READ_CALLS,
+    MAX_OBSERVED_READER_LINE_SCAN_BYTES};
 pub use search::{MAX_OBSERVED_READER_MATCHES, MAX_OBSERVED_READER_NEEDLE_BYTES,
     MAX_OBSERVED_READER_SCAN_BYTES, MAX_OBSERVED_READER_SEARCH_CALLS};
 
@@ -64,7 +67,8 @@ impl ObservedReaderEncoding {
 pub enum ObservedReaderError {
     App(AppError), Source(SourceError), Extent(ExtentError), View(ExtentViewError),
     InvalidPath, InvalidLimits, InvalidRange, MissingObservation, ObservationChanged,
-    StaleQuery, MissingHit, SearchHitChanged, Canceled, IdentityExhausted,
+    StaleQuery, MissingHit, SearchHitChanged, LineMissing, LineScanByteLimit,
+    LineOutputByteLimit, LineReadCallLimit, Canceled, IdentityExhausted,
 }
 impl ObservedReaderError {
     pub fn is_canceled(&self) -> bool {
@@ -90,6 +94,10 @@ impl std::fmt::Display for ObservedReaderError {
             Self::StaleQuery => f.write_str("OBSERVED_READER_STALE_QUERY"),
             Self::MissingHit => f.write_str("OBSERVED_READER_MISSING_HIT"),
             Self::SearchHitChanged => f.write_str("OBSERVED_READER_SEARCH_HIT_CHANGED"),
+            Self::LineMissing => f.write_str("OBSERVED_READER_LINE_MISSING"),
+            Self::LineScanByteLimit => f.write_str("OBSERVED_READER_LINE_SCAN_BYTE_LIMIT"),
+            Self::LineOutputByteLimit => f.write_str("OBSERVED_READER_LINE_OUTPUT_BYTE_LIMIT"),
+            Self::LineReadCallLimit => f.write_str("OBSERVED_READER_LINE_READ_CALL_LIMIT"),
             Self::Canceled => f.write_str("OBSERVED_READER_CANCELED"),
             Self::IdentityExhausted => f.write_str("OBSERVED_READER_IDENTITY_EXHAUSTED"),
         }
@@ -113,6 +121,7 @@ struct Observation {
     sha256: Sha256Digest,
     io: ExtentReadStats,
     find_hit: Option<search::FindHit>,
+    line_navigation: Option<lines::LineNavigation>,
 }
 
 /// Each session requires a fresh non-reused owner. All accepted observations
@@ -230,7 +239,8 @@ impl ObservedReaderSession {
         // not encode bounds planned from a different length as though identical.
         if extent.observed_length() != length { return Err(ObservedReaderError::ObservationChanged); }
         let sha256 = extent_sha256(extent.bytes(), canceled)?;
-        Ok(Observation { extent, plan, requested_bytes: bytes, encoding, sha256, io, find_hit: None })
+        Ok(Observation { extent, plan, requested_bytes: bytes, encoding, sha256, io,
+            find_hit: None, line_navigation: None })
     }
 
     fn accept_observation(&mut self, candidate: Observation) {
@@ -293,7 +303,9 @@ impl ObservedReaderSession {
         out.literal(",\"text_kind\":\"logical-observed-text-not-shaped\",\"visible_range\":")?; out.range(text.range())?;
         out.literal(",\"boundaries_adjusted\":")?; out.boolean(text.range() != page.plan.visible)?;
         out.literal(",\"first_physical_line\":")?;
-        if let Some(line) = text.first_line_number().filter(|_| !text.range().is_empty()) {
+        let first_line = page.line_navigation.and_then(|receipt| receipt.first_physical_line(page, text))
+            .or_else(|| text.first_line_number().filter(|_| !text.range().is_empty()));
+        if let Some(line) = first_line {
             out.integer(line)?;
         } else { out.literal("null")?; }
         out.literal(",\"text\":")?; out.quoted(text.text())?;
@@ -401,6 +413,7 @@ fn encode_observation(out: &mut Output, page: &Observation, new_read: bool) -> R
         ("additional_read_calls", if new_read { page.io.read_calls } else { 0 })] {
         out.literal(",")?; out.quoted(key)?; out.literal(":")?; out.integer(value)?;
     }
+    lines::encode_line_navigation(out, page.line_navigation)?;
     Ok(())
 }
 fn whole_observation(extent: &ObservedExtent) -> bool {

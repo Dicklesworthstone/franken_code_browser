@@ -5,8 +5,8 @@
 //! numbers; they are never re-read from a possibly changed live source.
 
 use std::{ffi::OsString, fs::Metadata, io::{self, Read, Write}, path::PathBuf};
-use fcb::{BrowserSession, ByteLength, ByteOffset, ByteRange};
-use fcb::search::{CaptureRequest, ObservedExtent, ResourceBudget};
+use fcb::{ArenaOwnerId, BrowserSession, ByteLength, ByteOffset, ByteRange};
+use fcb::search::{CaptureRequest, ExtentReadStats, ObservedExtent, ResourceAllocationId, ResourceBudget};
 use fcb::source::{DetectedEncoding, LineNumber};
 use fcb::source::line_index::{LineWindowScanner, LineWindowStatus};
 use fcb_core::ResourceLease;
@@ -186,24 +186,45 @@ pub(crate) fn run(argv: &[OsString], stdout: &mut impl Write, stderr: &mut impl 
     exit
 }
 
-struct Scan {
-    cursor: LineWindowScanner,
-    encoding: DetectedEncoding,
-    selected: Vec<u8>,
-    backing_start: Option<u64>,
-    bytes_read: u64,
-    read_calls: u64,
-    stop: &'static str,
+/// Shared worker request for CLI and native observed-reader line navigation.
+/// The caller owns identity/resource admission and the source's read position.
+#[derive(Clone, Copy)]
+pub(crate) struct LineScanRequest {
+    pub first: LineNumber,
+    pub count: u64,
+    pub max_bytes: usize,
+    pub max_scan: u64,
+    pub max_read_calls: u64,
+    pub encoding: Encoding,
+}
+
+pub(crate) struct Scan {
+    pub cursor: LineWindowScanner,
+    pub encoding: DetectedEncoding,
+    pub selected: Vec<u8>,
+    pub backing_start: Option<u64>,
+    pub bytes_read: u64,
+    pub read_calls: u64,
+    pub stop: &'static str,
     _selected: ResourceLease,
 }
 
-fn read(reader: &mut impl Read, buffer: &mut [u8], calls: &mut u64,
+fn read(reader: &mut impl Read, buffer: &mut [u8], io: &mut ExtentReadStats,
     canceled: &mut impl FnMut() -> bool) -> Result<Option<usize>, AppError> {
     if canceled() { return Err(AppError::Canceled); }
-    *calls += 1;
+    io.read_calls += 1;
+    io.last_step_calls = 1;
+    io.last_step_bytes = 0;
     match reader.read(buffer) {
-        Ok(count) if count <= buffer.len() => Ok(Some(count)),
-        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(None),
+        Ok(count) if count <= buffer.len() => {
+            io.bytes_read += count as u64;
+            io.last_step_bytes = count;
+            Ok(Some(count))
+        }
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+            io.interrupted_calls += 1;
+            Ok(None)
+        }
         _ => Err(AppError::Io),
     }
 }
@@ -232,21 +253,34 @@ fn retain(scan: &mut Scan, base: u64, bytes: &[u8], capacity: usize) -> Result<b
 
 fn scan(reader: &mut impl Read, request: &Request, budget: &ResourceBudget,
     canceled: &mut impl FnMut() -> bool) -> Result<Scan, AppError> {
+    let options = LineScanRequest { first: request.first, count: request.count,
+        max_bytes: request.max_bytes, max_scan: request.max_scan,
+        max_read_calls: MAX_READ_CALLS, encoding: request.encoding };
+    scan_lines(reader, options, budget, owner(), [allocation(61), allocation(62)],
+        &mut ExtentReadStats::default(), canceled)
+}
+
+/// Scan once from the caller's byte-zero read position. Selected bytes and
+/// decoder context are retained from that SAME observation, never re-read.
+/// I/O stats are updated on every attempt, including failure and cancellation,
+/// so a host charges spent work without accepting an incomplete observation.
+pub(crate) fn scan_lines(reader: &mut impl Read, request: LineScanRequest, budget: &ResourceBudget,
+    scan_owner: ArenaOwnerId, allocations: [ResourceAllocationId; 2], io: &mut ExtentReadStats,
+    canceled: &mut impl FnMut() -> bool) -> Result<Scan, AppError> {
     let capacity = request.max_bytes.checked_add(8).ok_or(AppError::InputLimit)?;
-    let selected_lease = budget.try_reserve_managed(owner(), allocation(61), ByteLength::new(capacity as u64))
+    let selected_lease = budget.try_reserve_managed(scan_owner, allocations[0], ByteLength::new(capacity as u64))
         .map_err(|_| AppError::Admission)?;
-    let _input = budget.try_reserve_managed(owner(), allocation(62), ByteLength::new((BUFFER_BYTES + 8) as u64))
+    let _input = budget.try_reserve_managed(scan_owner, allocations[1], ByteLength::new((BUFFER_BYTES + 8) as u64))
         .map_err(|_| AppError::Admission)?;
     let mut selected = Vec::new();
     selected.try_reserve_exact(capacity).map_err(|_| AppError::Admission)?;
     if selected.capacity() > capacity { return Err(AppError::Admission); }
     let mut prefix = [0u8; 3];
     let mut filled = 0usize;
-    let mut calls = 0u64;
     let mut eof = false;
-    while filled < prefix.len() && (filled as u64) < request.max_scan && calls < MAX_READ_CALLS {
+    while filled < prefix.len() && (filled as u64) < request.max_scan && io.read_calls < request.max_read_calls {
         let count = (prefix.len() - filled).min((request.max_scan - filled as u64).min(3) as usize);
-        match read(reader, &mut prefix[filled..filled + count], &mut calls, canceled)? {
+        match read(reader, &mut prefix[filled..filled + count], io, canceled)? {
             Some(0) => { eof = true; break; }
             Some(count) => filled += count,
             None => {}
@@ -260,7 +294,7 @@ fn scan(reader: &mut impl Read, request: &Request, budget: &ResourceBudget,
     };
     let cursor = LineWindowScanner::new(request.first, request.count, encoding).map_err(|_| AppError::InvalidRange)?;
     let mut result = Scan { cursor, encoding, selected, backing_start: None, bytes_read: filled as u64,
-        read_calls: calls, stop: "pending", _selected: selected_lease };
+        read_calls: io.read_calls, stop: "pending", _selected: selected_lease };
     result.cursor.step(ByteOffset::new(0), &prefix[..filled], filled).map_err(|_| AppError::InvalidRange)?;
     let mut fits = retain(&mut result, 0, &prefix[..filled], capacity)?;
     let mut history = [0u8; 8];
@@ -289,10 +323,10 @@ fn scan(reader: &mut impl Read, request: &Request, budget: &ResourceBudget,
             LineWindowStatus::Pending => {}
         }
         if result.bytes_read == request.max_scan { result.stop = "scan-byte-limit"; break; }
-        if result.read_calls == MAX_READ_CALLS { result.stop = "read-call-limit"; break; }
+        if io.read_calls == request.max_read_calls { result.stop = "read-call-limit"; break; }
         let count = wanted.min(request.max_scan - result.bytes_read).min(BUFFER_BYTES as u64) as usize;
         buffer[..history_len].copy_from_slice(&history[..history_len]);
-        let Some(count) = read(reader, &mut buffer[history_len..history_len + count], &mut result.read_calls, canceled)? else { continue; };
+        let Some(count) = read(reader, &mut buffer[history_len..history_len + count], io, canceled)? else { continue; };
         if count == 0 { eof = true; continue; }
         let base = result.bytes_read;
         result.bytes_read += count as u64;
@@ -306,10 +340,11 @@ fn scan(reader: &mut impl Read, request: &Request, budget: &ResourceBudget,
         history[..history_len].copy_from_slice(&buffer[available - history_len..available]);
     }
     if canceled() { return Err(AppError::Canceled); }
+    result.read_calls = io.read_calls;
     Ok(result)
 }
 
-fn same_metadata(left: &Metadata, right: &Metadata) -> bool {
+pub(crate) fn same_metadata(left: &Metadata, right: &Metadata) -> bool {
     #[cfg(unix)] {
         use std::os::unix::fs::MetadataExt;
         left.dev() == right.dev() && left.ino() == right.ino() && left.len() == right.len()
@@ -545,6 +580,80 @@ mod tests {
         let result = scan(&mut Interrupt, &request(1, 1), &budget(), &mut || false).unwrap();
         assert_eq!(result.stop, "read-call-limit"); assert_eq!(result.read_calls, MAX_READ_CALLS);
         assert!(!result.cursor.reached_eof());
+    }
+
+    fn shared_request(first: u64, count: u64, max_calls: u64) -> LineScanRequest {
+        let options = request(first, count);
+        LineScanRequest { first: options.first, count, max_bytes: options.max_bytes,
+            max_scan: options.max_scan, max_read_calls: max_calls, encoding: Encoding::Utf8 }
+    }
+
+    #[test]
+    fn shared_scanner_uses_the_hosts_owner_and_preserves_failed_read_accounting() {
+        struct Scripted { call: usize }
+        impl Read for Scripted {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                self.call += 1;
+                match self.call {
+                    1 => { output[..2].copy_from_slice(b"a\r"); Ok(2) }
+                    2 => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                    3 => { output[0] = b'\n'; Ok(1) }
+                    _ => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+                }
+            }
+        }
+        let scan_owner = ArenaOwnerId::new(91).unwrap();
+        let budget = ResourceBudget::new(scan_owner, ByteLength::new(MANAGED_BYTES)).unwrap();
+        let mut io = ExtentReadStats::default();
+        let error = scan_lines(&mut Scripted { call: 0 }, shared_request(2, 1, 8),
+            &budget, scan_owner, [allocation(101), allocation(102)], &mut io, &mut || false).err().unwrap();
+        assert_eq!(error, AppError::Io);
+        assert_eq!(io.bytes_read, 3);
+        assert_eq!(io.read_calls, 4, "failed and interrupted calls spend the allowance");
+        assert_eq!(io.interrupted_calls, 1);
+    }
+
+    #[test]
+    fn shared_scanner_cancellation_keeps_successful_payload_accounting() {
+        use std::cell::Cell;
+        struct CancelOnRead<'a>(&'a Cell<bool>);
+        impl Read for CancelOnRead<'_> {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                output[..3].copy_from_slice(b"a\nb");
+                self.0.set(true);
+                Ok(3)
+            }
+        }
+        let canceled = Cell::new(false);
+        let mut io = ExtentReadStats::default();
+        let error = scan_lines(&mut CancelOnRead(&canceled), shared_request(2, 1, 8),
+            &budget(), owner(), [allocation(101), allocation(102)], &mut io,
+            &mut || canceled.get()).err().unwrap();
+        assert_eq!(error, AppError::Canceled);
+        assert_eq!(io.bytes_read, 3);
+        assert_eq!(io.read_calls, 1);
+    }
+
+    #[test]
+    fn shared_scanner_call_budget_cannot_masquerade_as_eof() {
+        for max_calls in [3, 4] {
+            let mut reader = ShortReads { input: Cursor::new(b"a\nb".as_slice()),
+                chunk: 1, interrupt: false, calls: 0 };
+            let mut io = ExtentReadStats::default();
+            let result = scan_lines(&mut reader, shared_request(2, 1, max_calls), &budget(),
+                owner(), [allocation(101), allocation(102)], &mut io, &mut || false).unwrap();
+            assert_eq!(io.bytes_read, 3);
+            assert_eq!(io.read_calls, max_calls);
+            assert_eq!(result.read_calls, io.read_calls);
+            if max_calls == 3 {
+                assert_eq!(result.stop, "read-call-limit");
+                assert!(!result.cursor.reached_eof());
+            } else {
+                assert_eq!(result.stop, "resolved");
+                assert!(result.cursor.reached_eof());
+                assert_eq!(exact_bytes(&result), b"b");
+            }
+        }
     }
 
     #[test]
