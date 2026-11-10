@@ -19,6 +19,8 @@ pub(crate) enum IndexCommand<'a> {
         max_matches: usize, max_scan_bytes: u64 },
     BeginScoped { generation: u64, index_generation: u64, needle: &'a str, scope: &'a AtlasSearchScope,
         max_matches: usize, max_scan_bytes: u64 },
+    BeginExpression { generation: u64, index_generation: u64, expression: &'a str,
+        scope: &'a AtlasSearchScope, max_matches: usize, max_scan_bytes: u64 },
     Clear { generation: u64 },
 }
 impl AtlasSessions {
@@ -49,6 +51,9 @@ impl AtlasSessions {
                 session.search.search_indexed_scoped(&session.atlas, generation, index_generation, needle, scope.clone(), max_matches, max_scan_bytes, &mut stop),
             IndexCommand::BeginScoped { generation, index_generation, needle, scope, max_matches, max_scan_bytes } =>
                 session.search.begin_indexed_scoped(&session.atlas, generation, index_generation, needle, scope.clone(), max_matches, max_scan_bytes, &mut stop),
+            IndexCommand::BeginExpression { generation, index_generation, expression, scope, max_matches, max_scan_bytes } =>
+                session.search.begin_indexed_expression_scoped(&session.atlas, generation, index_generation,
+                    expression, scope.clone(), max_matches, max_scan_bytes, &mut stop),
             IndexCommand::Clear { generation } => session.search.clear_index(&session.atlas, generation, &mut stop),
         };
         // Epoch cancellation invalidates both paused work kinds. A terminal

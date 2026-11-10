@@ -78,6 +78,8 @@ pub(super) enum Command<'a> {
     SearchBegin { generation: u64, needle: &'a str, options: AtlasSearchOptions },
     SearchScoped { generation: u64, needle: &'a str, scope: &'a AtlasSearchScope, options: AtlasSearchOptions },
     SearchBeginScoped { generation: u64, needle: &'a str, scope: &'a AtlasSearchScope, options: AtlasSearchOptions },
+    SearchBeginExpression { generation: u64, expression: &'a str, scope: &'a AtlasSearchScope,
+        options: AtlasSearchOptions, max_scan_bytes: u64 },
     StructureBegin { generation: u64, needle: &'a str, scope: &'a AtlasSearchScope, options: AtlasStructureOptions },
     SearchStep { generation: u64 },
     SearchPage { generation: u64, start: usize, limit: usize },
@@ -203,6 +205,9 @@ impl AtlasSessions {
             Command::SearchBegin { generation, needle, options } => session.search.begin(&session.atlas, generation, needle, options, &mut stop).map_err(AccessError::from),
             Command::SearchScoped { generation, needle, scope, options } => session.search.search_scoped(&session.atlas, generation, needle, scope.clone(), options, &mut stop).map_err(AccessError::from),
             Command::SearchBeginScoped { generation, needle, scope, options } => session.search.begin_scoped(&session.atlas, generation, needle, scope.clone(), options, &mut stop).map_err(AccessError::from),
+            Command::SearchBeginExpression { generation, expression, scope, options, max_scan_bytes } =>
+                session.search.begin_expression_scoped(&session.atlas, generation, expression,
+                    scope.clone(), options, max_scan_bytes, &mut stop).map_err(AccessError::from),
             Command::StructureBegin { generation, needle, scope, options } => session.search.begin_structure(&session.atlas, generation, needle, scope.clone(), options, &mut stop).map_err(AccessError::from),
             Command::SearchStep { generation } => session.search.step(&session.atlas, generation, &mut stop).map_err(AccessError::from),
             Command::SearchPage { generation, start, limit } => session.search.page(&session.atlas, generation, start, limit, &mut stop).map_err(AccessError::from),
@@ -305,3 +310,6 @@ mod search_tests;
 #[cfg(all(test, unix))]
 #[path = "atlas_progressive_tests.rs"]
 mod progressive_tests;
+#[cfg(all(test, unix))]
+#[path = "atlas_expression_sessions_tests.rs"]
+mod expression_tests;

@@ -221,6 +221,8 @@ pub extern "C" fn fcb_atlas_search_open_reader(handle: u64, reader: u64, generat
 mod index;
 #[path = "atlas_structure_ffi.rs"]
 mod structure;
+#[path = "atlas_expression_ffi.rs"]
+mod expression;
 
 #[cfg(all(test, unix))]
 #[path = "atlas_search_ffi_tests.rs"]
