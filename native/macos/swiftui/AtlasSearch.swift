@@ -146,26 +146,62 @@ enum AtlasSearchText {
     }
 }
 
-/// These are distinct engine requests. Symbols are qualified heuristic
-/// candidates; headings come from the shared Markdown parser.
+/// Each mode is a distinct shared-engine request. Whole-token occurrences
+/// include comments and literals; declarations remain heuristic candidates.
 enum AtlasSearchMode: String, CaseIterable, Identifiable, Sendable {
-    case text, expression, symbols, headings
+    case text, expression, symbols, headings, occurrences
     var id: String { rawValue }
     var isTextual: Bool { self == .text || self == .expression }
+    var supportsNameMatching: Bool { self == .symbols || self == .headings }
+    func effectiveNameMode(_ supplied: AtlasSearchNameMode) -> AtlasSearchNameMode {
+        self == .occurrences ? .exact : (isTextual ? .contains : supplied)
+    }
     var label: String {
-        switch self { case .text: return "Text"; case .expression: return "Expression"; case .symbols: return "Symbols"; case .headings: return "Headings" }
+        switch self {
+        case .text: return "Text"
+        case .expression: return "Expression"
+        case .symbols: return "Symbols"
+        case .headings: return "Headings"
+        case .occurrences: return "Occurrences"
+        }
     }
     var code: UInt64 {
-        switch self { case .text: return 0; case .symbols: return 1; case .headings: return 2; case .expression: return 3 }
+        switch self { case .text: return 0; case .symbols: return 1; case .headings: return 2; case .expression: return 3; case .occurrences: return 4 }
     }
     var wireMode: String {
-        switch self { case .text: return "exact-decoded-literal"; case .expression: return "decoded-text-expression"; case .symbols: return "symbol-name"; case .headings: return "markdown-heading" }
+        switch self {
+        case .text: return "exact-decoded-literal"
+        case .expression: return "decoded-text-expression"
+        case .symbols: return "symbol-name"
+        case .headings: return "markdown-heading"
+        case .occurrences: return "identifier-occurrence"
+        }
     }
     var evidence: String {
-        switch self { case .text: return "exact-decoded-literal"; case .expression: return "decoded-text-expression"; case .symbols: return "heuristic-outline-candidate"; case .headings: return "fmd-heading" }
+        switch self {
+        case .text: return "exact-decoded-literal"
+        case .expression: return "decoded-text-expression"
+        case .symbols: return "heuristic-outline-candidate"
+        case .headings: return "fmd-heading"
+        case .occurrences: return "whole-token-text-candidate"
+        }
+    }
+    var structureFileByteLimit: UInt64 {
+        switch self {
+        case .symbols: return 65_536
+        case .headings: return 262_144
+        case .occurrences: return 524_288
+        case .text, .expression: return 0
+        }
     }
     var resultLabel: String {
-        switch self { case .text: return "exact matches"; case .expression: return "expression matches"; case .symbols: return "symbol candidates"; case .headings: return "Markdown headings" }
+        switch self {
+        case .text: return "exact matches"
+        case .expression: return "expression matches"
+        case .symbols: return "symbol candidates"
+        case .headings: return "Markdown headings"
+        case .occurrences: return "whole-token occurrences"
+        }
     }
     var explanation: String {
         switch self {
@@ -173,10 +209,35 @@ enum AtlasSearchMode: String, CaseIterable, Identifiable, Sendable {
         case .expression: return "Quoted phrases, required terms, -excluded terms, path: and lang: filters. All terms apply to the same captured file; results select the first positive term."
         case .symbols: return "Case-sensitive heuristic declaration candidates in Rust, Python, JavaScript, TypeScript, Go and C/C++. Compiler resolution and references are not claimed."
         case .headings: return "Case-sensitive Markdown heading names from the shared parser, with canonical slugs and original source ranges."
+        case .occurrences: return "Exact, case-sensitive whole-token names, including comments and literals. Shared token rules preserve Unicode spelling without normalization; results do not establish compiler-resolved references. Files above 512 KiB or with unsupported text encoding remain outside coverage."
         }
     }
     var placeholder: String {
-        switch self { case .text: return "Text in project…"; case .expression: return "\"pub fn\" Result -unsafe lang:rust"; case .symbols: return "Declaration name…"; case .headings: return "Markdown heading…" }
+        switch self {
+        case .text: return "Text in project…"
+        case .expression: return "\"pub fn\" Result -unsafe lang:rust"
+        case .symbols: return "Declaration name…"
+        case .headings: return "Markdown heading…"
+        case .occurrences: return "Exact identifier name…"
+        }
+    }
+}
+
+/// This identifies the shared engine's policy. Native code does not implement
+/// token boundaries or normalize an identifier before sending it to Rust.
+enum AtlasSearchOccurrencePolicy {
+    static let tokenPolicy = "ascii-alphanumeric-underscore-dollar-plus-nonascii-nonwhitespace-noncontrol-v1"
+    static let nameSyntax = "single-token-no-leading-ascii-digit"
+    static func queryFailure(in data: Data) -> AtlasSearchError? {
+        struct Envelope: Decodable {
+            struct Failure: Decodable { let code: String }
+            let schema, status: String
+            let error: Failure
+        }
+        guard let value = try? JSONDecoder().decode(Envelope.self, from: data),
+              ["fcb.atlas-search/1", "fcb.atlas-session/1"].contains(value.schema),
+              value.status == "error", value.error.code == "REFERENCE_INVALID_NAME" else { return nil }
+        return .query(value.error.code)
     }
 }
 
@@ -196,10 +257,27 @@ struct AtlasSearchStructure: Hashable, Sendable {
     let candidate: UInt64
     let headingSlug: String?
     let evidenceStart, evidenceEnd: UInt64
-    var mode: AtlasSearchMode { headingSlug == nil ? .symbols : .headings }
+    var mode: AtlasSearchMode {
+        evidence == AtlasSearchMode.occurrences.evidence ? .occurrences : (headingSlug == nil ? .symbols : .headings)
+    }
     var label: String {
+        if mode == .occurrences { return "Whole-token text occurrence · comments and literals included" }
         if let headingSlug { return "Markdown heading · #\(headingSlug)" }
         return "\(language) · \(kind) · heuristic candidate"
+    }
+    static func == (a: Self, b: Self) -> Bool {
+        a.name.utf8.elementsEqual(b.name.utf8) && a.kind == b.kind
+            && a.language == b.language && a.evidence == b.evidence && a.candidate == b.candidate
+            && AtlasSearchText.sameActualText(a.headingSlug, b.headingSlug)
+            && a.evidenceStart == b.evidenceStart && a.evidenceEnd == b.evidenceEnd
+    }
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(name.utf8.count)
+        for byte in name.utf8 { hasher.combine(byte) }
+        hasher.combine(kind); hasher.combine(language); hasher.combine(evidence); hasher.combine(candidate)
+        hasher.combine(headingSlug != nil)
+        if let headingSlug { for byte in headingSlug.utf8 { hasher.combine(byte) } }
+        hasher.combine(evidenceStart); hasher.combine(evidenceEnd)
     }
 }
 
@@ -233,6 +311,7 @@ enum AtlasSearchError: Error, Sendable {
         case .invalidResponse: return "Search response could not be read. Results are unavailable, not an empty match set."
         case .query(let code):
             switch code {
+            case "REFERENCE_INVALID_NAME": return "Enter one identifier token of at most 1,024 UTF-8 bytes, without whitespace. ASCII token characters are letters, digits, _ and $; a name cannot begin with an ASCII digit. The shared token rules preserve non-ASCII spelling."
             case "QUERY_EMPTY": return "Include a positive search term or quoted phrase in the expression."
             case "QUERY_SYNTAX_ERROR": return "The expression has invalid syntax. Check quoted phrases, escapes, and nonempty path: or lang: filters."
             case "QUERY_REGEX_UNQUALIFIED": return "Regular expressions are not supported. Use literal terms, quoted phrases, exclusions, and path: or lang: filters."
@@ -303,10 +382,12 @@ struct AtlasSearchReport: Sendable {
         case .expression: noun = count == 1 ? "expression match" : "expression matches"
         case .symbols: noun = count == 1 ? "symbol candidate" : "symbol candidates"
         case .headings: noun = count == 1 ? "heading" : "headings"
+        case .occurrences: noun = count == 1 ? "whole-token occurrence" : "whole-token occurrences"
         }
         let qualification = mode == .symbols
             ? " Heuristic declaration candidates; compiler resolution and reference completeness are not claimed."
-            : (mode.isTextual && !caseSensitive ? " Compared using Unicode lowercase; source spelling is preserved." : "")
+            : (mode == .occurrences ? " Exact token spelling, including comments and literals; compiler resolution is not claimed."
+                : (mode.isTextual && !caseSensitive ? " Compared using Unicode lowercase; source spelling is preserved." : ""))
         if let progress, progress.isRunning {
             let membership = isWorkspaceScope ? "catalogued" : "eligible"
             return "Searching: \(count) \(noun) found; \(progress.examinedFiles) of \(progress.cataloguedFiles) \(membership) files examined. Results are provisional." + qualification
@@ -320,7 +401,10 @@ struct AtlasSearchReport: Sendable {
         if truncated { reasons.append("result limit reached") }
         if let coverage = structureCoverage {
             if unavailableFiles > 0 { reasons.append("\(unavailableFiles) files with unavailable or incomplete analysis") }
-            if coverage.unsupportedFiles > 0 { reasons.append("\(coverage.unsupportedFiles) unsupported languages within that total") }
+            if coverage.unsupportedFiles > 0 {
+                let reason = mode == .occurrences ? "files with unsupported text encoding" : "unsupported languages"
+                reasons.append("\(coverage.unsupportedFiles) \(reason) within that total")
+            }
             if coverage.extractionLimitedFiles > 0 { reasons.append("\(coverage.extractionLimitedFiles) files reached extraction limits") }
             if coverage.metadataOmitted > 0 { reasons.append("\(coverage.metadataOmitted) matching results omitted by metadata limits") }
         } else {
@@ -435,7 +519,7 @@ struct AtlasSearchInput: Sendable {
         self.fileScope = fileScope
         self.pathScope = pathScope
         self.mode = mode
-        self.nameMode = mode.isTextual ? .contains : nameMode
+        self.nameMode = mode.effectiveNameMode(nameMode)
         self.caseSensitive = mode.isTextual ? caseSensitive : true
     }
     func requireLegacyScope() throws {

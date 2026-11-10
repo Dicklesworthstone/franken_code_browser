@@ -44,7 +44,179 @@ private final class Calls: @unchecked Sendable {
         } catch {}
         check(readCount == 0, "Invalid source/range must not trigger any approximate read")
     }
+    private static func referencePage(identity: AtlasReaderIdentity, name: String = "foo",
+        ranges: [(UInt64, UInt64)], request: AtlasReferencePageRequest = .initial,
+        generation: UInt64 = 29) -> AtlasReferencePage {
+        let retained = UInt64(ranges.count)
+        let end = min(retained, request.start + request.limit)
+        let rows = ranges.enumerated().dropFirst(Int(request.start)).prefix(Int(request.limit)).map { index, range in
+            AtlasReferenceOccurrence(id: UInt64(index + 1),
+                range: AtlasOutlineRange(start: range.0, end: range.1), line: 1)
+        }
+        return AtlasReferencePage(id: UUID(),
+            inventory: AtlasReferenceInventory(identity: identity, generation: generation, name: name,
+                maxItems: AtlasReferencePage.maxItems, retained: retained, matchesCounted: retained, limited: false),
+            request: request, rows: rows, nextOffset: end < retained ? end : nil)
+    }
+    @MainActor private static func occurrenceActivation() async throws {
+        // A substring search would spend all 4096 retained hits on these
+        // identifier prefixes. The local whole-token inventory has one actual
+        // token. This is a fixed engine receipt, not a native token parser.
+        let prefix = String(repeating: "foobar ", count: 5000)
+        let source = prefix + "foo"
+        let start = UInt64(prefix.utf8.count), end = UInt64(source.utf8.count)
+        let sourceID = identity(bytes: end, encoding: "utf8")
+        let selected = Self.selected(needle: "foo", start: start, end: end, bytes: end, mode: .occurrences)
+        let single = referencePage(identity: sourceID, ranges: [(start, end)])
+        var prepares = 0, pageCalls = 0, reads = 0
+        let activated = try await AtlasCapturedReader.activateOccurrence(selected, identity: sourceID,
+            prepare: { name in
+                prepares += 1
+                check(name.utf8.elementsEqual("foo".utf8), "Pass original token spelling to shared reference engine")
+                return single
+            }, nextPage: { _ in pageCalls += 1; return single },
+            read: { target in reads += 1; return target })
+        check(prepares == 1 && pageCalls == 0 && reads == 1,
+            "One bounded whole-token inventory activates beyond 4096 substring prefixes")
+        check(activated.page.occurrence.id == 1 && activated.page.occurrence.range.start == start
+              && activated.page.occurrence.range.end == end && activated.page.generation == 29,
+            "Selection uses local reference ID and exact original range, not substring ordinal")
+        check(activated.target.pageID == single.id && activated.history.isEmpty,
+            "Initial reference page and its selection authority stay together")
+        do {
+            _ = try AtlasCapturedReader.structuralRequest(selected, identity: sourceID)
+            preconditionFailure("Occurrence fell back to an unselected structural byte window")
+        } catch AtlasReaderError.invalidResponse { checks += 1 }
+        await refused(selected, identity: sourceID)
+
+        let ranges = (0..<4096).map { (UInt64($0 * 4), UInt64($0 * 4 + 3)) }
+        let manyID = identity(bytes: 16_384, encoding: "utf8")
+        let last = Self.selected(needle: "foo", start: ranges.last!.0, end: ranges.last!.1,
+            bytes: manyID.capturedBytes, mode: .occurrences)
+        var visited: [AtlasReferencePageRequest] = []
+        let paged = try await AtlasCapturedReader.activateOccurrence(last, identity: manyID,
+            prepare: { _ in referencePage(identity: manyID, ranges: ranges) },
+            nextPage: { request in
+                visited.append(request)
+                return referencePage(identity: manyID, ranges: ranges, request: request)
+            }, read: { $0 })
+        check(visited.count == 32 && paged.history.count == 32
+              && visited.first == .init(start: 64, limit: 128)
+              && paged.page.occurrence.id == 4096 && paged.referencePage.nextOffset == nil,
+            "Maximum local inventory is bounded to 33 pages and retains backward page history")
+        check(paged.page.pageID == paged.referencePage.id, "Selected later row belongs to the displayed current page")
+
+        for (encoding, name, width) in [
+            ("utf8", "éx", UInt64(3)), ("utf16le", "éx", 4), ("utf16be", "éx", 4)
+        ] {
+            let sourceID = identity(bytes: 20, encoding: encoding)
+            let target = Self.selected(needle: name, start: 2, end: 2 + width, mode: .occurrences)
+            let local = referencePage(identity: sourceID, name: name, ranges: [(2, 2 + width)])
+            let result = try await AtlasCapturedReader.activateOccurrence(target, identity: sourceID,
+                prepare: { _ in local }, nextPage: { _ in local }, read: { $0 })
+            check(result.page.name.utf8.elementsEqual(name.utf8)
+                  && result.page.occurrence.range.end == 2 + width,
+                "Original UTF-8/UTF-16 source coordinates survive whole-token activation for " + encoding)
+            var selectedRead = false
+            do {
+                _ = try await AtlasCapturedReader.activateOccurrence(target, identity: sourceID,
+                    prepare: { _ in referencePage(identity: sourceID, name: "e\u{301}x", ranges: [(2, 2 + width)]) },
+                    nextPage: { _ in local }, read: { _ in selectedRead = true; return "wrong spelling" })
+                preconditionFailure("Canonical-equivalent reference name substituted")
+            } catch AtlasReaderError.invalidResponse { checks += 1 }
+            check(!selectedRead, "Unicode spelling mismatch cannot authorize selection")
+        }
+
+        for wrong in [
+            referencePage(identity: identity(bytes: end, path: "other.rs", encoding: "utf8"), ranges: [(start, end)]),
+            referencePage(identity: sourceID, name: "other", ranges: [(start, end)]),
+            referencePage(identity: sourceID, ranges: [(start - 1, end - 1)]),
+            referencePage(identity: sourceID, ranges: [(start, end)], generation: 0)
+        ] {
+            var attemptedRead = false
+            do {
+                _ = try await AtlasCapturedReader.activateOccurrence(selected, identity: sourceID,
+                    prepare: { _ in wrong }, nextPage: { _ in wrong },
+                    read: { _ in attemptedRead = true; return "approximate occurrence" })
+                preconditionFailure("Invalid local occurrence inventory accepted")
+            } catch {}
+            check(!attemptedRead, "Wrong source/name/range/generation has no approximate activation")
+        }
+
+        let shortRanges = Array(ranges.prefix(70))
+        let smallID = identity(bytes: 280, encoding: "utf8")
+        let later = Self.selected(needle: "foo", start: 276, end: 279, bytes: 280, mode: .occurrences)
+        var crossed = false
+        do {
+            _ = try await AtlasCapturedReader.activateOccurrence(later, identity: smallID,
+                prepare: { _ in referencePage(identity: smallID, ranges: shortRanges) },
+                nextPage: { request in
+                    referencePage(identity: smallID, ranges: shortRanges, request: request, generation: 30)
+                }, read: { _ in crossed = true; return "changed generation" })
+            preconditionFailure("Reference pages from two inventories mixed")
+        } catch AtlasReaderError.invalidResponse { checks += 1 }
+        check(!crossed, "Changed inventory is rejected before retained selection")
+
+        // Source edits or selection replacement revoke the same opening ticket
+        // even if a suspended retained operation completes successfully.
+        var current = true
+        var prepareContinuation: CheckedContinuation<AtlasReferencePage, Never>?
+        var staleReads = 0
+        let stalePrepare = Task { @MainActor in
+            try await AtlasCapturedReader.activateOccurrence(selected, identity: sourceID,
+                prepare: { _ in await withCheckedContinuation { prepareContinuation = $0 } },
+                nextPage: { _ in single }, read: { _ in staleReads += 1; return "stale" },
+                isCurrent: { current })
+        }
+        while prepareContinuation == nil { await Task.yield() }
+        current = false; prepareContinuation!.resume(returning: single)
+        do { _ = try await stalePrepare.value; preconditionFailure("Superseded preparation delivered") }
+        catch AtlasReaderError.canceled { checks += 1 }
+        check(staleReads == 0, "Superseded preparation cannot issue selection")
+
+        current = true
+        var nextContinuation: CheckedContinuation<AtlasReferencePage, Never>?
+        let staleNext = Task { @MainActor in
+            try await AtlasCapturedReader.activateOccurrence(later, identity: smallID,
+                prepare: { _ in referencePage(identity: smallID, ranges: shortRanges) },
+                nextPage: { _ in await withCheckedContinuation { nextContinuation = $0 } },
+                read: { _ in staleReads += 1; return "stale" }, isCurrent: { current })
+        }
+        while nextContinuation == nil { await Task.yield() }
+        current = false
+        nextContinuation!.resume(returning: referencePage(identity: smallID, ranges: shortRanges,
+            request: .init(start: 64, limit: 128)))
+        do { _ = try await staleNext.value; preconditionFailure("Superseded pagination delivered") }
+        catch AtlasReaderError.canceled { checks += 1 }
+        check(staleReads == 0, "Superseded continuation cannot issue selection")
+
+        current = true
+        var readContinuation: CheckedContinuation<String, Never>?
+        let staleRead = Task { @MainActor in
+            try await AtlasCapturedReader.activateOccurrence(selected, identity: sourceID,
+                prepare: { _ in single }, nextPage: { _ in single },
+                read: { _ in await withCheckedContinuation { readContinuation = $0 } },
+                isCurrent: { current })
+        }
+        while readContinuation == nil { await Task.yield() }
+        current = false; readContinuation!.resume(returning: "late selected page")
+        do { _ = try await staleRead.value; preconditionFailure("Superseded occurrence page delivered") }
+        catch AtlasReaderError.canceled { checks += 1 }
+
+        var preparedCanceled = false
+        let canceled = Task { @MainActor in
+            try await AtlasCapturedReader.activateOccurrence(selected, identity: sourceID,
+                prepare: { _ in preparedCanceled = true; return single },
+                nextPage: { _ in single }, read: { _ in "canceled" })
+        }
+        canceled.cancel()
+        do { _ = try await canceled.value; preconditionFailure("Pre-canceled occurrence work ran") }
+        catch is CancellationError { checks += 1 }
+        check(!preparedCanceled, "Canceled opening performs no local occurrence extraction")
+    }
+
     @MainActor static func main() async throws {
+        try await occurrenceActivation()
         let imported = try AtlasReaderInput(captured: selected())
         check(imported.fullPath == "src.rs", "Imported label remains the engine's relative source identity")
         let live = try AtlasReaderInput(root: "/repo", path: "src.rs")
@@ -78,6 +250,7 @@ private final class Calls: @unchecked Sendable {
         for invalid in [
             selected(mode: .text),
             selected(mode: .expression),
+            selected(mode: .occurrences),
             selected(path: "other.rs", mode: .headings),
             selected(start: 12, end: 10, mode: .symbols),
             selected(start: 10, end: 21, mode: .headings),

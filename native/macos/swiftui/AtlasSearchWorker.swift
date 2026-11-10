@@ -172,7 +172,8 @@ enum AtlasNativeSearch {
         guard length <= 16 * 1024 * 1024 else { throw AtlasSearchError.invalidResponse }
         do {
             let data = Data(bytes: pointer, count: length)
-            if let failure = AtlasSearchExpression.queryFailure(in: data) { throw failure }
+            if let failure = AtlasSearchExpression.queryFailure(in: data)
+                ?? AtlasSearchOccurrencePolicy.queryFailure(in: data) { throw failure }
             let result = try JSONDecoder().decode(T.self, from: data)
             if cancellation.isCanceled { throw AtlasSearchError.canceled }
             return result
@@ -188,6 +189,8 @@ private struct SearchPage: Decodable {
     let case_sensitive: Bool?
     let requested_mode, realized_mode, name_mode, name_case, evidence_level, completeness_basis: String?
     let semantic_complete: Bool?
+    let includes_comments_and_literals, compiler_resolved: Bool?
+    let token_policy, name_syntax, unicode_normalization: String?
     let structure_file_byte_limit, unsupported_structure_files, extraction_limited_files: String?
     let structure_metadata_omitted, structure_metadata_bytes: String?
     let discovery_complete, search_in_progress, search_complete, truncated: Bool
@@ -229,6 +232,12 @@ private struct SearchWireStructure: Decodable, Equatable {
     let name, kind, language, candidate_id, evidence_level: String
     let heading_slug: String?
     let evidence_range: SearchWireRange
+    static func == (a: Self, b: Self) -> Bool {
+        a.name.utf8.elementsEqual(b.name.utf8) && a.kind == b.kind && a.language == b.language
+            && a.candidate_id == b.candidate_id && a.evidence_level == b.evidence_level
+            && AtlasSearchText.sameActualText(a.heading_slug, b.heading_slug)
+            && a.evidence_range == b.evidence_range
+    }
 }
 private struct SearchWireRange: Decodable, Equatable { let start, end: String }
 private struct SearchWirePath: Decodable, Equatable { let encoding, hex, display: String }
@@ -403,6 +412,17 @@ private struct SearchStream {
               try number(page.displayed_hits) == UInt64(retained),
               page.search_in_progress == (page.stop_reason == nil) else { throw invalid() }
         let structureCoverage: AtlasSearchStructureCoverage?
+        if mode == .occurrences {
+            guard nameMode == .exact, caseSensitive,
+                  page.includes_comments_and_literals == true, page.compiler_resolved == false,
+                  page.token_policy == AtlasSearchOccurrencePolicy.tokenPolicy,
+                  page.name_syntax == AtlasSearchOccurrencePolicy.nameSyntax,
+                  page.unicode_normalization == "none" else { throw invalid() }
+        } else {
+            guard page.includes_comments_and_literals == nil, page.compiler_resolved == nil,
+                  page.token_policy == nil, page.name_syntax == nil,
+                  page.unicode_normalization == nil else { throw invalid() }
+        }
         if mode.isTextual {
             guard page.requested_mode == nil, page.realized_mode == nil, page.name_mode == nil,
                   page.name_case == nil, page.evidence_level == nil, page.semantic_complete == nil,
@@ -426,7 +446,7 @@ private struct SearchStream {
                 extractionLimitedFiles: count(extraction, max: min(scanned, unavailable)),
                 metadataOmitted: count(omitted, max: 4096 * 4096),
                 metadataBytes: count(bytes, max: 8 * 1024 * 1024))
-            guard coverage.fileByteLimit == (mode == .symbols ? 65_536 : 262_144),
+            guard coverage.fileByteLimit == mode.structureFileByteLimit,
                   coverage.unsupportedFiles + coverage.extractionLimitedFiles <= unavailable,
                   coverage.unsupportedFiles + scanned <= examined,
                   coverage.metadataOmitted == 0 || unavailable > 0,
@@ -490,7 +510,7 @@ private struct SearchStream {
                   !value.language.isEmpty, value.language.utf8.count <= 64,
                   value.evidence_level == mode.evidence,
                   value.heading_slug == nil || (value.heading_slug!.utf8.count <= 4096 && !value.heading_slug!.utf8.contains(0)),
-                  length <= (mode == .symbols ? 65_536 : 262_144) else { throw invalid() }
+                  length <= mode.structureFileByteLimit else { throw invalid() }
             let candidate = try number(value.candidate_id)
             let evidenceStart = try number(value.evidence_range.start)
             let evidenceEnd = try number(value.evidence_range.end)
@@ -500,6 +520,12 @@ private struct SearchStream {
                 guard let slug = value.heading_slug, !slug.isEmpty,
                       value.kind == "heading", value.language == "markdown",
                       evidenceStart == start, evidenceEnd == end else { throw invalid() }
+            } else if mode == .occurrences {
+                guard value.name.utf8.elementsEqual(query.utf8),
+                      value.kind == "identifier-occurrence", value.language == "text",
+                      value.heading_slug == nil, evidenceStart == start, evidenceEnd == end,
+                      end - start == UInt64(query.utf8.count)
+                        || end - start == UInt64(query.utf16.count * 2) else { throw invalid() }
             } else {
                 guard value.heading_slug == nil,
                       ["rust", "python", "javascript", "typescript", "go", "cpp"].contains(value.language) else { throw invalid() }
@@ -513,7 +539,8 @@ private struct SearchStream {
             structure: structure, actualText: wire.matched_text,
             excerpt: try wire.excerpt?.validated(hitStart: start, hitEnd: end,
                 capturedBytes: length, actualText: mode.isTextual
-                    ? (wire.matched_text ?? state?.expression?.primaryNeedle ?? query) : nil))
+                    ? (wire.matched_text ?? state?.expression?.primaryNeedle ?? query)
+                    : (mode == .occurrences ? query : nil)))
     }
     private func invalid() -> AtlasSearchError { .invalidResponse }
     private func number(_ text: String) throws -> UInt64 {

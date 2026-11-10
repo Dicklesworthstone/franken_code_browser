@@ -48,7 +48,7 @@ void fixture_expect_path(uint64_t kind, const char *path) {
     expected_path_kind = kind; strcpy(expected_path, path);
 }
 void fixture_expect_structure(uint64_t mode, uint64_t name_mode) {
-    assert(mode >= 1 && mode <= 2 && name_mode <= 2);
+    assert(((mode == 1 || mode == 2) && name_mode <= 2) || (mode == 4 && name_mode == 0));
     expected_mode = mode; expected_name_mode = name_mode;
 }
 void fixture_expect_expression(const char *expression, uint64_t case_sensitive) {

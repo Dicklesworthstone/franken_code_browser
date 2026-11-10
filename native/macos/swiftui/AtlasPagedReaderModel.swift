@@ -250,9 +250,11 @@ import Observation
             let liveInput = try AtlasReaderInput(root: root, path: path)
             if let target = capturedTarget {
                 guard target.root.utf8.elementsEqual(root.utf8), target.path.utf8.elementsEqual(path.utf8),
-                      !target.mode.isTextual || coordinator.supportsFind else { throw AtlasReaderError.invalidInput }
+                      !target.mode.isTextual || coordinator.supportsFind,
+                      target.mode != .occurrences || coordinator.supportsReferences else { throw AtlasReaderError.invalidInput }
                 input = try AtlasReaderInput(captured: target)
                 fileQuery = target.mode.isTextual ? target.needle : ""
+                referenceName = target.mode == .occurrences ? target.needle : ""
             } else if let supplied = suppliedSource {
                 guard supplied.matches(root: root, path: path) else { throw AtlasReaderError.invalidInput }
                 guard liveTransport.openBytes != nil else { throw AtlasReaderError.unavailable }
@@ -266,7 +268,8 @@ import Observation
             refreshAccessLease = accessLease
         } catch let error as AtlasReaderError { notice = error.message; return }
         catch { notice = AtlasReaderError.invalidInput.message; return }
-        let ticket = begin(query: capturedTarget != nil)
+        let ticket = begin(query: capturedTarget?.mode.isTextual == true,
+            references: capturedTarget?.mode == .occurrences)
         notice = capturedTarget != nil ? "Opening the exact retained search capture…"
             : suppliedSource != nil ? "Opening the complete source already displayed…"
             : "Capturing source for bounded page navigation…"
@@ -285,6 +288,20 @@ import Observation
                         findReport = selected.report
                         selectedHitIndex = selected.index
                         install(selected.page, request: .hit(selected.target))
+                    } else if target.mode == .occurrences {
+                        let selected = try await AtlasCapturedReader.activateOccurrence(target,
+                            identity: opened.identity,
+                            prepare: { try await coordinator.prepareReferences($0) },
+                            nextPage: { try await coordinator.referencePage($0) },
+                            read: { try await coordinator.read(.reference($0)) },
+                            isCurrent: {
+                                operation == ticket && referenceName.utf8.elementsEqual(target.needle.utf8)
+                            })
+                        guard operation == ticket, !Task.isCancelled else { return }
+                        referencePage = selected.referencePage
+                        referenceRowsAuthorized = true
+                        referenceHistory = selected.history
+                        install(selected.page, request: .reference(selected.target))
                     } else {
                         let request = try AtlasCapturedReader.structuralRequest(target, identity: opened.identity)
                         let selected = try await coordinator.read(request)
@@ -292,8 +309,12 @@ import Observation
                         install(selected, request: request)
                     }
                     finish(ticket)
-                    notice = target.mode.isTextual ? "Opened the exact search capture without rereading the live file."
-                        : "Opened retained \(target.mode == .headings ? "heading" : "declaration") evidence at original bytes \(target.start)–\(target.end). No live-file reread."
+                    if target.mode == .occurrences {
+                        notice = "Opened the exact whole-token occurrence in the retained search capture. Comments and literals are included; compiler resolution is not claimed. No live-file reread."
+                    } else {
+                        notice = target.mode.isTextual ? "Opened the exact search capture without rereading the live file."
+                            : "Opened retained \(target.mode == .headings ? "heading" : "declaration") evidence at original bytes \(target.start)–\(target.end). No live-file reread."
+                    }
                 } else {
                     install(opened, request: .firstPage)
                     finish(ticket)

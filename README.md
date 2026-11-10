@@ -31,6 +31,12 @@ The shell installer downloads the current release and its SHA-256 sidecar, verif
 
 Open FrankenCodeBrowser, choose a project folder, drag to pan, and scroll to zoom. Use `⌘F` to search exact text, click a file to read it, or choose a file-type filter from the toolbar (Markdown, Python, Rust, or custom extensions).
 
+The global search sidebar also offers **Occurrences** for exact whole-token
+identifier text across the selected workspace, folder, file or visible scope.
+Results include comments and strings and open their retained source with exact
+occurrence highlighting. See [workspace identifier occurrences](native/macos/README.md#workspace-identifier-occurrences)
+for encoding, coverage and capture limits.
+
 The current source also adds **Search large project files…** in the search sidebar.
 It streams exact UTF-8 or BOM-marked UTF-16 text across the project catalog beyond
 ordinary capture limits, with a selectable 256 MiB–4 GiB total I/O budget,

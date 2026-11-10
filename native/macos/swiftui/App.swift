@@ -380,7 +380,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
             pathKind: searchPathKind.rawValue, path: searchPathKind == .visible
                 ? (currentVisibleSearch?.snapshot.id.uuidString ?? "")
                 : (searchPathKind == .workspace ? "" : searchPathInput),
-            mode: searchMode, nameMode: searchMode.isTextual ? .contains : searchNameMode,
+            mode: searchMode, nameMode: searchMode.effectiveNameMode(searchNameMode),
             caseSensitive: effectiveSearchCaseSensitive)
     }
 
@@ -589,7 +589,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
             runSearch(debounce: true)
         }
         .onChange(of: searchNameMode) { _, _ in
-            if !searchMode.isTextual {
+            if searchMode.supportsNameMatching {
                 clearSearch()
                 runSearch(debounce: true)
             }
@@ -823,9 +823,9 @@ private struct AtlasFrozenViewportSearch: Sendable {
             Picker("Search mode", selection: $searchMode) {
                 ForEach(AtlasSearchMode.allCases) { mode in Text(mode.label).tag(mode) }
             }
-            .pickerStyle(.segmented).padding(.horizontal, 10)
+            .pickerStyle(.menu).padding(.horizontal, 10)
             .accessibilityLabel("Search mode")
-            .help("Search literal text, expressions with required/excluded terms and filters, declaration candidates, or Markdown headings")
+            .help("Search literal text, expressions, declaration candidates, Markdown headings, or whole-token identifier occurrences across the selected scope")
             HStack {
                 TextField(searchMode.placeholder, text: $query)
                     .textFieldStyle(.roundedBorder)
@@ -850,12 +850,14 @@ private struct AtlasFrozenViewportSearch: Sendable {
                     .help("When off, compare using Unicode lowercase. Results retain the original source spelling and byte ranges.")
                     .padding(.horizontal, 10).padding(.top, 6)
             }
-            if !searchMode.isTextual {
+            if searchMode.supportsNameMatching {
                 Picker("Name matching", selection: $searchNameMode) {
                     ForEach(AtlasSearchNameMode.allCases) { mode in Text(mode.label).tag(mode) }
                 }
                 .pickerStyle(.segmented).padding(.horizontal, 10).padding(.top, 6)
                 .accessibilityLabel("Name matching")
+            }
+            if !searchMode.isTextual {
                 Text(searchMode.explanation)
                     .font(.caption2).foregroundStyle(.secondary)
                     .padding(.horizontal, 10).padding(.top, 4)
@@ -872,7 +874,8 @@ private struct AtlasFrozenViewportSearch: Sendable {
             }
             searchLocationControls
             HStack {
-                Toggle("Captured index", isOn: $useCapturedIndex)
+                Toggle("Captured index", isOn: Binding(
+                    get: { wantsCapturedIndex }, set: { useCapturedIndex = $0 }))
                     .toggleStyle(.checkbox)
                     .disabled(loadingProject || !searchMode.isTextual)
                     .help("Capture the current file and location scope once, then search those retained bytes until Refresh.")
@@ -1970,7 +1973,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
             let input = try AtlasSearchInput(root: requestedRoot, query: requestedText,
                 fileScope: fileScope.searchScope(custom: customExtensions),
                 pathScope: pathScope,
-                mode: searchMode, nameMode: searchNameMode, caseSensitive: effectiveSearchCaseSensitive)
+                mode: searchMode, nameMode: searchMode.effectiveNameMode(searchNameMode), caseSensitive: effectiveSearchCaseSensitive)
             clearSearch()
             searchPending = true
             searchTitle = input.pathScope.isVisible ? "Searching frozen atlas files" : "Searching project"

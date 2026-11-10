@@ -80,6 +80,7 @@ enum AtlasSearchCaptureFactory {
                   witness.hit.start == hit.start, witness.hit.end == hit.end,
                   witness.hit.captureSHA256 == hit.captureSHA256,
                   witness.hit.captureByteLength == hit.captureByteLength,
+                  witness.hit.structure == hit.structure,
                   AtlasSearchText.sameActualText(witness.hit.actualText, hit.actualText),
                   let path = hit.sourcePath, hit.start < hit.end else { return nil }
             let mode = requestedMode ?? witness.hit.structure?.mode ?? .text
@@ -87,6 +88,14 @@ enum AtlasSearchCaptureFactory {
                   mode != .expression || hit.actualText != nil,
                   !mode.isTextual || AtlasSearchText.accepts(actualText: hit.actualText,
                 needle: needle, caseSensitive: caseSensitive) else { return nil }
+            if mode == .occurrences {
+                guard caseSensitive, let structure = witness.hit.structure,
+                      structure.name.utf8.elementsEqual(needle.utf8),
+                      structure.kind == "identifier-occurrence", structure.language == "text",
+                      structure.headingSlug == nil,
+                      structure.evidenceStart == hit.start, structure.evidenceEnd == hit.end,
+                      (hit.captureByteLength ?? UInt64.max) <= mode.structureFileByteLimit else { return nil }
+            }
             // The exact reader proves the source spelling at the selected
             // original-byte range, even when the workspace query ignored case.
             let exactNeedle = mode.isTextual ? (hit.actualText ?? needle) : needle

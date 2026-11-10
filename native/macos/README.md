@@ -225,6 +225,48 @@ integration. They have not been executed in this code-first session; Rust and
 Swift compilation, executable qualification and physical-Mac interaction
 verification remain pending.
 
+## Workspace identifier occurrences
+
+Choose **Occurrences** in the search-mode picker and enter one identifier-like
+token to find its exact spelling across the selected project scope. For example,
+`run` matches complete `run` tokens, including those in comments and strings,
+while excluding `runner`, `_run`, `run_` and `$run`. Matching is case-sensitive;
+Prefix, Contains and Match case controls do not change this mode.
+
+The shared reference engine defines the token policy: ASCII letters, digits,
+underscore and dollar belong to tokens. Non-ASCII non-whitespace, non-control
+runs stay intact conservatively, including combining marks. A query must fit
+within 1,024 UTF-8 bytes, contain one token, and not start with an ASCII digit.
+There is no Unicode normalization. These are **whole-token text occurrences**,
+including declarations, comments and literals; they do not establish compiler
+name binding or a complete semantic-reference inventory.
+
+Occurrences honors the selected file types and **Workspace**, **Folder**,
+**File**, or frozen **Visible atlas files** location. It captures sources during
+the query and publishes bounded progressive results through the normal results
+list and atlas overlays. The captured-index switch is inactive for this mode.
+All file extensions can participate when their source encoding is supported;
+this mode does not rely on the declaration extractor's language list.
+
+The native query retains at most 1,000 matches, examines at most 4,096 files and
+spends at most 32 MiB of source-read work. The shared occurrence extractor admits
+**512 KiB per complete file**, with UTF-8 and BOM-marked UTF-16 in either byte
+order. Oversized sources, malformed text, read failures and exhausted budgets
+remain explicit incomplete coverage. Reaching the result allowance alone does
+not prove omitted matches: the query can continue checking later files for a
+further whole-token occurrence.
+
+Selecting a result opens its exact retained source and revalidates the selected
+original-byte range through the reader's existing Occurrences inventory. It
+does not reopen the working file or substitute a substring hit. The resulting
+highlight and copy actions retain their own occurrence identity, including when
+the file changes after the workspace search. Results from superseded modes,
+scopes or query generations cannot authorize a new selection.
+
+The host, C boundary, native worker/decoder and retained-reader regression
+suites cover the complete route. These code-first additions still await
+executable Rust/Swift verification and physical-Mac qualification.
+
 ## Searching large files across a project
 
 Choose **Search large project files…** in the search sidebar to search exact,
