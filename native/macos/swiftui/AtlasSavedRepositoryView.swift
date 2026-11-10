@@ -5,7 +5,11 @@ import AppKit
 /// once, and release it only after the writer or archive descriptor drains.
 final class AtlasSavedFileAccess {
     let url: URL
-    init(selectedURL: URL) { url = selectedURL }
+    private let accessing: Bool
+    init(selectedURL: URL) {
+        url = selectedURL
+        accessing = selectedURL.startAccessingSecurityScopedResource()
+    }
     var nativePath: String? {
         guard url.isFileURL else { return nil }
         return url.withUnsafeFileSystemRepresentation { pointer in
@@ -23,7 +27,7 @@ final class AtlasSavedFileAccess {
             return nil
         }
     }
-    deinit { url.stopAccessingSecurityScopedResource() }
+    deinit { if accessing { url.stopAccessingSecurityScopedResource() } }
 }
 
 /// A selected FCBS archive is a complete independent browsing entry point. The
@@ -240,13 +244,14 @@ final class AtlasSavedFileAccess {
     }
     private var literalSearchPane: some View {
         VStack(alignment: .leading, spacing: 10) {
+            indexPane
             HStack {
                 TextField("Literal text in all captured members", text: $model.searchInput)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { panelNotice = ""; model.search() }
                     .accessibilityLabel("Case-sensitive literal search across the saved archive")
                 Button { panelNotice = ""; model.search() } label: { Label("Search archive", systemImage: "magnifyingglass") }
-                    .disabled(!model.canOperate || !model.validSearchInput)
+                    .disabled(!model.canSearch || !model.validSearchInput)
                 Button("Clear") { panelNotice = ""; model.clearSearch() }
                     .disabled(!model.canOperate || (model.searchPage == nil && model.searchInput.isEmpty))
             }
@@ -314,6 +319,45 @@ final class AtlasSavedFileAccess {
                 }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 12)
             }
         }.padding(.leading, 8)
+    }
+    private var indexPane: some View {
+        DisclosureGroup("Saved search index") {
+            VStack(alignment: .leading, spacing: 6) {
+                if !model.indexStateKnown {
+                    Text("Index acceptance is unconfirmed. Reload status before changing the index or starting a new literal search.")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                if let index = model.index {
+                    Text("\(index.indexed) indexed members · \(index.uncovered) uncovered · \(index.unavailable) unavailable")
+                        .font(.caption.weight(.semibold))
+                    if let path = model.indexPath {
+                        Text(path).font(.caption).lineLimit(2).truncationMode(.middle).textSelection(.enabled)
+                    }
+                    Text("Last checked: \(index.pageBytes) posting bytes read · \(index.pageLoads) page loads · \(index.cacheHits) cache hits · 64 KiB page cache")
+                        .font(.caption2).foregroundStyle(.secondary)
+                    Text("Trusted page-manifest SHA-256: \(index.pin)")
+                        .font(.caption2.monospaced()).textSelection(.enabled)
+                } else if model.indexStateKnown {
+                    Text("No index attached. Literal searches scan captured source directly.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                TextField("Trusted page-manifest SHA-256 from the index build receipt", text: $model.indexPinInput)
+                    .textFieldStyle(.roundedBorder).font(.caption.monospaced())
+                    .disabled(!model.canChangeIndex)
+                    .accessibilityLabel("Trusted index page-manifest SHA-256 from its build receipt")
+                HStack {
+                    Button("Choose FCBD index…", action: chooseIndex)
+                        .disabled(!model.canChangeIndex || !AtlasSavedWire.digest(model.indexPinInput) || readerTask != nil)
+                    Button("Detach index") { panelNotice = ""; model.detachIndex() }
+                        .disabled(!model.canChangeIndex || model.index == nil)
+                    Spacer()
+                    Button("Reload index status") { panelNotice = ""; model.reloadIndex() }
+                        .disabled(!model.canOperate)
+                }.controlSize(.small)
+                Text("Use the digest from a trusted index build receipt, not a whole-file checksum. Posting pages are checked when read; exact source verification and direct scans cover candidates, uncovered members and short literals. Expression search scans source directly.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }.padding(.top, 5)
+        }.font(.callout)
     }
     private var expressionSearchPane: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -445,6 +489,12 @@ final class AtlasSavedFileAccess {
                 .font(.caption)
             Text("Unavailable members: \(page.unavailable) · Unsupported decoding: \(page.unsupported) · \(page.sourceBytes) source bytes read")
                 .font(.caption).foregroundStyle(.secondary)
+            if let generation = page.indexGeneration {
+                Text("Query used index generation \(generation): \(page.indexEliminatedFiles) members eliminated · \(page.fallbackFiles) direct-scan fallbacks · \(page.postingEntriesVisited) postings visited")
+                    .font(.caption2).foregroundStyle(.secondary)
+            } else {
+                Text("This query scanned saved source without an index.").font(.caption2).foregroundStyle(.secondary)
+            }
             if page.truncated {
                 Text("The retained-match limit stopped the search. More matches may exist, and the seen count is a lower bound.")
                     .font(.caption).foregroundStyle(.orange)
@@ -625,6 +675,20 @@ final class AtlasSavedFileAccess {
             panelNotice = "The selected archive filename cannot be represented exactly by the native open interface."; return
         }
         panelNotice = ""; model.open(path: path, accessLease: access)
+    }
+    private func chooseIndex() {
+        guard model.canChangeIndex, AtlasSavedWire.digest(model.indexPinInput), readerTask == nil else { return }
+        let pin = model.indexPinInput
+        let panel = NSOpenPanel()
+        panel.title = "Attach an FCBD saved search index"
+        panel.message = "Select the demand-paged index built for this exact saved archive. Its page-manifest digest must match the trusted build receipt entered above."
+        panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let access = AtlasSavedFileAccess(selectedURL: url)
+        guard let path = access.nativePath else {
+            panelNotice = "The selected index filename cannot be represented exactly by the native open interface."; return
+        }
+        panelNotice = ""; model.attachIndex(path: path, pin: pin, accessLease: access)
     }
     private func openMember(_ member: AtlasSavedMember, from identity: AtlasSavedIdentity) {
         launchReader {

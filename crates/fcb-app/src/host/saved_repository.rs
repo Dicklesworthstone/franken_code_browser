@@ -141,6 +141,7 @@ impl SavedRepositorySession {
         out.literal(",\"accepted_structure_generation\":")?; optional(&mut out, self.accepted_structure_generation())?;
         out.literal(",\"last_structure_attempt\":")?; out.integer(self.last_structure_attempt())?;
         out.literal(",\"accepted_index_generation\":")?; optional(&mut out, self.index_generation())?;
+        out.literal(",\"last_index_attempt\":")?; out.integer(self.last_index_attempt)?;
         out.literal(",\"accepted_relationship_generation\":")?; optional(&mut out, self.relationship_generation())?;
         let directory = self.archive.directory();
         out.literal(",\"initial_archive_bytes_read\":")?; out.integer(directory.validation_stats().bytes_read)?;
@@ -198,6 +199,7 @@ impl SavedRepositorySession {
             INDEX_CACHE_PAGES, &self.budget, id, &mut canceled)?;
         let candidate = AcceptedIndex { generation, pin: trusted_pin, pages };
         let mut out = self.output("index-attach")?;
+        out.literal(",\"last_index_attempt\":")?; out.integer(generation)?;
         index_fields(&mut out, &candidate)?; out.literal("}\n")?;
         let response = self.finish(out, false, &mut canceled)?;
         self.index = Some(candidate);
@@ -209,6 +211,7 @@ impl SavedRepositorySession {
         -> Result<HostResponse, SavedRepositoryError> {
         index_attempt(&mut self.last_index_attempt, generation)?; check(&mut canceled)?;
         let mut out = self.output("index-detach")?;
+        out.literal(",\"last_index_attempt\":")?; out.integer(generation)?;
         out.literal(",\"accepted_index_generation\":null}\n")?;
         let response = self.finish(out, false, &mut canceled)?;
         self.index = None; Ok(response)
@@ -411,10 +414,16 @@ fn finish_query(mut query: PagedQuery<'_, '_, File>, generation: QueryGeneration
 }
 fn index_fields(out: &mut Output, index: &AcceptedIndex) -> Result<(), SavedRepositoryError> {
     let io = index.pages.io_stats();
+    let coverage = index.pages.stats();
     out.literal(",\"index_generation\":")?; out.integer(index.generation)?;
     out.literal(",\"index_pin\":")?; out.quoted(&index.pin.to_hex())?;
     out.literal(",\"index_kind\":\"demand-paged-postings-v1\",\"index_pin_scope\":\"page-manifest-envelope-sha256\",\"index_body_verified_on_open\":false")?;
-    for (key, value) in [("index_page_bytes_read", io.page_bytes_read), ("index_page_loads", io.page_loads),
+    for (key, value) in [("index_members", coverage.members as u64),
+        ("index_indexed_files", coverage.indexed_files as u64),
+        ("index_uncovered_files", coverage.uncovered_files as u64),
+        ("index_unavailable_files", coverage.unavailable_files as u64),
+        ("index_file_bytes", index.pages.file_bytes()), ("index_manifest_bytes_read", io.manifest_bytes_read),
+        ("index_page_bytes_read", io.page_bytes_read), ("index_page_loads", io.page_loads),
         ("index_cache_hits", io.cache_hits), ("index_cache_capacity_bytes", index.pages.cache_capacity_bytes() as u64)] {
         out.literal(",")?; out.quoted(key)?; out.literal(":")?; out.integer(value)?;
     }

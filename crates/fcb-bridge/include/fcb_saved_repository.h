@@ -40,6 +40,13 @@ char *fcb_saved_members(uint64_t handle, uint64_t start, uint64_t limit);
  * Archive-binding/pin failure preserves the preceding accepted index/results.
  * Both strings must be readable/NUL-terminated UTF-8 until return.
  * Attach/detach share an increasing INDEX generation, independent of queries.
+ * Info and successful attach/detach expose last_index_attempt for recovery.
+ * Attached index receipts include archive-bound indexed/uncovered/unavailable
+ * member counts and manifest/page I/O. Coverage is not a whole-body integrity
+ * claim; unsupported text formats and short needles can require direct scans.
+ * Retain selected-file access through entered work and accepted attachment.
+ * Lost/canceled replies require info reconciliation before releasing a grant;
+ * neither replay the pathname nor assume cancellation reverted acceptance.
  */
 char *fcb_saved_attach_index(uint64_t handle, uint64_t generation,
     const char *path, const char *trusted_digest);

@@ -9,6 +9,9 @@ use crate::reader_sessions::Command as ReaderCommand;
 
 struct Fixture { path: PathBuf, index: PathBuf, pin: Sha256Digest, source_at: u64, index_tail: u64 }
 fn fixture(source: &[u8]) -> Fixture {
+    fixture_with_coverage(source, IndexLimits::default(), false)
+}
+fn fixture_with_coverage(source: &[u8], limits: IndexLimits, unavailable: bool) -> Fixture {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let root = std::env::temp_dir().join(format!("fcb-saved-handles-{}-{}-{}", std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
@@ -17,13 +20,17 @@ fn fixture(source: &[u8]) -> Fixture {
     let owner = ArenaOwnerId::new(8820).unwrap();
     let budget = ResourceBudget::new(owner, ByteLength::new(64 * 1024 * 1024)).unwrap();
     let id = |n| ResourceAllocationId::new(n).unwrap();
-    let entries = [SnapshotEntry { path: b"a.rs", observed_bytes: source.len() as u64, data: SnapshotData::Captured(source) },
+    let mut entries = vec![SnapshotEntry { path: b"a.rs", observed_bytes: source.len() as u64, data: SnapshotData::Captured(source) },
         SnapshotEntry { path: b"b.rs", observed_bytes: 9, data: SnapshotData::Captured(b"unrelated") }];
+    if unavailable {
+        entries.push(SnapshotEntry { path: b"unavailable.rs", observed_bytes: 99,
+            data: SnapshotData::Unavailable("READ_DENIED") });
+    }
     let bytes = SnapshotBytes::encode(owner, true, "test", &entries, Default::default(), &budget, id(1), || false).unwrap();
     let source_at = bytes.bytes().windows(source.len()).position(|b| b == source).unwrap() as u64;
     let path = root.join("saved.fcbs"); fs::write(&path, bytes.bytes()).unwrap();
     let mut archive = PagedSnapshot::open(File::open(&path).unwrap(), owner, Default::default(), &budget, id(2), || false).unwrap();
-    let forward = SnapshotIndex::build(&mut archive, IndexLimits::default(), &budget, [id(3), id(4), id(5), id(6)], || false).unwrap();
+    let forward = SnapshotIndex::build(&mut archive, limits, &budget, [id(3), id(4), id(5), id(6)], || false).unwrap();
     let inverted = forward.invert(&budget, id(7), || false).unwrap();
     let artifact = inverted.encode_paged(&budget, id(8), || false).unwrap();
     let index = root.join("saved.fcbd"); fs::write(&index, artifact.bytes()).unwrap();
@@ -167,6 +174,9 @@ fn damaged_member_cannot_install_a_reader_and_damaged_postings_do_not_erase_old_
     let mut writer = OpenOptions::new().write(true).open(&f.index).unwrap();
     writer.seek(SeekFrom::Start(f.index_tail)).unwrap(); writer.write_all(&[0xff]).unwrap(); writer.flush().unwrap();
     assert!(table.execute(handle, Command::Search { generation: 2, needle: "needle", limit: 10 }, || false).is_err());
+    let failed_page = table.execute(handle, Command::Info, || false).unwrap();
+    assert!(number(failed_page.as_str(), "index_page_bytes_read") > 0);
+    assert_eq!(number(failed_page.as_str(), "index_page_loads"), 0);
     assert_eq!(number(&page(&table, handle, 1), "retained_hits"), 1);
     table.execute(handle, Command::DetachIndex { generation: 2 }, || false).unwrap();
     assert_eq!(number(&query(&table, handle, 3, "needle"), "retained_hits"), 1);
@@ -186,7 +196,46 @@ fn stale_search_activation_and_failed_index_replacement_preserve_completed_state
     assert_eq!(table.open_reader(handle, &readers, reader, Selection::Hit { generation: 1, id: 1 }, || false).err(),
         Some(AccessError::Saved(SavedRepositoryError::StaleQuery)));
     assert!(table.execute(handle, Command::AttachIndex { generation: 2, path: &f.index, pin: Sha256Digest::new([0; 32]) }, || false).is_err());
-    assert_eq!(number(table.execute(handle, Command::Info, || false).unwrap().as_str(), "accepted_index_generation"), 1);
+    let current = table.execute(handle, Command::Info, || false).unwrap();
+    assert_eq!(number(current.as_str(), "accepted_index_generation"), 1);
+    assert_eq!(number(current.as_str(), "last_index_attempt"), 2);
     table.open_reader(handle, &readers, reader, Selection::Hit { generation: 2, id: 1 }, || false).unwrap();
     readers.close(reader).unwrap(); table.close(handle).unwrap();
+}
+
+#[test]
+fn saved_index_receipts_report_real_coverage_and_queries_keep_their_original_index_after_detach() {
+    let f = fixture_with_coverage(b"needle needle", IndexLimits {
+        max_source_bytes_per_file: 9, ..IndexLimits::default()
+    }, true);
+    let table = SavedSessions::new(); let handle = open(&table, &f);
+    let attached = table.execute(handle, Command::AttachIndex { generation: 1, path: &f.index, pin: f.pin }, || false).unwrap();
+    for (key, expected) in [("index_members", 3), ("index_indexed_files", 1),
+        ("index_uncovered_files", 1), ("index_unavailable_files", 1), ("index_page_bytes_read", 0),
+        ("index_page_loads", 0), ("index_cache_capacity_bytes", 65_536), ("last_index_attempt", 1)] {
+        assert_eq!(number(attached.as_str(), key), expected, "{key}");
+    }
+    assert_eq!(number(attached.as_str(), "index_file_bytes"), fs::metadata(&f.index).unwrap().len());
+    assert!(number(attached.as_str(), "index_manifest_bytes_read") < number(attached.as_str(), "index_file_bytes"));
+    assert!(attached.as_str().contains("\"index_body_verified_on_open\":false"));
+    let found = query(&table, handle, 1, "needle");
+    assert_eq!(number(&found, "retained_hits"), 2);
+    assert_eq!(number(&found, "fallback_files"), 1);
+    assert_eq!(number(&found, "unavailable_files"), 1);
+    let before = table.execute(handle, Command::Info, || false).unwrap();
+    assert_eq!(number(before.as_str(), "index_indexed_files"), 1);
+    let detached = table.execute(handle, Command::DetachIndex { generation: 2 }, || false).unwrap();
+    assert_eq!(number(detached.as_str(), "last_index_attempt"), 2);
+    assert!(detached.as_str().contains("\"accepted_index_generation\":null"));
+    let retained = page(&table, handle, 1);
+    assert_eq!(number(&retained, "index_generation"), 1);
+    assert!(retained.contains(&format!("\"index_pin\":\"{}\"", f.pin.to_hex())));
+    let after = table.execute(handle, Command::Info, || false).unwrap();
+    assert_eq!(number(before.as_str(), "member_bytes_read"), number(after.as_str(), "member_bytes_read"));
+    assert_eq!(number(after.as_str(), "last_index_attempt"), 2);
+    assert!(!after.as_str().contains("\"index_members\""));
+    let direct = query(&table, handle, 2, "needle");
+    assert!(direct.contains("\"index_generation\":null"));
+    assert_eq!(number(&direct, "retained_hits"), 2);
+    table.close(handle).unwrap();
 }

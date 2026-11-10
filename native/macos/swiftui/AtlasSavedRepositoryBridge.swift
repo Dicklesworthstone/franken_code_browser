@@ -4,6 +4,8 @@ import Foundation
 @_silgen_name("fcb_saved_open") private func savedOpen(_ h: UInt64, _ path: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_info") private func savedInfo(_ h: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_members") private func savedMembers(_ h: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_attach_index") private func savedAttachIndex(_ h: UInt64, _ generation: UInt64, _ path: UnsafePointer<CChar>?, _ pin: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_detach_index") private func savedDetachIndex(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_search") private func savedSearch(_ h: UInt64, _ generation: UInt64, _ needle: UnsafePointer<CChar>?, _ matches: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_results") private func savedResults(_ h: UInt64, _ generation: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_clear_results") private func savedClearResults(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
@@ -31,6 +33,13 @@ extension AtlasSavedTransport {
             return path.withCString { take(savedOpen(handle, $0)) }
         case .info: return take(savedInfo(handle))
         case .members(let start, let limit): return take(savedMembers(handle, start, limit))
+        case .attachIndex(let generation, let path, let pin):
+            guard generation > 0, path.hasPrefix("/"), path.utf8.count <= 16_384,
+                  !path.utf8.contains(0), AtlasSavedWire.digest(pin) else { return nil }
+            return path.withCString { path in pin.withCString { take(savedAttachIndex(handle, generation, path, $0)) } }
+        case .detachIndex(let generation):
+            guard generation > 0 else { return nil }
+            return take(savedDetachIndex(handle, generation))
         case .search(let generation, let needle, let matches):
             guard generation > 0, AtlasSavedSearchWire.validNeedle(needle),
                   (1...AtlasSavedSearchWire.maximumHits).contains(matches) else { return nil }

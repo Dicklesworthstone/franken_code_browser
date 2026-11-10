@@ -28,6 +28,12 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         var expressionGeneration: UInt64?
         var expression: String?
         var expressionAttempt: UInt64 = 0
+        var indexGeneration: UInt64?
+        var indexPin: String?
+        var indexAttempt: UInt64 = 0
+        var indexPageBytes: UInt64 = 0
+        var queryIndexGeneration: UInt64?
+        var queryIndexPin: String?
         var readBytes: UInt64 = 0
         var readCalls: UInt64 = 0
         var refused = false
@@ -60,6 +66,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     private var fault: String?
     private var blocked = false
     private var blockedSearch = false
+    private var blockedIndex = false
     private var wrongPage: Set<UInt64> = []
 
     private func locked<T>(_ body: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return body() }
@@ -67,6 +74,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     func corruptNext(_ kind: String) { locked { fault = kind } }
     func blockNextHandoff() { locked { blocked = true } }
     func blockNextSearch() { locked { blockedSearch = true } }
+    func blockNextIndex() { locked { blockedIndex = true } }
     var searchUTF8: [UInt8] { Array(("é" + String(repeating: "x", count: 200) + "banana\n").utf8) }
     var searchUTF16: [UInt8] {
         [255, 254, 233, 0] + Array(repeating: [UInt8(120), 0], count: 200).flatMap { $0 }
@@ -170,16 +178,36 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     }
     func info(_ owner: UInt64, path archivePath: String = "/saved/repository.fcbs",
         generation: UInt64? = nil, query: UInt64? = nil, bytes: UInt64 = 0, calls: UInt64 = 0,
-        expression: UInt64? = nil, expressionAttempt: UInt64 = 0) -> [String: Any] {
+        expression: UInt64? = nil, expressionAttempt: UInt64 = 0,
+        index: UInt64? = nil, pin: String? = nil, indexAttempt: UInt64 = 0, indexPageBytes: UInt64 = 0) -> [String: Any] {
         var out = header(owner, "info")
         out["archive_path"] = path(Array(archivePath.utf8), archivePath)
         out["accepted_relationship_generation"] = generation.map(String.init) as Any? ?? NSNull()
         out["accepted_query_generation"] = query.map(String.init) as Any? ?? NSNull()
-        out["accepted_index_generation"] = NSNull()
+        out["accepted_index_generation"] = index.map(String.init) as Any? ?? NSNull()
+        out["last_index_attempt"] = String(indexAttempt)
+        if let index, let pin {
+            out.merge(indexFields(generation: index, pin: pin)) { _, new in new }
+            out["index_page_bytes_read"] = String(indexPageBytes)
+        }
         out["accepted_expression_generation"] = expression.map(String.init) as Any? ?? NSNull()
         out["last_expression_attempt"] = String(expressionAttempt)
         out["initial_archive_bytes_read"] = "2048"; out["directory_reserved_bytes"] = "4096"
         out["member_bytes_read"] = String(bytes); out["member_read_calls"] = String(calls)
+        return out
+    }
+    func indexFields(generation: UInt64, pin: String) -> [String: Any] {
+        ["index_generation": String(generation), "index_pin": pin,
+         "index_kind": "demand-paged-postings-v1", "index_pin_scope": "page-manifest-envelope-sha256",
+         "index_body_verified_on_open": false, "index_members": "5", "index_indexed_files": "3",
+         "index_uncovered_files": "1", "index_unavailable_files": "1", "index_file_bytes": "4096",
+         "index_manifest_bytes_read": "512", "index_page_bytes_read": "0", "index_page_loads": "0",
+         "index_cache_hits": "0", "index_cache_capacity_bytes": "65536"]
+    }
+    func indexAttachment(_ owner: UInt64, generation: UInt64, pin: String) -> [String: Any] {
+        var out = header(owner, "index-attach")
+        out.merge(indexFields(generation: generation, pin: pin)) { _, new in new }
+        out["last_index_attempt"] = String(generation)
         return out
     }
     func searchHits(_ needle: String) -> [QueryHit] {
@@ -198,17 +226,20 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             "original_range": ["start": String(hit.start), "end": String(hit.end)]]
     }
     func searchPage(_ owner: UInt64, generation: UInt64, needle: String = "ana",
-        start: UInt64 = 0, limit: UInt64 = 64, searching: Bool = false) -> [String: Any] {
+        start: UInt64 = 0, limit: UInt64 = 64, searching: Bool = false,
+        index: UInt64? = nil, pin: String? = nil) -> [String: Any] {
         var out = header(owner, searching ? "search" : "results")
         let hits = searchHits(needle), end = min(UInt64(hits.count), start + limit)
         let sourceBytes = members.compactMap(\.bytes).reduce(0) { $0 + $1.count }
         out.merge(["query_generation": String(generation), "needle": needle,
-            "index_generation": NSNull(), "index_pin": NSNull(), "mode": "exact-decoded-literal",
+            "index_generation": index.map(String.init) as Any? ?? NSNull(), "index_pin": pin as Any? ?? NSNull(),
+            "mode": "exact-decoded-literal",
             "search_complete": false, "truncated": false, "retained_hits": String(hits.count),
             "matches_seen": String(hits.count), "unavailable_files": "1", "unsupported_files": "0",
             "member_bytes_read": String(sourceBytes), "member_read_calls": "4",
             "scanned_bytes": String(sourceBytes), "peak_source_bytes": String(members.compactMap(\.bytes).map(\.count).max() ?? 0),
-            "index_eliminated_files": "0", "fallback_files": "0", "posting_entries_visited": "0",
+            "index_eliminated_files": index == nil ? "0" : "1", "fallback_files": index == nil ? "0" : "2",
+            "posting_entries_visited": index == nil ? "0" : "3",
             "retained_source_payload_bytes": "0",
             "hits": (start..<end).map { hitObject($0 + 1, needle: needle) },
             "next_offset": end < UInt64(hits.count) ? String(end) as Any : NSNull()
@@ -388,6 +419,9 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             case .search, .expressionSearch:
                 let pause = locked { let value = blockedSearch; blockedSearch = false; return value }
                 if pause { entered.signal(); precondition(resume.wait(timeout: .now() + .seconds(5)) == .success) }
+            case .attachIndex, .detachIndex:
+                let pause = locked { let value = blockedIndex; blockedIndex = false; return value }
+                if pause { entered.signal(); precondition(resume.wait(timeout: .now() + .seconds(5)) == .success) }
             default: break
             }
             return locked {
@@ -402,9 +436,35 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                 case .info:
                     log.append("info:\(handle)")
                     guard let session = sessions[handle], !session.refused else { return nil }
+                    if fault == "index-info" { fault = nil; return nil }
                     return encode(info(handle, path: session.path, generation: session.generation, query: session.queryGeneration,
                         bytes: session.readBytes, calls: session.readCalls, expression: session.expressionGeneration,
-                        expressionAttempt: session.expressionAttempt))
+                        expressionAttempt: session.expressionAttempt, index: session.indexGeneration,
+                        pin: session.indexPin, indexAttempt: session.indexAttempt, indexPageBytes: session.indexPageBytes))
+                case .attachIndex(let generation, let path, let pin):
+                    log.append("index-attach:\(handle):\(generation):\(path)")
+                    guard var session = sessions[handle], generation > session.indexAttempt else { return nil }
+                    session.indexAttempt = generation
+                    if fault == "index-refused" {
+                        fault = nil; sessions[handle] = session
+                        return encode(["schema": "fcb.saved-repository/1", "status": "error", "owner": String(handle),
+                            "error": ["code": "SNAPSHOT_INDEX_PIN_MISMATCH"]])
+                    }
+                    session.indexGeneration = generation; session.indexPin = pin; session.indexPageBytes = 0
+                    sessions[handle] = session
+                    if fault == "index-lost" { fault = nil; return nil }
+                    if fault == "index-unknown" { fault = "index-info"; return nil }
+                    return encode(indexAttachment(handle, generation: generation, pin: pin))
+                case .detachIndex(let generation):
+                    log.append("index-detach:\(handle):\(generation)")
+                    guard var session = sessions[handle], generation > session.indexAttempt else { return nil }
+                    session.indexAttempt = generation; session.indexGeneration = nil; session.indexPin = nil
+                    sessions[handle] = session
+                    if fault == "index-detach-lost" { fault = nil; return nil }
+                    if fault == "index-unknown" { fault = "index-info"; return nil }
+                    var out = header(handle, "index-detach")
+                    out["accepted_index_generation"] = NSNull(); out["last_index_attempt"] = String(generation)
+                    return encode(out)
                 case .members(let start, let limit):
                     guard sessions[handle] != nil, start <= 5 else { return nil }
                     log.append("members:\(handle):\(start):\(limit)")
@@ -442,16 +502,26 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                     log.append("search:\(handle):\(generation):\(needle)")
                     guard var session = sessions[handle] else { return nil }
                     if fault == "search" { fault = nil; return nil }
+                    if fault == "index-page-failed" {
+                        fault = nil; session.indexPageBytes += 16; sessions[handle] = session
+                        return encode(["schema": "fcb.saved-repository/1", "status": "error", "owner": String(handle),
+                            "error": ["code": "PAGED_INDEX_CHANGED_PAGE"]])
+                    }
                     session.queryGeneration = generation; session.needle = needle
+                    session.queryIndexGeneration = session.indexGeneration; session.queryIndexPin = session.indexPin
                     session.readBytes += UInt64(members.compactMap(\.bytes).reduce(0) { $0 + $1.count }); session.readCalls += 4
                     sessions[handle] = session
                     if fault == "search-lost" { fault = nil; return nil }
-                    return encode(searchPage(handle, generation: generation, needle: needle, searching: true))
+                    return encode(searchPage(handle, generation: generation, needle: needle, searching: true,
+                        index: session.queryIndexGeneration, pin: session.queryIndexPin))
                 case .results(let generation, let start, let limit):
                     log.append("results:\(handle):\(generation):\(start)")
                     guard let session = sessions[handle], session.queryGeneration == generation, let needle = session.needle else { return nil }
                     if fault == "results" { fault = nil; return nil }
-                    return encode(searchPage(handle, generation: generation, needle: needle, start: start, limit: limit))
+                    var page = searchPage(handle, generation: generation, needle: needle, start: start, limit: limit,
+                        index: session.queryIndexGeneration, pin: session.queryIndexPin)
+                    if fault == "index-query-pin" { fault = nil; page["index_pin"] = String(repeating: "f", count: 64) }
+                    return encode(page)
                 case .clearResults(let generation):
                     log.append("clear-search:\(handle):\(generation)")
                     sessions[handle]?.queryGeneration = nil; sessions[handle]?.needle = nil

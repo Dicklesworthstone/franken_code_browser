@@ -62,7 +62,9 @@ fn unknown_handles_return_independently_owned_bounded_errors_without_source_leak
 fn actual_c_open_search_paging_clear_and_close_preserve_returned_string_ownership() {
     let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
     use fcb::{ArenaOwnerId, ByteLength};
-    use fcb::search::{ResourceAllocationId, ResourceBudget, snapshot::{SnapshotBytes, SnapshotEntry, SnapshotData}};
+    use fcb::search::{IndexLimits, ResourceAllocationId, ResourceBudget,
+        snapshot::{SnapshotBytes, SnapshotEntry, SnapshotData}, paged_snapshot::PagedSnapshot,
+        snapshot_index::SnapshotIndex};
     let root = std::env::temp_dir().join(format!("fcb-saved-c-{}-{}", std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     std::fs::create_dir_all(&root).unwrap(); let path = root.join("source.fcbs");
@@ -72,13 +74,30 @@ fn actual_c_open_search_paging_clear_and_close_preserve_returned_string_ownershi
         path: b"source.rs", observed_bytes: 6, data: SnapshotData::Captured(b"needle") }], Default::default(),
         &budget, ResourceAllocationId::new(1).unwrap(), || false).unwrap();
     std::fs::write(&path, bytes.bytes()).unwrap();
+    let id = |n| ResourceAllocationId::new(n).unwrap();
+    let mut archive = PagedSnapshot::open(std::fs::File::open(&path).unwrap(), owner,
+        Default::default(), &budget, id(2), || false).unwrap();
+    let forward = SnapshotIndex::build(&mut archive, IndexLimits::default(), &budget,
+        [id(3), id(4), id(5), id(6)], || false).unwrap();
+    let inverse = forward.invert(&budget, id(7), || false).unwrap();
+    let artifact = inverse.encode_paged(&budget, id(8), || false).unwrap();
+    let index_path = root.join("search.fcbd"); std::fs::write(&index_path, artifact.bytes()).unwrap();
+    let index_path = CString::new(index_path.to_str().unwrap()).unwrap();
+    let pin = CString::new(artifact.digest().to_hex()).unwrap();
     let path = CString::new(path.to_str().unwrap()).unwrap(); let needle = CString::new("needle").unwrap();
     let handle = fcb_saved_create(); assert_ne!(handle, 0);
     let opened = take(unsafe { fcb_saved_open(handle, path.as_ptr()) }); assert!(opened.contains("\"status\":\"ok\""));
     let members = take(fcb_saved_members(handle, 0, 10)); assert!(members.contains("\"captured\":true"));
+    let attached = take(unsafe { fcb_saved_attach_index(handle, 1, index_path.as_ptr(), pin.as_ptr()) });
+    assert!(attached.contains("\"index_indexed_files\":\"1\""));
+    assert!(attached.contains("\"index_page_bytes_read\":\"0\""));
     let searched = take(unsafe { fcb_saved_search(handle, 1, needle.as_ptr(), 10) });
     assert!(searched.contains("\"retained_hits\":\"1\""));
+    assert!(searched.contains("\"index_generation\":\"1\""));
     let retained = fcb_saved_results(handle, 1, 0, 10);
+    let detached = take(fcb_saved_detach_index(handle, 2));
+    assert!(detached.contains("\"last_index_attempt\":\"2\""));
+    assert!(take(fcb_saved_info(handle)).contains("\"accepted_index_generation\":null"));
     assert!(take(fcb_saved_clear_results(handle, 2)).contains("\"accepted_query_generation\":null"));
     assert_eq!(fcb_saved_close(handle), 1);
     assert!(take(retained).contains("\"retained_hits\":\"1\""));

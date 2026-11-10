@@ -51,7 +51,186 @@ import Dispatch
         try await scopedExpressionsKeepExactReadersAndIndependentModes()
         await expressionRecoveryCancellationAndArchiveReplacement()
         await forgedExpressionReceiptsAndLateReadersRetire()
-        print("Saved literal and expression search, scoped coverage, UTF-8/UTF-16 matches, independent generations, recovery and cancellation regressions passed.")
+        try indexReceiptsRequireArchiveCoverageAndTrustedPin()
+        try await indexAttachmentPreservesQueriesAndRetainsGrants()
+        await unknownIndexStateRetainsBothGrantsUntilReconciled()
+        await damagedIndexKeepsAcceptedResultsAndCanDetach()
+        await canceledAndClosedIndexAttachmentsDrainBeforeRelease()
+        print("Saved search, index attachment and coverage, UTF-8/UTF-16 matches, independent generations, grant lifetimes, recovery and cancellation regressions passed.")
+    }
+
+    private static func indexReceiptsRequireArchiveCoverageAndTrustedPin() throws {
+        let f = SavedRepositoryFixture(searchVectors: true), pin = String(repeating: "a", count: 64)
+        let identity = try AtlasSavedInfo.decode(f.encode(f.info(40)), handle: 40,
+            expectedPath: Array("/saved/repository.fcbs".utf8), fresh: true).identity
+        let index = try AtlasSavedIndex.decodeAttach(f.encode(f.indexAttachment(40, generation: UInt64.max, pin: pin)),
+            identity: identity, generation: UInt64.max, pin: pin)
+        precondition(index.indexed == 3 && index.uncovered == 1 && index.unavailable == 1)
+        precondition(index.pageBytes == 0 && index.cacheCapacity == 65_536)
+        for field in ["owner", "archive_digest", "index_generation", "index_pin", "last_index_attempt", "index_members",
+                      "index_indexed_files", "index_uncovered_files", "index_unavailable_files", "index_pin_scope",
+                      "index_kind", "index_body_verified_on_open", "index_file_bytes", "index_manifest_bytes_read",
+                      "index_page_bytes_read", "index_cache_capacity_bytes"] {
+            var bad = f.indexAttachment(40, generation: 1, pin: pin)
+            switch field {
+            case "owner": bad[field] = "41"
+            case "archive_digest", "index_pin": bad[field] = String(repeating: "b", count: 64)
+            case "index_generation", "last_index_attempt": bad[field] = "2"
+            case "index_members": bad[field] = "6"
+            case "index_indexed_files": bad[field] = "4"
+            case "index_uncovered_files", "index_unavailable_files": bad[field] = "0"
+            case "index_body_verified_on_open": bad[field] = true
+            case "index_file_bytes": bad[field] = "25165825"
+            case "index_manifest_bytes_read": bad[field] = "4194337"
+            case "index_page_bytes_read": bad[field] = "8"
+            default: bad.removeValue(forKey: field)
+            }
+            rejected("forged attached index accepted: \(field)") {
+                _ = try AtlasSavedIndex.decodeAttach(f.encode(bad), identity: identity, generation: 1, pin: pin)
+            }
+        }
+        var info = f.info(40, index: 1, pin: pin, indexAttempt: 2)
+        let accepted = try AtlasSavedInfo.decode(f.encode(info), handle: 40,
+            expectedPath: Array("/saved/repository.fcbs".utf8), identity: identity)
+        precondition(accepted.index?.generation == 1 && accepted.lastIndexAttempt == 2)
+        let failedPage = try AtlasSavedInfo.decode(f.encode(f.info(40, index: 1, pin: pin,
+            indexAttempt: 2, indexPageBytes: 16)), handle: 40, expectedPath: Array("/saved/repository.fcbs".utf8))
+        precondition(failedPage.index?.pageBytes == 16 && failedPage.index?.pageLoads == 0)
+        info["accepted_index_generation"] = NSNull()
+        rejected("detached info retained contradictory index metadata") {
+            _ = try AtlasSavedInfo.decode(f.encode(info), handle: 40, expectedPath: Array("/saved/repository.fcbs".utf8))
+        }
+        info = f.info(40, index: 2, pin: pin, indexAttempt: 1)
+        rejected("accepted generation exceeded the attempted generation") {
+            _ = try AtlasSavedInfo.decode(f.encode(info), handle: 40, expectedPath: Array("/saved/repository.fcbs".utf8))
+        }
+        var detach = f.header(40, "index-detach")
+        detach["accepted_index_generation"] = NSNull(); detach["last_index_attempt"] = "3"
+        try AtlasSavedIndex.decodeDetach(f.encode(detach), identity: identity, generation: 3)
+        rejected("detach receipt rebound to another attempt") {
+            try AtlasSavedIndex.decodeDetach(f.encode(detach), identity: identity, generation: 4)
+        }
+        var direct = f.searchPage(40, generation: 1)
+        direct["index_eliminated_files"] = "1"
+        rejected("direct scan claimed an index elimination") {
+            _ = try AtlasSavedSearchPage.decode(f.encode(direct), identity: identity, generation: 1,
+                needle: "ana", start: 0, limit: 64)
+        }
+    }
+
+    private final class FileGrant {}
+    @MainActor private static func indexAttachmentPreservesQueriesAndRetainsGrants() async throws {
+        let f = SavedRepositoryFixture(searchVectors: true), model = await prepared(f)
+        let direct = model.searchPage!, pin = String(repeating: "a", count: 64)
+        var grant: FileGrant? = FileGrant(); weak var held = grant
+        model.attachIndex(path: "/saved/index.fcbd", pin: pin, accessLease: grant); grant = nil
+        await wait("index did not attach") { !model.busy }
+        precondition(model.index?.generation == 1 && model.indexPath == "/saved/index.fcbd" && held != nil)
+        precondition(model.queryGeneration == direct.generation && model.relationshipGeneration == 1)
+        model.loadSearchResults(start: 0, from: direct)
+        await wait("pre-index results did not paginate") { !model.busy }
+        precondition(model.searchPage?.indexGeneration == nil)
+        model.search()
+        await wait("indexed search did not finish") { !model.busy }
+        let indexed = model.searchPage!
+        precondition(indexed.indexGeneration == 1 && indexed.indexPin == pin && indexed.indexEliminatedFiles == 1)
+        precondition(indexed.fallbackFiles == 2 && indexed.postingEntriesVisited == 3)
+        f.corruptNext("index-query-pin"); model.loadSearchResults(start: 0, from: indexed)
+        await wait("forged query page did not finish") { !model.busy }
+        precondition(model.searchPage?.indexPin == pin, "pagination rebound a query to another index")
+        var refused: FileGrant? = FileGrant(); weak var discarded = refused
+        f.corruptNext("index-refused")
+        model.attachIndex(path: "/saved/wrong.fcbd", pin: pin, accessLease: refused); refused = nil
+        await wait("refused replacement did not finish") { !model.busy }
+        precondition(model.index?.generation == 1 && model.info?.lastIndexAttempt == 2 && held != nil)
+        await wait("refused replacement kept its unused grant") { discarded == nil }
+        var replacement: FileGrant? = FileGrant(); weak var retained = replacement
+        let nextPin = String(repeating: "b", count: 64)
+        f.corruptNext("index-lost")
+        model.attachIndex(path: "/saved/new.fcbd", pin: nextPin, accessLease: replacement); replacement = nil
+        await wait("lost attach reply did not reconcile") { !model.busy }
+        precondition(model.index?.generation == 3 && model.index?.pin == nextPin && retained != nil)
+        await wait("replaced index grant was retained") { held == nil }
+        precondition(f.calls.filter { $0.hasPrefix("index-attach:") }.count == 3, "attachment replayed a pathname")
+        f.corruptNext("index-detach-lost"); model.detachIndex()
+        await wait("lost detach reply did not reconcile") { !model.busy }
+        precondition(model.index == nil && model.info?.lastIndexAttempt == 4 && model.indexStateKnown)
+        await wait("detached index grant did not retire") { retained == nil }
+        model.loadSearchResults(start: 0, from: indexed)
+        await wait("detached-index query page did not survive") { !model.busy }
+        precondition(model.searchPage?.indexGeneration == 1 && model.searchPage?.indexPin == pin)
+        let capture = try await model.openHit(indexed.hits[0], from: model.searchPage!, readerTransport: f.readerTransport())
+        precondition(capture.match?.start == 203, "detaching the index changed exact captured match navigation")
+        model.close(); capture.reader.close()
+    }
+
+    @MainActor private static func unknownIndexStateRetainsBothGrantsUntilReconciled() async {
+        let f = SavedRepositoryFixture(searchVectors: true), model = await prepared(f)
+        let pin = String(repeating: "a", count: 64)
+        var first: FileGrant? = FileGrant(); weak var previous = first
+        model.attachIndex(path: "/saved/first.fcbd", pin: pin, accessLease: first); first = nil
+        await wait("initial index did not attach") { !model.busy }
+        var second: FileGrant? = FileGrant(); weak var candidate = second
+        f.corruptNext("index-unknown")
+        model.attachIndex(path: "/saved/second.fcbd", pin: String(repeating: "b", count: 64), accessLease: second); second = nil
+        await wait("unknown attachment did not finish") { !model.busy }
+        precondition(!model.indexStateKnown && !model.canChangeIndex && !model.canSearch)
+        precondition(previous != nil && candidate != nil, "unconfirmed acceptance released an index grant")
+        let attempts = f.calls.filter { $0.hasPrefix("index-attach:") }.count
+        model.attachIndex(path: "/saved/third.fcbd", pin: pin, accessLease: nil); model.search()
+        precondition(!model.busy && f.calls.filter { $0.hasPrefix("index-attach:") }.count == attempts)
+        model.reloadIndex()
+        await wait("index status did not recover") { !model.busy }
+        precondition(model.indexStateKnown && model.index?.generation == 2 && candidate != nil)
+        await wait("old grant survived accepted replacement") { previous == nil }
+        f.corruptNext("index-unknown"); model.detachIndex()
+        await wait("unknown detach did not finish") { !model.busy }
+        precondition(!model.indexStateKnown && candidate != nil)
+        model.reloadIndex()
+        await wait("detached status did not recover") { !model.busy }
+        precondition(model.indexStateKnown && model.index == nil)
+        await wait("detached grant survived reconciliation") { candidate == nil }
+        model.close()
+    }
+
+    @MainActor private static func canceledAndClosedIndexAttachmentsDrainBeforeRelease() async {
+        for closing in [false, true] {
+            let f = SavedRepositoryFixture(), model = AtlasSavedRepositoryModel(transport: f.savedTransport)
+            var source: FileGrant? = FileGrant(); weak var archiveGrant = source
+            model.open(path: "/saved/repository.fcbs", accessLease: source); source = nil
+            await wait("archive grant fixture did not open") { !model.busy }
+            var selected: FileGrant? = FileGrant(); weak var indexGrant = selected
+            f.blockNextIndex()
+            model.attachIndex(path: "/saved/pending.fcbd", pin: String(repeating: "a", count: 64), accessLease: selected)
+            selected = nil
+            await wait("index call did not enter worker") { f.entered.wait(timeout: .now()) == .success }
+            if closing { model.close() } else { model.cancel() }
+            precondition(archiveGrant != nil && indexGrant != nil && !f.calls.contains("saved-close:40"))
+            f.resume.signal()
+            await wait("entered index work did not drain") { !model.busy }
+            if !closing {
+                precondition(model.indexStateKnown && model.index?.generation == 1 && indexGrant != nil,
+                    "cancel after acceptance dropped the accepted index grant")
+                model.close()
+            }
+            await wait("saved resources did not retire together") {
+                f.calls.contains("saved-close:40") && archiveGrant == nil && indexGrant == nil
+            }
+        }
+    }
+
+    @MainActor private static func damagedIndexKeepsAcceptedResultsAndCanDetach() async {
+        let f = SavedRepositoryFixture(searchVectors: true), model = await prepared(f)
+        model.attachIndex(path: "/saved/damaged.fcbd", pin: String(repeating: "a", count: 64), accessLease: nil)
+        await wait("damage fixture index did not attach") { !model.busy }
+        f.corruptNext("index-page-failed"); model.search()
+        await wait("failed page verification did not reconcile") { !model.busy }
+        precondition(model.indexStateKnown && model.queryGeneration == 1)
+        precondition(model.index?.pageBytes == 16 && model.index?.pageLoads == 0 && model.canChangeIndex)
+        model.detachIndex()
+        await wait("damaged index could not be detached") { !model.busy }
+        precondition(model.index == nil && model.queryGeneration == 1)
+        model.close()
     }
 
     private static func exactPageAndPartialCoverageContracts() throws {

@@ -2,11 +2,47 @@ import Foundation
 import Observation
 import Dispatch
 
-/// This immutable lifetime container is never operated on by a worker. The
-/// archive descriptor and its selected-file grant drain together off the UI.
+private final class AtlasSavedIndexAccess: @unchecked Sendable {
+    let generation: UInt64
+    let pin, path: String
+    let reference: AnyObject?
+    init(generation: UInt64, pin: String, path: String, reference: AnyObject?) {
+        self.generation = generation; self.pin = pin; self.path = path; self.reference = reference
+    }
+    func matches(_ index: AtlasSavedIndex) -> Bool { generation == index.generation && pin == index.pin }
+}
+
+/// At most one accepted and one pending index grant accompany the archive.
+/// A missing reply never releases either grant until info identifies the
+/// accepted generation, or the archive descriptor drains during retirement.
 private final class AtlasSavedAccess: @unchecked Sendable {
     let reference: AnyObject?
+    private let lock = NSLock()
+    private static let retirement = DispatchQueue(label: "dev.frankencode.browser.saved-index-access-retirement", qos: .utility)
+    private var index: AtlasSavedIndexAccess?
+    private var candidate: AtlasSavedIndexAccess?
     init(_ reference: AnyObject?) { self.reference = reference }
+    func stage(_ access: AtlasSavedIndexAccess) {
+        lock.lock(); defer { lock.unlock() }
+        precondition(candidate == nil)
+        candidate = access
+    }
+    func resolve(_ accepted: AtlasSavedIndex?) throws -> String? {
+        lock.lock(); defer { lock.unlock() }
+        guard let accepted else {
+            let retired = (index, candidate); index = nil; candidate = nil
+            Self.retirement.async { withExtendedLifetime(retired) {} }
+            return nil
+        }
+        if let candidate, candidate.matches(accepted) {
+            let retired = index; index = candidate; self.candidate = nil
+            Self.retirement.async { withExtendedLifetime(retired) {} }
+        } else if index?.matches(accepted) == true {
+            let retired = candidate; candidate = nil
+            Self.retirement.async { withExtendedLifetime(retired) {} }
+        } else { throw AtlasSavedError.invalidResponse }
+        return index?.path
+    }
 }
 private final class AtlasSavedSession: @unchecked Sendable {
     let handle: UInt64
@@ -19,6 +55,8 @@ private final class AtlasSavedSession: @unchecked Sendable {
         self.handle = handle; self.transport = transport; self.access = AtlasSavedAccess(access)
     }
     func cancel() { _ = transport.cancel(handle) }
+    func stageIndex(_ candidate: AtlasSavedIndexAccess) { access.stage(candidate) }
+    func resolveIndex(_ accepted: AtlasSavedIndex?) throws -> String? { try access.resolve(accepted) }
     deinit {
         let handle = handle, transport = transport, access = access
         Self.retirement.async {
@@ -47,12 +85,15 @@ private final class AtlasSavedSession: @unchecked Sendable {
     private(set) var queryGeneration: UInt64?
     private(set) var expressionPage: AtlasSavedExpressionPage?
     private(set) var expressionGeneration: UInt64?
+    private(set) var indexStateKnown = true
+    private(set) var indexPath: String?
     private(set) var busy = false
     private(set) var closed = false
     private(set) var notice = "Open an FCBS saved repository to browse its captured members and documentation links."
     var memberOffsetInput = "0"
     var searchInput = ""
     var searchMode: AtlasSavedSearchMode = .literal
+    var indexPinInput = ""
     @ObservationIgnored private let transport: AtlasSavedTransport
     @ObservationIgnored private let io = AtlasProjectIO()
     @ObservationIgnored private var session: AtlasSavedSession?
@@ -62,11 +103,15 @@ private final class AtlasSavedSession: @unchecked Sendable {
     @ObservationIgnored private var lastRelationshipAttempt: UInt64 = 0
     @ObservationIgnored private var lastQueryAttempt: UInt64 = 0
     @ObservationIgnored private var lastExpressionAttempt: UInt64 = 0
+    @ObservationIgnored private var lastIndexAttempt: UInt64 = 0
 
     init(transport: AtlasSavedTransport) { self.transport = transport }
     var canOperate: Bool { !busy && !closed }
     var readerDomain: UUID? { transport.readerDomain }
     var validSearchInput: Bool { AtlasSavedSearchWire.validNeedle(searchInput) }
+    var index: AtlasSavedIndex? { info?.index }
+    var canChangeIndex: Bool { canOperate && info != nil && indexStateKnown }
+    var canSearch: Bool { canOperate && (searchMode == .expression || indexStateKnown) }
     var searchIsCurrent: Bool {
         guard searchMode == .literal, let searchPage, info?.identity == searchPage.identity,
               queryGeneration == searchPage.generation else { return false }
@@ -113,11 +158,88 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 model.lastRelationshipAttempt = 0; model.memberOffsetInput = "0"
                 model.searchPage = nil; model.queryGeneration = nil; model.lastQueryAttempt = 0; model.searchInput = ""
                 model.expressionPage = nil; model.expressionGeneration = nil; model.lastExpressionAttempt = 0
+                model.indexStateKnown = true; model.indexPath = nil; model.lastIndexAttempt = 0; model.indexPinInput = ""
                 model.notice = "Opened the saved manifest. Search all captured text or build documentation links explicitly when ready."
             } catch {
                 if model.pending === candidate { model.pending = nil; candidate.cancel() }
                 throw error
             }
+        }
+    }
+
+    func attachIndex(path: String, pin: String, accessLease: AnyObject?) {
+        guard canChangeIndex, let info else { return }
+        guard path.hasPrefix("/"), path.utf8.count <= 16_384, !path.utf8.contains(0), AtlasSavedWire.digest(pin) else {
+            notice = "Choose an FCBD index and enter the 64 lowercase hexadecimal characters from its trusted build receipt."; return
+        }
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let generation = try model.nextIndexGeneration()
+            lease.stageIndex(AtlasSavedIndexAccess(generation: generation, pin: pin, path: path, reference: accessLease))
+            model.notice = "Checking the selected index against the saved archive and trusted page-manifest pin…"
+            do {
+                let index = try AtlasSavedIndex.decodeAttach(await model.run(lease,
+                    .attachIndex(generation: generation, path: path, pin: pin), flag: flag),
+                    identity: info.identity, generation: generation, pin: pin)
+                guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
+                try model.acceptIndex(index, attempt: generation, lease: lease)
+                model.notice = "Attached the saved index. New literal searches use verified posting pages and exact captured-source checks."
+            } catch {
+                let failure = Self.message(error)
+                let recovered = await model.reconcileIndex(lease)
+                model.notice = recovered ? "\(failure) Recovered the accepted index without reopening its path."
+                    : "\(failure) Index acceptance is unconfirmed. Reload index status before attaching another index or starting a literal search."
+            }
+        }
+    }
+    func detachIndex() {
+        guard canChangeIndex, let info, info.index != nil else { return }
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let generation = try model.nextIndexGeneration()
+            do {
+                try AtlasSavedIndex.decodeDetach(await model.run(lease, .detachIndex(generation: generation), flag: flag),
+                    identity: info.identity, generation: generation)
+                guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
+                try model.acceptIndex(nil, attempt: generation, lease: lease)
+                model.notice = "Detached the index. New literal searches scan captured source directly; accepted results remain available."
+            } catch {
+                let failure = Self.message(error)
+                let recovered = await model.reconcileIndex(lease)
+                model.notice = recovered ? "\(failure) Recovered the accepted index after the detach request."
+                    : "\(failure) Detach is unconfirmed. Reload index status to inspect the accepted state."
+            }
+        }
+    }
+    func reloadIndex() {
+        guard info != nil else { return }
+        perform { model, _ in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let recovered = await model.reconcileIndex(lease)
+            model.notice = recovered ? "Reloaded index coverage and page I/O without reopening source or index paths."
+                : "Index acceptance is unconfirmed. Its file grants remain held until status is recovered or the archive is closed."
+        }
+    }
+    private func acceptIndex(_ index: AtlasSavedIndex?, attempt: UInt64, lease: AtlasSavedSession) throws {
+        indexPath = try lease.resolveIndex(index)
+        self.info?.index = index; self.info?.lastIndexAttempt = attempt
+        lastIndexAttempt = max(lastIndexAttempt, attempt); indexStateKnown = true
+    }
+    private func acceptInfo(_ current: AtlasSavedInfo, lease: AtlasSavedSession) throws {
+        guard current.lastIndexAttempt >= (info?.lastIndexAttempt ?? 0) else { throw AtlasSavedError.invalidResponse }
+        indexPath = try lease.resolveIndex(current.index)
+        info = current; lastIndexAttempt = max(lastIndexAttempt, current.lastIndexAttempt); indexStateKnown = true
+    }
+    private func reconcileIndex(_ lease: AtlasSavedSession) async -> Bool {
+        guard !closed, session === lease, let previous = info else { return false }
+        do {
+            let current = try AtlasSavedInfo.decode(await run(lease, .info, flag: AtlasSearchCancellation()),
+                handle: lease.handle, expectedPath: previous.path.bytes, identity: previous.identity)
+            guard !closed, session === lease else { return false }
+            try acceptInfo(current, lease: lease); return true
+        } catch {
+            indexStateKnown = false
+            return false
         }
     }
 
@@ -199,7 +321,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
             let current = try AtlasSavedInfo.decode(await run(lease, .info, flag: flag),
                 handle: lease.handle, expectedPath: previous.path.bytes, identity: previous.identity)
             guard !closed, session === lease else { return false }
-            info = current; relationshipGeneration = current.relationshipGeneration
+            try acceptInfo(current, lease: lease); relationshipGeneration = current.relationshipGeneration
             guard let generation = current.relationshipGeneration else { relationships = nil; direction = .all; return true }
             lastRelationshipAttempt = max(lastRelationshipAttempt, generation)
             if relationships?.generation == generation { return true }
@@ -218,7 +340,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     /// never changes the label or navigation authority of an accepted query.
     func search() {
         if searchMode == .expression { searchExpression(); return }
-        guard canOperate, let info else { return }
+        guard canSearch, let info else { return }
         if searchInput.isEmpty { clearSearch(); return }
         guard validSearchInput else {
             notice = "Enter 1–1024 UTF-8 bytes of literal text, without NUL. Search is case sensitive and does not normalize Unicode."; return
@@ -232,6 +354,9 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 let page = try AtlasSavedSearchPage.decode(await model.run(lease,
                     .search(generation: generation, needle: needle, matches: 4096), flag: flag),
                     identity: info.identity, generation: generation, needle: needle, start: 0, limit: 64, searching: true)
+                guard page.indexGeneration == info.index?.generation, page.indexPin == info.index?.pin else {
+                    throw AtlasSavedError.invalidResponse
+                }
                 guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
                 model.queryGeneration = generation; model.searchPage = page
                 model.notice = page.complete ? "Search finished across the complete captured manifest."
@@ -276,6 +401,9 @@ private final class AtlasSavedSession: @unchecked Sendable {
             let next = try AtlasSavedSearchPage.decode(await model.run(lease,
                 .results(generation: generation, start: start, limit: 64), flag: flag),
                 identity: info.identity, generation: generation, needle: accepted.needle, start: start, limit: 64)
+            guard next.indexGeneration == accepted.indexGeneration, next.indexPin == accepted.indexPin else {
+                throw AtlasSavedError.invalidResponse
+            }
             guard model.session === lease, !model.closed, model.queryGeneration == generation else { throw AtlasSavedError.canceled }
             model.searchPage = next
             model.notice = "Showing \(next.hits.count) of \(next.retained) retained matches. Result pages read metadata only."
@@ -297,7 +425,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
             let current = try AtlasSavedInfo.decode(await run(lease, .info, flag: flag),
                 handle: lease.handle, expectedPath: previous.path.bytes, identity: previous.identity)
             guard !closed, session === lease else { return false }
-            info = current; queryGeneration = current.queryGeneration
+            try acceptInfo(current, lease: lease); queryGeneration = current.queryGeneration
             guard let generation = current.queryGeneration else { searchPage = nil; return true }
             lastQueryAttempt = max(lastQueryAttempt, generation)
             if searchPage?.generation == generation && searchPage?.identity == current.identity { return true }
@@ -391,7 +519,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
             let current = try AtlasSavedInfo.decode(await run(lease, .info, flag: flag), handle: lease.handle,
                 expectedPath: previous.path.bytes, identity: previous.identity)
             guard !closed, session === lease, current.expressionStateKnown else { throw AtlasSavedError.invalidResponse }
-            info = current; expressionGeneration = current.expressionGeneration
+            try acceptInfo(current, lease: lease); expressionGeneration = current.expressionGeneration
             lastExpressionAttempt = max(lastExpressionAttempt, current.lastExpressionAttempt)
             guard let generation = current.expressionGeneration else { expressionPage = nil; return true }
             if expressionPage?.generation == generation && expressionPage?.identity == current.identity { return true }
@@ -559,6 +687,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         direction = .all; lastRelationshipAttempt = 0; memberOffsetInput = "0"
         searchPage = nil; queryGeneration = nil; lastQueryAttempt = 0; searchInput = ""
         expressionPage = nil; expressionGeneration = nil; lastExpressionAttempt = 0
+        indexPath = nil; indexStateKnown = true; lastIndexAttempt = 0; indexPinInput = ""
     }
     private func run(_ lease: AtlasSavedSession, _ request: AtlasSavedRequest,
         flag: AtlasSearchCancellation) async throws -> String? {
@@ -592,6 +721,11 @@ private final class AtlasSavedSession: @unchecked Sendable {
         let previous = max(lastExpressionAttempt, max(expressionGeneration ?? 0, info?.lastExpressionAttempt ?? 0))
         guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
         lastExpressionAttempt = previous + 1; return lastExpressionAttempt
+    }
+    private func nextIndexGeneration() throws -> UInt64 {
+        let previous = max(lastIndexAttempt, info?.lastIndexAttempt ?? 0)
+        guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
+        lastIndexAttempt = previous + 1; return lastIndexAttempt
     }
     private static func message(_ error: Error) -> String {
         if let error = error as? AtlasSavedError { return error.message }

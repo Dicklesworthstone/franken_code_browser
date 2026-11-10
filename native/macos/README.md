@@ -112,6 +112,47 @@ They execute the actual packaging scripts with fake compiler/signing tools and
 retain their fixture logs. They establish packaging control flow, not native
 compilation, code-signing validity, Launch Services behavior or rendering.
 
+## Saved repository search indexes
+
+In **Saved Repository → Text search → Literal**, expand **Saved search index**
+to attach an existing FCBD demand-paged index to the currently opened FCBS
+archive. Paste its trusted **page-manifest SHA-256** and choose the index file.
+The engine checks the pin and exact archive binding before replacing an accepted
+index. No index is inferred from a neighboring filename or loaded automatically.
+
+Build an index explicitly with the matching CLI and retain its receipt:
+
+```sh
+fcb snapshot index build /absolute/path/source.fcbs \
+  --output /absolute/path/search.fcbd --paged --json
+```
+
+Use the receipt's `index_digest` when `index_pin_scope` is
+`page-manifest-envelope-sha256`. This pins the metadata envelope and its page
+hashes; a whole-file checksum is a different value. Native attachment reads the
+bounded manifest and keeps a 64 KiB page cache. Posting pages are verified when
+read, and candidate matches still verify the exact saved source. The UI shows
+indexed, uncovered and unavailable member counts. Short literals, uncovered
+members and text encodings without compatible postings retain direct scanning.
+Expression searches use their existing direct source scan.
+
+Each accepted literal result reports its own index generation, eliminated
+members, direct-scan fallbacks and postings visited. **Reload index status**
+refreshes cumulative page I/O without reopening either selected path. **Detach
+index** changes subsequent literal searches; existing result pages and captured
+readers remain available. A rejected replacement preserves the prior index.
+Lost or canceled replies reconcile the accepted generation on the same handle.
+If status remains unknown, new index changes and literal searches wait for a
+successful reload or archive close. Both possible index grants stay retained
+until that outcome is known, and entered work drains before closure releases
+the archive and index access.
+
+The native model/receipt and public-header C marshaling regressions are in
+`swiftui/tests/test-saved-search.sh`; actual FCBS/FCBD and ABI cases are in
+`crates/fcb-bridge/src/saved_sessions_tests.rs` and `saved_ffi_tests.rs`.
+These additions still require the configured independent strict-RCH verifier.
+Physical-Mac picker, sandbox access and native UI qualification remain pending.
+
 ## Comparing saved project captures
 
 Choose **Compare Captures** in the toolbar, or **Compare captures…** inside

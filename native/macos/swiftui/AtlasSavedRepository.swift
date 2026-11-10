@@ -114,6 +114,8 @@ struct AtlasSavedInfo: Sendable {
     /// Legacy transports can still serve literal queries. An omitted field
     /// cannot establish that an expression clear or failed attempt succeeded.
     let expressionStateKnown: Bool
+    var index: AtlasSavedIndex?
+    var lastIndexAttempt: UInt64
     let initialArchiveBytes: UInt64
     let memberBytesRead: UInt64
     let memberReadCalls: UInt64
@@ -123,15 +125,18 @@ struct AtlasSavedInfo: Sendable {
         let data = try AtlasSavedWire.admit(json, handle: handle, command: "info", identity: identity)
         do {
             let w = try JSONDecoder().decode(Wire.self, from: data)
+            let actualIdentity = try JSONDecoder().decode(AtlasSavedIdentity.self, from: data)
+            let index = try AtlasSavedIndex.current(data, identity: actualIdentity, generation: w.index)
             guard w.path.bytes == expectedPath, w.path.bytes.first == 47,
                   w.initial.value <= 80 * 1024 * 1024,
                   !fresh || (w.relationship == nil && w.query == nil && w.index == nil && w.expression == nil &&
-                    w.expressionAttempt == 0 &&
+                    w.expressionAttempt == 0 && w.indexAttempt == 0 &&
                     w.memberBytes.value == 0 && w.memberCalls.value == 0) else { throw AtlasSavedError.invalidResponse }
-            return Self(identity: try JSONDecoder().decode(AtlasSavedIdentity.self, from: data),
+            return Self(identity: actualIdentity,
                 path: w.path, relationshipGeneration: w.relationship, queryGeneration: w.query,
                 expressionGeneration: w.expression, lastExpressionAttempt: w.expressionAttempt,
-                expressionStateKnown: w.expressionKnown, initialArchiveBytes: w.initial.value,
+                expressionStateKnown: w.expressionKnown, index: index, lastIndexAttempt: w.indexAttempt,
+                initialArchiveBytes: w.initial.value,
                 memberBytesRead: w.memberBytes.value, memberReadCalls: w.memberCalls.value)
         } catch let error as AtlasSavedError { throw error }
         catch { throw AtlasSavedError.invalidResponse }
@@ -141,11 +146,12 @@ struct AtlasSavedInfo: Sendable {
         let relationship, query, index: UInt64?
         let expression: UInt64?
         let expressionAttempt: UInt64
+        let indexAttempt: UInt64
         let expressionKnown: Bool
         let initial, memberBytes, memberCalls: AtlasSavedNumber
         enum CodingKeys: CodingKey {
             case archive_path, accepted_relationship_generation, accepted_query_generation, accepted_index_generation,
-                 accepted_expression_generation, last_expression_attempt,
+                 accepted_expression_generation, last_expression_attempt, last_index_attempt,
                  initial_archive_bytes_read, member_bytes_read, member_read_calls
         }
         init(from decoder: Decoder) throws {
@@ -159,6 +165,8 @@ struct AtlasSavedInfo: Sendable {
             path = try c.decode(AtlasSavedPath.self, forKey: .archive_path)
             relationship = try generation(.accepted_relationship_generation)
             query = try generation(.accepted_query_generation); index = try generation(.accepted_index_generation)
+            indexAttempt = try c.decode(AtlasSavedNumber.self, forKey: .last_index_attempt).value
+            guard index == nil || index! <= indexAttempt else { throw AtlasSavedError.invalidResponse }
             expressionKnown = c.contains(.accepted_expression_generation) && c.contains(.last_expression_attempt)
             guard c.contains(.accepted_expression_generation) == c.contains(.last_expression_attempt) else {
                 throw AtlasSavedError.invalidResponse
@@ -172,6 +180,101 @@ struct AtlasSavedInfo: Sendable {
             memberBytes = try c.decode(AtlasSavedNumber.self, forKey: .member_bytes_read)
             memberCalls = try c.decode(AtlasSavedNumber.self, forKey: .member_read_calls)
         }
+    }
+}
+
+/// The trusted pin identifies the FCBD page manifest, not a checksum of the
+/// whole file. Coverage describes its recorded rows; short literals and text
+/// encodings without matching postings still use exact saved-source scanning.
+struct AtlasSavedIndex: Sendable, Decodable {
+    let generation: UInt64
+    let pin: String
+    let members, indexed, uncovered, unavailable: UInt64
+    let fileBytes, manifestBytes, pageBytes, pageLoads, cacheHits, cacheCapacity: UInt64
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        generation = try c.decode(AtlasSavedNumber.self, forKey: .index_generation).value
+        pin = try c.decode(String.self, forKey: .index_pin)
+        members = try c.decode(AtlasSavedNumber.self, forKey: .index_members).value
+        indexed = try c.decode(AtlasSavedNumber.self, forKey: .index_indexed_files).value
+        uncovered = try c.decode(AtlasSavedNumber.self, forKey: .index_uncovered_files).value
+        unavailable = try c.decode(AtlasSavedNumber.self, forKey: .index_unavailable_files).value
+        fileBytes = try c.decode(AtlasSavedNumber.self, forKey: .index_file_bytes).value
+        manifestBytes = try c.decode(AtlasSavedNumber.self, forKey: .index_manifest_bytes_read).value
+        pageBytes = try c.decode(AtlasSavedNumber.self, forKey: .index_page_bytes_read).value
+        pageLoads = try c.decode(AtlasSavedNumber.self, forKey: .index_page_loads).value
+        cacheHits = try c.decode(AtlasSavedNumber.self, forKey: .index_cache_hits).value
+        cacheCapacity = try c.decode(AtlasSavedNumber.self, forKey: .index_cache_capacity_bytes).value
+        guard generation > 0, AtlasSavedWire.digest(pin), members <= 65_536,
+              indexed <= members, uncovered <= members - indexed, unavailable == members - indexed - uncovered,
+              (32...UInt64(4 * 1024 * 1024 + 32)).contains(manifestBytes),
+              manifestBytes <= fileBytes, fileBytes <= 24 * 1024 * 1024, cacheCapacity == 65_536,
+              // Failed/canceled verification can read a page without ever
+              // publishing it into the verified-page cache.
+              pageLoads == 0 || pageBytes > 0,
+              try c.decode(String.self, forKey: .index_kind) == "demand-paged-postings-v1",
+              try c.decode(String.self, forKey: .index_pin_scope) == "page-manifest-envelope-sha256",
+              try !c.decode(Bool.self, forKey: .index_body_verified_on_open) else {
+            throw AtlasSavedError.invalidResponse
+        }
+    }
+    private func validate(_ identity: AtlasSavedIdentity) throws {
+        guard members == identity.members, indexed + uncovered == identity.captured,
+              unavailable == identity.members - identity.captured else { throw AtlasSavedError.invalidResponse }
+    }
+    static func current(_ data: Data, identity: AtlasSavedIdentity, generation: UInt64?) throws -> Self? {
+        // Detached info has no index fields. Reject contradictory metadata
+        // instead of interpreting an omitted or null generation as an index.
+        struct Presence: Decodable {
+            let present: Bool
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                present = CodingKeys.allCases.contains { c.contains($0) }
+            }
+        }
+        guard let generation else {
+            guard try !JSONDecoder().decode(Presence.self, from: data).present else { throw AtlasSavedError.invalidResponse }
+            return nil
+        }
+        let index = try JSONDecoder().decode(Self.self, from: data)
+        try index.validate(identity)
+        guard index.generation == generation else { throw AtlasSavedError.invalidResponse }
+        return index
+    }
+    static func decodeAttach(_ json: String?, identity: AtlasSavedIdentity, generation: UInt64, pin: String) throws -> Self {
+        let data = try AtlasSavedWire.admit(json, handle: identity.owner, command: "index-attach", identity: identity)
+        do {
+            struct Attempt: Decodable { let last_index_attempt: AtlasSavedNumber }
+            let index = try JSONDecoder().decode(Self.self, from: data)
+            try index.validate(identity)
+            guard index.generation == generation, index.pin == pin,
+                  try JSONDecoder().decode(Attempt.self, from: data).last_index_attempt.value == generation,
+                  index.pageBytes == 0, index.pageLoads == 0, index.cacheHits == 0 else { throw AtlasSavedError.invalidResponse }
+            return index
+        } catch let error as AtlasSavedError { throw error }
+        catch { throw AtlasSavedError.invalidResponse }
+    }
+    static func decodeDetach(_ json: String?, identity: AtlasSavedIdentity, generation: UInt64) throws {
+        let data = try AtlasSavedWire.admit(json, handle: identity.owner, command: "index-detach", identity: identity)
+        struct Detached: Decodable {
+            let accepted_index_generation: AtlasSavedSearchOptional<AtlasSavedNumber>
+            let last_index_attempt: AtlasSavedNumber
+        }
+        do {
+            let w = try JSONDecoder().decode(Detached.self, from: data)
+            guard w.accepted_index_generation.value == nil, w.last_index_attempt.value == generation else {
+                throw AtlasSavedError.invalidResponse
+            }
+            _ = try current(data, identity: identity, generation: nil)
+        } catch let error as AtlasSavedError { throw error }
+        catch { throw AtlasSavedError.invalidResponse }
+    }
+    private enum CodingKeys: CodingKey, CaseIterable {
+        case index_generation, index_pin, index_kind, index_pin_scope, index_body_verified_on_open,
+             index_members, index_indexed_files, index_uncovered_files, index_unavailable_files,
+             index_file_bytes, index_manifest_bytes_read, index_page_bytes_read, index_page_loads,
+             index_cache_hits, index_cache_capacity_bytes
     }
 }
 
@@ -459,6 +562,8 @@ struct AtlasSavedRelationships: Sendable {
 enum AtlasSavedRequest: Sendable {
     case open(path: String), info
     case members(start: UInt64, limit: UInt64)
+    case attachIndex(generation: UInt64, path: String, pin: String)
+    case detachIndex(generation: UInt64)
     case search(generation: UInt64, needle: String, matches: UInt64)
     case results(generation: UInt64, start: UInt64, limit: UInt64)
     case clearResults(generation: UInt64)

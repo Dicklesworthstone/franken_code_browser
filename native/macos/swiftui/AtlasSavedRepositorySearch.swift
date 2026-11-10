@@ -223,6 +223,9 @@ struct AtlasSavedSearchPage: Sendable {
     let peakSourceBytes: UInt64
     let indexGeneration: UInt64?
     let indexPin: String?
+    let indexEliminatedFiles: UInt64
+    let fallbackFiles: UInt64
+    let postingEntriesVisited: UInt64
 
     /// A nil expected needle is reserved for recovering the currently accepted
     /// query through info/results. New searches always bind the exact submitted
@@ -256,12 +259,13 @@ struct AtlasSavedSearchPage: Sendable {
                   w.index_eliminated_files.value <= identity.members, w.fallback_files.value <= identity.members,
                   (indexGeneration == nil) == (indexPin == nil),
                   indexGeneration == nil || (indexGeneration! > 0 && AtlasSavedWire.digest(indexPin!)),
+                  indexGeneration != nil || (w.index_eliminated_files.value == 0 && w.fallback_files.value == 0 &&
+                    w.posting_entries_visited.value == 0),
                   start <= retained, UInt64(w.hits.count) == min(limit, retained - start) else {
                 throw AtlasSavedError.invalidResponse
             }
             // These are query-time index counters, not a partition of source
             // coverage and not a claim about the currently attached index.
-            _ = w.posting_entries_visited.value
             var previous: AtlasSavedHit?
             for (position, hit) in w.hits.enumerated() {
                 guard hit.id == start + UInt64(position) + 1, hit.member < identity.members else {
@@ -283,7 +287,9 @@ struct AtlasSavedSearchPage: Sendable {
                 start: start, next: next, complete: w.search_complete, truncated: w.truncated,
                 retained: retained, seen: seen, unavailable: unavailable, unsupported: unsupported,
                 sourceBytes: loaded, scannedBytes: w.scanned_bytes.value, peakSourceBytes: w.peak_source_bytes.value,
-                indexGeneration: indexGeneration, indexPin: indexPin)
+                indexGeneration: indexGeneration, indexPin: indexPin,
+                indexEliminatedFiles: w.index_eliminated_files.value, fallbackFiles: w.fallback_files.value,
+                postingEntriesVisited: w.posting_entries_visited.value)
         } catch let error as AtlasSavedError { throw error }
         catch { throw AtlasSavedError.invalidResponse }
     }
