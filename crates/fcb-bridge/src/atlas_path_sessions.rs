@@ -31,7 +31,7 @@ impl AtlasSessions {
             PathCommand::Clear { generation } => session.paths.clear(&session.atlas, generation, &mut stop),
         };
         if let Err(error) = cell.validate(epoch) {
-            session.search.cancel_pending();
+            session.cancel_work();
             return Err(error);
         }
         result.map_err(AccessError::from)
@@ -56,7 +56,7 @@ impl AtlasSessions {
         // Once installed, a late cancellation suppresses the reply but cannot
         // roll back the independently owned reader. Inspect/close that handle.
         if let Err(error) = cell.validate(epoch) {
-            session.search.cancel_pending();
+            session.cancel_work();
             return Err(error);
         }
         result

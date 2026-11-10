@@ -23,6 +23,9 @@ pub(super) use index::IndexCommand;
 #[path = "atlas_stream_sessions.rs"]
 mod stream;
 pub(super) use stream::StreamCommand;
+#[path = "atlas_links_sessions.rs"]
+mod links;
+pub(super) use links::LinksCommand;
 
 pub(super) const MAX_ATLAS_SESSIONS: usize = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,13 +99,19 @@ struct Session {
     operation_epoch: u64,
 }
 impl Session {
+    /// One atlas epoch owns every resumable operation. Retire provisional work
+    /// together while preserving already accepted sources and results.
+    fn cancel_work(&mut self) {
+        self.search.cancel_pending();
+        self.search.cancel_index_build();
+        self.search.cancel_relationships_pending();
+    }
     /// Cancellation can arrive BETWEEN resumable calls. Reclaim obsolete query
-    /// and index-construction work on this worker before reading or resuming it.
+    /// and index/link-construction work before reading or resuming it.
     /// Completed index/results are committed and are not rolled back here.
     fn synchronize(&mut self, epoch: u64) {
         if self.operation_epoch != epoch {
-            self.search.cancel_pending();
-            self.search.cancel_index_build();
+            self.cancel_work();
             self.operation_epoch = epoch;
         }
     }
@@ -217,8 +226,7 @@ impl AtlasSessions {
             Command::Scope { generation, scope } => session.atlas.prepare(generation, AtlasAction::Scope(scope), &mut stop).map_err(AccessError::from),
         };
         if let Err(error) = cell.validate(epoch) {
-            session.search.cancel_pending();
-            session.search.cancel_index_build();
+            session.cancel_work();
             return Err(error);
         }
         result
@@ -242,8 +250,7 @@ impl AtlasSessions {
         // A late close/cancel suppresses delivery, but does not pretend to undo
         // an already installed reader. The known destination can be reconciled.
         if let Err(error) = cell.validate(epoch) {
-            session.search.cancel_pending();
-            session.search.cancel_index_build();
+            session.cancel_work();
             return Err(error);
         }
         result
@@ -265,8 +272,7 @@ impl AtlasSessions {
             |owner, reader_stop| session.search.open_reader(&session.atlas, owner, generation, hit, reader_stop).map_err(AccessError::from),
             &mut stop);
         if let Err(error) = cell.validate(epoch) {
-            session.search.cancel_pending();
-            session.search.cancel_index_build();
+            session.cancel_work();
             return Err(error);
         }
         result

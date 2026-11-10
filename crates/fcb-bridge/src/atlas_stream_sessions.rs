@@ -32,8 +32,7 @@ impl AtlasSessions {
                 if cell.validate(epoch).is_ok() { progress(response); }
             });
         if let Err(error) = cell.validate(epoch) {
-            session.search.cancel_pending();
-            session.search.cancel_index_build();
+            session.cancel_work();
             return Err(error);
         }
         if canceled() { return Err(AccessError::Canceled); }
@@ -62,8 +61,7 @@ impl AtlasSessions {
         // replacement; callers must reconcile or revoke old result actions
         // after an uncertain reply. The cell permit outlives the entered work.
         if let Err(error) = cell.validate(epoch) {
-            session.search.cancel_pending();
-            session.search.cancel_index_build();
+            session.cancel_work();
             return Err(error);
         }
         if canceled() { return Err(AccessError::Canceled); }

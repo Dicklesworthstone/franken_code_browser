@@ -56,11 +56,10 @@ impl AtlasSessions {
                     expression, scope.clone(), max_matches, max_scan_bytes, &mut stop),
             IndexCommand::Clear { generation } => session.search.clear_index(&session.atlas, generation, &mut stop),
         };
-        // Epoch cancellation invalidates both paused work kinds. A terminal
+        // Epoch cancellation invalidates all paused atlas work. A terminal
         // acceptance cannot be rolled back merely because its reply was canceled.
         if let Err(error) = cell.validate(epoch) {
-            session.search.cancel_pending();
-            session.search.cancel_index_build();
+            session.cancel_work();
             return Err(error);
         }
         result.map_err(AccessError::from)
@@ -86,8 +85,7 @@ impl AtlasSessions {
                 reader_owner, index_generation, file, revision, reader_stop).map_err(AccessError::from),
             &mut stop);
         if let Err(error) = cell.validate(epoch) {
-            session.search.cancel_pending();
-            session.search.cancel_index_build();
+            session.cancel_work();
             return Err(error);
         }
         result

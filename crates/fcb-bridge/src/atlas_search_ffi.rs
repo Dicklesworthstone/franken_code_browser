@@ -223,6 +223,8 @@ mod index;
 mod structure;
 #[path = "atlas_expression_ffi.rs"]
 mod expression;
+#[path = "atlas_links_ffi.rs"]
+mod links;
 
 #[cfg(all(test, unix))]
 #[path = "atlas_search_ffi_tests.rs"]
