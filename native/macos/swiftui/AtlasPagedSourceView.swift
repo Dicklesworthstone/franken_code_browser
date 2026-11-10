@@ -19,6 +19,7 @@ import AppKit
     @State private var model: AtlasPagedReaderModel
     @State private var copyNotice = ""
     @State private var showsOutline = false
+    @State private var showsReferences = false
     @State private var showsDocument = false
     @State private var showsSplitPreview = false
     @State private var wrapsLines = false
@@ -98,6 +99,7 @@ import AppKit
         .onChange(of: project?.info?.owner) { _, _ in closeLinked() }
         .onChange(of: model.navigation) { _, _ in copyNotice = "" }
         .onChange(of: Array(model.fileQuery.utf8)) { _, _ in copyNotice = "" }
+        .onChange(of: Array(model.referenceName.utf8)) { _, _ in copyNotice = "" }
     }
 
     private var modalLocalNavigation: AtlasDocumentPreviewModel.LocalNavigation? {
@@ -201,6 +203,19 @@ import AppKit
 
     private var sourcePane: some View {
         VStack(spacing: 4) {
+            if let label = model.referenceSelectionLabel {
+                HStack {
+                    Text(label).font(.caption2).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Copy occurrence hex") {
+                        guard let hex = model.referenceHex else { return }
+                        NSPasteboard.general.clearContents()
+                        copyNotice = NSPasteboard.general.setString(hex, forType: .string)
+                            ? "Copied the occurrence's exact original bytes as hex." : "Clipboard write failed."
+                    }
+                    .help("Copy the selected occurrence's captured bytes, including its original encoding")
+                }.padding(.horizontal, 10)
+            }
             if let label = model.symbolSelectionLabel {
                 HStack {
                     Text(label).font(.caption2).foregroundStyle(.secondary)
@@ -357,7 +372,19 @@ import AppKit
                 Button("Find", action: model.find).disabled(!model.canFind || model.fileQuery.isEmpty)
                 Button("Outline") { showsOutline = true }
                     .disabled(!model.canBuildOutline)
-                    .popover(isPresented: $showsOutline) { AtlasOutlineBrowser(model: model) }
+                    .popover(isPresented: $showsOutline) {
+                        AtlasOutlineBrowser(model: model, findOccurrences: { target in
+                            model.findReferences(for: target)
+                            showsOutline = false
+                            showsReferences = true
+                        })
+                    }
+                Button("Occurrences") { showsReferences = true }
+                    .disabled(model.page == nil)
+                    .help("Find whole-identifier text occurrences in the retained source, including comments and literals")
+                    .popover(isPresented: $showsReferences) {
+                        AtlasReferenceBrowser(model: model, openOccurrence: { showsReferences = false })
+                    }
                 Button("Markdown") {
                     showsDocument = true
                     preparePreview()

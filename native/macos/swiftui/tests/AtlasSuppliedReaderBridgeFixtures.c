@@ -2,6 +2,7 @@
  * This is not a substitute for the Rust supplied-reader integration tests. */
 #include "../../../../crates/fcb-bridge/include/fcb_reader_supplied.h"
 #include "../../../../crates/fcb-bridge/include/fcb_reader_comparison.h"
+#include "../../../../crates/fcb-bridge/include/fcb_reader_references.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,6 +53,38 @@ char *fcb_reader_compare(uint64_t before, uint64_t after, uint64_t generation,
     ++calls;
     char *result = strdup("{\"comparison_fixture\":true}");
     assert(result); ++allocated; return result;
+}
+static char *reference_reply(const char *json) {
+    ++calls;
+    if (mode == 2) return NULL;
+    char *result;
+    if (mode == 3) { result = strdup("{\"invalid_utf8\":\"\xff\"}"); }
+    else if (mode == 4) {
+        const size_t length = 4 * 1024 * 1024 + 1;
+        result = malloc(length + 1); assert(result);
+        memset(result, 'x', length); result[length] = 0;
+    } else { result = strdup(mode == 5 ? "" : json); }
+    assert(result); ++allocated; return result;
+}
+char *fcb_reader_references(uint64_t handle, uint64_t generation,
+    const char *name, uint64_t max_items) {
+    assert(handle == fixture_handle && generation == UINT64_MAX);
+    assert(name && !strcmp(name, "e\xcc\x81") && max_items == UINT64_C(4096));
+    return reference_reply("{\"references_fixture\":true}");
+}
+char *fcb_reader_reference_page(uint64_t handle, uint64_t generation,
+    uint64_t start, uint64_t limit) {
+    /* Deliberately outside admission bounds: only full-width ABI preservation
+     * is exercised here; production host range validation is tested in Rust. */
+    assert(handle == fixture_handle && generation == UINT64_MAX);
+    assert(start == UINT64_MAX - 2 && limit == UINT64_C(128));
+    return reference_reply("{\"reference_page_fixture\":true}");
+}
+char *fcb_reader_reference(uint64_t handle, uint64_t generation,
+    uint64_t reference_id, uint64_t context_bytes) {
+    assert(handle == fixture_handle && generation == UINT64_MAX);
+    assert(reference_id == UINT64_MAX - 3 && context_bytes == UINT64_C(2048));
+    return reference_reply("{\"reference_fixture\":true}");
 }
 uint8_t fcb_reader_cancel(uint64_t handle) { assert(handle == fixture_handle); return 1; }
 uint8_t fcb_reader_close(uint64_t handle) { assert(handle == fixture_handle); return 1; }

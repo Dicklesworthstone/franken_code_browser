@@ -25,6 +25,9 @@ struct AtlasReaderTransport: Sendable {
     let fork: (@Sendable (UInt64, UInt64) -> String?)?
     let openBytes: (@Sendable (UInt64, String, Data) -> SuppliedResponse?)?
     let comparison: AtlasReaderComparisonTransport?
+    /// Optional whole-token occurrence service over the same retained source.
+    /// Independent of outline extraction, literal Find and native presentation.
+    let references: AtlasReaderReferencesTransport?
 
     init(create: @escaping @Sendable () -> UInt64,
          open: @escaping @Sendable (UInt64, String, UInt64) -> String?,
@@ -36,12 +39,14 @@ struct AtlasReaderTransport: Sendable {
          retirementFailed: @escaping @Sendable () -> Void,
          fork: (@Sendable (UInt64, UInt64) -> String?)? = nil,
          openBytes: (@Sendable (UInt64, String, Data) -> SuppliedResponse?)? = nil,
-         comparison: AtlasReaderComparisonTransport? = nil) {
+         comparison: AtlasReaderComparisonTransport? = nil,
+         references: AtlasReaderReferencesTransport? = nil) {
         self.create = create; self.open = open; self.window = window; self.lines = lines
         self.cancel = cancel; self.close = close; self.retirementFailed = retirementFailed
         self.fork = fork
         self.openBytes = openBytes
         self.comparison = comparison
+        self.references = references
         self.position = position
     }
 }
@@ -135,6 +140,9 @@ private final class AtlasReaderSession: @unchecked Sendable {
     private var outlineInventory: AtlasOutlineInventory?
     private var acceptedOutline: AtlasOutlinePage?
     private var lastOutlineGeneration: UInt64 = 0
+    private var referenceInventory: AtlasReferenceInventory?
+    private var acceptedReferences: AtlasReferencePage?
+    private var lastReferenceGeneration: UInt64 = 0
     private var acceptedFind: AtlasReaderFindReport?
     private var lastFindGeneration: UInt64 = 0
     private var lastComparisonGeneration: UInt64 = 0
@@ -156,6 +164,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
     }
     var supportsFind: Bool { searchTransport != nil }
     var supportsOutline: Bool { outlineTransport != nil }
+    var supportsReferences: Bool { (session?.transport ?? transport).references != nil }
     var supportsDocument: Bool { documentTransport != nil }
     var supportsPosition: Bool { (session?.transport ?? transport).position != nil }
     var canFork: Bool { session?.transport.fork != nil && info != nil }
@@ -479,6 +488,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
         cancellation = nil
         acceptedFind = nil
         resetOutline()
+        resetReferences()
         documentState.close()
         // Query targets can escape the current capture. Keep their generation
         // counters monotonic for this coordinator instead of recycling one.
@@ -494,6 +504,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
         if case .position = request, session.transport.position == nil { throw AtlasReaderError.unavailable }
         let outline = outlineTransport
         let search = searchTransport
+        let references = session.transport.references
         cancel()
         let ticket = UUID()
         operation = ticket
@@ -516,6 +527,10 @@ private final class AtlasReaderSession: @unchecked Sendable {
                 case .symbol(let target):
                     guard let outline else { throw AtlasReaderError.unavailable }
                     json = outline.symbol(session.handle, target.generation, target.symbol.id, AtlasOutlineTarget.contextBytes)
+                case .reference(let target):
+                    guard let references else { throw AtlasReaderError.unavailable }
+                    json = references.reference(session.handle, target.generation, target.occurrence.id,
+                        AtlasReferenceTarget.contextBytes)
                 }
                 return try AtlasReaderPage.decode(json, info: info, request: request)
             }
@@ -540,6 +555,12 @@ private final class AtlasReaderSession: @unchecked Sendable {
         if case .symbol(let target) = request {
             guard outlineTransport != nil, let acceptedOutline,
                   acceptedOutline.target(id: target.symbol.id) == target else {
+                throw AtlasReaderError.invalidInput
+            }
+        }
+        if case .reference(let target) = request {
+            guard supportsReferences, let acceptedReferences,
+                  acceptedReferences.target(id: target.occurrence.id) == target else {
                 throw AtlasReaderError.invalidInput
             }
         }
@@ -635,6 +656,73 @@ private final class AtlasReaderSession: @unchecked Sendable {
         }
     }
 
+    /// Whole-token text candidates are independent of literal Find and language
+    /// outlines. Attempts never recycle generations, including canceled work.
+    /// The old Rust inventory may survive a failed attempt, but it cannot regain
+    /// native activation authority from an ambiguous canceled delivery.
+    func prepareReferences(_ name: String) async throws -> AtlasReferencePage {
+        guard let session, let info, let references = session.transport.references else {
+            throw AtlasReaderError.unavailable
+        }
+        try AtlasReferencePage.validateName(name)
+        guard info.identity.capturedBytes <= AtlasReferencePage.sourceLimit else {
+            throw AtlasReaderError.engine("REFERENCE_SOURCE_LIMIT")
+        }
+        let (generation, overflow) = lastReferenceGeneration.addingReportingOverflow(1)
+        guard !overflow else { throw AtlasReaderError.unavailable }
+        lastReferenceGeneration = generation
+        resetReferences()
+        cancel()
+        let ticket = UUID(), flag = AtlasSearchCancellation()
+        operation = ticket; cancellation = flag
+        do {
+            let page = try await io.perform(cancellation: flag, keepingAlive: [session]) {
+                try AtlasReferencePage.decode(
+                    references.prepare(session.handle, generation, name, AtlasReferencePage.maxItems),
+                    info: info, generation: generation, name: name, request: .initial, preparing: true)
+            }
+            guard self.session === session, operation == ticket, !flag.isCanceled,
+                  !Task.isCancelled else { throw AtlasReaderError.canceled }
+            referenceInventory = page.inventory
+            acceptedReferences = page
+            cancellation = nil
+            return page
+        } catch {
+            if self.session === session, operation == ticket { cancellation = nil }
+            throw Self.readerError(error)
+        }
+    }
+
+    /// Page the retained occurrence inventory without rescanning or reading a
+    /// live pathname. Returned IDs keep their original meaning across pages.
+    func referencePage(_ request: AtlasReferencePageRequest) async throws -> AtlasReferencePage {
+        try request.validate()
+        guard let session, let info, let references = session.transport.references,
+              let inventory = referenceInventory else { throw AtlasReaderError.unavailable }
+        acceptedReferences = nil
+        cancel()
+        let ticket = UUID(), flag = AtlasSearchCancellation()
+        operation = ticket; cancellation = flag
+        do {
+            let page = try await io.perform(cancellation: flag, keepingAlive: [session]) {
+                try AtlasReferencePage.decode(
+                    references.page(session.handle, inventory.generation, request.start, request.limit),
+                    info: info, generation: inventory.generation, name: inventory.name,
+                    request: request, inventory: inventory)
+            }
+            guard self.session === session, operation == ticket, !flag.isCanceled,
+                  !Task.isCancelled, referenceInventory?.matches(inventory) == true else {
+                throw AtlasReaderError.canceled
+            }
+            acceptedReferences = page
+            cancellation = nil
+            return page
+        } catch {
+            if self.session === session, operation == ticket { cancellation = nil }
+            throw Self.readerError(error)
+        }
+    }
+
     /// Document parsing, paging, provenance and copy share the retained source
     /// handle and its bounded I/O lane. The optional capability stays inert for
     /// source-only hosts. Admission precedes cancellation so invalid requests
@@ -683,6 +771,8 @@ private final class AtlasReaderSession: @unchecked Sendable {
     /// Revoke native rows, not source/search state or the bounded Rust index.
     func revokeOutlinePage() { acceptedOutline = nil }
     func resetOutline() { acceptedOutline = nil; outlineInventory = nil }
+    func revokeReferencePage() { acceptedReferences = nil }
+    func resetReferences() { acceptedReferences = nil; referenceInventory = nil }
 
     /// Revoke native activation authority without evicting captured source or
     /// interrupting unrelated byte/line navigation. The host cancels active
@@ -707,6 +797,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
         info = nil
         acceptedFind = nil
         resetOutline()
+        resetReferences()
         // Counters belong to this coordinator, not a capture. Old query
         // targets must not become current after close/open of identical bytes.
         documentState.close()

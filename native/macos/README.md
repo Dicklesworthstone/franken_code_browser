@@ -326,6 +326,40 @@ and reports that the native caret is unavailable. It does not round the target.
 Source, bridge, and native regression cases are included; executable Rust/Swift
 and physical-Mac qualification remain pending.
 
+## Identifier occurrences in retained source
+
+Open **Occurrences** in the paged source reader, enter an identifier and press
+**Find**. You can also choose **Occurrences** beside an outline entry to use its
+exact name. The list searches the entire retained file and lets you page through
+its results. Select a row to highlight that exact original-byte range in the
+source, then use ordinary native Copy for decoded text or **Copy occurrence hex**
+for the original encoded bytes. Navigation uses the same capture even if the
+working-tree file has changed or been renamed.
+
+These are case-sensitive whole-token text matches, including declarations,
+comments and string literals. They do not establish compiler bindings or
+distinguish references to separate declarations with the same spelling. The
+shared Rust token policy groups ASCII letters and digits, `_`, `$`, and
+conservative non-ASCII runs; matching does not normalize Unicode spelling.
+Occurrence line labels count LF boundaries, including CRLF. Original byte
+ranges remain exact for CR-only source as well.
+
+This service admits up to **512 KiB** of valid UTF-8 or BOM-marked UTF-16 source
+and identifiers of at most **1,024 UTF-8 bytes**. It retains at most **4,096
+occurrences**, returns the first 64 rows and pages through subsequent retained
+rows without rescanning. A limit reports an incomplete inventory and a lower
+bound on matches instead of presenting a truncated count as exhaustive. Files
+outside these bounds remain available through the ordinary source reader.
+Editing the identifier or starting a replacement search revokes old row actions;
+failed or canceled work preserves the accepted source page. Find, outline and
+occurrence queries have independent generations and selection identities.
+
+The Rust host and C-boundary suites cover exact-byte navigation, changed files,
+UTF-16, limits and cancellation. The portable decoder and model suites are wired
+through `swiftui/tests/test-reader-references.sh`; the supplied-reader suite also
+covers native reference-call marshaling. These are code-first additions awaiting
+the configured strict-RCH verification lane and physical-Mac qualification.
+
 ## Local test image
 
 For a local drag-to-Applications test image:

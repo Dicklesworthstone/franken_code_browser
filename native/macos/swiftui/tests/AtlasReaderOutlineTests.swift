@@ -1,6 +1,6 @@
 // Portable production outline/reader tests; only the foreign C boundary is
 // injected. Link AtlasSearch.swift, AtlasSearchCoordinator.swift, AtlasProjectIO,
-// AtlasSource, AtlasReader, AtlasReaderSearch, AtlasReaderOutline,
+// AtlasSource, AtlasReader, AtlasReaderSearch, AtlasReaderOutline, AtlasReaderReferences,
 // AtlasReaderCoordinator and AtlasPagedReaderModel. No Apple UI or parser mock.
 import Foundation
 import Dispatch

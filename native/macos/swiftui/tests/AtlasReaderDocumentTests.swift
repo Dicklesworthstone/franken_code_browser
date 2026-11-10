@@ -1,7 +1,7 @@
 // Portable production document admission/decoder tests. These fixed foreign
 // responses test the host contract, not an imitation Markdown parser.
 // swiftc -swift-version 6 -warnings-as-errors AtlasReader.swift \
-//   AtlasReaderSearch.swift AtlasReaderOutline.swift AtlasReaderDocument.swift \
+//   AtlasReaderSearch.swift AtlasReaderOutline.swift AtlasReaderReferences.swift AtlasReaderDocument.swift \
 //   tests/AtlasReaderDocumentTests.swift -o /tmp/fcb-document-tests
 import Foundation
 

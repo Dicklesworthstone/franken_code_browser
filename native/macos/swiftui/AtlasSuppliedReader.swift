@@ -55,7 +55,8 @@ struct AtlasSuppliedReaderSource: Sendable {
         let capture_sha256, initial_source_bytes_read, initial_read_calls: String
         enum CodingKeys: CodingKey {
             case capture_sha256, initial_source_bytes_read, initial_read_calls,
-                 accepted_query_generation, accepted_outline_generation, accepted_document_generation
+                 accepted_query_generation, accepted_outline_generation, accepted_document_generation,
+                 accepted_reference_generation
         }
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -67,6 +68,11 @@ struct AtlasSuppliedReaderSource: Sendable {
             for key in [CodingKeys.accepted_query_generation, .accepted_outline_generation,
                         .accepted_document_generation] {
                 guard c.contains(key), try c.decodeNil(forKey: key) else {
+                    throw AtlasReaderError.invalidResponse
+                }
+            }
+            if c.contains(.accepted_reference_generation) {
+                guard try c.decodeNil(forKey: .accepted_reference_generation) else {
                     throw AtlasReaderError.invalidResponse
                 }
             }
@@ -92,6 +98,7 @@ extension AtlasReaderTransport {
         Self(create: create, open: { handle, path, limit in
             source.open(handle: handle, label: path, limit: limit, using: self)
         }, window: window, lines: lines, position: position, cancel: cancel, close: close,
-        retirementFailed: retirementFailed, fork: fork, openBytes: openBytes, comparison: comparison)
+        retirementFailed: retirementFailed, fork: fork, openBytes: openBytes, comparison: comparison,
+        references: references)
     }
 }

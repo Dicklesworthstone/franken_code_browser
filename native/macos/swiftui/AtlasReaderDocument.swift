@@ -604,7 +604,8 @@ private struct AtlasReaderDocumentWire: Decodable {
               try text("selection_namespace") == "document",
               try text("source_mapping") == "enclosing-regions-not-glyph-exact",
               try range("rendered_utf8_range") == target.rendered,
-              try absent(["query_generation", "outline_generation", "symbol_id", "declaration_line", "semantic_resolution"]) else {
+              try absent(["query_generation", "outline_generation", "symbol_id", "declaration_line", "semantic_resolution",
+                          "reference_generation", "reference_id", "reference_line", "includes_comments_and_literals", "compiler_resolved"]) else {
             throw AtlasReaderError.invalidResponse
         }
     }

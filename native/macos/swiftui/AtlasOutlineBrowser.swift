@@ -4,6 +4,7 @@ import SwiftUI
 /// second parser or compiler resolver. Filtering never reopens the pathname.
 @MainActor struct AtlasOutlineBrowser: View {
     @Bindable var model: AtlasPagedReaderModel
+    var findOccurrences: ((AtlasOutlineTarget) -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -36,25 +37,36 @@ import SwiftUI
                 Text(page.summary).font(.caption).foregroundStyle(.secondary)
                 List {
                     ForEach(page.rows) { symbol in
-                        Button {
-                            // Capture the row's ORIGINAL page token, not a
-                            // reusable list offset or the latest page's row ID.
-                            if let target = page.target(id: symbol.id) { model.openSymbol(target) }
-                        } label: {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(String(reflecting: symbol.name))
-                                    .font(.system(.body, design: .monospaced)).lineLimit(1)
-                                Text("\(symbol.kind) · line \(symbol.line)" + (symbol.nameRange == nil ? " · declaration evidence" : ""))
-                                    .font(.caption2).foregroundStyle(.secondary)
+                        HStack {
+                            Button {
+                                // Capture the row's ORIGINAL page token, not a
+                                // reusable list offset or the latest page's row ID.
+                                if let target = page.target(id: symbol.id) { model.openSymbol(target) }
+                            } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(String(reflecting: symbol.name))
+                                        .font(.system(.body, design: .monospaced)).lineLimit(1)
+                                    Text("\(symbol.kind) · line \(symbol.line)" + (symbol.nameRange == nil ? " · declaration evidence" : ""))
+                                        .font(.caption2).foregroundStyle(.secondary)
+                                }
+                                .padding(.leading, CGFloat(min(symbol.depth, 8)) * 8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
                             }
-                            .padding(.leading, CGFloat(min(symbol.depth, 8)) * 8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .contentShape(Rectangle())
+                            .buttonStyle(.plain)
+                            .disabled(!model.outlineIsCurrent || model.busy)
+                            .accessibilityLabel("Open outline candidate " + String(reflecting: symbol.name))
+                            .help("Navigate this candidate in the retained capture; this is not compiler-proven name resolution")
+                            if let findOccurrences {
+                                Button("Occurrences") {
+                                    if let target = page.target(id: symbol.id) { findOccurrences(target) }
+                                }
+                                .buttonStyle(.borderless)
+                                .disabled(!model.outlineIsCurrent || !model.canFindReferences || model.busy)
+                                .accessibilityLabel("Find whole-identifier occurrences of " + String(reflecting: symbol.name))
+                                .help("Find this name throughout the retained source, including comments and literals")
+                            }
                         }
-                        .buttonStyle(.plain)
-                        .disabled(!model.outlineIsCurrent || model.busy)
-                        .accessibilityLabel("Open outline candidate " + String(reflecting: symbol.name))
-                        .help("Navigate this candidate in the retained capture; this is not compiler-proven name resolution")
                     }
                 }
                 .id(page.id)

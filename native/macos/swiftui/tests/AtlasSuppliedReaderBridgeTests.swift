@@ -71,7 +71,34 @@ import Foundation
                          "position arguments or response ownership changed at the native boundary")
         }
         precondition(suppliedCalls() == 7)
+        guard let references = AtlasReaderTransport.native.references else {
+            fatalError("native retained occurrence capability missing")
+        }
+        // Exercise the actual three C entry points, including exact decomposed
+        // UTF-8 spelling, full-width integers, nullable replies and owned frees.
+        // Malformed UTF-8, oversized and empty replies are refused and freed.
+        // The fixture intentionally accepts out-of-range page/row coordinates
+        // to distinguish UInt64 transport from the Rust host admission policy.
+        precondition(AtlasReaderLimits.responseBytes == 4 * 1024 * 1024)
+        for mode in [Int32(0), 2, 3, 4, 5] {
+            suppliedMode(mode)
+            let before = suppliedCalls()
+            let prepared = await Task.detached {
+                references.prepare(handle, UInt64.max, "e\u{301}", AtlasReferencePage.maxItems)
+            }.value
+            precondition(prepared == (mode == 0 ? "{\"references_fixture\":true}" : nil))
+            let page = await Task.detached {
+                references.page(handle, UInt64.max, UInt64.max - 2, 128)
+            }.value
+            precondition(page == (mode == 0 ? "{\"reference_page_fixture\":true}" : nil))
+            let selected = await Task.detached {
+                references.reference(handle, UInt64.max, UInt64.max - 3, AtlasReferenceTarget.contextBytes)
+            }.value
+            precondition(selected == (mode == 0 ? "{\"reference_fixture\":true}" : nil))
+            precondition(suppliedCalls() == before + 3 && suppliedLive() == 0,
+                         "occurrence ABI arguments or response ownership changed")
+        }
         precondition(AtlasReaderTransport.native.close(handle))
-        print("AtlasSuppliedReaderBridgeTests: exact raw buffer, SHA, empty capture, limits, pair/position arguments and allocation checks passed")
+        print("AtlasSuppliedReaderBridgeTests: exact raw buffer, SHA, empty capture, limits, pair/position/occurrence arguments and allocation checks passed")
     }
 }
