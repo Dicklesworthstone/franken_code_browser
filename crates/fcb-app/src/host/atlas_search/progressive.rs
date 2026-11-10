@@ -63,7 +63,10 @@ pub(super) struct SearchWork {
     pub(super) snapshot: Snapshot,
     pub(super) execution: SearchExecution,
 }
-pub(super) enum SearchExecution { Live(LiveWork), Indexed(IndexedWork), Structure(super::structure::StructureWork) }
+pub(super) enum SearchExecution {
+    Live(LiveWork), Indexed(IndexedWork), Structure(super::structure::StructureWork),
+    Expression(super::expression::ExpressionWork),
+}
 pub(super) struct LiveWork {
     // Exact mode keeps the original incremental scanner. Lowercase matching is
     // delegated to DirectSourceScanner over the same bounded complete capture.
@@ -163,7 +166,7 @@ impl RetainedAtlasSearch {
             .map_err(|_| AppError::Admission)?;
         let scope_files = scope.freeze(atlas, eligible_files, canceled)?;
         let case_sensitive = scope.case_sensitive();
-        let snapshot = Snapshot { generation, needle: copy_text(needle)?, structure: None,
+        let snapshot = Snapshot { generation, needle: copy_text(needle)?, expression: None, structure: None,
             structure_rows: Vec::new(), files: reserve(capacity)?,
             scope, scope_files, scope_region, eligible_files,
             hits: reserve(options.max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?,
@@ -206,6 +209,7 @@ impl RetainedAtlasSearch {
             }
             SearchExecution::Indexed(indexed) => self.advance_indexed_work(atlas, snapshot, indexed, canceled)?,
             SearchExecution::Structure(structure) => self.advance_structure_work(atlas, snapshot, structure, canceled)?,
+            SearchExecution::Expression(expression) => self.advance_expression_work(atlas, snapshot, expression, canceled)?,
         }
         self.validate(atlas)?; check(canceled)?;
         snapshot.step_count = snapshot.step_count.checked_add(1).ok_or(AtlasSearchError::IdentityExhausted)?;

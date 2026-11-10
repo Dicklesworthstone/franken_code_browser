@@ -2,7 +2,8 @@
 
 //! Explicit capture/index preparation followed by zero-source-I/O queries.
 //! Synchronous and one-file resumable queries use the same owning cursor and
-//! verifier. Native paths stay with the atlas; query text is literal, not syntax.
+//! verifier. Native paths stay with the atlas. Explicit expression admission
+//! shares this pipeline while the original text methods remain literal.
 
 #[path = "index_build.rs"]
 mod build;
@@ -184,7 +185,7 @@ impl RetainedAtlasSearch {
         needle: &str, scope: AtlasSearchScope, max_matches: usize, max_scan_bytes: u64,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         let mut work = self.prepare_indexed_work(atlas, generation, index_generation, needle,
-            scope, max_matches, max_scan_bytes, &mut canceled)?;
+            scope, max_matches, max_scan_bytes, false, &mut canceled)?;
         while work.snapshot.stop_reason.is_none() { self.advance_work(atlas, &mut work, &mut canceled)?; }
         let response = self.work_response(atlas, &work, "search-indexed", &mut canceled)?;
         self.accepted = Some(work.snapshot);
@@ -208,29 +209,47 @@ impl RetainedAtlasSearch {
         needle: &str, scope: AtlasSearchScope, max_matches: usize, max_scan_bytes: u64,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         let work = self.prepare_indexed_work(atlas, generation, index_generation, needle,
-            scope, max_matches, max_scan_bytes, &mut canceled)?;
+            scope, max_matches, max_scan_bytes, false, &mut canceled)?;
         let response = self.work_response(atlas, &work, "begin-indexed", &mut canceled)?;
         self.pending = Some(work);
         Ok(response)
     }
 
-    fn prepare_indexed_work(&mut self, atlas: &AtlasSession, generation: u64, index_generation: u64,
-        needle: &str, scope: AtlasSearchScope, max_matches: usize, max_scan_bytes: u64,
+    pub(super) fn prepare_indexed_work(&mut self, atlas: &AtlasSession, generation: u64, index_generation: u64,
+        text: &str, scope: AtlasSearchScope, max_matches: usize, max_scan_bytes: u64, expression: bool,
         canceled: &mut impl FnMut() -> bool)
         -> Result<SearchWork, AtlasSearchError> {
         self.validate(atlas)?; self.attempt(generation)?; check(canceled)?;
-        if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES
-            || !(1..=MAX_ATLAS_SEARCH_HITS).contains(&max_matches)
-            || max_scan_bytes > MAX_ATLAS_SEARCH_SOURCE_BYTES as u64 { return Err(AtlasSearchError::InvalidLimits); }
+        let scan_limit = if expression { MAX_ATLAS_EXPRESSION_SCAN_BYTES } else { MAX_ATLAS_SEARCH_SOURCE_BYTES as u64 };
+        if !(1..=MAX_ATLAS_SEARCH_HITS).contains(&max_matches) || max_scan_bytes > scan_limit
+            || (!expression && (text.is_empty() || text.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES)) {
+            return Err(AtlasSearchError::InvalidLimits);
+        }
+        // Expression metadata predicates freeze membership before the owning
+        // query inspects captures/unavailable members or spends scan quotas.
+        let admitted = if expression { Some(self.admit_expression(atlas, text, &scope, max_scan_bytes, canceled)?) }
+            else { None };
         let [state_id, ast_id, query_id] = [self.next_id()?, self.next_id()?, self.next_id()?];
         let owner = self.manifest.owner();
         let retained = self.index.as_ref().ok_or(AtlasSearchError::MissingIndex)?;
         if retained.generation != index_generation { return Err(AtlasSearchError::StaleIndex); }
-        let (eligible_files, scope_region) = scope.admission_counts(atlas, canceled)?;
-        let outside_capture_scope = retained.capture_scope.query_members_outside(atlas, &scope, canceled)?;
-        let scope_bytes = if scope.is_all() { 0 } else {
+        let (eligible_files, scope_region) = if let Some(admitted) = &admitted {
+            (admitted.eligible, admitted.region)
+        } else { scope.admission_counts(atlas, canceled)? };
+        let outside_capture_scope = if let Some(admitted) = &admitted {
+            let mut outside = 0;
+            for &file in &admitted.files {
+                check(canceled)?;
+                let entry = atlas.atlas().catalog().entry(file).ok_or(AtlasSearchError::WrongAtlas)?;
+                if !retained.capture_scope.scope.includes_path(entry.path().raw().as_bytes()) { outside += 1; }
+            }
+            outside
+        } else { retained.capture_scope.query_members_outside(atlas, &scope, canceled)? };
+        // Expression admission already owns its selected-ID reservation.
+        let scope_bytes = if expression || scope.is_all() { 0 } else {
             eligible_files.checked_mul(size_of::<FileId>()).ok_or(AppError::Admission)?
         };
+        let needle = admitted.as_ref().map_or(text, |admitted| admitted.parsed.primary_needle.as_str());
         let capacity = retained.engine.captured_files().min(max_matches);
         let text_capacity = matched_text_capacity(needle, &scope)?;
         let scratch = if scope.case_sensitive() { 2 * 1024 * 1024 }
@@ -243,16 +262,30 @@ impl RetainedAtlasSearch {
             .ok_or(AppError::Admission)?;
         let lease = self.budget.try_reserve_managed(owner, state_id, ByteLength::new(charge))
             .map_err(|_| AppError::Admission)?;
-        let scope_files = scope.freeze(atlas, eligible_files, canceled)?;
-        let parsed = ParsedQuery { primary_needle: copy_text(needle)?, raw_query: copy_text(needle)?,
-            is_phrase: true, conjunction_terms: Vec::new(), exclusion_terms: Vec::new(),
-            path_filters: Vec::new(), lang_filters: Vec::new() };
+        let (mut parsed, expression, scope_files) = match admitted {
+            Some(admitted) => (admitted.parsed, Some(admitted.summary), Some(admitted.files)),
+            None => (ParsedQuery { primary_needle: copy_text(text)?, raw_query: copy_text(text)?,
+                is_phrase: true, conjunction_terms: Vec::new(), exclusion_terms: Vec::new(),
+                path_filters: Vec::new(), lang_filters: Vec::new() }, None,
+                scope.freeze(atlas, eligible_files, canceled)?),
+        };
+        if expression.is_some() {
+            // Native index captures deliberately carry no display path. The
+            // atlas already applied these exact shared predicates to its
+            // UTF-8/escaped search keys and froze BOTH captured and unavailable
+            // membership above. Reapplying them to the index's empty path
+            // would reject authorized members and corrupt examined counters.
+            // Content predicates remain intact for same-capture verification.
+            parsed.path_filters.clear();
+            parsed.lang_filters.clear();
+        }
+        let needle = copy_text(&parsed.primary_needle)?;
         let qgen = QueryGeneration::new(owner, generation).map_err(|_| AtlasSearchError::IdentityExhausted)?;
         let mut options = QueryOptions::new(qgen).with_mode(SearchMode::DecodedText {
             case_sensitive: scope.case_sensitive(), normalization: UnicodeNormalization::Exact,
         });
         options.max_matches = max_matches; options.max_bytes_scanned = Some(max_scan_bytes);
-        let query = if scope.is_all() {
+        let query = if expression.is_none() && scope.is_all() {
             OwnedIndexedQuery::new(&retained.engine, parsed, options, &self.budget,
                 [ast_id, query_id], || canceled() || atlas.validate_active().is_err())?
         } else {
@@ -262,12 +295,14 @@ impl RetainedAtlasSearch {
         };
         let unavailable = query.report().unavailable_files().len();
         let eligible_captured = query.report().known_files() - unavailable;
-        let pending = eligible_files.checked_sub(unavailable).ok_or(AtlasSearchError::WrongAtlas)?;
+        let examined = unavailable.checked_add(expression.as_ref().map_or(0, |expression| expression.excluded))
+            .ok_or(AtlasSearchError::WrongAtlas)?;
+        let pending = eligible_files.checked_sub(examined).ok_or(AtlasSearchError::WrongAtlas)?;
         let case_sensitive = scope.case_sensitive();
-        let mut snapshot = Snapshot { generation, needle: copy_text(needle)?, structure: None,
+        let mut snapshot = Snapshot { generation, needle, expression, structure: None,
             structure_rows: Vec::new(), files: reserve(capacity)?,
             scope, scope_files, scope_region, eligible_files,
-            hits: reserve(max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?, examined: unavailable, scanned: 0,
+            hits: reserve(max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?, examined, scanned: 0,
             matched_texts: reserve(if case_sensitive { 0 } else { max_matches })?,
             matched_text_capacity: text_capacity,
             unavailable, pending, matches_seen: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0,
@@ -302,7 +337,8 @@ impl RetainedAtlasSearch {
         report.validate_delivery(retained.engine.id(), qgen)?;
         self.validate(atlas)?; check(canceled)?;
         let results = report.capture_results();
-        candidate.examined = report.examined_files() + report.unavailable_files().len();
+        let expression_excluded = candidate.expression.as_ref().map_or(0, |expression| expression.excluded);
+        candidate.examined = report.examined_files() + report.unavailable_files().len() + expression_excluded;
         candidate.pending = candidate.eligible_files.checked_sub(candidate.examined).ok_or(AtlasSearchError::WrongAtlas)?;
         candidate.scanned = report.scan_attempts();
         candidate.matches_seen = results.total_matches_counted as u64;
@@ -329,6 +365,10 @@ impl RetainedAtlasSearch {
         usage.verified = report.scan_attempts();
         usage.fallback = report.fallback_attempts();
         usage.scanned_bytes = results.scanned_bytes;
+        if let Some(expression) = candidate.expression.as_mut() {
+            if results.scanned_bytes > expression.max_scan_bytes { return Err(AtlasSearchError::WrongAtlas); }
+            expression.scanned_input_bytes = results.scanned_bytes;
+        }
         usage.eligible_captured = report.known_files() - report.unavailable_files().len();
         usage.capture_unavailable = report.unavailable_files().len();
         for &file in &results.unsupported_files[work.unsupported_seen..] {

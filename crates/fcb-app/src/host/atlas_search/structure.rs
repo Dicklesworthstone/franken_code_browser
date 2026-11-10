@@ -148,7 +148,7 @@ impl RetainedAtlasSearch {
         let lease = self.budget.try_reserve_managed(self.manifest.owner(), state_id, ByteLength::new(charge as u64))
             .map_err(|_| AppError::Admission)?;
         let scope_files = scope.freeze(atlas, eligible_files, &mut canceled)?;
-        let snapshot = Snapshot { generation, needle: copy_text(needle)?,
+        let snapshot = Snapshot { generation, needle: copy_text(needle)?, expression: None,
             structure: Some(StructureQuery { mode: options.mode, name_mode: options.name_mode,
                 source_limit: options.limits.max_file_bytes, metadata_bytes: 0, metadata_omitted: 0,
                 unsupported_files: 0, extraction_limited_files: 0 }),

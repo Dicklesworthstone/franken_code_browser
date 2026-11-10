@@ -26,6 +26,9 @@ pub use structure::{AtlasStructureMode, AtlasStructureOptions, MAX_ATLAS_STRUCTU
 use structure::{StructureQuery, StructureRow};
 mod text_matching;
 use text_matching::{matched_text_capacity, retained_text_bytes};
+mod expression;
+pub use expression::MAX_ATLAS_EXPRESSION_SCAN_BYTES;
+use expression::ExpressionSummary;
 mod excerpt;
 use excerpt::Excerpts;
 pub use excerpt::{MAX_ATLAS_EXCERPT_SOURCE_BYTES, MAX_ATLAS_EXCERPT_TEXT_BYTES};
@@ -127,6 +130,7 @@ struct Unavailable { file: FileId, reason: &'static str }
 struct Snapshot {
     generation: u64,
     needle: String,
+    expression: Option<ExpressionSummary>,
     structure: Option<StructureQuery>,
     structure_rows: Vec<StructureRow>,
     scope: AtlasSearchScope,
@@ -427,7 +431,8 @@ fn summary(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot) -> Resul
     out.quoted(if snapshot.structure.is_some() { "live-structure-scan" }
         else if snapshot.index_usage.is_some() { "retained-ephemeral-index" } else { "live-capture-scan" })?;
     if let Some(usage) = &snapshot.index_usage { usage.encode(out)?; }
-    if let Some(structure) = &snapshot.structure { structure.encode(out)?; }
+    if let Some(expression) = &snapshot.expression { expression.encode(out, &snapshot.needle)?; }
+    else if let Some(structure) = &snapshot.structure { structure.encode(out)?; }
     else {
         out.literal(",\"mode\":")?;
         out.quoted(if snapshot.scope.case_sensitive() { "exact-decoded-literal" }
