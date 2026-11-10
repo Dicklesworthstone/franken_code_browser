@@ -455,6 +455,8 @@ mod tests {
 }
 
 pub mod display_mapping;
+/// Retained City geometry, shared orthographic projection and exact-frame picking.
+pub mod city;
 pub mod host_target;
 pub mod reference_oracle;
 pub mod semantic_order;
