@@ -15,6 +15,31 @@ pub(crate) enum StreamCommand<'a> {
 }
 
 impl AtlasSessions {
+    /// Synchronous progress holds this session's permit until the entered call
+    /// drains. Other sessions and nonblocking cancellation/close remain usable.
+    pub(crate) fn execute_stream_with_progress(&self, handle: u64, needle: &str,
+        options: AtlasStreamSearchOptions, mut canceled: impl FnMut() -> bool,
+        stopped: impl FnMut() -> bool, mut progress: impl FnMut(&HostResponse))
+        -> Result<HostResponse, AccessError> {
+        let cell = self.get(handle)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let mut state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        let session = state.as_mut().ok_or(AccessError::NotOpen)?;
+        session.synchronize(epoch);
+        let result = session.stream.search_with_progress(&session.atlas, needle, options,
+            || cell.validate(epoch).is_err() || canceled(), stopped, |response| {
+                if cell.validate(epoch).is_ok() { progress(response); }
+            });
+        if let Err(error) = cell.validate(epoch) {
+            session.search.cancel_pending();
+            session.search.cancel_index_build();
+            return Err(error);
+        }
+        if canceled() { return Err(AccessError::Canceled); }
+        result.map_err(AccessError::from)
+    }
+
     pub(crate) fn execute_stream(&self, handle: u64, command: StreamCommand<'_>,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
         let cell = self.get(handle)?;

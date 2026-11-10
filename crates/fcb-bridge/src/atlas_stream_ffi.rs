@@ -32,6 +32,51 @@ pub unsafe extern "C" fn fcb_atlas_stream_search_cancelable(handle: u64,
     }))
 }
 
+/// Borrowed UTF-8 bytes valid only during this synchronous callback. They are
+/// length-delimited, not NUL terminated, and must never be freed by the caller.
+pub type AtlasStreamProgressCallback = unsafe extern "C" fn(*const u8, u64, *mut c_void);
+
+/// Search with provisional first-page progress and a distinct Stop-and-keep
+/// poll. Nonzero stop accepts finalized-file results as explicitly partial;
+/// nonzero poll cancels delivery and preserves the previous accepted inventory.
+/// # Safety
+/// The needle and cancellation requirements match the cancelable entry point.
+/// All callbacks/context must remain valid until return and must not unwind,
+/// reenter this session, or retain borrowed pointers. Copy progress bytes within
+/// the callback. Only the final non-null return is freed with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_stream_search_progress(handle: u64,
+    needle: *const c_char, max_matches: u64, max_scan_bytes: u64, max_read_calls: u64,
+    poll: Option<SearchCancellationCallback>, stop: Option<SearchCancellationCallback>,
+    progress: Option<AtlasStreamProgressCallback>, context: *mut c_void) -> *mut c_char {
+    reply(|| answer(handle, |atlases| {
+        // A foreign poll may signal once. Every observation revokes the whole
+        // entered operation, including the extra check before callback delivery.
+        let cancellation_seen = std::cell::Cell::new(false);
+        let canceled = || {
+            let requested = cancellation_seen.get()
+                || poll.is_some_and(|poll| unsafe { poll(context) != 0 });
+            cancellation_seen.set(requested);
+            requested
+        };
+        if canceled() { return Err(AccessError::Canceled); }
+        let needle = unsafe { bounded_needle(needle) }?;
+        let options = AtlasStreamSearchOptions { max_matches: number(max_matches)?,
+            max_scan_bytes, max_read_calls };
+        atlases.execute_stream_with_progress(handle, needle, options, &canceled,
+            || stop.is_some_and(|stop| unsafe { stop(context) != 0 }),
+            |response| {
+                // A callback may revoke delivery. The host polls again before
+                // another source quantum or terminal inventory publication.
+                if canceled() { return; }
+                if let Some(progress) = progress {
+                    let bytes = response.as_str().as_bytes();
+                    unsafe { progress(bytes.as_ptr(), bytes.len() as u64, context) };
+                }
+            })
+    }))
+}
+
 /// Page at most 32 retained rows, without source I/O. A missing or replaced
 /// generation is an error, never an empty successful result set.
 #[unsafe(no_mangle)]

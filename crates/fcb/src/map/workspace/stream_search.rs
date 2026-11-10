@@ -45,11 +45,11 @@ impl Default for AtlasStreamLimits {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AtlasStreamState { Pending, Finished, Canceled, Failed }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AtlasStreamStop { MatchLimit, ByteLimit, ReadCallLimit }
+pub enum AtlasStreamStop { MatchLimit, ByteLimit, ReadCallLimit, UserStopped }
 impl AtlasStreamStop {
     pub const fn code(self) -> &'static str {
         match self { Self::MatchLimit => "match-limit", Self::ByteLimit => "byte-limit",
-            Self::ReadCallLimit => "read-call-limit" }
+            Self::ReadCallLimit => "read-call-limit", Self::UserStopped => "user-stopped" }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,6 +136,27 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
     /// included in stats, so cancellation/failure cannot hide spent I/O.
     pub fn report(&self) -> &AtlasStreamReport<'atlas, 'catalog, A> { &self.report }
     pub fn cancel(&mut self) { self.active = None; self.report.state = AtlasStreamState::Canceled; }
+
+    /// Stop a pending observation while preserving its finalized file results.
+    /// Active-file reads are already charged to the report, but its unfinished
+    /// decoder, tentative hits and unverified final metadata are discarded.
+    /// That file remains unexamined. This is a terminal partial answer, distinct
+    /// from cancellation, which cannot publish a replacement result.
+    pub fn stop_and_keep(&mut self) -> Result<AtlasStreamState, AtlasStreamError> {
+        if let Err(error) = self.report.atlas.validate_active() {
+            self.cancel(); return Err(error.into());
+        }
+        match self.state() {
+            AtlasStreamState::Pending => {
+                self.active = None;
+                self.stop(AtlasStreamStop::UserStopped);
+                Ok(self.state())
+            }
+            AtlasStreamState::Finished => Ok(self.state()),
+            AtlasStreamState::Canceled => Err(AtlasStreamError::Canceled),
+            AtlasStreamState::Failed => Err(AtlasStreamError::Pending),
+        }
+    }
 
     /// Supply files using the given exact catalog path/request; callback paths
     /// are data, never permission to widen scope. The host remains responsible

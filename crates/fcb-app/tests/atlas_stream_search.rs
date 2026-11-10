@@ -321,3 +321,257 @@ fn wrong_atlas_and_revoked_grants_cannot_deliver_even_retained_literal_evidence(
     assert!(service.page(&atlas, 1, 0, 1).is_err());
     assert!(service.search(&atlas, "needle", opts(), || false).is_err());
 }
+
+
+fn assert_progress_prefix(value: &Json, previous: Option<&Json>) {
+    assert_eq!(value.get("command").text(), "progress");
+    assert!(!value.get("terminal").flag());
+    assert!(!value.get("selection_available").flag());
+    assert!(!value.get("search_complete").flag());
+    assert!(!value.get("truncated").flag());
+    assert_eq!(value.get("stop_reason"), &Json::Null);
+    assert_eq!(value.get("page_offset").number(), 0);
+    assert_eq!(value.get("page_count").number(), value.get("retained_hits").number().min(32));
+    assert_eq!(value.get("hits").array().len() as u64, value.get("page_count").number());
+    assert_eq!(value.get("files_examined").number() + value.get("files_unexamined").number(),
+        value.get("catalogued_files").number());
+    if value.get("retained_hits").number() > 32 {
+        assert_eq!(value.get("next_offset").number(), 32);
+    } else {
+        assert_eq!(value.get("next_offset"), &Json::Null);
+    }
+    if let Some(previous) = previous {
+        for key in ["owner", "source_manifest", "layout_revision", "root_path", "query_generation",
+            "needle", "limits", "discovery_complete", "catalogued_files", "discovery_policy", "excluded_entries"] {
+            assert_eq!(value.get(key), previous.get(key), "progress cannot change {key}");
+        }
+        assert_eq!(value.get("progress_sequence").number(), previous.get("progress_sequence").number() + 1);
+        for key in ["files_examined", "incomplete_files", "unavailable_files", "unsupported_files", "failed_files",
+            "matching_files", "retained_hits", "matches_seen", "payload_bytes_read", "scanned_input_bytes",
+            "read_calls", "interrupted_read_calls", "peak_input_buffer_bytes", "retained_witness_bytes"] {
+            assert!(value.get(key).number() >= previous.get(key).number(), "{key} must be cumulative");
+        }
+        assert!(value.get("files_unexamined").number() <= previous.get("files_unexamined").number());
+        assert!(value.get("hits").array().starts_with(previous.get("hits").array()));
+        assert!(value.get("diagnostics").array().starts_with(previous.get("diagnostics").array()));
+    } else {
+        assert_eq!(value.get("progress_sequence").number(), 1);
+        assert_eq!(value.get("payload_bytes_read").number(), 0);
+        assert_eq!(value.get("retained_hits").number(), 0);
+    }
+}
+
+#[test]
+fn progress_publishes_bounded_append_only_rows_before_terminal_inventory_and_preserves_paging() {
+    let fixture = Fixture::new();
+    for n in 0..70 { fixture.write(&format!("a-{n:02}.rs"), b"needle"); }
+    fixture.write("z.rs", &vec![b'x'; 8 * 1024 * 1024]);
+    let atlas = fixture.atlas(100); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let mut observations = Vec::new();
+    let response = service.search_with_progress(&atlas, "needle", opts(), || false, || false, |response| {
+        assert_eq!(response.exit_code(), EXIT_PARTIAL);
+        let value = json(response);
+        assert_progress_prefix(&value, observations.last());
+        observations.push(value);
+    }).unwrap();
+    let terminal = json(&response);
+    assert_eq!(response.exit_code(), EXIT_OK);
+    assert!(terminal.get("terminal").flag());
+    assert!(terminal.get("selection_available").flag());
+    assert!(terminal.get("search_complete").flag());
+    assert_eq!(terminal.get("retained_hits").number(), 70);
+    assert!(observations.iter().any(|value| value.get("retained_hits").number() == 1
+        && value.get("files_unexamined").number() > 0), "first finalized match is visible before later files");
+    assert!(observations.iter().any(|value| value.get("retained_hits").number() == 70
+        && value.get("payload_bytes_read").number() > 70 * 6), "active-file I/O advances independently of rows");
+    assert!(observations.len() <= 36, "publication is bounded by prefix growth and 256-quanta cadence");
+    for value in &observations {
+        assert!(terminal.get("hits").array().starts_with(value.get("hits").array()));
+        assert!(terminal.get("payload_bytes_read").number() >= value.get("payload_bytes_read").number());
+    }
+    assert_eq!(service.source_bytes_read(), 70 * 6 + 8 * 1024 * 1024);
+    let io = (service.source_bytes_read(), service.read_calls());
+    let page = json(&service.page(&atlas, 1, 32, 32).unwrap());
+    assert!(page.get("terminal").flag());
+    assert!(page.get("selection_available").flag());
+    assert_eq!(page.get("hits").array()[0].get("index").number(), 32);
+    assert_eq!(page.get("retained_hits").number(), 70);
+    assert_eq!(io, (service.source_bytes_read(), service.read_calls()));
+}
+
+#[test]
+fn stop_during_an_active_file_accepts_only_finalized_witnesses_with_exact_spent_io() {
+    use std::cell::Cell;
+    let fixture = Fixture::new(); fixture.write("a.rs", b"needle");
+    let mut active = b"needle".to_vec(); active.resize(8 * 1024 * 1024, b'x');
+    fixture.write("b.rs", &active); fixture.write("c.rs", b"needle");
+    let atlas = fixture.atlas(64); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let stop = Cell::new(false); let mut last = None;
+    let response = service.search_with_progress(&atlas, "needle", opts(), || false, || stop.get(), |response| {
+        let value = json(response);
+        assert_progress_prefix(&value, last.as_ref());
+        if value.get("payload_bytes_read").number() > 6 { stop.set(true); }
+        last = Some(value);
+    }).unwrap();
+    let terminal = json(&response); let previous = last.unwrap();
+    assert!(stop.get());
+    assert_eq!(response.exit_code(), EXIT_PARTIAL);
+    assert_eq!(terminal.get("stop_reason").text(), "user-stopped");
+    assert!(terminal.get("terminal").flag());
+    assert!(terminal.get("selection_available").flag());
+    assert!(!terminal.get("search_complete").flag());
+    assert!(!terminal.get("truncated").flag());
+    assert_eq!(terminal.get("files_examined").number(), 1);
+    assert_eq!(terminal.get("files_unexamined").number(), 2);
+    assert_eq!(terminal.get("incomplete_files").number(), 0, "unfinished active file stays unexamined");
+    assert_eq!(terminal.get("retained_hits").number(), 1);
+    assert_eq!(terminal.get("matches_seen").number(), 1);
+    assert_eq!(terminal.get("retained_witness_bytes").number(), 6);
+    assert_eq!(terminal.get("hits"), previous.get("hits"));
+    for key in ["payload_bytes_read", "scanned_input_bytes", "read_calls", "interrupted_read_calls"] {
+        assert_eq!(terminal.get(key), previous.get(key), "Stop performs no extra scanner work");
+    }
+    assert_eq!(service.source_bytes_read(), 6 + 4 * 1024 * 1024);
+    assert_eq!(service.read_calls(), 257);
+    assert_eq!(service.accepted_generation(), Some(1));
+    fixture.write("a.rs", b"different now");
+    let io = (service.source_bytes_read(), service.read_calls());
+    let hit = json(&service.hit(&atlas, 1, 0).unwrap());
+    assert_eq!(hit.get("hit").get("original_hex").text(), hex(b"needle"));
+    let page = json(&service.page(&atlas, 1, 0, 32).unwrap());
+    assert_eq!(page.get("hits"), terminal.get("hits"));
+    assert_eq!(page.get("stop_reason").text(), "user-stopped");
+    assert_eq!(io, (service.source_bytes_read(), service.read_calls()));
+    assert!(matches!(service.hit(&atlas, 1, 1), Err(AtlasStreamSearchError::MissingHit)));
+}
+
+#[test]
+fn cancellation_after_progress_wins_over_stop_and_keeps_old_generation_and_spent_reads() {
+    use std::cell::Cell;
+    let fixture = Fixture::new(); fixture.write("a.rs", b"old needle");
+    fixture.write("b.rs", &vec![b'x'; 8 * 1024 * 1024]);
+    let atlas = fixture.atlas(64); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let old = search(&mut service, &atlas, "old");
+    let before = (service.source_bytes_read(), service.read_calls());
+    let cancel = Cell::new(false); let stop = Cell::new(false); let mut spent = None;
+    let result = service.search_with_progress(&atlas, "needle", opts(), || cancel.get(), || stop.get(), |response| {
+        let value = json(response);
+        if value.get("payload_bytes_read").number() > 10 {
+            spent = Some((value.get("payload_bytes_read").number(), value.get("read_calls").number()));
+            cancel.set(true); stop.set(true);
+        }
+    });
+    assert!(matches!(result, Err(AtlasStreamSearchError::Canceled)));
+    let spent = spent.unwrap();
+    assert_eq!((service.source_bytes_read(), service.read_calls()), (before.0 + spent.0, before.1 + spent.1));
+    assert_eq!(service.accepted_generation(), Some(1));
+    assert_eq!(service.last_attempted_generation(), 2);
+    let old_page = json(&service.page(&atlas, 1, 0, 32).unwrap());
+    assert_eq!(old_page.get("hits"), old.get("hits"));
+    assert_eq!(json(&service.hit(&atlas, 1, 0).unwrap()).get("hit").get("original_hex").text(), hex(b"old"));
+    assert!(matches!(service.page(&atlas, 2, 0, 32), Err(AtlasStreamSearchError::StaleQuery)));
+    let next = search(&mut service, &atlas, "needle");
+    assert_eq!(next.get("query_generation").number(), 3);
+    assert!(next.get("hits").array()[0].get("source_revision").number()
+        > old.get("hits").array()[0].get("source_revision").number() + 2,
+        "discarded observations cannot reuse source identity");
+}
+
+#[test]
+fn a_progress_callback_can_stop_before_first_io_and_empty_catalog_still_finishes_complete() {
+    use std::cell::Cell;
+    let fixture = Fixture::new(); fixture.write("a.rs", b"needle");
+    let atlas = fixture.atlas(64); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let stop = Cell::new(false); let mut callbacks = 0;
+    let response = service.search_with_progress(&atlas, "needle", opts(), || false, || stop.get(), |response| {
+        callbacks += 1; let value = json(response); assert_progress_prefix(&value, None); stop.set(true);
+    }).unwrap();
+    let report = json(&response);
+    assert_eq!(callbacks, 1);
+    assert_eq!(report.get("stop_reason").text(), "user-stopped");
+    assert_eq!(report.get("files_examined").number(), 0);
+    assert_eq!(report.get("files_unexamined").number(), 1);
+    assert_eq!(report.get("payload_bytes_read").number(), 0);
+    assert_eq!(report.get("read_calls").number(), 0);
+    assert_eq!(service.accepted_generation(), Some(1));
+    assert_eq!(service.source_bytes_read(), 0);
+
+    let empty = Fixture::new(); let atlas = empty.atlas(64);
+    let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let report = json(&service.search_with_progress(&atlas, "needle", opts(), || false, || true,
+        |_| panic!("an already complete empty catalog has no pending progress")).unwrap());
+    assert!(report.get("search_complete").flag());
+    assert!(report.get("terminal").flag());
+    assert_eq!(report.get("stop_reason"), &Json::Null);
+}
+
+#[test]
+fn malformed_active_text_never_retracts_an_earlier_progress_witness_or_exposes_tentative_matches() {
+    let fixture = Fixture::new();
+    let mut utf16 = vec![0xff, 0xfe];
+    utf16.extend("needle\n".encode_utf16().flat_map(u16::to_le_bytes));
+    fixture.write("a.rs", &utf16);
+    let mut malformed = b"needle".to_vec(); malformed.resize(5 * 1024 * 1024, b'x'); malformed.push(0xff);
+    fixture.write("b.rs", &malformed);
+    let atlas = fixture.atlas(64); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let mut observations = Vec::new();
+    let terminal = json(&service.search_with_progress(&atlas, "needle", opts(), || false, || false, |response| {
+        let value = json(response);
+        assert_progress_prefix(&value, observations.last());
+        assert!(value.get("retained_hits").number() <= 1);
+        observations.push(value);
+    }).unwrap());
+    assert!(!terminal.get("search_complete").flag());
+    assert_eq!(terminal.get("unsupported_files").number(), 1);
+    assert_eq!(terminal.get("retained_hits").number(), 1);
+    assert_eq!(terminal.get("hits").array()[0].get("encoding").text(), "utf16le");
+    assert!(observations.iter().any(|value| value.get("files_examined").number() == 1
+        && value.get("payload_bytes_read").number() > utf16.len() as u64));
+    for value in observations { assert!(terminal.get("hits").array().starts_with(value.get("hits").array())); }
+    let hit = json(&service.hit(&atlas, 1, 0).unwrap());
+    assert_eq!(hit.get("hit").get("original_hex").text(),
+        hex(&"needle".encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>()));
+    assert_eq!(service.source_bytes_read(), (utf16.len() + malformed.len()) as u64);
+}
+
+#[test]
+fn negative_file_progress_has_bounded_cadence_and_terminal_limits_remain_explicit() {
+    let fixture = Fixture::new(); fixture.write("a.rs", &vec![b'x'; 20 * 1024 * 1024]);
+    let atlas = fixture.atlas(64); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let mut callbacks = 0; let mut previous = None;
+    let report = json(&service.search_with_progress(&atlas, "needle", opts(), || false, || false, |response| {
+        let value = json(response); callbacks += 1;
+        assert_progress_prefix(&value, previous.as_ref());
+        assert_eq!(value.get("files_examined").number(), 0);
+        previous = Some(value);
+    }).unwrap());
+    assert!((4..=6).contains(&callbacks), "1280 read quanta must not produce 1280 callback documents");
+    assert!(report.get("search_complete").flag());
+    assert_eq!(report.get("retained_hits").number(), 0);
+    assert_eq!(report.get("payload_bytes_read").number(), 20 * 1024 * 1024);
+    let report = json(&service.search_with_progress(&atlas, "needle",
+        AtlasStreamSearchOptions { max_scan_bytes: 1024, ..opts() }, || false, || false, |_| {}).unwrap());
+    assert_eq!(report.get("stop_reason").text(), "byte-limit");
+    assert!(!report.get("search_complete").flag());
+    assert!(report.get("terminal").flag());
+    assert!(report.get("selection_available").flag());
+}
+
+#[test]
+fn revocation_from_progress_and_invalid_admission_cannot_publish_a_new_inventory() {
+    let fixture = Fixture::new(); fixture.write("a.rs", b"needle");
+    let atlas = fixture.atlas(64); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    search(&mut service, &atlas, "needle");
+    let before = (service.source_bytes_read(), service.read_calls());
+    assert!(matches!(service.search_with_progress(&atlas, "", opts(), || false, || false,
+        |_| panic!("invalid query must not publish progress")), Err(AtlasStreamSearchError::InvalidLimits)));
+    assert_eq!(service.accepted_generation(), Some(1));
+    assert_eq!(before, (service.source_bytes_read(), service.read_calls()));
+    let result = service.search_with_progress(&atlas, "needle", opts(), || false, || false,
+        |_| atlas.atlas().catalog().grant().revoke());
+    assert!(result.is_err());
+    assert_eq!(service.accepted_generation(), Some(1));
+    assert_eq!(service.last_attempted_generation(), 3);
+    assert_eq!(before, (service.source_bytes_read(), service.read_calls()));
+    assert!(service.page(&atlas, 1, 0, 32).is_err(), "retained evidence cannot bypass revoked authority");
+}

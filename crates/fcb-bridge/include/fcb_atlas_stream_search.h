@@ -38,6 +38,32 @@ char *fcb_atlas_stream_search_cancelable(uint64_t handle, const char *needle,
     uint64_t max_matches, uint64_t max_scan_bytes, uint64_t max_read_calls,
     int32_t (*poll)(void *context), void *context);
 
+/* Progressive variant of the same search. Each progress callback carries a
+ * provisional first page (at most 32 finalized-file hits) with command=progress,
+ * terminal=false, selection_available=false and a monotonically increasing
+ * decimal-string progress_sequence. Active-file matches are never exposed.
+ * Callbacks are bounded by scanner work and run on the entered worker.
+ *
+ * json is borrowed for the callback ONLY, has exactly length UTF-8 bytes, and
+ * is NOT NUL terminated. Copy it before returning; do NOT call fcb_free_string
+ * on it. Do not unwind, reenter the session or retain the pointer/context.
+ *
+ * poll requests hard cancellation; stop requests Stop and keep results. Stop
+ * abandons the active file, preserves spent I/O and accepts finalized-file
+ * evidence with stop_reason=user-stopped and search_complete=false. A hard
+ * cancellation takes precedence. Provisional rows cannot authorize page/hit
+ * actions; use the returned terminal generation after successful acceptance.
+ * Terminal search/page reports have terminal=true, selection_available=true.
+ * All callbacks are optional and borrowed until return. The final non-null
+ * returned string alone is owned and must be freed once with fcb_free_string.
+ */
+typedef void (*fcb_atlas_stream_progress_callback)(
+    const uint8_t *json, uint64_t length, void *context);
+char *fcb_atlas_stream_search_progress(uint64_t handle, const char *needle,
+    uint64_t max_matches, uint64_t max_scan_bytes, uint64_t max_read_calls,
+    int32_t (*poll)(void *context), int32_t (*stop)(void *context),
+    fcb_atlas_stream_progress_callback progress, void *context);
+
 /* No source I/O. generation must identify the accepted report; start is a
  * zero-based retained-row position and count is 1..32. next_offset=null means
  * the end of the terminal retained rows, not proof of full source coverage.

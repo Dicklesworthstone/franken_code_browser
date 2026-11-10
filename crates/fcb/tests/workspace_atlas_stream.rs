@@ -340,3 +340,124 @@ fn empty_catalog_is_complete_even_with_zero_io_and_zero_retained_hits() {
     let report = run(&atlas, "needle", AtlasStreamLimits { max_bytes: 0, max_read_calls: 0, max_matches: 0 }, &budget, 10);
     assert!(report.is_complete()); assert_eq!(report.stats().bytes_read, 0); assert!(report.files().is_empty());
 }
+
+#[test]
+fn stopping_keeps_finalized_witnesses_and_charges_discarded_active_file_io() {
+    let root = Fixture::new();
+    root.write("a.rs", b"needle");
+    let mut active = b"needle".to_vec(); active.resize(64 * 1024, b'x');
+    root.write("b.rs", &active); root.write("c.rs", b"needle");
+    let budget = budget(); let catalog = root.catalog(&budget, 10); let atlas = atlas(&catalog, &budget, 2);
+    let needle = StreamingNeedle::text(owner(), "needle", &budget, allocation(10)).unwrap();
+    let mut job = AtlasStreamSearch::new(&atlas, &needle, revision(100), generation(1), AtlasStreamLimits::default(),
+        &budget, [allocation(11), allocation(12)]).unwrap();
+    let mut opens = 0;
+    for _ in 0..2 {
+        job.step(StreamReadStep::default(), generation(1), |_, path| {
+            opens += 1;
+            File::open(root.0.join(path.raw().to_path_buf())).map_err(|_| SourceError::CaptureUnavailable)
+        }, || false).unwrap();
+    }
+    assert_eq!(opens, 2);
+    assert_eq!(job.state(), AtlasStreamState::Pending);
+    assert_eq!(job.report().files_examined(), 1);
+    assert_eq!(job.report().unexamined_files(), 2);
+    assert_eq!(job.report().hits().len(), 1, "an active file's tentative match is not published");
+    let spent = job.report().stats();
+    assert_eq!(spent.bytes_read, 6 + 16 * 1024);
+    assert_eq!(spent.read_calls, 2);
+    assert_eq!(spent.matches_seen, 1);
+    let first = job.report().hits()[0];
+    assert_eq!(job.stop_and_keep().unwrap(), AtlasStreamState::Finished);
+    assert_eq!(job.stop_and_keep().unwrap(), AtlasStreamState::Finished, "Stop is idempotent");
+    assert_eq!(job.step(StreamReadStep::default(), generation(1),
+        |_, _| panic!("a stopped job must not reopen any source"), || false).unwrap(), AtlasStreamState::Finished);
+    let report = job.finish().unwrap();
+    assert_eq!(report.stop_reason(), Some(AtlasStreamStop::UserStopped));
+    assert_eq!(report.stop_reason().unwrap().code(), "user-stopped");
+    assert!(!report.is_complete());
+    assert_eq!(report.stats(), spent);
+    assert_eq!(report.files_examined(), 1);
+    assert_eq!(report.unexamined_files(), 2);
+    assert_eq!(report.hits(), &[first]);
+    root.write("a.rs", b"changed live source");
+    assert_eq!(report.select_hit(0, &atlas, generation(1)).unwrap().original_bytes(), b"needle");
+    assert!(matches!(report.select_hit(1, &atlas, generation(1)), Err(AtlasStreamError::InvalidHit)));
+}
+
+#[test]
+fn stop_before_first_open_is_partial_and_never_revives_cancellation_or_relabels_completion() {
+    let root = Fixture::new(); root.write("a.rs", b"needle");
+    let budget = budget(); let catalog = root.catalog(&budget, 10); let atlas = atlas(&catalog, &budget, 2);
+    let needle = StreamingNeedle::text(owner(), "needle", &budget, allocation(10)).unwrap();
+    let mut job = AtlasStreamSearch::new(&atlas, &needle, revision(100), generation(1), AtlasStreamLimits::default(),
+        &budget, [allocation(11), allocation(12)]).unwrap();
+    assert_eq!(job.stop_and_keep().unwrap(), AtlasStreamState::Finished);
+    let stopped = job.finish().unwrap();
+    assert_eq!(stopped.files_examined(), 0);
+    assert_eq!(stopped.unexamined_files(), 1);
+    assert_eq!(stopped.stats(), Default::default());
+    assert!(!stopped.is_complete());
+    assert_eq!(stopped.stop_reason(), Some(AtlasStreamStop::UserStopped));
+
+    let mut canceled = AtlasStreamSearch::new(&atlas, &needle, revision(200), generation(2), AtlasStreamLimits::default(),
+        &budget, [allocation(21), allocation(22)]).unwrap();
+    canceled.cancel();
+    assert_eq!(canceled.stop_and_keep(), Err(AtlasStreamError::Canceled));
+    assert!(matches!(canceled.finish(), Err(AtlasStreamError::Canceled)));
+
+    for (base, limits, expected) in [
+        (30, AtlasStreamLimits::default(), None),
+        (40, AtlasStreamLimits { max_bytes: 1, ..Default::default() }, Some(AtlasStreamStop::ByteLimit)),
+    ] {
+        let mut finished = AtlasStreamSearch::new(&atlas, &needle, revision(base * 100), generation(base), limits,
+            &budget, [allocation(base + 1), allocation(base + 2)]).unwrap();
+        while finished.state() == AtlasStreamState::Pending {
+            finished.step(StreamReadStep::default(), generation(base), |_, path|
+                File::open(root.0.join(path.raw().to_path_buf())).map_err(|_| SourceError::CaptureUnavailable), || false).unwrap();
+        }
+        assert_eq!(finished.stop_and_keep().unwrap(), AtlasStreamState::Finished);
+        let report = finished.finish().unwrap();
+        assert_eq!(report.stop_reason(), expected);
+        assert_eq!(report.is_complete(), expected.is_none());
+    }
+
+    let mut revoked = AtlasStreamSearch::new(&atlas, &needle, revision(500), generation(5), AtlasStreamLimits::default(),
+        &budget, [allocation(51), allocation(52)]).unwrap();
+    catalog.grant().revoke();
+    assert!(revoked.stop_and_keep().is_err());
+    assert!(matches!(revoked.finish(), Err(AtlasStreamError::Canceled)));
+}
+
+#[test]
+fn pending_report_prefix_survives_a_later_files_malformed_text_without_exposing_tentative_hits() {
+    let root = Fixture::new();
+    let mut utf16 = vec![0xff, 0xfe];
+    utf16.extend("needle\n".encode_utf16().flat_map(u16::to_le_bytes));
+    root.write("a.rs", &utf16);
+    let mut malformed = b"needle".to_vec(); malformed.resize(16 * 1024, b'x'); malformed.push(0xff);
+    root.write("b.rs", &malformed);
+    let budget = budget(); let catalog = root.catalog(&budget, 10); let atlas = atlas(&catalog, &budget, 2);
+    let needle = StreamingNeedle::text(owner(), "needle", &budget, allocation(10)).unwrap();
+    let mut job = AtlasStreamSearch::new(&atlas, &needle, revision(100), generation(1), AtlasStreamLimits::default(),
+        &budget, [allocation(11), allocation(12)]).unwrap();
+    let mut open = |_: fcb::search::CaptureRequest, path: &fcb::source::path::NormalizedPath|
+        File::open(root.0.join(path.raw().to_path_buf())).map_err(|_| SourceError::CaptureUnavailable);
+    job.step(StreamReadStep::default(), generation(1), &mut open, || false).unwrap();
+    assert_eq!(job.report().files_examined(), 1);
+    assert!(!job.report().is_complete());
+    let first = job.report().hits()[0];
+    let witness = job.report().select_hit(0, &atlas, generation(1)).unwrap().original_bytes().to_vec();
+    assert_eq!(witness, "needle".encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
+    job.step(StreamReadStep::default(), generation(1), &mut open, || false).unwrap();
+    assert_eq!(job.report().files_examined(), 1);
+    assert_eq!(job.report().hits(), &[first]);
+    assert_eq!(job.report().stats().matches_seen, 1);
+    assert_eq!(job.report().stats().bytes_read, utf16.len() as u64 + 16 * 1024);
+    job.step(StreamReadStep::default(), generation(1), &mut open, || false).unwrap();
+    let report = job.finish().unwrap();
+    assert_eq!(report.hits(), &[first]);
+    assert_eq!(report.files()[1].state(), AtlasStreamFileState::Scanned(StreamReadState::UnsupportedText));
+    assert_eq!(report.select_hit(0, &atlas, generation(1)).unwrap().original_bytes(), witness);
+    assert!(!report.is_complete());
+}

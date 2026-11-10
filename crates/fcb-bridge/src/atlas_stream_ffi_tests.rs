@@ -128,12 +128,172 @@ fn c_stream_rejects_foreign_input_and_caps_without_losing_previous_witness() {
 fn c_stream_public_signatures_and_header_are_consistent() {
     let _: unsafe extern "C" fn(u64, *const c_char, u64, u64, u64,
         Option<SearchCancellationCallback>, *mut c_void) -> *mut c_char = fcb_atlas_stream_search_cancelable;
+    let _: unsafe extern "C" fn(u64, *const c_char, u64, u64, u64,
+        Option<SearchCancellationCallback>, Option<SearchCancellationCallback>,
+        Option<AtlasStreamProgressCallback>, *mut c_void) -> *mut c_char = fcb_atlas_stream_search_progress;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_atlas_stream_search_page;
     let _: extern "C" fn(u64, u64, u64) -> *mut c_char = fcb_atlas_stream_search_hit;
     let _: extern "C" fn(u64) -> *mut c_char = fcb_atlas_stream_search_clear;
     let header = include_str!("../include/fcb_atlas_stream_search.h");
-    for name in ["fcb_atlas_stream_search_cancelable(", "fcb_atlas_stream_search_page(",
+    for name in ["fcb_atlas_stream_search_cancelable(", "fcb_atlas_stream_search_progress(",
+        "fcb_atlas_stream_search_page(",
         "fcb_atlas_stream_search_hit(", "fcb_atlas_stream_search_clear("] {
         assert_eq!(header.matches(name).count(), 1, "{name}");
     }
+}
+
+
+#[derive(Default)]
+struct ProgressContext {
+    frames: Vec<String>,
+    stop: bool,
+    canceled: bool,
+    cancel_on_match: bool,
+    invalid: bool,
+}
+unsafe extern "C" fn progress_poll(context: *mut c_void) -> i32 {
+    let state = unsafe { &*(context.cast::<ProgressContext>()) };
+    i32::from(state.canceled || state.invalid)
+}
+unsafe extern "C" fn progress_stop(context: *mut c_void) -> i32 {
+    i32::from(unsafe { &*(context.cast::<ProgressContext>()) }.stop)
+}
+unsafe extern "C" fn progress_receive(bytes: *const u8, length: u64, context: *mut c_void) {
+    let state = unsafe { &mut *(context.cast::<ProgressContext>()) };
+    // Never panic across the C boundary, including on a malformed receipt.
+    if bytes.is_null() || length == 0 || length > 8 * 1024 * 1024 {
+        state.invalid = true; return;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(bytes, length as usize) };
+    let Ok(frame) = std::str::from_utf8(bytes) else { state.invalid = true; return; };
+    if !frame.contains("\"command\":\"progress\"") ||
+        !frame.contains("\"terminal\":false,\"selection_available\":false") ||
+        state.frames.len() >= 4 {
+        state.invalid = true; return;
+    }
+    state.frames.push(frame.to_owned());
+    if frame.contains("\"retained_hits\":\"1\"") {
+        if state.cancel_on_match { state.canceled = true; } else { state.stop = true; }
+    }
+}
+fn progressive(handle: u64, state: &mut ProgressContext) -> String {
+    let needle = CString::new("needle").unwrap();
+    take(unsafe { fcb_atlas_stream_search_progress(handle, needle.as_ptr(), 256, 4096, 4096,
+        Some(progress_poll), Some(progress_stop), Some(progress_receive),
+        std::ptr::from_mut(state).cast()) })
+}
+
+#[test]
+fn c_progress_is_borrowed_finalized_evidence_and_stop_accepts_actionable_partial_results() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("a.rs"), b"needle\n").unwrap();
+    fs::write(fixture.0.join("z.rs"), b"needle\n").unwrap();
+    let handle = fixture.open();
+    let mut state = ProgressContext::default();
+    let accepted = progressive(handle, &mut state);
+    assert!(!state.invalid && state.stop && !state.canceled);
+    assert_eq!(state.frames.len(), 2);
+    assert_eq!(field(&state.frames[0], "retained_hits"), 0);
+    assert_eq!(field(&state.frames[1], "retained_hits"), 1);
+    assert_eq!(field(&state.frames[0], "progress_sequence"), 1);
+    assert_eq!(field(&state.frames[1], "progress_sequence"), 2);
+    assert!(accepted.contains("\"status\":\"ok\""), "{accepted}");
+    assert!(accepted.contains("\"stop_reason\":\"user-stopped\""), "{accepted}");
+    assert!(accepted.contains("\"terminal\":true,\"selection_available\":true"));
+    assert!(accepted.contains("\"search_complete\":false"));
+    assert_eq!(field(&accepted, "files_examined"), 1);
+    assert_eq!(field(&accepted, "files_unexamined"), 1);
+    let generation = field(&accepted, "query_generation");
+    // The copied callback frame outlives its borrowed buffer and terminal reply.
+    assert_eq!(field(&state.frames[1], "query_generation"), generation);
+    fs::rename(fixture.0.join("a.rs"), fixture.0.join("retired.rs")).unwrap();
+    let retained = take(fcb_atlas_stream_search_hit(handle, generation, 0));
+    assert!(retained.contains("\"original_hex\":\"6e6565646c65\""));
+    assert!(retained.contains("\"additional_source_bytes_read\":\"0\""));
+    let page = take(fcb_atlas_stream_search_page(handle, generation, 0, 1));
+    assert!(page.contains("\"terminal\":true,\"selection_available\":true"));
+    assert_eq!(field(&page, "retained_hits"), 1);
+    assert_eq!(fcb_atlas_close(handle), 1);
+}
+
+#[test]
+fn c_progress_hard_cancellation_and_invalid_input_preserve_previous_inventory() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("a.rs"), b"old needle\n").unwrap();
+    fs::write(fixture.0.join("z.rs"), b"needle\n").unwrap();
+    let handle = fixture.open();
+    let previous = search(handle, "old", 256, 4096, 4096);
+    let generation = field(&previous, "query_generation");
+    let mut state = ProgressContext { cancel_on_match: true, ..Default::default() };
+    let result = progressive(handle, &mut state);
+    assert!(!state.invalid && state.canceled);
+    assert!(result.contains("ATLAS_HANDLE_CANCELED"), "{result}");
+    assert!(take(fcb_atlas_stream_search_hit(handle, generation, 0)).contains("6f6c64"));
+    let mut both = ProgressContext { canceled: true, stop: true, ..Default::default() };
+    assert!(progressive(handle, &mut both).contains("ATLAS_HANDLE_CANCELED"));
+    assert!(both.frames.is_empty());
+    let mut invalid = ProgressContext::default();
+    let invalid_result = take(unsafe { fcb_atlas_stream_search_progress(handle, std::ptr::null(),
+        256, 4096, 4096, Some(progress_poll), Some(progress_stop), Some(progress_receive),
+        std::ptr::from_mut(&mut invalid).cast()) });
+    assert!(invalid_result.contains("ATLAS_HANDLE_INVALID_ARGUMENT"));
+    assert!(invalid.frames.is_empty());
+    assert!(take(fcb_atlas_stream_search_hit(handle, generation, 0)).contains("6f6c64"));
+    assert_eq!(fcb_atlas_close(handle), 1);
+}
+
+
+#[derive(Default)]
+struct OneShotCancellation {
+    polls: usize,
+    cancel_at: Option<usize>,
+    first_delivery_poll: Option<usize>,
+    callbacks: usize,
+    stopped: bool,
+}
+unsafe extern "C" fn one_shot_poll(context: *mut c_void) -> i32 {
+    let state = unsafe { &mut *(context.cast::<OneShotCancellation>()) };
+    state.polls += 1;
+    i32::from(state.cancel_at == Some(state.polls))
+}
+unsafe extern "C" fn one_shot_stop(context: *mut c_void) -> i32 {
+    i32::from(unsafe { &*(context.cast::<OneShotCancellation>()) }.stopped)
+}
+unsafe extern "C" fn one_shot_receive(_: *const u8, _: u64, context: *mut c_void) {
+    let state = unsafe { &mut *(context.cast::<OneShotCancellation>()) };
+    state.callbacks += 1;
+    state.first_delivery_poll.get_or_insert(state.polls);
+    state.stopped = true;
+}
+
+#[test]
+fn c_progress_latches_one_shot_cancellation_before_callback_delivery() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("a.rs"), b"needle\n").unwrap();
+    let handle = fixture.open();
+    let needle = CString::new("needle").unwrap();
+    let run = |state: &mut OneShotCancellation| take(unsafe {
+        fcb_atlas_stream_search_progress(handle, needle.as_ptr(), 256, 4096, 4096,
+            Some(one_shot_poll), Some(one_shot_stop), Some(one_shot_receive),
+            std::ptr::from_mut(state).cast())
+    });
+    // Find the poll immediately before the initial borrowed callback without
+    // coupling this regression to the encoder's internal number of gates.
+    let mut probe = OneShotCancellation::default();
+    let accepted = run(&mut probe);
+    assert_eq!(probe.callbacks, 1);
+    assert!(accepted.contains("\"stop_reason\":\"user-stopped\""));
+    let generation = field(&accepted, "query_generation");
+    let mut once = OneShotCancellation {
+        cancel_at: probe.first_delivery_poll, ..Default::default()
+    };
+    let rejected = run(&mut once);
+    assert!(rejected.contains("ATLAS_HANDLE_CANCELED"), "{rejected}");
+    assert_eq!(once.callbacks, 0);
+    let retained = take(fcb_atlas_stream_search_page(handle, generation, 0, 1));
+    assert!(retained.contains("\"status\":\"ok\""), "{retained}");
+    assert_eq!(fcb_atlas_close(handle), 1);
 }
