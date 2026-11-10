@@ -267,6 +267,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     @State private var finderReaderCapture: AtlasProgressiveFileCapture?
     @State private var observedReader: AtlasObservedReaderPresentation?
     @State private var workspaceStreamSearch: AtlasWorkspaceStreamPresentation?
+    @State private var projectLinks: AtlasProjectLinksPresentation?
     @State private var readingDesk = AtlasReadingDeskModel(transport: .native)
     @State private var showsReadingDesk = false
     @State private var reviewDeskAfterSheetDismissal = false
@@ -374,6 +375,21 @@ private struct AtlasFrozenViewportSearch: Sendable {
         workspaceStreamSearch = nil
     }
 
+    private func openProjectLinks(_ direction: AtlasProjectLinkDirection = .all) {
+        guard let authority = snapshotExportSource else { return }
+        let path = direction == .all ? nil
+            : (finderReaderCapture?.file.rawPath ?? selectedPath.map { Array($0.utf8) })
+        guard direction == .all || path != nil else { return }
+        closeProjectLinks()
+        projectLinks = AtlasProjectLinksPresentation(root: authority.root,
+            initialPath: path, direction: direction, access: authority.access)
+    }
+
+    private func closeProjectLinks() {
+        projectLinks?.close()
+        projectLinks = nil
+    }
+
     private var searchContext: AtlasSearchContext {
         AtlasSearchContext(root: root, query: query, loadGeneration: loadGeneration,
             atlasRevision: atlasRevision, scope: fileScope.rawValue, customExtensions: customExtensions,
@@ -474,6 +490,11 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 Label("Saved Repository", systemImage: "archivebox")
             }
             .help("Save the current project as an FCBS archive, or read saved members, documentation links and backlinks")
+            Button { openProjectLinks() } label: {
+                Label("Documentation", systemImage: "link")
+            }
+            .disabled(snapshotExportSource == nil)
+            .help("Capture project sources and browse documentation links, backlinks, and their retained evidence")
             Button { moveSearchResult(backwards: true) } label: {
                 Label("Previous Match", systemImage: "arrow.up")
             }
@@ -492,6 +513,10 @@ private struct AtlasFrozenViewportSearch: Sendable {
         .sheet(isPresented: $showsSavedRepository, onDismiss: finishReadingDeskReview) {
             AtlasSavedRepositoryView(model: savedRepository, desk: readingDesk, exporter: snapshotExport,
                 currentSource: { snapshotExportSource })
+        }
+        .sheet(item: $projectLinks, onDismiss: finishReadingDeskReview) { presentation in
+            AtlasProjectLinksView(presentation: presentation).id(presentation.id)
+                .onDisappear { presentation.close() }
         }
         .sheet(item: $observedReader, onDismiss: finishReadingDeskReview) { presentation in
             AtlasObservedReaderView(presentation: presentation).id(presentation.id)
@@ -544,6 +569,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
             snapshotExport.cancel()
             closeObservedReader()
             closeWorkspaceStreamSearch()
+            closeProjectLinks()
             showsSavedRepository = false
             readingDesk.close()
             showsReadingDesk = false
@@ -574,6 +600,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
             snapshotExport.cancel()
             closeObservedReader()
             closeWorkspaceStreamSearch()
+            closeProjectLinks()
         }
         .onChange(of: atlasResidency.contentRevision) { _, _ in
             refreshResidentSearchOverlay()
@@ -669,12 +696,13 @@ private struct AtlasFrozenViewportSearch: Sendable {
 
     private func reviewReadingDeskBeforeClosing() {
         guard !readingDesk.closed, !showsReadingDesk else { return }
-        if showsFileFinder || showsSavedRepository || observedReader != nil || workspaceStreamSearch != nil {
+        if showsFileFinder || showsSavedRepository || observedReader != nil || workspaceStreamSearch != nil || projectLinks != nil {
             // Wait for the other sheet's actual dismissal before presenting
             // the desk. An active note editor is preserved by the close guard.
             reviewDeskAfterSheetDismissal = true
             showsFileFinder = false; showsSavedRepository = false; closeObservedReader()
             closeWorkspaceStreamSearch()
+            closeProjectLinks()
         } else { showsReadingDesk = true }
     }
     private func finishReadingDeskReview() {
@@ -1256,6 +1284,24 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 stat("project files", "\(files.count)")
                 stat("project", (root as NSString).lastPathComponent)
             }
+            Divider()
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Documentation").font(.caption.weight(.semibold))
+                if selectedPath != nil || finderReaderCapture != nil {
+                    Button { openProjectLinks(.incoming) } label: {
+                        Label("Backlinks to this file", systemImage: "arrow.turn.up.left")
+                    }
+                    Button { openProjectLinks(.outgoing) } label: {
+                        Label("Links from this file", systemImage: "arrow.up.right")
+                    }
+                }
+                Button { openProjectLinks() } label: {
+                    Label("Browse project links", systemImage: "link")
+                }
+                Text("Build links from captured Markdown and open their source evidence.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            .controlSize(.small).disabled(snapshotExportSource == nil)
             Spacer()
         }
         .padding(12)
@@ -1422,6 +1468,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
         snapshotExport.cancel()
         closeObservedReader()
         closeWorkspaceStreamSearch()
+        closeProjectLinks()
         closeAtlasResidency()
         closeFinderReader()
         workspaceSearch?.refresh()

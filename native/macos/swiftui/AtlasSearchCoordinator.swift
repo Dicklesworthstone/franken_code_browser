@@ -63,7 +63,7 @@ private final class AtlasSearchDebounceTimer: @unchecked Sendable {
 /// One latest immutable progress report and at most one queued main callback.
 /// A slow main thread cannot accumulate a report-sized DispatchQueue backlog.
 /// Closing on the worker retires pending progress before terminal delivery.
-private final class AtlasSearchProgressMailbox: @unchecked Sendable {
+final class AtlasSearchProgressMailbox: @unchecked Sendable {
     private let lock = NSLock()
     private var latest: AtlasSearchReport?
     private var scheduled = false

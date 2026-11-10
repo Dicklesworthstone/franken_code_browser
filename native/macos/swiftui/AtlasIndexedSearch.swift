@@ -26,6 +26,15 @@ struct AtlasIndexedSearchTransport: Sendable {
     var expressionQueryBegin: (@Sendable (UInt64, UInt64, UInt64, String, AtlasSearchFileScope, AtlasSearchPathScope, Bool) throws -> String?)? = nil
 }
 
+/// A completed retained source index, without an admitted text query. A links
+/// browser can borrow its captures while keeping the same bounded capture
+/// builder, immutable provenance and worker-only owner used by search.
+struct AtlasPreparedIndex: Sendable {
+    let owner: AtlasSearchCaptureOwner
+    let basis: AtlasIndexedBasis
+    let root: String
+}
+
 /// An explicit captured-index session. The app serializes run() on its existing
 /// one-active/one-newest search coordinator. A concurrent caller is refused,
 /// never added to an unbounded queue. Construction is inert. Replace this owner
@@ -65,6 +74,27 @@ final class AtlasIndexedSearch: @unchecked Sendable {
     private var cached: Session?
     private var preparing: Preparation?
     init(transport: AtlasIndexedSearchTransport) { self.transport = transport }
+
+    func prepare(root: String, scope: AtlasSearchFileScope = .all,
+                 pathScope: AtlasSearchPathScope = .workspace,
+                 cancellation: AtlasSearchCancellation, access: AtlasSearchAccessLease,
+                 progress: @Sendable (AtlasSearchReport) -> Void) throws -> AtlasPreparedIndex {
+        guard !root.isEmpty, root.utf8.count <= 16_384, !root.utf8.contains(0) else {
+            throw AtlasSearchError.invalidRequest
+        }
+        try check(cancellation)
+        guard serial.try() else { throw AtlasSearchError.unavailable }
+        defer { serial.unlock() }
+        let grant = access.reference.map(ObjectIdentifier.init)
+        if cached.map({ $0.root.utf8.elementsEqual(root.utf8) && $0.grant == grant }) != true {
+            cached = nil
+            cached = try build(root: root, scope: scope, pathScope: pathScope, mode: .text,
+                caseSensitive: true, access: access, cancellation: cancellation, progress: progress)
+        }
+        try check(cancellation)
+        guard let cached else { throw AtlasSearchError.unavailable }
+        return AtlasPreparedIndex(owner: cached.owner, basis: cached.basis, root: cached.root)
+    }
 
     func run(root: String, query: String, cancellation: AtlasSearchCancellation,
              access: AtlasSearchAccessLease, progress: @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport {

@@ -225,6 +225,57 @@ integration. They have not been executed in this code-first session; Rust and
 Swift compilation, executable qualification and physical-Mac interaction
 verification remain pending.
 
+## Project documentation links and backlinks
+
+Choose **Documentation** in the toolbar, or use **Backlinks to this file** and
+**Links from this file** in the Inspector. **Capture and build links** prepares
+an independent captured project index, then extracts Markdown destinations
+through the shared parser. This covers links from documentation to source files
+as well as links between documents. File-type display filters and the visible
+atlas region do not narrow this project capture.
+
+Use **All**, **Outgoing**, or **Backlinks** to browse the inventory. **Use path**
+selects an exact project-relative filename; **Whole project** removes that file
+filter. A path supplied from the Inspector keeps its original native bytes,
+including a non-UTF-8 filename. A path from another atlas is resolved against
+this inventory's own catalog instead of reusing a foreign file ID. An absent
+catalog path is reported as unavailable, not as an empty complete backlink set.
+
+Each row distinguishes a captured target from an unavailable, uncaptured,
+missing, external or unresolved destination. **Links from source** and
+**Backlinks to target** navigate between those file relationships.
+**Read source document** opens the exact Markdown capture that supplied the
+evidence. **Read captured target** opens a resolved target from the same index;
+it is unavailable when no target capture exists. These actions neither reread
+the working tree nor fetch external URLs. Pin a reader to keep code and its
+documentation visible while following another link.
+
+Evidence identifies the **whole captured Markdown document**. The parser's
+destination establishes the relationship, but this surface does not claim an
+exact source span for the link token. Destination fragments remain explicitly
+unqualified: opening `guide.md#section` opens the captured target document
+without inventing a heading offset. These are documentation relationships;
+compiler imports, calls and dependency completeness are not inferred.
+
+Source preparation admits at most 4,096 files, 1 MiB per file and 32 MiB of
+source-read work. Link extraction visits at most one captured Markdown
+document per worker step, parses at most 256 KiB per document and 32 MiB in
+aggregate, and retains at most 4,096 links. Progress reports missing captures,
+unsupported or oversized documents, parse limits, diagnostics and truncated
+link output. A partial inventory cannot establish that a file has no backlinks.
+Markdown extraction accepts UTF-8; UTF-16 Markdown is reported as unsupported
+and leaves coverage partial. Captured UTF-16 target files remain readable.
+
+**Rebuild links** reuses the prepared source captures. **Refresh sources**
+captures the current project again so file edits can affect the inventory.
+Already opened readers and pins retain their original bytes. Cancellation and
+replacement reject stale link responses; an old link identity cannot authorize
+an open against a replacement index.
+
+Host, registry, C-boundary and native regression fixtures accompany this
+workflow. They remain unexecuted in this code-first session; compilation and
+physical-Mac interaction verification are pending.
+
 ## Workspace identifier occurrences
 
 Choose **Occurrences** in the search-mode picker and enter one identifier-like
