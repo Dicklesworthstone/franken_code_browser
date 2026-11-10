@@ -306,10 +306,18 @@ documentation visible while following another link.
 
 Evidence identifies the **whole captured Markdown document**. The parser's
 destination establishes the relationship, but this surface does not claim an
-exact source span for the link token. Destination fragments remain explicitly
-unqualified: opening `guide.md#section` opens the captured target document
-without inventing a heading offset. These are documentation relationships;
-compiler imports, calls and dependency completeness are not inferred.
+exact source span for the link token. Opening `guide.md#section` now checks the
+selected target's canonical heading identity through the shared Markdown
+adapter, then starts the reader at the verified original byte range in that
+**retained capture**. Percent escapes are decoded once; a query suffix does not
+change the captured file. List pages do not parse target headings eagerly.
+Missing, ambiguous, invalid, unsupported or over-budget fragments open the
+captured file at its beginning with an explicit explanation. Non-Markdown line
+fragments such as `code.rs#L20` do not become guessed line jumps. Reading the
+source evidence still starts at the beginning of the whole Markdown document.
+These are documentation relationships; compiler imports, calls and dependency
+completeness are not inferred. The heading-navigation addition requires
+executable and physical-Mac qualification.
 
 Source preparation admits at most 4,096 files, 1 MiB per file and 32 MiB of
 source-read work. Link extraction visits at most one captured Markdown

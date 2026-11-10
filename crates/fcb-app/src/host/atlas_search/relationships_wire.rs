@@ -114,7 +114,8 @@ fn row(out: &mut Output, atlas: &AtlasSession, link: &Link, id: u64) -> Result<(
 }
 
 pub(super) fn reader(out: &mut Output, atlas: &AtlasSession, snapshot: &RelationshipSnapshot, link: &Link,
-    id: u64, side: AtlasRelationshipSide, source: SourceProof, reader_owner: ArenaOwnerId, info: &HostResponse)
+    id: u64, side: AtlasRelationshipSide, source: SourceProof, reader_owner: ArenaOwnerId, info: &HostResponse,
+    navigation: (FragmentResolution, Option<&str>))
     -> Result<(), AtlasSearchError> {
     identity(out, snapshot)?;
     out.literal(",\"link_id\":")?; out.integer(id)?;
@@ -127,6 +128,20 @@ pub(super) fn reader(out: &mut Output, atlas: &AtlasSession, snapshot: &Relation
     out.literal(",\"source_observation\":\"retained-index-capture\",\"source_reopened\":false,\"additional_source_bytes_read\":\"0\",\"evidence_precision\":\"whole-captured-markdown-document\",\"reader_owner\":")?;
     out.integer(reader_owner.get())?;
     fragment(out, link)?;
+    // Preserve the list's unqualified suffix receipt for existing consumers.
+    // This additive result applies only to the explicitly opened capture/side.
+    let (resolution, slug) = navigation;
+    let suffix = if side == AtlasRelationshipSide::Target {
+        link.suffix.find('#').map(|at| &link.suffix[at..]).unwrap_or("")
+    } else { "" };
+    out.literal(",\"fragment_suffix\":")?; out.quoted(suffix)?;
+    out.literal(",\"fragment_status\":")?; out.quoted(resolution.name())?;
+    out.literal(",\"fragment_slug\":")?;
+    match slug { Some(slug) => out.quoted(slug)?, None => out.literal("null")? }
+    out.literal(",\"target_range\":")?;
+    match resolution.range() { Some(range) => out.range(range)?, None => out.literal("null")? }
+    out.literal(",\"initial_original_offset\":")?;
+    out.integer(resolution.range().map_or(0, |range| range.start().get()))?;
     out.literal(",\"reader\":")?; out.literal(info.as_str().trim_end())?;
     out.literal("}\n")?;
     Ok(())

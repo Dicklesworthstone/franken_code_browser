@@ -164,6 +164,118 @@ fn original_markdown_bom_and_utf16_targets_survive_live_source_replacement_and_i
 }
 
 #[test]
+fn target_heading_uses_retained_original_bytes_without_consuming_preview_state() {
+    use fcb_app::host::reader::ReaderDocumentOptions;
+    let doc = b"[guide](guide.MARKDOWN?view=source#real-%68eading)\n";
+    let guide = b"\xef\xbb\xbfpreamble\r\n\r\n## Real Heading\r\n\r\nCaptured body.\r\n";
+    let expected = guide.windows(b"## Real Heading".len()).position(|bytes| bytes == b"## Real Heading").unwrap();
+    let mut f = Fixture::new(&[("README.md", doc), ("guide.MARKDOWN", guide)]);
+    f.build(1); let page = f.prepare(1, 1);
+    // Building/listing the graph must not eagerly parse every target fragment.
+    assert_eq!(page.get("links").array()[0].get("fragment_resolution").text(), "unqualified");
+    fs::write(f.root.join("guide.MARKDOWN"), b"# Replacement\n\nNo old heading.\n").unwrap();
+    let (mut reader, response) = f.search.open_relationship_reader(&f.atlas, owner(59801), 1, 1, Side::Target, || false).unwrap();
+    let receipt = json(&response);
+    assert_eq!(receipt.get("fragment_status").text(), "resolved");
+    assert_eq!(receipt.get("fragment_suffix").text(), "#real-%68eading");
+    assert_eq!(receipt.get("fragment_slug").text(), "real-heading");
+    assert_eq!(receipt.get("destination_suffix").text(), "?view=source#real-%68eading");
+    let range = receipt.get("target_range");
+    assert_eq!(range.get("start").number(), expected as u64);
+    assert_eq!(receipt.get("initial_original_offset").number(), expected as u64);
+    assert_eq!(std::str::from_utf8(&guide[expected..range.get("end").number() as usize]).unwrap().trim_end(), "## Real Heading");
+    assert_eq!(receipt.get("source_sha256").text(), Sha256::digest(guide).to_hex());
+    assert!(!receipt.get("source_reopened").flag());
+    assert_eq!(receipt.get("additional_source_bytes_read").number(), 0);
+    assert_eq!(receipt.get("reader").get("accepted_document_generation"), &Json::Null);
+    assert_eq!(reader.document_generation(), None);
+    assert_eq!(reader.document_links_generation(), None);
+    assert_eq!(reader.capture().bytes(), guide);
+    let (_, evidence) = f.search.open_relationship_reader(&f.atlas, owner(59802), 1, 1, Side::Evidence, || false).unwrap();
+    let evidence = json(&evidence);
+    assert_eq!(evidence.get("fragment_status").text(), "none");
+    assert_eq!(evidence.get("fragment_suffix").text(), "");
+    assert_eq!(evidence.get("target_range"), &Json::Null);
+    assert_eq!(evidence.get("initial_original_offset").number(), 0);
+    f.search.clear_index(&f.atlas, 2, || false).unwrap();
+    // The independent reader and its first preview remain usable after index retirement.
+    reader.prepare_document(1, ReaderDocumentOptions::default(), || false).unwrap();
+    assert_eq!(reader.document_generation(), Some(1));
+    assert_eq!(json(&reader.copy_range(expected as u64, range.get("end").number(), || false).unwrap())
+        .get("original_hex").text(), hex(&guide[expected..range.get("end").number() as usize]));
+}
+
+#[test]
+fn unqualified_target_fragments_keep_exact_file_reading_and_distinct_fallbacks() {
+    let doc = b"[ok](guide.md#repeat) [collision](guide.md#repeat-2) [missing](guide.md#absent) \
+        [once](guide.md#%2572epeat) [case](guide.md#Repeat) [invalid](guide.md#%ff) \
+        [zero](guide.md#%00) [top](guide.md#) [code](code.rs#L2) [query](guide.md?plain=1)\n";
+    let guide = b"# Repeat\n\n# Repeat\n\n# Repeat-2\n\n";
+    let mut f = Fixture::new(&[("README.md", doc), ("guide.md", guide), ("code.rs", b"first\nsecond\n")]);
+    f.build(1); f.prepare(1, 1);
+    let expected = [
+        ("resolved", Some("repeat")), ("ambiguous", Some("repeat-2")),
+        ("missing-heading", Some("absent")), ("missing-heading", Some("%72epeat")),
+        ("missing-heading", Some("Repeat")), ("invalid", None), ("invalid", None),
+        ("document-start", None), ("unsupported", Some("L2")), ("none", None),
+    ];
+    for (ordinal, (status, slug)) in expected.iter().enumerate() {
+        let (reader, response) = f.search.open_relationship_reader(&f.atlas, owner(59810 + ordinal as u64),
+            1, ordinal as u64 + 1, Side::Target, || false).unwrap();
+        let receipt = json(&response);
+        assert_eq!(receipt.get("fragment_status").text(), *status, "link {}", ordinal + 1);
+        match slug {
+            Some(slug) => assert_eq!(receipt.get("fragment_slug").text(), *slug),
+            None => assert_eq!(receipt.get("fragment_slug"), &Json::Null),
+        }
+        assert_eq!(receipt.get("initial_original_offset").number(), 0);
+        if *status != "resolved" { assert_eq!(receipt.get("target_range"), &Json::Null); }
+        assert_eq!(reader.document_generation(), None);
+        assert_eq!(reader.capture().bytes(), if ordinal == 8 { b"first\nsecond\n".as_slice() } else { guide.as_slice() });
+    }
+}
+
+#[test]
+fn heading_limits_do_not_turn_unqualified_source_into_a_missing_heading() {
+    for (ordinal, (guide, status)) in [
+        (vec![b'x'; MAX_DOCUMENT_LINK_SOURCE_BYTES + 1], "limited"),
+        (b"\xff\xfe#\0 \0T\0a\0r\0g\0e\0t\0".to_vec(), "unsupported"),
+        (b"\xff".to_vec(), "unsupported"),
+        (b"> # Target\n".to_vec(), "unsupported"),
+    ].into_iter().enumerate() {
+        let mut f = Fixture::new(&[("README.md", b"[target](guide.md#absent)"), ("guide.md", &guide)]);
+        f.build(1); f.prepare(1, 1);
+        let (reader, response) = f.search.open_relationship_reader(&f.atlas, owner(59830 + ordinal as u64),
+            1, 1, Side::Target, || false).unwrap();
+        let receipt = json(&response);
+        assert_eq!(receipt.get("fragment_status").text(), status);
+        assert_eq!(receipt.get("target_range"), &Json::Null);
+        assert_eq!(receipt.get("initial_original_offset").number(), 0);
+        assert_eq!(reader.capture().bytes(), guide.as_slice());
+    }
+}
+
+#[test]
+fn cancellation_during_selected_target_qualification_preserves_the_graph() {
+    let doc = b"[plain](guide.md) [heading](guide.md#target)\n";
+    let guide = format!("{}# Target\n", "# Other\n\n".repeat(100));
+    let mut f = Fixture::new(&[("README.md", doc), ("guide.md", guide.as_bytes())]);
+    f.build(1); f.prepare(1, 1);
+    let mut plain_checks = 0;
+    f.search.open_relationship_reader(&f.atlas, owner(59840), 1, 1, Side::Target, || {
+        plain_checks += 1; false
+    }).unwrap();
+    let mut heading_checks = 0;
+    assert!(f.search.open_relationship_reader(&f.atlas, owner(59841), 1, 2, Side::Target, || {
+        heading_checks += 1; heading_checks > plain_checks
+    }).is_err());
+    assert!(heading_checks > plain_checks, "Negative control must reach extra heading qualification work");
+    let (_, response) = f.search.open_relationship_reader(&f.atlas, owner(59842), 1, 2, Side::Target, || false).unwrap();
+    assert_eq!(json(&response).get("fragment_status").text(), "resolved");
+    assert!(f.page(1, Direction::All, None, 0, 64).get("relationships_complete").flag());
+}
+
+#[test]
 fn narrower_capture_scope_cannot_claim_no_backlinks_from_excluded_markdown() {
     let mut f = Fixture::new(&[("README.md", b"[code](src/lib.rs)"),
         ("docs/extra.md", b"[code](../src/lib.rs)"), ("src/lib.rs", b"source")]);

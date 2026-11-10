@@ -79,6 +79,26 @@ fn backlinks_open_exact_evidence_and_target_after_live_sources_change() {
 }
 
 #[test]
+fn retained_heading_navigation_crosses_the_registry_without_reopening_or_preview_publication() {
+    let table = AtlasSessions::new(); let readers = ReaderSessions::new();
+    let guide = b"preamble\n\n## Details\n\nExact retained instructions.\n";
+    let (handle, root) = open(&table, &[("README.md", b"[guide](guide.md#details)\n"), ("guide.md", guide)]);
+    begin(&table, handle, 1); finish(&table, handle, 1);
+    fs::write(root.join("guide.md"), b"# Changed\n").unwrap();
+    let reader = readers.create().unwrap();
+    let receipt = table.open_link_reader(handle, &readers, reader, 1, 1, AtlasRelationshipSide::Target, || false).unwrap();
+    assert!(receipt.as_str().contains("\"fragment_status\":\"resolved\""));
+    assert!(receipt.as_str().contains("\"fragment_slug\":\"details\""));
+    assert_eq!(number(receipt.as_str(), "initial_original_offset"), 10);
+    assert!(receipt.as_str().contains("\"accepted_document_generation\":null"));
+    assert_eq!(number(receipt.as_str(), "additional_source_bytes_read"), 0);
+    table.close(handle).unwrap();
+    let bytes = readers.execute(reader, ReaderCommand::CopyRange { start: 10, end: guide.len() as u64 }, || false).unwrap();
+    assert!(bytes.as_str().contains(&hex(&guide[10..])));
+    readers.close(reader).unwrap();
+}
+
+#[test]
 fn relationship_attempts_are_independent_and_epoch_cancel_preserves_accepted_inventory() {
     let table = AtlasSessions::new();
     let (handle, _) = open(&table, &[("README.md", DOC), ("more.md", b"[engine](src/lib.rs)"), ("src/lib.rs", SOURCE)]);

@@ -29,11 +29,12 @@ final class ProjectLinksFixture: @unchecked Sendable {
         ["encoding": "unix-bytes", "hex": hex(path.utf8), "display": path]
     }
     static func source(_ file: UInt64) -> String {
-        let text = file == 1 ? String(repeating: "[code](src.rs#part)\n", count: 70) : "fn captured() {}\n"
+        let text = file == 1 ? String(repeating: "[guide](guide.md#part)\n", count: 70)
+            : String(repeating: "x", count: 32) + "\n\n## Part\n\nCaptured guidance.\n"
         return text + String(repeating: " ", count: (file == 1 ? 4096 : 100) - text.utf8.count)
     }
     static func digest(_ file: UInt64) -> String { String(repeating: file == 1 ? "a" : "b", count: 64) }
-    static func name(_ file: UInt64) -> String { file == 1 ? "docs.md" : "src.rs" }
+    static func name(_ file: UInt64) -> String { file == 1 ? "docs.md" : "guide.md" }
     static func identity(owner: UInt64, generation: UInt64, command: String) -> [String: Any] {
         ["schema": "fcb.atlas-links/1", "status": "ok", "command": command, "owner": String(owner),
          "source_manifest": "1", "layout_revision": "3", "index_generation": "1", "capture_manifest": "2",
@@ -42,8 +43,8 @@ final class ProjectLinksFixture: @unchecked Sendable {
     static func row(_ id: UInt64) -> [String: Any] {
         ["link_id": String(id), "source_file_id": "1", "source_revision": "1", "source_path": path("docs.md"),
          "source_sha256": digest(1), "source_bytes": "4096", "source_link_id": String(id), "block_index": "0",
-         "evidence_range": ["start": "0", "end": "4096"], "destination": "src.rs#part", "resolution": "captured",
-         "target_file_id": "2", "target_revision": "1", "target_path": path("src.rs"),
+         "evidence_range": ["start": "0", "end": "4096"], "destination": "guide.md#part", "resolution": "captured",
+         "target_file_id": "2", "target_revision": "1", "target_path": path("guide.md"),
          "target_sha256": digest(2), "target_bytes": "100", "destination_suffix": "#part", "fragment_resolution": "unqualified"]
     }
     static func page(owner: UInt64, generation: UInt64, command: String, running: Bool = false,
@@ -51,7 +52,7 @@ final class ProjectLinksFixture: @unchecked Sendable {
         var result = identity(owner: owner, generation: generation, command: command)
         let retained: UInt64 = running ? 0 : 70
         let selected: [UInt64] = running ? [] : ((path == nil || direction == .all
-            || (direction == .outgoing && path == "docs.md") || (direction == .incoming && path == "src.rs")) ? Array(1...70) : [])
+            || (direction == .outgoing && path == "docs.md") || (direction == .incoming && path == "guide.md")) ? Array(1...70) : [])
         let total = UInt64(selected.count), end = min(total, start + limit)
         result.merge([
             "source_observation": "retained-index-captures", "evidence_precision": "whole-captured-markdown-document",
@@ -93,7 +94,10 @@ final class ProjectLinksFixture: @unchecked Sendable {
             "source_observation": "retained-index-capture", "source_reopened": false, "additional_source_bytes_read": "0",
             "reader_owner": String(reader), "reader": readerInfo(reader, file: file),
             "evidence_precision": "whole-captured-markdown-document", "destination_suffix": "#part",
-            "fragment_resolution": "unqualified"], uniquingKeysWith: { _, value in value })
+            "fragment_resolution": "unqualified", "fragment_suffix": side == .target ? "#part" : "",
+            "fragment_status": side == .target ? "resolved" : "none", "fragment_slug": side == .target ? "part" : NSNull(),
+            "target_range": side == .target ? ["start": "34", "end": "42"] : NSNull(),
+            "initial_original_offset": side == .target ? "34" : "0"], uniquingKeysWith: { _, value in value })
         return value
     }
     private func call(_ phase: String, _ value: [String: Any]) -> String {
@@ -114,7 +118,7 @@ final class ProjectLinksFixture: @unchecked Sendable {
         }, step: { owner, generation, _ in
             self.call("step", Self.page(owner: owner, generation: generation, command: "links-step"))
         }, page: { owner, generation, direction, hex, start, limit in
-            let selected = ["docs.md", "src.rs"].first { Self.hex($0.utf8) == hex }
+            let selected = ["docs.md", "guide.md"].first { Self.hex($0.utf8) == hex }
             if hex != nil && selected == nil {
                 return self.call("page", ["schema": "fcb.atlas-links/1", "status": "error", "error": ["code": "ATLAS_LINKS_PATH_NOT_FOUND"]])
             }

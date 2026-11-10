@@ -167,15 +167,19 @@ import Observation
         let flag = AtlasSearchCancellation(), transport = transport
         cancellation = flag; busy = true
         let reader = AtlasPagedReaderModel(transport: readerTransport, search: search, outline: outline, document: document)
+        let receipt = AtlasProjectLinkReaderReceiptBox()
         defer { finish() }
         do {
             try await withTaskCancellationHandler(operation: {
-                try await reader.openRetained(offset: 0, registryDomain: domain) { destination in
+                try await reader.openRetained(registryDomain: domain) { destination in
                     guard !flag.isCanceled else { throw AtlasProjectLinksError.canceled }
                     return try prepared.owner.call { handle in
                         let json = try transport.openReader(handle, destination, page.generation, link.id, side)
-                        return try AtlasProjectLinkReaderReceipt.decode(json, index: prepared, generation: page.generation,
+                        let admitted = try AtlasProjectLinkReaderReceipt.decode(json, index: prepared, generation: page.generation,
                             link: link, side: side, destination: destination)
+                        try receipt.set(admitted)
+                        return AtlasReaderRetainedInitialization(info: admitted.info,
+                            initialOriginalOffset: admitted.fragment.initialOriginalOffset)
                     }
                 }
                 try accept(flag)
@@ -183,8 +187,11 @@ import Observation
                       initial.identity.pathBytes == file.path.bytes,
                       initial.identity.capturedBytes == file.capturedBytes else { throw AtlasProjectLinksError.invalidResponse }
             }, onCancel: { flag.cancel() })
-            notice = "Opened the exact retained \(side == .evidence ? "Markdown source" : "target") document. No live file was reopened."
-            return AtlasProjectLinkReaderCapture(reader: reader, owner: prepared.basis.owner, path: file.path, link: link, side: side)
+            let accepted = try receipt.accepted()
+            notice = "Opened the exact retained \(side == .evidence ? "Markdown source" : "target") document. "
+                + accepted.fragment.navigationDescription
+            return AtlasProjectLinkReaderCapture(reader: reader, owner: prepared.basis.owner, path: file.path,
+                link: link, side: side, fragment: accepted.fragment)
         } catch {
             reader.close(); notice = Self.message(error); throw error
         }

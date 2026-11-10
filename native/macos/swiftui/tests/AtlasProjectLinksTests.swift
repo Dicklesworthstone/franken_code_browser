@@ -39,7 +39,7 @@ import Foundation
         let page = try decode(valid, index: index)
         precondition(page.links.count == 64 && page.total == 70 && page.next == 64 && page.complete)
         precondition(page.basis.owner > 9_007_199_254_740_992 && page.links[0].source.id == 1
-            && page.links[0].target?.id == 2 && page.links[0].label.contains("unqualified"))
+            && page.links[0].target?.id == 2 && page.links[0].label.contains("checked when"))
         var short = valid
         short["links"] = Array((valid["links"] as! [[String: Any]]).prefix(7)); short["next_offset"] = "7"
         let shortened = try decode(short, index: index)
@@ -70,9 +70,9 @@ import Foundation
         precondition(!partialPage.complete)
         partial["relationships_complete"] = true; refuse(partial, index: index)
 
-        let selected = Array("src.rs".utf8)
+        let selected = Array("guide.md".utf8)
         let incoming = ProjectLinksFixture.page(owner: index.basis.owner, generation: 1,
-            command: "links-page", direction: .incoming, path: "src.rs")
+            command: "links-page", direction: .incoming, path: "guide.md")
         let incomingPage = try decode(incoming, index: index, direction: .incoming, path: selected)
         precondition(incomingPage.total == 70)
         refuse(incoming, index: index, direction: .incoming, path: Array("docs.md".utf8))
@@ -104,9 +104,10 @@ import Foundation
 
         let link = page.links[0], receiver: UInt64 = 77
         let receipt = ProjectLinksFixture.receipt(owner: index.basis.owner, reader: receiver, generation: 1, link: 1, side: .target)
-        let info = try AtlasProjectLinkReaderReceipt.decode(ProjectLinksFixture.json(receipt), index: index,
+        let admitted = try AtlasProjectLinkReaderReceipt.decode(ProjectLinksFixture.json(receipt), index: index,
             generation: 1, link: link, side: .target, destination: receiver)
-        precondition(info.identity.pathBytes == selected && info.identity.capturedBytes == 100)
+        precondition(admitted.info.identity.pathBytes == selected && admitted.info.identity.capturedBytes == 100)
+        precondition(admitted.fragment.status == "resolved" && admitted.fragment.initialOriginalOffset == 34)
         for key in ["source_reopened", "additional_source_bytes_read", "source_sha256", "reader_owner", "destination_suffix"] {
             var bad = receipt
             switch key {
@@ -122,6 +123,49 @@ import Foundation
                 preconditionFailure("Changed captured-reader evidence admitted")
             } catch {}
         }
+        let fragmentFields = ["fragment_status", "fragment_suffix", "fragment_slug", "target_range", "initial_original_offset"]
+        func admitReader(_ value: [String: Any], side: AtlasProjectLinkSide = .target) throws -> AtlasProjectLinkReaderReceipt {
+            try AtlasProjectLinkReaderReceipt.decode(ProjectLinksFixture.json(value), index: index,
+                generation: 1, link: link, side: side, destination: receiver)
+        }
+        func refuseReader(_ value: [String: Any], side: AtlasProjectLinkSide = .target) {
+            do { _ = try admitReader(value, side: side); preconditionFailure("Unqualified fragment became a navigation anchor") }
+            catch {}
+        }
+        for field in fragmentFields {
+            var omitted = receipt; omitted.removeValue(forKey: field); refuseReader(omitted)
+        }
+        for (key, value) in [
+            ("initial_original_offset", "35"), ("initial_original_offset", "034"),
+            ("fragment_status", "missing-heading"), ("fragment_status", "unresolved"),
+            ("fragment_suffix", "#other"), ("fragment_slug", ""), ("fragment_slug", "part\u{0}")
+        ] {
+            var bad = receipt; bad[key] = value; refuseReader(bad)
+        }
+        for range in [["start": "34", "end": "101"], ["start": "34", "end": "34"], ["start": "33", "end": "42"]] {
+            var bad = receipt; bad["target_range"] = range; refuseReader(bad)
+        }
+        var wrongEncoding = receipt, wrongInfo = receipt["reader"] as! [String: Any]
+        wrongInfo["encoding"] = "utf16le"; wrongEncoding["reader"] = wrongInfo; refuseReader(wrongEncoding)
+        for status in ["missing-heading", "ambiguous", "limited", "unsupported", "invalid"] {
+            var fallback = receipt
+            fallback["fragment_status"] = status; fallback["target_range"] = NSNull(); fallback["initial_original_offset"] = "0"
+            if status == "invalid" { fallback["fragment_slug"] = NSNull() }
+            let result = try admitReader(fallback)
+            precondition(result.fragment.status == status && result.fragment.initialOriginalOffset == 0
+                && result.fragment.navigationDescription.contains("beginning"))
+        }
+        var evidenceReceipt = ProjectLinksFixture.receipt(owner: index.basis.owner, reader: receiver,
+            generation: 1, link: 1, side: .evidence)
+        let evidenceReader = try admitReader(evidenceReceipt, side: .evidence)
+        precondition(evidenceReader.fragment.initialOriginalOffset == 0)
+        for field in fragmentFields { evidenceReceipt[field] = receipt[field] }
+        refuseReader(evidenceReceipt, side: .evidence)
+        var legacy = receipt
+        for field in fragmentFields { legacy.removeValue(forKey: field) }
+        let legacyReader = try admitReader(legacy)
+        precondition(legacyReader.fragment.status == "unqualified" && legacyReader.fragment.initialOriginalOffset == 0,
+            "An old receipt can only open at the beginning")
 
         let live = ProjectLinksFixture()
         let model = AtlasProjectLinksModel(root: "/project", initialPath: selected, direction: .incoming, transport: live.transport)
@@ -132,8 +176,26 @@ import Foundation
         let source = try await model.open(accepted.links[0], from: accepted, side: .evidence, readerTransport: live.readerTransport)
         let target = try await model.open(accepted.links[0], from: accepted, side: .target, readerTransport: live.readerTransport)
         precondition(source.reader.page?.text == ProjectLinksFixture.source(1)
-            && target.reader.page?.text == ProjectLinksFixture.source(2))
-        precondition(source.evidenceLabel.contains("whole captured document") && target.evidenceLabel.contains("unqualified"))
+            && target.reader.page?.text == String(ProjectLinksFixture.source(2).dropFirst(34)))
+        precondition(source.evidenceLabel.contains("whole captured document") && target.evidenceLabel.contains("heading #part"))
+        precondition(target.reader.page?.start == 34 && !target.reader.canRefresh,
+            "A heading opens from its retained capture, never by granting a current live path")
+        target.reader.offsetInput = "0"; target.reader.goToByte(); await settled(target.reader)
+        target.reader.back(); await settled(target.reader)
+        precondition(target.reader.page?.start == 34, "Back navigation preserves the original heading position")
+        live.patch { phase, value in
+            var value = value
+            if phase == "reader" { value["initial_original_offset"] = "35" }
+            return value
+        }
+        let closedBefore = live.log.filter { $0 == "close-reader" }.count
+        do {
+            _ = try await model.open(accepted.links[0], from: accepted, side: .target, readerTransport: live.readerTransport)
+            preconditionFailure("A mismatched heading offset published a reader")
+        } catch {}
+        precondition(live.log.filter { $0 == "close-reader" }.count == closedBefore + 1
+            && target.reader.page?.start == 34, "Rejected navigation drains only its new reader")
+        live.patch { _, value in value }
         let creates = live.log.filter { $0 == "create-reader" }.count
         model.loadPage(start: 64); await settled(model)
         precondition(model.page?.links.count == 6 && model.page?.links.first?.id == 65)

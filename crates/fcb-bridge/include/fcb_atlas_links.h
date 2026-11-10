@@ -64,8 +64,15 @@ char *fcb_atlas_links_page(uint64_t handle, uint64_t generation, uint64_t direct
  * reader is an existing EMPTY fcb_reader_create handle. The selected link ID
  * and generation, current retained index, exact source/target identity and
  * independent reader receipt are checked before transfer. External, missing,
- * unresolved and uncaptured targets are refused. Fragment qualification is
- * explicit in the receipt; a URL suffix is not an invented source offset.
+ * unresolved and uncaptured targets are refused. For side=1, the selected
+ * retained target's Markdown heading is qualified through the shared adapter.
+ * fragment_status, fragment_slug, fragment_suffix, target_range and
+ * initial_original_offset describe the result. Only status=resolved carries a
+ * nonempty original-byte target_range and its start as the initial offset;
+ * missing/ambiguous/invalid/limited/unsupported fragments open from offset 0.
+ * Evidence side=0 always reports fragment_status=none and offset 0. The legacy
+ * fragment_resolution describes the unqualified list row, not this navigation.
+ * This temporary qualification publishes no reader preview/query generation.
  * Index clear/replacement invalidates old link authority. Readers already
  * installed own their bytes and survive graph/index/atlas retirement.
  * Late cancellation can suppress a reply after receiver installation: inspect

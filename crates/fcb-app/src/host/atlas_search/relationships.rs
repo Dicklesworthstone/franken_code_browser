@@ -10,7 +10,7 @@ use fcb::document::links::{CapturedDocumentLinks, DocumentLinkError,
     MAX_DOCUMENT_LINK_SOURCE_BYTES, MAX_DOCUMENT_LINKS, MAX_DOCUMENT_LINK_DESTINATION_BYTES,
     resolve_document_destination};
 use fcb::store::Sha256Digest;
-use crate::host::document_fragment::markdown;
+use crate::host::document_fragment::{markdown, FragmentResolution};
 use super::*;
 
 #[path = "relationships_wire.rs"]
@@ -199,9 +199,10 @@ impl RetainedAtlasSearch {
         self.finish(atlas, out, partial, &mut canceled)
     }
 
-    /// Open an independently owned exact capture. Fragment suffixes remain
-    /// unqualified and select no heading/line; the ordinary reader starts at 0.
-    /// Metadata/source replacement or index clearing invalidates old edges.
+    /// Open an independently owned exact capture. Only a selected target's
+    /// fragment is qualified, using the shared upstream heading/source map.
+    /// List pages remain metadata-only; evidence always opens the whole source
+    /// document. Metadata/source replacement or index clearing invalidates edges.
     pub fn open_relationship_reader(&mut self, atlas: &AtlasSession, reader_owner: ArenaOwnerId,
         generation: u64, id: u64, side: AtlasRelationshipSide, mut canceled: impl FnMut() -> bool)
         -> Result<(ReaderSession, HostResponse), AtlasSearchError> {
@@ -224,8 +225,13 @@ impl RetainedAtlasSearch {
         let mut stop = || canceled() || atlas.validate_active().is_err();
         let mut reader = ReaderSession::from_bytes(reader_owner, &label, source.bytes(), &mut stop)?;
         if reader.capture_sha256() != proof.digest { return Err(AtlasSearchError::StaleIndex); }
+        let (fragment, slug) = match side {
+            AtlasRelationshipSide::Evidence => (FragmentResolution::None, None),
+            AtlasRelationshipSide::Target => reader.resolve_document_fragment(&link.suffix, &mut stop)?,
+        };
         let info = reader.info(&mut stop)?;
-        wire::reader(&mut out, atlas, snapshot, link, id, side, proof, reader_owner, &info)?;
+        wire::reader(&mut out, atlas, snapshot, link, id, side, proof, reader_owner, &info,
+            (fragment, slug.as_deref()))?;
         let response = self.finish(atlas, out, false, &mut canceled)?;
         Ok((reader, response))
     }

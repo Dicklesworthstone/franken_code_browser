@@ -98,7 +98,7 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
         case "external": status = "External destination; no network content was fetched"
         default: status = "Destination could not be resolved within the project"
         }
-        return status + (destinationSuffix.isEmpty ? "" : " · destination suffix is unqualified; no fragment jump")
+        return status + (destinationSuffix.contains("#") ? " · heading fragment is checked when the target opens" : "")
     }
     var canOpenTarget: Bool { resolution == "captured" && target != nil }
     var evidenceLabel: String { "Parsed Markdown link · whole captured document evidence; no exact link span or heading jump" }

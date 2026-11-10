@@ -2,10 +2,13 @@ import Foundation
 
 /// Validate the graph owner, selected side and exact capture before admitting
 /// a separate reader. Documentation evidence identifies the whole document;
-/// destination fragments remain explicitly unqualified and never become jumps.
-enum AtlasProjectLinkReaderReceipt {
+/// only a qualified target heading may supply a nonzero initial source offset.
+struct AtlasProjectLinkReaderReceipt: Sendable {
+    let info: AtlasReaderInfo
+    let fragment: AtlasProjectLinkFragment
+
     static func decode(_ json: String?, index: AtlasPreparedIndex, generation: UInt64,
-        link: AtlasProjectLink, side: AtlasProjectLinkSide, destination: UInt64) throws -> AtlasReaderInfo {
+        link: AtlasProjectLink, side: AtlasProjectLinkSide, destination: UInt64) throws -> Self {
         guard destination > 0, destination != index.basis.owner,
               side == .evidence || link.canOpenTarget else { throw AtlasProjectLinksError.invalidInput }
         let file = side == .evidence ? link.source : link.target!
@@ -28,7 +31,98 @@ enum AtlasProjectLinkReaderReceipt {
         guard info.identity.capturedBytes == file.capturedBytes, info.captureSHA256 == file.digest else {
             throw AtlasProjectLinksError.invalidResponse
         }
-        return info
+        return Self(info: info, fragment: try AtlasProjectLinkFragment.decode(w, link: link, side: side, info: info))
+    }
+}
+
+/// The same captured heading semantics as the reader's Markdown adapter. This
+/// validates a receipt; it does not decode URI identities or invent heading slugs.
+struct AtlasProjectLinkFragment: Sendable {
+    let status: String
+    let slug: String?
+    let initialOriginalOffset: UInt64
+
+    var navigationDescription: String {
+        switch status {
+        case "none": "Opened at the beginning of the captured file."
+        case "document-start": "The empty fragment selects the captured document's beginning."
+        case "resolved": "Opened at heading #\(slug ?? "") in this capture."
+        case "missing-heading": "The requested heading is absent from this capture. Opened at the beginning."
+        case "ambiguous": "Multiple captured headings share this identity. Opened at the beginning."
+        case "limited": "Heading navigation reached a document or memory limit. Opened at the beginning."
+        case "unsupported": "The heading's source position could not be verified in this capture. Opened at the beginning."
+        case "invalid": "The link fragment is invalid. Opened at the beginning."
+        default: "The destination fragment is unqualified. Opened at the beginning."
+        }
+    }
+
+    static func decode(_ w: AtlasIndexWire, link: AtlasProjectLink, side: AtlasProjectLinkSide,
+        info: AtlasReaderInfo) throws -> Self {
+        let fields = ["fragment_status", "fragment_suffix", "fragment_slug", "target_range", "initial_original_offset"]
+        let present = fields.filter { w.fields.contains(AtlasIndexWire.Key($0)) }
+        let expected: String
+        if side == .target, let start = link.destinationSuffix.firstIndex(of: "#") {
+            expected = String(link.destinationSuffix[start...])
+        } else { expected = "" }
+        // An older engine's inert receipt may open the file, never invent a
+        // heading. Partial new receipts cannot acquire that compatibility path.
+        if present.isEmpty {
+            return Self(status: expected.isEmpty ? "none" : "unqualified", slug: nil, initialOriginalOffset: 0)
+        }
+        guard present.count == fields.count,
+              try w.text("fragment_suffix").utf8.elementsEqual(expected.utf8) else {
+            throw AtlasProjectLinksError.invalidResponse
+        }
+        let status = try w.text("fragment_status"), slug = try w.optionalText("fragment_slug")
+        let offset = try w.number("initial_original_offset")
+        if let slug {
+            guard !slug.isEmpty, slug.utf8.count <= 4096,
+                  slug.unicodeScalars.allSatisfy({ $0.value >= 32 && !(127...159).contains($0.value) }) else {
+                throw AtlasProjectLinksError.invalidResponse
+            }
+        }
+        switch status {
+        case "none":
+            guard expected.isEmpty, slug == nil else { throw AtlasProjectLinksError.invalidResponse }
+        case "document-start":
+            guard expected == "#", slug == nil else { throw AtlasProjectLinksError.invalidResponse }
+        case "resolved", "missing-heading", "ambiguous", "limited", "unsupported":
+            guard expected.hasPrefix("#"), expected.utf8.count > 1, slug != nil else {
+                throw AtlasProjectLinksError.invalidResponse
+            }
+        case "invalid":
+            guard expected.hasPrefix("#"), expected.utf8.count > 1, slug == nil else {
+                throw AtlasProjectLinksError.invalidResponse
+            }
+        default: throw AtlasProjectLinksError.invalidResponse
+        }
+        if status == "resolved" {
+            let range = try w.object("target_range"), start = try range.number("start"), end = try range.number("end")
+            guard side == .target, info.identity.encoding == "utf8", info.identity.capturedBytes <= 262_144,
+                  start < end, end <= info.identity.capturedBytes, offset == start else {
+                throw AtlasProjectLinksError.invalidResponse
+            }
+        } else {
+            guard offset == 0, try w.absent(["target_range"]) else { throw AtlasProjectLinksError.invalidResponse }
+        }
+        return Self(status: status, slug: slug, initialOriginalOffset: offset)
+    }
+}
+
+/// One worker-to-main receipt, bound to a single reader-open attempt. The lock
+/// never covers foreign work and the value is immutable after publication.
+final class AtlasProjectLinkReaderReceiptBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: AtlasProjectLinkReaderReceipt?
+    func set(_ receipt: AtlasProjectLinkReaderReceipt) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard value == nil else { throw AtlasProjectLinksError.invalidResponse }
+        value = receipt
+    }
+    func accepted() throws -> AtlasProjectLinkReaderReceipt {
+        lock.lock(); defer { lock.unlock() }
+        guard let value else { throw AtlasProjectLinksError.invalidResponse }
+        return value
     }
 }
 
@@ -39,12 +133,13 @@ enum AtlasProjectLinkReaderReceipt {
     let path: AtlasProjectLinkPath
     let link: AtlasProjectLink
     let side: AtlasProjectLinkSide
+    let fragment: AtlasProjectLinkFragment
     init(reader: AtlasPagedReaderModel, owner: UInt64, path: AtlasProjectLinkPath,
-         link: AtlasProjectLink, side: AtlasProjectLinkSide) {
-        self.reader = reader; self.owner = owner; self.path = path; self.link = link; self.side = side
+         link: AtlasProjectLink, side: AtlasProjectLinkSide, fragment: AtlasProjectLinkFragment) {
+        self.reader = reader; self.owner = owner; self.path = path; self.link = link; self.side = side; self.fragment = fragment
     }
     var evidenceLabel: String {
         side == .evidence ? link.evidenceLabel
-            : "Exact captured target document · destination fragments are unqualified; opened from the beginning"
+            : "Exact captured target document · " + fragment.navigationDescription
     }
 }
