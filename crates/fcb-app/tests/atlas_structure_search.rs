@@ -250,3 +250,36 @@ fn result_limit_reports_lookahead_and_later_file_coverage_without_reopening_on_p
     let after = search.progress(&atlas, 1).unwrap();
     assert_eq!(before.source_bytes_read, after.source_bytes_read); assert_eq!(before.read_calls, after.read_calls);
 }
+
+
+#[test]
+fn exact_symbol_and_heading_caps_continue_through_later_negative_files() {
+    for (mode, first, later, last, positive, negative) in [
+        (AtlasStructureMode::Symbols, "a.rs", "b.rs", "c.rs",
+            b"fn wanted() {}\n".as_slice(), b"fn other() {}\n".as_slice()),
+        (AtlasStructureMode::Headings, "a.md", "b.md", "c.md",
+            b"# wanted\n".as_slice(), b"# other\n".as_slice()),
+    ] {
+        for extra_match in [false, true] {
+            let mut parts = vec![(first, positive), (later, negative)];
+            if extra_match { parts.push((last, positive)); }
+            let fixture = Fixture::new(&parts);
+            let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+            let mut settings = options(mode);
+            settings.name_mode = SymbolNameMode::Exact; settings.limits.max_matches = 1;
+            search.begin_structure(&atlas, 1, "wanted", AtlasSearchScope::all(), settings, || false).unwrap();
+            let json = finish(&mut search, &atlas, 1);
+            count(&json, "retained_hits", 1); count(&json, "pending_files", 0);
+            count(&json, "matches_seen", if extra_match { 2 } else { 1 });
+            count(&json, "source_bytes_read",
+                (positive.len() + negative.len() + if extra_match { positive.len() } else { 0 }) as u64);
+            if extra_match {
+                assert!(json.contains("\"truncated\":true"));
+                assert!(json.contains("\"search_complete\":false"));
+            } else {
+                assert!(json.contains("\"truncated\":false"));
+                assert!(json.contains("\"search_complete\":true"));
+            }
+        }
+    }
+}

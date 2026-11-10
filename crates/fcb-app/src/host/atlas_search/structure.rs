@@ -411,9 +411,11 @@ fn update_coverage(atlas: &AtlasSession, query: &mut Snapshot, work: &StructureW
     query.source_bytes_read = work.io.bytes; query.read_calls = work.io.calls;
     query.stop_reason = if query.pending == 0 {
         Some(if query.truncated { AtlasSearchStop::MatchLimit } else { AtlasSearchStop::AllFilesExamined })
-    } else if query.truncated || (work.options.mode != AtlasStructureMode::Occurrences
-        && query.hits.len() == work.options.limits.max_matches) {
-        query.truncated = true; Some(AtlasSearchStop::MatchLimit)
+    } else if query.truncated {
+        // Reaching capacity alone is not evidence of another match. Continue
+        // bounded extraction through later negative files until append_row
+        // observes a real extra result, just as occurrence mode does.
+        Some(AtlasSearchStop::MatchLimit)
     } else if query.examined == work.options.limits.max_files { Some(AtlasSearchStop::FileLimit) }
     else if work.io.bytes >= work.options.limits.max_source_bytes as u64 { Some(AtlasSearchStop::SourceByteLimit) }
     else { None };
