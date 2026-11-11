@@ -175,6 +175,28 @@ pub unsafe extern "C" fn fcb_atlas_search_indexed_begin_matching(handle: u64, ge
     unsafe { submit_matching(handle, generation, index_generation, needle, extensions, filenames,
         path_kind, path, case_sensitive, max_matches, max_scan_bytes, true) }
 }
+
+/// Count all exact-text occurrences within the verification byte budget while
+/// retaining at most max_matches rows. Scope and index capture identity stay
+/// frozen; ordinary search_step/page/overlay/reader operations share the query.
+/// case_sensitive must be 1; the legacy matching route supports lowercase.
+/// # Safety
+/// Same pointer/list/path and returned-string contract as indexed_begin_matching.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_search_indexed_begin_counted_matching(handle: u64,
+    generation: u64, index_generation: u64, needle: *const c_char,
+    extensions: *const c_char, filenames: *const c_char, path_kind: u64,
+    path: *const c_char, case_sensitive: u64, max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
+    reply(|| answer(handle, |atlases| {
+        if !parse_case_sensitive(case_sensitive)? { return Err(AccessError::InvalidArgument); }
+        let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
+        if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES { return Err(AccessError::InvalidArgument); }
+        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?;
+        atlases.execute_index(handle, IndexCommand::BeginCounted { generation, index_generation,
+            needle, scope: &scope, max_matches: number(max_matches)?, max_scan_bytes }, || false)
+    }))
+}
+
 unsafe fn submit(handle: u64, generation: u64, index_generation: u64, needle: *const c_char,
     extensions: *const c_char, filenames: *const c_char,
     max_matches: u64, max_scan_bytes: u64, progressive: bool) -> *mut c_char {
