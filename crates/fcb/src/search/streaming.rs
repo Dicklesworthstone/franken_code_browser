@@ -11,14 +11,17 @@
 //! Matching is the existing overlapping KMP cursor. Text uses the existing
 //! source decoder to validate each complete-scalar window, then searches the
 //! uniquely encoded exact literal, with UTF-16 alignment and initial-BOM checks.
-//! This equivalence is ONLY for exact UTF-8/UTF-16 text, never normalization,
-//! case folding, replacement text, regex or a guessed character encoding.
+//! Unicode-insensitive text reuses the shared lowercase scalar cursor and keeps
+//! each occurrence's original spelling and encoded bytes. It does not add full
+//! case folding, canonical equivalence, replacement text, or guessed encodings.
 
 use std::{io::{self, Read}, mem::size_of};
-use fcb_core::{ArenaOwnerId, ByteLength, ByteOffset, ByteRange, FileId, QueryGeneration,
+use fcb_core::{ArenaOwnerId, ByteLength, ByteOffset, ByteRange, DecodedUtf8Offset, FileId, QueryGeneration,
     ResourceAllocationId, ResourceBudget, ResourceLease, SourceRevision};
 use fcb_source::{CaptureEncodingMap, CaptureRequest, DetectedEncoding, MappingSpan, SourceError, SpanKind, detect_encoding};
 use fcb_search::stream::{ByteSearchCursor, StreamError, MAX_STREAM_NEEDLE_BYTES};
+use fcb_search::{SearchMode, UnicodeNormalization};
+use fcb_search::normalized::{NormalizedCursor, SourceScalar, Units, matched_text_capacity};
 
 pub const STREAM_BUFFER_BYTES: usize = 16 * 1024;
 pub const MAX_STREAM_RESULTS: usize = 4096;
@@ -53,7 +56,7 @@ impl std::error::Error for StreamReadError {}
 impl From<StreamError> for StreamReadError { fn from(error: StreamError) -> Self { Self::Matcher(error) } }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StreamingMode { OriginalBytes, ExactText }
+pub enum StreamingMode { OriginalBytes, ExactText, LowercaseText }
 
 /// Reusable immutable literal. Pre-encoded alternatives avoid a self-referential
 /// cursor and allow reports to share ONE exact literal witness across all hits.
@@ -64,6 +67,7 @@ pub struct StreamingNeedle {
     utf8: Vec<u8>,
     little: Vec<u8>,
     big: Vec<u8>,
+    max_witness_bytes: usize,
     _lease: ResourceLease,
 }
 impl StreamingNeedle {
@@ -75,6 +79,26 @@ impl StreamingNeedle {
         allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
         Self::build(owner, text.as_bytes(), Some(text), budget, allocation)
     }
+    /// Match with the same Unicode lowercase semantics as retained text search.
+    /// This is not full case folding or canonical normalization. Original byte
+    /// ranges and spellings are retained separately for each accepted occurrence.
+    pub fn text_matching(owner: ArenaOwnerId, text: &str, case_sensitive: bool,
+        budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
+        let mut needle = Self::text(owner, text, budget, allocation)?;
+        if !case_sensitive {
+            let bound = matched_text_capacity(text, lowercase_mode()).map_err(|_| StreamReadError::InvalidLimits)?;
+            // Public host receipts admit at most twelve source bytes per UTF-8
+            // query byte. Refuse rather than silently widen it if tables change.
+            if bound > text.len().checked_mul(12).ok_or(StreamReadError::InvalidLimits)? {
+                return Err(StreamReadError::InvalidLimits);
+            }
+            needle.mode = StreamingMode::LowercaseText;
+            needle.max_witness_bytes = bound;
+        }
+        Ok(needle)
+    }
+    /// A source-length-independent upper bound for one retained original witness.
+    pub const fn max_witness_bytes(&self) -> usize { self.max_witness_bytes }
     fn build(owner: ArenaOwnerId, bytes: &[u8], text: Option<&str>, budget: &ResourceBudget,
         allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
         if bytes.is_empty() { return Err(StreamError::EmptyNeedle.into()); }
@@ -95,11 +119,11 @@ impl StreamingNeedle {
             }
         }
         Ok(Self { owner, mode: if text.is_some() { StreamingMode::ExactText } else { StreamingMode::OriginalBytes },
-            utf8, little, big, _lease: lease })
+            max_witness_bytes: bytes.len().max(utf16), utf8, little, big, _lease: lease })
     }
     pub const fn mode(&self) -> StreamingMode { self.mode }
     pub fn text_value(&self) -> Option<&str> {
-        (self.mode == StreamingMode::ExactText).then(|| std::str::from_utf8(&self.utf8).ok()).flatten()
+        (self.mode != StreamingMode::OriginalBytes).then(|| std::str::from_utf8(&self.utf8).ok()).flatten()
     }
     fn encoded(&self, encoding: Option<DetectedEncoding>) -> &[u8] {
         if self.mode == StreamingMode::OriginalBytes { return &self.utf8; }
@@ -162,6 +186,16 @@ impl StreamingHit {
     pub const fn original_range(self) -> ByteRange { self.range }
 }
 
+struct RetainedWitness { text: String, bytes: Vec<u8> }
+
+struct LowercaseWork {
+    cursor: NormalizedCursor,
+    window: Option<CaptureEncodingMap>,
+    decoded_base: u64,
+    position: usize,
+    pending: Option<(SourceScalar, Units)>,
+}
+
 /// Explicit synchronous-resumable reader operation. A step admits at most one
 /// successful read and one matcher batch. Interrupted calls spend call budget.
 /// A foreign blocking Read implementation has no invented wall-clock deadline.
@@ -175,6 +209,9 @@ pub struct ReaderSearch<'needle, R: Read> {
     encoding: Option<DetectedEncoding>,
     header: u64,
     cursor: Option<ByteSearchCursor<'needle>>,
+    initialized: bool,
+    lowercase: Option<LowercaseWork>,
+    witnesses: Vec<RetainedWitness>,
     buffer: Vec<u8>,
     base: u64,
     filled: usize,
@@ -207,18 +244,32 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
         // Decoder vectors/strings can grow geometrically. Charge conservative
         // transient reallocation overlap, the KMP table, input, batches and hits.
         // The source length is deliberately absent from this allocation formula.
-        let charge = size_of::<Self>() + size_of::<StreamReadReport<'needle>>()
+        let lowercase_charge = if needle.mode == StreamingMode::LowercaseText {
+            options.max_matches.checked_mul(size_of::<RetainedWitness>() + 2 * needle.max_witness_bytes)
+                .and_then(|n| n.checked_add(needle.max_witness_bytes
+                    * (size_of::<char>() + size_of::<usize>() + size_of::<SourceScalar>())))
+                .ok_or(StreamReadError::InvalidLimits)?
+        } else { 0 };
+        let charge = (size_of::<Self>() + size_of::<StreamReadReport<'needle>>()
             + STREAM_BUFFER_BYTES * (8 * size_of::<MappingSpan>() + 64)
             + MAX_STREAM_NEEDLE_BYTES * size_of::<usize>()
             + options.max_matches * size_of::<StreamingHit>()
-            + MAX_STREAM_STEP_HITS * size_of::<fcb_search::stream::ByteMatch>();
+            + MAX_STREAM_STEP_HITS * size_of::<fcb_search::stream::ByteMatch>())
+            .checked_add(lowercase_charge).ok_or(StreamReadError::InvalidLimits)?;
         let lease = budget.try_reserve_managed(needle.owner, allocation, ByteLength::new(charge as u64))
             .map_err(|_| StreamReadError::ResourceDenied)?;
         let mut buffer = reserve(STREAM_BUFFER_BYTES)?;
         buffer.resize(STREAM_BUFFER_BYTES, 0);
         let cursor = if needle.mode == StreamingMode::OriginalBytes { Some(ByteSearchCursor::new(&needle.utf8)?) } else { None };
+        let lowercase = if needle.mode == StreamingMode::LowercaseText {
+            Some(LowercaseWork { cursor: NormalizedCursor::new(needle.text_value().ok_or(StreamReadError::InvalidLimits)?,
+                lowercase_mode()).map_err(|_| StreamReadError::AllocationFailed)?
+                    .ok_or(StreamReadError::InvalidLimits)?, window: None, decoded_base: 0, position: 0, pending: None })
+        } else { None };
+        let witnesses = reserve(if lowercase.is_some() { options.max_matches } else { 0 })?;
         let mut search = Self { reader, needle, request, length, options, count_all_matches: false, encoding: options.encoding,
-            header: 0, cursor, buffer, base: 0, filled: 0, ready: 0, consumed: 0, eof: false,
+            header: 0, initialized: cursor.is_some(), cursor, lowercase, witnesses,
+            buffer, base: 0, filled: 0, ready: 0, consumed: 0, eof: false,
             hits: reserve(options.max_matches)?, matches_seen: 0, unsupported_at: None,
             state: StreamReadState::Pending, stats: StreamReadStats::default(), lease };
         if length.get() == 0 { search.prepare()?; search.set_terminal(); }
@@ -282,7 +333,9 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
         if canceled() { self.cancel(); return Ok(()); }
         if self.ready == 0 { self.prepare()?; }
         if self.state != StreamReadState::Pending { return Ok(()); }
-        if self.ready > self.consumed {
+        if self.lowercase.is_some() && self.ready > 0 {
+            self.advance_lowercase(step)?;
+        } else if self.ready > self.consumed {
             let cursor = self.cursor.as_mut().ok_or(StreamReadError::InvalidRange)?;
             let batch = cursor.step(&self.buffer[self.consumed..self.ready], step.max_bytes.min(STREAM_BUFFER_BYTES),
                 step.max_hits.min(MAX_STREAM_STEP_HITS))?;
@@ -301,18 +354,85 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
                     .map_err(|_| StreamReadError::InvalidRange)?;
                 self.hits.push(StreamingHit { occurrence: self.matches_seen, range });
             }
-            if self.consumed == self.ready {
-                self.buffer.copy_within(self.ready..self.filled, 0);
-                self.filled -= self.ready; self.base += self.ready as u64;
-                self.ready = 0; self.consumed = 0;
+        }
+        let lower_done = self.lowercase.as_ref().is_none_or(|work| work.pending.is_none()
+            && work.window.as_ref().is_none_or(|map| work.position == map.decoded_text().len()));
+        if self.ready > 0 && self.consumed == self.ready && lower_done {
+            if let Some(work) = &mut self.lowercase {
+                if let Some(map) = work.window.take() {
+                    work.decoded_base = work.decoded_base.checked_add(map.total_decoded_bytes())
+                        .ok_or(StreamReadError::InvalidRange)?;
+                }
             }
+            self.buffer.copy_within(self.ready..self.filled, 0);
+            self.filled -= self.ready; self.base += self.ready as u64;
+            self.ready = 0; self.consumed = 0;
         }
         self.set_terminal();
         Ok(())
     }
+    fn advance_lowercase(&mut self, step: StreamReadStep) -> Result<(), StreamReadError> {
+        let before = self.consumed;
+        let end = self.ready.min(self.consumed + step.max_bytes.min(STREAM_BUFFER_BYTES));
+        let max_hits = step.max_hits.min(MAX_STREAM_STEP_HITS);
+        let mut emitted = 0;
+        while emitted < max_hits {
+            let work = self.lowercase.as_mut().ok_or(StreamReadError::InvalidRange)?;
+            if let Some((scalar, units)) = &mut work.pending {
+                if let Some(unit) = units.next() {
+                    if let Some(hit) = work.cursor.push(unit, *scalar) {
+                        emitted += 1;
+                        self.matches_seen = self.matches_seen.checked_add(1).ok_or(StreamReadError::InvalidLimits)?;
+                        if self.hits.len() == self.options.max_matches {
+                            if self.count_all_matches { continue; }
+                            self.state = StreamReadState::Truncated;
+                            break;
+                        }
+                        let text = work.cursor.matched_text().map_err(|_| StreamReadError::AllocationFailed)?;
+                        if text.capacity() > self.needle.max_witness_bytes { return Err(StreamReadError::ResourceDenied); }
+                        let bytes = encode_witness(&text, self.encoding.ok_or(StreamReadError::InvalidRange)?,
+                            self.needle.max_witness_bytes)?;
+                        let range = ByteRange::new(ByteOffset::new(hit.raw_start), ByteOffset::new(hit.raw_end))
+                            .map_err(|_| StreamReadError::InvalidRange)?;
+                        if range.len().get() != bytes.len() as u64 { return Err(StreamReadError::InvalidRange); }
+                        self.witnesses.push(RetainedWitness { text, bytes });
+                        self.hits.push(StreamingHit { occurrence: self.matches_seen, range });
+                    }
+                    continue;
+                }
+                work.pending = None;
+            }
+            let map = work.window.as_ref().ok_or(StreamReadError::InvalidRange)?;
+            let Some(ch) = map.decoded_text()[work.position..].chars().next() else {
+                self.consumed = end;
+                break;
+            };
+            let decoded_start = work.decoded_base + work.position as u64;
+            let decoded_end = decoded_start + ch.len_utf8() as u64;
+            let raw_start = map.decoded_utf8_to_byte_offset(DecodedUtf8Offset::new(decoded_start))
+                .map_err(StreamReadError::Decoder)?.get();
+            let raw_end = map.decoded_utf8_to_byte_offset(DecodedUtf8Offset::new(decoded_end))
+                .map_err(StreamReadError::Decoder)?.get();
+            let local_end = usize::try_from(raw_end.checked_sub(self.base).ok_or(StreamReadError::InvalidRange)?)
+                .map_err(|_| StreamReadError::InvalidRange)?;
+            if local_end > end {
+                // Tiny quanta may stop within a validated scalar. Charge these
+                // original bytes now; feed the scalar only after its end arrives.
+                self.consumed = end;
+                break;
+            }
+            self.consumed = local_end;
+            work.position += ch.len_utf8();
+            let scalar = SourceScalar { ch, raw_start, raw_end, decoded_start, decoded_end };
+            work.pending = Some((scalar, work.cursor.units(ch)));
+        }
+        self.stats.last_step_scanned = self.consumed - before;
+        self.stats.scanned_bytes = self.base + self.consumed as u64;
+        Ok(())
+    }
     fn prepare(&mut self) -> Result<(), StreamReadError> {
         let final_input = self.eof || self.stats.bytes_read == self.length.get();
-        if self.cursor.is_none() {
+        if !self.initialized {
             // Only a possible partial header delays the encoding decision.
             // Ordinary one-byte ASCII input may already produce a useful hit
             // under a tiny budget; a byte budget is never treated as EOF.
@@ -328,20 +448,27 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
                 _ => 0,
             };
             let needle: &'needle StreamingNeedle = self.needle;
-            self.cursor = Some(ByteSearchCursor::new(needle.encoded(self.encoding))?);
+            if self.lowercase.is_none() {
+                self.cursor = Some(ByteSearchCursor::new(needle.encoded(self.encoding))?);
+            }
+            self.initialized = true;
         }
         self.ready = if self.needle.mode == StreamingMode::OriginalBytes || final_input { self.filled }
             else { complete_prefix(&self.buffer[..self.filled], self.encoding.ok_or(StreamReadError::InvalidRange)?) };
-        if self.needle.mode == StreamingMode::ExactText && self.ready > 0 {
+        if self.needle.mode != StreamingMode::OriginalBytes && self.ready > 0 {
             // Only validity is consumed here; stripped in-content FEFF remains
             // in the original input searched below. No second decoder is built.
             let map = CaptureEncodingMap::build_with_base_offset(&self.buffer[..self.ready],
-                self.encoding.ok_or(StreamReadError::InvalidRange)?, self.base, 0, 0, 0)
+                self.encoding.ok_or(StreamReadError::InvalidRange)?, self.base,
+                self.lowercase.as_ref().map_or(0, |work| work.decoded_base), 0, 0)
                 .map_err(StreamReadError::Decoder)?;
             if let Some(bad) = map.spans().iter().find(|span| matches!(span.kind, SpanKind::ReplacementMalformed | SpanKind::EscapedByte)) {
                 self.unsupported_at = Some(ByteOffset::new(bad.raw_start));
-                self.hits.clear(); self.matches_seen = 0;
+                self.hits.clear(); self.witnesses.clear(); self.matches_seen = 0;
                 self.state = StreamReadState::UnsupportedText;
+            } else if let Some(work) = &mut self.lowercase {
+                work.position = 0;
+                work.window = Some(map);
             }
         }
         Ok(())
@@ -363,7 +490,7 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
         let report = StreamReadReport { needle: self.needle, request: self.request, length: self.length,
             generation: self.options.generation, encoding: self.encoding, header: self.header,
             count_all_matches: self.count_all_matches,
-            hits: self.hits, matches_seen: self.matches_seen, unsupported_at: self.unsupported_at,
+            hits: self.hits, witnesses: self.witnesses, matches_seen: self.matches_seen, unsupported_at: self.unsupported_at,
             state: self.state, stats: self.stats, _lease: self.lease };
         Ok((self.reader, report))
     }
@@ -378,6 +505,7 @@ pub struct StreamReadReport<'needle> {
     header: u64,
     count_all_matches: bool,
     hits: Vec<StreamingHit>,
+    witnesses: Vec<RetainedWitness>,
     matches_seen: u64,
     unsupported_at: Option<ByteOffset>,
     state: StreamReadState,
@@ -407,19 +535,50 @@ impl StreamReadReport<'_> {
     /// truncation. This does NOT promise native snapshot stability.
     pub fn input_complete(&self) -> bool { self.state == StreamReadState::Complete }
     /// KMP equality plus validated exact encoding establishes these exact source
-    /// bytes. Identical witnesses share the compiled literal instead of retaining
-    /// one copy per occurrence. No surrounding bytes are claimed or recreated.
+    /// bytes. Exact matches share the compiled literal; lowercase matches retain
+    /// each contributing source spelling. No surrounding bytes are claimed.
     pub fn witness_bytes(&self, ordinal: usize) -> Result<&[u8], StreamReadError> {
         let hit = self.hits.get(ordinal).ok_or(StreamReadError::InvalidRange)?;
-        let literal = self.needle.encoded(self.encoding);
-        if hit.range.len().get() != literal.len() as u64 { return Err(StreamReadError::InvalidRange); }
-        Ok(literal)
+        let bytes = if self.needle.mode == StreamingMode::LowercaseText {
+            self.witnesses.get(ordinal).ok_or(StreamReadError::InvalidRange)?.bytes.as_slice()
+        } else { self.needle.encoded(self.encoding) };
+        if hit.range.len().get() != bytes.len() as u64 { return Err(StreamReadError::InvalidRange); }
+        Ok(bytes)
+    }
+    /// The exact original spelling which contributed this occurrence. A partial
+    /// lowercase expansion still retains its complete original source scalar.
+    pub fn matched_text(&self, ordinal: usize) -> Result<&str, StreamReadError> {
+        self.hits.get(ordinal).ok_or(StreamReadError::InvalidRange)?;
+        if self.needle.mode == StreamingMode::LowercaseText {
+            Ok(&self.witnesses.get(ordinal).ok_or(StreamReadError::InvalidRange)?.text)
+        } else { self.needle.text_value().ok_or(StreamReadError::InvalidRange) }
+    }
+    pub fn retained_witness_bytes(&self) -> usize {
+        if self.needle.mode == StreamingMode::LowercaseText {
+            self.witnesses.iter().map(|witness| witness.bytes.len()).sum()
+        } else if self.hits.is_empty() { 0 } else { self.needle.encoded(self.encoding).len() }
     }
     pub fn validate_delivery(&self, file: FileId, revision: SourceRevision, generation: QueryGeneration) -> Result<(), StreamReadError> {
         if file != self.request.file() || revision != self.request.revision() { return Err(StreamReadError::InvalidRange); }
         if generation != self.generation { return Err(StreamReadError::StaleGeneration); }
         Ok(())
     }
+}
+
+fn lowercase_mode() -> SearchMode {
+    SearchMode::DecodedText { case_sensitive: false, normalization: UnicodeNormalization::Exact }
+}
+fn encode_witness(text: &str, encoding: DetectedEncoding, maximum: usize) -> Result<Vec<u8>, StreamReadError> {
+    let length = if encoding.is_utf16() { text.encode_utf16().count() * 2 } else { text.len() };
+    if length > maximum { return Err(StreamReadError::ResourceDenied); }
+    let mut bytes = reserve(length)?;
+    if encoding.is_utf16() {
+        for unit in text.encode_utf16() {
+            let pair = if encoding == DetectedEncoding::Utf16Le { unit.to_le_bytes() } else { unit.to_be_bytes() };
+            bytes.extend_from_slice(&pair);
+        }
+    } else { bytes.extend_from_slice(text.as_bytes()); }
+    Ok(bytes)
 }
 
 fn reserve<T>(capacity: usize) -> Result<Vec<T>, StreamReadError> {

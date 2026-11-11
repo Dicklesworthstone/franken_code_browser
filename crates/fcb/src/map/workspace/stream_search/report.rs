@@ -60,8 +60,6 @@ pub struct AtlasStreamFile {
     pub(super) matching_files_through: usize,
     pub(super) first_hit: usize,
     pub(super) hit_count: usize,
-    pub(super) witness_start: usize,
-    pub(super) witness_len: usize,
 }
 impl AtlasStreamFile {
     pub const fn file(&self) -> FileId { self.request.file() }
@@ -90,6 +88,10 @@ pub struct AtlasStreamHit {
     pub(super) file_record: usize,
     pub(super) occurrence_id: u64,
     pub(super) original_range: ByteRange,
+    pub(super) witness_start: usize,
+    pub(super) witness_len: usize,
+    pub(super) text_start: usize,
+    pub(super) text_len: usize,
 }
 impl AtlasStreamHit {
     pub const fn node(&self) -> AtlasNodeId { self.node }
@@ -105,10 +107,12 @@ pub struct AtlasStreamReport<'atlas, 'catalog, A: AtlasStreamSource = WorkspaceA
     pub(super) generation: QueryGeneration,
     pub(super) limits: AtlasStreamLimits,
     pub(super) count_all_matches: bool,
+    pub(super) case_sensitive: bool,
     pub(super) files: Vec<AtlasStreamFile>,
     pub(super) hits: Vec<AtlasStreamHit>,
     pub(super) matched_files: Vec<usize>,
     pub(super) witnesses: Vec<u8>,
+    pub(super) matched_text: String,
     /// None preserves the legacy whole-catalog cursor without allocating a
     /// duplicate universe. Some(empty) is an explicit empty query scope.
     pub(super) selected_ordinals: Option<Vec<usize>>,
@@ -124,6 +128,7 @@ impl<'atlas, 'catalog, A: AtlasStreamSource> AtlasStreamReport<'atlas, 'catalog,
     pub const fn generation(&self) -> QueryGeneration { self.generation }
     pub const fn limits(&self) -> AtlasStreamLimits { self.limits }
     pub const fn count_all_matches(&self) -> bool { self.count_all_matches }
+    pub const fn case_sensitive(&self) -> bool { self.case_sensitive }
     /// Row retention and scan completeness are independent in counting mode.
     pub fn hits_truncated(&self) -> bool { self.stats.matches_seen > self.hits.len() as u64 }
     /// Finalized files with at least one observed occurrence, even when none of
@@ -145,6 +150,7 @@ impl<'atlas, 'catalog, A: AtlasStreamSource> AtlasStreamReport<'atlas, 'catalog,
     /// Includes an active file whose final result has not yet been accepted.
     pub fn unexamined_files(&self) -> usize { self.eligible_files() - self.files.len() }
     pub fn retained_witness_bytes(&self) -> usize { self.witnesses.len() }
+    pub fn retained_matched_text_bytes(&self) -> usize { self.matched_text.len() }
     pub fn reserved_bytes(&self) -> u64 { self._lease.info().bytes().get() }
     pub fn is_complete(&self) -> bool {
         self.state == AtlasStreamState::Finished && self.stop.is_none()
@@ -165,12 +171,15 @@ impl<'atlas, 'catalog, A: AtlasStreamSource> AtlasStreamReport<'atlas, 'catalog,
         self.validate_delivery(atlas, generation)?;
         let hit = self.hits.get(position).ok_or(AtlasStreamError::InvalidHit)?;
         let file = self.files.get(hit.file_record).ok_or(AtlasStreamError::InvalidHit)?;
-        let bytes = self.witnesses.get(file.witness_start..file.witness_start + file.witness_len)
+        let bytes = self.witnesses.get(hit.witness_start..hit.witness_start + hit.witness_len)
             .ok_or(AtlasStreamError::InvalidHit)?;
         if hit.request != file.request || hit.original_range.len().get() != bytes.len() as u64 {
             return Err(AtlasStreamError::InvalidHit);
         }
-        Ok(AtlasStreamSelection { hit, file, original_bytes: bytes, text: &self.literal })
+        let text = if self.case_sensitive { self.literal.as_str() } else {
+            self.matched_text.get(hit.text_start..hit.text_start + hit.text_len).ok_or(AtlasStreamError::InvalidHit)?
+        };
+        Ok(AtlasStreamSelection { hit, file, original_bytes: bytes, text })
     }
     /// Preserve ONLY the selected literal in the existing exact extent reader.
     /// The native consistency remains on this report; extent backing is the

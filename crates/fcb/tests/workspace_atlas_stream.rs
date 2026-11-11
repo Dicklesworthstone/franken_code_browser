@@ -659,3 +659,69 @@ fn pending_report_prefix_survives_a_later_files_malformed_text_without_exposing_
     assert_eq!(report.select_hit(0, &atlas, generation(1)).unwrap().original_bytes(), witness);
     assert!(!report.is_complete());
 }
+
+#[test]
+fn lowercase_workspace_counts_beyond_retention_and_preserves_each_original_witness() {
+    let root = Fixture::new();
+    root.write("a.rs", "KK".as_bytes());
+    let utf16: Vec<u8> = "\u{feff}kK".encode_utf16().flat_map(u16::to_be_bytes).collect();
+    root.write("b.rs", &utf16);
+    root.write("c.txt", b"KKK");
+    let budget = budget(); let catalog = root.catalog(&budget, 10); let atlas = atlas(&catalog, &budget, 2);
+    for retained in [0, 1, 4] {
+        let needle = StreamingNeedle::text_matching(owner(), "k", false, &budget, allocation(10)).unwrap();
+        let mut job = AtlasStreamSearch::new_scoped_counting(&atlas, &needle, revision(100), generation(1),
+            AtlasStreamLimits { max_matches: retained, ..Default::default() }, &[0, 1],
+            &budget, [allocation(11), allocation(12)]).unwrap();
+        let mut opened = Vec::new();
+        while job.state() == AtlasStreamState::Pending {
+            job.step(StreamReadStep { max_bytes: 1, max_calls: 1, max_hits: 1 }, generation(1), |_, path| {
+                opened.push(path.raw().as_bytes().to_vec());
+                File::open(root.0.join(path.raw().to_path_buf())).map_err(|_| SourceError::CaptureUnavailable)
+            }, || false).unwrap();
+        }
+        let report = job.finish().unwrap();
+        drop(needle);
+        assert!(report.is_complete());
+        assert!(!report.case_sensitive());
+        assert_eq!(opened, [b"a.rs".to_vec(), b"b.rs".to_vec()]);
+        assert_eq!(report.stats().bytes_read, 10);
+        assert_eq!(report.stats().matches_seen, 4);
+        assert_eq!(report.matching_files_seen(), 2);
+        assert_eq!(report.hits().len(), retained);
+        assert_eq!(report.eligible_files(), 2);
+        assert_eq!(report.excluded_files(), 1);
+        assert_eq!(report.hits_truncated(), retained < 4);
+        let expected: [(&str, &[u8]); 4] = [("K", "K".as_bytes()), ("K", b"K"), ("k", &[0, 0x6b]), ("K", &[0x21, 0x2a])];
+        for (position, &(text, bytes)) in expected.iter().take(retained).enumerate() {
+            let hit = report.select_hit(position, &atlas, generation(1)).unwrap();
+            assert_eq!(hit.matched_text(), text);
+            assert_eq!(hit.original_bytes(), bytes);
+        }
+        assert_eq!(report.retained_witness_bytes(), expected.iter().take(retained).map(|(_, bytes)| bytes.len()).sum::<usize>());
+    }
+}
+
+#[test]
+fn lowercase_workspace_witnesses_survive_mutation_and_partial_files_do_not_count_as_negatives() {
+    let root = Fixture::new();
+    root.write("a.rs", "K K".as_bytes());
+    root.write("b.rs", b"K\xff");
+    let budget = budget(); let catalog = root.catalog(&budget, 10); let atlas = atlas(&catalog, &budget, 2);
+    let needle = StreamingNeedle::text_matching(owner(), "k", false, &budget, allocation(10)).unwrap();
+    let mut job = AtlasStreamSearch::new_counting(&atlas, &needle, revision(100), generation(1),
+        AtlasStreamLimits::default(), &budget, [allocation(11), allocation(12)]).unwrap();
+    while job.state() == AtlasStreamState::Pending {
+        job.step(StreamReadStep::default(), generation(1), |_, path|
+            File::open(root.0.join(path.raw().to_path_buf())).map_err(|_| SourceError::CaptureUnavailable), || false).unwrap();
+    }
+    let report = job.finish().unwrap();
+    assert!(!report.is_complete());
+    assert_eq!(report.stats().matches_seen, 2);
+    assert_eq!(report.stats().incomplete_files, 1);
+    assert_eq!(report.files()[1].state(), AtlasStreamFileState::Scanned(StreamReadState::UnsupportedText));
+    root.write("a.rs", b"replacement");
+    assert_eq!(report.select_hit(0, &atlas, generation(1)).unwrap().original_bytes(), "K".as_bytes());
+    assert_eq!(report.select_hit(1, &atlas, generation(1)).unwrap().original_bytes(), b"K");
+    assert_eq!(report.retained_witness_bytes(), 4);
+}

@@ -11,7 +11,7 @@ use crate::{QueryError, SearchMode, UnicodeNormalization, canonical_decompose_ch
 /// One original scalar. Expansions may contribute several matching units with
 /// this same provenance; their occurrence identities must remain distinct.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct SourceScalar {
+pub struct SourceScalar {
     pub ch: char,
     pub raw_start: u64,
     pub raw_end: u64,
@@ -20,7 +20,7 @@ pub(super) struct SourceScalar {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Occurrence {
+pub struct Occurrence {
     pub raw_start: u64,
     pub raw_end: u64,
     pub decoded_start: u64,
@@ -70,7 +70,7 @@ impl Transform {
 
 /// An allocation-free scalar transform. Using ToLowercase directly avoids
 /// assuming a fixed maximum expansion length for future toolchain tables.
-pub(super) enum Units {
+pub enum Units {
     Single(Option<char>),
     Expansion(&'static [char]),
     Lower(std::char::ToLowercase),
@@ -97,7 +97,7 @@ impl Iterator for Units {
 /// occupies at most four UTF-8 bytes. Partial expansions still contribute the
 /// complete source scalar, so query byte length alone is not a sound bound.
 /// This depends only on the declared query, never on the largest source file.
-pub(crate) fn matched_text_capacity(query: &str, mode: SearchMode) -> Result<usize, QueryError> {
+pub fn matched_text_capacity(query: &str, mode: SearchMode) -> Result<usize, QueryError> {
     crate::validate_needle(query.as_bytes())?;
     let Some(transform) = Transform::for_mode(mode) else { return Ok(query.len()); };
     let mut units = 0usize;
@@ -112,7 +112,10 @@ pub(crate) fn matched_text_capacity(query: &str, mode: SearchMode) -> Result<usi
 
 /// KMP over transformed scalar units. The failure table and source ring are
 /// O(transformed needle length); no source-sized normalized string is built.
-pub(super) struct NormalizedCursor {
+/// Callers supply monotonically ordered, validated decoder provenance. Units
+/// from one scalar must be pushed in order before advancing to the next scalar;
+/// occurrence IDs and work/retention budgets remain the caller's responsibility.
+pub struct NormalizedCursor {
     transform: Transform,
     needle: Vec<char>,
     failure: Vec<usize>,

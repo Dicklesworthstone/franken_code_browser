@@ -16,7 +16,7 @@ pub use report::{AtlasStreamFile, AtlasStreamFileState, AtlasStreamHit,
 use std::{fs::File, marker::PhantomData, mem::size_of};
 use fcb_core::{ByteLength, QueryGeneration, ResourceAllocationId, ResourceBudget, SourceRevision};
 use crate::search::{CaptureRequest, FileSearch, FileSearchError, FileSearchReport,
-    StreamReadError, StreamReadOptions, StreamReadState, StreamReadStats, StreamReadStep, StreamingNeedle};
+    StreamReadError, StreamReadOptions, StreamReadState, StreamReadStats, StreamReadStep, StreamingMode, StreamingNeedle};
 use crate::source::{SourceError, path::NormalizedPath};
 use super::{WorkspaceAtlas, WorkspaceAtlasError};
 
@@ -91,7 +91,8 @@ pub struct AtlasStreamSearch<'atlas, 'catalog, 'worker, A: AtlasStreamSource = W
 }
 impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 'catalog, 'worker, A> {
     /// Allocations: [compact retained report, one reusable file-search worker].
-    /// Build the StreamingNeedle separately; only exact text is admitted here.
+    /// Build the StreamingNeedle separately; exact and Unicode lowercase text
+    /// share the same bounded reader and original-byte witness contract.
     /// UTF-8 and BOM-marked UTF-16 reuse the shared engine's encoding contract.
     /// Both borrowed and retained atlases reuse their existing catalog/layout.
     /// A filtered display layout is not a whole-catalog search authority.
@@ -155,14 +156,18 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
         let projection_bytes = ordinals.map_or(0, <[usize]>::len).checked_mul(size_of::<usize>())
             .ok_or(AtlasStreamError::InvalidLimits)?;
         let witness_files = count.min(limits.max_matches);
-        // UTF-16 needs at most twice the UTF-8 literal's byte length. Store one
-        // encoded witness per matched file, not a decoder lease for every file.
-        let witness_bytes = witness_files.checked_mul(text.len()).and_then(|n| n.checked_mul(2))
+        let case_sensitive = needle.mode() == StreamingMode::ExactText;
+        // Exact hits share one encoded literal per file. Lowercase hits retain
+        // their own spelling and byte witness, bounded by transformed query size.
+        let witness_count = if case_sensitive { witness_files } else { limits.max_matches };
+        let witness_bytes = witness_count.checked_mul(needle.max_witness_bytes())
             .ok_or(AtlasStreamError::InvalidLimits)?;
+        let text_bytes = if case_sensitive { 0 } else { witness_bytes };
         let charge = count.checked_mul(size_of::<AtlasStreamFile>())
             .and_then(|n| limits.max_matches.checked_mul(size_of::<AtlasStreamHit>()).and_then(|h| n.checked_add(h)))
             .and_then(|n| witness_files.checked_mul(size_of::<usize>()).and_then(|h| n.checked_add(h)))
             .and_then(|n| n.checked_add(witness_bytes))
+            .and_then(|n| n.checked_add(text_bytes))
             .and_then(|n| n.checked_add(projection_bytes))
             .and_then(|n| n.checked_add(text.len() + size_of::<Self>() + size_of::<AtlasStreamReport<'_, '_, A>>()))
             .ok_or(AtlasStreamError::InvalidLimits)?;
@@ -172,14 +177,17 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
         literal.try_reserve_exact(text.len()).map_err(|_| AtlasStreamError::AllocationFailed)?;
         if literal.capacity() > text.len() { return Err(AtlasStreamError::ResourceDenied); }
         literal.push_str(text);
+        let mut matched_text = String::new();
+        matched_text.try_reserve_exact(text_bytes).map_err(|_| AtlasStreamError::AllocationFailed)?;
+        if matched_text.capacity() > text_bytes { return Err(AtlasStreamError::ResourceDenied); }
         let selected_ordinals = ordinals.map(|values| {
             let mut selected = reserve(values.len())?;
             selected.extend_from_slice(values);
             Ok::<_, AtlasStreamError>(selected)
         }).transpose()?;
-        let report = AtlasStreamReport { atlas, generation, limits, count_all_matches, files: reserve(count)?,
+        let report = AtlasStreamReport { atlas, generation, limits, count_all_matches, case_sensitive, files: reserve(count)?,
             hits: reserve(limits.max_matches)?, matched_files: reserve(witness_files)?,
-            witnesses: reserve(witness_bytes)?, selected_ordinals, literal, stats: AtlasStreamStats::default(),
+            witnesses: reserve(witness_bytes)?, matched_text, selected_ordinals, literal, stats: AtlasStreamStats::default(),
             state: if count == 0 { AtlasStreamState::Finished } else { AtlasStreamState::Pending },
             stop: None, _lease: lease, _catalog: PhantomData };
         Ok(Self { report, needle, budget, worker_allocation: allocations[1], first_revision, active: None })
@@ -309,8 +317,7 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
             state: AtlasStreamFileState::Unavailable(error), encoding: None, observed_length: None,
             final_length: None, consistency: None, unsupported_at: None, stats,
             matches_seen: 0, matches_through: self.report.stats.matches_seen, matching_files_through,
-            first_hit: self.report.hits.len(), hit_count: 0,
-            witness_start: self.report.witnesses.len(), witness_len: 0 });
+            first_hit: self.report.hits.len(), hit_count: 0 });
         self.report.stats.incomplete_files += 1;
         Ok(())
     }
@@ -323,26 +330,36 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
         let matching_files_through = self.report.matching_files_seen().checked_add(usize::from(scan.matches_seen() > 0))
             .ok_or(AtlasStreamError::InvalidLimits)?;
         let node = self.report.atlas.node_for_file(scan.request().file())?;
-        let witness_start = self.report.witnesses.len();
-        let bytes = if count > 0 { scan.witness_bytes(0).map_err(FileSearchError::from)? } else { &[] };
-        if bytes.len() > self.report.witnesses.capacity() - witness_start { return Err(AtlasStreamError::ResourceDenied); }
+        let file_witness_start = self.report.witnesses.len();
         let file_record = self.report.files.len();
         let first_hit = self.report.hits.len();
-        for hit in scan.hits() {
+        for (ordinal, hit) in scan.hits().iter().enumerate() {
+            let bytes = scan.witness_bytes(ordinal).map_err(FileSearchError::from)?;
+            let text = scan.matched_text(ordinal).map_err(FileSearchError::from)?;
             if hit.original_range().len().get() != bytes.len() as u64 { return Err(AtlasStreamError::InvalidHit); }
+            let witness_start = if self.report.case_sensitive { file_witness_start } else { self.report.witnesses.len() };
+            if ordinal == 0 || !self.report.case_sensitive {
+                if bytes.len() > self.report.witnesses.capacity() - self.report.witnesses.len() {
+                    return Err(AtlasStreamError::ResourceDenied);
+                }
+                self.report.witnesses.extend_from_slice(bytes);
+            }
+            let text_start = self.report.matched_text.len();
+            if !self.report.case_sensitive {
+                if text.len() > self.report.matched_text.capacity() - text_start { return Err(AtlasStreamError::ResourceDenied); }
+                self.report.matched_text.push_str(text);
+            }
             self.report.hits.push(AtlasStreamHit { node, request: scan.request(), file_record,
-                occurrence_id: hit.occurrence_id(), original_range: hit.original_range() });
+                occurrence_id: hit.occurrence_id(), original_range: hit.original_range(),
+                witness_start, witness_len: bytes.len(), text_start, text_len: text.len() });
         }
-        if count > 0 {
-            self.report.witnesses.extend_from_slice(bytes);
-            self.report.matched_files.push(file_record);
-        }
+        if count > 0 { self.report.matched_files.push(file_record); }
         self.report.files.push(AtlasStreamFile { request: scan.request(), node,
             state: AtlasStreamFileState::Scanned(scan.state()), encoding: scan.encoding(),
             observed_length: Some(scan.observed_length()), final_length: file_report.final_length(),
             consistency: Some(file_report.consistency()), unsupported_at: scan.unsupported_at(), stats: scan.stats(),
             matches_seen: scan.matches_seen(), matches_through, matching_files_through,
-            first_hit, hit_count: count, witness_start, witness_len: bytes.len() });
+            first_hit, hit_count: count });
         self.report.stats.matches_seen = matches_through;
         if !file_report.is_complete() { self.report.stats.incomplete_files += 1; }
         Ok(())

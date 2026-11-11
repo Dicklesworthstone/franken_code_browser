@@ -9,7 +9,7 @@
 //! a newly qualified complete Unicode normalization implementation.
 
 mod capture;
-mod normalized;
+pub mod normalized;
 pub mod index;
 pub mod indexed_query;
 pub mod oracle;
