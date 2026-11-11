@@ -5,7 +5,7 @@
 //! cached relayout, reliable All restoration and workspace-wide search lanes.
 
 use std::{fs, path::PathBuf, sync::atomic::{AtomicU64, Ordering}};
-use fcb::ArenaOwnerId;
+use fcb::{ArenaOwnerId, Point2D};
 use fcb_app::EXIT_OK;
 use fcb_app::host::atlas_session::{AtlasAction, AtlasExtensionScope, AtlasScope, AtlasSession,
     AtlasSessionError, AtlasSessionOptions};
@@ -19,7 +19,11 @@ impl Fixture {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
             NEXT.fetch_add(1, Ordering::Relaxed)));
         fs::create_dir_all(&root).unwrap();
-        for (name, bytes) in files { fs::write(root.join(name), bytes).unwrap(); }
+        for (name, bytes) in files {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
         Self(root)
     }
     fn open(&self) -> AtlasSession {
@@ -242,4 +246,110 @@ fn same_scope_reapplication_is_a_cache_hit_not_a_repack() {
     // Re-applying the ACTIVE scope performs no relayout: same revision.
     let again = atlas.prepare(2, AtlasAction::Scope(rust_scope()), || false).unwrap();
     assert_eq!(field(again.as_str(), "layout_revision"), revision);
+}
+
+
+/// Keep both navigation directions and an unpresented candidate alive before
+/// attempting another scope. The visible file exists in both starting scopes.
+fn ready_scope(fixture: &Fixture, scope: AtlasScope) -> (AtlasSession, Point2D) {
+    let mut atlas = fixture.open();
+    atlas.prepare(1, AtlasAction::Scope(scope), || false).unwrap();
+    let a = atlas.view().index().unwrap().find_path(b"src/a.rs").unwrap().ordinal();
+    let b = atlas.view().index().unwrap().find_path(b"src/deep/main.rs").unwrap().ordinal();
+    atlas.prepare(2, AtlasAction::Focus(a), || false).unwrap();
+    atlas.prepare(3, AtlasAction::Focus(b), || false).unwrap();
+    atlas.prepare(4, AtlasAction::Back, || false).unwrap();
+    let rect = atlas.pending_plan().unwrap().parcels()[0].logical_rect();
+    let at = Point2D::new(rect.min_x() + rect.size().width() / 2.0,
+        rect.min_y() + rect.size().height() / 2.0).unwrap();
+    atlas.acknowledge(4, 1, 1, || false).unwrap();
+    atlas.prepare(5, AtlasAction::View, || false).unwrap();
+    (atlas, at)
+}
+
+#[test]
+fn cancellation_at_every_scope_checkpoint_preserves_navigation_and_presented_source() {
+    let fixture = fixture();
+    // Fresh construction, the cached All layout, and replacing the single
+    // alternative cache all obey the same publication boundary.
+    for (start, target) in [
+        (AtlasScope::All, rust_scope()),
+        (rust_scope(), AtlasScope::All),
+        (rust_scope(), custom_scope(&["md"])),
+    ] {
+        let (mut probe, _) = ready_scope(&fixture, start);
+        let mut checkpoints = 0;
+        probe.prepare(6, AtlasAction::Scope(target), || {
+            checkpoints += 1;
+            false
+        }).unwrap();
+        assert!(checkpoints >= 3);
+        drop(probe);
+        for cancel_at in 1..=checkpoints {
+            let (mut atlas, at) = ready_scope(&fixture, start);
+            let old_layout = atlas.view().layout().nodes().as_ptr();
+            let old_camera = atlas.pending_plan().unwrap().camera();
+            let old_focus = atlas.pending_plan().unwrap().focus();
+            let before = atlas.info(|| false).unwrap();
+            let old_pick = atlas.pick(1, 1, at, || false).unwrap();
+            let mut polls = 0;
+            let failed = atlas.prepare(6, AtlasAction::Scope(target), || {
+                polls += 1;
+                polls >= cancel_at
+            });
+            assert!(failed.is_err(), "checkpoint {cancel_at} of {checkpoints}");
+            assert!(polls >= cancel_at);
+            assert_eq!(*atlas.scope(), start);
+            assert_eq!(atlas.view().layout().nodes().as_ptr(), old_layout);
+            assert_eq!(atlas.pending_plan().unwrap().generation().get(), 5);
+            assert_eq!(atlas.pending_plan().unwrap().camera(), old_camera);
+            assert_eq!(atlas.pending_plan().unwrap().focus(), old_focus);
+            assert_eq!(atlas.presented_plan().unwrap().generation().get(), 4);
+            assert_eq!(atlas.pick(1, 1, at, || false).unwrap().as_str(), old_pick.as_str());
+            let after = atlas.info(|| false).unwrap();
+            for key in ["layout_revision", "history_depth", "forward_history_depth"] {
+                assert_eq!(field(after.as_str(), key), field(before.as_str(), key), "{key}");
+            }
+            assert!(matches!(atlas.prepare(6, AtlasAction::View, || false),
+                Err(AtlasSessionError::StaleGeneration)));
+            // A failed scope change cannot discard either endpoint stack.
+            atlas.prepare(7, AtlasAction::Forward, || false).unwrap();
+            atlas.prepare(8, AtlasAction::Back, || false).unwrap();
+            assert_eq!(atlas.pending_plan().unwrap().focus(), old_focus);
+            assert_eq!(atlas.pending_plan().unwrap().camera().origin(), old_camera.origin());
+        }
+    }
+}
+
+#[test]
+fn displayed_scope_keeps_its_file_bindings_when_the_alternative_cache_is_replaced() {
+    let fixture = fixture();
+    let (mut atlas, at) = ready_scope(&fixture, rust_scope());
+    let before = atlas.pick(1, 1, at, || false).unwrap();
+    let displayed_revision = field(before.as_str(), "layout_revision");
+    assert!(before.as_str().contains("src/a.rs"));
+
+    atlas.prepare(6, AtlasAction::Scope(custom_scope(&["md"])), || false).unwrap();
+    atlas.prepare(7, AtlasAction::Scope(custom_scope(&["toml"])), || false).unwrap();
+    assert_ne!(atlas.view().layout().revision().get().to_string(), displayed_revision);
+    assert_eq!(atlas.pick(1, 1, at, || false).unwrap().as_str(), before.as_str());
+
+    let (reader, receipt) = atlas.open_reader(owner(29602), 1, 1, at, 1024, || false).unwrap();
+    assert_eq!(reader.capture().bytes(), b"needle a\n");
+    assert_eq!(field(receipt.as_str(), "layout_revision"), displayed_revision);
+    assert!(receipt.as_str().contains("\"extensions\":[\"rs\"]"));
+    assert!(receipt.as_str().contains("src/a.rs"));
+    // Opening a displayed file that is absent from the prepared scope must
+    // not assign that old ordinal to an unrelated file in the new layout.
+    assert!(atlas.info(|| false).unwrap().as_str().contains("\"selection\":null"));
+
+    let acknowledged = atlas.acknowledge(4, 2, 1, || false).unwrap();
+    assert_eq!(field(acknowledged.as_str(), "layout_revision"), displayed_revision);
+    assert!(acknowledged.as_str().contains("\"extensions\":[\"rs\"]"));
+    assert_eq!(atlas.pending_plan().unwrap().generation().get(), 7);
+    assert!(atlas.pick(2, 1, at, || false).unwrap().as_str().contains("src/a.rs"));
+
+    atlas.acknowledge(7, 3, 1, || false).unwrap();
+    assert!(matches!(atlas.pick(2, 1, at, || false), Err(AtlasSessionError::StaleFrame)));
+    assert_eq!(atlas.presented_plan().unwrap().generation().get(), 7);
 }

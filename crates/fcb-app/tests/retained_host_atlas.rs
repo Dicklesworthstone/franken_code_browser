@@ -3,9 +3,9 @@
 
 use std::{fs, path::PathBuf, sync::atomic::{AtomicU64, Ordering}};
 use fcb::{ArenaOwnerId, Point2D};
-use fcb::map::{AtlasError, VisibleLimits};
+use fcb::map::{AtlasError, AtlasNodeId, Camera2D, VisibleLimits};
 use fcb_app::{EXIT_OK, EXIT_PARTIAL};
-use fcb_app::host::atlas_session::{AtlasAction, AtlasSession, AtlasSessionError, AtlasSessionOptions};
+use fcb_app::host::atlas_session::{AtlasAction, AtlasSession, AtlasSessionError, AtlasSessionOptions, MAX_ATLAS_HISTORY};
 
 struct Fixture(PathBuf);
 impl Fixture {
@@ -209,4 +209,95 @@ fn cancellation_and_root_refusal_do_not_construct_usable_sessions() {
     assert!(AtlasSession::open(owner, std::path::Path::new(""), Default::default(), || false).is_err());
     let link = fixture.0.join("link"); std::os::unix::fs::symlink(fixture.0.join("src"), &link).unwrap();
     assert!(matches!(AtlasSession::open(owner, &link, Default::default(), || false), Err(AtlasSessionError::App(fcb_app::AppError::Symlink))));
+}
+
+
+fn assert_position(session: &AtlasSession, expected: (AtlasNodeId, Camera2D)) {
+    let plan = session.pending_plan().unwrap();
+    assert_eq!(plan.focus(), expected.0);
+    assert_eq!(plan.camera().origin(), expected.1.origin());
+    assert_eq!(plan.camera().points_per_unit(), expected.1.points_per_unit());
+    assert_eq!(plan.camera().display(), expected.1.display());
+}
+
+#[test]
+fn navigation_keeps_working_after_history_capacity_and_replays_recent_endpoints() {
+    let fixture = Fixture::new(); let mut session = fixture.open();
+    let a = session.view().index().unwrap().find_path(b"src/a.rs").unwrap().ordinal();
+    let b = session.view().index().unwrap().find_path(b"src/b.rs").unwrap().ordinal();
+    let layout = session.view().layout().nodes().as_ptr();
+    let mut generation = 1;
+    session.prepare(generation, AtlasAction::View, || false).unwrap();
+    let mut departed = Vec::new();
+    for step in 0..(MAX_ATLAS_HISTORY * 3 + 5) {
+        // Distinct transforms make eviction and endpoint order observable,
+        // even though this journey alternates between the same two files.
+        generation += 1;
+        session.prepare(generation, AtlasAction::Pan(point(step as f64 * 0.125 + 1.0, 2.0)), || false).unwrap();
+        let plan = session.pending_plan().unwrap();
+        departed.push((plan.focus(), plan.camera()));
+        generation += 1;
+        session.prepare(generation, AtlasAction::Focus(if step % 2 == 0 { a } else { b }), || false).unwrap();
+    }
+    assert_eq!(session.view().layout().nodes().as_ptr(), layout);
+    let plan = session.pending_plan().unwrap();
+    let latest = (plan.focus(), plan.camera());
+    let history_depth = format!("\"history_depth\":\"{MAX_ATLAS_HISTORY}\"");
+    assert!(session.info(|| false).unwrap().as_str().contains(&history_depth));
+
+    let mut restored = Vec::new();
+    for &expected in departed.iter().rev().take(MAX_ATLAS_HISTORY) {
+        generation += 1;
+        session.prepare(generation, AtlasAction::Back, || false).unwrap();
+        assert_position(&session, expected);
+        assert_eq!(session.pending_plan().unwrap().camera().generation().get(), generation + 1);
+        restored.push(expected);
+    }
+    generation += 1;
+    assert!(matches!(session.prepare(generation, AtlasAction::Back, || false),
+        Err(AtlasSessionError::EmptyHistory)));
+    for &expected in restored.iter().rev().skip(1).chain(std::iter::once(&latest)) {
+        generation += 1;
+        session.prepare(generation, AtlasAction::Forward, || false).unwrap();
+        assert_position(&session, expected);
+    }
+    generation += 1;
+    assert!(matches!(session.prepare(generation, AtlasAction::Forward, || false),
+        Err(AtlasSessionError::EmptyHistory)));
+    let info = session.info(|| false).unwrap();
+    assert!(info.as_str().contains(&history_depth));
+    assert!(info.as_str().contains("\"forward_history_depth\":\"0\""));
+}
+
+#[test]
+fn refocus_after_pan_is_reversible_and_forward_adapts_to_current_display() {
+    let fixture = Fixture::new(); let mut session = fixture.open();
+    focus(&mut session, 1, b"src/a.rs");
+    let fitted = session.pending_plan().unwrap().camera();
+    let a = session.pending_plan().unwrap().focus();
+    session.prepare(2, AtlasAction::Pan(point(25.0, 50.0)), || false).unwrap();
+    let panned = session.pending_plan().unwrap().camera();
+    session.prepare(3, AtlasAction::Focus(a.ordinal()), || false).unwrap();
+    assert_ne!(panned.origin(), fitted.origin());
+    assert!(session.info(|| false).unwrap().as_str().contains("\"history_depth\":\"2\""));
+
+    session.prepare(4, AtlasAction::Back, || false).unwrap();
+    assert_position(&session, (a, panned));
+    let pending = session.pending_plan().unwrap().camera();
+    assert!(matches!(session.prepare(5, AtlasAction::Forward, || true),
+        Err(AtlasSessionError::Canceled)));
+    assert_eq!(session.pending_plan().unwrap().camera(), pending);
+    assert!(session.info(|| false).unwrap().as_str().contains("\"forward_history_depth\":\"1\""));
+
+    session.prepare(6, AtlasAction::Resize { width: 800.0, height: 600.0, scale: 2.0 }, || false).unwrap();
+    let display = session.pending_plan().unwrap().camera().display();
+    session.prepare(7, AtlasAction::Forward, || false).unwrap();
+    assert_position(&session, (a, fitted.with_display(display).unwrap()));
+    session.prepare(8, AtlasAction::Back, || false).unwrap();
+    assert_position(&session, (a, panned.with_display(display).unwrap()));
+
+    focus(&mut session, 9, b"src/b.rs");
+    assert!(session.info(|| false).unwrap().as_str().contains("\"forward_history_depth\":\"0\""));
+    assert!(matches!(session.prepare(10, AtlasAction::Forward, || false),
+        Err(AtlasSessionError::EmptyHistory)));
 }

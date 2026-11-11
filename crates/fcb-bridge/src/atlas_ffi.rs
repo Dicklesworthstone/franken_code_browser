@@ -65,6 +65,11 @@ pub extern "C" fn fcb_atlas_back(handle: u64, generation: u64) -> *mut c_char {
         Command::Prepare { generation, action: AtlasAction::Back }, || false)))
 }
 #[unsafe(no_mangle)]
+pub extern "C" fn fcb_atlas_forward(handle: u64, generation: u64) -> *mut c_char {
+    reply(|| answer(handle, |atlases| atlases.execute(handle,
+        Command::Prepare { generation, action: AtlasAction::Forward }, || false)))
+}
+#[unsafe(no_mangle)]
 pub extern "C" fn fcb_atlas_resize(handle: u64, generation: u64, width: f64, height: f64, scale: f64) -> *mut c_char {
     reply(|| answer(handle, |atlases| atlases.execute(handle,
         Command::Prepare { generation, action: AtlasAction::Resize { width, height, scale } }, || false)))

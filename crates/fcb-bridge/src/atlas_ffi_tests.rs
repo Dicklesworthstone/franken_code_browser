@@ -97,6 +97,7 @@ fn c_atlas_scope_filters_display_and_labels_responses() {
     assert!(take(unsafe { fcb_atlas_scope(a, 1, empty.as_ptr(), blank.as_ptr()) })
         .contains("ATLAS_HANDLE_INVALID_ARGUMENT"));
 
+    let original = take(fcb_atlas_info(a));
     let rust = CString::new("rust").unwrap();
     let scoped = take(unsafe { fcb_atlas_scope(a, 2, rust.as_ptr(), std::ptr::null()) });
     assert!(scoped.contains("\"catalogued_files\":\"1\""), "{scoped}");
@@ -104,7 +105,6 @@ fn c_atlas_scope_filters_display_and_labels_responses() {
     assert!(scoped.contains("\"workspace_files\":\"2\""));
     // Restoring All reuses the retained original layout revision, while the
     // scoped plan reported a fresh, distinct revision.
-    let original = take(fcb_atlas_info(a));
     let all = CString::new("all").unwrap();
     let restored = take(unsafe { fcb_atlas_scope(a, 3, all.as_ptr(), std::ptr::null()) });
     assert!(restored.contains("\"catalogued_files\":\"2\""));
@@ -132,6 +132,7 @@ fn c_atlas_function_types_match_header() {
     let _: extern "C" fn(u64, u64, f64, f64, f64) -> *mut c_char = fcb_atlas_zoom;
     let _: extern "C" fn(u64, u64, u64) -> *mut c_char = fcb_atlas_focus;
     let _: extern "C" fn(u64, u64) -> *mut c_char = fcb_atlas_back;
+    let _: extern "C" fn(u64, u64) -> *mut c_char = fcb_atlas_forward;
     let _: extern "C" fn(u64, u64, f64, f64, f64) -> *mut c_char = fcb_atlas_resize;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_atlas_present;
     let _: extern "C" fn(u64, u64, u64, f64, f64) -> *mut c_char = fcb_atlas_pick;
@@ -140,4 +141,36 @@ fn c_atlas_function_types_match_header() {
     let _: extern "C" fn(u64, u64, u64, u64, f64, f64, u64) -> *mut c_char = fcb_atlas_open_reader;
     let _: extern "C" fn(u64) -> u8 = fcb_atlas_cancel;
     let _: extern "C" fn(u64) -> u8 = fcb_atlas_close;
+}
+
+
+#[test]
+fn c_atlas_back_and_forward_restore_camera_endpoints_and_refocus_branches_history() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new(); let a = fixture.open();
+    let original = take(fcb_atlas_view(a, 1));
+    let focus = original.find("\"focus\":{\"ordinal\":").unwrap() + "\"focus\":{\"ordinal\":".len();
+    let root = original[focus..].split('"').nth(1).unwrap().parse::<u64>().unwrap();
+    let geometry = |text: &str| {
+        ["origin_x", "origin_y", "points_per_unit"].map(|key| {
+            let prefix = format!("\"{key}\":");
+            let start = text.find(&prefix).unwrap() + prefix.len();
+            text[start..].split(',').next().unwrap().to_string()
+        })
+    };
+    let panned = take(fcb_atlas_pan(a, 2, 25.0, 50.0));
+    assert_ne!(geometry(&original), geometry(&panned));
+    let focused = take(fcb_atlas_focus(a, 3, root));
+    assert_eq!(geometry(&focused), geometry(&original));
+    let back = take(fcb_atlas_back(a, 4));
+    assert_eq!(geometry(&back), geometry(&panned));
+    assert!(take(fcb_atlas_info(a)).contains("\"forward_history_depth\":\"1\""));
+    let forward = take(fcb_atlas_forward(a, 5));
+    assert_eq!(geometry(&forward), geometry(&original));
+    assert!(forward.contains("\"plan_generation\":\"5\""));
+
+    take(fcb_atlas_back(a, 6));
+    take(fcb_atlas_focus(a, 7, root));
+    assert!(take(fcb_atlas_forward(a, 8)).contains("ATLAS_SESSION_EMPTY_HISTORY"));
+    assert_eq!(fcb_atlas_close(a), 1);
 }

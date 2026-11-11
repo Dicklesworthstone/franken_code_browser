@@ -34,7 +34,10 @@ char *fcb_atlas_info(uint64_t handle);
 /* Plan generations strictly increase across accepted or failed admitted
  * attempts. A returned plan is a CANDIDATE, not acknowledgment of native pixels.
  * Coordinates/deltas are logical viewport points. Focus uses a layout ordinal
- * from this session's plan/tree. Back restores a bounded focus/camera history.
+ * from this session's plan/tree. Back/Forward restore recent focus/camera
+ * endpoints, adapting to the current display. Each history direction keeps at
+ * most 64 entries and evicts the oldest instead of blocking further focus.
+ * A new focus clears forward history; info reports both history depths.
  * Pan/zoom do not append history, rediscover files or repack geometry.
  */
 char *fcb_atlas_view(uint64_t handle, uint64_t generation);
@@ -42,12 +45,14 @@ char *fcb_atlas_pan(uint64_t handle, uint64_t generation, double dx, double dy);
 char *fcb_atlas_zoom(uint64_t handle, uint64_t generation, double x, double y, double factor);
 char *fcb_atlas_focus(uint64_t handle, uint64_t generation, uint64_t node);
 char *fcb_atlas_back(uint64_t handle, uint64_t generation);
+char *fcb_atlas_forward(uint64_t handle, uint64_t generation);
 char *fcb_atlas_resize(uint64_t handle, uint64_t generation, double width, double height, double scale);
 
 /* Call only when the host conservatively knows this plan was displayed. Frame
  * IDs strictly increase; display is the generation of the actual host surface.
  * This is a HOST DECLARATION, not OS/GPU observation by the bridge. Preparing a
- * newer candidate never replaces old picking geometry before acknowledgment.
+ * newer candidate never replaces old picking geometry or source bindings
+ * before acknowledgment, including across scope changes.
  * A superseded, never-acknowledged candidate cannot be presented later.
  */
 char *fcb_atlas_present(uint64_t handle, uint64_t generation, uint64_t frame, uint64_t display);
@@ -76,8 +81,10 @@ char *fcb_atlas_open_reader(uint64_t handle, uint64_t reader, uint64_t frame,
  * separators inside a token). The NEXT plan may repack geometry from the
  * frozen catalog on this worker; pan/zoom never repack, and no source is read
  * or parsed for any scope change. Restoring "all" reuses the retained original
- * layout, so earlier All-frame geometry and node identity stay valid. A scope
- * change resets focus/history/selection to the new layout's root. Search and
+ * layout. Preparing a scope keeps the displayed frame's layout/source bindings
+ * alive until replacement is acknowledged. A successful scope change resets
+ * focus/history/selection to the new layout's root; a failed or canceled
+ * attempt preserves the prior scope, history and candidate. Search and
  * path queries remain workspace-wide; their responses label the scope, and
  * paging/overlay encode only in-scope rows while counts stay workspace-wide.
  * Focus of a retained hit whose file is out of scope is refused.
