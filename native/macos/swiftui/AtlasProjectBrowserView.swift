@@ -117,18 +117,27 @@ import SwiftUI
             }
         }
         .onDisappear { readerTask?.cancel(); capture?.reader.close(); capture = nil }
+        .onChange(of: ObjectIdentifier(model)) { _, _ in
+            // The host keeps this view's identity only for an accepted refresh
+            // under the same root grant. Keep completed captures; an old row's
+            // in-flight open cannot be transferred to the replacement catalog.
+            readerTask?.cancel()
+            readerNotice = ""
+        }
     }
     private func open(_ file: AtlasProjectBrowserFile, from page: AtlasProjectBrowserPage) {
         guard readerTask == nil else { return }
+        let browser = model
         readerNotice = ""
         readerTask = Task {
             defer { readerTask = nil }
             do {
-                let captured = try await model.openFile(file, from: page, readerTransport: .native,
+                let captured = try await browser.openFile(file, from: page, readerTransport: .native,
                     search: .native, outline: .native, document: .native)
-                if Task.isCancelled { captured.reader.close() }
+                if Task.isCancelled || browser.closed { captured.reader.close() }
                 else { capture = captured }
             } catch {
+                guard !Task.isCancelled, !browser.closed else { return }
                 readerNotice = (error as? AtlasProjectBrowserError)?.message
                     ?? (error as? AtlasReaderError)?.message ?? "The selected file could not be opened."
             }
@@ -163,6 +172,10 @@ import SwiftUI
             }
             Text("The originating capture stays open while you follow links to files within this project, including files outside the retained discovery pages.")
                 .font(.caption).foregroundStyle(.secondary)
+            if origin.catalogOwner != model.info?.owner {
+                Text("Project refreshed. This source keeps its captured bytes and position. Following a link first verifies the originating capture against the current project file.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             HSplitView {
                 AtlasPagedSourceView(model: origin.reader, canKeep: canKeep, keep: keep,
                     openLocalLink: navigation(from: origin)).id(origin.id).frame(minWidth: 400)
@@ -192,27 +205,37 @@ import SwiftUI
                 operation = UUID(); task?.cancel(); task = nil
                 linked?.reader.close(); linked = nil; origin.reader.close()
             }
+            .onChange(of: ObjectIdentifier(model)) { _, _ in
+                // A pending old-owner link drains before another can start.
+                // Both already accepted reader models remain independently owned.
+                task?.cancel()
+                notice = "Project refreshed; the open source captures are unchanged."
+            }
     }
     private func navigation(from source: AtlasProjectBrowserCapture) -> AtlasDocumentPreviewModel.LocalNavigation? {
-        guard task == nil, !model.closed else { return nil }
+        guard task == nil, model.canOperate,
+              source.catalogOwner == model.info?.owner || model.canOpenVerifiedDocumentLinks else { return nil }
         return { target in open(target, from: source) }
     }
     private func open(_ target: AtlasReaderDocumentLinkTarget, from source: AtlasProjectBrowserCapture) {
         guard task == nil else { return }
+        let browser = model
         let ticket = UUID(); operation = ticket
-        notice = "Opening a new capture of the linked file within this project…"
+        notice = source.catalogOwner == browser.info?.owner
+            ? "Opening a new capture of the linked file within this project…"
+            : "Verifying the retained source against the refreshed project before opening its link…"
         task = Task {
             defer { if operation == ticket { task = nil } }
             do {
-                let candidate = try await model.openDocumentLink(target, from: source, readerTransport: .native,
+                let candidate = try await browser.openRetainedDocumentLink(target, from: source, readerTransport: .native,
                     search: .native, outline: .native, document: .native)
-                guard operation == ticket, !Task.isCancelled else { candidate.reader.close(); return }
+                guard operation == ticket, !Task.isCancelled, !browser.closed else { candidate.reader.close(); return }
                 let previous = linked
                 linked = candidate
                 previous?.reader.close()
                 notice = "Linked capture ready. Close it to return to the originating document."
             } catch {
-                guard operation == ticket else { return }
+                guard operation == ticket, !Task.isCancelled, !browser.closed else { return }
                 notice = (error as? AtlasProjectBrowserError)?.message
                     ?? (error as? AtlasReaderError)?.message ?? "The linked file could not be opened."
             }

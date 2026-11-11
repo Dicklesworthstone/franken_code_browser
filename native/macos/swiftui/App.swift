@@ -256,6 +256,10 @@ private struct AtlasFrozenViewportSearch: Sendable {
     @State private var projectChanges = AtlasProjectChanges(makeDriver: { AtlasNativeProjectChangeDriver() })
     @State private var projectRefresh = AtlasProjectRefresh(transport: .native)
     @State private var refreshOriginProject: UUID?
+    // Readers in Project Files belong to this root/grant lifetime, not to one
+    // discovery session. A same-root refresh replaces rows without remounting
+    // the sheet that owns an already accepted source capture.
+    @State private var projectViewIdentity = UUID()
     @State private var projectViewActive = false
     @State private var browserProject = UUID()
     @State private var showsCatalog = true
@@ -303,6 +307,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     @State private var fileText = ""
     @State private var selectedSource: AtlasSource?
     @State private var selectedReaderSelection: AtlasReaderSelection?
+    @State private var retainedReaderPresentation: (navigation: UUID, selection: AtlasReaderSelection?)?
     @State private var wrapsSourceLines = false
     @State private var showsSourceLineNumbers = true
     @State private var showsSourceWhitespace = false
@@ -321,6 +326,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     @State private var atlasLayoutPending = false
     @State private var projectCache: AtlasProjectCache?
     @State private var atlasRevision = UUID()
+    @State private var retainedAtlasRevision: UUID?
     @State private var focusRequest = UUID()
     @State private var selectedMatch: AtlasMatch?
     @State private var sourceError: String?
@@ -338,6 +344,11 @@ private struct AtlasFrozenViewportSearch: Sendable {
     private var textTiles: [AtlasTextTile] { atlasResidency.tiles }
     private var hasMetadataAtlas: Bool {
         atlasResidency.hasInstalledLayout(root: root, layoutRevision: atlasRevision)
+    }
+    private var hasRetainedAtlas: Bool { hasMetadataAtlas && retainedAtlasRevision == atlasRevision }
+    private var retainedReaderSelection: AtlasReaderSelection? {
+        guard retainedReaderPresentation?.navigation == focusRequest else { return nil }
+        return retainedReaderPresentation?.selection
     }
     private var snapshotExportSource: AtlasSnapshotExportSource? {
         guard !loadingProject, projectOpening.canBrowse, browserProject == loadGeneration,
@@ -429,13 +440,14 @@ private struct AtlasFrozenViewportSearch: Sendable {
     private var searchPathEditKey: [UInt8] { Array(searchPathInput.utf8.prefix(4097)) }
 
     private var currentVisibleSearch: AtlasFrozenViewportSearch? {
-        guard !atlasLayoutPending, hasMetadataAtlas, let frozenVisibleSearch,
+        guard !atlasLayoutPending, hasMetadataAtlas, !hasRetainedAtlas, let frozenVisibleSearch,
               frozenVisibleSearch.snapshot.view.belongs(to: root, project: loadGeneration, layout: atlasRevision) else { return nil }
         return frozenVisibleSearch
     }
 
     private var canFreezeVisibleSearch: Bool {
-        !loadingProject && !showsCatalog && !showsCity && !atlasLayoutPending && hasMetadataAtlas && visibleSearchTask == nil
+        !loadingProject && !showsCatalog && !showsCity && !atlasLayoutPending && hasMetadataAtlas
+            && !hasRetainedAtlas && visibleSearchTask == nil
             && visibleSearchView?.belongs(to: root, project: loadGeneration, layout: atlasRevision) == true
     }
 
@@ -462,7 +474,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     private var effectiveSearchCaseSensitive: Bool { !searchMode.isTextual || searchCaseSensitive }
     private var effectiveSearchCountAllMatches: Bool { searchMode.isTextual && searchCountAllMatches }
     private var overlayIsCurrent: Bool {
-        searchIsCurrent && overlayContentRevision == atlasResidency.contentRevision
+        !hasRetainedAtlas && searchIsCurrent && overlayContentRevision == atlasResidency.contentRevision
     }
 
     var body: some View {
@@ -602,6 +614,8 @@ private struct AtlasFrozenViewportSearch: Sendable {
             projectViewActive = false
             projectRefresh.cancel()
             refreshOriginProject = nil
+            projectViewIdentity = UUID()
+            retainedReaderPresentation = nil
 #if FCB_APP_STORE
             rootAccessLoader.cancel()
 #endif
@@ -649,6 +663,9 @@ private struct AtlasFrozenViewportSearch: Sendable {
         }
         .onChange(of: atlasResidency.contentRevision) { _, _ in
             refreshResidentSearchOverlay()
+        }
+        .onChange(of: focusRequest) { _, _ in
+            if retainedReaderPresentation?.navigation != focusRequest { retainedReaderPresentation = nil }
         }
         .onChange(of: useCapturedIndex) { _, _ in
             clearSearch()
@@ -864,8 +881,9 @@ private struct AtlasFrozenViewportSearch: Sendable {
                             .font(.caption2).foregroundStyle(.secondary)
                     }
                 } else if visibleSearchTask == nil {
-                    Text(hasMetadataAtlas ? "Show the text atlas, then choose its current view."
-                        : "Build the text atlas to choose its visible files.")
+                    Text(hasRetainedAtlas ? "Rebuild the earlier atlas before choosing its visible files."
+                        : (hasMetadataAtlas ? "Show the text atlas, then choose its current view."
+                            : "Build the text atlas to choose its visible files."))
                         .font(.caption2).foregroundStyle(.secondary)
                 }
                 if !visibleSearchNotice.isEmpty {
@@ -1043,7 +1061,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 // Catalog membership, not an eager source/Metal tile, makes a
                 // file discoverable. UTF-16 and unprepared files remain usable.
                 List {
-                    Section("Project files · \(displayedFiles.count)") {
+                    Section("\(hasRetainedAtlas ? "Earlier atlas files" : "Project files") · \(displayedFiles.count)") {
                         ForEach(displayedFiles, id: \.rawPathKey) { file in
                             Button {
                                 selectedHit = nil
@@ -1190,6 +1208,30 @@ private struct AtlasFrozenViewportSearch: Sendable {
         }
     }
 
+    @ViewBuilder private var retainedAtlasNotice: some View {
+        if hasRetainedAtlas {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "clock.arrow.circlepath").foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Earlier atlas retained").font(.callout.weight(.semibold))
+                    Text("Project Files uses the refreshed discovery. This map keeps its earlier membership, source previews and navigation until you rebuild it.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if projectOpening.isPreparing {
+                        Text(loadProgress).font(.caption).foregroundStyle(.secondary)
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading)
+                if !showsCatalog { Button("Project Files") { showsCatalog = true } }
+                if projectOpening.isPreparing {
+                    ProgressView().controlSize(.small)
+                    Button("Stop rebuild", action: cancelAtlasLoad)
+                } else {
+                    Button("Rebuild atlas", action: requestAtlasPreviews)
+                        .disabled(!projectOpening.canPrepare || projectRefresh.isRefreshing)
+                }
+            }.padding(10).background(.bar)
+        }
+    }
+
     @ViewBuilder private var rootAccessProgress: some View {
 #if FCB_APP_STORE
         if rootAccessLoader.isLoading {
@@ -1215,6 +1257,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 rootAccessProgress
                 projectChangeNotice
                 projectRefreshNotice
+                retainedAtlasNotice
                 if (showsCatalog || !hasMetadataAtlas), !projectBrowser.root.isEmpty {
                     progressiveProjectView
                 } else if !hasMetadataAtlas {
@@ -1259,8 +1302,13 @@ private struct AtlasFrozenViewportSearch: Sendable {
                                 openAtlasEntry(entry, layout: acceptedLayout)
                             },
                             onViewport: updateAtlasViewport,
-                            residencySummary: atlasLayoutPending ? "Preparing the selected file scope…" : atlasResidency.summary,
-                            retryPreviews: atlasResidency.retryUnavailable,
+                            residencySummary: hasRetainedAtlas
+                                ? "Earlier source previews retained. Rebuild atlas to load refreshed previews."
+                                : (atlasLayoutPending ? "Preparing the selected file scope…" : atlasResidency.summary),
+                            retryPreviews: {
+                                if hasRetainedAtlas { requestAtlasPreviews() }
+                                else { atlasResidency.retryUnavailable() }
+                            },
                             tiles: textTiles
                         )
                         .id(atlasRevision)
@@ -1268,7 +1316,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
                         .allowsHitTesting(!showsCity).disabled(showsCity).accessibilityHidden(showsCity)
                         if showsCity {
                             AtlasCityView(revision: atlasRevision, entries: atlasEntries,
-                                complete: projectOpening.catalog?.discoveryComplete ?? false,
+                                complete: !hasRetainedAtlas && (projectOpening.catalog?.discoveryComplete ?? false),
                                 seed: AtlasCitySeed(scale: camera.scale, offsetX: camera.offsetX, offsetY: camera.offsetY),
                                 selectedPath: selectedPath, scopeLabel: atlasScopeLabel,
                                 onSelect: { openAtlasEntry($0, layout: acceptedLayout) },
@@ -1339,7 +1387,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 // The Reading Desk toolbar opens the independently kept source.
                 readingDesk.keep(reader: reader)
             })
-            .id(loadGeneration)
+            .id(projectViewIdentity)
     }
 
     private func openCatalogFile(_ id: UInt64, project: UUID) {
@@ -1370,22 +1418,23 @@ private struct AtlasFrozenViewportSearch: Sendable {
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
                 Divider()
-                if let entry = projectOpening.catalog?.entries.first(where: { $0.rawPath.elementsEqual(path.utf8) }) {
+                if !hasRetainedAtlas, let entry = projectOpening.catalog?.entries.first(where: { $0.rawPath.elementsEqual(path.utf8) }) {
                     stat("observed bytes", String(entry.observedBytes))
                 } else {
-                    stat("bytes", ByteCountFormatter.string(fromByteCount: Int64(file.bytes), countStyle: .file))
+                    stat(hasRetainedAtlas ? "earlier observed bytes" : "bytes",
+                        ByteCountFormatter.string(fromByteCount: Int64(file.bytes), countStyle: .file))
                 }
                 stat("profile rows", "\(file.lineCount)")
                 stat("preview coverage", file.previewCoverage)
                 stat("captured lines", selectedSource.map { "\($0.lines.count)" } ?? "—")
                 let fileHits = hits.filter { $0.sourcePath == path }
                 stat("matches", "\(fileHits.count)")
-                stat("project files", "\(files.count)")
+                stat(hasRetainedAtlas ? "earlier atlas files" : "project files", "\(files.count)")
             } else {
                 Text("Click a file cell to inspect it.")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
-                stat("project files", "\(files.count)")
+                stat(hasRetainedAtlas ? "earlier atlas files" : "project files", "\(files.count)")
                 stat("project", (root as NSString).lastPathComponent)
             }
             Divider()
@@ -1468,6 +1517,11 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 .background(.bar)
                 Divider()
             }
+            if retainedReaderPresentation?.navigation == focusRequest {
+                Text("Project refresh keeps this reader independent. Read current ranges opens the file as it is now.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12).padding(.vertical, 4)
+            }
             if let capture = finderReaderCapture {
                 AtlasPagedSourceView(model: capture.reader, canPin: pinnedReaders.canAdd, pin: pinSource,
                     canKeep: readingDesk.canOperate, keep: keepSource, project: projectBrowser)
@@ -1494,7 +1548,8 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 }
             } else if let source = selectedSource, sourceError == nil {
                 AtlasSourceReader(source: source, navigation: focusRequest,
-                    selection: searchIsCurrent ? selectedReaderSelection : nil, wrapsLines: wrapsSourceLines,
+                    selection: (searchIsCurrent ? selectedReaderSelection : nil) ?? retainedReaderSelection,
+                    wrapsLines: wrapsSourceLines,
                     showsLineNumbers: showsSourceLineNumbers, showsWhitespace: showsSourceWhitespace,
                     firstPhysicalLine: 1, usesSyntaxPalette: true) {
                     if let document = atlasDocuments[source.path],
@@ -1628,17 +1683,27 @@ private struct AtlasFrozenViewportSearch: Sendable {
         closeObservedReader()
         closeWorkspaceStreamSearch()
         closeProjectLinks()
-        closeAtlasResidency()
+        // Keep the accepted map's coordinate domain and already admitted
+        // sources. Its old membership never becomes the new scan's evidence;
+        // no further preview or visible-scope admission uses it until rebuild.
+        retainedAtlasRevision = hasMetadataAtlas ? atlasRevision : nil
+        if showsReader, finderReaderCapture != nil || selectedPath != nil {
+            retainedReaderPresentation = (focusRequest, selectedReaderSelection ?? retainedReaderSelection)
+        }
+        // These inputs and focusRequest own the mounted paged reader. Keeping
+        // them preserves its capture, page, Find query and native selection.
+        // A pending legacy pathname read has no retained capture to transfer.
+        if sourceTask != nil, selectedSource == nil, !usesPagedReader {
+            sourceError = "Source opening stopped when the project refreshed. Open the file again from Project Files."
+        }
+        // Detach an accepted reader from its old workspace row before clearing
+        // visible-scope/search authority, which otherwise dismisses row opens.
+        cancelSourceLoad()
+        suspendAtlasPreparation()
         workspaceSearch?.refresh()
         showsFileFinder = false
-        capturedReaderTarget = nil
-        suppliedReaderTarget = nil
-        cancelSourceLoad()
         clearSearch()
-        selectedSource = nil
         selectedMatch = nil
-        sourceError = nil
-        fileText = ""
         loadTask?.cancel()
         loadCancellation?.cancel()
         projectIO.cancel()
@@ -1650,23 +1715,14 @@ private struct AtlasFrozenViewportSearch: Sendable {
         projectBrowser = candidate.browser
         previous.close()
         refreshOriginProject = candidate.project
-        showsCatalog = true
-        showsCity = false
-        // A Quick Open reader owns its retained bytes independently of both
-        // catalog sessions. Keep that model/SwiftUI identity and use the new
-        // project's verified-link route for any future current-source action.
-        if let retained = finderReaderCapture {
-            selectedPath = retained.file.path
-            usesPagedReader = true
-        } else {
-            selectedPath = nil
-            usesPagedReader = false
-            showsReader = false
-            focusRequest = UUID()
+        if !hasMetadataAtlas {
+            showsCatalog = true
+            showsCity = false
+            files = []
+            displayedFiles = []
         }
-        renewAtlasRevision()
-        files = []
-        displayedFiles = []
+        // The old legacy catalog's row IDs are not valid in this new project.
+        // Retained atlas clicks use their raw path or exact captured source.
         catalogEntries = []
         // A first page can still have unvisited members or omissions. Only a
         // real complete scan under the same uninterrupted watcher clears hints.
@@ -1682,6 +1738,8 @@ private struct AtlasFrozenViewportSearch: Sendable {
     private func replaceProject() {
         projectRefresh.cancel()
         refreshOriginProject = nil
+        projectViewIdentity = UUID()
+        retainedReaderPresentation = nil
         snapshotExport.cancel()
         closeObservedReader()
         closeWorkspaceStreamSearch()
@@ -1804,8 +1862,16 @@ private struct AtlasFrozenViewportSearch: Sendable {
         guard !Task.isCancelled, !cancellation.isCanceled, projectOpening.accepts(ticket),
               root.utf8.elementsEqual(requestedRoot.utf8),
               projectOpening.acceptPreviewCatalog(catalog, for: ticket) else { throw AtlasProjectIOError.canceled }
-        // AtlasFile's legacy byte field is presentation-only. The catalog above
-        // keeps full UInt64 observations, including values above native Int.max.
+        // A retained map remains one coherent layout while its replacement is
+        // prepared. Publish the fresh files with the new layout, never beneath
+        // old parcels if preparation fails or the user cancels it.
+        if !hasRetainedAtlas { updateAtlasFiles(catalog) }
+        updateCatalogFilter()
+    }
+
+    private func updateAtlasFiles(_ catalog: AtlasProjectCatalog) {
+        // AtlasFile's legacy byte field is presentation-only. The catalog keeps
+        // full UInt64 observations, including values above native Int.max.
         files = catalog.entries.compactMap { entry in
             guard let path = entry.sourcePath else { return nil }
             return AtlasFile(path: path, x: entry.x, y: entry.y, w: entry.width, h: entry.height,
@@ -1813,7 +1879,6 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 profileState: "disabled", profile: [], avgColor: AtlasFile.averageColor(profile: []))
         }
         displayedFiles = files.filter { fileScope.includes($0.path, custom: customExtensions) }
-        updateCatalogFilter()
     }
 
     private func requestStartupCatalog() {
@@ -1865,7 +1930,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
         loadCancellation = cancellation
         // Publishing optional atlas tiles must not dismiss a file reader that
         // the user opened while preparation ran. Show text atlas is explicit.
-        showsCatalog = true
+        if !hasMetadataAtlas { showsCatalog = true }
         loadProgress = projectOpening.catalog == nil ? "Collecting the bounded text-atlas catalog…"
             : "Preparing the file atlas…"
         loadTask = Task {
@@ -1961,9 +2026,10 @@ private struct AtlasFrozenViewportSearch: Sendable {
             return false
         }
         invalidateVisibleSearchScope()
+        retainedAtlasRevision = nil
         atlasEntries = compacted
         atlasScopeLabel = scopeLabel
-        displayedFiles = files.filter { fileScope.includes($0.path, custom: customExtensions) }
+        updateAtlasFiles(catalog)
         let bounds = compacted.reduce(CGRect.null) { result, entry in
             result.union(CGRect(x: entry.x, y: entry.y, width: entry.width, height: entry.height))
         }
@@ -2000,7 +2066,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     }
 
     private func updateAtlasViewport(_ world: CGRect, scale: Double) {
-        guard !showsCatalog, !showsCity, !atlasLayoutPending, hasMetadataAtlas else { return }
+        guard !showsCatalog, !showsCity, !atlasLayoutPending, hasMetadataAtlas, !hasRetainedAtlas else { return }
         if let viewport = try? AtlasVisibleSearchScope.Viewport(x: Double(world.minX), y: Double(world.minY),
             width: Double(world.width), height: Double(world.height)),
            visibleSearchView?.represents(root: root, project: loadGeneration,
@@ -2029,7 +2095,9 @@ private struct AtlasFrozenViewportSearch: Sendable {
         visibleSearchView = nil; frozenVisibleSearch = nil
         if searchPathKind == .visible {
             clearSearch()
-            visibleSearchNotice = "The atlas layout changed. Choose a new displayed view before searching its files."
+            visibleSearchNotice = hasRetainedAtlas
+                ? "Rebuild the retained atlas before choosing a refreshed visible-file search scope."
+                : "The atlas layout changed. Choose a new displayed view before searching its files."
         } else { visibleSearchNotice = "" }
     }
 
@@ -2098,12 +2166,18 @@ private struct AtlasFrozenViewportSearch: Sendable {
         }
     }
 
-    private func closeAtlasResidency() {
+    private func suspendAtlasPreparation() {
         invalidateVisibleSearchScope()
         atlasLayoutRequest = UUID()
         atlasLayoutTask?.cancel(); atlasLayoutTask = nil
         atlasLayoutCancellation?.cancel(); atlasLayoutCancellation = nil
         atlasLayoutIO.cancel(); atlasLayoutPending = false
+        atlasResidency.suspend()
+    }
+
+    private func closeAtlasResidency() {
+        suspendAtlasPreparation()
+        retainedAtlasRevision = nil
         atlasResidency.close(); atlasEntries = []
     }
 
@@ -2115,7 +2189,11 @@ private struct AtlasFrozenViewportSearch: Sendable {
         clearSearch()
         selectedPath = nil; selectedSource = nil; selectedMatch = nil
         updateCatalogFilter()
-        if hasMetadataAtlas {
+        if hasRetainedAtlas {
+            if projectOpening.isPreparing { cancelAtlasLoad() }
+            requestAtlasPreviews()
+            status = "Rebuilding the earlier atlas for \(fileScope.rawValue) scope. Project Files and search use the selected file types."
+        } else if hasMetadataAtlas {
             requestAtlasScopeLayout()
             status = "Preparing \(fileScope.rawValue) scope. Search uses the selected file types."
         } else if projectOpening.isPreparing, projectOpening.catalog != nil {
@@ -2147,7 +2225,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
         overlayLimited = false
         searchTitle = "Search project"
         searchSummary = "Enter text to search the project."
-        status = "\(displayedFiles.count) of \(files.count) files shown. Search cleared."
+        status = "\(hasRetainedAtlas ? "Earlier atlas: " : "")\(displayedFiles.count) of \(files.count) files shown. Search cleared."
     }
 
     private func prepareSearchOverlay(_ report: AtlasSearchReport, context: AtlasSearchContext,
@@ -2155,12 +2233,12 @@ private struct AtlasFrozenViewportSearch: Sendable {
         // Only a validated append-only stream in the same immutable atlas may
         // reuse geometry. New queries/scopes/captures start from no proof.
         let sameStream = report.streamID != nil && report.streamID == searchPresentation?.id
-        var matches: [SearchHit.ID: AtlasMatch] = sameStream && searchIsCurrent ? resolvedMatches : [:]
+        var matches: [SearchHit.ID: AtlasMatch] = !hasRetainedAtlas && sameStream && searchIsCurrent ? resolvedMatches : [:]
         let grouped = Dictionary(grouping: report.hits.compactMap { hit in
             hit.sourcePath.map { ($0, hit) }
         }, by: { Array($0.0.utf8) })
         for pathBytes in grouped.keys.sorted(by: { $0.lexicographicallyPrecedes($1) }) {
-            guard let path = String(bytes: pathBytes, encoding: .utf8),
+            guard !hasRetainedAtlas, let path = String(bytes: pathBytes, encoding: .utf8),
                   fileScope.includes(path, custom: customExtensions),
                   let document = atlasDocuments[path],
                   document.source.path.utf8.elementsEqual(pathBytes),
@@ -2432,7 +2510,8 @@ private struct AtlasFrozenViewportSearch: Sendable {
             usesPagedReader = true
             showsReader = true
             // The current row authorizes this transfer. The independent reader
-            // may then survive query edits/clear, but not a new project or view.
+            // survives query edits and same-root discovery refresh; replacing
+            // its root grant or explicitly opening another source revokes it.
             // No live-file fallback and no atlas geometry used as source proof.
             sourceSearchRow = nil
             selectedMatch = resolvedMatches[hit.id]
@@ -2441,7 +2520,9 @@ private struct AtlasFrozenViewportSearch: Sendable {
         }
         // String-keyed lookup may return a canonically equivalent filename.
         // Such a document cannot lend this request its source or capture proof.
-        if let source = atlasDocuments[path]?.source, source.path.utf8.elementsEqual(path.utf8) {
+        // An earlier atlas remains readable, but new file/search actions after
+        // refresh must capture their own source rather than borrow its bytes.
+        if !hasRetainedAtlas, let source = atlasDocuments[path]?.source, source.path.utf8.elementsEqual(path.utf8) {
             if exactMatch {
                 presentSource(source, searchRow: searchRow, exactMatch: true)
             } else {

@@ -715,6 +715,20 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
                     generation: target.inventory.generation, link: target.link.id, bytes: AtlasReaderLimits.captureBytes))
             }
     }
+    /// A retained reader can outlive the catalog that originally opened it.
+    /// Its page/file receipt must never be replayed against a refreshed catalog.
+    /// Crossing that boundary requires the existing exact-current-source proof;
+    /// the original capture stays readable if that proof fails or is unavailable.
+    func openRetainedDocumentLink(_ target: AtlasReaderDocumentLinkTarget, from origin: AtlasProjectBrowserCapture,
+        readerTransport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
+        outline: AtlasReaderOutlineTransport? = nil, document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasProjectBrowserCapture {
+        if origin.catalogOwner == info?.owner {
+            return try await openDocumentLink(target, from: origin, readerTransport: readerTransport,
+                search: search, outline: outline, document: document)
+        }
+        return try await openVerifiedDocumentLink(target, from: origin.reader, readerTransport: readerTransport,
+            search: search, outline: outline, document: document)
+    }
     /// A displayed, pinned or search capture has no catalog receipt. On this
     /// explicit action the service reads its normalized path under the active
     /// project grant and compares exact bytes before resolving the captured

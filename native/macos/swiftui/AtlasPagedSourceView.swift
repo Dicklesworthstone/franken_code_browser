@@ -26,6 +26,7 @@ import AppKit
     @State private var showsLineNumbers = true
     @State private var showsWhitespace = false
     @State private var linked: AtlasProjectBrowserCapture?
+    @State private var linkedRoot: String?
     @State private var showsLinked = false
     @State private var linkNotice = ""
     @State private var linkTask: Task<Void, Never>?
@@ -96,7 +97,7 @@ import AppKit
         .sheet(isPresented: $showsLinked, onDismiss: closeLinked) { linkedReader }
         .onAppear { if ownsModel { open() } }
         .onDisappear { closeLinked(); if ownsModel { model.close() }; copyNotice = "" }
-        .onChange(of: project?.info?.owner) { _, _ in closeLinked() }
+        .onChange(of: project?.info?.owner) { _, _ in projectChanged() }
         .onChange(of: model.navigation) { _, _ in copyNotice = "" }
         .onChange(of: model.textSelection?.id) { _, _ in copyNotice = "" }
         .onChange(of: Array(model.fileQuery.utf8)) { _, _ in copyNotice = "" }
@@ -124,7 +125,8 @@ import AppKit
     }
 
     private func capturedNavigation(from source: AtlasProjectBrowserCapture) -> AtlasDocumentPreviewModel.LocalNavigation? {
-        guard project?.canOperate == true, linkTask == nil else { return nil }
+        guard let project, project.canOperate, linkTask == nil,
+              source.catalogOwner == project.info?.owner || project.canOpenVerifiedDocumentLinks else { return nil }
         return { target in openLink(target, from: source.reader, capture: source) }
     }
 
@@ -164,7 +166,8 @@ import AppKit
     private func openLink(_ target: AtlasReaderDocumentLinkTarget, from source: AtlasPagedReaderModel,
                           capture: AtlasProjectBrowserCapture? = nil) {
         guard let project, linkTask == nil,
-              capture == nil ? project.canOpenVerifiedDocumentLinks : project.canOperate else { return }
+              project.canOperate,
+              capture?.catalogOwner == project.info?.owner || project.canOpenVerifiedDocumentLinks else { return }
         let ticket = UUID(); linkOperation = ticket
         linkNotice = capture == nil ? "Checking the originating capture and opening the linked file…"
             : "Opening the linked file from the retained document…"
@@ -173,19 +176,19 @@ import AppKit
             do {
                 let candidate: AtlasProjectBrowserCapture
                 if let capture {
-                    candidate = try await project.openDocumentLink(target, from: capture,
+                    candidate = try await project.openRetainedDocumentLink(target, from: capture,
                         readerTransport: .native, search: .native, outline: .native, document: .native)
                 } else {
                     candidate = try await project.openVerifiedDocumentLink(target, from: source,
                         readerTransport: .native, search: .native, outline: .native, document: .native)
                 }
-                guard linkOperation == ticket, !Task.isCancelled else { candidate.reader.close(); return }
+                guard linkOperation == ticket, !Task.isCancelled, !project.closed else { candidate.reader.close(); return }
                 let previous = linked
-                linked = candidate; showsLinked = true
+                linked = candidate; linkedRoot = project.root; showsLinked = true
                 previous?.reader.close()
                 linkNotice = "Linked capture ready. Return to source restores the originating reader."
             } catch {
-                guard linkOperation == ticket else { return }
+                guard linkOperation == ticket, !Task.isCancelled, !project.closed else { return }
                 linkNotice = (error as? AtlasProjectBrowserError)?.message
                     ?? (error as? AtlasReaderError)?.message ?? "The linked file could not be opened."
             }
@@ -199,7 +202,21 @@ import AppKit
 
     private func closeLinked() {
         linkOperation = UUID(); linkTask?.cancel(); linkTask = nil
-        showsLinked = false; linked?.reader.close(); linked = nil; linkNotice = ""
+        showsLinked = false; linked?.reader.close(); linked = nil; linkedRoot = nil; linkNotice = ""
+    }
+
+    private func projectChanged() {
+        // A same-root refresh retires catalog receipts, not accepted readers.
+        // Cancel pending old-owner work without reopening its admission slot
+        // until the task drains. New links must prove the retained source
+        // against the new catalog; a changed root still withdraws its sheet.
+        linkTask?.cancel()
+        if let project, !project.closed, let linkedRoot,
+           project.root.utf8.elementsEqual(linkedRoot.utf8), linked != nil {
+            linkNotice = "Project refreshed; the linked capture remains open. Following another link verifies its source against the current project."
+        } else {
+            showsLinked = false; linked?.reader.close(); linked = nil; linkedRoot = nil; linkNotice = ""
+        }
     }
 
     private var sourcePane: some View {

@@ -100,7 +100,11 @@ import Observation
                 // host's installation of this exact browser/opening identity.
                 if accepted(candidate) {
                     transferred = true
-                    self.notice = "Project refreshed. Retained source captures keep their original bytes."
+                    if let info = browser.info, info.complete, !info.more, info.omissionCount == 0 {
+                        self.notice = "Project discovery refreshed. Open readers keep their captured bytes and position."
+                    } else {
+                        self.notice = "New project page ready; discovery remains incomplete. Open readers keep their captured bytes and position."
+                    }
                 } else {
                     request.failOnce()
                     self.notice = "Refresh was not applied because the active project changed."

@@ -477,6 +477,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         try await failedAndRejectedRefreshKeepTheAcceptedProject()
         try await canceledRefreshDrainsBeforeRetryAndRetainsItsGrant()
         try await refreshPreservesPartialAndEmptyCoverage()
+        try await refreshedCatalogVerifiesLinksWithoutReplacingTheReader()
         await refreshRejectsInvalidRootsAndCancelBeforeEntry()
         try await capturedDocumentLinkOpensIndependentChain()
         try await forgedDocumentLinkReceiptsAreRefused()
@@ -828,7 +829,71 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
             await wait("empty first page failed refresh admission") { !refresh.isRefreshing }
             precondition(installed?.currentPage == true && changes.hints.isEmpty == complete)
             precondition(installed?.canContinue == !complete)
+            precondition(refresh.notice.contains("discovery remains incomplete") == !complete)
             installed?.close()
+        }
+    }
+    /// The Project Files sheet uses this route after the old discovery owner
+    /// retires. A coincidentally equal page/file number must not authorize a
+    /// link; only a successful current-source proof can open a new target.
+    @MainActor private static func refreshedCatalogVerifiesLinksWithoutReplacingTheReader() async throws {
+        for changedSource in [false, true] {
+            let f = ProjectBrowserFixture(), old = AtlasProjectBrowserModel(transport: f.transport)
+            try await old.open(root: "/repo", accessLease: nil)
+            let page = old.page!
+            let origin = try await old.openFile(page.files[0], from: page,
+                readerTransport: f.readerTransport, document: f.documentTransport)
+            let local = await prepareLink(origin.reader)
+            origin.reader.offsetInput = "4"; origin.reader.goToByte()
+            await wait("retained reader did not navigate before refresh") { !origin.reader.busy }
+            origin.reader.fileQuery = "ured"
+            let original = origin.reader.page!, source = origin.reader.source
+            let navigation = origin.reader.navigation, preview = origin.reader.documentPreview.page?.id
+            precondition(original.start == 4 && origin.reader.canGoBack)
+            let refresh = AtlasProjectRefresh(transport: f.transport)
+            var installed: AtlasProjectBrowserModel?
+            precondition(refresh.stage(root: "/repo", project: UUID(), accessLease: nil,
+                accepted: { candidate in
+                    installed = candidate.browser
+                    old.close()
+                    return true
+                }, failed: { _ in preconditionFailure("retained-reader refresh failed") }) != nil)
+            await wait("replacement catalog was not installed") { !refresh.isRefreshing }
+            let replacement = installed!
+            precondition(replacement.info?.owner == 41 && replacement.page?.id == page.id
+                && replacement.page?.files.first?.id == origin.file.id)
+            let allocations = f.calls.filter { $0.hasPrefix("reader-create:") }.count
+            await refuse("an old catalog receipt authorized a refreshed catalog link") {
+                _ = try await replacement.openDocumentLink(local, from: origin,
+                    readerTransport: f.readerTransport, document: f.documentTransport)
+            }
+            precondition(f.calls.filter { $0.hasPrefix("reader-create:") }.count == allocations)
+            if changedSource {
+                f.corrupt("verify-origin-changed")
+                await refuse("changed live bytes authorized the retained document's old link") {
+                    _ = try await replacement.openRetainedDocumentLink(local, from: origin,
+                        readerTransport: f.readerTransport, document: f.documentTransport)
+                }
+                await wait("rejected refreshed-link reader did not retire") { f.calls.contains("reader-close:101") }
+                precondition(replacement.notice.contains("differs from the retained capture"))
+            } else {
+                let target = try await replacement.openRetainedDocumentLink(local, from: origin,
+                    readerTransport: f.readerTransport, document: f.documentTransport)
+                precondition(target.catalogOwner == 41 && target.reader.page?.identity.owner == 101)
+                precondition(target.file.rawPath == f.raw(3) && target.pageID == 0)
+                target.reader.close()
+            }
+            precondition(f.calls.contains("verify:41:100:101:1:1"))
+            precondition(origin.reader.page?.identity.matches(original.identity) == true
+                && origin.reader.page?.originalHex == original.originalHex && origin.reader.page?.start == 4)
+            precondition(origin.reader.source === source && origin.reader.navigation == navigation
+                && origin.reader.fileQuery == "ured" && origin.reader.canGoBack)
+            precondition(origin.reader.documentPreview.page?.id == preview && origin.reader.documentPreview.allows(local))
+            precondition(!f.calls.contains("reader-close:100") && !f.calls.contains("LABEL-OPEN"))
+            origin.reader.back()
+            await wait("retained navigation history stopped working after refresh") { !origin.reader.busy }
+            precondition(origin.reader.page?.start == 0 && origin.reader.canGoForward)
+            origin.reader.close(); replacement.close()
         }
     }
     @MainActor private static func refreshRejectsInvalidRootsAndCancelBeforeEntry() async {
@@ -887,7 +952,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         })
         await wait("local activation did not reach its explicit project callback") { forwarded != nil }
         precondition(forwarded == local && f.calls.contains("document-link:100:1"))
-        let target = try await model.openDocumentLink(forwarded!, from: origin,
+        let target = try await model.openRetainedDocumentLink(forwarded!, from: origin,
             readerTransport: f.readerTransport, document: f.documentTransport)
         precondition(target.catalogOwner == origin.catalogOwner && target.pageID == 3 && target.file.id == 3)
         precondition(target.file.rawPath == f.raw(3) && target.file.observedBytes == 4096)
