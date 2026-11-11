@@ -27,8 +27,8 @@ pub const MAX_ATLAS_STREAM_CALLS: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AtlasStreamLimits {
-    /// Global retained occurrences. A full buffer still allows one lookahead
-    /// witness before declaring truncation, including across file boundaries.
+    /// Global retained occurrences. Default searches stop at one lookahead
+    /// occurrence; counting searches keep scanning without retaining more rows.
     pub max_matches: usize,
     /// Actual source I/O, including bytes spent before a file failed.
     pub max_bytes: u64,
@@ -98,7 +98,16 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
     pub fn new(atlas: &'atlas A, needle: &'worker StreamingNeedle,
         first_revision: SourceRevision, generation: QueryGeneration, limits: AtlasStreamLimits,
         budget: &'worker ResourceBudget, allocations: [ResourceAllocationId; 2]) -> Result<Self, AtlasStreamError> {
-        Self::admit(atlas, needle, first_revision, generation, limits, None, budget, allocations)
+        Self::admit(atlas, needle, first_revision, generation, limits, None, false, budget, allocations)
+    }
+
+    /// Count every occurrence within the admitted byte/read-call universe while
+    /// retaining only the first `max_matches` rows and their exact witnesses.
+    /// Reaching the row limit does not stop scanning or make coverage incomplete.
+    pub fn new_counting(atlas: &'atlas A, needle: &'worker StreamingNeedle,
+        first_revision: SourceRevision, generation: QueryGeneration, limits: AtlasStreamLimits,
+        budget: &'worker ResourceBudget, allocations: [ResourceAllocationId; 2]) -> Result<Self, AtlasStreamError> {
+        Self::admit(atlas, needle, first_revision, generation, limits, None, true, budget, allocations)
     }
 
     /// Search an immutable, strictly increasing projection of ORIGINAL catalog
@@ -111,12 +120,22 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
         first_revision: SourceRevision, generation: QueryGeneration, limits: AtlasStreamLimits,
         ordinals: &[usize], budget: &'worker ResourceBudget, allocations: [ResourceAllocationId; 2])
         -> Result<Self, AtlasStreamError> {
-        Self::admit(atlas, needle, first_revision, generation, limits, Some(ordinals), budget, allocations)
+        Self::admit(atlas, needle, first_revision, generation, limits, Some(ordinals), false, budget, allocations)
+    }
+
+    /// Counting variant of `new_scoped`; excluded catalog entries never consume
+    /// source I/O and files beyond the retained-row limit still contribute counts.
+    pub fn new_scoped_counting(atlas: &'atlas A, needle: &'worker StreamingNeedle,
+        first_revision: SourceRevision, generation: QueryGeneration, limits: AtlasStreamLimits,
+        ordinals: &[usize], budget: &'worker ResourceBudget, allocations: [ResourceAllocationId; 2])
+        -> Result<Self, AtlasStreamError> {
+        Self::admit(atlas, needle, first_revision, generation, limits, Some(ordinals), true, budget, allocations)
     }
 
     fn admit(atlas: &'atlas A, needle: &'worker StreamingNeedle,
         first_revision: SourceRevision, generation: QueryGeneration, limits: AtlasStreamLimits,
-        ordinals: Option<&[usize]>, budget: &'worker ResourceBudget, allocations: [ResourceAllocationId; 2])
+        ordinals: Option<&[usize]>, count_all_matches: bool,
+        budget: &'worker ResourceBudget, allocations: [ResourceAllocationId; 2])
         -> Result<Self, AtlasStreamError> {
         atlas.validate_active()?;
         let text = needle.text_value().ok_or(AtlasStreamError::InvalidLimits)?;
@@ -158,7 +177,7 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
             selected.extend_from_slice(values);
             Ok::<_, AtlasStreamError>(selected)
         }).transpose()?;
-        let report = AtlasStreamReport { atlas, generation, limits, files: reserve(count)?,
+        let report = AtlasStreamReport { atlas, generation, limits, count_all_matches, files: reserve(count)?,
             hits: reserve(limits.max_matches)?, matched_files: reserve(witness_files)?,
             witnesses: reserve(witness_bytes)?, selected_ordinals, literal, stats: AtlasStreamStats::default(),
             state: if count == 0 { AtlasStreamState::Finished } else { AtlasStreamState::Pending },
@@ -234,7 +253,11 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
                 max_bytes: self.report.limits.max_bytes - self.report.stats.bytes_read,
                 max_read_calls: self.report.limits.max_read_calls - self.report.stats.read_calls };
             let started = match opened {
-                Ok(file) => FileSearch::new(file, request, self.needle, options, self.budget, self.worker_allocation),
+                Ok(file) => if self.report.count_all_matches {
+                    FileSearch::new_counting(file, request, self.needle, options, self.budget, self.worker_allocation)
+                } else {
+                    FileSearch::new(file, request, self.needle, options, self.budget, self.worker_allocation)
+                },
                 Err(e) => Err(FileSearchError::Source(e)),
             };
             match started {
@@ -281,10 +304,12 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
     fn record_unavailable(&mut self, request: CaptureRequest, stats: StreamReadStats,
         error: FileSearchError) -> Result<(), AtlasStreamError> {
         let node = self.report.atlas.node_for_file(request.file())?;
+        let matching_files_through = self.report.matching_files_seen();
         self.report.files.push(AtlasStreamFile { request, node,
             state: AtlasStreamFileState::Unavailable(error), encoding: None, observed_length: None,
             final_length: None, consistency: None, unsupported_at: None, stats,
-            matches_seen: 0, first_hit: self.report.hits.len(), hit_count: 0,
+            matches_seen: 0, matches_through: self.report.stats.matches_seen, matching_files_through,
+            first_hit: self.report.hits.len(), hit_count: 0,
             witness_start: self.report.witnesses.len(), witness_len: 0 });
         self.report.stats.incomplete_files += 1;
         Ok(())
@@ -293,6 +318,10 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
         let scan = file_report.search();
         let count = scan.hits().len();
         if count > self.report.limits.max_matches - self.report.hits.len() { return Err(AtlasStreamError::InvalidLimits); }
+        let matches_through = self.report.stats.matches_seen.checked_add(scan.matches_seen())
+            .ok_or(AtlasStreamError::InvalidLimits)?;
+        let matching_files_through = self.report.matching_files_seen().checked_add(usize::from(scan.matches_seen() > 0))
+            .ok_or(AtlasStreamError::InvalidLimits)?;
         let node = self.report.atlas.node_for_file(scan.request().file())?;
         let witness_start = self.report.witnesses.len();
         let bytes = if count > 0 { scan.witness_bytes(0).map_err(FileSearchError::from)? } else { &[] };
@@ -312,9 +341,9 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
             state: AtlasStreamFileState::Scanned(scan.state()), encoding: scan.encoding(),
             observed_length: Some(scan.observed_length()), final_length: file_report.final_length(),
             consistency: Some(file_report.consistency()), unsupported_at: scan.unsupported_at(), stats: scan.stats(),
-            matches_seen: scan.matches_seen(), first_hit, hit_count: count, witness_start, witness_len: bytes.len() });
-        self.report.stats.matches_seen = self.report.stats.matches_seen.checked_add(scan.matches_seen())
-            .ok_or(AtlasStreamError::InvalidLimits)?;
+            matches_seen: scan.matches_seen(), matches_through, matching_files_through,
+            first_hit, hit_count: count, witness_start, witness_len: bytes.len() });
+        self.report.stats.matches_seen = matches_through;
         if !file_report.is_complete() { self.report.stats.incomplete_files += 1; }
         Ok(())
     }

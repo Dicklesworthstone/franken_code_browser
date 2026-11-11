@@ -49,9 +49,18 @@ fn atlas<'a>(catalog: &'a WorkspaceCatalog, budget: &ResourceBudget, alloc: u64)
 }
 fn run<'a, 'c>(atlas: &'a WorkspaceAtlas<'c>, literal: &str, limits: AtlasStreamLimits,
     budget: &ResourceBudget, base: u64) -> AtlasStreamReport<'a, 'c> {
+    run_mode(atlas, literal, limits, budget, base, false)
+}
+fn run_mode<'a, 'c>(atlas: &'a WorkspaceAtlas<'c>, literal: &str, limits: AtlasStreamLimits,
+    budget: &ResourceBudget, base: u64, count_all_matches: bool) -> AtlasStreamReport<'a, 'c> {
     let needle = StreamingNeedle::text(owner(), literal, budget, allocation(base)).unwrap();
-    let mut job = AtlasStreamSearch::new(atlas, &needle, revision(base * 100), generation(base), limits,
-        budget, [allocation(base + 1), allocation(base + 2)]).unwrap();
+    let mut job = if count_all_matches {
+        AtlasStreamSearch::new_counting(atlas, &needle, revision(base * 100), generation(base), limits,
+            budget, [allocation(base + 1), allocation(base + 2)])
+    } else {
+        AtlasStreamSearch::new(atlas, &needle, revision(base * 100), generation(base), limits,
+            budget, [allocation(base + 1), allocation(base + 2)])
+    }.unwrap();
     let root = atlas.catalog().grant().root_path().to_path_buf();
     for _ in 0..100_000 {
         if job.state() != AtlasStreamState::Pending { break; }
@@ -135,6 +144,92 @@ fn a_full_result_buffer_does_not_falsely_truncate_until_cross_file_lookahead() {
     assert!(!partial.is_complete()); assert_eq!(partial.stats().matches_seen, 2);
     assert_eq!(partial.hits().len(), 1); assert_eq!(partial.stop_reason(), Some(AtlasStreamStop::MatchLimit));
     assert_eq!(complete.select_hit(0, &atlas, generation(10)).unwrap().original_bytes(), b"needle");
+}
+
+#[test]
+fn counted_search_finishes_later_files_and_aggregates_unretained_occurrences_by_directory() {
+    let root = Fixture::new();
+    root.write("src/a.rs", b"aaaa"); root.write("src/deep/b.rs", b"aa");
+    root.write("src/empty.rs", b""); root.write("src-old/c.rs", b"aaa");
+    let budget = budget(); let catalog = root.catalog(&budget, 10); let atlas = atlas(&catalog, &budget, 2);
+    let index = atlas.index(&budget, allocation(3), || false).unwrap();
+    let limits = AtlasStreamLimits { max_matches: 1, ..Default::default() };
+    let legacy = run(&atlas, "aa", limits, &budget, 10);
+    assert!(!legacy.count_all_matches()); assert!(!legacy.is_complete());
+    assert_eq!(legacy.stats().matches_seen, 2); assert_eq!(legacy.files_examined(), 1);
+    let report = run_mode(&atlas, "aa", limits, &budget, 20, true);
+    assert!(report.count_all_matches()); assert!(report.is_complete()); assert!(report.hits_truncated());
+    assert_eq!(report.stop_reason(), None); assert_eq!(report.files_examined(), 4);
+    assert_eq!(report.stats().matches_seen, 6); assert_eq!(report.matching_files_seen(), 3);
+    assert_eq!(report.hits().len(), 1); assert_eq!(report.retained_witness_bytes(), 2);
+    assert_eq!(report.retained_matches_in(index.root_node()).unwrap(), (1, 1));
+    assert_eq!(report.counted_matches_in(index.root_node()).unwrap(), (6, 3));
+    assert_eq!(report.counted_matches_in(index.find_path(b"src").unwrap()).unwrap(), (4, 2));
+    assert_eq!(report.counted_matches_in(index.find_path(b"src/deep").unwrap()).unwrap(), (1, 1));
+    assert_eq!(report.counted_matches_in(index.find_path(b"src/a.rs").unwrap()).unwrap(), (3, 1));
+    assert_eq!(report.counted_matches_in(index.find_path(b"src/empty.rs").unwrap()).unwrap(), (0, 0));
+    assert_eq!(report.counted_matches_in(index.find_path(b"src-old").unwrap()).unwrap(), (2, 1));
+    assert_eq!(report.retained_matches_in(index.find_path(b"src").unwrap()).unwrap(), (0, 0));
+    assert_eq!(report.select_hit(0, &atlas, generation(20)).unwrap().original_bytes(), b"aa");
+    assert_eq!(report.reserved_bytes(), legacy.reserved_bytes(), "count totals use the admitted file table");
+}
+
+#[test]
+fn counted_scoped_zero_retention_counts_utf16_and_overlaps_without_opening_excluded_files() {
+    let root = Fixture::new(); root.write("a.rs", b"aaaa");
+    root.write("b.rs", &[0xff, 0xfe, b'a', 0, b'a', 0, b'a', 0]);
+    root.write("c.rs", b"excluded");
+    let budget = budget(); let catalog = root.catalog(&budget, 10); let atlas = atlas(&catalog, &budget, 2);
+    let needle = StreamingNeedle::text(owner(), "aa", &budget, allocation(10)).unwrap();
+    let mut job = AtlasStreamSearch::new_scoped_counting(&atlas, &needle, revision(100), generation(1),
+        AtlasStreamLimits { max_matches: 0, ..Default::default() }, &[0, 1],
+        &budget, [allocation(11), allocation(12)]).unwrap();
+    let mut opens = 0;
+    for _ in 0..100 {
+        if job.state() != AtlasStreamState::Pending { break; }
+        job.step(StreamReadStep::default(), generation(1), |_, path| {
+            assert_ne!(path.as_bytes(), b"c.rs"); opens += 1;
+            File::open(root.0.join(path.raw().to_path_buf())).map_err(|_| SourceError::CaptureUnavailable)
+        }, || false).unwrap();
+    }
+    let report = job.finish().unwrap();
+    assert_eq!(opens, 2); assert!(report.is_complete()); assert!(report.hits_truncated());
+    assert_eq!(report.eligible_files(), 2); assert_eq!(report.excluded_files(), 1);
+    assert_eq!(report.stats().matches_seen, 5); assert_eq!(report.matching_files_seen(), 2);
+    assert!(report.hits().is_empty()); assert_eq!(report.retained_witness_bytes(), 0);
+    assert_eq!(report.files()[0].matches_seen(), 3); assert_eq!(report.files()[1].matches_seen(), 2);
+    assert_eq!(report.files()[1].hit_count(), 0); assert_eq!(report.stats().bytes_read, 12);
+}
+
+#[test]
+fn counted_search_does_not_treat_io_caps_as_exhaustive_counts() {
+    let root = Fixture::new(); root.write("a.rs", b"aaaa"); root.write("b.rs", b"aaaa");
+    let budget = budget(); let catalog = root.catalog(&budget, 10); let atlas = atlas(&catalog, &budget, 2);
+    for (base, limits, reason) in [
+        (10, AtlasStreamLimits { max_matches: 1, max_bytes: 4, ..Default::default() }, AtlasStreamStop::ByteLimit),
+        (20, AtlasStreamLimits { max_matches: 1, max_read_calls: 1, ..Default::default() }, AtlasStreamStop::ReadCallLimit),
+    ] {
+        let report = run_mode(&atlas, "aa", limits, &budget, base, true);
+        assert!(!report.is_complete()); assert!(report.hits_truncated());
+        assert_eq!(report.stop_reason(), Some(reason)); assert_eq!(report.stats().matches_seen, 3);
+        assert_eq!(report.files_examined(), 1); assert_eq!(report.unexamined_files(), 1);
+        assert_eq!(report.hits().len(), 1); assert_eq!(report.matching_files_seen(), 1);
+        assert_eq!(report.stats().bytes_read, 4); assert_eq!(report.stats().read_calls, 1);
+    }
+}
+
+#[test]
+fn counted_unsupported_file_after_row_cap_cannot_contribute_false_exact_totals() {
+    let root = Fixture::new(); root.write("a.rs", b"aaaa");
+    let mut invalid = b"aa".to_vec(); invalid.resize(16 * 1024, b'x'); invalid.push(0xff);
+    root.write("b.rs", &invalid); root.write("c.rs", b"aaa");
+    let budget = budget(); let catalog = root.catalog(&budget, 10); let atlas = atlas(&catalog, &budget, 2);
+    let report = run_mode(&atlas, "aa", AtlasStreamLimits { max_matches: 1, ..Default::default() }, &budget, 10, true);
+    assert!(!report.is_complete()); assert_eq!(report.stop_reason(), None);
+    assert_eq!(report.stats().matches_seen, 5); assert_eq!(report.matching_files_seen(), 2);
+    assert_eq!(report.stats().incomplete_files, 1); assert_eq!(report.files_examined(), 3);
+    assert_eq!(report.files()[1].state(), AtlasStreamFileState::Scanned(StreamReadState::UnsupportedText));
+    assert_eq!(report.files()[1].matches_seen(), 0); assert_eq!(report.hits().len(), 1);
 }
 
 #[test]

@@ -73,6 +73,18 @@ private enum StreamFixture {
         if !request.fileScope.isAll || !request.pathScope.isWorkspace {
             value.merge(scope(request), uniquingKeysWith: { _, next in next })
         }
+        if request.countAllMatches {
+            value = counted(value, matches: UInt64(count), matchingFiles: count == 0 ? 0 : 1)
+        }
+        return value
+    }
+    static func counted(_ report: [String: Any], matches: UInt64, matchingFiles: UInt64) -> [String: Any] {
+        var value = report
+        value["count_all_matches"] = true
+        value["match_count_complete"] = report["search_complete"]
+        value["retained_matching_files"] = report["retained_matching_files"] ?? report["matching_files"]
+        value["matching_files"] = String(matchingFiles); value["matches_seen"] = String(matches)
+        value["truncated"] = matches > UInt64(report["retained_hits"] as! String)!
         return value
     }
     static func page(_ report: [String: Any], offset: Int = 0) -> [String: Any] {
@@ -112,6 +124,7 @@ private enum StreamProgressFixture {
         value["files_examined"] = stopped ? String(examined) : "2"
         value["files_unexamined"] = stopped ? String(2 - examined) : "0"
         value["search_complete"] = !stopped; value["stop_reason"] = stopped ? "user-stopped" as Any : NSNull()
+        if request.countAllMatches { value["match_count_complete"] = !stopped }
         let bytes = stopped ? payload : 2 * StreamFixture.length
         value["payload_bytes_read"] = String(bytes); value["scanned_input_bytes"] = String(bytes)
         value["read_calls"] = String((bytes + 16_383) / 16_384)
@@ -209,7 +222,9 @@ private final class StreamProbe: @unchecked Sendable {
             return result
         }
         gate?.wait()
-        var report = StreamFixture.report(owner, stale ? generation - 1 : generation, request)
+        var report = StreamFixture.report(owner, stale ? generation - 1 : generation, request,
+            count: request.countAllMatches ? 256 : 40)
+        if request.countAllMatches { report = StreamFixture.counted(report, matches: 2_000, matchingFiles: 1) }
         locked { reports[owner] = report }
         if fails { report["scope"] = "visible-only" } // Backend already replaced before bad delivery.
         return try StreamFixture.json(StreamFixture.page(report))
@@ -227,7 +242,9 @@ private final class StreamProbe: @unchecked Sendable {
         publish(try StreamFixture.json(StreamProgressFixture.progress(owner, generation, request,
             sequence: 1, count: 0, examined: 0, payload: 16_384)))
         for sequence in UInt64(2)...UInt64(burst ? 128 : 2) {
-            var progress = StreamProgressFixture.progress(owner, generation, request, sequence: sequence)
+            var progress = StreamProgressFixture.progress(owner, generation, request, sequence: sequence,
+                count: request.countAllMatches ? 256 : 40)
+            if request.countAllMatches { progress = StreamFixture.counted(progress, matches: 1_000, matchingFiles: 1) }
             if poisoned { progress["scope"] = "visible-only" }
             publish(try StreamFixture.json(progress))
             if flag.isCanceled { throw AtlasWorkspaceStreamError.canceled }
@@ -237,7 +254,12 @@ private final class StreamProbe: @unchecked Sendable {
             if stop.isRequested { stoppedRequests += 1; stoppedWithCancellation = stoppedWithCancellation || flag.isCanceled }
         }
         guard !flag.isCanceled else { throw AtlasWorkspaceStreamError.canceled }
-        let report = StreamProgressFixture.report(owner, stale ? generation - 1 : generation, request, stopped: stop.isRequested)
+        var report = StreamProgressFixture.report(owner, stale ? generation - 1 : generation, request,
+            stopped: stop.isRequested, count: request.countAllMatches ? 256 : 40)
+        if request.countAllMatches {
+            report = StreamFixture.counted(report, matches: stop.isRequested ? 1_000 : 2_000,
+                matchingFiles: stop.isRequested ? 1 : 2)
+        }
         locked { reports[owner] = report }
         return try StreamFixture.json(StreamFixture.page(report))
     }
@@ -303,7 +325,9 @@ private final class StreamContextProbe: @unchecked Sendable {
     static func main() async throws {
         try wireTests()
         try scopeWireTests()
+        try countedWireTests()
         try progressWireTests()
+        try await countedModelTests()
         try await progressModelTests()
         try await modelTests()
         try await scopedModelTests()
@@ -541,6 +565,143 @@ private final class StreamContextProbe: @unchecked Sendable {
         visibleWire["search_complete"] = false; visibleWire["scope_region_sha256"] = String(repeating: "0", count: 64)
         rejects("changed visible membership") { _ = try page(visibleWire, request: visible) }
         #endif
+    }
+
+    private static func countedWireTests() throws {
+        let owner: UInt64 = 0xfedcba9876543210
+        let request = try AtlasWorkspaceStreamRequest(needle: "old", maximumMatches: 2, countAllMatches: true)
+        let bounded = try AtlasWorkspaceStreamRequest(needle: "old", maximumMatches: 2)
+        precondition(!bounded.countAllMatches && request != bounded,
+            "Full counting is an explicit immutable request option")
+        let catalog = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(StreamProgressFixture.catalog(owner)), owner: owner)
+        let base = StreamFixture.counted(StreamProgressFixture.report(owner, 7, request,
+            stopped: false, count: 2), matches: 2_000, matchingFiles: 2)
+        func page(_ value: [String: Any], selected: AtlasWorkspaceStreamRequest? = nil) throws -> AtlasWorkspaceStreamPage {
+            try .decode(StreamFixture.json(StreamFixture.page(value)), catalog: catalog, root: catalog.root,
+                request: selected ?? request, requireTerminal: true)
+        }
+        func report(_ value: [String: Any]) throws -> AtlasWorkspaceStreamReport {
+            let decoded = try page(value)
+            return try .init(summary: decoded.summary, hits: decoded.hits)
+        }
+        let accepted = try report(base)
+        precondition(accepted.summary.complete && accepted.summary.matchCountComplete && accepted.summary.truncated)
+        precondition(accepted.summary.matchesSeen == 2_000 && accepted.summary.matchingFiles == 2
+            && accepted.summary.retainedMatchingFiles == 1 && accepted.hits.count == 2,
+            "Later files count even when the retained result inventory is already full")
+        precondition(accepted.summary.countLabel == "2000 matches in 2 observed files; first 2 retained")
+        precondition(accepted.summary.coverage.contains("counts include later matches"))
+        let target = accepted.target(for: accepted.hits[0]), witness = StreamFixture.witness(base, index: 0)
+        _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(witness), report: accepted,
+            root: catalog.root, target: target)
+        rejects("Counted reply cannot change a bounded request") { _ = try page(base, selected: bounded) }
+        for (key, value) in [("count_all_matches", false as Any), ("count_all_matches", "true" as Any),
+            ("match_count_complete", false as Any), ("match_count_complete", NSNull() as Any),
+            ("retained_matching_files", "0" as Any), ("retained_matching_files", "2" as Any),
+            ("retained_matching_files", "01" as Any), ("matching_files", "3" as Any),
+            ("matches_seen", "1" as Any), ("matches_seen", String(UInt64.max) as Any),
+            ("truncated", false as Any), ("stop_reason", "match-limit" as Any)] {
+            var bad = base; bad[key] = value
+            rejects("Counted report \(key)") { _ = try report(bad) }
+        }
+        let extensionFields = ["count_all_matches", "match_count_complete", "retained_matching_files"]
+        for key in extensionFields {
+            var bad = base; bad.removeValue(forKey: key)
+            rejects("Incomplete count extension \(key)") { _ = try report(bad) }
+            var badHit = witness; badHit.removeValue(forKey: key)
+            rejects("Counted witness omitted \(key)") {
+                _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(badHit), report: accepted,
+                    root: catalog.root, target: target)
+            }
+            badHit = witness; badHit[key] = key == "retained_matching_files" ? "2" as Any : false as Any
+            rejects("Counted witness changed \(key)") {
+                _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(badHit), report: accepted,
+                    root: catalog.root, target: target)
+            }
+        }
+
+        // Older bounded-mode receipts remain valid, but an absent or partial
+        // extension cannot silently turn a requested full count into that mode.
+        let legacy = StreamProgressFixture.report(owner, 8, bounded, stopped: false, count: 2)
+        let legacyPage = try page(legacy, selected: bounded)
+        precondition(legacyPage.summary.matchCountComplete && legacyPage.summary.retainedMatchingFiles == 1)
+        rejects("Counted request accepted a legacy receipt") { _ = try page(legacy) }
+        var explicitBounded = legacy
+        explicitBounded["count_all_matches"] = false; explicitBounded["match_count_complete"] = true
+        explicitBounded["retained_matching_files"] = "1"
+        let explicitPage = try page(explicitBounded, selected: bounded)
+        precondition(explicitPage.summary == legacyPage.summary)
+        for key in extensionFields {
+            var partial = explicitBounded; partial.removeValue(forKey: key)
+            rejects("Partial bounded count extension") { _ = try page(partial, selected: bounded) }
+        }
+        var widened = explicitBounded
+        widened["matches_seen"] = "2000"; widened["truncated"] = true
+        rejects("Legacy mode cannot silently count beyond its result limit") { _ = try page(widened, selected: bounded) }
+
+        let progressWire = StreamFixture.counted(StreamProgressFixture.progress(owner, 7, request,
+            sequence: 1, count: 2), matches: 1_000, matchingFiles: 1)
+        let progress = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(progressWire), catalog: catalog, request: request)
+        precondition(progress.summary.truncated && !progress.summary.complete && !progress.summary.matchCountComplete)
+        precondition(progress.countLabel.contains("1000 matches so far") && progress.page.hits.count == 2)
+        try progress.validateTerminal(page(base))
+        var falseComplete = progressWire; falseComplete["match_count_complete"] = true
+        rejects("Provisional full count cannot claim completion") {
+            _ = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(falseComplete), catalog: catalog, request: request)
+        }
+        var regressed = base; regressed["matches_seen"] = "999"
+        rejects("Terminal count regressed below finalized progress") { try progress.validateTerminal(page(regressed)) }
+
+        let stoppedWire = StreamFixture.counted(StreamProgressFixture.report(owner, 7, request,
+            stopped: true, count: 2), matches: 1_000, matchingFiles: 1)
+        let stopped = try report(stoppedWire)
+        try progress.validateTerminal(page(stoppedWire))
+        precondition(stopped.summary.truncated && !stopped.summary.matchCountComplete
+            && stopped.summary.countLabel.hasPrefix("At least 1000 matches")
+            && stopped.summary.stop == "user-stopped")
+        var budget = stoppedWire
+        budget["stop_reason"] = "byte-limit"
+        budget["payload_bytes_read"] = String(request.maximumScanBytes)
+        budget["scanned_input_bytes"] = String(request.maximumScanBytes)
+        budget["read_calls"] = String(request.maximumScanBytes / 16_384)
+        let limited = try report(budget)
+        precondition(!limited.summary.matchCountComplete && limited.summary.countLabel.hasPrefix("At least"))
+        budget["match_count_complete"] = true
+        rejects("Byte-limited count cannot claim exact totals") { _ = try report(budget) }
+    }
+
+    @MainActor private static func countedModelTests() async throws {
+        let probe = StreamProbe(), model = AtlasWorkspaceStreamModel(transport: probe.progressiveTransport, query: "old")
+        precondition(!model.countAllMatches)
+        model.open(.init(root: StreamFixture.root, project: UUID(), browserOwner: 1, access: nil))
+        try await wait("counted catalog") { !model.busy && model.catalog != nil }
+        model.countAllMatches = true
+        let gate = ObservedReaderGate(); probe.blockProgress(gate); model.search()
+        try await wait("counting beyond retained rows") { gate.entered && model.progress?.summary.matchesSeen == 1_000 }
+        precondition(model.progress?.summary.request.countAllMatches == true
+            && model.progress?.summary.retainedHits == 256 && !model.canSelect)
+        gate.release()
+        try await wait("complete counted inventory") { !model.busy && model.reportAuthorized }
+        let accepted = model.report!
+        precondition(accepted.summary.matchCountComplete && accepted.summary.matchesSeen == 2_000
+            && accepted.summary.matchingFiles == 2 && accepted.summary.retainedMatchingFiles == 1
+            && accepted.hits.count == 256 && probe.pageCount == 7)
+        model.select(accepted.target(for: accepted.hits[0]))
+        try await wait("counted retained literal") { !model.busy && model.witness != nil }
+        model.countAllMatches = false
+        precondition(model.report == nil && model.witness == nil && !model.canSelect,
+            "Changing the counting policy revokes prior evidence and selection authority")
+
+        model.countAllMatches = true
+        let obsolete = ObservedReaderGate(); probe.blockProgress(obsolete); model.search()
+        try await wait("obsolete counted progress") { obsolete.entered && model.progress != nil }
+        model.countAllMatches = false
+        precondition(!model.busy && model.progress == nil && model.report == nil)
+        obsolete.release(); try await wait("counted worker drain") { probe.activeCount == 0 }
+        await Task.yield(); precondition(model.report == nil && model.progress == nil)
+        model.search(); try await wait("bounded search after policy change") { !model.busy && model.reportAuthorized }
+        precondition(model.report?.summary.request.countAllMatches == false && model.report?.hits.count == 40)
+        model.close(); try await wait("counted owners retired") { probe.closedCount == probe.createCount }
     }
 
     private static func progressWireTests() throws {

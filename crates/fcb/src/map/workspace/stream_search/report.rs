@@ -23,8 +23,8 @@ pub struct AtlasStreamStats {
     pub read_calls: u64,
     pub interrupted_calls: u64,
     pub peak_input_buffer_bytes: usize,
-    /// Counts only finalized file reports. At most one unretained lookahead
-    /// occurrence is counted; a partial result is not an exhaustive total.
+    /// Counts only finalized file reports, including occurrences beyond the row
+    /// limit in counting mode. A partial scan is not an exhaustive total.
     pub matches_seen: u64,
     pub incomplete_files: usize,
 }
@@ -54,6 +54,10 @@ pub struct AtlasStreamFile {
     pub(super) unsupported_at: Option<ByteOffset>,
     pub(super) stats: StreamReadStats,
     pub(super) matches_seen: u64,
+    /// Prefix totals support bounded, allocation-free directory aggregation,
+    /// including files with no retained hit rows or witness bytes.
+    pub(super) matches_through: u64,
+    pub(super) matching_files_through: usize,
     pub(super) first_hit: usize,
     pub(super) hit_count: usize,
     pub(super) witness_start: usize,
@@ -100,6 +104,7 @@ pub struct AtlasStreamReport<'atlas, 'catalog, A: AtlasStreamSource = WorkspaceA
     pub(super) atlas: &'atlas A,
     pub(super) generation: QueryGeneration,
     pub(super) limits: AtlasStreamLimits,
+    pub(super) count_all_matches: bool,
     pub(super) files: Vec<AtlasStreamFile>,
     pub(super) hits: Vec<AtlasStreamHit>,
     pub(super) matched_files: Vec<usize>,
@@ -118,6 +123,14 @@ impl<'atlas, 'catalog, A: AtlasStreamSource> AtlasStreamReport<'atlas, 'catalog,
     pub fn atlas(&self) -> &'atlas A { self.atlas }
     pub const fn generation(&self) -> QueryGeneration { self.generation }
     pub const fn limits(&self) -> AtlasStreamLimits { self.limits }
+    pub const fn count_all_matches(&self) -> bool { self.count_all_matches }
+    /// Row retention and scan completeness are independent in counting mode.
+    pub fn hits_truncated(&self) -> bool { self.stats.matches_seen > self.hits.len() as u64 }
+    /// Finalized files with at least one observed occurrence, even when none of
+    /// that file's rows were retained. Unexamined files never contribute.
+    pub fn matching_files_seen(&self) -> usize {
+        self.files.last().map_or(0, |file| file.matching_files_through)
+    }
     pub const fn state(&self) -> AtlasStreamState { self.state }
     pub const fn stop_reason(&self) -> Option<AtlasStreamStop> { self.stop }
     pub const fn stats(&self) -> AtlasStreamStats { self.stats }
@@ -194,6 +207,31 @@ impl<'atlas, 'catalog, A: AtlasStreamSource> AtlasStreamReport<'atlas, 'catalog,
         let file_start = self.matched_files.partition_point(|&i| compare(self.files[i].node) == Ordering::Less);
         let file_end = self.matched_files.partition_point(|&i| compare(self.files[i].node) != Ordering::Greater);
         Ok((end - start, file_end - file_start))
+    }
+
+    /// (observed occurrences, distinct observed matching files) from finalized
+    /// files. These are exhaustive only when `is_complete()` is true. Prefix
+    /// totals live in the already-budgeted file table; lookup performs two binary
+    /// searches and allocates no source-sized or match-sized memory.
+    pub fn counted_matches_in(&self, node: AtlasNodeId) -> Result<(u64, usize), AtlasStreamError> {
+        self.validate_delivery(self.atlas, self.generation)?;
+        let layout = self.atlas.layout();
+        if node.root() != layout.root() || node.layout() != layout.revision() { return Err(AtlasStreamError::WrongAtlas); }
+        let parcel = layout.nodes().get(node.ordinal() as usize).ok_or(AtlasStreamError::InvalidHit)?;
+        if parcel.path().is_empty() { return Ok((self.stats.matches_seen, self.matching_files_seen())); }
+        let compare = |file: &AtlasStreamFile| {
+            let path = layout.nodes()[file.node.ordinal() as usize].path();
+            if parcel.kind() == NodeKind::Directory { subtree_compare(path, parcel.path()) }
+            else { path.cmp(parcel.path()) }
+        };
+        let start = self.files.partition_point(|file| compare(file) == Ordering::Less);
+        let end = self.files.partition_point(|file| compare(file) != Ordering::Greater);
+        let prefix = |position: usize| position.checked_sub(1).map_or((0, 0), |i| {
+            let file = &self.files[i]; (file.matches_through, file.matching_files_through)
+        });
+        let before = prefix(start);
+        let through = prefix(end);
+        Ok((through.0 - before.0, through.1 - before.1))
     }
 }
 

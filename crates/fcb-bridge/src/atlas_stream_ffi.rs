@@ -140,6 +140,55 @@ pub unsafe extern "C" fn fcb_atlas_stream_search_scoped_progress(handle: u64,
     }))
 }
 
+/// Count all occurrences within the scan budgets while retaining at most
+/// max_matches rows. Callbacks are optional, including progress and Stop.
+/// # Safety
+/// Needle/callback/return ownership requirements match
+/// fcb_atlas_stream_search_progress. No foreign pointer is retained.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_stream_search_counted_progress(handle: u64,
+    needle: *const c_char, max_matches: u64, max_scan_bytes: u64, max_read_calls: u64,
+    poll: Option<SearchCancellationCallback>, stop: Option<SearchCancellationCallback>,
+    progress: Option<AtlasStreamProgressCallback>, context: *mut c_void) -> *mut c_char {
+    unsafe { fcb_atlas_stream_search_scoped_counted_progress(handle, needle, max_matches, max_scan_bytes,
+        max_read_calls, std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), poll, stop, progress, context) }
+}
+
+/// Count all scoped occurrences without expanding the retained row/witness
+/// buffers. Scope, cancellation and Stop have the existing progress contract.
+/// # Safety
+/// String/callback/return ownership requirements match
+/// fcb_atlas_stream_search_scoped_progress. All callbacks are optional.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_stream_search_scoped_counted_progress(handle: u64,
+    needle: *const c_char, max_matches: u64, max_scan_bytes: u64, max_read_calls: u64,
+    extensions: *const c_char, filenames: *const c_char, path_kind: u64, path: *const c_char,
+    poll: Option<SearchCancellationCallback>, stop: Option<SearchCancellationCallback>,
+    progress: Option<AtlasStreamProgressCallback>, context: *mut c_void) -> *mut c_char {
+    reply(|| answer(handle, |atlases| {
+        let cancellation_seen = std::cell::Cell::new(false);
+        let canceled = || {
+            let requested = cancellation_seen.get()
+                || poll.is_some_and(|poll| unsafe { poll(context) != 0 });
+            cancellation_seen.set(requested);
+            requested
+        };
+        if canceled() { return Err(AccessError::Canceled); }
+        let needle = unsafe { bounded_needle(needle) }?;
+        let scope = unsafe { bounded_scope(extensions, filenames, path_kind, path) }?;
+        let options = AtlasStreamSearchOptions { max_matches: number(max_matches)?, max_scan_bytes, max_read_calls };
+        atlases.execute_stream_scoped_counted_with_progress(handle, needle, options, &scope, &canceled,
+            || stop.is_some_and(|stop| unsafe { stop(context) != 0 }),
+            |response| {
+                if canceled() { return; }
+                if let Some(progress) = progress {
+                    let bytes = response.as_str().as_bytes();
+                    unsafe { progress(bytes.as_ptr(), bytes.len() as u64, context) };
+                }
+            })
+    }))
+}
+
 /// Page at most 32 retained rows, without source I/O. A missing or replaced
 /// generation is an error, never an empty successful result set.
 #[unsafe(no_mangle)]

@@ -595,10 +595,22 @@ Open the sheet, enter the literal, choose **256 MiB**, **1 GiB**, or **4 GiB** a
 the total source I/O budget, and press **Search**. There is no per-file capture
 ceiling. The scan admits at most 1,048,576 read calls and retains at most 256
 matches. It uses a 16 KiB input buffer and stores one encoded literal witness
-per matching file instead of retaining complete sources. While the scan runs,
+per file with retained matches instead of retaining complete sources. While the scan runs,
 the sheet shows cumulative byte/read progress and previews up to the first 32
 matches from finalized file observations. The unfinished file contributes I/O
 progress, but its tentative matches are withheld until its observation finishes.
+
+Enable **Count all matches** to continue through the selected files after the
+256 retained rows fill. The total includes overlapping occurrences and matching
+files with no retained rows. The sheet distinguishes the total counted matches
+from the rows available to open or copy. A finished, unchanged observation can
+establish a complete count even when additional rows were omitted. If a byte or
+read-call budget, unsupported text, unavailable file, changed source or Stop
+prevents complete coverage, the displayed count remains partial. Counting uses
+the same memory, I/O and cancellation limits; it does not retain more source or
+occurrence rows. Without this option, the first additional match beyond the row
+allowance still stops the scan. Changing the option revokes the previous query's
+results and requires a new search.
 
 Choose **Stop and keep matches** to accept the finalized-file results immediately
 after the current scanner quantum drains. The unfinished file is abandoned and

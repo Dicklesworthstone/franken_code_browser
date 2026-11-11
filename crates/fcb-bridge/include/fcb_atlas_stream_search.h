@@ -101,6 +101,30 @@ char *fcb_atlas_stream_search_scoped_progress(uint64_t handle, const char *needl
     int32_t (*poll)(void *context), int32_t (*stop)(void *context),
     fcb_atlas_stream_progress_callback progress, void *context);
 
+/* Opt-in counting variants. Reaching max_matches limits retained rows and
+ * witness bytes only; scanning continues through eligible files until EOF,
+ * an I/O budget, Stop or cancellation. Legacy entry points retain their
+ * stop-at-first-overflow behavior. All callback pointers may be NULL.
+ *
+ * Summaries echo count_all_matches=true, matches_seen and matching_files for
+ * finalized file observations, plus retained_matching_files for files with
+ * retained rows. match_count_complete equals search_complete and is false in
+ * progress. A complete scan may have truncated=true (matches_seen exceeds
+ * retained_hits) with stop_reason=null. Partial coverage never asserts an
+ * exhaustive total. Hit receipts echo count_all_matches, match_count_complete
+ * and retained_matching_files from the accepted immutable report as well.
+ * The same scope, pointer, progress, Stop and cancellation contracts apply.
+ */
+char *fcb_atlas_stream_search_counted_progress(uint64_t handle, const char *needle,
+    uint64_t max_matches, uint64_t max_scan_bytes, uint64_t max_read_calls,
+    int32_t (*poll)(void *context), int32_t (*stop)(void *context),
+    fcb_atlas_stream_progress_callback progress, void *context);
+char *fcb_atlas_stream_search_scoped_counted_progress(uint64_t handle, const char *needle,
+    uint64_t max_matches, uint64_t max_scan_bytes, uint64_t max_read_calls,
+    const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
+    int32_t (*poll)(void *context), int32_t (*stop)(void *context),
+    fcb_atlas_stream_progress_callback progress, void *context);
+
 /* No source I/O. generation must identify the accepted report; start is a
  * zero-based retained-row position and count is 1..32. next_offset=null means
  * the end of the terminal retained rows, not proof of full source coverage.

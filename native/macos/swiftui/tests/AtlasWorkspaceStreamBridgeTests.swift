@@ -200,7 +200,60 @@ private final class WorkspaceProgressCopies: @unchecked Sendable {
         }
         precondition(count(14) == scopedBefore + UInt32(scopedRequests.count)
             && count(15) == progressiveBefore + UInt32(scopedRequests.count))
+        precondition(count(16) == 0 && count(17) == 0,
+            "Default requests must continue to call the original bounded ABI")
+
+        // Explicit full counting selects the additive ABI without changing the
+        // limits, scopes, copied callback bytes, or terminal ownership rules.
+        let boundedEntries = count(14), boundedProgress = count(15)
+        scopedRequests.append((0, request))
+        for (selection, scoped) in scopedRequests {
+            scope(selection)
+            let counted = try AtlasWorkspaceStreamRequest(needle: scoped.needle,
+                maximumScanBytes: scoped.maximumScanBytes, maximumMatches: scoped.maximumMatches,
+                maximumReadCalls: scoped.maximumReadCalls, fileScope: scoped.fileScope,
+                pathScope: scoped.pathScope, countAllMatches: true)
+            let direct = try transport.search(owner, counted, AtlasSearchCancellation())
+            let kept = AtlasWorkspaceStreamStop(), countedCopies = WorkspaceProgressCopies()
+            let streamed = try progressive(owner, counted, AtlasSearchCancellation(), kept) { text in
+                countedCopies.append(text); kept.requestStop()
+            }
+            precondition(direct == expected && streamed == expected && kept.isRequested)
+            precondition(countedCopies.values == ["{\"fixture\":\"workspace-progress\"}"])
+            precondition(allocations() == frees())
+        }
+        precondition(count(16) == UInt32(scopedRequests.count) && count(17) == UInt32(scopedRequests.count))
+        precondition(count(14) == boundedEntries && count(15) == boundedProgress)
         scope(0)
+        let counted = try AtlasWorkspaceStreamRequest(needle: request.needle,
+            maximumScanBytes: request.maximumScanBytes, countAllMatches: true)
+        let countedEntries = count(16), countedProgress = count(17)
+        do {
+            _ = try transport.search(owner, counted, canceledBeforeEntry)
+            preconditionFailure("Canceled counted request crossed ABI")
+        } catch AtlasWorkspaceStreamError.canceled { }
+        do {
+            _ = try progressive(owner, counted, canceledBeforeEntry, AtlasWorkspaceStreamStop()) { _ in }
+            preconditionFailure("Canceled counted progress crossed ABI")
+        } catch AtlasWorkspaceStreamError.canceled { }
+        precondition(count(16) == countedEntries && count(17) == countedProgress)
+        for lateMode in [Int32(4), Int32(5)] {
+            mode(lateMode)
+            let live = AtlasSearchCancellation()
+            do {
+                _ = try transport.search(owner, counted, live)
+                preconditionFailure("Counted fallback accepted late cancellation")
+            } catch AtlasWorkspaceStreamError.canceled { }
+            precondition(live.isCanceled && allocations() == frees())
+        }
+        mode(8)
+        let rejected = WorkspaceProgressCopies()
+        do {
+            _ = try progressive(owner, counted, AtlasSearchCancellation(), AtlasWorkspaceStreamStop()) { rejected.append($0) }
+            preconditionFailure("Counted search accepted malformed borrowed progress")
+        } catch AtlasWorkspaceStreamError.invalidResponse { }
+        precondition(rejected.values.isEmpty && allocations() == frees())
+        mode(0)
         print("Workspace stream ABI ownership, progressive bytes, Stop and cancellation fixtures passed")
     }
 }

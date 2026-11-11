@@ -27,8 +27,22 @@ impl AtlasSessions {
     }
 
     pub(crate) fn execute_stream_scoped_with_progress(&self, handle: u64, needle: &str,
+        options: AtlasStreamSearchOptions, scope: &AtlasSearchScope, canceled: impl FnMut() -> bool,
+        stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
+        -> Result<HostResponse, AccessError> {
+        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress, false)
+    }
+
+    pub(crate) fn execute_stream_scoped_counted_with_progress(&self, handle: u64, needle: &str,
+        options: AtlasStreamSearchOptions, scope: &AtlasSearchScope, canceled: impl FnMut() -> bool,
+        stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
+        -> Result<HostResponse, AccessError> {
+        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress, true)
+    }
+
+    fn execute_stream_progress_inner(&self, handle: u64, needle: &str,
         options: AtlasStreamSearchOptions, scope: &AtlasSearchScope, mut canceled: impl FnMut() -> bool,
-        stopped: impl FnMut() -> bool, mut progress: impl FnMut(&HostResponse))
+        stopped: impl FnMut() -> bool, mut progress: impl FnMut(&HostResponse), count_all_matches: bool)
         -> Result<HostResponse, AccessError> {
         let cell = self.get(handle)?;
         let epoch = cell.epoch.load(Ordering::Acquire);
@@ -36,10 +50,19 @@ impl AtlasSessions {
         cell.validate(epoch)?;
         let session = state.as_mut().ok_or(AccessError::NotOpen)?;
         session.synchronize(epoch);
-        let result = session.stream.search_scoped_with_progress(&session.atlas, needle, options, scope.clone(),
-            || cell.validate(epoch).is_err() || canceled(), stopped, |response| {
+        let result = {
+            let mut guarded_canceled = || cell.validate(epoch).is_err() || canceled();
+            let mut guarded_progress = |response: &HostResponse| {
                 if cell.validate(epoch).is_ok() { progress(response); }
-            });
+            };
+            if count_all_matches {
+                session.stream.search_scoped_counted_with_progress(&session.atlas, needle, options, scope.clone(),
+                    &mut guarded_canceled, stopped, &mut guarded_progress)
+            } else {
+                session.stream.search_scoped_with_progress(&session.atlas, needle, options, scope.clone(),
+                    &mut guarded_canceled, stopped, &mut guarded_progress)
+            }
+        };
         if let Err(error) = cell.validate(epoch) {
             session.cancel_work();
             return Err(error);

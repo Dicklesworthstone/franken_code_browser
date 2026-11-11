@@ -46,9 +46,9 @@ for encoding, coverage and capture limits.
 The current source also adds **Search large project files…** in the search sidebar.
 It streams exact UTF-8 or BOM-marked UTF-16 text across the project catalog beyond
 ordinary capture limits, with a selectable 256 MiB–4 GiB total I/O budget,
-progressive finalized-file previews, **Stop and keep matches**, explicit
-partial-coverage reporting, retained-match copying, and separately verified
-current-context reads. See the [native search workflow](native/macos/README.md#searching-large-files-across-a-project)
+progressive finalized-file previews, **Stop and keep matches**, optional
+**Count all matches** beyond the retained-result limit, explicit partial-coverage
+reporting, retained-match copying, and separately verified current-context reads. See the [native search workflow](native/macos/README.md#searching-large-files-across-a-project)
 for its catalog and result limits. This addition still requires executable and
 physical-Mac qualification; it is not a claim about an already released binary.
 

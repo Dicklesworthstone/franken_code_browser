@@ -9,7 +9,7 @@
 
 enum { CREATE, OPEN, SEARCH, PAGE, HIT, CLEAR, CANCEL, CLOSE, POLLS,
     PROGRESS_SEARCH, PROGRESS_CALLBACKS, STOP_POLLS, STOP_SEEN, PROGRESS_CANCELED,
-    SCOPED_SEARCH, SCOPED_PROGRESS, COUNTERS };
+    SCOPED_SEARCH, SCOPED_PROGRESS, COUNTED_SEARCH, COUNTED_PROGRESS, COUNTERS };
 static uint32_t counts[COUNTERS], allocations, frees;
 static int32_t mode;
 static uint32_t expected_scope;
@@ -175,6 +175,26 @@ char *fcb_atlas_stream_search_scoped_progress(uint64_t owner, const char *needle
     ++counts[SCOPED_PROGRESS]; check_scope(extensions, filenames, path_kind, path);
     char *result = fcb_atlas_stream_search_progress(owner, needle, maximum_matches,
         maximum_bytes, maximum_calls, poll, stop, progress, context);
+    check_scope(extensions, filenames, path_kind, path);
+    return result;
+}
+char *fcb_atlas_stream_search_scoped_counted_progress(uint64_t owner, const char *needle,
+    uint64_t maximum_matches, uint64_t maximum_bytes, uint64_t maximum_calls,
+    const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
+    workspace_fixture_poll poll, workspace_fixture_poll stop,
+    fcb_atlas_stream_progress_callback progress, void *context) {
+    check_scope(extensions, filenames, path_kind, path);
+    char *result;
+    if (stop == NULL && progress == NULL) {
+        ++counts[COUNTED_SEARCH];
+        result = fcb_atlas_stream_search_cancelable(owner, needle, maximum_matches,
+            maximum_bytes, maximum_calls, poll, context);
+    } else {
+        assert(stop != NULL && progress != NULL);
+        ++counts[COUNTED_PROGRESS];
+        result = fcb_atlas_stream_search_progress(owner, needle, maximum_matches,
+            maximum_bytes, maximum_calls, poll, stop, progress, context);
+    }
     check_scope(extensions, filenames, path_kind, path);
     return result;
 }

@@ -743,3 +743,121 @@ fn revocation_from_progress_and_invalid_admission_cannot_publish_a_new_inventory
     assert_eq!(before, (service.source_bytes_read(), service.read_calls()));
     assert!(service.page(&atlas, 1, 0, 32).is_err(), "retained evidence cannot bypass revoked authority");
 }
+
+#[test]
+fn counted_search_finishes_later_files_with_bounded_witnesses_and_stable_page_counts() {
+    let fixture = Fixture::new();
+    fixture.write("a.rs", b"banana banana");
+    let le: Vec<u8> = "\u{feff}banana".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let be: Vec<u8> = "\u{feff}banana banana".encode_utf16().flat_map(u16::to_be_bytes).collect();
+    fixture.write("b.rs", &le); fixture.write("c.rs", &be); fixture.write("d.rs", b"absent");
+    let atlas = fixture.atlas(64); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let options = AtlasStreamSearchOptions { max_matches: 1, ..opts() };
+    let legacy = json(&service.search(&atlas, "ana", options, || false).unwrap());
+    assert!(!legacy.get("count_all_matches").flag());
+    assert!(!legacy.get("match_count_complete").flag());
+    assert_eq!(legacy.get("matches_seen").number(), 2);
+    assert_eq!(legacy.get("stop_reason").text(), "match-limit");
+
+    let response = service.search_counted(&atlas, "ana", options, || false).unwrap();
+    assert_eq!(response.exit_code(), EXIT_PARTIAL, "omitted rows remain explicit in the exit code");
+    let report = json(&response);
+    assert!(report.get("search_complete").flag());
+    assert!(report.get("match_count_complete").flag());
+    assert!(report.get("count_all_matches").flag());
+    assert!(report.get("truncated").flag());
+    assert_eq!(report.get("stop_reason"), &Json::Null);
+    assert_eq!(report.get("matches_seen").number(), 10);
+    assert_eq!(report.get("matching_files").number(), 3);
+    assert_eq!(report.get("retained_matching_files").number(), 1);
+    assert_eq!(report.get("retained_hits").number(), 1);
+    assert_eq!(report.get("files_examined").number(), 4);
+    assert_eq!(report.get("files_unexamined").number(), 0);
+    assert_eq!(report.get("payload_bytes_read").number(), (13 + le.len() + be.len() + 6) as u64);
+    assert!(report.get("peak_input_buffer_bytes").number() <= 16 * 1024);
+    assert_eq!(service.retained_witness_bytes(), 3);
+    let generation = report.get("query_generation").number();
+    let io = (service.source_bytes_read(), service.read_calls());
+    fixture.write("a.rs", b"changed after search");
+    let page = json(&service.page(&atlas, generation, 0, 1).unwrap());
+    for key in ["count_all_matches", "match_count_complete", "search_complete", "truncated",
+        "matches_seen", "matching_files", "retained_matching_files", "retained_hits"] {
+        assert_eq!(page.get(key), report.get(key), "{key}");
+    }
+    let hit = json(&service.hit(&atlas, generation, 0).unwrap());
+    assert!(hit.get("count_all_matches").flag()); assert!(hit.get("match_count_complete").flag());
+    assert_eq!(hit.get("retained_matching_files").number(), 1);
+    assert_eq!(hit.get("hit").get("original_hex").text(), hex(b"ana"));
+    assert_eq!(bounds(hit.get("hit").get("original_range")), (1, 4));
+    assert!(matches!(service.hit(&atlas, generation, 1), Err(AtlasStreamSearchError::MissingHit)));
+    assert_eq!(io, (service.source_bytes_read(), service.read_calls()));
+}
+
+#[test]
+fn counted_search_keeps_scope_and_work_limits_separate_from_row_omissions() {
+    let fixture = Fixture::new();
+    fixture.write("a-excluded.rs", &vec![b'a'; 1024 * 1024]);
+    fixture.write("src/a.rs", b"aaaaaaaaaa"); fixture.write("src/b.rs", b"aaaaa");
+    let atlas = fixture.atlas(64); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let scope = AtlasSearchScope::all().with_path(AtlasSearchPathKind::Directory, "src").unwrap();
+    for (options, expected_matches, expected_bytes, stop) in [
+        (AtlasStreamSearchOptions { max_matches: 1, max_scan_bytes: 5, ..opts() }, 4, 5, "byte-limit"),
+        (AtlasStreamSearchOptions { max_matches: 1, max_read_calls: 1, ..opts() }, 9, 10, "read-call-limit"),
+    ] {
+        let response = service.search_scoped_counted(&atlas, "aa", options, scope.clone(), || false).unwrap();
+        assert_eq!(response.exit_code(), EXIT_PARTIAL);
+        let report = json(&response);
+        assert!(report.get("count_all_matches").flag()); assert!(report.get("truncated").flag());
+        assert!(!report.get("search_complete").flag()); assert!(!report.get("match_count_complete").flag());
+        assert_eq!(report.get("matches_seen").number(), expected_matches);
+        assert_eq!(report.get("payload_bytes_read").number(), expected_bytes);
+        assert_eq!(report.get("stop_reason").text(), stop);
+        assert_eq!(report.get("eligible_files").number(), 2); assert_eq!(report.get("excluded_files").number(), 1);
+        assert_eq!(report.get("files_unexamined").number(), 1);
+        assert_eq!(report.get("matching_files").number(), 1);
+        assert_eq!(report.get("retained_matching_files").number(), 1);
+    }
+    let complete = json(&service.search_scoped_counted(&atlas, "aa",
+        AtlasStreamSearchOptions { max_matches: 1, ..opts() }, scope, || false).unwrap());
+    assert!(complete.get("match_count_complete").flag()); assert!(complete.get("truncated").flag());
+    assert_eq!(complete.get("matches_seen").number(), 13);
+    assert_eq!(complete.get("matching_files").number(), 2);
+    assert_eq!(complete.get("payload_bytes_read").number(), 15);
+}
+
+#[test]
+fn counted_progress_stop_and_cancellation_keep_finalized_counts_after_retention_fills() {
+    use std::cell::Cell;
+    let fixture = Fixture::new();
+    fixture.write("a.rs", b"banana banana"); fixture.write("b.rs", b"banana");
+    let atlas = fixture.atlas(64); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let options = AtlasStreamSearchOptions { max_matches: 1, ..opts() };
+    let stop = Cell::new(false); let mut frames = Vec::new();
+    let response = service.search_counted_with_progress(&atlas, "ana", options,
+        || false, || stop.get(), |response| {
+            let frame = json(response);
+            assert!(frame.get("count_all_matches").flag());
+            assert!(!frame.get("match_count_complete").flag());
+            assert!(frame.get("retained_hits").number() <= 1);
+            if frame.get("matches_seen").number() == 4 { stop.set(true); }
+            frames.push(frame);
+        }).unwrap();
+    assert!(stop.get()); assert_eq!(frames.len(), 2); assert_eq!(response.exit_code(), EXIT_PARTIAL);
+    let report = json(&response);
+    assert_eq!(report.get("stop_reason").text(), "user-stopped");
+    assert_eq!(report.get("matches_seen").number(), 4);
+    assert_eq!(report.get("files_examined").number(), 1);
+    assert_eq!(report.get("files_unexamined").number(), 1);
+    assert!(report.get("truncated").flag()); assert!(!report.get("match_count_complete").flag());
+    let generation = report.get("query_generation").number();
+    let cancel = Cell::new(false);
+    let rejected = service.search_counted_with_progress(&atlas, "ana", options,
+        || cancel.get(), || false, |response| {
+            if json(response).get("matches_seen").number() == 4 { cancel.set(true); }
+        });
+    assert!(cancel.get()); assert!(matches!(rejected, Err(AtlasStreamSearchError::Canceled)));
+    assert_eq!(service.accepted_generation(), Some(generation));
+    let retained = json(&service.page(&atlas, generation, 0, 1).unwrap());
+    assert_eq!(retained.get("matches_seen"), report.get("matches_seen"));
+    assert_eq!(retained.get("hits"), report.get("hits"));
+}

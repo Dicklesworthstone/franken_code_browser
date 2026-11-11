@@ -239,6 +239,9 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
     var scanBytes: UInt64 = AtlasWorkspaceStreamLimits.scanBytes {
         didSet { if oldValue != scanBytes { revokeQuery() } }
     }
+    var countAllMatches = false {
+        didSet { if oldValue != countAllMatches { revokeQuery() } }
+    }
     @ObservationIgnored private let transport: AtlasWorkspaceStreamTransport
     @ObservationIgnored private let io = AtlasProjectIO()
     @ObservationIgnored private var authority: AtlasWorkspaceStreamSource?
@@ -264,7 +267,8 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
     private func currentRequest() throws -> AtlasWorkspaceStreamRequest {
         guard let authority else { throw AtlasWorkspaceStreamError.unavailable }
         return try .init(needle: queryText, maximumScanBytes: scanBytes,
-            fileScope: authority.fileScope, pathScope: authority.pathScope)
+            fileScope: authority.fileScope, pathScope: authority.pathScope,
+            countAllMatches: countAllMatches)
     }
     var canRefresh: Bool { !closed && authority != nil }
     var canStopAndKeep: Bool { !closed && busy && searching && !stopping && stopFlag != nil }

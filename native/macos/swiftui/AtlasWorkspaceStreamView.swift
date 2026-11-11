@@ -50,6 +50,14 @@ import AppKit
                     Button(model.searching ? "Cancel and discard" : "Cancel", action: model.cancel)
                 }
             }
+            HStack(spacing: 8) {
+                Toggle("Count all matches", isOn: $model.countAllMatches).toggleStyle(.checkbox)
+                    .help("Continue counting after the first 256 retained results, within the selected byte and read-call limits")
+                Text(model.countAllMatches
+                    ? "Scan past the result limit; keep the first 256 results. Counts are exact only when the search completes."
+                    : "The search stops when the result limit is reached.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             HStack {
                 if let catalog = model.catalog {
                     Text("\(catalog.files) catalogued files · \(catalog.discoveryComplete ? "discovery complete under product exclusions" : "discovery incomplete")")
@@ -59,7 +67,7 @@ import AppKit
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text("Up to 256 matches · literal text, not regular expressions")
+                Text("Up to 256 retained results · literal text, not regular expressions")
                     .font(.caption).foregroundStyle(.secondary)
             }
             if let progress = model.progress {
@@ -90,6 +98,7 @@ import AppKit
         .onDisappear { presentation.close() }
         .onChange(of: model.queryText) { _, _ in copyNotice = "" }
         .onChange(of: model.scanBytes) { _, _ in copyNotice = "" }
+        .onChange(of: model.countAllMatches) { _, _ in copyNotice = "" }
         .onChange(of: model.witness?.target) { _, _ in copyNotice = "" }
         .sheet(item: Binding(get: { model.currentContext }, set: { if $0 == nil { model.closeContext() } })) { context in
             AtlasObservedReaderView(presentation: context)
