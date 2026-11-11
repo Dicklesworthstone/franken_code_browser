@@ -7,10 +7,12 @@ import Foundation
 @_silgen_name("fcb_saved_attach_index") private func savedAttachIndex(_ h: UInt64, _ generation: UInt64, _ path: UnsafePointer<CChar>?, _ pin: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_detach_index") private func savedDetachIndex(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_search") private func savedSearch(_ h: UInt64, _ generation: UInt64, _ needle: UnsafePointer<CChar>?, _ matches: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_search_counted") private func savedCountedSearch(_ h: UInt64, _ generation: UInt64, _ needle: UnsafePointer<CChar>?, _ matches: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_results") private func savedResults(_ h: UInt64, _ generation: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_clear_results") private func savedClearResults(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_open_hit_reader") private func savedHitReader(_ h: UInt64, _ reader: UInt64, _ generation: UInt64, _ hit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_expression_search") private func savedExpressionSearch(_ h: UInt64, _ generation: UInt64, _ query: UnsafePointer<CChar>?, _ matches: UInt64, _ scanBytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_expression_search_counted") private func savedCountedExpressionSearch(_ h: UInt64, _ generation: UInt64, _ query: UnsafePointer<CChar>?, _ matches: UInt64, _ scanBytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_expression_results") private func savedExpressionResults(_ h: UInt64, _ generation: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_clear_expression") private func savedClearExpression(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_open_expression_hit_reader") private func savedExpressionReader(_ h: UInt64, _ reader: UInt64, _ generation: UInt64, _ hit: UInt64) -> UnsafeMutablePointer<CChar>?
@@ -49,6 +51,10 @@ extension AtlasSavedTransport {
             guard generation > 0, AtlasSavedSearchWire.validNeedle(needle),
                   (1...AtlasSavedSearchWire.maximumHits).contains(matches) else { return nil }
             return needle.withCString { take(savedSearch(handle, generation, $0, matches)) }
+        case .countedSearch(let generation, let needle, let matches):
+            guard generation > 0, AtlasSavedSearchWire.validNeedle(needle),
+                  matches <= AtlasSavedSearchWire.maximumHits else { return nil }
+            return needle.withCString { take(savedCountedSearch(handle, generation, $0, matches)) }
         case .results(let generation, let start, let limit):
             return take(savedResults(handle, generation, start, limit))
         case .clearResults(let generation): return take(savedClearResults(handle, generation))
@@ -58,6 +64,11 @@ extension AtlasSavedTransport {
                   (1...AtlasSavedSearchWire.maximumHits).contains(matches),
                   bytes <= AtlasSavedSearchWire.maximumSourceBytes else { return nil }
             return query.withCString { take(savedExpressionSearch(handle, generation, $0, matches, bytes)) }
+        case .countedExpressionSearch(let generation, let query, let matches, let bytes):
+            guard generation > 0, AtlasSavedSearchWire.validNeedle(query),
+                  matches <= AtlasSavedSearchWire.maximumHits,
+                  bytes <= AtlasSavedSearchWire.maximumSourceBytes else { return nil }
+            return query.withCString { take(savedCountedExpressionSearch(handle, generation, $0, matches, bytes)) }
         case .expressionResults(let generation, let start, let limit):
             return take(savedExpressionResults(handle, generation, start, limit))
         case .clearExpression(let generation): return take(savedClearExpression(handle, generation))

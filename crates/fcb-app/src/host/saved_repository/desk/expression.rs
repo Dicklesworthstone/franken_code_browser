@@ -44,7 +44,17 @@ pub struct SavedExpression {
 }
 impl SavedExpression {
     pub fn prepare(saved: &mut SavedRepositorySession, generation: u64, query: &str,
-        options: SavedExpressionOptions, mut canceled: impl FnMut() -> bool)
+        options: SavedExpressionOptions, canceled: impl FnMut() -> bool) -> Result<Self, SavedDeskError> {
+        Self::prepare_with_counting(saved, generation, query, options, false, canceled)
+    }
+
+    pub fn prepare_counted(saved: &mut SavedRepositorySession, generation: u64, query: &str,
+        options: SavedExpressionOptions, canceled: impl FnMut() -> bool) -> Result<Self, SavedDeskError> {
+        Self::prepare_with_counting(saved, generation, query, options, true, canceled)
+    }
+
+    fn prepare_with_counting(saved: &mut SavedRepositorySession, generation: u64, query: &str,
+        options: SavedExpressionOptions, count_all_matches: bool, mut canceled: impl FnMut() -> bool)
         -> Result<Self, SavedDeskError> {
         check(&mut canceled)?;
         if options.max_hits > super::super::MAX_SAVED_HITS || query.len() > MAX_QUERY_LEN {
@@ -63,10 +73,15 @@ impl SavedExpression {
         let first_file = FileId::new(owner, 1).map_err(|_| ExpressionError::IdentityExhausted)?;
         let first_revision = SourceRevision::new(owner, 1).map_err(|_| ExpressionError::IdentityExhausted)?;
         let before = saved.archive.load_stats();
-        let mut work = ExpressionQuery::new(&mut saved.archive, &plan, ExpressionOptions {
+        let query_options = ExpressionOptions {
             generation: qgen, first_file, first_revision, max_matches: options.max_hits,
             max_scan_bytes: options.max_scan_bytes,
-        }, &saved.budget, allocations)?;
+        };
+        let mut work = if count_all_matches {
+            ExpressionQuery::new_counting(&mut saved.archive, &plan, query_options, &saved.budget, allocations)?
+        } else {
+            ExpressionQuery::new(&mut saved.archive, &plan, query_options, &saved.budget, allocations)?
+        };
         while work.state() == ExpressionState::Pending {
             work.step(StreamReadStep::default(), qgen, &saved.budget, &mut canceled)?;
         }
@@ -112,13 +127,16 @@ impl SavedExpression {
         })?;
         out.literal(",\"complete\":")?; out.boolean(self.is_complete())?;
         out.literal(",\"matches_seen_exact\":")?; out.boolean(self.is_complete())?;
-        out.literal(",\"truncated\":")?; out.boolean(self.report.state() == ExpressionState::Truncated)?;
+        out.literal(",\"count_all_matches\":")?; out.boolean(self.report.count_all_matches())?;
+        out.literal(",\"truncated\":")?; out.boolean(self.report.hits_truncated())?;
         let s = self.stats();
         for (key, value) in [
             ("required_terms", self.plan.syntax().conjunction_terms.len() as u64),
             ("excluded_terms", self.plan.syntax().exclusion_terms.len() as u64),
             ("max_hits", self.options.max_hits as u64), ("max_scan_bytes", self.options.max_scan_bytes),
             ("retained_hits", self.retained_hits() as u64), ("matches_seen", self.report.matches_seen()),
+            ("matching_files", self.report.matching_files() as u64),
+            ("retained_matching_files", self.report.retained_matching_files() as u64),
             ("metadata_examined", s.metadata_examined as u64), ("scope_files", s.scope_files as u64),
             ("metadata_excluded", s.metadata_excluded as u64), ("unavailable_files", s.unavailable_files as u64),
             ("unsupported_files", s.unsupported_files as u64), ("members_loaded", s.members_loaded as u64),
@@ -243,11 +261,27 @@ impl SavedRepositorySession {
     /// accepted report. The candidate's first complete response is prepared
     /// before replacing that report, including work-limit/partial responses.
     pub fn expression_search(&mut self, generation: u64, query: &str, max_hits: usize,
-        max_scan_bytes: u64, mut canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedDeskError> {
+        max_scan_bytes: u64, canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedDeskError> {
+        self.expression_search_with_counting(generation, query, max_hits, max_scan_bytes, false, canceled)
+    }
+
+    /// Count all primary occurrences after the existing whole-member predicates
+    /// have been proved, retaining a bounded prefix (or zero) of exact witnesses.
+    /// The aggregate predicate/primary scan budget remains authoritative.
+    pub fn expression_search_counted(&mut self, generation: u64, query: &str, max_hits: usize,
+        max_scan_bytes: u64, canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedDeskError> {
+        self.expression_search_with_counting(generation, query, max_hits, max_scan_bytes, true, canceled)
+    }
+
+    fn expression_search_with_counting(&mut self, generation: u64, query: &str, max_hits: usize,
+        max_scan_bytes: u64, count_all_matches: bool, mut canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, SavedDeskError> {
         super::super::query_attempt(&mut self.last_expression_attempt, generation)?;
         check(&mut canceled)?;
-        let candidate = SavedExpression::prepare(self, generation, query,
-            SavedExpressionOptions { max_hits, max_scan_bytes }, &mut canceled)?;
+        let options = SavedExpressionOptions { max_hits, max_scan_bytes };
+        let candidate = if count_all_matches {
+            SavedExpression::prepare_counted(self, generation, query, options, &mut canceled)?
+        } else { SavedExpression::prepare(self, generation, query, options, &mut canceled)? };
         let response = candidate.page(self, generation, 0, 64, &mut canceled)?;
         self.expression = Some(candidate);
         Ok(response)

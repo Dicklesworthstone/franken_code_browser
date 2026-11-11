@@ -64,6 +64,17 @@ char *fcb_saved_detach_index(uint64_t handle, uint64_t generation);
  */
 char *fcb_saved_search(uint64_t handle, uint64_t generation,
     const char *needle, uint64_t max_matches);
+/* Same literal semantics and generation namespace, but max_matches 0..4096
+ * limits retained witnesses only. Zero counts without retaining navigable rows.
+ * Uses the same optional FCBD candidates and exact member verification.
+ * The search/results receipts add count_all_matches, matches_seen_exact,
+ * max_matches, matching_files and retained_matching_files. Count exactness is
+ * search_complete; truncated only means matches_seen exceeds retained_hits.
+ * Complete counts can therefore coexist with truncated rows. Missing or
+ * unsupported members and incomplete discovery still prevent exact totals.
+ */
+char *fcb_saved_search_counted(uint64_t handle, uint64_t generation,
+    const char *needle, uint64_t max_matches);
 char *fcb_saved_results(uint64_t handle, uint64_t generation,
     uint64_t start, uint64_t limit);
 char *fcb_saved_clear_results(uint64_t handle, uint64_t generation);
@@ -92,6 +103,16 @@ char *fcb_saved_clear_results(uint64_t handle, uint64_t generation);
  * is saved-expression; never reinterpret these hit IDs as literal query IDs.
  */
 char *fcb_saved_expression_search(uint64_t handle, uint64_t generation,
+    const char *query, uint64_t max_hits, uint64_t max_scan_bytes);
+/* Same expression syntax/predicate authority and generation namespace.
+ * Counts every primary occurrence within max_scan_bytes after predicates are
+ * established; max_hits 0..4096 only bounds retained witnesses. Zero is
+ * count-only. Adds count_all_matches, matching_files and retained_matching_files
+ * to expression receipts. matches_seen_exact equals complete independently of
+ * omitted rows; truncated is matches_seen > retained_hits. A work-limit or
+ * unavailable/unsupported member leaves totals inexact, including zero.
+ */
+char *fcb_saved_expression_search_counted(uint64_t handle, uint64_t generation,
     const char *query, uint64_t max_hits, uint64_t max_scan_bytes);
 char *fcb_saved_expression_results(uint64_t handle, uint64_t generation,
     uint64_t start, uint64_t limit);

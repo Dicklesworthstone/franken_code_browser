@@ -34,6 +34,28 @@ extension AtlasReaderTransport {
             precondition(transport.run(owner, .detachIndex(generation: generation)) == nil)
         }
         precondition(count(6) == 9, "every rejected non-null response must be freed exactly once")
+        mode(0)
+        for retained in [UInt64(0), 4096] {
+            precondition(transport.run(owner, .countedSearch(generation: generation,
+                needle: "e\u{301}", matches: retained)) == "{}")
+            precondition(transport.run(owner, .countedExpressionSearch(generation: generation,
+                query: "e\u{301} path:src/", matches: retained, scanBytes: 67_108_864)) == "{}")
+        }
+        precondition(count(7) == 2 && count(8) == 2 && count(6) == 13)
+        precondition(transport.run(owner, .countedSearch(generation: 0, needle: "e\u{301}", matches: 0)) == nil)
+        precondition(transport.run(owner, .countedSearch(generation: generation, needle: "", matches: 0)) == nil)
+        precondition(transport.run(owner, .countedSearch(generation: generation, needle: "e\u{301}", matches: 4097)) == nil)
+        precondition(transport.run(owner, .countedExpressionSearch(generation: generation,
+            query: "e\u{301} path:src/", matches: 0, scanBytes: 67_108_865)) == nil)
+        precondition(count(7) == 2 && count(8) == 2 && count(6) == 13,
+            "invalid counted queries crossed the foreign boundary")
+        for invalid in [Int32(1), 2, 3, 4] {
+            mode(invalid)
+            precondition(transport.run(owner, .countedSearch(generation: generation, needle: "e\u{301}", matches: 0)) == nil)
+            precondition(transport.run(owner, .countedExpressionSearch(generation: generation,
+                query: "e\u{301} path:src/", matches: 0, scanBytes: 67_108_864)) == nil)
+        }
+        precondition(count(6) == 19, "counted response ownership leaked or double-freed")
         print("AtlasSavedIndexBridgeTests: public-header signatures, full-width IDs, exact path bytes, pin admission and buffer ownership passed")
     }
 }

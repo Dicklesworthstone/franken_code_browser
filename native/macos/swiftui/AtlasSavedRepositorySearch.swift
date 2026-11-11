@@ -38,6 +38,61 @@ enum AtlasSavedSearchWire {
     }
 }
 
+/// Exhaustive occurrence totals and retained navigation rows are independent.
+/// New receipts must carry their entire count policy; legacy receipts retain
+/// the old one-omitted-match lower bound and cannot satisfy a count request.
+struct AtlasSavedSearchCount: Equatable, Sendable {
+    let all, exact: Bool
+    let maximum: UInt64
+    let matchingFiles, retainedMatchingFiles: UInt64?
+
+    static func admit(all: Bool?, exact: Bool?, matchingFiles: UInt64?, retainedFiles: UInt64?,
+        expected: Bool?, complete: Bool, truncated: Bool, retained: UInt64, seen: UInt64,
+        maximum: UInt64, availableFiles: UInt64, scannedBytes: UInt64, requiresReceipt: Bool = false) throws -> Self {
+        let hasReceipt = requiresReceipt || all != nil || matchingFiles != nil || retainedFiles != nil
+        let counted = all ?? false
+        guard expected == nil || counted == expected!, maximum <= AtlasSavedSearchWire.maximumHits,
+              retained <= maximum, seen >= retained, truncated == (seen > retained),
+              (exact ?? complete) == complete else { throw AtlasSavedError.invalidResponse }
+        if hasReceipt {
+            guard all != nil, exact != nil, let matchingFiles, let retainedFiles,
+                  matchingFiles <= availableFiles, matchingFiles <= seen,
+                  retainedFiles <= matchingFiles, retainedFiles <= retained,
+                  (matchingFiles == 0) == (seen == 0), (retainedFiles == 0) == (retained == 0) else {
+                throw AtlasSavedError.invalidResponse
+            }
+        }
+        if counted {
+            guard hasReceipt, seen <= scannedBytes,
+                  !truncated || retained == maximum else { throw AtlasSavedError.invalidResponse }
+        } else {
+            guard seen == retained + (truncated ? 1 : 0), !complete || !truncated else {
+                throw AtlasSavedError.invalidResponse
+            }
+        }
+        return Self(all: counted, exact: exact ?? complete, maximum: maximum,
+            matchingFiles: matchingFiles, retainedMatchingFiles: retainedFiles)
+    }
+
+    func validatePage(_ hits: [AtlasSavedHit], retained: UInt64) throws {
+        if let retainedMatchingFiles {
+            let files = UInt64(Set(hits.map(\.member)).count)
+            guard files <= retainedMatchingFiles,
+                  UInt64(hits.count) != retained || files == retainedMatchingFiles else {
+                throw AtlasSavedError.invalidResponse
+            }
+        }
+    }
+
+    func summary(seen: UInt64, retained: UInt64) -> String {
+        if exact {
+            let files = matchingFiles.map { " in \($0) captured files" } ?? ""
+            return "\(seen) matches\(files)" + (seen > retained ? "; first \(retained) retained" : "")
+        }
+        return "At least \(seen) matches; \(retained) retained · partial search"
+    }
+}
+
 /// An original-byte occurrence, qualified by its containing accepted page.
 /// A UTF-16 match can occupy a different byte length from the UTF-8 needle.
 struct AtlasSavedHit: Decodable, Sendable, Identifiable {
@@ -316,9 +371,23 @@ struct AtlasSavedExpressionPage: Sendable {
     let truncated: Bool
     let retained, seen, required, excluded, scopeFiles, filteredFiles, unavailable, unsupported: UInt64
     let sourceBytes, scannedBytes, scanLimit, predicateRejections: UInt64
+    let counting: AtlasSavedSearchCount
+
+    func hasSameSummary(as other: Self) -> Bool {
+        identity == other.identity && generation == other.generation
+            && expression.utf8.elementsEqual(other.expression.utf8)
+            && primaryNeedle.utf8.elementsEqual(other.primaryNeedle.utf8)
+            && counting == other.counting && state == other.state && complete == other.complete
+            && truncated == other.truncated && retained == other.retained && seen == other.seen
+            && scopeFiles == other.scopeFiles && filteredFiles == other.filteredFiles
+            && unavailable == other.unavailable && unsupported == other.unsupported
+            && sourceBytes == other.sourceBytes && scannedBytes == other.scannedBytes && scanLimit == other.scanLimit
+            && required == other.required && excluded == other.excluded && predicateRejections == other.predicateRejections
+    }
 
     static func decode(_ json: String?, identity: AtlasSavedIdentity, generation: UInt64,
-        expression expected: String?, start: UInt64, limit: UInt64) throws -> Self {
+        expression expected: String?, start: UInt64, limit: UInt64,
+        countAllMatches expectedCount: Bool? = nil) throws -> Self {
         let data = try AtlasSavedWire.admit(json, handle: identity.owner, command: "expression", identity: identity)
         do {
             let w = try JSONDecoder().decode(Wire.self, from: data)
@@ -327,6 +396,10 @@ struct AtlasSavedExpressionPage: Sendable {
             let scope = w.scope_files.value, unavailable = w.unavailable_files.value
             let loaded = w.members_loaded.value, unsupported = w.unsupported_files.value
             let sourceBytes = w.loaded_bytes.value, calls = w.member_read_calls.value
+            let counting = try AtlasSavedSearchCount.admit(all: w.count_all_matches, exact: w.matches_seen_exact,
+                matchingFiles: w.matching_files?.value, retainedFiles: w.retained_matching_files?.value,
+                expected: expectedCount, complete: w.complete, truncated: w.truncated, retained: retained,
+                seen: seen, maximum: w.max_hits.value, availableFiles: loaded, scannedBytes: w.scanned_bytes.value)
             guard generation > 0, w.expression_generation.value == generation,
                   w.selection_namespace == "saved-expression",
                   AtlasSavedSearchWire.validNeedle(w.expression), AtlasSavedSearchWire.validNeedle(w.primary_needle),
@@ -338,7 +411,7 @@ struct AtlasSavedExpressionPage: Sendable {
                   w.max_hits.value <= AtlasSavedSearchWire.maximumHits, retained <= w.max_hits.value,
                   w.max_scan_bytes.value <= AtlasSavedSearchWire.maximumSourceBytes,
                   w.scanned_bytes.value <= w.max_scan_bytes.value,
-                  w.truncated == (w.state == "truncated"), seen == retained + (w.truncated ? 1 : 0),
+                  counting.all ? w.state != "truncated" : w.truncated == (w.state == "truncated"),
                   w.metadata_examined.value == identity.members,
                   scope <= identity.members, w.metadata_excluded.value == identity.members - scope,
                   unavailable <= scope, unavailable <= identity.members - identity.captured,
@@ -371,12 +444,13 @@ struct AtlasSavedExpressionPage: Sendable {
             }
             let end = start + UInt64(w.hits.count), next = w.next_offset.value?.value
             guard next == (end < retained ? end : nil) else { throw AtlasSavedError.invalidResponse }
+            try counting.validatePage(w.hits, retained: retained)
             return Self(identity: identity, generation: generation, expression: w.expression, primaryNeedle: w.primary_needle,
                 hits: w.hits, start: start, next: next, state: w.state, complete: w.complete, truncated: w.truncated,
                 retained: retained, seen: seen, required: required, excluded: excluded, scopeFiles: scope,
                 filteredFiles: w.metadata_excluded.value, unavailable: unavailable, unsupported: unsupported,
                 sourceBytes: sourceBytes, scannedBytes: w.scanned_bytes.value, scanLimit: w.max_scan_bytes.value,
-                predicateRejections: w.predicate_rejections.value)
+                predicateRejections: w.predicate_rejections.value, counting: counting)
         } catch let error as AtlasSavedError { throw error }
         catch { throw AtlasSavedError.invalidResponse }
     }
@@ -416,6 +490,8 @@ struct AtlasSavedExpressionPage: Sendable {
     private struct Wire: Decodable {
         let selection_namespace, expression, primary_needle, predicate_scope, index_policy, state: String
         let case_sensitive, index_used, complete, matches_seen_exact, truncated: Bool
+        let count_all_matches: Bool?
+        let matching_files, retained_matching_files: AtlasSavedNumber?
         let expression_generation, required_terms, excluded_terms, max_hits, max_scan_bytes: AtlasSavedNumber
         let retained_hits, matches_seen, metadata_examined, scope_files, metadata_excluded: AtlasSavedNumber
         let unavailable_files, unsupported_files, members_loaded, member_bytes_read, member_read_calls: AtlasSavedNumber
@@ -427,6 +503,7 @@ struct AtlasSavedExpressionPage: Sendable {
         enum CodingKeys: String, CodingKey {
             case selection_namespace, expression, primary_needle, predicate_scope, index_policy, state
             case case_sensitive, index_used, complete, matches_seen_exact, truncated
+            case count_all_matches, matching_files, retained_matching_files
             case expression_generation, required_terms, excluded_terms, max_hits, max_scan_bytes
             case retained_hits, matches_seen, metadata_examined, scope_files, metadata_excluded
             case unavailable_files, unsupported_files, members_loaded, member_bytes_read, member_read_calls
@@ -447,9 +524,9 @@ struct AtlasSavedSearchPage: Sendable {
     let complete: Bool
     let truncated: Bool
     let retained: UInt64
-    /// The producer stops after proving one omitted occurrence. When truncated,
-    /// this is a lower bound for the archive, not an exhaustive match count.
+    /// This is exhaustive only when counting.exact establishes closed coverage.
     let seen: UInt64
+    let counting: AtlasSavedSearchCount
     let unavailable: UInt64
     let unsupported: UInt64
     let sourceBytes: UInt64
@@ -461,11 +538,22 @@ struct AtlasSavedSearchPage: Sendable {
     let fallbackFiles: UInt64
     let postingEntriesVisited: UInt64
 
+    func hasSameSummary(as other: Self) -> Bool {
+        identity == other.identity && generation == other.generation && needle.utf8.elementsEqual(other.needle.utf8)
+            && counting == other.counting && complete == other.complete && truncated == other.truncated
+            && retained == other.retained && seen == other.seen && unavailable == other.unavailable
+            && unsupported == other.unsupported && sourceBytes == other.sourceBytes && scannedBytes == other.scannedBytes
+            && peakSourceBytes == other.peakSourceBytes && indexGeneration == other.indexGeneration && indexPin == other.indexPin
+            && indexEliminatedFiles == other.indexEliminatedFiles && fallbackFiles == other.fallbackFiles
+            && postingEntriesVisited == other.postingEntriesVisited
+    }
+
     /// A nil expected needle is reserved for recovering the currently accepted
     /// query through info/results. New searches always bind the exact submitted
     /// UTF-8, and every subsequent page retains the returned accepted needle.
     static func decode(_ json: String?, identity: AtlasSavedIdentity, generation: UInt64,
-        needle expectedNeedle: String?, start: UInt64, limit: UInt64, searching: Bool = false) throws -> Self {
+        needle expectedNeedle: String?, start: UInt64, limit: UInt64, searching: Bool = false,
+        countAllMatches expectedCount: Bool? = nil) throws -> Self {
         let data = try AtlasSavedWire.admit(json, handle: identity.owner,
             command: searching ? "search" : "results", identity: identity)
         do {
@@ -475,6 +563,13 @@ struct AtlasSavedSearchPage: Sendable {
             let loaded = w.member_bytes_read.value, calls = w.member_read_calls.value
             let indexGeneration = w.index_generation.value?.value
             let indexPin = w.index_pin.value
+            let counting = try AtlasSavedSearchCount.admit(all: w.count_all_matches, exact: w.matches_seen_exact,
+                matchingFiles: w.matching_files?.value, retainedFiles: w.retained_matching_files?.value,
+                expected: expectedCount, complete: w.search_complete, truncated: w.truncated, retained: retained,
+                seen: seen, maximum: w.max_matches?.value ?? AtlasSavedSearchWire.maximumHits,
+                availableFiles: identity.captured, scannedBytes: w.scanned_bytes.value,
+                requiresReceipt: w.max_matches != nil || w.matches_seen_exact != nil)
+            guard w.count_all_matches == nil || w.max_matches != nil else { throw AtlasSavedError.invalidResponse }
             guard generation > 0, w.query_generation.value == generation,
                   AtlasSavedSearchWire.validNeedle(w.needle),
                   expectedNeedle == nil || w.needle.utf8.elementsEqual(expectedNeedle!.utf8),
@@ -483,8 +578,8 @@ struct AtlasSavedSearchPage: Sendable {
                   identity.captured <= identity.members,
                   unavailable == identity.members - identity.captured, unsupported <= identity.captured,
                   retained <= AtlasSavedSearchWire.maximumHits,
-                  seen == retained + (w.truncated ? 1 : 0),
-                  w.search_complete == (identity.discoveryComplete && unavailable == 0 && unsupported == 0 && !w.truncated),
+                  w.search_complete == (identity.discoveryComplete && unavailable == 0 && unsupported == 0
+                    && (counting.all || !w.truncated)),
                   loaded <= AtlasSavedSearchWire.maximumSourceBytes, w.scanned_bytes.value <= loaded,
                   w.peak_source_bytes.value <= AtlasSavedWire.memberBytes, w.peak_source_bytes.value <= loaded,
                   (loaded == 0 && calls == 0) || (loaded > 0 && calls > 0),
@@ -517,9 +612,10 @@ struct AtlasSavedSearchPage: Sendable {
             let end = start + UInt64(w.hits.count)
             let next = w.next_offset.value?.value
             guard next == (end < retained ? end : nil) else { throw AtlasSavedError.invalidResponse }
+            try counting.validatePage(w.hits, retained: retained)
             return Self(identity: identity, generation: generation, needle: w.needle, hits: w.hits,
                 start: start, next: next, complete: w.search_complete, truncated: w.truncated,
-                retained: retained, seen: seen, unavailable: unavailable, unsupported: unsupported,
+                retained: retained, seen: seen, counting: counting, unavailable: unavailable, unsupported: unsupported,
                 sourceBytes: loaded, scannedBytes: w.scanned_bytes.value, peakSourceBytes: w.peak_source_bytes.value,
                 indexGeneration: indexGeneration, indexPin: indexPin,
                 indexEliminatedFiles: w.index_eliminated_files.value, fallbackFiles: w.fallback_files.value,
@@ -549,6 +645,8 @@ struct AtlasSavedSearchPage: Sendable {
         let index_generation: AtlasSavedSearchOptional<AtlasSavedNumber>
         let index_pin: AtlasSavedSearchOptional<String>
         let search_complete, truncated: Bool
+        let count_all_matches, matches_seen_exact: Bool?
+        let max_matches, matching_files, retained_matching_files: AtlasSavedNumber?
         let retained_hits, matches_seen, unavailable_files, unsupported_files: AtlasSavedNumber
         let member_bytes_read, member_read_calls, scanned_bytes, peak_source_bytes: AtlasSavedNumber
         let index_eliminated_files, fallback_files, posting_entries_visited, retained_source_payload_bytes: AtlasSavedNumber

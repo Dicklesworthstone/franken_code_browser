@@ -89,6 +89,20 @@ pub unsafe extern "C" fn fcb_saved_search(handle: u64, generation: u64, needle: 
         sessions.execute(handle, Command::Search { generation, needle, limit: number(max_matches)? }, || false)
     }))
 }
+/// Count all exact decoded occurrences while retaining a bounded prefix.
+/// Zero requests count-only; complete counts can coexist with truncated rows.
+/// # Safety
+/// needle is null or readable NUL-terminated UTF-8 stable until return.
+/// Release every non-null response exactly once with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_saved_search_counted(handle: u64, generation: u64,
+    needle: *const c_char, max_matches: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| {
+        let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
+        sessions.execute(handle, Command::SearchCounted { generation, needle,
+            limit: number(max_matches)? }, || false)
+    }))
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_saved_results(handle: u64, generation: u64, start: u64, limit: u64) -> *mut c_char {
     reply(|| answer(handle, |sessions| sessions.execute(handle,
@@ -110,6 +124,20 @@ pub unsafe extern "C" fn fcb_saved_expression_search(handle: u64, generation: u6
     reply(|| answer(handle, |sessions| {
         let query = unsafe { cstr(query) }.ok_or(AccessError::InvalidArgument)?;
         sessions.execute(handle, Command::ExpressionSearch { generation, query,
+            max_hits: number(max_hits)?, max_scan_bytes }, || false)
+    }))
+}
+/// Exhaustive primary counts after whole-member expression predicates.
+/// The aggregate scan-byte budget remains authoritative; zero retains no rows.
+/// # Safety
+/// query is null or readable NUL-terminated UTF-8 stable until return.
+/// Release every non-null response exactly once with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_saved_expression_search_counted(handle: u64, generation: u64,
+    query: *const c_char, max_hits: u64, max_scan_bytes: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| {
+        let query = unsafe { cstr(query) }.ok_or(AccessError::InvalidArgument)?;
+        sessions.execute(handle, Command::ExpressionSearchCounted { generation, query,
             max_hits: number(max_hits)?, max_scan_bytes }, || false)
     }))
 }
@@ -215,3 +243,7 @@ mod relationships_tests;
 #[cfg(all(test, unix))]
 #[path = "saved_expression_ffi_tests.rs"]
 mod expression_tests;
+
+#[cfg(all(test, unix))]
+#[path = "saved_counted_ffi_tests.rs"]
+mod counted_tests;

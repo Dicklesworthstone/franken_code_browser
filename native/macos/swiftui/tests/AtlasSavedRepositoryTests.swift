@@ -25,8 +25,10 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         var generation: UInt64?
         var queryGeneration: UInt64?
         var needle: String?
+        var countAllMatches = false
         var expressionGeneration: UInt64?
         var expression: String?
+        var countAllExpressionMatches = false
         var expressionAttempt: UInt64 = 0
         var structureGeneration: UInt64?
         var structureMode: AtlasSavedSearchMode?
@@ -266,7 +268,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     }
     func searchPage(_ owner: UInt64, generation: UInt64, needle: String = "ana",
         start: UInt64 = 0, limit: UInt64 = 64, searching: Bool = false,
-        index: UInt64? = nil, pin: String? = nil) -> [String: Any] {
+        index: UInt64? = nil, pin: String? = nil, countAllMatches: Bool? = nil) -> [String: Any] {
         var out = header(owner, searching ? "search" : "results")
         let hits = searchHits(needle), end = min(UInt64(hits.count), start + limit)
         let sourceBytes = members.compactMap(\.bytes).reduce(0) { $0 + $1.count }
@@ -283,10 +285,16 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             "hits": (start..<end).map { hitObject($0 + 1, needle: needle) },
             "next_offset": end < UInt64(hits.count) ? String(end) as Any : NSNull()
         ]) { _, new in new }
+        if let countAllMatches {
+            out["count_all_matches"] = countAllMatches; out["matches_seen_exact"] = false
+            out["max_matches"] = "4096"
+            out["matching_files"] = String(Set(hits.map(\.member)).count)
+            out["retained_matching_files"] = out["matching_files"]
+        }
         return out
     }
     func expressionPage(_ owner: UInt64, generation: UInt64, query: String = "ana +banana -unsafe",
-        start: UInt64 = 0, limit: UInt64 = 64) -> [String: Any] {
+        start: UInt64 = 0, limit: UInt64 = 64, countAllMatches: Bool? = nil) -> [String: Any] {
         // Fixed protocol vectors. The production Rust tests own grammar and
         // predicate evaluation; this fixture does not implement either.
         let filtered = query == "ana path:raw"
@@ -310,6 +318,11 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             "retained_source_payload_bytes": "0", "hits": (start..<end).map { hitObject($0 + 1) },
             "next_offset": end < count ? String(end) as Any : NSNull()
         ]) { _, next in next }
+        if let countAllMatches {
+            out["count_all_matches"] = countAllMatches
+            out["matching_files"] = filtered ? "1" : "2"
+            out["retained_matching_files"] = out["matching_files"]
+        }
         return out
     }
     var occurrenceNeedle: String { "é" + String(repeating: "x", count: 200) + "banana" }
@@ -572,7 +585,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             case .openMember, .openRelationship, .openHit, .openExpressionHit, .openStructureHit:
                 let pause = locked { let value = blocked; blocked = false; return value }
                 if pause { entered.signal(); precondition(resume.wait(timeout: .now() + .seconds(5)) == .success) }
-            case .search, .expressionSearch, .structureSearch:
+            case .search, .countedSearch, .expressionSearch, .countedExpressionSearch, .structureSearch:
                 let pause = locked { let value = blockedSearch; blockedSearch = false; return value }
                 if pause { entered.signal(); precondition(resume.wait(timeout: .now() + .seconds(5)) == .success) }
             case .attachIndex, .detachIndex:
@@ -657,7 +670,8 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                           side == .evidence || link <= 2 else { return nil }
                     return handoff(handle, reader: reader, ordinal: side == .evidence ? 0 : 3,
                         generation: generation, link: link, side: side)
-                case .search(let generation, let needle, let matches):
+                case .search(let generation, let needle, let matches),
+                     .countedSearch(let generation, let needle, let matches):
                     precondition(matches == 4096)
                     log.append("search:\(handle):\(generation):\(needle)")
                     guard var session = sessions[handle] else { return nil }
@@ -668,19 +682,22 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                             "error": ["code": "PAGED_INDEX_CHANGED_PAGE"]])
                     }
                     session.queryGeneration = generation; session.needle = needle
+                    if case .countedSearch = request { session.countAllMatches = true }
+                    else { session.countAllMatches = false }
                     session.queryIndexGeneration = session.indexGeneration; session.queryIndexPin = session.indexPin
                     session.readBytes += UInt64(members.compactMap(\.bytes).reduce(0) { $0 + $1.count }); session.readCalls += 4
                     sessions[handle] = session
                     if fault == "search-lost" { fault = nil; return nil }
                     return encode(searchPage(handle, generation: generation, needle: needle, searching: true,
-                        index: session.queryIndexGeneration, pin: session.queryIndexPin))
+                        index: session.queryIndexGeneration, pin: session.queryIndexPin, countAllMatches: session.countAllMatches))
                 case .results(let generation, let start, let limit):
                     log.append("results:\(handle):\(generation):\(start)")
                     guard let session = sessions[handle], session.queryGeneration == generation, let needle = session.needle else { return nil }
                     if fault == "results" { fault = nil; return nil }
                     var page = searchPage(handle, generation: generation, needle: needle, start: start, limit: limit,
-                        index: session.queryIndexGeneration, pin: session.queryIndexPin)
+                        index: session.queryIndexGeneration, pin: session.queryIndexPin, countAllMatches: session.countAllMatches)
                     if fault == "index-query-pin" { fault = nil; page["index_pin"] = String(repeating: "f", count: 64) }
+                    if fault == "count-policy" { fault = nil; page["count_all_matches"] = !session.countAllMatches }
                     return encode(page)
                 case .clearResults(let generation):
                     log.append("clear-search:\(handle):\(generation)")
@@ -694,7 +711,8 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                           let needle = session.needle, id > 0, id <= UInt64(searchHits(needle).count) else { return nil }
                     return handoff(handle, reader: reader, ordinal: searchHits(needle)[Int(id - 1)].member,
                         generation: nil, link: nil, side: nil, query: generation, hitID: id)
-                case .expressionSearch(let generation, let query, let matches, let bytes):
+                case .expressionSearch(let generation, let query, let matches, let bytes),
+                     .countedExpressionSearch(let generation, let query, let matches, let bytes):
                     precondition(matches == 4096 && bytes == AtlasSavedSearchWire.maximumSourceBytes)
                     log.append("expression:\(handle):\(generation):\(query)")
                     guard var session = sessions[handle], generation > session.expressionAttempt else { return nil }
@@ -705,17 +723,22 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                             "error": ["code": "QUERY_SYNTAX_ERROR"]])
                     }
                     session.expressionGeneration = generation; session.expression = query
+                    if case .countedExpressionSearch = request { session.countAllExpressionMatches = true }
+                    else { session.countAllExpressionMatches = false }
                     session.readBytes += UInt64(members.compactMap(\.bytes).reduce(0) { $0 + $1.count }); session.readCalls += 4
                     sessions[handle] = session
                     if fault == "expression-lost" { fault = nil; return nil }
-                    return encode(expressionPage(handle, generation: generation, query: query))
+                    return encode(expressionPage(handle, generation: generation, query: query,
+                        countAllMatches: session.countAllExpressionMatches))
                 case .expressionResults(let generation, let start, let limit):
                     log.append("expression-results:\(handle):\(generation):\(start)")
                     guard let session = sessions[handle], session.expressionGeneration == generation,
                           let query = session.expression else { return nil }
                     if fault == "expression-results" { fault = nil; return nil }
-                    var page = expressionPage(handle, generation: generation, query: query, start: start, limit: limit)
+                    var page = expressionPage(handle, generation: generation, query: query, start: start, limit: limit,
+                        countAllMatches: session.countAllExpressionMatches)
                     if fault == "expression-results-primary" { fault = nil; page["primary_needle"] = "banana" }
+                    if fault == "expression-count-policy" { fault = nil; page["count_all_matches"] = !session.countAllExpressionMatches }
                     return encode(page)
                 case .clearExpression(let generation):
                     guard var session = sessions[handle], generation > session.expressionAttempt else { return nil }

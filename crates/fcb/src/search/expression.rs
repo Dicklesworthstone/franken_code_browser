@@ -168,6 +168,8 @@ pub struct ExpressionQuery<'archive, 'plan, R: Read + Seek> {
     active: Option<ReaderSearch<'plan, Cursor<VerifiedMember>>>,
     hits: Vec<ExpressionHit>,
     seen: u64,
+    matching_files: usize,
+    count_all_matches: bool,
     state: ExpressionState,
     stats: ExpressionStats,
     _lease: ResourceLease,
@@ -196,7 +198,17 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
         let mut hits = Vec::new(); hits.try_reserve_exact(options.max_matches).map_err(|_| ExpressionError::ResourceDenied)?;
         if hits.capacity() > options.max_matches { return Err(ExpressionError::ResourceDenied); }
         Ok(Self { archive, plan, index: None, options, allocations, scope_at: 0, next: 0, term: 0,
-            active: None, hits, seen: 0, state: ExpressionState::Pending, stats: ExpressionStats::default(), _lease: lease })
+            active: None, hits, seen: 0, matching_files: 0, count_all_matches: false,
+            state: ExpressionState::Pending, stats: ExpressionStats::default(), _lease: lease })
+    }
+    /// Evaluate the same whole-member predicates, then count every primary
+    /// occurrence within max_scan_bytes. Only max_matches witnesses survive;
+    /// zero retains no rows and does not turn an unknown predicate into absence.
+    pub fn new_counting(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
+        options: ExpressionOptions, budget: &ResourceBudget, allocations: [ResourceAllocationId; 3])
+        -> Result<Self, ExpressionError> {
+        let mut query = Self::new(archive, plan, options, budget, allocations)?;
+        query.count_all_matches = true; Ok(query)
     }
     /// Only the mandatory positive primary literal can prove exclusion. NOT
     /// terms are never used as a negative prefilter. Incompatible representations
@@ -207,6 +219,12 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
         index.validate_directory(archive.directory()).map_err(PagedSearchError::from)?;
         let mut query = Self::new(archive, plan, options, budget, allocations)?;
         query.index = Some(index); Ok(query)
+    }
+    pub fn new_indexed_counting(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
+        index: &'plan SnapshotIndex, options: ExpressionOptions, budget: &ResourceBudget,
+        allocations: [ResourceAllocationId; 3]) -> Result<Self, ExpressionError> {
+        let mut query = Self::new_indexed(archive, plan, index, options, budget, allocations)?;
+        query.count_all_matches = true; Ok(query)
     }
     pub const fn state(&self) -> ExpressionState { self.state }
     pub const fn stats(&self) -> ExpressionStats { self.stats }
@@ -278,6 +296,7 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
         }
         if primary {
             self.seen += report.matches_seen();
+            if report.matches_seen() > 0 { self.matching_files += 1; }
             for hit in report.hits() {
                 self.hits.push(ExpressionHit { ordinal: verified.ordinal(), file: report.request().file(),
                     revision: report.request().revision(), generation: self.options.generation,
@@ -315,8 +334,13 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
         options.max_matches = if self.term == self.plan.primary() { self.options.max_matches - self.hits.len() } else { 1 };
         options.max_bytes = length.min(self.options.max_scan_bytes.saturating_sub(self.stats.scanned_bytes));
         options.max_read_calls = fcb_store::paged_snapshot::MAX_SNAPSHOT_READ_CALLS;
-        let scan = ReaderSearch::new(Cursor::new(verified), request, ByteLength::new(length),
-            &self.plan.patterns[self.term], options, budget, self.allocations[2])?;
+        let scan = if self.count_all_matches && self.term == self.plan.primary() {
+            ReaderSearch::new_counting(Cursor::new(verified), request, ByteLength::new(length),
+                &self.plan.patterns[self.term], options, budget, self.allocations[2])?
+        } else {
+            ReaderSearch::new(Cursor::new(verified), request, ByteLength::new(length),
+                &self.plan.patterns[self.term], options, budget, self.allocations[2])?
+        };
         if self.term == self.plan.primary() { self.stats.primary_scans += 1; } else { self.stats.predicate_scans += 1; }
         self.active = Some(scan); Ok(())
     }
@@ -328,17 +352,26 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
         }
         Ok(ExpressionReport { archive: self.archive.directory().digest(), generation: self.options.generation,
             discovery_complete: self.archive.directory().discovery_complete(), state: self.state,
-            hits: self.hits, seen: self.seen, stats: self.stats, _lease: self._lease })
+            hits: self.hits, seen: self.seen, matching_files: self.matching_files,
+            count_all_matches: self.count_all_matches, stats: self.stats, _lease: self._lease })
     }
 }
 
 pub struct ExpressionReport {
     archive: Sha256Digest, generation: QueryGeneration, discovery_complete: bool,
-    state: ExpressionState, hits: Vec<ExpressionHit>, seen: u64, stats: ExpressionStats, _lease: ResourceLease,
+    state: ExpressionState, hits: Vec<ExpressionHit>, seen: u64, matching_files: usize,
+    count_all_matches: bool, stats: ExpressionStats, _lease: ResourceLease,
 }
 impl ExpressionReport {
     pub fn hits(&self) -> &[ExpressionHit] { &self.hits }
     pub const fn matches_seen(&self) -> u64 { self.seen }
+    pub const fn count_all_matches(&self) -> bool { self.count_all_matches }
+    pub fn hits_truncated(&self) -> bool { self.seen > self.hits.len() as u64 }
+    pub const fn matching_files(&self) -> usize { self.matching_files }
+    pub fn retained_matching_files(&self) -> usize {
+        self.hits.iter().enumerate().filter(|(position, hit)|
+            *position == 0 || self.hits[*position - 1].ordinal != hit.ordinal).count()
+    }
     pub const fn stats(&self) -> ExpressionStats { self.stats }
     pub const fn state(&self) -> ExpressionState { self.state }
     pub const fn is_complete(&self) -> bool {

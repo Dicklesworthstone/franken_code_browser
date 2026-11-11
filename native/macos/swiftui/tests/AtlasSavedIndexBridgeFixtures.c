@@ -5,10 +5,10 @@
 
 /* Public-header-checked foreign boundary. These responses test Swift marshaling
  * and ownership; real archive/posting behavior is exercised in saved_sessions_tests. */
-static uint64_t calls[7];
+static uint64_t calls[9];
 static int result_mode;
 void fixture_saved_index_mode(int mode) { result_mode = mode; }
-uint64_t fixture_saved_index_count(uint64_t index) { assert(index < 7); return calls[index]; }
+uint64_t fixture_saved_index_count(uint64_t index) { assert(index < 9); return calls[index]; }
 static char *reply(void) {
     if (result_mode == 1) return NULL;
     if (result_mode == 2) { char *p = malloc(2); assert(p); p[0] = (char)0xff; p[1] = 0; return p; }
@@ -39,11 +39,22 @@ uint8_t fcb_saved_close(uint64_t handle) { assert(handle == UINT64_MAX - 10); ca
 char *fcb_saved_open(uint64_t a, const char *b) { (void)a; (void)b; abort(); }
 STUB3(fcb_saved_members)
 char *fcb_saved_search(uint64_t a, uint64_t b, const char *c, uint64_t d) { (void)a; (void)b; (void)c; (void)d; abort(); }
+char *fcb_saved_search_counted(uint64_t handle, uint64_t generation, const char *needle, uint64_t matches) {
+    assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9);
+    assert(needle && strcmp(needle, "e\xcc\x81") == 0 && (matches == 0 || matches == 4096));
+    calls[7]++; return reply();
+}
 STUB4(fcb_saved_results)
 STUB2(fcb_saved_clear_results)
 STUB4(fcb_saved_open_hit_reader)
 char *fcb_saved_expression_search(uint64_t a, uint64_t b, const char *c, uint64_t d, uint64_t e) {
     (void)a; (void)b; (void)c; (void)d; (void)e; abort();
+}
+char *fcb_saved_expression_search_counted(uint64_t handle, uint64_t generation, const char *query,
+    uint64_t matches, uint64_t bytes) {
+    assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9);
+    assert(query && strcmp(query, "e\xcc\x81 path:src/") == 0 && (matches == 0 || matches == 4096));
+    assert(bytes == 67108864); calls[8]++; return reply();
 }
 STUB4(fcb_saved_expression_results)
 STUB2(fcb_saved_clear_expression)

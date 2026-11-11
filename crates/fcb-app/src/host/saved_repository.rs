@@ -222,10 +222,27 @@ impl SavedRepositorySession {
     /// files. This API runs to completion on the caller's worker, with engine
     /// cancellation checkpoints, not continuation across native calls.
     pub fn search(&mut self, generation: u64, needle: &str, max_matches: usize,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedRepositoryError> {
+        self.search_with_counting(generation, needle, max_matches, false, canceled)
+    }
+
+    /// Count the full admitted archive while retaining at most max_matches
+    /// exact witnesses. Zero requests counts alone. Optional persisted postings
+    /// still exclude only proven negatives; unsupported/unavailable sources keep
+    /// the count incomplete even when every admitted scan reached its end.
+    pub fn search_counted(&mut self, generation: u64, needle: &str, max_matches: usize,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedRepositoryError> {
+        self.search_with_counting(generation, needle, max_matches, true, canceled)
+    }
+
+    fn search_with_counting(&mut self, generation: u64, needle: &str, max_matches: usize,
+        count_all_matches: bool,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedRepositoryError> {
         query_attempt(&mut self.last_query_attempt, generation)?; check(&mut canceled)?;
         if needle.is_empty() || needle.len() > MAX_SAVED_NEEDLE_BYTES
-            || !(1..=MAX_SAVED_HITS).contains(&max_matches) { return Err(SavedRepositoryError::InvalidLimits); }
+            || max_matches > MAX_SAVED_HITS || (!count_all_matches && max_matches == 0) {
+            return Err(SavedRepositoryError::InvalidLimits);
+        }
         let [label_id, pattern_id, result_id, member_id, scan_id] = self.allocations()?;
         let lease = self.budget.try_reserve_managed(self.owner(), label_id,
             ByteLength::new((needle.len() + size_of::<AcceptedQuery>()) as u64)).map_err(|_| AppError::Admission)?;
@@ -240,12 +257,20 @@ impl SavedRepositorySession {
         let report = if let Some(index) = self.index.as_mut() {
             let pattern = IndexedNeedle::text(owner, needle, &self.budget, pattern_id)
                 .map_err(PagedSearchError::from)?;
-            let query = PagedQuery::new_paged(&mut self.archive, &pattern, &mut index.pages, opts, &self.budget, ids)?;
+            let query = if count_all_matches {
+                PagedQuery::new_paged_counting(&mut self.archive, &pattern, &mut index.pages, opts, &self.budget, ids)?
+            } else {
+                PagedQuery::new_paged(&mut self.archive, &pattern, &mut index.pages, opts, &self.budget, ids)?
+            };
             finish_query(query, qgen, &self.budget, &mut canceled)?
         } else {
             let pattern = StreamingNeedle::text(owner, needle, &self.budget, pattern_id)
                 .map_err(PagedSearchError::from)?;
-            let query = PagedQuery::new(&mut self.archive, &pattern, opts, &self.budget, ids)?;
+            let query = if count_all_matches {
+                PagedQuery::new_counting(&mut self.archive, &pattern, opts, &self.budget, ids)?
+            } else {
+                PagedQuery::new(&mut self.archive, &pattern, opts, &self.budget, ids)?
+            };
             finish_query(query, qgen, &self.budget, &mut canceled)?
         };
         check(&mut canceled)?;
@@ -350,8 +375,12 @@ impl SavedRepositorySession {
         out.literal(",\"index_pin\":")?;
         if let Some(pin) = query.index_pin { out.quoted(&pin.to_hex())?; } else { out.literal("null")?; }
         out.literal(",\"mode\":\"exact-decoded-literal\",\"search_complete\":")?; out.boolean(report.is_complete())?;
+        out.literal(",\"count_all_matches\":")?; out.boolean(report.count_all_matches())?;
+        out.literal(",\"matches_seen_exact\":")?; out.boolean(report.is_complete())?;
         out.literal(",\"truncated\":")?; out.boolean(report.truncated())?;
         for (key, value) in [("retained_hits", report.hits().len() as u64), ("matches_seen", report.matches_seen()),
+            ("max_matches", report.max_matches() as u64), ("matching_files", report.matching_files() as u64),
+            ("retained_matching_files", report.retained_matching_files() as u64),
             ("unavailable_files", report.unavailable_files() as u64), ("unsupported_files", stats.unsupported_files as u64),
             ("member_bytes_read", query.member_bytes_read), ("member_read_calls", query.member_read_calls),
             ("scanned_bytes", stats.scanned_bytes), ("peak_source_bytes", stats.peak_source_bytes as u64),

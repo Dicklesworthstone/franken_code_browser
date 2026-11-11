@@ -96,6 +96,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     var searchInput = ""
     var searchMode: AtlasSavedSearchMode = .literal
     var searchNameMode: AtlasSearchNameMode = .contains
+    var countAllMatches = true
     var indexPinInput = ""
     @ObservationIgnored private let transport: AtlasSavedTransport
     @ObservationIgnored private let io = AtlasProjectIO()
@@ -119,12 +120,12 @@ private final class AtlasSavedSession: @unchecked Sendable {
     var searchIsCurrent: Bool {
         guard searchMode == .literal, let searchPage, info?.identity == searchPage.identity,
               queryGeneration == searchPage.generation else { return false }
-        return searchInput.utf8.elementsEqual(searchPage.needle.utf8)
+        return searchInput.utf8.elementsEqual(searchPage.needle.utf8) && countAllMatches == searchPage.counting.all
     }
     var expressionIsCurrent: Bool {
         guard searchMode == .expression, let expressionPage, info?.identity == expressionPage.identity,
               expressionGeneration == expressionPage.generation else { return false }
-        return searchInput.utf8.elementsEqual(expressionPage.expression.utf8)
+        return searchInput.utf8.elementsEqual(expressionPage.expression.utf8) && countAllMatches == expressionPage.counting.all
     }
 
     var structureIsCurrent: Bool {
@@ -358,16 +359,20 @@ private final class AtlasSavedSession: @unchecked Sendable {
         guard validSearchInput else {
             notice = "Enter 1–1024 UTF-8 bytes of literal text, without NUL. Search is case sensitive and does not normalize Unicode."; return
         }
-        let needle = searchInput
+        let needle = searchInput, counting = countAllMatches
         perform { model, flag in
             guard let lease = model.session else { throw AtlasSavedError.unavailable }
             let generation = try model.nextQueryGeneration()
             model.notice = "Searching decoded text across the captured archive…"
             do {
-                let page = try AtlasSavedSearchPage.decode(await model.run(lease,
-                    .search(generation: generation, needle: needle, matches: 4096), flag: flag),
-                    identity: info.identity, generation: generation, needle: needle, start: 0, limit: 64, searching: true)
-                guard page.indexGeneration == info.index?.generation, page.indexPin == info.index?.pin else {
+                let request: AtlasSavedRequest = counting
+                    ? .countedSearch(generation: generation, needle: needle, matches: 4096)
+                    : .search(generation: generation, needle: needle, matches: 4096)
+                let page = try AtlasSavedSearchPage.decode(await model.run(lease, request, flag: flag),
+                    identity: info.identity, generation: generation, needle: needle, start: 0, limit: 64,
+                    searching: true, countAllMatches: counting)
+                guard page.counting.maximum == 4096,
+                      page.indexGeneration == info.index?.generation, page.indexPin == info.index?.pin else {
                     throw AtlasSavedError.invalidResponse
                 }
                 guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
@@ -407,15 +412,15 @@ private final class AtlasSavedSession: @unchecked Sendable {
         guard searchIsCurrent, let info, let accepted = searchPage, let generation = queryGeneration,
               start <= accepted.retained else { return }
         if let page {
-            guard page.identity == accepted.identity, page.generation == generation,
-                  page.needle.utf8.elementsEqual(accepted.needle.utf8) else { return }
+            guard page.hasSameSummary(as: accepted) else { return }
         }
         perform { model, flag in
             guard let lease = model.session else { throw AtlasSavedError.unavailable }
             let next = try AtlasSavedSearchPage.decode(await model.run(lease,
                 .results(generation: generation, start: start, limit: 64), flag: flag),
-                identity: info.identity, generation: generation, needle: accepted.needle, start: start, limit: 64)
-            guard next.indexGeneration == accepted.indexGeneration, next.indexPin == accepted.indexPin else {
+                identity: info.identity, generation: generation, needle: accepted.needle, start: start, limit: 64,
+                countAllMatches: accepted.counting.all)
+            guard next.hasSameSummary(as: accepted) else {
                 throw AtlasSavedError.invalidResponse
             }
             guard model.session === lease, !model.closed, model.queryGeneration == generation else { throw AtlasSavedError.canceled }
@@ -461,16 +466,21 @@ private final class AtlasSavedSession: @unchecked Sendable {
         guard validSearchInput else {
             notice = "Enter 1–1024 UTF-8 bytes of expression syntax without NUL. The first positive term names matches."; return
         }
-        let query = searchInput
+        let query = searchInput, counting = countAllMatches
         perform { model, flag in
             guard let lease = model.session else { throw AtlasSavedError.unavailable }
             let generation = try model.nextExpressionGeneration()
             model.notice = "Checking required and excluded terms across captured members…"
             do {
-                let page = try AtlasSavedExpressionPage.decode(await model.run(lease,
-                    .expressionSearch(generation: generation, query: query, matches: 4096,
-                        scanBytes: AtlasSavedSearchWire.maximumSourceBytes), flag: flag),
-                    identity: info.identity, generation: generation, expression: query, start: 0, limit: 64)
+                let request: AtlasSavedRequest = counting
+                    ? .countedExpressionSearch(generation: generation, query: query, matches: 4096,
+                        scanBytes: AtlasSavedSearchWire.maximumSourceBytes)
+                    : .expressionSearch(generation: generation, query: query, matches: 4096,
+                        scanBytes: AtlasSavedSearchWire.maximumSourceBytes)
+                let page = try AtlasSavedExpressionPage.decode(await model.run(lease, request, flag: flag),
+                    identity: info.identity, generation: generation, expression: query, start: 0, limit: 64,
+                    countAllMatches: counting)
+                guard page.counting.maximum == 4096 else { throw AtlasSavedError.invalidResponse }
                 guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
                 model.expressionGeneration = generation; model.expressionPage = page
                 model.notice = page.complete ? "Expression search finished over the captured scope."
@@ -504,15 +514,15 @@ private final class AtlasSavedSession: @unchecked Sendable {
         }
     }
     func loadExpressionResults(start: UInt64, from page: AtlasSavedExpressionPage) {
-        guard expressionIsCurrent, let accepted = expressionPage, page.identity == accepted.identity,
-              page.generation == accepted.generation, page.start == accepted.start,
-              page.expression.utf8.elementsEqual(accepted.expression.utf8),
-              page.primaryNeedle.utf8.elementsEqual(accepted.primaryNeedle.utf8), start <= accepted.retained else { return }
+        guard expressionIsCurrent, let accepted = expressionPage, page.hasSameSummary(as: accepted),
+              page.start == accepted.start, start <= accepted.retained else { return }
         perform { model, flag in
             guard let lease = model.session else { throw AtlasSavedError.unavailable }
             let next = try AtlasSavedExpressionPage.decode(await model.run(lease,
                 .expressionResults(generation: page.generation, start: start, limit: 64), flag: flag),
-                identity: page.identity, generation: page.generation, expression: page.expression, start: start, limit: 64)
+                identity: page.identity, generation: page.generation, expression: page.expression, start: start, limit: 64,
+                countAllMatches: page.counting.all)
+            guard next.hasSameSummary(as: accepted) else { throw AtlasSavedError.invalidResponse }
             guard model.session === lease, !model.closed, model.expressionGeneration == page.generation,
                   next.primaryNeedle.utf8.elementsEqual(page.primaryNeedle.utf8) else { throw AtlasSavedError.canceled }
             model.expressionPage = next
@@ -660,6 +670,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         search: AtlasReaderSearchTransport? = nil, outline: AtlasReaderOutlineTransport? = nil,
         document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasSavedReaderCapture {
         guard expressionIsCurrent, let accepted = expressionPage, info?.identity == page.identity,
+              page.hasSameSummary(as: accepted),
               accepted.identity == page.identity, expressionGeneration == page.generation, accepted.generation == page.generation,
               accepted.start == page.start, accepted.expression.utf8.elementsEqual(page.expression.utf8),
               accepted.primaryNeedle.utf8.elementsEqual(page.primaryNeedle.utf8),
@@ -675,6 +686,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         search: AtlasReaderSearchTransport? = nil, outline: AtlasReaderOutlineTransport? = nil,
         document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasSavedReaderCapture {
         guard searchIsCurrent, let accepted = searchPage, info?.identity == page.identity,
+              page.hasSameSummary(as: accepted),
               accepted.identity == page.identity, queryGeneration == page.generation, accepted.generation == page.generation,
               accepted.start == page.start, accepted.needle.utf8.elementsEqual(page.needle.utf8),
               page.hits.contains(where: { $0.matches(hit) }),

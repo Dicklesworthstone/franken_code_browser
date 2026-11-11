@@ -260,6 +260,8 @@ final class AtlasSavedFileAccess {
                     .disabled(!model.canOperate || (model.searchPage == nil && model.searchInput.isEmpty))
             }
             HStack {
+                Toggle("Count all matches", isOn: $model.countAllMatches)
+                    .toggleStyle(.checkbox).disabled(!model.canOperate)
                 Text("Case-sensitive decoded literal · entire saved archive · up to 4,096 retained matches")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
@@ -279,7 +281,9 @@ final class AtlasSavedFileAccess {
                             Text("The draft differs from these results. Submit it or restore the accepted query before opening a match.")
                                 .font(.caption).foregroundStyle(.orange)
                             Spacer()
-                            Button("Use accepted query") { model.searchInput = page.needle; panelNotice = "" }
+                            Button("Use accepted query") {
+                                model.searchInput = page.needle; model.countAllMatches = page.counting.all; panelNotice = ""
+                            }
                                 .controlSize(.small).disabled(!model.canOperate)
                         }
                     }
@@ -289,8 +293,8 @@ final class AtlasSavedFileAccess {
                 if page.hits.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("No retained text matches.").font(.headline)
-                        Text(page.complete
-                            ? "The accepted literal has no matches in the complete saved manifest."
+                        Text(page.seen > 0 ? "Matches were counted without retaining rows. Search again with a positive retained-match limit to open them."
+                            : page.complete ? "The accepted literal has no matches in the complete saved manifest."
                             : "Coverage is partial. An empty result cannot establish that the literal is absent from the repository.")
                             .foregroundStyle(.secondary)
                     }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 10)
@@ -378,7 +382,9 @@ final class AtlasSavedFileAccess {
             Text("The first positive term names matches. Other terms must appear in the same captured member; -terms must be absent. Quote phrases and paths containing spaces. Use path:, -path:, lang: or -lang: to filter members.")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
-                Text("Case sensitive · 64 terms and filters maximum · up to 4,096 matches · 64 MiB matching-work budget")
+                Toggle("Count all matches", isOn: $model.countAllMatches)
+                    .toggleStyle(.checkbox).disabled(!model.canOperate)
+                Text("Case sensitive · 64 terms and filters maximum · up to 4,096 retained rows · 64 MiB matching-work budget")
                     .font(.caption2).foregroundStyle(.secondary)
                 Spacer()
                 Button("Reload results") { panelNotice = ""; model.reloadSearchResults() }
@@ -399,7 +405,9 @@ final class AtlasSavedFileAccess {
                             Text("The draft differs from these results. Submit it or restore the accepted expression before opening a match.")
                                 .font(.caption).foregroundStyle(.orange)
                             Spacer()
-                            Button("Use accepted expression") { model.searchInput = page.expression; panelNotice = "" }
+                            Button("Use accepted expression") {
+                                model.searchInput = page.expression; model.countAllMatches = page.counting.all; panelNotice = ""
+                            }
                                 .controlSize(.small).disabled(!model.canOperate)
                         }
                     }
@@ -409,7 +417,8 @@ final class AtlasSavedFileAccess {
                 if page.hits.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("No retained expression matches.").font(.headline)
-                        Text(page.complete ? "The accepted expression has no matches in the complete captured scope."
+                        Text(page.seen > 0 ? "Matches were counted without retaining rows. Search again with a positive retained-match limit to open them."
+                            : page.complete ? "The accepted expression has no matches in the complete captured scope."
                             : "Coverage is partial. An empty result does not establish that the expression has no matches.")
                             .foregroundStyle(.secondary)
                     }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 10)
@@ -590,7 +599,9 @@ final class AtlasSavedFileAccess {
             Label(page.complete ? "Complete expression coverage" : "Partial expression coverage",
                 systemImage: page.complete ? "checkmark.circle" : "exclamationmark.circle")
                 .font(.caption.weight(.semibold)).foregroundStyle(page.complete ? Color.secondary : Color.orange)
-            Text("\(page.retained) matches retained · \(page.scopeFiles) members in scope · \(page.filteredFiles) filtered by path/language")
+            Text(page.counting.summary(seen: page.seen, retained: page.retained))
+                .font(.caption)
+            Text("\(page.scopeFiles) members in scope · \(page.filteredFiles) filtered by path/language")
                 .font(.caption)
             Text("Unavailable: \(page.unavailable) · Unsupported decoding: \(page.unsupported) · Predicate rejections: \(page.predicateRejections)")
                 .font(.caption).foregroundStyle(.secondary)
@@ -599,7 +610,7 @@ final class AtlasSavedFileAccess {
             if page.state == "work-limit" {
                 Text("The matching-work budget was exhausted. Earlier matches remain valid; more may exist. Narrow path or language filters and search again.")
                     .font(.caption).foregroundStyle(.orange)
-            } else if page.truncated {
+            } else if page.truncated && !page.counting.all {
                 Text("At least \(page.seen) matches were seen. The retained-match limit stopped the search.")
                     .font(.caption).foregroundStyle(.orange)
             }
@@ -618,9 +629,7 @@ final class AtlasSavedFileAccess {
                 Spacer()
                 Text("Query generation \(page.generation)").foregroundStyle(.secondary)
             }.font(.caption.weight(.semibold))
-            Text(page.truncated
-                ? "\(page.retained) matches retained · at least \(page.seen) matches seen"
-                : "\(page.retained) matches retained from scanned captures")
+            Text(page.counting.summary(seen: page.seen, retained: page.retained))
                 .font(.caption)
             Text("Unavailable members: \(page.unavailable) · Unsupported decoding: \(page.unsupported) · \(page.sourceBytes) source bytes read")
                 .font(.caption).foregroundStyle(.secondary)
@@ -630,7 +639,7 @@ final class AtlasSavedFileAccess {
             } else {
                 Text("This query scanned saved source without an index.").font(.caption2).foregroundStyle(.secondary)
             }
-            if page.truncated {
+            if page.truncated && !page.counting.all {
                 Text("The retained-match limit stopped the search. More matches may exist, and the seen count is a lower bound.")
                     .font(.caption).foregroundStyle(.orange)
             }

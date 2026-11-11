@@ -41,6 +41,8 @@ import Dispatch
     }
     @MainActor static func main() async throws {
         try exactPageAndPartialCoverageContracts()
+        try countedTotalsRemainIndependentOfStoredRows()
+        try await countedPoliciesStayFrozenAcrossPagingAndReaders()
         try await exactUTF8AndUTF16HandoffsKeepOriginalMatches()
         await frozenArchiveQueryPageAndEditorRejectStaleHits()
         await failedAndLostRepliesReconcileWithoutRepeatingSearch()
@@ -63,6 +65,107 @@ import Dispatch
         await damagedIndexKeepsAcceptedResultsAndCanDetach()
         await canceledAndClosedIndexAttachmentsDrainBeforeRelease()
         print("Saved text and structural search, index attachment and coverage, UTF-8/UTF-16 captures, independent generations, grant lifetimes, bounded navigation and recovery regressions passed.")
+    }
+
+    private static func countedTotalsRemainIndependentOfStoredRows() throws {
+        let f = SavedRepositoryFixture(searchVectors: true)
+        var literal = f.searchPage(40, generation: 1, countAllMatches: true)
+        literal["captured_members"] = "5"; literal["unavailable_files"] = "0"
+        literal["search_complete"] = true; literal["matches_seen_exact"] = true
+        literal["max_matches"] = "1"; literal["retained_hits"] = "1"
+        literal["matches_seen"] = "12000"; literal["matching_files"] = "2"
+        literal["retained_matching_files"] = "1"; literal["truncated"] = true
+        literal["member_bytes_read"] = "60000"; literal["scanned_bytes"] = "60000"
+        literal["hits"] = [f.hitObject(1)]
+        let identity = try JSONDecoder().decode(AtlasSavedIdentity.self, from: Data(f.encode(literal).utf8))
+        func decodeLiteral(_ object: [String: Any]) throws -> AtlasSavedSearchPage {
+            try AtlasSavedSearchPage.decode(f.encode(object), identity: identity, generation: 1,
+                needle: "ana", start: 0, limit: 64, countAllMatches: true)
+        }
+        let all = try decodeLiteral(literal)
+        precondition(all.complete && all.truncated && all.counting.exact && all.seen == 12000)
+        precondition(all.retained == 1 && all.counting.matchingFiles == 2 && all.counting.retainedMatchingFiles == 1)
+        precondition(all.counting.summary(seen: all.seen, retained: all.retained).contains("12000 matches"))
+        var zero = literal
+        zero["max_matches"] = "0"; zero["retained_hits"] = "0"
+        zero["retained_matching_files"] = "0"; zero["hits"] = [[String: Any]]()
+        let countOnly = try decodeLiteral(zero)
+        precondition(countOnly.complete && countOnly.hits.isEmpty && countOnly.seen == 12000 && countOnly.truncated)
+        for field in ["count_all_matches", "matches_seen_exact", "max_matches", "matching_files", "retained_matching_files"] {
+            var bad = literal; bad.removeValue(forKey: field)
+            rejected("counted literal accepted missing \(field)") { _ = try decodeLiteral(bad) }
+        }
+        for (field, value) in [("count_all_matches", false as Any), ("matches_seen_exact", false as Any),
+            ("matching_files", "0" as Any), ("retained_matching_files", "0" as Any),
+            ("max_matches", "4096" as Any), ("matches_seen", "60001" as Any)] {
+            var bad = literal; bad[field] = value
+            rejected("counted literal accepted inconsistent \(field)") { _ = try decodeLiteral(bad) }
+        }
+
+        var expression = f.expressionPage(40, generation: 1, query: "ana path:raw", countAllMatches: true)
+        expression["max_hits"] = "1"; expression["retained_hits"] = "1"
+        expression["matches_seen"] = "12000"; expression["truncated"] = true
+        expression["hits"] = [f.hitObject(1)]
+        expression["member_bytes_read"] = "60000"; expression["loaded_bytes"] = "60000"
+        expression["scanned_bytes"] = "60000"
+        let expressionIdentity = try JSONDecoder().decode(AtlasSavedIdentity.self, from: Data(f.encode(expression).utf8))
+        func decodeExpression(_ object: [String: Any]) throws -> AtlasSavedExpressionPage {
+            try AtlasSavedExpressionPage.decode(f.encode(object), identity: expressionIdentity, generation: 1,
+                expression: "ana path:raw", start: 0, limit: 64, countAllMatches: true)
+        }
+        let complete = try decodeExpression(expression)
+        precondition(complete.complete && complete.state == "complete" && complete.truncated && complete.seen == 12000)
+        var partial = expression
+        partial["state"] = "work-limit"; partial["complete"] = false; partial["matches_seen_exact"] = false
+        let limited = try decodeExpression(partial)
+        precondition(!limited.counting.exact && limited.counting.summary(seen: limited.seen, retained: limited.retained).contains("At least"))
+        var expressionZero = expression
+        expressionZero["max_hits"] = "0"; expressionZero["retained_hits"] = "0"
+        expressionZero["retained_matching_files"] = "0"; expressionZero["hits"] = [[String: Any]]()
+        let noRows = try decodeExpression(expressionZero)
+        precondition(noRows.complete && noRows.seen == 12000 && noRows.hits.isEmpty)
+        for field in ["count_all_matches", "matching_files", "retained_matching_files"] {
+            var bad = expression; bad.removeValue(forKey: field)
+            rejected("counted expression accepted missing \(field)") { _ = try decodeExpression(bad) }
+        }
+        var stoppedAtRows = expression; stoppedAtRows["state"] = "truncated"
+        stoppedAtRows["complete"] = false; stoppedAtRows["matches_seen_exact"] = false
+        rejected("count-all expression stopped at its retained-row limit") { _ = try decodeExpression(stoppedAtRows) }
+    }
+
+    @MainActor private static func countedPoliciesStayFrozenAcrossPagingAndReaders() async throws {
+        let f = SavedRepositoryFixture(searchVectors: true), model = await prepared(f)
+        let accepted = model.searchPage!
+        precondition(model.countAllMatches && accepted.counting.all)
+        let reader = try await model.openHit(accepted.hits[0], from: accepted, readerTransport: f.readerTransport())
+        model.countAllMatches = false
+        precondition(!model.searchIsCurrent && reader.canUseMatch)
+        await refused("edited count policy authorized an old result") {
+            _ = try await model.openHit(accepted.hits[0], from: accepted, readerTransport: f.readerTransport())
+        }
+        model.countAllMatches = true; f.corruptNext("count-policy")
+        model.loadSearchResults(start: 2, from: accepted)
+        await wait("changed count policy did not drain") { !model.busy }
+        precondition(model.searchPage?.start == 0 && model.searchPage?.counting.all == true)
+        model.countAllMatches = false; model.search()
+        await wait("bounded legacy search did not complete") { !model.busy }
+        precondition(model.searchPage?.counting.all == false && model.searchIsCurrent)
+        model.searchMode = .expression; model.searchInput = "ana path:raw"; model.countAllMatches = true; model.search()
+        await wait("counted expression did not complete") { !model.busy }
+        let expression = model.expressionPage!
+        precondition(expression.counting.all && expression.complete)
+        model.countAllMatches = false
+        await refused("edited expression count policy authorized an old result") {
+            _ = try await model.openExpressionHit(expression.hits[0], from: expression, readerTransport: f.readerTransport())
+        }
+        model.countAllMatches = true; f.corruptNext("expression-count-policy")
+        model.loadExpressionResults(start: 1, from: expression)
+        await wait("changed expression policy did not drain") { !model.busy }
+        precondition(model.expressionPage?.start == 0 && model.expressionPage?.counting.all == true)
+        model.closeArchive()
+        precondition(reader.canUseMatch)
+        _ = try await reader.withMatchReader { $0 }
+        reader.reader.close(); model.close()
     }
 
     private static func indexReceiptsRequireArchiveCoverageAndTrustedPin() throws {
