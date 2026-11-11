@@ -17,6 +17,7 @@ mod highlight;
 mod position;
 mod selection;
 pub(crate) mod document;
+mod document_display;
 mod document_links;
 #[cfg(test)]
 mod shared_tests;
@@ -65,6 +66,7 @@ pub enum ReaderSessionError {
     Symbol(SymbolError), MissingOutline, UnsupportedOutlineLanguage,
     Reference(fcb::search::symbols::ReferenceError), MissingReferences,
     Document(fcb::document::reader::DocumentReadError), MissingDocument,
+    DocumentDisplay(fcb::document::native_display::NativeDisplayError),
     DocumentLinks(fcb::document::links::DocumentLinkError), MissingDocumentLinks, MissingDocumentLink,
     Comparison(fcb::analysis::comparison::ComparisonError),
 }
@@ -75,6 +77,7 @@ impl std::fmt::Display for ReaderSessionError {
             Self::Source(e) => write!(f, "{e}"), Self::Stream(e) => write!(f, "{e}"),
             Self::View(e) => write!(f, "{e}"), Self::Lines(e) => write!(f, "{e}"),
             Self::Symbol(e) => write!(f, "{e}"), Self::Document(e) => write!(f, "{e}"),
+            Self::DocumentDisplay(e) => write!(f, "{e}"),
             Self::Reference(e) => write!(f, "{e}"),
             Self::DocumentLinks(e) => write!(f, "{e}"),
             Self::Comparison(e) => write!(f, "{e}"),
@@ -150,6 +153,7 @@ pub struct ReaderSession {
     references: Option<AcceptedReferences>,
     last_reference_attempt: u64,
     document: Option<fcb::document::reader::DocumentReader<'static>>,
+    document_display: Option<fcb::document::native_display::NativeDocumentDisplay>,
     document_links: Option<document_links::AcceptedDocumentLinks>,
     last_document_attempt: u64,
     last_comparison_attempt: u64,
@@ -212,7 +216,7 @@ impl ReaderSession {
             line_checkpoints: std::array::from_fn(|_| None), source_bytes_read: 0, read_calls: 0,
             file_observation: false, query: None, last_query_attempt: 0,
             outline: None, last_outline_attempt: 0, references: None, last_reference_attempt: 0,
-            document: None, document_links: None, last_document_attempt: 0,
+            document: None, document_display: None, document_links: None, last_document_attempt: 0,
             last_comparison_attempt: 0, next_allocation: 3,
             budget, _source_lease: source_lease, _state_lease: state_lease }
     }

@@ -26,6 +26,8 @@ pub mod publication;
 pub mod session;
 /// Bounded captured-document reading, heading navigation and explicit copy domains.
 pub mod reader;
+/// Retained, upstream-shaped display primitives and exact bundled font data.
+pub mod native_display;
 /// Original capture identities for upstream Markdown links and document evidence.
 pub mod links;
 pub use links::{CapturedDocumentLinks, DocumentLink, DocumentLinkError,
@@ -76,6 +78,7 @@ pub use franken_markdown::{
     ProvenanceAuditReport, RenderedElement, SourceSpan, TextSelectionRange,
     UnresolvedAsset,
 };
+pub use franken_markdown::display::VectorShapeType as NativeVectorShape;
 
 /// Upstream lexical roles translated for native source presentation.
 pub mod source_highlight;

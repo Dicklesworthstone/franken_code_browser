@@ -100,6 +100,8 @@ fn cancellation_during_replacement_preserves_old_document_and_is_classified_as_c
     assert!(pulse.canceled());
     assert!(pulse.json(handle).contains("\"exit_code\":\"130\""));
     assert!(AccessError::Reader(ReaderSessionError::Document(DocumentReadError::Canceled)).canceled());
+    assert!(AccessError::Reader(ReaderSessionError::DocumentDisplay(
+        fcb::document::native_display::NativeDisplayError::Canceled)).canceled());
     assert!(window(&readers, handle, 1).as_str().contains("Kept"));
     assert!(readers.execute(handle, Command::ClearDocument { generation: 4 }, || true).is_err());
     assert!(window(&readers, handle, 1).as_str().contains("Kept"));

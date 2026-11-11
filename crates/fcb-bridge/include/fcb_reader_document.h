@@ -42,6 +42,53 @@ char *fcb_reader_document(uint64_t handle, uint64_t generation,
  */
 char *fcb_reader_document_window(uint64_t handle, uint64_t generation,
     uint64_t first, uint64_t count);
+
+/* Optional native drawing packet for an already accepted logical document.
+ * FrankenMarkdown owns styles, wrapping, table/list geometry and glyph shaping;
+ * the native consumer draws exact bundled-face glyph IDs without reshaping.
+ * Logical flow rows/rendered byte offsets remain a separate, unchanged model.
+ * Width is 160..4096 points and is immutable for this document generation.
+ * A different width requires logical reflow and its fresh generation first.
+ * Rich preparation failures preserve the logical preview and captured source.
+ * The bounded simple-script font profile can refuse unsupported writing systems;
+ * DOCUMENT_DISPLAY_SHAPING_UNSUPPORTED is an explicit logical-preview fallback.
+ * Current cap: 64KiB source, 8192 items, 131072 glyphs, 4096 glyphs per run,
+ * six exact font faces and 8MiB total font bytes. Assets are never loaded.
+ * Math/diagrams can remain upstream text; unresolved images remain placeholders.
+ * Source ranges are optional qualified enclosing AST blocks, never glyph ranges.
+ * Geometry/font sizes are finite JSON NUMBERS; identities/counts are STRINGS.
+ * Prepare returns the first <=64 items, with page and font inventory metadata.
+ */
+char *fcb_reader_document_display(uint64_t handle, uint64_t generation,
+    uint64_t width_points);
+
+/* First is the zero-based retained display-item index, count is 1..128.
+ * At most 16384 glyphs are returned, without splitting any run. Follow the
+ * actual next_display_item, which can precede first+count. EOF is empty.
+ * Text bounds are upstream line boxes. Glyph x/y are relative to their baseline
+ * with typographic positive-up y. Align the exact face metrics within the box;
+ * do not perform platform shaping, line wrapping or font substitution.
+ */
+char *fcb_reader_document_display_page(uint64_t handle, uint64_t generation,
+    uint64_t first, uint64_t count);
+
+/* Original captured source anchor -> first item of its verified enclosing AST
+ * block, count 1..128. Requires qualified source ranges; missing/unqualified,
+ * whitespace gaps, BOM bytes, interior UTF-8 positions and stale identities
+ * fail explicitly. Original EOF returns the empty end page. Includes the exact
+ * original_anchor in the response; no logical-row percentage conversion occurs.
+ */
+char *fcb_reader_document_display_from_source(uint64_t handle, uint64_t generation,
+    uint64_t original_offset, uint64_t count);
+
+/* Exact immutable font face bytes in bounded hex chunks, not a filesystem path.
+ * font_index is local to this display's contiguous inventory; offset is a byte
+ * offset, count is 1..65536. Follow next_font_offset; EOF is an empty chunk.
+ * Reflow/clear/cancel/close revoke obsolete delivery under existing reader rules.
+ */
+char *fcb_reader_document_display_font(uint64_t handle, uint64_t generation,
+    uint64_t font_index, uint64_t offset, uint64_t count);
+
 char *fcb_reader_document_headings(uint64_t handle, uint64_t generation,
     uint64_t first, uint64_t count);
 

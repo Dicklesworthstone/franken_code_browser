@@ -46,6 +46,7 @@ impl AccessError {
                 | Self::Reader(ReaderSessionError::Symbol(SymbolError::Canceled))
                 | Self::Reader(ReaderSessionError::Reference(ReferenceError::Canceled))
                 | Self::Reader(ReaderSessionError::Document(DocumentReadError::Canceled))
+                | Self::Reader(ReaderSessionError::DocumentDisplay(fcb::document::native_display::NativeDisplayError::Canceled))
                 | Self::Reader(ReaderSessionError::DocumentLinks(fcb::document::links::DocumentLinkError::Canceled)) => true,
             Self::Reader(ReaderSessionError::Comparison(fcb::analysis::comparison::ComparisonError::Canceled)) => true,
             Self::Reader(ReaderSessionError::Host(HostError::App(e)) | ReaderSessionError::App(e)) => e.is_canceled(),
@@ -94,6 +95,10 @@ pub(super) enum Command<'a> {
     ClearReferences { generation: u64 },
     Document { generation: u64, options: ReaderDocumentOptions },
     DocumentWindow { generation: u64, first: usize, count: usize },
+    DocumentDisplay { generation: u64, width_points: u32 },
+    DocumentDisplayPage { generation: u64, first: usize, count: usize },
+    DocumentDisplayFromSource { generation: u64, offset: u64, count: usize },
+    DocumentDisplayFont { generation: u64, index: usize, offset: usize, count: usize },
     DocumentHeadings { generation: u64, first: usize, count: usize },
     DocumentHeading { generation: u64, slug: &'a str, count: usize },
     DocumentLinksPrepare { generation: u64, max_links: usize },
@@ -307,6 +312,10 @@ impl ReaderSessions {
             Command::ClearReferences { generation } => reader.clear_references(generation, &mut stop),
             Command::Document { generation, options } => reader.prepare_document(generation, options, &mut stop),
             Command::DocumentWindow { generation, first, count } => reader.document_window(generation, first, count, &mut stop),
+            Command::DocumentDisplay { generation, width_points } => reader.prepare_document_display(generation, width_points, &mut stop),
+            Command::DocumentDisplayPage { generation, first, count } => reader.document_display_page(generation, first, count, &mut stop),
+            Command::DocumentDisplayFromSource { generation, offset, count } => reader.document_display_from_source(generation, offset, count, &mut stop),
+            Command::DocumentDisplayFont { generation, index, offset, count } => reader.document_display_font(generation, index, offset, count, &mut stop),
             Command::DocumentHeadings { generation, first, count } => reader.document_headings(generation, first, count, &mut stop),
             Command::DocumentHeading { generation, slug, count } => reader.document_at_heading(generation, slug, count, &mut stop),
             Command::DocumentLinksPrepare { generation, max_links } => reader.prepare_document_links(generation, max_links, &mut stop),

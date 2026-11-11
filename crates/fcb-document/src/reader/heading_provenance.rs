@@ -20,6 +20,14 @@ impl DocumentReader<'_> {
     /// a lazy quote, or another block after an earlier span shifted the zip.
     pub fn qualify_heading_source_ranges(&self, budget: &ResourceBudget,
         allocation: ResourceAllocationId, mut canceled: impl FnMut() -> bool) -> Result<(), DocumentReadError> {
+        self.qualified_source_spans(budget, allocation, &mut canceled).map(|_| ())
+    }
+
+    /// The same conservative provenance audit also qualifies native display
+    /// items. Their spans must name one of these exact verified top-level blocks;
+    /// an arbitrary in-bounds slice is insufficient evidence for navigation.
+    pub(crate) fn qualified_source_spans(&self, budget: &ResourceBudget,
+        allocation: ResourceAllocationId, mut canceled: impl FnMut() -> bool) -> Result<Vec<SourceSpan>, DocumentReadError> {
         check(&mut canceled)?;
         let source = self.session.source_text();
         let workspace = crate::links::parse_workspace(source.as_bytes()).map_err(|_| DocumentReadError::EngineBudget)?;
@@ -102,7 +110,8 @@ impl DocumentReader<'_> {
             let expected = if start <= end && end > 0 { SourceSpan { start, end } } else { SourceSpan::default() };
             if seen != line.element_indices.len() || line.source_span != expected { return Err(DocumentReadError::InvalidOutput); }
         }
-        check(&mut canceled)
+        check(&mut canceled)?;
+        Ok(parsed.blocks.iter().map(|block| block.span).collect())
     }
 }
 

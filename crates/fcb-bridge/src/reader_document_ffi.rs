@@ -23,6 +23,32 @@ pub extern "C" fn fcb_reader_document_window(handle: u64, generation: u64, first
     reply(|| answer(handle, |readers| readers.execute(handle,
         Command::DocumentWindow { generation, first: number(first)?, count: number(count)? }, || false)))
 }
+/// Prepare exact upstream glyph geometry for an already accepted logical
+/// document generation. This is host-worker work, never a drawing callback.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_reader_document_display(handle: u64, generation: u64, width_points: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| readers.execute(handle,
+        Command::DocumentDisplay { generation,
+            width_points: u32::try_from(width_points).map_err(|_| AccessError::InvalidArgument)? }, || false)))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_reader_document_display_page(handle: u64, generation: u64, first: u64, count: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| readers.execute(handle,
+        Command::DocumentDisplayPage { generation, first: number(first)?, count: number(count)? }, || false)))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_reader_document_display_from_source(handle: u64, generation: u64,
+    original_offset: u64, count: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| readers.execute(handle,
+        Command::DocumentDisplayFromSource { generation, offset: original_offset, count: number(count)? }, || false)))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_reader_document_display_font(handle: u64, generation: u64,
+    font_index: u64, offset: u64, count: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| readers.execute(handle,
+        Command::DocumentDisplayFont { generation, index: number(font_index)?,
+            offset: number(offset)?, count: number(count)? }, || false)))
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_reader_document_headings(handle: u64, generation: u64, first: u64, count: u64) -> *mut c_char {
     reply(|| answer(handle, |readers| readers.execute(handle,
