@@ -103,6 +103,7 @@ import AppKit
         .onDisappear { presentation.close() }
         .onChange(of: model.navigation) { _, _ in copyNotice = "" }
         .onChange(of: model.searchText) { _, _ in copyNotice = "" }
+        .onChange(of: model.countAllSearchMatches) { _, _ in copyNotice = "" }
         .onChange(of: model.encoding) { _, _ in copyNotice = "" }
         .background {
             Button("Find in observed file") { searchFocused = true }
@@ -195,6 +196,14 @@ import AppKit
                 Button(model.searching ? "Restart Find" : "Find", action: model.find).disabled(!model.canSearch)
                 Button("Previous match", action: model.previousSearchHit).disabled(!model.canSelectSearchHit)
                 Button("Next match", action: model.nextSearchHit).disabled(!model.canSelectSearchHit)
+            }
+            HStack(spacing: 7) {
+                Toggle("Count all matches", isOn: $model.countAllSearchMatches).toggleStyle(.checkbox)
+                    .help("Continue counting after the first 256 retained matches, within the selected scan and read-call limits")
+                Text(model.countAllSearchMatches
+                    ? "Keep the first 256 matches but continue counting. The count is exact only when the observation completes unchanged."
+                    : "Find stops at the first match beyond the retained-result limit.")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
             Text("Find starts at byte 0 using the selected decoding, with at most 256 retained matches. A scan limit or file change leaves the total count unknown.")
                 .font(.caption2).foregroundStyle(.secondary)

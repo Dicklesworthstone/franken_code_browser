@@ -6,7 +6,7 @@ private enum ObservedSearchFixture {
     static func report(_ owner: UInt64, _ input: AtlasObservedReaderInput,
         _ request: AtlasObservedReaderSearchRequest, observation: UInt64 = 2,
         length: UInt64 = 64, offsets: [UInt64] = [4], state: String = "complete-observed-input",
-        consistency: String = "unchanged-metadata-not-atomic") -> [String: Any] {
+        consistency: String = "unchanged-metadata-not-atomic", matchesSeen: UInt64? = nil) -> [String: Any] {
         var out = ObservedReaderFixture.common(owner, input, "find")
         let bytes = min(length, request.maximumScanBytes)
         let literalBytes = UInt64(request.originalHex.utf8.count / 2)
@@ -20,13 +20,16 @@ private enum ObservedSearchFixture {
         out["state"] = state; out["consistency"] = consistency
         out["input_complete"] = state == "complete-observed-input"
         out["search_complete"] = state == "complete-observed-input" && consistency == "unchanged-metadata-not-atomic"
+        out["count_all_matches"] = request.countAllMatches
+        out["match_count_complete"] = out["search_complete"]
         out["max_matches"] = String(request.maximumMatches); out["max_scan_bytes"] = String(request.maximumScanBytes)
         out["max_read_calls"] = String(AtlasObservedReaderSearchLimits.readCalls)
         out["payload_bytes_read"] = String(bytes); out["scanned_input_bytes"] = String(bytes)
         out["read_calls"] = bytes == 0 ? "0" : "1"
         out["peak_input_buffer_bytes"] = String(min(bytes, AtlasObservedReaderSearchLimits.inputBufferBytes))
-        out["matches_seen"] = String(offsets.count + (state == "match-limit" ? 1 : 0))
-        out["retained_hits"] = String(offsets.count); out["truncated"] = state == "match-limit"
+        let seen = matchesSeen ?? UInt64(offsets.count + (state == "match-limit" ? 1 : 0))
+        out["matches_seen"] = String(seen)
+        out["retained_hits"] = String(offsets.count); out["truncated"] = seen > UInt64(offsets.count)
         out["unsupported_at"] = NSNull()
         out["additional_source_bytes_read"] = String(bytes); out["additional_read_calls"] = out["read_calls"]
         out["hits"] = offsets.enumerated().map { index, start in
@@ -142,18 +145,22 @@ private final class ObservedSearchProbe: @unchecked Sendable {
         let bytes = AtlasObservedReaderSearchRequest.originalBytes(text, encoding: request.encoding)
         let needle = AtlasObservedReaderSearchRequest.originalBytes(request.needle, encoding: request.encoding)
         let count = min(bytes.count, Int(request.maximumScanBytes))
-        var offsets: [UInt64] = []
+        var allOffsets: [UInt64] = []
         if count >= needle.count {
             for offset in 0...(count - needle.count) where bytes[offset..<(offset + needle.count)].elementsEqual(needle) {
-                offsets.append(UInt64(offset))
-                if offsets.count > Int(request.maximumMatches) { break }
+                allOffsets.append(UInt64(offset))
+                if !request.countAllMatches && allOffsets.count > Int(request.maximumMatches) { break }
             }
         }
         let state: String
-        if offsets.count > Int(request.maximumMatches) { offsets.removeLast(); state = "match-limit" }
-        else { state = count == bytes.count ? "complete-observed-input" : "byte-limit" }
+        if !request.countAllMatches && allOffsets.count > Int(request.maximumMatches) {
+            allOffsets.removeLast(); state = "match-limit"
+        } else { state = count == bytes.count ? "complete-observed-input" : "byte-limit" }
+        let retained = Array(allOffsets.prefix(Int(request.maximumMatches)))
+        let seen = request.countAllMatches ? UInt64(allOffsets.count)
+            : UInt64(retained.count + (state == "match-limit" ? 1 : 0))
         let report = ObservedSearchFixture.report(owner, input, request, observation: stale ? id - 1 : id,
-            length: UInt64(bytes.count), offsets: offsets, state: state)
+            length: UInt64(bytes.count), offsets: retained, state: state, matchesSeen: seen)
         lock.lock(); reports[owner] = report; lock.unlock()
         replyGate?.wait()
         return try ObservedReaderFixture.encode(report)
@@ -340,6 +347,20 @@ private final class ObservedSearchProbe: @unchecked Sendable {
             handle: owner, input: input, request: one)
         precondition(truncated.matchesSeen == 2 && truncated.countLabel.contains("At least 2"))
 
+        let countedRequest = try AtlasObservedReaderSearchRequest(generation: 9, needle: "old",
+            encoding: .utf8, maximumMatches: 1, countAllMatches: true)
+        let countedJSON = ObservedSearchFixture.report(owner, input, countedRequest,
+            offsets: [0], matchesSeen: 4)
+        let counted = try AtlasObservedReaderSearchReport.decode(ObservedReaderFixture.encode(countedJSON),
+            handle: owner, input: input, request: countedRequest)
+        precondition(counted.searchComplete && counted.matchCountComplete && counted.matchesSeen == 4
+            && counted.hits.count == 1 && counted.countLabel.contains("4 matches"))
+        var forgedCount = countedJSON; forgedCount["match_count_complete"] = false
+        rejects("count completeness") {
+            _ = try AtlasObservedReaderSearchReport.decode(ObservedReaderFixture.encode(forgedCount),
+                handle: owner, input: input, request: countedRequest)
+        }
+
         let atZero = ObservedSearchFixture.report(owner, input, request, length: 4, offsets: [0])
         let zeroReport = try decode(atZero), zeroTarget = zeroReport.target(for: zeroReport.hits[0])
         let zeroWitness = try AtlasObservedReaderSearchWitness.decode(ObservedReaderFixture.encode(ObservedSearchFixture.witness(atZero)),
@@ -495,6 +516,12 @@ private final class ObservedSearchProbe: @unchecked Sendable {
         model.reopenCurrentFile()
         try await wait("successful reopen") { !model.busy && model.info?.identity.owner != beforeReopen }
         precondition(model.searchReport == nil && model.page?.observation.id == 1)
+        model.countAllSearchMatches = true
+        precondition(model.searchReport == nil, "Changing count policy revokes accepted Find evidence")
+        model.searchText = "new"; model.find()
+        try await wait("counted model Find") { model.searchReport != nil && !model.busy }
+        precondition(model.searchReport?.request.countAllMatches == true
+            && model.searchReport?.matchCountComplete == true)
         model.close()
         try await wait("owners retire") { probe.lifetime.closedCount == probe.lifetime.createCount }
     }

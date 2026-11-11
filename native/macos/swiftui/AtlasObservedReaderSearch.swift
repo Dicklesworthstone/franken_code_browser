@@ -16,10 +16,12 @@ struct AtlasObservedReaderSearchRequest: Equatable, Sendable {
     let needle: String
     let encoding: AtlasObservedReaderEncoding
     let maximumMatches, maximumScanBytes: UInt64
+    let countAllMatches: Bool
 
     init(generation: UInt64, needle: String, encoding: AtlasObservedReaderEncoding,
          maximumMatches: UInt64 = AtlasObservedReaderSearchLimits.matches,
-         maximumScanBytes: UInt64 = AtlasObservedReaderSearchLimits.scanBytes) throws {
+         maximumScanBytes: UInt64 = AtlasObservedReaderSearchLimits.scanBytes,
+         countAllMatches: Bool = false) throws {
         guard generation > 0, !needle.isEmpty,
               needle.utf8.count <= AtlasObservedReaderSearchLimits.needleBytes,
               !needle.utf8.contains(0),
@@ -29,12 +31,13 @@ struct AtlasObservedReaderSearchRequest: Equatable, Sendable {
         }
         self.generation = generation; self.needle = needle; self.encoding = encoding
         self.maximumMatches = maximumMatches; self.maximumScanBytes = maximumScanBytes
+        self.countAllMatches = countAllMatches
     }
 
     static func == (a: Self, b: Self) -> Bool {
         a.generation == b.generation && a.needle.utf8.elementsEqual(b.needle.utf8)
             && a.encoding == b.encoding && a.maximumMatches == b.maximumMatches
-            && a.maximumScanBytes == b.maximumScanBytes
+            && a.maximumScanBytes == b.maximumScanBytes && a.countAllMatches == b.countAllMatches
     }
 
     /// Reverse encoding is only a correlation check against engine receipts;
@@ -105,7 +108,7 @@ struct AtlasObservedReaderSearchReport: Sendable {
     let observation, observedLength: UInt64
     let finalObservedLength: UInt64?
     let state, consistency: String
-    let inputComplete, searchComplete: Bool
+    let inputComplete, searchComplete, matchCountComplete: Bool
     let payloadBytesRead, scannedInputBytes, readCalls, peakInputBufferBytes, matchesSeen: UInt64
     let unsupportedAt: UInt64?
     let originalHex, witnessSHA256: String?
@@ -119,7 +122,13 @@ struct AtlasObservedReaderSearchReport: Sendable {
             && target.hit.index < UInt64(hits.count) && hits[Int(target.hit.index)] == target.hit
     }
     var countLabel: String {
-        if searchComplete { return "\(hits.count) matches in the observed input" }
+        if matchCountComplete {
+            let total = "\(matchesSeen) matches in the observed input"
+            return matchesSeen > UInt64(hits.count) ? total + "; first \(hits.count) retained" : total
+        }
+        if request.countAllMatches {
+            return "At least \(matchesSeen) matches; first \(hits.count) retained · partial count"
+        }
         if state == "match-limit" { return "At least \(matchesSeen) matches; first \(hits.count) retained" }
         return "\(hits.count) retained matches · partial search"
     }
@@ -136,8 +145,11 @@ struct AtlasObservedReaderSearchReport: Sendable {
         let changed = consistency == "unchanged-metadata-not-atomic"
             ? " Metadata checks did not detect a change; this is not an atomic snapshot."
             : " Metadata or read consistency: \(consistency). The total match count is unknown."
+        let retained = request.countAllMatches && matchesSeen > UInt64(hits.count)
+            ? " The result list retains the first \(hits.count) matches; the count includes later occurrences."
+            : ""
         return "Scanned \(scannedInputBytes) of \(observedLength) initially observed bytes; read \(payloadBytesRead) bytes in \(readCalls) calls. "
-            + reason + changed + " Only matching literal bytes are retained, without surrounding context."
+            + reason + changed + retained + " Only matching literal bytes are retained, without surrounding context."
     }
 
     static func decode(_ json: String?, handle: UInt64, input: AtlasObservedReaderInput,
@@ -150,6 +162,18 @@ struct AtlasObservedReaderSearchReport: Sendable {
             let observation = try w.observation.value(request: request)
             let count = UInt64(w.hits.count)
             let encoded = request.originalHex
+            let countFieldsPresent = w.count_all_matches != nil || w.match_count_complete != nil
+            let matchCountComplete: Bool
+            if countFieldsPresent {
+                guard w.count_all_matches == request.countAllMatches,
+                      w.match_count_complete == observation.searchComplete else {
+                    throw AtlasObservedReaderError.invalidResponse
+                }
+                matchCountComplete = w.match_count_complete!
+            } else {
+                guard !request.countAllMatches else { throw AtlasObservedReaderError.invalidResponse }
+                matchCountComplete = observation.searchComplete
+            }
             guard w.mode == "exact-decoded-text", w.case_sensitive,
                   w.literal_text.utf8.elementsEqual(request.needle.utf8),
                   w.max_matches.value == request.maximumMatches, w.max_scan_bytes.value == request.maximumScanBytes,
@@ -162,8 +186,8 @@ struct AtlasObservedReaderSearchReport: Sendable {
                   w.peak_input_buffer_bytes.value <= min(w.payload_bytes_read.value, AtlasObservedReaderSearchLimits.inputBufferBytes),
                   w.additional_source_bytes_read.value == w.payload_bytes_read.value,
                   w.additional_read_calls.value == w.read_calls.value,
-                  w.truncated == (w.observation.state == "match-limit"),
-                  w.matches_seen.value == count + (w.truncated ? 1 : 0),
+                  w.truncated == (w.matches_seen.value > count),
+                  count <= w.matches_seen.value,
                   !w.truncated || count == request.maximumMatches,
                   !observation.inputComplete || (w.scanned_input_bytes.value == observation.length
                     && w.payload_bytes_read.value == observation.length),
@@ -176,6 +200,14 @@ struct AtlasObservedReaderSearchReport: Sendable {
                     : (w.literal_original_hex == encoded
                       && w.literal_sha256.map { AtlasObservedReaderWire.validHex($0, bytes: 32) } == true)) else {
                 throw AtlasObservedReaderError.invalidResponse
+            }
+            if request.countAllMatches {
+                guard w.observation.state != "match-limit" else { throw AtlasObservedReaderError.invalidResponse }
+            } else {
+                guard w.truncated == (w.observation.state == "match-limit"),
+                      w.matches_seen.value == count + (w.truncated ? 1 : 0) else {
+                    throw AtlasObservedReaderError.invalidResponse
+                }
             }
             var hits: [AtlasObservedReaderSearchHit] = []; hits.reserveCapacity(w.hits.count)
             for (index, hit) in w.hits.enumerated() {
@@ -192,6 +224,7 @@ struct AtlasObservedReaderSearchReport: Sendable {
                 observedLength: observation.length, finalObservedLength: observation.finalLength,
                 state: w.observation.state, consistency: w.observation.consistency,
                 inputComplete: observation.inputComplete, searchComplete: observation.searchComplete,
+                matchCountComplete: matchCountComplete,
                 payloadBytesRead: w.payload_bytes_read.value, scannedInputBytes: w.scanned_input_bytes.value,
                 readCalls: w.read_calls.value, peakInputBufferBytes: w.peak_input_buffer_bytes.value,
                 matchesSeen: w.matches_seen.value, unsupportedAt: w.unsupported_at?.value,
@@ -204,6 +237,7 @@ struct AtlasObservedReaderSearchReport: Sendable {
         let mode, literal_text: String
         let literal_original_hex, literal_sha256: String?
         let case_sensitive, truncated: Bool
+        let count_all_matches, match_count_complete: Bool?
         let max_matches, max_scan_bytes, max_read_calls: AtlasObservedReaderWire.Number
         let payload_bytes_read, scanned_input_bytes, read_calls, peak_input_buffer_bytes: AtlasObservedReaderWire.Number
         let matches_seen, retained_hits, additional_source_bytes_read, additional_read_calls: AtlasObservedReaderWire.Number
@@ -220,6 +254,8 @@ struct AtlasObservedReaderSearchReport: Sendable {
             literal_original_hex = try c.decodeIfPresent(String.self, forKey: .literal_original_hex)
             literal_sha256 = try c.decodeIfPresent(String.self, forKey: .literal_sha256)
             case_sensitive = try c.decode(Bool.self, forKey: .case_sensitive); truncated = try c.decode(Bool.self, forKey: .truncated)
+            count_all_matches = try c.decodeIfPresent(Bool.self, forKey: .count_all_matches)
+            match_count_complete = try c.decodeIfPresent(Bool.self, forKey: .match_count_complete)
             max_matches = try c.decode(AtlasObservedReaderWire.Number.self, forKey: .max_matches)
             max_scan_bytes = try c.decode(AtlasObservedReaderWire.Number.self, forKey: .max_scan_bytes)
             max_read_calls = try c.decode(AtlasObservedReaderWire.Number.self, forKey: .max_read_calls)
@@ -236,6 +272,7 @@ struct AtlasObservedReaderSearchReport: Sendable {
         }
         private enum CodingKeys: CodingKey {
             case mode, literal_text, literal_original_hex, literal_sha256, case_sensitive, truncated
+            case count_all_matches, match_count_complete
             case max_matches, max_scan_bytes, max_read_calls, payload_bytes_read, scanned_input_bytes, read_calls
             case peak_input_buffer_bytes, matches_seen, retained_hits, additional_source_bytes_read, additional_read_calls
             case unsupported_at, hits

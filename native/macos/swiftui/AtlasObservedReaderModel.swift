@@ -163,6 +163,9 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     var searchScanBytes: UInt64 = AtlasObservedReaderSearchLimits.scanBytes {
         didSet { if oldValue != searchScanBytes { revokeSearch() } }
     }
+    var countAllSearchMatches = false {
+        didSet { if oldValue != countAllSearchMatches { revokeSearch() } }
+    }
     var offsetInput = "0"
     var lineInput = "1" {
         didSet { if oldValue != lineInput { revokeLineRequest() } }
@@ -213,7 +216,8 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     var canSearch: Bool {
         !closed && session != nil && transport.search != nil && lastSearchGeneration < UInt64.max
             && (try? AtlasObservedReaderSearchRequest(generation: 1, needle: searchText,
-                encoding: encoding, maximumScanBytes: searchScanBytes)) != nil
+                encoding: encoding, maximumScanBytes: searchScanBytes,
+                countAllMatches: countAllSearchMatches)) != nil
     }
     var canSelectSearchHit: Bool {
         searchAuthorized && !closed && !busy && session != nil && !(searchReport?.hits.isEmpty ?? true)
@@ -433,7 +437,8 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         let request: AtlasObservedReaderSearchRequest
         do {
             request = try .init(generation: lastSearchGeneration + 1, needle: searchText,
-                encoding: encoding, maximumScanBytes: searchScanBytes)
+                encoding: encoding, maximumScanBytes: searchScanBytes,
+                countAllMatches: countAllSearchMatches)
         } catch { notice = "Enter exact text of 1–4096 UTF-8 bytes without NUL, and choose a bounded scan limit."; return }
         lastSearchGeneration = request.generation
         // A replacement can commit in Rust before its reply is canceled or
@@ -450,7 +455,8 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
                 }
                 guard accepts(ticket, flag), self.session === session,
                       searchText.utf8.elementsEqual(request.needle.utf8), encoding == request.encoding,
-                      searchScanBytes == request.maximumScanBytes else { return }
+                      searchScanBytes == request.maximumScanBytes,
+                      countAllSearchMatches == request.countAllMatches else { return }
                 guard report.observation > latestObservation else { throw AtlasObservedReaderError.invalidResponse }
                 latestObservation = report.observation
                 searchReport = report; searchAuthorized = true; selectedSearchWitness = nil; clearSearchContext()

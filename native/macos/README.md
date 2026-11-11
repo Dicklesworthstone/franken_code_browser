@@ -665,7 +665,12 @@ Each search starts at byte zero and reads through a 16 KiB streaming buffer.
 The selected scan limit bounds source I/O; the default is 256 MiB and the maximum
 is 4 GiB. At most 256 hits and a 4096-byte UTF-8 query are admitted. Overlapping
 matches and matches split across read buffers retain exact original byte ranges,
-including UTF-16 surrogate pairs. The result reports actual bytes scanned and
+including UTF-16 surrogate pairs. Enable **Count all matches** to continue
+counting after the retained-hit table fills without retaining more rows or source
+bytes. A completed unchanged observation can then report an exhaustive count;
+byte/read-call limits, decoding failures, source changes and cancellation keep
+that count explicitly partial. Without the option, Find preserves its existing
+stop-at-first-overflow behavior. The result reports actual bytes scanned and
 read, and distinguishes reaching the observed end from stopping at a byte,
 read-call, result, or encoding limit. A completed scan is an observation of a
 mutable file, never an atomic snapshot.

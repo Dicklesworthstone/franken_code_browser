@@ -151,6 +151,12 @@ import Foundation
         }
 
         mode(0)
+        let countedRequest = try AtlasObservedReaderSearchRequest(generation: observation,
+            needle: "exact é😀", encoding: .utf8, maximumScanBytes: 1 << 32, countAllMatches: true)
+        let counted = try search.find(handle, countedRequest, AtlasSearchCancellation())
+        precondition(counted == expected && count(13) == 1,
+            "Counted Find must use the additive counted ABI without changing legacy Find dispatch")
+
         let canceled = AtlasSearchCancellation(); canceled.cancel()
         let enteredOpen = count(1), enteredWindow = count(3), enteredPolls = count(8), enteredFind = count(9)
         let enteredObserveHit = count(11)
