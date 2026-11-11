@@ -36,6 +36,11 @@ fn find(handle: u64, generation: u64, needle: &str, encoding: u64, hits: u64, by
     take(unsafe { fcb_observed_reader_find(handle, generation, needle.as_ptr(), encoding, hits, bytes,
         None, std::ptr::null_mut()) })
 }
+fn find_counted(handle: u64, generation: u64, needle: &str, encoding: u64, hits: u64, bytes: u64) -> String {
+    let needle = CString::new(needle).unwrap();
+    take(unsafe { fcb_observed_reader_find_counted(handle, generation, needle.as_ptr(), encoding, hits, bytes,
+        None, std::ptr::null_mut()) })
+}
 fn hit(handle: u64, generation: u64, index: u64) -> String {
     take(unsafe { fcb_observed_reader_observe_hit(handle, generation, index, 4096, 65_536,
         None, std::ptr::null_mut()) })
@@ -138,4 +143,49 @@ fn c_find_rejects_invalid_inputs_stale_generations_and_canceled_delivery() {
     }
     assert_eq!(fcb_observed_reader_close(handle), 1);
     assert!(hit(handle, 1, 0).contains("OBSERVED_READER_HANDLE_UNKNOWN"));
+}
+
+
+#[test]
+fn c_counted_find_continues_after_retention_fills_and_legacy_find_does_not() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (root, croot) = root();
+    fs::write(root.join("source"), b"banana banana").unwrap();
+    let handle = open(&croot);
+    let legacy = find(handle, 1, "ana", 1, 1, 64);
+    assert!(legacy.contains("\"state\":\"match-limit\""), "{legacy}");
+    assert_eq!(number(&legacy, "matches_seen"), 2);
+    assert!(legacy.contains("\"count_all_matches\":false"));
+
+    let counted = find_counted(handle, 2, "ana", 1, 1, 64);
+    assert!(counted.contains("\"state\":\"complete-observed-input\""), "{counted}");
+    assert!(counted.contains("\"search_complete\":true"));
+    assert!(counted.contains("\"count_all_matches\":true"));
+    assert!(counted.contains("\"match_count_complete\":true"));
+    assert!(counted.contains("\"truncated\":true"));
+    assert_eq!(number(&counted, "matches_seen"), 4);
+    assert_eq!(number(&counted, "retained_hits"), 1);
+    let literal = take(fcb_observed_reader_search_hit(handle, 2, 0));
+    assert!(literal.contains("\"count_all_matches\":true"), "{literal}");
+    assert!(literal.contains("\"match_count_complete\":true"), "{literal}");
+    assert!(literal.contains("\"original_hex\":\"616e61\""), "{literal}");
+    assert_eq!(fcb_observed_reader_close(handle), 1);
+}
+
+#[test]
+fn c_counted_find_keeps_budget_and_cancellation_semantics() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (root, croot) = root();
+    fs::write(root.join("source"), b"banana banana").unwrap();
+    let handle = open(&croot);
+    let partial = find_counted(handle, 1, "ana", 1, 1, 6);
+    assert!(partial.contains("\"state\":\"byte-limit\""), "{partial}");
+    assert!(partial.contains("\"match_count_complete\":false"));
+    assert_eq!(number(&partial, "matches_seen"), 2);
+    let needle = CString::new("ana").unwrap();
+    let canceled = take(unsafe { fcb_observed_reader_find_counted(handle, 2, needle.as_ptr(), 1, 1, 64,
+        Some(cancel_now), std::ptr::null_mut()) });
+    assert!(canceled.contains("\"exit_code\":\"130\""), "{canceled}");
+    assert!(take(fcb_observed_reader_search_hit(handle, 1, 0)).contains("\"original_hex\":\"616e61\""));
+    assert_eq!(fcb_observed_reader_close(handle), 1);
 }

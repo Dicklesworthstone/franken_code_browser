@@ -101,6 +101,17 @@ char *fcb_observed_reader_find(uint64_t handle, uint64_t generation,
     const char *needle, uint64_t encoding, uint64_t max_matches,
     uint64_t max_scan_bytes, fcb_observed_reader_poll poll, void *context);
 
+/* Opt-in complete counting under the same scan/read-call limits. Reaching
+ * max_matches limits retained rows/witness bytes only; scanning continues.
+ * count_all_matches=true and match_count_complete identify these receipts.
+ * A complete count may have truncated=true with state=complete-observed-input.
+ * Partial scans never claim an exhaustive count. Legacy find above preserves
+ * its stop-at-first-overflow behavior.
+ */
+char *fcb_observed_reader_find_counted(uint64_t handle, uint64_t generation,
+    const char *needle, uint64_t encoding, uint64_t max_matches,
+    uint64_t max_scan_bytes, fcb_observed_reader_poll poll, void *context);
+
 /* Zero-based hit_index must belong to the current accepted query generation.
  * Returns exactly the retained literal text/bytes and original-byte range,
  * with no source reread. Surrounding context was NOT retained. A host may

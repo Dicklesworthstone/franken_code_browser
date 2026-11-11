@@ -31,6 +31,7 @@ pub(super) struct AcceptedSearch {
     state: StreamReadState,
     io: StreamReadStats,
     matches_seen: u64,
+    count_all_matches: bool,
     unsupported_at: Option<ByteOffset>,
     max_matches: usize,
     max_scan_bytes: u64,
@@ -72,7 +73,21 @@ impl ObservedReaderSession {
     /// including on cancellation/failure. The previous accepted query remains
     /// usable until a replacement receipt passes its final delivery gate.
     pub fn search(&mut self, generation: u64, needle: &str, encoding: ObservedReaderEncoding,
-        max_matches: usize, max_scan_bytes: u64, mut canceled: impl FnMut() -> bool)
+        max_matches: usize, max_scan_bytes: u64, canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, ObservedReaderError> {
+        self.search_inner(generation, needle, encoding, max_matches, max_scan_bytes, false, canceled)
+    }
+
+    /// Count every exact occurrence within the same byte/read-call budgets while
+    /// retaining at most max_matches rows and one literal witness.
+    pub fn search_counted(&mut self, generation: u64, needle: &str, encoding: ObservedReaderEncoding,
+        max_matches: usize, max_scan_bytes: u64, canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, ObservedReaderError> {
+        self.search_inner(generation, needle, encoding, max_matches, max_scan_bytes, true, canceled)
+    }
+
+    fn search_inner(&mut self, generation: u64, needle: &str, encoding: ObservedReaderEncoding,
+        max_matches: usize, max_scan_bytes: u64, count_all_matches: bool, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, ObservedReaderError> {
         if generation == 0 || generation <= self.last_query_attempt { return Err(ObservedReaderError::StaleQuery); }
         self.last_query_attempt = generation;
@@ -102,7 +117,8 @@ impl ObservedReaderSession {
             }) };
         check(&mut canceled)?;
         let file = self.search_file.try_clone().map_err(|_| AppError::Io)?;
-        let (scanned, io) = scan(file, request, &pattern, options, &self.budget, worker_id, &mut canceled);
+        let (scanned, io) = scan(file, request, &pattern, options, &self.budget, worker_id,
+            count_all_matches, &mut canceled);
         self.source_bytes_read += io.bytes_read; // Headroom was admitted above.
         self.read_calls += io.read_calls;
         let report = scanned?;
@@ -206,7 +222,9 @@ impl ObservedReaderSession {
             ("additional_read_calls", query.io.read_calls)] {
             out.literal(",")?; out.quoted(key)?; out.literal(":")?; out.integer(value)?;
         }
-        out.literal(",\"truncated\":")?; out.boolean(query.state == StreamReadState::Truncated)?;
+        out.literal(",\"count_all_matches\":")?; out.boolean(query.count_all_matches)?;
+        out.literal(",\"match_count_complete\":")?; out.boolean(query.complete())?;
+        out.literal(",\"truncated\":")?; out.boolean(query.matches_seen > query.hits.len() as u64)?;
         out.literal(",\"unsupported_at\":")?;
         if let Some(offset) = query.unsupported_at { out.integer(offset.get())?; } else { out.literal("null")?; }
         out.literal(",\"hits\":[")?;
@@ -219,7 +237,9 @@ impl ObservedReaderSession {
             out.literal(",\"original_range\":")?; out.range(hit.original_range())?; out.literal("}")?;
         }
         out.literal("]}\n")?;
-        self.finish_output(out, if query.complete() { EXIT_OK } else { EXIT_PARTIAL }, canceled)
+        self.finish_output(out, if query.complete() && query.matches_seen == query.hits.len() as u64 {
+            EXIT_OK
+        } else { EXIT_PARTIAL }, canceled)
     }
 }
 
@@ -278,8 +298,9 @@ impl AcceptedSearch {
         Ok(Self { request: search.request(), generation: search.generation(), encoding,
             observed_length: search.observed_length(), final_length: report.final_length(),
             consistency: report.consistency(), state: search.state(), io: search.stats(),
-            matches_seen: search.matches_seen(), unsupported_at: search.unsupported_at(),
-            max_matches, max_scan_bytes, literal_text, literal_bytes, sha256, hits, _lease: lease })
+            matches_seen: search.matches_seen(), count_all_matches: search.count_all_matches(),
+            unsupported_at: search.unsupported_at(), max_matches, max_scan_bytes,
+            literal_text, literal_bytes, sha256, hits, _lease: lease })
     }
     fn complete(&self) -> bool {
         self.state == StreamReadState::Complete && self.consistency == ExtentConsistency::UnchangedMetadata
@@ -288,12 +309,16 @@ impl AcceptedSearch {
 
 fn scan<'needle>(file: File, request: CaptureRequest, needle: &'needle StreamingNeedle,
     options: StreamReadOptions, budget: &ResourceBudget, allocation: ResourceAllocationId,
-    canceled: &mut impl FnMut() -> bool)
+    count_all_matches: bool, canceled: &mut impl FnMut() -> bool)
     -> (Result<FileSearchReport<'needle>, ObservedReaderError>, StreamReadStats) {
     let mut io = StreamReadStats::default();
     let result = (|| {
         check(canceled)?;
-        let mut scan = FileSearch::new(file, request, needle, options, budget, allocation).map_err(AppError::from)?;
+        let mut scan = if count_all_matches {
+            FileSearch::new_counting(file, request, needle, options, budget, allocation)
+        } else {
+            FileSearch::new(file, request, needle, options, budget, allocation)
+        }.map_err(AppError::from)?;
         while scan.state() == StreamReadState::Pending {
             let step = scan.step(StreamReadStep::default(), options.generation, &mut *canceled);
             io = scan.stats(); // Include attempted I/O even if this step fails.
@@ -325,6 +350,8 @@ fn encode_query(out: &mut Output, query: &AcceptedSearch) -> Result<(), Observed
     out.literal(",\"state\":")?; out.quoted(query.state.code())?;
     out.literal(",\"input_complete\":")?; out.boolean(query.state == StreamReadState::Complete)?;
     out.literal(",\"search_complete\":")?; out.boolean(query.complete())?;
+    out.literal(",\"count_all_matches\":")?; out.boolean(query.count_all_matches)?;
+    out.literal(",\"match_count_complete\":")?; out.boolean(query.complete())?;
     Ok(())
 }
 

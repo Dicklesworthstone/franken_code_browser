@@ -352,3 +352,50 @@ fn oversized_requests_fail_before_payload_reads_and_cannot_replace_a_good_query(
     assert_eq!(json(&reader.search_hit(1, 0, || false).unwrap()).get("text").text(), "needle");
     assert_eq!(reader.search(4, "needle", ObservedReaderEncoding::Utf8, 8, 64, || false).err(), Some(ObservedReaderError::StaleQuery));
 }
+
+
+#[test]
+fn counted_find_keeps_rows_bounded_but_finishes_exact_overlapping_count() {
+    let fixture = Fixture::new(); fixture.write(b"banana banana");
+    let mut reader = fixture.reader();
+    let legacy = json(&reader.search(1, "ana", ObservedReaderEncoding::Utf8, 1, 64, || false).unwrap());
+    assert_eq!(legacy.get("state").text(), "match-limit");
+    assert_eq!(legacy.get("matches_seen").number(), 2);
+    assert!(!legacy.get("count_all_matches").flag());
+    assert!(!legacy.get("match_count_complete").flag());
+
+    let response = reader.search_counted(2, "ana", ObservedReaderEncoding::Utf8, 1, 64, || false).unwrap();
+    assert_eq!(response.exit_code(), EXIT_PARTIAL, "omitted rows remain explicit");
+    let counted = json(&response);
+    assert_eq!(counted.get("state").text(), "complete-observed-input");
+    assert!(counted.get("search_complete").flag());
+    assert!(counted.get("match_count_complete").flag());
+    assert!(counted.get("count_all_matches").flag());
+    assert!(counted.get("truncated").flag());
+    assert_eq!(counted.get("matches_seen").number(), 4);
+    assert_eq!(counted.get("retained_hits").number(), 1);
+    assert_eq!(counted.get("payload_bytes_read").number(), 13);
+    assert_hit(&counted, 0, 1, 4);
+    let witness = json(&reader.search_hit(2, 0, || false).unwrap());
+    assert!(witness.get("count_all_matches").flag());
+    assert!(witness.get("match_count_complete").flag());
+    assert_eq!(witness.get("original_hex").text(), "616e61");
+    assert_eq!(reader.search_hit(2, 1, || false).err(), Some(ObservedReaderError::MissingHit));
+}
+
+#[test]
+fn counted_find_reports_partial_count_when_scan_budget_ends() {
+    let fixture = Fixture::new(); fixture.write(b"banana banana");
+    let mut reader = fixture.reader();
+    let response = reader.search_counted(1, "ana", ObservedReaderEncoding::Utf8, 1, 6, || false).unwrap();
+    assert_eq!(response.exit_code(), EXIT_PARTIAL);
+    let counted = json(&response);
+    assert!(counted.get("count_all_matches").flag());
+    assert!(!counted.get("search_complete").flag());
+    assert!(!counted.get("match_count_complete").flag());
+    assert_eq!(counted.get("state").text(), "byte-limit");
+    assert_eq!(counted.get("matches_seen").number(), 2);
+    assert_eq!(counted.get("retained_hits").number(), 1);
+    assert!(counted.get("truncated").flag());
+    assert_eq!(counted.get("payload_bytes_read").number(), 6);
+}

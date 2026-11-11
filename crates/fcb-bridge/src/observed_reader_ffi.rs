@@ -143,6 +143,23 @@ pub unsafe extern "C" fn fcb_observed_reader_find(handle: u64, generation: u64,
     }))
 }
 
+/// Count all exact occurrences within the same scan budgets while retaining at
+/// most max_matches rows. Legacy fcb_observed_reader_find keeps early stopping.
+/// # Safety
+/// Pointer and callback requirements match fcb_observed_reader_find.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_observed_reader_find_counted(handle: u64, generation: u64,
+    needle: *const c_char, encoding: u64, max_matches: u64, max_scan_bytes: u64,
+    poll: Option<SearchCancellationCallback>, context: *mut c_void) -> *mut c_char {
+    reply(|| answer(handle, |readers| {
+        let needle = unsafe { bounded_text(needle, MAX_OBSERVED_READER_NEEDLE_BYTES) }?;
+        let encoding = decode_encoding(encoding)?;
+        let max_matches = usize::try_from(max_matches).map_err(|_| AccessError::InvalidArgument)?;
+        readers.execute(handle, Command::FindCounted { generation, needle, encoding, max_matches, max_scan_bytes },
+            || poll.is_some_and(|poll| unsafe { poll(context) != 0 }))
+    }))
+}
+
 /// Return only the accepted query's retained matched bytes. No source I/O and
 /// no silent substitution from current file contents or another query.
 #[unsafe(no_mangle)]

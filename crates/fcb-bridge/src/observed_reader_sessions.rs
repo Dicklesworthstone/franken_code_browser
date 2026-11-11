@@ -70,6 +70,8 @@ pub(super) enum Command<'a> {
     Copy { observation: u64, start: u64, end: u64 },
     Find { generation: u64, needle: &'a str, encoding: ObservedReaderEncoding,
         max_matches: usize, max_scan_bytes: u64 },
+    FindCounted { generation: u64, needle: &'a str, encoding: ObservedReaderEncoding,
+        max_matches: usize, max_scan_bytes: u64 },
     SearchHit { generation: u64, position: usize },
     ObserveHit { generation: u64, hit_index: usize, context_bytes: usize, window_bytes: usize },
 }
@@ -158,6 +160,8 @@ impl ObservedReaderSessions {
             Command::Copy { observation, start, end } => reader.copy_range(observation, start, end, &mut stop),
             Command::Find { generation, needle, encoding, max_matches, max_scan_bytes } =>
                 reader.search(generation, needle, encoding, max_matches, max_scan_bytes, &mut stop),
+            Command::FindCounted { generation, needle, encoding, max_matches, max_scan_bytes } =>
+                reader.search_counted(generation, needle, encoding, max_matches, max_scan_bytes, &mut stop),
             Command::SearchHit { generation, position } => reader.search_hit(generation, position, &mut stop),
             Command::ObserveHit { generation, hit_index, context_bytes, window_bytes } =>
                 reader.observe_hit(generation, hit_index, context_bytes, window_bytes, &mut stop),
