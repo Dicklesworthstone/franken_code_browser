@@ -209,7 +209,8 @@ impl<'source> Execution<'source> {
             || !ReferenceScanOracle::matches_lang_filters(doc.path, &query.lang_filters) {
             self.report.excluded_by_path += 1; return Ok(());
         }
-        if self.options.max_matches > 0 && !index.may_match(ordinal, query, &self.options)? {
+        if (self.count_all_matches || self.options.max_matches > 0)
+            && !index.may_match(ordinal, query, &self.options)? {
             self.report.skipped_by_index += 1; return Ok(());
         }
         if index.fallback(ordinal, &self.options, query.primary_needle.len()) { self.report.fallback_attempts += 1; }
@@ -405,6 +406,18 @@ impl<'source> EphemeralIndex<'source> {
         allocation: ResourceAllocationId, canceled: impl FnMut() -> bool)
         -> Result<IndexedSearchReport<'source>, IndexError> {
         let mut session = IndexedQuery::new(self, query, options, budget, allocation)?;
+        session.run_to_completion(canceled)?;
+        Ok(session.into_report())
+    }
+
+    /// Count every qualified occurrence within the verification budget while
+    /// retaining at most `options.max_matches` rows (including zero). A complete
+    /// report certifies the count over this manifest, independently of how many
+    /// rows were retained. Callers must report omitted rows separately.
+    pub fn search_counting(&self, query: &ParsedQuery, options: QueryOptions, budget: &ResourceBudget,
+        allocation: ResourceAllocationId, canceled: impl FnMut() -> bool)
+        -> Result<IndexedSearchReport<'source>, IndexError> {
+        let mut session = IndexedQuery::new_counting(self, query, options, budget, allocation)?;
         session.run_to_completion(canceled)?;
         Ok(session.into_report())
     }

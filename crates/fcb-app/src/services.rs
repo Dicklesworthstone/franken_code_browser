@@ -32,6 +32,9 @@ Indexed-capture defaults: 4096 files, 1 MiB/file, 32 MiB captured source.\n\
 --ignore-case uses existing Unicode lowercase text comparison for --text/--query;\n\
 metadata path/type filters keep their own semantics. --max-scan-bytes separately\n\
 bounds verification work; a zero --limit probes existence without emitting rows.\n\
+Add --count-all to verify all admitted text/expression occurrences after rows fill;\n\
+--count-all --limit 0 counts without storing hits. Capture/work limits still apply.\n\
+match_count_complete certifies counts independently of truncated result rows.\n\
 Default discovery uses static product exclusions, without rule-file reads.\n\
 --respect-ignores separately authorizes bounded nested .gitignore/.fcbignore\n\
 reads. Unknown/unsupported policies withhold affected source and report partial\n\

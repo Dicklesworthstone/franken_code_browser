@@ -27,7 +27,7 @@ pub struct Arguments {
     pub respect_ignores: bool,
     pub max_files: usize, pub max_file_bytes: usize, pub max_total_bytes: usize,
     pub whole_file: bool, pub max_scan_bytes: u64, pub ignore_case: bool,
-    /// Continue the whole-file scan after the retained-hit allowance is full.
+    /// Continue text verification or a whole-file scan after retained rows fill.
     pub count_all: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -175,7 +175,11 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         }
     }
     if parsed.stdin && parsed.file.is_some() { return Err(ArgumentError::MultipleSources); }
-    if parsed.count_all && !parsed.whole_file { return Err(ArgumentError::IncompatibleOptions); }
+    if parsed.count_all && (parsed.command != Command::Search
+        || (!parsed.whole_file && (!parsed.workspace
+            || !matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Query(_)))))) {
+        return Err(ArgumentError::IncompatibleOptions);
+    }
     if parsed.respect_ignores && (!parsed.workspace || parsed.include_excluded) { return Err(ArgumentError::IncompatibleOptions); }
     if parsed.ignore_case && (parsed.command != Command::Search || !parsed.workspace || parsed.whole_file
         || !matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Query(_)))) {
@@ -237,7 +241,8 @@ impl Arguments {
     /// The existing index detects this mode and falls back when its exact-byte
     /// negative certificates cannot cover case-insensitive comparisons.
     pub(crate) fn text_query_options(&self, generation: QueryGeneration) -> QueryOptions {
-        let mut options = QueryOptions::new(generation).with_max_matches(self.limit.max(1));
+        let retained = if self.count_all { self.limit } else { self.limit.max(1) };
+        let mut options = QueryOptions::new(generation).with_max_matches(retained);
         options.mode = SearchMode::DecodedText { case_sensitive: !self.ignore_case,
             normalization: UnicodeNormalization::Exact };
         options.max_bytes_scanned = Some(self.max_scan_bytes);
@@ -349,7 +354,7 @@ mod tests {
         assert!(!json_requested(&args(&["search", "file", "--whole-file", "--text", "--json"])));
     }
     #[test]
-    fn count_all_is_an_explicit_whole_file_policy_not_a_query_or_capture_option() {
+    fn count_all_is_explicit_for_whole_files_or_captured_workspace_text() {
         let counted = parse(&args(&["search", "root", "--workspace", "--whole-file",
             "--text", "needle", "--count-all", "--limit", "0"])).unwrap();
         assert!(counted.count_all && counted.whole_file);
@@ -360,13 +365,21 @@ mod tests {
         assert!(!literal.count_all);
         assert_eq!(literal.needle, Some(Needle::Text("--count-all".to_owned())));
         for input in [vec!["search", "file", "--text", "x", "--count-all"],
-            vec!["search", "root", "--workspace", "--text", "x", "--count-all"],
+            vec!["search", "root", "--workspace", "--path", "x", "--count-all"],
             vec!["search", "file", "--whole-file", "--text", "x", "--count-all", "--count-all"],
             vec!["inspect", "file", "--count-all"],
             vec!["search", "file", "--whole-file", "--path", "x", "--count-all"],
             vec!["search", "file", "--whole-file", "--text", "x", "--count-all", "--ignore-case"]] {
             assert!(parse(&args(&input)).is_err(), "{input:?}");
         }
+        for mode in ["--text", "--query"] {
+            let counted = parse(&args(&["search", "root", "--workspace", mode,
+                "needle", "--count-all", "--ignore-case", "--limit", "0"])).unwrap();
+            assert!(counted.count_all && !counted.whole_file);
+            assert_eq!(counted.text_query_options(crate::generation()).max_matches, 0);
+        }
+        let ordinary = parse(&args(&["search", "root", "--workspace", "--text", "needle", "--limit", "0"])).unwrap();
+        assert_eq!(ordinary.text_query_options(crate::generation()).max_matches, 1);
     }
     #[test]
     fn repository_rule_permission_is_explicit_and_not_a_query_value() {

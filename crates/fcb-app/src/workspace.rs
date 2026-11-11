@@ -184,15 +184,20 @@ fn text(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str,
         conjunction_terms: Vec::new(), exclusion_terms: Vec::new(), path_filters: Vec::new(),
         lang_filters: Vec::new(), raw_query: needle.to_owned() };
     let options = args.text_query_options(generation());
-    let report = index.search(&query, options, budget, allocation(37), &mut *canceled)?;
+    let report = if args.count_all {
+        index.search_counting(&query, options, budget, allocation(37), &mut *canceled)?
+    } else {
+        index.search(&query, options, budget, allocation(37), &mut *canceled)?
+    };
     if canceled() { return Err(AppError::Canceled); }
     let result = report.capture_results();
-    // A zero row limit still needs a one-hit probe to distinguish a complete
-    // negative from a matching source with no retained display rows.
-    let truncated = (args.limit == 0 && result.total_matches_counted > 0)
+    // The ordinary zero-row route retains its one-hit existence probe. Count-all
+    // instead verifies the entire admitted universe without retaining probe rows.
+    let truncated = result.total_matches_counted > args.limit
         || matches!(result.coverage, SearchCoverage::TruncatedAtLimit { .. });
     let complete = report.is_complete() && !truncated;
-    let matches_seen = if args.limit == 0 { result.total_matches_counted.min(1) }
+    let count_complete = report.is_complete() && (args.count_all || !truncated);
+    let matches_seen = if args.limit == 0 && !args.count_all { result.total_matches_counted.min(1) }
         else { result.total_matches_counted };
     if args.json {
         // One digest slot per admitted catalog entry; only matched captures are hashed.
@@ -211,6 +216,9 @@ fn text(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str,
         out.literal(",\"mode\":\"decoded-text-literal\",\"case_sensitive\":")?; out.boolean(!args.ignore_case)?;
         out.literal(",\"workspace_complete\":")?; out.boolean(complete)?;
         out.literal(",\"truncated\":")?; out.boolean(truncated)?;
+        out.literal(",\"count_all_matches\":")?; out.boolean(args.count_all)?;
+        out.literal(",\"match_count_complete\":")?; out.boolean(count_complete)?;
+        out.literal(",\"stored_hits\":")?; out.integer(result.matches.len().min(args.limit) as u64)?;
         out.literal(",\"work_limited\":")?; out.boolean(matches!(result.coverage, SearchCoverage::BudgetExhausted { .. }))?;
         out.literal(",\"max_scan_bytes\":")?; out.integer(args.max_scan_bytes)?;
         out.literal(",\"scanned_input_bytes\":")?; out.integer(result.scanned_bytes)?;
@@ -269,6 +277,7 @@ fn text(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str,
     } else {
         out.literal(if complete { "Complete captured-workspace search\n" } else { "PARTIAL workspace search\n" })?;
         if args.ignore_case { out.literal("Text case: Unicode lowercase comparison\n")?; }
+        count_summary(out, matches_seen, result.matches.len().min(args.limit), count_complete)?;
         for hit in result.matches.iter().take(args.limit) {
             out.path(&catalog.entry(hit.file_id).ok_or(AppError::InvalidRange)?.path().raw().to_path_buf())?;
             out.literal(" bytes ")?; out.literal(&hit.original_byte_range.start().get().to_string())?;
@@ -280,6 +289,14 @@ fn text(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path, needle: &str,
     }
     catalog.validate_active()?;
     Ok(if !complete { EXIT_PARTIAL } else if matches_seen == 0 { EXIT_NO_MATCH } else { EXIT_OK })
+}
+
+pub(super) fn count_summary(out: &mut Output, matches_seen: usize, stored_hits: usize,
+    complete: bool) -> Result<(), AppError> {
+    out.literal(if complete { "Exact occurrences: " } else { "Occurrences seen (partial count): " })?;
+    out.literal(&matches_seen.to_string())?;
+    out.literal("; retained rows: ")?; out.literal(&stored_hits.to_string())?; out.literal("\n")?;
+    Ok(())
 }
 
 fn file_record(out: &mut Output, catalog: &WorkspaceCatalog, file: fcb::FileId) -> Result<(), AppError> {

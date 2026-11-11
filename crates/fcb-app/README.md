@@ -176,6 +176,29 @@ or filesystem-read limits. A limited scan returns partial coverage, with
 qualified hit: absence can be complete, while an existing hit yields a truncated
 response with no hit rows. JSON declares `case_sensitive` for both text routes.
 
+Add **`--count-all`** to either captured-workspace text route to keep verifying
+after the retained-row allowance fills. For example:
+
+```sh
+fcb search /path/to/repository --workspace --text 'pub fn' --count-all --limit 50 --json
+fcb search /path/to/repository --workspace --query 'needle required -forbidden lang:rust' --count-all --limit 0 --json
+```
+
+The first command retains at most fifty exact hits; the second counts qualified
+primary occurrences without retaining rows. Conjunctions and exclusions filter
+whole captures and do not multiply the occurrence count. Case-insensitive and
+UTF-16 searches keep their existing decoder, original-byte maps and fallback
+verification route. No source or work allowance increases with `--count-all`.
+
+JSON reports `count_all_matches`, `matches_seen`, `stored_hits` and
+`match_count_complete` independently of `truncated`. Count completeness requires
+closed discovery and successful verification of every selected captured source;
+unavailable/unsupported sources and verification-budget exhaustion keep it false.
+`workspace_complete` continues to describe a complete response including its
+retained rows, so omitted rows still return exit 3 even with an exact total.
+Without `--count-all`, the existing bounded lookahead behavior is unchanged.
+These routes remain pending independent executable qualification.
+
 The workspace default policy is explicitly named
 `product-defaults/no-rule-files-v1`: common build/dependency/VCS directories and
 selected binary extensions are excluded by the existing product matcher.
@@ -292,8 +315,8 @@ Consult coverage fields and the exit status:
 Windowed search keeps `scope_complete`, `whole_file_complete`, and `truncated`
 separate. An exactly full result buffer is not proof of truncation: the existing
 matcher performs one-match lookahead. Counts in a truncated content search are
-matches actually seen; only the whole-file `--count-all` route can continue to
-an exhaustive count with omitted rows, and explicitly reports
+matches actually seen; the whole-file and captured-workspace `--count-all` routes
+can continue to an exhaustive count with omitted rows, and explicitly report
 `match_count_complete`. An actual leading BOM can be
 excluded from text while still covering the whole declared text representation.
 Changed/short/unknown observations never acquire stronger consistency merely

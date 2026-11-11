@@ -59,16 +59,22 @@ pub(super) fn execute(args: &Arguments, query: &ParsedQuery, catalog: &Workspace
         ManifestLimits { max_files: count, max_path_bytes: 16_384 })?;
     let index = EphemeralIndex::build(manifest, IndexLimits::default(), budget, allocation(36), &mut *canceled)?;
     let options = args.text_query_options(generation());
-    let report = index.search(query, options, budget, allocation(37), &mut *canceled)?;
+    let report = if args.count_all {
+        index.search_counting(query, options, budget, allocation(37), &mut *canceled)?
+    } else {
+        index.search(query, options, budget, allocation(37), &mut *canceled)?
+    };
     if canceled() { return Err(AppError::Canceled); }
     catalog.validate_active()?;
     let result = report.capture_results();
-    // The compatibility scanner's zero-cap mode does no scan. Perform one-hit
-    // lookahead instead, so limit=0 can still distinguish a complete negative.
-    let zero_overflow = args.limit == 0 && result.total_matches_counted > 0;
-    let truncated = zero_overflow || matches!(result.coverage, SearchCoverage::TruncatedAtLimit { .. });
+    // Count-all verifies the selected universe even with no retained rows. The
+    // ordinary route keeps its bounded lookahead and lower-bound count contract.
+    let truncated = result.total_matches_counted > args.limit
+        || matches!(result.coverage, SearchCoverage::TruncatedAtLimit { .. });
     let complete = report.is_complete() && !truncated;
-    let matches_seen = if args.limit == 0 { result.total_matches_counted.min(1) } else { result.total_matches_counted };
+    let count_complete = report.is_complete() && (args.count_all || !truncated);
+    let matches_seen = if args.limit == 0 && !args.count_all { result.total_matches_counted.min(1) }
+        else { result.total_matches_counted };
     if args.json {
         common(out, "search", catalog, root)?;
         out.literal(",\"mode\":\"decoded-text-expression\",\"expression\":")?; out.quoted(&query.raw_query)?;
@@ -78,6 +84,9 @@ pub(super) fn execute(args: &Arguments, query: &ParsedQuery, catalog: &Workspace
         out.literal(",\"metadata_excluded_files\":")?; out.integer((count - scope_files) as u64)?;
         out.literal(",\"workspace_complete\":")?; out.boolean(complete)?;
         out.literal(",\"truncated\":")?; out.boolean(truncated)?;
+        out.literal(",\"count_all_matches\":")?; out.boolean(args.count_all)?;
+        out.literal(",\"match_count_complete\":")?; out.boolean(count_complete)?;
+        out.literal(",\"stored_hits\":")?; out.integer(result.matches.len().min(args.limit) as u64)?;
         out.literal(",\"work_limited\":")?; out.boolean(matches!(result.coverage, SearchCoverage::BudgetExhausted { .. }))?;
         out.literal(",\"max_scan_bytes\":")?; out.integer(args.max_scan_bytes)?;
         out.literal(",\"scanned_input_bytes\":")?; out.integer(result.scanned_bytes)?;
@@ -118,6 +127,7 @@ pub(super) fn execute(args: &Arguments, query: &ParsedQuery, catalog: &Workspace
             else { "PARTIAL expression search: inspect scope, source, work and result limits\n" })?;
         out.literal("Query: ")?; out.human_text(&query.raw_query)?; out.literal("\n")?;
         if args.ignore_case { out.literal("Text case: Unicode lowercase comparison\n")?; }
+        count_summary(out, matches_seen, result.matches.len().min(args.limit), count_complete)?;
         for hit in result.matches.iter().take(args.limit) {
             if canceled() { return Err(AppError::Canceled); }
             out.path(&catalog.entry(hit.file_id).ok_or(AppError::InvalidRange)?.path().raw().to_path_buf())?;
