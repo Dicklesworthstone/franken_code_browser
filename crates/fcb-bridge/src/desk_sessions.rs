@@ -6,11 +6,12 @@
 
 use std::{mem::size_of, path::Path, sync::{Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}};
-use fcb::{ByteOffset, ByteRange};
+use fcb::{ByteOffset, ByteRange, FileId, SourceRevision};
 use fcb::search::{ReadingTarget, ReadingWindowOptions};
 use fcb::ui::reading_panes::desk::{MAX_ANNOTATION_BODY_BYTES, MAX_BOOKMARK_LABEL_BYTES};
 use fcb_app::host::{HostResponse, desk::{DeskCommand, DeskError, DeskLimits, DeskSession, DeskSessionError,
-    imports::ImportedSourceId, persistence::CheckpointIoError, reader::DeskReaderError}};
+    imports::ImportedSourceId, persistence::CheckpointIoError, reader::DeskReaderError,
+    comparison::{DeskComparisonError, DeskComparisonLimits}}};
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
 use super::reader_sessions::{self, ReaderSessions};
 
@@ -20,12 +21,13 @@ pub(super) const MAX_DESK_SESSIONS: usize = 2;
 pub(super) enum AccessError {
     Unknown, NotOpen, AlreadyOpen, Busy, Capacity, Canceled, Closed, Poisoned,
     InvalidArgument, Desk(DeskSessionError), Checkpoint(CheckpointIoError),
-    Reader(reader_sessions::AccessError), ReaderTransfer(DeskReaderError),
+    Reader(reader_sessions::AccessError), ReaderTransfer(DeskReaderError), Comparison(DeskComparisonError),
 }
 impl From<DeskSessionError> for AccessError { fn from(e: DeskSessionError) -> Self { Self::Desk(e) } }
 impl From<CheckpointIoError> for AccessError { fn from(e: CheckpointIoError) -> Self { Self::Checkpoint(e) } }
 impl From<reader_sessions::AccessError> for AccessError { fn from(e: reader_sessions::AccessError) -> Self { Self::Reader(e) } }
 impl From<DeskReaderError> for AccessError { fn from(e: DeskReaderError) -> Self { Self::ReaderTransfer(e) } }
+impl From<DeskComparisonError> for AccessError { fn from(e: DeskComparisonError) -> Self { Self::Comparison(e) } }
 impl std::fmt::Display for AccessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -36,6 +38,7 @@ impl std::fmt::Display for AccessError {
             Self::InvalidArgument => "DESK_HANDLE_INVALID_ARGUMENT",
             Self::Desk(e) => return write!(f, "{e}"), Self::Checkpoint(e) => return write!(f, "{e}"),
             Self::Reader(e) => return write!(f, "{e}"), Self::ReaderTransfer(e) => return write!(f, "{e}"),
+            Self::Comparison(e) => return write!(f, "{e}"),
         })
     }
 }
@@ -44,7 +47,8 @@ impl AccessError {
         match self {
             Self::Canceled | Self::Closed => true,
             Self::Desk(e) => e.is_canceled(), Self::Checkpoint(e) => e.is_canceled(),
-            Self::Reader(e) => e.canceled(), Self::ReaderTransfer(e) => e.is_canceled(), _ => false,
+            Self::Reader(e) => e.canceled(), Self::ReaderTransfer(e) => e.is_canceled(),
+            Self::Comparison(e) => e.is_canceled(), _ => false,
         }
     }
     pub(super) fn json(self, handle: u64) -> String {
@@ -71,6 +75,10 @@ pub(super) enum Command<'a> {
         start: u64, end: u64, label: &'a str },
     Annotate { expected: u64, attempt: u64, pane: u64, label: &'a str, body: &'a str },
     EditBookmark { expected: u64, attempt: u64, bookmark: u64, label: &'a str, body: &'a str },
+    SuggestReattachment { expected: u64, bookmark: u64, sequence: u64, pane: u64,
+        max_work: u64, max_edits: usize },
+    ReattachRange { expected: u64, attempt: u64, bookmark: u64, sequence: u64, pane: u64,
+        file: u64, revision: u64, start: u64, end: u64 },
     Window { expected: u64, pane: u64, offset: u64, bytes: usize },
     Restore { expected: u64, attempt: u64, path: &'a Path },
 }
@@ -165,6 +173,22 @@ impl DeskSessions {
                     validate_note(label, body)?;
                     desk.apply(expected, attempt, DeskCommand::EditBookmark {
                         bookmark, label: label.to_owned(), body: body.to_owned(),
+                    }, &mut *stop)?;
+                }
+                Command::SuggestReattachment { expected, bookmark, sequence, pane, max_work, max_edits } => {
+                    let pane = desk.model().pane_id(pane).map_err(DeskSessionError::from)?;
+                    return Ok(desk.suggest_bookmark_reattachment(expected, bookmark, sequence, pane,
+                        DeskComparisonLimits { max_source_bytes: 4 * 1024 * 1024,
+                            max_work, max_edit_distance: max_edits }, &mut *stop)?);
+                }
+                Command::ReattachRange { expected, attempt, bookmark, sequence, pane, file, revision, start, end } => {
+                    let owner = desk.model().owner();
+                    let pane = desk.model().pane_id(pane).map_err(DeskSessionError::from)?;
+                    let file = FileId::new(owner, file).map_err(|_| AccessError::InvalidArgument)?;
+                    let revision = SourceRevision::new(owner, revision).map_err(|_| AccessError::InvalidArgument)?;
+                    desk.apply(expected, attempt, DeskCommand::ReattachBookmarkRange {
+                        bookmark, expected_update_sequence: sequence, pane, file, revision,
+                        selection: range(start, end)?,
                     }, &mut *stop)?;
                 }
                 Command::Window { expected, pane, offset, bytes } => {

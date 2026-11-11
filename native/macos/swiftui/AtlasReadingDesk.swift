@@ -47,6 +47,9 @@ struct AtlasDeskLocation: Decodable, Sendable, Equatable {
     let revision: UInt64
     let offset: UInt64
     let selection: AtlasDeskRange?
+    init(file: UInt64, revision: UInt64, offset: UInt64, selection: AtlasDeskRange?) {
+        self.file = file; self.revision = revision; self.offset = offset; self.selection = selection
+    }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         file = try c.decode(AtlasDeskNumber.self, forKey: .file_id).value
@@ -196,6 +199,9 @@ struct AtlasDeskReattachment: Sendable {
     let bookmark: AtlasDeskBookmark
     let pane: AtlasDeskPane
     let priorBookmarks: Set<UInt64>
+    let destination: AtlasDeskLocation
+    private let requiresSelectedRange: Bool
+    private let priorActivePane: UInt64?
 
     init?(state: AtlasDeskState, bookmark: AtlasDeskBookmark, pane: AtlasDeskPane) {
         guard let old = bookmark.location.selection, let selected = pane.location.selection,
@@ -205,11 +211,24 @@ struct AtlasDeskReattachment: Sendable {
         owner = state.owner; baseRevision = state.revision
         self.bookmark = bookmark; self.pane = pane
         priorBookmarks = Set(state.bookmarks.map(\.id))
+        destination = pane.location; requiresSelectedRange = true; priorActivePane = state.activePane
+        guard isCurrent(in: state) else { return nil }
+    }
+    init?(proposal: AtlasDeskReattachmentProposal) {
+        guard proposal.outcome == .mapped, let range = proposal.targetRange,
+              proposal.target.bookmark.updateSequence < UInt64.max else { return nil }
+        let target = proposal.target, state = target.state
+        owner = state.owner; baseRevision = state.revision
+        bookmark = target.bookmark; pane = target.pane
+        priorBookmarks = Set(state.bookmarks.map(\.id)); priorActivePane = state.activePane
+        destination = AtlasDeskLocation(file: pane.location.file, revision: pane.location.revision,
+            offset: range.start, selection: range)
+        requiresSelectedRange = false
         guard isCurrent(in: state) else { return nil }
     }
     func isCurrent(in state: AtlasDeskState?) -> Bool {
         guard let state, state.owner == owner, state.revision == baseRevision,
-              state.activePane == pane.id,
+              (!requiresSelectedRange || state.activePane == pane.id),
               state.panes.first(where: { $0.id == pane.id })?.location == pane.location,
               let current = state.bookmarks.first(where: { $0.id == bookmark.id }) else { return false }
         return current.location == bookmark.location && current.updateSequence == bookmark.updateSequence
@@ -217,8 +236,15 @@ struct AtlasDeskReattachment: Sendable {
             && current.body.utf8.elementsEqual(bookmark.body.utf8)
     }
     func request(attempt: UInt64) -> AtlasDeskRequest {
-        .apply(revision: baseRevision, attempt: attempt, kind: 12, subject: bookmark.id,
-            start: pane.id, end: bookmark.updateSequence, label: "")
+        if requiresSelectedRange {
+            return .apply(revision: baseRevision, attempt: attempt, kind: 12, subject: bookmark.id,
+                start: pane.id, end: bookmark.updateSequence, label: "")
+        }
+        // A guided destination is explicit and independent of the pane's
+        // current selection. One engine transaction compares and moves it.
+        return .reattachRange(revision: baseRevision, attempt: attempt, bookmark: bookmark.id,
+            sequence: bookmark.updateSequence, pane: pane.id, file: destination.file,
+            sourceRevision: destination.revision, start: destination.selection!.start, end: destination.selection!.end)
     }
     func outcome(in state: AtlasDeskState, attempt: UInt64) -> AtlasDeskReattachmentOutcome {
         guard state.owner == owner, state.revision >= baseRevision, attempt > baseRevision else { return .unconfirmed }
@@ -229,9 +255,13 @@ struct AtlasDeskReattachment: Sendable {
               Set(state.bookmarks.map(\.id)) == priorBookmarks,
               let current = state.bookmarks.first(where: { $0.id == bookmark.id }),
               current.updateSequence == bookmark.updateSequence + 1,
-              current.location == pane.location,
+              current.location == destination,
               current.label.utf8.elementsEqual(bookmark.label.utf8),
               current.body.utf8.elementsEqual(bookmark.body.utf8) else { return .unconfirmed }
+        if !requiresSelectedRange {
+            guard state.activePane == priorActivePane,
+                  state.panes.first(where: { $0.id == pane.id })?.location == pane.location else { return .unconfirmed }
+        }
         return .accepted
     }
 }
@@ -560,6 +590,10 @@ enum AtlasDeskRequest: Sendable {
     case apply(revision: UInt64, attempt: UInt64, kind: UInt64, subject: UInt64, start: UInt64, end: UInt64, label: String)
     case annotate(revision: UInt64, attempt: UInt64, pane: UInt64, label: String, body: String)
     case editBookmark(revision: UInt64, attempt: UInt64, bookmark: UInt64, label: String, body: String)
+    case suggestReattachment(revision: UInt64, bookmark: UInt64, sequence: UInt64, pane: UInt64,
+        maxWork: UInt64, maxEdits: UInt64)
+    case reattachRange(revision: UInt64, attempt: UInt64, bookmark: UInt64, sequence: UInt64, pane: UInt64,
+        file: UInt64, sourceRevision: UInt64, start: UInt64, end: UInt64)
     case window(revision: UInt64, pane: UInt64, offset: UInt64)
     case keep(revision: UInt64, attempt: UInt64, reader: UInt64, start: UInt64, end: UInt64)
     case openReader(revision: UInt64, pane: UInt64, destination: UInt64)
@@ -586,5 +620,160 @@ struct AtlasReadingDeskTransport: Sendable {
         readerDomain: UUID? = nil) {
         self.create = create; self.run = run; self.cancel = cancel; self.close = close
         self.retirementFailed = retirementFailed; self.readerDomain = readerDomain
+    }
+}
+
+
+/// Freeze the original note and the user-chosen destination before worker
+/// comparison. The saved source may exist only through this note, with no open
+/// pane. A failed comparison never changes its anchor or consumes an attempt.
+struct AtlasDeskComparisonTarget: Sendable {
+    let state: AtlasDeskState
+    let bookmark: AtlasDeskBookmark
+    let pane: AtlasDeskPane
+    let maxWork: UInt64
+    let maxEdits: UInt64
+
+    init?(state: AtlasDeskState, bookmark: AtlasDeskBookmark, pane: AtlasDeskPane,
+        maxWork: UInt64 = 8 * 1024 * 1024, maxEdits: UInt64 = 256) {
+        guard let selected = bookmark.location.selection, selected.start < selected.end,
+              bookmark.updateSequence < UInt64.max, maxWork <= 64 * 1024 * 1024, maxEdits <= 512 else { return nil }
+        self.state = state; self.bookmark = bookmark; self.pane = pane
+        self.maxWork = maxWork; self.maxEdits = maxEdits
+        guard isCurrent(in: state) else { return nil }
+    }
+    func isCurrent(in current: AtlasDeskState?) -> Bool {
+        guard let current, current.owner == state.owner, current.revision == state.revision,
+              current.lastAttempt == state.lastAttempt,
+              let saved = current.bookmarks.first(where: { $0.id == bookmark.id }),
+              let target = current.panes.first(where: { $0.id == pane.id }) else { return false }
+        return saved.updateSequence == bookmark.updateSequence && saved.location == bookmark.location
+            && saved.label.utf8.elementsEqual(bookmark.label.utf8) && saved.body.utf8.elementsEqual(bookmark.body.utf8)
+            && target.location == pane.location && target.label.utf8.elementsEqual(pane.label.utf8)
+    }
+    var request: AtlasDeskRequest {
+        .suggestReattachment(revision: state.revision, bookmark: bookmark.id, sequence: bookmark.updateSequence,
+            pane: pane.id, maxWork: maxWork, maxEdits: maxEdits)
+    }
+}
+
+private struct AtlasDeskPresentOptional<Value: Decodable & Sendable>: Decodable, Sendable {
+    let value: Value?
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if c.decodeNil() { value = nil } else { value = try c.decode(Value.self) }
+    }
+}
+
+struct AtlasDeskComparisonSource: Decodable, Sendable {
+    let file_id, source_revision, bytes: AtlasDeskNumber
+    let label: String
+    func matches(_ location: AtlasDeskLocation) -> Bool {
+        file_id.value == location.file && source_revision.value == location.revision
+            && bytes.value <= 4 * 1024 * 1024 && !label.isEmpty && label.utf8.count <= 16_384
+            && location.offset <= bytes.value && (location.selection?.end ?? 0) <= bytes.value
+    }
+}
+
+struct AtlasDeskReattachmentPreview: Decodable, Sendable {
+    let original_range: AtlasDeskRange
+    let content_start: AtlasDeskNumber
+    let text, text_kind: String
+    let has_replacements: Bool
+    private let selection_window_utf8_range: AtlasDeskPresentOptional<AtlasDeskRange>
+    var selectionRange: AtlasDeskRange? { selection_window_utf8_range.value }
+    func validate(selected: AtlasDeskRange, sourceBytes: UInt64) throws {
+        let anchor = max(selected.start, content_start.value)
+        guard [0, 2, 3].contains(content_start.value), content_start.value <= sourceBytes,
+              original_range.start <= anchor, anchor <= original_range.end,
+              original_range.start < original_range.end || (anchor == sourceBytes && original_range.end == sourceBytes),
+              original_range.end <= sourceBytes, original_range.end - original_range.start <= 4096,
+              text.utf8.count <= 16_384, text_kind == "logical-captured-text-not-shaped" else {
+            throw AtlasReadingDeskError.invalidResponse
+        }
+        if let range = selectionRange {
+            // A nonempty original range can decode to an empty text range
+            // (for example an encoding BOM). Original bytes remain authority.
+            guard selected.start >= original_range.start, selected.end <= original_range.end, range.start <= range.end,
+                  range.end <= UInt64(text.utf8.count) else { throw AtlasReadingDeskError.invalidResponse }
+            let bytes = Array(text.utf8)
+            guard (range.start == UInt64(bytes.count) || bytes[Int(range.start)] & 0xC0 != 0x80),
+                  (range.end == UInt64(bytes.count) || bytes[Int(range.end)] & 0xC0 != 0x80) else {
+                throw AtlasReadingDeskError.invalidResponse
+            }
+        }
+    }
+}
+
+struct AtlasDeskReattachmentProposal: Sendable {
+    enum Outcome: String, Decodable, Sendable { case mapped, unchanged, changed, unresolved }
+    let target: AtlasDeskComparisonTarget
+    let outcome: Outcome
+    let targetRange: AtlasDeskRange?
+    let complete: Bool
+    let quality: String
+    let workUnits: UInt64
+    let beforeSource: AtlasDeskComparisonSource
+    let afterSource: AtlasDeskComparisonSource
+    let beforePreview: AtlasDeskReattachmentPreview
+    let afterPreview: AtlasDeskReattachmentPreview?
+
+    static func decode(_ json: String?, target: AtlasDeskComparisonTarget) throws -> Self {
+        let data = try AtlasDeskWire.admit(json, handle: target.state.owner, command: "suggest-reattachment")
+        do {
+            let w = try JSONDecoder().decode(Wire.self, from: data)
+            guard target.isCurrent(in: target.state),
+                  w.model_revision.value == target.state.revision, w.last_attempt.value == target.state.lastAttempt,
+                  w.bookmark.value == target.bookmark.id, w.update_sequence.value == target.bookmark.updateSequence,
+                  w.target_pane.value == target.pane.id, w.original_range == target.bookmark.location.selection,
+                  w.original_range.start < w.original_range.end,
+                  w.before_source.matches(target.bookmark.location), w.after_source.matches(target.pane.location),
+                  w.after_source.label.utf8.elementsEqual(target.pane.label.utf8),
+                  w.original_range.end <= w.before_source.bytes.value,
+                  w.max_work.value == target.maxWork, w.work_units.value <= target.maxWork,
+                  w.max_edit_distance.value == target.maxEdits, w.max_source_bytes.value == 4 * 1024 * 1024,
+                  ["exact", "work-limit", "edit-limit"].contains(w.comparison_quality),
+                  w.comparison_complete == (w.comparison_quality == "exact"),
+                  w.coordinate_domain == "original-bytes-may-split-text",
+                  w.alignment_semantics == "deterministic-not-identity-proof",
+                  !w.source_reopened, !w.native_presented, w.additional_source_bytes_read.value == 0 else {
+                throw AtlasReadingDeskError.invalidResponse
+            }
+            try w.before_preview.validate(selected: w.original_range, sourceBytes: w.before_source.bytes.value)
+            let range = w.target_range.value, preview = w.after_preview.value
+            switch w.outcome {
+            case .mapped, .unchanged:
+                guard let range, let preview, range.start < range.end, range.end <= w.after_source.bytes.value,
+                      range.end - range.start == w.original_range.end - w.original_range.start else {
+                    throw AtlasReadingDeskError.invalidResponse
+                }
+                let unchanged = target.bookmark.location.file == target.pane.location.file
+                    && target.bookmark.location.revision == target.pane.location.revision && range == w.original_range
+                guard (w.outcome == .unchanged) == unchanged else { throw AtlasReadingDeskError.invalidResponse }
+                try preview.validate(selected: range, sourceBytes: w.after_source.bytes.value)
+            case .changed, .unresolved:
+                guard range == nil, preview == nil, w.outcome != .unresolved || !w.comparison_complete else {
+                    throw AtlasReadingDeskError.invalidResponse
+                }
+            }
+            return Self(target: target, outcome: w.outcome, targetRange: range,
+                complete: w.comparison_complete, quality: w.comparison_quality, workUnits: w.work_units.value,
+                beforeSource: w.before_source, afterSource: w.after_source,
+                beforePreview: w.before_preview, afterPreview: preview)
+        } catch let error as AtlasReadingDeskError { throw error }
+        catch { throw AtlasReadingDeskError.invalidResponse }
+    }
+    private struct Wire: Decodable {
+        let model_revision, last_attempt, bookmark, update_sequence, target_pane: AtlasDeskNumber
+        let outcome: Outcome
+        let original_range: AtlasDeskRange
+        let target_range: AtlasDeskPresentOptional<AtlasDeskRange>
+        let comparison_complete: Bool
+        let comparison_quality, coordinate_domain, alignment_semantics: String
+        let source_reopened, native_presented: Bool
+        let additional_source_bytes_read, work_units, max_work, max_edit_distance, max_source_bytes: AtlasDeskNumber
+        let before_source, after_source: AtlasDeskComparisonSource
+        let before_preview: AtlasDeskReattachmentPreview
+        let after_preview: AtlasDeskPresentOptional<AtlasDeskReattachmentPreview>
     }
 }

@@ -153,3 +153,50 @@ fn lost_reattachment_delivery_keeps_one_committed_mapping_for_reconciliation() {
         Ok(())
     }).unwrap();
 }
+
+
+#[test]
+fn guided_proposal_is_readonly_and_lost_atomic_confirmation_is_reconciled_once() {
+    let (desks, handle, pane) = populated();
+    desks.execute(handle, Command::Annotate { expected: 1, attempt: 2,
+        pane, label: "Keep", body: "Exact personal text" }, || false).unwrap();
+    let target = desks.with_session(handle, || false, |desk, stop| {
+        let owner = desk.model().owner();
+        let source = SourceCapture::from_bytes(owner, FileId::new(owner, 2).unwrap(),
+            SourceRevision::new(owner, 2).unwrap(), "updated.rs", b"prefix exact".to_vec()).unwrap();
+        Ok(desk.adopt(2, 3, source, 1, None, &mut *stop)?.active.unwrap().get())
+    }).unwrap();
+    let before = desks.execute(handle, Command::State, || false).unwrap();
+    let partial = desks.execute(handle, Command::SuggestReattachment { expected: 3, bookmark: 1,
+        sequence: 1, pane: target, max_work: 0, max_edits: 256 }, || false).unwrap();
+    assert!(partial.as_str().contains("\"outcome\":\"unresolved\""));
+    assert!(partial.as_str().contains("\"target_range\":null"));
+    assert!(desks.execute(handle, Command::SuggestReattachment { expected: 3, bookmark: 1,
+        sequence: 1, pane: target, max_work: 1024, max_edits: 256 }, || true).is_err());
+    let after = desks.execute(handle, Command::State, || false).unwrap();
+    assert_eq!(after.as_str(), before.as_str());
+
+    let lost = desks.with_session(handle, || false, |desk, stop| {
+        let pane = desk.model().pane_id(target).map_err(DeskSessionError::from)?;
+        let location = desk.model().location(pane, 3).map_err(DeskSessionError::from)?;
+        desk.apply(3, 4, DeskCommand::ReattachBookmarkRange { bookmark: 1, expected_update_sequence: 1,
+            pane, file: location.file, revision: location.revision, selection: range(7, 12)? }, &mut *stop)?;
+        desks.cancel(handle)?;
+        Ok(desk.state(|| false)?)
+    });
+    assert!(matches!(lost, Err(AccessError::Canceled)));
+    let recovered = desks.execute(handle, Command::State, || false).unwrap();
+    assert_eq!(number(recovered.as_str(), "model_revision"), 4);
+    assert!(recovered.as_str().contains("\"update_sequence\":\"2\""));
+    assert!(recovered.as_str().contains("\"body\":\"Exact personal text\""));
+    desks.with_session(handle, || false, |desk, _| {
+        let pane = desk.model().pane_id(target).map_err(DeskSessionError::from)?;
+        let location = desk.model().location(pane, 4).map_err(DeskSessionError::from)?;
+        assert_eq!(location.offset, 1); assert_eq!(location.selection, None);
+        assert_eq!(desk.model().bookmarks()[0].location().selection, Some(range(7, 12)?));
+        Ok(())
+    }).unwrap();
+    assert!(desks.execute(handle, Command::ReattachRange { expected: 4, attempt: 4,
+        bookmark: 1, sequence: 1, pane: target, file: 2, revision: 2, start: 7, end: 12 }, || false).is_err());
+    assert_eq!(number(desks.execute(handle, Command::State, || false).unwrap().as_str(), "model_revision"), 4);
+}

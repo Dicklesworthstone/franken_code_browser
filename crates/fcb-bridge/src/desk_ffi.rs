@@ -91,6 +91,26 @@ pub extern "C" fn fcb_desk_window(handle: u64, expected: u64, pane: u64, offset:
     reply(|| answer(handle, |desks| desks.execute(handle,
         Command::Window { expected, pane, offset, bytes: number(bytes)? }, || false)))
 }
+/// Read-only bounded correspondence from a bookmark's retained capture to an
+/// explicit destination pane. The original pane need not remain open. No
+/// returned candidate is authority to change the note without confirmation.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_desk_suggest_reattachment(handle: u64, expected: u64, bookmark: u64,
+    sequence: u64, pane: u64, max_work: u64, max_edits: u64) -> *mut c_char {
+    reply(|| answer(handle, |desks| desks.execute(handle, Command::SuggestReattachment {
+        expected, bookmark, sequence, pane, max_work, max_edits: number(max_edits)?,
+    }, || false)))
+}
+/// Atomic explicit confirmation. Rechecks note version, destination capture and
+/// exact original bytes; does not change pane selections or navigation history.
+/// A lost reply requires state reconciliation, never automatic replay.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_desk_reattach_range(handle: u64, expected: u64, attempt: u64,
+    bookmark: u64, sequence: u64, pane: u64, file: u64, revision: u64, start: u64, end: u64) -> *mut c_char {
+    reply(|| answer(handle, |desks| desks.execute(handle, Command::ReattachRange {
+        expected, attempt, bookmark, sequence, pane, file, revision, start, end,
+    }, || false)))
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_desk_import_reader(handle: u64, expected: u64, attempt: u64,
     reader: u64, start: u64, end: u64) -> *mut c_char {

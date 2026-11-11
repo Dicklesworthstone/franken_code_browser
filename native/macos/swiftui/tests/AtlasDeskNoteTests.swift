@@ -24,6 +24,7 @@ private final class NoteFixture: @unchecked Sendable {
     private var marks: [Mark] = []
     private var nextBookmark: UInt64 = 1
     private var reattachmentRequests = 0
+    private var comparisonRequests = 0
     private var noteRequests = 0
     private var acceptedNotes = 0
     private var stateReads = 0
@@ -42,6 +43,8 @@ private final class NoteFixture: @unchecked Sendable {
     }
     var requestCount: Int { locked { noteRequests } }
     var reattachmentCount: Int { locked { reattachmentRequests } }
+    var comparisonCount: Int { locked { comparisonRequests } }
+    var proposalJSON: String { locked { encode(proposal(maxWork: 8 * 1024 * 1024, maxEdits: 256)) } }
     var acceptedCount: Int { locked { acceptedNotes } }
     var stateCount: Int { locked { stateReads } }
     var closeCount: Int { locked { closes } }
@@ -72,7 +75,7 @@ private final class NoteFixture: @unchecked Sendable {
     private func response(_ handle: UInt64, _ request: AtlasDeskRequest) -> String? {
         let isNote: Bool
         switch request {
-        case .annotate, .editBookmark, .apply(_, _, 12, _, _, _, _): isNote = true
+        case .annotate, .editBookmark, .suggestReattachment, .reattachRange, .apply(_, _, 12, _, _, _, _): isNote = true
         default: isNote = false
         }
         let gates = locked { () -> (DispatchSemaphore?, DispatchSemaphore?) in
@@ -148,6 +151,30 @@ private final class NoteFixture: @unchecked Sendable {
                 w["text_kind"] = "logical-captured-text-not-shaped"; w["line_semantics"] = "editor-rows"
                 w["has_replacements"] = false; w["reaches_eof"] = true; w["next_offset"] = NSNull()
                 w["rows"] = [["line": "1"]]; return encode(w)
+            case .suggestReattachment(let expected, let bookmark, let sequence, let subject, let maxWork, let maxEdits):
+                comparisonRequests += 1
+                guard expected == revision, subject == pane,
+                      let mark = marks.first, mark.id == bookmark, mark.sequence == sequence else {
+                    return error("DESK_STALE_BOOKMARK")
+                }
+                return encode(proposal(maxWork: maxWork, maxEdits: maxEdits))
+            case .reattachRange(let expected, let attempt, let bookmark, let sequence, let subject,
+                let targetFile, let targetRevision, let start, let end):
+                reattachmentRequests += 1
+                guard admit(expected, attempt) else { return error("DESK_STALE_ATTEMPT") }
+                if rejectMutation { rejectMutation = false; return error("DESK_CANCELED") }
+                guard subject == pane, targetFile == file, targetRevision == 1,
+                      let index = marks.firstIndex(where: { $0.id == bookmark }),
+                      marks[index].sequence == sequence, sequence < UInt64.max,
+                      let old = marks[index].selection, old.0 < old.1,
+                      start < end, end <= UInt64(source.utf8.count) else { return error("DESK_INVALID_LOCATION") }
+                let bytes = Array(source.utf8)
+                guard bytes[Int(old.0)..<Int(old.1)].elementsEqual(bytes[Int(start)..<Int(end)]) else {
+                    return error("DESK_SELECTION_MISMATCH")
+                }
+                marks[index].file = file; marks[index].offset = start; marks[index].selection = (start, end)
+                marks[index].sequence += 1; revision = attempt
+                return noteReply()
             default: return error("DESK_UNSUPPORTED_FIXTURE_COMMAND")
             }
         }
@@ -155,6 +182,31 @@ private final class NoteFixture: @unchecked Sendable {
     private func admit(_ expected: UInt64, _ attempt: UInt64) -> Bool {
         guard expected == revision, attempt > lastAttempt else { return false }
         lastAttempt = attempt; return true
+    }
+    private func proposal(maxWork: UInt64, maxEdits: UInt64) -> [String: Any] {
+        let mark = marks[0], old = mark.selection!
+        let range = ["start": String(old.0), "end": String(old.1)]
+        let text = String(decoding: source.utf8.dropFirst(Int(old.0)), as: UTF8.self)
+        let preview: [String: Any] = ["original_range": ["start": String(old.0), "end": String(source.utf8.count)],
+            "content_start": "0", "text": text, "text_kind": "logical-captured-text-not-shaped",
+            "has_replacements": false, "selection_window_utf8_range": ["start": "0", "end": String(old.1 - old.0)]]
+        var w = header("suggest-reattachment")
+        w["bookmark"] = String(mark.id); w["update_sequence"] = String(mark.sequence); w["target_pane"] = String(pane)
+        w["original_range"] = range; w["target_range"] = range
+        if maxWork == 0 { w["target_range"] = NSNull() }
+        w["outcome"] = maxWork == 0 ? "unresolved" : mark.file == file ? "unchanged" : "mapped"
+        w["comparison_complete"] = maxWork != 0; w["comparison_quality"] = maxWork == 0 ? "work-limit" : "exact"
+        w["coordinate_domain"] = "original-bytes-may-split-text"
+        w["alignment_semantics"] = "deterministic-not-identity-proof"; w["source_reopened"] = false
+        w["work_units"] = String(min(maxWork, 32)); w["max_work"] = String(maxWork)
+        w["max_edit_distance"] = String(maxEdits); w["max_source_bytes"] = String(4 * 1024 * 1024)
+        w["before_source"] = ["file_id": String(mark.file), "source_revision": "1",
+            "bytes": String(source.utf8.count), "label": "retained.rs"]
+        w["after_source"] = ["file_id": String(file), "source_revision": "1",
+            "bytes": String(source.utf8.count), "label": "retained.rs"]
+        w["before_preview"] = preview; w["after_preview"] = preview
+        if maxWork == 0 { w["after_preview"] = NSNull() }
+        return w
     }
     private func noteReply() -> String? {
         if loseReply { loseReply = false; return nil }
@@ -222,6 +274,9 @@ private final class NoteFixture: @unchecked Sendable {
         await canceledDelivery()
         await reattachmentOutcomes()
         await reattachmentGuardsAndCancellation()
+        try await guidedReattachmentOutcomes()
+        try await guidedReattachmentGuardsAndCancellation()
+        try guidedReattachmentWire()
         print("Desk note decoding, exact anchors, edit sequences, preserved drafts, lost replies and cancellation source fixtures passed")
     }
 
@@ -516,5 +571,177 @@ private final class NoteFixture: @unchecked Sendable {
         receipt["bookmarks"] = [result]; receipt["model_revision"] = "3"; receipt["last_attempt"] = "3"
         let later = try AtlasDeskState.decode(encoded(receipt), handle: fixture.owner)
         guard case .unconfirmed = submitted.outcome(in: later) else { fatalError("a newer desk revision laundered an older note receipt") }
+    }
+}
+
+
+extension AtlasDeskNoteTests {
+    @MainActor static func guidedReattachmentOutcomes() async throws {
+        for lostReads in [-1, 0, 1] {
+            let fixture = NoteFixture(); fixture.seedBookmark(label: "Café", body: "Original e\u{301}\u{0} text")
+            fixture.selectOtherCapture(); fixture.movePane()
+            let model = await started(fixture), state = model.state!, mark = state.bookmarks[0], pane = state.active!
+            precondition(pane.location.selection == nil)
+            let target = AtlasDeskComparisonTarget(state: state, bookmark: mark, pane: pane)!
+            let proposal = try await model.suggestReattachment(target)
+            precondition(proposal.outcome == .mapped && fixture.comparisonCount == 1 && fixture.reattachmentCount == 0)
+            precondition(model.state?.revision == state.revision && model.state?.bookmarks[0].location == mark.location)
+            let confirmed = AtlasDeskReattachment(proposal: proposal)!
+            precondition(confirmed.destination.selection == mark.location.selection)
+            if lostReads >= 0 { fixture.loseNextReply(stateFailures: lostReads) }
+            model.reattachBookmark(confirmed); await idle(model)
+            precondition(fixture.reattachmentCount == 1, "confirmation is sent once, including after a lost reply")
+            if lostReads == 1 {
+                precondition(model.state == nil && model.notice.contains("could not be verified"))
+                model.reattachBookmark(confirmed); precondition(fixture.reattachmentCount == 1)
+                model.reload(); await idle(model)
+            } else { precondition(model.notice.contains("Reattached the saved note")) }
+            let saved = model.state!.bookmarks[0]
+            precondition(saved.id == mark.id && saved.updateSequence == mark.updateSequence + 1)
+            precondition(saved.location == confirmed.destination && saved.location != mark.location)
+            precondition(saved.label.utf8.elementsEqual(mark.label.utf8) && saved.body.utf8.elementsEqual(mark.body.utf8))
+            precondition(model.state?.active?.location == pane.location, "guided confirmation does not select or move a pane")
+            precondition(!confirmed.isCurrent(in: model.state)); model.close()
+        }
+
+        // A proposal is not mutation authority: the confirmed command still
+        // checks the actual original bytes, even after a forged matching range.
+        let fixture = NoteFixture(); fixture.seedBookmark(body: "Keep my evidence")
+        fixture.selectOtherCapture(); fixture.movePane()
+        let model = await started(fixture), state = model.state!, mark = state.bookmarks[0]
+        let target = AtlasDeskComparisonTarget(state: state, bookmark: mark, pane: state.active!)!
+        var wire = try JSONSerialization.jsonObject(with: Data(fixture.proposalJSON.utf8)) as! [String: Any]
+        wire["target_range"] = ["start": "3", "end": "8"]
+        var preview = wire["after_preview"] as! [String: Any]
+        preview["original_range"] = ["start": "3", "end": String(fixture.source.utf8.count)]
+        preview["text"] = String(decoding: fixture.source.utf8.dropFirst(3), as: UTF8.self)
+        wire["after_preview"] = preview
+        let json = String(decoding: try JSONSerialization.data(withJSONObject: wire), as: UTF8.self)
+        let altered = try AtlasDeskReattachmentProposal.decode(json, target: target)
+        model.reattachBookmark(AtlasDeskReattachment(proposal: altered)!); await idle(model)
+        precondition(model.notice.contains("not accepted") && fixture.reattachmentCount == 1)
+        precondition(model.state?.bookmarks[0].location == mark.location && model.state?.bookmarks[0].updateSequence == 1)
+        precondition(model.state?.active?.location == state.active?.location); model.close()
+    }
+
+    @MainActor static func guidedReattachmentGuardsAndCancellation() async throws {
+        let stale = NoteFixture(); stale.seedBookmark(body: "Original note"); stale.selectOtherCapture()
+        let staleModel = await started(stale), state = staleModel.state!
+        let target = AtlasDeskComparisonTarget(state: state, bookmark: state.bookmarks[0], pane: state.active!)!
+        let proposal = try await staleModel.suggestReattachment(target), confirmation = AtlasDeskReattachment(proposal: proposal)!
+        stale.changeNoteElsewhere(); staleModel.reload(); await idle(staleModel)
+        precondition(!target.isCurrent(in: staleModel.state))
+        staleModel.reattachBookmark(confirmation); await idle(staleModel)
+        precondition(stale.reattachmentCount == 0)
+        do { _ = try await staleModel.suggestReattachment(target); fatalError("stale comparison was sent") } catch { }
+        precondition(stale.comparisonCount == 1); staleModel.close()
+
+        let fixture = NoteFixture(); fixture.seedBookmark(body: "Cancel comparison"); fixture.selectOtherCapture()
+        let model = await started(fixture), before = model.state!
+        let selected = AtlasDeskComparisonTarget(state: before, bookmark: before.bookmarks[0], pane: before.active!)!
+        let gate = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
+        fixture.gateNextNote(entered: gate, resume: resume)
+        let comparison = Task { try await model.suggestReattachment(selected) }
+        await entered(gate); comparison.cancel(); resume.signal()
+        do { _ = try await comparison.value; fatalError("canceled proposal accepted") } catch { }
+        precondition(!model.busy && fixture.reattachmentCount == 0)
+        precondition(model.state?.revision == before.revision && model.state?.bookmarks[0].location == before.bookmarks[0].location)
+
+        let acceptedProposal = try await model.suggestReattachment(selected)
+        let confirmed = AtlasDeskReattachment(proposal: acceptedProposal)!
+        let commitGate = DispatchSemaphore(value: 0), commitResume = DispatchSemaphore(value: 0)
+        fixture.loseNextReply(); fixture.gateNextNote(entered: commitGate, resume: commitResume)
+        model.reattachBookmark(confirmed); await entered(commitGate); model.cancel(); commitResume.signal(); await idle(model)
+        precondition(fixture.reattachmentCount == 1 && model.state?.bookmarks[0].location == confirmed.destination)
+        precondition(model.state?.active?.location == before.active?.location)
+        model.close()
+    }
+
+    static func guidedReattachmentWire() throws {
+        let fixture = NoteFixture(); fixture.seedBookmark(); fixture.selectOtherCapture(); fixture.movePane()
+        let state = try AtlasDeskState.decode(fixture.stateJSON, handle: fixture.owner)
+        let target = AtlasDeskComparisonTarget(state: state, bookmark: state.bookmarks[0], pane: state.active!)!
+        let base = try JSONSerialization.jsonObject(with: Data(fixture.proposalJSON.utf8)) as! [String: Any]
+        func encoded(_ value: [String: Any]) -> String {
+            String(decoding: try! JSONSerialization.data(withJSONObject: value), as: UTF8.self)
+        }
+        func rejects(_ value: [String: Any]) {
+            do { _ = try AtlasDeskReattachmentProposal.decode(encoded(value), target: target); fatalError("invalid comparison accepted") }
+            catch { }
+        }
+        let valid = try AtlasDeskReattachmentProposal.decode(encoded(base), target: target)
+        precondition(valid.outcome == .mapped && AtlasDeskReattachment(proposal: valid) != nil)
+        for (field, value) in [
+            ("owner", "999"), ("model_revision", "999"), ("last_attempt", "999"),
+            ("bookmark", "999"), ("update_sequence", "2"), ("target_pane", "999"),
+            ("max_work", "1"), ("work_units", String(target.maxWork + 1)),
+            ("max_edit_distance", "257"), ("max_source_bytes", "1"),
+            ("additional_source_bytes_read", "1"), ("comparison_quality", "guessed"),
+            ("alignment_semantics", "identity-proof"), ("coordinate_domain", "decoded-utf8"),
+        ] {
+            var changed = base; changed[field] = value; rejects(changed)
+        }
+        for key in ["source_reopened", "native_presented"] {
+            var changed = base; changed[key] = true; rejects(changed)
+        }
+        for key in ["target_range", "after_preview", "before_preview"] {
+            var changed = base; changed.removeValue(forKey: key); rejects(changed)
+        }
+        var changed = base; changed["comparison_complete"] = false; rejects(changed)
+        changed = base; changed["outcome"] = "unresolved"; rejects(changed)
+        changed = base; changed["target_range"] = ["start": "3", "end": "7"]; rejects(changed)
+        changed = base; changed["target_range"] = ["start": "11", "end": "16"]; rejects(changed)
+        for (side, field, value) in [("before_source", "file_id", "999"), ("after_source", "source_revision", "999"),
+            ("after_source", "bytes", "4"), ("after_source", "label", "another.rs")] {
+            changed = base; var source = changed[side] as! [String: Any]; source[field] = value
+            changed[side] = source; rejects(changed)
+        }
+        var preview = base["before_preview"] as! [String: Any]
+        preview["selection_window_utf8_range"] = ["start": "0", "end": "1000"]
+        changed = base; changed["before_preview"] = preview; rejects(changed)
+        preview = base["before_preview"] as! [String: Any]; preview["content_start"] = "1"
+        changed = base; changed["before_preview"] = preview; rejects(changed)
+        preview = base["before_preview"] as! [String: Any]
+        preview["text"] = "éxxx"; preview["selection_window_utf8_range"] = ["start": "1", "end": "5"]
+        changed = base; changed["before_preview"] = preview; rejects(changed)
+
+        changed = base; changed["comparison_quality"] = "edit-limit"; changed["comparison_complete"] = false
+        let partial = try AtlasDeskReattachmentProposal.decode(encoded(changed), target: target)
+        precondition(!partial.complete && AtlasDeskReattachment(proposal: partial) != nil,
+            "a verified equal span remains usable when unrelated spans exhaust the budget")
+        changed["outcome"] = "unresolved"; changed["target_range"] = NSNull(); changed["after_preview"] = NSNull()
+        let unresolved = try AtlasDeskReattachmentProposal.decode(encoded(changed), target: target)
+        precondition(unresolved.outcome == .unresolved && AtlasDeskReattachment(proposal: unresolved) == nil)
+        changed["comparison_quality"] = "exact"; changed["comparison_complete"] = true; rejects(changed)
+        changed["outcome"] = "changed"
+        let edited = try AtlasDeskReattachmentProposal.decode(encoded(changed), target: target)
+        precondition(edited.outcome == .changed && AtlasDeskReattachment(proposal: edited) == nil)
+
+        let unchangedFixture = NoteFixture(); unchangedFixture.seedBookmark()
+        let unchangedState = try AtlasDeskState.decode(unchangedFixture.stateJSON, handle: unchangedFixture.owner)
+        let unchangedTarget = AtlasDeskComparisonTarget(state: unchangedState, bookmark: unchangedState.bookmarks[0], pane: unchangedState.active!)!
+        let unchanged = try AtlasDeskReattachmentProposal.decode(unchangedFixture.proposalJSON, target: unchangedTarget)
+        precondition(unchanged.outcome == .unchanged && AtlasDeskReattachment(proposal: unchanged) == nil)
+
+        // A BOM is original evidence but has no logical display characters.
+        // The engine explicitly reports its content boundary, and a preview
+        // may be an empty EOF window without changing the selected byte range.
+        var bomState = try JSONSerialization.jsonObject(with: Data(fixture.stateJSON.utf8)) as! [String: Any]
+        var marks = bomState["bookmarks"] as! [[String: Any]]
+        marks[0]["selection"] = ["start": "0", "end": "2"]; marks[0]["offset"] = "0"; bomState["bookmarks"] = marks
+        var panes = bomState["panes"] as! [[String: Any]]
+        panes[0]["offset"] = "2"; panes[0]["selection"] = NSNull(); bomState["panes"] = panes
+        let decodedBOM = try AtlasDeskState.decode(encoded(bomState), handle: fixture.owner)
+        let bomTarget = AtlasDeskComparisonTarget(state: decodedBOM, bookmark: decodedBOM.bookmarks[0], pane: decodedBOM.active!)!
+        changed = base; changed["original_range"] = ["start": "0", "end": "2"]; changed["target_range"] = ["start": "0", "end": "2"]
+        for side in ["before_source", "after_source"] {
+            var source = changed[side] as! [String: Any]; source["bytes"] = "2"; changed[side] = source
+        }
+        let bomPreview: [String: Any] = ["original_range": ["start": "2", "end": "2"], "content_start": "2",
+            "text": "", "text_kind": "logical-captured-text-not-shaped", "has_replacements": false,
+            "selection_window_utf8_range": NSNull()]
+        changed["before_preview"] = bomPreview; changed["after_preview"] = bomPreview
+        let bom = try AtlasDeskReattachmentProposal.decode(encoded(changed), target: bomTarget)
+        precondition(bom.targetRange?.start == 0 && bom.targetRange?.end == 2 && bom.beforePreview.text.isEmpty)
     }
 }

@@ -51,6 +51,29 @@ char *fcb_desk_annotate(uint64_t handle, uint64_t expected, uint64_t attempt,
     uint64_t pane, const char *label, const uint8_t *body, uint64_t body_bytes);
 char *fcb_desk_edit_bookmark(uint64_t handle, uint64_t expected, uint64_t attempt,
     uint64_t bookmark, const char *label, const uint8_t *body, uint64_t body_bytes);
+/* Read-only guided recovery of a bookmark with a nonempty saved selection. Its
+ * original capture survives pane closure. Compare against an explicitly chosen
+ * retained pane, with <=67108864 work units and <=512 edit-distance allowance.
+ * Each source is <=4 MiB; zero work/edits are valid partial-comparison budgets.
+ * command="suggest-reattachment" reports mapped/unchanged/changed/unresolved,
+ * original/target byte ranges, both capture identities, bounded logical-text
+ * previews and exact/work-limit/edit-limit comparison quality. A mapped range
+ * lies wholly in a byte-verified equal span even if other spans are unresolved.
+ * This deterministic alignment is NOT identity continuity. Repeated text may
+ * have other correspondences. No note, pane, revision or attempt changes and
+ * no source is reopened. Preview text never grants source coordinates. */
+char *fcb_desk_suggest_reattachment(uint64_t handle, uint64_t expected,
+    uint64_t bookmark, uint64_t sequence, uint64_t pane, uint64_t max_work, uint64_t max_edits);
+/* Explicit confirmation, independent of the proposal receipt: validates current
+ * desk revision, bookmark sequence and target pane/file/source_revision, then
+ * re-compares the actual retained original bytes. Moves only this note's anchor
+ * to [start,end), with offset=start; preserves ID/label/body and increments its
+ * sequence. Pane selections, active focus and history remain unchanged. Empty,
+ * mismatching, stale or canceled mappings leave the note unchanged. As with all
+ * mutations, a lost reply requires a state read before another action. */
+char *fcb_desk_reattach_range(uint64_t handle, uint64_t expected, uint64_t attempt,
+    uint64_t bookmark, uint64_t sequence, uint64_t pane, uint64_t file,
+    uint64_t source_revision, uint64_t start, uint64_t end);
 /* SourceReader logical text with original byte ranges. 4..65536 requested
  * bytes, <=1024 rows. Page text is not copied back into source storage. */
 char *fcb_desk_window(uint64_t handle, uint64_t expected, uint64_t pane,

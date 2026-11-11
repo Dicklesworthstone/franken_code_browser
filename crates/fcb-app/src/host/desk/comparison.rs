@@ -19,6 +19,7 @@ use super::{DeskSession, DeskSessionError, DeskPaneId, DeskView, DeskError, Desk
 
 pub const MAX_COMPARISON_PAGE: usize = 128;
 pub const MAX_COMPARISON_WINDOW_BYTES: usize = 64 * 1024;
+pub const REATTACHMENT_PREVIEW_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeskComparisonError {
@@ -227,4 +228,126 @@ fn encode_span(out: &mut Output, span: Correspondence) -> Result<(), OutputError
     out.quoted(match span.kind() { CorrespondenceKind::Equal => "equal", CorrespondenceKind::Changed => "changed", CorrespondenceKind::Unresolved => "unresolved" })?;
     out.literal(",\"before_range\":")?; out.range(span.before())?;
     out.literal(",\"after_range\":")?; out.range(span.after())
+}
+
+impl DeskSession {
+    /// Read-only assistance for a saved personal anchor. The original pane may
+    /// already be closed: the bookmark itself retains its exact capture. The
+    /// existing bounded comparison engine proposes only a nonempty range wholly
+    /// inside one verified equal span. Repeated text is a deterministic alignment,
+    /// not evidence of identity continuity. Nothing moves until a separate,
+    /// explicit ReattachBookmarkRange command rechecks the actual source bytes.
+    pub fn suggest_bookmark_reattachment(&mut self, expected: u64, bookmark: u64,
+        expected_update_sequence: u64, target: DeskPaneId, limits: DeskComparisonLimits,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, DeskComparisonError> {
+        let target_location = self.model().location(target, expected)?;
+        let mark = self.model().bookmarks().iter().find(|mark| mark.id() == bookmark)
+            .ok_or(DeskError::MissingBookmark)?;
+        if mark.update_sequence() != expected_update_sequence { return Err(DeskError::StaleBookmark.into()); }
+        let original = mark.location();
+        let selected = original.selection.filter(|range| !range.is_empty()).ok_or(DeskError::InvalidLocation)?;
+        let old = self.model().retained_capture(expected, original.file, original.revision)?;
+        let new = self.model().source(target, expected)?;
+        if limits.max_source_bytes > MAX_DIFF_SOURCE_BYTES || limits.max_edit_distance > MAX_DIFF_EDITS
+            || limits.max_work > MAX_DIFF_WORK || old.bytes().len() > limits.max_source_bytes
+            || new.bytes().len() > limits.max_source_bytes { return Err(ComparisonError::Limits.into()); }
+        let labels = old.logical_path().len() + new.logical_path().len();
+        check(&mut canceled)?;
+        let [metadata_id, engine_id] = self.ids()?;
+        // These worker-local source adapters share bytes already owned by this
+        // locked desk. Account their copied labels/metadata until output drains;
+        // no comparison or uncharged capture clone escapes this operation.
+        let _metadata = self.budget.try_reserve_managed(self.model().owner(), metadata_id,
+            ByteLength::new((4 * labels + 4096) as u64)).map_err(|_| ComparisonError::ResourceDenied)?;
+        let old = self.model().retained_capture(expected, original.file, original.revision)?.clone();
+        let new = self.model().source(target, expected)?.clone();
+        let session = BrowserSession::new(self.model().owner());
+        let before = session.prepare_search_capture(old.clone()).map_err(|_| ComparisonError::Stale)?;
+        check(&mut canceled)?;
+        let after = session.prepare_search_capture(new.clone()).map_err(|_| ComparisonError::Stale)?;
+        let generation = QueryGeneration::new(self.model().owner(), expected.max(1)).map_err(|_| ComparisonError::Stale)?;
+        let comparison = CaptureComparison::build(before.capture(), after.capture(), generation,
+            limits, &self.budget, engine_id, &mut canceled)?;
+        let mapped = comparison.corresponding_after(selected);
+        let outcome = match mapped {
+            Some(range) if original.file == target_location.file && original.revision == target_location.revision
+                && selected == range => "unchanged",
+            Some(_) => "mapped",
+            None if comparison.spans().iter().any(|span| span.kind() == CorrespondenceKind::Unresolved
+                && span.before().start() < selected.end() && selected.start() < span.before().end()) => "unresolved",
+            None => "changed",
+        };
+        let quality = comparison.quality();
+        let stats = comparison.stats();
+        let mut out = self.output("suggest-reattachment")?;
+        out.literal(",\"bookmark\":")?; out.integer(bookmark)?;
+        out.literal(",\"update_sequence\":")?; out.integer(expected_update_sequence)?;
+        out.literal(",\"target_pane\":")?; out.integer(target.get())?;
+        out.literal(",\"outcome\":")?; out.quoted(outcome)?;
+        out.literal(",\"original_range\":")?; out.range(selected)?;
+        out.literal(",\"target_range\":")?;
+        match mapped { Some(range) => out.range(range)?, None => out.literal("null")? }
+        out.literal(",\"comparison_complete\":")?; out.boolean(quality == ComparisonQuality::Exact)?;
+        out.literal(",\"comparison_quality\":")?;
+        out.quoted(match quality { ComparisonQuality::Exact => "exact", ComparisonQuality::WorkLimit => "work-limit",
+            ComparisonQuality::EditLimit => "edit-limit" })?;
+        out.literal(",\"coordinate_domain\":\"original-bytes-may-split-text\",\"alignment_semantics\":\"deterministic-not-identity-proof\",\"source_reopened\":false")?;
+        out.literal(",\"work_units\":")?; out.integer(stats.work_units)?;
+        out.literal(",\"max_work\":")?; out.integer(limits.max_work)?;
+        out.literal(",\"max_edit_distance\":")?; out.integer(limits.max_edit_distance as u64)?;
+        out.literal(",\"max_source_bytes\":")?; out.integer(limits.max_source_bytes as u64)?;
+        for (name, source) in [("before_source", &old), ("after_source", &new)] {
+            out.literal(",")?; out.quoted(name)?; out.literal(":{\"file_id\":")?; out.integer(source.file().get())?;
+            out.literal(",\"source_revision\":")?; out.integer(source.revision().get())?;
+            out.literal(",\"bytes\":")?; out.integer(source.bytes().len() as u64)?;
+            out.literal(",\"label\":")?; out.quoted(source.logical_path())?; out.literal("}")?;
+        }
+        out.literal(",\"before_preview\":")?;
+        reattachment_preview(self, &mut out, &old, selected, generation, &mut canceled)?;
+        out.literal(",\"after_preview\":")?;
+        if let Some(range) = mapped { reattachment_preview(self, &mut out, &new, range, generation, &mut canceled)?; }
+        else { out.literal("null")?; }
+        out.literal("}\n")?;
+        Ok(self.finish(out, if quality == ComparisonQuality::Exact { EXIT_OK } else { EXIT_PARTIAL }, &mut canceled)?)
+    }
+}
+
+/// SourceReader supplies logical text and the original-byte-to-text map. A
+/// preview is bounded independently of the selected range and never changes a
+/// pane or silently expands the candidate to decoded character boundaries.
+fn reattachment_preview(desk: &mut DeskSession, out: &mut Output, source: &super::SourceCapture,
+    selected: ByteRange, generation: QueryGeneration, canceled: &mut impl FnMut() -> bool)
+    -> Result<(), DeskComparisonError> {
+    let [reader_id, window_id] = desk.ids()?;
+    let view = BrowserSession::new(desk.model().owner()).open_capture(source.clone())
+        .map_err(|_| ComparisonError::Stale)?;
+    let reader = view.source_reader(super::ReaderLimits::default(), &desk.budget, reader_id)
+        .map_err(DeskSessionError::from)?;
+    let mut seek = reader.seek(super::ReadingTarget::Byte(selected.start()), generation).map_err(DeskSessionError::from)?;
+    while seek.state() == super::ReadingSeekState::Pending {
+        seek.step(64 * 1024, generation, &mut *canceled).map_err(DeskSessionError::from)?;
+    }
+    let anchor = match seek.state() {
+        super::ReadingSeekState::Ready(anchor) => anchor,
+        super::ReadingSeekState::Canceled => return Err(DeskError::Canceled.into()),
+        _ => return Err(DeskSessionError::from(super::ReaderError::LineOutOfBounds).into()),
+    };
+    let window = reader.window(anchor, generation, super::ReadingWindowOptions {
+        max_bytes: REATTACHMENT_PREVIEW_BYTES, max_lines: 64,
+    }, &desk.budget, window_id, &mut *canceled).map_err(DeskSessionError::from)?;
+    out.literal("{\"original_range\":")?; out.range(window.raw_range())?;
+    out.literal(",\"content_start\":")?; out.integer(reader.encoding().bom_bytes_len())?;
+    out.literal(",\"text\":")?; out.quoted(window.text())?;
+    out.literal(",\"text_kind\":\"logical-captured-text-not-shaped\",\"has_replacements\":")?;
+    out.boolean(window.has_replacements())?;
+    out.literal(",\"selection_window_utf8_range\":")?;
+    match window.source_to_text(selected).ok() {
+        Some(range) => {
+            out.literal("{\"start\":")?; out.integer(range.start().get())?;
+            out.literal(",\"end\":")?; out.integer(range.end().get())?; out.literal("}")?;
+        }
+        None => out.literal("null")?,
+    }
+    out.literal("}")?;
+    Ok(())
 }

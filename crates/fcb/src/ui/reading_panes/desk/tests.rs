@@ -591,3 +591,70 @@ fn missing_foreign_and_exhausted_reattachments_are_transactional() {
     assert_eq!(desk.bookmarks()[0].update_sequence(), u64::MAX);
     assert_eq!(desk.revision(), 2);
 }
+
+
+#[test]
+fn confirmed_range_reattaches_without_changing_the_destination_pane_or_history() {
+    let (mut desk, _) = setup(DeskLimits::default());
+    let old = open(&mut desk, capture(1, 1, b"old \xff\0\r\n tail"), Some(range(4, 8)));
+    let bookmark = command(&mut desk, DeskCommand::Annotate {
+        pane: old, label: "Evidence".into(), body: "Keep\0my\r\nwords".into(),
+    }).created_bookmark.unwrap();
+    let target = open(&mut desk, capture(1, 2, b"new prefix \xff\0\r\n tail"), None);
+    command(&mut desk, DeskCommand::Scroll { pane: target, offset: 1 });
+    let pane_before = desk.location(target, desk.revision()).unwrap();
+    let history = desk.history().to_vec();
+    let cursor = desk.history_cursor();
+    command(&mut desk, DeskCommand::ReattachBookmarkRange {
+        bookmark, expected_update_sequence: 1, pane: target,
+        file: pane_before.file, revision: pane_before.revision, selection: range(11, 15),
+    });
+    assert_eq!(desk.location(target, desk.revision()).unwrap(), pane_before);
+    assert_eq!(desk.history(), history.as_slice()); assert_eq!(desk.history_cursor(), cursor);
+    assert_eq!(desk.active(), Some(target));
+    let mark = &desk.bookmarks()[0];
+    assert_eq!(mark.location().file, pane_before.file); assert_eq!(mark.location().revision, pane_before.revision);
+    assert_eq!(mark.location().selection, Some(range(11, 15))); assert_eq!(mark.location().offset, 11);
+    assert_eq!(mark.label(), "Evidence"); assert_eq!(mark.body(), "Keep\0my\r\nwords");
+    assert_eq!(mark.update_sequence(), 2);
+    command(&mut desk, DeskCommand::RecallBookmark(bookmark));
+    assert_eq!(desk.selected_bytes(desk.active().unwrap(), desk.revision()).unwrap(), b"\xff\0\r\n");
+}
+
+#[test]
+fn confirmed_range_rechecks_capture_version_sequence_and_actual_bytes_without_any_navigation() {
+    let (mut desk, _) = setup(DeskLimits::default());
+    let old = open(&mut desk, capture(1, 1, b"saved"), Some(range(0, 5)));
+    let bookmark = command(&mut desk, DeskCommand::Annotate {
+        pane: old, label: "keep".into(), body: "unchanged note".into(),
+    }).created_bookmark.unwrap();
+    let target = open(&mut desk, capture(2, 2, b"other saved"), Some(range(0, 1)));
+    let anchor = desk.bookmarks()[0].location();
+    let pane_before = desk.location(target, desk.revision()).unwrap();
+    let history = desk.history().to_vec();
+    for (file, rev, sequence, selection, error) in [
+        (1, 2, 1, range(6, 11), DeskError::StaleRevision),
+        (2, 1, 1, range(6, 11), DeskError::StaleRevision),
+        (2, 2, 2, range(6, 11), DeskError::StaleBookmark),
+        (2, 2, 1, range(0, 5), DeskError::SelectionMismatch),
+        (2, 2, 1, range(6, 10), DeskError::SelectionMismatch),
+        (2, 2, 1, range(6, 6), DeskError::InvalidLocation),
+        (2, 2, 1, range(6, 12), DeskError::InvalidLocation),
+    ] {
+        let expected = desk.revision();
+        assert_eq!(desk.apply(expected, desk.last_attempt() + 1, DeskCommand::ReattachBookmarkRange {
+            bookmark, expected_update_sequence: sequence, pane: target,
+            file: FileId::new(owner(900), file).unwrap(), revision: SourceRevision::new(owner(900), rev).unwrap(), selection,
+        }, || false), Err(error));
+        assert_eq!(desk.revision(), expected); assert_eq!(desk.bookmarks()[0].location(), anchor);
+        assert_eq!(desk.bookmarks()[0].update_sequence(), 1); assert_eq!(desk.bookmarks()[0].body(), "unchanged note");
+        assert_eq!(desk.location(target, expected).unwrap(), pane_before); assert_eq!(desk.history(), history.as_slice());
+    }
+    let expected = desk.revision();
+    assert_eq!(desk.apply(expected, desk.last_attempt() + 1, DeskCommand::ReattachBookmarkRange {
+        bookmark, expected_update_sequence: 1, pane: target, file: pane_before.file,
+        revision: pane_before.revision, selection: range(6, 11),
+    }, || true), Err(DeskError::Canceled));
+    assert_eq!(desk.bookmarks()[0].location(), anchor);
+    assert_eq!(desk.location(target, expected).unwrap(), pane_before);
+}

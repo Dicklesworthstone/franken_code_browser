@@ -137,6 +137,12 @@ pub enum DeskCommand {
     /// equal bytes do not establish file continuity or an automatic rename.
     /// Keep personal text and bookmark identity; increment its update sequence.
     ReattachBookmark { bookmark: u64, expected_update_sequence: u64, pane: DeskPaneId },
+    /// Confirm a reviewed correspondence without first changing the target
+    /// pane's selection or history. The explicit target capture is checked
+    /// again, and exact retained bytes are compared independently of any prior
+    /// comparison receipt. Only the personal anchor and its sequence change.
+    ReattachBookmarkRange { bookmark: u64, expected_update_sequence: u64,
+        pane: DeskPaneId, file: FileId, revision: SourceRevision, selection: ByteRange },
     RecallBookmark(u64),
     ForgetBookmark(u64),
     ClearHistory,
@@ -379,16 +385,17 @@ impl ReadingDesk {
                 mark.update_sequence = sequence;
             }
             DeskCommand::ReattachBookmark { bookmark, expected_update_sequence, pane } => {
-                let index = next.bookmarks.iter().position(|mark| mark.id == bookmark)
-                    .ok_or(DeskError::MissingBookmark)?;
-                let mark = &next.bookmarks[index];
-                if mark.update_sequence != expected_update_sequence { return Err(DeskError::StaleBookmark); }
-                let sequence = mark.update_sequence.checked_add(1).ok_or(DeskError::IdentityExhausted)?;
                 let target = location(&next, self.owner, pane)?;
-                verify_reattachment(&next, mark.location, target, &mut canceled)?;
-                let mark = &mut next.bookmarks[index];
-                mark.location = target;
-                mark.update_sequence = sequence;
+                reattach_bookmark(&mut next, bookmark, expected_update_sequence, target, &mut canceled)?;
+            }
+            DeskCommand::ReattachBookmarkRange { bookmark, expected_update_sequence,
+                pane, file, revision, selection } => {
+                let mut target = location(&next, self.owner, pane)?;
+                if file.owner() != self.owner || revision.owner() != self.owner { return Err(DeskError::OwnerMismatch); }
+                if target.file != file || target.revision != revision { return Err(DeskError::StaleRevision); }
+                target.offset = selection.start().get();
+                target.selection = Some(selection);
+                reattach_bookmark(&mut next, bookmark, expected_update_sequence, target, &mut canceled)?;
             }
             DeskCommand::RecallBookmark(id) => {
                 let at = next.bookmarks.iter().find(|b| b.id == id).ok_or(DeskError::MissingBookmark)?.location;
@@ -511,6 +518,18 @@ fn add_bookmark(state: &mut State, owner: ArenaOwnerId, limits: DeskLimits,
 /// Compare the two explicitly selected original-byte ranges without allocating
 /// decoded text, guessing a path mapping, or scanning for a convenient match.
 /// Long selections check cancellation between bounded comparison chunks.
+fn reattach_bookmark(state: &mut State, bookmark: u64, expected_update_sequence: u64,
+    target: DeskLocation, canceled: &mut impl FnMut() -> bool) -> Result<(), DeskError> {
+    let index = state.bookmarks.iter().position(|mark| mark.id == bookmark).ok_or(DeskError::MissingBookmark)?;
+    let mark = &state.bookmarks[index];
+    if mark.update_sequence != expected_update_sequence { return Err(DeskError::StaleBookmark); }
+    let sequence = mark.update_sequence.checked_add(1).ok_or(DeskError::IdentityExhausted)?;
+    verify_reattachment(state, mark.location, target, canceled)?;
+    let mark = &mut state.bookmarks[index];
+    mark.location = target;
+    mark.update_sequence = sequence;
+    Ok(())
+}
 fn verify_reattachment(state: &State, original: DeskLocation, target: DeskLocation,
     canceled: &mut impl FnMut() -> bool) -> Result<(), DeskError> {
     let old = selection_bytes(state, original)?;

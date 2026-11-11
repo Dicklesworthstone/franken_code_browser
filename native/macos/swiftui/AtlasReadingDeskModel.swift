@@ -182,6 +182,31 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
     }
 
 
+    /// Compare immutable retained captures on the desk's worker. The result is
+    /// only review material: no navigation, note mutation or attempt is issued.
+    func suggestReattachment(_ target: AtlasDeskComparisonTarget) async throws -> AtlasDeskReattachmentProposal {
+        guard canOperate else { throw AtlasReadingDeskError.unavailable }
+        guard target.isCurrent(in: state) else { throw AtlasReadingDeskError.staleReattachment }
+        try Task.checkCancellation()
+        let cancellation = AtlasDeskCancellation()
+        operationCancellation = cancellation; busy = true
+        defer {
+            busy = false; operationCancellation = nil
+            if closed { releaseSession() }
+        }
+        let lease = try await ensureStarted(cancellation), transport = transport
+        guard target.isCurrent(in: state) else { throw AtlasReadingDeskError.staleReattachment }
+        let json = try await withTaskCancellationHandler(operation: {
+            try await io.perform(keepingAlive: [lease], cancellation: cancellation) {
+                transport.run(lease.handle, target.request)
+            }
+        }, onCancel: { cancellation.cancel(); _ = transport.cancel(lease.handle) })
+        try cancellation.check()
+        try Task.checkCancellation()
+        guard !closed, target.isCurrent(in: state) else { throw AtlasReadingDeskError.staleReattachment }
+        return try AtlasDeskReattachmentProposal.decode(json, target: target)
+    }
+
     /// Submit the confirmed source mapping once. A lost reply triggers only a
     /// state read, so it cannot move the note twice or consume another version.
     func reattachBookmark(_ target: AtlasDeskReattachment) {
@@ -221,7 +246,7 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
             let message: String
             switch target.outcome(in: accepted, attempt: attempt) {
             case .accepted:
-                message = "Reattached the saved note to the selected range after comparing its original bytes. Its label and text are preserved. Save a new checkpoint to retain this change."
+                message = "Reattached the saved note to the confirmed range after comparing its original bytes. Its label and text are preserved. Save a new checkpoint to retain this change."
             case .notAccepted:
                 message = "Reattachment was not accepted. The saved note is unchanged; select a nonempty range with identical bytes and review the destination again."
             case .unconfirmed:

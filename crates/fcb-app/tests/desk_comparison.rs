@@ -2,7 +2,7 @@
 
 mod support;
 use support::{parse, Json};
-use fcb::{ArenaOwnerId, FileId, SourceRevision, SourceCapture};
+use fcb::{ArenaOwnerId, ByteOffset, ByteRange, FileId, SourceRevision, SourceCapture};
 use fcb::analysis::comparison::{ComparisonError, ComparisonQuality, ComparisonRelation, CorrespondenceKind};
 use fcb_app::{EXIT_OK, EXIT_PARTIAL};
 use fcb_app::host::{HostResponse, desk::{DeskSession, DeskLimits, DeskCommand, DeskPaneId,
@@ -192,4 +192,122 @@ fn same_pane_is_rejected_but_different_panes_need_not_share_a_logical_file_id() 
     let comparison = prepare(&mut d, a, b); let page = json(&comparison.page(&mut d, 3, 1, 0, 128, || false).unwrap());
     assert_ne!(page.get("before_source").get("file_id"), page.get("after_source").get("file_id"));
     assert_eq!(page.get("alignment_semantics").text(), "deterministic-not-identity-proof");
+}
+
+
+fn anchored(a: &[u8], b: &[u8], start: u64, end: u64) -> (DeskSession, DeskPaneId, u64) {
+    let (mut desk, before, after) = setup(a, b);
+    let selected = ByteRange::new(ByteOffset::new(start), ByteOffset::new(end)).unwrap();
+    desk.apply(3, 4, DeskCommand::Navigate { pane: before, offset: start, selection: Some(selected) }, || false).unwrap();
+    let bookmark = desk.apply(4, 5, DeskCommand::Annotate {
+        pane: before, label: "Keep this".into(), body: "Personal\0note\r\n".into(),
+    }, || false).unwrap().created_bookmark.unwrap();
+    desk.apply(5, 6, DeskCommand::Close(before), || false).unwrap();
+    (desk, after, bookmark)
+}
+
+#[test]
+fn guided_reattachment_uses_closed_bookmarks_capture_without_mutating_any_personal_state() {
+    let (mut desk, after, bookmark) = anchored(b"head saved tail\n", b"new head saved tail\n", 5, 10);
+    let original = desk.model().bookmarks()[0].location();
+    let pane_before = desk.model().location(after, 6).unwrap();
+    let history = desk.model().history().to_vec();
+    let response = desk.suggest_bookmark_reattachment(6, bookmark, 1, after, DeskComparisonLimits {
+        max_source_bytes: 4 * 1024 * 1024, ..Default::default()
+    }, || false).unwrap();
+    assert_eq!(response.exit_code(), EXIT_OK);
+    let value = json(&response);
+    assert_eq!(value.get("command").text(), "suggest-reattachment");
+    assert_eq!(value.get("outcome").text(), "mapped");
+    assert_eq!(value.get("original_range").get("start").number(), 5);
+    assert_eq!(value.get("target_range").get("start").number(), 9);
+    assert_eq!(value.get("target_range").get("end").number(), 14);
+    assert_eq!(value.get("before_source").get("file_id").number(), 1);
+    assert_eq!(value.get("after_source").get("file_id").number(), 2);
+    assert_eq!(value.get("alignment_semantics").text(), "deterministic-not-identity-proof");
+    assert!(!value.get("source_reopened").flag());
+    assert_eq!(value.get("additional_source_bytes_read").number(), 0);
+    assert!(value.get("before_preview").get("text").text().starts_with("saved"));
+    assert!(value.get("after_preview").get("text").text().starts_with("saved"));
+    assert_eq!(desk.model().revision(), 6); assert_eq!(desk.model().last_attempt(), 6);
+    assert_eq!(desk.model().bookmarks()[0].location(), original);
+    assert_eq!(desk.model().bookmarks()[0].body(), "Personal\0note\r\n");
+    assert_eq!(desk.model().bookmarks()[0].update_sequence(), 1);
+    assert_eq!(desk.model().location(after, 6).unwrap(), pane_before);
+    assert_eq!(desk.model().history(), history.as_slice());
+}
+
+#[test]
+fn guided_mapping_excludes_changed_and_unresolved_ranges_but_can_use_a_verified_partial_edge() {
+    for (start, end, max_work, max_edits, outcome, complete) in [
+        (5, 8, 1024, 256, "changed", true),
+        (5, 8, 1024, 0, "unresolved", false),
+        (9, 13, 1024, 0, "mapped", false),
+        (9, 13, 0, 256, "unresolved", false),
+    ] {
+        let (mut desk, after, bookmark) = anchored(b"head old tail", b"head NEW tail", start, end);
+        let value = json(&desk.suggest_bookmark_reattachment(6, bookmark, 1, after,
+            DeskComparisonLimits { max_work, max_edit_distance: max_edits, ..Default::default() }, || false).unwrap());
+        assert_eq!(value.get("outcome").text(), outcome);
+        assert_eq!(value.get("comparison_complete").flag(), complete);
+        if outcome == "mapped" {
+            assert_eq!(value.get("target_range").get("start").number(), 9);
+            assert_eq!(value.get("comparison_quality").text(), "edit-limit");
+        } else {
+            assert_eq!(value.get("target_range"), &Json::Null);
+            assert_eq!(value.get("after_preview"), &Json::Null);
+        }
+        assert_eq!(desk.model().revision(), 6); assert_eq!(desk.model().last_attempt(), 6);
+    }
+}
+
+#[test]
+fn guided_mapping_preserves_utf16_byte_coordinates_and_bounds_long_selection_previews() {
+    fn utf16(text: &str) -> Vec<u8> {
+        let mut bytes = vec![0xff, 0xfe]; bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes)); bytes
+    }
+    let (mut desk, after, bookmark) = anchored(&utf16("head saved\r\n"), &utf16("new head saved\r\n"), 12, 22);
+    let value = json(&desk.suggest_bookmark_reattachment(6, bookmark, 1, after, DeskComparisonLimits::default(), || false).unwrap());
+    assert_eq!(value.get("target_range").get("start").number(), 20);
+    assert_eq!(value.get("target_range").get("end").number(), 30);
+    assert!(value.get("before_preview").get("text").text().starts_with("saved"));
+    assert_eq!(value.get("before_preview").get("selection_window_utf8_range").get("end").number(), 5);
+    let bytes = vec![b'x'; 8192];
+    let (mut desk, after, bookmark) = anchored(&bytes, &bytes, 0, 8192);
+    let value = json(&desk.suggest_bookmark_reattachment(6, bookmark, 1, after, DeskComparisonLimits::default(), || false).unwrap());
+    assert_eq!(value.get("outcome").text(), "mapped");
+    assert_eq!(value.get("target_range").get("end").number(), 8192);
+    assert!(value.get("before_preview").get("text").text().len() <= 4096);
+    assert_eq!(value.get("before_preview").get("selection_window_utf8_range"), &Json::Null);
+}
+
+#[test]
+fn guided_mapping_rejects_stale_note_revision_caps_and_cancellation_without_consuming_an_attempt() {
+    let (mut desk, after, bookmark) = anchored(b"saved", b"prefix saved", 0, 5);
+    for (expected, sequence, limits, canceled, error) in [
+        (5, 1, DeskComparisonLimits::default(), false, DeskComparisonError::Desk(DeskError::StaleRevision.into())),
+        (6, 2, DeskComparisonLimits::default(), false, DeskComparisonError::Desk(DeskError::StaleBookmark.into())),
+        (6, 1, DeskComparisonLimits { max_source_bytes: 4, ..Default::default() }, false, DeskComparisonError::Analysis(ComparisonError::Limits)),
+        (6, 1, DeskComparisonLimits::default(), true, DeskComparisonError::Desk(DeskError::Canceled.into())),
+    ] {
+        assert_eq!(desk.suggest_bookmark_reattachment(expected, bookmark, sequence, after, limits, || canceled).err(), Some(error));
+        assert_eq!(desk.model().revision(), 6); assert_eq!(desk.model().last_attempt(), 6);
+        assert_eq!(desk.model().bookmarks()[0].update_sequence(), 1);
+    }
+}
+
+
+#[test]
+fn guided_mapping_keeps_bom_and_partial_scalar_byte_ranges_separate_from_logical_preview() {
+    for bytes in [b"\xff\xfe".as_slice(), b"\xef\xbb\xbfsource", b"\xff\xfea\0b\0"] {
+        let selected_end = if bytes.starts_with(b"\xef") { 3 } else { 2 };
+        let (mut desk, after, bookmark) = anchored(bytes, bytes, 0, selected_end);
+        let value = json(&desk.suggest_bookmark_reattachment(6, bookmark, 1, after,
+            DeskComparisonLimits::default(), || false).unwrap());
+        assert_eq!(value.get("outcome").text(), "mapped");
+        assert_eq!(value.get("target_range").get("start").number(), 0);
+        assert_eq!(value.get("target_range").get("end").number(), selected_end);
+        assert_eq!(value.get("before_preview").get("content_start").number(), selected_end);
+        assert_eq!(value.get("before_preview").get("selection_window_utf8_range"), &Json::Null);
+    }
 }

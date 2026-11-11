@@ -22,6 +22,7 @@ private final class AtlasDeskFileAccess {
     @State private var panelNotice = ""
     @State private var noteDraft: AtlasDeskNoteDraft?
     @State private var reattachment: AtlasDeskReattachment?
+    @State private var comparisonReview: AtlasDeskComparisonReview?
     @State private var readerCapture: AtlasDeskReaderCapture?
     @State private var readerTask: Task<Void, Never>?
     @State private var pins = AtlasPinnedReaders<AtlasPagedReaderModel>(
@@ -65,7 +66,8 @@ private final class AtlasDeskFileAccess {
             AtlasDeskReaderView(desk: model, capture: capture, pins: pins, project: project)
         }
         .sheet(item: $noteDraft) { draft in AtlasDeskNoteEditor(model: model, draft: draft) }
-        .onDisappear { reattachment = nil; readerTask?.cancel(); readerCapture?.reader.close(); pins.closeAll() }
+        .sheet(item: $comparisonReview) { review in AtlasDeskReattachmentReviewView(model: model, review: review) }
+        .onDisappear { reattachment = nil; comparisonReview = nil; readerTask?.cancel(); readerCapture?.reader.close(); pins.closeAll() }
         .alert("Reattach this saved note?", isPresented: Binding(
             get: { reattachment != nil }, set: { if !$0 { reattachment = nil } }), presenting: reattachment) { target in
             Button("Reattach note") { panelNotice = ""; model.reattachBookmark(target) }
@@ -157,6 +159,14 @@ private final class AtlasDeskFileAccess {
                             .font(.caption)
                             .disabled(reattachmentTarget(bookmark) == nil)
                             .help("Select a nonempty range of the same length in a retained source. Reattachment compares original bytes before moving the note.")
+                            Button("Find range in another capture…") {
+                                guard let state = model.state else { return }
+                                panelNotice = ""; comparisonReview = AtlasDeskComparisonReview(state: state, bookmark: bookmark)
+                            }
+                            .font(.caption)
+                            .disabled((bookmark.location.selection.map { $0.start >= $0.end } ?? true)
+                                || bookmark.updateSequence == UInt64.max || model.state?.panes.isEmpty != false)
+                            .help("Compare the note’s exact saved source with a retained capture, review a verified matching range, then confirm reattachment.")
                             if !bookmark.body.isEmpty {
                                 Text(String(bookmark.body.prefix(200))).font(.caption).foregroundStyle(.secondary)
                                     .lineLimit(3).textSelection(.enabled)
@@ -282,5 +292,153 @@ private final class AtlasDeskFileAccess {
         guard let access = AtlasDeskFileAccess(selectedURL: url) else { panelNotice = "The selected destination did not grant current write access."; return }
         panelNotice = ""
         model.exportSourcePack(target, limits: limits, path: url.path, accessLease: access)
+    }
+}
+
+
+private struct AtlasDeskComparisonReview: Identifiable {
+    let id = UUID()
+    let state: AtlasDeskState
+    let bookmark: AtlasDeskBookmark
+}
+
+/// Comparison is read-only. The single prominent confirmation submits an
+/// atomic source-bound note command; it never changes a pane as an intermediate
+/// step. Dismissing the preview cancels only unfinished comparison work.
+@MainActor private struct AtlasDeskReattachmentReviewView: View {
+    @Bindable var model: AtlasReadingDeskModel
+    let review: AtlasDeskComparisonReview
+    @Environment(\.dismiss) private var dismiss
+    @State private var paneID: UInt64
+    @State private var proposal: AtlasDeskReattachmentProposal?
+    @State private var task: Task<Void, Never>?
+    @State private var notice = ""
+
+    init(model: AtlasReadingDeskModel, review: AtlasDeskComparisonReview) {
+        self.model = model; self.review = review
+        let candidate = review.state.panes.first { $0.location.file != review.bookmark.location.file
+            || $0.location.revision != review.bookmark.location.revision }
+        _paneID = State(initialValue: candidate?.id ?? review.state.activePane ?? review.state.panes.first?.id ?? 0)
+    }
+    private var target: AtlasDeskComparisonTarget? {
+        guard let pane = review.state.panes.first(where: { $0.id == paneID }) else { return nil }
+        return AtlasDeskComparisonTarget(state: review.state, bookmark: review.bookmark, pane: pane)
+    }
+    private var confirmation: AtlasDeskReattachment? {
+        guard let proposal, proposal.target.pane.id == paneID, proposal.target.isCurrent(in: model.state) else { return nil }
+        return AtlasDeskReattachment(proposal: proposal)
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Recover a saved source range").font(.title2.weight(.semibold))
+                Spacer()
+                Button("Done") { task?.cancel(); dismiss() }.keyboardShortcut(.cancelAction)
+            }
+            Text(review.bookmark.label).font(.headline).textSelection(.enabled)
+            if !review.bookmark.body.isEmpty {
+                Text(String(review.bookmark.body.prefix(512))).font(.callout).lineLimit(5).textSelection(.enabled)
+            }
+            Text("The note stays attached to its original capture until you confirm a destination. Capture the updated file in the reading desk first, then choose that retained source below.")
+                .font(.callout).foregroundStyle(.secondary)
+            Picker("Compare with", selection: $paneID) {
+                ForEach(review.state.panes) { pane in
+                    Text("\(pane.label) · capture \(pane.location.file), revision \(pane.location.revision)").tag(pane.id)
+                }
+            }.disabled(task != nil)
+            HStack {
+                Button("Compare captured sources") { compare(expanded: false) }
+                    .disabled(!model.canOperate || target?.isCurrent(in: model.state) != true || task != nil)
+                if let proposal, !proposal.complete, proposal.target.maxWork < 64 * 1024 * 1024 {
+                    Button("Compare with larger budget") { compare(expanded: true) }
+                        .disabled(!model.canOperate || target?.isCurrent(in: model.state) != true || task != nil)
+                }
+                if task != nil { ProgressView().controlSize(.small); Button("Cancel comparison") { task?.cancel() } }
+            }
+            if target?.isCurrent(in: model.state) != true {
+                Text("The desk or saved note changed. Close this review and open it again from the current note.")
+                    .foregroundStyle(.orange)
+            }
+            if let proposal, proposal.target.pane.id == paneID {
+                result(proposal)
+            } else {
+                Text(notice.isEmpty ? "Comparison uses exact saved bytes, including the original capture if its pane has been closed." : notice)
+                    .foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
+            HStack {
+                Text("The note’s label and text are preserved. Save a new checkpoint after reattaching.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Reattach note to this range") {
+                    guard let confirmation, confirmation.isCurrent(in: model.state), model.canOperate else { return }
+                    model.reattachBookmark(confirmation); dismiss()
+                }.buttonStyle(.borderedProminent).disabled(confirmation == nil || !model.canOperate || task != nil)
+            }
+        }
+        .padding(20).frame(minWidth: 820, idealWidth: 1000, minHeight: 600, idealHeight: 720)
+        .onChange(of: paneID) { _, _ in proposal = nil; notice = "" }
+        .onDisappear { task?.cancel() }
+    }
+
+    @ViewBuilder private func result(_ value: AtlasDeskReattachmentProposal) -> some View {
+        switch value.outcome {
+        case .mapped:
+            Text("The saved selection has an exact byte match in this alignment.").font(.headline)
+            Text("Review both captures before confirming. Repeated text can have several possible alignments; equal bytes alone do not establish that the files are versions of one another.")
+                .font(.caption).foregroundStyle(.secondary)
+        case .unchanged:
+            Text("This is already the same saved source range.").font(.headline)
+        case .changed:
+            Text("No unchanged span contains the whole saved selection.").font(.headline)
+            Text("The selection crosses changed text. Keep the original evidence, or select a byte-identical range manually in the destination pane.")
+                .font(.caption).foregroundStyle(.secondary)
+        case .unresolved:
+            Text("This range could not be mapped within the comparison budget.").font(.headline)
+            Text("Try the larger budget, or review the source and select a byte-identical destination range manually.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        if !value.complete {
+            Text("The full comparison stopped at the \(value.quality == "work-limit" ? "work" : "edit-distance") limit. Any proposed range shown here was verified byte for byte; unresolved regions are excluded.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        HStack(alignment: .top, spacing: 12) {
+            preview(value.beforePreview, source: value.beforeSource, selected: review.bookmark.location.selection!, title: "Saved source")
+            if let after = value.afterPreview, let selected = value.targetRange {
+                preview(after, source: value.afterSource, selected: selected, title: "Proposed destination")
+            }
+        }.frame(maxHeight: .infinity)
+        Text("\(value.workUnits) / \(value.target.maxWork) comparison work units · no source file reopened")
+            .font(.caption2).foregroundStyle(.secondary)
+    }
+
+    private func preview(_ value: AtlasDeskReattachmentPreview, source: AtlasDeskComparisonSource,
+        selected: AtlasDeskRange, title: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title).font(.headline)
+            Text(source.label).font(.caption).lineLimit(2).textSelection(.enabled)
+            Text("Capture \(source.file_id.value), revision \(source.source_revision.value) · bytes \(selected.start)..<\(selected.end)")
+                .font(.caption2).foregroundStyle(.secondary)
+            ScrollView([.horizontal, .vertical]) {
+                Text(value.text).font(.system(size: 12, design: .monospaced)).textSelection(.enabled)
+                    .fixedSize(horizontal: true, vertical: true).frame(maxWidth: .infinity, alignment: .topLeading).padding(8)
+            }.background(Color(nsColor: .textBackgroundColor))
+            Text("Preview bytes \(value.original_range.start)..<\(value.original_range.end)\(value.has_replacements ? " · decoding replacements" : "")")
+                .font(.caption2).foregroundStyle(.secondary)
+            if value.selectionRange == nil {
+                Text("The full selected range is not representable inside this bounded text preview. Its original byte range remains unchanged.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+    private func compare(expanded: Bool) {
+        guard let target, model.canOperate, task == nil,
+              let request = AtlasDeskComparisonTarget(state: target.state, bookmark: target.bookmark, pane: target.pane,
+                maxWork: expanded ? 64 * 1024 * 1024 : 8 * 1024 * 1024, maxEdits: expanded ? 512 : 256) else { return }
+        proposal = nil; notice = "Comparing the retained captures…"
+        task = Task {
+            do { proposal = try await model.suggestReattachment(request); notice = "" }
+            catch { notice = (error as? AtlasReadingDeskError)?.message ?? "The comparison was canceled or could not finish." }
+            task = nil
+        }
     }
 }
