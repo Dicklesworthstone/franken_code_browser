@@ -76,7 +76,21 @@ impl ReferenceScanOracle {
     /// scope. Predicate occurrences never multiply the primary anchor hits.
     pub fn scan_document_with_cancel(
         doc: &SearchDocument<'_>, query: &ParsedQuery, options: &QueryOptions,
-        mut canceled: impl FnMut() -> bool,
+        canceled: impl FnMut() -> bool,
+    ) -> Result<SearchResult, QueryError> {
+        Self::scan_document_inner(doc, query, options, false, canceled)
+    }
+
+    pub fn scan_document_counting_with_cancel(
+        doc: &SearchDocument<'_>, query: &ParsedQuery, options: &QueryOptions,
+        canceled: impl FnMut() -> bool,
+    ) -> Result<SearchResult, QueryError> {
+        Self::scan_document_inner(doc, query, options, true, canceled)
+    }
+
+    fn scan_document_inner(
+        doc: &SearchDocument<'_>, query: &ParsedQuery, options: &QueryOptions,
+        count_all_matches: bool, mut canceled: impl FnMut() -> bool,
     ) -> Result<SearchResult, QueryError> {
         validate_query(query)?;
         if doc.file_id != doc.capture.request().file() {
@@ -91,7 +105,7 @@ impl ReferenceScanOracle {
             || !Self::matches_lang_filters(doc.path, &query.lang_filters) {
             return Ok(result);
         }
-        if options.max_matches == 0 && !doc.capture.bytes().is_empty() {
+        if !count_all_matches && options.max_matches == 0 && !doc.capture.bytes().is_empty() {
             result.coverage = SearchCoverage::TruncatedAtLimit { max_matches: 0 };
             return Ok(result);
         }
@@ -130,9 +144,15 @@ impl ReferenceScanOracle {
         }
 
         let primary_options = remaining_options(options, result.scanned_bytes, options.max_matches);
-        let mut primary = DirectSourceScanner::scan_complete_capture_with_cancel(
-            doc.capture, &query.primary_needle, &primary_options, &mut canceled,
-        )?;
+        let mut primary = if count_all_matches {
+            DirectSourceScanner::scan_complete_capture_counting_with_cancel(
+                doc.capture, &query.primary_needle, &primary_options, &mut canceled,
+            )
+        } else {
+            DirectSourceScanner::scan_complete_capture_with_cancel(
+                doc.capture, &query.primary_needle, &primary_options, &mut canceled,
+            )
+        }?;
         let scanned = add_scanned(result.scanned_bytes, primary.scanned_bytes, options)?;
         set_scanned(&mut primary, scanned);
         Ok(primary)
@@ -188,6 +208,46 @@ impl ReferenceScanOracle {
             if matches!(child.coverage, SearchCoverage::BudgetExhausted { .. }) {
                 result.coverage = SearchCoverage::BudgetExhausted { bytes_scanned: result.scanned_bytes };
                 break;
+            }
+        }
+        Ok(result)
+    }
+
+    /// Count the complete primary occurrence inventory under the byte budget
+    /// while retaining at most options.max_matches rows across the collection.
+    pub fn scan_collection_counting_with_cancel(
+        docs: &[SearchDocument<'_>], query: &ParsedQuery, options: &QueryOptions,
+        mut canceled: impl FnMut() -> bool,
+    ) -> Result<SearchResult, QueryError> {
+        validate_query(query)?;
+        let mut result = SearchResult::empty(SearchCoverage::Exhaustive);
+        if canceled() {
+            result.coverage = SearchCoverage::CanceledEarly;
+            return Ok(result);
+        }
+        for doc in docs {
+            let remaining_hits = options.max_matches.saturating_sub(result.matches.len());
+            let doc_options = remaining_options(options, result.scanned_bytes, remaining_hits);
+            let child = Self::scan_document_counting_with_cancel(doc, query, &doc_options, &mut canceled)?;
+            result.scanned_bytes = add_scanned(result.scanned_bytes, child.scanned_bytes, options)?;
+            result.unsupported_files.try_reserve(child.unsupported_files.len())
+                .map_err(|_| QueryError::LimitExceeded)?;
+            result.unsupported_files.extend(child.unsupported_files);
+            result.total_matches_counted = result.total_matches_counted
+                .checked_add(child.total_matches_counted).ok_or(QueryError::LimitExceeded)?;
+            let retained = child.matches.len().min(remaining_hits);
+            result.matches.try_reserve_exact(retained).map_err(|_| QueryError::LimitExceeded)?;
+            result.matches.extend(child.matches.into_iter().take(retained));
+            if matches!(child.coverage, SearchCoverage::CanceledEarly) {
+                result.coverage = SearchCoverage::CanceledEarly;
+                break;
+            }
+            if matches!(child.coverage, SearchCoverage::BudgetExhausted { .. }) {
+                result.coverage = SearchCoverage::BudgetExhausted { bytes_scanned: result.scanned_bytes };
+                break;
+            }
+            if matches!(child.coverage, SearchCoverage::TruncatedAtLimit { .. }) {
+                return Err(QueryError::LimitExceeded);
             }
         }
         Ok(result)

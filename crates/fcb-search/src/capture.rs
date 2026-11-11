@@ -29,6 +29,31 @@ pub(crate) fn scan_raw_chunks<'a>(
     revision: SourceRevision,
     needle: &[u8],
     options: &QueryOptions,
+    canceled: impl FnMut() -> bool,
+) -> Result<SearchResult, QueryError> {
+    scan_raw_chunks_inner(chunks, total_bytes, file_id, revision, needle, options, false, canceled)
+}
+
+pub(crate) fn scan_raw_chunks_counting<'a>(
+    chunks: impl IntoIterator<Item = Result<&'a [u8], QueryError>>,
+    total_bytes: u64,
+    file_id: FileId,
+    revision: SourceRevision,
+    needle: &[u8],
+    options: &QueryOptions,
+    canceled: impl FnMut() -> bool,
+) -> Result<SearchResult, QueryError> {
+    scan_raw_chunks_inner(chunks, total_bytes, file_id, revision, needle, options, true, canceled)
+}
+
+fn scan_raw_chunks_inner<'a>(
+    chunks: impl IntoIterator<Item = Result<&'a [u8], QueryError>>,
+    total_bytes: u64,
+    file_id: FileId,
+    revision: SourceRevision,
+    needle: &[u8],
+    options: &QueryOptions,
+    count_all_matches: bool,
     mut canceled: impl FnMut() -> bool,
 ) -> Result<SearchResult, QueryError> {
     let mut cursor = ByteSearchCursor::new(needle)?;
@@ -37,7 +62,7 @@ pub(crate) fn scan_raw_chunks<'a>(
         result.coverage = SearchCoverage::CanceledEarly;
         return Ok(result);
     }
-    if options.max_matches == 0 && total_bytes > 0 {
+    if !count_all_matches && options.max_matches == 0 && total_bytes > 0 {
         result.coverage = SearchCoverage::TruncatedAtLimit { max_matches: 0 };
         return Ok(result);
     }
@@ -68,8 +93,10 @@ pub(crate) fn scan_raw_chunks<'a>(
                 return Ok(result);
             }
             let work = remaining_bytes.min(MAX_STREAM_STEP_BYTES as u64) as usize;
-            let hit_budget = options.max_matches.saturating_sub(result.matches.len())
-                .saturating_add(1).min(MAX_STREAM_BATCH_HITS);
+            let hit_budget = if count_all_matches { MAX_STREAM_BATCH_HITS } else {
+                options.max_matches.saturating_sub(result.matches.len())
+                    .saturating_add(1).min(MAX_STREAM_BATCH_HITS)
+            };
             let batch = cursor.step(remaining, work, hit_budget)?;
             result.scanned_bytes = cursor.scanned_bytes();
             remaining = &remaining[batch.consumed..];
@@ -79,6 +106,7 @@ pub(crate) fn scan_raw_chunks<'a>(
                 result.total_matches_counted = result.total_matches_counted
                     .checked_add(1).ok_or(QueryError::LimitExceeded)?;
                 if result.matches.len() == options.max_matches {
+                    if count_all_matches { continue; }
                     result.coverage = SearchCoverage::TruncatedAtLimit {
                         max_matches: options.max_matches,
                     };
@@ -121,6 +149,11 @@ mod tests {
         scan_raw_chunks(chunks.iter().copied().map(Ok), chunks.iter().map(|c| c.len() as u64).sum(),
             file, revision, needle, options, || false).unwrap()
     }
+    fn scan_counting(chunks: &[&[u8]], needle: &[u8], options: &QueryOptions) -> SearchResult {
+        let (file, revision, _) = self::options();
+        scan_raw_chunks_counting(chunks.iter().copied().map(Ok), chunks.iter().map(|c| c.len() as u64).sum(),
+            file, revision, needle, options, || false).unwrap()
+    }
 
     #[test]
     fn capture_adapter_matches_across_three_or_more_chunks_in_source_order() {
@@ -156,6 +189,21 @@ mod tests {
         let zero = scan(&[b"a"], b"a", &options.with_max_matches(0));
         assert!(zero.matches.is_empty());
         assert_eq!(zero.scanned_bytes, 0);
+    }
+
+    #[test]
+    fn counting_mode_finishes_after_retained_rows_fill_including_zero_rows() {
+        let (_, _, options) = options();
+        let result = scan_counting(&[b"aaaaa"], b"a", &options.with_max_matches(2));
+        assert_eq!(result.matches.len(), 2);
+        assert_eq!(result.match_count(), 5);
+        assert_eq!(result.scanned_bytes, 5);
+        assert!(result.is_complete());
+        let zero = scan_counting(&[b"aaa"], b"a", &options.with_max_matches(0));
+        assert!(zero.matches.is_empty());
+        assert_eq!(zero.match_count(), 3);
+        assert_eq!(zero.scanned_bytes, 3);
+        assert!(zero.is_complete());
     }
 
     #[test]

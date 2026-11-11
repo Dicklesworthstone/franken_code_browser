@@ -281,3 +281,45 @@ fn empty_universe_terminates_without_verification() {
     assert!(cursor.report().is_complete());
     assert_eq!(cursor.report().scan_attempts(), 0);
 }
+
+
+#[test]
+fn counted_cursor_finishes_candidates_after_retained_rows_fill() {
+    let budget = budget();
+    let noise = b"needle ".repeat(2000);
+    let index = owned(&[("a.rs", &noise), ("b.rs", b"needle"), ("c.rs", b"absent")],
+        MembershipState::Closed, &[], IndexLimits::default(), &budget, 1);
+    let options = QueryOptions::new(generation(50)).with_max_matches(1);
+    let mut cursor = OwnedIndexedQuery::new_counting(&index, ParsedQuery::parse("needle").unwrap(),
+        options, &budget, [allocation(50), allocation(51)], || false).unwrap();
+    finish(&mut cursor, &index, 1);
+    let report = cursor.report();
+    assert!(report.is_complete());
+    assert_eq!(report.examined_files(), 3);
+    assert_eq!(report.capture_results().matches.len(), 1);
+    assert_eq!(report.capture_results().matches[0].file_id, file(1));
+    assert_eq!(report.capture_results().total_matches_counted, 2001);
+    assert_eq!(report.capture_results().coverage, fcb_search::SearchCoverage::Exhaustive);
+    assert!(report.scan_attempts() >= 2, "later matching candidates must still be verified");
+}
+
+#[test]
+fn scoped_counted_cursor_keeps_excluded_files_outside_count_and_budget() {
+    let budget = budget();
+    let noise = b"needle ".repeat(2000);
+    let index = owned(&[("noise.txt", &noise), ("src/a.rs", b"needle needle"), ("src/b.rs", b"needle")],
+        MembershipState::Closed, &[], IndexLimits::default(), &budget, 1);
+    let mut options = QueryOptions::new(generation(60)).with_max_matches(1);
+    options.max_bytes_scanned = Some(18);
+    let mut cursor = OwnedIndexedQuery::new_scoped_counting(&index, ParsedQuery::parse("needle").unwrap(),
+        options, |candidate| candidate != file(1), &budget,
+        [allocation(60), allocation(61)], || false).unwrap();
+    finish(&mut cursor, &index, 1);
+    let report = cursor.report();
+    assert!(report.is_complete());
+    assert_eq!(report.known_files(), 2);
+    assert_eq!(report.examined_files(), 2);
+    assert_eq!(report.capture_results().matches.len(), 1);
+    assert_eq!(report.capture_results().total_matches_counted, 3);
+    assert_eq!(report.capture_results().scanned_bytes, 18);
+}

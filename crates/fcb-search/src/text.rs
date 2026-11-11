@@ -22,13 +22,34 @@ pub(crate) fn scan_text_chunks<'a>(
     revision: SourceRevision,
     query: &str,
     options: &QueryOptions,
-    mut canceled: impl FnMut() -> bool,
+    canceled: impl FnMut() -> bool,
+) -> Result<SearchResult, QueryError> {
+    scan_text_chunks_inner(chunks, total_bytes, file_id, revision, query, options, false, canceled)
+}
+
+pub(crate) fn scan_text_chunks_counting<'a>(
+    chunks: impl IntoIterator<Item = Result<&'a [u8], QueryError>>,
+    total_bytes: u64,
+    file_id: FileId,
+    revision: SourceRevision,
+    query: &str,
+    options: &QueryOptions,
+    canceled: impl FnMut() -> bool,
+) -> Result<SearchResult, QueryError> {
+    scan_text_chunks_inner(chunks, total_bytes, file_id, revision, query, options, true, canceled)
+}
+
+fn scan_text_chunks_inner<'a>(
+    chunks: impl IntoIterator<Item = Result<&'a [u8], QueryError>>,
+    total_bytes: u64, file_id: FileId, revision: SourceRevision, query: &str,
+    options: &QueryOptions, count_all_matches: bool, mut canceled: impl FnMut() -> bool,
 ) -> Result<SearchResult, QueryError> {
     let mut scan = TextScan {
         cursor: ByteSearchCursor::new(query.as_bytes())?,
         normalized: NormalizedCursor::new(query, options.mode)?,
         query,
         options,
+        count_all_matches,
         file_id,
         revision,
         encoding: options.declared_encoding,
@@ -44,7 +65,7 @@ pub(crate) fn scan_text_chunks<'a>(
         scan.result.coverage = SearchCoverage::CanceledEarly;
         return Ok(scan.result);
     }
-    if options.max_matches == 0 && total_bytes > 0 {
+    if !count_all_matches && options.max_matches == 0 && total_bytes > 0 {
         scan.result.coverage = SearchCoverage::TruncatedAtLimit { max_matches: 0 };
         return Ok(scan.result);
     }
@@ -101,6 +122,7 @@ struct TextScan<'a> {
     normalized: Option<NormalizedCursor>,
     query: &'a str,
     options: &'a QueryOptions,
+    count_all_matches: bool,
     file_id: FileId,
     revision: SourceRevision,
     encoding: Option<DetectedEncoding>,
@@ -166,8 +188,10 @@ impl TextScan<'_> {
         } else {
             let mut remaining = decoded.as_bytes();
             while !remaining.is_empty() {
-                let hit_budget = self.options.max_matches.saturating_sub(self.result.matches.len())
-                    .saturating_add(1).min(MAX_STREAM_BATCH_HITS);
+                let hit_budget = if self.count_all_matches { MAX_STREAM_BATCH_HITS } else {
+                    self.options.max_matches.saturating_sub(self.result.matches.len())
+                        .saturating_add(1).min(MAX_STREAM_BATCH_HITS)
+                };
                 let batch = self.cursor.step(remaining, MAX_STREAM_STEP_BYTES, hit_budget)?;
                 remaining = &remaining[batch.consumed..];
                 for hit in batch.hits {
@@ -179,6 +203,7 @@ impl TextScan<'_> {
                     self.result.total_matches_counted = self.result.total_matches_counted
                         .checked_add(1).ok_or(QueryError::LimitExceeded)?;
                     if self.result.matches.len() == self.options.max_matches {
+                        if self.count_all_matches { continue; }
                         self.result.coverage = SearchCoverage::TruncatedAtLimit {
                             max_matches: self.options.max_matches,
                         };
@@ -235,6 +260,7 @@ impl TextScan<'_> {
                 self.result.total_matches_counted = self.result.total_matches_counted
                     .checked_add(1).ok_or(QueryError::LimitExceeded)?;
                 if self.result.matches.len() == self.options.max_matches {
+                    if self.count_all_matches { continue; }
                     self.result.coverage = SearchCoverage::TruncatedAtLimit {
                         max_matches: self.options.max_matches,
                     };
@@ -448,6 +474,22 @@ mod tests {
         assert_eq!(result.matches[0].original_byte_range.start().get(), 0);
         assert_eq!(result.scanned_bytes, 1);
         assert_eq!(result.coverage, SearchCoverage::BudgetExhausted { bytes_scanned: 1 });
+    }
+
+    #[test]
+    fn counting_mode_keeps_first_rows_but_counts_utf8_and_utf16_to_eof() {
+        let owner = ArenaOwnerId::new(91).unwrap();
+        for bytes in [b"banana banana".to_vec(),
+            "\u{feff}banana banana".encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>()] {
+            let options = QueryOptions::new(QueryGeneration::new(owner, 1).unwrap()).with_max_matches(1);
+            let result = scan_text_chunks_counting(bytes.chunks(1).map(Ok), bytes.len() as u64,
+                FileId::new(owner, 1).unwrap(), SourceRevision::new(owner, 1).unwrap(),
+                "ana", &options, || false).unwrap();
+            assert_eq!(result.matches.len(), 1);
+            assert_eq!(result.match_count(), 4);
+            assert_eq!(result.scanned_bytes, bytes.len() as u64);
+            assert!(result.is_complete());
+        }
     }
 
     #[test]

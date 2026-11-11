@@ -145,8 +145,9 @@ pub struct SearchMatch {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchResult {
     pub matches: Vec<SearchMatch>,
-    /// Matches actually seen, including at most one unstored lookahead match.
-    /// This is not an exhaustive total when coverage is partial or truncated.
+    /// Matches actually seen. Legacy bounded scans retain at most one unstored
+    /// lookahead occurrence; explicit counting scans may continue to exhaustive
+    /// coverage while retaining only their bounded result rows.
     pub total_matches_counted: usize,
     pub coverage: SearchCoverage,
     pub scanned_bytes: u64,
@@ -197,6 +198,28 @@ impl DirectSourceScanner {
                 query.as_bytes(), options, canceled,
             ),
             SearchMode::DecodedText { .. } => text::scan_text_chunks(
+                std::iter::once(Ok(bytes)), bytes.len() as u64,
+                file, revision, query, options, canceled,
+            ),
+        }
+    }
+
+    /// Scan the whole capture while retaining at most options.max_matches rows.
+    /// Row omission does not make coverage incomplete; byte/cancel/decoding limits do.
+    pub fn scan_complete_capture_counting_with_cancel(
+        capture: &CompleteCapture, query: &str, options: &QueryOptions,
+        canceled: impl FnMut() -> bool,
+    ) -> Result<SearchResult, QueryError> {
+        validate_needle(query.as_bytes())?;
+        let bytes = capture.bytes();
+        let file = capture.request().file();
+        let revision = capture.request().revision();
+        match options.mode {
+            SearchMode::RawBytes => capture::scan_raw_chunks_counting(
+                std::iter::once(Ok(bytes)), bytes.len() as u64, file, revision,
+                query.as_bytes(), options, canceled,
+            ),
+            SearchMode::DecodedText { .. } => text::scan_text_chunks_counting(
                 std::iter::once(Ok(bytes)), bytes.len() as u64,
                 file, revision, query, options, canceled,
             ),
