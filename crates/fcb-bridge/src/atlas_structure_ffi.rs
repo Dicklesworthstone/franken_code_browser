@@ -4,9 +4,10 @@
 //! extraction, source retention, work budgets and evidence qualification.
 
 use fcb::search::SymbolNameMode;
-use fcb_app::host::atlas_search::{AtlasStructureMode, AtlasStructureOptions};
+use fcb_app::host::atlas_search::{AtlasStructureMode, AtlasStructureOptions, AtlasIndexedStructureOptions};
 use super::{answer, cstr, number, parse_path_scope, reply, AccessError, AtlasSearchOptions,
     Command, MAX_ATLAS_SEARCH_NEEDLE_BYTES, c_char};
+use crate::atlas_sessions::IndexCommand;
 
 /// Admit structural-name search over the atlas's frozen catalog. mode=1 symbols,
 /// 2 Markdown headings, 4 whole-token occurrences. name_mode=0 exact, 1 prefix,
@@ -36,6 +37,34 @@ pub unsafe extern "C" fn fcb_atlas_structure_begin(handle: u64, generation: u64,
             max_file_bytes: number(max_file_bytes)?, max_source_bytes: number(max_source_bytes)? };
         atlases.execute(handle, Command::StructureBegin { generation, needle, scope: &scope,
             options: AtlasStructureOptions { mode, name_mode, limits } }, || false)
+    }))
+}
+
+/// Admit the same structural extraction over an immutable index capture set.
+/// mode/name_mode and scope follow fcb_atlas_structure_begin. max_scan_bytes
+/// bounds whole extraction inputs (0..32 MiB), not source I/O. max_matches is
+/// 1..4096. No live source path is reopened, and missing captures stay pending.
+/// # Safety
+/// Input strings are null or readable NUL-terminated UTF-8, stable until return.
+/// needle is required. Inputs are copied, never retained. The caller must free
+/// the returned string once with fcb_free_string and call this on a worker.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_structure_indexed_begin(handle: u64, generation: u64,
+    index_generation: u64, mode: u64, name_mode: u64, needle: *const c_char,
+    extensions: *const c_char, filenames: *const c_char, path_kind: u64,
+    path: *const c_char, max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
+    reply(|| answer(handle, |atlases| {
+        let mode = match mode { 1 => AtlasStructureMode::Symbols, 2 => AtlasStructureMode::Headings,
+            4 => AtlasStructureMode::Occurrences, _ => return Err(AccessError::InvalidArgument) };
+        let name_mode = match name_mode { 0 => SymbolNameMode::Exact, 1 => SymbolNameMode::Prefix,
+            2 => SymbolNameMode::Contains, _ => return Err(AccessError::InvalidArgument) };
+        let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
+        if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES { return Err(AccessError::InvalidArgument); }
+        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?;
+        let options = AtlasIndexedStructureOptions { mode, name_mode,
+            max_matches: number(max_matches)?, max_scan_bytes };
+        atlases.execute_index(handle, IndexCommand::BeginStructure { generation, index_generation,
+            needle, scope: &scope, options }, || false)
     }))
 }
 

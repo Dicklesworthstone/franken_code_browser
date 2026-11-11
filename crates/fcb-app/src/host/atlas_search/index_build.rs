@@ -234,7 +234,7 @@ impl RetainedAtlasSearch {
         // A query started on the old index while this builder was paused cannot
         // resume on its replacement. Completed rows/reader pins remain intact;
         // a pending live query is independent and can keep running.
-        if self.pending.as_ref().is_some_and(|work| matches!(&work.execution, SearchExecution::Indexed(_))) {
+        if self.pending.as_ref().is_some_and(|work| work.snapshot.index_usage.is_some()) {
             self.pending = None;
         }
         // Accepted relationship metadata retains its old identity and becomes

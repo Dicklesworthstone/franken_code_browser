@@ -1,6 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 use super::*;
 use super::super::{fcb_atlas_search_step, fcb_atlas_search_page, fcb_atlas_search_open_reader};
+use super::super::index::fcb_atlas_index_prepare;
 use crate::atlas_ffi::{fcb_atlas_create, fcb_atlas_open, fcb_atlas_close, fcb_atlas_search_step_cancelable};
 use crate::reader_ffi::{fcb_reader_create, fcb_reader_copy_range, fcb_reader_close, FFI_TEST_LOCK};
 use std::{ffi::{CStr, CString, c_void}, fs, path::PathBuf, sync::atomic::{AtomicU64, Ordering}};
@@ -13,6 +14,11 @@ fn structural_query_signature_and_public_header_match() {
     assert_eq!(header.matches("fcb_atlas_structure_begin(").count(), 1);
     assert!(header.contains("fcb_atlas_search_step"));
     assert!(header.contains("semantic_complete"));
+    let _: unsafe extern "C" fn(u64, u64, u64, u64, u64, *const c_char,
+        *const c_char, *const c_char, u64, *const c_char, u64, u64) -> *mut c_char
+        = fcb_atlas_structure_indexed_begin;
+    assert_eq!(header.matches("fcb_atlas_structure_indexed_begin(").count(), 1);
+    assert!(header.contains("retained-capture-structure"));
 }
 
 
@@ -184,4 +190,74 @@ fn c_canceling_occurrence_extraction_preserves_previous_query_and_reader_ownersh
     assert_eq!(integer(&take(fcb_atlas_search_page(fixture.handle, 1, 0, 100)), "retained_hits"), 1);
     assert!(take(fcb_reader_copy_range(reader, 0, 6)).contains("6e6565646c65"));
     assert_eq!(fcb_reader_close(reader), 1);
+}
+
+#[test]
+fn c_indexed_structure_uses_scoped_captures_and_zero_io_after_live_file_disappears() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let mut fixture = Fixture::new(&[("src/a.rs", b"fn needle() {}\n"),
+        ("src/noise.txt", b"needle"), ("src-old/a.rs", b"fn needle() {}\n")]);
+    let prepared = take(fcb_atlas_index_prepare(fixture.handle, 1, 100,
+        1024 * 1024, 32 * 1024 * 1024, 0));
+    assert!(prepared.contains("\"status\":\"ok\""), "{prepared}");
+    fs::remove_file(fixture.root.join("src/a.rs")).unwrap();
+    let needle = CString::new("needle").unwrap(); let types = CString::new("rs").unwrap();
+    let directory = CString::new("src").unwrap();
+    let admitted = take(unsafe { fcb_atlas_structure_indexed_begin(fixture.handle, 2, 1,
+        1, 0, needle.as_ptr(), types.as_ptr(), std::ptr::null(), 1,
+        directory.as_ptr(), 100, 32 * 1024 * 1024) });
+    assert!(admitted.contains("\"command\":\"begin-indexed-structure\""), "{admitted}");
+    assert_eq!(integer(&admitted, "source_bytes_read"), 0);
+    let page = finish(fixture.handle, 2);
+    for fragment in ["\"search_strategy\":\"retained-capture-structure\"",
+        "\"search_complete\":true", "\"semantic_complete\":false",
+        "\"mode\":\"symbol-name\"", "\"realized_mode\":\"heuristic-outline-candidate\""] {
+        assert!(page.contains(fragment), "{fragment}: {page}");
+    }
+    assert_eq!(integer(&page, "retained_hits"), 1);
+    assert_eq!(integer(&page, "eligible_captured_files"), 1);
+    assert_eq!(integer(&page, "verification_source_bytes"), b"fn needle() {}\n".len() as u64);
+    assert_eq!(integer(&page, "source_bytes_read"), 0); assert_eq!(integer(&page, "read_calls"), 0);
+    let reader = fcb_reader_create(); assert_ne!(reader, 0);
+    assert!(take(fcb_atlas_search_open_reader(fixture.handle, reader, 2, 1))
+        .contains("\"source_reopened\":false"));
+    // Extraction budget admission is distinct from capture/source I/O limits.
+    let empty_budget = take(unsafe { fcb_atlas_structure_indexed_begin(fixture.handle, 3, 1,
+        1, 0, needle.as_ptr(), types.as_ptr(), std::ptr::null(), 1, directory.as_ptr(), 100, 0) });
+    assert!(empty_budget.contains("\"status\":\"ok\""), "{empty_budget}");
+    let limited = finish(fixture.handle, 3);
+    assert!(limited.contains("\"stop_reason\":\"verification-byte-limit\""), "{limited}");
+    assert_eq!(integer(&limited, "pending_files"), 1);
+    assert_eq!(integer(&limited, "retained_hits"), 0);
+    assert_eq!(integer(&limited, "verification_source_bytes"), 0);
+    fixture.close();
+    assert!(take(fcb_reader_copy_range(reader, 3, 9)).contains("6e6565646c65"));
+    assert_eq!(fcb_reader_close(reader), 1);
+}
+
+#[test]
+fn c_indexed_structure_validates_modes_limits_and_cancels_without_losing_accepted_rows() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new(&[("source.txt", b"needle other")]);
+    take(fcb_atlas_index_prepare(fixture.handle, 1, 100, 1024, 1024, 0));
+    let needle = CString::new("needle").unwrap();
+    let begin_indexed = |generation, index_generation, mode, name_mode, maximum, bytes| {
+        take(unsafe { fcb_atlas_structure_indexed_begin(fixture.handle, generation, index_generation,
+            mode, name_mode, needle.as_ptr(), std::ptr::null(), std::ptr::null(), 0,
+            std::ptr::null(), maximum, bytes) })
+    };
+    assert!(begin_indexed(2, 1, 4, 0, 100, 1024).contains("\"status\":\"ok\""));
+    assert_eq!(integer(&finish(fixture.handle, 2), "retained_hits"), 1);
+    assert!(begin_indexed(3, 1, 3, 0, 100, 1024).contains("INVALID_ARGUMENT"));
+    assert!(begin_indexed(3, 1, 4, 1, 100, 1024).contains("ATLAS_SEARCH_INVALID_LIMITS"));
+    assert!(begin_indexed(4, 1, 4, 0, 0, 1024).contains("ATLAS_SEARCH_INVALID_LIMITS"));
+    assert!(begin_indexed(5, 1, 4, 0, 100, 32 * 1024 * 1024 + 1).contains("ATLAS_SEARCH_INVALID_LIMITS"));
+    assert!(begin_indexed(6, 99, 4, 0, 100, 1024).contains("ATLAS_SEARCH_STALE_INDEX"));
+    assert_eq!(integer(&take(fcb_atlas_search_page(fixture.handle, 2, 0, 100)), "retained_hits"), 1);
+    assert!(begin_indexed(7, 1, 4, 0, 100, 1024).contains("\"status\":\"ok\""));
+    let mut polls = 0u64;
+    let canceled = unsafe { fcb_atlas_search_step_cancelable(fixture.handle, 7,
+        Some(cancel_after_entry), std::ptr::from_mut(&mut polls).cast()) };
+    assert!(canceled.is_null()); assert!(polls > 1);
+    assert_eq!(integer(&take(fcb_atlas_search_page(fixture.handle, 2, 0, 100)), "retained_hits"), 1);
 }

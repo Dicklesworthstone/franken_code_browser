@@ -16,6 +16,7 @@ use fcb_core::{DocumentGeneration, DocumentId};
 use crate::workspace;
 use super::*;
 use super::progressive::SearchExecution;
+use super::indexed::IndexedStructureWork;
 
 pub const MAX_ATLAS_STRUCTURE_NAME_BYTES: usize = 4096;
 pub const MAX_ATLAS_STRUCTURE_METADATA_BYTES: usize = 8 * 1024 * 1024;
@@ -52,6 +53,24 @@ impl AtlasStructureOptions {
     pub fn new(mode: AtlasStructureMode) -> Self {
         Self { mode, name_mode: if mode == AtlasStructureMode::Occurrences { SymbolNameMode::Exact }
             else { SymbolNameMode::Contains }, limits: AtlasSearchOptions::default() }
+    }
+}
+
+/// Structural extraction over an already retained index capture set. The
+/// byte budget charges complete extraction inputs, never source I/O, and may
+/// be zero. Row storage is bounded independently from captured-source residency.
+#[derive(Clone, Copy, Debug)]
+pub struct AtlasIndexedStructureOptions {
+    pub mode: AtlasStructureMode,
+    pub name_mode: SymbolNameMode,
+    pub max_matches: usize,
+    pub max_scan_bytes: u64,
+}
+impl AtlasIndexedStructureOptions {
+    pub fn new(mode: AtlasStructureMode) -> Self {
+        let live = AtlasStructureOptions::new(mode);
+        Self { mode, name_mode: live.name_mode, max_matches: live.limits.max_matches,
+            max_scan_bytes: MAX_ATLAS_SEARCH_SOURCE_BYTES as u64 }
     }
 }
 
@@ -124,6 +143,7 @@ pub(super) struct StructureWork {
     extract_id: ResourceAllocationId,
     qualification_id: ResourceAllocationId,
     io: workspace::IoCounts,
+    indexed: Option<IndexedStructureWork>,
 }
 
 impl RetainedAtlasSearch {
@@ -134,14 +154,47 @@ impl RetainedAtlasSearch {
     /// Symbols/headings reject unsupported languages explicitly. Occurrences
     /// use the declared whole-token text policy for every admitted source type.
     pub fn begin_structure(&mut self, atlas: &AtlasSession, generation: u64, needle: &str,
+        scope: AtlasSearchScope, options: AtlasStructureOptions,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
+        self.begin_structure_inner(atlas, generation, needle, scope, options, None, canceled)
+    }
+
+    /// Search selected captured sources without reopening any live path. Name
+    /// extraction is the same qualified engine used by begin_structure; gram
+    /// negatives never exclude structural candidates. Uncaptured scope members
+    /// remain pending and failed captures remain unavailable. Existing captured
+    /// result activation survives later index replacement or clearing.
+    pub fn begin_indexed_structure(&mut self, atlas: &AtlasSession, generation: u64,
+        index_generation: u64, needle: &str, scope: AtlasSearchScope,
+        options: AtlasIndexedStructureOptions, canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AtlasSearchError> {
+        let limits = AtlasSearchOptions { max_matches: options.max_matches,
+            max_files: MAX_ATLAS_SEARCH_FILES, max_file_bytes: options.mode.source_limit(),
+            max_source_bytes: MAX_ATLAS_SEARCH_SOURCE_BYTES };
+        self.begin_structure_inner(atlas, generation, needle, scope,
+            AtlasStructureOptions { mode: options.mode, name_mode: options.name_mode, limits },
+            Some((index_generation, options.max_scan_bytes)), canceled)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_structure_inner(&mut self, atlas: &AtlasSession, generation: u64, needle: &str,
         scope: AtlasSearchScope, mut options: AtlasStructureOptions,
-        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
+        indexed: Option<(u64, u64)>, mut canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AtlasSearchError> {
         self.validate(atlas)?;
         // The text-only lowercase option cannot silently change or mislabel
         // the existing case-sensitive symbol/heading-name contract.
         if !scope.case_sensitive() { return Err(AtlasSearchError::InvalidScope); }
         self.attempt(generation)?;
         options.limits.validate()?;
+        if let Some((index_generation, max_scan_bytes)) = indexed {
+            if max_scan_bytes > MAX_ATLAS_SEARCH_SOURCE_BYTES as u64 { return Err(AtlasSearchError::InvalidLimits); }
+            match self.index_generation() {
+                None => return Err(AtlasSearchError::MissingIndex),
+                Some(current) if current != index_generation => return Err(AtlasSearchError::StaleIndex),
+                Some(_) => {}
+            }
+        }
         if options.mode == AtlasStructureMode::Occurrences {
             if options.name_mode != SymbolNameMode::Exact { return Err(AtlasSearchError::InvalidLimits); }
             validate_reference_name(needle).map_err(ReaderSessionError::from)?;
@@ -155,17 +208,24 @@ impl RetainedAtlasSearch {
         let scope_bytes = if scope.is_all() { 0 } else {
             eligible_files.checked_mul(size_of::<FileId>()).ok_or(AppError::Admission)?
         };
+        let scope_bytes = scope_bytes.checked_add(if indexed.is_some() {
+            MAX_ATLAS_SEARCH_FILES * size_of::<FileId>()
+        } else { 0 }).ok_or(AppError::Admission)?;
         let capacity = options.limits.max_matches.min(options.limits.max_files);
         // Occurrence rows retain only the exact query name and no slug. One
         // source is captured at a time, so the source budget plus one file
         // covers retained captures and the in-flight capture copy. The extent
         // and reference decoder keep their own separate managed reservations.
         // Preserve the existing symbol/heading envelopes unchanged.
-        let (source_charge, metadata_limit) = if options.mode == AtlasStructureMode::Occurrences {
+        let (live_source_charge, metadata_limit) = if options.mode == AtlasStructureMode::Occurrences {
             (options.limits.max_source_bytes.checked_add(options.limits.max_file_bytes)
                 .ok_or(AppError::Admission)?,
              options.limits.max_matches.checked_mul(needle.len()).ok_or(AppError::Admission)?)
         } else { (2 * options.limits.max_source_bytes, MAX_ATLAS_STRUCTURE_METADATA_BYTES) };
+        // Shared capture pins are charged to the snapshot too, so retiring or
+        // replacing the index cannot release the accepted reader's admission.
+        let source_charge = if indexed.is_some() { usize::try_from(self.indexed_source_bytes())
+            .map_err(|_| AppError::Admission)? } else { live_source_charge };
         let charge = source_charge
             .checked_add(capacity * (size_of::<RetainedFile>() + 64))
             .and_then(|n| n.checked_add(options.limits.max_matches
@@ -179,21 +239,32 @@ impl RetainedAtlasSearch {
         let lease = self.budget.try_reserve_managed(self.manifest.owner(), state_id, ByteLength::new(charge as u64))
             .map_err(|_| AppError::Admission)?;
         let scope_files = scope.freeze(atlas, eligible_files, &mut canceled)?;
+        let (indexed, index_usage, diagnostics) = match indexed {
+            Some((index_generation, max_scan_bytes)) => {
+                let (work, usage, diagnostics) = self.prepare_structure_sources(atlas, index_generation,
+                    &scope, &scope_files, max_scan_bytes, &mut canceled)?;
+                (Some(work), Some(usage), diagnostics)
+            }
+            None => (None, None, reserve(MAX_DIAGNOSTICS)?),
+        };
+        let unavailable = index_usage.as_ref().map_or(0, IndexQueryUsage::capture_unavailable);
+        let pending = eligible_files.checked_sub(unavailable).ok_or(AtlasSearchError::WrongAtlas)?;
         let snapshot = Snapshot { generation, needle: copy_text(needle)?, expression: None,
             structure: Some(StructureQuery { mode: options.mode, name_mode: options.name_mode,
                 source_limit: options.limits.max_file_bytes, metadata_limit, metadata_bytes: 0, metadata_omitted: 0,
                 unsupported_files: 0, extraction_limited_files: 0 }),
             structure_rows: reserve(options.limits.max_matches)?, files: reserve(capacity)?,
             scope, scope_files, scope_region, eligible_files,
-            hits: reserve(options.limits.max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?,
+            hits: reserve(options.limits.max_matches)?, diagnostics,
             matched_texts: Vec::new(), matched_text_capacity: 0,
-            examined: 0, scanned: 0, unavailable: 0, pending: eligible_files,
+            examined: unavailable, scanned: 0, unavailable, pending,
             matches_seen: 0, matching_files: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0, count_all_matches: false,
             truncated: false, complete: false, stop_reason: None, step_count: 0,
-            last_step_files: 0, last_step_bytes: 0, last_step_calls: 0, index_usage: None, _lease: lease };
+            last_step_files: 0, last_step_bytes: 0, last_step_calls: 0, index_usage, _lease: lease };
+        let command = if indexed.is_some() { "begin-indexed-structure" } else { "begin-structure" };
         let work = SearchWork { snapshot, execution: SearchExecution::Structure(StructureWork {
-            options, extract_id, qualification_id, io: workspace::IoCounts::default() }) };
-        let response = self.work_response(atlas, &work, "begin-structure", &mut canceled)?;
+            options, extract_id, qualification_id, io: workspace::IoCounts::default(), indexed }) };
+        let response = self.work_response(atlas, &work, command, &mut canceled)?;
         self.validate(atlas)?; check(&mut canceled)?;
         self.pending = Some(work);
         Ok(response)
@@ -201,6 +272,13 @@ impl RetainedAtlasSearch {
 
     pub(super) fn advance_structure_work(&self, atlas: &AtlasSession, candidate: &mut Snapshot,
         work: &mut StructureWork, canceled: &mut impl FnMut() -> bool) -> Result<(), AtlasSearchError> {
+        if let Some(indexed) = &work.indexed {
+            match self.index_generation() {
+                None => return Err(AtlasSearchError::MissingIndex),
+                Some(current) if current != indexed.generation => return Err(AtlasSearchError::StaleIndex),
+                Some(_) => {}
+            }
+        }
         update_coverage(atlas, candidate, work);
         if candidate.stop_reason.is_none() { self.structure_one_file(atlas, candidate, work, canceled)?; }
         update_coverage(atlas, candidate, work);
@@ -210,12 +288,15 @@ impl RetainedAtlasSearch {
     fn structure_one_file(&self, atlas: &AtlasSession, candidate: &mut Snapshot,
         work: &mut StructureWork, canceled: &mut impl FnMut() -> bool) -> Result<(), AtlasSearchError> {
         let catalog = atlas.atlas().catalog();
-        let file = match &candidate.scope_files {
-            Some(files) => files.get(candidate.examined).copied(),
-            None => catalog.file_id(candidate.examined),
+        let file = if let Some(indexed) = &work.indexed {
+            indexed.files.get(indexed.cursor).copied()
+        } else {
+            match &candidate.scope_files {
+                Some(files) => files.get(candidate.examined).copied(),
+                None => catalog.file_id(candidate.examined),
+            }
         }.ok_or(AtlasSearchError::WrongAtlas)?;
         let entry = catalog.entry(file).ok_or(AtlasSearchError::WrongAtlas)?;
-        candidate.examined += 1;
         let language = SymbolLanguage::from_path(entry.path().raw().as_bytes());
         let supported = match work.options.mode {
             AtlasStructureMode::Symbols => language.is_some(),
@@ -223,26 +304,52 @@ impl RetainedAtlasSearch {
             AtlasStructureMode::Occurrences => true,
         };
         if !supported {
+            examine_file(candidate, work);
             candidate.structure.as_mut().ok_or(AtlasSearchError::WrongAtlas)?.unsupported_files += 1;
             candidate.unavailable(file, "STRUCTURE_UNSUPPORTED_LANGUAGE"); return Ok(());
         }
-        if entry.observed_bytes() > work.options.limits.max_file_bytes as u64 {
+        if work.indexed.is_none() && entry.observed_bytes() > work.options.limits.max_file_bytes as u64 {
+            examine_file(candidate, work);
             candidate.unavailable(file, "STRUCTURE_FILE_BYTE_LIMIT"); return Ok(());
         }
         let owner = self.manifest.owner();
-        let revision = SourceRevision::new(owner, candidate.generation)
-            .map_err(|_| AtlasSearchError::IdentityExhausted)?;
-        let request = CaptureRequest::new(file, revision).map_err(|_| AtlasSearchError::WrongAtlas)?;
-        let root = catalog.grant().root_path().to_path_buf();
-        let captured = workspace::read_capture(&root, request, entry.path(), work.options.limits.max_file_bytes,
-            work.options.limits.max_source_bytes as u64, &mut work.io, &self.budget,
-            &mut || canceled() || atlas.validate_active().is_err());
-        self.validate(atlas)?; check(canceled)?;
-        let capture = match captured {
-            Ok(capture) => capture,
-            Err(fcb::source::SourceError::Canceled) => return Err(AtlasSearchError::Canceled),
-            Err(error) => { candidate.unavailable(file, error.code()); return Ok(()); }
+        let capture = if let Some(indexed) = work.indexed.as_mut() {
+            let capture = self.structure_capture(indexed.generation, file)?;
+            if capture.bytes().len() > work.options.limits.max_file_bytes {
+                candidate.examined += 1; indexed.cursor += 1;
+                candidate.unavailable(file, "STRUCTURE_FILE_BYTE_LIMIT"); return Ok(());
+            }
+            let next_bytes = indexed.scanned_bytes.checked_add(capture.bytes().len() as u64)
+                .ok_or(AppError::Admission)?;
+            if next_bytes > indexed.max_scan_bytes {
+                // Extraction consumes whole captures. Leave this member pending
+                // when its complete input cannot be admitted, without parsing
+                // a prefix and falsely reporting an empty name inventory.
+                candidate.stop_reason = Some(AtlasSearchStop::VerificationByteLimit);
+                return Ok(());
+            }
+            indexed.scanned_bytes = next_bytes;
+            indexed.cursor += 1; candidate.examined += 1;
+            capture
+        } else {
+            examine_file(candidate, work);
+            let revision = SourceRevision::new(owner, candidate.generation)
+                .map_err(|_| AtlasSearchError::IdentityExhausted)?;
+            let request = CaptureRequest::new(file, revision).map_err(|_| AtlasSearchError::WrongAtlas)?;
+            let root = catalog.grant().root_path().to_path_buf();
+            let captured = workspace::read_capture(&root, request, entry.path(), work.options.limits.max_file_bytes,
+                work.options.limits.max_source_bytes as u64, &mut work.io, &self.budget,
+                &mut || canceled() || atlas.validate_active().is_err());
+            self.validate(atlas)?; check(canceled)?;
+            match captured {
+                Ok(capture) => capture,
+                Err(fcb::source::SourceError::Canceled) => return Err(AtlasSearchError::Canceled),
+                Err(error) => { candidate.unavailable(file, error.code()); return Ok(()); }
+            }
         };
+        // Query generations can differ from the frozen index generation. Every
+        // row and reader must preserve its actual captured source revision.
+        let revision = capture.request().revision();
         let node = atlas.atlas().node_for_file(file).map_err(AtlasSessionError::from)?;
         let before_hits = candidate.hits.len();
         let before_unavailable = candidate.unavailable;
@@ -406,10 +513,26 @@ fn is_markdown(path: &[u8]) -> bool {
     let extension = &basename[dot + 1..];
     [b"md".as_slice(), b"markdown", b"mdown", b"mkd"].iter().any(|suffix| extension.eq_ignore_ascii_case(suffix))
 }
+fn examine_file(query: &mut Snapshot, work: &mut StructureWork) {
+    query.examined += 1;
+    if let Some(indexed) = work.indexed.as_mut() { indexed.cursor += 1; }
+}
 fn update_coverage(atlas: &AtlasSession, query: &mut Snapshot, work: &StructureWork) {
     query.pending = query.eligible_files - query.examined;
     query.source_bytes_read = work.io.bytes; query.read_calls = work.io.calls;
-    query.stop_reason = if query.pending == 0 {
+    query.stop_reason = if let Some(indexed) = &work.indexed {
+        if let Some(usage) = query.index_usage.as_mut() {
+            usage.record_structure_work(query.scanned, indexed.scanned_bytes);
+        }
+        if query.stop_reason == Some(AtlasSearchStop::VerificationByteLimit) {
+            query.stop_reason
+        } else if query.truncated { Some(AtlasSearchStop::MatchLimit) }
+        else if indexed.cursor == indexed.files.len() {
+            Some(if query.pending == 0 { AtlasSearchStop::AllFilesExamined }
+                else if query.pending == indexed.outside_capture_scope { AtlasSearchStop::CaptureScope }
+                else { indexed.capture_stop })
+        } else { None }
+    } else if query.pending == 0 {
         Some(if query.truncated { AtlasSearchStop::MatchLimit } else { AtlasSearchStop::AllFilesExamined })
     } else if query.truncated {
         // Reaching capacity alone is not evidence of another match. Continue

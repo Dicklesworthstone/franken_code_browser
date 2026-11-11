@@ -63,6 +63,36 @@ char *fcb_atlas_structure_begin(uint64_t handle, uint64_t generation,
     const char *path, uint64_t max_matches, uint64_t max_files,
     uint64_t max_file_bytes, uint64_t max_source_bytes);
 
+/* Run the same qualified structural-name extraction against the exact sources
+ * already retained by index_generation. No file is reopened and no trigram
+ * negative removes a candidate: symbols, headings and occurrences inspect
+ * every selected complete capture, including gram-quota fallback captures.
+ * mode/name_mode/needle/scope follow fcb_atlas_structure_begin above.
+ * max_matches: 1..4096; max_scan_bytes: 0..32 MiB of admitted extraction input.
+ * The owning extractor's per-file cap still applies. A complete capture that
+ * cannot fit the remaining extraction budget stays pending, with terminal
+ * stop_reason=verification-byte-limit. Unsupported/oversized/refused extraction
+ * is unavailable; files outside the retained capture scope or omitted during
+ * index preparation stay pending. Narrowing scope may prove complete coverage.
+ *
+ * Admission command=begin-indexed-structure, search_strategy=retained-capture-structure.
+ * Existing structure metadata and semantic_complete=false remain authoritative.
+ * Index generation/manifest/capture scope are frozen in every receipt, even
+ * after a replacement index. verification_source_bytes counts admitted full
+ * extraction inputs; verified_files=scanned_files, skipped_by_index=0 and
+ * fallback_files=0. source_bytes_read/read_calls remain zero. Examined files
+ * also include capture-unavailable and unsupported/oversized captured members.
+ * The existing worker step/cancel/page/overlay/open_reader route is shared.
+ * Accepted hits retain their original source revision and survive index
+ * replacement or clearing; unfinished old-index queries cannot resume on new
+ * bytes. This is bounded extraction, not exhaustive compiler reference search.
+ */
+char *fcb_atlas_structure_indexed_begin(uint64_t handle, uint64_t generation,
+    uint64_t index_generation, uint64_t mode, uint64_t name_mode,
+    const char *needle, const char *extensions, const char *filenames,
+    uint64_t path_kind, const char *path, uint64_t max_matches,
+    uint64_t max_scan_bytes);
+
 #ifdef __cplusplus
 }
 #endif

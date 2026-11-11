@@ -116,6 +116,17 @@ pub(super) struct IndexedWork {
     outside_capture_scope: usize,
     unsupported_seen: usize,
 }
+/// A structural query walks only selected complete captures. Its cursor is
+/// separate from examined_files, which already includes capture failures.
+pub(super) struct IndexedStructureWork {
+    pub(super) generation: u64,
+    pub(super) files: Vec<FileId>,
+    pub(super) cursor: usize,
+    pub(super) max_scan_bytes: u64,
+    pub(super) scanned_bytes: u64,
+    pub(super) outside_capture_scope: usize,
+    pub(super) capture_stop: AtlasSearchStop,
+}
 pub(super) struct IndexQueryUsage {
     generation: u64,
     manifest: u64,
@@ -128,6 +139,11 @@ pub(super) struct IndexQueryUsage {
     capture_unavailable: usize,
 }
 impl IndexQueryUsage {
+    pub(super) fn capture_unavailable(&self) -> usize { self.capture_unavailable }
+    pub(super) fn record_structure_work(&mut self, verified: usize, scanned_bytes: u64) {
+        self.verified = verified;
+        self.scanned_bytes = scanned_bytes;
+    }
     pub(super) fn encode(&self, out: &mut Output) -> Result<(), AtlasSearchError> {
         self.capture_scope.encode(out)?;
         out.literal(",\"index_generation\":")?; out.integer(self.generation)?;
@@ -153,6 +169,52 @@ impl From<IndexError> for AtlasSearchError {
 impl RetainedAtlasSearch {
     pub fn index_generation(&self) -> Option<u64> { self.index.as_ref().map(|i| i.generation) }
     pub fn indexed_source_bytes(&self) -> u64 { self.index.as_ref().map_or(0, |i| i.engine.source_bytes()) }
+
+    /// Metadata-only admission after the structural query reserves its source,
+    /// file-ID and diagnostic envelopes. No trigram exclusion is valid for
+    /// extracted symbol names or rendered heading titles: inspect every
+    /// selected complete capture, including gram-quota fallback captures.
+    pub(super) fn prepare_structure_sources(&self, atlas: &AtlasSession, index_generation: u64,
+        scope: &AtlasSearchScope, scope_files: &Option<Vec<FileId>>, max_scan_bytes: u64,
+        canceled: &mut impl FnMut() -> bool)
+        -> Result<(IndexedStructureWork, IndexQueryUsage, Vec<Unavailable>), AtlasSearchError> {
+        let retained = self.index.as_ref().ok_or(AtlasSearchError::MissingIndex)?;
+        if retained.generation != index_generation { return Err(AtlasSearchError::StaleIndex); }
+        let mut files = reserve(retained.engine.captured_files())?;
+        let catalog = atlas.atlas().catalog();
+        for ordinal in 0..catalog.entries().len() {
+            check(canceled)?;
+            let file = catalog.file_id(ordinal).ok_or(AtlasSearchError::WrongAtlas)?;
+            if scope::includes_file(scope_files, file) && retained.engine.capture(file).is_some() {
+                files.push(file);
+            }
+        }
+        let mut capture_unavailable = 0;
+        for &file in retained.engine.unavailable_files() {
+            check(canceled)?;
+            if scope::includes_file(scope_files, file) { capture_unavailable += 1; }
+        }
+        let mut diagnostics = reserve(MAX_DIAGNOSTICS)?;
+        for diagnostic in &retained.diagnostics {
+            check(canceled)?;
+            if scope::includes_file(scope_files, diagnostic.file) {
+                diagnostics.push(Unavailable { file: diagnostic.file, reason: diagnostic.reason });
+            }
+        }
+        let outside_capture_scope = retained.capture_scope.query_members_outside(atlas, scope, canceled)?;
+        let usage = IndexQueryUsage { generation: index_generation, manifest: retained.engine.id().revision(),
+            capture_scope: retained.capture_scope.clone(), skipped: 0, verified: 0, fallback: 0,
+            scanned_bytes: 0, eligible_captured: files.len(), capture_unavailable };
+        Ok((IndexedStructureWork { generation: index_generation, files, cursor: 0, max_scan_bytes,
+            scanned_bytes: 0, outside_capture_scope, capture_stop: retained.stop }, usage, diagnostics))
+    }
+
+    pub(super) fn structure_capture(&self, index_generation: u64, file: FileId)
+        -> Result<CompleteCapture, AtlasSearchError> {
+        let retained = self.index.as_ref().ok_or(AtlasSearchError::MissingIndex)?;
+        if retained.generation != index_generation { return Err(AtlasSearchError::StaleIndex); }
+        retained.engine.capture(file).cloned().ok_or(AtlasSearchError::WrongAtlas)
+    }
 
     /// Compatibility worker call over the SAME one-file preparation pipeline.
     /// Use begin_index/step_index to yield between captured/indexed members.

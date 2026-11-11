@@ -2,7 +2,7 @@
 
 //! Dispatch only. Index preparation and queries share the registered atlas,
 //! cancellation epoch, resource owner and captured-reader activation route.
-use fcb_app::host::atlas_search::AtlasIndexOptions;
+use fcb_app::host::atlas_search::{AtlasIndexOptions, AtlasIndexedStructureOptions};
 use super::*;
 
 pub(crate) enum IndexCommand<'a> {
@@ -27,6 +27,8 @@ pub(crate) enum IndexCommand<'a> {
         scope: &'a AtlasSearchScope, max_matches: usize, max_scan_bytes: u64 },
     BeginCountedExpression { generation: u64, index_generation: u64, expression: &'a str,
         scope: &'a AtlasSearchScope, max_matches: usize, max_scan_bytes: u64 },
+    BeginStructure { generation: u64, index_generation: u64, needle: &'a str,
+        scope: &'a AtlasSearchScope, options: AtlasIndexedStructureOptions },
     Clear { generation: u64 },
 }
 impl AtlasSessions {
@@ -69,6 +71,9 @@ impl AtlasSessions {
             IndexCommand::BeginCountedExpression { generation, index_generation, expression, scope, max_matches, max_scan_bytes } =>
                 session.search.begin_indexed_expression_counted_scoped(&session.atlas, generation, index_generation,
                     expression, scope.clone(), max_matches, max_scan_bytes, &mut stop),
+            IndexCommand::BeginStructure { generation, index_generation, needle, scope, options } =>
+                session.search.begin_indexed_structure(&session.atlas, generation, index_generation,
+                    needle, scope.clone(), options, &mut stop),
             IndexCommand::Clear { generation } => session.search.clear_index(&session.atlas, generation, &mut stop),
         };
         // Epoch cancellation invalidates all paused atlas work. A terminal
