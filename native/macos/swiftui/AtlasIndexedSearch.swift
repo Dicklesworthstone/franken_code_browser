@@ -24,9 +24,10 @@ struct AtlasIndexedSearchTransport: Sendable {
     /// Expressions are parsed and verified by the shared engine. The source
     /// capture scope is unchanged; syntax filters narrow only this query.
     var expressionQueryBegin: (@Sendable (UInt64, UInt64, UInt64, String, AtlasSearchFileScope, AtlasSearchPathScope, Bool) throws -> String?)? = nil
-    /// Exact literal counting scans past the retained-row limit. Legacy
-    /// transports keep their bounded result semantics until they opt in.
+    /// Existing exact-text callers opt into counting when this capability exists.
+    /// Explicit count requests never fall back to a row-limited query.
     var countedQueryBegin: (@Sendable (UInt64, UInt64, UInt64, String, AtlasSearchFileScope, AtlasSearchPathScope, Bool) throws -> String?)? = nil
+    var countedExpressionQueryBegin: (@Sendable (UInt64, UInt64, UInt64, String, AtlasSearchFileScope, AtlasSearchPathScope, Bool) throws -> String?)? = nil
 }
 
 /// A completed retained source index, without an admitted text query. A links
@@ -109,14 +110,17 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                    access: AtlasSearchAccessLease, progress: @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport {
         guard input.mode.isTextual else { throw AtlasSearchError.invalidRequest }
         let root = input.root, query = input.query, scope = input.fileScope, pathScope = input.pathScope
-        let countAllMatches = input.mode == .text && input.caseSensitive && transport.countedQueryBegin != nil
-        if input.mode == .expression {
+        let countAllMatches = input.countsIndexedMatches(supportsCounting: transport.countedQueryBegin != nil)
+        if countAllMatches {
+            guard input.mode == .expression ? transport.countedExpressionQueryBegin != nil
+                : transport.countedQueryBegin != nil else { throw AtlasSearchError.unsupportedCounting }
+        } else if input.mode == .expression {
             guard transport.expressionQueryBegin != nil else { throw AtlasSearchError.unavailable }
         } else if !input.caseSensitive {
             guard transport.matchingQueryBegin != nil else { throw AtlasSearchError.unsupportedMatching }
-        } else if !countAllMatches && pathScope.isWorkspace {
+        } else if pathScope.isWorkspace {
             guard scope.isAll || transport.scopedQueryBegin != nil else { throw AtlasSearchError.invalidScope }
-        } else if !countAllMatches {
+        } else {
             guard transport.pathScopedQueryBegin != nil else { throw AtlasSearchError.invalidPathScope }
         }
         try check(cancellation)
@@ -140,6 +144,12 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             let basis = session.basis, owner = session.owner
             try check(cancellation)
             let began = try owner.call { handle -> String? in
+                if countAllMatches {
+                    let counted = input.mode == .expression ? transport.countedExpressionQueryBegin
+                        : transport.countedQueryBegin
+                    guard let counted else { throw AtlasSearchError.unsupportedCounting }
+                    return try counted(handle, generation, basis.index, query, scope, pathScope, input.caseSensitive)
+                }
                 if input.mode == .expression {
                     guard let expression = transport.expressionQueryBegin else { throw AtlasSearchError.unavailable }
                     return try expression(handle, generation, basis.index, query, scope, pathScope, input.caseSensitive)
@@ -147,10 +157,6 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                 if !input.caseSensitive {
                     guard let matching = transport.matchingQueryBegin else { throw AtlasSearchError.unsupportedMatching }
                     return try matching(handle, generation, basis.index, query, scope, pathScope, input.caseSensitive)
-                }
-                if countAllMatches {
-                    guard let counted = transport.countedQueryBegin else { throw AtlasSearchError.unavailable }
-                    return try counted(handle, generation, basis.index, query, scope, pathScope, true)
                 }
                 if !pathScope.isWorkspace {
                     guard let scoped = transport.pathScopedQueryBegin else { throw AtlasSearchError.invalidPathScope }

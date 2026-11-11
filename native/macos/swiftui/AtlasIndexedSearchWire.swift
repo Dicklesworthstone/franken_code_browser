@@ -298,7 +298,7 @@ struct AtlasIndexedQueryPage {
             guard pending > 0, basis.captureScope.excludedFiles > 0 else { throw AtlasIndexWire.invalid() }
         }
         if countAllMatches {
-            guard mode == .text, caseSensitive, expression == nil,
+            guard mode.isTextual,
                   matches <= basis.sourceBytes, truncated == (matches > UInt64(retained)),
                   stop != "match-limit" else { throw AtlasIndexWire.invalid() }
         }

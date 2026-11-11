@@ -8,6 +8,7 @@ import Foundation
 @_silgen_name("fixture_refuse_create") private func refuseCreate()
 @_silgen_name("fixture_expect_scope") private func expectScope(_ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?)
 @_silgen_name("fixture_expect_path") private func expectPath(_ kind: UInt64, _ path: UnsafePointer<CChar>)
+@_silgen_name("fixture_expect_counted_case") private func expectCountedCase(_ caseSensitive: UInt64)
 @_silgen_name("fixture_expect_structure") private func expectStructure(_ mode: UInt64, _ nameMode: UInt64)
 @_cdecl("fixture_mark_canceled") public func markCanceled(_ context: UnsafeMutableRawPointer?) {
     guard let context else { preconditionFailure("Missing callback lifetime") }
@@ -43,6 +44,19 @@ private final class Reports: @unchecked Sendable {
             "pending_files": String(max(0, catalogued - step)), "matches_seen": String(total),
             "retained_hits": String(total), "displayed_hits": String(total), "step_count": String(step),
             "hits": rows, "next_offset": end < total ? String(end) : NSNull()]
+    }
+    private static func countedPage(_ command: String, step: Int, start: Int = 0,
+                                    caseSensitive: Bool) -> [String: Any] {
+        var value = page(command, step: step, total: step == 0 ? 0 : 1000,
+            start: start, running: step < 2, complete: step == 2)
+        value["case_sensitive"] = caseSensitive
+        value["mode"] = AtlasSearchText.wireMode(caseSensitive: caseSensitive)
+        value["matches_seen"] = step == 2 ? "1200" : (step == 0 ? "0" : "1000")
+        value["truncated"] = step == 2
+        if !caseSensitive, let rows = value["hits"] as? [[String: Any]] {
+            value["hits"] = rows.map { row in var row = row; row["matched_text"] = "X"; return row }
+        }
+        return value
     }
     private static func importReply() -> [String: Any] {
         var reply = hit(1)
@@ -217,6 +231,43 @@ private final class Reports: @unchecked Sendable {
         check(fixtureCount(6) == fixtureCount(7), label + ": every C allocation released")
     }
     @MainActor static func main() throws {
+        for caseSensitive in [true, false] {
+            resetFixture(); expectCountedCase(caseSensitive ? 1 : 0)
+            try install(0, ["status": "ok"])
+            try install(1, countedPage("begin", step: 0, caseSensitive: caseSensitive))
+            try install(2, countedPage("step", step: 1, caseSensitive: caseSensitive))
+            for (index, start) in stride(from: 64, to: 1000, by: 128).enumerated() {
+                try install(3, countedPage("page", step: 1, start: start, caseSensitive: caseSensitive),
+                    index: UInt32(index))
+            }
+            try install(2, countedPage("step", step: 2, caseSensitive: caseSensitive), index: 1)
+            var counted: AtlasSearchReport? = try AtlasNativeSearch.runScoped(
+                input: AtlasSearchInput(root: "/project", query: "x", caseSensitive: caseSensitive, countAllMatches: true),
+                cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
+            check(counted!.complete && counted!.matchCountComplete && counted!.truncated
+                && counted!.matchesSeen == 1200 && counted!.hits.count == 1000,
+                "Both matching modes finish counting beyond the bounded retained pages")
+            check(counted!.summary.contains("1200") && counted!.summary.contains("first 1000 retained"),
+                "Live totals distinguish counted occurrences from navigable rows")
+            check(fixtureCount(14) == 1 && fixtureCount(12) == 0 && fixtureCount(4) == 8,
+                "Explicit counting routes through the counted ABI and fetches only bounded retained rows")
+            counted = nil; retired()
+            check(fixtureCount(6) == fixtureCount(7), "Counted pages release every owned C response")
+        }
+        do {
+            resetFixture()
+            try install(0, ["status": "ok"])
+            var began = page("begin", step: 0); began["count_all_matches"] = false
+            var finished = page("step", step: 1, total: 1, running: false, complete: true, catalogued: 1)
+            finished["count_all_matches"] = false; began["catalogued_files"] = "1"; began["pending_files"] = "1"
+            try install(1, began); try install(2, finished)
+            var bounded: AtlasSearchReport? = try AtlasNativeSearch.runScoped(
+                input: AtlasSearchInput(root: "/project", query: "x", countAllMatches: false),
+                cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
+            check(bounded!.complete && !bounded!.countAllMatches && fixtureCount(14) == 0,
+                "Turning counting off explicitly preserves the bounded exact-text route")
+            bounded = nil; retired()
+        }
         try setup()
         let progress = Reports()
         var terminal: AtlasSearchReport? = try AtlasNativeSearch.runProgressive(root: "/project", query: "x",

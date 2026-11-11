@@ -45,6 +45,28 @@ private enum ExpressionFixture {
         out.merge(metadata(scanned: UInt64(step * 2000)), uniquingKeysWith: { _, new in new })
         return out
     }
+    static func countedPage(_ command: String, step: Int, start: Int = 0,
+                            caseSensitive: Bool) -> [String: Any] {
+        var value = page(command, step: step, total: step == 0 ? 0 : 1000, start: start, complete: step == 2)
+        value["case_sensitive"] = caseSensitive
+        value["count_all_matches"] = true; value["match_count_complete"] = step == 2
+        value["matches_seen"] = step == 2 ? "1200" : (step == 0 ? "0" : "1000")
+        value["truncated"] = step == 2
+        if !caseSensitive, let rows = value["hits"] as? [[String: Any]] {
+            value["hits"] = rows.map { row in var row = row; row["matched_text"] = "X"; return row }
+        }
+        return value
+    }
+    static func setupCounted(caseSensitive: Bool) {
+        resetExpressionFixture(); query.withCString { expectExpression($0, caseSensitive ? 1 : 0) }
+        install(0, ["status": "ok"])
+        install(1, countedPage("begin-expression", step: 0, caseSensitive: caseSensitive))
+        install(2, countedPage("step", step: 1, caseSensitive: caseSensitive))
+        for (index, start) in stride(from: 64, to: 1000, by: 128).enumerated() {
+            install(3, countedPage("page", step: 1, start: start, caseSensitive: caseSensitive), index: UInt32(index))
+        }
+        install(2, countedPage("step", step: 2, caseSensitive: caseSensitive), index: 1)
+    }
     static func install(_ kind: UInt32, _ object: [String: Any], index: UInt32 = 0) {
         json(object).withCString { setExpressionFixture(kind, index, $0) }
     }
@@ -80,8 +102,9 @@ private enum ExpressionFixture {
         precondition(expressionFixtureCount(5) == 1 && expressionFixtureCount(6) == expressionFixtureCount(7),
             "Each live query retires once and frees every foreign response")
     }
-    private static func live() throws -> AtlasSearchReport {
-        try AtlasNativeSearch.runScoped(input: AtlasSearchInput(root: "/project", query: ExpressionFixture.query, mode: .expression),
+    private static func live(countAllMatches: Bool? = nil, caseSensitive: Bool = true) throws -> AtlasSearchReport {
+        try AtlasNativeSearch.runScoped(input: AtlasSearchInput(root: "/project", query: ExpressionFixture.query,
+            mode: .expression, caseSensitive: caseSensitive, countAllMatches: countAllMatches),
             cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
     }
     private static func metadata(_ object: [String: Any], query: String = ExpressionFixture.query,
@@ -105,11 +128,50 @@ private enum ExpressionFixture {
     }
     private static func run(_ worker: AtlasIndexedSearch, query: String = ExpressionFixture.query,
                             mode: AtlasSearchMode = .expression, caseSensitive: Bool = true,
-                            reports: IndexReports = IndexReports()) throws -> AtlasSearchReport {
-        try worker.runScoped(input: AtlasSearchInput(root: "/repo", query: query, mode: mode, caseSensitive: caseSensitive),
+                            reports: IndexReports = IndexReports(), countAllMatches: Bool? = nil) throws -> AtlasSearchReport {
+        try worker.runScoped(input: AtlasSearchInput(root: "/repo", query: query, mode: mode,
+            caseSensitive: caseSensitive, countAllMatches: countAllMatches),
             cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: reports.offer)
     }
     static func main() throws {
+        for caseSensitive in [true, false] {
+            ExpressionFixture.setupCounted(caseSensitive: caseSensitive)
+            var counted: AtlasSearchReport? = try live(countAllMatches: true, caseSensitive: caseSensitive)
+            precondition(counted!.complete && counted!.countAllMatches && counted!.matchCountComplete
+                && counted!.truncated && counted!.matchesSeen == 1200 && counted!.hits.count == 1000,
+                "Live expressions count verified primary occurrences beyond retained rows in both case modes")
+            precondition(expressionFixtureCount(15) == 1 && expressionFixtureCount(4) == 8,
+                "Counted expressions use the additive ABI and ordinary bounded pages")
+            counted = nil; retireLive()
+
+            let fixture = IndexedFixture()
+            fixture.configure { $0.expressionExcluded = 1; $0.hitCount = 1000; $0.countedMatches = 2500 }
+            let indexed = try run(AtlasIndexedSearch(transport: fixture.countedTransport),
+                caseSensitive: caseSensitive, countAllMatches: true)
+            precondition(indexed.complete && indexed.matchCountComplete && indexed.truncated
+                && indexed.matchesSeen == 2500 && indexed.hits.count == 1000 && indexed.expression?.excludedFiles == 1,
+                "Captured expression counts retain their predicate evidence and bounded primary rows")
+        }
+        do {
+            let fixture = IndexedFixture(); var transport = fixture.countedTransport
+            transport.countedExpressionQueryBegin = nil
+            do { _ = try run(AtlasIndexedSearch(transport: transport), countAllMatches: true)
+                preconditionFailure("Counted expression silently used the bounded route")
+            } catch AtlasSearchError.unsupportedCounting { }
+            precondition(fixture.count("create:") == 0)
+        }
+        ExpressionFixture.setupCounted(caseSensitive: true)
+        var noProof = ExpressionFixture.countedPage("step", step: 1, caseSensitive: true)
+        noProof["search_in_progress"] = false; noProof["stop_reason"] = "verification-byte-limit"
+        ExpressionFixture.install(2, noProof)
+        var partialCount: AtlasSearchReport? = try live(countAllMatches: true)
+        precondition(!partialCount!.complete && !partialCount!.matchCountComplete
+            && partialCount!.summary.contains("Partial search"), "Predicate scan limits never prove an exact count")
+        partialCount = nil; retireLive()
+        ExpressionFixture.setupCounted(caseSensitive: true); cancelExpressionStep()
+        do { _ = try live(countAllMatches: true); preconditionFailure("Canceled counted expression published") }
+        catch AtlasSearchError.canceled { }
+        retireLive()
         let admitted = try metadata(ExpressionFixture.metadata())!
         let progressed = try metadata(ExpressionFixture.metadata(scanned: 20))!
         precondition(progressed.advances(admitted) && !admitted.advances(progressed))

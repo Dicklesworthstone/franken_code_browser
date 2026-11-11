@@ -54,6 +54,12 @@ import Foundation
         check(try t.expressionQueryBegin!(h, 53, 1, expression, AtlasSearchFileScope(extensions: ["rs"]),
             AtlasSearchPathScope(kind: .directory, path: "src"), false) != nil)
         check(live() == 0 && calls() == beforeExpressions + 2)
+        let beforeExpandedCounts = calls()
+        check(try t.countedQueryBegin!(h, 60, 1, "exact text", .all, .workspace, false) != nil)
+        check(try t.countedExpressionQueryBegin!(h, 62, 1, expression, .all, .workspace, true) != nil)
+        check(try t.countedExpressionQueryBegin!(h, 63, 1, expression, AtlasSearchFileScope(extensions: ["rs"]),
+            AtlasSearchPathScope(kind: .directory, path: "src"), false) != nil)
+        check(live() == 0 && calls() == beforeExpandedCounts + 3)
         let beforeCounts = calls()
         check(try t.countedQueryBegin!(h, 54, 1, "exact text", .all, .workspace, true) != nil)
         check(try t.countedQueryBegin!(h, 55, 1, "exact text", AtlasSearchFileScope(extensions: ["rs"]),

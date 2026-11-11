@@ -33,6 +33,12 @@ private func beginExpressionSearch(_ handle: UInt64, _ generation: UInt64, _ que
     _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ caseSensitive: UInt64,
     _ maxMatches: UInt64, _ maxFiles: UInt64, _ maxFileBytes: UInt64,
     _ maxSourceBytes: UInt64, _ maxScanBytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_search_begin_counted_expression")
+private func beginCountedExpressionSearch(_ handle: UInt64, _ generation: UInt64, _ query: UnsafePointer<CChar>?,
+    _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
+    _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ caseSensitive: UInt64,
+    _ maxMatches: UInt64, _ maxFiles: UInt64, _ maxFileBytes: UInt64,
+    _ maxSourceBytes: UInt64, _ maxScanBytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_structure_begin")
 private func beginStructureSearch(_ handle: UInt64, _ generation: UInt64, _ mode: UInt64, _ nameMode: UInt64,
     _ query: UnsafePointer<CChar>?, _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
@@ -100,6 +106,11 @@ enum AtlasNativeSearch {
                     pathScope.withCString { kind, path in
                         owner.call { handle in
                             if input.mode == .expression {
+                                if input.countsLiveMatches {
+                                    return beginCountedExpressionSearch(handle, 1, queryPointer, extensions, filenames,
+                                        kind, path, input.caseSensitive ? 1 : 0, 1000, 4096,
+                                        1024 * 1024, 32 * 1024 * 1024, AtlasSearchExpression.scanLimit)
+                                }
                                 return beginExpressionSearch(handle, 1, queryPointer, extensions, filenames,
                                     kind, path, input.caseSensitive ? 1 : 0, 1000, 4096,
                                     1024 * 1024, 32 * 1024 * 1024, AtlasSearchExpression.scanLimit)
@@ -109,13 +120,13 @@ enum AtlasNativeSearch {
                                     queryPointer, extensions, filenames, kind, path,
                                     1000, 4096, 1024 * 1024, 32 * 1024 * 1024)
                             }
+                            if input.countsLiveMatches {
+                                return beginCountedMatchingSearch(handle, 1, queryPointer, extensions, filenames,
+                                    kind, path, input.caseSensitive ? 1 : 0, 1000, 4096, 1024 * 1024, 32 * 1024 * 1024)
+                            }
                             if !input.caseSensitive {
                                 return beginMatchingSearch(handle, 1, queryPointer, extensions, filenames,
                                     kind, path, 0, 1000, 4096, 1024 * 1024, 32 * 1024 * 1024)
-                            }
-                            if input.mode == .text {
-                                return beginCountedMatchingSearch(handle, 1, queryPointer, extensions, filenames,
-                                    kind, path, 1, 1000, 4096, 1024 * 1024, 32 * 1024 * 1024)
                             }
                             if !pathScope.isWorkspace {
                                 return beginPathScopedSearch(handle, 1, queryPointer, extensions, filenames,
@@ -129,7 +140,8 @@ enum AtlasNativeSearch {
                 }
             }, cancellation)
             var stream = SearchStream(query: query, scope: scope, pathScope: pathScope,
-                mode: input.mode, nameMode: input.nameMode, caseSensitive: input.caseSensitive)
+                mode: input.mode, nameMode: input.nameMode, caseSensitive: input.caseSensitive,
+                countAllMatches: input.countsLiveMatches)
             var lastPublished: TimeInterval? = nil
             var publishedHits = 0
             while true {
@@ -263,6 +275,7 @@ private struct SearchStream {
     let mode: AtlasSearchMode
     let nameMode: AtlasSearchNameMode
     let caseSensitive: Bool
+    let countAllMatches: Bool
     let id = UUID()
     private var identity: [String]?
     private var state: SearchState?
@@ -272,10 +285,12 @@ private struct SearchStream {
     private var retainedTextBytes = 0
     private var retainedExcerptBytes = 0
     init(query: String, scope: AtlasSearchFileScope, pathScope: AtlasSearchPathScope,
-         mode: AtlasSearchMode, nameMode: AtlasSearchNameMode, caseSensitive: Bool = true) {
+         mode: AtlasSearchMode, nameMode: AtlasSearchNameMode, caseSensitive: Bool = true,
+         countAllMatches: Bool) {
         self.query = query; self.scope = scope; self.pathScope = pathScope
         self.mode = mode; self.nameMode = nameMode
         self.caseSensitive = caseSensitive
+        self.countAllMatches = countAllMatches
     }
     var count: Int { hits.count }
     var retained: Int { state?.retained ?? 0 }
@@ -374,7 +389,7 @@ private struct SearchStream {
             caseSensitive: caseSensitive, mode: mode, importReader: AtlasNativeSearch.importReader)
         return AtlasSearchReport(hits: hits, complete: state.complete, truncated: state.truncated,
             unavailableFiles: state.unavailable, unsupportedFiles: state.structureCoverage?.unsupportedFiles ?? 0, matchesSeen: state.matches,
-            countAllMatches: mode == .text && caseSensitive,
+            countAllMatches: countAllMatches,
             matchCountComplete: state.complete,
             progress: AtlasSearchProgress(isRunning: state.running, examinedFiles: state.examined,
                 cataloguedFiles: state.eligible), streamID: id, capture: capture,
@@ -420,8 +435,8 @@ private struct SearchStream {
         let retained = try count(page.retained_hits, max: 1000)
         let matches = try number(page.matches_seen)
         let steps = try count(page.step_count, max: 4097)
-        let countedExact = mode == .text && caseSensitive
-        guard (page.count_all_matches ?? false) == countedExact,
+        guard (page.count_all_matches ?? false) == countAllMatches,
+              !countAllMatches || page.match_count_complete != nil,
               (page.match_count_complete ?? page.search_complete) == page.search_complete,
               pending == eligible - examined, matches >= UInt64(retained),
               try number(page.displayed_hits) == UInt64(retained),
@@ -444,7 +459,7 @@ private struct SearchStream {
                   page.completeness_basis == nil, page.structure_file_byte_limit == nil,
                   page.unsupported_structure_files == nil, page.extraction_limited_files == nil,
                   page.structure_metadata_omitted == nil, page.structure_metadata_bytes == nil,
-                  matches <= (countedExact ? UInt64(32 * 1024 * 1024) : 1001) else { throw invalid() }
+                  matches <= (countAllMatches ? UInt64(32 * 1024 * 1024) : 1001) else { throw invalid() }
             structureCoverage = nil
         } else {
             guard page.requested_mode == mode.rawValue, page.realized_mode == mode.evidence,
@@ -472,7 +487,7 @@ private struct SearchStream {
         if let stop = page.stop_reason {
             guard ["all-files-examined", "file-limit", "source-byte-limit", "match-limit", "verification-byte-limit"].contains(stop) else { throw invalid() }
         }
-        if countedExact {
+        if countAllMatches {
             guard page.stop_reason != "match-limit",
                   page.truncated == (matches > UInt64(retained)) else { throw invalid() }
         } else if mode.isTextual {
@@ -482,7 +497,7 @@ private struct SearchStream {
         if page.search_complete {
             guard !page.search_in_progress, page.discovery_complete, pending == 0,
                   unavailable == 0,
-                  countedExact ? (page.match_count_complete == true) : (!page.truncated && matches == UInt64(retained))
+                  countAllMatches ? (page.match_count_complete == true) : (!page.truncated && matches == UInt64(retained))
                   else { throw invalid() }
             if let coverage = structureCoverage {
                 guard coverage.unsupportedFiles == 0, coverage.extractionLimitedFiles == 0,

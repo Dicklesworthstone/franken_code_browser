@@ -7,7 +7,7 @@
 
 static char *responses[5][8]; // open, begin, step, page, captured reader import
 static unsigned cursors[5];
-static _Atomic unsigned counts[15]; // create/open/begin/step/page/close/alloc/free/import/scoped-begin/path-begin/structure-begin/matching-begin/expression-begin/counted-begin
+static _Atomic unsigned counts[16]; // create/open/begin/step/page/close/alloc/free/import/scoped-begin/path-begin/structure-begin/matching-begin/expression-begin/counted-begin/counted-expression
 static int cancel_step, refuse_create;
 static char expected_extensions[1025], expected_filenames[1025];
 static int expected_all;
@@ -15,7 +15,7 @@ static uint64_t expected_path_kind;
 static char expected_path[4097];
 static uint64_t expected_mode, expected_name_mode;
 static char expected_expression[1025];
-static uint64_t expected_expression_case;
+static uint64_t expected_expression_case, expected_counted_case;
 extern void fixture_mark_canceled(void *);
 
 void fixture_reset(void) {
@@ -23,18 +23,18 @@ void fixture_reset(void) {
         for (unsigned j = 0; j < 8; ++j) { free(responses[i][j]); responses[i][j] = NULL; }
         cursors[i] = 0;
     }
-    for (unsigned i = 0; i < 15; ++i) atomic_store(&counts[i], 0);
+    for (unsigned i = 0; i < 16; ++i) atomic_store(&counts[i], 0);
     expected_extensions[0] = expected_filenames[0] = 0;
     expected_all = 1; expected_path_kind = 0; expected_path[0] = 0;
     cancel_step = refuse_create = 0;
     expected_mode = expected_name_mode = 0;
-    expected_expression[0] = 0; expected_expression_case = 1;
+    expected_expression[0] = 0; expected_expression_case = expected_counted_case = 1;
 }
 void fixture_set(unsigned kind, unsigned index, const char *text) {
     assert(kind < 5 && index < 8);
     free(responses[kind][index]); responses[kind][index] = strdup(text);
 }
-unsigned fixture_count(unsigned key) { assert(key < 15); return atomic_load(&counts[key]); }
+unsigned fixture_count(unsigned key) { assert(key < 16); return atomic_load(&counts[key]); }
 void fixture_expect_scope(const char *extensions, const char *filenames) {
     if (!extensions || !filenames) {
         assert(!extensions && !filenames); expected_all = 1; return;
@@ -54,6 +54,9 @@ void fixture_expect_structure(uint64_t mode, uint64_t name_mode) {
 void fixture_expect_expression(const char *expression, uint64_t case_sensitive) {
     assert(expression && strlen(expression) <= 1024 && case_sensitive <= 1);
     strcpy(expected_expression, expression); expected_expression_case = case_sensitive;
+}
+void fixture_expect_counted_case(uint64_t case_sensitive) {
+    assert(case_sensitive <= 1); expected_counted_case = case_sensitive;
 }
 static void check_scope(const char *extensions, const char *filenames) {
     if (expected_all) { assert(!extensions && !filenames); }
@@ -113,7 +116,7 @@ char *fcb_atlas_search_begin_counted_matching(uint64_t handle, uint64_t generati
                                      const char *extensions, const char *filenames,
                                      uint64_t path_kind, const char *path, uint64_t case_sensitive,
                                      uint64_t matches, uint64_t files, uint64_t file_bytes, uint64_t source_bytes) {
-    assert(case_sensitive == 1); ++counts[14];
+    assert(case_sensitive == expected_counted_case); ++counts[14];
     if (path_kind != 0) {
         return fcb_atlas_search_begin_path_scoped(handle, generation, query, extensions, filenames,
             path_kind, path, matches, files, file_bytes, source_bytes);
@@ -147,6 +150,15 @@ char *fcb_atlas_search_begin_expression(uint64_t handle, uint64_t generation, co
     else { assert(path && !strcmp(path, expected_path)); }
     ++counts[13];
     return fcb_atlas_search_begin(handle, generation, expression, matches, files, file_bytes, source_bytes);
+}
+char *fcb_atlas_search_begin_counted_expression(uint64_t handle, uint64_t generation, const char *expression,
+                                              const char *extensions, const char *filenames,
+                                              uint64_t path_kind, const char *path, uint64_t case_sensitive,
+                                              uint64_t matches, uint64_t files, uint64_t file_bytes,
+                                              uint64_t source_bytes, uint64_t scan_bytes) {
+    ++counts[15];
+    return fcb_atlas_search_begin_expression(handle, generation, expression, extensions, filenames,
+        path_kind, path, case_sensitive, matches, files, file_bytes, source_bytes, scan_bytes);
 }
 char *fcb_atlas_search_step_cancelable(uint64_t handle, uint64_t generation,
                                      int32_t (*poll)(void *), void *context) {

@@ -10,8 +10,10 @@ import Dispatch
     }
     @MainActor private static func run(_ worker: AtlasIndexedSearch, query: String = "x", root: String = "/repo",
                                       access: AnyObject? = nil, flag: AtlasSearchCancellation = AtlasSearchCancellation(),
-                                      reports: IndexReports = IndexReports(), caseSensitive: Bool = true) throws -> AtlasSearchReport {
-        try worker.runScoped(input: AtlasSearchInput(root: root, query: query, caseSensitive: caseSensitive),
+                                      reports: IndexReports = IndexReports(), caseSensitive: Bool = true,
+                                      countAllMatches: Bool? = nil) throws -> AtlasSearchReport {
+        try worker.runScoped(input: AtlasSearchInput(root: root, query: query, caseSensitive: caseSensitive,
+            countAllMatches: countAllMatches),
             cancellation: flag, access: AtlasSearchAccessLease(access), progress: reports.offer)
     }
     @MainActor private static func scoped(_ worker: AtlasIndexedSearch, scope: AtlasSearchFileScope,
@@ -224,6 +226,68 @@ import Dispatch
     }
     @MainActor static func main() throws {
         try countedSearch()
+        for caseSensitive in [true, false] {
+            let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.countedTransport)
+            f.configure { $0.hitCount = 1000; $0.countedMatches = 2500 }
+            let reports = IndexReports()
+            let counted = try run(w, reports: reports, caseSensitive: caseSensitive, countAllMatches: true)
+            check(counted.complete && counted.matchCountComplete && counted.countAllMatches && counted.truncated,
+                "A complete count remains complete when retained navigation rows are capped")
+            check(counted.matchesSeen == 2500 && counted.hits.count == 1000 && f.count("page:") > 0,
+                "Totals exceed the row cap without retaining or fetching extra rows")
+            check(counted.summary.contains("2500") && counted.summary.contains("first 1000 retained")
+                && !counted.summary.contains("Partial search"),
+                "The summary separates an exact total from the retained page limit")
+            check(reports.values.filter { $0.indexStatus?.building == false }.allSatisfy {
+                $0.countAllMatches && !$0.matchCountComplete
+            }, "Running counts never claim a complete total")
+            let target = counted.capture!.target(counted.hits[0])!
+            let bounded = try run(w, caseSensitive: caseSensitive, countAllMatches: false)
+            check(bounded.indexStatus?.reused == true && !bounded.countAllMatches
+                && f.count("build-begin:") == 1 && f.count("query-counted:true") == 1
+                && f.count("query-counted:false") == 1,
+                "Changing the count policy reuses captures and admits a fresh bounded query")
+            _ = try target.openReader(100)
+            check(f.count("source:") == 1 && f.count("open:") == 1,
+                "Earlier counted results retain capture-bound activation after a policy change")
+        }
+        for defect in ["missing-policy", "changed-policy", "missing-completeness", "false-completeness",
+                       "truncation", "count-overflow", "match-stop"] {
+            let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.countedTransport)
+            f.configure { $0.hitCount = 1000; $0.countedMatches = 2500 }
+            f.patch { phase, original in
+                var value = original
+                guard phase == "query-step" else { return value }
+                switch defect {
+                case "missing-policy": value.removeValue(forKey: "count_all_matches")
+                case "changed-policy": value["count_all_matches"] = false
+                case "missing-completeness": value.removeValue(forKey: "match_count_complete")
+                case "false-completeness": value["match_count_complete"] = true
+                case "truncation": value["truncated"] = false
+                case "count-overflow": value["matches_seen"] = "18446744073709551615"
+                default: value["stop_reason"] = "match-limit"; value["search_in_progress"] = false
+                }
+                return value
+            }
+            do { _ = try run(w, countAllMatches: true); preconditionFailure("Accepted invalid count proof: " + defect) }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        do {
+            let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.countedTransport)
+            f.configure { $0.unavailable = 1; $0.hitCount = 1000; $0.countedMatches = 2500 }
+            let partial = try run(w, countAllMatches: true)
+            check(!partial.complete && !partial.matchCountComplete && partial.matchesSeen == 2500
+                && partial.summary.contains("Partial search") && partial.summary.contains("2500"),
+                "Unavailable captures keep counted totals explicitly partial")
+        }
+        do {
+            let f = IndexedFixture(); var transport = f.countedTransport
+            transport.countedQueryBegin = nil
+            do { _ = try run(AtlasIndexedSearch(transport: transport), countAllMatches: true)
+                preconditionFailure("A counted request silently used a legacy row-limited query")
+            } catch AtlasSearchError.unsupportedCounting { checks += 1 }
+            check(f.count("create:") == 0, "Unsupported count policy is refused before discovery or capture")
+        }
         do {
             let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport)
             f.configure { $0.hitCount = 70 }

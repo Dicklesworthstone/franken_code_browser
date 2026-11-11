@@ -104,9 +104,14 @@ final class IndexedFixture: @unchecked Sendable {
     var countedTransport: AtlasIndexedSearchTransport {
         var transport = self.transport
         transport.countedQueryBegin = { h, g, index, needle, scope, pathScope, caseSensitive in
-            precondition(index == 1 && caseSensitive)
+            precondition(index == 1)
             return try self.response("query-begin", h, generation: g, needle: needle, scope: scope,
                 pathScope: pathScope, caseSensitive: caseSensitive, countAllMatches: true)
+        }
+        transport.countedExpressionQueryBegin = { h, g, index, expression, scope, pathScope, caseSensitive in
+            precondition(index == 1)
+            return try self.response("query-begin", h, generation: g, scope: scope,
+                pathScope: pathScope, caseSensitive: caseSensitive, countAllMatches: true, expression: expression)
         }
         return transport
     }

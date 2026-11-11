@@ -94,6 +94,10 @@ char *fcb_atlas_search_indexed_begin_counted_matching(uint64_t h, uint64_t g, ui
                                                     const char *extensions, const char *filenames,
                                                     uint64_t path_kind, const char *path, uint64_t case_sensitive,
                                                     uint64_t hits, uint64_t bytes) {
+    if (g == 60) {
+        assert(case_sensitive == 0 && !extensions && !filenames && path_kind == 0 && !path);
+        return fcb_atlas_search_indexed_begin(h, 44, index, needle, hits, bytes);
+    }
     assert(case_sensitive == 1);
     if (g == 54) {
         assert(!extensions && !filenames && path_kind == 0 && !path);
@@ -124,6 +128,14 @@ char *fcb_atlas_search_indexed_begin_expression(uint64_t h, uint64_t g, uint64_t
         assert(extensions && !strcmp(extensions, "rs") && filenames && !filenames[0]);
     }
     ++calls; return result();
+}
+char *fcb_atlas_search_indexed_begin_counted_expression(uint64_t h, uint64_t g, uint64_t index, const char *expression,
+                                                      const char *extensions, const char *filenames,
+                                                      uint64_t path_kind, const char *path, uint64_t case_sensitive,
+                                                      uint64_t hits, uint64_t bytes) {
+    assert(g == 62 || g == 63);
+    return fcb_atlas_search_indexed_begin_expression(h, g == 62 ? 52 : 53, index, expression,
+        extensions, filenames, path_kind, path, case_sensitive, hits, bytes);
 }
 char *fcb_atlas_search_step_cancelable(uint64_t h, uint64_t g, int32_t (*poll)(void *), void *ctx) {
     assert(h == handle && g == 44); ++calls; poll_now(poll, ctx); return result();

@@ -31,6 +31,17 @@ import Foundation
         check(empty.summary.hasPrefix("No exact matches"), "complete empty copy")
         let positive = try decode(envelope([hit()]))
         check(positive.complete && positive.hits.count == 1, "ordinary exact result")
+        let counted = AtlasSearchReport(hits: positive.hits, complete: true, truncated: true,
+            unavailableFiles: 0, unsupportedFiles: 0, matchesSeen: 3,
+            countAllMatches: true, matchCountComplete: true)
+        check(counted.summary.contains("3 exact matches") && counted.summary.contains("first 1 retained")
+            && !counted.summary.contains("Partial search"),
+            "Total-count wording and pluralization are independent of the retained row count")
+        let countedPartial = AtlasSearchReport(hits: positive.hits, complete: false, truncated: true,
+            unavailableFiles: 1, unsupportedFiles: 0, matchesSeen: 3,
+            countAllMatches: true, matchCountComplete: false)
+        check(countedPartial.summary.contains("3 exact matches counted") && countedPartial.summary.contains("More matches may exist"),
+            "An incomplete count is shown as a lower bound, never as an exact total")
         check(positive.hits[0].sourcePath == "src/a.rs", "native path decoded")
         check(positive.hits[0].start == 2 && positive.hits[0].end == 8, "exact offset domain")
         check(positive.hits[0].captureSHA256 == nil, "legacy results cannot claim exact capture identity")
@@ -234,6 +245,28 @@ import Foundation
             unavailableFiles: 0, unsupportedFiles: 0, matchesSeen: 0, pathScope: exactFile)
         check(pathReport.summary.contains("selected file") && pathReport.summary.contains("src/core/lib.rs"),
             "A file-scoped negative describes only that file")
+        let legacyPolicy = try AtlasSearchInput(root: "/project", query: "x")
+        check(legacyPolicy.countsLiveMatches && !legacyPolicy.countsIndexedMatches(supportsCounting: false)
+            && legacyPolicy.countsIndexedMatches(supportsCounting: true),
+            "Omitted count choice preserves exact counting for capable routes and bounded legacy transports")
+        for enabled in [true, false] {
+            let input = try AtlasSearchInput(root: "/project", query: "x", countAllMatches: enabled)
+            check(input.countsLiveMatches == enabled && input.countsIndexedMatches(supportsCounting: true) == enabled,
+                "Explicit count policy is frozen for either source mode")
+            do { try input.requireLegacyScope(); preconditionFailure("Legacy adapter discarded count policy") }
+            catch AtlasSearchError.unsupportedCounting { checks += 1 }
+        }
+        let countedExpression = try AtlasSearchInput(root: "/project", query: "x required",
+            mode: .expression, caseSensitive: false, countAllMatches: true)
+        check(countedExpression.countsLiveMatches && countedExpression.countsIndexedMatches(supportsCounting: true),
+            "Expressions and Unicode lowercase text can request full counts")
+        let structuralCount = try AtlasSearchInput(root: "/project", query: "name", mode: .symbols, countAllMatches: true)
+        check(!structuralCount.countsLiveMatches && !structuralCount.countsIndexedMatches(supportsCounting: true),
+            "Inactive text count preference cannot alter structural searches")
+        let countedContext = AtlasSearchContext(root: "/project", query: "x", loadGeneration: UUID(),
+            atlasRevision: UUID(), scope: "all", customExtensions: "", countAllMatches: true)
+        var boundedContext = countedContext; boundedContext.countAllMatches = false
+        check(!countedContext.matches(boundedContext), "Changing count policy revokes stale row and frame authority")
         let insensitive = try AtlasSearchInput(root: "/project", query: "İ", caseSensitive: false)
         check(!insensitive.caseSensitive && insensitive.query.utf8.elementsEqual("İ".utf8),
             "Match Case changes matching policy without transforming query bytes")

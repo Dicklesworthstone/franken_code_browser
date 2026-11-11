@@ -243,6 +243,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     @State private var searchMode: AtlasSearchMode = .text
     @State private var searchNameMode: AtlasSearchNameMode = .contains
     @State private var searchCaseSensitive = true
+    @State private var searchCountAllMatches = true
     @State private var resolvedMatches: [SearchHit.ID: AtlasMatch] = [:]
     @State private var searchRows: [CGRect] = []
     @State private var searchPaths: Set<String> = []
@@ -420,7 +421,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 ? (currentVisibleSearch?.snapshot.id.uuidString ?? "")
                 : (searchPathKind == .workspace ? "" : searchPathInput),
             mode: searchMode, nameMode: searchMode.effectiveNameMode(searchNameMode),
-            caseSensitive: effectiveSearchCaseSensitive)
+            caseSensitive: effectiveSearchCaseSensitive, countAllMatches: effectiveSearchCountAllMatches)
     }
 
     // Observe byte-distinct edits without duplicating an arbitrarily large
@@ -453,11 +454,13 @@ private struct AtlasFrozenViewportSearch: Sendable {
         !loadingProject && (searchReport?.indexStatus != nil) == wantsCapturedIndex
             && searchReport?.mode == searchMode
             && searchReport?.caseSensitive == effectiveSearchCaseSensitive
+            && searchReport?.countAllMatches == effectiveSearchCountAllMatches
             && searchPresentation?.isCurrent(in: searchContext) == true
     }
 
     private var wantsCapturedIndex: Bool { searchMode.isTextual && useCapturedIndex }
     private var effectiveSearchCaseSensitive: Bool { !searchMode.isTextual || searchCaseSensitive }
+    private var effectiveSearchCountAllMatches: Bool { searchMode.isTextual && searchCountAllMatches }
     private var overlayIsCurrent: Bool {
         searchIsCurrent && overlayContentRevision == atlasResidency.contentRevision
     }
@@ -668,6 +671,12 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 clearSearch()
                 // The captured source index is independent of query case.
                 // Keep it; only replace the query and its visible authority.
+                runSearch(debounce: true)
+            }
+        }
+        .onChange(of: searchCountAllMatches) { _, _ in
+            if searchMode.isTextual {
+                clearSearch()
                 runSearch(debounce: true)
             }
         }
@@ -927,6 +936,12 @@ private struct AtlasFrozenViewportSearch: Sendable {
                     .disabled(loadingProject || root.isEmpty)
                     .help("When off, compare using Unicode lowercase. Results retain the original source spelling and byte ranges.")
                     .padding(.horizontal, 10).padding(.top, 6)
+                Toggle("Count all matches", isOn: $searchCountAllMatches)
+                    .toggleStyle(.checkbox)
+                    .font(.caption)
+                    .disabled(loadingProject || root.isEmpty)
+                    .help("Continue counting after the first 1,000 results. Source and scan limits still apply; incomplete totals are labeled partial.")
+                    .padding(.horizontal, 10).padding(.top, 4)
             }
             if searchMode.supportsNameMatching {
                 Picker("Name matching", selection: $searchNameMode) {
@@ -2075,6 +2090,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
         resolvedMatches = [:]; searchRows = []; searchPaths = []; selectedMatch = nil
         guard let report = searchReport, (report.indexStatus != nil) == wantsCapturedIndex,
               report.mode == searchMode, report.caseSensitive == effectiveSearchCaseSensitive,
+              report.countAllMatches == effectiveSearchCountAllMatches,
               !loadingProject, canRebind else { return }
         prepareSearchOverlay(report, context: searchContext, retainingReportID: reportID)
         selectedMatch = selectedHit.flatMap { row in
@@ -2222,7 +2238,8 @@ private struct AtlasFrozenViewportSearch: Sendable {
             let input = try AtlasSearchInput(root: requestedRoot, query: requestedText,
                 fileScope: fileScope.searchScope(custom: customExtensions),
                 pathScope: pathScope,
-                mode: searchMode, nameMode: searchMode.effectiveNameMode(searchNameMode), caseSensitive: effectiveSearchCaseSensitive)
+                mode: searchMode, nameMode: searchMode.effectiveNameMode(searchNameMode),
+                caseSensitive: effectiveSearchCaseSensitive, countAllMatches: effectiveSearchCountAllMatches)
             clearSearch()
             searchPending = true
             searchTitle = input.pathScope.isVisible ? "Searching frozen atlas files" : "Searching project"

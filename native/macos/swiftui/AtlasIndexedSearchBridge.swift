@@ -36,6 +36,11 @@ private func indexedCountedQueryBegin(_ h: UInt64, _ g: UInt64, _ index: UInt64,
     _ text: UnsafePointer<CChar>?, _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
     _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ caseSensitive: UInt64,
     _ hits: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_search_indexed_begin_counted_expression")
+private func indexedCountedExpressionQueryBegin(_ h: UInt64, _ g: UInt64, _ index: UInt64,
+    _ text: UnsafePointer<CChar>?, _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
+    _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ caseSensitive: UInt64,
+    _ hits: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_search_page") private func indexedPage(_ h: UInt64, _ g: UInt64,
     _ start: UInt64, _ count: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_index_open_reader") private func indexedReader(_ h: UInt64, _ reader: UInt64,
@@ -101,6 +106,15 @@ extension AtlasIndexedSearchTransport {
                 try pathScope.withCString { kind, path in
                     try take(indexedCountedQueryBegin(h, g, index, text, extensions, filenames,
                         kind, path, caseSensitive ? 1 : 0, 1000, 32 * 1024 * 1024))
+                }
+            }
+        }
+    }, countedExpressionQueryBegin: { h, g, index, query, scope, pathScope, caseSensitive in
+        try query.withCString { text in
+            try scope.withCStrings { extensions, filenames in
+                try pathScope.withCString { kind, path in
+                    try take(indexedCountedExpressionQueryBegin(h, g, index, text, extensions, filenames,
+                        kind, path, caseSensitive ? 1 : 0, 1000, AtlasSearchExpression.scanLimit))
                 }
             }
         }

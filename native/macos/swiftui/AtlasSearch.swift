@@ -296,7 +296,7 @@ struct AtlasSearchStructureCoverage: Equatable, Sendable {
 }
 
 enum AtlasSearchError: Error, Sendable {
-    case unavailable, invalidResponse, canceled, invalidRequest, invalidScope, invalidPathScope, invalidVisibleScope, identityExhausted, unsupportedMatching
+    case unavailable, invalidResponse, canceled, invalidRequest, invalidScope, invalidPathScope, invalidVisibleScope, identityExhausted, unsupportedMatching, unsupportedCounting
     case query(String)
     var message: String {
         switch self {
@@ -307,6 +307,7 @@ enum AtlasSearchError: Error, Sendable {
         case .invalidPathScope: return "Enter a project-relative file or folder path of 1–4096 UTF-8 bytes. Do not use leading/trailing slashes, empty components, or '.'/'..' components."
         case .identityExhausted: return "This search session exhausted its request identities. Reopen the window before searching again."
         case .unsupportedMatching: return "This search connection does not support case-insensitive text. Turn on Match case to search."
+        case .unsupportedCounting: return "This search connection cannot honor the requested count policy. Reconnect to search."
         case .unavailable: return "Search unavailable. The project could not be read or the search exceeded its limits."
         case .invalidResponse: return "Search response could not be read. Results are unavailable, not an empty match set."
         case .query(let code):
@@ -376,12 +377,13 @@ struct AtlasSearchReport: Sendable {
     }
     private var resultSummary: String {
         let count = hits.count
+        let nounCount = countAllMatches ? matchesSeen : UInt64(count)
         let noun: String
         switch mode {
         case .text:
-            noun = caseSensitive ? (count == 1 ? "exact match" : "exact matches")
-                : (count == 1 ? "case-insensitive match" : "case-insensitive matches")
-        case .expression: noun = count == 1 ? "expression match" : "expression matches"
+            noun = caseSensitive ? (nounCount == 1 ? "exact match" : "exact matches")
+                : (nounCount == 1 ? "case-insensitive match" : "case-insensitive matches")
+        case .expression: noun = nounCount == 1 ? "expression match" : "expression matches"
         case .symbols: noun = count == 1 ? "symbol candidate" : "symbol candidates"
         case .headings: noun = count == 1 ? "heading" : "headings"
         case .occurrences: noun = count == 1 ? "whole-token occurrence" : "whole-token occurrences"
@@ -409,7 +411,7 @@ struct AtlasSearchReport: Sendable {
         }
         var reasons: [String] = []
         if truncated && !countAllMatches { reasons.append("result limit reached") }
-        if truncated && countAllMatches { reasons.append("first \(count) results retained; total count is not complete") }
+        if truncated && countAllMatches { reasons.append("total count is not complete") }
         if let coverage = structureCoverage {
             if unavailableFiles > 0 { reasons.append("\(unavailableFiles) files with unavailable or incomplete analysis") }
             if coverage.unsupportedFiles > 0 {
@@ -423,7 +425,10 @@ struct AtlasSearchReport: Sendable {
             if unsupportedFiles > 0 { reasons.append("\(unsupportedFiles) unsupported text files") }
         }
         if reasons.isEmpty { reasons.append(isWorkspaceScope ? "project coverage incomplete" : "scope coverage incomplete") }
-        return "Partial search: \(count) \(noun) shown; \(reasons.joined(separator: ", ")). More matches may exist." + qualification
+        let found = countAllMatches
+            ? "\(matchesSeen) \(noun) counted; first \(count) retained"
+            : "\(count) \(noun) shown"
+        return "Partial search: \(found); \(reasons.joined(separator: ", ")). More matches may exist." + qualification
     }
 
     static func decode(_ json: String?) throws -> Self {
@@ -515,12 +520,20 @@ struct AtlasSearchInput: Sendable {
     let mode: AtlasSearchMode
     let nameMode: AtlasSearchNameMode
     let caseSensitive: Bool
+    /// The UI always freezes an explicit policy. nil preserves existing callers:
+    /// exact text counts when its route supports counting; legacy transports
+    /// and other modes stay bounded. Explicit choices are never substituted.
+    let countAllMatches: Bool?
+    var countsLiveMatches: Bool { countAllMatches ?? (mode == .text && caseSensitive) }
+    func countsIndexedMatches(supportsCounting: Bool) -> Bool {
+        countAllMatches ?? (mode == .text && caseSensitive && supportsCounting)
+    }
     var isWorkspaceScope: Bool { fileScope.isAll && pathScope.isWorkspace }
 
     init(root: String, query: String, fileScope: AtlasSearchFileScope = .all,
          pathScope: AtlasSearchPathScope = .workspace,
          mode: AtlasSearchMode = .text, nameMode: AtlasSearchNameMode = .contains,
-         caseSensitive: Bool = true) throws {
+         caseSensitive: Bool = true, countAllMatches: Bool? = nil) throws {
         guard !root.isEmpty, root.utf8.count <= 16_384, !root.utf8.contains(0),
               !query.isEmpty, query.utf8.count <= 1_024, !query.utf8.contains(0) else {
             throw AtlasSearchError.invalidRequest
@@ -532,10 +545,12 @@ struct AtlasSearchInput: Sendable {
         self.mode = mode
         self.nameMode = mode.effectiveNameMode(nameMode)
         self.caseSensitive = mode.isTextual ? caseSensitive : true
+        self.countAllMatches = mode.isTextual ? countAllMatches : false
     }
     func requireLegacyScope() throws {
         guard mode == .text else { throw AtlasSearchError.invalidRequest }
         guard caseSensitive else { throw AtlasSearchError.unsupportedMatching }
+        guard countAllMatches == nil else { throw AtlasSearchError.unsupportedCounting }
         guard pathScope.isWorkspace else { throw AtlasSearchError.invalidPathScope }
         guard fileScope.isAll else { throw AtlasSearchError.invalidScope }
     }
@@ -783,10 +798,12 @@ struct AtlasSearchContext: Sendable {
     var mode: AtlasSearchMode = .text
     var nameMode: AtlasSearchNameMode = .contains
     var caseSensitive: Bool = true
+    var countAllMatches: Bool? = nil
 
     func matches(_ other: Self) -> Bool {
         loadGeneration == other.loadGeneration && atlasRevision == other.atlasRevision
             && mode == other.mode && nameMode == other.nameMode && caseSensitive == other.caseSensitive
+            && countAllMatches == other.countAllMatches
             && root.utf8.elementsEqual(other.root.utf8)
             && query.utf8.elementsEqual(other.query.utf8)
             && scope.utf8.elementsEqual(other.scope.utf8)
