@@ -743,6 +743,45 @@ This source addition includes regression cases for contrast, retained text,
 selection, and native drawing. Executable and physical-Mac qualification remain
 pending; it is not a claim about the already released binary.
 
+## Styled Markdown preview
+
+Open a retained source file and choose **Markdown**, or **Split preview** to keep
+the source alongside the document. The native reader now prepares a **Styled**
+view by default when the host supplies the rich-display capability. **Text**
+keeps the existing selectable logical preview available. The **Columns** field
+and **Reflow** control change the width without reopening the file.
+
+Styled pages draw FrankenMarkdown's shaped glyph IDs and positions using the
+exact bundled font bytes supplied by the retained reader. Headings, prose,
+lists, quotes, tables, code fences and supported vector decorations retain the
+shared engine's layout and semantic color roles. Appearance changes recolor
+the accepted display without reparsing or changing its source identity.
+
+**Previous page** and **Next page** move through bounded display pages. Switching
+between Styled and Text, or reflowing a mapped page, restores its enclosing
+captured Markdown block. Click a mapped element, use **Show source**, or use
+its accessibility action to inspect that block; split mode also navigates the
+source pane. This correspondence is at block granularity. It does not claim
+glyph-exact or inline-exact source spans. Text selection and verified copy
+remain available in Text and in the source reader.
+
+Preparation admits UTF-8 captures up to 64 KiB, at most 8,192 display elements,
+131,072 glyphs, and 8 MiB of bundled font resources. A page admits at most 128
+elements and 16,384 glyphs. Source, generation, layout and page identities are
+checked before accepting asynchronous results or enabling source actions.
+Cancellation, capture replacement and failed reflow cannot reactivate stale
+pages. Each logical generation retains one rich width; reflow creates a fresh
+generation.
+
+The bundled upstream shaping profile does not cover every writing system or
+combining sequence. Unsupported text leaves Text and the exact source readable.
+Images show alt-text placeholders and do not trigger asset or network loads;
+math and diagrams may use the upstream textual fallback. If source provenance
+cannot be qualified, the styled content can remain readable with source actions
+unavailable. These additions have wire, lifecycle, adapter, host and C-ABI
+regression cases, but executable and physical-Mac rendering qualification remain
+pending. They do not update the already released application binary.
+
 ## Source reader display
 
 The source reader's **Display** menu provides independent **Line numbers**,

@@ -38,6 +38,18 @@ fn app_sources(root: &Path) -> Vec<String> {
 }
 
 #[test]
+fn production_document_display_and_navigation() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for script in ["test-document-display.sh", "test-document-preview.sh"] {
+        checked(
+            Command::new("/bin/sh")
+                .current_dir(&root)
+                .arg(root.join("swiftui/tests").join(script)),
+        );
+    }
+}
+
+#[test]
 fn production_swift_camera_source_and_shell() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = std::env::temp_dir().join(format!(

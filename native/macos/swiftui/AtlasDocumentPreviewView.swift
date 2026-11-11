@@ -1,9 +1,9 @@
 import SwiftUI
 import AppKit
 
-/// Native presentation of the shared engine's logical flow and provenance.
-/// Text is already rendered by FrankenMarkdown: this view parses no Markdown,
-/// invents no heading slugs and grants no network or external-link access.
+/// Native presentation of the shared engine's shaped glyphs, logical flow and
+/// provenance. This view parses no Markdown, invents no heading slugs and grants
+/// no network or external-link access.
 @MainActor struct AtlasDocumentPreviewView: View {
     @Bindable var model: AtlasDocumentPreviewModel
     var embedded = false
@@ -53,7 +53,14 @@ import AppKit
     private var toolbar: some View {
         HStack(spacing: 10) {
             Label("Markdown preview", systemImage: "doc.richtext").font(.headline)
-            if !embedded { Text("Logical flow").font(.caption).foregroundStyle(.secondary) }
+            if model.richSupported && model.page != nil {
+                Picker("Preview presentation", selection: Binding(get: { model.showsStyled },
+                    set: { model.selectStyled($0) })) {
+                    Text("Styled").tag(true)
+                    Text("Text").tag(false)
+                }
+                .pickerStyle(.segmented).frame(width: 120).disabled(!model.canNavigate)
+            }
             Spacer()
             if embedded {
                 Button(showsContents ? "Hide contents" : "Contents") { showsContents.toggle() }
@@ -82,6 +89,17 @@ import AppKit
 
     private var flowControls: some View {
         HStack(spacing: 6) {
+            if model.showsStyled {
+                Button("Previous page", action: model.previousDisplay).disabled(!model.canDisplayBack)
+                Button("Next page", action: model.nextDisplay).disabled(!model.canDisplayNext)
+                if let page = model.displayPage {
+                    Text("Elements \(page.first + (page.items.isEmpty ? 0 : 1))–\(page.first + UInt64(page.items.count))")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("From source page", action: model.fromSource).disabled(!model.canNavigate)
+                    .help("Locate this source page in the exact logical preview")
+            } else {
             Button("Back", action: model.back).disabled(!model.canBack)
             Button("Forward", action: model.forward).disabled(!model.canForward)
                 .help("Revisit the document page left by Back, within this prepared generation")
@@ -94,12 +112,17 @@ import AppKit
             Spacer()
             Button("From source page", action: model.fromSource).disabled(!model.canNavigate)
                 .help("Locate the current source reader's original byte anchor in this document")
+            }
         }
         .controlSize(.small).padding(8)
     }
 
     @ViewBuilder private var flow: some View {
-        if let page = model.page {
+        if model.showsStyled, let page = model.displayPage {
+            AtlasDocumentDisplayView(page: page, fonts: model.displayFonts, enabled: model.canNavigate) { item in
+                model.showDisplaySource(item, pageID: page.id, navigate: embedded ? openSource : nil)
+            }
+        } else if let page = model.page {
             ScrollView([.horizontal, .vertical]) {
                 VStack(alignment: .leading, spacing: 2) {
                     if page.lines.isEmpty {

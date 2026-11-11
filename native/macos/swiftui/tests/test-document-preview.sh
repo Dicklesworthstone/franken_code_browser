@@ -25,7 +25,8 @@ set --
 # its shipped static runtime provides it without changing observable source.
 if [ "$(uname -s)" = Linux ]; then set -- -static-stdlib; fi
 swiftc "$@" -swift-version 6 -warnings-as-errors \
-    "$out/Vocabulary.swift" "$src/AtlasDocumentPreviewModel.swift" \
+    "$out/Vocabulary.swift" "$src/AtlasDocumentDisplay.swift" \
+    "$src/AtlasNavigationHistory.swift" "$src/AtlasDocumentPreviewModel.swift" \
     "$src/tests/AtlasDocumentPreviewTests.swift" -o "$out/tests"
 "$out/tests"
 printf 'Retained test artifacts: %s\n' "$out"

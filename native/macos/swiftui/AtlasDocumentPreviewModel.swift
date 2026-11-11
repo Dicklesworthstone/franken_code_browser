@@ -16,6 +16,11 @@ import Observation
     private(set) var headings: AtlasReaderDocumentHeadings?
     private(set) var links: AtlasReaderDocumentLinks?
     private(set) var source: AtlasReaderDocumentSource?
+    private(set) var displayPage: AtlasDocumentDisplayPage?
+    private(set) var displayFonts: [AtlasDocumentDisplayFont] = []
+    private(set) var showsStyled = false
+    private var prefersStyled = true
+    private var displayHistory: [UInt64] = []
     private(set) var busy = false
     private(set) var authorized = false
     private(set) var notice = ""
@@ -27,15 +32,17 @@ import Observation
     private var headingHistory: [UInt64] = []
     private var linkHistory: [UInt64] = []
     @ObservationIgnored private let supported: Bool
+    let richSupported: Bool
     @ObservationIgnored private let execute: Execute
     @ObservationIgnored private let cancelWork: @MainActor () -> Void
     @ObservationIgnored private let revoke: @MainActor () -> Void
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var operation = UUID()
 
-    init(supported: Bool, execute: @escaping Execute,
+    init(supported: Bool, richSupported: Bool = false, execute: @escaping Execute,
          cancel: @escaping @MainActor () -> Void, revoke: @escaping @MainActor () -> Void) {
         self.supported = supported
+        self.richSupported = richSupported
         self.execute = execute
         cancelWork = cancel
         self.revoke = revoke
@@ -60,6 +67,8 @@ import Observation
     var canHeadingsNext: Bool { canNavigate && headings?.next != nil }
     var canLinksBack: Bool { canNavigate && !linkHistory.isEmpty }
     var canLinksNext: Bool { canNavigate && links?.next != nil }
+    var canDisplayBack: Bool { canNavigate && !displayHistory.isEmpty }
+    var canDisplayNext: Bool { canNavigate && displayPage?.next != nil }
     var linkCoverage: String {
         guard let links else { return "Load the links parsed from this retained Markdown capture." }
         return "\(links.rows.count) of \(links.total) retained links shown; \(links.seen) parsed occurrences. "
@@ -72,6 +81,15 @@ import Observation
         guard let page else { return unavailableReason ?? "Prepare a logical FrankenMarkdown preview from the retained source." }
         let inventory = page.inventory
         let status = authorized ? "" : "Previous preview is read-only; prepare again before navigating or copying. "
+        if showsStyled, let display = displayPage {
+            return status + "FrankenMarkdown typography with bundled fonts. "
+                + "\(display.items.count) of \(display.inventory.totalItems) display elements shown. "
+                + (display.inventory.unresolvedImages > 0
+                    ? "\(display.inventory.unresolvedImages) images use placeholders; no assets are fetched. " : "")
+                + (display.inventory.qualifiedSources
+                    ? "Source actions select enclosing Markdown blocks."
+                    : "Source regions could not be qualified for this layout; use Text or the source reader.")
+        }
         return status + "Logical FrankenMarkdown flow, not native shaped document layout. "
             + "\(page.lines.count) of \(inventory.totalLines) flow rows shown at \(inventory.width) columns. "
             + "Source links select enclosing Markdown regions, not glyph-exact spans. "
@@ -97,7 +115,14 @@ import Observation
         guard let identity else { return }
         let initial = page == nil
         let anchor: UInt64
-        if let page {
+        if showsStyled, let displayPage {
+            guard displayPage.inventory.document.identity.matches(identity),
+                  let original = displaySourceAnchor(displayPage) else {
+                notice = "This styled page has no mapped source region to preserve. Switch to Text or move to a mapped page before changing width."
+                return
+            }
+            anchor = original
+        } else if let page {
             guard page.inventory.identity.matches(identity) else {
                 notice = AtlasReaderError.invalidResponse.message
                 return
@@ -122,6 +147,7 @@ import Observation
         authorized = false
         source = nil
         links = nil; linkHistory = []
+        displayPage = nil; displayFonts = []; displayHistory = []; showsStyled = false
         revoke()
         perform(.prepare(width: width), notice: "Preparing retained Markdown…", resolve: { result, execute in
             guard case .prepared(let firstPage, let headings) = result,
@@ -138,6 +164,8 @@ import Observation
                 throw AtlasReaderError.invalidResponse
             }
             return .prepared(page, headings)
+        }, then: { model in
+            if model.richSupported && model.prefersStyled { model.prepareDisplay() }
         }) { model, result in
             guard case .prepared(let page, let headings) = result, let identity = model.identity,
                   page.inventory.identity.matches(identity), page.inventory.width == width,
@@ -150,6 +178,120 @@ import Observation
             model.lineInput = String(page.first + 1)
             model.authorized = true
         }
+    }
+
+    /// Rich display has its own coordinate system and pagination. It never
+    /// borrows logical row numbers or their rendered UTF-8 selection offsets.
+    func selectStyled(_ styled: Bool) {
+        prefersStyled = styled
+        guard !busy else { return }
+        if !styled {
+            guard showsStyled, let displayPage else { showsStyled = false; return }
+            if let anchor = displaySourceAnchor(displayPage) {
+                navigate(.fromSource(offset: anchor))
+            } else {
+                showsStyled = false
+                notice = "This styled page has no mapped source region. Text resumes at its previous location."
+            }
+            return
+        }
+        if let displayPage, page?.inventory.matches(displayPage.inventory.document) == true {
+            showsStyled = true
+        } else { prepareDisplay() }
+    }
+    private func displaySourceAnchor(_ display: AtlasDocumentDisplayPage) -> UInt64? {
+        if display.first == display.inventory.totalItems {
+            return display.inventory.document.identity.capturedBytes
+        }
+        guard display.inventory.qualifiedSources else { return nil }
+        return display.items.lazy.compactMap(\.original).first?.start
+    }
+    private func retireDisplayLocation() {
+        displayPage = nil; displayHistory = []; showsStyled = false
+    }
+    func prepareDisplay() {
+        guard richSupported, canNavigate, let page else { return }
+        let inventory = page.inventory
+        let width = max(160, min(4096, inventory.width * 8))
+        let anchor: UInt64?
+        if page.first == 0 { anchor = nil }
+        else if page.first == inventory.totalLines { anchor = inventory.identity.capturedBytes }
+        else if let original = page.lines.lazy.compactMap(\.enclosingOriginal).first {
+            anchor = original.start
+        } else {
+            notice = "This page has no source region to preserve in the styled preview. Text preview remains available."
+            return
+        }
+        perform(.prepareDisplay(width: width), notice: "Preparing document typography…",
+            resolve: { result, execute in
+                guard case .display(let first, let fonts?) = result,
+                      first.inventory.document.matches(inventory), first.first == 0 else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                guard let anchor else { return result }
+                let restored = try await execute(.displayFromSource(offset: anchor))
+                guard case .display(let page, nil) = restored, page.inventory.matches(first.inventory) else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                return .display(page, fonts: fonts)
+            }) { model, result in
+            guard case .display(let display, let fonts?) = result,
+                  display.inventory.document.matches(inventory), display.inventory.width == width else {
+                throw AtlasReaderError.invalidResponse
+            }
+            try display.validateFonts(fonts)
+            model.displayPage = display; model.displayFonts = fonts; model.displayHistory = []
+            model.showsStyled = model.prefersStyled
+        }
+    }
+    func nextDisplay() {
+        guard let next = displayPage?.next else { return }
+        loadDisplay(first: next, goingBack: false)
+    }
+    func previousDisplay() {
+        guard let first = displayHistory.last else { return }
+        loadDisplay(first: first, goingBack: true)
+    }
+    private func loadDisplay(first: UInt64, goingBack: Bool) {
+        guard canNavigate, let previous = displayPage else { return }
+        perform(.displayPage(first: first), notice: "Reading document typography…") { model, result in
+            guard case .display(let display, nil) = result,
+                  display.inventory.matches(previous.inventory), display.first == first else {
+                throw AtlasReaderError.invalidResponse
+            }
+            try display.validateFonts(model.displayFonts)
+            if goingBack { _ = model.displayHistory.popLast() }
+            else {
+                model.displayHistory.append(previous.first)
+                if model.displayHistory.count > 128 { model.displayHistory.removeFirst() }
+            }
+            model.displayPage = display
+            model.showsStyled = model.prefersStyled
+        }
+    }
+    func allowsDisplayItem(_ item: AtlasDocumentDisplayItem, pageID: UUID) -> Bool {
+        canNavigate && displayPage?.id == pageID && item.original != nil
+            && displayPage?.items.contains(where: { $0.id == item.id && $0.original == item.original }) == true
+    }
+    func showDisplaySource(_ item: AtlasDocumentDisplayItem, pageID: UUID,
+                           navigate: SourceNavigation? = nil) {
+        guard allowsDisplayItem(item, pageID: pageID), let original = item.original,
+              let previous = page else { return }
+        let move = history.visit(previous.first)
+        perform(.fromSource(offset: original.start), notice: "Locating the captured Markdown block…",
+            then: { model in
+                guard let page = model.page, let target = page.target(at: page.first),
+                      target.line.enclosingOriginal == original else {
+                    model.notice = "This display element has no matching logical source region. The source reader remains available."
+                    return
+                }
+                model.showSource(target, navigate: navigate)
+            }) { model, result in
+                guard case .page(let page) = result, page.inventory.matches(previous.inventory),
+                      model.history.commit(move, resolved: page.first) else { throw AtlasReaderError.invalidResponse }
+                model.page = page; model.lineInput = String(page.first + 1)
+                model.source = nil
+            }
     }
 
     func next() { if let next = page?.next { navigate(first: next) } }
@@ -215,6 +357,7 @@ import Observation
                       model.history.commit(move, resolved: page.first) else { throw AtlasReaderError.invalidResponse }
                 model.page = page; model.source = nil
                 model.lineInput = String(page.first + 1)
+                model.retireDisplayLocation()
             } else {
                 guard !target.link.kind.navigatesWithinCapture else { throw AtlasReaderError.invalidResponse }
                 switch target.link.kind {
@@ -300,6 +443,7 @@ import Observation
         cancel(silent: true)
         revoke()
         identity = nil; page = nil; headings = nil; links = nil; source = nil
+        displayPage = nil; displayFonts = []; displayHistory = []; showsStyled = false
         authorized = false; history.reset(); headingHistory = []; linkHistory = []
         sourceOffset = 0; lineInput = "1"; notice = ""
     }
@@ -322,6 +466,7 @@ import Observation
             model.page = page
             model.source = nil
             model.lineInput = String(page.first + 1)
+            model.retireDisplayLocation()
         }
     }
     private func loadHeadings(first: UInt64, goingBack: Bool = false) {
@@ -385,6 +530,15 @@ import Observation
             } catch {
                 guard let self, self.operation == ticket, !Task.isCancelled else { return }
                 self.notice = (error as? AtlasReaderError)?.message ?? AtlasReaderError.unavailable.message
+                if case .prepareDisplay = request {
+                    self.showsStyled = false
+                    if let readerError = error as? AtlasReaderError, case .engine(let code) = readerError,
+                       code == "DOCUMENT_DISPLAY_SHAPING_UNSUPPORTED" {
+                        self.notice = "Bundled typography does not support all the text in this document. Text preview and the exact source remain available."
+                    } else {
+                        self.notice += " Text preview remains available."
+                    }
+                }
                 self.busy = false; self.task = nil
             }
         }

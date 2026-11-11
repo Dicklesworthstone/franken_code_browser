@@ -111,6 +111,8 @@ import Observation
             outline: outline, document: document)
         self.coordinator = coordinator
         documentPreview = AtlasDocumentPreviewModel(supported: document != nil,
+            richSupported: document?.prepareDisplay != nil && document?.displayPage != nil
+                && document?.displayFont != nil && document?.displayFromSource != nil,
             execute: { try await coordinator.document($0) },
             cancel: { coordinator.cancel() }, revoke: { coordinator.revokeDocument() })
     }

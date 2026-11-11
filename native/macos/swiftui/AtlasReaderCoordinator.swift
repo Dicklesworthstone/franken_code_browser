@@ -775,6 +775,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
     /// source-only hosts. Admission precedes cancellation so invalid requests
     /// cannot interrupt valid work or discard the currently accepted document.
     func document(_ request: AtlasReaderDocumentRequest) async throws -> AtlasReaderDocumentResult {
+        guard !Task.isCancelled else { throw AtlasReaderError.canceled }
         guard let session, let info, let document = documentTransport else {
             throw AtlasReaderError.unavailable
         }
@@ -787,9 +788,10 @@ private final class AtlasReaderSession: @unchecked Sendable {
         cancellation = flag
         do {
             let result = try await io.perform(cancellation: flag, keepingAlive: [session]) {
-                try job.execute(document)
+                try job.execute(document, canceled: { flag.isCanceled })
             }
-            guard self.session === session, operation == ticket, !flag.isCanceled else {
+            guard self.session === session, operation == ticket, !flag.isCanceled,
+                  !Task.isCancelled else {
                 throw AtlasReaderError.canceled
             }
             // A reflow, replacement, or independently revoked page cannot lend

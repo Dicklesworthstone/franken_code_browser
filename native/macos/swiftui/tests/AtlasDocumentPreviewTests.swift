@@ -8,11 +8,16 @@ import Foundation
     var cancels = 0
     var revocations = 0
     var held = false
+    var holdDisplay = false
+    var exactSourceRows = false
     var failure: AtlasReaderError?
     var pending: [(CheckedContinuation<AtlasReaderDocumentResult, Error>, AtlasReaderDocumentResult)] = []
     var generation: UInt64 = 0
     var identity = Fixture.identity()
     var inventory: AtlasReaderDocumentInventory?
+    var displayInventory: AtlasDocumentDisplayInventory?
+    var totalDisplayItems: UInt64 = 385
+    var unmappedDisplayItems: Set<UInt64> = []
     var totalLines: UInt64 = 1024
     var unmappedRows: Set<UInt64> = []
     var lastSourceAnchor: UInt64? {
@@ -25,15 +30,20 @@ import Foundation
         .init(owner: owner, file: 1, revision: revision, capturedBytes: bytes,
               pathBytes: Array(path.utf8), encoding: encoding, displayPath: path)
     }
-    func model(supported: Bool = true) -> AtlasDocumentPreviewModel {
-        AtlasDocumentPreviewModel(supported: supported, execute: { try await self.execute($0) },
+    func model(supported: Bool = true, richSupported: Bool = false) -> AtlasDocumentPreviewModel {
+        AtlasDocumentPreviewModel(supported: supported, richSupported: richSupported, execute: { try await self.execute($0) },
             cancel: { self.cancels += 1 }, revoke: { self.revocations += 1 })
     }
     func execute(_ request: AtlasReaderDocumentRequest) async throws -> AtlasReaderDocumentResult {
         requests.append(request)
         if let failure { self.failure = nil; throw failure }
         let value = try response(request)
-        if held {
+        let displayRequest: Bool
+        switch request {
+        case .prepareDisplay, .displayPage, .displayFromSource: displayRequest = true
+        default: displayRequest = false
+        }
+        if held || (holdDisplay && displayRequest) {
             return try await withCheckedThrowingContinuation { pending.append(($0, value)) }
         }
         return value
@@ -49,6 +59,7 @@ import Foundation
     func response(_ request: AtlasReaderDocumentRequest) throws -> AtlasReaderDocumentResult {
         if case .prepare(let width) = request {
             generation += 1
+            displayInventory = nil
             inventory = .init(identity: identity, generation: generation, width: width,
                 totalLines: totalLines, totalHeadings: 130, renderedBytes: 16384, sourceBase: 3)
             return .prepared(page(first: 0), headings(first: 0))
@@ -58,6 +69,9 @@ import Foundation
         case .headings(let first): return .headings(headings(first: first))
         case .heading(let target): return .page(page(first: target.heading.renderedOffset / 16))
         case .fromSource(let offset):
+            if exactSourceRows {
+                return .page(page(first: offset == identity.capturedBytes ? totalLines : min(totalLines, (max(3, offset) - 3) / 8)))
+            }
             return .page(page(first: offset == identity.capturedBytes ? totalLines : (offset == 3 ? 0 : 128)))
         case .source(let target):
             return .source(.init(target: target, visible: .init(start: 3, end: 8), text: "# hi\n",
@@ -71,8 +85,34 @@ import Foundation
         case .link(let target):
             return .link(.init(target: target, page: target.link.kind.navigatesWithinCapture
                 ? page(first: target.link.kind == .start ? 0 : 256) : nil))
+        case .prepareDisplay(let width):
+            guard let inventory else { throw AtlasReaderError.invalidInput }
+            displayInventory = .init(document: inventory, width: width,
+                bounds: .init(x: 0, y: 0, width: Double(width), height: Double(totalDisplayItems) * 20),
+                totalItems: totalDisplayItems, unresolvedImages: (totalDisplayItems + 1) / 2,
+                qualifiedSources: true, fonts: [])
+            return .display(display(first: 0), fonts: [])
+        case .displayPage(let first): return .display(display(first: first), fonts: nil)
+        case .displayFromSource(let offset):
+            let first = offset == identity.capturedBytes ? totalDisplayItems : min(totalDisplayItems, (max(3, offset) - 3) / 16)
+            return .display(display(first: first), fonts: nil)
         case .prepare: throw AtlasReaderError.invalidInput
         }
+    }
+    /// Typed lifecycle fixtures contain only images/vectors and zero font
+    /// resources. They exercise publication and source anchors without claiming
+    /// to supply native fonts, shaped text, parser output or rendering proof.
+    func display(first: UInt64) -> AtlasDocumentDisplayPage {
+        let inventory = displayInventory!, end = min(totalDisplayItems, first + AtlasDocumentDisplayLimits.pageItems)
+        let items = (first..<end).map { index -> AtlasDocumentDisplayItem in
+            let original = unmappedDisplayItems.contains(index) ? nil : AtlasDocumentByteRange(start: 3 + index * 16, end: 7 + index * 16)
+            let content: AtlasDocumentDisplayItem.Content = index.isMultiple(of: 2)
+                ? .image(alt: "Retained image \(index)") : .vector(shape: "horizontal-rule", role: "rule", stroke: 1)
+            return .init(id: index, bounds: .init(x: 0, y: Double(index) * 20, width: 120, height: 18),
+                original: original, content: content)
+        }
+        return .init(id: UUID(), inventory: inventory, first: first, items: items,
+            next: end < totalDisplayItems ? end : nil)
     }
     func links(first: UInt64) -> AtlasReaderDocumentLinks {
         let inventory = inventory!, total: UInt64 = 130, end = min(total, first + 64)
@@ -376,7 +416,191 @@ import Foundation
         }
         await anchoredPreparation()
         await documentLinks()
+        await styledLifecycle()
+        await styledDeliveries()
         print("AtlasDocumentPreviewTests: \(checks) checks passed")
+    }
+
+    @MainActor private static func styledLifecycle() async {
+        do {
+            let f = Fixture(), m = f.model(richSupported: true)
+            f.exactSourceRows = true; f.holdDisplay = true
+            m.bind(identity: f.identity, sourceOffset: 1027)
+            m.prepare(); await wait { f.pending.count == 1 }
+            let logical = m.page!
+            check(logical.first == 128 && m.authorized && m.busy && m.displayPage == nil,
+                  "Automatic typography preparation keeps the resolved logical source page available")
+            if case .prepareDisplay(let width) = f.requests.last! { check(width == 768, "Styled width derives from accepted logical width") }
+            else { preconditionFailure("Missing automatic display preparation") }
+            f.release(); await wait { f.pending.count == 1 }
+            if case .displayFromSource(let offset) = f.requests.last! { check(offset == 1027, "Styled preparation restores the accepted source block") }
+            else { preconditionFailure("Missing styled source restoration") }
+            check(m.displayPage == nil && !m.showsStyled && m.page?.id == logical.id,
+                  "The styled start page cannot flash before source restoration succeeds")
+            f.release(); await wait { !m.busy }
+            check(m.showsStyled && m.displayPage?.first == 64 && m.displayPage?.items.count == 128
+                  && m.displayFonts.isEmpty && !m.canDisplayBack && m.canDisplayNext,
+                  "A bounded image/vector page publishes after restoration without synthetic font resources")
+            check(m.coverage.contains("placeholders") && m.coverage.contains("enclosing Markdown blocks"),
+                  "Styled coverage keeps image and source-mapping limits explicit")
+            f.holdDisplay = false
+            let oldDisplay = m.displayPage!, oldItem = oldDisplay.items[0]
+            m.nextDisplay(); await wait { !m.busy }
+            check(m.displayPage?.first == 192 && m.canDisplayBack && m.page?.id == logical.id && !m.canBack,
+                  "Styled pagination follows item cursors without borrowing logical row history")
+            check(!m.allowsDisplayItem(oldItem, pageID: oldDisplay.id), "A prior styled page cannot authorize source actions")
+            m.previousDisplay(); await wait { !m.busy }
+            check(m.displayPage?.first == 64 && !m.canDisplayBack
+                  && !m.allowsDisplayItem(oldItem, pageID: oldDisplay.id),
+                  "Styled back restores location without reviving an old page token")
+            m.nextDisplay(); await wait { !m.busy }
+            m.bind(identity: f.identity, sourceOffset: 9000)
+            m.widthInput = "80"; m.prepare(); await wait { !m.busy }
+            let sourceAnchors = f.requests.compactMap { request -> UInt64? in
+                if case .fromSource(let offset) = request { return offset }; return nil
+            }
+            check(sourceAnchors.last == 3075 && m.page?.first == 384 && m.displayPage?.first == 192,
+                  "Width reflow follows the visible styled block rather than the old logical row or another pane's anchor")
+            check(m.showsStyled && m.page?.inventory.width == 80 && m.displayPage?.inventory.width == 640
+                  && m.displayPage?.inventory.document.generation == m.page?.inventory.generation && !m.canDisplayBack,
+                  "Reflow replaces both coordinate domains together and retires old styled history")
+            m.selectStyled(false); await wait { !m.busy }
+            check(!m.showsStyled && m.page?.first == 384 && m.displayPage == nil && !m.canDisplayBack,
+                  "Switching to Text resolves the visible styled source block and retires its stale display location")
+            m.selectStyled(true); await wait { !m.busy }
+            check(m.showsStyled && m.displayPage?.first == 192,
+                  "Switching back to Styled restores the current Text source block")
+            m.lineInput = "257"; m.goToLine(); await wait { !m.busy }
+            check(m.page?.first == 256 && !m.showsStyled && m.displayPage == nil,
+                  "Logical row navigation cannot leave an unrelated styled page visible")
+            m.selectStyled(true); await wait { !m.busy }
+            check(m.displayPage?.first == 128, "Styled retry follows the newly accepted logical row")
+            m.prepareLinks(); await wait { !m.busy }
+            m.openLink(m.links!.target(id: 2)!); await wait { !m.busy }
+            check(m.page?.first == 0 && m.displayPage == nil && !m.showsStyled && !m.canDisplayBack,
+                  "Accepted document-link navigation retires old styled content and its history")
+            m.selectStyled(true); await wait { !m.busy }
+            let sourcePage = m.displayPage!, sourceItem = sourcePage.items[0]
+            var sourceTargets: [AtlasReaderDocumentTarget] = []
+            m.showDisplaySource(sourceItem, pageID: sourcePage.id) { sourceTargets.append($0) }
+            await wait { !m.busy }
+            check(sourceTargets.count == 1 && sourceTargets[0].line.enclosingOriginal == sourceItem.original
+                  && m.sourceOffset(for: sourceTargets[0], reader: f.identity) == 3,
+                  "A current styled element resolves through the logical source map before source navigation")
+            for _ in 0..<3 { m.nextDisplay(); await wait { !m.busy } }
+            check(m.displayPage?.first == 384 && m.displayPage?.items.count == 1 && !m.canDisplayNext,
+                  "The final short styled page is bounded and ends item navigation")
+            let calls = f.requests.count
+            m.showDisplaySource(sourceItem, pageID: sourcePage.id) { _ in preconditionFailure("Old styled item navigated") }
+            check(f.requests.count == calls, "An obsolete styled page cannot submit source work")
+        }
+        do {
+            let f = Fixture(), m = f.model(richSupported: true)
+            f.unmappedDisplayItems = Set(0..<128)
+            await ready(f, m)
+            let page = m.page!, calls = f.requests.count, revocations = f.revocations
+            m.widthInput = "80"; m.prepare()
+            check(m.showsStyled && m.authorized && !m.busy && f.requests.count == calls && f.revocations == revocations,
+                  "Unmapped styled content refuses width reflow before revoking the accepted document")
+            m.selectStyled(false)
+            check(!m.showsStyled && m.page?.id == page.id && m.canNavigate && f.requests.count == calls
+                  && m.notice.contains("no mapped source region"),
+                  "Unmapped Styled-to-Text navigation keeps the prior logical location and explains the fallback")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            let calls = f.requests.count
+            m.selectStyled(true)
+            check(!m.showsStyled && m.displayPage == nil && m.authorized && f.requests.count == calls,
+                  "A host without rich transport remains a working logical preview without rich requests")
+        }
+        do {
+            let f = Fixture(), m = f.model(richSupported: true)
+            f.holdDisplay = true
+            m.bind(identity: f.identity, sourceOffset: 0); m.prepare()
+            await wait { f.pending.count == 1 }
+            f.reject(.engine("DOCUMENT_DISPLAY_SHAPING_UNSUPPORTED")); await wait { !m.busy }
+            check(m.authorized && m.page?.first == 0 && m.displayPage == nil && !m.showsStyled
+                  && m.notice.contains("Text preview and the exact source remain available"),
+                  "Unsupported typography falls back to the accepted logical document without losing source access")
+            m.next(); await wait { !m.busy }
+            f.holdDisplay = false; m.selectStyled(true); await wait { !m.busy }
+            check(m.page?.first == 64 && m.showsStyled && m.displayPage?.first == 32,
+                  "Logical navigation and an explicit styled retry still work after a typography refusal")
+        }
+    }
+
+    @MainActor private static func styledDeliveries() async {
+        for resolving in [false, true] {
+            let f = Fixture(), m = f.model(richSupported: true)
+            f.exactSourceRows = true; f.holdDisplay = true
+            m.bind(identity: f.identity, sourceOffset: 1027); m.prepare()
+            await wait { f.pending.count == 1 }
+            if resolving { f.release(); await wait { f.pending.count == 1 } }
+            let calls = f.requests.count, logical = m.page!.id
+            m.cancel(); f.release(); await settle()
+            check(m.page?.id == logical && m.authorized && !m.busy && m.displayPage == nil && !m.showsStyled
+                  && f.requests.count == calls,
+                  "Cancellation at either rich preparation stage suppresses delayed publication and unstarted restoration")
+        }
+        do {
+            let f = Fixture(), m = f.model(richSupported: true)
+            f.holdDisplay = true
+            m.bind(identity: f.identity, sourceOffset: 0); m.prepare()
+            await wait { f.pending.count == 1 }
+            m.cancel(); m.selectStyled(true); await wait { f.pending.count == 2 }
+            f.release(1); await wait { !m.busy }
+            let accepted = m.displayPage!
+            f.release(); await settle()
+            check(m.displayPage?.id == accepted.id && m.showsStyled,
+                  "A late canceled rich preparation cannot replace a newer accepted display")
+            m.nextDisplay(); await wait { f.pending.count == 1 }
+            m.cancel(); f.release(); await settle()
+            check(m.displayPage?.id == accepted.id && !m.canDisplayBack && m.canDisplayNext,
+                  "Canceled styled pagination preserves both accepted content and item history")
+        }
+        do {
+            let f = Fixture(), m = f.model(richSupported: true)
+            await ready(f, m)
+            f.holdDisplay = true
+            m.nextDisplay(); await wait { f.pending.count == 1 }
+            m.bind(identity: Fixture.identity(revision: 2), sourceOffset: 512)
+            f.release(); await settle()
+            check(m.page == nil && m.displayPage == nil && m.displayFonts.isEmpty && !m.authorized && !m.busy,
+                  "A delayed rich page cannot revive a replaced capture")
+        }
+        for foreignCapture in [false, true] {
+            let f = Fixture(), m = f.model(richSupported: true), foreign = Fixture()
+            await ready(f, m)
+            let accepted = m.displayPage!, logical = m.page!.id
+            foreign.identity = foreignCapture ? Fixture.identity(owner: 99) : f.identity
+            foreign.generation = foreignCapture ? 0 : 10
+            _ = try! foreign.response(.prepare(width: 96))
+            _ = try! foreign.response(.prepareDisplay(width: 768))
+            f.holdDisplay = true
+            m.nextDisplay(); await wait { f.pending.count == 1 }
+            f.release(replacement: .display(foreign.display(first: 128), fonts: nil))
+            await wait { !m.busy }
+            check(m.displayPage?.id == accepted.id && m.page?.id == logical && m.authorized
+                  && !m.canDisplayBack && m.notice == AtlasReaderError.invalidResponse.message,
+                  "A foreign capture or generation cannot replace a styled page or advance its history")
+        }
+        do {
+            let f = Fixture(), m = f.model(richSupported: true), foreign = Fixture()
+            f.exactSourceRows = true; f.holdDisplay = true
+            m.bind(identity: f.identity, sourceOffset: 1027); m.prepare()
+            await wait { f.pending.count == 1 }
+            f.release(); await wait { f.pending.count == 1 }
+            foreign.generation = 10
+            _ = try! foreign.response(.prepare(width: 96))
+            _ = try! foreign.response(.prepareDisplay(width: 768))
+            f.release(replacement: .display(foreign.display(first: 64), fonts: nil))
+            await wait { !m.busy }
+            check(m.page?.first == 128 && m.authorized && m.displayPage == nil && !m.showsStyled
+                  && m.notice.contains(AtlasReaderError.invalidResponse.message),
+                  "A foreign source-restoration generation cannot publish a rich page after a valid preparation")
+        }
     }
 
     @MainActor private static func anchoredPreparation() async {

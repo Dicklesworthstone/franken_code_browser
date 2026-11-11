@@ -23,6 +23,15 @@ private func fcb_reader_document_links(_ handle: UInt64, _ generation: UInt64, _
 @_silgen_name("fcb_reader_document_link")
 private func fcb_reader_document_link(_ handle: UInt64, _ generation: UInt64, _ link: UInt64, _ count: UInt64) -> UnsafeMutablePointer<CChar>?
 
+@_silgen_name("fcb_reader_document_display")
+private func fcb_reader_document_display(_ handle: UInt64, _ generation: UInt64, _ width: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_reader_document_display_page")
+private func fcb_reader_document_display_page(_ handle: UInt64, _ generation: UInt64, _ first: UInt64, _ count: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_reader_document_display_font")
+private func fcb_reader_document_display_font(_ handle: UInt64, _ generation: UInt64, _ font: UInt64, _ offset: UInt64, _ count: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_reader_document_display_from_source")
+private func fcb_reader_document_display_from_source(_ handle: UInt64, _ generation: UInt64, _ offset: UInt64, _ count: UInt64) -> UnsafeMutablePointer<CChar>?
+
 extension AtlasReaderDocumentTransport {
     static let native = Self(prepare: { handle, generation, width in
         take(fcb_reader_document(handle, generation, width, AtlasReaderDocumentLimits.sourceBytes,
@@ -36,11 +45,18 @@ extension AtlasReaderDocumentTransport {
     copy: { take(fcb_reader_document_copy($0, $1, $2, $3, $4)) },
     prepareLinks: { take(fcb_reader_document_links_prepare($0, $1, $2)) },
     links: { take(fcb_reader_document_links($0, $1, $2, $3)) },
-    link: { take(fcb_reader_document_link($0, $1, $2, $3)) })
+    link: { take(fcb_reader_document_link($0, $1, $2, $3)) },
+    prepareDisplay: { take(fcb_reader_document_display($0, $1, $2)) },
+    displayPage: { take(fcb_reader_document_display_page($0, $1, $2, $3)) },
+    displayFont: { take(fcb_reader_document_display_font($0, $1, $2, $3, $4)) },
+    displayFromSource: { take(fcb_reader_document_display_from_source($0, $1, $2, $3)) })
 
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
         guard let pointer else { return nil }
         defer { fcb_free_string(pointer) }
-        return String(cString: pointer)
+        var length = 0
+        while length <= AtlasReaderLimits.responseBytes && pointer[length] != 0 { length += 1 }
+        guard length <= AtlasReaderLimits.responseBytes else { return nil }
+        return String(validatingCString: pointer)
     }
 }

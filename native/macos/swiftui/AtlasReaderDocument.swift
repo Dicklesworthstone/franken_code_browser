@@ -14,6 +14,10 @@ struct AtlasReaderDocumentTransport: Sendable {
     var prepareLinks: (@Sendable (UInt64, UInt64, UInt64) -> String?)? = nil
     var links: (@Sendable (UInt64, UInt64, UInt64, UInt64) -> String?)? = nil
     var link: (@Sendable (UInt64, UInt64, UInt64, UInt64) -> String?)? = nil
+    var prepareDisplay: (@Sendable (UInt64, UInt64, UInt64) -> String?)? = nil
+    var displayPage: (@Sendable (UInt64, UInt64, UInt64, UInt64) -> String?)? = nil
+    var displayFont: (@Sendable (UInt64, UInt64, UInt64, UInt64, UInt64) -> String?)? = nil
+    var displayFromSource: (@Sendable (UInt64, UInt64, UInt64, UInt64) -> String?)? = nil
 }
 
 enum AtlasReaderDocumentLimits {
@@ -216,6 +220,9 @@ enum AtlasReaderDocumentRequest: Sendable {
     case prepareLinks
     case links(first: UInt64)
     case link(AtlasReaderDocumentLinkTarget)
+    case prepareDisplay(width: UInt64)
+    case displayPage(first: UInt64)
+    case displayFromSource(offset: UInt64)
     var command: String {
         switch self {
         case .prepare: "document-prepare"
@@ -228,6 +235,9 @@ enum AtlasReaderDocumentRequest: Sendable {
         case .prepareLinks: "document-links-prepare"
         case .links: "document-links"
         case .link: "document-link"
+        case .prepareDisplay: "document-display-prepare"
+        case .displayPage: "document-display-page"
+        case .displayFromSource: "document-display-from-source"
         }
     }
 }
@@ -240,6 +250,7 @@ enum AtlasReaderDocumentResult: Sendable {
     case copy(AtlasReaderDocumentCopy)
     case links(AtlasReaderDocumentLinks)
     case link(AtlasReaderDocumentLinkActivation)
+    case display(AtlasDocumentDisplayPage, fonts: [AtlasDocumentDisplayFont]?)
 }
 
 /// Immutable worker descriptor. Only native marshaling and validation happen
@@ -250,10 +261,13 @@ struct AtlasReaderDocumentJob: Sendable {
     let generation: UInt64
     let inventory: AtlasReaderDocumentInventory?
     let request: AtlasReaderDocumentRequest
+    var displayInventory: AtlasDocumentDisplayInventory? = nil
 
-    func execute(_ transport: AtlasReaderDocumentTransport) throws -> AtlasReaderDocumentResult {
+    func execute(_ transport: AtlasReaderDocumentTransport,
+                 canceled: () -> Bool = { false }) throws -> AtlasReaderDocumentResult {
         let handle = info.identity.owner, count = AtlasReaderDocumentLimits.pageLines
         let json: String?
+        if canceled() { throw AtlasReaderError.canceled }
         switch request {
         case .prepare(let width): json = transport.prepare(handle, generation, width)
         case .window(let first): json = transport.window(handle, generation, first, count)
@@ -273,7 +287,48 @@ struct AtlasReaderDocumentJob: Sendable {
         case .link(let target):
             guard let link = transport.link else { throw AtlasReaderError.unavailable }
             json = link(handle, generation, target.link.id, count)
+        case .prepareDisplay(let width):
+            guard let prepare = transport.prepareDisplay, let font = transport.displayFont,
+                  let inventory else { throw AtlasReaderError.unavailable }
+            let page = try AtlasDocumentDisplayWire.page(prepare(handle, generation, width),
+                document: inventory, command: request.command, first: 0, width: width)
+            var fonts: [AtlasDocumentDisplayFont] = []
+            for spec in page.inventory.fonts {
+                var bytes = Data(); bytes.reserveCapacity(Int(spec.bytes))
+                while UInt64(bytes.count) < spec.bytes {
+                    if canceled() { throw AtlasReaderError.canceled }
+                    let offset = UInt64(bytes.count)
+                    bytes.append(try AtlasDocumentDisplayWire.fontChunk(
+                        font(handle, generation, spec.index, offset, AtlasDocumentDisplayLimits.fontChunk),
+                        inventory: page.inventory, spec: spec, offset: offset))
+                }
+                if canceled() { throw AtlasReaderError.canceled }
+                fonts.append(try AtlasDocumentDisplayFont(index: spec.index, data: bytes))
+            }
+            try page.validateFonts(fonts)
+            if canceled() { throw AtlasReaderError.canceled }
+            return .display(page, fonts: fonts)
+        case .displayPage(let first):
+            guard let load = transport.displayPage, let inventory, let displayInventory else {
+                throw AtlasReaderError.unavailable
+            }
+            let page = try AtlasDocumentDisplayWire.page(
+                load(handle, generation, first, AtlasDocumentDisplayLimits.pageItems),
+                document: inventory, command: request.command, first: first, previous: displayInventory)
+            if canceled() { throw AtlasReaderError.canceled }
+            return .display(page, fonts: nil)
+        case .displayFromSource(let offset):
+            guard let load = transport.displayFromSource, let inventory, let displayInventory else {
+                throw AtlasReaderError.unavailable
+            }
+            let page = try AtlasDocumentDisplayWire.page(
+                load(handle, generation, offset, AtlasDocumentDisplayLimits.pageItems),
+                document: inventory, command: request.command, first: nil, sourceAnchor: offset,
+                previous: displayInventory)
+            if canceled() { throw AtlasReaderError.canceled }
+            return .display(page, fonts: nil)
         }
+        if canceled() { throw AtlasReaderError.canceled }
         return try decode(json)
     }
 
@@ -318,6 +373,7 @@ struct AtlasReaderDocumentJob: Sendable {
             case .links(let first): return .links(try wire.links(basis, first: first))
             case .link(let target): return .link(try wire.link(basis, target: target))
             case .source, .copy: throw AtlasReaderError.invalidResponse
+            case .prepareDisplay, .displayPage, .displayFromSource: throw AtlasReaderError.invalidResponse
             }
         } catch let error as AtlasReaderError { throw error }
         catch { throw AtlasReaderError.invalidResponse }
@@ -333,6 +389,7 @@ struct AtlasReaderDocumentJob: Sendable {
     private(set) var page: AtlasReaderDocumentPage?
     private(set) var headings: AtlasReaderDocumentHeadings?
     private(set) var links: AtlasReaderDocumentLinks?
+    private(set) var displayInventory: AtlasDocumentDisplayInventory?
 
     func admit(_ request: AtlasReaderDocumentRequest, info: AtlasReaderInfo) throws -> AtlasReaderDocumentJob {
         let next: UInt64
@@ -360,6 +417,18 @@ struct AtlasReaderDocumentJob: Sendable {
                 guard let links, first <= links.total else { throw AtlasReaderError.invalidInput }
             case .link(let target):
                 guard links?.target(id: target.link.id) == target else { throw AtlasReaderError.invalidInput }
+            case .prepareDisplay(let width):
+                guard (160...4096).contains(width),
+                      displayInventory == nil || displayInventory?.width == width else {
+                    throw AtlasReaderError.invalidInput
+                }
+            case .displayPage(let first):
+                guard let displayInventory, displayInventory.document.matches(inventory),
+                      first <= displayInventory.totalItems else { throw AtlasReaderError.invalidInput }
+            case .displayFromSource(let offset):
+                guard let displayInventory, displayInventory.document.matches(inventory),
+                      displayInventory.qualifiedSources, offset >= inventory.sourceBase,
+                      offset <= info.identity.capturedBytes else { throw AtlasReaderError.invalidInput }
             case .prepareLinks, .prepare: break
             }
         }
@@ -374,7 +443,8 @@ struct AtlasReaderDocumentJob: Sendable {
             // Retire the prior link-list token before entering that operation.
             links = nil
         }
-        let job = AtlasReaderDocumentJob(id: UUID(), info: info, generation: next, inventory: inventory, request: request)
+        var job = AtlasReaderDocumentJob(id: UUID(), info: info, generation: next, inventory: inventory, request: request)
+        job.displayInventory = displayInventory
         active = job.id
         return job
     }
@@ -396,11 +466,15 @@ struct AtlasReaderDocumentJob: Sendable {
             guard page?.target(at: source.target.line.id) == source.target else { throw AtlasReaderError.canceled }
         case .copy(let copy):
             guard page?.target(at: copy.target.line.id) == copy.target else { throw AtlasReaderError.canceled }
+        case .display(let page, _):
+            guard inventory?.matches(page.inventory.document) == true else { throw AtlasReaderError.canceled }
+            if let previous = displayInventory, !previous.matches(page.inventory) { throw AtlasReaderError.invalidResponse }
+            displayInventory = page.inventory
         }
         active = nil
     }
     func abandon(_ job: AtlasReaderDocumentJob) { if active == job.id { active = nil } }
-    func revoke() { active = nil; inventory = nil; page = nil; headings = nil; links = nil }
+    func revoke() { active = nil; inventory = nil; page = nil; headings = nil; links = nil; displayInventory = nil }
     func close() { revoke(); generation = 0 }
 }
 
