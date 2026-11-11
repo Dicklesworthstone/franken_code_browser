@@ -33,7 +33,7 @@ private enum StreamFixture {
             "scope_filenames": request.fileScope.filenames ?? "",
             "scope_path_kind": request.pathScope.kind.rawValue,
             "scope_path": request.pathScope.isVisible ? "" : request.pathScope.path,
-            "scope_path_hex": request.pathScope.pathHex, "case_sensitive": true,
+            "scope_path_hex": request.pathScope.pathHex, "case_sensitive": request.caseSensitive,
             "eligible_files": String(eligible), "excluded_files": String(catalogued - eligible)]
         if request.pathScope.isVisible {
             value["scope_region_sha256"] = request.pathScope.visibleIdentity!
@@ -45,9 +45,13 @@ private enum StreamFixture {
         return value
     }
     static func report(_ owner: UInt64, _ generation: UInt64, _ request: AtlasWorkspaceStreamRequest,
-                       count: Int = 40, encoding: AtlasObservedReaderEncoding = .utf8) -> [String: Any] {
+                       count: Int = 40, encoding: AtlasObservedReaderEncoding = .utf8,
+                       spellings: [String]? = nil) -> [String: Any] {
         var value = common(owner, generation, "search")
+        let literals = spellings ?? Array(repeating: request.needle, count: count)
+        precondition(literals.count == count)
         let bytes = AtlasObservedReaderSearchRequest.originalBytes(request.needle, encoding: encoding)
+        value["mode"] = request.caseSensitive ? "exact-decoded-literal" : "unicode-lowercase-literal"
         value["needle"] = request.needle; value["discovery_complete"] = true
         value["search_complete"] = true; value["truncated"] = false; value["stop_reason"] = NSNull()
         value["files_examined"] = "1"; value["files_unexamined"] = "0"
@@ -58,19 +62,22 @@ private enum StreamFixture {
         value["payload_bytes_read"] = String(length); value["scanned_input_bytes"] = String(length)
         value["read_calls"] = "256"; value["interrupted_read_calls"] = "0"
         value["peak_input_buffer_bytes"] = "16384"
-        value["retained_witness_bytes"] = String(count == 0 ? 0 : bytes.count)
+        value["retained_witness_bytes"] = String(request.caseSensitive ? (count == 0 ? 0 : bytes.count)
+            : literals.reduce(0) { $0 + AtlasObservedReaderSearchRequest.originalBytes($1, encoding: encoding).count })
         value["limits"] = ["max_matches": String(request.maximumMatches),
             "max_scan_bytes": String(request.maximumScanBytes), "max_read_calls": String(request.maximumReadCalls)]
         value["hits"] = (0..<count).map { index -> [String: Any] in
-            ["index": String(index), "occurrence_id": String(index + 1), "file_id": "1", "node_ordinal": "5",
+            let original = AtlasObservedReaderSearchRequest.originalBytes(literals[index], encoding: encoding)
+            return ["index": String(index), "occurrence_id": String(index + 1), "file_id": "1", "node_ordinal": "5",
              "source_revision": String(generation), "path": path([0x73, 0x72, 0x63, 0x2f, 0xff, 0x2e, 0x74, 0x78, 0x74]),
-             "original_range": ObservedReaderFixture.range(start + UInt64(index * 8), start + UInt64(index * 8 + bytes.count)),
+             "original_range": ObservedReaderFixture.range(start + UInt64(index * 8), start + UInt64(index * 8 + original.count)),
              "encoding": encoding.rawValue, "observed_length": String(length), "final_observed_length": String(length),
              "consistency": "unchanged-metadata-not-atomic", "file_state": "complete-observed-input", "file_complete": true,
-             "witness_sha256": String(repeating: "b", count: 64)]
+             "witness_sha256": String(repeating: request.caseSensitive || index % 2 == 0 ? "b" : "c", count: 64),
+             "fixture_spelling": literals[index]]
         }
         // Keep default receipts legacy to exercise backward compatibility.
-        if !request.fileScope.isAll || !request.pathScope.isWorkspace {
+        if !request.fileScope.isAll || !request.pathScope.isWorkspace || !request.caseSensitive {
             value.merge(scope(request), uniquingKeysWith: { _, next in next })
         }
         if request.countAllMatches {
@@ -99,7 +106,8 @@ private enum StreamFixture {
     static func witness(_ report: [String: Any], index: Int) -> [String: Any] {
         var value = report; value["command"] = "hit"
         var row = (report["hits"] as! [[String: Any]])[index]
-        let text = report["needle"] as! String, encoding = AtlasObservedReaderEncoding(rawValue: row["encoding"] as! String)!
+        let text = row["fixture_spelling"] as? String ?? report["needle"] as! String
+        let encoding = AtlasObservedReaderEncoding(rawValue: row["encoding"] as! String)!
         row["text"] = text
         row["original_hex"] = ObservedReaderFixture.hex(AtlasObservedReaderSearchRequest.originalBytes(text, encoding: encoding))
         value["hit"] = row; value.removeValue(forKey: "hits")
@@ -129,7 +137,7 @@ private enum StreamProgressFixture {
         value["payload_bytes_read"] = String(bytes); value["scanned_input_bytes"] = String(bytes)
         value["read_calls"] = String((bytes + 16_383) / 16_384)
         value["peak_input_buffer_bytes"] = String(min(bytes, 16_384))
-        if !request.fileScope.isAll || !request.pathScope.isWorkspace {
+        if !request.fileScope.isAll || !request.pathScope.isWorkspace || !request.caseSensitive {
             value.merge(StreamFixture.scope(request, catalogued: 2, eligible: 2),
                 uniquingKeysWith: { _, next in next })
         }
@@ -326,8 +334,10 @@ private final class StreamContextProbe: @unchecked Sendable {
         try wireTests()
         try scopeWireTests()
         try countedWireTests()
+        try lowercaseWireTests()
         try progressWireTests()
         try await countedModelTests()
+        try await lowercaseModelTests()
         try await progressModelTests()
         try await modelTests()
         try await scopedModelTests()
@@ -1019,5 +1029,126 @@ private final class StreamContextProbe: @unchecked Sendable {
         precondition(!probe.hasReleased("quarantine"))
         probe.allowClose(true); AtlasWorkspaceStreamModel.retryRetirements()
         try await wait("explicit bounded retirement retry") { probe.hasReleased("quarantine") && probe.closedCount == probe.createCount }
+    }
+}
+
+
+private extension AtlasWorkspaceStreamTests {
+    static func lowercaseWireTests() throws {
+        let owner: UInt64 = 0xfedcba9876543210
+        let catalog = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(StreamFixture.catalog(owner)), owner: owner)
+        let request = try AtlasWorkspaceStreamRequest(needle: "k", caseSensitive: false)
+        let exact = try AtlasWorkspaceStreamRequest(needle: "k")
+        precondition(request != exact && !request.caseSensitive)
+        for encoding in AtlasObservedReaderEncoding.allCases {
+            let wire = StreamFixture.report(owner, 1, request, count: 3, encoding: encoding, spellings: ["k", "K", "K"])
+            func decode(_ value: [String: Any], selected: AtlasWorkspaceStreamRequest? = nil) throws -> AtlasWorkspaceStreamReport {
+                let page = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(value)),
+                    catalog: catalog, root: catalog.root, request: selected ?? request)
+                return try .init(summary: page.summary, hits: page.hits)
+            }
+            let report = try decode(wire)
+            let bytes = ["k", "K", "K"].reduce(0) {
+                $0 + AtlasObservedReaderSearchRequest.originalBytes($1, encoding: encoding).count
+            }
+            precondition(report.summary.witnessBytes == UInt64(bytes) && report.hits.count == 3)
+            for (index, spelling) in ["k", "K", "K"].enumerated() {
+                let hit = report.hits[index], target = report.target(for: hit)
+                let witness = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(StreamFixture.witness(wire, index: index)),
+                    report: report, root: catalog.root, target: target)
+                precondition(witness.text.utf8.elementsEqual(spelling.utf8))
+                precondition(witness.originalHex == ObservedReaderFixture.hex(
+                    AtlasObservedReaderSearchRequest.originalBytes(spelling, encoding: encoding)))
+                precondition(hit.range.count == UInt64(witness.originalHex.utf8.count / 2))
+            }
+            var invalid = wire; invalid["retained_witness_bytes"] = String(bytes + 1)
+            rejects("lowercase per-occurrence witness accounting") { _ = try decode(invalid) }
+            invalid = wire; invalid["case_sensitive"] = true
+            rejects("wrong matching policy") { _ = try decode(invalid) }
+            invalid = wire; invalid.removeValue(forKey: "case_sensitive")
+            rejects("missing lowercase scope policy") { _ = try decode(invalid) }
+            rejects("lowercase receipt admitted as legacy exact") { _ = try decode(wire, selected: .init(needle: "k")) }
+            var badWitness = StreamFixture.witness(wire, index: 0)
+            var row = badWitness["hit"] as! [String: Any]; row["witness_sha256"] = String(repeating: "c", count: 64)
+            badWitness["hit"] = row
+            rejects("witness from another occurrence") {
+                _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(badWitness), report: report,
+                    root: catalog.root, target: report.target(for: report.hits[0]))
+            }
+            if encoding != .utf8 {
+                invalid = wire; var hits = invalid["hits"] as! [[String: Any]]
+                hits[0]["original_range"] = ObservedReaderFixture.range(StreamFixture.start + 1, StreamFixture.start + 3)
+                invalid["hits"] = hits
+                rejects("misaligned UTF16 lowercase witness") { _ = try decode(invalid) }
+            }
+        }
+
+        // Expansion evidence retains the entire contributing source scalar.
+        // Distinct engine occurrence IDs must survive even when raw ranges
+        // coincide; raw byte ranges are not an occurrence identity.
+        let expanded = try AtlasWorkspaceStreamRequest(needle: "\u{307}", caseSensitive: false)
+        var repeated = StreamFixture.report(owner, 2, expanded, count: 2, spellings: ["İ", "İ"])
+        var rows = repeated["hits"] as! [[String: Any]]
+        rows[1]["original_range"] = rows[0]["original_range"]
+        rows[1]["witness_sha256"] = rows[0]["witness_sha256"]; repeated["hits"] = rows
+        let page = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(repeated)),
+            catalog: catalog, root: catalog.root, request: expanded)
+        let report = try AtlasWorkspaceStreamReport(summary: page.summary, hits: page.hits)
+        precondition(report.hits.count == 2 && report.hits[0].range == report.hits[1].range
+            && report.hits[0].occurrence != report.hits[1].occurrence && report.summary.witnessBytes == 4)
+        let original = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(StreamFixture.witness(repeated, index: 1)),
+            report: report, root: catalog.root, target: report.target(for: report.hits[1]))
+        precondition(original.text == "İ" && original.originalHex == "c4b0")
+
+        let counted = try AtlasWorkspaceStreamRequest(needle: "k", maximumMatches: 3, countAllMatches: true, caseSensitive: false)
+        let full = StreamFixture.counted(StreamFixture.report(owner, 3, counted, count: 3, spellings: ["K", "k", "K"]),
+            matches: 99, matchingFiles: 1)
+        let countedPage = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(full)),
+            catalog: catalog, root: catalog.root, request: counted)
+        let countedReport = try AtlasWorkspaceStreamReport(summary: countedPage.summary, hits: countedPage.hits)
+        precondition(countedReport.summary.matchCountComplete && countedReport.summary.truncated
+            && countedReport.summary.matchesSeen == 99 && countedReport.summary.witnessBytes == 5)
+    }
+
+    @MainActor static func lowercaseModelTests() async throws {
+        let probe = StreamProbe(), model = AtlasWorkspaceStreamModel(transport: probe.progressiveTransport, query: "old")
+        precondition(model.caseSensitive)
+        model.open(.init(root: StreamFixture.root, project: UUID(), browserOwner: 1, access: nil))
+        try await wait("lowercase catalog") { !model.busy && model.catalog != nil }
+        model.caseSensitive = false; model.search()
+        try await wait("lowercase report") { !model.busy && model.reportAuthorized }
+        let report = model.report!, target = report.target(for: report.hits[0])
+        precondition(!report.summary.request.caseSensitive && report.summary.witnessBytes == 120)
+        model.select(target); try await wait("lowercase retained spelling") { !model.busy && model.witness != nil }
+        let contextProbe = StreamContextProbe(); model.readCurrentContext(transport: contextProbe.transport)
+        let context = model.currentContext!; context.start()
+        try await wait("lowercase current context") { context.model.page != nil && !context.model.busy }
+        model.caseSensitive = true
+        precondition(model.report == nil && model.witness == nil && !model.canSelect
+            && model.currentContext == nil && context.model.closed)
+        let calls = probe.hitCount; model.select(target); precondition(probe.hitCount == calls)
+
+        model.caseSensitive = false
+        let late = ObservedReaderGate(); probe.blockProgress(late); model.search()
+        try await wait("lowercase progressive work") { late.entered && model.progress != nil }
+        model.caseSensitive = true
+        precondition(!model.busy && model.progress == nil && model.report == nil)
+        late.release(); try await wait("lowercase progressive drain") { probe.activeCount == 0 }
+        await Task.yield(); precondition(model.report == nil && model.progress == nil)
+        for policy in [true, false] {
+            model.caseSensitive = policy; model.search()
+            try await wait("policy-specific report before clear") { !model.busy && model.reportAuthorized }
+            precondition(model.report?.summary.request.caseSensitive == policy)
+            model.clear(); try await wait("clear has no query matching policy") { !model.busy }
+            precondition(model.report == nil && model.witness == nil && model.canSearch
+                && model.notice.contains("Retained search literals cleared"))
+        }
+        model.caseSensitive = false; model.countAllMatches = true; model.search()
+        try await wait("counted lowercase inventory") { !model.busy && model.reportAuthorized }
+        precondition(model.report?.summary.request.countAllMatches == true
+            && model.report?.summary.request.caseSensitive == false
+            && model.report?.summary.matchCountComplete == true && model.report?.summary.matchesSeen == 2_000
+            && model.report?.summary.witnessBytes == 256 * 3)
+        model.close(); try await wait("lowercase owner retirement") { probe.closedCount == probe.createCount }
     }
 }

@@ -2,6 +2,7 @@ import Foundation
 
 enum AtlasObservedReaderSearchLimits {
     static let needleBytes = 4096
+    static let maximumWitnessBytes = needleBytes * 12
     static let matches: UInt64 = 256
     static let scanBytes: UInt64 = 256 * 1024 * 1024
     static let maximumScanBytes: UInt64 = 4 * 1024 * 1024 * 1024
@@ -9,19 +10,20 @@ enum AtlasObservedReaderSearchLimits {
     static let inputBufferBytes: UInt64 = 16 * 1024
 }
 
-/// Exact text and an explicit encoding for one bounded scan of the already
-/// opened file object. No case folding, normalization or regex is implied.
+/// Text, matching policy and explicit encoding for one bounded scan of the
+/// already opened file object. Unicode lowercase matching belongs to the engine.
 struct AtlasObservedReaderSearchRequest: Equatable, Sendable {
     let generation: UInt64
     let needle: String
     let encoding: AtlasObservedReaderEncoding
     let maximumMatches, maximumScanBytes: UInt64
     let countAllMatches: Bool
+    let caseSensitive: Bool
 
     init(generation: UInt64, needle: String, encoding: AtlasObservedReaderEncoding,
          maximumMatches: UInt64 = AtlasObservedReaderSearchLimits.matches,
          maximumScanBytes: UInt64 = AtlasObservedReaderSearchLimits.scanBytes,
-         countAllMatches: Bool = false) throws {
+         countAllMatches: Bool = false, caseSensitive: Bool = true) throws {
         guard generation > 0, !needle.isEmpty,
               needle.utf8.count <= AtlasObservedReaderSearchLimits.needleBytes,
               !needle.utf8.contains(0),
@@ -32,12 +34,14 @@ struct AtlasObservedReaderSearchRequest: Equatable, Sendable {
         self.generation = generation; self.needle = needle; self.encoding = encoding
         self.maximumMatches = maximumMatches; self.maximumScanBytes = maximumScanBytes
         self.countAllMatches = countAllMatches
+        self.caseSensitive = caseSensitive
     }
 
     static func == (a: Self, b: Self) -> Bool {
         a.generation == b.generation && a.needle.utf8.elementsEqual(b.needle.utf8)
             && a.encoding == b.encoding && a.maximumMatches == b.maximumMatches
             && a.maximumScanBytes == b.maximumScanBytes && a.countAllMatches == b.countAllMatches
+            && a.caseSensitive == b.caseSensitive
     }
 
     /// Reverse encoding is only a correlation check against engine receipts;
@@ -52,6 +56,24 @@ struct AtlasObservedReaderSearchRequest: Equatable, Sendable {
         return bytes
     }
     var originalHex: String { AtlasObservedReaderWire.hex(Self.originalBytes(needle, encoding: encoding)) }
+    var wireMode: String { caseSensitive ? "exact-decoded-text" : "unicode-lowercase-text" }
+
+    static func validWitnessRange(_ range: AtlasObservedByteRange, needle: String,
+        encoding: AtlasObservedReaderEncoding, caseSensitive: Bool) -> Bool {
+        guard range.count > 0, encoding == .utf8 || (range.start % 2 == 0 && range.end % 2 == 0) else { return false }
+        return caseSensitive ? range.count == UInt64(originalBytes(needle, encoding: encoding).count)
+            : range.count <= UInt64(needle.utf8.count * 12)
+    }
+    /// Check bounded spelling and its original encoding; do not duplicate the
+    /// engine's Unicode matching rules in a second native matcher.
+    static func validWitnessText(_ text: String, hex: String, range: AtlasObservedByteRange,
+        needle: String, encoding: AtlasObservedReaderEncoding, caseSensitive: Bool) -> Bool {
+        guard validWitnessRange(range, needle: needle, encoding: encoding, caseSensitive: caseSensitive),
+              !text.isEmpty, text.utf8.count <= needle.utf8.count * 24, !text.utf8.contains(0),
+              !caseSensitive || text.utf8.elementsEqual(needle.utf8) else { return false }
+        let bytes = originalBytes(text, encoding: encoding)
+        return UInt64(bytes.count) == range.count && hex == AtlasObservedReaderWire.hex(bytes)
+    }
 }
 
 struct AtlasObservedReaderSearchTransport: Sendable {
@@ -64,6 +86,7 @@ struct AtlasObservedReaderSearchTransport: Sendable {
 struct AtlasObservedReaderSearchHit: Equatable, Identifiable, Sendable {
     let index, occurrence: UInt64
     let range: AtlasObservedByteRange
+    let witnessSHA256: String
     var id: UInt64 { index }
 }
 
@@ -112,6 +135,7 @@ struct AtlasObservedReaderSearchReport: Sendable {
     let payloadBytesRead, scannedInputBytes, readCalls, peakInputBufferBytes, matchesSeen: UInt64
     let unsupportedAt: UInt64?
     let originalHex, witnessSHA256: String?
+    let retainedWitnessBytes: UInt64
     let hits: [AtlasObservedReaderSearchHit]
 
     func target(for hit: AtlasObservedReaderSearchHit) -> AtlasObservedReaderSearchTarget {
@@ -174,7 +198,7 @@ struct AtlasObservedReaderSearchReport: Sendable {
                 guard !request.countAllMatches else { throw AtlasObservedReaderError.invalidResponse }
                 matchCountComplete = observation.searchComplete
             }
-            guard w.mode == "exact-decoded-text", w.case_sensitive,
+            guard w.mode == request.wireMode, w.case_sensitive == request.caseSensitive,
                   w.literal_text.utf8.elementsEqual(request.needle.utf8),
                   w.max_matches.value == request.maximumMatches, w.max_scan_bytes.value == request.maximumScanBytes,
                   w.max_read_calls.value == AtlasObservedReaderSearchLimits.readCalls,
@@ -187,7 +211,7 @@ struct AtlasObservedReaderSearchReport: Sendable {
                   w.additional_source_bytes_read.value == w.payload_bytes_read.value,
                   w.additional_read_calls.value == w.read_calls.value,
                   w.truncated == (w.matches_seen.value > count),
-                  count <= w.matches_seen.value,
+                  count <= w.matches_seen.value, w.matches_seen.value <= w.scanned_input_bytes.value,
                   !w.truncated || count == request.maximumMatches,
                   !observation.inputComplete || (w.scanned_input_bytes.value == observation.length
                     && w.payload_bytes_read.value == observation.length),
@@ -196,7 +220,7 @@ struct AtlasObservedReaderSearchReport: Sendable {
                   (w.observation.state == "unsupported-text") == (w.unsupported_at != nil),
                   w.observation.state != "unsupported-text" || count == 0,
                   w.unsupported_at.map({ $0.value < w.payload_bytes_read.value }) ?? true,
-                  (count == 0 ? (w.literal_original_hex == nil && w.literal_sha256 == nil)
+                  (count == 0 || !request.caseSensitive ? (w.literal_original_hex == nil && w.literal_sha256 == nil)
                     : (w.literal_original_hex == encoded
                       && w.literal_sha256.map { AtlasObservedReaderWire.validHex($0, bytes: 32) } == true)) else {
                 throw AtlasObservedReaderError.invalidResponse
@@ -210,15 +234,27 @@ struct AtlasObservedReaderSearchReport: Sendable {
                 }
             }
             var hits: [AtlasObservedReaderSearchHit] = []; hits.reserveCapacity(w.hits.count)
+            var witnessBytes: UInt64 = 0
             for (index, hit) in w.hits.enumerated() {
+                let digest = request.caseSensitive ? w.literal_sha256 : hit.witness_sha256
                 guard hit.index.value == UInt64(index), hit.occurrence_id.value == UInt64(index) + 1,
-                      hit.original_range.count == UInt64(encoded.utf8.count / 2),
+                      AtlasObservedReaderSearchRequest.validWitnessRange(hit.original_range, needle: request.needle,
+                        encoding: request.encoding, caseSensitive: request.caseSensitive),
                       hit.original_range.end <= w.scanned_input_bytes.value,
-                      request.encoding == .utf8 || hit.original_range.start % 2 == 0,
-                      hits.last.map({ $0.range.start < hit.original_range.start }) ?? true else {
+                      let digest, AtlasObservedReaderWire.validHex(digest, bytes: 32),
+                      !request.caseSensitive || hit.witness_sha256 == nil || hit.witness_sha256 == digest,
+                      hits.last.map({ previous in request.caseSensitive
+                        ? previous.range.start < hit.original_range.start
+                        : previous.range.start <= hit.original_range.start && previous.range.end <= hit.original_range.end }) ?? true else {
                     throw AtlasObservedReaderError.invalidResponse
                 }
-                hits.append(.init(index: hit.index.value, occurrence: hit.occurrence_id.value, range: hit.original_range))
+                if !request.caseSensitive || index == 0 { witnessBytes += hit.original_range.count }
+                hits.append(.init(index: hit.index.value, occurrence: hit.occurrence_id.value,
+                    range: hit.original_range, witnessSHA256: digest))
+            }
+            guard request.caseSensitive || w.retained_witness_bytes != nil,
+                  w.retained_witness_bytes.map({ $0.value == witnessBytes }) ?? true else {
+                throw AtlasObservedReaderError.invalidResponse
             }
             return Self(identity: identity, request: request, observation: observation.id,
                 observedLength: observation.length, finalObservedLength: observation.finalLength,
@@ -228,7 +264,8 @@ struct AtlasObservedReaderSearchReport: Sendable {
                 payloadBytesRead: w.payload_bytes_read.value, scannedInputBytes: w.scanned_input_bytes.value,
                 readCalls: w.read_calls.value, peakInputBufferBytes: w.peak_input_buffer_bytes.value,
                 matchesSeen: w.matches_seen.value, unsupportedAt: w.unsupported_at?.value,
-                originalHex: w.literal_original_hex, witnessSHA256: w.literal_sha256, hits: hits)
+                originalHex: w.literal_original_hex, witnessSHA256: w.literal_sha256,
+                retainedWitnessBytes: witnessBytes, hits: hits)
         } catch { throw AtlasObservedReaderError.invalidResponse }
     }
 
@@ -242,10 +279,12 @@ struct AtlasObservedReaderSearchReport: Sendable {
         let payload_bytes_read, scanned_input_bytes, read_calls, peak_input_buffer_bytes: AtlasObservedReaderWire.Number
         let matches_seen, retained_hits, additional_source_bytes_read, additional_read_calls: AtlasObservedReaderWire.Number
         let unsupported_at: AtlasObservedReaderWire.Number?
+        let retained_witness_bytes: AtlasObservedReaderWire.Number?
         let hits: [Hit]
         struct Hit: Decodable {
             let index, occurrence_id: AtlasObservedReaderWire.Number
             let original_range: AtlasObservedByteRange
+            let witness_sha256: String?
         }
         init(from decoder: Decoder) throws {
             observation = try .init(from: decoder)
@@ -268,6 +307,7 @@ struct AtlasObservedReaderSearchReport: Sendable {
             additional_source_bytes_read = try c.decode(AtlasObservedReaderWire.Number.self, forKey: .additional_source_bytes_read)
             additional_read_calls = try c.decode(AtlasObservedReaderWire.Number.self, forKey: .additional_read_calls)
             unsupported_at = try c.decodeIfPresent(AtlasObservedReaderWire.Number.self, forKey: .unsupported_at)
+            retained_witness_bytes = try c.decodeIfPresent(AtlasObservedReaderWire.Number.self, forKey: .retained_witness_bytes)
             hits = try c.decode([Hit].self, forKey: .hits)
         }
         private enum CodingKeys: CodingKey {
@@ -275,7 +315,7 @@ struct AtlasObservedReaderSearchReport: Sendable {
             case count_all_matches, match_count_complete
             case max_matches, max_scan_bytes, max_read_calls, payload_bytes_read, scanned_input_bytes, read_calls
             case peak_input_buffer_bytes, matches_seen, retained_hits, additional_source_bytes_read, additional_read_calls
-            case unsupported_at, hits
+            case unsupported_at, retained_witness_bytes, hits
         }
     }
 }
@@ -294,14 +334,20 @@ struct AtlasObservedReaderSearchWitness: Sendable {
                 .identity(handle: handle, input: input, command: "search-hit")
             let common = try decoder.decode(AtlasObservedReaderSearchWire.Observation.self, from: data)
             let observation = try common.value(request: report.request)
+            if w.mode != nil || w.case_sensitive != nil || !report.request.caseSensitive {
+                guard w.mode == report.request.wireMode, w.case_sensitive == report.request.caseSensitive else {
+                    throw AtlasObservedReaderError.invalidResponse
+                }
+            }
             guard report.admits(target), identity == report.identity, observation.id == report.observation,
                   observation.length == report.observedLength, observation.finalLength == report.finalObservedLength,
                   observation.inputComplete == report.inputComplete, observation.searchComplete == report.searchComplete,
                   common.state == report.state, common.consistency == report.consistency,
                   w.index.value == target.hit.index, w.occurrence_id.value == target.hit.occurrence,
                   w.original_range == target.hit.range,
-                  w.text.utf8.elementsEqual(report.request.needle.utf8),
-                  w.original_hex == report.originalHex, w.witness_sha256 == report.witnessSHA256,
+                  AtlasObservedReaderSearchRequest.validWitnessText(w.text, hex: w.original_hex, range: target.hit.range,
+                    needle: report.request.needle, encoding: report.request.encoding, caseSensitive: report.request.caseSensitive),
+                  w.witness_sha256 == target.hit.witnessSHA256,
                   w.additional_source_bytes_read.value == 0, w.additional_read_calls.value == 0 else {
                 throw AtlasObservedReaderError.invalidResponse
             }
@@ -313,6 +359,8 @@ struct AtlasObservedReaderSearchWitness: Sendable {
         let index, occurrence_id, additional_source_bytes_read, additional_read_calls: AtlasObservedReaderWire.Number
         let original_range: AtlasObservedByteRange
         let text, original_hex, witness_sha256: String
+        let mode: String?
+        let case_sensitive: Bool?
     }
 
     /// New context is a separate observation. It may only receive a selection
@@ -364,9 +412,12 @@ struct AtlasObservedReaderExternalMatch: Sendable {
     let text, originalHex: String
     init(input: AtlasObservedReaderInput, range: AtlasObservedByteRange,
          encoding: AtlasObservedReaderEncoding, text: String, originalHex: String) throws {
+        guard !text.isEmpty, text.utf8.count <= AtlasObservedReaderSearchLimits.maximumWitnessBytes * 2,
+              range.count <= UInt64(AtlasObservedReaderSearchLimits.maximumWitnessBytes) else {
+            throw AtlasObservedReaderError.invalidInput
+        }
         let bytes = AtlasObservedReaderSearchRequest.originalBytes(text, encoding: encoding)
-        guard !text.isEmpty, text.utf8.count <= AtlasObservedReaderSearchLimits.needleBytes,
-              range.count == UInt64(bytes.count), range.count > 0,
+        guard range.count == UInt64(bytes.count), range.count > 0,
               originalHex == AtlasObservedReaderWire.hex(bytes),
               encoding == .utf8 || range.start % 2 == 0 else { throw AtlasObservedReaderError.invalidInput }
         self.input = input; self.range = range; self.encoding = encoding

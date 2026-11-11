@@ -16,7 +16,7 @@ enum AtlasWorkspaceStreamError: Error, Sendable {
     case engine(String)
     var message: String {
         switch self {
-        case .invalidInput: return "Enter exact text of 1–1024 UTF-8 bytes without NUL and choose a supported scan limit."
+        case .invalidInput: return "Enter text of 1–1024 UTF-8 bytes without NUL and choose a supported scan limit."
         case .unavailable: return "Large-file project search is unavailable. Close another search or refresh this file catalog."
         case .invalidResponse: return "The search response could not be verified. Previously accepted evidence is unchanged."
         case .canceled: return "Search canceled. Entered file work may still be draining."
@@ -31,12 +31,13 @@ struct AtlasWorkspaceStreamRequest: Equatable, Sendable {
     let fileScope: AtlasSearchFileScope
     let pathScope: AtlasSearchPathScope
     let countAllMatches: Bool
+    let caseSensitive: Bool
     init(needle: String, maximumScanBytes: UInt64 = AtlasWorkspaceStreamLimits.scanBytes,
          maximumMatches: UInt64 = AtlasWorkspaceStreamLimits.hits,
          maximumReadCalls: UInt64 = AtlasWorkspaceStreamLimits.readCalls,
          fileScope: AtlasSearchFileScope = .all,
          pathScope: AtlasSearchPathScope = .workspace,
-         countAllMatches: Bool = false) throws {
+         countAllMatches: Bool = false, caseSensitive: Bool = true) throws {
         guard !needle.isEmpty, needle.utf8.count <= AtlasWorkspaceStreamLimits.needleBytes,
               !needle.utf8.contains(0), (1...AtlasWorkspaceStreamLimits.hits).contains(maximumMatches),
               (1...AtlasWorkspaceStreamLimits.maximumScanBytes).contains(maximumScanBytes),
@@ -47,12 +48,14 @@ struct AtlasWorkspaceStreamRequest: Equatable, Sendable {
         self.maximumMatches = maximumMatches; self.maximumReadCalls = maximumReadCalls
         self.fileScope = fileScope; self.pathScope = pathScope
         self.countAllMatches = countAllMatches
+        self.caseSensitive = caseSensitive
     }
     static func == (a: Self, b: Self) -> Bool {
         a.needle.utf8.elementsEqual(b.needle.utf8) && a.maximumMatches == b.maximumMatches
             && a.maximumScanBytes == b.maximumScanBytes && a.maximumReadCalls == b.maximumReadCalls
             && a.fileScope == b.fileScope && a.pathScope == b.pathScope
             && a.countAllMatches == b.countAllMatches
+            && a.caseSensitive == b.caseSensitive
     }
 }
 
@@ -169,7 +172,7 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
 
     fileprivate static func decode(_ w: AtlasWorkspaceStreamWire, catalog: AtlasWorkspaceStreamCatalog,
                                    root: String, request: AtlasWorkspaceStreamRequest, terminal: Bool = true) throws -> Self {
-        let identity = try w.streamIdentity(owner: catalog.owner, root: root)
+        let identity = try w.streamIdentity(owner: catalog.owner, root: root, caseSensitive: request.caseSensitive)
         let limit = try w.object("limits")
         let files = try w.number("catalogued_files"), examined = try w.number("files_examined")
         let unexamined = try w.number("files_unexamined"), incomplete = try w.number("incomplete_files")
@@ -206,7 +209,9 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
               payload <= request.maximumScanBytes, scanned <= payload,
               calls <= request.maximumReadCalls, interrupted <= calls,
               payload == 0 || calls > 0, peak <= min(payload, 16 * 1024),
-              witnesses >= retainedFiles, witnesses <= retainedFiles * UInt64(request.needle.utf8.count * 2),
+              witnesses >= (request.caseSensitive ? retainedFiles : retained),
+              witnesses <= (request.caseSensitive ? retainedFiles * UInt64(request.needle.utf8.count * 2)
+                : retained * UInt64(request.needle.utf8.count * 12)),
               stop != "byte-limit" || payload == request.maximumScanBytes,
               stop != "read-call-limit" || calls == request.maximumReadCalls,
               complete == (terminal && discovery && scope.missing == 0 && unexamined == 0 && incomplete == 0 && stop == nil) else {
@@ -255,7 +260,6 @@ struct AtlasWorkspaceStreamHit: Equatable, Identifiable, Sendable {
         file == other.file && node == other.node && revision == other.revision && path == other.path
             && encoding == other.encoding && observedLength == other.observedLength && finalLength == other.finalLength
             && consistency == other.consistency && state == other.state && complete == other.complete
-            && witnessSHA256 == other.witnessSHA256
     }
     fileprivate static func decode(_ w: AtlasWorkspaceStreamWire, root: String,
                                    summary: AtlasWorkspaceStreamSummary) throws -> Self {
@@ -274,9 +278,10 @@ struct AtlasWorkspaceStreamHit: Equatable, Identifiable, Sendable {
         let length = try w.number("observed_length"), final = try w.optionalNumber("final_observed_length")
         let consistency = try w.text("consistency"), state = try w.text("file_state")
         let complete = try w.flag("file_complete"), digest = try w.text("witness_sha256")
-        let literalBytes = UInt64(AtlasObservedReaderSearchRequest.originalBytes(summary.request.needle, encoding: encoding).count)
         guard index < summary.retainedHits, occurrence > 0, occurrence <= summary.request.maximumMatches,
-              file > 0, revision > 0, range.count == literalBytes,
+              file > 0, revision > 0,
+              AtlasObservedReaderSearchRequest.validWitnessRange(range, needle: summary.request.needle,
+                encoding: encoding, caseSensitive: summary.request.caseSensitive),
               range.end <= length, range.end <= summary.scannedBytes,
               encoding == .utf8 || range.start % 2 == 0,
               ["complete-observed-input", "match-limit", "byte-limit", "read-call-limit", "short-read", "failed"].contains(state),
@@ -414,14 +419,19 @@ struct AtlasWorkspaceStreamReport: Sendable {
             if index > 0, hits[index - 1].file == hit.file {
                 let previous = hits[index - 1]
                 guard hit.sameFile(as: previous), hit.occurrence == previous.occurrence + 1,
-                      hit.range.start > previous.range.start else { throw AtlasWorkspaceStreamError.invalidResponse }
+                      !summary.request.caseSensitive || hit.witnessSHA256 == previous.witnessSHA256,
+                      summary.request.caseSensitive ? hit.range.start > previous.range.start
+                        : hit.range.start >= previous.range.start && hit.range.end >= previous.range.end else {
+                    throw AtlasWorkspaceStreamError.invalidResponse
+                }
             } else {
                 guard files.insert(hit.file).inserted, hit.occurrence == 1,
                       index == 0 || hits[index - 1].path.lexicographicallyPrecedes(hit.path) else {
                     throw AtlasWorkspaceStreamError.invalidResponse
                 }
-                bytes += hit.range.count
+                if summary.request.caseSensitive { bytes += hit.range.count }
             }
+            if !summary.request.caseSensitive { bytes += hit.range.count }
         }
         guard UInt64(files.count) <= summary.retainedMatchingFiles, bytes <= summary.witnessBytes else {
             throw AtlasWorkspaceStreamError.invalidResponse
@@ -455,14 +465,16 @@ struct AtlasWorkspaceStreamWitness: Sendable {
                 catalogued: report.summary.cataloguedFiles, complete: report.summary.complete)
             let counting = try w.countCoverage(request: report.summary.request,
                 complete: report.summary.complete, matchingFiles: report.summary.matchingFiles)
-            guard report.admits(target), try w.streamIdentity(owner: target.identity.owner, root: root) == target.identity,
+            guard report.admits(target),
+                  try w.streamIdentity(owner: target.identity.owner, root: root,
+                    caseSensitive: report.summary.request.caseSensitive) == target.identity,
                   scope.eligible == report.summary.eligibleFiles, scope.excluded == report.summary.excludedFiles,
                   scope.missing == report.summary.missingVisibleFiles,
                   counting.complete == report.summary.matchCountComplete,
                   counting.retainedFiles == report.summary.retainedMatchingFiles,
                   row == target.hit, try w.text("needle").utf8.elementsEqual(report.summary.request.needle.utf8),
-                  text.utf8.elementsEqual(report.summary.request.needle.utf8),
-                  hex == AtlasObservedReaderWire.hex(AtlasObservedReaderSearchRequest.originalBytes(text, encoding: row.encoding)),
+                  AtlasObservedReaderSearchRequest.validWitnessText(text, hex: hex, range: row.range,
+                    needle: report.summary.request.needle, encoding: row.encoding, caseSensitive: report.summary.request.caseSensitive),
                   try w.number("additional_source_bytes_read") == 0, try w.number("additional_read_calls") == 0 else {
                 throw AtlasWorkspaceStreamError.invalidResponse
             }
@@ -548,12 +560,12 @@ struct AtlasWorkspaceStreamWire: Decodable {
             "scope_region_catalogued_files", "scope_region_missing_files"]
         let present = (required + region).contains { fields.contains(Key($0)) }
         guard present else {
-            guard request.fileScope.isAll, request.pathScope.isWorkspace else {
+            guard request.fileScope.isAll, request.pathScope.isWorkspace, request.caseSensitive else {
                 throw AtlasWorkspaceStreamError.invalidResponse
             }
             return (catalogued, 0, 0)
         }
-        guard required.allSatisfy({ fields.contains(Key($0)) }), try flag("case_sensitive") else {
+        guard required.allSatisfy({ fields.contains(Key($0)) }), try flag("case_sensitive") == request.caseSensitive else {
             throw AtlasWorkspaceStreamError.invalidResponse
         }
         func additive(_ key: String) throws -> String? {
@@ -608,13 +620,13 @@ struct AtlasWorkspaceStreamWire: Decodable {
         guard try text("schema") == schema, try text("status") == "ok", try text("command") == command,
               try number("owner") == owner else { throw AtlasWorkspaceStreamError.invalidResponse }
     }
-    func streamIdentity(owner: UInt64, root: String) throws -> AtlasWorkspaceStreamIdentity {
+    func streamIdentity(owner: UInt64, root: String, caseSensitive: Bool) throws -> AtlasWorkspaceStreamIdentity {
         let manifest = try number("source_manifest"), layout = try number("layout_revision")
         let generation = try number("query_generation"), rawRoot = try object("root_path").pathBytes()
         guard try number("owner") == owner, manifest > 0, layout > 0, generation > 0,
               try number("last_attempt") >= generation,
               rawRoot.elementsEqual(root.utf8), try text("scope") == "catalogued-whole-files",
-              try text("strategy") == "streaming-whole-file", try text("mode") == "exact-decoded-literal",
+              try text("strategy") == "streaming-whole-file", try text("mode") == AtlasSearchText.wireMode(caseSensitive: caseSensitive),
               try text("capture_kind") == "literal-witnesses-only",
               try text("source_observation") == "per-file-streams-not-atomic-workspace" else {
             throw AtlasWorkspaceStreamError.invalidResponse

@@ -10,6 +10,17 @@ enum ObservedReaderFixture {
         String(decoding: try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]), as: UTF8.self)
     }
     static func range(_ start: UInt64, _ end: UInt64) -> [String: String] { ["start": String(start), "end": String(end)] }
+    /// Decode fixture-authored original bytes for a returned spelling. This is
+    /// test data construction only; production matching/decoding stays in Rust.
+    static func decodedOriginal(_ bytes: [UInt8], encoding: AtlasObservedReaderEncoding) -> String {
+        let decoder: String.Encoding
+        switch encoding {
+        case .utf8: decoder = .utf8
+        case .utf16le: decoder = .utf16LittleEndian
+        case .utf16be: decoder = .utf16BigEndian
+        }
+        return String(bytes: bytes, encoding: decoder)!
+    }
     static func common(_ owner: UInt64, _ input: AtlasObservedReaderInput, _ command: String) -> [String: Any] {
         ["schema": "fcb.observed-reader/1", "status": "ok", "command": command,
          "owner": String(owner), "file_id": "1", "capture_kind": "observed-extent",

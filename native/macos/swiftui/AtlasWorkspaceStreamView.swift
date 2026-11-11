@@ -25,14 +25,14 @@ import AppKit
                 .font(.system(.caption, design: .monospaced)).textSelection(.enabled).lineLimit(2)
             Text(verbatim: "Search scope: " + presentation.source.scopeDescription)
                 .font(.callout).textSelection(.enabled).lineLimit(3)
-            Text("Exact, case-sensitive text in the selected location and file types, including large files. UTF-8 and BOM-declared UTF-16 are recognized automatically. No per-file byte cap applies; the total byte budget limits the scan.")
+            Text("Search text in the selected location and file types, including large files. UTF-8 and BOM-declared UTF-16 are recognized automatically. No per-file byte cap applies; the total byte budget limits the scan.")
                 .font(.caption).foregroundStyle(.secondary)
             Text("This sheet keeps the sidebar's location and file-type selection fixed. Return to the sidebar and reopen this sheet to choose another scope. Discovery uses product exclusions and stops at 20,000 files; excluded files do not consume the scan budget.")
                 .font(.caption).foregroundStyle(.secondary)
             HStack(spacing: 8) {
-                TextField("Exact text to find", text: $model.queryText).textFieldStyle(.roundedBorder)
+                TextField("Text to find", text: $model.queryText).textFieldStyle(.roundedBorder)
                     .focused($queryFocused).onSubmit { if model.canSearch { model.search() } }
-                    .accessibilityLabel("Exact text to find in the selected search scope")
+                    .accessibilityLabel("Text to find in the selected search scope")
                 Picker("Total bytes", selection: $model.scanBytes) {
                     Text("256 MiB").tag(UInt64(256 * 1024 * 1024))
                     Text("1 GiB").tag(UInt64(1024 * 1024 * 1024))
@@ -51,6 +51,8 @@ import AppKit
                 }
             }
             HStack(spacing: 8) {
+                Toggle("Match case", isOn: $model.caseSensitive).toggleStyle(.checkbox)
+                    .help("When off, use Unicode lowercase matching while retaining the original spelling and byte ranges")
                 Toggle("Count all matches", isOn: $model.countAllMatches).toggleStyle(.checkbox)
                     .help("Continue counting after the first 256 retained results, within the selected byte and read-call limits")
                 Text(model.countAllMatches
@@ -99,6 +101,7 @@ import AppKit
         .onChange(of: model.queryText) { _, _ in copyNotice = "" }
         .onChange(of: model.scanBytes) { _, _ in copyNotice = "" }
         .onChange(of: model.countAllMatches) { _, _ in copyNotice = "" }
+        .onChange(of: model.caseSensitive) { _, _ in copyNotice = "" }
         .onChange(of: model.witness?.target) { _, _ in copyNotice = "" }
         .sheet(item: Binding(get: { model.currentContext }, set: { if $0 == nil { model.closeContext() } })) { context in
             AtlasObservedReaderView(presentation: context)
@@ -166,7 +169,7 @@ import AppKit
             } else {
                 ContentUnavailableView(model.busy ? "Searching…" : "Search the project catalog",
                     systemImage: "doc.text.magnifyingglass",
-                    description: Text("Enter exact text and press Search. Matching finalized files appear during the scan; stop and keep them when you have enough."))
+                    description: Text("Enter text and press Search. Matching finalized files appear during the scan; stop and keep them when you have enough."))
             }
             Spacer(minLength: 0)
         }.padding(.trailing, 8)

@@ -103,6 +103,7 @@ import AppKit
         .onDisappear { presentation.close() }
         .onChange(of: model.navigation) { _, _ in copyNotice = "" }
         .onChange(of: model.searchText) { _, _ in copyNotice = "" }
+        .onChange(of: model.searchCaseSensitive) { _, _ in copyNotice = "" }
         .onChange(of: model.countAllSearchMatches) { _, _ in copyNotice = "" }
         .onChange(of: model.encoding) { _, _ in copyNotice = "" }
         .background {
@@ -183,10 +184,10 @@ import AppKit
     private var searchControls: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 7) {
-                TextField("Find exact text in the opened file", text: $model.searchText)
+                TextField("Find text in the opened file", text: $model.searchText)
                     .textFieldStyle(.roundedBorder).focused($searchFocused).onSubmit(model.find)
-                    .accessibilityLabel("Exact text to find in the opened file")
-                    .help("Case-sensitive literal text, without normalization. Up to 4096 UTF-8 bytes; NUL is unsupported.")
+                    .accessibilityLabel("Text to find in the opened file")
+                    .help("Literal text with optional Unicode lowercase matching. Up to 4096 UTF-8 bytes; NUL is unsupported.")
                 Picker("Scan up to", selection: $model.searchScanBytes) {
                     Text("16 MiB").tag(UInt64(16 * 1024 * 1024))
                     Text("256 MiB").tag(AtlasObservedReaderSearchLimits.scanBytes)
@@ -198,6 +199,8 @@ import AppKit
                 Button("Next match", action: model.nextSearchHit).disabled(!model.canSelectSearchHit)
             }
             HStack(spacing: 7) {
+                Toggle("Match case", isOn: $model.searchCaseSensitive).toggleStyle(.checkbox)
+                    .help("When off, use Unicode lowercase matching and retain the original spelling and byte ranges")
                 Toggle("Count all matches", isOn: $model.countAllSearchMatches).toggleStyle(.checkbox)
                     .help("Continue counting after the first 256 retained matches, within the selected scan and read-call limits")
                 Text(model.countAllSearchMatches

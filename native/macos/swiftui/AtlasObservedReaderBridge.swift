@@ -25,6 +25,10 @@ private typealias ObservedReaderPoll = @convention(c) (UnsafeMutableRawPointer?)
     _ handle: UInt64, _ generation: UInt64, _ needle: UnsafePointer<CChar>?, _ encoding: UInt64,
     _ maximumMatches: UInt64, _ maximumScanBytes: UInt64,
     _ poll: ObservedReaderPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_observed_reader_find_matching") private func observedReaderFindMatching(
+    _ handle: UInt64, _ generation: UInt64, _ needle: UnsafePointer<CChar>?, _ encoding: UInt64,
+    _ caseSensitive: UInt64, _ countAllMatches: UInt64, _ maximumMatches: UInt64, _ maximumScanBytes: UInt64,
+    _ poll: ObservedReaderPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_observed_reader_search_hit") private func observedReaderSearchHit(
     _ handle: UInt64, _ generation: UInt64, _ index: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_observed_reader_observe_hit") private func observedReaderObserveHit(
@@ -59,6 +63,10 @@ extension AtlasObservedReaderTransport {
         search: .init(find: { handle, request, cancellation in
             try observedReaderPolling(cancellation) { poll, context in
                 request.needle.withCString { needle in
+                    if !request.caseSensitive {
+                        return observedReaderFindMatching(handle, request.generation, needle, request.encoding.abi,
+                            0, request.countAllMatches ? 1 : 0, request.maximumMatches, request.maximumScanBytes, poll, context)
+                    }
                     if request.countAllMatches {
                         return observedReaderFindCounted(handle, request.generation, needle, request.encoding.abi,
                             request.maximumMatches, request.maximumScanBytes, poll, context)

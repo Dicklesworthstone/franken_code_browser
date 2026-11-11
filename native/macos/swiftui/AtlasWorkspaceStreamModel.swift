@@ -52,8 +52,10 @@ struct AtlasWorkspaceStreamSourceIdentity: Equatable, Sendable {
     let model: AtlasWorkspaceStreamModel
     private var started = false
     private var retired = false
-    init(source: AtlasWorkspaceStreamSource, query: String, transport: AtlasWorkspaceStreamTransport) {
-        self.source = source; model = .init(transport: transport, query: query)
+    init(source: AtlasWorkspaceStreamSource, query: String, caseSensitive: Bool = true,
+         countAllMatches: Bool = false, transport: AtlasWorkspaceStreamTransport) {
+        self.source = source
+        model = .init(transport: transport, query: query, caseSensitive: caseSensitive, countAllMatches: countAllMatches)
     }
     func start() {
         guard !started, !retired else { return }
@@ -242,6 +244,9 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
     var countAllMatches = false {
         didSet { if oldValue != countAllMatches { revokeQuery() } }
     }
+    var caseSensitive = true {
+        didSet { if oldValue != caseSensitive { revokeQuery() } }
+    }
     @ObservationIgnored private let transport: AtlasWorkspaceStreamTransport
     @ObservationIgnored private let io = AtlasProjectIO()
     @ObservationIgnored private var authority: AtlasWorkspaceStreamSource?
@@ -254,8 +259,10 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
     @ObservationIgnored private var stopFlag: AtlasWorkspaceStreamStop?
     @ObservationIgnored private var progressMailbox: AtlasWorkspaceStreamProgressMailbox?
 
-    init(transport: AtlasWorkspaceStreamTransport, query: String = "") {
+    init(transport: AtlasWorkspaceStreamTransport, query: String = "",
+         caseSensitive: Bool = true, countAllMatches: Bool = false) {
         self.transport = transport; queryText = query
+        self.caseSensitive = caseSensitive; self.countAllMatches = countAllMatches
     }
     deinit { task?.cancel() }
     static func retryRetirements() { AtlasWorkspaceStreamRetirement.shared.retry() }
@@ -268,7 +275,7 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
         guard let authority else { throw AtlasWorkspaceStreamError.unavailable }
         return try .init(needle: queryText, maximumScanBytes: scanBytes,
             fileScope: authority.fileScope, pathScope: authority.pathScope,
-            countAllMatches: countAllMatches)
+            countAllMatches: countAllMatches, caseSensitive: caseSensitive)
     }
     var canRefresh: Bool { !closed && authority != nil }
     var canStopAndKeep: Bool { !closed && busy && searching && !stopping && stopFlag != nil }
@@ -438,7 +445,7 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
                 let generation = try await io.perform(cancellation: flag, keepingAlive: [session]) {
                     let wire = try AtlasWorkspaceStreamWire.read(session.transport.clear(session.handle), owner: session.handle)
                     try wire.header(schema: "fcb.atlas-stream-search/1", command: "clear", owner: session.handle)
-                    let identity = try wire.streamIdentity(owner: session.handle, root: catalog.root)
+                    let identity = try wire.streamIdentity(owner: session.handle, root: catalog.root, caseSensitive: true)
                     guard identity.manifest == catalog.manifest, identity.layout == catalog.layout,
                           try wire.number("retained_hits") == 0, try wire.number("retained_witness_bytes") == 0 else {
                         throw AtlasWorkspaceStreamError.invalidResponse

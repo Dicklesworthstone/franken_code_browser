@@ -58,7 +58,8 @@ import Foundation
         let target = AtlasObservedReaderSearchTarget(identity: .init(owner: handle, file: 1,
             path: input.absolutePath, displayPath: "fixture"), generation: observation, observation: 8,
             hit: .init(index: 255, occurrence: 256,
-                range: try .init(start: offset + 1024, end: offset + 1024 + UInt64(searchRequest.needle.utf8.count))))
+                range: try .init(start: offset + 1024, end: offset + 1024 + UInt64(searchRequest.needle.utf8.count)),
+                witnessSHA256: String(repeating: "a", count: 64)))
         let witness = AtlasObservedReaderSearchWitness(target: target, encoding: .utf8,
             text: searchRequest.needle, originalHex: searchRequest.originalHex, sha256: String(repeating: "a", count: 64))
         let verifiedHit = try observeHit(handle, witness, request, AtlasSearchCancellation())
@@ -158,6 +159,41 @@ import Foundation
             "Counted Find must use the additive counted ABI without changing legacy Find dispatch")
 
         let canceled = AtlasSearchCancellation(); canceled.cancel()
+        let exactEntries = count(9), countedEntries = count(13)
+        for encoding in AtlasObservedReaderEncoding.allCases {
+            for countAll in [false, true] {
+                let lower = try AtlasObservedReaderSearchRequest(generation: observation, needle: searchRequest.needle,
+                    encoding: encoding, maximumScanBytes: 1 << 32, countAllMatches: countAll, caseSensitive: false)
+                let result = try search.find(handle, lower, AtlasSearchCancellation())
+                precondition(result == expected && !lower.caseSensitive)
+            }
+        }
+        precondition(count(14) == 6 && count(15) == 3 && count(9) == exactEntries && count(13) == countedEntries,
+            "Lowercase Find freezes both policy flags and preserves the exact legacy dispatch")
+        let lower = try AtlasObservedReaderSearchRequest(generation: observation, needle: searchRequest.needle,
+            encoding: .utf8, maximumScanBytes: 1 << 32, countAllMatches: true, caseSensitive: false)
+        let matchingEntries = count(14)
+        do { _ = try search.find(handle, lower, canceled); preconditionFailure("Canceled lowercase Find crossed the ABI") }
+        catch AtlasObservedReaderError.canceled { }
+        precondition(count(14) == matchingEntries)
+        for invalid in [Int32(2), Int32(3)] {
+            mode(invalid); let released = frees()
+            do { _ = try search.find(handle, lower, AtlasSearchCancellation()); preconditionFailure("Malformed lowercase response accepted") }
+            catch AtlasObservedReaderError.invalidResponse { }
+            precondition(frees() == released + 1 && allocations() == frees())
+        }
+        for late in [Int32(4), Int32(5)] {
+            mode(late)
+            weak var released: AtlasSearchCancellation?
+            do {
+                let token = AtlasSearchCancellation(); released = token
+                do { _ = try search.find(handle, lower, token); preconditionFailure("Late lowercase cancellation accepted") }
+                catch AtlasObservedReaderError.canceled { }
+                precondition(token.isCanceled)
+            }
+            precondition(released == nil && allocations() == frees())
+        }
+        mode(0)
         let enteredOpen = count(1), enteredWindow = count(3), enteredPolls = count(8), enteredFind = count(9)
         let enteredObserveHit = count(11)
         let enteredLines = count(12)
@@ -179,6 +215,6 @@ import Foundation
         precondition(transport.create() == 0 && !transport.cancel(handle) && !transport.close(handle))
         precondition(count(0) == 2 && count(6) == 2 && count(7) == 2)
         precondition(allocations() == frees())
-        print("Observed reader production bridge ABI, callback lifetime, cancellation and exact allocation cleanup fixtures passed.")
+        print("Observed reader production bridge matching/count flags, callback lifetime, cancellation and exact allocation cleanup fixtures passed.")
     }
 }

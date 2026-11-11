@@ -166,6 +166,9 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     var countAllSearchMatches = false {
         didSet { if oldValue != countAllSearchMatches { revokeSearch() } }
     }
+    var searchCaseSensitive = true {
+        didSet { if oldValue != searchCaseSensitive { revokeSearch() } }
+    }
     var offsetInput = "0"
     var lineInput = "1" {
         didSet { if oldValue != lineInput { revokeLineRequest() } }
@@ -217,7 +220,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         !closed && session != nil && transport.search != nil && lastSearchGeneration < UInt64.max
             && (try? AtlasObservedReaderSearchRequest(generation: 1, needle: searchText,
                 encoding: encoding, maximumScanBytes: searchScanBytes,
-                countAllMatches: countAllSearchMatches)) != nil
+                countAllMatches: countAllSearchMatches, caseSensitive: searchCaseSensitive)) != nil
     }
     var canSelectSearchHit: Bool {
         searchAuthorized && !closed && !busy && session != nil && !(searchReport?.hits.isEmpty ?? true)
@@ -438,8 +441,8 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         do {
             request = try .init(generation: lastSearchGeneration + 1, needle: searchText,
                 encoding: encoding, maximumScanBytes: searchScanBytes,
-                countAllMatches: countAllSearchMatches)
-        } catch { notice = "Enter exact text of 1–4096 UTF-8 bytes without NUL, and choose a bounded scan limit."; return }
+                countAllMatches: countAllSearchMatches, caseSensitive: searchCaseSensitive)
+        } catch { notice = "Enter text of 1–4096 UTF-8 bytes without NUL, and choose a bounded scan limit."; return }
         lastSearchGeneration = request.generation
         // A replacement can commit in Rust before its reply is canceled or
         // rejected. Old literal bytes stay readable, but their query cannot
@@ -456,7 +459,8 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
                 guard accepts(ticket, flag), self.session === session,
                       searchText.utf8.elementsEqual(request.needle.utf8), encoding == request.encoding,
                       searchScanBytes == request.maximumScanBytes,
-                      countAllSearchMatches == request.countAllMatches else { return }
+                      countAllSearchMatches == request.countAllMatches,
+                      searchCaseSensitive == request.caseSensitive else { return }
                 guard report.observation > latestObservation else { throw AtlasObservedReaderError.invalidResponse }
                 latestObservation = report.observation
                 searchReport = report; searchAuthorized = true; selectedSearchWitness = nil; clearSearchContext()

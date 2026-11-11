@@ -254,6 +254,52 @@ private final class WorkspaceProgressCopies: @unchecked Sendable {
         } catch AtlasWorkspaceStreamError.invalidResponse { }
         precondition(rejected.values.isEmpty && allocations() == frees())
         mode(0)
-        print("Workspace stream ABI ownership, progressive bytes, Stop and cancellation fixtures passed")
+        let legacyScoped = count(14), legacyProgress = count(15), legacyCounted = count(16), legacyCountedProgress = count(17)
+        for (selection, scoped) in scopedRequests {
+            scope(selection)
+            for countAll in [false, true] {
+                let lower = try AtlasWorkspaceStreamRequest(needle: scoped.needle,
+                    maximumScanBytes: scoped.maximumScanBytes, maximumMatches: scoped.maximumMatches,
+                    maximumReadCalls: scoped.maximumReadCalls, fileScope: scoped.fileScope,
+                    pathScope: scoped.pathScope, countAllMatches: countAll, caseSensitive: false)
+                let direct = try transport.search(owner, lower, AtlasSearchCancellation())
+                let stop = AtlasWorkspaceStreamStop(), copies = WorkspaceProgressCopies()
+                let terminal = try progressive(owner, lower, AtlasSearchCancellation(), stop) {
+                    copies.append($0); stop.requestStop()
+                }
+                precondition(direct == expected && terminal == expected && stop.isRequested)
+                precondition(copies.values == ["{\"fixture\":\"workspace-progress\"}"] && allocations() == frees())
+            }
+        }
+        precondition(count(18) == UInt32(scopedRequests.count * 2) && count(19) == UInt32(scopedRequests.count * 2)
+            && count(20) == UInt32(scopedRequests.count * 2))
+        precondition(count(14) == legacyScoped && count(15) == legacyProgress
+            && count(16) == legacyCounted && count(17) == legacyCountedProgress,
+            "Lowercase requests must select the additive policy ABI without changing exact-case routes")
+        scope(0)
+        let lower = try AtlasWorkspaceStreamRequest(needle: request.needle, maximumScanBytes: request.maximumScanBytes,
+            countAllMatches: true, caseSensitive: false)
+        let matchingEntries = count(18), matchingProgress = count(19)
+        do { _ = try transport.search(owner, lower, canceledBeforeEntry); preconditionFailure("Canceled lowercase request entered C") }
+        catch AtlasWorkspaceStreamError.canceled { }
+        do { _ = try progressive(owner, lower, canceledBeforeEntry, AtlasWorkspaceStreamStop()) { _ in }
+            preconditionFailure("Canceled lowercase progress entered C")
+        } catch AtlasWorkspaceStreamError.canceled { }
+        precondition(count(18) == matchingEntries && count(19) == matchingProgress)
+        for late in [Int32(4), Int32(5)] {
+            mode(late); let token = AtlasSearchCancellation()
+            do { _ = try transport.search(owner, lower, token); preconditionFailure("Late lowercase reply accepted") }
+            catch AtlasWorkspaceStreamError.canceled { }
+            precondition(token.isCanceled && allocations() == frees())
+        }
+        mode(8)
+        let lowerCopies = WorkspaceProgressCopies()
+        do {
+            _ = try progressive(owner, lower, AtlasSearchCancellation(), AtlasWorkspaceStreamStop()) { lowerCopies.append($0) }
+            preconditionFailure("Malformed lowercase progress accepted")
+        } catch AtlasWorkspaceStreamError.invalidResponse { }
+        precondition(lowerCopies.values.isEmpty && allocations() == frees())
+        mode(0)
+        print("Workspace stream ABI matching/count flags, ownership, progressive bytes, Stop and cancellation fixtures passed")
     }
 }

@@ -402,7 +402,8 @@ private struct AtlasFrozenViewportSearch: Sendable {
             project: authority.identity.project, browserOwner: authority.identity.browserOwner,
             access: authority.access, fileScope: types, pathScope: pathScope)
         workspaceStreamSearch = AtlasWorkspaceStreamPresentation(source: source,
-            query: query, transport: .native)
+            query: query, caseSensitive: searchCaseSensitive,
+            countAllMatches: searchCountAllMatches, transport: .native)
     }
 
     private func closeWorkspaceStreamSearch() {
@@ -1000,7 +1001,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 Label("Search large project files…", systemImage: "doc.text.magnifyingglass")
             }
             .disabled(snapshotExportSource == nil)
-            .help("Search exact, case-sensitive text in the selected location and file types, including sources beyond capture limits. The sheet keeps this scope fixed and offers a total I/O budget.")
+            .help("Search text with optional Unicode lowercase matching in the selected location and file types, including sources beyond capture limits. The sheet keeps this scope fixed and offers a total I/O budget.")
             .padding(.horizontal, 10).padding(.top, 8)
             if wantsCapturedIndex {
                 Text("The first search captures the selected scope. Later queries reuse those bytes; Refresh captures the current scope and file edits. Limits within that scope: 4096 files, 1 MiB per file, 32 MiB total.")

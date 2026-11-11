@@ -9,7 +9,8 @@
 
 enum { CREATE, OPEN, SEARCH, PAGE, HIT, CLEAR, CANCEL, CLOSE, POLLS,
     PROGRESS_SEARCH, PROGRESS_CALLBACKS, STOP_POLLS, STOP_SEEN, PROGRESS_CANCELED,
-    SCOPED_SEARCH, SCOPED_PROGRESS, COUNTED_SEARCH, COUNTED_PROGRESS, COUNTERS };
+    SCOPED_SEARCH, SCOPED_PROGRESS, COUNTED_SEARCH, COUNTED_PROGRESS,
+    MATCHING_SEARCH, MATCHING_PROGRESS, MATCHING_COUNTED, COUNTERS };
 static uint32_t counts[COUNTERS], allocations, frees;
 static int32_t mode;
 static uint32_t expected_scope;
@@ -202,6 +203,29 @@ char *fcb_atlas_stream_search_scoped_counted_progress(uint64_t owner, const char
 char *fcb_atlas_stream_search_page(uint64_t owner, uint64_t generation, uint64_t start, uint64_t count) {
     assert(owner == owner_value && generation == generation_value && start == 224 && count == 32);
     ++counts[PAGE]; return response(PAGE);
+}
+char *fcb_atlas_stream_search_scoped_matching_progress(uint64_t owner, const char *needle,
+    uint64_t maximum_matches, uint64_t maximum_bytes, uint64_t maximum_calls,
+    const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
+    uint64_t case_sensitive, uint64_t count_all_matches,
+    workspace_fixture_poll poll, workspace_fixture_poll stop,
+    fcb_atlas_stream_progress_callback progress, void *context) {
+    assert(case_sensitive == 0 && count_all_matches <= 1);
+    counts[MATCHING_COUNTED] += (uint32_t)count_all_matches;
+    check_scope(extensions, filenames, path_kind, path);
+    char *result;
+    if (stop == NULL && progress == NULL) {
+        ++counts[MATCHING_SEARCH];
+        result = fcb_atlas_stream_search_cancelable(owner, needle, maximum_matches,
+            maximum_bytes, maximum_calls, poll, context);
+    } else {
+        assert(stop != NULL && progress != NULL);
+        ++counts[MATCHING_PROGRESS];
+        result = fcb_atlas_stream_search_progress(owner, needle, maximum_matches,
+            maximum_bytes, maximum_calls, poll, stop, progress, context);
+    }
+    check_scope(extensions, filenames, path_kind, path);
+    return result;
 }
 char *fcb_atlas_stream_search_hit(uint64_t owner, uint64_t generation, uint64_t index) {
     assert(owner == owner_value && generation == generation_value && index == (mode == 7 ? 0 : 255));
