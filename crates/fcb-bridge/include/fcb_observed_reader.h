@@ -112,6 +112,27 @@ char *fcb_observed_reader_find_counted(uint64_t handle, uint64_t generation,
     const char *needle, uint64_t encoding, uint64_t max_matches,
     uint64_t max_scan_bytes, fcb_observed_reader_poll poll, void *context);
 
+/* Explicit matching/count policy. Both flags are exactly 0 or 1. case_sensitive
+ * zero uses the shared Unicode lowercase semantics, without canonical
+ * normalization/full case folding. Existing find calls remain case-sensitive.
+ * Limits, cancellation, generation consumption and observation honesty match
+ * find above; max_matches=0 supports count-only scans when count_all_matches=1.
+ *
+ * find and search-hit echo mode=exact-decoded-text or unicode-lowercase-text,
+ * plus case_sensitive. Lowercase find has null literal_original_hex/SHA because
+ * no one literal proves every spelling; each hit row carries witness_sha256.
+ * The selected search-hit supplies its exact original text/original_hex/SHA.
+ * retained_witness_bytes is one shared witness for exact search or the sum of
+ * retained original ranges for lowercase search, at most 12*needle UTF-8 bytes
+ * per retained occurrence. Expansions retain whole contributing source scalars;
+ * occurrence IDs are distinct even when original ranges overlap or coincide.
+ * observe_hit verifies the selected bytes and spelling in a NEW observation.
+ */
+char *fcb_observed_reader_find_matching(uint64_t handle, uint64_t generation,
+    const char *needle, uint64_t encoding, uint64_t case_sensitive,
+    uint64_t count_all_matches, uint64_t max_matches, uint64_t max_scan_bytes,
+    fcb_observed_reader_poll poll, void *context);
+
 /* Zero-based hit_index must belong to the current accepted query generation.
  * Returns exactly the retained literal text/bytes and original-byte range,
  * with no source reread. Surrounding context was NOT retained. A host may

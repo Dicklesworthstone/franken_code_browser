@@ -244,3 +244,55 @@ fn c_search_limits_and_invalid_foreign_inputs_cannot_relabel_old_results() {
     assert!(partial.contains("\"payload_bytes_read\":\"0\""));
     assert_eq!(fcb_observed_reader_close(handle), 1);
 }
+
+#[test]
+fn c_matching_find_preserves_lowercase_original_witnesses_and_count_only_policy() {
+    let _: unsafe extern "C" fn(u64, u64, *const c_char, u64, u64, u64, u64, u64,
+        Option<SearchCancellationCallback>, *mut c_void) -> *mut c_char = fcb_observed_reader_find_matching;
+    assert!(include_str!("../include/fcb_observed_reader.h").contains("fcb_observed_reader_find_matching("));
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    for encoding in [1, 2, 3] {
+        let (root, croot) = root();
+        let text = "\u{feff}K K k";
+        let bytes: Vec<u8> = match encoding {
+            2 => text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+            3 => text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+            _ => text.as_bytes().to_vec(),
+        };
+        fs::write(root.join("source.rs"), &bytes).unwrap();
+        let handle = open(&croot, b"source.rs");
+        let needle = CString::new("k").unwrap();
+        let found = take(unsafe { fcb_observed_reader_find_matching(handle, 1, needle.as_ptr(),
+            encoding, 0, 1, 3, 1024, None, std::ptr::null_mut()) });
+        assert!(found.contains("\"mode\":\"unicode-lowercase-text\""), "{found}");
+        assert!(found.contains("\"case_sensitive\":false"));
+        assert!(found.contains("\"count_all_matches\":true"));
+        assert!(found.contains("\"match_count_complete\":true"));
+        assert!(found.contains("\"matches_seen\":\"3\""));
+        assert!(found.contains("\"literal_original_hex\":null"));
+        assert!(found.contains("\"literal_sha256\":null"));
+        assert_eq!(found.matches("\"witness_sha256\":").count(), 3);
+        let witness = take(fcb_observed_reader_search_hit(handle, 1, 0));
+        assert!(witness.contains("\"text\":\"K\""), "{witness}");
+        let original = match encoding { 2 => "2a21", 3 => "212a", _ => "e284aa" };
+        assert!(witness.contains(&format!("\"original_hex\":\"{original}\"")), "{witness}");
+        assert!(witness.contains("\"mode\":\"unicode-lowercase-text\""));
+        assert!(witness.contains("\"case_sensitive\":false"));
+        let before = take(fcb_observed_reader_info(handle));
+        for (case, count) in [(2, 1), (0, 2)] {
+            let refused = take(unsafe { fcb_observed_reader_find_matching(handle, 2, needle.as_ptr(),
+                encoding, case, count, 3, 1024, None, std::ptr::null_mut()) });
+            assert!(refused.contains("OBSERVED_READER_HANDLE_INVALID_ARGUMENT"), "{refused}");
+        }
+        assert_eq!(before, take(fcb_observed_reader_info(handle)));
+        assert_eq!(witness, take(fcb_observed_reader_search_hit(handle, 1, 0)));
+        let count_only = take(unsafe { fcb_observed_reader_find_matching(handle, 2, needle.as_ptr(),
+            encoding, 0, 1, 0, 1024, None, std::ptr::null_mut()) });
+        assert!(count_only.contains("\"retained_hits\":\"0\""), "{count_only}");
+        assert!(count_only.contains("\"retained_witness_bytes\":\"0\""));
+        assert!(count_only.contains("\"matches_seen\":\"3\""));
+        assert!(count_only.contains("\"match_count_complete\":true"));
+        assert!(count_only.contains("\"truncated\":true"));
+        assert_eq!(fcb_observed_reader_close(handle), 1);
+    }
+}

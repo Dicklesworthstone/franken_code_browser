@@ -160,6 +160,27 @@ pub unsafe extern "C" fn fcb_observed_reader_find_counted(handle: u64, generatio
     }))
 }
 
+/// Find with explicit matching and retention policies. Flags must be 0 or 1;
+/// lowercase uses Unicode scalar lowering, not canonical normalization or full
+/// case folding. Each retained row owns its original spelling/byte witness.
+/// # Safety
+/// Pointer and callback requirements match fcb_observed_reader_find.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_observed_reader_find_matching(handle: u64, generation: u64,
+    needle: *const c_char, encoding: u64, case_sensitive: u64, count_all_matches: u64,
+    max_matches: u64, max_scan_bytes: u64,
+    poll: Option<SearchCancellationCallback>, context: *mut c_void) -> *mut c_char {
+    reply(|| answer(handle, |readers| {
+        if case_sensitive > 1 || count_all_matches > 1 { return Err(AccessError::InvalidArgument); }
+        let needle = unsafe { bounded_text(needle, MAX_OBSERVED_READER_NEEDLE_BYTES) }?;
+        let encoding = decode_encoding(encoding)?;
+        let max_matches = usize::try_from(max_matches).map_err(|_| AccessError::InvalidArgument)?;
+        readers.execute(handle, Command::FindMatching { generation, needle, encoding,
+            case_sensitive: case_sensitive == 1, count_all_matches: count_all_matches == 1,
+            max_matches, max_scan_bytes }, || poll.is_some_and(|poll| unsafe { poll(context) != 0 }))
+    }))
+}
+
 /// Return only the accepted query's retained matched bytes. No source I/O and
 /// no silent substitution from current file contents or another query.
 #[unsafe(no_mangle)]

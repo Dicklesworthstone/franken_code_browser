@@ -382,8 +382,9 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
                 if let Some(unit) = units.next() {
                     if let Some(hit) = work.cursor.push(unit, *scalar) {
                         emitted += 1;
-                        self.matches_seen = self.matches_seen.checked_add(1).ok_or(StreamReadError::InvalidLimits)?;
+                        let occurrence = self.matches_seen.checked_add(1).ok_or(StreamReadError::InvalidLimits)?;
                         if self.hits.len() == self.options.max_matches {
+                            self.matches_seen = occurrence;
                             if self.count_all_matches { continue; }
                             self.state = StreamReadState::Truncated;
                             break;
@@ -395,8 +396,11 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
                         let range = ByteRange::new(ByteOffset::new(hit.raw_start), ByteOffset::new(hit.raw_end))
                             .map_err(|_| StreamReadError::InvalidRange)?;
                         if range.len().get() != bytes.len() as u64 { return Err(StreamReadError::InvalidRange); }
+                        // Allocation failure must leave a valid retained prefix:
+                        // omitted rows below the cap are not cap truncation.
                         self.witnesses.push(RetainedWitness { text, bytes });
-                        self.hits.push(StreamingHit { occurrence: self.matches_seen, range });
+                        self.hits.push(StreamingHit { occurrence, range });
+                        self.matches_seen = occurrence;
                     }
                     continue;
                 }
@@ -422,6 +426,10 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
                 break;
             }
             self.consumed = local_end;
+            // Preserve spent matching work even if the next witness allocation
+            // fails before this step can publish its ordinary trailing counters.
+            self.stats.last_step_scanned = self.consumed - before;
+            self.stats.scanned_bytes = self.base + self.consumed as u64;
             work.position += ch.len_utf8();
             let scalar = SourceScalar { ch, raw_start, raw_end, decoded_start, decoded_end };
             work.pending = Some((scalar, work.cursor.units(ch)));
@@ -633,6 +641,47 @@ mod tiny_budget_tests {
         for step in [StreamReadStep { max_bytes: 0, ..Default::default() }, StreamReadStep { max_hits: 0, ..Default::default() }] {
             assert_eq!(query.step(step, options.generation, || false).unwrap(), StreamReadState::Pending);
             assert_eq!(query.stats().bytes_read, 0); assert_eq!(query.stats().read_calls, 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod lowercase_failure_tests {
+    use super::*;
+
+    #[test]
+    fn refused_later_witness_keeps_scanned_bytes_and_accepted_counts_consistent() {
+        let owner = ArenaOwnerId::new(1517).unwrap();
+        let budget = ResourceBudget::new(owner, ByteLength::new(64 * 1024 * 1024)).unwrap();
+        let mut needle = StreamingNeedle::text_matching(owner, "k", false, &budget,
+            ResourceAllocationId::new(1).unwrap()).unwrap();
+        // Inject a retained-witness budget refusal after one valid occurrence,
+        // without global allocator hooks. K fits; the original Kelvin spelling
+        // is three UTF-8 bytes and exercises the checked refusal path.
+        needle.max_witness_bytes = 2;
+        let request = CaptureRequest::new(FileId::new(owner, 1).unwrap(), SourceRevision::new(owner, 1).unwrap()).unwrap();
+        let mut options = StreamReadOptions::new(QueryGeneration::new(owner, 1).unwrap());
+        options.max_matches = 4;
+        for counting in [false, true] {
+            let mut query = if counting {
+                ReaderSearch::new_counting("KK".as_bytes(), request, ByteLength::new(4), &needle,
+                    options, &budget, ResourceAllocationId::new(2).unwrap())
+            } else {
+                ReaderSearch::new("KK".as_bytes(), request, ByteLength::new(4), &needle,
+                    options, &budget, ResourceAllocationId::new(2).unwrap())
+            }.unwrap();
+            assert_eq!(query.step(StreamReadStep::default(), options.generation, || false), Err(StreamReadError::ResourceDenied));
+            assert_eq!(query.stats().scanned_bytes, 4);
+            assert_eq!(query.stats().last_step_scanned, 4);
+            assert_eq!(query.matches_seen(), 1);
+            let (_, report) = query.finish().unwrap();
+            assert_eq!(report.state(), StreamReadState::Failed(StreamReadError::ResourceDenied));
+            assert!(!report.input_complete());
+            assert!(!report.hits_truncated());
+            assert_eq!(report.hits().len(), 1);
+            assert_eq!(report.hits()[0].occurrence_id(), 1);
+            assert_eq!(report.witness_bytes(0).unwrap(), b"K");
+            assert_eq!(report.matched_text(0).unwrap(), "K");
         }
     }
 }

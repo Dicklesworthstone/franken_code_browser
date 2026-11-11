@@ -11,7 +11,7 @@ use std::{ffi::OsStr, fs::{self, File}, io::Write, os::unix::ffi::OsStrExt,
 use fcb::ArenaOwnerId;
 use fcb_app::{EXIT_OK, EXIT_PARTIAL, host::{HostResponse,
     atlas_session::{AtlasAction, AtlasSession, AtlasSessionOptions},
-    atlas_search::{AtlasSearchError, AtlasSearchPathKind, AtlasSearchScope},
+    atlas_search::{AtlasSearchPathKind, AtlasSearchScope},
     atlas_stream_search::{AtlasStreamSearchError, AtlasStreamSearchOptions, RetainedAtlasStreamSearch,
         MAX_ATLAS_STREAM_SEARCH_HITS, MAX_ATLAS_STREAM_SEARCH_NEEDLE_BYTES,
         MAX_ATLAS_STREAM_SEARCH_PAGE, MAX_ATLAS_STREAM_SEARCH_READ_CALLS, MAX_ATLAS_STREAM_SEARCH_SCAN_BYTES}}};
@@ -190,9 +190,10 @@ fn file_types_intersect_directory_before_io_and_preserve_original_ids_on_page_an
     assert_scope_echo(&page, &report); assert_scope_echo(&hit, &report);
     assert_eq!(hit.get("hit").get("original_hex").text(), hex(b"needle"));
     assert_eq!(io, (service.source_bytes_read(), service.read_calls()));
-    assert!(matches!(service.search_scoped(&atlas, "needle", opts(),
+    assert!(matches!(service.search_scoped(&atlas, "needle",
+        AtlasStreamSearchOptions { max_scan_bytes: 0, ..opts() },
         AtlasSearchScope::all().with_case_sensitive(false), || false),
-        Err(AtlasStreamSearchError::Scope(AtlasSearchError::InvalidScope))));
+        Err(AtlasStreamSearchError::InvalidLimits)));
     assert_eq!(io, (service.source_bytes_read(), service.read_calls()));
     assert_scope_echo(&json(&service.page(&atlas, 1, 0, 32).unwrap()), &report);
 }
@@ -860,4 +861,88 @@ fn counted_progress_stop_and_cancellation_keep_finalized_counts_after_retention_
     let retained = json(&service.page(&atlas, generation, 0, 1).unwrap());
     assert_eq!(retained.get("matches_seen"), report.get("matches_seen"));
     assert_eq!(retained.get("hits"), report.get("hits"));
+}
+
+#[test]
+fn lowercase_workspace_scope_counts_and_original_witnesses_survive_row_limits() {
+    let fixture = Fixture::new();
+    fixture.write("src/a.rs", "KK".as_bytes());
+    let utf16: Vec<u8> = "\u{feff}kK".encode_utf16().flat_map(u16::to_be_bytes).collect();
+    fixture.write("src/b.rs", &utf16);
+    fixture.write("src/ignored.md", b"KKKKKK");
+    let atlas = fixture.atlas(64); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let scope = AtlasSearchScope::from_csv(Some("rs"), None).unwrap()
+        .with_path(AtlasSearchPathKind::Directory, "src").unwrap().with_case_sensitive(false);
+    for (generation, retained) in [(1, 1), (2, 4)] {
+        let report = json(&service.search_scoped_counted(&atlas, "k",
+            AtlasStreamSearchOptions { max_matches: retained, ..opts() }, scope.clone(), || false).unwrap());
+        assert_eq!(report.get("query_generation").number(), generation);
+        assert_eq!(report.get("mode").text(), "unicode-lowercase-literal");
+        assert!(!report.get("case_sensitive").flag());
+        assert_eq!(report.get("eligible_files").number(), 2);
+        assert_eq!(report.get("excluded_files").number(), 1);
+        assert_eq!(report.get("payload_bytes_read").number(), 10);
+        assert_eq!(report.get("matches_seen").number(), 4);
+        assert_eq!(report.get("matching_files").number(), 2);
+        assert_eq!(report.get("retained_matching_files").number(), if retained == 1 { 1 } else { 2 });
+        assert_eq!(report.get("retained_hits").number(), retained as u64);
+        assert_eq!(report.get("truncated").flag(), retained < 4);
+        assert!(report.get("match_count_complete").flag());
+        let expected: [(&str, &[u8]); 4] = [("K", "K".as_bytes()), ("K", b"K"), ("k", &[0, 0x6b]), ("K", &[0x21, 0x2a])];
+        let mut bytes = 0;
+        let io = (service.source_bytes_read(), service.read_calls());
+        for (position, &(spelling, original)) in expected.iter().take(retained).enumerate() {
+            let selected = json(&service.hit(&atlas, generation, position).unwrap());
+            assert_scope_echo(&selected, &report);
+            assert_eq!(selected.get("mode"), report.get("mode"));
+            assert_eq!(selected.get("hit").get("text").text(), spelling);
+            assert_eq!(selected.get("hit").get("original_hex").text(), hex(original));
+            assert_eq!(selected.get("hit").get("witness_sha256"), report.get("hits").array()[position].get("witness_sha256"));
+            bytes += original.len();
+        }
+        assert_eq!(report.get("retained_witness_bytes").number(), bytes as u64);
+        assert_eq!(service.retained_witness_bytes(), bytes);
+        assert_eq!(io, (service.source_bytes_read(), service.read_calls()));
+        assert_eq!(json(&service.page(&atlas, generation, 0, 32).unwrap()).get("hits"), report.get("hits"));
+    }
+}
+
+#[test]
+fn lowercase_workspace_progress_and_partial_counts_preserve_accepted_witnesses() {
+    let fixture = Fixture::new();
+    fixture.write("a.rs", "KK".as_bytes());
+    fixture.write("b.rs", "kK".as_bytes());
+    let atlas = fixture.atlas(64); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let scope = AtlasSearchScope::all().with_case_sensitive(false);
+    let mut progress = Vec::new();
+    let complete = json(&service.search_scoped_counted_with_progress(&atlas, "k",
+        AtlasStreamSearchOptions { max_matches: 1, ..opts() }, scope.clone(), || false, || false,
+        |response| progress.push(json(response))).unwrap());
+    assert_eq!(complete.get("matches_seen").number(), 4);
+    assert!(complete.get("match_count_complete").flag());
+    assert!(progress.len() >= 2);
+    for preview in &progress {
+        assert_scope_echo(preview, &complete);
+        assert_eq!(preview.get("mode"), complete.get("mode"));
+        assert!(!preview.get("match_count_complete").flag());
+        assert!(!preview.get("selection_available").flag());
+        assert!(preview.get("matches_seen").number() <= 4);
+        if !preview.get("hits").array().is_empty() {
+            assert_eq!(preview.get("hits").array()[0], complete.get("hits").array()[0]);
+            assert_eq!(preview.get("retained_witness_bytes").number(), 3);
+        }
+    }
+    let partial = json(&service.search_scoped_counted(&atlas, "k",
+        AtlasStreamSearchOptions { max_scan_bytes: 3, ..opts() }, scope.clone(), || false).unwrap());
+    assert_eq!(partial.get("stop_reason").text(), "byte-limit");
+    assert!(!partial.get("match_count_complete").flag());
+    assert_eq!(partial.get("matches_seen").number(), 1);
+    assert_eq!(partial.get("payload_bytes_read").number(), 3);
+    let accepted = json(&service.hit(&atlas, 2, 0).unwrap());
+    assert_eq!(service.search_scoped_counted(&atlas, "K", opts(), scope, || true).err(), Some(AtlasStreamSearchError::Canceled));
+    fixture.write("a.rs", b"changed");
+    let witness = json(&service.hit(&atlas, 2, 0).unwrap());
+    assert_eq!(witness.get("hit"), accepted.get("hit"));
+    assert_eq!(witness.get("hit").get("text").text(), "K");
+    assert_eq!(witness.get("hit").get("original_hex").text(), "e284aa");
 }

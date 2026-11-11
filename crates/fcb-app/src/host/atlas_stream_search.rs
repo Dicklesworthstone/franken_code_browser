@@ -101,6 +101,8 @@ struct Hit {
     file: AtlasStreamFile,
     witness_start: usize,
     witness_len: usize,
+    text_start: usize,
+    text_len: usize,
     digest: Sha256Digest,
 }
 /// Reuse captured-search membership semantics and wire identity while keeping
@@ -114,9 +116,6 @@ struct FrozenScope {
 impl FrozenScope {
     fn admit(predicate: AtlasSearchScope, atlas: &AtlasSession, canceled: &mut impl FnMut() -> bool)
         -> Result<Self, AtlasStreamSearchError> {
-        // This service promises exact decoded spelling. Never silently accept
-        // a case-insensitive descriptor and then run the exact-text engine.
-        if !predicate.case_sensitive() { return Err(AtlasSearchError::InvalidScope.into()); }
         let (eligible, region) = predicate.admission_counts(atlas, canceled)?;
         let excluded = atlas.atlas().file_count().checked_sub(eligible).ok_or(AtlasStreamSearchError::WrongAtlas)?;
         Ok(Self { predicate, region, eligible, excluded })
@@ -143,6 +142,8 @@ impl FrozenScope {
     }
     fn encode(&self, out: &mut Output) -> Result<(), AtlasStreamSearchError> {
         self.predicate.encode(out)?;
+        out.literal(",\"mode\":")?;
+        out.quoted(if self.predicate.case_sensitive() { "exact-decoded-literal" } else { "unicode-lowercase-literal" })?;
         if let Some(region) = self.region { region.encode(out, "")?; }
         out.literal(",\"eligible_files\":")?; out.integer(self.eligible as u64)?;
         out.literal(",\"excluded_files\":")?; out.integer(self.excluded as u64)?;
@@ -157,6 +158,7 @@ struct Snapshot {
     scope: FrozenScope,
     hits: Vec<Hit>,
     witnesses: Vec<u8>,
+    matched_text: String,
     diagnostics: Vec<AtlasStreamFile>,
     examined: usize,
     unexamined: usize,
@@ -310,7 +312,8 @@ impl RetainedAtlasStreamSearch {
         // Reuse these allocation identities only after the previous callback's
         // admitted output and response have both been dropped.
         let progress_ids = if publish_progress { Some([self.next_id()?, self.next_id()?]) } else { None };
-        let pattern = StreamingNeedle::text(self.manifest.owner(), needle, &self.budget, pattern_id)
+        let pattern = StreamingNeedle::text_matching(self.manifest.owner(), needle,
+            scope.predicate.case_sensitive(), &self.budget, pattern_id)
             .map_err(AppError::from)?;
         let root = self.grant.root_path().to_path_buf();
         let mut tally = ProgressTally::default();
@@ -363,7 +366,11 @@ impl RetainedAtlasStreamSearch {
         out.literal(",\"retained_matching_files\":")?; out.integer(snapshot.retained_matching_files as u64)?;
         out.literal(",\"hit\":{")?;
         encode_hit(&mut out, atlas, hit, position)?;
-        out.literal(",\"text\":")?; out.quoted(&snapshot.needle)?;
+        out.literal(",\"text\":")?;
+        let text = if snapshot.scope.predicate.case_sensitive() { snapshot.needle.as_str() } else {
+            snapshot.matched_text.get(hit.text_start..hit.text_start + hit.text_len).ok_or(AtlasStreamSearchError::MissingHit)?
+        };
+        out.quoted(text)?;
         out.literal(",\"original_hex\":")?;
         let bytes = snapshot.witnesses.get(hit.witness_start..hit.witness_start + hit.witness_len)
             .ok_or(AtlasStreamSearchError::MissingHit)?;
@@ -376,6 +383,7 @@ impl RetainedAtlasStreamSearch {
         self.validate(atlas)?;
         let generation = self.next_generation()?;
         let mut out = self.output(atlas, "clear")?;
+        out.literal(",\"mode\":\"exact-decoded-literal\"")?;
         out.literal(",\"query_generation\":")?; out.integer(generation)?;
         out.literal(",\"retained_hits\":\"0\",\"retained_witness_bytes\":\"0\"}\n")?;
         let response = self.finish(atlas, out, false, &mut || false)?;
@@ -418,7 +426,7 @@ impl RetainedAtlasStreamSearch {
             out.literal(",\"")?; out.literal(key)?; out.literal("\":")?; out.integer(value)?;
         }
         out.literal(",\"root_path\":")?; out.path(&self.grant.root_path().to_path_buf())?;
-        out.literal(",\"scope\":\"catalogued-whole-files\",\"strategy\":\"streaming-whole-file\",\"mode\":\"exact-decoded-literal\"")?;
+        out.literal(",\"scope\":\"catalogued-whole-files\",\"strategy\":\"streaming-whole-file\"")?;
         out.literal(",\"capture_kind\":\"literal-witnesses-only\",\"source_observation\":\"per-file-streams-not-atomic-workspace\"")?;
         out.literal(",\"catalogued_files\":")?; out.integer(atlas.atlas().file_count() as u64)?;
         out.literal(",\"discovery_policy\":")?; out.quoted(atlas.atlas().catalog().policy_name())?;
@@ -481,7 +489,8 @@ impl RetainedAtlasStreamSearch {
             let selected = report.select_hit(position, atlas.atlas(), report.generation())?;
             let mut digest = Sha256::new(); digest.update(selected.original_bytes());
             let hit = Hit { hit, file: *selected.file_report(), witness_start: 0,
-                witness_len: selected.original_bytes().len(), digest: digest.finalize() };
+                witness_len: selected.original_bytes().len(), text_start: 0,
+                text_len: selected.matched_text().len(), digest: digest.finalize() };
             if position > 0 { out.literal(",")?; }
             out.literal("{")?; encode_hit(&mut out, atlas, &hit, position)?; out.literal("}")?;
         }
@@ -600,6 +609,7 @@ impl Snapshot {
         let charge = report.hits().len().checked_mul(size_of::<Hit>())
             .and_then(|n| diagnostic_count.checked_mul(size_of::<AtlasStreamFile>()).and_then(|v| n.checked_add(v)))
             .and_then(|n| n.checked_add(report.retained_witness_bytes()))
+            .and_then(|n| n.checked_add(report.retained_matched_text_bytes()))
             .and_then(|n| n.checked_add(report.literal().len() + size_of::<Self>() + 2 * size_of::<usize>()))
             .ok_or(AppError::Admission)?;
         let lease = budget.try_reserve_managed(report.generation().owner(), allocation, ByteLength::new(charge as u64))
@@ -607,14 +617,18 @@ impl Snapshot {
         let needle = copy_text(report.literal())?;
         let mut hits = reserve(report.hits().len())?;
         let mut witnesses = reserve(report.retained_witness_bytes())?;
+        let mut matched_text = String::new();
+        matched_text.try_reserve_exact(report.retained_matched_text_bytes()).map_err(|_| AppError::Admission)?;
+        if matched_text.capacity() > report.retained_matched_text_bytes() { return Err(AppError::Admission.into()); }
         let mut diagnostics = reserve(diagnostic_count)?;
         let mut previous: Option<(usize, usize, usize, Sha256Digest)> = None;
         let mut retained_matching_files = 0usize;
         for (position, &hit) in report.hits().iter().enumerate() {
             check(canceled)?;
             let selected = report.select_hit(position, report.atlas(), report.generation())?;
+            if previous.is_none_or(|(file, _, _, _)| file != hit.file_record()) { retained_matching_files += 1; }
             let (witness_start, witness_len, digest) = match previous {
-                Some((file, start, len, digest)) if file == hit.file_record() => (start, len, digest),
+                Some((file, start, len, digest)) if report.case_sensitive() && file == hit.file_record() => (start, len, digest),
                 _ => {
                     let start = witnesses.len();
                     let bytes = selected.original_bytes();
@@ -623,11 +637,16 @@ impl Snapshot {
                     let mut digest = Sha256::new(); digest.update(bytes);
                     let digest = digest.finalize();
                     previous = Some((hit.file_record(), start, bytes.len(), digest));
-                    retained_matching_files += 1;
                     (start, bytes.len(), digest)
                 }
             };
-            hits.push(Hit { hit, file: *selected.file_report(), witness_start, witness_len, digest });
+            let text_start = matched_text.len();
+            let text_len = selected.matched_text().len();
+            if !report.case_sensitive() {
+                if text_len > matched_text.capacity() - text_start { return Err(AppError::Admission.into()); }
+                matched_text.push_str(selected.matched_text());
+            }
+            hits.push(Hit { hit, file: *selected.file_report(), witness_start, witness_len, text_start, text_len, digest });
         }
         let mut unavailable = 0usize;
         let mut unsupported = 0usize;
@@ -646,7 +665,7 @@ impl Snapshot {
         let complete = report.is_complete() && scope.region_complete();
         let count_all_matches = report.count_all_matches();
         let matching_files = if count_all_matches { report.matching_files_seen() } else { retained_matching_files };
-        Ok(Self { generation: report.generation().get(), needle, options, scope, hits, witnesses, diagnostics,
+        Ok(Self { generation: report.generation().get(), needle, options, scope, hits, witnesses, matched_text, diagnostics,
             examined: report.files_examined(), unexamined: report.unexamined_files(), unavailable, unsupported, failed, matching_files,
             retained_matching_files, count_all_matches,
             stats: report.stats(), discovery_complete: report.atlas().discovery_complete(), complete,

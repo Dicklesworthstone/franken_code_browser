@@ -125,6 +125,29 @@ char *fcb_atlas_stream_search_scoped_counted_progress(uint64_t handle, const cha
     int32_t (*poll)(void *context), int32_t (*stop)(void *context),
     fcb_atlas_stream_progress_callback progress, void *context);
 
+/* Explicit Unicode lowercase or exact text search under frozen scope. Both
+ * flags are exactly 0 or 1; all callbacks may be NULL. Legacy APIs remain exact.
+ * mode is exact-decoded-literal or unicode-lowercase-literal and case_sensitive
+ * echoes the policy on search/progress/page/hit. This is scalar lowercase,
+ * without canonical normalization or full case folding. Scope exclusions still
+ * happen before I/O and incomplete/malformed files never establish absence.
+ *
+ * Lowercase rows retain individual witness_sha256 and original ranges. The hit
+ * endpoint returns each original spelling as text and its exact original_hex.
+ * retained_witness_bytes sums those ranges, bounded by 12*needle UTF-8 bytes per
+ * retained occurrence. Exact search preserves per-file shared literal storage.
+ * Overlapping/equal source ranges can represent distinct normalized occurrences;
+ * occurrence IDs, never deduplicated original ranges, define result identity.
+ * Current-context activation must compare the selected original bytes/spelling.
+ * Counting, Stop, cancellation and callback lifetimes match the APIs above.
+ */
+char *fcb_atlas_stream_search_scoped_matching_progress(uint64_t handle, const char *needle,
+    uint64_t max_matches, uint64_t max_scan_bytes, uint64_t max_read_calls,
+    const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
+    uint64_t case_sensitive, uint64_t count_all_matches,
+    int32_t (*poll)(void *context), int32_t (*stop)(void *context),
+    fcb_atlas_stream_progress_callback progress, void *context);
+
 /* No source I/O. generation must identify the accepted report; start is a
  * zero-based retained-row position and count is 1..32. next_offset=null means
  * the end of the terminal retained rows, not proof of full source coverage.

@@ -544,3 +544,55 @@ fn c_counted_progress_stop_and_cancel_remain_distinct_after_retention_fills() {
     assert!(take(fcb_atlas_stream_search_hit(handle, generation, 0)).contains("\"original_hex\":\"6161\""));
     assert_eq!(fcb_atlas_close(handle), 1);
 }
+
+#[test]
+fn c_scoped_matching_stream_preserves_case_policy_counts_and_per_hit_spelling() {
+    let _: unsafe extern "C" fn(u64, *const c_char, u64, u64, u64,
+        *const c_char, *const c_char, u64, *const c_char, u64, u64,
+        Option<SearchCancellationCallback>, Option<SearchCancellationCallback>,
+        Option<AtlasStreamProgressCallback>, *mut c_void) -> *mut c_char = fcb_atlas_stream_search_scoped_matching_progress;
+    assert!(include_str!("../include/fcb_atlas_stream_search.h").contains("fcb_atlas_stream_search_scoped_matching_progress("));
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("a.rs"), "KK".as_bytes()).unwrap();
+    let utf16: Vec<u8> = "\u{feff}kK".encode_utf16().flat_map(u16::to_be_bytes).collect();
+    fs::write(fixture.0.join("b.rs"), &utf16).unwrap();
+    fs::write(fixture.0.join("ignored.md"), b"KKKKKK").unwrap();
+    let handle = fixture.open();
+    let needle = CString::new("k").unwrap();
+    let extensions = CString::new("rs").unwrap();
+    let matching = |case, count| take(unsafe {
+        fcb_atlas_stream_search_scoped_matching_progress(handle, needle.as_ptr(), 3, 1024, 1024,
+            extensions.as_ptr(), std::ptr::null(), 0, std::ptr::null(), case, count,
+            None, None, None, std::ptr::null_mut())
+    });
+    let report = matching(0, 1);
+    assert!(report.contains("\"mode\":\"unicode-lowercase-literal\""), "{report}");
+    assert!(report.contains("\"case_sensitive\":false"));
+    assert!(report.contains("\"match_count_complete\":true"));
+    assert!(report.contains("\"truncated\":true"));
+    assert_eq!(field(&report, "eligible_files"), 2);
+    assert_eq!(field(&report, "excluded_files"), 1);
+    assert_eq!(field(&report, "payload_bytes_read"), 10);
+    assert_eq!(field(&report, "matches_seen"), 4);
+    assert_eq!(field(&report, "matching_files"), 2);
+    assert_eq!(field(&report, "retained_hits"), 3);
+    assert_eq!(field(&report, "retained_witness_bytes"), 6);
+    let generation = field(&report, "query_generation");
+    let first = take(fcb_atlas_stream_search_hit(handle, generation, 0));
+    assert!(first.contains("\"text\":\"K\""), "{first}");
+    assert!(first.contains("\"original_hex\":\"e284aa\""));
+    assert!(first.contains("\"case_sensitive\":false"));
+    let second = take(fcb_atlas_stream_search_hit(handle, generation, 1));
+    assert!(second.contains("\"text\":\"K\""));
+    assert!(second.contains("\"original_hex\":\"4b\""));
+    assert!(matching(2, 1).contains("ATLAS_HANDLE_INVALID_ARGUMENT"));
+    assert!(matching(0, 2).contains("ATLAS_HANDLE_INVALID_ARGUMENT"));
+    let kept = take(fcb_atlas_stream_search_hit(handle, generation, 0));
+    assert!(kept.contains("\"original_hex\":\"e284aa\""));
+    let exact = matching(1, 1);
+    assert!(exact.contains("\"mode\":\"exact-decoded-literal\""), "{exact}");
+    assert!(exact.contains("\"case_sensitive\":true"));
+    assert_eq!(field(&exact, "matches_seen"), 1);
+    assert_eq!(fcb_atlas_close(handle), 1);
+}

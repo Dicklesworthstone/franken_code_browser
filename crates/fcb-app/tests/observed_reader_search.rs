@@ -399,3 +399,114 @@ fn counted_find_reports_partial_count_when_scan_budget_ends() {
     assert!(counted.get("truncated").flag());
     assert_eq!(counted.get("payload_bytes_read").number(), 6);
 }
+
+#[test]
+fn lowercase_find_keeps_per_hit_spelling_ranges_and_hashes_in_every_explicit_encoding() {
+    for encoding in [ObservedReaderEncoding::Utf8, ObservedReaderEncoding::Utf16Le, ObservedReaderEncoding::Utf16Be] {
+        let fixture = Fixture::new();
+        let bytes = encoded("\u{feff}K K k", encoding);
+        fixture.write(&bytes);
+        let mut reader = fixture.reader();
+        let found = json(&reader.find_matching(1, "k", encoding, false, true, 8, bytes.len() as u64, || false).unwrap());
+        assert_eq!(found.get("mode").text(), "unicode-lowercase-text");
+        assert!(!found.get("case_sensitive").flag());
+        assert!(found.get("search_complete").flag());
+        assert!(found.get("match_count_complete").flag());
+        assert!(found.get("count_all_matches").flag());
+        assert_eq!(found.get("matches_seen").number(), 3);
+        assert_eq!(found.get("literal_original_hex"), &Json::Null);
+        assert_eq!(found.get("literal_sha256"), &Json::Null);
+        let before = json(&reader.info(|| false).unwrap());
+        let mut offset = encoded("\u{feff}", encoding).len() as u64;
+        let mut retained_bytes = 0;
+        for (position, spelling) in ["K", "K", "k"].into_iter().enumerate() {
+            let original = encoded(spelling, encoding);
+            let row = &found.get("hits").array()[position];
+            assert_eq!(bounds(row.get("original_range")), (offset, offset + original.len() as u64));
+            let witness = json(&reader.search_hit(1, position, || false).unwrap());
+            assert_eq!(witness.get("mode"), found.get("mode"));
+            assert_eq!(witness.get("case_sensitive"), found.get("case_sensitive"));
+            assert_eq!(witness.get("text").text(), spelling);
+            assert_eq!(witness.get("original_hex").text(), hex(&original));
+            let mut digest = fcb::store::Sha256::new(); digest.update(&original);
+            assert_eq!(row.get("witness_sha256").text(), digest.finalize().to_hex());
+            assert_eq!(witness.get("witness_sha256"), row.get("witness_sha256"));
+            assert_eq!(witness.get("additional_source_bytes_read").number(), 0);
+            retained_bytes += original.len() as u64;
+            offset += original.len() as u64 + encoded(" ", encoding).len() as u64;
+        }
+        assert_eq!(found.get("retained_witness_bytes").number(), retained_bytes);
+        assert_eq!(before.get("retained_search_witness_bytes").number(), retained_bytes);
+        assert_eq!(before, json(&reader.info(|| false).unwrap()));
+        let exact = json(&reader.search(2, "k", encoding, 8, bytes.len() as u64, || false).unwrap());
+        assert!(exact.get("case_sensitive").flag());
+        assert_eq!(exact.get("mode").text(), "exact-decoded-text");
+        assert_eq!(exact.get("matches_seen").number(), 1);
+        assert_eq!(exact.get("literal_original_hex").text(), hex(&encoded("k", encoding)));
+    }
+}
+
+#[test]
+fn lowercase_find_counts_without_rows_and_preserves_partial_and_canceled_policy() {
+    let fixture = Fixture::new(); fixture.write("KKkK".as_bytes());
+    let mut reader = fixture.reader();
+    let counted = json(&reader.find_matching(1, "k", ObservedReaderEncoding::Utf8, false, true, 0, 1024, || false).unwrap());
+    assert_eq!(counted.get("matches_seen").number(), 4);
+    assert!(counted.get("match_count_complete").flag());
+    assert!(counted.get("truncated").flag());
+    assert_eq!(counted.get("retained_hits").number(), 0);
+    assert_eq!(counted.get("retained_witness_bytes").number(), 0);
+    assert!(reader.search_hit(1, 0, || false).is_err());
+
+    let limited = json(&reader.find_matching(2, "k", ObservedReaderEncoding::Utf8, false, false, 1, 1024, || false).unwrap());
+    assert_eq!(limited.get("state").text(), "match-limit");
+    assert_eq!(limited.get("matches_seen").number(), 2);
+    assert!(!limited.get("match_count_complete").flag());
+    assert_eq!(limited.get("retained_witness_bytes").number(), 3);
+    let witness = json(&reader.search_hit(2, 0, || false).unwrap());
+    assert_eq!(witness.get("text").text(), "K");
+    let io = json(&reader.info(|| false).unwrap());
+    assert_eq!(reader.find_matching(3, "K", ObservedReaderEncoding::Utf8, false, true, 8, 1024, || true).err(),
+        Some(ObservedReaderError::Canceled));
+    assert_eq!(json(&reader.search_hit(2, 0, || false).unwrap()), witness);
+    assert_eq!(json(&reader.info(|| false).unwrap()).get("payload_bytes_read"), io.get("payload_bytes_read"));
+    let partial = json(&reader.find_matching(4, "k", ObservedReaderEncoding::Utf8, false, true, 8, 4, || false).unwrap());
+    assert_eq!(partial.get("state").text(), "byte-limit");
+    assert_eq!(partial.get("matches_seen").number(), 2);
+    assert!(!partial.get("match_count_complete").flag());
+    assert_eq!(partial.get("payload_bytes_read").number(), 4);
+}
+
+#[test]
+fn lowercase_current_context_requires_original_spelling_and_retained_history_survives_change() {
+    let fixture = Fixture::new(); fixture.write("K K k".as_bytes());
+    let mut reader = fixture.reader();
+    reader.find_matching(1, "k", ObservedReaderEncoding::Utf8, false, true, 8, 1024, || false).unwrap();
+    let retained = json(&reader.search_hit(1, 0, || false).unwrap());
+    let page = json(&reader.observe_hit(1, 0, 0, 64, || false).unwrap());
+    let observation = page.get("observation").number();
+    assert!(page.get("find_hit").get("witness_verified").flag());
+    let current = OpenOptions::new().write(true).open(fixture.0.join("source")).unwrap();
+    current.write_at(b"K  ", 0).unwrap();
+    assert_eq!(reader.observe_hit(1, 0, 0, 64, || false).err(), Some(ObservedReaderError::SearchHitChanged));
+    assert_eq!(json(&reader.search_hit(1, 0, || false).unwrap()), retained);
+    let replay = json(&reader.retained_window(observation, || false).unwrap());
+    assert_eq!(replay.get("find_hit"), page.get("find_hit"));
+    assert!(replay.get("text").text().starts_with("K"));
+}
+
+#[test]
+fn malformed_late_lowercase_source_revokes_tentative_counts_and_witnesses() {
+    let fixture = Fixture::new();
+    let mut bytes = "K K".as_bytes().to_vec(); bytes.resize(BUFFER_BYTES, b' '); bytes.push(0xff);
+    fixture.write(&bytes);
+    let mut reader = fixture.reader();
+    let report = json(&reader.find_matching(1, "k", ObservedReaderEncoding::Utf8, false, true, 8,
+        bytes.len() as u64, || false).unwrap());
+    assert_eq!(report.get("state").text(), "unsupported-text");
+    assert!(!report.get("match_count_complete").flag());
+    assert_eq!(report.get("matches_seen").number(), 0);
+    assert_eq!(report.get("retained_witness_bytes").number(), 0);
+    assert_eq!(report.get("unsupported_at").number(), BUFFER_BYTES as u64);
+    assert!(report.get("hits").array().is_empty());
+}

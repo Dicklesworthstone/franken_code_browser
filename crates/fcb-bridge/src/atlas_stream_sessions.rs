@@ -40,6 +40,15 @@ impl AtlasSessions {
         self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress, true)
     }
 
+    /// The scope carries the immutable case policy. The host chooses the shared
+    /// exact/lowercase engine; this layer only preserves lifecycle and counting.
+    pub(crate) fn execute_stream_scoped_matching_with_progress(&self, handle: u64, needle: &str,
+        options: AtlasStreamSearchOptions, scope: &AtlasSearchScope, count_all_matches: bool,
+        canceled: impl FnMut() -> bool, stopped: impl FnMut() -> bool,
+        progress: impl FnMut(&HostResponse)) -> Result<HostResponse, AccessError> {
+        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress, count_all_matches)
+    }
+
     fn execute_stream_progress_inner(&self, handle: u64, needle: &str,
         options: AtlasStreamSearchOptions, scope: &AtlasSearchScope, mut canceled: impl FnMut() -> bool,
         stopped: impl FnMut() -> bool, mut progress: impl FnMut(&HostResponse), count_all_matches: bool)

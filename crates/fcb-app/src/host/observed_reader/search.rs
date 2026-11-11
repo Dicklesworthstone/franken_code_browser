@@ -1,14 +1,15 @@
 #![forbid(unsafe_code)]
 
 //! Native-host composition of the public, bounded FileSearch engine. The last
-//! accepted query owns a small occurrence table and ONE exact literal witness;
-//! no whole-file capture, source spool, new matcher or inferred context exists.
+//! accepted query owns a small occurrence table and exact original witnesses.
+//! Exact queries share a literal; lowercase queries preserve each spelling.
+//! No whole-file capture, source spool, new matcher or inferred context exists.
 
 use std::{fs::File, mem::size_of, sync::Arc};
 use fcb::{ByteLength, ByteOffset, ByteRange, QueryGeneration, SourceRevision};
 use fcb::search::{CaptureRequest, DetectedEncoding, ExtentConsistency, FileSearch,
     FileSearchReport, ResourceAllocationId, ResourceBudget, StreamReadOptions,
-    StreamReadState, StreamReadStats, StreamReadStep, StreamingHit, StreamingNeedle};
+    StreamReadState, StreamReadStats, StreamReadStep, StreamingHit, StreamingMode, StreamingNeedle};
 use fcb::store::Sha256Digest;
 use fcb_core::ResourceLease;
 use crate::{AppError, EXIT_OK, EXIT_PARTIAL};
@@ -32,15 +33,19 @@ pub(super) struct AcceptedSearch {
     io: StreamReadStats,
     matches_seen: u64,
     count_all_matches: bool,
+    case_sensitive: bool,
     unsupported_at: Option<ByteOffset>,
     max_matches: usize,
     max_scan_bytes: u64,
     literal_text: String,
     literal_bytes: Vec<u8>,
     sha256: Option<Sha256Digest>,
+    witnesses: Vec<SearchWitness>,
     hits: Vec<StreamingHit>,
     _lease: ResourceLease,
 }
+
+struct SearchWitness { text: String, bytes: Vec<u8>, sha256: Sha256Digest }
 
 /// A verified hit selection belongs to its accepted immutable page. Replacing
 /// the current query cannot erase the provenance needed for history replay.
@@ -75,7 +80,7 @@ impl ObservedReaderSession {
     pub fn search(&mut self, generation: u64, needle: &str, encoding: ObservedReaderEncoding,
         max_matches: usize, max_scan_bytes: u64, canceled: impl FnMut() -> bool)
         -> Result<HostResponse, ObservedReaderError> {
-        self.search_inner(generation, needle, encoding, max_matches, max_scan_bytes, false, canceled)
+        self.search_inner(generation, needle, encoding, max_matches, max_scan_bytes, true, false, canceled)
     }
 
     /// Count every exact occurrence within the same byte/read-call budgets while
@@ -83,11 +88,21 @@ impl ObservedReaderSession {
     pub fn search_counted(&mut self, generation: u64, needle: &str, encoding: ObservedReaderEncoding,
         max_matches: usize, max_scan_bytes: u64, canceled: impl FnMut() -> bool)
         -> Result<HostResponse, ObservedReaderError> {
-        self.search_inner(generation, needle, encoding, max_matches, max_scan_bytes, true, canceled)
+        self.search_inner(generation, needle, encoding, max_matches, max_scan_bytes, true, true, canceled)
+    }
+
+    /// Search with an explicit frozen matching/count policy. Lowercase matching
+    /// uses the shared Unicode scalar engine and preserves each original witness.
+    pub fn find_matching(&mut self, generation: u64, needle: &str, encoding: ObservedReaderEncoding,
+        case_sensitive: bool, count_all_matches: bool, max_matches: usize, max_scan_bytes: u64,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, ObservedReaderError> {
+        self.search_inner(generation, needle, encoding, max_matches, max_scan_bytes,
+            case_sensitive, count_all_matches, canceled)
     }
 
     fn search_inner(&mut self, generation: u64, needle: &str, encoding: ObservedReaderEncoding,
-        max_matches: usize, max_scan_bytes: u64, count_all_matches: bool, mut canceled: impl FnMut() -> bool)
+        max_matches: usize, max_scan_bytes: u64, case_sensitive: bool, count_all_matches: bool,
+        mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, ObservedReaderError> {
         if generation == 0 || generation <= self.last_query_attempt { return Err(ObservedReaderError::StaleQuery); }
         self.last_query_attempt = generation;
@@ -106,7 +121,7 @@ impl ObservedReaderSession {
         self.source_bytes_read.checked_add(max_scan_bytes).ok_or(ObservedReaderError::IdentityExhausted)?;
         self.read_calls.checked_add(MAX_OBSERVED_READER_SEARCH_CALLS).ok_or(ObservedReaderError::IdentityExhausted)?;
         let [pattern_id, worker_id, result_id] = self.allocations()?;
-        let pattern = StreamingNeedle::text(self.owner(), needle, &self.budget, pattern_id).map_err(AppError::from)?;
+        let pattern = StreamingNeedle::text_matching(self.owner(), needle, case_sensitive, &self.budget, pattern_id).map_err(AppError::from)?;
         let request = CaptureRequest::new(self.reader.file_id(), revision)?;
         let options = StreamReadOptions { generation, max_matches, max_bytes: max_scan_bytes,
             max_read_calls: MAX_OBSERVED_READER_SEARCH_CALLS,
@@ -143,15 +158,16 @@ impl ObservedReaderSession {
         let query = self.query.as_ref().filter(|query| query.generation.get() == generation)
             .ok_or(ObservedReaderError::StaleQuery)?.clone();
         let hit = query.hits.get(position).ok_or(ObservedReaderError::MissingHit)?;
+        let (text, bytes, digest) = query.witness(position)?;
         let mut out = self.output("search-hit")?;
         encode_query(&mut out, &query)?;
         out.literal(",\"index\":")?; out.integer(position as u64)?;
         out.literal(",\"occurrence_id\":")?; out.integer(hit.occurrence_id())?;
         out.literal(",\"original_range\":")?; out.range(hit.original_range())?;
-        out.literal(",\"text\":")?; out.quoted(&query.literal_text)?;
-        out.literal(",\"original_hex\":")?; out.hex(&query.literal_bytes)?;
+        out.literal(",\"text\":")?; out.quoted(text)?;
+        out.literal(",\"original_hex\":")?; out.hex(bytes)?;
         out.literal(",\"witness_sha256\":")?;
-        out.quoted(&query.sha256.ok_or(ObservedReaderError::MissingHit)?.to_hex())?;
+        out.quoted(&digest.to_hex())?;
         out.literal(",\"additional_source_bytes_read\":\"0\",\"additional_read_calls\":\"0\"}\n")?;
         self.finish_output(out, EXIT_OK, &mut canceled)
     }
@@ -168,7 +184,8 @@ impl ObservedReaderSession {
         let query = self.query.as_ref().filter(|query| query.generation.get() == generation)
             .ok_or(ObservedReaderError::StaleQuery)?.clone();
         let hit = *query.hits.get(hit_index).ok_or(ObservedReaderError::MissingHit)?;
-        let witness_bytes = query.literal_bytes.len();
+        let (witness_text, witness, _) = query.witness(hit_index)?;
+        let witness_bytes = witness.len();
         // Scalar/CRLF floors can move both visible edges. Keep eight bytes of
         // slack so preferred context cannot clip any part of the selected hit.
         if !(4..=MAX_OBSERVED_READER_WINDOW_BYTES).contains(&window_bytes)
@@ -182,13 +199,13 @@ impl ObservedReaderSession {
         let [decode_id, clipped_decode_id] = self.allocations()?;
         let text = decode(&candidate, &self.budget, [decode_id, clipped_decode_id], &mut canceled)?;
         let original = hit.original_range();
-        if candidate.extent.range_bytes(original).ok() != Some(query.literal_bytes.as_slice()) {
+        if candidate.extent.range_bytes(original).ok() != Some(witness) {
             return Err(ObservedReaderError::SearchHitChanged);
         }
         let decoded = text.source_to_text(original).map_err(|_| ObservedReaderError::SearchHitChanged)?;
         let selection = text.text_selection(decoded).map_err(|_| ObservedReaderError::SearchHitChanged)?;
-        if selection.original_range != original || selection.original_bytes != query.literal_bytes.as_slice()
-            || selection.text != query.literal_text.as_str() || selection.contains_replacements {
+        if selection.original_range != original || selection.original_bytes != witness
+            || selection.text != witness_text || selection.contains_replacements {
             return Err(ObservedReaderError::SearchHitChanged);
         }
         candidate.find_hit = Some(FindHit { generation, search_observation: query.request.revision().get(),
@@ -204,13 +221,13 @@ impl ObservedReaderSession {
         check(canceled)?;
         let mut out = self.output("find")?;
         encode_query(&mut out, query)?;
-        out.literal(",\"mode\":\"exact-decoded-text\",\"case_sensitive\":true,\"literal_text\":")?;
+        out.literal(",\"literal_text\":")?;
         out.quoted(&query.literal_text)?;
         // Additive native aliases preserve every existing search receipt field.
         out.literal(",\"search_kind\":\"continuous-open-file-observation\",\"needle\":")?;
         out.quoted(&query.literal_text)?;
         out.literal(",\"literal_original_hex\":")?;
-        if query.hits.is_empty() { out.literal("null")?; } else { out.hex(&query.literal_bytes)?; }
+        if query.hits.is_empty() || !query.case_sensitive { out.literal("null")?; } else { out.hex(&query.literal_bytes)?; }
         out.literal(",\"literal_sha256\":")?;
         if let Some(digest) = query.sha256 { out.quoted(&digest.to_hex())?; } else { out.literal("null")?; }
         for (key, value) in [("max_matches", query.max_matches as u64), ("max_scan_bytes", query.max_scan_bytes),
@@ -218,12 +235,11 @@ impl ObservedReaderSession {
             ("scanned_input_bytes", query.io.scanned_bytes), ("read_calls", query.io.read_calls),
             ("source_bytes_read", query.io.bytes_read), ("scanned_bytes", query.io.scanned_bytes),
             ("peak_input_buffer_bytes", query.io.peak_buffer_bytes as u64), ("matches_seen", query.matches_seen),
-            ("retained_hits", query.hits.len() as u64), ("additional_source_bytes_read", query.io.bytes_read),
+            ("retained_hits", query.hits.len() as u64), ("retained_witness_bytes", query.witness_bytes() as u64),
+            ("additional_source_bytes_read", query.io.bytes_read),
             ("additional_read_calls", query.io.read_calls)] {
             out.literal(",")?; out.quoted(key)?; out.literal(":")?; out.integer(value)?;
         }
-        out.literal(",\"count_all_matches\":")?; out.boolean(query.count_all_matches)?;
-        out.literal(",\"match_count_complete\":")?; out.boolean(query.complete())?;
         out.literal(",\"truncated\":")?; out.boolean(query.matches_seen > query.hits.len() as u64)?;
         out.literal(",\"unsupported_at\":")?;
         if let Some(offset) = query.unsupported_at { out.integer(offset.get())?; } else { out.literal("null")?; }
@@ -234,7 +250,11 @@ impl ObservedReaderSession {
             out.literal("{\"index\":")?; out.integer(index as u64)?;
             out.literal(",\"hit_index\":")?; out.integer(index as u64)?;
             out.literal(",\"occurrence_id\":")?; out.integer(hit.occurrence_id())?;
-            out.literal(",\"original_range\":")?; out.range(hit.original_range())?; out.literal("}")?;
+            out.literal(",\"original_range\":")?; out.range(hit.original_range())?;
+            if !query.case_sensitive {
+                out.literal(",\"witness_sha256\":")?; out.quoted(&query.witness(index)?.2.to_hex())?;
+            }
+            out.literal("}")?;
         }
         out.literal("]}\n")?;
         self.finish_output(out, if query.complete() && query.matches_seen == query.hits.len() as u64 {
@@ -266,7 +286,7 @@ pub(super) fn encode_search_info(out: &mut Output, query: Option<&AcceptedSearch
     out.literal(",\"accepted_search_observation\":")?;
     if let Some(query) = query { out.integer(query.request.revision().get())?; } else { out.literal("null")?; }
     out.literal(",\"retained_search_hits\":")?; out.integer(query.map_or(0, |query| query.hits.len() as u64))?;
-    out.literal(",\"retained_search_witness_bytes\":")?; out.integer(query.map_or(0, |query| query.literal_bytes.len() as u64))?;
+    out.literal(",\"retained_search_witness_bytes\":")?; out.integer(query.map_or(0, |query| query.witness_bytes() as u64))?;
     Ok(())
 }
 
@@ -278,10 +298,21 @@ impl AcceptedSearch {
         check(canceled)?;
         let search = report.search();
         let text = search.text_literal().ok_or(ObservedReaderError::InvalidRange)?;
-        let witness = if search.hits().is_empty() { &[][..] } else { search.witness_bytes(0).map_err(AppError::from)? };
+        let case_sensitive = search.mode() == StreamingMode::ExactText;
+        let witness = if search.hits().is_empty() || !case_sensitive { &[][..] }
+            else { search.witness_bytes(0).map_err(AppError::from)? };
+        let mut per_hit_charge = 0usize;
+        if !case_sensitive {
+            for (ordinal, _) in search.hits().iter().enumerate() {
+                per_hit_charge = per_hit_charge.checked_add(size_of::<SearchWitness>())
+                    .and_then(|n| n.checked_add(search.witness_bytes(ordinal).ok()?.len()))
+                    .and_then(|n| n.checked_add(search.matched_text(ordinal).ok()?.len())).ok_or(AppError::Admission)?;
+            }
+        }
         let charge = search.hits().len().checked_mul(size_of::<StreamingHit>())
             .and_then(|n| n.checked_add(text.len()))
             .and_then(|n| n.checked_add(witness.len()))
+            .and_then(|n| n.checked_add(per_hit_charge))
             .and_then(|n| n.checked_add(size_of::<Self>() + 2 * size_of::<usize>())).ok_or(AppError::Admission)?;
         let lease = budget.try_reserve_managed(search.request().file().owner(), allocation, ByteLength::new(charge as u64))
             .map_err(|_| AppError::Admission)?;
@@ -293,14 +324,41 @@ impl AcceptedSearch {
         literal_bytes.extend_from_slice(witness);
         let mut hits = reserve(search.hits().len())?;
         hits.extend_from_slice(search.hits());
-        let sha256 = if hits.is_empty() { None } else { Some(extent_sha256(witness, canceled)?) };
+        let sha256 = if hits.is_empty() || !case_sensitive { None } else { Some(extent_sha256(witness, canceled)?) };
+        let mut witnesses = reserve(if case_sensitive { 0 } else { hits.len() })?;
+        if !case_sensitive {
+            for (ordinal, _) in hits.iter().enumerate() {
+                check(canceled)?;
+                let bytes = search.witness_bytes(ordinal).map_err(AppError::from)?;
+                let spelling = search.matched_text(ordinal).map_err(AppError::from)?;
+                let mut text = String::new();
+                text.try_reserve_exact(spelling.len()).map_err(|_| AppError::Admission)?;
+                if text.capacity() > spelling.len() { return Err(AppError::Admission.into()); }
+                text.push_str(spelling);
+                let mut retained = reserve(bytes.len())?;
+                retained.extend_from_slice(bytes);
+                witnesses.push(SearchWitness { text, bytes: retained, sha256: extent_sha256(bytes, canceled)? });
+            }
+        }
         check(canceled)?;
         Ok(Self { request: search.request(), generation: search.generation(), encoding,
             observed_length: search.observed_length(), final_length: report.final_length(),
             consistency: report.consistency(), state: search.state(), io: search.stats(),
-            matches_seen: search.matches_seen(), count_all_matches: search.count_all_matches(),
+            matches_seen: search.matches_seen(), count_all_matches: search.count_all_matches(), case_sensitive,
             unsupported_at: search.unsupported_at(), max_matches, max_scan_bytes,
-            literal_text, literal_bytes, sha256, hits, _lease: lease })
+            literal_text, literal_bytes, sha256, witnesses, hits, _lease: lease })
+    }
+    fn witness(&self, ordinal: usize) -> Result<(&str, &[u8], Sha256Digest), ObservedReaderError> {
+        self.hits.get(ordinal).ok_or(ObservedReaderError::MissingHit)?;
+        if self.case_sensitive {
+            Ok((&self.literal_text, &self.literal_bytes, self.sha256.ok_or(ObservedReaderError::MissingHit)?))
+        } else {
+            let witness = self.witnesses.get(ordinal).ok_or(ObservedReaderError::MissingHit)?;
+            Ok((&witness.text, &witness.bytes, witness.sha256))
+        }
+    }
+    fn witness_bytes(&self) -> usize {
+        if self.case_sensitive { self.literal_bytes.len() } else { self.witnesses.iter().map(|witness| witness.bytes.len()).sum() }
     }
     fn complete(&self) -> bool {
         self.state == StreamReadState::Complete && self.consistency == ExtentConsistency::UnchangedMetadata
@@ -333,6 +391,9 @@ fn scan<'needle>(file: File, request: CaptureRequest, needle: &'needle Streaming
 }
 
 fn encode_query(out: &mut Output, query: &AcceptedSearch) -> Result<(), ObservedReaderError> {
+    out.literal(",\"mode\":")?;
+    out.quoted(if query.case_sensitive { "exact-decoded-text" } else { "unicode-lowercase-text" })?;
+    out.literal(",\"case_sensitive\":")?; out.boolean(query.case_sensitive)?;
     out.literal(",\"query_generation\":")?; out.integer(query.generation.get())?;
     out.literal(",\"search_observation\":")?; out.integer(query.request.revision().get())?;
     out.literal(",\"encoding\":")?; out.quoted(query.encoding.code())?;
