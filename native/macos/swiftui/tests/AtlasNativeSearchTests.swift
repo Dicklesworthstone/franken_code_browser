@@ -359,6 +359,13 @@ private final class Reports: @unchecked Sendable {
             var bad = page("step", step: 1, total: 70); bad["match_count_complete"] = true
             try install(2, bad)
         }
+        for stop in ["file-limit", "source-byte-limit", "verification-byte-limit"] {
+            try rejected("complete counted result with " + stop) {
+                var bad = page("step", step: 2, total: 70, running: false, complete: true)
+                bad["stop_reason"] = stop
+                try install(2, bad, index: 1)
+            }
+        }
         try rejected("premature complete") {
             try install(2, page("step", step: 1, total: 70, complete: true))
         }

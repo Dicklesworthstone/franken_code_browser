@@ -497,7 +497,9 @@ private struct SearchStream {
         if page.search_complete {
             guard !page.search_in_progress, page.discovery_complete, pending == 0,
                   unavailable == 0,
-                  countAllMatches ? (page.match_count_complete == true) : (!page.truncated && matches == UInt64(retained))
+                  countAllMatches
+                    ? (page.match_count_complete == true && page.stop_reason == "all-files-examined")
+                    : (!page.truncated && matches == UInt64(retained))
                   else { throw invalid() }
             if let coverage = structureCoverage {
                 guard coverage.unsupportedFiles == 0, coverage.extractionLimitedFiles == 0,

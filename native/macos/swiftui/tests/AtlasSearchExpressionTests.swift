@@ -164,10 +164,27 @@ private enum ExpressionFixture {
         var noProof = ExpressionFixture.countedPage("step", step: 1, caseSensitive: true)
         noProof["search_in_progress"] = false; noProof["stop_reason"] = "verification-byte-limit"
         ExpressionFixture.install(2, noProof)
+        for (index, start) in stride(from: 64, to: 1000, by: 128).enumerated() {
+            var page = ExpressionFixture.countedPage("page", step: 1, start: start, caseSensitive: true)
+            page["search_in_progress"] = false; page["stop_reason"] = "verification-byte-limit"
+            ExpressionFixture.install(3, page, index: UInt32(index))
+        }
         var partialCount: AtlasSearchReport? = try live(countAllMatches: true)
         precondition(!partialCount!.complete && !partialCount!.matchCountComplete
             && partialCount!.summary.contains("Partial search"), "Predicate scan limits never prove an exact count")
         partialCount = nil; retireLive()
+        for caseSensitive in [true, false] {
+            for stop in ["file-limit", "source-byte-limit", "verification-byte-limit"] {
+                ExpressionFixture.setupCounted(caseSensitive: caseSensitive)
+                var bad = ExpressionFixture.countedPage("step", step: 2, caseSensitive: caseSensitive)
+                bad["stop_reason"] = stop
+                ExpressionFixture.install(2, bad, index: 1)
+                reject("Complete counted expression has a non-exhaustive terminal reason: " + stop) {
+                    _ = try live(countAllMatches: true, caseSensitive: caseSensitive)
+                }
+                retireLive()
+            }
+        }
         ExpressionFixture.setupCounted(caseSensitive: true); cancelExpressionStep()
         do { _ = try live(countAllMatches: true); preconditionFailure("Canceled counted expression published") }
         catch AtlasSearchError.canceled { }
