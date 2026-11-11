@@ -118,6 +118,16 @@ impl RetainedAtlasSearch {
         Ok(response)
     }
 
+    /// Admit exact-text work whose count can continue beyond retained rows.
+    pub fn begin_counted_scoped(&mut self, atlas: &AtlasSession, generation: u64, needle: &str,
+        scope: AtlasSearchScope, options: AtlasSearchOptions, mut canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AtlasSearchError> {
+        let work = self.prepare_counted_work(atlas, generation, needle, scope, options, &mut canceled)?;
+        let response = self.work_response(atlas, &work, "begin", &mut canceled)?;
+        self.pending = Some(work);
+        Ok(response)
+    }
+
     /// Advance at most ONE live or captured file and return append-only progress.
     /// Stale steps never discard a newer request. Any failed/canceled step drops
     /// that request's provisional state, not the previously accepted query.
@@ -143,6 +153,19 @@ impl RetainedAtlasSearch {
     pub(super) fn prepare_work(&mut self, atlas: &AtlasSession, generation: u64,
         needle: &str, scope: AtlasSearchScope, options: AtlasSearchOptions, canceled: &mut impl FnMut() -> bool)
         -> Result<SearchWork, AtlasSearchError> {
+        self.prepare_work_inner(atlas, generation, needle, scope, options, false, canceled)
+    }
+
+    pub(super) fn prepare_counted_work(&mut self, atlas: &AtlasSession, generation: u64,
+        needle: &str, scope: AtlasSearchScope, options: AtlasSearchOptions, canceled: &mut impl FnMut() -> bool)
+        -> Result<SearchWork, AtlasSearchError> {
+        if !scope.case_sensitive() { return Err(AtlasSearchError::InvalidScope); }
+        self.prepare_work_inner(atlas, generation, needle, scope, options, true, canceled)
+    }
+
+    fn prepare_work_inner(&mut self, atlas: &AtlasSession, generation: u64,
+        needle: &str, scope: AtlasSearchScope, options: AtlasSearchOptions, count_all_matches: bool,
+        canceled: &mut impl FnMut() -> bool) -> Result<SearchWork, AtlasSearchError> {
         self.validate(atlas)?; self.attempt(generation)?;
         options.validate()?;
         if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES {
@@ -174,7 +197,7 @@ impl RetainedAtlasSearch {
             matched_text_capacity: text_capacity,
             examined: 0, scanned: 0, unavailable: 0, pending: eligible_files,
             matches_seen: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0,
-            truncated: false, complete: false, stop_reason: None, step_count: 0,
+            count_all_matches, truncated: false, complete: false, stop_reason: None, step_count: 0,
             last_step_files: 0, last_step_bytes: 0, last_step_calls: 0, index_usage: None, _lease: lease };
         let pattern = if case_sensitive {
             Some(StreamingNeedle::text(self.manifest.owner(), needle, &self.budget, pattern_id)
@@ -191,7 +214,7 @@ impl RetainedAtlasSearch {
         let allocations = self.excerpt_ids(64)?;
         let mut excerpts = Excerpts::new(&self.budget, allocations);
         encode_page(&mut out, atlas, &work.snapshot, 0, 64, &mut excerpts, canceled)?;
-        self.finish(atlas, out, !work.snapshot.complete, canceled)
+        self.finish(atlas, out, !work.snapshot.complete || work.snapshot.truncated, canceled)
     }
 
     pub(super) fn advance_work(&self, atlas: &AtlasSession, work: &mut SearchWork,
@@ -255,9 +278,15 @@ impl RetainedAtlasSearch {
             // cannot append hits or retain another source capture below.
             scan_options.max_matches = work.options.max_matches - before_hits;
             scan_options.max_bytes = capture.bytes().len() as u64;
-            let mut scan = ReaderSearch::new(capture.bytes(), *capture.request(),
-                ByteLength::new(capture.bytes().len() as u64), pattern, scan_options,
-                &self.budget, work.scan_id).map_err(AppError::from)?;
+            let mut scan = if candidate.count_all_matches {
+                ReaderSearch::new_counting(capture.bytes(), *capture.request(),
+                    ByteLength::new(capture.bytes().len() as u64), pattern, scan_options,
+                    &self.budget, work.scan_id)
+            } else {
+                ReaderSearch::new(capture.bytes(), *capture.request(),
+                    ByteLength::new(capture.bytes().len() as u64), pattern, scan_options,
+                    &self.budget, work.scan_id)
+            }.map_err(AppError::from)?;
             while scan.state() == StreamReadState::Pending {
                 scan.step(StreamReadStep::default(), qgen,
                     || canceled() || atlas.validate_active().is_err()).map_err(AppError::from)?;
@@ -267,12 +296,16 @@ impl RetainedAtlasSearch {
             if report.state() == StreamReadState::Canceled { return Err(AtlasSearchError::Canceled); }
             if let StreamReadState::Failed(error) = report.state() { return Err(AppError::from(error).into()); }
             candidate.scanned += 1;
-            candidate.matches_seen += report.matches_seen();
+            candidate.matches_seen = candidate.matches_seen.checked_add(report.matches_seen())
+                .ok_or(AtlasSearchError::IdentityExhausted)?;
             if report.state() == StreamReadState::Truncated { candidate.truncated = true; }
             else if !report.input_complete() { candidate.unavailable(file, report.state().code()); }
             for hit in report.hits() {
                 candidate.hits.push(AtlasSearchHit { id: candidate.hits.len() as u64 + 1,
                     file, revision, node, original_range: hit.original_range(), source_slot: candidate.files.len() });
+            }
+            if candidate.count_all_matches {
+                candidate.truncated = candidate.matches_seen > candidate.hits.len() as u64;
             }
         } else {
             let remaining = work.options.max_matches - before_hits;
@@ -339,9 +372,10 @@ fn update_coverage(atlas: &AtlasSession, q: &mut Snapshot, work: &LiveWork) {
     q.source_bytes_read = work.io.bytes;
     q.read_calls = work.io.calls;
     q.stop_reason = if q.pending == 0 {
-        Some(if q.truncated { AtlasSearchStop::MatchLimit } else { AtlasSearchStop::AllFilesExamined })
-    } else if q.truncated {
-        // Filling the retained rows alone does not prove omitted occurrences.
+        Some(if q.truncated && !q.count_all_matches { AtlasSearchStop::MatchLimit }
+            else { AtlasSearchStop::AllFilesExamined })
+    } else if q.truncated && !q.count_all_matches {
+        // Legacy mode stops on omitted occurrences. Counted exact mode continues.
         Some(AtlasSearchStop::MatchLimit)
     } else if q.examined == work.options.max_files {
         Some(AtlasSearchStop::FileLimit)
@@ -349,5 +383,6 @@ fn update_coverage(atlas: &AtlasSession, q: &mut Snapshot, work: &LiveWork) {
         Some(AtlasSearchStop::SourceByteLimit)
     } else { None };
     q.complete = q.stop_reason.is_some() && atlas.atlas().discovery_complete()
-        && q.scope_region.is_none_or(|region| region.missing == 0) && q.pending == 0 && q.unavailable == 0 && !q.truncated;
+        && q.scope_region.is_none_or(|region| region.missing == 0) && q.pending == 0 && q.unavailable == 0
+        && (!q.truncated || q.count_all_matches);
 }

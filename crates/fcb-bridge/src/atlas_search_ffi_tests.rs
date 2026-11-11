@@ -113,6 +113,8 @@ fn c_search_signatures_and_header_declarations_agree() {
         *const c_char, u64, u64, u64, u64) -> *mut c_char = fcb_atlas_search_path_scoped;
     let _: unsafe extern "C" fn(u64, u64, *const c_char, *const c_char, *const c_char, u64,
         *const c_char, u64, u64, u64, u64) -> *mut c_char = fcb_atlas_search_begin_path_scoped;
+    let _: unsafe extern "C" fn(u64, u64, *const c_char, *const c_char, *const c_char, u64,
+        *const c_char, u64, u64, u64, u64, u64) -> *mut c_char = fcb_atlas_search_begin_counted_matching;
     let _: extern "C" fn(u64, u64) -> *mut c_char = fcb_atlas_search_step;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_atlas_search_page;
     let _: extern "C" fn(u64, u64) -> *mut c_char = fcb_atlas_search_overlay;
@@ -123,7 +125,8 @@ fn c_search_signatures_and_header_declarations_agree() {
     for function in ["fcb_atlas_search(", "fcb_atlas_search_begin(", "fcb_atlas_search_step(",
         "fcb_atlas_search_scoped(", "fcb_atlas_search_begin_scoped(",
         "fcb_atlas_search_path_scoped(", "fcb_atlas_search_begin_path_scoped(",
-        "fcb_atlas_search_page(", "fcb_atlas_search_overlay(", "fcb_atlas_search_clear(",
+        "fcb_atlas_search_begin_counted_matching(", "fcb_atlas_search_page(",
+        "fcb_atlas_search_overlay(", "fcb_atlas_search_clear(",
         "fcb_atlas_search_focus(", "fcb_atlas_search_open_reader("] {
         assert_eq!(header.matches(function).count(), 1, "{function}");
     }
@@ -378,4 +381,37 @@ fn c_visible_scope_owns_raw_membership_and_preserves_partial_indexed_coverage() 
     assert_eq!(fcb_atlas_close(atlas), 1);
     assert!(take(fcb_reader_copy_range(reader, 0, 6)).contains("6e6565646c65"));
     assert_eq!(fcb_reader_close(reader), 1);
+}
+
+
+#[test]
+fn c_counted_exact_search_scans_later_files_after_row_limit() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let root = std::env::temp_dir().join(format!("fcb-counted-search-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a.rs"), b"needle needle").unwrap();
+    fs::write(root.join("b.rs"), b"needle").unwrap();
+    let root_c = CString::new(root.to_str().unwrap()).unwrap();
+    let needle = CString::new("needle").unwrap();
+    let atlas = fcb_atlas_create(); assert_ne!(atlas, 0);
+    assert!(take(unsafe { fcb_atlas_open(atlas, root_c.as_ptr(), 100) }).contains("\"status\":\"ok\""));
+    let begin = take(unsafe { fcb_atlas_search_begin_counted_matching(atlas, 1, needle.as_ptr(),
+        std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 1, 1, 10, 1024, 4096) });
+    assert!(begin.contains("\"count_all_matches\":true"), "{begin}");
+    let first = take(fcb_atlas_search_step(atlas, 1));
+    assert!(first.contains("\"matches_seen\":\"2\""), "{first}");
+    assert!(first.contains("\"retained_hits\":\"1\""));
+    assert!(first.contains("\"search_in_progress\":true"), "{first}");
+    let second = take(fcb_atlas_search_step(atlas, 1));
+    for expected in ["\"search_complete\":true", "\"match_count_complete\":true",
+        "\"truncated\":true", "\"matches_seen\":\"3\"",
+        "\"retained_hits\":\"1\"", "\"stop_reason\":\"all-files-examined\""] {
+        assert!(second.contains(expected), "missing {expected}: {second}");
+    }
+    let insensitive = take(unsafe { fcb_atlas_search_begin_counted_matching(atlas, 2, needle.as_ptr(),
+        std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 0, 1, 10, 1024, 4096) });
+    assert!(insensitive.contains("INVALID_ARGUMENT"), "{insensitive}");
+    assert_eq!(fcb_atlas_close(atlas), 1);
+    let _ = fs::remove_dir_all(root);
 }

@@ -310,7 +310,7 @@ impl RetainedAtlasSearch {
             hits: reserve(max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?, examined, scanned: 0,
             matched_texts: reserve(if case_sensitive { 0 } else { max_matches })?,
             matched_text_capacity: text_capacity,
-            unavailable, pending, matches_seen: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0,
+            unavailable, pending, matches_seen: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0, count_all_matches: false,
             truncated: false, complete: false, stop_reason: None, step_count: 0,
             last_step_files: 0, last_step_bytes: 0, last_step_calls: 0,
             index_usage: Some(IndexQueryUsage { generation: index_generation, manifest: retained.engine.id().revision(),

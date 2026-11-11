@@ -166,6 +166,8 @@ struct Snapshot {
     source_bytes_read: u64,
     read_calls: u64,
     retained_bytes: usize,
+    /// Counted exact-text queries may omit rows while continuing through the frozen scope.
+    count_all_matches: bool,
     truncated: bool,
     complete: bool,
     stop_reason: Option<AtlasSearchStop>,
@@ -286,6 +288,19 @@ impl RetainedAtlasSearch {
         Ok(response)
     }
 
+    /// Exact-text route that continues counting after the retained hit table fills.
+    pub fn search_counted_scoped(&mut self, atlas: &AtlasSession, generation: u64, needle: &str,
+        scope: AtlasSearchScope, options: AtlasSearchOptions, mut canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AtlasSearchError> {
+        let mut work = self.prepare_counted_work(atlas, generation, needle, scope, options, &mut canceled)?;
+        while work.snapshot.stop_reason.is_none() {
+            self.advance_work(atlas, &mut work, &mut canceled)?;
+        }
+        let response = self.work_response(atlas, &work, "search", &mut canceled)?;
+        self.accepted = Some(work.snapshot);
+        Ok(response)
+    }
+
     /// Paging uses retained captures, including bounded decoded excerpts, and
     /// never reopens a live path or recomputes a query. Running-query pages are
     /// explicitly provisional; next_offset=null means end of currently retained
@@ -300,7 +315,7 @@ impl RetainedAtlasSearch {
         if start > snapshot.hits.len() { return Err(AtlasSearchError::InvalidLimits); }
         let mut excerpts = Excerpts::new(&self.budget, allocations);
         encode_page(&mut out, atlas, snapshot, start, limit, &mut excerpts, &mut canceled)?;
-        let partial = !snapshot.complete;
+        let partial = !snapshot.complete || snapshot.truncated;
         self.finish(atlas, out, partial, &mut canceled)
     }
 
@@ -331,7 +346,7 @@ impl RetainedAtlasSearch {
         }
         out.literal("],\"displayed_files\":")?; out.integer(displayed_files as u64)?;
         out.literal("}\n")?;
-        let partial = !snapshot.complete;
+        let partial = !snapshot.complete || snapshot.truncated;
         self.finish(atlas, out, partial, &mut canceled)
     }
 
@@ -464,6 +479,8 @@ fn summary(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot) -> Resul
     out.literal(",\"stop_reason\":")?;
     if let Some(reason) = snapshot.stop_reason { out.quoted(reason.code())?; } else { out.literal("null")?; }
     out.literal(",\"search_complete\":")?; out.boolean(snapshot.complete)?;
+    out.literal(",\"count_all_matches\":")?; out.boolean(snapshot.count_all_matches)?;
+    out.literal(",\"match_count_complete\":")?; out.boolean(snapshot.complete)?;
     out.literal(",\"truncated\":")?; out.boolean(snapshot.truncated)?;
     for (key, value) in [("eligible_files", snapshot.eligible_files as u64),
         ("excluded_files", (atlas.atlas().file_count() - snapshot.eligible_files) as u64),

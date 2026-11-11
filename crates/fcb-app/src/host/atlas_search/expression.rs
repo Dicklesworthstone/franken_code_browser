@@ -91,7 +91,7 @@ impl RetainedAtlasSearch {
             matched_texts: reserve(if case_sensitive { 0 } else { options.max_matches })?,
             matched_text_capacity: text_capacity, examined: excluded, scanned: 0, unavailable: 0,
             pending: admitted.eligible - excluded, matches_seen: 0, source_bytes_read: 0,
-            read_calls: 0, retained_bytes: 0, truncated: false, complete: false, stop_reason: None,
+            read_calls: 0, retained_bytes: 0, count_all_matches: false, truncated: false, complete: false, stop_reason: None,
             step_count: 0, last_step_files: 0, last_step_bytes: 0, last_step_calls: 0,
             index_usage: None, _lease: lease };
         let work = SearchWork { snapshot, execution: SearchExecution::Expression(ExpressionWork {
