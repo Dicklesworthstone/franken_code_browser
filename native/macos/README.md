@@ -447,9 +447,13 @@ Widening a query beyond that captured scope can therefore leave files
 uncaptured until Refresh. Indexed queries and result activation do no live
 source reads.
 
-Both routes retain at most 1,000 primary matches. Live capture and index
-preparation admit at most 4,096 files, 1 MiB per file and 32 MiB of aggregate
-source-read work. A prepared index additionally admits at most 2,097,152 grams;
+Both routes retain at most 1,000 primary matches. Exact case-sensitive live
+text search continues counting through its admitted file scope after those rows
+fill, so a complete scan may report an exhaustive match count while keeping only
+the first 1,000 selectable captures. Case-insensitive, expression and structural
+modes retain their separate bounded-result completeness contracts. Live capture
+and index preparation admit at most 4,096 files, 1 MiB per file and 32 MiB of
+aggregate source-read work. A prepared index additionally admits at most 2,097,152 grams;
 files without usable gram coverage use retained-source verification. Each
 expression has a separate **256 MiB verification-work budget**, shared across
 all required, excluded and primary probes. Rechecking the same capture for

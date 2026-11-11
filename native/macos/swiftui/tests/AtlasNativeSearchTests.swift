@@ -36,6 +36,7 @@ private final class Reports: @unchecked Sendable {
             "owner": "11", "source_manifest": "1", "layout_revision": "1", "query_generation": "1",
             "needle": "x", "mode": "exact-decoded-literal", "search_strategy": "live-capture-scan",
             "discovery_complete": true, "search_in_progress": running, "search_complete": complete,
+            "count_all_matches": true, "match_count_complete": complete,
             "truncated": false, "stop_reason": running ? NSNull() : "all-files-examined",
             "catalogued_files": String(catalogued), "examined_files": String(min(step, catalogued)),
             "scanned_files": String(min(step, catalogued)), "unavailable_files": "0",
@@ -109,6 +110,7 @@ private final class Reports: @unchecked Sendable {
         var value = scopedPage(command, scope: scope, step: step, eligible: eligible, total: total,
             running: running, pathScope: pathScope, hitPath: path)
         value["case_sensitive"] = false; value["mode"] = "unicode-lowercase-literal"; value["needle"] = needle
+        value["count_all_matches"] = false; value["match_count_complete"] = !running
         if total > 0 {
             var row = hit(1, path: path)
             row["matched_text"] = actualText
@@ -146,6 +148,7 @@ private final class Reports: @unchecked Sendable {
         var value = page(command, step: step, total: total, running: running,
             complete: complete, catalogued: catalogued)
         value["mode"] = mode.wireMode; value["search_strategy"] = "live-structure-scan"
+        value["count_all_matches"] = false; value["match_count_complete"] = complete
         value["requested_mode"] = mode.rawValue; value["realized_mode"] = mode.evidence
         value["evidence_level"] = mode.evidence; value["semantic_complete"] = false
         value["name_mode"] = nameMode.rawValue; value["name_case"] = "sensitive"
@@ -222,8 +225,9 @@ private final class Reports: @unchecked Sendable {
         check(terminal!.hits.map(\.id) == Array(0..<70), "Stable contiguous occurrence IDs")
         check(progress.values.contains { $0.isInProgress && $0.hits.count == 70 }, "Matches publish before final file")
         check(progress.values.allSatisfy { !$0.complete && $0.streamID == terminal!.streamID }, "Coverage and identity remain independent")
-        check(fixtureCount(1) == 1 && fixtureCount(2) == 1 && fixtureCount(3) == 2,
-              "One discovery, one admission, one step per file")
+        check(fixtureCount(1) == 1 && fixtureCount(2) == 1 && fixtureCount(3) == 2
+              && fixtureCount(14) == 1,
+              "One discovery, one counted admission, one step per file")
         check(fixtureCount(4) == 1, "Later progress does not refetch already retained pages")
         let firstID = terminal!.streamID
         var target = terminal!.capture?.target(terminal!.hits[0])
@@ -295,6 +299,14 @@ private final class Reports: @unchecked Sendable {
                 var bad = page("step", step: 1, total: 70); bad[key] = value
                 try install(2, bad)
             }
+        }
+        try rejected("count policy") {
+            var bad = page("step", step: 1, total: 70); bad["count_all_matches"] = false
+            try install(2, bad)
+        }
+        try rejected("count completeness") {
+            var bad = page("step", step: 1, total: 70); bad["match_count_complete"] = true
+            try install(2, bad)
         }
         try rejected("premature complete") {
             try install(2, page("step", step: 1, total: 70, complete: true))

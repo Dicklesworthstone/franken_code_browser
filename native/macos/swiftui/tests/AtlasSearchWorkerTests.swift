@@ -100,8 +100,10 @@ private func closeRetainedReader(_ handle: UInt64) -> UInt8
             if let result = try? $0.get(), !result.isInProgress { broad = result }
         }
         pump { broad != nil }
-        precondition(broad!.truncated && broad!.hits.count == 1000
-            && broad!.hits.allSatisfy { $0.path == "a_excluded.txt" }, "Control no longer exercises capped excluded results")
+        precondition(broad!.complete && broad!.truncated && broad!.matchCountComplete
+            && broad!.matchesSeen == 1002 && broad!.hits.count == 1000
+            && broad!.hits.allSatisfy { $0.path == "a_excluded.txt" },
+            "Exact workspace search must finish its count while retaining bounded rows")
         let scope = try AtlasFileScope.rust.searchScope()
         var selected: AtlasSearchReport?
         try scopedCoordinator.submitScoped(input: AtlasSearchInput(root: root.path, query: "scope-needle", fileScope: scope)) {
@@ -160,9 +162,10 @@ private func closeRetainedReader(_ handle: UInt64) -> UInt8
         }
         do {
             let control = try execute(AtlasSearchInput(root: root.path, query: "path-needle"))
-            precondition(control.truncated && control.hits.count == 1000
+            precondition(control.complete && control.truncated && control.matchCountComplete
+                && control.matchesSeen == 2004 && control.hits.count == 1000
                 && control.hits.allSatisfy { $0.sourcePath == "a_path_noise.txt" },
-                "Directory regression must first demonstrate workspace quota starvation")
+                "Workspace count must include later files after its retained rows fill")
         }
         do {
             let result = try execute(AtlasSearchInput(root: root.path, query: "path-needle", pathScope: directory))
@@ -174,9 +177,10 @@ private func closeRetainedReader(_ handle: UInt64) -> UInt8
         }
         do {
             let control = try execute(AtlasSearchInput(root: root.path, query: "file-needle", pathScope: directory))
-            precondition(control.truncated && control.hits.count == 1000
+            precondition(control.complete && control.truncated && control.matchCountComplete
+                && control.matchesSeen == 1002 && control.hits.count == 1000
                 && control.hits.allSatisfy { $0.sourcePath == "scoped/a_excluded.rs" },
-                "Exact-file regression must demonstrate starvation by an earlier sibling in the same folder")
+                "Directory count must include later sibling matches after retained rows fill")
         }
         do {
             let result = try execute(AtlasSearchInput(root: root.path, query: "file-needle", pathScope: file))

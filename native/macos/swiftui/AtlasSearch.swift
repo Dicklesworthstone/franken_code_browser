@@ -338,6 +338,8 @@ struct AtlasSearchReport: Sendable {
     let unavailableFiles: Int
     let unsupportedFiles: Int
     let matchesSeen: UInt64
+    var countAllMatches: Bool = false
+    var matchCountComplete: Bool = false
     var progress: AtlasSearchProgress? = nil
     /// One identity for an append-only stream; legacy one-shot reports use nil.
     var streamID: UUID? = nil
@@ -390,15 +392,24 @@ struct AtlasSearchReport: Sendable {
                 : (mode.isTextual && !caseSensitive ? " Compared using Unicode lowercase; source spelling is preserved." : ""))
         if let progress, progress.isRunning {
             let membership = isWorkspaceScope ? "catalogued" : "eligible"
-            return "Searching: \(count) \(noun) found; \(progress.examinedFiles) of \(progress.cataloguedFiles) \(membership) files examined. Results are provisional." + qualification
+            let found = countAllMatches
+                ? "\(matchesSeen) matches counted so far; first \(count) retained"
+                : "\(count) \(noun) found"
+            return "Searching: \(found); \(progress.examinedFiles) of \(progress.cataloguedFiles) \(membership) files examined. Results are provisional." + qualification
         }
         if complete {
             let scope = pathScope.isWorkspace ? (fileScope.isAll ? "captured project" : "selected file types")
                 : pathScope.selectionDescription
+            if countAllMatches && matchCountComplete {
+                if matchesSeen == 0 { return "No \(noun) in the \(scope)." + qualification }
+                let retained = matchesSeen > UInt64(count) ? "; first \(count) retained" : ""
+                return "\(matchesSeen) \(noun) in the \(scope)\(retained)." + qualification
+            }
             return (count == 0 ? "No \(noun) in the \(scope)." : "\(count) \(noun) in the \(scope).") + qualification
         }
         var reasons: [String] = []
-        if truncated { reasons.append("result limit reached") }
+        if truncated && !countAllMatches { reasons.append("result limit reached") }
+        if truncated && countAllMatches { reasons.append("first \(count) results retained; total count is not complete") }
         if let coverage = structureCoverage {
             if unavailableFiles > 0 { reasons.append("\(unavailableFiles) files with unavailable or incomplete analysis") }
             if coverage.unsupportedFiles > 0 {
