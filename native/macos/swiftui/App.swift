@@ -1481,7 +1481,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 AtlasSourceReader(source: source, navigation: focusRequest,
                     selection: searchIsCurrent ? selectedReaderSelection : nil, wrapsLines: wrapsSourceLines,
                     showsLineNumbers: showsSourceLineNumbers, showsWhitespace: showsSourceWhitespace,
-                    firstPhysicalLine: 1) {
+                    firstPhysicalLine: 1, usesSyntaxPalette: true) {
                     if let document = atlasDocuments[source.path],
                        document.source.path.utf8.elementsEqual(source.path.utf8),
                        document.source.text.utf8.elementsEqual(source.text.utf8) {
@@ -1502,7 +1502,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 }
             }
         }
-        .background(Color(red: 0.153, green: 0.157, blue: 0.133))
+        .background(Color(nsColor: .textBackgroundColor))
     }
 
     // MARK: Actions
@@ -2945,10 +2945,24 @@ struct AtlasInputOverlay: NSViewRepresentable {
 @main
 @MainActor struct FrankenCodeBrowserApp: App {
     @NSApplicationDelegateAdaptor(AtlasDeskApplicationDelegate.self) private var applicationDelegate
+    @AppStorage("fcb.appearance") private var appearance = AtlasAppearancePreference.system.rawValue
+    @AppStorage("fcb.increasedContrast") private var increasedContrast = false
     var body: some Scene {
         WindowGroup("FrankenCodeBrowser") {
             ContentView()
-                .preferredColorScheme(.dark)
+                .preferredColorScheme((AtlasAppearancePreference(rawValue: appearance) ?? .system).colorScheme)
+        }
+        .commands {
+            CommandMenu("Appearance") {
+                Picker("Appearance", selection: $appearance) {
+                    ForEach(AtlasAppearancePreference.allCases) { preference in
+                        Text(preference.title).tag(preference.rawValue)
+                    }
+                }
+                Divider()
+                Toggle("Increase Contrast", isOn: $increasedContrast)
+                    .help("Increase syntax and selection contrast. The system Increase Contrast setting is always respected.")
+            }
         }
     }
 }

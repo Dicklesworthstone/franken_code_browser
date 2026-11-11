@@ -4,6 +4,46 @@ import QuartzCore
 // Run with the production retained surface and its ordinary CPU acceptance path.
 // Metal submission does not participate in directory path construction.
 @main struct AtlasDirectoryPathTests {
+    @MainActor static func appearanceRetainsSceneIdentity() {
+        let text = "fn same_source() { /* retained */ }\n"
+        let capture = AtlasHighlightCapture(schema: "fcb.source-document/1", text: text,
+            runs: [.init(start: "0", length: String(text.utf16.count), role: "keyword")])
+        let document = AtlasDocument(path: "src/theme.rs", capture: capture)!, tile = document.tiles[0]
+        tile.rect = CGRect(x: 5, y: 5, width: 300, height: 65)
+        tile.parcelRect = CGRect(x: 0, y: 0, width: 310, height: 75); tile.parcelFirst = true
+        tile.prepareRaster(pixelBudget: 32768)
+        let raster = tile.raster!, mutation = AtlasTextTile.renderMutationEpoch
+        let metadata = [AtlasProjectCatalog.Entry(id: 1, rawPath: Array(tile.path.utf8), displayPath: tile.path,
+            sourcePath: tile.path, observedBytes: UInt64(text.utf8.count), x: 0, y: 0, width: 310, height: 75)]
+        let surface = AtlasRetainedSurface(metalEnabled: false), revision = UUID()
+        surface.frame = CGRect(x: 0, y: 0, width: 320, height: 180)
+        func update(_ palette: AtlasAppearancePalette) {
+            surface.update(tiles: [tile], revision: revision, scale: 1, offset: .zero,
+                selectedPath: tile.path, hitPaths: [tile.path], metadata: metadata, palette: palette)
+        }
+        update(.canonical)
+        let installs = surface.metrics.installs, metadataInstalls = surface.metrics.metadataInstalls
+        let path = surface.retainedMetadataPath, rect = tile.rect
+        for palette in [AtlasAppearancePalette.light, .dark, .highContrastLight, .highContrastDark] {
+            update(palette)
+            surface.prepareDetailPass()
+            precondition(surface.metrics.installs == installs && surface.metrics.metadataInstalls == metadataInstalls,
+                         "appearance must not reinstall the source scene or metadata layout")
+            precondition(surface.retainedMetadataPath == path && tile.rect == rect)
+            precondition(tile.raster === raster && AtlasTextTile.renderMutationEpoch == mutation,
+                         "canonical source caches and retained glyph geometry remain immutable")
+            precondition(surface.retainedOverviewImages.allSatisfy { !$0.visible },
+                         "canonical dark overview pixels must never cover a themed frame")
+            precondition(surface.retainedTransitionImage != nil || !surface.retainedDetailImages.isEmpty,
+                         "a themed CPU frame must retain readable source coverage")
+            precondition(AtlasAppearanceColor(surface.layer!.backgroundColor!) == palette.background)
+        }
+        update(.canonical)
+        precondition(surface.retainedOverviewImages.contains { $0.image === raster && $0.visible },
+                     "canonical appearance can reuse its original overview image")
+        surface.stopClock()
+    }
+
     @MainActor static func main() {
         _ = NSApplication.shared
         let capture = AtlasHighlightCapture(schema: "fcb.source-document/1", text: "let source = 1\n",
@@ -70,6 +110,7 @@ import QuartzCore
         precondition(surface.retainedDirectoryColors == colors, "selection and camera preserve colors")
         surface.stopClock()
         metadataResidency()
+        appearanceRetainsSceneIdentity()
         print("Directory path regression passed: \(checks) exact visible states, pure-pan re-entry, threshold, resize and selection")
     }
 

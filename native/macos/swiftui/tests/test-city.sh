@@ -16,6 +16,7 @@ PY
 clang -std=c11 -Wall -Wextra -Werror -I"$src/../../../crates/fcb-bridge/include" \
     -c "$src/tests/AtlasCityFixture.c" -o "$out/fixture.o"
 swiftc -swift-version 6 -warnings-as-errors \
+    "$src/AtlasAppearance.swift" \
     "$out/NativeRetirement.swift" "$src/AtlasProjectCatalog.swift" \
     "$src/AtlasCity.swift" "$src/AtlasCityModel.swift" \
     "$src/AtlasCityMetalView.swift" "$src/AtlasCityView.swift" \

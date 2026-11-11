@@ -19,6 +19,7 @@ import os
         let matchRows: [CGRect]
         let size: CGSize
         let backing: Double
+        var palette: AtlasAppearancePalette = .canonical
     }
     private struct Request { let serial: UInt64; let frame: Frame; let tileIDs: [Int]; let rasterIDs: [Int] }
     private struct Flight {
@@ -200,22 +201,28 @@ import os
     /// coverage stays on the GPU throughout its qualified minification range;
     /// cached source images and CoreText cover the remaining densities.
     func request(_ frame: Frame) {
+        if let previous = latestFrame, previous.palette != frame.palette {
+            // Geometry revision is unchanged. Fence already submitted colored
+            // frames while retaining their buffers until command completion.
+            invalidatePresentation()
+        }
         latestFrame = frame
         serial &+= 1
         let viewport = CGRect(x: -frame.offset.x / frame.scale, y: -frame.offset.y / frame.scale,
             width: frame.size.width / frame.scale, height: frame.size.height / frame.scale)
         let density = frame.scale * frame.backing
         let ids = batchIDs.filter { index in
-            guard let batch = scene?.batches[index], batch.rect.intersects(viewport),
+            guard scene?.supports(palette: frame.palette) == true,
+                  let batch = scene?.batches[index], batch.rect.intersects(viewport),
                   batch.supportsDisplayDensity(density), frame.tiles.indices.contains(index) else { return false }
             let tile = frame.tiles[index]
-            if let image = tile.raster, tile.rect.width > 0, tile.rect.height > 0,
+            if frame.palette.isCanonical, let image = tile.raster, tile.rect.width > 0, tile.rect.height > 0,
                Double(image.width) / tile.rect.width >= density * 1.15,
                Double(image.height) / tile.rect.height >= density * 1.15 { return false }
             return true
         }
         var rasterIDs: [Int] = []
-        if rasterEnabled {
+        if rasterEnabled && frame.palette.isCanonical {
             let glyphIDs = Set(ids)
             let rasterViewport = viewport.insetBy(dx: -1 / density, dy: -1 / density)
             for index in frame.tiles.indices {
@@ -258,7 +265,7 @@ import os
         guard let old = latestFrame, old.size != size || old.backing != backing else { return }
         let frame = Frame(tiles: old.tiles, revision: old.revision, scale: old.scale, offset: old.offset,
             selectedPath: old.selectedPath, hitPaths: old.hitPaths, matchRows: old.matchRows,
-            size: size, backing: backing)
+            size: size, backing: backing, palette: old.palette)
         // Expose complete sharp CPU coverage during a drawable resize. A newly
         // submitted frame receives a later serial than this temporary fallback.
         invalidatePresentation()
@@ -303,6 +310,7 @@ import os
             ($0.request.serial > acceptedSerial ||
                 ($0.request.serial == acceptedSerial && $0.command.status == .error)) &&
             $0.request.frame.revision == revision &&
+            $0.request.frame.palette == latestFrame?.palette &&
             $0.request.frame.size == size && $0.request.frame.backing == backing
         }).max(by: { $0.request.serial < $1.request.serial }) {
             let rasterStillCurrent = newest.request.rasterIDs.allSatisfy { id in
@@ -433,7 +441,8 @@ import os
                 try scene.encode(into: drawable.texture, commandBuffer: command,
                     scale: request.frame.scale * backing,
                     offset: CGPoint(x: request.frame.offset.x * backing, y: request.frame.offset.y * backing),
-                    tileIDs: request.tileIDs, raster: rasterScene, rasterIDs: request.rasterIDs)
+                    tileIDs: request.tileIDs, raster: rasterScene, rasterIDs: request.rasterIDs,
+                    palette: request.frame.palette)
             } else if let raster = rasterScene {
                 try raster.encode(into: drawable.texture, commandBuffer: command, scale: request.frame.scale * backing,
                     offset: CGPoint(x: request.frame.offset.x * backing, y: request.frame.offset.y * backing),

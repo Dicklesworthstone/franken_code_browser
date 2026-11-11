@@ -12,6 +12,7 @@ struct AtlasReaderSelection {
 /// styling is requested only when capture identity changes, not on every SwiftUI
 /// update. AppKit owns selection, keyboard navigation, copy and accessibility.
 @MainActor struct AtlasSourceReader: NSViewRepresentable {
+    @AtlasAppearance private var appearance
     let source: AtlasSource
     let navigation: UUID
     let selection: AtlasReaderSelection?
@@ -21,6 +22,7 @@ struct AtlasReaderSelection {
     var firstPhysicalLine: UInt64? = nil
     var backgroundColor: NSColor = .textBackgroundColor
     var foregroundColor: NSColor = .textColor
+    var usesSyntaxPalette = false
     /// Only user-driven native changes are delivered; the receiver resolves
     /// original bytes against this immutable presentation on its bounded worker.
     var onSelectionChange: ((AtlasSource, UUID, NSRange?) -> Void)? = nil
@@ -32,7 +34,9 @@ struct AtlasReaderSelection {
         context.coordinator.update(source: source, navigation: navigation,
             selection: selection, wrapsLines: wrapsLines, showsLineNumbers: showsLineNumbers,
             showsWhitespace: showsWhitespace, firstPhysicalLine: firstPhysicalLine,
-            backgroundColor: backgroundColor, foregroundColor: foregroundColor,
+            backgroundColor: usesSyntaxPalette ? appearance.background.nsColor : backgroundColor,
+            foregroundColor: usesSyntaxPalette ? appearance.color("plain").nsColor : foregroundColor,
+            palette: usesSyntaxPalette ? appearance : .canonical,
             onSelectionChange: onSelectionChange, styledSource: styledSource)
     }
 }
@@ -47,6 +51,8 @@ struct AtlasReaderSelection {
     let notice: NSTextField
     let lineRuler: AtlasReaderLineRuler
     private var installedSource: AtlasSource?
+    private var canonicalContent: NSAttributedString?
+    private var installedPalette: AtlasAppearancePalette = .canonical
     private var lastNavigation: UUID?
     private var lastTargetSource: AtlasSource?
     private var lastRange: NSRange?
@@ -124,6 +130,7 @@ struct AtlasReaderSelection {
                 wrapsLines: Bool = false, showsLineNumbers: Bool = false,
                 showsWhitespace: Bool = false, firstPhysicalLine: UInt64? = nil,
                 backgroundColor: NSColor = .textBackgroundColor, foregroundColor: NSColor = .textColor,
+                palette: AtlasAppearancePalette = .canonical,
                 onSelectionChange: ((AtlasSource, UUID, NSRange?) -> Void)? = nil,
                 styledSource: () -> NSAttributedString) -> Bool {
         precondition(Thread.isMainThread)
@@ -153,13 +160,23 @@ struct AtlasReaderSelection {
             let exact = styled.string.utf8.elementsEqual(source.text.utf8)
             let content = exact ? styled : NSAttributedString(string: source.text, attributes: [
                 .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
-                .foregroundColor: foregroundColor
+                .foregroundColor: palette.isCanonical ? foregroundColor : AtlasAppearancePalette.canonical.color("plain").nsColor
             ])
+            canonicalContent = NSAttributedString(attributedString: content)
             textView.textStorage?.setAttributedString(content)
             installedSource = source
             lineRuler.install(replacementLines)
             textView.setAccessibilityLabel("Read-only source: \(source.path)")
             textView.setSelectedRange(NSRange(location: 0, length: 0))
+        }
+        if changed || installedPalette != palette {
+            if let storage = textView.textStorage, let canonicalContent {
+                // Attribute-only edits preserve the installed source, native
+                // selection, navigation and scroll position. No styling closure
+                // or source-map work is repeated for an appearance update.
+                palette.apply(to: storage, canonical: canonicalContent)
+            }
+            installedPalette = palette
         }
         setReadingGuides(showsLineNumbers: showsLineNumbers, showsWhitespace: showsWhitespace,
             firstPhysicalLine: firstPhysicalLine, foregroundColor: foregroundColor,
@@ -321,6 +338,7 @@ struct AtlasReaderSelection {
     /// Selection-only refusals below intentionally retain the current source;
     /// source-admission failures must not leave it available to read or copy.
     private func refuseSource(_ message: String) -> Bool {
+        canonicalContent = nil
         textView.textStorage?.setAttributedString(NSAttributedString(string: ""))
         textView.setSelectedRange(NSRange(location: 0, length: 0))
         textView.scrollRangeToVisible(NSRange(location: 0, length: 0))

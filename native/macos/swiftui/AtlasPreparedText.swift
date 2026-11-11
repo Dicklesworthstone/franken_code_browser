@@ -112,11 +112,9 @@ struct AtlasPreparedLine {
 
     init(runs: [AtlasPreparedRun]) { self.runs = runs }
 
-    func draw(in context: CGContext, origin: CGPoint) {
+    func draw(in context: CGContext, origin: CGPoint, palette: AtlasAppearancePalette = .canonical) {
         if let retainedColorLine {
-            context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
-            context.textPosition = origin
-            CTLineDraw(retainedColorLine, context)
+            Self.drawRetained(retainedColorLine, in: context, origin: origin, palette: palette)
             return
         }
         // All runs share the line origin. Enter the baseline coordinate space
@@ -126,7 +124,7 @@ struct AtlasPreparedLine {
         context.translateBy(x: origin.x, y: origin.y)
         context.scaleBy(x: 1, y: -1)
         for run in runs {
-            context.setFillColor(run.color)
+            context.setFillColor(palette.replacing(run.color))
             context.textMatrix = run.matrix
             let visible = run.visibleGlyphRange(in: context)
             if !visible.isEmpty {
@@ -139,6 +137,54 @@ struct AtlasPreparedLine {
             }
         }
         context.restoreGState()
+    }
+
+    /// Native color glyphs retain CoreText's own drawing path. Other runs in
+    /// that same line still receive the current syntax colors. Replay uses the
+    /// saved CTRun glyphs, positions, font and matrix; it never shapes text.
+    static func drawRetained(_ line: CTLine, in context: CGContext, origin: CGPoint,
+                             palette: AtlasAppearancePalette) {
+        context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+        context.textPosition = origin
+        if palette.isCanonical { CTLineDraw(line, context); return }
+        for run in CTLineGetGlyphRuns(line) as! [CTRun] {
+            // Core Graphics does not include the text matrix in save/restore.
+            // Each native run therefore receives its own baseline explicitly.
+            context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+            context.textPosition = origin
+            let attributes = CTRunGetAttributes(run) as NSDictionary
+            let fontValue = attributes[kCTFontAttributeName] ?? attributes[NSAttributedString.Key.font.rawValue]
+            let value = (attributes[kCTForegroundColorAttributeName]
+                ?? attributes[NSAttributedString.Key.foregroundColor.rawValue]) as AnyObject?
+            let color: CGColor?
+            if let nsColor = value as? NSColor { color = nsColor.cgColor }
+            else if let value, CFGetTypeID(value) == CGColor.typeID { color = (value as! CGColor) }
+            else { color = nil }
+            guard let fontValue, let color else {
+                CTRunDraw(run, context, CFRange(location: 0, length: 0)); continue
+            }
+            let font = fontValue as! CTFont
+            if CTFontGetSymbolicTraits(font).contains(.traitColorGlyphs) {
+                CTRunDraw(run, context, CFRange(location: 0, length: 0)); continue
+            }
+            let count = CTRunGetGlyphCount(run)
+            guard count > 0 else { continue }
+            context.saveGState()
+            context.translateBy(x: origin.x, y: origin.y)
+            context.scaleBy(x: 1, y: -1)
+            context.textMatrix = CTRunGetTextMatrix(run)
+            context.setFillColor(palette.replacing(color))
+            if let glyphs = CTRunGetGlyphsPtr(run), let positions = CTRunGetPositionsPtr(run) {
+                CTFontDrawGlyphs(font, glyphs, positions, count, context)
+            } else {
+                var glyphs = [CGGlyph](repeating: 0, count: count)
+                var positions = [CGPoint](repeating: .zero, count: count)
+                CTRunGetGlyphs(run, CFRange(location: 0, length: 0), &glyphs)
+                CTRunGetPositions(run, CFRange(location: 0, length: 0), &positions)
+                CTFontDrawGlyphs(font, glyphs, positions, count, context)
+            }
+            context.restoreGState()
+        }
     }
 }
 

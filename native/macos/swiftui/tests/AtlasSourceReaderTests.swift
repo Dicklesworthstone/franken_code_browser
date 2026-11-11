@@ -17,6 +17,7 @@ import Foundation
         duplicateReadersKeepIndependentSelections()
         styleMismatchCannotRewriteSource()
         themedReaderKeepsSelectionAndInstalledStyles()
+        appearanceSwitchKeepsInstalledSourceAndViewport()
         emptyAndOversizedSourcesHaveDistinctOutcomes()
         unwrappedLongLinesScrollHorizontally()
         wrappingReflowsWithoutReplacingSourceOrSelection()
@@ -36,7 +37,7 @@ import Foundation
         replacementAndSameTextPagesHaveDistinctSelectionAuthority()
         noncontiguousSelectionCannotBecomeAnEnclosingRange()
         separateReaderCallbacksRemainIndependent()
-        print("AtlasSourceReader: 28 native selection, layout, reading-guide and source-identity scenarios passed")
+        print("AtlasSourceReader: 29 native selection, layout, appearance, reading-guide and source-identity scenarios passed")
     }
     static func present(_ reader: AtlasSourceReaderController, _ source: AtlasSource,
                         _ range: NSRange?, navigation: UUID = UUID()) -> Bool {
@@ -184,6 +185,44 @@ import Foundation
         precondition(reader.textView.string.isEmpty && !reader.notice.isHidden)
         precondition(reader.lineRuler.lineIndex == nil && reader.lineRuler.visibleLabels().isEmpty,
                      "source refusal retained stale line metadata")
+    }
+
+    static func appearanceSwitchKeepsInstalledSourceAndViewport() {
+        let source = AtlasSource(path: "theme.rs", text: String(repeating: "fn café() { /*😀*/ }\r\n", count: 120))
+        let reader = AtlasSourceReaderController(), navigation = UUID(), window = host(reader)
+        defer { window.close() }
+        var installations = 0
+        func update(_ palette: AtlasAppearancePalette) {
+            precondition(reader.update(source: source, navigation: navigation, selection: nil,
+                backgroundColor: palette.background.nsColor, foregroundColor: palette.color("plain").nsColor,
+                palette: palette) {
+                installations += 1
+                let styled = NSMutableAttributedString(string: source.text, attributes: [
+                    .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
+                    .foregroundColor: AtlasAppearancePalette.canonical.color("plain").nsColor
+                ])
+                styled.addAttribute(.foregroundColor, value: AtlasAppearancePalette.canonical.color("keyword").nsColor,
+                    range: NSRange(location: 0, length: 2))
+                return styled
+            })
+        }
+        update(.canonical)
+        let selection = NSRange(location: ("fn café() { /*😀*/ }\r\n" as NSString).length * 60, length: 2)
+        reader.textView.setSelectedRange(selection)
+        reader.textView.scrollRangeToVisible(selection)
+        _ = layout(reader)
+        let viewport = reader.scrollView.contentView.bounds.origin
+        let font = reader.textView.textStorage!.attribute(.font, at: 0, effectiveRange: nil) as! NSFont
+        for palette in [AtlasAppearancePalette.light, .highContrastDark, .dark, .highContrastLight, .canonical] {
+            update(palette)
+            precondition(installations == 1, "appearance must not call the source styling closure again")
+            precondition(reader.textView.string.utf8.elementsEqual(source.text.utf8))
+            precondition(reader.textView.selectedRange() == selection && reader.scrollView.contentView.bounds.origin == viewport,
+                         "appearance must preserve native selection and the reader's scroll anchor")
+            precondition(reader.textView.textStorage!.attribute(.font, at: 0, effectiveRange: nil) as? NSFont == font)
+            precondition(reader.textView.textStorage!.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
+                == palette.color("keyword").nsColor, "retained lexical color must follow every appearance switch")
+        }
     }
 
     /// Hidden native windows give the real scroll/clip/document views a finite

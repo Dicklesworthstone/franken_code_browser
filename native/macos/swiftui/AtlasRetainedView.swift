@@ -14,7 +14,8 @@ private struct AtlasTransitionDraw {
 /// Render immutable source rows into a private context. The live camera and
 /// layer tree never enter this worker; publication checks its generation.
 private func renderAtlasTransition(canvas: CGRect, width: Int, height: Int,
-                                   background: CGColor, draws: [AtlasTransitionDraw]) -> CGImage? {
+                                   background: CGColor, draws: [AtlasTransitionDraw],
+                                   palette: AtlasAppearancePalette) -> CGImage? {
     guard let bitmap = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
         bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
@@ -28,7 +29,7 @@ private func renderAtlasTransition(canvas: CGRect, width: Int, height: Int,
         bitmap.fill(draw.clipped)
         bitmap.translateBy(x: draw.rect.minX, y: draw.rect.minY)
         bitmap.scaleBy(x: draw.contentScale, y: draw.contentScale)
-        draw.tile.draw(in: bitmap, visibleRows: draw.rows)
+        draw.tile.draw(in: bitmap, visibleRows: draw.rows, palette: palette)
         bitmap.restoreGState()
     }
     return bitmap.makeImage()
@@ -37,6 +38,7 @@ private func renderAtlasTransition(canvas: CGRect, width: Int, height: Int,
 /// The native view owns image residence. Source capture and shaping remain in
 /// AtlasDocument; camera updates only move the retained world and query detail.
 struct AtlasRetainedView: NSViewRepresentable {
+    @AtlasAppearance private var appearance
     let tiles: [AtlasTextTile]
     let revision: UUID
     let scale: Double
@@ -63,12 +65,14 @@ struct AtlasRetainedView: NSViewRepresentable {
         private var backing = 0.0
         private weak var window: NSWindow?
         private var metalFailures = 0
+        private var palette: AtlasAppearancePalette?
 
         func matches(_ input: AtlasRetainedView, view: AtlasRetainedSurface) -> Bool {
             guard let window = view.window, view.metal != nil,
                   view.bounds.width > 0, view.bounds.height > 0,
                   self.window === window,
                   revision == input.revision, contentRevision == input.contentRevision,
+                  palette == input.appearance,
                   view.hasRequestedScene(revision: input.revision, contentRevision: input.contentRevision),
                   scale == input.scale, offset == input.offset,
                   selectedPath.map({ Array($0.utf8) }) == input.selectedPath.map({ Array($0.utf8) }),
@@ -92,6 +96,7 @@ struct AtlasRetainedView: NSViewRepresentable {
             window = view.window; metalFailures = view.metal?.failures ?? 0
             sourceTiles = input.tiles
             sourceMutationEpoch = AtlasTextTile.renderMutationEpoch
+            palette = input.appearance
         }
     }
 
@@ -105,7 +110,7 @@ struct AtlasRetainedView: NSViewRepresentable {
         context.coordinator.record(self, view: view)
         view.update(tiles: tiles, revision: revision, scale: scale, offset: offset,
                     selectedPath: selectedPath, hitPaths: hitPaths, matchRows: matchRows,
-                    metadata: metadata, contentRevision: contentRevision)
+                    metadata: metadata, contentRevision: contentRevision, palette: appearance)
     }
     static func dismantleNSView(_ view: AtlasRetainedSurface, coordinator: Coordinator) { view.stopClock() }
 }
@@ -143,6 +148,7 @@ final class AtlasRetainedSurface: NSView {
         let selectedPath: String?
         let hitPaths: Set<String>
         let matchRows: [CGRect]
+        let palette: AtlasAppearancePalette
     }
     private struct ContentReceipt {
         let scene: SceneSnapshot
@@ -189,6 +195,7 @@ final class AtlasRetainedSurface: NSView {
     private var requestedScene: SceneSnapshot?
     private var presentedScene: SceneSnapshot?
     private var latestInput: SceneInput?
+    private(set) var palette: AtlasAppearancePalette = .canonical
     private var pendingContentReceipt: ContentReceipt?
     private var contentNotificationScheduled = false
     private let metalEnabled: Bool
@@ -312,7 +319,7 @@ final class AtlasRetainedSurface: NSView {
                 layer?.addSublayer(metal.layer)
                 metal.accept = { [weak self] frame, covered in
                     guard let self, let scene = self.requestedScene,
-                          scene.renderRevision == frame.revision else { return }
+                          scene.renderRevision == frame.revision, self.palette == frame.palette else { return }
                     if self.metalCoveredTiles != covered {
                         self.lastLevel = Int.min
                         if !covered.isDisjoint(with: self.transitionTiles) { self.clearTransition() }
@@ -361,7 +368,8 @@ final class AtlasRetainedSurface: NSView {
                 update(tiles: input.tiles, revision: input.scene.identity.layout,
                     scale: input.scale, offset: input.offset, selectedPath: input.selectedPath,
                     hitPaths: input.hitPaths, matchRows: input.matchRows,
-                    metadata: input.scene.metadata, contentRevision: input.scene.identity.content)
+                    metadata: input.scene.metadata, contentRevision: input.scene.identity.content,
+                    palette: input.palette)
             }
             refreshDetail(); startClock()
         }
@@ -384,8 +392,10 @@ final class AtlasRetainedSurface: NSView {
 
     func update(tiles next: [AtlasTextTile], revision nextRevision: UUID, scale: Double,
                 offset: CGPoint, selectedPath: String?, hitPaths: Set<String>, matchRows: [CGRect] = [],
-                metadata: [AtlasProjectCatalog.Entry] = [], contentRevision: UUID? = nil) {
+                metadata: [AtlasProjectCatalog.Entry] = [], contentRevision: UUID? = nil,
+                palette: AtlasAppearancePalette = .canonical) {
         guard scale.isFinite, scale > 0, offset.x.isFinite, offset.y.isFinite else { return }
+        applyPalette(palette)
         let identity = SceneIdentity(layout: nextRevision, content: contentRevision)
         if requestedScene?.identity != identity {
             requestedScene = SceneSnapshot(identity: identity,
@@ -393,12 +403,12 @@ final class AtlasRetainedSurface: NSView {
         }
         guard let scene = requestedScene else { return }
         latestInput = SceneInput(scene: scene, tiles: next, scale: scale, offset: offset,
-            selectedPath: selectedPath, hitPaths: hitPaths, matchRows: matchRows)
+            selectedPath: selectedPath, hitPaths: hitPaths, matchRows: matchRows, palette: palette)
         if let metal, window != nil, bounds.width > 0, bounds.height > 0 {
             metal.prepare(tiles: next, revision: scene.renderRevision)
             metal.request(.init(tiles: next, revision: scene.renderRevision, scale: scale, offset: offset,
                 selectedPath: selectedPath, hitPaths: hitPaths, matchRows: matchRows,
-                size: bounds.size, backing: backingScale))
+                size: bounds.size, backing: backingScale, palette: palette))
             startClock()
             return
         }
@@ -411,6 +421,51 @@ final class AtlasRetainedSurface: NSView {
 
     func advanceMetalFrame() {
         metal?.advance(size: bounds.size, backing: backingScale)
+    }
+
+    /// Color-bearing images are disposable presentation state. Source tiles,
+    /// prepared glyphs, spatial indexes, parcel layout and GPU instance buffers
+    /// retain their identity when the host's appearance changes.
+    private func applyPalette(_ palette: AtlasAppearancePalette) {
+        guard self.palette != palette else { return }
+        self.palette = palette
+        metal?.invalidatePresentation()
+        metalCoveredTiles = []
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        layer?.backgroundColor = palette.background.cgColor
+        metadataBackground.fillColor = palette.parcel.cgColor
+        metadataSelection.strokeColor = palette.selection.cgColor
+        metadataHits.strokeColor = palette.search.cgColor
+        clearTransition()
+        for patch in patches.values { patch.layer.removeFromSuperlayer() }
+        patches.removeAll(keepingCapacity: true); pending.removeAll(keepingCapacity: true)
+        required.removeAll(keepingCapacity: true); visibleRequired.removeAll(keepingCapacity: true)
+        sharpFallbackRequired.removeAll(keepingCapacity: true); adequateOverview.removeAll(keepingCapacity: true)
+        metrics.detailBytes = 0
+        for caption in captions.values { caption.layer.removeFromSuperlayer() }
+        captions.removeAll(keepingCapacity: true); captionFrames.removeAll(keepingCapacity: true)
+        pendingCaptions.removeAll(keepingCapacity: true); metrics.captionBytes = 0
+        for (index, image) in overview.enumerated() {
+            image.contents = palette.isCanonical ? tiles[index].raster : nil
+            image.isHidden = !palette.isCanonical
+        }
+        for (path, outline) in outlines {
+            outline.borderColor = path == selected ? palette.selection.cgColor
+                : hits.contains(path) ? palette.search.cgColor : Self.outlineColor(path, palette: palette)
+        }
+        for (path, boundary) in directories { boundary.strokeColor = Self.directoryColor(path, palette: palette) }
+        for highlight in matchLayers {
+            highlight.backgroundColor = palette.search.withAlpha(palette.increasedContrast ? 0.3 : 0.18).cgColor
+            highlight.borderColor = palette.search.cgColor
+            highlight.borderWidth = palette.increasedContrast ? 1 / scale : 0
+        }
+        lastLevel = Int.min
+        CATransaction.commit()
+    }
+
+    private func markerWidth(selected: Bool) -> Double {
+        if palette.isCanonical { return 1.5 }
+        return selected ? (palette.increasedContrast ? 3 : 2.25) : 1.5
     }
 
     private func applyFrame(tiles next: [AtlasTextTile], revision nextRevision: UUID, scale: Double,
@@ -443,7 +498,7 @@ final class AtlasRetainedSurface: NSView {
                 let image = CALayer()
                 image.anchorPoint = .zero
                 image.frame = tile.rect
-                image.contents = tile.raster
+                image.contents = palette.isCanonical ? tile.raster : nil
                 image.contentsGravity = .resize
                 image.minificationFilter = .linear
                 image.magnificationFilter = .linear
@@ -455,7 +510,7 @@ final class AtlasRetainedSurface: NSView {
                     let outline = CALayer()
                     outline.frame = parcel; outline.zPosition = 2
                     outline.borderWidth = 0
-                    outline.borderColor = Self.outlineColor(tile.path)
+                    outline.borderColor = Self.outlineColor(tile.path, palette: palette)
                     world.addSublayer(outline); outlines[tile.path] = outline
                 }
                 world.addSublayer(image); overview.append(image)
@@ -493,7 +548,7 @@ final class AtlasRetainedSurface: NSView {
                 let boundary = CAShapeLayer()
                 boundary.anchorPoint = .zero
                 boundary.frame = rect; boundary.zPosition = 2.2
-                boundary.strokeColor = Self.directoryColor(path)
+                boundary.strokeColor = Self.directoryColor(path, palette: palette)
                 boundary.fillColor = nil
                 boundary.lineJoin = .round
                 world.addSublayer(boundary); directories[path] = boundary
@@ -514,7 +569,9 @@ final class AtlasRetainedSurface: NSView {
                 rect.width.isFinite && rect.height.isFinite && rect.width > 0 && rect.height > 0 {
                 let highlight = CALayer()
                 highlight.frame = rect
-                highlight.backgroundColor = NSColor(srgbRed: 0.95, green: 0.79, blue: 0.24, alpha: 0.22).cgColor
+                highlight.backgroundColor = palette.search.withAlpha(palette.increasedContrast ? 0.3 : 0.18).cgColor
+                highlight.borderColor = palette.search.cgColor
+                highlight.borderWidth = palette.increasedContrast ? 1 / scale : 0
                 highlight.zPosition = 2.5
                 world.addSublayer(highlight); matchLayers.append(highlight)
             }
@@ -526,10 +583,10 @@ final class AtlasRetainedSurface: NSView {
             selected = selectedPath; hits = hitPaths
             for (path, outline) in outlines {
                 let marked = path == selectedPath || hitPaths.contains(path)
-                outline.borderWidth = Self.safeStrokeWidth(marked ? 1.5 : 0.85,
+                outline.borderWidth = Self.safeStrokeWidth(marked ? markerWidth(selected: path == selectedPath) : 0.85,
                     scale: scale, gutter: outlineGutters[path] ?? 0)
-                outline.borderColor = marked ? (path == selectedPath ? NSColor.yellow : NSColor.orange).cgColor
-                    : Self.outlineColor(path)
+                outline.borderColor = marked ? (path == selectedPath ? palette.selection : palette.search).cgColor
+                    : Self.outlineColor(path, palette: palette)
             }
         }
         refreshMetadataMarkers(changed: markersChanged)
@@ -687,8 +744,9 @@ final class AtlasRetainedSurface: NSView {
             metadataHitsGutter = rebuild(metadataHits, paths: Array(hits.prefix(4096)))
             metadataMarkerRevision = metadataRevision; metrics.metadataMarkerBuilds += 1
         }
-        metadataSelection.lineWidth = Self.safeStrokeWidth(1.5, scale: scale, gutter: metadataSelectionGutter)
-        metadataHits.lineWidth = Self.safeStrokeWidth(1.5, scale: scale, gutter: metadataHitsGutter)
+        metadataSelection.lineWidth = Self.safeStrokeWidth(markerWidth(selected: true), scale: scale, gutter: metadataSelectionGutter)
+        metadataHits.lineWidth = Self.safeStrokeWidth(markerWidth(selected: false), scale: scale, gutter: metadataHitsGutter)
+        metadataHits.lineDashPattern = palette.isCanonical ? nil : [NSNumber(value: 4 / scale), NSNumber(value: 3 / scale)]
     }
 
     private func refreshDetail() {
@@ -716,7 +774,7 @@ final class AtlasRetainedSurface: NSView {
         adequateOverview.removeAll(keepingCapacity: true)
         adequateOverview.formUnion(metalCoveredTiles)
         for (index, image) in overview.enumerated() {
-            image.isHidden = metalCoveredTiles.contains(index)
+            image.isHidden = !palette.isCanonical || metalCoveredTiles.contains(index)
         }
         metrics.visibleRequestedPatches = 0; metrics.visibleRefusedPatches = 0; metrics.prefetchRequestedPatches = 0
         var visible = Set(largeTiles)
@@ -740,7 +798,7 @@ final class AtlasRetainedSurface: NSView {
             let tile = tiles[index]
             if bordered.insert(tile.path).inserted, let outline = outlines[tile.path] {
                 outline.borderWidth = Self.safeStrokeWidth(
-                    tile.path == selected || hits.contains(tile.path) ? 1.5 : 0.85,
+                    tile.path == selected || hits.contains(tile.path) ? markerWidth(selected: tile.path == selected) : 0.85,
                     scale: scale, gutter: outlineGutters[tile.path] ?? 0)
             }
         }
@@ -789,7 +847,7 @@ final class AtlasRetainedSurface: NSView {
         // spending hundreds of display callbacks drawing the same glyphs again.
         for index in ordered {
             let rect = tiles[index].rect
-            if let image = tiles[index].raster, rect.width > 0, rect.height > 0,
+            if palette.isCanonical, let image = tiles[index].raster, rect.width > 0, rect.height > 0,
                Double(image.width) / rect.width >= preparedDensity,
                Double(image.height) / rect.height >= preparedDensity {
                 adequateOverview.insert(index)
@@ -932,7 +990,8 @@ final class AtlasRetainedSurface: NSView {
             clearTransition(); metrics.transitionFailures += 1; return
         }
         let width = Int(physicalWidth), height = Int(physicalHeight)
-        let background = Monokai.background.cgColor
+        let palette = self.palette
+        let background = palette.background.cgColor
         let draws = missing.map { index -> AtlasTransitionDraw in
             let tile = tiles[index]
             let clipped = tile.rect.intersection(canvas)
@@ -950,11 +1009,11 @@ final class AtlasRetainedSurface: NSView {
             let paintedTiles = missing
             transitionWorker.async { [weak self] in
                 let image = renderAtlasTransition(canvas: canvas, width: width, height: height,
-                                                  background: background, draws: draws)
+                                                  background: background, draws: draws, palette: palette)
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     self.transitionInFlight = false
-                    guard self.transitionGeneration == generation else {
+                    guard self.transitionGeneration == generation, self.palette == palette else {
                         self.lastLevel = Int.min
                         self.refreshDetail()
                         return
@@ -975,7 +1034,7 @@ final class AtlasRetainedSurface: NSView {
             return
         }
         guard let image = renderAtlasTransition(canvas: canvas, width: width, height: height,
-                                                background: background, draws: draws) else {
+                                                background: background, draws: draws, palette: palette) else {
             clearTransition(); metrics.transitionFailures += 1; return
         }
         transition.frame = canvas
@@ -988,8 +1047,9 @@ final class AtlasRetainedSurface: NSView {
         metrics.transitionSeconds += CACurrentMediaTime() - start
     }
 
-    private static func outlineColor(_ path: String) -> CGColor {
-        directoryColor((path as NSString).deletingLastPathComponent).copy(alpha: 0.65) ?? NSColor.gray.cgColor
+    private static func outlineColor(_ path: String, palette: AtlasAppearancePalette) -> CGColor {
+        directoryColor((path as NSString).deletingLastPathComponent, palette: palette)
+            .copy(alpha: palette.increasedContrast ? 1 : 0.65) ?? NSColor.gray.cgColor
     }
 
     private static func contentGutter(_ content: CGRect, inside parcel: CGRect) -> Double {
@@ -1003,11 +1063,11 @@ final class AtlasRetainedSurface: NSView {
         max(0, min(screenPoints / scale, gutter * 0.75))
     }
 
-    private static func directoryColor(_ path: String) -> CGColor {
+    private static func directoryColor(_ path: String, palette: AtlasAppearancePalette) -> CGColor {
         // Stable across project opens and file additions; Swift Hasher is seeded.
         let hash = path.utf8.reduce(UInt64(14695981039346656037)) { ($0 ^ UInt64($1)) &* 1099511628211 }
         return NSColor(calibratedHue: CGFloat(hash % 360) / 360,
-                       saturation: 0.48, brightness: 0.90, alpha: 0.95).cgColor
+                       saturation: 0.48, brightness: palette.isLight ? 0.42 : 0.90, alpha: 0.95).cgColor
     }
 
     private func refreshCaptions() {
@@ -1053,7 +1113,8 @@ final class AtlasRetainedSurface: NSView {
         guard let frame = captionFrames[key] else { return }
         let label = metadataLabels[key.path] ?? key.path
         let line = CTLineCreateWithAttributedString(NSAttributedString(string: (label as NSString).lastPathComponent,
-            attributes: [.font: NSFont.monospacedSystemFont(ofSize: 13, weight: .medium), .foregroundColor: NSColor.white]))
+            attributes: [.font: NSFont.monospacedSystemFont(ofSize: 13, weight: .medium),
+                         .foregroundColor: palette.color("plain").nsColor]))
         let logicalWidth = min(320, max(1, ceil(CTLineGetTypographicBounds(line, nil, nil, nil)) + 12))
         let width = Int(logicalWidth) * key.backing, height = 22 * key.backing
         let bytes = width * height * 4
@@ -1067,7 +1128,7 @@ final class AtlasRetainedSurface: NSView {
               let bitmap = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
                   bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { metrics.captionFailures += 1; return }
-        bitmap.setFillColor(Monokai.background.withAlphaComponent(0.94).cgColor)
+        bitmap.setFillColor(palette.background.withAlpha(0.96).cgColor)
         bitmap.fill(CGRect(x: 0, y: 0, width: width, height: height))
         bitmap.translateBy(x: 0, y: Double(height)); bitmap.scaleBy(x: Double(key.backing), y: -Double(key.backing))
 
@@ -1171,7 +1232,7 @@ final class AtlasRetainedSurface: NSView {
             // Full already-shaped lines are clipped, never reshaped substrings.
             let first = max(0, min(tile.lineCount, Int(floor((nativeRect.minY - 38) / AtlasTextTile.lineHeight))))
             let end = max(first, min(tile.lineCount, Int(ceil((nativeRect.maxY + 16) / AtlasTextTile.lineHeight))))
-            tile.draw(in: bitmap, visibleRows: first..<end)
+            tile.draw(in: bitmap, visibleRows: first..<end, palette: palette)
             guard let image = bitmap.makeImage() else { metrics.detailFailures += 1; continue }
             let detail = CALayer()
             detail.frame = request.rect.offsetBy(dx: tile.rect.minX, dy: tile.rect.minY)

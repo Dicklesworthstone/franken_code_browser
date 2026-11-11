@@ -6,7 +6,7 @@ src=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 out=$(mktemp -d "${TMPDIR:-/tmp}/fcb-reader-position.XXXXXX")
 set --
 if [ "$(uname -s)" = Linux ]; then set -- -static-stdlib; fi
-if [ "$(uname -s)" = Darwin ]; then set -- "$@" "$src/AtlasSourceReader.swift"; fi
+if [ "$(uname -s)" = Darwin ]; then set -- "$@" "$src/AtlasAppearance.swift" "$src/AtlasSourceReader.swift"; fi
 swiftc "$@" -swift-version 6 -warnings-as-errors \
     "$src/AtlasSearch.swift" "$src/AtlasSearchExpression.swift" "$src/AtlasSearchCapture.swift" \
     "$src/AtlasSearchCoordinator.swift" "$src/AtlasProjectIO.swift" \

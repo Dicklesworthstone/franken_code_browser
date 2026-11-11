@@ -92,8 +92,8 @@ private final class AtlasCityGPU: @unchecked Sendable {
     #include <metal_stdlib>
     using namespace metal;
     struct CityInstance { float4 rect; float4 metric; };
-    struct CityUniforms { float4x4 matrix; uint4 options; };
-    struct CityVertex { float4 position [[position]]; float2 uv; float4 color; };
+    struct CityUniforms { float4x4 matrix; uint4 options; float4 building; float4 unknown; float4 selected; float4 contextColor; };
+    struct CityVertex { float4 position [[position]]; float2 uv; float4 color; float marked [[flat]]; };
     constant float3 cityCorners[30] = {
         float3(0,0,1),float3(1,0,1),float3(1,1,1), float3(0,0,1),float3(1,1,1),float3(0,1,1),
         float3(0,0,0),float3(1,0,0),float3(1,0,1), float3(0,0,0),float3(1,0,1),float3(0,0,1),
@@ -110,16 +110,18 @@ private final class AtlasCityGPU: @unchecked Sendable {
         bool context = u.options.y != 0;
         float3 point = float3(item.rect.xy + corner.xy * item.rect.zw, context ? 0.0f : corner.z * item.metric.x);
         CityVertex out; out.position = u.matrix * float4(point, 1.0f); out.uv = cityUV[vertex % 6];
-        float3 color = item.metric.y > 0 ? float3(0.43f,0.46f,0.49f) : float3(0.22f,0.43f,0.57f);
-        if (instance == u.options.x) color = float3(0.96f,0.69f,0.25f);
+        float3 color = item.metric.y > 0 ? u.unknown.rgb : u.building.rgb;
+        bool selected = instance == u.options.x;
+        if (selected) color = u.selected.rgb;
         float light = 0.48f + 0.52f * max(0.0f, dot(cityNormals[vertex / 6], normalize(float3(-0.45f,-0.55f,1.0f))));
-        out.color = float4(context ? float3(0.13f,0.20f,0.25f) : color * light, 1.0f);
+        out.color = float4(context ? u.contextColor.rgb : color * light, 1.0f);
+        out.marked = selected && !context ? 1.0f : 0.0f;
         return out;
     }
     fragment float4 fcbCityFragment(CityVertex in [[stage_in]]) {
         float edge = min(min(in.uv.x, 1.0f-in.uv.x), min(in.uv.y, 1.0f-in.uv.y));
         float pixel = max(max(fwidth(in.uv.x),fwidth(in.uv.y)),0.000001f);
-        float interior = smoothstep(0.0f,pixel*1.15f,edge);
+        float interior = smoothstep(0.0f,pixel*(in.marked > 0 ? 2.3f : 1.15f),edge);
         return float4(in.color.rgb * mix(0.48f,1.0f,interior),1.0f);
     }
     """
@@ -141,6 +143,7 @@ private final class AtlasCityDepth: @unchecked Sendable {
 }
 
 struct AtlasCityMetalView: NSViewRepresentable {
+    @AtlasAppearance private var appearance
     let scene: AtlasCityScene?
     let frame: AtlasCityFrame?
     let display: UInt64
@@ -153,7 +156,7 @@ struct AtlasCityMetalView: NSViewRepresentable {
     func makeNSView(context: Context) -> AtlasCitySurface { AtlasCitySurface() }
     func updateNSView(_ view: AtlasCitySurface, context: Context) {
         view.viewport = viewport; view.move = move; view.click = click; view.presented = presented; view.failed = failed
-        view.install(scene: scene, frame: frame, display: display, selected: selected)
+        view.install(scene: scene, frame: frame, display: display, selected: selected, palette: appearance)
     }
     static func dismantleNSView(_ view: AtlasCitySurface, coordinator: ()) { view.stop() }
 }
@@ -166,10 +169,12 @@ struct AtlasCityMetalView: NSViewRepresentable {
         let view: AtlasCityFrame
         let display: UInt64
         let selected: UInt32
+        let palette: AtlasAppearancePalette
     }
     private struct Uniforms {
         var c0, c1, c2, c3: SIMD4<Float>
         var options: SIMD4<UInt32>
+        var building, unknown, selected, contextColor: SIMD4<Float>
     }
     private struct Flight {
         let serial: UInt64
@@ -193,6 +198,7 @@ struct AtlasCityMetalView: NSViewRepresentable {
     /// allocation charged until a later drawable is actually displayed.
     private var displayedDepth: AtlasCityDepth?
     private var displayedSerial: UInt64 = 0
+    private var lastPresentationRequestSerial: UInt64 = 0
     private var requestedScene: AtlasCityScene?
     private var owner: UInt64 = 0, layoutID: UInt64 = 0
     private var epoch = UUID()
@@ -232,7 +238,8 @@ struct AtlasCityMetalView: NSViewRepresentable {
     // dismantleNSView -> stop() and the main-actor window-detachment callback,
     // never an off-main access to the display link or notification token.
 
-    func install(scene: AtlasCityScene?, frame: AtlasCityFrame?, display: UInt64, selected: UInt32) {
+    func install(scene: AtlasCityScene?, frame: AtlasCityFrame?, display: UInt64, selected: UInt32,
+                 palette: AtlasAppearancePalette = .canonical) {
         guard !stopped else { return }
         if scene?.owner != requestedScene?.owner || scene?.layout != requestedScene?.layout {
             epoch = UUID(); requestedScene = scene; owner = scene?.owner ?? 0; layoutID = scene?.layout ?? 0
@@ -242,9 +249,11 @@ struct AtlasCityMetalView: NSViewRepresentable {
             prepareScene()
         }
         if let frame, frame.owner == owner, frame.layout == layoutID, display > 0 {
-            let drawing = Drawing(view: frame, display: display, selected: selected)
+            let drawing = Drawing(view: frame, display: display, selected: selected, palette: palette)
+            if let latest, latest.palette != palette { metal.isHidden = true }
             if drawing != latest { latest = drawing; pending = drawing }
         } else { latest = nil; pending = nil }
+        metal.backgroundColor = palette.background.cgColor
         reportViewport(); prepareDepth(); wake()
     }
     override func layout() {
@@ -387,7 +396,8 @@ struct AtlasCityMetalView: NSViewRepresentable {
         let descriptor = MTLRenderPassDescriptor()
         descriptor.colorAttachments[0].texture = drawable.texture
         descriptor.colorAttachments[0].loadAction = .clear; descriptor.colorAttachments[0].storeAction = .store
-        descriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0.07, green: 0.09, blue: 0.12, alpha: 1)
+        let palette = drawing.palette, background = palette.background
+        descriptor.colorAttachments[0].clearColor = MTLClearColor(red: background.red, green: background.green, blue: background.blue, alpha: 1)
         descriptor.depthAttachment.texture = depth.texture
         descriptor.depthAttachment.loadAction = .clear; descriptor.depthAttachment.storeAction = .dontCare
         descriptor.depthAttachment.clearDepth = 1
@@ -397,7 +407,9 @@ struct AtlasCityMetalView: NSViewRepresentable {
         let m = drawing.view.matrix
         var uniform = Uniforms(c0: SIMD4(m[0], m[1], m[2], m[3]), c1: SIMD4(m[4], m[5], m[6], m[7]),
             c2: SIMD4(m[8], m[9], m[10], m[11]), c3: SIMD4(m[12], m[13], m[14], m[15]),
-            options: SIMD4(drawing.selected, 1, 0, 0))
+            options: SIMD4(drawing.selected, 1, 0, 0),
+            building: palette.color("type").vector, unknown: palette.color("comment").vector,
+            selected: palette.selection.vector, contextColor: palette.parcel.vector)
         encoder.setRenderPipelineState(gpu.pipeline)
         encoder.setCullMode(.none)
         encoder.setVertexBuffer(gpu.instances, offset: 0, index: 0)
@@ -427,7 +439,7 @@ struct AtlasCityMetalView: NSViewRepresentable {
                 self.presented(.init(view: drawing.view, frame: serial, display: drawing.display))
             }
         }
-        command.addCompletedHandler { [weak self, gpu, depth] command in
+        command.addCompletedHandler { [weak self, gpu, depth, drawable] command in
             // Independent completion ownership survives view/window teardown.
             withExtendedLifetime((gpu, depth)) {}
             let failed = command.status == .error
@@ -436,12 +448,22 @@ struct AtlasCityMetalView: NSViewRepresentable {
                 self.retireCompleted()
                 if failed && !self.stopped && self.epoch == ticket {
                     self.failed("A City graphics command failed. Return to 2D or retry City.")
+                } else if !failed, !self.stopped, self.epoch == ticket,
+                          serial > self.lastPresentationRequestSerial,
+                          self.latest?.palette == drawing.palette, self.window != nil,
+                          drawing.view.width == Double(self.bounds.width),
+                          drawing.view.height == Double(self.bounds.height) {
+                    // Accept after completion without waiting on the main
+                    // thread. A submitted frame from the previous palette may
+                    // retire its resources but must never become visible.
+                    self.metal.isHidden = false
+                    self.lastPresentationRequestSerial = serial
+                    drawable.present()
                 }
             }
         }
         flights.append(Flight(serial: serial, command: command, gpu: gpu, depth: depth, drawable: drawable))
-        metal.isHidden = false
-        command.present(drawable); command.commit(); wake()
+        command.commit(); wake()
     }
 
     func stop() {

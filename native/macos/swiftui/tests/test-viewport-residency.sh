@@ -15,6 +15,7 @@ Path(sys.argv[2]).write_text(search[:search.index('/// Immutable after admission
 PY
 clang -std=gnu11 -Wall -Wextra -Werror -c "$src/tests/AtlasViewportFixture.c" -o "$out/fixture.o"
 swiftc -swift-version 6 -warnings-as-errors \
+    "$src/AtlasAppearance.swift" \
     "$out/Support.swift" "$src/AtlasProjectCatalog.swift" "$src/AtlasProjectWorker.swift" \
     "$src/AtlasSource.swift" "$src/AtlasPreparedText.swift" "$src/AtlasDocument.swift" "$src/AtlasParcelLayout.swift" \
     "$src/AtlasViewportWorker.swift" "$src/AtlasViewportResidency.swift" \

@@ -37,6 +37,7 @@ fn profile_native_loading() {
                 "-O",
                 "-parse-as-library",
                 "swiftui/AtlasSource.swift",
+                "swiftui/AtlasAppearance.swift",
                 "swiftui/AtlasDocument.swift",
                 "swiftui/AtlasPreparedText.swift",
                 "swiftui/AtlasProjectCache.swift",

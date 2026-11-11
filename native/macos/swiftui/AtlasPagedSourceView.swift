@@ -285,7 +285,7 @@ import AppKit
                     selection: model.nativeSelectionRange.map { AtlasReaderSelection(source: source, range: $0) },
                     wrapsLines: wrapsLines, showsLineNumbers: showsLineNumbers,
                     showsWhitespace: showsWhitespace, firstPhysicalLine: physicalLineBase(page),
-                    backgroundColor: Monokai.background, foregroundColor: Monokai.color("plain"),
+                    usesSyntaxPalette: true,
                     onSelectionChange: { source, navigation, range in
                         copyNotice = ""
                         model.updateTextSelection(source: source, navigation: navigation, range: range)

@@ -49,7 +49,7 @@ fn production_swift_camera_source_and_shell() {
             .as_nanos()
     ));
     std::fs::create_dir(&scratch).unwrap();
-    for name in ["AtlasCamera", "AtlasSource", "AtlasSearch"] {
+    for name in ["AtlasCamera", "AtlasSource", "AtlasSearch", "AtlasAppearance"] {
         let binary = scratch.join(name);
         checked(
             Command::new("xcrun")
@@ -70,6 +70,7 @@ fn production_swift_camera_source_and_shell() {
                 "swiftc",
                 "-parse-as-library",
                 "swiftui/AtlasSource.swift",
+                "swiftui/AtlasAppearance.swift",
                 "swiftui/AtlasDocument.swift",
                 "swiftui/AtlasPreparedText.swift",
                 "swiftui/tests/AtlasDocumentTests.swift",
@@ -88,6 +89,7 @@ fn production_swift_camera_source_and_shell() {
                 "swiftc",
                 "-parse-as-library",
                 "swiftui/AtlasSource.swift",
+                "swiftui/AtlasAppearance.swift",
                 "swiftui/AtlasDocument.swift",
                 "swiftui/AtlasPreparedText.swift",
                 "swiftui/AtlasSearch.swift",
@@ -107,6 +109,7 @@ fn production_swift_camera_source_and_shell() {
                 "swiftc",
                 "-parse-as-library",
                 "swiftui/AtlasSource.swift",
+                "swiftui/AtlasAppearance.swift",
                 "swiftui/AtlasDocument.swift",
                 "swiftui/AtlasPreparedText.swift",
                 "swiftui/AtlasProjectCatalog.swift",
@@ -126,6 +129,7 @@ fn production_swift_camera_source_and_shell() {
                 "swiftc",
                 "-parse-as-library",
                 "swiftui/AtlasSource.swift",
+                "swiftui/AtlasAppearance.swift",
                 "swiftui/AtlasDocument.swift",
                 "swiftui/AtlasPreparedText.swift",
                 "swiftui/AtlasMatch.swift",
@@ -144,6 +148,7 @@ fn production_swift_camera_source_and_shell() {
                 "swiftc",
                 "-parse-as-library",
                 "swiftui/AtlasSource.swift",
+                "swiftui/AtlasAppearance.swift",
                 "swiftui/AtlasDocument.swift",
                 "swiftui/AtlasPreparedText.swift",
                 "swiftui/AtlasSearch.swift",
@@ -206,6 +211,7 @@ fn production_swift_camera_source_and_shell() {
                 "-parse-as-library",
                 "swiftui/AtlasSource.swift",
                 "swiftui/AtlasMatch.swift",
+                "swiftui/AtlasAppearance.swift",
                 "swiftui/AtlasDocument.swift",
                 "swiftui/AtlasPreparedText.swift",
                 "swiftui/AtlasProjectCatalog.swift",
@@ -249,6 +255,7 @@ fn offscreen_metal_glyph_quality() {
                 "swiftc",
                 "-parse-as-library",
                 "swiftui/AtlasSource.swift",
+                "swiftui/AtlasAppearance.swift",
                 "swiftui/AtlasDocument.swift",
                 "swiftui/AtlasPreparedText.swift",
                 "swiftui/AtlasMetalRasterRenderer.swift",
@@ -321,6 +328,7 @@ fn source_lifetime_through_metal_completion() {
                 "swiftc",
                 "-parse-as-library",
                 "swiftui/AtlasSource.swift",
+                "swiftui/AtlasAppearance.swift",
                 "swiftui/AtlasDocument.swift",
                 "swiftui/AtlasPreparedText.swift",
                 "swiftui/AtlasMetalRasterRenderer.swift",

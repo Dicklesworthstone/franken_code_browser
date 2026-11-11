@@ -4,6 +4,46 @@ import ImageIO
 import CoreText
 
 @main struct AtlasPreparedTextTests {
+    static func appearanceReplaysMixedColorRuns() {
+        let text = "fn A😀B café e\u{301} שלום /* comment */ 17"
+        let roles: [(NSRange, String)] = [
+            ((text as NSString).range(of: "fn"), "keyword"),
+            ((text as NSString).range(of: "/* comment */"), "comment"),
+            ((text as NSString).range(of: "17"), "number")
+        ]
+        let styled = AtlasDocument.style(text: text, runs: roles)
+        let native = CTLineCreateWithAttributedString(styled)
+        var prepared = AtlasPreparedLine(native, source: text)!
+        precondition(prepared.hasColorGlyphs, "mixed line must exercise native emoji fallback")
+        prepared.retainedColorLine = native
+        let glyphs = prepared.runs.map(\.glyphs), positions = prepared.runs.map(\.positions)
+        func render(_ draw: (CGContext) -> Void) -> Data {
+            let bitmap = CGContext(data: nil, width: 512, height: 72, bitsPerComponent: 8,
+                bytesPerRow: 2048, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+            bitmap.translateBy(x: 0, y: 72); bitmap.scaleBy(x: 1, y: -1)
+            draw(bitmap)
+            return bitmap.makeImage()!.dataProvider!.data! as Data
+        }
+        for palette in AtlasAppearancePalette.allCases {
+            // Independent native oracle: CoreText draws a newly colored copy in
+            // the test only. Production replays the original glyph positions.
+            let reference = NSMutableAttributedString(attributedString: styled)
+            reference.addAttribute(.foregroundColor, value: palette.color("plain").nsColor,
+                range: NSRange(location: 0, length: reference.length))
+            for (range, role) in roles { reference.addAttribute(.foregroundColor, value: palette.color(role).nsColor, range: range) }
+            let nativeReference = CTLineCreateWithAttributedString(reference)
+            let expected = render {
+                $0.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+                $0.textPosition = CGPoint(x: 6, y: 32)
+                CTLineDraw(nativeReference, $0)
+            }
+            let actual = render { prepared.draw(in: $0, origin: CGPoint(x: 6, y: 32), palette: palette) }
+            precondition(actual == expected, "appearance replay must preserve mixed emoji baselines and recolor surrounding text")
+            precondition(prepared.runs.map(\.glyphs) == glyphs && prepared.runs.map(\.positions) == positions,
+                         "appearance never replaces retained glyphs or their positions")
+        }
+    }
     static func sharedLineStateReplay() {
         let text = "fn café(a\u{301}: &str) { שלום /* fj */ return 17; }"
         let styled = NSMutableAttributedString(string: text, attributes: [
@@ -370,6 +410,7 @@ import CoreText
         }
     }
     static func main() throws {
+        appearanceReplaysMixedColorRuns()
         sharedLineStateReplay()
         clippedGlyphReplay()
         try overviewCache()

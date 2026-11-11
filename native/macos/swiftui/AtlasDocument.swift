@@ -202,17 +202,18 @@ final class AtlasTextTile {
         self.sourceRange = sourceRange
     }
 
-    /// Both cached overview and close-up use these exact same colored glyphs.
-    func draw(in context: CGContext, visibleRows: Range<Int>? = nil) {
+    /// Geometry and canonical run colors stay immutable across appearance changes.
+    func draw(in context: CGContext, visibleRows: Range<Int>? = nil,
+              palette: AtlasAppearancePalette = .canonical) {
         context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
         context.textPosition = CGPoint(x: 4, y: 12)
-        if let header { CTLineDraw(header, context) }
-        else { preparedHeader?.draw(in: context, origin: CGPoint(x: 4, y: 12)) }
+        if let header { AtlasPreparedLine.drawRetained(header, in: context, origin: context.textPosition, palette: palette) }
+        else { preparedHeader?.draw(in: context, origin: CGPoint(x: 4, y: 12), palette: palette) }
         for index in visibleRows ?? (0..<lineCount) {
             context.textPosition = CGPoint(x: 4, y: 34 + Double(index) * Self.lineHeight)
             if let preparedLines {
-                preparedLines[index].draw(in: context, origin: context.textPosition)
-            } else { CTLineDraw(lines[index], context) }
+                preparedLines[index].draw(in: context, origin: context.textPosition, palette: palette)
+            } else { AtlasPreparedLine.drawRetained(lines[index], in: context, origin: context.textPosition, palette: palette) }
         }
     }
 

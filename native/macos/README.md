@@ -726,6 +726,23 @@ cover same-scan retention, UTF-16 and CRLF boundaries, large prefixes, retained
 history, limits, stale replies, and cancellation. These are code-first changes;
 executable Rust/Swift and physical-Mac qualification remain pending.
 
+## Appearance
+
+The **Appearance** menu offers **System**, **Light**, and **Dark**, plus an
+**Increase Contrast** option. System follows the host window appearance; the
+system's Increase Contrast setting is respected even when the app's additional
+contrast option is off. These preferences persist across launches.
+
+The atlas, City view, source readers, selection, and search colors use the same
+resolved palette. Changing appearance retains captured source, lexical roles,
+source selections, glyph positions, and camera geometry. Background-dependent
+colored raster tiles are refreshed; old in-flight tiles cannot publish into the
+new palette. Existing prepared-source archives keep their canonical color format.
+
+This source addition includes regression cases for contrast, retained text,
+selection, and native drawing. Executable and physical-Mac qualification remain
+pending; it is not a claim about the already released binary.
+
 ## Source reader display
 
 The source reader's **Display** menu provides independent **Line numbers**,

@@ -42,7 +42,12 @@ import Metal
         var clip: SIMD4<Float>
         var baseline: SIMD4<Float>
     }
-    private struct Uniforms { var camera: SIMD4<Float>; var viewport: SIMD4<Float> }
+    private struct Uniforms {
+        var camera: SIMD4<Float>; var viewport: SIMD4<Float>
+        var background: SIMD4<Float>; var plain: SIMD4<Float>; var keyword: SIMD4<Float>
+        var typeName: SIMD4<Float>; var functionName: SIMD4<Float>; var string: SIMD4<Float>
+        var number: SIMD4<Float>; var comment: SIMD4<Float>
+    }
     private struct Mask { let rect: CGRect; let inkRect: CGRect; let uv: SIMD4<Float> }
     static let maximumInstances = 8_000_000
     static let atlasSide = 128
@@ -68,6 +73,13 @@ import Metal
     private let pipeline: MTLRenderPipelineState
     private let additivePipeline: MTLRenderPipelineState
     private let opaqueBackgrounds: Bool
+    private let recolorableMasks: Bool
+
+    /// RGB-phase masks contain canonical colored pixels. Coverage masks and
+    /// instance geometry remain reusable; light ink requires signed blending.
+    func supports(palette: AtlasAppearancePalette) -> Bool {
+        palette.isCanonical || (recolorableMasks && (!opaqueBackgrounds || tileMemoryPipeline != nil))
+    }
 
     convenience init(device: MTLDevice, lines: [Line], pixelsPerPoint: Double) throws {
         try self.init(device: device, tiles: [SceneTile(id: 0, rect: .zero, sourceScale: 1, lines: lines)],
@@ -121,6 +133,7 @@ import Metal
         admittedMaskCapacity = maskCapacity
         self.device = device; self.pixelsPerPoint = pixelsPerPoint
         self.opaqueBackgrounds = opaqueBackgrounds
+        recolorableMasks = !rgbPhases
         let side = Self.atlasSide
         var layers: [[Float]] = []
         var styles: [CGColor] = []
@@ -424,7 +437,9 @@ import Metal
     /// Returns an explicit fallback instead of magnifying an inadequate mask.
     func encode(into target: MTLTexture, commandBuffer: MTLCommandBuffer,
                 scale: Double, offset: CGPoint, tileIDs: [Int]? = nil,
-                raster: AtlasMetalRasterRenderer? = nil, rasterIDs: [Int] = []) throws {
+                raster: AtlasMetalRasterRenderer? = nil, rasterIDs: [Int] = [],
+                palette: AtlasAppearancePalette = .canonical) throws {
+        guard supports(palette: palette), palette.isCanonical || rasterIDs.isEmpty else { throw Fallback.unsupportedColor }
         guard scale.isFinite, scale > 0, offset.x.isFinite, offset.y.isFinite,
               abs(offset.x) <= 10_000_000, abs(offset.y) <= 10_000_000 else { throw Fallback.invalidGeometry }
         if let raster { try raster.validate(scale: scale, tileIDs: rasterIDs, deviceRegistryID: device.registryID) }
@@ -439,12 +454,18 @@ import Metal
         guard target.device.registryID == device.registryID, commandBuffer.device.registryID == device.registryID,
               target.pixelFormat == .bgra8Unorm, target.sampleCount == 1,
               target.textureType == .type2D, target.usage.contains(.renderTarget) else { throw Fallback.incompatibleTarget }
+        let colors = palette.syntaxColors
         var uniforms = Uniforms(camera: SIMD4(Float(scale), Float(offset.x), Float(offset.y), Float(scale - Double(Float(scale)))),
             viewport: SIMD4(Float(target.width), Float(target.height),
-                Float(offset.x - Double(Float(offset.x))), Float(offset.y - Double(Float(offset.y)))))
-        let useTileMemory = tileMemoryPipeline != nil && selected.contains { id in
+                Float(offset.x - Double(Float(offset.x))), Float(offset.y - Double(Float(offset.y)))),
+            background: palette.background.vector, plain: colors[0].vector, keyword: colors[1].vector,
+            typeName: colors[2].vector, functionName: colors[3].vector, string: colors[4].vector,
+            number: colors[5].vector, comment: colors[6].vector)
+        // Signed deltas keep dark ink on a light background intact. Never
+        // accumulate those deltas in an unsigned target, even at full density.
+        let useTileMemory = tileMemoryPipeline != nil && (!palette.isCanonical || selected.contains { id in
             scale * pixelsPerPoint / batches[id]!.pixelsPerWorldPoint < Self.directBlendMinimumDensity
-        }
+        })
         let accumulation: MTLTexture?
         if useTileMemory {
             // The presenter bounds outstanding commands. This texture has no
@@ -515,7 +536,24 @@ import Metal
         return ResolvedPixel{accumulated};
     }
     struct Instance { float4 rect; float4 uv; float4 color; float4 clip; float4 baseline; };
-    struct Uniforms { float4 camera; float4 viewport; };
+    struct Uniforms {
+        float4 camera; float4 viewport;
+        float4 background; float4 plain; float4 keyword; float4 typeName;
+        float4 functionName; float4 string; float4 number; float4 comment;
+    };
+    float4 displayColor(float4 color, constant Uniforms &u) {
+        float3 rgb = color.rgb;
+        float3 mapped = rgb;
+        if (all(abs(rgb - float3(22,26,29)/255.0) < 0.00001)) mapped = u.background.rgb;
+        else if (all(abs(rgb - float3(248,248,242)/255.0) < 0.00001)) mapped = u.plain.rgb;
+        else if (all(abs(rgb - float3(249,38,114)/255.0) < 0.00001)) mapped = u.keyword.rgb;
+        else if (all(abs(rgb - float3(102,217,239)/255.0) < 0.00001)) mapped = u.typeName.rgb;
+        else if (all(abs(rgb - float3(166,226,46)/255.0) < 0.00001)) mapped = u.functionName.rgb;
+        else if (all(abs(rgb - float3(230,219,116)/255.0) < 0.00001)) mapped = u.string.rgb;
+        else if (all(abs(rgb - float3(174,129,255)/255.0) < 0.00001)) mapped = u.number.rgb;
+        else if (all(abs(rgb - float3(117,113,94)/255.0) < 0.00001)) mapped = u.comment.rgb;
+        return float4(mapped, color.a);
+    }
     struct Out { float4 position [[position]]; float2 uv; float2 world; float4 color; float4 clip; float solid [[flat]]; uint layer [[flat]]; float4 rect [[flat]]; float4 maskUV [[flat]]; };
     // Double-float operations retain residuals across cancellation and bin boundaries.
     float2 phaseTwoSum(float a, float b) {
@@ -672,18 +710,19 @@ import Metal
     fragment float4 glyphFragment(Out in [[stage_in]], texture2d_array<float> atlas [[texture(0)]], constant Uniforms &u [[buffer(1)]]) {
         float2 world = (in.position.xy - u.camera.yz) / u.camera.x;
         if (any(world < in.clip.xy) || any(world >= in.clip.zw)) discard_fragment();
-        float alpha = (in.solid > 0 ? 1 : boxCoverage(atlas, in, u)) * in.color.a;
-        return float4(in.color.rgb * alpha, alpha);
+        float4 color = displayColor(in.color, u);
+        float alpha = (in.solid > 0 ? 1 : boxCoverage(atlas, in, u)) * color.a;
+        return float4(color.rgb * alpha, alpha);
     }
     fragment float4 glyphDeltaFragment(Out in [[stage_in]], texture2d_array<float> atlas [[texture(0)]], constant Uniforms &u [[buffer(1)]]) {
         float2 world = (in.position.xy - u.camera.yz) / u.camera.x;
         if (any(world < in.clip.xy) || any(world >= in.clip.zw)) discard_fragment();
         if (in.maskUV.y > 0 || in.maskUV.y == -1) return float4(rgbBoxDelta(atlas, in, u), 0);
-        float coverage = boxCoverage(atlas, in, u) * in.color.a;
-        const float3 background = float3(22.0, 26.0, 29.0) / 255.0;
+        float4 color = displayColor(in.color, u);
+        float coverage = boxCoverage(atlas, in, u) * color.a;
         // Filtering and addition commute for disjoint source ink. Source-over
         // after filtering would spuriously subtract overlapping filter lobes.
-        return float4((in.color.rgb - background) * coverage, 0);
+        return float4((color.rgb - u.background.rgb) * coverage, 0);
     }
     """
 }

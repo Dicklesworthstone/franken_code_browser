@@ -29,6 +29,7 @@ fn main() {
         "swiftui/AtlasVisibleSearchScope.swift",
         "swiftui/AtlasMatch.swift",
         "swiftui/AtlasDocument.swift",
+        "swiftui/AtlasAppearance.swift",
         "swiftui/AtlasPreparedText.swift",
         "swiftui/AtlasProjectCache.swift",
         "swiftui/AtlasProjectCatalog.swift",
