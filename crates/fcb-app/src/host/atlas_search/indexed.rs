@@ -190,15 +190,15 @@ impl RetainedAtlasSearch {
         needle: &str, scope: AtlasSearchScope, max_matches: usize, max_scan_bytes: u64,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         let mut work = self.prepare_indexed_work(atlas, generation, index_generation, needle,
-            scope, max_matches, max_scan_bytes, false, &mut canceled)?;
+            scope, max_matches, max_scan_bytes, false, false, &mut canceled)?;
         while work.snapshot.stop_reason.is_none() { self.advance_work(atlas, &mut work, &mut canceled)?; }
         let response = self.work_response(atlas, &work, "search-indexed", &mut canceled)?;
         self.accepted = Some(work.snapshot);
         Ok(response)
     }
 
-    /// Count every exact-text occurrence in the admitted capture scope while
-    /// retaining at most `max_matches` navigable rows. Verification still obeys
+    /// Count every decoded-text occurrence in the admitted capture scope while
+    /// retaining at most `max_matches` navigable rows, including zero. Verification still obeys
     /// the query-wide byte budget; an exhausted budget is not an exact total.
     pub fn search_indexed_counted_scoped(&mut self, atlas: &AtlasSession, generation: u64,
         index_generation: u64, needle: &str, scope: AtlasSearchScope, max_matches: usize,
@@ -229,7 +229,7 @@ impl RetainedAtlasSearch {
         needle: &str, scope: AtlasSearchScope, max_matches: usize, max_scan_bytes: u64,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         let work = self.prepare_indexed_work(atlas, generation, index_generation, needle,
-            scope, max_matches, max_scan_bytes, false, &mut canceled)?;
+            scope, max_matches, max_scan_bytes, false, false, &mut canceled)?;
         let response = self.work_response(atlas, &work, "begin-indexed", &mut canceled)?;
         self.pending = Some(work);
         Ok(response)
@@ -261,19 +261,18 @@ impl RetainedAtlasSearch {
         index_generation: u64, needle: &str, scope: AtlasSearchScope, max_matches: usize,
         max_scan_bytes: u64, canceled: &mut impl FnMut() -> bool)
         -> Result<SearchWork, AtlasSearchError> {
-        // The bounded lowercase route remains independently selectable. Never
-        // silently change requested matching semantics to obtain a total.
-        if !scope.case_sensitive() { return Err(AtlasSearchError::InvalidScope); }
+        // The shared counted verifier honors both exact and Unicode lowercase
+        // matching while preserving the selected scope and bounded row storage.
         self.prepare_indexed_work_inner(atlas, generation, index_generation, needle, scope,
             max_matches, max_scan_bytes, false, true, canceled)
     }
 
     pub(super) fn prepare_indexed_work(&mut self, atlas: &AtlasSession, generation: u64, index_generation: u64,
         text: &str, scope: AtlasSearchScope, max_matches: usize, max_scan_bytes: u64, expression: bool,
-        canceled: &mut impl FnMut() -> bool)
+        count_all_matches: bool, canceled: &mut impl FnMut() -> bool)
         -> Result<SearchWork, AtlasSearchError> {
         self.prepare_indexed_work_inner(atlas, generation, index_generation, text, scope,
-            max_matches, max_scan_bytes, expression, false, canceled)
+            max_matches, max_scan_bytes, expression, count_all_matches, canceled)
     }
 
     fn prepare_indexed_work_inner(&mut self, atlas: &AtlasSession, generation: u64, index_generation: u64,
@@ -282,7 +281,8 @@ impl RetainedAtlasSearch {
         -> Result<SearchWork, AtlasSearchError> {
         self.validate(atlas)?; self.attempt(generation)?; check(canceled)?;
         let scan_limit = if expression { MAX_ATLAS_EXPRESSION_SCAN_BYTES } else { MAX_ATLAS_SEARCH_SOURCE_BYTES as u64 };
-        if !(1..=MAX_ATLAS_SEARCH_HITS).contains(&max_matches) || max_scan_bytes > scan_limit
+        if max_matches > MAX_ATLAS_SEARCH_HITS || (max_matches == 0 && !count_all_matches)
+            || max_scan_bytes > scan_limit
             || (!expression && (text.is_empty() || text.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES)) {
             return Err(AtlasSearchError::InvalidLimits);
         }
@@ -346,7 +346,7 @@ impl RetainedAtlasSearch {
             case_sensitive: scope.case_sensitive(), normalization: UnicodeNormalization::Exact,
         });
         options.max_matches = max_matches; options.max_bytes_scanned = Some(max_scan_bytes);
-        let query = if count_all_matches && scope.is_all() {
+        let query = if count_all_matches && expression.is_none() && scope.is_all() {
             OwnedIndexedQuery::new_counting(&retained.engine, parsed, options, &self.budget,
                 [ast_id, query_id], || canceled() || atlas.validate_active().is_err())?
         } else if count_all_matches {
@@ -373,7 +373,8 @@ impl RetainedAtlasSearch {
             hits: reserve(max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?, examined, scanned: 0,
             matched_texts: reserve(if case_sensitive { 0 } else { max_matches })?,
             matched_text_capacity: text_capacity,
-            unavailable, pending, matches_seen: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0, count_all_matches,
+            unavailable, pending, matches_seen: 0, matching_files: 0,
+            source_bytes_read: 0, read_calls: 0, retained_bytes: 0, count_all_matches,
             truncated: false, complete: false, stop_reason: None, step_count: 0,
             last_step_files: 0, last_step_bytes: 0, last_step_calls: 0,
             index_usage: Some(IndexQueryUsage { generation: index_generation, manifest: retained.engine.id().revision(),

@@ -54,6 +54,47 @@ pub unsafe extern "C" fn fcb_atlas_search_indexed_begin_expression(handle: u64, 
     }))
 }
 
+/// Count every verified primary occurrence after all document predicates pass.
+/// max_matches is 0..4096 retained rows, independent of the total count and the
+/// explicit verification budget. Continue with ordinary search_step/page.
+/// # Safety
+/// Same bounded strings, workers and owned-response contract as begin_expression.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_search_begin_counted_expression(handle: u64, generation: u64,
+    expression: *const c_char, extensions: *const c_char, filenames: *const c_char,
+    path_kind: u64, path: *const c_char, case_sensitive: u64, max_matches: u64,
+    max_files: u64, max_file_bytes: u64, max_source_bytes: u64, max_scan_bytes: u64) -> *mut c_char {
+    reply(|| answer(handle, |atlases| {
+        let expression = unsafe { bounded_expression(expression) }?;
+        let case_sensitive = parse_case_sensitive(case_sensitive)?;
+        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?
+            .with_case_sensitive(case_sensitive);
+        let options = AtlasSearchOptions { max_matches: number(max_matches)?, max_files: number(max_files)?,
+            max_file_bytes: number(max_file_bytes)?, max_source_bytes: number(max_source_bytes)? };
+        atlases.execute(handle, Command::SearchBeginCountedExpression { generation, expression,
+            scope: &scope, options, max_scan_bytes }, || false)
+    }))
+}
+
+/// Count over accepted captures with the same independent row/scan limits.
+/// Scope, expression, case policy and capture identity stay fixed across steps.
+/// # Safety
+/// Same bounded strings and owned-response contract as indexed_begin_expression.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_search_indexed_begin_counted_expression(handle: u64, generation: u64,
+    index_generation: u64, expression: *const c_char, extensions: *const c_char, filenames: *const c_char,
+    path_kind: u64, path: *const c_char, case_sensitive: u64,
+    max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
+    reply(|| answer(handle, |atlases| {
+        let expression = unsafe { bounded_expression(expression) }?;
+        let case_sensitive = parse_case_sensitive(case_sensitive)?;
+        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?
+            .with_case_sensitive(case_sensitive);
+        atlases.execute_index(handle, IndexCommand::BeginCountedExpression { generation, index_generation,
+            expression, scope: &scope, max_matches: number(max_matches)?, max_scan_bytes }, || false)
+    }))
+}
+
 // Only foreign string admission lives here. Empty/invalid syntax reaches the
 // shared parser so callers receive its specific QUERY_* diagnostic.
 unsafe fn bounded_expression<'a>(pointer: *const c_char) -> Result<&'a str, AccessError> {

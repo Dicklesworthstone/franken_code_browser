@@ -81,6 +81,12 @@ impl AtlasSearchOptions {
         }
         Ok(())
     }
+
+    fn validate_counted(self) -> Result<(), AtlasSearchError> {
+        // A count-only request retains no rows. All source/file bounds and the
+        // maximum retained-row allowance keep their existing admission rules.
+        Self { max_matches: self.max_matches.max(1), ..self }.validate()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,10 +169,11 @@ struct Snapshot {
     unavailable: usize,
     pending: usize,
     matches_seen: u64,
+    matching_files: usize,
     source_bytes_read: u64,
     read_calls: u64,
     retained_bytes: usize,
-    /// Counted exact-text queries may omit rows while continuing through the frozen scope.
+    /// Counted text queries may omit rows while continuing through the frozen scope.
     count_all_matches: bool,
     truncated: bool,
     complete: bool,
@@ -288,7 +295,7 @@ impl RetainedAtlasSearch {
         Ok(response)
     }
 
-    /// Exact-text route that continues counting after the retained hit table fills.
+    /// Decoded-text route that continues counting after the retained hit table fills.
     pub fn search_counted_scoped(&mut self, atlas: &AtlasSession, generation: u64, needle: &str,
         scope: AtlasSearchScope, options: AtlasSearchOptions, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
@@ -487,7 +494,8 @@ fn summary(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot) -> Resul
         ("examined_files", snapshot.examined as u64), ("scanned_files", snapshot.scanned as u64),
         ("unavailable_files", snapshot.unavailable as u64), ("pending_files", snapshot.pending as u64),
         ("matches_seen", snapshot.matches_seen), ("retained_hits", snapshot.hits.len() as u64),
-        ("matching_files", snapshot.files.len() as u64), ("source_bytes_read", snapshot.source_bytes_read),
+        ("matching_files", snapshot.matching_files as u64),
+        ("retained_matching_files", snapshot.files.len() as u64), ("source_bytes_read", snapshot.source_bytes_read),
         ("read_calls", snapshot.read_calls), ("retained_source_bytes", snapshot.retained_bytes as u64),
         ("step_count", snapshot.step_count), ("last_step_files", snapshot.last_step_files as u64),
         ("last_step_source_bytes", snapshot.last_step_bytes), ("last_step_read_calls", snapshot.last_step_calls)] {

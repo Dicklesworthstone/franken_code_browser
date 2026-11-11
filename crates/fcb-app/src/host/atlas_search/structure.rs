@@ -188,7 +188,7 @@ impl RetainedAtlasSearch {
             hits: reserve(options.limits.max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?,
             matched_texts: Vec::new(), matched_text_capacity: 0,
             examined: 0, scanned: 0, unavailable: 0, pending: eligible_files,
-            matches_seen: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0, count_all_matches: false,
+            matches_seen: 0, matching_files: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0, count_all_matches: false,
             truncated: false, complete: false, stop_reason: None, step_count: 0,
             last_step_files: 0, last_step_bytes: 0, last_step_calls: 0, index_usage: None, _lease: lease };
         let work = SearchWork { snapshot, execution: SearchExecution::Structure(StructureWork {

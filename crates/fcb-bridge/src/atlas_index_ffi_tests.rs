@@ -25,12 +25,14 @@ fn all_five_index_entrypoint_types_and_header_declarations_agree() {
         u64, *const c_char, u64, u64) -> *mut c_char = fcb_atlas_search_indexed_begin_path_scoped;
     let _: unsafe extern "C" fn(u64, u64, u64, *const c_char, *const c_char, *const c_char,
         u64, *const c_char, u64, u64, u64) -> *mut c_char = fcb_atlas_search_indexed_begin_counted_matching;
+    let _: unsafe extern "C" fn(u64, u64, u64, *const c_char, *const c_char, *const c_char,
+        u64, *const c_char, u64, u64, u64) -> *mut c_char = fcb_atlas_search_indexed_counted_matching;
     let header = include_str!("../include/fcb_atlas_index.h");
     for name in ["fcb_atlas_index_prepare(", "fcb_atlas_index_info(",
         "fcb_atlas_index_clear(", "fcb_atlas_search_indexed(", "fcb_atlas_search_indexed_begin(",
         "fcb_atlas_search_indexed_scoped(", "fcb_atlas_search_indexed_begin_scoped(",
         "fcb_atlas_search_indexed_path_scoped(", "fcb_atlas_search_indexed_begin_path_scoped(",
-        "fcb_atlas_search_indexed_begin_counted_matching("] {
+        "fcb_atlas_search_indexed_begin_counted_matching(", "fcb_atlas_search_indexed_counted_matching("] {
         assert_eq!(header.matches(name).count(), 1, "{name}");
     }
 }
@@ -92,7 +94,7 @@ fn counted_index_abi_preserves_rows_scope_cancellation_and_original_captures() {
     assert!(first.contains("\"truncated\":true"));
     // Rejected case policy must not supersede the already running generation.
     let invalid = take(unsafe { fcb_atlas_search_indexed_begin_counted_matching(atlas, 3, 1,
-        needle.as_ptr(), std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 0, 1, 4096) });
+        needle.as_ptr(), std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 2, 1, 4096) });
     assert!(invalid.contains("INVALID_ARGUMENT"), "{invalid}");
     fs::write(root.join("a.rs"), b"replacement").unwrap();
     fs::write(root.join("b.rs"), b"replacement").unwrap();

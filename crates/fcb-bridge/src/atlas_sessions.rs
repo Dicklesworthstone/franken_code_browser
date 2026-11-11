@@ -84,6 +84,8 @@ pub(super) enum Command<'a> {
     SearchBeginCountedScoped { generation: u64, needle: &'a str, scope: &'a AtlasSearchScope, options: AtlasSearchOptions },
     SearchBeginExpression { generation: u64, expression: &'a str, scope: &'a AtlasSearchScope,
         options: AtlasSearchOptions, max_scan_bytes: u64 },
+    SearchBeginCountedExpression { generation: u64, expression: &'a str, scope: &'a AtlasSearchScope,
+        options: AtlasSearchOptions, max_scan_bytes: u64 },
     StructureBegin { generation: u64, needle: &'a str, scope: &'a AtlasSearchScope, options: AtlasStructureOptions },
     SearchStep { generation: u64 },
     SearchPage { generation: u64, start: usize, limit: usize },
@@ -219,6 +221,9 @@ impl AtlasSessions {
                 session.search.begin_counted_scoped(&session.atlas, generation, needle, scope.clone(), options, &mut stop).map_err(AccessError::from),
             Command::SearchBeginExpression { generation, expression, scope, options, max_scan_bytes } =>
                 session.search.begin_expression_scoped(&session.atlas, generation, expression,
+                    scope.clone(), options, max_scan_bytes, &mut stop).map_err(AccessError::from),
+            Command::SearchBeginCountedExpression { generation, expression, scope, options, max_scan_bytes } =>
+                session.search.begin_expression_counted_scoped(&session.atlas, generation, expression,
                     scope.clone(), options, max_scan_bytes, &mut stop).map_err(AccessError::from),
             Command::StructureBegin { generation, needle, scope, options } => session.search.begin_structure(&session.atlas, generation, needle, scope.clone(), options, &mut stop).map_err(AccessError::from),
             Command::SearchStep { generation } => session.search.step(&session.atlas, generation, &mut stop).map_err(AccessError::from),

@@ -56,6 +56,26 @@ char *fcb_atlas_search_indexed_begin_expression(uint64_t handle, uint64_t genera
     const char *filenames, uint64_t path_kind, const char *path,
     uint64_t case_sensitive, uint64_t max_matches, uint64_t max_scan_bytes);
 
+/* Count all verified primary occurrences while retaining at most max_matches
+ * rows (0..4096; zero is count-only). Document predicates must still pass in
+ * full before their primary occurrences count. max_scan_bytes, capture limits,
+ * cancellation and scope retain the contracts above. matches_seen counts
+ * occurrences and matching_files counts observed matching files, including
+ * those beyond the row cap. retained_hits/retained_matching_files describe
+ * navigable retained results. match_count_complete is independent of truncated;
+ * a partial verification or omitted capture never proves an exact total.
+ * Existing expression entrypoints preserve their early-stop behavior.
+ */
+char *fcb_atlas_search_begin_counted_expression(uint64_t handle, uint64_t generation,
+    const char *expression, const char *extensions, const char *filenames,
+    uint64_t path_kind, const char *path, uint64_t case_sensitive,
+    uint64_t max_matches, uint64_t max_files, uint64_t max_file_bytes,
+    uint64_t max_source_bytes, uint64_t max_scan_bytes);
+char *fcb_atlas_search_indexed_begin_counted_expression(uint64_t handle, uint64_t generation,
+    uint64_t index_generation, const char *expression, const char *extensions,
+    const char *filenames, uint64_t path_kind, const char *path,
+    uint64_t case_sensitive, uint64_t max_matches, uint64_t max_scan_bytes);
+
 #ifdef __cplusplus
 }
 #endif

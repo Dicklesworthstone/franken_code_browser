@@ -173,15 +173,13 @@ fn missing_visible_members_and_unsupported_text_keep_counts_partial() {
 }
 
 #[test]
-fn cancellation_and_invalid_case_preserve_the_previously_accepted_capture() {
+fn cancellation_stale_steps_and_lowercase_counting_preserve_capture_identity() {
     let (_fixture, atlas, mut search) = setup(&[("a.rs", b"banana"), ("b.rs", b"banana banana")]);
     search.search_indexed_counted_scoped(&atlas, 2, 1, "ana", AtlasSearchScope::all(), 1, 65536, || false).unwrap();
     let old = search.hit(&atlas, 2, 1).unwrap();
     search.begin_indexed_counted(&atlas, 3, 1, "ana", 1, 65536, || false).unwrap();
     search.step(&atlas, 3, || false).unwrap();
-    assert_eq!(search.begin_indexed_counted_scoped(&atlas, 4, 1, "ANA",
-        AtlasSearchScope::all().with_case_sensitive(false), 1, 65536, || false).err(),
-        Some(AtlasSearchError::InvalidScope));
+    assert_eq!(search.step(&atlas, 99, || false).err(), Some(AtlasSearchError::StaleQuery));
     assert_eq!(search.pending_generation(), Some(3));
     assert_eq!(search.step(&atlas, 3, || true).err(), Some(AtlasSearchError::Canceled));
     assert_eq!(search.pending_generation(), None);
@@ -190,4 +188,11 @@ fn cancellation_and_invalid_case_preserve_the_previously_accepted_capture() {
     search.begin_indexed_counted(&atlas, 4, 1, "ana", 1, 65536, || false).unwrap();
     assert_eq!(search.step(&atlas, 3, || false).err(), Some(AtlasSearchError::StaleQuery));
     counted(&finish(&mut search, &atlas, 4), 6, 1, true);
+    // Counted matching now preserves the existing lowercase semantics too.
+    // A zero-row query still counts both captures without retaining source pins.
+    search.begin_indexed_counted_scoped(&atlas, 5, 1, "ANA",
+        AtlasSearchScope::all().with_case_sensitive(false), 0, 65536, || false).unwrap();
+    let lowercase = finish(&mut search, &atlas, 5);
+    counted(&lowercase, 6, 0, true);
+    assert_eq!(lowercase.get("retained_source_bytes").number(), 0);
 }

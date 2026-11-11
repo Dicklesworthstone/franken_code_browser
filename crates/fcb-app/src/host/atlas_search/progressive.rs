@@ -33,6 +33,8 @@ pub struct AtlasSearchProgress {
     pub stop_reason: Option<AtlasSearchStop>,
     pub complete: bool,
     pub truncated: bool,
+    pub count_all_matches: bool,
+    pub match_count_complete: bool,
     pub eligible_files: usize,
     pub excluded_files: usize,
     /// Frozen requested-region membership, independent of file-type filtering.
@@ -45,8 +47,12 @@ pub struct AtlasSearchProgress {
     pub unavailable_files: usize,
     pub pending_files: usize,
     pub retained_hits: usize,
-    /// Observed occurrences, including at most one unstored lookahead hit.
+    /// Legacy queries include at most one unstored lookahead hit. Counted
+    /// queries continue observing occurrences independently of retained rows.
     pub matches_seen: u64,
+    /// Distinct files with observed primary occurrences, including omitted rows.
+    pub matching_files: usize,
+    pub retained_matching_files: usize,
     pub retained_source_bytes: usize,
     pub source_bytes_read: u64,
     pub read_calls: u64,
@@ -87,12 +93,15 @@ impl RetainedAtlasSearch {
         let q = self.snapshot(generation)?;
         Ok(AtlasSearchProgress { generation: q.generation, stop_reason: q.stop_reason,
             complete: q.complete, truncated: q.truncated, examined_files: q.examined,
+            count_all_matches: q.count_all_matches, match_count_complete: q.complete,
             eligible_files: q.eligible_files, excluded_files: atlas.atlas().file_count() - q.eligible_files,
             scope_region_files: q.scope.region_files(),
             scope_region_catalogued_files: q.scope_region.map(|region| region.catalogued),
             scope_region_missing_files: q.scope_region.map(|region| region.missing),
             scanned_files: q.scanned, unavailable_files: q.unavailable, pending_files: q.pending,
-            retained_hits: q.hits.len(), matches_seen: q.matches_seen, retained_source_bytes: q.retained_bytes,
+            retained_hits: q.hits.len(), matches_seen: q.matches_seen,
+            matching_files: q.matching_files, retained_matching_files: q.files.len(),
+            retained_source_bytes: q.retained_bytes,
             source_bytes_read: q.source_bytes_read, read_calls: q.read_calls,
             step_count: q.step_count, last_step_files: q.last_step_files,
             last_step_source_bytes: q.last_step_bytes, last_step_read_calls: q.last_step_calls })
@@ -118,7 +127,7 @@ impl RetainedAtlasSearch {
         Ok(response)
     }
 
-    /// Admit exact-text work whose count can continue beyond retained rows.
+    /// Admit decoded-text work whose count can continue beyond retained rows.
     pub fn begin_counted_scoped(&mut self, atlas: &AtlasSession, generation: u64, needle: &str,
         scope: AtlasSearchScope, options: AtlasSearchOptions, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
@@ -159,7 +168,6 @@ impl RetainedAtlasSearch {
     pub(super) fn prepare_counted_work(&mut self, atlas: &AtlasSession, generation: u64,
         needle: &str, scope: AtlasSearchScope, options: AtlasSearchOptions, canceled: &mut impl FnMut() -> bool)
         -> Result<SearchWork, AtlasSearchError> {
-        if !scope.case_sensitive() { return Err(AtlasSearchError::InvalidScope); }
         self.prepare_work_inner(atlas, generation, needle, scope, options, true, canceled)
     }
 
@@ -167,7 +175,7 @@ impl RetainedAtlasSearch {
         needle: &str, scope: AtlasSearchScope, options: AtlasSearchOptions, count_all_matches: bool,
         canceled: &mut impl FnMut() -> bool) -> Result<SearchWork, AtlasSearchError> {
         self.validate(atlas)?; self.attempt(generation)?;
-        options.validate()?;
+        if count_all_matches { options.validate_counted()?; } else { options.validate()?; }
         if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES {
             return Err(AtlasSearchError::InvalidLimits);
         }
@@ -196,7 +204,7 @@ impl RetainedAtlasSearch {
             matched_texts: reserve(if case_sensitive { 0 } else { options.max_matches })?,
             matched_text_capacity: text_capacity,
             examined: 0, scanned: 0, unavailable: 0, pending: eligible_files,
-            matches_seen: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0,
+            matches_seen: 0, matching_files: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0,
             count_all_matches, truncated: false, complete: false, stop_reason: None, step_count: 0,
             last_step_files: 0, last_step_bytes: 0, last_step_calls: 0, index_usage: None, _lease: lease };
         let pattern = if case_sensitive {
@@ -224,6 +232,7 @@ impl RetainedAtlasSearch {
         let before_files = snapshot.examined;
         let before_bytes = snapshot.source_bytes_read;
         let before_calls = snapshot.read_calls;
+        let before_matches = snapshot.matches_seen;
         match &mut work.execution {
             SearchExecution::Live(live) => {
                 update_coverage(atlas, snapshot, live);
@@ -235,6 +244,9 @@ impl RetainedAtlasSearch {
             SearchExecution::Expression(expression) => self.advance_expression_work(atlas, snapshot, expression, canceled)?,
         }
         self.validate(atlas)?; check(canceled)?;
+        // Every execution variant advances at most one source member. Count
+        // that member once even when all of its occurrences exceed row storage.
+        if snapshot.matches_seen > before_matches { snapshot.matching_files += 1; }
         snapshot.step_count = snapshot.step_count.checked_add(1).ok_or(AtlasSearchError::IdentityExhausted)?;
         snapshot.last_step_files = snapshot.examined - before_files;
         snapshot.last_step_bytes = snapshot.source_bytes_read - before_bytes;
@@ -312,17 +324,21 @@ impl RetainedAtlasSearch {
             let mut scan_options = QueryOptions::new(qgen).with_mode(SearchMode::DecodedText {
                 case_sensitive: false, normalization: UnicodeNormalization::Exact,
             });
-            // The shared normalized scanner treats zero as an immediate limit.
-            // A one-hit probe still distinguishes no later match from an
-            // omitted occurrence once the retained snapshot is exactly full.
-            scan_options.max_matches = remaining.max(1);
+            // Legacy mode uses one lookahead when rows are full. Counted mode
+            // accepts zero retained rows and still verifies every occurrence.
+            scan_options.max_matches = if candidate.count_all_matches { remaining } else { remaining.max(1) };
             scan_options.max_bytes_scanned = Some(capture.bytes().len() as u64);
             let scratch = text_matching::scan_scratch_bytes(scan_options.max_matches,
                 candidate.matched_text_capacity)?;
             let _scan_lease = self.budget.try_reserve_managed(self.manifest.owner(), work.scan_id,
                 ByteLength::new(scratch as u64)).map_err(|_| AppError::Admission)?;
-            let scanned = DirectSourceScanner::scan_complete_capture_with_cancel(&capture,
-                &candidate.needle, &scan_options, || canceled() || atlas.validate_active().is_err());
+            let scanned = if candidate.count_all_matches {
+                DirectSourceScanner::scan_complete_capture_counting_with_cancel(&capture,
+                    &candidate.needle, &scan_options, || canceled() || atlas.validate_active().is_err())
+            } else {
+                DirectSourceScanner::scan_complete_capture_with_cancel(&capture,
+                    &candidate.needle, &scan_options, || canceled() || atlas.validate_active().is_err())
+            };
             self.validate(atlas)?; check(canceled)?;
             let report = match scanned {
                 Ok(report) => report,
@@ -335,8 +351,10 @@ impl RetainedAtlasSearch {
             };
             if report.coverage == SearchCoverage::CanceledEarly { return Err(AtlasSearchError::Canceled); }
             candidate.scanned += 1;
-            let counted = report.total_matches_counted.min(remaining + 1);
-            candidate.matches_seen += counted as u64;
+            let counted = if candidate.count_all_matches { report.total_matches_counted }
+                else { report.total_matches_counted.min(remaining + 1) };
+            candidate.matches_seen = candidate.matches_seen.checked_add(counted as u64)
+                .ok_or(AtlasSearchError::IdentityExhausted)?;
             if counted > remaining || matches!(report.coverage, SearchCoverage::TruncatedAtLimit { .. }) {
                 candidate.truncated = true;
             }
@@ -375,7 +393,7 @@ fn update_coverage(atlas: &AtlasSession, q: &mut Snapshot, work: &LiveWork) {
         Some(if q.truncated && !q.count_all_matches { AtlasSearchStop::MatchLimit }
             else { AtlasSearchStop::AllFilesExamined })
     } else if q.truncated && !q.count_all_matches {
-        // Legacy mode stops on omitted occurrences. Counted exact mode continues.
+        // Legacy mode stops on omitted occurrences. Counted mode continues.
         Some(AtlasSearchStop::MatchLimit)
     } else if q.examined == work.options.max_files {
         Some(AtlasSearchStop::FileLimit)

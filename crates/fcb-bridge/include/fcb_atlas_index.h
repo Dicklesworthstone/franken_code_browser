@@ -151,18 +151,25 @@ char *fcb_atlas_search_indexed_begin_matching(uint64_t handle, uint64_t generati
     const char *filenames, uint64_t path_kind, const char *path,
     uint64_t case_sensitive, uint64_t max_matches, uint64_t max_scan_bytes);
 
-/* Exact-case counting over the same retained capture scope. case_sensitive
- * must be 1; 0 or an invalid value is rejected without superseding work.
- * max_matches bounds stored rows only. Counting continues through later
- * admitted captures within max_scan_bytes, without source I/O or index rebuild.
- * count_all_matches=true identifies this policy. matches_seen can exceed
- * retained_hits; truncated describes omitted rows independently of coverage.
- * match_count_complete equals search_complete: only a closed, fully examined
- * selected universe with no unavailable/pending files establishes the total.
- * A completed exact count can therefore have truncated=true. Budget-limited,
- * incomplete-capture and missing-visible-member queries remain partial.
- * Existing entrypoints retain their bounded-lookahead behavior. */
+/* Count every verified occurrence over the selected retained captures while
+ * retaining the first max_matches rows (0..4096; zero supports count-only).
+ * max_scan_bytes stays an independent verification bound; cancellation and
+ * omitted captures still make counts partial. matches_seen is the occurrence
+ * count, retained_hits bounds navigation, and match_count_complete reports
+ * count coverage independently of truncated (retained_hits < matches_seen).
+ * match_count_complete equals search_complete: a closed, fully examined
+ * selected universe with no unavailable/pending files is required.
+ * matching_files counts all observed matching files; retained_matching_files
+ * counts files that back retained rows. Both Unicode matching modes are supported.
+ * Existing indexed entrypoints preserve their early-stop/nonzero-limit contract.
+ * Resume the begin form with fcb_atlas_search_step. Same pointer/owned-string
+ * contract as indexed_begin_matching; no source pathname is reopened.
+ */
 char *fcb_atlas_search_indexed_begin_counted_matching(uint64_t handle, uint64_t generation,
+    uint64_t index_generation, const char *needle, const char *extensions,
+    const char *filenames, uint64_t path_kind, const char *path,
+    uint64_t case_sensitive, uint64_t max_matches, uint64_t max_scan_bytes);
+char *fcb_atlas_search_indexed_counted_matching(uint64_t handle, uint64_t generation,
     uint64_t index_generation, const char *needle, const char *extensions,
     const char *filenames, uint64_t path_kind, const char *path,
     uint64_t case_sensitive, uint64_t max_matches, uint64_t max_scan_bytes);

@@ -134,11 +134,13 @@ char *fcb_atlas_search_begin_matching(uint64_t handle, uint64_t generation, cons
     uint64_t case_sensitive, uint64_t max_matches, uint64_t max_files,
     uint64_t max_file_bytes, uint64_t max_source_bytes);
 
-/* Exact-case counted variant. max_matches bounds retained rows/captures only;
+/* Counted variant with the same 0/1 case choice as begin_matching.
+ * max_matches (0..4096, including count-only) bounds retained rows/captures only;
  * scanning continues through the frozen scope until ordinary source/file limits.
- * search_complete may be true with truncated=true: matches_seen is then complete
- * for the admitted observation while only retained_hits rows are actionable.
- * case_sensitive must be 1.
+ * search_complete/match_count_complete may be true with truncated=true:
+ * matches_seen is then complete for the admitted observation while only
+ * retained_hits rows are actionable. matching_files includes every observed
+ * matching file; retained_matching_files includes only files backing rows.
  */
 char *fcb_atlas_search_begin_counted_matching(uint64_t handle, uint64_t generation, const char *needle,
     const char *extensions, const char *filenames, uint64_t path_kind, const char *path,

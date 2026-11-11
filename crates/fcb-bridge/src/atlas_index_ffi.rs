@@ -173,28 +173,34 @@ pub unsafe extern "C" fn fcb_atlas_search_indexed_begin_matching(handle: u64, ge
     path_kind: u64, path: *const c_char, case_sensitive: u64,
     max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
     unsafe { submit_matching(handle, generation, index_generation, needle, extensions, filenames,
-        path_kind, path, case_sensitive, max_matches, max_scan_bytes, true) }
+        path_kind, path, case_sensitive, max_matches, max_scan_bytes, true, false) }
 }
-
-/// Count all exact-text occurrences within the verification byte budget while
-/// retaining at most max_matches rows. Scope and index capture identity stay
-/// frozen; ordinary search_step/page/overlay/reader operations share the query.
-/// case_sensitive must be 1; the legacy matching route supports lowercase.
+/// Count every verified occurrence while retaining only the first max_matches
+/// rows (0..4096, including count-only requests). The independent scan budget
+/// still bounds verification. Read match_count_complete separately from
+/// truncated: a complete count can have fewer retained rows than matches_seen.
 /// # Safety
 /// Same pointer/list/path and returned-string contract as indexed_begin_matching.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn fcb_atlas_search_indexed_begin_counted_matching(handle: u64,
-    generation: u64, index_generation: u64, needle: *const c_char,
-    extensions: *const c_char, filenames: *const c_char, path_kind: u64,
-    path: *const c_char, case_sensitive: u64, max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
-    reply(|| answer(handle, |atlases| {
-        if !parse_case_sensitive(case_sensitive)? { return Err(AccessError::InvalidArgument); }
-        let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
-        if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES { return Err(AccessError::InvalidArgument); }
-        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?;
-        atlases.execute_index(handle, IndexCommand::BeginCounted { generation, index_generation,
-            needle, scope: &scope, max_matches: number(max_matches)?, max_scan_bytes }, || false)
-    }))
+pub unsafe extern "C" fn fcb_atlas_search_indexed_begin_counted_matching(handle: u64, generation: u64,
+    index_generation: u64, needle: *const c_char, extensions: *const c_char, filenames: *const c_char,
+    path_kind: u64, path: *const c_char, case_sensitive: u64,
+    max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
+    unsafe { submit_matching(handle, generation, index_generation, needle, extensions, filenames,
+        path_kind, path, case_sensitive, max_matches, max_scan_bytes, true, true) }
+}
+
+/// Synchronous worker form of indexed_begin_counted_matching. Existing indexed
+/// entrypoints retain their early-stop behavior and nonzero row limit.
+/// # Safety
+/// Same pointer/list/path and returned-string contract as indexed_begin_matching.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_search_indexed_counted_matching(handle: u64, generation: u64,
+    index_generation: u64, needle: *const c_char, extensions: *const c_char, filenames: *const c_char,
+    path_kind: u64, path: *const c_char, case_sensitive: u64,
+    max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
+    unsafe { submit_matching(handle, generation, index_generation, needle, extensions, filenames,
+        path_kind, path, case_sensitive, max_matches, max_scan_bytes, false, true) }
 }
 
 unsafe fn submit(handle: u64, generation: u64, index_generation: u64, needle: *const c_char,
@@ -207,11 +213,12 @@ unsafe fn submit_with_path(handle: u64, generation: u64, index_generation: u64, 
     extensions: *const c_char, filenames: *const c_char, path_kind: u64, path: *const c_char,
     max_matches: u64, max_scan_bytes: u64, progressive: bool) -> *mut c_char {
     unsafe { submit_matching(handle, generation, index_generation, needle, extensions, filenames,
-        path_kind, path, 1, max_matches, max_scan_bytes, progressive) }
+        path_kind, path, 1, max_matches, max_scan_bytes, progressive, false) }
 }
 unsafe fn submit_matching(handle: u64, generation: u64, index_generation: u64, needle: *const c_char,
     extensions: *const c_char, filenames: *const c_char, path_kind: u64, path: *const c_char,
-    case_sensitive: u64, max_matches: u64, max_scan_bytes: u64, progressive: bool) -> *mut c_char {
+    case_sensitive: u64, max_matches: u64, max_scan_bytes: u64, progressive: bool,
+    count_all_matches: bool) -> *mut c_char {
     reply(|| answer(handle, |atlases| {
         let case_sensitive = parse_case_sensitive(case_sensitive)?;
         let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
@@ -219,11 +226,13 @@ unsafe fn submit_matching(handle: u64, generation: u64, index_generation: u64, n
         let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?
             .with_case_sensitive(case_sensitive);
         let max_matches = number(max_matches)?;
-        let command = match (scope.is_all() && case_sensitive, progressive) {
-            (true, true) => IndexCommand::Begin { generation, index_generation, needle, max_matches, max_scan_bytes },
-            (true, false) => IndexCommand::Query { generation, index_generation, needle, max_matches, max_scan_bytes },
-            (false, true) => IndexCommand::BeginScoped { generation, index_generation, needle, scope: &scope, max_matches, max_scan_bytes },
-            (false, false) => IndexCommand::QueryScoped { generation, index_generation, needle, scope: &scope, max_matches, max_scan_bytes },
+        let command = match (count_all_matches, scope.is_all() && case_sensitive, progressive) {
+            (true, _, true) => IndexCommand::BeginCounted { generation, index_generation, needle, scope: &scope, max_matches, max_scan_bytes },
+            (true, _, false) => IndexCommand::QueryCountedScoped { generation, index_generation, needle, scope: &scope, max_matches, max_scan_bytes },
+            (false, true, true) => IndexCommand::Begin { generation, index_generation, needle, max_matches, max_scan_bytes },
+            (false, true, false) => IndexCommand::Query { generation, index_generation, needle, max_matches, max_scan_bytes },
+            (false, false, true) => IndexCommand::BeginScoped { generation, index_generation, needle, scope: &scope, max_matches, max_scan_bytes },
+            (false, false, false) => IndexCommand::QueryScoped { generation, index_generation, needle, scope: &scope, max_matches, max_scan_bytes },
         };
         atlases.execute_index(handle, command, || false)
     }))

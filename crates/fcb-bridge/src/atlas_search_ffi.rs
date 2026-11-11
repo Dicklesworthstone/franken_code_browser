@@ -102,8 +102,8 @@ pub unsafe extern "C" fn fcb_atlas_search_begin_matching(handle: u64, generation
         case_sensitive, max_matches, max_files, max_file_bytes, max_source_bytes, true) }
 }
 
-/// Admit an exact-case literal query that keeps scanning/counting after its
-/// retained hit table fills. Other matching modes keep their existing contracts.
+/// Admit a literal query that keeps scanning/counting after its retained hit
+/// table fills. Supports exact spelling and Unicode lowercase comparison.
 /// # Safety
 /// Pointer/list/path ownership matches fcb_atlas_search_begin_matching.
 #[unsafe(no_mangle)]
@@ -112,13 +112,13 @@ pub unsafe extern "C" fn fcb_atlas_search_begin_counted_matching(handle: u64, ge
     path_kind: u64, path: *const c_char, case_sensitive: u64,
     max_matches: u64, max_files: u64, max_file_bytes: u64, max_source_bytes: u64) -> *mut c_char {
     reply(|| answer(handle, |atlases| {
-        if !parse_case_sensitive(case_sensitive)? { return Err(AccessError::InvalidArgument); }
+        let case_sensitive = parse_case_sensitive(case_sensitive)?;
         let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
         if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES {
             return Err(AccessError::InvalidArgument);
         }
         let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?
-            .with_case_sensitive(true);
+            .with_case_sensitive(case_sensitive);
         let options = AtlasSearchOptions { max_matches: number(max_matches)?, max_files: number(max_files)?,
             max_file_bytes: number(max_file_bytes)?, max_source_bytes: number(max_source_bytes)? };
         atlases.execute(handle, Command::SearchBeginCountedScoped { generation, needle, scope: &scope, options }, || false)

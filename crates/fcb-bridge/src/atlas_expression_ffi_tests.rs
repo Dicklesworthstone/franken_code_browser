@@ -2,8 +2,10 @@
 
 use super::*;
 use super::super::{fcb_atlas_search, fcb_atlas_search_step, fcb_atlas_search_page,
-    fcb_atlas_search_open_reader};
-use super::super::index::{fcb_atlas_index_prepare, fcb_atlas_index_clear};
+    fcb_atlas_search_open_reader, fcb_atlas_search_begin_counted_matching};
+use super::super::index::{fcb_atlas_index_prepare, fcb_atlas_index_clear,
+    fcb_atlas_search_indexed_begin_matching, fcb_atlas_search_indexed_begin_counted_matching,
+    fcb_atlas_search_indexed_counted_matching};
 use crate::atlas_ffi::{fcb_atlas_create, fcb_atlas_open, fcb_atlas_close};
 use crate::reader_ffi::{fcb_reader_create, fcb_reader_copy_range, fcb_reader_close, FFI_TEST_LOCK};
 use std::{ffi::{CStr, CString}, fs, path::PathBuf};
@@ -135,8 +137,13 @@ fn expression_abi_types_public_header_and_foreign_string_bounds_agree() {
         u64, *const c_char, u64, u64, u64, u64, u64, u64) -> *mut c_char = fcb_atlas_search_begin_expression;
     let _: unsafe extern "C" fn(u64, u64, u64, *const c_char, *const c_char, *const c_char,
         u64, *const c_char, u64, u64, u64) -> *mut c_char = fcb_atlas_search_indexed_begin_expression;
+    let _: unsafe extern "C" fn(u64, u64, *const c_char, *const c_char, *const c_char,
+        u64, *const c_char, u64, u64, u64, u64, u64, u64) -> *mut c_char = fcb_atlas_search_begin_counted_expression;
+    let _: unsafe extern "C" fn(u64, u64, u64, *const c_char, *const c_char, *const c_char,
+        u64, *const c_char, u64, u64, u64) -> *mut c_char = fcb_atlas_search_indexed_begin_counted_expression;
     let header = include_str!("../include/fcb_atlas_expression.h");
-    for name in ["fcb_atlas_search_begin_expression(", "fcb_atlas_search_indexed_begin_expression("] {
+    for name in ["fcb_atlas_search_begin_expression(", "fcb_atlas_search_indexed_begin_expression(",
+        "fcb_atlas_search_begin_counted_expression(", "fcb_atlas_search_indexed_begin_counted_expression("] {
         assert_eq!(header.matches(name).count(), 1, "{name}");
     }
     let limit = CString::new("x".repeat(MAX_QUERY_LEN)).unwrap();
@@ -145,4 +152,101 @@ fn expression_abi_types_public_header_and_foreign_string_bounds_agree() {
     assert_eq!(unsafe { bounded_expression(unterminated.as_ptr().cast()) }.err(), Some(AccessError::InvalidArgument));
     let empty = CString::new("").unwrap();
     assert_eq!(unsafe { bounded_expression(empty.as_ptr()) }.unwrap(), "");
+}
+
+#[test]
+fn c_counted_indexed_literals_separate_total_from_rows_and_preserve_legacy_limits() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (root, handle) = workspace(&[("a.rs", b"needle needle"), ("b.rs", b"NEEDLE NEEDLE")]);
+    assert!(take(fcb_atlas_index_prepare(handle, 1, 100, 8192, 65536, 65536)).contains("\"capture_complete\":true"));
+    // Counting must use the accepted captures, never changed live source.
+    fs::write(root.join("a.rs"), b"replacement").unwrap();
+    let needle = CString::new("needle").unwrap();
+    let admitted = take(unsafe { fcb_atlas_search_indexed_begin_counted_matching(handle, 2, 1,
+        needle.as_ptr(), std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 0, 1, 65536) });
+    assert!(admitted.contains("\"count_all_matches\":true"), "{admitted}");
+    assert!(admitted.contains("\"match_count_complete\":false"));
+    let counted = finish(handle, 2);
+    for field in ["\"matches_seen\":\"4\"", "\"retained_hits\":\"1\"",
+        "\"matching_files\":\"2\"", "\"retained_matching_files\":\"1\"",
+        "\"match_count_complete\":true", "\"search_complete\":true", "\"truncated\":true",
+        "\"source_bytes_read\":\"0\""] {
+        assert!(counted.contains(field), "missing {field}: {counted}");
+    }
+    let legacy = take(unsafe { fcb_atlas_search_indexed_begin_matching(handle, 3, 1,
+        needle.as_ptr(), std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 0, 1, 65536) });
+    assert!(legacy.contains("\"count_all_matches\":false"));
+    let bounded = finish(handle, 3);
+    assert!(bounded.contains("\"matches_seen\":\"2\"") && bounded.contains("\"search_complete\":false"), "{bounded}");
+    let only_count = take(unsafe { fcb_atlas_search_indexed_counted_matching(handle, 4, 1,
+        needle.as_ptr(), std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 0, 0, 65536) });
+    for field in ["\"matches_seen\":\"4\"", "\"retained_hits\":\"0\"",
+        "\"matching_files\":\"2\"", "\"retained_matching_files\":\"0\"",
+        "\"match_count_complete\":true", "\"truncated\":true"] {
+        assert!(only_count.contains(field), "missing {field}: {only_count}");
+    }
+    let no_budget = take(unsafe { fcb_atlas_search_indexed_counted_matching(handle, 5, 1,
+        needle.as_ptr(), std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 0, 1, 0) });
+    assert!(no_budget.contains("\"match_count_complete\":false") && no_budget.contains("\"search_complete\":false"), "{no_budget}");
+    assert_eq!(fcb_atlas_close(handle), 1);
+}
+
+#[test]
+fn c_counted_expressions_count_only_verified_documents_live_and_from_captures() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (root, handle) = workspace(&[("a.rs", b"needle needle required"),
+        ("b.rs", b"NEEDLE required"), ("c.rs", b"needle required forbidden")]);
+    let expression = CString::new("needle required -forbidden").unwrap();
+    let admitted = take(unsafe { fcb_atlas_search_begin_counted_expression(handle, 1, expression.as_ptr(),
+        std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 0, 1, 100, 8192, 65536, 65536) });
+    assert!(admitted.contains("\"source_bytes_read\":\"0\"") && admitted.contains("\"count_all_matches\":true"), "{admitted}");
+    let live = finish(handle, 1);
+    for field in ["\"matches_seen\":\"3\"", "\"retained_hits\":\"1\"",
+        "\"matching_files\":\"2\"", "\"match_count_complete\":true", "\"truncated\":true"] {
+        assert!(live.contains(field), "missing {field}: {live}");
+    }
+    assert!(take(fcb_atlas_index_prepare(handle, 2, 100, 8192, 65536, 65536)).contains("\"capture_complete\":true"));
+    fs::write(root.join("b.rs"), b"no longer matches").unwrap();
+    let admitted = take(unsafe { fcb_atlas_search_indexed_begin_counted_expression(handle, 3, 2,
+        expression.as_ptr(), std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 0, 0, 65536) });
+    assert!(admitted.contains("\"count_all_matches\":true"), "{admitted}");
+    let indexed = finish(handle, 3);
+    for field in ["\"matches_seen\":\"3\"", "\"retained_hits\":\"0\"",
+        "\"matching_files\":\"2\"", "\"retained_matching_files\":\"0\"",
+        "\"match_count_complete\":true", "\"search_complete\":true", "\"source_bytes_read\":\"0\""] {
+        assert!(indexed.contains(field), "missing {field}: {indexed}");
+    }
+    let admitted = take(unsafe { fcb_atlas_search_begin_counted_expression(handle, 4, expression.as_ptr(),
+        std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 0, 0, 100, 8192, 65536, 0) });
+    assert!(admitted.contains("\"status\":\"ok\""));
+    let no_proof = finish(handle, 4);
+    assert!(no_proof.contains("\"match_count_complete\":false") && no_proof.contains("\"search_complete\":false"), "{no_proof}");
+    assert_eq!(fcb_atlas_close(handle), 1);
+}
+
+#[test]
+fn c_counted_live_lowercase_counts_expansions_and_rejects_invalid_flags_without_replacing_results() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (_, handle) = workspace(&[("a.rs", "İ i".as_bytes()), ("b.rs", b"I")]);
+    let needle = CString::new("i").unwrap();
+    let admitted = take(unsafe { fcb_atlas_search_begin_counted_matching(handle, 1, needle.as_ptr(),
+        std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 0, 1, 100, 8192, 65536) });
+    assert!(admitted.contains("\"status\":\"ok\"") && admitted.contains("\"case_sensitive\":false"), "{admitted}");
+    let result = finish(handle, 1);
+    for field in ["\"matches_seen\":\"3\"", "\"retained_hits\":\"1\"", "\"matching_files\":\"2\"",
+        "\"count_all_matches\":true", "\"match_count_complete\":true", "\"search_complete\":true",
+        "\"truncated\":true"] {
+        assert!(result.contains(field), "missing {field}: {result}");
+    }
+    let invalid = take(unsafe { fcb_atlas_search_begin_counted_matching(handle, 2, needle.as_ptr(),
+        std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 2, 1, 100, 8192, 65536) });
+    assert!(invalid.contains("INVALID_ARGUMENT"), "{invalid}");
+    assert!(take(fcb_atlas_search_page(handle, 1, 0, 100)).contains("\"matches_seen\":\"3\""));
+    let count_only = take(unsafe { fcb_atlas_search_begin_counted_matching(handle, 2, needle.as_ptr(),
+        std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 0, 0, 100, 8192, 65536) });
+    assert!(count_only.contains("\"status\":\"ok\""), "{count_only}");
+    let result = finish(handle, 2);
+    assert!(result.contains("\"matches_seen\":\"3\"") && result.contains("\"retained_hits\":\"0\"")
+        && result.contains("\"match_count_complete\":true"), "{result}");
+    assert_eq!(fcb_atlas_close(handle), 1);
 }

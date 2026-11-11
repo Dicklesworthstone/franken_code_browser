@@ -63,9 +63,26 @@ impl RetainedAtlasSearch {
     /// The ordinary step/page/overlay/reader paths use this same query identity.
     pub fn begin_expression_scoped(&mut self, atlas: &AtlasSession, generation: u64,
         expression: &str, scope: AtlasSearchScope, options: AtlasSearchOptions,
-        max_scan_bytes: u64, mut canceled: impl FnMut() -> bool)
+        max_scan_bytes: u64, canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
-        self.validate(atlas)?; self.attempt(generation)?; options.validate()?;
+        self.begin_expression_inner(atlas, generation, expression, scope, options, max_scan_bytes, false, canceled)
+    }
+
+    /// Count primary occurrences after all same-capture predicates succeed,
+    /// continuing beyond the retained-row allowance under the work budget.
+    pub fn begin_expression_counted_scoped(&mut self, atlas: &AtlasSession, generation: u64,
+        expression: &str, scope: AtlasSearchScope, options: AtlasSearchOptions,
+        max_scan_bytes: u64, canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AtlasSearchError> {
+        self.begin_expression_inner(atlas, generation, expression, scope, options, max_scan_bytes, true, canceled)
+    }
+
+    fn begin_expression_inner(&mut self, atlas: &AtlasSession, generation: u64,
+        expression: &str, scope: AtlasSearchScope, options: AtlasSearchOptions,
+        max_scan_bytes: u64, count_all_matches: bool, mut canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AtlasSearchError> {
+        self.validate(atlas)?; self.attempt(generation)?;
+        if count_all_matches { options.validate_counted()?; } else { options.validate()?; }
         check(&mut canceled)?;
         let admitted = self.admit_expression(atlas, expression, &scope, max_scan_bytes, &mut canceled)?;
         let [state_id, scan_id] = [self.next_id()?, self.next_id()?];
@@ -90,8 +107,8 @@ impl RetainedAtlasSearch {
             hits: reserve(options.max_matches)?, diagnostics: reserve(MAX_DIAGNOSTICS)?,
             matched_texts: reserve(if case_sensitive { 0 } else { options.max_matches })?,
             matched_text_capacity: text_capacity, examined: excluded, scanned: 0, unavailable: 0,
-            pending: admitted.eligible - excluded, matches_seen: 0, source_bytes_read: 0,
-            read_calls: 0, retained_bytes: 0, count_all_matches: false, truncated: false, complete: false, stop_reason: None,
+            pending: admitted.eligible - excluded, matches_seen: 0, matching_files: 0, source_bytes_read: 0,
+            read_calls: 0, retained_bytes: 0, count_all_matches, truncated: false, complete: false, stop_reason: None,
             step_count: 0, last_step_files: 0, last_step_bytes: 0, last_step_calls: 0,
             index_usage: None, _lease: lease };
         let work = SearchWork { snapshot, execution: SearchExecution::Expression(ExpressionWork {
@@ -109,7 +126,21 @@ impl RetainedAtlasSearch {
         max_matches: usize, max_scan_bytes: u64, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
         let work = self.prepare_indexed_work(atlas, generation, index_generation, expression,
-            scope, max_matches, max_scan_bytes, true, &mut canceled)?;
+            scope, max_matches, max_scan_bytes, true, false, &mut canceled)?;
+        let response = self.work_response(atlas, &work, "begin-indexed-expression", &mut canceled)?;
+        self.validate(atlas)?; check(&mut canceled)?;
+        self.pending = Some(work);
+        Ok(response)
+    }
+
+    /// Indexed expression counting uses the same frozen scope and predicate
+    /// verifier, with zero retained rows permitted for count-only requests.
+    pub fn begin_indexed_expression_counted_scoped(&mut self, atlas: &AtlasSession, generation: u64,
+        index_generation: u64, expression: &str, scope: AtlasSearchScope,
+        max_matches: usize, max_scan_bytes: u64, mut canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AtlasSearchError> {
+        let work = self.prepare_indexed_work(atlas, generation, index_generation, expression,
+            scope, max_matches, max_scan_bytes, true, true, &mut canceled)?;
         let response = self.work_response(atlas, &work, "begin-indexed-expression", &mut canceled)?;
         self.validate(atlas)?; check(&mut canceled)?;
         self.pending = Some(work);
@@ -204,16 +235,21 @@ impl RetainedAtlasSearch {
         let mut options = QueryOptions::new(generation).with_mode(SearchMode::DecodedText {
             case_sensitive: candidate.scope.case_sensitive(), normalization: UnicodeNormalization::Exact,
         });
-        // One-hit lookahead proves an omitted primary occurrence after all
-        // predicates. A full output buffer alone cannot establish truncation.
-        options.max_matches = remaining.max(1);
+        // Legacy mode uses one lookahead to prove an omitted occurrence.
+        // Counted mode retains only the remaining rows and counts all matches.
+        options.max_matches = if candidate.count_all_matches { remaining } else { remaining.max(1) };
         options.max_bytes_scanned = Some(remaining_work);
         let text_capacity = candidate.matched_text_capacity.max(candidate.needle.len());
         let scratch = text_matching::scan_scratch_bytes(options.max_matches, text_capacity)?;
         let _scan_lease = self.budget.try_reserve_managed(owner, work.scan_id, ByteLength::new(scratch as u64))
             .map_err(|_| AppError::Admission)?;
-        let report = ReferenceScanOracle::scan_document_with_cancel(&document, &work.parsed, &options,
-            || canceled() || atlas.validate_active().is_err()).map_err(IndexError::from)?;
+        let report = if candidate.count_all_matches {
+            ReferenceScanOracle::scan_document_counting_with_cancel(&document, &work.parsed, &options,
+                || canceled() || atlas.validate_active().is_err())
+        } else {
+            ReferenceScanOracle::scan_document_with_cancel(&document, &work.parsed, &options,
+                || canceled() || atlas.validate_active().is_err())
+        }.map_err(IndexError::from)?;
         self.validate(atlas)?; check(canceled)?;
         if report.coverage == SearchCoverage::CanceledEarly { return Err(AtlasSearchError::Canceled); }
         let expression = candidate.expression.as_mut().ok_or(AtlasSearchError::WrongAtlas)?;
@@ -222,10 +258,11 @@ impl RetainedAtlasSearch {
         expression.work_limited = matches!(report.coverage, SearchCoverage::BudgetExhausted { .. });
         let work_limited = expression.work_limited;
         candidate.scanned += 1;
-        let counted = report.total_matches_counted.min(remaining + 1);
+        let counted = if candidate.count_all_matches { report.total_matches_counted }
+            else { report.total_matches_counted.min(remaining + 1) };
         candidate.matches_seen = candidate.matches_seen.checked_add(counted as u64)
             .ok_or(AtlasSearchError::IdentityExhausted)?;
-        candidate.truncated = counted > remaining || matches!(report.coverage, SearchCoverage::TruncatedAtLimit { .. });
+        candidate.truncated |= counted > remaining || matches!(report.coverage, SearchCoverage::TruncatedAtLimit { .. });
         if !report.unsupported_files.is_empty() { candidate.unavailable(file, "unsupported-text"); }
         else if work_limited { candidate.unavailable(file, "verification-byte-limit"); }
         let node = atlas.atlas().node_for_file(file).map_err(AtlasSessionError::from)?;
@@ -258,7 +295,7 @@ fn update_coverage(atlas: &AtlasSession, q: &mut Snapshot, work: &ExpressionWork
     let selected_examined = q.examined.checked_sub(expression.excluded).ok_or(AtlasSearchError::WrongAtlas)?;
     q.pending = q.eligible_files.checked_sub(q.examined).ok_or(AtlasSearchError::WrongAtlas)?;
     q.source_bytes_read = work.io.bytes; q.read_calls = work.io.calls;
-    q.stop_reason = if q.truncated { Some(AtlasSearchStop::MatchLimit) }
+    q.stop_reason = if q.truncated && !q.count_all_matches { Some(AtlasSearchStop::MatchLimit) }
         else if expression.work_limited { Some(AtlasSearchStop::VerificationByteLimit) }
         else if q.pending == 0 { Some(AtlasSearchStop::AllFilesExamined) }
         else if selected_examined == work.options.max_files { Some(AtlasSearchStop::FileLimit) }
