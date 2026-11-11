@@ -5,22 +5,34 @@
 //! not copied into diagnostics, shell commands or terminal control sequences.
 
 use fcb::search::{RawPath, workspace::WorkspaceCatalog};
+use fcb::source::ignore::repository::RepositoryRules;
 use crate::output::{Output, OutputError};
 
 pub(crate) fn fields(out: &mut Output, catalog: &WorkspaceCatalog) -> Result<(), OutputError> {
-    out.literal(",\"rule_files_enabled\":")?; out.boolean(catalog.reads_rule_files())?;
+    policy_fields(out, catalog.reads_rule_files(), catalog.rule_policy(), catalog.discovery_complete(), 32)
+}
+
+/// Native progressive cursors keep the same bounded rule evidence without
+/// materializing a complete WorkspaceCatalog. Source-payload I/O remains a
+/// separate counter in both routes.
+pub(crate) fn policy_fields(out: &mut Output, enabled: bool, policy: Option<&RepositoryRules>,
+    discovery_complete: bool, max_diagnostics: usize) -> Result<(), OutputError> {
+    out.literal(",\"rule_files_enabled\":")?; out.boolean(enabled)?;
     out.literal(",\"rule_policy\":")?;
-    let Some(policy) = catalog.rule_policy() else { return out.literal("null"); };
+    let Some(policy) = policy else { return out.literal("null"); };
     let stats = policy.stats();
+    let diagnostic_count = policy.diagnostics().len().min(max_diagnostics);
+    let diagnostics_omitted = (stats.diagnostics_omitted as u64)
+        .saturating_add((policy.diagnostics().len() - diagnostic_count) as u64);
     out.literal("{\"observed_rules_complete\":")?; out.boolean(stats.is_complete())?;
-    out.literal(",\"scope_complete\":")?; out.boolean(stats.is_complete() && catalog.discovery_complete())?;
+    out.literal(",\"scope_complete\":")?; out.boolean(stats.is_complete() && discovery_complete)?;
     for (key, value) in [
         ("configuration_bytes_read", stats.bytes_read), ("configuration_read_calls", stats.read_calls),
         ("configuration_checks", stats.checks), ("files_read", stats.files_read as u64),
         ("files_loaded", stats.files_loaded as u64), ("rules_loaded", stats.rules_loaded as u64),
         ("compiled_admission_bytes", stats.compiled_admission_bytes as u64), ("match_steps", stats.match_steps),
         ("failed_files", stats.failed_files as u64), ("unresolved_paths", stats.unresolved_paths as u64),
-        ("diagnostics_omitted", stats.diagnostics_omitted as u64),
+        ("diagnostics_omitted", diagnostics_omitted),
     ] {
         out.literal(",")?; out.quoted(key)?; out.literal(":")?; out.integer(value)?;
     }
@@ -37,7 +49,7 @@ pub(crate) fn fields(out: &mut Output, catalog: &WorkspaceCatalog) -> Result<(),
         out.quoted(key)?; out.literal(":")?; out.integer(value)?;
     }
     out.literal("},\"diagnostics\":[")?;
-    for (position, diagnostic) in policy.diagnostics().iter().enumerate() {
+    for (position, diagnostic) in policy.diagnostics().iter().take(diagnostic_count).enumerate() {
         if position > 0 { out.literal(",")?; }
         out.literal("{\"path\":")?;
         out.path(&RawPath::from_bytes(diagnostic.path()).to_path_buf())?;

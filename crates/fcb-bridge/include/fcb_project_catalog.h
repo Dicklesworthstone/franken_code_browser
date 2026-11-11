@@ -34,8 +34,9 @@ uint64_t fcb_catalog_create(void);
 
 /* UTF-8 root must remain readable/NUL-terminated until return. Opens the root
  * and consumes ONE bounded discovery batch, not the complete directory tree.
- * No source payload or repository rule file is read. The explicit policy is
- * product-defaults/no-rule-files-v1; symlinks are not followed.
+ * No source payload is read. The repository-rules-v1 policy reads bounded
+ * nested .gitignore/.fcbignore configuration with separate counters and limits;
+ * unresolved rules leave affected scope partial. Symlinks are not followed.
  * Default traversal bounds: 256 entries and 64 KiB of batch paths (at most one
  * additional 2048-byte path), depth 32, queue 4096, one directory descriptor.
  * At most FOUR pages / 1024 file rows remain retained; there is no global file

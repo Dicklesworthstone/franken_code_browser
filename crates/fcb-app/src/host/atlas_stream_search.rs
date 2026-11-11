@@ -389,6 +389,7 @@ impl RetainedAtlasStreamSearch {
         out.literal(",\"capture_kind\":\"literal-witnesses-only\",\"source_observation\":\"per-file-streams-not-atomic-workspace\"")?;
         out.literal(",\"catalogued_files\":")?; out.integer(atlas.atlas().file_count() as u64)?;
         out.literal(",\"discovery_policy\":")?; out.quoted(atlas.atlas().catalog().policy_name())?;
+        crate::workspace::rule_output::fields(&mut out, atlas.atlas().catalog())?;
         out.literal(",\"excluded_entries\":")?; out.integer(atlas.atlas().catalog().aggregate().excluded)?;
         Ok(out)
     }

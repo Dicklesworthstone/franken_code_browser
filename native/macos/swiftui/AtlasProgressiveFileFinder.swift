@@ -79,6 +79,7 @@ struct AtlasProgressiveFileReport: Sendable {
     let more, paused, discoveryComplete, complete, pending, truncated: Bool
     let unavailable, cycles, pathLimited, depthLimited, queueRefused: UInt64
     let excluded, symlinks, special: UInt64
+    let policy: AtlasRepositoryPolicy
     let rows: [AtlasProgressiveFileRow]
     var omissionCount: UInt64 {
         [unavailable, cycles, pathLimited, depthLimited, queueRefused].reduce(0) {
@@ -99,6 +100,7 @@ struct AtlasProgressiveFileReport: Sendable {
         else { text += " Search finished with incomplete coverage." }
         if truncated { text += " Best \(rows.count) results retained; refine the query for other matches." }
         if omissionCount > 0 { text += " \(omissionCount) discovery omissions." }
+        text += " " + policy.summary
         return text
     }
     static func decode(_ json: String?, owner: UInt64, generation: UInt64, query: AtlasFileQuery,
@@ -108,12 +110,14 @@ struct AtlasProgressiveFileReport: Sendable {
             let w = try JSONDecoder().decode(Wire.self, from: data)
             let revision = w.revision.value, searched = w.searched_files.value, retained = w.retained_hits.value
             let complete = w.search_complete
+            let policy = try AtlasRepositoryPolicy.admit(name: w.policy, enabled: w.rule_files_enabled,
+                evidence: w.rule_policy, discoveryComplete: w.discovery_complete)
             guard w.query_generation.value == generation, generation > 0, revision > 0,
                   expected == nil || expected == revision, w.processed_batches.value == revision - 1,
                   w.query_hex == query.text.utf8.map({ String(format: "%02x", $0) }).joined(),
                   w.mode == query.mode.wire, w.caseMode == (query.matchCase ? "sensitive" : "unicode-lowercase"),
                   w.key_version.value == 1, w.identity_scope == "retained-query-session",
-                  w.ordering == "ranked-observed-paths", w.policy == "product-defaults/no-rule-files-v1",
+                  w.ordering == "ranked-observed-paths",
                   !w.source_payload_read, w.discovery_source_bytes_read.value == 0,
                   w.discovery_source_read_calls.value == 0,
                   ["searching", "paused", "complete", "partial"].contains(w.state),
@@ -156,7 +160,7 @@ struct AtlasProgressiveFileReport: Sendable {
                 pathLimited: w.discovery.path_limited.value, depthLimited: w.discovery.depth_limited.value,
                 queueRefused: w.discovery.queue_refused.value, excluded: w.discovery.excluded_entries.value,
                 symlinks: w.discovery.symlinks_not_followed.value, special: w.discovery.special_objects.value,
-                rows: w.hits)
+                policy: policy, rows: w.hits)
         } catch let error as AtlasProgressiveFileError { throw error }
         catch { throw AtlasProgressiveFileError.invalidResponse }
     }
@@ -185,6 +189,8 @@ struct AtlasProgressiveFileReport: Sendable {
         let query_hex, mode, caseMode, identity_scope, ordering, policy, state: String
         let source_payload_read, more, paused, discovery_complete, search_complete, pending_batch, truncated: Bool
         let discovery_source_bytes_read, discovery_source_read_calls: AtlasFinderNumber
+        let rule_files_enabled: Bool?
+        let rule_policy: AtlasRepositoryRuleEvidence?
         let catalogued_files, searched_files, matches_seen, files_examined, candidates_examined, work_units: AtlasFinderNumber
         let retained_hits, retained_path_bytes, processed_batches: AtlasFinderNumber
         let replay_after_revision: AtlasFinderNumber?
@@ -196,6 +202,7 @@ struct AtlasProgressiveFileReport: Sendable {
             case query_generation, revision, key_version, query_hex, mode, identity_scope, ordering, policy, state
             case source_payload_read, more, paused, discovery_complete, search_complete, pending_batch, truncated
             case discovery_source_bytes_read, discovery_source_read_calls, catalogued_files, searched_files
+            case rule_files_enabled, rule_policy
             case matches_seen, files_examined, candidates_examined, work_units, retained_hits, retained_path_bytes
             case processed_batches, replay_after_revision, limits, discovery
             case boundedHits = "hits"
@@ -263,6 +270,8 @@ private struct AtlasProgressiveFileReceipt: Sendable {
                 let query_hex, mode, caseMode, identity_scope, ordering, policy: String
                 let source_payload_read: Bool
                 let discovery_source_bytes_read, discovery_source_read_calls: AtlasFinderNumber
+                let rule_files_enabled: Bool?
+                let rule_policy: AtlasRepositoryRuleEvidence?
                 let catalogued_files, searched_files, matches_seen, retained_hits, retained_path_bytes: AtlasFinderNumber
                 let reader_owner, source_bytes_read, source_read_calls: AtlasFinderNumber
                 let source_observation: String
@@ -270,19 +279,22 @@ private struct AtlasProgressiveFileReceipt: Sendable {
                     case selection, query_generation, revision, key_version, query_hex, mode
                     case identity_scope, ordering, policy, source_payload_read
                     case discovery_source_bytes_read, discovery_source_read_calls
+                    case rule_files_enabled, rule_policy
                     case catalogued_files, searched_files, matches_seen, retained_hits, retained_path_bytes
                     case reader_owner, source_bytes_read, source_read_calls, source_observation
                     case caseMode = "case"
                 }
             }
             let selected = try JSONDecoder().decode(Selection.self, from: data)
+            let policy = try AtlasRepositoryPolicy.admit(name: selected.policy, enabled: selected.rule_files_enabled,
+                evidence: selected.rule_policy, discoveryComplete: report.discoveryComplete)
             guard selected.query_generation.value == report.generation, selected.revision.value == report.revision,
                   selected.key_version.value == 1,
                   selected.query_hex == report.query.text.utf8.map({ String(format: "%02x", $0) }).joined(),
                   selected.mode == report.query.mode.wire,
                   selected.caseMode == (report.query.matchCase ? "sensitive" : "unicode-lowercase"),
                   selected.identity_scope == "retained-query-session", selected.ordering == "ranked-observed-paths",
-                  selected.policy == "product-defaults/no-rule-files-v1", selected.source_payload_read,
+                  policy == report.policy, selected.source_payload_read,
                   selected.discovery_source_bytes_read.value == 0, selected.discovery_source_read_calls.value == 0,
                   selected.catalogued_files.value == report.catalogued, selected.searched_files.value == report.searched,
                   selected.matches_seen.value == report.matches, selected.retained_hits.value == UInt64(report.rows.count),

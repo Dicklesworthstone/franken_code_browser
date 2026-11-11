@@ -290,7 +290,7 @@ fn escaped_long_top_k_paths_fit_the_declared_global_snapshot_bound() {
 }
 
 #[test]
-fn metadata_policy_and_omission_counters_keep_coverage_separate_from_top_k_truncation() {
+fn repository_policy_and_omission_counters_keep_coverage_separate_from_top_k_truncation() {
     let root = root();
     fs::write(root.join(".gitignore"), b"visible.rs\n").unwrap();
     fs::write(root.join("visible.rs"), b"source").unwrap();
@@ -300,9 +300,10 @@ fn metadata_policy_and_omission_counters_keep_coverage_separate_from_top_k_trunc
     fs::write(nested.join("visible-hidden.rs"), b"source").unwrap();
     let mut session = start(&root, 73701, b"visible", Default::default());
     let page = finish(&mut session);
-    assert_eq!(page.get("matches_seen").number(), 1);
-    assert_eq!(raw(&page.get("hits").array()[0]), b"visible.rs");
-    assert_eq!(page.get("policy").text(), "product-defaults/no-rule-files-v1");
+    assert_eq!(page.get("matches_seen").number(), 0);
+    assert!(page.get("hits").array().is_empty());
+    assert_eq!(page.get("policy").text(), "repository-rules-v1");
+    assert_eq!(page.get("rule_policy").get("configuration_bytes_read").number(), 11);
     assert_eq!(page.get("state").text(), "partial");
     assert!(!page.get("truncated").flag()); assert!(!page.get("search_complete").flag());
     assert!(page.get("discovery").get("path_limited").number() > 0);

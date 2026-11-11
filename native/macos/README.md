@@ -109,6 +109,27 @@ this handoff belongs only to the macOS executable. Other platforms remain
 headless. Non-UTF-8 project and filename arguments are refused by the UTF-8
 native startup path rather than being lossily rewritten.
 
+### Repository ignore rules
+
+The native file browser, Quick Open, project-wide source search, 2D atlas and
+City use the engine's bounded repository-rule policy. Discovery reads nested
+`.gitignore` and `.fcbignore` files; `.fcbignore` follows `.gitignore` within each
+directory. The existing product exclusions and protected internal directories
+still apply. Rule files are configuration inputs, never commands to execute.
+
+The browser and filename finder report how many rule files were applied. Rule
+reads have their own counters and limits: 16 KiB per file, 64 KiB in total,
+256 admitted files and 1,024 patterns, with separate compile and matching-work limits.
+Metadata discovery still reads no source payload. An unsupported, unreadable,
+oversized or unsafe rule file leaves the affected scope unknown and reports
+partial coverage and a diagnostic; it cannot turn hidden files into proven
+no-match results or deletion evidence. Excluded-directory counts do not invent
+a count for their unvisited descendants.
+
+Use **Refresh project**, or the search surface's **Refresh file catalog**, after
+changing ignore rules. Captures and searches already retained by an earlier
+catalog keep their original identity and coverage.
+
 ### Refreshing an open project
 
 **Refresh project** prepares a new bounded metadata page while the accepted

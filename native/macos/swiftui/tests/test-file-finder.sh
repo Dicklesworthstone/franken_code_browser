@@ -40,7 +40,7 @@ compile_progressive() {
         "$src/AtlasReaderOutline.swift" "$src/AtlasReaderReferences.swift" "$src/AtlasReaderDocument.swift" "$src/AtlasReaderTextSelection.swift" "$src/AtlasReaderCoordinator.swift" \
         "$src/AtlasCapturedReader.swift" "$src/AtlasSuppliedReader.swift" "$src/AtlasNavigationHistory.swift" \
         "$src/AtlasSource.swift" "$src/AtlasDocumentPreviewModel.swift" "$src/AtlasPagedReaderModel.swift" \
-        "$src/AtlasFileFinder.swift" "$src/AtlasProgressiveFileFinder.swift"
+        "$src/AtlasRepositoryPolicy.swift" "$src/AtlasFileFinder.swift" "$src/AtlasProgressiveFileFinder.swift"
 }
 compile_progressive "$@" "$src/tests/AtlasProgressiveFileFinderTests.swift" -o "$out/progressive-panel-tests"
 "$out/progressive-panel-tests"

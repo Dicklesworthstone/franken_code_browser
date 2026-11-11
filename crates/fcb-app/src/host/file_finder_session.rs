@@ -4,7 +4,8 @@
 //! Each immutable query owns a fresh traversal. The shared path index/ranker is
 //! built only for one discovery batch, then its top-k contribution is merged
 //! into retained raw-path hits. Neither visited metadata nor prepared keys grow
-//! with workspace size. No source or ignore-rule payload is read while finding.
+//! with workspace size. No source payload is read while finding; the shared
+//! catalog separately bounds and reports repository-ignore configuration reads.
 //!
 //! Consuming a directory iterator cannot be rolled back. The catalog retains a
 //! pending batch until matching and the entire result merge commit together.
@@ -288,7 +289,10 @@ impl FileFinderSession {
         out.literal(",\"query_hex\":")?; out.hex(&self.needle)?;
         out.literal(",\"mode\":")?; out.quoted(match self.options.mode { PathMatchMode::Exact => "exact", PathMatchMode::Prefix => "prefix", PathMatchMode::Fuzzy => "fuzzy" })?;
         out.literal(",\"case\":")?; out.quoted(match self.options.case { PathCase::Sensitive => "sensitive", PathCase::UnicodeLowercase => "unicode-lowercase" })?;
-        out.literal(",\"identity_scope\":\"retained-query-session\",\"ordering\":\"ranked-observed-paths\",\"policy\":\"product-defaults/no-rule-files-v1\",\"source_payload_read\":")?;
+        out.literal(",\"identity_scope\":\"retained-query-session\",\"ordering\":\"ranked-observed-paths\",\"policy\":")?;
+        out.quoted(super::RULE_POLICY_NAME)?;
+        self.catalog.encode_rule_policy(&mut out)?;
+        out.literal(",\"source_payload_read\":")?;
         out.boolean(command == "open-reader")?;
         out.literal(",\"discovery_source_bytes_read\":\"0\",\"discovery_source_read_calls\":\"0\",\"state\":")?;
         out.quoted(if self.complete() { "complete" } else if !self.more() { "partial" }

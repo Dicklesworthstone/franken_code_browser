@@ -12,6 +12,7 @@ use fcb::map::workspace::{AtlasScope, WorkspaceAtlas, WorkspaceAtlasError, Works
 use fcb::search::{CaptureRequest, RawPath, ResourceBudget, RootId, SearchManifestId};
 use fcb::search::workspace::{RootGrant, WorkspaceCatalog, WorkspaceError, WorkspaceLimits, WorkspaceStage};
 use fcb::source::{CancelFlag, DetectedEncoding, SourceError};
+use fcb::source::ignore::repository::RuleLimits;
 use fcb::source::line_index::{LineNumber, LineWindowScanner, LineWindowStatus};
 use crate::{AppError, allocation, file_id, input, owner, workspace};
 use crate::output::{Output, OutputError, MAX_ENCODED_BYTES};
@@ -82,8 +83,8 @@ pub fn prepare(root: &Path, options: LegacyAtlasOptions, mut canceled: impl FnMu
     let grant = RootGrant::new(RootId::new(owner(), 1).map_err(|_| AppError::InvalidRange)?, RawPath::from_path(&root));
     let limits = WorkspaceLimits { max_files: options.max_files, max_total_path_bytes: 2 * 1024 * 1024,
         max_file_bytes: 0, max_source_bytes: 0, ..WorkspaceLimits::default() };
-    let mut catalog = WorkspaceCatalog::open(grant, SearchManifestId::new(owner(), 1).map_err(AppError::from)?,
-        file_id(), limits, false, &budget, allocation(30))?;
+    let mut catalog = WorkspaceCatalog::open_rule_aware(grant, SearchManifestId::new(owner(), 1).map_err(AppError::from)?,
+        file_id(), limits, RuleLimits::default(), &budget, [allocation(30), allocation(39)])?;
     let cancel = CancelFlag::new();
     while catalog.stage() == WorkspaceStage::Discovering {
         if canceled() { return Err(AppError::Canceled.into()); }
@@ -103,6 +104,7 @@ pub fn prepare(root: &Path, options: LegacyAtlasOptions, mut canceled: impl FnMu
     let mut out = Output::new(owner(), MAX_ENCODED_BYTES, &budget, allocation(1))?;
     out.literal("{\"schema\":\"fcb.host-atlas/1\",\"identity_scope\":\"response-local\",\"native_presented\":false,\"discovery_complete\":true,\"policy\":")?;
     out.quoted(catalog.policy_name())?;
+    workspace::rule_output::fields(&mut out, &catalog)?;
     out.literal(",\"metric\":")?; out.quoted(atlas.layout().options().metric().name())?;
     out.literal(",\"profile_semantics\":\"utf8-line-byte-length-neutral-class-not-syntax\",\"profile_retention\":\"summary-only-not-readable-source\",\"world\":{\"w\":4096,\"h\":4096},\"files\":[")?;
     let mut io = workspace::IoCounts::default();

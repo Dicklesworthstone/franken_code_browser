@@ -58,7 +58,7 @@ fn file_beyond_both_native_capture_ceilings_is_searchable_with_only_literal_rete
     file.write_all(b"needle\n").unwrap(); drop(file);
     let length = offset + 7;
     let atlas = fixture.atlas(64); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
-    assert_eq!(service.source_bytes_read(), 0, "catalog preparation is metadata-only");
+    assert_eq!(service.source_bytes_read(), 0, "catalog preparation reads no source payload");
     let response = service.search(&atlas, "needle\n", opts(), || false).unwrap();
     assert_eq!(response.exit_code(), EXIT_OK);
     let report = json(&response);
@@ -132,7 +132,8 @@ fn frozen_all_catalog_scope_survives_display_filter_and_live_new_files() {
     assert_eq!(report.get("retained_hits").number(), 2);
     assert!(report.get("search_complete").flag());
     assert_eq!(report.get("scope").text(), "catalogued-whole-files");
-    assert_eq!(report.get("discovery_policy").text(), "product-defaults/no-rule-files-v1");
+    assert!(report.get("discovery_policy").text().starts_with("repository-rules-v1:"));
+    assert!(report.get("rule_policy").get("scope_complete").flag());
     assert!(report.get("excluded_entries").number() >= 1);
 }
 

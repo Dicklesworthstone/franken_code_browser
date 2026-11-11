@@ -285,7 +285,7 @@ fn root_revocation_and_relative_symlink_swap_deny_new_capture_but_keep_prior_rea
 }
 
 #[test]
-fn metadata_policy_reads_no_rule_files_and_depth_or_path_limits_stay_partial() {
+fn repository_policy_reads_configuration_without_source_and_keeps_coverage_limits_partial() {
     let root = new_root();
     fs::write(root.join(".gitignore"), b"visible.rs\n").unwrap();
     fs::write(root.join("visible.rs"), ORIGINAL).unwrap();
@@ -293,9 +293,11 @@ fn metadata_policy_reads_no_rule_files_and_depth_or_path_limits_stay_partial() {
     fs::create_dir(root.join(".git")).unwrap(); fs::write(root.join(".git/objects"), ORIGINAL).unwrap();
     let mut session = CatalogSession::open(owner(71801), &root, || false).unwrap();
     let page = json(&session.page(1, || false).unwrap());
-    assert!(page.get("files").array().iter().any(|row| raw_path(row) == PathBuf::from("visible.rs")));
-    assert_eq!(page.get("policy").text(), "product-defaults/no-rule-files-v1");
-    assert!(page.get("discovery").get("excluded_entries").number() >= 2); limits(&page);
+    assert!(!page.get("files").array().iter().any(|row| raw_path(row) == PathBuf::from("visible.rs")));
+    assert_eq!(page.get("policy").text(), "repository-rules-v1");
+    assert_eq!(page.get("rule_policy").get("configuration_bytes_read").number(), 11);
+    assert_eq!(page.get("rule_policy").get("files_loaded").number(), 1);
+    assert!(page.get("discovery").get("excluded_entries").number() >= 3); limits(&page);
     for long_paths in [false, true] {
         let root = new_root(); fs::write(root.join("reachable.rs"), ORIGINAL).unwrap();
         let mut nested = root.clone();

@@ -89,6 +89,7 @@ struct AtlasProjectBrowserInfo: Sendable {
     let state: String
     let more, paused, complete: Bool
     let directories, excluded, symlinks, special, unavailable, cycles, pathLimited, depthLimited, queueRefused: UInt64
+    let policy: AtlasRepositoryPolicy
     func retains(_ page: UInt64) -> Bool { page >= firstRetained && page <= latest }
     var omissionCount: UInt64 {
         // Presentation only: never wrap counters from a very long discovery.
@@ -103,8 +104,10 @@ struct AtlasProjectBrowserInfo: Sendable {
         do {
             let w = try JSONDecoder().decode(Wire.self, from: data)
             let latest = w.latest_page.value, first = w.first_retained_page.value
+            let policy = try AtlasRepositoryPolicy.admit(name: w.policy, enabled: w.rule_files_enabled,
+                evidence: w.rule_policy, discoveryComplete: w.discovery_complete)
             guard owner > 0, w.owner.value == owner, w.identity_scope == "retained-session",
-                  w.ordering == "provisional-discovery-order", w.policy == "product-defaults/no-rule-files-v1",
+                  w.ordering == "provisional-discovery-order",
                   !w.native_presented, w.discovery_source_bytes_read.value == 0, w.discovery_source_read_calls.value == 0,
                   ["discovering", "paused", "complete", "partial"].contains(w.state),
                   w.paused == (w.state == "paused"), w.more == (w.state == "discovering" || w.state == "paused"),
@@ -129,7 +132,8 @@ struct AtlasProjectBrowserInfo: Sendable {
                 excluded: w.discovery.excluded_entries.value, symlinks: w.discovery.symlinks_not_followed.value,
                 special: w.discovery.special_objects.value, unavailable: w.discovery.unavailable.value,
                 cycles: w.discovery.cycles.value, pathLimited: w.discovery.path_limited.value,
-                depthLimited: w.discovery.depth_limited.value, queueRefused: w.discovery.queue_refused.value)
+                depthLimited: w.discovery.depth_limited.value, queueRefused: w.discovery.queue_refused.value,
+                policy: policy)
         } catch let error as AtlasProjectBrowserError { throw error }
         catch { throw AtlasProjectBrowserError.invalidResponse }
     }
@@ -145,6 +149,8 @@ struct AtlasProjectBrowserInfo: Sendable {
         let identity_scope, ordering, policy, state: String
         let native_presented, more, paused, discovery_complete: Bool
         let discovery_source_bytes_read, discovery_source_read_calls: AtlasCatalogNumber
+        let rule_files_enabled: Bool?
+        let rule_policy: AtlasRepositoryRuleEvidence?
         let limits: Limits
         let discovery: Discovery
     }
@@ -786,6 +792,7 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
         self.page = page; info = page.info
         notice = page.info.more ? "Project page ready. Continue discovers the next bounded batch."
             : (page.info.complete ? "Discovery finished for this project policy." : "Discovery finished with omissions; inspect the coverage counts.")
+        notice += " " + page.info.policy.summary
     }
     private func recover(_ lease: AtlasProjectBrowserSession) async -> Bool {
         guard !closed, session === lease else { return false }

@@ -14,6 +14,7 @@ private final class ProgressiveFinderFixture: @unchecked Sendable {
     let domain = UUID(), entered = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
     let firstMatchStep: UInt64
     let completeStep: UInt64
+    let repositoryRules: Bool
     let source = Array("captured\n".utf8)
     let digest = "af9f5d825b4a9e493a23ea438db355287c4320107eb98c3542879fef26b82628"
     private let lock = NSLock()
@@ -21,8 +22,8 @@ private final class ProgressiveFinderFixture: @unchecked Sendable {
     private var nextOwner: UInt64 = 40, nextReader: UInt64 = 100
     private var fault: String?, blocked = false, evicts = false
     private var log: [String] = []
-    init(firstMatchStep: UInt64 = 1, completeStep: UInt64 = 8) {
-        self.firstMatchStep = firstMatchStep; self.completeStep = completeStep
+    init(firstMatchStep: UInt64 = 1, completeStep: UInt64 = 8, repositoryRules: Bool = false) {
+        self.firstMatchStep = firstMatchStep; self.completeStep = completeStep; self.repositoryRules = repositoryRules
     }
     private func locked<T>(_ work: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return work() }
     var calls: [String] { locked { log } }
@@ -50,7 +51,7 @@ private final class ProgressiveFinderFixture: @unchecked Sendable {
         let ids: [UInt64] = found ? (evicts ? Array(fileID(session)...(fileID(session) + 255)) : [fileID(session)]) : []
         let hits = ids.map(row)
         let matches = found ? UInt64(evicts ? 257 : 1) : 0
-        return ["schema": "fcb.file-finder-session/1", "status": "ok", "command": command, "owner": String(owner),
+        var out: [String: Any] = ["schema": "fcb.file-finder-session/1", "status": "ok", "command": command, "owner": String(owner),
             "query_generation": String(session.generation), "revision": String(session.revision),
             "query_hex": hex(session.query.text.utf8), "mode": session.query.mode.wire,
             "case": session.query.matchCase ? "sensitive" : "unicode-lowercase", "key_version": "1",
@@ -73,6 +74,22 @@ private final class ProgressiveFinderFixture: @unchecked Sendable {
                 "excluded_entries": "0", "symlinks_not_followed": "0", "special_objects": "0", "unavailable": "0",
                 "cycles": "0", "path_limited": "0", "depth_limited": "0", "queue_refused": "0"],
             "hits": hits]
+        if repositoryRules {
+            out["policy"] = "repository-rules-v1"; out["rule_files_enabled"] = true
+            out["rule_policy"] = ruleEvidence(complete: terminal)
+        }
+        return out
+    }
+    func ruleEvidence(complete: Bool) -> [String: Any] {
+        ["observed_rules_complete": true, "scope_complete": complete,
+         "configuration_bytes_read": "11", "configuration_read_calls": "2", "configuration_checks": "4",
+         "files_read": "1", "files_loaded": "1", "rules_loaded": "1", "compiled_admission_bytes": "1024",
+         "match_steps": "37", "failed_files": "0", "unresolved_paths": "0", "diagnostics_omitted": "0",
+         "limits": ["max_file_bytes": "16384", "max_total_bytes": "65536", "max_files": "256",
+            "max_checks": "32768", "max_read_calls": "65536", "max_rules": "1024",
+            "max_pattern_bytes": "512", "max_compiled_bytes": "16777216",
+            "max_match_steps": "1000000", "max_total_match_steps": "64000000"],
+         "diagnostics": []]
     }
     private func readerHeader(_ owner: UInt64, raw: [UInt8], command: String) -> [String: Any] {
         ["schema": "fcb.reader-session/1", "status": "ok", "command": command, "owner": String(owner),
@@ -170,6 +187,10 @@ private final class ProgressiveFinderFixture: @unchecked Sendable {
                         case "case": out["case"] = "sensitive"
                         case "selection": out["selection"] = row(file + 1)
                         case "source-read": out["source_payload_read"] = false
+                        case "policy": out["policy"] = "other-policy"
+                        case "rule-evidence":
+                            var rules = out["rule_policy"] as! [String: Any]
+                            rules["configuration_bytes_read"] = "12"; out["rule_policy"] = rules
                         case "observation": out["source_observation"] = "metadata-snapshot"
                         case "reader-path": nested["path"] = path(Array("other.rs".utf8))
                         case "reader-generation": nested["accepted_query_generation"] = "1"
@@ -215,11 +236,63 @@ private final class ProgressiveFinderFixture: @unchecked Sendable {
     }
     @MainActor static func main() async throws {
         try boundedWireAndCoverage()
+        try repositoryRuleEvidence()
         try await autoProgressStopRecoveryAndSelection()
         await editsCoalesceAndRevokeOldRows()
         await exactRawCaptureAndForgedReceipts()
+        await ruleAwareCaptureReceipts()
         await closeDrainsGrantAndCapture()
         print("Progressive Quick Open wire, late results, selection, recovery, raw-reader and grant-lifetime regressions passed.")
+    }
+    private static func repositoryRuleEvidence() throws {
+        let fixture = ProgressiveFinderFixture(repositoryRules: true)
+        let query = try AtlasFileQuery(text: "rs")
+        let session = ProgressiveFinderFixture.Session(generation: 1, query: query)
+        let initial = fixture.header(session)
+        let accepted = try AtlasProgressiveFileReport.decode(fixture.json(initial), owner: 40,
+            generation: 1, query: query, command: "page")
+        precondition(accepted.policy.evidence?.filesLoaded == 1 && accepted.policy.evidence?.configurationBytesRead == 11)
+        precondition(accepted.summary.contains("Repository ignore rules"))
+        for fault in ["missing-evidence", "disabled", "scope", "complete", "bytes", "calls", "checks", "files",
+                      "rules", "work", "limits", "diagnostics", "traversal", "counter-format"] {
+            var bad = initial, rules = fixture.ruleEvidence(complete: false)
+            switch fault {
+            case "missing-evidence": bad.removeValue(forKey: "rule_policy")
+            case "disabled": bad["rule_files_enabled"] = false
+            case "scope": rules["scope_complete"] = true
+            case "complete": rules["failed_files"] = "1"
+            case "bytes": rules["configuration_bytes_read"] = "65537"
+            case "calls": rules["configuration_read_calls"] = "65537"
+            case "checks": rules["configuration_checks"] = "32769"
+            case "files": rules["files_loaded"] = "2"
+            case "rules": rules["rules_loaded"] = "1025"
+            case "work": rules["match_steps"] = "64000001"
+            case "limits":
+                var limits = rules["limits"] as! [String: String]; limits["max_total_bytes"] = "65537"; rules["limits"] = limits
+            case "diagnostics":
+                let diagnostic: [String: Any] = ["path": fixture.path(Array(".gitignore".utf8)), "code": "RULE_READ_FAILED"]
+                rules["diagnostics"] = Array(repeating: diagnostic, count: 33)
+            case "traversal":
+                rules["observed_rules_complete"] = false; rules["failed_files"] = "1"
+                let diagnostic: [String: Any] = ["path": fixture.path(Array("../.gitignore".utf8)), "code": "RULE_READ_FAILED"]
+                rules["diagnostics"] = [diagnostic]
+            default: rules["configuration_bytes_read"] = "011"
+            }
+            if fault != "missing-evidence" { bad["rule_policy"] = rules }
+            reject("forged repository-policy evidence admitted: \(fault)") {
+                _ = try AtlasProgressiveFileReport.decode(fixture.json(bad), owner: 40, generation: 1, query: query, command: "page")
+            }
+        }
+        var terminal = session; terminal.revision = 129; terminal.replay = 113
+        var partial = fixture.header(terminal), rules = fixture.ruleEvidence(complete: false)
+        rules["observed_rules_complete"] = false; rules["failed_files"] = "1"
+        let diagnostic: [String: Any] = ["path": fixture.path(Array("nested/.gitignore".utf8)), "code": "RULE_UNSUPPORTED_PATTERN"]
+        rules["diagnostics"] = [diagnostic]
+        partial["rule_policy"] = rules; partial["state"] = "partial"
+        partial["discovery_complete"] = false; partial["search_complete"] = false
+        var discovery = partial["discovery"] as! [String: String]; discovery["unavailable"] = "1"; partial["discovery"] = discovery
+        let report = try AtlasProgressiveFileReport.decode(fixture.json(partial), owner: 40, generation: 1, query: query, command: "page")
+        precondition(!report.complete && report.summary.contains("nested/.gitignore: unsupported ignore pattern"))
     }
     private static func boundedWireAndCoverage() throws {
         let fixture = ProgressiveFinderFixture()
@@ -350,7 +423,7 @@ private final class ProgressiveFinderFixture: @unchecked Sendable {
         precondition(capture?.reader.page?.text == "ured\n" && !fixture.calls.contains("LABEL-OPEN"))
         capture?.reader.close()
         for fault in ["revision", "generation", "query", "mode", "case", "selection", "source-read",
-                      "observation", "reader-path", "reader-generation", "lost"] {
+                      "observation", "reader-path", "reader-generation", "policy", "lost"] {
             let fixture = ProgressiveFinderFixture(), model = await started(fixture)
             fixture.corrupt(fault)
             model.openSelected(readerTransport: fixture.readerTransport) { _ in preconditionFailure("forged reader receipt admitted: \(fault)") }
@@ -358,6 +431,28 @@ private final class ProgressiveFinderFixture: @unchecked Sendable {
             precondition(!fixture.calls.contains("LABEL-OPEN"))
             model.close()
         }
+    }
+    @MainActor private static func ruleAwareCaptureReceipts() async {
+        let fixture = ProgressiveFinderFixture(repositoryRules: true), model = await started(fixture)
+        precondition(model.report?.policy.evidence?.filesLoaded == 1)
+        var capture: AtlasProgressiveFileCapture?
+        model.openSelected(readerTransport: fixture.readerTransport) { capture = $0 }
+        await wait("rule-aware source capture did not finish") { !model.busy }
+        precondition(capture?.reader.page?.text == "captured\n")
+        precondition(!fixture.calls.contains("LABEL-OPEN"))
+        model.close(); capture?.reader.close()
+
+        // Both receipts are individually well-formed; different configuration
+        // evidence must still fail the selected report's identity check.
+        let changed = ProgressiveFinderFixture(repositoryRules: true), protected = await started(changed)
+        changed.corrupt("rule-evidence")
+        protected.openSelected(readerTransport: changed.readerTransport) { _ in
+            preconditionFailure("source handoff accepted different rule evidence than its selected result")
+        }
+        await wait("changed-rule receipt did not retire its reader") {
+            !protected.busy && changed.calls.contains("reader-close:100")
+        }
+        precondition(!changed.calls.contains("LABEL-OPEN")); protected.close()
     }
     @MainActor private static func closeDrainsGrantAndCapture() async {
         final class Grant { }

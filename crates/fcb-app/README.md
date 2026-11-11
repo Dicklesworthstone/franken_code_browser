@@ -163,12 +163,17 @@ are not followed and special objects are not read. Exclusion counts are counts
 of observed excluded entries; an excluded directory may contain an unknown
 number of descendants.
 
-**Nested `.gitignore` and `.fcbignore` files are not loaded as configuration in
-this bounded lane.** Those files may still be ordinary source members searched
-for literal text. The metadata walker never reads them while determining
-membership, so repository-provided rule files cannot cause hidden source reads
-or an unbounded growing rule set. This is not a claim of Git ignore compatibility
-for the workspace CLI.
+Use `--respect-ignores` with a workspace command to select the bounded
+`repository-rules-v1` engine also used by native browsing, filename finding,
+project search and atlas membership. It loads nested `.gitignore` and
+`.fcbignore` files with separate configuration byte/read/work budgets; the
+source-payload counters do not hide those reads. JSON includes `rule_policy`
+limits, counters and diagnostics. Unsupported, unreadable or over-limit rules
+leave affected paths unknown and coverage partial, rather than guessing their
+membership. `--respect-ignores` and `--include-excluded` are mutually exclusive.
+`fcb snapshot save` accepts the same policy option and retains the rule evidence
+with the saved catalog. Without the option, these CLI routes retain their
+named policy that does not load repository rules as configuration.
 
 Workspace admission defaults and CLI maximums for the indexed-capture strategy:
 

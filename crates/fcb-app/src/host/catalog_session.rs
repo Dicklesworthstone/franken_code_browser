@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
-//! Progressive, metadata-only project browsing. One worker operation advances
+//! Progressive project browsing with bounded repository-ignore observations.
+//! One worker operation advances
 //! the existing bounded walker by one batch; no full-tree vector, atlas layout,
-//! source capture, rule-file read, or runtime is required before the first page.
+//! source capture or runtime is required before the first page. Configuration
+//! reads have separate admission, counters and limits from source-payload I/O.
 //! Four immutable pages remain addressable independently of total files visited.
 //! Discovery order is provisional, not a globally sorted namespace snapshot.
 //!
@@ -19,10 +21,9 @@ pub use document_links::{CatalogDocumentLinkSelection, CatalogReaderAcceptance, 
 use std::{collections::VecDeque, fs, mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, FileId};
 use fcb::search::{ResourceAllocationId, ResourceBudget, RootId};
-use fcb::source::{CancelFlag, DirectoryId, NormalizedPath, RawPath, RootGrant,
-    SourceError, SymlinkPolicy};
+use fcb::source::{CancelFlag, DirectoryId, NormalizedPath, RawPath, RootGrant, SourceError};
 use fcb::source::discovery::{BoundedDiscovery, DiscoveryAggregate, DiscoveryKind, DiscoveryLimits};
-use fcb::source::ignore::IgnoreMatcher;
+use fcb::source::ignore::repository::{RepositoryRules, RuleError, RuleLimits, RULE_POLICY_NAME};
 use fcb_core::ResourceLease;
 use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES, input, workspace};
 use crate::output::{Output, OutputError};
@@ -48,7 +49,7 @@ const FIRST_WINDOW_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatalogSessionError {
-    App(AppError), Source(SourceError), Reader(ReaderSessionError),
+    App(AppError), Source(SourceError), Rules(RuleError), Reader(ReaderSessionError),
     InvalidLimits, ForeignOwner, StalePage, MissingFile, NoMorePages,
     StaleReaderReceipt, ReaderReceiptMismatch, OriginCaptureChanged, UnsupportedDocumentLink,
     LinkTargetNotRetained, AmbiguousLinkTarget,
@@ -57,7 +58,7 @@ pub enum CatalogSessionError {
 impl CatalogSessionError {
     pub fn is_canceled(self) -> bool {
         match self {
-            Self::Canceled | Self::Source(SourceError::Canceled)
+            Self::Canceled | Self::Source(SourceError::Canceled) | Self::Rules(RuleError::Source(SourceError::Canceled))
                 | Self::Reader(ReaderSessionError::Canceled | ReaderSessionError::Source(SourceError::Canceled)) => true,
             Self::App(error) => error.is_canceled(),
             Self::Reader(ReaderSessionError::Host(HostError::App(error)) | ReaderSessionError::App(error)) => error.is_canceled(),
@@ -69,7 +70,7 @@ impl CatalogSessionError {
 impl std::fmt::Display for CatalogSessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::App(e) => write!(f, "{e}"), Self::Source(e) => write!(f, "{e}"), Self::Reader(e) => write!(f, "{e}"),
+            Self::App(e) => write!(f, "{e}"), Self::Source(e) => write!(f, "{e}"), Self::Rules(e) => write!(f, "{e}"), Self::Reader(e) => write!(f, "{e}"),
             Self::InvalidLimits => f.write_str("CATALOG_SESSION_INVALID_LIMITS"),
             Self::ForeignOwner => f.write_str("CATALOG_SESSION_FOREIGN_OWNER"),
             Self::StalePage => f.write_str("CATALOG_SESSION_STALE_PAGE"),
@@ -89,6 +90,7 @@ impl std::fmt::Display for CatalogSessionError {
 impl std::error::Error for CatalogSessionError {}
 impl From<AppError> for CatalogSessionError { fn from(e: AppError) -> Self { Self::App(e) } }
 impl From<SourceError> for CatalogSessionError { fn from(e: SourceError) -> Self { Self::Source(e) } }
+impl From<RuleError> for CatalogSessionError { fn from(e: RuleError) -> Self { Self::Rules(e) } }
 impl From<ReaderSessionError> for CatalogSessionError { fn from(e: ReaderSessionError) -> Self { Self::Reader(e) } }
 impl From<OutputError> for CatalogSessionError { fn from(e: OutputError) -> Self { Self::App(e.into()) } }
 
@@ -102,6 +104,9 @@ pub struct CatalogSession {
     requested_root: RawPath,
     root_identity: DirectoryId,
     discovery: Option<BoundedDiscovery>,
+    // Preserve admitted rule observations/diagnostics when traversal ends;
+    // retiring the cursor must not erase the evidence behind partial coverage.
+    repository_rules: Option<RepositoryRules>,
     aggregate: DiscoveryAggregate,
     pages: VecDeque<CatalogPage>,
     latest_page: u64,
@@ -116,6 +121,8 @@ pub struct CatalogSession {
 }
 impl CatalogSession {
     /// Open a canonical, nonsymlink root and publish exactly one walker batch.
+    /// Native browsing honors the shared supported .gitignore/.fcbignore policy;
+    /// opening authorizes bounded configuration reads, never source capture.
     /// A page containing only directories/exclusions can have no file rows and
     /// still have more=true. That is progress, never proof of an empty project.
     pub fn open(owner: ArenaOwnerId, root: &Path, mut canceled: impl FnMut() -> bool)
@@ -139,14 +146,15 @@ impl CatalogSession {
         let grant = RootGrant::new(RootId::new(owner, 1).map_err(|_| CatalogSessionError::IdentityExhausted)?, RawPath::from_path(&root));
         let limits = DiscoveryLimits::new(1, WALK_DEPTH, MAX_CATALOG_PATH_BYTES as u32,
             MAX_CATALOG_PAGE_ENTRIES as u32, 64 * 1024, WALK_QUEUE)?;
-        let discovery = BoundedDiscovery::open_metadata_only(grant.clone(), SymlinkPolicy::DisallowAll,
-            limits, IgnoreMatcher::product_defaults())?;
+        let discovery = BoundedDiscovery::open_rule_aware(grant.clone(), limits,
+            RuleLimits::default(), &budget, allocation(2)?)?;
         let mut pages = VecDeque::new();
         pages.try_reserve_exact(MAX_CATALOG_RETAINED_PAGES).map_err(|_| AppError::Admission)?;
         if pages.capacity() > MAX_CATALOG_RETAINED_PAGES { return Err(AppError::Admission.into()); }
-        let mut session = Self { grant, requested_root, root_identity, discovery: Some(discovery), aggregate: DiscoveryAggregate::default(),
+        let mut session = Self { grant, requested_root, root_identity, discovery: Some(discovery), repository_rules: None,
+            aggregate: DiscoveryAggregate::default(),
             pages, latest_page: 0, catalogued_files: 0, next_link_file: FIRST_CATALOG_LINK_FILE_ID, complete: false, paused: false,
-            reader_receipts: document_links::CatalogReaderReceipts::default(), next_allocation: 2, budget, _lease: lease };
+            reader_receipts: document_links::CatalogReaderReceipts::default(), next_allocation: 3, budget, _lease: lease };
         session.consume_page(&mut canceled)?;
         session.validate_active()?;
         check(&mut canceled)?;
@@ -155,6 +163,18 @@ impl CatalogSession {
 
     pub fn owner(&self) -> ArenaOwnerId { self.grant.owner() }
     pub fn grant(&self) -> &RootGrant { &self.grant }
+
+    fn rule_policy(&self) -> Option<&RepositoryRules> {
+        self.repository_rules.as_ref().or_else(|| self.discovery.as_ref().and_then(BoundedDiscovery::repository_rules))
+    }
+    fn retire_discovery(&mut self) {
+        self.repository_rules = self.discovery.take().and_then(BoundedDiscovery::into_repository_rules);
+    }
+    fn encode_rule_policy(&self, out: &mut Output) -> Result<(), OutputError> {
+        // Eight worst-case diagnostic paths fit alongside a full catalog page
+        // in the existing response envelope. The omitted count remains exact.
+        workspace::rule_output::policy_fields(out, true, self.rule_policy(), self.complete, 8)
+    }
 
     /// Root identity is pinned across a long-lived iterator. This detects an
     /// observed replacement/root symlink, not hostile ancestor races; those
@@ -318,7 +338,7 @@ impl CatalogSession {
         let walker_complete = discovery.is_complete();
         let batch = match batch {
             Ok(batch) => batch,
-            Err(error) => { self.discovery = None; self.complete = false; self.paused = false; return Err(error.into()); }
+            Err(error) => { self.retire_discovery(); self.complete = false; self.paused = false; return Err(error.into()); }
         };
         let more = batch.as_ref().is_some_and(|batch| batch.more());
         let mut path_bytes = 0;
@@ -333,8 +353,9 @@ impl CatalogSession {
         }
         let a = self.aggregate;
         self.complete = !more && walker_complete && a.unavailable == 0 && a.cycles == 0
-            && a.depth_limited == 0 && a.path_limited == 0 && a.queue_refused == 0;
-        if !more { self.discovery = None; }
+            && a.depth_limited == 0 && a.path_limited == 0 && a.queue_refused == 0
+            && self.rule_policy().is_some_and(|rules| rules.stats().is_complete());
+        if !more { self.retire_discovery(); }
         self.paused = false;
         if self.pages.len() == MAX_CATALOG_RETAINED_PAGES { self.pages.pop_front(); }
         self.pages.push_back(CatalogPage { id, files, path_bytes });
@@ -348,7 +369,10 @@ impl CatalogSession {
         out.literal("{\"schema\":\"fcb.project-catalog-session/1\",\"status\":\"ok\",\"command\":")?;
         out.quoted(command)?;
         out.literal(",\"owner\":")?; out.integer(self.owner().get())?;
-        out.literal(",\"identity_scope\":\"retained-session\",\"ordering\":\"provisional-discovery-order\",\"policy\":\"product-defaults/no-rule-files-v1\",\"native_presented\":false,\"discovery_source_bytes_read\":\"0\",\"discovery_source_read_calls\":\"0\",\"state\":")?;
+        out.literal(",\"identity_scope\":\"retained-session\",\"ordering\":\"provisional-discovery-order\",\"policy\":")?;
+        out.quoted(RULE_POLICY_NAME)?;
+        self.encode_rule_policy(&mut out)?;
+        out.literal(",\"native_presented\":false,\"discovery_source_bytes_read\":\"0\",\"discovery_source_read_calls\":\"0\",\"state\":")?;
         out.quoted(if self.complete { "complete" } else if self.discovery.is_none() { "partial" }
             else if self.paused { "paused" } else { "discovering" })?;
         out.literal(",\"more\":")?; out.boolean(self.discovery.is_some())?;

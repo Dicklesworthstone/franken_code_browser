@@ -426,6 +426,8 @@ impl RetainedAtlasSearch {
         // Search summaries separately echo the immutable query admission scope.
         atlas.encode_scope(&mut out).map_err(AtlasSearchError::from)?;
         out.literal(",\"catalogued_files\":")?; out.integer(atlas.atlas().file_count() as u64)?;
+        out.literal(",\"discovery_policy\":")?; out.quoted(atlas.atlas().catalog().policy_name())?;
+        crate::workspace::rule_output::fields(&mut out, atlas.atlas().catalog())?;
         Ok(out)
     }
     fn finish(&mut self, atlas: &AtlasSession, out: Output, partial: bool,

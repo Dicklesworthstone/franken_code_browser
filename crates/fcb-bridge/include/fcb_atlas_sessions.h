@@ -17,7 +17,8 @@ extern "C" {
  *
  * At most four live/initializing/retiring atlas cells. Handles are opaque, not
  * pointers, never reused in this loaded library, and distinct from reader IDs.
- * Zero from create means refusal. Open is metadata-only, once per handle;
+ * Zero from create means refusal. Open is once per handle and reads no source
+ * payload. Bounded .gitignore/.fcbignore reads have separate policy receipts;
  * max_files is 1..20000 (4096 recommended), with separate shared path/page caps.
  * Partial discovery remains usable and explicitly incomplete. Initial viewport
  * is 1024x768 points at scale 1. Resize creates a new display generation.

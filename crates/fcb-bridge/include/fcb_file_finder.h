@@ -7,10 +7,11 @@
 extern "C" {
 #endif
 
-/* Progressive metadata-only filename/path queries, without a global file-count
- * cutoff. The product-defaults/no-rule-files-v1 policy and bounded discovery
- * omissions are reported explicitly. All calls except create/cancel are worker
- * operations; no call presents pixels or performs an implicit source read.
+/* Progressive filename/path queries, without a global file-count cutoff.
+ * The repository-rules-v1 policy reads bounded nested ignore configuration;
+ * configuration I/O, policy failures and discovery omissions are reported
+ * separately from source-payload reads. All calls except create/cancel are
+ * worker operations; no call presents pixels or implicitly captures source.
  *
  * A handle owns one immutable query. Query edits require a new handle and a new
  * scan from the root. There are at most four live or retiring finder handles.

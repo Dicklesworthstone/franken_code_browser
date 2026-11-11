@@ -13,6 +13,8 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
     let emptyFirst: Bool
     let completeFirst: Bool
     let fragmentStatus: String
+    let repositoryRules: Bool
+    let ruleFailure: String?
     private let lock = NSLock()
     private var sessions: [UInt64: Session] = [:], readers: [UInt64: [UInt8]] = [:]
     private var receipts: [UInt64: (page: UInt64, file: UInt64)] = [:]
@@ -21,10 +23,13 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
     private var nextDirectFile: UInt64 = 1 << 63
     private var fault: String?, blocked = false
     private var log: [String] = []
-    init(emptyFirst: Bool = false, completeFirst: Bool = false, fragmentStatus: String = "unsupported") {
+    init(emptyFirst: Bool = false, completeFirst: Bool = false, fragmentStatus: String = "unsupported",
+        repositoryRules: Bool = false, ruleFailure: String? = nil) {
         precondition(["none", "document-start", "resolved", "missing-heading", "ambiguous",
             "limited", "unsupported", "invalid"].contains(fragmentStatus))
+        precondition(ruleFailure == nil || repositoryRules)
         self.emptyFirst = emptyFirst; self.completeFirst = completeFirst; self.fragmentStatus = fragmentStatus
+        self.repositoryRules = repositoryRules; self.ruleFailure = ruleFailure
     }
     private func locked<T>(_ work: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return work() }
     var calls: [String] { locked { log } }
@@ -69,17 +74,31 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
     func row(_ page: UInt64) -> [String: Any] {
         ["file_id": String(page - (emptyFirst ? 1 : 0)), "path": path(raw(page)), "observed_bytes": "4096"]
     }
+    private func ruleEvidence(scopeComplete: Bool) -> [String: Any] {
+        let diagnostics: [[String: Any]] = ruleFailure.map {
+            [["path": path(Array("nested/.gitignore".utf8)), "code": $0]]
+        } ?? []
+        return ["observed_rules_complete": ruleFailure == nil, "scope_complete": scopeComplete,
+            "configuration_bytes_read": "24", "configuration_read_calls": "2", "configuration_checks": "6",
+            "files_read": "2", "files_loaded": ruleFailure == nil ? "2" : "1", "rules_loaded": "2",
+            "compiled_admission_bytes": "256", "match_steps": "12", "failed_files": ruleFailure == nil ? "0" : "1",
+            "unresolved_paths": "0", "diagnostics_omitted": "0", "diagnostics": diagnostics,
+            "limits": ["max_file_bytes": "16384", "max_total_bytes": "65536", "max_files": "256",
+                "max_checks": "32768", "max_read_calls": "65536", "max_rules": "1024", "max_pattern_bytes": "512",
+                "max_compiled_bytes": "16777216", "max_match_steps": "1000000", "max_total_match_steps": "64000000"]]
+    }
     func header(_ owner: UInt64 = 40, command: String = "info", latest: UInt64 = 1, paused: Bool = false) -> [String: Any] {
         let first = latest > 4 ? latest - 3 : 1
         let pages = Array(first...latest), files = pages.filter { !(emptyFirst && $0 == 1) }
         let count = latest - (emptyFirst ? 1 : 0)
-        let complete = completeFirst && latest == 1 && !paused
-        return ["schema": "fcb.project-catalog-session/1", "status": "ok", "command": command, "owner": String(owner),
+        let partialRules = ruleFailure != nil
+        let complete = completeFirst && latest == 1 && !paused && !partialRules
+        var out: [String: Any] = ["schema": "fcb.project-catalog-session/1", "status": "ok", "command": command, "owner": String(owner),
             "identity_scope": "retained-session", "ordering": "provisional-discovery-order",
             "policy": "product-defaults/no-rule-files-v1", "native_presented": false,
             "discovery_source_bytes_read": "0", "discovery_source_read_calls": "0",
-            "state": paused ? "paused" : (complete ? "complete" : "discovering"),
-            "more": !complete, "paused": paused, "discovery_complete": complete,
+            "state": partialRules ? "partial" : (paused ? "paused" : (complete ? "complete" : "discovering")),
+            "more": !complete && !partialRules, "paused": paused && !partialRules, "discovery_complete": complete,
             "latest_page": String(latest), "first_retained_page": String(first), "retained_pages": String(pages.count),
             "retained_files": String(files.count), "retained_path_bytes": String(files.reduce(0) { $0 + raw($1).count }),
             "catalogued_files": String(count),
@@ -88,6 +107,12 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
             "discovery": ["files": String(count), "directories": String(latest), "excluded_entries": "0",
                 "symlinks_not_followed": "0", "special_objects": "0", "unavailable": "0", "cycles": "0",
                 "path_limited": "0", "depth_limited": "0", "queue_refused": "0"]]
+        if repositoryRules {
+            out["policy"] = "repository-rules-v1"
+            out["rule_files_enabled"] = true
+            out["rule_policy"] = ruleEvidence(scopeComplete: complete)
+        }
+        return out
     }
     func page(_ id: UInt64 = 1, owner: UInt64 = 40, latest: UInt64 = 1, paused: Bool = false) -> [String: Any] {
         var out = header(owner, command: "page", latest: latest, paused: paused)
@@ -443,6 +468,8 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
     }
     @MainActor static func main() async throws {
         try boundedWireAndCoverage()
+        try repositoryRuleWireAndCoverage()
+        try await repositoryRuleFailuresKeepRowsAndDirtyHints()
         try await emptyPagesLostRepliesPauseAndEviction()
         try await exactRawFileCaptureAndForgedReceipts()
         try await closeDrainsGrantAndLateCapture()
@@ -465,7 +492,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         try await qualifiedHeadingOffsetStartsReaderAndHistoryAtCapturedAnchor()
         try await typedFragmentFallbacksKeepReadableTargets()
         try await malformedQualifiedHeadingReceiptsNeverPublishTargets()
-        print("Progressive project pages, staged refresh, recovery, raw-file capture, page-independent document-link proofs, independent targets and grant-lifetime regressions passed.")
+        print("Progressive project pages, repository-rule coverage, staged refresh, recovery, raw-file capture, page-independent document-link proofs, independent targets and grant-lifetime regressions passed.")
     }
     private static func boundedWireAndCoverage() throws {
         let f = ProjectBrowserFixture()
@@ -509,6 +536,107 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         var unordered = f.page(2, latest: 2)
         unordered["files"] = [f.row(2), f.row(1)]
         reject("non-increasing file IDs were accepted") { _ = try AtlasProjectBrowserPage.decode(f.json(unordered), owner: 40) }
+    }
+    private static func repositoryRuleWireAndCoverage() throws {
+        // The production page/info decoders accept old service receipts, but
+        // new policy claims require evidence even when the page has no rows.
+        let legacy = ProjectBrowserFixture()
+        let old = try AtlasProjectBrowserPage.decode(legacy.json(legacy.page()), owner: 40)
+        precondition(old.info.policy.name == "product-defaults/no-rule-files-v1" && old.info.policy.evidence == nil)
+        var explicitLegacy = legacy.header()
+        explicitLegacy["rule_files_enabled"] = false; explicitLegacy["rule_policy"] = NSNull()
+        let legacyInfo = try AtlasProjectBrowserInfo.decode(legacy.json(explicitLegacy), owner: 40)
+        precondition(legacyInfo.policy == old.info.policy)
+
+        let progressive = ProjectBrowserFixture(repositoryRules: true)
+        let first = try AtlasProjectBrowserPage.decode(progressive.json(progressive.page()), owner: 40, page: 1)
+        let evidence = first.info.policy.evidence!
+        precondition(first.info.policy.name == "repository-rules-v1" && first.info.more && !first.info.complete)
+        precondition(evidence.observedRulesComplete && !evidence.scopeComplete
+            && evidence.configurationBytesRead == 24 && evidence.configurationReadCalls == 2
+            && evidence.configurationChecks == 6 && evidence.filesRead == 2 && evidence.filesLoaded == 2
+            && evidence.rulesLoaded == 2 && evidence.compiledAdmissionBytes == 256 && evidence.matchSteps == 12)
+        precondition(first.files[0].rawPath == progressive.raw(1) && evidence.diagnostics.isEmpty)
+        let paused = try AtlasProjectBrowserInfo.decode(progressive.json(progressive.header(command: "stop", paused: true)),
+            owner: 40, command: "stop")
+        precondition(paused.paused && paused.more && !paused.complete && paused.policy == first.info.policy)
+
+        let complete = ProjectBrowserFixture(completeFirst: true, repositoryRules: true)
+        let finished = try AtlasProjectBrowserPage.decode(complete.json(complete.page()), owner: 40)
+        let info = try AtlasProjectBrowserInfo.decode(complete.json(complete.header()), owner: 40)
+        precondition(finished.info.complete && !finished.info.more && info.policy == finished.info.policy
+            && info.policy.evidence?.scopeComplete == true && info.omissionCount == 0)
+        let empty = ProjectBrowserFixture(emptyFirst: true, completeFirst: true, repositoryRules: true)
+        let emptyPage = try AtlasProjectBrowserPage.decode(empty.json(empty.page()), owner: 40)
+        precondition(emptyPage.files.isEmpty && emptyPage.info.complete && emptyPage.info.policy.evidence?.scopeComplete == true)
+
+        for fault in ["unknown-policy", "legacy-with-rules", "missing-enabled", "disabled", "missing-evidence",
+                      "scope-progressive", "scope-incomplete", "failed-complete", "configuration-bytes",
+                      "configuration-type", "rule-limits", "source-bytes", "source-calls"] {
+            var bad = complete.page(), proof = bad["rule_policy"] as! [String: Any]
+            switch fault {
+            case "unknown-policy": bad["policy"] = "repository-rules-invented"
+            case "legacy-with-rules": bad["policy"] = "product-defaults/no-rule-files-v1"
+            case "missing-enabled": bad.removeValue(forKey: "rule_files_enabled")
+            case "disabled": bad["rule_files_enabled"] = false
+            case "missing-evidence": bad["rule_policy"] = NSNull()
+            case "scope-progressive":
+                bad["state"] = "discovering"; bad["more"] = true; bad["discovery_complete"] = false
+            case "scope-incomplete": proof["scope_complete"] = false; bad["rule_policy"] = proof
+            case "failed-complete":
+                proof["failed_files"] = "1"; proof["observed_rules_complete"] = false
+                proof["scope_complete"] = false; bad["rule_policy"] = proof
+            case "configuration-bytes": proof["configuration_bytes_read"] = "65537"; bad["rule_policy"] = proof
+            case "configuration-type": proof["configuration_read_calls"] = 2; bad["rule_policy"] = proof
+            case "rule-limits":
+                var limits = proof["limits"] as! [String: String]
+                limits["max_total_bytes"] = "131072"; proof["limits"] = limits; bad["rule_policy"] = proof
+            case "source-bytes": bad["discovery_source_bytes_read"] = "1"
+            default: bad["discovery_source_read_calls"] = "1"
+            }
+            reject("browser page trusted invalid rule coverage: \(fault)") {
+                _ = try AtlasProjectBrowserPage.decode(complete.json(bad), owner: 40)
+            }
+            bad["command"] = "info"
+            reject("browser recovery info trusted invalid rule coverage: \(fault)") {
+                _ = try AtlasProjectBrowserInfo.decode(complete.json(bad), owner: 40)
+            }
+        }
+    }
+    @MainActor private static func repositoryRuleFailuresKeepRowsAndDirtyHints() async throws {
+        for failure in ["RULE_UNSUPPORTED_PATTERN", "RULE_READ_FAILED"] {
+            let f = ProjectBrowserFixture(completeFirst: true, repositoryRules: true, ruleFailure: failure)
+            let model = AtlasProjectBrowserModel(transport: f.transport)
+            try await model.open(root: "/repo", accessLease: nil)
+            let page = model.page!, policy = page.info.policy, evidence = policy.evidence!
+            precondition(model.currentPage && model.canOperate && !model.canContinue && page.info.state == "partial")
+            precondition(!page.info.complete && !page.info.more && page.info.omissionCount == 0
+                && !evidence.observedRulesComplete && !evidence.scopeComplete && evidence.failedFiles == 1)
+            precondition(evidence.diagnostics.count == 1 && evidence.diagnostics[0].code == failure
+                && evidence.diagnostics[0].path.hex == f.hex(Array("nested/.gitignore".utf8)))
+            precondition(policy.summary.contains("affected paths were omitted")
+                && policy.summary.contains(failure == "RULE_UNSUPPORTED_PATTERN"
+                    ? "unsupported ignore pattern" : "ignore file could not be read"))
+            // General directory omissions can be zero while rule scope is
+            // unresolved. That exhausted page must not acknowledge dirty hints.
+            var changes = AtlasProjectChangeState()
+            let watcher = UUID(), project = UUID()
+            changes.bind(watcher)
+            changes.receive(AtlasProjectChangeDelivery(generation: watcher, monitoring: true, hints: .contentsChanged))
+            changes.beginDiscovery(project: project)
+            changes.reportDiscovery(project: project, complete: page.info.complete, more: page.info.more,
+                omissions: page.info.omissionCount, pendingChanges: false)
+            precondition(changes.hints.contains(.contentsChanged))
+            // Rule failures do not revoke qualified rows elsewhere in the
+            // project. Reader receipts and replayed info carry the same policy.
+            let capture = try await model.openFile(page.files[0], from: page, readerTransport: f.readerTransport)
+            precondition(capture.reader.page?.text == "captured\n" && model.info?.policy == policy)
+            model.reload(); await wait("partial rule coverage did not survive page recovery") { !model.busy }
+            precondition(model.currentPage && model.info?.policy == policy && model.info?.complete == false)
+            model.close()
+            precondition(capture.reader.canPin && !f.calls.contains("LABEL-OPEN"))
+            capture.reader.close()
+        }
     }
     @MainActor private static func emptyPagesLostRepliesPauseAndEviction() async throws {
         let failed = ProjectBrowserFixture(), recovered = AtlasProjectBrowserModel(transport: failed.transport)

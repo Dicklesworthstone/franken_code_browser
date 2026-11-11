@@ -34,6 +34,7 @@ pub fn prepare(root: &Path, max_files: usize, mut canceled: impl FnMut() -> bool
     out.boolean(catalog.discovery_complete())?;
     out.literal(",\"catalogued_files\":")?; out.integer(catalog.entries().len() as u64)?;
     out.literal(",\"policy\":")?; out.quoted(catalog.policy_name())?;
+    crate::workspace::rule_output::fields(&mut out, catalog)?;
     out.literal(",\"world\":{\"w\":4096,\"h\":4096},\"files\":[")?;
     for (ordinal, entry) in catalog.entries().iter().enumerate() {
         if canceled() { return Err(AtlasSessionError::Canceled); }

@@ -16,6 +16,7 @@ use fcb::map::workspace::retained::RetainedWorkspaceAtlas;
 use fcb::search::{QueryGeneration, RawPath, ResourceAllocationId, ResourceBudget, RootId, SearchManifestId};
 use fcb::search::workspace::{RootGrant, WorkspaceCatalog, WorkspaceError, WorkspaceLimits, WorkspaceStage};
 use fcb::source::CancelFlag;
+use fcb::source::ignore::repository::RuleLimits;
 use fcb_core::{PresentedFrameId, ResourceLease};
 use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES, input, workspace};
 use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
@@ -138,8 +139,9 @@ impl AtlasSession {
         let grant = RootGrant::new(RootId::new(owner, 1).map_err(|_| AtlasSessionError::IdentityExhausted)?, RawPath::from_path(&root));
         let limits = WorkspaceLimits { max_files: options.max_files, max_file_bytes: 0, max_source_bytes: 0,
             ..WorkspaceLimits::default() };
-        let mut catalog = WorkspaceCatalog::open(grant, SearchManifestId::new(owner, 1).map_err(AppError::from)?,
-            FileId::new(owner, 1).map_err(|_| AtlasSessionError::IdentityExhausted)?, limits, false, &budget, allocation(1)?)?;
+        let mut catalog = WorkspaceCatalog::open_rule_aware(grant, SearchManifestId::new(owner, 1).map_err(AppError::from)?,
+            FileId::new(owner, 1).map_err(|_| AtlasSessionError::IdentityExhausted)?, limits,
+            RuleLimits::default(), &budget, [allocation(1)?, allocation(5)?])?;
         while catalog.stage() == WorkspaceStage::Discovering {
             check(&mut canceled)?;
             catalog.step(&CancelFlag::new())?;
@@ -518,6 +520,8 @@ impl AtlasSession {
         out.literal(",\"layout_revision\":")?; out.integer(self.view().layout().revision().get())?;
         out.literal(",\"discovery_complete\":")?; out.boolean(self.view().discovery_complete())?;
         out.literal(",\"catalogued_files\":")?; out.integer(self.view().file_count() as u64)?;
+        out.literal(",\"discovery_policy\":")?; out.quoted(self.atlas.catalog().policy_name())?;
+        workspace::rule_output::fields(&mut out, self.atlas.catalog())?;
         self.encode_scope(&mut out)?;
         out.literal(",\"retention\":\"frozen-catalog-and-spatial-index\"")?;
         Ok(out)
