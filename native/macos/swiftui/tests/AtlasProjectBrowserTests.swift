@@ -10,6 +10,8 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
     let digest = "af9f5d825b4a9e493a23ea438db355287c4320107eb98c3542879fef26b82628"
     let headingSource = Array("preface\n\n## Details\n\nTarget.\n".utf8)
     let headingDigest = "12e28cc36046d8f48dd90d5364790e2d5d591c7c9b1658dcd636125a631bd59d"
+    let lineSource = Array("first\r\n\r\nlet x = 7;\r\nlast\r\n".utf8)
+    let lineDigest = "5cca6e0d05bfa2b08813fc9f5f62c8beef040de0f7898560647e69d4f64d8b02"
     let emptyFirst: Bool
     let completeFirst: Bool
     let fragmentStatus: String
@@ -26,7 +28,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
     init(emptyFirst: Bool = false, completeFirst: Bool = false, fragmentStatus: String = "unsupported",
         repositoryRules: Bool = false, ruleFailure: String? = nil) {
         precondition(["none", "document-start", "resolved", "missing-heading", "ambiguous",
-            "limited", "unsupported", "invalid"].contains(fragmentStatus))
+            "limited", "unsupported", "invalid", "resolved-lines", "missing-line"].contains(fragmentStatus))
         precondition(ruleFailure == nil || repositoryRules)
         self.emptyFirst = emptyFirst; self.completeFirst = completeFirst; self.fragmentStatus = fragmentStatus
         self.repositoryRules = repositoryRules; self.ruleFailure = ruleFailure
@@ -44,20 +46,24 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
     }
     func raw(_ page: UInt64) -> [UInt8] {
         if page == 2 { return [255, 46, 114, 115] }
-        if page == 3 && fragmentStatus != "unsupported" { return Array("src/guide.md".utf8) }
+        if page == 3 && !["unsupported", "resolved-lines", "missing-line"].contains(fragmentStatus) { return Array("src/guide.md".utf8) }
         return Array("src/p\(page).rs".utf8)
     }
     private func sourceBytes(for raw: [UInt8]) -> [UInt8] {
-        fragmentStatus == "resolved" && raw == self.raw(3) ? headingSource : source
+        if fragmentStatus == "resolved-lines" && raw == self.raw(3) { return lineSource }
+        return fragmentStatus == "resolved" && raw == self.raw(3) ? headingSource : source
     }
     private func captureDigest(for raw: [UInt8]) -> String {
-        fragmentStatus == "resolved" && raw == self.raw(3) ? headingDigest : digest
+        if fragmentStatus == "resolved-lines" && raw == self.raw(3) { return lineDigest }
+        return fragmentStatus == "resolved" && raw == self.raw(3) ? headingDigest : digest
     }
     private var fragmentSuffix: String {
         switch fragmentStatus {
         case "none": return ""
         case "document-start": return "#"
         case "missing-heading": return "#absent"
+        case "resolved-lines": return "#%4C2-L3"
+        case "missing-line": return "#L999"
         case "ambiguous": return "#repeat-2"
         case "invalid": return "#%ff"
         default: return "#details"
@@ -67,6 +73,8 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         switch fragmentStatus {
         case "none", "document-start", "invalid": return nil
         case "missing-heading": return "absent"
+        case "resolved-lines": return "L2-L3"
+        case "missing-line": return "L999"
         case "ambiguous": return "repeat-2"
         default: return "details"
         }
@@ -146,7 +154,8 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         return out
     }
     private func documentDestination(_ raw: [UInt8]) -> String {
-        raw == self.raw(3) ? "p1.rs" : (fragmentStatus == "unsupported" ? "p3.rs" : "guide.md") + fragmentSuffix
+        raw == self.raw(3) ? "p1.rs" : (["unsupported", "resolved-lines", "missing-line"].contains(fragmentStatus)
+            ? "p3.rs" : "guide.md") + fragmentSuffix
     }
     /// Bounded logical output at the injected boundary. The sample capture is
     /// unchanged; neither the fixture nor native model implements a Markdown
@@ -287,7 +296,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
                         let suffix = targetPage == 3 ? fragmentSuffix : ""
                         let status = targetPage == 3 ? fragmentStatus : "none"
                         let slug = targetPage == 3 ? fragmentSlug : nil
-                        let offset: UInt64 = status == "resolved" ? 9 : 0
+                        let offset: UInt64 = status == "resolved" ? 9 : (status == "resolved-lines" ? 7 : 0)
                         let targetBytes = sourceBytes(for: targetRaw)
                         readers[destination] = targetRaw
                         receipts[destination] = (acceptedPage, acceptedFile)
@@ -305,7 +314,8 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
                         out["destination"] = destinationText; out["destination_suffix"] = suffix
                         out["fragment_status"] = status
                         out["fragment_slug"] = slug.map { $0 as Any } ?? NSNull()
-                        out["target_range"] = status == "resolved" ? ["start": "9", "end": "20"] as Any : NSNull()
+                        out["target_range"] = status == "resolved" ? ["start": "9", "end": "20"] as Any
+                            : (status == "resolved-lines" ? ["start": "7", "end": "21"] as Any : NSNull())
                         out["fragment_suffix"] = suffix; out["initial_original_offset"] = String(offset)
                         var nested = readerInfo(destination, raw: targetRaw)
                         var first = window(destination, raw: targetRaw, start: offset, limit: 16_384)
@@ -349,6 +359,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
                                 out["initial_original_offset"] = "1"
                                 first = window(destination, raw: targetRaw, start: 1, limit: 16_384)
                             case "link-fragment-slug": out["fragment_slug"] = NSNull()
+                            case "link-line-slug": out["fragment_slug"] = "L03-L2"
                             case "link-fragment-fields":
                                 out.removeValue(forKey: "fragment_slug"); out.removeValue(forKey: "target_range")
                             case "link-fragment-empty-range": out["target_range"] = ["start": "9", "end": "9"]
@@ -491,6 +502,8 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         try await interruptedVerifiedLinksRetireOnlyCandidates()
         try await staleAndInterruptedDocumentLinksRetireOnlyCandidates()
         try await qualifiedHeadingOffsetStartsReaderAndHistoryAtCapturedAnchor()
+        sourceLineFragmentWirePolicy()
+        try await qualifiedSourceLinesStartIndependentReaderAndHistory()
         try await typedFragmentFallbacksKeepReadableTargets()
         try await malformedQualifiedHeadingReceiptsNeverPublishTargets()
         print("Progressive project pages, repository-rule coverage, staged refresh, recovery, raw-file capture, page-independent document-link proofs, independent targets and grant-lifetime regressions passed.")
@@ -1313,8 +1326,89 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
             && origin.reader.page?.originalHex == original.originalHex && !f.calls.contains("LABEL-OPEN"))
         target.reader.close(); origin.reader.close(); model.close()
     }
+    private static func sourceLineFragmentWirePolicy() {
+        let valid: [(String, UInt64, UInt64)] = [
+            ("L1", 1, 1), ("L42-L57", 42, 57), ("L2-L2", 2, 2),
+            ("L18446744073709551615", UInt64.max, UInt64.max)
+        ]
+        for (slug, first, last) in valid {
+            let lines = AtlasSourceLineFragment(slug)
+            precondition(lines?.first == first && lines?.last == last)
+        }
+        for slug in ["", "L", "L0", "L01", "l2", "L2-3", "L3-L2", "L2-L0", "L2-L03", "L2-", "-L2",
+                     "L2-L3-L4", "L+2", "L٢", "L2\n", "%4C2", "L18446744073709551616"] {
+            precondition(AtlasSourceLineFragment(slug) == nil, "Noncanonical source line admitted: \(slug)")
+        }
+        func identity(_ encoding: String, path: String = "src/lib.rs", bytes: UInt64 = 300_000) -> AtlasReaderIdentity {
+            .init(owner: 7, file: 1, revision: 3, capturedBytes: bytes,
+                pathBytes: Array(path.utf8), encoding: encoding, displayPath: path)
+        }
+        let range = AtlasDocumentByteRange(start: 270_000, end: 270_006)
+        for encoding in ["utf8", "utf16le", "utf16be"] {
+            precondition(AtlasSourceLineFragment.admits(range, in: identity(encoding)),
+                "Source-line navigation must not inherit the Markdown document byte cap")
+        }
+        precondition(!AtlasSourceLineFragment.admits(range, in: identity("unsupported")))
+        precondition(!AtlasSourceLineFragment.admits(range, in: identity("utf8", path: "README.MD")))
+        precondition(!AtlasSourceLineFragment.admits(range, in: identity("utf8", path: "docs/a.Markdown")))
+        precondition(!AtlasSourceLineFragment.admits(range, in: identity("utf8", bytes: AtlasReaderLimits.captureBytes + 1)))
+        precondition(!AtlasSourceLineFragment.admits(.init(start: 270_001, end: 270_006), in: identity("utf16le")))
+        precondition(!AtlasSourceLineFragment.admits(.init(start: 270_000, end: 270_005), in: identity("utf16be")))
+        for encoding in ["utf16le", "utf16be"] {
+            precondition(AtlasSourceLineFragment.admits(.init(start: 270_000, end: 300_001),
+                in: identity(encoding, bytes: 300_001)), "An incomplete final code unit remains original source content")
+            precondition(!AtlasSourceLineFragment.admits(.init(start: 270_000, end: 300_001),
+                in: identity(encoding, bytes: 300_003)), "Only EOF can end a line range at an incomplete code unit")
+            precondition(!AtlasSourceLineFragment.admits(.init(start: 270_001, end: 300_001),
+                in: identity(encoding, bytes: 300_001)))
+        }
+        precondition(!AtlasSourceLineFragment.admits(.init(start: 300_000, end: 300_000), in: identity("utf8")),
+            "The physical-line scanner does not manufacture an empty line after the final delimiter")
+        precondition(!AtlasSourceLineFragment.admits(.init(start: 299_999, end: 300_001), in: identity("utf8")))
+    }
+    @MainActor private static func qualifiedSourceLinesStartIndependentReaderAndHistory() async throws {
+        let f = ProjectBrowserFixture(fragmentStatus: "resolved-lines")
+        let (model, origin, local) = try await linkEnvironment(f)
+        let original = origin.reader.page!
+        let target = try await model.openDocumentLink(local, from: origin,
+            readerTransport: f.readerTransport, document: f.documentTransport)
+        precondition(target.fragment.status == .resolvedLines && target.fragment.slug == "L2-L3")
+        precondition(target.fragment.targetRange == AtlasDocumentByteRange(start: 7, end: 21)
+            && target.fragment.initialOriginalOffset == 7 && !target.fragment.isFallback)
+        precondition(target.fragment.navigationDescription.contains("source lines 2–3"))
+        precondition(target.reader.page?.start == 7 && target.reader.page?.text == "\r\nlet x = 7;\r\nlast\r\n")
+        precondition(target.captureSHA256 == f.lineDigest && target.unappliedFragment.isEmpty)
+        target.reader.offsetInput = "0"; target.reader.goToByte()
+        await wait("source navigation did not leave the linked lines") { !target.reader.busy }
+        target.reader.back()
+        await wait("Back did not restore the captured source-line anchor") { !target.reader.busy }
+        precondition(target.reader.page?.start == 7 && target.reader.canGoForward)
+        precondition(origin.reader.page?.identity.matches(original.identity) == true
+            && origin.reader.page?.originalHex == original.originalHex && !f.calls.contains("LABEL-OPEN"))
+        model.close()
+        target.reader.forward()
+        await wait("source-line capture did not survive catalog closure") { !target.reader.busy }
+        precondition(target.reader.page?.start == 0 && target.reader.canPin)
+        target.reader.close(); origin.reader.close()
+
+        for fault in ["link-line-slug", "link-fragment-empty-range", "link-fragment-outside",
+                      "link-fragment-offset", "link-fragment-fallback-range", "link-window-zero", "link-window"] {
+            let fixture = ProjectBrowserFixture(fragmentStatus: "resolved-lines")
+            let (catalog, source, link) = try await linkEnvironment(fixture)
+            let accepted = source.reader.page!
+            fixture.corrupt(fault)
+            await refuse("malformed source-line receipt published a reader: \(fault)") {
+                _ = try await catalog.openDocumentLink(link, from: source,
+                    readerTransport: fixture.readerTransport, document: fixture.documentTransport)
+            }
+            await wait("invalid source-line candidate did not retire") { fixture.calls.contains("reader-close:101") }
+            precondition(source.reader.page?.identity.matches(accepted.identity) == true
+                && source.reader.page?.originalHex == accepted.originalHex && source.reader.documentPreview.allows(link))
+            source.reader.close(); catalog.close()
+        }
+    }
     @MainActor private static func typedFragmentFallbacksKeepReadableTargets() async throws {
-        for status in ["none", "document-start", "missing-heading", "ambiguous", "limited", "unsupported", "invalid"] {
+        for status in ["none", "document-start", "missing-heading", "missing-line", "ambiguous", "limited", "unsupported", "invalid"] {
             let f = ProjectBrowserFixture(fragmentStatus: status)
             let (model, origin, local) = try await linkEnvironment(f)
             let target = try await model.openDocumentLink(local, from: origin,

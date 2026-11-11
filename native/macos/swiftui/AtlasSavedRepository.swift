@@ -365,9 +365,10 @@ enum AtlasSavedFragmentResolution: String, Decodable, Sendable {
     case none, resolved, ambiguous, limited, unsupported, invalid, unresolved
     case documentStart = "document-start"
     case missingHeading = "missing-heading"
+    case resolvedLines = "resolved-lines", missingLine = "missing-line"
 }
 
-struct AtlasSavedHeadingRange: Decodable, Sendable, Equatable {
+struct AtlasSavedFragmentRange: Decodable, Sendable, Equatable {
     let start: UInt64
     let end: UInt64
     var contextStart: UInt64 { start > 128 ? start - 128 : 0 }
@@ -375,7 +376,7 @@ struct AtlasSavedHeadingRange: Decodable, Sendable, Equatable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         start = try c.decode(AtlasSavedNumber.self, forKey: .start).value
         end = try c.decode(AtlasSavedNumber.self, forKey: .end).value
-        guard start < end, end <= AtlasSavedWire.documentBytes else { throw AtlasSavedError.invalidResponse }
+        guard start < end, end <= AtlasSavedWire.memberBytes else { throw AtlasSavedError.invalidResponse }
     }
     static func matches(_ value: Any?, expected: Self?) -> Bool {
         guard let expected else { return value is NSNull }
@@ -401,9 +402,16 @@ struct AtlasSavedLink: Decodable, Sendable, Identifiable {
     let suffix: String
     let fragmentResolution: AtlasSavedFragmentResolution
     let fragmentSlug: String?
-    let targetRange: AtlasSavedHeadingRange?
-    var fragmentUnresolved: Bool { ![.none, .documentStart, .resolved].contains(fragmentResolution) }
+    let targetRange: AtlasSavedFragmentRange?
+    var fragmentUnresolved: Bool { ![.none, .documentStart, .resolved, .resolvedLines].contains(fragmentResolution) }
     var canOpenTarget: Bool { resolution == "captured" }
+    var targetActionLabel: String {
+        switch fragmentResolution {
+        case .resolved: "Read captured heading"
+        case .resolvedLines: "Read captured source lines"
+        default: "Read captured target"
+        }
+    }
     var targetNavigationDescription: String {
         switch fragmentResolution {
         case .none: return "Captured target opens at byte 0."
@@ -411,12 +419,16 @@ struct AtlasSavedLink: Decodable, Sendable, Identifiable {
         case .resolved:
             guard let targetRange, let fragmentSlug else { return "Captured heading unavailable." }
             return "Captured heading #\(fragmentSlug) · original bytes \(targetRange.start)..<\(targetRange.end)"
+        case .resolvedLines:
+            guard let targetRange, let lines = AtlasSourceLineFragment(fragmentSlug) else { return "Captured source line range unavailable." }
+            return "Captured \(lines.label) · original bytes \(targetRange.start)..<\(targetRange.end)"
+        case .missingLine: return "The requested source line range is absent from this capture. The target opens at byte 0."
         case .missingHeading: return "The requested heading is absent from the captured document. The target opens at byte 0."
         case .ambiguous: return "Multiple captured headings have this identity. The target opens at byte 0."
-        case .limited: return "Heading resolution reached a source or document limit. The target opens at byte 0."
-        case .unsupported: return "This captured target has no supported Markdown heading navigation. It opens at byte 0."
+        case .limited: return "Fragment resolution reached a source or document limit. The target opens at byte 0."
+        case .unsupported: return "This captured target has no supported navigation for the requested fragment. It opens at byte 0."
         case .invalid: return "The URL fragment is invalid. A captured target opens at byte 0."
-        case .unresolved: return "The URL fragment is unresolved; no heading destination is established."
+        case .unresolved: return "The URL fragment is unresolved; no source destination is established."
         }
     }
     init(from decoder: Decoder) throws {
@@ -438,7 +450,7 @@ struct AtlasSavedLink: Decodable, Sendable, Identifiable {
         fragmentResolution = try c.decode(AtlasSavedFragmentResolution.self, forKey: .fragment_resolution)
         guard c.contains(.fragment_slug), c.contains(.target_range) else { throw AtlasSavedError.invalidResponse }
         fragmentSlug = try c.decodeIfPresent(String.self, forKey: .fragment_slug)
-        targetRange = try c.decodeIfPresent(AtlasSavedHeadingRange.self, forKey: .target_range)
+        targetRange = try c.decodeIfPresent(AtlasSavedFragmentRange.self, forKey: .target_range)
         let occurrence = try c.decode(AtlasSavedNumber.self, forKey: .source_link_id).value
         _ = try c.decode(AtlasSavedNumber.self, forKey: .block_index) // Parser ordering only, never a coordinate.
         guard (1...4096).contains(id), sourceMember < 65_536, sourceFile == sourceMember + 1,
@@ -476,7 +488,15 @@ struct AtlasSavedLink: Decodable, Sendable, Identifiable {
             }
         case .resolved:
             guard resolution == "captured", fragmentSlug != nil, let targetRange,
+                  targetRange.end <= AtlasSavedWire.documentBytes,
                   targetMember != sourceMember || targetRange.end <= evidenceEnd else { throw AtlasSavedError.invalidResponse }
+        case .resolvedLines:
+            guard resolution == "captured", AtlasSourceLineFragment(fragmentSlug) != nil, let targetRange,
+                  let targetPath, AtlasSourceLineFragment.admitsSourcePath(targetPath.bytes),
+                  targetMember != sourceMember || targetRange.end <= evidenceEnd else { throw AtlasSavedError.invalidResponse }
+        case .missingLine:
+            guard resolution == "captured", AtlasSourceLineFragment(fragmentSlug) != nil, targetRange == nil,
+                  let targetPath, AtlasSourceLineFragment.admitsSourcePath(targetPath.bytes) else { throw AtlasSavedError.invalidResponse }
         case .missingHeading, .ambiguous, .limited, .unsupported:
             guard resolution == "captured", fragmentSlug != nil, targetRange == nil else { throw AtlasSavedError.invalidResponse }
         case .unresolved:

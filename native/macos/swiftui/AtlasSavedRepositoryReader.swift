@@ -114,7 +114,7 @@ struct AtlasSavedReaderReceipt: Sendable {
                       object["side"] as? String == side.rawValue,
                       object["evidence_precision"] as? String == AtlasSavedWire.evidencePrecision,
                       object["fragment_resolution"] as? String == link.fragmentResolution.rawValue,
-                      AtlasSavedHeadingRange.matches(object["target_range"], expected: link.targetRange),
+                      AtlasSavedFragmentRange.matches(object["target_range"], expected: link.targetRange),
                       (object["offset"] as? String).flatMap(AtlasReaderWire.integer) ==
                         (side == .target ? link.targetRange?.start ?? 0 : 0),
                       (object["member_bytes_read"] as? String).flatMap(AtlasReaderWire.integer) == member.observedBytes,
@@ -138,8 +138,20 @@ struct AtlasSavedReaderReceipt: Sendable {
                     guard link.canOpenTarget, member.id == link.targetMember,
                           member.path.bytes == link.targetPath?.bytes,
                           link.targetRange == nil || link.targetRange!.end <= member.observedBytes,
-                          AtlasSavedHeadingRange.matches(object["selection"], expected: link.targetRange) else {
+                          AtlasSavedFragmentRange.matches(object["selection"], expected: link.targetRange) else {
                         throw AtlasSavedError.invalidResponse
+                    }
+                    if link.fragmentResolution == .resolved {
+                        guard info.identity.encoding == "utf8", member.observedBytes <= AtlasSavedWire.documentBytes else {
+                            throw AtlasSavedError.invalidResponse
+                        }
+                    } else if link.fragmentResolution == .resolvedLines {
+                        guard let range = link.targetRange,
+                              AtlasSourceLineFragment.admits(.init(start: range.start, end: range.end), in: info.identity) else {
+                            throw AtlasSavedError.invalidResponse
+                        }
+                    } else if link.fragmentResolution == .missingLine {
+                        guard AtlasSourceLineFragment.admitsIdentity(info.identity) else { throw AtlasSavedError.invalidResponse }
                     }
                 }
                 request = .window(offset: side == .target ? link.targetRange?.contextStart ?? 0 : 0, bytes: 16 * 1024)

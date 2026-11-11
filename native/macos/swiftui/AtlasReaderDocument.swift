@@ -47,6 +47,56 @@ struct AtlasDocumentByteRange: Equatable, Sendable, Decodable {
     }
 }
 
+/// Validate the service's once-decoded source-line fragment without deriving
+/// byte offsets, decoding a URL, or treating a source line as a Markdown heading.
+/// Only the captured-source service can establish the original-byte range.
+struct AtlasSourceLineFragment: Equatable, Sendable {
+    let first: UInt64
+    let last: UInt64
+
+    init?(_ slug: String?) {
+        guard let slug, slug.utf8.count <= 43 else { return nil }
+        let parts = slug.split(separator: "-", omittingEmptySubsequences: false)
+        guard (1...2).contains(parts.count) else { return nil }
+        func line(_ part: Substring) -> UInt64? {
+            let bytes = part.utf8
+            guard bytes.first == 76, bytes.count > 1,
+                  let firstDigit = bytes.dropFirst().first, (49...57).contains(firstDigit),
+                  bytes.dropFirst().allSatisfy({ (48...57).contains($0) }) else { return nil }
+            return UInt64(part.dropFirst())
+        }
+        guard let first = line(parts[0]), let last = line(parts[parts.count - 1]), last >= first else { return nil }
+        self.first = first; self.last = last
+    }
+
+    var label: String { first == last ? "source line \(first)" : "source lines \(first)–\(last)" }
+
+    static func admitsSourcePath(_ bytes: [UInt8]) -> Bool {
+        let name = bytes.split(separator: 47, omittingEmptySubsequences: false).last ?? []
+        guard let dot = name.lastIndex(of: 46) else { return true }
+        let ext = name[name.index(after: dot)...].map { (65...90).contains($0) ? $0 + 32 : $0 }
+        return ext != Array("md".utf8) && ext != Array("markdown".utf8)
+    }
+
+    static func admitsIdentity(_ identity: AtlasReaderIdentity) -> Bool {
+        admitsSourcePath(identity.pathBytes) && identity.capturedBytes <= AtlasReaderLimits.captureBytes &&
+            ["utf8", "utf16le", "utf16be"].contains(identity.encoding)
+    }
+
+    static func admits(_ range: AtlasDocumentByteRange, in identity: AtlasReaderIdentity) -> Bool {
+        guard admitsIdentity(identity),
+              range.valid(upTo: identity.capturedBytes, nonempty: true) else { return false }
+        switch identity.encoding {
+        case "utf8": return true
+        // An incomplete final UTF-16 code unit is still original source
+        // content. The reader labels its replacement decoding separately.
+        case "utf16le", "utf16be":
+            return range.start % 2 == 0 && (range.end % 2 == 0 || range.end == identity.capturedBytes)
+        default: return false
+        }
+    }
+}
+
 struct AtlasReaderDocumentInventory: Sendable {
     let identity: AtlasReaderIdentity
     let generation: UInt64

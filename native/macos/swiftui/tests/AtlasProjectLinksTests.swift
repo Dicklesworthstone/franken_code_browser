@@ -31,6 +31,56 @@ import Foundation
         do { _ = try decode(value, index: index, direction: direction, path: path); preconditionFailure("Malformed link authority admitted") }
         catch {}
     }
+    private static func sourceLineReceipts(_ index: AtlasPreparedIndex) throws {
+        var row = ProjectLinksFixture.row(1)
+        row["target_path"] = ProjectLinksFixture.path("src/lib.rs")
+        row["destination"] = "src/lib.rs#%4C2-L3"; row["destination_suffix"] = "#%4C2-L3"
+        let link = try JSONDecoder().decode(AtlasProjectLink.self,
+            from: Data(ProjectLinksFixture.json(row).utf8))
+        for encoding in ["utf8", "utf16le", "utf16be"] {
+            var receipt = ProjectLinksFixture.receipt(owner: index.basis.owner, reader: 77,
+                generation: 1, link: 1, side: .target)
+            var reader = receipt["reader"] as! [String: Any]
+            reader["path"] = row["target_path"]; reader["encoding"] = encoding
+            receipt["path"] = row["target_path"]; receipt["reader"] = reader
+            receipt["destination_suffix"] = row["destination_suffix"]
+            receipt["fragment_suffix"] = row["destination_suffix"]
+            receipt["fragment_status"] = "resolved-lines"; receipt["fragment_slug"] = "L2-L3"
+            func admit(_ value: [String: Any]) throws -> AtlasProjectLinkReaderReceipt {
+                try AtlasProjectLinkReaderReceipt.decode(ProjectLinksFixture.json(value), index: index,
+                    generation: 1, link: link, side: .target, destination: 77)
+            }
+            func reject(_ value: [String: Any]) {
+                do { _ = try admit(value); preconditionFailure("Malformed source-line target admitted: \(encoding)") }
+                catch {}
+            }
+            let accepted = try admit(receipt)
+            precondition(accepted.fragment.status == "resolved-lines" && accepted.fragment.initialOriginalOffset == 34
+                && accepted.fragment.navigationDescription.contains("source lines 2–3"))
+            var missing = receipt
+            missing["fragment_status"] = "missing-line"; missing["target_range"] = NSNull()
+            missing["initial_original_offset"] = "0"
+            let fallback = try admit(missing)
+            precondition(fallback.fragment.initialOriginalOffset == 0
+                && fallback.fragment.navigationDescription.contains("absent"))
+            for slug in ["L0", "L01", "L3-L2", "L2-3", "L18446744073709551616", "%4C2"] {
+                var bad = receipt; bad["fragment_slug"] = slug; reject(bad)
+            }
+            for range in [["start": "34", "end": "34"], ["start": "34", "end": "101"]] {
+                var bad = receipt; bad["target_range"] = range; reject(bad)
+            }
+            var bad = receipt
+            bad["fragment_status"] = "missing-line"; reject(bad)
+            bad = receipt; bad["initial_original_offset"] = "35"; reject(bad)
+            bad = receipt; bad.removeValue(forKey: "fragment_slug"); reject(bad)
+            var unsupported = reader; unsupported["encoding"] = "unsupported"
+            bad = receipt; bad["reader"] = unsupported; reject(bad)
+            if encoding != "utf8" {
+                bad = receipt; bad["target_range"] = ["start": "34", "end": "41"]; reject(bad)
+                bad = receipt; bad["fragment_status"] = "resolved"; reject(bad)
+            }
+        }
+    }
     @MainActor static func main() async throws {
         let fixture = ProjectLinksFixture(), index = try await prepared(fixture)
         precondition(fixture.index.count("create:") == 1 && fixture.index.count("query-begin:") == 0,
@@ -166,6 +216,7 @@ import Foundation
         let legacyReader = try admitReader(legacy)
         precondition(legacyReader.fragment.status == "unqualified" && legacyReader.fragment.initialOriginalOffset == 0,
             "An old receipt can only open at the beginning")
+        try sourceLineReceipts(index)
 
         let live = ProjectLinksFixture()
         let model = AtlasProjectLinksModel(root: "/project", initialPath: selected, direction: .incoming, transport: live.transport)

@@ -291,7 +291,7 @@ fn canonical_collisions_missing_and_invalid_fragments_remain_distinct_from_file_
         ("missing-heading", Some("absent")), ("missing-heading", Some("%72epeat")),
         ("missing-heading", Some("Repeat")), ("missing-heading", Some("repeat+two")),
         ("invalid", None), ("invalid", None), ("document-start", None),
-        ("unsupported", Some("L2")), ("document-start", None), ("none", None), ("none", None),
+        ("resolved-lines", Some("L2")), ("document-start", None), ("none", None), ("none", None),
     ];
     for (index, (status, slug)) in expected.iter().enumerate() {
         let id = index as u64 + 1;
@@ -303,12 +303,16 @@ fn canonical_collisions_missing_and_invalid_fragments_remain_distinct_from_file_
             Some(slug) => assert_eq!(receipt.get("fragment_slug").text(), *slug),
             None => assert_eq!(receipt.get("fragment_slug"), &Json::Null),
         }
-        assert_eq!(receipt.get("initial_original_offset").number(), 0);
-        assert_eq!(receipt.get("window").get("visible_range").get("start").number(), 0);
+        let offset = if *status == "resolved-lines" { 6 } else { 0 };
+        assert_eq!(receipt.get("initial_original_offset").number(), offset);
+        assert_eq!(receipt.get("window").get("visible_range").get("start").number(), offset);
         if *status == "resolved" {
             let range = receipt.get("target_range");
             assert_eq!(range.get("start").number(), 0);
             assert_eq!(std::str::from_utf8(&guide[..range.get("end").number() as usize]).unwrap().trim_end(), "# Repeat");
+        } else if *status == "resolved-lines" {
+            assert_eq!(receipt.get("target_range").get("start").number(), 6);
+            assert_eq!(receipt.get("target_range").get("end").number(), 13);
         } else { assert_eq!(receipt.get("target_range"), &Json::Null); }
         assert_eq!(reader.document_generation(), None);
         assert_eq!(receipt.get("reader").get("accepted_document_generation"), &Json::Null);
@@ -316,6 +320,89 @@ fn canonical_collisions_missing_and_invalid_fragments_remain_distinct_from_file_
         else { assert_eq!(reader.capture().bytes(), guide); }
     }
     assert_eq!(origin.capture().bytes(), source);
+}
+
+#[test]
+fn source_line_links_select_original_utf8_utf16_and_large_capture_ranges() {
+    for encoding in 0..3 {
+        let root = new_root();
+        let encode = |text: &str| -> Vec<u8> { match encoding {
+            0 => text.as_bytes().to_vec(),
+            1 => text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+            _ => text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+        } };
+        let prefix = "\u{feff}preamble\r\n";
+        let selected = "\u{010a}🦀\rthird\n";
+        let bytes = encode(&format!("{prefix}{selected}last"));
+        let start = encode(prefix).len() as u64;
+        let end = start + encode(selected).len() as u64;
+        fs::write(root.join("README.md"), b"[lines](code.rs?source=1#%4C2-L3) [same](code.rs#L2-L3)").unwrap();
+        fs::write(root.join("code.rs"), &bytes).unwrap();
+        let (mut catalog, found) = catalog(&root, 78100 + encoding * 10);
+        let source = row(&found, "README.md");
+        let origin = open(&mut catalog, &source, 78101 + encoding * 10);
+        for id in 1..=2 {
+            let (mut reader, response) = catalog.open_document_link(&origin, owner(78101 + encoding * 10 + id),
+                selection(&source, 1, id), 4096, || false).unwrap();
+            let receipt = json(&response);
+            assert_eq!(receipt.get("fragment_status").text(), "resolved-lines");
+            assert_eq!(receipt.get("fragment_slug").text(), "L2-L3");
+            assert_eq!(receipt.get("target_range").get("start").number(), start);
+            assert_eq!(receipt.get("target_range").get("end").number(), end);
+            assert_eq!(receipt.get("initial_original_offset").number(), start);
+            assert_eq!(receipt.get("window").get("requested_original_range").get("start").number(), start);
+            assert_eq!(receipt.get("source_bytes_read").number(), bytes.len() as u64);
+            assert_eq!(reader.document_generation(), None);
+            assert_eq!(reader.document_links_generation(), None);
+            assert_eq!(json(&reader.copy_range(start, end, || false).unwrap()).get("original_hex").text(), hex(&encode(selected)));
+        }
+    }
+
+    let root = new_root();
+    let mut bytes = vec![b'x'; fcb::document::links::MAX_DOCUMENT_LINK_SOURCE_BYTES + 31];
+    bytes.extend_from_slice(b"\r\nexact final line");
+    let start = bytes.len() - b"exact final line".len();
+    fs::write(root.join("README.md"), b"[deep](large.rs#L2)").unwrap();
+    fs::write(root.join("large.rs"), &bytes).unwrap();
+    let (mut catalog, found) = catalog(&root, 78140);
+    let source = row(&found, "README.md"); let origin = open(&mut catalog, &source, 78141);
+    let (reader, response) = catalog.open_document_link(&origin, owner(78142), selection(&source, 1, 1),
+        1024 * 1024, || false).unwrap();
+    let receipt = json(&response);
+    assert_eq!(receipt.get("fragment_status").text(), "resolved-lines");
+    assert_eq!(receipt.get("target_range").get("start").number(), start as u64);
+    assert_eq!(receipt.get("target_range").get("end").number(), bytes.len() as u64);
+    assert_eq!(reader.capture().bytes(), bytes);
+}
+
+#[test]
+fn source_line_syntax_missing_endpoints_and_markdown_heading_identity_stay_distinct() {
+    let root = new_root();
+    let source = b"[missing](code.rs#L3) [end](code.rs#L1-L3) [zero](code.rs#L0) \
+        [leading](code.rs#L01) [reverse](code.rs#L2-L1) [overflow](code.rs#L18446744073709551616) \
+        [named](code.rs#License) [twice](code.rs#%254C2) [heading](guide.md#L2) [empty](empty.rs#L1)";
+    fs::write(root.join("README.md"), source).unwrap();
+    fs::write(root.join("code.rs"), b"one\r\ntwo\n").unwrap();
+    fs::write(root.join("guide.md"), b"# L2\n").unwrap();
+    fs::write(root.join("empty.rs"), b"").unwrap();
+    let (mut catalog, found) = catalog(&root, 78150);
+    let source_row = row(&found, "README.md"); let origin = open(&mut catalog, &source_row, 78151);
+    for (index, (status, slug)) in [
+        ("missing-line", Some("L3")), ("missing-line", Some("L1-L3")), ("invalid", None),
+        ("invalid", None), ("invalid", None), ("invalid", None), ("unsupported", Some("License")),
+        ("unsupported", Some("%4C2")), ("missing-heading", Some("L2")), ("missing-line", Some("L1")),
+    ].iter().enumerate() {
+        let (_, response) = catalog.open_document_link(&origin, owner(78160 + index as u64),
+            selection(&source_row, 1, index as u64 + 1), 4096, || false).unwrap();
+        let receipt = json(&response);
+        assert_eq!(receipt.get("fragment_status").text(), *status, "link {}", index + 1);
+        match slug {
+            Some(slug) => assert_eq!(receipt.get("fragment_slug").text(), *slug),
+            None => assert_eq!(receipt.get("fragment_slug"), &Json::Null),
+        }
+        assert_eq!(receipt.get("target_range"), &Json::Null);
+        assert_eq!(receipt.get("initial_original_offset").number(), 0);
+    }
 }
 
 #[test]

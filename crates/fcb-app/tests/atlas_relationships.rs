@@ -217,7 +217,7 @@ fn unqualified_target_fragments_keep_exact_file_reading_and_distinct_fallbacks()
         ("resolved", Some("repeat")), ("ambiguous", Some("repeat-2")),
         ("missing-heading", Some("absent")), ("missing-heading", Some("%72epeat")),
         ("missing-heading", Some("Repeat")), ("invalid", None), ("invalid", None),
-        ("document-start", None), ("unsupported", Some("L2")), ("none", None),
+        ("document-start", None), ("resolved-lines", Some("L2")), ("none", None),
     ];
     for (ordinal, (status, slug)) in expected.iter().enumerate() {
         let (reader, response) = f.search.open_relationship_reader(&f.atlas, owner(59810 + ordinal as u64),
@@ -228,10 +228,51 @@ fn unqualified_target_fragments_keep_exact_file_reading_and_distinct_fallbacks()
             Some(slug) => assert_eq!(receipt.get("fragment_slug").text(), *slug),
             None => assert_eq!(receipt.get("fragment_slug"), &Json::Null),
         }
-        assert_eq!(receipt.get("initial_original_offset").number(), 0);
-        if *status != "resolved" { assert_eq!(receipt.get("target_range"), &Json::Null); }
+        assert_eq!(receipt.get("initial_original_offset").number(), if *status == "resolved-lines" { 6 } else { 0 });
+        if *status == "resolved-lines" {
+            assert_eq!(receipt.get("target_range").get("start").number(), 6);
+            assert_eq!(receipt.get("target_range").get("end").number(), 13);
+        } else if *status != "resolved" { assert_eq!(receipt.get("target_range"), &Json::Null); }
         assert_eq!(reader.document_generation(), None);
         assert_eq!(reader.capture().bytes(), if ordinal == 8 { b"first\nsecond\n".as_slice() } else { guide.as_slice() });
+    }
+}
+
+#[test]
+fn retained_source_line_ranges_survive_live_replacement_and_index_retirement() {
+    let doc = b"[lines](src/lib.rs#L2-L3) [last](src/lib.rs#L4) [missing](src/lib.rs#L2-L5)";
+    for little_endian in [true, false] {
+        let encode = |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(|unit|
+            if little_endian { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect() };
+        let prefix = "\u{feff}first\r\n";
+        let selected = "\u{010a}🦀\rthird\n";
+        let bytes = encode(&format!("{prefix}{selected}last"));
+        let start = encode(prefix).len() as u64;
+        let end = start + encode(selected).len() as u64;
+        let mut f = Fixture::new(&[("README.md", doc), ("src/lib.rs", &bytes)]);
+        f.build(1); f.prepare(1, 1);
+        fs::write(f.root.join("src/lib.rs"), b"replacement with different lines\n").unwrap();
+        let (mut reader, response) = f.search.open_relationship_reader(&f.atlas, owner(59860),
+            1, 1, Side::Target, || false).unwrap();
+        let receipt = json(&response);
+        assert_eq!(receipt.get("fragment_status").text(), "resolved-lines");
+        assert_eq!(receipt.get("fragment_slug").text(), "L2-L3");
+        assert_eq!(receipt.get("target_range").get("start").number(), start);
+        assert_eq!(receipt.get("target_range").get("end").number(), end);
+        assert_eq!(receipt.get("initial_original_offset").number(), start);
+        assert_eq!(receipt.get("source_sha256").text(), Sha256::digest(&bytes).to_hex());
+        assert_eq!(receipt.get("additional_source_bytes_read").number(), 0);
+        assert!(!receipt.get("source_reopened").flag());
+        assert_eq!(reader.document_generation(), None);
+        let (_, last) = f.search.open_relationship_reader(&f.atlas, owner(59861), 1, 2, Side::Target, || false).unwrap();
+        assert_eq!(json(&last).get("target_range").get("start").number(), end);
+        assert_eq!(json(&last).get("target_range").get("end").number(), bytes.len() as u64);
+        let (_, missing) = f.search.open_relationship_reader(&f.atlas, owner(59862), 1, 3, Side::Target, || false).unwrap();
+        assert_eq!(json(&missing).get("fragment_status").text(), "missing-line");
+        assert_eq!(json(&missing).get("target_range"), &Json::Null);
+        f.search.clear_index(&f.atlas, 2, || false).unwrap();
+        assert_eq!(reader.capture().bytes(), bytes);
+        assert_eq!(json(&reader.copy_range(start, end, || false).unwrap()).get("original_hex").text(), hex(&encode(selected)));
     }
 }
 

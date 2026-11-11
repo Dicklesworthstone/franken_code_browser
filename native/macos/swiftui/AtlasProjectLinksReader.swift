@@ -2,7 +2,7 @@ import Foundation
 
 /// Validate the graph owner, selected side and exact capture before admitting
 /// a separate reader. Documentation evidence identifies the whole document;
-/// only a qualified target heading may supply a nonzero initial source offset.
+/// only a qualified target heading or source line may supply a source offset.
 struct AtlasProjectLinkReaderReceipt: Sendable {
     let info: AtlasReaderInfo
     let fragment: AtlasProjectLinkFragment
@@ -35,8 +35,8 @@ struct AtlasProjectLinkReaderReceipt: Sendable {
     }
 }
 
-/// The same captured heading semantics as the reader's Markdown adapter. This
-/// validates a receipt; it does not decode URI identities or invent heading slugs.
+/// Captured heading and source-line outcomes from the shared service. This
+/// validates a receipt; it does not decode URI identities or derive byte spans.
 struct AtlasProjectLinkFragment: Sendable {
     let status: String
     let slug: String?
@@ -47,10 +47,12 @@ struct AtlasProjectLinkFragment: Sendable {
         case "none": "Opened at the beginning of the captured file."
         case "document-start": "The empty fragment selects the captured document's beginning."
         case "resolved": "Opened at heading #\(slug ?? "") in this capture."
+        case "resolved-lines": "Opened at \(AtlasSourceLineFragment(slug)?.label ?? "the requested source lines") in this capture."
+        case "missing-line": "The requested source line range is absent from this capture. Opened at the beginning."
         case "missing-heading": "The requested heading is absent from this capture. Opened at the beginning."
         case "ambiguous": "Multiple captured headings share this identity. Opened at the beginning."
-        case "limited": "Heading navigation reached a document or memory limit. Opened at the beginning."
-        case "unsupported": "The heading's source position could not be verified in this capture. Opened at the beginning."
+        case "limited": "Fragment navigation reached a source, document or memory limit. Opened at the beginning."
+        case "unsupported": "The fragment's source position could not be verified in this capture. Opened at the beginning."
         case "invalid": "The link fragment is invalid. Opened at the beginning."
         default: "The destination fragment is unqualified. Opened at the beginning."
         }
@@ -90,6 +92,12 @@ struct AtlasProjectLinkFragment: Sendable {
             guard expected.hasPrefix("#"), expected.utf8.count > 1, slug != nil else {
                 throw AtlasProjectLinksError.invalidResponse
             }
+        case "resolved-lines", "missing-line":
+            guard side == .target, expected.hasPrefix("#"), expected.utf8.count > 1,
+                  AtlasSourceLineFragment(slug) != nil,
+                  AtlasSourceLineFragment.admitsIdentity(info.identity) else {
+                throw AtlasProjectLinksError.invalidResponse
+            }
         case "invalid":
             guard expected.hasPrefix("#"), expected.utf8.count > 1, slug == nil else {
                 throw AtlasProjectLinksError.invalidResponse
@@ -100,6 +108,11 @@ struct AtlasProjectLinkFragment: Sendable {
             let range = try w.object("target_range"), start = try range.number("start"), end = try range.number("end")
             guard side == .target, info.identity.encoding == "utf8", info.identity.capturedBytes <= 262_144,
                   start < end, end <= info.identity.capturedBytes, offset == start else {
+                throw AtlasProjectLinksError.invalidResponse
+            }
+        } else if status == "resolved-lines" {
+            let range = try w.object("target_range"), start = try range.number("start"), end = try range.number("end")
+            guard AtlasSourceLineFragment.admits(.init(start: start, end: end), in: info.identity), offset == start else {
                 throw AtlasProjectLinksError.invalidResponse
             }
         } else {

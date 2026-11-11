@@ -98,10 +98,10 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
         case "external": status = "External destination; no network content was fetched"
         default: status = "Destination could not be resolved within the project"
         }
-        return status + (destinationSuffix.contains("#") ? " · heading fragment is checked when the target opens" : "")
+        return status + (destinationSuffix.contains("#") ? " · fragment is checked when the target opens" : "")
     }
     var canOpenTarget: Bool { resolution == "captured" && target != nil }
-    var evidenceLabel: String { "Parsed Markdown link · whole captured document evidence; no exact link span or heading jump" }
+    var evidenceLabel: String { "Parsed Markdown link · whole captured document evidence; no exact link span or target navigation" }
 
     init(from decoder: Decoder) throws {
         let w = try AtlasIndexWire(from: decoder)

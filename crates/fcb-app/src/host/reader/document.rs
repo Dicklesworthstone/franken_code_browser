@@ -10,7 +10,8 @@ pub use fcb::document::reader::DocumentReadOptions as ReaderDocumentOptions;
 use fcb::document::{TextSelectionRange, reader::{DocumentReader, DocumentReadError}};
 use fcb::source::RawPath;
 use fcb_core::{DocumentGeneration, DocumentId};
-use crate::host::document_fragment::{self, FragmentResolution, QualifiedDocumentFragments};
+use crate::host::document_fragment::{self, FragmentResolution, QualifiedDocumentFragments,
+    QualifiedSourceLines, SourceLineFragment, MAX_SOURCE_LINE_FRAGMENT_BYTES};
 use super::{check, range, ByteOffset, HostResponse, Output, ReaderSession,
     ReaderSessionError, SelectionIdentity, EXIT_OK, MAX_READER_CONTEXT_BYTES, MAX_READER_WINDOW_BYTES};
 
@@ -34,10 +35,18 @@ impl ReaderSession {
         mut canceled: impl FnMut() -> bool)
         -> Result<(FragmentResolution, Option<String>), ReaderSessionError> {
         check(&mut canceled)?;
-        let (mut resolution, slug) = document_fragment::prepare_fragment(true, suffix)?;
-        if let Some(slug) = slug.as_deref() {
+        let (mut resolution, mut slug) = document_fragment::prepare_fragment(true, suffix)?;
+        if let Some(requested) = slug.as_deref() {
             if !document_fragment::markdown(RawPath::from_path(&self.path).as_bytes()) {
-                resolution = FragmentResolution::Unsupported;
+                resolution = match SourceLineFragment::parse(requested) {
+                    Ok(fragment) => QualifiedSourceLines::prepare(self.capture.bytes(), MAX_SOURCE_LINE_FRAGMENT_BYTES)
+                        .resolve(fragment, &mut canceled).map_err(|error| match error {
+                            crate::AppError::Canceled => ReaderSessionError::Canceled,
+                            other => ReaderSessionError::App(other),
+                        })?,
+                    Err(refusal) => refusal,
+                };
+                if resolution == FragmentResolution::Invalid { slug = None; }
             } else {
                 let [layout_id, provenance_id] = self.allocations()?;
                 // This private document ID is separate from the accepted
@@ -49,7 +58,7 @@ impl ReaderSession {
                 let qualified = QualifiedDocumentFragments::prepare(&self.capture, id, generation,
                     &self.budget, [layout_id, provenance_id], &mut canceled)
                     .map_err(fragment_error)?;
-                resolution = qualified.resolve(slug, &mut canceled).map_err(fragment_error)?;
+                resolution = qualified.resolve(requested, &mut canceled).map_err(fragment_error)?;
             }
         }
         check(&mut canceled)?;

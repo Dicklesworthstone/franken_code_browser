@@ -267,10 +267,11 @@ struct AtlasProjectBrowserTransport: Sendable {
 
 enum AtlasProjectBrowserFragmentStatus: String, Decodable, Sendable {
     case none, documentStart = "document-start", resolved, missingHeading = "missing-heading"
+    case resolvedLines = "resolved-lines", missingLine = "missing-line"
     case ambiguous, limited, unsupported, invalid, notApplied = "not-applied"
 }
 
-/// The service qualifies headings against the newly captured target. Swift
+/// The service qualifies headings or source lines against the captured target. Swift
 /// validates its bounded result without decoding URLs or deriving source spans.
 struct AtlasProjectBrowserFragment: Sendable {
     let status: AtlasProjectBrowserFragmentStatus
@@ -280,16 +281,18 @@ struct AtlasProjectBrowserFragment: Sendable {
     let initialOriginalOffset: UInt64
 
     static let none = Self(status: .none, slug: nil, suffix: "", targetRange: nil, initialOriginalOffset: 0)
-    var isFallback: Bool { ![.none, .documentStart, .resolved].contains(status) }
+    var isFallback: Bool { ![.none, .documentStart, .resolved, .resolvedLines].contains(status) }
     var navigationDescription: String {
         switch status {
         case .none: "Opened at the beginning of the captured file."
         case .documentStart: "The empty link fragment selects the captured document's beginning."
         case .resolved: "Opened at heading #\(slug ?? "") in this capture."
+        case .resolvedLines: "Opened at \(AtlasSourceLineFragment(slug)?.label ?? "the requested source lines") in this capture."
+        case .missingLine: "The requested source line range is absent from this capture. Opened at the beginning."
         case .missingHeading: "The requested heading is absent from this captured document. Opened at the beginning."
         case .ambiguous: "Multiple captured headings share this identity. Opened at the beginning."
-        case .limited: "Heading navigation reached a document or memory limit. Opened at the beginning."
-        case .unsupported: "The heading's source position could not be verified in this capture. Opened at the beginning."
+        case .limited: "Fragment navigation reached a source, document or memory limit. Opened at the beginning."
+        case .unsupported: "The fragment's source position could not be verified in this capture. Opened at the beginning."
         case .invalid: "The link fragment is invalid. Opened at the beginning."
         case .notApplied: "The link fragment was not applied. Opened at the beginning."
         }
@@ -316,6 +319,12 @@ struct AtlasProjectBrowserFragment: Sendable {
             guard expected.hasPrefix("#"), expected.utf8.count > 1, wire.slug != nil else {
                 throw AtlasProjectBrowserError.invalidResponse
             }
+        case .resolvedLines, .missingLine:
+            guard expected.hasPrefix("#"), expected.utf8.count > 1,
+                  AtlasSourceLineFragment(wire.slug) != nil,
+                  AtlasSourceLineFragment.admitsIdentity(identity) else {
+                throw AtlasProjectBrowserError.invalidResponse
+            }
         case .invalid:
             guard expected.hasPrefix("#"), expected.utf8.count > 1, wire.slug == nil else {
                 throw AtlasProjectBrowserError.invalidResponse
@@ -326,6 +335,9 @@ struct AtlasProjectBrowserFragment: Sendable {
         if wire.status == .resolved {
             guard identity.encoding == "utf8", identity.capturedBytes <= 256 * 1024,
                   let range = wire.targetRange, range.valid(upTo: identity.capturedBytes, nonempty: true),
+                  wire.offset == range.start else { throw AtlasProjectBrowserError.invalidResponse }
+        } else if wire.status == .resolvedLines {
+            guard let range = wire.targetRange, AtlasSourceLineFragment.admits(range, in: identity),
                   wire.offset == range.start else { throw AtlasProjectBrowserError.invalidResponse }
         } else {
             guard wire.targetRange == nil, wire.offset == 0 else { throw AtlasProjectBrowserError.invalidResponse }

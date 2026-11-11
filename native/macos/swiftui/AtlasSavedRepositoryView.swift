@@ -165,7 +165,7 @@ final class AtlasSavedFileAccess {
                     : (model.searchMode == .expression
                         ? "Expression terms are exact and case sensitive. Required/excluded terms apply across each complete captured member; results identify primary-term occurrences. Member names never open working-tree paths."
                         : "Structural results retain the shared extractor's evidence level and original source coordinates. All searches use this saved archive; member names never open working-tree paths."))
-                : "Documentation evidence is the original captured document. Qualified Markdown headings open their captured source range; unresolved destinations show why. Member names never open working-tree paths.")
+                : "Documentation evidence is the original captured document. Qualified Markdown headings and source-line fragments open their captured byte range; unresolved destinations show why. Member names never open working-tree paths.")
                 .font(.caption2).foregroundStyle(.secondary)
         }.frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -761,7 +761,7 @@ final class AtlasSavedFileAccess {
                 Text("Captured document evidence").font(.caption2).foregroundStyle(.secondary)
                 Spacer()
                 Button("Read source document") { openLink(link, from: page, side: .evidence) }
-                Button(link.targetRange == nil ? "Read captured target" : "Read captured heading") { openLink(link, from: page, side: .target) }
+                Button(link.targetActionLabel) { openLink(link, from: page, side: .target) }
                     .disabled(!link.canOpenTarget)
             }.controlSize(.small).disabled(!model.canOperate || readerTask != nil)
         }.padding(10).frame(maxWidth: .infinity, alignment: .leading)

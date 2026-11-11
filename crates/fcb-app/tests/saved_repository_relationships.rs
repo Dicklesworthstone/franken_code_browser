@@ -57,8 +57,8 @@ fn captured_links_and_reverse_backlinks_use_exact_manifest_members_and_occurrenc
     assert_eq!(result.get("scanned_markdown_members").number(), 2);
     assert_eq!(result.get("retained_links").number(), 10);
     assert_eq!(result.get("links_seen").number(), 10);
-    // Both fragments into README share one additional, bounded heading pass.
-    assert_eq!(result.get("member_bytes_read").number(), (2 * readme.len() + guide.len()) as u64);
+    // Heading and source-line targets each share one additional qualification pass.
+    assert_eq!(result.get("member_bytes_read").number(), (2 * readme.len() + guide.len() + b"fn captured() {}\n".len()) as u64);
     assert_eq!(result.get("retained_source_payload_bytes").number(), 0);
     let links = result.get("links").array();
     for (index, link) in links.iter().enumerate() {
@@ -72,7 +72,7 @@ fn captured_links_and_reverse_backlinks_use_exact_manifest_members_and_occurrenc
     assert_eq!(links[0].get("target_member").number(), 2);
     assert_eq!(links[0].get("target_path").get("hex").text(), hex(b"src/a b.rs"));
     assert_eq!(links[0].get("target_suffix").text(), "#L2");
-    assert_eq!(links[0].get("fragment_resolution").text(), "unsupported");
+    assert_eq!(links[0].get("fragment_resolution").text(), "missing-line");
     assert_eq!(links[0].get("source_digest").text(), Sha256::digest(readme).to_hex());
     assert_eq!(links[1].get("target_member").number(), 2);
     assert_eq!(links[1].get("source_link_id").number(), 2);
@@ -128,7 +128,7 @@ fn reader_navigation_keeps_original_bom_frontmatter_and_malformed_target_bytes_a
     assert_eq!(receipt.get("source_digest").text(), Sha256::digest(code).to_hex());
     assert_eq!(receipt.get("offset").number(), 0);
     assert_eq!(receipt.get("selection"), &Json::Null);
-    assert_eq!(receipt.get("fragment_resolution").text(), "unsupported");
+    assert_eq!(receipt.get("fragment_resolution").text(), "missing-line");
     assert_eq!(receipt.get("reader").get("capture_sha256").text(), Sha256::digest(code).to_hex());
     assert_eq!(receipt.get("member_bytes_read").number(), code.len() as u64);
     assert_ne!(evidence.capture().request().file().owner(), target.capture().request().file().owner());
@@ -306,7 +306,7 @@ fn relationship_desk_navigation_enters_normal_history_and_refused_actions_keep_o
     assert_eq!(desk.model().source(active, 2).unwrap().bytes(), code);
     let receipt = json(&saved.desk_open_response(&desk, &target).unwrap());
     assert_eq!(receipt.get("relationship_side").text(), "target");
-    assert_eq!(receipt.get("fragment_resolution").text(), "unsupported");
+    assert_eq!(receipt.get("fragment_resolution").text(), "missing-line");
     drop(saved);
     fs::rename(&f.path, f.root.join("moved.fcbs")).unwrap();
     desk.apply(2, 3, DeskCommand::Back, || false).unwrap();
@@ -406,7 +406,7 @@ fn fragment_outcomes_never_confuse_captured_files_with_qualified_headings() {
     let links = result.get("links").array();
     assert_eq!(links.len(), 12);
     for (index, expected) in ["resolved", "ambiguous", "missing-heading", "missing-heading", "missing-heading",
-        "missing-heading", "invalid", "invalid", "document-start", "unsupported", "unresolved", "unresolved"].iter().enumerate() {
+        "missing-heading", "invalid", "invalid", "document-start", "missing-line", "unresolved", "unresolved"].iter().enumerate() {
         assert_eq!(links[index].get("fragment_resolution").text(), *expected, "link {}", index + 1);
         if index > 0 { assert_eq!(links[index].get("target_range"), &Json::Null); }
     }
@@ -421,6 +421,85 @@ fn fragment_outcomes_never_confuse_captured_files_with_qualified_headings() {
         assert_eq!(receipt.get("selection"), &Json::Null);
         assert_eq!(receipt.get("fragment_resolution"), links[(id - 1) as usize].get("fragment_resolution"));
     }
+}
+
+#[test]
+fn saved_source_line_targets_share_qualification_and_preserve_exact_reader_and_desk_selection() {
+    let source = b"[last](src.rs#L4) [prefix](src.rs#L1-L3) [range](src.rs#L2-L3) [same](src.rs#L2) \
+        [missing-end](src.rs#L2-L5) [zero](src.rs#L01) [reverse](src.rs#L3-L2) \
+        [named](src.rs#License) [decoded](src.rs#%4C2) [once](src.rs#%254C2)";
+    let encode = |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+    let prefix = "\u{feff}head\r";
+    let second = "\u{010a}🦀\r\n";
+    let third = "third\r";
+    let bytes = encode(&format!("{prefix}{second}{third}last"));
+    let start = encode(prefix).len() as u64;
+    let second_end = start + encode(second).len() as u64;
+    let end = second_end + encode(third).len() as u64;
+    let f = Fixture::new(&[entry(b"README.md", source), entry(b"src.rs", &bytes)], true);
+    let mut saved = f.open(56501);
+    let result = prepare(&mut saved, 1);
+    assert!(result.get("relationships_complete").flag());
+    assert_eq!(result.get("member_bytes_read").number(), (source.len() + bytes.len()) as u64);
+    assert_eq!(result.get("retained_source_payload_bytes").number(), 0);
+    let links = result.get("links").array();
+    for (index, expected) in ["resolved-lines", "resolved-lines", "resolved-lines", "resolved-lines",
+        "missing-line", "invalid", "invalid", "unsupported", "resolved-lines", "unsupported"].iter().enumerate() {
+        assert_eq!(links[index].get("fragment_resolution").text(), *expected, "link {}", index + 1);
+        if *expected == "invalid" { assert_eq!(links[index].get("fragment_slug"), &Json::Null); }
+        if *expected != "resolved-lines" { assert_eq!(links[index].get("target_range"), &Json::Null); }
+    }
+    for (index, first, last) in [(0, end, bytes.len() as u64), (1, 0, end),
+        (2, start, end), (3, start, second_end), (8, start, second_end)] {
+        let range = links[index].get("target_range");
+        assert_eq!(range.get("start").number(), first);
+        assert_eq!(range.get("end").number(), last);
+    }
+    assert_eq!(links[8].get("fragment_slug").text(), "L2");
+    assert_eq!(links[9].get("fragment_slug").text(), "%4C2");
+    let (mut reader, response) = saved.open_relationship_reader(owner(56502), 1, 3, Side::Target, || false).unwrap();
+    let receipt = json(&response);
+    assert_eq!(receipt.get("fragment_resolution").text(), "resolved-lines");
+    assert_eq!(receipt.get("selection"), links[2].get("target_range"));
+    assert_eq!(receipt.get("offset").number(), start);
+    assert_eq!(receipt.get("window").get("requested_original_range").get("start").number(), start.saturating_sub(128));
+    assert!(!receipt.get("live_source_reopened").flag());
+    let mut desk = DeskSession::new(owner(56503), DeskLimits::default()).unwrap();
+    let opened = saved.open_relationship_desk(&mut desk, 0, 1, 1, 3, Side::Target, || false).unwrap();
+    let pane = opened.imported.change.active.unwrap();
+    assert_eq!(desk.model().selected_bytes(pane, 1).unwrap(), &bytes[start as usize..end as usize]);
+    assert_eq!(json(&saved.desk_open_response(&desk, &opened).unwrap()).get("fragment_resolution").text(), "resolved-lines");
+    drop(saved);
+    fs::rename(&f.path, f.root.join("moved-lines.fcbs")).unwrap();
+    assert_eq!(json(&reader.copy_range(start, end, || false).unwrap()).get("original_hex").text(), hex(&bytes[start as usize..end as usize]));
+    assert_eq!(desk.model().selected_bytes(pane, 1).unwrap(), &bytes[start as usize..end as usize]);
+}
+
+#[test]
+fn saved_source_line_budget_refusal_is_not_missing_and_retry_keeps_capture_authority() {
+    let source = b"[first](large.rs#L2) [overlap](large.rs#L1-L2) [absent](large.rs#L3)";
+    let mut bytes = vec![b'x'; MAX_DOCUMENT_LINK_SOURCE_BYTES + 11];
+    bytes.extend_from_slice(b"\nlast\n");
+    let start = bytes.len() - b"last\n".len();
+    let f = Fixture::new(&[entry(b"README.md", source), entry(b"large.rs", &bytes)], true);
+    let mut saved = f.open(56510);
+    let limited = json(&saved.prepare_relationships(1, 64, source.len() as u64, || false).unwrap());
+    assert!(limited.get("relationships_complete").flag());
+    assert_eq!(limited.get("member_bytes_read").number(), source.len() as u64);
+    for link in limited.get("links").array() {
+        assert_eq!(link.get("fragment_resolution").text(), "limited");
+        assert_eq!(link.get("target_range"), &Json::Null);
+    }
+    let accepted = prepare(&mut saved, 2);
+    let links = accepted.get("links").array();
+    assert_eq!(accepted.get("member_bytes_read").number(), (source.len() + bytes.len()) as u64);
+    assert_eq!(links[0].get("fragment_resolution").text(), "resolved-lines");
+    assert_eq!(links[0].get("target_range").get("start").number(), start as u64);
+    assert_eq!(links[0].get("target_range").get("end").number(), bytes.len() as u64);
+    assert_eq!(links[1].get("fragment_resolution").text(), "resolved-lines");
+    whole(links[1].get("target_range"), &bytes);
+    assert_eq!(links[2].get("fragment_resolution").text(), "missing-line");
+    assert_eq!(links[2].get("target_range"), &Json::Null);
 }
 
 #[test]
