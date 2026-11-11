@@ -86,6 +86,24 @@ char *fcb_reader_position(uint64_t handle, uint64_t line, uint64_t column,
  * max_scan_bytes is original input work over the already captured source. */
 char *fcb_reader_find(uint64_t handle, uint64_t generation, const char *needle,
     uint64_t max_matches, uint64_t max_scan_bytes);
+
+#define FCB_READER_FIND_IGNORE_CASE UINT64_C(1)
+#define FCB_READER_FIND_COUNT_ALL UINT64_C(2)
+/* Additive Find options; flags=0 preserves fcb_reader_find exactly. Rejects
+ * unknown flag bits. IGNORE_CASE uses Rust Unicode lowercase comparison, not
+ * locale rules, full case folding or canonical normalization. Each insensitive
+ * row includes matched_text and original_hex for its own original source range;
+ * the query text is never substituted for that spelling. literal_original_hex
+ * is null for insensitive results. Overlapping occurrences remain distinct.
+ * COUNT_ALL continues within max_scan_bytes after retained rows fill, including
+ * zero-row counting. match_count_complete/search_complete remain false after
+ * byte exhaustion or unsupported decoding. rows_truncated is independent.
+ * Responses name case_sensitive, count_all_matches and retained_limit. Long
+ * needles may lower retained_limit to bound the complete response and witness
+ * storage. max_matches=0 requires COUNT_ALL on the IGNORE_CASE route.
+ * Cancellation/failure preserves the previously accepted query and capture. */
+char *fcb_reader_find_with_options(uint64_t handle, uint64_t generation,
+    const char *needle, uint64_t max_matches, uint64_t max_scan_bytes, uint64_t flags);
 char *fcb_reader_hit(uint64_t handle, uint64_t generation, uint64_t index, uint64_t context_bytes);
 
 /* Exact byte exports as JSON hex; no clipboard or filesystem write. The range

@@ -35,6 +35,29 @@ private func findPacket(_ generation: UInt64 = 1, needle: String = "😀") -> [S
     }
     return out
 }
+private func configuredPacket(_ generation: UInt64 = 1, needle: String = "😀",
+                              options: AtlasReaderFindOptions, retainedLimit: UInt64 = 4096) -> [String: Any] {
+    if options == .init() { return findPacket(generation, needle: needle) }
+    // Fixture-only original spelling; the production host owns matching.
+    let original = !options.caseSensitive && needle == "ONE" ? "one" : needle
+    var out = findPacket(generation, needle: original)
+    var rows = Array((out["hits"] as! [[String: Any]]).prefix(Int(retainedLimit)))
+    out["needle"] = needle
+    out["mode"] = options.caseSensitive ? "exact-decoded-literal" : "unicode-lowercase-literal"
+    out["case_sensitive"] = options.caseSensitive; out["count_all_matches"] = options.countAllMatches
+    out["retained_limit"] = String(retainedLimit); out["retained_hits"] = String(rows.count)
+    out["rows_truncated"] = ranges(original).count > rows.count; out["match_count_complete"] = true
+    if !options.caseSensitive {
+        out["literal_original_hex"] = NSNull()
+        for index in rows.indices {
+            let hit = ranges(original)[index]
+            rows[index]["matched_text"] = original
+            rows[index]["original_hex"] = hex(sourceBytes[Int(hit.0)..<Int(hit.1)])
+        }
+    } else if rows.isEmpty { out["literal_original_hex"] = NSNull() }
+    out["hits"] = rows
+    return out
+}
 private func pagePacket(command: String = "window", generation: UInt64 = 1, needle: String = "😀", hit index: Int = 0,
                         offset: UInt64 = 0, bytes: UInt64 = AtlasReaderLimits.pageBytes) -> [String: Any] {
     var out = header(command)
@@ -83,6 +106,20 @@ private final class Transport: @unchecked Sendable {
             return json(pagePacket(command: "hit", generation: generation, needle: value, hit: Int(index)))
         })
     }
+    var configurableSearch: AtlasReaderSearchTransport {
+        let legacy = search
+        return AtlasReaderSearchTransport(find: legacy.find, hit: legacy.hit,
+            findWithOptions: { [self] _, generation, value, count, bytes, flags in
+                precondition(!Thread.isMainThread && count == 4096 && bytes == UInt64(sourceBytes.count))
+                precondition(flags <= 3)
+                let options = AtlasReaderFindOptions(caseSensitive: flags & 1 == 0, countAllMatches: flags & 2 != 0)
+                lock.lock(); needle = !options.caseSensitive && value == "ONE" ? "one" : value
+                let block = paused; paused = false
+                calls.append("find:\(generation)"); calls.append("flags:\(flags)"); lock.unlock()
+                if block { entered.signal(); precondition(gate.wait(timeout: .now() + .seconds(5)) == .success) }
+                return json(configuredPacket(generation, needle: value, options: options))
+            })
+    }
 }
 
 @main struct AtlasReaderSearchTests {
@@ -129,6 +166,63 @@ private final class Transport: @unchecked Sendable {
         var noHits = findPacket(needle: "absent"); noHits["state"] = "unsupported-text"; noHits["search_complete"] = false; noHits["unsupported_at"] = "0"
         let unsupported = try AtlasReaderFindReport.decode(json(noHits), info: info, generation: 1, needle: "absent")
         check(!unsupported.complete && unsupported.hits.isEmpty, "unsupported source became exhaustive no-match")
+        let lowercase = AtlasReaderFindOptions(caseSensitive: false, countAllMatches: false)
+        let lowerPacket = configuredPacket(needle: "ONE", options: lowercase)
+        let lower = try AtlasReaderFindReport.decode(json(lowerPacket), info: info, generation: 1,
+            needle: "ONE", options: lowercase)
+        check(lower.complete && lower.hits.count == 1 && lower.options == lowercase,
+              "declared lowercase request lost its mode")
+        let lowerTarget = lower.target(at: 0)!
+        check(lowerTarget.needle == "one" && lowerTarget.originalHex == "6f006e006500",
+              "query spelling substituted for original UTF-16 witness")
+        let lowerPage = try AtlasReaderPage.decode(json(pagePacket(command: "hit", needle: "one")),
+            info: info, request: .hit(lowerTarget))
+        check(lowerPage.selection?.target.start == 8 && lowerPage.selection?.utf8Start == 5,
+              "case-insensitive hit did not retain exact capture coordinates")
+        rejects("lowercase packet accepted as exact") {
+            _ = try AtlasReaderFindReport.decode(json(lowerPacket), info: info, generation: 1, needle: "ONE")
+        }
+        let counting = AtlasReaderFindOptions(caseSensitive: true, countAllMatches: true)
+        let countPacket = configuredPacket(options: counting, retainedLimit: 1)
+        let counted = try AtlasReaderFindReport.decode(json(countPacket), info: info, generation: 1,
+            needle: "😀", options: counting)
+        check(counted.complete && counted.matchesSeen == 2 && counted.hits.count == 1 && counted.retainedLimit == 1,
+              "full count became truncated coverage or invented retained rows")
+        check(counted.summary.contains("2 exact matches counted") && counted.summary.contains("first 1"),
+              "summary hid counted occurrences outside navigation rows")
+        let zeroCount = try AtlasReaderFindReport.decode(json(configuredPacket(options: counting, retainedLimit: 0)),
+            info: info, generation: 1, needle: "😀", options: counting)
+        check(zeroCount.complete && zeroCount.matchesSeen == 2 && zeroCount.target(at: 0) == nil,
+              "zero-row count lost its complete count or authorized a phantom target")
+        let invalidCountFields: [(String, Any)] = [("case_sensitive", false), ("count_all_matches", false),
+            ("match_count_complete", false), ("rows_truncated", false), ("retained_limit", "0"),
+            ("matches_seen", "18446744073709551615"), ("matches_seen", String(sourceBytes.count + 1))]
+        for (key, value) in invalidCountFields {
+            var bad = countPacket; bad[key] = value
+            rejects("inconsistent counted \(key)") {
+                _ = try AtlasReaderFindReport.decode(json(bad), info: info, generation: 1, needle: "😀", options: counting)
+            }
+        }
+        for key in ["case_sensitive", "count_all_matches", "match_count_complete", "rows_truncated", "retained_limit"] {
+            var bad = lowerPacket; bad.removeValue(forKey: key)
+            rejects("missing declared option \(key)") {
+                _ = try AtlasReaderFindReport.decode(json(bad), info: info, generation: 1, needle: "ONE", options: lowercase)
+            }
+        }
+        var incompleteCount = countPacket
+        incompleteCount["search_complete"] = false; incompleteCount["match_count_complete"] = false
+        incompleteCount["state"] = "byte-limit"; incompleteCount["scanned_bytes"] = "18"
+        let observedCount = try AtlasReaderFindReport.decode(json(incompleteCount), info: info, generation: 1,
+            needle: "😀", options: counting)
+        check(!observedCount.complete && observedCount.summary.contains("More matches may exist"),
+              "byte-limited count became an exhaustive answer")
+        for (key, value) in [("matched_text", ""), ("original_hex", "6f"), ("original_hex", "6F006E006500")] {
+            var bad = lowerPacket; var rows = bad["hits"] as! [[String: Any]]
+            rows[0][key] = value; bad["hits"] = rows
+            rejects("invalid lowercase row witness \(key)") {
+                _ = try AtlasReaderFindReport.decode(json(bad), info: info, generation: 1, needle: "ONE", options: lowercase)
+            }
+        }
         for invalid in ["", "a\0b", String(repeating: "a", count: 4097)] {
             rejects("invalid find input") { try AtlasReaderFindReport.validateNeedle(invalid) }
         }
@@ -158,6 +252,26 @@ private final class Transport: @unchecked Sendable {
         rejects("case-changed reader spelling borrowed an original witness") {
             _ = try AtlasReaderPage.decode(json(widePagePacket), info: wideInfo, request: .hit(wideTarget))
         }
+        let expandedNeedle = String(repeating: "k", count: 4096)
+        let expandedOriginal = String(repeating: "K", count: 4096)
+        let expandedHex = String(repeating: "2a21", count: 4096)
+        var expanded = wideFind
+        expanded["needle"] = expandedNeedle; expanded["mode"] = "unicode-lowercase-literal"
+        expanded["case_sensitive"] = false; expanded["count_all_matches"] = false
+        expanded["retained_limit"] = "15"; expanded["match_count_complete"] = true; expanded["rows_truncated"] = false
+        expanded["literal_original_hex"] = NSNull()
+        expanded["hits"] = [["hit_index": "0", "occurrence_id": "1", "original_range": ["start": "2", "end": "8194"],
+            "matched_text": expandedOriginal, "original_hex": expandedHex]]
+        let expandedReport = try AtlasReaderFindReport.decode(json(expanded), info: wideInfo, generation: 1,
+            needle: expandedNeedle, options: lowercase)
+        let expandedTarget = expandedReport.target(at: 0)!
+        try AtlasReaderRequest.hit(expandedTarget).validate(capturedBytes: 8194)
+        widePagePacket["text"] = expandedOriginal; widePagePacket["original_hex"] = "fffe" + expandedHex
+        widePagePacket["selection"] = ["query_generation": "1", "original_range": ["start": "2", "end": "8194"],
+            "window_utf8_range": ["start": "0", "end": "12288"], "original_hex": expandedHex]
+        let expandedPage = try AtlasReaderPage.decode(json(widePagePacket), info: wideInfo, request: .hit(expandedTarget))
+        check(expandedPage.selection?.target.needle.utf8.count == 12288,
+              "longer original lowercase spelling was incorrectly admitted as another query or refused as a hit")
         var unicode = findPacket(needle: "é")
         unicode["needle"] = "e\u{301}"
         rejects("query canonical alias accepted") { _ = try AtlasReaderFindReport.decode(json(unicode), info: info, generation: 1, needle: "é") }
@@ -246,6 +360,35 @@ private final class Transport: @unchecked Sendable {
             check(model.findReport?.generation == 2 && !driver.log.contains("hit:1:0"), "canceled query published or reused generation")
             model.close()
             wait("canceled query capture did not retire") { driver.log.contains("close") }
+        }
+        do {
+            let driver = Transport()
+            let model = AtlasPagedReaderModel(transport: driver.source, search: driver.configurableSearch)
+            model.open(root: "/project", path: "unicode", accessLease: nil)
+            wait("configurable find model open") { !model.busy && model.page != nil }
+            check(model.canConfigureFind, "optional Find capability hidden")
+            model.findOptions = lowercase; model.fileQuery = "ONE"; model.find()
+            wait("case-insensitive source activation") { !model.busy && model.selectedHitIndex == 0 }
+            check(model.findIsCurrent && model.matchHex == "6f006e006500"
+                && model.nativeSelectionRange == NSRange(location: 3, length: 3), "original lowercase source selection/copy")
+            let retained = model.source
+            model.findOptions.countAllMatches = true
+            check(model.findReport == nil && model.matchHex == nil && model.nativeSelectionRange == nil
+                && model.source === retained, "option edit did not synchronously revoke old query authority")
+            driver.pauseFind(); model.find()
+            wait("counting query entered worker") { driver.entered.wait(timeout: .now()) == .success }
+            model.findOptions.caseSensitive = true
+            check(!model.busy && model.findReport == nil, "case edit did not cancel pending count")
+            model.fileQuery = "one"; model.find(); driver.gate.signal()
+            wait("replacement option query drained") {
+                !model.busy && model.findReport?.generation == 3 && model.selectedHitIndex == 0
+            }
+            check(model.findReport?.options == counting && driver.log.contains("flags:1")
+                && driver.log.contains("flags:3") && driver.log.contains("flags:2"), "requested option bits lost across worker")
+            check(!driver.log.contains("hit:2:0") && model.matchHex == "6f006e006500",
+                  "canceled option query published or borrowed replacement authority")
+            model.close()
+            wait("configurable find reader did not retire") { driver.log.contains("close") }
         }
         print("PASS: \(checks) retained-file find, UTF-16 hit, generation, copy and cancellation checks")
     }

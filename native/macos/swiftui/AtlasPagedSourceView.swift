@@ -101,6 +101,7 @@ import AppKit
         .onChange(of: model.navigation) { _, _ in copyNotice = "" }
         .onChange(of: model.textSelection?.id) { _, _ in copyNotice = "" }
         .onChange(of: Array(model.fileQuery.utf8)) { _, _ in copyNotice = "" }
+        .onChange(of: model.findOptions) { _, _ in copyNotice = "" }
         .onChange(of: Array(model.referenceName.utf8)) { _, _ in copyNotice = "" }
     }
 
@@ -413,8 +414,14 @@ import AppKit
                 TextField("Find in retained file…", text: $model.fileQuery)
                     .frame(width: 190)
                     .textFieldStyle(.roundedBorder).onSubmit(model.find)
-                    .accessibilityLabel("Exact text to find in this retained file")
+                    .accessibilityLabel("Text to find in this retained file")
                 Button("Find", action: model.find).disabled(!model.canFind || model.fileQuery.isEmpty)
+                Toggle("Match case", isOn: $model.findOptions.caseSensitive)
+                    .disabled(!model.canConfigureFind)
+                    .help("When off, compare Unicode lowercase spellings. Original source characters and bytes remain unchanged.")
+                Toggle("Count all matches", isOn: $model.findOptions.countAllMatches)
+                    .disabled(!model.canConfigureFind)
+                    .help("Continue scanning the retained file after navigation rows fill; completeness and retained rows are reported separately.")
                 Button("Outline") { showsOutline = true }
                     .disabled(!model.canBuildOutline)
                     .popover(isPresented: $showsOutline) {

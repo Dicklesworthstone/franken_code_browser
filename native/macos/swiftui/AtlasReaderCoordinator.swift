@@ -168,6 +168,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
         self.documentTransport = document
     }
     var supportsFind: Bool { searchTransport != nil }
+    var supportsFindOptions: Bool { searchTransport?.findWithOptions != nil }
     var supportsOutline: Bool { outlineTransport != nil }
     var supportsReferences: Bool { (session?.transport ?? transport).references != nil }
     var supportsDocument: Bool { documentTransport != nil }
@@ -615,9 +616,10 @@ private final class AtlasReaderSession: @unchecked Sendable {
 
     /// Search the retained source, not the current disk file or only the visible
     /// page. Attempts consume generations even when canceled or refused later.
-    func find(_ needle: String) async throws -> AtlasReaderFindReport {
+    func find(_ needle: String, options: AtlasReaderFindOptions = .init()) async throws -> AtlasReaderFindReport {
         guard let session, let info, let search = searchTransport else { throw AtlasReaderError.unavailable }
         try AtlasReaderFindReport.validateNeedle(needle)
+        guard options == .init() || search.findWithOptions != nil else { throw AtlasReaderError.unavailable }
         let (generation, overflow) = lastFindGeneration.addingReportingOverflow(1)
         guard !overflow else { throw AtlasReaderError.unavailable }
         lastFindGeneration = generation
@@ -630,8 +632,9 @@ private final class AtlasReaderSession: @unchecked Sendable {
         do {
             let report = try await io.perform(cancellation: flag, keepingAlive: [session]) {
                 try AtlasReaderFindReport.decode(
-                    search.find(session.handle, generation, needle, AtlasReaderFindReport.maxHits, info.identity.capturedBytes),
-                    info: info, generation: generation, needle: needle)
+                    search.performFind(session.handle, generation, needle, AtlasReaderFindReport.maxHits,
+                        info.identity.capturedBytes, options: options),
+                    info: info, generation: generation, needle: needle, options: options)
             }
             guard self.session === session, operation == ticket, !flag.isCanceled else { throw AtlasReaderError.canceled }
             acceptedFind = report

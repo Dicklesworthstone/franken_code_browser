@@ -33,6 +33,9 @@ import Observation
             if !oldValue.utf8.elementsEqual(fileQuery.utf8) { clearFileSearch() }
         }
     }
+    var findOptions = AtlasReaderFindOptions() {
+        didSet { if oldValue != findOptions { clearFileSearch() } }
+    }
     private(set) var findReport: AtlasReaderFindReport?
     private(set) var selectedHitIndex: Int?
     private var selectedRange: NSRange?
@@ -132,8 +135,11 @@ import Observation
     var retainedRegistryDomain: UUID? { coordinator.retainedRegistryDomain }
     var retainedCaptureSHA256: String? { coordinator.retainedCaptureSHA256 }
     var canFind: Bool { page != nil && coordinator.supportsFind }
+    var canConfigureFind: Bool { coordinator.supportsFindOptions }
     var canGoToPosition: Bool { page != nil && coordinator.supportsPosition }
-    var findIsCurrent: Bool { findReport?.needle.utf8.elementsEqual(fileQuery.utf8) == true }
+    var findIsCurrent: Bool {
+        findReport?.needle.utf8.elementsEqual(fileQuery.utf8) == true && findReport?.options == findOptions
+    }
     var canMoveHit: Bool { findIsCurrent && findReport?.hits.isEmpty == false && !busy }
     var nativeSelectionRange: NSRange? {
         if let position = page?.position { return position.nativeCaretRange }
@@ -388,6 +394,7 @@ import Observation
                       !target.mode.isTextual || coordinator.supportsFind,
                       target.mode != .occurrences || coordinator.supportsReferences else { throw AtlasReaderError.invalidInput }
                 input = try AtlasReaderInput(captured: target)
+                findOptions = .init()
                 fileQuery = target.mode.isTextual ? target.needle : ""
                 referenceName = target.mode == .occurrences ? target.needle : ""
             } else if let supplied = suppliedSource {
@@ -627,6 +634,7 @@ import Observation
     func find() {
         guard canFind else { return }
         let needle = fileQuery
+        let options = findOptions
         do { try AtlasReaderFindReport.validateNeedle(needle) }
         catch { notice = AtlasReaderError.invalidInput.message; return }
         clearFileSearch()
@@ -634,8 +642,9 @@ import Observation
         notice = "Searching the retained file…"
         task = Task {
             do {
-                let report = try await coordinator.find(needle)
-                guard operation == ticket, !Task.isCancelled, fileQuery.utf8.elementsEqual(needle.utf8) else { return }
+                let report = try await coordinator.find(needle, options: options)
+                guard operation == ticket, !Task.isCancelled, fileQuery.utf8.elementsEqual(needle.utf8),
+                      findOptions == options else { return }
                 findReport = report
                 finish(ticket)
                 notice = report.summary

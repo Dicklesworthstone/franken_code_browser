@@ -103,6 +103,24 @@ pub unsafe extern "C" fn fcb_reader_find(handle: u64, generation: u64, needle: *
     }))
 }
 
+/// Additive Find controls: flags bit 0 enables Unicode lowercase comparison;
+/// bit 1 continues counting after retained rows fill. Other bits are invalid.
+/// # Safety
+/// Same foreign-string lifetime contract as fcb_reader_find.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_reader_find_with_options(handle: u64, generation: u64,
+    needle: *const c_char, max_matches: u64, max_scan_bytes: u64, flags: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| {
+        if flags & !3 != 0 { return Err(AccessError::InvalidArgument); }
+        let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
+        let options = fcb_app::host::reader::ReaderFindOptions {
+            case_sensitive: flags & 1 == 0, count_all_matches: flags & 2 != 0,
+        };
+        readers.execute(handle, Command::FindWithOptions { generation, needle,
+            limit: number(max_matches)?, scan_bytes: max_scan_bytes, options }, || false)
+    }))
+}
+
 /// Exact selection plus bounded source context for a retained query occurrence.
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_reader_hit(handle: u64, generation: u64, index: u64, context_bytes: u64) -> *mut c_char {

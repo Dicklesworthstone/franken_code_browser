@@ -103,7 +103,7 @@ enum AtlasReaderRequest: Equatable, Sendable {
         case .position(let line, let column, _, _):
             guard line > 0, column > 0 else { throw AtlasReaderError.invalidInput }
         case .hit(let target):
-            try AtlasReaderFindReport.validateNeedle(target.needle)
+            try AtlasReaderFindReport.validateMatchedText(target.needle)
             guard target.generation > 0, target.index < AtlasReaderFindReport.maxHits,
                   target.start < target.end, target.end <= capturedBytes,
                   target.end - target.start <= AtlasReaderFindReport.maximumWitnessBytes,

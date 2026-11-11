@@ -111,6 +111,49 @@ fn c_generation_validation_never_selects_a_different_querys_row() {
 }
 
 #[test]
+fn c_find_options_count_beyond_rows_and_keep_original_utf16_witnesses() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let bytes: Vec<u8> = "\u{feff}K K k\r\n".encode_utf16().flat_map(u16::to_be_bytes).collect();
+    let (path, cpath) = file(&bytes);
+    let handle = open(&cpath);
+    fs::write(path, b"changed disk content").unwrap();
+    let needle = CString::new("k").unwrap();
+    let counted = take(unsafe { fcb_reader_find_with_options(handle, 1, needle.as_ptr(), 1, bytes.len() as u64, 3) });
+    assert!(counted.contains("\"mode\":\"unicode-lowercase-literal\""), "{counted}");
+    assert!(counted.contains("\"search_complete\":true"));
+    assert!(counted.contains("\"match_count_complete\":true"));
+    assert!(counted.contains("\"rows_truncated\":true"));
+    assert!(counted.contains("\"matches_seen\":\"3\""));
+    assert!(counted.contains("\"retained_hits\":\"1\""));
+    assert!(counted.contains("\"matched_text\":\"K\""));
+    assert!(counted.contains("\"original_hex\":\"212a\""));
+    assert!(counted.contains("\"original_range\":{\"start\":\"2\",\"end\":\"4\"}"));
+    let hit = take(fcb_reader_hit(handle, 1, 0, 64));
+    assert!(hit.contains("K K k\\r\\n"));
+    assert!(hit.contains("\"additional_source_bytes_read\":\"0\""));
+    assert!(take(fcb_reader_copy_hit(handle, 1, 0)).contains("\"original_hex\":\"212a\""));
+    // Failed flag admission must not replace an accepted generation.
+    let invalid = take(unsafe { fcb_reader_find_with_options(handle, 2, needle.as_ptr(), 1, 100, 4) });
+    assert!(invalid.contains("READER_HANDLE_INVALID_ARGUMENT"));
+    assert!(take(fcb_reader_copy_hit(handle, 1, 0)).contains("212a"));
+    let bounded = take(unsafe { fcb_reader_find_with_options(handle, 2, needle.as_ptr(), 1, 100, 1) });
+    assert!(bounded.contains("\"state\":\"match-limit\""));
+    assert!(bounded.contains("\"matches_seen\":\"2\""));
+    assert!(bounded.contains("\"match_count_complete\":false"));
+    assert!(take(fcb_reader_copy_hit(handle, 1, 0)).contains("READER_SESSION_STALE_QUERY"));
+    let zero = take(unsafe { fcb_reader_find_with_options(handle, 3, needle.as_ptr(), 0, 100, 3) });
+    assert!(zero.contains("\"matches_seen\":\"3\""));
+    assert!(zero.contains("\"retained_hits\":\"0\""));
+    assert!(zero.contains("\"search_complete\":true"));
+    assert!(take(fcb_reader_copy_hit(handle, 3, 0)).contains("READER_SESSION_MISSING_HIT"));
+    assert!(take(unsafe { fcb_reader_find_with_options(handle, 4, std::ptr::null(), 1, 100, 3) })
+        .contains("READER_HANDLE_INVALID_ARGUMENT"));
+    assert_eq!(fcb_reader_close(handle), 1);
+    assert!(take(unsafe { fcb_reader_find_with_options(handle, 4, needle.as_ptr(), 1, 100, 3) })
+        .contains("READER_HANDLE_UNKNOWN"));
+}
+
+#[test]
 fn c_typed_positions_keep_utf16_coordinates_on_the_retained_capture() {
     let _guard = FFI_TEST_LOCK.lock().unwrap();
     let bytes: Vec<u8> = "\u{feff}x\r\nA🦀e\u{301}\tZ\r\n"
@@ -191,6 +234,7 @@ fn c_symbol_function_types_match_the_public_header() {
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_reader_lines;
     let _: extern "C" fn(u64, u64, u64, u64, u64) -> *mut c_char = fcb_reader_position;
     let _: unsafe extern "C" fn(u64, u64, *const c_char, u64, u64) -> *mut c_char = fcb_reader_find;
+    let _: unsafe extern "C" fn(u64, u64, *const c_char, u64, u64, u64) -> *mut c_char = fcb_reader_find_with_options;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_reader_hit;
     let _: extern "C" fn(u64, u64, u64) -> *mut c_char = fcb_reader_copy_range;
     let _: extern "C" fn(u64, u64, u64) -> *mut c_char = fcb_reader_copy_hit;

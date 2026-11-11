@@ -140,11 +140,13 @@ after cancellation, another refresh waits for entered I/O to drain.
 
 A validated replacement is installed only while the same window, project,
 byte-exact root, and access grant still own the request. Successful refresh
-restarts current-project search and atlas preparation against the new catalog.
-Quick Open's retained reader, pinned readers, and Reading Desk captures keep
-their original source bytes; refresh does not silently substitute live bytes
-into those captures. File and directory search scopes remain selected, while
-an old visible-atlas scope must be selected again on the new map.
+restarts current-project search against the new catalog while keeping the open
+retained reader's source, page, Find selection, and navigation. Quick Open,
+pinned readers, and Reading Desk captures also keep their original source bytes.
+The earlier atlas keeps its membership, previews, and navigation until you
+choose **Rebuild atlas**; **Project Files** shows the refreshed discovery
+separately. File and directory search scopes remain selected, while an old
+visible-atlas scope must be selected again after the new map is built.
 
 Filesystem-change notices are hints to refresh. A partial first page remains
 partial, and the notice clears only after complete discovery without omissions
@@ -447,12 +449,17 @@ Widening a query beyond that captured scope can therefore leave files
 uncaptured until Refresh. Indexed queries and result activation do no live
 source reads.
 
-Both routes retain at most 1,000 primary matches. Exact case-sensitive live
-text search continues counting through its admitted file scope after those rows
-fill, so a complete scan may report an exhaustive match count while keeping only
-the first 1,000 selectable captures. Case-insensitive, expression and structural
-modes retain their separate bounded-result completeness contracts. Live capture
-and index preparation admit at most 4,096 files, 1 MiB per file and 32 MiB of
+Both routes retain at most 1,000 primary matches. **Count all matches** starts
+enabled for Text and Expression searches, with either case choice, across live
+captures and the retained workspace index. Counting continues through the
+admitted scope after navigation rows fill; expressions count primary occurrences
+only after their same-capture predicates succeed. A complete scan can report an
+exhaustive total while retaining only the first 1,000 selectable matches.
+Eligible files outside the captured scope, unavailable captures and verification
+limits still leave the count explicitly partial. Turn counting off to stop when
+an additional match proves the navigation-row limit was exceeded. Changing the
+choice starts a fresh query; structural modes keep their separate bounded-result
+contracts. Live capture and index preparation admit at most 4,096 files, 1 MiB per file and 32 MiB of
 aggregate source-read work. A prepared index additionally admits at most 2,097,152 grams;
 files without usable gram coverage use retained-source verification. Each
 expression has a separate **256 MiB verification-work budget**, shared across
@@ -823,6 +830,30 @@ These controls apply within the source reader's existing admission bounds,
 including retained and pinned pages. Native layout, scrolling, and copy
 regressions are included for the configured macOS verification lane;
 physical-Mac execution remains pending.
+
+## Finding text in a retained file
+
+The paged source reader's **Find** scans its complete retained capture, including
+text outside the visible page. **Match case** starts enabled. Turn it off for the
+same Unicode lowercase comparison as workspace search, including `k` matching
+`K` and a lowercase expansion mapping back to the complete original character.
+UTF-8, BOM-marked UTF-16, and original CR/LF/CRLF spellings keep their source-byte
+coordinates. **Previous hit**, **Next hit**, and **Copy hit hex** use each hit's
+original spelling and encoded bytes, even after the disk file changes.
+
+Enable **Count all matches** to continue scanning after navigation rows fill.
+The summary reports the full observed count separately from the retained rows;
+byte limits or unsupported text remain explicitly incomplete. Find retains at
+most 4,096 rows, and long Unicode witnesses can lower that limit to bound the
+response. Queries admit at most 4,096 UTF-8 bytes. Editing the query or either
+option immediately revokes the old hit actions and cancels pending publication
+while preserving the readable source page.
+
+The additive `fcb_reader_find_with_options` ABI preserves the original exact
+Find entry point. Host, C-boundary, and native model/decoder cases cover count
+limits, UTF-16, expansion witnesses and stale/canceled requests. The native suite
+is available through `swiftui/tests/test-reader-search.sh`; independent
+strict-RCH execution and physical-Mac qualification remain pending.
 
 ## Selected passages, copying, and notes
 

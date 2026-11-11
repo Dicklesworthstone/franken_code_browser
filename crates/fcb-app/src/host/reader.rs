@@ -16,6 +16,7 @@ mod comparison;
 mod highlight;
 mod position;
 mod selection;
+mod search;
 pub(crate) mod document;
 mod document_display;
 mod document_links;
@@ -28,6 +29,7 @@ pub use document::{DocumentCopyMode, ReaderDocumentOptions, MAX_READER_DOCUMENT_
 pub use comparison::ReaderComparisonLimits;
 pub use position::ReaderColumnKind;
 pub use selection::MAX_READER_SELECTION_WINDOW_BYTES;
+pub use search::ReaderFindOptions;
 use outline::{AcceptedOutline, SelectionIdentity};
 use references::AcceptedReferences;
 
@@ -35,7 +37,7 @@ use std::{mem::size_of, path::{Path, PathBuf}, sync::Arc};
 use fcb::{ArenaOwnerId, BrowserSession, ByteLength, ByteOffset, ByteRange, FileId, SourceRevision};
 use fcb::search::{CaptureRequest, CompleteCapture, DetectedEncoding, ExtentViewError,
     ObservedExtent, QueryGeneration, ReaderSearch, ResourceAllocationId, ResourceBudget,
-    StreamReadError, StreamReadOptions, StreamReadState, StreamReadStep, StreamingHit, StreamingNeedle, SymbolError};
+    StreamReadError, StreamReadOptions, StreamReadState, StreamReadStep, StreamingNeedle, SymbolError};
 use fcb::source::{SourceError, detect_encoding};
 use fcb::source::line_index::{LineNumber, LineWindowError, LineWindowScanner, LineWindowStatus};
 use fcb::store::{Sha256, Sha256Digest};
@@ -69,6 +71,7 @@ pub enum ReaderSessionError {
     DocumentDisplay(fcb::document::native_display::NativeDisplayError),
     DocumentLinks(fcb::document::links::DocumentLinkError), MissingDocumentLinks, MissingDocumentLink,
     Comparison(fcb::analysis::comparison::ComparisonError),
+    Query(fcb::search::QueryError),
 }
 impl std::fmt::Display for ReaderSessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -81,6 +84,7 @@ impl std::fmt::Display for ReaderSessionError {
             Self::Reference(e) => write!(f, "{e}"),
             Self::DocumentLinks(e) => write!(f, "{e}"),
             Self::Comparison(e) => write!(f, "{e}"),
+            Self::Query(e) => write!(f, "{e}"),
             Self::MissingDocument => f.write_str("READER_SESSION_NO_DOCUMENT"),
             Self::MissingDocumentLinks => f.write_str("READER_SESSION_NO_DOCUMENT_LINKS"),
             Self::MissingDocumentLink => f.write_str("READER_SESSION_MISSING_DOCUMENT_LINK"),
@@ -106,6 +110,11 @@ impl From<StreamReadError> for ReaderSessionError { fn from(e: StreamReadError) 
 impl From<ExtentViewError> for ReaderSessionError { fn from(e: ExtentViewError) -> Self { Self::View(e) } }
 impl From<LineWindowError> for ReaderSessionError { fn from(e: LineWindowError) -> Self { Self::Lines(e) } }
 impl From<SymbolError> for ReaderSessionError { fn from(e: SymbolError) -> Self { Self::Symbol(e) } }
+impl From<fcb::search::QueryError> for ReaderSessionError {
+    fn from(e: fcb::search::QueryError) -> Self {
+        if e == fcb::search::QueryError::Canceled { Self::Canceled } else { Self::Query(e) }
+    }
+}
 impl From<fcb::search::symbols::ReferenceError> for ReaderSessionError {
     fn from(e: fcb::search::symbols::ReferenceError) -> Self { Self::Reference(e) }
 }
@@ -116,7 +125,7 @@ impl From<OutputError> for ReaderSessionError { fn from(e: OutputError) -> Self 
 
 struct AcceptedQuery {
     generation: u64,
-    hits: Vec<StreamingHit>,
+    hits: Vec<ByteRange>,
     _lease: ResourceLease,
 }
 
@@ -253,7 +262,7 @@ impl ReaderSession {
     pub fn hit_range(&self, generation: u64, position: usize) -> Result<ByteRange, ReaderSessionError> {
         let query = self.query.as_ref().ok_or(ReaderSessionError::MissingHit)?;
         if query.generation != generation { return Err(ReaderSessionError::StaleQuery); }
-        query.hits.get(position).map(|h| h.original_range()).ok_or(ReaderSessionError::MissingHit)
+        query.hits.get(position).copied().ok_or(ReaderSessionError::MissingHit)
     }
     pub fn info(&mut self, mut canceled: impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
         check(&mut canceled)?;
@@ -332,7 +341,7 @@ impl ReaderSession {
         self.last_query_attempt = generation;
         check(&mut canceled)?;
         let [pattern_id, worker_id, result_id] = self.allocations()?;
-        let charge = max_matches.checked_mul(size_of::<StreamingHit>())
+        let charge = max_matches.checked_mul(size_of::<ByteRange>())
             .and_then(|n| n.checked_add(size_of::<AcceptedQuery>())).ok_or(AppError::Admission)?;
         let lease = self.budget.try_reserve_managed(self.owner(), result_id, ByteLength::new(charge as u64))
             .map_err(|_| AppError::Admission)?;
@@ -350,7 +359,7 @@ impl ReaderSession {
         check(&mut canceled)?;
         if report.state() == StreamReadState::Canceled { return Err(ReaderSessionError::Canceled); }
         if let StreamReadState::Failed(error) = report.state() { return Err(error.into()); }
-        hits.extend_from_slice(report.hits());
+        hits.extend(report.hits().iter().map(|hit| hit.original_range()));
         let mut out = self.output("find")?;
         out.literal(",\"query_generation\":")?; out.integer(generation)?;
         out.literal(",\"mode\":\"exact-decoded-literal\",\"needle\":")?; out.quoted(needle)?;
@@ -364,7 +373,7 @@ impl ReaderSession {
         out.literal(",\"unsupported_at\":")?;
         if let Some(offset) = report.unsupported_at() { out.integer(offset.get())?; } else { out.literal("null")?; }
         out.literal(",\"hits\":[")?;
-        for (i, hit) in hits.iter().enumerate() {
+        for (i, hit) in report.hits().iter().enumerate() {
             check(&mut canceled)?;
             if i > 0 { out.literal(",")?; }
             out.literal("{\"hit_index\":")?; out.integer(i as u64)?;
