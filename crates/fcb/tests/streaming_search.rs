@@ -6,7 +6,7 @@ use fcb::{ArenaOwnerId, ByteLength, FileId, SourceRevision};
 use fcb::search::{CaptureRequest, CompleteCapture, DirectSourceScanner, QueryGeneration,
     QueryOptions, ReaderSearch, ResourceAllocationId, ResourceBudget, StreamReadError,
     StreamReadOptions, StreamReadState, StreamReadStep, StreamingNeedle};
-use fcb::search::streaming::STREAM_BUFFER_BYTES;
+use fcb::search::streaming::{MAX_STREAM_STEP_HITS, STREAM_BUFFER_BYTES};
 
 fn owner() -> ArenaOwnerId { ArenaOwnerId::new(1215).unwrap() }
 fn generation(id: u64) -> QueryGeneration { QueryGeneration::new(owner(), id).unwrap() }
@@ -116,12 +116,177 @@ fn exact_result_capacity_uses_one_lookahead_and_zero_capacity_can_prove_absence(
         let (_, report) = query.finish().unwrap();
         assert_eq!(report.state(), state); assert_eq!(report.matches_seen(), count);
         assert_eq!(report.hits().len(), limit.min(2));
+        assert!(!report.count_all_matches());
+        assert_eq!(report.hits_truncated(), state == StreamReadState::Truncated);
     }
     let mut options = StreamReadOptions::new(generation(1)); options.max_matches = 0;
     let mut query = ReaderSearch::new(b"nothing".as_slice(), request(), ByteLength::new(7), &pattern,
         options, &budget, allocation(2)).unwrap();
     finish(&mut query, StreamReadStep::default());
     assert_eq!(query.state(), StreamReadState::Complete);
+}
+
+#[test]
+fn counting_keeps_a_bounded_prefix_and_exact_overlap_counts_across_text_encodings() {
+    let text = "banana 😀😀\r\nbanana café\u{feff}😀";
+    let mut utf8_bom = vec![0xef, 0xbb, 0xbf]; utf8_bom.extend_from_slice(text.as_bytes());
+    for bytes in [text.as_bytes().to_vec(), utf8_bom, utf16(text, true), utf16(text, false)] {
+        for needle in ["ana", "😀", "café", "\u{feff}", "absent"] {
+            let budget = budget();
+            let pattern = StreamingNeedle::text(owner(), needle, &budget, allocation(1)).unwrap();
+            let capture = CompleteCapture::new(request(), ByteLength::new(bytes.len() as u64), Arc::from(bytes.as_slice())).unwrap();
+            let oracle = DirectSourceScanner::scan_complete_capture(&capture, needle, &QueryOptions::new(generation(1))).unwrap();
+            let expected: Vec<_> = oracle.matches.iter().map(|hit| hit.original_byte_range).collect();
+            for limit in [0, 1, 2, 8] {
+                for chunk in [1, 3, 7] {
+                    for quantum in [1, STREAM_BUFFER_BYTES] {
+                        let mut options = StreamReadOptions::new(generation(1)); options.max_matches = limit;
+                        let input = Chunks { remaining: &bytes, chunk, calls: 0 };
+                        let mut query = ReaderSearch::new_counting(input, request(), ByteLength::new(bytes.len() as u64),
+                            &pattern, options, &budget, allocation(2)).unwrap();
+                        assert!(query.count_all_matches());
+                        finish(&mut query, StreamReadStep { max_bytes: quantum, max_hits: 1, max_calls: 1 });
+                        let (_, report) = query.finish().unwrap();
+                        assert!(report.input_complete(), "needle={needle}, limit={limit}, chunk={chunk}: {:?}", report.state());
+                        assert!(report.count_all_matches());
+                        assert_eq!(report.matches_seen(), expected.len() as u64);
+                        assert_eq!(report.hits_truncated(), expected.len() > limit);
+                        assert_eq!(report.stats().bytes_read, bytes.len() as u64);
+                        assert_eq!(report.hits().iter().map(|hit| hit.original_range()).collect::<Vec<_>>(),
+                            expected[..expected.len().min(limit)]);
+                        for (index, hit) in report.hits().iter().enumerate() {
+                            let (start, end) = hit.original_range().as_usize_bounds().unwrap();
+                            assert_eq!(report.witness_bytes(index).unwrap(), &bytes[start..end]);
+                            assert_eq!(hit.occurrence_id(), index as u64 + 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn counting_dense_overlaps_keeps_work_and_memory_bounded_after_the_hit_table_fills() {
+    let bytes = vec![b'a'; STREAM_BUFFER_BYTES * 2 + 3];
+    let budget = budget();
+    let pattern = StreamingNeedle::raw(owner(), b"aaa", &budget, allocation(1)).unwrap();
+    let mut options = StreamReadOptions::new(generation(1)); options.max_matches = 2;
+    let mut query = ReaderSearch::new_counting(bytes.as_slice(), request(), ByteLength::new(bytes.len() as u64),
+        &pattern, options, &budget, allocation(2)).unwrap();
+    let charge = budget.accounting().reserved().get();
+    for step in [StreamReadStep { max_bytes: 0, ..Default::default() },
+        StreamReadStep { max_hits: 0, ..Default::default() }] {
+        query.step(step, generation(1), || false).unwrap();
+        assert_eq!(query.stats().bytes_read, 0); assert_eq!(query.matches_seen(), 0);
+    }
+    let step = StreamReadStep { max_bytes: 97, max_hits: 3, max_calls: 1 };
+    for _ in 0..100_000 {
+        if query.state() != StreamReadState::Pending { break; }
+        let before = query.matches_seen();
+        query.step(step, generation(1), || false).unwrap();
+        assert!(query.matches_seen() - before <= step.max_hits.min(MAX_STREAM_STEP_HITS) as u64);
+        assert!(query.stats().last_step_read <= step.max_bytes);
+        assert!(query.stats().last_step_scanned <= step.max_bytes);
+        assert!(query.stats().last_step_calls <= step.max_calls);
+        assert!(query.hits().len() <= options.max_matches);
+        assert_eq!(budget.accounting().reserved().get(), charge);
+    }
+    let (_, report) = query.finish().unwrap();
+    assert!(report.input_complete()); assert!(report.hits_truncated());
+    assert_eq!(report.matches_seen(), bytes.len() as u64 - 2);
+    assert_eq!(report.hits().len(), 2);
+    assert_eq!(report.hits()[0].original_range().start().get(), 0);
+    assert_eq!(report.hits()[1].original_range().start().get(), 1);
+    assert!(report.stats().peak_buffer_bytes <= STREAM_BUFFER_BYTES);
+}
+
+#[test]
+fn counting_with_zero_retention_can_prove_empty_input_or_no_matches() {
+    let budget = budget();
+    let pattern = StreamingNeedle::raw(owner(), b"a", &budget, allocation(1)).unwrap();
+    for bytes in [b"".as_slice(), b"bbb".as_slice()] {
+        let mut options = StreamReadOptions::new(generation(1)); options.max_matches = 0;
+        let mut query = ReaderSearch::new_counting(bytes, request(), ByteLength::new(bytes.len() as u64),
+            &pattern, options, &budget, allocation(2)).unwrap();
+        finish(&mut query, StreamReadStep::default());
+        let (_, report) = query.finish().unwrap();
+        assert!(report.input_complete()); assert!(report.count_all_matches());
+        assert_eq!(report.matches_seen(), 0); assert!(report.hits().is_empty());
+        assert!(!report.hits_truncated());
+    }
+}
+
+#[test]
+fn counting_after_overflow_still_stops_at_byte_call_and_short_read_limits() {
+    let budget = budget();
+    let pattern = StreamingNeedle::raw(owner(), b"aa", &budget, allocation(1)).unwrap();
+    for (max_bytes, max_calls, supplied, state, read, matches) in [
+        (4, 100, 6, StreamReadState::ByteLimit, 4, 3),
+        (100, 2, 6, StreamReadState::CallLimit, 4, 3),
+        (100, 100, 4, StreamReadState::ShortRead, 4, 3),
+        (0, 100, 6, StreamReadState::ByteLimit, 0, 0),
+        (100, 0, 6, StreamReadState::CallLimit, 0, 0),
+    ] {
+        let mut options = StreamReadOptions::new(generation(1));
+        options.max_matches = 0; options.max_bytes = max_bytes; options.max_read_calls = max_calls;
+        let input = Chunks { remaining: &b"aaaaaa"[..supplied], chunk: 2, calls: 0 };
+        let mut query = ReaderSearch::new_counting(input, request(), ByteLength::new(6), &pattern,
+            options, &budget, allocation(2)).unwrap();
+        finish(&mut query, StreamReadStep { max_bytes: 3, max_hits: 1, max_calls: 1 });
+        let (_, report) = query.finish().unwrap();
+        assert_eq!(report.state(), state); assert!(!report.input_complete());
+        assert_eq!(report.stats().bytes_read, read); assert_eq!(report.matches_seen(), matches);
+        assert!(report.hits().is_empty()); assert_eq!(report.hits_truncated(), matches > 0);
+    }
+}
+
+#[test]
+fn counting_checks_malformed_suffixes_after_omitting_earlier_text_matches() {
+    let budget = budget();
+    let pattern = StreamingNeedle::text(owner(), "needle", &budget, allocation(1)).unwrap();
+    for bytes in [b"needle needle\xff".to_vec(), [utf16("needle needle", true), vec![0x00, 0xd8]].concat(),
+        [utf16("needle needle", false), vec![0xff]].concat()] {
+        for limit in [0, 1] {
+            let mut options = StreamReadOptions::new(generation(1)); options.max_matches = limit;
+            let input = Chunks { remaining: &bytes, chunk: 1, calls: 0 };
+            let mut query = ReaderSearch::new_counting(input, request(), ByteLength::new(bytes.len() as u64),
+                &pattern, options, &budget, allocation(2)).unwrap();
+            let mut most_seen = 0;
+            for _ in 0..1_000 {
+                if query.state() != StreamReadState::Pending { break; }
+                query.step(StreamReadStep::default(), generation(1), || false).unwrap();
+                most_seen = most_seen.max(query.matches_seen());
+            }
+            let (_, report) = query.finish().unwrap();
+            assert_eq!(most_seen, 2);
+            assert_eq!(report.state(), StreamReadState::UnsupportedText); assert!(!report.input_complete());
+            assert!(report.unsupported_at().is_some());
+            assert_eq!(report.matches_seen(), 0); assert!(report.hits().is_empty());
+            assert!(!report.hits_truncated());
+        }
+    }
+}
+
+#[test]
+fn counting_cancellation_or_stale_generation_stops_reads_after_retention_fills() {
+    let budget = budget();
+    let pattern = StreamingNeedle::raw(owner(), b"a", &budget, allocation(1)).unwrap();
+    for stale in [false, true] {
+        let mut options = StreamReadOptions::new(generation(1)); options.max_matches = 0;
+        let mut query = ReaderSearch::new_counting(b"aaaaaaaa".as_slice(), request(), ByteLength::new(8),
+            &pattern, options, &budget, allocation(2)).unwrap();
+        query.step(StreamReadStep { max_bytes: 1, ..Default::default() }, generation(1), || false).unwrap();
+        assert_eq!(query.matches_seen(), 1); assert_eq!(query.state(), StreamReadState::Pending);
+        let before = query.stats().bytes_read;
+        let result = query.step(StreamReadStep::default(), generation(if stale { 2 } else { 1 }), || !stale);
+        if stale { assert_eq!(result, Err(StreamReadError::StaleGeneration)); }
+        query.step(StreamReadStep::default(), generation(1), || false).unwrap();
+        assert_eq!(query.state(), StreamReadState::Canceled); assert_eq!(query.stats().bytes_read, before);
+        let (_, report) = query.finish().unwrap();
+        assert!(!report.input_complete()); assert!(report.hits_truncated());
+        assert_eq!(report.matches_seen(), 1); assert!(report.count_all_matches());
+    }
 }
 
 #[test]

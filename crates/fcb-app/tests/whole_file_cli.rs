@@ -115,6 +115,128 @@ fn result_limit_is_shared_and_exactly_full_is_not_proof_of_truncation() {
 }
 
 #[test]
+fn count_all_separates_complete_counts_from_retained_rows_across_buffers() {
+    let temp = Temp::new();
+    let bytes = vec![b'a'; 32 * 1024 + 5];
+    let file = temp.file("overlapping.rs", &bytes);
+    // Negative control: the unchanged default must still stop at the first
+    // excess witness, rather than accidentally opt every search into more I/O.
+    let (exit, limited) = invoke(&file, &["--whole-file", "--text", "aa", "--limit", "1"]);
+    assert_eq!(exit, EXIT_PARTIAL);
+    assert!(!limited.get("count_all_matches").flag());
+    assert!(!limited.get("match_count_complete").flag());
+    assert_eq!(limited.get("matches_seen").number(), 2);
+    let (exit, counted) = invoke(&file, &["--whole-file", "--text", "aa", "--limit", "1", "--count-all"]);
+    // Exit 3 continues to disclose omitted rows; the count has its own proof.
+    assert_eq!(exit, EXIT_PARTIAL);
+    assert!(counted.get("count_all_matches").flag());
+    assert!(counted.get("whole_file_complete").flag());
+    assert!(counted.get("match_count_complete").flag());
+    assert!(counted.get("truncated").flag());
+    assert_eq!(counted.get("state").text(), "complete-observed-input");
+    assert_eq!(counted.get("matches_seen").number(), (bytes.len() - 1) as u64);
+    assert_eq!(counted.get("stored_hits").number(), 1);
+    assert_eq!(counted.get("hits").array().len(), 1);
+    assert_eq!(counted.get("literal_original_hex").text(), "6161");
+    assert_eq!(counted.get("payload_bytes_read").number(), bytes.len() as u64);
+    assert!(counted.get("peak_input_buffer_bytes").number() <= 16 * 1024);
+}
+
+#[test]
+fn count_all_visits_later_files_and_counts_utf16_without_retaining_more_hits() {
+    let temp = Temp::new();
+    temp.file("a.rs", b"banana banana");
+    temp.file("b.rs", &utf16("banana", true));
+    temp.file("c.rs", &utf16("banana banana", false));
+    temp.file("d.rs", b"absent");
+    let (exit, counted) = invoke(&temp.0, &["--workspace", "--whole-file", "--text", "ana",
+        "--limit", "1", "--count-all"]);
+    assert_eq!(exit, EXIT_PARTIAL);
+    assert!(counted.get("workspace_complete").flag());
+    assert!(counted.get("match_count_complete").flag());
+    assert!(counted.get("truncated").flag());
+    assert_eq!(counted.get("matches_seen").number(), 10);
+    assert_eq!(counted.get("stored_hits").number(), 1);
+    assert_eq!(counted.get("matching_files").number(), 3);
+    assert_eq!(counted.get("files_examined").number(), 4);
+    assert_eq!(counted.get("unexamined_files").number(), 0);
+    assert_eq!(counted.get("incomplete_files").number(), 0);
+    assert_eq!(counted.get("stop_reason"), &Json::Null);
+    let files = counted.get("files").array();
+    assert_eq!(files[1].get("matches_seen").number(), 2);
+    assert!(files[1].get("hits").array().is_empty());
+    assert_eq!(files[1].get("literal_original_hex"), &Json::Null);
+    assert_eq!(files[2].get("matches_seen").number(), 4);
+    assert!(files.iter().all(|file| file.get("whole_file_complete").flag()));
+}
+
+#[test]
+fn zero_retention_counting_distinguishes_presence_and_complete_absence() {
+    let temp = Temp::new(); let file = temp.file("file.rs", b"banana");
+    let (exit, counted) = invoke(&file, &["--whole-file", "--text", "ana", "--count-all", "--limit", "0"]);
+    assert_eq!(exit, EXIT_PARTIAL);
+    assert!(counted.get("match_count_complete").flag());
+    assert_eq!(counted.get("matches_seen").number(), 2);
+    assert!(counted.get("hits").array().is_empty());
+    assert_eq!(counted.get("literal_original_hex"), &Json::Null);
+    let (exit, absent) = invoke(&file, &["--whole-file", "--text", "missing", "--count-all", "--limit", "0"]);
+    assert_eq!(exit, EXIT_NO_MATCH);
+    assert!(absent.get("match_count_complete").flag());
+    assert!(!absent.get("truncated").flag());
+    let (exit, exact) = invoke(&file, &["--whole-file", "--text", "ana", "--count-all", "--limit", "2"]);
+    assert_eq!(exit, EXIT_OK);
+    assert!(exact.get("match_count_complete").flag());
+    assert!(!exact.get("truncated").flag());
+}
+
+#[test]
+fn count_all_does_not_turn_a_scan_budget_into_an_exhaustive_total() {
+    let temp = Temp::new();
+    temp.file("a.rs", b"aaaaaaaaaa"); temp.file("b.rs", b"aaaaa");
+    let (exit, counted) = invoke(&temp.0, &["--workspace", "--whole-file", "--text", "aa",
+        "--count-all", "--limit", "1", "--max-scan-bytes", "5"]);
+    assert_eq!(exit, EXIT_PARTIAL);
+    assert!(!counted.get("workspace_complete").flag());
+    assert!(!counted.get("match_count_complete").flag());
+    assert!(counted.get("truncated").flag());
+    assert_eq!(counted.get("matches_seen").number(), 4);
+    assert_eq!(counted.get("payload_bytes_read").number(), 5);
+    assert_eq!(counted.get("unexamined_files").number(), 1);
+    assert_eq!(counted.get("stop_reason").text(), "byte-limit");
+}
+
+#[test]
+fn count_all_preserves_raw_byte_semantics_and_unsupported_text_coverage() {
+    let temp = Temp::new();
+    temp.file("a.rs", b"aaa"); temp.file("b.rs", b"a\xffa\xff"); temp.file("c.rs", b"aa");
+    let (exit, text) = invoke(&temp.0, &["--workspace", "--whole-file", "--text", "a", "--count-all", "--limit", "1"]);
+    assert_eq!(exit, EXIT_PARTIAL);
+    assert!(!text.get("match_count_complete").flag());
+    assert_eq!(text.get("incomplete_files").number(), 1);
+    assert_eq!(text.get("matches_seen").number(), 5);
+    assert_eq!(text.get("files_examined").number(), 3);
+    let (exit, raw) = invoke(&temp.0, &["--workspace", "--whole-file", "--raw-hex", "ff", "--count-all", "--limit", "0"]);
+    assert_eq!(exit, EXIT_PARTIAL);
+    assert!(raw.get("match_count_complete").flag());
+    assert_eq!(raw.get("matches_seen").number(), 2);
+    assert_eq!(raw.get("stored_hits").number(), 0);
+}
+
+#[test]
+fn count_all_can_cancel_after_the_retained_buffer_has_filled() {
+    let temp = Temp::new(); let file = temp.file("file.rs", &vec![b'a'; 128 * 1024]);
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let mut checks = 0;
+    let code = run(&args(&file, &["--whole-file", "--text", "a", "--count-all", "--limit", "1"]),
+        &mut NoStdin, &mut stdout, &mut stderr, || { checks += 1; checks > 64 });
+    assert_eq!(code, EXIT_CANCELED);
+    assert!(stderr.is_empty());
+    let error = parse(&stdout).unwrap();
+    assert_eq!(error.get("status").text(), "error");
+    assert_eq!(error.get("error").get("code").text(), "CLI_CANCELED");
+}
+
+#[test]
 fn unsupported_text_leaves_other_file_results_useful_and_raw_mode_can_search_it() {
     let temp = Temp::new(); temp.file("a.rs", b"needle"); temp.file("b.rs", b"bad\xff");
     let (exit, text) = invoke(&temp.0, &["--workspace", "--whole-file", "--text", "needle"]);

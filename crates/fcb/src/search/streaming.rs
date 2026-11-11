@@ -112,6 +112,8 @@ impl StreamingNeedle {
 pub struct StreamReadOptions {
     pub generation: QueryGeneration,
     pub encoding: Option<DetectedEncoding>,
+    /// Maximum retained hits. `ReaderSearch::new` stops after the first omitted
+    /// occurrence; `ReaderSearch::new_counting` keeps counting within its budgets.
     pub max_matches: usize,
     pub max_bytes: u64,
     pub max_read_calls: u64,
@@ -169,6 +171,7 @@ pub struct ReaderSearch<'needle, R: Read> {
     request: CaptureRequest,
     length: ByteLength,
     options: StreamReadOptions,
+    count_all_matches: bool,
     encoding: Option<DetectedEncoding>,
     header: u64,
     cursor: Option<ByteSearchCursor<'needle>>,
@@ -186,6 +189,9 @@ pub struct ReaderSearch<'needle, R: Read> {
     lease: ResourceLease,
 }
 impl<'needle, R: Read> ReaderSearch<'needle, R> {
+    /// Search until completion, a work limit, or the first occurrence beyond the
+    /// retained-hit limit. The latter leaves a lower-bound count and match-limit
+    /// state; use `new_counting` to continue without retaining additional hits.
     pub fn new(reader: R, request: CaptureRequest, length: ByteLength,
         needle: &'needle StreamingNeedle, options: StreamReadOptions,
         budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
@@ -211,17 +217,29 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
         let mut buffer = reserve(STREAM_BUFFER_BYTES)?;
         buffer.resize(STREAM_BUFFER_BYTES, 0);
         let cursor = if needle.mode == StreamingMode::OriginalBytes { Some(ByteSearchCursor::new(&needle.utf8)?) } else { None };
-        let mut search = Self { reader, needle, request, length, options, encoding: options.encoding,
+        let mut search = Self { reader, needle, request, length, options, count_all_matches: false, encoding: options.encoding,
             header: 0, cursor, buffer, base: 0, filled: 0, ready: 0, consumed: 0, eof: false,
             hits: reserve(options.max_matches)?, matches_seen: 0, unsupported_at: None,
             state: StreamReadState::Pending, stats: StreamReadStats::default(), lease };
         if length.get() == 0 { search.prepare()?; search.set_terminal(); }
         Ok(search)
     }
+    /// Count every overlapping occurrence while retaining at most `max_matches`
+    /// witnesses, including a count-only scan when that limit is zero. Byte,
+    /// call, per-step and cancellation limits still apply; a count is exact only
+    /// when the report completes its declared input under the requested semantics.
+    pub fn new_counting(reader: R, request: CaptureRequest, length: ByteLength,
+        needle: &'needle StreamingNeedle, options: StreamReadOptions,
+        budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
+        let mut search = Self::new(reader, request, length, needle, options, budget, allocation)?;
+        search.count_all_matches = true;
+        Ok(search)
+    }
     pub const fn state(&self) -> StreamReadState { self.state }
     pub const fn stats(&self) -> StreamReadStats { self.stats }
     pub fn hits(&self) -> &[StreamingHit] { &self.hits }
     pub const fn matches_seen(&self) -> u64 { self.matches_seen }
+    pub const fn count_all_matches(&self) -> bool { self.count_all_matches }
     pub const fn generation(&self) -> QueryGeneration { self.options.generation }
     pub fn cancel(&mut self) { self.state = StreamReadState::Canceled; }
 
@@ -275,7 +293,10 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
                 if self.needle.mode == StreamingMode::ExactText && (hit.start < self.header
                     || (self.encoding.is_some_and(|encoding| encoding.is_utf16()) && hit.start % 2 != 0)) { continue; }
                 self.matches_seen += 1;
-                if self.hits.len() == self.options.max_matches { self.state = StreamReadState::Truncated; break; }
+                if self.hits.len() == self.options.max_matches {
+                    if self.count_all_matches { continue; }
+                    self.state = StreamReadState::Truncated; break;
+                }
                 let range = ByteRange::new(ByteOffset::new(hit.start), ByteOffset::new(hit.end))
                     .map_err(|_| StreamReadError::InvalidRange)?;
                 self.hits.push(StreamingHit { occurrence: self.matches_seen, range });
@@ -341,6 +362,7 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
         if self.state == StreamReadState::Pending { return Err(StreamReadError::Pending); }
         let report = StreamReadReport { needle: self.needle, request: self.request, length: self.length,
             generation: self.options.generation, encoding: self.encoding, header: self.header,
+            count_all_matches: self.count_all_matches,
             hits: self.hits, matches_seen: self.matches_seen, unsupported_at: self.unsupported_at,
             state: self.state, stats: self.stats, _lease: self.lease };
         Ok((self.reader, report))
@@ -354,6 +376,7 @@ pub struct StreamReadReport<'needle> {
     generation: QueryGeneration,
     encoding: Option<DetectedEncoding>,
     header: u64,
+    count_all_matches: bool,
     hits: Vec<StreamingHit>,
     matches_seen: u64,
     unsupported_at: Option<ByteOffset>,
@@ -372,9 +395,16 @@ impl StreamReadReport<'_> {
     pub const fn state(&self) -> StreamReadState { self.state }
     pub const fn stats(&self) -> StreamReadStats { self.stats }
     pub const fn matches_seen(&self) -> u64 { self.matches_seen }
+    /// Whether this scan was asked to continue counting after its hit table filled.
+    /// Work limits, cancellation and decoding failures can still leave it partial.
+    pub const fn count_all_matches(&self) -> bool { self.count_all_matches }
+    /// Whether known occurrences were omitted from the retained result table.
+    /// This is independent of input coverage and may be true for a complete scan.
+    pub fn hits_truncated(&self) -> bool { self.matches_seen > self.hits.len() as u64 }
     pub const fn unsupported_at(&self) -> Option<ByteOffset> { self.unsupported_at }
     pub fn hits(&self) -> &[StreamingHit] { &self.hits }
-    /// Complete over the supplied sequence/length, NOT native snapshot stability.
+    /// Complete over the supplied sequence/length, independent of retained-hit
+    /// truncation. This does NOT promise native snapshot stability.
     pub fn input_complete(&self) -> bool { self.state == StreamReadState::Complete }
     /// KMP equality plus validated exact encoding establishes these exact source
     /// bytes. Identical witnesses share the compiled literal instead of retaining

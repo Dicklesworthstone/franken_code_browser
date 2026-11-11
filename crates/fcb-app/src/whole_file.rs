@@ -34,9 +34,13 @@ fn options(args: &Arguments, bytes: u64, calls: u64, matches: usize) -> StreamRe
         }}
 }
 fn scan<'needle>(file: File, request: CaptureRequest, needle: &'needle StreamingNeedle,
-    options: StreamReadOptions, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool)
+    options: StreamReadOptions, count_all: bool, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool)
     -> Result<FileSearchReport<'needle>, AppError> {
-    let mut scan = FileSearch::new(file, request, needle, options, budget, allocation(41))?;
+    let mut scan = if count_all {
+        FileSearch::new_counting(file, request, needle, options, budget, allocation(41))?
+    } else {
+        FileSearch::new(file, request, needle, options, budget, allocation(41))?
+    };
     while scan.state() == StreamReadState::Pending {
         // Read/decoder failures are retained terminal report states. No retry
         // restarts at byte zero and silently double-counts a partial observation.
@@ -53,7 +57,8 @@ pub(crate) fn single(args: &Arguments, out: &mut Output, budget: &ResourceBudget
     let path = input::absolute(args.file.as_deref().ok_or(AppError::InvalidRange)?)?;
     let (file, _) = input::open_regular(&path)?;
     let request = CaptureRequest::new(file_id(), revision()).map_err(|_| AppError::InvalidRange)?;
-    let report = scan(file, request, &pattern, options(args, args.max_scan_bytes, MAX_READ_CALLS, args.limit), budget, canceled)?;
+    let report = scan(file, request, &pattern, options(args, args.max_scan_bytes, MAX_READ_CALLS, args.limit),
+        args.count_all, budget, canceled)?;
     if args.json {
         out.literal("{\"schema\":")?; out.quoted(SCHEMA)?;
         out.literal(",\"status\":\"ok\",\"command\":\"search\",\"scope\":\"named-file\",\"identity_scope\":\"response-local\",\"path\":")?;
@@ -73,6 +78,7 @@ pub(crate) fn workspace(args: &Arguments, catalog: &WorkspaceCatalog, root: &Pat
     out: &mut Output, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<u8, AppError> {
     let pattern = needle(args, budget)?;
     let (mut bytes, mut calls, mut stored, mut seen, mut examined, mut failed) = (0u64, 0u64, 0usize, 0u64, 0usize, 0usize);
+    let mut matching_files = 0usize;
     let mut complete = catalog.discovery_complete();
     let mut truncated = false;
     let mut stopped = None;
@@ -81,6 +87,7 @@ pub(crate) fn workspace(args: &Arguments, catalog: &WorkspaceCatalog, root: &Pat
         out.literal(",\"strategy\":\"streaming-whole-file\",\"capture_limits_applied\":false,\"max_scan_bytes\":")?;
         out.integer(args.max_scan_bytes)?;
         out.literal(",\"max_read_calls\":")?; out.integer(MAX_READ_CALLS)?;
+        out.literal(",\"count_all_matches\":")?; out.boolean(args.count_all)?;
         out.literal(",\"files\":[")?;
     } else { out.literal("Streaming workspace search; only literal witnesses are retained\n")?; }
     for (ordinal, entry) in catalog.entries().iter().enumerate() {
@@ -95,7 +102,7 @@ pub(crate) fn workspace(args: &Arguments, catalog: &WorkspaceCatalog, root: &Pat
             Ok(file) => {
                 let mut stop = || canceled() || catalog.validate_active().is_err();
                 scan(file, request, &pattern, options(args, args.max_scan_bytes.saturating_sub(bytes),
-                    MAX_READ_CALLS.saturating_sub(calls), args.limit.saturating_sub(stored)), budget, &mut stop)
+                    MAX_READ_CALLS.saturating_sub(calls), args.limit.saturating_sub(stored)), args.count_all, budget, &mut stop)
             }
             Err(error) => Err(error),
         };
@@ -111,6 +118,8 @@ pub(crate) fn workspace(args: &Arguments, catalog: &WorkspaceCatalog, root: &Pat
                 let search = report.search();
                 bytes += search.stats().bytes_read; calls += search.stats().read_calls;
                 stored += search.hits().len(); seen += search.matches_seen();
+                if search.matches_seen() > 0 { matching_files += 1; }
+                truncated |= search.hits_truncated();
                 complete &= report.is_complete();
                 if !report.is_complete() { failed += 1; }
                 if args.json { fields(&report, out, canceled)?; } else { human(&report, out)?; }
@@ -138,6 +147,7 @@ pub(crate) fn workspace(args: &Arguments, catalog: &WorkspaceCatalog, root: &Pat
     catalog.validate_active()?;
     if args.json {
         out.literal("],\"workspace_complete\":")?; out.boolean(complete)?;
+        out.literal(",\"match_count_complete\":")?; out.boolean(complete)?;
         out.literal(",\"truncated\":")?; out.boolean(truncated)?;
         out.literal(",\"files_examined\":")?; out.integer(examined as u64)?;
         out.literal(",\"unexamined_files\":")?; out.integer((catalog.entries().len() - examined) as u64)?;
@@ -146,15 +156,21 @@ pub(crate) fn workspace(args: &Arguments, catalog: &WorkspaceCatalog, root: &Pat
         out.literal(",\"read_calls\":")?; out.integer(calls)?;
         out.literal(",\"matches_seen\":")?; out.integer(seen)?;
         out.literal(",\"stored_hits\":")?; out.integer(stored as u64)?;
+        out.literal(",\"matching_files\":")?; out.integer(matching_files as u64)?;
         out.literal(",\"stop_reason\":")?;
         if let Some(reason) = stopped { out.quoted(reason)?; } else { out.literal("null")?; }
         out.literal("}\n")?;
     } else {
         out.literal(if complete { "Complete observed-workspace scan\n" } else { "PARTIAL observed-workspace scan\n" })?;
         out.literal("Files examined: ")?; out.literal(&examined.to_string())?;
-        out.literal("; source bytes read: ")?; out.literal(&bytes.to_string())?; out.literal("\n")?;
+        out.literal("; source bytes read: ")?; out.literal(&bytes.to_string())?;
+        out.literal(if complete { "; total matches: " } else { "; matches seen: " })?;
+        out.literal(&seen.to_string())?;
+        out.literal("; retained hits: ")?; out.literal(&stored.to_string())?;
+        if truncated { out.literal(" (additional matches omitted)")?; }
+        out.literal("\n")?;
     }
-    Ok(if !complete { EXIT_PARTIAL } else if seen == 0 { EXIT_NO_MATCH } else { EXIT_OK })
+    Ok(if !complete || truncated { EXIT_PARTIAL } else if seen == 0 { EXIT_NO_MATCH } else { EXIT_OK })
 }
 
 fn open_workspace_source(root: &Path, relative: &NormalizedPath) -> Result<File, AppError> {
@@ -162,7 +178,8 @@ fn open_workspace_source(root: &Path, relative: &NormalizedPath) -> Result<File,
     Ok(input::open_regular(&path)?.0)
 }
 fn exit(report: &FileSearchReport<'_>) -> u8 {
-    if !report.is_complete() { EXIT_PARTIAL } else if report.search().matches_seen() == 0 { EXIT_NO_MATCH } else { EXIT_OK }
+    if !report.is_complete() || report.search().hits_truncated() { EXIT_PARTIAL }
+    else if report.search().matches_seen() == 0 { EXIT_NO_MATCH } else { EXIT_OK }
 }
 fn fields(report: &FileSearchReport<'_>, out: &mut Output, canceled: &mut impl FnMut() -> bool) -> Result<(), AppError> {
     let search = report.search();
@@ -177,7 +194,9 @@ fn fields(report: &FileSearchReport<'_>, out: &mut Output, canceled: &mut impl F
     out.literal(",\"state\":")?; out.quoted(search.state().code())?;
     out.literal(",\"input_complete\":")?; out.boolean(search.input_complete())?;
     out.literal(",\"whole_file_complete\":")?; out.boolean(report.is_complete())?;
-    out.literal(",\"truncated\":")?; out.boolean(search.state() == StreamReadState::Truncated)?;
+    out.literal(",\"count_all_matches\":")?; out.boolean(search.count_all_matches())?;
+    out.literal(",\"match_count_complete\":")?; out.boolean(report.is_complete())?;
+    out.literal(",\"truncated\":")?; out.boolean(search.hits_truncated())?;
     out.literal(",\"observed_length\":")?; out.integer(search.observed_length().get())?;
     out.literal(",\"final_length\":")?;
     if let Some(length) = report.final_length() { out.integer(length.get())?; } else { out.literal("null")?; }
@@ -218,7 +237,10 @@ fn human(report: &FileSearchReport<'_>, out: &mut Output) -> Result<(), AppError
     }
     out.literal(if report.is_complete() { "  Complete observed sequence; " } else { "  PARTIAL: " })?;
     out.literal(search.state().code())?;
-    out.literal("; matches seen ")?; out.literal(&search.matches_seen().to_string())?;
+    out.literal(if report.is_complete() { "; total matches " } else { "; matches seen " })?;
+    out.literal(&search.matches_seen().to_string())?;
+    out.literal("; retained hits ")?; out.literal(&search.hits().len().to_string())?;
+    if search.hits_truncated() { out.literal(" (additional matches omitted)")?; }
     out.literal("; bytes read ")?; out.literal(&search.stats().bytes_read.to_string())?; out.literal("\n")?;
     Ok(())
 }

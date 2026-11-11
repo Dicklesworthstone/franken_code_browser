@@ -54,6 +54,70 @@ fn finds_cross_buffer_and_late_matches_beyond_the_complete_capture_limit() {
 }
 
 #[test]
+fn counting_completes_a_file_with_more_matches_than_retained_witnesses() {
+    let temp = Temp::new();
+    let bytes = b"banana".repeat(6000); fs::write(temp.file(), &bytes).unwrap();
+    let mut host = File::open(temp.file()).unwrap(); host.seek(SeekFrom::Start(3)).unwrap();
+    let budget = budget();
+    let pattern = StreamingNeedle::text(owner(), "ana", &budget, allocation(1)).unwrap();
+    for limit in [0, 1, 2] {
+        let mut options = StreamReadOptions::new(generation(1)); options.max_matches = limit;
+        let mut query = FileSearch::new_counting(host.try_clone().unwrap(), request(), &pattern,
+            options, &budget, allocation(2)).unwrap();
+        assert!(query.count_all_matches());
+        let charge = budget.accounting().reserved().get();
+        finish(&mut query);
+        assert_eq!(budget.accounting().reserved().get(), charge);
+        let report = query.finish().unwrap();
+        assert!(report.is_complete()); assert!(report.search().input_complete());
+        assert!(report.search().hits_truncated()); assert!(report.search().count_all_matches());
+        assert_eq!(report.search().matches_seen(), 12_000);
+        assert_eq!(report.search().hits().len(), limit);
+        assert_eq!(report.search().stats().bytes_read, bytes.len() as u64);
+        assert!(report.search().stats().peak_buffer_bytes <= 16 * 1024);
+        assert_eq!(host.stream_position().unwrap(), 3);
+        if limit > 0 {
+            let evidence = report.retain_hit(0, &budget, allocation(3)).unwrap();
+            let view = BrowserSession::new(owner()).open_extent(evidence.clone()).unwrap();
+            assert_eq!(view.raw_selection(evidence.range()).unwrap(), b"ana");
+            assert_eq!(evidence.range().start().get(), 1);
+        }
+    }
+    // The original constructor remains the early-stop negative control: a full
+    // first read does not make an overflowed result a complete search count.
+    let mut options = StreamReadOptions::new(generation(1)); options.max_matches = 1;
+    let mut limited = FileSearch::new(host, request(), &pattern, options, &budget, allocation(2)).unwrap();
+    finish(&mut limited);
+    let report = limited.finish().unwrap();
+    assert!(!report.is_complete()); assert!(!report.search().count_all_matches());
+    assert_eq!(report.search().state(), StreamReadState::Truncated);
+    assert_eq!(report.search().matches_seen(), 2); assert!(report.search().hits_truncated());
+}
+
+#[test]
+fn counting_after_hit_retention_fills_does_not_hide_file_mutation_or_short_reads() {
+    for grow in [false, true] {
+        let temp = Temp::new(); fs::write(temp.file(), vec![b'a'; 64 * 1024]).unwrap();
+        let budget = budget();
+        let pattern = StreamingNeedle::raw(owner(), b"a", &budget, allocation(1)).unwrap();
+        let mut options = StreamReadOptions::new(generation(1)); options.max_matches = 0;
+        let mut query = FileSearch::new_counting(File::open(temp.file()).unwrap(), request(), &pattern,
+            options, &budget, allocation(2)).unwrap();
+        query.step(StreamReadStep::default(), generation(1), || false).unwrap();
+        assert_eq!(query.state(), StreamReadState::Pending);
+        let writer = OpenOptions::new().write(true).open(temp.file()).unwrap();
+        writer.set_len(if grow { 128 * 1024 } else { 0 }).unwrap();
+        finish(&mut query);
+        let report = query.finish().unwrap();
+        assert!(!report.is_complete()); assert!(report.search().hits_truncated());
+        assert!(report.search().hits().is_empty());
+        assert_eq!(report.consistency(), if grow { ExtentConsistency::ChangedDuringRead } else { ExtentConsistency::ShortRead });
+        assert_eq!(report.search().state(), if grow { StreamReadState::Complete } else { StreamReadState::ShortRead });
+        assert_eq!(report.search().matches_seen(), if grow { 64 * 1024 } else { 16 * 1024 });
+    }
+}
+
+#[test]
 fn positioned_scan_does_not_move_a_host_shared_file_cursor() {
     let temp = Temp::new(); fs::write(temp.file(), b"abc needle tail").unwrap();
     let mut host = File::open(temp.file()).unwrap(); host.seek(SeekFrom::Start(3)).unwrap();

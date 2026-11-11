@@ -41,10 +41,14 @@ quotas stay unavailable, not false no-match results. No atomic-repository claim.
 Continuous whole-file search, without retaining full source:\n\
   fcb search FILE --whole-file --text TEXT [--json]\n\
   fcb search ROOT --workspace --whole-file --text TEXT [--json]\n\
+  --count-all continues counting after --limit retained rows, within I/O limits.\n\
+  Use --count-all --limit 0 for counts without retaining occurrence rows.\n\
   --raw-hex HEX also works; --max-scan-bytes N admits source I/O separately.\n\
 Default scan allowance: 256 MiB GLOBAL, maximum 1 TiB; input buffer: 16 KiB.\n\
 Only exact literal witnesses are retained. The scan has separate read-call\n\
 and result limits, preserves cross-buffer hits, and reports incomplete files.\n\
+match_count_complete reports exhaustive observed counts separately from truncated\n\
+rows; omitted rows still exit 3 even when the admitted scan/count is complete.\n\
 Whole-file mode starts at byte zero, requires named files, and does not accept\n\
 window offsets, stdin, path queries or indexed-capture byte-limit switches.\n\n\
 File-window options: --offset DECIMAL --bytes DECIMAL --limit DECIMAL\n\
@@ -107,14 +111,14 @@ pub(crate) fn capabilities(args: &Arguments, out: &mut Output) -> Result<u8, App
             out.literal(",\"reason\":")?; out.quoted(reason)?; out.literal("}")?;
         }
         out.literal("],\"whole_file_search\":{\"state\":")?; out.quoted(file_state)?;
-        out.literal(",\"flag\":\"--whole-file\",\"input_buffer_bytes\":\"16384\",\"default_max_scan_bytes\":\"268435456\",\"maximum_max_scan_bytes\":\"1099511627776\",\"retention\":\"literal-witnesses-only\"}}\n")?;
+        out.literal(",\"flag\":\"--whole-file\",\"count_all_flag\":\"--count-all\",\"input_buffer_bytes\":\"16384\",\"default_max_scan_bytes\":\"268435456\",\"maximum_max_scan_bytes\":\"1099511627776\",\"retention\":\"literal-witnesses-only\"}}\n")?;
     } else {
         out.literal("FrankenCodeBrowser: headless source tools; independent verification pending.\n")?;
         if diagnostic { out.literal("Static diagnostic only: no source scans, benchmarks, database opens, or repairs.\n")?; }
         for (name, state, reason) in rows { out.literal(name)?; out.literal(": ")?;
             out.literal(state)?; out.literal(" — ")?; out.literal(reason)?; out.literal("\n")?; }
         out.literal("whole-file-streaming: ")?; out.literal(file_state)?;
-        out.literal(" — explicit --whole-file; global I/O budget, 16 KiB input buffer, literal witnesses only.\n")?;
+        out.literal(" — explicit --whole-file; optional --count-all, global I/O budget, 16 KiB input buffer, literal witnesses only.\n")?;
     }
     Ok(EXIT_OK)
 }

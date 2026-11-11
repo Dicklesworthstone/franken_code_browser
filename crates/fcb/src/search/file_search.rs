@@ -58,17 +58,35 @@ impl<'needle> FileSearch<'needle> {
     pub fn new(file: File, request: CaptureRequest, needle: &'needle StreamingNeedle,
         options: StreamReadOptions, budget: &ResourceBudget, allocation: ResourceAllocationId)
         -> Result<Self, FileSearchError> {
+        Self::build(file, request, needle, options, budget, allocation, false)
+    }
+    /// Observe the complete declared file within the work budgets, counting
+    /// overlapping occurrences after the bounded hit table fills. A zero
+    /// `max_matches` retains no witnesses but still counts the observed input.
+    pub fn new_counting(file: File, request: CaptureRequest, needle: &'needle StreamingNeedle,
+        options: StreamReadOptions, budget: &ResourceBudget, allocation: ResourceAllocationId)
+        -> Result<Self, FileSearchError> {
+        Self::build(file, request, needle, options, budget, allocation, true)
+    }
+    fn build(file: File, request: CaptureRequest, needle: &'needle StreamingNeedle,
+        options: StreamReadOptions, budget: &ResourceBudget, allocation: ResourceAllocationId,
+        count_all_matches: bool) -> Result<Self, FileSearchError> {
         if !cfg!(unix) { return Err(FileSearchError::UnsupportedPlatform); }
         let metadata = file.metadata().map_err(|_| SourceError::CaptureUnavailable)?;
         if !metadata.is_file() { return Err(SourceError::SpecialObject.into()); }
         let before = Stamp::from_metadata(&metadata);
-        let search = ReaderSearch::new(PositionedInput { file, offset: 0 }, request,
-            ByteLength::new(before.length), needle, options, budget, allocation)?;
+        let input = PositionedInput { file, offset: 0 };
+        let search = if count_all_matches {
+            ReaderSearch::new_counting(input, request, ByteLength::new(before.length), needle, options, budget, allocation)?
+        } else {
+            ReaderSearch::new(input, request, ByteLength::new(before.length), needle, options, budget, allocation)?
+        };
         Ok(Self { search, before })
     }
     pub fn state(&self) -> StreamReadState { self.search.state() }
     pub fn stats(&self) -> StreamReadStats { self.search.stats() }
     pub fn generation(&self) -> QueryGeneration { self.search.generation() }
+    pub fn count_all_matches(&self) -> bool { self.search.count_all_matches() }
     pub fn cancel(&mut self) { self.search.cancel(); }
     pub fn step(&mut self, step: StreamReadStep, generation: QueryGeneration,
         canceled: impl FnMut() -> bool) -> Result<StreamReadState, FileSearchError> {
@@ -98,7 +116,8 @@ impl FileSearchReport<'_> {
     pub fn search(&self) -> &StreamReadReport<'_> { &self.report }
     pub const fn consistency(&self) -> ExtentConsistency { self.consistency }
     pub const fn final_length(&self) -> Option<ByteLength> { self.final_length }
-    /// Completed declared byte sequence with matching before/after metadata.
+    /// Completed declared byte sequence with matching before/after metadata,
+    /// independent of whether the retained hit table omits known occurrences.
     /// This is explicitly NOT an atomic filesystem or whole-workspace snapshot.
     pub fn is_complete(&self) -> bool {
         self.report.input_complete() && self.consistency == ExtentConsistency::UnchangedMetadata

@@ -41,6 +41,7 @@ fcb search huge.rs --whole-file --text needle --max-scan-bytes 4294967296 --json
 fcb search payload.bin --whole-file --raw-hex 00ff --json
 fcb search /path/to/repository --workspace --whole-file --text 'pub fn' --json
 fcb search /path/to/repository --workspace --whole-file --raw-hex 00ff --json
+fcb search /path/to/repository --workspace --whole-file --text 'pub fn' --count-all --limit 50 --json
 ```
 
 By default, the scope is **one explicitly selected file**, not its siblings or
@@ -88,6 +89,15 @@ read-call limit. In a workspace, byte, read-call and stored-hit budgets are
 **global**, not reset per file; failed reads still spend their work allowance.
 A limit stops with explicit partial coverage and an unexamined-file count.
 
+Add **`--count-all`** to continue scanning after the retained-hit allowance is
+full. For example, `--count-all --limit 50` retains the first fifty occurrences
+while counting later matches in the same file and subsequent workspace files.
+`--count-all --limit 0` retains no occurrence rows and still counts matches.
+The same overlapping literal semantics apply, including UTF-16 and cross-buffer
+matches. The source buffer, retained-hit bound and global byte/read-call limits
+are unchanged; counting never grants unlimited I/O or suppresses cancellation.
+Without this opt-in, the existing first-extra-match stop remains the default.
+
 `--whole-file` requires named files and `search`; it does not accept stdin,
 window offsets/byte counts, path queries, `--max-file-bytes` or
 `--max-total-bytes`. The latter are full-capture reservations for the default
@@ -112,6 +122,11 @@ do not move a cursor shared with the host's other file handle.
 
 `input_complete` means the declared continuous byte sequence was searched.
 `whole_file_complete` additionally requires unchanged before/after metadata.
+`match_count_complete` reports whether `matches_seen` is an exhaustive count for
+that observed file (or the admitted catalog at workspace level). It can be true
+while `truncated` is true: the scan finished, but some occurrence rows were not
+retained. `count_all_matches` records the selected policy. A partial scan's count
+is only the matches established so far, even when the row buffer is full.
 `state` distinguishes completion, match limit, byte limit, read-call limit,
 short read, unsupported text, cancellation and failure. Encountered malformed
 text invalidates that file's exact-text results; raw-byte search remains an
@@ -122,10 +137,16 @@ exact original-byte hit ranges, counters, consistency and terminal state.
 `literal_original_hex` supplies the shared witness once when hits exist.
 `decoded_range` is null: the scanner does not invent global decoded coordinates.
 Workspace output has `files`, `files_examined`, `unexamined_files`,
-`incomplete_files`, `workspace_complete`, global counts and `stop_reason`.
+`incomplete_files`, `workspace_complete`, `matching_files`, global counts and
+`stop_reason`. `matching_files` includes files with counted occurrences after
+the global row allowance fills; these files have empty retained-hit arrays.
 An exactly full result buffer is not truncation; one extra verified occurrence
 establishes truncation. A complete zero-match scan exits 1; incomplete scans exit
-3 even with zero hits. The 8 MiB response cap remains independent of scan size.
+3 even with zero hits. Omitted occurrence rows also exit 3, including a complete
+`--count-all` scan: use `match_count_complete` to determine whether the reported
+count is exhaustive. A completed counted scan has no `stop_reason` solely
+because rows were omitted. The 8 MiB response cap remains independent of scan
+size. This addition is code-first; executable qualification remains pending.
 
 ## Workspace inspection and indexed-capture search
 
@@ -271,7 +292,9 @@ Consult coverage fields and the exit status:
 Windowed search keeps `scope_complete`, `whole_file_complete`, and `truncated`
 separate. An exactly full result buffer is not proof of truncation: the existing
 matcher performs one-match lookahead. Counts in a truncated content search are
-matches actually seen, not an exhaustive total. An actual leading BOM can be
+matches actually seen; only the whole-file `--count-all` route can continue to
+an exhaustive count with omitted rows, and explicitly reports
+`match_count_complete`. An actual leading BOM can be
 excluded from text while still covering the whole declared text representation.
 Changed/short/unknown observations never acquire stronger consistency merely
 because matching finished.

@@ -27,6 +27,8 @@ pub struct Arguments {
     pub respect_ignores: bool,
     pub max_files: usize, pub max_file_bytes: usize, pub max_total_bytes: usize,
     pub whole_file: bool, pub max_scan_bytes: u64, pub ignore_case: bool,
+    /// Continue the whole-file scan after the retained-hit allowance is full.
+    pub count_all: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArgumentError { Limit, UnknownCommand, UnknownOption, DuplicateOption, MissingValue,
@@ -76,7 +78,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         stdin: false, offset: 0, bytes: 64 * 1024, limit: 100, encoding: Encoding::Auto, needle: None,
         workspace: false, include_excluded: false, respect_ignores: false, max_files: 4096,
         max_file_bytes: 1024 * 1024, max_total_bytes: 32 * 1024 * 1024,
-        whole_file: false, max_scan_bytes: 256 * 1024 * 1024, ignore_case: false };
+        whole_file: false, max_scan_bytes: 256 * 1024 * 1024, ignore_case: false, count_all: false };
     if args.is_empty() { return Ok(parsed); }
     let mut start = 1;
     parsed.command = match args[0].to_str() {
@@ -105,7 +107,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
                 "--workspace" => 256, "--include-excluded" => 512, "--max-files" => 1024,
                 "--max-file-bytes" => 2048, "--max-total-bytes" => 4096, "--path" => 8192,
                 "--whole-file" => 16384, "--max-scan-bytes" => 32768, "--respect-ignores" => 65536,
-                "--query" => 131072, "--ignore-case" => 262144,
+                "--query" => 131072, "--ignore-case" => 262144, "--count-all" => 524288,
                 _ => return Err(ArgumentError::UnknownOption),
             };
             if seen & bit != 0 { return Err(ArgumentError::DuplicateOption); }
@@ -117,6 +119,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
             if option == "--respect-ignores" { parsed.respect_ignores = true; continue; }
             if option == "--whole-file" { parsed.whole_file = true; continue; }
             if option == "--ignore-case" { parsed.ignore_case = true; continue; }
+            if option == "--count-all" { parsed.count_all = true; continue; }
             let value = args.get(cursor).ok_or(ArgumentError::MissingValue)?; cursor += 1;
             let value = value.to_str().ok_or(ArgumentError::MissingValue)?;
             match option {
@@ -172,6 +175,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         }
     }
     if parsed.stdin && parsed.file.is_some() { return Err(ArgumentError::MultipleSources); }
+    if parsed.count_all && !parsed.whole_file { return Err(ArgumentError::IncompatibleOptions); }
     if parsed.respect_ignores && (!parsed.workspace || parsed.include_excluded) { return Err(ArgumentError::IncompatibleOptions); }
     if parsed.ignore_case && (parsed.command != Command::Search || !parsed.workspace || parsed.whole_file
         || !matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Query(_)))) {
@@ -343,6 +347,26 @@ mod tests {
             assert!(parse(&args(&input)).is_err(), "{input:?}");
         }
         assert!(!json_requested(&args(&["search", "file", "--whole-file", "--text", "--json"])));
+    }
+    #[test]
+    fn count_all_is_an_explicit_whole_file_policy_not_a_query_or_capture_option() {
+        let counted = parse(&args(&["search", "root", "--workspace", "--whole-file",
+            "--text", "needle", "--count-all", "--limit", "0"])).unwrap();
+        assert!(counted.count_all && counted.whole_file);
+        assert_eq!(counted.limit, 0);
+        let ordinary = parse(&args(&["search", "file", "--whole-file", "--text", "needle"])).unwrap();
+        assert!(!ordinary.count_all);
+        let literal = parse(&args(&["search", "file", "--whole-file", "--text", "--count-all"])).unwrap();
+        assert!(!literal.count_all);
+        assert_eq!(literal.needle, Some(Needle::Text("--count-all".to_owned())));
+        for input in [vec!["search", "file", "--text", "x", "--count-all"],
+            vec!["search", "root", "--workspace", "--text", "x", "--count-all"],
+            vec!["search", "file", "--whole-file", "--text", "x", "--count-all", "--count-all"],
+            vec!["inspect", "file", "--count-all"],
+            vec!["search", "file", "--whole-file", "--path", "x", "--count-all"],
+            vec!["search", "file", "--whole-file", "--text", "x", "--count-all", "--ignore-case"]] {
+            assert!(parse(&args(&input)).is_err(), "{input:?}");
+        }
     }
     #[test]
     fn repository_rule_permission_is_explicit_and_not_a_query_value() {
