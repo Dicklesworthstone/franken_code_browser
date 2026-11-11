@@ -10,9 +10,10 @@ enum AtlasIndexedSource {
                         mode: AtlasSearchMode = .text,
                         importReader: @escaping Import) -> AtlasSearchCapture {
         AtlasSearchCapture(retainAccess: { owner.retainAccess($0) }, target: { candidate in
-            guard mode.isTextual, hits.indices.contains(candidate.id), hits[candidate.id].matches(candidate),
+            guard hits.indices.contains(candidate.id), hits[candidate.id].matches(candidate),
+                  mode.isTextual ? candidate.structure == nil : candidate.structure?.mode == mode,
                   mode != .expression || candidate.actualText != nil,
-                  AtlasSearchText.accepts(actualText: candidate.actualText, needle: needle,
+                  !mode.isTextual || AtlasSearchText.accepts(actualText: candidate.actualText, needle: needle,
                     caseSensitive: caseSensitive),
                   let path = candidate.sourcePath, let bytes = candidate.captureByteLength else { return nil }
             let row = hits[candidate.id]

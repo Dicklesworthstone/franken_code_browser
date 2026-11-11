@@ -43,6 +43,8 @@ final class IndexedFixture: @unchecked Sendable {
         var caseSensitive = true
         var countAllMatches = false
         var expression: String?
+        var structureMode: AtlasSearchMode?
+        var nameMode: AtlasSearchNameMode = .contains
     }
     private let lock = NSLock()
     private var config = Configuration()
@@ -116,6 +118,16 @@ final class IndexedFixture: @unchecked Sendable {
         return transport
     }
 
+    var structuralTransport: AtlasIndexedSearchTransport {
+        var transport = self.transport
+        transport.structureQueryBegin = { h, g, index, mode, nameMode, needle, scope, pathScope in
+            precondition(index == 1 && !mode.isTextual)
+            return try self.response("query-begin", h, generation: g, needle: needle, scope: scope,
+                pathScope: pathScope, structureMode: mode, nameMode: nameMode)
+        }
+        return transport
+    }
+
     private func response(_ phase: String, _ h: UInt64, generation: UInt64 = 1,
                           needle: String = "", start: Int = 0, reader: UInt64 = 100, sourceFile: UInt64 = 1,
                           scope: AtlasSearchFileScope = .all,
@@ -123,6 +135,8 @@ final class IndexedFixture: @unchecked Sendable {
                           caseSensitive: Bool = true,
                           countAllMatches: Bool = false,
                           expression: String? = nil,
+                          structureMode: AtlasSearchMode? = nil,
+                          nameMode: AtlasSearchNameMode = .contains,
                           cancellation: AtlasSearchCancellation? = nil) throws -> String? {
         lock.lock(); let block = blocked; lock.unlock()
         block?(phase)
@@ -143,6 +157,8 @@ final class IndexedFixture: @unchecked Sendable {
             s.caseSensitive = caseSensitive
             s.countAllMatches = countAllMatches
             s.expression = expression
+            s.structureMode = structureMode; s.nameMode = nameMode
+            if let structureMode { events.append("query-structure:\(structureMode.rawValue):\(nameMode.rawValue)") }
             if let expression {
                 s.needle = s.config.expressionPrimary
                 events.append("query-expression:\(expression)")
@@ -228,7 +244,8 @@ final class IndexedFixture: @unchecked Sendable {
             let pending = eligible - expressionExcluded - available - unavailable
             precondition(eligible <= c.files && available <= captured && unavailable <= captureUnavailable && pending >= 0)
             let examined = min(s.queryStep, available)
-            let scanned = s.caseSensitive ? min(1, examined) : examined, skipped = max(0, examined - scanned)
+            let scanned = s.caseSensitive && s.structureMode == nil ? min(1, examined) : examined
+            let skipped = max(0, examined - scanned)
             let running = phase == "query-begin" || examined < available
             let count = examined > 0 ? (scoped ? c.scopedHitCount ?? c.hitCount : c.hitCount) : 0
             let matches = s.countAllMatches && examined > 0 ? (c.countedMatches ?? UInt64(count)) : UInt64(count)
@@ -238,13 +255,21 @@ final class IndexedFixture: @unchecked Sendable {
             var rows: [[String: Any]] = []
             if first < end {
                 for n in first..<end {
-                    let width = s.caseSensitive ? (s.expression == nil ? 1 : s.needle.utf8.count) : c.insensitiveRangeBytes
+                    let width = s.structureMode != nil ? s.needle.utf8.count
+                        : (s.caseSensitive ? (s.expression == nil ? 1 : s.needle.utf8.count) : c.insensitiveRangeBytes)
                     let range: [String: String] = ["start": String(n * 2), "end": String(n * 2 + width)]
                     let path: [String: String] = ["encoding": "unix-bytes", "hex": c.pathHex, "display": "a.rs"]
                     var row: [String: Any] = ["hit_id": String(n + 1), "file_id": String(c.fileID), "source_revision": "1",
                         "capture_sha256": c.digest, "capture_byte_length": "4096", "original_range": range, "path": path]
                     if !s.caseSensitive { row["matched_text"] = c.insensitiveText }
                     else if s.expression != nil { row["matched_text"] = s.needle }
+                    if let mode = s.structureMode {
+                        row["structure"] = ["name": s.needle,
+                            "kind": mode == .headings ? "heading" : (mode == .occurrences ? "identifier-occurrence" : "function"),
+                            "language": mode == .headings ? "markdown" : (mode == .occurrences ? "text" : "rust"),
+                            "candidate_id": String(n + 1), "evidence_level": mode.evidence,
+                            "heading_slug": mode == .headings ? "x-\(n + 1)" : NSNull(), "evidence_range": range]
+                    }
                     rows.append(row)
                 }
             }
@@ -263,6 +288,24 @@ final class IndexedFixture: @unchecked Sendable {
                     ? (capturePending > 0 ? "source-byte-limit" : "capture-scope") : "all-files-examined"),
                 "hits": rows, "next_offset": end < count ? String(end) : NSNull()]
             value.merge(fields, uniquingKeysWith: { _, n in n })
+            if let mode = s.structureMode {
+                value["command"] = phase == "query-begin" ? "begin-indexed-structure" : (phase == "page" ? "page" : "step")
+                value["mode"] = mode.wireMode; value["search_strategy"] = "retained-capture-structure"
+                value["requested_mode"] = mode.rawValue; value["realized_mode"] = mode.evidence
+                value["name_mode"] = s.nameMode.rawValue; value["name_case"] = "sensitive"
+                value["evidence_level"] = mode.evidence; value["semantic_complete"] = false
+                value["completeness_basis"] = "admitted-extraction-processing"
+                value["structure_file_byte_limit"] = String(mode.structureFileByteLimit)
+                value["unsupported_structure_files"] = "0"; value["extraction_limited_files"] = "0"
+                value["structure_metadata_omitted"] = "0"; value["structure_metadata_bytes"] = String(count * 128)
+                value["fallback_files"] = "0"; value["verification_source_bytes"] = String(scanned == 0 ? 0 : 4096 + (scanned - 1) * 100)
+                value["count_all_matches"] = false; value["match_count_complete"] = complete
+                if mode == .occurrences {
+                    value["includes_comments_and_literals"] = true; value["compiler_resolved"] = false
+                    value["token_policy"] = AtlasSearchOccurrencePolicy.tokenPolicy
+                    value["name_syntax"] = AtlasSearchOccurrencePolicy.nameSyntax; value["unicode_normalization"] = "none"
+                }
+            }
             if s.countAllMatches {
                 value["count_all_matches"] = true
                 value["match_count_complete"] = complete

@@ -49,6 +49,149 @@ import Dispatch
         }
         return value
     }
+    @MainActor private static func structuralSearch() throws {
+        func search(_ worker: AtlasIndexedSearch, _ mode: AtlasSearchMode,
+                    nameMode: AtlasSearchNameMode = .contains,
+                    scope: AtlasSearchFileScope = .all, pathScope: AtlasSearchPathScope = .workspace,
+                    reports: IndexReports = IndexReports()) throws -> AtlasSearchReport {
+            try worker.runScoped(input: AtlasSearchInput(root: "/repo", query: "x", fileScope: scope,
+                pathScope: pathScope, mode: mode, nameMode: nameMode), cancellation: AtlasSearchCancellation(),
+                access: AtlasSearchAccessLease(nil), progress: reports.offer)
+        }
+        do {
+            let f = IndexedFixture(), worker = AtlasIndexedSearch(transport: f.structuralTransport)
+            let text = try run(worker)
+            let source = text.capture!.target(text.hits[0])!
+            var selected: [AtlasSearchCapturedHit] = [source]
+            for mode in [AtlasSearchMode.symbols, .headings, .occurrences] {
+                let report = try search(worker, mode, nameMode: .prefix)
+                check(report.complete && report.mode == mode && !report.countAllMatches,
+                    "Each structural mode searches the same complete captured source universe")
+                check(report.nameMode == mode.effectiveNameMode(.prefix)
+                    && report.structureCoverage?.fileByteLimit == mode.structureFileByteLimit,
+                    "Structural name policy and extraction bounds survive the report boundary")
+                check(report.indexStatus?.reused == true && report.indexStatus?.verifiedFiles == 2
+                    && report.indexStatus?.skippedFiles == 0 && report.indexStatus?.verificationBytes == 4196,
+                    "Extraction visits captured sources without claiming trigram skips")
+                check(report.hits.allSatisfy { $0.structure?.mode == mode && $0.actualText == nil },
+                    "Structural rows preserve qualified evidence rather than text-match claims")
+                check(report.resultLabel == mode.resultLabel && report.summary.contains("Captured index;"),
+                    "Structural result labels and summaries retain the frozen-source distinction")
+                let hit = report.hits[0]
+                var forged = hit
+                forged.structure = nil
+                check(report.capture?.target(forged) == nil, "Removing structural evidence cannot forge activation")
+                let target = report.capture!.target(hit)!
+                check(target.mode == mode, "Captured activation retains structural mode")
+                selected.append(target)
+            }
+            _ = try run(worker, query: "another query")
+            for target in selected { _ = try target.openReader(100) }
+            check(f.count("create:") == 1 && f.count("build-begin:") == 1 && f.count("build-step:") == 2
+                && f.count("source:") == 4, "Mode edits reuse one index and all earlier source capabilities remain valid")
+            check(f.count("query-structure:occurrences:exact") == 1,
+                "Occurrence requests normalize the name policy to exact before the bridge")
+        }
+        do {
+            let f = IndexedFixture(), worker = AtlasIndexedSearch(transport: f.transport)
+            do { _ = try search(worker, .symbols); preconditionFailure("Missing structural capability accepted") }
+            catch AtlasSearchError.unavailable { checks += 1 }
+            check(f.count("create:") == 0, "Legacy transports refuse structural requests before any discovery or capture")
+        }
+        do {
+            let f = IndexedFixture()
+            f.configure { $0.hitCount = 200 }
+            let worker = AtlasIndexedSearch(transport: f.structuralTransport)
+            let reports = IndexReports()
+            let report = try search(worker, .headings, nameMode: .exact, reports: reports)
+            check(report.hits.count == 200 && f.count("page:") > 0
+                && report.hits[199].structure?.candidate == 200,
+                "Paged structural metadata and source witnesses survive bounded page delivery")
+            check(reports.values.allSatisfy { $0.mode == .headings && $0.nameMode == .exact },
+                "Index-build progress retains the requested mode and name policy")
+        }
+        do {
+            let f = IndexedFixture()
+            f.configure { $0.files = 3; $0.captureEligible = 1; $0.captureCaptured = 1
+                $0.scopedEligible = 1; $0.scopedCaptured = 1; $0.scopedHitCount = 1 }
+            let worker = AtlasIndexedSearch(transport: f.structuralTransport)
+            _ = try search(worker, .symbols, pathScope: AtlasSearchPathScope(kind: .file, path: "a.rs"))
+            let broader = try search(worker, .occurrences)
+            check(!broader.complete && broader.indexStatus?.uncapturedFiles == 2 && broader.indexStatus?.reused == true,
+                "A broader structural query reports uncaptured members instead of opening live paths")
+            check(f.count("build-begin:") == 1, "Scope broadening leaves capture membership immutable")
+        }
+        do {
+            let f = IndexedFixture()
+            f.patch { phase, original in
+                var value = original
+                if phase == "query-step", value["step_count"] as? String == "2" {
+                    value["scanned_files"] = "1"; value["verified_files"] = "1"
+                    value["verification_source_bytes"] = "4096"
+                    value["unsupported_structure_files"] = "1"; value["unavailable_files"] = "1"
+                    value["search_complete"] = false; value["match_count_complete"] = false
+                }
+                return value
+            }
+            let report = try search(AtlasIndexedSearch(transport: f.structuralTransport), .symbols)
+            check(!report.complete && report.unsupportedFiles == 1 && report.unavailableFiles == 1
+                && report.hits.count == 2, "Unsupported captured members preserve useful rows with partial extraction coverage")
+        }
+        do {
+            let f = IndexedFixture()
+            f.configure { $0.files = 1; $0.hitCount = 0 }
+            f.patch { phase, original in
+                var value = original
+                if phase == "query-step" {
+                    value["scanned_files"] = "0"; value["verified_files"] = "0"
+                    value["extraction_limited_files"] = "1"; value["unavailable_files"] = "1"
+                    value["search_complete"] = false; value["match_count_complete"] = false
+                }
+                return value
+            }
+            let report = try search(AtlasIndexedSearch(transport: f.structuralTransport), .headings)
+            check(!report.complete && report.structureCoverage?.extractionLimitedFiles == 1
+                && report.indexStatus?.verifiedFiles == 0 && report.indexStatus?.verificationBytes == 4096,
+                "Heading qualification failure preserves admitted work without claiming accepted extraction")
+        }
+        for defect in ["strategy", "io", "mode", "semantic", "name-policy", "range", "candidate", "missing-evidence", "repeated-evidence"] {
+            let f = IndexedFixture()
+            f.patch { phase, original in
+                var value = original
+                guard phase == "query-step" else { return value }
+                switch defect {
+                case "strategy": value["search_strategy"] = "retained-ephemeral-index"
+                case "io": value["source_bytes_read"] = "1"
+                case "mode": value["requested_mode"] = "headings"
+                case "semantic": value["semantic_complete"] = true
+                case "name-policy": value["name_mode"] = "exact"
+                default:
+                    var rows = value["hits"] as! [[String: Any]]
+                    var structure = rows[0]["structure"] as! [String: Any]
+                    if defect == "range" { structure["evidence_range"] = ["start": "1", "end": "1"] }
+                    if defect == "candidate" { structure["candidate_id"] = "0" }
+                    if defect == "repeated-evidence", value["step_count"] as? String == "2" { structure["name"] = "changed" }
+                    rows[0]["structure"] = defect == "missing-evidence" ? NSNull() : structure
+                    value["hits"] = rows
+                }
+                return value
+            }
+            do { _ = try search(AtlasIndexedSearch(transport: f.structuralTransport), .symbols)
+                preconditionFailure("Invalid captured structural receipt accepted: " + defect) }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        do {
+            let f = IndexedFixture()
+            f.patch { phase, original in
+                guard phase == "query-begin" else { return original }
+                return ["schema": "fcb.atlas-search/1", "status": "error", "error": ["code": "REFERENCE_INVALID_NAME"]]
+            }
+            do { _ = try search(AtlasIndexedSearch(transport: f.structuralTransport), .occurrences)
+                preconditionFailure("Invalid identifier query accepted") }
+            catch AtlasSearchError.query(let code) { check(code == "REFERENCE_INVALID_NAME", "Shared token-policy query failures remain actionable") }
+        }
+    }
+
     @MainActor private static func countedSearch() throws {
         do {
             let f = IndexedFixture(), reports = IndexReports()
@@ -225,6 +368,7 @@ import Dispatch
         #endif
     }
     @MainActor static func main() throws {
+        try structuralSearch()
         try countedSearch()
         for caseSensitive in [true, false] {
             let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.countedTransport)

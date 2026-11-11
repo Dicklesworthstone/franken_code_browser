@@ -74,6 +74,25 @@ import Foundation
         check(try t.countedQueryBegin!(h, 58, 1, "exact text", .all, AtlasSearchPathScope(visiblePaths: []), true) != nil)
         check(live() == 0 && calls() == beforeCounts + 6)
         #endif
+        let beforeStructure = calls()
+        check(try t.structureQueryBegin!(h, 70, 1, .symbols, .prefix, "SomeName", .all, .workspace) != nil)
+        check(try t.structureQueryBegin!(h, 71, 1, .headings, .contains, "SomeName",
+            AtlasSearchFileScope(extensions: ["md"]), AtlasSearchPathScope(kind: .directory, path: "docs")) != nil)
+        check(try t.structureQueryBegin!(h, 72, 1, .occurrences, .contains, "SomeName", .all,
+            AtlasSearchPathScope(kind: .file, path: "src/exact.rs")) != nil)
+        check(live() == 0 && calls() == beforeStructure + 3)
+        do { _ = try t.structureQueryBegin!(h, 70, 1, .text, .contains, "SomeName", .all, .workspace)
+            preconditionFailure("Text mode admitted to structural bridge") }
+        catch AtlasSearchError.invalidRequest { checks += 1 }
+        check(calls() == beforeStructure + 3)
+        mode(1); check(try t.structureQueryBegin!(h, 70, 1, .symbols, .prefix, "SomeName", .all, .workspace) == nil && live() == 0)
+        for bad: Int32 in [2, 3] {
+            mode(bad)
+            do { _ = try t.structureQueryBegin!(h, 70, 1, .symbols, .prefix, "SomeName", .all, .workspace)
+                preconditionFailure("Malformed structural response accepted") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+            check(live() == 0)
+        }
         mode(1); check(try t.countedQueryBegin!(h, 54, 1, "exact text", .all, .workspace, true) == nil && live() == 0)
         for bad: Int32 in [2, 3] {
             mode(bad)

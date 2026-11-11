@@ -17,6 +17,7 @@ struct AtlasIndexWire: Decodable {
         guard json.utf8.count <= 8 * 1024 * 1024, let data = json.data(using: .utf8) else { throw invalid() }
         do {
             if let failure = AtlasSearchExpression.queryFailure(in: data) { throw failure }
+            if let failure = AtlasSearchOccurrencePolicy.queryFailure(in: data) { throw failure }
             return try JSONDecoder().decode(Self.self, from: data)
         }
         catch let error as AtlasSearchError { throw error }
@@ -154,6 +155,7 @@ struct AtlasIndexedHit: Decodable, Sendable, Equatable {
             throw AtlasIndexWire.invalid()
         }
         if let actualText, !AtlasSearchText.validActualText(actualText) { throw AtlasIndexWire.invalid() }
+        let structure = try AtlasIndexedStructure.decode(wire)
         let hex = Array(pathHex.utf8)
         func nibble(_ b: UInt8) throws -> UInt8 {
             switch b { case 48...57: return b - 48; case 97...102: return b - 87; default: throw AtlasIndexWire.invalid() }
@@ -170,7 +172,7 @@ struct AtlasIndexedHit: Decodable, Sendable, Equatable {
                 capturedBytes: bytes, actualText: actualText)
         hit = SearchHit(id: Int(ordinal - 1), path: display, sourcePath: String(bytes: raw, encoding: .utf8),
             start: start, end: end, captureSHA256: digest, captureByteLength: bytes,
-            actualText: actualText, excerpt: excerpt)
+            structure: structure, actualText: actualText, excerpt: excerpt)
     }
     static func == (a: Self, b: Self) -> Bool {
         a.sameWitness(as: b) && a.hit.excerpt == b.hit.excerpt
@@ -180,6 +182,7 @@ struct AtlasIndexedHit: Decodable, Sendable, Equatable {
             && hit.start == other.hit.start && hit.end == other.hit.end
             && hit.captureSHA256 == other.hit.captureSHA256 && hit.captureByteLength == other.hit.captureByteLength
             && hit.path.utf8.elementsEqual(other.hit.path.utf8)
+            && hit.structure == other.hit.structure
             && AtlasSearchText.sameActualText(hit.actualText, other.hit.actualText)
     }
     func repeats(_ old: Self) -> Bool {
@@ -189,7 +192,91 @@ struct AtlasIndexedHit: Decodable, Sendable, Equatable {
         hit.id == other.id && hit.start == other.start && hit.end == other.end
             && hit.captureSHA256 == other.captureSHA256 && hit.captureByteLength == other.captureByteLength
             && hit.sourcePath?.utf8.elementsEqual(other.sourcePath?.utf8 ?? "".utf8) == true
+            && hit.structure == other.structure
             && AtlasSearchText.sameActualText(hit.actualText, other.actualText)
+    }
+}
+
+/// Only validates shared-engine evidence. Extraction, name matching and token
+/// boundaries stay in Rust; native code cannot upgrade candidates to semantics.
+enum AtlasIndexedStructure {
+    static func decode(_ row: AtlasIndexWire) throws -> AtlasSearchStructure? {
+        guard try !row.absent(["structure"]) else { return nil }
+        let value = try row.object("structure"), range = try value.object("evidence_range")
+        return try AtlasSearchStructure(name: value.text("name"), kind: value.text("kind"),
+            language: value.text("language"), evidence: value.text("evidence_level"),
+            candidate: value.number("candidate_id"), headingSlug: value.optionalText("heading_slug"),
+            evidenceStart: range.number("start"), evidenceEnd: range.number("end"))
+    }
+
+    static func accepts(_ hit: SearchHit, mode: AtlasSearchMode, needle: String) -> Bool {
+        guard !mode.isTextual, hit.actualText == nil, let value = hit.structure,
+              value.mode == mode, value.evidence == mode.evidence,
+              !value.name.isEmpty, value.name.utf8.count <= 4096,
+              !value.kind.isEmpty, value.kind.utf8.count <= 64, !value.kind.utf8.contains(0),
+              !value.language.isEmpty, value.language.utf8.count <= 64,
+              value.candidate > 0, value.candidate <= 4096,
+              let bytes = hit.captureByteLength, bytes <= mode.structureFileByteLimit,
+              value.evidenceStart <= hit.start, value.evidenceEnd >= hit.end,
+              value.evidenceEnd <= bytes else { return false }
+        if let slug = value.headingSlug, slug.utf8.count > 4096 || slug.utf8.contains(0) { return false }
+        switch mode {
+        case .headings:
+            return value.headingSlug?.isEmpty == false && value.kind == "heading" && value.language == "markdown"
+                && value.evidenceStart == hit.start && value.evidenceEnd == hit.end
+        case .occurrences:
+            return value.name.utf8.elementsEqual(needle.utf8)
+                && value.kind == "identifier-occurrence" && value.language == "text" && value.headingSlug == nil
+                && value.evidenceStart == hit.start && value.evidenceEnd == hit.end
+                && (hit.end - hit.start == UInt64(needle.utf8.count)
+                    || hit.end - hit.start == UInt64(needle.utf16.count) * 2)
+                && hit.excerpt?.matchesSourceText(needle) != false
+        case .symbols:
+            return value.headingSlug == nil
+                && ["rust", "python", "javascript", "typescript", "go", "cpp"].contains(value.language)
+        case .text, .expression: return false
+        }
+    }
+
+    static func coverage(_ w: AtlasIndexWire, mode: AtlasSearchMode, nameMode: AtlasSearchNameMode,
+                         scanned: Int, examined: Int, unavailable: Int, retained: Int,
+                         matches: UInt64) throws -> AtlasSearchStructureCoverage? {
+        if mode == .occurrences {
+            guard nameMode == .exact, try w.flag("includes_comments_and_literals"),
+                  try !w.flag("compiler_resolved"),
+                  try w.text("token_policy") == AtlasSearchOccurrencePolicy.tokenPolicy,
+                  try w.text("name_syntax") == AtlasSearchOccurrencePolicy.nameSyntax,
+                  try w.text("unicode_normalization") == "none" else { throw AtlasIndexWire.invalid() }
+        } else {
+            guard try w.absent(["includes_comments_and_literals", "compiler_resolved", "token_policy",
+                "name_syntax", "unicode_normalization"]) else { throw AtlasIndexWire.invalid() }
+        }
+        if mode.isTextual {
+            guard try w.absent(["requested_mode", "realized_mode", "name_mode", "name_case", "evidence_level",
+                "semantic_complete", "completeness_basis", "structure_file_byte_limit", "unsupported_structure_files",
+                "extraction_limited_files", "structure_metadata_omitted", "structure_metadata_bytes"]) else {
+                throw AtlasIndexWire.invalid()
+            }
+            return nil
+        }
+        guard try w.text("requested_mode") == mode.rawValue, try w.text("realized_mode") == mode.evidence,
+              try w.text("name_mode") == nameMode.rawValue, try w.text("name_case") == "sensitive",
+              try w.text("evidence_level") == mode.evidence, try !w.flag("semantic_complete"),
+              try w.text("completeness_basis") == "admitted-extraction-processing" else { throw AtlasIndexWire.invalid() }
+        let coverage = try AtlasSearchStructureCoverage(fileByteLimit: w.number("structure_file_byte_limit"),
+            unsupportedFiles: w.count("unsupported_structure_files", upTo: unavailable),
+            // Heading source qualification can exhaust its reservation before
+            // any extraction is accepted into scanned_files.
+            extractionLimitedFiles: w.count("extraction_limited_files", upTo: unavailable),
+            metadataOmitted: w.count("structure_metadata_omitted", upTo: 4096 * 4096),
+            metadataBytes: w.count("structure_metadata_bytes", upTo: 8 * 1024 * 1024))
+        guard coverage.fileByteLimit == mode.structureFileByteLimit,
+              coverage.unsupportedFiles + coverage.extractionLimitedFiles <= unavailable,
+              coverage.unsupportedFiles + scanned <= examined,
+              coverage.metadataOmitted == 0 || unavailable > 0,
+              matches <= 4096 * 4096,
+              matches <= UInt64(retained + coverage.metadataOmitted + 1) else { throw AtlasIndexWire.invalid() }
+        return coverage
     }
 }
 
@@ -200,6 +287,7 @@ struct AtlasIndexedQueryState: Equatable {
     let running, complete, truncated, countAllMatches, matchCountComplete: Bool
     let stop: String?
     let expression: AtlasSearchExpression?
+    let structureCoverage: AtlasSearchStructureCoverage?
 }
 struct AtlasIndexedQueryPage {
     let state: AtlasIndexedQueryState
@@ -209,11 +297,12 @@ struct AtlasIndexedQueryPage {
 
     init(_ json: String?, basis: AtlasIndexedBasis, generation: UInt64, needle: String,
          scope: AtlasSearchFileScope = .all, pathScope: AtlasSearchPathScope = .workspace,
-         caseSensitive: Bool = true, mode: AtlasSearchMode = .text, countAllMatches: Bool = false,
+         caseSensitive: Bool = true, mode: AtlasSearchMode = .text, nameMode: AtlasSearchNameMode = .contains,
+         countAllMatches: Bool = false,
          command: String) throws {
         let w = try AtlasIndexWire.decode(json)
         try basis.validate(w, command: command)
-        guard mode.isTextual else { throw AtlasIndexWire.invalid() }
+        guard mode.isTextual || (caseSensitive && !countAllMatches) else { throw AtlasIndexWire.invalid() }
         let kind = try w.optionalText("search_scope")
         try pathScope.validateEcho(kind: w.optionalText("scope_path_kind"),
             path: w.optionalText("scope_path"), hex: w.optionalText("scope_path_hex"),
@@ -276,21 +365,33 @@ struct AtlasIndexedQueryPage {
             allFileTypes: scope.isAll, complete: complete)
         guard try w.number("query_generation") == generation, generation > basis.index,
               expression != nil || primaryNeedle.utf8.elementsEqual(needle.utf8),
-              try w.text("mode") == (mode == .expression ? "decoded-text-expression" : AtlasSearchText.wireMode(caseSensitive: caseSensitive)),
+              try w.text("mode") == (mode == .text ? AtlasSearchText.wireMode(caseSensitive: caseSensitive) : mode.wireMode),
               try (w.optionalFlag("case_sensitive") ?? true) == caseSensitive,
-              try w.text("search_strategy") == "retained-ephemeral-index",
+              try w.text("search_strategy") == (mode.isTextual ? "retained-ephemeral-index" : "retained-capture-structure"),
               try w.flag("discovery_complete") == basis.discoveryComplete,
               try w.number("catalogued_files") == UInt64(basis.files),
               try w.number("displayed_hits") == UInt64(retained), try w.number("verified_files") == UInt64(scanned),
               try w.number("source_bytes_read") == 0, try w.number("read_calls") == 0,
               scanned + skipped <= captured,
-              examined == expressionExcluded + scanned + skipped + captureUnavailable, pending == eligible - examined,
-              unavailable >= captureUnavailable, unavailable <= captureUnavailable + scanned,
+              pending == eligible - examined, unavailable >= captureUnavailable, unavailable <= examined,
               verification <= (expression?.maxScanBytes ?? basis.sourceBytes),
               expression == nil || expression?.scannedInputBytes == verification,
               matches >= UInt64(retained), running == (stop == nil) else {
             throw AtlasIndexWire.invalid()
         }
+        if mode.isTextual {
+            guard examined == expressionExcluded + scanned + skipped + captureUnavailable,
+                  unavailable <= captureUnavailable + scanned else { throw AtlasIndexWire.invalid() }
+        } else {
+            // Unsupported or oversized captures are examined without running
+            // an extractor. They remain unavailable, never proven negatives.
+            guard skipped == 0, fallback == 0, examined >= scanned + captureUnavailable,
+                  examined <= captured + captureUnavailable,
+                  examined - scanned <= unavailable else { throw AtlasIndexWire.invalid() }
+        }
+        let structureCoverage = try AtlasIndexedStructure.coverage(w, mode: mode,
+            nameMode: nameMode, scanned: scanned, examined: examined - captureUnavailable,
+            unavailable: unavailable - captureUnavailable, retained: retained, matches: matches)
         if let stop, !["all-files-examined", "file-limit", "source-byte-limit", "capture-scope", "match-limit", "verification-byte-limit"].contains(stop) {
             throw AtlasIndexWire.invalid()
         }
@@ -310,14 +411,22 @@ struct AtlasIndexedQueryPage {
             } else {
                 guard !truncated, matches == UInt64(retained) else { throw AtlasIndexWire.invalid() }
             }
+            if let coverage = structureCoverage {
+                guard stop == "all-files-examined", coverage.unsupportedFiles == 0,
+                      coverage.extractionLimitedFiles == 0, coverage.metadataOmitted == 0 else {
+                    throw AtlasIndexWire.invalid()
+                }
+            }
         }
         hits = try w.rows("hits", limit: command == "page" ? 128 : 64)
         guard hits.allSatisfy({ scope.admitsRawPath($0.rawPathBytes) && pathScope.admitsRawPath($0.rawPathBytes)
             && basis.captureScope.fileScope.admitsRawPath($0.rawPathBytes)
             && basis.captureScope.pathScope.admitsRawPath($0.rawPathBytes)
-            && (expression == nil || $0.hit.actualText != nil)
-            && AtlasSearchText.accepts(actualText: $0.hit.actualText, needle: primaryNeedle, caseSensitive: caseSensitive)
-            && ($0.hit.excerpt?.matchesSourceText($0.hit.actualText ?? primaryNeedle) != false) }) else {
+            && (mode.isTextual
+                ? ($0.hit.structure == nil && (expression == nil || $0.hit.actualText != nil)
+                    && AtlasSearchText.accepts(actualText: $0.hit.actualText, needle: primaryNeedle, caseSensitive: caseSensitive)
+                    && ($0.hit.excerpt?.matchesSourceText($0.hit.actualText ?? primaryNeedle) != false))
+                : AtlasIndexedStructure.accepts($0.hit, mode: mode, needle: primaryNeedle)) }) else {
             throw AtlasIndexWire.invalid()
         }
         next = try w.optionalNumber("next_offset")
@@ -327,7 +436,7 @@ struct AtlasIndexedQueryPage {
             pending: pending, retained: retained, step: step, skipped: skipped, fallback: fallback,
             matches: matches, verificationBytes: verification, running: running, complete: complete,
             truncated: truncated, countAllMatches: countAllMatches, matchCountComplete: matchCountComplete,
-            stop: stop, expression: expression)
+            stop: stop, expression: expression, structureCoverage: structureCoverage)
     }
 }
 
@@ -352,10 +461,17 @@ struct AtlasIndexedAccumulator {
             if let expression = n.expression, let previous = p.expression {
                 guard expression.advances(previous) else { throw AtlasIndexWire.invalid() }
             } else if n.expression != nil || p.expression != nil { throw AtlasIndexWire.invalid() }
+            if let coverage = n.structureCoverage, let previous = p.structureCoverage {
+                guard coverage.advances(previous) else { throw AtlasIndexWire.invalid() }
+            } else if n.structureCoverage != nil || p.structureCoverage != nil { throw AtlasIndexWire.invalid() }
         } else {
             guard n.running, n.step == 0, n.retained == 0, n.matches == 0,
                   n.examined == n.captureUnavailable + (n.expression?.excludedFiles ?? 0), n.scanned == 0, n.skipped == 0,
                   n.verificationBytes == 0 else { throw AtlasIndexWire.invalid() }
+            if let coverage = n.structureCoverage {
+                guard coverage.unsupportedFiles == 0, coverage.extractionLimitedFiles == 0,
+                      coverage.metadataOmitted == 0, coverage.metadataBytes == 0 else { throw AtlasIndexWire.invalid() }
+            }
         }
         state = n
         try append(page, start: 0, limit: 64)
@@ -378,7 +494,9 @@ struct AtlasIndexedAccumulator {
                 }
                 let charge = row.pathHex.utf8.count + row.rawPathBytes.count
                     + 2 * row.hit.path.utf8.count + (row.hit.sourcePath?.utf8.count ?? 0)
-                    + 2 * (row.hit.actualText?.utf8.count ?? 0) + 512
+                    + 2 * (row.hit.actualText?.utf8.count ?? 0)
+                    + 2 * (row.hit.structure?.name.utf8.count ?? 0)
+                    + 2 * (row.hit.structure?.headingSlug?.utf8.count ?? 0) + 512
                 guard charge <= AtlasSearchRetention.witnessBytes - textBytes else { throw AtlasIndexWire.invalid() }
                 var admitted = row
                 if let excerpt = row.hit.excerpt {

@@ -28,6 +28,10 @@ struct AtlasIndexedSearchTransport: Sendable {
     /// Explicit count requests never fall back to a row-limited query.
     var countedQueryBegin: (@Sendable (UInt64, UInt64, UInt64, String, AtlasSearchFileScope, AtlasSearchPathScope, Bool) throws -> String?)? = nil
     var countedExpressionQueryBegin: (@Sendable (UInt64, UInt64, UInt64, String, AtlasSearchFileScope, AtlasSearchPathScope, Bool) throws -> String?)? = nil
+    /// Structural extraction borrows this same index's immutable captures.
+    /// Missing capability must refuse before discovery or source capture.
+    var structureQueryBegin: (@Sendable (UInt64, UInt64, UInt64, AtlasSearchMode, AtlasSearchNameMode,
+        String, AtlasSearchFileScope, AtlasSearchPathScope) throws -> String?)? = nil
 }
 
 /// A completed retained source index, without an admitted text query. A links
@@ -92,7 +96,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
         let grant = access.reference.map(ObjectIdentifier.init)
         if cached.map({ $0.root.utf8.elementsEqual(root.utf8) && $0.grant == grant }) != true {
             cached = nil
-            cached = try build(root: root, scope: scope, pathScope: pathScope, mode: .text,
+            cached = try build(root: root, scope: scope, pathScope: pathScope, mode: .text, nameMode: .contains,
                 caseSensitive: true, access: access, cancellation: cancellation, progress: progress)
         }
         try check(cancellation)
@@ -108,10 +112,11 @@ final class AtlasIndexedSearch: @unchecked Sendable {
 
     func runScoped(input: AtlasSearchInput, cancellation: AtlasSearchCancellation,
                    access: AtlasSearchAccessLease, progress: @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport {
-        guard input.mode.isTextual else { throw AtlasSearchError.invalidRequest }
         let root = input.root, query = input.query, scope = input.fileScope, pathScope = input.pathScope
         let countAllMatches = input.countsIndexedMatches(supportsCounting: transport.countedQueryBegin != nil)
-        if countAllMatches {
+        if !input.mode.isTextual {
+            guard transport.structureQueryBegin != nil else { throw AtlasSearchError.unavailable }
+        } else if countAllMatches {
             guard input.mode == .expression ? transport.countedExpressionQueryBegin != nil
                 : transport.countedQueryBegin != nil else { throw AtlasSearchError.unsupportedCounting }
         } else if input.mode == .expression {
@@ -134,7 +139,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                 // Publish a successfully finished index before the next cancel
                 // gate. Cancellation can suppress query delivery, not make an
                 // acknowledged complete source universe need another capture.
-                cached = try build(root: root, scope: scope, pathScope: pathScope, mode: input.mode, caseSensitive: input.caseSensitive,
+                cached = try build(root: root, scope: scope, pathScope: pathScope, mode: input.mode,
+                    nameMode: input.nameMode, caseSensitive: input.caseSensitive,
                     access: access, cancellation: cancellation, progress: progress)
             }
             guard let session = cached else { throw AtlasSearchError.unavailable }
@@ -144,6 +150,10 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             let basis = session.basis, owner = session.owner
             try check(cancellation)
             let began = try owner.call { handle -> String? in
+                if !input.mode.isTextual {
+                    guard let structure = transport.structureQueryBegin else { throw AtlasSearchError.unavailable }
+                    return try structure(handle, generation, basis.index, input.mode, input.nameMode, query, scope, pathScope)
+                }
                 if countAllMatches {
                     let counted = input.mode == .expression ? transport.countedExpressionQueryBegin
                         : transport.countedQueryBegin
@@ -168,8 +178,9 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             }
             var page = try AtlasIndexedQueryPage(began,
                 basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope,
-                caseSensitive: input.caseSensitive, mode: input.mode, countAllMatches: countAllMatches,
-                command: input.mode == .expression ? "begin-indexed-expression" : "begin-indexed")
+                caseSensitive: input.caseSensitive, mode: input.mode, nameMode: input.nameMode, countAllMatches: countAllMatches,
+                command: !input.mode.isTextual ? "begin-indexed-structure"
+                    : (input.mode == .expression ? "begin-indexed-expression" : "begin-indexed"))
             var result = AtlasIndexedAccumulator()
             var lastPublished = -Double.infinity
             var publishedHits = 0
@@ -181,7 +192,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     let start = result.hits.count
                     let tail = try AtlasIndexedQueryPage(owner.call { try transport.page($0, generation, UInt64(start), 128) },
                         basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope,
-                        caseSensitive: input.caseSensitive, mode: input.mode, countAllMatches: countAllMatches, command: "page")
+                        caseSensitive: input.caseSensitive, mode: input.mode, nameMode: input.nameMode,
+                        countAllMatches: countAllMatches, command: "page")
                     try result.append(tail, start: start, limit: 128)
                 }
                 let state = page.state
@@ -190,7 +202,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     caseSensitive: input.caseSensitive, mode: input.mode,
                     importReader: transport.sourceReader)
                 let report = AtlasSearchReport(hits: result.hits.map(\.hit), complete: state.complete,
-                    truncated: state.truncated, unavailableFiles: state.unavailable, unsupportedFiles: 0,
+                    truncated: state.truncated, unavailableFiles: state.unavailable,
+                    unsupportedFiles: state.structureCoverage?.unsupportedFiles ?? 0,
                     matchesSeen: state.matches, countAllMatches: state.countAllMatches,
                     matchCountComplete: state.matchCountComplete,
                     progress: AtlasSearchProgress(isRunning: state.running, examinedFiles: state.examined, cataloguedFiles: state.eligible),
@@ -203,7 +216,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                         captureMissingVisibleFiles: basis.captureScope.visibleMissingFiles,
                         uncapturedFiles: state.eligible - (state.expression?.excludedFiles ?? 0) - state.captured - state.captureUnavailable),
                     fileScope: scope, excludedFiles: basis.files - state.eligible, pathScope: pathScope,
-                    mode: input.mode, caseSensitive: input.caseSensitive, visibleMissingFiles: state.visibleMissing,
+                    mode: input.mode, nameMode: input.nameMode, structureCoverage: state.structureCoverage,
+                    caseSensitive: input.caseSensitive, visibleMissingFiles: state.visibleMissing,
                     expression: state.expression)
                 try check(cancellation)
                 if !state.running { return report }
@@ -214,7 +228,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                 try check(cancellation)
                 page = try AtlasIndexedQueryPage(owner.call { try transport.queryStep($0, generation, cancellation) },
                     basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope,
-                    caseSensitive: input.caseSensitive, mode: input.mode, countAllMatches: countAllMatches, command: "step")
+                    caseSensitive: input.caseSensitive, mode: input.mode, nameMode: input.nameMode,
+                    countAllMatches: countAllMatches, command: "step")
             }
         } catch {
             if cancellation.isCanceled { throw AtlasSearchError.canceled }
@@ -253,7 +268,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
     }
 
     private func build(root: String, scope: AtlasSearchFileScope, pathScope: AtlasSearchPathScope,
-                       mode: AtlasSearchMode, caseSensitive: Bool,
+                       mode: AtlasSearchMode, nameMode: AtlasSearchNameMode, caseSensitive: Bool,
                        access: AtlasSearchAccessLease, cancellation: AtlasSearchCancellation,
                        progress: @Sendable (AtlasSearchReport) -> Void) throws -> Session {
         let grant = access.reference.map(ObjectIdentifier.init)
@@ -281,7 +296,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                         captureFileScope: page.captureScope.fileScope, capturePathScope: page.captureScope.pathScope,
                         captureEligibleFiles: page.captureScope.eligibleFiles,
                         captureMissingVisibleFiles: page.captureScope.visibleMissingFiles),
-                    fileScope: scope, pathScope: pathScope, mode: mode, caseSensitive: caseSensitive))
+                    fileScope: scope, pathScope: pathScope, mode: mode, nameMode: nameMode, caseSensitive: caseSensitive))
                 lastPublished = now
             }
             // Cancellation here leaves the last acknowledged Rust step intact.

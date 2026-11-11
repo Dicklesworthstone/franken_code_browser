@@ -470,7 +470,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
             && searchPresentation?.isCurrent(in: searchContext) == true
     }
 
-    private var wantsCapturedIndex: Bool { searchMode.isTextual && useCapturedIndex }
+    private var wantsCapturedIndex: Bool { useCapturedIndex }
     private var effectiveSearchCaseSensitive: Bool { !searchMode.isTextual || searchCaseSensitive }
     private var effectiveSearchCountAllMatches: Bool { searchMode.isTextual && searchCountAllMatches }
     private var overlayIsCurrent: Bool {
@@ -988,7 +988,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 Toggle("Captured index", isOn: Binding(
                     get: { wantsCapturedIndex }, set: { useCapturedIndex = $0 }))
                     .toggleStyle(.checkbox)
-                    .disabled(loadingProject || !searchMode.isTextual)
+                    .disabled(loadingProject)
                     .help("Capture the current file and location scope once, then search those retained bytes until Refresh.")
                 Spacer()
                 Button("Refresh", action: refreshCapturedSearch)
@@ -2331,7 +2331,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
             if input.mode == .expression {
                 searchSummary += " " + input.mode.explanation
             } else if !input.mode.isTextual {
-                searchSummary = "Searching \(input.mode == .symbols ? "declaration candidates" : "Markdown headings"). \(input.mode.explanation)"
+                searchSummary = "Searching \(input.mode.resultLabel). \(input.mode.explanation)"
                 if input.pathScope.isVisible {
                     searchSummary += " Scope: \(visibleScope?.snapshot.count ?? 0) files from the frozen atlas view."
                 }
@@ -2382,7 +2382,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
         clearSearch()
         workspaceSearch?.refresh()
         if query.isEmpty {
-            searchSummary = "Captured index cleared. Enter text to capture the current file and location scope; an opened reader keeps its original bytes."
+            searchSummary = "Captured index cleared. Enter a query to capture the current file and location scope; an opened reader keeps its original bytes."
             status = searchSummary
         } else { runSearch() }
     }
