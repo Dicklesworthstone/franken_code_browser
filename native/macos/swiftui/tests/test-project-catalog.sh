@@ -46,5 +46,6 @@ swiftc "$@" -swift-version 6 -warnings-as-errors \
     "$src/AtlasReaderOutline.swift" "$src/AtlasReaderReferences.swift" "$src/AtlasReaderDocument.swift" "$src/AtlasReaderTextSelection.swift" "$src/AtlasReaderCoordinator.swift" \
     "$src/AtlasCapturedReader.swift" "$src/AtlasSuppliedReader.swift" "$src/AtlasNavigationHistory.swift" \
     "$src/AtlasSource.swift" "$src/AtlasDocumentPreviewModel.swift" "$src/AtlasPagedReaderModel.swift" \
-    "$src/AtlasProjectBrowser.swift" "$src/tests/AtlasProjectBrowserTests.swift" -o "$out/progressive-browser"
+    "$src/AtlasProjectCatalog.swift" "$src/AtlasProjectOpening.swift" "$src/AtlasProjectChanges.swift" \
+    "$src/AtlasProjectBrowser.swift" "$src/AtlasProjectRefresh.swift" "$src/tests/AtlasProjectBrowserTests.swift" -o "$out/progressive-browser"
 "$out/progressive-browser"

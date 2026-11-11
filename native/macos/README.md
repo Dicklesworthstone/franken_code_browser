@@ -109,6 +109,29 @@ this handoff belongs only to the macOS executable. Other platforms remain
 headless. Non-UTF-8 project and filename arguments are refused by the UTF-8
 native startup path rather than being lossily rewritten.
 
+### Refreshing an open project
+
+**Refresh project** prepares a new bounded metadata page while the accepted
+project remains usable. You can keep browsing its files, searching, moving the
+atlas, and reading captured source during that work. **Cancel refresh** or a
+failed scan leaves that project in place. Only one replacement may be pending;
+after cancellation, another refresh waits for entered I/O to drain.
+
+A validated replacement is installed only while the same window, project,
+byte-exact root, and access grant still own the request. Successful refresh
+restarts current-project search and atlas preparation against the new catalog.
+Quick Open's retained reader, pinned readers, and Reading Desk captures keep
+their original source bytes; refresh does not silently substitute live bytes
+into those captures. File and directory search scopes remain selected, while
+an old visible-atlas scope must be selected again on the new map.
+
+Filesystem-change notices are hints to refresh. A partial first page remains
+partial, and the notice clears only after complete discovery without omissions
+or a newer observed change. Choosing a different folder or granting access
+again replaces the project immediately through the normal opening flow. This
+refresh operation does not automatically reconcile deleted files or migrate
+annotations between captures.
+
 ### Opening a source file
 
 ```sh

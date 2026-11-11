@@ -11,6 +11,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
     let headingSource = Array("preface\n\n## Details\n\nTarget.\n".utf8)
     let headingDigest = "12e28cc36046d8f48dd90d5364790e2d5d591c7c9b1658dcd636125a631bd59d"
     let emptyFirst: Bool
+    let completeFirst: Bool
     let fragmentStatus: String
     private let lock = NSLock()
     private var sessions: [UInt64: Session] = [:], readers: [UInt64: [UInt8]] = [:]
@@ -20,10 +21,10 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
     private var nextDirectFile: UInt64 = 1 << 63
     private var fault: String?, blocked = false
     private var log: [String] = []
-    init(emptyFirst: Bool = false, fragmentStatus: String = "unsupported") {
+    init(emptyFirst: Bool = false, completeFirst: Bool = false, fragmentStatus: String = "unsupported") {
         precondition(["none", "document-start", "resolved", "missing-heading", "ambiguous",
             "limited", "unsupported", "invalid"].contains(fragmentStatus))
-        self.emptyFirst = emptyFirst; self.fragmentStatus = fragmentStatus
+        self.emptyFirst = emptyFirst; self.completeFirst = completeFirst; self.fragmentStatus = fragmentStatus
     }
     private func locked<T>(_ work: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return work() }
     var calls: [String] { locked { log } }
@@ -72,11 +73,13 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         let first = latest > 4 ? latest - 3 : 1
         let pages = Array(first...latest), files = pages.filter { !(emptyFirst && $0 == 1) }
         let count = latest - (emptyFirst ? 1 : 0)
+        let complete = completeFirst && latest == 1 && !paused
         return ["schema": "fcb.project-catalog-session/1", "status": "ok", "command": command, "owner": String(owner),
             "identity_scope": "retained-session", "ordering": "provisional-discovery-order",
             "policy": "product-defaults/no-rule-files-v1", "native_presented": false,
             "discovery_source_bytes_read": "0", "discovery_source_read_calls": "0",
-            "state": paused ? "paused" : "discovering", "more": true, "paused": paused, "discovery_complete": false,
+            "state": paused ? "paused" : (complete ? "complete" : "discovering"),
+            "more": !complete, "paused": paused, "discovery_complete": complete,
             "latest_page": String(latest), "first_retained_page": String(first), "retained_pages": String(pages.count),
             "retained_files": String(files.count), "retained_path_bytes": String(files.reduce(0) { $0 + raw($1).count }),
             "catalogued_files": String(count),
@@ -188,7 +191,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
                 precondition(!Thread.isMainThread)
                 let delay: Bool
                 switch request {
-                case .advance, .openReader, .openDocumentLink:
+                case .open, .advance, .openReader, .openDocumentLink:
                     delay = locked { let value = blocked; blocked = false; return value }
                 default: delay = false
                 }
@@ -443,6 +446,11 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         try await emptyPagesLostRepliesPauseAndEviction()
         try await exactRawFileCaptureAndForgedReceipts()
         try await closeDrainsGrantAndLateCapture()
+        try await refreshKeepsAcceptedProjectUsableUntilPublication()
+        try await failedAndRejectedRefreshKeepTheAcceptedProject()
+        try await canceledRefreshDrainsBeforeRetryAndRetainsItsGrant()
+        try await refreshPreservesPartialAndEmptyCoverage()
+        await refreshRejectsInvalidRootsAndCancelBeforeEntry()
         try await capturedDocumentLinkOpensIndependentChain()
         try await forgedDocumentLinkReceiptsAreRefused()
         try await unobservedLinkTargetOpensWithoutDiscovery()
@@ -457,7 +465,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         try await qualifiedHeadingOffsetStartsReaderAndHistoryAtCapturedAnchor()
         try await typedFragmentFallbacksKeepReadableTargets()
         try await malformedQualifiedHeadingReceiptsNeverPublishTargets()
-        print("Progressive project pages, recovery, raw-file capture, page-independent document-link proofs, independent targets and grant-lifetime regressions passed.")
+        print("Progressive project pages, staged refresh, recovery, raw-file capture, page-independent document-link proofs, independent targets and grant-lifetime regressions passed.")
     }
     private static func boundedWireAndCoverage() throws {
         let f = ProjectBrowserFixture()
@@ -571,6 +579,145 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         await refuse("closed project published a late reader") { _ = try await pending.value }
         await wait("closed project/capture failed to retire") { f.calls.contains("close:40") && f.calls.contains("reader-close:100") && observed == nil }
         precondition(model.info == nil && model.page == nil && !f.calls.contains("LABEL-OPEN"))
+    }
+    @MainActor private static func refreshKeepsAcceptedProjectUsableUntilPublication() async throws {
+        let f = ProjectBrowserFixture(), old = AtlasProjectBrowserModel(transport: f.transport)
+        try await old.open(root: "/repo", accessLease: nil)
+        let page = old.page!, previousProject = UUID()
+        let capture = try await old.openFile(page.files[0], from: page, readerTransport: f.readerTransport)
+        let original = capture.reader.page!
+        let refresh = AtlasProjectRefresh(transport: f.transport)
+        var installed: AtlasProjectBrowserModel?, publishedProject: UUID?
+        f.blockNext()
+        let candidateProject = refresh.stage(root: "/repo", project: previousProject, accessLease: nil,
+            accepted: { candidate in
+                precondition(!old.closed && old.currentPage && candidate.previousProject == previousProject)
+                precondition(candidate.project == candidate.opening.projectID && candidate.opening.canBrowse
+                    && candidate.opening.canPrepare && !candidate.opening.hasAtlas)
+                precondition(candidate.root.utf8.elementsEqual(old.root.utf8) && candidate.accessIdentity == nil)
+                installed = candidate.browser; publishedProject = candidate.project
+                old.close()
+                return true
+            }, failed: { _ in preconditionFailure("successful refresh reported failure") })!
+        await wait("refresh did not enter its private discovery") { f.entered.wait(timeout: .now()) == .success }
+        precondition(refresh.isRefreshing && installed == nil && old.canOperate && old.currentPage)
+        precondition(!f.calls.contains("close:40") && !f.calls.contains("reader-close:100"))
+        precondition(refresh.stage(root: "/repo", project: previousProject, accessLease: nil,
+            accepted: { _ in preconditionFailure("a second candidate was admitted") }, failed: { _ in }) == nil)
+        // The accepted browser has its own queue: user browsing remains live
+        // even while the replacement's foreign call is blocked.
+        old.advance(); await wait("accepted project stopped browsing during refresh") { !old.busy }
+        precondition(old.page?.id == 2 && old.currentPage && installed == nil)
+        f.resume.signal()
+        await wait("refresh did not publish its qualified replacement") { !refresh.isRefreshing }
+        let replacement = installed!
+        precondition(old.closed && replacement.canContinue && publishedProject == candidateProject
+            && candidateProject != previousProject && replacement.info?.owner == 41)
+        precondition(capture.reader.page?.identity.matches(original.identity) == true
+            && capture.reader.page?.originalHex == original.originalHex && capture.reader.canPin)
+        capture.reader.offsetInput = "4"; capture.reader.goToByte()
+        await wait("retained source stopped reading after refresh") { !capture.reader.busy }
+        precondition(capture.reader.page?.text == "ured\n" && !f.calls.contains("LABEL-OPEN"))
+        refresh.close()
+        precondition(replacement.canOperate && !replacement.closed)
+        capture.reader.close(); replacement.close()
+    }
+    @MainActor private static func failedAndRejectedRefreshKeepTheAcceptedProject() async throws {
+        for mode in ["failed", "rejected"] {
+            let f = ProjectBrowserFixture(), old = AtlasProjectBrowserModel(transport: f.transport)
+            try await old.open(root: "/repo", accessLease: nil)
+            let page = old.page!, project = UUID(), refresh = AtlasProjectRefresh(transport: f.transport)
+            var deliveries = 0, failures: [UUID] = []
+            if mode == "failed" { f.corrupt("open-recovery-lost") }
+            let candidateProject = refresh.stage(root: "/repo", project: project, accessLease: nil,
+                accepted: { candidate in
+                    deliveries += 1
+                    precondition(candidate.browser.currentPage && old.canOperate && !old.closed)
+                    return false // The host revoked the original project/root/grant.
+                }, failed: { failures.append($0) })!
+            await wait("failed/rejected candidate did not drain") { !refresh.isRefreshing }
+            await wait("failed/rejected candidate was not retired") { f.calls.contains("close:41") }
+            precondition(failures == [candidateProject] && deliveries == (mode == "failed" ? 0 : 1))
+            precondition(old.currentPage && old.canOperate && old.page?.id == page.id
+                && old.info?.owner == 40 && !f.calls.contains("close:40"))
+            precondition(f.calls.filter { $0 == "open:41" }.count == 1
+                && f.calls.filter { $0 == "close:41" }.count == 1)
+            let capture = try await old.openFile(page.files[0], from: page, readerTransport: f.readerTransport)
+            precondition(capture.reader.page?.text == "captured\n")
+            refresh.close(); precondition(failures.count == 1)
+            capture.reader.close(); old.close()
+        }
+    }
+    @MainActor private static func canceledRefreshDrainsBeforeRetryAndRetainsItsGrant() async throws {
+        final class Grant { }
+        let f = ProjectBrowserFixture(), old = AtlasProjectBrowserModel(transport: f.transport)
+        try await old.open(root: "/repo", accessLease: nil)
+        let refresh = AtlasProjectRefresh(transport: f.transport), project = UUID()
+        var grant: Grant? = Grant(); weak var observed = grant
+        var failures: [UUID] = [], publications = 0
+        f.blockNext()
+        let candidateProject = refresh.stage(root: "/repo", project: project, accessLease: grant,
+            accepted: { _ in publications += 1; return true }, failed: { failures.append($0) })!
+        grant = nil
+        await wait("cancel fixture did not enter discovery") { f.entered.wait(timeout: .now()) == .success }
+        refresh.cancel(); refresh.cancel()
+        precondition(failures == [candidateProject] && publications == 0 && old.canOperate)
+        precondition(refresh.isRefreshing && observed != nil && !f.calls.contains("close:41"))
+        precondition(refresh.stage(root: "/repo", project: project, accessLease: nil,
+            accepted: { _ in preconditionFailure("retry accumulated behind canceled work") }, failed: { _ in }) == nil)
+        f.resume.signal()
+        await wait("canceled discovery/grant did not retire") {
+            !refresh.isRefreshing && f.calls.contains("close:41") && observed == nil
+        }
+        precondition(publications == 0 && failures == [candidateProject] && old.currentPage)
+        var installed: AtlasProjectBrowserModel?
+        precondition(refresh.stage(root: "/repo", project: project, accessLease: nil,
+            accepted: { installed = $0.browser; return true },
+            failed: { _ in preconditionFailure("retry failed") }) != nil)
+        await wait("refresh slot did not reopen after cancellation drained") { !refresh.isRefreshing }
+        precondition(installed?.info?.owner == 42 && installed?.canOperate == true && old.canOperate)
+        precondition(f.calls.filter { $0 == "close:41" }.count == 1)
+        installed?.close(); old.close()
+    }
+    @MainActor private static func refreshPreservesPartialAndEmptyCoverage() async throws {
+        for complete in [false, true] {
+            let f = ProjectBrowserFixture(emptyFirst: true, completeFirst: complete)
+            let refresh = AtlasProjectRefresh(transport: f.transport), generation = UUID()
+            var changes = AtlasProjectChangeState(), installed: AtlasProjectBrowserModel?
+            changes.bind(generation)
+            changes.receive(AtlasProjectChangeDelivery(generation: generation, monitoring: true, hints: .contentsChanged))
+            let candidateProject = refresh.stage(root: "/repo", project: UUID(), accessLease: nil,
+                accepted: { candidate in
+                    let info = candidate.browser.info!
+                    precondition(candidate.browser.page?.files.isEmpty == true && candidate.opening.canBrowse)
+                    precondition(info.complete == complete && info.more == !complete)
+                    changes.reportDiscovery(project: candidate.project, complete: info.complete,
+                        more: info.more, omissions: info.omissionCount, pendingChanges: false)
+                    installed = candidate.browser
+                    return true
+                }, failed: { changes.cancelDiscovery(project: $0) })!
+            changes.beginDiscovery(project: candidateProject)
+            await wait("empty first page failed refresh admission") { !refresh.isRefreshing }
+            precondition(installed?.currentPage == true && changes.hints.isEmpty == complete)
+            precondition(installed?.canContinue == !complete)
+            installed?.close()
+        }
+    }
+    @MainActor private static func refreshRejectsInvalidRootsAndCancelBeforeEntry() async {
+        let f = ProjectBrowserFixture(), refresh = AtlasProjectRefresh(transport: f.transport)
+        for root in ["relative", "/bad\0root", "/" + String(repeating: "a", count: 16_384)] {
+            precondition(refresh.stage(root: root, project: UUID(), accessLease: nil,
+                accepted: { _ in preconditionFailure("invalid root was opened") },
+                failed: { _ in preconditionFailure("invalid root created an attempt") }) == nil)
+        }
+        var failures: [UUID] = []
+        let project = refresh.stage(root: "/repo", project: UUID(), accessLease: nil,
+            accepted: { _ in preconditionFailure("canceled pre-entry refresh was published") },
+            failed: { failures.append($0) })!
+        refresh.close()
+        precondition(refresh.isRefreshing && failures == [project])
+        await wait("pre-entry cancel did not release its slot") { !refresh.isRefreshing }
+        precondition(f.calls.isEmpty && failures == [project])
     }
     @MainActor private static func prepareLink(_ reader: AtlasPagedReaderModel) async -> AtlasReaderDocumentLinkTarget {
         let preview = reader.documentPreview

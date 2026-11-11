@@ -253,6 +253,9 @@ private struct AtlasFrozenViewportSearch: Sendable {
     @State private var projectOpening = AtlasProjectOpening()
     @State private var projectBrowser = AtlasProjectBrowserModel(transport: .native)
     @State private var projectChanges = AtlasProjectChanges(makeDriver: { AtlasNativeProjectChangeDriver() })
+    @State private var projectRefresh = AtlasProjectRefresh(transport: .native)
+    @State private var refreshOriginProject: UUID?
+    @State private var projectViewActive = false
     @State private var browserProject = UUID()
     @State private var showsCatalog = true
     @State private var catalogEntries: [AtlasProjectCatalog.Entry] = []
@@ -563,6 +566,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 .onDisappear { presentation.close() }
         }
         .onAppear {
+            projectViewActive = true
 #if FCB_APP_STORE
             if rootAccess != nil { requestAtlasLoad() }
             else if !appStoreStartupConsumed {
@@ -592,6 +596,9 @@ private struct AtlasFrozenViewportSearch: Sendable {
 #endif
         }
         .onDisappear {
+            projectViewActive = false
+            projectRefresh.cancel()
+            refreshOriginProject = nil
 #if FCB_APP_STORE
             rootAccessLoader.cancel()
 #endif
@@ -1141,9 +1148,28 @@ private struct AtlasFrozenViewportSearch: Sendable {
                     Text("Pinned and kept captures remain unchanged.")
                         .font(.caption).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, alignment: .leading)
-                Button("Refresh project", action: requestAtlasLoad).disabled(loadingProject)
+                Button("Refresh project", action: requestAtlasLoad)
+                    .disabled(loadingProject || projectRefresh.isRefreshing)
                 if projectChanges.needsFolderSelection {
                     Button("Choose folder…", action: chooseProject)
+                }
+            }.padding(10).background(.bar)
+        }
+    }
+
+    @ViewBuilder private var projectRefreshNotice: some View {
+        if refreshOriginProject == loadGeneration, !projectRefresh.notice.isEmpty {
+            HStack(alignment: .top, spacing: 10) {
+                if projectRefresh.isRefreshing {
+                    ProgressView().controlSize(.small)
+                        .accessibilityLabel("Preparing a replacement project page")
+                }
+                Text(projectRefresh.notice).font(.callout)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if projectRefresh.isRefreshing {
+                    Button("Cancel refresh") { projectRefresh.cancel() }
+                } else {
+                    Button("Dismiss") { refreshOriginProject = nil }
                 }
             }.padding(10).background(.bar)
         }
@@ -1173,6 +1199,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
             VStack(spacing: 0) {
                 rootAccessProgress
                 projectChangeNotice
+                projectRefreshNotice
                 if (showsCatalog || !hasMetadataAtlas), !projectBrowser.root.isEmpty {
                     progressiveProjectView
                 } else if !hasMetadataAtlas {
@@ -1524,9 +1551,122 @@ private struct AtlasFrozenViewportSearch: Sendable {
         atlasRevision = revision
     }
 
-    /// Project opening performs only the bounded metadata operation. Text
-    /// capture/highlighting/raster preparation is an explicit subsequent action.
+    /// A same-root refresh prepares a private first page while the accepted
+    /// project remains usable. Root/grant replacements use the separate initial
+    /// load route and immediately revoke their previous source authority.
     private func requestAtlasLoad() {
+        if projectOpening.canBrowse, !projectBrowser.closed,
+           browserProject == loadGeneration, projectBrowser.root.utf8.elementsEqual(root.utf8) {
+            requestProjectRefresh()
+        } else {
+            replaceProject()
+        }
+    }
+
+    private func requestProjectRefresh() {
+        guard projectViewActive, !projectRefresh.isRefreshing, !loadingProject,
+              projectOpening.canBrowse, !projectBrowser.closed,
+              browserProject == loadGeneration, projectBrowser.root.utf8.elementsEqual(root.utf8) else { return }
+        let previous = projectBrowser, previousProject = browserProject
+        let accessLease: AnyObject?
+#if FCB_APP_STORE
+        guard !rootAccessLoader.isLoading, let access = rootAccess,
+              access.url.path.utf8.elementsEqual(root.utf8) else {
+            status = "Choose the project folder again to grant read access."
+            return
+        }
+        accessLease = access
+#else
+        accessLease = nil
+#endif
+        if let project = projectRefresh.stage(root: root, project: previousProject, accessLease: accessLease,
+            accepted: { candidate in acceptProjectRefresh(candidate, replacing: previous) },
+            failed: { project in projectChanges.cancelDiscovery(project: project) }) {
+            refreshOriginProject = previousProject
+            // The coordinator opens on a later main-actor turn. Record the
+            // watcher epoch before any candidate result can be delivered.
+            projectChanges.bind(root: root, accessLease: accessLease)
+            projectChanges.beginDiscovery(project: project)
+        }
+    }
+
+    /// Commit only after the replacement page is validated. There is no await
+    /// between checking the owning project/grant and revoking its old actions.
+    /// Failed/canceled preparation never enters this path.
+    private func acceptProjectRefresh(_ candidate: AtlasProjectRefresh.Candidate,
+        replacing previous: AtlasProjectBrowserModel) -> Bool {
+        guard projectViewActive, projectBrowser === previous, !previous.closed,
+              browserProject == candidate.previousProject, loadGeneration == candidate.previousProject,
+              root.utf8.elementsEqual(candidate.root.utf8),
+              candidate.browser.root.utf8.elementsEqual(candidate.root.utf8),
+              candidate.project != candidate.previousProject, candidate.opening.projectID == candidate.project,
+              candidate.opening.canBrowse, candidate.browser.currentPage, !candidate.browser.closed,
+              let info = candidate.browser.info else { return false }
+#if FCB_APP_STORE
+        guard !rootAccessLoader.isLoading,
+              rootAccess.map(ObjectIdentifier.init) == candidate.accessIdentity,
+              rootAccess?.url.path.utf8.elementsEqual(candidate.root.utf8) == true else { return false }
+#else
+        guard candidate.accessIdentity == nil else { return false }
+#endif
+        snapshotExport.cancel()
+        closeObservedReader()
+        closeWorkspaceStreamSearch()
+        closeProjectLinks()
+        closeAtlasResidency()
+        workspaceSearch?.refresh()
+        showsFileFinder = false
+        capturedReaderTarget = nil
+        suppliedReaderTarget = nil
+        cancelSourceLoad()
+        clearSearch()
+        selectedSource = nil
+        selectedMatch = nil
+        sourceError = nil
+        fileText = ""
+        loadTask?.cancel()
+        loadCancellation?.cancel()
+        projectIO.cancel()
+        loadTask = nil
+        loadCancellation = nil
+        loadProgress = ""
+        projectOpening = candidate.opening
+        browserProject = candidate.project
+        projectBrowser = candidate.browser
+        previous.close()
+        refreshOriginProject = candidate.project
+        showsCatalog = true
+        showsCity = false
+        // A Quick Open reader owns its retained bytes independently of both
+        // catalog sessions. Keep that model/SwiftUI identity and use the new
+        // project's verified-link route for any future current-source action.
+        if let retained = finderReaderCapture {
+            selectedPath = retained.file.path
+            usesPagedReader = true
+        } else {
+            selectedPath = nil
+            usesPagedReader = false
+            showsReader = false
+            focusRequest = UUID()
+        }
+        renewAtlasRevision()
+        files = []
+        displayedFiles = []
+        catalogEntries = []
+        // A first page can still have unvisited members or omissions. Only a
+        // real complete scan under the same uninterrupted watcher clears hints.
+        projectChanges.reportDiscovery(project: candidate.project, complete: info.complete,
+            more: info.more, omissions: info.omissionCount)
+        status = candidate.browser.notice
+        if !query.isEmpty { runSearch(debounce: true) }
+        return true
+    }
+
+    /// Initial project opening performs only the bounded metadata operation.
+    /// Text capture/highlighting/raster preparation is a subsequent action.
+    private func replaceProject() {
+        projectRefresh.cancel()
+        refreshOriginProject = nil
         snapshotExport.cancel()
         closeObservedReader()
         closeWorkspaceStreamSearch()
@@ -2423,7 +2563,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
         searchTitle = "Search project"
         searchSummary = "Enter text to search the project."
         selectedPath = nil
-        requestAtlasLoad()
+        replaceProject()
     }
 
     private func restoreProject(_ path: String) {
@@ -2457,7 +2597,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
         searchTitle = "Search project"
         searchSummary = "Enter text to search the project."
         selectedPath = nil
-        requestAtlasLoad()
+        replaceProject()
     }
 #endif
 
