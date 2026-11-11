@@ -24,6 +24,9 @@ struct AtlasIndexedSearchTransport: Sendable {
     /// Expressions are parsed and verified by the shared engine. The source
     /// capture scope is unchanged; syntax filters narrow only this query.
     var expressionQueryBegin: (@Sendable (UInt64, UInt64, UInt64, String, AtlasSearchFileScope, AtlasSearchPathScope, Bool) throws -> String?)? = nil
+    /// Exact literal counting scans past the retained-row limit. Legacy
+    /// transports keep their bounded result semantics until they opt in.
+    var countedQueryBegin: (@Sendable (UInt64, UInt64, UInt64, String, AtlasSearchFileScope, AtlasSearchPathScope, Bool) throws -> String?)? = nil
 }
 
 /// A completed retained source index, without an admitted text query. A links
@@ -106,13 +109,14 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                    access: AtlasSearchAccessLease, progress: @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport {
         guard input.mode.isTextual else { throw AtlasSearchError.invalidRequest }
         let root = input.root, query = input.query, scope = input.fileScope, pathScope = input.pathScope
+        let countAllMatches = input.mode == .text && input.caseSensitive && transport.countedQueryBegin != nil
         if input.mode == .expression {
             guard transport.expressionQueryBegin != nil else { throw AtlasSearchError.unavailable }
         } else if !input.caseSensitive {
             guard transport.matchingQueryBegin != nil else { throw AtlasSearchError.unsupportedMatching }
-        } else if pathScope.isWorkspace {
+        } else if !countAllMatches && pathScope.isWorkspace {
             guard scope.isAll || transport.scopedQueryBegin != nil else { throw AtlasSearchError.invalidScope }
-        } else {
+        } else if !countAllMatches {
             guard transport.pathScopedQueryBegin != nil else { throw AtlasSearchError.invalidPathScope }
         }
         try check(cancellation)
@@ -144,6 +148,10 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     guard let matching = transport.matchingQueryBegin else { throw AtlasSearchError.unsupportedMatching }
                     return try matching(handle, generation, basis.index, query, scope, pathScope, input.caseSensitive)
                 }
+                if countAllMatches {
+                    guard let counted = transport.countedQueryBegin else { throw AtlasSearchError.unavailable }
+                    return try counted(handle, generation, basis.index, query, scope, pathScope, true)
+                }
                 if !pathScope.isWorkspace {
                     guard let scoped = transport.pathScopedQueryBegin else { throw AtlasSearchError.invalidPathScope }
                     return try scoped(handle, generation, basis.index, query, scope, pathScope)
@@ -154,7 +162,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             }
             var page = try AtlasIndexedQueryPage(began,
                 basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope,
-                caseSensitive: input.caseSensitive, mode: input.mode,
+                caseSensitive: input.caseSensitive, mode: input.mode, countAllMatches: countAllMatches,
                 command: input.mode == .expression ? "begin-indexed-expression" : "begin-indexed")
             var result = AtlasIndexedAccumulator()
             var lastPublished = -Double.infinity
@@ -167,7 +175,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     let start = result.hits.count
                     let tail = try AtlasIndexedQueryPage(owner.call { try transport.page($0, generation, UInt64(start), 128) },
                         basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope,
-                        caseSensitive: input.caseSensitive, mode: input.mode, command: "page")
+                        caseSensitive: input.caseSensitive, mode: input.mode, countAllMatches: countAllMatches, command: "page")
                     try result.append(tail, start: start, limit: 128)
                 }
                 let state = page.state
@@ -177,7 +185,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     importReader: transport.sourceReader)
                 let report = AtlasSearchReport(hits: result.hits.map(\.hit), complete: state.complete,
                     truncated: state.truncated, unavailableFiles: state.unavailable, unsupportedFiles: 0,
-                    matchesSeen: state.matches,
+                    matchesSeen: state.matches, countAllMatches: state.countAllMatches,
+                    matchCountComplete: state.matchCountComplete,
                     progress: AtlasSearchProgress(isRunning: state.running, examinedFiles: state.examined, cataloguedFiles: state.eligible),
                     streamID: result.id, capture: capture,
                     indexStatus: AtlasSearchIndexStatus(building: false, reused: reused,
@@ -199,7 +208,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                 try check(cancellation)
                 page = try AtlasIndexedQueryPage(owner.call { try transport.queryStep($0, generation, cancellation) },
                     basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope,
-                    caseSensitive: input.caseSensitive, mode: input.mode, command: "step")
+                    caseSensitive: input.caseSensitive, mode: input.mode, countAllMatches: countAllMatches, command: "step")
             }
         } catch {
             if cancellation.isCanceled { throw AtlasSearchError.canceled }

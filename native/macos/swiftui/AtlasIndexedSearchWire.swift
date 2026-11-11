@@ -197,7 +197,7 @@ struct AtlasIndexedQueryState: Equatable {
     let eligible, captured, captureUnavailable, visibleMissing: Int
     let examined, scanned, unavailable, pending, retained, step, skipped, fallback: Int
     let matches, verificationBytes: UInt64
-    let running, complete, truncated: Bool
+    let running, complete, truncated, countAllMatches, matchCountComplete: Bool
     let stop: String?
     let expression: AtlasSearchExpression?
 }
@@ -209,7 +209,8 @@ struct AtlasIndexedQueryPage {
 
     init(_ json: String?, basis: AtlasIndexedBasis, generation: UInt64, needle: String,
          scope: AtlasSearchFileScope = .all, pathScope: AtlasSearchPathScope = .workspace,
-         caseSensitive: Bool = true, mode: AtlasSearchMode = .text, command: String) throws {
+         caseSensitive: Bool = true, mode: AtlasSearchMode = .text, countAllMatches: Bool = false,
+         command: String) throws {
         let w = try AtlasIndexWire.decode(json)
         try basis.validate(w, command: command)
         guard mode.isTextual else { throw AtlasIndexWire.invalid() }
@@ -258,6 +259,18 @@ struct AtlasIndexedQueryPage {
         let matches = try w.number("matches_seen"), verification = try w.number("verification_source_bytes")
         let running = try w.flag("search_in_progress"), complete = try w.flag("search_complete")
         let truncated = try w.flag("truncated"), stop = try w.optionalText("stop_reason")
+        let hasCountReceipt = w.fields.contains(AtlasIndexWire.Key("count_all_matches"))
+            || w.fields.contains(AtlasIndexWire.Key("match_count_complete"))
+        let matchCountComplete: Bool
+        if hasCountReceipt || countAllMatches {
+            // An opted-in count must carry both typed receipts on every page.
+            // Missing/null fields must not turn a partial count into a total.
+            guard try w.flag("count_all_matches") == countAllMatches else { throw AtlasIndexWire.invalid() }
+            matchCountComplete = try w.flag("match_count_complete")
+            guard matchCountComplete == complete else { throw AtlasIndexWire.invalid() }
+        } else {
+            matchCountComplete = complete
+        }
         let visibleMissing = try pathScope.validateRegionCoverage(catalogued: w.optionalText("scope_region_catalogued_files"),
             missing: w.optionalText("scope_region_missing_files"), eligible: eligible, searchCatalogFiles: basis.files,
             allFileTypes: scope.isAll, complete: complete)
@@ -284,9 +297,19 @@ struct AtlasIndexedQueryPage {
         if stop == "capture-scope" {
             guard pending > 0, basis.captureScope.excludedFiles > 0 else { throw AtlasIndexWire.invalid() }
         }
+        if countAllMatches {
+            guard mode == .text, caseSensitive, expression == nil,
+                  matches <= basis.sourceBytes, truncated == (matches > UInt64(retained)),
+                  stop != "match-limit" else { throw AtlasIndexWire.invalid() }
+        }
         if complete {
-            guard !running, !truncated, basis.discoveryComplete, pending == 0, unavailable == 0,
-                  matches == UInt64(retained) else { throw AtlasIndexWire.invalid() }
+            guard !running, basis.discoveryComplete, pending == 0, unavailable == 0,
+                  visibleMissing == 0 else { throw AtlasIndexWire.invalid() }
+            if countAllMatches {
+                guard matchCountComplete, stop == "all-files-examined" else { throw AtlasIndexWire.invalid() }
+            } else {
+                guard !truncated, matches == UInt64(retained) else { throw AtlasIndexWire.invalid() }
+            }
         }
         hits = try w.rows("hits", limit: command == "page" ? 128 : 64)
         guard hits.allSatisfy({ scope.admitsRawPath($0.rawPathBytes) && pathScope.admitsRawPath($0.rawPathBytes)
@@ -303,7 +326,8 @@ struct AtlasIndexedQueryPage {
             examined: examined, scanned: scanned, unavailable: unavailable,
             pending: pending, retained: retained, step: step, skipped: skipped, fallback: fallback,
             matches: matches, verificationBytes: verification, running: running, complete: complete,
-            truncated: truncated, stop: stop, expression: expression)
+            truncated: truncated, countAllMatches: countAllMatches, matchCountComplete: matchCountComplete,
+            stop: stop, expression: expression)
     }
 }
 
@@ -320,7 +344,7 @@ struct AtlasIndexedAccumulator {
         let n = page.state
         if let p = state {
             guard p.running, n.eligible == p.eligible, n.captured == p.captured, n.captureUnavailable == p.captureUnavailable,
-                  n.visibleMissing == p.visibleMissing,
+                  n.visibleMissing == p.visibleMissing, n.countAllMatches == p.countAllMatches,
                   n.step == p.step + 1, n.examined >= p.examined, n.examined <= p.examined + 1,
                   n.scanned >= p.scanned, n.skipped >= p.skipped, n.fallback >= p.fallback,
                   n.unavailable >= p.unavailable, n.retained >= p.retained, n.matches >= p.matches,

@@ -47,7 +47,183 @@ import Dispatch
         }
         return value
     }
+    @MainActor private static func countedSearch() throws {
+        do {
+            let f = IndexedFixture(), reports = IndexReports()
+            f.configure { $0.hitCount = 1000; $0.countedMatches = 3000 }
+            let w = AtlasIndexedSearch(transport: f.countedTransport)
+            let first = try run(w, reports: reports)
+            check(first.complete && first.truncated && first.countAllMatches && first.matchCountComplete,
+                "An exhaustive count remains complete when retained results are capped")
+            check(first.matchesSeen == 3000 && first.hits.count == 1000
+                && first.hits.map(\.id) == Array(0..<1000), "Counted totals do not expand or renumber retained witnesses")
+            check(first.summary.contains("3000 exact matches") && first.summary.contains("first 1000 retained"),
+                "Completed indexed search presents the total separately from its retained rows")
+            check(reports.values.contains { $0.isInProgress && $0.countAllMatches && !$0.matchCountComplete
+                && $0.truncated && $0.matchesSeen == 3000 && $0.hits.count == 1000
+                && $0.summary.contains("counted so far") }, "Progressive counts stay provisional past the row limit")
+            let target = first.capture!.target(first.hits[999])!
+            let next = try run(w)
+            check(next.indexStatus?.reused == true && next.matchesSeen == 3000
+                && next.streamID != first.streamID && f.count("build-step:") == 2 && f.count("open:") == 1,
+                "Repeated full counts reuse the captured index without recapturing live files")
+            _ = try target.openReader(100)
+            check(f.count("source:") == 1 && f.count("query-counted:true") == 2,
+                "Bounded retained witnesses still open their original source after another counted query")
+        }
+        do {
+            let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.countedTransport)
+            let insensitive = try run(w, caseSensitive: false)
+            let expression = try w.runScoped(input: AtlasSearchInput(root: "/repo", query: "x", mode: .expression),
+                cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
+            check(!insensitive.countAllMatches && !expression.countAllMatches && f.count("query-counted:true") == 0,
+                "Insensitive literals and expressions retain their existing bounded semantics")
+            let legacy = try run(AtlasIndexedSearch(transport: IndexedFixture().transport))
+            check(!legacy.countAllMatches && legacy.complete, "Legacy bounded transports remain supported")
+        }
+        do {
+            let f = IndexedFixture()
+            f.configure { $0.files = 3; $0.scopedEligible = 1; $0.scopedCaptured = 1
+                $0.hitCount = 1000; $0.countedMatches = 3000 }
+            var transport = f.countedTransport
+            transport.scopedQueryBegin = nil; transport.pathScopedQueryBegin = nil
+            let w = AtlasIndexedSearch(transport: transport)
+            let path = try AtlasSearchPathScope(kind: .file, path: "a.rs")
+            let scope = try AtlasSearchFileScope(extensions: ["rs"])
+            let selected = try scoped(w, scope: scope, pathScope: path)
+            check(selected.complete && selected.matchCountComplete && selected.matchesSeen == 3000
+                && selected.fileScope == scope && selected.pathScope == path && selected.excludedFiles == 2,
+                "The counted admission carries file-type and exact-path scopes without legacy scoped entry points")
+            let broader = try run(w)
+            check(!broader.complete && !broader.matchCountComplete && broader.countAllMatches
+                && broader.matchesSeen == 3000 && broader.indexStatus?.uncapturedFiles == 2,
+                "Widening a query beyond its original captures cannot claim a global total")
+        }
+        for reason in ["pending", "unavailable", "discovery", "verification"] {
+            let f = IndexedFixture()
+            f.configure { c in
+                c.files = 3; c.hitCount = 1000; c.countedMatches = 3000
+                if reason == "pending" { c.pending = 1 }
+                if reason == "unavailable" { c.unavailable = 1 }
+                if reason == "discovery" { c.discovery = false }
+            }
+            if reason == "verification" {
+                f.patch { phase, original in
+                    var value = original
+                    if (phase == "query-step" || phase == "page"), value["step_count"] as? String == "1" {
+                        value["search_in_progress"] = false; value["stop_reason"] = "verification-byte-limit"
+                    }
+                    return value
+                }
+            }
+            let partial = try run(AtlasIndexedSearch(transport: f.countedTransport))
+            check(partial.countAllMatches && !partial.complete && !partial.matchCountComplete
+                && partial.truncated && partial.matchesSeen == 3000 && partial.hits.count == 1000
+                && partial.summary.contains("total count is not complete"),
+                "Incomplete \(reason) coverage cannot label its observed count as exhaustive")
+        }
+        do {
+            let f = IndexedFixture(), flag = AtlasSearchCancellation(), reports = IndexReports()
+            f.configure { $0.hitCount = 1000; $0.countedMatches = 3000 }
+            let w = AtlasIndexedSearch(transport: f.countedTransport)
+            do {
+                _ = try w.run(root: "/repo", query: "x", cancellation: flag, access: AtlasSearchAccessLease(nil)) { report in
+                    reports.offer(report)
+                    if report.truncated { flag.cancel() }
+                }
+                preconditionFailure("Count continuation ignored cancellation")
+            } catch AtlasSearchError.canceled { checks += 1 }
+            check(f.count("query-step:") == 1 && reports.values.allSatisfy { !$0.matchCountComplete },
+                "Canceling after useful retained rows suppresses any exhaustive-count claim or further work")
+            let next = try run(w)
+            check(next.matchCountComplete && next.indexStatus?.reused == true && f.count("create:") == 1
+                && f.trace.contains { $0.hasPrefix("query-begin:") && $0.hasSuffix(":3") },
+                "A canceled count consumes its generation while preserving the completed source index")
+        }
+        for defect in ["missing-policy", "missing-completion", "null-policy", "non-bool-policy", "wrong-policy",
+                       "early-complete", "too-many-matches", "wrong-truncation", "wrong-stop", "match-limit",
+                       "stale-generation", "page-count-drift", "page-missing-receipt", "decreasing-count", "false-total"] {
+            let f = IndexedFixture()
+            f.configure { $0.hitCount = 1000; $0.countedMatches = 3000 }
+            f.patch { phase, original in
+                var value = original
+                if phase == "query-begin" {
+                    switch defect {
+                    case "missing-policy": value.removeValue(forKey: "count_all_matches")
+                    case "missing-completion": value.removeValue(forKey: "match_count_complete")
+                    case "null-policy": value["count_all_matches"] = NSNull()
+                    case "non-bool-policy": value["count_all_matches"] = "true"
+                    case "wrong-policy": value["count_all_matches"] = false
+                    default: break
+                    }
+                }
+                if phase == "query-step" {
+                    switch defect {
+                    case "early-complete": value["search_complete"] = true; value["match_count_complete"] = true
+                    case "too-many-matches": value["matches_seen"] = "4197"
+                    case "wrong-truncation": value["truncated"] = false
+                    case "stale-generation": value["query_generation"] = "1"
+                    default: break
+                    }
+                    if value["step_count"] as? String == "2" {
+                        switch defect {
+                        case "wrong-stop": value["stop_reason"] = "verification-byte-limit"
+                        case "match-limit": value["stop_reason"] = "match-limit"
+                        case "decreasing-count": value["matches_seen"] = "2999"
+                        case "false-total": value["match_count_complete"] = false
+                        default: break
+                        }
+                    }
+                }
+                if phase == "page" {
+                    if defect == "page-count-drift" { value["matches_seen"] = "3001" }
+                    if defect == "page-missing-receipt" {
+                        value.removeValue(forKey: "count_all_matches"); value.removeValue(forKey: "match_count_complete")
+                    }
+                }
+                return value
+            }
+            do { _ = try run(AtlasIndexedSearch(transport: f.countedTransport)); preconditionFailure("Accepted counted defect: " + defect) }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        do {
+            let f = IndexedFixture()
+            f.patch { phase, original in
+                var value = original
+                if phase == "query-begin" { value["count_all_matches"] = true; value["match_count_complete"] = false }
+                return value
+            }
+            do { _ = try run(AtlasIndexedSearch(transport: f.transport)); preconditionFailure("Bounded request accepted counted receipt") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        #if canImport(CryptoKit)
+        for falselyComplete in [false, true] {
+            let f = IndexedFixture()
+            f.configure { c in
+                c.scopedEligible = 1; c.scopedCaptured = 1; c.captureVisibleCatalogued = 1
+                c.captureVisibleMissing = 1; c.hitCount = 1000; c.countedMatches = 3000
+            }
+            if falselyComplete {
+                f.patch { phase, original in
+                    var value = original
+                    if phase == "query-step" { value["search_complete"] = true; value["match_count_complete"] = true }
+                    return value
+                }
+            }
+            let region = try AtlasSearchPathScope(visiblePaths: [Array("a.rs".utf8), Array("missing.rs".utf8)])
+            do {
+                let partial = try scoped(AtlasIndexedSearch(transport: f.countedTransport), scope: .all, pathScope: region)
+                check(!falselyComplete && !partial.matchCountComplete && partial.visibleMissingFiles == 1
+                    && partial.countAllMatches && partial.matchesSeen == 3000,
+                    "Missing visible membership prevents an exhaustive count even after all available captures were searched")
+            } catch AtlasSearchError.invalidResponse {
+                check(falselyComplete, "Only a false visible completeness receipt is rejected")
+            }
+        }
+        #endif
+    }
     @MainActor static func main() throws {
+        try countedSearch()
         do {
             let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport)
             f.configure { $0.hitCount = 70 }

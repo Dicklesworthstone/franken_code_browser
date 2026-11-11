@@ -90,6 +90,27 @@ char *fcb_atlas_search_indexed_begin_matching(uint64_t h, uint64_t g, uint64_t i
     }
     return fcb_atlas_search_indexed_begin(h, 44, index, needle, hits, bytes);
 }
+char *fcb_atlas_search_indexed_begin_counted_matching(uint64_t h, uint64_t g, uint64_t index, const char *needle,
+                                                    const char *extensions, const char *filenames,
+                                                    uint64_t path_kind, const char *path, uint64_t case_sensitive,
+                                                    uint64_t hits, uint64_t bytes) {
+    assert(case_sensitive == 1);
+    if (g == 54) {
+        assert(!extensions && !filenames && path_kind == 0 && !path);
+    } else if (g == 55) {
+        assert(extensions && !strcmp(extensions, "rs") && filenames && !filenames[0]);
+        assert(path_kind == 2 && path && !strcmp(path, "src/exact.rs"));
+    } else if (g == 56) {
+        assert(!extensions && !filenames && path_kind == 1 && path && !strcmp(path, "src"));
+    } else if (g == 57) {
+        assert(!extensions && !filenames && path_kind == 3 && path && !strcmp(path, "612e7273,ff2e7273"));
+    } else if (g == 58) {
+        assert(!extensions && !filenames && path_kind == 3 && path && !path[0]);
+    } else {
+        assert(g == 59 && extensions && !extensions[0] && filenames && !filenames[0] && path_kind == 0 && !path);
+    }
+    return fcb_atlas_search_indexed_begin(h, 44, index, needle, hits, bytes);
+}
 char *fcb_atlas_search_indexed_begin_expression(uint64_t h, uint64_t g, uint64_t index, const char *expression,
                                                const char *extensions, const char *filenames,
                                                uint64_t path_kind, const char *path, uint64_t case_sensitive,

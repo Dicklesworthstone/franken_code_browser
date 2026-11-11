@@ -9,6 +9,7 @@ final class IndexedFixture: @unchecked Sendable {
         var discovery = true
         var fallback = false
         var hitCount = 2
+        var countedMatches: UInt64? = nil
         var pathHex = "612e7273"
         var fileID: UInt64 = 1
         var digest = String(repeating: "a", count: 64)
@@ -40,6 +41,7 @@ final class IndexedFixture: @unchecked Sendable {
         var captureFileScope: AtlasSearchFileScope = .all
         var capturePathScope: AtlasSearchPathScope = .workspace
         var caseSensitive = true
+        var countAllMatches = false
         var expression: String?
     }
     private let lock = NSLock()
@@ -98,11 +100,23 @@ final class IndexedFixture: @unchecked Sendable {
         })
     }
 
+    /// Opt-in count receipts; the default fixture keeps legacy bounded pages.
+    var countedTransport: AtlasIndexedSearchTransport {
+        var transport = self.transport
+        transport.countedQueryBegin = { h, g, index, needle, scope, pathScope, caseSensitive in
+            precondition(index == 1 && caseSensitive)
+            return try self.response("query-begin", h, generation: g, needle: needle, scope: scope,
+                pathScope: pathScope, caseSensitive: caseSensitive, countAllMatches: true)
+        }
+        return transport
+    }
+
     private func response(_ phase: String, _ h: UInt64, generation: UInt64 = 1,
                           needle: String = "", start: Int = 0, reader: UInt64 = 100, sourceFile: UInt64 = 1,
                           scope: AtlasSearchFileScope = .all,
                           pathScope: AtlasSearchPathScope = .workspace,
                           caseSensitive: Bool = true,
+                          countAllMatches: Bool = false,
                           expression: String? = nil,
                           cancellation: AtlasSearchCancellation? = nil) throws -> String? {
         lock.lock(); let block = blocked; lock.unlock()
@@ -122,6 +136,7 @@ final class IndexedFixture: @unchecked Sendable {
             s.generation = generation; s.needle = needle; s.queryStep = 0; s.scope = scope
             s.pathScope = pathScope
             s.caseSensitive = caseSensitive
+            s.countAllMatches = countAllMatches
             s.expression = expression
             if let expression {
                 s.needle = s.config.expressionPrimary
@@ -130,6 +145,7 @@ final class IndexedFixture: @unchecked Sendable {
             events.append("query-scope:\(scope.wireKind):\(scope.extensions ?? ""):\(scope.filenames ?? "")")
             events.append("query-path:\(pathScope.kind.rawValue):\(pathScope.pathHex)")
             events.append("query-case:\(caseSensitive)")
+            events.append("query-counted:\(countAllMatches)")
         }
         if phase == "query-step" || phase == "page" { precondition(s.generation == generation) }
         if phase == "query-step" { s.queryStep += 1 }
@@ -210,6 +226,9 @@ final class IndexedFixture: @unchecked Sendable {
             let scanned = s.caseSensitive ? min(1, examined) : examined, skipped = max(0, examined - scanned)
             let running = phase == "query-begin" || examined < available
             let count = examined > 0 ? (scoped ? c.scopedHitCount ?? c.hitCount : c.hitCount) : 0
+            let matches = s.countAllMatches && examined > 0 ? (c.countedMatches ?? UInt64(count)) : UInt64(count)
+            let complete = !running && pending == 0 && unavailable == 0
+                && (!s.pathScope.isVisible || c.captureVisibleMissing == 0) && c.discovery
             let first = phase == "page" ? start : 0, end = min(count, first + (phase == "page" ? 128 : 64))
             var rows: [[String: Any]] = []
             if first < end {
@@ -232,14 +251,17 @@ final class IndexedFixture: @unchecked Sendable {
                 "examined_files": String(expressionExcluded + examined + unavailable), "scanned_files": String(scanned), "verified_files": String(scanned),
                 "skipped_by_index": String(skipped), "fallback_files": String(c.fallback || !s.caseSensitive ? scanned : 0),
                 "unavailable_files": String(unavailable), "pending_files": String(eligible - expressionExcluded - examined - unavailable),
-                "retained_hits": String(count), "displayed_hits": String(count), "matches_seen": String(count), "step_count": String(s.queryStep),
+                "retained_hits": String(count), "displayed_hits": String(count), "matches_seen": String(matches), "step_count": String(s.queryStep),
                 "verification_source_bytes": String(scanned == 0 ? 0 : min(4096, totalBytes)), "source_bytes_read": "0", "read_calls": "0",
-                "search_in_progress": running, "search_complete": !running && pending == 0 && unavailable == 0
-                    && (!s.pathScope.isVisible || c.captureVisibleMissing == 0) && c.discovery,
-                "truncated": false, "stop_reason": running ? NSNull() : (pending > 0
+                "search_in_progress": running, "search_complete": complete,
+                "truncated": matches > UInt64(count), "stop_reason": running ? NSNull() : (pending > 0
                     ? (capturePending > 0 ? "source-byte-limit" : "capture-scope") : "all-files-examined"),
                 "hits": rows, "next_offset": end < count ? String(end) : NSNull()]
             value.merge(fields, uniquingKeysWith: { _, n in n })
+            if s.countAllMatches {
+                value["count_all_matches"] = true
+                value["match_count_complete"] = complete
+            }
             if let expression = s.expression {
                 let scannedInput = UInt64(scanned) * c.expressionWorkBytes
                 value["mode"] = "decoded-text-expression"; value["expression"] = expression

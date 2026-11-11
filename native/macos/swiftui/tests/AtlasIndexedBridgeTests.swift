@@ -54,6 +54,29 @@ import Foundation
         check(try t.expressionQueryBegin!(h, 53, 1, expression, AtlasSearchFileScope(extensions: ["rs"]),
             AtlasSearchPathScope(kind: .directory, path: "src"), false) != nil)
         check(live() == 0 && calls() == beforeExpressions + 2)
+        let beforeCounts = calls()
+        check(try t.countedQueryBegin!(h, 54, 1, "exact text", .all, .workspace, true) != nil)
+        check(try t.countedQueryBegin!(h, 55, 1, "exact text", AtlasSearchFileScope(extensions: ["rs"]),
+            AtlasSearchPathScope(kind: .file, path: "src/exact.rs"), true) != nil)
+        check(try t.countedQueryBegin!(h, 56, 1, "exact text", .all,
+            AtlasSearchPathScope(kind: .directory, path: "src"), true) != nil)
+        check(try t.countedQueryBegin!(h, 59, 1, "exact text", AtlasSearchFileScope(extensions: []), .workspace, true) != nil)
+        check(live() == 0 && calls() == beforeCounts + 4)
+        #if canImport(CryptoKit)
+        check(try t.countedQueryBegin!(h, 57, 1, "exact text", .all,
+            AtlasSearchPathScope(visiblePaths: [[255, 46, 114, 115], Array("a.rs".utf8)]), true) != nil)
+        check(try t.countedQueryBegin!(h, 58, 1, "exact text", .all, AtlasSearchPathScope(visiblePaths: []), true) != nil)
+        check(live() == 0 && calls() == beforeCounts + 6)
+        #endif
+        mode(1); check(try t.countedQueryBegin!(h, 54, 1, "exact text", .all, .workspace, true) == nil && live() == 0)
+        for bad: Int32 in [2, 3] {
+            mode(bad)
+            do {
+                _ = try t.countedQueryBegin!(h, 54, 1, "exact text", .all, .workspace, true)
+                preconditionFailure("Malformed counted response accepted")
+            } catch AtlasSearchError.invalidResponse { checks += 1 }
+            check(live() == 0)
+        }
         mode(1); check(try t.expressionQueryBegin!(h, 52, 1, expression, .all, .workspace, true) == nil && live() == 0)
         for bad: Int32 in [2, 3] {
             mode(bad)
