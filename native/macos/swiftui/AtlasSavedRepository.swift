@@ -661,4 +661,8 @@ struct AtlasSavedTransport: Sendable {
     let close: @Sendable (UInt64) -> Bool
     let retirementFailed: @Sendable () -> Void
     let readerDomain: UUID?
+    // Archive/member authority is separate from the ordinary reader transport.
+    // Optional closures keep older embedders/source-only fixture hosts valid.
+    var imagesAuthorize: (@Sendable (UInt64, UInt64, UInt64, UInt64) -> String?)? = nil
+    var imagePrepare: (@Sendable (UInt64, UInt64, UInt64, UInt64, UInt64, UInt64) -> String?)? = nil
 }

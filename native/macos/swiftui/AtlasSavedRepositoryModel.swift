@@ -44,10 +44,22 @@ private final class AtlasSavedAccess: @unchecked Sendable {
         return index?.path
     }
 }
+/// Revocation is independent of ARC. An already entered worker may retain the
+/// archive lease while it drains, but no later image operation may acquire it.
+private final class AtlasSavedImageRevocation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var active = true
+    var isActive: Bool { lock.lock(); defer { lock.unlock() }; return active }
+    @discardableResult func revoke() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let wasActive = active; active = false; return wasActive
+    }
+}
 private final class AtlasSavedSession: @unchecked Sendable {
     let handle: UInt64
     let transport: AtlasSavedTransport
     private let access: AtlasSavedAccess
+    private let images = AtlasSavedImageRevocation()
     private static let retirement = DispatchQueue(label: "dev.frankencode.browser.saved-retirement", qos: .utility)
     init(transport: AtlasSavedTransport, access: AnyObject?) throws {
         let handle = transport.create()
@@ -57,7 +69,39 @@ private final class AtlasSavedSession: @unchecked Sendable {
     func cancel() { _ = transport.cancel(handle) }
     func stageIndex(_ candidate: AtlasSavedIndexAccess) { access.stage(candidate) }
     func resolveIndex(_ accepted: AtlasSavedIndex?) throws -> String? { try access.resolve(accepted) }
+    func revokeDocumentImages() {
+        if images.revoke() { cancel() }
+    }
+    func documentTransport(_ document: AtlasReaderDocumentTransport?, archive: AtlasSavedIdentity,
+        sourceMember: UInt64) throws -> AtlasReaderDocumentTransport? {
+        guard var document else { return nil }
+        // Never inherit another archive's provider when following a saved link.
+        document.savedImages = nil
+        guard let authorize = transport.imagesAuthorize, let prepare = transport.imagePrepare else { return document }
+        guard archive.owner == handle else { throw AtlasSavedError.invalidResponse }
+        let source = try AtlasSavedDocumentImageSource(archiveOwner: handle, archiveDigest: archive.digest,
+            sourceMember: sourceMember, members: archive.members)
+        let gate = images
+        document.savedImages = .init(source: source,
+            isAvailable: { [weak self] in gate.isActive && self != nil },
+            authorize: { [weak self] reader, generation in
+                guard gate.isActive, let lease = self else { return nil }
+                return withExtendedLifetime(lease) {
+                    let result = authorize(lease.handle, reader, sourceMember, generation)
+                    return gate.isActive ? result : nil
+                }
+            },
+            prepare: { [weak self] reader, generation, item, request in
+                guard gate.isActive, let lease = self else { return nil }
+                return withExtendedLifetime(lease) {
+                    let result = prepare(lease.handle, reader, sourceMember, generation, item, request)
+                    return gate.isActive ? result : nil
+                }
+            })
+        return document
+    }
     deinit {
+        images.revoke()
         let handle = handle, transport = transport, access = access
         Self.retirement.async {
             withExtendedLifetime(access) {
@@ -166,6 +210,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 let page = try AtlasSavedMembers.decode(await model.run(candidate, .members(start: 0, limit: 64), flag: flag),
                     identity: opened.identity, start: 0, limit: 64)
                 guard !flag.isCanceled, !model.closed, model.pending === candidate else { throw AtlasSavedError.canceled }
+                model.session?.revokeDocumentImages()
                 model.session = candidate; model.pending = nil
                 model.info = opened; model.members = page; model.selectedMember = page.items.first
                 model.relationships = nil; model.relationshipGeneration = nil; model.direction = .all
@@ -855,9 +900,10 @@ private final class AtlasSavedSession: @unchecked Sendable {
         guard canOperate, let lease = session, let info, info.identity == saved, let domain = readerDomain,
               readerTransport.comparison?.domain == domain else { throw AtlasSavedError.unavailable }
         try Task.checkCancellation()
+        let imageDocument = try lease.documentTransport(document, archive: info.identity, sourceMember: ordinal)
         let flag = AtlasSearchCancellation()
         cancellation = flag; busy = true
-        let reader = AtlasPagedReaderModel(transport: readerTransport, search: search, outline: outline, document: document)
+        let reader = AtlasPagedReaderModel(transport: readerTransport, search: search, outline: outline, document: imageDocument)
         defer { finish() }
         do {
             return try await withTaskCancellationHandler(operation: {
@@ -938,11 +984,12 @@ private final class AtlasSavedSession: @unchecked Sendable {
     }
     func closeArchive() {
         guard canOperate else { return }
-        session = nil; clearMetadata()
-        notice = "Closed the archive. Independent readers and Desk captures keep their own verified bytes."
+        session?.revokeDocumentImages(); session = nil; clearMetadata()
+        notice = "Closed the archive. Independent readers and already loaded images keep their captured bytes; new saved-image loads require the opened archive."
     }
     func close() {
         guard !closed else { return }
+        session?.revokeDocumentImages(); pending?.revokeDocumentImages()
         closed = true; cancel(); task?.cancel(); clearMetadata()
         if !busy { session = nil; pending = nil }
     }

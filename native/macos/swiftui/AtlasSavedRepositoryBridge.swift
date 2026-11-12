@@ -30,6 +30,11 @@ import Foundation
 @_silgen_name("fcb_saved_open_member_reader") private func savedMemberReader(_ h: UInt64, _ reader: UInt64, _ member: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_open_relationship_reader") private func savedLinkReader(_ h: UInt64, _ reader: UInt64,
     _ generation: UInt64, _ link: UInt64, _ side: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_document_images_authorize") private func savedImagesAuthorize(_ h: UInt64,
+    _ reader: UInt64, _ member: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_document_image_prepare") private func savedImagePrepare(_ h: UInt64,
+    _ reader: UInt64, _ member: UInt64, _ generation: UInt64,
+    _ item: UInt64, _ request: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_cancel") private func savedCancel(_ h: UInt64) -> UInt8
 @_silgen_name("fcb_saved_close") private func savedClose(_ h: UInt64) -> UInt8
 @_silgen_name("fcb_free_string") private func savedFree(_ pointer: UnsafeMutablePointer<CChar>?)
@@ -104,7 +109,14 @@ extension AtlasSavedTransport {
         }
     }, cancel: { savedCancel($0) == 1 }, close: { savedClose($0) == 1 }, retirementFailed: {
         try? FileHandle.standardError.write(contentsOf: Data("FCB_SAVED_RETIREMENT_UNAVAILABLE\n".utf8))
-    }, readerDomain: AtlasReaderTransport.native.comparison?.domain)
+    }, readerDomain: AtlasReaderTransport.native.comparison?.domain,
+        imagesAuthorize: { handle, reader, member, generation in
+            guard handle > 0, reader > 0, handle != reader, generation > 0 else { return nil }
+            return take(savedImagesAuthorize(handle, reader, member, generation))
+        }, imagePrepare: { handle, reader, member, generation, item, request in
+            guard handle > 0, reader > 0, handle != reader, generation > 0 else { return nil }
+            return take(savedImagePrepare(handle, reader, member, generation, item, request))
+        })
 
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
         guard let pointer else { return nil }

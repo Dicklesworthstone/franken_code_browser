@@ -2,7 +2,8 @@ import Foundation
 
 /// The native host consumes FrankenMarkdown's logical flow. It never parses
 /// Markdown or invents heading slugs. Optional local images require an explicit
-/// current-root capability; document path labels never confer access.
+/// current-root capability or a still-open saved-archive provider. Document path
+/// labels never confer access.
 struct AtlasReaderDocumentTransport: Sendable {
     let prepare: @Sendable (UInt64, UInt64, UInt64) -> String?
     let window: @Sendable (UInt64, UInt64, UInt64, UInt64) -> String?
@@ -22,6 +23,34 @@ struct AtlasReaderDocumentTransport: Sendable {
     var imagesAuthorize: (@Sendable (UInt64, UInt64, String, String) -> String?)? = nil
     var imagePrepare: (@Sendable (UInt64, UInt64, UInt64, UInt64) -> String?)? = nil
     var imageChunk: (@Sendable (UInt64, UInt64, UInt64, UInt64, UInt64, UInt64) -> String?)? = nil
+    // Frozen for this reader at the verified saved-member handoff. A separate
+    // revocation gate prevents acquisition after archive close/replacement.
+    var savedImages: AtlasSavedDocumentImageProvider? = nil
+}
+
+/// Archive identity is independent of native paths and current-root grants.
+/// These values qualify only image replies from an explicitly opened archive.
+struct AtlasSavedDocumentImageSource: Sendable, Equatable {
+    let archiveOwner: UInt64
+    let archiveDigest: String
+    let sourceMember: UInt64
+    let members: UInt64
+    init(archiveOwner: UInt64, archiveDigest: String, sourceMember: UInt64, members: UInt64) throws {
+        guard archiveOwner > 0, sourceMember < members, members <= 65_536,
+              archiveDigest.utf8.count == 64,
+              archiveDigest.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+            throw AtlasReaderError.invalidInput
+        }
+        self.archiveOwner = archiveOwner; self.archiveDigest = archiveDigest
+        self.sourceMember = sourceMember; self.members = members
+    }
+}
+
+struct AtlasSavedDocumentImageProvider: Sendable {
+    let source: AtlasSavedDocumentImageSource
+    let isAvailable: @Sendable () -> Bool
+    let authorize: @Sendable (UInt64, UInt64) -> String?
+    let prepare: @Sendable (UInt64, UInt64, UInt64, UInt64) -> String?
 }
 
 /// Supplied only by an explicit current project open, alongside that reader's
@@ -413,30 +442,50 @@ struct AtlasReaderDocumentJob: Sendable {
                             canceled: () -> Bool) throws -> AtlasDocumentDisplayPage {
         if canceled() { throw AtlasReaderError.canceled }
         guard !page.imageTargets.isEmpty else { return page }
-        guard let source = imageSource else {
-            return try page.withImages([], notice: "Local images need current project folder access.")
+        let saved = transport.savedImages
+        guard imageSource == nil || saved == nil else { throw AtlasReaderError.invalidResponse }
+        guard imageSource != nil || saved != nil else {
+            return try page.withImages([], notice: "Local images need current project folder access or an opened saved archive.")
         }
-        guard let authorize = transport.imagesAuthorize, let prepare = transport.imagePrepare,
-              let chunk = transport.imageChunk else {
+        guard let prepare = saved?.prepare ?? transport.imagePrepare, let chunk = transport.imageChunk,
+              saved != nil || transport.imagesAuthorize != nil else {
             return try page.withImages([], notice: "Local image loading is unavailable in this host.")
         }
+        let revokedNotice = "This saved archive was closed or replaced. Already loaded pages remain readable; open a new saved reader to load more images."
+        func available() -> Bool { saved?.isAvailable() ?? true }
+        guard available() else { return try page.withImages([], notice: revokedNotice) }
 #if canImport(ImageIO) && canImport(CoreGraphics) && canImport(CryptoKit)
         let handle = info.identity.owner
         let authorization: AtlasDocumentImageAuthorization
         do {
-            authorization = try AtlasDocumentDisplayWire.imageAuthorization(
-                authorize(handle, generation, source.root, source.relativePath),
-                document: page.inventory.document, root: source.root, sourceRelative: source.relativePath)
+            if let saved {
+                let json = saved.authorize(handle, generation)
+                if canceled() { throw AtlasReaderError.canceled }
+                guard available() else { return try page.withImages([], notice: revokedNotice) }
+                authorization = try AtlasDocumentDisplayWire.savedImageAuthorization(json,
+                    document: page.inventory.document, source: saved.source)
+            } else {
+                guard let source = imageSource, let authorize = transport.imagesAuthorize else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                authorization = try AtlasDocumentDisplayWire.imageAuthorization(
+                    authorize(handle, generation, source.root, source.relativePath),
+                    document: page.inventory.document, root: source.root, sourceRelative: source.relativePath)
+            }
         } catch let error as AtlasReaderError {
             if canceled() { throw AtlasReaderError.canceled }
+            guard available() else { return try page.withImages([], notice: revokedNotice) }
             if case .engine = error {
-                return try page.withImages([], notice:
-                    "Local images were not loaded because the current source or folder access could not be verified.")
+                return try page.withImages([], notice: saved == nil
+                    ? "Local images were not loaded because the current source or folder access could not be verified."
+                    : "Saved images remain placeholders because the captured source or archive access could not be verified.")
             }
             throw error
         }
         if canceled() { throw AtlasReaderError.canceled }
-        guard info.captureSHA256 == nil || info.captureSHA256 == authorization.captureSHA256 else {
+        guard available() else { return try page.withImages([], notice: revokedNotice) }
+        guard authorization.displayWidth == page.inventory.width,
+              info.captureSHA256 == nil || info.captureSHA256 == authorization.captureSHA256 else {
             throw AtlasReaderError.invalidResponse
         }
         var images: [AtlasDocumentDisplayImage] = []
@@ -444,16 +493,20 @@ struct AtlasReaderDocumentJob: Sendable {
         var refused = page.imageTargets.count > AtlasDocumentImageLimits.pageImages
         for target in page.imageTargets.prefix(AtlasDocumentImageLimits.pageImages) {
             if canceled() { throw AtlasReaderError.canceled }
+            guard available() else { return try page.withImages([], notice: revokedNotice) }
             if retainedBytes == AtlasDocumentImageLimits.pageBytes { refused = true; break }
             do {
-                let receipt = try AtlasDocumentDisplayWire.imagePrepared(
-                    prepare(handle, generation, target.itemIndex, target.requestID),
+                let json = prepare(handle, generation, target.itemIndex, target.requestID)
+                if canceled() { throw AtlasReaderError.canceled }
+                guard available() else { return try page.withImages([], notice: revokedNotice) }
+                let receipt = try AtlasDocumentDisplayWire.imagePrepared(json,
                     target: target, authorization: authorization)
                 var bytes = Data()
                 bytes.reserveCapacity(Int(receipt.totalBytes))
                 bytes.append(receipt.firstChunk)
                 while UInt64(bytes.count) < receipt.totalBytes {
                     if canceled() { throw AtlasReaderError.canceled }
+                    guard available() else { return try page.withImages([], notice: revokedNotice) }
                     let offset = UInt64(bytes.count)
                     let next = try AtlasDocumentDisplayWire.imageChunk(
                         chunk(handle, generation, target.itemIndex, target.requestID, offset, 64 * 1024),
@@ -463,6 +516,7 @@ struct AtlasReaderDocumentJob: Sendable {
                 }
                 try AtlasDocumentDisplayWire.verifyImage(bytes, receipt: receipt)
                 if canceled() { throw AtlasReaderError.canceled }
+                guard available() else { return try page.withImages([], notice: revokedNotice) }
                 let image = try AtlasDocumentImageDecoder.decode(bytes, target: target,
                     remainingBytes: AtlasDocumentImageLimits.pageBytes - retainedBytes, canceled: canceled)
                 guard image.format == receipt.format else { throw AtlasReaderError.invalidResponse }
@@ -470,8 +524,9 @@ struct AtlasReaderDocumentJob: Sendable {
                 images.append(image)
             } catch let error as AtlasReaderError {
                 if canceled() { throw AtlasReaderError.canceled }
-                // Reader/image policy refusals are visible placeholders. A
-                // malformed or cross-generation receipt is never accepted.
+                guard available() else { return try page.withImages([], notice: revokedNotice) }
+                // Policy refusals leave placeholders. Malformed/cross-generation
+                // receipts are rejected before any decoded image is published.
                 if case .engine = error { refused = true; continue }
                 throw error
             } catch is AtlasDocumentImageError {
@@ -480,12 +535,14 @@ struct AtlasReaderDocumentJob: Sendable {
             }
         }
         if canceled() { throw AtlasReaderError.canceled }
-        return try page.withImages(images, notice: refused
-            ? "Some images remain placeholders: only bounded local PNG/JPEG files are available." : nil)
+        guard available() else { return try page.withImages([], notice: revokedNotice) }
+        return try page.withImages(images, notice: refused ? (saved == nil
+            ? "Some images remain placeholders: only bounded local PNG/JPEG files are available."
+            : "Some images remain placeholders: only captured PNG/JPEG assets within the saved-image limits can be displayed.") : nil)
 #else
         // Portable wire consumers never claim Apple image decoding and never
         // read assets they cannot display.
-        _ = source; _ = authorize; _ = prepare; _ = chunk
+        _ = prepare; _ = chunk
         return try page.withImages([], notice: "Image decoding is unavailable in this host.")
 #endif
     }

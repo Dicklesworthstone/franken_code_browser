@@ -49,26 +49,30 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     let domain = UUID()
     let searchVectors: Bool
     let expansionVectors: Bool
+    let imageVectors: Bool
     let headingVectors: Bool
     let longHeading: Bool
     let lineEncoding: String?
     let lineRange: (UInt64, UInt64)?
     init(searchVectors: Bool = false, headingVectors: Bool = false, longHeading: Bool = false,
-        lineEncoding: String? = nil, lineRange: (UInt64, UInt64)? = nil, expansionVectors: Bool = false) {
+        lineEncoding: String? = nil, lineRange: (UInt64, UInt64)? = nil, expansionVectors: Bool = false,
+        imageVectors: Bool = false) {
         precondition(lineEncoding == nil || (["utf8", "utf16le", "utf16be"].contains(lineEncoding!) && !searchVectors && !headingVectors))
         precondition(!expansionVectors || (searchVectors && !headingVectors && lineEncoding == nil))
-        self.searchVectors = searchVectors; self.expansionVectors = expansionVectors
+        precondition(!imageVectors || (!searchVectors && !headingVectors && lineEncoding == nil))
+        self.searchVectors = searchVectors; self.expansionVectors = expansionVectors; self.imageVectors = imageVectors
         self.headingVectors = headingVectors; self.longHeading = longHeading
         self.lineEncoding = lineEncoding; self.lineRange = lineRange
     }
     let archiveDigest = String(repeating: "d", count: 64)
     var source: [UInt8] {
+        if imageVectors { return [239, 187, 191] + Array("![Captured](logo.png)\n".utf8) }
         if expansionVectors { return [] }
         return Array((headingVectors
             ? "\u{feff}---\ntitle: Saved\n---\n\n[guide](docs/guide.md#caf-%64etails) [again](docs/guide.md) [missing](absent.rs) [empty]()\n"
             : "\u{feff}---\ntitle: Saved\n---\n\n[code](src/lib.rs#L2) [again](src/lib.rs) [missing](absent.rs) [empty]()\n").utf8)
     }
-    var sourceDigest: String { expansionVectors
+    var sourceDigest: String { imageVectors ? "f516e5137a5d7dece58f380f377c14957965d8536721aea27ff60ad62e67a20c" : expansionVectors
         ? "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" : headingVectors
         ? "9359955440643a4a2294506051b4cd66f7009333234a8e3f85392495ec5a9a0f"
         : "8591776e77fd8d9050b0a5796da773312c306092c3fc05f22dbe9413cfcff6d3" }
@@ -103,6 +107,8 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     private var sessions: [UInt64: Session] = [:]
     private var readers: [UInt64: Member] = [:]
     private var documentStates: [UInt64: (generation: UInt64, width: UInt64)] = [:]
+    private var displayWidths: [UInt64: UInt64] = [:]
+    private var blockedImage = false
     private var log: [String] = []
     private var fault: String?
     private var blocked = false
@@ -116,6 +122,13 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     func blockNextHandoff() { locked { blocked = true } }
     func blockNextSearch() { locked { blockedSearch = true } }
     func blockNextIndex() { locked { blockedIndex = true } }
+    func blockNextImage() { locked { blockedImage = true } }
+    let png: [UInt8] = [137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,1,0,0,0,1,8,6,0,0,0,31,21,196,137,0,0,0,16,73,68,65,84,120,1,1,5,0,250,255,0,255,0,0,255,5,0,1,255,250,92,136,209,0,0,0,0,73,69,78,68,174,66,96,130]
+    let pngDigest = "18f4fa5bba0f3aee92c9c6c7b85367a2247e976a9ff46056a06338685487cfc1"
+    private var imageMember: Member? {
+        imageVectors ? Member(path: Array("logo.png".utf8), display: "logo.png",
+            bytes: png, digest: pngDigest, encoding: "unsupported") : nil
+    }
     var searchUTF8: [UInt8] { expansionVectors ? [0xc4, 0xb0]
         : Array(("é" + String(repeating: "x", count: 200) + "banana\n").utf8) }
     var searchUTF16: [UInt8] {
@@ -135,7 +148,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                 digest: expansionVectors ? "138366bfcd2687fbf98b5a0f74101c54efbf1fdda422e4a8de157b57e633ac3b" : searchVectors ? "0896dfbe40292ec212fa69dac19c681c8f56ba79c407cbad6817580762413ecf"
                     : "a8100ae6aa1940d0b663bb31cd466142ebbdbd5187131b92d93818987832eb89",
                 encoding: searchVectors ? "utf16le" : "utf8"),
-            lineMember ?? Member(path: Array((headingVectors ? "docs/guide.md" : "src/lib.rs").utf8),
+            imageMember ?? lineMember ?? Member(path: Array((headingVectors ? "docs/guide.md" : "src/lib.rs").utf8),
                 display: headingVectors ? "docs/guide.md" : "src/lib.rs",
                 bytes: headingVectors ? headingBytes : (searchVectors ? [254, 255, 0, 97, 254, 255, 0, 98] : Array("abc".utf8)),
                 digest: headingVectors ? (longHeading
@@ -888,7 +901,14 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         close: { [self] handle in
             precondition(!Thread.isMainThread)
             locked { sessions.removeValue(forKey: handle); log.append("saved-close:\(handle)") }; return true
-        }, retirementFailed: { fatalError("saved retirement failed") }, readerDomain: domain)
+        }, retirementFailed: { fatalError("saved retirement failed") }, readerDomain: domain,
+            imagesAuthorize: { [self] archive, reader, member, generation in
+                imageReply("document-images-authorize", archive: archive, reader: reader,
+                    member: member, generation: generation)
+            }, imagePrepare: { [self] archive, reader, member, generation, item, request in
+                imageReply("document-image-prepare", archive: archive, reader: reader,
+                    member: member, generation: generation, item: item, request: request)
+            })
     }
     /// Fixed upstream-boundary replies for the actual saved source reader.
     /// Production document decoding, preview activation, saved lookup and
@@ -910,7 +930,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                 "rendering": "logical-frankenmarkdown-flow",
                 "source_mapping": "enclosing-regions-not-glyph-exact",
                 "width_columns": String(state.width), "parser_source_base": "3",
-                "total_flow_lines": "1", "total_headings": "0", "rendered_utf8_bytes": "14"
+                "total_flow_lines": "1", "total_headings": "0", "rendered_utf8_bytes": imageVectors ? "8" : "14"
             ]) { _, new in new }
             func linkRow(_ id: UInt64) -> [String: Any] {
                 let saved = linkObject(id)
@@ -935,8 +955,8 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             } else {
                 guard first == 0 else { return nil }
                 out["first_flow_line"] = "0"
-                out["flow_lines"] = [["flow_line": "0", "text": "Saved document",
-                    "rendered_utf8_range": ["start": "0", "end": "14"],
+                out["flow_lines"] = [["flow_line": "0", "text": imageVectors ? "Captured" : "Saved document",
+                    "rendered_utf8_range": ["start": "0", "end": imageVectors ? "8" : "14"],
                     "enclosing_original_range": ["start": "3", "end": String(source.count)]]]
                 out["next_flow_line"] = NSNull(); out["whole_document_visible"] = true
                 out["headings"] = [[String: Any]](); out["next_heading"] = NSNull()
@@ -946,7 +966,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         }
     }
     var documentTransport: AtlasReaderDocumentTransport {
-        .init(prepare: { [self] owner, generation, width in
+        var result = AtlasReaderDocumentTransport(prepare: { [self] owner, generation, width in
             documentReply("document-prepare", owner: owner, generation: generation, width: width)
         }, window: { [self] owner, generation, first, _ in
             documentReply("document-window", owner: owner, generation: generation, first: first)
@@ -962,6 +982,96 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         }, link: { [self] owner, generation, id, _ in
             documentReply("document-link", owner: owner, generation: generation, link: id)
         })
+        if imageVectors {
+            result.prepareDisplay = { [self] reader, generation, width in
+                imageDisplay("document-display-prepare", reader: reader, generation: generation, width: width)
+            }
+            result.displayPage = { [self] reader, generation, first, _ in
+                imageDisplay("document-display-page", reader: reader, generation: generation, first: first)
+            }
+            result.displayFromSource = { [self] reader, generation, offset, _ in
+                imageDisplay("document-display-from-source", reader: reader, generation: generation, anchor: offset)
+            }
+            result.displayFont = { _, _, _, _, _ in preconditionFailure("Image-only page requested font payload") }
+            result.imagesAuthorize = { _, _, _, _ in preconditionFailure("Saved reader attempted current-root authorization") }
+            result.imagePrepare = { _, _, _, _ in preconditionFailure("Saved reader attempted current-root image acquisition") }
+            result.imageChunk = { _, _, _, _, _, _ in preconditionFailure("One-chunk PNG requested an extra image chunk") }
+        }
+        return result
+    }
+
+    /// Fixed shaped image occurrence and real encoded PNG bytes at the foreign
+    /// boundary. Parser/path/digest verification is exercised by Rust tests;
+    /// these fixtures execute the production saved provider, worker, wire checks
+    /// and (on macOS) ImageIO decode rather than a replacement image decoder.
+    private func imageDisplay(_ command: String, reader: UInt64, generation: UInt64,
+        width: UInt64? = nil, first: UInt64 = 0, anchor: UInt64? = nil) -> String? {
+        precondition(!Thread.isMainThread)
+        return locked {
+            guard imageVectors, let member = readers[reader], member.bytes == source,
+                  documentStates[reader]?.generation == generation, first <= 1 else { return nil }
+            if let width { displayWidths[reader] = width }
+            guard let width = displayWidths[reader] else { return nil }
+            let bounds: [String: Any] = ["x": 0, "y": 0, "width": width, "height": 20]
+            var out = readerHeader(reader, member: member, command: command)
+            out.merge([
+                "document_generation": String(generation), "display_width_points": String(width),
+                "rendering": "bundled-frankenmarkdown-display", "native_shaped": false, "glyph_shaped": true,
+                "source_mapping": "enclosing-ast-blocks-not-glyph-exact", "source_ranges_qualified": true,
+                "total_display_items": "1", "total_glyphs": "0", "unresolved_images": "1",
+                "display_bounds": bounds, "fonts": [[String: Any]](), "first_display_item": String(first),
+                "display_items": first == 0 ? [[
+                    "item_index": "0", "kind": "image", "bounds": bounds,
+                    "enclosing_original_range": ["start": "3", "end": String(source.count)],
+                    "request_id": "44", "destination": "logo.png", "alt_text": "Captured", "is_resolved": false
+                ]] : [[String: Any]](), "next_display_item": NSNull()
+            ]) { _, new in new }
+            if let anchor { out["original_anchor"] = String(anchor) }
+            log.append("image-display:\(reader):\(generation)")
+            return encode(out)
+        }
+    }
+    private func imageReply(_ command: String, archive: UInt64, reader: UInt64,
+        member sourceMember: UInt64, generation: UInt64, item: UInt64 = 0, request: UInt64 = 44) -> String? {
+        precondition(!Thread.isMainThread)
+        let pause = locked {
+            let value = command == "document-image-prepare" && blockedImage
+            if value { blockedImage = false }
+            log.append("saved-image-enter:\(command):\(archive):\(reader):\(sourceMember):\(generation)")
+            return value
+        }
+        if pause { entered.signal(); precondition(resume.wait(timeout: .now() + .seconds(5)) == .success) }
+        return locked {
+            guard imageVectors, sessions[archive] != nil, sourceMember == 0,
+                  let member = readers[reader], member.bytes == source,
+                  documentStates[reader]?.generation == generation, let width = displayWidths[reader],
+                  item == 0, request == 44 else { return nil }
+            var out = readerHeader(reader, member: member, command: command)
+            out.merge([
+                "document_generation": String(generation), "display_width_points": String(width),
+                "saved_archive_owner": String(archive), "saved_archive_digest": archiveDigest,
+                "saved_source_member": String(sourceMember), "source_relative": path(member.path, member.display),
+                "live_root_authority": false, "max_image_bytes": "4194304",
+                "max_image_cache_bytes": "8388608", "max_images": "16", "max_image_chunk_bytes": "65536"
+            ]) { _, new in new }
+            if command == "document-images-authorize" {
+                out.merge(["images_authorized": true, "source_authority": "verified-saved-member",
+                    "authorization_reused": false, "source_verification_bytes_read": "0",
+                    "source_verification_read_calls": "0", "retained_image_bytes": "0", "retained_images": "0"]) { _, new in new }
+            } else {
+                out.merge(["item_index": "0", "request_id": "44", "destination": "logo.png",
+                    "enclosing_original_range": ["start": "3", "end": String(source.count)],
+                    "image_sha256": pngDigest, "image_format": "png", "format_validation": "signature-only",
+                    "decoded": false, "image_observation": "verified-saved-member",
+                    "image_member": "3", "image_archive_digest": archiveDigest,
+                    "total_image_bytes": String(png.count), "image_offset": "0", "image_bytes": String(png.count),
+                    "image_hex": hex(png), "next_image_offset": NSNull(),
+                    "image_bytes_read": String(png.count), "image_read_calls": "1",
+                    "retained_image_bytes": String(png.count), "retained_images": "1"]) { _, new in new }
+            }
+            log.append("saved-image-return:\(command):\(archive):\(reader):\(generation)")
+            return encode(out)
+        }
     }
 
     func readerTransport(domain: UUID? = nil) -> AtlasReaderTransport {
@@ -1026,6 +1136,11 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     @MainActor static func main() async throws {
         try decoderContracts()
         try await actualModelNavigationAndIndependentReaders()
+        try await savedImagesUseCapturedProviderAndSurviveArchiveClosure()
+        try await savedImagesRevokeOnReplacementAndPreserveFailedReplacement()
+#if canImport(ImageIO) && canImport(CoreGraphics) && canImport(CryptoKit)
+        try await savedImageLateCompletionAndCancellationKeepSourceIndependent()
+#endif
         try await savedPreviewLocalLinksAndHistory()
         try await savedPreviewLinkIdentityAndRecovery()
         try await savedPreviewLateHandoffs()
@@ -1187,6 +1302,150 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         await wait("archive did not retire independently") { f.calls.contains("saved-close:40") }
         evidence.reader.close(); target.reader.close(); raw.reader.close(); model.close()
     }
+
+    @MainActor private static func imageReader(_ f: SavedRepositoryFixture, _ model: AtlasSavedRepositoryModel,
+        styled: Bool = true) async throws -> AtlasSavedReaderCapture {
+        let capture = try await model.openMember(model.members!.items[0], from: model.info!.identity,
+            readerTransport: f.readerTransport(), document: f.documentTransport)
+        capture.reader.documentPreview.selectStyled(styled)
+        capture.reader.documentPreview.prepare()
+        await wait("saved image source preview did not prepare") {
+            !capture.reader.documentPreview.busy && (styled
+                ? capture.reader.documentPreview.displayPage != nil : capture.reader.documentPreview.page != nil)
+        }
+        return capture
+    }
+    @MainActor private static func savedImagesUseCapturedProviderAndSurviveArchiveClosure() async throws {
+        let f = SavedRepositoryFixture(imageVectors: true), model = await opened(f)
+        let capture = try await imageReader(f, model)
+        let preview = capture.reader.documentPreview
+        let sourcePage = capture.reader.page!, displayed = preview.displayPage!
+        precondition(sourcePage.identity.pathBytes == Array("README.md".utf8) && !capture.reader.canRefresh)
+#if canImport(ImageIO) && canImport(CoreGraphics) && canImport(CryptoKit)
+        precondition(displayed.images.count == 1 && displayed.imageNotice == nil)
+        let image = displayed.images[0]
+        precondition(image.width == 1 && image.height == 1 && image.byteCount == 4 && image.format == .png)
+        precondition(image.target.destination == "logo.png")
+        precondition(f.calls.contains("saved-image-enter:document-images-authorize:40:100:0:1"))
+        precondition(f.calls.contains("saved-image-enter:document-image-prepare:40:100:0:1"))
+#else
+        precondition(displayed.images.isEmpty && displayed.imageNotice?.contains("decoding") == true)
+        precondition(!f.calls.contains { $0.hasPrefix("saved-image-enter:") })
+#endif
+        // A pin uses its destination reader handle with the frozen source member,
+        // rather than retaining or reusing the original handle's cache identity.
+        let pinned = try await capture.reader.fork()
+        pinned.documentPreview.prepare()
+        await wait("pinned saved source did not prepare its independent preview") {
+            !pinned.documentPreview.busy && pinned.documentPreview.displayPage != nil
+        }
+#if canImport(ImageIO) && canImport(CoreGraphics) && canImport(CryptoKit)
+        precondition(pinned.documentPreview.displayPage?.images.count == 1)
+        precondition(f.calls.contains("saved-image-enter:document-image-prepare:40:101:0:1"))
+#endif
+        let requests = f.calls.filter { $0.hasPrefix("saved-image-enter:") }.count
+        model.closeArchive()
+        precondition(preview.displayPage?.id == displayed.id && capture.reader.page?.identity.matches(sourcePage.identity) == true
+            && capture.reader.page?.originalHex == sourcePage.originalHex)
+#if canImport(ImageIO) && canImport(CoreGraphics) && canImport(CryptoKit)
+        precondition(preview.displayPage!.images[0] === displayed.images[0],
+            "Archive close discarded an independently retained decoded image")
+#endif
+        await wait("saved readers retained archive authority after close") { f.calls.contains("saved-close:40") }
+        preview.prepareDisplay()
+        await wait("closed saved provider prevented readable display replay") { !preview.busy }
+        precondition(preview.displayPage?.images.isEmpty == true)
+        precondition(preview.displayPage?.imageNotice?.contains("closed or replaced") == true)
+        precondition(f.calls.filter { $0.hasPrefix("saved-image-enter:") }.count == requests)
+        capture.reader.offsetInput = "4"; capture.reader.goToByte()
+        await wait("retained Markdown stopped paging after archive close") { !capture.reader.busy }
+        precondition(capture.reader.page?.originalHex == f.hex(f.source.dropFirst(4)))
+        precondition(!f.calls.contains("LIVE-OPEN"))
+        pinned.close(); capture.reader.close(); model.close()
+    }
+
+    @MainActor private static func savedImagesRevokeOnReplacementAndPreserveFailedReplacement() async throws {
+        let f = SavedRepositoryFixture(imageVectors: true), model = await opened(f)
+        let capture = try await imageReader(f, model), preview = capture.reader.documentPreview
+        let original = model.info!.identity, source = capture.reader.page!
+        f.corruptNext("open"); model.open(path: "/saved/refused.fcbs", accessLease: nil)
+        await wait("failed saved-image replacement did not drain") { !model.busy }
+        precondition(model.info?.identity == original)
+        preview.prepareDisplay()
+        await wait("original saved provider was lost after failed replacement") { !preview.busy }
+#if canImport(ImageIO) && canImport(CoreGraphics) && canImport(CryptoKit)
+        precondition(preview.displayPage?.images.count == 1)
+#endif
+        model.open(path: "/saved/equal-content.fcbs", accessLease: nil)
+        await wait("replacement archive did not open") { !model.busy }
+        precondition(model.info?.identity.owner == 42 && model.info?.identity.digest == original.digest)
+        let requests = f.calls.filter { $0.hasPrefix("saved-image-enter:") }.count
+        preview.prepareDisplay()
+        await wait("revoked old reader lost styled source replay") { !preview.busy }
+        precondition(preview.displayPage?.images.isEmpty == true
+            && preview.displayPage?.imageNotice?.contains("closed or replaced") == true)
+        precondition(f.calls.filter { $0.hasPrefix("saved-image-enter:") }.count == requests)
+        precondition(capture.reader.page?.identity.matches(source.identity) == true
+            && capture.reader.page?.originalHex == source.originalHex)
+        let fresh = try await imageReader(f, model)
+#if canImport(ImageIO) && canImport(CoreGraphics) && canImport(CryptoKit)
+        precondition(fresh.reader.documentPreview.displayPage?.images.count == 1)
+        precondition(f.calls.contains("saved-image-enter:document-image-prepare:42:101:0:1"))
+#endif
+        precondition(!f.calls.contains("LIVE-OPEN"))
+        capture.reader.close(); fresh.reader.close(); model.close()
+    }
+
+#if canImport(ImageIO) && canImport(CoreGraphics) && canImport(CryptoKit)
+    private final class SavedImageAccessLease {}
+    @MainActor private static func savedImageLateCompletionAndCancellationKeepSourceIndependent() async throws {
+        for closing in [true, false] {
+            let f = SavedRepositoryFixture(imageVectors: true)
+            let model = AtlasSavedRepositoryModel(transport: f.savedTransport)
+            var grant: SavedImageAccessLease? = SavedImageAccessLease()
+            weak var held = grant
+            model.open(path: "/saved/repository.fcbs", accessLease: grant)
+            grant = nil
+            await wait("archive grant did not open") { !model.busy }
+            let capture = try await imageReader(f, model, styled: false)
+            let preview = capture.reader.documentPreview, source = capture.reader.page!
+            f.blockNextImage()
+            preview.prepareDisplay()
+            await wait("saved image prepare did not enter worker") { f.entered.wait(timeout: .now()) == .success }
+            if closing {
+                model.closeArchive()
+                precondition(held != nil && !f.calls.contains("saved-close:40"),
+                    "Archive grant retired before entered image acquisition drained")
+            } else { preview.cancel() }
+            f.resume.signal()
+            await wait("entered image call did not drain") {
+                f.calls.contains("saved-image-return:document-image-prepare:40:100:1") && !preview.busy
+            }
+            if closing {
+                await wait("revoked archive did not retire after image drain") {
+                    held == nil && f.calls.contains("saved-close:40")
+                }
+                precondition(preview.displayPage?.images.isEmpty == true)
+                precondition(preview.displayPage?.imageNotice?.contains("closed or replaced") == true)
+                let requests = f.calls.filter { $0.hasPrefix("saved-image-enter:") }.count
+                preview.prepareDisplay()
+                await wait("revoked provider blocked source display") { !preview.busy }
+                precondition(f.calls.filter { $0.hasPrefix("saved-image-enter:") }.count == requests)
+            } else {
+                precondition(preview.displayPage == nil, "Canceled image work published a late display")
+                // The same archive/source remains available for an explicit retry.
+                preview.prepareDisplay()
+                await wait("saved-image retry did not publish after canceled work drained") {
+                    !preview.busy && preview.displayPage != nil
+                }
+                precondition(preview.displayPage?.images.count == 1)
+            }
+            precondition(capture.reader.page?.identity.matches(source.identity) == true
+            && capture.reader.page?.originalHex == source.originalHex && !f.calls.contains("LIVE-OPEN"))
+            capture.reader.close(); model.close()
+        }
+    }
+#endif
 
     @MainActor private static func previewed(_ f: SavedRepositoryFixture, _ model: AtlasSavedRepositoryModel)
         async throws -> AtlasSavedReaderCapture {

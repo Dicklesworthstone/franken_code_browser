@@ -440,12 +440,15 @@ enum AtlasDocumentImageDecoder {
 #endif
 }
 
+enum AtlasDocumentImageAuthority: Sendable {
+    case current(requestedRoot: [UInt8], assetRoot: [UInt8])
+    case saved(AtlasSavedDocumentImageSource)
+}
 struct AtlasDocumentImageAuthorization: Sendable {
     let document: AtlasReaderDocumentInventory
     let displayWidth: UInt64
     let captureSHA256: String
-    let requestedRoot: [UInt8]
-    let assetRoot: [UInt8]
+    let authority: AtlasDocumentImageAuthority
     let sourceRelative: [UInt8]
 }
 struct AtlasDocumentImageReceipt: Sendable {
@@ -455,6 +458,8 @@ struct AtlasDocumentImageReceipt: Sendable {
     let format: AtlasDocumentImageFormat
     let sha256: String
     let firstChunk: Data
+    // Chunks from another archive member cannot reuse an equal content digest.
+    let savedImageMember: UInt64?
 }
 
 /// No header is accepted from a different source/capture, no string counter is
@@ -531,8 +536,17 @@ enum AtlasDocumentDisplayWire {
                   bytes <= AtlasDocumentImageLimits.encodedCacheBytes,
                   (retained == 0) == (bytes == 0) else { throw AtlasReaderError.invalidResponse }
         }
+        func savedImageSource(_ source: AtlasSavedDocumentImageSource) throws {
+            guard try number("saved_archive_owner") == source.archiveOwner,
+                  try digest("saved_archive_digest") == source.archiveDigest,
+                  try number("saved_source_member") == source.sourceMember,
+                  try !flag("live_root_authority"),
+                  !values.contains(Key("requested_root")), !values.contains(Key("asset_root")) else {
+                throw AtlasReaderError.invalidResponse
+            }
+        }
         func imageIdentity(_ target: AtlasDocumentDisplayImageTarget,
-                           authorization: AtlasDocumentImageAuthorization, command: String) throws {
+                           authorization: AtlasDocumentImageAuthorization, command: String) throws -> UInt64? {
             guard target.inventory.qualifiedSources, let original = target.original,
                   original.valid(upTo: target.inventory.document.identity.capturedBytes, nonempty: true),
                   original.start >= target.inventory.document.sourceBase,
@@ -544,19 +558,36 @@ enum AtlasDocumentDisplayWire {
                   try number("document_generation") == target.inventory.document.generation,
                   try number("display_width_points") == target.inventory.width,
                   try digest("capture_sha256") == authorization.captureSHA256,
-                  try nativePath("requested_root") == authorization.requestedRoot,
-                  try nativePath("asset_root") == authorization.assetRoot,
                   try nativePath("source_relative") == authorization.sourceRelative,
                   try number("item_index") == target.itemIndex,
                   try number("request_id") == target.requestID,
                   try text("destination").utf8.elementsEqual(target.destination.utf8),
                   values.contains(Key("enclosing_original_range")),
                   try values.decodeIfPresent(AtlasDocumentByteRange.self, forKey: Key("enclosing_original_range")) == target.original,
-                  try text("format_validation") == "signature-only", try !flag("decoded"),
-                  try text("image_observation") == "current-root-capture" else {
+                  try text("format_validation") == "signature-only", try !flag("decoded") else {
                 throw AtlasReaderError.invalidResponse
             }
+            let savedMember: UInt64?
+            switch authorization.authority {
+            case .current(let requestedRoot, let assetRoot):
+                guard try nativePath("requested_root") == requestedRoot,
+                      try nativePath("asset_root") == assetRoot,
+                      try text("image_observation") == "current-root-capture" else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                savedMember = nil
+            case .saved(let source):
+                try savedImageSource(source)
+                let member = try number("image_member")
+                guard member < source.members,
+                      try digest("image_archive_digest") == source.archiveDigest,
+                      try text("image_observation") == "verified-saved-member" else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                savedMember = member
+            }
             try imageLimits()
+            return savedMember
         }
         func imageBytes(total: UInt64, offset: UInt64) throws -> Data {
             guard offset < total, try number("image_offset") == offset else {
@@ -785,16 +816,70 @@ enum AtlasDocumentDisplayWire {
             guard assetRoot.first == 47 else { throw AtlasReaderError.invalidResponse }
             try w.imageLimits()
             return .init(document: document, displayWidth: width, captureSHA256: try w.digest("capture_sha256"),
-                requestedRoot: Array(root.utf8), assetRoot: assetRoot, sourceRelative: Array(sourceRelative.utf8))
+                authority: .current(requestedRoot: Array(root.utf8), assetRoot: assetRoot),
+                sourceRelative: Array(sourceRelative.utf8))
+        } catch let error as AtlasReaderError { throw error }
+        catch { throw AtlasReaderError.invalidResponse }
+    }
+    /// Saved success still uses the retained reader schema. Saved-handle errors
+    /// have their own schema/owner and are admitted only for this exact provider.
+    /// Unknown schemas, success-shaped saved responses and owner swaps fail shut.
+    private static func admitImage(_ json: String?, document: AtlasReaderDocumentInventory,
+                                   saved: AtlasSavedDocumentImageSource?) throws -> Data {
+        guard let json else { throw AtlasReaderError.unavailable }
+        guard json.utf8.count <= AtlasReaderLimits.responseBytes else { throw AtlasReaderError.invalidResponse }
+        let data = Data(json.utf8)
+        struct Status: Decodable {
+            let schema, status, owner: String
+            let exit_code: String?
+            let error: Diagnostic?
+            struct Diagnostic: Decodable { let code: String }
+        }
+        let status = try JSONDecoder().decode(Status.self, from: data)
+        if status.schema == "fcb.saved-repository/1" {
+            guard let saved, status.status == "error",
+                  AtlasReaderWire.integer(status.owner) == saved.archiveOwner,
+                  status.exit_code == "2" || status.exit_code == "130",
+                  let code = status.error?.code, !code.isEmpty, code.utf8.count <= 512,
+                  code.unicodeScalars.allSatisfy({ $0.value >= 32 && $0.value != 127 }) else {
+                throw AtlasReaderError.invalidResponse
+            }
+            throw AtlasReaderError.engine(code)
+        }
+        return try AtlasReaderWire.admit(json, handle: document.identity.owner)
+    }
+    static func savedImageAuthorization(_ json: String?, document: AtlasReaderDocumentInventory,
+        source: AtlasSavedDocumentImageSource) throws -> AtlasDocumentImageAuthorization {
+        do {
+            let w = try JSONDecoder().decode(Fields.self,
+                from: admitImage(json, document: document, saved: source))
+            let width = try w.number("display_width_points")
+            guard try w.header.identity(handle: document.identity.owner).matches(document.identity),
+                  document.identity.owner != source.archiveOwner,
+                  w.header.command == "document-images-authorize",
+                  try w.number("document_generation") == document.generation,
+                  (160...4096).contains(width),
+                  try w.flag("images_authorized"), try w.text("source_authority") == "verified-saved-member",
+                  try w.number("source_verification_bytes_read") == 0,
+                  try w.number("source_verification_read_calls") == 0,
+                  try w.nativePath("source_relative") == document.identity.pathBytes else {
+                throw AtlasReaderError.invalidResponse
+            }
+            _ = try w.flag("authorization_reused")
+            try w.savedImageSource(source); try w.imageLimits()
+            return .init(document: document, displayWidth: width, captureSHA256: try w.digest("capture_sha256"),
+                authority: .saved(source), sourceRelative: document.identity.pathBytes)
         } catch let error as AtlasReaderError { throw error }
         catch { throw AtlasReaderError.invalidResponse }
     }
     static func imagePrepared(_ json: String?, target: AtlasDocumentDisplayImageTarget,
                               authorization: AtlasDocumentImageAuthorization) throws -> AtlasDocumentImageReceipt {
         do {
+            let saved: AtlasSavedDocumentImageSource?
+            if case .saved(let source) = authorization.authority { saved = source } else { saved = nil }
             let w = try JSONDecoder().decode(Fields.self,
-                from: AtlasReaderWire.admit(json, handle: target.inventory.document.identity.owner))
-            try w.imageIdentity(target, authorization: authorization, command: "document-image-prepare")
+                from: admitImage(json, document: target.inventory.document, saved: saved))
+            let savedMember = try w.imageIdentity(target, authorization: authorization, command: "document-image-prepare")
             let total = try w.number("total_image_bytes"), read = try w.number("image_bytes_read")
             let calls = try w.number("image_read_calls")
             guard total > 0, total <= UInt64(AtlasDocumentImageLimits.encodedBytes),
@@ -804,7 +889,8 @@ enum AtlasDocumentDisplayWire {
                 throw AtlasReaderError.invalidResponse
             }
             return .init(target: target, authorization: authorization, totalBytes: total, format: format,
-                sha256: try w.digest("image_sha256"), firstChunk: try w.imageBytes(total: total, offset: 0))
+                sha256: try w.digest("image_sha256"), firstChunk: try w.imageBytes(total: total, offset: 0),
+                savedImageMember: savedMember)
         } catch let error as AtlasReaderError { throw error }
         catch { throw AtlasReaderError.invalidResponse }
     }
@@ -812,8 +898,9 @@ enum AtlasDocumentDisplayWire {
         do {
             let w = try JSONDecoder().decode(Fields.self,
                 from: AtlasReaderWire.admit(json, handle: receipt.target.inventory.document.identity.owner))
-            try w.imageIdentity(receipt.target, authorization: receipt.authorization, command: "document-image-chunk")
-            guard try w.number("total_image_bytes") == receipt.totalBytes,
+            let savedMember = try w.imageIdentity(receipt.target, authorization: receipt.authorization, command: "document-image-chunk")
+            guard savedMember == receipt.savedImageMember,
+                  try w.number("total_image_bytes") == receipt.totalBytes,
                   try w.text("image_format") == receipt.format.rawValue,
                   try w.digest("image_sha256") == receipt.sha256,
                   try w.number("retained_images") > 0, try w.number("retained_image_bytes") >= receipt.totalBytes,

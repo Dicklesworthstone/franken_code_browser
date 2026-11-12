@@ -142,7 +142,7 @@ struct AtlasExternalWebLink: Sendable {
         return status + "Logical FrankenMarkdown flow, not native shaped document layout. "
             + "\(page.lines.count) of \(inventory.totalLines) flow rows shown at \(inventory.width) columns. "
             + "Source links select enclosing Markdown regions, not glyph-exact spans. "
-            + "Width changes return to the start of the first mapped Markdown region shown. Web links open only through Open in browser. Local images load in Styled mode with current project folder access."
+            + "Width changes return to the start of the first mapped Markdown region shown. Web links open only through Open in browser. Styled mode can load local images from the current project or captured assets in the opened saved archive."
     }
 
     /// Same-capture source paging changes only the synchronization anchor.

@@ -120,7 +120,10 @@ import CryptoKit
         let unmapped = try decode(unqualified)
         precondition(unmapped.imageTargets.isEmpty, "Unqualified source must never request an asset read")
         let authority = try authorize(imageAuthorityWire())
-        precondition(authority.requestedRoot == Array("/p".utf8) && authority.assetRoot == Array("/canonical/p".utf8))
+        guard case .current(let requestedRoot, let assetRoot) = authority.authority else {
+            preconditionFailure("Current image route acquired a saved archive authority")
+        }
+        precondition(requestedRoot == Array("/p".utf8) && assetRoot == Array("/canonical/p".utf8))
         for inventory in [page.inventory, unmapped.inventory] {
             let missingEvidence = AtlasDocumentDisplayImageTarget(inventory: inventory, itemIndex: target.itemIndex,
                 requestID: target.requestID, destination: target.destination, bounds: target.bounds, original: nil)
@@ -223,7 +226,113 @@ import CryptoKit
         let zeroID = try decode(w)
         precondition(zeroID.imageTargets[0].requestID == 0)
     }
+    static var savedDocument: AtlasReaderDocumentInventory {
+        let reader = document.identity
+        let identity = AtlasReaderIdentity(owner: reader.owner, file: reader.file, revision: reader.revision,
+            capturedBytes: reader.capturedBytes, pathBytes: Array("README.md".utf8),
+            encoding: reader.encoding, displayPath: "README.md")
+        return .init(identity: identity, generation: document.generation, width: document.width,
+            totalLines: document.totalLines, totalHeadings: document.totalHeadings,
+            renderedBytes: document.renderedBytes, sourceBase: document.sourceBase)
+    }
+    static var savedSource: AtlasSavedDocumentImageSource {
+        try! .init(archiveOwner: 40, archiveDigest: String(repeating: "cd", count: 32), sourceMember: 0, members: 3)
+    }
+    static func savedImageWire(_ wire: [String: Any]) -> [String: Any] {
+        var w = wire
+        w["path"] = path("README.md"); w["source_relative"] = path("README.md")
+        w.removeValue(forKey: "requested_root"); w.removeValue(forKey: "asset_root")
+        w["saved_archive_owner"] = "40"; w["saved_archive_digest"] = savedSource.archiveDigest
+        w["saved_source_member"] = "0"; w["live_root_authority"] = false
+        w["source_authority"] = "verified-saved-member"
+        w["source_verification_bytes_read"] = "0"; w["source_verification_read_calls"] = "0"
+        w["additional_source_bytes_read"] = "0"
+        if w["image_observation"] != nil {
+            w["image_observation"] = "verified-saved-member"
+            w["image_member"] = "1"; w["image_archive_digest"] = savedSource.archiveDigest
+        }
+        return w
+    }
+    static func savedAuthorize(_ w: [String: Any]) throws -> AtlasDocumentImageAuthorization {
+        try AtlasDocumentDisplayWire.savedImageAuthorization(json(w), document: savedDocument, source: savedSource)
+    }
+    static func savedImageReceipts() throws {
+        let page = try AtlasDocumentDisplayWire.page(json(savedImageWire(imagePageWire())),
+            document: savedDocument, command: "document-display-prepare", first: 0, width: 200)
+        let target = page.imageTargets[0]
+        let authority = try savedAuthorize(savedImageWire(imageAuthorityWire()))
+        guard case .saved(let accepted) = authority.authority else {
+            preconditionFailure("Saved images acquired current-root authority")
+        }
+        precondition(accepted == savedSource && authority.sourceRelative == Array("README.md".utf8))
+        let receipt = try AtlasDocumentDisplayWire.imagePrepared(json(savedImageWire(preparedImageWire())),
+            target: target, authorization: authority)
+        precondition(receipt.firstChunk == Data("abc".utf8) && receipt.savedImageMember == 1)
+        for (key, value) in [
+            ("saved_archive_owner", "41"), ("saved_archive_digest", String(repeating: "de", count: 32)),
+            ("saved_source_member", "1"), ("source_verification_read_calls", "1"),
+            ("source_verification_bytes_read", "20"), ("source_authority", "verified-current-source"),
+            ("document_generation", "6"), ("owner", "40")
+        ] {
+            var w = savedImageWire(imageAuthorityWire()); w[key] = value
+            do { _ = try savedAuthorize(w); preconditionFailure("Saved authority accepted \(key)") }
+            catch AtlasReaderError.invalidResponse { }
+        }
+        for key in ["requested_root", "asset_root", "source_relative", "live_root_authority"] {
+            var w = savedImageWire(imageAuthorityWire())
+            if key == "live_root_authority" { w[key] = true }
+            else { w[key] = path(key == "source_relative" ? "other.md" : "/live") }
+            do { _ = try savedAuthorize(w); preconditionFailure("Saved authority accepted \(key)") }
+            catch AtlasReaderError.invalidResponse { }
+        }
+        for (key, value) in [
+            ("image_member", "3"), ("image_archive_digest", String(repeating: "de", count: 32)),
+            ("saved_archive_owner", "41"), ("saved_source_member", "1"),
+            ("image_observation", "current-root-capture"), ("request_id", "45"),
+            ("destination", "images/cafe\u{301}.png"), ("display_width_points", "201"),
+            ("capture_sha256", String(repeating: "de", count: 32))
+        ] {
+            var w = savedImageWire(preparedImageWire()); w[key] = value
+            do { _ = try AtlasDocumentDisplayWire.imagePrepared(json(w), target: target, authorization: authority)
+                preconditionFailure("Saved image receipt accepted \(key)")
+            } catch AtlasReaderError.invalidResponse { }
+        }
+        let large = try AtlasDocumentDisplayWire.imagePrepared(json(savedImageWire(preparedImageWire(total: 65537))),
+            target: target, authorization: authority)
+        var tail = savedImageWire(preparedImageWire(total: 65537))
+        tail["command"] = "document-image-chunk"; tail["image_offset"] = "65536"
+        tail["image_bytes"] = "1"; tail["image_hex"] = "ff"; tail["next_image_offset"] = NSNull()
+        tail["image_bytes_read"] = "0"; tail["image_read_calls"] = "0"
+        let last = try AtlasDocumentDisplayWire.imageChunk(json(tail), receipt: large, offset: 65536)
+        precondition(last == Data([255]))
+        // Equal content digests still cannot switch archive member authority.
+        for (key, value) in [("image_member", "2"), ("saved_source_member", "1"),
+            ("image_archive_digest", String(repeating: "de", count: 32))] {
+            var swapped = tail; swapped[key] = value
+            do { _ = try AtlasDocumentDisplayWire.imageChunk(json(swapped), receipt: large, offset: 65536)
+                preconditionFailure("Saved chunk changed \(key)")
+            } catch AtlasReaderError.invalidResponse { }
+        }
+        let unavailable: [String: Any] = ["schema": "fcb.saved-repository/1", "status": "error",
+            "owner": "40", "exit_code": "2", "error": ["code": "DOCUMENT_IMAGE_SAVED_MEMBER_MISSING"]]
+        do { _ = try AtlasDocumentDisplayWire.imagePrepared(json(unavailable), target: target, authorization: authority)
+            preconditionFailure("Missing captured asset was accepted")
+        } catch AtlasReaderError.engine(let code) { precondition(code == "DOCUMENT_IMAGE_SAVED_MEMBER_MISSING") }
+        for (key, value) in [("owner", "41"), ("status", "ok"), ("exit_code", "0"), ("schema", "unknown")] {
+            var forged = unavailable; forged[key] = value
+            do { _ = try AtlasDocumentDisplayWire.imagePrepared(json(forged), target: target, authorization: authority)
+                preconditionFailure("Saved error accepted invalid \(key)")
+            } catch AtlasReaderError.invalidResponse { }
+        }
+        let current = try authorize(imageAuthorityWire())
+        let currentPage = try decode(imagePageWire())
+        do { _ = try AtlasDocumentDisplayWire.imagePrepared(json(unavailable), target: currentPage.imageTargets[0],
+            authorization: current)
+            preconditionFailure("Saved error schema entered current-root image route")
+        } catch AtlasReaderError.invalidResponse { }
+    }
     static func main() throws {
+        try savedImageReceipts()
         let accepted = try decode(wire())
         precondition(accepted.items.count == 1 && accepted.first == 0 && accepted.next == nil)
         precondition(accepted.items[0].original == .init(start: 0, end: 20))
