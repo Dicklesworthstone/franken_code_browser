@@ -156,7 +156,7 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
         let projection_bytes = ordinals.map_or(0, <[usize]>::len).checked_mul(size_of::<usize>())
             .ok_or(AtlasStreamError::InvalidLimits)?;
         let witness_files = count.min(limits.max_matches);
-        let case_sensitive = needle.mode() == StreamingMode::ExactText;
+        let case_sensitive = matches!(needle.mode(), StreamingMode::ExactText | StreamingMode::Identifier);
         // Exact hits share one encoded literal per file. Lowercase hits retain
         // their own spelling and byte witness, bounded by transformed query size.
         let witness_count = if case_sensitive { witness_files } else { limits.max_matches };
@@ -185,7 +185,7 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
             selected.extend_from_slice(values);
             Ok::<_, AtlasStreamError>(selected)
         }).transpose()?;
-        let report = AtlasStreamReport { atlas, generation, limits, count_all_matches, case_sensitive, files: reserve(count)?,
+        let report = AtlasStreamReport { atlas, generation, limits, count_all_matches, case_sensitive, mode: needle.mode(), files: reserve(count)?,
             hits: reserve(limits.max_matches)?, matched_files: reserve(witness_files)?,
             witnesses: reserve(witness_bytes)?, matched_text, selected_ordinals, literal, stats: AtlasStreamStats::default(),
             state: if count == 0 { AtlasStreamState::Finished } else { AtlasStreamState::Pending },

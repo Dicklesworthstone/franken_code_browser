@@ -17,11 +17,12 @@ use std::mem::size_of;
 
 use fcb_core::{ByteLength, ByteRange, DecodedUtf8Offset, DecodedUtf8Range, FileId,
     QueryGeneration, ResourceAllocationId, ResourceBudget, ResourceLease, SourceRevision};
+use fcb_search::identifier::{IdentifierCursor, MAX_IDENTIFIER_BYTES, validate_identifier};
 use fcb_source::{CaptureEncodingMap, CaptureRequest, DetectedEncoding, SpanKind, detect_encoding};
 
 pub const MAX_REFERENCE_SOURCE_BYTES: usize = 512 * 1024;
 pub const MAX_REFERENCE_ITEMS: usize = 4096;
-pub const MAX_REFERENCE_NAME_BYTES: usize = 1024;
+pub const MAX_REFERENCE_NAME_BYTES: usize = MAX_IDENTIFIER_BYTES;
 const CANCEL_QUANTUM: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,32 +121,30 @@ impl<'source> CapturedReferences<'source> {
         if owned_name.capacity() > name.len() { return Err(ReferenceError::ResourceDenied); }
         owned_name.push_str(name);
         let text = map.decoded_text();
-        let mut start = None;
+        let mut cursor = IdentifierCursor::new(name).map_err(|_| ReferenceError::InvalidName)?;
+        let mut start = 0usize;
         let mut token_line = 1u64;
         let mut line = 1u64;
         let mut checkpoint = 0usize;
         let mut counted = 0usize;
         let mut limited = false;
-        // One pass over scalars; source fragments are compared only at complete
-        // token boundaries. A long token cannot cause repeated prefix rescans.
+        // The same allocation-free cursor drives streaming occurrence search.
+        // Only a delimiter or true capture end completes an exact token.
         for (offset, scalar) in text.char_indices().chain(std::iter::once((text.len(), '\0'))) {
             if offset - checkpoint >= CANCEL_QUANTUM {
                 if canceled() { return Err(ReferenceError::Canceled); }
                 checkpoint = offset;
             }
-            if token_scalar(scalar) {
-                if start.is_none() { start = Some(offset); token_line = line; }
-            } else if let Some(begin) = start.take() {
-                if text.get(begin..offset) == Some(name) {
-                    counted += 1;
-                    if candidates.len() == max_items { limited = true; break; }
-                    let decoded_range = DecodedUtf8Range::new(DecodedUtf8Offset::new(begin as u64),
-                        DecodedUtf8Offset::new(offset as u64)).map_err(|_| ReferenceError::InvalidEvidence)?;
-                    let original_range = map.decoded_utf8_range_to_byte_range(decoded_range)
-                        .map_err(|_| ReferenceError::InvalidEvidence)?;
-                    candidates.push(ReferenceCandidate { id: candidates.len() as u64 + 1,
-                        original_range, decoded_range, line: token_line });
-                }
+            if !cursor.in_token() { start = offset; token_line = line; }
+            if cursor.push(scalar) {
+                counted += 1;
+                if candidates.len() == max_items { limited = true; break; }
+                let decoded_range = DecodedUtf8Range::new(DecodedUtf8Offset::new(start as u64),
+                    DecodedUtf8Offset::new(offset as u64)).map_err(|_| ReferenceError::InvalidEvidence)?;
+                let original_range = map.decoded_utf8_range_to_byte_range(decoded_range)
+                    .map_err(|_| ReferenceError::InvalidEvidence)?;
+                candidates.push(ReferenceCandidate { id: candidates.len() as u64 + 1,
+                    original_range, decoded_range, line: token_line });
             }
             if scalar == '\n' { line += 1; }
         }
@@ -192,17 +191,9 @@ impl<'source> CapturedReferences<'source> {
     }
 }
 
-fn token_scalar(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '_' | '$')
-        || (!c.is_ascii() && !c.is_whitespace() && !c.is_control())
-}
 /// Validate the exact query token without reading source or allocating memory.
 pub fn validate_reference_name(name: &str) -> Result<(), ReferenceError> {
-    if name.is_empty() || name.len() > MAX_REFERENCE_NAME_BYTES
-        || !name.chars().all(token_scalar) || name.as_bytes()[0].is_ascii_digit() {
-        return Err(ReferenceError::InvalidName);
-    }
-    Ok(())
+    validate_identifier(name).map_err(|_| ReferenceError::InvalidName)
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 fcb-core = { path = "../fcb-core" }
+fcb-search = { path = "../fcb-search" }
 fcb-source = { path = "../fcb-source" }
 
 [dev-dependencies]

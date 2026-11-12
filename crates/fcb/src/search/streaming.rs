@@ -14,12 +14,15 @@
 //! Unicode-insensitive text reuses the shared lowercase scalar cursor and keeps
 //! each occurrence's original spelling and encoded bytes. It does not add full
 //! case folding, canonical equivalence, replacement text, or guessed encodings.
+//! Identifier occurrences share the captured-reference whole-token policy and
+//! wait for a delimiter or actual input end, including across read boundaries.
 
 use std::{io::{self, Read}, mem::size_of};
 use fcb_core::{ArenaOwnerId, ByteLength, ByteOffset, ByteRange, DecodedUtf8Offset, FileId, QueryGeneration,
     ResourceAllocationId, ResourceBudget, ResourceLease, SourceRevision};
 use fcb_source::{CaptureEncodingMap, CaptureRequest, DetectedEncoding, MappingSpan, SourceError, SpanKind, detect_encoding};
 use fcb_search::stream::{ByteSearchCursor, StreamError, MAX_STREAM_NEEDLE_BYTES};
+use fcb_search::identifier::{IdentifierCursor, validate_identifier};
 use fcb_search::{SearchMode, UnicodeNormalization};
 use fcb_search::normalized::{NormalizedCursor, SourceScalar, Units, matched_text_capacity};
 
@@ -30,7 +33,7 @@ pub const MAX_STREAM_STEP_CALLS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamReadError {
-    InvalidLimits, InvalidRange, OwnerMismatch, ResourceDenied, AllocationFailed,
+    InvalidLimits, InvalidRange, InvalidIdentifier, OwnerMismatch, ResourceDenied, AllocationFailed,
     Io, InvalidReadCount, Pending, StaleGeneration,
     Decoder(SourceError), Matcher(StreamError),
 }
@@ -42,6 +45,7 @@ impl std::fmt::Display for StreamReadError {
             _ => f.write_str(match self {
                 Self::InvalidLimits => "STREAM_READ_INVALID_LIMITS",
                 Self::InvalidRange => "STREAM_READ_INVALID_RANGE",
+                Self::InvalidIdentifier => "STREAM_READ_INVALID_IDENTIFIER",
                 Self::OwnerMismatch => "STREAM_READ_OWNER_MISMATCH",
                 Self::ResourceDenied => "STREAM_READ_RESOURCE_DENIED",
                 Self::AllocationFailed => "STREAM_READ_ALLOCATION_FAILED",
@@ -56,7 +60,7 @@ impl std::error::Error for StreamReadError {}
 impl From<StreamError> for StreamReadError { fn from(error: StreamError) -> Self { Self::Matcher(error) } }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StreamingMode { OriginalBytes, ExactText, LowercaseText }
+pub enum StreamingMode { OriginalBytes, ExactText, LowercaseText, Identifier }
 
 /// Reusable immutable literal. Pre-encoded alternatives avoid a self-referential
 /// cursor and allow reports to share ONE exact literal witness across all hits.
@@ -78,6 +82,16 @@ impl StreamingNeedle {
     pub fn text(owner: ArenaOwnerId, text: &str, budget: &ResourceBudget,
         allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
         Self::build(owner, text.as_bytes(), Some(text), budget, allocation)
+    }
+    /// Exact whole-token text occurrences, including comments and strings.
+    /// Shares the captured-reference token policy; no compiler binding, lexer,
+    /// case folding or Unicode identifier-completeness claim is introduced.
+    pub fn identifier(owner: ArenaOwnerId, name: &str, budget: &ResourceBudget,
+        allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
+        validate_identifier(name).map_err(|_| StreamReadError::InvalidIdentifier)?;
+        let mut needle = Self::text(owner, name, budget, allocation)?;
+        needle.mode = StreamingMode::Identifier;
+        Ok(needle)
     }
     /// Match with the same Unicode lowercase semantics as retained text search.
     /// This is not full case folding or canonical normalization. Original byte
@@ -196,6 +210,15 @@ struct LowercaseWork {
     pending: Option<(SourceScalar, Units)>,
 }
 
+struct IdentifierWork<'needle> {
+    cursor: IdentifierCursor<'needle>,
+    window: Option<CaptureEncodingMap>,
+    decoded_base: u64,
+    position: usize,
+    token_start: u64,
+    token_end: u64,
+}
+
 /// Explicit synchronous-resumable reader operation. A step admits at most one
 /// successful read and one matcher batch. Interrupted calls spend call budget.
 /// A foreign blocking Read implementation has no invented wall-clock deadline.
@@ -211,6 +234,7 @@ pub struct ReaderSearch<'needle, R: Read> {
     cursor: Option<ByteSearchCursor<'needle>>,
     initialized: bool,
     lowercase: Option<LowercaseWork>,
+    identifier: Option<IdentifierWork<'needle>>,
     witnesses: Vec<RetainedWitness>,
     buffer: Vec<u8>,
     base: u64,
@@ -266,9 +290,14 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
                 lowercase_mode()).map_err(|_| StreamReadError::AllocationFailed)?
                     .ok_or(StreamReadError::InvalidLimits)?, window: None, decoded_base: 0, position: 0, pending: None })
         } else { None };
+        let identifier = if needle.mode == StreamingMode::Identifier {
+            Some(IdentifierWork { cursor: IdentifierCursor::new(needle.text_value()
+                .ok_or(StreamReadError::InvalidIdentifier)?).map_err(|_| StreamReadError::InvalidIdentifier)?,
+                window: None, decoded_base: 0, position: 0, token_start: 0, token_end: 0 })
+        } else { None };
         let witnesses = reserve(if lowercase.is_some() { options.max_matches } else { 0 })?;
         let mut search = Self { reader, needle, request, length, options, count_all_matches: false, encoding: options.encoding,
-            header: 0, initialized: cursor.is_some(), cursor, lowercase, witnesses,
+            header: 0, initialized: cursor.is_some(), cursor, lowercase, identifier, witnesses,
             buffer, base: 0, filled: 0, ready: 0, consumed: 0, eof: false,
             hits: reserve(options.max_matches)?, matches_seen: 0, unsupported_at: None,
             state: StreamReadState::Pending, stats: StreamReadStats::default(), lease };
@@ -333,7 +362,9 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
         if canceled() { self.cancel(); return Ok(()); }
         if self.ready == 0 { self.prepare()?; }
         if self.state != StreamReadState::Pending { return Ok(()); }
-        if self.lowercase.is_some() && self.ready > 0 {
+        if self.identifier.is_some() && self.ready > 0 {
+            self.advance_identifier(step)?;
+        } else if self.lowercase.is_some() && self.ready > 0 {
             self.advance_lowercase(step)?;
         } else if self.ready > self.consumed {
             let cursor = self.cursor.as_mut().ok_or(StreamReadError::InvalidRange)?;
@@ -357,8 +388,16 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
         }
         let lower_done = self.lowercase.as_ref().is_none_or(|work| work.pending.is_none()
             && work.window.as_ref().is_none_or(|map| work.position == map.decoded_text().len()));
-        if self.ready > 0 && self.consumed == self.ready && lower_done {
+        let identifier_done = self.identifier.as_ref().is_none_or(|work|
+            work.window.as_ref().is_none_or(|map| work.position == map.decoded_text().len()));
+        if self.ready > 0 && self.consumed == self.ready && lower_done && identifier_done {
             if let Some(work) = &mut self.lowercase {
+                if let Some(map) = work.window.take() {
+                    work.decoded_base = work.decoded_base.checked_add(map.total_decoded_bytes())
+                        .ok_or(StreamReadError::InvalidRange)?;
+                }
+            }
+            if let Some(work) = &mut self.identifier {
                 if let Some(map) = work.window.take() {
                     work.decoded_base = work.decoded_base.checked_add(map.total_decoded_bytes())
                         .ok_or(StreamReadError::InvalidRange)?;
@@ -368,9 +407,79 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
             self.filled -= self.ready; self.base += self.ready as u64;
             self.ready = 0; self.consumed = 0;
         }
+        // Only an actual input end closes a pending whole token. A byte/call
+        // allowance, read quantum, short buffer or UI pause is not a boundary.
+        // A real early EOF may retain a final witness, but remains ShortRead.
+        if self.state == StreamReadState::Pending && self.ready == 0 && self.filled == 0
+            && (self.eof || self.stats.bytes_read == self.length.get()) {
+            let final_hit = self.identifier.as_mut().and_then(|work|
+                work.cursor.finish().then_some((work.token_start, work.token_end)));
+            if let Some((start, end)) = final_hit { self.retain_identifier(start, end)?; }
+        }
         self.set_terminal();
         Ok(())
     }
+
+    fn advance_identifier(&mut self, step: StreamReadStep) -> Result<(), StreamReadError> {
+        let before = self.consumed;
+        let end = self.ready.min(self.consumed + step.max_bytes.min(STREAM_BUFFER_BYTES));
+        let max_hits = step.max_hits.min(MAX_STREAM_STEP_HITS);
+        let mut emitted = 0;
+        while emitted < max_hits {
+            let work = self.identifier.as_mut().ok_or(StreamReadError::InvalidRange)?;
+            let map = work.window.as_ref().ok_or(StreamReadError::InvalidRange)?;
+            let Some(ch) = map.decoded_text()[work.position..].chars().next() else {
+                self.consumed = end;
+                break;
+            };
+            let decoded_start = work.decoded_base + work.position as u64;
+            let decoded_end = decoded_start + ch.len_utf8() as u64;
+            let raw_start = map.decoded_utf8_to_byte_offset(DecodedUtf8Offset::new(decoded_start))
+                .map_err(StreamReadError::Decoder)?.get();
+            let raw_end = map.decoded_utf8_to_byte_offset(DecodedUtf8Offset::new(decoded_end))
+                .map_err(StreamReadError::Decoder)?.get();
+            let local_end = usize::try_from(raw_end.checked_sub(self.base).ok_or(StreamReadError::InvalidRange)?)
+                .map_err(|_| StreamReadError::InvalidRange)?;
+            if local_end > end {
+                self.consumed = end;
+                break;
+            }
+            self.consumed = local_end;
+            self.stats.last_step_scanned = self.consumed - before;
+            self.stats.scanned_bytes = self.base + self.consumed as u64;
+            work.position += ch.len_utf8();
+            if !work.cursor.in_token() { work.token_start = raw_start; }
+            let matched = work.cursor.push(ch);
+            if work.cursor.in_token() { work.token_end = raw_end; }
+            let range = (work.token_start, work.token_end);
+            if matched {
+                emitted += 1;
+                self.retain_identifier(range.0, range.1)?;
+                if self.state != StreamReadState::Pending { break; }
+            }
+        }
+        self.stats.last_step_scanned = self.consumed - before;
+        self.stats.scanned_bytes = self.base + self.consumed as u64;
+        Ok(())
+    }
+
+    fn retain_identifier(&mut self, start: u64, end: u64) -> Result<(), StreamReadError> {
+        let range = ByteRange::new(ByteOffset::new(start), ByteOffset::new(end))
+            .map_err(|_| StreamReadError::InvalidRange)?;
+        // Equality was established scalar-by-scalar under the qualified decoder.
+        // Exact encoding means every hit can share the immutable query witness.
+        if range.len().get() != self.needle.encoded(self.encoding).len() as u64 {
+            return Err(StreamReadError::InvalidRange);
+        }
+        self.matches_seen = self.matches_seen.checked_add(1).ok_or(StreamReadError::InvalidLimits)?;
+        if self.hits.len() < self.options.max_matches {
+            self.hits.push(StreamingHit { occurrence: self.matches_seen, range });
+        } else if !self.count_all_matches {
+            self.state = StreamReadState::Truncated;
+        }
+        Ok(())
+    }
+
     fn advance_lowercase(&mut self, step: StreamReadStep) -> Result<(), StreamReadError> {
         let before = self.consumed;
         let end = self.ready.min(self.consumed + step.max_bytes.min(STREAM_BUFFER_BYTES));
@@ -456,7 +565,7 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
                 _ => 0,
             };
             let needle: &'needle StreamingNeedle = self.needle;
-            if self.lowercase.is_none() {
+            if self.lowercase.is_none() && self.identifier.is_none() {
                 self.cursor = Some(ByteSearchCursor::new(needle.encoded(self.encoding))?);
             }
             self.initialized = true;
@@ -468,13 +577,17 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
             // in the original input searched below. No second decoder is built.
             let map = CaptureEncodingMap::build_with_base_offset(&self.buffer[..self.ready],
                 self.encoding.ok_or(StreamReadError::InvalidRange)?, self.base,
-                self.lowercase.as_ref().map_or(0, |work| work.decoded_base), 0, 0)
+                self.lowercase.as_ref().map(|work| work.decoded_base)
+                    .or_else(|| self.identifier.as_ref().map(|work| work.decoded_base)).unwrap_or(0), 0, 0)
                 .map_err(StreamReadError::Decoder)?;
             if let Some(bad) = map.spans().iter().find(|span| matches!(span.kind, SpanKind::ReplacementMalformed | SpanKind::EscapedByte)) {
                 self.unsupported_at = Some(ByteOffset::new(bad.raw_start));
                 self.hits.clear(); self.witnesses.clear(); self.matches_seen = 0;
                 self.state = StreamReadState::UnsupportedText;
             } else if let Some(work) = &mut self.lowercase {
+                work.position = 0;
+                work.window = Some(map);
+            } else if let Some(work) = &mut self.identifier {
                 work.position = 0;
                 work.window = Some(map);
             }

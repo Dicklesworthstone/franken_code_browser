@@ -8,7 +8,7 @@ use fcb_core::{ByteLength, ByteOffset, ByteRange, FileId, QueryGeneration,
     ResourceAllocationId, ResourceBudget, ResourceLease, SourceRevision};
 use crate::map::{AtlasNodeId, NodeKind};
 use crate::search::{CaptureRequest, DetectedEncoding, ExtentConsistency, FileSearchError,
-    ObservedExtent, StreamReadState, StreamReadStats};
+    ObservedExtent, StreamReadState, StreamReadStats, StreamingMode};
 use super::{AtlasStreamError, AtlasStreamLimits, AtlasStreamSource, AtlasStreamState, AtlasStreamStop, WorkspaceAtlas};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,6 +108,7 @@ pub struct AtlasStreamReport<'atlas, 'catalog, A: AtlasStreamSource = WorkspaceA
     pub(super) limits: AtlasStreamLimits,
     pub(super) count_all_matches: bool,
     pub(super) case_sensitive: bool,
+    pub(super) mode: StreamingMode,
     pub(super) files: Vec<AtlasStreamFile>,
     pub(super) hits: Vec<AtlasStreamHit>,
     pub(super) matched_files: Vec<usize>,
@@ -129,6 +130,7 @@ impl<'atlas, 'catalog, A: AtlasStreamSource> AtlasStreamReport<'atlas, 'catalog,
     pub const fn limits(&self) -> AtlasStreamLimits { self.limits }
     pub const fn count_all_matches(&self) -> bool { self.count_all_matches }
     pub const fn case_sensitive(&self) -> bool { self.case_sensitive }
+    pub const fn mode(&self) -> StreamingMode { self.mode }
     /// Row retention and scan completeness are independent in counting mode.
     pub fn hits_truncated(&self) -> bool { self.stats.matches_seen > self.hits.len() as u64 }
     /// Finalized files with at least one observed occurrence, even when none of

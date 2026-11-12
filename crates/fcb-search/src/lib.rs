@@ -9,6 +9,7 @@
 //! a newly qualified complete Unicode normalization implementation.
 
 mod capture;
+pub mod identifier;
 pub mod normalized;
 pub mod index;
 pub mod indexed_query;

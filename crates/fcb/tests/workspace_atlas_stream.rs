@@ -90,6 +90,45 @@ fn finds_a_hit_beyond_capture_limits_without_retaining_the_skipped_source() {
 }
 
 #[test]
+fn scoped_occurrences_stream_large_files_and_count_without_retaining_extra_rows() {
+    let root = Fixture::new();
+    let mut bytes = vec![b'x'; 600 * 1024];
+    bytes.extend_from_slice(b" foo foobar foo");
+    root.write("a.rs", &bytes);
+    let mut utf16 = vec![0xff, 0xfe];
+    for unit in "foo".encode_utf16() { utf16.extend_from_slice(&unit.to_le_bytes()); }
+    root.write("b.rs", &utf16);
+    root.write("c.rs", b"foo foo foo");
+    let budget = budget(); let catalog = root.catalog(&budget, 10); let atlas = atlas(&catalog, &budget, 2);
+    let needle = StreamingNeedle::identifier(owner(), "foo", &budget, allocation(10)).unwrap();
+    let mut job = AtlasStreamSearch::new_scoped_counting(&atlas, &needle, revision(100), generation(10),
+        AtlasStreamLimits { max_matches: 1, ..Default::default() }, &[0, 1],
+        &budget, [allocation(11), allocation(12)]).unwrap();
+    for _ in 0..10_000 {
+        if job.state() != AtlasStreamState::Pending { break; }
+        job.step(StreamReadStep::default(), generation(10), |_, path| {
+            assert_ne!(path.raw().to_path_buf(), PathBuf::from("c.rs"));
+            File::open(root.0.join(path.raw().to_path_buf())).map_err(|_| SourceError::CaptureUnavailable)
+        }, || false).unwrap();
+    }
+    let report = job.finish().unwrap();
+    assert_eq!(report.mode(), fcb::search::StreamingMode::Identifier);
+    assert!(report.case_sensitive());
+    assert!(report.is_complete());
+    assert_eq!(report.excluded_files(), 1);
+    assert_eq!(report.stats().matches_seen, 3);
+    assert_eq!(report.hits().len(), 1);
+    assert_eq!(report.matching_files_seen(), 2);
+    assert!(report.hits_truncated());
+    assert_eq!(report.retained_witness_bytes(), 3);
+    assert_eq!(report.retained_matched_text_bytes(), 0);
+    let selection = report.select_hit(0, &atlas, generation(10)).unwrap();
+    assert_eq!(selection.matched_text(), "foo");
+    assert_eq!(selection.original_bytes(), b"foo");
+    assert_eq!(selection.hit().original_range().start().get(), 600 * 1024 + 1);
+}
+
+#[test]
 fn cross_buffer_utf8_and_both_utf16_orders_keep_original_ranges_and_witnesses() {
     let root = Fixture::new(); let needle = "x😀y";
     let mut utf8 = vec![b'a'; 16 * 1024 - 2]; utf8.extend_from_slice(needle.as_bytes()); root.write("a.rs", &utf8);

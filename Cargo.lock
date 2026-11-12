@@ -22,6 +22,7 @@ name = "fcb-analysis"
 version = "0.1.0"
 dependencies = [
  "fcb-core",
+ "fcb-search",
  "fcb-source",
  "fcb-test-support",
 ]
