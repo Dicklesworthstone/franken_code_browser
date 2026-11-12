@@ -6,7 +6,7 @@ use std::{ffi::c_char, path::Path, sync::OnceLock};
 use fcb_app::host::{HostResponse, saved_repository::{Sha256Digest, SnapshotLimits}};
 use fcb_app::host::saved_repository::relationships::{RelationshipDirection, RelationshipSide};
 use super::{cstr, reply, string_out};
-use super::saved_sessions::{AccessError, Command, SavedSessions, Selection};
+use super::saved_sessions::{AccessError, Command, DocumentImageCommand, SavedSessions, Selection};
 
 static SAVED: OnceLock<SavedSessions> = OnceLock::new();
 
@@ -236,6 +236,34 @@ pub extern "C" fn fcb_saved_open_relationship_reader(handle: u64, reader: u64,
         sessions.open_reader(handle, readers, reader, Selection::Relationship { generation, id: link_id, side }, || false)
     }))
 }
+/// Authorize images from the captured source member in this saved archive.
+/// Requires an existing retained reader with the exact member path/length/digest
+/// and a prepared document display at generation. Reads no current source path.
+/// Success is fcb.reader-session/1; failures use fcb.saved-repository/1 with this saved
+/// handle. Free either response once with fcb_free_string. Worker only.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_saved_document_images_authorize(handle: u64, reader: u64,
+    source_member: u64, generation: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| {
+        let readers = crate::reader_ffi::registry().ok_or(crate::reader_sessions::AccessError::UnknownHandle)?;
+        sessions.document_images(handle, readers, reader, number(source_member)?, generation,
+            DocumentImageCommand::Authorize, || false)
+    }))
+}
+/// Capture a parser-owned local image from a member of the SAME open archive.
+/// Returns the first encoded chunk using the existing reader image schema,
+/// with saved-archive/member provenance and no live root authority. Subsequent
+/// fcb_reader_document_image_chunk calls replay admitted bytes without archive
+/// I/O. Existing PNG/JPEG, cache and chunk limits apply. Worker only.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_saved_document_image_prepare(handle: u64, reader: u64,
+    source_member: u64, generation: u64, item_index: u64, request_id: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| {
+        let readers = crate::reader_ffi::registry().ok_or(crate::reader_sessions::AccessError::UnknownHandle)?;
+        sessions.document_images(handle, readers, reader, number(source_member)?, generation,
+            DocumentImageCommand::Prepare { item_index: number(item_index)?, request_id }, || false)
+    }))
+}
 /// Nonblocking cooperative cancellation of the current operation. Accepted
 /// archive/index/results and independently owned readers are not rolled back.
 #[unsafe(no_mangle)]
@@ -268,3 +296,7 @@ mod counted_tests;
 #[cfg(all(test, unix))]
 #[path = "saved_matching_ffi_tests.rs"]
 mod matching_tests;
+
+#[cfg(all(test, unix))]
+#[path = "saved_document_images_ffi_tests.rs"]
+mod document_images_tests;

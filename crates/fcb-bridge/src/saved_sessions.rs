@@ -88,6 +88,10 @@ pub(super) enum Command<'a> {
     Relationships { generation: u64, member: Option<usize>, direction: RelationshipDirection, start: usize, limit: usize },
     ClearRelationships { generation: u64 },
 }
+pub(super) enum DocumentImageCommand {
+    Authorize,
+    Prepare { item_index: usize, request_id: u64 },
+}
 #[derive(Clone, Copy)]
 pub(super) enum Selection {
     Hit { generation: u64, id: u64 }, Member(usize),
@@ -234,6 +238,29 @@ impl SavedSessions {
         cell.validate(epoch)?;
         result
     }
+    /// Existing reader destination: image acquisition may mutate only its
+    /// bounded image cache. Closing/canceling either service prevents delivery;
+    /// the source and already retained image bytes have independent lifetimes.
+    pub(super) fn document_images(&self, handle: u64, readers: &ReaderSessions,
+        reader: u64, source_member: usize, generation: u64, command: DocumentImageCommand,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        let cell = self.get(handle)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let mut state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        let session = state.as_mut().ok_or(AccessError::NotOpen)?;
+        let mut stop = || cell.validate(epoch).is_err() || canceled();
+        let result = readers.with_document_images(reader, |reader, reader_stop| match command {
+            DocumentImageCommand::Authorize =>
+                session.authorize_document_images(reader, source_member, generation, reader_stop).map_err(AccessError::from),
+            DocumentImageCommand::Prepare { item_index, request_id } =>
+                session.prepare_document_image(reader, source_member, generation, item_index,
+                    request_id, reader_stop).map_err(AccessError::from),
+        }, &mut stop);
+        cell.validate(epoch)?;
+        result
+    }
+
     pub(super) fn cancel(&self, handle: u64) -> Result<(), AccessError> {
         let cell = self.get(handle)?;
         if cell.closed.load(Ordering::Acquire) { return Err(AccessError::Closed); }
@@ -274,3 +301,7 @@ mod expression_tests;
 #[cfg(all(test, unix))]
 #[path = "saved_structure_sessions_tests.rs"]
 mod structure_tests;
+
+#[cfg(all(test, unix))]
+#[path = "saved_document_images_sessions_tests.rs"]
+mod document_images_tests;

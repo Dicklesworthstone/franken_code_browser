@@ -186,6 +186,23 @@ impl ReaderSessions {
         if canceled() { return Err(AccessError::Canceled.into()); }
         result
     }
+    /// Borrow one retained reader for the saved archive's image adapter. Both
+    /// registries keep their own cancellation epochs; no handle/borrow escapes.
+    /// try_lock returns Busy for competing work rather than nesting waits.
+    pub(super) fn with_document_images<T, E: From<AccessError>>(&self, handle: u64,
+        work: impl FnOnce(&mut ReaderSession, &mut dyn FnMut() -> bool) -> Result<T, E>,
+        mut canceled: impl FnMut() -> bool) -> Result<T, E> {
+        let cell = self.get(handle)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let mut state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        if canceled() { return Err(AccessError::Canceled.into()); }
+        let reader = state.as_mut().ok_or(AccessError::NotOpen)?;
+        let result = work(reader, &mut || cell.validate(epoch).is_err() || canceled());
+        cell.validate(epoch)?;
+        if canceled() { return Err(AccessError::Canceled.into()); }
+        result
+    }
     /// Borrow both reader cells without waiting on either. Different owner
     /// handles explicitly authorize the host comparison adapter's private
     /// source transfer; no generic same-owner analysis check is bypassed.

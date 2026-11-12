@@ -239,6 +239,31 @@ char *fcb_saved_open_member_reader(uint64_t handle, uint64_t reader,
 char *fcb_saved_open_relationship_reader(uint64_t handle, uint64_t reader,
     uint64_t generation, uint64_t link_id, uint64_t side);
 
+/* Archive-only Markdown images. The reader must already contain the exact
+ * captured source_member and a prepared document display at document_generation.
+ * Authorization checks archive member path/length/digest against the reader;
+ * acquisition resolves only an upstream image item/request to a captured member.
+ * No source label is opened as a native path and no live root grant is created.
+ *
+ * Success uses fcb.reader-session/1 with saved_archive_owner, saved_archive_digest,
+ * saved_source_member, source_relative and live_root_authority=false. Prepared
+ * images also identify image_member/image_archive_digest and carry the first
+ * bounded encoded chunk. Failure uses fcb.saved-repository/1 for the saved handle.
+ * Free every non-null response once with fcb_free_string.
+ *
+ * Existing limits: 4 MiB per image, 8 MiB/16 encoded images per reader/display,
+ * 64 KiB chunks; archive limits may be smaller. PNG/JPEG admission checks only
+ * signatures; the host decoder must enforce dimensions/frames/pixel budgets.
+ * fcb_reader_document_image_chunk replays admitted bytes after archive close.
+ * New authorization/acquisition requires the still-open saved handle.
+ * Both functions are synchronous worker calls and cancel with either handle.
+ */
+char *fcb_saved_document_images_authorize(uint64_t handle, uint64_t reader,
+    uint64_t source_member, uint64_t document_generation);
+char *fcb_saved_document_image_prepare(uint64_t handle, uint64_t reader,
+    uint64_t source_member, uint64_t document_generation,
+    uint64_t item_index, uint64_t request_id);
+
 /* Cooperative cancel changes the operation epoch without waiting on source.
  * Close removes authority and cancels work, but does not close delivered readers
  * or free response strings. Close can reclaim memory and must run on a worker.

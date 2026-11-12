@@ -533,6 +533,7 @@ pub mod desk;
 
 /// Parsed Markdown links and reverse backlinks in the closed saved manifest.
 pub mod relationships;
+pub mod images;
 pub use relationships::{RelationshipDirection, RelationshipSide, SavedRelationshipError};
 
 /// Bounded symbol, Markdown heading and whole-token searches of saved members.

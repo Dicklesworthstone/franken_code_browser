@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
 
 //! Explicit native-worker acquisition of local image bytes. A reader's path
-//! remains a label: authority requires a separately supplied current root and
-//! relative source path, followed by an exact comparison with retained source.
-//! The upstream display supplies every image occurrence and destination.
+//! remains a label: current-source authority requires a separately supplied root
+//! and exact retained-source comparison; saved authority requires a verified
+//! archive member with the same raw path and digest. Saved labels are never
+//! reopened as native paths. The upstream display owns occurrences/destinations.
 //! Encoded captures are immutable; native ImageIO owns real decoding and its
 //! independent dimension/frame/pixel/thumbnail budgets. No synthetic decoder,
 //! network client, filesystem include, source mutation or layout engine exists
@@ -11,7 +12,8 @@
 //! observed symlinks are refused, but hostile ancestor races are not qualified.
 
 use std::{fs, mem::size_of, path::{Component, Path, PathBuf}};
-use fcb::ByteLength;
+use fcb::{ArenaOwnerId, ByteLength};
+use fcb::search::paged_snapshot::VerifiedMember;
 use fcb::document::{ImageCodecValidator, ImageFormat, resolve_document_destination};
 use fcb::source::{CaptureRequest, DirectoryId, NormalizedPath, RawPath, RootGrant, SourceError};
 use fcb::store::Sha256Digest;
@@ -30,7 +32,7 @@ const MAX_ASSET_PATH_BYTES: usize = 16_384;
 pub enum DocumentImageError {
     NotAuthorized, OriginMismatch, OriginChanged, DifferentAuthority,
     UnsupportedDestination, UnsupportedFormat, CacheLimit, MissingImage,
-    InvalidLimits, InvalidRange,
+    InvalidLimits, InvalidRange, MissingSavedMember, UnavailableSavedMember,
 }
 impl DocumentImageError {
     pub const fn code(self) -> &'static str {
@@ -45,6 +47,8 @@ impl DocumentImageError {
             Self::MissingImage => "DOCUMENT_IMAGE_NOT_PREPARED",
             Self::InvalidLimits => "DOCUMENT_IMAGE_INVALID_LIMITS",
             Self::InvalidRange => "DOCUMENT_IMAGE_INVALID_RANGE",
+            Self::MissingSavedMember => "DOCUMENT_IMAGE_SAVED_MEMBER_MISSING",
+            Self::UnavailableSavedMember => "DOCUMENT_IMAGE_SAVED_MEMBER_UNAVAILABLE",
         }
     }
 }
@@ -56,12 +60,34 @@ impl From<DocumentImageError> for ReaderSessionError {
     fn from(error: DocumentImageError) -> Self { Self::DocumentImage(error) }
 }
 
+enum ImageData {
+    Current(HostBytes),
+    Saved { member: VerifiedMember, read_calls: u64 },
+}
+impl ImageData {
+    fn bytes(&self) -> &[u8] {
+        match self { Self::Current(data) => &data.bytes, Self::Saved { member, .. } => member.bytes() }
+    }
+    fn read_calls(&self) -> u64 {
+        match self { Self::Current(data) => data.read_calls, Self::Saved { read_calls, .. } => *read_calls }
+    }
+}
 struct RetainedImage {
     item_index: usize,
     request_id: u64,
-    data: HostBytes,
+    data: ImageData,
     digest: Sha256Digest,
     format: ImageFormat,
+}
+struct CurrentImageAuthority {
+    requested_root: PathBuf,
+    root: PathBuf,
+    root_identity: DirectoryId,
+    grant: RootGrant,
+}
+enum ImageAuthority {
+    Current(CurrentImageAuthority),
+    Saved { owner: ArenaOwnerId, archive: Sha256Digest, source_member: usize },
 }
 
 pub(super) struct DocumentImages {
@@ -69,10 +95,7 @@ pub(super) struct DocumentImages {
     width_points: u32,
     source: CaptureRequest,
     source_digest: Sha256Digest,
-    requested_root: PathBuf,
-    root: PathBuf,
-    root_identity: DirectoryId,
-    grant: RootGrant,
+    authority: ImageAuthority,
     source_relative: NormalizedPath,
     images: Vec<RetainedImage>,
     bytes: usize,
@@ -80,15 +103,38 @@ pub(super) struct DocumentImages {
 }
 impl DocumentImages {
     fn validate_active(&self) -> Result<(), ReaderSessionError> {
-        self.grant.validate_active()?;
-        let metadata = fs::symlink_metadata(&self.root).map_err(|_| AppError::SourceChanged)?;
+        let current = self.current()?;
+        current.grant.validate_active()?;
+        let metadata = fs::symlink_metadata(&current.root).map_err(|_| AppError::SourceChanged)?;
         if metadata.file_type().is_symlink() || !metadata.is_dir()
-            || DirectoryId::from_path(&self.root).map_err(|_| AppError::SourceChanged)? != self.root_identity
-            || fs::canonicalize(&self.root).map_err(|_| AppError::SourceChanged)? != self.root {
+            || DirectoryId::from_path(&current.root).map_err(|_| AppError::SourceChanged)? != current.root_identity
+            || fs::canonicalize(&current.root).map_err(|_| AppError::SourceChanged)? != current.root {
             return Err(AppError::SourceChanged.into());
         }
-        self.grant.validate_active()?;
+        current.grant.validate_active()?;
         Ok(())
+    }
+    fn current(&self) -> Result<&CurrentImageAuthority, ReaderSessionError> {
+        match &self.authority {
+            ImageAuthority::Current(current) => Ok(current),
+            ImageAuthority::Saved { .. } => Err(DocumentImageError::DifferentAuthority.into()),
+        }
+    }
+    fn matches_saved(&self, owner: ArenaOwnerId, archive: Sha256Digest, source_member: usize) -> bool {
+        matches!(&self.authority, ImageAuthority::Saved { owner: accepted, archive: digest, source_member: member }
+            if owner == *accepted && archive == *digest && source_member == *member)
+    }
+    fn source_authority(&self) -> &'static str {
+        match &self.authority {
+            ImageAuthority::Current(_) => "verified-current-source",
+            ImageAuthority::Saved { .. } => "verified-saved-member",
+        }
+    }
+    fn image_observation(&self) -> &'static str {
+        match &self.authority {
+            ImageAuthority::Current(_) => "current-root-capture",
+            ImageAuthority::Saved { .. } => "verified-saved-member",
+        }
     }
     fn image(&self, item_index: usize, request_id: u64) -> Option<&RetainedImage> {
         self.images.iter().find(|image| image.item_index == item_index && image.request_id == request_id)
@@ -113,7 +159,7 @@ impl ReaderSession {
         }
         if let Some(assets) = &self.document_images {
             self.image_snapshot(generation)?;
-            if assets.requested_root.as_os_str() != root.as_os_str()
+            if assets.current()?.requested_root.as_os_str() != root.as_os_str()
                 || assets.source_relative.as_bytes() != source_relative {
                 return Err(DocumentImageError::DifferentAuthority.into());
             }
@@ -157,10 +203,12 @@ impl ReaderSession {
         images.try_reserve_exact(MAX_DOCUMENT_IMAGES).map_err(|_| AppError::Admission)?;
         if images.capacity() > MAX_DOCUMENT_IMAGES { return Err(AppError::Admission.into()); }
         let candidate = DocumentImages { generation, width_points, source: *self.capture.request(),
-            source_digest: self.capture_sha256, requested_root, root: canonical_root, root_identity,
-            grant, source_relative: relative, images, bytes: 0, _lease: lease };
+            source_digest: self.capture_sha256,
+            authority: ImageAuthority::Current(CurrentImageAuthority {
+                requested_root, root: canonical_root, root_identity, grant }),
+            source_relative: relative, images, bytes: 0, _lease: lease };
         candidate.validate_active()?; check(&mut canceled)?;
-        let source = workspace::checked_source_path(&candidate.root, &candidate.source_relative)?;
+        let source = workspace::checked_source_path(&candidate.current()?.root, &candidate.source_relative)?;
         let (bytes_read, read_calls) = {
             let result = {
                 let mut stop = || canceled() || candidate.validate_active().is_err();
@@ -189,13 +237,128 @@ impl ReaderSession {
         Ok(response)
     }
 
+    /// Archive authority is supplied only by the saved-repository adapter after
+    /// its directory identifies the exact retained Markdown path, bytes and
+    /// digest. No native root/path capability is created or retained here.
+    pub(crate) fn authorize_saved_document_images(&mut self, generation: u64,
+        archive_owner: ArenaOwnerId, archive: Sha256Digest, source_member: usize,
+        source_relative: &[u8], source_digest: Sha256Digest,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
+        check(&mut canceled)?;
+        let width_points = self.display_snapshot(generation)?.width_points();
+        if archive_owner == self.owner() || source_relative.is_empty()
+            || source_relative.len() > MAX_ASSET_PATH_BYTES {
+            return Err(DocumentImageError::InvalidLimits.into());
+        }
+        if source_digest != self.capture_sha256
+            || RawPath::from_path(&self.path).as_bytes() != source_relative {
+            return Err(DocumentImageError::OriginMismatch.into());
+        }
+        if let Some(assets) = &self.document_images {
+            self.image_snapshot(generation)?;
+            if !assets.matches_saved(archive_owner, archive, source_member)
+                || assets.source_relative.as_bytes() != source_relative {
+                return Err(DocumentImageError::DifferentAuthority.into());
+            }
+            return self.image_authorization_response(generation, None, 0, 0, &mut canceled);
+        }
+        let [allocation] = self.allocations()?;
+        let charge = MAX_DOCUMENT_IMAGE_CACHE_BYTES + 256 * 1024 + size_of::<DocumentImages>();
+        let lease = self.budget.try_reserve_managed(self.owner(), allocation,
+            ByteLength::new(charge as u64)).map_err(|_| AppError::Admission)?;
+        let relative = NormalizedPath::new(RawPath::from_bytes(source_relative))?;
+        if relative.as_bytes() != source_relative || std::str::from_utf8(source_relative).is_err() {
+            return Err(DocumentImageError::OriginMismatch.into());
+        }
+        let mut images = Vec::new();
+        images.try_reserve_exact(MAX_DOCUMENT_IMAGES).map_err(|_| AppError::Admission)?;
+        if images.capacity() > MAX_DOCUMENT_IMAGES { return Err(AppError::Admission.into()); }
+        let candidate = DocumentImages { generation, width_points, source: *self.capture.request(),
+            source_digest,
+            authority: ImageAuthority::Saved { owner: archive_owner, archive, source_member },
+            source_relative: relative, images, bytes: 0, _lease: lease };
+        let response = self.image_authorization_response(generation, Some(&candidate), 0, 0, &mut canceled)?;
+        check(&mut canceled)?;
+        self.document_images = Some(candidate);
+        Ok(response)
+    }
+
+    /// Resolve only an image occurrence admitted by the immutable upstream
+    /// display. A cached occurrence returns no path and performs no archive I/O.
+    /// The saved adapter uses this path strictly as an archive-member key.
+    pub(crate) fn saved_document_image_path(&self, generation: u64,
+        archive_owner: ArenaOwnerId, archive: Sha256Digest, source_member: usize,
+        item_index: usize, request_id: u64) -> Result<Option<(String, usize)>, ReaderSessionError> {
+        let image = self.display_snapshot(generation)?.image_request(item_index, request_id)?;
+        let assets = self.image_snapshot(generation)?;
+        if !assets.matches_saved(archive_owner, archive, source_member) {
+            return Err(DocumentImageError::DifferentAuthority.into());
+        }
+        if assets.image(item_index, request_id).is_some() { return Ok(None); }
+        if assets.images.len() >= MAX_DOCUMENT_IMAGES || assets.bytes >= MAX_DOCUMENT_IMAGE_CACHE_BYTES {
+            return Err(DocumentImageError::CacheLimit.into());
+        }
+        let destination = image.destination.trim();
+        if destination.is_empty() || destination.starts_with('/') || destination.starts_with('\\')
+            || destination.chars().any(char::is_control) {
+            return Err(DocumentImageError::UnsupportedDestination.into());
+        }
+        let source = std::str::from_utf8(assets.source_relative.as_bytes())
+            .map_err(|_| DocumentImageError::UnsupportedDestination)?;
+        let (path, suffix) = resolve_document_destination(source, image.destination)
+            .ok_or(DocumentImageError::UnsupportedDestination)?;
+        if !suffix.is_empty() || path.len() > MAX_ASSET_PATH_BYTES {
+            return Err(DocumentImageError::UnsupportedDestination.into());
+        }
+        let relative = NormalizedPath::new(RawPath::from_bytes(path.as_bytes()))?;
+        if relative.as_bytes() != path.as_bytes() { return Err(SourceError::PathEscape.into()); }
+        Ok(Some((path, MAX_DOCUMENT_IMAGE_BYTES.min(MAX_DOCUMENT_IMAGE_CACHE_BYTES - assets.bytes))))
+    }
+
+    /// The archive-owned verified member brings its managed-byte lease into the
+    /// same bounded reader cache as current-root images. It owns no open archive
+    /// or root grant; already admitted chunks survive archive closure.
+    pub(crate) fn retain_saved_document_image(&mut self, generation: u64,
+        archive_owner: ArenaOwnerId, archive: Sha256Digest, source_member: usize,
+        item_index: usize, request_id: u64, data: Option<(VerifiedMember, u64)>,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
+        check(&mut canceled)?;
+        let path = self.saved_document_image_path(generation, archive_owner, archive,
+            source_member, item_index, request_id)?;
+        let Some((member, read_calls)) = data else {
+            if path.is_some() { return Err(DocumentImageError::MissingImage.into()); }
+            return self.image_response("document-image-prepare", generation, item_index, request_id,
+                None, 0, MAX_DOCUMENT_IMAGE_CHUNK, &mut canceled);
+        };
+        let (_, limit) = path.ok_or(DocumentImageError::InvalidRange)?;
+        if member.archive_digest() != archive || member.bytes().is_empty() || member.bytes().len() > limit {
+            return Err(DocumentImageError::InvalidLimits.into());
+        }
+        let format = match ImageCodecValidator::sniff_format(member.bytes()) {
+            Some(format @ (ImageFormat::Png | ImageFormat::Jpeg)) => format,
+            _ => return Err(DocumentImageError::UnsupportedFormat.into()),
+        };
+        let digest = member.source_digest();
+        let candidate = RetainedImage { item_index, request_id, digest, format,
+            data: ImageData::Saved { member, read_calls } };
+        let response = self.image_response("document-image-prepare", generation, item_index, request_id,
+            Some(&candidate), 0, MAX_DOCUMENT_IMAGE_CHUNK, &mut canceled)?;
+        check(&mut canceled)?;
+        let assets = self.document_images.as_mut().ok_or(DocumentImageError::NotAuthorized)?;
+        assets.bytes += candidate.data.bytes().len();
+        assets.images.push(candidate);
+        Ok(response)
+    }
+
     fn image_authorization_response(&mut self, generation: u64, candidate: Option<&DocumentImages>,
         bytes_read: u64, read_calls: u64, canceled: &mut impl FnMut() -> bool)
         -> Result<HostResponse, ReaderSessionError> {
         let mut out = self.output_with_source_reads("document-images-authorize", bytes_read)?;
         let assets = match candidate { Some(assets) => assets, None => self.image_snapshot(generation)? };
         image_summary(&mut out, assets, assets.bytes, assets.images.len())?;
-        out.literal(",\"images_authorized\":true,\"source_authority\":\"verified-current-source\",\"authorization_reused\":")?;
+        out.literal(",\"images_authorized\":true,\"source_authority\":")?;
+        out.quoted(assets.source_authority())?;
+        out.literal(",\"authorization_reused\":")?;
         out.boolean(candidate.is_none())?;
         out.literal(",\"source_verification_bytes_read\":")?; out.integer(bytes_read)?;
         out.literal(",\"source_verification_read_calls\":")?; out.integer(read_calls)?;
@@ -213,6 +376,7 @@ impl ReaderSession {
         check(&mut canceled)?;
         let image = self.display_snapshot(generation)?.image_request(item_index, request_id)?;
         let assets = self.image_snapshot(generation)?;
+        assets.current()?;
         if assets.image(item_index, request_id).is_some() {
             return self.image_response("document-image-prepare", generation, item_index, request_id,
                 None, 0, MAX_DOCUMENT_IMAGE_CHUNK, &mut canceled);
@@ -237,7 +401,7 @@ impl ReaderSession {
         let relative = NormalizedPath::new(RawPath::from_bytes(path.as_bytes()))?;
         if relative.as_bytes() != path.as_bytes() { return Err(SourceError::PathEscape.into()); }
         assets.validate_active()?; check(&mut canceled)?;
-        let native = workspace::checked_source_path(&assets.root, &relative)?;
+        let native = workspace::checked_source_path(&assets.current()?.root, &relative)?;
         let limit = MAX_DOCUMENT_IMAGE_BYTES.min(MAX_DOCUMENT_IMAGE_CACHE_BYTES - assets.bytes);
         let result = {
             let mut stop = || canceled() || assets.validate_active().is_err();
@@ -253,12 +417,12 @@ impl ReaderSession {
             _ => return Err(DocumentImageError::UnsupportedFormat.into()),
         };
         let digest = source_sha256(&data.bytes, &mut canceled)?;
-        let candidate = RetainedImage { item_index, request_id, data, digest, format };
+        let candidate = RetainedImage { item_index, request_id, data: ImageData::Current(data), digest, format };
         let response = self.image_response("document-image-prepare", generation, item_index, request_id,
             Some(&candidate), 0, MAX_DOCUMENT_IMAGE_CHUNK, &mut canceled)?;
         self.image_snapshot(generation)?.validate_active()?; check(&mut canceled)?;
         let assets = self.document_images.as_mut().ok_or(DocumentImageError::NotAuthorized)?;
-        assets.bytes += candidate.data.bytes.len();
+        assets.bytes += candidate.data.bytes().len();
         assets.images.push(candidate);
         Ok(response)
     }
@@ -280,7 +444,7 @@ impl ReaderSession {
             || assets.source != *self.capture.request() || assets.source_digest != self.capture_sha256 {
             return Err(DocumentImageError::OriginMismatch.into());
         }
-        assets.grant.validate_active()?;
+        if let ImageAuthority::Current(current) = &assets.authority { current.grant.validate_active()?; }
         Ok(assets)
     }
 
@@ -298,12 +462,12 @@ impl ReaderSession {
         let assets = self.image_snapshot(generation)?;
         let image = candidate.or_else(|| assets.image(item_index, request_id))
             .ok_or(DocumentImageError::MissingImage)?;
-        if image.item_index != item_index || image.request_id != request_id || offset > image.data.bytes.len() {
+        if image.item_index != item_index || image.request_id != request_id || offset > image.data.bytes().len() {
             return Err(DocumentImageError::InvalidRange.into());
         }
-        let end = offset.saturating_add(count).min(image.data.bytes.len());
+        let end = offset.saturating_add(count).min(image.data.bytes().len());
         image_summary(&mut out, assets,
-            assets.bytes + candidate.map_or(0, |image| image.data.bytes.len()),
+            assets.bytes + candidate.map_or(0, |image| image.data.bytes().len()),
             assets.images.len() + usize::from(candidate.is_some()))?;
         out.literal(",\"item_index\":")?; out.integer(item_index as u64)?;
         out.literal(",\"request_id\":")?; out.integer(request_id)?;
@@ -313,17 +477,22 @@ impl ReaderSession {
         out.literal(",\"image_format\":")?;
         out.quoted(match image.format { ImageFormat::Png => "png", ImageFormat::Jpeg => "jpeg",
             _ => return Err(DocumentImageError::UnsupportedFormat.into()) })?;
-        out.literal(",\"format_validation\":\"signature-only\",\"decoded\":false,\"image_observation\":\"current-root-capture\"")?;
-        out.literal(",\"total_image_bytes\":")?; out.integer(image.data.bytes.len() as u64)?;
+        out.literal(",\"format_validation\":\"signature-only\",\"decoded\":false,\"image_observation\":")?;
+        out.quoted(assets.image_observation())?;
+        if let ImageData::Saved { member, .. } = &image.data {
+            out.literal(",\"image_member\":")?; out.integer(member.ordinal() as u64)?;
+            out.literal(",\"image_archive_digest\":")?; out.quoted(&member.archive_digest().to_hex())?;
+        }
+        out.literal(",\"total_image_bytes\":")?; out.integer(image.data.bytes().len() as u64)?;
         out.literal(",\"image_offset\":")?; out.integer(offset as u64)?;
         out.literal(",\"image_bytes\":")?; out.integer((end - offset) as u64)?;
-        out.literal(",\"image_hex\":")?; out.hex(&image.data.bytes[offset..end])?;
+        out.literal(",\"image_hex\":")?; out.hex(&image.data.bytes()[offset..end])?;
         out.literal(",\"next_image_offset\":")?;
-        if end < image.data.bytes.len() { out.integer(end as u64)?; } else { out.literal("null")?; }
+        if end < image.data.bytes().len() { out.integer(end as u64)?; } else { out.literal("null")?; }
         out.literal(",\"image_bytes_read\":")?;
-        out.integer(candidate.map_or(0, |image| image.data.bytes.len() as u64))?;
+        out.integer(candidate.map_or(0, |image| image.data.bytes().len() as u64))?;
         out.literal(",\"image_read_calls\":")?;
-        out.integer(candidate.map_or(0, |image| image.data.read_calls))?;
+        out.integer(candidate.map_or(0, |image| image.data.read_calls()))?;
         out.literal("}\n")?;
         self.finish_output(out, EXIT_OK, canceled)
     }
@@ -334,8 +503,18 @@ fn image_summary(out: &mut Output, assets: &DocumentImages, retained_bytes: usiz
     out.literal(",\"document_generation\":")?; out.integer(assets.generation)?;
     out.literal(",\"display_width_points\":")?; out.integer(assets.width_points as u64)?;
     out.literal(",\"capture_sha256\":")?; out.quoted(&assets.source_digest.to_hex())?;
-    out.literal(",\"requested_root\":")?; out.path(&assets.requested_root)?;
-    out.literal(",\"asset_root\":")?; out.path(&assets.root)?;
+    match &assets.authority {
+        ImageAuthority::Current(current) => {
+            out.literal(",\"requested_root\":")?; out.path(&current.requested_root)?;
+            out.literal(",\"asset_root\":")?; out.path(&current.root)?;
+        }
+        ImageAuthority::Saved { owner, archive, source_member } => {
+            out.literal(",\"saved_archive_owner\":")?; out.integer(owner.get())?;
+            out.literal(",\"saved_archive_digest\":")?; out.quoted(&archive.to_hex())?;
+            out.literal(",\"saved_source_member\":")?; out.integer(*source_member as u64)?;
+            out.literal(",\"live_root_authority\":false")?;
+        }
+    }
     out.literal(",\"source_relative\":")?; out.path(&assets.source_relative.raw().to_path_buf())?;
     for (key, value) in [("max_image_bytes", MAX_DOCUMENT_IMAGE_BYTES),
         ("max_image_cache_bytes", MAX_DOCUMENT_IMAGE_CACHE_BYTES), ("max_images", MAX_DOCUMENT_IMAGES),
