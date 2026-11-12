@@ -93,7 +93,7 @@ impl ReaderSession {
         self.finish_output(out, EXIT_OK, &mut canceled)
     }
 
-    fn display_snapshot(&self, generation: u64) -> Result<&NativeDocumentDisplay, ReaderSessionError> {
+    pub(super) fn display_snapshot(&self, generation: u64) -> Result<&NativeDocumentDisplay, ReaderSessionError> {
         self.document_snapshot(generation)?;
         let display = self.document_display.as_ref().ok_or(NativeDisplayError::MissingDisplay)?;
         display.validate_delivery(&self.capture, generation)?;

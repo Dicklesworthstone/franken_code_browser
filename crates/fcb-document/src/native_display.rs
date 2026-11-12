@@ -76,6 +76,20 @@ pub struct NativeDocumentDisplay {
     _lease: ResourceLease,
 }
 
+/// One upstream image occurrence in this exact source-qualified display.
+/// The request ID is an upstream identifier, not a display index or a path.
+/// These borrowed values authorize no I/O; the host supplies a separate root
+/// capability and keeps any returned bytes bound to this layout generation.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeImageRequest<'display> {
+    pub item_index: usize,
+    pub request_id: u64,
+    pub destination: &'display str,
+    pub alt_text: &'display str,
+    pub bounds: DisplayRect,
+    pub enclosing_original_range: ByteRange,
+}
+
 impl NativeDocumentDisplay {
     /// Prepare on the host worker. The shared parser is bounded-input but not
     /// preemptible. Emission and shaping poll cancellation between bounded units.
@@ -154,6 +168,21 @@ impl NativeDocumentDisplay {
     pub fn unresolved_images(&self) -> usize { self.unresolved_images }
     pub fn glyph_count(&self) -> usize { self.glyph_count }
     pub fn font_count(&self) -> usize { self.font_ids.len() }
+
+    /// Select only a retained parser-produced image occurrence. Unqualified
+    /// block provenance leaves the image readable as a placeholder, but cannot
+    /// acquire the source authority used by a native asset request.
+    pub fn image_request(&self, item_index: usize, request_id: u64)
+        -> Result<NativeImageRequest<'_>, NativeDisplayError> {
+        let Some(DisplayItem::Image(image)) = self.display.items().get(item_index) else {
+            return Err(NativeDisplayError::InvalidRange);
+        };
+        if image.request_id != request_id { return Err(NativeDisplayError::InvalidRange); }
+        let enclosing_original_range = self.original_range(item_index)?
+            .filter(|range| !range.is_empty()).ok_or(NativeDisplayError::InvalidOutput)?;
+        Ok(NativeImageRequest { item_index, request_id, destination: &image.destination,
+            alt_text: &image.alt_text, bounds: self.display.items()[item_index].bounds(), enclosing_original_range })
+    }
 
     pub fn validate_delivery(&self, capture: &CompleteCapture, generation: u64)
         -> Result<(), NativeDisplayError> {

@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 //! A retained native-host reading session over ONE immutable source capture.
-//! Only `open` performs filesystem I/O. Windows, physical-line navigation,
+//! `open` and explicitly authorized document image acquisition perform I/O.
+//! Windows, physical-line navigation,
 //! search, outlines, Markdown previews and exact copies use retained bytes.
 //! Live opening and safe supplied captures admit at most 32 MiB in full; this
 //! is not out-of-core storage. Windows/copies remain at most 256 KiB, while
@@ -19,6 +20,7 @@ mod selection;
 mod search;
 pub(crate) mod document;
 mod document_display;
+mod document_images;
 mod document_links;
 #[cfg(test)]
 mod shared_tests;
@@ -26,6 +28,8 @@ pub use outline::{ReaderOutlineOptions, MAX_READER_SYMBOL_PAGE, MAX_READER_SYMBO
 pub use references::{MAX_READER_REFERENCE_PAGE, MAX_READER_REFERENCE_NAME_BYTES,
     MAX_READER_REFERENCES, MAX_READER_REFERENCE_SOURCE_BYTES};
 pub use document::{DocumentCopyMode, ReaderDocumentOptions, MAX_READER_DOCUMENT_PAGE};
+pub use document_images::{DocumentImageError, MAX_DOCUMENT_IMAGE_BYTES,
+    MAX_DOCUMENT_IMAGE_CACHE_BYTES, MAX_DOCUMENT_IMAGE_CHUNK, MAX_DOCUMENT_IMAGES};
 pub use comparison::ReaderComparisonLimits;
 pub use position::ReaderColumnKind;
 pub use selection::MAX_READER_SELECTION_WINDOW_BYTES;
@@ -69,6 +73,7 @@ pub enum ReaderSessionError {
     Reference(fcb::search::symbols::ReferenceError), MissingReferences,
     Document(fcb::document::reader::DocumentReadError), MissingDocument,
     DocumentDisplay(fcb::document::native_display::NativeDisplayError),
+    DocumentImage(DocumentImageError),
     DocumentLinks(fcb::document::links::DocumentLinkError), MissingDocumentLinks, MissingDocumentLink,
     Comparison(fcb::analysis::comparison::ComparisonError),
     Query(fcb::search::QueryError),
@@ -81,6 +86,7 @@ impl std::fmt::Display for ReaderSessionError {
             Self::View(e) => write!(f, "{e}"), Self::Lines(e) => write!(f, "{e}"),
             Self::Symbol(e) => write!(f, "{e}"), Self::Document(e) => write!(f, "{e}"),
             Self::DocumentDisplay(e) => write!(f, "{e}"),
+            Self::DocumentImage(e) => write!(f, "{e}"),
             Self::Reference(e) => write!(f, "{e}"),
             Self::DocumentLinks(e) => write!(f, "{e}"),
             Self::Comparison(e) => write!(f, "{e}"),
@@ -163,6 +169,7 @@ pub struct ReaderSession {
     last_reference_attempt: u64,
     document: Option<fcb::document::reader::DocumentReader<'static>>,
     document_display: Option<fcb::document::native_display::NativeDocumentDisplay>,
+    document_images: Option<document_images::DocumentImages>,
     document_links: Option<document_links::AcceptedDocumentLinks>,
     last_document_attempt: u64,
     last_comparison_attempt: u64,
@@ -225,7 +232,7 @@ impl ReaderSession {
             line_checkpoints: std::array::from_fn(|_| None), source_bytes_read: 0, read_calls: 0,
             file_observation: false, query: None, last_query_attempt: 0,
             outline: None, last_outline_attempt: 0, references: None, last_reference_attempt: 0,
-            document: None, document_display: None, document_links: None, last_document_attempt: 0,
+            document: None, document_display: None, document_images: None, document_links: None, last_document_attempt: 0,
             last_comparison_attempt: 0, next_allocation: 3,
             budget, _source_lease: source_lease, _state_lease: state_lease }
     }
@@ -494,6 +501,10 @@ impl ReaderSession {
         Ok(std::array::from_fn(|i| ResourceAllocationId::new(first + i as u64).expect("nonzero checked allocation")))
     }
     fn output(&mut self, command: &str) -> Result<Output, ReaderSessionError> {
+        self.output_with_source_reads(command, 0)
+    }
+    fn output_with_source_reads(&mut self, command: &str, source_bytes_read: u64)
+        -> Result<Output, ReaderSessionError> {
         let [id] = self.allocations()?;
         let mut out = Output::new(self.owner(), MAX_RESPONSE_BYTES, &self.budget, id)?;
         out.literal("{\"schema\":\"fcb.reader-session/1\",\"status\":\"ok\",\"command\":")?; out.quoted(command)?;
@@ -502,7 +513,8 @@ impl ReaderSession {
         out.literal(",\"source_revision\":")?; out.integer(self.capture.request().revision().get())?;
         out.literal(",\"path\":")?; out.path(&self.path)?;
         out.literal(",\"captured_bytes\":")?; out.integer(self.length())?;
-        out.literal(",\"additional_source_bytes_read\":\"0\",\"native_presented\":false,\"encoding\":")?;
+        out.literal(",\"additional_source_bytes_read\":")?; out.integer(source_bytes_read)?;
+        out.literal(",\"native_presented\":false,\"encoding\":")?;
         out.quoted(match self.encoding { DetectedEncoding::Utf16Le => "utf16le", DetectedEncoding::Utf16Be => "utf16be",
             DetectedEncoding::Utf8 { .. } => "utf8", _ => "unsupported" })?;
         Ok(out)

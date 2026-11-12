@@ -101,6 +101,9 @@ pub(super) enum Command<'a> {
     DocumentDisplayPage { generation: u64, first: usize, count: usize },
     DocumentDisplayFromSource { generation: u64, offset: u64, count: usize },
     DocumentDisplayFont { generation: u64, index: usize, offset: usize, count: usize },
+    DocumentImagesAuthorize { generation: u64, root: &'a Path, source_relative: &'a [u8] },
+    DocumentImagePrepare { generation: u64, item_index: usize, request_id: u64 },
+    DocumentImageChunk { generation: u64, item_index: usize, request_id: u64, offset: usize, count: usize },
     DocumentHeadings { generation: u64, first: usize, count: usize },
     DocumentHeading { generation: u64, slug: &'a str, count: usize },
     DocumentLinksPrepare { generation: u64, max_links: usize },
@@ -320,6 +323,12 @@ impl ReaderSessions {
             Command::DocumentDisplayPage { generation, first, count } => reader.document_display_page(generation, first, count, &mut stop),
             Command::DocumentDisplayFromSource { generation, offset, count } => reader.document_display_from_source(generation, offset, count, &mut stop),
             Command::DocumentDisplayFont { generation, index, offset, count } => reader.document_display_font(generation, index, offset, count, &mut stop),
+            Command::DocumentImagesAuthorize { generation, root, source_relative } =>
+                reader.authorize_document_images(generation, root, source_relative, &mut stop),
+            Command::DocumentImagePrepare { generation, item_index, request_id } =>
+                reader.prepare_document_image(generation, item_index, request_id, &mut stop),
+            Command::DocumentImageChunk { generation, item_index, request_id, offset, count } =>
+                reader.document_image_chunk(generation, item_index, request_id, offset, count, &mut stop),
             Command::DocumentHeadings { generation, first, count } => reader.document_headings(generation, first, count, &mut stop),
             Command::DocumentHeading { generation, slug, count } => reader.document_at_heading(generation, slug, count, &mut stop),
             Command::DocumentLinksPrepare { generation, max_links } => reader.prepare_document_links(generation, max_links, &mut stop),

@@ -9,7 +9,9 @@ extern "C" {
 /* Retained Markdown on an existing OPEN reader, including a captured atlas hit.
  * Every call is synchronous HOST-WORKER work. Preparation/reflow calls the shared
  * FrankenMarkdown engine; viewport/heading/copy/navigation calls reuse its output.
- * No source path is reopened and no asset or external URL is fetched. Link
+ * Ordinary document/layout calls do no source or asset I/O. Only the explicit
+ * local-image authorization/read calls below may open current files. No external
+ * URL is fetched. Link
  * activation below navigates only the same captured document's qualified anchors.
  * No native font shaping, glyph-exact mapping or actual presentation is claimed.
  * Returned JSON uses fcb.reader-session/1. Check status; non-null can be an error.
@@ -53,8 +55,9 @@ char *fcb_reader_document_window(uint64_t handle, uint64_t generation,
  * The bounded simple-script font profile can refuse unsupported writing systems;
  * DOCUMENT_DISPLAY_SHAPING_UNSUPPORTED is an explicit logical-preview fallback.
  * Current cap: 64KiB source, 8192 items, 131072 glyphs, 4096 glyphs per run,
- * six exact font faces and 8MiB total font bytes. Assets are never loaded.
- * Math/diagrams can remain upstream text; unresolved images remain placeholders.
+ * six exact font faces and 8MiB total font bytes. Layout does not load assets.
+ * Math/diagrams can remain upstream text. Image slots may be filled separately
+ * through the explicit local-image API below; upstream layout stays unchanged.
  * Source ranges are optional qualified enclosing AST blocks, never glyph ranges.
  * Geometry/font sizes are finite JSON NUMBERS; identities/counts are STRINGS.
  * Prepare returns the first <=64 items, with page and font inventory metadata.
@@ -88,6 +91,55 @@ char *fcb_reader_document_display_from_source(uint64_t handle, uint64_t generati
  */
 char *fcb_reader_document_display_font(uint64_t handle, uint64_t generation,
     uint64_t font_index, uint64_t offset, uint64_t count);
+
+/* Optional CURRENT local-image access, separate from retained Markdown layout.
+ * root is a current host-granted absolute UTF-8 folder, NUL-terminated, 1..16384
+ * bytes. source_relative is 1..16384 raw native path bytes, without NUL; this is
+ * the selected Markdown path relative to root, never an escaped display label.
+ * Inputs remain readable/immutable through return. The host must retain its
+ * native root grant until all calls and reader retirement drain. This API does
+ * not acquire native access from stored paths.
+ *
+ * The host verifies the current source's complete bounded bytes against the
+ * retained capture before authorizing any image. A changed source is refused.
+ * Authorization is bound to reader/capture/document generation and this exact
+ * root/path. Repeating the same accepted grant reuses it; replacement requires a
+ * fresh document generation. Reflow/clear drops authority and encoded images.
+ * The first successful call reports its source verification reads honestly;
+ * ordinary layout/prepare/chunk calls never claim those reads as retained I/O.
+ *
+ * Root/path checks use the host's current no-follow source policy. They reject
+ * symlink components and observed identity changes; hostile ancestor replacement
+ * between pathname checks is not an atomic descriptor-root confinement claim.
+ */
+char *fcb_reader_document_images_authorize(uint64_t handle, uint64_t generation,
+    const char *root, const uint8_t *source_relative, uint64_t source_relative_length);
+
+/* Select the upstream image occurrence by BOTH display item and request_id.
+ * Destination text comes from the accepted shared-engine display list; callers
+ * cannot substitute a path/URL. Only relative PNG/JPEG file bytes under the
+ * explicit root are admitted. Network URLs, absolute/escaping paths, special
+ * files, unsupported formats and missing grants fail without a silent fetch.
+ *
+ * Max encoded image 4MiB; retained cache 8MiB and 16 images per document.
+ * The response includes the first <=65536 bytes as hex, content SHA-256, exact
+ * image target/destination, root/source identity, total bytes and next offset.
+ * Signature detection is not decoding or validity proof: decoded=false. The
+ * native host must enforce image dimensions/frame/pixel budgets on a worker.
+ * A successful repeated prepare reuses immutable bytes, even if disk changes.
+ */
+char *fcb_reader_document_image_prepare(uint64_t handle, uint64_t generation,
+    uint64_t item_index, uint64_t request_id);
+
+/* Read only the admitted immutable encoded image; no source or image file I/O.
+ * offset is an encoded byte offset, count 1..65536. EOF is an empty chunk.
+ * Every receipt echoes capture, generation, item/request, destination, total
+ * length and content digest. Never combine chunks from differing receipts.
+ * Existing reader cancel/close rules revoke late delivery without inventing a
+ * rollback for work already accepted by the host.
+ */
+char *fcb_reader_document_image_chunk(uint64_t handle, uint64_t generation,
+    uint64_t item_index, uint64_t request_id, uint64_t offset, uint64_t count);
 
 char *fcb_reader_document_headings(uint64_t handle, uint64_t generation,
     uint64_t first, uint64_t count);

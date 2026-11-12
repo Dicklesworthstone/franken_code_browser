@@ -2,7 +2,7 @@
 
 //! Thin marshaling for the same retained-reader document service used by hosts.
 //! No native renderer, Markdown engine, source lookup or independent registry.
-use std::ffi::c_char;
+use std::{ffi::c_char, path::Path};
 use fcb_app::host::reader::{ReaderDocumentOptions, DocumentCopyMode};
 use super::{answer, cstr, number, reply, AccessError, Command};
 
@@ -49,6 +49,62 @@ pub extern "C" fn fcb_reader_document_display_font(handle: u64, generation: u64,
         Command::DocumentDisplayFont { generation, index: number(font_index)?,
             offset: number(offset)?, count: number(count)? }, || false)))
 }
+/// Explicit current-root authorization for optional local images. Source path
+/// labels never become authority: the safe host verifies the selected source
+/// under this root against the retained capture before admitting image reads.
+/// # Safety
+/// root is null or readable through its NUL terminator (at most 16384 bytes).
+/// source_relative is null or points to source_relative_length readable bytes;
+/// both buffers remain immutable through return. No pointer is retained. The
+/// host retains its native root grant until all image work and reader close drain.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_reader_document_images_authorize(handle: u64, generation: u64,
+    root: *const c_char, source_relative: *const u8, source_relative_length: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| {
+        let length = number(source_relative_length)?;
+        if source_relative.is_null() || !(1..=16_384).contains(&length) {
+            return Err(AccessError::InvalidArgument);
+        }
+        let root = unsafe { image_root(root) }?;
+        let relative = unsafe { std::slice::from_raw_parts(source_relative, length) };
+        if relative.contains(&0) { return Err(AccessError::InvalidArgument); }
+        readers.execute(handle, Command::DocumentImagesAuthorize {
+            generation, root: Path::new(root), source_relative: relative }, || false)
+    }))
+}
+
+/// Bound the scan before constructing a borrowed string; allocation never
+/// depends on an untrusted foreign path length.
+unsafe fn image_root<'a>(pointer: *const c_char) -> Result<&'a str, AccessError> {
+    if pointer.is_null() { return Err(AccessError::InvalidArgument); }
+    for length in 0..=16_384 {
+        if unsafe { *pointer.add(length) } == 0 {
+            if length == 0 { return Err(AccessError::InvalidArgument); }
+            let bytes = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), length) };
+            return std::str::from_utf8(bytes).map_err(|_| AccessError::InvalidArgument);
+        }
+    }
+    Err(AccessError::InvalidArgument)
+}
+
+/// Read a bounded local asset on the host worker, or reuse the immutable
+/// encoded capture for the same display item/request. This performs no decode.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_reader_document_image_prepare(handle: u64, generation: u64,
+    item_index: u64, request_id: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| readers.execute(handle,
+        Command::DocumentImagePrepare { generation, item_index: number(item_index)?, request_id }, || false)))
+}
+
+/// Copy a bounded chunk of the retained encoded asset, without filesystem I/O.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_reader_document_image_chunk(handle: u64, generation: u64,
+    item_index: u64, request_id: u64, offset: u64, count: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| readers.execute(handle,
+        Command::DocumentImageChunk { generation, item_index: number(item_index)?, request_id,
+            offset: number(offset)?, count: number(count)? }, || false)))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_reader_document_headings(handle: u64, generation: u64, first: u64, count: u64) -> *mut c_char {
     reply(|| answer(handle, |readers| readers.execute(handle,

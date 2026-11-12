@@ -176,3 +176,40 @@ fn unsupported_shaping_cancellation_and_admission_preserve_the_logical_reader() 
     assert!(reader.rendered_text().contains("Logical preview survives."));
     assert!(reader.window(0, 64).unwrap().whole_document_visible());
 }
+
+#[test]
+fn image_occurrences_keep_upstream_identity_destination_and_original_bom_region() {
+    let source = capture("\u{feff}# Images\n\n![First](assets/a%20b.png)\n\n![Second](../outside.jpg)\n".as_bytes());
+    let budget = budget(); let reader = read(&source, &budget); let display = display(&reader, &budget, 640);
+    let images: Vec<_> = display.display().items().iter().enumerate().filter_map(|(index, item)| match item {
+        DisplayItem::Image(image) => Some((index, image.request_id, image.destination.as_str())),
+        _ => None,
+    }).collect();
+    assert_eq!(images.len(), 2);
+    for (position, (index, id, destination)) in images.iter().copied().enumerate() {
+        let image = display.image_request(index, id).unwrap();
+        assert_eq!(image.item_index, index);
+        assert_eq!(image.request_id, id);
+        assert_eq!(image.destination, destination, "the adapter must not reinterpret URL bytes");
+        assert_eq!(image.alt_text, if position == 0 { "First" } else { "Second" });
+        let (start, end) = image.enclosing_original_range.as_usize_bounds().unwrap();
+        assert!(start >= 3 && start < end);
+        assert!(std::str::from_utf8(&source.bytes()[start..end]).unwrap().contains(destination));
+        assert_eq!(display.image_request(index, id.wrapping_add(1)).err(), Some(NativeDisplayError::InvalidRange));
+    }
+    let text = display.display().items().iter().position(|item| matches!(item, DisplayItem::Text(_))).unwrap();
+    assert_eq!(display.image_request(text, images[0].1).err(), Some(NativeDisplayError::InvalidRange));
+    assert_eq!(display.image_request(display.display().items().len(), 0).err(), Some(NativeDisplayError::InvalidRange));
+}
+
+#[test]
+fn unqualified_display_images_keep_fallbacks_but_cannot_authorize_asset_acquisition() {
+    let source = capture(b"---\ntitle: metadata\n---\n\n![Image](images/local.png)\n");
+    let budget = budget(); let reader = read(&source, &budget); let display = display(&reader, &budget, 640);
+    assert!(!display.source_ranges_qualified());
+    let (index, id) = display.display().items().iter().enumerate().find_map(|(index, item)| match item {
+        DisplayItem::Image(image) => Some((index, image.request_id)), _ => None,
+    }).unwrap();
+    assert_eq!(display.unresolved_images(), 1);
+    assert_eq!(display.image_request(index, id).err(), Some(NativeDisplayError::InvalidOutput));
+}

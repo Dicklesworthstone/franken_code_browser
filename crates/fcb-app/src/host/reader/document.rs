@@ -94,6 +94,7 @@ impl ReaderSession {
         check(&mut canceled)?;
         self.document = Some(candidate); // Old layout destruction is worker work.
         self.document_display = None;
+        self.document_images = None;
         self.document_links = None;
         Ok(response)
     }
@@ -223,6 +224,7 @@ impl ReaderSession {
         check(&mut canceled)?;
         self.document = None;
         self.document_display = None;
+        self.document_images = None;
         self.document_links = None;
         Ok(response)
     }
