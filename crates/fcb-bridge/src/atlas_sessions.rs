@@ -26,6 +26,9 @@ pub(super) use stream::StreamCommand;
 #[path = "atlas_links_sessions.rs"]
 mod links;
 pub(super) use links::LinksCommand;
+#[path = "atlas_imports_sessions.rs"]
+mod imports;
+pub(super) use imports::ImportsCommand;
 
 pub(super) const MAX_ATLAS_SESSIONS: usize = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,9 +111,10 @@ impl Session {
         self.search.cancel_pending();
         self.search.cancel_index_build();
         self.search.cancel_relationships_pending();
+        self.search.cancel_imports_pending();
     }
     /// Cancellation can arrive BETWEEN resumable calls. Reclaim obsolete query
-    /// and index/link-construction work before reading or resuming it.
+    /// and index/relationship construction before reading or resuming it.
     /// Completed index/results are committed and are not rolled back here.
     fn synchronize(&mut self, epoch: u64) {
         if self.operation_epoch != epoch {

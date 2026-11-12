@@ -17,8 +17,11 @@ use progressive::SearchWork;
 mod indexed;
 pub use indexed::{AtlasIndexOptions, AtlasIndexBuildProgress, MAX_ATLAS_INDEX_GRAMS,
     AtlasRelationshipDirection, AtlasRelationshipSide, MAX_ATLAS_RELATIONSHIPS,
-    MAX_ATLAS_RELATIONSHIP_PARSE_BYTES, MAX_ATLAS_RELATIONSHIP_METADATA_BYTES};
-use indexed::{IndexQueryUsage, RetainedIndex, IndexBuildWork, RelationshipSnapshot, RelationshipsWork};
+    MAX_ATLAS_RELATIONSHIP_PARSE_BYTES, MAX_ATLAS_RELATIONSHIP_METADATA_BYTES,
+    AtlasImportDirection, AtlasImportSide, MAX_ATLAS_IMPORTS, MAX_ATLAS_IMPORT_PARSE_BYTES,
+    MAX_ATLAS_IMPORT_METADATA_BYTES, MAX_ATLAS_IMPORT_SOURCE_BYTES};
+use indexed::{IndexQueryUsage, RetainedIndex, IndexBuildWork, RelationshipSnapshot, RelationshipsWork,
+    ImportsSnapshot, ImportsWork};
 mod scope;
 pub use scope::{AtlasSearchScope, AtlasSearchPathKind, MAX_SEARCH_SCOPE_TOKENS, MAX_SEARCH_SCOPE_TOKEN_BYTES,
     MAX_SEARCH_SCOPE_LIST_BYTES, MAX_SEARCH_SCOPE_PATH_BYTES, MAX_SEARCH_REGION_FILES, MAX_SEARCH_REGION_WIRE_BYTES};
@@ -93,10 +96,12 @@ impl AtlasSearchOptions {
 pub enum AtlasSearchError {
     App(AppError), Atlas(AtlasSessionError), Reader(ReaderSessionError), Index(IndexError),
     Document(fcb::document::links::DocumentLinkError),
+    Import(fcb::search::imports::ImportError),
     InvalidLimits, InvalidScope, WrongAtlas, StaleQuery, MissingQuery, MissingHit, Canceled,
     IdentityExhausted, MissingIndex, StaleIndex, OutOfScope,
     MissingRelationships, StaleRelationships, MissingRelationship, MissingRelationshipPath,
     RelationshipTargetUnavailable,
+    MissingImports, StaleImports, MissingImport, MissingImportPath, ImportTargetUnavailable,
 }
 impl std::fmt::Display for AtlasSearchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -104,6 +109,7 @@ impl std::fmt::Display for AtlasSearchError {
             Self::App(e) => write!(f, "{e}"), Self::Atlas(e) => write!(f, "{e}"),
             Self::Reader(e) => write!(f, "{e}"), Self::Index(e) => write!(f, "{e}"),
             Self::Document(e) => write!(f, "{e}"),
+            Self::Import(e) => write!(f, "{e}"),
             other => f.write_str(match other {
                 Self::InvalidLimits => "ATLAS_SEARCH_INVALID_LIMITS",
                 Self::InvalidScope => "ATLAS_SEARCH_INVALID_SCOPE",
@@ -121,6 +127,11 @@ impl std::fmt::Display for AtlasSearchError {
                 Self::MissingRelationship => "ATLAS_LINKS_NOT_FOUND",
                 Self::MissingRelationshipPath => "ATLAS_LINKS_PATH_NOT_FOUND",
                 Self::RelationshipTargetUnavailable => "ATLAS_LINKS_TARGET_UNAVAILABLE",
+                Self::MissingImports => "ATLAS_IMPORTS_NOT_PREPARED",
+                Self::StaleImports => "ATLAS_IMPORTS_STALE_GENERATION",
+                Self::MissingImport => "ATLAS_IMPORTS_NOT_FOUND",
+                Self::MissingImportPath => "ATLAS_IMPORTS_PATH_NOT_FOUND",
+                Self::ImportTargetUnavailable => "ATLAS_IMPORTS_TARGET_UNAVAILABLE",
                 _ => unreachable!(),
             }),
         }
@@ -217,6 +228,9 @@ pub struct RetainedAtlasSearch {
     relationships: Option<RelationshipSnapshot>,
     relationships_pending: Option<RelationshipsWork>,
     last_relationship_attempt: u64,
+    imports: Option<ImportsSnapshot>,
+    imports_pending: Option<ImportsWork>,
+    last_import_attempt: u64,
     budget: ResourceBudget,
     _metadata_lease: ResourceLease,
 }
@@ -234,6 +248,7 @@ impl RetainedAtlasSearch {
         Ok(Self { manifest, grant: grant.clone(), layout: atlas.atlas().layout().revision(), last_attempt: 0,
             next_allocation: 100, accepted: None, pending: None, index: None, building: None,
             relationships: None, relationships_pending: None, last_relationship_attempt: 0,
+            imports: None, imports_pending: None, last_import_attempt: 0,
             budget, _metadata_lease: metadata_lease })
     }
     pub fn accepted_generation(&self) -> Option<u64> { self.accepted.as_ref().map(|q| q.generation) }

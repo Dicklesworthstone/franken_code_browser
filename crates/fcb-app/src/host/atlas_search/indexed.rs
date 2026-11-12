@@ -16,6 +16,11 @@ mod relationships;
 pub use relationships::{AtlasRelationshipDirection, AtlasRelationshipSide, MAX_ATLAS_RELATIONSHIPS,
     MAX_ATLAS_RELATIONSHIP_PARSE_BYTES, MAX_ATLAS_RELATIONSHIP_METADATA_BYTES};
 pub(super) use relationships::{RelationshipSnapshot, RelationshipsWork};
+#[path = "imports.rs"]
+mod imports;
+pub use imports::{AtlasImportDirection, AtlasImportSide, MAX_ATLAS_IMPORTS,
+    MAX_ATLAS_IMPORT_PARSE_BYTES, MAX_ATLAS_IMPORT_METADATA_BYTES, MAX_ATLAS_IMPORT_SOURCE_BYTES};
+pub(super) use imports::{ImportsSnapshot, ImportsWork};
 
 use std::mem::size_of;
 use fcb::search::{CaptureRequest, IndexError, IndexLimits, IndexedQueryState,
@@ -567,6 +572,8 @@ impl RetainedAtlasSearch {
         out.literal(",\"index_generation\":null,\"indexed_source_bytes\":\"0\"}\n")?;
         let response = self.finish(atlas, out, false, &mut canceled)?;
         self.cancel_relationships_pending();
+        self.cancel_imports_pending();
+        self.imports = None;
         self.index = None;
         Ok(response)
     }

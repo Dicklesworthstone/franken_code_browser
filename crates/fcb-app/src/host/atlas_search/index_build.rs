@@ -240,6 +240,8 @@ impl RetainedAtlasSearch {
         // Accepted relationship metadata retains its old identity and becomes
         // explicitly stale; no old edge may resume against replacement bytes.
         self.cancel_relationships_pending();
+        self.cancel_imports_pending();
+        self.imports = None;
         self.index = Some(candidate);
         Ok(response)
     }

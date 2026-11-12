@@ -248,6 +248,8 @@ mod structure;
 mod expression;
 #[path = "atlas_links_ffi.rs"]
 mod links;
+#[path = "atlas_imports_ffi.rs"]
+mod imports;
 
 #[cfg(all(test, unix))]
 #[path = "atlas_search_ffi_tests.rs"]
