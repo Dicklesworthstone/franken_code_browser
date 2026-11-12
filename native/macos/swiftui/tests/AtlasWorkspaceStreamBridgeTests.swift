@@ -300,6 +300,113 @@ private final class WorkspaceProgressCopies: @unchecked Sendable {
         } catch AtlasWorkspaceStreamError.invalidResponse { }
         precondition(lowerCopies.values.isEmpty && allocations() == frees())
         mode(0)
-        print("Workspace stream ABI matching/count flags, ownership, progressive bytes, Stop and cancellation fixtures passed")
+
+        // Whole-token requests have their own additive ABI. Both count policies
+        // must preserve scope buffers, callback lifetime and exact Unicode bytes.
+        let beforeOccurrences = (UInt32(14)...UInt32(20)).map { count($0) }
+        precondition(count(21) == 0 && count(22) == 0 && count(23) == 0)
+        for (selection, scoped) in scopedRequests {
+            scope(selection)
+            for countAll in [false, true] {
+                let occurrences = try AtlasWorkspaceStreamRequest(needle: "token_é😀",
+                    maximumScanBytes: scoped.maximumScanBytes, maximumMatches: scoped.maximumMatches,
+                    maximumReadCalls: scoped.maximumReadCalls, fileScope: scoped.fileScope,
+                    pathScope: scoped.pathScope, countAllMatches: countAll, mode: .occurrences)
+                precondition(occurrences.caseSensitive)
+                let direct = try transport.search(owner, occurrences, AtlasSearchCancellation())
+                let stop = AtlasWorkspaceStreamStop(), copies = WorkspaceProgressCopies()
+                let terminal = try progressive(owner, occurrences, AtlasSearchCancellation(), stop) {
+                    copies.append($0); stop.requestStop()
+                }
+                precondition(direct == expected && terminal == expected && stop.isRequested)
+                precondition(copies.values == ["{\"fixture\":\"workspace-progress\"}"])
+                precondition(allocations() == frees())
+            }
+        }
+        precondition(count(21) == UInt32(scopedRequests.count * 2)
+            && count(22) == UInt32(scopedRequests.count * 2)
+            && count(23) == UInt32(scopedRequests.count * 2))
+        precondition((UInt32(14)...UInt32(20)).map { count($0) } == beforeOccurrences,
+            "Whole-token mode must never dispatch to literal or lowercase search")
+        scope(0)
+        let occurrences = try AtlasWorkspaceStreamRequest(needle: "token_é😀",
+            maximumScanBytes: request.maximumScanBytes, countAllMatches: true, mode: .occurrences)
+        let occurrenceEntries = count(21), occurrenceProgress = count(22), occurrenceCallbacks = count(10)
+        do {
+            _ = try transport.search(owner, occurrences, canceledBeforeEntry)
+            preconditionFailure("Canceled occurrence request entered C")
+        } catch AtlasWorkspaceStreamError.canceled { }
+        do {
+            _ = try progressive(owner, occurrences, canceledBeforeEntry, AtlasWorkspaceStreamStop()) { _ in }
+            preconditionFailure("Canceled occurrence progress entered C")
+        } catch AtlasWorkspaceStreamError.canceled { }
+        precondition(count(21) == occurrenceEntries && count(22) == occurrenceProgress
+            && count(10) == occurrenceCallbacks && allocations() == frees())
+
+        let occurrenceStop = AtlasWorkspaceStreamStop(); occurrenceStop.requestStop()
+        let noProgress = WorkspaceProgressCopies(), previousStops = count(12)
+        let stoppedOccurrences = try progressive(owner, occurrences, AtlasSearchCancellation(), occurrenceStop) {
+            noProgress.append($0)
+        }
+        precondition(stoppedOccurrences == expected && noProgress.values.isEmpty
+            && count(10) == occurrenceCallbacks && count(12) == previousStops + 1)
+        precondition(allocations() == frees())
+
+        for late in [Int32(4), Int32(5)] {
+            mode(late)
+            let live = AtlasSearchCancellation(), releasedBefore = frees()
+            do {
+                _ = try transport.search(owner, occurrences, live)
+                preconditionFailure("Occurrence terminal route accepted late cancellation")
+            } catch AtlasWorkspaceStreamError.canceled { }
+            precondition(live.isCanceled && frees() == releasedBefore + (late == 4 ? 1 : 0))
+            precondition(allocations() == frees())
+        }
+        for terminalMode in [Int32(0), Int32(1)] {
+            mode(terminalMode)
+            weak var released: AtlasSearchCancellation?
+            let releasedBefore = frees(), canceledBefore = count(13)
+            do {
+                let live = AtlasSearchCancellation(); released = live
+                do {
+                    _ = try progressive(owner, occurrences, live, AtlasWorkspaceStreamStop()) { _ in live.cancel() }
+                    preconditionFailure("Occurrence callback cancellation accepted a terminal response")
+                } catch AtlasWorkspaceStreamError.canceled { }
+            }
+            precondition(released == nil && count(13) == canceledBefore + 1)
+            precondition(frees() == releasedBefore + (terminalMode == 0 ? 1 : 0))
+            precondition(allocations() == frees())
+        }
+
+        for malformed in [Int32(8), Int32(9), Int32(10), Int32(11)] {
+            mode(malformed)
+            let copies = WorkspaceProgressCopies(), releasedBefore = frees(), canceledBefore = count(13)
+            do {
+                _ = try progressive(owner, occurrences, AtlasSearchCancellation(), AtlasWorkspaceStreamStop()) {
+                    copies.append($0)
+                }
+                preconditionFailure("Malformed occurrence progress reached the sink")
+            } catch AtlasWorkspaceStreamError.invalidResponse { }
+            precondition(copies.values.isEmpty && count(13) == canceledBefore + 1)
+            precondition(frees() == releasedBefore + 1 && allocations() == frees())
+        }
+        for invalidTerminal in [Int32(2), Int32(3)] {
+            mode(invalidTerminal)
+            let copies = WorkspaceProgressCopies(), releasedBefore = frees()
+            do {
+                _ = try progressive(owner, occurrences, AtlasSearchCancellation(), AtlasWorkspaceStreamStop()) {
+                    copies.append($0)
+                }
+                preconditionFailure("Malformed occurrence terminal response accepted")
+            } catch AtlasWorkspaceStreamError.invalidResponse { }
+            precondition(copies.values == ["{\"fixture\":\"workspace-progress\"}"])
+            precondition(frees() == releasedBefore + 1 && allocations() == frees())
+        }
+        mode(1)
+        let absentOccurrences = try transport.search(owner, occurrences, AtlasSearchCancellation())
+        let absentProgress = try progressive(owner, occurrences, AtlasSearchCancellation(), AtlasWorkspaceStreamStop()) { _ in }
+        precondition(absentOccurrences == nil && absentProgress == nil && allocations() == frees())
+        mode(0)
+        print("Workspace stream ABI occurrence/matching/count flags, ownership, progressive bytes, Stop and cancellation fixtures passed")
     }
 }

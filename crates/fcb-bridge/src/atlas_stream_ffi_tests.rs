@@ -49,6 +49,64 @@ fn search(handle: u64, needle: &str, matches: u64, bytes: u64, calls: u64) -> St
 }
 
 #[test]
+fn c_occurrences_keep_exact_scoped_counts_witnesses_and_old_inventory_on_invalid_input() {
+    let _: unsafe extern "C" fn(u64, *const c_char, u64, u64, u64,
+        *const c_char, *const c_char, u64, *const c_char, u64,
+        Option<SearchCancellationCallback>, Option<SearchCancellationCallback>,
+        Option<AtlasStreamProgressCallback>, *mut c_void) -> *mut c_char =
+        fcb_atlas_stream_search_scoped_occurrences_progress;
+    assert!(include_str!("../include/fcb_atlas_stream_search.h")
+        .contains("fcb_atlas_stream_search_scoped_occurrences_progress("));
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    let mut large = vec![b' '; 600 * 1024];
+    large.extend_from_slice(b"item item_suffix _item item$ // item\n\"item\"\nitem");
+    fs::write(fixture.0.join("a.rs"), &large).unwrap();
+    fs::write(fixture.0.join("b.md"), b"item").unwrap();
+    let handle = fixture.open();
+    let needle = CString::new("item").unwrap(); let extensions = CString::new("rs").unwrap();
+    let run = |needle: &CString, count| take(unsafe {
+        fcb_atlas_stream_search_scoped_occurrences_progress(handle, needle.as_ptr(), 1,
+            4 * 1024 * 1024, 4096, extensions.as_ptr(), std::ptr::null(), 0, std::ptr::null(), count,
+            None, None, None, std::ptr::null_mut())
+    });
+    let accepted = run(&needle, 1);
+    assert!(accepted.contains("\"status\":\"ok\""), "{accepted}");
+    assert!(accepted.contains("\"mode\":\"whole-token-occurrences\""));
+    assert!(accepted.contains("\"evidence_level\":\"whole-token-text-candidate\""));
+    assert!(accepted.contains("\"includes_comments_and_literals\":true"));
+    assert!(accepted.contains("\"compiler_resolved\":false"));
+    assert!(accepted.contains("\"semantic_complete\":false"));
+    assert!(accepted.contains("\"case_sensitive\":true"));
+    assert!(accepted.contains("\"match_count_complete\":true"));
+    assert_eq!(field(&accepted, "matches_seen"), 4);
+    assert_eq!(field(&accepted, "retained_hits"), 1);
+    assert_eq!(field(&accepted, "eligible_files"), 1);
+    assert_eq!(field(&accepted, "excluded_files"), 1);
+    assert_eq!(field(&accepted, "payload_bytes_read"), large.len() as u64);
+    let generation = field(&accepted, "query_generation");
+    assert!(run(&needle, 2).contains("ATLAS_HANDLE_INVALID_ARGUMENT"));
+    assert!(run(&CString::new("two names").unwrap(), 1).contains("STREAM_READ_INVALID_IDENTIFIER"));
+    let rejected = take(unsafe {
+        fcb_atlas_stream_search_scoped_occurrences_progress(handle, needle.as_ptr(), 1, 4096, 4096,
+            extensions.as_ptr(), std::ptr::null(), 0, std::ptr::null(), 1,
+            Some(canceled), None, None, std::ptr::null_mut())
+    });
+    assert!(rejected.contains("ATLAS_HANDLE_CANCELED"), "{rejected}");
+    fs::write(fixture.0.join("a.rs"), b"changed").unwrap();
+    for receipt in [take(fcb_atlas_stream_search_page(handle, generation, 0, 1)),
+        take(fcb_atlas_stream_search_hit(handle, generation, 0))] {
+        assert!(receipt.contains("\"mode\":\"whole-token-occurrences\""), "{receipt}");
+        assert!(receipt.contains("\"match_count_complete\":true"));
+    }
+    let hit = take(fcb_atlas_stream_search_hit(handle, generation, 0));
+    assert!(hit.contains("\"original_hex\":\"6974656d\""));
+    assert!(hit.contains("\"additional_source_bytes_read\":\"0\""));
+    assert!(hit.contains("\"additional_read_calls\":\"0\""));
+    assert_eq!(fcb_atlas_close(handle), 1);
+}
+
+#[test]
 fn c_stream_finds_large_utf8_and_bom_utf16_files_and_keeps_exact_literal_after_replacement() {
     let _guard = FFI_TEST_LOCK.lock().unwrap();
     let fixture = Fixture::new();

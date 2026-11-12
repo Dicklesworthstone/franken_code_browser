@@ -46,6 +46,115 @@ fn search(service: &mut RetainedAtlasStreamSearch, atlas: &AtlasSession, needle:
 }
 
 #[test]
+fn whole_identifiers_beyond_capture_limits_keep_original_utf8_and_utf16_witnesses() {
+    for encoding in ["utf8", "utf16le", "utf16be"] {
+        let fixture = Fixture::new();
+        let encode = |text: &str| -> Vec<u8> { match encoding {
+            "utf16le" => text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+            "utf16be" => text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+            _ => text.as_bytes().to_vec(),
+        } };
+        let prefix = format!("\u{feff}{}", " ".repeat(600 * 1024));
+        let text = format!("{prefix}needle needlework _needle needle$ needleβ βneedle // needle\n\"needle\"\nneedle");
+        let expected = [prefix.len(), text.find("// needle").unwrap() + 3,
+            text.find("\"needle\"").unwrap() + 1, text.rfind("needle").unwrap()];
+        let bytes = encode(&text);
+        fixture.write("large.rs", &bytes); fixture.write("excluded.md", b"needle");
+        let atlas = fixture.atlas(64); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+        let scope = AtlasSearchScope::all().with_path(AtlasSearchPathKind::File, "large.rs").unwrap();
+        let mut frames = Vec::new();
+        let response = service.search_scoped_occurrences_with_progress(&atlas, "needle", opts(),
+            scope.clone(), false, || false, || false, |response| frames.push(json(response))).unwrap();
+        assert_eq!(response.exit_code(), EXIT_OK);
+        let report = json(&response);
+        for receipt in frames.iter().chain(std::iter::once(&report)) {
+            assert_eq!(receipt.get("mode").text(), "whole-token-occurrences");
+            assert_eq!(receipt.get("evidence_level").text(), "whole-token-text-candidate");
+            assert!(receipt.get("includes_comments_and_literals").flag());
+            assert!(!receipt.get("compiler_resolved").flag());
+            assert!(!receipt.get("semantic_complete").flag());
+            assert!(receipt.get("case_sensitive").flag());
+            assert_eq!(receipt.get("eligible_files").number(), 1);
+            assert_eq!(receipt.get("excluded_files").number(), 1);
+        }
+        assert!(report.get("search_complete").flag());
+        assert_eq!(report.get("matches_seen").number(), 4);
+        assert_eq!(report.get("payload_bytes_read").number(), bytes.len() as u64);
+        assert!(report.get("peak_input_buffer_bytes").number() <= 16 * 1024);
+        assert_eq!(report.get("retained_witness_bytes").number(), encode("needle").len() as u64);
+        let generation = report.get("query_generation").number();
+        let io = (service.source_bytes_read(), service.read_calls());
+        for (index, offset) in expected.into_iter().enumerate() {
+            let start = encode(&text[..offset]).len();
+            let end = start + encode("needle").len();
+            let hit = json(&service.hit(&atlas, generation, index).unwrap());
+            assert_eq!(hit.get("mode"), report.get("mode"));
+            assert_eq!(hit.get("evidence_level"), report.get("evidence_level"));
+            assert_eq!(bounds(hit.get("hit").get("original_range")), (start as u64, end as u64));
+            assert_eq!(hit.get("hit").get("original_hex").text(), hex(&bytes[start..end]));
+            assert_eq!(hit.get("hit").get("text").text(), "needle");
+        }
+        assert_eq!(io, (service.source_bytes_read(), service.read_calls()));
+        let counted = json(&service.search_scoped_occurrences_with_progress(&atlas, "needle",
+            AtlasStreamSearchOptions { max_matches: 1, ..opts() }, scope.clone(), true,
+            || false, || false, |_| {}).unwrap());
+        assert!(counted.get("match_count_complete").flag());
+        assert!(counted.get("truncated").flag());
+        assert_eq!(counted.get("matches_seen").number(), 4);
+        assert_eq!(counted.get("retained_hits").number(), 1);
+        let generation = counted.get("query_generation").number();
+        let io = (service.source_bytes_read(), service.read_calls());
+        let invalid = service.search_scoped_occurrences_with_progress(&atlas, "two names", opts(),
+            scope.clone(), false, || false, || false, |_| panic!("invalid input must not publish"));
+        assert_eq!(invalid.err().unwrap().to_string(), "STREAM_READ_INVALID_IDENTIFIER");
+        assert_eq!(service.accepted_generation(), Some(generation));
+        assert!(matches!(service.search_scoped_occurrences_with_progress(&atlas, "needle", opts(),
+            scope.with_case_sensitive(false), false, || false, || false, |_| {}),
+            Err(AtlasStreamSearchError::InvalidLimits)));
+        fixture.write("large.rs", b"replaced live source");
+        let retained = json(&service.hit(&atlas, generation, 0).unwrap());
+        assert_eq!(retained.get("hit").get("original_hex").text(), hex(&encode("needle")));
+        assert_eq!(io, (service.source_bytes_read(), service.read_calls()));
+    }
+}
+
+#[test]
+fn identifier_budget_boundary_never_claims_an_unfinished_token_and_cancel_preserves_history() {
+    use std::cell::Cell;
+    let fixture = Fixture::new(); fixture.write("a.rs", b"needle needle_more");
+    let atlas = fixture.atlas(64); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let response = service.search_scoped_occurrences_with_progress(&atlas, "needle",
+        AtlasStreamSearchOptions { max_scan_bytes: 13, ..opts() }, AtlasSearchScope::all(), true,
+        || false, || false, |_| {}).unwrap();
+    assert_eq!(response.exit_code(), EXIT_PARTIAL);
+    let report = json(&response);
+    assert_eq!(report.get("stop_reason").text(), "byte-limit");
+    assert!(!report.get("match_count_complete").flag());
+    assert_eq!(report.get("matches_seen").number(), 1);
+    assert_eq!(bounds(report.get("hits").array()[0].get("original_range")), (0, 6));
+    let generation = report.get("query_generation").number();
+    let io = (service.source_bytes_read(), service.read_calls());
+    let cancel = Cell::new(false); let stop = Cell::new(false);
+    let rejected = service.search_scoped_occurrences_with_progress(&atlas, "needle", opts(),
+        AtlasSearchScope::all(), false, || cancel.get(), || stop.get(), |_| {
+            cancel.set(true); stop.set(true);
+        });
+    assert!(matches!(rejected, Err(AtlasStreamSearchError::Canceled)));
+    assert_eq!(service.accepted_generation(), Some(generation));
+    assert_eq!(io, (service.source_bytes_read(), service.read_calls()));
+    assert_eq!(json(&service.page(&atlas, generation, 0, 32).unwrap()).get("mode").text(),
+        "whole-token-occurrences");
+    stop.set(false);
+    let kept = service.search_scoped_occurrences_with_progress(&atlas, "needle", opts(),
+        AtlasSearchScope::all(), false, || false, || stop.get(), |_| stop.set(true)).unwrap();
+    assert_eq!(kept.exit_code(), EXIT_PARTIAL);
+    let kept = json(&kept);
+    assert_eq!(kept.get("stop_reason").text(), "user-stopped");
+    assert_eq!(kept.get("retained_hits").number(), 0);
+    assert_eq!(io, (service.source_bytes_read(), service.read_calls()));
+}
+
+#[test]
 fn file_beyond_both_native_capture_ceilings_is_searchable_with_only_literal_retention() {
     let fixture = Fixture::new();
     let mut file = File::create(fixture.0.join("large.rs")).unwrap();

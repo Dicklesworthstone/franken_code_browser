@@ -51,7 +51,16 @@ private enum StreamFixture {
         let literals = spellings ?? Array(repeating: request.needle, count: count)
         precondition(literals.count == count)
         let bytes = AtlasObservedReaderSearchRequest.originalBytes(request.needle, encoding: encoding)
-        value["mode"] = request.caseSensitive ? "exact-decoded-literal" : "unicode-lowercase-literal"
+        value["mode"] = request.mode.wireMode(caseSensitive: request.caseSensitive)
+        if request.mode == .occurrences {
+            value["evidence_level"] = "whole-token-text-candidate"
+            value["includes_comments_and_literals"] = true
+            value["compiler_resolved"] = false; value["semantic_complete"] = false
+            value["count_all_matches"] = request.countAllMatches
+            value["match_count_complete"] = true
+            value["retained_matching_files"] = count == 0 ? "0" : "1"
+            value["terminal"] = true; value["selection_available"] = true
+        }
         value["needle"] = request.needle; value["discovery_complete"] = true
         value["search_complete"] = true; value["truncated"] = false; value["stop_reason"] = NSNull()
         value["files_examined"] = "1"; value["files_unexamined"] = "0"
@@ -77,7 +86,7 @@ private enum StreamFixture {
              "fixture_spelling": literals[index]]
         }
         // Keep default receipts legacy to exercise backward compatibility.
-        if !request.fileScope.isAll || !request.pathScope.isWorkspace || !request.caseSensitive {
+        if request.mode == .occurrences || !request.fileScope.isAll || !request.pathScope.isWorkspace || !request.caseSensitive {
             value.merge(scope(request), uniquingKeysWith: { _, next in next })
         }
         if request.countAllMatches {
@@ -132,12 +141,12 @@ private enum StreamProgressFixture {
         value["files_examined"] = stopped ? String(examined) : "2"
         value["files_unexamined"] = stopped ? String(2 - examined) : "0"
         value["search_complete"] = !stopped; value["stop_reason"] = stopped ? "user-stopped" as Any : NSNull()
-        if request.countAllMatches { value["match_count_complete"] = !stopped }
+        if request.countAllMatches || request.mode == .occurrences { value["match_count_complete"] = !stopped }
         let bytes = stopped ? payload : 2 * StreamFixture.length
         value["payload_bytes_read"] = String(bytes); value["scanned_input_bytes"] = String(bytes)
         value["read_calls"] = String((bytes + 16_383) / 16_384)
         value["peak_input_buffer_bytes"] = String(min(bytes, 16_384))
-        if !request.fileScope.isAll || !request.pathScope.isWorkspace || !request.caseSensitive {
+        if request.mode == .occurrences || !request.fileScope.isAll || !request.pathScope.isWorkspace || !request.caseSensitive {
             value.merge(StreamFixture.scope(request, catalogued: 2, eligible: 2),
                 uniquingKeysWith: { _, next in next })
         }
@@ -335,9 +344,11 @@ private final class StreamContextProbe: @unchecked Sendable {
         try scopeWireTests()
         try countedWireTests()
         try lowercaseWireTests()
+        try occurrenceWireTests()
         try progressWireTests()
         try await countedModelTests()
         try await lowercaseModelTests()
+        try await occurrenceModelTests()
         try await progressModelTests()
         try await modelTests()
         try await scopedModelTests()
@@ -1150,5 +1161,121 @@ private extension AtlasWorkspaceStreamTests {
             && model.report?.summary.matchCountComplete == true && model.report?.summary.matchesSeen == 2_000
             && model.report?.summary.witnessBytes == 256 * 3)
         model.close(); try await wait("lowercase owner retirement") { probe.closedCount == probe.createCount }
+    }
+}
+
+
+private extension AtlasWorkspaceStreamTests {
+    static func occurrenceWireTests() throws {
+        let owner: UInt64 = 0xfedcba9876543210
+        let catalog = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(StreamFixture.catalog(owner)), owner: owner)
+        let request = try AtlasWorkspaceStreamRequest(needle: "old", mode: .occurrences)
+        let literalRequest = try AtlasWorkspaceStreamRequest(needle: "old")
+        precondition(request != literalRequest)
+        rejects("case-insensitive identifier request") {
+            _ = try AtlasWorkspaceStreamRequest(needle: "old", caseSensitive: false, mode: .occurrences)
+        }
+        for encoding in AtlasObservedReaderEncoding.allCases {
+            let wire = StreamFixture.report(owner, 1, request, count: 3, encoding: encoding)
+            func decode(_ value: [String: Any], selected: AtlasWorkspaceStreamRequest? = nil) throws -> AtlasWorkspaceStreamReport {
+                let page = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(value)),
+                    catalog: catalog, root: catalog.root, request: selected ?? request)
+                return try .init(summary: page.summary, hits: page.hits)
+            }
+            let report = try decode(wire)
+            precondition(report.summary.request.mode == .occurrences && report.summary.matchCountComplete
+                && report.summary.witnessBytes == UInt64(AtlasObservedReaderSearchRequest.originalBytes("old", encoding: encoding).count))
+            for index in report.hits.indices {
+                let witness = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(StreamFixture.witness(wire, index: index)),
+                    report: report, root: catalog.root, target: report.target(for: report.hits[index]))
+                precondition(witness.text == "old" && witness.originalHex == ObservedReaderFixture.hex(
+                    AtlasObservedReaderSearchRequest.originalBytes("old", encoding: encoding)))
+            }
+            for (key, value) in [("mode", "exact-decoded-literal" as Any),
+                ("evidence_level", "compiler-reference" as Any), ("includes_comments_and_literals", false as Any),
+                ("compiler_resolved", true as Any), ("semantic_complete", true as Any), ("case_sensitive", false as Any)] {
+                var bad = wire; bad[key] = value
+                rejects("identifier report policy \(key)") { _ = try decode(bad) }
+                var badWitness = StreamFixture.witness(wire, index: 0); badWitness[key] = value
+                rejects("identifier witness policy \(key)") {
+                    _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(badWitness), report: report,
+                        root: catalog.root, target: report.target(for: report.hits[0]))
+                }
+            }
+            for key in ["evidence_level", "includes_comments_and_literals", "compiler_resolved",
+                "semantic_complete", "count_all_matches", "match_count_complete", "retained_matching_files",
+                "search_scope", "case_sensitive", "terminal"] {
+                var bad = wire; bad.removeValue(forKey: key)
+                rejects("missing identifier contract \(key)") { _ = try decode(bad) }
+            }
+            rejects("identifier receipt admitted for a literal request") {
+                _ = try decode(wire, selected: .init(needle: "old"))
+            }
+            let legacy = StreamFixture.report(owner, 1, try .init(needle: "old"), count: 3, encoding: encoding)
+            rejects("legacy literal receipt admitted as identifiers") { _ = try decode(legacy) }
+        }
+        let counted = try AtlasWorkspaceStreamRequest(needle: "old", maximumMatches: 3, countAllMatches: true, mode: .occurrences)
+        let full = StreamFixture.counted(StreamFixture.report(owner, 2, counted, count: 3), matches: 99, matchingFiles: 1)
+        let page = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(full)),
+            catalog: catalog, root: catalog.root, request: counted)
+        let report = try AtlasWorkspaceStreamReport(summary: page.summary, hits: page.hits)
+        precondition(report.summary.matchesSeen == 99 && report.summary.truncated
+            && report.summary.matchCountComplete && report.summary.witnessBytes == 3)
+
+        let progressiveCatalog = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(StreamProgressFixture.catalog(owner)), owner: owner)
+        let middle = StreamProgressFixture.progress(owner, 3, request, sequence: 2)
+        let progress = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(middle),
+            catalog: progressiveCatalog, request: request)
+        precondition(!progress.summary.matchCountComplete && progress.summary.request.mode == .occurrences)
+        var wrongMode = middle; wrongMode["mode"] = "exact-decoded-literal"
+        rejects("literal callback in an identifier search") {
+            _ = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(wrongMode),
+                catalog: progressiveCatalog, request: request)
+        }
+        let stopped = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(
+            StreamProgressFixture.report(owner, 3, request, stopped: true))), catalog: progressiveCatalog,
+            root: progressiveCatalog.root, request: request, requireTerminal: true)
+        try progress.validateTerminal(stopped)
+        precondition(stopped.summary.stop == "user-stopped" && !stopped.summary.matchCountComplete)
+    }
+
+    @MainActor static func occurrenceModelTests() async throws {
+        let probe = StreamProbe(), model = AtlasWorkspaceStreamModel(transport: probe.progressiveTransport,
+            query: "old", caseSensitive: false)
+        model.open(.init(root: StreamFixture.root, project: UUID(), browserOwner: 1, access: nil))
+        try await wait("identifier catalog") { !model.busy && model.catalog != nil }
+        model.search(); try await wait("initial lowercase text") { !model.busy && model.reportAuthorized }
+        let literal = model.report!, oldTarget = literal.target(for: literal.hits[0])
+        model.select(oldTarget); try await wait("old literal witness") { !model.busy && model.witness != nil }
+        let contextProbe = StreamContextProbe(); model.readCurrentContext(transport: contextProbe.transport)
+        let context = model.currentContext!; context.start()
+        try await wait("old literal context") { context.model.page != nil && !context.model.busy }
+        model.mode = .occurrences
+        precondition(!model.caseSensitive && model.report == nil && model.witness == nil && !model.canSelect
+            && model.currentContext == nil && context.model.closed)
+        let calls = probe.hitCount; model.select(oldTarget); precondition(probe.hitCount == calls)
+        model.search(); try await wait("whole identifier inventory") { !model.busy && model.reportAuthorized }
+        let report = model.report!
+        precondition(report.summary.request.mode == .occurrences && report.summary.request.caseSensitive
+            && report.summary.witnessBytes == 3 && report.summary.coverage.contains("no compiler resolution"))
+        model.select(report.target(for: report.hits[0]))
+        try await wait("whole identifier witness") { !model.busy && model.witness != nil }
+        precondition(model.witness?.text == "old")
+        let late = ObservedReaderGate(); probe.blockProgress(late); model.search()
+        try await wait("pending identifier progress") { late.entered && model.progress != nil }
+        model.mode = .text
+        precondition(!model.busy && model.progress == nil && model.report == nil && model.witness == nil)
+        late.release(); try await wait("identifier mode change drains") { probe.activeCount == 0 }
+        await Task.yield(); precondition(model.report == nil && model.progress == nil)
+        model.search(); try await wait("restored text policy") { !model.busy && model.reportAuthorized }
+        precondition(model.report?.summary.request.mode == .text && model.report?.summary.request.caseSensitive == false)
+        model.mode = .occurrences; model.countAllMatches = true; model.search()
+        try await wait("counted whole identifiers") { !model.busy && model.reportAuthorized }
+        precondition(model.report?.summary.matchesSeen == 2_000 && model.report?.summary.matchCountComplete == true
+            && model.report?.summary.retainedHits == 256 && model.report?.summary.witnessBytes == 3)
+        model.clear(); try await wait("identifier clear") { !model.busy }
+        precondition(model.canSearch && model.report == nil && model.witness == nil
+            && model.notice.contains("Retained search literals cleared"))
+        model.close(); try await wait("identifier owner retirement") { probe.closedCount == probe.createCount }
     }
 }

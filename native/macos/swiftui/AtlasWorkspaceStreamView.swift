@@ -25,14 +25,17 @@ import AppKit
                 .font(.system(.caption, design: .monospaced)).textSelection(.enabled).lineLimit(2)
             Text(verbatim: "Search scope: " + presentation.source.scopeDescription)
                 .font(.callout).textSelection(.enabled).lineLimit(3)
-            Text("Search text in the selected location and file types, including large files. UTF-8 and BOM-declared UTF-16 are recognized automatically. No per-file byte cap applies; the total byte budget limits the scan.")
+            Text("Search text or whole identifiers in the selected location and file types, including large files. UTF-8 and BOM-declared UTF-16 are recognized automatically. No per-file byte cap applies; the total byte budget limits the scan.")
                 .font(.caption).foregroundStyle(.secondary)
             Text("This sheet keeps the sidebar's location and file-type selection fixed. Return to the sidebar and reopen this sheet to choose another scope. Discovery uses product exclusions and stops at 20,000 files; excluded files do not consume the scan budget.")
                 .font(.caption).foregroundStyle(.secondary)
             HStack(spacing: 8) {
-                TextField("Text to find", text: $model.queryText).textFieldStyle(.roundedBorder)
+                Picker("Search mode", selection: $model.mode) {
+                    ForEach(AtlasWorkspaceStreamMode.allCases) { mode in Text(mode.label).tag(mode) }
+                }.frame(width: 170)
+                TextField(model.mode == .occurrences ? "Exact identifier" : "Text to find", text: $model.queryText).textFieldStyle(.roundedBorder)
                     .focused($queryFocused).onSubmit { if model.canSearch { model.search() } }
-                    .accessibilityLabel("Text to find in the selected search scope")
+                    .accessibilityLabel(model.mode == .occurrences ? "Exact identifier in the selected search scope" : "Text to find in the selected search scope")
                 Picker("Total bytes", selection: $model.scanBytes) {
                     Text("256 MiB").tag(UInt64(256 * 1024 * 1024))
                     Text("1 GiB").tag(UInt64(1024 * 1024 * 1024))
@@ -51,13 +54,20 @@ import AppKit
                 }
             }
             HStack(spacing: 8) {
-                Toggle("Match case", isOn: $model.caseSensitive).toggleStyle(.checkbox)
-                    .help("When off, use Unicode lowercase matching while retaining the original spelling and byte ranges")
+                Toggle("Match case", isOn: Binding(get: { model.mode == .occurrences || model.caseSensitive },
+                    set: { model.caseSensitive = $0 })).toggleStyle(.checkbox)
+                    .disabled(model.mode == .occurrences)
+                    .help(model.mode == .occurrences ? "Whole identifiers always match exact case."
+                        : "When off, use Unicode lowercase matching while retaining the original spelling and byte ranges")
                 Toggle("Count all matches", isOn: $model.countAllMatches).toggleStyle(.checkbox)
                     .help("Continue counting after the first 256 retained results, within the selected byte and read-call limits")
                 Text(model.countAllMatches
                     ? "Scan past the result limit; keep the first 256 results. Counts are exact only when the search completes."
                     : "The search stops when the result limit is reached.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if model.mode == .occurrences {
+                Text("Occurrences match one complete identifier with exact case, including comments and literals. ASCII letters, digits, _ and $ are token characters; an identifier cannot start with an ASCII digit. Non-ASCII runs use conservative boundaries. These are text candidates, without compiler resolution.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             HStack {
@@ -69,7 +79,9 @@ import AppKit
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text("Up to 256 retained results · literal text, not regular expressions")
+                Text(model.mode == .occurrences
+                    ? "Up to 256 retained results · whole-identifier text candidates"
+                    : "Up to 256 retained results · literal text, not regular expressions")
                     .font(.caption).foregroundStyle(.secondary)
             }
             if let progress = model.progress {
@@ -102,6 +114,7 @@ import AppKit
         .onChange(of: model.scanBytes) { _, _ in copyNotice = "" }
         .onChange(of: model.countAllMatches) { _, _ in copyNotice = "" }
         .onChange(of: model.caseSensitive) { _, _ in copyNotice = "" }
+        .onChange(of: model.mode) { _, _ in copyNotice = "" }
         .onChange(of: model.witness?.target) { _, _ in copyNotice = "" }
         .sheet(item: Binding(get: { model.currentContext }, set: { if $0 == nil { model.closeContext() } })) { context in
             AtlasObservedReaderView(presentation: context)

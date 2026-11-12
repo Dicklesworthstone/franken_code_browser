@@ -229,6 +229,45 @@ pub unsafe extern "C" fn fcb_atlas_stream_search_scoped_matching_progress(handle
     }))
 }
 
+/// Exact whole-identifier occurrences with bounded progress and independent
+/// count/row limits. Comments and literals are included; no compiler resolution
+/// is implied. Identifier syntax and token boundaries belong to the shared
+/// engine. All callbacks are optional for a terminal-only response.
+/// # Safety
+/// String, callback and return ownership requirements match
+/// fcb_atlas_stream_search_scoped_progress. No foreign pointer is retained.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_stream_search_scoped_occurrences_progress(handle: u64,
+    needle: *const c_char, max_matches: u64, max_scan_bytes: u64, max_read_calls: u64,
+    extensions: *const c_char, filenames: *const c_char, path_kind: u64, path: *const c_char,
+    count_all_matches: u64,
+    poll: Option<SearchCancellationCallback>, stop: Option<SearchCancellationCallback>,
+    progress: Option<AtlasStreamProgressCallback>, context: *mut c_void) -> *mut c_char {
+    reply(|| answer(handle, |atlases| {
+        let cancellation_seen = std::cell::Cell::new(false);
+        let canceled = || {
+            let requested = cancellation_seen.get()
+                || poll.is_some_and(|poll| unsafe { poll(context) != 0 });
+            cancellation_seen.set(requested);
+            requested
+        };
+        if canceled() { return Err(AccessError::Canceled); }
+        if count_all_matches > 1 { return Err(AccessError::InvalidArgument); }
+        let needle = unsafe { bounded_needle(needle) }?;
+        let scope = unsafe { bounded_scope(extensions, filenames, path_kind, path) }?;
+        let options = AtlasStreamSearchOptions { max_matches: number(max_matches)?, max_scan_bytes, max_read_calls };
+        atlases.execute_stream_scoped_occurrences_with_progress(handle, needle, options, &scope, count_all_matches == 1,
+            &canceled, || stop.is_some_and(|stop| unsafe { stop(context) != 0 }),
+            |response| {
+                if canceled() { return; }
+                if let Some(progress) = progress {
+                    let bytes = response.as_str().as_bytes();
+                    unsafe { progress(bytes.as_ptr(), bytes.len() as u64, context) };
+                }
+            })
+    }))
+}
+
 /// Page at most 32 retained rows, without source I/O. A missing or replaced
 /// generation is an error, never an empty successful result set.
 #[unsafe(no_mangle)]

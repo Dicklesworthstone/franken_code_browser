@@ -10,7 +10,8 @@
 enum { CREATE, OPEN, SEARCH, PAGE, HIT, CLEAR, CANCEL, CLOSE, POLLS,
     PROGRESS_SEARCH, PROGRESS_CALLBACKS, STOP_POLLS, STOP_SEEN, PROGRESS_CANCELED,
     SCOPED_SEARCH, SCOPED_PROGRESS, COUNTED_SEARCH, COUNTED_PROGRESS,
-    MATCHING_SEARCH, MATCHING_PROGRESS, MATCHING_COUNTED, COUNTERS };
+    MATCHING_SEARCH, MATCHING_PROGRESS, MATCHING_COUNTED,
+    OCCURRENCES_SEARCH, OCCURRENCES_PROGRESS, OCCURRENCES_COUNTED, COUNTERS };
 static uint32_t counts[COUNTERS], allocations, frees;
 static int32_t mode;
 static uint32_t expected_scope;
@@ -96,20 +97,22 @@ char *fcb_atlas_open_cancelable(uint64_t owner, const char *root, uint64_t maxim
     assert(strcmp(root, "/repo-\xc3\xa9") == 0); ++counts[OPEN]; poll_context(poll, context);
     assert(strcmp(root, "/repo-\xc3\xa9") == 0); return response(OPEN);
 }
-char *fcb_atlas_stream_search_cancelable(uint64_t owner, const char *needle, uint64_t maximum_matches,
-    uint64_t maximum_bytes, uint64_t maximum_calls, workspace_fixture_poll poll, void *context) {
+static char *fixture_search(uint64_t owner, const char *needle, uint64_t maximum_matches,
+    uint64_t maximum_bytes, uint64_t maximum_calls, workspace_fixture_poll poll, void *context,
+    const char *expected_needle) {
     assert(owner == owner_value && needle != NULL && maximum_matches == 256);
     assert(maximum_bytes == UINT64_C(4294967296) && maximum_calls == 1048576);
-    assert(strcmp(needle, "exact \xc3\xa9\xf0\x9f\x98\x80") == 0);
+    assert(strcmp(needle, expected_needle) == 0);
     ++counts[SEARCH]; poll_context(poll, context);
-    assert(strcmp(needle, "exact \xc3\xa9\xf0\x9f\x98\x80") == 0); return response(SEARCH);
+    assert(strcmp(needle, expected_needle) == 0); return response(SEARCH);
 }
-char *fcb_atlas_stream_search_progress(uint64_t owner, const char *needle, uint64_t maximum_matches,
+static char *fixture_progress(uint64_t owner, const char *needle, uint64_t maximum_matches,
     uint64_t maximum_bytes, uint64_t maximum_calls, workspace_fixture_poll poll,
-    workspace_fixture_poll stop, fcb_atlas_stream_progress_callback progress, void *context) {
+    workspace_fixture_poll stop, fcb_atlas_stream_progress_callback progress, void *context,
+    const char *expected_needle) {
     assert(owner == owner_value && needle != NULL && maximum_matches == 256);
     assert(maximum_bytes == UINT64_C(4294967296) && maximum_calls == 1048576);
-    assert(strcmp(needle, "exact \xc3\xa9\xf0\x9f\x98\x80") == 0);
+    assert(strcmp(needle, expected_needle) == 0);
     assert(poll != NULL && stop != NULL && progress != NULL && context != NULL);
     ++counts[PROGRESS_SEARCH]; ++counts[POLLS]; assert(poll(context) == 0);
     ++counts[STOP_POLLS];
@@ -129,8 +132,20 @@ char *fcb_atlas_stream_search_progress(uint64_t owner, const char *needle, uint6
     if (poll(context) != 0) { ++counts[PROGRESS_CANCELED]; return response(SEARCH); }
     ++counts[STOP_POLLS];
     if (stop(context) != 0) ++counts[STOP_SEEN];
-    assert(strcmp(needle, "exact \xc3\xa9\xf0\x9f\x98\x80") == 0);
+    assert(strcmp(needle, expected_needle) == 0);
     return response(SEARCH);
+}
+
+char *fcb_atlas_stream_search_cancelable(uint64_t owner, const char *needle, uint64_t maximum_matches,
+    uint64_t maximum_bytes, uint64_t maximum_calls, workspace_fixture_poll poll, void *context) {
+    return fixture_search(owner, needle, maximum_matches, maximum_bytes, maximum_calls, poll, context,
+        "exact \xc3\xa9\xf0\x9f\x98\x80");
+}
+char *fcb_atlas_stream_search_progress(uint64_t owner, const char *needle, uint64_t maximum_matches,
+    uint64_t maximum_bytes, uint64_t maximum_calls, workspace_fixture_poll poll,
+    workspace_fixture_poll stop, fcb_atlas_stream_progress_callback progress, void *context) {
+    return fixture_progress(owner, needle, maximum_matches, maximum_bytes, maximum_calls, poll,
+        stop, progress, context, "exact \xc3\xa9\xf0\x9f\x98\x80");
 }
 
 static void check_scope(const char *extensions, const char *filenames, uint64_t path_kind, const char *path) {
@@ -223,6 +238,29 @@ char *fcb_atlas_stream_search_scoped_matching_progress(uint64_t owner, const cha
         ++counts[MATCHING_PROGRESS];
         result = fcb_atlas_stream_search_progress(owner, needle, maximum_matches,
             maximum_bytes, maximum_calls, poll, stop, progress, context);
+    }
+    check_scope(extensions, filenames, path_kind, path);
+    return result;
+}
+char *fcb_atlas_stream_search_scoped_occurrences_progress(uint64_t owner, const char *needle,
+    uint64_t maximum_matches, uint64_t maximum_bytes, uint64_t maximum_calls,
+    const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
+    uint64_t count_all_matches, workspace_fixture_poll poll, workspace_fixture_poll stop,
+    fcb_atlas_stream_progress_callback progress, void *context) {
+    assert(count_all_matches <= 1);
+    counts[OCCURRENCES_COUNTED] += (uint32_t)count_all_matches;
+    check_scope(extensions, filenames, path_kind, path);
+    const char *identifier = "token_\xc3\xa9\xf0\x9f\x98\x80";
+    char *result;
+    if (stop == NULL && progress == NULL) {
+        ++counts[OCCURRENCES_SEARCH];
+        result = fixture_search(owner, needle, maximum_matches, maximum_bytes, maximum_calls,
+            poll, context, identifier);
+    } else {
+        assert(stop != NULL && progress != NULL);
+        ++counts[OCCURRENCES_PROGRESS];
+        result = fixture_progress(owner, needle, maximum_matches, maximum_bytes, maximum_calls,
+            poll, stop, progress, context, identifier);
     }
     check_scope(extensions, filenames, path_kind, path);
     return result;

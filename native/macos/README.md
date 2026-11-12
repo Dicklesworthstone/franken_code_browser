@@ -583,16 +583,38 @@ executable Rust/Swift verification and physical-Mac qualification.
 
 ## Searching large files across a project
 
-Choose **Search large project files…** in the search sidebar to search exact,
-case-sensitive text in the sidebar's selected location and file types, using a
-separately retained project catalog. Workspace, folder, exact file and frozen
+Choose **Search large project files…** in the search sidebar to search text or
+exact whole identifiers in the sidebar's selected location and file types,
+using a separately retained project catalog. Workspace, folder, exact file and frozen
 visible-atlas selections use the same predicates as ordinary search. Rust scopes
 include `Cargo.toml`; custom extension scopes keep their exact selected keys,
 and an empty custom scope searches no files.
 This route streams file contents through the shared Rust matcher, including
 files beyond the ordinary search's 1 MiB per-file and 32 MiB total capture limits.
 It recognizes UTF-8 and BOM-marked UTF-16 in either byte order. Queries contain
-1–1024 UTF-8 bytes; overlapping matches keep their exact original byte ranges.
+1–1024 UTF-8 bytes; overlapping text matches keep their exact original byte ranges.
+
+Choose **Text** for literal matching. **Match case** selects exact spelling;
+turning it off uses Unicode scalar lowercase matching without canonical
+normalization or full case folding. Lowercase results retain each match's
+original spelling and encoded bytes.
+
+Choose **Occurrences** for one complete, case-sensitive identifier. This route
+continues beyond the captured occurrence extractor's 512 KiB source allowance,
+subject to the same total scan limits as Text. It uses the same token policy as
+captured occurrences: ASCII letters, digits, underscore and dollar are token
+characters, and an identifier cannot start with an ASCII digit. Non-ASCII
+non-whitespace/non-control runs use conservative boundaries. Comments and
+string literals are included. These are text candidates, without compiler
+resolution or a claim of semantic completeness.
+
+The matcher carries token state across decoder windows and work quanta.
+Only an observed delimiter or actual source end can finish a matching token;
+a scan-budget cutoff does not turn a prefix of a longer token into a hit.
+Occurrences supports the same scopes, progress, Stop, cancellation and
+**Count all matches** options. Match case is fixed on in this mode; returning
+to Text restores the saved case preference. Opening from the sidebar's
+Occurrences mode selects it automatically.
 
 The sheet freezes the location and file-type selection when it opens. Moving the
 camera, changing the sidebar or refreshing the sheet's catalog cannot widen that
@@ -602,11 +624,12 @@ remain separately reported as missing requested files, preventing a false
 complete result. Location/type exclusions are reported separately from discovery
 policy exclusions and do not consume file-read, byte or result budgets.
 
-Open the sheet, enter the literal, choose **256 MiB**, **1 GiB**, or **4 GiB** as
+Open the sheet, enter the literal or identifier, choose **256 MiB**, **1 GiB**, or **4 GiB** as
 the total source I/O budget, and press **Search**. There is no per-file capture
 ceiling. The scan admits at most 1,048,576 read calls and retains at most 256
-matches. It uses a 16 KiB input buffer and stores one encoded literal witness
-per file with retained matches instead of retaining complete sources. While the scan runs,
+matches. It uses a 16 KiB input buffer. Exact Text and Occurrences share one
+encoded witness per file with retained matches; lowercase Text retains each
+hit's original spelling and bytes. Complete sources are not retained. While the scan runs,
 the sheet shows cumulative byte/read progress and previews up to the first 32
 matches from finalized file observations. The unfinished file contributes I/O
 progress, but its tentative matches are withheld until its observation finishes.
@@ -653,8 +676,11 @@ changes. **Read current context** explicitly opens the current canonical pathnam
 under the current project access grant, creates an independent observed reader,
 and checks the literal's original bytes before highlighting. Changed bytes are
 reported as changed; the earlier result never claims the new file's identity.
-Changing the query, refreshing the catalog, replacing the project or closing the
-sheet closes this child reader and revokes its actions synchronously.
+For an occurrence result, this comparison verifies the retained token bytes;
+it does not re-establish surrounding token boundaries or compiler binding.
+Changing the query, mode or case policy, refreshing the catalog, replacing the
+project or closing the sheet closes this child reader and revokes its actions
+synchronously.
 
 The safe host service is `fcb_app::host::atlas_stream_search`; native hosts use
 [`fcb_atlas_stream_search.h`](../../crates/fcb-bridge/include/fcb_atlas_stream_search.h)

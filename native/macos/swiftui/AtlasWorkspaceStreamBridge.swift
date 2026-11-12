@@ -34,6 +34,13 @@ private typealias WorkspaceStreamProgress = @convention(c) (
     _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ caseSensitive: UInt64, _ countAllMatches: UInt64,
     _ poll: WorkspaceStreamPoll?, _ stop: WorkspaceStreamPoll?, _ progress: WorkspaceStreamProgress?,
     _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_stream_search_scoped_occurrences_progress") private func workspaceStreamOccurrencesProgress(
+    _ owner: UInt64, _ needle: UnsafePointer<CChar>?, _ maximumMatches: UInt64,
+    _ maximumBytes: UInt64, _ maximumCalls: UInt64,
+    _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
+    _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ countAllMatches: UInt64,
+    _ poll: WorkspaceStreamPoll?, _ stop: WorkspaceStreamPoll?, _ progress: WorkspaceStreamProgress?,
+    _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_stream_search_page") private func workspaceStreamPage(
     _ owner: UInt64, _ generation: UInt64, _ start: UInt64, _ count: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_stream_search_hit") private func workspaceStreamHit(
@@ -53,6 +60,11 @@ extension AtlasWorkspaceStreamTransport {
             request.needle.withCString { needle in
                 request.fileScope.withCStrings { extensions, filenames in
                     request.pathScope.withCString { kind, path in
+                        if request.mode == .occurrences {
+                            return workspaceStreamOccurrencesProgress(owner, needle, request.maximumMatches,
+                                request.maximumScanBytes, request.maximumReadCalls, extensions, filenames,
+                                kind, path, request.countAllMatches ? 1 : 0, poll, nil, nil, context)
+                        }
                         if !request.caseSensitive {
                             return workspaceStreamSearchMatchingProgress(owner, needle, request.maximumMatches,
                                 request.maximumScanBytes, request.maximumReadCalls, extensions, filenames,
@@ -152,6 +164,12 @@ private func workspaceStreamProgressive(_ owner: UInt64, _ request: AtlasWorkspa
             let pointer = request.needle.withCString { needle in
                 request.fileScope.withCStrings { extensions, filenames in
                     request.pathScope.withCString { kind, path in
+                        if request.mode == .occurrences {
+                            return workspaceStreamOccurrencesProgress(owner, needle, request.maximumMatches,
+                                request.maximumScanBytes, request.maximumReadCalls, extensions, filenames,
+                                kind, path, request.countAllMatches ? 1 : 0,
+                                poll, stopped, receive, Unmanaged.passUnretained(box).toOpaque())
+                        }
                         if !request.caseSensitive {
                             return workspaceStreamSearchMatchingProgress(owner, needle, request.maximumMatches,
                                 request.maximumScanBytes, request.maximumReadCalls, extensions, filenames,

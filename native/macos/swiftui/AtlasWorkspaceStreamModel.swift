@@ -53,9 +53,11 @@ struct AtlasWorkspaceStreamSourceIdentity: Equatable, Sendable {
     private var started = false
     private var retired = false
     init(source: AtlasWorkspaceStreamSource, query: String, caseSensitive: Bool = true,
-         countAllMatches: Bool = false, transport: AtlasWorkspaceStreamTransport) {
+         countAllMatches: Bool = false, mode: AtlasWorkspaceStreamMode = .text,
+         transport: AtlasWorkspaceStreamTransport) {
         self.source = source
-        model = .init(transport: transport, query: query, caseSensitive: caseSensitive, countAllMatches: countAllMatches)
+        model = .init(transport: transport, query: query, caseSensitive: caseSensitive,
+            countAllMatches: countAllMatches, mode: mode)
     }
     func start() {
         guard !started, !retired else { return }
@@ -247,6 +249,9 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
     var caseSensitive = true {
         didSet { if oldValue != caseSensitive { revokeQuery() } }
     }
+    var mode: AtlasWorkspaceStreamMode = .text {
+        didSet { if oldValue != mode { revokeQuery() } }
+    }
     @ObservationIgnored private let transport: AtlasWorkspaceStreamTransport
     @ObservationIgnored private let io = AtlasProjectIO()
     @ObservationIgnored private var authority: AtlasWorkspaceStreamSource?
@@ -260,9 +265,10 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
     @ObservationIgnored private var progressMailbox: AtlasWorkspaceStreamProgressMailbox?
 
     init(transport: AtlasWorkspaceStreamTransport, query: String = "",
-         caseSensitive: Bool = true, countAllMatches: Bool = false) {
+         caseSensitive: Bool = true, countAllMatches: Bool = false,
+         mode: AtlasWorkspaceStreamMode = .text) {
         self.transport = transport; queryText = query
-        self.caseSensitive = caseSensitive; self.countAllMatches = countAllMatches
+        self.caseSensitive = caseSensitive; self.countAllMatches = countAllMatches; self.mode = mode
     }
     deinit { task?.cancel() }
     static func retryRetirements() { AtlasWorkspaceStreamRetirement.shared.retry() }
@@ -275,7 +281,7 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
         guard let authority else { throw AtlasWorkspaceStreamError.unavailable }
         return try .init(needle: queryText, maximumScanBytes: scanBytes,
             fileScope: authority.fileScope, pathScope: authority.pathScope,
-            countAllMatches: countAllMatches, caseSensitive: caseSensitive)
+            countAllMatches: countAllMatches, caseSensitive: mode == .occurrences || caseSensitive, mode: mode)
     }
     var canRefresh: Bool { !closed && authority != nil }
     var canStopAndKeep: Bool { !closed && busy && searching && !stopping && stopFlag != nil }

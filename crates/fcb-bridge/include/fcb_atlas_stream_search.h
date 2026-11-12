@@ -148,6 +148,35 @@ char *fcb_atlas_stream_search_scoped_matching_progress(uint64_t handle, const ch
     int32_t (*poll)(void *context), int32_t (*stop)(void *context),
     fcb_atlas_stream_progress_callback progress, void *context);
 
+/* Exact whole-identifier occurrences through the same bounded streaming
+ * decoder, with no per-file capture limit. count_all_matches is exactly 0 or 1;
+ * all callbacks may be NULL. Scope and callback ownership match the APIs above.
+ *
+ * The shared captured/streaming token policy admits ASCII letters, digits,
+ * underscore and dollar; an identifier cannot start with an ASCII digit.
+ * Non-ASCII non-whitespace/non-control runs are conservative token content.
+ * needle must be one complete identifier. Matching is case-sensitive, includes
+ * comments and literals, and performs no compiler or language-server resolution.
+ * A delimiter or actual observed end of source completes a token; a decoder
+ * window, work quantum or scan-budget boundary cannot manufacture a match.
+ *
+ * search/progress/page/hit echo mode=whole-token-occurrences, case_sensitive=true,
+ * evidence_level=whole-token-text-candidate, includes_comments_and_literals=true,
+ * compiler_resolved=false and semantic_complete=false. After ordinary needle
+ * admission, invalid identifier syntax returns STREAM_READ_INVALID_IDENTIFIER
+ * and preserves the accepted inventory.
+ * Retained witnesses are exact encoded token bytes with shared per-file storage.
+ * Opening current context verifies those literal bytes, not unchanged neighboring
+ * token boundaries or symbol identity. Coverage and count completeness retain
+ * their separate existing meanings.
+ */
+char *fcb_atlas_stream_search_scoped_occurrences_progress(uint64_t handle, const char *needle,
+    uint64_t max_matches, uint64_t max_scan_bytes, uint64_t max_read_calls,
+    const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
+    uint64_t count_all_matches,
+    int32_t (*poll)(void *context), int32_t (*stop)(void *context),
+    fcb_atlas_stream_progress_callback progress, void *context);
+
 /* No source I/O. generation must identify the accepted report; start is a
  * zero-based retained-row position and count is 1..32. next_offset=null means
  * the end of the terminal retained rows, not proof of full source coverage.

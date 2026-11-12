@@ -403,7 +403,8 @@ private struct AtlasFrozenViewportSearch: Sendable {
             access: authority.access, fileScope: types, pathScope: pathScope)
         workspaceStreamSearch = AtlasWorkspaceStreamPresentation(source: source,
             query: query, caseSensitive: searchCaseSensitive,
-            countAllMatches: searchCountAllMatches, transport: .native)
+            countAllMatches: searchCountAllMatches,
+            mode: searchMode == .occurrences ? .occurrences : .text, transport: .native)
     }
 
     private func closeWorkspaceStreamSearch() {

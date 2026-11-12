@@ -11,6 +11,15 @@ enum AtlasWorkspaceStreamLimits {
     static let responseBytes = 8 * 1024 * 1024
 }
 
+enum AtlasWorkspaceStreamMode: String, CaseIterable, Identifiable, Sendable {
+    case text, occurrences
+    var id: String { rawValue }
+    var label: String { self == .text ? "Text" : "Occurrences" }
+    func wireMode(caseSensitive: Bool) -> String {
+        self == .occurrences ? "whole-token-occurrences" : AtlasSearchText.wireMode(caseSensitive: caseSensitive)
+    }
+}
+
 enum AtlasWorkspaceStreamError: Error, Sendable {
     case invalidInput, unavailable, invalidResponse, canceled
     case engine(String)
@@ -20,6 +29,8 @@ enum AtlasWorkspaceStreamError: Error, Sendable {
         case .unavailable: return "Large-file project search is unavailable. Close another search or refresh this file catalog."
         case .invalidResponse: return "The search response could not be verified. Previously accepted evidence is unchanged."
         case .canceled: return "Search canceled. Entered file work may still be draining."
+        case .engine("STREAM_READ_INVALID_IDENTIFIER"):
+            return "Enter one exact identifier without spaces or ASCII punctuation other than _ and $. An identifier cannot start with an ASCII digit."
         case .engine(let code): return "The requested search operation is unavailable (\(code))."
         }
     }
@@ -32,30 +43,33 @@ struct AtlasWorkspaceStreamRequest: Equatable, Sendable {
     let pathScope: AtlasSearchPathScope
     let countAllMatches: Bool
     let caseSensitive: Bool
+    let mode: AtlasWorkspaceStreamMode
     init(needle: String, maximumScanBytes: UInt64 = AtlasWorkspaceStreamLimits.scanBytes,
          maximumMatches: UInt64 = AtlasWorkspaceStreamLimits.hits,
          maximumReadCalls: UInt64 = AtlasWorkspaceStreamLimits.readCalls,
          fileScope: AtlasSearchFileScope = .all,
          pathScope: AtlasSearchPathScope = .workspace,
-         countAllMatches: Bool = false, caseSensitive: Bool = true) throws {
+         countAllMatches: Bool = false, caseSensitive: Bool = true,
+         mode: AtlasWorkspaceStreamMode = .text) throws {
         guard !needle.isEmpty, needle.utf8.count <= AtlasWorkspaceStreamLimits.needleBytes,
               !needle.utf8.contains(0), (1...AtlasWorkspaceStreamLimits.hits).contains(maximumMatches),
               (1...AtlasWorkspaceStreamLimits.maximumScanBytes).contains(maximumScanBytes),
-              (1...AtlasWorkspaceStreamLimits.readCalls).contains(maximumReadCalls) else {
+              (1...AtlasWorkspaceStreamLimits.readCalls).contains(maximumReadCalls),
+              mode != .occurrences || caseSensitive else {
             throw AtlasWorkspaceStreamError.invalidInput
         }
         self.needle = needle; self.maximumScanBytes = maximumScanBytes
         self.maximumMatches = maximumMatches; self.maximumReadCalls = maximumReadCalls
         self.fileScope = fileScope; self.pathScope = pathScope
         self.countAllMatches = countAllMatches
-        self.caseSensitive = caseSensitive
+        self.caseSensitive = caseSensitive; self.mode = mode
     }
     static func == (a: Self, b: Self) -> Bool {
         a.needle.utf8.elementsEqual(b.needle.utf8) && a.maximumMatches == b.maximumMatches
             && a.maximumScanBytes == b.maximumScanBytes && a.maximumReadCalls == b.maximumReadCalls
             && a.fileScope == b.fileScope && a.pathScope == b.pathScope
             && a.countAllMatches == b.countAllMatches
-            && a.caseSensitive == b.caseSensitive
+            && a.caseSensitive == b.caseSensitive && a.mode == b.mode
     }
 }
 
@@ -153,7 +167,10 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
         return "\(retainedHits) retained matches · partial search"
     }
     var coverage: String {
-        var result = "Examined \(examinedFiles) of \(eligibleFiles) eligible files; \(excludedFiles) catalogued files excluded by location or file type. \(unexaminedFiles) eligible files remain unexamined, \(incompleteFiles) incomplete (\(unavailableFiles) unavailable, \(unsupportedFiles) unsupported text, \(failedFiles) failed reads). "
+        var result = request.mode == .occurrences
+            ? "Exact whole-identifier text candidates, including comments and literals; no compiler resolution. "
+            : (request.caseSensitive ? "Exact text matching. " : "Unicode lowercase matching without canonical normalization or full case folding. ")
+        result += "Examined \(examinedFiles) of \(eligibleFiles) eligible files; \(excludedFiles) catalogued files excluded by location or file type. \(unexaminedFiles) eligible files remain unexamined, \(incompleteFiles) incomplete (\(unavailableFiles) unavailable, \(unsupportedFiles) unsupported text, \(failedFiles) failed reads). "
         result += "Scanned \(scannedBytes) bytes; read \(payloadBytes) bytes in \(readCalls) calls. "
         if request.countAllMatches && truncated {
             result += "The result list retains the first \(retainedHits) matches in \(retainedMatchingFiles) files; counts include later matches. "
@@ -172,7 +189,7 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
 
     fileprivate static func decode(_ w: AtlasWorkspaceStreamWire, catalog: AtlasWorkspaceStreamCatalog,
                                    root: String, request: AtlasWorkspaceStreamRequest, terminal: Bool = true) throws -> Self {
-        let identity = try w.streamIdentity(owner: catalog.owner, root: root, caseSensitive: request.caseSensitive)
+        let identity = try w.streamIdentity(owner: catalog.owner, root: root, caseSensitive: request.caseSensitive, mode: request.mode)
         let limit = try w.object("limits")
         let files = try w.number("catalogued_files"), examined = try w.number("files_examined")
         let unexamined = try w.number("files_unexamined"), incomplete = try w.number("incomplete_files")
@@ -311,7 +328,7 @@ struct AtlasWorkspaceStreamPage: Sendable {
                        offset: UInt64 = 0, requireTerminal: Bool = false) throws -> Self {
         let w = try AtlasWorkspaceStreamWire.read(json, owner: catalog.owner)
         do {
-            try w.terminalState(expected: true, required: requireTerminal)
+            try w.terminalState(expected: true, required: requireTerminal || request.mode == .occurrences)
             return try decode(w, catalog: catalog, root: root, request: request,
                 command: previous == nil ? "search" : "page", terminal: true, previous: previous, offset: offset)
         } catch { throw AtlasWorkspaceStreamError.invalidResponse }
@@ -467,7 +484,7 @@ struct AtlasWorkspaceStreamWitness: Sendable {
                 complete: report.summary.complete, matchingFiles: report.summary.matchingFiles)
             guard report.admits(target),
                   try w.streamIdentity(owner: target.identity.owner, root: root,
-                    caseSensitive: report.summary.request.caseSensitive) == target.identity,
+                    caseSensitive: report.summary.request.caseSensitive, mode: report.summary.request.mode) == target.identity,
                   scope.eligible == report.summary.eligibleFiles, scope.excluded == report.summary.excludedFiles,
                   scope.missing == report.summary.missingVisibleFiles,
                   counting.complete == report.summary.matchCountComplete,
@@ -539,7 +556,7 @@ struct AtlasWorkspaceStreamWire: Decodable {
         matchingFiles: UInt64) throws -> (complete: Bool, retainedFiles: UInt64) {
         let required = ["count_all_matches", "match_count_complete", "retained_matching_files"]
         guard required.contains(where: { fields.contains(Key($0)) }) else {
-            guard !request.countAllMatches else { throw AtlasWorkspaceStreamError.invalidResponse }
+            guard request.mode == .text, !request.countAllMatches else { throw AtlasWorkspaceStreamError.invalidResponse }
             return (complete, matchingFiles)
         }
         guard required.allSatisfy({ fields.contains(Key($0)) }),
@@ -560,7 +577,7 @@ struct AtlasWorkspaceStreamWire: Decodable {
             "scope_region_catalogued_files", "scope_region_missing_files"]
         let present = (required + region).contains { fields.contains(Key($0)) }
         guard present else {
-            guard request.fileScope.isAll, request.pathScope.isWorkspace, request.caseSensitive else {
+            guard request.mode == .text, request.fileScope.isAll, request.pathScope.isWorkspace, request.caseSensitive else {
                 throw AtlasWorkspaceStreamError.invalidResponse
             }
             return (catalogued, 0, 0)
@@ -620,16 +637,23 @@ struct AtlasWorkspaceStreamWire: Decodable {
         guard try text("schema") == schema, try text("status") == "ok", try text("command") == command,
               try number("owner") == owner else { throw AtlasWorkspaceStreamError.invalidResponse }
     }
-    func streamIdentity(owner: UInt64, root: String, caseSensitive: Bool) throws -> AtlasWorkspaceStreamIdentity {
+    func streamIdentity(owner: UInt64, root: String, caseSensitive: Bool,
+        mode: AtlasWorkspaceStreamMode = .text) throws -> AtlasWorkspaceStreamIdentity {
         let manifest = try number("source_manifest"), layout = try number("layout_revision")
         let generation = try number("query_generation"), rawRoot = try object("root_path").pathBytes()
         guard try number("owner") == owner, manifest > 0, layout > 0, generation > 0,
               try number("last_attempt") >= generation,
               rawRoot.elementsEqual(root.utf8), try text("scope") == "catalogued-whole-files",
-              try text("strategy") == "streaming-whole-file", try text("mode") == AtlasSearchText.wireMode(caseSensitive: caseSensitive),
+              try text("strategy") == "streaming-whole-file", try text("mode") == mode.wireMode(caseSensitive: caseSensitive),
               try text("capture_kind") == "literal-witnesses-only",
               try text("source_observation") == "per-file-streams-not-atomic-workspace" else {
             throw AtlasWorkspaceStreamError.invalidResponse
+        }
+        if mode == .occurrences {
+            guard caseSensitive, try flag("case_sensitive"),
+                  try text("evidence_level") == "whole-token-text-candidate",
+                  try flag("includes_comments_and_literals"), try flag("compiler_resolved") == false,
+                  try flag("semantic_complete") == false else { throw AtlasWorkspaceStreamError.invalidResponse }
         }
         for key in ["capture_sha256", "whole_file_sha256", "source_revision", "capture_byte_length"] where fields.contains(Key(key)) {
             guard try fields.decodeNil(forKey: Key(key)) else { throw AtlasWorkspaceStreamError.invalidResponse }
