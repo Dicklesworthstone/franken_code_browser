@@ -213,6 +213,28 @@ They execute the actual packaging scripts with fake compiler/signing tools and
 retain their fixture logs. They establish packaging control flow, not native
 compilation, code-signing validity, Launch Services behavior or rendering.
 
+## Searching saved repository text
+
+Open **Saved Repository → Search → Literal** to search the captured FCBS archive.
+**Match case** starts enabled. Turn it off for the same Unicode scalar lowercase
+matching used by live text search; neither mode applies full case folding,
+canonical normalization, or expression syntax. **Count all matches** remains
+independent of the 4,096 retained result limit and does not turn partial archive
+coverage into a complete count.
+
+Lowercase queries scan verified saved members directly, because exact FCBD
+postings cannot establish absence under a different matching policy. An
+attached index stays available for subsequent exact searches. The accepted
+query's case policy follows its counts, result pages and source activation.
+Changing the draft's policy disables actions on the previous results;
+**Use accepted query** restores those inputs without rescanning.
+
+**Read source** opens the exact original-byte occurrence, preserving the actual
+UTF-8 or UTF-16 spelling even when the query matches a lowercase expansion.
+The source reader remains independently usable after the archive closes.
+Case/mode, byte-witness, index-bypass, cancellation and native ABI regressions
+are included; executable verification remains pending.
+
 ## Searching saved repository structure
 
 Open **Saved Repository**, choose an FCBS archive, and use **Search** to select
@@ -285,7 +307,8 @@ bounded manifest and keeps a 64 KiB page cache. Posting pages are verified when
 read, and candidate matches still verify the exact saved source. The UI shows
 indexed, uncovered and unavailable member counts. Short literals, uncovered
 members and text encodings without compatible postings retain direct scanning.
-Expression and structural searches use their independent direct source scans.
+Unicode lowercase literal, expression and structural searches use direct source scans;
+the accepted query reports which policy actually ran.
 
 Each accepted literal result reports its own index generation, eliminated
 members, direct-scan fallbacks and postings visited. **Reload index status**
@@ -838,8 +861,28 @@ generation.
 
 The bundled upstream shaping profile does not cover every writing system or
 combining sequence. Unsupported text leaves Text and the exact source readable.
-Images show alt-text placeholders and do not trigger asset or network loads;
-math and diagrams may use the upstream textual fallback. If source provenance
+Local PNG/JPEG images can now fill the upstream image slots in Styled mode.
+Opening a current project file supplies its explicit folder access alongside the
+reader's native lease. Before the first image read, Rust verifies that the
+current Markdown still matches the retained capture exactly. Saved/offline
+readers have no implicit local-image authority. Images are current local
+observations, not historical assets reconstructed from the source capture.
+
+The reader admits at most 4 MiB of encoded data per image, 8 MiB and 16 images
+per document, and returns identity-checked chunks with an exact content digest.
+The native worker verifies that digest, accepts a complete single-frame PNG or
+JPEG with at most 8,192 pixels per side and 16,777,216 source pixels, and makes
+a display-sized thumbnail of at most 1,024 pixels per side. A page retains at
+most 16 MiB of decoded RGBA pixels; codec working memory is a separate bound.
+Decode and final pixel retirement run off the interaction thread. Drawing only
+aspect-fits the prepared pixels in FrankenMarkdown's existing rectangle.
+
+Remote URLs, missing/currently changed sources, unavailable folder access,
+unsupported formats and exceeded limits leave alt-text placeholders with
+coverage information. No image request fetches the network. These additions
+include real PNG/JPEG pixel, framing, resource, source-authority and cancellation
+regressions; executable and physical-Mac qualification remain pending.
+Math and diagrams may use the upstream textual fallback. If source provenance
 cannot be qualified, the styled content can remain readable with source actions
 unavailable. These additions have wire, lifecycle, adapter, host and C-ABI
 regression cases, but executable and physical-Mac rendering qualification remain

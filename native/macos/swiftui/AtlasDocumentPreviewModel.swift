@@ -129,10 +129,12 @@ struct AtlasExternalWebLink: Sendable {
         let inventory = page.inventory
         let status = authorized ? "" : "Previous preview is read-only; prepare again before navigating or copying. "
         if showsStyled, let display = displayPage {
+            let imageSlots = display.items.filter { if case .image = $0.content { return true }; return false }.count
+            let imageCoverage = imageSlots == 0 ? "" :
+                "\(display.images.count) local images loaded, \(imageSlots - display.images.count) placeholders on this page. "
             return status + "FrankenMarkdown typography with bundled fonts. "
                 + "\(display.items.count) of \(display.inventory.totalItems) display elements shown. "
-                + (display.inventory.unresolvedImages > 0
-                    ? "\(display.inventory.unresolvedImages) images use placeholders; no assets are fetched. " : "")
+                + imageCoverage + (display.imageNotice.map { $0 + " " } ?? "")
                 + (display.inventory.qualifiedSources
                     ? "Source actions select enclosing Markdown blocks."
                     : "Source regions could not be qualified for this layout; use Text or the source reader.")
@@ -140,7 +142,7 @@ struct AtlasExternalWebLink: Sendable {
         return status + "Logical FrankenMarkdown flow, not native shaped document layout. "
             + "\(page.lines.count) of \(inventory.totalLines) flow rows shown at \(inventory.width) columns. "
             + "Source links select enclosing Markdown regions, not glyph-exact spans. "
-            + "Width changes return to the start of the first mapped Markdown region shown. Web links open only through Open in browser; assets are not fetched."
+            + "Width changes return to the start of the first mapped Markdown region shown. Web links open only through Open in browser. Local images load in Styled mode with current project folder access."
     }
 
     /// Same-capture source paging changes only the synchronization anchor.

@@ -67,6 +67,9 @@ struct AtlasReaderReplacement: Sendable {
 struct AtlasReaderRetainedInitialization: Sendable {
     let info: AtlasReaderInfo
     let initialOriginalOffset: UInt64
+    /// Only an explicitly authorized current-project handoff may provide this.
+    /// Default saved/desk transfers supply neither image authority nor a lease.
+    var imageSource: AtlasDocumentImageSource? = nil
 }
 
 /// Keep the validated request with its page so initial navigation history uses
@@ -154,7 +157,9 @@ private final class AtlasReaderSession: @unchecked Sendable {
     private var session: AtlasReaderSession?
     private var info: AtlasReaderInfo?
     private var pendingSession: AtlasReaderSession?
-    private var stagedCapture: (id: UUID, info: AtlasReaderInfo, page: AtlasReaderPage)?
+    private var stagedCapture: (id: UUID, info: AtlasReaderInfo, page: AtlasReaderPage,
+                                imageSource: AtlasDocumentImageSource?)?
+    private var documentImageSource: AtlasDocumentImageSource?
     private var cancellation: AtlasSearchCancellation?
     private var operation = UUID()
     private var activeTextSelection: UUID?
@@ -185,8 +190,10 @@ private final class AtlasReaderSession: @unchecked Sendable {
 
     /// Open a caller-authorized retained capture into an EMPTY destination in
     /// the same native registry. The initializer runs in the existing reader
-    /// worker lane; it never invokes transport.open or supplies a native grant.
+    /// worker lane; it never invokes transport.open.
     /// Its closure retains the exporting service until the foreign call drains.
+    /// The typed overload can additionally accept an explicit current-project
+    /// image capability plus its lease; ordinary retained transfers stay inert.
     func openRetained(label: String, offset: UInt64, registryDomain: UUID,
         initialize: @escaping @Sendable (UInt64) throws -> String?) async throws -> AtlasReaderPage {
         guard label.utf8.count <= 16_384 else { throw AtlasReaderError.invalidInput }
@@ -214,12 +221,13 @@ private final class AtlasReaderSession: @unchecked Sendable {
         }
         return opened.page
     }
-    func openRetained(registryDomain: UUID,
+    func openRetained(registryDomain: UUID, accessLease: AnyObject? = nil,
         initialize: @escaping @Sendable (UInt64) throws -> AtlasReaderRetainedInitialization) async throws -> AtlasReaderRetainedPage {
         try Task.checkCancellation()
         guard session == nil, pendingSession == nil, info == nil,
               transport.comparison?.domain == registryDomain else { throw AtlasReaderError.unavailable }
-        let next = try AtlasReaderSession(transport: transport, accessLease: nil)
+        let hasImageAccess = accessLease != nil
+        let next = try AtlasReaderSession(transport: transport, accessLease: accessLease)
         cancel()
         pendingSession = next
         let ticket = UUID(), flag = AtlasSearchCancellation()
@@ -236,19 +244,25 @@ private final class AtlasReaderSession: @unchecked Sendable {
                           offset <= info.identity.capturedBytes else {
                         throw AtlasReaderError.invalidResponse
                     }
+                    if let source = initialization.imageSource {
+                        guard hasImageAccess,
+                              source.relativePath.utf8.elementsEqual(info.identity.pathBytes) else {
+                            throw AtlasReaderError.invalidResponse
+                        }
+                    }
                     guard !flag.isCanceled else { throw AtlasReaderError.canceled }
                     let request = AtlasReaderRequest.window(offset: offset, bytes: AtlasReaderLimits.pageBytes)
                     try request.validate(capturedBytes: info.identity.capturedBytes)
                     let page = try AtlasReaderPage.decode(
                         next.transport.window(next.handle, offset, request.byteLimit), info: info, request: request)
-                    return (info, AtlasReaderRetainedPage(page: page, request: request))
+                    return (info, AtlasReaderRetainedPage(page: page, request: request), initialization.imageSource)
                 }
             }, onCancel: { flag.cancel(); next.cancel() })
             try Task.checkCancellation()
             guard pendingSession === next, operation == ticket, !flag.isCanceled else {
                 throw AtlasReaderError.canceled
             }
-            session = next; info = result.0
+            session = next; info = result.0; documentImageSource = result.2
             pendingSession = nil; cancellation = nil; operation = UUID()
             return result.1
         } catch {
@@ -348,6 +362,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
             bytes: max(4, min(AtlasReaderLimits.maximumPageBytes, original.end - original.start)))
         guard original.position == nil || transport.position != nil else { throw AtlasReaderError.unavailable }
         try request.validate(capturedBytes: sourceInfo.identity.capturedBytes)
+        let imageSource = parent.documentImageSource
         let next = try AtlasReaderSession(transport: transport, sharingAccessFrom: source)
         pendingSession = next
         let ticket = UUID()
@@ -399,6 +414,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
             }
             session = next
             info = result.0
+            documentImageSource = imageSource
             pendingSession = nil
             cancellation = nil
             operation = UUID()
@@ -422,8 +438,9 @@ private final class AtlasReaderSession: @unchecked Sendable {
 
     /// Convenience for callers with no separate presentation transaction. An
     /// unsuccessful replacement preserves the previous accepted reader.
-    func open(input: AtlasReaderInput, accessLease: AnyObject? = nil) async throws -> AtlasReaderPage {
-        let replacement = try await stageOpen(input: input, accessLease: accessLease)
+    func open(input: AtlasReaderInput, accessLease: AnyObject? = nil,
+              imageSource: AtlasDocumentImageSource? = nil) async throws -> AtlasReaderPage {
+        let replacement = try await stageOpen(input: input, accessLease: accessLease, imageSource: imageSource)
         do {
             try Task.checkCancellation()
             return try commitOpen(replacement)
@@ -439,6 +456,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
     /// An explicit live refresh can supply the original live transport instead
     /// of a search-capture-only adapter; this never happens as a fallback.
     func stageOpen(input: AtlasReaderInput, accessLease: AnyObject? = nil,
+                   imageSource: AtlasDocumentImageSource? = nil,
                    using replacementTransport: AtlasReaderTransport? = nil) async throws -> AtlasReaderReplacement {
         try Task.checkCancellation()
         // Empty-handle admission performs no filesystem work. A refused new
@@ -463,7 +481,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
             }
             guard pendingSession === next, operation == ticket, !flag.isCanceled,
                   !Task.isCancelled else { throw AtlasReaderError.canceled }
-            stagedCapture = (ticket, result.0, result.1)
+            stagedCapture = (ticket, result.0, result.1, imageSource)
             cancellation = nil
             return AtlasReaderReplacement(id: ticket)
         } catch {
@@ -490,6 +508,9 @@ private final class AtlasReaderSession: @unchecked Sendable {
         }
         session = next
         info = staged.info
+        // Keep this explicit capability with the accepted session and its
+        // native grant. Retained-only initialization never supplies one.
+        documentImageSource = staged.imageSource
         pendingSession = nil
         stagedCapture = nil
         cancellation = nil
@@ -782,7 +803,10 @@ private final class AtlasReaderSession: @unchecked Sendable {
         guard let session, let info, let document = documentTransport else {
             throw AtlasReaderError.unavailable
         }
-        let job = try documentState.admit(request, info: info)
+        var job = try documentState.admit(request, info: info)
+        job.imageSource = documentImageSource
+        // Capture an immutable descriptor for the worker's Sendable closure.
+        let admitted = job
         cancel()
         activeDocumentJob = job
         let ticket = UUID()
@@ -790,9 +814,11 @@ private final class AtlasReaderSession: @unchecked Sendable {
         let flag = AtlasSearchCancellation()
         cancellation = flag
         do {
-            let result = try await io.perform(cancellation: flag, keepingAlive: [session]) {
-                try job.execute(document, canceled: { flag.isCanceled })
-            }
+            let result = try await withTaskCancellationHandler(operation: {
+                try await io.perform(cancellation: flag, keepingAlive: [session]) {
+                    try admitted.execute(document, canceled: { flag.isCanceled })
+                }
+            }, onCancel: { flag.cancel(); session.cancel() })
             guard self.session === session, operation == ticket, !flag.isCanceled,
                   !Task.isCancelled else {
                 throw AtlasReaderError.canceled
@@ -854,6 +880,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
         // Counters belong to this coordinator, not a capture. Old query
         // targets must not become current after close/open of identical bytes.
         documentState.close()
+        documentImageSource = nil
         session = nil
     }
 

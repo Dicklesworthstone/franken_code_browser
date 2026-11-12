@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(CryptoKit)
+import CryptoKit
+#endif
 
 // Actual native decoder fixtures, not proof of Rust shaping or native pixels.
 @main enum AtlasDocumentDisplayTests {
@@ -58,6 +61,167 @@ import Foundation
             _ = try decodeAnchor(wire, offset: offset)
             preconditionFailure("Accepted invalid source-anchored display: \(label)")
         } catch { }
+    }
+    static func path(_ text: String) -> [String: String] {
+        ["encoding": "unix-bytes", "hex": text.utf8.map { String(format: "%02x", $0) }.joined(), "display": text]
+    }
+    static func imagePageWire() -> [String: Any] {
+        var w = wire(), row = item()
+        row.removeValue(forKey: "glyphs")
+        row["kind"] = "image"; row["request_id"] = "44"; row["destination"] = "images/café.png"
+        row["alt_text"] = "Actual source image"; row["is_resolved"] = false
+        w["display_items"] = [row]; w["fonts"] = [[String: Any]](); w["unresolved_images"] = "1"
+        return w
+    }
+    static func imageAuthorityWire() -> [String: Any] {
+        var w = imagePageWire()
+        w["command"] = "document-images-authorize"
+        w["requested_root"] = path("/p"); w["asset_root"] = path("/canonical/p")
+        w["source_relative"] = path("README.md")
+        w["capture_sha256"] = String(repeating: "ab", count: 32)
+        w["images_authorized"] = true; w["source_authority"] = "verified-current-source"
+        w["authorization_reused"] = false
+        w["source_verification_bytes_read"] = "20"; w["source_verification_read_calls"] = "1"
+        w["additional_source_bytes_read"] = "20"
+        w["max_image_bytes"] = "4194304"; w["max_image_cache_bytes"] = "8388608"
+        w["max_images"] = "16"; w["max_image_chunk_bytes"] = "65536"
+        w["retained_image_bytes"] = "0"; w["retained_images"] = "0"
+        return w
+    }
+    static func authorize(_ w: [String: Any]) throws -> AtlasDocumentImageAuthorization {
+        try AtlasDocumentDisplayWire.imageAuthorization(json(w), document: document, root: "/p", sourceRelative: "README.md")
+    }
+    static func preparedImageWire(total: Int = 3) -> [String: Any] {
+        var w = imageAuthorityWire()
+        w["command"] = "document-image-prepare"; w["additional_source_bytes_read"] = "0"
+        w["item_index"] = "0"; w["request_id"] = "44"; w["destination"] = "images/café.png"
+        w["enclosing_original_range"] = ["start": "0", "end": "20"]
+        w["image_sha256"] = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        w["image_format"] = "png"; w["format_validation"] = "signature-only"
+        w["decoded"] = false; w["image_observation"] = "current-root-capture"
+        w["total_image_bytes"] = String(total); w["image_offset"] = "0"
+        w["image_bytes"] = String(min(total, 65536))
+        // These receipt bytes test framing and digests, not image decoding.
+        // The native image lane below uses actual PNG/JPEG encoded fixtures.
+        w["image_hex"] = total == 3 ? "616263" : String(repeating: "00", count: min(total, 65536))
+        if total > 65536 { w["next_image_offset"] = "65536" } else { w["next_image_offset"] = NSNull() }
+        w["image_bytes_read"] = String(total); w["image_read_calls"] = "1"
+        w["retained_image_bytes"] = String(total); w["retained_images"] = "1"
+        return w
+    }
+    static func imageReceipts() throws {
+        let page = try decode(imagePageWire()), target = page.imageTargets[0]
+        precondition(target.itemIndex == 0 && target.requestID == 44 && target.destination == "images/café.png")
+        precondition(page.images.isEmpty && page.imageNotice == nil)
+        var unqualified = imagePageWire()
+        unqualified["source_ranges_qualified"] = false
+        var unqualifiedRow = (unqualified["display_items"] as! [[String: Any]])[0]
+        unqualifiedRow["enclosing_original_range"] = NSNull(); unqualified["display_items"] = [unqualifiedRow]
+        let unmapped = try decode(unqualified)
+        precondition(unmapped.imageTargets.isEmpty, "Unqualified source must never request an asset read")
+        let authority = try authorize(imageAuthorityWire())
+        precondition(authority.requestedRoot == Array("/p".utf8) && authority.assetRoot == Array("/canonical/p".utf8))
+        for inventory in [page.inventory, unmapped.inventory] {
+            let missingEvidence = AtlasDocumentDisplayImageTarget(inventory: inventory, itemIndex: target.itemIndex,
+                requestID: target.requestID, destination: target.destination, bounds: target.bounds, original: nil)
+            var forged = preparedImageWire(); forged["enclosing_original_range"] = NSNull()
+            do {
+                _ = try AtlasDocumentDisplayWire.imagePrepared(json(forged), target: missingEvidence, authorization: authority)
+                preconditionFailure("Image receipt accepted missing enclosing source evidence")
+            } catch AtlasReaderError.invalidResponse { }
+        }
+        do {
+            var reused = imageAuthorityWire()
+            reused["authorization_reused"] = true; reused["additional_source_bytes_read"] = "0"
+            reused["source_verification_bytes_read"] = "0"; reused["source_verification_read_calls"] = "0"
+            _ = try authorize(reused)
+            reused["source_verification_read_calls"] = "1"
+            do { _ = try authorize(reused); preconditionFailure("Reused image authority claimed new I/O") }
+            catch AtlasReaderError.invalidResponse { }
+        }
+        for (field, value) in [
+            ("owner", "8"), ("source_revision", "4"), ("document_generation", "6"),
+            ("additional_source_bytes_read", "0"), ("source_verification_bytes_read", "0"),
+            ("source_authority", "path-label"), ("capture_sha256", "ab"),
+            ("max_image_bytes", "4194305"), ("retained_images", "17")
+        ] {
+            var w = imageAuthorityWire(); w[field] = value
+            do { _ = try authorize(w); preconditionFailure("Image authority accepted \(field)") }
+            catch AtlasReaderError.invalidResponse { }
+        }
+        for (field, value) in [
+            ("requested_root", "/elsewhere"), ("source_relative", "other.md"), ("asset_root", "relative/root")
+        ] {
+            var w = imageAuthorityWire(); w[field] = path(value)
+            do { _ = try authorize(w); preconditionFailure("Image authority accepted a different \(field)") }
+            catch AtlasReaderError.invalidResponse { }
+        }
+        let receipt = try AtlasDocumentDisplayWire.imagePrepared(json(preparedImageWire()), target: target, authorization: authority)
+        precondition(receipt.firstChunk == Data("abc".utf8) && receipt.totalBytes == 3 && receipt.format == .png)
+        #if canImport(CryptoKit)
+        try AtlasDocumentDisplayWire.verifyImage(Data("abc".utf8), receipt: receipt)
+        do { try AtlasDocumentDisplayWire.verifyImage(Data("abd".utf8), receipt: receipt)
+            preconditionFailure("Different bytes accepted under the retained image digest")
+        } catch AtlasReaderError.invalidResponse { }
+        #endif
+        do {
+            try AtlasDocumentDisplayWire.verifyImage(Data("ab".utf8), receipt: receipt)
+            preconditionFailure("Truncated image assembly accepted")
+        } catch AtlasReaderError.invalidResponse { }
+        for (field, value) in [
+            ("item_index", "1"), ("request_id", "0"), ("display_width_points", "201"),
+            ("destination", "images/cafe\u{301}.png"), ("capture_sha256", String(repeating: "cd", count: 32)),
+            ("image_hex", "61626g"), ("image_bytes", "2"), ("image_offset", "1"),
+            ("image_format", "gif"), ("format_validation", "pixel-decoded"),
+            ("image_observation", "historical-capture"), ("additional_source_bytes_read", "1"),
+            ("image_sha256", String(repeating: "AB", count: 32)), ("retained_image_bytes", "8388609")
+        ] {
+            var w = preparedImageWire(); w[field] = value
+            do { _ = try AtlasDocumentDisplayWire.imagePrepared(json(w), target: target, authorization: authority)
+                preconditionFailure("Image prepare accepted \(field)")
+            } catch AtlasReaderError.invalidResponse { }
+        }
+        do {
+            var w = preparedImageWire(); w["enclosing_original_range"] = ["start": "0", "end": "19"]
+            do { _ = try AtlasDocumentDisplayWire.imagePrepared(json(w), target: target, authorization: authority)
+                preconditionFailure("Image attached to different source evidence")
+            } catch AtlasReaderError.invalidResponse { }
+            w = preparedImageWire(); w["image_bytes_read"] = "0"; w["image_read_calls"] = "0"
+            _ = try AtlasDocumentDisplayWire.imagePrepared(json(w), target: target, authorization: authority)
+        }
+        let large = try AtlasDocumentDisplayWire.imagePrepared(json(preparedImageWire(total: 65537)),
+            target: target, authorization: authority)
+        precondition(large.firstChunk.count == 65536)
+        var tail = preparedImageWire(total: 65537)
+        tail["command"] = "document-image-chunk"; tail["image_offset"] = "65536"; tail["image_bytes"] = "1"
+        tail["image_hex"] = "ff"; tail["next_image_offset"] = NSNull()
+        tail["image_bytes_read"] = "0"; tail["image_read_calls"] = "0"
+        let last = try AtlasDocumentDisplayWire.imageChunk(json(tail), receipt: large, offset: 65536)
+        precondition(last == Data([255]))
+        for (field, value) in [
+            ("image_offset", "65535"), ("next_image_offset", "65537"), ("image_bytes", "2"),
+            ("image_sha256", String(repeating: "cd", count: 32)), ("image_bytes_read", "1"),
+            ("image_read_calls", "1"), ("request_id", "45"), ("total_image_bytes", "65538")
+        ] {
+            var w = tail; w[field] = value
+            do { _ = try AtlasDocumentDisplayWire.imageChunk(json(w), receipt: large, offset: 65536)
+                preconditionFailure("Image chunk accepted \(field)")
+            } catch AtlasReaderError.invalidResponse { }
+        }
+        var swappedRoot = tail; swappedRoot["asset_root"] = path("/different/canonical/root")
+        do { _ = try AtlasDocumentDisplayWire.imageChunk(json(swappedRoot), receipt: large, offset: 65536)
+            preconditionFailure("Image chunk crossed canonical root authority")
+        } catch AtlasReaderError.invalidResponse { }
+        for field in ["request_id", "destination"] {
+            var w = imagePageWire(), row = (w["display_items"] as! [[String: Any]])[0]
+            row.removeValue(forKey: field); w["display_items"] = [row]
+            rejects(w, "missing parser image identity \(field)")
+        }
+        var w = imagePageWire(), row = (w["display_items"] as! [[String: Any]])[0]
+        row["request_id"] = "044"; w["display_items"] = [row]; rejects(w, "noncanonical image request ID")
+        row["request_id"] = "0"; w["display_items"] = [row]
+        let zeroID = try decode(w)
+        precondition(zeroID.imageTargets[0].requestID == 0)
     }
     static func main() throws {
         let accepted = try decode(wire())
@@ -176,6 +340,7 @@ import Foundation
                 } catch { }
             }
         }
-        print("Native display wire: capture/generation, geometry, provenance, source anchors, glyph/page budgets and font framing passed")
+        try imageReceipts()
+        print("Native display wire: capture/generation, geometry, source anchors, glyph/font budgets and exact image receipts passed")
     }
 }

@@ -1,6 +1,13 @@
 import Foundation
+import Dispatch
 #if canImport(CoreGraphics)
 import CoreGraphics
+#endif
+#if canImport(ImageIO)
+import ImageIO
+#endif
+#if canImport(CryptoKit)
+import CryptoKit
 #endif
 
 /// A bounded consumer of the shared engine's already-shaped display list.
@@ -94,10 +101,16 @@ struct AtlasDocumentDisplayItem: Identifiable, Sendable {
     let bounds: AtlasDocumentDisplayRect
     let original: AtlasDocumentByteRange?
     let content: Content
+    let imageReference: AtlasDocumentDisplayImageReference?
+    init(id: UInt64, bounds: AtlasDocumentDisplayRect, original: AtlasDocumentByteRange?,
+         content: Content, imageReference: AtlasDocumentDisplayImageReference? = nil) {
+        self.id = id; self.bounds = bounds; self.original = original
+        self.content = content; self.imageReference = imageReference
+    }
     var readingText: String? {
         switch content {
         case .text(let text, _, _, _): text
-        case .image(let alt): alt.isEmpty ? "Image unavailable" : "Image: " + alt
+        case .image(let alt): alt.isEmpty ? "Image" : "Image: " + alt
         case .vector, .anchor: nil
         }
     }
@@ -109,10 +122,53 @@ struct AtlasDocumentDisplayPage: Sendable {
     let first: UInt64
     let items: [AtlasDocumentDisplayItem]
     let next: UInt64?
+    private(set) var images: [AtlasDocumentDisplayImage] = []
+    private(set) var imageRevision = UUID()
+    private(set) var imageNotice: String?
+    init(id: UUID, inventory: AtlasDocumentDisplayInventory, first: UInt64,
+         items: [AtlasDocumentDisplayItem], next: UInt64?) {
+        self.id = id; self.inventory = inventory; self.first = first
+        self.items = items; self.next = next
+    }
     /// Page geometry is a slice of the upstream coordinate system. Pages may
     /// overlap vertically when many items occupy the same table/paragraph.
     var top: Double { items.map(\.bounds.y).min() ?? inventory.bounds.y }
     var bottom: Double { items.map(\.bounds.maxY).max() ?? top }
+    var imageTargets: [AtlasDocumentDisplayImageTarget] { items.compactMap(imageTarget) }
+    func imageTarget(_ item: AtlasDocumentDisplayItem) -> AtlasDocumentDisplayImageTarget? {
+        guard inventory.qualifiedSources, case .image = item.content, let reference = item.imageReference,
+              let original = item.original,
+              original.valid(upTo: inventory.document.identity.capturedBytes, nonempty: true),
+              original.start >= inventory.document.sourceBase,
+              item.bounds.width > 0, item.bounds.height > 0 else { return nil }
+        return .init(inventory: inventory, itemIndex: item.id, requestID: reference.requestID,
+            destination: reference.destination, bounds: item.bounds, original: item.original)
+    }
+    /// A page owns bounded decoded resources. No pixel buffer can attach to a
+    /// different capture, document generation, width or parser asset reference.
+    func withImages(_ images: [AtlasDocumentDisplayImage], notice: String? = nil) throws -> Self {
+        guard images.count <= AtlasDocumentImageLimits.pageImages,
+              notice.map({ $0.utf8.count <= 2048 }) ?? true else {
+            throw AtlasReaderError.invalidResponse
+        }
+        var bytes = 0, indexes = Set<UInt64>()
+        for image in images {
+            guard indexes.insert(image.target.itemIndex).inserted,
+                  let item = items.first(where: { $0.id == image.target.itemIndex }),
+                  let target = imageTarget(item), target.matches(image.target),
+                  image.byteCount <= AtlasDocumentImageLimits.pageBytes - bytes else {
+                throw AtlasReaderError.invalidResponse
+            }
+            bytes += image.byteCount
+        }
+        var page = self
+        page.images = images; page.imageRevision = UUID(); page.imageNotice = notice
+        return page
+    }
+    func image(for item: AtlasDocumentDisplayItem) -> AtlasDocumentDisplayImage? {
+        guard let target = imageTarget(item) else { return nil }
+        return images.first { $0.target.matches(target) }
+    }
     func validateFonts(_ fonts: [AtlasDocumentDisplayFont]) throws {
         guard fonts.count == inventory.fonts.count else { throw AtlasReaderError.invalidResponse }
         for spec in inventory.fonts {
@@ -128,6 +184,277 @@ struct AtlasDocumentDisplayPage: Sendable {
             }
         }
     }
+}
+
+/// A parser-owned asset reference. Destination text never supplies a root grant.
+struct AtlasDocumentDisplayImageReference: Sendable {
+    let requestID: UInt64
+    let destination: String
+}
+struct AtlasDocumentDisplayImageTarget: Sendable {
+    let inventory: AtlasDocumentDisplayInventory
+    let itemIndex: UInt64
+    let requestID: UInt64
+    let destination: String
+    let bounds: AtlasDocumentDisplayRect
+    let original: AtlasDocumentByteRange?
+    func matches(_ other: Self) -> Bool {
+        inventory.matches(other.inventory) && itemIndex == other.itemIndex
+            && requestID == other.requestID && destination.utf8.elementsEqual(other.destination.utf8)
+            && bounds == other.bounds && original == other.original
+    }
+}
+enum AtlasDocumentImageLimits {
+    static let encodedBytes = 4 * 1024 * 1024
+    static let encodedCacheBytes: UInt64 = 8 * 1024 * 1024
+    static let chunkBytes: UInt64 = 64 * 1024
+    static let sourceDimension = 8192
+    static let sourcePixels = 16 * 1024 * 1024
+    // At most eight bits per component: a source RGBA raster is at most 64 MiB.
+    // Codec-private working memory is separate from retained thumbnail bytes;
+    // these input/output bounds are not a total-process memory guarantee.
+    static let sourceRasterBytes = sourcePixels * 4
+    static let thumbnailDimension = 1024
+    static let thumbnailBytes = thumbnailDimension * thumbnailDimension * 4
+    static let pageImages = 16
+    static let pageBytes = 16 * 1024 * 1024
+    static let retainedBytes = 128 * 1024 * 1024
+    static let retainedImages = 256
+}
+enum AtlasDocumentImageError: Error, Equatable {
+    case unavailable, wrongExecutor, unsupported, invalidImage, resourceLimit
+}
+enum AtlasDocumentImageFormat: String, Sendable { case png, jpeg }
+
+/// A reservation follows its immutable pixels through off-thread retirement.
+/// Both queued retirement records and resident/retiring pixels have fixed caps.
+fileprivate final class AtlasDocumentImageBudget: @unchecked Sendable {
+    static let shared = AtlasDocumentImageBudget()
+    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "dev.frankencode.document-image-retirement", qos: .utility)
+    private var bytes = 0, images = 0
+    func reserve(_ count: Int) throws -> AtlasDocumentImageReservation {
+        lock.lock(); defer { lock.unlock() }
+        guard count > 0, count <= AtlasDocumentImageLimits.retainedBytes - bytes,
+              images < AtlasDocumentImageLimits.retainedImages else {
+            throw AtlasDocumentImageError.resourceLimit
+        }
+        bytes += count; images += 1
+        return AtlasDocumentImageReservation(budget: self, bytes: count)
+    }
+    func release(_ count: Int) {
+        lock.lock(); defer { lock.unlock() }
+        bytes -= count; images -= 1
+    }
+    func retire(_ work: @escaping @Sendable () -> Void) { queue.async(execute: work) }
+}
+fileprivate final class AtlasDocumentImageReservation: @unchecked Sendable {
+    private let budget: AtlasDocumentImageBudget
+    private let bytes: Int
+    // The constructing worker transfers sole release authority to the
+    // retirement payload. No shared caller can release this token concurrently.
+    private var active = true
+    init(budget: AtlasDocumentImageBudget, bytes: Int) { self.budget = budget; self.bytes = bytes }
+    func close() {
+        guard active else { return }
+        active = false; budget.release(bytes)
+    }
+    deinit { close() }
+}
+#if canImport(CoreGraphics)
+private final class AtlasDocumentImageStorage: @unchecked Sendable {
+    private(set) var image: CGImage?
+    private let reservation: AtlasDocumentImageReservation
+    init(image: CGImage, reservation: AtlasDocumentImageReservation) {
+        self.image = image; self.reservation = reservation
+    }
+    func retire() {
+        // Clear the last privately owned pixel reference before reopening
+        // admission. Drawing keeps the outer resource alive until it returns.
+        image = nil
+        reservation.close()
+    }
+}
+#endif
+
+/// The compressed bytes and ImageIO source are released on the worker. The only
+/// native resource retained here is a CGImage over canonical sRGB RGBA pixels;
+/// drawing never runs a codec or accesses a source pathname.
+final class AtlasDocumentDisplayImage: @unchecked Sendable {
+    let target: AtlasDocumentDisplayImageTarget
+    let format: AtlasDocumentImageFormat
+    let sourceWidth: Int
+    let sourceHeight: Int
+    let width: Int
+    let height: Int
+    let byteCount: Int
+#if canImport(CoreGraphics)
+    private let storage: AtlasDocumentImageStorage
+#endif
+    fileprivate init(target: AtlasDocumentDisplayImageTarget, format: AtlasDocumentImageFormat,
+                     sourceWidth: Int, sourceHeight: Int, width: Int, height: Int, rgba: Data,
+                     reservation: AtlasDocumentImageReservation) throws {
+        guard width > 0, height > 0, width <= AtlasDocumentImageLimits.thumbnailDimension,
+              height <= AtlasDocumentImageLimits.thumbnailDimension,
+              rgba.count == width * height * 4 else { throw AtlasDocumentImageError.invalidImage }
+        self.target = target; self.format = format
+        self.sourceWidth = sourceWidth; self.sourceHeight = sourceHeight
+        self.width = width; self.height = height; byteCount = rgba.count
+#if canImport(CoreGraphics)
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let provider = CGDataProvider(data: rgba as CFData),
+              let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                  bytesPerRow: width * 4, space: colorSpace,
+                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
+                      | CGBitmapInfo.byteOrder32Big.rawValue), provider: provider, decode: nil,
+                  shouldInterpolate: true, intent: .defaultIntent) else {
+            throw AtlasDocumentImageError.resourceLimit
+        }
+        storage = AtlasDocumentImageStorage(image: image, reservation: reservation)
+#endif
+    }
+    deinit {
+#if canImport(CoreGraphics)
+        let storage = storage
+        AtlasDocumentImageBudget.shared.retire { storage.retire() }
+#endif
+    }
+#if canImport(CoreGraphics)
+    /// The caller's coordinate system is the document's top-left, positive-Y
+    /// down space. A local flip presents the source pixels upright in that slot.
+    func draw(in context: CGContext, slot: AtlasDocumentDisplayRect) {
+        guard slot.valid, slot.width > 0, slot.height > 0, let image = storage.image else { return }
+        let box = fittedBounds(in: slot)
+        context.saveGState()
+        context.clip(to: CGRect(x: slot.x, y: slot.y, width: slot.width, height: slot.height))
+        context.interpolationQuality = .high
+        context.translateBy(x: box.x, y: box.maxY)
+        context.scaleBy(x: 1, y: -1)
+        context.draw(image, in: CGRect(x: 0, y: 0, width: box.width, height: box.height))
+        context.restoreGState()
+        // Keep the retirement lease alive through the final synchronous draw,
+        // including under optimized ARC lifetime shortening.
+        withExtendedLifetime(self) {}
+    }
+#endif
+    /// Fit in the existing engine-owned slot without changing flow or anchors.
+    func fittedBounds(in slot: AtlasDocumentDisplayRect) -> AtlasDocumentDisplayRect {
+        let scale = min(slot.width / Double(width), slot.height / Double(height))
+        let width = Double(width) * scale, height = Double(height) * scale
+        return .init(x: slot.x + (slot.width - width) / 2, y: slot.y + (slot.height - height) / 2,
+            width: width, height: height)
+    }
+}
+enum AtlasDocumentImageDecoder {
+    /// Called by the serialized reader worker. remainingBytes is the unspent
+    /// retained page allowance. ImageIO calls themselves are noninterruptible;
+    /// cancellation is checked before and after them and before publication.
+    static func decode(_ data: Data, target: AtlasDocumentDisplayImageTarget,
+                       remainingBytes: Int, canceled: () -> Bool) throws -> AtlasDocumentDisplayImage {
+        if canceled() { throw AtlasReaderError.canceled }
+        guard !Thread.isMainThread else { throw AtlasDocumentImageError.wrongExecutor }
+        guard !data.isEmpty, data.count <= AtlasDocumentImageLimits.encodedBytes,
+              remainingBytes > 0, remainingBytes <= AtlasDocumentImageLimits.pageBytes,
+              target.bounds.valid, target.bounds.width > 0, target.bounds.height > 0 else {
+            throw AtlasDocumentImageError.resourceLimit
+        }
+#if canImport(ImageIO) && canImport(CoreGraphics)
+        return try autoreleasepool {
+            let format: AtlasDocumentImageFormat
+            if data.starts(with: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) { format = .png }
+            else if data.starts(with: [0xff, 0xd8, 0xff]) { format = .jpeg }
+            else { throw AtlasDocumentImageError.unsupported }
+            let options = [kCGImageSourceShouldCache: false, kCGImageSourceShouldAllowFloat: false] as CFDictionary
+            guard let source = CGImageSourceCreateWithData(data as CFData, options),
+                  let type = CGImageSourceGetType(source),
+                  (type as String) == (format == .png ? "public.png" : "public.jpeg"),
+                  CGImageSourceGetStatus(source) == .statusComplete else {
+                throw AtlasDocumentImageError.invalidImage
+            }
+            if canceled() { throw AtlasReaderError.canceled }
+            guard CGImageSourceGetCount(source) == 1 else { throw AtlasDocumentImageError.unsupported }
+            guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, options) as? [String: Any],
+                  let width = integer(properties[kCGImagePropertyPixelWidth as String]),
+                  let height = integer(properties[kCGImagePropertyPixelHeight as String]),
+                  let depth = integer(properties[kCGImagePropertyDepth as String]), depth <= 8,
+                  width <= AtlasDocumentImageLimits.sourceDimension,
+                  height <= AtlasDocumentImageLimits.sourceDimension,
+                  width * height <= AtlasDocumentImageLimits.sourcePixels else {
+                throw AtlasDocumentImageError.resourceLimit
+            }
+            if canceled() { throw AtlasReaderError.canceled }
+            let maximum = min(AtlasDocumentImageLimits.thumbnailDimension,
+                max(1, Int(ceil(max(target.bounds.width, target.bounds.height) * 2))))
+            // Conservative admission before ImageIO thumbnail allocation.
+            let admittedBytes = min(width, maximum) * min(height, maximum) * 4
+            guard admittedBytes <= remainingBytes else { throw AtlasDocumentImageError.resourceLimit }
+            let reservation = try AtlasDocumentImageBudget.shared.reserve(admittedBytes)
+            let thumbnailOptions = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: maximum,
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceShouldAllowFloat: false
+            ] as CFDictionary
+            guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions),
+                  CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
+                  thumbnail.width > 0, thumbnail.height > 0,
+                  thumbnail.width <= maximum, thumbnail.height <= maximum else {
+                throw AtlasDocumentImageError.invalidImage
+            }
+            if canceled() { throw AtlasReaderError.canceled }
+            let outputBytes = thumbnail.width * thumbnail.height * 4
+            guard outputBytes <= remainingBytes, outputBytes <= admittedBytes else {
+                throw AtlasDocumentImageError.resourceLimit
+            }
+            var rgba = Data(count: outputBytes)
+            let drawn = rgba.withUnsafeMutableBytes { storage -> Bool in
+                guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+                      let context = CGContext(data: storage.baseAddress, width: thumbnail.width,
+                          height: thumbnail.height, bitsPerComponent: 8, bytesPerRow: thumbnail.width * 4,
+                          space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                              | CGBitmapInfo.byteOrder32Big.rawValue) else { return false }
+                context.setBlendMode(.copy)
+                context.draw(thumbnail, in: CGRect(x: 0, y: 0, width: CGFloat(thumbnail.width), height: CGFloat(thumbnail.height)))
+                return true
+            }
+            guard drawn else { throw AtlasDocumentImageError.resourceLimit }
+            if canceled() { throw AtlasReaderError.canceled }
+            let image = try AtlasDocumentDisplayImage(target: target, format: format, sourceWidth: width,
+                sourceHeight: height, width: thumbnail.width, height: thumbnail.height, rgba: rgba, reservation: reservation)
+            if canceled() { throw AtlasReaderError.canceled }
+            return image
+        }
+#else
+        throw AtlasDocumentImageError.unavailable
+#endif
+    }
+#if canImport(ImageIO) && canImport(CoreGraphics)
+    private static func integer(_ value: Any?) -> Int? {
+        guard let value = value as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID() else { return nil }
+        let number = value.doubleValue
+        guard number.isFinite, number > 0, number.rounded(.towardZero) == number,
+              number <= Double(AtlasDocumentImageLimits.sourceDimension) else { return nil }
+        return Int(number)
+    }
+#endif
+}
+
+struct AtlasDocumentImageAuthorization: Sendable {
+    let document: AtlasReaderDocumentInventory
+    let displayWidth: UInt64
+    let captureSHA256: String
+    let requestedRoot: [UInt8]
+    let assetRoot: [UInt8]
+    let sourceRelative: [UInt8]
+}
+struct AtlasDocumentImageReceipt: Sendable {
+    let target: AtlasDocumentDisplayImageTarget
+    let authorization: AtlasDocumentImageAuthorization
+    let totalBytes: UInt64
+    let format: AtlasDocumentImageFormat
+    let sha256: String
+    let firstChunk: Data
 }
 
 /// No header is accepted from a different source/capture, no string counter is
@@ -176,6 +503,80 @@ enum AtlasDocumentDisplayWire {
                   try text("source_mapping") == "enclosing-ast-blocks-not-glyph-exact" else {
                 throw AtlasReaderError.invalidResponse
             }
+        }
+        func digest(_ name: String) throws -> String {
+            let value = try text(name)
+            guard value.utf8.count == 64,
+                  value.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+                throw AtlasReaderError.invalidResponse
+            }
+            return value
+        }
+        func nativePath(_ name: String) throws -> [UInt8] {
+            let path = try values.decode(AtlasReaderWire.Header.NativePath.self, forKey: Key(name))
+            guard path.encoding == "unix-bytes", path.display.utf8.count <= 65_536 else {
+                throw AtlasReaderError.invalidResponse
+            }
+            let bytes = try AtlasReaderWire.pathBytes(path.hex)
+            guard !bytes.isEmpty, !bytes.contains(0) else { throw AtlasReaderError.invalidResponse }
+            return bytes
+        }
+        func imageLimits() throws {
+            let retained = try number("retained_images"), bytes = try number("retained_image_bytes")
+            guard try number("max_image_bytes") == UInt64(AtlasDocumentImageLimits.encodedBytes),
+                  try number("max_image_cache_bytes") == AtlasDocumentImageLimits.encodedCacheBytes,
+                  try number("max_images") == UInt64(AtlasDocumentImageLimits.pageImages),
+                  try number("max_image_chunk_bytes") == AtlasDocumentImageLimits.chunkBytes,
+                  retained <= UInt64(AtlasDocumentImageLimits.pageImages),
+                  bytes <= AtlasDocumentImageLimits.encodedCacheBytes,
+                  (retained == 0) == (bytes == 0) else { throw AtlasReaderError.invalidResponse }
+        }
+        func imageIdentity(_ target: AtlasDocumentDisplayImageTarget,
+                           authorization: AtlasDocumentImageAuthorization, command: String) throws {
+            guard target.inventory.qualifiedSources, let original = target.original,
+                  original.valid(upTo: target.inventory.document.identity.capturedBytes, nonempty: true),
+                  original.start >= target.inventory.document.sourceBase,
+                  authorization.document.matches(target.inventory.document),
+                  authorization.displayWidth == target.inventory.width,
+                  try header.identity(handle: target.inventory.document.identity.owner)
+                    .matches(target.inventory.document.identity),
+                  header.command == command,
+                  try number("document_generation") == target.inventory.document.generation,
+                  try number("display_width_points") == target.inventory.width,
+                  try digest("capture_sha256") == authorization.captureSHA256,
+                  try nativePath("requested_root") == authorization.requestedRoot,
+                  try nativePath("asset_root") == authorization.assetRoot,
+                  try nativePath("source_relative") == authorization.sourceRelative,
+                  try number("item_index") == target.itemIndex,
+                  try number("request_id") == target.requestID,
+                  try text("destination").utf8.elementsEqual(target.destination.utf8),
+                  values.contains(Key("enclosing_original_range")),
+                  try values.decodeIfPresent(AtlasDocumentByteRange.self, forKey: Key("enclosing_original_range")) == target.original,
+                  try text("format_validation") == "signature-only", try !flag("decoded"),
+                  try text("image_observation") == "current-root-capture" else {
+                throw AtlasReaderError.invalidResponse
+            }
+            try imageLimits()
+        }
+        func imageBytes(total: UInt64, offset: UInt64) throws -> Data {
+            guard offset < total, try number("image_offset") == offset else {
+                throw AtlasReaderError.invalidResponse
+            }
+            let count = min(AtlasDocumentImageLimits.chunkBytes, total - offset)
+            guard try number("image_bytes") == count,
+                  try optionalNumber("next_image_offset") == (offset + count < total ? offset + count : nil) else {
+                throw AtlasReaderError.invalidResponse
+            }
+            let hex = try text("image_hex")
+            guard hex.utf8.count == Int(count * 2),
+                  hex.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+                throw AtlasReaderError.invalidResponse
+            }
+            var bytes = Data(); bytes.reserveCapacity(Int(count))
+            let input = Array(hex.utf8)
+            func nibble(_ b: UInt8) -> UInt8 { b <= 57 ? b - 48 : b - 87 }
+            for i in stride(from: 0, to: input.count, by: 2) { bytes.append(nibble(input[i]) * 16 + nibble(input[i + 1])) }
+            return bytes
         }
         func inventory(_ document: AtlasReaderDocumentInventory) throws -> AtlasDocumentDisplayInventory {
             struct Font: Decodable { let font_index, byte_length: String }
@@ -240,6 +641,7 @@ enum AtlasDocumentDisplayWire {
             }
             let kind = try text("kind")
             let content: AtlasDocumentDisplayItem.Content
+            var imageReference: AtlasDocumentDisplayImageReference?
             switch kind {
             case "text":
                 let text = try self.text("text"), role = try self.text("color_role")
@@ -268,10 +670,14 @@ enum AtlasDocumentDisplayWire {
                       glyphs.isEmpty else { throw AtlasReaderError.invalidResponse }
                 content = .vector(shape: shape, role: role, stroke: stroke)
             case "image":
-                let alt = try text("alt_text")
+                let alt = try text("alt_text"), destination = try text("destination")
                 guard try !fields.decode(Bool.self, forKey: Key("is_resolved")), glyphs.isEmpty,
-                      alt.utf8.count <= 16_384 else { throw AtlasReaderError.invalidResponse }
+                      alt.utf8.count <= 16_384, destination.utf8.count <= 4096,
+                      let requestID = AtlasReaderWire.integer(try text("request_id")) else {
+                    throw AtlasReaderError.invalidResponse
+                }
                 content = .image(alt: alt)
+                imageReference = .init(requestID: requestID, destination: destination)
             case "anchor":
                 let id = try text("anchor_id")
                 let heading = try fields.decode(Bool.self, forKey: Key("is_heading"))
@@ -282,7 +688,8 @@ enum AtlasDocumentDisplayWire {
                 content = .anchor(id, heading: heading, level: level)
             default: throw AtlasReaderError.invalidResponse
             }
-            return .init(id: index, bounds: bounds, original: original, content: content)
+            return .init(id: index, bounds: bounds, original: original, content: content,
+                imageReference: imageReference)
         }
     }
     static func page(_ json: String?, document: AtlasReaderDocumentInventory,
@@ -345,6 +752,87 @@ enum AtlasDocumentDisplayWire {
             return .init(id: UUID(), inventory: inventory, first: first, items: items, next: next)
         } catch let error as AtlasReaderError { throw error }
         catch { throw AtlasReaderError.invalidResponse }
+    }
+    static func imageAuthorization(_ json: String?, document: AtlasReaderDocumentInventory,
+                                   root: String, sourceRelative: String) throws -> AtlasDocumentImageAuthorization {
+        do {
+            let w = try JSONDecoder().decode(Fields.self,
+                from: AtlasReaderWire.admit(json, handle: document.identity.owner))
+            let h = w.header, identity = document.identity
+            let verified = try w.number("source_verification_bytes_read"), calls = try w.number("source_verification_read_calls")
+            let reused = try w.flag("authorization_reused"), width = try w.number("display_width_points")
+            // Authorization alone is allowed to re-read the current source.
+            // Never normalize this read count to reuse the zero-I/O header check.
+            guard h.command == "document-images-authorize",
+                  AtlasReaderWire.integer(h.owner) == identity.owner,
+                  AtlasReaderWire.integer(h.file_id) == identity.file,
+                  AtlasReaderWire.integer(h.source_revision) == identity.revision,
+                  AtlasReaderWire.integer(h.captured_bytes) == identity.capturedBytes,
+                  h.encoding == identity.encoding, !h.native_presented,
+                  h.path.encoding == "unix-bytes", h.path.display.utf8.count <= 65_536,
+                  try AtlasReaderWire.pathBytes(h.path.hex) == identity.pathBytes,
+                  AtlasReaderWire.integer(h.additional_source_bytes_read) == verified,
+                  try w.number("document_generation") == document.generation,
+                  try w.flag("images_authorized"), try w.text("source_authority") == "verified-current-source",
+                  (160...4096).contains(width),
+                  reused ? (verified == 0 && calls == 0)
+                    : (verified == identity.capturedBytes && (identity.capturedBytes == 0 || calls > 0)),
+                  try w.nativePath("requested_root") == Array(root.utf8),
+                  try w.nativePath("source_relative") == Array(sourceRelative.utf8) else {
+                throw AtlasReaderError.invalidResponse
+            }
+            let assetRoot = try w.nativePath("asset_root")
+            guard assetRoot.first == 47 else { throw AtlasReaderError.invalidResponse }
+            try w.imageLimits()
+            return .init(document: document, displayWidth: width, captureSHA256: try w.digest("capture_sha256"),
+                requestedRoot: Array(root.utf8), assetRoot: assetRoot, sourceRelative: Array(sourceRelative.utf8))
+        } catch let error as AtlasReaderError { throw error }
+        catch { throw AtlasReaderError.invalidResponse }
+    }
+    static func imagePrepared(_ json: String?, target: AtlasDocumentDisplayImageTarget,
+                              authorization: AtlasDocumentImageAuthorization) throws -> AtlasDocumentImageReceipt {
+        do {
+            let w = try JSONDecoder().decode(Fields.self,
+                from: AtlasReaderWire.admit(json, handle: target.inventory.document.identity.owner))
+            try w.imageIdentity(target, authorization: authorization, command: "document-image-prepare")
+            let total = try w.number("total_image_bytes"), read = try w.number("image_bytes_read")
+            let calls = try w.number("image_read_calls")
+            guard total > 0, total <= UInt64(AtlasDocumentImageLimits.encodedBytes),
+                  try w.number("retained_images") > 0, try w.number("retained_image_bytes") >= total,
+                  (read == 0 && calls == 0) || (read == total && calls > 0),
+                  let format = AtlasDocumentImageFormat(rawValue: try w.text("image_format")) else {
+                throw AtlasReaderError.invalidResponse
+            }
+            return .init(target: target, authorization: authorization, totalBytes: total, format: format,
+                sha256: try w.digest("image_sha256"), firstChunk: try w.imageBytes(total: total, offset: 0))
+        } catch let error as AtlasReaderError { throw error }
+        catch { throw AtlasReaderError.invalidResponse }
+    }
+    static func imageChunk(_ json: String?, receipt: AtlasDocumentImageReceipt, offset: UInt64) throws -> Data {
+        do {
+            let w = try JSONDecoder().decode(Fields.self,
+                from: AtlasReaderWire.admit(json, handle: receipt.target.inventory.document.identity.owner))
+            try w.imageIdentity(receipt.target, authorization: receipt.authorization, command: "document-image-chunk")
+            guard try w.number("total_image_bytes") == receipt.totalBytes,
+                  try w.text("image_format") == receipt.format.rawValue,
+                  try w.digest("image_sha256") == receipt.sha256,
+                  try w.number("retained_images") > 0, try w.number("retained_image_bytes") >= receipt.totalBytes,
+                  try w.number("image_bytes_read") == 0, try w.number("image_read_calls") == 0 else {
+                throw AtlasReaderError.invalidResponse
+            }
+            return try w.imageBytes(total: receipt.totalBytes, offset: offset)
+        } catch let error as AtlasReaderError { throw error }
+        catch { throw AtlasReaderError.invalidResponse }
+    }
+    static func verifyImage(_ data: Data, receipt: AtlasDocumentImageReceipt) throws {
+        guard UInt64(data.count) == receipt.totalBytes,
+              data.count <= AtlasDocumentImageLimits.encodedBytes else { throw AtlasReaderError.invalidResponse }
+#if canImport(CryptoKit)
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        guard digest == receipt.sha256 else { throw AtlasReaderError.invalidResponse }
+#else
+        throw AtlasDocumentImageError.unavailable
+#endif
     }
     static func fontChunk(_ json: String?, inventory: AtlasDocumentDisplayInventory,
                           spec: AtlasDocumentDisplayFontSpec, offset: UInt64) throws -> Data {

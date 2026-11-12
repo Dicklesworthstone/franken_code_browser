@@ -88,6 +88,7 @@ import Observation
     @ObservationIgnored private let outlineTransport: AtlasReaderOutlineTransport?
     @ObservationIgnored private let documentTransport: AtlasReaderDocumentTransport?
     @ObservationIgnored private var refreshInput: AtlasReaderInput?
+    @ObservationIgnored private var refreshImageSource: AtlasDocumentImageSource?
     @ObservationIgnored private var refreshAccessLease: AnyObject?
     @ObservationIgnored private let coordinator: AtlasReaderCoordinator
     @ObservationIgnored private var task: Task<Void, Never>?
@@ -348,6 +349,7 @@ import Observation
         let ticket = UUID()
         let sourceNavigation = navigation
         let allowedRefresh = refreshInput
+        let allowedImages = refreshImageSource
         let accessLease = refreshAccessLease
         let child = AtlasPagedReaderModel(transport: liveTransport, search: searchTransport,
             outline: outlineTransport, document: documentTransport)
@@ -367,6 +369,7 @@ import Observation
             guard pinOperation == ticket, navigation == sourceNavigation,
                   page?.identity.matches(original.identity) == true else { throw AtlasReaderError.canceled }
             child.refreshInput = allowedRefresh
+            child.refreshImageSource = allowedImages
             child.refreshAccessLease = accessLease
             child.forkedCapture = true
             child.retainedOnly = retainedOnly
@@ -407,9 +410,11 @@ import Observation
             // Remember only the explicitly opened project/path and its current
             // lease. Captured metadata alone never grants a refresh destination.
             refreshInput = liveInput
+            refreshImageSource = try? AtlasDocumentImageSource(root: root, relativePath: path)
             refreshAccessLease = accessLease
         } catch let error as AtlasReaderError { notice = error.message; return }
         catch { notice = AtlasReaderError.invalidInput.message; return }
+        let imageSource = refreshImageSource
         let ticket = begin(query: capturedTarget?.mode.isTextual == true,
             references: capturedTarget?.mode == .occurrences)
         notice = capturedTarget != nil ? "Opening the exact retained search capture…"
@@ -417,7 +422,7 @@ import Observation
             : "Capturing source for bounded page navigation…"
         task = Task {
             do {
-                let opened = try await coordinator.open(input: input, accessLease: accessLease)
+                let opened = try await coordinator.open(input: input, accessLease: accessLease, imageSource: imageSource)
                 guard operation == ticket, !Task.isCancelled else { return }
                 if let target = capturedTarget {
                     if target.mode.isTextual {
@@ -470,7 +475,7 @@ import Observation
                 // hidden capture or falling back to current disk contents.
                 if operation == ticket, page == nil {
                     coordinator.close()
-                    refreshInput = nil; refreshAccessLease = nil
+                    refreshInput = nil; refreshImageSource = nil; refreshAccessLease = nil
                 }
                 fail(error, ticket: ticket)
             }
@@ -505,7 +510,7 @@ import Observation
             AtlasReaderRetainedInitialization(info: try initialize(handle), initialOriginalOffset: offset)
         }
     }
-    func openRetained(registryDomain: UUID,
+    func openRetained(registryDomain: UUID, accessLease: AnyObject? = nil,
         initialize: @escaping @Sendable (UInt64) throws -> AtlasReaderRetainedInitialization) async throws {
         guard page == nil, !busy, capturedTarget == nil, suppliedSource == nil else {
             throw AtlasReaderError.unavailable
@@ -513,7 +518,8 @@ import Observation
         let ticket = begin()
         notice = "Opening the exact retained capture…"
         do {
-            let opened = try await coordinator.openRetained(registryDomain: registryDomain, initialize: initialize)
+            let opened = try await coordinator.openRetained(registryDomain: registryDomain,
+                accessLease: accessLease, initialize: initialize)
             try Task.checkCancellation()
             guard operation == ticket else { throw AtlasReaderError.canceled }
             retainedOnly = true
@@ -536,13 +542,14 @@ import Observation
     func refreshFromDisk() {
         guard canRefresh, let input = refreshInput else { return }
         let accessLease = refreshAccessLease
+        let imageSource = refreshImageSource
         let ticket = begin()
         isRefreshing = true
         notice = "Capturing current disk bytes… The retained source remains unchanged until refresh succeeds."
         task = Task {
             do {
                 let replacement = try await coordinator.stageOpen(input: input,
-                    accessLease: accessLease, using: liveTransport)
+                    accessLease: accessLease, imageSource: imageSource, using: liveTransport)
                 guard operation == ticket, !Task.isCancelled else { return }
                 // No await between session commit and presentation install.
                 // Source navigation, cancellation and close all revoke both
@@ -831,7 +838,7 @@ import Observation
         coordinator.cancel()
         if page == nil {
             coordinator.close()
-            refreshInput = nil; refreshAccessLease = nil
+            refreshInput = nil; refreshImageSource = nil; refreshAccessLease = nil
         }
         busy = false; isRefreshing = false
         queryWork = false
@@ -849,7 +856,7 @@ import Observation
         operation = UUID()
         task?.cancel(); task = nil
         coordinator.close()
-        refreshInput = nil; refreshAccessLease = nil
+        refreshInput = nil; refreshImageSource = nil; refreshAccessLease = nil
         isRefreshing = false; refreshedFromDisk = false; forkedCapture = false
         retainedOnly = false
         page = nil; source = nil; history.reset()

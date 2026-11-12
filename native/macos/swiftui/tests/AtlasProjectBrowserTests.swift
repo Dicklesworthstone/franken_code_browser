@@ -219,6 +219,53 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
             return document(owner, command: "document-link", generation: generation)
         })
     }
+    /// An image-only display from the injected service. Image authority is
+    /// recorded and then refused, so these tests exercise production routing
+    /// and grant lifetime without performing codec work.
+    private func imageDisplay(_ owner: UInt64, generation: UInt64, width: UInt64, first: UInt64) -> String? {
+        precondition(!Thread.isMainThread)
+        return locked {
+            guard let raw = readers[owner], documents[owner]?.generation == generation else { return nil }
+            var out = readerHeader(owner, raw: raw, command: "document-display-prepare")
+            let bounds: [String: Double] = ["x": 0, "y": 0, "width": 64, "height": 64]
+            out["document_generation"] = String(generation); out["display_width_points"] = String(width)
+            out["rendering"] = "bundled-frankenmarkdown-display"
+            out["native_shaped"] = false; out["glyph_shaped"] = true
+            out["source_mapping"] = "enclosing-ast-blocks-not-glyph-exact"
+            out["source_ranges_qualified"] = true; out["total_display_items"] = "1"
+            out["unresolved_images"] = "1"; out["display_bounds"] = bounds
+            out["fonts"] = [[String: String]](); out["first_display_item"] = String(first)
+            out["display_items"] = [[
+                "item_index": "0", "kind": "image", "bounds": bounds,
+                "enclosing_original_range": ["start": "0", "end": String(sourceBytes(for: raw).count)],
+                "request_id": "17", "destination": "assets/red.png", "alt_text": "Red pixel", "is_resolved": false
+            ]] as [[String: Any]]
+            out["next_display_item"] = NSNull()
+            return json(out)
+        }
+    }
+    var imageDocumentTransport: AtlasReaderDocumentTransport {
+        var transport = documentTransport
+        transport.prepareDisplay = { [self] owner, generation, width in
+            imageDisplay(owner, generation: generation, width: width, first: 0)
+        }
+        transport.displayFont = { _, _, _, _, _ in preconditionFailure("Image-only display requested fonts") }
+        transport.displayPage = { _, _, _, _ in preconditionFailure("Image fixture unexpectedly paginated") }
+        transport.displayFromSource = { _, _, _, _ in preconditionFailure("Image fixture unexpectedly restored a source anchor") }
+        transport.imagesAuthorize = { [self] owner, _, root, relative in
+            precondition(!Thread.isMainThread)
+            let pause = locked {
+                log.append("image-authorize:\(owner):\(root):\(relative)")
+                let pause = blocked; blocked = false; return pause
+            }
+            if pause { entered.signal(); precondition(resume.wait(timeout: .now() + .seconds(5)) == .success) }
+            return json(["schema": "fcb.reader-session/1", "status": "error", "owner": String(owner),
+                "exit_code": "2", "error": ["code": "DOCUMENT_IMAGE_ORIGIN_CHANGED"]])
+        }
+        transport.imagePrepare = { _, _, _, _ in preconditionFailure("Refused image source was read") }
+        transport.imageChunk = { _, _, _, _, _, _ in preconditionFailure("Refused image source supplied bytes") }
+        return transport
+    }
     var transport: AtlasProjectBrowserTransport {
         AtlasProjectBrowserTransport(create: { [self] in locked { let id = nextOwner; nextOwner += 1; return id } },
             run: { [self] owner, request in
@@ -478,6 +525,9 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         do { try await operation(); preconditionFailure(message) } catch { }
     }
     @MainActor static func main() async throws {
+        try await projectCapturesKeepImageAccessThroughForkAndDrain()
+        try await projectLinkImagesUseTheVerifiedTargetPath()
+        try await retainedLabelsAndNonUTF8PathsStayImageInert()
         try boundedWireAndCoverage()
         try repositoryRuleWireAndCoverage()
         try await repositoryRuleFailuresKeepRowsAndDirtyHints()
@@ -508,6 +558,129 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         try await malformedQualifiedHeadingReceiptsNeverPublishTargets()
         print("Progressive project pages, repository-rule coverage, staged refresh, recovery, raw-file capture, page-independent document-link proofs, independent targets and grant-lifetime regressions passed.")
     }
+    @MainActor private static func prepareImages(_ reader: AtlasPagedReaderModel) async {
+        reader.documentPreview.prepare()
+        await wait("image display did not prepare") {
+            !reader.documentPreview.busy && reader.documentPreview.displayPage != nil
+        }
+        precondition(reader.documentPreview.showsStyled && reader.documentPreview.displayPage?.items.count == 1)
+    }
+
+    @MainActor private static func projectCapturesKeepImageAccessThroughForkAndDrain() async throws {
+        final class Grant {}
+        let f = ProjectBrowserFixture(), model = AtlasProjectBrowserModel(transport: f.transport)
+        var grant: Grant? = Grant(); weak var held = grant
+        try await model.open(root: "/repo", accessLease: grant); grant = nil
+        let page = model.page!
+        let capture = try await model.openFile(page.files[0], from: page,
+            readerTransport: f.readerTransport, document: f.imageDocumentTransport)
+        precondition(!f.calls.contains(where: { $0.hasPrefix("image-authorize:") }),
+            "Opening source implicitly read images")
+        await prepareImages(capture.reader)
+#if canImport(ImageIO) && canImport(CoreGraphics) && canImport(CryptoKit)
+        precondition(f.calls.contains("image-authorize:100:/repo:src/p1.rs"))
+        precondition(capture.reader.documentPreview.displayPage?.imageNotice?.contains("verified") == true)
+#else
+        precondition(!f.calls.contains(where: { $0.hasPrefix("image-authorize:") }))
+#endif
+        let pinned = try await capture.reader.fork()
+        model.close(); capture.reader.close()
+        await wait("catalog or original reader did not retire") {
+            f.calls.contains("close:40") && f.calls.contains("reader-close:100")
+        }
+        precondition(held != nil && pinned.canPin && !pinned.canRefresh,
+            "The image grant was lost or became a live refresh capability")
+#if canImport(ImageIO) && canImport(CoreGraphics) && canImport(CryptoKit)
+        f.blockNext(); pinned.documentPreview.prepare()
+        await wait("pinned image authorization did not enter") { f.entered.wait(timeout: .now()) == .success }
+        precondition(f.calls.contains("image-authorize:101:/repo:src/p1.rs"))
+        pinned.close()
+        precondition(held != nil && !f.calls.contains("reader-close:101"),
+            "Reader close revoked root access before image work drained")
+        f.resume.signal()
+#else
+        await prepareImages(pinned); pinned.close()
+#endif
+        await wait("last pinned reader or its root grant did not retire") {
+            f.calls.contains("reader-close:101") && held == nil
+        }
+        precondition(!f.calls.contains("LABEL-OPEN"))
+    }
+
+    @MainActor private static func projectLinkImagesUseTheVerifiedTargetPath() async throws {
+        final class Grant {}
+        let f = ProjectBrowserFixture(), model = AtlasProjectBrowserModel(transport: f.transport)
+        var grant: Grant? = Grant(); weak var held = grant
+        try await model.open(root: "/repo", accessLease: grant); grant = nil
+        let page = model.page!
+        let origin = try await model.openFile(page.files[0], from: page,
+            readerTransport: f.readerTransport, document: f.imageDocumentTransport)
+        let link = await prepareLink(origin.reader)
+        let target = try await model.openDocumentLink(link, from: origin,
+            readerTransport: f.readerTransport, document: f.imageDocumentTransport)
+        precondition(target.file.rawPath == Array("src/p3.rs".utf8))
+        precondition(!f.calls.contains(where: { $0.hasPrefix("image-authorize:101:") }))
+        model.close(); origin.reader.close()
+        await wait("link source or catalog did not retire") {
+            f.calls.contains("close:40") && f.calls.contains("reader-close:100")
+        }
+        precondition(held != nil, "Linked reader lost its current project grant")
+        await prepareImages(target.reader)
+#if canImport(ImageIO) && canImport(CoreGraphics) && canImport(CryptoKit)
+        precondition(f.calls.contains("image-authorize:101:/repo:src/p3.rs"),
+            "Linked image authority used the source path or decoded destination instead of the verified target")
+#endif
+        target.reader.close()
+        await wait("linked reader kept its grant after retirement") {
+            f.calls.contains("reader-close:101") && held == nil
+        }
+        precondition(!f.calls.contains("LABEL-OPEN"))
+    }
+
+    @MainActor private static func retainedLabelsAndNonUTF8PathsStayImageInert() async throws {
+        let f = ProjectBrowserFixture(), model = AtlasProjectBrowserModel(transport: f.transport)
+        try await model.open(root: "/repo", accessLease: nil)
+        let page = model.page!
+        let origin = try await model.openFile(page.files[0], from: page, readerTransport: f.readerTransport)
+        let sourceOwner = origin.reader.page!.identity.owner, rawPath = origin.file.rawPath
+        let retained = AtlasPagedReaderModel(transport: f.readerTransport, document: f.imageDocumentTransport)
+        try await retained.openRetained(pathBytes: rawPath, offset: 0, registryDomain: f.domain) { destination in
+            f.readerTransport.fork!(sourceOwner, destination)
+        }
+        await prepareImages(retained)
+        precondition(retained.documentPreview.displayPage?.imageNotice?.contains("folder access") == true)
+        precondition(!f.calls.contains(where: { $0.hasPrefix("image-authorize:") }),
+            "Default retained initialization inherited current-source authority from a path label")
+
+        // Supplying a capability requires both an explicit access lease and
+        // an exact match to the initialized reader's verified raw path.
+        for (access, relative) in [(false, "src/p1.rs"), (true, "src/other.rs")] {
+            let candidate = AtlasPagedReaderModel(transport: f.readerTransport, document: f.imageDocumentTransport)
+            let capability = try AtlasDocumentImageSource(root: "/repo", relativePath: relative)
+            let lease: AnyObject? = access ? NSObject() : nil
+            await refuse("unbound retained image capability was accepted") {
+                try await candidate.openRetained(registryDomain: f.domain, accessLease: lease) { destination in
+                    let info = try AtlasReaderInfo.decodeRetainedInitialization(
+                        f.readerTransport.fork!(sourceOwner, destination), handle: destination, pathBytes: rawPath)
+                    return AtlasReaderRetainedInitialization(info: info, initialOriginalOffset: 0,
+                        imageSource: capability)
+                }
+            }
+            precondition(candidate.page == nil)
+            candidate.close()
+        }
+        model.advance()
+        await wait("non-UTF8 metadata page did not arrive") { !model.busy }
+        let rawPage = model.page!
+        let raw = try await model.openFile(rawPage.files[0], from: rawPage,
+            readerTransport: f.readerTransport, document: f.imageDocumentTransport)
+        await prepareImages(raw.reader)
+        precondition(raw.reader.page?.identity.pathBytes == rawPage.files[0].rawPath)
+        precondition(raw.reader.documentPreview.displayPage?.imageNotice?.contains("folder access") == true)
+        precondition(!f.calls.contains(where: { $0.hasPrefix("image-authorize:") }))
+        retained.close(); raw.reader.close(); origin.reader.close(); model.close()
+    }
+
     private static func boundedWireAndCoverage() throws {
         let f = ProjectBrowserFixture()
         let first = try AtlasProjectBrowserPage.decode(f.json(f.page()), owner: 40, page: 1)

@@ -77,6 +77,7 @@ import CoreText
         case glyphs(GlyphBatch)
         case vector(AtlasDocumentDisplayRect, shape: String, role: String, stroke: Double)
         case image(AtlasDocumentDisplayRect, label: CTLine)
+        case raster(AtlasDocumentDisplayRect, resource: AtlasDocumentDisplayImage)
     }
     private var page: AtlasDocumentDisplayPage?
     private var drawings: [Drawing] = []
@@ -90,7 +91,7 @@ import CoreText
     func install(_ page: AtlasDocumentDisplayPage, fonts: [AtlasDocumentDisplayFont],
                  palette: AtlasAppearancePalette, enabled: Bool,
                  openSource: @escaping (AtlasDocumentDisplayItem) -> Void) {
-        let changed = self.page?.id != page.id
+        let changed = self.page?.id != page.id || self.page?.imageRevision != page.imageRevision
         self.page = page; self.palette = palette; self.enabled = enabled; self.openSource = openSource
         if changed {
             selection = nil; drawings = []
@@ -127,6 +128,12 @@ import CoreText
                 case .vector(let shape, let role, let stroke):
                     drawings.append(.vector(item.bounds, shape: shape, role: role, stroke: stroke))
                 case .image(let alt):
+                    if let image = page.image(for: item) {
+                        // Keep the wrapper, not a borrowed CGImage. Its bounded
+                        // pixel reservation survives drawing and retires off-thread.
+                        drawings.append(.raster(item.bounds, resource: image))
+                        continue
+                    }
                     // Placeholder decoration is prepared once, never shaped
                     // during scrolling. Full alt text remains accessible.
                     let label = alt.isEmpty ? "Image unavailable" : "Image: " + String(alt.prefix(512))
@@ -161,6 +168,8 @@ import CoreText
                 context.restoreGState()
             case .vector(let box, let shape, let role, let stroke):
                 drawVector(box, shape: shape, role: role, stroke: stroke, context: context)
+            case .raster(let box, let resource):
+                resource.draw(in: context, slot: box)
             case .image(let box, let label):
                 let rect = rectangle(box)
                 context.saveGState()

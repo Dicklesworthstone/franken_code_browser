@@ -558,6 +558,9 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
     let owner: UInt64
     let transport: AtlasProjectBrowserTransport
     private let access: AtlasProjectBrowserAccess
+    /// Share only the native root-access lifetime with a captured reader. The
+    /// catalog itself can retire while the independent reader keeps this grant.
+    var retainedAccessLease: AnyObject { access }
     private static let retirement = DispatchQueue(label: "dev.frankencode.browser.discovery-retirement", qos: .utility)
     init(transport: AtlasProjectBrowserTransport, access: AnyObject?) throws {
         let owner = transport.create()
@@ -683,14 +686,16 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
         do {
             return try await withTaskCancellationHandler(operation: {
                 let receipt = AtlasProjectBrowserReceiptBox()
-                try await reader.openRetained(pathBytes: file.rawPath, offset: 0, registryDomain: domain) { destination in
+                let imageSource = Self.imageSource(root: root, rawPath: file.rawPath)
+                try await reader.openRetained(registryDomain: domain, accessLease: lease.retainedAccessLease) { destination in
                     guard !flag.isCanceled else { throw AtlasProjectBrowserError.canceled }
                     return try withExtendedLifetime(lease) {
                         let admitted = try AtlasProjectBrowserReceipt.decode(lease.transport.run(lease.owner,
                             .openReader(reader: destination, page: page.id, file: file.id, bytes: AtlasReaderLimits.captureBytes)),
                             owner: lease.owner, page: page.id, file: file, destination: destination)
                         try receipt.set(admitted)
-                        return admitted.readerJSON
+                        return AtlasReaderRetainedInitialization(info: admitted.info, initialOriginalOffset: 0,
+                            imageSource: imageSource)
                     }
                 }
                 try Task.checkCancellation()
@@ -774,18 +779,20 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
               origin.documentPreview.allows(target) else { throw AtlasProjectBrowserError.stale }
         let flag = AtlasSearchCancellation(); self.flag = flag; busy = true
         let reader = AtlasPagedReaderModel(transport: readerTransport, search: search, outline: outline, document: document)
+        let imageRoot = root
         defer { finish() }
         do {
             return try await withTaskCancellationHandler(operation: {
                 let receipt = AtlasProjectBrowserLinkReceiptBox()
-                try await reader.openRetained(registryDomain: domain) { destination in
+                try await reader.openRetained(registryDomain: domain, accessLease: lease.retainedAccessLease) { destination in
                     guard !flag.isCanceled else { throw AtlasProjectBrowserError.canceled }
                     return try withExtendedLifetime(lease) {
                         let admitted = try AtlasProjectBrowserLinkReceipt.decode(initialize(destination),
                             source: source, target: target, destination: destination)
                         try receipt.set(admitted)
                         return AtlasReaderRetainedInitialization(info: admitted.capture.info,
-                            initialOriginalOffset: admitted.capture.initialOriginalOffset)
+                            initialOriginalOffset: admitted.capture.initialOriginalOffset,
+                            imageSource: Self.imageSource(root: imageRoot, rawPath: admitted.file.rawPath))
                     }
                 }
                 try Task.checkCancellation()
@@ -807,6 +814,13 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
             let failure: Error = closed || flag.isCanceled || Task.isCancelled ? AtlasProjectBrowserError.canceled : error
             notice = Self.message(failure); throw failure
         }
+    }
+    /// Preserve the verified raw spelling. Non-UTF8 filenames still open as
+    /// captured source, but cannot enter the UTF8-only local-image boundary.
+    private nonisolated static func imageSource(root: String, rawPath: [UInt8]) -> AtlasDocumentImageSource? {
+        guard let path = String(bytes: rawPath, encoding: .utf8),
+              path.utf8.elementsEqual(rawPath) else { return nil }
+        return try? AtlasDocumentImageSource(root: root, relativePath: path)
     }
     func close() {
         guard !closed else { return }

@@ -96,7 +96,68 @@ import Foundation
         await rejected { _ = try await plain.document(.prepare(width: 100)) }
         plain.close()
         try await documentLinks(input)
+        try await documentImages(input)
         print("\(checks) retained-document coordinator checks passed")
+    }
+
+    @MainActor static func documentImages(_ input: AtlasReaderInput) async throws {
+        let capability = try AtlasDocumentImageSource(root: "/project", relativePath: "README.md")
+        for (root, path) in [("relative", "README.md"), ("/project", "../README.md"),
+                             ("/project", "docs//README.md"), ("/project", "/README.md")] {
+            do {
+                _ = try AtlasDocumentImageSource(root: root, relativePath: path)
+                preconditionFailure("Invalid image source capability")
+            } catch is AtlasReaderError { checks += 1 }
+        }
+
+        // A reader label that looks like a real file supplies no image grant.
+        let inertWire = DocumentImageBoundary(owner: 21)
+        let inert = AtlasReaderCoordinator(transport: inertWire.source.reader, document: inertWire.document)
+        _ = try await inert.open(input: input)
+        _ = try await inert.document(.prepare(width: 100))
+        guard case .display(let inertPage, _) = try await inert.document(.prepareDisplay(width: 640)) else { fatalError() }
+        check(inertWire.authorizations == 0 && inertPage.images.isEmpty,
+              "Document label silently supplied a current-root capability")
+        check(inertPage.imageNotice?.contains("folder access") == true, "Missing grant was not explained")
+        inert.close()
+
+        let wire = DocumentImageBoundary(owner: 22)
+        let coordinator = AtlasReaderCoordinator(transport: wire.source.reader, document: wire.document)
+        var lease: DocumentImageTestLease? = DocumentImageTestLease()
+        weak var held = lease
+        _ = try await coordinator.open(input: input, accessLease: lease, imageSource: capability)
+        lease = nil
+        _ = try await coordinator.document(.prepare(width: 100))
+        guard case .display(let page, _) = try await coordinator.document(.prepareDisplay(width: 640)) else { fatalError() }
+        check(page.images.isEmpty && page.items.count == 1, "Optional image refusal discarded the display")
+#if canImport(ImageIO) && canImport(CoreGraphics) && canImport(CryptoKit)
+        check(wire.authorizations == 1 && wire.receivedSource == capability,
+              "Current root/path did not reach the image worker exactly")
+        check(page.imageNotice?.contains("verified") == true, "Source verification refusal was hidden")
+
+        // Task cancellation itself withdraws an image job even without an
+        // explicit model cancel callback; the native grant stays until drain.
+        let canceledGate = wire.blockNext()
+        let canceled = Task { try await coordinator.document(.displayPage(first: 0)) }
+        try await until { canceledGate.hasEntered }
+        canceled.cancel()
+        canceledGate.release()
+        await rejected { _ = try await canceled.value }
+
+        let closingGate = wire.blockNext()
+        let closing = Task { try await coordinator.document(.displayPage(first: 0)) }
+        try await until { closingGate.hasEntered }
+        coordinator.close()
+        check(held != nil && wire.source.snapshot.closes == 0,
+              "Root access or reader retired while image authorization was active")
+        closingGate.release()
+        await rejected { _ = try await closing.value }
+        try await until { held == nil && wire.source.snapshot.closes == 1 }
+#else
+        check(wire.authorizations == 0, "A host without a native decoder read image assets")
+        coordinator.close()
+        try await until { held == nil && wire.source.snapshot.closes == 1 }
+#endif
     }
 
     @MainActor static func documentLinks(_ input: AtlasReaderInput) async throws {
@@ -144,5 +205,76 @@ import Foundation
         check(legacyWire.snapshot.calls == before, "legacy transport faked a link operation")
         _ = try await legacy.document(.window(first: 0))
         legacy.close()
+    }
+}
+
+
+/// This boundary deliberately refuses current-source verification. It tests
+/// the production worker/grant/lifecycle path, not image decoding or Markdown.
+private final class DocumentImageTestLease {}
+private final class DocumentImageBoundary: @unchecked Sendable {
+    let source: DocumentBoundary
+    private let lock = NSLock()
+    private var calls = 0
+    private var received: AtlasDocumentImageSource?
+    private var gate: DocumentCallGate?
+    init(owner: UInt64) { source = DocumentBoundary(owner: owner) }
+    var authorizations: Int { lock.withLock { calls } }
+    var receivedSource: AtlasDocumentImageSource? { lock.withLock { received } }
+    func blockNext() -> DocumentCallGate {
+        let next = DocumentCallGate()
+        lock.withLock { gate = next }
+        return next
+    }
+    private func display(_ command: String, generation: UInt64, width: UInt64, first: UInt64) -> String {
+        var result = DocumentWireFixture.header(command, owner: source.owner)
+        let bounds: [String: Double] = ["x": 0, "y": 0, "width": 64, "height": 64]
+        result["document_generation"] = String(generation)
+        result["display_width_points"] = String(width)
+        result["rendering"] = "bundled-frankenmarkdown-display"
+        result["native_shaped"] = false; result["glyph_shaped"] = true
+        result["source_mapping"] = "enclosing-ast-blocks-not-glyph-exact"
+        result["source_ranges_qualified"] = true; result["total_display_items"] = "1"
+        result["unresolved_images"] = "1"; result["display_bounds"] = bounds
+        result["fonts"] = [[String: String]]()
+        result["first_display_item"] = String(first)
+        result["display_items"] = first == 0 ? [[
+            "item_index": "0", "kind": "image", "bounds": bounds,
+            "enclosing_original_range": DocumentWireFixture.range(DocumentWireFixture.start, DocumentWireFixture.end),
+            "request_id": "17", "destination": "assets/red.png", "alt_text": "Red pixel", "is_resolved": false
+        ]] as [[String: Any]] : [[String: Any]]()
+        result["next_display_item"] = NSNull()
+        return DocumentWireFixture.json(result)
+    }
+    var document: AtlasReaderDocumentTransport {
+        var transport = source.document
+        transport.prepareDisplay = { [self] _, generation, width in
+            display("document-display-prepare", generation: generation, width: width, first: 0)
+        }
+        transport.displayPage = { [self] _, generation, first, _ in
+            display("document-display-page", generation: generation, width: 640, first: first)
+        }
+        transport.displayFont = { _, _, _, _, _ in
+            preconditionFailure("Image-only display requested font bytes")
+        }
+        transport.imagesAuthorize = { [self] _, _, root, relative in
+            precondition(!Thread.isMainThread, "Image work reached the interaction thread")
+            let source = try! AtlasDocumentImageSource(root: root, relativePath: relative)
+            let blocked = lock.withLock {
+                calls += 1; received = source
+                let blocked = gate; gate = nil; return blocked
+            }
+            blocked?.wait()
+            return DocumentWireFixture.json(["schema": "fcb.reader-session/1", "status": "error",
+                "owner": String(self.source.owner), "exit_code": "2",
+                "error": ["code": "DOCUMENT_IMAGE_ORIGIN_CHANGED"]])
+        }
+        transport.imagePrepare = { _, _, _, _ in
+            preconditionFailure("Refused source verification allowed image acquisition")
+        }
+        transport.imageChunk = { _, _, _, _, _, _ in
+            preconditionFailure("Refused source verification allowed image chunk delivery")
+        }
+        return transport
     }
 }

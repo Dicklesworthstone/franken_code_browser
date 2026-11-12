@@ -120,7 +120,7 @@ fn labels_equal_digests_and_stale_sources_do_not_grant_another_origin() {
     root.write("other.md", source);
     assert_eq!(reader.authorize_document_images(1, root.path(), b"other.md", || false).err(),
         Some(error(DocumentImageError::OriginMismatch)));
-    root.write("README.md", b"# Different\n\n![Logo](logo.png)\n");
+    root.write("README.md", b"# Modified\n\n![Logo](logo.png)\n");
     assert_eq!(reader.authorize_document_images(1, root.path(), b"README.md", || false).err(),
         Some(error(DocumentImageError::OriginChanged)));
     assert_eq!(reader.prepare_document_image(1, images[0].0, images[0].1, || false).err(),

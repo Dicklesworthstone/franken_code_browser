@@ -32,6 +32,16 @@ private func fcb_reader_document_display_font(_ handle: UInt64, _ generation: UI
 @_silgen_name("fcb_reader_document_display_from_source")
 private func fcb_reader_document_display_from_source(_ handle: UInt64, _ generation: UInt64, _ offset: UInt64, _ count: UInt64) -> UnsafeMutablePointer<CChar>?
 
+@_silgen_name("fcb_reader_document_images_authorize")
+private func fcb_reader_document_images_authorize(_ handle: UInt64, _ generation: UInt64,
+    _ root: UnsafePointer<CChar>?, _ relative: UnsafePointer<UInt8>?, _ length: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_reader_document_image_prepare")
+private func fcb_reader_document_image_prepare(_ handle: UInt64, _ generation: UInt64,
+    _ item: UInt64, _ request: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_reader_document_image_chunk")
+private func fcb_reader_document_image_chunk(_ handle: UInt64, _ generation: UInt64,
+    _ item: UInt64, _ request: UInt64, _ offset: UInt64, _ count: UInt64) -> UnsafeMutablePointer<CChar>?
+
 extension AtlasReaderDocumentTransport {
     static let native = Self(prepare: { handle, generation, width in
         take(fcb_reader_document(handle, generation, width, AtlasReaderDocumentLimits.sourceBytes,
@@ -49,7 +59,17 @@ extension AtlasReaderDocumentTransport {
     prepareDisplay: { take(fcb_reader_document_display($0, $1, $2)) },
     displayPage: { take(fcb_reader_document_display_page($0, $1, $2, $3)) },
     displayFont: { take(fcb_reader_document_display_font($0, $1, $2, $3, $4)) },
-    displayFromSource: { take(fcb_reader_document_display_from_source($0, $1, $2, $3)) })
+    displayFromSource: { take(fcb_reader_document_display_from_source($0, $1, $2, $3)) },
+    imagesAuthorize: { handle, generation, root, relative in
+        let bytes = Array(relative.utf8)
+        return root.withCString { root in
+            bytes.withUnsafeBufferPointer {
+                take(fcb_reader_document_images_authorize(handle, generation, root, $0.baseAddress, UInt64($0.count)))
+            }
+        }
+    },
+    imagePrepare: { take(fcb_reader_document_image_prepare($0, $1, $2, $3)) },
+    imageChunk: { take(fcb_reader_document_image_chunk($0, $1, $2, $3, $4, $5)) })
 
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
         guard let pointer else { return nil }
