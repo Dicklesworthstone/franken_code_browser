@@ -55,14 +55,14 @@ import Foundation
                 catch {}
             }
             let accepted = try admit(receipt)
-            precondition(accepted.fragment.status == "resolved-lines" && accepted.fragment.initialOriginalOffset == 34
-                && accepted.fragment.navigationDescription.contains("source lines 2–3"))
+            precondition(accepted.fragment?.status == "resolved-lines" && accepted.initialOriginalOffset == 34
+                && accepted.navigationDescription.contains("source lines 2–3"))
             var missing = receipt
             missing["fragment_status"] = "missing-line"; missing["target_range"] = NSNull()
             missing["initial_original_offset"] = "0"
             let fallback = try admit(missing)
-            precondition(fallback.fragment.initialOriginalOffset == 0
-                && fallback.fragment.navigationDescription.contains("absent"))
+            precondition(fallback.initialOriginalOffset == 0
+                && fallback.navigationDescription.contains("absent"))
             for slug in ["L0", "L01", "L3-L2", "L2-3", "L18446744073709551616", "%4C2"] {
                 var bad = receipt; bad["fragment_slug"] = slug; reject(bad)
             }
@@ -157,7 +157,7 @@ import Foundation
         let admitted = try AtlasProjectLinkReaderReceipt.decode(ProjectLinksFixture.json(receipt), index: index,
             generation: 1, link: link, side: .target, destination: receiver)
         precondition(admitted.info.identity.pathBytes == selected && admitted.info.identity.capturedBytes == 100)
-        precondition(admitted.fragment.status == "resolved" && admitted.fragment.initialOriginalOffset == 34)
+        precondition(admitted.fragment?.status == "resolved" && admitted.initialOriginalOffset == 34)
         for key in ["source_reopened", "additional_source_bytes_read", "source_sha256", "reader_owner", "destination_suffix"] {
             var bad = receipt
             switch key {
@@ -202,19 +202,19 @@ import Foundation
             fallback["fragment_status"] = status; fallback["target_range"] = NSNull(); fallback["initial_original_offset"] = "0"
             if status == "invalid" { fallback["fragment_slug"] = NSNull() }
             let result = try admitReader(fallback)
-            precondition(result.fragment.status == status && result.fragment.initialOriginalOffset == 0
-                && result.fragment.navigationDescription.contains("beginning"))
+            precondition(result.fragment?.status == status && result.initialOriginalOffset == 0
+                && result.navigationDescription.contains("beginning"))
         }
         var evidenceReceipt = ProjectLinksFixture.receipt(owner: index.basis.owner, reader: receiver,
             generation: 1, link: 1, side: .evidence)
         let evidenceReader = try admitReader(evidenceReceipt, side: .evidence)
-        precondition(evidenceReader.fragment.initialOriginalOffset == 0)
+        precondition(evidenceReader.initialOriginalOffset == 0)
         for field in fragmentFields { evidenceReceipt[field] = receipt[field] }
         refuseReader(evidenceReceipt, side: .evidence)
         var legacy = receipt
         for field in fragmentFields { legacy.removeValue(forKey: field) }
         let legacyReader = try admitReader(legacy)
-        precondition(legacyReader.fragment.status == "unqualified" && legacyReader.fragment.initialOriginalOffset == 0,
+        precondition(legacyReader.fragment?.status == "unqualified" && legacyReader.initialOriginalOffset == 0,
             "An old receipt can only open at the beginning")
         try sourceLineReceipts(index)
 

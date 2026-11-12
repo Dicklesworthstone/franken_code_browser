@@ -7,10 +7,11 @@ import SwiftUI
     let root: String
     let initialPath: [UInt8]?
     let model: AtlasProjectLinksModel
-    init(root: String, initialPath: [UInt8]?, direction: AtlasProjectLinkDirection, access: AnyObject?) {
+    init(root: String, initialPath: [UInt8]?, direction: AtlasProjectLinkDirection,
+         projection: AtlasProjectRelationshipProjection = .documentation, access: AnyObject?) {
         self.root = root; self.initialPath = initialPath
         model = AtlasProjectLinksModel(root: root, initialPath: initialPath,
-            direction: direction, access: access, transport: .native)
+            direction: direction, projection: projection, access: access, transport: .native)
     }
     func close() { model.close() }
 }
@@ -27,16 +28,17 @@ import SwiftUI
     @State private var pageStarts: [UInt64] = []
     @State private var pins = AtlasPinnedReaders<AtlasPagedReaderModel>(
         canFork: { $0.canPin }, fork: { try await $0.fork() }, retire: { $0.close() },
-        failureMessage: { ($0 as? AtlasReaderError)?.message ?? "The documentation capture could not be pinned." })
+        failureMessage: { ($0 as? AtlasReaderError)?.message ?? "The retained relationship source could not be pinned." })
     @Environment(\.dismiss) private var dismiss
 
     private struct PaginationScope: Equatable {
         let owner, index, generation: UInt64
         let direction: AtlasProjectLinkDirection
+        let projection: AtlasProjectRelationshipProjection
         let path: [UInt8]?
         init(_ page: AtlasProjectLinksPage) {
             owner = page.basis.owner; index = page.basis.index; generation = page.generation
-            direction = page.direction; path = page.path?.bytes
+            direction = page.direction; projection = page.projection; path = page.path?.bytes
         }
     }
 
@@ -61,8 +63,8 @@ import SwiftUI
                 Text(progress.summary).font(.caption).foregroundStyle(.secondary)
             }
             if let page = model.page {
-                Label(page.building ? "Building documentation links…"
-                    : (page.complete ? "Documentation coverage complete" : "Partial documentation coverage"),
+                Label(page.building ? "Building \(page.projection.noun)…"
+                    : (page.complete ? "\(page.projection.label) inventory complete" : "Partial \(page.projection.label.lowercased()) coverage"),
                     systemImage: page.building ? "doc.text.magnifyingglass"
                         : (page.complete ? "checkmark.circle" : "exclamationmark.circle"))
                     .font(.caption.weight(.semibold))
@@ -84,7 +86,7 @@ import SwiftUI
                     .font(.caption).textSelection(.enabled)
                 Spacer()
             }
-            Text("Links describe captured Markdown destinations. Evidence identifies the whole source document; link-token positions and compiler relationships are not established.")
+            Text(model.projection.explanation)
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .padding(14).frame(minWidth: 1080, idealWidth: 1320, minHeight: 700, idealHeight: 840)
@@ -99,9 +101,9 @@ import SwiftUI
     private var header: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack {
-                Label("Project documentation", systemImage: "link").font(.title2.weight(.semibold))
+                Label("Project relationships", systemImage: "link").font(.title2.weight(.semibold))
                 Spacer()
-                Button(model.hasPreparedSources ? "Rebuild links" : "Capture and build links") {
+                Button(model.hasPreparedSources ? "Rebuild \(model.projection.noun)" : "Capture and build \(model.projection.noun)") {
                     readerNotice = ""; model.prepare()
                 }.disabled(!canOperate)
                 Button("Refresh sources") { readerNotice = ""; model.prepare(refresh: true) }
@@ -110,18 +112,26 @@ import SwiftUI
                 Button("Done") { close(); dismiss() }.keyboardShortcut(.cancelAction)
             }
             Text(verbatim: presentation.root).font(.caption.monospaced()).lineLimit(2).textSelection(.enabled)
-            Text("Capture the project once, then follow links and backlinks within those retained bytes. Refresh sources to include edits.")
+            Text("Capture the project once, then inspect documentation or imports within those retained bytes. Refresh sources to include edits.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
 
     private var filters: some View {
         VStack(alignment: .leading, spacing: 6) {
+            Picker("Relationship evidence", selection: Binding(get: { model.projection }, set: { value in
+                readerNotice = ""; model.selectProjection(value)
+            })) {
+                ForEach(model.availableProjections) { projection in
+                    Text(projection.label).tag(projection)
+                }
+            }
+            .pickerStyle(.segmented).frame(maxWidth: 400).disabled(!canOperate)
             HStack {
                 TextField("Exact project-relative path, such as src/lib.rs", text: $pathInput)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { selectTypedPath() }
-                    .accessibilityLabel("Exact project-relative path for documentation relationships")
+                    .accessibilityLabel("Exact project-relative path for relationships")
                 Button("Use path", action: selectTypedPath)
                     .disabled(!canOperate || pathInput.isEmpty)
                 Button("Whole project") { readerNotice = ""; model.selectPath(nil) }
@@ -132,12 +142,12 @@ import SwiftUI
                     readerNotice = ""; model.filter(direction: value)
                 })) {
                     ForEach([AtlasProjectLinkDirection.all, .outgoing, .incoming], id: \.rawValue) { direction in
-                        Text(direction.label).tag(direction)
+                        Text(model.projection.directionLabel(direction)).tag(direction)
                             .disabled(direction != .all && model.selectedPath == nil)
                     }
                 }.pickerStyle(.segmented).frame(maxWidth: 400).disabled(!canOperate)
                 Spacer()
-                Text(model.selectedPath == nil ? "All project links" : "Exact selected file")
+                Text(model.selectedPath == nil ? "All project \(model.projection.noun)" : "Exact selected file")
                     .font(.caption).foregroundStyle(.secondary)
             }
             if let path = model.selectedPath, String(bytes: path, encoding: .utf8) == nil {
@@ -153,14 +163,14 @@ import SwiftUI
                 if let path = page.path {
                     Text(verbatim: path.display).font(.caption.monospaced()).lineLimit(2).textSelection(.enabled)
                 }
-                if page.building || page.direction != model.direction || page.path?.bytes != model.selectedPath {
-                    ContentUnavailableView("Preparing documentation links…", systemImage: "doc.text.magnifyingglass",
+                if page.building || page.projection != model.projection || page.direction != model.direction || page.path?.bytes != model.selectedPath {
+                    ContentUnavailableView("Preparing \(model.projection.noun)…", systemImage: "doc.text.magnifyingglass",
                         description: Text("The captured project inventory is being built. This file and direction filter will be applied when it is ready."))
                 } else if page.links.isEmpty {
-                    ContentUnavailableView("No retained links in this scope",
+                    ContentUnavailableView("No retained \(page.projection.noun) in this scope",
                         systemImage: "doc.text.magnifyingglass", description: Text(page.complete
-                            ? "No parsed Markdown links match this file and direction."
-                            : "Coverage is partial. Uncaptured, unsupported, or unparsed documents may contain additional links."))
+                            ? (page.projection == .documentation ? "No parsed Markdown links match this file and direction." : "No import statements in the supported lexical inventory match this file and direction.")
+                            : "Coverage is partial. Uncaptured, unsupported, or unparsed sources may contain additional relationships."))
                 } else {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 8) {
@@ -182,10 +192,15 @@ import SwiftUI
                 }.controlSize(.small)
             } else {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text(model.busy ? "Capturing project sources…" : "Find the documentation behind a source file")
+                    Text(model.busy ? "Capturing project sources…" : (model.projection == .imports
+                        ? "Follow imports through the captured project" : "Find the documentation behind a source file"))
                         .font(.headline)
-                    Text("Build documentation links, then choose Backlinks for a source path or Outgoing for a Markdown document.")
-                    Text("Capture admits up to 4,096 files, 1 MiB per file and 32 MiB total. Link extraction reads retained Markdown up to 256 KiB per document and keeps at most 4,096 links. Omitted documents remain visible in coverage.")
+                    Text(model.projection == .documentation
+                        ? "Build documentation links, then choose Backlinks for a source path or Outgoing for a Markdown document."
+                        : "Build import candidates, then choose Outgoing for declarations in a file or Imported by for catalog candidates targeting it. Read each exact statement before following its target.")
+                    Text(model.projection == .documentation
+                        ? "Capture admits up to 4,096 files, 1 MiB per file and 32 MiB total. Link extraction reads retained Markdown up to 256 KiB per document and keeps at most 4,096 links. Omitted documents remain visible in coverage."
+                        : "Import extraction examines retained Rust module/use declarations and JavaScript/TypeScript static imports and re-exports, including JSX/TSX. It admits up to 128 KiB per source and 4,096 statements within the bounded project capture. Package loading and compiler resolution are not performed.")
                         .font(.caption).foregroundStyle(.secondary)
                     Text("File filters and visible-map selection do not narrow this project capture.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -200,20 +215,23 @@ import SwiftUI
             Text(verbatim: link.destination.isEmpty ? "(empty destination)" : link.destination)
                 .font(.callout).lineLimit(4).textSelection(.enabled)
             Text(link.label).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            if link.projection == .imports {
+                Text(link.evidenceLabel).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
+            }
             if let path = link.targetPath {
                 Text(verbatim: path.display).font(.caption.monospaced()).lineLimit(2).textSelection(.enabled)
             }
             HStack {
-                Button("Read source document") { open(link, page: page, side: .evidence) }
-                Button("Read captured target") { open(link, page: page, side: .target) }
+                Button(link.projection == .imports ? "Read import evidence" : "Read source document") { open(link, page: page, side: .evidence) }
+                Button(link.projection == .imports ? "Read target candidate" : "Read captured target") { open(link, page: page, side: .target) }
                     .disabled(!link.canOpenTarget)
             }
             HStack {
-                Button("Links from source") {
+                Button(link.projection == .imports ? "Imports from source" : "Links from source") {
                     readerNotice = ""; model.selectPath(link.source.path.bytes, direction: .outgoing)
                 }
                 if let path = link.targetPath {
-                    Button("Backlinks to target") {
+                    Button(link.projection == .imports ? "Imported by" : "Backlinks to target") {
                         readerNotice = ""; model.selectPath(path.bytes, direction: .incoming)
                     }
                 }
@@ -248,7 +266,7 @@ import SwiftUI
             AtlasPinnedReadersView(readers: pins)
         } else {
             ContentUnavailableView("Read the captured evidence", systemImage: "doc.text",
-                description: Text("Open a source document or a captured target. Pin one side to keep code and documentation together while following another link."))
+                description: Text("Open a source statement, document, or captured target. Pin one side to keep its evidence beside the next source."))
         }
     }
 

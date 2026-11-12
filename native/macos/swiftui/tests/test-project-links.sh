@@ -1,5 +1,5 @@
 #!/bin/sh
-# Production native documentation-link decoder/model and Swift-to-C marshaling.
+# Production native documentation/import decoder/model and Swift-to-C marshaling.
 # Run through strict RCH at a reviewed source revision. Scripted envelopes do
 # not qualify Rust extraction, a real project capture or physical-Mac UI work.
 set -eu
@@ -20,6 +20,8 @@ set -- "$@" -swift-version 6 -warnings-as-errors \
     "$src/tests/AtlasIndexedSearchFixture.swift" "$src/tests/AtlasProjectLinksFixture.swift"
 swiftc "$@" "$src/tests/AtlasProjectLinksTests.swift" -o "$out/model-tests"
 "$out/model-tests"
+swiftc "$@" "$src/tests/AtlasProjectImportsTests.swift" -o "$out/import-tests"
+"$out/import-tests"
 cc -std=c11 -Wall -Wextra -Werror -I"$src/../../../crates/fcb-bridge/include" \
     -c "$src/tests/AtlasProjectLinksFixtures.c" -o "$out/links-fixture.o"
 swiftc "$@" "$src/AtlasProjectLinksBridge.swift" "$src/tests/AtlasProjectLinksBridgeTests.swift" \

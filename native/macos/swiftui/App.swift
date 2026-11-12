@@ -412,14 +412,15 @@ private struct AtlasFrozenViewportSearch: Sendable {
         workspaceStreamSearch = nil
     }
 
-    private func openProjectLinks(_ direction: AtlasProjectLinkDirection = .all) {
+    private func openProjectLinks(_ direction: AtlasProjectLinkDirection = .all,
+        projection: AtlasProjectRelationshipProjection = .documentation) {
         guard let authority = snapshotExportSource else { return }
         let path = direction == .all ? nil
             : (finderReaderCapture?.file.rawPath ?? selectedPath.map { Array($0.utf8) })
         guard direction == .all || path != nil else { return }
         closeProjectLinks()
         projectLinks = AtlasProjectLinksPresentation(root: authority.root,
-            initialPath: path, direction: direction, access: authority.access)
+            initialPath: path, direction: direction, projection: projection, access: authority.access)
     }
 
     private func closeProjectLinks() {
@@ -542,10 +543,10 @@ private struct AtlasFrozenViewportSearch: Sendable {
             }
             .help("Compare two saved project captures and open exact before/after sources")
             Button { openProjectLinks() } label: {
-                Label("Documentation", systemImage: "link")
+                Label("Relationships", systemImage: "link")
             }
             .disabled(snapshotExportSource == nil)
-            .help("Capture project sources and browse documentation links, backlinks, and their retained evidence")
+            .help("Capture project sources and follow documentation links or lexical import candidates with retained evidence")
             Button { moveSearchResult(backwards: true) } label: {
                 Label("Previous Match", systemImage: "arrow.up")
             }
@@ -1441,19 +1442,25 @@ private struct AtlasFrozenViewportSearch: Sendable {
             }
             Divider()
             VStack(alignment: .leading, spacing: 7) {
-                Text("Documentation").font(.caption.weight(.semibold))
+                Text("Relationships").font(.caption.weight(.semibold))
                 if selectedPath != nil || finderReaderCapture != nil {
+                    Button { openProjectLinks(.outgoing, projection: .imports) } label: {
+                        Label("Imports from this file", systemImage: "arrow.up.right")
+                    }
+                    Button { openProjectLinks(.incoming, projection: .imports) } label: {
+                        Label("Files importing this target", systemImage: "arrow.turn.up.left")
+                    }
                     Button { openProjectLinks(.incoming) } label: {
-                        Label("Backlinks to this file", systemImage: "arrow.turn.up.left")
+                        Label("Documentation backlinks", systemImage: "arrow.turn.up.left")
                     }
                     Button { openProjectLinks(.outgoing) } label: {
-                        Label("Links from this file", systemImage: "arrow.up.right")
+                        Label("Documentation links", systemImage: "arrow.up.right")
                     }
                 }
                 Button { openProjectLinks() } label: {
-                    Label("Browse project links", systemImage: "link")
+                    Label("Browse project relationships", systemImage: "link")
                 }
-                Text("Build links from captured Markdown and open their source evidence.")
+                Text("Read exact import statements or captured Markdown links. Import targets are catalog candidates, not compiler-resolved dependencies.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
             .controlSize(.small).disabled(snapshotExportSource == nil)
