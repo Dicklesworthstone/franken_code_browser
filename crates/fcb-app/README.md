@@ -37,11 +37,13 @@ fcb search /path/to/repository --workspace --path 'src/lib' --json
 fcb search /path/to/repository --workspace --text needle --max-files 8192 --max-total-bytes 67108864 --json
 
 fcb search huge.rs --whole-file --text needle --json
+fcb search huge.rs --whole-file --text needle --ignore-case --json
 fcb search huge.rs --whole-file --text needle --max-scan-bytes 4294967296 --json
 fcb search payload.bin --whole-file --raw-hex 00ff --json
 fcb search /path/to/repository --workspace --whole-file --text 'pub fn' --json
 fcb search /path/to/repository --workspace --whole-file --raw-hex 00ff --json
 fcb search /path/to/repository --workspace --whole-file --text 'pub fn' --count-all --limit 50 --json
+fcb search /path/to/repository --workspace --whole-file --text 'pub fn' --ignore-case --count-all --limit 0 --json
 ```
 
 By default, the scope is **one explicitly selected file**, not its siblings or
@@ -63,15 +65,23 @@ default workspace capture limit and does not accumulate the repository's source
 payloads in memory. It uses the existing overlapping KMP matcher and source
 UTF-8/UTF-16 decoder, not an external search executable or a second engine.
 
-Text matching is exact and case-sensitive. A literal is prepared in UTF-8 and
-UTF-16LE/BE; decoder validation, code-unit alignment and actual leading-BOM
-handling make encoded matching equivalent to these exact text semantics.
+Text matching is exact and case-sensitive by default. A literal is prepared in
+UTF-8 and UTF-16LE/BE; decoder validation, code-unit alignment and actual
+leading-BOM handling make encoded matching equivalent to these exact text
+semantics. Add **`--ignore-case`** to use the existing Unicode lowercase scalar
+matcher for either a single file or a workspace. For example, `k` matches
+`K`, `K`, and `k`; a match for `i` inside the lowercase expansion of `İ`
+retains the entire original source scalar. Each occurrence keeps its own
+original spelling and exact encoded bytes. This does not add full case folding
+(`ss` does not match `ß`) or canonical accent normalization.
+
 Literal matches may cross any number of short reads or buffer boundaries, even
 when the literal is longer than the 16 KiB input buffer. Internal U+FEFF scalars
-remain content. Normalization, case folding and regex are not silently applied.
-`--encoding` can declare `utf8`, `utf16le`, or `utf16be`; automatic detection uses
-the beginning of the SAME continuous observation. `--raw-hex` searches arbitrary
-original bytes and cannot be combined with an encoding override.
+remain content. Regex is not silently applied. `--encoding` can declare
+`utf8`, `utf16le`, or `utf16be`; automatic detection uses the beginning of
+the SAME continuous observation. `--raw-hex` searches arbitrary original bytes
+and cannot be combined with an encoding override or `--ignore-case`.
+File-window and stdin search retain their existing exact semantics.
 
 The operation's allocations depend on fixed input/decoder scratch, literal
 length and result capacity, not the source file's length. The input buffer is
@@ -107,11 +117,12 @@ Use `--max-files` and `--include-excluded` with an explicit workspace as before.
 ### Retention and consistency
 
 Streaming results retain **literal witnesses only**, not arbitrary discarded
-source ranges. The matched original bytes are proven equal to the encoded
-literal and share one immutable backing value rather than being copied for
-every occurrence. The public `FileSearchReport::retain_hit` can materialize an
-exact `ObservedExtent` for a selected occurrence without rereading a changed
-live file. It never synthesizes neighboring lines, a file digest, or a full
+source ranges. Exact text and raw-byte matches share one immutable encoded
+literal. Unicode lowercase matches retain each occurrence's original spelling
+and encoded bytes, because the source may differ from the query in both
+spelling and byte length. The public `FileSearchReport::retain_hit` can
+materialize an exact `ObservedExtent` for a selected occurrence without
+rereading a changed live file. It never synthesizes neighboring lines, a file digest, or a full
 snapshot. Reading neighboring source is a new observation with a new revision.
 
 Before/after metadata is taken on the actual open file. Length and modification
@@ -132,10 +143,18 @@ short read, unsupported text, cancellation and failure. Encountered malformed
 text invalidates that file's exact-text results; raw-byte search remains an
 explicit alternative. Other completed files' results remain useful.
 
-Whole-file JSON uses `strategy: "streaming-whole-file"`. Each file record carries
+Whole-file JSON uses `strategy: "streaming-whole-file"`. Matching metadata is
+present on each file and at workspace level: `mode` is
+`exact-decoded-text`, `unicode-lowercase-text`, or `original-bytes`;
+`case_sensitive` records the text choice and `normalization` is `exact`.
+The latter two fields are null for raw-byte search. Each file record carries
 exact original-byte hit ranges, counters, consistency and terminal state.
-`literal_original_hex` supplies the shared witness once when hits exist.
-`decoded_range` is null: the scanner does not invent global decoded coordinates.
+`literal_text` remains the requested text. Exact text and raw-byte searches
+supply their shared `literal_original_hex` once when hits exist. Lowercase
+search sets that field to null and adds `matched_text` and `original_hex`
+to each retained hit. `retained_witness_bytes` reports retained original-byte
+payload, including zero for count-only scans. `decoded_range` is null: the
+scanner does not invent global decoded coordinates.
 Workspace output has `files`, `files_examined`, `unexamined_files`,
 `incomplete_files`, `workspace_complete`, `matching_files`, global counts and
 `stop_reason`. `matching_files` includes files with counted occurrences after
@@ -381,6 +400,9 @@ oracle across short reads, long literals, BOMs, UTF-16 alignment, malformed
 suffixes and result limits. File tests exercise large-file tails, shared-cursor
 isolation, truncation/growth, namespace replacement and retained witnesses.
 `whole_file_cli` exercises actual command dispatch and the standalone binary.
+Its lowercase regressions cover UTF-8 and both UTF-16 byte orders, expansion
+and original-byte witnesses, scalar splits, exact-mode negative controls,
+global counting and limits, malformed input, cancellation and option rejection.
 
 The independent verifier should run these selections using the repository's
 strict-RCH lane, not local worker builds:

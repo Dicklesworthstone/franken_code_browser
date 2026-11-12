@@ -7,7 +7,7 @@
 use std::{fs::File, path::Path};
 use fcb::source::path::NormalizedPath;
 use fcb::search::{CaptureRequest, DetectedEncoding, ExtentConsistency, FileSearch, FileSearchReport,
-    ResourceBudget, StreamReadOptions, StreamReadState, StreamReadStep, StreamingNeedle};
+    ResourceBudget, StreamReadOptions, StreamReadState, StreamReadStep, StreamingMode, StreamingNeedle};
 use fcb::search::workspace::WorkspaceCatalog;
 use crate::{AppError, SCHEMA, EXIT_OK, EXIT_NO_MATCH, EXIT_PARTIAL, allocation, owner, generation, revision, file_id};
 use crate::args::{Arguments, Encoding, Needle};
@@ -19,7 +19,7 @@ const MAX_READ_CALLS: u64 = 16 * 1024 * 1024;
 
 fn needle(args: &Arguments, budget: &ResourceBudget) -> Result<StreamingNeedle, AppError> {
     match args.needle.as_ref() {
-        Some(Needle::Text(text)) => Ok(StreamingNeedle::text(owner(), text, budget, allocation(40))?),
+        Some(Needle::Text(text)) => Ok(StreamingNeedle::text_matching(owner(), text, !args.ignore_case, budget, allocation(40))?),
         Some(Needle::Raw(bytes)) => Ok(StreamingNeedle::raw(owner(), bytes, budget, allocation(40))?),
         _ => Err(AppError::InvalidRange),
     }
@@ -88,6 +88,7 @@ pub(crate) fn workspace(args: &Arguments, catalog: &WorkspaceCatalog, root: &Pat
         out.integer(args.max_scan_bytes)?;
         out.literal(",\"max_read_calls\":")?; out.integer(MAX_READ_CALLS)?;
         out.literal(",\"count_all_matches\":")?; out.boolean(args.count_all)?;
+        matching_fields(pattern.mode(), out)?;
         out.literal(",\"files\":[")?;
     } else { out.literal("Streaming workspace search; only literal witnesses are retained\n")?; }
     for (ordinal, entry) in catalog.entries().iter().enumerate() {
@@ -181,13 +182,27 @@ fn exit(report: &FileSearchReport<'_>) -> u8 {
     if !report.is_complete() || report.search().hits_truncated() { EXIT_PARTIAL }
     else if report.search().matches_seen() == 0 { EXIT_NO_MATCH } else { EXIT_OK }
 }
+fn matching_fields(mode: StreamingMode, out: &mut Output) -> Result<(), AppError> {
+    // Only the raw, exact and lowercase literal modes constructed by this
+    // command's private needle() reach this formatter.
+    out.literal(",\"mode\":")?;
+    out.quoted(if mode == StreamingMode::OriginalBytes { "original-bytes" }
+        else if mode == StreamingMode::LowercaseText { "unicode-lowercase-text" }
+        else { "exact-decoded-text" })?;
+    out.literal(",\"case_sensitive\":")?;
+    if mode == StreamingMode::OriginalBytes { out.literal("null")?; }
+    else { out.boolean(mode != StreamingMode::LowercaseText)?; }
+    out.literal(",\"normalization\":")?;
+    if mode == StreamingMode::OriginalBytes { out.literal("null")?; }
+    else { out.quoted("exact")?; }
+    Ok(())
+}
 fn fields(report: &FileSearchReport<'_>, out: &mut Output, canceled: &mut impl FnMut() -> bool) -> Result<(), AppError> {
     let search = report.search();
     out.literal(",\"file_id\":")?; out.integer(search.request().file().get())?;
     out.literal(",\"revision\":")?; out.integer(search.request().revision().get())?;
     out.literal(",\"query_generation\":")?; out.integer(search.generation().get())?;
-    out.literal(",\"mode\":")?;
-    out.quoted(if search.text_literal().is_some() { "exact-decoded-text" } else { "original-bytes" })?;
+    matching_fields(search.mode(), out)?;
     out.literal(",\"encoding\":")?;
     out.quoted(match search.encoding() { Some(DetectedEncoding::Utf16Le) => "utf16le",
         Some(DetectedEncoding::Utf16Be) => "utf16be", Some(DetectedEncoding::Utf8 { .. }) => "utf8", _ => "not-selected" })?;
@@ -206,6 +221,7 @@ fn fields(report: &FileSearchReport<'_>, out: &mut Output, canceled: &mut impl F
     out.literal(",\"peak_input_buffer_bytes\":")?; out.integer(search.stats().peak_buffer_bytes as u64)?;
     out.literal(",\"matches_seen\":")?; out.integer(search.matches_seen())?;
     out.literal(",\"stored_hits\":")?; out.integer(search.hits().len() as u64)?;
+    out.literal(",\"retained_witness_bytes\":")?; out.integer(search.retained_witness_bytes() as u64)?;
     out.literal(",\"unsupported_at\":")?;
     if let Some(offset) = search.unsupported_at() { out.integer(offset.get())?; } else { out.literal("null")?; }
     out.literal(",\"error_code\":")?;
@@ -217,20 +233,32 @@ fn fields(report: &FileSearchReport<'_>, out: &mut Output, canceled: &mut impl F
     out.literal(",\"retention\":\"literal-witnesses-only\",\"literal_text\":")?;
     if let Some(text) = search.text_literal() { out.quoted(text)?; } else { out.literal("null")?; }
     out.literal(",\"literal_original_hex\":")?;
-    if search.hits().is_empty() { out.literal("null")?; } else { out.hex(search.witness_bytes(0)?)?; }
+    if search.hits().is_empty() || search.mode() == StreamingMode::LowercaseText {
+        out.literal("null")?;
+    } else { out.hex(search.witness_bytes(0)?)?; }
     out.literal(",\"hits\":[")?;
     for (index, hit) in search.hits().iter().enumerate() {
         if canceled() { return Err(AppError::Canceled); }
         if index > 0 { out.literal(",")?; }
         out.literal("{\"occurrence_id\":")?; out.integer(hit.occurrence_id())?;
         out.literal(",\"original_range\":")?; out.range(hit.original_range())?;
-        out.literal(",\"decoded_range\":null}")?;
+        out.literal(",\"decoded_range\":null")?;
+        if search.mode() == StreamingMode::LowercaseText {
+            out.literal(",\"matched_text\":")?; out.quoted(search.matched_text(index)?)?;
+            out.literal(",\"original_hex\":")?; out.hex(search.witness_bytes(index)?)?;
+        }
+        out.literal("}")?;
     }
     out.literal("]")?;
     Ok(())
 }
 fn human(report: &FileSearchReport<'_>, out: &mut Output) -> Result<(), AppError> {
     let search = report.search();
+    out.literal("  Matching: ")?;
+    out.literal(if search.mode() == StreamingMode::OriginalBytes { "original bytes" }
+        else if search.mode() == StreamingMode::LowercaseText { "Unicode lowercase text; exact normalization" }
+        else { "exact case-sensitive text" })?;
+    out.literal("\n")?;
     for hit in search.hits() {
         out.literal("  bytes ")?; out.literal(&hit.original_range().start().get().to_string())?;
         out.literal("..")?; out.literal(&hit.original_range().end().get().to_string())?; out.literal("\n")?;

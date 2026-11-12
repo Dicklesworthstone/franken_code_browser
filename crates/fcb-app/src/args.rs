@@ -181,8 +181,12 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         return Err(ArgumentError::IncompatibleOptions);
     }
     if parsed.respect_ignores && (!parsed.workspace || parsed.include_excluded) { return Err(ArgumentError::IncompatibleOptions); }
-    if parsed.ignore_case && (parsed.command != Command::Search || !parsed.workspace || parsed.whole_file
-        || !matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Query(_)))) {
+    let allows_ignore_case = if parsed.whole_file {
+        matches!(parsed.needle.as_ref(), Some(Needle::Text(_)))
+    } else {
+        parsed.workspace && matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Query(_)))
+    };
+    if parsed.ignore_case && (parsed.command != Command::Search || !allows_ignore_case) {
         return Err(ArgumentError::IncompatibleOptions);
     }
     if parsed.whole_file {
@@ -369,7 +373,7 @@ mod tests {
             vec!["search", "file", "--whole-file", "--text", "x", "--count-all", "--count-all"],
             vec!["inspect", "file", "--count-all"],
             vec!["search", "file", "--whole-file", "--path", "x", "--count-all"],
-            vec!["search", "file", "--whole-file", "--text", "x", "--count-all", "--ignore-case"]] {
+            vec!["search", "file", "--whole-file", "--raw-hex", "78", "--count-all", "--ignore-case"]] {
             assert!(parse(&args(&input)).is_err(), "{input:?}");
         }
         for mode in ["--text", "--query"] {
@@ -415,17 +419,27 @@ mod tests {
         }
     }
     #[test]
-    fn case_insensitive_search_is_explicit_and_limited_to_captured_workspace_text() {
+    fn case_insensitive_search_is_explicit_for_captured_workspace_and_whole_file_text() {
         for kind in ["--text", "--query"] {
             let options = parse(&args(&["search", "root", "--workspace", kind, "ÄPFEL", "--ignore-case",
                 "--max-scan-bytes", "123"])).unwrap();
             assert!(options.ignore_case); assert_eq!(options.max_scan_bytes, 123);
         }
+        for input in [vec!["search", "file", "--whole-file", "--text", "ÄPFEL", "--ignore-case"],
+            vec!["search", "root", "--workspace", "--whole-file", "--text", "ÄPFEL", "--ignore-case"],
+            vec!["search", "file", "--whole-file", "--text", "ÄPFEL", "--ignore-case", "--count-all", "--limit", "0"],
+            vec!["search", "file", "--whole-file", "--text", "ÄPFEL", "--ignore-case", "--encoding", "utf16le"]] {
+            let options = parse(&args(&input)).unwrap();
+            assert!(options.ignore_case && options.whole_file);
+        }
         let literal = parse(&args(&["search", "root", "--workspace", "--text", "--ignore-case"])).unwrap();
         assert!(!literal.ignore_case);
         assert_eq!(literal.needle, Some(Needle::Text("--ignore-case".to_owned())));
         for input in [vec!["search", "file", "--text", "x", "--ignore-case"],
-            vec!["search", "root", "--workspace", "--whole-file", "--text", "x", "--ignore-case"],
+            vec!["search", "file", "--whole-file", "--raw-hex", "78", "--ignore-case"],
+            vec!["search", "root", "--workspace", "--whole-file", "--raw-hex", "78", "--ignore-case"],
+            vec!["search", "--stdin", "--text", "x", "--ignore-case"],
+            vec!["search", "root", "--workspace", "--whole-file", "--query", "x", "--ignore-case"],
             vec!["search", "root", "--workspace", "--path", "x", "--ignore-case"],
             vec!["inspect", "root", "--workspace", "--ignore-case"],
             vec!["search", "root", "--workspace", "--text", "x", "--ignore-case", "--ignore-case"],

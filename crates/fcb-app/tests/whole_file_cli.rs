@@ -39,6 +39,19 @@ fn utf16(text: &str, little: bool) -> Vec<u8> {
     bytes
 }
 
+fn encoded(text: &str, encoding: &str) -> Vec<u8> {
+    match encoding {
+        "utf8" => text.as_bytes().to_vec(),
+        "utf16le" => text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+        "utf16be" => text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+        _ => panic!("unexpected encoding"),
+    }
+}
+fn hex(bytes: &[u8]) -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() }
+fn bounds(hit: &Json) -> (u64, u64) {
+    (hit.get("original_range").get("start").number(), hit.get("original_range").get("end").number())
+}
+
 #[test]
 fn whole_file_mode_reaches_a_large_file_tail_without_weakening_the_window_route() {
     let temp = Temp::new();
@@ -225,15 +238,19 @@ fn count_all_preserves_raw_byte_semantics_and_unsupported_text_coverage() {
 #[test]
 fn count_all_can_cancel_after_the_retained_buffer_has_filled() {
     let temp = Temp::new(); let file = temp.file("file.rs", &vec![b'a'; 128 * 1024]);
-    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-    let mut checks = 0;
-    let code = run(&args(&file, &["--whole-file", "--text", "a", "--count-all", "--limit", "1"]),
-        &mut NoStdin, &mut stdout, &mut stderr, || { checks += 1; checks > 64 });
-    assert_eq!(code, EXIT_CANCELED);
-    assert!(stderr.is_empty());
-    let error = parse(&stdout).unwrap();
-    assert_eq!(error.get("status").text(), "error");
-    assert_eq!(error.get("error").get("code").text(), "CLI_CANCELED");
+    for (query, ignore_case) in [("a", false), ("A", true)] {
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let mut flags = vec!["--whole-file", "--text", query, "--count-all", "--limit", "1"];
+        if ignore_case { flags.push("--ignore-case"); }
+        let mut checks = 0;
+        let code = run(&args(&file, &flags), &mut NoStdin, &mut stdout, &mut stderr,
+            || { checks += 1; checks > 64 });
+        assert_eq!(code, EXIT_CANCELED);
+        assert!(stderr.is_empty());
+        let error = parse(&stdout).unwrap();
+        assert_eq!(error.get("status").text(), "error");
+        assert_eq!(error.get("error").get("code").text(), "CLI_CANCELED");
+    }
 }
 
 #[test]
@@ -284,11 +301,220 @@ fn standalone_executable_delivers_whole_file_and_workspace_search() {
     let mut bytes = vec![b'x'; 1024 * 1024 + 1]; bytes.extend_from_slice(b"needle");
     let file = temp.file("huge.rs", &bytes);
     for (path, flags) in [(&file, vec!["--whole-file", "--text", "needle"]),
-        (&temp.0, vec!["--whole-file", "--workspace", "--text", "needle"])] {
+        (&temp.0, vec!["--whole-file", "--workspace", "--text", "needle"]),
+        (&file, vec!["--whole-file", "--text", "NEEDLE", "--ignore-case"]),
+        (&temp.0, vec!["--whole-file", "--workspace", "--text", "NEEDLE", "--ignore-case"])] {
         let result = Command::new(env!("CARGO_BIN_EXE_fcb")).args(args(path, &flags)).output().unwrap();
         assert!(result.status.success(), "stderr={:?}", String::from_utf8_lossy(&result.stderr));
         assert!(result.stderr.is_empty());
         let json = parse(&result.stdout).unwrap();
         assert_eq!(json.get("strategy").text(), "streaming-whole-file");
+        if flags.contains(&"--ignore-case") {
+            assert_eq!(json.get("mode").text(), "unicode-lowercase-text");
+            assert!(!json.get("case_sensitive").flag());
+            let report = if flags.contains(&"--workspace") { &json.get("files").array()[0] } else { &json };
+            let hit = &report.get("hits").array()[0];
+            assert_eq!(hit.get("matched_text").text(), "needle");
+            assert_eq!(hit.get("original_hex").text(), "6e6565646c65");
+            assert_eq!(bounds(hit), (1024 * 1024 + 1, 1024 * 1024 + 7));
+        }
     }
+}
+
+#[test]
+fn lowercase_file_search_retains_each_original_spelling_in_utf8_and_utf16() {
+    let temp = Temp::new();
+    for encoding in ["utf8", "utf16le", "utf16be"] {
+        let source = encoded("\u{feff}K K k", encoding);
+        let file = temp.file("case.rs", &source);
+        for declaration in ["auto", encoding] {
+            let (exit, json) = invoke(&file, &["--whole-file", "--text", "k", "--ignore-case",
+                "--encoding", declaration]);
+            assert_eq!(exit, EXIT_OK);
+            assert_eq!(json.get("mode").text(), "unicode-lowercase-text");
+            assert!(!json.get("case_sensitive").flag());
+            assert_eq!(json.get("normalization").text(), "exact");
+            assert_eq!(json.get("encoding").text(), encoding);
+            assert!(json.get("whole_file_complete").flag());
+            assert_eq!(json.get("matches_seen").number(), 3);
+            assert_eq!(json.get("literal_text").text(), "k");
+            assert_eq!(json.get("literal_original_hex"), &Json::Null);
+            let hits = json.get("hits").array();
+            let mut offset = encoded("\u{feff}", encoding).len() as u64;
+            let mut retained = 0u64;
+            for (index, spelling) in ["K", "K", "k"].iter().enumerate() {
+                let witness = encoded(spelling, encoding);
+                assert_eq!(bounds(&hits[index]), (offset, offset + witness.len() as u64));
+                assert_eq!(hits[index].get("matched_text").text(), *spelling);
+                assert_eq!(hits[index].get("original_hex").text(), hex(&witness));
+                assert_eq!(hits[index].get("decoded_range"), &Json::Null);
+                offset += witness.len() as u64 + encoded(" ", encoding).len() as u64;
+                retained += witness.len() as u64;
+            }
+            assert_eq!(json.get("retained_witness_bytes").number(), retained);
+        }
+        let (exit, exact) = invoke(&file, &["--whole-file", "--text", "k"]);
+        assert_eq!(exit, EXIT_OK);
+        assert_eq!(exact.get("mode").text(), "exact-decoded-text");
+        assert!(exact.get("case_sensitive").flag());
+        assert_eq!(exact.get("matches_seen").number(), 1);
+        assert_eq!(exact.get("literal_original_hex").text(), hex(&encoded("k", encoding)));
+        assert_eq!(bounds(&exact.get("hits").array()[0]),
+            ((source.len() - encoded("k", encoding).len()) as u64, source.len() as u64));
+        assert_eq!(fs::read(&file).unwrap(), source);
+    }
+}
+
+#[test]
+fn lowercase_scalar_expansions_keep_complete_source_units_without_full_case_folding() {
+    let temp = Temp::new();
+    let file = temp.file("expansion.rs", "İ i\u{0307} ß SS ss".as_bytes());
+    let (exit, scalar) = invoke(&file, &["--whole-file", "--text", "i", "--ignore-case"]);
+    assert_eq!(exit, EXIT_OK);
+    let hits = scalar.get("hits").array();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(bounds(&hits[0]), (0, 2));
+    assert_eq!(hits[0].get("matched_text").text(), "İ");
+    assert_eq!(hits[0].get("original_hex").text(), "c4b0");
+    assert_eq!(bounds(&hits[1]), (3, 4));
+    assert_eq!(hits[1].get("matched_text").text(), "i");
+    assert_ne!(hits[0].get("occurrence_id"), hits[1].get("occurrence_id"));
+    let (exit, expanded) = invoke(&file, &["--whole-file", "--text", "i\u{0307}", "--ignore-case"]);
+    assert_eq!(exit, EXIT_OK);
+    let hits = expanded.get("hits").array();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(bounds(&hits[0]), (0, 2));
+    assert_eq!(bounds(&hits[1]), (3, 6));
+    assert_eq!(hits[1].get("matched_text").text(), "i\u{0307}");
+    assert_eq!(hits[1].get("original_hex").text(), "69cc87");
+    let (exit, exact) = invoke(&file, &["--whole-file", "--text", "i\u{0307}"]);
+    assert_eq!(exit, EXIT_OK);
+    assert_eq!(exact.get("matches_seen").number(), 1);
+    let (exit, lower) = invoke(&file, &["--whole-file", "--text", "ss", "--ignore-case"]);
+    assert_eq!(exit, EXIT_OK);
+    assert_eq!(lower.get("matches_seen").number(), 2);
+    assert_eq!(lower.get("hits").array()[0].get("matched_text").text(), "SS");
+    assert_eq!(lower.get("hits").array()[1].get("matched_text").text(), "ss");
+    let accents = temp.file("accents.rs", "Ä A\u{0308} ä".as_bytes());
+    let (exit, exact_accents) = invoke(&accents, &["--whole-file", "--text", "ä", "--ignore-case"]);
+    assert_eq!(exit, EXIT_OK);
+    assert_eq!(exact_accents.get("matches_seen").number(), 2);
+    assert_eq!(bounds(&exact_accents.get("hits").array()[1]), (7, 9));
+}
+
+#[test]
+fn lowercase_matches_survive_a_source_scalar_split_at_the_input_buffer_boundary() {
+    let temp = Temp::new();
+    let prefix = 16 * 1024 - 1;
+    let mut source = vec![b'x'; prefix]; source.extend_from_slice("KKk".as_bytes());
+    let file = temp.file("split.rs", &source);
+    let (exit, json) = invoke(&file, &["--whole-file", "--text", "k", "--ignore-case"]);
+    assert_eq!(exit, EXIT_OK);
+    assert!(json.get("whole_file_complete").flag());
+    assert_eq!(json.get("matches_seen").number(), 3);
+    assert_eq!(bounds(&json.get("hits").array()[0]), (prefix as u64, prefix as u64 + 3));
+    assert_eq!(json.get("hits").array()[0].get("original_hex").text(), "e284aa");
+    assert_eq!(json.get("payload_bytes_read").number(), source.len() as u64);
+    assert!(json.get("peak_input_buffer_bytes").number() <= 16 * 1024);
+}
+
+#[test]
+fn lowercase_workspace_counting_remains_global_with_exact_per_hit_witnesses() {
+    let temp = Temp::new();
+    temp.file("a.rs", "K K k".as_bytes());
+    temp.file("b.rs", &utf16("Kk", true));
+    temp.file("c.rs", &utf16("KK", false));
+    let (exit, limited) = invoke(&temp.0, &["--workspace", "--whole-file", "--text", "k",
+        "--ignore-case", "--limit", "1"]);
+    assert_eq!(exit, EXIT_PARTIAL);
+    assert!(!limited.get("match_count_complete").flag());
+    assert_eq!(limited.get("matches_seen").number(), 2);
+    assert_eq!(limited.get("unexamined_files").number(), 2);
+    assert_eq!(limited.get("stop_reason").text(), "match-limit");
+    for (limit, retained) in [("0", 0u64), ("1", 1), ("7", 7)] {
+        let (exit, json) = invoke(&temp.0, &["--workspace", "--whole-file", "--text", "k",
+            "--ignore-case", "--count-all", "--limit", limit]);
+        assert_eq!(exit, if retained < 7 { EXIT_PARTIAL } else { EXIT_OK });
+        assert_eq!(json.get("mode").text(), "unicode-lowercase-text");
+        assert!(!json.get("case_sensitive").flag());
+        assert_eq!(json.get("normalization").text(), "exact");
+        assert!(json.get("workspace_complete").flag());
+        assert!(json.get("match_count_complete").flag());
+        assert_eq!(json.get("matches_seen").number(), 7);
+        assert_eq!(json.get("stored_hits").number(), retained);
+        assert_eq!(json.get("matching_files").number(), 3);
+        assert_eq!(json.get("files_examined").number(), 3);
+        assert_eq!(json.get("unexamined_files").number(), 0);
+        assert_eq!(json.get("stop_reason"), &Json::Null);
+        for file in json.get("files").array() {
+            assert!(file.get("whole_file_complete").flag());
+            assert_eq!(file.get("literal_original_hex"), &Json::Null);
+            if retained == 0 {
+                assert!(file.get("hits").array().is_empty());
+                assert_eq!(file.get("retained_witness_bytes").number(), 0);
+            }
+        }
+        if retained == 7 {
+            let files = json.get("files").array();
+            assert_eq!(files[1].get("hits").array()[0].get("original_hex").text(), "4b00");
+            assert_eq!(files[2].get("hits").array()[0].get("original_hex").text(), "212a");
+            assert_eq!(files[2].get("hits").array()[0].get("matched_text").text(), "K");
+        }
+    }
+    let (exit, absent) = invoke(&temp.0, &["--workspace", "--whole-file", "--text", "absent",
+        "--ignore-case", "--count-all", "--limit", "0"]);
+    assert_eq!(exit, EXIT_NO_MATCH);
+    assert!(absent.get("match_count_complete").flag());
+    assert_eq!(absent.get("matches_seen").number(), 0);
+}
+
+#[test]
+fn lowercase_counting_preserves_partial_budget_and_malformed_source_reporting() {
+    let temp = Temp::new();
+    temp.file("a.rs", "K K k".as_bytes()); temp.file("b.rs", b"K");
+    let (exit, limited) = invoke(&temp.0, &["--workspace", "--whole-file", "--text", "k",
+        "--ignore-case", "--count-all", "--limit", "1", "--max-scan-bytes", "5"]);
+    assert_eq!(exit, EXIT_PARTIAL);
+    assert!(!limited.get("match_count_complete").flag());
+    assert_eq!(limited.get("payload_bytes_read").number(), 5);
+    assert_eq!(limited.get("matches_seen").number(), 2);
+    assert_eq!(limited.get("unexamined_files").number(), 1);
+    assert_eq!(limited.get("stop_reason").text(), "byte-limit");
+    temp.file("c.rs", b"K\xff");
+    let (exit, malformed) = invoke(&temp.0, &["--workspace", "--whole-file", "--text", "k",
+        "--ignore-case", "--count-all"]);
+    assert_eq!(exit, EXIT_PARTIAL);
+    assert!(!malformed.get("match_count_complete").flag());
+    assert_eq!(malformed.get("matches_seen").number(), 4);
+    assert_eq!(malformed.get("incomplete_files").number(), 1);
+    assert_eq!(malformed.get("files_examined").number(), 3);
+    let rejected = &malformed.get("files").array()[2];
+    assert_eq!(rejected.get("state").text(), "unsupported-text");
+    assert_eq!(rejected.get("matches_seen").number(), 0);
+    assert_eq!(rejected.get("retained_witness_bytes").number(), 0);
+    assert!(rejected.get("hits").array().is_empty());
+}
+
+#[test]
+fn lowercase_whole_file_requests_reject_byte_and_window_options_before_io() {
+    let temp = Temp::new(); let missing = temp.0.join("missing.rs");
+    for flags in [
+        vec!["--whole-file", "--raw-hex", "4b", "--ignore-case"],
+        vec!["--workspace", "--whole-file", "--raw-hex", "4b", "--ignore-case"],
+        vec!["--text", "k", "--ignore-case"],
+        vec!["--whole-file", "--text", "k", "--ignore-case", "--bytes", "4"],
+        vec!["--whole-file", "--text", "k", "--ignore-case", "--offset", "0"],
+    ] {
+        let (exit, error) = invoke(&missing, &flags);
+        assert_eq!(exit, EXIT_ERROR);
+        assert_eq!(error.get("error").get("code").text(), "CLI_INCOMPATIBLE_OPTIONS");
+    }
+    let file = temp.file("raw.rs", b"K k");
+    let (exit, raw) = invoke(&file, &["--whole-file", "--raw-hex", "4b"]);
+    assert_eq!(exit, EXIT_OK);
+    assert_eq!(raw.get("mode").text(), "original-bytes");
+    assert_eq!(raw.get("case_sensitive"), &Json::Null);
+    assert_eq!(raw.get("normalization"), &Json::Null);
+    assert_eq!(raw.get("matches_seen").number(), 1);
+    assert_eq!(raw.get("literal_original_hex").text(), "4b");
 }
