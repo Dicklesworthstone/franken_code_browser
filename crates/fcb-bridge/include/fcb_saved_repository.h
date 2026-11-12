@@ -75,6 +75,27 @@ char *fcb_saved_search(uint64_t handle, uint64_t generation,
  */
 char *fcb_saved_search_counted(uint64_t handle, uint64_t generation,
     const char *needle, uint64_t max_matches);
+/* Match-case selection for the same literal query generation namespace.
+ * case_sensitive and count_all_matches are exactly 0 or 1. Match case 1 is the
+ * existing exact-decoded-literal policy; 0 uses unicode-lowercase-literal with
+ * the shared scalar lowercase mapping (not full folding or normalization).
+ * max_matches is 0..4096 when counting, 1..4096 otherwise.
+ *
+ * Exact FCBD postings are incompatible with lowercase matching. Such queries
+ * verify every admitted saved member directly while preserving the attachment.
+ * Search/results freeze case_sensitive, mode, index_used and index_policy;
+ * a bypassed index has null query index_generation/index_pin and no posting I/O.
+ * Count, coverage, cancellation and immutable row identities are unchanged.
+ * Open-hit selection receipts repeat the matching policy and include text:
+ * the actual decoded source spelling covering the original-byte witness.
+ * A lowercase expansion can match part of a scalar, so this text includes the
+ * complete contributing scalar and need not equal the needle. original_hex,
+ * range and the verified saved-member digest remain authoritative.
+ * needle must remain readable/NUL-terminated UTF-8 until return.
+ */
+char *fcb_saved_search_matching(uint64_t handle, uint64_t generation,
+    const char *needle, uint64_t case_sensitive, uint64_t count_all_matches,
+    uint64_t max_matches);
 char *fcb_saved_results(uint64_t handle, uint64_t generation,
     uint64_t start, uint64_t limit);
 char *fcb_saved_clear_results(uint64_t handle, uint64_t generation);

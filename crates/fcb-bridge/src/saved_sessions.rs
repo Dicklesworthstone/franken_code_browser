@@ -72,6 +72,8 @@ pub(super) enum Command<'a> {
     DetachIndex { generation: u64 },
     Search { generation: u64, needle: &'a str, limit: usize },
     SearchCounted { generation: u64, needle: &'a str, limit: usize },
+    SearchMatching { generation: u64, needle: &'a str, limit: usize,
+        case_sensitive: bool, count_all_matches: bool },
     Results { generation: u64, start: usize, limit: usize },
     Clear { generation: u64 },
     ExpressionSearch { generation: u64, query: &'a str, max_hits: usize, max_scan_bytes: u64 },
@@ -194,6 +196,9 @@ impl SavedSessions {
             Command::DetachIndex { generation } => session.detach_index(generation, &mut stop).map_err(AccessError::from),
             Command::Search { generation, needle, limit } => session.search(generation, needle, limit, &mut stop).map_err(AccessError::from),
             Command::SearchCounted { generation, needle, limit } => session.search_counted(generation, needle, limit, &mut stop).map_err(AccessError::from),
+            Command::SearchMatching { generation, needle, limit, case_sensitive, count_all_matches } =>
+                session.search_matching(generation, needle, limit, case_sensitive, count_all_matches,
+                    &mut stop).map_err(AccessError::from),
             Command::Results { generation, start, limit } => session.results(generation, start, limit, &mut stop).map_err(AccessError::from),
             Command::Clear { generation } => session.clear_results(generation, &mut stop).map_err(AccessError::from),
         };

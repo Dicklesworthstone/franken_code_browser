@@ -103,6 +103,23 @@ pub unsafe extern "C" fn fcb_saved_search_counted(handle: u64, generation: u64,
             limit: number(max_matches)? }, || false)
     }))
 }
+/// Exact or Unicode scalar-lowercase literal search with optional complete counts.
+/// Both flags are exactly zero or one. Lowercase queries bypass exact postings.
+/// # Safety
+/// needle is null or readable NUL-terminated UTF-8 stable until return.
+/// Release every non-null response exactly once with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_saved_search_matching(handle: u64, generation: u64,
+    needle: *const c_char, case_sensitive: u64, count_all_matches: u64,
+    max_matches: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| {
+        if case_sensitive > 1 || count_all_matches > 1 { return Err(AccessError::InvalidArgument); }
+        let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
+        sessions.execute(handle, Command::SearchMatching { generation, needle,
+            limit: number(max_matches)?, case_sensitive: case_sensitive == 1,
+            count_all_matches: count_all_matches == 1 }, || false)
+    }))
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_saved_results(handle: u64, generation: u64, start: u64, limit: u64) -> *mut c_char {
     reply(|| answer(handle, |sessions| sessions.execute(handle,
@@ -247,3 +264,7 @@ mod expression_tests;
 #[cfg(all(test, unix))]
 #[path = "saved_counted_ffi_tests.rs"]
 mod counted_tests;
+
+#[cfg(all(test, unix))]
+#[path = "saved_matching_ffi_tests.rs"]
+mod matching_tests;

@@ -15,6 +15,7 @@ use fcb::search::paged_snapshot::{IndexedNeedle, PagedCapture, PagedHit, PagedQu
 use fcb::search::snapshot_index::SnapshotIndexError;
 use fcb::search::snapshot_index::paged::{PagedPostings, PagedPostingError};
 use fcb::search::snapshot_structure::StructureError;
+use fcb::source::{CaptureEncodingMap, SpanKind, detect_encoding};
 use fcb_core::ResourceLease;
 pub use fcb::search::snapshot::{SnapshotLimits, Sha256Digest};
 use crate::{AppError, input, MANAGED_BYTES, EXIT_OK, EXIT_PARTIAL};
@@ -24,6 +25,9 @@ use super::{HostResponse, MAX_HOST_TEXT_BYTES, reader::{ReaderSession, ReaderSes
 pub const MAX_SAVED_HITS: usize = 4096;
 pub const MAX_SAVED_PAGE: usize = 128;
 pub const MAX_SAVED_NEEDLE_BYTES: usize = 1024;
+/// Complete source scalars can contribute more bytes than their lowercase
+/// match. Keep activation witnesses within the shared streaming witness bound.
+pub const MAX_SAVED_MATCHED_TEXT_BYTES: usize = 12 * MAX_SAVED_NEEDLE_BYTES;
 const INDEX_CACHE_PAGES: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,7 +81,7 @@ impl From<OutputError> for SavedRepositoryError { fn from(e: OutputError) -> Sel
 
 struct AcceptedIndex { generation: u64, pin: Sha256Digest, pages: PagedPostings<File> }
 struct AcceptedQuery {
-    generation: u64, needle: String, report: PagedReport,
+    generation: u64, needle: String, case_sensitive: bool, report: PagedReport,
     index_generation: Option<u64>, index_pin: Option<Sha256Digest>,
     member_bytes_read: u64, member_read_calls: u64, _label_lease: ResourceLease,
 }
@@ -223,7 +227,7 @@ impl SavedRepositorySession {
     /// cancellation checkpoints, not continuation across native calls.
     pub fn search(&mut self, generation: u64, needle: &str, max_matches: usize,
         canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedRepositoryError> {
-        self.search_with_counting(generation, needle, max_matches, false, canceled)
+        self.search_matching(generation, needle, max_matches, true, false, canceled)
     }
 
     /// Count the full admitted archive while retaining at most max_matches
@@ -232,11 +236,16 @@ impl SavedRepositorySession {
     /// the count incomplete even when every admitted scan reached its end.
     pub fn search_counted(&mut self, generation: u64, needle: &str, max_matches: usize,
         canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedRepositoryError> {
-        self.search_with_counting(generation, needle, max_matches, true, canceled)
+        self.search_matching(generation, needle, max_matches, true, true, canceled)
     }
 
-    fn search_with_counting(&mut self, generation: u64, needle: &str, max_matches: usize,
-        count_all_matches: bool,
+    /// Search with the shared exact or Unicode scalar-lowercase literal engine.
+    /// Lowercasing is not full case folding or canonical normalization. Exact
+    /// posting pages cannot prove negatives for this mode, so lowercase queries
+    /// verify the entire admitted member manifest without consulting the index.
+    /// The selected policy is frozen with counts, pages and activation receipts.
+    pub fn search_matching(&mut self, generation: u64, needle: &str, max_matches: usize,
+        case_sensitive: bool, count_all_matches: bool,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedRepositoryError> {
         query_attempt(&mut self.last_query_attempt, generation)?; check(&mut canceled)?;
         if needle.is_empty() || needle.len() > MAX_SAVED_NEEDLE_BYTES
@@ -254,7 +263,8 @@ impl SavedRepositorySession {
             first_revision: SourceRevision::new(owner, 1).map_err(|_| SavedRepositoryError::IdentityExhausted)?, max_matches };
         let before = self.archive.load_stats();
         let ids = [result_id, member_id, scan_id];
-        let report = if let Some(index) = self.index.as_mut() {
+        let used_index = case_sensitive && self.index.is_some();
+        let report = if let Some(index) = self.index.as_mut().filter(|_| case_sensitive) {
             let pattern = IndexedNeedle::text(owner, needle, &self.budget, pattern_id)
                 .map_err(PagedSearchError::from)?;
             let query = if count_all_matches {
@@ -264,7 +274,7 @@ impl SavedRepositorySession {
             };
             finish_query(query, qgen, &self.budget, &mut canceled)?
         } else {
-            let pattern = StreamingNeedle::text(owner, needle, &self.budget, pattern_id)
+            let pattern = StreamingNeedle::text_matching(owner, needle, case_sensitive, &self.budget, pattern_id)
                 .map_err(PagedSearchError::from)?;
             let query = if count_all_matches {
                 PagedQuery::new_counting(&mut self.archive, &pattern, opts, &self.budget, ids)?
@@ -276,8 +286,9 @@ impl SavedRepositorySession {
         check(&mut canceled)?;
         report.validate_delivery(self.archive_digest(), qgen)?;
         let after = self.archive.load_stats();
-        let candidate = AcceptedQuery { generation, needle: label, report,
-            index_generation: self.index_generation(), index_pin: self.index.as_ref().map(|i| i.pin),
+        let candidate = AcceptedQuery { generation, needle: label, case_sensitive, report,
+            index_generation: self.index_generation().filter(|_| used_index),
+            index_pin: self.index.as_ref().filter(|_| used_index).map(|i| i.pin),
             member_bytes_read: after.bytes_read - before.bytes_read,
             member_read_calls: after.read_calls - before.read_calls, _label_lease: lease };
         let mut out = self.output("search")?;
@@ -349,10 +360,33 @@ impl SavedRepositorySession {
         out.integer(reader_owner.get())?;
         out.literal(",\"selection\":")?;
         if let Some((id, hit)) = selected {
+            let case_sensitive = self.accepted(hit.generation().get())?.case_sensitive;
+            let original = capture.hit_bytes(hit)?;
+            if original.len() > MAX_SAVED_MATCHED_TEXT_BYTES {
+                return Err(SavedRepositoryError::MissingHit);
+            }
+            // Decode the verified original span, not the normalized needle.
+            // Mapping starts at its original offset so an interior BOM stays text.
+            let [text_id] = self.allocations()?;
+            let text_lease = self.budget.try_reserve_managed(self.owner(), text_id,
+                ByteLength::new((original.len().max(4) * 256 + 4096) as u64))
+                .map_err(|_| AppError::Admission)?;
+            let text = CaptureEncodingMap::build_with_base_offset(original,
+                detect_encoding(capture.bytes()), hit.original_range().start().get(), 0, 0, 0)
+                .map_err(|_| SavedRepositoryError::MissingHit)?;
+            if text.decoded_text().is_empty() || text.decoded_text().len() > MAX_SAVED_MATCHED_TEXT_BYTES
+                || text.spans().iter().any(|span|
+                    matches!(span.kind, SpanKind::ReplacementMalformed | SpanKind::EscapedByte)) {
+                return Err(SavedRepositoryError::MissingHit);
+            }
+            check(canceled)?;
             out.literal("{\"query_generation\":")?; out.integer(hit.generation().get())?;
             out.literal(",\"hit_id\":")?; out.integer(id)?;
+            encode_matching(&mut out, case_sensitive)?;
             out.literal(",\"domain\":\"original-source-bytes\",\"original_range\":")?; out.range(hit.original_range())?;
-            out.literal(",\"original_hex\":")?; out.hex(capture.hit_bytes(hit)?)?; out.literal("}")?;
+            out.literal(",\"text\":")?; out.quoted(text.decoded_text())?;
+            out.literal(",\"original_hex\":")?; out.hex(original)?; out.literal("}")?;
+            drop(text); drop(text_lease);
         } else { out.literal("null")?; }
         out.literal(",\"reader\":")?; out.literal(info.as_str())?;
         out.literal(",\"window\":")?; out.literal(window.as_str())?; out.literal("}\n")?;
@@ -374,7 +408,12 @@ impl SavedRepositorySession {
         out.literal(",\"index_generation\":")?; optional(out, query.index_generation)?;
         out.literal(",\"index_pin\":")?;
         if let Some(pin) = query.index_pin { out.quoted(&pin.to_hex())?; } else { out.literal("null")?; }
-        out.literal(",\"mode\":\"exact-decoded-literal\",\"search_complete\":")?; out.boolean(report.is_complete())?;
+        encode_matching(out, query.case_sensitive)?;
+        out.literal(",\"index_used\":")?; out.boolean(query.index_generation.is_some())?;
+        out.literal(",\"index_policy\":")?;
+        out.quoted(if query.index_generation.is_some() { "exact-compatible-postings" }
+            else { "direct-verified-member-scan" })?;
+        out.literal(",\"search_complete\":")?; out.boolean(report.is_complete())?;
         out.literal(",\"count_all_matches\":")?; out.boolean(report.count_all_matches())?;
         out.literal(",\"matches_seen_exact\":")?; out.boolean(report.is_complete())?;
         out.literal(",\"truncated\":")?; out.boolean(report.truncated())?;
@@ -474,6 +513,11 @@ fn check(canceled: &mut impl FnMut() -> bool) -> Result<(), SavedRepositoryError
 }
 fn page_limits(start: usize, limit: usize, count: usize) -> Result<(), SavedRepositoryError> {
     if !(1..=MAX_SAVED_PAGE).contains(&limit) || start > count { Err(SavedRepositoryError::InvalidLimits) } else { Ok(()) }
+}
+fn encode_matching(out: &mut Output, case_sensitive: bool) -> Result<(), OutputError> {
+    out.literal(",\"case_sensitive\":")?; out.boolean(case_sensitive)?;
+    out.literal(",\"mode\":")?;
+    out.quoted(if case_sensitive { "exact-decoded-literal" } else { "unicode-lowercase-literal" })
 }
 fn optional(out: &mut Output, value: Option<u64>) -> Result<(), OutputError> {
     if let Some(value) = value { out.integer(value) } else { out.literal("null") }
