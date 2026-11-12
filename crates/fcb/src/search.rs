@@ -82,6 +82,10 @@ pub use selection::{
     StreamedExportOptions, StreamedFileExport, TextHitResult, hit_test_line,
 };
 
+/// Shared source-specific import extraction and closed-catalog resolution.
+#[cfg(feature = "analysis")]
+pub use fcb_analysis::imports;
+
 pub use fcb_search::*;
 pub use fcb_search::paths::{IndexedPath, PathCase, PathEntry, PathIndex, PathIndexLimits,
     PathMatch, PathMatchKind, PathMatchMode, PathRank, PathSearch, PathSearchError, PathSearchOptions,

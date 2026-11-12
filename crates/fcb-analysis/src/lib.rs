@@ -16,6 +16,8 @@ pub mod outline;
 pub mod symbols;
 /// Exact whole-token occurrences, explicitly not compiler reference resolution.
 pub mod references;
+/// Lexical import evidence and explicit closed-catalog navigation candidates.
+pub mod imports;
 
 pub use comparison::{CaptureComparison, ComparisonError, ComparisonLimits, ComparisonQuality,
     ComparisonRelation, ComparisonStats, Correspondence, CorrespondenceKind};

@@ -14,6 +14,7 @@ path = "src/lib.rs"
 fcb-core = { path = "../fcb-core" }
 fcb-search = { path = "../fcb-search" }
 fcb-source = { path = "../fcb-source" }
+franken_markdown = { git = "https://github.com/Dicklesworthstone/franken_markdown.git", rev = "d6fbd1d5c191b36f4474f7bfd7d544c208c4b9df", default-features = false }
 
 [dev-dependencies]
 fcb-test-support = { path = "../fcb-test-support" }

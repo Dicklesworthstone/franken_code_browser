@@ -25,6 +25,7 @@ dependencies = [
  "fcb-search",
  "fcb-source",
  "fcb-test-support",
+ "franken_markdown",
 ]
 
 [[package]]
