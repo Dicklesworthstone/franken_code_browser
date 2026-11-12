@@ -97,6 +97,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     var searchMode: AtlasSavedSearchMode = .literal
     var searchNameMode: AtlasSearchNameMode = .contains
     var countAllMatches = true
+    var searchCaseSensitive = true
     var indexPinInput = ""
     @ObservationIgnored private let transport: AtlasSavedTransport
     @ObservationIgnored private let io = AtlasProjectIO()
@@ -121,6 +122,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         guard searchMode == .literal, let searchPage, info?.identity == searchPage.identity,
               queryGeneration == searchPage.generation else { return false }
         return searchInput.utf8.elementsEqual(searchPage.needle.utf8) && countAllMatches == searchPage.counting.all
+            && searchCaseSensitive == searchPage.caseSensitive
     }
     var expressionIsCurrent: Bool {
         guard searchMode == .expression, let expressionPage, info?.identity == expressionPage.identity,
@@ -357,22 +359,28 @@ private final class AtlasSavedSession: @unchecked Sendable {
         guard canSearch, let info else { return }
         if searchInput.isEmpty { clearSearch(); return }
         guard validSearchInput else {
-            notice = "Enter 1–1024 UTF-8 bytes of literal text, without NUL. Search is case sensitive and does not normalize Unicode."; return
+            notice = "Enter 1–1024 UTF-8 bytes of literal text, without NUL. Matching does not normalize Unicode."; return
         }
-        let needle = searchInput, counting = countAllMatches
+        let needle = searchInput, counting = countAllMatches, caseSensitive = searchCaseSensitive
         perform { model, flag in
             guard let lease = model.session else { throw AtlasSavedError.unavailable }
             let generation = try model.nextQueryGeneration()
             model.notice = "Searching decoded text across the captured archive…"
             do {
-                let request: AtlasSavedRequest = counting
-                    ? .countedSearch(generation: generation, needle: needle, matches: 4096)
-                    : .search(generation: generation, needle: needle, matches: 4096)
+                let request: AtlasSavedRequest
+                if caseSensitive {
+                    request = counting ? .countedSearch(generation: generation, needle: needle, matches: 4096)
+                        : .search(generation: generation, needle: needle, matches: 4096)
+                } else {
+                    request = .matchingSearch(generation: generation, needle: needle,
+                        caseSensitive: false, countAllMatches: counting, matches: 4096)
+                }
                 let page = try AtlasSavedSearchPage.decode(await model.run(lease, request, flag: flag),
                     identity: info.identity, generation: generation, needle: needle, start: 0, limit: 64,
-                    searching: true, countAllMatches: counting)
+                    searching: true, countAllMatches: counting, caseSensitive: caseSensitive)
                 guard page.counting.maximum == 4096,
-                      page.indexGeneration == info.index?.generation, page.indexPin == info.index?.pin else {
+                      page.indexGeneration == (caseSensitive ? info.index?.generation : nil),
+                      page.indexPin == (caseSensitive ? info.index?.pin : nil) else {
                     throw AtlasSavedError.invalidResponse
                 }
                 guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
@@ -419,7 +427,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
             let next = try AtlasSavedSearchPage.decode(await model.run(lease,
                 .results(generation: generation, start: start, limit: 64), flag: flag),
                 identity: info.identity, generation: generation, needle: accepted.needle, start: start, limit: 64,
-                countAllMatches: accepted.counting.all)
+                countAllMatches: accepted.counting.all, caseSensitive: accepted.caseSensitive)
             guard next.hasSameSummary(as: accepted) else {
                 throw AtlasSavedError.invalidResponse
             }
@@ -692,7 +700,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
               page.hits.contains(where: { $0.matches(hit) }),
               accepted.hits.contains(where: { $0.matches(hit) }) else { throw AtlasSavedError.invalidInput }
         return try await openReader(saved: page.identity, ordinal: hit.member, expected: nil,
-            origin: .hit(generation: page.generation, needle: page.needle, hit: hit),
+            origin: .hit(generation: page.generation, needle: page.needle, hit: hit, caseSensitive: page.caseSensitive),
             readerTransport: readerTransport, search: search, outline: outline, document: document)
     }
 
@@ -772,7 +780,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                     case .member: request = .openMember(reader: destination, member: member.id)
                     case .relationship(let generation, let link, let side):
                         request = .openRelationship(reader: destination, generation: generation, link: link.id, side: side)
-                    case .hit(let generation, _, let hit):
+                    case .hit(let generation, _, let hit, _):
                         request = .openHit(reader: destination, generation: generation, hit: hit.id)
                     case .expressionHit(let generation, _, _, let hit):
                         request = .openExpressionHit(reader: destination, generation: generation, hit: hit.id)

@@ -603,6 +603,7 @@ enum AtlasSavedRequest: Sendable {
     case detachIndex(generation: UInt64)
     case search(generation: UInt64, needle: String, matches: UInt64)
     case countedSearch(generation: UInt64, needle: String, matches: UInt64)
+    case matchingSearch(generation: UInt64, needle: String, caseSensitive: Bool, countAllMatches: Bool, matches: UInt64)
     case results(generation: UInt64, start: UInt64, limit: UInt64)
     case clearResults(generation: UInt64)
     case openHit(reader: UInt64, generation: UInt64, hit: UInt64)

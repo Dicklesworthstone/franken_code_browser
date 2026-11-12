@@ -56,6 +56,27 @@ extension AtlasReaderTransport {
                 query: "e\u{301} path:src/", matches: 0, scanBytes: 67_108_864)) == nil)
         }
         precondition(count(6) == 19, "counted response ownership leaked or double-freed")
-        print("AtlasSavedIndexBridgeTests: public-header signatures, full-width IDs, exact path bytes, pin admission and buffer ownership passed")
+        mode(0)
+        for (matchCase, countAll, retained) in [(false, false, UInt64(4096)), (false, true, 0), (true, true, 4096)] {
+            precondition(transport.run(owner, .matchingSearch(generation: generation, needle: "e\u{301}",
+                caseSensitive: matchCase, countAllMatches: countAll, matches: retained)) == "{}")
+        }
+        precondition(count(9) == 3 && count(6) == 22)
+        for (queryGeneration, needle, countAll, retained) in [
+            (UInt64(0), "e\u{301}", true, UInt64(0)), (generation, "", true, 0),
+            (generation, "e\0", true, 0), (generation, String(repeating: "x", count: 1025), true, 0),
+            (generation, "e\u{301}", true, 4097), (generation, "e\u{301}", false, 0)
+        ] {
+            precondition(transport.run(owner, .matchingSearch(generation: queryGeneration, needle: needle,
+                caseSensitive: false, countAllMatches: countAll, matches: retained)) == nil)
+        }
+        precondition(count(9) == 3 && count(6) == 22, "invalid matching queries crossed the foreign boundary")
+        for invalid in [Int32(1), 2, 3, 4] {
+            mode(invalid)
+            precondition(transport.run(owner, .matchingSearch(generation: generation, needle: "e\u{301}",
+                caseSensitive: false, countAllMatches: true, matches: 0)) == nil)
+        }
+        precondition(count(9) == 7 && count(6) == 25, "matching response ownership leaked or double-freed")
+        print("AtlasSavedIndexBridgeTests: public-header signatures, matching/count flags, full-width IDs, exact path bytes, pin admission and buffer ownership passed")
     }
 }

@@ -161,7 +161,7 @@ final class AtlasSavedFileAccess {
             }
             Text(section == .text
                 ? (model.searchMode == .literal
-                    ? "Literal search is case sensitive and does not interpret query syntax or normalize Unicode. Member names never open working-tree paths."
+                    ? "Match case compares literal text exactly. Turn it off to compare Unicode lowercase text; neither mode normalizes Unicode or interprets query syntax. Member names never open working-tree paths."
                     : (model.searchMode == .expression
                         ? "Expression terms are exact and case sensitive. Required/excluded terms apply across each complete captured member; results identify primary-term occurrences. Member names never open working-tree paths."
                         : "Structural results retain the shared extractor's evidence level and original source coordinates. All searches use this saved archive; member names never open working-tree paths."))
@@ -253,16 +253,19 @@ final class AtlasSavedFileAccess {
                 TextField("Literal text in all captured members", text: $model.searchInput)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { panelNotice = ""; model.search() }
-                    .accessibilityLabel("Case-sensitive literal search across the saved archive")
+                    .accessibilityLabel("Literal search across the saved archive")
                 Button { panelNotice = ""; model.search() } label: { Label("Search archive", systemImage: "magnifyingglass") }
                     .disabled(!model.canSearch || !model.validSearchInput)
                 Button("Clear") { panelNotice = ""; model.clearSearch() }
                     .disabled(!model.canOperate || (model.searchPage == nil && model.searchInput.isEmpty))
             }
             HStack {
+                Toggle("Match case", isOn: $model.searchCaseSensitive)
+                    .toggleStyle(.checkbox).disabled(!model.canOperate)
+                    .help("Turn off to compare Unicode lowercase text. This does not use full case folding or Unicode normalization.")
                 Toggle("Count all matches", isOn: $model.countAllMatches)
                     .toggleStyle(.checkbox).disabled(!model.canOperate)
-                Text("Case-sensitive decoded literal · entire saved archive · up to 4,096 retained matches")
+                Text("Entire saved archive · up to 4,096 retained matches")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("Reload results") { panelNotice = ""; model.reloadSearchResults() }
@@ -276,13 +279,15 @@ final class AtlasSavedFileAccess {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("Accepted query").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                     Text(page.needle).font(.body.monospaced()).lineLimit(3).textSelection(.enabled)
+                    Text(page.matchingDescription).font(.caption).foregroundStyle(.secondary)
                     if !model.searchIsCurrent {
                         HStack {
                             Text("The draft differs from these results. Submit it or restore the accepted query before opening a match.")
                                 .font(.caption).foregroundStyle(.orange)
                             Spacer()
                             Button("Use accepted query") {
-                                model.searchInput = page.needle; model.countAllMatches = page.counting.all; panelNotice = ""
+                                model.searchInput = page.needle; model.countAllMatches = page.counting.all
+                                model.searchCaseSensitive = page.caseSensitive; panelNotice = ""
                             }
                                 .controlSize(.small).disabled(!model.canOperate)
                         }
@@ -362,7 +367,7 @@ final class AtlasSavedFileAccess {
                     Button("Reload index status") { panelNotice = ""; model.reloadIndex() }
                         .disabled(!model.canOperate)
                 }.controlSize(.small)
-                Text("Use the digest from a trusted index build receipt, not a whole-file checksum. Posting pages are checked when read; exact source verification and direct scans cover candidates, uncovered members and short literals. Expression search scans source directly.")
+                Text("Use the digest from a trusted index build receipt, not a whole-file checksum. Posting pages are checked when read; exact source verification and direct scans cover candidates, uncovered members and short literals. Unicode lowercase and expression searches scan source directly.")
                     .font(.caption2).foregroundStyle(.secondary)
             }.padding(.top, 5)
         }.font(.callout)
@@ -941,8 +946,9 @@ final class AtlasSavedFileAccess {
     }
     private func savedMatchActions(_ match: AtlasSavedMatchEvidence) -> some View {
         VStack(alignment: .leading, spacing: 5) {
-            if case .hit(_, let needle, _) = capture.origin {
+            if case .hit(_, let needle, _, let caseSensitive) = capture.origin {
                 Text("Saved literal: \(needle)").font(.callout.monospaced()).lineLimit(2).textSelection(.enabled)
+                Text(caseSensitive ? "Match case" : "Unicode lowercase matching").font(.caption).foregroundStyle(.secondary)
             } else if case .expressionHit(_, let expression, let primary, _) = capture.origin {
                 Text("Saved expression: \(expression)").font(.callout.monospaced()).lineLimit(2).textSelection(.enabled)
                 Text("Primary occurrence: \(primary)").font(.caption.monospaced()).lineLimit(2).textSelection(.enabled)

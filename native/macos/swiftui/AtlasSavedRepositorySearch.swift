@@ -518,6 +518,8 @@ struct AtlasSavedSearchPage: Sendable {
     let identity: AtlasSavedIdentity
     let generation: UInt64
     let needle: String
+    let caseSensitive: Bool
+    var matchingDescription: String { caseSensitive ? "Match case" : "Unicode lowercase matching" }
     let hits: [AtlasSavedHit]
     let start: UInt64
     let next: UInt64?
@@ -540,7 +542,7 @@ struct AtlasSavedSearchPage: Sendable {
 
     func hasSameSummary(as other: Self) -> Bool {
         identity == other.identity && generation == other.generation && needle.utf8.elementsEqual(other.needle.utf8)
-            && counting == other.counting && complete == other.complete && truncated == other.truncated
+            && caseSensitive == other.caseSensitive && counting == other.counting && complete == other.complete && truncated == other.truncated
             && retained == other.retained && seen == other.seen && unavailable == other.unavailable
             && unsupported == other.unsupported && sourceBytes == other.sourceBytes && scannedBytes == other.scannedBytes
             && peakSourceBytes == other.peakSourceBytes && indexGeneration == other.indexGeneration && indexPin == other.indexPin
@@ -553,7 +555,7 @@ struct AtlasSavedSearchPage: Sendable {
     /// UTF-8, and every subsequent page retains the returned accepted needle.
     static func decode(_ json: String?, identity: AtlasSavedIdentity, generation: UInt64,
         needle expectedNeedle: String?, start: UInt64, limit: UInt64, searching: Bool = false,
-        countAllMatches expectedCount: Bool? = nil) throws -> Self {
+        countAllMatches expectedCount: Bool? = nil, caseSensitive expectedCase: Bool? = nil) throws -> Self {
         let data = try AtlasSavedWire.admit(json, handle: identity.owner,
             command: searching ? "search" : "results", identity: identity)
         do {
@@ -563,6 +565,19 @@ struct AtlasSavedSearchPage: Sendable {
             let loaded = w.member_bytes_read.value, calls = w.member_read_calls.value
             let indexGeneration = w.index_generation.value?.value
             let indexPin = w.index_pin.value
+            let caseSensitive: Bool
+            switch (w.mode, w.case_sensitive) {
+            case ("exact-decoded-literal", nil), ("exact-decoded-literal", .some(true)): caseSensitive = true
+            case ("unicode-lowercase-literal", .some(false)): caseSensitive = false
+            default: throw AtlasSavedError.invalidResponse
+            }
+            // Older exact receipts omit these additive fields. A matching-policy
+            // receipt is accepted only as a complete, internally consistent set.
+            if w.case_sensitive != nil || w.index_used != nil || w.index_policy != nil {
+                guard w.case_sensitive == caseSensitive, w.index_used == (indexGeneration != nil),
+                      w.index_policy == (indexGeneration == nil ? "direct-verified-member-scan" : "exact-compatible-postings"),
+                      caseSensitive || indexGeneration == nil else { throw AtlasSavedError.invalidResponse }
+            }
             let counting = try AtlasSavedSearchCount.admit(all: w.count_all_matches, exact: w.matches_seen_exact,
                 matchingFiles: w.matching_files?.value, retainedFiles: w.retained_matching_files?.value,
                 expected: expectedCount, complete: w.search_complete, truncated: w.truncated, retained: retained,
@@ -574,7 +589,7 @@ struct AtlasSavedSearchPage: Sendable {
                   AtlasSavedSearchWire.validNeedle(w.needle),
                   expectedNeedle == nil || w.needle.utf8.elementsEqual(expectedNeedle!.utf8),
                   !searching || (expectedNeedle != nil && start == 0 && limit == 64),
-                  w.mode == "exact-decoded-literal", (1...128).contains(limit),
+                  expectedCase == nil || expectedCase == caseSensitive, (1...128).contains(limit),
                   identity.captured <= identity.members,
                   unavailable == identity.members - identity.captured, unsupported <= identity.captured,
                   retained <= AtlasSavedSearchWire.maximumHits,
@@ -603,7 +618,8 @@ struct AtlasSavedSearchPage: Sendable {
                 if let previous {
                     guard hit.member >= previous.member else { throw AtlasSavedError.invalidResponse }
                     if hit.member == previous.member {
-                        guard hit.start > previous.start, hit.path.bytes == previous.path.bytes,
+                        guard (caseSensitive ? hit.start > previous.start :
+                            hit.start >= previous.start && hit.end >= previous.end), hit.path.bytes == previous.path.bytes,
                               hit.digest == previous.digest else { throw AtlasSavedError.invalidResponse }
                     }
                 }
@@ -613,7 +629,7 @@ struct AtlasSavedSearchPage: Sendable {
             let next = w.next_offset.value?.value
             guard next == (end < retained ? end : nil) else { throw AtlasSavedError.invalidResponse }
             try counting.validatePage(w.hits, retained: retained)
-            return Self(identity: identity, generation: generation, needle: w.needle, hits: w.hits,
+            return Self(identity: identity, generation: generation, needle: w.needle, caseSensitive: caseSensitive, hits: w.hits,
                 start: start, next: next, complete: w.search_complete, truncated: w.truncated,
                 retained: retained, seen: seen, counting: counting, unavailable: unavailable, unsupported: unsupported,
                 sourceBytes: loaded, scannedBytes: w.scanned_bytes.value, peakSourceBytes: w.peak_source_bytes.value,
@@ -642,6 +658,8 @@ struct AtlasSavedSearchPage: Sendable {
     private struct Wire: Decodable {
         let query_generation: AtlasSavedNumber
         let needle, mode: String
+        let case_sensitive, index_used: Bool?
+        let index_policy: String?
         let index_generation: AtlasSavedSearchOptional<AtlasSavedNumber>
         let index_pin: AtlasSavedSearchOptional<String>
         let search_complete, truncated: Bool

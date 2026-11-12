@@ -26,6 +26,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         var queryGeneration: UInt64?
         var needle: String?
         var countAllMatches = false
+        var caseSensitive = true
         var expressionGeneration: UInt64?
         var expression: String?
         var countAllExpressionMatches = false
@@ -47,23 +48,28 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     }
     let domain = UUID()
     let searchVectors: Bool
+    let expansionVectors: Bool
     let headingVectors: Bool
     let longHeading: Bool
     let lineEncoding: String?
     let lineRange: (UInt64, UInt64)?
     init(searchVectors: Bool = false, headingVectors: Bool = false, longHeading: Bool = false,
-        lineEncoding: String? = nil, lineRange: (UInt64, UInt64)? = nil) {
+        lineEncoding: String? = nil, lineRange: (UInt64, UInt64)? = nil, expansionVectors: Bool = false) {
         precondition(lineEncoding == nil || (["utf8", "utf16le", "utf16be"].contains(lineEncoding!) && !searchVectors && !headingVectors))
-        self.searchVectors = searchVectors; self.headingVectors = headingVectors; self.longHeading = longHeading
+        precondition(!expansionVectors || (searchVectors && !headingVectors && lineEncoding == nil))
+        self.searchVectors = searchVectors; self.expansionVectors = expansionVectors
+        self.headingVectors = headingVectors; self.longHeading = longHeading
         self.lineEncoding = lineEncoding; self.lineRange = lineRange
     }
     let archiveDigest = String(repeating: "d", count: 64)
     var source: [UInt8] {
-        Array((headingVectors
+        if expansionVectors { return [] }
+        return Array((headingVectors
             ? "\u{feff}---\ntitle: Saved\n---\n\n[guide](docs/guide.md#caf-%64etails) [again](docs/guide.md) [missing](absent.rs) [empty]()\n"
             : "\u{feff}---\ntitle: Saved\n---\n\n[code](src/lib.rs#L2) [again](src/lib.rs) [missing](absent.rs) [empty]()\n").utf8)
     }
-    var sourceDigest: String { headingVectors
+    var sourceDigest: String { expansionVectors
+        ? "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" : headingVectors
         ? "9359955440643a4a2294506051b4cd66f7009333234a8e3f85392495ec5a9a0f"
         : "8591776e77fd8d9050b0a5796da773312c306092c3fc05f22dbe9413cfcff6d3" }
     var headingBytes: [UInt8] {
@@ -109,9 +115,11 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     func blockNextHandoff() { locked { blocked = true } }
     func blockNextSearch() { locked { blockedSearch = true } }
     func blockNextIndex() { locked { blockedIndex = true } }
-    var searchUTF8: [UInt8] { Array(("é" + String(repeating: "x", count: 200) + "banana\n").utf8) }
+    var searchUTF8: [UInt8] { expansionVectors ? [0xc4, 0xb0]
+        : Array(("é" + String(repeating: "x", count: 200) + "banana\n").utf8) }
     var searchUTF16: [UInt8] {
-        [255, 254, 233, 0] + Array(repeating: [UInt8(120), 0], count: 200).flatMap { $0 }
+        if expansionVectors { return [255, 254, 0x30, 0x01] }
+        return [255, 254, 233, 0] + Array(repeating: [UInt8(120), 0], count: 200).flatMap { $0 }
             + [98, 0, 97, 0, 110, 0, 97, 0, 110, 0, 97, 0, 10, 0]
     }
     var members: [Member] {
@@ -119,11 +127,11 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             Member(path: Array("README.md".utf8), display: "README.md", bytes: source, digest: sourceDigest),
             Member(path: rawPath, display: "raw-\\xff.rs",
                 bytes: searchVectors ? searchUTF8 : Array("changed bytes\n".utf8),
-                digest: searchVectors ? "ec34a752af5a6ce18bfd388bda04c6c9f60b22301b44d413c085507ca994f6cc"
+                digest: expansionVectors ? "a65018cffe8e0ed3f3112a79326e4c9718dc498a1f18a3a72f2f77c792c48b70" : searchVectors ? "ec34a752af5a6ce18bfd388bda04c6c9f60b22301b44d413c085507ca994f6cc"
                     : "7c60358cb724c1b671469c5f167cea45a4f70df4e3ac87b79340692e6f17f574"),
             Member(path: Array("skipped.md".utf8), display: "skipped.md",
                 bytes: searchVectors ? searchUTF16 : [255],
-                digest: searchVectors ? "0896dfbe40292ec212fa69dac19c681c8f56ba79c407cbad6817580762413ecf"
+                digest: expansionVectors ? "138366bfcd2687fbf98b5a0f74101c54efbf1fdda422e4a8de157b57e633ac3b" : searchVectors ? "0896dfbe40292ec212fa69dac19c681c8f56ba79c407cbad6817580762413ecf"
                     : "a8100ae6aa1940d0b663bb31cd466142ebbdbd5187131b92d93818987832eb89",
                 encoding: searchVectors ? "utf16le" : "utf8"),
             lineMember ?? Member(path: Array((headingVectors ? "docs/guide.md" : "src/lib.rs").utf8),
@@ -251,16 +259,22 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         out["last_index_attempt"] = String(generation)
         return out
     }
-    func searchHits(_ needle: String) -> [QueryHit] {
+    func searchHits(_ needle: String, caseSensitive: Bool = true) -> [QueryHit] {
         // Independent fixed vectors; no substitute matcher or offset inference.
         guard searchVectors else { return [] }
+        if expansionVectors {
+            guard (!caseSensitive && (needle.utf8.elementsEqual("i".utf8) || needle.utf8.elementsEqual("\u{307}".utf8)))
+                || needle.utf8.elementsEqual("\u{130}".utf8) else { return [] }
+            return [QueryHit(member: 1, start: 0, end: 2), QueryHit(member: 2, start: 2, end: 4)]
+        }
+        if !caseSensitive && needle.utf8.elementsEqual("ANA".utf8) { return searchHits("ana") }
         if needle.utf8.elementsEqual("\u{feff}".utf8) { return [QueryHit(member: 3, start: 4, end: 6)] }
         guard needle.utf8.elementsEqual("ana".utf8) else { return [] }
         return [QueryHit(member: 1, start: 203, end: 206), QueryHit(member: 1, start: 205, end: 208),
             QueryHit(member: 2, start: 406, end: 412), QueryHit(member: 2, start: 410, end: 416)]
     }
-    func hitObject(_ id: UInt64, needle: String = "ana") -> [String: Any] {
-        let hit = searchHits(needle)[Int(id - 1)], member = members[Int(hit.member)]
+    func hitObject(_ id: UInt64, needle: String = "ana", caseSensitive: Bool = true) -> [String: Any] {
+        let hit = searchHits(needle, caseSensitive: caseSensitive)[Int(id - 1)], member = members[Int(hit.member)]
         return ["hit_id": String(id), "member": String(hit.member), "file_id": String(hit.member + 1),
             "source_revision": String(hit.member + 1), "source_digest": member.digest!,
             "path": path(member.path, member.display),
@@ -268,13 +282,16 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     }
     func searchPage(_ owner: UInt64, generation: UInt64, needle: String = "ana",
         start: UInt64 = 0, limit: UInt64 = 64, searching: Bool = false,
-        index: UInt64? = nil, pin: String? = nil, countAllMatches: Bool? = nil) -> [String: Any] {
+        index: UInt64? = nil, pin: String? = nil, countAllMatches: Bool? = nil,
+        caseSensitive: Bool = true) -> [String: Any] {
         var out = header(owner, searching ? "search" : "results")
-        let hits = searchHits(needle), end = min(UInt64(hits.count), start + limit)
+        let hits = searchHits(needle, caseSensitive: caseSensitive), end = min(UInt64(hits.count), start + limit)
         let sourceBytes = members.compactMap(\.bytes).reduce(0) { $0 + $1.count }
         out.merge(["query_generation": String(generation), "needle": needle,
             "index_generation": index.map(String.init) as Any? ?? NSNull(), "index_pin": pin as Any? ?? NSNull(),
-            "mode": "exact-decoded-literal",
+            "mode": caseSensitive ? "exact-decoded-literal" : "unicode-lowercase-literal",
+            "case_sensitive": caseSensitive, "index_used": index != nil,
+            "index_policy": index == nil ? "direct-verified-member-scan" : "exact-compatible-postings",
             "search_complete": false, "truncated": false, "retained_hits": String(hits.count),
             "matches_seen": String(hits.count), "unavailable_files": "1", "unsupported_files": "0",
             "member_bytes_read": String(sourceBytes), "member_read_calls": "4",
@@ -282,7 +299,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             "index_eliminated_files": index == nil ? "0" : "1", "fallback_files": index == nil ? "0" : "2",
             "posting_entries_visited": index == nil ? "0" : "3",
             "retained_source_payload_bytes": "0",
-            "hits": (start..<end).map { hitObject($0 + 1, needle: needle) },
+            "hits": (start..<end).map { hitObject($0 + 1, needle: needle, caseSensitive: caseSensitive) },
             "next_offset": end < UInt64(hits.count) ? String(end) as Any : NSNull()
         ]) { _, new in new }
         if let countAllMatches {
@@ -468,11 +485,24 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         out["selection"] = side == .evidence ? ["start": "0", "end": String(bytes.count)] as Any : NSNull()
         out["reader_owner"] = String(reader)
         var windowStart: UInt64 = 0, windowBytes: UInt64 = 16 * 1024
-        if let query, let hitID, let needle = sessions[saved]?.needle {
-            let hit = searchHits(needle)[Int(hitID - 1)]
+        if let query, let hitID, let session = sessions[saved], let needle = session.needle {
+            let hit = searchHits(needle, caseSensitive: session.caseSensitive)[Int(hitID - 1)]
+            let original = Array(bytes[Int(hit.start)..<Int(hit.end)])
+            let spelling: String
+            if member.encoding == "utf8" { spelling = String(decoding: original, as: UTF8.self) }
+            else {
+                let units = stride(from: 0, to: original.count, by: 2).map { offset in
+                    member.encoding == "utf16le"
+                        ? UInt16(original[offset]) | UInt16(original[offset + 1]) << 8
+                        : UInt16(original[offset]) << 8 | UInt16(original[offset + 1])
+                }
+                spelling = String(decoding: units, as: UTF16.self)
+            }
             out["selection"] = ["query_generation": String(query), "hit_id": String(hitID),
+                "case_sensitive": session.caseSensitive,
+                "mode": session.caseSensitive ? "exact-decoded-literal" : "unicode-lowercase-literal", "text": spelling,
                 "domain": "original-source-bytes", "original_range": ["start": String(hit.start), "end": String(hit.end)],
-                "original_hex": hex(bytes[Int(hit.start)..<Int(hit.end)])]
+                "original_hex": hex(original)]
             windowStart = hit.start - min(hit.start, 132)
             windowBytes = max(4, min(UInt64(bytes.count), hit.end + 132) - windowStart)
         }
@@ -558,6 +588,17 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                 var selected = out["selection"] as! [String: Any]
                 selected["query_generation"] = selected.removeValue(forKey: "expression_generation")
                 out["selection"] = selected
+            case "hit-case", "hit-mode", "hit-text", "hit-text-missing", "hit-policy-missing":
+                var selected = out["selection"] as! [String: Any]
+                switch fault {
+                case "hit-case": selected["case_sensitive"] = true
+                case "hit-mode": selected["mode"] = "exact-decoded-literal"
+                case "hit-text": selected["text"] = "ANA"
+                case "hit-text-missing": selected.removeValue(forKey: "text")
+                default:
+                    for field in ["case_sensitive", "mode", "text"] { selected.removeValue(forKey: field) }
+                }
+                out["selection"] = selected
             case "hit-generation", "hit-id", "hit-domain", "hit-range", "hit-hex":
                 var selected = out["selection"] as! [String: Any]
                 switch fault {
@@ -585,7 +626,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             case .openMember, .openRelationship, .openHit, .openExpressionHit, .openStructureHit:
                 let pause = locked { let value = blocked; blocked = false; return value }
                 if pause { entered.signal(); precondition(resume.wait(timeout: .now() + .seconds(5)) == .success) }
-            case .search, .countedSearch, .expressionSearch, .countedExpressionSearch, .structureSearch:
+            case .search, .countedSearch, .matchingSearch, .expressionSearch, .countedExpressionSearch, .structureSearch:
                 let pause = locked { let value = blockedSearch; blockedSearch = false; return value }
                 if pause { entered.signal(); precondition(resume.wait(timeout: .now() + .seconds(5)) == .success) }
             case .attachIndex, .detachIndex:
@@ -671,8 +712,16 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                     return handoff(handle, reader: reader, ordinal: side == .evidence ? 0 : 3,
                         generation: generation, link: link, side: side)
                 case .search(let generation, let needle, let matches),
-                     .countedSearch(let generation, let needle, let matches):
+                     .countedSearch(let generation, let needle, let matches),
+                     .matchingSearch(let generation, let needle, _, _, let matches):
                     precondition(matches == 4096)
+                    let caseSensitive: Bool, countAllMatches: Bool
+                    switch request {
+                    case .matchingSearch(_, _, let matching, let counting, _):
+                        caseSensitive = matching; countAllMatches = counting
+                    case .countedSearch: caseSensitive = true; countAllMatches = true
+                    default: caseSensitive = true; countAllMatches = false
+                    }
                     log.append("search:\(handle):\(generation):\(needle)")
                     guard var session = sessions[handle] else { return nil }
                     if fault == "search" { fault = nil; return nil }
@@ -682,22 +731,25 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                             "error": ["code": "PAGED_INDEX_CHANGED_PAGE"]])
                     }
                     session.queryGeneration = generation; session.needle = needle
-                    if case .countedSearch = request { session.countAllMatches = true }
-                    else { session.countAllMatches = false }
-                    session.queryIndexGeneration = session.indexGeneration; session.queryIndexPin = session.indexPin
+                    session.caseSensitive = caseSensitive; session.countAllMatches = countAllMatches
+                    session.queryIndexGeneration = caseSensitive ? session.indexGeneration : nil
+                    session.queryIndexPin = caseSensitive ? session.indexPin : nil
                     session.readBytes += UInt64(members.compactMap(\.bytes).reduce(0) { $0 + $1.count }); session.readCalls += 4
                     sessions[handle] = session
                     if fault == "search-lost" { fault = nil; return nil }
                     return encode(searchPage(handle, generation: generation, needle: needle, searching: true,
-                        index: session.queryIndexGeneration, pin: session.queryIndexPin, countAllMatches: session.countAllMatches))
+                        index: session.queryIndexGeneration, pin: session.queryIndexPin,
+                        countAllMatches: session.countAllMatches, caseSensitive: session.caseSensitive))
                 case .results(let generation, let start, let limit):
                     log.append("results:\(handle):\(generation):\(start)")
                     guard let session = sessions[handle], session.queryGeneration == generation, let needle = session.needle else { return nil }
                     if fault == "results" { fault = nil; return nil }
                     var page = searchPage(handle, generation: generation, needle: needle, start: start, limit: limit,
-                        index: session.queryIndexGeneration, pin: session.queryIndexPin, countAllMatches: session.countAllMatches)
+                        index: session.queryIndexGeneration, pin: session.queryIndexPin,
+                        countAllMatches: session.countAllMatches, caseSensitive: session.caseSensitive)
                     if fault == "index-query-pin" { fault = nil; page["index_pin"] = String(repeating: "f", count: 64) }
                     if fault == "count-policy" { fault = nil; page["count_all_matches"] = !session.countAllMatches }
+                    if fault == "case-policy" { fault = nil; page["case_sensitive"] = !session.caseSensitive }
                     return encode(page)
                 case .clearResults(let generation):
                     log.append("clear-search:\(handle):\(generation)")
@@ -708,8 +760,10 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                     return encode(out)
                 case .openHit(let reader, let generation, let id):
                     guard let session = sessions[handle], session.queryGeneration == generation,
-                          let needle = session.needle, id > 0, id <= UInt64(searchHits(needle).count) else { return nil }
-                    return handoff(handle, reader: reader, ordinal: searchHits(needle)[Int(id - 1)].member,
+                          let needle = session.needle, id > 0,
+                          id <= UInt64(searchHits(needle, caseSensitive: session.caseSensitive).count) else { return nil }
+                    return handoff(handle, reader: reader,
+                        ordinal: searchHits(needle, caseSensitive: session.caseSensitive)[Int(id - 1)].member,
                         generation: nil, link: nil, side: nil, query: generation, hitID: id)
                 case .expressionSearch(let generation, let query, let matches, let bytes),
                      .countedExpressionSearch(let generation, let query, let matches, let bytes):

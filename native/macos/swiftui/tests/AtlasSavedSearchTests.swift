@@ -40,6 +40,11 @@ import Dispatch
         do { try await operation(); preconditionFailure(message) } catch { }
     }
     @MainActor static func main() async throws {
+        try matchingPoliciesBindPagesAndRejectIncompatiblePostings()
+        try await lowercaseSearchKeepsOriginalReadersAndFrozenIndexPolicy()
+        try await lowercaseExpansionReadersKeepWholeOriginalScalars()
+        await canceledLowercaseSearchRecoversItsSubmittedPolicy()
+        await forgedLowercaseActivationPoliciesRetireDestinations()
         try exactPageAndPartialCoverageContracts()
         try countedTotalsRemainIndependentOfStoredRows()
         try await countedPoliciesStayFrozenAcrossPagingAndReaders()
@@ -65,6 +70,159 @@ import Dispatch
         await damagedIndexKeepsAcceptedResultsAndCanDetach()
         await canceledAndClosedIndexAttachmentsDrainBeforeRelease()
         print("Saved text and structural search, index attachment and coverage, UTF-8/UTF-16 captures, independent generations, grant lifetimes, bounded navigation and recovery regressions passed.")
+    }
+
+    private static func matchingPoliciesBindPagesAndRejectIncompatiblePostings() throws {
+        let f = SavedRepositoryFixture(searchVectors: true)
+        let exactObject = f.searchPage(40, generation: 1, countAllMatches: true)
+        let identity = try JSONDecoder().decode(AtlasSavedIdentity.self, from: Data(f.encode(exactObject).utf8))
+        let exact = try AtlasSavedSearchPage.decode(f.encode(exactObject), identity: identity, generation: 1,
+            needle: "ana", start: 0, limit: 64, countAllMatches: true, caseSensitive: true)
+        var lowercase = f.searchPage(40, generation: 1, countAllMatches: true, caseSensitive: false)
+        func decode(_ object: [String: Any]) throws -> AtlasSavedSearchPage {
+            try AtlasSavedSearchPage.decode(f.encode(object), identity: identity, generation: 1,
+                needle: "ana", start: 0, limit: 64, countAllMatches: true, caseSensitive: false)
+        }
+        let accepted = try decode(lowercase)
+        precondition(!accepted.caseSensitive && accepted.indexGeneration == nil)
+        precondition(accepted.counting == exact.counting && !accepted.hasSameSummary(as: exact))
+        rejected("an exact response satisfied a lowercase request") { _ = try decode(exactObject) }
+        for field in ["case_sensitive", "mode", "index_used", "index_policy"] {
+            var bad = lowercase; bad.removeValue(forKey: field)
+            rejected("lowercase page accepted a missing \(field)") { _ = try decode(bad) }
+        }
+        for (field, value) in [("case_sensitive", true as Any), ("case_sensitive", "false" as Any),
+            ("mode", "full-case-fold" as Any), ("index_used", true as Any),
+            ("index_policy", "exact-compatible-postings" as Any)] {
+            var bad = lowercase; bad[field] = value
+            rejected("lowercase page accepted an inconsistent \(field)") { _ = try decode(bad) }
+        }
+        var indexed = lowercase
+        indexed["index_generation"] = "1"; indexed["index_pin"] = String(repeating: "a", count: 64)
+        indexed["index_used"] = true; indexed["index_policy"] = "exact-compatible-postings"
+        rejected("lowercase query claimed incompatible exact postings") { _ = try decode(indexed) }
+        var legacy = exactObject
+        for field in ["case_sensitive", "index_used", "index_policy"] { legacy.removeValue(forKey: field) }
+        let previous = try AtlasSavedSearchPage.decode(f.encode(legacy), identity: identity, generation: 1,
+            needle: "ana", start: 0, limit: 64, countAllMatches: true, caseSensitive: true)
+        precondition(previous.caseSensitive && previous.hasSameSummary(as: exact))
+        // Normalized occurrences retain separate IDs even when source bounds
+        // coincide. Exact literal pages continue to require increasing starts.
+        var hits = lowercase["hits"] as! [[String: Any]]
+        hits[1]["original_range"] = hits[0]["original_range"]; lowercase["hits"] = hits
+        let overlapping = try decode(lowercase)
+        precondition(overlapping.hits[0].id != overlapping.hits[1].id)
+        precondition(overlapping.hits[0].start == overlapping.hits[1].start)
+        var exactDuplicate = lowercase
+        exactDuplicate["case_sensitive"] = true; exactDuplicate["mode"] = "exact-decoded-literal"
+        rejected("exact literal accepted duplicate source occurrences") {
+            _ = try AtlasSavedSearchPage.decode(f.encode(exactDuplicate), identity: identity, generation: 1,
+                needle: "ana", start: 0, limit: 64, countAllMatches: true, caseSensitive: true)
+        }
+    }
+
+    @MainActor private static func lowercaseSearchKeepsOriginalReadersAndFrozenIndexPolicy() async throws {
+        let f = SavedRepositoryFixture(searchVectors: true), model = await prepared(f)
+        precondition(model.searchCaseSensitive && model.searchPage?.caseSensitive == true)
+        let pin = String(repeating: "a", count: 64)
+        var grant: FileGrant? = FileGrant(); weak var held = grant
+        model.attachIndex(path: "/saved/index.fcbd", pin: pin, accessLease: grant); grant = nil
+        await wait("matching index did not attach") { !model.busy }
+        model.searchCaseSensitive = false; model.searchInput = "ANA"; model.search()
+        await wait("lowercase search did not finish") { !model.busy }
+        let accepted = model.searchPage!
+        precondition(!accepted.caseSensitive && accepted.needle == "ANA" && accepted.hits.count == 4)
+        precondition(accepted.indexGeneration == nil && accepted.indexPin == nil && model.index?.generation == 1)
+        precondition(held != nil && model.searchIsCurrent && accepted.counting.all)
+        let utf8 = try await model.openHit(accepted.hits[0], from: accepted, readerTransport: f.readerTransport())
+        let utf16 = try await model.openHit(accepted.hits[3], from: accepted, readerTransport: f.readerTransport())
+        precondition(utf8.match?.originalHex == "616e61" && utf16.match?.originalHex == "61006e006100")
+        precondition(!utf8.origin.literalCaseSensitive && !utf16.origin.literalCaseSensitive)
+        model.searchCaseSensitive = true
+        precondition(!model.searchIsCurrent && utf8.canUseMatch && utf16.canUseMatch)
+        await refused("edited case policy authorized an old hit") {
+            _ = try await model.openHit(accepted.hits[0], from: accepted, readerTransport: f.readerTransport())
+        }
+        model.searchCaseSensitive = false
+        f.corruptNext("case-policy"); model.loadSearchResults(start: 2, from: accepted)
+        await wait("forged matching policy did not drain") { !model.busy }
+        precondition(model.searchPage?.start == 0 && model.searchPage?.caseSensitive == false)
+        f.corruptNext("search-lost"); model.search()
+        await wait("lost lowercase reply did not reconcile") { !model.busy }
+        precondition(model.queryGeneration == 3 && model.searchPage?.caseSensitive == false && model.searchIsCurrent)
+        precondition(f.calls.filter { $0 == "search:40:3:ANA" }.count == 1)
+        precondition(model.searchPage?.indexGeneration == nil && model.index?.generation == 1 && held != nil)
+        model.searchCaseSensitive = true; model.searchInput = "ana"; model.search()
+        await wait("exact replacement did not finish") { !model.busy }
+        precondition(model.searchPage?.caseSensitive == true && model.searchPage?.indexGeneration == 1)
+        await refused("replacement query rebound an old lowercase hit") {
+            _ = try await model.openHit(accepted.hits[0], from: accepted, readerTransport: f.readerTransport())
+        }
+        model.closeArchive()
+        precondition(utf8.canUseMatch && utf16.canUseMatch)
+        _ = try await utf16.withMatchReader { $0 }
+        await wait("closed archive retained its index grant") { held == nil }
+        precondition(!f.calls.contains("LIVE-OPEN"))
+        utf8.reader.close(); utf16.reader.close(); model.close()
+    }
+
+    @MainActor private static func lowercaseExpansionReadersKeepWholeOriginalScalars() async throws {
+        let f = SavedRepositoryFixture(searchVectors: true, expansionVectors: true)
+        let model = AtlasSavedRepositoryModel(transport: f.savedTransport)
+        model.open(path: "/saved/expansions.fcbs", accessLease: nil)
+        await wait("expansion archive did not open") { !model.busy }
+        model.searchCaseSensitive = false; model.searchInput = "i"; model.search()
+        await wait("expansion search did not finish") { !model.busy }
+        let page = model.searchPage!
+        precondition(page.hits.count == 2 && page.seen == 2 && !page.caseSensitive)
+        let utf8 = try await model.openHit(page.hits[0], from: page, readerTransport: f.readerTransport())
+        let utf16 = try await model.openHit(page.hits[1], from: page, readerTransport: f.readerTransport())
+        precondition(utf8.match?.start == 0 && utf8.match?.end == 2 && utf8.match?.originalHex == "c4b0")
+        precondition(utf16.match?.start == 2 && utf16.match?.end == 4 && utf16.match?.originalHex == "3001")
+        precondition(utf16.reader.page?.identity.encoding == "utf16le")
+        model.searchInput = "\u{307}"; model.search()
+        await wait("combining expansion query did not finish") { !model.busy }
+        let combining = model.searchPage!
+        let scalar = try await model.openHit(combining.hits[0], from: combining, readerTransport: f.readerTransport())
+        precondition(scalar.match?.originalHex == "c4b0", "an expansion narrowed the original scalar witness")
+        model.closeArchive()
+        precondition(utf8.canUseMatch && utf16.canUseMatch && scalar.canUseMatch)
+        utf8.reader.close(); utf16.reader.close(); scalar.reader.close(); model.close()
+    }
+
+    @MainActor private static func canceledLowercaseSearchRecoversItsSubmittedPolicy() async {
+        let f = SavedRepositoryFixture(searchVectors: true), model = await prepared(f)
+        f.blockNextSearch(); model.searchCaseSensitive = false; model.searchInput = "ANA"; model.search()
+        await wait("lowercase query did not enter the worker") { f.entered.wait(timeout: .now()) == .success }
+        model.searchCaseSensitive = true; model.cancel(); f.resume.signal()
+        await wait("canceled lowercase query did not reconcile") { !model.busy }
+        precondition(model.queryGeneration == 2 && model.searchPage?.caseSensitive == false)
+        precondition(!model.searchIsCurrent && model.relationshipGeneration == 1)
+        precondition(f.calls.filter { $0 == "search:40:2:ANA" }.count == 1)
+        let accepted = model.searchPage!
+        await refused("canceled reply inherited the edited matching policy") {
+            _ = try await model.openHit(accepted.hits[0], from: accepted, readerTransport: f.readerTransport())
+        }
+        model.searchCaseSensitive = false
+        precondition(model.searchIsCurrent)
+        model.close()
+    }
+
+    @MainActor private static func forgedLowercaseActivationPoliciesRetireDestinations() async {
+        for fault in ["hit-case", "hit-mode", "hit-text", "hit-text-missing", "hit-policy-missing"] {
+            let f = SavedRepositoryFixture(searchVectors: true), model = await prepared(f)
+            model.searchCaseSensitive = false; model.searchInput = "ANA"; model.search()
+            await wait("lowercase fault fixture did not search") { !model.busy }
+            let page = model.searchPage!
+            f.corruptNext(fault)
+            await refused("forged lowercase activation published a reader: \(fault)") {
+                _ = try await model.openHit(page.hits[0], from: page, readerTransport: f.readerTransport())
+            }
+            await wait("forged lowercase destination did not retire") { f.calls.contains("reader-close:100") }
+            precondition(f.calls.filter { $0 == "handoff:100" }.count == 1 && !f.calls.contains("LIVE-OPEN"))
+            precondition(model.queryGeneration == 2 && model.searchPage?.caseSensitive == false)
+            model.close()
+        }
     }
 
     private static func countedTotalsRemainIndependentOfStoredRows() throws {
