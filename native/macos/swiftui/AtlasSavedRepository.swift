@@ -2,12 +2,16 @@ import Foundation
 
 enum AtlasSavedError: Error, Sendable {
     case unavailable, invalidInput, invalidResponse, canceled, engine(String)
+    case staleDocumentLink, unindexedDocumentLink, unavailableDocumentTarget
     var message: String {
         switch self {
         case .unavailable: return "The saved repository could not admit this operation."
         case .invalidInput: return "Choose a valid saved archive, member or documentation link."
         case .invalidResponse: return "The saved repository response could not be verified. Reload its accepted metadata before continuing."
         case .canceled: return "Saved repository work was canceled. Entered work may still be draining."
+        case .staleDocumentLink: return "The saved archive or originating document preview changed. Return to that captured document and choose the link again."
+        case .unindexedDocumentLink: return "This occurrence is outside the retained saved-link inventory. Its coverage may be partial; no target was opened."
+        case .unavailableDocumentTarget: return "This link has no captured target in the opened archive. No working-tree file was opened."
         case .engine(let code): return "Saved repository operation unavailable (\(code))."
         }
     }
@@ -395,6 +399,9 @@ struct AtlasSavedLink: Decodable, Sendable, Identifiable {
     let sourceDigest: String
     let sourcePath: AtlasSavedPath
     let evidenceEnd: UInt64
+    /// Parser occurrence and block order, never a link-token byte coordinate.
+    let sourceOccurrence: UInt64
+    let blockIndex: UInt64
     let destination: String
     let resolution: String
     let targetMember: UInt64?
@@ -451,12 +458,12 @@ struct AtlasSavedLink: Decodable, Sendable, Identifiable {
         guard c.contains(.fragment_slug), c.contains(.target_range) else { throw AtlasSavedError.invalidResponse }
         fragmentSlug = try c.decodeIfPresent(String.self, forKey: .fragment_slug)
         targetRange = try c.decodeIfPresent(AtlasSavedFragmentRange.self, forKey: .target_range)
-        let occurrence = try c.decode(AtlasSavedNumber.self, forKey: .source_link_id).value
-        _ = try c.decode(AtlasSavedNumber.self, forKey: .block_index) // Parser ordering only, never a coordinate.
+        sourceOccurrence = try c.decode(AtlasSavedNumber.self, forKey: .source_link_id).value
+        blockIndex = try c.decode(AtlasSavedNumber.self, forKey: .block_index).value
         guard (1...4096).contains(id), sourceMember < 65_536, sourceFile == sourceMember + 1,
               sourceRevision == sourceFile, AtlasSavedWire.digest(sourceDigest), sourcePath.isMember,
               range.start == 0, evidenceEnd > 0, evidenceEnd <= AtlasSavedWire.documentBytes,
-              (1...131_072).contains(occurrence), destination.utf8.count <= 4096,
+              (1...131_072).contains(sourceOccurrence), blockIndex < 131_072, destination.utf8.count <= 4096,
               suffix.utf8.count <= destination.utf8.count,
               (fragmentResolution != .none) == suffix.contains("#"),
               ["captured", "unavailable", "missing", "external", "unresolved"].contains(resolution) else {
@@ -512,11 +519,25 @@ struct AtlasSavedLink: Decodable, Sendable, Identifiable {
         }
         return id == other.id && sourceMember == other.sourceMember && sourceDigest == other.sourceDigest &&
             sourcePath.bytes == other.sourcePath.bytes && evidenceEnd == other.evidenceEnd &&
+            sourceOccurrence == other.sourceOccurrence && blockIndex == other.blockIndex &&
             destination.utf8.elementsEqual(other.destination.utf8) && resolution == other.resolution &&
             targetMember == other.targetMember && targetPath?.bytes == other.targetPath?.bytes &&
             suffix.utf8.elementsEqual(other.suffix.utf8) && fragmentResolution == other.fragmentResolution &&
             sameSlug &&
             targetRange == other.targetRange
+    }
+    /// Both inventories use the same upstream parser on the same immutable
+    /// member. Equal URL text alone cannot substitute another occurrence.
+    func matchesDocumentOccurrence(_ target: AtlasReaderDocumentLinkTarget, source: AtlasSavedMember) -> Bool {
+        source.captured && sourceMember == source.id && sourceFile == source.file
+            && sourceRevision == source.file && sourceDigest == source.digest
+            && sourcePath.bytes == source.path.bytes && evidenceEnd == source.observedBytes
+            && sourceOccurrence == target.link.id && blockIndex == target.link.blockIndex
+            && target.link.evidence.start == 0 && target.link.evidence.end == evidenceEnd
+            && target.link.kind == .local
+            && destination.utf8.elementsEqual(target.link.destination.utf8)
+            && target.inventory.identity.pathBytes == source.path.bytes
+            && target.inventory.identity.capturedBytes == source.observedBytes
     }
     enum CodingKeys: CodingKey {
         case link_id, source_member, source_file_id, source_revision, source_digest, source_path, evidence_range,
@@ -536,6 +557,15 @@ struct AtlasSavedRelationships: Sendable {
     let complete: Bool
     let truncated: Bool
     let markdown, scanned, unavailable, unsupported, sourceLimited, diagnostics, retained, seen, matching, sourceBytes: UInt64
+
+    func matchesInventory(_ other: Self) -> Bool {
+        identity == other.identity && generation == other.generation && direction == other.direction
+            && member == other.member && complete == other.complete && truncated == other.truncated
+            && markdown == other.markdown && scanned == other.scanned && unavailable == other.unavailable
+            && unsupported == other.unsupported && sourceLimited == other.sourceLimited
+            && diagnostics == other.diagnostics && retained == other.retained && seen == other.seen
+            && matching == other.matching && sourceBytes == other.sourceBytes
+    }
 
     static func decode(_ json: String?, identity: AtlasSavedIdentity, generation: UInt64,
         direction: AtlasSavedDirection, member: UInt64?, start: UInt64, limit: UInt64, preparing: Bool = false) throws -> Self {

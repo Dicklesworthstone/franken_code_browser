@@ -88,7 +88,7 @@ final class AtlasSavedFileAccess {
         }
         .padding(16).frame(minWidth: 1020, idealWidth: 1320, minHeight: 660, idealHeight: 800)
         .sheet(item: $readerCapture) { capture in
-            AtlasSavedReaderView(capture: capture, desk: desk, pins: pins)
+            AtlasSavedReaderView(capture: capture, archive: model, desk: desk, pins: pins)
         }
         .sheet(isPresented: $showsComparison) { AtlasSnapshotComparisonView(desk: desk) }
         .onDisappear {
@@ -889,12 +889,23 @@ final class AtlasSavedFileAccess {
 }
 
 @MainActor private struct AtlasSavedReaderView: View {
-    let capture: AtlasSavedReaderCapture
+    @Bindable var archive: AtlasSavedRepositoryModel
     @Bindable var desk: AtlasReadingDeskModel
     @Bindable var pins: AtlasPinnedReaders<AtlasPagedReaderModel>
     @Environment(\.dismiss) private var dismiss
     @State private var showsDesk = false
     @State private var matchNotice = ""
+    @State private var history: AtlasSavedReaderHistory
+    @State private var linkTask: Task<Void, Never>?
+    @State private var linkOperation = UUID()
+    @State private var linkNotice = ""
+
+    init(capture: AtlasSavedReaderCapture, archive: AtlasSavedRepositoryModel, desk: AtlasReadingDeskModel,
+         pins: AtlasPinnedReaders<AtlasPagedReaderModel>) {
+        self.archive = archive; self.desk = desk; self.pins = pins
+        _history = State(initialValue: AtlasSavedReaderHistory(capture))
+    }
+    private var capture: AtlasSavedReaderCapture { history.current }
     private var pinGroup: String { "saved-repository:\(capture.owner)" }
     private var canKeep: Bool {
         desk.canOperate && desk.readerDomain != nil && capture.reader.retainedRegistryDomain == desk.readerDomain
@@ -911,6 +922,25 @@ final class AtlasSavedFileAccess {
                 Button("Reading Desk") { showsDesk = true }
                 Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
             }.controlSize(.small).padding(.horizontal, 12).padding(.top, 12)
+            HStack {
+                Button { history.back(); matchNotice = ""; linkNotice = "" } label: {
+                    Label("Back", systemImage: "chevron.left")
+                }.disabled(!history.canBack || linkTask != nil)
+                Button { history.forward(); matchNotice = ""; linkNotice = "" } label: {
+                    Label("Forward", systemImage: "chevron.right")
+                }.disabled(!history.canForward || linkTask != nil)
+                Text("Saved reader \(history.position + 1) of \(history.entries.count)")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                if linkTask != nil {
+                    ProgressView().controlSize(.small)
+                    Button("Cancel link") { linkTask?.cancel(); linkNotice = "Cancel requested; waiting for entered archive work." }
+                }
+            }.controlSize(.small).padding(.horizontal, 12)
+            if !linkNotice.isEmpty {
+                Text(verbatim: linkNotice).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12)
+            }
             if let match = capture.match { savedMatchActions(match) }
             else if case .structureHit(_, _, _, _, let item) = capture.origin {
                 HStack {
@@ -926,13 +956,19 @@ final class AtlasSavedFileAccess {
             HSplitView {
                 AtlasPagedSourceView(model: capture.reader, canPin: pins.canAdd, pin: { reader in
                     pins.pin(reader, root: pinGroup, label: capture.member.path.display)
-                }, canKeep: canKeep, keep: keep)
+                }, canKeep: canKeep, keep: keep, openLocalLink: localNavigation)
+                .id(capture.id)
                 .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
                 if !pins.entries.isEmpty || pins.busy {
                     AtlasPinnedReadersView(readers: pins, canKeep: canKeep, keep: keep)
                         .frame(minWidth: 350, idealWidth: 480)
                 }
             }
+            Text(capture.archiveIdentity != nil && archive.info?.identity == capture.archiveIdentity
+                ? "Markdown local links follow captured members in this archive. The first link may prepare its bounded link inventory. Back and Forward retain up to four readers; pin a source or keep it in the Desk to preserve it longer."
+                : "The originating archive is closed or replaced. Retained readers, Back, Forward, pinning and the Desk remain available; new local-link navigation is disabled.")
+                .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
             Text(capture.match == nil
                 ? "Keep in Desk preserves the current original-byte page. Add bookmarks or notes there and save a checkpoint to retain your reading work."
                 : "Keep saved match preserves the exact range above. The reader toolbar's Keep in Desk preserves the current page. Add a note or bookmark and save a checkpoint in the Desk.")
@@ -942,7 +978,39 @@ final class AtlasSavedFileAccess {
         .frame(minWidth: 980, idealWidth: 1280, minHeight: 680, idealHeight: 820)
         .onAppear { pins.bind(root: pinGroup) }
         .sheet(isPresented: $showsDesk) { AtlasReadingDeskView(model: desk) }
-        .onDisappear { capture.reader.close() }
+        .onDisappear {
+            linkOperation = UUID(); linkTask?.cancel(); linkTask = nil
+            history.close()
+        }
+    }
+    private var localNavigation: AtlasDocumentPreviewModel.LocalNavigation? {
+        guard linkTask == nil, archive.canFollowDocumentLinks(from: capture) else { return nil }
+        let source = capture
+        return { target in openLink(target, from: source) }
+    }
+    private func openLink(_ target: AtlasReaderDocumentLinkTarget, from source: AtlasSavedReaderCapture) {
+        guard linkTask == nil, history.current.id == source.id,
+              archive.canFollowDocumentLinks(from: source) else { return }
+        let ticket = UUID(); linkOperation = ticket
+        linkNotice = "Resolving this captured occurrence within the saved archive…"
+        linkTask = Task {
+            defer { if linkOperation == ticket { linkTask = nil } }
+            do {
+                let candidate = try await archive.openDocumentLink(target, from: source,
+                    readerTransport: .native, search: .native, outline: .native, document: .native)
+                guard linkOperation == ticket, !Task.isCancelled, history.current.id == source.id,
+                      archive.canFollowDocumentLinks(from: source), history.accept(candidate) else {
+                    candidate.reader.close(); return
+                }
+                matchNotice = ""
+                linkNotice = "Opened captured source. Back restores the previous reader and its source page."
+            } catch {
+                guard linkOperation == ticket else { return }
+                linkNotice = Task.isCancelled ? "Link navigation canceled. The originating captured reader remains available."
+                    : ((error as? AtlasSavedError)?.message ?? (error as? AtlasReaderError)?.message
+                        ?? "The saved link could not be opened. The originating reader remains available.")
+            }
+        }
     }
     private func savedMatchActions(_ match: AtlasSavedMatchEvidence) -> some View {
         VStack(alignment: .leading, spacing: 5) {

@@ -102,6 +102,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     private var nextReader: UInt64 = 100
     private var sessions: [UInt64: Session] = [:]
     private var readers: [UInt64: Member] = [:]
+    private var documentStates: [UInt64: (generation: UInt64, width: UInt64)] = [:]
     private var log: [String] = []
     private var fault: String?
     private var blocked = false
@@ -697,12 +698,32 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                         + (headingVectors ? 2 * headingBytes.count : 0) + (lineEncoding != nil ? members[3].bytes!.count : 0))
                     session.readCalls += headingVectors ? 4 : (lineEncoding != nil ? 3 : 2)
                     sessions[handle] = session
+                    if fault == "build-lost" { fault = nil; return nil }
                     return encode(relationships(handle, generation: generation, preparing: true))
                 case .relationships(let generation, let direction, let member, let start, let limit):
                     log.append("links:\(handle):\(generation):\(direction.rawValue):\(start)")
                     guard sessions[handle]?.generation == generation else { return nil }
-                    return encode(relationships(handle, generation: generation, direction: direction,
-                        member: member, start: start, limit: limit))
+                    var page = relationships(handle, generation: generation, direction: direction,
+                        member: member, start: start, limit: limit)
+                    if direction == .outgoing, let fault, fault.hasPrefix("document-link-") {
+                        self.fault = nil
+                        if fault == "document-link-omitted" {
+                            page["links"] = [[String: Any]](); page["matching_links"] = "0"; page["next_offset"] = NSNull()
+                        } else {
+                            var rows = page["links"] as! [[String: Any]]
+                            switch fault {
+                            case "document-link-occurrence": rows[0]["source_link_id"] = "10"
+                            case "document-link-block": rows[0]["block_index"] = "1"
+                            case "document-link-destination": rows[0]["destination"] = "other.rs#L2"
+                            case "document-link-digest": rows[0]["source_digest"] = String(repeating: "e", count: 64)
+                            case "document-link-path": rows[0]["source_path"] = path(Array("OTHER.md".utf8), "README.md")
+                            case "document-link-range": rows[0]["evidence_range"] = ["start": "0", "end": String(source.count - 1)]
+                            default: preconditionFailure("unexpected document lookup fault")
+                            }
+                            page["links"] = rows
+                        }
+                    }
+                    return encode(page)
                 case .openMember(let reader, let member):
                     guard sessions[handle] != nil, member < 5 else { return nil }
                     return handoff(handle, reader: reader, ordinal: member, generation: nil, link: nil, side: nil)
@@ -869,6 +890,80 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             locked { sessions.removeValue(forKey: handle); log.append("saved-close:\(handle)") }; return true
         }, retirementFailed: { fatalError("saved retirement failed") }, readerDomain: domain)
     }
+    /// Fixed upstream-boundary replies for the actual saved source reader.
+    /// Production document decoding, preview activation, saved lookup and
+    /// capture handoff execute; these fixtures do not qualify Markdown parsing.
+    private func documentReply(_ command: String, owner: UInt64, generation: UInt64,
+                               width: UInt64? = nil, first: UInt64 = 0, link: UInt64 = 0,
+                               anchor: UInt64 = 0) -> String? {
+        precondition(!Thread.isMainThread)
+        return locked {
+            guard let member = readers[owner], member.path == Array("README.md".utf8),
+                  member.bytes == source else { return nil }
+            if let width { documentStates[owner] = (generation, width) }
+            guard let state = documentStates[owner], state.generation == generation else { return nil }
+            log.append("\(command):\(owner):\(generation)")
+            var out = readerHeader(owner, member: member, command: command)
+            out.merge([
+                "document_generation": String(generation), "document_ready": true,
+                "layout_complete": true, "native_shaped": false,
+                "rendering": "logical-frankenmarkdown-flow",
+                "source_mapping": "enclosing-regions-not-glyph-exact",
+                "width_columns": String(state.width), "parser_source_base": "3",
+                "total_flow_lines": "1", "total_headings": "0", "rendered_utf8_bytes": "14"
+            ]) { _, new in new }
+            func linkRow(_ id: UInt64) -> [String: Any] {
+                let saved = linkObject(id)
+                return ["link_id": String(id), "block_index": "0",
+                    "evidence_range": ["start": "0", "end": String(source.count)],
+                    "destination": saved["destination"]!, "destination_display": saved["destination"]!,
+                    "kind": id == 4 ? "same-document-start" : "local-reference", "fragment_slug": NSNull()]
+            }
+            if ["document-links-prepare", "document-links", "document-link"].contains(command) {
+                out.merge(["links_ready": true, "links_complete": true, "links_truncated": false,
+                    "links_seen": "4", "retained_links": "4", "parser_diagnostics": "0",
+                    "evidence_precision": "whole-captured-markdown-document"]) { _, new in new }
+                if command == "document-link" {
+                    guard (1...3).contains(link) else { return nil }
+                    out["link"] = linkRow(link); out["activated"] = false
+                } else {
+                    guard first == 0 || first == 4 else { return nil }
+                    out["first_link"] = String(first)
+                    out["links"] = (first..<4).map { linkRow($0 + 1) }
+                    out["next_link"] = NSNull()
+                }
+            } else {
+                guard first == 0 else { return nil }
+                out["first_flow_line"] = "0"
+                out["flow_lines"] = [["flow_line": "0", "text": "Saved document",
+                    "rendered_utf8_range": ["start": "0", "end": "14"],
+                    "enclosing_original_range": ["start": "3", "end": String(source.count)]]]
+                out["next_flow_line"] = NSNull(); out["whole_document_visible"] = true
+                out["headings"] = [[String: Any]](); out["next_heading"] = NSNull()
+                if command == "document-from-source" { out["original_anchor"] = String(anchor) }
+            }
+            return encode(out)
+        }
+    }
+    var documentTransport: AtlasReaderDocumentTransport {
+        .init(prepare: { [self] owner, generation, width in
+            documentReply("document-prepare", owner: owner, generation: generation, width: width)
+        }, window: { [self] owner, generation, first, _ in
+            documentReply("document-window", owner: owner, generation: generation, first: first)
+        }, headings: { [self] owner, generation, first, _ in
+            documentReply("document-headings", owner: owner, generation: generation, first: first)
+        }, heading: { _, _, _, _ in nil }, fromSource: { [self] owner, generation, offset, _ in
+            documentReply("document-from-source", owner: owner, generation: generation, anchor: offset)
+        }, source: { _, _, _, _, _ in nil }, copy: { _, _, _, _, _ in nil },
+        prepareLinks: { [self] owner, generation, _ in
+            documentReply("document-links-prepare", owner: owner, generation: generation)
+        }, links: { [self] owner, generation, first, _ in
+            documentReply("document-links", owner: owner, generation: generation, first: first)
+        }, link: { [self] owner, generation, id, _ in
+            documentReply("document-link", owner: owner, generation: generation, link: id)
+        })
+    }
+
     func readerTransport(domain: UUID? = nil) -> AtlasReaderTransport {
         AtlasReaderTransport(create: { [self] in locked {
             let id = nextReader; nextReader += 1; log.append("reader-create:\(id)"); return id
@@ -931,6 +1026,10 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     @MainActor static func main() async throws {
         try decoderContracts()
         try await actualModelNavigationAndIndependentReaders()
+        try await savedPreviewLocalLinksAndHistory()
+        try await savedPreviewLinkIdentityAndRecovery()
+        try await savedPreviewLateHandoffs()
+        try await savedReaderHistoryIsBounded()
         try await capturedHeadingNavigationAndFrozenReceipts()
         try await capturedSourceLineNavigationAndAlignment()
         await failedReplacementAndGenerationRecovery()
@@ -1087,6 +1186,215 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         precondition(!f.calls.contains("LIVE-OPEN"))
         await wait("archive did not retire independently") { f.calls.contains("saved-close:40") }
         evidence.reader.close(); target.reader.close(); raw.reader.close(); model.close()
+    }
+
+    @MainActor private static func previewed(_ f: SavedRepositoryFixture, _ model: AtlasSavedRepositoryModel)
+        async throws -> AtlasSavedReaderCapture {
+        let source = try await model.openMember(model.members!.items[0], from: model.info!.identity,
+            readerTransport: f.readerTransport(), document: f.documentTransport)
+        precondition(source.archiveIdentity == model.info?.identity && model.canFollowDocumentLinks(from: source))
+        source.reader.documentPreview.prepare()
+        await wait("saved Markdown preview did not prepare") { !source.reader.documentPreview.busy }
+        precondition(source.reader.documentPreview.canNavigate)
+        source.reader.documentPreview.prepareLinks()
+        await wait("saved Markdown links did not prepare") { !source.reader.documentPreview.busy }
+        precondition(source.reader.documentPreview.links?.rows.count == 4)
+        return source
+    }
+
+    @MainActor private static func savedPreviewLocalLinksAndHistory() async throws {
+        for f in [SavedRepositoryFixture(headingVectors: true), SavedRepositoryFixture(lineEncoding: "utf8"),
+                  SavedRepositoryFixture(lineEncoding: "utf16le"), SavedRepositoryFixture(lineEncoding: "utf16be"),
+                  SavedRepositoryFixture()] {
+            let model = await opened(f), source = try await previewed(f, model)
+            let sourcePage = source.reader.page!, target = source.reader.documentPreview.links!.target(id: 1)!
+            var activated: AtlasReaderDocumentLinkTarget?
+            source.reader.documentPreview.openLink(target, openLocal: { activated = $0 })
+            await wait("explicit saved local-link action did not verify the originating occurrence") {
+                activated != nil && !source.reader.documentPreview.busy
+            }
+            precondition(activated == target && f.calls.contains("document-link:100:1"))
+            let followed = try await model.openDocumentLink(activated!, from: source,
+                readerTransport: f.readerTransport(), document: f.documentTransport)
+            precondition(followed.member.id == 3 && followed.archiveIdentity == source.archiveIdentity)
+            precondition(followed.reader.retainedCaptureSHA256 == f.members[3].digest && !followed.reader.canRefresh)
+            if f.headingVectors { precondition(followed.evidenceLabel.contains("#caf-details")) }
+            else if f.lineEncoding != nil { precondition(followed.evidenceLabel.contains("source line 2")) }
+            else { precondition(followed.evidenceLabel.contains("no supported navigation"),
+                "Unsupported fragments must keep the verified byte-zero fallback explanation") }
+            precondition(source.reader.page?.identity.matches(sourcePage.identity) == true
+                && source.reader.page?.originalHex == sourcePage.originalHex
+                && source.reader.documentPreview.allows(target), "Following a link changed the source reader")
+            precondition(f.calls.filter { $0.hasPrefix("prepare:") }.count == 1)
+            var history = AtlasSavedReaderHistory(source)
+            precondition(history.accept(followed) && history.current.id == followed.id && history.canBack)
+            history.back()
+            precondition(history.current.id == source.id && history.current.reader.page?.originalHex == sourcePage.originalHex)
+            history.forward()
+            precondition(history.current.id == followed.id)
+            history.back()
+            let second = source.reader.documentPreview.links!.target(id: 2)!
+            let replacement = try await model.openDocumentLink(second, from: source,
+                readerTransport: f.readerTransport(), document: f.documentTransport)
+            precondition(history.accept(replacement) && !history.canForward && history.entries.count == 2)
+            await wait("discarded forward reader did not retire") { f.calls.contains("reader-close:101") }
+            precondition(f.calls.filter { $0.hasPrefix("prepare:") }.count == 1,
+                "Onward navigation reparsed the archive instead of paging retained link metadata")
+            model.closeArchive()
+            precondition(!model.canFollowDocumentLinks(from: source) && !model.canFollowDocumentLinks(from: replacement))
+            let calls = f.calls.count
+            await refused("closed archive authorized a fresh target") {
+                _ = try await model.openDocumentLink(target, from: source, readerTransport: f.readerTransport())
+            }
+            precondition(f.calls.count == calls)
+            history.back()
+            source.reader.offsetInput = "25"; source.reader.goToByte()
+            await wait("original saved reader stopped paging after archive closure") { !source.reader.busy }
+            precondition(history.current.id == source.id && source.reader.page?.start == 25
+                && source.reader.page?.originalHex == f.hex(f.source.dropFirst(25)))
+            precondition(!f.calls.contains("LIVE-OPEN"))
+            history.close(); model.close()
+        }
+    }
+
+    @MainActor private static func savedPreviewLinkIdentityAndRecovery() async throws {
+        let f = SavedRepositoryFixture(headingVectors: true), model = await opened(f)
+        let source = try await previewed(f, model)
+        let target = source.reader.documentPreview.links!.target(id: 1)!
+        let first = try JSONDecoder().decode(AtlasSavedLink.self, from: Data(f.encode(f.linkObject(1)).utf8))
+        var duplicate = f.linkObject(1)
+        duplicate["link_id"] = "2"; duplicate["source_link_id"] = "2"; duplicate["block_index"] = "1"
+        let sameDestination = try JSONDecoder().decode(AtlasSavedLink.self, from: Data(f.encode(duplicate).utf8))
+        precondition(first.matchesDocumentOccurrence(target, source: source.member)
+            && !sameDestination.matchesDocumentOccurrence(target, source: source.member))
+        let secondTarget = AtlasReaderDocumentLinkTarget(inventory: target.inventory, pageID: target.pageID,
+            link: AtlasReaderDocumentLink(id: 2, blockIndex: 1, evidence: target.link.evidence,
+                destination: target.link.destination, display: target.link.display, kind: .local, fragment: nil))
+        precondition(sameDestination.matchesDocumentOccurrence(secondTarget, source: source.member)
+            && !first.matchesDocumentOccurrence(secondTarget, source: source.member),
+            "Equal destinations lost their independent parser occurrence/block identity")
+        let callsBeforeForged = f.calls.count
+        await refused("a forged but equal-destination occurrence reached archive work") {
+            _ = try await model.openDocumentLink(secondTarget, from: source, readerTransport: f.readerTransport())
+        }
+        precondition(f.calls.count == callsBeforeForged)
+
+        f.corruptNext("build-lost")
+        await refused("lost relationship build receipt was treated as a verified target") {
+            _ = try await model.openDocumentLink(target, from: source, readerTransport: f.readerTransport())
+        }
+        precondition(model.relationshipGeneration == 1 && f.calls.filter { $0.hasPrefix("prepare:") }.count == 1)
+        let recovered = try await model.openDocumentLink(target, from: source, readerTransport: f.readerTransport())
+        precondition(recovered.member.id == 3 && f.calls.filter { $0.hasPrefix("prepare:") }.count == 1)
+        recovered.reader.close()
+
+        for fault in ["document-link-occurrence", "document-link-block", "document-link-destination",
+                      "document-link-digest", "document-link-path", "document-link-range", "document-link-omitted"] {
+            let admissions = f.calls.filter { $0.hasPrefix("reader-create:") }.count
+            f.corruptNext(fault)
+            await refused("mismatched saved link evidence admitted a target: \(fault)") {
+                _ = try await model.openDocumentLink(target, from: source, readerTransport: f.readerTransport())
+            }
+            precondition(f.calls.filter { $0.hasPrefix("reader-create:") }.count == admissions
+                && source.reader.documentPreview.allows(target), "Lookup failure discarded the originating preview")
+            if fault == "document-link-omitted" { precondition(model.notice.contains("coverage may be partial")) }
+        }
+        let missing = source.reader.documentPreview.links!.target(id: 3)!
+        let admissions = f.calls.filter { $0.hasPrefix("reader-create:") }.count
+        await refused("uncaptured saved target was opened from the working tree") {
+            _ = try await model.openDocumentLink(missing, from: source, readerTransport: f.readerTransport())
+        }
+        precondition(model.notice.contains("no captured target")
+            && f.calls.filter { $0.hasPrefix("reader-create:") }.count == admissions)
+
+        source.reader.documentPreview.widthInput = "80"; source.reader.documentPreview.prepare()
+        let beforeReflow = f.calls.filter { $0.hasPrefix("links:") || $0.hasPrefix("prepare:") }.count
+        await refused("reflowed preview reused a stale link target") {
+            _ = try await model.openDocumentLink(target, from: source, readerTransport: f.readerTransport())
+        }
+        await wait("reflow did not finish") { !source.reader.documentPreview.busy }
+        precondition(f.calls.filter { $0.hasPrefix("links:") || $0.hasPrefix("prepare:") }.count == beforeReflow)
+        source.reader.documentPreview.prepareLinks()
+        await wait("reflowed links did not reload") { !source.reader.documentPreview.busy }
+        let current = source.reader.documentPreview.links!.target(id: 1)!
+        precondition(current.inventory.generation != target.inventory.generation)
+
+        let original = source.reader.page!
+        model.open(path: "/saved/repository.fcbs", accessLease: nil)
+        await wait("equal-content archive replacement did not finish") { !model.busy }
+        precondition(model.info?.identity.digest == source.archiveIdentity?.digest
+            && model.info?.identity.owner != source.owner && !model.canFollowDocumentLinks(from: source))
+        let calls = f.calls.count
+        await refused("same saved pathname and bytes revived the old archive capability") {
+            _ = try await model.openDocumentLink(current, from: source, readerTransport: f.readerTransport())
+        }
+        precondition(f.calls.count == calls && source.reader.page?.identity.matches(original.identity) == true
+            && source.reader.page?.originalHex == original.originalHex && !f.calls.contains("LIVE-OPEN"))
+        source.reader.close(); model.close()
+    }
+
+    @MainActor private static func savedPreviewLateHandoffs() async throws {
+        for action in ["cancel", "reflow", "close"] {
+            let f = SavedRepositoryFixture(lineEncoding: "utf16le"), model = await opened(f)
+            let source = try await previewed(f, model)
+            let original = source.reader.page!, target = source.reader.documentPreview.links!.target(id: 1)!
+            f.blockNextHandoff()
+            let pending = Task {
+                try await model.openDocumentLink(target, from: source, readerTransport: f.readerTransport())
+            }
+            await wait("saved document handoff did not enter") { f.entered.wait(timeout: .now()) == .success }
+            if action == "cancel" { pending.cancel() }
+            else if action == "close" { model.close() }
+            else {
+                source.reader.documentPreview.widthInput = "80"; source.reader.documentPreview.prepare()
+                await wait("source preview could not reflow independently of the target transfer") {
+                    !source.reader.documentPreview.busy
+                }
+            }
+            precondition(!f.calls.contains("saved-close:40") && !f.calls.contains("reader-close:100"))
+            f.resume.signal()
+            await refused("late \(action) target escaped its originating preview") { _ = try await pending.value }
+            await wait("canceled or stale saved-link destination did not retire") { f.calls.contains("reader-close:101") }
+            precondition(!f.calls.contains("reader-close:100") && source.reader.page?.identity.matches(original.identity) == true
+                && source.reader.page?.originalHex == original.originalHex && !f.calls.contains("LIVE-OPEN"))
+            if action == "close" {
+                await wait("closed archive grant did not drain") { f.calls.contains("saved-close:40") }
+            }
+            source.reader.close(); model.close()
+        }
+    }
+
+    @MainActor private static func savedReaderHistoryIsBounded() async throws {
+        let f = SavedRepositoryFixture(), model = await opened(f)
+        let identity = model.info!.identity, member = model.members!.items[0]
+        let first = try await model.openMember(member, from: identity, readerTransport: f.readerTransport())
+        var history = AtlasSavedReaderHistory(first)
+        for _ in 0..<4 {
+            let next = try await model.openMember(member, from: identity, readerTransport: f.readerTransport())
+            precondition(history.accept(next))
+        }
+        precondition(history.entries.count == AtlasSavedReaderHistory.capacity
+            && history.position == AtlasSavedReaderHistory.capacity - 1)
+        await wait("oldest history capture was not retired at the bound") { f.calls.contains("reader-close:100") }
+        let forwardOwner = history.current.reader.page!.identity.owner
+        history.back(); history.back()
+        let replacement = try await model.openMember(member, from: identity, readerTransport: f.readerTransport())
+        precondition(history.accept(replacement) && !history.canForward && history.entries.count == 3)
+        await wait("abandoned forward capture was not retired") {
+            f.calls.contains("reader-close:\(forwardOwner)")
+        }
+        model.open(path: "/saved/other.fcbs", accessLease: nil)
+        await wait("history archive replacement did not finish") { !model.busy }
+        let foreign = try await model.openMember(model.members!.items[0], from: model.info!.identity,
+            readerTransport: f.readerTransport())
+        precondition(!history.accept(foreign) && history.current.id == replacement.id)
+        foreign.reader.close()
+        history.close(); history.close()
+        precondition(history.closed && !history.canBack && !history.canForward)
+        await wait("history retained sources did not retire") {
+            (100...106).allSatisfy { f.calls.contains("reader-close:\($0)") }
+        }
+        model.close()
     }
 
     @MainActor private static func capturedSourceLineNavigationAndAlignment() async throws {

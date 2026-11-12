@@ -304,12 +304,16 @@ final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
     let id = UUID()
     let reader: AtlasPagedReaderModel
     let owner: UInt64
+    /// Membership authority for onward links, not a live filesystem grant.
+    /// The independent source reader remains usable when this archive closes.
+    let archiveIdentity: AtlasSavedIdentity?
     let member: AtlasSavedMember
     let origin: AtlasSavedReaderOrigin
     let match: AtlasSavedMatchEvidence?
     init(reader: AtlasPagedReaderModel, owner: UInt64, member: AtlasSavedMember, origin: AtlasSavedReaderOrigin,
-        match: AtlasSavedMatchEvidence? = nil) {
+        match: AtlasSavedMatchEvidence? = nil, archiveIdentity: AtlasSavedIdentity? = nil) {
         self.reader = reader; self.owner = owner; self.member = member; self.origin = origin; self.match = match
+        self.archiveIdentity = archiveIdentity
     }
     var evidenceLabel: String {
         switch origin {
@@ -337,5 +341,40 @@ final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
         guard canUseMatch else { throw AtlasSavedError.unavailable }
         try Task.checkCancellation()
         return try await reader.withRetainedReader(work)
+    }
+}
+
+
+/// At most four independent captures retain the reading journey. Back/Forward
+/// changes only the selected capture; its byte page, Find and preview survive.
+/// Discarded forward entries and the oldest entry retire through reader.close(),
+/// whose coordinator drains work and destroys native source off the UI thread.
+@MainActor struct AtlasSavedReaderHistory {
+    static let capacity = 4
+    private(set) var entries: [AtlasSavedReaderCapture]
+    private(set) var position = 0
+    private(set) var closed = false
+    init(_ first: AtlasSavedReaderCapture) { entries = [first] }
+    var current: AtlasSavedReaderCapture { entries[position] }
+    var canBack: Bool { !closed && position > 0 }
+    var canForward: Bool { !closed && position + 1 < entries.count }
+    mutating func back() { if canBack { position -= 1 } }
+    mutating func forward() { if canForward { position += 1 } }
+    @discardableResult mutating func accept(_ candidate: AtlasSavedReaderCapture) -> Bool {
+        guard !closed, let archive = current.archiveIdentity,
+              candidate.archiveIdentity == archive, candidate.owner == archive.owner,
+              !entries.contains(where: { $0.id == candidate.id }) else { return false }
+        for retired in entries.dropFirst(position + 1) { retired.reader.close() }
+        entries.removeSubrange((position + 1)..<entries.count)
+        if entries.count == Self.capacity {
+            entries.removeFirst().reader.close()
+        }
+        entries.append(candidate); position = entries.count - 1
+        return true
+    }
+    mutating func close() {
+        guard !closed else { return }
+        closed = true
+        for entry in entries { entry.reader.close() }
     }
 }

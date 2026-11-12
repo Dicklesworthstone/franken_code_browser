@@ -268,7 +268,7 @@ import AppKit
         switch kind {
         case .heading: "Go to this document's heading"
         case .start: "Go to document start"
-        case .local: openLocalLink == nil ? "Local target needs a project capture route" : "Open admitted project target"
+        case .local: openLocalLink == nil ? "Local target needs an authorized capture route" : "Open authorized captured target"
         case .external: "External web destination"
         case .unsupported: "Unsupported destination"
         }

@@ -441,8 +441,8 @@ struct AtlasExternalWebLink: Sendable {
                 switch target.link.kind {
                 case .local:
                     model.notice = openLocal == nil
-                        ? "This local link needs a current project capture route. No file was opened."
-                        : "The current project will resolve this retained link against its admitted files."
+                        ? "This local link needs an authorized capture route. No file was opened."
+                        : "The enclosing source provider will resolve this retained link against its admitted files."
                 case .external: model.notice = "External destination. No browser or network request was opened."
                 case .unsupported: model.notice = "This destination is unsupported by the shared document resolver."
                 case .heading, .start: throw AtlasReaderError.invalidResponse

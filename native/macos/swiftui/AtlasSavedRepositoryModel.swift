@@ -713,6 +713,124 @@ private final class AtlasSavedSession: @unchecked Sendable {
         return try await openReader(saved: identity, ordinal: member.id, expected: member, origin: .member,
             readerTransport: readerTransport, search: search, outline: outline, document: document)
     }
+    /// An opened archive supplies this capability, never a saved path label.
+    /// Closing/replacing it disables onward navigation without closing readers.
+    func canFollowDocumentLinks(from source: AtlasSavedReaderCapture) -> Bool {
+        canOperate && ownsDocumentSource(source)
+    }
+    private func ownsDocumentSource(_ source: AtlasSavedReaderCapture) -> Bool {
+        guard !closed, let archive = source.archiveIdentity, let info, let session,
+              info.identity == archive, session.handle == archive.owner, source.owner == archive.owner,
+              let domain = readerDomain, source.reader.retainedRegistryDomain == domain,
+              source.member.captured, let digest = source.member.digest,
+              source.reader.retainedCaptureSHA256 == digest,
+              let identity = source.reader.page?.identity,
+              identity.pathBytes == source.member.path.bytes,
+              identity.capturedBytes == source.member.observedBytes else { return false }
+        return true
+    }
+    private func ownsDocumentLink(_ target: AtlasReaderDocumentLinkTarget, from source: AtlasSavedReaderCapture) -> Bool {
+        ownsDocumentSource(source) && target.link.kind == .local
+            && source.reader.page?.identity.matches(target.inventory.identity) == true
+            && source.reader.documentPreview.allows(target)
+            && target.link.evidence.start == 0 && target.link.evidence.end == source.member.observedBytes
+    }
+
+    /// Follow a verified preview occurrence through the existing saved-manifest
+    /// relationship resolver. No member label is opened as a working-tree path.
+    /// The bounded relationship inventory is prepared once on this deliberate
+    /// action, if needed; later actions page retained metadata without parsing.
+    func openDocumentLink(_ target: AtlasReaderDocumentLinkTarget, from source: AtlasSavedReaderCapture,
+        readerTransport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
+        outline: AtlasReaderOutlineTransport? = nil, document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasSavedReaderCapture {
+        guard canFollowDocumentLinks(from: source), ownsDocumentLink(target, from: source),
+              let archive = source.archiveIdentity,
+              readerTransport.comparison?.domain == readerDomain else { throw AtlasSavedError.staleDocumentLink }
+        try Task.checkCancellation()
+        do {
+            let (generation, link) = try await resolveDocumentLink(target, from: source)
+            try Task.checkCancellation()
+            guard canFollowDocumentLinks(from: source), ownsDocumentLink(target, from: source),
+                  relationshipGeneration == generation, let targetMember = link.targetMember else {
+                throw AtlasSavedError.staleDocumentLink
+            }
+            let opened = try await openReader(saved: archive, ordinal: targetMember, expected: nil,
+                origin: .relationship(generation: generation, link: link, side: .target),
+                readerTransport: readerTransport, search: search, outline: outline, document: document)
+            guard !Task.isCancelled, ownsDocumentLink(target, from: source),
+                  relationshipGeneration == generation else {
+                opened.reader.close()
+                throw AtlasSavedError.staleDocumentLink
+            }
+            notice = "Opened the linked captured member. Back returns to the original saved reader; no current-project file was read."
+            return opened
+        } catch {
+            notice = Self.message(error)
+            throw error
+        }
+    }
+
+    private func resolveDocumentLink(_ target: AtlasReaderDocumentLinkTarget, from source: AtlasSavedReaderCapture)
+        async throws -> (UInt64, AtlasSavedLink) {
+        guard canOperate, ownsDocumentLink(target, from: source), let lease = session,
+              let archive = source.archiveIdentity else { throw AtlasSavedError.staleDocumentLink }
+        let flag = AtlasSearchCancellation()
+        cancellation = flag; busy = true
+        defer { finish() }
+        return try await withTaskCancellationHandler(operation: {
+            if relationshipGeneration == nil {
+                let generation = try nextRelationshipGeneration()
+                notice = "Preparing bounded documentation links from the saved archive…"
+                do {
+                    let page = try AtlasSavedRelationships.decode(await run(lease,
+                        .prepareRelationships(generation: generation, links: 4096, bytes: AtlasSavedWire.relationshipBytes), flag: flag),
+                        identity: archive, generation: generation, direction: .all, member: nil, start: 0, limit: 64, preparing: true)
+                    guard session === lease, !flag.isCanceled, ownsDocumentLink(target, from: source) else {
+                        throw AtlasSavedError.staleDocumentLink
+                    }
+                    relationshipGeneration = generation; relationships = page; direction = .all
+                } catch {
+                    // A missing/canceled reply may follow publication. Recover
+                    // metadata once; never replay the build or a source open.
+                    _ = await reconcileRelationships(lease)
+                    throw error
+                }
+            }
+            guard let generation = relationshipGeneration else { throw AtlasSavedError.unavailable }
+            var first: UInt64 = 0
+            var previous: AtlasSavedRelationships?
+            var lastOccurrence: UInt64 = 0
+            while true {
+                try Task.checkCancellation()
+                guard session === lease, !flag.isCanceled, ownsDocumentLink(target, from: source),
+                      relationshipGeneration == generation else { throw AtlasSavedError.staleDocumentLink }
+                let page = try AtlasSavedRelationships.decode(await run(lease,
+                    .relationships(generation: generation, direction: .outgoing, member: source.member.id, start: first, limit: 64),
+                    flag: flag), identity: archive, generation: generation, direction: .outgoing,
+                    member: source.member.id, start: first, limit: 64)
+                guard session === lease, !flag.isCanceled, ownsDocumentLink(target, from: source),
+                      relationshipGeneration == generation,
+                      previous.map({ page.matchesInventory($0) }) != false else { throw AtlasSavedError.staleDocumentLink }
+                for link in page.links {
+                    guard link.sourceOccurrence > lastOccurrence, link.sourceMember == source.member.id,
+                          link.sourceDigest == source.member.digest, link.sourcePath.bytes == source.member.path.bytes,
+                          link.evidenceEnd == source.member.observedBytes else { throw AtlasSavedError.invalidResponse }
+                    lastOccurrence = link.sourceOccurrence
+                    if link.sourceOccurrence == target.link.id {
+                        guard link.matchesDocumentOccurrence(target, source: source.member) else {
+                            throw AtlasSavedError.invalidResponse
+                        }
+                        guard link.canOpenTarget, link.targetMember != nil else { throw AtlasSavedError.unavailableDocumentTarget }
+                        return (generation, link)
+                    }
+                }
+                guard let next = page.next else { throw AtlasSavedError.unindexedDocumentLink }
+                // Wire decoding already proves monotonic, <=4096 pagination.
+                first = next; previous = page
+            }
+        }, onCancel: { flag.cancel(); lease.cancel() })
+    }
+
     func openLink(_ link: AtlasSavedLink, from page: AtlasSavedRelationships, side: AtlasSavedLinkSide, readerTransport: AtlasReaderTransport,
         search: AtlasReaderSearchTransport? = nil, outline: AtlasReaderOutlineTransport? = nil,
         document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasSavedReaderCapture {
@@ -802,7 +920,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 try accepted.validateInitialPage(reader.page)
                 notice = "Opened the exact verified saved member. The independent reader remains usable after this archive is closed."
                 return AtlasSavedReaderCapture(reader: reader, owner: info.identity.owner, member: member, origin: origin,
-                    match: accepted.match)
+                    match: accepted.match, archiveIdentity: info.identity)
             }, onCancel: { flag.cancel(); lease.cancel() })
         } catch {
             // A lost/canceled receipt may have initialized the destination. It
