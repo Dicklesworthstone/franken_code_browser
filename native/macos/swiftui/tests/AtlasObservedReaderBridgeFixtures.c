@@ -7,7 +7,7 @@
 #include <string.h>
 
 enum { CREATE, OPEN, INFO, WINDOW, RETAINED, COPY, CANCEL, CLOSE, POLLS, FIND, HIT, OBSERVE_HIT, LINES, COUNTED_FIND,
-    MATCHING_FIND, MATCHING_COUNTED, COUNTERS };
+    MATCHING_FIND, MATCHING_COUNTED, OCCURRENCES_FIND, OCCURRENCES_COUNTED, RESOLVE_SELECTION, COUNTERS };
 static uint32_t counts[COUNTERS], allocations, frees, encoding_bits;
 static int32_t mode;
 static char *owned;
@@ -89,6 +89,25 @@ char *fcb_observed_reader_copy(uint64_t handle, uint64_t observation, uint64_t s
     assert(handle == handle_value && observation == observation_value);
     assert(start == offset_value + 3 && end == offset_value + 17);
     ++counts[COPY]; return response();
+}
+char *fcb_observed_reader_resolve_selection(uint64_t handle, uint64_t observation,
+    uint64_t utf8_start, uint64_t utf8_end) {
+    assert(handle == handle_value && observation == observation_value);
+    assert(utf8_start == offset_value + 3 && utf8_end == offset_value + 17);
+    ++counts[RESOLVE_SELECTION]; return response();
+}
+char *fcb_observed_reader_find_mode(uint64_t handle, uint64_t generation, const char *needle,
+    uint64_t encoding, uint64_t search_mode, uint64_t case_sensitive, uint64_t count_all_matches,
+    uint64_t max_matches, uint64_t max_scan_bytes, fcb_observed_reader_poll poll, void *context) {
+    assert(handle == handle_value && generation == observation_value);
+    assert(search_mode == 1 && case_sensitive == 1 && count_all_matches <= 1);
+    assert(needle != NULL && strcmp(needle, "exact_\xc3\xa9") == 0);
+    assert(encoding >= 1 && encoding <= 3 && max_matches == 256 && max_scan_bytes == UINT64_C(4294967296));
+    ++counts[OCCURRENCES_FIND]; counts[OCCURRENCES_COUNTED] += (uint32_t)count_all_matches;
+    encoding_bits |= 1u << (unsigned)encoding;
+    poll_context(poll, context);
+    assert(strcmp(needle, "exact_\xc3\xa9") == 0);
+    return response();
 }
 char *fcb_observed_reader_find(uint64_t handle, uint64_t generation, const char *needle,
     uint64_t encoding, uint64_t max_matches, uint64_t max_scan_bytes,

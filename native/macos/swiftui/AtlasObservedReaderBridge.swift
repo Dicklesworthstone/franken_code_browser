@@ -17,6 +17,13 @@ private typealias ObservedReaderPoll = @convention(c) (UnsafeMutableRawPointer?)
     _ poll: ObservedReaderPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_observed_reader_copy") private func observedReaderCopy(
     _ handle: UInt64, _ observation: UInt64, _ start: UInt64, _ end: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_observed_reader_resolve_selection") private func observedReaderResolveSelection(
+    _ handle: UInt64, _ observation: UInt64, _ utf8Start: UInt64, _ utf8End: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_observed_reader_find_mode") private func observedReaderFindMode(
+    _ handle: UInt64, _ generation: UInt64, _ needle: UnsafePointer<CChar>?, _ encoding: UInt64,
+    _ mode: UInt64, _ caseSensitive: UInt64, _ countAllMatches: UInt64,
+    _ maximumMatches: UInt64, _ maximumScanBytes: UInt64,
+    _ poll: ObservedReaderPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_observed_reader_find") private func observedReaderFind(
     _ handle: UInt64, _ generation: UInt64, _ needle: UnsafePointer<CChar>?, _ encoding: UInt64,
     _ maximumMatches: UInt64, _ maximumScanBytes: UInt64,
@@ -63,6 +70,11 @@ extension AtlasObservedReaderTransport {
         search: .init(find: { handle, request, cancellation in
             try observedReaderPolling(cancellation) { poll, context in
                 request.needle.withCString { needle in
+                    if request.mode == .occurrences {
+                        return observedReaderFindMode(handle, request.generation, needle, request.encoding.abi,
+                            1, 1, request.countAllMatches ? 1 : 0,
+                            request.maximumMatches, request.maximumScanBytes, poll, context)
+                    }
                     if !request.caseSensitive {
                         return observedReaderFindMatching(handle, request.generation, needle, request.encoding.abi,
                             0, request.countAllMatches ? 1 : 0, request.maximumMatches, request.maximumScanBytes, poll, context)
@@ -87,7 +99,14 @@ extension AtlasObservedReaderTransport {
             let prefix = range.start - request.offset
             // The host reserves eight bytes for scalar/CRLF boundary floors.
             // Refuse a request whose desired prefix would be shortened there.
-            guard prefix <= request.bytes - range.count - 8 else { throw AtlasObservedReaderError.invalidInput }
+            if witness.mode == .occurrences {
+                guard request.bytes >= 24, range.count <= request.bytes - 24,
+                      prefix >= min(range.start, 8), prefix <= request.bytes - range.count - 16 else {
+                    throw AtlasObservedReaderError.invalidInput
+                }
+            } else {
+                guard prefix <= request.bytes - range.count - 8 else { throw AtlasObservedReaderError.invalidInput }
+            }
             return try observedReaderPolling(cancellation) { poll, context in
                 observedReaderObserveHit(handle, target.generation, target.hit.index, prefix, request.bytes, poll, context)
             }
@@ -96,7 +115,7 @@ extension AtlasObservedReaderTransport {
                 observedReaderLines(handle, request.firstLine, request.lines, request.maximumSelectedBytes,
                     request.maximumScanBytes, request.encoding.abi, poll, context)
             }
-        })
+        }, resolveSelection: { try observedReaderTake(observedReaderResolveSelection($0, $1, $2, $3)) })
 }
 
 private func observedReaderPolling(_ cancellation: AtlasSearchCancellation,

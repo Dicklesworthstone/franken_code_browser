@@ -15,6 +15,11 @@ private enum ObservedSearchFixture {
         out["query_generation"] = String(request.generation); out["search_observation"] = String(observation)
         out["encoding"] = request.encoding.rawValue; out["encoding_basis"] = "explicit-for-this-search"
         out["mode"] = request.wireMode; out["case_sensitive"] = request.caseSensitive
+        if request.mode == .occurrences {
+            out["requested_mode"] = "occurrences"; out["realized_mode"] = "whole-token-occurrences"
+            out["evidence_level"] = "whole-token-text-candidate"; out["includes_comments_and_literals"] = true
+            out["compiler_resolved"] = false; out["semantic_complete"] = false
+        }
         out["retention"] = "literal-witnesses-only"; out["literal_text"] = request.needle
         out["literal_original_hex"] = offsets.isEmpty ? NSNull() : request.originalHex as Any
         out["literal_sha256"] = offsets.isEmpty ? NSNull() : String(repeating: "b", count: 64) as Any
@@ -238,6 +243,15 @@ private final class ObservedSearchProbe: @unchecked Sendable {
             "occurrence_id": String(witness.target.hit.occurrence), "original_range": ObservedReaderFixture.range(hit.start, hit.end),
             "decoded_utf8_range": ObservedReaderFixture.range(decodedStart, decodedStart + UInt64(witness.text.utf8.count)),
             "witness_verified": true, "verification": "equal-original-bytes-in-new-observation"]
+        if witness.mode == .occurrences {
+            var navigation = page["find_hit"] as! [String: Any]
+            navigation["mode"] = "whole-token-occurrences"; navigation["case_sensitive"] = true
+            navigation["requested_mode"] = "occurrences"; navigation["realized_mode"] = "whole-token-occurrences"
+            navigation["evidence_level"] = "whole-token-text-candidate"; navigation["includes_comments_and_literals"] = true
+            navigation["compiler_resolved"] = false; navigation["semantic_complete"] = false
+            navigation["token_boundaries_verified"] = true
+            page["find_hit"] = navigation
+        }
         lock.lock(); pages[owner, default: [:]][id] = page; lock.unlock()
         return try ObservedReaderFixture.encode(page)
     }
@@ -613,7 +627,7 @@ private final class ObservedSearchProbe: @unchecked Sendable {
         probe.failVerifiedJump(); model.goToVerifiedMatch()
         try await wait("failed verified jump") { !model.busy }
         precondition(model.page!.matches(accepted) && model.searchSelection == NSRange(location: 4, length: 4)
-            && model.notice.contains("changed or disappeared"))
+            && model.notice.contains("match or its token boundaries changed"))
         probe.setContent("old\nxxxx\nend\n"); model.goToVerifiedMatch()
         try await wait("changed verified bytes") { !model.busy }
         precondition(model.page!.matches(accepted) && model.selectedSearchWitness?.text == "term",
@@ -687,6 +701,8 @@ private final class ObservedSearchProbe: @unchecked Sendable {
     }
 
     @MainActor static func main() async throws {
+        try occurrenceWireTests()
+        try await occurrenceModelTests()
         try wireTests()
         try lowercaseWireTests()
         try await modelTests()
@@ -828,5 +844,122 @@ private extension AtlasObservedReaderSearchTests {
         precondition(model.searchReport?.matchCountComplete == true && model.searchReport?.matchesSeen == 300
             && model.searchReport?.hits.count == 256 && model.searchReport?.retainedWitnessBytes == 256 * 3)
         model.close(); try await wait("lowercase Find owner retirement") { probe.lifetime.closedCount == probe.lifetime.createCount }
+    }
+}
+
+
+private extension AtlasObservedReaderSearchTests {
+    static func occurrenceWireTests() throws {
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.rs".utf8))
+        let owner: UInt64 = 41
+        let request = try AtlasObservedReaderSearchRequest(generation: 7, needle: "name",
+            encoding: .utf8, countAllMatches: true, mode: .occurrences)
+        precondition(request.mode == .occurrences && request.wireMode == "whole-token-occurrences")
+        rejects("case-insensitive occurrence request") {
+            _ = try AtlasObservedReaderSearchRequest(generation: 1, needle: "name",
+                encoding: .utf8, caseSensitive: false, mode: .occurrences)
+        }
+        rejects("oversized identifier") {
+            _ = try AtlasObservedReaderSearchRequest(generation: 1, needle: String(repeating: "a", count: 1025),
+                encoding: .utf8, mode: .occurrences)
+        }
+        let raw = ObservedSearchFixture.report(owner, input, request, observation: 8,
+            length: 20, offsets: [4, 12], matchesSeen: 2)
+        let report = try AtlasObservedReaderSearchReport.decode(ObservedReaderFixture.encode(raw),
+            handle: owner, input: input, request: request)
+        precondition(report.matchCountComplete && report.matchesSeen == 2 && report.coverage.contains("compiler"))
+        for field in ["requested_mode", "realized_mode", "evidence_level",
+                      "includes_comments_and_literals", "compiler_resolved", "semantic_complete"] {
+            var bad = raw; bad.removeValue(forKey: field)
+            rejects("missing occurrence evidence " + field) {
+                _ = try AtlasObservedReaderSearchReport.decode(ObservedReaderFixture.encode(bad),
+                    handle: owner, input: input, request: request)
+            }
+        }
+        var literal = raw; literal["mode"] = "exact-decoded-text"
+        rejects("literal relabeled as occurrences") {
+            _ = try AtlasObservedReaderSearchReport.decode(ObservedReaderFixture.encode(literal),
+                handle: owner, input: input, request: request)
+        }
+        let target = report.target(for: report.hits[0]), rawWitness = ObservedSearchFixture.witness(raw)
+        let witness = try AtlasObservedReaderSearchWitness.decode(ObservedReaderFixture.encode(rawWitness),
+            handle: owner, input: input, report: report, target: target)
+        precondition(witness.mode == .occurrences && witness.text == "name")
+        var semantic = rawWitness; semantic["compiler_resolved"] = true
+        rejects("compiler claim on spelling witness") {
+            _ = try AtlasObservedReaderSearchWitness.decode(ObservedReaderFixture.encode(semantic),
+                handle: owner, input: input, report: report, target: target)
+        }
+
+        let contextRequest = try AtlasObservedReaderRequest(offset: 0, bytes: 64)
+        var context = ObservedReaderFixture.page(owner, input, 9, contextRequest, length: 9, text: "    name ")
+        let ordinary = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(context),
+            handle: owner, input: input, request: contextRequest)
+        precondition(witness.verify(context: ordinary) == .tokenBoundariesUnverified,
+            "Equal bytes alone cannot prove current identifier boundaries")
+        context["command"] = "observe-hit"
+        var hit: [String: Any] = ["query_generation": "7", "search_observation": "8", "hit_index": "0",
+            "occurrence_id": "1", "original_range": ObservedReaderFixture.range(4, 8),
+            "decoded_utf8_range": ObservedReaderFixture.range(4, 8), "witness_verified": true,
+            "verification": "equal-original-bytes-in-new-observation", "mode": "whole-token-occurrences",
+            "case_sensitive": true, "token_boundaries_verified": true, "requested_mode": "occurrences",
+            "realized_mode": "whole-token-occurrences", "evidence_level": "whole-token-text-candidate",
+            "includes_comments_and_literals": true, "compiler_resolved": false, "semantic_complete": false]
+        context["find_hit"] = hit
+        let verified = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(context),
+            handle: owner, input: input, request: contextRequest, hit: witness)
+        precondition(verified.verifiedSearchSelection == NSRange(location: 4, length: 4))
+        hit["token_boundaries_verified"] = false; context["find_hit"] = hit
+        rejects("unverified identifier boundary") {
+            _ = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(context),
+                handle: owner, input: input, request: contextRequest, hit: witness)
+        }
+        hit.removeValue(forKey: "token_boundaries_verified"); context["find_hit"] = hit
+        rejects("missing identifier boundary proof") {
+            _ = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(context),
+                handle: owner, input: input, request: contextRequest, hit: witness)
+        }
+    }
+
+    @MainActor static func occurrenceModelTests() async throws {
+        // This scheduling fixture uses already-separated names. Shared Rust
+        // tests own identifier grammar and neighbor/buffer boundary correctness.
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.rs".utf8))
+        let probe = ObservedSearchProbe(verifiedNavigation: true); probe.setContent("name name\n")
+        let model = AtlasObservedReaderModel(transport: probe.transport)
+        model.open(.init(input: input, project: UUID(), access: nil))
+        try await wait("occurrence reader opened") { !model.busy && model.page != nil }
+        model.searchText = "name"; model.searchCaseSensitive = false; model.searchMode = .occurrences
+        model.countAllSearchMatches = true; model.find()
+        try await wait("occurrences accepted") { !model.busy && model.searchAuthorized }
+        let report = model.searchReport!, target = report.target(for: report.hits[0])
+        precondition(report.request.mode == .occurrences && report.request.caseSensitive
+            && report.request.countAllMatches && report.matchesSeen == 2)
+        model.selectSearchHit(target)
+        try await wait("occurrence witness") { !model.busy && model.selectedSearchWitness != nil }
+        model.readSearchContext()
+        try await wait("unqualified fresh context") { !model.busy }
+        precondition(model.searchContext == .tokenBoundariesUnverified && model.searchSelection == nil)
+        model.goToVerifiedMatch()
+        try await wait("verified identifier page") { !model.busy }
+        precondition(model.page?.findHit?.tokenBoundariesVerified == true
+            && model.searchSelection == NSRange(location: 0, length: 4))
+        let verifiedPage = model.page!.observation
+        model.searchMode = .text
+        precondition(model.searchReport == nil && model.selectedSearchWitness == nil && !model.searchAuthorized)
+        precondition(model.page?.observation == verifiedPage && model.page?.findHit?.tokenBoundariesVerified == true,
+            "Changing query mode does not rewrite a retained verified page")
+        model.selectSearchHit(target); precondition(model.selectedSearchWitness == nil)
+        model.find()
+        try await wait("literal after occurrences") { !model.busy && model.searchAuthorized }
+        precondition(model.searchReport?.request.mode == .text && model.searchReport?.request.caseSensitive == false)
+        let gate = ObservedReaderGate(); probe.blockFindReply(gate)
+        model.searchMode = .occurrences; model.find()
+        try await wait("occurrence result waiting") { gate.entered }
+        model.searchMode = .text
+        precondition(model.searchReport == nil && !model.searchAuthorized)
+        gate.release(); try await wait("obsolete occurrence drained") { probe.activeCount == 0 }
+        await Task.yield(); precondition(model.searchReport == nil)
+        model.close(); try await wait("occurrence owner retired") { probe.lifetime.closedCount == probe.lifetime.createCount }
     }
 }

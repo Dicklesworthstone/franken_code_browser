@@ -17,6 +17,11 @@ swiftc "$@" -swift-version 6 -warnings-as-errors \
     "$src/AtlasSource.swift" "$src/AtlasObservedReader.swift" "$src/AtlasObservedReaderSearch.swift" "$src/AtlasObservedReaderModel.swift" \
     "$src/tests/AtlasObservedReaderFixture.swift" "$src/tests/AtlasObservedReaderSearchTests.swift" -o "$out/search"
 "$out/search"
+swiftc "$@" -swift-version 6 -warnings-as-errors \
+    "$src/AtlasSearch.swift" "$src/AtlasSearchExpression.swift" "$src/AtlasSearchCoordinator.swift" "$src/AtlasProjectIO.swift" \
+    "$src/AtlasSource.swift" "$src/AtlasObservedReader.swift" "$src/AtlasObservedReaderSearch.swift" "$src/AtlasObservedReaderModel.swift" \
+    "$src/tests/AtlasObservedReaderFixture.swift" "$src/tests/AtlasObservedReaderSelectionTests.swift" -o "$out/selection"
+"$out/selection"
 clang -std=gnu11 -Wall -Wextra -Werror -c "$src/tests/AtlasObservedReaderBridgeFixtures.c" -o "$out/fixture.o"
 swiftc "$@" -swift-version 6 -warnings-as-errors \
     "$src/AtlasSearch.swift" "$src/AtlasSearchExpression.swift" "$src/AtlasSearchCoordinator.swift" \

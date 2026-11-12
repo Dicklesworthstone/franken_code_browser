@@ -104,6 +104,16 @@ enum ObservedReaderFixture {
         }
         return out
     }
+    static func selection(_ page: [String: Any], utf8Start: UInt64, utf8End: UInt64,
+                          originalStart: UInt64, originalEnd: UInt64, text: String,
+                          originalHex: String, replacements: Bool = false) -> [String: Any] {
+        var out = retained(page); out["command"] = "resolve-selection"
+        out["selection_namespace"] = "native-text"; out["window_original_range"] = out["visible_range"]
+        out["window_utf8_range"] = range(utf8Start, utf8End)
+        out["original_range"] = range(originalStart, originalEnd)
+        out["text"] = text; out["original_hex"] = originalHex; out["contains_replacements"] = replacements
+        return out
+    }
     static func failure(_ owner: UInt64, _ code: String) throws -> String {
         try encode(["schema": "fcb.observed-reader/1", "status": "error", "owner": String(owner),
             "exit_code": "2", "error": ["code": code]])
@@ -134,6 +144,9 @@ final class ObservedReaderProbe: @unchecked Sendable {
     private var active = 0, mostActive = 0, creates = 0, opens = 0, copies = 0, restores = 0
     private var gates: [UInt64: ObservedReaderGate] = [:]
     private var lineGates: [UInt64: ObservedReaderGate] = [:]
+    private var selectionGates: [UInt64: ObservedReaderGate] = [:]
+    private var selections = 0
+    private var selectionStarts: [UInt64] = []
     private var nextLineFailure: String?
     private var failureOnNextOpen = false
     private var closeAllowed = true
@@ -151,10 +164,14 @@ final class ObservedReaderProbe: @unchecked Sendable {
             retained: { owner, id in try self.restore(owner, id) },
             copy: { owner, id, start, end in try self.copy(owner, id, start, end) },
             cancel: { _ in true }, close: { self.close($0) }, retirementFailed: { self.failedRetirement() },
-            lines: { owner, request, _ in try self.lines(owner, request) })
+            lines: { owner, request, _ in try self.lines(owner, request) },
+            resolveSelection: { owner, observation, start, end in try self.selection(owner, observation, start, end) })
     }
     func block(_ offset: UInt64, on gate: ObservedReaderGate) { lock.lock(); gates[offset] = gate; lock.unlock() }
     func blockLine(_ first: UInt64, on gate: ObservedReaderGate) { lock.lock(); lineGates[first] = gate; lock.unlock() }
+    func blockSelection(_ start: UInt64, on gate: ObservedReaderGate) { lock.lock(); selectionGates[start] = gate; lock.unlock() }
+    var selectionCount: Int { lock.lock(); defer { lock.unlock() }; return selections }
+    var requestedSelectionStarts: [UInt64] { lock.lock(); defer { lock.unlock() }; return selectionStarts }
     func failLine(_ code: String) { lock.lock(); nextLineFailure = code; lock.unlock() }
     func failOpen() { lock.lock(); failureOnNextOpen = true; lock.unlock() }
     func setCloseAllowed(_ value: Bool) { lock.lock(); closeAllowed = value; lock.unlock() }
@@ -239,6 +256,27 @@ final class ObservedReaderProbe: @unchecked Sendable {
             return try ObservedReaderFixture.failure(owner, "OBSERVED_READER_OBSERVATION_UNAVAILABLE")
         }
         return try ObservedReaderFixture.encode(ObservedReaderFixture.copy(page))
+    }
+    private func selection(_ owner: UInt64, _ id: UInt64, _ start: UInt64, _ end: UInt64) throws -> String? {
+        lock.lock()
+        selections += 1; selectionStarts.append(start)
+        active += 1; mostActive = max(mostActive, active)
+        let retainedPage = pages[owner]?[id], gate = selectionGates.removeValue(forKey: start)
+        lock.unlock()
+        gate?.wait()
+        lock.lock(); defer { active -= 1; lock.unlock() }
+        guard let page = retainedPage, pages[owner]?[id] != nil,
+              let text = page["text"] as? String, let visible = page["visible_range"] as? [String: String],
+              let base = visible["start"].flatMap({ UInt64($0) }), start < end,
+              end <= UInt64(text.utf8.count),
+              let selected = String(bytes: Array(text.utf8)[Int(start)..<Int(end)], encoding: .utf8) else {
+            return try ObservedReaderFixture.failure(owner, "OBSERVED_READER_OBSERVATION_UNAVAILABLE")
+        }
+        // This probe constructs ASCII/UTF-8 receipts. Decoder semantics are
+        // covered by separately authored wire examples and Rust production tests.
+        return try ObservedReaderFixture.encode(ObservedReaderFixture.selection(page,
+            utf8Start: start, utf8End: end, originalStart: base + start, originalEnd: base + end,
+            text: selected, originalHex: ObservedReaderFixture.hex(Array(selected.utf8))))
     }
     private func close(_ owner: UInt64) -> Bool {
         lock.lock(); defer { lock.unlock() }

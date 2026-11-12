@@ -74,11 +74,32 @@ import AppKit
                         .help("Copy the exact original bytes of this retained observation, not a new file read or the decoded selection")
                 }
                 if let source = model.source {
+                    HStack(spacing: 8) {
+                        if model.resolvingTextSelection { ProgressView().controlSize(.small) }
+                        Text(model.textSelectionNotice.isEmpty
+                            ? "Select text to copy its exact original bytes or observed-source location."
+                            : model.textSelectionNotice)
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                        Spacer()
+                        Menu("Copy selection") {
+                            Button("Copy selected text") { copySelected(.text) }
+                            Button("Copy text with location") { copySelected(.withLocation) }
+                            Button("Copy selected original hex") { copySelected(.originalHex) }
+                        }
+                        .disabled(!model.canCopySelection)
+                        .help("Copy this exact retained observation; other file ranges remain unknown")
+                        if model.hasTextSelectionIntent && model.textSelection == nil && !model.resolvingTextSelection {
+                            Button("Retry selection", action: model.retryTextSelection).disabled(model.busy)
+                        }
+                    }.controlSize(.small)
                     AtlasSourceReader(source: source, navigation: model.navigation,
                         selection: model.searchSelection.map { AtlasReaderSelection(source: source, range: $0) },
                         wrapsLines: wrapsLines, showsLineNumbers: showsLineNumbers,
                         showsWhitespace: showsWhitespace, firstPhysicalLine: page.firstPhysicalLine,
-                        backgroundColor: Monokai.background, foregroundColor: Monokai.color("plain")) {
+                        backgroundColor: Monokai.background, foregroundColor: Monokai.color("plain"),
+                        onSelectionChange: { source, navigation, range in
+                            model.updateTextSelection(source: source, navigation: navigation, range: range)
+                        }) {
                             AtlasDocument.style(text: source.text, runs: [])
                         }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -94,7 +115,7 @@ import AppKit
                 Text(model.notice).textSelection(.enabled)
                 if !copyNotice.isEmpty { Text(copyNotice) }
                 Text(model.coverage)
-                Text("Selected text copies the displayed decoding. Original hex copies exact bytes. At most eight observations are retained; an evicted range is unavailable until you explicitly observe it again.")
+                Text("Copy selection preserves the displayed decoding, original selected bytes, or extent provenance. Original hex copies the whole visible observation. At most eight observations are retained; an evicted range is unavailable until you explicitly observe it again.")
             }
             .font(.caption).foregroundStyle(.secondary)
         }
@@ -103,6 +124,8 @@ import AppKit
         .onDisappear { presentation.close() }
         .onChange(of: model.navigation) { _, _ in copyNotice = "" }
         .onChange(of: model.searchText) { _, _ in copyNotice = "" }
+        .onChange(of: model.searchMode) { _, _ in copyNotice = "" }
+        .onChange(of: model.textSelection?.id) { _, _ in copyNotice = "" }
         .onChange(of: model.searchCaseSensitive) { _, _ in copyNotice = "" }
         .onChange(of: model.countAllSearchMatches) { _, _ in copyNotice = "" }
         .onChange(of: model.encoding) { _, _ in copyNotice = "" }
@@ -184,10 +207,11 @@ import AppKit
     private var searchControls: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 7) {
-                TextField("Find text in the opened file", text: $model.searchText)
+                TextField(model.searchMode == .occurrences ? "Find exact identifier" : "Find text in the opened file", text: $model.searchText)
                     .textFieldStyle(.roundedBorder).focused($searchFocused).onSubmit(model.find)
-                    .accessibilityLabel("Text to find in the opened file")
-                    .help("Literal text with optional Unicode lowercase matching. Up to 4096 UTF-8 bytes; NUL is unsupported.")
+                    .accessibilityLabel(model.searchMode == .occurrences ? "Exact identifier in the opened file" : "Text to find in the opened file")
+                    .help(model.searchMode == .occurrences ? "One exact identifier, up to 1024 UTF-8 bytes. Includes comments and literals; compiler references are not established."
+                        : "Literal text with optional Unicode lowercase matching. Up to 4096 UTF-8 bytes; NUL is unsupported.")
                 Picker("Scan up to", selection: $model.searchScanBytes) {
                     Text("16 MiB").tag(UInt64(16 * 1024 * 1024))
                     Text("256 MiB").tag(AtlasObservedReaderSearchLimits.scanBytes)
@@ -199,8 +223,14 @@ import AppKit
                 Button("Next match", action: model.nextSearchHit).disabled(!model.canSelectSearchHit)
             }
             HStack(spacing: 7) {
-                Toggle("Match case", isOn: $model.searchCaseSensitive).toggleStyle(.checkbox)
-                    .help("When off, use Unicode lowercase matching and retain the original spelling and byte ranges")
+                Picker("Find mode", selection: $model.searchMode) {
+                    ForEach(AtlasObservedReaderSearchMode.allCases) { Text($0.label).tag($0) }
+                }.frame(width: 165)
+                Toggle("Match case", isOn: Binding(get: { model.searchMode == .occurrences || model.searchCaseSensitive },
+                    set: { model.searchCaseSensitive = $0 })).toggleStyle(.checkbox)
+                    .disabled(model.searchMode == .occurrences)
+                    .help(model.searchMode == .occurrences ? "Whole identifiers always use exact case."
+                        : "When off, use Unicode lowercase matching and retain the original spelling and byte ranges")
                 Toggle("Count all matches", isOn: $model.countAllSearchMatches).toggleStyle(.checkbox)
                     .help("Continue counting after the first 256 retained matches, within the selected scan and read-call limits")
                 Text(model.countAllSearchMatches
@@ -208,12 +238,14 @@ import AppKit
                     : "Find stops at the first match beyond the retained-result limit.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
-            Text("Find starts at byte 0 using the selected decoding, with at most 256 retained matches. A scan limit or file change leaves the total count unknown.")
+            Text(model.searchMode == .occurrences
+                ? "Occurrences use shared whole-token rules and exact spelling, including comments and literals. Compiler resolution is not claimed. Scanning starts at byte 0; at most 256 matches are retained."
+                : "Find starts at byte 0 using the selected decoding, with at most 256 retained matches. A scan limit or file change leaves the total count unknown.")
                 .font(.caption2).foregroundStyle(.secondary)
             if let report = model.searchReport {
                 HStack(alignment: .top, spacing: 12) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(report.countLabel).font(.caption.bold())
+                        Text(report.request.mode.label + " · " + report.countLabel).font(.caption.bold())
                         if !report.hits.isEmpty {
                             ScrollView {
                                 LazyVStack(alignment: .leading, spacing: 2) {
@@ -237,7 +269,7 @@ import AppKit
                     }.frame(minWidth: 230, alignment: .leading)
                     if let witness = model.selectedSearchWitness {
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("Verified retained literal · \(witness.encoding.label)").font(.caption.bold())
+                            Text((witness.mode == .occurrences ? "Retained identifier" : "Verified retained literal") + " · \(witness.encoding.label)").font(.caption.bold())
                             ScrollView {
                                 Text(verbatim: witness.text).font(.system(.caption, design: .monospaced))
                                     .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
@@ -270,6 +302,29 @@ import AppKit
                     Text(context.message).font(.caption).foregroundStyle(context.selection == nil ? .secondary : .primary)
                 }
             }
+        }
+    }
+
+    private enum SelectionCopyFormat { case text, withLocation, originalHex }
+    private func copySelected(_ format: SelectionCopyFormat) {
+        guard model.canCopySelection, let selection = model.textSelection else { return }
+        let value: String
+        switch format {
+        case .text: value = selection.text
+        case .withLocation: value = selection.withLocationText
+        case .originalHex: value = selection.originalHex
+        }
+        let pasteboard = NSPasteboard.general, expected = NSPasteboard.general.changeCount
+        guard model.canCopySelection, model.textSelection?.id == selection.id else { return }
+        switch AtlasReaderSelectionClipboard.publish(value, to: pasteboard, expectedChangeCount: expected) {
+        case .copied:
+            copyNotice = "Copied the selected retained observation; no source bytes were reread."
+        case .tooLarge:
+            copyNotice = "The selection exceeds the 2 MiB clipboard staging budget. Select a smaller passage; nothing was copied."
+        case .changed:
+            copyNotice = "The clipboard changed before publication. Its newer contents were preserved; copy again to replace them."
+        case .failed:
+            copyNotice = "Clipboard publication failed. Its contents may have changed; no rollback was attempted."
         }
     }
 

@@ -155,8 +155,26 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     private(set) var searchContext: AtlasObservedReaderSearchContext?
     private(set) var externalContext: AtlasObservedReaderSearchContext?
     private(set) var searchSelection: NSRange?
+    private(set) var textSelection: AtlasObservedReaderSelection?
+    private(set) var resolvingTextSelection = false
+    private(set) var hasTextSelectionIntent = false
+    private(set) var textSelectionNotice = ""
+    private struct TextSelectionIntent {
+        let id: UUID
+        let source: AtlasSource
+        let navigation: UUID
+        let page: AtlasObservedReaderPage
+        let range: NSRange
+    }
+    @ObservationIgnored private var textSelectionIntent: TextSelectionIntent?
+    @ObservationIgnored private var pendingTextSelection: TextSelectionIntent?
+    @ObservationIgnored private var textSelectionTask: Task<Void, Never>?
+    @ObservationIgnored private var textSelectionFlag: AtlasSearchCancellation?
     private(set) var searching = false
     private(set) var searchAuthorized = false
+    var searchMode: AtlasObservedReaderSearchMode = .text {
+        didSet { if oldValue != searchMode { revokeSearch() } }
+    }
     var searchText = "" {
         didSet { if !oldValue.utf8.elementsEqual(searchText.utf8) { revokeSearch() } }
     }
@@ -201,7 +219,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     private var historyIndex = 0
 
     init(transport: AtlasObservedReaderTransport) { self.transport = transport }
-    deinit { task?.cancel() }
+    deinit { task?.cancel(); textSelectionTask?.cancel() }
 
     static func retryRetirements() { AtlasObservedReaderRetirement.shared.retry() }
 
@@ -216,11 +234,19 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     var canReadLines: Bool { canObserve && transport.lines != nil && (try? lineRequest()) != nil }
     var canReopen: Bool { !closed && authority != nil }
     var canCopy: Bool { !busy && page != nil && session != nil && !closed }
+    var canCopySelection: Bool {
+        guard !closed, !busy, let selection = textSelection, let page,
+              let intent = textSelectionIntent else { return false }
+        return source === intent.source && navigation == intent.navigation
+            && page.observation == selection.observation && page.visibleRange == selection.visibleRange
+            && intent.range == selection.nativeRange
+    }
+    private var effectiveSearchCaseSensitive: Bool { searchMode == .occurrences || searchCaseSensitive }
     var canSearch: Bool {
         !closed && session != nil && transport.search != nil && lastSearchGeneration < UInt64.max
             && (try? AtlasObservedReaderSearchRequest(generation: 1, needle: searchText,
                 encoding: encoding, maximumScanBytes: searchScanBytes,
-                countAllMatches: countAllSearchMatches, caseSensitive: searchCaseSensitive)) != nil
+                countAllMatches: countAllSearchMatches, caseSensitive: effectiveSearchCaseSensitive, mode: searchMode)) != nil
     }
     var canSelectSearchHit: Bool {
         searchAuthorized && !closed && !busy && session != nil && !(searchReport?.hits.isEmpty ?? true)
@@ -257,6 +283,90 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
             message += " Physical line labels and retained bytes came from the same bounded prefix scan. Matching before/after metadata does not make the scan atomic."
         } else { message += " Layout and line labels are local to this range." }
         return message + " Back/Forward and original-byte copy use retained observations without rereading. Reopen current file explicitly follows pathname replacement."
+    }
+
+    /// Dragging retains only a small native descriptor. One draining task and
+    /// one newest descriptor share the reader's bounded worker; selection never
+    /// starts filesystem work or cancels a foreground navigation.
+    func updateTextSelection(source: AtlasSource, navigation: UUID, range: NSRange?) {
+        guard self.source === source, self.navigation == navigation, let page else { return }
+        guard let range, range.length != 0 else { clearTextSelection(); return }
+        if let intent = textSelectionIntent, intent.source === source,
+           intent.navigation == navigation, intent.range == range,
+           textSelection != nil || resolvingTextSelection { return }
+        let intent = TextSelectionIntent(id: UUID(), source: source, navigation: navigation,
+            page: page, range: range)
+        textSelectionIntent = intent; hasTextSelectionIntent = true; textSelection = nil
+        textSelectionFlag?.cancel()
+        guard transport.resolveSelection != nil else {
+            pendingTextSelection = nil; resolvingTextSelection = false
+            textSelectionNotice = "Exact selected-source actions are unavailable for this connection."
+            return
+        }
+        pendingTextSelection = intent; resolvingTextSelection = true
+        textSelectionNotice = busy ? "Selection waits for the reader operation to finish."
+            : "Resolving the selection against retained observed bytes…"
+        startTextSelectionWork()
+    }
+
+    func retryTextSelection() {
+        guard let intent = textSelectionIntent, self.source === intent.source,
+              navigation == intent.navigation, !busy, !closed else { return }
+        textSelectionIntent = nil
+        updateTextSelection(source: intent.source, navigation: intent.navigation, range: intent.range)
+    }
+
+    private func suspendTextSelection() {
+        guard let intent = textSelectionIntent else { return }
+        textSelection = nil; pendingTextSelection = intent; resolvingTextSelection = true
+        textSelectionNotice = "Resolving the displayed selection after the reader operation…"
+        textSelectionFlag?.cancel(); textSelectionTask?.cancel()
+    }
+
+    private func clearTextSelection() {
+        textSelectionIntent = nil; pendingTextSelection = nil; textSelection = nil
+        hasTextSelectionIntent = false; resolvingTextSelection = false; textSelectionNotice = ""
+        textSelectionFlag?.cancel(); textSelectionTask?.cancel()
+    }
+
+    private func startTextSelectionWork() {
+        guard textSelectionTask == nil, pendingTextSelection != nil, !busy, !closed else { return }
+        textSelectionTask = Task {
+            defer {
+                textSelectionTask = nil; textSelectionFlag = nil
+                startTextSelectionWork()
+            }
+            while !Task.isCancelled, !busy, !closed, let intent = pendingTextSelection {
+                pendingTextSelection = nil
+                guard textSelectionIntent?.id == intent.id, self.source === intent.source,
+                      navigation == intent.navigation, let session, let input = authority?.input,
+                      let resolve = session.transport.resolveSelection else { continue }
+                let cancellation = AtlasSearchCancellation(); textSelectionFlag = cancellation
+                let selectedPage = intent.page, nativeRange = intent.range
+                do {
+                    let resolved = try await io.perform(cancellation: cancellation, keepingAlive: [session]) {
+                        let request = try AtlasObservedReaderSelectionRequest(page: selectedPage, nativeRange: nativeRange)
+                        guard !cancellation.isCanceled else { throw AtlasObservedReaderError.canceled }
+                        return try AtlasObservedReaderSelection.decode(
+                            resolve(session.handle, selectedPage.observation.id, request.utf8Start, request.utf8End),
+                            input: input, request: request)
+                    }
+                    guard !Task.isCancelled, !cancellation.isCanceled, !busy, !closed,
+                          textSelectionIntent?.id == intent.id, self.session === session,
+                          self.source === intent.source, navigation == intent.navigation,
+                          page?.observation == intent.page.observation,
+                          page?.visibleRange == intent.page.visibleRange else { continue }
+                    textSelection = resolved; resolvingTextSelection = false
+                    textSelectionNotice = resolved.summary
+                } catch {
+                    guard !Task.isCancelled, !busy, !closed, textSelectionIntent?.id == intent.id,
+                          self.source === intent.source, navigation == intent.navigation else { continue }
+                    textSelection = nil; resolvingTextSelection = false
+                    textSelectionNotice = "The selected range could not be resolved exactly. Retry a complete character range. "
+                        + message(error)
+                }
+            }
+        }
     }
 
     func open(_ source: AtlasObservedReaderSource) {
@@ -441,8 +551,13 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         do {
             request = try .init(generation: lastSearchGeneration + 1, needle: searchText,
                 encoding: encoding, maximumScanBytes: searchScanBytes,
-                countAllMatches: countAllSearchMatches, caseSensitive: searchCaseSensitive)
-        } catch { notice = "Enter text of 1–4096 UTF-8 bytes without NUL, and choose a bounded scan limit."; return }
+                countAllMatches: countAllSearchMatches, caseSensitive: effectiveSearchCaseSensitive, mode: searchMode)
+        } catch {
+            notice = searchMode == .occurrences
+                ? "Enter one exact identifier of at most 1024 UTF-8 bytes, and choose a bounded scan limit."
+                : "Enter text of 1–4096 UTF-8 bytes without NUL, and choose a bounded scan limit."
+            return
+        }
         lastSearchGeneration = request.generation
         // A replacement can commit in Rust before its reply is canceled or
         // rejected. Old literal bytes stay readable, but their query cannot
@@ -460,7 +575,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
                       searchText.utf8.elementsEqual(request.needle.utf8), encoding == request.encoding,
                       searchScanBytes == request.maximumScanBytes,
                       countAllSearchMatches == request.countAllMatches,
-                      searchCaseSensitive == request.caseSensitive else { return }
+                      effectiveSearchCaseSensitive == request.caseSensitive, searchMode == request.mode else { return }
                 guard report.observation > latestObservation else { throw AtlasObservedReaderError.invalidResponse }
                 latestObservation = report.observation
                 searchReport = report; searchAuthorized = true; selectedSearchWitness = nil; clearSearchContext()
@@ -553,7 +668,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         let request: AtlasObservedReaderRequest
         do {
             request = try .init(offset: range.start - before,
-                bytes: max(pageBytes, before + range.count + AtlasObservedReaderLimits.contextBytes),
+                bytes: max(pageBytes, before + range.count + (witness.mode == .occurrences ? 24 : AtlasObservedReaderLimits.contextBytes)),
                 encoding: witness.encoding)
         } catch { notice = AtlasObservedReaderError.invalidInput.message; return }
         let (ticket, flag) = begin("Reading fresh context and verifying the selected match…")
@@ -583,25 +698,28 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         // page receipt or make its exact highlight disappear during a failed
         // replacement operation.
         let retainedSelection = page?.verifiedSearchSelection
-        if searchSelection != retainedSelection { navigation = UUID() }
+        if searchSelection != retainedSelection { clearTextSelection(); navigation = UUID() }
         searchSelection = retainedSelection; searchContext = nil; externalContext = nil
     }
     private func revokeSearch() {
         if searchOperation { cancelWork() }
         searchReport = nil; searchAuthorized = false; selectedSearchWitness = nil; clearSearchContext()
+        startTextSelectionWork()
     }
     private func revokeLineRequest() {
         guard lineOperation else { return }
         cancelWork()
         notice = "Line request changed. The accepted observation is unchanged; the earlier scan may still be draining."
+        startTextSelectionWork()
     }
 
     func cancel() {
         cancelWork()
         notice = "Operation canceled. Accepted observations and retained search literals are unchanged; entered work may still be draining."
+        startTextSelectionWork()
     }
     func close() {
-        cancelWork(); closed = true
+        cancelWork(); clearTextSelection(); closed = true
         session = nil; pendingSession = nil; authority = nil
         info = nil; page = nil; source = nil; history = []; historyIndex = 0
         latestObservation = 0
@@ -615,6 +733,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         return (ticket, flag)
     }
     private func cancelWork() {
+        suspendTextSelection()
         operation = UUID(); flag?.cancel(); task?.cancel(); io.cancel()
         session?.cancel(); pendingSession?.cancel()
         task = nil; flag = nil; pendingSession = nil; busy = false; searching = false; searchOperation = false; lineOperation = false
@@ -625,6 +744,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     private func finish(_ ticket: UUID) {
         guard operation == ticket else { return }
         busy = false; flag = nil; task = nil; pendingSession = nil; searching = false; searchOperation = false; lineOperation = false
+        startTextSelectionWork()
     }
     private func fail(_ error: Error, ticket: UUID) {
         guard operation == ticket else { return }
@@ -635,8 +755,10 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         if let error = error as? AtlasObservedReaderError {
             if case .engine(let code) = error {
                 switch code {
+                case "STREAM_READ_INVALID_IDENTIFIER":
+                    return "Enter one exact identifier without spaces or ASCII punctuation other than _ and $. An identifier cannot start with an ASCII digit."
                 case "OBSERVED_READER_SEARCH_HIT_CHANGED":
-                    return "The selected match changed or disappeared. The accepted page is unchanged. Run Find again, or read current context explicitly."
+                    return "The selected match or its token boundaries changed. The accepted page is unchanged. Run Find again, or read current context explicitly."
                 case "OBSERVED_READER_LINE_MISSING":
                     return "The scan reached the end of the opened file before the requested line. The accepted page is unchanged."
                 case "OBSERVED_READER_LINE_SCAN_BYTE_LIMIT":
@@ -654,6 +776,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         return AtlasObservedReaderError.invalidResponse.message
     }
     private func install(_ page: AtlasObservedReaderPage, append: Bool) {
+        clearTextSelection()
         clearSearchContext()
         // Updating controls to an accepted historical request must not revoke
         // the operation that is installing that exact immutable receipt.

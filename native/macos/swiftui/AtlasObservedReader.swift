@@ -334,6 +334,129 @@ struct AtlasObservedReaderCopy: Sendable {
     }
 }
 
+/// Native coordinates name one displayed observation. UTF-16 to UTF-8
+/// conversion happens on the worker; only the retained Rust decoder maps those
+/// display coordinates to original bytes.
+struct AtlasObservedReaderSelectionRequest: Sendable {
+    let page: AtlasObservedReaderPage
+    let nativeRange: NSRange
+    let utf8Start, utf8End: UInt64
+    let text: String
+
+    init(page: AtlasObservedReaderPage, nativeRange: NSRange) throws {
+        guard page.visibleRange.count <= AtlasObservedReaderLimits.maximumPageBytes,
+              page.text.utf8.count <= Int(AtlasObservedReaderLimits.maximumPageBytes * 3),
+              AtlasObservedReaderWire.validHex(page.originalHex, bytes: page.visibleRange.count) else {
+            throw AtlasObservedReaderError.invalidInput
+        }
+        let native = page.text as NSString
+        guard nativeRange.location != NSNotFound, nativeRange.location >= 0,
+              nativeRange.length > 0, nativeRange.location <= native.length,
+              nativeRange.length <= native.length - nativeRange.location,
+              native.rangeOfComposedCharacterSequences(for: nativeRange) == nativeRange,
+              let range = Range(nativeRange, in: page.text) else {
+            throw AtlasObservedReaderError.invalidInput
+        }
+        let start = page.text.utf8.distance(from: page.text.utf8.startIndex, to: range.lowerBound)
+        let end = page.text.utf8.distance(from: page.text.utf8.startIndex, to: range.upperBound)
+        guard start >= 0, start < end else { throw AtlasObservedReaderError.invalidInput }
+        self.page = page; self.nativeRange = nativeRange
+        utf8Start = UInt64(start); utf8End = UInt64(end); text = String(page.text[range])
+    }
+}
+
+/// Exact selected bytes of one immutable observed extent. This does not claim
+/// that unseen ranges were captured or that the whole file had one revision.
+struct AtlasObservedReaderSelection: Sendable, Identifiable {
+    let id: UUID
+    let observation: AtlasObservedReaderObservation
+    let visibleRange: AtlasObservedByteRange
+    let nativeRange: NSRange
+    let utf8Start, utf8End: UInt64
+    let originalRange: AtlasObservedByteRange
+    let text, originalHex, withLocationText: String
+    let containsReplacements: Bool
+
+    var summary: String {
+        "Selected original bytes \(originalRange.start)..<\(originalRange.end) · observation \(observation.id)"
+            + (containsReplacements ? " · decoded text includes replacement characters." : " · line endings preserved.")
+    }
+
+    static func decode(_ json: String?, input: AtlasObservedReaderInput,
+                       request: AtlasObservedReaderSelectionRequest) throws -> Self {
+        let page = request.page, owner = request.page.observation.identity.owner
+        let data = try AtlasObservedReaderWire.admit(json, handle: owner)
+        do {
+            let decoder = JSONDecoder(), w = try decoder.decode(Wire.self, from: data)
+            let identity = try decoder.decode(AtlasObservedReaderWire.Header.self, from: data)
+                .identity(handle: owner, input: input, command: "resolve-selection")
+            let basis = try decoder.decode(AtlasObservedReaderWire.Observation.self, from: data)
+            let observation = try basis.value(identity: identity, reads: false, lineNavigation: w.line_navigation)
+            guard observation == page.observation, w.line_navigation == page.lineNavigation,
+                  w.selection_namespace == "native-text", w.window_original_range == page.visibleRange,
+                  w.window_utf8_range.start == request.utf8Start, w.window_utf8_range.end == request.utf8End,
+                  w.original_range.count > 0, page.visibleRange.contains(w.original_range),
+                  w.original_range.count <= AtlasObservedReaderLimits.maximumPageBytes,
+                  w.text.utf8.elementsEqual(request.text.utf8),
+                  AtlasObservedReaderWire.validHex(w.original_hex, bytes: w.original_range.count),
+                  !w.contains_replacements || page.hasReplacements,
+                  !w.contains_replacements || w.text.unicodeScalars.contains(where: { $0.value == 0xfffd }) else {
+                throw AtlasObservedReaderError.invalidResponse
+            }
+            let raw = Array(page.originalHex.utf8)
+            let start = Int((w.original_range.start - page.visibleRange.start) * 2)
+            let end = Int((w.original_range.end - page.visibleRange.start) * 2)
+            guard raw[start..<end].elementsEqual(w.original_hex.utf8) else {
+                throw AtlasObservedReaderError.invalidResponse
+            }
+            let encoding = observation.request.encoding
+            let encoded = AtlasObservedReaderSearchRequest.originalBytes(w.text, encoding: encoding)
+            let roundTrips = AtlasObservedReaderWire.hex(encoded) == w.original_hex
+            guard roundTrips == !w.contains_replacements else { throw AtlasObservedReaderError.invalidResponse }
+            if !page.hasReplacements {
+                // Encoding a qualified lossless prefix is a receipt correlation
+                // check, not another source decoder. Equal words elsewhere in
+                // the page cannot lend their offsets to this native selection.
+                guard let range = Range(request.nativeRange, in: page.text),
+                      AtlasObservedReaderWire.hex(AtlasObservedReaderSearchRequest.originalBytes(page.text,
+                        encoding: encoding)) == page.originalHex else { throw AtlasObservedReaderError.invalidResponse }
+                let prefixBytes = AtlasObservedReaderSearchRequest.originalBytes(
+                    String(page.text[..<range.lowerBound]), encoding: encoding).count
+                guard w.original_range.start == page.visibleRange.start + UInt64(prefixBytes),
+                      w.original_range.end == w.original_range.start + UInt64(encoded.count) else {
+                    throw AtlasObservedReaderError.invalidResponse
+                }
+            }
+            let provenance: [String: Any] = [
+                "source": "retained-observed-extent", "whole_file_immutable": false,
+                "owner": String(owner), "file_id": String(identity.file), "observation": String(observation.id),
+                "extent_sha256": observation.extentSHA256,
+                "captured_range": ["start": String(observation.capturedRange.start), "end": String(observation.capturedRange.end)],
+                "original_range": ["start": String(w.original_range.start), "end": String(w.original_range.end)],
+                "path": ["encoding": "unix-bytes", "hex": AtlasObservedReaderWire.hex(identity.path),
+                         "display": identity.displayPath],
+                "encoding": encoding.rawValue, "copy_representation": "logical-unicode",
+                "line_endings": "preserved", "contains_replacements": w.contains_replacements
+            ]
+            let location = String(decoding: try JSONSerialization.data(withJSONObject: provenance,
+                options: [.sortedKeys]), as: UTF8.self)
+            return Self(id: UUID(), observation: observation, visibleRange: page.visibleRange,
+                nativeRange: request.nativeRange, utf8Start: request.utf8Start, utf8End: request.utf8End,
+                originalRange: w.original_range, text: w.text, originalHex: w.original_hex,
+                withLocationText: "FCB observed selection (original byte offsets; other ranges unknown)\n"
+                    + location + "\n\n" + w.text,
+                containsReplacements: w.contains_replacements)
+        } catch { throw AtlasObservedReaderError.invalidResponse }
+    }
+    private struct Wire: Decodable {
+        let selection_namespace: String
+        let window_original_range, window_utf8_range, original_range: AtlasObservedByteRange
+        let text, original_hex: String
+        let contains_replacements: Bool
+        let line_navigation: AtlasObservedReaderLineNavigation?
+    }
+}
+
 struct AtlasObservedReaderTransport: Sendable {
     let create: @Sendable () -> UInt64
     let open: @Sendable (UInt64, AtlasObservedReaderInput, AtlasSearchCancellation) throws -> String?
@@ -346,6 +469,7 @@ struct AtlasObservedReaderTransport: Sendable {
     let retirementFailed: @Sendable () -> Void
     var search: AtlasObservedReaderSearchTransport? = nil
     var lines: (@Sendable (UInt64, AtlasObservedReaderLineRequest, AtlasSearchCancellation) throws -> String?)? = nil
+    var resolveSelection: (@Sendable (UInt64, UInt64, UInt64, UInt64) throws -> String?)? = nil
 }
 
 // Shared by the bounded range and search receipts. Neither admits a complete
