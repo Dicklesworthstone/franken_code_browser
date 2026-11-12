@@ -11,6 +11,7 @@ mod index;
 mod catalog;
 mod expression;
 mod structure;
+mod matching;
 
 use std::{ffi::OsString, fs::{self, File, OpenOptions}, io::{self, Write}, path::{Path, PathBuf}, sync::Arc};
 use fcb::{ByteLength, ByteOffset, ByteRange};
@@ -32,6 +33,13 @@ const HELP: &str = "fcb snapshot save ROOT --output NEW_FILE [--json] [--respect
 fcb snapshot catalog FILE --output NEW_CATALOG [--json]\n\
 fcb snapshot inspect FILE [--json] [--limit N]\n\
 fcb snapshot search FILE (--text LITERAL | --raw-hex HEX | --query EXPRESSION) [--json] [--limit N]\n\
+Literal options: --ignore-case (text only), --count-all (text or raw bytes).\n\
+Complete --count-all exits 0 for a positive total or 1 for zero, even when rows are capped.\n\
+Incomplete saved coverage exits 3; ordinary capped searches also exit 3.\n\
+--ignore-case uses Unicode scalar lowercase, not full case folding or canonical normalization.\n\
+--count-all finishes the saved scope while retaining at most --limit N hits; --limit 0 counts only.\n\
+Exact counts, saved-scope coverage and retained-hit truncation are reported separately.\n\
+These matching/count options are not supported by expression or structure queries.\n\
 fcb snapshot structure FILE --mode symbols|headings|occurrences --name TEXT [--json]\n\
 fcb snapshot read FILE (--member NAME | --member-hex HEX) [--json]\n\
 fcb snapshot index help  # Build/reopen pinned substring indexes\n\
@@ -66,6 +74,7 @@ struct Settings {
     expression: Option<String>, max_scan_bytes: u64,
     structure_mode: Option<StructureMode>, structure_name: Option<String>,
     name_mode: SymbolNameMode, max_structure_source_bytes: u64,
+    ignore_case: bool, count_all_matches: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Effect { None, Incomplete, Written, Synced }
@@ -127,7 +136,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
         limit: 100, limits: WorkspaceLimits::default(), include_excluded: false, respect_ignores: false,
         catalog: None, catalog_pin: None, expression: None, max_scan_bytes: 256 * 1024 * 1024,
         structure_mode: None, structure_name: None, name_mode: SymbolNameMode::Exact,
-        max_structure_source_bytes: MAX_STRUCTURE_SOURCE_BYTES };
+        max_structure_source_bytes: MAX_STRUCTURE_SOURCE_BYTES, ignore_case: false, count_all_matches: false };
     let mut seen = 0u32;
     let mut cursor = usize::from(!args.is_empty());
     let mut positional = false;
@@ -144,6 +153,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 "--catalog" => 65536, "--catalog-digest" => 131072, "--respect-ignores" => 262144,
                 "--query" => 524288, "--max-scan-bytes" => 1048576,
                 "--mode" => 2097152, "--name" => 4194304, "--name-mode" => 8388608, "--max-source-bytes" => 16777216,
+                "--ignore-case" => 33554432, "--count-all" => 67108864,
                 _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")), };
             if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
             seen |= bit;
@@ -151,6 +161,8 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
             if option == "--include-excluded" { settings.include_excluded = true; continue; }
             if option == "--respect-ignores" { settings.respect_ignores = true; continue; }
             if option == "--raw" { settings.raw = true; continue; }
+            if option == "--ignore-case" { settings.ignore_case = true; continue; }
+            if option == "--count-all" { settings.count_all_matches = true; continue; }
             let value = args.get(cursor).ok_or_else(|| Failure::new("CLI_MISSING_VALUE"))?; cursor += 1;
             if option == "--output" || option == "--catalog" {
                 if value.is_empty() { return Err(Failure::new("CLI_MISSING_VALUE")); }
@@ -222,8 +234,10 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
         Mode::Inspect => settings.source.is_some() && seen & !(1 | 8 | catalog_options) == 0,
         Mode::Search => settings.source.is_some()
             && usize::from(settings.text.is_some()) + usize::from(settings.raw_needle.is_some()) + usize::from(settings.expression.is_some()) == 1
-            && seen & !(1 | 4 | 8 | 32768 | catalog_options | 524288 | 1048576) == 0
-            && (seen & 1048576 == 0 || settings.expression.is_some()),
+            && seen & !(1 | 4 | 8 | 32768 | catalog_options | 524288 | 1048576 | 33554432 | 67108864) == 0
+            && (seen & 1048576 == 0 || settings.expression.is_some())
+            && (!settings.ignore_case || settings.text.is_some())
+            && (!settings.count_all_matches || settings.expression.is_none()),
         Mode::Structure => settings.source.is_some() && settings.structure_mode.is_some() && settings.structure_name.is_some()
             && seen & !(1 | 8 | catalog_options | 2097152 | 4194304 | 8388608 | 16777216) == 0
             && (settings.structure_mode != Some(StructureMode::Occurrences) || settings.name_mode == SymbolNameMode::Exact),

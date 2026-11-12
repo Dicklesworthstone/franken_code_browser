@@ -62,27 +62,29 @@ pub(super) fn execute(options: &Options, out: &mut Output, budget: &ResourceBudg
             EXIT_PARTIAL
         } else { EXIT_OK });
     }
-    let needle = match (&options.text, &options.raw) {
-        (Some(text), None) => IndexedNeedle::text(owner(), text, budget, allocation(157)),
-        (None, Some(bytes)) => IndexedNeedle::raw(owner(), bytes, budget, allocation(157)),
-        _ => return Err(Failure::new("CLI_INVALID_NEEDLE")),
-    }.map_err(|error| Failure::new(&error.to_string()))?;
-    let opts = PagedQueryOptions { generation: generation(), first_file: file_id(), first_revision: revision(), max_matches: options.limit };
-    let mut query = PagedQuery::new_paged(&mut archive, &needle, &mut index, opts, budget,
-        [allocation(158), allocation(159), allocation(160)])?;
-    while query.state() == PagedQueryState::Pending {
-        query.step(StreamReadStep::default(), generation(), budget, &mut *canceled)?;
-    }
-    let report = query.finish()?;
-    if canceled() { return Err(Failure::canceled()); }
+    let report = if options.ignore_case {
+        matching::direct(&mut archive, options.text.as_deref(), None, true, options.count_all_matches,
+            options.limit, budget, [allocation(157), allocation(158), allocation(159), allocation(160)], canceled)?
+    } else {
+        let needle = match (&options.text, &options.raw) {
+            (Some(text), None) => IndexedNeedle::text(owner(), text, budget, allocation(157)),
+            (None, Some(bytes)) => IndexedNeedle::raw(owner(), bytes, budget, allocation(157)),
+            _ => return Err(Failure::new("CLI_INVALID_NEEDLE")),
+        }.map_err(|error| Failure::new(&error.to_string()))?;
+        let opts = PagedQueryOptions { generation: generation(), first_file: file_id(), first_revision: revision(), max_matches: options.limit };
+        let ids = [allocation(158), allocation(159), allocation(160)];
+        let query = if options.count_all_matches {
+            PagedQuery::new_paged_counting(&mut archive, &needle, &mut index, opts, budget, ids)?
+        } else {
+            PagedQuery::new_paged(&mut archive, &needle, &mut index, opts, budget, ids)?
+        };
+        matching::finish(query, budget, canceled)?
+    };
     if options.json {
-        begin(out, "snapshot-index-search")?; summary(out, archive.directory(), index.stats(), pin)?; fields(out)?;
+        begin(out, "snapshot-index-search")?; summary(out, archive.directory(), index.stats(), pin)?; search_fields(out, options.ignore_case)?;
         io_fields(out, index.io_stats(), index.file_bytes(), index.cache_capacity_bytes())?;
-        out.literal(",\"identity_scope\":\"response-local\",\"mode\":")?;
-        out.quoted(if options.text.is_some() { "exact-text" } else { "original-bytes" })?;
-        out.literal(",\"workspace_complete\":")?; out.boolean(report.is_complete())?;
-        out.literal(",\"truncated\":")?; out.boolean(report.truncated())?;
-        out.literal(",\"matches_seen\":")?; out.integer(report.matches_seen())?;
+        out.literal(",\"identity_scope\":\"response-local\"")?;
+        matching::fields(out, &report, options.raw.is_some(), options.ignore_case, true)?;
         out.literal(",\"unsupported_text_files_count\":")?; out.integer(report.stats().unsupported_files as u64)?;
         out.literal(",\"index_eliminated_files\":")?; out.integer(report.stats().index_eliminated_files as u64)?;
         out.literal(",\"index_candidates\":")?; out.integer(report.stats().index_candidates as u64)?;
@@ -93,32 +95,21 @@ pub(super) fn execute(options: &Options, out: &mut Output, budget: &ResourceBudg
         out.literal(",\"member_payload_bytes_loaded\":")?; out.integer(archive.load_stats().bytes_read)?;
         out.literal(",\"loaded_members\":")?; out.integer(archive.load_stats().loaded_members)?;
         out.literal(",\"scanned_bytes\":")?; out.integer(report.stats().scanned_bytes)?;
-        out.literal(",\"hits\":[")?;
     } else {
         out.literal(if report.is_complete() { "Complete saved-scope search.\n" } else { "PARTIAL saved-scope search.\n" })?;
-        out.literal("Index pages and source members were verified on demand; unread backing integrity remains unchecked.\n")?;
+        out.literal(if options.ignore_case { "The index manifest was validated; its posting pages were not consulted.\n" }
+            else { "Index pages and source members were verified on demand; unread backing integrity remains unchecked.\n" })?;
+        matching::human(out, &report, options.ignore_case, true)?;
     }
-    for (position, hit) in report.hits().iter().enumerate() {
-        if canceled() { return Err(Failure::canceled()); }
-        let member = archive.directory().member(hit.ordinal()).ok_or_else(|| Failure::new("SNAPSHOT_MEMBER_MISSING"))?;
-        let path = RawPath::from_bytes(member.path).to_path_buf();
-        if options.json {
-            if position > 0 { out.literal(",")?; }
-            out.literal("{\"file_id\":")?; out.integer(hit.file().get())?;
-            out.literal(",\"revision\":")?; out.integer(hit.revision().get())?;
-            out.literal(",\"path\":")?; out.path(&path)?;
-            out.literal(",\"source_digest\":")?; out.quoted(&hit.source_digest().to_hex())?;
-            out.literal(",\"original_range\":")?; out.range(hit.original_range())?; out.literal("}")?;
-        } else {
-            out.path(&path)?; out.literal(" bytes ")?; out.literal(&hit.original_range().start().get().to_string())?;
-            out.literal("..")?; out.literal(&hit.original_range().end().get().to_string())?; out.literal("\n")?;
-        }
-    }
-    if options.json { out.literal("]}\n")?; }
-    Ok(if !report.is_complete() { EXIT_PARTIAL } else if report.hits().is_empty() { EXIT_NO_MATCH } else { EXIT_OK })
+    matching::hits(&mut archive, &report, options.raw.is_some(), options.json, out, budget, canceled)?;
+    if options.json { out.literal("}\n")?; }
+    Ok(matching::exit(&report))
 }
-fn fields(out: &mut Output) -> Result<(), Failure> {
-    out.literal(",\"index_layout\":\"demand-paged-postings-v1\",\"candidate_strategy\":\"rarest-posting-intersection\",\"index_pin_scope\":\"page-manifest-envelope-sha256\",\"index_body_verified_on_open\":false,\"index_page_verification\":\"sha256-before-use\"")?;
+fn fields(out: &mut Output) -> Result<(), Failure> { search_fields(out, false) }
+fn search_fields(out: &mut Output, ignore_case: bool) -> Result<(), Failure> {
+    out.literal(",\"index_layout\":\"demand-paged-postings-v1\",\"candidate_strategy\":")?;
+    out.quoted(if ignore_case { "direct-verified-member-scan" } else { "rarest-posting-intersection" })?;
+    out.literal(",\"index_pin_scope\":\"page-manifest-envelope-sha256\",\"index_body_verified_on_open\":false,\"index_page_verification\":\"sha256-before-use\"")?;
     out.literal(",\"index_page_bytes\":")?; out.integer(POSTING_PAGE_BYTES as u64)?; Ok(())
 }
 fn io_fields(out: &mut Output, io: PostingPageIo, file_bytes: u64, capacity: usize) -> Result<(), Failure> {

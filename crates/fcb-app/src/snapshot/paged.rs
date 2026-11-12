@@ -5,14 +5,14 @@
 
 use std::fs::File;
 use fcb::{ByteOffset, ByteRange, FileId, SourceRevision};
-use fcb::search::{RawPath, ResourceBudget, StreamingNeedle, StreamReadStep,
+use fcb::search::{RawPath, ResourceBudget,
     ReaderLimits, ReadingTarget, ReadingSeekState, ReadingWindowOptions};
 use fcb::search::reader::LineNumber;
 use fcb::search::paged_snapshot::{PagedSnapshot, PagedSnapshotError, PagedMemberData,
-    PagedQuery, PagedQueryOptions, PagedQueryState, PagedSearchError, PagedCapture, SnapshotDirectory};
-use crate::{allocation, file_id, generation, owner, revision, EXIT_OK, EXIT_NO_MATCH, EXIT_PARTIAL};
+    PagedSearchError, PagedCapture, SnapshotDirectory};
+use crate::{allocation, generation, owner, EXIT_OK, EXIT_PARTIAL};
 use crate::output::{Output, OutputError};
-use super::{Settings, Mode, Failure, begin, catalog};
+use super::{Settings, Mode, Failure, begin, catalog, matching};
 
 impl From<PagedSnapshotError> for Failure {
     fn from(error: PagedSnapshotError) -> Self { Self { code: error.to_string(), canceled: error == PagedSnapshotError::Canceled } }
@@ -84,55 +84,28 @@ fn inspect(settings: &Settings, directory: &SnapshotDirectory, out: &mut Output,
 }
 fn search(settings: &Settings, archive: &mut PagedSnapshot<File>, out: &mut Output,
     budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<u8, Failure> {
-    let needle = match (&settings.text, &settings.raw_needle) {
-        (Some(text), None) => StreamingNeedle::text(owner(), text, budget, allocation(105)),
-        (None, Some(bytes)) => StreamingNeedle::raw(owner(), bytes, budget, allocation(105)),
-        _ => return Err(Failure::new("CLI_INVALID_NEEDLE")),
-    }.map_err(crate::AppError::from)?;
-    let options = PagedQueryOptions { generation: generation(), first_file: file_id(),
-        first_revision: revision(), max_matches: settings.limit };
-    let mut query = PagedQuery::new(archive, &needle, options, budget, [allocation(106), allocation(107), allocation(108)])?;
-    while query.state() == PagedQueryState::Pending {
-        query.step(StreamReadStep::default(), generation(), budget, &mut *canceled)?;
-    }
-    let report = query.finish()?;
-    if canceled() { return Err(Failure::canceled()); }
+    let report = matching::direct(archive, settings.text.as_deref(), settings.raw_needle.as_deref(),
+        settings.ignore_case, settings.count_all_matches, settings.limit, budget,
+        [allocation(105), allocation(106), allocation(107), allocation(108)], canceled)?;
     if settings.json {
         begin(out, "snapshot-search")?; summary(out, archive.directory())?;
-        out.literal(",\"identity_scope\":\"response-local\",\"engine\":\"bounded-stream-exact\",\"payload_residency\":\"one-verified-member\",\"workspace_complete\":")?;
-        out.boolean(report.is_complete())?;
-        out.literal(",\"truncated\":")?; out.boolean(report.truncated())?;
+        out.literal(",\"identity_scope\":\"response-local\",\"engine\":")?;
+        out.quoted(if settings.ignore_case { "bounded-stream-unicode-lowercase" } else { "bounded-stream-exact" })?;
+        out.literal(",\"payload_residency\":\"one-verified-member\"")?;
+        matching::fields(out, &report, settings.raw_needle.is_some(), settings.ignore_case, false)?;
         out.literal(",\"unsupported_text_files_count\":")?; out.integer(report.stats().unsupported_files as u64)?;
-        out.literal(",\"matches_seen\":")?; out.integer(report.matches_seen())?;
         out.literal(",\"files_searched\":")?; out.integer(report.stats().files_searched as u64)?;
         out.literal(",\"peak_source_bytes\":")?; out.integer(report.stats().peak_source_bytes as u64)?;
         out.literal(",\"member_payload_bytes_loaded\":")?; out.integer(archive.load_stats().bytes_read)?;
         out.literal(",\"member_read_calls\":")?; out.integer(archive.load_stats().read_calls)?;
         out.literal(",\"scanned_bytes\":")?; out.integer(report.stats().scanned_bytes)?;
-        out.literal(",\"hits\":[")?;
-    } else { out.literal(if report.is_complete() { "Complete saved-scope search; no live roots accessed.\n" } else { "PARTIAL saved-scope search; no live roots accessed.\n" })?; }
-    for (ordinal, hit) in report.hits().iter().enumerate() {
-        if canceled() { return Err(Failure::canceled()); }
-        let member = archive.directory().member(hit.ordinal()).ok_or_else(|| Failure::new("SNAPSHOT_MEMBER_MISSING"))?;
-        let path = RawPath::from_bytes(member.path).to_path_buf();
-        if settings.json {
-            if ordinal != 0 { out.literal(",")?; }
-            out.literal("{\"file_id\":")?; out.integer(hit.file().get())?;
-            out.literal(",\"revision\":")?; out.integer(hit.revision().get())?;
-            out.literal(",\"path\":")?; out.path(&path)?;
-            out.literal(",\"original_range\":")?; out.range(hit.original_range())?;
-            out.literal(",\"matched_text\":")?;
-            match settings.text.as_deref() { Some(text) => out.quoted(text)?, None => out.literal("null")? }
-            out.literal(",\"matched_raw_hex\":")?;
-            match settings.raw_needle.as_deref() { Some(bytes) => out.hex(bytes)?, None => out.literal("null")? }
-            out.literal("}")?;
-        } else {
-            out.path(&path)?; out.literal(" bytes ")?; out.literal(&hit.original_range().start().get().to_string())?;
-            out.literal("..")?; out.literal(&hit.original_range().end().get().to_string())?; out.literal("\n")?;
-        }
+    } else {
+        out.literal(if report.is_complete() { "Complete saved-scope search; no live roots accessed.\n" } else { "PARTIAL saved-scope search; no live roots accessed.\n" })?;
+        matching::human(out, &report, settings.ignore_case, false)?;
     }
-    if settings.json { out.literal("]}\n")?; }
-    Ok(if !report.is_complete() { EXIT_PARTIAL } else if report.hits().is_empty() { EXIT_NO_MATCH } else { EXIT_OK })
+    matching::hits(archive, &report, settings.raw_needle.is_some(), settings.json, out, budget, canceled)?;
+    if settings.json { out.literal("}\n")?; }
+    Ok(matching::exit(&report))
 }
 fn read(settings: &Settings, archive: &mut PagedSnapshot<File>, out: &mut Output,
     budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<u8, Failure> {

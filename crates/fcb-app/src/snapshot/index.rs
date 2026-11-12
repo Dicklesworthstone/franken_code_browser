@@ -10,15 +10,15 @@ mod paging;
 
 use std::{ffi::OsString, fs, io::{self, Read, Seek, Write}, path::{Path, PathBuf}};
 use fcb::ByteLength;
-use fcb::search::{IndexLimits, RawPath, ResourceBudget, StreamReadStep};
-use fcb::search::paged_snapshot::{PagedQuery, PagedQueryOptions, PagedQueryState,
+use fcb::search::{IndexLimits, ResourceBudget};
+use fcb::search::paged_snapshot::{PagedQuery, PagedQueryOptions,
     IndexedNeedle, SnapshotDirectory, PagedSnapshotError};
 use fcb::search::snapshot::Sha256Digest;
 use fcb::search::snapshot_index::{SnapshotIndex, SnapshotIndexError, SavedIndexStats, MAX_POSTINGS_BYTES, MAX_INDEX_GRAMS};
 use fcb_core::ResourceLease;
 use crate::{allocation, file_id, generation, owner, revision, input};
 use crate::output::{Output, MAX_RESPONSE_BYTES};
-use super::{Failure, Effect, begin, failure_output, write_new, hex, decimal, catalog,
+use super::{Failure, Effect, begin, failure_output, write_new, hex, decimal, catalog, matching,
     MAX_ARGUMENTS, MAX_ARGUMENT_BYTES, MAX_SINGLE_ARGUMENT, MANAGED_BYTES,
     EXIT_OK, EXIT_NO_MATCH, EXIT_ERROR, EXIT_PARTIAL, EXIT_CANCELED};
 
@@ -28,6 +28,12 @@ fcb snapshot index refresh NEW_SNAPSHOT --base OLD_SNAPSHOT --index OLD_INDEX\n\
 fcb snapshot index inspect SNAPSHOT --index INDEX --index-digest TRUSTED_SHA256 [--paged] [--json]\n\
 fcb snapshot index search SNAPSHOT --index INDEX --index-digest TRUSTED_SHA256\n\
     (--text LITERAL | --raw-hex HEX) [--paged] [--limit N] [--json]\n\
+Search options: --ignore-case (text only), --count-all (text or raw bytes).\n\
+Complete --count-all exits 0 for a positive total or 1 for zero, even when rows are capped.\n\
+Incomplete saved coverage exits 3; ordinary capped searches also exit 3.\n\
+--ignore-case uses Unicode scalar lowercase, not full case folding or canonical normalization.\n\
+Exact indexes are validated but bypassed for this mode; saved members are scanned directly.\n\
+--count-all completes the saved scope, retaining at most --limit N hits; --limit 0 counts only.\n\
 Build/refresh options: --max-grams N --max-file-bytes N --max-source-bytes N\n\
 --inverted persists resident global postings for rarest-list intersection.\n\
 --paged builds/opens FCBD verified pages with a four-page 64 KiB cache.\n\
@@ -50,7 +56,7 @@ struct Options {
     pin: Option<Sha256Digest>, text: Option<String>, raw: Option<Vec<u8>>, json: bool,
     limit: usize, build: IndexLimits, catalog: Option<PathBuf>, catalog_pin: Option<Sha256Digest>,
     base: Option<PathBuf>, base_catalog: Option<PathBuf>, base_catalog_pin: Option<Sha256Digest>,
-    inverted: bool, paged: bool,
+    inverted: bool, paged: bool, ignore_case: bool, count_all_matches: bool,
 }
 impl From<SnapshotIndexError> for Failure {
     fn from(error: SnapshotIndexError) -> Self {
@@ -89,7 +95,8 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
     };
     let mut out = Options { action, archive: None, output: None, index: None, pin: None, text: None,
         raw: None, json: false, limit: 100, build: IndexLimits::default(), catalog: None, catalog_pin: None,
-        base: None, base_catalog: None, base_catalog_pin: None, inverted: false, paged: false };
+        base: None, base_catalog: None, base_catalog_pin: None, inverted: false, paged: false,
+        ignore_case: false, count_all_matches: false };
     let mut seen = 0u32;
     let mut cursor = usize::from(!args.is_empty());
     let mut positional = false;
@@ -106,7 +113,7 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
             "--max-file-bytes" => 256, "--max-source-bytes" => 512,
             "--catalog" => 1024, "--catalog-digest" => 2048,
             "--base" => 4096, "--base-catalog" => 8192, "--base-catalog-digest" => 16384,
-            "--inverted" => 32768, "--paged" => 65536,
+            "--inverted" => 32768, "--paged" => 65536, "--ignore-case" => 131072, "--count-all" => 262144,
             _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")),
         };
         if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
@@ -114,6 +121,8 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
         if option == "--json" { out.json = true; continue; }
         if option == "--inverted" { out.inverted = true; continue; }
         if option == "--paged" { out.paged = true; continue; }
+        if option == "--ignore-case" { out.ignore_case = true; continue; }
+        if option == "--count-all" { out.count_all_matches = true; continue; }
         let value = args.get(cursor).ok_or_else(|| Failure::new("CLI_MISSING_VALUE"))?; cursor += 1;
         if value.is_empty() { return Err(Failure::new("CLI_MISSING_VALUE")); }
         match option {
@@ -157,7 +166,8 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
             && seen & !(1 | 2 | 4 | 8 | 128 | 256 | 512 | catalog_options | 4096 | 8192 | 16384 | 32768) == 0,
         Action::Inspect => out.archive.is_some() && out.index.is_some() && out.pin.is_some() && seen & !(1 | 4 | 8 | catalog_options | 65536) == 0,
         Action::Search => out.archive.is_some() && out.index.is_some() && out.pin.is_some()
-            && (out.text.is_some() != out.raw.is_some()) && seen & !(1 | 4 | 8 | 16 | 32 | 64 | catalog_options | 65536) == 0,
+            && (out.text.is_some() != out.raw.is_some()) && (!out.ignore_case || out.text.is_some())
+            && seen & !(1 | 4 | 8 | 16 | 32 | 64 | catalog_options | 65536 | 131072 | 262144) == 0,
     };
     if !valid || (out.inverted && out.paged) { return Err(Failure::new("CLI_INCOMPATIBLE_OPTIONS")); }
     Ok(out)
@@ -265,26 +275,24 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
         return Ok(if index.stats().uncovered_files > 0 || index.stats().unavailable_files > 0
             || !archive.directory().discovery_complete() { EXIT_PARTIAL } else { EXIT_OK });
     }
-    let needle = match (&options.text, &options.raw) {
-        (Some(text), None) => IndexedNeedle::text(owner(), text, budget, allocation(157)),
-        (None, Some(bytes)) => IndexedNeedle::raw(owner(), bytes, budget, allocation(157)),
-        _ => return Err(Failure::new("CLI_INVALID_NEEDLE")),
-    }.map_err(|error| Failure::new(&error.to_string()))?;
-    let opts = PagedQueryOptions { generation: generation(), first_file: file_id(), first_revision: revision(), max_matches: options.limit };
-    let mut query = index.query(&mut archive, &needle, opts, budget)?;
-    while query.state() == PagedQueryState::Pending {
-        query.step(StreamReadStep::default(), generation(), budget, &mut *canceled)?;
-    }
-    let report = query.finish()?;
-    if canceled() { return Err(Failure::canceled()); }
+    let report = if options.ignore_case {
+        matching::direct(&mut archive, options.text.as_deref(), None, true, options.count_all_matches,
+            options.limit, budget, [allocation(157), allocation(158), allocation(159), allocation(160)], canceled)?
+    } else {
+        let needle = match (&options.text, &options.raw) {
+            (Some(text), None) => IndexedNeedle::text(owner(), text, budget, allocation(157)),
+            (None, Some(bytes)) => IndexedNeedle::raw(owner(), bytes, budget, allocation(157)),
+            _ => return Err(Failure::new("CLI_INVALID_NEEDLE")),
+        }.map_err(|error| Failure::new(&error.to_string()))?;
+        let opts = PagedQueryOptions { generation: generation(), first_file: file_id(), first_revision: revision(), max_matches: options.limit };
+        let query = index.query(&mut archive, &needle, opts, options.count_all_matches, budget)?;
+        matching::finish(query, budget, canceled)?
+    };
     if options.json {
         begin(out, "snapshot-index-search")?; summary(out, archive.directory(), index.stats(), pin)?;
-        inverted::fields(out, index.inverted())?;
-        out.literal(",\"identity_scope\":\"response-local\",\"mode\":")?;
-        out.quoted(if options.text.is_some() { "exact-text" } else { "original-bytes" })?;
-        out.literal(",\"workspace_complete\":")?; out.boolean(report.is_complete())?;
-        out.literal(",\"truncated\":")?; out.boolean(report.truncated())?;
-        out.literal(",\"matches_seen\":")?; out.integer(report.matches_seen())?;
+        inverted::search_fields(out, index.inverted(), options.ignore_case)?;
+        out.literal(",\"identity_scope\":\"response-local\"")?;
+        matching::fields(out, &report, options.raw.is_some(), options.ignore_case, true)?;
         out.literal(",\"unsupported_text_files_count\":")?; out.integer(report.stats().unsupported_files as u64)?;
         out.literal(",\"index_eliminated_files\":")?; out.integer(report.stats().index_eliminated_files as u64)?;
         out.literal(",\"index_candidates\":")?; out.integer(report.stats().index_candidates as u64)?;
@@ -299,28 +307,13 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
         out.literal(",\"loaded_members\":")?; out.integer(archive.load_stats().loaded_members)?;
         out.literal(",\"scanned_bytes\":")?; out.integer(report.stats().scanned_bytes)?;
         out.literal(",\"peak_retained_source_bytes\":")?; out.integer(report.stats().peak_source_bytes as u64)?;
-        out.literal(",\"hits\":[")?;
     } else {
-        out.literal(if report.is_complete() { "Complete indexed saved-scope search.\n" } else { "PARTIAL indexed saved-scope search.\n" })?;
+        out.literal(if report.is_complete() { "Complete saved-scope search.\n" } else { "PARTIAL saved-scope search.\n" })?;
+        matching::human(out, &report, options.ignore_case, true)?;
     }
-    for (position, hit) in report.hits().iter().enumerate() {
-        if canceled() { return Err(Failure::canceled()); }
-        let member = archive.directory().member(hit.ordinal()).ok_or_else(|| Failure::new("SNAPSHOT_MEMBER_MISSING"))?;
-        let path = RawPath::from_bytes(member.path).to_path_buf();
-        if options.json {
-            if position > 0 { out.literal(",")?; }
-            out.literal("{\"file_id\":")?; out.integer(hit.file().get())?;
-            out.literal(",\"revision\":")?; out.integer(hit.revision().get())?;
-            out.literal(",\"path\":")?; out.path(&path)?;
-            out.literal(",\"source_digest\":")?; out.quoted(&hit.source_digest().to_hex())?;
-            out.literal(",\"original_range\":")?; out.range(hit.original_range())?; out.literal("}")?;
-        } else {
-            out.path(&path)?; out.literal(" bytes ")?; out.literal(&hit.original_range().start().get().to_string())?;
-            out.literal("..")?; out.literal(&hit.original_range().end().get().to_string())?; out.literal("\n")?;
-        }
-    }
-    if options.json { out.literal("]}\n")?; }
-    Ok(if !report.is_complete() { EXIT_PARTIAL } else if report.hits().is_empty() { EXIT_NO_MATCH } else { EXIT_OK })
+    matching::hits(&mut archive, &report, options.raw.is_some(), options.json, out, budget, canceled)?;
+    if options.json { out.literal("}\n")?; }
+    Ok(matching::exit(&report))
 }
 fn summary(out: &mut Output, directory: &SnapshotDirectory, stats: SavedIndexStats, pin: Sha256Digest) -> Result<(), Failure> {
     out.literal(",\"source_scope\":\"saved-observations-only\",\"live_roots_accessed\":false,\"snapshot_digest\":")?;

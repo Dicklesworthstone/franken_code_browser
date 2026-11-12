@@ -25,12 +25,14 @@ impl QueryIndex {
     pub(super) fn inverted(&self) -> bool { matches!(self, Self::Postings(_)) }
     pub(super) fn query<'archive, 'query, R: Read + Seek>(&'query self,
         archive: &'archive mut PagedSnapshot<R>, needle: &'query IndexedNeedle<'_>,
-        options: PagedQueryOptions, budget: &ResourceBudget)
+        options: PagedQueryOptions, count_all_matches: bool, budget: &ResourceBudget)
         -> Result<PagedQuery<'archive, 'query, R>, Failure> {
         let allocations = [allocation(158), allocation(159), allocation(160)];
-        Ok(match self {
-            Self::Segments(index) => PagedQuery::new_indexed(archive, needle, index, options, budget, allocations)?,
-            Self::Postings(index) => PagedQuery::new_postings(archive, needle, index, options, budget, allocations)?,
+        Ok(match (self, count_all_matches) {
+            (Self::Segments(index), false) => PagedQuery::new_indexed(archive, needle, index, options, budget, allocations)?,
+            (Self::Segments(index), true) => PagedQuery::new_indexed_counting(archive, needle, index, options, budget, allocations)?,
+            (Self::Postings(index), false) => PagedQuery::new_postings(archive, needle, index, options, budget, allocations)?,
+            (Self::Postings(index), true) => PagedQuery::new_postings_counting(archive, needle, index, options, budget, allocations)?,
         })
     }
 }
@@ -44,9 +46,13 @@ pub(super) fn encode(index: &SnapshotIndex, inverted: bool, budget: &ResourceBud
 }
 
 pub(super) fn fields(out: &mut Output, inverted: bool) -> Result<(), Failure> {
+    search_fields(out, inverted, false)
+}
+pub(super) fn search_fields(out: &mut Output, inverted: bool, ignore_case: bool) -> Result<(), Failure> {
     out.literal(",\"index_layout\":")?;
     out.quoted(if inverted { "global-postings-v1" } else { "per-member-grams-v1" })?;
     out.literal(",\"candidate_strategy\":")?;
-    out.quoted(if inverted { "rarest-posting-intersection" } else { "per-member-probes" })?;
+    out.quoted(if ignore_case { "direct-verified-member-scan" }
+        else if inverted { "rarest-posting-intersection" } else { "per-member-probes" })?;
     Ok(())
 }
