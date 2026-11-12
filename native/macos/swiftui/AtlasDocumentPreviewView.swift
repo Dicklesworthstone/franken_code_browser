@@ -2,8 +2,8 @@ import SwiftUI
 import AppKit
 
 /// Native presentation of the shared engine's shaped glyphs, logical flow and
-/// provenance. This view parses no Markdown, invents no heading slugs and grants
-/// no network or external-link access.
+/// provenance. This view parses no Markdown or heading slugs. Only the explicit
+/// Open in browser action hands a verified HTTP(S) destination to the OS.
 @MainActor struct AtlasDocumentPreviewView: View {
     @Bindable var model: AtlasDocumentPreviewModel
     var embedded = false
@@ -211,19 +211,23 @@ import AppKit
                 if let links = model.links {
                     ForEach(links.rows) { link in
                         if let target = links.target(id: link.id) {
-                            Button { model.openLink(target, openLocal: openLocalLink) } label: {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(verbatim: link.display.isEmpty ? "(document start)" : link.display)
-                                        .lineLimit(3).font(.system(.body, design: .monospaced))
-                                    Text("Occurrence \(link.id) · " + linkDisposition(link.kind))
-                                        .font(.caption).foregroundStyle(.secondary)
+                            if link.kind == .external {
+                                externalLinkRow(target)
+                            } else {
+                                Button { model.openLink(target, openLocal: openLocalLink) } label: {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(verbatim: link.display.isEmpty ? "(document start)" : link.display)
+                                            .lineLimit(3).font(.system(.body, design: .monospaced))
+                                        Text("Occurrence \(link.id) · " + linkDisposition(link.kind))
+                                            .font(.caption).foregroundStyle(.secondary)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
                                 }
-                                .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+                                .buttonStyle(.plain)
+                                .disabled(!model.canNavigate || !(link.kind.navigatesWithinCapture
+                                    || (link.kind == .local && openLocalLink != nil)))
+                                .help(linkDisposition(link.kind) + ": " + link.display)
                             }
-                            .buttonStyle(.plain)
-                            .disabled(!model.canNavigate || !(link.kind.navigatesWithinCapture
-                                || (link.kind == .local && openLocalLink != nil)))
-                            .help(linkDisposition(link.kind) + ": " + link.display)
                         }
                     }
                     if links.rows.isEmpty {
@@ -237,12 +241,35 @@ import AppKit
                 .textSelection(.enabled).padding(10)
         }
     }
+    private func externalLinkRow(_ target: AtlasReaderDocumentLinkTarget) -> some View {
+        let destination = AtlasExternalWebLink(target.link.destination)
+        return VStack(alignment: .leading, spacing: 6) {
+            // Display the URL actually passed to the OS, including its escaped
+            // query/fragment, rather than substituting a source-provided label.
+            Text(verbatim: destination?.display ?? target.link.display)
+                .font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            Button {
+                model.openExternalLink(target) { NSWorkspace.shared.open($0.url) }
+            } label: {
+                Label("Open in browser", systemImage: "arrow.up.right.square")
+            }
+            .buttonStyle(.bordered).controlSize(.small)
+            .disabled(!model.canOpenExternalLink(target))
+            .help("Open this retained HTTP or HTTPS destination in your configured default browser")
+            if destination == nil {
+                Text("This destination is not a supported HTTP or HTTPS web address.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
     private func linkDisposition(_ kind: AtlasReaderDocumentLinkKind) -> String {
         switch kind {
         case .heading: "Go to this document's heading"
         case .start: "Go to document start"
         case .local: openLocalLink == nil ? "Local target needs a project capture route" : "Open admitted project target"
-        case .external: "External destination; not opened"
+        case .external: "External web destination"
         case .unsupported: "Unsupported destination"
         }
     }

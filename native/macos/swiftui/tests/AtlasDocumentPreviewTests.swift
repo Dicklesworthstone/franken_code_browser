@@ -10,6 +10,7 @@ import Foundation
     var held = false
     var holdDisplay = false
     var exactSourceRows = false
+    var externalDestination = "https://example.invalid/docs?q=a%20b#section"
     var failure: AtlasReaderError?
     var pending: [(CheckedContinuation<AtlasReaderDocumentResult, Error>, AtlasReaderDocumentResult)] = []
     var generation: UInt64 = 0
@@ -130,7 +131,7 @@ import Foundation
             case .heading: destination = "#heading"
             case .start: destination = "#"
             case .local: destination = "guide.md#setup"
-            case .external: destination = "https://example.invalid"
+            case .external: destination = externalDestination
             case .unsupported: destination = "javascript:alert(1)"
             }
             return .init(id: index + 1, blockIndex: 0, evidence: .init(start: 0, end: identity.capturedBytes),
@@ -416,6 +417,7 @@ import Foundation
         }
         await anchoredPreparation()
         await documentLinks()
+        await externalWebLinks()
         await styledLifecycle()
         await styledDeliveries()
         print("AtlasDocumentPreviewTests: \(checks) checks passed")
@@ -806,6 +808,148 @@ import Foundation
             m.cancel(); f.release(); await settle()
             check(m.page?.id == previous.id && m.canBack && m.canForward,
                   "A canceled navigation leaves both directions of accepted history intact")
+        }
+    }
+
+    @MainActor private static func externalWebLinks() async {
+        // The real URL policy is exercised without opening a browser or making
+        // a network request. Native OS handoff remains a physical-Mac lane.
+        let allowed = [
+            "https://example.invalid/docs?q=a%20b#section", "http://localhost:8080/",
+            "HTTPS://example.invalid/path", "https://[::1]:8443/guide",
+            "https://xn--bcher-kva.example/guide", "https://example.invalid/文档?q=é",
+            "https://example.invalid/%252e%252e?value=%252f",
+        ]
+        for destination in allowed {
+            check(AtlasExternalWebLink(destination) != nil, "A supported web destination was refused: \(destination)")
+        }
+        let prefix = "https://example.invalid/"
+        let boundary = prefix + String(repeating: "a", count: AtlasReaderDocumentLimits.destinationBytes - prefix.utf8.count)
+        check(AtlasExternalWebLink(boundary) != nil && AtlasExternalWebLink(boundary + "a") == nil,
+              "The URL byte allowance must include the complete destination")
+        let escaped = "https://example.invalid/a%2Fb?q=%252f#part%202"
+        check(AtlasExternalWebLink(escaped)?.url.absoluteString == escaped,
+              "The OS must receive original percent escapes, not a second decoded interpretation")
+        for destination in [
+            "", "../guide.md", "file:///tmp/source", "file://remote/path", "javascript:alert(1)",
+            "mailto:test@example.invalid", "ftp://example.invalid/file", "//example.invalid/path",
+            "https:example.invalid/path", "https:///path", "https://", "https://example.invalid:",
+            "https://user@example.invalid/", "https://user:secret@example.invalid/", "https://@example.invalid/",
+            "https://example.invalid%40other.invalid/", "https://%65xample.invalid/", "https://例子.invalid/",
+            "https://example.invalid:65536/", "https://example.invalid:0/", "https://example.invalid:-1/",
+            " https://example.invalid", "https://example.invalid ", "https://example.invalid/a b",
+            "https://example.invalid/\nforged", "https://example.invalid/%0a", "https://example.invalid/%0D%0a",
+            "https://example.invalid/%00", "https://example.invalid/\u{202e}txt", "https://example.invalid/%E2%80%AEtxt",
+            "https://example.invalid/\u{2066}x", "https://example.invalid/%C2%85", "https://example.invalid/%E2%80%A8",
+            "https://example.invalid/\\other", "https://example.invalid/%5cother", "https://example.invalid/%",
+            "https://example.invalid/%0", "https://example.invalid/%GG", "https://example.invalid/%FF",
+        ] {
+            check(AtlasExternalWebLink(destination) == nil, "An unsafe or ambiguous destination reached URL admission")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            m.prepareLinks(); await wait { !m.busy }
+            let target = m.links!.target(id: 4)!, previous = m.page!
+            var opened: [String] = []
+            m.openLink(target); await wait { !m.busy }
+            check(opened.isEmpty && m.notice.contains("No browser"), "Ordinary classification must remain inert")
+            check(m.canOpenExternalLink(target), "A retained HTTP(S) target should enable the explicit action")
+            f.held = true
+            m.openExternalLink(target) { link in
+                check(!m.busy && m.allows(target), "Browser callback ran before worker drain or after revocation")
+                opened.append(link.url.absoluteString); return true
+            }
+            await wait { f.pending.count == 1 }
+            m.openExternalLink(target) { _ in opened.append("duplicate"); return true }
+            await settle()
+            check(opened.isEmpty && f.pending.count == 1, "Handoff preceded verification or a second click queued a duplicate")
+            f.release(); await wait { !m.busy }; await settle()
+            check(opened == [f.externalDestination] && m.page?.id == previous.id && !m.canBack,
+                  "Explicit web handoff must preserve source and navigation while passing the verified URL once")
+            check(m.notice == "Sent the link to your default browser.", "Successful OS acceptance was not reported")
+            f.held = false
+            f.failure = .engine("DOCUMENT_STALE_GENERATION")
+            m.openExternalLink(target) { _ in opened.append("failed verification"); return true }
+            await wait { !m.busy }
+            check(opened == [f.externalDestination] && m.notice.contains("DOCUMENT_STALE_GENERATION"),
+                  "Failed retained-link verification still invoked the browser adapter")
+            m.openExternalLink(target) { _ in false }; await wait { !m.busy }
+            check(m.notice.contains("could not open") && m.page?.id == previous.id,
+                  "OS refusal must remain visible without replacing the source")
+            m.openExternalLink(target) { _ in m.close(); return true }; await wait { !m.busy }; await settle()
+            check(m.page == nil && m.links == nil && m.notice.isEmpty,
+                  "A reentrant browser adapter revived a closed preview")
+        }
+        for interruption in ["cancel", "reflow", "rebind", "close", "reload"] {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            m.prepareLinks(); await wait { !m.busy }
+            let target = m.links!.target(id: 4)!
+            var opens = 0
+            f.held = true
+            m.openExternalLink(target) { _ in opens += 1; return true }
+            await wait { f.pending.count == 1 }
+            switch interruption {
+            case "cancel": m.cancel()
+            case "reflow": m.widthInput = "80"; m.prepare(); await wait { f.pending.count == 2 }
+            case "rebind": m.bind(identity: Fixture.identity(revision: 2), sourceOffset: 0)
+            case "reload": m.cancel(silent: true); m.prepareLinks(); await wait { f.pending.count == 2 }
+            default: m.close()
+            }
+            f.held = false
+            while !f.pending.isEmpty { f.release() }
+            await settle(); await wait { !m.busy }
+            check(opens == 0, "A \(interruption) preview still delivered a delayed browser action")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            m.prepareLinks(); await wait { !m.busy }
+            let target = m.links!.target(id: 4)!, requests = f.requests.count
+            var opens = 0
+            for id: UInt64 in [1, 2, 3, 5] {
+                m.openExternalLink(m.links!.target(id: id)!) { _ in opens += 1; return true }
+            }
+            check(f.requests.count == requests && opens == 0, "Another link classification acquired web authority")
+            m.nextLinks(); await wait { !m.busy }
+            let pagedRequests = f.requests.count
+            m.openExternalLink(target) { _ in opens += 1; return true }
+            check(f.requests.count == pagedRequests && opens == 0, "An obsolete link-page target reached the worker")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            m.prepareLinks(); await wait { !m.busy }
+            let target = m.links!.target(id: 4)!, before = m.page!
+            var opens = 0
+            f.held = true
+            m.openExternalLink(target) { _ in opens += 1; return true }
+            await wait { f.pending.count == 1 }
+            let substituted = AtlasReaderDocumentLinkTarget(inventory: target.inventory,
+                pageID: UUID(), link: target.link)
+            f.release(replacement: .link(.init(target: substituted, page: nil)))
+            await wait { !m.busy }
+            check(opens == 0 && m.page?.id == before.id && m.notice == AtlasReaderError.invalidResponse.message,
+                  "A mismatched verified response reached the browser")
+            m.openExternalLink(target) { _ in opens += 1; return true }
+            await wait { f.pending.count == 1 }
+            f.release(replacement: .link(.init(target: target, page: f.page(first: 256))))
+            await wait { !m.busy }
+            check(opens == 0 && m.page?.id == before.id,
+                  "A source-navigation response acquired external handoff authority")
+        }
+        for destination in ["javascript:alert(1)", "https://user:secret@example.invalid/", "https://example.invalid/%0a"] {
+            let f = Fixture(), m = f.model()
+            f.externalDestination = destination
+            await ready(f, m)
+            m.prepareLinks(); await wait { !m.busy }
+            let target = m.links!.target(id: 4)!, requests = f.requests.count
+            var opens = 0
+            check(!m.canOpenExternalLink(target), "Classification alone enabled an unsafe external action")
+            m.openExternalLink(target) { _ in opens += 1; return true }
+            check(opens == 0 && f.requests.count == requests && m.notice.contains("Only absolute HTTP"),
+                  "A disallowed address reached the worker or OS adapter")
         }
     }
 

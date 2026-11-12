@@ -793,6 +793,15 @@ source pane. This correspondence is at block granularity. It does not claim
 glyph-exact or inline-exact source spans. Text selection and verified copy
 remain available in Text and in the source reader.
 
+In the preview's **Links** list, **Open in browser** explicitly sends a verified
+HTTP or HTTPS destination to your configured default browser. The row shows the
+URL passed to the OS. This route accepts ASCII or punycode hosts, preserves
+percent escapes, and refuses credentials, hidden controls, bidi formatting and
+custom schemes. Loading a document or its links never launches a browser.
+Canceling, reflowing, replacing or closing the preview withdraws a pending
+handoff. URL-policy and stale-action regressions are included; executable and
+physical-Mac browser-handoff verification remain pending.
+
 Preparation admits UTF-8 captures up to 64 KiB, at most 8,192 display elements,
 131,072 glyphs, and 8 MiB of bundled font resources. A page admits at most 128
 elements and 16,384 glyphs. Source, generation, layout and page identities are

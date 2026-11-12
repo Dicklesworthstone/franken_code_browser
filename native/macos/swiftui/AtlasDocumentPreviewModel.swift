@@ -1,6 +1,50 @@
 import Foundation
 import Observation
 
+/// A web destination admitted for an explicit OS handoff. Parsing this value is
+/// inert. Keep percent escapes in the URL passed to the browser; decode once
+/// only to reject hidden controls, bidi formatting and backslash ambiguity.
+/// Native paths, custom schemes and credentials never enter this route.
+struct AtlasExternalWebLink: Sendable {
+    let url: URL
+    var display: String { url.absoluteString }
+
+    init?(_ destination: String) {
+        guard !destination.isEmpty, destination.utf8.count <= AtlasReaderDocumentLimits.destinationBytes,
+              !destination.unicodeScalars.contains(where: {
+                  CharacterSet.whitespacesAndNewlines.contains($0) || Self.forbidden($0)
+              }), !destination.contains("\\"),
+              let decoded = destination.removingPercentEncoding,
+              !decoded.unicodeScalars.contains(where: Self.forbidden), !decoded.contains("\\"),
+              let components = URLComponents(string: destination),
+              let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              destination.lowercased().hasPrefix(scheme + "://"),
+              components.user == nil, components.password == nil,
+              let host = components.host, !host.isEmpty,
+              components.port.map({ (1...65535).contains($0) }) ?? true else { return nil }
+
+        // Do not reinterpret percent-encoded or Unicode authority delimiters.
+        // ASCII DNS names, punycode names and bracketed IPv6 remain supported;
+        // Unicode is allowed in the path, query and fragment.
+        let authority = destination.dropFirst(scheme.count + 3).prefix { !"/?#".contains($0) }
+        guard !authority.isEmpty, authority.last != ":",
+              authority.utf8.allSatisfy({ byte in
+                  (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte)
+                      || [45, 46, 58, 91, 93, 95].contains(byte)
+              }), let url = components.url, !url.isFileURL,
+              url.scheme?.lowercased() == scheme, url.host != nil else { return nil }
+        self.url = url
+    }
+
+    private static func forbidden(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0...0x1f, 0x7f...0x9f, 0x061c, 0x200e...0x200f,
+             0x2028...0x202e, 0x2066...0x2069, 0xfeff: true
+        default: false
+        }
+    }
+}
+
 /// User-facing Markdown navigation over the reader's existing immutable capture.
 /// The injected operation is the retained reader coordinator, not a parser or a
 /// new source provider. Source-only hosts do not prepare a document implicitly.
@@ -11,6 +55,9 @@ import Observation
     /// Only an enclosing host with an independently qualified project/capture
     /// route may install this callback. Destination labels never create grants.
     typealias LocalNavigation = @MainActor (AtlasReaderDocumentLinkTarget) -> Void
+    /// Called only after an explicit web-link action and retained-target
+    /// verification. The native host supplies its configured OS browser route.
+    typealias ExternalNavigation = @MainActor (AtlasExternalWebLink) -> Bool
 
     private(set) var page: AtlasReaderDocumentPage?
     private(set) var headings: AtlasReaderDocumentHeadings?
@@ -93,7 +140,7 @@ import Observation
         return status + "Logical FrankenMarkdown flow, not native shaped document layout. "
             + "\(page.lines.count) of \(inventory.totalLines) flow rows shown at \(inventory.width) columns. "
             + "Source links select enclosing Markdown regions, not glyph-exact spans. "
-            + "Width changes return to the start of the first mapped Markdown region shown. No external links or assets are fetched."
+            + "Width changes return to the start of the first mapped Markdown region shown. Web links open only through Open in browser; assets are not fetched."
     }
 
     /// Same-capture source paging changes only the synchronization anchor.
@@ -338,6 +385,35 @@ import Observation
     func previousLinks() { if let first = linkHistory.last { loadLinks(first: first, goingBack: true) } }
     func allows(_ target: AtlasReaderDocumentLinkTarget) -> Bool {
         canNavigate && links?.target(id: target.link.id) == target
+    }
+    func canOpenExternalLink(_ target: AtlasReaderDocumentLinkTarget) -> Bool {
+        allows(target) && target.link.kind == .external && AtlasExternalWebLink(target.link.destination) != nil
+    }
+
+    /// Deliberate browser action, separate from inert link classification and
+    /// local-source navigation. The worker confirms the complete retained row;
+    /// cancellation, reflow, page replacement or close withdraws the action.
+    func openExternalLink(_ target: AtlasReaderDocumentLinkTarget, open: @escaping ExternalNavigation) {
+        guard allows(target), target.link.kind == .external else { return }
+        guard let destination = AtlasExternalWebLink(target.link.destination) else {
+            notice = "Only absolute HTTP or HTTPS links without credentials, hidden controls or ambiguous hosts can open in the browser."
+            return
+        }
+        perform(.link(target), notice: "Verifying retained web link…", then: { model in
+            guard model.canOpenExternalLink(target) else { return }
+            let ticket = model.operation
+            let opened = open(destination)
+            // The OS adapter or an embedding host can synchronously replace or
+            // close the reader. Do not revive its state after that handoff.
+            guard model.operation == ticket, model.allows(target) else { return }
+            model.notice = opened ? "Sent the link to your default browser."
+                : "The default browser could not open this link."
+        }) { model, result in
+            guard case .link(let activation) = result, activation.target == target,
+                  activation.page == nil, model.links?.target(id: target.link.id) == target else {
+                throw AtlasReaderError.invalidResponse
+            }
+        }
     }
     func openLink(_ target: AtlasReaderDocumentLinkTarget, openLocal: LocalNavigation? = nil) {
         guard allows(target), let previous = page else { return }
