@@ -151,6 +151,25 @@ char *fcb_observed_reader_find_matching(uint64_t handle, uint64_t generation,
     uint64_t count_all_matches, uint64_t max_matches, uint64_t max_scan_bytes,
     fcb_observed_reader_poll poll, void *context);
 
+/* Additive search mode: 0=literal text, 1=whole-token occurrences. mode and
+ * boolean flags are checked; unknown values are never coerced. Text preserves
+ * the matching/count semantics above. Occurrences requires case_sensitive=1
+ * and a valid shared identifier of at most 1024 UTF-8 bytes. ASCII letters,
+ * digits, '_' and '$' plus conservative non-ASCII runs define token boundaries;
+ * names cannot begin with an ASCII digit. No Unicode normalization, compiler
+ * binding or exclusion of comments/string literals is implied.
+ *
+ * Occurrence receipts carry mode/realized_mode="whole-token-occurrences",
+ * requested_mode="occurrences", evidence_level="whole-token-text-candidate",
+ * includes_comments_and_literals=true and compiler_resolved/semantic_complete
+ * false. Count-only and bounded partial coverage remain separate from rows.
+ * Read boundaries, byte limits and malformed input are not inferred EOF.
+ */
+char *fcb_observed_reader_find_mode(uint64_t handle, uint64_t generation,
+    const char *needle, uint64_t encoding, uint64_t mode, uint64_t case_sensitive,
+    uint64_t count_all_matches, uint64_t max_matches, uint64_t max_scan_bytes,
+    fcb_observed_reader_poll poll, void *context);
+
 /* Zero-based hit_index must belong to the current accepted query generation.
  * Returns exactly the retained literal text/bytes and original-byte range,
  * with no source reread. Surrounding context was NOT retained. A host may
@@ -167,7 +186,12 @@ char *fcb_observed_reader_search_hit(uint64_t handle, uint64_t generation,
  * provenance and page-local decoded UTF-8 selection. It never reuses the old
  * search observation's identity. Context and window sizes are bounded by the
  * source service; window_bytes is 4..262144 and must contain the full hit plus
- * eight bytes of scalar/CRLF boundary slack.
+ * eight bytes of scalar/CRLF boundary slack for text queries. Occurrences
+ * require 24 bytes of slack and always obtain adjacent scalar context even if
+ * context_bytes=0. Both current token boundaries must also verify; a matching
+ * old witness inside a now-longer identifier is refused. The retained find_hit
+ * records its original mode and token_boundaries_verified, so history replay
+ * remains qualified after another query replaces the active search.
  * Retained-window navigation afterward performs no file I/O.
  */
 char *fcb_observed_reader_observe_hit(uint64_t handle, uint64_t generation,

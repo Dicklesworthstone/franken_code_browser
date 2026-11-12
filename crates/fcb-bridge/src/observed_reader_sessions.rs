@@ -7,7 +7,7 @@
 use std::{mem::size_of, path::Path, sync::{Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}};
 use fcb_app::host::{HostResponse, observed_reader::{ObservedReaderSession,
-    ObservedReaderError, ObservedReaderEncoding}};
+    ObservedReaderError, ObservedReaderEncoding, ObservedReaderSearchKind}};
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
 
 pub(super) const MAX_SESSIONS: usize = 4;
@@ -75,6 +75,9 @@ pub(super) enum Command<'a> {
         max_matches: usize, max_scan_bytes: u64 },
     FindMatching { generation: u64, needle: &'a str, encoding: ObservedReaderEncoding,
         case_sensitive: bool, count_all_matches: bool, max_matches: usize, max_scan_bytes: u64 },
+    FindMode { generation: u64, needle: &'a str, encoding: ObservedReaderEncoding,
+        kind: ObservedReaderSearchKind, case_sensitive: bool, count_all_matches: bool,
+        max_matches: usize, max_scan_bytes: u64 },
     SearchHit { generation: u64, position: usize },
     ObserveHit { generation: u64, hit_index: usize, context_bytes: usize, window_bytes: usize },
 }
@@ -169,6 +172,9 @@ impl ObservedReaderSessions {
                 reader.search_counted(generation, needle, encoding, max_matches, max_scan_bytes, &mut stop),
             Command::FindMatching { generation, needle, encoding, case_sensitive, count_all_matches, max_matches, max_scan_bytes } =>
                 reader.find_matching(generation, needle, encoding, case_sensitive, count_all_matches, max_matches, max_scan_bytes, &mut stop),
+            Command::FindMode { generation, needle, encoding, kind, case_sensitive, count_all_matches, max_matches, max_scan_bytes } =>
+                reader.find_with_kind(generation, needle, encoding, kind, case_sensitive,
+                    count_all_matches, max_matches, max_scan_bytes, &mut stop),
             Command::SearchHit { generation, position } => reader.search_hit(generation, position, &mut stop),
             Command::ObserveHit { generation, hit_index, context_bytes, window_bytes } =>
                 reader.observe_hit(generation, hit_index, context_bytes, window_bytes, &mut stop),

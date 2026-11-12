@@ -5,7 +5,7 @@
 //! host/source services. No input pointer survives the synchronous call.
 
 use std::{ffi::{c_char, c_void}, path::Path, sync::OnceLock};
-use fcb_app::host::{HostResponse, observed_reader::{ObservedReaderEncoding,
+use fcb_app::host::{HostResponse, observed_reader::{ObservedReaderEncoding, ObservedReaderSearchKind,
     MAX_OBSERVED_READER_NEEDLE_BYTES}};
 use super::{reply, string_out, SearchCancellationCallback};
 use super::observed_reader_sessions::{AccessError, Command, ObservedReaderSessions};
@@ -186,6 +186,31 @@ pub unsafe extern "C" fn fcb_observed_reader_find_matching(handle: u64, generati
         let encoding = decode_encoding(encoding)?;
         let max_matches = usize::try_from(max_matches).map_err(|_| AccessError::InvalidArgument)?;
         readers.execute(handle, Command::FindMatching { generation, needle, encoding,
+            case_sensitive: case_sensitive == 1, count_all_matches: count_all_matches == 1,
+            max_matches, max_scan_bytes }, || poll.is_some_and(|poll| unsafe { poll(context) != 0 }))
+    }))
+}
+
+/// Select literal text (mode 0) or whole-token occurrences (mode 1). Occurrence
+/// names use the shared bounded token policy and require case_sensitive=1.
+/// Existing find entry points retain their literal-text behavior.
+/// # Safety
+/// Pointer and callback requirements match fcb_observed_reader_find.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_observed_reader_find_mode(handle: u64, generation: u64,
+    needle: *const c_char, encoding: u64, mode: u64, case_sensitive: u64,
+    count_all_matches: u64, max_matches: u64, max_scan_bytes: u64,
+    poll: Option<SearchCancellationCallback>, context: *mut c_void) -> *mut c_char {
+    reply(|| answer(handle, |readers| {
+        if case_sensitive > 1 || count_all_matches > 1 { return Err(AccessError::InvalidArgument); }
+        let kind = match mode {
+            0 => ObservedReaderSearchKind::Text, 1 => ObservedReaderSearchKind::Occurrences,
+            _ => return Err(AccessError::InvalidArgument),
+        };
+        let needle = unsafe { bounded_text(needle, MAX_OBSERVED_READER_NEEDLE_BYTES) }?;
+        let encoding = decode_encoding(encoding)?;
+        let max_matches = usize::try_from(max_matches).map_err(|_| AccessError::InvalidArgument)?;
+        readers.execute(handle, Command::FindMode { generation, needle, encoding, kind,
             case_sensitive: case_sensitive == 1, count_all_matches: count_all_matches == 1,
             max_matches, max_scan_bytes }, || poll.is_some_and(|poll| unsafe { poll(context) != 0 }))
     }))

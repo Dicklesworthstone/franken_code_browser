@@ -2,7 +2,7 @@
 
 //! Native-host composition of the public, bounded FileSearch engine. The last
 //! accepted query owns a small occurrence table and exact original witnesses.
-//! Exact queries share a literal; lowercase queries preserve each spelling.
+//! Exact/whole-token queries share a literal; lowercase queries preserve each spelling.
 //! No whole-file capture, source spool, new matcher or inferred context exists.
 
 use std::{fs::File, mem::size_of, sync::Arc};
@@ -11,16 +11,36 @@ use fcb::search::{CaptureRequest, DetectedEncoding, ExtentConsistency, FileSearc
     FileSearchReport, ResourceAllocationId, ResourceBudget, StreamReadOptions,
     StreamReadState, StreamReadStats, StreamReadStep, StreamingHit, StreamingMode, StreamingNeedle};
 use fcb::store::Sha256Digest;
+use fcb::search::identifier::{MAX_IDENTIFIER_BYTES, token_scalar};
 use fcb_core::ResourceLease;
 use crate::{AppError, EXIT_OK, EXIT_PARTIAL};
 use crate::output::Output;
 use super::{HostResponse, ObservedReaderEncoding, ObservedReaderError,
-    ObservedReaderSession, MAX_OBSERVED_READER_WINDOW_BYTES, check, decode, extent_sha256};
+    ObservedReaderSession, Observation, MAX_OBSERVED_READER_WINDOW_BYTES, check, decode, extent_sha256};
 
 pub const MAX_OBSERVED_READER_NEEDLE_BYTES: usize = 4096;
 pub const MAX_OBSERVED_READER_MATCHES: usize = 256;
 pub const MAX_OBSERVED_READER_SCAN_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const MAX_OBSERVED_READER_SEARCH_CALLS: u64 = 1_048_576;
+pub const MAX_OBSERVED_READER_OCCURRENCE_BYTES: usize = MAX_IDENTIFIER_BYTES;
+
+/// Whole-token occurrences are exact text candidates, including comments and
+/// literals, under the shared conservative token policy. They are not compiler
+/// references. Text mode preserves the existing literal/lowercase semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservedReaderSearchKind { Text, Occurrences }
+impl ObservedReaderSearchKind {
+    pub const fn requested(self) -> &'static str {
+        match self { Self::Text => "text", Self::Occurrences => "occurrences" }
+    }
+    pub const fn realized(self, case_sensitive: bool) -> &'static str {
+        match self {
+            Self::Occurrences => "whole-token-occurrences",
+            Self::Text if case_sensitive => "exact-decoded-text",
+            Self::Text => "unicode-lowercase-text",
+        }
+    }
+}
 
 pub(super) struct AcceptedSearch {
     request: CaptureRequest,
@@ -33,6 +53,7 @@ pub(super) struct AcceptedSearch {
     io: StreamReadStats,
     matches_seen: u64,
     count_all_matches: bool,
+    kind: ObservedReaderSearchKind,
     case_sensitive: bool,
     unsupported_at: Option<ByteOffset>,
     max_matches: usize,
@@ -51,6 +72,8 @@ struct SearchWitness { text: String, bytes: Vec<u8>, sha256: Sha256Digest }
 /// the current query cannot erase the provenance needed for history replay.
 #[derive(Clone, Copy)]
 pub(super) struct FindHit {
+    kind: ObservedReaderSearchKind,
+    case_sensitive: bool,
     generation: u64,
     search_observation: u64,
     hit_index: usize,
@@ -80,7 +103,8 @@ impl ObservedReaderSession {
     pub fn search(&mut self, generation: u64, needle: &str, encoding: ObservedReaderEncoding,
         max_matches: usize, max_scan_bytes: u64, canceled: impl FnMut() -> bool)
         -> Result<HostResponse, ObservedReaderError> {
-        self.search_inner(generation, needle, encoding, max_matches, max_scan_bytes, true, false, canceled)
+        self.search_inner(generation, needle, encoding, ObservedReaderSearchKind::Text,
+            max_matches, max_scan_bytes, true, false, canceled)
     }
 
     /// Count every exact occurrence within the same byte/read-call budgets while
@@ -88,7 +112,8 @@ impl ObservedReaderSession {
     pub fn search_counted(&mut self, generation: u64, needle: &str, encoding: ObservedReaderEncoding,
         max_matches: usize, max_scan_bytes: u64, canceled: impl FnMut() -> bool)
         -> Result<HostResponse, ObservedReaderError> {
-        self.search_inner(generation, needle, encoding, max_matches, max_scan_bytes, true, true, canceled)
+        self.search_inner(generation, needle, encoding, ObservedReaderSearchKind::Text,
+            max_matches, max_scan_bytes, true, true, canceled)
     }
 
     /// Search with an explicit frozen matching/count policy. Lowercase matching
@@ -96,12 +121,26 @@ impl ObservedReaderSession {
     pub fn find_matching(&mut self, generation: u64, needle: &str, encoding: ObservedReaderEncoding,
         case_sensitive: bool, count_all_matches: bool, max_matches: usize, max_scan_bytes: u64,
         canceled: impl FnMut() -> bool) -> Result<HostResponse, ObservedReaderError> {
-        self.search_inner(generation, needle, encoding, max_matches, max_scan_bytes,
+        self.find_with_kind(generation, needle, encoding, ObservedReaderSearchKind::Text,
+            case_sensitive, count_all_matches, max_matches, max_scan_bytes, canceled)
+    }
+
+    /// Search literal text or exact whole-token occurrences with one frozen
+    /// mode/count policy. Occurrences use the shared streaming token cursor,
+    /// including UTF-16 and read-chunk boundaries, without retaining the file.
+    /// Only case-sensitive occurrences are supported; incompatible options and
+    /// invalid token names fail before source I/O and preserve accepted results.
+    pub fn find_with_kind(&mut self, generation: u64, needle: &str, encoding: ObservedReaderEncoding,
+        kind: ObservedReaderSearchKind, case_sensitive: bool, count_all_matches: bool,
+        max_matches: usize, max_scan_bytes: u64, canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, ObservedReaderError> {
+        self.search_inner(generation, needle, encoding, kind, max_matches, max_scan_bytes,
             case_sensitive, count_all_matches, canceled)
     }
 
     fn search_inner(&mut self, generation: u64, needle: &str, encoding: ObservedReaderEncoding,
-        max_matches: usize, max_scan_bytes: u64, case_sensitive: bool, count_all_matches: bool,
+        kind: ObservedReaderSearchKind, max_matches: usize, max_scan_bytes: u64,
+        case_sensitive: bool, count_all_matches: bool,
         mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, ObservedReaderError> {
         if generation == 0 || generation <= self.last_query_attempt { return Err(ObservedReaderError::StaleQuery); }
@@ -113,7 +152,8 @@ impl ObservedReaderSession {
             .map_err(|_| ObservedReaderError::IdentityExhausted)?;
         check(&mut canceled)?;
         if needle.is_empty() || needle.len() > MAX_OBSERVED_READER_NEEDLE_BYTES
-            || max_matches > MAX_OBSERVED_READER_MATCHES || max_scan_bytes > MAX_OBSERVED_READER_SCAN_BYTES {
+            || max_matches > MAX_OBSERVED_READER_MATCHES || max_scan_bytes > MAX_OBSERVED_READER_SCAN_BYTES
+            || (kind == ObservedReaderSearchKind::Occurrences && !case_sensitive) {
             return Err(ObservedReaderError::InvalidLimits);
         }
         // Reserve representable cumulative accounting before any payload read.
@@ -121,7 +161,12 @@ impl ObservedReaderSession {
         self.source_bytes_read.checked_add(max_scan_bytes).ok_or(ObservedReaderError::IdentityExhausted)?;
         self.read_calls.checked_add(MAX_OBSERVED_READER_SEARCH_CALLS).ok_or(ObservedReaderError::IdentityExhausted)?;
         let [pattern_id, worker_id, result_id] = self.allocations()?;
-        let pattern = StreamingNeedle::text_matching(self.owner(), needle, case_sensitive, &self.budget, pattern_id).map_err(AppError::from)?;
+        let pattern = match kind {
+            ObservedReaderSearchKind::Text =>
+                StreamingNeedle::text_matching(self.owner(), needle, case_sensitive, &self.budget, pattern_id),
+            ObservedReaderSearchKind::Occurrences =>
+                StreamingNeedle::identifier(self.owner(), needle, &self.budget, pattern_id),
+        }.map_err(AppError::from)?;
         let request = CaptureRequest::new(self.reader.file_id(), revision)?;
         let options = StreamReadOptions { generation, max_matches, max_bytes: max_scan_bytes,
             max_read_calls: MAX_OBSERVED_READER_SEARCH_CALLS,
@@ -186,14 +231,21 @@ impl ObservedReaderSession {
         let hit = *query.hits.get(hit_index).ok_or(ObservedReaderError::MissingHit)?;
         let (witness_text, witness, _) = query.witness(hit_index)?;
         let witness_bytes = witness.len();
-        // Scalar/CRLF floors can move both visible edges. Keep eight bytes of
-        // slack so preferred context cannot clip any part of the selected hit.
+        // Scalar/CRLF floors can move both visible edges. Occurrences also
+        // require both adjacent scalars (or a qualified input boundary); zero
+        // requested context must not skip whole-token revalidation.
+        let occurrences = query.kind == ObservedReaderSearchKind::Occurrences;
+        let slack = if occurrences { 24 } else { 8 };
         if !(4..=MAX_OBSERVED_READER_WINDOW_BYTES).contains(&window_bytes)
             || context_bytes > MAX_OBSERVED_READER_WINDOW_BYTES
-            || witness_bytes.checked_add(8).is_none_or(|need| need > window_bytes) {
+            || witness_bytes.checked_add(slack).is_none_or(|need| need > window_bytes) {
             return Err(ObservedReaderError::InvalidLimits);
         }
-        let prefix = context_bytes.min(window_bytes - witness_bytes - 8) as u64;
+        let prefix = if occurrences {
+            context_bytes.max(8).min(window_bytes - witness_bytes - 16)
+        } else {
+            context_bytes.min(window_bytes - witness_bytes - 8)
+        } as u64;
         let offset = hit.original_range().start().get().saturating_sub(prefix);
         let mut candidate = self.capture_window(revision, offset, window_bytes, query.encoding, &mut canceled)?;
         let [decode_id, clipped_decode_id] = self.allocations()?;
@@ -208,7 +260,13 @@ impl ObservedReaderSession {
             || selection.text != witness_text || selection.contains_replacements {
             return Err(ObservedReaderError::SearchHitChanged);
         }
-        candidate.find_hit = Some(FindHit { generation, search_observation: query.request.revision().get(),
+        if occurrences {
+            let start = usize::try_from(decoded.start().get()).map_err(|_| ObservedReaderError::InvalidRange)?;
+            let end = usize::try_from(decoded.end().get()).map_err(|_| ObservedReaderError::InvalidRange)?;
+            verify_token_context(&candidate, &text, start, end)?;
+        }
+        candidate.find_hit = Some(FindHit { kind: query.kind, case_sensitive: query.case_sensitive,
+            generation, search_observation: query.request.revision().get(),
             hit_index, occurrence: hit.occurrence_id(), original_range: original,
             decoded_start: decoded.start().get(), decoded_end: decoded.end().get() });
         let response = self.page_response_decoded("observe-hit", &candidate, &text, true, &mut canceled)?;
@@ -263,6 +321,28 @@ impl ObservedReaderSession {
     }
 }
 
+/// Compare adjacent decoded scalars from this same new observation. A matching
+/// witness can cease to be a whole token after a neighboring edit; a clipped
+/// window or a byte limit cannot stand in for a delimiter or observed EOF.
+fn verify_token_context(page: &Observation, text: &fcb::search::ExtentText, start: usize, end: usize)
+    -> Result<(), ObservedReaderError> {
+    let before = text.text().get(..start).ok_or(ObservedReaderError::SearchHitChanged)?;
+    let after = text.text().get(end..).ok_or(ObservedReaderError::SearchHitChanged)?;
+    match before.chars().next_back() {
+        Some(scalar) if !token_scalar(scalar) => {}
+        None if page.plan.visible.start().get() == 0 => {}
+        _ => return Err(ObservedReaderError::SearchHitChanged),
+    }
+    match after.chars().next() {
+        Some(scalar) if !token_scalar(scalar) => {}
+        None if text.range().end().get() == page.extent.observed_length().get()
+            && page.extent.request_filled()
+            && page.extent.consistency() == ExtentConsistency::UnchangedMetadata => {}
+        _ => return Err(ObservedReaderError::SearchHitChanged),
+    }
+    Ok(())
+}
+
 pub(super) fn encode_find_hit(out: &mut Output, hit: Option<FindHit>) -> Result<(), ObservedReaderError> {
     out.literal(",\"find_hit\":")?;
     let Some(hit) = hit else { out.literal("null")?; return Ok(()); };
@@ -273,7 +353,11 @@ pub(super) fn encode_find_hit(out: &mut Output, hit: Option<FindHit>) -> Result<
     out.literal(",\"original_range\":")?; out.range(hit.original_range)?;
     out.literal(",\"decoded_utf8_range\":{\"start\":")?; out.integer(hit.decoded_start)?;
     out.literal(",\"end\":")?; out.integer(hit.decoded_end)?;
-    out.literal("},\"witness_verified\":true,\"verification\":\"equal-original-bytes-in-new-observation\"}")?;
+    out.literal("},\"witness_verified\":true,\"verification\":\"equal-original-bytes-in-new-observation\"")?;
+    encode_mode(out, hit.kind, hit.case_sensitive)?;
+    out.literal(",\"token_boundaries_verified\":")?;
+    out.boolean(hit.kind == ObservedReaderSearchKind::Occurrences)?;
+    out.literal("}")?;
     Ok(())
 }
 
@@ -298,7 +382,12 @@ impl AcceptedSearch {
         check(canceled)?;
         let search = report.search();
         let text = search.text_literal().ok_or(ObservedReaderError::InvalidRange)?;
-        let case_sensitive = search.mode() == StreamingMode::ExactText;
+        let (kind, case_sensitive) = match search.mode() {
+            StreamingMode::ExactText => (ObservedReaderSearchKind::Text, true),
+            StreamingMode::LowercaseText => (ObservedReaderSearchKind::Text, false),
+            StreamingMode::Identifier => (ObservedReaderSearchKind::Occurrences, true),
+            StreamingMode::OriginalBytes => return Err(ObservedReaderError::InvalidRange),
+        };
         let witness = if search.hits().is_empty() || !case_sensitive { &[][..] }
             else { search.witness_bytes(0).map_err(AppError::from)? };
         let mut per_hit_charge = 0usize;
@@ -344,7 +433,7 @@ impl AcceptedSearch {
         Ok(Self { request: search.request(), generation: search.generation(), encoding,
             observed_length: search.observed_length(), final_length: report.final_length(),
             consistency: report.consistency(), state: search.state(), io: search.stats(),
-            matches_seen: search.matches_seen(), count_all_matches: search.count_all_matches(), case_sensitive,
+            matches_seen: search.matches_seen(), count_all_matches: search.count_all_matches(), kind, case_sensitive,
             unsupported_at: search.unsupported_at(), max_matches, max_scan_bytes,
             literal_text, literal_bytes, sha256, witnesses, hits, _lease: lease })
     }
@@ -390,10 +479,20 @@ fn scan<'needle>(file: File, request: CaptureRequest, needle: &'needle Streaming
     (result, io)
 }
 
+fn encode_mode(out: &mut Output, kind: ObservedReaderSearchKind, case_sensitive: bool)
+    -> Result<(), ObservedReaderError> {
+    out.literal(",\"mode\":")?; out.quoted(kind.realized(case_sensitive))?;
+    out.literal(",\"requested_mode\":")?; out.quoted(kind.requested())?;
+    out.literal(",\"realized_mode\":")?; out.quoted(kind.realized(case_sensitive))?;
+    out.literal(",\"case_sensitive\":")?; out.boolean(case_sensitive)?;
+    if kind == ObservedReaderSearchKind::Occurrences {
+        out.literal(",\"evidence_level\":\"whole-token-text-candidate\",\"includes_comments_and_literals\":true,\"compiler_resolved\":false,\"semantic_complete\":false")?;
+    }
+    Ok(())
+}
+
 fn encode_query(out: &mut Output, query: &AcceptedSearch) -> Result<(), ObservedReaderError> {
-    out.literal(",\"mode\":")?;
-    out.quoted(if query.case_sensitive { "exact-decoded-text" } else { "unicode-lowercase-text" })?;
-    out.literal(",\"case_sensitive\":")?; out.boolean(query.case_sensitive)?;
+    encode_mode(out, query.kind, query.case_sensitive)?;
     out.literal(",\"query_generation\":")?; out.integer(query.generation.get())?;
     out.literal(",\"search_observation\":")?; out.integer(query.request.revision().get())?;
     out.literal(",\"encoding\":")?; out.quoted(query.encoding.code())?;

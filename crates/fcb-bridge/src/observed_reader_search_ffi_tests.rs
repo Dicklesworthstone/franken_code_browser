@@ -189,3 +189,98 @@ fn c_counted_find_keeps_budget_and_cancellation_semantics() {
     assert!(take(fcb_observed_reader_search_hit(handle, 1, 0)).contains("\"original_hex\":\"616e61\""));
     assert_eq!(fcb_observed_reader_close(handle), 1);
 }
+
+fn find_mode(handle: u64, generation: u64, needle: &str, encoding: u64, mode: u64,
+    case_sensitive: u64, count_all_matches: u64, hits: u64, bytes: u64) -> String {
+    let needle = CString::new(needle).unwrap();
+    take(unsafe { fcb_observed_reader_find_mode(handle, generation, needle.as_ptr(), encoding,
+        mode, case_sensitive, count_all_matches, hits, bytes, None, std::ptr::null_mut()) })
+}
+
+#[test]
+fn c_occurrence_mode_distinguishes_tokens_from_literal_hits_and_counts_without_rows() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (root, croot) = root();
+    fs::write(root.join("source"), b"cat bobcat cat2 _cat $cat cat$ // cat\n\"cat\" Cat\n").unwrap();
+    let handle = open(&croot);
+    let literal = find(handle, 1, "cat", 1, 16, 1024);
+    assert_eq!(number(&literal, "matches_seen"), 8);
+    assert!(literal.contains("\"mode\":\"exact-decoded-text\""));
+    let tokens = find_mode(handle, 2, "cat", 1, 1, 1, 0, 16, 1024);
+    for expected in ["\"mode\":\"whole-token-occurrences\"", "\"requested_mode\":\"occurrences\"",
+        "\"realized_mode\":\"whole-token-occurrences\"", "\"case_sensitive\":true",
+        "\"evidence_level\":\"whole-token-text-candidate\"", "\"includes_comments_and_literals\":true",
+        "\"compiler_resolved\":false", "\"semantic_complete\":false", "\"search_complete\":true"] {
+        assert!(tokens.contains(expected), "missing {expected}: {tokens}");
+    }
+    assert_eq!(number(&tokens, "matches_seen"), 3);
+    assert_eq!(number(&tokens, "retained_hits"), 3);
+    let witness = take(fcb_observed_reader_search_hit(handle, 2, 0));
+    assert!(witness.contains("\"original_hex\":\"636174\""));
+    assert!(witness.contains("\"mode\":\"whole-token-occurrences\""));
+    let current = hit(handle, 2, 0);
+    assert!(current.contains("\"token_boundaries_verified\":true"), "{current}");
+    let counted = find_mode(handle, 3, "cat", 1, 1, 1, 1, 0, 1024);
+    assert_eq!(number(&counted, "matches_seen"), 3);
+    assert_eq!(number(&counted, "retained_hits"), 0);
+    assert!(counted.contains("\"match_count_complete\":true"));
+    assert!(counted.contains("\"truncated\":true"));
+    assert_eq!(fcb_observed_reader_close(handle), 1);
+}
+
+#[test]
+fn c_occurrence_mode_keeps_utf16_witnesses_but_refuses_changed_neighbor_boundaries() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (root, croot) = root();
+    let bytes: Vec<u8> = "\u{feff}cat catx cat".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    fs::write(root.join("source"), &bytes).unwrap();
+    let handle = open(&croot);
+    let tokens = find_mode(handle, 1, "cat", 2, 1, 1, 0, 16, 1024);
+    assert_eq!(number(&tokens, "matches_seen"), 2);
+    assert!(tokens.contains("\"original_range\":{\"start\":\"2\",\"end\":\"8\"}"));
+    assert!(tokens.contains("\"original_range\":{\"start\":\"20\",\"end\":\"26\"}"));
+    let current = hit(handle, 1, 0);
+    assert!(current.contains("\"token_boundaries_verified\":true"), "{current}");
+    let observation = number(&current, "observation");
+    let file = OpenOptions::new().write(true).open(root.join("source")).unwrap();
+    file.write_at(&[b'x', 0], 8).unwrap();
+    assert!(hit(handle, 1, 0).contains("OBSERVED_READER_SEARCH_HIT_CHANGED"));
+    let old = take(fcb_observed_reader_search_hit(handle, 1, 0));
+    assert!(old.contains("\"original_hex\":\"630061007400\""));
+    assert!(old.contains("\"additional_source_bytes_read\":\"0\""));
+    // A later literal query does not rewrite the mode frozen in history.
+    assert_eq!(number(&find(handle, 2, "cat", 2, 16, 1024), "matches_seen"), 3);
+    let replay = take(fcb_observed_reader_retained(handle, observation));
+    assert!(replay.contains("\"mode\":\"whole-token-occurrences\""));
+    assert!(replay.contains("\"token_boundaries_verified\":true"));
+    assert!(replay.contains("\"query_generation\":\"1\""));
+    assert_eq!(fcb_observed_reader_close(handle), 1);
+}
+
+#[test]
+fn c_occurrence_mode_rejects_unknown_flags_invalid_names_and_canceled_replacements() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (root, croot) = root();
+    fs::write(root.join("source"), b"foo foobar Foo").unwrap();
+    let handle = open(&croot);
+    assert_eq!(number(&find_mode(handle, 1, "foo", 1, 1, 1, 0, 16, 1024), "matches_seen"), 1);
+    for (mode, case_sensitive, count_all) in [(2, 1, 0), (u64::MAX, 1, 0), (1, 2, 0), (1, 1, 2)] {
+        let result = find_mode(handle, 2, "foo", 1, mode, case_sensitive, count_all, 16, 1024);
+        assert!(result.contains("OBSERVED_READER_HANDLE_INVALID_ARGUMENT"), "{result}");
+    }
+    let incompatible = find_mode(handle, 2, "foo", 1, 1, 0, 0, 16, 1024);
+    assert!(incompatible.contains("OBSERVED_READER_INVALID_LIMITS"), "{incompatible}");
+    for (generation, name) in [(3, "foo bar"), (4, "1foo"), (5, "foo-bar")] {
+        let result = find_mode(handle, generation, name, 1, 1, 1, 0, 16, 1024);
+        assert!(result.contains("STREAM_READ_INVALID_IDENTIFIER"), "{result}");
+    }
+    let needle = CString::new("foo").unwrap();
+    let canceled = take(unsafe { fcb_observed_reader_find_mode(handle, 6, needle.as_ptr(),
+        1, 1, 1, 0, 16, 1024, Some(cancel_now), std::ptr::null_mut()) });
+    assert!(canceled.contains("\"exit_code\":\"130\""), "{canceled}");
+    assert!(take(fcb_observed_reader_search_hit(handle, 1, 0)).contains("\"text\":\"foo\""));
+    let lower = find_mode(handle, 7, "foo", 1, 0, 0, 1, 16, 1024);
+    assert_eq!(number(&lower, "matches_seen"), 3);
+    assert!(lower.contains("\"mode\":\"unicode-lowercase-text\""));
+    assert_eq!(fcb_observed_reader_close(handle), 1);
+}
