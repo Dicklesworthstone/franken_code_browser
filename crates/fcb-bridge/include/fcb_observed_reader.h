@@ -82,6 +82,24 @@ char *fcb_observed_reader_retained(uint64_t handle, uint64_t observation);
 char *fcb_observed_reader_copy(uint64_t handle, uint64_t observation,
     uint64_t start, uint64_t end);
 
+/* Resolve one nonempty selection in the accepted observation's displayed
+ * logical text. utf8_start/end are half-open UTF-8 byte offsets LOCAL to that
+ * text, not native UTF-16 units or absolute source offsets. The native host
+ * supplies whole grapheme boundaries and verifies the reply against the
+ * currently displayed observation before permitting copy.
+ *
+ * Returns command "resolve-selection", selection_namespace "native-text",
+ * window_original_range, window_utf8_range, exact absolute original_range,
+ * decoded text, original_hex and contains_replacements. All observation and
+ * extent digest fields are preserved; additional source I/O counters are zero.
+ * At most 256 KiB of selected original bytes is admitted. Empty/reversed,
+ * split-scalar, past-end and evicted-observation selections fail explicitly.
+ * A malformed-byte replacement is disclosed; exact hex keeps those bytes.
+ * No clipboard side effect, source reread or whole-file capture is implied.
+ */
+char *fcb_observed_reader_resolve_selection(uint64_t handle, uint64_t observation,
+    uint64_t utf8_start, uint64_t utf8_end);
+
 /* Exact case-sensitive decoded-text search from byte zero of the SAME opened
  * file object. Runs on a worker, polling cooperatively between bounded reads.
  * generation is nonzero and strictly increases on each valid query attempt.

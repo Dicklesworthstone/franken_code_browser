@@ -68,6 +68,7 @@ pub(super) enum Command<'a> {
         encoding: ObservedReaderEncoding },
     Retained { observation: u64 },
     Copy { observation: u64, start: u64, end: u64 },
+    ResolveSelection { observation: u64, utf8_start: u64, utf8_end: u64 },
     Find { generation: u64, needle: &'a str, encoding: ObservedReaderEncoding,
         max_matches: usize, max_scan_bytes: u64 },
     FindCounted { generation: u64, needle: &'a str, encoding: ObservedReaderEncoding,
@@ -160,6 +161,8 @@ impl ObservedReaderSessions {
                 reader.read_lines(first_line, line_count, max_bytes, max_scan_bytes, encoding, &mut stop),
             Command::Retained { observation } => reader.retained_window(observation, &mut stop),
             Command::Copy { observation, start, end } => reader.copy_range(observation, start, end, &mut stop),
+            Command::ResolveSelection { observation, utf8_start, utf8_end } =>
+                reader.resolve_selection(observation, utf8_start, utf8_end, &mut stop),
             Command::Find { generation, needle, encoding, max_matches, max_scan_bytes } =>
                 reader.search(generation, needle, encoding, max_matches, max_scan_bytes, &mut stop),
             Command::FindCounted { generation, needle, encoding, max_matches, max_scan_bytes } =>

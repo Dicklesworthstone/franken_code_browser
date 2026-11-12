@@ -124,6 +124,16 @@ pub extern "C" fn fcb_observed_reader_copy(handle: u64, observation: u64, start:
         Command::Copy { observation, start, end }, || false)))
 }
 
+/// Resolve decoded UTF-8 boundaries in one exact retained observation. This
+/// performs no source I/O and has no clipboard effect. Cancellation through the
+/// handle's epoch withdraws in-flight delivery; the observation stays readable.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_observed_reader_resolve_selection(handle: u64, observation: u64,
+    utf8_start: u64, utf8_end: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| readers.execute(handle,
+        Command::ResolveSelection { observation, utf8_start, utf8_end }, || false)))
+}
+
 /// Search one continuous observation of the already opened file. Only exact
 /// literal witnesses are retained, not surrounding source or a whole capture.
 /// # Safety
@@ -229,3 +239,7 @@ mod search_tests;
 #[cfg(all(test, unix))]
 #[path = "observed_reader_lines_ffi_tests.rs"]
 mod lines_tests;
+
+#[cfg(all(test, unix))]
+#[path = "observed_reader_selection_ffi_tests.rs"]
+mod selection_tests;

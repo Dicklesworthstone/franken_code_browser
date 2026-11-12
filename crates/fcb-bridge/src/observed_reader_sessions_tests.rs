@@ -192,3 +192,57 @@ fn closing_a_line_scan_revokes_delivery_and_keeps_other_readers_available() {
     for handle in handles.into_iter().skip(1) { readers.close(handle).unwrap(); }
     assert_eq!(readers.live.load(Ordering::Acquire), 0);
 }
+
+#[test]
+fn native_selection_cancellation_revokes_delivery_without_revoking_retained_bytes() {
+    let readers = ObservedReaderSessions::new();
+    let handle = readers.create().unwrap();
+    let path = root();
+    readers.open(handle, &path, b"source.rs", || false).unwrap();
+    readers.execute(handle, Command::Window { offset: 0, bytes: 32,
+        encoding: ObservedReaderEncoding::Utf8 }, || false).unwrap();
+    let before = readers.execute(handle, Command::Info, || false).unwrap();
+    let mut canceled = false;
+    let response = readers.execute(handle, Command::ResolveSelection {
+        observation: 1, utf8_start: 0, utf8_end: 5,
+    }, || {
+        if !canceled { canceled = true; readers.cancel(handle).unwrap(); }
+        false
+    });
+    assert!(matches!(response, Err(AccessError::Canceled)));
+    let after = readers.execute(handle, Command::Info, || false).unwrap();
+    assert_eq!(before.as_str(), after.as_str());
+    let selected = readers.execute(handle, Command::ResolveSelection {
+        observation: 1, utf8_start: 0, utf8_end: 5,
+    }, || false).unwrap();
+    assert!(selected.as_str().contains("\"text\":\"first\""));
+    assert!(selected.as_str().contains("\"additional_source_bytes_read\":\"0\""));
+    readers.close(handle).unwrap();
+}
+
+#[test]
+fn close_during_native_selection_does_not_touch_another_reader() {
+    let readers = ObservedReaderSessions::new();
+    let first = readers.create().unwrap();
+    let second = readers.create().unwrap();
+    let path = root();
+    for handle in [first, second] {
+        readers.open(handle, &path, b"source.rs", || false).unwrap();
+        readers.execute(handle, Command::Window { offset: 0, bytes: 32,
+            encoding: ObservedReaderEncoding::Utf8 }, || false).unwrap();
+    }
+    let mut closed = false;
+    let response = readers.execute(first, Command::ResolveSelection {
+        observation: 1, utf8_start: 0, utf8_end: 5,
+    }, || {
+        if !closed { closed = true; readers.close(first).unwrap(); }
+        false
+    });
+    assert!(matches!(response, Err(AccessError::Closed)));
+    let selected = readers.execute(second, Command::ResolveSelection {
+        observation: 1, utf8_start: 0, utf8_end: 5,
+    }, || false).unwrap();
+    assert!(selected.as_str().contains("\"text\":\"first\""));
+    assert!(matches!(readers.execute(first, Command::Info, || false), Err(AccessError::Unknown)));
+    readers.close(second).unwrap();
+}
