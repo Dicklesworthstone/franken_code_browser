@@ -285,6 +285,40 @@ occurrences, large target ranges, partial coverage, independent generations,
 lost replies, cancellation and stale or forged activation receipts. Executable
 Rust/Swift verification and physical-Mac qualification remain pending.
 
+## Following imports in a saved repository
+
+Open an FCBS archive in **Saved Repository**, choose **Imports**, and select
+**Build imports**. This uses the same Rust, JavaScript/TypeScript/JSX/TSX and
+Python lexical import engine and finite catalog policies as Project relationships.
+The archive supplies both source evidence and target membership; opening an
+import does not require a working-tree checkout or grant access to live paths.
+
+**All imports** lists the retained statements. Select a member on the left and
+choose **Outgoing** or **Imported by** to inspect either direction. Each row
+keeps the original statement and specifier byte ranges and reports whether its
+target is captured, unavailable, missing, ambiguous, external or unresolved.
+**Read statement** opens the original source near that exact statement range.
+**Open target candidate** is available only for a unique captured catalog target.
+Both actions reverify the member digest from the already opened archive before
+installing an independent reader; in-place corruption never substitutes live
+source. Opened readers remain usable after the import inventory or archive closes.
+
+The build processes one source member at a time, admits at most 128 KiB per
+source and 32 MiB in aggregate, and retains up to 4,096 import occurrences.
+Accepted inventory data contains metadata, with no retained source payloads.
+Pagination and direction changes use that inventory without repeating source
+reads. Missing captures, unsupported sources, parser diagnostics, source limits,
+row truncation and incomplete archive discovery remain visible coverage limits.
+An empty partial result does not establish the absence of incoming imports.
+
+Import builds and clears have their own generation, independent of text,
+structural and documentation-link searches. Failed or canceled replacements
+preserve the previous accepted inventory; **Reload** reconciles a lost response
+with the same open archive. Original UTF-8 and UTF-16 byte evidence, native path
+bytes, cancellation, stale identities, corruption and independent reader
+lifetimes have host, C-ABI and native regression cases. Executable verification
+and physical-Mac qualification remain pending.
+
 ## Saved repository search indexes
 
 In **Saved Repository → Search → Literal**, expand **Saved search index**
@@ -594,8 +628,8 @@ binding. Bare-relative wildcard imports have no guessed target.
 The inventory admits 128 KiB per source, 32 MiB of aggregate parsing and 4,096
 retained statements. Unsupported syntax, malformed decoding, parse limits and
 omitted rows remain visible coverage conditions. These limits apply to the
-captured project import browser; saved-repository relationship browsing remains
-a separate Markdown-link workflow. Rust/Swift regression fixtures cover Python
+captured project import browser. The **Saved Repository → Imports** workflow
+applies the same lexical policies to archived members. Rust/Swift regression fixtures cover Python
 source spans, UTF-16 coordinates, relative targets, ambiguity, stale captures and
 native evidence validation. Executable and physical-Mac verification remain
 pending.

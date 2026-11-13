@@ -42,7 +42,7 @@ final class AtlasSavedFileAccess {
     @State private var panelNotice = ""
     @State private var section: Section = .text
     private enum Section: String, CaseIterable, Identifiable {
-        case text = "Search", links = "Documentation links"
+        case text = "Search", links = "Documentation links", imports = "Imports"
         var id: String { rawValue }
     }
     @State private var readerCapture: AtlasSavedReaderCapture?
@@ -70,14 +70,20 @@ final class AtlasSavedFileAccess {
                         Picker("Saved repository activity", selection: $section) {
                             ForEach(Section.allCases) { Text($0.rawValue).tag($0) }
                         }.pickerStyle(.segmented).padding(.leading, 8)
-                        if section == .text { searchPane } else { relationshipsPane }
+                        if section == .text { searchPane }
+                        else if section == .imports { importsPane }
+                        else { relationshipsPane }
                     }.frame(minWidth: 620, maxWidth: .infinity, maxHeight: .infinity)
+                        .onChange(of: section) { _, next in
+                            if next == .imports, model.imports == nil { model.loadImports(direction: model.importDirection) }
+                            if next == .links, model.relationships == nil { model.loadRelationships(direction: model.direction) }
+                        }
                 }
             } else {
                 VStack(spacing: 14) {
                     Image(systemName: "archivebox").font(.system(size: 42)).foregroundStyle(.secondary)
                     Text("Save and read a repository").font(.title2.weight(.semibold))
-                    Text("Choose an FCBS archive to search captured text, symbols, headings and identifier occurrences, read source and Markdown, and follow documentation links.")
+                    Text("Choose an FCBS archive to search captured text, symbols, headings and identifier occurrences, read source and Markdown, and follow documentation links or source imports.")
                         .multilineTextAlignment(.center).frame(maxWidth: 540)
                     Button("Open saved repository…", action: chooseArchive).disabled(!model.canOperate)
                     Text("The archive is read only. Unavailable members remain visible, with their omission reason.")
@@ -216,7 +222,7 @@ final class AtlasSavedFileAccess {
     }
     private func memberRow(_ member: AtlasSavedMember, in page: AtlasSavedMembers) -> some View {
         Button {
-            panelNotice = ""; model.selectMember(member, from: page.identity)
+            panelNotice = ""; model.selectMember(member, from: page.identity, forImports: section == .imports)
         } label: {
             HStack(alignment: .top, spacing: 7) {
                 Image(systemName: member.captured ? "doc.text" : "doc.badge.ellipsis")
@@ -667,6 +673,88 @@ final class AtlasSavedFileAccess {
         }.padding(10).frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.primary.opacity(0.035)).clipShape(RoundedRectangle(cornerRadius: 7))
     }
+    private var importsPane: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Source imports").font(.headline)
+                Spacer()
+                Button(model.importGeneration == nil ? "Build imports" : "Rebuild imports") {
+                    panelNotice = ""; model.prepareImports()
+                }
+                Button("Reload", action: model.reloadImports)
+                Button("Clear", action: model.clearImports).disabled(model.importGeneration == nil)
+            }.disabled(!model.canOperate)
+            Picker("Import direction", selection: Binding(get: { model.importDirection }, set: { model.loadImports(direction: $0) })) {
+                Text("All imports").tag(AtlasSavedDirection.all)
+                Text("Outgoing").tag(AtlasSavedDirection.outgoing).disabled(model.selectedMember == nil)
+                Text("Imported by").tag(AtlasSavedDirection.incoming).disabled(model.selectedMember == nil)
+            }.pickerStyle(.segmented).disabled(!model.canOperate || model.importGeneration == nil)
+            if model.importDirection != .all, let member = model.selectedMember {
+                Text("\(model.importDirection == .incoming ? "Imports targeting" : "Imports declared in") \(member.path.display)")
+                    .font(.caption).lineLimit(2).textSelection(.enabled)
+            }
+            Text("Rust modules/use, JavaScript and TypeScript imports/re-exports, and Python imports. Targets are candidates in this saved manifest; compiler and package resolution are not established.")
+                .font(.caption).foregroundStyle(.secondary)
+            if let page = model.imports, model.importsAreCurrent {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(page.complete ? "Lexical coverage complete within the saved manifest" : "Partial lexical import coverage")
+                        .font(.caption.weight(.semibold)).foregroundStyle(page.complete ? Color.secondary : Color.orange)
+                    Text("\(page.scanned) / \(page.sources) eligible members parsed · \(page.retained) imports retained · \(page.sourceBytes) source bytes read")
+                        .font(.caption)
+                    if !page.complete {
+                        Text("Unavailable: \(page.unavailable) · Unsupported: \(page.unsupported) · Source limit: \(page.sourceLimited) · Diagnostics: \(page.diagnostics)")
+                            .font(.caption).foregroundStyle(.secondary)
+                        if page.truncated { Text("Import retention was truncated; additional relationships may be omitted.").font(.caption).foregroundStyle(.orange) }
+                        if !page.identity.discoveryComplete { Text("Archive discovery was incomplete; files outside its manifest are unknown.").font(.caption).foregroundStyle(.orange) }
+                    }
+                }.textSelection(.enabled)
+                Divider()
+                if page.links.isEmpty {
+                    Text(page.complete ? "No matching lexical imports in the parsed saved members."
+                        : "No matching retained imports. Partial coverage cannot establish that this member has no imports or incoming dependencies.")
+                        .foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 10) {
+                            ForEach(page.links) { link in importRow(link, in: page) }
+                        }
+                    }.frame(maxHeight: .infinity)
+                }
+                HStack {
+                    Button("Previous imports") { model.loadImports(direction: page.direction, start: page.start >= 64 ? page.start - 64 : 0) }
+                        .disabled(!model.canOperate || page.start == 0)
+                    Spacer()
+                    Text("\(page.start)..<\(page.start + UInt64(page.links.count)) of \(page.matching)").font(.caption)
+                    Spacer()
+                    Button("Next imports") { if let next = page.next { model.loadImports(direction: page.direction, start: next) } }
+                        .disabled(!model.canOperate || page.next == nil)
+                }.controlSize(.small)
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(model.busy ? "Preparing saved import metadata…" : "Build imports to inspect source dependencies.").font(.headline)
+                    Text("Select a saved member to inspect its outgoing statements or incoming catalog candidates. Read the exact statement or open a captured target without a working-tree checkout.")
+                    Text("Each build admits up to 4,096 statements and 32 MiB of source, with a 128 KiB limit per source member. Unavailable, unsupported and limited sources remain visible in coverage.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 12)
+            }
+        }.padding(.leading, 8)
+    }
+    private func importRow(_ link: AtlasSavedImport, in page: AtlasSavedImports) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(verbatim: link.sourcePath.display).font(.caption.weight(.semibold)).lineLimit(2)
+            Text(verbatim: link.destination.debugDescription).font(.callout).lineLimit(4).textSelection(.enabled)
+            Text("\(link.label) · original bytes \(link.evidence.start)..<\(link.evidence.end)").font(.caption).foregroundStyle(.secondary)
+            Text(verbatim: link.resolutionLabel).font(.caption).foregroundStyle(.secondary)
+            if let target = link.targetPath { Text(verbatim: target.display).font(.caption).lineLimit(2).textSelection(.enabled) }
+            HStack {
+                Text(verbatim: link.resolutionBasis).font(.caption2).foregroundStyle(.secondary)
+                Spacer()
+                Button("Read statement") { openImport(link, from: page, side: .evidence) }
+                Button("Open target candidate") { openImport(link, from: page, side: .target) }.disabled(!link.canOpenTarget)
+            }.controlSize(.small).disabled(!model.canOperate || readerTask != nil)
+        }.padding(10).frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.primary.opacity(0.035)).clipShape(RoundedRectangle(cornerRadius: 7))
+    }
     private var relationshipsPane: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
@@ -851,6 +939,12 @@ final class AtlasSavedFileAccess {
                 search: .native, outline: .native, document: .native)
         }
     }
+    private func openImport(_ link: AtlasSavedImport, from page: AtlasSavedImports, side: AtlasSavedLinkSide) {
+        launchReader {
+            try await model.openImport(link, from: page, side: side, readerTransport: .native,
+                search: .native, outline: .native, document: .native)
+        }
+    }
     private func openHit(_ hit: AtlasSavedHit, from page: AtlasSavedSearchPage) {
         launchReader {
             try await model.openHit(hit, from: page, readerTransport: .native,
@@ -942,6 +1036,17 @@ final class AtlasSavedFileAccess {
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12)
             }
             if let match = capture.match { savedMatchActions(match) }
+            else if case .importLink(_, let link, .evidence) = capture.origin {
+                HStack {
+                    Text("Exact lexical statement in this captured source. Use the reader selection tools to inspect its original bytes.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Return to statement") {
+                        capture.reader.offsetInput = String(link.evidence.contextStart)
+                        capture.reader.goToByte()
+                    }.disabled(!capture.reader.canPin)
+                }.controlSize(.small).padding(.horizontal, 12)
+            }
             else if case .structureHit(_, _, _, _, let item) = capture.origin {
                 HStack {
                     Text("This result spans more than the bounded selection witness. The reader starts near its original source range.")

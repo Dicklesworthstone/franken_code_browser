@@ -30,6 +30,13 @@ import Foundation
 @_silgen_name("fcb_saved_open_member_reader") private func savedMemberReader(_ h: UInt64, _ reader: UInt64, _ member: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_open_relationship_reader") private func savedLinkReader(_ h: UInt64, _ reader: UInt64,
     _ generation: UInt64, _ link: UInt64, _ side: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_prepare_imports") private func savedPrepareImports(_ h: UInt64, _ generation: UInt64,
+    _ imports: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_imports") private func savedImports(_ h: UInt64, _ generation: UInt64,
+    _ direction: UInt64, _ member: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_clear_imports") private func savedClearImports(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_open_import_reader") private func savedImportReader(_ h: UInt64, _ reader: UInt64,
+    _ generation: UInt64, _ importID: UInt64, _ side: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_document_images_authorize") private func savedImagesAuthorize(_ h: UInt64,
     _ reader: UInt64, _ member: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_document_image_prepare") private func savedImagePrepare(_ h: UInt64,
@@ -106,6 +113,22 @@ extension AtlasSavedTransport {
         case .openMember(let reader, let member): return take(savedMemberReader(handle, reader, member))
         case .openRelationship(let reader, let generation, let link, let side):
             return take(savedLinkReader(handle, reader, generation, link, side.code))
+        case .prepareImports(let generation, let imports, let bytes):
+            guard generation > 0, (1...AtlasSavedImportWire.maximumLinks).contains(imports),
+                  bytes <= AtlasSavedImportWire.maximumSourceBytes else { return nil }
+            return take(savedPrepareImports(handle, generation, imports, bytes))
+        case .imports(let generation, let direction, let member, let start, let limit):
+            guard generation > 0, (direction == .all) == (member == nil),
+                  member == nil || member! < 65_536, start <= AtlasSavedImportWire.maximumLinks,
+                  (1...128).contains(limit) else { return nil }
+            return take(savedImports(handle, generation, direction.code, member ?? 0, start, limit))
+        case .clearImports(let generation):
+            guard generation > 0 else { return nil }
+            return take(savedClearImports(handle, generation))
+        case .openImport(let reader, let generation, let importID, let side):
+            guard reader > 0, reader != handle, generation > 0,
+                  (1...AtlasSavedImportWire.maximumLinks).contains(importID) else { return nil }
+            return take(savedImportReader(handle, reader, generation, importID, side.code))
         }
     }, cancel: { savedCancel($0) == 1 }, close: { savedClose($0) == 1 }, retirementFailed: {
         try? FileHandle.standardError.write(contentsOf: Data("FCB_SAVED_RETIREMENT_UNAVAILABLE\n".utf8))

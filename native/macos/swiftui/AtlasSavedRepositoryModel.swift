@@ -125,6 +125,9 @@ private final class AtlasSavedSession: @unchecked Sendable {
     private(set) var relationships: AtlasSavedRelationships?
     private(set) var direction: AtlasSavedDirection = .all
     private(set) var relationshipGeneration: UInt64?
+    private(set) var imports: AtlasSavedImports?
+    private(set) var importDirection: AtlasSavedDirection = .all
+    private(set) var importGeneration: UInt64?
     private(set) var searchPage: AtlasSavedSearchPage?
     private(set) var queryGeneration: UInt64?
     private(set) var expressionPage: AtlasSavedExpressionPage?
@@ -150,6 +153,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var cancellation: AtlasSearchCancellation?
     @ObservationIgnored private var lastRelationshipAttempt: UInt64 = 0
+    @ObservationIgnored private var lastImportAttempt: UInt64 = 0
     @ObservationIgnored private var lastQueryAttempt: UInt64 = 0
     @ObservationIgnored private var lastExpressionAttempt: UInt64 = 0
     @ObservationIgnored private var lastStructureAttempt: UInt64 = 0
@@ -158,6 +162,11 @@ private final class AtlasSavedSession: @unchecked Sendable {
     init(transport: AtlasSavedTransport) { self.transport = transport }
     var canOperate: Bool { !busy && !closed }
     var readerDomain: UUID? { transport.readerDomain }
+    var importsAreCurrent: Bool {
+        guard let imports, info?.identity == imports.identity, importGeneration == imports.generation,
+              importDirection == imports.direction else { return false }
+        return imports.direction == .all || imports.member == selectedMember?.id
+    }
     var validSearchInput: Bool { AtlasSavedSearchWire.validNeedle(searchInput) }
     var index: AtlasSavedIndex? { info?.index }
     var canChangeIndex: Bool { canOperate && info != nil && indexStateKnown }
@@ -214,12 +223,13 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 model.session = candidate; model.pending = nil
                 model.info = opened; model.members = page; model.selectedMember = page.items.first
                 model.relationships = nil; model.relationshipGeneration = nil; model.direction = .all
+                model.imports = nil; model.importGeneration = nil; model.importDirection = .all; model.lastImportAttempt = 0
                 model.lastRelationshipAttempt = 0; model.memberOffsetInput = "0"
                 model.searchPage = nil; model.queryGeneration = nil; model.lastQueryAttempt = 0; model.searchInput = ""
                 model.expressionPage = nil; model.expressionGeneration = nil; model.lastExpressionAttempt = 0
                 model.structurePage = nil; model.structureGeneration = nil; model.lastStructureAttempt = 0
                 model.indexStateKnown = true; model.indexPath = nil; model.lastIndexAttempt = 0; model.indexPinInput = ""
-                model.notice = "Opened the saved manifest. Search all captured text or build documentation links explicitly when ready."
+                model.notice = "Opened the saved manifest. Search captured text, or build documentation links and source imports when ready."
             } catch {
                 if model.pending === candidate { model.pending = nil; candidate.cancel() }
                 throw error
@@ -320,14 +330,117 @@ private final class AtlasSavedSession: @unchecked Sendable {
         }
         loadMembers(start: start)
     }
-    func selectMember(_ member: AtlasSavedMember, from identity: AtlasSavedIdentity) {
+    func selectMember(_ member: AtlasSavedMember, from identity: AtlasSavedIdentity, forImports: Bool = false) {
         guard canOperate, info?.identity == identity, members?.identity == identity,
               members?.items.contains(where: { $0.matches(member) }) == true else { return }
         selectedMember = member
-        if direction != .all, relationshipGeneration != nil {
-            relationships = nil
+        if direction != .all { relationships = nil }
+        if importDirection != .all { imports = nil }
+        if forImports, importDirection != .all, importGeneration != nil {
+            loadImports(direction: importDirection)
+        } else if !forImports, direction != .all, relationshipGeneration != nil {
             loadRelationships(direction: direction)
         }
+    }
+
+    func prepareImports() {
+        guard let info else { return }
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let generation = try model.nextImportGeneration()
+            model.notice = "Parsing captured Rust, JavaScript, TypeScript and Python import statements…"
+            do {
+                let page = try AtlasSavedImports.decode(await model.run(lease,
+                    .prepareImports(generation: generation, imports: AtlasSavedImportWire.maximumLinks,
+                        bytes: AtlasSavedImportWire.maximumSourceBytes), flag: flag), identity: info.identity,
+                    generation: generation, direction: .all, member: nil, start: 0, limit: 64, preparing: true)
+                guard model.session === lease, !model.closed, !flag.isCanceled else { throw AtlasSavedError.canceled }
+                model.importGeneration = generation; model.imports = page; model.importDirection = .all
+                model.notice = page.complete ? "Lexical imports are complete within this saved manifest; targets are catalog candidates."
+                    : "Source import coverage is partial. Missing incoming imports cannot be ruled out; inspect the omission counts."
+            } catch {
+                let restored = await model.reconcileImports(lease)
+                model.notice = restored
+                    ? "The build reply was not accepted. Recovered the accepted import inventory without rebuilding."
+                    : "The import generation could not be verified. Reload imports before navigating results."
+            }
+        }
+    }
+    func loadImports(direction: AtlasSavedDirection, start: UInt64 = 0) {
+        guard let info, let generation = importGeneration else { return }
+        let member = direction == .all ? nil : selectedMember?.id
+        guard direction == .all || member != nil else { return }
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let page = try AtlasSavedImports.decode(await model.run(lease,
+                .imports(generation: generation, direction: direction, member: member, start: start, limit: 64), flag: flag),
+                identity: info.identity, generation: generation, direction: direction, member: member, start: start, limit: 64)
+            guard model.session === lease, !model.closed, !flag.isCanceled,
+                  model.importGeneration == generation else { throw AtlasSavedError.canceled }
+            model.imports = page; model.importDirection = direction
+            model.notice = "Showing \(page.links.count) of \(page.matching) matching imports. Pagination reads retained metadata only."
+        }
+    }
+    func reloadImports() {
+        perform { model, _ in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let recovered = await model.reconcileImports(lease)
+            model.notice = recovered ? "Reloaded the accepted import generation without parsing source again."
+                : "The accepted import generation is unavailable. Saved members remain readable independently."
+        }
+    }
+    func clearImports() {
+        guard let info, importGeneration != nil else { return }
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let generation = try model.nextImportGeneration()
+            do {
+                try AtlasSavedImportWire.clear(await model.run(lease, .clearImports(generation: generation), flag: flag),
+                    identity: info.identity, generation: generation)
+                guard model.session === lease, !model.closed, !flag.isCanceled else { throw AtlasSavedError.canceled }
+                model.imports = nil; model.importGeneration = nil; model.importDirection = .all
+                model.notice = "Cleared retained import metadata. Open source readers keep their captured bytes."
+            } catch {
+                let recovered = await model.reconcileImports(lease)
+                model.notice = recovered ? "Recovered the accepted import state after the clear reply was unavailable."
+                    : "The accepted import state is unknown. Reload imports before continuing."
+            }
+        }
+    }
+    private func reconcileImports(_ lease: AtlasSavedSession) async -> Bool {
+        guard !closed, session === lease, let previous = info else { return false }
+        let flag = AtlasSearchCancellation()
+        do {
+            let current = try AtlasSavedInfo.decode(await run(lease, .info, flag: flag), handle: lease.handle,
+                expectedPath: previous.path.bytes, identity: previous.identity)
+            guard !closed, session === lease, current.importStateKnown,
+                  current.lastImportAttempt >= previous.lastImportAttempt else { throw AtlasSavedError.invalidResponse }
+            try acceptInfo(current, lease: lease)
+            lastImportAttempt = max(lastImportAttempt, current.lastImportAttempt)
+            importGeneration = current.importGeneration
+            guard let generation = current.importGeneration else { imports = nil; importDirection = .all; return true }
+            if importsAreCurrent { return true }
+            let page = try AtlasSavedImports.decode(await run(lease,
+                .imports(generation: generation, direction: .all, member: nil, start: 0, limit: 64), flag: flag),
+                identity: current.identity, generation: generation, direction: .all, member: nil, start: 0, limit: 64)
+            guard !closed, session === lease else { return false }
+            imports = page; importDirection = .all; return true
+        } catch {
+            importGeneration = nil; imports = nil
+            return false
+        }
+    }
+
+    func openImport(_ link: AtlasSavedImport, from page: AtlasSavedImports, side: AtlasSavedLinkSide,
+        readerTransport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
+        outline: AtlasReaderOutlineTransport? = nil, document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasSavedReaderCapture {
+        guard importsAreCurrent, let current = imports, current.matchesInventory(page), current.start == page.start,
+              current.links.contains(where: { $0.matches(link) }), page.links.contains(where: { $0.matches(link) }),
+              side == .evidence || link.canOpenTarget,
+              let ordinal = side == .evidence ? link.sourceMember : link.targetMember else { throw AtlasSavedError.invalidInput }
+        return try await openReader(saved: page.identity, ordinal: ordinal, expected: nil,
+            origin: .importLink(generation: page.generation, link: link, side: side), readerTransport: readerTransport,
+            search: search, outline: outline, document: document)
     }
 
     func prepareRelationships() {
@@ -926,6 +1039,9 @@ private final class AtlasSavedSession: @unchecked Sendable {
                         }
                     }
                 }
+                if case .importLink(_, let link, let side) = origin {
+                    guard link.matches(member, side: side) else { throw AtlasSavedError.invalidResponse }
+                }
                 let contextStart: UInt64
                 if let hit = origin.searchHit {
                     guard member.id == hit.member, member.file == hit.file, member.file == hit.revision,
@@ -935,6 +1051,8 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 } else if case .relationship(_, let link, .target) = origin, let range = link.targetRange {
                     guard range.end <= member.observedBytes else { throw AtlasSavedError.invalidResponse }
                     contextStart = range.contextStart
+                } else if case .importLink(_, let link, .evidence) = origin {
+                    contextStart = link.evidence.contextStart
                 } else { contextStart = 0 }
                 let receipt = AtlasSavedReaderReceiptBox()
                 try await reader.openRetained(pathBytes: member.path.bytes, offset: contextStart, registryDomain: domain) { destination in
@@ -944,6 +1062,8 @@ private final class AtlasSavedSession: @unchecked Sendable {
                     case .member: request = .openMember(reader: destination, member: member.id)
                     case .relationship(let generation, let link, let side):
                         request = .openRelationship(reader: destination, generation: generation, link: link.id, side: side)
+                    case .importLink(let generation, let link, let side):
+                        request = .openImport(reader: destination, generation: generation, importID: link.id, side: side)
                     case .hit(let generation, _, let hit, _):
                         request = .openHit(reader: destination, generation: generation, hit: hit.id)
                     case .expressionHit(let generation, _, _, let hit):
@@ -996,6 +1116,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     private func clearMetadata() {
         info = nil; members = nil; selectedMember = nil; relationships = nil; relationshipGeneration = nil
         direction = .all; lastRelationshipAttempt = 0; memberOffsetInput = "0"
+        imports = nil; importGeneration = nil; importDirection = .all; lastImportAttempt = 0
         searchPage = nil; queryGeneration = nil; lastQueryAttempt = 0; searchInput = ""
         expressionPage = nil; expressionGeneration = nil; lastExpressionAttempt = 0
         structurePage = nil; structureGeneration = nil; lastStructureAttempt = 0
@@ -1028,6 +1149,11 @@ private final class AtlasSavedSession: @unchecked Sendable {
         let previous = max(lastQueryAttempt, queryGeneration ?? 0)
         guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
         lastQueryAttempt = previous + 1; return lastQueryAttempt
+    }
+    private func nextImportGeneration() throws -> UInt64 {
+        let previous = max(lastImportAttempt, max(importGeneration ?? 0, info?.lastImportAttempt ?? 0))
+        guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
+        lastImportAttempt = previous + 1; return lastImportAttempt
     }
     private func nextExpressionGeneration() throws -> UInt64 {
         let previous = max(lastExpressionAttempt, max(expressionGeneration ?? 0, info?.lastExpressionAttempt ?? 0))

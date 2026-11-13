@@ -5,10 +5,10 @@
 
 /* Public-header-checked foreign boundary. These responses test Swift marshaling
  * and ownership; real archive/posting behavior is exercised in saved_sessions_tests. */
-static uint64_t calls[10];
+static uint64_t calls[14];
 static int result_mode;
 void fixture_saved_index_mode(int mode) { result_mode = mode; }
-uint64_t fixture_saved_index_count(uint64_t index) { assert(index < 10); return calls[index]; }
+uint64_t fixture_saved_index_count(uint64_t index) { assert(index < 14); return calls[index]; }
 static char *reply(void) {
     if (result_mode == 1) return NULL;
     if (result_mode == 2) { char *p = malloc(2); assert(p); p[0] = (char)0xff; p[1] = 0; return p; }
@@ -76,4 +76,33 @@ STUB2(fcb_saved_clear_relationships)
 STUB3(fcb_saved_open_member_reader)
 char *fcb_saved_open_relationship_reader(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
     (void)a; (void)b; (void)c; (void)d; (void)e; abort();
+}
+char *fcb_saved_prepare_imports(uint64_t handle, uint64_t generation, uint64_t links, uint64_t bytes) {
+    assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9);
+    assert(links == 4096 && bytes == 33554432); calls[10]++; return reply();
+}
+char *fcb_saved_imports(uint64_t handle, uint64_t generation, uint64_t direction,
+    uint64_t member, uint64_t start, uint64_t limit) {
+    assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9);
+    assert(direction == 2 && member == 65535 && start == 4096 && limit == 128); calls[11]++; return reply();
+}
+char *fcb_saved_clear_imports(uint64_t handle, uint64_t generation) {
+    assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9); calls[12]++; return reply();
+}
+char *fcb_saved_open_import_reader(uint64_t handle, uint64_t reader, uint64_t generation, uint64_t id, uint64_t side) {
+    assert(handle == UINT64_MAX - 10 && reader == UINT64_MAX - 8 && generation == UINT64_MAX - 9);
+    assert(id == 4096 && side == 1); calls[13]++; return reply();
+}
+/* The production transport also contains these independent capabilities. Keep
+ * every referenced symbol header-checked even when this fixture does not use it. */
+char *fcb_saved_structure_search(uint64_t a, uint64_t b, uint64_t c, uint64_t d,
+    const char *e, uint64_t f, uint64_t g) {
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; abort();
+}
+STUB4(fcb_saved_structure_results)
+STUB2(fcb_saved_clear_structure)
+STUB4(fcb_saved_open_structure_hit_reader)
+STUB4(fcb_saved_document_images_authorize)
+char *fcb_saved_document_image_prepare(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; abort();
 }

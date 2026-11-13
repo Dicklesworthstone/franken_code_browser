@@ -3,6 +3,7 @@ import Foundation
 enum AtlasSavedReaderOrigin: Sendable {
     case member
     case relationship(generation: UInt64, link: AtlasSavedLink, side: AtlasSavedLinkSide)
+    case importLink(generation: UInt64, link: AtlasSavedImport, side: AtlasSavedLinkSide)
     case hit(generation: UInt64, needle: String, hit: AtlasSavedHit, caseSensitive: Bool = true)
     case expressionHit(generation: UInt64, expression: String, primaryNeedle: String, hit: AtlasSavedHit)
     case structureHit(generation: UInt64, mode: AtlasSavedSearchMode, nameMode: AtlasSearchNameMode,
@@ -15,7 +16,7 @@ enum AtlasSavedReaderOrigin: Sendable {
         switch self {
         case .hit(_, _, let hit, _), .expressionHit(_, _, _, let hit): return hit
         case .structureHit(_, _, _, _, let item): return item.hit
-        case .member, .relationship: return nil
+        case .member, .relationship, .importLink: return nil
         }
     }
 }
@@ -77,6 +78,7 @@ struct AtlasSavedReaderReceipt: Sendable {
         switch origin {
         case .member, .hit: command = "open-reader"
         case .relationship: command = "relationships-open-reader"
+        case .importLink: command = "imports-open-reader"
         case .expressionHit: command = "expression-open-reader"
         case .structureHit: command = "structure-open-reader"
         }
@@ -169,6 +171,42 @@ struct AtlasSavedReaderReceipt: Sendable {
                     }
                 }
                 request = .window(offset: side == .target ? link.targetRange?.contextStart ?? 0 : 0, bytes: 16 * 1024)
+                match = nil
+            case .importLink(let generation, let link, let side):
+                try AtlasSavedImportWire.validateContract(data)
+                struct ImportReceipt: Decodable {
+                    let import_generation, link_id, reader_owner, source_bytes, offset: AtlasSavedNumber
+                    let member_bytes_read, member_read_calls: AtlasSavedNumber
+                    let side: String
+                    let path: AtlasSavedPath
+                    let relationship: AtlasSavedImport
+                }
+                let accepted = try JSONDecoder().decode(ImportReceipt.self, from: data)
+                guard generation > 0, accepted.import_generation.value == generation, accepted.link_id.value == link.id,
+                      accepted.side == side.rawValue, accepted.reader_owner.value == destination,
+                      accepted.path.bytes == member.path.bytes, accepted.source_bytes.value == member.observedBytes,
+                      accepted.relationship.matches(link), link.matches(member, side: side),
+                      accepted.offset.value == (side == .evidence ? link.evidence.start : 0),
+                      accepted.member_bytes_read.value == member.observedBytes,
+                      (member.observedBytes == 0 && accepted.member_read_calls.value == 0) ||
+                        (member.observedBytes > 0 && accepted.member_read_calls.value > 0 &&
+                            accepted.member_read_calls.value <= AtlasSavedImportWire.maximumMemberReadCalls) else {
+                    throw AtlasSavedError.invalidResponse
+                }
+                if side == .evidence {
+                    guard ["utf8", "utf16le", "utf16be"].contains(info.identity.encoding),
+                          let selected = object["selection"] as? [String: Any] else {
+                        throw AtlasSavedError.invalidResponse
+                    }
+                    if info.identity.encoding != "utf8" {
+                        guard member.observedBytes % 2 == 0, link.evidence.start % 2 == 0, link.evidence.end % 2 == 0,
+                              link.specifier.start % 2 == 0, link.specifier.end % 2 == 0 else { throw AtlasSavedError.invalidResponse }
+                    }
+                    let range = try JSONDecoder().decode(AtlasSavedImportRange.self,
+                        from: JSONSerialization.data(withJSONObject: selected))
+                    guard range == link.evidence else { throw AtlasSavedError.invalidResponse }
+                } else if !(object["selection"] is NSNull) { throw AtlasSavedError.invalidResponse }
+                request = .window(offset: side == .evidence ? link.evidence.contextStart : 0, bytes: 16 * 1024)
                 match = nil
             case .structureHit(let generation, let mode, let nameMode, let needle, let item):
                 let hit = item.hit
@@ -322,6 +360,10 @@ final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
             return "Captured document evidence: original bytes 0..<\(member.observedBytes). Individual link positions are not established."
         case .relationship(_, let link, .target):
             return link.targetNavigationDescription
+        case .importLink(_, let link, .evidence):
+            return "\(link.label) · exact statement bytes \(link.evidence.start)..<\(link.evidence.end) · specifier bytes \(link.specifier.start)..<\(link.specifier.end)"
+        case .importLink(_, let link, .target):
+            return "Saved catalog candidate for \(link.destination) · \(link.resolutionBasis) · lexical relationship, not compiler resolution"
         case .hit(let generation, _, let hit, let caseSensitive):
             return "Saved search \(generation), occurrence \(hit.id) · \(caseSensitive ? "match case" : "Unicode lowercase matching") · original bytes \(hit.start)..<\(hit.end)"
         case .expressionHit(let generation, _, _, let hit):

@@ -121,6 +121,9 @@ struct AtlasSavedInfo: Sendable {
     let structureGeneration: UInt64?
     let lastStructureAttempt: UInt64
     let structureStateKnown: Bool
+    let importGeneration: UInt64?
+    let lastImportAttempt: UInt64
+    let importStateKnown: Bool
     var index: AtlasSavedIndex?
     var lastIndexAttempt: UInt64
     let initialArchiveBytes: UInt64
@@ -138,12 +141,14 @@ struct AtlasSavedInfo: Sendable {
                   w.initial.value <= 80 * 1024 * 1024,
                   !fresh || (w.relationship == nil && w.query == nil && w.index == nil && w.expression == nil &&
                     w.expressionAttempt == 0 && w.structure == nil && w.structureAttempt == 0 && w.indexAttempt == 0 &&
+                    w.importGeneration == nil && w.importAttempt == 0 &&
                     w.memberBytes.value == 0 && w.memberCalls.value == 0) else { throw AtlasSavedError.invalidResponse }
             return Self(identity: actualIdentity,
                 path: w.path, relationshipGeneration: w.relationship, queryGeneration: w.query,
                 expressionGeneration: w.expression, lastExpressionAttempt: w.expressionAttempt,
                 expressionStateKnown: w.expressionKnown, structureGeneration: w.structure,
                 lastStructureAttempt: w.structureAttempt, structureStateKnown: w.structureKnown,
+                importGeneration: w.importGeneration, lastImportAttempt: w.importAttempt, importStateKnown: w.importKnown,
                 index: index, lastIndexAttempt: w.indexAttempt, initialArchiveBytes: w.initial.value,
                 memberBytesRead: w.memberBytes.value, memberReadCalls: w.memberCalls.value)
         } catch let error as AtlasSavedError { throw error }
@@ -159,11 +164,15 @@ struct AtlasSavedInfo: Sendable {
         let structure: UInt64?
         let structureAttempt: UInt64
         let structureKnown: Bool
+        let importGeneration: UInt64?
+        let importAttempt: UInt64
+        let importKnown: Bool
         let initial, memberBytes, memberCalls: AtlasSavedNumber
         enum CodingKeys: CodingKey {
             case archive_path, accepted_relationship_generation, accepted_query_generation, accepted_index_generation,
                  accepted_expression_generation, last_expression_attempt, last_index_attempt,
                  accepted_structure_generation, last_structure_attempt,
+                 accepted_import_generation, last_import_attempt,
                  initial_archive_bytes_read, member_bytes_read, member_read_calls
         }
         init(from decoder: Decoder) throws {
@@ -197,6 +206,15 @@ struct AtlasSavedInfo: Sendable {
                 structureAttempt = try c.decode(AtlasSavedNumber.self, forKey: .last_structure_attempt).value
             } else { structure = nil; structureAttempt = 0 }
             guard structure == nil || structure! <= structureAttempt else { throw AtlasSavedError.invalidResponse }
+            importKnown = c.contains(.accepted_import_generation) && c.contains(.last_import_attempt)
+            guard c.contains(.accepted_import_generation) == c.contains(.last_import_attempt) else {
+                throw AtlasSavedError.invalidResponse
+            }
+            if importKnown {
+                importGeneration = try generation(.accepted_import_generation)
+                importAttempt = try c.decode(AtlasSavedNumber.self, forKey: .last_import_attempt).value
+            } else { importGeneration = nil; importAttempt = 0 }
+            guard importGeneration == nil || importGeneration! <= importAttempt else { throw AtlasSavedError.invalidResponse }
             initial = try c.decode(AtlasSavedNumber.self, forKey: .initial_archive_bytes_read)
             memberBytes = try c.decode(AtlasSavedNumber.self, forKey: .member_bytes_read)
             memberCalls = try c.decode(AtlasSavedNumber.self, forKey: .member_read_calls)
@@ -652,6 +670,10 @@ enum AtlasSavedRequest: Sendable {
     case clearRelationships(generation: UInt64)
     case openMember(reader: UInt64, member: UInt64)
     case openRelationship(reader: UInt64, generation: UInt64, link: UInt64, side: AtlasSavedLinkSide)
+    case prepareImports(generation: UInt64, imports: UInt64, bytes: UInt64)
+    case imports(generation: UInt64, direction: AtlasSavedDirection, member: UInt64?, start: UInt64, limit: UInt64)
+    case clearImports(generation: UInt64)
+    case openImport(reader: UInt64, generation: UInt64, importID: UInt64, side: AtlasSavedLinkSide)
 }
 
 struct AtlasSavedTransport: Sendable {

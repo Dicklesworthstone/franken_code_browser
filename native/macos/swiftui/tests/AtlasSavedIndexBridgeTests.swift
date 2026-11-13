@@ -77,6 +77,26 @@ extension AtlasReaderTransport {
                 caseSensitive: false, countAllMatches: true, matches: 0)) == nil)
         }
         precondition(count(9) == 7 && count(6) == 25, "matching response ownership leaked or double-freed")
-        print("AtlasSavedIndexBridgeTests: public-header signatures, matching/count flags, full-width IDs, exact path bytes, pin admission and buffer ownership passed")
+        mode(0)
+        precondition(transport.run(owner, .prepareImports(generation: generation, imports: 4096, bytes: 33_554_432)) == "{}")
+        precondition(transport.run(owner, .imports(generation: generation, direction: .incoming, member: 65_535, start: 4096, limit: 128)) == "{}")
+        precondition(transport.run(owner, .clearImports(generation: generation)) == "{}")
+        precondition(transport.run(owner, .openImport(reader: UInt64.max - 8, generation: generation, importID: 4096, side: .target)) == "{}")
+        precondition((10...13).allSatisfy { count(UInt64($0)) == 1 } && count(6) == 29)
+        let invalidImports: [AtlasSavedRequest] = [
+            .prepareImports(generation: 0, imports: 4096, bytes: 33_554_432),
+            .prepareImports(generation: generation, imports: 0, bytes: 33_554_432),
+            .prepareImports(generation: generation, imports: 4096, bytes: 33_554_433),
+            .imports(generation: generation, direction: .all, member: 0, start: 0, limit: 64),
+            .imports(generation: generation, direction: .incoming, member: nil, start: 0, limit: 64),
+            .imports(generation: generation, direction: .incoming, member: 65_536, start: 0, limit: 64),
+            .imports(generation: generation, direction: .incoming, member: 1, start: 0, limit: 129),
+            .openImport(reader: owner, generation: generation, importID: 1, side: .target),
+            .openImport(reader: UInt64.max - 8, generation: generation, importID: 4097, side: .target)
+        ]
+        for request in invalidImports { precondition(transport.run(owner, request) == nil) }
+        precondition((10...13).allSatisfy { count(UInt64($0)) == 1 } && count(6) == 29,
+            "invalid import request crossed the foreign boundary")
+        print("AtlasSavedIndexBridgeTests: public-header signatures, import/matching flags, full-width IDs, exact path bytes, pin admission and buffer ownership passed")
     }
 }
