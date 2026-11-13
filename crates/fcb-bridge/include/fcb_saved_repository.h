@@ -216,6 +216,44 @@ char *fcb_saved_relationships(uint64_t handle, uint64_t generation,
     uint64_t direction, uint64_t member, uint64_t start, uint64_t limit);
 char *fcb_saved_clear_relationships(uint64_t handle, uint64_t generation);
 
+/* Lexical import navigation over the same closed saved manifest. This inventory
+ * has its own increasing prepare/clear generation, independent of documentation
+ * relationships and text/structure searches. Failed or canceled replacement
+ * preserves the previously accepted inventory. info exposes the accepted import
+ * generation and last attempted generation for reconciliation after lost replies.
+ *
+ * Reuses the shared Rust, JS/TS and Python import extractor and declared finite
+ * catalog candidate policies. Import statements preserve original byte evidence;
+ * candidates do not establish compiler or runtime bindings. No live source path,
+ * package execution, sys.path or network access is used. Prepare admits 1..4096
+ * rows, up to 32 MiB aggregate source reads and at most 128 KiB per source member.
+ * Inspect imports_complete, truncation, diagnostics and omission counters before
+ * interpreting an empty incoming/outgoing page. Accepted rows retain metadata;
+ * source payloads are loaded one member at a time during extraction.
+ *
+ * direction 0 = all (member MUST be 0), 1 = outgoing, 2 = incoming. Ordinals and
+ * filtered offsets are zero-based; link IDs are one-based. Page limit is 1..128.
+ * Pagination reads no member payload. Missing, unavailable, ambiguous, external
+ * and unsupported destinations remain explicit; only a unique captured target
+ * can authorize target navigation. Calls execute synchronously on a host worker.
+ */
+char *fcb_saved_prepare_imports(uint64_t handle, uint64_t generation,
+    uint64_t max_links, uint64_t max_source_bytes);
+char *fcb_saved_imports(uint64_t handle, uint64_t generation,
+    uint64_t direction, uint64_t member, uint64_t start, uint64_t limit);
+char *fcb_saved_clear_imports(uint64_t handle, uint64_t generation);
+
+/* Existing EMPTY reader destination. side 0 opens the exact original import
+ * statement range; side 1 opens a unique captured catalog candidate at byte 0.
+ * The selected member digest is reverified from the retained archive before
+ * installation. The receipt qualifies import generation/link/side, archive,
+ * member and reader identities, with original byte selection for evidence.
+ * Delivered readers survive import replacement and saved-session closure.
+ * Responses, including failures, are owned strings freed with fcb_free_string.
+ */
+char *fcb_saved_open_import_reader(uint64_t handle, uint64_t reader,
+    uint64_t generation, uint64_t link_id, uint64_t side);
+
 /* Existing EMPTY destination from fcb_reader_create. Admission precedes member
  * I/O. hit IDs are one-based and qualified by the accepted query generation;
  * member ordinals are zero-based. Reads verify the saved member digest again;

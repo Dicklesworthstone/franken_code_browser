@@ -97,12 +97,14 @@ pub struct SavedRepositorySession {
     expression: Option<desk::SavedExpression>,
     structure: Option<structure::AcceptedStructure>,
     relationships: Option<relationships::AcceptedRelationships>,
+    imports: Option<imports::AcceptedImports>,
     path: PathBuf,
     last_query_attempt: u64,
     last_expression_attempt: u64,
     last_structure_attempt: u64,
     last_index_attempt: u64,
     last_relationship_attempt: u64,
+    last_import_attempt: u64,
     next_allocation: u64,
     budget: ResourceBudget,
     _lease: ResourceLease,
@@ -126,9 +128,9 @@ impl SavedRepositorySession {
         if metadata.len() > limits.max_document_bytes as u64 { return Err(SavedRepositoryError::InvalidLimits); }
         let archive = PagedSnapshot::open(file, owner, limits, &budget, allocation(2)?, &mut canceled)?;
         check(&mut canceled)?;
-        Ok(Self { archive, index: None, query: None, expression: None, structure: None, relationships: None, path, last_query_attempt: 0,
+        Ok(Self { archive, index: None, query: None, expression: None, structure: None, relationships: None, imports: None, path, last_query_attempt: 0,
             last_expression_attempt: 0, last_structure_attempt: 0,
-            last_index_attempt: 0, last_relationship_attempt: 0, next_allocation: 3, budget, _lease: lease })
+            last_index_attempt: 0, last_relationship_attempt: 0, last_import_attempt: 0, next_allocation: 3, budget, _lease: lease })
     }
     pub fn owner(&self) -> ArenaOwnerId { self.archive.directory().owner() }
     pub fn archive_digest(&self) -> Sha256Digest { self.archive.directory().digest() }
@@ -147,6 +149,8 @@ impl SavedRepositorySession {
         out.literal(",\"accepted_index_generation\":")?; optional(&mut out, self.index_generation())?;
         out.literal(",\"last_index_attempt\":")?; out.integer(self.last_index_attempt)?;
         out.literal(",\"accepted_relationship_generation\":")?; optional(&mut out, self.relationship_generation())?;
+        out.literal(",\"accepted_import_generation\":")?; optional(&mut out, self.import_generation())?;
+        out.literal(",\"last_import_attempt\":")?; out.integer(self.last_import_attempt())?;
         let directory = self.archive.directory();
         out.literal(",\"initial_archive_bytes_read\":")?; out.integer(directory.validation_stats().bytes_read)?;
         out.literal(",\"directory_reserved_bytes\":")?; out.integer(directory.retained_charge() as u64)?;
@@ -535,6 +539,10 @@ pub mod desk;
 pub mod relationships;
 pub mod images;
 pub use relationships::{RelationshipDirection, RelationshipSide, SavedRelationshipError};
+
+/// Lexical source imports and reverse importers in the closed saved manifest.
+pub mod imports;
+pub use imports::{SavedImportDirection, SavedImportSide, SavedImportError};
 
 /// Bounded symbol, Markdown heading and whole-token searches of saved members.
 pub mod structure;

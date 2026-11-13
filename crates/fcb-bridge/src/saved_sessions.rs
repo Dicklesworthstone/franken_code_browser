@@ -9,6 +9,7 @@ use std::{mem::size_of, path::Path, sync::{Arc, Mutex, MutexGuard, TryLockError,
 use fcb_app::host::{HostResponse, saved_repository::{SavedRepositorySession, SavedRepositoryError,
     SnapshotLimits, Sha256Digest}};
 use fcb_app::host::saved_repository::relationships::{SavedRelationshipError, RelationshipDirection, RelationshipSide};
+use fcb_app::host::saved_repository::imports::{SavedImportError, SavedImportDirection, SavedImportSide};
 use fcb_app::host::saved_repository::desk::SavedDeskError;
 use fcb_app::host::saved_repository::structure::{StructureMode, SymbolNameMode};
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
@@ -19,11 +20,12 @@ pub(super) const MAX_SAVED_SESSIONS: usize = 4;
 pub(super) enum AccessError {
     Unknown, NotOpen, AlreadyOpen, Busy, Capacity, Canceled, Closed, Poisoned,
     InvalidArgument, Saved(SavedRepositoryError), Relationship(SavedRelationshipError),
-    Expression(SavedDeskError), Reader(reader_sessions::AccessError),
+    Expression(SavedDeskError), Import(SavedImportError), Reader(reader_sessions::AccessError),
 }
 impl From<SavedRepositoryError> for AccessError { fn from(e: SavedRepositoryError) -> Self { Self::Saved(e) } }
 impl From<SavedRelationshipError> for AccessError { fn from(e: SavedRelationshipError) -> Self { Self::Relationship(e) } }
 impl From<SavedDeskError> for AccessError { fn from(e: SavedDeskError) -> Self { Self::Expression(e) } }
+impl From<SavedImportError> for AccessError { fn from(e: SavedImportError) -> Self { Self::Import(e) } }
 impl From<reader_sessions::AccessError> for AccessError { fn from(e: reader_sessions::AccessError) -> Self { Self::Reader(e) } }
 impl std::fmt::Display for AccessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -35,6 +37,7 @@ impl std::fmt::Display for AccessError {
             Self::InvalidArgument => "SAVED_HANDLE_INVALID_ARGUMENT",
             Self::Saved(e) => return write!(f, "{e}"), Self::Relationship(e) => return write!(f, "{e}"),
             Self::Expression(e) => return write!(f, "{e}"),
+            Self::Import(e) => return write!(f, "{e}"),
             Self::Reader(e) => return write!(f, "{e}"),
         })
     }
@@ -46,6 +49,7 @@ impl AccessError {
             Self::Saved(error) => error.is_canceled(), Self::Reader(error) => error.canceled(),
             Self::Relationship(error) => error.is_canceled(),
             Self::Expression(error) => error.is_canceled(),
+            Self::Import(error) => error.is_canceled(),
             _ => false,
         }
     }
@@ -87,6 +91,9 @@ pub(super) enum Command<'a> {
     PrepareRelationships { generation: u64, max_links: usize, max_source_bytes: u64 },
     Relationships { generation: u64, member: Option<usize>, direction: RelationshipDirection, start: usize, limit: usize },
     ClearRelationships { generation: u64 },
+    PrepareImports { generation: u64, max_links: usize, max_source_bytes: u64 },
+    Imports { generation: u64, member: Option<usize>, direction: SavedImportDirection, start: usize, limit: usize },
+    ClearImports { generation: u64 },
 }
 pub(super) enum DocumentImageCommand {
     Authorize,
@@ -98,6 +105,7 @@ pub(super) enum Selection {
     ExpressionHit { generation: u64, id: u64 },
     StructureHit { generation: u64, id: u64 },
     Relationship { generation: u64, id: u64, side: RelationshipSide },
+    Import { generation: u64, id: u64, side: SavedImportSide },
 }
 
 struct Permit(Arc<AtomicUsize>);
@@ -194,6 +202,12 @@ impl SavedSessions {
                 session.relationship_page(generation, member, direction, start, limit, &mut stop).map_err(AccessError::from),
             Command::ClearRelationships { generation } =>
                 session.clear_relationships(generation, &mut stop).map_err(AccessError::from),
+            Command::PrepareImports { generation, max_links, max_source_bytes } =>
+                session.prepare_imports(generation, max_links, max_source_bytes, &mut stop).map_err(AccessError::from),
+            Command::Imports { generation, member, direction, start, limit } =>
+                session.import_page(generation, member, direction, start, limit, &mut stop).map_err(AccessError::from),
+            Command::ClearImports { generation } =>
+                session.clear_imports(generation, &mut stop).map_err(AccessError::from),
             Command::Info => session.info(&mut stop).map_err(AccessError::from),
             Command::Members { start, limit } => session.members(start, limit, &mut stop).map_err(AccessError::from),
             Command::AttachIndex { generation, path, pin } => session.attach_index(generation, path, pin, &mut stop).map_err(AccessError::from),
@@ -233,6 +247,8 @@ impl SavedSessions {
                 Selection::Member(ordinal) => session.open_member_reader(owner, ordinal, reader_stop).map_err(AccessError::from),
                 Selection::Relationship { generation, id, side } =>
                     session.open_relationship_reader(owner, generation, id, side, reader_stop).map_err(AccessError::from),
+                Selection::Import { generation, id, side } =>
+                    session.open_import_reader(owner, generation, id, side, reader_stop).map_err(AccessError::from),
             }
         }, &mut stop);
         cell.validate(epoch)?;
@@ -293,6 +309,10 @@ mod tests;
 #[cfg(all(test, unix))]
 #[path = "saved_relationships_sessions_tests.rs"]
 mod relationships_tests;
+
+#[cfg(all(test, unix))]
+#[path = "saved_imports_sessions_tests.rs"]
+mod imports_tests;
 
 #[cfg(all(test, unix))]
 #[path = "saved_expression_sessions_tests.rs"]
