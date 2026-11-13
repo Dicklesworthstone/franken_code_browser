@@ -5,7 +5,7 @@
 
 use fcb::{BrowserSession, ByteRange};
 use fcb::search::{DetectedEncoding, ExtentConsistency, ExtentQuery, ExtentQueryOptions,
-    ExtentQueryState, ResourceBudget};
+    ExtentQueryState, ExtentTextOptions, ResourceBudget};
 use crate::{AppError, SCHEMA, EXIT_OK, EXIT_NO_MATCH, EXIT_PARTIAL, allocation, generation, owner};
 use crate::args::{Arguments, Command, Encoding, Needle};
 use crate::input::{self, Loaded};
@@ -17,10 +17,10 @@ const HELP: &str = "FrankenCodeBrowser — bounded headless source tools\n\n\
   fcb inspect FILE [--json]           Metadata only; no source payload read\n\
   fcb read FILE [--json]              Decode a bounded source window\n\
   fcb open FILE --json                Same headless reading operation\n\
-  fcb search FILE --text TEXT [--json]\n\
-  fcb search FILE --raw-hex HEX [--json]\n\
+  fcb search FILE --text TEXT [--ignore-case] [--count-all] [--json]\n\
+  fcb search FILE --raw-hex HEX [--count-all] [--json]\n\
   fcb read --stdin [--json]           Bounded input; EOF required\n\
-  fcb search --stdin --text TEXT [--json]\n\n\
+  fcb search --stdin --text TEXT [--ignore-case] [--count-all] [--json]\n\n\
 Explicit workspace scope:\n\
   fcb inspect ROOT --workspace [--json]\n\
   fcb search ROOT --workspace --text TEXT [--ignore-case] [--json]\n\
@@ -69,6 +69,11 @@ File-window options: --offset DECIMAL --bytes DECIMAL --limit DECIMAL\n\
 File defaults: offset 0, 65536 visible source bytes, 100 stored matches.\n\
 Limits: 262144 visible bytes, 4096 stored matches, 8 MiB response.\n\
 Far-offset text requires --encoding; --raw-hex searches original bytes.\n\
+Window/stdin --ignore-case uses Unicode lowercase comparison for --text only.\n\
+Window/stdin --count-all counts text or raw matches after retained rows fill.\n\
+scope_match_count_complete certifies only the retained scope; match_count_complete\n\
+also requires whole observed-file coverage. Omitted rows still exit 3. Neither\n\
+option reads beyond --bytes or fills unobserved source gaps.\n\
 Headless directory scans require --workspace. Indexed workspace mode does not\n\
 accept stdin, window offsets, raw-byte queries or an encoding override.\n\
 Whole-file workspace mode accepts raw bytes and explicit text encoding.\n\
@@ -100,8 +105,8 @@ pub(crate) fn capabilities(args: &Arguments, out: &mut Output) -> Result<u8, App
         ("bounded-stdin-reading", implemented, "Explicit input only; EOF required within byte cap."),
         ("named-file-range-reading", file_state, "One regular file; no full-file capture prerequisite."),
         ("file-inspection", file_state, "Metadata only; recursive catalog requires explicit --workspace."),
-        ("exact-window-text-search", implemented, "Existing decoded UTF-8/UTF-16 range search; scope explicit."),
-        ("exact-window-byte-search", implemented, "Existing overlapping byte matcher; scope explicit."),
+        ("exact-window-text-search", implemented, "Decoded UTF-8/UTF-16 literal search; optional Unicode lowercase comparison and scoped exhaustive counts."),
+        ("exact-window-byte-search", implemented, "Overlapping original-byte matcher; optional scoped exhaustive counts, no case conversion."),
         ("lossless-json-output", implemented, "One bounded document; decimal-string integers and Unix path hex."),
         ("native-gui", "unavailable", "AppKit/Metal composition is not implemented in this binary."),
         ("native-app-launch", launch_state, "Binary-only handoff to a compatible installed app; no installation probe or in-process renderer. Native readiness is not established."),
@@ -160,7 +165,8 @@ pub(crate) fn source(args: &Arguments, loaded: &Loaded, out: &mut Output,
     let view = BrowserSession::new(owner()).open_extent(loaded.extent.clone())?;
     let options = ExtentQueryOptions { generation: generation(), max_matches: args.limit };
     if let Some(Needle::Raw(needle)) = args.needle.as_ref() {
-        let mut query = ExtentQuery::raw(&view, loaded.visible, needle, options, budget, allocation(21))?;
+        let mut query = ExtentQuery::raw_with_counting(&view, loaded.visible, needle, options,
+            args.count_all, budget, allocation(21))?;
         return search_result(args, loaded, &mut query, 0, "original-bytes", out, canceled);
     }
     let encoding = match args.encoding {
@@ -181,7 +187,8 @@ pub(crate) fn source(args: &Arguments, loaded: &Loaded, out: &mut Output,
     } else { 0 };
     let text = view.decode(loaded.visible, encoding, generation(), budget, allocation(20), &mut *canceled)?;
     if let Some(Needle::Text(needle)) = args.needle.as_ref() {
-        let mut query = ExtentQuery::text(&text, needle, options, budget, allocation(21))?;
+        let matching = ExtentTextOptions { case_sensitive: !args.ignore_case, count_all_matches: args.count_all };
+        let mut query = ExtentQuery::text_with_options(&text, needle, options, matching, budget, allocation(21))?;
         return search_result(args, loaded, &mut query, header, encoding_name(encoding), out, canceled);
     }
     let complete = whole_scope(loaded, text.range(), header);
@@ -215,19 +222,29 @@ fn search_result(args: &Arguments, loaded: &Loaded, query: &mut ExtentQuery<'_, 
     while query.state() == ExtentQueryState::Pending { query.step(64 * 1024, generation(), &mut *canceled)?; }
     let scope_complete = query.scope_complete();
     let whole = scope_complete && whole_scope(loaded, query.scope(), header);
-    let truncated = query.state() == ExtentQueryState::Truncated;
+    let truncated = query.results_truncated();
+    let raw = matches!(args.needle.as_ref(), Some(Needle::Raw(_)));
     if args.json {
         begin(out, "search")?; describe_source(loaded, out)?;
         out.literal(",\"mode\":")?; out.quoted(mode)?;
+        out.literal(",\"case_sensitive\":")?;
+        if raw { out.literal("null")?; } else { out.boolean(!args.ignore_case)?; }
+        out.literal(",\"normalization\":")?;
+        if raw { out.literal("null")?; } else { out.quoted("exact")?; }
+        out.literal(",\"case_insensitive_semantics\":")?;
+        if args.ignore_case { out.quoted("unicode-lowercase")?; } else { out.literal("null")?; }
+        out.literal(",\"count_all_matches\":")?; out.boolean(args.count_all)?;
         out.literal(",\"scope\":")?; out.range(query.scope())?;
         out.literal(",\"scope_complete\":")?; out.boolean(scope_complete)?;
         out.literal(",\"whole_file_complete\":")?; out.boolean(whole)?;
+        out.literal(",\"scope_match_count_complete\":")?; out.boolean(scope_complete)?;
+        out.literal(",\"match_count_complete\":")?; out.boolean(whole)?;
         out.literal(",\"truncated\":")?; out.boolean(truncated)?;
         out.literal(",\"matches_seen\":")?; out.integer(query.matches_seen())?;
         out.literal(",\"stored_hits\":")?; out.integer(query.hits().len() as u64)?;
         out.literal(",\"scanned_input_bytes\":")?; out.integer(query.scanned_input_bytes())?;
         out.literal(",\"input_domain\":")?;
-        out.quoted(if matches!(args.needle.as_ref(), Some(Needle::Raw(_))) { "original-bytes" } else { "window-utf8" })?;
+        out.quoted(if raw { "original-bytes" } else { "window-utf8" })?;
         out.literal(",\"hits\":[")?;
         for (index, hit) in query.hits().iter().enumerate() {
             if canceled() { return Err(AppError::Canceled); }
@@ -243,15 +260,20 @@ fn search_result(args: &Arguments, loaded: &Loaded, query: &mut ExtentQuery<'_, 
         }
         out.literal("]}\n")?;
     } else {
-        out.literal(if whole { "Complete observed-file search\n" } else { "PARTIAL search (unseen source or result limit)\n" })?;
+        out.literal(if whole && !truncated { "Complete observed-file search\n" }
+            else { "PARTIAL search (unseen source or omitted result rows)\n" })?;
+        if args.ignore_case { out.literal("Comparison: Unicode lowercase; original source byte ranges\n")?; }
         for hit in query.hits() {
             out.literal("bytes ")?; out.literal(&hit.original_range().start().get().to_string())?;
             out.literal("..")?; out.literal(&hit.original_range().end().get().to_string())?; out.literal("\n")?;
         }
         out.literal("Matches seen: ")?; out.literal(&query.matches_seen().to_string())?;
-        out.literal(if truncated { " (lookahead count, not an exhaustive total)\n" } else { "\n" })?;
+        out.literal(if !scope_complete { " (lookahead count, not an exhaustive total)\n" }
+            else if whole { " (complete observed-file count)\n" }
+            else { " (complete retained-window count; unsearched source remains)\n" })?;
+        if truncated { out.literal("Result rows omitted by --limit; count completeness is reported separately.\n")?; }
     }
-    Ok(if !whole { EXIT_PARTIAL } else if query.matches_seen() == 0 { EXIT_NO_MATCH } else { EXIT_OK })
+    Ok(if !whole || truncated { EXIT_PARTIAL } else if query.matches_seen() == 0 { EXIT_NO_MATCH } else { EXIT_OK })
 }
 
 fn whole_scope(loaded: &Loaded, scope: ByteRange, header: u64) -> bool {

@@ -25,10 +25,12 @@ fcb inspect 'src/file with spaces.rs' --json
 fcb read src/lib.rs
 fcb open src/lib.rs --json
 fcb search src/lib.rs --text 'pub fn' --json --limit 100
+fcb search src/lib.rs --text 'cancel' --ignore-case --count-all --limit 50 --json
 fcb search payload.bin --raw-hex 00ff --json
 fcb read huge.rs --offset 4294967333 --bytes 32768 --encoding utf8 --json
 fcb search huge.rs --offset 4294967333 --bytes 32768 --encoding utf8 --text needle --json
 printf 'banana' | fcb search --stdin --text ana --json
+printf 'Banana BANANA' | fcb search --stdin --text ana --ignore-case --count-all --limit 0 --json
 fcb read --json -- --filename-starting-with-a-dash
 
 fcb inspect /path/to/repository --workspace --json
@@ -83,7 +85,8 @@ remain content. Regex is not silently applied. `--encoding` can declare
 `utf8`, `utf16le`, or `utf16be`; automatic detection uses the beginning of
 the SAME continuous observation. `--raw-hex` searches arbitrary original bytes
 and cannot be combined with an encoding override or `--ignore-case`.
-File-window and stdin search retain their existing exact semantics.
+File-window and stdin search offer the same explicit lowercase and counting
+options within their bounded captured scope; see below.
 
 Use **`--identifier NAME`** instead of `--text` for exact whole-token occurrences
 in either a named file or an explicit workspace. This uses the same shared
@@ -331,6 +334,44 @@ UTF-16 units, graphemes or visual columns. Missing global line context is `null`
 Interior BOM characters remain content; an actual leading BOM is omitted from
 logical text. Separate range observations do not establish cross-window matches.
 
+Text search in a file window or stdin accepts **`--ignore-case`** and
+**`--count-all`**, independently or together. Matching remains exact and
+case-sensitive unless `--ignore-case` is selected. Lowercase matching reuses
+the shared Unicode scalar matcher: `k` matches `K` and `K`, and matching
+part of the lowercase expansion of `İ` retains the entire contributing
+original scalar. This is Unicode lowercase comparison, not full case folding
+or accent normalization. Original-byte ranges still refer to the captured
+UTF-8 or UTF-16 source, while decoded offsets remain window-local.
+
+`--count-all` continues through the admitted window after its retained-hit
+limit, including `--limit 0` for counts without rows. It does not read the
+rest of a large file, enlarge the window, join independent observations,
+or ignore cancellation. Overlapping occurrences count separately. Original-byte
+queries also support counting with `--raw-hex ... --count-all`; they reject
+`--ignore-case` because byte matching has no text case semantics.
+For example:
+
+```sh
+fcb search huge.rs --offset 4294967333 --bytes 32768 --encoding utf8 \
+  --text cancel --ignore-case --count-all --limit 20 --json
+printf 'Banana BANANA' | fcb search --stdin --text ana \
+  --ignore-case --count-all --limit 0 --json
+```
+
+A finished window scan reports `scope_match_count_complete: true`.
+`match_count_complete` certifies the whole observed file or stdin only when
+the source-coverage and consistency checks also pass. `truncated` reports
+omitted result rows independently: an exhaustive count can coexist with a
+truncated list and exit status 3. Without `--count-all`, one extra match
+establishes truncation and stops the scan; that lookahead count is not an
+exhaustive total.
+
+Window/stdin JSON keeps the existing encoding-valued `mode`. Text queries add
+`case_sensitive`, `normalization: "exact"`, and
+`case_insensitive_semantics: "unicode-lowercase"` when requested (otherwise null).
+Raw queries use null for all three text-comparison fields. `count_all_matches`
+records the selected counting policy.
+
 `read` is explicitly headless. Human text preserves line feeds and tabs but
 escapes terminal/directional controls. This is a safe logical display, not an
 original-byte export. JSON contains actual logical text and separate original
@@ -360,9 +401,10 @@ Consult coverage fields and the exit status:
 Windowed search keeps `scope_complete`, `whole_file_complete`, and `truncated`
 separate. An exactly full result buffer is not proof of truncation: the existing
 matcher performs one-match lookahead. Counts in a truncated content search are
-matches actually seen; the whole-file and captured-workspace `--count-all` routes
-can continue to an exhaustive count with omitted rows, and explicitly report
-`match_count_complete`. An actual leading BOM can be
+matches actually seen. The window, stdin, whole-file and captured-workspace
+`--count-all` routes can continue to an exhaustive count within their declared
+scope with omitted rows. Windowed output additionally distinguishes
+`scope_match_count_complete` from whole-source `match_count_complete`. An actual leading BOM can be
 excluded from text while still covering the whole declared text representation.
 Changed/short/unknown observations never acquire stronger consistency merely
 because matching finished.

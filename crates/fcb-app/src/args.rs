@@ -27,7 +27,7 @@ pub struct Arguments {
     pub respect_ignores: bool,
     pub max_files: usize, pub max_file_bytes: usize, pub max_total_bytes: usize,
     pub whole_file: bool, pub max_scan_bytes: u64, pub ignore_case: bool,
-    /// Continue text verification or a whole-file scan after retained rows fill.
+    /// Continue the admitted literal/expression scan after retained rows fill.
     pub count_all: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,15 +187,16 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         return Err(ArgumentError::IncompatibleOptions);
     }
     if parsed.count_all && (parsed.command != Command::Search
-        || (!parsed.whole_file && (!parsed.workspace
-            || !matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Query(_)))))) {
+        || (!parsed.whole_file && !(matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Raw(_)))
+            || (parsed.workspace && matches!(parsed.needle.as_ref(), Some(Needle::Query(_))))))) {
         return Err(ArgumentError::IncompatibleOptions);
     }
     if parsed.respect_ignores && (!parsed.workspace || parsed.include_excluded) { return Err(ArgumentError::IncompatibleOptions); }
     let allows_ignore_case = if parsed.whole_file {
         matches!(parsed.needle.as_ref(), Some(Needle::Text(_)))
     } else {
-        parsed.workspace && matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Query(_)))
+        matches!(parsed.needle.as_ref(), Some(Needle::Text(_)))
+            || (parsed.workspace && matches!(parsed.needle.as_ref(), Some(Needle::Query(_))))
     };
     if parsed.ignore_case && (parsed.command != Command::Search || !allows_ignore_case) {
         return Err(ArgumentError::IncompatibleOptions);
@@ -369,7 +370,7 @@ mod tests {
         assert!(!json_requested(&args(&["search", "file", "--whole-file", "--text", "--json"])));
     }
     #[test]
-    fn count_all_is_explicit_for_whole_files_or_captured_workspace_text() {
+    fn count_all_is_explicit_for_admitted_literal_and_expression_scopes() {
         let counted = parse(&args(&["search", "root", "--workspace", "--whole-file",
             "--text", "needle", "--count-all", "--limit", "0"])).unwrap();
         assert!(counted.count_all && counted.whole_file);
@@ -379,13 +380,20 @@ mod tests {
         let literal = parse(&args(&["search", "file", "--whole-file", "--text", "--count-all"])).unwrap();
         assert!(!literal.count_all);
         assert_eq!(literal.needle, Some(Needle::Text("--count-all".to_owned())));
-        for input in [vec!["search", "file", "--text", "x", "--count-all"],
-            vec!["search", "root", "--workspace", "--path", "x", "--count-all"],
+        for input in [vec!["search", "root", "--workspace", "--path", "x", "--count-all"],
             vec!["search", "file", "--whole-file", "--text", "x", "--count-all", "--count-all"],
             vec!["inspect", "file", "--count-all"],
             vec!["search", "file", "--whole-file", "--path", "x", "--count-all"],
             vec!["search", "file", "--whole-file", "--raw-hex", "78", "--count-all", "--ignore-case"]] {
             assert!(parse(&args(&input)).is_err(), "{input:?}");
+        }
+        for input in [vec!["search", "file", "--text", "x", "--count-all", "--limit", "0"],
+            vec!["search", "--stdin", "--text", "x", "--count-all", "--limit", "0"],
+            vec!["search", "file", "--raw-hex", "78", "--count-all", "--limit", "0"],
+            vec!["search", "--stdin", "--raw-hex", "78", "--count-all", "--limit", "0"]] {
+            let counted = parse(&args(&input)).unwrap();
+            assert!(counted.count_all && !counted.whole_file && !counted.workspace);
+            assert_eq!(counted.limit, 0);
         }
         for mode in ["--text", "--query"] {
             let counted = parse(&args(&["search", "root", "--workspace", mode,
@@ -430,7 +438,7 @@ mod tests {
         }
     }
     #[test]
-    fn case_insensitive_search_is_explicit_for_captured_workspace_and_whole_file_text() {
+    fn case_insensitive_search_is_explicit_for_text_in_each_admitted_scope() {
         for kind in ["--text", "--query"] {
             let options = parse(&args(&["search", "root", "--workspace", kind, "ÄPFEL", "--ignore-case",
                 "--max-scan-bytes", "123"])).unwrap();
@@ -447,9 +455,16 @@ mod tests {
         assert!(!literal.ignore_case);
         assert_eq!(literal.needle, Some(Needle::Text("--ignore-case".to_owned())));
         for input in [vec!["search", "file", "--text", "x", "--ignore-case"],
+            vec!["search", "--stdin", "--text", "x", "--ignore-case"],
+            vec!["search", "file", "--text", "x", "--ignore-case", "--count-all", "--limit", "0"],
+            vec!["search", "file", "--text", "x", "--ignore-case", "--offset", "10", "--encoding", "utf16be"]] {
+            let options = parse(&args(&input)).unwrap();
+            assert!(options.ignore_case && !options.whole_file && !options.workspace);
+        }
+        for input in [vec!["search", "file", "--raw-hex", "78", "--ignore-case"],
+            vec!["search", "--stdin", "--raw-hex", "78", "--ignore-case"],
             vec!["search", "file", "--whole-file", "--raw-hex", "78", "--ignore-case"],
             vec!["search", "root", "--workspace", "--whole-file", "--raw-hex", "78", "--ignore-case"],
-            vec!["search", "--stdin", "--text", "x", "--ignore-case"],
             vec!["search", "root", "--workspace", "--whole-file", "--query", "x", "--ignore-case"],
             vec!["search", "root", "--workspace", "--path", "x", "--ignore-case"],
             vec!["inspect", "root", "--workspace", "--ignore-case"],

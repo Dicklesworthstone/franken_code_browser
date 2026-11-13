@@ -64,7 +64,7 @@ pub use extents::{ExtentConsistency, ExtentError, ExtentReadState, ExtentReadSta
     ExtentStepBudget, ExtentWindowRequest, FileExtentRead, FileRangeReader,
     ObservedExtent, ExtentView, ExtentViewError, ExtentText};
 pub use extent_query::{ExtentMatch, ExtentQuery, ExtentQueryError, ExtentQueryInput,
-    ExtentQueryOptions, ExtentQueryState};
+    ExtentQueryOptions, ExtentQueryState, ExtentTextOptions};
 pub use reader::{LineNumber, ReaderError, ReaderIndexProgress, ReaderLimits, ReadingAnchor,
     ReadingSeek, ReadingSeekState, ReadingTarget, SourceReader};
 pub use reading_window::{LineEnding, ReadingLine, ReadingSelection, ReadingWindow, ReadingWindowOptions};
