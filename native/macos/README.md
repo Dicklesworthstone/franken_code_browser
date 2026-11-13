@@ -927,6 +927,34 @@ unavailable. These additions have wire, lifecycle, adapter, host and C-ABI
 regression cases, but executable and physical-Mac rendering qualification remain
 pending. They do not update the already released application binary.
 
+### Following links between captured files
+
+A local destination in the preview's **Links** list can open another file under
+the active project grant. The existing link operation validates the originating
+capture before returning an independently retained target reader. The linked
+source sheet now offers **Back** and **Forward** across the last three accepted
+destinations. Moving through this trail reuses captured bytes and keeps each
+reader's page, selection, search and preview state without reopening its path.
+
+The originating source stays available behind the sheet. **Return to source**
+closes the trail and restores that reader. An unavailable destination or
+canceled onward link leaves the accepted source and its Forward history intact.
+Only a successfully accepted destination discards the old Forward branch.
+At the three-destination limit, accepting another target releases the oldest
+linked reader; the originating source remains available separately. Reader
+capacity can still refuse an additional target without evicting the current one.
+
+Refreshing the catalog under the same root and native grant keeps accepted
+captures and cancels pending link work. New onward links revalidate their source
+against the refreshed project. Replacing the root or its grant closes the trail.
+Cancellation retains the single pending-operation slot until entered work
+finishes, so repeated clicks cannot accumulate background link opens.
+
+The history lifecycle suite covers retained positions and bytes, successful
+branching, failed/canceled opens, bounded eviction, refresh, grant replacement,
+dismissal and late replies. Executable verification and physical-Mac scrolling,
+selection, focus and accessibility qualification remain pending.
+
 ## Source reader display
 
 The source reader's **Display** menu provides independent **Line numbers**,

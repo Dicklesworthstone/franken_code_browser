@@ -588,6 +588,10 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
     private(set) var info: AtlasProjectBrowserInfo?
     private(set) var page: AtlasProjectBrowserPage?
     private(set) var root = ""
+    /// Lifetime identity of the native grant supplied by the project owner.
+    /// Same-path grant replacement must revoke local-link history; a catalog
+    /// refresh using this same grant may preserve already retained readers.
+    private(set) var rootAccessIdentity: ObjectIdentifier?
     private(set) var busy = false
     private(set) var closed = false
     private(set) var notice = "Opening the first project page…"
@@ -608,7 +612,8 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
         guard !closed, !busy, session == nil, root.hasPrefix("/"), root.utf8.count <= 16_384,
               !root.utf8.contains(0) else { throw AtlasProjectBrowserError.unavailable }
         let lease = try AtlasProjectBrowserSession(transport: transport, access: accessLease)
-        self.root = root; session = lease; busy = true
+        self.root = root; rootAccessIdentity = accessLease.map(ObjectIdentifier.init)
+        session = lease; busy = true
         let flag = AtlasSearchCancellation(); self.flag = flag
         defer { finish() }
         do {

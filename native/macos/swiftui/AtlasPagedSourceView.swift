@@ -25,12 +25,11 @@ import AppKit
     @State private var wrapsLines = false
     @State private var showsLineNumbers = true
     @State private var showsWhitespace = false
-    @State private var linked: AtlasProjectBrowserCapture?
-    @State private var linkedRoot: String?
+    @State private var linkHistory = AtlasDocumentLinkHistory<AtlasProjectBrowserCapture>(
+        retire: { $0.reader.close() },
+        failureMessage: { ($0 as? AtlasProjectBrowserError)?.message
+            ?? ($0 as? AtlasReaderError)?.message ?? "The linked file could not be opened." })
     @State private var showsLinked = false
-    @State private var linkNotice = ""
-    @State private var linkTask: Task<Void, Never>?
-    @State private var linkOperation = UUID()
 
     init(root: String, path: String, accessLease: AnyObject?, captured: AtlasSearchCapturedHit? = nil,
          supplied: AtlasSuppliedReaderSource? = nil,
@@ -71,11 +70,11 @@ import AppKit
         VStack(spacing: 4) {
             controls
             findControls
-            if !linkNotice.isEmpty {
+            if !linkHistory.notice.isEmpty {
                 HStack {
-                    Text(linkNotice).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    Text(linkHistory.notice).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                     Spacer()
-                    if linkTask != nil {
+                    if linkHistory.busy {
                         ProgressView().controlSize(.small)
                         Button("Cancel link", action: cancelLink)
                     }
@@ -98,6 +97,11 @@ import AppKit
         .onAppear { if ownsModel { open() } }
         .onDisappear { closeLinked(); if ownsModel { model.close() }; copyNotice = "" }
         .onChange(of: project?.info?.owner) { _, _ in projectChanged() }
+        .onChange(of: project?.rootAccessIdentity) { _, _ in projectChanged() }
+        .onChange(of: project?.closed) { _, _ in projectChanged() }
+        .onChange(of: linkHistory.current?.id) { _, current in
+            if current != nil { showsLinked = true }
+        }
         .onChange(of: model.navigation) { _, _ in copyNotice = "" }
         .onChange(of: model.textSelection?.id) { _, _ in copyNotice = "" }
         .onChange(of: Array(model.fileQuery.utf8)) { _, _ in copyNotice = "" }
@@ -121,102 +125,112 @@ import AppKit
     }
 
     private func verifiedNavigation(from source: AtlasPagedReaderModel) -> AtlasDocumentPreviewModel.LocalNavigation? {
-        guard project?.canOpenVerifiedDocumentLinks == true, linkTask == nil else { return nil }
+        guard project?.canOpenVerifiedDocumentLinks == true, !linkHistory.busy else { return nil }
         return { target in openLink(target, from: source) }
     }
 
     private func capturedNavigation(from source: AtlasProjectBrowserCapture) -> AtlasDocumentPreviewModel.LocalNavigation? {
-        guard let project, project.canOperate, linkTask == nil,
+        guard let project, project.canOperate, !linkHistory.busy,
               source.catalogOwner == project.info?.owner || project.canOpenVerifiedDocumentLinks else { return nil }
         return { target in openLink(target, from: source.reader, capture: source) }
     }
 
-    /// The original reader remains mounted behind this sheet with its exact
-    /// capture, position, query and preview. Onward links replace only the
-    /// independent target after a complete, validated acceptance.
+    /// Keep the bounded history's reader views mounted as well as their
+    /// captures. This preserves native scroll/selection and preview state when
+    /// Back/Forward changes the active file, without rebuilding its source.
     private var linkedReader: some View {
         VStack(spacing: 8) {
             HStack {
                 Label("Linked source", systemImage: "link").font(.headline)
+                Button("Back", action: linkHistory.back).disabled(!linkHistory.canBack)
+                    .help("Return to the previous retained linked source without reading the file again")
+                Button("Forward", action: linkHistory.forward).disabled(!linkHistory.canForward)
+                    .help("Return to the next retained linked source without reading the file again")
+                if linkHistory.current != nil {
+                    Text("\(linkHistory.position + 1) of \(linkHistory.captures.count)")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Spacer()
-                if linkTask != nil {
+                if linkHistory.busy {
                     ProgressView().controlSize(.small)
-                    Button("Cancel link", action: cancelLink)
+                    Button("Cancel link", action: cancelLink).disabled(linkHistory.canceling)
                 }
-                Button("Return to source") { showsLinked = false }
+                Button("Return to source", action: closeLinked)
+                    .help("Close this link history and return to the originating source")
             }
-            if let linked {
-                Text(verbatim: linked.file.display).font(.caption).textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                if linked.fragment.status != .none {
-                    Text(verbatim: linked.fragment.navigationDescription).font(.caption)
-                        .foregroundStyle(linked.fragment.isFallback ? Color.orange : Color.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+            ZStack(alignment: .topLeading) {
+                ForEach(linkHistory.captures) { capture in
+                    linkedDestination(capture)
+                        .opacity(linkHistory.current === capture ? 1 : 0)
+                        .allowsHitTesting(linkHistory.current === capture)
+                        .disabled(linkHistory.current !== capture)
+                        .accessibilityHidden(linkHistory.current !== capture)
                 }
-                AtlasPagedSourceView(model: linked.reader, canKeep: canKeep, keep: keep,
-                    openLocalLink: capturedNavigation(from: linked))
-                    .id(linked.id)
             }
-            if !linkNotice.isEmpty {
-                Text(linkNotice).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            Text("Back and Forward keep your place in up to three linked sources. Return to source restores the originating reader.")
+                .font(.caption2).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if !linkHistory.notice.isEmpty {
+                Text(linkHistory.notice).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }.padding(14).frame(minWidth: 850, idealWidth: 1100, minHeight: 600, idealHeight: 760)
+        .background(AtlasDocumentLinkFocus(capture: linkHistory.current?.id)
+            .allowsHitTesting(false).accessibilityHidden(true))
+    }
+
+    private func linkedDestination(_ capture: AtlasProjectBrowserCapture) -> some View {
+        VStack(spacing: 8) {
+            Text(verbatim: capture.file.display).font(.caption).textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if capture.fragment.status != .none {
+                Text(verbatim: capture.fragment.navigationDescription).font(.caption)
+                    .foregroundStyle(capture.fragment.isFallback ? Color.orange : Color.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            AtlasPagedSourceView(model: capture.reader, canKeep: canKeep, keep: keep,
+                openLocalLink: capturedNavigation(from: capture))
+        }
     }
 
     private func openLink(_ target: AtlasReaderDocumentLinkTarget, from source: AtlasPagedReaderModel,
                           capture: AtlasProjectBrowserCapture? = nil) {
-        guard let project, linkTask == nil,
-              project.canOperate,
+        guard let project, !linkHistory.busy, project.canOperate,
               capture?.catalogOwner == project.info?.owner || project.canOpenVerifiedDocumentLinks else { return }
-        let ticket = UUID(); linkOperation = ticket
-        linkNotice = capture == nil ? "Checking the originating capture and opening the linked file…"
-            : "Opening the linked file from the retained document…"
-        linkTask = Task {
-            defer { if linkOperation == ticket { linkTask = nil } }
-            do {
-                let candidate: AtlasProjectBrowserCapture
-                if let capture {
-                    candidate = try await project.openRetainedDocumentLink(target, from: capture,
-                        readerTransport: .native, search: .native, outline: .native, document: .native)
-                } else {
-                    candidate = try await project.openVerifiedDocumentLink(target, from: source,
-                        readerTransport: .native, search: .native, outline: .native, document: .native)
-                }
-                guard linkOperation == ticket, !Task.isCancelled, !project.closed else { candidate.reader.close(); return }
-                let previous = linked
-                linked = candidate; linkedRoot = project.root; showsLinked = true
-                previous?.reader.close()
-                linkNotice = "Linked capture ready. Return to source restores the originating reader."
-            } catch {
-                guard linkOperation == ticket, !Task.isCancelled, !project.closed else { return }
-                linkNotice = (error as? AtlasProjectBrowserError)?.message
-                    ?? (error as? AtlasReaderError)?.message ?? "The linked file could not be opened."
+        // An action retained by an older, hidden destination cannot branch the
+        // currently displayed source. The engine separately verifies the exact
+        // link/capture identities before returning a new reader.
+        if let capture, linkHistory.current !== capture { return }
+        linkHistory.bind(root: project.root, accessIdentity: project.rootAccessIdentity)
+        linkHistory.follow {
+            if let capture {
+                return try await project.openRetainedDocumentLink(target, from: capture,
+                    readerTransport: .native, search: .native, outline: .native, document: .native)
             }
+            return try await project.openVerifiedDocumentLink(target, from: source,
+                readerTransport: .native, search: .native, outline: .native, document: .native)
         }
     }
 
-    private func cancelLink() {
-        linkOperation = UUID(); linkTask?.cancel(); linkTask = nil
-        linkNotice = "Link opening canceled. The retained source is unchanged."
-    }
+    private func cancelLink() { linkHistory.cancel() }
 
     private func closeLinked() {
-        linkOperation = UUID(); linkTask?.cancel(); linkTask = nil
-        showsLinked = false; linked?.reader.close(); linked = nil; linkedRoot = nil; linkNotice = ""
+        showsLinked = false
+        linkHistory.close()
     }
 
     private func projectChanged() {
-        // A same-root refresh retires catalog receipts, not accepted readers.
-        // Cancel pending old-owner work without reopening its admission slot
-        // until the task drains. New links must prove the retained source
-        // against the new catalog; a changed root still withdraws its sheet.
-        linkTask?.cancel()
-        if let project, !project.closed, let linkedRoot,
-           project.root.utf8.elementsEqual(linkedRoot.utf8), linked != nil {
-            linkNotice = "Project refreshed; the linked capture remains open. Following another link verifies its source against the current project."
+        // Catalog refresh withdraws only its pending link operation. Exact
+        // captured history survives if raw root bytes and the actual native
+        // grant are unchanged. Root/grant revocation closes the whole trail.
+        guard let project, !project.closed, project.info != nil else {
+            closeLinked()
+            return
+        }
+        if linkHistory.bind(root: project.root, accessIdentity: project.rootAccessIdentity) {
+            linkHistory.catalogRefreshed()
         } else {
-            showsLinked = false; linked?.reader.close(); linked = nil; linkedRoot = nil; linkNotice = ""
+            showsLinked = false
         }
     }
 
@@ -525,5 +539,20 @@ import AppKit
         copyNotice = NSPasteboard.general.setString(page.originalHex, forType: .string)
             ? "Copied \(page.end - page.start) original bytes as hex."
             : "The clipboard did not accept this page's original hex."
+    }
+}
+
+/// Retained invisible text views must not keep the native first responder:
+/// otherwise Copy or typing could target an older source after Back/Forward.
+/// Resolve this sheet's own window, never an application-global key window.
+@MainActor private struct AtlasDocumentLinkFocus: NSViewRepresentable {
+    let capture: UUID?
+    final class Coordinator { var capture: UUID? }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeNSView(context: Context) -> NSView { NSView() }
+    func updateNSView(_ view: NSView, context: Context) {
+        guard context.coordinator.capture != capture else { return }
+        context.coordinator.capture = capture
+        view.window?.makeFirstResponder(nil)
     }
 }
