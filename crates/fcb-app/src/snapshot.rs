@@ -33,13 +33,14 @@ const HELP: &str = "fcb snapshot save ROOT --output NEW_FILE [--json] [--respect
 fcb snapshot catalog FILE --output NEW_CATALOG [--json]\n\
 fcb snapshot inspect FILE [--json] [--limit N]\n\
 fcb snapshot search FILE (--text LITERAL | --raw-hex HEX | --query EXPRESSION) [--json] [--limit N]\n\
-Literal options: --ignore-case (text only), --count-all (text or raw bytes).\n\
+Matching options: --ignore-case (literal text only), --count-all (text, raw bytes or expressions).\n\
 Complete --count-all exits 0 for a positive total or 1 for zero, even when rows are capped.\n\
 Incomplete saved coverage exits 3; ordinary capped searches also exit 3.\n\
 --ignore-case uses Unicode scalar lowercase, not full case folding or canonical normalization.\n\
 --count-all finishes the saved scope while retaining at most --limit N hits; --limit 0 counts only.\n\
 Exact counts, saved-scope coverage and retained-hit truncation are reported separately.\n\
-These matching/count options are not supported by expression or structure queries.\n\
+Expression counts include primary occurrences only after all whole-member predicates succeed.\n\
+Expression --ignore-case and structure matching/count options remain unsupported.\n\
 fcb snapshot structure FILE --mode symbols|headings|occurrences --name TEXT [--json]\n\
 fcb snapshot read FILE (--member NAME | --member-hex HEX) [--json]\n\
 fcb snapshot index help  # Build/reopen pinned substring indexes\n\
@@ -236,8 +237,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
             && usize::from(settings.text.is_some()) + usize::from(settings.raw_needle.is_some()) + usize::from(settings.expression.is_some()) == 1
             && seen & !(1 | 4 | 8 | 32768 | catalog_options | 524288 | 1048576 | 33554432 | 67108864) == 0
             && (seen & 1048576 == 0 || settings.expression.is_some())
-            && (!settings.ignore_case || settings.text.is_some())
-            && (!settings.count_all_matches || settings.expression.is_none()),
+            && (!settings.ignore_case || settings.text.is_some()),
         Mode::Structure => settings.source.is_some() && settings.structure_mode.is_some() && settings.structure_name.is_some()
             && seen & !(1 | 8 | catalog_options | 2097152 | 4194304 | 8388608 | 16777216) == 0
             && (settings.structure_mode != Some(StructureMode::Occurrences) || settings.name_mode == SymbolNameMode::Exact),

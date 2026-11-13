@@ -30,8 +30,12 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
         budget, [allocation(104), allocation(110)], canceled)?;
     let options = ExpressionOptions { generation: generation(), first_file: file_id(), first_revision: revision(),
         max_matches: settings.limit, max_scan_bytes: settings.max_scan_bytes };
-    let mut query = ExpressionQuery::new(&mut archive, &plan, options, budget,
-        [allocation(151), allocation(152), allocation(153)])?;
+    let allocations = [allocation(151), allocation(152), allocation(153)];
+    let mut query = if settings.count_all_matches {
+        ExpressionQuery::new_counting(&mut archive, &plan, options, budget, allocations)?
+    } else {
+        ExpressionQuery::new(&mut archive, &plan, options, budget, allocations)?
+    };
     while query.state() == ExpressionState::Pending {
         query.step(StreamReadStep::default(), generation(), budget, &mut *canceled)?;
     }
@@ -46,7 +50,10 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
         out.literal(",\"policy\":")?; out.quoted(archive.directory().policy())?;
         out.literal(",\"discovery_complete\":")?; out.boolean(archive.directory().discovery_complete())?;
         out.literal(",\"workspace_complete\":")?; out.boolean(report.is_complete())?;
-        out.literal(",\"truncated\":")?; out.boolean(report.state() == ExpressionState::Truncated)?;
+        out.literal(",\"truncated\":")?; out.boolean(report.hits_truncated())?;
+        out.literal(",\"count_all_matches\":")?; out.boolean(report.count_all_matches())?;
+        out.literal(",\"matches_seen_exact\":")?; out.boolean(report.is_complete())?;
+        out.literal(",\"match_count_complete\":")?; out.boolean(report.is_complete())?;
         out.literal(",\"work_limited\":")?; out.boolean(report.state() == ExpressionState::WorkLimit)?;
         out.literal(",\"max_scan_bytes\":")?; out.integer(settings.max_scan_bytes)?;
         out.literal(",\"archive_validation_bytes\":")?; out.integer(archive.directory().validation_stats().bytes_read)?;
@@ -65,6 +72,10 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
             ("predicate_rejections", stats.predicate_rejections as u64),
             ("primary_scans", stats.primary_scans as u64),
             ("matches_seen", report.matches_seen()),
+            ("stored_hits", report.hits().len() as u64),
+            ("max_matches", settings.limit as u64),
+            ("matching_files", report.matching_files() as u64),
+            ("retained_matching_files", report.retained_matching_files() as u64),
         ] {
             out.literal(",")?; out.quoted(name)?; out.literal(":")?; out.integer(count)?;
         }
@@ -73,6 +84,13 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
         out.literal(if report.is_complete() { "Complete saved-scope expression search; no live root accessed.\n" }
             else { "PARTIAL saved-scope expression search; no live root accessed.\n" })?;
         out.literal("Query: ")?; out.human_text(raw)?; out.literal("\n")?;
+        if report.count_all_matches() {
+            out.literal("Primary matches seen: ")?; out.literal(&report.matches_seen().to_string())?;
+            out.literal(if report.is_complete() { " (exact)" } else { " (lower bound; saved scope incomplete)" })?;
+            out.literal("; retained hits: ")?; out.literal(&report.hits().len().to_string())?;
+            out.literal("; matching files: ")?; out.literal(&report.matching_files().to_string())?;
+            out.literal(". Whole-member conjunctions and exclusions filter qualifying files.\n")?;
+        }
     }
     for (i, hit) in report.hits().iter().enumerate() {
         if canceled() { return Err(Failure::canceled()); }
