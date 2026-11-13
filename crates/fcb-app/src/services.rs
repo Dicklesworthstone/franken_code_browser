@@ -44,12 +44,19 @@ quotas stay unavailable, not false no-match results. No atomic-repository claim.
 Continuous whole-file search, without retaining full source:\n\
   fcb search FILE --whole-file --text TEXT [--ignore-case] [--json]\n\
   fcb search ROOT --workspace --whole-file --text TEXT [--ignore-case] [--json]\n\
+  fcb search FILE --whole-file --identifier NAME [--json]\n\
+  fcb search ROOT --workspace --whole-file --identifier NAME [--json]\n\
   --count-all continues counting after --limit retained rows, within I/O limits.\n\
   Use --count-all --limit 0 for counts without retaining occurrence rows.\n\
   --raw-hex HEX also works; --max-scan-bytes N admits source I/O separately.\n\
 Default scan allowance: 256 MiB GLOBAL, maximum 1 TiB; input buffer: 16 KiB.\n\
 --ignore-case uses Unicode lowercase comparison and retains each occurrence's\n\
 original spelling and bytes; it does not add full case folding or normalization.\n\
+--identifier uses exact case-sensitive whole-token text, including comments and\n\
+strings, not compiler references. It cannot combine with --ignore-case or another\n\
+query mode. Token boundaries cross buffers; a byte limit does not imply token end.\n\
+ASCII letters/digits/_/$ and conservative non-ASCII runs form tokens; NAME must\n\
+not start with an ASCII digit and has a 1024-byte UTF-8 limit.\n\
 Only literal witnesses are retained. The scan has separate read-call and result\n\
 limits, preserves cross-buffer hits, and reports incomplete files.\n\
 match_count_complete reports exhaustive observed counts separately from truncated\n\
@@ -116,14 +123,14 @@ pub(crate) fn capabilities(args: &Arguments, out: &mut Output) -> Result<u8, App
             out.literal(",\"reason\":")?; out.quoted(reason)?; out.literal("}")?;
         }
         out.literal("],\"whole_file_search\":{\"state\":")?; out.quoted(file_state)?;
-        out.literal(",\"flag\":\"--whole-file\",\"count_all_flag\":\"--count-all\",\"ignore_case_flag\":\"--ignore-case\",\"case_insensitive_semantics\":\"unicode-lowercase\",\"normalization\":\"exact\",\"input_buffer_bytes\":\"16384\",\"default_max_scan_bytes\":\"268435456\",\"maximum_max_scan_bytes\":\"1099511627776\",\"retention\":\"literal-witnesses-only\"}}\n")?;
+        out.literal(",\"flag\":\"--whole-file\",\"count_all_flag\":\"--count-all\",\"ignore_case_flag\":\"--ignore-case\",\"identifier_flag\":\"--identifier\",\"identifier_semantics\":\"whole-token-text-candidate\",\"identifier_case_sensitive\":true,\"case_insensitive_semantics\":\"unicode-lowercase\",\"normalization\":\"exact\",\"input_buffer_bytes\":\"16384\",\"default_max_scan_bytes\":\"268435456\",\"maximum_max_scan_bytes\":\"1099511627776\",\"retention\":\"literal-witnesses-only\"}}\n")?;
     } else {
         out.literal("FrankenCodeBrowser: headless source tools; independent verification pending.\n")?;
         if diagnostic { out.literal("Static diagnostic only: no source scans, benchmarks, database opens, or repairs.\n")?; }
         for (name, state, reason) in rows { out.literal(name)?; out.literal(": ")?;
             out.literal(state)?; out.literal(" — ")?; out.literal(reason)?; out.literal("\n")?; }
         out.literal("whole-file-streaming: ")?; out.literal(file_state)?;
-        out.literal(" — explicit --whole-file; optional text --ignore-case and --count-all, global I/O budget, 16 KiB input buffer, literal witnesses only.\n")?;
+        out.literal(" — explicit --whole-file; text or whole-token --identifier, optional text --ignore-case and --count-all, global I/O budget, 16 KiB input buffer, literal witnesses only.\n")?;
     }
     Ok(EXIT_OK)
 }

@@ -21,6 +21,7 @@ fn needle(args: &Arguments, budget: &ResourceBudget) -> Result<StreamingNeedle, 
     match args.needle.as_ref() {
         Some(Needle::Text(text)) => Ok(StreamingNeedle::text_matching(owner(), text, !args.ignore_case, budget, allocation(40))?),
         Some(Needle::Raw(bytes)) => Ok(StreamingNeedle::raw(owner(), bytes, budget, allocation(40))?),
+        Some(Needle::Identifier(name)) => Ok(StreamingNeedle::identifier(owner(), name, budget, allocation(40))?),
         _ => Err(AppError::InvalidRange),
     }
 }
@@ -183,18 +184,22 @@ fn exit(report: &FileSearchReport<'_>) -> u8 {
     else if report.search().matches_seen() == 0 { EXIT_NO_MATCH } else { EXIT_OK }
 }
 fn matching_fields(mode: StreamingMode, out: &mut Output) -> Result<(), AppError> {
-    // Only the raw, exact and lowercase literal modes constructed by this
-    // command's private needle() reach this formatter.
     out.literal(",\"mode\":")?;
-    out.quoted(if mode == StreamingMode::OriginalBytes { "original-bytes" }
-        else if mode == StreamingMode::LowercaseText { "unicode-lowercase-text" }
-        else { "exact-decoded-text" })?;
+    out.quoted(match mode {
+        StreamingMode::OriginalBytes => "original-bytes",
+        StreamingMode::ExactText => "exact-decoded-text",
+        StreamingMode::LowercaseText => "unicode-lowercase-text",
+        StreamingMode::Identifier => "whole-token-occurrences",
+    })?;
     out.literal(",\"case_sensitive\":")?;
     if mode == StreamingMode::OriginalBytes { out.literal("null")?; }
     else { out.boolean(mode != StreamingMode::LowercaseText)?; }
     out.literal(",\"normalization\":")?;
     if mode == StreamingMode::OriginalBytes { out.literal("null")?; }
     else { out.quoted("exact")?; }
+    if mode == StreamingMode::Identifier {
+        out.literal(",\"evidence_level\":\"whole-token-text-candidate\",\"includes_comments_and_literals\":true,\"compiler_resolved\":false,\"semantic_complete\":false")?;
+    }
     Ok(())
 }
 fn fields(report: &FileSearchReport<'_>, out: &mut Output, canceled: &mut impl FnMut() -> bool) -> Result<(), AppError> {
@@ -255,9 +260,12 @@ fn fields(report: &FileSearchReport<'_>, out: &mut Output, canceled: &mut impl F
 fn human(report: &FileSearchReport<'_>, out: &mut Output) -> Result<(), AppError> {
     let search = report.search();
     out.literal("  Matching: ")?;
-    out.literal(if search.mode() == StreamingMode::OriginalBytes { "original bytes" }
-        else if search.mode() == StreamingMode::LowercaseText { "Unicode lowercase text; exact normalization" }
-        else { "exact case-sensitive text" })?;
+    out.literal(match search.mode() {
+        StreamingMode::OriginalBytes => "original bytes",
+        StreamingMode::ExactText => "exact case-sensitive text",
+        StreamingMode::LowercaseText => "Unicode lowercase text; exact normalization",
+        StreamingMode::Identifier => "exact whole-token occurrences, including comments and strings; not compiler references",
+    })?;
     out.literal("\n")?;
     for hit in search.hits() {
         out.literal("  bytes ")?; out.literal(&hit.original_range().start().get().to_string())?;

@@ -44,6 +44,8 @@ fcb search /path/to/repository --workspace --whole-file --text 'pub fn' --json
 fcb search /path/to/repository --workspace --whole-file --raw-hex 00ff --json
 fcb search /path/to/repository --workspace --whole-file --text 'pub fn' --count-all --limit 50 --json
 fcb search /path/to/repository --workspace --whole-file --text 'pub fn' --ignore-case --count-all --limit 0 --json
+fcb search huge.rs --whole-file --identifier cancel --json
+fcb search /path/to/repository --workspace --whole-file --identifier cancel --count-all --limit 50 --json
 ```
 
 By default, the scope is **one explicitly selected file**, not its siblings or
@@ -82,6 +84,26 @@ remain content. Regex is not silently applied. `--encoding` can declare
 the SAME continuous observation. `--raw-hex` searches arbitrary original bytes
 and cannot be combined with an encoding override or `--ignore-case`.
 File-window and stdin search retain their existing exact semantics.
+
+Use **`--identifier NAME`** instead of `--text` for exact whole-token occurrences
+in either a named file or an explicit workspace. This uses the same shared
+identifier matcher as native project search. A search for `cancel` matches
+`cancel()` and `"cancel"`, while excluding `cancelled`, `_cancel`, `$cancel`,
+`1cancel`, and `Cancel`. Comments and strings participate; results are text
+candidates and do not claim compiler-resolved references. Tokens contain ASCII
+letters/digits, `_`, `$`, and conservative non-ASCII non-whitespace/non-control
+runs. That policy preserves combining marks and non-ASCII punctuation as part
+of a token; it is not a language-specific or Unicode-identifier parser.
+
+The identifier must be one nonempty token of at most 1024 UTF-8 bytes and cannot
+begin with an ASCII digit. Matching is case-sensitive and uses exact encoding
+semantics; `--ignore-case` and other query modes cannot be combined with it.
+Both UTF-8 and UTF-16 retain exact original-byte witnesses, including matches
+split across read buffers. Only a delimiter or the actual end of the observation
+establishes the token's end: stopping at a byte budget never accepts a partial
+token. `--identifier` requires `--whole-file`; source windows and stdin do not
+silently acquire different boundary semantics. `--count-all`, including
+`--limit 0`, and the existing global byte/read-call limits also apply.
 
 The operation's allocations depend on fixed input/decoder scratch, literal
 length and result capacity, not the source file's length. The input buffer is
@@ -145,7 +167,7 @@ explicit alternative. Other completed files' results remain useful.
 
 Whole-file JSON uses `strategy: "streaming-whole-file"`. Matching metadata is
 present on each file and at workspace level: `mode` is
-`exact-decoded-text`, `unicode-lowercase-text`, or `original-bytes`;
+`exact-decoded-text`, `unicode-lowercase-text`, `whole-token-occurrences`, or `original-bytes`;
 `case_sensitive` records the text choice and `normalization` is `exact`.
 The latter two fields are null for raw-byte search. Each file record carries
 exact original-byte hit ranges, counters, consistency and terminal state.
@@ -155,6 +177,10 @@ search sets that field to null and adds `matched_text` and `original_hex`
 to each retained hit. `retained_witness_bytes` reports retained original-byte
 payload, including zero for count-only scans. `decoded_range` is null: the
 scanner does not invent global decoded coordinates.
+Identifier results additionally record `evidence_level: "whole-token-text-candidate"`,
+`includes_comments_and_literals: true`, `compiler_resolved: false`, and
+`semantic_complete: false`. Match-count completeness still describes the
+observed token search, independently of those intentionally limited semantics.
 Workspace output has `files`, `files_examined`, `unexamined_files`,
 `incomplete_files`, `workspace_complete`, `matching_files`, global counts and
 `stop_reason`. `matching_files` includes files with counted occurrences after

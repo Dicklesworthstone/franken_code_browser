@@ -18,7 +18,7 @@ pub enum Command { Help, Capabilities, Doctor, Inspect, Open, Read, Search, Laun
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Encoding { Auto, Utf8, Utf16Le, Utf16Be }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Needle { Text(String), Raw(Vec<u8>), Path(String), Query(ParsedQuery) }
+pub enum Needle { Text(String), Raw(Vec<u8>), Path(String), Query(ParsedQuery), Identifier(String) }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Arguments {
     pub command: Command, pub json: bool, pub file: Option<PathBuf>, pub stdin: bool,
@@ -60,7 +60,7 @@ pub fn json_requested(args: &[OsString]) -> bool {
         if argument == "--" { break; }
         if argument == "--json" { return true; }
         if matches!(argument.to_str(), Some("--offset" | "--bytes" | "--limit" | "--encoding" | "--text" | "--raw-hex"
-            | "--query" | "--path" | "--max-files" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes")) { cursor += 1; }
+            | "--query" | "--identifier" | "--path" | "--max-files" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes")) { cursor += 1; }
     }
     false
 }
@@ -108,6 +108,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
                 "--max-file-bytes" => 2048, "--max-total-bytes" => 4096, "--path" => 8192,
                 "--whole-file" => 16384, "--max-scan-bytes" => 32768, "--respect-ignores" => 65536,
                 "--query" => 131072, "--ignore-case" => 262144, "--count-all" => 524288,
+                "--identifier" => 1048576,
                 _ => return Err(ArgumentError::UnknownOption),
             };
             if seen & bit != 0 { return Err(ArgumentError::DuplicateOption); }
@@ -162,6 +163,11 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
                     if parsed.needle.is_some() { return Err(ArgumentError::InvalidNeedle); }
                     parsed.needle = Some(Needle::Query(ParsedQuery::parse(value).map_err(ArgumentError::Query)?));
                 }
+                "--identifier" => {
+                    if parsed.needle.is_some() { return Err(ArgumentError::InvalidNeedle); }
+                    fcb::search::identifier::validate_identifier(value).map_err(|_| ArgumentError::InvalidNeedle)?;
+                    parsed.needle = Some(Needle::Identifier(value.to_owned()));
+                }
                 "--raw-hex" => {
                     if parsed.needle.is_some() { return Err(ArgumentError::InvalidNeedle); }
                     parsed.needle = Some(Needle::Raw(hex_bytes(value)?));
@@ -175,6 +181,11 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         }
     }
     if parsed.stdin && parsed.file.is_some() { return Err(ArgumentError::MultipleSources); }
+    // A window boundary is not a token boundary. Whole identifiers use the
+    // continuous observation engine, which can establish both boundaries.
+    if matches!(parsed.needle.as_ref(), Some(Needle::Identifier(_))) && !parsed.whole_file {
+        return Err(ArgumentError::IncompatibleOptions);
+    }
     if parsed.count_all && (parsed.command != Command::Search
         || (!parsed.whole_file && (!parsed.workspace
             || !matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Query(_)))))) {
@@ -194,7 +205,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
             return Err(ArgumentError::IncompatibleOptions);
         }
         if parsed.file.is_none() { return Err(ArgumentError::MissingSource); }
-        if !matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Raw(_))) { return Err(ArgumentError::InvalidNeedle); }
+        if !matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Raw(_) | Needle::Identifier(_))) { return Err(ArgumentError::InvalidNeedle); }
         if matches!(parsed.needle.as_ref(), Some(Needle::Raw(_))) && seen & 32 != 0 { return Err(ArgumentError::IncompatibleOptions); }
         if !parsed.workspace && seen & (512 | 1024) != 0 { return Err(ArgumentError::IncompatibleOptions); }
         return Ok(parsed);
