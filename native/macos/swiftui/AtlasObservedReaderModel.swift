@@ -249,6 +249,17 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     var canObserve: Bool { !closed && session != nil }
     var canReadLines: Bool { canObserve && transport.lines != nil && (try? lineRequest()) != nil }
     var canReopen: Bool { !closed && authority != nil }
+    /// Current path authority belongs to the accepted opened file, independently
+    /// of which bounded observation is visible. A pending reopen cannot replace
+    /// that capability until its first range validates.
+    func currentFileForExternalEditor() -> (input: AtlasObservedReaderInput, lease: AnyObject?,
+        authority: AtlasObservedReaderSourceIdentity, identity: AtlasObservedReaderIdentity)? {
+        guard !closed, let authority, let session, let info, let page,
+              info.identity.owner == session.handle,
+              page.observation.identity == info.identity,
+              info.identity.path == authority.input.absolutePath else { return nil }
+        return (authority.input, authority.access, authority.identity, info.identity)
+    }
     var canCopy: Bool { !busy && page != nil && session != nil && !closed }
     var canCopySelection: Bool {
         guard !closed, !busy, let selection = textSelection, let page,

@@ -10,11 +10,15 @@ private final class FileBoundary: @unchecked Sendable {
     private var paths: [String] = []
     private var closed = 0
     private var gate: DocumentCallGate?
+    private var windowGate: DocumentCallGate?
     private var refuseWindow = false
     var openedPaths: [String] { lock.withLock { paths } }
     var closes: Int { lock.withLock { closed } }
     func blockOpen() -> DocumentCallGate {
         let gate = DocumentCallGate(); lock.withLock { self.gate = gate }; return gate
+    }
+    func blockWindow() -> DocumentCallGate {
+        let gate = DocumentCallGate(); lock.withLock { windowGate = gate }; return gate
     }
     func failWindow() { lock.withLock { refuseWindow = true } }
     private func source(_ owner: UInt64) -> DocumentBoundary { lock.withLock { sources[owner]! } }
@@ -37,7 +41,12 @@ private final class FileBoundary: @unchecked Sendable {
         AtlasReaderTransport(create: { [self] in create() },
             open: { [self] in open($0, path: $1, limit: $2) },
             window: { [self] owner, offset, bytes in
-                let refused = lock.withLock { let refused = refuseWindow; refuseWindow = false; return refused }
+                let (blocked, refused) = lock.withLock {
+                    let blocked = windowGate, refused = refuseWindow
+                    windowGate = nil; refuseWindow = false
+                    return (blocked, refused)
+                }
+                blocked?.wait()
                 return refused ? nil : source(owner).reader.window(owner, offset, bytes)
             },
             lines: { _, _, _, _ in nil }, cancel: { _ in true },
@@ -111,9 +120,10 @@ private final class FileGrant {}
     }
     static func main() async throws {
         try await fileOnlyRefresh()
+        try await externalEditorCapabilityRequiresAcceptedPageAndOwnsFileGrant()
         try await failedFirstPage()
         try await canceledOpenRetainsGrantUntilDrain()
-        print("SelectedFileReader: exact capture, file-only Markdown/refresh, failed first page, cancellation and grant retirement passed")
+        print("SelectedFileReader: exact capture, file-only Markdown/refresh, editor authority, failed first page, cancellation and grant retirement passed")
     }
     static func input() throws -> AtlasReaderInput { try .init(root: "/project", path: "README.md") }
 
@@ -125,6 +135,10 @@ private final class FileGrant {}
         precondition(model.page?.originalHex == DocumentWireFixture.hex(DocumentWireFixture.raw))
         precondition(model.canRefresh && held != nil && model.documentPreview.richSupported)
         for pass in 0..<2 {
+            var handoff = model.currentFileForExternalEditor()
+            precondition(handoff?.input.fullPath == DocumentWireFixture.path && handoff?.lease === held)
+            precondition(handoff?.identity.matches(model.page!.identity) == true)
+            handoff = nil
             model.documentPreview.widthInput = "80"
             model.documentPreview.prepare()
             try await until { !model.documentPreview.busy && model.documentPreview.displayPage != nil }
@@ -145,7 +159,38 @@ private final class FileGrant {}
         } catch is AtlasReaderError {}
         precondition(model.page?.identity.matches(original) == true && wire.openedPaths.count == 2)
         model.close()
+        precondition(model.currentFileForExternalEditor() == nil)
         try await until { held == nil && wire.closes == 2 }
+    }
+    static func externalEditorCapabilityRequiresAcceptedPageAndOwnsFileGrant() async throws {
+        let wire = FileBoundary(), model = AtlasPagedReaderModel(transport: wire.reader)
+        precondition(model.currentFileForExternalEditor() == nil, "inert reader acquired editor authority")
+        let gate = wire.blockWindow()
+        var grant: FileGrant? = FileGrant(); weak var held = grant
+        var operation: Task<Void, Error>? = Task { [grant] in
+            try await model.openSelectedFile(input: input(), accessLease: grant)
+        }
+        try await until { gate.hasEntered }
+        grant = nil
+        precondition(model.busy && model.page == nil && held != nil)
+        precondition(model.currentFileForExternalEditor() == nil,
+            "metadata admission authorized an editor before the first page validated")
+        gate.release()
+        try await operation!.value
+        operation = nil
+        let before = wire.openedPaths
+        var handoff = model.currentFileForExternalEditor()
+        precondition(handoff?.input.fullPath == DocumentWireFixture.path)
+        precondition(handoff?.identity.matches(model.page!.identity) == true && handoff?.lease === held)
+        precondition(wire.openedPaths == before, "editor capability extraction reopened source")
+        model.close()
+        precondition(model.currentFileForExternalEditor() == nil, "closed model retained editor authority")
+        try await until { wire.closes == 1 }
+        withExtendedLifetime(handoff) {
+            precondition(held != nil, "an extracted editor capability lost its selected-file grant")
+        }
+        handoff = nil
+        try await until { held == nil }
     }
     static func failedFirstPage() async throws {
         let wire = FileBoundary(), model = AtlasPagedReaderModel(transport: wire.reader)
@@ -156,7 +201,7 @@ private final class FileGrant {}
             preconditionFailure("invalid first page published")
         } catch is AtlasReaderError {}
         grant = nil
-        precondition(model.page == nil && !model.canRefresh)
+        precondition(model.page == nil && !model.canRefresh && model.currentFileForExternalEditor() == nil)
         try await until { held == nil && wire.closes == 1 }
     }
     static func canceledOpenRetainsGrantUntilDrain() async throws {
@@ -168,6 +213,7 @@ private final class FileGrant {}
                 try await model.openSelectedFile(input: input(), accessLease: grant)
             }
             try await until { gate.hasEntered }
+            precondition(model.currentFileForExternalEditor() == nil)
             grant = nil
             if closing { model.close() } else { operation?.cancel() }
             precondition(held != nil && wire.closes == 0)
@@ -175,7 +221,7 @@ private final class FileGrant {}
             do { try await operation!.value; preconditionFailure("canceled capture published") }
             catch {}
             operation = nil
-            precondition(model.page == nil && !model.canRefresh)
+            precondition(model.page == nil && !model.canRefresh && model.currentFileForExternalEditor() == nil)
             try await until { wire.closes == 1 && held == nil }
         }
     }

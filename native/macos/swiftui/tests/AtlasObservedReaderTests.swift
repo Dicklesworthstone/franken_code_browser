@@ -33,6 +33,7 @@ import Foundation
         try await lineNavigation()
         try await lineEditsAndCancellation()
         try await latestAndReopen()
+        try await currentFileEditorAuthority()
         try await cancellationAndGrantDrain()
         try await quarantineAndCapacity()
         print("AtlasObservedReaderTests: \(checks) checks passed")
@@ -474,6 +475,80 @@ import Foundation
             "Successful explicit reopen commits a new owner and clears only observed-range history")
         reader.close()
         await wait("Reopened descriptors did not retire") { probe.closedCount == probe.createCount }
+    }
+
+    @MainActor private static func currentFileEditorAuthority() async throws {
+        let probe = ObservedReaderProbe()
+        let model = AtlasObservedReaderModel(transport: probe.transport)
+        model.pageBytes = 4
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("current é.rs".utf8))
+        check(model.currentFileForExternalEditor() == nil, "A pathname without an accepted reader grants no editor action")
+        let first = ObservedReaderGate(); probe.block(0, on: first)
+        model.open(source(input, access: ObservedReaderGrant(probe, "editor-original")))
+        await wait("Initial editor capability fixture did not enter") { first.entered }
+        check(model.currentFileForExternalEditor() == nil,
+            "A pending first observation must not authorize an editor action")
+        first.release()
+        await wait("Initial editor capability fixture did not accept") { !model.busy && model.page != nil }
+        let original = model.currentFileForExternalEditor()!
+        check(original.input == input && original.identity.path == input.absolutePath && original.lease != nil
+            && original.identity.displayPath == "escaped presentation label",
+            "Editor capability comes from exact admitted path and grant, never the presentation label")
+
+        let next = ObservedReaderGate(); probe.block(4, on: next)
+        model.nextRange()
+        await wait("Editor navigation fixture did not enter") { next.entered }
+        check(model.currentFileForExternalEditor()?.identity == original.identity,
+            "A pending range read does not revoke the same opened file's editor action")
+        next.release()
+        await wait("Editor navigation fixture did not accept") { !model.busy && model.page?.visibleRange.start == 4 }
+        check(model.currentFileForExternalEditor()?.identity == original.identity
+            && model.currentFileForExternalEditor()?.authority == original.authority
+            && model.currentFileForExternalEditor()?.lease === original.lease,
+            "New observed pages keep the same current-file authority and opened owner")
+        model.back()
+        await wait("Editor history fixture did not restore") { !model.busy && model.page?.visibleRange.start == 0 }
+        check(model.currentFileForExternalEditor()?.identity == original.identity,
+            "Retained observation history does not invalidate a chooser for this opened file")
+
+        probe.failOpen(); model.reopenCurrentFile()
+        await wait("Failed editor reopen fixture did not finish") { !model.busy }
+        check(model.currentFileForExternalEditor()?.identity == original.identity,
+            "Failed explicit reopen preserves the accepted editor capability")
+        let reopening = ObservedReaderGate(); probe.block(0, on: reopening)
+        model.reopenCurrentFile()
+        await wait("Editor reopen fixture did not enter") { reopening.entered }
+        check(model.currentFileForExternalEditor()?.identity == original.identity,
+            "Reopen cannot relabel the accepted editor capability before first-page validation")
+        reopening.release()
+        await wait("Editor reopen fixture did not commit") {
+            !model.busy && model.currentFileForExternalEditor()?.identity != original.identity
+        }
+        let reopened = model.currentFileForExternalEditor()!
+        check(reopened.authority == original.authority && reopened.lease === original.lease
+            && reopened.identity.owner != original.identity.owner,
+            "Accepted reopen invalidates an earlier chooser by opened owner even for an unchanged path and grant")
+
+        model.open(source(input, access: ObservedReaderGrant(probe, "editor-replacement")))
+        check(model.currentFileForExternalEditor() == nil,
+            "Replacing source authority revokes an earlier chooser immediately")
+        await wait("Replacement editor authority never accepted") { !model.busy && model.page != nil }
+        let replacement = model.currentFileForExternalEditor()!
+        check(replacement.authority != reopened.authority && replacement.lease !== reopened.lease
+            && replacement.identity != reopened.identity,
+            "A new grant to the same pathname is not the earlier source's editor capability")
+        model.close()
+        check(model.currentFileForExternalEditor() == nil, "Closing revokes editor authority synchronously")
+        await wait("Editor authority descriptors did not retire") { probe.closedCount == probe.createCount }
+
+        let raw = try AtlasObservedReaderInput(selectedFile: [47, 115, 101, 108, 101, 99, 116, 101, 100, 47, 255])
+        try await model.openSelectedFile(AtlasObservedReaderSource(selectedFile: raw, access: nil))
+        let rawCapability = model.currentFileForExternalEditor()!
+        check(rawCapability.input.route == .selectedFile && rawCapability.identity.path == raw.absolutePath
+            && String(bytes: rawCapability.input.absolutePath, encoding: .utf8) == nil,
+            "A native filename retains exact bytes so the view can refuse lossy editor URL conversion")
+        model.close()
+        await wait("Raw editor authority descriptor did not retire") { probe.closedCount == probe.createCount }
     }
 
     @MainActor private static func cancellationAndGrantDrain() async throws {

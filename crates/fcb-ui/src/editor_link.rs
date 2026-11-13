@@ -9,10 +9,19 @@
 
 use std::fmt;
 
+/// Per-field byte bound for configured editor, decoded file path and optional
+/// root authority. Refuse before copying any input into arguments or errors.
+pub const MAX_EDITOR_INPUT_BYTES: usize = 16_384;
+/// A file argument can append two colons and two decimal `u32` coordinates.
+pub const MAX_EDITOR_ARGUMENT_BYTES: usize = MAX_EDITOR_INPUT_BYTES + 22;
+
 /// Refusal reasons for untrusted or malformed external actions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ActionRefusalReason {
     Empty,
+    InputLimit,
+    InvalidPath,
+    ControlCharacter,
     DisallowedScheme(String),
     NonlocalAuthority(String),
     PathTraversal,
@@ -26,6 +35,9 @@ impl fmt::Display for ActionRefusalReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => f.write_str("action payload is empty"),
+            Self::InputLimit => f.write_str("editor action input exceeds its byte limit"),
+            Self::InvalidPath => f.write_str("editor action requires an unambiguous absolute native path"),
+            Self::ControlCharacter => f.write_str("control character in editor action input"),
             Self::DisallowedScheme(s) => write!(f, "scheme '{s}' is not in the allowlist"),
             Self::NonlocalAuthority(a) => write!(f, "nonlocal file authority '{a}' rejected"),
             Self::PathTraversal => f.write_str("path traversal attempt detected"),
@@ -65,7 +77,59 @@ fn contains_shell_metachars(s: &str) -> bool {
     s.chars().any(|c| matches!(c, ';' | '&' | '|' | '`' | '$' | '<' | '>' | '(' | ')' | '!' | '\\'))
 }
 
+fn validate_editor_text(text: &str) -> Result<(), ActionRefusalReason> {
+    if text.len() > MAX_EDITOR_INPUT_BYTES {
+        return Err(ActionRefusalReason::InputLimit);
+    }
+    if text.trim().is_empty() {
+        return Err(ActionRefusalReason::Empty);
+    }
+    if contains_newlines(text) || text.contains(['\u{2028}', '\u{2029}']) {
+        return Err(ActionRefusalReason::NewlineInjection);
+    }
+    if text.chars().any(|ch| ch.is_control()) {
+        return Err(ActionRefusalReason::ControlCharacter);
+    }
+    if contains_bidi_controls(text) || text.chars().any(|ch|
+        matches!(ch, '\u{061c}' | '\u{2066}'..='\u{206f}')) {
+        return Err(ActionRefusalReason::BidiSpoofing);
+    }
+    Ok(())
+}
+
+fn editor_absolute_path(path: &str, is_root: bool) -> Result<&str, ActionRefusalReason> {
+    // These are already-decoded Unix paths, never URLs or shell words. Do not
+    // decode percent sequences, fold case/Unicode, or consult the filesystem.
+    if !path.starts_with('/') || path.starts_with("//") {
+        return Err(ActionRefusalReason::InvalidPath);
+    }
+    if path == "/" {
+        return if is_root { Ok(path) } else { Err(ActionRefusalReason::InvalidPath) };
+    }
+    let path = if is_root { path.strip_suffix('/').unwrap_or(path) } else { path };
+    for component in path[1..].split('/') {
+        if component == "." || component == ".." {
+            return Err(ActionRefusalReason::PathTraversal);
+        }
+        if component.is_empty() {
+            return Err(ActionRefusalReason::InvalidPath);
+        }
+    }
+    Ok(path)
+}
+
 /// Validate and build a structured command for opening an external editor.
+///
+/// The caller supplies an explicitly trusted editor and already-decoded absolute
+/// native source/root paths, each at most `MAX_EDITOR_INPUT_BYTES`. URI strings
+/// are not accepted; literal percent sequences and filename shell metacharacters
+/// remain literal. Program names and the existing `-g`/`+line` conventions remain
+/// supported; this helper neither resolves editor-specific syntax nor launches it.
+///
+/// Root checking is lexical component ancestry with exact bytes and optional
+/// trailing root slash. It performs no I/O and cannot establish native grants or
+/// confinement against symlink/ancestor replacement. The host retains and
+/// revalidates its actual source authority before the explicit OS handoff.
 pub fn validate_editor_handoff(
     configured_editor: &str,
     file_path: &str,
@@ -73,28 +137,27 @@ pub fn validate_editor_handoff(
     column: Option<u32>,
     root_confinement: Option<&str>,
 ) -> Result<StructuredOsCommand, ActionRefusalReason> {
-    if configured_editor.trim().is_empty() || file_path.trim().is_empty() {
-        return Err(ActionRefusalReason::Empty);
+    // Check all lengths before diagnostic copies, including the root supplied
+    // as authority. One oversized field must not produce an oversized error.
+    if [Some(configured_editor), Some(file_path), root_confinement].into_iter()
+        .flatten().any(|text| text.len() > MAX_EDITOR_INPUT_BYTES) {
+        return Err(ActionRefusalReason::InputLimit);
     }
-    if contains_newlines(configured_editor) || contains_newlines(file_path) {
-        return Err(ActionRefusalReason::NewlineInjection);
-    }
+    validate_editor_text(configured_editor)?;
+    validate_editor_text(file_path)?;
     if contains_shell_metachars(configured_editor) {
         return Err(ActionRefusalReason::UntrustedEditor(configured_editor.to_string()));
     }
-    if contains_bidi_controls(configured_editor) || contains_bidi_controls(file_path) {
-        return Err(ActionRefusalReason::BidiSpoofing);
-    }
+    let file_path = editor_absolute_path(file_path, false)?;
 
-    // Traversal check.
-    if file_path.contains("/../") || file_path.ends_with("/..") || file_path == ".." {
-        return Err(ActionRefusalReason::PathTraversal);
-    }
-
-    // Root confinement check: if a root is given, path must be inside root.
+    // A component prefix is authority; a string prefix is not. In particular,
+    // /repo grants neither /repository nor /repo-old, and an empty root is not /.
     if let Some(root) = root_confinement {
-        let clean_root = root.trim_end_matches('/');
-        if !file_path.starts_with(clean_root) {
+        validate_editor_text(root)?;
+        let clean_root = editor_absolute_path(root, true)?;
+        let within_root = clean_root == "/" || file_path == clean_root
+            || file_path.strip_prefix(clean_root).is_some_and(|rest| rest.starts_with('/'));
+        if !within_root {
             return Err(ActionRefusalReason::PathEscapesRoot {
                 path: file_path.to_string(),
                 root: root.to_string(),
@@ -102,9 +165,9 @@ pub fn validate_editor_handoff(
         }
     }
 
-    let mut args = Vec::new();
+    let mut args = Vec::with_capacity(2);
     if let (Some(l), Some(c)) = (line, column) {
-        args.push(format!("-g"));
+        args.push("-g".to_string());
         args.push(format!("{file_path}:{l}:{c}"));
     } else if let Some(l) = line {
         args.push(format!("+{l}"));

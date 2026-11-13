@@ -407,6 +407,7 @@ import AppKit
                 .disabled(model.source == nil)
                 .help("Show line numbers or whitespace, or wrap long lines. These display choices preserve the captured source and selection.")
                 Spacer()
+                AtlasEditorActionView(source: { model.externalEditorSource() })
                 Button("Refresh from disk", action: model.refreshFromDisk)
                     .disabled(!model.canRefresh)
                     .help("Explicitly recapture this project file. Success starts a new capture at the first page and clears old exact targets/history; failure keeps the retained source.")

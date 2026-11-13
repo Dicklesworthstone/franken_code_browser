@@ -311,6 +311,16 @@ fn native_file_folder_intake_and_selected_reader() {
 }
 
 #[test]
+fn external_editor_handoff_authority_and_lifetimes() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    checked(
+        Command::new("/bin/sh")
+            .current_dir(&root)
+            .arg("swiftui/tests/test-editor-handoff.sh"),
+    );
+}
+
+#[test]
 fn observed_range_reader_contracts_and_bridge() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     checked(

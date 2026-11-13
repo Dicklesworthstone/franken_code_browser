@@ -126,6 +126,12 @@ import Observation
     var canGoForward: Bool { history.canForward && !busy }
     var canGoNext: Bool { page?.nextOffset != nil && !busy }
     var canRefresh: Bool { page != nil && refreshInput != nil && !busy && !documentPreview.busy }
+    /// An explicitly admitted current-file capability, never the page's label.
+    /// Forks carry this lease independently; retained-only imports have none.
+    func currentFileForExternalEditor() -> (input: AtlasReaderInput, lease: AnyObject?, identity: AtlasReaderIdentity)? {
+        guard canRefresh, let refreshInput, let page else { return nil }
+        return (refreshInput, refreshAccessLease, page.identity)
+    }
     var canPin: Bool { page != nil && !busy && !pinning && !documentPreview.busy && !resolvingTextSelection && coordinator.canFork }
     var canKeep: Bool {
         guard canPin, let page else { return false }

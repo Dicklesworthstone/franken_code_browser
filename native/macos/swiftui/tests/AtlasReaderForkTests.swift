@@ -227,6 +227,7 @@ private final class Driver: @unchecked Sendable {
             let driver = Driver()
             let inert = AtlasPagedReaderModel(transport: driver.transport())
             check(!inert.canPin && driver.log.isEmpty, "pin capability starts a capture")
+            check(inert.currentFileForExternalEditor() == nil, "inert reader acquired a current-file handoff")
             let unsupported = opened(driver, forkEnabled: false)
             let before = driver.log
             check(!unsupported.canPin, "missing transport capability advertised")
@@ -273,6 +274,11 @@ private final class Driver: @unchecked Sendable {
             wait("parent navigation") { !parent.busy }
             let original = parent.page!, navigation = parent.navigation
             let before = driver.log
+            var parentHandoff = parent.currentFileForExternalEditor()
+            check(parentHandoff?.input.fullPath == "/project/file" && parentHandoff?.lease === weakLease
+                  && parentHandoff?.identity.matches(original.identity) == true,
+                  "live editor capability lost its exact path, lease or accepted capture identity")
+            parentHandoff = nil
             let child = pin(parent)
             check(parent.navigation == navigation && parent.page?.identity.matches(original.identity) == true,
                   "pin changed parent navigation")
@@ -289,6 +295,13 @@ private final class Driver: @unchecked Sendable {
             parent.close()
             wait("parent did not retire independently") { driver.log.contains("close:1") }
             check(weakLease != nil && child.canFind && child.canRefresh, "closing parent revoked child/grant")
+            check(parent.currentFileForExternalEditor() == nil, "parent close kept its editor action enabled")
+            var childHandoff = child.currentFileForExternalEditor()
+            check(childHandoff?.input.fullPath == "/project/file" && childHandoff?.lease === weakLease
+                  && childHandoff?.identity.matches(child.page!.identity) == true
+                  && childHandoff?.identity.owner != original.identity.owner,
+                  "fork editor capability borrowed parent identity or lost its independent live grant")
+            childHandoff = nil
             child.offsetInput = "0"; child.goToByte()
             wait("child navigation after parent close") { !child.busy }
             check(child.page?.text == "zero\none\ntwo\n", "child substituted live bytes")
@@ -297,7 +310,13 @@ private final class Driver: @unchecked Sendable {
             check(child.page?.text == "changed file\n" && child.refreshedFromDisk,
                   "explicit refresh did not use authorized live path")
             check(driver.log.contains("open:3:/project/file"), "refresh lost original authorized root/path")
+            var refreshedHandoff = child.currentFileForExternalEditor()
+            check(refreshedHandoff?.input.fullPath == "/project/file" && refreshedHandoff?.lease === weakLease
+                  && refreshedHandoff?.identity.matches(child.page!.identity) == true,
+                  "explicit refresh left editor capability bound to an obsolete identity")
+            refreshedHandoff = nil
             child.close()
+            check(child.currentFileForExternalEditor() == nil, "child close kept an editor capability")
             wait("grant did not retire with last child") { weakLease == nil }
         }
 

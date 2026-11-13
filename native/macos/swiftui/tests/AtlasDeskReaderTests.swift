@@ -8,7 +8,7 @@ private final class DeskReaderFixture: @unchecked Sendable {
     private let lock = NSLock()
     let domain = UUID()
     let owner: UInt64 = 19
-    let label = "../offline/README.md"
+    let label: String
     let bytes: [UInt8]
     private var revision: UInt64 = 1
     private var file: UInt64 = 1
@@ -22,8 +22,9 @@ private final class DeskReaderFixture: @unchecked Sendable {
     let entered = DispatchSemaphore(value: 0)
     let resume = DispatchSemaphore(value: 0)
 
-    init(bytes: [UInt8] = Array("# Saved\nneedle\r\nexact\0bytes\n".utf8), offset: UInt64 = 8) {
-        self.bytes = bytes; self.offset = offset
+    init(bytes: [UInt8] = Array("# Saved\nneedle\r\nexact\0bytes\n".utf8), offset: UInt64 = 8,
+         label: String = "../offline/README.md") {
+        self.bytes = bytes; self.offset = offset; self.label = label
         selection = (offset, min(offset + 6, UInt64(bytes.count)))
     }
     private func locked<T>(_ body: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return body() }
@@ -210,6 +211,8 @@ private final class DeskReaderFixture: @unchecked Sendable {
         precondition(opened.reader.page?.text == "needle\r\nexact\0bytes\n")
         precondition(desk.state!.active!.location == original && desk.state?.revision == 1)
         precondition(!opened.reader.canRefresh && opened.reader.canPin && opened.reader.canCompare)
+        precondition(opened.reader.currentFileForExternalEditor() == nil,
+            "a retained-only desk label became current-file editor authority")
         opened.reader.refreshFromDisk()
         precondition(!fixture.calls.contains("LIVE-OPEN"), "a retained label granted a disk-open route")
         opened.reader.offsetInput = "0"; opened.reader.goToByte()
@@ -223,11 +226,27 @@ private final class DeskReaderFixture: @unchecked Sendable {
         precondition(fixture.calls.filter { $0 == "update" }.count == 1, "an old reader rebound offsets after restore")
         let pinned = try await opened.reader.fork()
         precondition(!pinned.canRefresh && pinned.page?.originalHex == opened.reader.page?.originalHex)
+        precondition(pinned.currentFileForExternalEditor() == nil,
+            "pinning retained source invented an editor grant")
         desk.close()
         opened.reader.offsetInput = "8"; opened.reader.goToByte()
         await wait("independent reader did not survive desk close") { !opened.reader.busy }
         precondition(opened.reader.page?.text == "needle\r\nexact\0bytes\n")
         opened.reader.close(); pinned.close()
+
+        // A plausible absolute filename is still a retained label, not proof
+        // of current native access. Neither importing nor pinning may infer it.
+        let namedFixture = DeskReaderFixture(label: "/project/README.md")
+        let namedDesk = await started(namedFixture)
+        let named = try await namedDesk.openReader(pane: 1, transport: namedFixture.readerTransport())
+        precondition(named.reader.page?.identity.pathBytes == Array(namedFixture.label.utf8))
+        precondition(named.reader.currentFileForExternalEditor() == nil)
+        let namedPin = try await named.reader.fork()
+        named.reader.close(); namedDesk.close()
+        precondition(namedPin.page != nil && namedPin.currentFileForExternalEditor() == nil,
+            "an absolute retained label acquired a live capability after its parent closed")
+        precondition(!namedFixture.calls.contains("LIVE-OPEN"))
+        namedPin.close()
 
         let foreignFixture = DeskReaderFixture(), foreignDesk = await started(foreignFixture)
         do {

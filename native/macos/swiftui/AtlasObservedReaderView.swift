@@ -1,6 +1,20 @@
 import SwiftUI
 import AppKit
 
+extension AtlasObservedReaderModel {
+    func externalEditorSource() -> AtlasEditorSource? {
+        guard let admitted = currentFileForExternalEditor(),
+              let path = String(bytes: admitted.input.absolutePath, encoding: .utf8),
+              path.utf8.elementsEqual(admitted.input.absolutePath) else { return nil }
+        return try? AtlasEditorSource(path: path, accessLease: admitted.lease,
+            isCurrent: { [weak self] in
+                guard let current = self?.currentFileForExternalEditor() else { return false }
+                return current.authority == admitted.authority && current.identity == admitted.identity
+                    && current.input == admitted.input && current.lease === admitted.lease
+            })
+    }
+}
+
 /// A separate live-range surface. Opening it never replaces an exact retained
 /// reader or imports an old search, bookmark, outline or saved-archive anchor.
 @MainActor struct AtlasObservedReaderView: View {
@@ -49,6 +63,13 @@ import AppKit
                     .font(.caption).foregroundStyle(.secondary)
                 if let verification = model.externalContext {
                     Text(verification.message).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            HStack(spacing: 8) {
+                AtlasEditorActionView(source: { model.externalEditorSource() })
+                if model.currentFileForExternalEditor() != nil && model.externalEditorSource() == nil {
+                    Text("This native filename cannot be passed safely and losslessly to an editor.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
             controls

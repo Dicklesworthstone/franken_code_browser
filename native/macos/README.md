@@ -54,6 +54,39 @@ transports. SwiftUI typechecking, actual Finder/drop delivery, security-scoped
 grants and physical-Mac interaction still require the independent native
 qualification lane; these fixtures do not constitute a rendered-product pass.
 
+## Open the current file in an editor
+
+The retained source reader and Observed Range Reader provide **Open Current
+File in Editor…**. On first use, choose an installed application in the native
+panel. The app remembers that editor for this session. The adjacent menu lets
+you choose another editor or forget the selection. Saved-source readers without
+current file access keep the action disabled; choose the file with **Open** to
+provide that access explicitly. A pinned live reader keeps its own file access
+after its original reader closes.
+
+This opens the **current disk file**, which can differ from the retained capture
+or range observation. Captured bytes remain unchanged, and captured line/column
+coordinates are not passed as if they described the current disk version. The
+native host passes separate application and document URLs to `NSWorkspace`,
+without a shell, guessed editor command-line flags, or path decoding. It honors
+the selected application installation instead of substituting a different
+running copy. Paths must round-trip losslessly as UTF-8 and contain no control
+or directional-spoofing characters.
+
+An editor choice that finishes after its reader closes or is replaced cannot
+send a file or change the configured editor. Cancellation withdraws an action
+before OS submission, and another action waits until the old choice drains.
+After submission, the OS request is allowed to finish with both the file and
+application access leases retained. Forgetting the editor or closing the reader
+does not release a grant still used by that request. Application metadata checks
+run on the bounded native worker.
+
+The focused injected-boundary fixtures are in
+[swiftui/tests/test-editor-handoff.sh](swiftui/tests/test-editor-handoff.sh),
+with live/fork/retained-only capability checks in the existing reader fixtures.
+They are code-first additions pending strict-RCH execution. Actual application
+launching and sandboxed macOS handoff still require native qualification.
+
 ## City view
 
 After preparing a text atlas, choose **City** in the toolbar. The City uses the
