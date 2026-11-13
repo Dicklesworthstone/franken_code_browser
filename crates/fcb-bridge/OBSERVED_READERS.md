@@ -1,16 +1,19 @@
 # Observed range readers
 
 The API in `include/fcb_observed_reader.h` opens a current, explicitly selected
-root-relative file without capturing its entire contents. It uses the existing
-safe `fcb_app::host::observed_reader` adapter, `FileRangeReader`, `ObservedExtent`
-and logical extent decoder. It does not change the complete-capture contract of
-`fcb_reader_*` or import live ranges into an old search/desk/archive capture.
+root-relative file or exact standalone file without capturing its entire
+contents. It uses the existing safe `fcb_app::host::observed_reader` adapter,
+`FileRangeReader`, `ObservedExtent` and logical extent decoder. It does not
+change the complete-capture contract of `fcb_reader_*` or import live ranges
+into an old search/desk/archive capture.
 
 ## Host lifecycle
 
 1. Reserve an empty handle with `fcb_observed_reader_create`.
-2. Keep the current project grant alive and call `open` on a worker with the
-   absolute root and canonical lowercase hex for the exact native relative path.
+2. Keep the selected source's native grant alive. For a project file, call `open`
+   on a worker with the absolute root and canonical lowercase hex for the exact
+   native relative path. For a standalone file, call `open_file` with lowercase
+   hex for its exact absolute native path, including non-UTF8 path components.
    Check the returned `info` identity and raw absolute path. Open reads metadata
    only; a lost reply is not permission to reopen a loaded handle.
 3. Call `window` with an absolute original-byte offset, a 4–262144 byte visible
@@ -37,7 +40,14 @@ new handle is the explicit way to follow the current pathname.
 Root-relative component validation and the existing observed-symlink and
 nonblocking/no-follow leaf checks apply. This does not qualify confinement
 against hostile replacement of ancestor directories. The embedding host owns
-native root authority; a saved path or an old exact result does not grant it.
+native source authority; a saved path or an old exact result does not grant it.
+The standalone `open_file` route requires only the selected file's grant. It
+does not stat, catalog or grant the parent as a project. It validates bounded
+absolute path components and admits the leaf with the same regular-file,
+no-follow and nonblocking checks. Both routes initialize from the admitted
+descriptor, report zero payload reads on open and retain identical range,
+search, copy and cancellation behavior. Neither route can reopen a loaded
+handle through the other entry point.
 
 Responses use `fcb.observed-reader/1`. Integer fields are canonical decimal
 strings; native paths carry reversible Unix bytes. Each window reports its

@@ -20,8 +20,9 @@ extern "C" {
  * use only those immutable bytes; eviction is an explicit unavailable error,
  * never permission to reread a live path under an old identity.
  *
- * Keep the current root's native access grant alive through close/drain. Root
- * is absolute NUL-terminated UTF-8 (<=16384 bytes). relative_path_hex is bounded
+ * Keep the selected file's or current root's native access grant alive through
+ * close/drain. For project-relative open, root is absolute NUL-terminated UTF-8
+ * (<=16384 bytes). relative_path_hex is bounded
  * lowercase hex (<=32768 chars) encoding exact native root-relative components,
  * including non-UTF8 names. Absolute paths, NUL, empty/dot/dotdot components and
  * observed symlinks are refused. Leaf no-follow/nonblocking open is enforced;
@@ -47,6 +48,18 @@ uint64_t fcb_observed_reader_create(void);
  * return. A loaded handle cannot be reopened. */
 char *fcb_observed_reader_open(uint64_t handle, const char *root,
     const char *relative_path_hex, fcb_observed_reader_poll poll, void *context);
+
+/* Metadata-only open of ONE explicitly selected file without a project grant.
+ * absolute_path_hex is NUL-terminated lowercase hex (<=32768 chars) of the exact
+ * absolute native path (<=16384 decoded bytes, <=256 components), including
+ * non-UTF8 names. NUL, empty/dot/dotdot components and a final symlink or special
+ * file are refused. The parent is neither inspected nor granted as a project.
+ * Ancestor replacement confinement is not claimed. Keep this selected file's
+ * native grant through close/drain. Inputs/poll obey the open contract above;
+ * success has the same info schema, exact absolute path and zero payload I/O.
+ * Either opener loads the handle once; callers cannot switch its source. */
+char *fcb_observed_reader_open_file(uint64_t handle, const char *absolute_path_hex,
+    fcb_observed_reader_poll poll, void *context);
 char *fcb_observed_reader_info(uint64_t handle);
 
 /* bytes is 4..262144; offset is an absolute original-byte position. Explicit

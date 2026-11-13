@@ -63,6 +63,100 @@ fn close_during_open_revokes_delivery_without_waiting_or_reusing_the_slot() {
 }
 
 #[test]
+fn exact_file_open_cancellation_leaves_no_state_and_loaded_handles_cannot_switch_sources() {
+    let readers = ObservedReaderSessions::new();
+    let root = root(); let path = root.join("source.rs");
+    let probe = readers.create().unwrap();
+    let mut gates = 0;
+    readers.open_file(probe, &path, || { gates += 1; false }).unwrap();
+    readers.close(probe).unwrap();
+    assert!(gates > 1);
+    for stop in 1..=gates {
+        let handle = readers.create().unwrap();
+        let mut calls = 0;
+        assert!(readers.open_file(handle, &path, || { calls += 1; calls == stop }).is_err());
+        assert_eq!(calls, stop);
+        assert!(matches!(readers.execute(handle, Command::Info, || false), Err(AccessError::NotOpen)));
+        let info = readers.open_file(handle, &path, || false).unwrap();
+        assert!(info.as_str().contains("\"payload_bytes_read\":\"0\""));
+        assert!(matches!(readers.open_file(handle, &path, || false), Err(AccessError::AlreadyOpen)));
+        assert!(matches!(readers.open(handle, &root, b"source.rs", || false), Err(AccessError::AlreadyOpen)));
+        readers.close(handle).unwrap();
+    }
+    let handle = readers.create().unwrap();
+    readers.open(handle, &root, b"source.rs", || false).unwrap();
+    assert!(matches!(readers.open_file(handle, &path, || false), Err(AccessError::AlreadyOpen)));
+    readers.close(handle).unwrap();
+}
+
+#[test]
+fn cancel_after_the_last_open_poll_cannot_leave_an_undelivered_reader_installed() {
+    let readers = ObservedReaderSessions::new();
+    let root = root(); let path = root.join("source.rs");
+    for standalone in [false, true] {
+        let probe = readers.create().unwrap();
+        let mut gates = 0;
+        if standalone { readers.open_file(probe, &path, || { gates += 1; false }).unwrap(); }
+        else { readers.open(probe, &root, b"source.rs", || { gates += 1; false }).unwrap(); }
+        readers.close(probe).unwrap();
+        let handle = readers.create().unwrap();
+        let mut calls = 0;
+        let mut cancel_at_publication = || {
+            calls += 1;
+            if calls == gates { readers.cancel(handle).unwrap(); }
+            false // The epoch change, not this return value, withdraws delivery.
+        };
+        let result = if standalone { readers.open_file(handle, &path, &mut cancel_at_publication) }
+            else { readers.open(handle, &root, b"source.rs", &mut cancel_at_publication) };
+        assert!(matches!(result, Err(AccessError::Canceled)));
+        assert!(matches!(readers.execute(handle, Command::Info, || false), Err(AccessError::NotOpen)));
+        readers.open_file(handle, &path, || false).unwrap();
+        readers.close(handle).unwrap();
+    }
+}
+
+#[test]
+fn closing_an_admitted_standalone_open_keeps_its_permit_until_the_worker_drains() {
+    let readers = ObservedReaderSessions::new();
+    let root = root(); let path = root.join("source.rs");
+    let probe = readers.create().unwrap();
+    let mut gates = 0;
+    readers.open_file(probe, &path, || { gates += 1; false }).unwrap();
+    readers.close(probe).unwrap();
+    let handles: Vec<_> = (0..MAX_SESSIONS).map(|_| readers.create().unwrap()).collect();
+    let first = handles[0];
+    let (entered, receive_entered) = mpsc::sync_channel(0);
+    let (release, receive_release) = mpsc::sync_channel(0);
+    std::thread::scope(|scope| {
+        let readers_ref = &readers;
+        let worker = scope.spawn(move || {
+            let mut calls = 0;
+            readers_ref.open_file(first, &path, || {
+                calls += 1;
+                if calls == gates {
+                    // Pause after descriptor and response admission, not before
+                    // opening. This is a direct Rust hook, never a foreign poll.
+                    entered.send(()).unwrap(); receive_release.recv().unwrap();
+                }
+                false
+            })
+        });
+        receive_entered.recv().unwrap();
+        readers.open(handles[1], &root, b"source.rs", || false).unwrap();
+        readers.close(first).unwrap();
+        assert!(matches!(readers.execute(first, Command::Info, || false), Err(AccessError::Unknown)));
+        assert!(matches!(readers.create(), Err(AccessError::Capacity)));
+        release.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+    });
+    let replacement = readers.create().unwrap();
+    assert!(!handles.contains(&replacement));
+    readers.close(replacement).unwrap();
+    for handle in handles.into_iter().skip(1) { readers.close(handle).unwrap(); }
+    assert_eq!(readers.live.load(Ordering::Acquire), 0);
+}
+
+#[test]
 fn cancellation_reuses_the_session_but_never_the_observation_or_handle_identity() {
     let readers = ObservedReaderSessions::new();
     let complete_readers = super::super::reader_sessions::ReaderSessions::new();

@@ -44,6 +44,17 @@ fn decode_path(hex: &str, bytes: &mut [u8; MAX_PATH_BYTES]) -> Result<usize, Acc
     }
     Ok(hex.len() / 2)
 }
+fn native_path(bytes: &[u8]) -> Result<&Path, AccessError> {
+    #[cfg(unix)] {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+        Ok(Path::new(OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))] {
+        let _ = bytes;
+        Err(AccessError::Reader(fcb_app::host::observed_reader::ObservedReaderError::App(
+            fcb_app::AppError::UnsupportedPlatform)))
+    }
+}
 fn decode_encoding(encoding: u64) -> Result<ObservedReaderEncoding, AccessError> {
     match encoding {
         1 => Ok(ObservedReaderEncoding::Utf8), 2 => Ok(ObservedReaderEncoding::Utf16Le),
@@ -72,6 +83,26 @@ pub unsafe extern "C" fn fcb_observed_reader_open(handle: u64, root: *const c_ch
         let mut bytes = [0u8; MAX_PATH_BYTES];
         let length = decode_path(hex, &mut bytes)?;
         readers.open(handle, Path::new(root), &bytes[..length],
+            || poll.is_some_and(|poll| unsafe { poll(context) != 0 }))
+    }))
+}
+
+/// Metadata-only open of the one explicitly selected native file. The exact
+/// absolute path is hex encoded so non-UTF8 filenames need no lossy conversion.
+/// No parent project is opened or discovered and no payload bytes are read.
+/// # Safety
+/// absolute_path_hex is null or readable NUL-terminated storage through return.
+/// poll/context obey the same worker lifetime contract as project-relative open.
+/// The host retains the selected file's native grant until close/drain and frees
+/// returned strings once using fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_observed_reader_open_file(handle: u64, absolute_path_hex: *const c_char,
+    poll: Option<SearchCancellationCallback>, context: *mut c_void) -> *mut c_char {
+    reply(|| answer(handle, |readers| {
+        let hex = unsafe { bounded_text(absolute_path_hex, MAX_PATH_BYTES * 2) }?;
+        let mut bytes = [0u8; MAX_PATH_BYTES];
+        let length = decode_path(hex, &mut bytes)?;
+        readers.open_file(handle, native_path(&bytes[..length])?,
             || poll.is_some_and(|poll| unsafe { poll(context) != 0 }))
     }))
 }

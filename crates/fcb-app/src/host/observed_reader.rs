@@ -5,11 +5,13 @@
 //! Opening observes metadata only. Each window reads a fresh source revision;
 //! retained windows and copies use only their original owned extent bytes.
 //!
-//! The host retains its root grant and runs every call/drop on a worker. Native
-//! path composition rejects traversal and checks each selected component; the
-//! existing opener protects the leaf object. This is not a claim of race-safe
-//! confinement against hostile ancestor replacement. An opened descriptor does
-//! not follow later pathname replacements. Reopen explicitly to observe those.
+//! The host retains its selected-file or root grant and runs every call/drop on
+//! a worker. Root-relative opening checks each selected component; exact-file
+//! opening admits only the named file without discovering or granting its
+//! parent. Both use the same no-follow regular-file opener. This is not a claim
+//! of race-safe confinement against hostile ancestor replacement. An opened
+//! descriptor does not follow later pathname replacements. Reopen explicitly
+//! to observe those.
 //!
 //! `fcb.observed-reader/1` uses decimal-string integers and reversible absolute
 //! path bytes. Window receipts distinguish requested/captured/visible ranges,
@@ -154,11 +156,7 @@ impl ObservedReaderSession {
         mut canceled: impl FnMut() -> bool) -> Result<Self, ObservedReaderError> {
         check(&mut canceled)?;
         validate_paths(root, relative)?;
-        let budget = ResourceBudget::new(owner, ByteLength::new(MANAGED_BYTES)).map_err(|_| AppError::Admission)?;
-        // Admission includes temporary path/segment overlap, the retained path
-        // and all fixed observation slots, before path allocation or native I/O.
-        let lease = budget.try_reserve_managed(owner, allocation(1)?,
-            ByteLength::new((256 * 1024 + size_of::<Self>()) as u64)).map_err(|_| AppError::Admission)?;
+        let (budget, lease) = Self::admit(owner)?;
         let root = input::absolute(root)?;
         let mut parts = relative.split(|byte| *byte == b'/');
         let mut selected = NormalizedPath::from_dirent_name(parts.next().ok_or(ObservedReaderError::InvalidPath)?)?;
@@ -170,10 +168,42 @@ impl ObservedReaderSession {
         let path = workspace::checked_source_path(&root, &selected)?;
         check(&mut canceled)?;
         let (file, metadata) = input::open_regular(&path)?;
+        Self::from_opened_file(owner, path, file, metadata, budget, lease, &mut canceled)
+    }
+
+    /// Open only the CURRENT explicitly selected absolute native file path.
+    /// The parent is not inspected or admitted as a project. The caller keeps
+    /// this file's native access alive until close; opening reads metadata only.
+    /// The path remains a lossless label for the admitted descriptor, not an
+    /// immutable capture or authority to open another file beside it.
+    pub fn open_file(owner: ArenaOwnerId, absolute_path: &Path,
+        mut canceled: impl FnMut() -> bool) -> Result<Self, ObservedReaderError> {
+        check(&mut canceled)?;
+        validate_file_path(absolute_path)?;
+        let (budget, lease) = Self::admit(owner)?;
+        let path = absolute_path.to_path_buf();
+        check(&mut canceled)?;
+        let (file, metadata) = input::open_regular(&path)?;
+        Self::from_opened_file(owner, path, file, metadata, budget, lease, &mut canceled)
+    }
+
+    fn admit(owner: ArenaOwnerId) -> Result<(ResourceBudget, ResourceLease), ObservedReaderError> {
+        let budget = ResourceBudget::new(owner, ByteLength::new(MANAGED_BYTES)).map_err(|_| AppError::Admission)?;
+        // Admission includes temporary path/segment overlap, the retained path
+        // and all fixed observation slots, before path allocation or native I/O.
+        let lease = budget.try_reserve_managed(owner, allocation(1)?,
+            ByteLength::new((256 * 1024 + size_of::<Self>()) as u64)).map_err(|_| AppError::Admission)?;
+        Ok((budget, lease))
+    }
+
+    fn from_opened_file(owner: ArenaOwnerId, path: PathBuf, file: fs::File, metadata: fs::Metadata,
+        budget: ResourceBudget, lease: ResourceLease, canceled: &mut impl FnMut() -> bool)
+        -> Result<Self, ObservedReaderError> {
+        check(canceled)?;
         let search_file = file.try_clone().map_err(|_| AppError::Io)?;
         let file_id = FileId::new(owner, 1).map_err(|_| ObservedReaderError::IdentityExhausted)?;
         let reader = FileRangeReader::new(file_id, file)?;
-        check(&mut canceled)?;
+        check(canceled)?;
         Ok(Self { reader, search_file, path, initial_length: ByteLength::new(metadata.len()),
             observations: std::array::from_fn(|_| None), next_slot: 0, last_observation: 0,
             last_query_attempt: 0, query: None,
@@ -461,6 +491,20 @@ fn validate_paths(root: &Path, relative: &[u8]) -> Result<(), ObservedReaderErro
         Ok(())
     }
     #[cfg(not(unix))] { let _ = (root, relative); Err(AppError::UnsupportedPlatform.into()) }
+}
+fn validate_file_path(path: &Path) -> Result<(), ObservedReaderError> {
+    if !input::NATIVE_FILE_SUPPORTED { return Err(AppError::UnsupportedPlatform.into()); }
+    #[cfg(unix)] {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.first() != Some(&b'/') || bytes.len() > MAX_PATH_BYTES || bytes.contains(&0)
+            || bytes[1..].split(|byte| *byte == b'/').any(invalid_component)
+            || bytes[1..].split(|byte| *byte == b'/').count() > MAX_PATH_COMPONENTS {
+            return Err(ObservedReaderError::InvalidPath);
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))] { let _ = path; Err(AppError::UnsupportedPlatform.into()) }
 }
 fn invalid_component(component: &[u8]) -> bool {
     component.is_empty() || component == b"." || component == b".."

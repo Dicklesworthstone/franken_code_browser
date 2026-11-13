@@ -9,7 +9,7 @@ mod support;
 use std::{ffi::OsString, fs::{self, OpenOptions}, os::unix::{ffi::{OsStrExt, OsStringExt}, fs::FileExt},
     path::{Path, PathBuf}, sync::atomic::{AtomicU64, Ordering}, time::{SystemTime, UNIX_EPOCH}};
 use fcb::ArenaOwnerId;
-use fcb_app::{EXIT_OK, EXIT_PARTIAL, host::{HostResponse, observed_reader::{ObservedReaderEncoding,
+use fcb_app::{AppError, EXIT_OK, EXIT_PARTIAL, host::{HostResponse, observed_reader::{ObservedReaderEncoding,
     ObservedReaderError, ObservedReaderSession, MAX_OBSERVED_READER_WINDOW_BYTES,
     MAX_OBSERVED_READER_OBSERVATIONS}}};
 use support::{Json, parse};
@@ -79,6 +79,90 @@ fn sparse_file_above_four_gib_is_metadata_only_until_a_bounded_observation() {
     assert_eq!(after.get("payload_bytes_read").number(), 22);
     assert_eq!(after.get("retained_payload_bytes").number(), 22);
     assert_eq!(ids(&after), [1]);
+}
+
+#[test]
+fn standalone_sparse_file_needs_no_parent_project_and_preserves_raw_absolute_identity() {
+    let fixture = Fixture::new();
+    let directory = fixture.0.join("physical"); fs::create_dir(&directory).unwrap();
+    let selected_parent = fixture.0.join("selected-parent");
+    std::os::unix::fs::symlink(&directory, &selected_parent).unwrap();
+    let name = b"selected-\xff.log";
+    let path = selected_parent.join(OsString::from_vec(name.to_vec()));
+    let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
+    let offset = (1u64 << 32) + 47;
+    file.set_len(offset + 128).unwrap();
+    assert_eq!(file.write_at(b"selected", offset).unwrap(), 8);
+    // This parent is deliberately not admissible as a project root. A file
+    // grant must not be converted into a project grant just to read its ranges.
+    assert_eq!(ObservedReaderSession::open(ArenaOwnerId::new(64_001).unwrap(),
+        &selected_parent, name, || false).err(), Some(ObservedReaderError::App(AppError::Symlink)));
+    let mut reader = ObservedReaderSession::open_file(ArenaOwnerId::new(64_002).unwrap(),
+        &path, || false).unwrap();
+    let initial = json(&reader.info(|| false).unwrap());
+    assert_eq!(initial.get("path").get("hex").text(), hex(path.as_os_str().as_bytes()));
+    assert_eq!(initial.get("initial_observed_length").number(), offset + 128);
+    assert_eq!(initial.get("payload_bytes_read").number(), 0);
+    assert_eq!(initial.get("read_calls").number(), 0);
+    assert_eq!(initial.get("retained_payload_bytes").number(), 0);
+    assert!(ids(&initial).is_empty());
+    let page = read(&mut reader, offset, 8);
+    assert_eq!(page.get("text").text(), "selected");
+    assert_eq!(bounds(page.get("visible_range")), (offset, offset + 8));
+    assert_eq!(page.get("observation_source_bytes_read").number(), 24);
+    assert_eq!(page.get("path"), initial.get("path"));
+    assert!(!page.get("whole_file_observed").flag());
+    let after = json(&reader.info(|| false).unwrap());
+    assert_eq!(after.get("payload_bytes_read").number(), 24);
+    assert_eq!(after.get("retained_payload_bytes").number(), 24);
+}
+
+#[test]
+fn standalone_search_and_windows_keep_the_admitted_object_after_pathname_replacement() {
+    let fixture = Fixture::new(); fixture.write(b"needle original\n");
+    let path = fixture.0.join("source");
+    let mut reader = ObservedReaderSession::open_file(ArenaOwnerId::new(64_003).unwrap(),
+        &path, || false).unwrap();
+    let old = read(&mut reader, 0, 6);
+    fs::rename(&path, fixture.0.join("moved")).unwrap();
+    fs::write(&path, b"replacement only\n").unwrap();
+    let found = json(&reader.search(1, "needle", ObservedReaderEncoding::Utf8, 8, 1024, || false).unwrap());
+    assert!(found.get("search_complete").flag());
+    assert_eq!(found.get("retained_hits").number(), 1);
+    let witness = json(&reader.search_hit(1, 0, || false).unwrap());
+    assert_eq!(witness.get("original_hex").text(), hex(b"needle"));
+    assert_eq!(read(&mut reader, 7, 8).get("text").text(), "original");
+    assert_eq!(json(&reader.retained_window(1, || false).unwrap()).get("original_hex"), old.get("original_hex"));
+    let mut current = ObservedReaderSession::open_file(ArenaOwnerId::new(64_004).unwrap(),
+        &path, || false).unwrap();
+    assert_eq!(read(&mut current, 0, 11).get("text").text(), "replacement");
+    assert_eq!(json(&current.search(1, "needle", ObservedReaderEncoding::Utf8, 8, 1024, || false).unwrap())
+        .get("retained_hits").number(), 0, "only an explicit new handle follows the replacement");
+}
+
+#[test]
+fn standalone_path_admission_rejects_ambiguous_paths_and_nonregular_leaves() {
+    use std::os::unix::{fs::symlink, net::UnixListener};
+    let fixture = Fixture::new(); fixture.write(b"source");
+    let owner = ArenaOwnerId::new(64_005).unwrap();
+    for bytes in [b"".as_slice(), b"source", b"/", b"/a/./source", b"/a/../source", b"/a//source",
+        b"/a/source/", b"/a/source\0"] {
+        let path = PathBuf::from(OsString::from_vec(bytes.to_vec()));
+        assert_eq!(ObservedReaderSession::open_file(owner, &path, || false).err(), Some(ObservedReaderError::InvalidPath));
+    }
+    for path in [format!("/{}", "x".repeat(16_384)), format!("/{}x", "x/".repeat(256))] {
+        assert_eq!(ObservedReaderSession::open_file(owner, Path::new(&path), || false).err(), Some(ObservedReaderError::InvalidPath));
+    }
+    let link = fixture.0.join("link"); symlink(fixture.0.join("source"), &link).unwrap();
+    assert_eq!(ObservedReaderSession::open_file(owner, &link, || false).err(), Some(ObservedReaderError::App(AppError::Symlink)));
+    assert_eq!(ObservedReaderSession::open_file(owner, &fixture.0, || false).err(), Some(ObservedReaderError::App(AppError::Directory)));
+    let socket_path = fixture.0.join("socket");
+    let _socket = UnixListener::bind(&socket_path).unwrap();
+    assert_eq!(ObservedReaderSession::open_file(owner, &socket_path, || false).err(), Some(ObservedReaderError::App(AppError::Special)));
+    let fifo = fixture.0.join("fifo");
+    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    assert_eq!(ObservedReaderSession::open_file(owner, &fifo, || false).err(), Some(ObservedReaderError::App(AppError::Special)));
+    assert!(ObservedReaderSession::open_file(owner, &fixture.0.join("missing"), || true).err().unwrap().is_canceled());
 }
 
 #[test]

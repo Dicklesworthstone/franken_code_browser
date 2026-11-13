@@ -82,6 +82,11 @@ pub(super) enum Command<'a> {
     ObserveHit { generation: u64, hit_index: usize, context_bytes: usize, window_bytes: usize },
 }
 
+enum OpenSource<'a> {
+    Project { root: &'a Path, relative: &'a [u8] },
+    File(&'a Path),
+}
+
 struct Permit(Arc<AtomicUsize>);
 impl Drop for Permit { fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); } }
 struct Cell {
@@ -134,6 +139,14 @@ impl ObservedReaderSessions {
             .cloned().ok_or(AccessError::Unknown)
     }
     pub(super) fn open(&self, handle: u64, root: &Path, relative: &[u8],
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        self.open_source(handle, OpenSource::Project { root, relative }, canceled)
+    }
+    pub(super) fn open_file(&self, handle: u64, absolute_path: &Path,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        self.open_source(handle, OpenSource::File(absolute_path), canceled)
+    }
+    fn open_source(&self, handle: u64, source: OpenSource<'_>,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
         let cell = self.get(handle)?;
         let epoch = cell.epoch.load(Ordering::Acquire);
@@ -141,12 +154,20 @@ impl ObservedReaderSessions {
         cell.validate(epoch)?;
         if state.is_some() { return Err(AccessError::AlreadyOpen); }
         let mut stop = || cell.validate(epoch).is_err() || canceled();
-        let mut candidate = ObservedReaderSession::open(
-            ArenaOwnerId::new(handle).map_err(|_| AccessError::IdentityExhausted)?, root, relative, &mut stop)?;
+        let owner = ArenaOwnerId::new(handle).map_err(|_| AccessError::IdentityExhausted)?;
+        let mut candidate = match source {
+            OpenSource::Project { root, relative } => ObservedReaderSession::open(owner, root, relative, &mut stop)?,
+            OpenSource::File(path) => ObservedReaderSession::open_file(owner, path, &mut stop)?,
+        };
         let response = candidate.info(&mut stop)?;
         if stop() { return Err(AccessError::Canceled); }
         *state = Some(candidate);
-        cell.validate(epoch)?;
+        if let Err(error) = cell.validate(epoch) {
+            // A concurrent cancel can win after the last poll but before the
+            // state move. An undelivered open must leave its handle empty.
+            *state = None;
+            return Err(error);
+        }
         Ok(response)
     }
     pub(super) fn execute(&self, handle: u64, command: Command<'_>,

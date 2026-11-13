@@ -1,7 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use super::*;
-use std::{ffi::{CStr, CString}, fs::{self, OpenOptions}, os::unix::{ffi::OsStringExt, fs::FileExt},
+use std::{ffi::{CStr, CString}, fs::{self, OpenOptions}, os::unix::{ffi::{OsStrExt, OsStringExt}, fs::FileExt},
     sync::atomic::{AtomicU64, Ordering}, time::{SystemTime, UNIX_EPOCH}};
 use crate::reader_ffi::FFI_TEST_LOCK;
 
@@ -66,6 +66,75 @@ fn c_sparse_file_past_four_gib_reads_only_requested_ranges_and_keeps_old_bytes()
     assert!(take(fcb_observed_reader_retained(handle, 1)).contains("\"status\":\"error\""));
     assert_eq!(fcb_observed_reader_close(handle), 1);
     assert!(window(handle, offset, 6, 1).contains("OBSERVED_READER_HANDLE_UNKNOWN"));
+}
+
+#[test]
+fn c_standalone_raw_path_opens_a_sparse_file_without_reading_the_source() {
+    let _: unsafe extern "C" fn(u64, *const c_char, Option<SearchCancellationCallback>, *mut c_void)
+        -> *mut c_char = fcb_observed_reader_open_file;
+    assert!(include_str!("../include/fcb_observed_reader.h").contains("fcb_observed_reader_open_file("));
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (root, _) = root();
+    let path = root.join(std::ffi::OsString::from_vec(b"selected-\xff.rs".to_vec()));
+    let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
+    let offset = (1u64 << 32) + 512;
+    file.set_len(offset + 128).unwrap();
+    assert_eq!(file.write_at(b"before", offset).unwrap(), 6);
+    let encoded = hex(path.as_os_str().as_bytes());
+    let handle = fcb_observed_reader_create(); assert_ne!(handle, 0);
+    let info = take(unsafe { fcb_observed_reader_open_file(handle, encoded.as_ptr(), None, std::ptr::null_mut()) });
+    assert!(info.contains("\"status\":\"ok\""), "{info}");
+    assert!(info.contains(&format!("\"hex\":\"{}\"", encoded.to_str().unwrap())));
+    assert!(info.contains(&format!("\"initial_observed_length\":\"{}\"", offset + 128)));
+    assert!(info.contains("\"payload_bytes_read\":\"0\""));
+    assert!(info.contains("\"read_calls\":\"0\""));
+    assert!(info.contains("\"retained_observations\":[]"));
+    let page = window(handle, offset, 6, 1);
+    assert!(page.contains("\"text\":\"before\""), "{page}");
+    assert!(page.contains("\"observation_source_bytes_read\":\"22\""));
+    fs::rename(&path, root.join("moved.rs")).unwrap();
+    fs::write(&path, b"replacement").unwrap();
+    assert!(window(handle, offset, 6, 1).contains("\"text\":\"before\""));
+    assert!(take(fcb_observed_reader_copy(handle, 1, offset, offset + 6)).contains("\"original_hex\":\"6265666f7265\""));
+    assert_eq!(fcb_observed_reader_close(handle), 1);
+    assert!(take(fcb_observed_reader_info(handle)).contains("OBSERVED_READER_HANDLE_UNKNOWN"));
+}
+
+#[test]
+fn c_standalone_open_rejects_invalid_paths_without_loading_or_retargeting_a_handle() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (root, croot) = root();
+    let path = root.join("source.rs"); fs::write(&path, b"selected source\n").unwrap();
+    let encoded = hex(path.as_os_str().as_bytes());
+    let handle = fcb_observed_reader_create(); assert_ne!(handle, 0);
+    assert!(take(unsafe { fcb_observed_reader_open_file(handle, std::ptr::null(), None, std::ptr::null_mut()) })
+        .contains("OBSERVED_READER_HANDLE_INVALID_ARGUMENT"));
+    for malformed in [String::new(), "f".into(), "zz".into(), "2F".into(), "61".repeat(MAX_PATH_BYTES + 1)] {
+        let malformed = CString::new(malformed).unwrap();
+        assert!(take(unsafe { fcb_observed_reader_open_file(handle, malformed.as_ptr(), None, std::ptr::null_mut()) })
+            .contains("OBSERVED_READER_HANDLE_INVALID_ARGUMENT"));
+    }
+    for invalid in [b"source.rs".as_slice(), b"/", b"/tmp/../source.rs", b"/tmp/./source.rs", b"/tmp//source.rs", b"/tmp/source.rs\0"] {
+        let invalid = hex(invalid);
+        assert!(take(unsafe { fcb_observed_reader_open_file(handle, invalid.as_ptr(), None, std::ptr::null_mut()) })
+            .contains("OBSERVED_READER_INVALID_PATH"));
+    }
+    let link = root.join("link.rs"); std::os::unix::fs::symlink(&path, &link).unwrap();
+    let link = hex(link.as_os_str().as_bytes());
+    assert!(take(unsafe { fcb_observed_reader_open_file(handle, link.as_ptr(), None, std::ptr::null_mut()) })
+        .contains("\"status\":\"error\""));
+    assert!(take(unsafe { fcb_observed_reader_open_file(handle, encoded.as_ptr(), Some(cancel_now), std::ptr::null_mut()) })
+        .contains("\"exit_code\":\"130\""));
+    assert!(take(fcb_observed_reader_info(handle)).contains("OBSERVED_READER_HANDLE_NOT_OPEN"));
+    assert!(take(unsafe { fcb_observed_reader_open_file(handle, encoded.as_ptr(), None, std::ptr::null_mut()) })
+        .contains("\"payload_bytes_read\":\"0\""));
+    assert!(take(unsafe { fcb_observed_reader_open_file(handle, encoded.as_ptr(), None, std::ptr::null_mut()) })
+        .contains("OBSERVED_READER_HANDLE_ALREADY_OPEN"));
+    let relative = hex(b"source.rs");
+    assert!(take(unsafe { fcb_observed_reader_open(handle, croot.as_ptr(), relative.as_ptr(), None, std::ptr::null_mut()) })
+        .contains("OBSERVED_READER_HANDLE_ALREADY_OPEN"));
+    assert!(window(handle, 0, 8, 1).contains("\"text\":\"selected\""));
+    assert_eq!(fcb_observed_reader_close(handle), 1);
 }
 
 #[test]
