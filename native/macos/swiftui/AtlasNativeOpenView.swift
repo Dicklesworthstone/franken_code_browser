@@ -1,40 +1,67 @@
 import SwiftUI
 import AppKit
 
-extension AtlasNativeOpen where Reader == AtlasPagedReaderModel {
-    static func native() -> AtlasNativeOpen<AtlasPagedReaderModel> {
+/// One accepted native-file choice. Both reader kinds retain only the exact
+/// selected-file lease, and retire through the same intake lifecycle.
+@MainActor final class AtlasNativeFileReader {
+    enum Content {
+        case retained(AtlasPagedReaderModel)
+        case observed(AtlasObservedReaderPresentation)
+    }
+    let content: Content
+    init(_ content: Content) { self.content = content }
+    func close() {
+        switch content {
+        case .retained(let model): model.close()
+        case .observed(let presentation): presentation.close()
+        }
+    }
+}
+
+extension AtlasNativeOpen where Reader == AtlasNativeFileReader {
+    static func native() -> AtlasNativeOpen<AtlasNativeFileReader> {
         AtlasNativeOpen(
             prepare: { try AtlasNativeOpenAccess.selection($0, origin: $1) },
-            resolve: { try AtlasNativeOpenAccess.resolve($0, cancellation: $1, lease: $2) },
+            resolve: { try AtlasNativeOpenAccess.resolve($0, cancellation: $1, lease: $2,
+                retainedLimit: AtlasReaderLimits.captureBytes) },
             capture: { target in
-                guard case .file(let url, let lease) = target else { throw AtlasNativeOpenError.invalidSelection }
-                let model = AtlasPagedReaderModel(transport: .native, search: .native,
-                    outline: .native, document: .native)
-                do {
-                    // The parent is only a component of the exact file path.
-                    // No directory grant, discovery, or local-image source is made.
-                    let input = try AtlasReaderInput(root: url.deletingLastPathComponent().path,
-                        path: url.lastPathComponent)
-                    try await model.openSelectedFile(input: input, accessLease: lease)
-                    return model
-                } catch {
-                    model.close()
-                    throw error
+                switch target {
+                case .file(let url, let lease):
+                    let model = AtlasPagedReaderModel(transport: .native, search: .native,
+                        outline: .native, document: .native)
+                    do {
+                        // The parent is only a component of the exact file path.
+                        // No directory grant, discovery, or local-image source is made.
+                        let input = try AtlasReaderInput(root: url.deletingLastPathComponent().path,
+                            path: url.lastPathComponent)
+                        try await model.openSelectedFile(input: input, accessLease: lease)
+                        return AtlasNativeFileReader(.retained(model))
+                    } catch {
+                        model.close()
+                        throw error
+                    }
+                case .observedFile(let url, let lease):
+                    let input = try AtlasObservedReaderInput(selectedFile: Array(url.path.utf8))
+                    let source = try AtlasObservedReaderSource(selectedFile: input, access: lease)
+                    let presentation = AtlasObservedReaderPresentation(source: source, transport: .native)
+                    try await presentation.prepareSelectedFile()
+                    return AtlasNativeFileReader(.observed(presentation))
+                case .folder:
+                    throw AtlasNativeOpenError.invalidSelection
                 }
             },
             retire: { $0.close() },
             failureMessage: {
                 if let error = $0 as? AtlasNativeOpenError { return error.message }
-                if let error = $0 as? AtlasReaderError {
-                    return error.message + " Selected File captures up to 32 MiB. For larger files, choose a project folder and use its Range Reader."
-                }
+                if let error = $0 as? AtlasReaderError { return error.message }
+                if let error = $0 as? AtlasObservedReaderError { return error.message }
                 return AtlasNativeOpenError.unavailable.message
             })
     }
 }
 
 @MainActor struct AtlasNativeOpenStatus: View {
-    let model: AtlasNativeOpen<AtlasPagedReaderModel>
+    let model: AtlasNativeOpen<AtlasNativeFileReader>
     var body: some View {
         if !model.notice.isEmpty {
             HStack(spacing: 10) {
@@ -52,7 +79,7 @@ extension AtlasNativeOpen where Reader == AtlasPagedReaderModel {
 }
 
 @MainActor struct AtlasNativeOpenView: View {
-    let model: AtlasNativeOpen<AtlasPagedReaderModel>
+    let model: AtlasNativeOpen<AtlasNativeFileReader>
     let presentationID: UUID
     let chooseProject: @MainActor () -> Void
     @Environment(\.dismiss) private var dismiss
@@ -77,7 +104,13 @@ extension AtlasNativeOpen where Reader == AtlasPagedReaderModel {
             Divider()
             if let reader = model.reader {
                 // No project, local-link callback or image-root authority.
-                AtlasPagedSourceView(model: reader).id(ObjectIdentifier(reader))
+                Group {
+                    switch reader.content {
+                    case .retained(let retained): AtlasPagedSourceView(model: retained)
+                    case .observed(let presentation):
+                        AtlasObservedReaderView(presentation: presentation, showsCloseButton: false)
+                    }
+                }.id(ObjectIdentifier(reader))
             }
             AtlasNativeOpenStatus(model: model)
         }
@@ -97,7 +130,7 @@ extension AtlasNativeOpen where Reader == AtlasPagedReaderModel {
 
 /// Registers an actual native window without replacing SwiftUI's delegate.
 @MainActor struct AtlasNativeOpenWindow: NSViewRepresentable {
-    let model: AtlasNativeOpen<AtlasPagedReaderModel>
+    let model: AtlasNativeOpen<AtlasNativeFileReader>
     let newWindow: @MainActor () -> Void
     let receive: @MainActor (AtlasNativeOpenRouting.Event) -> Void
 
@@ -105,12 +138,12 @@ extension AtlasNativeOpen where Reader == AtlasPagedReaderModel {
         let registration = UUID()
         private weak var observedWindow: NSWindow?
         private var closeObserver: NSObjectProtocol?
-        private var model: AtlasNativeOpen<AtlasPagedReaderModel>?
+        private var model: AtlasNativeOpen<AtlasNativeFileReader>?
         private var receive: (@MainActor (AtlasNativeOpenRouting.Event) -> Void)?
         private var installation: Task<Void, Never>?
 
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
-        func configure(model: AtlasNativeOpen<AtlasPagedReaderModel>,
+        func configure(model: AtlasNativeOpen<AtlasNativeFileReader>,
                        newWindow: @escaping @MainActor () -> Void,
                        receive: @escaping @MainActor (AtlasNativeOpenRouting.Event) -> Void) {
             self.model = model; self.receive = receive

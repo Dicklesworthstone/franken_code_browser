@@ -231,7 +231,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     @State private var root = ""
     @State private var projectStartup = AtlasProjectStartup()
 #endif
-    @State private var nativeOpen = AtlasNativeOpen<AtlasPagedReaderModel>.native()
+    @State private var nativeOpen = AtlasNativeOpen<AtlasNativeFileReader>.native()
     @State private var nativeDrop = AtlasNativeDrop<NSItemProvider> { provider, complete in
         provider.loadObject(ofClass: NSURL.self) { value, _ in
             if let value = value as? NSURL { complete(.success(value as URL)) }

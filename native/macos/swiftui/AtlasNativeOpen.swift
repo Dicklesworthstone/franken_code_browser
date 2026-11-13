@@ -52,6 +52,7 @@ final class AtlasNativeOpenLease: @unchecked Sendable {
 
 enum AtlasNativeOpenTarget: Sendable {
     case file(URL, AtlasNativeOpenLease?)
+    case observedFile(URL, AtlasNativeOpenLease?)
 #if FCB_APP_STORE
     case folder(AppStoreRootAccess)
 #else
@@ -60,13 +61,20 @@ enum AtlasNativeOpenTarget: Sendable {
 
     var url: URL {
         switch self {
-        case .file(let url, _): return url
+        case .file(let url, _), .observedFile(let url, _): return url
 #if FCB_APP_STORE
         case .folder(let access): return access.url
 #else
         case .folder(let url): return url
 #endif
         }
+    }
+
+    /// Metadata chooses the reader strategy before payload is read. The Rust
+    /// open still validates the current regular object; size is not identity.
+    static func selectedFile(_ url: URL, lease: AtlasNativeOpenLease?,
+                             observedBytes: UInt64, retainedLimit: UInt64) -> Self {
+        observedBytes > retainedLimit ? .observedFile(url, lease) : .file(url, lease)
     }
 }
 
@@ -153,7 +161,7 @@ enum AtlasNativeOpenTarget: Sendable {
 
     func cancel() {
         reserve()
-        notice = reader == nil ? "Opening canceled." : "Opening canceled. The current retained file is unchanged."
+        notice = reader == nil ? "Opening canceled." : "Opening canceled. The current file is unchanged."
     }
 
     func closeReader() {
@@ -207,7 +215,7 @@ enum AtlasNativeOpenTarget: Sendable {
                     // activation path owns persistence and discovery.
                     submission.openFolder(target)
                     notice = ""
-                case .file:
+                case .file, .observedFile:
                     let candidate = try await capture(target)
                     guard accepts(submission.id), !Task.isCancelled else {
                         retire(candidate)
@@ -221,7 +229,7 @@ enum AtlasNativeOpenTarget: Sendable {
             } catch {
                 if accepts(submission.id), !Task.isCancelled {
                     notice = failureMessage(error)
-                    if reader != nil { notice += " The current retained file is unchanged." }
+                    if reader != nil { notice += " The current file is unchanged." }
                 }
             }
             // Even a canceled, closed or superseded request owns its slot until
@@ -388,10 +396,11 @@ enum AtlasNativeOpenAccess {
     /// Native metadata is admission only. The shared Rust source reader still
     /// verifies the opened regular object, byte limits and capture identity.
     static func resolve(_ url: URL, cancellation: AtlasSearchCancellation,
-                        lease: AtlasNativeOpenLease?) throws -> AtlasNativeOpenTarget {
+                        lease: AtlasNativeOpenLease?, retainedLimit: UInt64) throws -> AtlasNativeOpenTarget {
         guard AtlasNativeOpenRequest.selectedURL([url]) != nil else { throw AtlasNativeOpenError.invalidSelection }
         guard !cancellation.isCanceled else { throw CancellationError() }
-        guard let kind = try FileManager.default.attributesOfItem(atPath: url.path)[.type] as? FileAttributeType else {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard let kind = attributes[.type] as? FileAttributeType else {
             throw AtlasNativeOpenError.unsupported
         }
         guard !cancellation.isCanceled else { throw CancellationError() }
@@ -403,12 +412,15 @@ enum AtlasNativeOpenAccess {
             return .folder(url)
 #endif
         case .typeRegular:
+            guard let size = attributes[.size] as? NSNumber,
+                  let bytes = UInt64(size.stringValue) else { throw AtlasNativeOpenError.unavailable }
 #if FCB_APP_STORE
             let access = try AtlasNativeFileScope(url, cancellation: cancellation)
             guard !cancellation.isCanceled else { throw CancellationError() }
-            return .file(access.url, AtlasNativeOpenLease(access))
+            return .selectedFile(access.url, lease: AtlasNativeOpenLease(access),
+                observedBytes: bytes, retainedLimit: retainedLimit)
 #else
-            return .file(url, lease)
+            return .selectedFile(url, lease: lease, observedBytes: bytes, retainedLimit: retainedLimit)
 #endif
         default:
             throw AtlasNativeOpenError.unsupported

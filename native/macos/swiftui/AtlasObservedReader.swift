@@ -21,7 +21,7 @@ enum AtlasObservedReaderError: Error, Sendable {
     case engine(String)
     var message: String {
         switch self {
-        case .invalidInput: return "Choose a current project file and a valid original-byte offset."
+        case .invalidInput: return "Choose an authorized local file and a valid original-byte offset."
         case .unavailable: return "The observed range reader is unavailable. Close another range reader and try again."
         case .invalidResponse: return "The observed range response could not be verified. The accepted range is unchanged."
         case .canceled: return "Range reading canceled. Entered work may still be draining."
@@ -37,9 +37,11 @@ enum AtlasObservedReaderEncoding: String, CaseIterable, Identifiable, Sendable {
     var label: String { switch self { case .utf8: "UTF-8"; case .utf16le: "UTF-16 LE"; case .utf16be: "UTF-16 BE" } }
 }
 
-/// This is a lexical request, not a filesystem grant. The App separately binds
-/// it to the current project and retains that project's native access lease.
+/// A lexical request, never a filesystem grant. A selected-file route names
+/// exactly one absolute path and does not manufacture a parent project root.
 struct AtlasObservedReaderInput: Equatable, Sendable {
+    enum Route: Equatable, Sendable { case project, selectedFile }
+    let route: Route
     let root: String
     let relativePath: [UInt8]
     let absolutePath: [UInt8]
@@ -61,16 +63,37 @@ struct AtlasObservedReaderInput: Equatable, Sendable {
         guard absolute.count <= AtlasObservedReaderLimits.maximumPathBytes else {
             throw AtlasObservedReaderError.invalidInput
         }
+        route = .project
         self.root = root; self.relativePath = relativePath; absolutePath = absolute
         relativeHex = AtlasObservedReaderWire.hex(relativePath)
     }
 
+    init(selectedFile absolutePath: [UInt8]) throws {
+        guard absolutePath.first == 47, absolutePath.count > 1,
+              absolutePath.count <= AtlasObservedReaderLimits.maximumPathBytes,
+              !absolutePath.contains(0) else { throw AtlasObservedReaderError.invalidInput }
+        let parts = absolutePath.dropFirst().split(separator: 47, omittingEmptySubsequences: false)
+        guard parts.count <= 256,
+              !parts.contains(where: { $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46]) }) else {
+            throw AtlasObservedReaderError.invalidInput
+        }
+        route = .selectedFile
+        root = ""; relativePath = []; relativeHex = ""
+        self.absolutePath = absolutePath
+    }
+
+    var absoluteHex: String { AtlasObservedReaderWire.hex(absolutePath) }
+
     static func == (a: Self, b: Self) -> Bool {
-        a.root.utf8.elementsEqual(b.root.utf8) && a.relativePath == b.relativePath
+        a.route == b.route && a.root.utf8.elementsEqual(b.root.utf8)
+            && a.relativePath == b.relativePath && a.absolutePath == b.absolutePath
     }
 
     var displayPath: String {
-        String(bytes: relativePath, encoding: .utf8) ?? "Native path (hex): " + relativeHex
+        if route == .selectedFile {
+            return String(bytes: absolutePath, encoding: .utf8) ?? "Native path (hex): " + absoluteHex
+        }
+        return String(bytes: relativePath, encoding: .utf8) ?? "Native path (hex): " + relativeHex
     }
 }
 

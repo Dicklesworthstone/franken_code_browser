@@ -4,12 +4,14 @@ import Dispatch
 
 struct AtlasObservedReaderSourceIdentity: Equatable, Sendable {
     let input: AtlasObservedReaderInput
+    // Host authorization epoch. A standalone selected file gets an independent
+    // choice UUID; its input route remains distinct from a project capability.
     let project: UUID
     let grant: ObjectIdentifier?
 }
 
-/// Created by a current-project UI action, never by a saved source label or an
-/// old exact search anchor. The model retains this authority until close/drain.
+/// Created by a current-project or exact-file UI action, never by a saved label
+/// or an old exact search anchor. Authority is retained until close/drain.
 @MainActor struct AtlasObservedReaderSource: Identifiable {
     let id = UUID()
     let identity: AtlasObservedReaderSourceIdentity
@@ -21,6 +23,12 @@ struct AtlasObservedReaderSourceIdentity: Equatable, Sendable {
         identity = .init(input: input, project: project, grant: access.map(ObjectIdentifier.init))
         self.access = access
         self.currentMatch = currentMatch
+    }
+    init(selectedFile input: AtlasObservedReaderInput, access: AnyObject?) throws {
+        guard input.route == .selectedFile else { throw AtlasObservedReaderError.invalidInput }
+        identity = .init(input: input, project: UUID(), grant: access.map(ObjectIdentifier.init))
+        self.access = access
+        currentMatch = nil
     }
 }
 
@@ -38,6 +46,14 @@ struct AtlasObservedReaderSourceIdentity: Equatable, Sendable {
     func start() {
         guard !started, !retired else { return }
         started = true; model.open(source)
+    }
+    /// File intake publishes this presentation only after the first bounded
+    /// observation succeeds. Ordinary view appearance must not open it again.
+    func prepareSelectedFile() async throws {
+        guard !started, !retired else { throw AtlasObservedReaderError.unavailable }
+        started = true
+        do { try await model.openSelectedFile(source) }
+        catch { close(); throw error }
     }
     func close() { retired = true; model.close() }
 }
@@ -375,46 +391,81 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         reopenCurrentFile()
     }
 
+    /// Initialize a fresh file-only range reader transactionally for native
+    /// intake. It cannot replace an accepted model or borrow a project scope.
+    func openSelectedFile(_ source: AtlasObservedReaderSource) async throws {
+        try Task.checkCancellation()
+        guard source.input.route == .selectedFile, authority == nil,
+              session == nil, pendingSession == nil, page == nil, !busy else {
+            throw AtlasObservedReaderError.invalidInput
+        }
+        authority = source; closed = false
+        do { try await performOpen(prepareOpen()) }
+        catch { close(); throw error }
+    }
+
+    private struct Opening {
+        let candidate: AtlasObservedReaderSession
+        let input: AtlasObservedReaderInput
+        let request: AtlasObservedReaderRequest
+        let currentMatch: AtlasObservedReaderExternalMatch?
+        let ticket: UUID
+        let flag: AtlasSearchCancellation
+    }
+
     /// Opening a new descriptor is an explicit action. Keep the old descriptor,
     /// observation and history until the candidate's first range validates.
     func reopenCurrentFile() {
-        guard canReopen, let authority else { return }
+        guard canReopen else { return }
+        let opening: Opening
+        do { opening = try prepareOpen() }
+        catch { notice = message(error); return }
+        task = Task {
+            do { try await performOpen(opening) }
+            catch {} // performOpen preserves the accepted reader and reports failure.
+        }
+    }
+
+    private func prepareOpen() throws -> Opening {
+        guard canReopen, let authority else { throw AtlasObservedReaderError.unavailable }
         revokeSearch()
         let request: AtlasObservedReaderRequest
-        do {
-            if let match = authority.currentMatch {
-                guard match.input == authority.input else { throw AtlasObservedReaderError.invalidInput }
-                request = try match.request(); encoding = match.encoding
-            } else { request = try AtlasObservedReaderRequest(offset: 0, bytes: pageBytes, encoding: encoding) }
-        }
-        catch { notice = AtlasObservedReaderError.invalidInput.message; return }
-        let candidate: AtlasObservedReaderSession
-        do { candidate = try AtlasObservedReaderSession(transport: transport, access: authority.access) }
-        catch { notice = message(error); return }
+        if let match = authority.currentMatch {
+            guard match.input == authority.input else { throw AtlasObservedReaderError.invalidInput }
+            request = try match.request(); encoding = match.encoding
+        } else { request = try AtlasObservedReaderRequest(offset: 0, bytes: pageBytes, encoding: encoding) }
+        let candidate = try AtlasObservedReaderSession(transport: transport, access: authority.access)
         let (ticket, flag) = begin("Opening the current pathname and observing its first bounded range…")
         pendingSession = candidate
-        let input = authority.input, currentMatch = authority.currentMatch
-        task = Task {
-            do {
-                let accepted = try await io.perform(cancellation: flag, keepingAlive: [candidate]) {
-                    let info = try AtlasObservedReaderInfo.decode(
-                        candidate.transport.open(candidate.handle, input, flag), handle: candidate.handle, input: input, initial: true)
-                    guard !flag.isCanceled else { throw AtlasObservedReaderError.canceled }
-                    let page = try AtlasObservedReaderPage.decode(
-                        candidate.transport.window(candidate.handle, request, flag), handle: candidate.handle,
-                        input: input, request: request)
-                    return (info, page, currentMatch?.verify(context: page))
-                }
-                guard accepts(ticket, flag), pendingSession === candidate else { return }
-                session = candidate; pendingSession = nil; info = accepted.0
-                history = []; historyIndex = 0; latestObservation = 0
-                install(accepted.1, append: true)
-                externalContext = accepted.2
-                if let verification = accepted.2 { searchSelection = verification.selection }
-                finish(ticket)
-                notice = accepted.2.map { "Opened the current pathname as a new observation. " + $0.message }
-                    ?? "Opened a new file descriptor and retained observation \(accepted.1.observation.id). No whole-file capture was created."
-            } catch { fail(error, ticket: ticket) }
+        return Opening(candidate: candidate, input: authority.input, request: request,
+            currentMatch: authority.currentMatch, ticket: ticket, flag: flag)
+    }
+
+    private func performOpen(_ opening: Opening) async throws {
+        let candidate = opening.candidate, input = opening.input, request = opening.request
+        let currentMatch = opening.currentMatch, ticket = opening.ticket, flag = opening.flag
+        do {
+            let accepted = try await io.perform(cancellation: flag, keepingAlive: [candidate]) {
+                let info = try AtlasObservedReaderInfo.decode(
+                    candidate.transport.open(candidate.handle, input, flag), handle: candidate.handle, input: input, initial: true)
+                guard !flag.isCanceled else { throw AtlasObservedReaderError.canceled }
+                let page = try AtlasObservedReaderPage.decode(
+                    candidate.transport.window(candidate.handle, request, flag), handle: candidate.handle,
+                    input: input, request: request)
+                return (info, page, currentMatch?.verify(context: page))
+            }
+            guard accepts(ticket, flag), pendingSession === candidate else { throw AtlasObservedReaderError.canceled }
+            session = candidate; pendingSession = nil; info = accepted.0
+            history = []; historyIndex = 0; latestObservation = 0
+            install(accepted.1, append: true)
+            externalContext = accepted.2
+            if let verification = accepted.2 { searchSelection = verification.selection }
+            finish(ticket)
+            notice = accepted.2.map { "Opened the current pathname as a new observation. " + $0.message }
+                ?? "Opened a new file descriptor and retained observation \(accepted.1.observation.id). No whole-file capture was created."
+        } catch {
+            fail(error, ticket: ticket)
+            throw error
         }
     }
 

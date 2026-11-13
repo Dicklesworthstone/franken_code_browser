@@ -16,14 +16,19 @@ then `open "$APP"` and `./scripts/install_macos_app.sh "$APP"` if desired.
 Use **File → Open…** (**Command-O**), the toolbar **Open** button, Finder's
 **Open With**, or drop one local file or folder onto the main window. A folder
 uses the existing project access and progressive catalog workflow. A file opens
-in an independent **Selected File** reader, with retained source pages, Find,
-Outline, Markdown and original-byte selection/copy. Opening a file leaves the
+in an independent **Selected File** reader. Files up to **32 MiB** have retained
+source pages, Find, Outline, Markdown and original-byte selection/copy. Opening a file leaves the
 current project available. The app registers as an alternate viewer for text,
 source-code files and folders; it does not take over default file associations.
 
-The file route captures at most **32 MiB**. Larger files can be read through the
-existing **Project Files → Range Reader** after explicitly choosing their
-project folder. Symbolic links, special files, remote URLs, multiple items and
+Larger files open directly in the **Observed Range Reader** using the selected
+file's own access. Opening reads metadata and the first **64 KiB** range with
+bounded decoding context. Byte navigation, physical-line navigation, bounded
+Find, retained observation history and original-byte selection/copy work without
+capturing the whole file or choosing its containing project. The first range
+uses explicitly labeled UTF-8 decoding; choose UTF-16LE or UTF-16BE when needed.
+Each range is a separate observation; unread regions remain unknown.
+Symbolic links, special files, remote URLs, multiple items and
 paths that cannot be represented losslessly as UTF-8 are refused. Use the
 project catalog's native path support for filenames outside this entry point's
 UTF-8 contract.
@@ -32,13 +37,14 @@ In sandboxed builds, the selected file has its own in-memory, read-only native
 grant. Its containing folder is only a path component: it is not authorized,
 remembered as a project, scanned, or used to load neighboring Markdown images
 or links. **Open Project Folder…** makes that broader choice explicit.
-**Refresh from Disk** retains the original file-only scope.
+**Refresh from Disk** and the range reader's **Reopen current file** retain the
+original file-only scope.
 
 Only one opening operation and one newest pending choice are admitted per
 window. Typed file-URL drop providers have their own one-active/one-pending
 admission and stay retained through canceled callbacks. Canceling, closing or making a newer choice fences late panel/drop and
-worker results. A replacement file appears only after its first captured page
-validates; failure preserves the current retained reader. Finder events route
+worker results. A replacement file appears only after its first page validates;
+failure preserves the current reader and its accepted bytes. Finder events route
 to one existing window, or wait for a window on launch/reopen.
 
 The focused regression entry point is

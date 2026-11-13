@@ -26,4 +26,11 @@ swiftc "$@" -swift-version 6 -warnings-as-errors \
     "$src/AtlasDocumentPreviewModel.swift" "$src/AtlasPagedReaderModel.swift" \
     "$src/tests/AtlasReaderDocumentFixture.swift" "$src/tests/AtlasSelectedFileReaderTests.swift" -o "$out/selected-file-reader"
 "$out/selected-file-reader"
+swiftc "$@" -swift-version 6 -warnings-as-errors \
+    "$src/AtlasSearch.swift" "$src/AtlasSearchExpression.swift" "$src/AtlasSearchCoordinator.swift" \
+    "$src/AtlasProjectIO.swift" "$src/AtlasRootAccessLoader.swift" "$src/AppStoreRootAccess.swift" \
+    "$src/AtlasSource.swift" "$src/AtlasNativeOpen.swift" \
+    "$src/AtlasObservedReader.swift" "$src/AtlasObservedReaderSearch.swift" "$src/AtlasObservedReaderModel.swift" \
+    "$src/tests/AtlasObservedReaderFixture.swift" "$src/tests/AtlasSelectedRangeReaderTests.swift" -o "$out/selected-range-reader"
+"$out/selected-range-reader"
 printf 'Retained native-open fixture artifacts: %s\n' "$out"

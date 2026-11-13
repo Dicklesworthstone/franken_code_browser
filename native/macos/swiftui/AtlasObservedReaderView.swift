@@ -5,6 +5,7 @@ import AppKit
 /// reader or imports an old search, bookmark, outline or saved-archive anchor.
 @MainActor struct AtlasObservedReaderView: View {
     let presentation: AtlasObservedReaderPresentation
+    let showsCloseButton: Bool
     private var origin: AtlasObservedReaderSource { presentation.source }
     @State private var model: AtlasObservedReaderModel
     @State private var wrapsLines = false
@@ -14,8 +15,9 @@ import AppKit
     @FocusState private var searchFocused: Bool
     @Environment(\.dismiss) private var dismiss
 
-    init(presentation: AtlasObservedReaderPresentation) {
+    init(presentation: AtlasObservedReaderPresentation, showsCloseButton: Bool = true) {
         self.presentation = presentation
+        self.showsCloseButton = showsCloseButton
         _model = State(initialValue: presentation.model)
     }
 
@@ -26,15 +28,22 @@ import AppKit
                 Spacer()
                 Button("Reopen current file", action: model.reopenCurrentFile).disabled(!model.canReopen)
                     .help("Open the current pathname as a new descriptor and observe its first range. Keep the accepted observation if opening fails.")
-                Button("Done") { presentation.close(); dismiss() }.keyboardShortcut(.cancelAction)
+                if showsCloseButton {
+                    Button("Done") { presentation.close(); dismiss() }.keyboardShortcut(.cancelAction)
+                }
             }
             Text(verbatim: model.info?.identity.displayPath ?? String(reflecting: origin.input.displayPath))
                 .font(.system(.caption, design: .monospaced))
                 .textSelection(.enabled).lineLimit(2)
-            Text(verbatim: "Project: " + String(reflecting: origin.input.root)).font(.caption).foregroundStyle(.secondary)
-                .textSelection(.enabled).lineLimit(1).truncationMode(.middle)
-            Text("Observe part of a current file, including files larger than the complete reader's 32 MiB limit. Each read is independent; the original complete reader stays unchanged.")
-                .font(.caption).foregroundStyle(.secondary)
+            if origin.input.route == .selectedFile {
+                Text("File access is limited to this selection. Each read retains a bounded observation; unread regions remain unknown.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                Text(verbatim: "Project: " + String(reflecting: origin.input.root)).font(.caption).foregroundStyle(.secondary)
+                    .textSelection(.enabled).lineLimit(1).truncationMode(.middle)
+                Text("Observe part of a current file, including files larger than the complete reader's 32 MiB limit. Each read is independent; the original complete reader stays unchanged.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             if let match = origin.currentMatch {
                 Text("Current context for retained match at original bytes \(match.range.start)..<\(match.range.end). This explicitly reopens the current pathname; the earlier search retained only literal bytes.")
                     .font(.caption).foregroundStyle(.secondary)

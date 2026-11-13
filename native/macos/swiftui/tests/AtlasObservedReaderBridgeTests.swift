@@ -78,6 +78,13 @@ import Foundation
         precondition(count(12) == 3 && allocations() == 15 && frees() == 15,
             "Line requests preserve UInt64 coordinates, independent byte limits and explicit decoding at the ABI")
 
+        let selectedFile = try AtlasObservedReaderInput(selectedFile: input.absolutePath)
+        let projectOpens = count(1), priorPolls = count(8)
+        let selectedFirst = try transport.open(handle, selectedFile, AtlasSearchCancellation())
+        precondition(selectedFirst == expected && selectedFile != input && count(19) == 1
+            && count(1) == projectOpens && count(8) == priorPolls + 1 && allocations() == frees(),
+            "The same raw path selected as one file must use the exact-file ABI, without a parent project open")
+
         guard let resolveSelection = transport.resolveSelection else { preconditionFailure("Native selection transport is missing") }
         let occurrences = try AtlasObservedReaderSearchRequest(generation: observation,
             needle: "exact_é", encoding: .utf8, maximumScanBytes: 1 << 32, mode: .occurrences)
@@ -102,6 +109,7 @@ import Foundation
         // Every allocating entrypoint shares the actual bounded take/free path.
         let commands: [() throws -> String?] = [
             { try transport.open(handle, input, AtlasSearchCancellation()) },
+            { try transport.open(handle, selectedFile, AtlasSearchCancellation()) },
             { try transport.info(handle) },
             { try transport.window(handle, request, AtlasSearchCancellation()) },
             { try transport.retained(handle, observation) },
@@ -132,7 +140,7 @@ import Foundation
 
         // C invokes the supplied callback with its live object context. The
         // transport frees the obsolete reply before throwing cancellation.
-        for operation in 0..<6 {
+        for operation in 0..<7 {
             for lateMode: Int32 in [4, 5] {
                 mode(lateMode)
                 weak var released: AtlasSearchCancellation?
@@ -146,7 +154,8 @@ import Foundation
                         case 2: _ = try search.find(handle, searchRequest, token)
                         case 3: _ = try observeHit(handle, witness, request, token)
                         case 4: _ = try readLines(handle, lineRequest, token)
-                        default: _ = try search.find(handle, occurrences, token)
+                        case 5: _ = try search.find(handle, occurrences, token)
+                        default: _ = try transport.open(handle, selectedFile, token)
                         }
                         preconditionFailure("Late canceled read-only delivery was not suppressed")
                     } catch AtlasObservedReaderError.canceled { }
@@ -204,7 +213,10 @@ import Foundation
         let enteredOpen = count(1), enteredWindow = count(3), enteredPolls = count(8), enteredFind = count(9)
         let enteredObserveHit = count(11)
         let enteredLines = count(12)
+        let enteredFile = count(19)
         do { _ = try transport.open(handle, input, canceled); preconditionFailure("Pre-entry open cancellation ignored") }
+        catch AtlasObservedReaderError.canceled { }
+        do { _ = try transport.open(handle, selectedFile, canceled); preconditionFailure("Pre-entry exact-file cancellation ignored") }
         catch AtlasObservedReaderError.canceled { }
         do { _ = try transport.window(handle, request, canceled); preconditionFailure("Pre-entry window cancellation ignored") }
         catch AtlasObservedReaderError.canceled { }
@@ -217,6 +229,7 @@ import Foundation
         precondition(count(1) == enteredOpen && count(3) == enteredWindow && count(8) == enteredPolls && count(9) == enteredFind)
         precondition(count(11) == enteredObserveHit)
         precondition(count(12) == enteredLines)
+        precondition(count(19) == enteredFile)
         let beforeOccurrences = count(16), beforeCountedOccurrences = count(17)
         let legacyFinds = count(9), legacyCounted = count(13), legacyMatching = count(14)
         for encoding in AtlasObservedReaderEncoding.allCases {

@@ -5,6 +5,9 @@ private typealias ObservedReaderPoll = @convention(c) (UnsafeMutableRawPointer?)
 @_silgen_name("fcb_observed_reader_open") private func observedReaderOpen(
     _ handle: UInt64, _ root: UnsafePointer<CChar>?, _ relativeHex: UnsafePointer<CChar>?,
     _ poll: ObservedReaderPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_observed_reader_open_file") private func observedReaderOpenFile(
+    _ handle: UInt64, _ absoluteHex: UnsafePointer<CChar>?,
+    _ poll: ObservedReaderPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_observed_reader_info") private func observedReaderInfo(_ handle: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_observed_reader_window") private func observedReaderWindow(
     _ handle: UInt64, _ offset: UInt64, _ bytes: UInt64, _ encoding: UInt64,
@@ -50,9 +53,16 @@ extension AtlasObservedReaderTransport {
         create: { observedReaderCreate() },
         open: { handle, input, cancellation in
             try observedReaderPolling(cancellation) { poll, context in
-                input.root.withCString { root in
-                    input.relativeHex.withCString { relative in
-                        observedReaderOpen(handle, root, relative, poll, context)
+                switch input.route {
+                case .selectedFile:
+                    return input.absoluteHex.withCString { absolute in
+                        observedReaderOpenFile(handle, absolute, poll, context)
+                    }
+                case .project:
+                    return input.root.withCString { root in
+                        input.relativeHex.withCString { relative in
+                            observedReaderOpen(handle, root, relative, poll, context)
+                        }
                     }
                 }
             }

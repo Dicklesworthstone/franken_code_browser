@@ -7,7 +7,7 @@
 #include <string.h>
 
 enum { CREATE, OPEN, INFO, WINDOW, RETAINED, COPY, CANCEL, CLOSE, POLLS, FIND, HIT, OBSERVE_HIT, LINES, COUNTED_FIND,
-    MATCHING_FIND, MATCHING_COUNTED, OCCURRENCES_FIND, OCCURRENCES_COUNTED, RESOLVE_SELECTION, COUNTERS };
+    MATCHING_FIND, MATCHING_COUNTED, OCCURRENCES_FIND, OCCURRENCES_COUNTED, RESOLVE_SELECTION, OPEN_FILE, COUNTERS };
 static uint32_t counts[COUNTERS], allocations, frees, encoding_bits;
 static int32_t mode;
 static char *owned;
@@ -60,6 +60,15 @@ char *fcb_observed_reader_open(uint64_t handle, const char *root, const char *re
     /* Both borrowed C strings must remain valid throughout callback execution. */
     assert(strcmp(root, "/repo-\xc3\xa9") == 0);
     assert(strcmp(relative_hex, "7372632fff5c220a2e7273") == 0);
+    return response();
+}
+char *fcb_observed_reader_open_file(uint64_t handle, const char *absolute_hex,
+    fcb_observed_reader_poll poll, void *context) {
+    assert(handle == handle_value && absolute_hex != NULL);
+    assert(strcmp(absolute_hex, "2f7265706f2dc3a92f7372632fff5c220a2e7273") == 0);
+    ++counts[OPEN_FILE]; poll_context(poll, context);
+    /* The exact raw pathname stays live while the poll callback runs. */
+    assert(strcmp(absolute_hex, "2f7265706f2dc3a92f7372632fff5c220a2e7273") == 0);
     return response();
 }
 char *fcb_observed_reader_info(uint64_t handle) {

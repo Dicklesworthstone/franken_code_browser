@@ -137,6 +137,7 @@ final class ObservedReaderProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var nextOwner: UInt64 = 40
     private var inputs: [UInt64: AtlasObservedReaderInput] = [:]
+    private var openingInputs: [AtlasObservedReaderInput] = []
     private var ids: [UInt64: UInt64] = [:]
     private var pages: [UInt64: [UInt64: [String: Any]]] = [:]
     private var requests: [UInt64] = []
@@ -148,6 +149,7 @@ final class ObservedReaderProbe: @unchecked Sendable {
     private var selections = 0
     private var selectionStarts: [UInt64] = []
     private var nextLineFailure: String?
+    private var nextWindowFailure: String?
     private var failureOnNextOpen = false
     private var closeAllowed = true
     private var closes: [UInt64: Int] = [:]
@@ -173,6 +175,7 @@ final class ObservedReaderProbe: @unchecked Sendable {
     var selectionCount: Int { lock.lock(); defer { lock.unlock() }; return selections }
     var requestedSelectionStarts: [UInt64] { lock.lock(); defer { lock.unlock() }; return selectionStarts }
     func failLine(_ code: String) { lock.lock(); nextLineFailure = code; lock.unlock() }
+    func failWindow(_ code: String) { lock.lock(); nextWindowFailure = code; lock.unlock() }
     func failOpen() { lock.lock(); failureOnNextOpen = true; lock.unlock() }
     func setCloseAllowed(_ value: Bool) { lock.lock(); closeAllowed = value; lock.unlock() }
     func setContent(_ value: String) { lock.lock(); content = value; lock.unlock() }
@@ -185,6 +188,10 @@ final class ObservedReaderProbe: @unchecked Sendable {
     var activeReads: Int { lock.lock(); defer { lock.unlock() }; return active }
     var createCount: Int { lock.lock(); defer { lock.unlock() }; return creates }
     var openCount: Int { lock.lock(); defer { lock.unlock() }; return opens }
+    var openedInputs: [AtlasObservedReaderInput] {
+        lock.lock(); defer { lock.unlock() }
+        return openingInputs
+    }
     var copyCount: Int { lock.lock(); defer { lock.unlock() }; return copies }
     var restoreCount: Int { lock.lock(); defer { lock.unlock() }; return restores }
     var closedCount: Int { lock.lock(); defer { lock.unlock() }; return closed.count }
@@ -198,6 +205,7 @@ final class ObservedReaderProbe: @unchecked Sendable {
     private func open(_ owner: UInt64, _ input: AtlasObservedReaderInput) throws -> String? {
         lock.lock(); defer { lock.unlock() }
         opens += 1
+        openingInputs.append(input)
         if failureOnNextOpen {
             failureOnNextOpen = false
             return try ObservedReaderFixture.failure(owner, "OBSERVED_READER_INVALID_PATH")
@@ -215,10 +223,12 @@ final class ObservedReaderProbe: @unchecked Sendable {
         guard let input = inputs[owner] else { lock.unlock(); return nil }
         requests.append(request.offset); active += 1; mostActive = max(mostActive, active)
         let id = (ids[owner] ?? 0) + 1; ids[owner] = id
-        let gate = gates.removeValue(forKey: request.offset), text = content
+        let gate = gates.removeValue(forKey: request.offset), text = content, failure = nextWindowFailure
+        nextWindowFailure = nil
         lock.unlock()
         gate?.wait() // Intentionally returns a valid late result even after cancellation.
         lock.lock(); defer { active -= 1; lock.unlock() }
+        if let failure { return try ObservedReaderFixture.failure(owner, failure) }
         let page = ObservedReaderFixture.page(owner, input, id, request, text: text)
         pages[owner, default: [:]][id] = page
         if let keys = pages[owner]?.keys.sorted(), keys.count > 8, let first = keys.first { pages[owner]?.removeValue(forKey: first) }
