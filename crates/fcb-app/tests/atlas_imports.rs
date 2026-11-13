@@ -92,6 +92,7 @@ fn coverage(page: &Json) {
     assert_eq!(page.get("relationship_kind").text(), "lexical-import");
     assert_eq!(page.get("resolution_domain").text(), "declared-catalog-candidates");
     assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v3");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v3");
     assert_eq!(page.get("extraction_policy").text(), "rust-use-tree-js-static-and-python-import-v3");
     assert!(!page.get("compiler_resolved").flag()); assert!(!page.get("semantic_complete").flag());
     assert_eq!(page.get("source_files").number(), page.get("captured_source_files").number()
@@ -111,8 +112,10 @@ fn coverage(page: &Json) {
 #[test]
 fn rust_use_tree_leaves_keep_independent_occurrences_and_exact_statement_evidence() {
     let statement = b"use crate::shared::{self, Thing as Alias, nested::{Alpha, Beta}, *};";
-    let mut f = Fixture::new(&[("src/lib.rs", statement), ("src/shared.rs", b"pub struct Thing;"),
-        ("src/shared/nested.rs", b"pub struct Alpha; pub struct Beta;")]);
+    let shared = b"pub struct Thing;";
+    let nested = b"pub struct Alpha; pub struct Beta;";
+    let mut f = Fixture::new(&[("src/lib.rs", statement), ("src/shared.rs", shared),
+        ("src/shared/nested.rs", nested)]);
     f.build(1);
     let result = f.prepare(1, 1);
     assert!(result.get("relationships_complete").flag());
@@ -130,17 +133,53 @@ fn rust_use_tree_leaves_keep_independent_occurrences_and_exact_statement_evidenc
         assert_eq!(row.get("source_link_id").number(), index as u64 + 1);
         assert_eq!(range(row.get("evidence_range"), statement), statement);
         assert_eq!(range(row.get("specifier_range"), statement), evidence);
+        let (path, bytes) = if matches!(index, 2 | 3) {
+            (b"src/shared/nested.rs".as_slice(), nested.as_slice())
+        } else { (b"src/shared.rs".as_slice(), shared.as_slice()) };
+        assert_eq!(row.get("resolution").text(), "captured");
+        assert_eq!(row.get("resolution_basis").text(), if matches!(index, 0 | 4) {
+            "rust-use-module-file-candidate"
+        } else { "rust-use-module-prefix-candidate" });
+        assert_eq!(row.get("target_path").get("hex").text(), hex(path));
+        assert_eq!(row.get("target_sha256").text(), Sha256::digest(bytes).to_hex());
+        assert_eq!(row.get("target_bytes").number(), bytes.len() as u64);
+        assert_eq!(row.get("target_revision").number(), 1);
         let (reader, receipt) = f.search.open_import_reader(&f.atlas, owner(72910 + index as u64),
             1, row.get("link_id").number(), Side::Evidence, || false).unwrap();
         assert_eq!(reader.capture().bytes(), statement);
         assert_eq!(json(&receipt).get("relationship"), row);
     }
+    let incoming = f.page(1, Direction::Incoming, Some(b"src/shared.rs"), 0, 2);
+    assert_eq!(incoming.get("matching_links").number(), 3);
+    assert_eq!(ids(&incoming), [1, 2]);
+    assert_eq!(incoming.get("next_offset").number(), 2);
+    let tail = f.page(1, Direction::Incoming, Some(b"src/shared.rs"), 2, 2);
+    assert_eq!(ids(&tail), [5]);
+    assert_eq!(tail.get("next_offset"), &Json::Null);
+    assert_eq!(ids(&f.page(1, Direction::Incoming, Some(b"src/shared/nested.rs"), 0, 64)), [3, 4]);
+
+    // A prefix candidate opens the captured containing module at byte zero;
+    // changing the live source cannot turn this into an item-definition claim.
+    fs::write(f.root.join("src/lib.rs"), b"use changed::Thing;").unwrap();
+    fs::write(f.root.join("src/shared.rs"), b"pub struct Changed;").unwrap();
+    let (target, receipt) = f.search.open_import_reader(&f.atlas, owner(72920), 1, 2, Side::Target, || false).unwrap();
+    let receipt = json(&receipt);
+    assert_eq!(receipt.get("relationship"), &rows[1]);
+    assert_eq!(receipt.get("initial_original_offset").number(), 0);
+    assert_eq!(receipt.get("source_sha256").text(), Sha256::digest(shared).to_hex());
+    assert_eq!(receipt.get("additional_source_bytes_read").number(), 0);
+    assert!(!receipt.get("source_reopened").flag());
+    assert!(!receipt.get("compiler_resolved").flag());
+    assert_eq!(target.capture().bytes(), shared);
     f.begin(2, 1, 2, MAX_ATLAS_IMPORT_PARSE_BYTES);
     let limited = f.finish(2);
     assert_eq!(limited.get("retained_links").number(), 2);
     assert_eq!(limited.get("links_seen").number(), 5);
     assert!(limited.get("truncated").flag());
     assert!(!limited.get("relationships_complete").flag());
+    assert_eq!(f.search.open_import_reader(&f.atlas, owner(72921), 1, 2, Side::Target, || false).err(),
+        Some(Error::StaleImports));
+    assert_eq!(target.capture().bytes(), shared, "an independent reader survives projection replacement");
 }
 
 #[test]
@@ -171,8 +210,10 @@ fn exact_source_occurrences_and_incoming_outgoing_pages_share_one_inventory() {
     assert_eq!(module.get("resolution_basis").text(), "rust-module-file-candidate");
     assert_eq!(module.get("target_path").get("hex").text(), hex(b"src/worker.rs"));
     let usage = link(&result, b"src/lib.rs", "crate::worker::Thing");
-    assert_eq!(usage.get("resolution").text(), "unresolved");
-    assert_eq!(usage.get("resolution_basis").text(), "unresolved-rust-use");
+    assert_eq!(usage.get("resolution").text(), "captured");
+    assert_eq!(usage.get("resolution_basis").text(), "rust-use-module-prefix-candidate");
+    assert_eq!(usage.get("target_file_id"), module.get("target_file_id"));
+    assert_eq!(usage.get("target_sha256").text(), Sha256::digest(worker).to_hex());
     assert_eq!(range(usage.get("evidence_range"), rust), b"use crate::worker::Thing;");
     let import = link(&result, b"web/main.ts", "./dep");
     assert_eq!(range(import.get("evidence_range"), javascript), b"import { value } from './dep';");
@@ -180,14 +221,63 @@ fn exact_source_occurrences_and_incoming_outgoing_pages_share_one_inventory() {
     assert_eq!(import.get("language").text(), "typescript");
     assert_eq!(import.get("resolution_basis").text(), "unique-relative-module-candidate");
     let incoming = f.page(1, Direction::Incoming, Some(b"src/worker.rs"), 0, 1);
-    assert_eq!(incoming.get("matching_links").number(), 2); assert_eq!(ids(&incoming), [1]);
+    assert_eq!(incoming.get("matching_links").number(), 3); assert_eq!(ids(&incoming), [1]);
     assert_eq!(incoming.get("next_offset").number(), 1);
     let second = f.page(1, Direction::Incoming, Some(b"src/worker.rs"), 1, 1);
-    assert_eq!(ids(&second), [3]); assert_eq!(second.get("next_offset"), &Json::Null);
-    assert_eq!(second.get("links").array()[0].get("source_link_id").number(), 3);
+    assert_eq!(ids(&second), [2]); assert_eq!(second.get("next_offset").number(), 2);
+    assert_eq!(second.get("links").array()[0], *usage);
+    let third = f.page(1, Direction::Incoming, Some(b"src/worker.rs"), 2, 1);
+    assert_eq!(ids(&third), [3]); assert_eq!(third.get("next_offset"), &Json::Null);
+    assert_eq!(third.get("links").array()[0].get("source_link_id").number(), 3);
     assert_eq!(second.get("hashed_source_bytes"), result.get("hashed_source_bytes"));
     assert_eq!(ids(&f.page(1, Direction::Outgoing, Some(b"web/main.ts"), 0, 64)), [4, 5]);
     assert_eq!(ids(&f.page(1, Direction::All, Some(b"web/dep.ts"), 0, 64)), [4, 5]);
+}
+
+#[test]
+fn rust_root_and_module_ambiguity_preserve_evidence_and_never_guess_a_target() {
+    let root = b"use crate::choice::Item;\nuse crate::missing;\nuse external::Thing;\n";
+    let consumer = b"use crate::choice;";
+    let nested = b"mod inner { use super::choice; }";
+    let overridden = b"#[path = \"actual.rs\"] mod moved; use crate::choice;";
+    let mut f = Fixture::new(&[("src/lib.rs", root), ("src/main.rs", b""),
+        ("src/choice.rs", b"pub struct Item;"), ("src/choice/mod.rs", b"pub struct Item;"),
+        ("src/consumer.rs", consumer), ("src/nested.rs", nested),
+        ("src/overridden.rs", overridden), ("src/bin/tool.rs", consumer)]);
+    f.build(1);
+    let page = f.prepare(1, 1);
+    assert!(page.get("relationships_complete").flag(), "the lexical inventory can be complete while targets are unknown");
+    let cases: &[(&[u8], &[u8], &str, &str, &str)] = &[
+        (b"src/lib.rs", root, "crate::choice::Item", "ambiguous", "ambiguous-catalog-target"),
+        (b"src/lib.rs", root, "crate::missing", "missing", "no-catalog-target"),
+        (b"src/lib.rs", root, "external::Thing", "unresolved", "unresolved-rust-use"),
+        (b"src/consumer.rs", consumer, "crate::choice", "ambiguous", "ambiguous-rust-crate-root"),
+        (b"src/nested.rs", nested, "super::choice", "unresolved", "unresolved-rust-use"),
+        (b"src/overridden.rs", overridden, "crate::choice", "unresolved", "unresolved-rust-use"),
+        (b"src/bin/tool.rs", consumer, "crate::choice", "unresolved", "unresolved-rust-use"),
+    ];
+    for (index, &(path, source, destination, resolution, basis)) in cases.iter().enumerate() {
+        let row = link(&page, path, destination);
+        assert_eq!(row.get("resolution").text(), resolution);
+        assert_eq!(row.get("resolution_basis").text(), basis);
+        for field in ["target_file_id", "target_path", "target_revision", "target_sha256", "target_bytes"] {
+            assert_eq!(row.get(field), &Json::Null);
+        }
+        assert_eq!(range(row.get("evidence_range"), source), format!("use {destination};").as_bytes());
+        assert_eq!(range(row.get("specifier_range"), source), destination.as_bytes());
+        let id = row.get("link_id").number();
+        assert_eq!(f.search.open_import_reader(&f.atlas, owner(72930 + index as u64),
+            1, id, Side::Target, || false).err(), Some(Error::ImportTargetUnavailable));
+        let (reader, receipt) = f.search.open_import_reader(&f.atlas, owner(72940 + index as u64),
+            1, id, Side::Evidence, || false).unwrap();
+        assert_eq!(reader.capture().bytes(), source);
+        assert_eq!(json(&receipt).get("relationship"), row);
+    }
+    for target in [b"src/choice.rs".as_slice(), b"src/choice/mod.rs"] {
+        let incoming = f.page(1, Direction::Incoming, Some(target), 0, 64);
+        assert_eq!(incoming.get("matching_links").number(), 0);
+        assert!(incoming.get("links").array().is_empty(), "ambiguous files must not acquire reverse links");
+    }
 }
 
 #[test]
@@ -446,7 +536,7 @@ fn python_relative_imports_share_incoming_navigation_and_exact_retained_readers(
     let page = f.prepare(1, 1);
     assert!(page.get("relationships_complete").flag(), "{page:?}");
     assert_eq!(page.get("retained_links").number(), 5);
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v2");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v3");
 
     let row = link(&page, b"pkg/main.py", ".worker");
     assert_eq!(row.get("language").text(), "python");

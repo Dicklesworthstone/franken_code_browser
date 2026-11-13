@@ -192,10 +192,112 @@ import Foundation
         }
     }
 
+    /// A use leaf may identify a conventional module file or only the module
+    /// containing a possible item. Both remain lexical navigation candidates.
+    private static func rustUseWire(_ index: AtlasPreparedIndex) throws {
+        let original = ProjectLinksFixture.importPage(owner: index.basis.owner,
+            generation: 1, command: "imports-page")
+        let captureFields = ["target_revision", "target_sha256", "target_bytes"]
+        let targetFields = ["target_file_id", "target_path"] + captureFields
+        let localBases = ["rust-use-module-file-candidate", "rust-use-module-prefix-candidate"]
+        for basis in localBases {
+            var value = original, rows = original["links"] as! [[String: Any]]
+            for i in rows.indices {
+                rows[i]["lexical_import_kind"] = "rust-use"
+                rows[i]["destination"] = basis == localBases[0] ? "crate::child" : "crate::child::Child"
+                rows[i]["resolution_basis"] = basis
+            }
+            value["links"] = rows
+            let page = try decode(value, index: index), link = page.links[0]
+            precondition(link.canOpenTarget && link.target?.id == 4
+                && link.importEvidence?.kind == "rust-use"
+                && link.evidenceLabel.contains("not compiler resolved"))
+            precondition(link.label.contains("containing-module candidate") == (basis == localBases[1]))
+
+            for resolution in ["unavailable", "uncaptured", "outside-capture-scope"] {
+                var unavailable = value, unavailableRows = rows
+                for i in unavailableRows.indices {
+                    unavailableRows[i]["resolution"] = resolution
+                    for field in captureFields { unavailableRows[i][field] = NSNull() }
+                }
+                unavailable["links"] = unavailableRows
+                let candidate = try decode(unavailable, index: index).links[0]
+                precondition(!candidate.canOpenTarget && candidate.targetFile == 4 && candidate.target == nil)
+                precondition(candidate.label.lowercased().contains("containing-module candidate") == (basis == localBases[1]))
+            }
+            for (language, kind) in [("rust", "rust-module"), ("python", "python-from"),
+                ("javascript", "javascript-import"), ("typescript", "javascript-export"),
+                ("jsx", "javascript-import"), ("tsx", "javascript-export")] {
+                var bad = value, changed = rows
+                changed[0]["language"] = language; changed[0]["lexical_import_kind"] = kind
+                bad["links"] = changed; refuse(bad, index: index)
+            }
+            for resolution in ["missing", "ambiguous", "external", "unresolved"] {
+                var bad = value, changed = rows
+                for i in changed.indices {
+                    changed[i]["resolution"] = resolution
+                    for field in targetFields { changed[i][field] = NSNull() }
+                }
+                bad["links"] = changed; refuse(bad, index: index)
+            }
+            var old = value; old["resolver"] = "fcb-closed-catalog-imports-v2"
+            refuse(old, index: index)
+            for side in [AtlasProjectLinkSide.evidence, .target] {
+                var receipt = ProjectLinksFixture.importReceipt(owner: index.basis.owner, reader: 77,
+                    generation: 1, link: 1, side: side)
+                receipt["relationship"] = rows[0]
+                func admit(_ wire: [String: Any]) throws -> AtlasProjectLinkReaderReceipt {
+                    try AtlasProjectLinkReaderReceipt.decode(ProjectLinksFixture.json(wire), index: index,
+                        generation: 1, link: link, side: side, destination: 77)
+                }
+                let admitted = try admit(receipt)
+                precondition(admitted.initialOriginalOffset == (side == .evidence ? 11 : 0))
+                if side == .target {
+                    precondition(admitted.navigationDescription.contains("containing-module candidate") == (basis == localBases[1]))
+                    if basis == localBases[1] {
+                        precondition(admitted.navigationDescription.contains("imported item location and compiler resolution are not established"))
+                    }
+                } else {
+                    precondition(admitted.navigationDescription.contains("exact import evidence"))
+                }
+                var bad = receipt, changed = rows[0]
+                changed["resolution_basis"] = basis == localBases[0] ? localBases[1] : localBases[0]
+                bad["relationship"] = changed
+                do { _ = try admit(bad); preconditionFailure("Changed Rust candidate provenance admitted") } catch {}
+            }
+        }
+
+        var ambiguous = original, rows = original["links"] as! [[String: Any]]
+        for i in rows.indices {
+            rows[i]["lexical_import_kind"] = "rust-use"; rows[i]["destination"] = "crate::child"
+            rows[i]["resolution"] = "ambiguous"; rows[i]["resolution_basis"] = "ambiguous-rust-crate-root"
+            for field in targetFields { rows[i][field] = NSNull() }
+        }
+        ambiguous["links"] = rows
+        let refusedRoot = try decode(ambiguous, index: index).links[0]
+        precondition(!refusedRoot.canOpenTarget && refusedRoot.targetFile == nil && refusedRoot.targetPath == nil
+            && refusedRoot.label.contains("crate roots") && refusedRoot.label.contains("no target was selected"))
+        for (language, kind) in [("rust", "rust-module"), ("python", "python-from"), ("javascript", "javascript-import")] {
+            var bad = ambiguous, changed = rows
+            changed[0]["language"] = language; changed[0]["lexical_import_kind"] = kind
+            bad["links"] = changed; refuse(bad, index: index)
+        }
+        for resolution in ["missing", "external", "unresolved"] {
+            var bad = ambiguous, changed = rows
+            changed[0]["resolution"] = resolution; bad["links"] = changed
+            refuse(bad, index: index)
+        }
+        var forgedTarget = original, targetRows = original["links"] as! [[String: Any]]
+        targetRows[0]["lexical_import_kind"] = "rust-use"
+        targetRows[0]["resolution_basis"] = "ambiguous-rust-crate-root"
+        forgedTarget["links"] = targetRows; refuse(forgedTarget, index: index)
+    }
+
     @MainActor static func main() async throws {
         let fixture = ProjectLinksFixture(includesImports: true), index = try await prepared(fixture)
         try wire(index)
         try pythonWire(index)
+        try rustUseWire(index)
         let live = ProjectLinksFixture(includesImports: true)
         let model = AtlasProjectLinksModel(root: "/project", transport: live.transport)
         precondition(model.availableProjections == [.documentation, .imports])

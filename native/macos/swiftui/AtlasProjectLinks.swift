@@ -135,7 +135,7 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
               try w.text("relationship_kind") == "lexical-import",
               try w.text("evidence_precision") == "exact-import-source-range",
               try w.text("extractor") == "franken-markdown-d6fbd1d5/import-statements-v3",
-              try w.text("resolver") == "fcb-closed-catalog-imports-v2",
+              try w.text("resolver") == "fcb-closed-catalog-imports-v3",
               try w.text("extraction_policy") == "rust-use-tree-js-static-and-python-import-v3",
               try !w.flag("compiler_resolved"), try !w.flag("semantic_complete") else {
             throw AtlasProjectLinksError.invalidResponse
@@ -153,8 +153,13 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
         }
         guard kinds.contains(kind),
               ["exact-relative-path", "unique-relative-module-candidate", "rust-module-file-candidate",
+               "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "ambiguous-rust-crate-root",
                "python-relative-module-candidate", "unresolved-rust-use", "external-specifier",
                "unsupported-specifier", "no-catalog-target", "ambiguous-catalog-target"].contains(resolutionBasis) else {
+            throw AtlasProjectLinksError.invalidResponse
+        }
+        if ["rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "ambiguous-rust-crate-root"]
+            .contains(resolutionBasis) && (language != "rust" || kind != "rust-use") {
             throw AtlasProjectLinksError.invalidResponse
         }
         if resolutionBasis == "python-relative-module-candidate" && (language != "python" || kind != "python-from") {
@@ -193,13 +198,19 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
     let destination, resolution, destinationSuffix, fragmentResolution: String
     var label: String {
         let status: String
+        let modulePrefix = importEvidence?.resolutionBasis == "rust-use-module-prefix-candidate"
         switch resolution {
-        case "captured": status = projection == .imports ? "Captured catalog target candidate" : "Exact target capture available"
-        case "unavailable": status = "Target capture unavailable"
-        case "uncaptured": status = "Target is catalogued but was not captured"
-        case "outside-capture-scope": status = "Target is outside the retained capture scope"
+        case "captured": status = modulePrefix ? "Captured containing-module candidate"
+            : (projection == .imports ? "Captured catalog target candidate" : "Exact target capture available")
+        case "unavailable": status = modulePrefix ? "Containing-module candidate capture unavailable" : "Target capture unavailable"
+        case "uncaptured": status = modulePrefix ? "Containing-module candidate is catalogued but was not captured"
+            : "Target is catalogued but was not captured"
+        case "outside-capture-scope": status = modulePrefix ? "Containing-module candidate is outside the retained capture scope"
+            : "Target is outside the retained capture scope"
         case "missing": status = "Target is absent from this captured catalog"
-        case "ambiguous": status = "Several catalog targets are possible; no target was selected"
+        case "ambiguous": status = importEvidence?.resolutionBasis == "ambiguous-rust-crate-root"
+            ? "Several crate roots are possible; no target was selected"
+            : "Several catalog targets are possible; no target was selected"
         case "external": status = projection == .imports ? "External specifier; no package resolution or network content" : "External destination; no network content was fetched"
         default: status = projection == .imports ? "No supported catalog target was established" : "Destination could not be resolved within the project"
         }
@@ -279,9 +290,9 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
             switch resolution {
             case "captured", "unavailable", "uncaptured", "outside-capture-scope":
                 allowed = ["exact-relative-path", "unique-relative-module-candidate", "rust-module-file-candidate",
-                    "python-relative-module-candidate"]
+                    "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "python-relative-module-candidate"]
             case "missing": allowed = ["no-catalog-target"]
-            case "ambiguous": allowed = ["ambiguous-catalog-target"]
+            case "ambiguous": allowed = ["ambiguous-catalog-target", "ambiguous-rust-crate-root"]
             case "external": allowed = ["external-specifier"]
             default: allowed = ["unresolved-rust-use", "unsupported-specifier"]
             }

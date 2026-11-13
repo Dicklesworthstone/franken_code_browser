@@ -22,7 +22,7 @@ enum AtlasSavedImportWire {
               w.resolution_domain == "declared-catalog-candidates",
               w.extractor == "franken-markdown-d6fbd1d5/import-statements-v3",
               w.extraction_policy == "rust-use-tree-js-static-and-python-import-v3",
-              w.resolver == "fcb-closed-catalog-imports-v2",
+              w.resolver == "fcb-closed-catalog-imports-v3",
               !w.compiler_resolved, !w.semantic_complete else { throw AtlasSavedError.invalidResponse }
     }
 
@@ -70,11 +70,14 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         }
     }
     var resolutionLabel: String {
+        let modulePrefix = resolutionBasis == "rust-use-module-prefix-candidate"
         switch resolution {
-        case "captured": return "Captured catalog target candidate"
-        case "unavailable": return "Target recorded without source bytes"
+        case "captured": return modulePrefix ? "Captured containing-module candidate" : "Captured catalog target candidate"
+        case "unavailable": return modulePrefix ? "Containing-module candidate recorded without source bytes"
+            : "Target recorded without source bytes"
         case "missing": return "No target in the saved manifest"
-        case "ambiguous": return "Several catalog targets are possible"
+        case "ambiguous": return resolutionBasis == "ambiguous-rust-crate-root"
+            ? "Several crate roots are possible; no target was selected" : "Several catalog targets are possible"
         case "external": return "External specifier"
         default: return "No supported catalog target established"
         }
@@ -119,8 +122,13 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
               !destination.isEmpty, destination.utf8.count <= 1024, kinds.contains(kind),
               ["captured", "unavailable", "missing", "ambiguous", "external", "unresolved"].contains(resolution),
               ["exact-relative-path", "unique-relative-module-candidate", "rust-module-file-candidate",
+               "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "ambiguous-rust-crate-root",
                "python-relative-module-candidate", "unresolved-rust-use", "external-specifier",
                "unsupported-specifier", "no-catalog-target", "ambiguous-catalog-target"].contains(resolutionBasis) else {
+            throw AtlasSavedError.invalidResponse
+        }
+        if ["rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "ambiguous-rust-crate-root"]
+            .contains(resolutionBasis) && (language != "rust" || kind != "rust-use") {
             throw AtlasSavedError.invalidResponse
         }
         if resolutionBasis == "python-relative-module-candidate" && (language != "python" || kind != "python-from") {
@@ -133,9 +141,10 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         let acceptedBases: [String]
         switch resolution {
         case "captured", "unavailable": acceptedBases = ["exact-relative-path", "unique-relative-module-candidate",
-            "rust-module-file-candidate", "python-relative-module-candidate"]
+            "rust-module-file-candidate", "rust-use-module-file-candidate", "rust-use-module-prefix-candidate",
+            "python-relative-module-candidate"]
         case "missing": acceptedBases = ["no-catalog-target"]
-        case "ambiguous": acceptedBases = ["ambiguous-catalog-target"]
+        case "ambiguous": acceptedBases = ["ambiguous-catalog-target", "ambiguous-rust-crate-root"]
         case "external": acceptedBases = ["external-specifier"]
         default: acceptedBases = ["unsupported-specifier", "unresolved-rust-use"]
         }

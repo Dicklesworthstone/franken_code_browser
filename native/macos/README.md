@@ -712,6 +712,23 @@ is a normalized path, not a verbatim source excerpt. Malformed or over-budget
 trees remain unresolved evidence with partial coverage. Nested scopes, macros,
 and explicit path overrides do not acquire conventional file-resolution authority.
 
+Qualified Rust `crate::`, `self::` and repeated `super::` paths can navigate
+conventional module candidates in the captured catalog. The resolver checks
+both `name.rs` and `name/mod.rs`; competing module files or inferred crate roots
+remain ambiguous. A qualified path with a known module prefix, such as
+`crate::worker::Task`, can open the captured worker module as a **containing-module
+candidate**. The row and opened reader distinguish this from an exact module-file
+candidate: neither establishes the imported item's definition or compiler binding.
+
+Root inference uses the nearest conventional `lib.rs` or `main.rs`, with bounded
+ancestor and path-component traversal. It stops at automatic-target boundaries
+such as `src/bin`, `tests`, `examples` and `benches`. Bare/external imports,
+unknown roots, unsupported module spellings and exhausted limits retain readable
+evidence without a guessed target. Custom Cargo layouts, conditional compilation,
+re-exports and `#[path]` resolution require stronger evidence than this policy
+provides. The same navigation policy applies to saved archive members without
+reopening a working tree.
+
 Python navigation uses an explicit catalog policy. `from .worker import Tool`
 looks for the unique `worker.py` or `worker/__init__.py` candidate beside the
 source; additional leading dots ascend catalog directories without escaping
@@ -725,11 +742,11 @@ installed dependencies. A catalog candidate does not establish a Python runtime
 binding. Bare-relative wildcard imports have no guessed target.
 
 The inventory admits 128 KiB per source, 32 MiB of aggregate parsing and 4,096
-retained statements. Unsupported syntax, malformed decoding, parse limits and
+retained import occurrences. Unsupported syntax, malformed decoding, parse limits and
 omitted rows remain visible coverage conditions. These limits apply to the
 captured project import browser. The **Saved Repository → Imports** workflow
-applies the same lexical policies to archived members. Rust/Swift regression fixtures cover Python
-source spans, UTF-16 coordinates, relative targets, ambiguity, stale captures and
+applies the same lexical policies to archived members. Rust/Swift regression fixtures cover Rust
+use trees and Python imports, UTF-16 coordinates, relative targets, ambiguity, stale captures and
 native evidence validation. Executable and physical-Mac verification remain
 pending.
 

@@ -50,10 +50,13 @@ struct AtlasProjectLinkReaderReceipt: Sendable {
               offset == (side == .evidence ? evidence.start : 0),
               try w.absent(["fragment_status", "fragment_suffix", "fragment_slug", "target_range",
                             "destination_suffix", "fragment_resolution"]) else { throw AtlasProjectLinksError.invalidResponse }
+        let targetDescription = link.importEvidence?.resolutionBasis == "rust-use-module-prefix-candidate"
+            ? "Opened the retained containing-module candidate at the beginning. The imported item location and compiler resolution are not established."
+            : "Opened the retained catalog target candidate at the beginning. Compiler resolution is not established."
         return Self(info: info, fragment: nil, initialOriginalOffset: offset,
             navigationDescription: side == .evidence
                 ? "Opened the exact import evidence at original bytes \(evidence.start)..<\(evidence.end) in this capture."
-                : "Opened the retained catalog target candidate at the beginning. Compiler resolution is not established.")
+                : targetDescription)
     }
 }
 
@@ -177,6 +180,6 @@ final class AtlasProjectLinkReaderReceiptBox: @unchecked Sendable {
     }
     var evidenceLabel: String {
         side == .evidence ? link.evidenceLabel
-            : (link.projection == .imports ? "Captured catalog target candidate · " : "Exact captured target document · ") + navigationDescription
+            : (link.projection == .imports ? "\(link.label) · " : "Exact captured target document · ") + navigationDescription
     }
 }

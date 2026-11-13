@@ -69,7 +69,9 @@ fn import_navigation_retains_exact_statement_and_target_after_working_tree_edits
     assert_eq!(number(&result, "retained_links"), 2);
     assert!(result.contains("\"relationship_kind\":\"lexical-import\"") && result.contains("\"compiler_resolved\":false"));
     let incoming = page(&table, handle, 1, AtlasImportDirection::Incoming, Some(b"src/child.rs")).unwrap();
-    assert_eq!(incoming.as_str().matches("\"link_id\":").count(), 1);
+    assert_eq!(incoming.as_str().matches("\"link_id\":").count(), 2);
+    assert!(incoming.as_str().contains("\"resolution_basis\":\"rust-module-file-candidate\""));
+    assert!(incoming.as_str().contains("\"resolution_basis\":\"rust-use-module-prefix-candidate\""));
     let id = number(incoming.as_str(), "link_id");
     fs::write(root.join("src/lib.rs"), b"mod changed;\n").unwrap();
     fs::write(root.join("src/child.rs"), b"pub struct Changed;\n").unwrap();
@@ -166,7 +168,7 @@ fn markdown_import_and_search_generations_remain_independent_across_cancellation
     assert_eq!(session.search.relationship_generation(), Some(1));
     drop(state); drop(cell);
     assert!(table.execute_imports(handle, ImportsCommand::Step { generation: 2 }, || false).is_err());
-    assert_eq!(number(page(&table, handle, 1, AtlasImportDirection::Incoming, Some(b"src/child.rs")).unwrap().as_str(), "matching_links"), 1);
+    assert_eq!(number(page(&table, handle, 1, AtlasImportDirection::Incoming, Some(b"src/child.rs")).unwrap().as_str(), "matching_links"), 2);
     assert!(table.execute_imports(handle, ImportsCommand::Begin { generation: 2, index_generation: 1,
         max_imports: 100, max_parse_bytes: 65536 }, || false).is_err());
     assert!(table.execute_imports(handle, ImportsCommand::Begin { generation: 3, index_generation: 999,
@@ -184,7 +186,9 @@ fn markdown_import_and_search_generations_remain_independent_across_cancellation
 #[test]
 fn unresolved_imports_are_readable_evidence_and_occupied_receivers_preserve_their_source() {
     let table = AtlasSessions::new(); let readers = ReaderSessions::new();
-    let (handle, _) = standard(&table); begin(&table, handle, 1); finish(&table, handle, 1);
+    let source = b"mod child;\nuse external_crate::Child;\n";
+    let (handle, _) = open(&table, &[("src/lib.rs", source), ("src/child.rs", CHILD)]);
+    begin(&table, handle, 1); finish(&table, handle, 1);
     let reader = readers.create().unwrap();
     for id in [0, 2, 999] {
         assert!(table.open_import_reader(handle, &readers, reader, 1, id, AtlasImportSide::Target, || false).is_err());
@@ -194,8 +198,8 @@ fn unresolved_imports_are_readable_evidence_and_occupied_receivers_preserve_thei
     assert!(receipt.as_str().contains("\"resolution_basis\":\"unresolved-rust-use\""));
     assert_eq!(table.open_import_reader(handle, &readers, reader, 1, 1, AtlasImportSide::Target, || false).err(),
         Some(AccessError::Reader(reader_sessions::AccessError::AlreadyOpen)));
-    let retained = readers.execute(reader, ReaderCommand::CopyRange { start: 0, end: SOURCE.len() as u64 }, || false).unwrap();
-    assert!(retained.as_str().contains(&hex(SOURCE)));
+    let retained = readers.execute(reader, ReaderCommand::CopyRange { start: 0, end: source.len() as u64 }, || false).unwrap();
+    assert!(retained.as_str().contains(&hex(source)));
     readers.close(reader).unwrap(); table.close(handle).unwrap();
 }
 
@@ -210,7 +214,7 @@ fn zero_parse_allowance_is_partial_and_retry_can_find_the_import() {
     let incoming = page(&table, handle, 1, AtlasImportDirection::Incoming, Some(b"src/child.rs")).unwrap();
     assert!(incoming.as_str().contains("\"relationships_complete\":false"));
     begin(&table, handle, 2); finish(&table, handle, 2);
-    assert_eq!(number(page(&table, handle, 2, AtlasImportDirection::Incoming, Some(b"src/child.rs")).unwrap().as_str(), "matching_links"), 1);
+    assert_eq!(number(page(&table, handle, 2, AtlasImportDirection::Incoming, Some(b"src/child.rs")).unwrap().as_str(), "matching_links"), 2);
     table.close(handle).unwrap();
 }
 

@@ -15,11 +15,14 @@ fn take(pointer: *mut c_char) -> String {
     unsafe { crate::fcb_free_string(pointer) }; value
 }
 fn workspace() -> (PathBuf, u64) {
+    workspace_source(SOURCE)
+}
+fn workspace_source(source: &[u8]) -> (PathBuf, u64) {
     let root = std::env::temp_dir().join(format!("fcb-atlas-imports-c-{}-{}", std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("README.md"), b"[source](src/lib.rs)\n").unwrap();
-    fs::write(root.join("src/lib.rs"), SOURCE).unwrap();
+    fs::write(root.join("src/lib.rs"), source).unwrap();
     fs::write(root.join("src/child.rs"), CHILD).unwrap();
     let handle = fcb_atlas_create(); assert_ne!(handle, 0);
     let text = CString::new(root.to_str().unwrap()).unwrap();
@@ -54,22 +57,26 @@ fn c_imports_open_exact_statement_and_target_from_frozen_captures() {
     assert!(finished.contains("\"compiler_resolved\":false"));
     assert!(finished.contains("\"semantic_complete\":false"));
     let path = CString::new(hex(b"src/child.rs")).unwrap();
-    let incoming = take(unsafe { fcb_atlas_imports_page(handle, 1, 2, path.as_ptr(), 0, 1) });
+    let incoming = take(unsafe { fcb_atlas_imports_page(handle, 1, 2, path.as_ptr(), 1, 1) });
+    assert_eq!(number(&incoming, "matching_links"), 2);
     assert_eq!(incoming.matches("\"link_id\":").count(), 1);
-    assert!(incoming.contains("\"lexical_import_kind\":\"rust-module\""), "{incoming}");
-    assert!(incoming.contains("\"resolution_basis\":\"rust-module-file-candidate\""));
+    assert!(incoming.contains("\"lexical_import_kind\":\"rust-use\""), "{incoming}");
+    assert!(incoming.contains("\"resolution_basis\":\"rust-use-module-prefix-candidate\""));
+    assert!(incoming.contains("\"resolver\":\"fcb-closed-catalog-imports-v3\""));
     assert!(incoming.contains("\"source_bytes_read\":\"0\""));
     let id = number(&incoming, "link_id");
     fs::write(root.join("src/lib.rs"), b"mod changed;\n").unwrap();
     fs::write(root.join("src/child.rs"), b"pub struct Changed;\n").unwrap();
     let evidence = fcb_reader_create(); let target = fcb_reader_create();
     assert_ne!(evidence, 0); assert_ne!(target, 0);
-    let start = SOURCE.windows(b"mod child;".len()).position(|w| w == b"mod child;").unwrap() as u64;
+    let statement = b"use crate::child::Child;";
+    let start = SOURCE.windows(statement.len()).position(|w| w == statement).unwrap() as u64;
     for (reader, side, expected) in [(evidence, 0, start), (target, 1, 0)] {
         let receipt = take(fcb_atlas_imports_open_reader(handle, reader, 1, id, side));
         assert!(receipt.contains("\"command\":\"imports-open-reader\""), "{receipt}");
         assert!(receipt.contains("\"relationship\":{") && receipt.contains("\"evidence_precision\":\"exact-import-source-range\""));
         assert!(receipt.contains("\"source_reopened\":false"));
+        assert!(receipt.contains("\"resolution_basis\":\"rust-use-module-prefix-candidate\""));
         assert_eq!(number(&receipt, "initial_original_offset"), expected);
         assert!(receipt.contains(&format!("\"reader_owner\":\"{reader}\"")));
     }
@@ -86,7 +93,9 @@ fn c_imports_open_exact_statement_and_target_from_frozen_captures() {
 
 #[test]
 fn c_import_path_limits_and_unresolved_targets_do_not_install_live_readers() {
-    let _guard = FFI_TEST_LOCK.lock().unwrap(); let (_, handle) = workspace();
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let source = b"mod child;\nuse external_crate::Child;\n";
+    let (_, handle) = workspace_source(source);
     begin(handle, 1); finish(handle, 1);
     for path in ["", "0", "6A", "zz", "00", "2e2e2f7372632f6c69622e7273", "616273656e742e7273"] {
         let path = CString::new(path).unwrap();
@@ -101,15 +110,15 @@ fn c_import_path_limits_and_unresolved_targets_do_not_install_live_readers() {
             .contains("\"status\":\"error\""));
     }
     let reader = fcb_reader_create(); assert_ne!(reader, 0);
-    // The second row is a lexical Rust use statement whose binding is not resolved.
+    // A bare crate name has no local-catalog navigation authority.
     for (id, side) in [(0, 0), (999, 0), (1, 2), (2, 1)] {
         assert!(take(fcb_atlas_imports_open_reader(handle, reader, 1, id, side)).contains("\"status\":\"error\""));
         assert!(take(fcb_reader_info(reader)).contains("READER_HANDLE_NOT_OPEN"));
     }
     assert!(take(fcb_atlas_imports_open_reader(handle, reader, 1, 2, 0)).contains("\"status\":\"ok\""));
-    assert!(take(fcb_reader_copy_range(reader, 0, SOURCE.len() as u64)).contains(&hex(SOURCE)));
+    assert!(take(fcb_reader_copy_range(reader, 0, source.len() as u64)).contains(&hex(source)));
     assert!(take(fcb_atlas_imports_open_reader(handle, reader, 1, 1, 1)).contains("\"status\":\"error\""));
-    assert!(take(fcb_reader_copy_range(reader, 0, SOURCE.len() as u64)).contains(&hex(SOURCE)));
+    assert!(take(fcb_reader_copy_range(reader, 0, source.len() as u64)).contains(&hex(source)));
     assert_eq!(fcb_reader_close(reader), 1); assert_eq!(fcb_atlas_close(handle), 1);
 }
 

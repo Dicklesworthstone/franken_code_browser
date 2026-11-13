@@ -29,7 +29,7 @@ private final class SavedImportFixture: @unchecked Sendable {
          "evidence_precision": "exact-import-source-range", "resolution_domain": "declared-catalog-candidates",
          "compiler_resolved": false, "semantic_complete": false,
          "extractor": "franken-markdown-d6fbd1d5/import-statements-v3",
-         "extraction_policy": "rust-use-tree-js-static-and-python-import-v3", "resolver": "fcb-closed-catalog-imports-v2"]
+         "extraction_policy": "rust-use-tree-js-static-and-python-import-v3", "resolver": "fcb-closed-catalog-imports-v3"]
     }
     func link(_ id: UInt64) -> [String: Any] {
         let target = base.members[id == 1 ? 3 : 4]
@@ -157,6 +157,85 @@ private final class SavedImportFixture: @unchecked Sendable {
     private static func reject(_ work: () throws -> Void) {
         do { try work(); preconditionFailure("forged import receipt accepted") } catch {}
     }
+    @MainActor private static func rustUseWire(_ fixture: SavedImportFixture, identity: AtlasSavedIdentity,
+        source: AtlasSavedReaderCapture, target: AtlasSavedReaderCapture) throws {
+        func decode(_ value: [String: Any]) throws -> AtlasSavedImports {
+            try AtlasSavedImports.decode(fixture.base.encode(value), identity: identity, generation: 1,
+                direction: .all, member: nil, start: 0, limit: 64)
+        }
+        let original = fixture.page(identity.owner, generation: 1)
+        let targetFields = ["target_member", "target_file_id", "target_path", "target_revision", "target_digest", "target_bytes"]
+        let localBases = ["rust-use-module-file-candidate", "rust-use-module-prefix-candidate"]
+        var previous: AtlasSavedImport?
+        for basis in localBases {
+            var value = original, rows = original["links"] as! [[String: Any]]
+            for i in rows.indices {
+                rows[i]["lexical_import_kind"] = "rust-use"
+                rows[i]["destination"] = basis == localBases[0] ? "crate::saved" : "crate::saved::Item"
+                rows[i]["resolution_basis"] = basis
+            }
+            value["links"] = rows
+            let page = try decode(value), link = page.links[0], unavailable = page.links[1]
+            precondition(link.canOpenTarget && link.targetMember == 3 && link.kind == "rust-use")
+            precondition(!unavailable.canOpenTarget && unavailable.targetMember == 4 && unavailable.targetDigest == nil)
+            precondition(link.resolutionLabel.contains("containing-module candidate") == (basis == localBases[1]))
+            precondition(unavailable.resolutionLabel.lowercased().contains("containing-module candidate") == (basis == localBases[1]))
+            let targetCapture = AtlasSavedReaderCapture(reader: target.reader, owner: target.owner, member: target.member,
+                origin: .importLink(generation: 1, link: link, side: .target), archiveIdentity: identity)
+            precondition(targetCapture.evidenceLabel.contains("containing-module candidate") == (basis == localBases[1]))
+            if basis == localBases[1] {
+                precondition(targetCapture.evidenceLabel.contains("imported item location and compiler resolution are not established"))
+            }
+            let evidenceCapture = AtlasSavedReaderCapture(reader: source.reader, owner: source.owner, member: source.member,
+                origin: .importLink(generation: 1, link: link, side: .evidence), archiveIdentity: identity)
+            precondition(evidenceCapture.evidenceLabel.contains("exact statement bytes \(link.evidence.start)..<\(link.evidence.end)")
+                && evidenceCapture.evidenceLabel.contains("specifier bytes \(link.specifier.start)..<\(link.specifier.end)"))
+            if let previous { precondition(!link.matches(previous), "Module prefix evidence cannot replace a module file receipt") }
+            previous = link
+            for (language, kind) in [("rust", "rust-module"), ("python", "python-from"),
+                ("javascript", "javascript-import"), ("typescript", "javascript-export"),
+                ("jsx", "javascript-import"), ("tsx", "javascript-export")] {
+                var bad = value, changed = rows
+                changed[0]["language"] = language; changed[0]["lexical_import_kind"] = kind
+                bad["links"] = changed; reject { _ = try decode(bad) }
+            }
+            for resolution in ["missing", "ambiguous", "external", "unresolved"] {
+                var bad = value, changed = rows
+                for i in changed.indices {
+                    changed[i]["resolution"] = resolution
+                    for field in targetFields { changed[i][field] = NSNull() }
+                }
+                bad["links"] = changed; reject { _ = try decode(bad) }
+            }
+            var old = value; old["resolver"] = "fcb-closed-catalog-imports-v2"
+            reject { _ = try decode(old) }
+        }
+        var ambiguous = original, rows = original["links"] as! [[String: Any]]
+        for i in rows.indices {
+            rows[i]["lexical_import_kind"] = "rust-use"; rows[i]["destination"] = "crate::saved"
+            rows[i]["resolution"] = "ambiguous"; rows[i]["resolution_basis"] = "ambiguous-rust-crate-root"
+            for field in targetFields { rows[i][field] = NSNull() }
+        }
+        ambiguous["links"] = rows
+        let refusedRoot = try decode(ambiguous).links[0]
+        precondition(!refusedRoot.canOpenTarget && refusedRoot.targetMember == nil && refusedRoot.targetPath == nil
+            && refusedRoot.resolutionLabel.contains("crate roots")
+            && refusedRoot.resolutionLabel.contains("no target was selected"))
+        for (language, kind) in [("rust", "rust-module"), ("python", "python-from"), ("javascript", "javascript-import")] {
+            var bad = ambiguous, changed = rows
+            changed[0]["language"] = language; changed[0]["lexical_import_kind"] = kind
+            bad["links"] = changed; reject { _ = try decode(bad) }
+        }
+        for resolution in ["missing", "external", "unresolved"] {
+            var bad = ambiguous, changed = rows
+            changed[0]["resolution"] = resolution; bad["links"] = changed
+            reject { _ = try decode(bad) }
+        }
+        var forgedTarget = original, targetRows = original["links"] as! [[String: Any]]
+        targetRows[0]["lexical_import_kind"] = "rust-use"
+        targetRows[0]["resolution_basis"] = "ambiguous-rust-crate-root"
+        forgedTarget["links"] = targetRows; reject { _ = try decode(forgedTarget) }
+    }
     @MainActor static func main() async throws {
         let f = SavedImportFixture()
         let browser = AtlasSavedRepositoryModel(transport: f.transport)
@@ -208,6 +287,7 @@ private final class SavedImportFixture: @unchecked Sendable {
         precondition(source.member.id == 1 && source.reader.page?.start == 74 && source.reader.page?.identity.pathBytes == f.base.rawPath)
         let target = try await browser.openImport(link, from: first, side: .target, readerTransport: f.base.readerTransport())
         precondition(target.member.id == 3 && target.reader.page?.start == 0 && target.reader.page?.identity.encoding == "utf16be")
+        try rustUseWire(f, identity: identity, source: source, target: target)
         f.corrupt("reader-many-calls")
         let retried = try await browser.openImport(link, from: first, side: .evidence, readerTransport: f.base.readerTransport())
         precondition(retried.reader.canPin); retried.reader.close()

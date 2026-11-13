@@ -5,6 +5,8 @@
 //! A local target is a navigable lexical candidate, not compiler resolution.
 use super::{ImportFact, ImportKind, ImportLanguage};
 
+mod rust;
+
 pub const MAX_IMPORT_RESOLUTION_PATH_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,9 +43,12 @@ impl<T> ImportResolution<T> {
 /// JavaScript/TypeScript uses the exact relative filename first. If absent and
 /// extensionless, a finite set of source extensions and index files is admitted
 /// only when exactly one path exists. Rust uses conventional file modules for
-/// a top-level external mod; use, attributes and unmodeled scopes remain
-/// unresolved. Multiple matching paths are ambiguous even if a callback maps
-/// them to the same target identity. No extension preference is inferred.
+/// a top-level external mod. Eligible qualified use leaves navigate conventional
+/// module files through the bounded policy in `rust`; a remaining item suffix
+/// is explicitly a module-prefix candidate, never a definition location.
+/// Attributes and unmodeled source scopes remain unresolved. Multiple matching
+/// paths are ambiguous even if a callback maps them to the same target identity.
+/// No extension preference is inferred.
 /// Python admits only explicit relative module candidates: leading dots climb
 /// the source directory, then dotted names become components, with .py and
 /// /__init__.py as the complete finite set. Absolute imports remain external;
@@ -56,7 +61,7 @@ pub fn resolve_import<T: Copy + Eq>(
         return ImportResolution::without(Unresolved, "unsupported-specifier");
     }
     if fact.kind() == ImportKind::RustUse {
-        return ImportResolution::without(Unresolved, "unresolved-rust-use");
+        return rust::resolve_use(source_path, fact, &mut lookup);
     }
     let destination = fact.destination();
     if !fact.resolution_allowed() || destination.is_empty()

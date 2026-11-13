@@ -369,6 +369,9 @@ final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
         case .importLink(_, let link, .evidence):
             return "\(link.label) · exact statement bytes \(link.evidence.start)..<\(link.evidence.end) · specifier bytes \(link.specifier.start)..<\(link.specifier.end)"
         case .importLink(_, let link, .target):
+            if link.resolutionBasis == "rust-use-module-prefix-candidate" {
+                return "Saved containing-module candidate for \(link.destination) · imported item location and compiler resolution are not established"
+            }
             return "Saved catalog candidate for \(link.destination) · \(link.resolutionBasis) · lexical relationship, not compiler resolution"
         case .hit(let generation, _, let hit, let caseSensitive):
             return "Saved search \(generation), occurrence \(hit.id) · \(caseSensitive ? "match case" : "Unicode lowercase matching") · original bytes \(hit.start)..<\(hit.end)"

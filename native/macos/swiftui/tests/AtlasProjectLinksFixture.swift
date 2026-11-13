@@ -194,7 +194,7 @@ extension ProjectLinksFixture {
     static var importProof: [String: Any] {
         ["projection": "lexical-source-imports", "relationship_kind": "lexical-import",
          "evidence_precision": "exact-import-source-range", "extractor": "franken-markdown-d6fbd1d5/import-statements-v3",
-         "resolver": "fcb-closed-catalog-imports-v2", "extraction_policy": "rust-use-tree-js-static-and-python-import-v3",
+         "resolver": "fcb-closed-catalog-imports-v3", "extraction_policy": "rust-use-tree-js-static-and-python-import-v3",
          "compiler_resolved": false, "semantic_complete": false]
     }
     static func importRow(_ id: UInt64) -> [String: Any] {
