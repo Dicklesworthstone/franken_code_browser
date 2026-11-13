@@ -11,6 +11,43 @@ From the repository root on macOS 14+:
 To inspect a built app before installation, run `APP="$(./scripts/build_macos_app.sh)"`,
 then `open "$APP"` and `./scripts/install_macos_app.sh "$APP"` if desired.
 
+## Open files and project folders
+
+Use **File → Open…** (**Command-O**), the toolbar **Open** button, Finder's
+**Open With**, or drop one local file or folder onto the main window. A folder
+uses the existing project access and progressive catalog workflow. A file opens
+in an independent **Selected File** reader, with retained source pages, Find,
+Outline, Markdown and original-byte selection/copy. Opening a file leaves the
+current project available. The app registers as an alternate viewer for text,
+source-code files and folders; it does not take over default file associations.
+
+The file route captures at most **32 MiB**. Larger files can be read through the
+existing **Project Files → Range Reader** after explicitly choosing their
+project folder. Symbolic links, special files, remote URLs, multiple items and
+paths that cannot be represented losslessly as UTF-8 are refused. Use the
+project catalog's native path support for filenames outside this entry point's
+UTF-8 contract.
+
+In sandboxed builds, the selected file has its own in-memory, read-only native
+grant. Its containing folder is only a path component: it is not authorized,
+remembered as a project, scanned, or used to load neighboring Markdown images
+or links. **Open Project Folder…** makes that broader choice explicit.
+**Refresh from Disk** retains the original file-only scope.
+
+Only one opening operation and one newest pending choice are admitted per
+window. Typed file-URL drop providers have their own one-active/one-pending
+admission and stay retained through canceled callbacks. Canceling, closing or making a newer choice fences late panel/drop and
+worker results. A replacement file appears only after its first captured page
+validates; failure preserves the current retained reader. Finder events route
+to one existing window, or wait for a window on launch/reopen.
+
+The focused regression entry point is
+[swiftui/tests/test-native-open.sh](swiftui/tests/test-native-open.sh).
+It exercises production intake/routing and reader models with controlled
+transports. SwiftUI typechecking, actual Finder/drop delivery, security-scoped
+grants and physical-Mac interaction still require the independent native
+qualification lane; these fixtures do not constitute a rendered-product pass.
+
 ## City view
 
 After preparing a text atlas, choose **City** in the toolbar. The City uses the

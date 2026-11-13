@@ -301,6 +301,16 @@ fn snapshot_export_receipts_lifetimes_and_bridge() {
 }
 
 #[test]
+fn native_file_folder_intake_and_selected_reader() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    checked(
+        Command::new("/bin/sh")
+            .current_dir(&root)
+            .arg("swiftui/tests/test-native-open.sh"),
+    );
+}
+
+#[test]
 fn observed_range_reader_contracts_and_bridge() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     checked(

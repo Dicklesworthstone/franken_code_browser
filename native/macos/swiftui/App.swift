@@ -8,6 +8,7 @@
 // uses.
 
 import SwiftUI
+import UniformTypeIdentifiers
 import AppKit
 import CoreText
 
@@ -230,6 +231,14 @@ private struct AtlasFrozenViewportSearch: Sendable {
     @State private var root = ""
     @State private var projectStartup = AtlasProjectStartup()
 #endif
+    @State private var nativeOpen = AtlasNativeOpen<AtlasPagedReaderModel>.native()
+    @State private var nativeDrop = AtlasNativeDrop<NSItemProvider> { provider, complete in
+        provider.loadObject(ofClass: NSURL.self) { value, _ in
+            if let value = value as? NSURL { complete(.success(value as URL)) }
+            else { complete(.failure(.invalidSelection)) }
+        }
+    }
+    @Environment(\.openWindow) private var openWindow
     @State private var query = ""
     @FocusState private var searchFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -490,7 +499,17 @@ private struct AtlasFrozenViewportSearch: Sendable {
         }
         .frame(minWidth: 1180, minHeight: 740)
         .background(AtlasDeskCloseProtection(model: readingDesk, review: reviewReadingDeskBeforeClosing))
+        .background(AtlasNativeOpenWindow(model: nativeOpen,
+            newWindow: { [openWindow] in openWindow(id: "browser") }, receive: receiveNativeOpen))
+        .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil, perform: acceptNativeDrop)
+        .safeAreaInset(edge: .bottom) {
+            if !nativeOpen.showsReader { AtlasNativeOpenStatus(model: nativeOpen) }
+        }
         .toolbar {
+            Button { chooseNativeItem(allowFiles: true) } label: {
+                Label("Open", systemImage: "folder.badge.plus")
+            }
+            .help("Open one file or project folder (⌘O)")
             Button {
                 showsSidebar = true
                 searchFocused = true
@@ -560,6 +579,12 @@ private struct AtlasFrozenViewportSearch: Sendable {
             .disabled(!searchIsCurrent || hits.isEmpty)
             .help("Next search match (⌘G)")
         }
+        .sheet(isPresented: $nativeOpen.showsReader) {
+            if let presentation = nativeOpen.presentationID {
+                AtlasNativeOpenView(model: nativeOpen, presentationID: presentation,
+                    chooseProject: chooseProject).id(presentation)
+            }
+        }
         .sheet(isPresented: $showsFileFinder, onDismiss: finishReadingDeskReview) { fileFinderSheet }
         .sheet(isPresented: $showsReadingDesk) { AtlasReadingDeskView(model: readingDesk, project: projectBrowser) }
         .sheet(isPresented: $showsSavedRepository, onDismiss: finishReadingDeskReview) {
@@ -585,6 +610,8 @@ private struct AtlasFrozenViewportSearch: Sendable {
         }
         .onAppear {
             projectViewActive = true
+            nativeOpen.cancelExternal = { [weak nativeDrop] in nativeDrop?.cancel() }
+            nativeOpen.activate()
 #if FCB_APP_STORE
             if rootAccess != nil { requestAtlasLoad() }
             else if !appStoreStartupConsumed {
@@ -612,9 +639,11 @@ private struct AtlasFrozenViewportSearch: Sendable {
             }
             if !root.isEmpty { requestAtlasLoad() }
 #endif
+            AtlasNativeOpenRouting.shared.flush(createWindow: false)
         }
         .onDisappear {
             projectViewActive = false
+            nativeOpen.close()
             projectRefresh.cancel()
             refreshOriginProject = nil
             projectViewIdentity = UUID()
@@ -2670,6 +2699,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
 
 #if FCB_APP_STORE
     private func activateProject(_ access: AppStoreRootAccess) {
+        nativeOpen.closeReader()
         // Replacing the native grant revokes this window's pin deliveries even
         // when the newly authorized folder happens to have the same path.
         projectChanges.close()
@@ -2685,6 +2715,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     }
 
     private func restoreProject(_ path: String) {
+        nativeOpen.reserve()
         guard let request = AppStoreRootAccess.restorationRequest(path) else {
             rootAccessLoader.cancel()
             status = "Saved project access is unavailable. Choose the folder again to restore it."
@@ -2707,6 +2738,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     }
 #else
     private func setRoot(_ newRoot: String) {
+        nativeOpen.closeReader()
         projectChanges.close()
         root = newRoot
         UserDefaults.standard.set(newRoot, forKey: "fcb.root")
@@ -2719,33 +2751,90 @@ private struct AtlasFrozenViewportSearch: Sendable {
     }
 #endif
 
-    private func chooseProject() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.directoryURL = root.isEmpty ? FileManager.default.homeDirectoryForCurrentUser : URL(fileURLWithPath: root)
-        panel.message = "Choose the project root to lay out and browse"
+    private func chooseProject() { chooseNativeItem(allowFiles: false) }
+
+    private func receiveNativeOpen(_ event: AtlasNativeOpenRouting.Event) {
+        switch event {
+        case .choose: chooseNativeItem(allowFiles: true)
+        case .open(let url): openNativeItem([url], origin: .external)
+        case .invalid: nativeOpen.reject(AtlasNativeOpenError.invalidSelection.message)
+        }
+    }
+
+    private func openNativeItem(_ urls: [URL], origin: AtlasNativeOpenOrigin, ifCurrent ticket: UUID? = nil) {
+        guard projectViewActive, ticket == nil || nativeOpen.accepts(ticket!) else { return }
 #if FCB_APP_STORE
-        // A late panel callback cannot reopen a closed window or replace a
-        // newer choice. Its adopted native grant still drains exactly once.
-        let accessIntent = rootAccessLoader.cancel()
+        rootAccessLoader.cancel()
 #endif
-        panel.begin { response in
-            guard response == .OK, let url = panel.url else { return }
+        nativeOpen.open(urls, origin: origin, ifCurrent: ticket) { target in
+            guard case .folder(let selected) = target else { return }
 #if FCB_APP_STORE
-            let selection = AppStoreRootAccess.selectionRequest(url)
-            guard rootAccessLoader.accepts(accessIntent) else { return }
-            guard let (request, selectionLease) = selection else {
-                status = "Could not retain read access to this folder. Choose it again."
-                return
-            }
-            requestRootAccess(request, ifCurrent: accessIntent, keepingAlive: [selectionLease])
+            activateProject(selected)
 #else
-            setRoot(url.path)
+            setRoot(selected.path)
 #endif
         }
     }
+
+    private func chooseNativeItem(allowFiles: Bool) {
+        guard projectViewActive else { return }
+        let intent = nativeOpen.reserve()
+#if FCB_APP_STORE
+        rootAccessLoader.cancel()
+#endif
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = allowFiles
+        panel.allowsMultipleSelection = false
+        panel.resolvesAliases = false
+        panel.directoryURL = root.isEmpty ? FileManager.default.homeDirectoryForCurrentUser : URL(fileURLWithPath: root)
+        panel.message = allowFiles
+            ? "Open one file for reading, or choose a project folder to browse"
+            : "Choose the project root to lay out and browse"
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            guard projectViewActive, nativeOpen.accepts(intent) else {
+#if FCB_APP_STORE
+                // Drain the panel's automatically started grant even when its
+                // callback belongs to an older choice or a closed window.
+                _ = AppStoreRootAccess.selectionRequest(url)
+#endif
+                return
+            }
+            guard AtlasNativeOpenRequest.selectedURL([url]) != nil else {
+#if FCB_APP_STORE
+                _ = AppStoreRootAccess.selectionRequest(url)
+#endif
+                nativeOpen.reject(AtlasNativeOpenError.invalidSelection.message)
+                return
+            }
+            openNativeItem([url], origin: .panel, ifCurrent: intent)
+        }
+    }
+
+    private func acceptNativeDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard projectViewActive, providers.count == 1, let provider = providers.first,
+              provider.canLoadObject(ofClass: NSURL.self) else {
+            nativeOpen.reject(AtlasNativeOpenError.invalidSelection.message)
+            return false
+        }
+        let intent = nativeOpen.reserve()
+#if FCB_APP_STORE
+        rootAccessLoader.cancel()
+#endif
+        nativeOpen.waitForDrop(intent)
+        nativeDrop.submit(provider) { result in
+            guard projectViewActive, nativeOpen.accepts(intent) else { return }
+            guard case .success(let url) = result,
+                  AtlasNativeOpenRequest.selectedURL([url]) != nil else {
+                nativeOpen.rejectDrop(intent)
+                return
+            }
+            openNativeItem([url], origin: .external, ifCurrent: intent)
+        }
+        return true
+    }
+
 }
 
 // MARK: - Atlas canvas (display-link driven, text at every zoom)
@@ -3060,17 +3149,24 @@ struct AtlasInputOverlay: NSViewRepresentable {
 
 // MARK: - App
 
+extension AtlasDeskApplicationDelegate {
+    func application(_ application: NSApplication, open urls: [URL]) {
+        AtlasNativeOpenRouting.shared.open(urls)
+    }
+}
+
 @main
 @MainActor struct FrankenCodeBrowserApp: App {
     @NSApplicationDelegateAdaptor(AtlasDeskApplicationDelegate.self) private var applicationDelegate
     @AppStorage("fcb.appearance") private var appearance = AtlasAppearancePreference.system.rawValue
     @AppStorage("fcb.increasedContrast") private var increasedContrast = false
     var body: some Scene {
-        WindowGroup("FrankenCodeBrowser") {
+        WindowGroup("FrankenCodeBrowser", id: "browser") {
             ContentView()
                 .preferredColorScheme((AtlasAppearancePreference(rawValue: appearance) ?? .system).colorScheme)
         }
         .commands {
+            AtlasNativeOpenCommands()
             CommandMenu("Appearance") {
                 Picker("Appearance", selection: $appearance) {
                     ForEach(AtlasAppearancePreference.allCases) { preference in

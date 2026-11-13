@@ -482,6 +482,38 @@ import Observation
         }
     }
 
+    /// Open one explicitly authorized file without creating parent-directory
+    /// authority. This initializer is transactional for its host: only a new,
+    /// empty model may use it and the host publishes it after successful return.
+    /// Refresh and forks retain this exact path/lease, with no local image root.
+    func openSelectedFile(input: AtlasReaderInput, accessLease: AnyObject?) async throws {
+        try Task.checkCancellation()
+        guard page == nil, !busy, capturedTarget == nil, suppliedSource == nil else {
+            throw AtlasReaderError.unavailable
+        }
+        let ticket = begin()
+        notice = "Capturing the selected file for bounded page navigation…"
+        do {
+            let replacement = try await coordinator.stageOpen(input: input, accessLease: accessLease)
+            try Task.checkCancellation()
+            guard operation == ticket else { throw AtlasReaderError.canceled }
+            let opened = try coordinator.commitOpen(replacement)
+            refreshInput = input
+            refreshImageSource = nil
+            refreshAccessLease = accessLease
+            install(opened, request: .firstPage)
+            finish(ticket)
+            notice = "Opened the selected file. Reading nearby files requires a separate project-folder choice."
+        } catch {
+            if operation == ticket {
+                coordinator.close()
+                refreshInput = nil; refreshImageSource = nil; refreshAccessLease = nil
+                fail(error, ticket: ticket)
+            }
+            throw error
+        }
+    }
+
     /// Initialize a new model from retained service data without creating a
     /// live-path refresh capability. The host owns the ready model on success;
     /// ordinary view appearance must not call open(root:path:) afterward.
