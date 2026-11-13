@@ -576,3 +576,91 @@ no substring posting index.
 The existing `fcb symbols SAVED.fcbs --snapshot` interface remains available
 for saved outlines and reference candidates. This unified command additionally
 provides repository-wide heading search and trusted-catalog opening.
+
+## Count saved expression matches
+
+Saved expression search can count every primary occurrence after applying its
+whole-member required, excluded, and path predicates:
+
+```sh
+fcb snapshot search saved.fcbs --query 'needle required -excluded path:src/' --count-all --max-matches 0 --json
+```
+
+Here `needle` supplies the occurrences being counted; `required`, `-excluded`
+and `path:src/` decide which members qualify. The retained-hit limit is
+independent of counting: zero retains no rows, while a positive
+`--max-matches` keeps that many exact witnesses and continues counting.
+Source and work allowances, unavailable members, archive discovery, and the
+reported completeness fields remain authoritative. `--count-all` does not
+turn a partial scan into a complete count or widen its budgets.
+
+## Build a saved repository search index in the host
+
+`SavedRepositorySession::build_index(operation, destination, limits, canceled)`
+creates a new FCBD index directly from the archive handle that the session
+already owns. Renaming or replacing the archive pathname cannot redirect this
+build to different source. Each loaded member is verified against the retained
+archive directory before the existing `SnapshotIndex::build`, `invert` and
+`encode_paged` engines use its bytes. No live workspace source is opened.
+
+`SavedIndexBuildLimits` makes the work explicit: `max_file_bytes` is at most
+256 KiB, `max_source_bytes` is at most 64 MiB across all attempted member loads,
+and `max_grams` is at most 2,097,152 retained file/gram entries. Those ceilings
+are also the defaults. Per-file grams remain capped at 65,536, scratch at
+1 MiB, and the final FCBD artifact at 24 MiB. Zero quotas are accepted;
+refused files remain present as uncovered records. One member is loaded at a
+time, but construction, inversion and encoding use the bounded resident
+production builder. This is not an out-of-core sort or an incremental store.
+Old attached indexes, accepted queries, and previous build receipts stay
+charged while a replacement build is admitted.
+
+The destination must be a new file. The shared create-only writer requests
+mode 0600 on Unix, never overwrites or deletes an existing file, and reports
+the actual bytes written plus file and parent-directory sync progress. A
+partial or canceled output remains at the chosen destination for inspection.
+The artifact is source-derived sensitive data and is not encrypted. Sync
+requests do not establish power-loss qualification.
+
+A terminal build returns `fcb.saved-repository/1`, `command: "index-build"`,
+the session/archive identity, `operation`, exact destination bytes, requested
+limits, member-read accounting, coverage counts, `index_pin`, and the write
+effect. The trusted pin comes from the production encoder and has
+`index_pin_scope: "page-manifest-envelope-sha256"`; it is not a hash supplied
+by the file being opened. `coverage_complete` requires complete archive
+discovery and no unavailable or uncovered members. Limited coverage is a
+valid partial build: ordinary searches still verify candidates and directly
+scan members that the index cannot safely exclude.
+
+Build operations have their own strictly increasing identity, independent of
+index-attachment and query generations. `info` exposes
+`last_index_build_attempt` and nullable `last_index_build_operation`. One
+terminal receipt is retained by the session, including write failures and
+cancellation. `index_build_receipt(operation, canceled)` returns the same
+immutable receipt without rerunning construction, reading the destination,
+or loading any source. Invalid, stale, or pre-admission failed requests leave
+the prior receipt available; a newer admitted terminal operation replaces it.
+The receipt belongs to this live saved session and is not a durable journal.
+
+The host must reconcile a canceled or lost response through receipt lookup,
+never by automatically repeating the write. Receipt storage and the initial
+reply are admitted before publication. Once the writer returns, the host
+retains the terminal effect before encoding or transport can fail, and no
+late cancellation gate may replace that outcome. The effects distinguish
+no create, an incomplete created file, complete bytes with sync unconfirmed,
+completed file sync, and completed file plus parent sync.
+
+Building leaves the attached index, accepted query, and retained readers
+unchanged. Attachment is a separate explicit
+`attach_index(generation, destination, trusted_pin, canceled)` action.
+`attach_eligible` is true only after the complete artifact bytes were written;
+it can remain true when a later sync or cancellation caused `status: "error"`.
+Attachment still validates the current destination against the retained pin
+and archive identity before accepting it. A failed or incomplete build never
+becomes an attached index by implication.
+
+`tests/saved_repository_index_build.rs` adds host regressions for retained
+archive identity, raw destination names, partial coverage and direct-scan
+fallback, exclusive writes, operation/receipt ownership, lost replies,
+short and complete canceled writes, source damage, and every observed
+construction/publication cancellation boundary. This implementation is
+code-first; independent executable verification remains pending.

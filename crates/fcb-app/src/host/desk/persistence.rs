@@ -185,6 +185,13 @@ pub(super) fn checked_path(path: &Path) -> Result<PathBuf, CheckpointIoError> {
 /// deletes a destination or turns a partial effect into an alleged rollback.
 pub(super) fn publish_new_payload(destination: &Path, bytes: &[u8], outcome: &mut CheckpointSave,
     canceled: &mut impl FnMut() -> bool) -> Result<(), CheckpointIoError> {
+    publish_new_bytes(destination, bytes, &mut outcome.effect, &mut outcome.bytes_written, canceled)
+}
+/// The same create-only writer for other explicitly requested host artifacts.
+/// Callers retain their own operation identity and terminal receipt. This helper
+/// reports effects through borrowed counters even when it returns an error.
+pub(crate) fn publish_new_bytes(destination: &Path, bytes: &[u8], effect: &mut CheckpointSaveEffect,
+    bytes_written: &mut u64, canceled: &mut impl FnMut() -> bool) -> Result<(), CheckpointIoError> {
     let parent = File::open(destination.parent().ok_or(CheckpointIoError::InvalidPath)?)
         .map_err(|_| CheckpointIoError::Io)?;
     if !parent.metadata().map_err(|_| CheckpointIoError::Io)?.is_dir() { return Err(CheckpointIoError::InvalidPath); }
@@ -194,18 +201,23 @@ pub(super) fn publish_new_payload(destination: &Path, bytes: &[u8], outcome: &mu
     let mut file = options.open(destination).map_err(|e| if e.kind() == io::ErrorKind::AlreadyExists {
         CheckpointIoError::DestinationExists
     } else { CheckpointIoError::Io })?;
-    outcome.effect = CheckpointSaveEffect::Created;
-    write_payload(&mut file, bytes, outcome, canceled)?;
+    *effect = CheckpointSaveEffect::Created;
+    write_bytes(&mut file, bytes, effect, bytes_written, canceled)?;
     stop(canceled)?;
     file.sync_all().map_err(|_| CheckpointIoError::Io)?;
-    outcome.effect = CheckpointSaveEffect::FileSynced;
+    *effect = CheckpointSaveEffect::FileSynced;
     stop(canceled)?;
     parent.sync_all().map_err(|_| CheckpointIoError::Io)?;
-    outcome.effect = CheckpointSaveEffect::DirectorySynced;
+    *effect = CheckpointSaveEffect::DirectorySynced;
     Ok(())
 }
+#[cfg(test)]
 fn write_payload(writer: &mut impl Write, bytes: &[u8], outcome: &mut CheckpointSave,
     canceled: &mut impl FnMut() -> bool) -> Result<(), CheckpointIoError> {
+    write_bytes(writer, bytes, &mut outcome.effect, &mut outcome.bytes_written, canceled)
+}
+fn write_bytes(writer: &mut impl Write, bytes: &[u8], effect: &mut CheckpointSaveEffect,
+    bytes_written: &mut u64, canceled: &mut impl FnMut() -> bool) -> Result<(), CheckpointIoError> {
     let mut at = 0usize; let mut calls = 0usize;
     while at < bytes.len() {
         stop(canceled)?;
@@ -213,12 +225,12 @@ fn write_payload(writer: &mut impl Write, bytes: &[u8], outcome: &mut Checkpoint
         calls += 1;
         let end = (at + IO_CHUNK).min(bytes.len());
         match writer.write(&bytes[at..end]) {
-            Ok(n) if n > 0 && n <= end - at => { at += n; outcome.bytes_written = at as u64; }
+            Ok(n) if n > 0 && n <= end - at => { at += n; *bytes_written = at as u64; }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             _ => return Err(CheckpointIoError::Io),
         }
     }
-    outcome.effect = CheckpointSaveEffect::Written;
+    *effect = CheckpointSaveEffect::Written;
     Ok(())
 }
 struct LoadedCheckpoint { bytes: Vec<u8>, _lease: ResourceLease }

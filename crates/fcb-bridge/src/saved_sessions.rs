@@ -11,6 +11,7 @@ use fcb_app::host::{HostResponse, saved_repository::{SavedRepositorySession, Sav
 use fcb_app::host::saved_repository::relationships::{SavedRelationshipError, RelationshipDirection, RelationshipSide};
 use fcb_app::host::saved_repository::imports::{SavedImportError, SavedImportDirection, SavedImportSide};
 use fcb_app::host::saved_repository::paths::SavedPathOptions;
+use fcb_app::host::saved_repository::index_build::SavedIndexBuildLimits;
 use fcb_app::host::saved_repository::desk::SavedDeskError;
 use fcb_app::host::saved_repository::structure::{StructureMode, SymbolNameMode};
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
@@ -73,6 +74,7 @@ impl AccessError {
 
 pub(super) enum Command<'a> {
     Info, Members { start: usize, limit: usize },
+    IndexBuildReceipt { operation: u64 },
     AttachIndex { generation: u64, path: &'a Path, pin: Sha256Digest },
     DetachIndex { generation: u64 },
     Search { generation: u64, needle: &'a str, limit: usize },
@@ -220,6 +222,8 @@ impl SavedSessions {
             Command::ClearPaths { generation } =>
                 session.clear_paths(generation, &mut stop).map_err(AccessError::from),
             Command::Info => session.info(&mut stop).map_err(AccessError::from),
+            Command::IndexBuildReceipt { operation } =>
+                session.index_build_receipt(operation, &mut stop).map_err(AccessError::from),
             Command::Members { start, limit } => session.members(start, limit, &mut stop).map_err(AccessError::from),
             Command::AttachIndex { generation, path, pin } => session.attach_index(generation, path, pin, &mut stop).map_err(AccessError::from),
             Command::DetachIndex { generation } => session.detach_index(generation, &mut stop).map_err(AccessError::from),
@@ -235,6 +239,21 @@ impl SavedSessions {
         // not roll back state. Info/results reconcile the known handle.
         cell.validate(epoch)?;
         result
+    }
+    /// A build can create a destination before cancellation/close arrives.
+    /// The host retains and returns an effect-bearing terminal receipt. Never
+    /// replace that receipt with a late handle error after the writer drains.
+    /// This cell/lock also retains the archive and capacity through that drain.
+    pub(super) fn build_index(&self, handle: u64, operation: u64,
+        destination: &Path, limits: SavedIndexBuildLimits,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        let cell = self.get(handle)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let mut state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        let session = state.as_mut().ok_or(AccessError::NotOpen)?;
+        let mut stop = || cell.validate(epoch).is_err() || canceled();
+        session.build_index(operation, destination, limits, &mut stop).map_err(AccessError::from)
     }
     /// Lock saved source before destination, both nonblocking. The existing
     /// reader registry admits an empty handle BEFORE any member read occurs.

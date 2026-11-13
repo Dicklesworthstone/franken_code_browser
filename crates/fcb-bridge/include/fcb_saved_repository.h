@@ -90,6 +90,47 @@ char *fcb_saved_attach_index(uint64_t handle, uint64_t generation,
     const char *path, const char *trusted_digest);
 char *fcb_saved_detach_index(uint64_t handle, uint64_t generation);
 
+/* Build FCBD from the already opened archive using the shared index engine.
+ * destination is an explicitly chosen, borrowed NUL-terminated UTF-8 path.
+ * Creation is exclusive: no overwrite, rename, retry or deletion of output.
+ * Retain the selected output write grant until the entered worker call drains.
+ * Limits (also defaults): max_file_bytes <=262144, max_source_bytes <=67108864,
+ * max_grams <=2097152. Zero is allowed and can leave explicit uncovered members.
+ * Per-member grams <=65536, scratch <=1048576, encoded FCBD <=25165824 bytes.
+ * A separate increasing build operation is consumed before admission, even on
+ * preadmission failure. Building does not change accepted index/query state.
+ *
+ * A terminal index-build receipt is retained before delivery, including write
+ * failures/cancellation. effect distinguishes none, destination-created-incomplete,
+ * complete-file-sync-unconfirmed, complete-file-sync-requested, and
+ * complete-file-and-parent-sync-requested. bytes_written and index_bytes are
+ * separate; success alone does not certify whole-source coverage or power-loss
+ * durability. The output is source-derived sensitive data and is not encrypted.
+ *
+ * A complete artifact can be attach_eligible even after cancellation or a sync
+ * error. index_pin is the trusted build-time page-manifest-envelope digest;
+ * attach explicitly with fcb_saved_attach_index to revalidate the chosen file.
+ * No automatic attachment occurs. Never infer a trusted pin from input bytes.
+ *
+ * Cancellation/close after a write must not hide the receipt returned by the
+ * entered call. Null or an unparseable reply does not prove no write occurred.
+ * Keep the saved handle open and recover the same operation with receipt();
+ * do not retry the write. Only the latest admitted terminal receipt is kept.
+ * info exposes last_index_build_attempt and nullable last_index_build_operation.
+ * Receipt replay is immutable and reads neither member nor destination bytes.
+ * The optional poll runs only on the calling thread, must not block/unwind or
+ * reenter the bridge, and returns nonzero to cancel. Null means no callback.
+ * context and all borrowed input must remain valid until the call returns.
+ */
+char *fcb_saved_build_index(uint64_t handle, uint64_t operation,
+    const char *destination, uint64_t max_file_bytes,
+    uint64_t max_source_bytes, uint64_t max_grams);
+char *fcb_saved_build_index_cancelable(uint64_t handle, uint64_t operation,
+    const char *destination, uint64_t max_file_bytes,
+    uint64_t max_source_bytes, uint64_t max_grams,
+    int32_t (*poll)(void *), void *context);
+char *fcb_saved_index_build_receipt(uint64_t handle, uint64_t operation);
+
 /* Case-sensitive decoded literal (1..1024 UTF-8 bytes), NOT query syntax.
  * max_matches 1..4096. Uses direct saved-source scanning without an index;
  * attached indexes use rarest posting candidates plus exact source verification.

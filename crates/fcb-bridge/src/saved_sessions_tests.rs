@@ -156,6 +156,51 @@ fn close_during_work_retains_capacity_until_its_archive_owner_drains() {
 }
 
 #[test]
+fn cancel_after_index_destination_creation_delivers_recoverable_write_effect() {
+    let f = fixture(b"needle"); let table = SavedSessions::new(); let handle = open(&table, &f);
+    attach(&table, handle, &f); query(&table, handle, 1, "needle");
+    let destination = f.path.with_extension("canceled.fcbd");
+    let mut signaled = false;
+    let response = table.build_index(handle, 1, &destination, Default::default(), || {
+        if !signaled && destination.exists() {
+            table.cancel(handle).unwrap(); signaled = true; return true;
+        }
+        false
+    }).unwrap();
+    assert!(signaled);
+    assert!(response.as_str().contains("\"effect\":\"destination-created-incomplete\""));
+    assert!(response.as_str().contains("SAVED_INDEX_WRITE_CANCELED"));
+    assert_eq!(fs::metadata(&destination).unwrap().len(), 0);
+    assert_eq!(table.execute(handle, Command::IndexBuildReceipt { operation: 1 }, || false).unwrap().as_str(), response.as_str());
+    let info = table.execute(handle, Command::Info, || false).unwrap();
+    assert_eq!(number(info.as_str(), "accepted_index_generation"), 1);
+    assert_eq!(number(info.as_str(), "accepted_query_generation"), 1);
+    table.close(handle).unwrap();
+}
+
+#[test]
+fn close_during_index_write_keeps_effect_response_and_capacity_until_drain() {
+    let f = fixture(b"needle"); let table = SavedSessions::new(); let handle = open(&table, &f);
+    let rest: Vec<_> = (1..MAX_SAVED_SESSIONS).map(|_| table.create().unwrap()).collect();
+    let destination = f.path.with_extension("closed.fcbd");
+    let mut closed = false;
+    let response = table.build_index(handle, 1, &destination, Default::default(), || {
+        if !closed && destination.exists() {
+            table.close(handle).unwrap(); closed = true;
+            assert_eq!(table.create().err(), Some(AccessError::Capacity)); return true;
+        }
+        false
+    }).unwrap();
+    assert!(closed);
+    assert!(response.as_str().contains("\"effect\":\"destination-created-incomplete\""));
+    assert_eq!(number(response.as_str(), "bytes_written"), 0);
+    assert_eq!(fs::metadata(&destination).unwrap().len(), 0);
+    assert_eq!(table.execute(handle, Command::IndexBuildReceipt { operation: 1 }, || false).err(), Some(AccessError::Unknown));
+    let fresh = table.create().unwrap(); assert_ne!(fresh, handle);
+    table.close(fresh).unwrap(); for id in rest { table.close(id).unwrap(); }
+}
+
+#[test]
 fn archive_and_index_descriptors_can_move_to_an_explicit_host_worker() {
     let f = fixture(b"needle"); let table = SavedSessions::new(); let handle = open(&table, &f); attach(&table, handle, &f);
     fs::rename(&f.path, f.path.with_extension("moved")).unwrap();

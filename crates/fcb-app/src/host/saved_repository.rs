@@ -34,7 +34,7 @@ const INDEX_CACHE_PAGES: usize = 4;
 pub enum SavedRepositoryError {
     App(AppError), Archive(PagedSnapshotError), Query(PagedSearchError),
     Index(PagedPostingError), Reader(ReaderSessionError), Structure(StructureError),
-    InvalidLimits, MissingQuery, StaleQuery, MissingHit, StaleIndex,
+    InvalidLimits, MissingQuery, StaleQuery, MissingHit, StaleIndex, MissingIndexBuild, StaleIndexBuild,
     IdentityExhausted, Canceled,
 }
 impl SavedRepositoryError {
@@ -65,6 +65,8 @@ impl std::fmt::Display for SavedRepositoryError {
             Self::StaleQuery => f.write_str("SAVED_SESSION_STALE_QUERY"),
             Self::MissingHit => f.write_str("SAVED_SESSION_NO_HIT"),
             Self::StaleIndex => f.write_str("SAVED_SESSION_STALE_INDEX"),
+            Self::MissingIndexBuild => f.write_str("SAVED_SESSION_NO_INDEX_BUILD"),
+            Self::StaleIndexBuild => f.write_str("SAVED_SESSION_STALE_INDEX_BUILD"),
             Self::IdentityExhausted => f.write_str("SAVED_SESSION_IDENTITY_EXHAUSTED"),
             Self::Canceled => f.write_str("SAVED_SESSION_CANCELED"),
         }
@@ -93,6 +95,7 @@ struct AcceptedQuery {
 pub struct SavedRepositorySession {
     archive: PagedSnapshot<File>,
     index: Option<AcceptedIndex>,
+    index_build: Option<index_build::RetainedIndexBuild>,
     query: Option<AcceptedQuery>,
     expression: Option<desk::SavedExpression>,
     structure: Option<structure::AcceptedStructure>,
@@ -104,6 +107,7 @@ pub struct SavedRepositorySession {
     last_expression_attempt: u64,
     last_structure_attempt: u64,
     last_index_attempt: u64,
+    last_index_build_attempt: u64,
     last_relationship_attempt: u64,
     last_import_attempt: u64,
     last_path_attempt: u64,
@@ -130,9 +134,9 @@ impl SavedRepositorySession {
         if metadata.len() > limits.max_document_bytes as u64 { return Err(SavedRepositoryError::InvalidLimits); }
         let archive = PagedSnapshot::open(file, owner, limits, &budget, allocation(2)?, &mut canceled)?;
         check(&mut canceled)?;
-        Ok(Self { archive, index: None, query: None, expression: None, structure: None, relationships: None, imports: None, paths: None, path, last_query_attempt: 0,
+        Ok(Self { archive, index: None, index_build: None, query: None, expression: None, structure: None, relationships: None, imports: None, paths: None, path, last_query_attempt: 0,
             last_expression_attempt: 0, last_structure_attempt: 0,
-            last_index_attempt: 0, last_relationship_attempt: 0, last_import_attempt: 0, last_path_attempt: 0, next_allocation: 3, budget, _lease: lease })
+            last_index_attempt: 0, last_index_build_attempt: 0, last_relationship_attempt: 0, last_import_attempt: 0, last_path_attempt: 0, next_allocation: 3, budget, _lease: lease })
     }
     pub fn owner(&self) -> ArenaOwnerId { self.archive.directory().owner() }
     pub fn archive_digest(&self) -> Sha256Digest { self.archive.directory().digest() }
@@ -150,6 +154,8 @@ impl SavedRepositorySession {
         out.literal(",\"last_structure_attempt\":")?; out.integer(self.last_structure_attempt())?;
         out.literal(",\"accepted_index_generation\":")?; optional(&mut out, self.index_generation())?;
         out.literal(",\"last_index_attempt\":")?; out.integer(self.last_index_attempt)?;
+        out.literal(",\"last_index_build_attempt\":")?; out.integer(self.last_index_build_attempt())?;
+        out.literal(",\"last_index_build_operation\":")?; optional(&mut out, self.last_index_build_operation())?;
         out.literal(",\"accepted_relationship_generation\":")?; optional(&mut out, self.relationship_generation())?;
         out.literal(",\"accepted_import_generation\":")?; optional(&mut out, self.import_generation())?;
         out.literal(",\"last_import_attempt\":")?; out.integer(self.last_import_attempt())?;
@@ -550,6 +556,10 @@ pub use imports::{SavedImportDirection, SavedImportSide, SavedImportError};
 
 /// Metadata-only filename/path navigation over the closed saved directory.
 pub mod paths;
+
+/// Explicit create-only FCBD construction and retained write-effect receipts.
+pub mod index_build;
+pub use index_build::SavedIndexBuildLimits;
 
 /// Bounded symbol, Markdown heading and whole-token searches of saved members.
 pub mod structure;
