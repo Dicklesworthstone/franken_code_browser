@@ -117,6 +117,32 @@ extension AtlasReaderTransport {
         for request in invalidPaths { precondition(transport.run(owner, request) == nil) }
         precondition((14...17).allSatisfy { count(UInt64($0)) == 1 } && count(6) == 33,
             "invalid filename request crossed the foreign boundary")
-        print("AtlasSavedIndexBridgeTests: public-header signatures, import/path/matching flags, raw query bytes, full-width IDs and buffer ownership passed")
+        for limits in [AtlasSavedIndexBuildLimits.standard, .init(fileBytes: 0, sourceBytes: 0, grams: 0)] {
+            precondition(transport.run(owner, .buildIndex(operation: generation, destination: path, limits: limits)) == "{}")
+        }
+        precondition(transport.run(owner, .indexBuildReceipt(operation: generation)) == "{}")
+        precondition(count(18) == 2 && count(19) == 1 && count(6) == 36)
+        let invalidBuilds: [AtlasSavedRequest] = [
+            .buildIndex(operation: 0, destination: path, limits: .standard),
+            .buildIndex(operation: generation, destination: "/", limits: .standard),
+            .buildIndex(operation: generation, destination: "/a/../index.fcbd", limits: .standard),
+            .buildIndex(operation: generation, destination: "/a\0.fcbd", limits: .standard),
+            .buildIndex(operation: generation, destination: "/" + String(repeating: "x", count: 16_384), limits: .standard),
+            .buildIndex(operation: generation, destination: path, limits: .init(fileBytes: 262_145, sourceBytes: 1, grams: 1)),
+            .buildIndex(operation: generation, destination: path, limits: .init(fileBytes: 1, sourceBytes: 67_108_865, grams: 1)),
+            .buildIndex(operation: generation, destination: path, limits: .init(fileBytes: 1, sourceBytes: 1, grams: 2_097_153)),
+            .indexBuildReceipt(operation: 0)
+        ]
+        for request in invalidBuilds { precondition(transport.run(owner, request) == nil) }
+        precondition(count(18) == 2 && count(19) == 1 && count(6) == 36,
+            "invalid publication crossed the foreign boundary")
+        for invalid in [Int32(1), 2, 3, 4] {
+            mode(invalid)
+            precondition(transport.run(owner, .buildIndex(operation: generation, destination: path, limits: .standard)) == nil)
+            precondition(transport.run(owner, .indexBuildReceipt(operation: generation)) == nil)
+        }
+        precondition(count(18) == 6 && count(19) == 5 && count(6) == 42,
+            "publication response ownership leaked or double-freed")
+        print("AtlasSavedIndexBridgeTests: public-header signatures, publication/import/path/matching requests, native bytes, full-width IDs and buffer ownership passed")
     }
 }

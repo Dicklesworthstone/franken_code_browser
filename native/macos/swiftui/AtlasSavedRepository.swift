@@ -129,6 +129,9 @@ struct AtlasSavedInfo: Sendable {
     let pathStateKnown: Bool
     var index: AtlasSavedIndex?
     var lastIndexAttempt: UInt64
+    var lastIndexBuildAttempt: UInt64
+    var lastIndexBuildOperation: UInt64?
+    let indexBuildStateKnown: Bool
     let initialArchiveBytes: UInt64
     let memberBytesRead: UInt64
     let memberReadCalls: UInt64
@@ -144,6 +147,7 @@ struct AtlasSavedInfo: Sendable {
                   w.initial.value <= 80 * 1024 * 1024,
                   !fresh || (w.relationship == nil && w.query == nil && w.index == nil && w.expression == nil &&
                     w.expressionAttempt == 0 && w.structure == nil && w.structureAttempt == 0 && w.indexAttempt == 0 &&
+                    w.indexBuildAttempt == 0 && w.indexBuildOperation == nil &&
                     w.importGeneration == nil && w.importAttempt == 0 && w.pathGeneration == nil && w.pathAttempt == 0 &&
                     w.memberBytes.value == 0 && w.memberCalls.value == 0) else { throw AtlasSavedError.invalidResponse }
             return Self(identity: actualIdentity,
@@ -153,7 +157,9 @@ struct AtlasSavedInfo: Sendable {
                 lastStructureAttempt: w.structureAttempt, structureStateKnown: w.structureKnown,
                 importGeneration: w.importGeneration, lastImportAttempt: w.importAttempt, importStateKnown: w.importKnown,
                 pathGeneration: w.pathGeneration, lastPathAttempt: w.pathAttempt, pathStateKnown: w.pathKnown,
-                index: index, lastIndexAttempt: w.indexAttempt, initialArchiveBytes: w.initial.value,
+                index: index, lastIndexAttempt: w.indexAttempt,
+                lastIndexBuildAttempt: w.indexBuildAttempt, lastIndexBuildOperation: w.indexBuildOperation,
+                indexBuildStateKnown: w.indexBuildKnown, initialArchiveBytes: w.initial.value,
                 memberBytesRead: w.memberBytes.value, memberReadCalls: w.memberCalls.value)
         } catch let error as AtlasSavedError { throw error }
         catch { throw AtlasSavedError.invalidResponse }
@@ -164,6 +170,9 @@ struct AtlasSavedInfo: Sendable {
         let expression: UInt64?
         let expressionAttempt: UInt64
         let indexAttempt: UInt64
+        let indexBuildAttempt: UInt64
+        let indexBuildOperation: UInt64?
+        let indexBuildKnown: Bool
         let expressionKnown: Bool
         let structure: UInt64?
         let structureAttempt: UInt64
@@ -178,6 +187,7 @@ struct AtlasSavedInfo: Sendable {
         enum CodingKeys: CodingKey {
             case archive_path, accepted_relationship_generation, accepted_query_generation, accepted_index_generation,
                  accepted_expression_generation, last_expression_attempt, last_index_attempt,
+                 last_index_build_attempt, last_index_build_operation,
                  accepted_structure_generation, last_structure_attempt,
                  accepted_import_generation, last_import_attempt,
                  accepted_path_generation, last_path_attempt,
@@ -196,6 +206,17 @@ struct AtlasSavedInfo: Sendable {
             query = try generation(.accepted_query_generation); index = try generation(.accepted_index_generation)
             indexAttempt = try c.decode(AtlasSavedNumber.self, forKey: .last_index_attempt).value
             guard index == nil || index! <= indexAttempt else { throw AtlasSavedError.invalidResponse }
+            indexBuildKnown = c.contains(.last_index_build_attempt) && c.contains(.last_index_build_operation)
+            guard c.contains(.last_index_build_attempt) == c.contains(.last_index_build_operation) else {
+                throw AtlasSavedError.invalidResponse
+            }
+            if indexBuildKnown {
+                indexBuildAttempt = try c.decode(AtlasSavedNumber.self, forKey: .last_index_build_attempt).value
+                indexBuildOperation = try generation(.last_index_build_operation)
+            } else { indexBuildAttempt = 0; indexBuildOperation = nil }
+            guard indexBuildOperation == nil || indexBuildOperation! <= indexBuildAttempt else {
+                throw AtlasSavedError.invalidResponse
+            }
             expressionKnown = c.contains(.accepted_expression_generation) && c.contains(.last_expression_attempt)
             guard c.contains(.accepted_expression_generation) == c.contains(.last_expression_attempt) else {
                 throw AtlasSavedError.invalidResponse
@@ -666,6 +687,8 @@ enum AtlasSavedRequest: Sendable {
     case members(start: UInt64, limit: UInt64)
     case attachIndex(generation: UInt64, path: String, pin: String)
     case detachIndex(generation: UInt64)
+    case buildIndex(operation: UInt64, destination: String, limits: AtlasSavedIndexBuildLimits)
+    case indexBuildReceipt(operation: UInt64)
     case search(generation: UInt64, needle: String, matches: UInt64)
     case countedSearch(generation: UInt64, needle: String, matches: UInt64)
     case matchingSearch(generation: UInt64, needle: String, caseSensitive: Bool, countAllMatches: Bool, matches: UInt64)

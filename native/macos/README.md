@@ -382,12 +382,39 @@ and physical-Mac qualification remain pending.
 ## Saved repository search indexes
 
 In **Saved Repository → Search → Literal**, expand **Saved search index**
-to attach an existing FCBD demand-paged index to the currently opened FCBS
-archive. Paste its trusted **page-manifest SHA-256** and choose the index file.
-The engine checks the pin and exact archive binding before replacing an accepted
-index. No index is inferred from a neighboring filename or loaded automatically.
+and choose **Build and save index…** to create an FCBD index from the archive
+already open in the app. Choose a new destination in the save panel. The build
+uses the retained archive descriptor and verifies captured members; it does not
+reopen the archive's original pathname or read the live project. An existing
+destination is never overwritten. The output contains unencrypted source-derived
+search data, so choose its destination with the same care as the saved sources.
 
-Build an index explicitly with the matching CLI and retain its receipt:
+The native build admits up to **256 KiB per member**, **64 MiB of source** and
+**2,097,152 posting pairs**, with a **24 MiB** encoded output ceiling. It uses the
+existing bounded resident builder, inversion and demand-paged encoder. Members
+outside the build quotas remain explicitly uncovered and can still be searched
+by exact source scanning. The receipt shows indexed, uncovered and unavailable
+counts and retains the archive's historical discovery completeness.
+
+When complete bytes have been written, choose **Attach built index**. This uses
+the trusted page-manifest pin returned by the build and revalidates the file and
+its exact archive binding. Building alone preserves the current attachment,
+search results and captured readers. Keep the displayed **Build receipt SHA-256**
+with the FCBD file if it will be attached in another session. To attach an
+existing index, paste that trusted pin and choose the file in the same panel.
+No index is inferred from a neighboring filename or loaded automatically.
+
+Cancellation waits for entered work to drain. A retained write receipt records
+whether nothing was created, an incomplete destination remains, or complete
+bytes were written with file/directory synchronization requested. A failed sync
+or late cancellation can leave a complete file available for explicit verified
+attachment. **Reload write receipt** recovers the same immutable result without
+building, writing or rereading source. An uncertain outcome never retries a
+write automatically; inspect the destination before choosing another filename.
+The app retains destination access through entered work and subsequent explicit
+attachment. These receipts do not certify durability across power loss.
+
+The matching CLI can also build an index explicitly; retain its receipt:
 
 ```sh
 fcb snapshot index build /absolute/path/source.fcbs \
@@ -416,8 +443,11 @@ until that outcome is known, and entered work drains before closure releases
 the archive and index access.
 
 The native model/receipt and public-header C marshaling regressions are in
-`swiftui/tests/test-saved-search.sh`; actual FCBS/FCBD and ABI cases are in
-`crates/fcb-bridge/src/saved_sessions_tests.rs` and `saved_ffi_tests.rs`.
+`swiftui/tests/test-saved-search.sh` and `test-saved-index-build.sh`; actual
+FCBS/FCBD construction, create-only publication, cancellation, receipt recovery
+and ABI cases are in `crates/fcb-app/tests/saved_repository_index_build.rs`,
+`crates/fcb-bridge/src/saved_sessions_tests.rs`, `saved_index_build_ffi_tests.rs`
+and `saved_ffi_tests.rs`.
 These additions still require the configured independent strict-RCH verifier.
 Physical-Mac picker, sandbox access and native UI qualification remain pending.
 

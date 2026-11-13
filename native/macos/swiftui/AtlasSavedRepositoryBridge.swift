@@ -6,6 +6,9 @@ import Foundation
 @_silgen_name("fcb_saved_members") private func savedMembers(_ h: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_attach_index") private func savedAttachIndex(_ h: UInt64, _ generation: UInt64, _ path: UnsafePointer<CChar>?, _ pin: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_detach_index") private func savedDetachIndex(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_build_index") private func savedBuildIndex(_ h: UInt64, _ operation: UInt64,
+    _ destination: UnsafePointer<CChar>?, _ fileBytes: UInt64, _ sourceBytes: UInt64, _ grams: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_index_build_receipt") private func savedIndexBuildReceipt(_ h: UInt64, _ operation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_search") private func savedSearch(_ h: UInt64, _ generation: UInt64, _ needle: UnsafePointer<CChar>?, _ matches: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_search_counted") private func savedCountedSearch(_ h: UInt64, _ generation: UInt64, _ needle: UnsafePointer<CChar>?, _ matches: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_search_matching") private func savedMatchingSearch(_ h: UInt64, _ generation: UInt64,
@@ -69,6 +72,14 @@ extension AtlasSavedTransport {
         case .detachIndex(let generation):
             guard generation > 0 else { return nil }
             return take(savedDetachIndex(handle, generation))
+        case .buildIndex(let operation, let destination, let limits):
+            guard operation > 0, AtlasSavedIndexBuildRequest.validDestination(destination), limits.isValid else { return nil }
+            return destination.withCString {
+                take(savedBuildIndex(handle, operation, $0, limits.fileBytes, limits.sourceBytes, limits.grams))
+            }
+        case .indexBuildReceipt(let operation):
+            guard operation > 0 else { return nil }
+            return take(savedIndexBuildReceipt(handle, operation))
         case .search(let generation, let needle, let matches):
             guard generation > 0, AtlasSavedSearchWire.validNeedle(needle),
                   (1...AtlasSavedSearchWire.maximumHits).contains(matches) else { return nil }

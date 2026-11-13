@@ -435,6 +435,8 @@ final class AtlasSavedFileAccess {
     private var indexPane: some View {
         DisclosureGroup("Saved search index") {
             VStack(alignment: .leading, spacing: 6) {
+                indexBuildPane
+                Divider()
                 if !model.indexStateKnown {
                     Text("Index acceptance is unconfirmed. Reload status before changing the index or starting a new literal search.")
                         .font(.caption).foregroundStyle(.orange)
@@ -470,6 +472,57 @@ final class AtlasSavedFileAccess {
                     .font(.caption2).foregroundStyle(.secondary)
             }.padding(.top, 5)
         }.font(.callout)
+    }
+    private var indexBuildPane: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Button("Build and save index…", action: buildIndex)
+                    .disabled(!model.canBuildIndex || readerTask != nil)
+                    .help("Build bounded postings from this opened archive and create a new FCBD file")
+                if model.indexBuildInProgress {
+                    ProgressView().controlSize(.small)
+                    Text(model.indexBuildCancellationRequested ? "Waiting for write outcome…" : "Building index…")
+                        .font(.caption)
+                }
+                Spacer()
+                if model.canAttachBuiltIndex {
+                    Button("Attach built index") { panelNotice = ""; model.attachBuiltIndex() }
+                        .disabled(readerTask != nil)
+                }
+                if model.indexBuildRequest != nil {
+                    Button("Reload write receipt") { panelNotice = ""; model.reloadIndexBuildReceipt() }
+                        .disabled(!model.canOperate)
+                }
+            }.controlSize(.small)
+            if model.info?.indexBuildStateKnown == false {
+                Text("This saved-repository service does not expose index publication. Existing trusted indexes can still be attached below.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            Text("Creates an unencrypted source-derived search file. Up to 256 KiB per member, 64 MiB of captured source and 2,097,152 posting pairs are admitted. Uncovered members keep exact source scanning.")
+                .font(.caption2).foregroundStyle(.secondary)
+            if let request = model.indexBuildRequest {
+                Text("Destination: \(String(reflecting: request.destination))")
+                    .font(.caption).lineLimit(2).textSelection(.enabled)
+                Text(model.indexBuildNotice)
+                    .font(.caption).foregroundStyle(model.indexBuildOutcomeKnown ? Color.secondary : Color.orange)
+                    .textSelection(.enabled)
+            }
+            if let receipt = model.indexBuildReceipt {
+                if let coverage = receipt.coverage {
+                    Text("\(coverage.indexed) indexed · \(coverage.uncovered) uncovered · \(coverage.unavailable) unavailable · \(receipt.bytesWritten) bytes written")
+                        .font(.caption2).foregroundStyle(.secondary)
+                    if !receipt.identity.discoveryComplete {
+                        Text("Project discovery was incomplete when this archive was saved. The index describes its recorded manifest.")
+                            .font(.caption2).foregroundStyle(.orange)
+                    }
+                }
+                if receipt.attachEligible, let pin = receipt.pin {
+                    Text("Build receipt SHA-256: \(pin)").font(.caption2.monospaced()).textSelection(.enabled)
+                    Text("Keep this page-manifest pin with the index to attach it in a later session. Attach verifies the selected file against the pin and this archive.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
     }
     private var expressionSearchPane: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1019,6 +1072,26 @@ final class AtlasSavedFileAccess {
             panelNotice = "The selected index filename cannot be represented exactly by the native open interface."; return
         }
         panelNotice = ""; model.attachIndex(path: path, pin: pin, accessLease: access)
+    }
+    private func buildIndex() {
+        guard model.canBuildIndex, readerTask == nil, let identity = model.info?.identity else { return }
+        let panel = NSSavePanel()
+        panel.title = "Build a search index for the opened saved repository"
+        panel.prompt = "Build and save"
+        panel.nameFieldStringValue = "Repository.fcbd"
+        panel.message = "Creates an unencrypted file containing source-derived search data from this opened archive. Limits: 256 KiB per member, 64 MiB source, 2,097,152 posting pairs. Uncovered files remain searchable by direct scanning. Choose a new filename; existing files are never overwritten. Attachment is a separate action."
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let access = AtlasSavedFileAccess(selectedURL: url)
+        guard model.canBuildIndex, model.info?.identity == identity, readerTask == nil else {
+            panelNotice = "The opened archive changed while choosing a destination. Review the current archive and choose Build again. No index build was started."
+            return
+        }
+        guard let path = access.nativePath else {
+            panelNotice = "The selected destination cannot be represented exactly by the native save interface. No index build was started."
+            return
+        }
+        panelNotice = ""; model.buildIndex(destination: path, accessLease: access)
     }
     private func openMember(_ member: AtlasSavedMember, from identity: AtlasSavedIdentity) {
         launchReader {

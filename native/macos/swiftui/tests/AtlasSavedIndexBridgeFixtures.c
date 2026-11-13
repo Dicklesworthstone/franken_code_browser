@@ -5,10 +5,10 @@
 
 /* Public-header-checked foreign boundary. These responses test Swift marshaling
  * and ownership; real archive/posting behavior is exercised in saved_sessions_tests. */
-static uint64_t calls[18];
+static uint64_t calls[20];
 static int result_mode;
 void fixture_saved_index_mode(int mode) { result_mode = mode; }
-uint64_t fixture_saved_index_count(uint64_t index) { assert(index < 18); return calls[index]; }
+uint64_t fixture_saved_index_count(uint64_t index) { assert(index < 20); return calls[index]; }
 static char *reply(void) {
     if (result_mode == 1) return NULL;
     if (result_mode == 2) { char *p = malloc(2); assert(p); p[0] = (char)0xff; p[1] = 0; return p; }
@@ -28,6 +28,17 @@ char *fcb_saved_attach_index(uint64_t handle, uint64_t generation, const char *p
 }
 char *fcb_saved_detach_index(uint64_t handle, uint64_t generation) {
     assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9); calls[2]++; return reply();
+}
+char *fcb_saved_build_index(uint64_t handle, uint64_t operation, const char *destination,
+    uint64_t file_bytes, uint64_t source_bytes, uint64_t grams) {
+    assert(handle == UINT64_MAX - 10 && operation == UINT64_MAX - 9);
+    assert(destination && strcmp(destination, "/index-e\xcc\x81.fcbd") == 0);
+    assert((file_bytes == 262144 && source_bytes == 67108864 && grams == 2097152)
+        || (file_bytes == 0 && source_bytes == 0 && grams == 0));
+    calls[18]++; return reply();
+}
+char *fcb_saved_index_build_receipt(uint64_t handle, uint64_t operation) {
+    assert(handle == UINT64_MAX - 10 && operation == UINT64_MAX - 9); calls[19]++; return reply();
 }
 char *fcb_saved_info(uint64_t handle) { assert(handle == UINT64_MAX - 10); calls[3]++; return reply(); }
 uint8_t fcb_saved_cancel(uint64_t handle) { assert(handle == UINT64_MAX - 10); calls[4]++; return 1; }

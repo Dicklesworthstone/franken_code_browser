@@ -891,6 +891,8 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                         generation: nil, link: nil, side: nil, hitID: id, structure: generation)
                 case .pathSearch, .pathResults, .clearPaths, .openPathHit:
                     return nil // Dedicated path fixture wraps this shared source owner.
+                case .buildIndex, .indexBuildReceipt:
+                    return nil // Dedicated publication fixture wraps this shared source owner.
                 case .prepareImports, .imports, .clearImports, .openImport:
                     return nil // Dedicated imports fixture wraps this shared source owner.
                 case .clearRelationships(let generation):

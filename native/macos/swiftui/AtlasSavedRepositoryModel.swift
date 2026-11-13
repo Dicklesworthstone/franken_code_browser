@@ -138,6 +138,12 @@ private final class AtlasSavedSession: @unchecked Sendable {
     private(set) var structureGeneration: UInt64?
     private(set) var indexStateKnown = true
     private(set) var indexPath: String?
+    private(set) var indexBuildRequest: AtlasSavedIndexBuildRequest?
+    private(set) var indexBuildReceipt: AtlasSavedIndexBuildReceipt?
+    private(set) var indexBuildOutcomeKnown = true
+    private(set) var indexBuildInProgress = false
+    private(set) var indexBuildCancellationRequested = false
+    private(set) var indexBuildNotice = "Build an index from this opened archive and save it to a new file."
     private(set) var busy = false
     private(set) var closed = false
     private(set) var notice = "Open an FCBS saved repository to browse its captured members and documentation links."
@@ -164,6 +170,8 @@ private final class AtlasSavedSession: @unchecked Sendable {
     @ObservationIgnored private var lastExpressionAttempt: UInt64 = 0
     @ObservationIgnored private var lastStructureAttempt: UInt64 = 0
     @ObservationIgnored private var lastIndexAttempt: UInt64 = 0
+    @ObservationIgnored private var lastIndexBuildAttempt: UInt64 = 0
+    @ObservationIgnored private var indexBuildAccess: AnyObject?
 
     init(transport: AtlasSavedTransport) { self.transport = transport }
     var canOperate: Bool { !busy && !closed }
@@ -181,6 +189,15 @@ private final class AtlasSavedSession: @unchecked Sendable {
     var validSearchInput: Bool { AtlasSavedSearchWire.validNeedle(searchInput) }
     var index: AtlasSavedIndex? { info?.index }
     var canChangeIndex: Bool { canOperate && info != nil && indexStateKnown }
+    var canBuildIndex: Bool {
+        canOperate && info?.indexBuildStateKnown == true &&
+            max(lastIndexBuildAttempt, info?.lastIndexBuildAttempt ?? 0) < UInt64.max
+    }
+    var canAttachBuiltIndex: Bool {
+        guard canChangeIndex, let request = indexBuildRequest, let receipt = indexBuildReceipt else { return false }
+        return indexBuildOutcomeKnown && request.identity == info?.identity && receipt.identity == request.identity &&
+            receipt.operation == request.operation && receipt.attachEligible && receipt.pin != nil
+    }
     var canSearch: Bool { canOperate && (searchMode != .literal || indexStateKnown) }
     var searchIsCurrent: Bool {
         guard searchMode == .literal, let searchPage, info?.identity == searchPage.identity,
@@ -241,11 +258,106 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 model.expressionPage = nil; model.expressionGeneration = nil; model.lastExpressionAttempt = 0
                 model.structurePage = nil; model.structureGeneration = nil; model.lastStructureAttempt = 0
                 model.indexStateKnown = true; model.indexPath = nil; model.lastIndexAttempt = 0; model.indexPinInput = ""
+                model.clearIndexBuild()
                 model.notice = "Opened the saved manifest. Search captured text, or build documentation links and source imports when ready."
             } catch {
                 if model.pending === candidate { model.pending = nil; candidate.cancel() }
                 throw error
             }
+        }
+    }
+
+    func buildIndex(destination: String, accessLease: AnyObject?, limits: AtlasSavedIndexBuildLimits = .standard) {
+        guard canBuildIndex, let info else { return }
+        guard AtlasSavedIndexBuildRequest.validDestination(destination), limits.isValid,
+              Array(destination.utf8) != info.path.bytes else {
+            notice = "Choose a new absolute index filename and supported build limits. No build was started."; return
+        }
+        if !indexBuildOutcomeKnown, let previous = indexBuildRequest,
+            previous.destination.utf8.elementsEqual(destination.utf8) {
+            notice = "The earlier write outcome for this destination is unconfirmed. Reload its receipt or choose a different new filename."; return
+        }
+        perform { model, flag in
+            guard let lease = model.session, model.info?.identity == info.identity else { throw AtlasSavedError.unavailable }
+            let operation = try model.nextIndexBuildOperation()
+            let request = try AtlasSavedIndexBuildRequest(identity: info.identity, operation: operation,
+                destination: destination, limits: limits)
+            model.indexBuildRequest = request; model.indexBuildReceipt = nil; model.indexBuildAccess = accessLease
+            model.indexBuildOutcomeKnown = false; model.indexBuildInProgress = true
+            model.indexBuildCancellationRequested = false
+            model.indexBuildNotice = "Building bounded postings from verified captured members, then creating the selected index file…"
+            model.notice = model.indexBuildNotice
+            defer { model.indexBuildInProgress = false }
+            do {
+                // Keep destination authority through the actual worker return,
+                // even if closing the view clears the model's references.
+                let lifetime: [AnyObject] = [lease] + [accessLease].compactMap { $0 }
+                let json = try await model.io.perform(cancellation: flag, keepingAlive: lifetime) {
+                    lease.transport.run(lease.handle, .buildIndex(operation: operation,
+                        destination: request.destination, limits: request.limits))
+                }
+                let receipt = try AtlasSavedIndexBuildReceipt.decode(json, request: request)
+                guard !model.closed, model.session === lease else { return }
+                try model.acceptIndexBuild(receipt, request: request)
+            } catch {
+                guard !model.closed, model.session === lease else { return }
+                // The generic I/O queue discards a canceled delivery only after
+                // its entered call has drained. Reconcile that operation on the
+                // same session with a fresh flag; never repeat the writer.
+                let recovered = await model.reconcileIndexBuild(lease, request: request)
+                if recovered {
+                    model.indexBuildNotice = "Recovered the retained write receipt. \(model.indexBuildReceipt!.message)"
+                } else {
+                    model.indexBuildNotice = "The write outcome could not be verified. The selected destination may contain a complete or incomplete index. Reload the retained receipt before using that file; a new build requires a different filename."
+                }
+                model.notice = model.indexBuildNotice
+            }
+        }
+    }
+    func reloadIndexBuildReceipt() {
+        guard let request = indexBuildRequest else { return }
+        perform { model, _ in
+            guard let lease = model.session, model.info?.identity == request.identity else { throw AtlasSavedError.unavailable }
+            if await model.reconcileIndexBuild(lease, request: request) {
+                model.indexBuildNotice = "Recovered the retained write receipt. \(model.indexBuildReceipt!.message)"
+            } else {
+                model.indexBuildNotice = model.indexBuildOutcomeKnown
+                    ? "The latest receipt read failed. The previously verified write receipt remains available."
+                    : "The write outcome is still unconfirmed. No build was retried. Inspect the selected destination before explicitly choosing another filename."
+            }
+            model.notice = model.indexBuildNotice
+        }
+    }
+    func attachBuiltIndex() {
+        guard canAttachBuiltIndex, let request = indexBuildRequest, let pin = indexBuildReceipt?.pin else { return }
+        attachIndex(path: request.destination, pin: pin, accessLease: indexBuildAccess)
+    }
+    private func acceptIndexBuild(_ receipt: AtlasSavedIndexBuildReceipt, request: AtlasSavedIndexBuildRequest) throws {
+        guard info?.identity == request.identity, receipt.identity == request.identity,
+              receipt.operation == request.operation, indexBuildRequest?.operation == request.operation else {
+            throw AtlasSavedError.invalidResponse
+        }
+        indexBuildReceipt = receipt; indexBuildOutcomeKnown = true
+        lastIndexBuildAttempt = max(lastIndexBuildAttempt, request.operation)
+        let acceptedAttempt = max(info?.lastIndexBuildAttempt ?? 0, request.operation)
+        info?.lastIndexBuildAttempt = acceptedAttempt
+        info?.lastIndexBuildOperation = request.operation
+        if receipt.attachEligible, let pin = receipt.pin { indexPinInput = pin }
+        indexBuildNotice = receipt.message; notice = receipt.message
+    }
+    private func reconcileIndexBuild(_ lease: AtlasSavedSession, request: AtlasSavedIndexBuildRequest) async -> Bool {
+        guard !closed, session === lease, info?.identity == request.identity,
+              indexBuildRequest?.operation == request.operation else { return false }
+        do {
+            let receipt = try AtlasSavedIndexBuildReceipt.decode(await run(lease,
+                .indexBuildReceipt(operation: request.operation), flag: AtlasSearchCancellation()), request: request)
+            guard !closed, session === lease else { return false }
+            try acceptIndexBuild(receipt, request: request); return true
+        } catch {
+            // Missing/stale receipts are not proof that the destination was
+            // untouched. Preserve any already verified immutable receipt.
+            indexBuildOutcomeKnown = indexBuildReceipt?.operation == request.operation
+            return false
         }
     }
 
@@ -308,9 +420,13 @@ private final class AtlasSavedSession: @unchecked Sendable {
         lastIndexAttempt = max(lastIndexAttempt, attempt); indexStateKnown = true
     }
     private func acceptInfo(_ current: AtlasSavedInfo, lease: AtlasSavedSession) throws {
-        guard current.lastIndexAttempt >= (info?.lastIndexAttempt ?? 0) else { throw AtlasSavedError.invalidResponse }
+        guard current.lastIndexAttempt >= (info?.lastIndexAttempt ?? 0),
+              !current.indexBuildStateKnown || current.lastIndexBuildAttempt >= (info?.lastIndexBuildAttempt ?? 0) else {
+            throw AtlasSavedError.invalidResponse
+        }
         indexPath = try lease.resolveIndex(current.index)
         info = current; lastIndexAttempt = max(lastIndexAttempt, current.lastIndexAttempt); indexStateKnown = true
+        lastIndexBuildAttempt = max(lastIndexBuildAttempt, current.lastIndexBuildAttempt)
     }
     private func reconcileIndex(_ lease: AtlasSavedSession) async -> Bool {
         guard !closed, session === lease, let previous = info else { return false }
@@ -1225,7 +1341,11 @@ private final class AtlasSavedSession: @unchecked Sendable {
     func cancel() {
         guard busy else { return }
         cancellation?.cancel(); session?.cancel(); pending?.cancel()
-        notice = "Cancel requested. Waiting for entered saved-archive work to drain."
+        if indexBuildInProgress {
+            indexBuildCancellationRequested = true
+            indexBuildNotice = "Cancellation requested. Waiting for the writer to drain and report whether the destination was created."
+            notice = indexBuildNotice
+        } else { notice = "Cancel requested. Waiting for entered saved-archive work to drain." }
     }
     func closeArchive() {
         guard canOperate else { return }
@@ -1247,6 +1367,13 @@ private final class AtlasSavedSession: @unchecked Sendable {
         expressionPage = nil; expressionGeneration = nil; lastExpressionAttempt = 0
         structurePage = nil; structureGeneration = nil; lastStructureAttempt = 0
         indexPath = nil; indexStateKnown = true; lastIndexAttempt = 0; indexPinInput = ""
+        clearIndexBuild()
+    }
+    private func clearIndexBuild() {
+        indexBuildRequest = nil; indexBuildReceipt = nil; indexBuildAccess = nil
+        indexBuildOutcomeKnown = true; indexBuildInProgress = false; indexBuildCancellationRequested = false
+        lastIndexBuildAttempt = 0
+        indexBuildNotice = "Build an index from this opened archive and save it to a new file."
     }
     private func run(_ lease: AtlasSavedSession, _ request: AtlasSavedRequest,
         flag: AtlasSearchCancellation) async throws -> String? {
@@ -1300,6 +1427,11 @@ private final class AtlasSavedSession: @unchecked Sendable {
         let previous = max(lastIndexAttempt, info?.lastIndexAttempt ?? 0)
         guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
         lastIndexAttempt = previous + 1; return lastIndexAttempt
+    }
+    private func nextIndexBuildOperation() throws -> UInt64 {
+        let previous = max(lastIndexBuildAttempt, info?.lastIndexBuildAttempt ?? 0)
+        guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
+        lastIndexBuildAttempt = previous + 1; return lastIndexBuildAttempt
     }
     private static func message(_ error: Error) -> String {
         if let error = error as? AtlasSavedError { return error.message }
