@@ -10,6 +10,7 @@ use fcb_app::host::{HostResponse, saved_repository::{SavedRepositorySession, Sav
     SnapshotLimits, Sha256Digest}};
 use fcb_app::host::saved_repository::relationships::{SavedRelationshipError, RelationshipDirection, RelationshipSide};
 use fcb_app::host::saved_repository::imports::{SavedImportError, SavedImportDirection, SavedImportSide};
+use fcb_app::host::saved_repository::paths::SavedPathOptions;
 use fcb_app::host::saved_repository::desk::SavedDeskError;
 use fcb_app::host::saved_repository::structure::{StructureMode, SymbolNameMode};
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
@@ -94,6 +95,9 @@ pub(super) enum Command<'a> {
     PrepareImports { generation: u64, max_links: usize, max_source_bytes: u64 },
     Imports { generation: u64, member: Option<usize>, direction: SavedImportDirection, start: usize, limit: usize },
     ClearImports { generation: u64 },
+    PathSearch { generation: u64, needle: &'a [u8], options: SavedPathOptions },
+    PathResults { generation: u64, start: usize, limit: usize },
+    ClearPaths { generation: u64 },
 }
 pub(super) enum DocumentImageCommand {
     Authorize,
@@ -106,6 +110,7 @@ pub(super) enum Selection {
     StructureHit { generation: u64, id: u64 },
     Relationship { generation: u64, id: u64, side: RelationshipSide },
     Import { generation: u64, id: u64, side: SavedImportSide },
+    PathHit { generation: u64, id: u64 },
 }
 
 struct Permit(Arc<AtomicUsize>);
@@ -208,6 +213,12 @@ impl SavedSessions {
                 session.import_page(generation, member, direction, start, limit, &mut stop).map_err(AccessError::from),
             Command::ClearImports { generation } =>
                 session.clear_imports(generation, &mut stop).map_err(AccessError::from),
+            Command::PathSearch { generation, needle, options } =>
+                session.path_search(generation, needle, options, &mut stop).map_err(AccessError::from),
+            Command::PathResults { generation, start, limit } =>
+                session.path_results(generation, start, limit, &mut stop).map_err(AccessError::from),
+            Command::ClearPaths { generation } =>
+                session.clear_paths(generation, &mut stop).map_err(AccessError::from),
             Command::Info => session.info(&mut stop).map_err(AccessError::from),
             Command::Members { start, limit } => session.members(start, limit, &mut stop).map_err(AccessError::from),
             Command::AttachIndex { generation, path, pin } => session.attach_index(generation, path, pin, &mut stop).map_err(AccessError::from),
@@ -249,6 +260,8 @@ impl SavedSessions {
                     session.open_relationship_reader(owner, generation, id, side, reader_stop).map_err(AccessError::from),
                 Selection::Import { generation, id, side } =>
                     session.open_import_reader(owner, generation, id, side, reader_stop).map_err(AccessError::from),
+                Selection::PathHit { generation, id } =>
+                    session.open_path_hit_reader(owner, generation, id, reader_stop).map_err(AccessError::from),
             }
         }, &mut stop);
         cell.validate(epoch)?;

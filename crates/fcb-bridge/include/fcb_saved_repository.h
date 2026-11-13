@@ -33,6 +33,44 @@ char *fcb_saved_info(uint64_t handle);
  */
 char *fcb_saved_members(uint64_t handle, uint64_t start, uint64_t limit);
 
+/* Quick Open searches the already validated archive directory with the shared
+ * exact/prefix/fuzzy path ranker, including members without captured contents.
+ * query is a borrowed 1..256-byte native path query, with no NUL. Raw non-UTF-8
+ * names are supported. mode: 0 exact, 1 prefix, 2 fuzzy; match_case: 0 Unicode
+ * scalar lowercase, 1 sensitive. No canonical normalization is applied.
+ * max_results is 0..256; max_work_units is 0..2^32 and bounds ranker work, not
+ * elapsed time. Metadata index construction has separate archive/memory bounds.
+ *
+ * Search and page read no member payload, live source, or persistent index.
+ * Directory search completeness is independent of historical discovery and
+ * capture completeness: unavailable members still have searchable filenames.
+ * search_complete/matches_seen_exact describe the examined archive metadata;
+ * truncated describes retained rows, and work_limited keeps global top-k and
+ * absence claims incomplete. Pages may shorten to fit response bounds; follow
+ * next_offset rather than adding the requested limit. Page limit is 1..128.
+ *
+ * Path generations are independent of text/import/document searches. Search
+ * and clear attempts must increase; failed/canceled replacement preserves old
+ * accepted rows. These calls run synchronously on a host worker. Query bytes
+ * remain valid until return; free every owned response with fcb_free_string.
+ */
+char *fcb_saved_path_search(uint64_t handle, uint64_t generation,
+    const uint8_t *query, uint64_t query_bytes, uint64_t mode, uint64_t match_case,
+    uint64_t max_results, uint64_t max_work_units);
+char *fcb_saved_path_results(uint64_t handle, uint64_t generation,
+    uint64_t start, uint64_t limit);
+char *fcb_saved_clear_paths(uint64_t handle, uint64_t generation);
+
+/* Existing EMPTY reader destination. Validates the accepted path generation
+ * and one-based hit before resolving its member ordinal; then verifies the
+ * selected captured member from the retained archive. Returns the ordinary
+ * open-reader receipt with selection:null. Unavailable rows cannot open.
+ * Reader admission precedes source I/O, and accepted readers remain usable
+ * after path results or the saved archive are closed.
+ */
+char *fcb_saved_open_path_hit_reader(uint64_t handle, uint64_t reader,
+    uint64_t generation, uint64_t hit);
+
 /* Optional FCBD index. The 64-hex trusted_digest MUST come from its original
  * trusted build receipt, NOT be inferred from the input file. It pins the
  * metadata envelope including page hashes, not a whole-file checksum. Pages
