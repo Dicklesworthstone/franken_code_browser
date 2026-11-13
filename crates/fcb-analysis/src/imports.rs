@@ -12,6 +12,7 @@
 
 mod python;
 mod resolve;
+mod rust;
 pub use resolve::{resolve_import, ImportResolution, ImportResolutionKind};
 
 use std::mem::size_of;
@@ -25,8 +26,8 @@ pub const MAX_IMPORT_ITEMS: usize = 4096;
 pub const MAX_IMPORT_SPECIFIER_BYTES: usize = 1024;
 const MAX_STATEMENT_TERMINALS: usize = 1024;
 const MAX_STATEMENT_BYTES: usize = 16 * 1024;
-pub const IMPORT_EXTRACTOR: &str = "franken-markdown-d6fbd1d5/import-statements-v2";
-pub const IMPORT_POLICY: &str = "rust-mod-use-js-static-and-python-import-v2";
+pub const IMPORT_EXTRACTOR: &str = "franken-markdown-d6fbd1d5/import-statements-v3";
+pub const IMPORT_POLICY: &str = "rust-use-tree-js-static-and-python-import-v3";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImportLanguage { Rust, JavaScript, TypeScript, Jsx, Tsx, Python }
@@ -87,7 +88,11 @@ pub struct ImportFact {
 impl ImportFact {
     pub const fn id(&self) -> u64 { self.id }
     pub const fn kind(&self) -> ImportKind { self.kind }
-    /// Lexical destination under IMPORT_POLICY. Python dotted names omit
+    /// Lexical destination under IMPORT_POLICY. Rust use trees produce one
+    /// canonical path per leaf, omitting comments, whitespace and aliases;
+    /// final `self` names its parent path. The exact specifier_range is the
+    /// leaf spelling, while original_range preserves the whole use statement.
+    /// Python dotted names omit
     /// inter-token whitespace/continuations. A bare-relative from import
     /// combines its explicit leading dots with each imported name; its exact
     /// specifier_range covers that name, and original_range retains the dots.
@@ -246,56 +251,6 @@ impl<'a> Statements<'a> {
         owned.push_str(destination);
         self.facts.push(ImportFact { id: self.facts.len() as u64 + 1, kind, destination: owned,
             original_range, specifier_range, resolution_allowed: allowed });
-        Ok(())
-    }
-    fn rust(&mut self, canceled: &mut impl FnMut() -> bool) -> Result<(), ImportError> {
-        // Explicit path attributes may change module layout. This initial policy
-        // conservatively withholds ALL mod targets in such a file; facts remain.
-        let overrides = (0..self.tokens.len()).any(|i| self.word(i) == "#" && self.word(i + 1) == "["
-            && matches!(self.word(i + 2), "path" | "cfg_attr"));
-        let mut depth = 0usize;
-        let mut i = 0;
-        while i < self.tokens.len() {
-            check(canceled)?;
-            if self.keyword(i, "mod") {
-                let raw = self.word(i + 1) == "r" && self.word(i + 2) == "#" && identifier(self.word(i + 3))
-                    && self.tokens[i + 1].end == self.tokens[i + 2].start
-                    && self.tokens[i + 2].end == self.tokens[i + 3].start;
-                let name_end = i + if raw { 3 } else { 1 };
-                let semicolon = name_end + 1;
-                if self.word(semicolon) == ";" && (raw || identifier(self.word(i + 1))) {
-                    let start = self.tokens[i + 1].start; let end = self.tokens[name_end].end;
-                    let text = self.text;
-                    self.add(ImportKind::RustModule, self.tokens[i].start, self.tokens[semicolon].end,
-                        start, end, &text[start..end], depth == 0 && !overrides)?;
-                    i = semicolon + 1; continue;
-                }
-            }
-            if self.keyword(i, "use") {
-                let mut j = i + 1; let mut braces = 0usize;
-                while j < self.tokens.len() && j - i <= MAX_STATEMENT_TERMINALS
-                    && self.tokens[j].end - self.tokens[i].start <= MAX_STATEMENT_BYTES {
-                    let word = self.word(j);
-                    if word == ";" && braces == 0 { break; }
-                    if word == "}" && braces == 0 { break; }
-                    if j > i + 1 && (self.keyword(j, "use") || self.keyword(j, "mod")) { break; }
-                    if word == "{" { braces += 1; } else if word == "}" { braces -= 1; }
-                    j += 1;
-                }
-                if self.word(j) == ";" && j > i + 1 {
-                    let start = self.tokens[i + 1].start; let end = self.tokens[j - 1].end;
-                    let text = self.text; let destination = &text[start..end];
-                    self.add(ImportKind::RustUse, self.tokens[i].start, self.tokens[j].end, start, end, destination, false)?;
-                    i = j + 1; continue;
-                }
-                self.diagnostics += 1;
-            }
-            match self.word(i) {
-                "{" | "(" | "[" => depth = depth.saturating_add(1),
-                "}" | ")" | "]" => depth = depth.saturating_sub(1), _ => {}
-            }
-            i += 1;
-        }
         Ok(())
     }
     fn javascript(&mut self, canceled: &mut impl FnMut() -> bool) -> Result<(), ImportError> {

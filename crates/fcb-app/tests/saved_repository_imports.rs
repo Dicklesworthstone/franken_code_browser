@@ -39,6 +39,39 @@ fn utf16(text: &str, big: bool) -> Vec<u8> {
 }
 
 #[test]
+fn saved_rust_use_tree_pages_preserve_leaf_identity_and_original_utf16_evidence() {
+    let statement = "use crate::shared::{self, Thing as Alias, nested::{Alpha, Beta}, *};";
+    for big in [false, true] {
+        let source = utf16(statement, big);
+        let f = Fixture::new(&[entry(b"src/lib.rs", &source), entry(b"src/shared.rs", b"pub struct Thing;"),
+            entry(b"src/shared/nested.rs", b"pub struct Alpha; pub struct Beta;")], true);
+        let mut saved = f.open(57801 + u64::from(big));
+        let result = prepare(&mut saved, 1);
+        assert!(result.get("imports_complete").flag());
+        assert_eq!(result.get("links_seen").number(), 5);
+        let rows = result.get("links").array();
+        for (index, (destination, spelling)) in [
+            ("crate::shared", "self"), ("crate::shared::Thing", "Thing"),
+            ("crate::shared::nested::Alpha", "Alpha"), ("crate::shared::nested::Beta", "Beta"),
+            ("crate::shared::*", "*"),
+        ].into_iter().enumerate() {
+            let row = &rows[index];
+            assert_eq!(row.get("destination").text(), destination);
+            assert_eq!(row.get("source_link_id").number(), index as u64 + 1);
+            assert_eq!(range(&source, row.get("evidence_range")), &source[2..]);
+            assert_eq!(range(&source, row.get("specifier_range")), &utf16(spelling, big)[2..]);
+        }
+        let before = reads(&mut saved);
+        let page = json(&saved.import_page(1, Some(0), Direction::Outgoing, 2, 2, || false).unwrap());
+        assert_eq!(page.get("matching_links").number(), 5);
+        assert_eq!(page.get("next_offset").number(), 4);
+        assert_eq!(page.get("links").array()[0], rows[2]);
+        assert_eq!(page.get("links").array()[1], rows[3]);
+        assert_eq!(reads(&mut saved), before, "paging use leaves must not reread archive members");
+    }
+}
+
+#[test]
 fn shared_language_extractors_publish_exact_occurrences_and_metadata_only_reverse_pages() {
     let js = b"import item from './util';\nexport { item } from './util';\n";
     let python = b"from . import helper as kept\nfrom .helper import Value\n";
@@ -58,7 +91,7 @@ fn shared_language_extractors_publish_exact_occurrences_and_metadata_only_revers
     assert_eq!(result.get("projection").text(), "lexical-source-imports");
     assert_eq!(result.get("evidence_precision").text(), "exact-import-source-range");
     assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v2");
-    assert_eq!(result.get("extraction_policy").text(), "rust-mod-use-js-static-and-python-import-v2");
+    assert_eq!(result.get("extraction_policy").text(), "rust-use-tree-js-static-and-python-import-v3");
     assert_eq!(result.get("completeness_scope").text(), "parsed-source-imports-in-saved-manifest");
     assert!(!result.get("compiler_resolved").flag());
     assert!(!result.get("semantic_complete").flag());

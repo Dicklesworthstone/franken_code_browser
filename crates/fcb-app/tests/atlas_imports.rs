@@ -91,8 +91,8 @@ fn coverage(page: &Json) {
     assert_eq!(page.get("evidence_precision").text(), "exact-import-source-range");
     assert_eq!(page.get("relationship_kind").text(), "lexical-import");
     assert_eq!(page.get("resolution_domain").text(), "declared-catalog-candidates");
-    assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v2");
-    assert_eq!(page.get("extraction_policy").text(), "rust-mod-use-js-static-and-python-import-v2");
+    assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v3");
+    assert_eq!(page.get("extraction_policy").text(), "rust-use-tree-js-static-and-python-import-v3");
     assert!(!page.get("compiler_resolved").flag()); assert!(!page.get("semantic_complete").flag());
     assert_eq!(page.get("source_files").number(), page.get("captured_source_files").number()
         + page.get("capture_unavailable_source_files").number() + page.get("outside_capture_scope_source_files").number()
@@ -106,6 +106,41 @@ fn coverage(page: &Json) {
     assert!(page.get("metadata_bytes").number() <= MAX_ATLAS_IMPORT_METADATA_BYTES as u64);
     assert!(page.get("parsed_source_bytes").number() <= page.get("max_parse_bytes").number());
     assert!(page.get("retained_links").number() <= page.get("links_seen").number());
+}
+
+#[test]
+fn rust_use_tree_leaves_keep_independent_occurrences_and_exact_statement_evidence() {
+    let statement = b"use crate::shared::{self, Thing as Alias, nested::{Alpha, Beta}, *};";
+    let mut f = Fixture::new(&[("src/lib.rs", statement), ("src/shared.rs", b"pub struct Thing;"),
+        ("src/shared/nested.rs", b"pub struct Alpha; pub struct Beta;")]);
+    f.build(1);
+    let result = f.prepare(1, 1);
+    assert!(result.get("relationships_complete").flag());
+    assert_eq!(result.get("links_seen").number(), 5);
+    let rows = result.get("links").array();
+    for (index, (destination, evidence)) in [
+        ("crate::shared", b"self".as_slice()),
+        ("crate::shared::Thing", b"Thing".as_slice()),
+        ("crate::shared::nested::Alpha", b"Alpha".as_slice()),
+        ("crate::shared::nested::Beta", b"Beta".as_slice()),
+        ("crate::shared::*", b"*".as_slice()),
+    ].into_iter().enumerate() {
+        let row = &rows[index];
+        assert_eq!(row.get("destination").text(), destination);
+        assert_eq!(row.get("source_link_id").number(), index as u64 + 1);
+        assert_eq!(range(row.get("evidence_range"), statement), statement);
+        assert_eq!(range(row.get("specifier_range"), statement), evidence);
+        let (reader, receipt) = f.search.open_import_reader(&f.atlas, owner(72910 + index as u64),
+            1, row.get("link_id").number(), Side::Evidence, || false).unwrap();
+        assert_eq!(reader.capture().bytes(), statement);
+        assert_eq!(json(&receipt).get("relationship"), row);
+    }
+    f.begin(2, 1, 2, MAX_ATLAS_IMPORT_PARSE_BYTES);
+    let limited = f.finish(2);
+    assert_eq!(limited.get("retained_links").number(), 2);
+    assert_eq!(limited.get("links_seen").number(), 5);
+    assert!(limited.get("truncated").flag());
+    assert!(!limited.get("relationships_complete").flag());
 }
 
 #[test]

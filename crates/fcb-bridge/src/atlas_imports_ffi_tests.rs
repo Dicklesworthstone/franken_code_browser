@@ -183,7 +183,7 @@ fn c_python_import_candidates_keep_exact_evidence_and_targets_after_live_edits()
     let result = finish(atlas, 1);
     assert_eq!(number(&result, "retained_links"), 1, "{result}");
     assert!(result.contains("\"language\":\"python\""));
-    assert!(result.contains("\"extraction_policy\":\"rust-mod-use-js-static-and-python-import-v2\""));
+    assert!(result.contains("\"extraction_policy\":\"rust-use-tree-js-static-and-python-import-v3\""));
     let filter = CString::new(hex(b"pkg/worker.py")).unwrap();
     let incoming = take(unsafe { fcb_atlas_imports_page(atlas, 1, 2, filter.as_ptr(), 0, 64) });
     assert_eq!(number(&incoming, "matching_links"), 1);

@@ -703,6 +703,15 @@ comma-separated imports, parenthesized from-import lists and explicit line
 continuations preserve their original statement evidence. Comments and strings
 are classified by the shared FrankenMarkdown lexer.
 
+Rust `use` trees produce one retained occurrence per imported path, including
+aliases, nested groups, grouped `self`, and glob imports. For example,
+`use crate::worker::{self, Task as Job};` produces `crate::worker` and
+`crate::worker::Task`. Each occurrence keeps the exact original statement and
+the original bytes of its own leaf (`self` or `Task`); the displayed destination
+is a normalized path, not a verbatim source excerpt. Malformed or over-budget
+trees remain unresolved evidence with partial coverage. Nested scopes, macros,
+and explicit path overrides do not acquire conventional file-resolution authority.
+
 Python navigation uses an explicit catalog policy. `from .worker import Tool`
 looks for the unique `worker.py` or `worker/__init__.py` candidate beside the
 source; additional leading dots ascend catalog directories without escaping

@@ -30,13 +30,14 @@ fn utf16(text: &str, big: bool) -> Vec<u8> {
 fn rust_modules_uses_aliases_and_duplicates_keep_exact_statement_evidence() {
     let source = b"pub mod child;\nuse crate::child::{Thing, Other as Alias};\nmod child;\n";
     let imports = build(source, ImportLanguage::Rust, 20);
-    assert_eq!(destinations(&imports), ["child", "crate::child::{Thing, Other as Alias}", "child"]);
-    assert_eq!(imports.links_seen(), 3); assert!(imports.is_complete());
+    assert_eq!(destinations(&imports), ["child", "crate::child::Thing", "crate::child::Other", "child"]);
+    assert_eq!(imports.links_seen(), 4); assert!(imports.is_complete());
     assert_eq!(imports.facts()[0].kind(), ImportKind::RustModule); assert!(imports.facts()[0].resolution_allowed());
-    assert_eq!(imports.facts()[1].kind(), ImportKind::RustUse); assert!(!imports.facts()[1].resolution_allowed());
+    assert_eq!(imports.facts()[1].kind(), ImportKind::RustUse); assert!(imports.facts()[1].resolution_allowed());
     assert_eq!(imports.source_bytes(1).unwrap(), b"mod child;");
     assert_eq!(imports.source_bytes(2).unwrap(), b"use crate::child::{Thing, Other as Alias};");
-    assert_ne!(imports.facts()[0].original_range(), imports.facts()[2].original_range());
+    assert_eq!(imports.source_bytes(3).unwrap(), b"use crate::child::{Thing, Other as Alias};");
+    assert_ne!(imports.facts()[0].original_range(), imports.facts()[3].original_range());
     for (index, fact) in imports.facts().iter().enumerate() { assert_eq!(fact.id(), index as u64 + 1); }
 }
 

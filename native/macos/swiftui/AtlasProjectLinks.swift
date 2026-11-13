@@ -134,9 +134,9 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
         guard try w.text("projection") == "lexical-source-imports",
               try w.text("relationship_kind") == "lexical-import",
               try w.text("evidence_precision") == "exact-import-source-range",
-              try w.text("extractor") == "franken-markdown-d6fbd1d5/import-statements-v2",
+              try w.text("extractor") == "franken-markdown-d6fbd1d5/import-statements-v3",
               try w.text("resolver") == "fcb-closed-catalog-imports-v2",
-              try w.text("extraction_policy") == "rust-mod-use-js-static-and-python-import-v2",
+              try w.text("extraction_policy") == "rust-use-tree-js-static-and-python-import-v3",
               try !w.flag("compiler_resolved"), try !w.flag("semantic_complete") else {
             throw AtlasProjectLinksError.invalidResponse
         }

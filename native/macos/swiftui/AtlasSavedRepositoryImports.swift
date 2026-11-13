@@ -20,8 +20,8 @@ enum AtlasSavedImportWire {
         guard w.projection == "lexical-source-imports", w.relationship_kind == "lexical-import",
               w.evidence_precision == "exact-import-source-range",
               w.resolution_domain == "declared-catalog-candidates",
-              w.extractor == "franken-markdown-d6fbd1d5/import-statements-v2",
-              w.extraction_policy == "rust-mod-use-js-static-and-python-import-v2",
+              w.extractor == "franken-markdown-d6fbd1d5/import-statements-v3",
+              w.extraction_policy == "rust-use-tree-js-static-and-python-import-v3",
               w.resolver == "fcb-closed-catalog-imports-v2",
               !w.compiler_resolved, !w.semantic_complete else { throw AtlasSavedError.invalidResponse }
     }
