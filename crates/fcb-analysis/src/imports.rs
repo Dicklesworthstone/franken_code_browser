@@ -4,11 +4,13 @@
 //!
 //! FrankenMarkdown owns string/comment/keyword classification. This module
 //! consumes its validated byte spans and recognizes a small source-specific
-//! statement grammar: Rust external mod/use and JS/TS static import/export-from.
+//! statement grammar: Rust external mod/use, JS/TS static import/export-from,
+//! and Python import/from statements.
 //! It is not a compiler, build graph, package resolver, or replacement lexer.
 //! Every result remains lexical evidence; closed-catalog navigation is explicit.
 //! UTF-8/UTF-16 decoding and evidence conversion use the common source map.
 
+mod python;
 mod resolve;
 pub use resolve::{resolve_import, ImportResolution, ImportResolutionKind};
 
@@ -23,15 +25,15 @@ pub const MAX_IMPORT_ITEMS: usize = 4096;
 pub const MAX_IMPORT_SPECIFIER_BYTES: usize = 1024;
 const MAX_STATEMENT_TERMINALS: usize = 1024;
 const MAX_STATEMENT_BYTES: usize = 16 * 1024;
-pub const IMPORT_EXTRACTOR: &str = "franken-markdown-d6fbd1d5/import-statements-v1";
-pub const IMPORT_POLICY: &str = "rust-mod-use-and-js-static-import-export-v1";
+pub const IMPORT_EXTRACTOR: &str = "franken-markdown-d6fbd1d5/import-statements-v2";
+pub const IMPORT_POLICY: &str = "rust-mod-use-js-static-and-python-import-v2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ImportLanguage { Rust, JavaScript, TypeScript, Jsx, Tsx }
+pub enum ImportLanguage { Rust, JavaScript, TypeScript, Jsx, Tsx, Python }
 impl ImportLanguage {
     pub const fn name(self) -> &'static str {
         match self { Self::Rust => "rust", Self::JavaScript => "javascript", Self::TypeScript => "typescript",
-            Self::Jsx => "jsx", Self::Tsx => "tsx" }
+            Self::Jsx => "jsx", Self::Tsx => "tsx", Self::Python => "python" }
     }
     pub fn from_path(path: &[u8]) -> Option<Self> {
         let file = path.rsplit(|&byte| byte == b'/').next()?;
@@ -42,16 +44,18 @@ impl ImportLanguage {
         match &lower[..suffix.len()] {
             b"rs" => Some(Self::Rust), b"js" | b"mjs" | b"cjs" => Some(Self::JavaScript),
             b"ts" | b"mts" | b"cts" => Some(Self::TypeScript), b"jsx" => Some(Self::Jsx), b"tsx" => Some(Self::Tsx),
+            b"py" | b"pyi" => Some(Self::Python),
             _ => None,
         }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ImportKind { RustModule, RustUse, JavaScriptImport, JavaScriptExport }
+pub enum ImportKind { RustModule, RustUse, JavaScriptImport, JavaScriptExport, PythonImport, PythonFrom }
 impl ImportKind {
     pub const fn name(self) -> &'static str {
         match self { Self::RustModule => "rust-module", Self::RustUse => "rust-use",
-            Self::JavaScriptImport => "javascript-import", Self::JavaScriptExport => "javascript-export" }
+            Self::JavaScriptImport => "javascript-import", Self::JavaScriptExport => "javascript-export",
+            Self::PythonImport => "python-import", Self::PythonFrom => "python-from" }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,6 +87,10 @@ pub struct ImportFact {
 impl ImportFact {
     pub const fn id(&self) -> u64 { self.id }
     pub const fn kind(&self) -> ImportKind { self.kind }
+    /// Lexical destination under IMPORT_POLICY. Python dotted names omit
+    /// inter-token whitespace/continuations. A bare-relative from import
+    /// combines its explicit leading dots with each imported name; its exact
+    /// specifier_range covers that name, and original_range retains the dots.
     pub fn destination(&self) -> &str { &self.destination }
     pub const fn original_range(&self) -> ByteRange { self.original_range }
     pub const fn specifier_range(&self) -> ByteRange { self.specifier_range }
@@ -110,7 +118,8 @@ impl<'source> CapturedImports<'source> {
         // buffers, all retained specifiers and result rows before allocation.
         let charge = source.len().checked_add(1).and_then(|n| n.checked_mul(768))
             .and_then(|n| max_items.checked_mul(size_of::<ImportFact>() + MAX_IMPORT_SPECIFIER_BYTES).and_then(|m| n.checked_add(m)))
-            .and_then(|n| n.checked_add(size_of::<Self>() + 4096)).ok_or(ImportError::ResourceDenied)?;
+            .and_then(|n| n.checked_add(size_of::<Self>() + 4096 + MAX_STATEMENT_TERMINALS * size_of::<usize>()))
+            .ok_or(ImportError::ResourceDenied)?;
         let lease = budget.try_reserve_managed(generation.owner(), allocation, ByteLength::new(charge as u64))
             .map_err(|_| ImportError::ResourceDenied)?;
         let encoding = detect_encoding(source);
@@ -131,6 +140,7 @@ impl<'source> CapturedImports<'source> {
             facts: reserve(max_items)?, max_items, seen: 0, diagnostics: 0, truncated: false };
         match language {
             ImportLanguage::Rust => parser.rust(&mut canceled)?,
+            ImportLanguage::Python => parser.python(&mut canceled)?,
             _ => parser.javascript(&mut canceled)?,
         }
         check(&mut canceled)?;

@@ -562,6 +562,45 @@ Host, registry, C-boundary and native regression fixtures accompany this
 workflow. They remain unexecuted in this code-first session; compilation and
 physical-Mac interaction verification are pending.
 
+## Project import navigation
+
+In **Project relationships**, choose **Imports**, then **Capture and build
+import candidates**. The inventory reuses the same captured sources as the
+documentation view. **Outgoing** shows import statements in one file;
+**Imported by** lists statements whose catalog candidate is that file.
+**Read import evidence** opens the original statement's exact capture and byte
+range. **Read target candidate** opens an independent reader over the retained
+target, even if the live files have since changed.
+
+The shared import engine supports Rust external module/use declarations,
+JavaScript/TypeScript static imports and re-exports (including JSX/TSX), and
+Python `import` and `from` statements in `.py` and `.pyi` files. Python aliases,
+comma-separated imports, parenthesized from-import lists and explicit line
+continuations preserve their original statement evidence. Comments and strings
+are classified by the shared FrankenMarkdown lexer.
+
+Python navigation uses an explicit catalog policy. `from .worker import Tool`
+looks for the unique `worker.py` or `worker/__init__.py` candidate beside the
+source; additional leading dots ascend catalog directories without escaping
+the root. `from . import helper` offers the corresponding `.helper` candidate.
+Its exact specifier evidence is the imported name `helper`; the displayed
+destination combines that name with the statement's relative prefix.
+Multiple possible paths remain ambiguous, with no target chosen. Absolute
+imports such as `import requests` and `from package import value` retain
+readable evidence but do not search `sys.path`, execute package code, or infer
+installed dependencies. A catalog candidate does not establish a Python runtime
+binding. Bare-relative wildcard imports have no guessed target.
+
+The inventory admits 128 KiB per source, 32 MiB of aggregate parsing and 4,096
+retained statements. Unsupported syntax, malformed decoding, parse limits and
+omitted rows remain visible coverage conditions. These limits apply to the
+captured project import browser; saved-repository relationship browsing remains
+a separate Markdown-link workflow. Rust/Swift regression fixtures cover Python
+source spans, UTF-16 coordinates, relative targets, ambiguity, stale captures and
+native evidence validation. Executable and physical-Mac verification remain
+pending.
+
+
 ## Workspace identifier occurrences
 
 Choose **Occurrences** in the search-mode picker and enter one identifier-like

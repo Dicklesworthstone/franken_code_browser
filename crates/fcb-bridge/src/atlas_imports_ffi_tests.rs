@@ -162,3 +162,47 @@ fn c_import_signatures_and_hex_paths_preserve_raw_bytes_without_normalization() 
     let unterminated = vec![b'0'; 2 * MAX_SEARCH_SCOPE_PATH_BYTES + 1];
     assert_eq!(unsafe { decode_path(unterminated.as_ptr().cast()) }.err(), Some(AccessError::InvalidArgument));
 }
+
+
+#[test]
+fn c_python_import_candidates_keep_exact_evidence_and_targets_after_live_edits() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let root = std::env::temp_dir().join(format!("fcb-python-imports-c-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let source = b"# Python evidence\nfrom .worker import Tool\n";
+    let worker = b"class Tool:\n    pass\n";
+    fs::create_dir_all(root.join("pkg")).unwrap();
+    fs::write(root.join("pkg/__init__.py"), b"").unwrap();
+    fs::write(root.join("pkg/main.py"), source).unwrap();
+    fs::write(root.join("pkg/worker.py"), worker).unwrap();
+    let atlas = fcb_atlas_create(); assert_ne!(atlas, 0);
+    let path = CString::new(root.to_str().unwrap()).unwrap();
+    assert!(take(unsafe { fcb_atlas_open(atlas, path.as_ptr(), 100) }).contains("\"status\":\"ok\""));
+    assert!(take(fcb_atlas_index_prepare(atlas, 1, 100, 8192, 65536, 65536)).contains("\"capture_complete\":true"));
+    assert!(begin(atlas, 1).contains("\"status\":\"ok\""));
+    let result = finish(atlas, 1);
+    assert_eq!(number(&result, "retained_links"), 1, "{result}");
+    assert!(result.contains("\"language\":\"python\""));
+    assert!(result.contains("\"extraction_policy\":\"rust-mod-use-js-static-and-python-import-v2\""));
+    let filter = CString::new(hex(b"pkg/worker.py")).unwrap();
+    let incoming = take(unsafe { fcb_atlas_imports_page(atlas, 1, 2, filter.as_ptr(), 0, 64) });
+    assert_eq!(number(&incoming, "matching_links"), 1);
+    assert!(incoming.contains("\"resolution_basis\":\"python-relative-module-candidate\""));
+    let id = number(&incoming, "link_id");
+    fs::write(root.join("pkg/main.py"), b"import changed\n").unwrap();
+    fs::write(root.join("pkg/worker.py"), b"changed source\n").unwrap();
+    let evidence = fcb_reader_create(); let target = fcb_reader_create();
+    assert_ne!(evidence, 0); assert_ne!(target, 0);
+    for (reader, side, start) in [(evidence, 0, b"# Python evidence\n".len() as u64), (target, 1, 0)] {
+        let receipt = take(fcb_atlas_imports_open_reader(atlas, reader, 1, id, side));
+        assert!(receipt.contains("\"status\":\"ok\""), "{receipt}");
+        assert!(receipt.contains("\"lexical_import_kind\":\"python-from\""));
+        assert!(receipt.contains("\"source_reopened\":false"));
+        assert_eq!(number(&receipt, "initial_original_offset"), start);
+    }
+    assert_eq!(fcb_atlas_close(atlas), 1);
+    for (reader, bytes) in [(evidence, source.as_slice()), (target, worker.as_slice())] {
+        assert!(take(fcb_reader_copy_range(reader, 0, bytes.len() as u64)).contains(&hex(bytes)));
+        assert_eq!(fcb_reader_close(reader), 1);
+    }
+}

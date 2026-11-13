@@ -3,7 +3,7 @@
 //! A finite, explicit path policy over a caller's closed file catalog.
 //! No filesystem, package manifest, compiler configuration or URL is consulted.
 //! A local target is a navigable lexical candidate, not compiler resolution.
-use super::{ImportFact, ImportKind};
+use super::{ImportFact, ImportKind, ImportLanguage};
 
 pub const MAX_IMPORT_RESOLUTION_PATH_BYTES: usize = 16 * 1024;
 
@@ -44,6 +44,10 @@ impl<T> ImportResolution<T> {
 /// a top-level external mod; use, attributes and unmodeled scopes remain
 /// unresolved. Multiple matching paths are ambiguous even if a callback maps
 /// them to the same target identity. No extension preference is inferred.
+/// Python admits only explicit relative module candidates: leading dots climb
+/// the source directory, then dotted names become components, with .py and
+/// /__init__.py as the complete finite set. Absolute imports remain external;
+/// no sys.path, package execution, namespace-package or NFKC inference occurs.
 pub fn resolve_import<T: Copy + Eq>(
     source_path: &[u8], fact: &ImportFact, mut lookup: impl FnMut(&[u8]) -> Option<T>,
 ) -> ImportResolution<T> {
@@ -63,6 +67,9 @@ pub fn resolve_import<T: Copy + Eq>(
     }
     if fact.kind() == ImportKind::RustModule {
         return rust_module(source_path, destination, &mut lookup);
+    }
+    if matches!(fact.kind(), ImportKind::PythonImport | ImportKind::PythonFrom) {
+        return python_module(source_path, fact.kind(), destination, &mut lookup);
     }
     if destination.contains('#') || destination.ends_with('/')
         || matches!(destination.rsplit('/').next(), Some("." | "..")) {
@@ -108,6 +115,35 @@ fn rust_module<T: Copy + Eq>(
     }
     if !path.push(name.as_bytes()) { return unsupported(); }
     candidates(&mut path, &[b".rs", b"/mod.rs"], "rust-module-file-candidate", lookup)
+}
+
+fn python_module<T: Copy + Eq>(
+    source_path: &[u8], kind: ImportKind, destination: &str, lookup: &mut impl FnMut(&[u8]) -> Option<T>,
+) -> ImportResolution<T> {
+    let unsupported = || ImportResolution::without(ImportResolutionKind::Unresolved, "unsupported-specifier");
+    if ImportLanguage::from_path(source_path) != Some(ImportLanguage::Python) { return unsupported(); }
+    let dots = destination.bytes().take_while(|&byte| byte == b'.').count();
+    let names = &destination[dots..];
+    // Only the ASCII identifier subset has a byte-exact filename spelling
+    // without Python's NFKC normalization. Never guess a Unicode target.
+    if names.is_empty() || !names.split('.').all(|part| {
+        let mut bytes = part.bytes();
+        bytes.next().is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+            && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+    }) { return unsupported(); }
+    if dots == 0 {
+        return ImportResolution::without(ImportResolutionKind::External, "external-specifier");
+    }
+    if kind != ImportKind::PythonFrom { return unsupported(); }
+    let Some(mut path) = CatalogPath::parent(source_path) else { return unsupported(); };
+    for _ in 1..dots {
+        if path.len == 0 { return unsupported(); }
+        path.len = path.bytes().iter().rposition(|&byte| byte == b'/').unwrap_or(0);
+    }
+    for part in names.split('.') {
+        if !path.push(part.as_bytes()) { return unsupported(); }
+    }
+    candidates(&mut path, &[b".py", b"/__init__.py"], "python-relative-module-candidate", lookup)
 }
 
 fn candidates<T: Copy + Eq>(
@@ -288,4 +324,48 @@ mod tests {
             |_| None);
         assert_eq!(result.kind, ImportResolutionKind::Unresolved, "unprobeable candidates cannot establish absence");
     }
+    #[test]
+    fn python_forged_specifiers_and_unprobeable_candidates_never_authorize_lookup() {
+        for destination in [".", "..", ".foo..bar", ".foo/bar", ".foo\\bar",
+            ".foo bar", ".foo%2fbar", ".foo?raw", ".foo#anchor", ".caf\u{e9}", ".2name"] {
+            let result: ImportResolution<usize> = resolve_import(b"pkg/main.py",
+                &fact(ImportKind::PythonFrom, destination), |_| panic!("unsupported Python target: {destination}"));
+            assert_eq!(result.kind, ImportResolutionKind::Unresolved, "{destination}");
+        }
+        for (source, kind, destination) in [
+            (b"pkg/main.rs".as_slice(), ImportKind::PythonFrom, ".helper"),
+            (b"pkg/main.py", ImportKind::PythonImport, ".helper"),
+            (b"main.py", ImportKind::PythonFrom, "..helper"),
+        ] {
+            let result: ImportResolution<usize> = resolve_import(source, &fact(kind, destination),
+                |_| panic!("invalid Python source/scope looked up"));
+            assert_eq!(result.kind, ImportResolutionKind::Unresolved);
+        }
+        let source = [vec![b'x'; MAX_IMPORT_RESOLUTION_PATH_BYTES - 8], b"/main.py".to_vec()].concat();
+        let result: ImportResolution<usize> = resolve_import(&source, &fact(ImportKind::PythonFrom, ".helper"),
+            |_| panic!("not all Python candidates fit; uniqueness cannot be established"));
+        assert_eq!(result.kind, ImportResolutionKind::Unresolved);
+    }
+
+    #[test]
+    fn python_local_candidates_are_exactly_module_and_package_without_extension_preference() {
+        for source in [b"pkg/main.py".as_slice(), b"pkg/main.pyi", b"pkg/__init__.py", b"pkg/API.PY"] {
+            for target in [b"pkg/helper.py".as_slice(), b"pkg/helper/__init__.py"] {
+                let result = resolve(source, ImportKind::PythonFrom, ".helper", &[target]);
+                assert_eq!(result.target, Some(0));
+                assert_eq!(result.basis, "python-relative-module-candidate");
+            }
+        }
+        assert_eq!(resolve(b"main.py", ImportKind::PythonFrom, ".helper", &[b"helper.py"]).target, Some(0));
+        assert_eq!(resolve(b"pkg/main.py", ImportKind::PythonFrom, ".Helper", &[b"pkg/helper.py"]).kind,
+            ImportResolutionKind::Missing);
+        assert_eq!(resolve(b"a/b/main.py", ImportKind::PythonFrom, "..shared.tool", &[b"a/shared/tool.py"]).target,
+            Some(0));
+        let mut calls = 0;
+        let missing: ImportResolution<usize> = resolve_import(b"pkg/main.py", &fact(ImportKind::PythonFrom, ".helper"),
+            |_| { calls += 1; None });
+        assert_eq!(calls, 2);
+        assert_eq!(missing.kind, ImportResolutionKind::Missing);
+    }
+
 }

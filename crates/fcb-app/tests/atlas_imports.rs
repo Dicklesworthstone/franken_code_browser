@@ -91,8 +91,8 @@ fn coverage(page: &Json) {
     assert_eq!(page.get("evidence_precision").text(), "exact-import-source-range");
     assert_eq!(page.get("relationship_kind").text(), "lexical-import");
     assert_eq!(page.get("resolution_domain").text(), "declared-catalog-candidates");
-    assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v1");
-    assert_eq!(page.get("extraction_policy").text(), "rust-mod-use-and-js-static-import-export-v1");
+    assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v2");
+    assert_eq!(page.get("extraction_policy").text(), "rust-mod-use-js-static-and-python-import-v2");
     assert!(!page.get("compiler_resolved").flag()); assert!(!page.get("semantic_complete").flag());
     assert_eq!(page.get("source_files").number(), page.get("captured_source_files").number()
         + page.get("capture_unavailable_source_files").number() + page.get("outside_capture_scope_source_files").number()
@@ -394,4 +394,95 @@ fn raw_non_utf8_parent_paths_resolve_only_to_the_exact_captured_catalog_spelling
         row.get("link_id").number(), Side::Target, || false).unwrap();
     assert_eq!(reader.capture().bytes(), target);
     assert_eq!(json(&receipt).get("path").get("hex").text(), hex(b"dir-\xff/dep.ts"));
+}
+
+
+#[test]
+fn python_relative_imports_share_incoming_navigation_and_exact_retained_readers() {
+    let source = b"# captured Python source\nfrom .worker import Tool\nfrom . import helper as alias\nimport external.library\nfrom .ambiguous import Value\nfrom ...outside import Nope\n";
+    let worker = b"class Tool:\n    pass\n";
+    let helper = b"VALUE = 1\n";
+    let mut f = Fixture::new(&[
+        ("pkg/__init__.py", b""), ("pkg/main.py", source), ("pkg/worker.py", worker),
+        ("pkg/helper.py", helper), ("pkg/ambiguous.py", b"VALUE = 2\n"),
+        ("pkg/ambiguous/__init__.py", b"VALUE = 3\n"), ("outside.py", b"SECRET = 4\n"),
+    ]);
+    f.build(1);
+    let page = f.prepare(1, 1);
+    assert!(page.get("relationships_complete").flag(), "{page:?}");
+    assert_eq!(page.get("retained_links").number(), 5);
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v2");
+
+    let row = link(&page, b"pkg/main.py", ".worker");
+    assert_eq!(row.get("language").text(), "python");
+    assert_eq!(row.get("lexical_import_kind").text(), "python-from");
+    assert_eq!(row.get("resolution").text(), "captured");
+    assert_eq!(row.get("resolution_basis").text(), "python-relative-module-candidate");
+    assert_eq!(row.get("target_path").get("hex").text(), hex(b"pkg/worker.py"));
+    assert_eq!(range(row.get("evidence_range"), source), b"from .worker import Tool");
+    assert_eq!(range(row.get("specifier_range"), source), b".worker");
+    assert_eq!(row.get("source_sha256").text(), Sha256::digest(source).to_hex());
+    let helper_row = link(&page, b"pkg/main.py", ".helper");
+    assert_eq!(range(helper_row.get("specifier_range"), source), b"helper",
+        "A relative prefix plus an imported name is not a fictional contiguous source slice");
+    assert_eq!(helper_row.get("target_path").get("hex").text(), hex(b"pkg/helper.py"));
+    let incoming = f.page(1, Direction::Incoming, Some(b"pkg/worker.py"), 0, 64);
+    assert_eq!(incoming.get("matching_links").number(), 1);
+    assert_eq!(incoming.get("links").array()[0], *row);
+    let outgoing = f.page(1, Direction::Outgoing, Some(b"pkg/main.py"), 0, 64);
+    assert_eq!(outgoing.get("matching_links").number(), 5);
+    for (destination, status) in [
+        ("external.library", "external"), (".ambiguous", "ambiguous"), ("...outside", "unresolved")
+    ] {
+        let refused = link(&page, b"pkg/main.py", destination);
+        assert_eq!(refused.get("resolution").text(), status);
+        assert_eq!(refused.get("target_file_id"), &Json::Null);
+        assert_eq!(f.search.open_import_reader(&f.atlas, owner(72911), 1,
+            refused.get("link_id").number(), Side::Target, || false).err(), Some(Error::ImportTargetUnavailable));
+    }
+
+    // Navigation follows the index's captured source, even after both live
+    // files change and after the relationship inventory itself is retired.
+    fs::write(f.root.join("pkg/main.py"), b"import changed\n").unwrap();
+    fs::write(f.root.join("pkg/worker.py"), b"class Changed: pass\n").unwrap();
+    let id = row.get("link_id").number();
+    let (evidence, receipt) = f.search.open_import_reader(&f.atlas, owner(72912), 1, id, Side::Evidence, || false).unwrap();
+    let receipt = json(&receipt);
+    assert_eq!(receipt.get("relationship"), row);
+    assert_eq!(receipt.get("initial_original_offset"), row.get("evidence_range").get("start"));
+    assert_eq!(receipt.get("additional_source_bytes_read").number(), 0);
+    let (target, receipt) = f.search.open_import_reader(&f.atlas, owner(72913), 1, id, Side::Target, || false).unwrap();
+    assert!(!json(&receipt).get("source_reopened").flag());
+    f.search.clear_index(&f.atlas, 2, || false).unwrap();
+    assert_eq!(evidence.capture().bytes(), source);
+    assert_eq!(target.capture().bytes(), worker);
+}
+
+#[test]
+fn python_import_evidence_keeps_original_utf16_coordinates_and_package_candidates() {
+    let statement = "from .tools import Tool";
+    let prefix = "# \u{1f40d} Python\r\n";
+    let text = format!("\u{feff}{prefix}{statement}\r\n");
+    for big_endian in [false, true] {
+        let source: Vec<u8> = text.encode_utf16().flat_map(|unit| {
+            if big_endian { unit.to_be_bytes() } else { unit.to_le_bytes() }
+        }).collect();
+        let target = b"class Tool:\n    pass\n";
+        let mut f = Fixture::new(&[
+            ("pkg/__init__.py", b""), ("pkg/main.py", &source), ("pkg/tools/__init__.py", target)
+        ]);
+        f.build(1);
+        let page = f.prepare(1, 1);
+        assert!(page.get("relationships_complete").flag());
+        let row = link(&page, b"pkg/main.py", ".tools");
+        let start = 2 + prefix.encode_utf16().count() * 2;
+        let end = start + statement.encode_utf16().count() * 2;
+        assert_eq!(row.get("evidence_range").get("start").number(), start as u64);
+        assert_eq!(row.get("evidence_range").get("end").number(), end as u64);
+        assert_eq!(row.get("target_path").get("hex").text(), hex(b"pkg/tools/__init__.py"));
+        let (reader, receipt) = f.search.open_import_reader(&f.atlas, owner(72914), 1,
+            row.get("link_id").number(), Side::Evidence, || false).unwrap();
+        assert_eq!(reader.capture().bytes(), source);
+        assert_eq!(json(&receipt).get("initial_original_offset").number(), start as u64);
+    }
 }

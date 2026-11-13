@@ -193,8 +193,8 @@ final class ProjectLinksFixture: @unchecked Sendable {
 extension ProjectLinksFixture {
     static var importProof: [String: Any] {
         ["projection": "lexical-source-imports", "relationship_kind": "lexical-import",
-         "evidence_precision": "exact-import-source-range", "extractor": "franken-markdown-d6fbd1d5/import-statements-v1",
-         "resolver": "fcb-closed-catalog-imports-v1", "extraction_policy": "rust-mod-use-and-js-static-import-export-v1",
+         "evidence_precision": "exact-import-source-range", "extractor": "franken-markdown-d6fbd1d5/import-statements-v2",
+         "resolver": "fcb-closed-catalog-imports-v2", "extraction_policy": "rust-mod-use-js-static-and-python-import-v2",
          "compiler_resolved": false, "semantic_complete": false]
     }
     static func importRow(_ id: UInt64) -> [String: Any] {

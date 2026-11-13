@@ -115,9 +115,87 @@ import Foundation
         substituted["schema"] = "fcb.atlas-imports/1"; refuse(substituted, index: index)
     }
 
+
+    /// Language support is accepted only with its declared evidence policy.
+    /// Scripted envelopes exercise the native consumer; real-source extraction
+    /// and original-byte navigation are covered by the Rust host/ABI fixtures.
+    private static func pythonWire(_ index: AtlasPreparedIndex) throws {
+        var value = ProjectLinksFixture.importPage(owner: index.basis.owner,
+            generation: 1, command: "imports-page")
+        var rows = value["links"] as! [[String: Any]]
+        for i in rows.indices {
+            rows[i]["language"] = "python"
+            rows[i]["lexical_import_kind"] = "python-from"
+            rows[i]["destination"] = ".worker"
+            rows[i]["resolution_basis"] = "python-relative-module-candidate"
+            rows[i]["source_path"] = ProjectLinksFixture.path("pkg/main.py")
+            rows[i]["target_path"] = ProjectLinksFixture.path("pkg/worker.py")
+        }
+        value["links"] = rows
+        let page = try decode(value, index: index), link = page.links[0]
+        precondition(link.canOpenTarget && link.importEvidence?.language == "python")
+        precondition(link.importEvidence?.kind == "python-from"
+            && link.evidenceLabel.contains("Python from-import statement")
+            && link.evidenceLabel.contains("not compiler resolved"))
+        precondition(link.source.path.bytes == Array("pkg/main.py".utf8)
+            && link.target?.path.bytes == Array("pkg/worker.py".utf8))
+
+        for (key, wrong) in [
+            ("language", "rust"), ("language", "swift"),
+            ("lexical_import_kind", "python-import"),
+            ("lexical_import_kind", "javascript-import"),
+            ("resolution_basis", "rust-module-file-candidate"),
+            ("resolution_basis", "unique-relative-module-candidate"),
+            ("resolution_basis", "external-specifier")
+        ] {
+            var bad = value, changed = rows
+            changed[0][key] = wrong; bad["links"] = changed
+            refuse(bad, index: index)
+        }
+        for (key, oldPolicy) in [
+            ("extractor", "franken-markdown-d6fbd1d5/import-statements-v1"),
+            ("resolver", "fcb-closed-catalog-imports-v1"),
+            ("extraction_policy", "rust-mod-use-and-js-static-import-export-v1")
+        ] {
+            var bad = value; bad[key] = oldPolicy
+            refuse(bad, index: index)
+        }
+
+        // Absolute Python imports keep readable source evidence without
+        // assigning a local module by guessing sys.path or package execution.
+        var external = value, externalRows = rows
+        for i in externalRows.indices {
+            externalRows[i]["lexical_import_kind"] = "python-import"
+            externalRows[i]["destination"] = "external.library"
+            externalRows[i]["resolution"] = "external"
+            externalRows[i]["resolution_basis"] = "external-specifier"
+            for key in ["target_file_id", "target_path", "target_revision", "target_sha256", "target_bytes"] {
+                externalRows[i][key] = NSNull()
+            }
+        }
+        external["links"] = externalRows
+        let absolute = try decode(external, index: index).links[0]
+        precondition(!absolute.canOpenTarget && absolute.importEvidence?.kind == "python-import"
+            && absolute.evidenceLabel.contains("Python import statement"))
+        for (resolution, basis) in [("missing", "no-catalog-target"),
+            ("ambiguous", "ambiguous-catalog-target"), ("unresolved", "unsupported-specifier")] {
+            var unavailable = external, unavailableRows = externalRows
+            for i in unavailableRows.indices {
+                unavailableRows[i]["lexical_import_kind"] = "python-from"
+                unavailableRows[i]["destination"] = ".worker"
+                unavailableRows[i]["resolution"] = resolution
+                unavailableRows[i]["resolution_basis"] = basis
+            }
+            unavailable["links"] = unavailableRows
+            let unavailablePage = try decode(unavailable, index: index)
+            precondition(unavailablePage.links.allSatisfy { !$0.canOpenTarget })
+        }
+    }
+
     @MainActor static func main() async throws {
         let fixture = ProjectLinksFixture(includesImports: true), index = try await prepared(fixture)
         try wire(index)
+        try pythonWire(index)
         let live = ProjectLinksFixture(includesImports: true)
         let model = AtlasProjectLinksModel(root: "/project", transport: live.transport)
         precondition(model.availableProjections == [.documentation, .imports])
