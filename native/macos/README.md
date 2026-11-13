@@ -130,6 +130,34 @@ Use **Refresh project**, or the search surface's **Refresh file catalog**, after
 changing ignore rules. Captures and searches already retained by an earlier
 catalog keep their original identity and coverage.
 
+### Reading large files from Project Files
+
+Every **Project Files** row offers **Read ranges**, so a file can be read directly
+from a discovery page even when it is larger than the complete reader's **32 MiB**
+limit. Files whose observed size exceeds that limit recommend this action.
+Clicking the filename still requests an independent complete capture; an earlier
+size observation does not decide whether the current file fits that request.
+If capture reaches its input limit, its message points to **Read ranges**.
+
+**Read ranges** opens the existing **Observed Range Reader** with a bounded first
+range. It supports byte and physical-line navigation, literal and occurrence
+search, and exact copying from retained observations. Each newly read range is
+an observation of the current file, with its own identity and coverage. It does
+not claim a whole-file immutable revision or replace an earlier exact capture.
+
+The clicked file must still belong to the displayed retained discovery page and
+the same project root and access grant. Raw native filenames, including names
+that are not UTF-8, follow their retained byte identity. The app closes this
+current-source surface when the project is replaced or refreshed, or its access
+grant changes. Entered range work drains before its descriptor and access lease
+retire; independently retained complete readers remain usable.
+
+Focused native cases in
+[`swiftui/tests/test-project-catalog.sh`](swiftui/tests/test-project-catalog.sh)
+cover oversized metadata, explicit range admission after capture refusal, raw
+filenames, stale rows and grants, cancellation/drain, and surviving exact readers.
+Executable verification and physical-Mac interaction checks remain pending.
+
 ### Refreshing an open project
 
 **Refresh project** prepares a new bounded metadata page while the accepted

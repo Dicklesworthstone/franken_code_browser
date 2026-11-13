@@ -5,6 +5,12 @@ import Dispatch
 enum AtlasProjectBrowserError: Error, Sendable {
     case unavailable, invalidResponse, stale, canceled
     case engine(String)
+    var captureMessage: String {
+        if case .engine("CLI_INPUT_LIMIT") = self {
+            return "The complete reader admits up to 32 MiB per file. Choose Read ranges beside this file to read bounded observations of its current contents."
+        }
+        return message
+    }
     var message: String {
         switch self {
         case .unavailable: return "Project browsing is unavailable. Refresh the project to try again."
@@ -608,6 +614,17 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
     var canContinue: Bool { canOperate && info?.more == true }
     var currentPage: Bool { guard let info, let page else { return false }; return info.owner == page.info.owner && info.retains(page.id) }
 
+    /// A clicked row must still belong to this session's displayed retained
+    /// page. Return the accepted raw identity, never the caller's display text.
+    /// Both complete capture and explicit current-range reading use this check;
+    /// admitting metadata alone performs no filesystem or source operation.
+    func currentFile(_ file: AtlasProjectBrowserFile, from page: AtlasProjectBrowserPage) -> AtlasProjectBrowserFile? {
+        guard canOperate, currentPage, let accepted = self.page, let lease = session,
+              page.info.owner == lease.owner, accepted.id == page.id,
+              accepted.info.owner == page.info.owner, page.files.contains(where: { $0.matches(file) }) else { return nil }
+        return accepted.files.first(where: { $0.matches(file) })
+    }
+
     func open(root: String, accessLease: AnyObject?) async throws {
         guard !closed, !busy, session == nil, root.hasPrefix("/"), root.utf8.count <= 16_384,
               !root.utf8.contains(0) else { throw AtlasProjectBrowserError.unavailable }
@@ -678,10 +695,8 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
     func openFile(_ file: AtlasProjectBrowserFile, from page: AtlasProjectBrowserPage,
         readerTransport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
         outline: AtlasReaderOutlineTransport? = nil, document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasProjectBrowserCapture {
-        guard canOperate, currentPage, let accepted = self.page, let lease = session, let domain = transport.readerDomain,
-              readerTransport.comparison?.domain == domain, page.info.owner == lease.owner,
-              accepted.id == page.id, accepted.info.owner == page.info.owner,
-              accepted.files.contains(where: { $0.matches(file) }), page.files.contains(where: { $0.matches(file) }) else {
+        guard currentFile(file, from: page) != nil, let lease = session, let domain = transport.readerDomain,
+              readerTransport.comparison?.domain == domain else {
             throw AtlasProjectBrowserError.stale
         }
         try Task.checkCancellation()

@@ -12,6 +12,8 @@ import SwiftUI
     let build, cancelPreviews, refresh, showAtlas: () -> Void
     let canKeep: Bool
     let keep: (AtlasPagedReaderModel) -> Void
+    let canReadRanges: Bool
+    let readRanges: (AtlasProjectBrowserFile, AtlasProjectBrowserPage) throws -> Void
     @State private var capture: AtlasProjectBrowserCapture?
     @State private var readerTask: Task<Void, Never>?
     @State private var readerNotice = ""
@@ -66,16 +68,28 @@ import SwiftUI
                         }.frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
                         List(entries) { file in
-                            Button { open(file, from: page) } label: {
-                                HStack(alignment: .top) {
-                                    Image(systemName: "doc.text").foregroundStyle(.secondary)
-                                    Text(verbatim: file.display).font(.system(size: 12, design: .monospaced))
-                                        .lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
-                                    Text("\(file.observedBytes) bytes observed").font(.caption2).foregroundStyle(.secondary)
-                                }.contentShape(Rectangle())
-                            }.buttonStyle(.plain).disabled(!model.canOperate || readerTask != nil)
-                                .accessibilityLabel("Open " + file.display)
-                                .help("Capture the selected file now and read it independently of discovery")
+                            HStack(alignment: .top, spacing: 12) {
+                                Button { open(file, from: page) } label: {
+                                    HStack(alignment: .top) {
+                                        Image(systemName: "doc.text").foregroundStyle(.secondary)
+                                        Text(verbatim: file.display).font(.system(size: 12, design: .monospaced))
+                                            .lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+                                        VStack(alignment: .trailing, spacing: 2) {
+                                            Text("\(file.observedBytes) bytes observed")
+                                            if file.observedBytes > AtlasReaderLimits.captureBytes {
+                                                Text("Read ranges recommended").foregroundStyle(.orange)
+                                            }
+                                        }.font(.caption2).foregroundStyle(.secondary)
+                                    }.contentShape(Rectangle())
+                                }.buttonStyle(.plain).disabled(!model.canOperate || readerTask != nil)
+                                    .accessibilityLabel("Open " + file.display)
+                                    .help("Capture up to 32 MiB now and read it independently of discovery. Choose Read ranges for larger files.")
+                                Button("Read ranges") { observe(file, from: page) }
+                                    .buttonStyle(.bordered).controlSize(.small)
+                                    .disabled(!canReadRanges || !model.canOperate || readerTask != nil)
+                                    .accessibilityLabel("Read current ranges of " + file.display)
+                                    .help("Open bounded observations of this current project file, including files larger than 32 MiB")
+                            }
                         }.listStyle(.inset).id("\(info.owner):\(page.id)")
                     }
                     HStack {
@@ -88,6 +102,8 @@ import SwiftUI
                         Text("Retained pages \(info.firstRetained)…\(info.latest)").font(.caption).foregroundStyle(.secondary)
                     }.controlSize(.small)
                     Text("The latest four pages stay available as you continue; Refresh starts discovery again. Page order follows discovery, and the file filter applies to the displayed page.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                    Text("Click a filename to retain a complete capture up to 32 MiB. Read ranges opens the current file in bounded observations; earlier captures keep their original bytes.")
                         .font(.caption2).foregroundStyle(.secondary)
                 } else {
                     Button("Reload latest page", action: model.reload).disabled(!model.canOperate)
@@ -125,6 +141,16 @@ import SwiftUI
             readerNotice = ""
         }
     }
+    private func observe(_ file: AtlasProjectBrowserFile, from page: AtlasProjectBrowserPage) {
+        guard canReadRanges, readerTask == nil else { return }
+        do {
+            try readRanges(file, page)
+            readerNotice = "Opening the current file in the Observed Range Reader. Each range is a separate observation."
+        } catch {
+            readerNotice = (error as? AtlasProjectBrowserError)?.message
+                ?? (error as? AtlasObservedReaderError)?.message ?? "This current file is unavailable. Choose it again from Project Files."
+        }
+    }
     private func open(_ file: AtlasProjectBrowserFile, from page: AtlasProjectBrowserPage) {
         guard readerTask == nil else { return }
         let browser = model
@@ -138,7 +164,7 @@ import SwiftUI
                 else { capture = captured }
             } catch {
                 guard !Task.isCancelled, !browser.closed else { return }
-                readerNotice = (error as? AtlasProjectBrowserError)?.message
+                readerNotice = (error as? AtlasProjectBrowserError)?.captureMessage
                     ?? (error as? AtlasReaderError)?.message ?? "The selected file could not be opened."
             }
         }

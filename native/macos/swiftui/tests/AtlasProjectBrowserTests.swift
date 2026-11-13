@@ -17,6 +17,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
     let fragmentStatus: String
     let repositoryRules: Bool
     let ruleFailure: String?
+    let observedBytes: UInt64
     private let lock = NSLock()
     private var sessions: [UInt64: Session] = [:], readers: [UInt64: [UInt8]] = [:]
     private var receipts: [UInt64: (page: UInt64, file: UInt64)] = [:]
@@ -26,12 +27,13 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
     private var fault: String?, blocked = false
     private var log: [String] = []
     init(emptyFirst: Bool = false, completeFirst: Bool = false, fragmentStatus: String = "unsupported",
-        repositoryRules: Bool = false, ruleFailure: String? = nil) {
+        repositoryRules: Bool = false, ruleFailure: String? = nil, observedBytes: UInt64 = 4096) {
         precondition(["none", "document-start", "resolved", "missing-heading", "ambiguous",
             "limited", "unsupported", "invalid", "resolved-lines", "missing-line"].contains(fragmentStatus))
         precondition(ruleFailure == nil || repositoryRules)
         self.emptyFirst = emptyFirst; self.completeFirst = completeFirst; self.fragmentStatus = fragmentStatus
         self.repositoryRules = repositoryRules; self.ruleFailure = ruleFailure
+        self.observedBytes = observedBytes
     }
     private func locked<T>(_ work: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return work() }
     var calls: [String] { locked { log } }
@@ -80,7 +82,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         }
     }
     func row(_ page: UInt64) -> [String: Any] {
-        ["file_id": String(page - (emptyFirst ? 1 : 0)), "path": path(raw(page)), "observed_bytes": "4096"]
+        ["file_id": String(page - (emptyFirst ? 1 : 0)), "path": path(raw(page)), "observed_bytes": String(observedBytes)]
     }
     private func ruleEvidence(scopeComplete: Bool) -> [String: Any] {
         let diagnostics: [[String: Any]] = ruleFailure.map {
@@ -306,6 +308,11 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
                         guard let session = sessions[owner], pageID <= session.latest, session.latest - pageID < 4,
                               file == pageID - (emptyFirst ? 1 : 0), bytes == AtlasReaderLimits.captureBytes else { return nil }
                         log.append("capture:\(owner):\(pageID):\(file)")
+                        if fault == "capture-limit" {
+                            fault = nil
+                            return json(["schema": "fcb.project-catalog-session/1", "status": "error", "owner": String(owner),
+                                "error": ["code": "CLI_INPUT_LIMIT"]])
+                        }
                         let raw = raw(pageID); readers[reader] = raw
                         receipts[reader] = (pageID, file)
                         var out = header(owner, command: "open-reader", latest: session.latest, paused: session.paused)
@@ -533,6 +540,9 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         try await repositoryRuleFailuresKeepRowsAndDirtyHints()
         try await emptyPagesLostRepliesPauseAndEviction()
         try await exactRawFileCaptureAndForgedReceipts()
+        try await observedRangeAdmissionUsesCurrentRawRowsAndGrant()
+        try await captureLimitOffersIndependentCurrentRanges()
+        try await projectRangeRevocationDrainsWithoutClosingCaptures()
         try await closeDrainsGrantAndLateCapture()
         try await refreshKeepsAcceptedProjectUsableUntilPublication()
         try await failedAndRejectedRefreshKeepTheAcceptedProject()
@@ -894,6 +904,162 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         await refuse("closed project published a late reader") { _ = try await pending.value }
         await wait("closed project/capture failed to retire") { f.calls.contains("close:40") && f.calls.contains("reader-close:100") && observed == nil }
         precondition(model.info == nil && model.page == nil && !f.calls.contains("LABEL-OPEN"))
+    }
+
+    @MainActor private static func observedRangeAdmissionUsesCurrentRawRowsAndGrant() async throws {
+        final class Grant { }
+        let f = ProjectBrowserFixture(observedBytes: (1 << 33) + 32)
+        let model = AtlasProjectBrowserModel(transport: f.transport), grant = Grant(), project = UUID()
+        let root = "/r\u{e9}po"
+        try await model.open(root: root, accessLease: grant)
+        model.advance(); await wait("raw range row did not arrive") { !model.busy }
+        let page = model.page!, file = page.files[0], before = f.calls
+        let source = try model.observedSource(file, from: page, root: root, project: project,
+            browserOwner: page.info.owner, accessLease: grant)
+        precondition(source.input.relativePath == [255, 46, 114, 115]
+            && source.input.absolutePath == Array(root.utf8) + [47, 255, 46, 114, 115]
+            && source.identity.project == project && source.identity.grant == ObjectIdentifier(grant)
+            && source.currentMatch == nil && file.observedBytes > UInt64(UInt32.max))
+        precondition(f.calls == before, "Admitting a large row must not create a reader, capture source or rediscover files")
+
+        func row(_ fields: [String: Any]) throws -> AtlasProjectBrowserFile {
+            try JSONDecoder().decode(AtlasProjectBrowserFile.self, from: Data(f.json(fields).utf8))
+        }
+        var changedDisplay = f.row(2), label = f.path(f.raw(2))
+        label["display"] = "/outside/never-open-this-label"; changedDisplay["path"] = label
+        let relabeled = try model.observedSource(row(changedDisplay), from: page, root: root,
+            project: project, browserOwner: page.info.owner, accessLease: grant)
+        precondition(relabeled.input == source.input, "Display labels cannot replace a retained row's raw filename")
+        for (key, value) in [("file_id", "99" as Any), ("observed_bytes", "0" as Any),
+            ("path", f.path(Array("other.rs".utf8)) as Any)] {
+            var forged = f.row(2); forged[key] = value
+            reject("Changed row identity acquired current-source authority") {
+                _ = try model.observedSource(row(forged), from: page, root: root,
+                    project: project, browserOwner: page.info.owner, accessLease: grant)
+            }
+        }
+        for differentRoot in ["/other", "/re\u{301}po"] {
+            reject("Different raw root acquired current-source authority") {
+                _ = try model.observedSource(file, from: page, root: differentRoot,
+                    project: project, browserOwner: page.info.owner, accessLease: grant)
+            }
+        }
+        let differentGrants: [AnyObject?] = [Grant(), nil]
+        for differentGrant in differentGrants {
+            reject("Replaced or absent grant acquired current-source authority") {
+                _ = try model.observedSource(file, from: page, root: root,
+                    project: project, browserOwner: page.info.owner, accessLease: differentGrant)
+            }
+        }
+        reject("Different catalog owner acquired current-source authority") {
+            _ = try model.observedSource(file, from: page, root: root,
+                project: project, browserOwner: page.info.owner + 1, accessLease: grant)
+        }
+        let foreign = try AtlasProjectBrowserPage.decode(f.json(f.page(2, owner: 99, latest: 2)), owner: 99)
+        reject("Foreign page acquired current-source authority") {
+            _ = try model.observedSource(file, from: foreign, root: root,
+                project: project, browserOwner: page.info.owner, accessLease: grant)
+        }
+        f.blockNext(); model.advance()
+        await wait("Discovery did not enter before range admission") { f.entered.wait(timeout: .now()) == .success }
+        reject("Busy page admitted a second source action") {
+            _ = try model.observedSource(file, from: page, root: root,
+                project: project, browserOwner: page.info.owner, accessLease: grant)
+        }
+        f.resume.signal(); await wait("Discovery failed to drain") { !model.busy }
+        reject("A row from the previously displayed page remained actionable") {
+            _ = try model.observedSource(file, from: page, root: root,
+                project: project, browserOwner: page.info.owner, accessLease: grant)
+        }
+        model.load(page: page.id); await wait("Retained raw page failed to reload") { !model.busy }
+        let reloaded = try model.observedSource(file, from: page, root: root, project: project,
+            browserOwner: page.info.owner, accessLease: grant)
+        precondition(reloaded.input == source.input)
+        model.close()
+        reject("Closed browser retained current-source authority") {
+            _ = try model.observedSource(file, from: page, root: root,
+                project: project, browserOwner: page.info.owner, accessLease: grant)
+        }
+        precondition(!f.calls.contains(where: { $0.hasPrefix("capture:") }) && !f.calls.contains("LABEL-OPEN"))
+    }
+
+    @MainActor private static func captureLimitOffersIndependentCurrentRanges() async throws {
+        // Old metadata does not authorize weakening a complete capture. A file
+        // can shrink below the cap or grow beyond it after the discovery page.
+        let f = ProjectBrowserFixture(observedBytes: (1 << 33) + 32)
+        let model = AtlasProjectBrowserModel(transport: f.transport), project = UUID()
+        try await model.open(root: "/repo", accessLease: nil)
+        let page = model.page!, file = page.files[0]
+        let capture = try await model.openFile(file, from: page, readerTransport: f.readerTransport)
+        let exact = capture.reader.page!
+        precondition(exact.identity.capturedBytes == 9 && file.observedBytes > AtlasReaderLimits.captureBytes,
+            "Observed metadata size must not refuse a now-small complete capture")
+        f.corrupt("capture-limit")
+        do {
+            _ = try await model.openFile(file, from: page, readerTransport: f.readerTransport)
+            preconditionFailure("An oversized file became a partial complete capture")
+        } catch let error as AtlasProjectBrowserError {
+            guard case .engine("CLI_INPUT_LIMIT") = error else { throw error }
+            precondition(error.captureMessage.contains("Read ranges") && error.captureMessage.contains("32 MiB"))
+        }
+        precondition(model.currentPage && model.canOperate && capture.reader.page?.identity.matches(exact.identity) == true)
+        let probe = ObservedReaderProbe()
+        let presentation = AtlasObservedReaderPresentation(source: try model.observedSource(file, from: page,
+            root: "/repo", project: project, browserOwner: page.info.owner, accessLease: nil), transport: probe.transport)
+        presentation.model.pageBytes = 4
+        precondition(probe.createCount == 0, "Choosing ranges constructs no source owner on the interaction callback")
+        presentation.start()
+        await wait("Large-file ranges failed to open after capture refusal") { !presentation.model.busy && presentation.model.page != nil }
+        precondition(presentation.model.page?.observation.observedLength == ObservedReaderFixture.length
+            && presentation.model.page?.observation.wholeFileObserved == false
+            && presentation.model.page?.visibleRange.count == 4
+            && capture.reader.page?.text == exact.text && probe.openCount == 1)
+        presentation.close()
+        await wait("Independent range owner did not retire") { probe.closedCount == 1 }
+        precondition(capture.reader.canPin && capture.reader.page?.identity.matches(exact.identity) == true)
+        probe.failOpen()
+        let failed = AtlasObservedReaderPresentation(source: try model.observedSource(file, from: page,
+            root: "/repo", project: project, browserOwner: page.info.owner, accessLease: nil), transport: probe.transport)
+        failed.model.pageBytes = 4; failed.start()
+        await wait("Unavailable current source did not finish") { !failed.model.busy }
+        precondition(failed.model.page == nil && capture.reader.page?.text == exact.text && model.canOperate,
+            "A failed current-file open must preserve the previous complete capture and discovery page")
+        failed.close()
+        await wait("Failed observed candidate did not retire") { probe.closedCount == 2 }
+        capture.reader.close(); model.close()
+    }
+
+    @MainActor private static func projectRangeRevocationDrainsWithoutClosingCaptures() async throws {
+        let f = ProjectBrowserFixture(), probe = ObservedReaderProbe()
+        let browser = AtlasProjectBrowserModel(transport: f.transport), project = UUID()
+        var grant: ObservedReaderGrant? = ObservedReaderGrant(probe, "project-ranges")
+        try await browser.open(root: "/repo", accessLease: grant)
+        let page = browser.page!, file = page.files[0]
+        let capture = try await browser.openFile(file, from: page, readerTransport: f.readerTransport)
+        var presentation: AtlasObservedReaderPresentation? = AtlasObservedReaderPresentation(
+            source: try browser.observedSource(file, from: page, root: "/repo", project: project,
+                browserOwner: page.info.owner, accessLease: grant), transport: probe.transport)
+        grant = nil
+        let rangeReader = presentation!.model; rangeReader.pageBytes = 4
+        presentation!.start()
+        await wait("Project range reader failed to open") { !rangeReader.busy && rangeReader.page != nil }
+        let gate = ObservedReaderGate(); probe.block(4, on: gate)
+        rangeReader.observe(offset: 4)
+        await wait("Project range worker did not enter") { gate.entered }
+        // Match App's authority-change route: revoke the presentation before
+        // releasing the sheet, without touching the independently kept capture.
+        presentation!.close(); presentation!.start(); presentation = nil; browser.close()
+        precondition(rangeReader.closed && probe.createCount == 1 && probe.closedCount == 0
+            && !probe.hasReleased("project-ranges") && capture.reader.canPin)
+        gate.release()
+        await wait("Revoked observed worker did not drain") { probe.closedCount == 1 && f.calls.contains("close:40") }
+        precondition(rangeReader.page == nil && !probe.hasReleased("project-ranges"),
+            "Late observations stay revoked; the surviving capture still owns its native access lease")
+        capture.reader.offsetInput = "4"; capture.reader.goToByte()
+        await wait("Exact capture stopped reading after current-range revocation") { !capture.reader.busy }
+        precondition(capture.reader.page?.text == "ured\n" && probe.openCount == 1 && probe.maximumActive == 1)
+        capture.reader.close()
+        await wait("Final captured grant did not drain") { probe.hasReleased("project-ranges") }
     }
     @MainActor private static func refreshKeepsAcceptedProjectUsableUntilPublication() async throws {
         let f = ProjectBrowserFixture(), old = AtlasProjectBrowserModel(transport: f.transport)

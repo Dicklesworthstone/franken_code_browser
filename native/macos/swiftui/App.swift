@@ -1374,6 +1374,7 @@ private struct AtlasFrozenViewportSearch: Sendable {
     }
 
     private var progressiveProjectView: some View {
+        let browser = projectBrowser, rangeAuthority = snapshotExportSource
         let visible = projectBrowser.page?.files.filter { file in
             String(bytes: file.rawPath, encoding: .utf8).map { fileScope.includes($0, custom: customExtensions) }
                 ?? (fileScope == .all)
@@ -1389,6 +1390,16 @@ private struct AtlasFrozenViewportSearch: Sendable {
                 // Keep the capture without replacing the file reader's sheet.
                 // The Reading Desk toolbar opens the independently kept source.
                 readingDesk.keep(reader: reader)
+            }, canReadRanges: rangeAuthority != nil, readRanges: { file, page in
+                // A queued action from an older rendered page cannot borrow a
+                // replacement project's grant, even when the root text matches.
+                guard let authority = rangeAuthority, projectBrowser === browser,
+                      snapshotExportSource?.identity == authority.identity else { throw AtlasProjectBrowserError.stale }
+                let source = try browser.observedSource(file, from: page, root: authority.root,
+                    project: authority.identity.project, browserOwner: authority.identity.browserOwner,
+                    accessLease: authority.access)
+                closeObservedReader()
+                observedReader = AtlasObservedReaderPresentation(source: source, transport: .native)
             })
             .id(projectViewIdentity)
     }
