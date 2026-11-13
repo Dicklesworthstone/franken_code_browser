@@ -128,6 +128,8 @@ private final class AtlasSavedSession: @unchecked Sendable {
     private(set) var imports: AtlasSavedImports?
     private(set) var importDirection: AtlasSavedDirection = .all
     private(set) var importGeneration: UInt64?
+    private(set) var pathPage: AtlasSavedPaths?
+    private(set) var pathGeneration: UInt64?
     private(set) var searchPage: AtlasSavedSearchPage?
     private(set) var queryGeneration: UInt64?
     private(set) var expressionPage: AtlasSavedExpressionPage?
@@ -140,6 +142,9 @@ private final class AtlasSavedSession: @unchecked Sendable {
     private(set) var closed = false
     private(set) var notice = "Open an FCBS saved repository to browse its captured members and documentation links."
     var memberOffsetInput = "0"
+    var pathInput = ""
+    var pathMode: AtlasSavedPathMode = .fuzzy
+    var pathCaseSensitive = false
     var searchInput = ""
     var searchMode: AtlasSavedSearchMode = .literal
     var searchNameMode: AtlasSearchNameMode = .contains
@@ -154,6 +159,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     @ObservationIgnored private var cancellation: AtlasSearchCancellation?
     @ObservationIgnored private var lastRelationshipAttempt: UInt64 = 0
     @ObservationIgnored private var lastImportAttempt: UInt64 = 0
+    @ObservationIgnored private var lastPathAttempt: UInt64 = 0
     @ObservationIgnored private var lastQueryAttempt: UInt64 = 0
     @ObservationIgnored private var lastExpressionAttempt: UInt64 = 0
     @ObservationIgnored private var lastStructureAttempt: UInt64 = 0
@@ -162,6 +168,11 @@ private final class AtlasSavedSession: @unchecked Sendable {
     init(transport: AtlasSavedTransport) { self.transport = transport }
     var canOperate: Bool { !busy && !closed }
     var readerDomain: UUID? { transport.readerDomain }
+    var validPathInput: Bool { AtlasSavedPathWire.validQuery(Array(pathInput.utf8)) }
+    var pathSearchIsCurrent: Bool {
+        guard let pathPage, info?.identity == pathPage.identity, pathGeneration == pathPage.generation else { return false }
+        return Array(pathInput.utf8) == pathPage.query && pathMode == pathPage.mode && pathCaseSensitive == pathPage.caseSensitive
+    }
     var importsAreCurrent: Bool {
         guard let imports, info?.identity == imports.identity, importGeneration == imports.generation,
               importDirection == imports.direction else { return false }
@@ -224,6 +235,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 model.info = opened; model.members = page; model.selectedMember = page.items.first
                 model.relationships = nil; model.relationshipGeneration = nil; model.direction = .all
                 model.imports = nil; model.importGeneration = nil; model.importDirection = .all; model.lastImportAttempt = 0
+                model.pathPage = nil; model.pathGeneration = nil; model.lastPathAttempt = 0; model.pathInput = ""
                 model.lastRelationshipAttempt = 0; model.memberOffsetInput = "0"
                 model.searchPage = nil; model.queryGeneration = nil; model.lastQueryAttempt = 0; model.searchInput = ""
                 model.expressionPage = nil; model.expressionGeneration = nil; model.lastExpressionAttempt = 0
@@ -333,6 +345,9 @@ private final class AtlasSavedSession: @unchecked Sendable {
     func selectMember(_ member: AtlasSavedMember, from identity: AtlasSavedIdentity, forImports: Bool = false) {
         guard canOperate, info?.identity == identity, members?.identity == identity,
               members?.items.contains(where: { $0.matches(member) }) == true else { return }
+        selectAcceptedMember(member, forImports: forImports)
+    }
+    private func selectAcceptedMember(_ member: AtlasSavedMember, forImports: Bool) {
         selectedMember = member
         if direction != .all { relationships = nil }
         if importDirection != .all { imports = nil }
@@ -341,6 +356,114 @@ private final class AtlasSavedSession: @unchecked Sendable {
         } else if !forImports, direction != .all, relationshipGeneration != nil {
             loadRelationships(direction: direction)
         }
+    }
+
+    func searchPaths() {
+        guard canOperate, info != nil else { return }
+        if pathInput.isEmpty { clearPaths(); return }
+        guard validPathInput else { notice = "Enter a filename or path using up to 256 UTF-8 bytes, without NUL."; return }
+        submitPaths(query: Array(pathInput.utf8), mode: pathMode, caseSensitive: pathCaseSensitive, work: AtlasSavedPathWire.defaultWork)
+    }
+    func searchMorePaths() {
+        guard pathSearchIsCurrent, let page = pathPage, page.canSearchMore else { return }
+        submitPaths(query: page.query, mode: page.mode, caseSensitive: page.caseSensitive, work: page.expandedWork)
+    }
+    private func submitPaths(query: [UInt8], mode: AtlasSavedPathMode, caseSensitive: Bool, work: UInt64) {
+        guard let info else { return }
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let generation = try model.nextPathGeneration()
+            model.notice = "Finding filenames across the saved manifest…"
+            do {
+                let page = try AtlasSavedPaths.decode(await model.run(lease,
+                    .pathSearch(generation: generation, query: query, mode: mode, caseSensitive: caseSensitive,
+                        results: AtlasSavedPathWire.maximumResults, work: work), flag: flag), identity: info.identity,
+                    generation: generation, query: query, mode: mode, caseSensitive: caseSensitive,
+                    maxResults: AtlasSavedPathWire.maximumResults, maxWorkUnits: work, start: 0, limit: 64)
+                guard !model.closed, !flag.isCanceled, model.session === lease else { throw AtlasSavedError.canceled }
+                model.pathGeneration = generation; model.pathPage = page
+                model.notice = page.complete ? "Searched filenames throughout the saved manifest without reading source payloads."
+                    : "Filename results are partial. Search more to inspect additional candidates, or narrow the query."
+            } catch {
+                let recovered = await model.reconcilePaths(lease)
+                model.notice = recovered ? "Recovered the accepted filename results without repeating the search."
+                    : "The accepted filename results could not be verified. Reload names before opening a result."
+            }
+        }
+    }
+    func loadPaths(start: UInt64) {
+        guard pathSearchIsCurrent, let page = pathPage else { return }
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let next = try AtlasSavedPaths.decode(await model.run(lease,
+                .pathResults(generation: page.generation, start: start, limit: 64), flag: flag), identity: page.identity,
+                generation: page.generation, query: page.query, mode: page.mode, caseSensitive: page.caseSensitive,
+                maxResults: page.maxResults, maxWorkUnits: page.maxWorkUnits, start: start, limit: 64)
+            guard !model.closed, !flag.isCanceled, model.session === lease, model.pathGeneration == page.generation,
+                  next.matchesInventory(page) else { throw AtlasSavedError.canceled }
+            model.pathPage = next
+            model.notice = "Showing retained filename results. Paging does not repeat the search or load source payloads."
+        }
+    }
+    func reloadPaths() {
+        perform { model, _ in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let recovered = await model.reconcilePaths(lease)
+            model.notice = recovered ? "Reloaded accepted filename results from the retained saved query."
+                : "Filename results are unavailable. Search names again when ready."
+        }
+    }
+    func clearPaths() {
+        guard let info else { return }
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let generation = try model.nextPathGeneration()
+            do {
+                try AtlasSavedPathWire.clear(await model.run(lease, .clearPaths(generation: generation), flag: flag),
+                    identity: info.identity, generation: generation)
+                guard !model.closed, !flag.isCanceled, model.session === lease else { throw AtlasSavedError.canceled }
+                model.pathGeneration = nil; model.pathPage = nil
+                model.notice = "Cleared filename results. Source search and relationship inventories are unchanged."
+            } catch {
+                let recovered = await model.reconcilePaths(lease)
+                model.notice = recovered ? "Recovered the accepted filename state after the clear reply was unavailable."
+                    : "Filename state is unknown. Reload names before continuing."
+            }
+        }
+    }
+    private func reconcilePaths(_ lease: AtlasSavedSession) async -> Bool {
+        guard !closed, session === lease, let previous = info else { return false }
+        let flag = AtlasSearchCancellation()
+        do {
+            let current = try AtlasSavedInfo.decode(await run(lease, .info, flag: flag), handle: lease.handle,
+                expectedPath: previous.path.bytes, identity: previous.identity)
+            guard !closed, session === lease, current.pathStateKnown,
+                  current.lastPathAttempt >= previous.lastPathAttempt else { throw AtlasSavedError.invalidResponse }
+            try acceptInfo(current, lease: lease); lastPathAttempt = max(lastPathAttempt, current.lastPathAttempt)
+            pathGeneration = current.pathGeneration
+            guard let generation = current.pathGeneration else { pathPage = nil; return true }
+            if pathPage?.generation == generation { return true }
+            let page = try AtlasSavedPaths.decode(await run(lease, .pathResults(generation: generation, start: 0, limit: 64), flag: flag),
+                identity: current.identity, generation: generation, start: 0, limit: 64)
+            guard !closed, session === lease else { return false }
+            pathPage = page; return true
+        } catch { pathGeneration = nil; pathPage = nil; return false }
+    }
+    private func ownsPathHit(_ hit: AtlasSavedPathHit, from page: AtlasSavedPaths) -> Bool {
+        guard pathSearchIsCurrent, let current = pathPage, current.matchesInventory(page), current.start == page.start else { return false }
+        return current.hits.contains { $0.matches(hit) } && page.hits.contains { $0.matches(hit) }
+    }
+    func selectPathHit(_ hit: AtlasSavedPathHit, from page: AtlasSavedPaths, forImports: Bool = false) {
+        guard canOperate, ownsPathHit(hit, from: page) else { return }
+        selectAcceptedMember(hit.member, forImports: forImports)
+    }
+    func openPathHit(_ hit: AtlasSavedPathHit, from page: AtlasSavedPaths, readerTransport: AtlasReaderTransport,
+        search: AtlasReaderSearchTransport? = nil, outline: AtlasReaderOutlineTransport? = nil,
+        document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasSavedReaderCapture {
+        guard ownsPathHit(hit, from: page), hit.member.captured else { throw AtlasSavedError.invalidInput }
+        return try await openReader(saved: page.identity, ordinal: hit.member.id, expected: hit.member,
+            origin: .pathHit(generation: page.generation, hit: hit), readerTransport: readerTransport,
+            search: search, outline: outline, document: document)
     }
 
     func prepareImports() {
@@ -1060,6 +1183,8 @@ private final class AtlasSavedSession: @unchecked Sendable {
                     let request: AtlasSavedRequest
                     switch origin {
                     case .member: request = .openMember(reader: destination, member: member.id)
+                    case .pathHit(let generation, let hit):
+                        request = .openPathHit(reader: destination, generation: generation, hit: hit.id)
                     case .relationship(let generation, let link, let side):
                         request = .openRelationship(reader: destination, generation: generation, link: link.id, side: side)
                     case .importLink(let generation, let link, let side):
@@ -1117,6 +1242,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         info = nil; members = nil; selectedMember = nil; relationships = nil; relationshipGeneration = nil
         direction = .all; lastRelationshipAttempt = 0; memberOffsetInput = "0"
         imports = nil; importGeneration = nil; importDirection = .all; lastImportAttempt = 0
+        pathPage = nil; pathGeneration = nil; pathInput = ""; lastPathAttempt = 0
         searchPage = nil; queryGeneration = nil; lastQueryAttempt = 0; searchInput = ""
         expressionPage = nil; expressionGeneration = nil; lastExpressionAttempt = 0
         structurePage = nil; structureGeneration = nil; lastStructureAttempt = 0
@@ -1154,6 +1280,11 @@ private final class AtlasSavedSession: @unchecked Sendable {
         let previous = max(lastImportAttempt, max(importGeneration ?? 0, info?.lastImportAttempt ?? 0))
         guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
         lastImportAttempt = previous + 1; return lastImportAttempt
+    }
+    private func nextPathGeneration() throws -> UInt64 {
+        let previous = max(lastPathAttempt, max(pathGeneration ?? 0, info?.lastPathAttempt ?? 0))
+        guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
+        lastPathAttempt = previous + 1; return lastPathAttempt
     }
     private func nextExpressionGeneration() throws -> UInt64 {
         let previous = max(lastExpressionAttempt, max(expressionGeneration ?? 0, info?.lastExpressionAttempt ?? 0))

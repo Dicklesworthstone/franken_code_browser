@@ -178,7 +178,20 @@ final class AtlasSavedFileAccess {
     private var membersPane: some View {
         VStack(alignment: .leading, spacing: 9) {
             Text("Saved members").font(.headline)
-            if let page = model.members {
+            HStack {
+                TextField("Find filename or path", text: $model.pathInput).onSubmit { model.searchPaths() }
+                Button("Find", action: model.searchPaths).disabled(!model.validPathInput)
+            }.disabled(!model.canOperate)
+            Picker("Filename matching", selection: $model.pathMode) {
+                ForEach(AtlasSavedPathMode.allCases) { Text($0.label).tag($0) }
+            }.pickerStyle(.segmented).disabled(!model.canOperate)
+            HStack {
+                Toggle("Match case", isOn: $model.pathCaseSensitive).toggleStyle(.checkbox)
+                Spacer()
+                Button("Reload names", action: model.reloadPaths)
+            }.controlSize(.small).disabled(!model.canOperate)
+            if let page = model.pathPage { pathResults(page) }
+            else if let page = model.members {
                 Text("Members \(page.start)..<\(page.start + UInt64(page.items.count)) · metadata only")
                     .font(.caption).foregroundStyle(.secondary)
                 ScrollView {
@@ -219,6 +232,86 @@ final class AtlasSavedFileAccess {
                 }
             }
         }.padding(.trailing, 8)
+    }
+    private func pathResults(_ page: AtlasSavedPaths) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Filename results").font(.caption.weight(.semibold))
+                Spacer()
+                Button("Clear") { model.pathInput = ""; model.clearPaths() }.disabled(!model.canOperate)
+            }.controlSize(.small)
+            Text(verbatim: "Query: " + (String(bytes: page.query, encoding: .utf8) ?? "native filename bytes"))
+                .font(.caption).lineLimit(2).textSelection(.enabled)
+            if !model.pathSearchIsCurrent {
+                Text("Matching options changed. Find again to use results for this query.")
+                    .font(.caption).foregroundStyle(.orange)
+                if let query = String(bytes: page.query, encoding: .utf8) {
+                    Button("Use accepted query") {
+                        model.pathInput = query; model.pathMode = page.mode; model.pathCaseSensitive = page.caseSensitive
+                    }.controlSize(.small).disabled(!model.canOperate)
+                }
+            }
+            Text(page.complete ? "\(page.seen) matching names in the saved manifest · \(page.retained) retained"
+                : "Partial filename results · \(page.filesExamined) of \(page.identity.members) members examined")
+                .font(.caption).foregroundStyle(page.complete ? Color.secondary : Color.orange)
+            if page.workLimited {
+                HStack(alignment: .top) {
+                    Text(page.canSearchMore ? "Search more to inspect additional candidates, or narrow the filename."
+                        : "The filename search reached its limit. Narrow the query to inspect the remaining names.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if page.canSearchMore {
+                        Button("Search more", action: model.searchMorePaths)
+                            .disabled(!model.canOperate || !model.pathSearchIsCurrent)
+                    }
+                }.controlSize(.small)
+            } else if page.truncated {
+                Text("Showing the highest-ranked \(page.retained) names. Narrow the query to reach other matches.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if page.hits.isEmpty {
+                Text(page.complete ? "No matching saved filenames." : "No names retained in the examined portion of the manifest.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 6) {
+                        ForEach(page.hits) { hit in pathHitRow(hit, from: page) }
+                    }
+                }.frame(maxHeight: .infinity)
+            }
+            HStack {
+                Button("Previous names") { model.loadPaths(start: page.start >= 64 ? page.start - 64 : 0) }
+                    .disabled(page.start == 0)
+                Spacer()
+                Text("\(page.start + UInt64(page.hits.count)) / \(page.retained)").font(.caption)
+                Spacer()
+                Button("Next names") { if let next = page.next { model.loadPaths(start: next) } }.disabled(page.next == nil)
+            }.controlSize(.small).disabled(!model.canOperate || !model.pathSearchIsCurrent)
+            Text("All recorded filenames participate, including unavailable source. Filename searches read metadata only.")
+                .font(.caption2).foregroundStyle(.secondary)
+            if !page.identity.discoveryComplete {
+                Text("The archive was saved with incomplete project discovery. Names outside its manifest are unknown.")
+                    .font(.caption2).foregroundStyle(.orange)
+            }
+        }
+    }
+    private func pathHitRow(_ hit: AtlasSavedPathHit, from page: AtlasSavedPaths) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Button { model.selectPathHit(hit, from: page, forImports: section == .imports) } label: {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: hit.member.captured ? "doc.text" : "doc.badge.ellipsis").foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(verbatim: hit.member.path.display).lineLimit(3).truncationMode(.middle)
+                        Text(hit.member.captured ? "\(hit.member.observedBytes) captured bytes" : "Unavailable · \(hit.member.reason ?? "UNKNOWN")")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                    if model.selectedMember?.id == hit.member.id { Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.accentColor) }
+                }.contentShape(Rectangle())
+            }.buttonStyle(.plain)
+            Button("Read") { openPathHit(hit, from: page) }.controlSize(.small)
+                .disabled(!hit.member.captured || readerTask != nil)
+        }.padding(6).background(model.selectedMember?.id == hit.member.id ? Color.accentColor.opacity(0.09) : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 6)).disabled(!model.canOperate || !model.pathSearchIsCurrent)
     }
     private func memberRow(_ member: AtlasSavedMember, in page: AtlasSavedMembers) -> some View {
         Button {
@@ -942,6 +1035,12 @@ final class AtlasSavedFileAccess {
     private func openImport(_ link: AtlasSavedImport, from page: AtlasSavedImports, side: AtlasSavedLinkSide) {
         launchReader {
             try await model.openImport(link, from: page, side: side, readerTransport: .native,
+                search: .native, outline: .native, document: .native)
+        }
+    }
+    private func openPathHit(_ hit: AtlasSavedPathHit, from page: AtlasSavedPaths) {
+        launchReader {
+            try await model.openPathHit(hit, from: page, readerTransport: .native,
                 search: .native, outline: .native, document: .native)
         }
     }

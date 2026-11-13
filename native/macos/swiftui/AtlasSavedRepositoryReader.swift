@@ -2,6 +2,7 @@ import Foundation
 
 enum AtlasSavedReaderOrigin: Sendable {
     case member
+    case pathHit(generation: UInt64, hit: AtlasSavedPathHit)
     case relationship(generation: UInt64, link: AtlasSavedLink, side: AtlasSavedLinkSide)
     case importLink(generation: UInt64, link: AtlasSavedImport, side: AtlasSavedLinkSide)
     case hit(generation: UInt64, needle: String, hit: AtlasSavedHit, caseSensitive: Bool = true)
@@ -16,7 +17,7 @@ enum AtlasSavedReaderOrigin: Sendable {
         switch self {
         case .hit(_, _, let hit, _), .expressionHit(_, _, _, let hit): return hit
         case .structureHit(_, _, _, _, let item): return item.hit
-        case .member, .relationship, .importLink: return nil
+        case .member, .relationship, .importLink, .pathHit: return nil
         }
     }
 }
@@ -76,7 +77,7 @@ struct AtlasSavedReaderReceipt: Sendable {
         origin: AtlasSavedReaderOrigin, destination: UInt64) throws -> Self {
         let command: String
         switch origin {
-        case .member, .hit: command = "open-reader"
+        case .member, .hit, .pathHit: command = "open-reader"
         case .relationship: command = "relationships-open-reader"
         case .importLink: command = "imports-open-reader"
         case .expressionHit: command = "expression-open-reader"
@@ -118,7 +119,10 @@ struct AtlasSavedReaderReceipt: Sendable {
                 selectionGeneration = "expression_generation"
             } else { selectionGeneration = "query_generation" }
             switch origin {
-            case .member:
+            case .member, .pathHit:
+                if case .pathHit(let generation, let hit) = origin {
+                    guard generation > 0, hit.member.matches(member) else { throw AtlasSavedError.invalidResponse }
+                }
                 guard object["selection"] is NSNull,
                       (object["reader_owner"] as? String).flatMap(AtlasReaderWire.integer) == destination else {
                     throw AtlasSavedError.invalidResponse
@@ -356,6 +360,8 @@ final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
     var evidenceLabel: String {
         switch origin {
         case .member: return "Exact saved member · \(member.observedBytes) original bytes"
+        case .pathHit(_, let hit):
+            return "Saved filename result · \(hit.matchKind) · \(member.observedBytes) exact captured bytes"
         case .relationship(_, _, .evidence):
             return "Captured document evidence: original bytes 0..<\(member.observedBytes). Individual link positions are not established."
         case .relationship(_, let link, .target):

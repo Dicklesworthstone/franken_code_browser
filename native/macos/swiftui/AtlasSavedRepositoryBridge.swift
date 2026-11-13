@@ -37,6 +37,14 @@ import Foundation
 @_silgen_name("fcb_saved_clear_imports") private func savedClearImports(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_open_import_reader") private func savedImportReader(_ h: UInt64, _ reader: UInt64,
     _ generation: UInt64, _ importID: UInt64, _ side: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_path_search") private func savedPathSearch(_ h: UInt64, _ generation: UInt64,
+    _ query: UnsafePointer<UInt8>?, _ queryBytes: UInt64, _ mode: UInt64, _ matchCase: UInt64,
+    _ results: UInt64, _ work: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_path_results") private func savedPathResults(_ h: UInt64, _ generation: UInt64,
+    _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_clear_paths") private func savedClearPaths(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_open_path_hit_reader") private func savedPathReader(_ h: UInt64, _ reader: UInt64,
+    _ generation: UInt64, _ hit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_document_images_authorize") private func savedImagesAuthorize(_ h: UInt64,
     _ reader: UInt64, _ member: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_document_image_prepare") private func savedImagePrepare(_ h: UInt64,
@@ -129,6 +137,22 @@ extension AtlasSavedTransport {
             guard reader > 0, reader != handle, generation > 0,
                   (1...AtlasSavedImportWire.maximumLinks).contains(importID) else { return nil }
             return take(savedImportReader(handle, reader, generation, importID, side.code))
+        case .pathSearch(let generation, let query, let mode, let caseSensitive, let results, let work):
+            guard generation > 0, AtlasSavedPathWire.validQuery(query), results <= AtlasSavedPathWire.maximumResults,
+                  work <= AtlasSavedPathWire.maximumWork else { return nil }
+            return query.withUnsafeBufferPointer {
+                take(savedPathSearch(handle, generation, $0.baseAddress, UInt64($0.count), mode.code,
+                    caseSensitive ? 1 : 0, results, work))
+            }
+        case .pathResults(let generation, let start, let limit):
+            guard generation > 0, start <= AtlasSavedPathWire.maximumResults, (1...128).contains(limit) else { return nil }
+            return take(savedPathResults(handle, generation, start, limit))
+        case .clearPaths(let generation):
+            guard generation > 0 else { return nil }
+            return take(savedClearPaths(handle, generation))
+        case .openPathHit(let reader, let generation, let hit):
+            guard reader > 0, reader != handle, generation > 0, (1...AtlasSavedPathWire.maximumResults).contains(hit) else { return nil }
+            return take(savedPathReader(handle, reader, generation, hit))
         }
     }, cancel: { savedCancel($0) == 1 }, close: { savedClose($0) == 1 }, retirementFailed: {
         try? FileHandle.standardError.write(contentsOf: Data("FCB_SAVED_RETIREMENT_UNAVAILABLE\n".utf8))

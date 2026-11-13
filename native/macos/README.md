@@ -213,6 +213,38 @@ They execute the actual packaging scripts with fake compiler/signing tools and
 retain their fixture logs. They establish packaging control flow, not native
 compilation, code-signing validity, Launch Services behavior or rendering.
 
+## Finding filenames in a saved repository
+
+Open an FCBS archive in **Saved Repository** and use **Find filename or path**
+in the **Saved members** sidebar. **Exact**, **Prefix** and **Fuzzy** use the
+shared ranked path engine over every recorded member, including files whose
+source was unavailable when the archive was created. **Match case** is optional;
+the default uses Unicode scalar lowercase matching without normalization.
+Finding names and paging results use archive metadata only.
+
+The finder retains up to 256 ranked names. **Next names** and **Previous names**
+browse that accepted ranking; **Read** verifies and opens the selected captured
+member in an independent reader. Selecting a name also makes that member
+available to the documentation and import direction filters, even when it is
+outside the ordinary member page. Unavailable entries remain visible with their
+recorded reason and cannot open a source reader. Original native filename bytes
+remain the identity behind the escaped display label.
+
+Partial filename results show how much of the saved manifest was examined.
+**Search more** repeats the same accepted query with a larger bounded allowance,
+keeping the current results available through failed or canceled replacements.
+A complete ranking with more than 256 matches reports its separate retention
+limit. Narrow the query to reach other matches. Historical incomplete project
+discovery remains distinct from searching all names actually in the archive.
+
+Changing query options disables the previous rows until **Find** runs again;
+**Use accepted query** restores their options without searching. **Reload names**
+recovers retained results after an unavailable reply. **Clear** removes filename
+results independently of source searches and relationship inventories. Activated
+readers remain usable after clearing results or closing the archive. Host, C ABI
+and native regression cases cover these flows; independent executable
+verification and physical-Mac qualification remain pending.
+
 ## Searching saved repository text
 
 Open **Saved Repository → Search → Literal** to search the captured FCBS archive.

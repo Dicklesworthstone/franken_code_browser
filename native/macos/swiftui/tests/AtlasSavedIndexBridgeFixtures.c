@@ -5,10 +5,10 @@
 
 /* Public-header-checked foreign boundary. These responses test Swift marshaling
  * and ownership; real archive/posting behavior is exercised in saved_sessions_tests. */
-static uint64_t calls[14];
+static uint64_t calls[18];
 static int result_mode;
 void fixture_saved_index_mode(int mode) { result_mode = mode; }
-uint64_t fixture_saved_index_count(uint64_t index) { assert(index < 14); return calls[index]; }
+uint64_t fixture_saved_index_count(uint64_t index) { assert(index < 18); return calls[index]; }
 static char *reply(void) {
     if (result_mode == 1) return NULL;
     if (result_mode == 2) { char *p = malloc(2); assert(p); p[0] = (char)0xff; p[1] = 0; return p; }
@@ -105,4 +105,22 @@ STUB4(fcb_saved_open_structure_hit_reader)
 STUB4(fcb_saved_document_images_authorize)
 char *fcb_saved_document_image_prepare(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
     (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; abort();
+}
+char *fcb_saved_path_search(uint64_t handle, uint64_t generation, const uint8_t *query, uint64_t length,
+    uint64_t mode, uint64_t match_case, uint64_t results, uint64_t work) {
+    assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9);
+    assert(query && length == 3 && query[0] == 255 && query[1] == '/' && query[2] == 'a');
+    assert(mode == 1 && match_case == 0 && results == 256 && work == UINT64_C(4294967296));
+    calls[14]++; return reply();
+}
+char *fcb_saved_path_results(uint64_t handle, uint64_t generation, uint64_t start, uint64_t limit) {
+    assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9);
+    assert(start == 256 && limit == 128); calls[15]++; return reply();
+}
+char *fcb_saved_clear_paths(uint64_t handle, uint64_t generation) {
+    assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9); calls[16]++; return reply();
+}
+char *fcb_saved_open_path_hit_reader(uint64_t handle, uint64_t reader, uint64_t generation, uint64_t hit) {
+    assert(handle == UINT64_MAX - 10 && reader == UINT64_MAX - 8 && generation == UINT64_MAX - 9 && hit == 256);
+    calls[17]++; return reply();
 }

@@ -15,7 +15,7 @@ swiftc "$@" -swift-version 6 -warnings-as-errors \
     "$src/AtlasReaderTextSelection.swift" "$src/AtlasReaderCoordinator.swift" "$src/AtlasCapturedReader.swift" "$src/AtlasSuppliedReader.swift" \
     "$src/AtlasNavigationHistory.swift" "$src/AtlasSource.swift" \
     "$src/AtlasDocumentPreviewModel.swift" "$src/AtlasPagedReaderModel.swift" \
-    "$src/AtlasSavedRepository.swift" "$src/AtlasSavedRepositoryImports.swift" "$src/AtlasSavedRepositorySearch.swift" \
+    "$src/AtlasSavedRepository.swift" "$src/AtlasSavedRepositoryImports.swift" "$src/AtlasSavedRepositoryPaths.swift" "$src/AtlasSavedRepositorySearch.swift" \
     "$src/AtlasSavedRepositoryReader.swift" "$src/AtlasSavedRepositoryModel.swift" \
     "$src/tests/AtlasSavedRepositoryTests.swift" -o "$out/saved-repository-tests"
 "$out/saved-repository-tests"

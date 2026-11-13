@@ -97,6 +97,26 @@ extension AtlasReaderTransport {
         for request in invalidImports { precondition(transport.run(owner, request) == nil) }
         precondition((10...13).allSatisfy { count(UInt64($0)) == 1 } && count(6) == 29,
             "invalid import request crossed the foreign boundary")
-        print("AtlasSavedIndexBridgeTests: public-header signatures, import/matching flags, full-width IDs, exact path bytes, pin admission and buffer ownership passed")
+        let query: [UInt8] = [255, 47, 97]
+        precondition(transport.run(owner, .pathSearch(generation: generation, query: query,
+            mode: .prefix, caseSensitive: false, results: 256, work: 4_294_967_296)) == "{}")
+        precondition(transport.run(owner, .pathResults(generation: generation, start: 256, limit: 128)) == "{}")
+        precondition(transport.run(owner, .clearPaths(generation: generation)) == "{}")
+        precondition(transport.run(owner, .openPathHit(reader: UInt64.max - 8, generation: generation, hit: 256)) == "{}")
+        precondition((14...17).allSatisfy { count(UInt64($0)) == 1 } && count(6) == 33)
+        let invalidPaths: [AtlasSavedRequest] = [
+            .pathSearch(generation: 0, query: query, mode: .fuzzy, caseSensitive: false, results: 256, work: 1),
+            .pathSearch(generation: generation, query: [], mode: .fuzzy, caseSensitive: false, results: 256, work: 1),
+            .pathSearch(generation: generation, query: [0], mode: .fuzzy, caseSensitive: false, results: 256, work: 1),
+            .pathSearch(generation: generation, query: Array(repeating: 1, count: 257), mode: .fuzzy, caseSensitive: false, results: 256, work: 1),
+            .pathSearch(generation: generation, query: query, mode: .fuzzy, caseSensitive: false, results: 257, work: 1),
+            .pathSearch(generation: generation, query: query, mode: .fuzzy, caseSensitive: false, results: 256, work: 4_294_967_297),
+            .pathResults(generation: generation, start: 257, limit: 64), .pathResults(generation: generation, start: 0, limit: 0),
+            .clearPaths(generation: 0), .openPathHit(reader: owner, generation: generation, hit: 1)
+        ]
+        for request in invalidPaths { precondition(transport.run(owner, request) == nil) }
+        precondition((14...17).allSatisfy { count(UInt64($0)) == 1 } && count(6) == 33,
+            "invalid filename request crossed the foreign boundary")
+        print("AtlasSavedIndexBridgeTests: public-header signatures, import/path/matching flags, raw query bytes, full-width IDs and buffer ownership passed")
     }
 }
