@@ -454,6 +454,79 @@ cargo test --locked -p fcb-app --test whole_file_cli
 No compiled binary, execution receipt, signed artifact, native qualification or
 product gate closure is asserted by the presence of this implementation.
 
+## Follow saved imports in a persistent reading desk
+
+`fcb desk --stdio` can browse lexical source imports inside an opened FCBS
+repository, follow an exact import statement or its captured target, and retain
+that source in the ordinary reading desk. The source remains available to
+`copy`, history, bookmarks, annotations and FCBK checkpoint saves after
+`saved-close`. The archive does not need a live working tree.
+
+Input frames are tab-separated: expected Desk revision, command, then arguments.
+Replies are one `fcb.desk-stdio/1` JSON object per frame. Start at revision zero
+and use each reply's `accepted_revision` for the next request. Opening a saved
+archive returns its attachment token in `saved_token`; this token is distinct
+from member IDs and query generations. For example, this single process opens
+an archive, prepares its imports, pages the accepted result, and exits:
+
+```sh
+printf '0\tsaved-open\trepository.fcbs\n0\tsaved-imports-build\t1\t1\t4096\t33554432\n0\tsaved-imports-page\t1\t1\t0\t64\n0\tquit\n' | fcb desk --stdio
+```
+
+Use these commands with the returned token and import generation:
+
+| Command and arguments after the expected revision | Result |
+| --- | --- |
+| `saved-imports-build TOKEN IMPORT_GEN MAX_LINKS MAX_SOURCE_BYTES` | Prepare a bounded projection; return its first page and coverage. |
+| `saved-imports-page TOKEN IMPORT_GEN OFFSET COUNT` | Page all retained occurrences. |
+| `saved-imports-from TOKEN IMPORT_GEN MEMBER OFFSET COUNT` | Page imports originating in one member. |
+| `saved-importers TOKEN IMPORT_GEN MEMBER OFFSET COUNT` | Page occurrences whose unique catalog target is that member. |
+| `saved-import-source TOKEN IMPORT_GEN LINK_ID` | Import and select the exact original statement in the Desk. |
+| `saved-import-target TOKEN IMPORT_GEN LINK_ID` | Import a captured target at byte zero. |
+| `saved-imports-clear TOKEN NEW_IMPORT_GEN` | Discard the projection while retaining activated Desk sources. |
+
+The projection reuses the shared Rust, JavaScript/TypeScript/JSX/TSX and Python
+extractor and closed-manifest resolver. Each occurrence retains its original
+statement and specifier byte ranges, source digest, language, extraction policy
+and explicit resolution outcome. Python relative imports consider the finite
+`.py` and `/__init__.py` candidates; absolute Python imports remain external.
+These are lexical relationships with `compiler_resolved: false` and
+`semantic_complete: false`. They do not inspect a runtime import path, execute
+project code, install dependencies, or fetch external packages.
+
+Preparation verifies at most one eligible source at a time. `MAX_LINKS` is
+1..4096, aggregate source allowance is 0..33554432 bytes, and a source larger
+than 131072 bytes is explicitly omitted. No source payload remains in the
+projection. Pages read metadata only, retain stable one-based occurrence IDs,
+and accept `COUNT` 1..128; member ordinals and page offsets are zero-based.
+Always follow `next_offset`, which reflects the rows actually delivered.
+`imports_complete`, source omission counters, parser diagnostics and
+`truncated` describe coverage. An empty partial page does not establish that
+the member has no importers.
+
+Import generations are independent of Markdown relationships, literal queries,
+expressions and disk indexes. Build and clear attempts strictly increase within
+one attachment; an admitted failed or canceled replacement preserves the prior
+accepted projection. Replies expose both `saved_import_generation` and
+`last_saved_import_attempt`. A new archive attachment invalidates the old token
+and starts a separate generation domain.
+
+Source and target activation reverify the selected archive member before the
+existing Desk import transaction. They alone change the Desk revision. Evidence
+selects the complete original statement, including exact UTF-16LE/BE bytes;
+`copy` returns those original bytes. Missing, ambiguous, external or unresolved
+targets cannot open, and a recorded target without captured bytes remains
+explicitly unavailable. A failed or canceled activation preserves the previous
+place. Repeated member, literal-hit and import selections reuse the same exact
+retained source identity.
+
+Activation receipts use `selection_namespace: "saved-import"` and include
+`import_generation`, `import_link_id` and `import_side`, along with the verified
+source digest and the original byte selection. A checkpoint preserves activated
+source bytes, places and notes; the archive handle and import projection are not
+persisted or reopened. This consumer is code-first; independent executable
+verification remains pending.
+
 ## Search structure in a saved repository
 
 The saved structural query uses the same symbol, whole-token and qualified

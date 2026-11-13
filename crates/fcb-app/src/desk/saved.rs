@@ -9,6 +9,7 @@ use crate::output::OutputError;
 use crate::host::saved_repository::{SavedRepositorySession, SavedRepositoryError, SnapshotLimits, Sha256Digest};
 pub(super) use crate::host::saved_repository::desk::SavedDeskError;
 use crate::host::saved_repository::desk::{SavedExpression, SavedExpressionOptions};
+use crate::host::saved_repository::imports::{SavedImportError, SavedImportDirection, SavedImportSide};
 use crate::host::saved_repository::relationships::{SavedRelationshipError, RelationshipDirection, RelationshipSide};
 use fcb::search::expression::ExpressionError;
 
@@ -34,6 +35,25 @@ pub(super) const SAVED_HELP: &str = "\nOffline FCBS repositories (not FCBK readi
   saved-backlinks TOKEN REL_GEN MEMBER OFFSET COUNT\n\
   saved-link-source TOKEN REL_GEN LINK_ID | saved-link-target TOKEN REL_GEN LINK_ID\n\
   saved-links-clear TOKEN NEW_REL_GEN\n\
+  saved-imports-build TOKEN IMPORT_GEN MAX_LINKS MAX_SOURCE_BYTES\n\
+  saved-imports-page TOKEN IMPORT_GEN OFFSET COUNT\n\
+  saved-imports-from TOKEN IMPORT_GEN MEMBER OFFSET COUNT\n\
+  saved-importers TOKEN IMPORT_GEN MEMBER OFFSET COUNT\n\
+  saved-import-source TOKEN IMPORT_GEN LINK_ID | saved-import-target TOKEN IMPORT_GEN LINK_ID\n\
+  saved-imports-clear TOKEN NEW_IMPORT_GEN\n\
+Source imports reuse the shared Rust/JS/TS/JSX/TSX/Python lexical extractor\n\
+and closed saved-manifest resolver. Evidence selects the complete exact original\n\
+statement in UTF8/UTF16 source. Captured targets open at byte zero. External,\n\
+missing, ambiguous, unresolved and unavailable targets cannot open. This does\n\
+not establish compiler resolution or execute code. Build reads at most\n\
+MAX_SOURCE_BYTES (0..32 MiB), with 128 KiB per eligible source and 1..4096\n\
+retained statements; omission/diagnostic counters keep coverage explicit.\n\
+IMPORT_GEN is independent of Markdown/text/index/expression generations. Build\n\
+and clear attempts increase; failures preserve the last accepted projection.\n\
+Import pages read metadata only; COUNT is 1..128. Member ordinals start at zero,\n\
+link IDs at one. Only source/target activation changes the Desk revision.\n\
+Activated bytes and exact selections can be annotated, revisited and saved\n\
+after archive detachment; no import projection or archive handle is persisted.\n\
 Documentation links use the pinned Markdown parser and exact archive-member\n\
 resolution. Link evidence is the whole original captured Markdown document,\n\
 not a parser block position or inline token. Build scans at most MAX_SOURCE_BYTES of Markdown (up to 32 MiB,\n\
@@ -81,6 +101,9 @@ impl From<SavedRepositoryError> for Failure {
 impl From<SavedRelationshipError> for Failure {
     fn from(error: SavedRelationshipError) -> Self { Self::Saved(error.into()) }
 }
+impl From<SavedImportError> for Failure {
+    fn from(error: SavedImportError) -> Self { Self::Saved(error.into()) }
+}
 pub(super) struct SavedCommands {
     current: Option<(u64, SavedRepositorySession)>,
     expression: Option<SavedExpression>,
@@ -94,6 +117,8 @@ impl SavedCommands {
             ("saved_query_generation", self.current.as_ref().and_then(|(_, s)| s.accepted_generation())),
             ("saved_index_generation", self.current.as_ref().and_then(|(_, s)| s.index_generation())),
             ("saved_relationship_generation", self.current.as_ref().and_then(|(_, s)| s.relationship_generation())),
+            ("saved_import_generation", self.current.as_ref().and_then(|(_, s)| s.import_generation())),
+            ("last_saved_import_attempt", self.current.as_ref().map(|(_, s)| s.last_import_attempt())),
             ("saved_expression_generation", self.expression.as_ref().map(SavedExpression::generation)),
             ("last_saved_expression_attempt", self.current.as_ref().map(|_| self.last_expression_attempt))] {
             out.literal(",")?; out.quoted(key)?; out.literal(":")?;
@@ -152,6 +177,26 @@ impl SavedCommands {
             }
             ("saved-links-clear", [token, generation]) =>
                 Ok(self.get(number(token)?)?.clear_relationships(number(generation)?, &mut *canceled)?),
+            ("saved-imports-build", [token, generation, limit, bytes]) =>
+                Ok(self.get(number(token)?)?.prepare_imports(number(generation)?, count(limit)?, number(bytes)?, &mut *canceled)?),
+            ("saved-imports-page", [token, generation, first, limit]) =>
+                Ok(self.get(number(token)?)?.import_page(number(generation)?, None, SavedImportDirection::All,
+                    count(first)?, count(limit)?, &mut *canceled)?),
+            ("saved-imports-from" | "saved-importers", [token, generation, member, first, limit]) => {
+                let direction = if command == "saved-imports-from" { SavedImportDirection::Outgoing }
+                    else { SavedImportDirection::Incoming };
+                Ok(self.get(number(token)?)?.import_page(number(generation)?, Some(count(member)?), direction,
+                    count(first)?, count(limit)?, &mut *canceled)?)
+            }
+            ("saved-import-source" | "saved-import-target", [token, generation, link]) => {
+                let side = if command == "saved-import-source" { SavedImportSide::Evidence } else { SavedImportSide::Target };
+                let saved = self.get(number(token)?)?;
+                let opened = saved.open_import_desk(desk, expected, attempt,
+                    number(generation)?, number(link)?, side, &mut *canceled)?;
+                Ok(saved.desk_open_response(desk, &opened)?)
+            }
+            ("saved-imports-clear", [token, generation]) =>
+                Ok(self.get(number(token)?)?.clear_imports(number(generation)?, &mut *canceled)?),
             ("saved-find" | "saved-find-text-hex", [token, generation, limit, text]) => {
                 let decoded;
                 let needle = if command == "saved-find-text-hex" {

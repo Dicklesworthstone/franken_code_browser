@@ -76,6 +76,11 @@ impl Resolution {
 }
 #[derive(Clone, Copy)]
 struct SourceProof { member: usize, file: FileId, revision: SourceRevision, digest: Sha256Digest, bytes: u64 }
+/// A selected endpoint from one accepted projection, never a supplied path.
+/// Both independent readers and Desk imports reverify this same proof.
+#[derive(Clone, Copy)]
+pub(super) struct ImportTarget { source: SourceProof, pub selection: Option<ByteRange> }
+impl ImportTarget { pub fn member(self) -> usize { self.source.member } }
 struct Link {
     source: SourceProof, source_link: u64, evidence: ByteRange, specifier: ByteRange,
     language: ImportLanguage, kind: ImportKind, destination: String, resolution: Resolution,
@@ -244,26 +249,11 @@ impl SavedRepositorySession {
         -> Result<(ReaderSession, HostResponse), SavedImportError> {
         if owner == self.owner() { return Err(SavedImportError::OwnerMismatch); }
         check(&mut canceled)?;
-        let link = self.import_link(generation, link_id)?;
-        let (selected, selection) = match side {
-            SavedImportSide::Evidence => (link.source, Some(link.evidence)),
-            SavedImportSide::Target => match link.resolution {
-                Resolution::Captured => (link.target.ok_or(SavedImportError::UnresolvedTarget)?, None),
-                Resolution::Unavailable => return Err(SavedImportError::TargetUnavailable),
-                _ => return Err(SavedImportError::UnresolvedTarget),
-            }
-        };
+        let target = self.import_target(generation, link_id, side)?;
+        let selected = target.source;
+        let selection = target.selection;
         let before = self.archive.load_stats();
-        let [load_id, pin_id] = self.allocations()?;
-        let capture = PagedCapture::load(&mut self.archive, selected.member, selected.file, selected.revision,
-            &self.budget, [load_id, pin_id], &mut canceled)?;
-        if capture.source_digest() != selected.digest || capture.bytes().len() as u64 != selected.bytes {
-            return Err(PagedSearchError::InvalidHit.into());
-        }
-        if let Some(range) = selection {
-            let (start, end) = range.as_usize_bounds().map_err(|_| AppError::InvalidRange)?;
-            capture.bytes().get(start..end).ok_or(AppError::InvalidRange)?;
-        }
+        let capture = self.load_import_target(target, &mut canceled)?;
         let path = self.archive.directory().member(selected.member).ok_or(SavedImportError::MissingImport)?.path;
         let label = RawPath::from_bytes(path).to_path_buf();
         let mut reader = ReaderSession::from_bytes(owner, &label, capture.bytes(), &mut canceled)?;
@@ -295,6 +285,36 @@ impl SavedRepositorySession {
         out.literal("}\n")?;
         let response = self.finish(out, false, &mut canceled)?;
         Ok((reader, response))
+    }
+
+    pub(super) fn import_target(&self, generation: u64, link_id: u64, side: SavedImportSide)
+        -> Result<ImportTarget, SavedImportError> {
+        let link = self.import_link(generation, link_id)?;
+        let (source, selection) = match side {
+            SavedImportSide::Evidence => (link.source, Some(link.evidence)),
+            SavedImportSide::Target => match link.resolution {
+                Resolution::Captured => (link.target.ok_or(SavedImportError::UnresolvedTarget)?, None),
+                Resolution::Unavailable => return Err(SavedImportError::TargetUnavailable),
+                _ => return Err(SavedImportError::UnresolvedTarget),
+            }
+        };
+        Ok(ImportTarget { source, selection })
+    }
+    pub(super) fn load_import_target(&mut self, target: ImportTarget,
+        canceled: &mut impl FnMut() -> bool) -> Result<PagedCapture, SavedImportError> {
+        check(canceled)?;
+        let selected = target.source;
+        let ids = self.allocations()?;
+        let capture = PagedCapture::load(&mut self.archive, selected.member, selected.file, selected.revision,
+            &self.budget, ids, &mut *canceled)?;
+        if capture.source_digest() != selected.digest || capture.bytes().len() as u64 != selected.bytes {
+            return Err(PagedSearchError::InvalidHit.into());
+        }
+        if let Some(range) = target.selection {
+            let (start, end) = range.as_usize_bounds().map_err(|_| AppError::InvalidRange)?;
+            capture.bytes().get(start..end).ok_or(AppError::InvalidRange)?;
+        }
+        Ok(capture)
     }
 
     fn accepted_imports(&self, generation: u64) -> Result<&AcceptedImports, SavedImportError> {

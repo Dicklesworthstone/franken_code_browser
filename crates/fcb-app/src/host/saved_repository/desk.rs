@@ -12,15 +12,17 @@ use crate::host::desk::{DeskSession, DeskSessionError, DeskError,
 use super::{SavedRepositorySession, SavedRepositoryError, PagedCapture, PagedHit,
     PagedMemberData, PagedSearchError, PagedSnapshotError, FileId, SourceRevision, ByteLength,
     RawPath, Sha256Digest, HostResponse, OutputError, AppError, check,
+    imports::{SavedImportError, SavedImportSide},
     relationships::{RelationshipSide, SavedRelationshipError, FragmentResolution}};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SavedDeskError { Saved(SavedRepositoryError), Desk(DeskSessionError),
-    Expression(expression::ExpressionError), Relationship(SavedRelationshipError) }
+    Expression(expression::ExpressionError), Relationship(SavedRelationshipError), Import(SavedImportError) }
 impl std::fmt::Display for SavedDeskError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self { Self::Saved(e) => write!(f, "{e}"), Self::Desk(e) => write!(f, "{e}"),
-            Self::Expression(e) => write!(f, "{e}"), Self::Relationship(e) => write!(f, "{e}") }
+            Self::Expression(e) => write!(f, "{e}"), Self::Relationship(e) => write!(f, "{e}"),
+            Self::Import(e) => write!(f, "{e}") }
     }
 }
 impl std::error::Error for SavedDeskError {}
@@ -34,6 +36,9 @@ impl From<AppError> for SavedDeskError { fn from(e: AppError) -> Self { Self::Sa
 impl From<SavedRelationshipError> for SavedDeskError {
     fn from(e: SavedRelationshipError) -> Self { Self::Relationship(e) }
 }
+impl From<SavedImportError> for SavedDeskError {
+    fn from(e: SavedImportError) -> Self { Self::Import(e) }
+}
 impl From<expression::ExpressionError> for SavedDeskError {
     fn from(e: expression::ExpressionError) -> Self { Self::Expression(e) }
 }
@@ -41,7 +46,7 @@ impl SavedDeskError {
     pub fn is_canceled(self) -> bool { match self { Self::Saved(e) => e.is_canceled(), Self::Desk(e) => e.is_canceled(),
         Self::Expression(expression::ExpressionError::Canceled) => true,
         Self::Expression(expression::ExpressionError::Search(e)) => SavedRepositoryError::Query(e).is_canceled(),
-        Self::Expression(_) => false, Self::Relationship(e) => e.is_canceled(),
+        Self::Expression(_) => false, Self::Relationship(e) => e.is_canceled(), Self::Import(e) => e.is_canceled(),
     } }
 }
 
@@ -56,6 +61,7 @@ pub struct SavedDeskOpen {
     query: Option<(u64, u64)>,
     expression: Option<(u64, u64)>,
     relationship: Option<(u64, u64, RelationshipSide, FragmentResolution)>,
+    import_link: Option<(u64, u64, SavedImportSide)>,
     selection: Option<ByteRange>,
     member_bytes_read: u64,
     member_read_calls: u64,
@@ -102,6 +108,27 @@ impl SavedRepositorySession {
         opened.relationship = Some((generation, link_id, side, target.fragment));
         Ok(opened)
     }
+
+    /// Follow an exact lexical import statement or its captured catalog target
+    /// into ordinary Desk navigation, annotations and checkpoints. The accepted
+    /// projection supplies the endpoint; no specifier becomes a live path.
+    pub fn open_import_desk(&mut self, desk: &mut DeskSession, expected: u64,
+        attempt: u64, generation: u64, link_id: u64, side: SavedImportSide,
+        mut canceled: impl FnMut() -> bool) -> Result<SavedDeskOpen, SavedDeskError> {
+        validate_desk(desk, expected, attempt)?;
+        check(&mut canceled)?;
+        let target = self.import_target(generation, link_id, side)?;
+        self.validate_desk_member(desk, expected, attempt, target.member(), &mut canceled)?;
+        let before = self.archive.load_stats();
+        let capture = self.load_import_target(target, &mut canceled)?;
+        let after = self.archive.load_stats();
+        let mut opened = self.import_desk_capture(desk, expected, attempt, target.member(),
+            &capture, target.selection, None,
+            (after.bytes_read - before.bytes_read, after.read_calls - before.read_calls), &mut canceled)?;
+        // The accepted Desk mutation is final; attaching provenance cannot fail.
+        opened.import_link = Some((generation, link_id, side));
+        Ok(opened)
+    }
     fn open_desk(&mut self, desk: &mut DeskSession, expected: u64, attempt: u64,
         ordinal: usize, selected: Option<(u64, PagedHit)>, canceled: &mut impl FnMut() -> bool)
         -> Result<SavedDeskOpen, SavedDeskError> {
@@ -138,8 +165,8 @@ impl SavedRepositorySession {
         Ok(())
     }
 
-    /// One common import transaction for direct members, literal hits and
-    /// expression witnesses. Callers supply only an already verified capture.
+    /// One common import transaction for saved members and selected evidence.
+    /// Callers supply only an already verified capture.
     fn import_desk_capture(&mut self, desk: &mut DeskSession, expected: u64, attempt: u64,
         ordinal: usize, capture: &PagedCapture, selection: Option<ByteRange>,
         query: Option<(u64, u64)>, io: (u64, u64), canceled: &mut impl FnMut() -> bool)
@@ -158,7 +185,7 @@ impl SavedRepositorySession {
             selection.map_or(0, |r| r.start().get()), selection, &mut *canceled)?;
         // No fallible work or cancellation gate after the accepted transaction.
         Ok(SavedDeskOpen { imported, archive, member: ordinal, source_digest, query, expression: None,
-            relationship: None, selection,
+            relationship: None, import_link: None, selection,
             member_bytes_read: io.0, member_read_calls: io.1 })
     }
 
@@ -193,8 +220,13 @@ impl SavedRepositorySession {
         match opened.relationship { Some((_, _, side, _)) => out.quoted(side.name())?, None => out.literal("null")? }
         out.literal(",\"fragment_resolution\":")?;
         match opened.relationship { Some((_, _, _, fragment)) => out.quoted(fragment.name())?, None => out.literal("null")? }
+        out.literal(",\"import_generation\":")?; super::optional(&mut out, opened.import_link.map(|r| r.0))?;
+        out.literal(",\"import_link_id\":")?; super::optional(&mut out, opened.import_link.map(|r| r.1))?;
+        out.literal(",\"import_side\":")?;
+        match opened.import_link { Some((_, _, side)) => out.quoted(side.name())?, None => out.literal("null")? }
         out.literal(",\"selection_namespace\":")?;
-        out.quoted(if opened.relationship.is_some() { "saved-relationship" } else if opened.expression.is_some() {
+        out.quoted(if opened.import_link.is_some() { "saved-import" } else if opened.relationship.is_some() {
+            "saved-relationship" } else if opened.expression.is_some() {
             "saved-expression" } else if opened.query.is_some() { "saved-literal" } else { "saved-member" })?;
         out.literal(",\"selection\":")?;
         match opened.selection { Some(r) => out.range(r)?, None => out.literal("null")? }
