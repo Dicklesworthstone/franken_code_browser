@@ -545,7 +545,7 @@ import AppKit
 /// Retained invisible text views must not keep the native first responder:
 /// otherwise Copy or typing could target an older source after Back/Forward.
 /// Resolve this sheet's own window, never an application-global key window.
-@MainActor private struct AtlasDocumentLinkFocus: NSViewRepresentable {
+@MainActor struct AtlasDocumentLinkFocus: NSViewRepresentable {
     let capture: UUID?
     final class Coordinator { var capture: UUID? }
     func makeCoordinator() -> Coordinator { Coordinator() }

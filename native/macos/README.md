@@ -935,6 +935,8 @@ capture before returning an independently retained target reader. The linked
 source sheet now offers **Back** and **Forward** across the last three accepted
 destinations. Moving through this trail reuses captured bytes and keeps each
 reader's page, selection, search and preview state without reopening its path.
+The same history is available when opening a file through **Project files**:
+the originating source stays on the left, with linked destinations on the right.
 
 The originating source stays available behind the sheet. **Return to source**
 closes the trail and restores that reader. An unavailable destination or
