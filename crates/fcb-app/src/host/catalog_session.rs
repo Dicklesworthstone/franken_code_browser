@@ -17,6 +17,9 @@
 pub mod finder;
 mod document_links;
 pub use document_links::{CatalogDocumentLinkSelection, CatalogReaderAcceptance, FIRST_CATALOG_LINK_FILE_ID, MAX_CATALOG_READER_RECEIPTS};
+mod content_search;
+pub use content_search::{CatalogContentSearchError, CatalogContentSearchMode, CatalogContentSearchOptions,
+    CatalogContentSearchSession, MAX_CATALOG_STREAM_STEPS};
 
 use std::{collections::VecDeque, fs, mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, FileId};

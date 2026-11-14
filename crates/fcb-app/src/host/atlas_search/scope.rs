@@ -206,6 +206,11 @@ impl AtlasSearchScope {
     /// Declared viewport membership, including paths absent from a search
     /// catalog. This is independent of any additional file-type filtering.
     pub fn region_files(&self) -> Option<usize> { self.region.as_ref().map(|region| region.files()) }
+    /// Count declared region membership independently of file-type admission
+    /// while a progressive catalog has not yet observed its complete universe.
+    pub(crate) fn region_includes_path(&self, path: &[u8]) -> bool {
+        self.region.as_ref().is_some_and(|region| region.includes(path))
+    }
     pub fn includes_path(&self, path: &[u8]) -> bool {
         if !self.path.includes(path) || self.region.as_ref().is_some_and(|region| !region.includes(path)) { return false; }
         if self.all { return true; }
