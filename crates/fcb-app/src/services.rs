@@ -80,6 +80,25 @@ match_count_complete reports exhaustive observed counts separately from truncate
 rows; omitted rows still exit 3 even when the admitted scan/count is complete.\n\
 Whole-file mode starts at byte zero, requires named files, and does not accept\n\
 window offsets, stdin, path queries or indexed-capture byte-limit switches.\n\n\
+Progressive whole-project content search without a frozen catalog:\n\
+  fcb search ROOT --workspace --whole-file --progressive --respect-ignores\n\
+      --text TEXT [--ignore-case] [--count-all] [--json | --stream]\n\
+  --identifier NAME and --query EXPRESSION also use this shared native service.\n\
+Discovery and reading interleave; total file/path counts have no catalog quota.\n\
+Four 256-entry catalog pages are retained, independent of files visited. Paths,\n\
+depth, pending directories, rule evaluation and source I/O remain bounded;\n\
+reported omissions make coverage partial. Order is provisional discovery order.\n\
+--respect-ignores is required. Explicit --max-files, --include-excluded,\n\
+--raw-hex, --encoding and capture/window controls are rejected in this mode.\n\
+Encoding is automatic UTF-8/UTF-16. Query limit: 1024 bytes; --limit: 1..256;\n\
+--max-scan-bytes: 1..4294967296 (default 256 MiB); read calls: 1048576.\n\
+--skip-matches and --count-all retain exact witnesses independently of counts.\n\
+Expressions scan/count admitted files to establish same-file predicates.\n\
+JSON uses fcb.progressive-search/1; explicit --stream uses\n\
+fcb.progressive-search-stream/1 start/progress/match/terminal records.\n\
+JSON admission failure returns one error document; stream exhaustion retains\n\
+delivered records and a partial terminal. Cancellation retains finalized hits.\n\
+A new invocation/offset starts a new live walk, not an immutable continuation.\n\n\
 File-window options: --offset DECIMAL --bytes DECIMAL --limit DECIMAL\n\
                      --encoding auto|utf8|utf16le|utf16be\n\
 --limit also bounds workspace result/listing rows; -- ends options.\n\
@@ -93,7 +112,7 @@ also requires whole observed-file coverage. Omitted rows still exit 3. Neither\n
 option reads beyond --bytes or fills unobserved source gaps.\n\
 Headless directory scans require --workspace. Indexed workspace mode does not\n\
 accept stdin, window offsets, raw-byte queries or an encoding override.\n\
-Whole-file workspace mode accepts raw bytes and explicit text encoding.\n\
+Frozen-catalog whole-file workspace mode accepts raw bytes and explicit encoding.\n\
 IDs are response-local. Decoded offsets are window-local UTF-8, not file bytes.\n\
 Human source output escapes terminal controls; JSON retains logical text.\n\
 Exit: 0 complete, 1 complete no-match, 2 error, 3 partial/truncated, 130 canceled.\n\
@@ -128,6 +147,7 @@ pub(crate) fn capabilities(args: &Arguments, out: &mut Output) -> Result<u8, App
         ("native-gui", "unavailable", "AppKit/Metal composition is not implemented in this binary."),
         ("native-app-launch", launch_state, "Binary-only handoff to a compatible installed app; no installation probe or in-process renderer. Native readiness is not established."),
         ("workspace-cli-search", file_state, "Explicit discovery, native paths, indexed captures or whole-file streaming; --respect-ignores separately admits bounded repository rules."),
+        ("progressive-workspace-content-search", file_state, "Explicit --progressive --respect-ignores interleaves bounded discovery and whole-file search without an aggregate catalog cap; separate JSON/NDJSON schemas and truthful omissions."),
         ("persistent-cli-index", "unavailable", "No store is opened or implicitly created."),
         ("markdown-preview", "unavailable", "No integrated upstream document renderer in this lane."),
         ("regex-search", "unavailable", "No qualified regex engine selected."),

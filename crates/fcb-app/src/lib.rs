@@ -179,11 +179,15 @@ pub fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut impl Writ
     }
     let wants_json = args::json_requested(arguments);
     let wants_stream = args::stream_requested(arguments);
+    let wants_progressive = args::progressive_requested(arguments);
     let parsed = args::parse(arguments);
     let budget = match ResourceBudget::new(owner(), ByteLength::new(MANAGED_BYTES)) {
         Ok(budget) => budget,
         Err(_) => { let _ = stderr.write(b"CLI_RESOURCE_DENIED\n"); return EXIT_ERROR; }
     };
+    if wants_progressive {
+        return whole_file::progressive::run(parsed, wants_json, wants_stream, stdout, stderr, &budget, &mut canceled);
+    }
     if wants_stream {
         return whole_file::ndjson::run(parsed, stdout, stderr, &budget, &mut canceled);
     }

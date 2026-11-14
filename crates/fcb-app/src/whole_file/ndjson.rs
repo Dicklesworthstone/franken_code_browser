@@ -19,15 +19,15 @@ use crate::{input, workspace};
 pub(crate) const SCHEMA: &str = "fcb.search-stream/1";
 pub(crate) const MAX_STREAM_OUTPUT_BYTES: u64 = 256 * 1024 * 1024;
 const TERMINAL_RESERVE: u64 = 16 * 1024;
-const MAX_WRITE_CALLS: usize = 4096;
+pub(crate) const MAX_WRITE_CALLS: usize = 4096;
 const PROGRESS_STEPS: u64 = 256;
 
-enum Failure {
-    Service(AppError),
+pub(crate) enum Failure<E = AppError> {
+    Service(E),
     Delivery { canceled: bool },
 }
-impl From<AppError> for Failure { fn from(error: AppError) -> Self { Self::Service(error) } }
-impl From<OutputError> for Failure { fn from(error: OutputError) -> Self { Self::Service(error.into()) } }
+impl<E: From<AppError>> From<AppError> for Failure<E> { fn from(error: AppError) -> Self { Self::Service(error.into()) } }
+impl<E: From<OutputError>> From<OutputError> for Failure<E> { fn from(error: OutputError) -> Self { Self::Service(error.into()) } }
 
 struct CountingWriter<'a, W> { writer: &'a mut W, written: usize }
 impl<W: Write> Write for CountingWriter<'_, W> {
@@ -39,28 +39,31 @@ impl<W: Write> Write for CountingWriter<'_, W> {
     fn flush(&mut self) -> io::Result<()> { self.writer.flush() }
 }
 
-struct Sink<'a, W> {
+pub(crate) struct Sink<'a, W> {
     writer: &'a mut W,
     output: Output,
     sequence: u64,
     emitted_bytes: u64,
     max_bytes: u64,
+    schema: &'static str,
 }
 impl<'a, W: Write> Sink<'a, W> {
     fn new(writer: &'a mut W, budget: &ResourceBudget) -> Result<Self, AppError> {
-        Ok(Self { writer, output: Output::new(owner(), MAX_RESPONSE_BYTES, budget, allocation(1))?,
-            sequence: 0, emitted_bytes: 0, max_bytes: MAX_STREAM_OUTPUT_BYTES })
+        Self::with_schema(writer, budget, SCHEMA)
     }
-
-    fn emit<C: FnMut() -> bool>(&mut self, kind: &str, canceled: &mut C,
-        encode: impl FnOnce(&mut Output, &mut C) -> Result<(), AppError>) -> Result<(), Failure> {
+    pub(crate) fn with_schema(writer: &'a mut W, budget: &ResourceBudget, schema: &'static str) -> Result<Self, AppError> {
+        Ok(Self { writer, output: Output::new(owner(), MAX_RESPONSE_BYTES, budget, allocation(1))?,
+            sequence: 0, emitted_bytes: 0, max_bytes: MAX_STREAM_OUTPUT_BYTES, schema })
+    }
+    pub(crate) fn emit<C: FnMut() -> bool, E: From<AppError> + From<OutputError>>(&mut self, kind: &str, canceled: &mut C,
+        encode: impl FnOnce(&mut Output, &mut C) -> Result<(), E>) -> Result<(), Failure<E>> {
         if canceled() { return Err(AppError::Canceled.into()); }
         self.output.clear();
-        self.output.literal("{\"schema\":")?; self.output.quoted(SCHEMA)?;
+        self.output.literal("{\"schema\":")?; self.output.quoted(self.schema)?;
         self.output.literal(",\"type\":")?; self.output.quoted(kind)?;
         self.output.literal(",\"sequence\":")?; self.output.integer(self.sequence)?;
         self.output.literal(",\"owner\":\"1\",\"query_generation\":\"1\"")?;
-        encode(&mut self.output, canceled)?;
+        encode(&mut self.output, canceled).map_err(Failure::Service)?;
         self.output.literal("}\n")?;
         let bytes = self.output.as_bytes().len() as u64;
         let allowance = if kind == "terminal" { self.max_bytes }

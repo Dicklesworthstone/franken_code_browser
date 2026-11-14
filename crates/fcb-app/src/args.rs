@@ -24,6 +24,9 @@ pub struct Arguments {
     pub command: Command, pub json: bool, pub file: Option<PathBuf>, pub stdin: bool,
     /// Explicit versioned NDJSON for continuous named-file/workspace search.
     pub stream: bool,
+    /// Opt into bounded discovery interleaved with content search. This route
+    /// has its own schema and explicit policy/options, not a frozen manifest.
+    pub progressive: bool,
     pub offset: u64, pub bytes: usize, pub limit: usize, pub encoding: Encoding,
     pub needle: Option<Needle>, pub workspace: bool, pub include_excluded: bool,
     pub respect_ignores: bool,
@@ -37,7 +40,7 @@ pub struct Arguments {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArgumentError { Limit, UnknownCommand, UnknownOption, DuplicateOption, MissingValue,
     MissingSource, MultipleSources, InvalidNumber, InvalidEncoding, InvalidNeedle, IncompatibleOptions,
-    Query(QueryError) }
+    Query(QueryError), ProgressivePolicy, ProgressiveOptions, ProgressiveLimits }
 impl ArgumentError {
     pub const fn code(self) -> &'static str {
         match self {
@@ -47,6 +50,9 @@ impl ArgumentError {
             Self::MultipleSources => "CLI_MULTIPLE_SOURCES", Self::InvalidNumber => "CLI_INVALID_NUMBER",
             Self::InvalidEncoding => "CLI_INVALID_ENCODING", Self::InvalidNeedle => "CLI_INVALID_NEEDLE",
             Self::IncompatibleOptions => "CLI_INCOMPATIBLE_OPTIONS", Self::Query(error) => error.code(),
+            Self::ProgressivePolicy => "CLI_PROGRESSIVE_REQUIRES_RESPECT_IGNORES",
+            Self::ProgressiveOptions => "CLI_PROGRESSIVE_UNSUPPORTED_OPTIONS",
+            Self::ProgressiveLimits => "CLI_PROGRESSIVE_LIMITS",
         }
     }
 }
@@ -58,6 +64,7 @@ impl std::error::Error for ArgumentError {}
 /// Option values and positional-only paths remain data, not output-mode flags.
 pub fn json_requested(args: &[OsString]) -> bool { output_flag_requested(args, "--json") }
 pub fn stream_requested(args: &[OsString]) -> bool { output_flag_requested(args, "--stream") }
+pub fn progressive_requested(args: &[OsString]) -> bool { output_flag_requested(args, "--progressive") }
 fn output_flag_requested(args: &[OsString], flag: &str) -> bool {
     let mut cursor = 0;
     let end = args.len().min(MAX_ARGUMENTS + 1);
@@ -81,7 +88,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         if total > MAX_ARGUMENT_BYTES { return Err(ArgumentError::Limit); }
     }
     let mut parsed = Arguments { command: Command::Launch, json: false, file: None,
-        stdin: false, stream: false, offset: 0, bytes: 64 * 1024, limit: 100, encoding: Encoding::Auto, needle: None,
+        stdin: false, stream: false, progressive: false, offset: 0, bytes: 64 * 1024, limit: 100, encoding: Encoding::Auto, needle: None,
         workspace: false, include_excluded: false, respect_ignores: false, max_files: 4096,
         max_file_bytes: 1024 * 1024, max_total_bytes: 32 * 1024 * 1024,
         whole_file: false, max_scan_bytes: 256 * 1024 * 1024, ignore_case: false, count_all: false, skip_matches: 0 };
@@ -115,12 +122,14 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
                 "--whole-file" => 16384, "--max-scan-bytes" => 32768, "--respect-ignores" => 65536,
                 "--query" => 131072, "--ignore-case" => 262144, "--count-all" => 524288,
                 "--identifier" => 1048576, "--stream" => 2097152, "--skip-matches" => 4194304,
+                "--progressive" => 8388608,
                 _ => return Err(ArgumentError::UnknownOption),
             };
             if seen & bit != 0 { return Err(ArgumentError::DuplicateOption); }
             seen |= bit;
             if option == "--json" { parsed.json = true; continue; }
             if option == "--stream" { parsed.stream = true; continue; }
+            if option == "--progressive" { parsed.progressive = true; continue; }
             if option == "--stdin" { parsed.stdin = true; continue; }
             if option == "--workspace" { parsed.workspace = true; continue; }
             if option == "--include-excluded" { parsed.include_excluded = true; continue; }
@@ -214,6 +223,23 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
     };
     if parsed.ignore_case && (parsed.command != Command::Search || !allows_ignore_case) {
         return Err(ArgumentError::IncompatibleOptions);
+    }
+    if parsed.progressive {
+        if parsed.command != Command::Search || !parsed.workspace || !parsed.whole_file
+            || seen & (32 | 512 | 1024 | 128) != 0 {
+            return Err(ArgumentError::ProgressiveOptions);
+        }
+        if !parsed.respect_ignores { return Err(ArgumentError::ProgressivePolicy); }
+        let query_bytes = match parsed.needle.as_ref() {
+            Some(Needle::Text(text) | Needle::Identifier(text)) => text.len(),
+            Some(Needle::Query(query)) => query.raw_query.len(),
+            _ => return Err(ArgumentError::ProgressiveOptions),
+        };
+        if query_bytes > 1024 || !(1..=256).contains(&parsed.limit)
+            || !(1..=4u64 * 1024 * 1024 * 1024).contains(&parsed.max_scan_bytes)
+            || parsed.skip_matches.checked_add(parsed.limit as u64).and_then(|n| n.checked_add(1)).is_none() {
+            return Err(ArgumentError::ProgressiveLimits);
+        }
     }
     if parsed.whole_file {
         if parsed.command != Command::Search || parsed.stdin || seen & (4 | 8 | 2048 | 4096 | 8192) != 0 {
@@ -326,6 +352,51 @@ mod tests {
         assert!(!stream_requested(&path));
         assert!(!parse(&path).unwrap().stream);
         assert!(!stream_requested(&args(&["search", "file.rs", "--identifier", "--stream"])));
+    }
+
+    #[test]
+    fn progressive_catalog_search_requires_its_explicit_scope_and_policy() {
+        let base = ["search", "root", "--workspace", "--whole-file", "--progressive", "--respect-ignores"];
+        for (mode, value) in [("--text", "needle"), ("--identifier", "needle"),
+            ("--query", "needle required -forbidden path:src lang:rust")] {
+            let mut input = args(&base); input.extend(args(&[mode, value, "--count-all", "--limit", "256",
+                "--skip-matches", "9007199254740993", "--max-scan-bytes", "4294967296", "--stream"]));
+            let parsed = parse(&input).unwrap();
+            assert!(parsed.progressive && parsed.respect_ignores && parsed.stream);
+            assert_eq!(parsed.skip_matches, 9_007_199_254_740_993);
+            assert_eq!(parsed.max_scan_bytes, 4u64 * 1024 * 1024 * 1024);
+        }
+        assert_eq!(parse(&args(&["search", "root", "--workspace", "--whole-file", "--progressive", "--text", "x"])),
+            Err(ArgumentError::ProgressivePolicy));
+        for input in [vec!["search", "root", "--whole-file", "--progressive", "--text", "x"],
+            vec!["search", "root", "--workspace", "--progressive", "--text", "x"],
+            vec!["inspect", "root", "--workspace", "--progressive"], vec!["--progressive", "root"]] {
+            assert!(parse(&args(&input)).is_err(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn progressive_mode_rejects_frozen_or_unsupported_semantics_instead_of_ignoring_them() {
+        let base = ["search", "root", "--workspace", "--whole-file", "--progressive", "--respect-ignores", "--text", "x"];
+        for option in [vec!["--encoding", "auto"], vec!["--encoding", "utf16le"], vec!["--max-files", "65536"],
+            vec!["--include-excluded"], vec!["--max-file-bytes", "0"], vec!["--max-total-bytes", "0"],
+            vec!["--offset", "0"], vec!["--bytes", "4"]] {
+            let mut input = args(&base); input.extend(args(&option));
+            assert!(parse(&input).is_err(), "{option:?}");
+        }
+        for option in [vec!["--limit", "0"], vec!["--limit", "257"], vec!["--max-scan-bytes", "0"],
+            vec!["--max-scan-bytes", "4294967297"], vec!["--skip-matches", "18446744073709551615"]] {
+            let mut input = args(&base); input.extend(args(&option));
+            assert_eq!(parse(&input), Err(ArgumentError::ProgressiveLimits), "{option:?}");
+        }
+        let mut query = args(&base[..6]); query.extend(args(&["--raw-hex", "ff"]));
+        assert_eq!(parse(&query), Err(ArgumentError::ProgressiveOptions));
+        let mut query = args(&base[..6]); query.extend(["--text".into(), "x".repeat(1025).into()]);
+        assert_eq!(parse(&query), Err(ArgumentError::ProgressiveLimits));
+        let literal = args(&["search", "file", "--whole-file", "--text", "--progressive"]);
+        assert!(!progressive_requested(&literal) && !parse(&literal).unwrap().progressive);
+        let path = args(&["search", "--whole-file", "--text", "x", "--", "--progressive"]);
+        assert!(!progressive_requested(&path) && !parse(&path).unwrap().progressive);
     }
 
     #[test]

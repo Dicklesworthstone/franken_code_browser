@@ -5,6 +5,7 @@
 //! GLOBAL for a workspace, including work spent before a source failure.
 
 pub(crate) mod ndjson;
+pub(crate) mod progressive;
 
 use std::{fs::File, path::Path};
 use fcb::source::path::{NormalizedPath, RawPath};

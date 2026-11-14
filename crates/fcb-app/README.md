@@ -173,6 +173,67 @@ window offsets/byte counts, `--path` queries, `--max-file-bytes` or
 indexed route. Workspace discovery limits and static exclusions still apply.
 Use `--max-files` and `--include-excluded` with an explicit workspace as before.
 
+### Progressive discovery and content search
+
+Use **`--progressive`** to interleave repository discovery and whole-file search
+without first retaining a complete workspace catalog:
+
+```sh
+fcb search /path/to/repository --workspace --whole-file --progressive --respect-ignores \
+  --text 'pub fn' --count-all --limit 100 --json
+fcb search /path/to/repository --workspace --whole-file --progressive --respect-ignores \
+  --query 'anchor required -forbidden path:src/ lang:rust' --stream
+fcb search /path/to/repository --workspace --whole-file --progressive --respect-ignores \
+  --identifier cancel --skip-matches 256 --limit 100 --max-scan-bytes 4294967296
+```
+
+This route uses the same progressive catalog service and continuous file matcher
+as native large-project search. It has **no aggregate file-count or cumulative
+path-storage limit**: old catalog pages are evicted after examination while exact
+match witnesses keep their own path and original bytes. A long traversal can
+reach files beyond both the frozen catalog's 65,536-file maximum and its path
+storage quota. Results follow observed discovery order; they are not a sorted
+or atomic workspace snapshot.
+
+The explicit `--respect-ignores` opt-in is required because this service reads
+bounded repository ignore rules. UTF-8 and BOM-marked UTF-16 text are detected
+automatically. Text and expressions support `--ignore-case`; identifiers retain
+their exact whole-token policy. Expressions establish required/excluded
+predicates on each observed file before publishing primary matches. Counting
+continues for expressions, or for literal/identifier searches with `--count-all`,
+after retained rows fill. `--skip-matches` scans preceding occurrences within
+the same I/O bounds; a later invocation is a fresh walk and can observe a
+different order after filesystem changes.
+
+Progressive invocation accepts 1–256 retained matches, query text up to 1,024
+UTF-8 bytes, and a total scan allowance of 1 byte–4 GiB (256 MiB by default).
+The read-call ceiling is 1,048,576. Discovery retains at most four 256-entry
+pages, with 2,048-byte relative paths, depth 32 and a 4,096-entry pending
+frontier. These are residency and traversal bounds, not a total discovered-file
+ceiling. Omitted paths, refused frontier entries, rule diagnostics, unavailable
+sources and incomplete scans remain explicit coverage metadata. Raw-byte
+queries, explicit encodings, `--max-files`, `--include-excluded`, zero-row
+requests and captured-window options are rejected for this mode.
+
+Ordinary output is human-readable; **`--json`** emits one bounded document with
+schema **`fcb.progressive-search/1`**. **`--stream`** instead emits
+**`fcb.progressive-search-stream/1`** records with `start`, `progress`, `match`
+and exactly one required `terminal`. A match contains a finalized exact byte
+range, matched text and original-byte hex. Progress exposes actual discovery,
+scan, retention and omission counters. Numeric fields use canonical decimal
+strings. The existing bounded sink limits each record to 8 MiB and the complete
+stream to 256 MiB; output exhaustion stops further work and reports a partial
+terminal at a clean record boundary. A failed or partially written record is
+interrupted output and is not repaired by appending more JSON. Ordinary JSON
+that exceeds its 8 MiB document cap returns a bounded error document.
+
+Cancellation between bounded service steps preserves finalized matches and
+reports canceled coverage. Complete counting with omitted rows remains partial
+output, separately from count completeness. The existing frozen-catalog search
+routes and their schemas keep their current contracts. Focused source, argument,
+large-discovery and output-boundary regressions accompany this addition;
+independent executable verification is pending.
+
 ### Later match windows
 
 Use **`--skip-matches N`** with `--whole-file` to reach occurrences beyond the

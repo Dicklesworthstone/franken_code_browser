@@ -27,21 +27,27 @@ impl CatalogContentSearchSession {
         }
         out.literal("],\"next_offset\":")?;
         if end < self.hits.len() { out.integer(end as u64)?; } else { out.literal("null")?; }
+        self.encode_diagnostics(&mut out, &mut canceled)?;
+        out.literal("}\n")?;
+        self.finish(out, &mut canceled)
+    }
+
+    pub(super) fn encode_diagnostics(&self, out: &mut Output, canceled: &mut impl FnMut() -> bool)
+        -> Result<(), CatalogContentSearchError> {
         out.literal(",\"diagnostics\":[")?;
         for (position, receipt) in self.diagnostics.iter().enumerate() {
-            check(&mut canceled)?;
+            check(canceled)?;
             if position != 0 { out.literal(",")?; }
             out.literal("{\"file_id\":")?; out.integer(receipt.request.file().get())?;
-            integer(&mut out, "source_revision", receipt.request.revision().get())?;
-            encode_receipt(&mut out, *receipt)?;
+            integer(out, "source_revision", receipt.request.revision().get())?;
+            encode_receipt(out, *receipt)?;
             out.literal(",\"unsupported_at\":")?;
             if let Some(offset) = receipt.unsupported_at { out.integer(offset.get())?; } else { out.literal("null")?; }
             out.literal("}")?;
         }
         out.literal("]")?;
-        boolean(&mut out, "diagnostics_truncated", self.incomplete > self.diagnostics.len() as u64)?;
-        out.literal("}\n")?;
-        self.finish(out, &mut canceled)
+        boolean(out, "diagnostics_truncated", self.incomplete > self.diagnostics.len() as u64)?;
+        Ok(())
     }
 
     pub(super) fn witness(&mut self, position: usize, mut canceled: impl FnMut() -> bool)
@@ -65,17 +71,22 @@ impl CatalogContentSearchSession {
         let id = self.catalog.next_id()?;
         let mut out = Output::new(self.owner(), MAX_CATALOG_RESPONSE_BYTES, &self.catalog.budget, id)?;
         out.literal("{\"schema\":\"fcb.catalog-stream/1\",\"status\":\"ok\",\"command\":")?; out.quoted(command)?;
-        integer(&mut out, "owner", self.owner().get())?;
-        integer(&mut out, "query_generation", self.generation.get())?;
-        integer(&mut out, "revision", self.revision)?;
-        integer(&mut out, "progress_sequence", self.revision)?;
+        self.encode_metadata(&mut out)?;
+        Ok(out)
+    }
+
+    pub(super) fn encode_metadata(&self, out: &mut Output) -> Result<(), CatalogContentSearchError> {
+        integer(out, "owner", self.owner().get())?;
+        integer(out, "query_generation", self.generation.get())?;
+        integer(out, "revision", self.revision)?;
+        integer(out, "progress_sequence", self.revision)?;
         out.literal(",\"root_path\":")?; out.path(&self.grant().root_path().to_path_buf())?;
         out.literal(",\"scope\":\"progressively-discovered-whole-files\",\"strategy\":\"streaming-whole-file\",
             \"capture_kind\":\"literal-witnesses-only\",\"source_observation\":\"per-file-streams-not-atomic-workspace\",
             \"ordering\":\"provisional-discovery-order\",\"membership\":\"progressive-observation\",\"discovery_policy\":")?;
         out.quoted(RULE_POLICY_NAME)?;
-        self.catalog.encode_rule_policy(&mut out)?;
-        self.options.scope.encode(&mut out)?;
+        self.catalog.encode_rule_policy(out)?;
+        self.options.scope.encode(out)?;
         out.literal(",\"mode\":")?;
         out.quoted(match self.options.mode {
             CatalogContentSearchMode::Expression => "decoded-text-expression",
@@ -90,16 +101,16 @@ impl CatalogContentSearchSession {
             out.literal(",\"primary_needle\":")?; out.quoted(&expression.primary_needle)?;
             out.literal(",\"query_syntax\":\"fcb-bounded-expression/1\",\"predicate_scope\":\"same-observed-stream\",
                 \"path_filter_domain\":\"root-relative-utf8-or-escaped-search-key\"")?;
-            integer(&mut out, "expression_scope_files", self.expression_scope_files)?;
-            integer(&mut out, "expression_excluded_files", self.eligible - self.expression_scope_files)?;
+            integer(out, "expression_scope_files", self.expression_scope_files)?;
+            integer(out, "expression_excluded_files", self.eligible - self.expression_scope_files)?;
         }
         if self.options.mode == CatalogContentSearchMode::Occurrences {
             out.literal(",\"evidence_level\":\"whole-token-text-candidate\",\"includes_comments_and_literals\":true,
                 \"compiler_resolved\":false,\"semantic_complete\":false")?;
         }
         if let Some(files) = self.options.scope.region_files() {
-            integer(&mut out, "scope_region_catalogued_files", self.region_catalogued)?;
-            integer(&mut out, "scope_region_missing_files", (files as u64).saturating_sub(self.region_catalogued))?;
+            integer(out, "scope_region_catalogued_files", self.region_catalogued)?;
+            integer(out, "scope_region_missing_files", (files as u64).saturating_sub(self.region_catalogued))?;
         }
         let complete = self.complete();
         let more = self.more();
@@ -109,7 +120,7 @@ impl CatalogContentSearchSession {
             ("match_count_complete", complete),
             ("page_has_more_matches", self.matches_seen.saturating_sub(self.options.start_after) > self.hits.len() as u64),
             ("truncated", self.matches_seen > self.hits.len() as u64)] {
-            boolean(&mut out, key, value)?;
+            boolean(out, key, value)?;
         }
         out.literal(",\"stop_reason\":")?;
         if let Some(stop) = self.stop_reason { out.quoted(stop.code())?; } else { out.literal("null")?; }
@@ -130,12 +141,12 @@ impl CatalogContentSearchSession {
             ("retained_witness_bytes", self.witnesses.len() as u64),
             ("retained_catalog_pages", self.catalog.pages.len() as u64),
             ("retained_catalog_files", self.catalog.pages.iter().map(|page| page.files.len() as u64).sum())] {
-            integer(&mut out, key, value)?;
+            integer(out, key, value)?;
         }
         out.literal(",\"limits\":{\"max_matches\":")?; out.integer(self.options.limits.max_matches as u64)?;
-        integer(&mut out, "max_scan_bytes", self.options.limits.max_scan_bytes)?;
-        integer(&mut out, "max_read_calls", self.options.limits.max_read_calls)?;
-        integer(&mut out, "max_steps_per_advance", MAX_CATALOG_STREAM_STEPS as u64)?;
+        integer(out, "max_scan_bytes", self.options.limits.max_scan_bytes)?;
+        integer(out, "max_read_calls", self.options.limits.max_read_calls)?;
+        integer(out, "max_steps_per_advance", MAX_CATALOG_STREAM_STEPS as u64)?;
         out.literal("},\"discovery\":{")?;
         let aggregate = self.catalog.aggregate;
         for (position, (key, value)) in [("files", aggregate.files), ("directories", aggregate.directories),
@@ -147,7 +158,7 @@ impl CatalogContentSearchSession {
             out.quoted(key)?; out.literal(":")?; out.integer(value)?;
         }
         out.literal("}")?;
-        Ok(out)
+        Ok(())
     }
     fn finish(&mut self, out: Output, canceled: &mut impl FnMut() -> bool)
         -> Result<HostResponse, CatalogContentSearchError> {
@@ -172,7 +183,7 @@ fn integer(out: &mut Output, key: &str, value: u64) -> Result<(), OutputError> {
 fn boolean(out: &mut Output, key: &str, value: bool) -> Result<(), OutputError> {
     out.literal(",")?; out.quoted(key)?; out.literal(":")?; out.boolean(value)
 }
-fn encode_hit(out: &mut Output, hit: &Hit, position: usize) -> Result<(), CatalogContentSearchError> {
+pub(super) fn encode_hit(out: &mut Output, hit: &Hit, position: usize) -> Result<(), CatalogContentSearchError> {
     if hit.range.len().get() != hit.witness_len as u64 { return Err(CatalogContentSearchError::MissingHit); }
     out.literal("\"index\":")?; out.integer(position as u64)?;
     integer(out, "occurrence_id", hit.occurrence)?;

@@ -32,7 +32,10 @@ fn capabilities_and_static_doctor_are_real_inert_commands_not_gui_launches() {
         assert!(!document.get("native_ready").flag());
         assert!(!document.get("source_scanned").flag());
         let features = document.get("features").array();
-        assert_eq!(features.len(), 12);
+        assert_eq!(features.len(), 14);
+        assert!(features.iter().any(|row| row.get("name").text() == "progressive-workspace-content-search"
+            && row.get("state").text() == if cfg!(any(target_os = "macos", all(target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")))) { "implemented-unqualified" } else { "unavailable" }));
         assert!(features.iter().any(|row| row.get("name").text() == "exact-window-text-search"
             && row.get("state").text() == "implemented-unqualified"));
         assert!(features.iter().any(|row| row.get("name").text() == "native-gui"

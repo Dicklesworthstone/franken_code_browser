@@ -20,6 +20,7 @@ pub use document_links::{CatalogDocumentLinkSelection, CatalogReaderAcceptance, 
 mod content_search;
 pub use content_search::{CatalogContentSearchError, CatalogContentSearchMode, CatalogContentSearchOptions,
     CatalogContentSearchSession, MAX_CATALOG_STREAM_STEPS};
+pub(crate) use content_search::cli::CatalogSearchProgress;
 
 use std::{collections::VecDeque, fs, mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, FileId};

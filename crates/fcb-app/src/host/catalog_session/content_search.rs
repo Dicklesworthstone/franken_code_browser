@@ -9,6 +9,7 @@
 //! Membership is an observed traversal, never an atomic filesystem snapshot.
 
 mod wire;
+pub(crate) mod cli;
 #[cfg(all(test, unix))]
 mod tests;
 
@@ -250,23 +251,28 @@ impl CatalogContentSearchSession {
     /// source bytes remain recoverable after cancellation or output denial.
     pub fn advance(&mut self, generation: u64, after_revision: u64, max_steps: usize,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, CatalogContentSearchError> {
+        self.advance_work(generation, after_revision, max_steps, &mut canceled)?;
+        self.snapshot("advance", 0, MAX_ATLAS_STREAM_SEARCH_PAGE, canceled)
+    }
+    fn advance_work(&mut self, generation: u64, after_revision: u64, max_steps: usize,
+        canceled: &mut impl FnMut() -> bool) -> Result<(), CatalogContentSearchError> {
         self.validate_generation(generation)?;
         if !(1..=MAX_CATALOG_STREAM_STEPS).contains(&max_steps) { return Err(CatalogContentSearchError::InvalidLimits); }
         if self.replay_after_revision == Some(after_revision) && after_revision < self.revision {
-            return self.snapshot("advance", 0, MAX_ATLAS_STREAM_SEARCH_PAGE, canceled);
+            return Ok(());
         }
         if after_revision != self.revision { return Err(CatalogContentSearchError::StaleRevision); }
         if !self.more() { return Err(CatalogContentSearchError::NoMoreResults); }
-        check(&mut canceled)?; self.validate_active()?;
+        check(canceled)?; self.validate_active()?;
         self.revision = add(self.revision, 1)?;
         self.replay_after_revision = Some(after_revision);
         let result = (|| {
             for _ in 0..max_steps {
-                check(&mut canceled)?; self.validate_active()?;
+                check(canceled)?; self.validate_active()?;
                 if !self.more() { break; }
-                self.step(&mut canceled)?;
+                self.step(canceled)?;
             }
-            self.snapshot("advance", 0, MAX_ATLAS_STREAM_SEARCH_PAGE, &mut canceled)
+            Ok(())
         })();
         if result.as_ref().is_err_and(|error: &CatalogContentSearchError| error.is_canceled())
             && self.active.as_ref().is_some_and(|active| active.search.state() == StreamReadState::Canceled) {
@@ -281,8 +287,13 @@ impl CatalogContentSearchSession {
     }
     pub fn stop(&mut self, generation: u64, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, CatalogContentSearchError> {
+        self.stop_work(generation, &mut canceled)?;
+        self.snapshot("stop", 0, MAX_ATLAS_STREAM_SEARCH_PAGE, canceled)
+    }
+    fn stop_work(&mut self, generation: u64, canceled: &mut impl FnMut() -> bool)
+        -> Result<(), CatalogContentSearchError> {
         self.validate_generation(generation)?;
-        check(&mut canceled)?; self.validate_active()?;
+        check(canceled)?; self.validate_active()?;
         if self.more() {
             self.revision = add(self.revision, 1)?;
             self.replay_after_revision = None;
@@ -291,7 +302,7 @@ impl CatalogContentSearchSession {
             self.finished = None;
             self.stop_reason = Some(Stop::UserStopped);
         }
-        self.snapshot("stop", 0, MAX_ATLAS_STREAM_SEARCH_PAGE, canceled)
+        Ok(())
     }
 
     fn validate_generation(&self, generation: u64) -> Result<(), CatalogContentSearchError> {
