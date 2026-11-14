@@ -118,6 +118,15 @@ struct AtlasWorkspaceStreamTransport: Sendable {
     let close: @Sendable (UInt64) -> Bool
     let retirementFailed: @Sendable () -> Void
     let progressiveSearch: ProgressiveSearch?
+    /// Catalog searches create an immutable, separately owned query. The
+    /// revision is required when paging or selecting retained evidence.
+    struct CatalogSearch: Sendable {
+        let search: @Sendable (UInt64, String, UInt64, AtlasWorkspaceStreamRequest,
+            AtlasSearchCancellation, AtlasWorkspaceStreamStop, @Sendable (String) -> Void) throws -> String?
+        let page: @Sendable (UInt64, UInt64, UInt64, UInt64, UInt64) throws -> String?
+        let hit: @Sendable (UInt64, UInt64, UInt64, UInt64) throws -> String?
+    }
+    let catalogSearch: CatalogSearch?
 
     init(create: @escaping @Sendable () -> UInt64,
          open: @escaping @Sendable (UInt64, String, AtlasSearchCancellation) throws -> String?,
@@ -128,17 +137,28 @@ struct AtlasWorkspaceStreamTransport: Sendable {
          cancel: @escaping @Sendable (UInt64) -> Bool,
          close: @escaping @Sendable (UInt64) -> Bool,
          retirementFailed: @escaping @Sendable () -> Void,
-         progressiveSearch: ProgressiveSearch? = nil) {
+         progressiveSearch: ProgressiveSearch? = nil, catalogSearch: CatalogSearch? = nil) {
         self.create = create; self.open = open; self.search = search; self.page = page
         self.hit = hit; self.clear = clear; self.cancel = cancel; self.close = close
         self.retirementFailed = retirementFailed; self.progressiveSearch = progressiveSearch
+        self.catalogSearch = catalogSearch
     }
 }
 
 struct AtlasWorkspaceStreamCatalog: Equatable, Sendable {
-    let owner, manifest, layout, files: UInt64
+    let owner, files: UInt64
+    let manifest, layout: UInt64?
     let root: String
     let discoveryComplete: Bool
+    var progressive: Bool { manifest == nil && layout == nil }
+    /// This is readiness to search a granted root, not a discovery receipt.
+    /// Membership is established by the catalog search's subsequent responses.
+    static func ready(owner: UInt64, root: String) throws -> Self {
+        guard owner > 0 else { throw AtlasWorkspaceStreamError.unavailable }
+        guard root.utf8.first == 47, root.utf8.count <= AtlasObservedReaderLimits.maximumPathBytes,
+              !root.utf8.contains(0) else { throw AtlasWorkspaceStreamError.invalidInput }
+        return Self(owner: owner, files: 0, manifest: nil, layout: nil, root: root, discoveryComplete: false)
+    }
     static func == (a: Self, b: Self) -> Bool {
         a.owner == b.owner && a.manifest == b.manifest && a.layout == b.layout && a.files == b.files
             && a.discoveryComplete == b.discoveryComplete && a.root.utf8.elementsEqual(b.root.utf8)
@@ -156,15 +176,19 @@ struct AtlasWorkspaceStreamCatalog: Equatable, Sendable {
                 throw AtlasWorkspaceStreamError.invalidResponse
             }
             _ = try AtlasObservedReaderInput(root: root, relativePath: [120])
-            return Self(owner: owner, manifest: manifest, layout: layout, files: files, root: root,
+            return Self(owner: owner, files: files, manifest: manifest, layout: layout, root: root,
                 discoveryComplete: try w.flag("discovery_complete"))
         } catch { throw AtlasWorkspaceStreamError.invalidResponse }
     }
 }
 
 struct AtlasWorkspaceStreamIdentity: Equatable, Sendable {
-    let owner, manifest, layout, generation: UInt64
+    let owner: UInt64
+    let manifest, layout: UInt64?
+    let generation: UInt64
     let root: [UInt8]
+    var progressive: Bool { manifest == nil && layout == nil }
+    var schema: String { progressive ? "fcb.catalog-stream/1" : "fcb.atlas-stream-search/1" }
 }
 
 /// Immutable parser and path-filter evidence for this query generation. Swift
@@ -180,10 +204,13 @@ struct AtlasWorkspaceStreamExpression: Equatable, Sendable {
 
 struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
     let identity: AtlasWorkspaceStreamIdentity
+    let revision: UInt64?
     let request: AtlasWorkspaceStreamRequest
     let primaryNeedle: String
     let expression: AtlasWorkspaceStreamExpression?
     let discoveryComplete, complete, matchCountComplete, truncated: Bool
+    let discoveryMore: Bool
+    let pendingCataloguedFiles: UInt64
     let skippedMatches: UInt64
     let pageHasMoreMatches: Bool
     let stop: String?
@@ -224,6 +251,10 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
             result += "Expression counts and highlights the primary literal; required and excluded terms were checked against the same completed file observation. \(expression.excludedFiles) of \(eligibleFiles) location/type-eligible files excluded by expression path or language filters. "
         }
         result += "Examined \(examinedFiles) of \(searchedFiles) search-eligible files; \(excludedFiles) catalogued files excluded by location or file type. \(unexaminedFiles) search-eligible files remain unexamined, \(incompleteFiles) incomplete (\(unavailableFiles) unavailable, \(unsupportedFiles) unsupported text, \(failedFiles) failed reads). "
+        if identity.progressive {
+            result += "\(cataloguedFiles) files discovered so far; \(pendingCataloguedFiles) await scope admission. "
+            if discoveryMore { result += "Discovery is still open; the total project file count is unknown. " }
+        }
         result += "Scanned \(scannedBytes) bytes; read \(payloadBytes) bytes in \(readCalls) calls. "
         if request.pageStartAfter > 0 {
             result += "This new scan skipped \(skippedMatches) of \(request.pageStartAfter) requested occurrences. "
@@ -233,12 +264,13 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
             result += "\(retainedRangeLabel) in \(retainedMatchingFiles) files; counts include omitted matches. "
         }
         if missingVisibleFiles > 0 { result += "\(missingVisibleFiles) requested atlas files are absent from this search catalog. " }
-        if !discoveryComplete { result += "Discovery is incomplete; additional project files may be absent. " }
+        if !discoveryComplete && !discoveryMore { result += "Discovery is incomplete; additional project files may be absent. " }
         switch stop {
         case "match-limit": result += "The result limit stopped the scan. "
         case "byte-limit": result += "The total byte limit stopped the scan. "
         case "read-call-limit": result += "The read-call limit stopped the scan. "
         case "user-stopped": result += "Stopped at your request; matches from finalized files were kept. Any unfinished file remains unexamined. "
+        case "discovery-unavailable": result += "Discovery could not continue; additional project files may be absent. "
         default: break
         }
         return result + "Discovery policy: \(discoveryPolicy); \(excludedEntries) excluded entries (files or directories). Files were observed separately, without an atomic workspace snapshot. Only matching literal bytes are retained."
@@ -246,7 +278,11 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
 
     fileprivate static func decode(_ w: AtlasWorkspaceStreamWire, catalog: AtlasWorkspaceStreamCatalog,
                                    root: String, request: AtlasWorkspaceStreamRequest, terminal: Bool = true) throws -> Self {
-        let identity = try w.streamIdentity(owner: catalog.owner, root: root, caseSensitive: request.caseSensitive, mode: request.mode)
+        let identity = try w.streamIdentity(owner: catalog.owner, root: root,
+            caseSensitive: request.caseSensitive, mode: request.mode, progressive: catalog.progressive)
+        let revision = catalog.progressive ? try w.number("revision") : nil
+        let pending = catalog.progressive ? try w.number("pending_catalogued_files") : 0
+        let discoveryMore = catalog.progressive ? try w.flag("discovery_more") : false
         let limit = try w.object("limits")
         let files = try w.number("catalogued_files"), examined = try w.number("files_examined")
         let unexamined = try w.number("files_unexamined"), incomplete = try w.number("incomplete_files")
@@ -262,12 +298,14 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
         let counting = try w.countCoverage(request: request, complete: complete, matchingFiles: matching)
         let window = try w.matchWindow(request: request, seen: seen, retained: retained)
         let retainedFiles = counting.retainedFiles
-        let scope = try w.scopeCoverage(request: request, catalogued: catalog.files, complete: complete)
+        let scope = try w.scopeCoverage(request: request, catalogued: files, complete: complete,
+            progressive: catalog.progressive)
         let primary = try w.text("needle")
         let expression = try w.expressionCoverage(request: request, primary: primary, eligible: scope.eligible)
         let searchedFiles = expression?.scopeFiles ?? scope.eligible
         guard identity.layout == catalog.layout, identity.manifest == catalog.manifest,
-              files == catalog.files, discovery == catalog.discoveryComplete,
+              catalog.progressive || (files == catalog.files && discovery == catalog.discoveryComplete),
+              pending <= files, !discovery || !discoveryMore,
               !policy.isEmpty, policy.utf8.count <= 256,
               policy.unicodeScalars.allSatisfy({ $0.value >= 32 && $0.value != 127 }),
               try limit.number("max_matches") == request.maximumMatches,
@@ -279,7 +317,8 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
               retainedFiles <= matching, retainedFiles <= retained,
               (retained == 0) == (retainedFiles == 0), (seen == 0) == (matching == 0),
               retained <= request.maximumMatches, retained <= seen, seen <= scanned,
-              stop == nil || ["match-limit", "byte-limit", "read-call-limit", "user-stopped"].contains(stop!),
+              stop == nil || ["match-limit", "byte-limit", "read-call-limit", "user-stopped"].contains(stop!)
+                || (catalog.progressive && stop == "discovery-unavailable"),
               terminal || (stop == nil && !complete),
               truncated == (seen > retained),
               !window.hasMore || retained == request.maximumMatches,
@@ -291,8 +330,13 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
                 : retained * UInt64(primary.utf8.count * 12)),
               stop != "byte-limit" || payload == request.maximumScanBytes,
               stop != "read-call-limit" || calls == request.maximumReadCalls,
-              complete == (terminal && discovery && scope.missing == 0 && unexamined == 0 && incomplete == 0 && stop == nil) else {
+              complete == (terminal && discovery && !discoveryMore && pending == 0
+                && scope.missing == 0 && unexamined == 0 && incomplete == 0 && stop == nil) else {
             throw AtlasWorkspaceStreamError.invalidResponse
+        }
+        if catalog.progressive {
+            guard let revision, revision > 0, try w.number("progress_sequence") == revision,
+                  try w.flag("more") == !terminal else { throw AtlasWorkspaceStreamError.invalidResponse }
         }
         if request.countAllMatches {
             guard stop != "match-limit" else { throw AtlasWorkspaceStreamError.invalidResponse }
@@ -303,9 +347,10 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
                 throw AtlasWorkspaceStreamError.invalidResponse
             }
         }
-        return Self(identity: identity, request: request, primaryNeedle: primary, expression: expression,
+        return Self(identity: identity, revision: revision, request: request, primaryNeedle: primary, expression: expression,
             discoveryComplete: discovery, complete: complete,
             matchCountComplete: counting.complete, truncated: truncated,
+            discoveryMore: discoveryMore, pendingCataloguedFiles: pending,
             skippedMatches: window.skipped, pageHasMoreMatches: window.hasMore, stop: stop,
             discoveryPolicy: policy, excludedEntries: excluded,
             eligibleFiles: scope.eligible, excludedFiles: scope.excluded, missingVisibleFiles: scope.missing,
@@ -319,7 +364,9 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
 }
 
 struct AtlasWorkspaceStreamHit: Equatable, Identifiable, Sendable {
-    let index, occurrence, file, node, revision: UInt64
+    let index, occurrence, file: UInt64
+    let node: UInt64?
+    let revision: UInt64
     let path: [UInt8]
     let displayPath: String
     let range: AtlasObservedByteRange
@@ -344,7 +391,14 @@ struct AtlasWorkspaceStreamHit: Equatable, Identifiable, Sendable {
     fileprivate static func decode(_ w: AtlasWorkspaceStreamWire, root: String,
                                    summary: AtlasWorkspaceStreamSummary) throws -> Self {
         let index = try w.number("index"), occurrence = try w.number("occurrence_id")
-        let file = try w.number("file_id"), node = try w.number("node_ordinal"), revision = try w.number("source_revision")
+        let file = try w.number("file_id"), revision = try w.number("source_revision")
+        let node: UInt64?
+        if summary.identity.progressive {
+            guard !w.fields.contains(AtlasWorkspaceStreamWire.Key("node_ordinal")) else {
+                throw AtlasWorkspaceStreamError.invalidResponse
+            }
+            node = nil
+        } else { node = try w.number("node_ordinal") }
         let path = try w.object("path"), raw = try path.pathBytes()
         _ = try AtlasObservedReaderInput(root: root, relativePath: raw)
         guard summary.request.fileScope.admitsRawPath(raw), summary.request.pathScope.admitsRawPath(raw) else {
@@ -394,15 +448,28 @@ struct AtlasWorkspaceStreamPage: Sendable {
         do {
             try w.terminalState(expected: true, required: requireTerminal || request.mode != .text)
             return try decode(w, catalog: catalog, root: root, request: request,
-                command: previous == nil ? "search" : "page", terminal: true, previous: previous, offset: offset)
+                command: catalog.progressive ? "page" : previous == nil ? "search" : "page",
+                terminal: true, previous: previous, offset: offset)
         } catch { throw AtlasWorkspaceStreamError.invalidResponse }
     }
 
     fileprivate static func decode(_ w: AtlasWorkspaceStreamWire, catalog: AtlasWorkspaceStreamCatalog,
         root: String, request: AtlasWorkspaceStreamRequest, command: String, terminal: Bool,
         previous: AtlasWorkspaceStreamSummary? = nil, offset: UInt64 = 0) throws -> Self {
-        try w.header(schema: "fcb.atlas-stream-search/1", command: command, owner: catalog.owner)
-        let summary = try AtlasWorkspaceStreamSummary.decode(w, catalog: catalog, root: root,
+        try w.header(schema: catalog.progressive ? "fcb.catalog-stream/1" : "fcb.atlas-stream-search/1",
+            command: command, owner: catalog.owner)
+        let observedRoot: String
+        if catalog.progressive {
+            // The open receipt establishes the canonical root for an alias.
+            // Progress continuity and immutable subsequent pages must keep it.
+            let raw = try w.object("root_path").pathBytes()
+            guard let canonical = String(bytes: raw, encoding: .utf8) else {
+                throw AtlasWorkspaceStreamError.invalidResponse
+            }
+            _ = try AtlasObservedReaderInput(root: canonical, relativePath: [120])
+            observedRoot = canonical
+        } else { observedRoot = root }
+        let summary = try AtlasWorkspaceStreamSummary.decode(w, catalog: catalog, root: observedRoot,
             request: request, terminal: terminal)
         let rows = try w.rows("hits", limit: Int(AtlasWorkspaceStreamLimits.page))
         let count = try w.number("page_count"), next = try w.optionalNumber("next_offset")
@@ -413,7 +480,7 @@ struct AtlasWorkspaceStreamPage: Sendable {
             throw AtlasWorkspaceStreamError.invalidResponse
         }
         let hits = try rows.enumerated().map { position, row in
-            let hit = try AtlasWorkspaceStreamHit.decode(row, root: root, summary: summary)
+            let hit = try AtlasWorkspaceStreamHit.decode(row, root: observedRoot, summary: summary)
             guard hit.index == offset + UInt64(position) else { throw AtlasWorkspaceStreamError.invalidResponse }
             return hit
         }
@@ -443,8 +510,12 @@ struct AtlasWorkspaceStreamProgress: Sendable {
             try w.terminalState(expected: false, required: true)
             let sequence = try w.number("progress_sequence")
             guard sequence > 0 else { throw AtlasWorkspaceStreamError.invalidResponse }
+            let command = catalog.progressive ? try w.text("command") : "progress"
+            guard !catalog.progressive || ["info", "advance"].contains(command) else {
+                throw AtlasWorkspaceStreamError.invalidResponse
+            }
             let page = try AtlasWorkspaceStreamPage.decode(w, catalog: catalog, root: catalog.root,
-                request: request, command: "progress", terminal: false)
+                request: request, command: command, terminal: false)
             _ = try AtlasWorkspaceStreamReport.validatePrefix(page.hits, summary: page.summary)
             let result = Self(sequence: sequence, page: page)
             if let previous { try result.validate(after: previous) }
@@ -463,14 +534,33 @@ struct AtlasWorkspaceStreamProgress: Sendable {
         to next: AtlasWorkspaceStreamPage) throws {
         let old = previous.summary, new = next.summary
         guard new.identity == old.identity, new.request == old.request,
-              new.primaryNeedle.utf8.elementsEqual(old.primaryNeedle.utf8), new.expression == old.expression,
-              new.cataloguedFiles == old.cataloguedFiles, new.discoveryComplete == old.discoveryComplete,
-              new.eligibleFiles == old.eligibleFiles, new.excludedFiles == old.excludedFiles,
+              new.primaryNeedle.utf8.elementsEqual(old.primaryNeedle.utf8),
               new.missingVisibleFiles == old.missingVisibleFiles,
-              new.discoveryPolicy.utf8.elementsEqual(old.discoveryPolicy.utf8), new.excludedEntries == old.excludedEntries,
+              new.discoveryPolicy.utf8.elementsEqual(old.discoveryPolicy.utf8),
               previous.offset == 0, next.offset == 0, next.hits.count >= previous.hits.count,
               Array(next.hits.prefix(previous.hits.count)) == previous.hits else {
             throw AtlasWorkspaceStreamError.invalidResponse
+        }
+        if new.identity.progressive {
+            guard let revision = new.revision, let priorRevision = old.revision, revision > priorRevision,
+                  new.cataloguedFiles >= old.cataloguedFiles, new.eligibleFiles >= old.eligibleFiles,
+                  new.excludedFiles >= old.excludedFiles, new.excludedEntries >= old.excludedEntries,
+                  !old.discoveryComplete || new.discoveryComplete, old.discoveryMore || !new.discoveryMore else {
+                throw AtlasWorkspaceStreamError.invalidResponse
+            }
+            if let before = old.expression, let after = new.expression {
+                guard before.query.utf8.elementsEqual(after.query.utf8),
+                      before.primaryNeedle.utf8.elementsEqual(after.primaryNeedle.utf8),
+                      after.scopeFiles >= before.scopeFiles, after.excludedFiles >= before.excludedFiles else {
+                    throw AtlasWorkspaceStreamError.invalidResponse
+                }
+            } else if old.expression != new.expression { throw AtlasWorkspaceStreamError.invalidResponse }
+        } else {
+            guard new.expression == old.expression, new.cataloguedFiles == old.cataloguedFiles,
+                  new.discoveryComplete == old.discoveryComplete, new.eligibleFiles == old.eligibleFiles,
+                  new.excludedFiles == old.excludedFiles, new.excludedEntries == old.excludedEntries else {
+                throw AtlasWorkspaceStreamError.invalidResponse
+            }
         }
         let before = [old.examinedFiles, old.incompleteFiles, old.unavailableFiles, old.unsupportedFiles,
             old.failedFiles, old.matchingFiles, old.retainedMatchingFiles, old.retainedHits, old.matchesSeen, old.payloadBytes,
@@ -510,7 +600,9 @@ struct AtlasWorkspaceStreamReport: Sendable {
             } else {
                 guard files.insert(hit.file).inserted,
                       index == 0 ? hit.occurrence <= summary.skippedMatches + 1 : hit.occurrence == 1,
-                      index == 0 || hits[index - 1].path.lexicographicallyPrecedes(hit.path) else {
+                      index == 0 || (summary.identity.progressive
+                        ? hits[index - 1].file < hit.file
+                        : hits[index - 1].path.lexicographicallyPrecedes(hit.path)) else {
                     throw AtlasWorkspaceStreamError.invalidResponse
                 }
                 if summary.request.caseSensitive { bytes += hit.range.count }
@@ -541,12 +633,13 @@ struct AtlasWorkspaceStreamWitness: Sendable {
                        target: AtlasWorkspaceStreamTarget) throws -> Self {
         let w = try AtlasWorkspaceStreamWire.read(json, owner: target.identity.owner)
         do {
-            try w.header(schema: "fcb.atlas-stream-search/1", command: "hit", owner: target.identity.owner)
+            try w.header(schema: target.identity.schema, command: "hit", owner: target.identity.owner)
             let hit = try w.object("hit")
             let row = try AtlasWorkspaceStreamHit.decode(hit, root: root, summary: report.summary)
             let text = try hit.text("text"), hex = try hit.text("original_hex")
             let scope = try w.scopeCoverage(request: report.summary.request,
-                catalogued: report.summary.cataloguedFiles, complete: report.summary.complete)
+                catalogued: report.summary.cataloguedFiles, complete: report.summary.complete,
+                progressive: target.identity.progressive)
             try w.matchOffset(request: report.summary.request)
             let counting = try w.countCoverage(request: report.summary.request,
                 complete: report.summary.complete, matchingFiles: report.summary.matchingFiles)
@@ -555,7 +648,8 @@ struct AtlasWorkspaceStreamWitness: Sendable {
                 primary: primary, eligible: scope.eligible)
             guard report.admits(target),
                   try w.streamIdentity(owner: target.identity.owner, root: root,
-                    caseSensitive: report.summary.request.caseSensitive, mode: report.summary.request.mode) == target.identity,
+                    caseSensitive: report.summary.request.caseSensitive, mode: report.summary.request.mode,
+                    progressive: target.identity.progressive) == target.identity,
                   scope.eligible == report.summary.eligibleFiles, scope.excluded == report.summary.excludedFiles,
                   scope.missing == report.summary.missingVisibleFiles,
                   counting.complete == report.summary.matchCountComplete,
@@ -566,6 +660,11 @@ struct AtlasWorkspaceStreamWitness: Sendable {
                     needle: report.summary.primaryNeedle, encoding: row.encoding, caseSensitive: report.summary.request.caseSensitive),
                   try w.number("additional_source_bytes_read") == 0, try w.number("additional_read_calls") == 0 else {
                 throw AtlasWorkspaceStreamError.invalidResponse
+            }
+            if target.identity.progressive {
+                guard try w.number("revision") == report.summary.revision else {
+                    throw AtlasWorkspaceStreamError.invalidResponse
+                }
             }
             return Self(target: target, text: text, originalHex: hex)
         } catch { throw AtlasWorkspaceStreamError.invalidResponse }
@@ -592,7 +691,7 @@ struct AtlasWorkspaceStreamWire: Decodable {
             let w = try JSONDecoder().decode(Self.self, from: Data(json.utf8))
             guard try w.number("owner") == owner else { throw AtlasWorkspaceStreamError.invalidResponse }
             if try w.text("status") == "error" {
-                guard ["fcb.atlas-session/1", "fcb.atlas-stream-search/1"].contains(try w.text("schema")) else {
+                guard ["fcb.atlas-session/1", "fcb.atlas-stream-search/1", "fcb.catalog-stream/1"].contains(try w.text("schema")) else {
                     throw AtlasWorkspaceStreamError.invalidResponse
                 }
                 let code = try w.object("error").text("code")
@@ -692,15 +791,20 @@ struct AtlasWorkspaceStreamWire: Decodable {
     /// Older all-files receipts may omit the complete scope extension. A
     /// scoped query requires the exact predicate on progress, pages and hits.
     func scopeCoverage(request: AtlasWorkspaceStreamRequest, catalogued: UInt64,
-        complete: Bool) throws -> (eligible: UInt64, excluded: UInt64, missing: UInt64) {
-        guard catalogued <= AtlasWorkspaceStreamLimits.files else { throw AtlasWorkspaceStreamError.invalidResponse }
+        complete: Bool, progressive: Bool = false) throws -> (eligible: UInt64, excluded: UInt64, missing: UInt64) {
+        guard catalogued <= UInt64(Int.max), progressive || catalogued <= AtlasWorkspaceStreamLimits.files else {
+            throw AtlasWorkspaceStreamError.invalidResponse
+        }
+        let pending = progressive ? try number("pending_catalogued_files") : 0
+        guard pending <= catalogued else { throw AtlasWorkspaceStreamError.invalidResponse }
+        let admittedCatalog = catalogued - pending
         let required = ["search_scope", "scope_extensions", "scope_filenames", "scope_path_kind",
             "scope_path", "scope_path_hex", "eligible_files", "excluded_files", "case_sensitive"]
         let region = ["scope_region_sha256", "scope_region_files", "scope_region_path_bytes",
             "scope_region_catalogued_files", "scope_region_missing_files"]
         let present = (required + region).contains { fields.contains(Key($0)) }
         guard present else {
-            guard request.mode == .text, request.fileScope.isAll, request.pathScope.isWorkspace, request.caseSensitive else {
+            guard !progressive, request.mode == .text, request.fileScope.isAll, request.pathScope.isWorkspace, request.caseSensitive else {
                 throw AtlasWorkspaceStreamError.invalidResponse
             }
             return (catalogued, 0, 0)
@@ -717,11 +821,11 @@ struct AtlasWorkspaceStreamWire: Decodable {
         let eligible = try request.fileScope.eligibleFiles(kind: text("search_scope"),
             extensions: text("scope_extensions"), filenames: text("scope_filenames"),
             eligible: text("eligible_files"), excluded: text("excluded_files"),
-            catalogued: Int(catalogued), pathScoped: !request.pathScope.isWorkspace)
+            catalogued: Int(admittedCatalog), pathScoped: !request.pathScope.isWorkspace)
         let missing = try request.pathScope.validateRegionCoverage(catalogued: additive("scope_region_catalogued_files"),
             missing: additive("scope_region_missing_files"), eligible: eligible,
             searchCatalogFiles: Int(catalogued), allFileTypes: request.fileScope.isAll, complete: complete)
-        return (UInt64(eligible), catalogued - UInt64(eligible), UInt64(missing))
+        return (UInt64(eligible), admittedCatalog - UInt64(eligible), UInt64(missing))
     }
     func object(_ key: String) throws -> Self { try fields.decode(Self.self, forKey: Key(key)) }
     func rows(_ key: String, limit: Int) throws -> [Self] {
@@ -761,12 +865,26 @@ struct AtlasWorkspaceStreamWire: Decodable {
               try number("owner") == owner else { throw AtlasWorkspaceStreamError.invalidResponse }
     }
     func streamIdentity(owner: UInt64, root: String, caseSensitive: Bool,
-        mode: AtlasWorkspaceStreamMode = .text) throws -> AtlasWorkspaceStreamIdentity {
-        let manifest = try number("source_manifest"), layout = try number("layout_revision")
+        mode: AtlasWorkspaceStreamMode = .text, progressive: Bool = false) throws -> AtlasWorkspaceStreamIdentity {
+        let manifest: UInt64?, layout: UInt64?
+        if progressive {
+            guard !["source_manifest", "layout_revision", "last_attempt", "node_ordinal"].contains(where: { fields.contains(Key($0)) }),
+                  try text("membership") == "progressive-observation",
+                  try text("ordering") == "provisional-discovery-order" else {
+                throw AtlasWorkspaceStreamError.invalidResponse
+            }
+            manifest = nil; layout = nil
+        } else {
+            manifest = try number("source_manifest"); layout = try number("layout_revision")
+            guard (manifest ?? 0) > 0, (layout ?? 0) > 0,
+                  try number("last_attempt") >= number("query_generation") else {
+                throw AtlasWorkspaceStreamError.invalidResponse
+            }
+        }
         let generation = try number("query_generation"), rawRoot = try object("root_path").pathBytes()
-        guard try number("owner") == owner, manifest > 0, layout > 0, generation > 0,
-              try number("last_attempt") >= generation,
-              rawRoot.elementsEqual(root.utf8), try text("scope") == "catalogued-whole-files",
+        guard try number("owner") == owner, generation > 0,
+              rawRoot.elementsEqual(root.utf8),
+              try text("scope") == (progressive ? "progressively-discovered-whole-files" : "catalogued-whole-files"),
               try text("strategy") == "streaming-whole-file", try text("mode") == mode.wireMode(caseSensitive: caseSensitive),
               try text("capture_kind") == "literal-witnesses-only",
               try text("source_observation") == "per-file-streams-not-atomic-workspace" else {

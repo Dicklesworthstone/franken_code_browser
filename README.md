@@ -44,12 +44,16 @@ occurrence highlighting. See [workspace identifier occurrences](native/macos/REA
 for encoding, coverage and capture limits.
 
 The current source also adds **Search large project files…** in the search sidebar.
-It streams exact UTF-8 or BOM-marked UTF-16 text across the project catalog beyond
-ordinary capture limits, with a selectable 256 MiB–4 GiB total I/O budget,
+It progressively discovers and streams UTF-8 or BOM-marked UTF-16 files beyond
+ordinary capture limits and the atlas's 20,000-file ceiling, with a selectable
+256 MiB–4 GiB total I/O budget,
 progressive finalized-file previews, **Stop and keep matches**, optional
 **Count all matches** beyond the retained-result limit, explicit partial-coverage
-reporting, retained-match copying, and separately verified current-context reads. See the [native search workflow](native/macos/README.md#searching-large-files-across-a-project)
-for its catalog and result limits. This addition still requires executable and
+reporting, retained-match copying, and separately verified current-context reads.
+Workspace, folder and exact-file searches keep bounded discovery pages while
+visiting later files; visible-atlas searches retain their explicit map membership.
+See the [native search workflow](native/macos/README.md#searching-large-files-across-a-project)
+for discovery, I/O and result limits. This addition still requires executable and
 physical-Mac qualification; it is not a claim about an already released binary.
 
 The large-file **Observed Range Reader** now also supports bounded line-number

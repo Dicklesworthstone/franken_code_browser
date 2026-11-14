@@ -480,7 +480,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             query: query, caseSensitive: searchCaseSensitive,
             countAllMatches: searchCountAllMatches,
             mode: searchMode == .occurrences ? .occurrences : searchMode == .expression ? .expression : .text,
-            transport: .native)
+            transport: pathScope.isVisible ? .native : .catalogNative)
     }
 
     private func closeWorkspaceStreamSearch() {

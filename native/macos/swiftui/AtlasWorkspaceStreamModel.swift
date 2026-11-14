@@ -317,6 +317,14 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
         let candidate: AtlasWorkspaceStreamSession
         do { candidate = try .init(transport: transport, access: authority.access) }
         catch { notice = message(error); return }
+        if transport.catalogSearch != nil {
+            do {
+                catalog = try .ready(owner: candidate.handle, root: authority.root)
+                session = candidate; lastGeneration = 0
+                notice = "Ready to discover and search project files. Each search traverses beyond the atlas file limit within the selected byte budget."
+            } catch { notice = message(error) }
+            return
+        }
         let (ticket, flag) = begin("Discovering a fresh catalog of at most 20,000 project files…")
         opening = true; pendingSession = candidate
         let root = authority.root
@@ -348,22 +356,34 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
         search(startAfter: request.pageStartAfter - min(request.pageStartAfter, request.maximumMatches))
     }
     private func search(startAfter: UInt64) {
-        guard canSearch, let session, let catalog else { return }
+        guard canSearch, let previousSession = session, let previousCatalog = catalog else { return }
         let request: AtlasWorkspaceStreamRequest
         do { request = try currentRequest(startAfter: startAfter) }
         catch { notice = message(error); return }
+        let session: AtlasWorkspaceStreamSession, catalog: AtlasWorkspaceStreamCatalog
+        if transport.catalogSearch != nil {
+            guard let authority else { return }
+            do {
+                session = try .init(transport: transport, access: authority.access)
+                catalog = try .ready(owner: session.handle, root: authority.root)
+            } catch { notice = message(error); return }
+        } else { session = previousSession; catalog = previousCatalog }
         // A foreign call can replace the query before its reply is lost or
         // rejected. Preserve old bytes for reading, but revoke their actions.
         revokeTargets(clearEvidence: false)
         let (ticket, flag) = begin(startAfter == 0
             ? "Searching the selected location and file types, including large files…"
             : "Scanning current files again, skipping the first \(startAfter) matches… Earlier results remain a separate observation.")
+        self.session = session; self.catalog = catalog
         searching = true
         let progressive = session.transport.progressiveSearch
-        let stop = progressive == nil ? nil : AtlasWorkspaceStreamStop()
+        let catalogSearch = session.transport.catalogSearch
+        let hasProgress = progressive != nil || catalogSearch != nil
+        let stop = hasProgress ? AtlasWorkspaceStreamStop() : nil
+        let requestedGeneration = lastGeneration + 1
         stopFlag = stop
         let mailbox: AtlasWorkspaceStreamProgressMailbox?
-        if progressive != nil {
+        if hasProgress {
             mailbox = .init(catalog: catalog, request: request, minimumGeneration: lastGeneration,
                 cancellation: flag) { [weak self, weak session] progress in
                 guard let self, let session, self.busy, self.searching,
@@ -379,20 +399,33 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
                 let accepted = try await io.perform(cancellation: flag, keepingAlive: [session]) {
                     defer { mailbox?.close() }
                     let response: String?
-                    if let progressive, let stop, let mailbox {
+                    if let catalogSearch, let stop, let mailbox {
+                        response = try catalogSearch.search(session.handle, catalog.root, requestedGeneration,
+                            request, flag, stop) { mailbox.offer($0) }
+                    } else if let progressive, let stop, let mailbox {
                         response = try progressive(session.handle, request, flag, stop) { mailbox.offer($0) }
                     } else { response = try session.transport.search(session.handle, request, flag) }
                     var page = try AtlasWorkspaceStreamPage.decode(response, catalog: catalog,
-                        root: catalog.root, request: request, requireTerminal: progressive != nil)
+                        root: catalog.root, request: request, requireTerminal: hasProgress)
+                    if catalogSearch != nil && page.summary.identity.generation != requestedGeneration {
+                        throw AtlasWorkspaceStreamError.invalidResponse
+                    }
                     try mailbox?.seal(validating: page)
                     let summary = page.summary
                     var hits = page.hits
                     while let next = page.next {
                         guard !flag.isCanceled else { throw AtlasWorkspaceStreamError.canceled }
-                        page = try AtlasWorkspaceStreamPage.decode(session.transport.page(session.handle,
-                            summary.identity.generation, next, AtlasWorkspaceStreamLimits.page),
+                        let response: String?
+                        if let catalogSearch, let revision = summary.revision {
+                            response = try catalogSearch.page(session.handle, summary.identity.generation,
+                                revision, next, AtlasWorkspaceStreamLimits.page)
+                        } else {
+                            response = try session.transport.page(session.handle, summary.identity.generation,
+                                next, AtlasWorkspaceStreamLimits.page)
+                        }
+                        page = try AtlasWorkspaceStreamPage.decode(response,
                             catalog: catalog, root: catalog.root, request: request, previous: summary,
-                            offset: next, requireTerminal: progressive != nil)
+                            offset: next, requireTerminal: hasProgress)
                         hits.append(contentsOf: page.hits)
                     }
                     return try AtlasWorkspaceStreamReport(summary: summary, hits: hits)
@@ -403,6 +436,12 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
                     throw AtlasWorkspaceStreamError.invalidResponse
                 }
                 lastGeneration = accepted.summary.identity.generation
+                if catalog.progressive {
+                    guard let canonicalRoot = String(bytes: accepted.summary.identity.root, encoding: .utf8) else {
+                        throw AtlasWorkspaceStreamError.invalidResponse
+                    }
+                    self.catalog = try .ready(owner: session.handle, root: canonicalRoot)
+                }
                 report = accepted; witness = nil; reportAuthorized = true
                 finish(ticket)
                 notice = accepted.summary.stop == "user-stopped"
@@ -433,8 +472,13 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
         task = Task {
             do {
                 let accepted = try await io.perform(cancellation: flag, keepingAlive: [session]) {
-                    try AtlasWorkspaceStreamWitness.decode(session.transport.hit(session.handle,
-                        target.identity.generation, target.hit.index), report: report, root: catalog.root, target: target)
+                    let response: String?
+                    if let catalogSearch = session.transport.catalogSearch, let revision = report.summary.revision {
+                        response = try catalogSearch.hit(session.handle, target.identity.generation, revision, target.hit.index)
+                    } else {
+                        response = try session.transport.hit(session.handle, target.identity.generation, target.hit.index)
+                    }
+                    return try AtlasWorkspaceStreamWitness.decode(response, report: report, root: catalog.root, target: target)
                 }
                 guard accepts(ticket, flag), self.session === session, reportAuthorized,
                       self.report?.admits(target) == true else { return }
@@ -462,6 +506,10 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
 
     func clear() {
         revokeTargets(clearEvidence: true)
+        if transport.catalogSearch != nil {
+            refreshCatalog()
+            return
+        }
         guard !closed, let session, let catalog else { return }
         let (ticket, flag) = begin("Releasing retained search literals…")
         task = Task {
@@ -485,6 +533,7 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
 
     func cancel() {
         cancelWork()
+        if transport.catalogSearch != nil { revokeTargets(clearEvidence: false) }
         notice = "Operation canceled. Accepted evidence remains readable; entered file work may still be draining."
     }
     func close() {
@@ -506,10 +555,14 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
         return (ticket, flag)
     }
     private func cancelWork() {
+        let cancelCatalogSession = busy || opening
         progressMailbox?.close(); progressMailbox = nil; progress = nil
         stopFlag = nil; searching = false; stopping = false
         operation = UUID(); flag?.cancel(); task?.cancel(); io.cancel()
-        session?.cancel(); pendingSession?.cancel()
+        // Catalog queries are immutable and hard cancellation retires their
+        // authority. Idle paging/selection must not cancel an accepted query.
+        if transport.catalogSearch == nil || cancelCatalogSession { session?.cancel() }
+        pendingSession?.cancel()
         task = nil; flag = nil; pendingSession = nil; busy = false; opening = false
     }
     private func accepts(_ ticket: UUID, _ flag: AtlasSearchCancellation) -> Bool {

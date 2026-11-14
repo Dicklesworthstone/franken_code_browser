@@ -17,8 +17,9 @@ import AppKit
             HStack {
                 Label("Search large project files", systemImage: "doc.text.magnifyingglass").font(.headline)
                 Spacer()
-                Button("Refresh file catalog", action: model.refreshCatalog).disabled(!model.canRefresh)
-                    .help("Discover the current project again, including files added since this catalog was opened")
+                Button(presentation.source.pathScope.isVisible ? "Refresh file catalog" : "Reset search",
+                    action: model.refreshCatalog).disabled(!model.canRefresh)
+                    .help("Release this search's results and prepare a fresh discovery of the current project")
                 Button("Done") { presentation.close(); dismiss() }.keyboardShortcut(.cancelAction)
             }
             Text(verbatim: "Project: " + String(reflecting: presentation.source.root))
@@ -27,7 +28,9 @@ import AppKit
                 .font(.callout).textSelection(.enabled).lineLimit(3)
             Text("Search text, expressions or whole identifiers in the selected location and file types, including large files. UTF-8 and BOM-declared UTF-16 are recognized automatically. No per-file byte cap applies; the total byte budget limits the scan.")
                 .font(.caption).foregroundStyle(.secondary)
-            Text("This sheet keeps the sidebar's location and file-type selection fixed. Return to the sidebar and reopen this sheet to choose another scope. Discovery uses product exclusions and stops at 20,000 files; excluded files do not consume the scan budget.")
+            Text(presentation.source.pathScope.isVisible
+                ? "This sheet keeps the displayed atlas membership and file-type selection fixed. Its frozen search catalog contains at most 20,000 files; missing requested paths are reported as incomplete coverage."
+                : "This sheet keeps the sidebar's location and file-type selection fixed. Discovery continues beyond the atlas file limit using repository rules; excluded files do not consume the scan budget. The total file count remains unknown until discovery finishes.")
                 .font(.caption).foregroundStyle(.secondary)
             HStack(spacing: 8) {
                 Picker("Search mode", selection: $model.mode) {
@@ -81,7 +84,9 @@ import AppKit
             }
             HStack {
                 if let catalog = model.catalog {
-                    Text("\(catalog.files) catalogued files · \(catalog.discoveryComplete ? "discovery complete under product exclusions" : "discovery incomplete")")
+                    Text(catalog.progressive
+                        ? "Progressive project discovery · each search observes current files again"
+                        : "\(catalog.files) catalogued files · \(catalog.discoveryComplete ? "discovery complete under product exclusions" : "discovery incomplete")")
                         .font(.caption).foregroundStyle(.secondary)
                 } else {
                     Text(model.opening ? "Discovering project files…" : "No accepted file catalog")
@@ -97,8 +102,14 @@ import AppKit
             }
             if let progress = model.progress {
                 VStack(alignment: .leading, spacing: 4) {
-                    ProgressView(value: Double(progress.summary.examinedFiles),
-                        total: Double(max(1, progress.summary.searchedFiles)))
+                    if progress.summary.discoveryMore || progress.summary.pendingCataloguedFiles > 0 {
+                        ProgressView("Discovering and searching project files…")
+                        Text("\(progress.summary.cataloguedFiles) files discovered so far; \(progress.summary.pendingCataloguedFiles) await scope admission.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        ProgressView(value: Double(progress.summary.examinedFiles),
+                            total: Double(max(1, progress.summary.searchedFiles)))
+                    }
                     Text("Examined \(progress.summary.examinedFiles) of \(progress.summary.searchedFiles) search-eligible files · \(progress.summary.excludedFiles) excluded by location/type · read \(progress.summary.payloadBytes) bytes in \(progress.summary.readCalls) calls")
                         .font(.caption).foregroundStyle(.secondary)
                     if let expression = progress.summary.expression {
@@ -150,7 +161,9 @@ import AppKit
                     Button("Scan earlier matches", action: model.scanEarlier).disabled(!model.canScanEarlier)
                     Button("Scan later matches", action: model.scanLater).disabled(!model.canScanLater)
                 }
-                Text("Each window scans current files again. Files may have changed; the new results replace the previous observation.")
+                Text(report.summary.identity.progressive
+                    ? "Each window discovers and scans current files again. Files and discovery order may have changed; the new results replace the previous observation."
+                    : "Each window scans current files again. Files may have changed; the new results replace the previous observation.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             if let progress = model.progress {

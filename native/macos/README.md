@@ -1028,8 +1028,11 @@ executable Rust/Swift verification and physical-Mac qualification.
 
 Choose **Search large project files…** in the search sidebar to search text,
 expressions or exact whole identifiers in the sidebar's selected location and file types,
-using a separately retained project catalog. Workspace, folder, exact file and frozen
-visible-atlas selections use the same predicates as ordinary search. Rust scopes
+using independent, progressive project discovery for workspace, folder and exact-file
+scopes. Content search continues beyond the atlas's 20,000-file ceiling without
+building a larger map or retaining every discovered pathname. Frozen visible-atlas
+selections keep their explicit map membership. All four selections use the same
+location and file-type predicates as ordinary search. Rust scopes
 include `Cargo.toml`; custom extension scopes keep their exact selected keys,
 and an empty custom scope searches no files.
 This route streams file contents through the shared Rust matcher, including
@@ -1089,7 +1092,11 @@ Occurrences mode selects it automatically.
 
 The sheet freezes the location and file-type selection when it opens. Moving the
 camera, changing the sidebar or refreshing the sheet's catalog cannot widen that
-selection. Reopen the sheet to choose another scope. For a visible-atlas scope,
+selection. Reopen the sheet to choose another scope. Workspace, folder and exact-file
+searches observe current membership anew on each query; their discovered and eligible
+file counts grow as the walk advances. The progress display keeps the total unknown
+while more discovery remains and separately reports discovered files awaiting scope
+admission. For a visible-atlas scope,
 choose the atlas view in the sidebar first. Files absent from the search catalog
 remain separately reported as missing requested files, preventing a false
 complete result. Location/type exclusions are reported separately from discovery
@@ -1109,7 +1116,10 @@ For Text, Expression and Occurrences, **Scan later matches** and **Scan earlier 
 open another bounded result window when available. Each action scans current
 files again from the beginning, charging skipped matches against the same I/O
 budgets. The new window replaces the previous observation and receives fresh
-query and source identities; files may have changed between scans. A regular
+query and source identities; files may have changed between scans. Progressive
+queries also rediscover membership, and discovery order can change between walks.
+These ordinal windows therefore describe new observations, not stable pages of a
+frozen workspace result set. A regular
 **Search** starts again at the first window. Each Expression window counts all
 qualifying primary matches within the I/O budgets and retains up to 256 results
 after the requested number of skipped matches. Required and excluded predicates
@@ -1141,11 +1151,21 @@ attempt's delivery while entered work drains on the worker. They do not convert
 a canceled attempt into a stopped result. Previously accepted evidence remains
 readable when retained by the surface, with obsolete actions disabled.
 
-The catalog admits at most 20,000 regular files, subject to separate path and
-discovery-page limits and the product's exclusions. Search covers the eligible
-members of this catalog under the sheet's frozen scope. **Refresh file catalog**
-discovers current membership again within the same location and type selection, including
-new files. Existing queries never turn newly created or uncatalogued files into
+Workspace, folder and exact-file search has no total discovered-file cutoff. It
+retains at most four discovery pages of 256 entries each, one active streaming
+reader, 256 result rows and a bounded diagnostic prefix. The shared
+`repository-rules-v1` policy observes supported `.gitignore` and `.fcbignore`
+rules. Traversal still has separate path, depth, pending-directory and rule-reading
+limits; a refusal remains visible as incomplete discovery. Matches keep their raw
+path and original bytes independently of discovery-page eviction, so a result
+from a later file can still be copied or opened in the current-context reader.
+
+Visible-atlas search continues to use the separately retained atlas catalog, with
+at most 20,000 regular files and the same explicit region membership. **Reset
+search** releases a progressive query's results and prepares another query within
+the frozen selection; **Refresh file catalog** rediscovers the visible-atlas
+catalog. The next progressive query observes current membership again, including new files.
+Neither path claims an atomic workspace snapshot or treats undiscovered files as
 proven no-match results. The summary separately reports incomplete discovery,
 unexamined files, unsupported text, unavailable files, failed reads, and byte,
 call or match-limit stops, and user-requested stops. Excluded entries include pruned directories; their
@@ -1166,15 +1186,19 @@ Changing the query, mode or case policy, refreshing the catalog, replacing the
 project or closing the sheet closes this child reader and revokes its actions
 synchronously.
 
-The safe host service is `fcb_app::host::atlas_stream_search`; native hosts use
-[`fcb_atlas_stream_search.h`](../../crates/fcb-bridge/include/fcb_atlas_stream_search.h)
-with existing atlas handles. The public `AtlasStreamSearch` accepts both borrowed
-and retained atlas metadata without rebuilding geometry. Added core, host, C ABI,
-native receipt, cancellation/lifetime and context-navigation cases cover this
-integration, including raw-expression ABI routing, immutable parsed-primary and
-predicate metadata, expression scope accounting, original encoded witnesses,
-observed-end admission, counted progress and Stop. They are code-first additions: executable Rust/Swift verification
-and physical-Mac qualification remain pending.
+The progressive host service is
+`fcb_app::host::catalog_session::CatalogContentSearchSession`; native hosts use
+[`fcb_catalog_stream.h`](../../crates/fcb-bridge/include/fcb_catalog_stream.h).
+Each query owns an independent handle, bounded advance operations and
+revision-checked result pages. Its `fcb.catalog-stream/1` receipts explicitly
+describe progressive membership and never invent atlas node or layout identities.
+The visible-atlas route retains `fcb_app::host::atlas_stream_search` and
+[`fcb_atlas_stream_search.h`](../../crates/fcb-bridge/include/fcb_atlas_stream_search.h).
+Both reuse the same streaming matcher, expression semantics and exact witness
+representation. Added core, host, C ABI and native cases target large discovery,
+encoding, original-byte retention, query replacement, cancellation, bounded
+results, counted progress and Stop. They are code-first additions: executable
+Rust/Swift verification and physical-Mac qualification remain pending.
 
 ## Finding text in one large file
 

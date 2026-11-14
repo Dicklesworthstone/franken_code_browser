@@ -19,4 +19,11 @@ swiftc "$@" -swift-version 6 -warnings-as-errors \
     "$src/AtlasWorkspaceStream.swift" "$src/AtlasWorkspaceStreamBridge.swift" \
     "$src/tests/AtlasWorkspaceStreamBridgeTests.swift" "$out/fixture.o" -o "$out/bridge"
 "$out/bridge"
+clang -std=gnu11 -Wall -Wextra -Werror -c "$src/tests/AtlasWorkspaceCatalogBridgeFixtures.c" -o "$out/catalog-fixture.o"
+swiftc "$@" -swift-version 6 -warnings-as-errors \
+    "$src/AtlasSearch.swift" "$src/AtlasSearchExpression.swift" "$src/AtlasSearchCoordinator.swift" \
+    "$src/AtlasSource.swift" "$src/AtlasObservedReader.swift" "$src/AtlasObservedReaderSearch.swift" \
+    "$src/AtlasWorkspaceStream.swift" "$src/AtlasWorkspaceCatalogBridge.swift" \
+    "$src/tests/AtlasWorkspaceCatalogBridgeTests.swift" "$out/catalog-fixture.o" -o "$out/catalog-bridge"
+"$out/catalog-bridge"
 printf 'Retained test artifacts: %s\n' "$out"

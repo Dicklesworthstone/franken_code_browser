@@ -213,6 +213,48 @@ private enum StreamProgressFixture {
     }
 }
 
+/// Progressive membership deliberately exceeds the atlas cap. Captured
+/// literal evidence remains identical while discovery totals grow.
+private enum CatalogStreamFixture {
+    static func report(_ owner: UInt64, _ generation: UInt64, _ request: AtlasWorkspaceStreamRequest,
+        revision: UInt64 = 3, discovered: UInt64 = 25_001, pending: UInt64 = 0,
+        terminal: Bool = true, stopped: Bool = false, count: Int = 40) -> [String: Any] {
+        var value = StreamFixture.report(owner, generation, request, count: count,
+            primaryNeedle: request.mode == .expression ? "old" : nil)
+        for key in ["source_manifest", "layout_revision", "last_attempt"] { value.removeValue(forKey: key) }
+        value["schema"] = "fcb.catalog-stream/1"
+        value["scope"] = "progressively-discovered-whole-files"
+        value["membership"] = "progressive-observation"; value["ordering"] = "provisional-discovery-order"
+        value["revision"] = String(revision); value["progress_sequence"] = String(revision)
+        value["catalogued_files"] = String(discovered); value["pending_catalogued_files"] = String(pending)
+        value["files_examined"] = String(discovered - pending); value["files_unexamined"] = "0"
+        value["discovery_more"] = !terminal || stopped
+        value["discovery_complete"] = terminal && !stopped
+        value["search_complete"] = terminal && !stopped; value["match_count_complete"] = terminal && !stopped
+        value["terminal"] = terminal; value["selection_available"] = terminal; value["more"] = !terminal
+        value["count_all_matches"] = request.countAllMatches
+        value["retained_matching_files"] = count == 0 ? "0" : "1"
+        value["stop_reason"] = stopped ? "user-stopped" as Any : NSNull()
+        value["page_start_after"] = String(request.pageStartAfter); value["skipped_matches"] = "0"
+        value["page_has_more_matches"] = false
+        value.merge(StreamFixture.scope(request, catalogued: discovered - pending, eligible: discovered - pending),
+            uniquingKeysWith: { _, next in next })
+        if request.mode == .expression {
+            value["expression_scope_files"] = String(discovered - pending); value["expression_excluded_files"] = "0"
+        }
+        var rows = value["hits"] as! [[String: Any]]
+        for index in rows.indices { rows[index].removeValue(forKey: "node_ordinal"); rows[index]["file_id"] = "20001" }
+        value["hits"] = rows
+        return value
+    }
+    static func page(_ value: [String: Any], offset: Int = 0) -> [String: Any] {
+        var page = StreamFixture.page(value, offset: offset); page["command"] = "page"; return page
+    }
+    static func progress(_ value: [String: Any]) -> [String: Any] {
+        var page = Self.page(value); page["command"] = "advance"; return page
+    }
+}
+
 private final class StreamProbe: @unchecked Sendable {
     private let expressionPrimary: String?
     init(expressionPrimary: String? = nil) { self.expressionPrimary = expressionPrimary }
@@ -250,6 +292,23 @@ private final class StreamProbe: @unchecked Sendable {
             progressiveSearch: { owner, request, flag, stop, publish in
                 try self.progressiveSearch(owner, request, flag, stop, publish)
             })
+    }
+    var catalogTransport: AtlasWorkspaceStreamTransport {
+        let base = transport
+        return .init(create: base.create,
+            open: { _, _, _ in preconditionFailure("Progressive readiness must not discover a frozen atlas") },
+            search: base.search, page: base.page, hit: base.hit, clear: base.clear,
+            cancel: base.cancel, close: base.close, retirementFailed: base.retirementFailed,
+            catalogSearch: .init(search: { owner, root, generation, request, flag, stop, publish in
+                precondition(root == StreamFixture.root || root == "/selected-alias/")
+                return try self.catalogSearch(owner, generation, request, flag, stop, publish)
+            }, page: { owner, generation, revision, start, count in
+                precondition(revision == 3)
+                return try self.page(owner, generation, start, count)
+            }, hit: { owner, generation, revision, index in
+                precondition(revision == 3)
+                return try self.hit(owner, generation, index)
+            }))
     }
     func blockProgress(_ gate: ObservedReaderGate) { locked { progressGate = gate } }
     func poisonProgress() { locked { badProgress = true } }
@@ -340,6 +399,30 @@ private final class StreamProbe: @unchecked Sendable {
         locked { reports[owner] = report }
         return try StreamFixture.json(StreamFixture.page(report))
     }
+    private func catalogSearch(_ owner: UInt64, _ generation: UInt64, _ request: AtlasWorkspaceStreamRequest,
+        _ flag: AtlasSearchCancellation, _ stop: AtlasWorkspaceStreamStop,
+        _ publish: @Sendable (String) -> Void) throws -> String {
+        enter(); defer { leave() }
+        let (gate, poisoned) = locked {
+            precondition(generations[owner] == nil, "A progressive query handle must never reopen")
+            generations[owner] = generation; searches += 1
+            let result = (progressGate, badProgress); progressGate = nil; badProgress = false
+            return result
+        }
+        for (revision, discovered) in [(UInt64(1), UInt64(20_001)), (2, 25_001)] {
+            var value = CatalogStreamFixture.report(owner, generation, request, revision: revision,
+                discovered: discovered, pending: 1, terminal: false)
+            if poisoned { value["pending_catalogued_files"] = String(discovered + 1) }
+            publish(try StreamFixture.json(CatalogStreamFixture.progress(value)))
+            guard !flag.isCanceled else { throw AtlasWorkspaceStreamError.canceled }
+        }
+        gate?.wait()
+        guard !flag.isCanceled else { throw AtlasWorkspaceStreamError.canceled }
+        let value = CatalogStreamFixture.report(owner, generation, request,
+            pending: stop.isRequested ? 1 : 0, stopped: stop.isRequested)
+        locked { reports[owner] = value }
+        return try StreamFixture.json(CatalogStreamFixture.page(value))
+    }
     private func page(_ owner: UInt64, _ generation: UInt64, _ start: UInt64, _ count: UInt64) throws -> String {
         enter(); defer { leave() }
         let (gate, fails, report) = locked {
@@ -409,6 +492,8 @@ private final class StreamContextProbe: @unchecked Sendable {
         try expressionWireTests()
         try expressionWindowWireTests()
         try progressWireTests()
+        try catalogWireTests()
+        try await catalogModelTests()
         try await countedModelTests()
         try await lowercaseModelTests()
         try await occurrenceModelTests()
@@ -430,6 +515,156 @@ private final class StreamContextProbe: @unchecked Sendable {
             try await Task.sleep(for: .milliseconds(5))
         }
         preconditionFailure("Timed out: " + label)
+    }
+    private static func catalogWireTests() throws {
+        let owner: UInt64 = 0xfedcba9876543210
+        let catalog = try AtlasWorkspaceStreamCatalog.ready(owner: owner, root: StreamFixture.root)
+        let request = try AtlasWorkspaceStreamRequest(needle: "old")
+        func decode(_ value: [String: Any]) throws -> AtlasWorkspaceStreamPage {
+            try .decode(StreamFixture.json(CatalogStreamFixture.page(value)), catalog: catalog,
+                root: catalog.root, request: request, requireTerminal: true)
+        }
+        var value = CatalogStreamFixture.report(owner, 7, request, count: 2)
+        var rows = value["hits"] as! [[String: Any]]
+        rows[1]["file_id"] = "25001"; rows[1]["occurrence_id"] = "1"
+        rows[1]["path"] = StreamFixture.path(Array("a.txt".utf8))
+        value["hits"] = rows; value["matching_files"] = "2"; value["retained_matching_files"] = "2"
+        value["retained_witness_bytes"] = "6"
+        let page = try decode(value), report = try AtlasWorkspaceStreamReport(summary: page.summary, hits: page.hits)
+        precondition(report.summary.cataloguedFiles == 25_001 && report.summary.complete)
+        precondition(report.summary.identity.manifest == nil && report.summary.identity.layout == nil
+            && report.hits.allSatisfy { $0.node == nil })
+        precondition(report.hits[1].path.lexicographicallyPrecedes(report.hits[0].path),
+            "Discovery order must not be confused with a lexical atlas manifest")
+        let target = report.target(for: report.hits[1])
+        let witnessWire = StreamFixture.witness(value, index: 1)
+        _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(witnessWire), report: report,
+            root: catalog.root, target: target)
+        for (key, replacement) in [("revision", "2"), ("query_generation", "8")] {
+            var stale = witnessWire; stale[key] = replacement
+            rejects("catalog witness " + key) {
+                _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(stale), report: report,
+                    root: catalog.root, target: target)
+            }
+        }
+        var fakeNode = value
+        var fakeRows = rows; fakeRows[0]["node_ordinal"] = "0"; fakeNode["hits"] = fakeRows
+        rejects("invented atlas membership") { _ = try decode(fakeNode) }
+        for (key, replacement) in [("source_manifest", "1"), ("pending_catalogued_files", "25002"),
+            ("catalogued_files", String(UInt64.max)), ("eligible_files", "25002")] {
+            var invalid = value; invalid[key] = replacement
+            rejects("progressive " + key) { _ = try decode(invalid) }
+        }
+        var falseComplete = value; falseComplete["discovery_more"] = true
+        rejects("complete while discovery remains open") { _ = try decode(falseComplete) }
+        var wrongOrder = value
+        var inverted = rows; inverted[1]["file_id"] = "1"; wrongOrder["hits"] = inverted
+        rejects("nonmonotonic discovery identities") {
+            let page = try decode(wrongOrder)
+            _ = try AtlasWorkspaceStreamReport(summary: page.summary, hits: page.hits)
+        }
+        let firstValue = CatalogStreamFixture.report(owner, 8, request,
+            revision: 1, discovered: 20_001, pending: 1, terminal: false)
+        let nextValue = CatalogStreamFixture.report(owner, 8, request,
+            revision: 2, discovered: 25_001, pending: 1, terminal: false)
+        let first = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(CatalogStreamFixture.progress(firstValue)),
+            catalog: catalog, request: request)
+        let next = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(CatalogStreamFixture.progress(nextValue)),
+            catalog: catalog, request: request, previous: first)
+        precondition(next.summary.discoveryMore && next.summary.pendingCataloguedFiles == 1)
+        try next.validateTerminal(decode(CatalogStreamFixture.report(owner, 8, request)))
+        rejects("discovery count regressed") {
+            var regressed = firstValue; regressed["revision"] = "3"; regressed["progress_sequence"] = "3"
+            _ = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(CatalogStreamFixture.progress(regressed)),
+                catalog: catalog, request: request, previous: next)
+        }
+        let frozen = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(StreamFixture.catalog(owner)), owner: owner)
+        rejects("progressive receipt admitted as a frozen manifest") {
+            _ = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(CatalogStreamFixture.page(value)),
+                catalog: frozen, root: frozen.root, request: request)
+        }
+        let expression = try AtlasWorkspaceStreamRequest(needle: "old path:src", mode: .expression)
+        let expressionFirst = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(CatalogStreamFixture.progress(
+            CatalogStreamFixture.report(owner, 9, expression, revision: 1, discovered: 20_001, pending: 1, terminal: false))),
+            catalog: catalog, request: expression)
+        let expressionNext = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(CatalogStreamFixture.progress(
+            CatalogStreamFixture.report(owner, 9, expression, revision: 2, pending: 1, terminal: false))),
+            catalog: catalog, request: expression, previous: expressionFirst)
+        precondition(expressionNext.summary.expression?.scopeFiles == 25_000)
+
+        // Empty discovery batches do not imply EOF or a complete zero-hit
+        // result. Explicit empty type predicates still finish traversal.
+        func withoutReads(_ value: [String: Any]) -> [String: Any] {
+            var result = value
+            for key in ["payload_bytes_read", "scanned_input_bytes", "read_calls", "peak_input_buffer_bytes"] {
+                result[key] = "0"
+            }
+            return result
+        }
+        var emptyBatch = withoutReads(CatalogStreamFixture.progress(CatalogStreamFixture.report(owner, 10, request,
+            revision: 1, discovered: 0, terminal: false, count: 0)))
+        emptyBatch["command"] = "info"
+        let emptyProgress = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(emptyBatch), catalog: catalog, request: request)
+        precondition(emptyProgress.summary.discoveryMore && !emptyProgress.summary.complete && emptyProgress.page.hits.isEmpty)
+        let emptyTerminal = try decode(withoutReads(CatalogStreamFixture.report(owner, 10, request,
+            revision: 2, discovered: 0, count: 0)))
+        try emptyProgress.validateTerminal(emptyTerminal)
+        precondition(emptyTerminal.summary.complete && emptyTerminal.summary.cataloguedFiles == 0)
+        let noTypes = try AtlasWorkspaceStreamRequest(needle: "old", fileScope: .init(extensions: []))
+        var excluded = withoutReads(CatalogStreamFixture.report(owner, 11, noTypes, count: 0))
+        excluded["eligible_files"] = "0"; excluded["excluded_files"] = "25001"; excluded["files_examined"] = "0"
+        let noFiles = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(CatalogStreamFixture.page(excluded)),
+            catalog: catalog, root: catalog.root, request: noTypes, requireTerminal: true)
+        precondition(noFiles.summary.complete && noFiles.summary.searchedFiles == 0 && noFiles.summary.excludedFiles == 25_001)
+        var switchedRoot = nextValue; switchedRoot["root_path"] = StreamFixture.path(Array("/different-project".utf8))
+        switchedRoot["revision"] = "3"; switchedRoot["progress_sequence"] = "3"
+        rejects("canonical root changed during discovery") {
+            _ = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(CatalogStreamFixture.progress(switchedRoot)),
+                catalog: catalog, request: request, previous: next)
+        }
+    }
+    @MainActor private static func catalogModelTests() async throws {
+        let probe = StreamProbe(), model = AtlasWorkspaceStreamModel(transport: probe.catalogTransport, query: "old")
+        model.open(.init(root: "/selected-alias/", project: UUID(), browserOwner: 1, access: nil))
+        precondition(model.canSearch && !model.busy && model.catalog?.progressive == true && probe.searchCount == 0)
+        let gate = ObservedReaderGate(); probe.blockProgress(gate); model.search()
+        try await wait("discovery beyond atlas prefix") { gate.entered && model.progress?.summary.cataloguedFiles == 25_001 }
+        precondition(model.canStopAndKeep && !model.canSelect && model.progress?.page.hits.first?.node == nil)
+        model.stopAndKeep(); gate.release()
+        try await wait("progressive stop retains pages") { !model.busy && model.reportAuthorized }
+        let stopped = model.report!, target = stopped.target(for: stopped.hits[0])
+        precondition(stopped.hits.count == 40 && stopped.summary.stop == "user-stopped"
+            && stopped.summary.pendingCataloguedFiles == 1 && !stopped.summary.complete
+            && model.catalog?.root == StreamFixture.root)
+        let cancellations = probe.cancelCount
+        model.select(target); try await wait("progressive retained witness") { !model.busy && model.witness != nil }
+        precondition(probe.cancelCount == cancellations, "Selecting accepted catalog evidence must not cancel its immutable handle")
+        let contextProbe = StreamContextProbe()
+        model.readCurrentContext(transport: contextProbe.transport)
+        let context = model.currentContext!; context.start()
+        try await wait("read a path outside the atlas prefix") { context.model.page != nil && !context.model.busy }
+        precondition(context.source.input.relativePath == target.hit.path
+            && context.model.searchSelection == NSRange(location: 1024, length: 3))
+        contextProbe.change(); context.model.reopenCurrentFile()
+        try await wait("changed progressive hit context") { !context.model.busy }
+        precondition(context.model.externalContext == .changed && context.model.searchSelection == nil)
+
+        model.search(); try await wait("fresh progressive query owner") { !model.busy && model.reportAuthorized }
+        let replacement = model.report!
+        precondition(replacement.summary.identity.owner != stopped.summary.identity.owner
+            && replacement.summary.identity.generation > stopped.summary.identity.generation
+            && replacement.summary.complete && !replacement.admits(target))
+        let hits = probe.hitCount; model.select(target); precondition(probe.hitCount == hits)
+        let obsolete = ObservedReaderGate(); probe.blockProgress(obsolete); model.search()
+        try await wait("cancel progressive search") { obsolete.entered && model.progress != nil }
+        model.cancel(); obsolete.release()
+        try await wait("canceled progressive worker drains") { probe.activeCount == 0 }
+        precondition(!model.canSelect && !model.reportAuthorized && model.progress == nil)
+        probe.poisonProgress(); model.search()
+        try await wait("invalid progressive scope refused") { !model.busy }
+        precondition(!model.reportAuthorized && model.notice.contains("could not be verified"))
+        model.clear(); precondition(model.report == nil && model.witness == nil && model.canSearch)
+        model.close(); try await wait("progressive query owners retired") { probe.closedCount == probe.createCount }
     }
     private static func matchWindowWireTests() throws {
         let owner: UInt64 = 0xfedcba9876543210
