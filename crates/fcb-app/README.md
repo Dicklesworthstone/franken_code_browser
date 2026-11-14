@@ -48,6 +48,9 @@ fcb search /path/to/repository --workspace --whole-file --text 'pub fn' --count-
 fcb search /path/to/repository --workspace --whole-file --text 'pub fn' --ignore-case --count-all --limit 0 --json
 fcb search huge.rs --whole-file --identifier cancel --json
 fcb search /path/to/repository --workspace --whole-file --identifier cancel --count-all --limit 50 --json
+fcb search huge.rs --whole-file --query '"pub fn" Result -unsafe' --json
+fcb search /path/to/repository --workspace --whole-file --query 'ana required -forbidden path:src/ lang:rust' --json
+fcb search /path/to/repository --workspace --whole-file --query 'ana required -forbidden lang:rust' --ignore-case --count-all --limit 0 --json
 ```
 
 By default, the scope is **one explicitly selected file**, not its siblings or
@@ -108,12 +111,39 @@ token. `--identifier` requires `--whole-file`; source windows and stdin do not
 silently acquire different boundary semantics. `--count-all`, including
 `--limit 0`, and the existing global byte/read-call limits also apply.
 
-The operation's allocations depend on fixed input/decoder scratch, literal
-length and result capacity, not the source file's length. The input buffer is
-16 KiB; decoder scratch and KMP state are separately admitted, so **16 KiB is not
+Use **`--query EXPRESSION`** for the existing phrase, required-term, exclusion,
+path and language syntax over a named file or workspace. For example,
+`--query '"pub fn" Result -unsafe path:src/ lang:rust'` returns `pub fn`
+occurrences only in Rust files whose same continuous observation contains
+`Result` and contains no `unsafe`. All text terms share one continuous source
+observation and one decoding pass; `--ignore-case` applies to all of them together. Path/language
+filters run before source opening. `--text` remains a literal and is never
+silently reinterpreted as an expression.
+
+Streaming expressions qualify only after supported decoding reaches the end of
+the admitted observation. Primary candidates from an invalid or incomplete file
+are withheld, even when all positive terms were seen before the I/O limit.
+Previously completed files remain useful in a partial workspace result. Terms
+may cross input boundaries or occur far apart without requiring full captures.
+A changed source is still an observation, not an atomic snapshot.
+
+Expressions continue scanning and count every qualified primary occurrence
+regardless of `--count-all`, because final predicates require the full stream.
+`--limit` bounds only retained rows; a completed expression can therefore report
+an exhaustive count and omitted rows together. `--limit 0` retains no witnesses
+while distinguishing complete absence from qualified occurrences. Rejected
+files contribute no count, rows or truncation. See
+[search expression semantics](SEARCH_EXPRESSIONS.md) for the grammar, metadata
+domains and saved-source route.
+
+The operation's allocations depend on fixed input/decoder scratch, prepared
+pattern lengths, term count and result capacity, not the source file's length.
+The input buffer is 16 KiB; decoder scratch and KMP state are separately admitted, so **16 KiB is not
 a claim about total process memory**. Each step performs at most one successful
-read, 32 read attempts including interruptions, and one batch of at most 64
-candidate matches. Both source processing and retained output are bounded.
+read, 32 read attempts including interruptions, and one primary-matcher batch
+of at most 64 candidate matches. Expressions also advance their bounded predicate
+state over that same consumed input. Both source processing and retained output
+are bounded.
 Blocking OS calls do not acquire a fabricated wall-clock deadline.
 
 `--max-scan-bytes` controls original-source I/O independently from capture
@@ -131,10 +161,12 @@ while counting later matches in the same file and subsequent workspace files.
 The same overlapping literal semantics apply, including UTF-16 and cross-buffer
 matches. The source buffer, retained-hit bound and global byte/read-call limits
 are unchanged; counting never grants unlimited I/O or suppresses cancellation.
-Without this opt-in, the existing first-extra-match stop remains the default.
+Without this opt-in, literal, raw-byte and identifier searches stop at the first
+extra match. Expressions always finish predicate evaluation and count their
+qualified primary occurrences as described above.
 
 `--whole-file` requires named files and `search`; it does not accept stdin,
-window offsets/byte counts, path queries, `--max-file-bytes` or
+window offsets/byte counts, `--path` queries, `--max-file-bytes` or
 `--max-total-bytes`. The latter are full-capture reservations for the default
 indexed route. Workspace discovery limits and static exclusions still apply.
 Use `--max-files` and `--include-excluded` with an explicit workspace as before.
@@ -142,7 +174,8 @@ Use `--max-files` and `--include-excluded` with an explicit workspace as before.
 ### Retention and consistency
 
 Streaming results retain **literal witnesses only**, not arbitrary discarded
-source ranges. Exact text and raw-byte matches share one immutable encoded
+source ranges. For expressions, these are primary-occurrence witnesses;
+predicate evaluation does not retain all required/excluded-term source spans. Exact text and raw-byte matches share one immutable encoded
 literal. Unicode lowercase matches retain each occurrence's original spelling
 and encoded bytes, because the source may differ from the query in both
 spelling and byte length. The public `FileSearchReport::retain_hit` can
@@ -170,7 +203,8 @@ explicit alternative. Other completed files' results remain useful.
 
 Whole-file JSON uses `strategy: "streaming-whole-file"`. Matching metadata is
 present on each file and at workspace level: `mode` is
-`exact-decoded-text`, `unicode-lowercase-text`, `whole-token-occurrences`, or `original-bytes`;
+`exact-decoded-text`, `unicode-lowercase-text`, `decoded-text-expression`,
+`whole-token-occurrences`, or `original-bytes`;
 `case_sensitive` records the text choice and `normalization` is `exact`.
 The latter two fields are null for raw-byte search. Each file record carries
 exact original-byte hit ranges, counters, consistency and terminal state.
@@ -180,6 +214,16 @@ search sets that field to null and adds `matched_text` and `original_hex`
 to each retained hit. `retained_witness_bytes` reports retained original-byte
 payload, including zero for count-only scans. `decoded_range` is null: the
 scanner does not invent global decoded coordinates.
+Expression results also declare the original `expression`,
+`predicate_scope: "same-observed-stream"`, and `path_filter_domain`. Each observed
+file reports nullable `expression_qualified`: true or false after a supported
+complete stream, null if unfinished or invalid. This reports predicates over
+the observed sequence; changed file metadata can still make
+`whole_file_complete` and `query_complete` false. Workspace `scope_files` and
+`metadata_excluded_files` count known selected and filtered entries separately.
+An excluded named file reports `state: "metadata-excluded"`, complete query/count,
+zero source I/O and null source identities/lengths; `input_complete` and
+`whole_file_complete` remain false because the source was never observed.
 Identifier results additionally record `evidence_level: "whole-token-text-candidate"`,
 `includes_comments_and_literals: true`, `compiler_resolved: false`, and
 `semantic_complete: false`. Match-count completeness still describes the

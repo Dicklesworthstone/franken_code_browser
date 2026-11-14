@@ -44,12 +44,22 @@ quotas stay unavailable, not false no-match results. No atomic-repository claim.
 Continuous whole-file search, without retaining full source:\n\
   fcb search FILE --whole-file --text TEXT [--ignore-case] [--json]\n\
   fcb search ROOT --workspace --whole-file --text TEXT [--ignore-case] [--json]\n\
+  fcb search FILE --whole-file --query EXPRESSION [--ignore-case] [--json]\n\
+  fcb search ROOT --workspace --whole-file --query EXPRESSION [--ignore-case] [--json]\n\
   fcb search FILE --whole-file --identifier NAME [--json]\n\
   fcb search ROOT --workspace --whole-file --identifier NAME [--json]\n\
   --count-all continues counting after --limit retained rows, within I/O limits.\n\
   Use --count-all --limit 0 for counts without retaining occurrence rows.\n\
   --raw-hex HEX also works; --max-scan-bytes N admits source I/O separately.\n\
 Default scan allowance: 256 MiB GLOBAL, maximum 1 TiB; input buffer: 16 KiB.\n\
+--query reuses phrases, required terms, exclusions, path: and lang: filters.\n\
+Example: --query 'anchor required -forbidden path:src lang:rust'. Whitespace\n\
+means conjunction; AND remains literal text. Metadata filters run before reads.\n\
+All content terms inspect the same continuous observation. Candidates are held\n\
+until the complete input qualifies; partial files publish no expression hits.\n\
+Expressions must scan/count the admitted file even without --count-all; --limit\n\
+bounds retained rows, including zero. Inspect expression_qualified, coverage\n\
+and truncation separately. This does not create an atomic filesystem snapshot.\n\
 --ignore-case uses Unicode lowercase comparison and retains each occurrence's\n\
 original spelling and bytes; it does not add full case folding or normalization.\n\
 --identifier uses exact case-sensitive whole-token text, including comments and\n\
@@ -128,14 +138,14 @@ pub(crate) fn capabilities(args: &Arguments, out: &mut Output) -> Result<u8, App
             out.literal(",\"reason\":")?; out.quoted(reason)?; out.literal("}")?;
         }
         out.literal("],\"whole_file_search\":{\"state\":")?; out.quoted(file_state)?;
-        out.literal(",\"flag\":\"--whole-file\",\"count_all_flag\":\"--count-all\",\"ignore_case_flag\":\"--ignore-case\",\"identifier_flag\":\"--identifier\",\"identifier_semantics\":\"whole-token-text-candidate\",\"identifier_case_sensitive\":true,\"case_insensitive_semantics\":\"unicode-lowercase\",\"normalization\":\"exact\",\"input_buffer_bytes\":\"16384\",\"default_max_scan_bytes\":\"268435456\",\"maximum_max_scan_bytes\":\"1099511627776\",\"retention\":\"literal-witnesses-only\"}}\n")?;
+        out.literal(",\"flag\":\"--whole-file\",\"count_all_flag\":\"--count-all\",\"ignore_case_flag\":\"--ignore-case\",\"identifier_flag\":\"--identifier\",\"expression_flag\":\"--query\",\"expression_predicate_scope\":\"same-observed-stream\",\"expression_requires_complete_input\":true,\"expression_counts_full_observation\":true,\"identifier_semantics\":\"whole-token-text-candidate\",\"identifier_case_sensitive\":true,\"case_insensitive_semantics\":\"unicode-lowercase\",\"normalization\":\"exact\",\"input_buffer_bytes\":\"16384\",\"default_max_scan_bytes\":\"268435456\",\"maximum_max_scan_bytes\":\"1099511627776\",\"retention\":\"literal-witnesses-only\"}}\n")?;
     } else {
         out.literal("FrankenCodeBrowser: headless source tools; independent verification pending.\n")?;
         if diagnostic { out.literal("Static diagnostic only: no source scans, benchmarks, database opens, or repairs.\n")?; }
         for (name, state, reason) in rows { out.literal(name)?; out.literal(": ")?;
             out.literal(state)?; out.literal(" — ")?; out.literal(reason)?; out.literal("\n")?; }
         out.literal("whole-file-streaming: ")?; out.literal(file_state)?;
-        out.literal(" — explicit --whole-file; text or whole-token --identifier, optional text --ignore-case and --count-all, global I/O budget, 16 KiB input buffer, literal witnesses only.\n")?;
+        out.literal(" — explicit --whole-file; text, --query expressions or whole-token --identifier; optional text/expression --ignore-case and --count-all, global I/O budget, 16 KiB input buffer, literal witnesses only.\n")?;
     }
     Ok(EXIT_OK)
 }

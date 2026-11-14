@@ -5,9 +5,11 @@
 //! GLOBAL for a workspace, including work spent before a source failure.
 
 use std::{fs::File, path::Path};
-use fcb::source::path::NormalizedPath;
+use fcb::source::path::{NormalizedPath, RawPath};
+use fcb::ByteLength;
 use fcb::search::{CaptureRequest, DetectedEncoding, ExtentConsistency, FileSearch, FileSearchReport,
-    ResourceBudget, StreamReadOptions, StreamReadState, StreamReadStep, StreamingMode, StreamingNeedle};
+    ParsedQuery, ReferenceScanOracle, ResourceBudget, StreamReadOptions, StreamReadState, StreamReadStep,
+    StreamingMode, StreamingNeedle};
 use fcb::search::workspace::WorkspaceCatalog;
 use crate::{AppError, SCHEMA, EXIT_OK, EXIT_NO_MATCH, EXIT_PARTIAL, allocation, owner, generation, revision, file_id};
 use crate::args::{Arguments, Encoding, Needle};
@@ -22,8 +24,36 @@ fn needle(args: &Arguments, budget: &ResourceBudget) -> Result<StreamingNeedle, 
         Some(Needle::Text(text)) => Ok(StreamingNeedle::text_matching(owner(), text, !args.ignore_case, budget, allocation(40))?),
         Some(Needle::Raw(bytes)) => Ok(StreamingNeedle::raw(owner(), bytes, budget, allocation(40))?),
         Some(Needle::Identifier(name)) => Ok(StreamingNeedle::identifier(owner(), name, budget, allocation(40))?),
+        Some(Needle::Query(query)) => Ok(StreamingNeedle::expression(owner(), query, !args.ignore_case, budget, allocation(40))?),
         _ => Err(AppError::InvalidRange),
     }
+}
+fn expression(args: &Arguments) -> Option<&ParsedQuery> {
+    match args.needle.as_ref() { Some(Needle::Query(query)) => Some(query), _ => None }
+}
+fn matches_metadata(args: &Arguments, path: &RawPath) -> bool {
+    let Some(query) = expression(args) else { return true; };
+    let test = |key: &str| ReferenceScanOracle::matches_path_filters(key, &query.path_filters)
+        && ReferenceScanOracle::matches_lang_filters(key, &query.lang_filters);
+    match std::str::from_utf8(path.as_bytes()) {
+        Ok(key) => test(key),
+        Err(_) => test(&path.display_escaped().to_string()),
+    }
+}
+fn expression_fields(args: &Arguments, path_domain: &str, out: &mut Output) -> Result<(), AppError> {
+    if let Some(query) = expression(args) {
+        out.literal(",\"expression\":")?; out.quoted(&query.raw_query)?;
+        out.literal(",\"predicate_scope\":\"same-observed-stream\",\"path_filter_domain\":")?;
+        out.quoted(path_domain)?;
+    }
+    Ok(())
+}
+fn expression_human(args: &Arguments, out: &mut Output) -> Result<(), AppError> {
+    if let Some(query) = expression(args) {
+        out.literal("Expression: ")?; out.human_text(&query.raw_query)?; out.literal("\n")?;
+        out.literal("Content predicates are qualified together at the end of each observed file.\n")?;
+    }
+    Ok(())
 }
 fn options(args: &Arguments, bytes: u64, calls: u64, matches: usize) -> StreamReadOptions {
     StreamReadOptions { generation: generation(), max_matches: matches, max_bytes: bytes, max_read_calls: calls,
@@ -54,8 +84,15 @@ fn scan<'needle>(file: File, request: CaptureRequest, needle: &'needle Streaming
 pub(crate) fn single(args: &Arguments, out: &mut Output, budget: &ResourceBudget,
     canceled: &mut impl FnMut() -> bool) -> Result<u8, AppError> {
     let pattern = needle(args, budget)?;
+    // Admit the absolute native path plus its bounded escaped metadata key.
+    let _paths = budget.try_reserve_managed(owner(), allocation(42), ByteLength::new(128 * 1024))
+        .map_err(|_| AppError::Admission)?;
     if canceled() { return Err(AppError::Canceled); }
     let path = input::absolute(args.file.as_deref().ok_or(AppError::InvalidRange)?)?;
+    if !matches_metadata(args, &RawPath::from_path(&path)) {
+        return excluded_single(args, &path, out);
+    }
+    if canceled() { return Err(AppError::Canceled); }
     let (file, _) = input::open_regular(&path)?;
     let request = CaptureRequest::new(file_id(), revision()).map_err(|_| AppError::InvalidRange)?;
     let report = scan(file, request, &pattern, options(args, args.max_scan_bytes, MAX_READ_CALLS, args.limit),
@@ -66,18 +103,58 @@ pub(crate) fn single(args: &Arguments, out: &mut Output, budget: &ResourceBudget
         out.path(&path)?;
         out.literal(",\"strategy\":\"streaming-whole-file\",\"max_scan_bytes\":")?; out.integer(args.max_scan_bytes)?;
         out.literal(",\"max_read_calls\":")?; out.integer(MAX_READ_CALLS)?;
+        expression_fields(args, "absolute-named-path-utf8-or-escaped-search-key", out)?;
+        if expression(args).is_some() {
+            out.literal(",\"scope_files\":\"1\",\"metadata_excluded_files\":\"0\"")?;
+        }
         fields(&report, out, canceled)?;
         out.literal("}\n")?;
     } else {
         out.literal("Continuous observed-file search: ")?; out.path(&path)?; out.literal("\n")?;
+        expression_human(args, out)?;
         human(&report, out)?;
     }
     Ok(exit(&report))
 }
 
+/// A metadata predicate can exclude an explicitly named path without opening
+/// it. Query absence is established, but there is no invented source observation.
+fn excluded_single(args: &Arguments, path: &Path, out: &mut Output) -> Result<u8, AppError> {
+    if args.json {
+        out.literal("{\"schema\":")?; out.quoted(SCHEMA)?;
+        out.literal(",\"status\":\"ok\",\"command\":\"search\",\"scope\":\"named-file\",\"identity_scope\":\"response-local\",\"path\":")?;
+        out.path(path)?;
+        out.literal(",\"strategy\":\"streaming-whole-file\",\"max_scan_bytes\":")?;
+        out.integer(args.max_scan_bytes)?;
+        out.literal(",\"max_read_calls\":")?; out.integer(MAX_READ_CALLS)?;
+        matching_fields(if args.ignore_case { StreamingMode::LowercaseText } else { StreamingMode::ExactText }, true, out)?;
+        expression_fields(args, "absolute-named-path-utf8-or-escaped-search-key", out)?;
+        out.literal(",\"scope_files\":\"0\",\"metadata_excluded_files\":\"1\",\"state\":\"metadata-excluded\",\"query_complete\":true,\"expression_qualified\":null,\"input_complete\":false,\"whole_file_complete\":false")?;
+        out.literal(",\"count_all_matches\":")?; out.boolean(args.count_all)?;
+        out.literal(",\"match_count_complete\":true,\"truncated\":false,\"file_id\":null,\"revision\":null,\"query_generation\":")?;
+        out.integer(generation().get())?;
+        out.literal(",\"encoding\":null,\"observed_length\":null,\"final_length\":null,\"payload_bytes_read\":\"0\",\"scanned_input_bytes\":\"0\",\"read_calls\":\"0\",\"peak_input_buffer_bytes\":\"0\",\"matches_seen\":\"0\",\"stored_hits\":\"0\",\"retained_witness_bytes\":\"0\",\"unsupported_at\":null,\"error_code\":null,\"consistency\":null,\"retention\":\"literal-witnesses-only\",\"literal_text\":null,\"literal_original_hex\":null,\"hits\":[]}\n")?;
+    } else {
+        out.literal("Excluded by expression path/language filters: ")?; out.path(path)?;
+        out.literal("\nSource payload bytes read: 0; matches: 0\n")?;
+    }
+    Ok(EXIT_NO_MATCH)
+}
+
 pub(crate) fn workspace(args: &Arguments, catalog: &WorkspaceCatalog, root: &Path,
     out: &mut Output, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<u8, AppError> {
     let pattern = needle(args, budget)?;
+    let _paths = budget.try_reserve_managed(owner(), allocation(42), ByteLength::new(128 * 1024))
+        .map_err(|_| AppError::Admission)?;
+    // Freeze selected metadata membership before source I/O. Unknown discovery
+    // still prevents a complete workspace claim, even if every known row filters out.
+    let mut scope_files = 0usize;
+    for entry in catalog.entries() {
+        if canceled() { return Err(AppError::Canceled); }
+        if matches_metadata(args, entry.path().raw()) { scope_files += 1; }
+    }
+    catalog.validate_active()?;
+    let metadata_excluded = catalog.entries().len() - scope_files;
     let (mut bytes, mut calls, mut stored, mut seen, mut examined, mut failed) = (0u64, 0u64, 0usize, 0u64, 0usize, 0usize);
     let mut matching_files = 0usize;
     let mut complete = catalog.discovery_complete();
@@ -89,12 +166,19 @@ pub(crate) fn workspace(args: &Arguments, catalog: &WorkspaceCatalog, root: &Pat
         out.integer(args.max_scan_bytes)?;
         out.literal(",\"max_read_calls\":")?; out.integer(MAX_READ_CALLS)?;
         out.literal(",\"count_all_matches\":")?; out.boolean(args.count_all)?;
-        matching_fields(pattern.mode(), out)?;
+        matching_fields(pattern.mode(), expression(args).is_some(), out)?;
+        expression_fields(args, "root-relative-utf8-or-escaped-search-key", out)?;
+        out.literal(",\"scope_files\":")?; out.integer(scope_files as u64)?;
+        out.literal(",\"metadata_excluded_files\":")?; out.integer(metadata_excluded as u64)?;
         out.literal(",\"files\":[")?;
-    } else { out.literal("Streaming workspace search; only literal witnesses are retained\n")?; }
+    } else {
+        out.literal("Streaming workspace search; only literal witnesses are retained\n")?;
+        expression_human(args, out)?;
+    }
     for (ordinal, entry) in catalog.entries().iter().enumerate() {
         if canceled() { return Err(AppError::Canceled); }
         catalog.validate_active()?;
+        if !matches_metadata(args, entry.path().raw()) { continue; }
         let file_id = catalog.file_id(ordinal).ok_or(AppError::InvalidRange)?;
         let request = CaptureRequest::new(file_id,
             fcb::SourceRevision::new(owner(), ordinal as u64 + 1).map_err(|_| AppError::InvalidRange)?)
@@ -145,14 +229,14 @@ pub(crate) fn workspace(args: &Arguments, catalog: &WorkspaceCatalog, root: &Pat
         if args.json { out.literal("}")?; }
         if stopped.is_some() { break; }
     }
-    complete &= examined == catalog.entries().len();
+    complete &= examined == scope_files;
     catalog.validate_active()?;
     if args.json {
         out.literal("],\"workspace_complete\":")?; out.boolean(complete)?;
         out.literal(",\"match_count_complete\":")?; out.boolean(complete)?;
         out.literal(",\"truncated\":")?; out.boolean(truncated)?;
         out.literal(",\"files_examined\":")?; out.integer(examined as u64)?;
-        out.literal(",\"unexamined_files\":")?; out.integer((catalog.entries().len() - examined) as u64)?;
+        out.literal(",\"unexamined_files\":")?; out.integer((scope_files - examined) as u64)?;
         out.literal(",\"incomplete_files\":")?; out.integer(failed as u64)?;
         out.literal(",\"payload_bytes_read\":")?; out.integer(bytes)?;
         out.literal(",\"read_calls\":")?; out.integer(calls)?;
@@ -183,14 +267,14 @@ fn exit(report: &FileSearchReport<'_>) -> u8 {
     if !report.is_complete() || report.search().hits_truncated() { EXIT_PARTIAL }
     else if report.search().matches_seen() == 0 { EXIT_NO_MATCH } else { EXIT_OK }
 }
-fn matching_fields(mode: StreamingMode, out: &mut Output) -> Result<(), AppError> {
+fn matching_fields(mode: StreamingMode, is_expression: bool, out: &mut Output) -> Result<(), AppError> {
     out.literal(",\"mode\":")?;
-    out.quoted(match mode {
+    out.quoted(if is_expression { "decoded-text-expression" } else { match mode {
         StreamingMode::OriginalBytes => "original-bytes",
         StreamingMode::ExactText => "exact-decoded-text",
         StreamingMode::LowercaseText => "unicode-lowercase-text",
         StreamingMode::Identifier => "whole-token-occurrences",
-    })?;
+    } })?;
     out.literal(",\"case_sensitive\":")?;
     if mode == StreamingMode::OriginalBytes { out.literal("null")?; }
     else { out.boolean(mode != StreamingMode::LowercaseText)?; }
@@ -207,7 +291,13 @@ fn fields(report: &FileSearchReport<'_>, out: &mut Output, canceled: &mut impl F
     out.literal(",\"file_id\":")?; out.integer(search.request().file().get())?;
     out.literal(",\"revision\":")?; out.integer(search.request().revision().get())?;
     out.literal(",\"query_generation\":")?; out.integer(search.generation().get())?;
-    matching_fields(search.mode(), out)?;
+    matching_fields(search.mode(), search.is_expression(), out)?;
+    if search.is_expression() {
+        out.literal(",\"expression_qualified\":")?;
+        if let Some(qualified) = search.expression_qualified() { out.boolean(qualified)?; }
+        else { out.literal("null")?; }
+        out.literal(",\"query_complete\":")?; out.boolean(report.is_complete())?;
+    }
     out.literal(",\"encoding\":")?;
     out.quoted(match search.encoding() { Some(DetectedEncoding::Utf16Le) => "utf16le",
         Some(DetectedEncoding::Utf16Be) => "utf16be", Some(DetectedEncoding::Utf8 { .. }) => "utf8", _ => "not-selected" })?;
@@ -267,6 +357,14 @@ fn human(report: &FileSearchReport<'_>, out: &mut Output) -> Result<(), AppError
         StreamingMode::Identifier => "exact whole-token occurrences, including comments and strings; not compiler references",
     })?;
     out.literal("\n")?;
+    if search.is_expression() {
+        out.literal("  Expression: ")?;
+        out.literal(match search.expression_qualified() {
+            Some(true) => "content predicates satisfied\n",
+            Some(false) => "file excluded by content predicates\n",
+            None => "qualification incomplete; candidate matches withheld\n",
+        })?;
+    }
     for hit in search.hits() {
         out.literal("  bytes ")?; out.literal(&hit.original_range().start().get().to_string())?;
         out.literal("..")?; out.literal(&hit.original_range().end().get().to_string())?; out.literal("\n")?;

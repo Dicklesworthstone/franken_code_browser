@@ -16,6 +16,16 @@ fcb search ROOT --workspace \
 fcb search ROOT --workspace --respect-ignores \
   --query 'needle required -forbidden' --max-scan-bytes 16777216 --json
 
+# Search a file beyond the capture limit using one continuous observation.
+fcb search huge.rs --whole-file \
+  --query '"pub fn" Result -unsafe' --json
+
+# Filter workspace metadata before opening source files, then count qualified
+# occurrences while retaining no result rows.
+fcb search ROOT --workspace --whole-file \
+  --query 'ana required -forbidden path:src/ lang:rust' \
+  --ignore-case --count-all --limit 0 --json
+
 # Evaluate the same syntax over saved source without accessing the original root.
 fcb snapshot search saved.fcbs \
   --query 'ana required -forbidden lang:rs' --json
@@ -35,11 +45,13 @@ fcb snapshot search saved.fcbs --query '"pub fn" Result lang:rust' \
 such as `needle -forbidden` or `path:src/`. It is not silently reparsed. Expressions,
 raw-byte queries, and literal queries are mutually exclusive within one command.
 
-The live command requires `--workspace` and uses bounded complete captures. It
-does not accept `--stdin`, single-file windows, `--whole-file`, or encoding
-overrides: those routes have different source-retention/scope contracts and keep
-their existing literal APIs. An uncaptured suffix cannot prove a document-wide
-negative predicate. Snapshot expressions use the saved complete member captures.
+Live expressions have two explicit source routes. The default requires
+`--workspace` and uses bounded complete captures. Add `--whole-file` to scan a
+named file or workspace member continuously without retaining its complete
+source; this route also accepts encoding declarations. Neither expression route
+accepts stdin or single-file byte windows. An unobserved suffix cannot prove a
+document-wide negative predicate. Snapshot expressions use the saved complete
+member captures.
 
 ## Existing query language, not a second parser
 
@@ -47,9 +59,9 @@ The commands use `fcb-search::ParsedQuery` and its existing limits: 1,024 raw UT
 bytes and 64 tokens. The first positive term or quoted phrase supplies the
 returned occurrence ranges. Additional positive terms are document-wide AND
 predicates; `+term` is also accepted. `-term` and `-"quoted phrase"` exclude a file
-when that text occurs anywhere in that same capture. Quoted phrases support
-escaped quotes and backslashes. Text comparisons are case-sensitive decoded
-matching by default. Live captured-workspace and snapshot expressions accept `--ignore-case`,
+when that text occurs anywhere in that same source observation or capture.
+Quoted phrases support escaped quotes and backslashes. Text comparisons are case-sensitive decoded
+matching by default. All expression routes accept `--ignore-case`,
 which applies the existing Unicode lowercase comparison to primary, required and
 excluded text together. Metadata path/type filters keep their existing semantics.
 The result declares `case_sensitive`, and hits retain complete contributing source
@@ -57,7 +69,7 @@ byte ranges. Snapshot results also declare `mode` as `decoded-text-expression` o
 `unicode-lowercase-expression`, with `normalization: "exact"`. Unicode scalar
 lowercase comparison can expand a character, so a query `i` can select the complete
 original `İ` scalar, and `k` can select `K`. It does not fold `ß` to `ss` or equate
-composed and decomposed accents. Neither route implies compiler symbols or
+composed and decomposed accents. These routes do not imply compiler symbols or
 whole-word matching.
 
 Snapshot expression rows retain metadata without source payloads. Their
@@ -85,20 +97,81 @@ unchanged; non-UTF-8 paths use the established reversible escaped search label.
 Native path bytes are separately preserved for output and source identity.
 
 There is no new regex, OR, nesting, case-folding, or Unicode-normalization mode.
-Words such as `OR` are ordinary literal tokens, not boolean operators. Explicit
-regex prefixes are rejected with the existing query error. Filenames and option
+Words such as `AND` and `OR` are ordinary literal tokens, not boolean operators.
+Explicit regex prefixes are rejected with the existing query error. Filenames and option
 values that resemble flags remain data when passed as values or after `--`.
+
+## Whole-file expressions in one observation
+
+`--whole-file --query` uses the shared streaming expression matcher and source
+decoder. Every primary, required and excluded term observes the same decoded
+stream from one open file. The command does not reopen a changing live file for
+each term, buffer a full source copy, or add a second query parser. Terms can be
+far apart and can cross the 16 KiB input boundaries. UTF-8 and UTF-16 matches
+retain their complete original-byte ranges, including BOM and surrogate offsets.
+`--ignore-case` applies to every text term together and retains the primary
+occurrence's actual original spelling.
+
+A file qualifies only after the complete admitted observation has been decoded
+successfully, a primary occurrence and every required term were seen, and no
+excluded term was seen. Until then, primary occurrences are private candidates. A malformed suffix,
+source-read failure or exhausted byte/read-call allowance publishes no hits or
+match count from that unfinished file. An earlier completed file can still
+contribute useful results to a partial workspace response. This rule also
+applies to expressions without negative terms: an early positive match is not a
+complete-file expression result.
+
+Unlike literal whole-file search, an expression must continue to the end to
+decide its predicates. It therefore counts every primary occurrence in each
+qualified file even without `--count-all`. `--limit` only bounds retained rows,
+and a rejected file never consumes that allowance or manufactures truncation.
+With `--limit 0`, a complete negative exits 1; qualified occurrences produce
+an exact count with no rows and exit 3 for omitted results. `--count-all` remains
+accepted and is recorded in `count_all_matches`, but does not change expression
+qualification. Ordinary `--text`, `--raw-hex` and `--identifier` retain their
+existing first-extra-match stop unless counting is requested.
+
+For this route, `--max-scan-bytes` counts original-source I/O once, independent
+of the number of predicates. The existing byte and read-call limits are global
+across a workspace. Source capture limits do not apply, and expression scope
+does not allow combining `--whole-file` with `--max-file-bytes` or
+`--max-total-bytes`. Matcher state and retained witnesses remain bounded by
+query and result admission; the input-buffer size is not a total-memory claim.
+
+Path and language filters run before source opening. Workspace path filters use
+root-relative UTF-8 or reversible escaped search keys. A named-file filter uses
+the absolute supplied native path's UTF-8 or escaped key, without canonicalizing
+its components; `path_filter_domain` identifies the chosen domain. Workspace
+`scope_files` and `metadata_excluded_files` separate selected known entries
+from metadata exclusions. An excluded named file reports
+`state: "metadata-excluded"`, zero source I/O, and null source identities and
+lengths. Its query and count are complete, but `input_complete` and
+`whole_file_complete` remain false because no source observation occurred.
+Unfinished discovery still prevents complete workspace coverage.
+
+Whole-file expression JSON declares `strategy: "streaming-whole-file"`,
+`mode: "decoded-text-expression"`, the original `expression`, and
+`predicate_scope: "same-observed-stream"`. `case_sensitive` records the
+selected text comparison. On an observed file, `expression_qualified` is true
+or false after supported completion and null while qualification remains
+unproven. This concerns predicates within the observed sequence; changed
+before/after metadata can still leave `whole_file_complete` and `query_complete`
+false. `truncated` describes omitted rows independently of
+`match_count_complete`; a completed expression can have both fields true.
+Only primary witnesses are retained. Predicate qualification does not retain
+every contributing source span, neighboring lines, or a full snapshot.
+Unchanged before/after file metadata is still not an atomic snapshot.
 
 ## Live capture and saved-source execution
 
-Live expressions reuse the current workspace discovery, optional repository-rule
-policy, host file reader, capture admission, `EphemeralIndex`, and exact query
+Captured-workspace expressions reuse the current discovery, optional repository
+rules, host file reader, capture admission, `EphemeralIndex`, and exact query
 verifier. Path/type exclusions are decided before a source read, so excluded files
 do not consume retained-source bytes or the filesystem payload-read allowance.
 The selected manifest removes those entries instead of describing them as missing
 selected captures. An oversized or unreadable selected file remains unavailable.
 
-The live route retains its admitted source collection; it is not a one-member
+The captured route retains its admitted source collection; it is not a one-member
 streaming implementation. Its existing defaults remain 4,096 files, 1 MiB per
 capture, and 32 MiB retained source. Discovery limits still apply to the original
 workspace traversal, so a later query filter cannot undo unfinished discovery.
@@ -128,20 +201,23 @@ its literal/raw query routes, including resident and demand-paged postings.
 
 ## Work, completeness, and identity
 
-`--max-scan-bytes` admits aggregate matching work across ALL predicate and primary
-scans: 256 MiB by default, with an explicit maximum of 1 TiB. Reading the same
-retained source for another term still spends matching work. This does not replace
+For captured-workspace and saved-source expressions, `--max-scan-bytes` admits
+aggregate matching work across ALL predicate and primary scans: 256 MiB by
+default, with an explicit maximum of 1 TiB. Reading the same retained source for
+another term still spends matching work. This does not replace
 source-capture, source-load, archive-validation, or configuration-I/O accounting.
 Live source admission and index construction may precede a matching-work stop.
 
 A partial predicate scan cannot establish that a required term is absent or an
 excluded term never occurs. Primary hits are withheld until their predicates
-qualify. A primary scan that later reaches its work cap can return useful exact
-hits with partial coverage. Unsupported text is counted separately, rather than
-silently searched through replacement characters as though it were exact text.
+qualify. On the captured and saved routes, a subsequent primary scan that reaches
+its work cap can return useful exact hits with partial coverage. The single-pass
+whole-file route instead withholds all candidates from an incomplete observation.
+Unsupported text is counted separately, rather than silently searched through
+replacement characters as though it were exact text.
 
 `workspace_complete` requires completed selected-source search, closed discovery,
-no unavailable selected captures, and no unsupported selected text. Missing files
+no unavailable selected sources, and no unsupported selected text. Missing files
 outside the explicit metadata scope do not poison that scope's answer. Incomplete
 discovery remains incomplete, including unknown repository-policy subtrees.
 
@@ -150,7 +226,9 @@ truncation. An exactly full buffer is not proof of another hit; cross-file
 lookahead continues. Limit zero performs lookahead too: an exhaustive negative
 can succeed with no hits, while an actual occurrence returns a truncated response.
 `matches_seen` is observed qualified matches, not an invented exhaustive total
-when work or result limits stop the query.
+when work or result limits stop the captured or saved query. Whole-file
+expressions count all qualified occurrences when their observation completes,
+independently of retained-row limits.
 
 Snapshot `--count-all` continues past the retained-row cap, including a zero cap,
 while keeping the same source and matching-work allowances. A completed count
@@ -188,7 +266,11 @@ They exercise retained-buffer mutation between terms, changed-source rejection,
 filtered unavailable members, cancellation, stale identities, and reader reopening.
 `expression_cli` covers live and saved commands, repository rules, catalog opening,
 raw names, read-only effects, and the actual executable after a source-root move.
-These tests are committed, not claimed executed in this implementation session.
+`whole_file_expression_cli` covers large-file streaming, metadata filtering
+before source access, UTF-16 offsets, cross-buffer predicates, lowercase
+witnesses, invalid suffixes, global I/O limits, zero-row counting and executable
+dispatch. These tests are committed, not claimed executed in this implementation
+session.
 
 This adds usable expression search, not a native search panel, general boolean or
 regex engine, complete glob matching, or new index format. Existing snapshot size

@@ -193,7 +193,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
     }
     if parsed.respect_ignores && (!parsed.workspace || parsed.include_excluded) { return Err(ArgumentError::IncompatibleOptions); }
     let allows_ignore_case = if parsed.whole_file {
-        matches!(parsed.needle.as_ref(), Some(Needle::Text(_)))
+        matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Query(_)))
     } else {
         matches!(parsed.needle.as_ref(), Some(Needle::Text(_)))
             || (parsed.workspace && matches!(parsed.needle.as_ref(), Some(Needle::Query(_))))
@@ -206,7 +206,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
             return Err(ArgumentError::IncompatibleOptions);
         }
         if parsed.file.is_none() { return Err(ArgumentError::MissingSource); }
-        if !matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Raw(_) | Needle::Identifier(_))) { return Err(ArgumentError::InvalidNeedle); }
+        if !matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Raw(_) | Needle::Identifier(_) | Needle::Query(_))) { return Err(ArgumentError::InvalidNeedle); }
         if matches!(parsed.needle.as_ref(), Some(Needle::Raw(_))) && seen & 32 != 0 { return Err(ArgumentError::IncompatibleOptions); }
         if !parsed.workspace && seen & (512 | 1024) != 0 { return Err(ArgumentError::IncompatibleOptions); }
         return Ok(parsed);
@@ -432,10 +432,34 @@ mod tests {
         for input in [vec!["search", "root", "--workspace", "--query", "x", "--text", "y"],
             vec!["search", "root", "--workspace", "--text", "x", "--query", "y"],
             vec!["search", "file", "--query", "x"], vec!["search", "--stdin", "--query", "x"],
-            vec!["search", "root", "--workspace", "--whole-file", "--query", "x"],
             vec!["inspect", "root", "--workspace", "--query", "x"]] {
             assert!(parse(&args(&input)).is_err(), "{input:?}");
         }
+    }
+    #[test]
+    fn whole_file_expressions_keep_stream_budgets_and_literal_modes_distinct() {
+        for input in [
+            vec!["search", "file.rs", "--whole-file", "--query", "anchor required -forbidden"],
+            vec!["search", "root", "--workspace", "--whole-file", "--query", "anchor required path:src lang:rust",
+                "--ignore-case", "--count-all", "--limit", "0", "--max-scan-bytes", "4294967297"],
+            vec!["search", "file", "--whole-file", "--query", "anchor", "--encoding", "utf16le"],
+        ] {
+            let parsed = parse(&args(&input)).unwrap();
+            assert!(parsed.whole_file);
+            assert!(matches!(parsed.needle, Some(Needle::Query(_))));
+        }
+        for input in [
+            vec!["search", "--stdin", "--whole-file", "--query", "anchor"],
+            vec!["search", "file", "--whole-file", "--query", "anchor", "--offset", "0"],
+            vec!["search", "file", "--whole-file", "--query", "anchor", "--bytes", "16"],
+            vec!["search", "root", "--workspace", "--whole-file", "--query", "anchor", "--max-total-bytes", "10"],
+            vec!["search", "file", "--whole-file", "--query", "anchor", "--raw-hex", "61"],
+            vec!["search", "file", "--whole-file", "--query", "anchor", "--identifier", "name"],
+        ] {
+            assert!(parse(&args(&input)).is_err(), "{input:?}");
+        }
+        assert_eq!(parse(&args(&["search", "file", "--whole-file", "--query", "regex:.*"])),
+            Err(ArgumentError::Query(QueryError::RegexUnqualified)));
     }
     #[test]
     fn case_insensitive_search_is_explicit_for_text_in_each_admitted_scope() {
@@ -465,7 +489,6 @@ mod tests {
             vec!["search", "--stdin", "--raw-hex", "78", "--ignore-case"],
             vec!["search", "file", "--whole-file", "--raw-hex", "78", "--ignore-case"],
             vec!["search", "root", "--workspace", "--whole-file", "--raw-hex", "78", "--ignore-case"],
-            vec!["search", "root", "--workspace", "--whole-file", "--query", "x", "--ignore-case"],
             vec!["search", "root", "--workspace", "--path", "x", "--ignore-case"],
             vec!["inspect", "root", "--workspace", "--ignore-case"],
             vec!["search", "root", "--workspace", "--text", "x", "--ignore-case", "--ignore-case"],
