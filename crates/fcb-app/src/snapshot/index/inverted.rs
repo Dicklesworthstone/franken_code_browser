@@ -25,14 +25,14 @@ impl QueryIndex {
     pub(super) fn inverted(&self) -> bool { matches!(self, Self::Postings(_)) }
     pub(super) fn query<'archive, 'query, R: Read + Seek>(&'query self,
         archive: &'archive mut PagedSnapshot<R>, needle: &'query IndexedNeedle<'_>,
-        options: PagedQueryOptions, count_all_matches: bool, budget: &ResourceBudget)
+        options: PagedQueryOptions, skip_matches: u64, count_all_matches: bool, budget: &ResourceBudget)
         -> Result<PagedQuery<'archive, 'query, R>, Failure> {
         let allocations = [allocation(158), allocation(159), allocation(160)];
-        Ok(match (self, count_all_matches) {
-            (Self::Segments(index), false) => PagedQuery::new_indexed(archive, needle, index, options, budget, allocations)?,
-            (Self::Segments(index), true) => PagedQuery::new_indexed_counting(archive, needle, index, options, budget, allocations)?,
-            (Self::Postings(index), false) => PagedQuery::new_postings(archive, needle, index, options, budget, allocations)?,
-            (Self::Postings(index), true) => PagedQuery::new_postings_counting(archive, needle, index, options, budget, allocations)?,
+        Ok(match self {
+            Self::Segments(index) => PagedQuery::new_indexed_page(archive, needle, index,
+                options, skip_matches, count_all_matches, budget, allocations)?,
+            Self::Postings(index) => PagedQuery::new_postings_page(archive, needle, index,
+                options, skip_matches, count_all_matches, budget, allocations)?,
         })
     }
 }

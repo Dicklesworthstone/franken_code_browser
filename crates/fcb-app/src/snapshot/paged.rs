@@ -85,7 +85,7 @@ fn inspect(settings: &Settings, directory: &SnapshotDirectory, out: &mut Output,
 fn search(settings: &Settings, archive: &mut PagedSnapshot<File>, out: &mut Output,
     budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<u8, Failure> {
     let report = matching::direct(archive, settings.text.as_deref(), settings.raw_needle.as_deref(),
-        settings.ignore_case, settings.count_all_matches, settings.limit, budget,
+        settings.ignore_case, settings.count_all_matches, settings.limit, settings.skip_matches, budget,
         [allocation(105), allocation(106), allocation(107), allocation(108)], canceled)?;
     if settings.json {
         begin(out, "snapshot-search")?; summary(out, archive.directory())?;

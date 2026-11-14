@@ -39,6 +39,10 @@ Incomplete saved coverage exits 3; ordinary capped searches also exit 3.\n\
 --ignore-case uses Unicode scalar lowercase, not full case folding or canonical normalization.\n\
 --count-all finishes the saved scope while retaining at most --limit N hits; --limit 0 counts only.\n\
 Exact counts, saved-scope coverage and retained-hit truncation are reported separately.\n\
+Search/structure windows: --skip-matches N skips qualified matches before retaining --limit N rows.\n\
+Reuse the same archive digest, query and options with next_match_offset to reach later matches.\n\
+Earlier omitted rows keep ordinary search exits partial (3); --count-all retains its total-based exit.\n\
+Zero-row queries never propose a nonprogressing continuation. Source/work caps still apply.\n\
 Expression counts include primary occurrences only after all whole-member predicates succeed.\n\
 Expression --ignore-case applies Unicode lowercase to every positive and excluded text term.\n\
 Structure matching/count options remain unsupported.\n\
@@ -76,7 +80,7 @@ struct Settings {
     expression: Option<String>, max_scan_bytes: u64,
     structure_mode: Option<StructureMode>, structure_name: Option<String>,
     name_mode: SymbolNameMode, max_structure_source_bytes: u64,
-    ignore_case: bool, count_all_matches: bool,
+    ignore_case: bool, count_all_matches: bool, skip_matches: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Effect { None, Incomplete, Written, Synced }
@@ -107,7 +111,7 @@ impl From<SavedSourceError> for Failure {
 fn takes_value(text: &str) -> bool {
     matches!(text, "--output" | "--text" | "--raw-hex" | "--limit" | "--max-files" | "--max-file-bytes" | "--max-total-bytes"
         | "--member" | "--member-hex" | "--offset" | "--line" | "--bytes" | "--lines" | "--catalog" | "--catalog-digest"
-        | "--query" | "--max-scan-bytes" | "--mode" | "--name" | "--name-mode" | "--max-source-bytes")
+        | "--query" | "--max-scan-bytes" | "--mode" | "--name" | "--name-mode" | "--max-source-bytes" | "--skip-matches")
 }
 fn wants_json(args: &[OsString]) -> bool {
     let mut cursor = 0;
@@ -138,7 +142,8 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
         limit: 100, limits: WorkspaceLimits::default(), include_excluded: false, respect_ignores: false,
         catalog: None, catalog_pin: None, expression: None, max_scan_bytes: 256 * 1024 * 1024,
         structure_mode: None, structure_name: None, name_mode: SymbolNameMode::Exact,
-        max_structure_source_bytes: MAX_STRUCTURE_SOURCE_BYTES, ignore_case: false, count_all_matches: false };
+        max_structure_source_bytes: MAX_STRUCTURE_SOURCE_BYTES, ignore_case: false, count_all_matches: false,
+        skip_matches: 0 };
     let mut seen = 0u32;
     let mut cursor = usize::from(!args.is_empty());
     let mut positional = false;
@@ -155,7 +160,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 "--catalog" => 65536, "--catalog-digest" => 131072, "--respect-ignores" => 262144,
                 "--query" => 524288, "--max-scan-bytes" => 1048576,
                 "--mode" => 2097152, "--name" => 4194304, "--name-mode" => 8388608, "--max-source-bytes" => 16777216,
-                "--ignore-case" => 33554432, "--count-all" => 67108864,
+                "--ignore-case" => 33554432, "--count-all" => 67108864, "--skip-matches" => 134217728,
                 _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")), };
             if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
             seen |= bit;
@@ -216,6 +221,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 "--max-scan-bytes" if number <= crate::args::MAX_SCAN_BYTES => settings.max_scan_bytes = number,
                 "--max-source-bytes" if number <= MAX_STRUCTURE_SOURCE_BYTES => settings.max_structure_source_bytes = number,
                 "--offset" => settings.offset = number,
+                "--skip-matches" => settings.skip_matches = number,
                 "--line" if number > 0 => settings.line = Some(number),
                 "--bytes" if (4..=256 * 1024).contains(&number) => settings.window_bytes = number as usize,
                 "--lines" if (1..=4096).contains(&number) => settings.lines = number as usize,
@@ -236,11 +242,11 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
         Mode::Inspect => settings.source.is_some() && seen & !(1 | 8 | catalog_options) == 0,
         Mode::Search => settings.source.is_some()
             && usize::from(settings.text.is_some()) + usize::from(settings.raw_needle.is_some()) + usize::from(settings.expression.is_some()) == 1
-            && seen & !(1 | 4 | 8 | 32768 | catalog_options | 524288 | 1048576 | 33554432 | 67108864) == 0
+            && seen & !(1 | 4 | 8 | 32768 | catalog_options | 524288 | 1048576 | 33554432 | 67108864 | 134217728) == 0
             && (seen & 1048576 == 0 || settings.expression.is_some())
             && (!settings.ignore_case || settings.text.is_some() || settings.expression.is_some()),
         Mode::Structure => settings.source.is_some() && settings.structure_mode.is_some() && settings.structure_name.is_some()
-            && seen & !(1 | 8 | catalog_options | 2097152 | 4194304 | 8388608 | 16777216) == 0
+            && seen & !(1 | 8 | catalog_options | 2097152 | 4194304 | 8388608 | 16777216 | 134217728) == 0
             && (settings.structure_mode != Some(StructureMode::Occurrences) || settings.name_mode == SymbolNameMode::Exact),
         Mode::Read => settings.source.is_some() && settings.member.is_some()
             && seen & !(1 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 | catalog_options) == 0
@@ -558,4 +564,23 @@ mod tests {
         assert!(!wants_json(&args(&["structure", "saved", "--name-mode", "--json"])));
         assert!(!wants_json(&args(&["structure", "saved", "--max-source-bytes", "--json"])));
     }
+    #[test]
+    fn match_windows_accept_full_width_offsets_and_remain_search_only() {
+        let parsed = parse(&args(&["search", "saved", "--text", "needle",
+            "--skip-matches", "18446744073709551615"])).unwrap();
+        assert_eq!(parsed.skip_matches, u64::MAX);
+        let parsed = parse(&args(&["structure", "saved", "--mode", "headings",
+            "--name", "Guide", "--skip-matches", "0"])).unwrap();
+        assert_eq!(parsed.skip_matches, 0);
+        for values in [
+            vec!["inspect", "saved", "--skip-matches", "0"],
+            vec!["read", "saved", "--member", "a", "--skip-matches", "0"],
+            vec!["save", "root", "--output", "new", "--skip-matches", "0"],
+            vec!["catalog", "saved", "--output", "new", "--skip-matches", "0"],
+            vec!["search", "saved", "--text", "x", "--skip-matches", "1", "--skip-matches", "2"],
+        ] { assert!(parse(&args(&values)).is_err()); }
+        assert!(!wants_json(&args(&["search", "saved", "--text", "x", "--skip-matches", "--json"])));
+        assert!(wants_json(&args(&["search", "saved", "--text", "x", "--skip-matches", "--json", "--json"])));
+    }
+
 }

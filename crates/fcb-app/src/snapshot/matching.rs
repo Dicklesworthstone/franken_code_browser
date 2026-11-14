@@ -22,7 +22,7 @@ const MAX_WITNESS_BYTES: usize = 12 * 1024;
 
 pub(super) fn direct<R: Read + Seek>(archive: &mut PagedSnapshot<R>,
     text: Option<&str>, raw: Option<&[u8]>, ignore_case: bool, count_all_matches: bool,
-    max_matches: usize, budget: &ResourceBudget, ids: [ResourceAllocationId; 4],
+    max_matches: usize, skip_matches: u64, budget: &ResourceBudget, ids: [ResourceAllocationId; 4],
     canceled: &mut impl FnMut() -> bool) -> Result<PagedReport, Failure> {
     let needle = match (text, raw) {
         (Some(text), None) => StreamingNeedle::text_matching(owner(), text, !ignore_case, budget, ids[0]),
@@ -32,11 +32,8 @@ pub(super) fn direct<R: Read + Seek>(archive: &mut PagedSnapshot<R>,
     let options = PagedQueryOptions { generation: generation(), first_file: file_id(),
         first_revision: revision(), max_matches };
     let allocations = [ids[1], ids[2], ids[3]];
-    let query = if count_all_matches {
-        PagedQuery::new_counting(archive, &needle, options, budget, allocations)?
-    } else {
-        PagedQuery::new(archive, &needle, options, budget, allocations)?
-    };
+    let query = PagedQuery::new_page(archive, &needle, options, skip_matches,
+        count_all_matches, budget, allocations)?;
     finish(query, budget, canceled)
 }
 pub(super) fn finish<R: Read + Seek>(mut query: PagedQuery<'_, '_, R>,
@@ -64,6 +61,8 @@ pub(super) fn fields(out: &mut Output, report: &PagedReport, raw: bool,
     out.literal(",\"workspace_complete\":")?; out.boolean(report.is_complete())?;
     out.literal(",\"truncated\":")?; out.boolean(report.truncated())?;
     out.literal(",\"count_all_matches\":")?; out.boolean(report.count_all_matches())?;
+    window_fields(out, report.skip_matches(), report.skipped_matches(), report.hits().len(),
+        report.has_more_matches(), report.next_match_offset())?;
     out.literal(",\"matches_seen_exact\":")?; out.boolean(report.is_complete())?;
     for (name, value) in [("matches_seen", report.matches_seen()),
         ("stored_hits", report.hits().len() as u64), ("max_matches", report.max_matches() as u64),
@@ -82,6 +81,8 @@ pub(super) fn human(out: &mut Output, report: &PagedReport, ignore_case: bool,
         out.literal("Unicode scalar-lowercase literal matching; no full case folding or canonical normalization.\n")?;
         if index_available { out.literal("The exact index is incompatible with this mode; all saved members are verified and scanned directly.\n")?; }
     }
+    window_human(out, report.skip_matches(), report.skipped_matches(), report.hits().len(),
+        report.has_more_matches(), report.next_match_offset())?;
     if report.count_all_matches() {
         out.literal("Matches seen: ")?; out.literal(&report.matches_seen().to_string())?;
         out.literal(if report.is_complete() { " (exact)" } else { " (lower bound; saved scope incomplete)" })?;
@@ -163,5 +164,38 @@ pub(super) fn hits<R: Read + Seek>(archive: &mut PagedSnapshot<R>, report: &Page
 // searched, even if its optional retained rows are capped or zero. Ordinary
 // bounded queries stop scanning at their cap and remain incomplete (exit 3).
 pub(super) fn exit(report: &PagedReport) -> u8 {
-    if !report.is_complete() { EXIT_PARTIAL } else if report.matches_seen() == 0 { EXIT_NO_MATCH } else { EXIT_OK }
+    if !report.is_complete() || (!report.count_all_matches() && report.skipped_matches() > 0) {
+        EXIT_PARTIAL
+    } else if report.matches_seen() == 0 { EXIT_NO_MATCH } else { EXIT_OK }
+}
+
+/// A continuation is useful only after this response actually retained rows and
+/// the engine can advance past the requested offset. Count-only/existence
+/// probes still expose has_more_matches without advertising an endless loop.
+pub(super) fn window_fields(out: &mut Output, offset: u64, skipped: u64,
+    retained: usize, has_more: bool, next: Option<u64>) -> Result<(), Failure> {
+    out.literal(",\"result_offset\":")?; out.integer(offset)?;
+    out.literal(",\"skipped_matches\":")?; out.integer(skipped)?;
+    out.literal(",\"has_more_matches\":")?; out.boolean(has_more)?;
+    out.literal(",\"next_match_offset\":")?;
+    match next.filter(|next| retained > 0 && *next > offset) {
+        Some(next) => out.integer(next)?,
+        None => out.literal("null")?,
+    }
+    Ok(())
+}
+pub(super) fn window_human(out: &mut Output, offset: u64, skipped: u64,
+    retained: usize, has_more: bool, next: Option<u64>) -> Result<(), Failure> {
+    if offset != 0 {
+        out.literal("Result offset: ")?; out.literal(&offset.to_string())?;
+        out.literal("; preceding matches observed: ")?; out.literal(&skipped.to_string())?;
+        out.literal("; retained rows: ")?; out.literal(&retained.to_string())?; out.literal(".\n")?;
+    }
+    if let Some(next) = next.filter(|next| retained > 0 && *next > offset) {
+        out.literal("Later matches are available. Repeat the same saved archive and query with --skip-matches ")?;
+        out.literal(&next.to_string())?; out.literal(".\n")?;
+    } else if has_more {
+        out.literal("Additional matches exist; use a positive --limit to retain a progressing result window.\n")?;
+    }
+    Ok(())
 }

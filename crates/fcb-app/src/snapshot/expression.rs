@@ -7,7 +7,7 @@ use fcb::search::{StreamReadStep};
 use fcb::search::expression::{ExpressionError, ExpressionOptions, ExpressionPlan, ExpressionQuery, ExpressionState};
 use fcb::search::paged_snapshot::{PagedSearchError, PagedSnapshotError};
 use crate::{generation, allocation, file_id, owner, revision, EXIT_NO_MATCH, EXIT_OK, EXIT_PARTIAL};
-use super::{Settings, Failure, ResourceBudget, Output, RawPath, begin, catalog};
+use super::{Settings, Failure, ResourceBudget, Output, RawPath, begin, catalog, matching};
 
 impl From<ExpressionError> for Failure {
     fn from(error: ExpressionError) -> Self {
@@ -32,11 +32,8 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
     let options = ExpressionOptions { generation: generation(), first_file: file_id(), first_revision: revision(),
         max_matches: settings.limit, max_scan_bytes: settings.max_scan_bytes };
     let allocations = [allocation(151), allocation(152), allocation(153)];
-    let mut query = if settings.count_all_matches {
-        ExpressionQuery::new_counting(&mut archive, &plan, options, budget, allocations)?
-    } else {
-        ExpressionQuery::new(&mut archive, &plan, options, budget, allocations)?
-    };
+    let mut query = ExpressionQuery::new_page(&mut archive, &plan, options,
+        settings.skip_matches, settings.count_all_matches, budget, allocations)?;
     while query.state() == ExpressionState::Pending {
         query.step(StreamReadStep::default(), generation(), budget, &mut *canceled)?;
     }
@@ -56,6 +53,8 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
         out.literal(",\"workspace_complete\":")?; out.boolean(report.is_complete())?;
         out.literal(",\"truncated\":")?; out.boolean(report.hits_truncated())?;
         out.literal(",\"count_all_matches\":")?; out.boolean(report.count_all_matches())?;
+        matching::window_fields(out, report.skip_matches(), report.skipped_matches(),
+            report.hits().len(), report.has_more_matches(), report.next_match_offset())?;
         out.literal(",\"matches_seen_exact\":")?; out.boolean(report.is_complete())?;
         out.literal(",\"match_count_complete\":")?; out.boolean(report.is_complete())?;
         out.literal(",\"work_limited\":")?; out.boolean(report.state() == ExpressionState::WorkLimit)?;
@@ -88,6 +87,8 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
         out.literal(if report.is_complete() { "Complete saved-scope expression search; no live root accessed.\n" }
             else { "PARTIAL saved-scope expression search; no live root accessed.\n" })?;
         out.literal("Query: ")?; out.human_text(raw)?; out.literal("\n")?;
+        matching::window_human(out, report.skip_matches(), report.skipped_matches(),
+            report.hits().len(), report.has_more_matches(), report.next_match_offset())?;
         if !plan.case_sensitive() { out.literal("Text case: Unicode lowercase comparison for every positive and excluded term.\n")?; }
         if report.count_all_matches() {
             out.literal("Primary matches seen: ")?; out.literal(&report.matches_seen().to_string())?;
@@ -127,5 +128,7 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
         out.literal("; member bytes loaded: ")?; out.literal(&stats.loaded_bytes.to_string())?; out.literal("\n")?;
         if report.state() == ExpressionState::WorkLimit { out.literal("Matching-work allowance exhausted; no exhaustive-negative claim.\n")?; }
     }
-    Ok(if !report.is_complete() { EXIT_PARTIAL } else if report.matches_seen() == 0 { EXIT_NO_MATCH } else { EXIT_OK })
+    Ok(if !report.is_complete() || (!report.count_all_matches() && report.skipped_matches() > 0) {
+        EXIT_PARTIAL
+    } else if report.matches_seen() == 0 { EXIT_NO_MATCH } else { EXIT_OK })
 }

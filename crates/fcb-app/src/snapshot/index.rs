@@ -28,7 +28,11 @@ fcb snapshot index refresh NEW_SNAPSHOT --base OLD_SNAPSHOT --index OLD_INDEX\n\
 fcb snapshot index inspect SNAPSHOT --index INDEX --index-digest TRUSTED_SHA256 [--paged] [--json]\n\
 fcb snapshot index search SNAPSHOT --index INDEX --index-digest TRUSTED_SHA256\n\
     (--text LITERAL | --raw-hex HEX) [--paged] [--limit N] [--json]\n\
-Search options: --ignore-case (text only), --count-all (text or raw bytes).\n\
+Search options: --ignore-case (text only), --count-all (text or raw bytes), --skip-matches N.\n\
+Match offsets consume verified matches, not index candidates; all index layouts share result order.\n\
+Repeat the same archive digest, query and options with next_match_offset for later rows.\n\
+Earlier omitted rows keep ordinary exits partial (3); --count-all keeps total-based exits.\n\
+Zero retained rows never propose a nonprogressing continuation.\n\
 Complete --count-all exits 0 for a positive total or 1 for zero, even when rows are capped.\n\
 Incomplete saved coverage exits 3; ordinary capped searches also exit 3.\n\
 --ignore-case uses Unicode scalar lowercase, not full case folding or canonical normalization.\n\
@@ -56,7 +60,7 @@ struct Options {
     pin: Option<Sha256Digest>, text: Option<String>, raw: Option<Vec<u8>>, json: bool,
     limit: usize, build: IndexLimits, catalog: Option<PathBuf>, catalog_pin: Option<Sha256Digest>,
     base: Option<PathBuf>, base_catalog: Option<PathBuf>, base_catalog_pin: Option<Sha256Digest>,
-    inverted: bool, paged: bool, ignore_case: bool, count_all_matches: bool,
+    inverted: bool, paged: bool, ignore_case: bool, count_all_matches: bool, skip_matches: u64,
 }
 impl From<SnapshotIndexError> for Failure {
     fn from(error: SnapshotIndexError) -> Self {
@@ -68,7 +72,7 @@ impl From<SnapshotIndexError> for Failure {
 fn takes_value(arg: &str) -> bool {
     matches!(arg, "--output" | "--index" | "--index-digest" | "--text" | "--raw-hex" | "--limit"
         | "--max-grams" | "--max-file-bytes" | "--max-source-bytes" | "--catalog" | "--catalog-digest"
-        | "--base" | "--base-catalog" | "--base-catalog-digest")
+        | "--base" | "--base-catalog" | "--base-catalog-digest" | "--skip-matches")
 }
 fn wants_json(args: &[OsString]) -> bool {
     let mut i = 0;
@@ -96,7 +100,7 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
     let mut out = Options { action, archive: None, output: None, index: None, pin: None, text: None,
         raw: None, json: false, limit: 100, build: IndexLimits::default(), catalog: None, catalog_pin: None,
         base: None, base_catalog: None, base_catalog_pin: None, inverted: false, paged: false,
-        ignore_case: false, count_all_matches: false };
+        ignore_case: false, count_all_matches: false, skip_matches: 0 };
     let mut seen = 0u32;
     let mut cursor = usize::from(!args.is_empty());
     let mut positional = false;
@@ -113,7 +117,7 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
             "--max-file-bytes" => 256, "--max-source-bytes" => 512,
             "--catalog" => 1024, "--catalog-digest" => 2048,
             "--base" => 4096, "--base-catalog" => 8192, "--base-catalog-digest" => 16384,
-            "--inverted" => 32768, "--paged" => 65536, "--ignore-case" => 131072, "--count-all" => 262144,
+            "--inverted" => 32768, "--paged" => 65536, "--ignore-case" => 131072, "--count-all" => 262144, "--skip-matches" => 524288,
             _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")),
         };
         if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
@@ -149,6 +153,7 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
         let number = decimal(text).map_err(|error| Failure::new(error.code()))?;
         match option {
             "--limit" if number <= 4096 => out.limit = number as usize,
+            "--skip-matches" => out.skip_matches = number,
             "--max-grams" if number <= MAX_INDEX_GRAMS as u64 => out.build.max_total_grams = number as usize,
             "--max-file-bytes" if number <= 256 * 1024 => out.build.max_source_bytes_per_file = number as usize,
             "--max-source-bytes" if number <= 64 * 1024 * 1024 => out.build.max_source_bytes_total = number,
@@ -167,7 +172,7 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
         Action::Inspect => out.archive.is_some() && out.index.is_some() && out.pin.is_some() && seen & !(1 | 4 | 8 | catalog_options | 65536) == 0,
         Action::Search => out.archive.is_some() && out.index.is_some() && out.pin.is_some()
             && (out.text.is_some() != out.raw.is_some()) && (!out.ignore_case || out.text.is_some())
-            && seen & !(1 | 4 | 8 | 16 | 32 | 64 | catalog_options | 65536 | 131072 | 262144) == 0,
+            && seen & !(1 | 4 | 8 | 16 | 32 | 64 | catalog_options | 65536 | 131072 | 262144 | 524288) == 0,
     };
     if !valid || (out.inverted && out.paged) { return Err(Failure::new("CLI_INCOMPATIBLE_OPTIONS")); }
     Ok(out)
@@ -277,7 +282,8 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
     }
     let report = if options.ignore_case {
         matching::direct(&mut archive, options.text.as_deref(), None, true, options.count_all_matches,
-            options.limit, budget, [allocation(157), allocation(158), allocation(159), allocation(160)], canceled)?
+            options.limit, options.skip_matches, budget,
+            [allocation(157), allocation(158), allocation(159), allocation(160)], canceled)?
     } else {
         let needle = match (&options.text, &options.raw) {
             (Some(text), None) => IndexedNeedle::text(owner(), text, budget, allocation(157)),
@@ -285,7 +291,7 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
             _ => return Err(Failure::new("CLI_INVALID_NEEDLE")),
         }.map_err(|error| Failure::new(&error.to_string()))?;
         let opts = PagedQueryOptions { generation: generation(), first_file: file_id(), first_revision: revision(), max_matches: options.limit };
-        let query = index.query(&mut archive, &needle, opts, options.count_all_matches, budget)?;
+        let query = index.query(&mut archive, &needle, opts, options.skip_matches, options.count_all_matches, budget)?;
         matching::finish(query, budget, canceled)?
     };
     if options.json {
@@ -436,4 +442,25 @@ mod tests {
         assert_eq!(parsed.text.as_deref(), Some("--paged")); assert!(!parsed.paged);
         assert!(parse(&args(&["refresh", "new", "--base", "old", "--index", "i", "--index-digest", &pin, "--output", "next", "--paged"])).is_err());
     }
+    #[test]
+    fn indexed_match_windows_are_search_only_and_do_not_change_json_detection() {
+        let pin = "ab".repeat(32);
+        let parsed = parse(&args(&["search", "saved", "--index", "index", "--index-digest", &pin,
+            "--text", "needle", "--skip-matches", "18446744073709551615"])).unwrap();
+        assert_eq!(parsed.skip_matches, u64::MAX);
+        for mut values in [
+            vec!["build", "saved", "--output", "new"],
+            vec!["inspect", "saved", "--index", "index", "--index-digest", &pin],
+            vec!["refresh", "saved", "--base", "old", "--index", "index",
+                "--index-digest", &pin, "--output", "new"],
+        ] {
+            values.extend(["--skip-matches", "0"]);
+            assert!(parse(&args(&values)).is_err());
+        }
+        assert!(parse(&args(&["search", "saved", "--index", "index", "--index-digest", &pin,
+            "--text", "needle", "--skip-matches", "1", "--skip-matches", "2"])).is_err());
+        assert!(!wants_json(&args(&["search", "saved", "--skip-matches", "--json"])));
+        assert!(wants_json(&args(&["search", "saved", "--skip-matches", "--json", "--json"])));
+    }
+
 }

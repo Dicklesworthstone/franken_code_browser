@@ -8,7 +8,7 @@ use fcb::search::SymbolNameMode;
 use fcb::search::snapshot_structure::{StructureError, StructureMode, StructureOptions,
     StructureQuery, StructureState};
 use crate::{allocation, file_id, generation, revision, EXIT_OK, EXIT_NO_MATCH, EXIT_PARTIAL};
-use super::{Settings, Failure, ResourceBudget, Output, RawPath, begin, catalog};
+use super::{Settings, Failure, ResourceBudget, Output, RawPath, begin, catalog, matching};
 
 impl From<StructureError> for Failure {
     fn from(error: StructureError) -> Self {
@@ -27,7 +27,7 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
     let options = StructureOptions { generation: generation(), first_file: file_id(),
         first_revision: revision(), mode, name_mode: settings.name_mode,
         max_matches: settings.limit, max_source_bytes: settings.max_structure_source_bytes };
-    let mut query = StructureQuery::new(&mut archive, name, options, budget,
+    let mut query = StructureQuery::new_page(&mut archive, name, options, settings.skip_matches, budget,
         [allocation(160), allocation(161), allocation(162), allocation(163), allocation(164)])?;
     while query.state() == StructureState::Pending {
         query.step(generation(), budget, &mut *canceled)?;
@@ -54,7 +54,10 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
         out.literal(",\"discovery_complete\":")?; out.boolean(archive.directory().discovery_complete())?;
         out.literal(",\"workspace_complete\":")?; out.boolean(report.is_complete())?;
         out.literal(",\"matches_seen_exact\":")?; out.boolean(report.is_complete())?;
-        out.literal(",\"truncated\":")?; out.boolean(report.state() == StructureState::Truncated)?;
+        out.literal(",\"truncated\":")?;
+        out.boolean(report.state() == StructureState::Truncated || report.skipped_matches() > 0)?;
+        matching::window_fields(out, report.skip_matches(), report.skipped_matches(),
+            report.hits().len(), report.has_more_matches(), report.next_match_offset())?;
         out.literal(",\"work_limited\":")?; out.boolean(report.state() == StructureState::WorkLimit)?;
         out.literal(",\"state\":")?; out.quoted(match report.state() {
             StructureState::Complete => "complete", StructureState::Truncated => "truncated",
@@ -86,6 +89,8 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
         out.literal(if report.is_complete() { "Complete saved-scope structural search; no live roots accessed.\n" }
             else { "PARTIAL saved-scope structural search; no live roots accessed.\n" })?;
         out.literal("Evidence: ")?; out.literal(mode.realized())?; out.literal(". Name: ")?; out.human_text(name)?; out.literal("\n")?;
+        matching::window_human(out, report.skip_matches(), report.skipped_matches(),
+            report.hits().len(), report.has_more_matches(), report.next_match_offset())?;
         if mode == StructureMode::Occurrences {
             out.literal("Whole-token text includes comments and literals; compiler bindings are not resolved.\n")?;
         } else if mode == StructureMode::Symbols {
@@ -133,5 +138,6 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
             out.literal("Aggregate source allowance exhausted; no exhaustive-negative claim.\n")?;
         }
     }
-    Ok(if !report.is_complete() { EXIT_PARTIAL } else if report.matches_seen() == 0 { EXIT_NO_MATCH } else { EXIT_OK })
+    Ok(if !report.is_complete() || report.skipped_matches() > 0 { EXIT_PARTIAL }
+        else if report.matches_seen() == 0 { EXIT_NO_MATCH } else { EXIT_OK })
 }

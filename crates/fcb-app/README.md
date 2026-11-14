@@ -456,6 +456,58 @@ raw bytes and encoding declarations. Neither strategy is a persistent or
 out-of-core posting index: one retains bounded captures and an ephemeral index;
 the other scans continuous source while retaining only literal witnesses.
 
+## Later matches in saved archives
+
+Saved searches expose the same bounded match windows as the native saved
+repository browser. Add **`--skip-matches N`** to literal/raw/expression
+search, structural search, or any saved-index search:
+
+```sh
+fcb snapshot search project.fcbs --text cancel --skip-matches 4096 --limit 100 --json
+fcb snapshot search project.fcbs --query 'cancel Result -deprecated lang:rust' --skip-matches 100 --json
+fcb snapshot structure project.fcbs --mode occurrences --name cancel --skip-matches 4096 --json
+fcb snapshot structure project.fcbs --mode symbols --name Cancel --name-mode prefix --skip-matches 100 --json
+fcb snapshot index search project.fcbs --index project.fcbd --index-digest TRUSTED_SHA256 \
+    --paged --text cancel --skip-matches 4096 --limit 100 --json
+```
+
+The offset skips verified qualifying occurrences in the engine's deterministic
+member/source order, including overlapping literal matches. It does not skip
+files, index candidates, bytes, or rendered rows. Expressions skip only primary
+occurrences in members whose complete captures satisfy every required and
+excluded predicate. Symbols, headings, and identifier occurrences retain their
+existing evidence classes and per-file extraction limits.
+
+Every result reports `result_offset` (requested), `skipped_matches`
+(actually observed), `has_more_matches`, and nullable
+`next_match_offset`. Repeat the same query, options, and archive digest
+with the returned next offset to reach later matches without raising the
+4,096-row retention cap. Per-member indexes, resident global postings and
+demand-paged postings use the same window order. Case-insensitive index
+fallbacks keep the offset while directly verifying saved source.
+
+A continuation is emitted only when later matches are known and this response
+retained at least one row, with a strictly increasing offset. Zero-row
+existence/count-only queries can report more matches while returning a null
+continuation. A noncounting literal search with `--limit 0` retains its existing
+no-scan behavior; add `--count-all` for an actual count. Null does not prove absence when source coverage or work is
+incomplete. Structural metadata omissions consume qualified match positions;
+use the engine's next offset rather than adding the visible row count.
+
+Counts include skipped matches. Saved-scope coverage, total-count exactness,
+omitted rows and more matches after this window remain separate. Ordinary
+queries return partial exit 3 when any preceding matches were omitted, even
+on a fully scanned final window. Explicit `--count-all` retains its
+total-based exit contract: 0 for an exhaustive positive total and 1 for an
+exhaustive zero total, including empty windows beyond the end. Incomplete
+coverage or exhausted work still returns 3.
+
+Each invocation reopens and verifies the selected archive and any explicit
+index/catalog pins; compare `snapshot_digest` between requests. Replacing
+the archive or changing the query does not continue the old result sequence.
+Offsets do not remove source, extraction, memory, response, or matching-work
+limits, and no live repository source is accessed.
+
 ## Single-file windows and stdin
 
 Default visible size is 65,536 original bytes; the maximum is 262,144. A range

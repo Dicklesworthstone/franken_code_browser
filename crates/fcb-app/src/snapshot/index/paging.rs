@@ -64,7 +64,8 @@ pub(super) fn execute(options: &Options, out: &mut Output, budget: &ResourceBudg
     }
     let report = if options.ignore_case {
         matching::direct(&mut archive, options.text.as_deref(), None, true, options.count_all_matches,
-            options.limit, budget, [allocation(157), allocation(158), allocation(159), allocation(160)], canceled)?
+            options.limit, options.skip_matches, budget,
+            [allocation(157), allocation(158), allocation(159), allocation(160)], canceled)?
     } else {
         let needle = match (&options.text, &options.raw) {
             (Some(text), None) => IndexedNeedle::text(owner(), text, budget, allocation(157)),
@@ -73,11 +74,8 @@ pub(super) fn execute(options: &Options, out: &mut Output, budget: &ResourceBudg
         }.map_err(|error| Failure::new(&error.to_string()))?;
         let opts = PagedQueryOptions { generation: generation(), first_file: file_id(), first_revision: revision(), max_matches: options.limit };
         let ids = [allocation(158), allocation(159), allocation(160)];
-        let query = if options.count_all_matches {
-            PagedQuery::new_paged_counting(&mut archive, &needle, &mut index, opts, budget, ids)?
-        } else {
-            PagedQuery::new_paged(&mut archive, &needle, &mut index, opts, budget, ids)?
-        };
+        let query = PagedQuery::new_paged_page(&mut archive, &needle, &mut index, opts,
+            options.skip_matches, options.count_all_matches, budget, ids)?;
         matching::finish(query, budget, canceled)?
     };
     if options.json {
