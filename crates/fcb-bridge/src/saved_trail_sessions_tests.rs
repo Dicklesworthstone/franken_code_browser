@@ -123,3 +123,53 @@ fn canceling_reader_preparation_leaves_an_empty_destination_and_a_reusable_attac
     assert!(saved.open_reader(handle, &readers, reader, Selection::Trail { generation: 1, item: 0 }, || false).is_ok());
     readers.close(reader).unwrap(); saved.close(handle).unwrap();
 }
+
+fn write_request(destination: &Path) -> SavedTrailWriteRequest<'_> {
+    SavedTrailWriteRequest { operation: 1, parent: None, member: 0,
+        selection: ByteRange::new(ByteOffset::new(6), ByteOffset::new(14)).unwrap(),
+        title: "Authored trail", rationale: "Exact saved source", destination }
+}
+
+#[test]
+fn cancel_during_trail_publication_preserves_effect_and_recovery_without_replay() {
+    let fixture = fixture(); let saved = SavedSessions::new(); let handle = open(&saved, &fixture);
+    attach(&saved, handle, &fixture.trail, 1).unwrap();
+    let destination = fixture.archive.with_extension("canceled.fcbt"); let mut signaled = false;
+    let response = saved.write_trail(handle, write_request(&destination), || {
+        if !signaled && destination.exists() { saved.cancel(handle).unwrap(); signaled = true; return true; }
+        false
+    }).unwrap();
+    assert!(signaled);
+    assert!(response.as_str().contains("\"effect\":\"destination-created-incomplete\""));
+    assert!(response.as_str().contains("SAVED_TRAIL_WRITE_CANCELED"));
+    assert_eq!(number(response.as_str(), "bytes_written"), 0);
+    assert_eq!(fs::metadata(&destination).unwrap().len(), 0);
+    fs::write(&destination, b"changed externally after writer drained").unwrap();
+    assert_eq!(saved.execute(handle, Command::TrailWriteReceipt { operation: 1 }, || false).unwrap().as_str(), response.as_str());
+    assert_eq!(fs::read(&destination).unwrap(), b"changed externally after writer drained");
+    assert_eq!(number(saved.execute(handle, Command::Info, || false).unwrap().as_str(), "accepted_trail_generation"), 1);
+    assert!(page(&saved, handle, 1).is_ok());
+    assert_eq!(saved.write_trail(handle, write_request(&destination), || false).err(), Some(AccessError::Trail(SavedTrailError::StaleWrite)));
+    saved.close(handle).unwrap();
+}
+
+#[test]
+fn closing_during_trail_write_keeps_its_effect_response_and_capacity_through_drain() {
+    let fixture = fixture(); let saved = SavedSessions::new(); let handle = open(&saved, &fixture);
+    let rest: Vec<_> = (1..MAX_SAVED_SESSIONS).map(|_| saved.create().unwrap()).collect();
+    let destination = fixture.archive.with_extension("closed.fcbt"); let mut closed = false;
+    let response = saved.write_trail(handle, write_request(&destination), || {
+        if !closed && destination.exists() {
+            saved.close(handle).unwrap(); closed = true;
+            assert_eq!(saved.create().err(), Some(AccessError::Capacity)); return true;
+        }
+        false
+    }).unwrap();
+    assert!(closed);
+    assert!(response.as_str().contains("\"effect\":\"destination-created-incomplete\""));
+    assert_eq!(number(response.as_str(), "bytes_written"), 0);
+    assert_eq!(fs::metadata(&destination).unwrap().len(), 0);
+    assert_eq!(saved.execute(handle, Command::TrailWriteReceipt { operation: 1 }, || false).err(), Some(AccessError::Unknown));
+    let fresh = saved.create().unwrap(); assert_ne!(fresh, handle);
+    saved.close(fresh).unwrap(); for handle in rest { saved.close(handle).unwrap(); }
+}

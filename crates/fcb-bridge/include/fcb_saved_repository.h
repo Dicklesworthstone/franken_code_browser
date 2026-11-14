@@ -73,6 +73,51 @@ char *fcb_saved_trail_detach(uint64_t handle, uint64_t generation);
 char *fcb_saved_open_trail_reader(uint64_t handle, uint64_t reader,
     uint64_t generation, uint64_t item);
 
+/* Author a NEW immutable FCBT from an exact saved-member byte range. The host
+ * verifies bytes using the retained archive descriptor, never its pathname or
+ * a live source file. member is zero-based; start <= end <= captured length.
+ * Empty ranges are point bookmarks. Text is explicit UTF-8 bytes, including
+ * embedded NUL: title <=256 bytes, rationale <=4096 bytes; null is permitted
+ * only when the corresponding length is zero. All inputs remain valid until
+ * return. destination/digest are borrowed NUL-terminated UTF-8.
+ *
+ * New: expected_trail_generation=0 and expected_trail_digest="". Append:
+ * current accepted attachment generation plus its 64-hex digest, and title
+ * equal to its exact existing title. Preserves every parent visit/rationale,
+ * including repeats and other archives; records the parent's digest. Limits
+ * remain 1024 visits / 4 MiB and never evict or truncate earlier user notes.
+ * Never attaches the output or changes accepted trail/query/reader state.
+ *
+ * Each host-entered operation consumes a fresh strictly increasing nonzero ID,
+ * independent of attach/search generations. Creation is exclusive (Unix 0600),
+ * never overwrite; hold destination write access through worker drain. Receipt
+ * capacity is admitted before source verification/publication. A cancel/close
+ * after create cannot erase the effect-bearing response. Cancellation never
+ * deletes a created file or rolls back its bytes. Inspect status, effect and
+ * bytes_written; complete_artifact/attach_eligible are true only after all
+ * encoded bytes were written. Digest/counts can describe an encoded artifact
+ * even when destination creation/write failed. No power-loss guarantee.
+ *
+ * command=trail-write in fcb.saved-repository/1 binds exact archive/member/path,
+ * source digest/length/range, reviewed title/rationale, parent, destination,
+ * produced artifact digest/counts, source read counters and terminal effect.
+ * info exposes last_trail_write_attempt and nullable last_trail_write_operation.
+ * Missing/malformed/null delivery is uncertain: recover the exact operation's
+ * immutable receipt without I/O or replay. Never auto-retry a lost write reply.
+ */
+char *fcb_saved_trail_write(uint64_t handle, uint64_t operation,
+    uint64_t expected_trail_generation, const char *expected_trail_digest,
+    uint64_t member, uint64_t start, uint64_t end,
+    const uint8_t *title, uint64_t title_length,
+    const uint8_t *rationale, uint64_t rationale_length, const char *destination);
+char *fcb_saved_trail_write_cancelable(uint64_t handle, uint64_t operation,
+    uint64_t expected_trail_generation, const char *expected_trail_digest,
+    uint64_t member, uint64_t start, uint64_t end,
+    const uint8_t *title, uint64_t title_length,
+    const uint8_t *rationale, uint64_t rationale_length, const char *destination,
+    int32_t (*poll)(void *), void *context);
+char *fcb_saved_trail_write_receipt(uint64_t handle, uint64_t operation);
+
 /* Quick Open searches the already validated archive directory with the shared
  * exact/prefix/fuzzy path ranker, including members without captured contents.
  * query is a borrowed 1..256-byte native path query, with no NUL. Raw non-UTF-8

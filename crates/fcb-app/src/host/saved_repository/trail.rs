@@ -17,10 +17,15 @@ use super::{ArenaOwnerId, AppError, ByteLength, FileId, HostResponse, Output, Ou
 pub const MAX_SAVED_TRAIL_PAGE: usize = 32;
 const MAX_READ_CALLS: usize = 131_072;
 
+/// Explicit immutable trail authoring and retained create-only write receipts.
+pub mod write;
+pub use write::{SavedTrailWriteParent, SavedTrailWriteRequest};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SavedTrailError {
     Saved(SavedRepositoryError), Trail(TrailReadError), InvalidLimits, MissingTrail,
     StaleGeneration, ReadFailed, FileChanged, ReadCallLimit,
+    MissingWrite, StaleWrite, ParentMismatch,
 }
 impl std::fmt::Display for SavedTrailError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -32,6 +37,9 @@ impl std::fmt::Display for SavedTrailError {
             Self::ReadFailed => f.write_str("SAVED_TRAIL_READ_FAILED"),
             Self::FileChanged => f.write_str("SAVED_TRAIL_FILE_CHANGED"),
             Self::ReadCallLimit => f.write_str("SAVED_TRAIL_READ_CALL_LIMIT"),
+            Self::MissingWrite => f.write_str("SAVED_TRAIL_NO_WRITE"),
+            Self::StaleWrite => f.write_str("SAVED_TRAIL_STALE_WRITE"),
+            Self::ParentMismatch => f.write_str("SAVED_TRAIL_PARENT_MISMATCH"),
         }
     }
 }
