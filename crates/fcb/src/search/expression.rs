@@ -45,6 +45,7 @@ impl From<PagedSearchError> for ExpressionError { fn from(e: PagedSearchError) -
 /// exactly exclusion_count + conjunction_count + 1 pattern IDs are used.
 pub struct ExpressionPlan {
     owner: ArenaOwnerId,
+    case_sensitive: bool,
     syntax: ParsedQuery,
     patterns: Vec<StreamingNeedle>,
     _lease: ResourceLease,
@@ -53,6 +54,15 @@ impl ExpressionPlan {
     pub fn parse(owner: ArenaOwnerId, query: &str, budget: &ResourceBudget,
         allocation: ResourceAllocationId, first_pattern: ResourceAllocationId)
         -> Result<Self, ExpressionError> {
+        Self::parse_with_matching(owner, query, true, budget, allocation, first_pattern)
+    }
+    /// Apply one immutable comparison policy to every required, excluded and
+    /// primary term. False uses the shared Unicode scalar lowercase matcher;
+    /// it does not enable full case folding or canonical normalization. Path
+    /// and language filters retain their existing metadata matching semantics.
+    pub fn parse_with_matching(owner: ArenaOwnerId, query: &str, case_sensitive: bool,
+        budget: &ResourceBudget, allocation: ResourceAllocationId,
+        first_pattern: ResourceAllocationId) -> Result<Self, ExpressionError> {
         if query.len() > super::MAX_QUERY_LEN { return Err(QueryError::NeedleTooLong.into()); }
         // Includes the parser's temporary scalar/token vectors, retained AST,
         // lowercased filters, pattern descriptors, and geometric overlap.
@@ -70,12 +80,14 @@ impl ExpressionPlan {
             .chain(std::iter::once(&syntax.primary_needle)).enumerate() {
             let id = ResourceAllocationId::new(first_pattern.get() + i as u64)
                 .map_err(|_| ExpressionError::IdentityExhausted)?;
-            patterns.push(StreamingNeedle::text(owner, term, budget, id)?);
+            patterns.push(StreamingNeedle::text_matching(owner, term, case_sensitive, budget, id)?);
         }
-        Ok(Self { owner, syntax, patterns, _lease: lease })
+        Ok(Self { owner, case_sensitive, syntax, patterns, _lease: lease })
     }
     pub fn syntax(&self) -> &ParsedQuery { &self.syntax }
     pub const fn owner(&self) -> ArenaOwnerId { self.owner }
+    pub const fn case_sensitive(&self) -> bool { self.case_sensitive }
+    pub const fn realized_mode(&self) -> &'static str { realized_mode(self.case_sensitive) }
     fn primary(&self) -> usize { self.patterns.len() - 1 }
     fn required(&self, term: usize) -> bool { term >= self.syntax.exclusion_terms.len() }
     fn admits(&self, native: &[u8]) -> bool {
@@ -258,7 +270,11 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
             let member = self.archive.directory().member(ordinal).ok_or(PagedSearchError::InvalidHit)?;
             if !self.plan.admits(member.path) || matches!(member.data, PagedMemberData::Unavailable(_)) { return Ok(()); }
             if let Some(index) = self.index {
-                match index.text_decision(ordinal, Some(&self.plan.syntax.primary_needle)) {
+                // The saved index certifies absence of exact UTF-8 grams only.
+                // Lowercase matching can find different bytes (even different
+                // byte lengths), so exact negatives must never skip a member.
+                let exact = self.plan.case_sensitive.then_some(self.plan.syntax.primary_needle.as_str());
+                match index.text_decision(ordinal, exact) {
                     IndexDecision::Excluded => { self.stats.index_eliminated += 1; return Ok(()); }
                     IndexDecision::Verify => self.stats.index_candidates += 1,
                     IndexDecision::Fallback => self.stats.index_fallbacks += 1,
@@ -353,18 +369,21 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
         Ok(ExpressionReport { archive: self.archive.directory().digest(), generation: self.options.generation,
             discovery_complete: self.archive.directory().discovery_complete(), state: self.state,
             hits: self.hits, seen: self.seen, matching_files: self.matching_files,
-            count_all_matches: self.count_all_matches, stats: self.stats, _lease: self._lease })
+            case_sensitive: self.plan.case_sensitive, count_all_matches: self.count_all_matches,
+            stats: self.stats, _lease: self._lease })
     }
 }
 
 pub struct ExpressionReport {
     archive: Sha256Digest, generation: QueryGeneration, discovery_complete: bool,
     state: ExpressionState, hits: Vec<ExpressionHit>, seen: u64, matching_files: usize,
-    count_all_matches: bool, stats: ExpressionStats, _lease: ResourceLease,
+    case_sensitive: bool, count_all_matches: bool, stats: ExpressionStats, _lease: ResourceLease,
 }
 impl ExpressionReport {
     pub fn hits(&self) -> &[ExpressionHit] { &self.hits }
     pub const fn matches_seen(&self) -> u64 { self.seen }
+    pub const fn case_sensitive(&self) -> bool { self.case_sensitive }
+    pub const fn realized_mode(&self) -> &'static str { realized_mode(self.case_sensitive) }
     pub const fn count_all_matches(&self) -> bool { self.count_all_matches }
     pub fn hits_truncated(&self) -> bool { self.seen > self.hits.len() as u64 }
     pub const fn matching_files(&self) -> usize { self.matching_files }
@@ -383,6 +402,10 @@ impl ExpressionReport {
         if self.archive != archive || self.generation != generation { return Err(ExpressionError::StaleQuery); }
         Ok(())
     }
+}
+
+const fn realized_mode(case_sensitive: bool) -> &'static str {
+    if case_sensitive { "decoded-text-expression" } else { "unicode-lowercase-expression" }
 }
 
 #[cfg(test)]
