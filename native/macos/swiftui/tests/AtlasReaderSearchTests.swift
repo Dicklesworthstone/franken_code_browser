@@ -58,6 +58,48 @@ private func configuredPacket(_ generation: UInt64 = 1, needle: String = "😀",
     out["hits"] = rows
     return out
 }
+
+/// Long query witnesses can reduce the host's retained row allowance. This
+/// one-row fixture makes the same page boundary visible in a tiny source.
+/// The source stays fixed; only retained occurrence rows and their local indexes
+/// change. No matching logic is substituted for the production search engine.
+private func pagedFindPacket(_ generation: UInt64 = 1, needle: String = "😀",
+                             startAfter: UInt64 = 0, options: AtlasReaderFindOptions = .init(),
+                             partial: Bool = false) -> [String: Any] {
+    let original = !options.caseSensitive && needle == "ONE" ? "one" : needle
+    let all = ranges(original)
+    let available = partial ? Array(all.prefix(1)) : all
+    let start = Int(min(startAfter, UInt64(available.count)))
+    let selected = Array(available.dropFirst(start).prefix(1))
+    let later = available.count > start + selected.count
+    let seen = options.countAllMatches ? available.count : start + selected.count + (later ? 1 : 0)
+    let skipped = min(startAfter, UInt64(seen))
+    let complete = !partial && (options.countAllMatches || !later)
+    var out = header("find")
+    out["query_generation"] = String(generation); out["needle"] = needle
+    out["mode"] = options.caseSensitive ? "exact-decoded-literal" : "unicode-lowercase-literal"
+    out["case_sensitive"] = options.caseSensitive; out["count_all_matches"] = options.countAllMatches
+    out["retained_limit"] = "1"; out["page_start_after"] = String(startAfter)
+    out["skipped_matches"] = String(skipped); out["has_more_matches"] = UInt64(seen) - skipped > UInt64(selected.count)
+    out["state"] = partial ? "byte-limit" : (complete ? "complete-observed-input" : "match-limit")
+    out["search_complete"] = complete; out["match_count_complete"] = complete
+    out["scanned_bytes"] = partial ? String(available.last?.1 ?? 0) : String(sourceBytes.count)
+    out["matches_seen"] = String(seen); out["retained_hits"] = String(selected.count)
+    out["rows_truncated"] = seen > selected.count; out["unsupported_at"] = NSNull()
+    out["literal_original_hex"] = options.caseSensitive
+        ? (selected.first.map { hex(sourceBytes[Int($0.0)..<Int($0.1)]) as Any } ?? NSNull()) : NSNull()
+    out["hits"] = selected.enumerated().map { index, hit in
+        var row: [String: Any] = ["hit_index": String(index), "occurrence_id": String(start + index + 1),
+            "original_range": ["start": String(hit.0), "end": String(hit.1)]]
+        if !options.caseSensitive {
+            row["matched_text"] = original
+            row["original_hex"] = hex(sourceBytes[Int(hit.0)..<Int(hit.1)])
+        }
+        return row
+    }
+    return out
+}
+
 private func pagePacket(command: String = "window", generation: UInt64 = 1, needle: String = "😀", hit index: Int = 0,
                         offset: UInt64 = 0, bytes: UInt64 = AtlasReaderLimits.pageBytes) -> [String: Any] {
     var out = header(command)
@@ -83,9 +125,14 @@ private final class Transport: @unchecked Sendable {
     private var calls: [String] = []
     private var needle = "😀"
     private var paused = false
+    private var pageStart: UInt64 = 0
+    private var malformedPage = false
+    private var partialPage = false
     let entered = DispatchSemaphore(value: 0), gate = DispatchSemaphore(value: 0)
     var log: [String] { lock.lock(); defer { lock.unlock() }; return calls }
     func pauseFind() { lock.lock(); paused = true; lock.unlock() }
+    func rejectNextPage() { lock.lock(); malformedPage = true; lock.unlock() }
+    func limitNextPage() { lock.lock(); partialPage = true; lock.unlock() }
     private func record(_ text: String) { lock.lock(); calls.append(text); lock.unlock() }
     var source: AtlasReaderTransport {
         AtlasReaderTransport(create: { 7 }, open: { [self] _, _, _ in record("open"); return json(header("info")) },
@@ -120,6 +167,33 @@ private final class Transport: @unchecked Sendable {
                 return json(configuredPacket(generation, needle: value, options: options))
             })
     }
+
+    var pagingSearch: AtlasReaderSearchTransport {
+        let legacy = search
+        return AtlasReaderSearchTransport(find: legacy.find, hit: { [self] _, generation, index, context in
+            precondition(!Thread.isMainThread && context == AtlasReaderHitTarget.contextBytes)
+            lock.lock(); let value = needle, originalIndex = pageStart + index
+            calls.append("hit:\(generation):\(index)")
+            calls.append("global-hit:\(generation):\(originalIndex)")
+            lock.unlock()
+            return json(pagePacket(command: "hit", generation: generation, needle: value, hit: Int(originalIndex)))
+        }, findPage: { [self] _, generation, value, startAfter, count, bytes, flags in
+            precondition(!Thread.isMainThread && count == AtlasReaderFindReport.maxHits && bytes == UInt64(sourceBytes.count))
+            precondition(flags <= 3)
+            let options = AtlasReaderFindOptions(caseSensitive: flags & 1 == 0, countAllMatches: flags & 2 != 0)
+            lock.lock()
+            needle = !options.caseSensitive && value == "ONE" ? "one" : value; pageStart = startAfter
+            let block = paused, malformed = malformedPage, partial = partialPage
+            paused = false; malformedPage = false; partialPage = false
+            calls.append("page:\(generation):\(startAfter)"); calls.append("page-flags:\(flags)")
+            lock.unlock()
+            if block { entered.signal(); precondition(gate.wait(timeout: .now() + .seconds(5)) == .success) }
+            var packet = pagedFindPacket(generation, needle: value, startAfter: startAfter, options: options, partial: partial)
+            if malformed { packet["page_start_after"] = String(startAfter + 1) }
+            record("page-return:\(generation)")
+            return json(packet)
+        })
+    }
 }
 
 @main struct AtlasReaderSearchTests {
@@ -138,6 +212,217 @@ private final class Transport: @unchecked Sendable {
         }
         check(result, message)
     }
+
+    @MainActor private static func pagingReceipts(info: AtlasReaderInfo) throws {
+        let first = try AtlasReaderFindReport.decode(json(pagedFindPacket()), info: info,
+            generation: 1, needle: "😀", startAfter: 0)
+        check(first.pageStartAfter == 0 && first.skippedMatches == 0 && first.retainedLimit == 1,
+              "first page lost its declared cursor or effective retained allowance")
+        check(!first.complete && first.hasMoreMatches && first.matchesSeen == 2 && first.hits.count == 1,
+              "page truncation became complete coverage or lost its known later occurrence")
+        check(first.hits[0].occurrence == 1 && first.hits[0].index == 0
+            && first.summary.contains("Matches 1–1"), "first global occurrence mislabeled")
+        let secondPacket = pagedFindPacket(2, startAfter: 1)
+        let second = try AtlasReaderFindReport.decode(json(secondPacket), info: info,
+            generation: 2, needle: "😀", startAfter: 1)
+        check(second.complete && !second.hasMoreMatches && second.skippedMatches == 1
+            && second.matchesSeen == 2 && second.hits[0].occurrence == 2
+            && second.hits[0].index == 0, "second page confused local and global occurrence indexes")
+        let target = second.target(at: 0)!
+        let page = try AtlasReaderPage.decode(json(pagePacket(command: "hit", generation: 2, hit: 1)),
+            info: info, request: .hit(target))
+        let source = AtlasSource(path: "test", text: page.text)
+        check(target.start == 16 && target.end == 20 && target.originalHex == "3dd800de"
+            && page.selection?.utf8Start == 9 && page.selection?.utf8End == 13
+            && source.utf16Range(byteStart: 9, byteEnd: 13) == NSRange(location: 7, length: 2),
+            "later-page source selection/copy borrowed first-page coordinates")
+        let counting = AtlasReaderFindOptions(caseSensitive: true, countAllMatches: true)
+        let counted = try AtlasReaderFindReport.decode(json(pagedFindPacket(options: counting)), info: info,
+            generation: 1, needle: "😀", options: counting, startAfter: 0)
+        check(counted.complete && counted.matchesSeen == 2 && counted.hasMoreMatches && counted.hits.count == 1,
+              "complete count suppressed navigation to omitted rows")
+        let lowercase = AtlasReaderFindOptions(caseSensitive: false, countAllMatches: false)
+        let lower = try AtlasReaderFindReport.decode(json(pagedFindPacket(needle: "ONE", options: lowercase)),
+            info: info, generation: 1, needle: "ONE", options: lowercase, startAfter: 0)
+        check(lower.target(at: 0)?.needle == "one" && lower.target(at: 0)?.originalHex == "6f006e006500",
+              "paged lowercase query replaced original source spelling")
+        let empty = try AtlasReaderFindReport.decode(json(pagedFindPacket(startAfter: 2)), info: info,
+            generation: 1, needle: "😀", startAfter: 2)
+        check(empty.complete && empty.hits.isEmpty && empty.skippedMatches == 2
+            && !empty.hasMoreMatches, "earlier page omissions became phantom future matches")
+        let partial = try AtlasReaderFindReport.decode(json(pagedFindPacket(partial: true)), info: info,
+            generation: 1, needle: "😀", startAfter: 0)
+        check(!partial.complete && !partial.hasMoreMatches && partial.matchesSeen == 1
+            && partial.summary.hasPrefix("Partial"), "unknown remainder became a complete result boundary")
+
+        let invalid: [(String, Any)] = [
+            ("page_start_after", "1"), ("page_start_after", "00"), ("skipped_matches", "1"),
+            ("has_more_matches", false), ("retained_limit", "0"), ("retained_hits", "2"),
+            ("matches_seen", "1"), ("rows_truncated", false), ("match_count_complete", true),
+            ("case_sensitive", false), ("count_all_matches", true), ("search_complete", true)
+        ]
+        for (key, value) in invalid {
+            var bad = pagedFindPacket(); bad[key] = value
+            rejects("inconsistent paging receipt \(key)") {
+                _ = try AtlasReaderFindReport.decode(json(bad), info: info, generation: 1, needle: "😀", startAfter: 0)
+            }
+        }
+        for key in ["page_start_after", "skipped_matches", "has_more_matches", "retained_limit",
+                    "case_sensitive", "count_all_matches", "match_count_complete", "rows_truncated"] {
+            var bad = pagedFindPacket(); bad.removeValue(forKey: key)
+            rejects("missing required paging receipt \(key)") {
+                _ = try AtlasReaderFindReport.decode(json(bad), info: info, generation: 1, needle: "😀", startAfter: 0)
+            }
+        }
+        for (key, value) in [("occurrence_id", "1"), ("occurrence_id", "3"), ("hit_index", "1")] {
+            var bad = secondPacket; var rows = bad["hits"] as! [[String: Any]]
+            rows[0][key] = value; bad["hits"] = rows
+            rejects("foreign or noncontiguous page row \(key)") {
+                _ = try AtlasReaderFindReport.decode(json(bad), info: info, generation: 2, needle: "😀", startAfter: 1)
+            }
+        }
+        rejects("wrong requested page cursor accepted") {
+            _ = try AtlasReaderFindReport.decode(json(secondPacket), info: info, generation: 2, needle: "😀", startAfter: 0)
+        }
+        rejects("legacy packet granted paging authority") {
+            _ = try AtlasReaderFindReport.decode(json(findPacket()), info: info, generation: 1, needle: "😀", startAfter: 0)
+        }
+        rejects("unsolicited paging receipt accepted by a legacy host") {
+            _ = try AtlasReaderFindReport.decode(json(pagedFindPacket()), info: info, generation: 1, needle: "😀")
+        }
+        let legacy = try AtlasReaderFindReport.decode(json(findPacket()), info: info, generation: 1, needle: "😀")
+        check(legacy.pageStartAfter == nil && legacy.skippedMatches == 0 && !legacy.hasMoreMatches,
+              "legacy complete reports changed meaning")
+        let driver = Transport()
+        rejects("legacy transport silently restarted a later page at zero") {
+            _ = try driver.search.performFind(7, 1, "😀", 4096, UInt64(sourceBytes.count),
+                options: .init(), startAfter: 1)
+        }
+        check(driver.log.isEmpty, "unsupported paging reached the legacy ABI")
+    }
+
+    @MainActor private static func pagingNavigation() {
+        do {
+            let driver = Transport()
+            let model = AtlasPagedReaderModel(transport: driver.source, search: driver.pagingSearch)
+            model.open(root: "/project", path: "unicode", accessLease: nil)
+            wait("paged model open") { !model.busy && model.page != nil }
+            check(model.canConfigureFind, "paging-only transport lost Find options")
+            model.fileQuery = "😀"; model.find()
+            wait("first occurrence page") { !model.busy && model.findReport?.generation == 1 && model.selectedHitIndex == 0 }
+            check(model.findPositionLabel == "Match 1 of at least 2" && model.matchHex == "3dd800de"
+                && model.nativeSelectionRange == NSRange(location: 0, length: 2), "first paged selection or global label")
+            let beforeStart = driver.log
+            model.moveHit(backwards: true)
+            check(!model.busy && driver.log == beforeStart && model.findReport?.generation == 1,
+                  "first-page Previous wrapped before the total was known")
+            model.moveHit(backwards: false)
+            wait("next page did not reach second global occurrence") {
+                !model.busy && model.findReport?.generation == 2 && model.selectedHitIndex == 0
+            }
+            check(model.findReport?.pageStartAfter == 1 && model.findPositionLabel == "Match 2 of 2"
+                && model.nativeSelectionRange == NSRange(location: 7, length: 2) && model.matchHex == "3dd800de",
+                "later-page native selection/copy or complete count")
+            model.moveHit(backwards: true)
+            wait("previous page did not select its final occurrence") {
+                !model.busy && model.findReport?.generation == 3 && model.selectedHitIndex == 0
+            }
+            check(model.findReport?.pageStartAfter == 0 && model.findPositionLabel == "Match 1 of 2"
+                && model.nativeSelectionRange == NSRange(location: 0, length: 2),
+                "previous-page replay lost exact coordinates or the known immutable total")
+            model.moveHit(backwards: true)
+            wait("known-total Previous did not wrap to final page") {
+                !model.busy && model.findReport?.generation == 4 && model.selectedHitIndex == 0
+            }
+            check(model.findReport?.pageStartAfter == 1 && model.findPositionLabel == "Match 2 of 2",
+                  "known total wrapped within first retained table")
+            model.moveHit(backwards: false)
+            wait("final-page Next did not wrap to first page") {
+                !model.busy && model.findReport?.generation == 5 && model.selectedHitIndex == 0
+            }
+            check(model.findReport?.pageStartAfter == 0 && model.findPositionLabel == "Match 1 of 2",
+                  "end wrap lost the global occurrence count")
+            check(driver.log.filter { $0.hasPrefix("page:") } == ["page:1:0", "page:2:1", "page:3:0", "page:4:1", "page:5:0"],
+                  "page navigation reused a generation or wrong skip ordinal")
+            check(driver.log.contains("global-hit:2:1") && driver.log.contains("global-hit:4:1")
+                && !driver.log.contains(where: { $0.hasPrefix("find:") }), "paging bypassed the additive ABI or selected a local index globally")
+            model.close()
+            wait("paged model close") { driver.log.contains("close") }
+            check(driver.log.filter { $0 == "open" }.count == 1, "paging reopened current disk bytes")
+        }
+        do {
+            let driver = Transport()
+            let model = AtlasPagedReaderModel(transport: driver.source, search: driver.pagingSearch)
+            model.open(root: "/project", path: "unicode", accessLease: nil)
+            wait("partial page model open") { !model.busy && model.page != nil }
+            driver.limitNextPage(); model.fileQuery = "😀"; model.find()
+            wait("partial page first occurrence") { !model.busy && model.selectedHitIndex == 0 }
+            let calls = driver.log
+            model.moveHit(backwards: false)
+            check(!model.busy && driver.log == calls && model.findReport?.complete == false
+                && model.findPositionLabel == "Match 1 of at least 1" && model.notice.hasPrefix("Partial"),
+                "partial coverage wrapped or manufactured a later page without evidence")
+            model.close()
+            wait("partial page model close") { driver.log.contains("close") }
+        }
+        do {
+            let driver = Transport()
+            let model = AtlasPagedReaderModel(transport: driver.source, search: driver.pagingSearch)
+            model.open(root: "/project", path: "unicode", accessLease: nil)
+            wait("rejected page model open") { !model.busy && model.page != nil }
+            model.fileQuery = "😀"; model.find()
+            wait("rejected page initial find") { !model.busy && model.selectedHitIndex == 0 }
+            let retained = model.source
+            driver.rejectNextPage(); model.moveHit(backwards: false)
+            check(model.findReport == nil && model.matchHex == nil && model.nativeSelectionRange == nil
+                && model.source === retained, "page attempt kept old hit authority or evicted readable source")
+            wait("bad page receipt did not fail") { !model.busy }
+            check(model.findReport == nil && !model.canMoveHit && model.source === retained
+                && !driver.log.contains("hit:2:0"), "rejected page activated old or unvalidated rows")
+            model.find()
+            wait("Find did not recover after rejected page") {
+                !model.busy && model.findReport?.generation == 3 && model.selectedHitIndex == 0
+            }
+            check(model.matchHex == "3dd800de", "recovery lost exact copy witness")
+            model.close()
+            wait("rejected page model close") { driver.log.contains("close") }
+        }
+        for edit in [false, true] {
+            let driver = Transport()
+            let model = AtlasPagedReaderModel(transport: driver.source, search: driver.pagingSearch)
+            model.open(root: "/project", path: "unicode", accessLease: nil)
+            wait("canceled page model open") { !model.busy && model.page != nil }
+            model.fileQuery = "😀"; model.find()
+            wait("canceled page initial find") { !model.busy && model.selectedHitIndex == 0 }
+            let retained = model.source
+            driver.pauseFind(); model.moveHit(backwards: false)
+            wait("page worker did not pause") { driver.entered.wait(timeout: .now()) == .success }
+            if edit {
+                model.findOptions = .init(caseSensitive: false, countAllMatches: false)
+                model.fileQuery = "ONE"
+            } else { model.cancel() }
+            check(!model.busy && model.findReport == nil && model.matchHex == nil
+                && model.nativeSelectionRange == nil && model.source === retained,
+                "edited or canceled page retained authority or replaced the source")
+            model.find(); driver.gate.signal()
+            wait("replacement query after canceled page did not drain") {
+                !model.busy && model.findReport?.generation == 3 && model.selectedHitIndex == 0
+            }
+            check(!driver.log.contains("hit:2:0") && model.findReport?.pageStartAfter == 0,
+                  "late page published or reused a canceled generation")
+            if edit {
+                check(model.findReport?.needle == "ONE" && driver.log.contains("page-flags:1")
+                    && model.matchHex == "6f006e006500" && model.nativeSelectionRange == NSRange(location: 3, length: 3),
+                    "replacement lowercase page lost options or original UTF-16 spelling")
+            } else {
+                check(model.matchHex == "3dd800de" && model.nativeSelectionRange == NSRange(location: 0, length: 2),
+                      "canceled page replacement selected the wrong occurrence")
+            }
+            model.close()
+            wait("canceled page model close") { driver.log.contains("close") }
+        }
+    }
+
     @MainActor static func main() throws {
         let info = try AtlasReaderInfo.decode(json(header("info")), handle: 7, path: "/project/unicode")
         let report = try AtlasReaderFindReport.decode(json(findPacket()), info: info, generation: 1, needle: "😀")
@@ -390,6 +675,8 @@ private final class Transport: @unchecked Sendable {
             model.close()
             wait("configurable find reader did not retire") { driver.log.contains("close") }
         }
+        try pagingReceipts(info: info)
+        pagingNavigation()
         print("PASS: \(checks) retained-file find, UTF-16 hit, generation, copy and cancellation checks")
     }
 }

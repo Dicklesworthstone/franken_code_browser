@@ -6,9 +6,14 @@ struct AtlasReaderSearchTransport: Sendable {
     let find: @Sendable (UInt64, UInt64, String, UInt64, UInt64) -> String?
     let hit: @Sendable (UInt64, UInt64, UInt64, UInt64) -> String?
     var findWithOptions: (@Sendable (UInt64, UInt64, String, UInt64, UInt64, UInt64) -> String?)? = nil
+    /// Ordinal pages replay the same immutable capture; they do not reopen disk.
+    var findPage: (@Sendable (UInt64, UInt64, String, UInt64, UInt64, UInt64, UInt64) -> String?)? = nil
 
     func performFind(_ handle: UInt64, _ generation: UInt64, _ needle: String,
-                     _ matches: UInt64, _ bytes: UInt64, options: AtlasReaderFindOptions) throws -> String? {
+                     _ matches: UInt64, _ bytes: UInt64, options: AtlasReaderFindOptions,
+                     startAfter: UInt64 = 0) throws -> String? {
+        if let findPage { return findPage(handle, generation, needle, startAfter, matches, bytes, options.flags) }
+        guard startAfter == 0 else { throw AtlasReaderError.unavailable }
         if let findWithOptions { return findWithOptions(handle, generation, needle, matches, bytes, options.flags) }
         guard options == .init() else { throw AtlasReaderError.unavailable }
         return find(handle, generation, needle, matches, bytes)
@@ -56,6 +61,10 @@ struct AtlasReaderFindReport: Sendable {
     let needle: String
     let options: AtlasReaderFindOptions
     let retainedLimit: UInt64
+    /// Nil identifies a legacy, single-table response without paging authority.
+    let pageStartAfter: UInt64?
+    let skippedMatches: UInt64
+    let hasMoreMatches: Bool
     let complete: Bool
     let state: String
     let matchesSeen: UInt64
@@ -88,7 +97,17 @@ struct AtlasReaderFindReport: Sendable {
     }
     var summary: String {
         let comparison = options.caseSensitive ? "exact" : "case-insensitive"
+        if pageStartAfter != nil, let first = hits.first, let last = hits.last {
+            let count = complete ? "\(matchesSeen)" : "at least \(matchesSeen)"
+            let more = hasMoreMatches ? " Next continues to later matches." : ""
+            if complete || state == "match-limit" {
+                return "Matches \(first.occurrence)–\(last.occurrence) of \(count) \(comparison) matches in the retained file.\(more)"
+            }
+        }
         if complete {
+            if pageStartAfter != nil {
+                return "\(matchesSeen) \(comparison) matches counted in the retained file; no matches on this page."
+            }
             if matchesSeen > UInt64(hits.count) {
                 return "\(matchesSeen) \(comparison) matches counted in the retained file; first \(hits.count) retained for navigation."
             }
@@ -107,7 +126,7 @@ struct AtlasReaderFindReport: Sendable {
     }
 
     static func decode(_ json: String?, info: AtlasReaderInfo, generation: UInt64, needle: String,
-                       options: AtlasReaderFindOptions = .init()) throws -> Self {
+                       options: AtlasReaderFindOptions = .init(), startAfter: UInt64? = nil) throws -> Self {
         try validateNeedle(needle)
         let data = try AtlasReaderWire.admit(json, handle: info.identity.owner)
         do {
@@ -132,13 +151,33 @@ struct AtlasReaderFindReport: Sendable {
                   wire.search_complete == (wire.state == "complete-observed-input") else {
                 throw AtlasReaderError.invalidResponse
             }
-            if options != .init() {
+            let skipped: UInt64
+            let more: Bool
+            if let startAfter {
+                guard startAfter <= identity.capturedBytes,
+                      let cursor = wire.page_start_after, AtlasReaderWire.integer(cursor) == startAfter,
+                      let skippedText = wire.skipped_matches,
+                      let actualSkipped = AtlasReaderWire.integer(skippedText),
+                      actualSkipped == min(startAfter, seen),
+                      retained == min(retainedLimit, seen - actualSkipped),
+                      let hasMore = wire.has_more_matches,
+                      hasMore == (seen - actualSkipped > retained),
+                      retainedLimit > 0 else { throw AtlasReaderError.invalidResponse }
+                skipped = actualSkipped
+                more = hasMore
+            } else {
+                guard wire.page_start_after == nil, wire.skipped_matches == nil,
+                      wire.has_more_matches == nil else { throw AtlasReaderError.invalidResponse }
+                skipped = 0
+                more = seen > retained
+            }
+            if options != .init() || startAfter != nil {
                 guard wire.case_sensitive != nil, wire.count_all_matches != nil,
                       wire.retained_limit != nil, wire.match_count_complete == wire.search_complete,
                       wire.rows_truncated == (seen > retained) else { throw AtlasReaderError.invalidResponse }
             }
             if wire.search_complete {
-                guard (options.countAllMatches || seen == retained), wire.unsupported_at == nil,
+                guard (options.countAllMatches || seen - skipped == retained), wire.unsupported_at == nil,
                       scanned == identity.capturedBytes else { throw AtlasReaderError.invalidResponse }
             }
             if let unsupported = wire.unsupported_at {
@@ -168,16 +207,21 @@ struct AtlasReaderFindReport: Sendable {
                 let bytes = options.caseSensitive ? witnessBytes : UInt64(hex.utf8.count / 2)
                 guard AtlasReaderWire.integer(hit.hit_index) == UInt64(index),
                       let occurrence = AtlasReaderWire.integer(hit.occurrence_id),
-                      occurrence > 0,
+                      occurrence > 0, occurrence <= seen,
                       occurrences.insert(occurrence).inserted,
                       range.start < range.end, range.end <= identity.capturedBytes,
                       bytes > 0, bytes <= maximumWitnessBytes,
                       AtlasReaderWire.validHex(hex, bytes: bytes),
                       range.end - range.start == bytes else { throw AtlasReaderError.invalidResponse }
+                if let startAfter {
+                    let (expected, overflow) = startAfter.addingReportingOverflow(UInt64(index) + 1)
+                    guard !overflow, occurrence == expected else { throw AtlasReaderError.invalidResponse }
+                }
                 return Hit(index: UInt64(index), occurrence: occurrence, start: range.start, end: range.end,
                     matchedText: text, originalHex: hex)
             }
             return Self(identity: identity, generation: generation, needle: needle, options: options, retainedLimit: retainedLimit,
+                pageStartAfter: startAfter, skippedMatches: skipped, hasMoreMatches: more,
                 complete: wire.search_complete, state: wire.state, matchesSeen: seen,
                 hits: hits, originalHex: wire.literal_original_hex)
         } catch let error as AtlasReaderError { throw error }
@@ -190,12 +234,15 @@ struct AtlasReaderFindReport: Sendable {
         let search_complete: Bool
         let case_sensitive, count_all_matches, match_count_complete, rows_truncated: Bool?
         let retained_limit: String?
+        let page_start_after, skipped_matches: String?
+        let has_more_matches: Bool?
         let literal_original_hex, unsupported_at: String?
         let hits: [HitWire]
         enum CodingKeys: CodingKey {
             case query_generation, mode, needle, state, scanned_bytes, matches_seen, retained_hits,
                  search_complete, literal_original_hex, unsupported_at, hits,
-                 case_sensitive, count_all_matches, match_count_complete, rows_truncated, retained_limit
+                 case_sensitive, count_all_matches, match_count_complete, rows_truncated, retained_limit,
+                 page_start_after, skipped_matches, has_more_matches
         }
         struct HitWire: Decodable {
             let hit_index, occurrence_id: String
@@ -218,6 +265,9 @@ struct AtlasReaderFindReport: Sendable {
             match_count_complete = try c.decodeIfPresent(Bool.self, forKey: .match_count_complete)
             rows_truncated = try c.decodeIfPresent(Bool.self, forKey: .rows_truncated)
             retained_limit = try c.decodeIfPresent(String.self, forKey: .retained_limit)
+            page_start_after = try c.decodeIfPresent(String.self, forKey: .page_start_after)
+            skipped_matches = try c.decodeIfPresent(String.self, forKey: .skipped_matches)
+            has_more_matches = try c.decodeIfPresent(Bool.self, forKey: .has_more_matches)
             literal_original_hex = try c.decodeIfPresent(String.self, forKey: .literal_original_hex)
             unsupported_at = try c.decodeIfPresent(String.self, forKey: .unsupported_at)
             var rows = try c.nestedUnkeyedContainer(forKey: .hits)

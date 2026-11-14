@@ -121,6 +121,26 @@ pub unsafe extern "C" fn fcb_reader_find_with_options(handle: u64, generation: u
     }))
 }
 
+/// Bounded retained Find page after a count of occurrences, never a byte offset.
+/// Replays the immutable capture from byte zero within max_scan_bytes. Each page
+/// requires a new generation; flags have the same meaning as Find with options.
+/// # Safety
+/// Same foreign-string lifetime contract as fcb_reader_find.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_reader_find_page(handle: u64, generation: u64,
+    needle: *const c_char, start_after: u64, max_matches: u64, max_scan_bytes: u64,
+    flags: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| {
+        if flags & !3 != 0 { return Err(AccessError::InvalidArgument); }
+        let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
+        let options = fcb_app::host::reader::ReaderFindOptions {
+            case_sensitive: flags & 1 == 0, count_all_matches: flags & 2 != 0,
+        };
+        readers.execute(handle, Command::FindPage { generation, needle, start_after,
+            limit: number(max_matches)?, scan_bytes: max_scan_bytes, options }, || false)
+    }))
+}
+
 /// Exact selection plus bounded source context for a retained query occurrence.
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_reader_hit(handle: u64, generation: u64, index: u64, context_bytes: u64) -> *mut c_char {

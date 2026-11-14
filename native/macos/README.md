@@ -1214,19 +1214,38 @@ UTF-8, BOM-marked UTF-16, and original CR/LF/CRLF spellings keep their source-by
 coordinates. **Previous hit**, **Next hit**, and **Copy hit hex** use each hit's
 original spelling and encoded bytes, even after the disk file changes.
 
-Enable **Count all matches** to continue scanning after navigation rows fill.
-The summary reports the full observed count separately from the retained rows;
-byte limits or unsupported text remain explicitly incomplete. Find retains at
-most 4,096 rows, and long Unicode witnesses can lower that limit to bound the
-response. Queries admit at most 4,096 UTF-8 bytes. Editing the query or either
-option immediately revokes the old hit actions and cancels pending publication
-while preserving the readable source page.
+Focus the source text or its Find field to use **⌘F**, **⌘G**, and **⇧⌘G**.
+The commands belong to that reader, including independently pinned readers.
+⌘F selects its query; ⌘G and ⇧⌘G move through its accepted matches. Empty or
+pending reader searches keep those commands local.
 
-The additive `fcb_reader_find_with_options` ABI preserves the original exact
-Find entry point. Host, C-boundary, and native model/decoder cases cover count
-limits, UTF-16, expansion witnesses and stale/canceled requests. The native suite
-is available through `swiftui/tests/test-reader-search.sh`; independent
-strict-RCH execution and physical-Mac qualification remain pending.
+**Next hit** continues beyond the retained row limit by loading another bounded
+page; **Previous hit** returns through earlier pages. The position shows global
+occurrence numbers, not a page-local index. Each page retains at most 4,096
+rows, and long Unicode witnesses can lower that limit to bound the response.
+Pages replay the same immutable capture from byte zero, skipping earlier
+occurrences before retaining witnesses. They do not reread the live file.
+Replay spends the ordinary scan and cancellation budgets, so later pages may
+take longer even though retained result memory stays bounded.
+
+Enable **Count all matches** to continue counting after a page fills. The
+summary distinguishes the full observed count from the current page; byte
+limits or unsupported text remain explicitly incomplete. Navigation wraps
+between the first and last match only after a complete scan has established the
+total. Before then, Previous at the first match stays there; Next continues
+forward. A partial scan never presents its last retained row as the file's final
+match. Queries admit at most 4,096 UTF-8 bytes. Editing the query or either
+option immediately revokes the old hit actions and cancels pending publication.
+Canceling a page request preserves the readable source but revokes its old hit
+actions; use Find to start again.
+
+The additive `fcb_reader_find_page` ABI uses global occurrence offsets and fresh
+query generations. It preserves the original Find and Find-with-options entry
+points. Host, C-boundary, and native model/decoder regressions cover result-page
+boundaries, UTF-16, overlapping matches, lowercase expansion witnesses, and
+stale/canceled requests. The native suites are available through
+`swiftui/tests/test-reader-search.sh` and `swiftui/tests/test-reader-commands.sh`;
+independent strict-RCH execution and physical-Mac qualification remain pending.
 
 ## Selected passages, copying, and notes
 

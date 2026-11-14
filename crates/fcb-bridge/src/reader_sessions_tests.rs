@@ -172,3 +172,72 @@ fn error_handoffs_are_bounded_and_never_success_shaped() {
         assert!(!json.as_bytes().contains(&0)); assert!(json.ends_with("}\n"));
     }
 }
+
+#[test]
+fn find_pages_preserve_overlapping_ordinals_and_replace_only_their_own_hit_table() {
+    let sessions = ReaderSessions::new(); let h = sessions.create().unwrap();
+    sessions.supply(h, b"aaaaa").unwrap();
+    let options = ReaderFindOptions::default();
+    let first = sessions.execute(h, Command::FindPage { generation: 1, needle: "aa",
+        start_after: 0, limit: 1, scan_bytes: 100, options }, || false).unwrap();
+    assert!(first.as_str().contains("\"page_start_after\":\"0\""));
+    assert!(first.as_str().contains("\"skipped_matches\":\"0\""));
+    assert!(first.as_str().contains("\"matches_seen\":\"2\""));
+    assert!(first.as_str().contains("\"has_more_matches\":true"));
+    let next = sessions.execute(h, Command::FindPage { generation: 2, needle: "aa",
+        start_after: 1, limit: 1, scan_bytes: 100, options }, || false).unwrap();
+    assert!(next.as_str().contains("\"page_start_after\":\"1\""));
+    assert!(next.as_str().contains("\"skipped_matches\":\"1\""));
+    assert!(next.as_str().contains("\"matches_seen\":\"3\""));
+    assert!(next.as_str().contains("\"retained_hits\":\"1\""));
+    assert!(next.as_str().contains("\"occurrence_id\":\"2\""));
+    assert!(next.as_str().contains("\"original_range\":{\"start\":\"1\",\"end\":\"3\"}"));
+    assert!(sessions.execute(h, Command::CopyHit { generation: 1, index: 0 }, || false)
+        .err().unwrap().to_string().contains("READER_SESSION_STALE_QUERY"));
+    let selected = sessions.execute(h, Command::Hit { generation: 2, index: 0, context: 32 },
+        || false).unwrap();
+    assert!(selected.as_str().contains("\"original_range\":{\"start\":\"1\",\"end\":\"3\"}"));
+    let beyond = sessions.execute(h, Command::FindPage { generation: 3, needle: "aa",
+        start_after: 5, limit: 1, scan_bytes: 100, options }, || false).unwrap();
+    assert!(beyond.as_str().contains("\"page_start_after\":\"5\""));
+    assert!(beyond.as_str().contains("\"skipped_matches\":\"4\""));
+    assert!(beyond.as_str().contains("\"matches_seen\":\"4\""));
+    assert!(beyond.as_str().contains("\"retained_hits\":\"0\""));
+    assert!(beyond.as_str().contains("\"has_more_matches\":false"));
+    assert!(beyond.as_str().contains("\"search_complete\":true"));
+    sessions.close(h).unwrap();
+}
+
+#[test]
+fn canceled_find_page_keeps_the_previously_accepted_page_selectable() {
+    let sessions = ReaderSessions::new(); let h = sessions.create().unwrap();
+    sessions.supply(h, b"aaaaa").unwrap();
+    let options = ReaderFindOptions::default();
+    sessions.execute(h, Command::FindPage { generation: 1, needle: "aa",
+        start_after: 0, limit: 1, scan_bytes: 100, options }, || false).unwrap();
+    let entered = Barrier::new(2); let release = Barrier::new(2);
+    std::thread::scope(|scope| {
+        let job = scope.spawn(|| {
+            let mut first = true;
+            sessions.execute(h, Command::FindPage { generation: 2, needle: "aa",
+                start_after: 1, limit: 1, scan_bytes: 100, options }, || {
+                if first { first = false; entered.wait(); release.wait(); }
+                false
+            })
+        });
+        entered.wait();
+        let canceled = sessions.cancel(h);
+        release.wait();
+        assert!(canceled.is_ok());
+        assert_eq!(job.join().unwrap().err(), Some(AccessError::Canceled));
+    });
+    let old = sessions.execute(h, Command::CopyHit { generation: 1, index: 0 }, || false).unwrap();
+    assert!(old.as_str().contains("\"original_hex\":\"6161\""));
+    assert!(sessions.execute(h, Command::FindPage { generation: 2, needle: "aa",
+        start_after: 1, limit: 1, scan_bytes: 100, options }, || false)
+        .err().unwrap().to_string().contains("READER_SESSION_STALE_QUERY"));
+    let retry = sessions.execute(h, Command::FindPage { generation: 3, needle: "aa",
+        start_after: 1, limit: 1, scan_bytes: 100, options }, || false).unwrap();
+    assert!(retry.as_str().contains("\"original_range\":{\"start\":\"1\",\"end\":\"3\"}"));
+    sessions.close(h).unwrap();
+}

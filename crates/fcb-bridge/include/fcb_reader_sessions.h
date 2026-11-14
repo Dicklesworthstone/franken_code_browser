@@ -104,6 +104,29 @@ char *fcb_reader_find(uint64_t handle, uint64_t generation, const char *needle,
  * Cancellation/failure preserves the previously accepted query and capture. */
 char *fcb_reader_find_with_options(uint64_t handle, uint64_t generation,
     const char *needle, uint64_t max_matches, uint64_t max_scan_bytes, uint64_t flags);
+/* Page through literal occurrences without retaining every earlier row.
+ * start_after is an occurrence count (0 selects the first page), NOT a source
+ * byte offset; it must not exceed captured_bytes. Overlapping matches keep
+ * their ordinary stream order. Each request replays the same immutable capture
+ * from byte 0; max_scan_bytes includes the work spent skipping earlier matches.
+ * No live-path read or source-byte cursor can replace this capture replay.
+ *
+ * flags and upper row/needle limits match find_with_options; max_matches=0
+ * requires COUNT_ALL for every paged query. Each attempted page requires a
+ * strictly newer generation, even when needle/options are unchanged.
+ * Acceptance replaces retained rows: index 0 now means this page's
+ * first row, and old generations cannot select or copy any of the new rows.
+ * Failed/canceled pages preserve previously accepted rows.
+ *
+ * Responses add page_start_after (requested ordinal), skipped_matches (actual
+ * occurrences skipped) and has_more_matches (a later occurrence was observed).
+ * matches_seen remains GLOBAL from capture start, including skipped matches;
+ * retained_hits counts only this page. COUNT_ALL may finish counting beyond it.
+ * has_more_matches=false alone is not an exhaustive-search claim: always inspect
+ * search_complete/match_count_complete and the scan state. An ordinal beyond
+ * the final occurrence yields an empty page when the scan reaches the end. */
+char *fcb_reader_find_page(uint64_t handle, uint64_t generation, const char *needle,
+    uint64_t start_after, uint64_t max_matches, uint64_t max_scan_bytes, uint64_t flags);
 char *fcb_reader_hit(uint64_t handle, uint64_t generation, uint64_t index, uint64_t context_bytes);
 
 /* Exact byte exports as JSON hex; no clipboard or filesystem write. The range

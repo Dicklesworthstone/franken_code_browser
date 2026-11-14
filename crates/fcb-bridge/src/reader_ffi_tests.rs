@@ -235,9 +235,88 @@ fn c_symbol_function_types_match_the_public_header() {
     let _: extern "C" fn(u64, u64, u64, u64, u64) -> *mut c_char = fcb_reader_position;
     let _: unsafe extern "C" fn(u64, u64, *const c_char, u64, u64) -> *mut c_char = fcb_reader_find;
     let _: unsafe extern "C" fn(u64, u64, *const c_char, u64, u64, u64) -> *mut c_char = fcb_reader_find_with_options;
+    let _: unsafe extern "C" fn(u64, u64, *const c_char, u64, u64, u64, u64) -> *mut c_char = fcb_reader_find_page;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_reader_hit;
     let _: extern "C" fn(u64, u64, u64) -> *mut c_char = fcb_reader_copy_range;
     let _: extern "C" fn(u64, u64, u64) -> *mut c_char = fcb_reader_copy_hit;
     let _: extern "C" fn(u64) -> u8 = fcb_reader_cancel;
     let _: extern "C" fn(u64) -> u8 = fcb_reader_close;
+}
+
+#[test]
+fn c_find_pages_keep_global_counts_and_original_utf16_spelling_after_disk_changes() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let bytes: Vec<u8> = "\u{feff}K K k K\r\n".encode_utf16().flat_map(u16::to_be_bytes).collect();
+    let (path, cpath) = file(&bytes);
+    let handle = open(&cpath);
+    fs::write(path, b"changed live source").unwrap();
+    let first = {
+        let needle = CString::new("k").unwrap();
+        take(unsafe { fcb_reader_find_page(handle, 1, needle.as_ptr(), 0, 1, 100, 1) })
+    };
+    assert!(first.contains("\"has_more_matches\":true"), "{first}");
+    assert!(first.contains("\"matched_text\":\"K\""));
+    assert!(first.contains("\"original_hex\":\"212a\""));
+    assert!(take(fcb_reader_copy_hit(handle, 1, 0)).contains("\"original_hex\":\"212a\""));
+    let page = {
+        let needle = CString::new("k").unwrap();
+        take(unsafe { fcb_reader_find_page(handle, 2, needle.as_ptr(), 1, 1, 100, 3) })
+    }; // Retained occurrences never borrow the foreign needle.
+    assert!(page.contains("\"page_start_after\":\"1\""), "{page}");
+    assert!(page.contains("\"skipped_matches\":\"1\""));
+    assert!(page.contains("\"matches_seen\":\"4\""));
+    assert!(page.contains("\"retained_hits\":\"1\""));
+    assert!(page.contains("\"occurrence_id\":\"2\""));
+    assert!(page.contains("\"has_more_matches\":true"));
+    assert!(page.contains("\"match_count_complete\":true"));
+    assert!(page.contains("\"search_complete\":true"));
+    assert!(page.contains("\"matched_text\":\"K\""));
+    assert!(page.contains("\"original_hex\":\"004b\""));
+    assert!(page.contains("\"original_range\":{\"start\":\"6\",\"end\":\"8\"}"));
+    assert!(take(fcb_reader_copy_hit(handle, 1, 0)).contains("READER_SESSION_STALE_QUERY"));
+    assert!(take(fcb_reader_copy_hit(handle, 2, 0)).contains("\"original_hex\":\"004b\""));
+    let selected = take(fcb_reader_hit(handle, 2, 0, 64));
+    assert!(selected.contains("K K k K\\r\\n"));
+    assert!(selected.contains("\"additional_source_bytes_read\":\"0\""));
+    assert_eq!(fcb_reader_close(handle), 1);
+}
+
+#[test]
+fn c_find_page_boundaries_and_invalid_flags_preserve_accepted_rows() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (_, path) = file(b"aaaaa"); let handle = open(&path);
+    let needle = CString::new("aa").unwrap();
+    let accepted = take(unsafe { fcb_reader_find_page(handle, 1, needle.as_ptr(), 1, 1, 100, 0) });
+    assert!(accepted.contains("\"status\":\"ok\""), "{accepted}");
+    assert!(take(unsafe { fcb_reader_find_page(handle, 2, needle.as_ptr(), 1, 1, 100, 4) })
+        .contains("READER_HANDLE_INVALID_ARGUMENT"));
+    assert!(take(unsafe { fcb_reader_find_page(handle, 2, std::ptr::null(), 1, 1, 100, 0) })
+        .contains("READER_HANDLE_INVALID_ARGUMENT"));
+    for (start_after, limit) in [(u64::MAX, 1), (1, u64::MAX), (1, 0)] {
+        let rejected = take(unsafe { fcb_reader_find_page(handle, 2, needle.as_ptr(),
+            start_after, limit, 100, 0) });
+        assert!(rejected.contains("\"status\":\"error\""), "{rejected}");
+        assert!(take(fcb_reader_copy_hit(handle, 1, 0)).contains("\"original_hex\":\"6161\""));
+    }
+    let empty = take(unsafe { fcb_reader_find_page(handle, 3, needle.as_ptr(), 5, 1, 100, 0) });
+    assert!(empty.contains("\"page_start_after\":\"5\""), "{empty}");
+    assert!(empty.contains("\"skipped_matches\":\"4\""));
+    assert!(empty.contains("\"matches_seen\":\"4\""));
+    assert!(empty.contains("\"retained_hits\":\"0\""));
+    assert!(empty.contains("\"has_more_matches\":false"));
+    assert!(empty.contains("\"search_complete\":true"));
+    assert!(take(fcb_reader_copy_hit(handle, 3, 0)).contains("READER_SESSION_MISSING_HIT"));
+    let count = take(unsafe { fcb_reader_find_page(handle, 4, needle.as_ptr(), 2, 0, 100, 2) });
+    assert!(count.contains("\"skipped_matches\":\"2\""), "{count}");
+    assert!(count.contains("\"matches_seen\":\"4\""));
+    assert!(count.contains("\"retained_hits\":\"0\""));
+    assert!(count.contains("\"has_more_matches\":true"));
+    assert!(count.contains("\"match_count_complete\":true"));
+    let partial = take(unsafe { fcb_reader_find_page(handle, 5, needle.as_ptr(), 2, 1, 1, 0) });
+    assert!(partial.contains("\"search_complete\":false"), "{partial}");
+    assert!(partial.contains("\"retained_hits\":\"0\""));
+    assert!(partial.contains("\"has_more_matches\":false"));
+    assert_eq!(fcb_reader_close(handle), 1);
+    assert!(take(unsafe { fcb_reader_find_page(handle, 6, needle.as_ptr(), 0, 1, 100, 0) })
+        .contains("READER_HANDLE_UNKNOWN"));
 }

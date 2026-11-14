@@ -81,6 +81,8 @@ pub(super) enum Command<'a> {
     Find { generation: u64, needle: &'a str, limit: usize, scan_bytes: u64 },
     FindWithOptions { generation: u64, needle: &'a str, limit: usize, scan_bytes: u64,
         options: ReaderFindOptions },
+    FindPage { generation: u64, needle: &'a str, start_after: u64, limit: usize,
+        scan_bytes: u64, options: ReaderFindOptions },
     Hit { generation: u64, index: usize, context: usize },
     CopyRange { start: u64, end: u64 },
     ResolveSelection { window_start: u64, window_end: u64, utf8_start: u64, utf8_end: u64 },
@@ -319,6 +321,8 @@ impl ReaderSessions {
             Command::Find { generation, needle, limit, scan_bytes } => reader.search(generation, needle, limit, scan_bytes, &mut stop),
             Command::FindWithOptions { generation, needle, limit, scan_bytes, options } =>
                 reader.search_with_options(generation, needle, limit, scan_bytes, options, &mut stop),
+            Command::FindPage { generation, needle, start_after, limit, scan_bytes, options } =>
+                reader.search_page(generation, needle, start_after, limit, scan_bytes, options, &mut stop),
             Command::Hit { generation, index, context } => reader.hit_window(generation, index, context, &mut stop),
             Command::CopyRange { start, end } => reader.copy_range(start, end, &mut stop),
             Command::ResolveSelection { window_start, window_end, utf8_start, utf8_end } =>

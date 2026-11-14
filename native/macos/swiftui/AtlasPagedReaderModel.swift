@@ -38,6 +38,8 @@ import Observation
     }
     private(set) var findReport: AtlasReaderFindReport?
     private(set) var selectedHitIndex: Int?
+    /// A complete count stays valid while paging this same immutable query.
+    private var knownFindMatchCount: UInt64?
     private var selectedRange: NSRange?
     private(set) var textSelection: AtlasReaderTextSelection?
     private(set) var resolvingTextSelection = false
@@ -148,6 +150,13 @@ import Observation
         findReport?.needle.utf8.elementsEqual(fileQuery.utf8) == true && findReport?.options == findOptions
     }
     var canMoveHit: Bool { findIsCurrent && findReport?.hits.isEmpty == false && !busy }
+    var findPositionLabel: String? {
+        guard findIsCurrent, let report = findReport, let index = selectedHitIndex,
+              report.hits.indices.contains(index) else { return nil }
+        let ordinal = report.hits[index].occurrence
+        if let total = knownFindMatchCount { return "Match \(ordinal) of \(total)" }
+        return "Match \(ordinal) of at least \(report.matchesSeen)"
+    }
     var nativeSelectionRange: NSRange? {
         if let position = page?.position { return position.nativeCaretRange }
         if findIsCurrent, page?.selection?.target.generation == findReport?.generation,
@@ -439,6 +448,7 @@ import Observation
                             read: { try await coordinator.read(.hit($0)) })
                         guard operation == ticket, !Task.isCancelled else { return }
                         findReport = selected.report
+                        knownFindMatchCount = selected.report.complete ? selected.report.matchesSeen : nil
                         selectedHitIndex = selected.index
                         install(selected.page, request: .hit(selected.target))
                     } else if target.mode == .occurrences {
@@ -691,6 +701,7 @@ import Observation
                 guard operation == ticket, !Task.isCancelled, fileQuery.utf8.elementsEqual(needle.utf8),
                       findOptions == options else { return }
                 findReport = report
+                knownFindMatchCount = report.complete ? report.matchesSeen : nil
                 finish(ticket)
                 notice = report.summary
                 if !report.hits.isEmpty { moveHit(backwards: false) }
@@ -699,7 +710,7 @@ import Observation
     }
     func clearFileSearch() {
         if queryWork { cancel() }
-        findReport = nil; selectedHitIndex = nil
+        findReport = nil; selectedHitIndex = nil; knownFindMatchCount = nil
         if page?.selection != nil { selectedRange = nil }
         coordinator.clearFind()
     }
@@ -708,10 +719,69 @@ import Observation
         let count = report.hits.count
         let index: Int
         if let selected = selectedHitIndex {
+            if let start = report.pageStartAfter, coordinator.supportsFindPages {
+                if backwards && selected == 0 {
+                    if start > 0 {
+                        loadFindPage(startAfter: start > report.retainedLimit ? start - report.retainedLimit : 0,
+                                     backwards: true)
+                        return
+                    }
+                    if let total = knownFindMatchCount, total > UInt64(count) {
+                        let lastPage = ((total - 1) / report.retainedLimit) * report.retainedLimit
+                        loadFindPage(startAfter: lastPage, backwards: true)
+                        return
+                    }
+                    // Until EOF establishes the total, wrapping would silently
+                    // treat this bounded page as the complete result set.
+                    if report.hasMoreMatches || !report.complete {
+                        notice = "At the first match. Continue forward to reach later matches."
+                        return
+                    }
+                } else if !backwards && selected == count - 1 {
+                    if report.hasMoreMatches, let last = report.hits.last {
+                        loadFindPage(startAfter: last.occurrence, backwards: false)
+                        return
+                    }
+                    guard report.complete else {
+                        notice = report.summary
+                        return
+                    }
+                    if start > 0 {
+                        loadFindPage(startAfter: 0, backwards: false)
+                        return
+                    }
+                }
+            }
             index = backwards ? (selected == 0 ? count - 1 : selected - 1) : (selected == count - 1 ? 0 : selected + 1)
         } else { index = backwards ? count - 1 : 0 }
         guard let target = report.target(at: index) else { return }
         navigate(.hit(target), hitIndex: index)
+    }
+
+    /// One retained result page at a time. Replaying the prefix spends the
+    /// normal scan budget and uses a fresh generation; source bytes stay fixed.
+    private func loadFindPage(startAfter: UInt64, backwards: Bool) {
+        guard canMoveHit, coordinator.supportsFindPages else { return }
+        let needle = fileQuery
+        let options = findOptions
+        // A host may accept a new generation before Swift rejects its receipt.
+        // Revoke old rows now, including on cancellation or decode failure.
+        findReport = nil; selectedHitIndex = nil; selectedRange = nil
+        coordinator.clearFind()
+        let ticket = begin(query: true)
+        notice = "Loading more matches from the retained file…"
+        task = Task {
+            do {
+                let report = try await coordinator.find(needle, options: options, startAfter: startAfter)
+                guard operation == ticket, !Task.isCancelled, fileQuery.utf8.elementsEqual(needle.utf8),
+                      findOptions == options else { return }
+                findReport = report
+                if report.complete { knownFindMatchCount = report.matchesSeen }
+                finish(ticket)
+                notice = report.summary
+                if !report.hits.isEmpty { moveHit(backwards: backwards) }
+            } catch { fail(error, ticket: ticket) }
+        }
     }
 
     /// Extract once, independently of literal search. Unsupported or oversized
@@ -898,7 +968,7 @@ import Observation
         isRefreshing = false; refreshedFromDisk = false; forkedCapture = false
         retainedOnly = false
         page = nil; source = nil; history.reset()
-        findReport = nil; selectedHitIndex = nil; selectedRange = nil
+        findReport = nil; selectedHitIndex = nil; selectedRange = nil; knownFindMatchCount = nil
         queryWork = false; outlineWork = false; referenceWork = false; positionWork = false
         fileQuery = ""
         outlinePage = nil; hasOutline = false; outlineRowsAuthorized = false

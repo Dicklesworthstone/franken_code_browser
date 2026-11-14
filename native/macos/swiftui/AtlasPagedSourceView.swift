@@ -470,6 +470,10 @@ import AppKit
                 .help("Read source and Markdown side by side from one retained capture; each pane scrolls independently")
                 Button("Previous hit") { model.moveHit(backwards: true) }.disabled(!model.canMoveHit)
                 Button("Next hit") { model.moveHit(backwards: false) }.disabled(!model.canMoveHit)
+                if let position = model.findPositionLabel {
+                    Text(position).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        .accessibilityLabel(position)
+                }
                 if model.matchHex != nil {
                     Button("Copy hit hex") {
                         guard let hex = model.matchHex else { return }
