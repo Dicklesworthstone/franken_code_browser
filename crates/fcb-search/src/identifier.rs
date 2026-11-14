@@ -7,6 +7,8 @@
 //! conservatively, including combining marks and punctuation. Matching is exact
 //! and case-sensitive; there is no normalization or Unicode identifier claim.
 
+use std::borrow::Cow;
+
 pub const MAX_IDENTIFIER_BYTES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,7 +34,7 @@ pub fn validate_identifier(name: &str) -> Result<(), InvalidIdentifier> {
 /// cancellation. A successful `push` closes the preceding token on a delimiter.
 /// Call `finish` only at an actual end of input, never a chunk or budget boundary.
 pub struct IdentifierCursor<'name> {
-    name: &'name str,
+    name: Cow<'name, str>,
     in_token: bool,
     matched: usize,
     rejected: bool,
@@ -41,7 +43,13 @@ pub struct IdentifierCursor<'name> {
 impl<'name> IdentifierCursor<'name> {
     pub fn new(name: &'name str) -> Result<Self, InvalidIdentifier> {
         validate_identifier(name)?;
-        Ok(Self { name, in_token: false, matched: 0, rejected: false })
+        Ok(Self { name: Cow::Borrowed(name), in_token: false, matched: 0, rejected: false })
+    }
+
+    /// Transfer an already admitted bounded name into a resumable worker.
+    pub fn new_owned(name: String) -> Result<IdentifierCursor<'static>, InvalidIdentifier> {
+        validate_identifier(&name)?;
+        Ok(IdentifierCursor { name: Cow::Owned(name), in_token: false, matched: 0, rejected: false })
     }
 
     pub const fn in_token(&self) -> bool { self.in_token }

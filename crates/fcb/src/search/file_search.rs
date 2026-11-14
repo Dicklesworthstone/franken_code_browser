@@ -7,7 +7,7 @@
 //! length/mtime are checked again on completion. Matching reads are a continuous
 //! observed sequence, not an atomic snapshot or a promise of rereadable holes.
 
-use std::{fs::{File, Metadata}, io::{self, Read}, time::SystemTime};
+use std::{fs::{File, Metadata}, io::{self, Read}, sync::Arc, time::SystemTime};
 use fcb_core::{ByteLength, QueryGeneration, ResourceAllocationId, ResourceBudget};
 use fcb_source::{CaptureRequest, SourceError};
 use super::{ExtentConsistency, ExtentError, ObservedExtent};
@@ -87,6 +87,21 @@ impl<'needle> FileSearch<'needle> {
         let search = ReaderSearch::new_page(input, request, ByteLength::new(before.length), needle,
             options, skip_matches, count_all_matches, budget, allocation)?;
         Ok(Self { search, before })
+    }
+    /// Keep compiled-pattern authority alive across independently scheduled
+    /// bounded steps without borrowing the host session that owns this worker.
+    /// Finished reports retain the same authority and exact witness semantics.
+    pub fn new_owned_page(file: File, request: CaptureRequest, needle: Arc<StreamingNeedle>,
+        options: StreamReadOptions, skip_matches: u64, count_all_matches: bool,
+        budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<FileSearch<'static>, FileSearchError> {
+        if !cfg!(unix) { return Err(FileSearchError::UnsupportedPlatform); }
+        let metadata = file.metadata().map_err(|_| SourceError::CaptureUnavailable)?;
+        if !metadata.is_file() { return Err(SourceError::SpecialObject.into()); }
+        let before = Stamp::from_metadata(&metadata);
+        let input = PositionedInput { file, offset: 0 };
+        let search = ReaderSearch::new_owned_page(input, request, ByteLength::new(before.length), needle,
+            options, skip_matches, count_all_matches, budget, allocation)?;
+        Ok(FileSearch { search, before })
     }
     pub fn state(&self) -> StreamReadState { self.search.state() }
     pub fn stats(&self) -> StreamReadStats { self.search.stats() }

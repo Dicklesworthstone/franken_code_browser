@@ -7,6 +7,8 @@
 //! number of calls, including calls ending in the middle of a match. No source
 //! stitching or repository-sized occurrence list is constructed.
 
+use std::borrow::Cow;
+
 /// Admission limits for one cursor and one cooperative execution quantum.
 pub const MAX_STREAM_NEEDLE_BYTES: usize = 65_536;
 pub const MAX_STREAM_STEP_BYTES: usize = 65_536;
@@ -69,7 +71,7 @@ pub struct ByteSearchBatch {
 /// publishing a batch. Call [`Self::cancel`] when a query is superseded.
 #[derive(Debug)]
 pub struct ByteSearchCursor<'needle> {
-    needle: &'needle [u8],
+    needle: Cow<'needle, [u8]>,
     failure: Vec<usize>,
     matched: usize,
     scanned: u64,
@@ -79,6 +81,22 @@ pub struct ByteSearchCursor<'needle> {
 
 impl<'needle> ByteSearchCursor<'needle> {
     pub fn new(needle: &'needle [u8]) -> Result<Self, StreamError> {
+        Self::with_needle(Cow::Borrowed(needle))
+    }
+
+    /// Own a bounded copy of the pattern so a resumable worker can outlive the
+    /// caller's pattern borrow. Input bytes are still never retained here.
+    pub fn new_owned(needle: &[u8]) -> Result<ByteSearchCursor<'static>, StreamError> {
+        if needle.is_empty() { return Err(StreamError::EmptyNeedle); }
+        if needle.len() > MAX_STREAM_NEEDLE_BYTES { return Err(StreamError::NeedleTooLong); }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(needle.len()).map_err(|_| StreamError::AllocationFailed)?;
+        if bytes.capacity() > needle.len() { return Err(StreamError::AllocationFailed); }
+        bytes.extend_from_slice(needle);
+        ByteSearchCursor::with_needle(Cow::Owned(bytes))
+    }
+
+    fn with_needle(needle: Cow<'needle, [u8]>) -> Result<Self, StreamError> {
         if needle.is_empty() {
             return Err(StreamError::EmptyNeedle);
         }

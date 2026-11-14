@@ -19,7 +19,7 @@
 //! Expressions feed bounded predicate cursors from the same validated observation
 //! and withhold primary witnesses until the entire declared input qualifies.
 
-use std::{io::{self, Read}, mem::size_of};
+use std::{io::{self, Read}, mem::size_of, ops::Deref, sync::Arc};
 use fcb_core::{ArenaOwnerId, ByteLength, ByteOffset, ByteRange, DecodedUtf8Offset, FileId, QueryGeneration,
     ResourceAllocationId, ResourceBudget, ResourceLease, SourceRevision};
 use fcb_source::{CaptureEncodingMap, CaptureRequest, DetectedEncoding, MappingSpan, SourceError, SpanKind, detect_encoding};
@@ -244,9 +244,51 @@ struct IdentifierWork<'needle> {
 /// consume exactly that prefix/scalar progress, with cancellation checkpoints.
 /// Interrupted calls spend call budget.
 /// A foreign blocking Read implementation has no invented wall-clock deadline.
+enum NeedleBacking<'needle> {
+    Borrowed(&'needle StreamingNeedle),
+    Owned(Arc<StreamingNeedle>),
+}
+impl Deref for NeedleBacking<'_> {
+    type Target = StreamingNeedle;
+    fn deref(&self) -> &Self::Target {
+        match self { Self::Borrowed(needle) => needle, Self::Owned(needle) => needle }
+    }
+}
+impl<'needle> NeedleBacking<'needle> {
+    fn cursor(&self, encoding: Option<DetectedEncoding>) -> Result<ByteSearchCursor<'needle>, StreamReadError> {
+        Ok(match self {
+            Self::Borrowed(needle) => ByteSearchCursor::new(needle.encoded(encoding))?,
+            Self::Owned(needle) => ByteSearchCursor::new_owned(needle.encoded(encoding))?,
+        })
+    }
+    fn identifier(&self) -> Result<IdentifierCursor<'needle>, StreamReadError> {
+        match self {
+            Self::Borrowed(needle) => IdentifierCursor::new(needle.text_value()
+                .ok_or(StreamReadError::InvalidIdentifier)?).map_err(|_| StreamReadError::InvalidIdentifier),
+            Self::Owned(needle) => {
+                let text = needle.text_value().ok_or(StreamReadError::InvalidIdentifier)?;
+                let mut owned = String::new();
+                owned.try_reserve_exact(text.len()).map_err(|_| StreamReadError::AllocationFailed)?;
+                if owned.capacity() > text.len() { return Err(StreamReadError::AllocationFailed); }
+                owned.push_str(text);
+                IdentifierCursor::new_owned(owned).map_err(|_| StreamReadError::InvalidIdentifier)
+            }
+        }
+    }
+    fn expression(&self, encoding: DetectedEncoding) -> Result<Option<ExpressionWork<'needle>>, StreamReadError> {
+        match self {
+            Self::Borrowed(needle) => needle.expression.as_ref()
+                .map(|expression| ExpressionWork::new(expression, needle.mode, encoding)).transpose(),
+            Self::Owned(needle) => needle.expression.as_ref()
+                .map(|expression| ExpressionWork::new_owned(expression, needle.mode, encoding)).transpose(),
+        }
+    }
+}
+
 pub struct ReaderSearch<'needle, R: Read> {
     reader: R,
-    needle: &'needle StreamingNeedle,
+    needle: NeedleBacking<'needle>,
+    expression_enabled: bool,
     request: CaptureRequest,
     length: ByteLength,
     options: StreamReadOptions,
@@ -306,6 +348,23 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
         needle: &'needle StreamingNeedle, options: StreamReadOptions,
         skip_matches: u64, count_all_matches: bool,
         budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
+        Self::with_needle(reader, request, length, NeedleBacking::Borrowed(needle), options,
+            skip_matches, count_all_matches, budget, allocation)
+    }
+    /// Own shared compiled-pattern authority across resumable host calls.
+    /// Cursor patterns are bounded independent copies; the compiled pattern's
+    /// original lease stays alive through the worker and its finished report.
+    pub fn new_owned_page(reader: R, request: CaptureRequest, length: ByteLength,
+        needle: Arc<StreamingNeedle>, options: StreamReadOptions,
+        skip_matches: u64, count_all_matches: bool,
+        budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<ReaderSearch<'static, R>, StreamReadError> {
+        ReaderSearch::with_needle(reader, request, length, NeedleBacking::Owned(needle), options,
+            skip_matches, count_all_matches, budget, allocation)
+    }
+    fn with_needle(reader: R, request: CaptureRequest, length: ByteLength,
+        needle: NeedleBacking<'needle>, options: StreamReadOptions,
+        skip_matches: u64, count_all_matches: bool,
+        budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
         if request.file().owner() != needle.owner || options.generation.owner() != needle.owner {
             return Err(StreamReadError::OwnerMismatch);
         }
@@ -330,25 +389,30 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
             + options.max_matches * size_of::<StreamingHit>()
             + MAX_STREAM_STEP_HITS * size_of::<fcb_search::stream::ByteMatch>())
             .checked_add(lowercase_charge)
+            // Owning cursors copy only query data, never source data. Include
+            // all encoded predicate alternatives and transient string storage.
+            .and_then(|n| n.checked_add(if matches!(needle, NeedleBacking::Owned(_)) {
+                MAX_STREAM_NEEDLE_BYTES * 2 + fcb_search::MAX_QUERY_LEN * 8
+            } else { 0 }))
             .and_then(|n| n.checked_add(if needle.is_expression() { ExpressionWork::charge() } else { 0 }))
             .ok_or(StreamReadError::InvalidLimits)?;
         let lease = budget.try_reserve_managed(needle.owner, allocation, ByteLength::new(charge as u64))
             .map_err(|_| StreamReadError::ResourceDenied)?;
         let mut buffer = reserve(STREAM_BUFFER_BYTES)?;
         buffer.resize(STREAM_BUFFER_BYTES, 0);
-        let cursor = if needle.mode == StreamingMode::OriginalBytes { Some(ByteSearchCursor::new(&needle.utf8)?) } else { None };
+        let cursor = if needle.mode == StreamingMode::OriginalBytes { Some(needle.cursor(None)?) } else { None };
         let lowercase = if needle.mode == StreamingMode::LowercaseText {
             Some(LowercaseWork { cursor: NormalizedCursor::new(needle.text_value().ok_or(StreamReadError::InvalidLimits)?,
                 lowercase_mode()).map_err(|_| StreamReadError::AllocationFailed)?
                     .ok_or(StreamReadError::InvalidLimits)?, window: None, decoded_base: 0, position: 0, pending: None })
         } else { None };
         let identifier = if needle.mode == StreamingMode::Identifier {
-            Some(IdentifierWork { cursor: IdentifierCursor::new(needle.text_value()
-                .ok_or(StreamReadError::InvalidIdentifier)?).map_err(|_| StreamReadError::InvalidIdentifier)?,
+            Some(IdentifierWork { cursor: needle.identifier()?,
                 window: None, decoded_base: 0, position: 0, token_start: 0, token_end: 0 })
         } else { None };
         let witnesses = reserve(if lowercase.is_some() { options.max_matches } else { 0 })?;
-        let mut search = Self { reader, needle, request, length, options, count_all_matches, skip_matches, encoding: options.encoding,
+        let expression_enabled = needle.is_expression();
+        let mut search = Self { reader, needle, expression_enabled, request, length, options, count_all_matches, skip_matches, encoding: options.encoding,
             header: 0, initialized: cursor.is_some(), cursor, expression: None, expression_qualified: None,
             lowercase, identifier, witnesses,
             buffer, base: 0, filled: 0, ready: 0, consumed: 0, eof: false,
@@ -374,10 +438,10 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
         else { &self.hits }
     }
     pub const fn matches_seen(&self) -> u64 {
-        if self.needle.is_expression() && !matches!(self.expression_qualified, Some(true)) { 0 }
+        if self.expression_enabled && !matches!(self.expression_qualified, Some(true)) { 0 }
         else { self.matches_seen }
     }
-    pub const fn is_expression(&self) -> bool { self.needle.is_expression() }
+    pub const fn is_expression(&self) -> bool { self.expression_enabled }
     pub const fn expression_qualified(&self) -> Option<bool> { self.expression_qualified }
     pub const fn count_all_matches(&self) -> bool { self.count_all_matches }
     pub const fn generation(&self) -> QueryGeneration { self.options.generation }
@@ -654,13 +718,10 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
                 DetectedEncoding::Utf16Be if prefix.starts_with(&[0xfe, 0xff]) => 2,
                 _ => 0,
             };
-            let needle: &'needle StreamingNeedle = self.needle;
             if self.lowercase.is_none() && self.identifier.is_none() {
-                self.cursor = Some(ByteSearchCursor::new(needle.encoded(self.encoding))?);
+                self.cursor = Some(self.needle.cursor(self.encoding)?);
             }
-            if let Some(expression) = &needle.expression {
-                self.expression = Some(ExpressionWork::new(expression, needle.mode, encoding)?);
-            }
+            self.expression = self.needle.expression(encoding)?;
             self.initialized = true;
         }
         self.ready = if self.needle.mode == StreamingMode::OriginalBytes || final_input { self.filled }
@@ -708,7 +769,8 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
     pub fn finish(mut self) -> Result<(R, StreamReadReport<'needle>), StreamReadError> {
         if self.state == StreamReadState::Pending { return Err(StreamReadError::Pending); }
         if !matches!(self.expression_qualified, Some(true)) { self.discard_expression_candidates(); }
-        let report = StreamReadReport { needle: self.needle, request: self.request, length: self.length,
+        let report = StreamReadReport { needle: self.needle, expression_enabled: self.expression_enabled,
+            request: self.request, length: self.length,
             generation: self.options.generation, encoding: self.encoding, header: self.header,
             count_all_matches: self.count_all_matches, skip_matches: self.skip_matches,
             expression_qualified: self.expression_qualified,
@@ -719,7 +781,8 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
 }
 
 pub struct StreamReadReport<'needle> {
-    needle: &'needle StreamingNeedle,
+    needle: NeedleBacking<'needle>,
+    expression_enabled: bool,
     request: CaptureRequest,
     length: ByteLength,
     generation: QueryGeneration,
@@ -744,7 +807,7 @@ impl StreamReadReport<'_> {
     pub const fn header_bytes(&self) -> u64 { self.header }
     pub fn mode(&self) -> StreamingMode { self.needle.mode }
     pub fn text_literal(&self) -> Option<&str> { self.needle.text_value() }
-    pub const fn is_expression(&self) -> bool { self.needle.is_expression() }
+    pub const fn is_expression(&self) -> bool { self.expression_enabled }
     /// Content eligibility over this observation, including the primary term.
     /// None means a literal pattern or unresolved/incomplete expression. Use
     /// `is_expression` to distinguish those cases. Metadata filters belong to

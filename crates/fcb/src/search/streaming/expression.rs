@@ -133,6 +133,29 @@ impl<'needle> ExpressionWork<'needle> {
         Ok(Self { terms })
     }
 
+    /// Own only the bounded exact predicate patterns. Lowercase cursors already
+    /// own their normalized tables; no predicate retains source text.
+    pub(super) fn new_owned(needle: &ExpressionNeedle, mode: StreamingMode,
+        encoding: DetectedEncoding) -> Result<ExpressionWork<'static>, StreamReadError> {
+        let mut terms = reserve(needle.terms.len())?;
+        for term in &needle.terms {
+            let cursor = match mode {
+                StreamingMode::ExactText => PredicateCursor::Exact(ByteSearchCursor::new_owned(term.encoded(encoding))?),
+                StreamingMode::LowercaseText => {
+                    let text = std::str::from_utf8(&term.utf8).map_err(|_| StreamReadError::InvalidExpression)?;
+                    let bound = matched_text_capacity(text, lowercase_mode())
+                        .map_err(|_| StreamReadError::InvalidExpression)?;
+                    if bound > text.len() * 12 { return Err(StreamReadError::InvalidExpression); }
+                    PredicateCursor::Lowercase(NormalizedCursor::new(text, lowercase_mode())
+                        .map_err(|_| StreamReadError::AllocationFailed)?.ok_or(StreamReadError::InvalidExpression)?)
+                }
+                _ => return Err(StreamReadError::InvalidExpression),
+            };
+            terms.push(Predicate { excluded: term.excluded, seen: false, cursor });
+        }
+        Ok(ExpressionWork { terms })
+    }
+
     /// Feed precisely the validated raw prefix consumed by the primary cursor.
     /// A false return means cancellation, never a negative predicate result.
     pub(super) fn feed_exact(&mut self, bytes: &[u8], header: u64,
