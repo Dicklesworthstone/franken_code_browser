@@ -167,6 +167,10 @@ impl<'a> TrailTarget<'a> {
 pub struct TrailCapture<'a> { target: TrailTarget<'a>, capture: PagedCapture }
 impl<'a> TrailCapture<'a> {
     pub const fn target(&self) -> TrailTarget<'a> { self.target }
+    /// The complete, digest-verified archived member behind this selection.
+    /// Borrowing these bytes keeps the retained capture's admission in force;
+    /// a host copying them into another reader must admit that copy separately.
+    pub fn bytes(&self) -> &[u8] { self.capture.bytes() }
     pub fn selected_bytes(&self) -> &[u8] {
         let (start, end) = self.target.entry.range.as_usize_bounds().expect("validated selection");
         &self.capture.bytes()[start..end]

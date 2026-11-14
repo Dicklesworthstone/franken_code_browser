@@ -102,6 +102,7 @@ pub struct SavedRepositorySession {
     relationships: Option<relationships::AcceptedRelationships>,
     imports: Option<imports::AcceptedImports>,
     paths: Option<paths::AcceptedPaths>,
+    trail: Option<trail::AcceptedTrail>,
     path: PathBuf,
     last_query_attempt: u64,
     last_expression_attempt: u64,
@@ -111,6 +112,7 @@ pub struct SavedRepositorySession {
     last_relationship_attempt: u64,
     last_import_attempt: u64,
     last_path_attempt: u64,
+    last_trail_attempt: u64,
     next_allocation: u64,
     budget: ResourceBudget,
     _lease: ResourceLease,
@@ -134,9 +136,9 @@ impl SavedRepositorySession {
         if metadata.len() > limits.max_document_bytes as u64 { return Err(SavedRepositoryError::InvalidLimits); }
         let archive = PagedSnapshot::open(file, owner, limits, &budget, allocation(2)?, &mut canceled)?;
         check(&mut canceled)?;
-        Ok(Self { archive, index: None, index_build: None, query: None, expression: None, structure: None, relationships: None, imports: None, paths: None, path, last_query_attempt: 0,
+        Ok(Self { archive, index: None, index_build: None, query: None, expression: None, structure: None, relationships: None, imports: None, paths: None, trail: None, path, last_query_attempt: 0,
             last_expression_attempt: 0, last_structure_attempt: 0,
-            last_index_attempt: 0, last_index_build_attempt: 0, last_relationship_attempt: 0, last_import_attempt: 0, last_path_attempt: 0, next_allocation: 3, budget, _lease: lease })
+            last_index_attempt: 0, last_index_build_attempt: 0, last_relationship_attempt: 0, last_import_attempt: 0, last_path_attempt: 0, last_trail_attempt: 0, next_allocation: 3, budget, _lease: lease })
     }
     pub fn owner(&self) -> ArenaOwnerId { self.archive.directory().owner() }
     pub fn archive_digest(&self) -> Sha256Digest { self.archive.directory().digest() }
@@ -161,6 +163,8 @@ impl SavedRepositorySession {
         out.literal(",\"last_import_attempt\":")?; out.integer(self.last_import_attempt())?;
         out.literal(",\"accepted_path_generation\":")?; optional(&mut out, self.accepted_path_generation())?;
         out.literal(",\"last_path_attempt\":")?; out.integer(self.last_path_attempt())?;
+        out.literal(",\"accepted_trail_generation\":")?; optional(&mut out, self.trail_generation())?;
+        out.literal(",\"last_trail_attempt\":")?; out.integer(self.last_trail_attempt())?;
         let directory = self.archive.directory();
         out.literal(",\"initial_archive_bytes_read\":")?; out.integer(directory.validation_stats().bytes_read)?;
         out.literal(",\"directory_reserved_bytes\":")?; out.integer(directory.retained_charge() as u64)?;
@@ -573,6 +577,10 @@ pub use imports::{SavedImportDirection, SavedImportSide, SavedImportError};
 
 /// Metadata-only filename/path navigation over the closed saved directory.
 pub mod paths;
+
+/// Explicit user-owned reading trails over the already opened saved archive.
+pub mod trail;
+pub use trail::SavedTrailError;
 
 /// Explicit create-only FCBD construction and retained write-effect receipts.
 pub mod index_build;

@@ -33,6 +33,46 @@ char *fcb_saved_info(uint64_t handle);
  */
 char *fcb_saved_members(uint64_t handle, uint64_t start, uint64_t limit);
 
+/* Explicit user-owned FCBT reading trails. Attach reads and validates the whole
+ * selected regular file (at most 4 MiB / 1024 ordered visits), retaining only
+ * reference/rationale bytes. It never opens any archive or live path named by
+ * a visit. Repeated visits and mixed-archive references remain separate rows.
+ * path is borrowed NUL-terminated UTF-8 valid until return. Retain selected-file
+ * access through entered attachment work/drain; no path is reopened afterward.
+ *
+ * Attach/detach attempts use their own strictly increasing nonzero generation.
+ * Failed/canceled replacement preserves the preceding accepted trail. A late
+ * cancellation can suppress delivery after acceptance; fcb_saved_info exposes
+ * accepted_trail_generation and last_trail_attempt, and page recovers the
+ * accepted state. Do not infer rollback or replay a pathname from a lost reply.
+ *
+ * Attach returns the first page. Page start/item ordinals are zero-based and
+ * limit is 1..32. Commands are trail-attach/trail-page/trail-detach in the shared
+ * fcb.saved-repository/1 schema. Pages expose trail digest/title/parent, exact
+ * original ranges, rationale, raw paths, total/ready/unavailable counts and
+ * next_offset. Readiness is relative to the opened archive metadata: ready,
+ * other-archive, missing-member, unavailable-member, changed-source or
+ * invalid-range. It is not a proof of a later payload read. No source payload
+ * is loaded by attachment or pagination; no entry is silently omitted.
+ */
+char *fcb_saved_trail_attach(uint64_t handle, uint64_t generation,
+    const char *path);
+char *fcb_saved_trail_page(uint64_t handle, uint64_t generation,
+    uint64_t start, uint64_t limit);
+char *fcb_saved_trail_detach(uint64_t handle, uint64_t generation);
+
+/* Admit an existing EMPTY reader before source I/O, resolve the immutable
+ * generation-bound visit, then reverify the saved member digest/length/range.
+ * Unready visits fail without installing a reader or reading live source.
+ * The trail-open-reader receipt preserves the entire exact selection, including
+ * empty point bookmarks and ranges larger than the initial 16 KiB window.
+ * Initial window starts at max(0, selection.start - 132); it is not a claim
+ * that the whole selection is visible. The independently admitted reader keeps
+ * its exact source after the trail, selected file, or saved session is closed.
+ */
+char *fcb_saved_open_trail_reader(uint64_t handle, uint64_t reader,
+    uint64_t generation, uint64_t item);
+
 /* Quick Open searches the already validated archive directory with the shared
  * exact/prefix/fuzzy path ranker, including members without captured contents.
  * query is a borrowed 1..256-byte native path query, with no NUL. Raw non-UTF-8

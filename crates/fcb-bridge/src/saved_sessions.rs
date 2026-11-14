@@ -10,6 +10,7 @@ use fcb_app::host::{HostResponse, saved_repository::{SavedRepositorySession, Sav
     SnapshotLimits, Sha256Digest}};
 use fcb_app::host::saved_repository::relationships::{SavedRelationshipError, RelationshipDirection, RelationshipSide};
 use fcb_app::host::saved_repository::imports::{SavedImportError, SavedImportDirection, SavedImportSide};
+use fcb_app::host::saved_repository::trail::SavedTrailError;
 use fcb_app::host::saved_repository::paths::SavedPathOptions;
 use fcb_app::host::saved_repository::index_build::SavedIndexBuildLimits;
 use fcb_app::host::saved_repository::desk::SavedDeskError;
@@ -22,12 +23,13 @@ pub(super) const MAX_SAVED_SESSIONS: usize = 4;
 pub(super) enum AccessError {
     Unknown, NotOpen, AlreadyOpen, Busy, Capacity, Canceled, Closed, Poisoned,
     InvalidArgument, Saved(SavedRepositoryError), Relationship(SavedRelationshipError),
-    Expression(SavedDeskError), Import(SavedImportError), Reader(reader_sessions::AccessError),
+    Expression(SavedDeskError), Import(SavedImportError), Trail(SavedTrailError), Reader(reader_sessions::AccessError),
 }
 impl From<SavedRepositoryError> for AccessError { fn from(e: SavedRepositoryError) -> Self { Self::Saved(e) } }
 impl From<SavedRelationshipError> for AccessError { fn from(e: SavedRelationshipError) -> Self { Self::Relationship(e) } }
 impl From<SavedDeskError> for AccessError { fn from(e: SavedDeskError) -> Self { Self::Expression(e) } }
 impl From<SavedImportError> for AccessError { fn from(e: SavedImportError) -> Self { Self::Import(e) } }
+impl From<SavedTrailError> for AccessError { fn from(e: SavedTrailError) -> Self { Self::Trail(e) } }
 impl From<reader_sessions::AccessError> for AccessError { fn from(e: reader_sessions::AccessError) -> Self { Self::Reader(e) } }
 impl std::fmt::Display for AccessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -40,6 +42,7 @@ impl std::fmt::Display for AccessError {
             Self::Saved(e) => return write!(f, "{e}"), Self::Relationship(e) => return write!(f, "{e}"),
             Self::Expression(e) => return write!(f, "{e}"),
             Self::Import(e) => return write!(f, "{e}"),
+            Self::Trail(e) => return write!(f, "{e}"),
             Self::Reader(e) => return write!(f, "{e}"),
         })
     }
@@ -52,6 +55,7 @@ impl AccessError {
             Self::Relationship(error) => error.is_canceled(),
             Self::Expression(error) => error.is_canceled(),
             Self::Import(error) => error.is_canceled(),
+            Self::Trail(error) => error.is_canceled(),
             _ => false,
         }
     }
@@ -108,6 +112,9 @@ pub(super) enum Command<'a> {
     PathSearch { generation: u64, needle: &'a [u8], options: SavedPathOptions },
     PathResults { generation: u64, start: usize, limit: usize },
     ClearPaths { generation: u64 },
+    AttachTrail { generation: u64, path: &'a Path },
+    TrailPage { generation: u64, start: usize, limit: usize },
+    DetachTrail { generation: u64 },
 }
 pub(super) enum DocumentImageCommand {
     Authorize,
@@ -121,6 +128,7 @@ pub(super) enum Selection {
     Relationship { generation: u64, id: u64, side: RelationshipSide },
     Import { generation: u64, id: u64, side: SavedImportSide },
     PathHit { generation: u64, id: u64 },
+    Trail { generation: u64, item: usize },
 }
 
 struct Permit(Arc<AtomicUsize>);
@@ -240,6 +248,12 @@ impl SavedSessions {
                 session.path_results(generation, start, limit, &mut stop).map_err(AccessError::from),
             Command::ClearPaths { generation } =>
                 session.clear_paths(generation, &mut stop).map_err(AccessError::from),
+            Command::AttachTrail { generation, path } =>
+                session.attach_trail(generation, path, &mut stop).map_err(AccessError::from),
+            Command::TrailPage { generation, start, limit } =>
+                session.trail_page(generation, start, limit, &mut stop).map_err(AccessError::from),
+            Command::DetachTrail { generation } =>
+                session.detach_trail(generation, &mut stop).map_err(AccessError::from),
             Command::Info => session.info(&mut stop).map_err(AccessError::from),
             Command::IndexBuildReceipt { operation } =>
                 session.index_build_receipt(operation, &mut stop).map_err(AccessError::from),
@@ -303,6 +317,8 @@ impl SavedSessions {
                     session.open_import_reader(owner, generation, id, side, reader_stop).map_err(AccessError::from),
                 Selection::PathHit { generation, id } =>
                     session.open_path_hit_reader(owner, generation, id, reader_stop).map_err(AccessError::from),
+                Selection::Trail { generation, item } =>
+                    session.open_trail_reader(owner, generation, item, reader_stop).map_err(AccessError::from),
             }
         }, &mut stop);
         cell.validate(epoch)?;
@@ -379,3 +395,7 @@ mod structure_tests;
 #[cfg(all(test, unix))]
 #[path = "saved_document_images_sessions_tests.rs"]
 mod document_images_tests;
+
+#[cfg(all(test, unix))]
+#[path = "saved_trail_sessions_tests.rs"]
+mod trail_tests;

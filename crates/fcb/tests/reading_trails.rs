@@ -44,7 +44,10 @@ fn pin_append_navigate_and_read_exact_utf16_after_archive_handle_closes() {
     let retained = second_target.open(&mut archive, view.digest(), nav.generation(), FileId::new(owner(), 100).unwrap(),
         SourceRevision::new(owner(), 200).unwrap(), &budget, [allocation(7), allocation(8)], || false).unwrap();
     drop(archive);
+    assert_eq!(retained.bytes(), bytes, "the complete verified member survives its archive handle");
     assert_eq!(retained.selected_bytes(), &bytes[20..26]);
+    assert_eq!(retained.selected_bytes().as_ptr(), retained.bytes()[20..].as_ptr(),
+        "selection and full-member access borrow the same admitted capture");
     let reader = retained.reader(ReaderLimits::default(), &budget, allocation(9)).unwrap();
     let mut seek = reader.seek(ReadingTarget::Range(range(20, 26)), nav.generation()).unwrap();
     while seek.state() == ReadingSeekState::Pending { seek.step(4, nav.generation(), || false).unwrap(); }
