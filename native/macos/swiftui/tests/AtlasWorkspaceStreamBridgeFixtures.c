@@ -11,7 +11,8 @@ enum { CREATE, OPEN, SEARCH, PAGE, HIT, CLEAR, CANCEL, CLOSE, POLLS,
     PROGRESS_SEARCH, PROGRESS_CALLBACKS, STOP_POLLS, STOP_SEEN, PROGRESS_CANCELED,
     SCOPED_SEARCH, SCOPED_PROGRESS, COUNTED_SEARCH, COUNTED_PROGRESS,
     MATCHING_SEARCH, MATCHING_PROGRESS, MATCHING_COUNTED,
-    OCCURRENCES_SEARCH, OCCURRENCES_PROGRESS, OCCURRENCES_COUNTED, COUNTERS };
+    OCCURRENCES_SEARCH, OCCURRENCES_PROGRESS, OCCURRENCES_COUNTED,
+    WINDOW_SEARCH, WINDOW_PROGRESS, WINDOW_COUNTED, WINDOW_OCCURRENCES, WINDOW_LOWERCASE, COUNTERS };
 static uint32_t counts[COUNTERS], allocations, frees;
 static int32_t mode;
 static uint32_t expected_scope;
@@ -261,6 +262,33 @@ char *fcb_atlas_stream_search_scoped_occurrences_progress(uint64_t owner, const 
         ++counts[OCCURRENCES_PROGRESS];
         result = fixture_progress(owner, needle, maximum_matches, maximum_bytes, maximum_calls,
             poll, stop, progress, context, identifier);
+    }
+    check_scope(extensions, filenames, path_kind, path);
+    return result;
+}
+char *fcb_atlas_stream_search_scoped_page_progress(uint64_t owner, const char *needle,
+    uint64_t maximum_matches, uint64_t maximum_bytes, uint64_t maximum_calls,
+    const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
+    uint64_t case_sensitive, uint64_t count_all_matches, uint64_t occurrences, uint64_t start_after,
+    workspace_fixture_poll poll, workspace_fixture_poll stop,
+    fcb_atlas_stream_progress_callback progress, void *context) {
+    assert(case_sensitive <= 1 && count_all_matches <= 1 && occurrences <= 1);
+    assert(occurrences == 0 || case_sensitive == 1);
+    assert(start_after == UINT64_C(9007199254740993)); /* above exact Double range */
+    counts[WINDOW_COUNTED] += (uint32_t)count_all_matches;
+    counts[WINDOW_OCCURRENCES] += (uint32_t)occurrences;
+    counts[WINDOW_LOWERCASE] += (uint32_t)(case_sensitive == 0);
+    check_scope(extensions, filenames, path_kind, path);
+    const char *expected = occurrences ? "token_\xc3\xa9\xf0\x9f\x98\x80" : "exact \xc3\xa9\xf0\x9f\x98\x80";
+    char *result;
+    if (stop == NULL && progress == NULL) {
+        ++counts[WINDOW_SEARCH];
+        result = fixture_search(owner, needle, maximum_matches, maximum_bytes, maximum_calls, poll, context, expected);
+    } else {
+        assert(stop != NULL && progress != NULL);
+        ++counts[WINDOW_PROGRESS];
+        result = fixture_progress(owner, needle, maximum_matches, maximum_bytes, maximum_calls,
+            poll, stop, progress, context, expected);
     }
     check_scope(extensions, filenames, path_kind, path);
     return result;

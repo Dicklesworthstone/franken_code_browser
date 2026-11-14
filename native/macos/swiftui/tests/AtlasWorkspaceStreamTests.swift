@@ -199,6 +199,7 @@ private final class StreamProbe: @unchecked Sendable {
     private var reports: [UInt64: [String: Any]] = [:]
     private var searchGate: ObservedReaderGate?, hitGate: ObservedReaderGate?, pageGate: ObservedReaderGate?
     private var badSearch = false, badPage = false, badOpen = false, staleSearch = false
+    private var matchWindows = false
     private var searches = 0, hits = 0, pages = 0, active = 0, mostActive = 0, created = 0
     private var closed = Set<UInt64>(), released = Set<String>()
     private var closeAllowed = true, retirementFailures = 0
@@ -233,6 +234,7 @@ private final class StreamProbe: @unchecked Sendable {
     var stopCount: Int { locked { stoppedRequests } }
     var stopCanceledWork: Bool { locked { stoppedWithCancellation } }
     var cancelCount: Int { locked { cancelCalls } }
+    func enableMatchWindows() { locked { matchWindows = true } }
     func blockSearch(_ gate: ObservedReaderGate) { locked { searchGate = gate } }
     func blockHit(_ gate: ObservedReaderGate) { locked { hitGate = gate } }
     func blockPage(_ gate: ObservedReaderGate) { locked { pageGate = gate } }
@@ -260,16 +262,18 @@ private final class StreamProbe: @unchecked Sendable {
     }
     private func search(_ owner: UInt64, _ request: AtlasWorkspaceStreamRequest) throws -> String {
         enter(); defer { leave() }
-        let (gate, fails, stale, generation) = locked {
-            let result = (searchGate, badSearch, staleSearch, (generations[owner] ?? 0) + 1)
+        let (gate, fails, stale, generation, windows) = locked {
+            let result = (searchGate, badSearch, staleSearch, (generations[owner] ?? 0) + 1, matchWindows)
             searchGate = nil; badSearch = false; staleSearch = false
             searches += 1; generations[owner] = result.3
             return result
         }
         gate?.wait()
-        var report = StreamFixture.report(owner, stale ? generation - 1 : generation, request,
-            count: request.countAllMatches ? 256 : 40)
-        if request.countAllMatches { report = StreamFixture.counted(report, matches: 2_000, matchingFiles: 1) }
+        var report = windows
+            ? StreamFixture.matchWindow(owner, stale ? generation - 1 : generation, request)
+            : StreamFixture.report(owner, stale ? generation - 1 : generation, request,
+                count: request.countAllMatches ? 256 : 40)
+        if request.countAllMatches && !windows { report = StreamFixture.counted(report, matches: 2_000, matchingFiles: 1) }
         locked { reports[owner] = report }
         if fails { report["scope"] = "visible-only" } // Backend already replaced before bad delivery.
         return try StreamFixture.json(StreamFixture.page(report))
@@ -380,6 +384,7 @@ private final class StreamContextProbe: @unchecked Sendable {
         try await occurrenceModelTests()
         try await progressModelTests()
         try await modelTests()
+        try await matchWindowModelTests()
         try await scopedModelTests()
         try await lifetimeTests()
         print("Workspace stream wire/model/context fixtures passed; no native presentation qualification claimed")
@@ -1021,6 +1026,58 @@ private final class StreamContextProbe: @unchecked Sendable {
         precondition(model.report == nil && model.progress == nil)
     }
 
+    @MainActor private static func matchWindowModelTests() async throws {
+        let probe = StreamProbe(), model = AtlasWorkspaceStreamModel(transport: probe.transport, query: "old")
+        probe.enableMatchWindows()
+        model.open(.init(root: StreamFixture.root, project: UUID(), browserOwner: 1, access: nil))
+        try await wait("match-window catalog") { !model.busy && model.catalog != nil }
+        model.search(); try await wait("initial match window") { !model.busy && model.reportAuthorized }
+        let first = model.report!, oldTarget = first.target(for: first.hits[0])
+        precondition(first.hits.count == 256 && model.canScanLater && !model.canScanEarlier)
+        precondition(first.summary.matchesSeen == 257 && first.summary.request.pageStartAfter == 0)
+        model.scanLater()
+        precondition(!model.canSelect && !model.canScanLater && model.report?.summary.identity == first.summary.identity)
+        try await wait("second match window") { !model.busy && model.reportAuthorized }
+        let second = model.report!
+        precondition(second.hits.count == 256 && second.summary.request.pageStartAfter == 256)
+        precondition(second.hits.first?.occurrence == 257 && second.hits.last?.occurrence == 512)
+        precondition(second.summary.identity.generation > first.summary.identity.generation
+            && second.hits[0].revision > first.hits[0].revision && !second.admits(oldTarget))
+        let priorHits = probe.hitCount
+        model.select(oldTarget); precondition(probe.hitCount == priorHits && !model.busy)
+        model.select(second.target(for: second.hits[0]))
+        try await wait("later retained witness") { !model.busy && model.witness != nil }
+        precondition(model.witness?.target.hit.occurrence == 257)
+        model.scanLater(); try await wait("final match window") { !model.busy && model.reportAuthorized }
+        let last = model.report!
+        precondition(last.hits.count == 88 && last.summary.request.pageStartAfter == 512
+            && last.summary.complete && last.summary.truncated)
+        precondition(last.hits.first?.occurrence == 513 && last.hits.last?.occurrence == 600)
+        precondition(!model.canScanLater && model.canScanEarlier, "An omitted prefix is not a later match")
+        model.scanEarlier(); try await wait("earlier fresh scan") { !model.busy && model.reportAuthorized }
+        precondition(model.report?.summary.request.pageStartAfter == 256 && model.report?.hits.count == 256)
+        precondition(model.report!.summary.identity.generation > last.summary.identity.generation)
+
+        // Cancellation revokes the pending new observation, including its
+        // eventual late receipt, while preserving the previous bytes read-only.
+        let accepted = model.report!, gate = ObservedReaderGate()
+        probe.blockSearch(gate); model.scanLater()
+        try await wait("later scan entered") { gate.entered }
+        model.cancel(); gate.release()
+        try await wait("later scan drained") { probe.activeCount == 0 }
+        await Task.yield()
+        precondition(model.report?.summary.identity == accepted.summary.identity
+            && !model.reportAuthorized && !model.canScanLater && !model.canScanEarlier)
+        model.search(); try await wait("restart from beginning") { !model.busy && model.reportAuthorized }
+        precondition(model.report?.summary.request.pageStartAfter == 0 && model.report?.hits.first?.occurrence == 1)
+
+        let beforeFailure = model.report!
+        probe.failSearch(); model.scanLater(); try await wait("rejected later response") { !model.busy }
+        precondition(model.report?.summary.identity == beforeFailure.summary.identity && !model.canSelect)
+        model.queryText = "different"
+        precondition(model.report == nil && model.witness == nil && !model.canScanLater)
+        model.close(); try await wait("match-window owner retired") { probe.closedCount == probe.createCount }
+    }
     @MainActor private static func modelTests() async throws {
         let probe = StreamProbe(), model = AtlasWorkspaceStreamModel(transport: probe.transport, query: "old")
         model.open(.init(root: "/selected-alias/", project: UUID(), browserOwner: 99, access: nil))

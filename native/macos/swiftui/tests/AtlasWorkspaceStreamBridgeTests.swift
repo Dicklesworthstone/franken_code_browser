@@ -407,6 +407,53 @@ private final class WorkspaceProgressCopies: @unchecked Sendable {
         let absentProgress = try progressive(owner, occurrences, AtlasSearchCancellation(), AtlasWorkspaceStreamStop()) { _ in }
         precondition(absentOccurrences == nil && absentProgress == nil && allocations() == frees())
         mode(0)
-        print("Workspace stream ABI occurrence/matching/count flags, ownership, progressive bytes, Stop and cancellation fixtures passed")
+        try matchWindowBridgeTests()
+        print("Workspace stream ABI match windows, occurrence/matching/count flags, ownership, progressive bytes, Stop and cancellation fixtures passed")
+    }
+
+    private static func matchWindowBridgeTests() throws {
+        let transport = AtlasWorkspaceStreamTransport.native
+        let progressive = transport.progressiveSearch!
+        for searchMode in AtlasWorkspaceStreamMode.allCases {
+            for counting in [false, true] {
+                for sensitive in (searchMode == .occurrences ? [true] : [true, false]) {
+                    reset()
+                    let owner = transport.create(), canceled = AtlasSearchCancellation()
+                    let request = try AtlasWorkspaceStreamRequest(
+                        needle: searchMode == .occurrences ? "token_é😀" : "exact é😀",
+                        maximumScanBytes: 1 << 32, countAllMatches: counting, caseSensitive: sensitive,
+                        mode: searchMode, pageStartAfter: 9_007_199_254_740_993)
+                    let direct = try transport.search(owner, request, AtlasSearchCancellation())
+                    let copies = WorkspaceProgressCopies()
+                    let terminal = try progressive(owner, request, AtlasSearchCancellation(), AtlasWorkspaceStreamStop()) {
+                        copies.append($0)
+                    }
+                    precondition(direct == "{\"fixture\":\"workspace-stream\"}" && terminal == direct)
+                    precondition(copies.values == ["{\"fixture\":\"workspace-progress\"}"])
+                    precondition(count(24) == 1 && count(25) == 1)
+                    precondition(count(26) == (counting ? 2 : 0)
+                        && count(27) == (searchMode == .occurrences ? 2 : 0)
+                        && count(28) == (sensitive ? 0 : 2))
+                    precondition(allocations() == frees(), "Both owned terminal replies must be freed")
+                    canceled.cancel()
+                    do {
+                        _ = try transport.search(owner, request, canceled)
+                        preconditionFailure("Canceled match-window search entered C")
+                    } catch AtlasWorkspaceStreamError.canceled { }
+                    do {
+                        _ = try progressive(owner, request, canceled, AtlasWorkspaceStreamStop()) { _ in }
+                        preconditionFailure("Canceled match-window progress entered C")
+                    } catch AtlasWorkspaceStreamError.canceled { }
+                    precondition(count(24) == 1 && count(25) == 1)
+                    let live = AtlasSearchCancellation(), freed = frees()
+                    do {
+                        _ = try progressive(owner, request, live, AtlasWorkspaceStreamStop()) { _ in live.cancel() }
+                        preconditionFailure("Canceled match-window callback delivered terminal output")
+                    } catch AtlasWorkspaceStreamError.canceled { }
+                    precondition(count(13) == 1 && frees() == freed + 1 && allocations() == frees())
+                    precondition(transport.close(owner))
+                }
+            }
+        }
     }
 }

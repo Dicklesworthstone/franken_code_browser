@@ -277,15 +277,18 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
         !closed && !opening && session != nil && catalog != nil && lastGeneration < UInt64.max
             && (try? currentRequest()) != nil
     }
-    private func currentRequest() throws -> AtlasWorkspaceStreamRequest {
+    private func currentRequest(startAfter: UInt64 = 0) throws -> AtlasWorkspaceStreamRequest {
         guard let authority else { throw AtlasWorkspaceStreamError.unavailable }
         return try .init(needle: queryText, maximumScanBytes: scanBytes,
             fileScope: authority.fileScope, pathScope: authority.pathScope,
-            countAllMatches: countAllMatches, caseSensitive: mode == .occurrences || caseSensitive, mode: mode)
+            countAllMatches: countAllMatches, caseSensitive: mode == .occurrences || caseSensitive,
+            mode: mode, pageStartAfter: startAfter)
     }
     var canRefresh: Bool { !closed && authority != nil }
     var canStopAndKeep: Bool { !closed && busy && searching && !stopping && stopFlag != nil }
     var canSelect: Bool { !closed && !busy && reportAuthorized && session != nil && report != nil }
+    var canScanLater: Bool { canSelect && report?.summary.nextStartAfter != nil }
+    var canScanEarlier: Bool { canSelect && (report?.summary.request.pageStartAfter ?? 0) > 0 }
     var canReadCurrentContext: Bool {
         guard canSelect, let report, let witness else { return false }
         return report.admits(witness.target)
@@ -331,15 +334,29 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
         }
     }
 
-    func search() {
+    func search() { search(startAfter: 0) }
+
+    /// Each window is a new live scan, with new query/source identities.
+    /// Preserve prior evidence as read-only until the replacement is accepted.
+    func scanLater() {
+        guard canScanLater, let next = report?.summary.nextStartAfter else { return }
+        search(startAfter: next)
+    }
+    func scanEarlier() {
+        guard canScanEarlier, let request = report?.summary.request else { return }
+        search(startAfter: request.pageStartAfter - min(request.pageStartAfter, request.maximumMatches))
+    }
+    private func search(startAfter: UInt64) {
         guard canSearch, let session, let catalog else { return }
         let request: AtlasWorkspaceStreamRequest
-        do { request = try currentRequest() }
+        do { request = try currentRequest(startAfter: startAfter) }
         catch { notice = message(error); return }
         // A foreign call can replace the query before its reply is lost or
         // rejected. Preserve old bytes for reading, but revoke their actions.
         revokeTargets(clearEvidence: false)
-        let (ticket, flag) = begin("Searching the selected location and file types, including large files…")
+        let (ticket, flag) = begin(startAfter == 0
+            ? "Searching the selected location and file types, including large files…"
+            : "Scanning current files again, skipping the first \(startAfter) matches… Earlier results remain a separate observation.")
         searching = true
         let progressive = session.transport.progressiveSearch
         let stop = progressive == nil ? nil : AtlasWorkspaceStreamStop()
@@ -350,7 +367,7 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
                 cancellation: flag) { [weak self, weak session] progress in
                 guard let self, let session, self.busy, self.searching,
                       self.accepts(ticket, flag), self.session === session, self.catalog == catalog,
-                      request == (try? self.currentRequest()) else { return }
+                      request == (try? self.currentRequest(startAfter: request.pageStartAfter)) else { return }
                 self.progress = progress
                 if !self.stopping { self.notice = progress.countLabel }
             }
@@ -380,7 +397,7 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
                     return try AtlasWorkspaceStreamReport(summary: summary, hits: hits)
                 }
                 guard accepts(ticket, flag), self.session === session, self.catalog == catalog,
-                      request == (try? currentRequest()) else { return }
+                      request == (try? currentRequest(startAfter: request.pageStartAfter)) else { return }
                 guard accepted.summary.identity.generation > lastGeneration else {
                     throw AtlasWorkspaceStreamError.invalidResponse
                 }

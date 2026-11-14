@@ -60,9 +60,9 @@ import AppKit
                     .help(model.mode == .occurrences ? "Whole identifiers always match exact case."
                         : "When off, use Unicode lowercase matching while retaining the original spelling and byte ranges")
                 Toggle("Count all matches", isOn: $model.countAllMatches).toggleStyle(.checkbox)
-                    .help("Continue counting after the first 256 retained results, within the selected byte and read-call limits")
+                    .help("Continue counting beyond the retained result window, within the selected byte and read-call limits")
                 Text(model.countAllMatches
-                    ? "Scan past the result limit; keep the first 256 results. Counts are exact only when the search completes."
+                    ? "Scan past the result limit; keep up to 256 results per scan. Counts are exact only when the search completes."
                     : "The search stops when the result limit is reached.")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -129,6 +129,15 @@ import AppKit
                 Spacer()
                 Button("Clear", action: model.clear).disabled(model.report == nil)
             }
+            if let report = model.report,
+               report.summary.pageHasMoreMatches || report.summary.request.pageStartAfter > 0 {
+                HStack {
+                    Button("Scan earlier matches", action: model.scanEarlier).disabled(!model.canScanEarlier)
+                    Button("Scan later matches", action: model.scanLater).disabled(!model.canScanLater)
+                }
+                Text("Each window scans current files again. Files may have changed; the new results replace the previous observation.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             if let progress = model.progress {
                 Text("Preview while searching. Stop and keep matches, or wait for completion, to select a retained result.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -148,7 +157,7 @@ import AppKit
                         }
                     }
                     if progress.summary.retainedHits > UInt64(progress.page.hits.count) {
-                        Text("Showing the first \(progress.page.hits.count) matches. All \(progress.summary.retainedHits) retained matches become available when the scan stops.")
+                        Text("Showing \(progress.page.hits.count) matches from this window. All \(progress.summary.retainedHits) retained matches become available when the scan stops.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
