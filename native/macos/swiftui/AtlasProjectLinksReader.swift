@@ -168,18 +168,21 @@ final class AtlasProjectLinkReaderReceiptBox: @unchecked Sendable {
     let id = UUID()
     let reader: AtlasPagedReaderModel
     let owner: UInt64
+    let basis: AtlasIndexedBasis
     let path: AtlasProjectLinkPath
     let link: AtlasProjectLink
     let side: AtlasProjectLinkSide
     let fragment: AtlasProjectLinkFragment?
     let navigationDescription: String
-    init(reader: AtlasPagedReaderModel, owner: UInt64, path: AtlasProjectLinkPath,
+    init(reader: AtlasPagedReaderModel, basis: AtlasIndexedBasis, path: AtlasProjectLinkPath,
          link: AtlasProjectLink, side: AtlasProjectLinkSide, fragment: AtlasProjectLinkFragment?, navigationDescription: String) {
-        self.reader = reader; self.owner = owner; self.path = path; self.link = link; self.side = side; self.fragment = fragment
+        self.reader = reader; self.owner = basis.owner; self.basis = basis
+        self.path = path; self.link = link; self.side = side; self.fragment = fragment
         self.navigationDescription = navigationDescription
     }
     var evidenceLabel: String {
         side == .evidence ? link.evidenceLabel
             : (link.projection == .imports ? "\(link.label) · " : "Exact captured target document · ") + navigationDescription
     }
+    var file: AtlasProjectLinkFile { side == .evidence ? link.source : link.target! }
 }

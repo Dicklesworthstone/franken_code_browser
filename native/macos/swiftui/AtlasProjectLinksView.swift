@@ -18,11 +18,13 @@ import SwiftUI
 
 @MainActor struct AtlasProjectLinksView: View {
     let presentation: AtlasProjectLinksPresentation
+    let desk: AtlasReadingDeskModel
     @State private var model: AtlasProjectLinksModel
     @State private var pathInput: String
-    @State private var reader: AtlasProjectLinkReaderCapture?
-    @State private var readerTask: Task<Void, Never>?
-    @State private var readerTicket = UUID()
+    @State private var history = AtlasDocumentLinkHistory<AtlasProjectLinkReaderCapture>(
+        retire: { $0.reader.close() },
+        failureMessage: { ($0 as? AtlasProjectLinksError)?.message ?? ($0 as? AtlasReaderError)?.message
+            ?? "The linked capture could not be opened. Your retained reading position is unchanged." })
     @State private var readerNotice = ""
     @State private var paginationScope: PaginationScope?
     @State private var pageStarts: [UInt64] = []
@@ -43,12 +45,13 @@ import SwiftUI
         }
     }
 
-    init(presentation: AtlasProjectLinksPresentation) {
-        self.presentation = presentation
+    init(presentation: AtlasProjectLinksPresentation, desk: AtlasReadingDeskModel) {
+        self.presentation = presentation; self.desk = desk
         _model = State(initialValue: presentation.model)
         _pathInput = State(initialValue: presentation.initialPath.flatMap { String(bytes: $0, encoding: .utf8) } ?? "")
     }
-    private var canOperate: Bool { model.canOperate && readerTask == nil }
+    private var canOperate: Bool { model.canOperate && !history.busy }
+    private var reader: AtlasProjectLinkReaderCapture? { history.current }
     private var pinGroup: String { "project-links:\(presentation.id.uuidString)" }
     private var previousPageStart: UInt64? {
         guard let page = model.page, paginationScope == PaginationScope(page),
@@ -79,11 +82,11 @@ import SwiftUI
             }
             Divider()
             HStack {
-                if model.busy || readerTask != nil {
+                if model.busy || history.busy {
                     ProgressView().controlSize(.small)
-                    Button("Cancel") { readerNotice = ""; cancelReader(); model.cancel() }
+                    Button("Cancel") { readerNotice = ""; history.cancel(); model.cancel() }
                 }
-                Text(readerNotice.isEmpty ? model.notice : readerNotice)
+                Text(readerNotice.isEmpty ? (history.notice.isEmpty ? model.notice : history.notice) : readerNotice)
                     .font(.caption).textSelection(.enabled)
                 Spacer()
             }
@@ -91,7 +94,10 @@ import SwiftUI
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .padding(14).frame(minWidth: 1080, idealWidth: 1320, minHeight: 700, idealHeight: 840)
-        .onAppear { pins.bind(root: pinGroup) }
+        .onAppear {
+            pins.bind(root: pinGroup)
+            history.bind(root: presentation.root, accessIdentity: ObjectIdentifier(presentation))
+        }
         .onChange(of: model.selectedPath) { _, path in
             pathInput = path.flatMap { String(bytes: $0, encoding: .utf8) } ?? ""
         }
@@ -260,15 +266,24 @@ import SwiftUI
         if let capture = reader {
             VStack(alignment: .leading, spacing: 7) {
                 HStack {
+                    Button { readerNotice = ""; history.back() } label: { Label("Back", systemImage: "chevron.left") }
+                        .disabled(!history.canBack || !model.canOperate)
+                    Button { readerNotice = ""; history.forward() } label: { Label("Forward", systemImage: "chevron.right") }
+                        .disabled(!history.canForward || !model.canOperate)
                     Text(verbatim: capture.path.display).font(.headline).lineLimit(2).textSelection(.enabled)
                     Spacer()
-                    Button("Close reader") { readerNotice = ""; cancelReader(); reader?.reader.close(); reader = nil }
+                    Button("Close reader") {
+                        readerNotice = ""; history.close()
+                        history.bind(root: presentation.root, accessIdentity: ObjectIdentifier(presentation))
+                    }
                 }.controlSize(.small)
                 Text(capture.evidenceLabel).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                 HSplitView {
                     AtlasPagedSourceView(model: capture.reader, canPin: pins.canAdd, pin: { source in
                         pins.pin(source, root: pinGroup, label: capture.path.display)
-                    })
+                    }, canKeep: desk.canOperate, keep: keep,
+                        openLocalLink: localNavigation(from: capture))
+                    .id(capture.id)
                     .frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
                     if !pins.entries.isEmpty || pins.busy {
                         AtlasPinnedReadersView(readers: pins).frame(minWidth: 330, idealWidth: 430)
@@ -302,27 +317,32 @@ import SwiftUI
     }
     private func open(_ link: AtlasProjectLink, page: AtlasProjectLinksPage, side: AtlasProjectLinkSide) {
         guard canOperate, !page.building else { return }
-        readerNotice = "Opening the retained \(side == .evidence ? "source document" : "target")…"
-        let ticket = UUID(); readerTicket = ticket
-        readerTask = Task { @MainActor in
-            do {
-                let opened = try await model.open(link, from: page, side: side,
-                    readerTransport: .native, search: .native, outline: .native, document: .native)
-                guard readerTicket == ticket, !Task.isCancelled, !model.closed else { opened.reader.close(); return }
-                reader?.reader.close(); reader = opened
-                readerNotice = "Opened the retained source without rereading the project file."
-            } catch {
-                guard readerTicket == ticket, !Task.isCancelled, !model.closed else { return }
-                readerNotice = (error as? AtlasProjectLinksError)?.message ?? (error as? AtlasReaderError)?.message
-                    ?? "The relationship could not open its captured source. Rebuild links to refresh the available evidence."
-            }
-            if readerTicket == ticket { readerTask = nil }
+        readerNotice = ""
+        history.follow {
+            try await model.open(link, from: page, side: side,
+                readerTransport: .native, search: .native, outline: .native, document: .native)
         }
     }
-    private func cancelReader() {
-        readerTicket = UUID(); readerTask?.cancel(); readerTask = nil
+
+    private func localNavigation(from source: AtlasProjectLinkReaderCapture) -> AtlasDocumentPreviewModel.LocalNavigation? {
+        guard canOperate, reader?.id == source.id, model.canFollowDocumentLinks(from: source) else { return nil }
+        return { target in
+            guard canOperate, reader?.id == source.id, model.canFollowDocumentLinks(from: source) else { return }
+            readerNotice = ""
+            history.follow {
+                try await model.openDocumentLink(target, from: source,
+                    readerTransport: .native, search: .native, outline: .native, document: .native)
+            }
+        }
+    }
+
+    private func keep(_ source: AtlasPagedReaderModel) {
+        guard desk.canOperate, source.canKeep, let domain = desk.readerDomain,
+              source.retainedRegistryDomain == domain else { return }
+        desk.keep(reader: source)
+        readerNotice = "Keeping the exact selection or current source window in the Reading Desk."
     }
     private func close() {
-        cancelReader(); reader?.reader.close(); reader = nil; pins.closeAll(); presentation.close()
+        history.close(); pins.closeAll(); presentation.close()
     }
 }

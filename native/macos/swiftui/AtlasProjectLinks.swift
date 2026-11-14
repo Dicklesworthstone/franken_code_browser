@@ -2,12 +2,19 @@ import Foundation
 
 enum AtlasProjectLinksError: Error, Sendable {
     case unavailable, invalidInput, invalidResponse, canceled, engine(String)
+    case staleDocumentLink, unindexedDocumentLink, unavailableDocumentTarget
     var message: String {
         switch self {
         case .unavailable: return "Project relationships are unavailable. Capture the project again."
         case .invalidInput: return "Choose a current relationship or an exact relative project path."
         case .invalidResponse: return "The relationship response could not be verified. It is not an empty result."
         case .canceled: return "Relationship work was canceled."
+        case .staleDocumentLink:
+            return "This document link no longer belongs to the current project capture. The retained reader and its history remain available."
+        case .unindexedDocumentLink:
+            return "This occurrence is outside the retained documentation-link inventory. Your reading position is unchanged."
+        case .unavailableDocumentTarget:
+            return "This link has no available target in the retained project capture. Your reading position is unchanged."
         case .engine(let code):
             if ["ATLAS_LINKS_PATH_NOT_FOUND", "ATLAS_IMPORTS_PATH_NOT_FOUND"].contains(code) {
                 return "That exact path is outside this captured atlas catalog. The previous results remain available; refresh to capture the current project."
@@ -245,7 +252,7 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
     var canOpenTarget: Bool { resolution == "captured" && target != nil }
     var evidenceLabel: String {
         guard let importEvidence else {
-            return "Parsed Markdown link · whole captured document evidence; no exact link span or target navigation"
+            return "Parsed Markdown link · whole captured document evidence; no exact link-token span"
         }
         return "\(importEvidence.label) · original bytes \(evidenceRange.start)..<\(evidenceRange.end) · not compiler resolved"
     }

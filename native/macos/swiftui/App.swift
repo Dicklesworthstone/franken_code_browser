@@ -677,7 +677,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             AtlasSnapshotComparisonView(desk: readingDesk)
         }
         .sheet(item: $projectLinks, onDismiss: finishReadingDeskReview) { presentation in
-            AtlasProjectLinksView(presentation: presentation).id(presentation.id)
+            AtlasProjectLinksView(presentation: presentation, desk: readingDesk).id(presentation.id)
                 .onDisappear { presentation.close() }
         }
         .sheet(item: $observedReader, onDismiss: finishReadingDeskReview) { presentation in

@@ -22,6 +22,7 @@ final class ProjectLinksFixture: @unchecked Sendable {
         }
     }
     private let lock = NSLock()
+    private var documents: [UInt64: (generation: UInt64, width: UInt64)] = [:]
     private var events: [String] = []
     private var generations: [UInt64: UInt64] = [:]
     private var readerFiles: [UInt64: UInt64] = [:]
@@ -184,6 +185,75 @@ final class ProjectLinksFixture: @unchecked Sendable {
             self.events.append("close-reader"); return true
         }, retirementFailed: { preconditionFailure("Unexpected fixture retirement failure") },
         comparison: .init(domain: domain, compare: { _, _, _, _, _ in nil }))
+    }
+}
+
+
+// Fixed logical-flow/link receipts exercise the actual preview admission and
+// captured relationship navigation; this boundary does not implement a parser.
+extension ProjectLinksFixture {
+    private func document(_ owner: UInt64, command: String, generation: UInt64,
+        width: UInt64? = nil, first: UInt64 = 0, selected: UInt64? = nil) -> String? {
+        precondition(!Thread.isMainThread)
+        lock.lock()
+        guard let file = readerFiles[owner] else { lock.unlock(); return nil }
+        if let width { documents[owner] = (generation, width) }
+        let accepted = documents[owner]
+        lock.unlock()
+        guard let accepted, accepted.generation == generation else { return nil }
+        var out = Self.readerInfo(owner, file: file)
+        out["command"] = command; out["document_generation"] = String(generation)
+        out["document_ready"] = true; out["layout_complete"] = true; out["native_shaped"] = false
+        out["rendering"] = "logical-frankenmarkdown-flow"
+        out["source_mapping"] = "enclosing-regions-not-glyph-exact"
+        out["width_columns"] = String(accepted.width); out["parser_source_base"] = "0"
+        out["total_flow_lines"] = "1"; out["total_headings"] = "0"; out["rendered_utf8_bytes"] = "8"
+        if command == "document-prepare" || command == "document-window" {
+            precondition(first == 0)
+            out["first_flow_line"] = "0"; out["next_flow_line"] = NSNull(); out["whole_document_visible"] = true
+            out["flow_lines"] = [["flow_line": "0", "text": "captured",
+                "rendered_utf8_range": ["start": "0", "end": "8"],
+                "enclosing_original_range": ["start": "0", "end": String(Self.source(file).utf8.count)]] as [String: Any]]
+            out["headings"] = [] as [String]; out["next_heading"] = NSNull()
+        } else {
+            let total: UInt64 = file == 1 ? 70 : 0
+            func row(_ id: UInt64) -> [String: Any] {
+                ["link_id": String(id), "block_index": "0", "evidence_range": ["start": "0", "end": "4096"],
+                 "destination": "guide.md#part", "destination_display": "guide.md#part",
+                 "kind": "local-reference", "fragment_slug": NSNull()]
+            }
+            out["links_ready"] = true; out["links_complete"] = true; out["links_truncated"] = false
+            out["links_seen"] = String(total); out["retained_links"] = String(total); out["parser_diagnostics"] = "0"
+            out["evidence_precision"] = "whole-captured-markdown-document"
+            if let selected {
+                precondition(selected > 0 && selected <= total)
+                out["link"] = row(selected); out["activated"] = false
+            } else {
+                precondition(first <= total)
+                let end = min(first + 64, total)
+                out["first_link"] = String(first); out["links"] = (first..<end).map { row($0 + 1) }
+                out["next_link"] = end < total ? String(end) as Any : NSNull()
+            }
+        }
+        return call(command, out)
+    }
+    var documentTransport: AtlasReaderDocumentTransport {
+        .init(prepare: { self.document($0, command: "document-prepare", generation: $1, width: $2) },
+        window: { owner, generation, first, count in
+            precondition(count == 64)
+            return self.document(owner, command: "document-window", generation: generation, first: first)
+        }, headings: { _, _, _, _ in nil }, heading: { _, _, _, _ in nil },
+        fromSource: { _, _, _, _ in nil }, source: { _, _, _, _, _ in nil }, copy: { _, _, _, _, _ in nil },
+        prepareLinks: { owner, generation, limit in
+            precondition(limit == 4096)
+            return self.document(owner, command: "document-links-prepare", generation: generation)
+        }, links: { owner, generation, first, count in
+            precondition(count == 64)
+            return self.document(owner, command: "document-links", generation: generation, first: first)
+        }, link: { owner, generation, id, count in
+            precondition(count == 64)
+            return self.document(owner, command: "document-link", generation: generation, selected: id)
+        })
     }
 }
 

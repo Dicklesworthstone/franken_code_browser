@@ -130,6 +130,13 @@ the Reading Desk, including point bookmarks and selections spanning several page
 the existing CLI commands that create trails. This source implementation still requires
 independent native verification.
 
+**Project relationships keep your reading place.** Documentation links and
+backlinks open exact captured sources. Their Markdown preview can follow local
+links through the retained inventory, with Back/Forward across three retained
+readers and exact selection handoff to the Reading Desk. A missing or canceled
+destination preserves the current source and forward history. See
+[project documentation navigation](native/macos/README.md#project-documentation-links-and-backlinks).
+
 **City uses the same map.** Its buildings retain the current file footprints and IDs;
 height is a bounded logarithmic transform of **observed file bytes**, capped at 1 GiB,
 with explicit unknown and partial-catalog counts. Camera movement does not discover

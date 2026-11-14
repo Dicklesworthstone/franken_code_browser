@@ -14,13 +14,15 @@ set -- "$@" -swift-version 6 -warnings-as-errors \
     "$src/AtlasReader.swift" "$src/AtlasReaderSearch.swift" "$src/AtlasReaderComparison.swift" \
     "$src/AtlasReaderOutline.swift" "$src/AtlasReaderReferences.swift" "$src/AtlasReaderDocument.swift" "$src/AtlasDocumentDisplay.swift" \
     "$src/AtlasReaderTextSelection.swift" "$src/AtlasReaderCoordinator.swift" "$src/AtlasCapturedReader.swift" "$src/AtlasSuppliedReader.swift" \
-    "$src/AtlasNavigationHistory.swift" "$src/AtlasSource.swift" \
+    "$src/AtlasNavigationHistory.swift" "$src/AtlasDocumentLinkHistory.swift" "$src/AtlasSource.swift" \
     "$src/AtlasDocumentPreviewModel.swift" "$src/AtlasPagedReaderModel.swift" \
     "$src/AtlasProjectLinks.swift" "$src/AtlasProjectLinksGeometry.swift" "$src/AtlasProjectLinksModel.swift" "$src/AtlasProjectLinksReader.swift" \
     "$src/tests/AtlasIndexedSearchFixture.swift" "$src/tests/AtlasProjectLinksFixture.swift" \
     "$src/tests/AtlasProjectLinksGeometryTests.swift"
 swiftc "$@" "$src/tests/AtlasProjectLinksTests.swift" -o "$out/model-tests"
 "$out/model-tests"
+swiftc "$@" "$src/tests/AtlasProjectLinkJourneysTests.swift" -o "$out/journey-tests"
+"$out/journey-tests"
 swiftc "$@" "$src/tests/AtlasProjectImportsTests.swift" -o "$out/import-tests"
 "$out/import-tests"
 cc -std=c11 -Wall -Wextra -Werror -I"$src/../../../crates/fcb-bridge/include" \

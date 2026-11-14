@@ -954,6 +954,22 @@ it is unavailable when no target capture exists. These actions neither reread
 the working tree nor fetch external URLs. Pin a reader to keep code and its
 documentation visible while following another link.
 
+The relationship reader also follows local links from its Markdown preview.
+It matches the exact preview occurrence against the retained documentation
+inventory, including its original destination bytes and source capture, then
+opens the captured target at its qualified heading or source-line range.
+Resolving a link pages metadata without changing the Inspector's projection,
+file filter or page. Missing targets and occurrences outside a partial inventory
+leave the current reader in place.
+
+**Back** and **Forward** restore the last three independently retained readers,
+including their source positions and preview state. Failed or canceled opens
+preserve Forward; a successful new visit releases the abandoned forward entries.
+The oldest reader is released when the bound fills. **Keep in Reading Desk**
+keeps the verified source selection or current byte window through the existing
+capture-transfer path. Refreshing the project preserves reading history but
+revokes onward links from sources belonging to the previous capture.
+
 Evidence identifies the **whole captured Markdown document**. The parser's
 destination establishes the relationship, but this surface does not claim an
 exact source span for the link token. Opening `guide.md#section` now checks the
@@ -963,7 +979,8 @@ adapter, then starts the reader at the verified original byte range in that
 change the captured file. List pages do not parse target headings eagerly.
 Missing, ambiguous, invalid, unsupported or over-budget fragments open the
 captured file at its beginning with an explicit explanation. Non-Markdown line
-fragments such as `code.rs#L20` do not become guessed line jumps. Reading the
+fragments such as `code.rs#L20` use the shared retained-source line resolver;
+unavailable line ranges fall back to the beginning with an explanation. Reading the
 source evidence still starts at the beginning of the whole Markdown document.
 These are documentation relationships; compiler imports, calls and dependency
 completeness are not inferred. The heading-navigation addition requires

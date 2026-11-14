@@ -193,11 +193,26 @@ import Observation
         document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasProjectLinkReaderCapture {
         guard canOperate, let accepted = self.page, accepted.id == page.id, !accepted.building,
               page.projection == projection, link.projection == projection,
-              accepted.links.contains(link), let prepared, prepared.basis == page.basis,
+              accepted.links.contains(link) else { throw AtlasProjectLinksError.invalidInput }
+        return try await openRetainedLink(link, from: page, side: side, readerTransport: readerTransport,
+            search: search, outline: outline, document: document)
+    }
+
+    /// Both the visible Inspector and a verified preview occurrence enter the
+    /// same captured-reader transfer. A hidden outgoing page cannot replace the
+    /// user's visible filter, projection, or pagination position.
+    private func openRetainedLink(_ link: AtlasProjectLink, from page: AtlasProjectLinksPage,
+        side: AtlasProjectLinkSide, readerTransport: AtlasReaderTransport,
+        search: AtlasReaderSearchTransport?, outline: AtlasReaderOutlineTransport?,
+        document: AtlasReaderDocumentTransport?) async throws -> AtlasProjectLinkReaderCapture {
+        guard canOperate, let accepted = acceptedPages[page.projection], !accepted.building,
+              accepted.basis == page.basis, accepted.generation == page.generation,
+              accepted.coverage == page.coverage, page.links.contains(link),
+              let prepared, prepared.basis == page.basis,
               let domain = transport.readerDomain, readerTransport.comparison?.domain == domain,
               side == .evidence || link.canOpenTarget else { throw AtlasProjectLinksError.invalidInput }
         let file = side == .evidence ? link.source : link.target!
-        let flag = AtlasSearchCancellation(), operations = try transport.operations(for: projection)
+        let flag = AtlasSearchCancellation(), operations = try transport.operations(for: page.projection)
         cancellation = flag; busy = true
         let reader = AtlasPagedReaderModel(transport: readerTransport, search: search, outline: outline, document: document)
         let receipt = AtlasProjectLinkReaderReceiptBox()
@@ -216,17 +231,121 @@ import Observation
                     }
                 }
                 try accept(flag)
-                guard self.page?.id == page.id, let initial = reader.page,
+                guard self.prepared?.basis == prepared.basis,
+                      self.acceptedPages[page.projection]?.generation == page.generation,
+                      let initial = reader.page,
                       initial.identity.pathBytes == file.path.bytes,
                       initial.identity.capturedBytes == file.capturedBytes else { throw AtlasProjectLinksError.invalidResponse }
             }, onCancel: { flag.cancel() })
             let accepted = try receipt.accepted()
             notice = accepted.navigationDescription
-            return AtlasProjectLinkReaderCapture(reader: reader, owner: prepared.basis.owner, path: file.path,
+            return AtlasProjectLinkReaderCapture(reader: reader, basis: prepared.basis, path: file.path,
                 link: link, side: side, fragment: accepted.fragment, navigationDescription: accepted.navigationDescription)
         } catch {
             reader.close(); notice = Self.message(error); throw error
         }
+    }
+
+    func canFollowDocumentLinks(from source: AtlasProjectLinkReaderCapture) -> Bool {
+        canOperate && ownsDocumentSource(source)
+            && acceptedPages[.documentation].map({ !$0.building && $0.basis == source.basis }) == true
+    }
+
+    private func ownsDocumentSource(_ source: AtlasProjectLinkReaderCapture) -> Bool {
+        guard !closed, prepared?.basis == source.basis, source.owner == source.basis.owner,
+              let domain = transport.readerDomain, source.reader.retainedRegistryDomain == domain,
+              source.reader.retainedCaptureSHA256 == source.file.digest,
+              let identity = source.reader.page?.identity,
+              identity.pathBytes == source.file.path.bytes,
+              identity.capturedBytes == source.file.capturedBytes else { return false }
+        return true
+    }
+
+    private func ownsDocumentLink(_ target: AtlasReaderDocumentLinkTarget,
+        from source: AtlasProjectLinkReaderCapture) -> Bool {
+        ownsDocumentSource(source) && target.link.kind == .local
+            && source.reader.page?.identity.matches(target.inventory.identity) == true
+            && source.reader.documentPreview.allows(target)
+            && target.link.evidence.start == 0 && target.link.evidence.end == source.file.capturedBytes
+    }
+
+    /// Resolve the exact FMD occurrence in retained metadata, then open the
+    /// captured target with its qualified heading/line anchor. Path spelling
+    /// alone never authorizes navigation or a working-tree reopen.
+    func openDocumentLink(_ target: AtlasReaderDocumentLinkTarget, from source: AtlasProjectLinkReaderCapture,
+        readerTransport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
+        outline: AtlasReaderOutlineTransport? = nil,
+        document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasProjectLinkReaderCapture {
+        guard canFollowDocumentLinks(from: source), ownsDocumentLink(target, from: source),
+              readerTransport.comparison?.domain == transport.readerDomain else {
+            throw AtlasProjectLinksError.staleDocumentLink
+        }
+        do {
+            let (link, page) = try await resolveDocumentLink(target, from: source)
+            try Task.checkCancellation()
+            guard canFollowDocumentLinks(from: source), ownsDocumentLink(target, from: source) else {
+                throw AtlasProjectLinksError.staleDocumentLink
+            }
+            let opened = try await openRetainedLink(link, from: page, side: .target,
+                readerTransport: readerTransport, search: search, outline: outline, document: document)
+            guard !Task.isCancelled, ownsDocumentLink(target, from: source),
+                  acceptedPages[.documentation]?.generation == page.generation else {
+                opened.reader.close()
+                throw AtlasProjectLinksError.staleDocumentLink
+            }
+            notice = "Opened the linked capture. Back restores the previous retained reader."
+            return opened
+        } catch {
+            notice = Self.message(error)
+            throw error
+        }
+    }
+
+    private func resolveDocumentLink(_ target: AtlasReaderDocumentLinkTarget,
+        from source: AtlasProjectLinkReaderCapture) async throws -> (AtlasProjectLink, AtlasProjectLinksPage) {
+        guard canOperate, ownsDocumentLink(target, from: source), let index = prepared,
+              let inventory = acceptedPages[.documentation], !inventory.building,
+              inventory.basis == source.basis else { throw AtlasProjectLinksError.staleDocumentLink }
+        let flag = AtlasSearchCancellation()
+        cancellation = flag; busy = true
+        defer { finish() }
+        return try await withTaskCancellationHandler(operation: {
+            var first: UInt64 = 0, lastOccurrence: UInt64 = 0, lastLink: UInt64 = 0
+            var total: UInt64?
+            while true {
+                try accept(flag)
+                guard ownsDocumentLink(target, from: source),
+                      acceptedPages[.documentation]?.generation == inventory.generation else {
+                    throw AtlasProjectLinksError.staleDocumentLink
+                }
+                let next = try await fetch(index, generation: inventory.generation,
+                    coverage: inventory.coverage, direction: .outgoing, path: source.file.path.bytes,
+                    start: first, flag: flag)
+                try accept(flag)
+                guard ownsDocumentLink(target, from: source), next.filterFile == source.file.id,
+                      total == nil || total == next.total else { throw AtlasProjectLinksError.invalidResponse }
+                total = next.total
+                for link in next.links {
+                    guard link.source == source.file, link.sourceLink > lastOccurrence, link.id > lastLink else {
+                        throw AtlasProjectLinksError.invalidResponse
+                    }
+                    lastOccurrence = link.sourceLink; lastLink = link.id
+                    if link.sourceLink == target.link.id {
+                        guard link.block == target.link.blockIndex,
+                              link.evidenceRange.start == target.link.evidence.start,
+                              link.evidenceRange.end == target.link.evidence.end,
+                              link.destination.utf8.elementsEqual(target.link.destination.utf8) else {
+                            throw AtlasProjectLinksError.invalidResponse
+                        }
+                        guard link.canOpenTarget else { throw AtlasProjectLinksError.unavailableDocumentTarget }
+                        return (link, next)
+                    }
+                }
+                guard let offset = next.next else { throw AtlasProjectLinksError.unindexedDocumentLink }
+                // The wire proves strict progress and at most 4096 entries.
+                first = offset
+            }
+        }, onCancel: { flag.cancel() })
     }
 
     func cancel() {
