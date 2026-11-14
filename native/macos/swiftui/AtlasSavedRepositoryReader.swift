@@ -2,6 +2,7 @@ import Foundation
 
 enum AtlasSavedReaderOrigin: Sendable {
     case member
+    case trail(generation: UInt64, digest: String, entry: AtlasSavedTrailEntry)
     case pathHit(generation: UInt64, hit: AtlasSavedPathHit)
     case relationship(generation: UInt64, link: AtlasSavedLink, side: AtlasSavedLinkSide)
     case importLink(generation: UInt64, link: AtlasSavedImport, side: AtlasSavedLinkSide)
@@ -20,7 +21,7 @@ enum AtlasSavedReaderOrigin: Sendable {
         switch self {
         case .hit(_, _, let hit, _), .expressionHit(_, _, _, let hit, _): return hit
         case .structureHit(_, _, _, _, let item): return item.hit
-        case .member, .relationship, .importLink, .pathHit: return nil
+        case .member, .trail, .relationship, .importLink, .pathHit: return nil
         }
     }
 }
@@ -81,6 +82,7 @@ struct AtlasSavedReaderReceipt: Sendable {
         let command: String
         switch origin {
         case .member, .hit, .pathHit: command = "open-reader"
+        case .trail: command = "trail-open-reader"
         case .relationship: command = "relationships-open-reader"
         case .importLink: command = "imports-open-reader"
         case .expressionHit: command = "expression-open-reader"
@@ -129,6 +131,32 @@ struct AtlasSavedReaderReceipt: Sendable {
                 selectionGeneration = "expression_generation"
             } else { selectionGeneration = "query_generation" }
             switch origin {
+            case .trail(let generation, let digest, let entry):
+                struct TrailReceipt: Decodable {
+                    let trail_generation, item, reader_owner, source_bytes, offset: AtlasSavedNumber
+                    let trail_digest: String
+                    let path: AtlasSavedPath
+                    let entry: AtlasSavedTrailEntry
+                    let selection: AtlasSavedTrailRange
+                    let member_bytes_read, member_read_calls: AtlasSavedNumber
+                }
+                let accepted = try JSONDecoder().decode(TrailReceipt.self, from: data)
+                try entry.validate(in: saved)
+                guard generation > 0, AtlasSavedWire.digest(digest), entry.matches(member),
+                      accepted.trail_generation.value == generation, accepted.trail_digest == digest,
+                      accepted.item.value == entry.id, accepted.reader_owner.value == destination,
+                      accepted.entry.matches(entry), accepted.path.bytes == member.path.bytes,
+                      accepted.source_bytes.value == member.observedBytes,
+                      accepted.selection == entry.range, accepted.offset.value == entry.range.start,
+                      accepted.member_bytes_read.value == member.observedBytes,
+                      (member.observedBytes == 0 && accepted.member_read_calls.value == 0) ||
+                        (member.observedBytes > 0 && accepted.member_read_calls.value > 0 &&
+                            accepted.member_read_calls.value <= 1_048_576) else { throw AtlasSavedError.invalidResponse }
+                // A trail range may be a point, a whole file, or span many
+                // reader pages. Its exact anchor does not require duplicating
+                // the selected payload into a giant hexadecimal witness.
+                request = .window(offset: entry.range.contextStart, bytes: 16 * 1024)
+                match = nil
             case .member, .pathHit:
                 if case .pathHit(let generation, let hit) = origin {
                     guard generation > 0, hit.member.matches(member) else { throw AtlasSavedError.invalidResponse }
@@ -372,14 +400,18 @@ final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
     let member: AtlasSavedMember
     let origin: AtlasSavedReaderOrigin
     let match: AtlasSavedMatchEvidence?
+    private let trailIdentity: AtlasReaderIdentity?
     init(reader: AtlasPagedReaderModel, owner: UInt64, member: AtlasSavedMember, origin: AtlasSavedReaderOrigin,
         match: AtlasSavedMatchEvidence? = nil, archiveIdentity: AtlasSavedIdentity? = nil) {
         self.reader = reader; self.owner = owner; self.member = member; self.origin = origin; self.match = match
         self.archiveIdentity = archiveIdentity
+        if case .trail = origin { trailIdentity = reader.page?.identity } else { trailIdentity = nil }
     }
     var evidenceLabel: String {
         switch origin {
         case .member: return "Exact saved member · \(member.observedBytes) original bytes"
+        case .trail(_, _, let entry):
+            return "Reading trail item \(entry.id + 1) · \(entry.range.label) · explicit user selection"
         case .pathHit(_, let hit):
             return "Saved filename result · \(hit.matchKind) · \(member.observedBytes) exact captured bytes"
         case .relationship(_, _, .evidence):
@@ -404,6 +436,17 @@ final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
     var canUseMatch: Bool {
         guard let match, reader.canPin, let page = reader.page else { return false }
         return page.identity.matches(match.identity)
+    }
+    var canUseTrailRange: Bool {
+        guard case .trail(_, _, let entry) = origin, entry.matches(member),
+              reader.canPin, let identity = trailIdentity, let page = reader.page else { return false }
+        return page.identity.matches(identity) && identity.capturedBytes == entry.sourceBytes &&
+            identity.pathBytes == entry.path.bytes
+    }
+    func withTrailReader<Value: Sendable>(_ work: @escaping @Sendable (UInt64) throws -> Value) async throws -> Value {
+        guard canUseTrailRange else { throw AtlasSavedError.unavailable }
+        try Task.checkCancellation()
+        return try await reader.withRetainedReader(work)
     }
     /// Recheck the exact independent reader after any Desk startup wait. The
     /// caller keeps this occurrence's frozen original range, not whichever page

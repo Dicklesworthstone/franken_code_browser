@@ -666,6 +666,53 @@ and `saved_ffi_tests.rs`.
 These additions still require the configured independent strict-RCH verifier.
 Physical-Mac picker, sandbox access and native UI qualification remain pending.
 
+## Following saved reading trails
+
+Open an FCBS archive in **Saved Repository**, choose **Reading trail**, then
+**Open reading trail…** to select an FCBT file. The list preserves the saved
+order, repeated visits, exact original byte ranges and user rationale. Use
+**Previous item**, **Next item** or the paged list to select an entry, then
+**Open selected source** to read it.
+
+A trail can reference several archives. Every entry remains visible, including
+ones marked **Requires a different saved archive**, missing, uncaptured or
+changed. Select the matching archive explicitly and open the trail there to
+read those entries. Readiness comes from the currently opened archive's
+manifest; opening an entry independently verifies its actual saved payload,
+source digest, length and original range before creating the reader.
+
+The reader's **Previous trail item** and **Next trail item** follow the saved
+sequence across page boundaries. An unavailable visit leaves its rationale
+selected and the current reader intact; navigation can continue from that
+visit. **Back** restores an earlier retained reader. **Return to trail range**
+returns to its context, and **Keep trail range in Desk** preserves the complete
+original range for notes and bookmarks, including zero-length point bookmarks
+and selections that span several reader pages.
+
+Attachment reads at most 4 MiB and 1,024 entries. Pages contain at most 32
+entries and load reference metadata only. Source comes from the opened saved
+archive, with a bounded initial 16 KiB context window. An independent reader
+retains its verified bytes after the trail or archive closes. Failed or
+early-canceled replacements preserve the preceding attachment. Late cancellation
+can arrive after acceptance; **Reload state** recovers the accepted attachment
+after an unavailable reply without reopening the trail pathname.
+
+Existing CLI commands create and append immutable trails with an explicit new
+destination. For example, after saving `project.fcbs`:
+
+```sh
+fcb trail add project.fcbs --member src/main.rs --start 0 --end 80 \
+  --note 'Start at the entry point' --title 'Project tour' --output tour.fcbt
+fcb trail add project.fcbs --member src/lib.rs --start 0 --end 120 \
+  --note 'Follow the public interface' --from tour.fcbt --output tour-expanded.fcbt
+```
+
+Choose ranges within each captured member. Ranges are half-open original byte
+offsets, not text columns. Trail files contain notes and references; the saved
+archive supplies the source. The native attachment, reader navigation and Desk
+handoff have host, C-boundary and Swift regression fixtures. Independent
+execution and physical-Mac qualification remain pending.
+
 ## Comparing saved project captures
 
 Choose **Compare Captures** in the toolbar, or **Compare captures…** inside

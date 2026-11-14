@@ -42,7 +42,7 @@ final class AtlasSavedFileAccess {
     @State private var panelNotice = ""
     @State private var section: Section = .text
     private enum Section: String, CaseIterable, Identifiable {
-        case text = "Search", links = "Documentation links", imports = "Imports"
+        case text = "Search", links = "Documentation links", imports = "Imports", trail = "Reading trail"
         var id: String { rawValue }
     }
     @State private var readerCapture: AtlasSavedReaderCapture?
@@ -72,6 +72,7 @@ final class AtlasSavedFileAccess {
                         }.pickerStyle(.segmented).padding(.leading, 8)
                         if section == .text { searchPane }
                         else if section == .imports { importsPane }
+                        else if section == .trail { trailPane }
                         else { relationshipsPane }
                     }.frame(minWidth: 620, maxWidth: .infinity, maxHeight: .infinity)
                         .onChange(of: section) { _, next in
@@ -335,6 +336,104 @@ final class AtlasSavedFileAccess {
         }.buttonStyle(.plain).disabled(!model.canOperate)
         .accessibilityLabel("\(member.path.display), \(member.captured ? "captured" : "unavailable")")
     }
+    private var trailPane: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Reading trail").font(.headline)
+                Spacer()
+                Button("Open reading trail…", action: chooseTrail).disabled(!model.canOpenTrail || readerTask != nil)
+                Button("Reload state", action: model.reloadTrail).disabled(!model.canOperate || readerTask != nil)
+                Button("Close trail", action: model.detachTrail)
+                    .disabled(!model.canOpenTrail || model.trailGeneration == nil || readerTask != nil)
+            }.controlSize(.small)
+            if !model.trailStateKnown {
+                Text("The accepted attachment is unknown. These previously verified notes are read only until Reload state succeeds.")
+                    .font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+            }
+            if let page = model.trailPage {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(verbatim: page.title.isEmpty ? "Untitled trail" : page.title).font(.title3.weight(.semibold))
+                    Text(verbatim: page.path.display).font(.caption).lineLimit(2).textSelection(.enabled)
+                    Text("\(page.total) ordered items · \(page.ready) ready in this archive · \(page.unavailable) unavailable here")
+                        .font(.caption)
+                    Text("Readiness checks saved manifest metadata. Opening an item verifies its exact captured source. All notes and repeated visits retain their saved order.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if let parent = page.parentDigest {
+                        Text("Parent trail digest: \(parent)").font(.caption2.monospaced()).textSelection(.enabled)
+                    }
+                }
+                HStack {
+                    Button("Previous item") {
+                        if let item = model.selectedTrailItem, item > 0 { model.selectTrailItem(item - 1) }
+                    }.disabled(model.selectedTrailItem == nil || model.selectedTrailItem == 0)
+                    Button("Next item") {
+                        if let item = model.selectedTrailItem, item + 1 < page.total { model.selectTrailItem(item + 1) }
+                    }.disabled(model.selectedTrailItem == nil || (model.selectedTrailItem ?? 0) + 1 >= page.total)
+                    Spacer()
+                    if let entry = model.selectedTrailEntry {
+                        Button("Open selected source") { openTrail(entry, from: page) }.disabled(!entry.canOpen)
+                    }
+                }.controlSize(.small).disabled(!model.canOperate || !model.trailIsCurrent || readerTask != nil)
+                if page.items.isEmpty {
+                    Text("This trail contains no items.").foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollViewReader { scroll in
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 8) {
+                                ForEach(page.items) { entry in trailRow(entry, page: page).id(entry.id) }
+                            }
+                        }.onChange(of: model.selectedTrailItem) { _, item in
+                            if let item { scroll.scrollTo(item, anchor: .center) }
+                        }
+                    }.frame(maxHeight: .infinity)
+                }
+                HStack {
+                    Button("Previous page") { model.loadTrailPage(start: page.start >= 32 ? page.start - 32 : 0) }
+                        .disabled(page.start == 0)
+                    Text("Items \(page.start)..<\(page.start + UInt64(page.items.count)) of \(page.total)")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button("Next page") { if let next = page.next { model.loadTrailPage(start: next) } }
+                        .disabled(page.next == nil)
+                    Spacer()
+                    Text("\(page.retainedBytes) retained trail bytes").font(.caption2).foregroundStyle(.secondary)
+                }.controlSize(.small).disabled(!model.canOperate || !model.trailIsCurrent || readerTask != nil)
+            } else {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Follow a saved sequence of exact source ranges and notes.").font(.title3)
+                    Text("Choose an FCBT reading trail for the opened saved repository. Items for other archives, uncaptured members or changed sources stay visible with their notes. Select those archives explicitly to read their matching entries.")
+                    Text("The trail contains references and rationale. Source comes only from the saved archive you opened.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
+        }.padding(.leading, 8)
+    }
+    private func trailRow(_ entry: AtlasSavedTrailEntry, page: AtlasSavedTrailPage) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .top) {
+                Button { model.selectTrailItem(entry.id) } label: {
+                    HStack(alignment: .top) {
+                        Text("\(entry.id + 1).").monospacedDigit()
+                        Text(verbatim: entry.path.display).multilineTextAlignment(.leading)
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }.buttonStyle(.plain).disabled(!model.canOperate || !model.trailIsCurrent || readerTask != nil)
+                Button("Open source") { openTrail(entry, from: page) }
+                    .disabled(!entry.canOpen || !model.canOperate || !model.trailIsCurrent || readerTask != nil)
+            }
+            Text(entry.range.label).font(.caption.monospaced()).textSelection(.enabled)
+            Text(entry.readiness.label).font(.caption.weight(.medium))
+                .foregroundStyle(entry.canOpen ? Color.secondary : Color.orange)
+            if !entry.rationale.isEmpty { Text(verbatim: entry.rationale).font(.callout).textSelection(.enabled) }
+            if entry.readiness == .otherArchive {
+                Text("Archive digest: \(entry.archiveDigest)").font(.caption2.monospaced()).textSelection(.enabled)
+            }
+        }.controlSize(.small).padding(10).frame(maxWidth: .infinity, alignment: .leading)
+        .background(model.selectedTrailItem == entry.id ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.035))
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Trail item \(entry.id + 1), \(entry.path.display), \(entry.readiness.label)")
+    }
+
     private var searchPane: some View {
         VStack(alignment: .leading, spacing: 10) {
             Picker("Saved search mode", selection: $model.searchMode) {
@@ -1099,6 +1198,22 @@ final class AtlasSavedFileAccess {
         }
         panelNotice = ""; model.open(path: path, accessLease: access)
     }
+    private func chooseTrail() {
+        guard model.canOpenTrail, readerTask == nil, let identity = model.info?.identity else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Open an FCBT reading trail"
+        panel.message = "Read ordered source anchors and notes. Only entries matching the currently opened saved archive can open source."
+        panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let access = AtlasSavedFileAccess(selectedURL: url)
+        guard model.canOpenTrail, model.info?.identity == identity, readerTask == nil else {
+            panelNotice = "The saved archive changed while choosing a trail. Choose the trail again for the current archive."; return
+        }
+        guard let path = access.nativePath else {
+            panelNotice = "The selected trail filename cannot be represented exactly by the native open interface."; return
+        }
+        panelNotice = ""; section = .trail; model.attachTrail(path: path, accessLease: access)
+    }
     private func chooseIndex() {
         guard model.canChangeIndex, AtlasSavedWire.digest(model.indexPinInput), readerTask == nil else { return }
         let pin = model.indexPinInput
@@ -1132,6 +1247,12 @@ final class AtlasSavedFileAccess {
             return
         }
         panelNotice = ""; model.buildIndex(destination: path, accessLease: access)
+    }
+    private func openTrail(_ entry: AtlasSavedTrailEntry, from page: AtlasSavedTrailPage) {
+        launchReader {
+            try await model.openTrailItem(entry, from: page, readerTransport: .native,
+                search: .native, outline: .native, document: .native)
+        }
     }
     private func openMember(_ member: AtlasSavedMember, from identity: AtlasSavedIdentity) {
         launchReader {
@@ -1229,10 +1350,10 @@ final class AtlasSavedFileAccess {
                 Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
             }.controlSize(.small).padding(.horizontal, 12).padding(.top, 12)
             HStack {
-                Button { history.back(); matchNotice = ""; linkNotice = "" } label: {
+                Button { history.back(); syncTrailCursor(); matchNotice = ""; linkNotice = "" } label: {
                     Label("Back", systemImage: "chevron.left")
                 }.disabled(!history.canBack || linkTask != nil)
-                Button { history.forward(); matchNotice = ""; linkNotice = "" } label: {
+                Button { history.forward(); syncTrailCursor(); matchNotice = ""; linkNotice = "" } label: {
                     Label("Forward", systemImage: "chevron.right")
                 }.disabled(!history.canForward || linkTask != nil)
                 Text("Saved reader \(history.position + 1) of \(history.entries.count)")
@@ -1240,14 +1361,15 @@ final class AtlasSavedFileAccess {
                 Spacer()
                 if linkTask != nil {
                     ProgressView().controlSize(.small)
-                    Button("Cancel link") { linkTask?.cancel(); linkNotice = "Cancel requested; waiting for entered archive work." }
+                    Button("Cancel navigation") { linkTask?.cancel(); linkNotice = "Cancel requested; waiting for entered archive work." }
                 }
             }.controlSize(.small).padding(.horizontal, 12)
             if !linkNotice.isEmpty {
                 Text(verbatim: linkNotice).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12)
             }
-            if let match = capture.match { savedMatchActions(match) }
+            if case .trail(_, _, let entry) = capture.origin { savedTrailActions(entry) }
+            else if let match = capture.match { savedMatchActions(match) }
             else if case .importLink(_, let link, .evidence) = capture.origin {
                 HStack {
                     Text("Exact lexical statement in this captured source. Use the reader selection tools to inspect its original bytes.")
@@ -1304,6 +1426,80 @@ final class AtlasSavedFileAccess {
         guard linkTask == nil, archive.canFollowDocumentLinks(from: capture) else { return nil }
         let source = capture
         return { target in openLink(target, from: source) }
+    }
+    private func syncTrailCursor() {
+        if archive.canNavigateTrail(from: capture), case .trail(_, _, let entry) = capture.origin {
+            archive.selectTrailItem(entry.id)
+        }
+    }
+    private func savedTrailActions(_ entry: AtlasSavedTrailEntry) -> some View {
+        let active = archive.canNavigateTrail(from: capture)
+        let cursor = active ? archive.selectedTrailItem ?? entry.id : entry.id
+        let selected = active ? archive.selectedTrailEntry : nil
+        return VStack(alignment: .leading, spacing: 5) {
+            if !entry.rationale.isEmpty {
+                Text(verbatim: entry.rationale).font(.callout).lineLimit(5).textSelection(.enabled)
+            }
+            HStack {
+                Button("Previous trail item") { if cursor > 0 { openTrailItem(cursor - 1) } }
+                    .disabled(!active || cursor == 0 || linkTask != nil)
+                Button("Next trail item") { openTrailItem(cursor + 1) }
+                    .disabled(!active || cursor + 1 >= (archive.trailPage?.total ?? 0) || linkTask != nil)
+                Spacer()
+                Button("Return to trail range") {
+                    capture.reader.offsetInput = String(entry.range.contextStart); capture.reader.goToByte()
+                }.disabled(!capture.canUseTrailRange)
+                Button("Keep trail range in Desk") {
+                    keepTrailRange()
+                }.disabled(!canKeep || !capture.canUseTrailRange)
+            }.controlSize(.small)
+            if let selected, selected.id != entry.id, !selected.canOpen {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Trail item \(selected.id + 1): \(selected.path.display) · \(selected.readiness.label)")
+                        .font(.caption.weight(.semibold)).foregroundStyle(.orange)
+                    Text(selected.range.label).font(.caption.monospaced())
+                    if !selected.rationale.isEmpty {
+                        Text(verbatim: selected.rationale).font(.caption).textSelection(.enabled)
+                    }
+                    Text("This reader still shows item \(entry.id + 1). Previous and Next continue from item \(selected.id + 1).")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Text("The full original range stays anchored even when it spans several pages. Keep trail range preserves that exact range, including point bookmarks.")
+                .font(.caption).foregroundStyle(.secondary)
+        }.padding(.horizontal, 12)
+    }
+    private func openTrailItem(_ item: UInt64) {
+        let source = capture
+        guard linkTask == nil, archive.canNavigateTrail(from: source) else { return }
+        let ticket = UUID(); linkOperation = ticket
+        linkNotice = "Opening trail item \(item + 1) from its verified saved capture…"
+        linkTask = Task {
+            defer { if linkOperation == ticket { linkTask = nil } }
+            do {
+                let candidate = try await archive.openTrailItem(at: item, from: source,
+                    readerTransport: .native, search: .native, outline: .native, document: .native)
+                guard linkOperation == ticket, !Task.isCancelled, history.current.id == source.id,
+                      archive.canNavigateTrail(from: source), history.accept(candidate) else {
+                    candidate.reader.close(); return
+                }
+                matchNotice = ""; linkNotice = "Opened the exact saved trail range. Back restores the previous reader."
+            } catch {
+                guard linkOperation == ticket else { return }
+                linkNotice = Task.isCancelled ? "Trail navigation canceled. The current captured reader remains available."
+                    : ((error as? AtlasSavedError)?.message ?? (error as? AtlasReaderError)?.message
+                        ?? "The trail item could not be opened. The current reader remains available.")
+            }
+        }
+    }
+    private func keepTrailRange() {
+        let source = capture
+        guard canKeep, source.canUseTrailRange, case .trail(_, _, let entry) = source.origin,
+              let domain = source.reader.retainedRegistryDomain, domain == desk.readerDomain else { return }
+        desk.keepCapture(start: entry.range.start, end: entry.range.end, sourceDomain: domain) { work in
+            try await source.withTrailReader(work)
+        }
+        showsDesk = true
     }
     private func openLink(_ target: AtlasReaderDocumentLinkTarget, from source: AtlasSavedReaderCapture) {
         guard linkTask == nil, history.current.id == source.id,

@@ -347,7 +347,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     @State private var readingDesk = AtlasReadingDeskModel(transport: .native)
     @State private var showsReadingDesk = false
     @State private var reviewDeskAfterSheetDismissal = false
-    @State private var savedRepository = AtlasSavedRepositoryModel(transport: .native)
+    @State private var savedRepository = AtlasSavedRepositoryModel(transport: .native, trails: .native)
     @State private var snapshotExport = AtlasSnapshotExportModel(transport: .native)
     @State private var showsSavedRepository = false
     @State private var showsSnapshotComparison = false

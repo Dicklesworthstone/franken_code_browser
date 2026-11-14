@@ -130,6 +130,10 @@ private final class AtlasSavedSession: @unchecked Sendable {
     private(set) var importGeneration: UInt64?
     private(set) var pathPage: AtlasSavedPaths?
     private(set) var pathGeneration: UInt64?
+    private(set) var trailPage: AtlasSavedTrailPage?
+    private(set) var trailGeneration: UInt64?
+    private(set) var trailStateKnown = true
+    private(set) var selectedTrailItem: UInt64?
     private(set) var searchPage: AtlasSavedSearchPage?
     private(set) var queryGeneration: UInt64?
     private(set) var expressionPage: AtlasSavedExpressionPage?
@@ -158,6 +162,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     var searchCaseSensitive = true
     var indexPinInput = ""
     @ObservationIgnored private let transport: AtlasSavedTransport
+    @ObservationIgnored private let trails: AtlasSavedTrailTransport?
     @ObservationIgnored private let io = AtlasProjectIO()
     @ObservationIgnored private var session: AtlasSavedSession?
     @ObservationIgnored private var pending: AtlasSavedSession?
@@ -166,6 +171,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     @ObservationIgnored private var lastRelationshipAttempt: UInt64 = 0
     @ObservationIgnored private var lastImportAttempt: UInt64 = 0
     @ObservationIgnored private var lastPathAttempt: UInt64 = 0
+    @ObservationIgnored private var lastTrailAttempt: UInt64 = 0
     @ObservationIgnored private var lastQueryAttempt: UInt64 = 0
     @ObservationIgnored private var lastExpressionAttempt: UInt64 = 0
     @ObservationIgnored private var lastStructureAttempt: UInt64 = 0
@@ -173,9 +179,23 @@ private final class AtlasSavedSession: @unchecked Sendable {
     @ObservationIgnored private var lastIndexBuildAttempt: UInt64 = 0
     @ObservationIgnored private var indexBuildAccess: AnyObject?
 
-    init(transport: AtlasSavedTransport) { self.transport = transport }
+    init(transport: AtlasSavedTransport, trails: AtlasSavedTrailTransport? = nil) {
+        self.transport = transport; self.trails = trails
+    }
     var canOperate: Bool { !busy && !closed }
     var readerDomain: UUID? { transport.readerDomain }
+    var canOpenTrail: Bool {
+        canOperate && trails != nil && info?.trailStateKnown == true && trailStateKnown &&
+            max(lastTrailAttempt, info?.lastTrailAttempt ?? 0) < UInt64.max
+    }
+    var trailIsCurrent: Bool {
+        guard trailStateKnown, let trailPage else { return false }
+        return trailPage.identity == info?.identity && trailPage.generation == trailGeneration
+    }
+    var selectedTrailEntry: AtlasSavedTrailEntry? {
+        guard trailIsCurrent, let selectedTrailItem else { return nil }
+        return trailPage?.items.first { $0.id == selectedTrailItem }
+    }
     var validPathInput: Bool { AtlasSavedPathWire.validQuery(Array(pathInput.utf8)) }
     var pathSearchIsCurrent: Bool {
         guard let pathPage, info?.identity == pathPage.identity, pathGeneration == pathPage.generation else { return false }
@@ -254,6 +274,8 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 model.relationships = nil; model.relationshipGeneration = nil; model.direction = .all
                 model.imports = nil; model.importGeneration = nil; model.importDirection = .all; model.lastImportAttempt = 0
                 model.pathPage = nil; model.pathGeneration = nil; model.lastPathAttempt = 0; model.pathInput = ""
+                model.trailPage = nil; model.trailGeneration = nil; model.lastTrailAttempt = 0
+                model.trailStateKnown = true; model.selectedTrailItem = nil
                 model.lastRelationshipAttempt = 0; model.memberOffsetInput = "0"
                 model.searchPage = nil; model.queryGeneration = nil; model.lastQueryAttempt = 0; model.searchInput = ""
                 model.expressionPage = nil; model.expressionGeneration = nil; model.lastExpressionAttempt = 0
@@ -415,6 +437,160 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 : "Index acceptance is unconfirmed. Its file grants remain held until status is recovered or the archive is closed."
         }
     }
+    func attachTrail(path: String, accessLease: AnyObject?) {
+        guard canOpenTrail, let info, path.hasPrefix("/"), path.utf8.count <= 16_384,
+              !path.utf8.contains(0) else { return }
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let generation = try model.nextTrailGeneration()
+            model.trailStateKnown = false
+            model.notice = "Reading the selected trail and checking its anchors against this saved manifest…"
+            do {
+                let page = try AtlasSavedTrailPage.decode(await model.runTrail(lease,
+                    .attach(generation: generation, path: path), flag: flag, access: accessLease),
+                    identity: info.identity, generation: generation, start: 0, attachingPath: Array(path.utf8))
+                guard !flag.isCanceled, !model.closed, model.session === lease else { throw AtlasSavedError.canceled }
+                model.acceptTrail(page, selected: page.items.first?.id)
+                model.notice = "Opened \(page.total) ordered trail items. \(page.ready) match this saved archive; source bytes are verified when an item opens."
+            } catch {
+                let recovered = await model.reconcileTrail(lease)
+                model.notice = recovered
+                    ? "Recovered the accepted reading trail after the open reply was unavailable. Review its filename and title before continuing."
+                    : "The accepted trail is unknown. Reload its state before opening an item or replacing it. Previously opened readers remain available."
+            }
+        }
+    }
+    func loadTrailPage(start: UInt64, selecting item: UInt64? = nil) {
+        guard trailIsCurrent, let previous = trailPage, start <= previous.total,
+              item == nil || (item! >= start && item! < min(previous.total, start + AtlasSavedTrailPage.pageSize)) else { return }
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let page = try AtlasSavedTrailPage.decode(await model.runTrail(lease,
+                .page(generation: previous.generation, start: start, limit: AtlasSavedTrailPage.pageSize), flag: flag),
+                identity: previous.identity, generation: previous.generation, start: start)
+            guard !flag.isCanceled, !model.closed, model.session === lease, model.trailIsCurrent,
+                  page.matchesAttachment(previous) else { throw AtlasSavedError.invalidResponse }
+            model.acceptTrail(page, selected: item ?? page.items.first?.id)
+            model.notice = "Showing ordered trail items \(start)..<\(start + UInt64(page.items.count)). This page reads retained references and notes only."
+        }
+    }
+    func selectTrailItem(_ item: UInt64) {
+        guard canOperate, trailIsCurrent, let page = trailPage, item < page.total else { return }
+        if page.items.contains(where: { $0.id == item }) { selectedTrailItem = item }
+        else { loadTrailPage(start: item / AtlasSavedTrailPage.pageSize * AtlasSavedTrailPage.pageSize, selecting: item) }
+    }
+    func reloadTrail() {
+        guard trails != nil, info?.trailStateKnown == true else { return }
+        perform { model, _ in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            model.notice = await model.reconcileTrail(lease)
+                ? "Reloaded the accepted trail without reopening its filename or reading source payloads."
+                : "The accepted trail state is unavailable. Opened source readers remain usable."
+        }
+    }
+    func detachTrail() {
+        guard canOpenTrail, let info, trailGeneration != nil else { return }
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let generation = try model.nextTrailGeneration()
+            model.trailStateKnown = false
+            do {
+                try AtlasSavedTrailPage.decodeDetach(await model.runTrail(lease, .detach(generation: generation), flag: flag),
+                    identity: info.identity, generation: generation)
+                guard !flag.isCanceled, !model.closed, model.session === lease else { throw AtlasSavedError.canceled }
+                model.trailPage = nil; model.trailGeneration = nil; model.selectedTrailItem = nil
+                model.trailStateKnown = true
+                model.notice = "Closed the reading trail. Independent source readers keep their verified captures."
+            } catch {
+                model.notice = await model.reconcileTrail(lease)
+                    ? "Recovered the accepted trail state after the close reply was unavailable."
+                    : "The accepted trail state is unknown. Reload the trail before continuing."
+            }
+        }
+    }
+    private func acceptTrail(_ page: AtlasSavedTrailPage, selected: UInt64?) {
+        trailPage = page; trailGeneration = page.generation; trailStateKnown = true
+        lastTrailAttempt = max(lastTrailAttempt, page.lastAttempt); selectedTrailItem = selected
+    }
+    private func reconcileTrail(_ lease: AtlasSavedSession) async -> Bool {
+        guard !closed, session === lease, let previous = info else { return false }
+        let flag = AtlasSearchCancellation()
+        do {
+            let current = try AtlasSavedInfo.decode(await run(lease, .info, flag: flag), handle: lease.handle,
+                expectedPath: previous.path.bytes, identity: previous.identity)
+            guard !closed, session === lease, current.trailStateKnown,
+                  current.lastTrailAttempt >= previous.lastTrailAttempt else { throw AtlasSavedError.invalidResponse }
+            try acceptInfo(current, lease: lease)
+            lastTrailAttempt = max(lastTrailAttempt, current.lastTrailAttempt)
+            guard let generation = current.trailGeneration else {
+                trailPage = nil; trailGeneration = nil; selectedTrailItem = nil; trailStateKnown = true; return true
+            }
+            let old = trailPage
+            let start = old?.generation == generation ? old!.start : 0
+            let page = try AtlasSavedTrailPage.decode(await runTrail(lease,
+                .page(generation: generation, start: start, limit: AtlasSavedTrailPage.pageSize), flag: flag),
+                identity: current.identity, generation: generation, start: start)
+            guard !closed, session === lease,
+                  old?.generation != generation || page.matchesAttachment(old!) else { throw AtlasSavedError.invalidResponse }
+            let selection = selectedTrailItem.flatMap { wanted in page.items.contains { $0.id == wanted } ? wanted : nil }
+            acceptTrail(page, selected: selection ?? page.items.first?.id)
+            return true
+        } catch {
+            // Keep the last verified notes visible, but they cannot authorize
+            // a handoff until the actual accepted attachment is recovered.
+            trailStateKnown = false; return false
+        }
+    }
+    func canNavigateTrail(from capture: AtlasSavedReaderCapture) -> Bool {
+        guard canOperate, trailIsCurrent, let page = trailPage,
+              capture.archiveIdentity == page.identity,
+              case .trail(let generation, let digest, _) = capture.origin else { return false }
+        return generation == page.generation && digest == page.digest
+    }
+    func openTrailItem(_ entry: AtlasSavedTrailEntry, from page: AtlasSavedTrailPage,
+        readerTransport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
+        outline: AtlasReaderOutlineTransport? = nil, document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasSavedReaderCapture {
+        guard trailIsCurrent, let current = trailPage, current.matchesAttachment(page), current.start == page.start,
+              current.items.contains(where: { $0.matches(entry) }), page.items.contains(where: { $0.matches(entry) }),
+              entry.canOpen, let ordinal = entry.member else { throw AtlasSavedError.invalidInput }
+        selectedTrailItem = entry.id
+        return try await openReader(saved: page.identity, ordinal: ordinal, expected: nil,
+            origin: .trail(generation: page.generation, digest: page.digest, entry: entry),
+            readerTransport: readerTransport, search: search, outline: outline, document: document)
+    }
+    /// Sequence navigation deliberately visits unavailable entries too. It
+    /// leaves their notes selected in the trail instead of silently skipping.
+    func openTrailItem(at item: UInt64, from capture: AtlasSavedReaderCapture,
+        readerTransport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
+        outline: AtlasReaderOutlineTransport? = nil, document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasSavedReaderCapture {
+        guard canNavigateTrail(from: capture), let previous = trailPage, item < previous.total else { throw AtlasSavedError.unavailable }
+        try Task.checkCancellation()
+        if !previous.items.contains(where: { $0.id == item }) {
+            try await fetchTrailPage(item: item, previous: previous)
+        }
+        guard canNavigateTrail(from: capture), let page = trailPage,
+              let entry = page.items.first(where: { $0.id == item }) else { throw AtlasSavedError.invalidResponse }
+        selectedTrailItem = item
+        guard entry.canOpen else { throw AtlasSavedError.unavailableTrailItem(entry.readiness.label) }
+        return try await openTrailItem(entry, from: page, readerTransport: readerTransport,
+            search: search, outline: outline, document: document)
+    }
+    private func fetchTrailPage(item: UInt64, previous: AtlasSavedTrailPage) async throws {
+        guard canOperate, let lease = session else { throw AtlasSavedError.unavailable }
+        let flag = AtlasSearchCancellation(); cancellation = flag; busy = true
+        defer { finish() }
+        let start = item / AtlasSavedTrailPage.pageSize * AtlasSavedTrailPage.pageSize
+        try await withTaskCancellationHandler(operation: {
+            let page = try AtlasSavedTrailPage.decode(await runTrail(lease,
+                .page(generation: previous.generation, start: start, limit: AtlasSavedTrailPage.pageSize), flag: flag),
+                identity: previous.identity, generation: previous.generation, start: start)
+            try Task.checkCancellation()
+            guard !closed, !flag.isCanceled, session === lease, trailIsCurrent,
+                  page.matchesAttachment(previous) else { throw AtlasSavedError.canceled }
+            acceptTrail(page, selected: item)
+        }, onCancel: { flag.cancel(); lease.cancel() })
+    }
+
     private func acceptIndex(_ index: AtlasSavedIndex?, attempt: UInt64, lease: AtlasSavedSession) throws {
         indexPath = try lease.resolveIndex(index)
         self.info?.index = index; self.info?.lastIndexAttempt = attempt
@@ -1368,6 +1544,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
               readerTransport.comparison?.domain == domain else { throw AtlasSavedError.unavailable }
         try Task.checkCancellation()
         let imageDocument = try lease.documentTransport(document, archive: info.identity, sourceMember: ordinal)
+        let trailTransport = trails
         let flag = AtlasSearchCancellation()
         cancellation = flag; busy = true
         let reader = AtlasPagedReaderModel(transport: readerTransport, search: search, outline: outline, document: imageDocument)
@@ -1396,6 +1573,10 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 if case .importLink(_, let link, let side) = origin {
                     guard link.matches(member, side: side) else { throw AtlasSavedError.invalidResponse }
                 }
+                if case .trail(_, _, let entry) = origin {
+                    try entry.validate(in: info.identity)
+                    guard entry.matches(member) else { throw AtlasSavedError.invalidResponse }
+                }
                 let contextStart: UInt64
                 if let hit = origin.searchHit {
                     guard member.id == hit.member, member.file == hit.file, member.file == hit.revision,
@@ -1407,28 +1588,39 @@ private final class AtlasSavedSession: @unchecked Sendable {
                     contextStart = range.contextStart
                 } else if case .importLink(_, let link, .evidence) = origin {
                     contextStart = link.evidence.contextStart
+                } else if case .trail(_, _, let entry) = origin {
+                    contextStart = entry.range.contextStart
                 } else { contextStart = 0 }
                 let receipt = AtlasSavedReaderReceiptBox()
                 try await reader.openRetained(pathBytes: member.path.bytes, offset: contextStart, registryDomain: domain) { destination in
                     guard !flag.isCanceled else { throw AtlasSavedError.canceled }
-                    let request: AtlasSavedRequest
-                    switch origin {
-                    case .member: request = .openMember(reader: destination, member: member.id)
-                    case .pathHit(let generation, let hit):
-                        request = .openPathHit(reader: destination, generation: generation, hit: hit.id)
-                    case .relationship(let generation, let link, let side):
-                        request = .openRelationship(reader: destination, generation: generation, link: link.id, side: side)
-                    case .importLink(let generation, let link, let side):
-                        request = .openImport(reader: destination, generation: generation, importID: link.id, side: side)
-                    case .hit(let generation, _, let hit, _):
-                        request = .openHit(reader: destination, generation: generation, hit: hit.id)
-                    case .expressionHit(let generation, _, _, let hit, _):
-                        request = .openExpressionHit(reader: destination, generation: generation, hit: hit.id)
-                    case .structureHit(let generation, _, _, _, let item):
-                        request = .openStructureHit(reader: destination, generation: generation, hit: item.id)
+                    let response: String?
+                    if case .trail(let generation, _, let entry) = origin {
+                        guard let trailTransport else { throw AtlasSavedError.unavailable }
+                        response = trailTransport.run(lease.handle,
+                            .openReader(reader: destination, generation: generation, item: entry.id))
+                    } else {
+                        let request: AtlasSavedRequest
+                        switch origin {
+                        case .trail: throw AtlasSavedError.invalidResponse
+                        case .member: request = .openMember(reader: destination, member: member.id)
+                        case .pathHit(let generation, let hit):
+                            request = .openPathHit(reader: destination, generation: generation, hit: hit.id)
+                        case .relationship(let generation, let link, let side):
+                            request = .openRelationship(reader: destination, generation: generation, link: link.id, side: side)
+                        case .importLink(let generation, let link, let side):
+                            request = .openImport(reader: destination, generation: generation, importID: link.id, side: side)
+                        case .hit(let generation, _, let hit, _):
+                            request = .openHit(reader: destination, generation: generation, hit: hit.id)
+                        case .expressionHit(let generation, _, _, let hit, _):
+                            request = .openExpressionHit(reader: destination, generation: generation, hit: hit.id)
+                        case .structureHit(let generation, _, _, _, let item):
+                            request = .openStructureHit(reader: destination, generation: generation, hit: item.id)
+                        }
+                        response = lease.transport.run(lease.handle, request)
                     }
                     return try withExtendedLifetime(lease) {
-                        let accepted = try AtlasSavedReaderReceipt.decode(lease.transport.run(lease.handle, request),
+                        let accepted = try AtlasSavedReaderReceipt.decode(response,
                             saved: info.identity, member: member, origin: origin, destination: destination)
                         try receipt.set(accepted)
                         return accepted.readerJSON
@@ -1478,6 +1670,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         direction = .all; lastRelationshipAttempt = 0; memberOffsetInput = "0"
         imports = nil; importGeneration = nil; importDirection = .all; lastImportAttempt = 0
         pathPage = nil; pathGeneration = nil; pathInput = ""; lastPathAttempt = 0
+        trailPage = nil; trailGeneration = nil; selectedTrailItem = nil; lastTrailAttempt = 0; trailStateKnown = true
         searchPage = nil; queryGeneration = nil; lastQueryAttempt = 0; searchInput = ""
         expressionPage = nil; expressionGeneration = nil; lastExpressionAttempt = 0
         structurePage = nil; structureGeneration = nil; lastStructureAttempt = 0
@@ -1493,6 +1686,12 @@ private final class AtlasSavedSession: @unchecked Sendable {
     private func run(_ lease: AtlasSavedSession, _ request: AtlasSavedRequest,
         flag: AtlasSearchCancellation) async throws -> String? {
         try await io.perform(cancellation: flag, keepingAlive: [lease]) { lease.transport.run(lease.handle, request) }
+    }
+    private func runTrail(_ lease: AtlasSavedSession, _ request: AtlasSavedTrailRequest,
+        flag: AtlasSearchCancellation, access: AnyObject? = nil) async throws -> String? {
+        guard let trails else { throw AtlasSavedError.unavailable }
+        let retained: [AnyObject] = [lease] + (access.map { [$0] } ?? [])
+        return try await io.perform(cancellation: flag, keepingAlive: retained) { trails.run(lease.handle, request) }
     }
     private func perform(_ work: @escaping @MainActor (AtlasSavedRepositoryModel, AtlasSearchCancellation) async throws -> Void) {
         guard canOperate else { return }
@@ -1527,6 +1726,11 @@ private final class AtlasSavedSession: @unchecked Sendable {
         let previous = max(lastPathAttempt, max(pathGeneration ?? 0, info?.lastPathAttempt ?? 0))
         guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
         lastPathAttempt = previous + 1; return lastPathAttempt
+    }
+    private func nextTrailGeneration() throws -> UInt64 {
+        let previous = max(lastTrailAttempt, max(trailGeneration ?? 0, info?.lastTrailAttempt ?? 0))
+        guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
+        lastTrailAttempt = previous + 1; return lastTrailAttempt
     }
     private func nextExpressionGeneration() throws -> UInt64 {
         let previous = max(lastExpressionAttempt, max(expressionGeneration ?? 0, info?.lastExpressionAttempt ?? 0))

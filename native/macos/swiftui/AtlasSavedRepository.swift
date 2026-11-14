@@ -3,6 +3,7 @@ import Foundation
 enum AtlasSavedError: Error, Sendable {
     case unavailable, invalidInput, invalidResponse, canceled, engine(String)
     case staleDocumentLink, unindexedDocumentLink, unavailableDocumentTarget
+    case unavailableTrailItem(String)
     var message: String {
         switch self {
         case .unavailable: return "The saved repository could not admit this operation."
@@ -12,6 +13,7 @@ enum AtlasSavedError: Error, Sendable {
         case .staleDocumentLink: return "The saved archive or originating document preview changed. Return to that captured document and choose the link again."
         case .unindexedDocumentLink: return "This occurrence is outside the retained saved-link inventory. Its coverage may be partial; no target was opened."
         case .unavailableDocumentTarget: return "This link has no captured target in the opened archive. No working-tree file was opened."
+        case .unavailableTrailItem(let reason): return "\(reason). The item's notes remain selected in the reading trail; this reader is unchanged."
         case .engine(let code): return "Saved repository operation unavailable (\(code))."
         }
     }
@@ -127,6 +129,9 @@ struct AtlasSavedInfo: Sendable {
     let pathGeneration: UInt64?
     let lastPathAttempt: UInt64
     let pathStateKnown: Bool
+    let trailGeneration: UInt64?
+    let lastTrailAttempt: UInt64
+    let trailStateKnown: Bool
     var index: AtlasSavedIndex?
     var lastIndexAttempt: UInt64
     var lastIndexBuildAttempt: UInt64
@@ -149,6 +154,7 @@ struct AtlasSavedInfo: Sendable {
                     w.expressionAttempt == 0 && w.structure == nil && w.structureAttempt == 0 && w.indexAttempt == 0 &&
                     w.indexBuildAttempt == 0 && w.indexBuildOperation == nil &&
                     w.importGeneration == nil && w.importAttempt == 0 && w.pathGeneration == nil && w.pathAttempt == 0 &&
+                    w.trailGeneration == nil && w.trailAttempt == 0 &&
                     w.memberBytes.value == 0 && w.memberCalls.value == 0) else { throw AtlasSavedError.invalidResponse }
             return Self(identity: actualIdentity,
                 path: w.path, relationshipGeneration: w.relationship, queryGeneration: w.query,
@@ -157,6 +163,7 @@ struct AtlasSavedInfo: Sendable {
                 lastStructureAttempt: w.structureAttempt, structureStateKnown: w.structureKnown,
                 importGeneration: w.importGeneration, lastImportAttempt: w.importAttempt, importStateKnown: w.importKnown,
                 pathGeneration: w.pathGeneration, lastPathAttempt: w.pathAttempt, pathStateKnown: w.pathKnown,
+                trailGeneration: w.trailGeneration, lastTrailAttempt: w.trailAttempt, trailStateKnown: w.trailKnown,
                 index: index, lastIndexAttempt: w.indexAttempt,
                 lastIndexBuildAttempt: w.indexBuildAttempt, lastIndexBuildOperation: w.indexBuildOperation,
                 indexBuildStateKnown: w.indexBuildKnown, initialArchiveBytes: w.initial.value,
@@ -183,6 +190,9 @@ struct AtlasSavedInfo: Sendable {
         let pathGeneration: UInt64?
         let pathAttempt: UInt64
         let pathKnown: Bool
+        let trailGeneration: UInt64?
+        let trailAttempt: UInt64
+        let trailKnown: Bool
         let initial, memberBytes, memberCalls: AtlasSavedNumber
         enum CodingKeys: CodingKey {
             case archive_path, accepted_relationship_generation, accepted_query_generation, accepted_index_generation,
@@ -191,6 +201,7 @@ struct AtlasSavedInfo: Sendable {
                  accepted_structure_generation, last_structure_attempt,
                  accepted_import_generation, last_import_attempt,
                  accepted_path_generation, last_path_attempt,
+                 accepted_trail_generation, last_trail_attempt,
                  initial_archive_bytes_read, member_bytes_read, member_read_calls
         }
         init(from decoder: Decoder) throws {
@@ -253,6 +264,15 @@ struct AtlasSavedInfo: Sendable {
                 pathAttempt = try c.decode(AtlasSavedNumber.self, forKey: .last_path_attempt).value
             } else { pathGeneration = nil; pathAttempt = 0 }
             guard pathGeneration == nil || pathGeneration! <= pathAttempt else { throw AtlasSavedError.invalidResponse }
+            trailKnown = c.contains(.accepted_trail_generation) && c.contains(.last_trail_attempt)
+            guard c.contains(.accepted_trail_generation) == c.contains(.last_trail_attempt) else {
+                throw AtlasSavedError.invalidResponse
+            }
+            if trailKnown {
+                trailGeneration = try generation(.accepted_trail_generation)
+                trailAttempt = try c.decode(AtlasSavedNumber.self, forKey: .last_trail_attempt).value
+            } else { trailGeneration = nil; trailAttempt = 0 }
+            guard trailGeneration == nil || trailGeneration! <= trailAttempt else { throw AtlasSavedError.invalidResponse }
             initial = try c.decode(AtlasSavedNumber.self, forKey: .initial_archive_bytes_read)
             memberBytes = try c.decode(AtlasSavedNumber.self, forKey: .member_bytes_read)
             memberCalls = try c.decode(AtlasSavedNumber.self, forKey: .member_read_calls)

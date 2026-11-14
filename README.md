@@ -92,7 +92,7 @@ development.
 | Surface | Current state |
 |---|---|
 | Rust engine and bridge | Workspace discovery, exact source captures, layout, search, saved-repository and reader services, retained City geometry/cameras/CPU picking, plus a C ABI for the native shell. |
-| Headless `fcb` binary | Explicit file/workspace inspection, bounded reading and exact text/byte search with versioned JSON. Bare `fcb` and human `fcb open` still report that the GUI launcher is unavailable in this binary. |
+| Headless `fcb` binary | Explicit file/workspace inspection, bounded reading and exact text/byte search with versioned JSON; saved archives and reading-trail creation, reading and export. On macOS, bare `fcb` and human `fcb open` can hand off to an installed native app. |
 | Native app | [`native/macos/`](native/macos/) contains a SwiftUI shell with dense text parcels, directory outlines, Monokai-inspired color, Metal glyph presentation, camera gestures, exact-text search with a match count, file-type filters, a source reader and local prepared-text cache. The source also includes an optional retained Metal City view with metric heights and selection into the existing reader. A notarized developer-preview DMG is available. |
 | Future work | Full rich Markdown reading, complete native accessibility/IME, City GPU/interaction qualification, release-grade smoothness, clean-machine distribution qualification and independent native verification remain open. |
 
@@ -106,6 +106,14 @@ Open a repository → explore its atlas → select a file → read exact source
 
 The browsing product does not execute project code to open a directory. Editing, builds,
 debuggers and terminals are outside its initial release scope.
+
+**Saved reading trails connect exact source with user notes.** The native Saved Repository
+window opens FCBT trails, keeps mixed-archive and unavailable visits visible, and follows
+ordered ranges through independently verified archived readers. Ranges can be retained in
+the Reading Desk, including point bookmarks and selections spanning several pages. See
+[the native workflow](native/macos/README.md#following-saved-reading-trails) for controls and
+the existing CLI commands that create trails. This source implementation still requires
+independent native verification.
 
 **City uses the same map.** Its buildings retain the current file footprints and IDs;
 height is a bounded logarithmic transform of **observed file bytes**, capped at 1 GiB,
@@ -273,8 +281,8 @@ fcb capabilities --json
 fcb doctor --json
 ```
 
-Those source commands are implemented in `fcb-app`; native GUI launch, `trail export`, and several
-planned commands are not. See the [CLI reference](crates/fcb-app/README.md) for supported flags,
+Those source commands, macOS native launch handoff and bounded `trail` commands are implemented
+in `fcb-app`. See the [CLI reference](crates/fcb-app/README.md) for supported flags,
 scope limits, output schema and qualification boundaries. `doctor` is a static capability report,
 not a benchmark or repair command. On this development machine, Cargo builds use the configured
 remote-compilation lane and require disk-pressure preflight.

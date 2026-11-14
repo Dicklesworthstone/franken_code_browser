@@ -59,9 +59,11 @@ but is not a recursively authorized workspace. A directory requires explicit
 `--workspace` on `inspect` or `search`. Selecting stdin, a single file, or a
 metadata diagnostic never silently widens that authority.
 
-Persistent index/cache commands, trail export, replay, Markdown preview, regex,
-and the native launcher remain unavailable. This CLI lane does not claim
-completion of all FCB-057 acceptance criteria.
+The CLI also provides bounded saved-archive and reading-trail commands, including
+`trail add`, `inspect`, `read` and `export`. The native Saved Repository window can
+follow the resulting FCBT files; see [reading-trail usage](../../native/macos/README.md#following-saved-reading-trails).
+On macOS, human `fcb open` and bare `fcb` can hand off to an installed native app.
+This CLI lane does not claim completion of all FCB-057 acceptance criteria.
 
 ## Whole-file streaming search
 
