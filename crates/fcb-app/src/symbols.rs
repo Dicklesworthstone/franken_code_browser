@@ -31,7 +31,7 @@ const HELP: &str = "fcb symbols FILE [--name TEXT] [--match exact|prefix|contain
 fcb symbols ROOT --workspace [--name TEXT] [--json]\n\
 fcb symbols SAVED.fcbs --snapshot [--member PATH | --member-hex HEX] [--name TEXT] [--json]\n\
 Reference candidates: add --references --name IDENTIFIER to any scope above.\n\
-Options: --language rust|python|javascript|typescript|go|cpp\n\
+Options: --language rust|python|javascript|typescript|go|cpp|swift\n\
          --encoding utf8|utf16le|utf16be --limit N --max-files N --max-bytes N\n\
          --include-excluded (workspace only)\n\
 Lists declaration candidates from bounded outline recognition, NOT compiler definitions.\n\

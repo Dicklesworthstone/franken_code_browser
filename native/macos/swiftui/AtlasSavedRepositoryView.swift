@@ -723,7 +723,7 @@ final class AtlasSavedFileAccess {
     private var structureExplanation: String {
         switch model.searchMode {
         case .symbols:
-            return "Heuristic declarations from Rust, Python, JavaScript, TypeScript, Go and C/C++. Qualified names use the shared outline engine; results do not claim compiler resolution."
+            return "Heuristic declarations from Rust, Python, JavaScript, TypeScript, Go, C/C++ and Swift. Qualified names use the shared outline engine; results do not claim compiler resolution."
         case .headings:
             return "Markdown titles and duplicate-aware slugs come from FrankenMarkdown. Only qualified original source ranges can open a result."
         case .occurrences:

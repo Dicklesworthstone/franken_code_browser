@@ -188,6 +188,12 @@ private final class Driver: @unchecked Sendable {
         }
         let outline = try decode(Fixture.outline())
         check(outline.rows.count == 2 && outline.inventory.generation == 1, "outline admission")
+        // Decoder coverage only; production Rust/CLI fixtures exercise Swift
+        // extraction and exact source ranges without substituting this driver.
+        check(AtlasOutlineLanguage.swift.engineName == "swift", "Swift language option lost")
+        let swiftOutline = try decode(Fixture.outline(language: "swift"))
+        check(swiftOutline.inventory.language == "swift" && swiftOutline.rows.count == 2,
+            "Swift result rejected by native outline decoder")
         check(outline.target(id: 0) == nil && outline.target(id: 3) == nil, "row offset used as symbol ID")
         check(outline.rows[0].name == "café" && outline.rows[0].nameRange == AtlasOutlineRange(start: 8, end: 16), "UTF-16 identity span")
         let target = outline.target(id: 1)!

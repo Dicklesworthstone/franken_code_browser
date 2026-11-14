@@ -400,7 +400,7 @@ member names are labels and never open working-tree paths.
 
 | Mode | Matching and evidence | Per-member source limit |
 | --- | --- | --- |
-| Symbols | Case-sensitive exact, prefix, or contains matching against shared outline names, including qualified names. Rust, Python, JavaScript, TypeScript, Go and C/C++ declarations are heuristic candidates. | 64 KiB |
+| Symbols | Case-sensitive exact, prefix, or contains matching against shared outline names, including qualified names. Rust, Python, JavaScript, TypeScript, Go, C/C++ and Swift declarations are heuristic candidates. | 64 KiB |
 | Headings | Case-sensitive exact, prefix, or contains matching against FrankenMarkdown heading titles. Results retain duplicate-aware slugs and qualified original source ranges. | 256 KiB |
 | Occurrences | One exact identifier token, including spelling matches in declarations, comments and string literals. Supported UTF-8 and BOM-marked UTF-16 keep their original byte coordinates. | 512 KiB |
 
@@ -440,6 +440,46 @@ They cover qualified names whose source spelling differs, headings, UTF-16
 occurrences, large target ranges, partial coverage, independent generations,
 lost replies, cancellation and stale or forged activation receipts. Executable
 Rust/Swift verification and physical-Mac qualification remain pending.
+
+## Navigating Swift declarations
+
+Swift source now participates in **Symbols** searches in live projects and saved
+repositories, and in the retained reader and Reading Desk **Outline** tools.
+The reader infers Swift from the filename (including an uppercase suffix); its
+language selector also offers **swift** for captures with another extension.
+Choose a candidate to select its original name bytes, or copy its declaration
+evidence from the same retained capture. UTF-8 BOM and BOM-marked UTF-16 captures
+preserve their original byte coordinates.
+
+The Swift route recognizes structs, classes, actors, enums, protocols,
+extensions, nested types, functions, methods, initializers, deinitializers,
+subscripts, simple stored/computed properties and type aliases. Protocol
+requirements without bodies remain navigable. Single escaped identifiers select
+the spelling inside their backticks; qualified extension names retain their
+complete original spelling. Access modifiers, attributes and generic signatures
+do not change the candidate's identity.
+
+The pinned FrankenMarkdown Swift lexer owns comment and string boundaries.
+Nested comments, raw/multiline strings, imports, function bodies, property
+bodies and closures do not contribute declarations. This is a conservative
+declaration recognizer: local declarations, enum cases, tuple and secondary
+comma-separated bindings, macro expansion and compiler name resolution are
+outside its scope. It does not evaluate conditional compilation or claim a
+complete Swift grammar or symbol inventory.
+
+The shared 64 KiB original/decoded source, 4,096-line and 4,096-candidate limits
+apply. Swift additionally caps delimiter nesting at 128 and a retained name at
+4,096 UTF-8 bytes. Mismatched or unclosed delimiters produce an explicit
+extraction refusal while the source remains readable; reaching the item limit
+keeps the existing partial-result label. Cancellation and replaced query
+generations retain the existing reader/session authority checks.
+
+Regression cases cover actual extraction, CLI file/workspace/offline-archive
+routes, retained-reader selection and copy, original UTF-16 offsets, protocol
+requirements, opaque syntax, limits and cancellation. The native decoder admits
+the Swift language without changing evidence or capture validation. These
+cases are authored; executable Rust/Swift verification and physical-Mac
+qualification remain pending.
 
 ## Following imports in a saved repository
 

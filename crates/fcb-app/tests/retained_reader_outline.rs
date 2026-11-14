@@ -231,3 +231,51 @@ fn response_ownership_and_absent_candidates_do_not_claim_semantic_completeness()
     assert!(out.as_str().contains("\"retained_symbols\":\"0\""));
     assert!(out.as_str().contains("\"semantic_complete\":false"));
 }
+
+
+#[test]
+fn swift_outline_inference_override_filter_and_copy_preserve_the_retained_capture() {
+    let text = "// 😀\r\nactor Loader {\r\n    func `repeat`() {}\r\n}\n";
+    for little in [true, false] {
+        let encode = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(|unit|
+            if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect() };
+        let mut source = if little { vec![0xff, 0xfe] } else { vec![0xfe, 0xff] };
+        source.extend_from_slice(&encode(text));
+        let mut r = ReaderSession::from_bytes(ArenaOwnerId::new(9311).unwrap(),
+            Path::new("Loader.SWIFT"), &source, || false).unwrap();
+        let address = r.capture().bytes().as_ptr();
+        let outline = r.prepare_outline(1, Default::default(), || false).unwrap();
+        assert_eq!(outline.exit_code(), EXIT_OK);
+        assert!(outline.as_str().contains("\"language\":\"swift\""));
+        assert!(outline.as_str().contains("\"kind\":\"actor\""));
+        assert!(outline.as_str().contains("\"semantic_complete\":false"));
+        let target = id(&mut r, 1, "repeat");
+        let selected = r.symbol_range(1, target, false).unwrap();
+        assert_eq!(bytes(&r, selected), encode("repeat"));
+        let page = r.symbol_window(1, target, 256, || false).unwrap();
+        assert!(page.as_str().contains("\"declaration_line\":\"3\""));
+        assert!(page.as_str().contains("\"selection_namespace\":\"outline\""));
+        let copied = r.copy_symbol(1, target, false, || false).unwrap();
+        assert!(copied.as_str().contains(&format!("\"original_hex\":\"{}\"", hex(&encode("repeat")))));
+        assert!(copied.as_str().contains("\"additional_source_bytes_read\":\"0\""));
+        assert_eq!(r.capture().bytes().as_ptr(), address);
+        r.prepare_outline(2, ReaderOutlineOptions { language: Some(SymbolLanguage::Swift),
+            ..Default::default() }, || false).unwrap();
+        let replacement = id(&mut r, 2, "repeat");
+        assert_eq!(bytes(&r, r.symbol_range(2, replacement, false).unwrap()), encode("repeat"));
+        assert_eq!(r.symbol_range(1, target, false).err(),
+            Some(ReaderSessionError::Symbol(SymbolError::StaleQuery)));
+    }
+}
+
+#[test]
+fn malformed_swift_outline_refusal_preserves_source_reading() {
+    let source = b"struct Incomplete { func kept() {}";
+    let mut r = ReaderSession::from_bytes(ArenaOwnerId::new(9312).unwrap(),
+        Path::new("Incomplete.swift"), source, || false).unwrap();
+    assert_eq!(r.prepare_outline(1, Default::default(), || false).err(),
+        Some(ReaderSessionError::Symbol(SymbolError::InvalidEvidence)));
+    assert!(r.read_window(0, source.len(), || false).is_ok());
+    assert!(r.copy_range(0, source.len() as u64, || false).is_ok());
+    assert_eq!(r.outline_generation(), None);
+}

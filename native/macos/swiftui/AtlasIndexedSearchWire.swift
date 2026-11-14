@@ -233,7 +233,7 @@ enum AtlasIndexedStructure {
                 && hit.excerpt?.matchesSourceText(needle) != false
         case .symbols:
             return value.headingSlug == nil
-                && ["rust", "python", "javascript", "typescript", "go", "cpp"].contains(value.language)
+                && ["rust", "python", "javascript", "typescript", "go", "cpp", "swift"].contains(value.language)
         case .text, .expression: return false
         }
     }

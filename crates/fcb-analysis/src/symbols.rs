@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Navigation adapter for the existing outline extractor, not another parser.
+//! Navigation adapters over the existing outline extractor and shared lexers.
 //!
 //! The legacy language routes recognize only a subset of declarations and some
 //! use line heuristics. Every non-fallback result here is therefore a CANDIDATE,
@@ -13,6 +13,8 @@
 //! Rust, and at most 128 bytes of Python indentation. These conservative guards
 //! bound recursive extraction/destruction without trusting legacy max_depth or
 //! max_items settings. Rejected files remain available to the ordinary reader.
+//! Swift uses the pinned upstream lexer and a bounded declaration recognizer;
+//! it does not introduce another lexer or compiler-semantic claims.
 
 use std::mem::size_of;
 use fcb_core::{ByteLength, ByteRange, DecodedUtf8Offset, DecodedUtf8Range, FileId,
@@ -20,24 +22,27 @@ use fcb_core::{ByteLength, ByteRange, DecodedUtf8Offset, DecodedUtf8Range, FileI
 use fcb_source::{CaptureEncodingMap, CaptureRequest, DetectedEncoding, SpanKind, detect_encoding};
 use crate::{ExtractorLimits, OutlineExtractor, OutlineItem, OutlineItemKind};
 
+mod swift;
+
 pub const MAX_SYMBOL_SOURCE_BYTES: usize = 64 * 1024;
 pub const MAX_SYMBOL_ITEMS: usize = 4096;
 const MAX_LINES: usize = 4096;
 const MAX_RECURSIVE_SCOPES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SymbolLanguage { Rust, Python, JavaScript, TypeScript, Go, Cpp }
+pub enum SymbolLanguage { Rust, Python, JavaScript, TypeScript, Go, Cpp, Swift }
 impl SymbolLanguage {
     pub const fn name(self) -> &'static str {
         match self { Self::Rust => "rust", Self::Python => "python", Self::JavaScript => "javascript",
-            Self::TypeScript => "typescript", Self::Go => "go", Self::Cpp => "cpp" }
+            Self::TypeScript => "typescript", Self::Go => "go", Self::Cpp => "cpp", Self::Swift => "swift" }
     }
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "rust" | "rs" => Some(Self::Rust), "python" | "py" => Some(Self::Python),
             "javascript" | "js" | "jsx" | "mjs" | "cjs" => Some(Self::JavaScript),
             "typescript" | "ts" | "tsx" => Some(Self::TypeScript), "go" => Some(Self::Go),
-            "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" => Some(Self::Cpp), _ => None,
+            "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" => Some(Self::Cpp),
+            "swift" => Some(Self::Swift), _ => None,
         }
     }
     /// Only inspect a raw filename suffix. No lossy path conversion or source I/O.
@@ -160,19 +165,24 @@ impl<'source> CapturedSymbols<'source> {
         line_starts.push(0);
         line_starts.extend(text.bytes().enumerate().filter_map(|(i, b)| (b == b'\n').then_some(i + 1)));
         if canceled() { return Err(SymbolError::Canceled); }
-        // Do not pass the caller's display limit into extraction: nested items
-        // outside earlier top-level results must not disappear during filtering.
-        let extracted = OutlineExtractor::new(ExtractorLimits { max_items: MAX_SYMBOL_SOURCE_BYTES,
-            max_depth: MAX_RECURSIVE_SCOPES, work_budget_bytes: MAX_SYMBOL_SOURCE_BYTES, lines_per_block: 50 })
-            .extract(request.file(), request.revision(), language.name(), text.as_bytes());
-        if canceled() { return Err(SymbolError::Canceled); }
-        let mut candidates = Vec::new();
-        candidates.try_reserve_exact(max_items).map_err(|_| SymbolError::ResourceDenied)?;
-        if candidates.capacity() > max_items { return Err(SymbolError::ResourceDenied); }
-        let mut limited = false;
-        for item in &extracted.items {
-            append(item, None, 0, &map, &line_starts, &mut candidates, max_items, &mut limited, &mut canceled)?;
-        }
+        let (candidates, limited) = if language == SymbolLanguage::Swift {
+            swift::extract(&map, &line_starts, max_items, &mut canceled)?
+        } else {
+            // Do not pass the caller's display limit into extraction: nested items
+            // outside earlier top-level results must not disappear during filtering.
+            let extracted = OutlineExtractor::new(ExtractorLimits { max_items: MAX_SYMBOL_SOURCE_BYTES,
+                max_depth: MAX_RECURSIVE_SCOPES, work_budget_bytes: MAX_SYMBOL_SOURCE_BYTES, lines_per_block: 50 })
+                .extract(request.file(), request.revision(), language.name(), text.as_bytes());
+            if canceled() { return Err(SymbolError::Canceled); }
+            let mut candidates = Vec::new();
+            candidates.try_reserve_exact(max_items).map_err(|_| SymbolError::ResourceDenied)?;
+            if candidates.capacity() > max_items { return Err(SymbolError::ResourceDenied); }
+            let mut limited = false;
+            for item in &extracted.items {
+                append(item, None, 0, &map, &line_starts, &mut candidates, max_items, &mut limited, &mut canceled)?;
+            }
+            (candidates, limited)
+        };
         let fallback = candidates.is_empty() && !source.is_empty();
         if canceled() { return Err(SymbolError::Canceled); }
         Ok(Self { source, request, generation, language, encoding, candidates, limited, fallback, _lease: lease })

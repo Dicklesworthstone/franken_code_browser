@@ -186,7 +186,7 @@ struct AtlasSavedStructureHit: Decodable, Sendable, Identifiable {
         switch mode {
         case .symbols:
             guard structure.headingSlug == nil,
-                  ["rust", "python", "javascript", "typescript", "go", "cpp"].contains(structure.language) else {
+                  ["rust", "python", "javascript", "typescript", "go", "cpp", "swift"].contains(structure.language) else {
                 throw AtlasSavedError.invalidResponse
             }
         case .headings:

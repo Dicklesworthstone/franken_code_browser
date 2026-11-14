@@ -220,3 +220,56 @@ fn actual_binary_exercises_workspace_and_offline_symbol_routes() {
     let parsed = parse(&result.stdout).unwrap();
     assert_eq!(parsed.get("candidates").array().len(), 2); assert!(!parsed.get("live_roots_accessed").flag());
 }
+
+
+#[test]
+fn swift_file_and_explicit_language_commands_return_real_declaration_ranges() {
+    let fixture = Fixture::new();
+    let source = b"import class Foundation.NSObject\nstruct Browser {\n    func open() {}\n}\n";
+    fixture.file("Browser.swift", source);
+    fixture.file("source.txt", source);
+    for (path, explicit) in [("Browser.swift", false), ("source.txt", true)] {
+        let mut args = fixture.file_args(path);
+        values(&mut args, &["--name", "open"]);
+        if explicit { values(&mut args, &["--language", "swift"]); }
+        let (exit, output) = invoke(&args, || false);
+        assert_eq!(exit, EXIT_OK);
+        assert!(!output.get("compiler_resolved").flag());
+        assert!(!output.get("symbol_inventory_complete").flag());
+        let candidates = output.get("candidates").array();
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.get("language").text(), "swift");
+        assert_eq!(candidate.get("kind").text(), "method");
+        assert_eq!(candidate.get("line").number(), 3);
+        let name = candidate.get("name_range");
+        assert_eq!(&source[name.get("start").number() as usize..name.get("end").number() as usize], b"open");
+        assert_eq!(output.get("stats").get("unsupported_language_files").number(), 0);
+    }
+}
+
+#[test]
+fn swift_workspace_and_offline_snapshot_routes_count_only_recognized_file_suffixes() {
+    let fixture = Fixture::new();
+    fixture.file("Browser.SWIFT", b"actor Browser { func open() {} }\n");
+    fixture.file("notes.txt", b"func open() {}\n");
+    let mut args = fixture.workspace_args();
+    values(&mut args, &["--name", "open"]);
+    let (exit, output) = invoke(&args, || false);
+    assert_eq!(exit, EXIT_PARTIAL);
+    assert_eq!(output.get("candidates").array().len(), 1);
+    assert_eq!(output.get("candidates").array()[0].get("language").text(), "swift");
+    assert_eq!(output.get("stats").get("analyzed_files").number(), 1);
+    assert_eq!(output.get("stats").get("unsupported_language_files").number(), 1);
+    fixture.save();
+    fs::rename(fixture.root(), fixture.0.join("retired-root")).unwrap();
+    let mut saved = fixture.saved_args();
+    values(&mut saved, &["--name", "open"]);
+    let (exit, output) = invoke(&saved, || false);
+    assert_eq!(exit, EXIT_PARTIAL);
+    assert!(!output.get("live_roots_accessed").flag());
+    assert_eq!(output.get("candidates").array().len(), 1);
+    assert_eq!(output.get("candidates").array()[0].get("name").text(), "open");
+    assert_eq!(output.get("candidates").array()[0].get("language").text(), "swift");
+    assert_eq!(output.get("stats").get("unsupported_language_files").number(), 1);
+}

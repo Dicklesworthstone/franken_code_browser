@@ -59,6 +59,12 @@ pub enum OutlineItemKind {
     Struct,
     /// Class declaration.
     Class,
+    /// Swift actor declaration.
+    Actor,
+    /// Swift protocol declaration.
+    Protocol,
+    /// Swift extension declaration.
+    Extension,
     /// Interface declaration.
     Interface,
     /// Trait declaration.
@@ -73,6 +79,16 @@ pub enum OutlineItemKind {
     Function,
     /// Method within a class, struct, or impl block.
     Method,
+    /// Initializer declaration.
+    Initializer,
+    /// Deinitializer declaration.
+    Deinitializer,
+    /// Subscript declaration.
+    Subscript,
+    /// Stored or computed property declaration.
+    Property,
+    /// Top-level mutable variable declaration.
+    Variable,
     /// Markdown heading with 1-based level (1..=6).
     Heading { level: u8 },
     /// Constant or static item.
@@ -91,6 +107,9 @@ impl OutlineItemKind {
             Self::Module => "module",
             Self::Struct => "struct",
             Self::Class => "class",
+            Self::Actor => "actor",
+            Self::Protocol => "protocol",
+            Self::Extension => "extension",
             Self::Interface => "interface",
             Self::Trait => "trait",
             Self::Impl => "impl",
@@ -98,6 +117,11 @@ impl OutlineItemKind {
             Self::Variant => "variant",
             Self::Function => "function",
             Self::Method => "method",
+            Self::Initializer => "initializer",
+            Self::Deinitializer => "deinitializer",
+            Self::Subscript => "subscript",
+            Self::Property => "property",
+            Self::Variable => "variable",
             Self::Heading { .. } => "heading",
             Self::Const => "const",
             Self::TypeAlias => "type",

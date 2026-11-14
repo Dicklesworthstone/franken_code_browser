@@ -9,7 +9,7 @@ struct AtlasReaderOutlineTransport: Sendable {
 }
 
 enum AtlasOutlineLanguage: String, CaseIterable, Identifiable, Sendable {
-    case automatic = "", rust, python, javascript, typescript, go, cpp
+    case automatic = "", rust, python, javascript, typescript, go, cpp, swift
     var id: String { rawValue }
     var label: String { self == .automatic ? "Infer from filename" : rawValue }
     var engineName: String? { self == .automatic ? nil : rawValue }
