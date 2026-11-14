@@ -993,3 +993,25 @@ Public-path regressions cover CLI scopes, live/indexed structural search,
 UTF-16 evidence, retained C-bridge copies after live source replacement, lexical
 contexts, limits, cancellation and stale activation. These tests are authored;
 independent executable verification remains pending.
+
+## Retained relationship parcel geometry
+
+Live documentation/import page receipts now include the additive
+`geometry_projection: "retained-atlas-parcels-v1"` capability. The header
+contains `world` and nullable `filter_parcel`; each retained row contains
+`source_parcel` and nullable `target_parcel`. Rectangles use decimal-string
+`x`, `y`, `w` and `h` fields alongside the existing canonical identity fields.
+
+Every rectangle comes from that relationship owner's retained workspace atlas,
+under the existing source-manifest, layout, index, capture-manifest and
+relationship-generation receipt. It is independent of the current display
+`view()`. This serialization performs no source I/O, graph traversal or new
+layout. A target parcel identifies catalog placement, not captured-source
+availability. The selected file's parcel is retained even when its filtered
+page has no links.
+
+The native consumer validates the entire geometry capability, consistent
+rectangles for repeated file IDs and world bounds before constructing a bounded
+direct-neighbor view on the worker. Older list-only receipts remain supported;
+a response with incomplete geometry fields is rejected. Existing exact-reader
+admission, lexical/document evidence levels and page limits remain unchanged.

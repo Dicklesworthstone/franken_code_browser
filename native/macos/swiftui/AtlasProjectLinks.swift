@@ -219,6 +219,7 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
     let block: UInt64?
     let evidenceRange: AtlasProjectLinkRange
     let importEvidence: AtlasProjectImportEvidence?
+    let geometry: AtlasProjectLinkGeometry?
     let destination, resolution, destinationSuffix, fragmentResolution: String
     var label: String {
         let status: String
@@ -323,11 +324,13 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
             }
             guard allowed.contains(importEvidence.resolutionBasis) else { throw AtlasProjectLinksError.invalidResponse }
         }
+        geometry = try AtlasProjectLinkGeometry(w, hasTarget: targetFile != nil)
     }
     static func == (a: Self, b: Self) -> Bool {
         a.id == b.id && a.projection == b.projection && a.source == b.source && a.target == b.target
             && a.targetPath == b.targetPath && a.targetFile == b.targetFile && a.sourceLink == b.sourceLink
             && a.block == b.block && a.evidenceRange == b.evidenceRange && a.importEvidence == b.importEvidence
+            && a.geometry == b.geometry
             && a.destination.utf8.elementsEqual(b.destination.utf8) && a.resolution == b.resolution
             && a.destinationSuffix.utf8.elementsEqual(b.destinationSuffix.utf8) && a.fragmentResolution == b.fragmentResolution
     }
@@ -441,6 +444,8 @@ struct AtlasProjectLinksPage: Identifiable, Sendable {
     let start, limit, total: UInt64
     let links: [AtlasProjectLink]
     let next: UInt64?
+    let geometry: AtlasProjectLinksGeometry?
+    let neighborhood: AtlasProjectLinksNeighborhood?
     var summary: String { coverage.summary }
     var complete: Bool { coverage.complete }
     var building: Bool { coverage.building }
@@ -512,8 +517,12 @@ struct AtlasProjectLinksPage: Identifiable, Sendable {
                 files[file.id] = file
             }
         }
+        let geometry = try AtlasProjectLinksGeometry(w, filterFile: filterFile, links: links)
+        let neighborhood = AtlasProjectLinksNeighborhood.make(geometry: geometry, filterFile: filterFile,
+            path: selected, links: links, total: total)
         return Self(basis: index.basis, generation: generation, coverage: coverage, direction: direction,
-            path: selected, filterFile: filterFile, start: start, limit: limit, total: total, links: links, next: next)
+            path: selected, filterFile: filterFile, start: start, limit: limit, total: total, links: links, next: next,
+            geometry: geometry, neighborhood: neighborhood)
     }
 }
 

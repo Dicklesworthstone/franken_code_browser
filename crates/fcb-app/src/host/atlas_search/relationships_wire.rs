@@ -5,6 +5,9 @@
 
 use super::*;
 
+#[path = "relationship_geometry.rs"]
+mod geometry;
+
 fn identity(out: &mut Output, snapshot: &RelationshipSnapshot) -> Result<(), AtlasSearchError> {
     for (key, value) in [("relationship_generation", snapshot.generation),
         ("index_generation", snapshot.index_generation), ("capture_manifest", snapshot.manifest)] {
@@ -50,6 +53,7 @@ pub(super) fn page(out: &mut Output, atlas: &AtlasSession, index: &RetainedIndex
     let matching = snapshot.links.iter().filter(|link| link.matches(filter, direction)).count();
     if start > matching { return Err(AtlasSearchError::InvalidLimits); }
     summary(out, atlas, index, snapshot)?;
+    geometry::header(out, atlas, filter)?;
     out.literal(",\"direction\":")?; out.quoted(direction.name())?;
     out.literal(",\"filter_file_id\":")?;
     match filter { Some(file) => out.integer(file.get())?, None => out.literal("null")? }
@@ -108,6 +112,7 @@ fn row(out: &mut Output, atlas: &AtlasSession, link: &Link, id: u64) -> Result<(
     match link.target { Some(target) => out.quoted(&target.digest.to_hex())?, None => out.literal("null")? }
     out.literal(",\"target_bytes\":")?;
     match link.target { Some(target) => out.integer(target.bytes)?, None => out.literal("null")? }
+    geometry::row(out, atlas, link.source.file, link.target_file)?;
     fragment(out, link)?;
     out.literal("}")?;
     Ok(())

@@ -88,6 +88,42 @@ fn coverage(page: &Json) {
     assert!(page.get("parsed_source_bytes").number() <= page.get("max_parse_bytes").number());
 }
 
+fn atlas_parcel(atlas: &AtlasSession, path: &[u8]) -> Json {
+    let index = atlas.atlas().index().unwrap();
+    let node = index.find_path(path).unwrap();
+    let rect = index.bounds_in(node, index.root_node()).unwrap();
+    parse(format!("{{\"x\":\"{}\",\"y\":\"{}\",\"w\":\"{}\",\"h\":\"{}\"}}",
+        rect.min_x(), rect.min_y(), rect.size().width(), rect.size().height()).as_bytes()).unwrap()
+}
+
+#[test]
+fn selected_relationship_parcels_keep_their_owner_layout_across_display_scope_and_source_changes() {
+    use fcb_app::host::atlas_session::AtlasAction;
+    let mut f = Fixture::new(&[("README.md", b"[a](src/a.rs) [again](src/a.rs) [external](https://example.invalid)\n"),
+        ("src/a.rs", b"fn a() {}\n"), ("src/unused.rs", b"fn unused() {}\n")]);
+    f.build(1); f.prepare(1, 1);
+    let before = f.page(1, Direction::Incoming, Some(b"src/a.rs"), 0, 64);
+    assert_eq!(before.get("geometry_projection").text(), "retained-atlas-parcels-v1");
+    assert_eq!(before.get("world").get("w").text(), "4096");
+    assert_eq!(before.get("filter_parcel"), &atlas_parcel(&f.atlas, b"src/a.rs"));
+    for row in before.get("links").array() {
+        assert_eq!(row.get("source_parcel"), &atlas_parcel(&f.atlas, b"README.md"));
+        assert_eq!(row.get("target_parcel"), before.get("filter_parcel"));
+    }
+    f.atlas.prepare(1, AtlasAction::Scope(AtlasSession::preset_scope("rust").unwrap()), || false).unwrap();
+    assert!(f.atlas.view().index().unwrap().find_path(b"README.md").is_none());
+    fs::write(f.root.join("README.md"), b"replacement with no links").unwrap();
+    let after = f.page(1, Direction::Incoming, Some(b"src/a.rs"), 0, 64);
+    assert_eq!(after, before, "Map geometry must use the retained search owner, never the active display scope");
+    let empty = f.page(1, Direction::All, Some(b"src/unused.rs"), 0, 64);
+    assert_eq!(empty.get("matching_links").number(), 0);
+    assert_eq!(empty.get("filter_parcel"), &atlas_parcel(&f.atlas, b"src/unused.rs"));
+    let all = f.page(1, Direction::All, None, 0, 64);
+    assert_eq!(all.get("filter_parcel"), &Json::Null);
+    assert_eq!(all.get("links").array()[2].get("target_parcel"), &Json::Null);
+    assert_eq!(all.get("source_bytes_read").number(), 0);
+}
+
 #[test]
 fn exact_paths_occurrence_multiplicity_and_filtered_pages_share_one_project_inventory() {
     let readme = b"# Overview\n\n[implementation](src/a%20b.rs#L2) [again](src/a%20b.rs)\n\n[once](src/a%2520b.rs)\n\n[missing](src/missing.rs)\n\n[network](https://example.invalid/never-fetch)\n\n[escape](../outside.rs)\n\n[anchor](#overview)\n";

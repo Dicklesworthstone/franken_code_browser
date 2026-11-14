@@ -26,6 +26,7 @@ import SwiftUI
     @State private var readerNotice = ""
     @State private var paginationScope: PaginationScope?
     @State private var pageStarts: [UInt64] = []
+    @State private var showsNeighborhood = true
     @State private var pins = AtlasPinnedReaders<AtlasPagedReaderModel>(
         canFork: { $0.canPin }, fork: { try await $0.fork() }, retire: { $0.close() },
         failureMessage: { ($0 as? AtlasReaderError)?.message ?? "The retained relationship source could not be pinned." })
@@ -162,6 +163,18 @@ import SwiftUI
             if let page = model.page {
                 if let path = page.path {
                     Text(verbatim: path.display).font(.caption.monospaced()).lineLimit(2).textSelection(.enabled)
+                }
+                if !page.building, page.projection == model.projection, page.direction == model.direction,
+                   page.path?.bytes == model.selectedPath, let neighborhood = page.neighborhood {
+                    DisclosureGroup("Direct neighborhood", isExpanded: $showsNeighborhood) {
+                        AtlasProjectLinksMapView(neighborhood: neighborhood, projection: page.projection) { path in
+                            guard canOperate, model.page?.id == page.id else { return }
+                            readerNotice = ""; model.selectPath(path, direction: .all)
+                        }
+                        .disabled(!canOperate)
+                        .padding(.top, 6)
+                    }
+                    .font(.caption.weight(.semibold))
                 }
                 if page.building || page.projection != model.projection || page.direction != model.direction || page.path?.bytes != model.selectedPath {
                     ContentUnavailableView("Preparing \(model.projection.noun)…", systemImage: "doc.text.magnifyingglass",

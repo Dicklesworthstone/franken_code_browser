@@ -988,6 +988,41 @@ Host, registry, C-boundary and native regression fixtures accompany this
 workflow. They remain unexecuted in this code-first session; compilation and
 physical-Mac interaction verification are pending.
 
+## Direct relationship neighborhoods
+
+**Project relationships** now shows a **Direct neighborhood** map when an exact
+file is selected. Choose **Documentation** or **Imports**, build the retained
+inventory, and use an Inspector relationship action or **Use path** to select a
+catalog file. The current **All**, **Outgoing**, **Backlinks** or **Imported by**
+filter determines which direct evidence records appear.
+
+Arrows connect the source and target parcels at positions supplied by that
+relationship inventory's own retained atlas. Orange indicates outgoing
+connections and blue indicates incoming connections. Select a parcel to inspect
+that file's incoming and outgoing relationships; the existing evidence list and
+exact source/target reader actions remain available. A selected file with no
+retained relationships still has its own parcel.
+
+The map groups repeated directed pairs and shows their per-page evidence count
+as **×N**. At most **32 distinct connections** are drawn from the current
+bounded result page. Its summary separately counts records without catalog
+targets, records beyond the map limit, and records on other result pages.
+Changing the page changes the displayed neighborhood. An uncaptured catalog
+target can have a parcel without gaining a source-reader action.
+
+Positions belong to this captured relationship inventory, independently of the
+main atlas's current camera or display filter. Changing live files does not
+change these retained positions or evidence; **Refresh sources** creates a new
+inventory. Old-page clicks cannot activate a replacement page. Older hosts
+without geometry continue to provide the evidence list.
+
+This view presents direct documentation evidence and lexical import candidates.
+It does not compute transitive reachability, strongly connected components or
+compiler dependencies. Those graph analyses remain with the designated shared
+graph engine. Authored host/native cases cover scope changes, live edits,
+missing targets, zero-edge files, duplicate evidence, map limits, stale layouts
+and malformed geometry; executable and physical-Mac verification are pending.
+
 ## Project import navigation
 
 In **Project relationships**, choose **Imports**, then **Capture and build

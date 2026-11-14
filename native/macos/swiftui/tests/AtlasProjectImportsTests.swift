@@ -404,6 +404,7 @@ import Foundation
 
     @MainActor static func main() async throws {
         let fixture = ProjectLinksFixture(includesImports: true), index = try await prepared(fixture)
+        try ProjectLinksGeometryTests.run(index, projection: .imports)
         try wire(index)
         try pythonWire(index)
         try cppWire(index)

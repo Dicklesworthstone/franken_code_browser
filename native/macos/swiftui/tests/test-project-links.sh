@@ -16,8 +16,9 @@ set -- "$@" -swift-version 6 -warnings-as-errors \
     "$src/AtlasReaderTextSelection.swift" "$src/AtlasReaderCoordinator.swift" "$src/AtlasCapturedReader.swift" "$src/AtlasSuppliedReader.swift" \
     "$src/AtlasNavigationHistory.swift" "$src/AtlasSource.swift" \
     "$src/AtlasDocumentPreviewModel.swift" "$src/AtlasPagedReaderModel.swift" \
-    "$src/AtlasProjectLinks.swift" "$src/AtlasProjectLinksModel.swift" "$src/AtlasProjectLinksReader.swift" \
-    "$src/tests/AtlasIndexedSearchFixture.swift" "$src/tests/AtlasProjectLinksFixture.swift"
+    "$src/AtlasProjectLinks.swift" "$src/AtlasProjectLinksGeometry.swift" "$src/AtlasProjectLinksModel.swift" "$src/AtlasProjectLinksReader.swift" \
+    "$src/tests/AtlasIndexedSearchFixture.swift" "$src/tests/AtlasProjectLinksFixture.swift" \
+    "$src/tests/AtlasProjectLinksGeometryTests.swift"
 swiftc "$@" "$src/tests/AtlasProjectLinksTests.swift" -o "$out/model-tests"
 "$out/model-tests"
 swiftc "$@" "$src/tests/AtlasProjectImportsTests.swift" -o "$out/import-tests"

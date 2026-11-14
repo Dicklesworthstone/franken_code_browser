@@ -83,6 +83,7 @@ import Foundation
     }
     @MainActor static func main() async throws {
         let fixture = ProjectLinksFixture(), index = try await prepared(fixture)
+        try ProjectLinksGeometryTests.run(index, projection: .documentation)
         precondition(fixture.index.count("create:") == 1 && fixture.index.count("query-begin:") == 0,
             "Prepare-only leases must use the existing builder without a dummy query")
         let valid = ProjectLinksFixture.page(owner: index.basis.owner, generation: 1, command: "links-page")

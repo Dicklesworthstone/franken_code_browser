@@ -109,6 +109,38 @@ fn coverage(page: &Json) {
     assert!(page.get("retained_links").number() <= page.get("links_seen").number());
 }
 
+fn atlas_parcel(atlas: &AtlasSession, path: &[u8]) -> Json {
+    let index = atlas.atlas().index().unwrap();
+    let node = index.find_path(path).unwrap();
+    let rect = index.bounds_in(node, index.root_node()).unwrap();
+    parse(format!("{{\"x\":\"{}\",\"y\":\"{}\",\"w\":\"{}\",\"h\":\"{}\"}}",
+        rect.min_x(), rect.min_y(), rect.size().width(), rect.size().height()).as_bytes()).unwrap()
+}
+
+#[test]
+fn direct_import_geometry_is_catalog_bound_and_keeps_reader_occurrence_identity() {
+    use fcb_app::host::atlas_session::AtlasAction;
+    let mut f = Fixture::new(&[("src/main.js", b"import './child.js';\nimport './child.js';\nimport 'external';\n"),
+        ("src/child.js", b"export const child = 1;\n"), ("README.md", b"# Guide\n")]);
+    f.build(1); f.prepare(1, 1);
+    let before = f.page(1, Direction::Outgoing, Some(b"src/main.js"), 0, 64);
+    assert_eq!(before.get("geometry_projection").text(), "retained-atlas-parcels-v1");
+    assert_eq!(before.get("filter_parcel"), &atlas_parcel(&f.atlas, b"src/main.js"));
+    let rows = before.get("links").array();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].get("source_parcel"), before.get("filter_parcel"));
+    assert_eq!(rows[0].get("target_parcel"), &atlas_parcel(&f.atlas, b"src/child.js"));
+    assert_eq!(rows[1].get("target_parcel"), rows[0].get("target_parcel"));
+    assert_eq!(rows[2].get("target_parcel"), &Json::Null);
+    f.atlas.prepare(1, AtlasAction::Scope(AtlasSession::preset_scope("markdown").unwrap()), || false).unwrap();
+    fs::write(f.root.join("src/main.js"), b"replacement without imports").unwrap();
+    assert_eq!(f.page(1, Direction::Outgoing, Some(b"src/main.js"), 0, 64), before);
+    let (_, receipt) = f.search.open_import_reader(&f.atlas, owner(72990), 1,
+        rows[1].get("link_id").number(), Side::Evidence, || false).unwrap();
+    assert_eq!(json(&receipt).get("relationship"), &rows[1]);
+    assert_eq!(json(&receipt).get("additional_source_bytes_read").number(), 0);
+}
+
 #[test]
 fn cpp_includes_keep_exact_catalog_targets_and_retained_reader_evidence() {
     let source = b"// captured C++\r\n# include \"detail/value.h\" // evidence\r\n#include <vector>\r\n#include HEADER_NAME\r\n";

@@ -46,6 +46,12 @@ selection and explicitly heuristic declaration evidence. See
 [Java/C# navigation](native/macos/README.md#navigating-java-and-c-declarations)
 for supported syntax and limits. Executable/native qualification is pending.
 
+**Project relationships** also offers a bounded
+[Direct neighborhood map](native/macos/README.md#direct-relationship-neighborhoods)
+for the selected file's documentation links or import candidates. Follow a
+neighbor while keeping the exact evidence list and captured readers available;
+the map reports omitted and unresolved records explicitly.
+
 The global search sidebar also offers **Occurrences** for exact whole-token
 identifier text across the selected workspace, folder, file or visible scope.
 Results include comments and strings and open their retained source with exact

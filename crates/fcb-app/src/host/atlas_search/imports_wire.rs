@@ -4,6 +4,9 @@
 //! occurrence IDs and exact captured evidence; filters do not renumber rows.
 use super::*;
 
+#[path = "relationship_geometry.rs"]
+mod geometry;
+
 fn identity(out: &mut Output, snapshot: &ImportsSnapshot) -> Result<(), AtlasSearchError> {
     for (key, value) in [("relationship_generation", snapshot.generation),
         ("index_generation", snapshot.index_generation), ("capture_manifest", snapshot.manifest)] {
@@ -54,6 +57,7 @@ pub(super) fn page(out: &mut Output, atlas: &AtlasSession, index: &RetainedIndex
     let matching = snapshot.links.iter().filter(|link| link.matches(filter, direction)).count();
     if start > matching { return Err(AtlasSearchError::InvalidLimits); }
     summary(out, atlas, index, snapshot)?;
+    geometry::header(out, atlas, filter)?;
     out.literal(",\"direction\":")?; out.quoted(direction.name())?;
     out.literal(",\"filter_file_id\":")?;
     if let Some(file) = filter { out.integer(file.get())?; } else { out.literal("null")?; }
@@ -111,6 +115,7 @@ fn row(out: &mut Output, atlas: &AtlasSession, link: &Link, id: u64) -> Result<(
     if let Some(target) = link.target { out.quoted(&target.digest.to_hex())?; } else { out.literal("null")?; }
     out.literal(",\"target_bytes\":")?;
     if let Some(target) = link.target { out.integer(target.bytes)?; } else { out.literal("null")?; }
+    geometry::row(out, atlas, link.source.file, link.target_file)?;
     out.literal("}")?;
     Ok(())
 }
