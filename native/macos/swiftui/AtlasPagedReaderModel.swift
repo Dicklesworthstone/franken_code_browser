@@ -143,8 +143,13 @@ import Observation
     var canCompare: Bool { page != nil && !busy && !pinning && !documentPreview.busy && !resolvingTextSelection && coordinator.supportsComparison }
     var retainedRegistryDomain: UUID? { coordinator.retainedRegistryDomain }
     var retainedCaptureSHA256: String? { coordinator.retainedCaptureSHA256 }
-    var canFind: Bool { page != nil && coordinator.supportsFind }
-    var canConfigureFind: Bool { coordinator.supportsFindOptions }
+    var canFind: Bool {
+        page != nil && coordinator.supportsFind && (findOptions.mode != .expression || coordinator.supportsFindExpression)
+    }
+    var canFindExpression: Bool { coordinator.supportsFindExpression }
+    var canConfigureFind: Bool {
+        findOptions.mode == .expression ? coordinator.supportsFindExpression : coordinator.supportsFindOptions
+    }
     var canGoToPosition: Bool { page != nil && coordinator.supportsPosition }
     var findIsCurrent: Bool {
         findReport?.needle.utf8.elementsEqual(fileQuery.utf8) == true && findReport?.options == findOptions
@@ -222,7 +227,8 @@ import Observation
         return selection
     }
     var canFindSelectedText: Bool {
-        canFind && searchableSelection?.searchText(maximumUTF8Bytes: AtlasReaderFindReport.maximumNeedleBytes) != nil
+        page != nil && coordinator.supportsFind
+            && searchableSelection?.searchText(maximumUTF8Bytes: AtlasReaderFindReport.maximumNeedleBytes) != nil
     }
     var canFindSelectedDeclarations: Bool {
         canBuildOutline && searchableSelection?.searchText(maximumUTF8Bytes: 256) != nil
@@ -235,9 +241,10 @@ import Observation
         return try? AtlasReaderSelectionQuery(selection: selection, mode: mode)
     }
     @discardableResult func findSelectedText(selectionID: UUID) -> Bool {
-        guard canFind, let selection = searchableSelection, selection.id == selectionID,
+        guard canFindSelectedText, let selection = searchableSelection, selection.id == selectionID,
               let text = selection.searchText(maximumUTF8Bytes: AtlasReaderFindReport.maximumNeedleBytes) else { return false }
         fileQuery = text
+        findOptions.mode = .literal
         findOptions.caseSensitive = true
         find()
         return true
@@ -747,11 +754,17 @@ import Observation
         guard canFind else { return }
         let needle = fileQuery
         let options = findOptions
-        do { try AtlasReaderFindReport.validateNeedle(needle) }
-        catch { notice = AtlasReaderError.invalidInput.message; return }
+        do { try AtlasReaderFindReport.validateNeedle(needle, mode: options.mode) }
+        catch {
+            notice = options.mode == .expression
+                ? "Enter an expression of up to 1024 UTF-8 bytes, without NUL characters."
+                : AtlasReaderError.invalidInput.message
+            return
+        }
         clearFileSearch()
         let ticket = begin(query: true)
-        notice = "Searching the retained file…"
+        notice = options.mode == .expression
+            ? "Checking expression terms across the retained file…" : "Searching the retained file…"
         task = Task {
             do {
                 let report = try await coordinator.find(needle, options: options)
@@ -776,7 +789,7 @@ import Observation
         let count = report.hits.count
         let index: Int
         if let selected = selectedHitIndex {
-            if let start = report.pageStartAfter, coordinator.supportsFindPages {
+            if let start = report.pageStartAfter, coordinator.supportsFindPages(for: report.options.mode) {
                 if backwards && selected == 0 {
                     if start > 0 {
                         loadFindPage(startAfter: start > report.retainedLimit ? start - report.retainedLimit : 0,
@@ -818,7 +831,7 @@ import Observation
     /// One retained result page at a time. Replaying the prefix spends the
     /// normal scan budget and uses a fresh generation; source bytes stay fixed.
     private func loadFindPage(startAfter: UInt64, backwards: Bool) {
-        guard canMoveHit, coordinator.supportsFindPages else { return }
+        guard canMoveHit, coordinator.supportsFindPages(for: findOptions.mode) else { return }
         let needle = fileQuery
         let options = findOptions
         // A host may accept a new generation before Swift rejects its receipt.

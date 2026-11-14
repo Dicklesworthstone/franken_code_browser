@@ -9,6 +9,9 @@ private func fcb_reader_find_with_options(_ handle: UInt64, _ generation: UInt64
 @_silgen_name("fcb_reader_find_page")
 private func fcb_reader_find_page(_ handle: UInt64, _ generation: UInt64, _ needle: UnsafePointer<CChar>?,
     _ startAfter: UInt64, _ matches: UInt64, _ scanBytes: UInt64, _ flags: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_reader_find_expression_page")
+private func fcb_reader_find_expression_page(_ handle: UInt64, _ generation: UInt64, _ expression: UnsafePointer<CChar>?,
+    _ startAfter: UInt64, _ matches: UInt64, _ scanBytes: UInt64, _ flags: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_reader_hit")
 private func fcb_reader_hit(_ handle: UInt64, _ generation: UInt64, _ index: UInt64,
                             _ context: UInt64) -> UnsafeMutablePointer<CChar>?
@@ -20,6 +23,8 @@ extension AtlasReaderSearchTransport {
         needle.withCString { take(fcb_reader_find_with_options(handle, generation, $0, matches, bytes, flags)) }
     }, findPage: { handle, generation, needle, startAfter, matches, bytes, flags in
         needle.withCString { take(fcb_reader_find_page(handle, generation, $0, startAfter, matches, bytes, flags)) }
+    }, findExpressionPage: { handle, generation, expression, startAfter, matches, bytes, flags in
+        expression.withCString { take(fcb_reader_find_expression_page(handle, generation, $0, startAfter, matches, bytes, flags)) }
     })
 
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {

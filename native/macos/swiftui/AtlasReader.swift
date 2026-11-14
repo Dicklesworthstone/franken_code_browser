@@ -25,7 +25,19 @@ enum AtlasReaderError: Error, Sendable {
         case .unavailable: return "The retained reader could not admit this source. No empty or partial capture was substituted."
         case .invalidResponse: return "The reader response could not be verified. The previous capture has not been replaced."
         case .canceled: return "Reader operation canceled. In-flight work may still be draining."
-        case .engine(let code): return "Retained reader unavailable (\(code))."
+        case .engine(let code):
+            switch code {
+            case "READER_SESSION_EXPRESSION_SCOPE_UNSUPPORTED":
+                return "This expression uses path, language or type filters. Use project search for those filters; retained-file expressions support required terms, quoted phrases and -excluded terms."
+            case "QUERY_EMPTY": return "Enter a required term or quoted phrase for the expression."
+            case "QUERY_NEEDLE_TOO_LONG", "QUERY_LIMIT_EXCEEDED":
+                return "This expression exceeds the bounded query limits. Use up to 1024 UTF-8 bytes and fewer terms."
+            case "QUERY_REGEX_UNQUALIFIED":
+                return "Regular expressions are unavailable. Use literal terms, quoted phrases and -excluded terms."
+            case "QUERY_SYNTAX_ERROR":
+                return "The expression could not be parsed. Check quotes and provide a required term before exclusions."
+            default: return "Retained reader unavailable (\(code))."
+            }
         }
     }
 }

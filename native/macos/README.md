@@ -1501,6 +1501,23 @@ physical-Mac execution remains pending.
 
 ## Finding text in a retained file
 
+Choose **Text** or **Expression** in the retained reader's Find controls. Text
+uses a literal spelling. Expression uses the shared query language: for example,
+`"request failed" timeout -deprecated` finds the quoted primary phrase only
+when the same captured file also contains `timeout` and contains no
+`deprecated`. Expressions accept at most 1,024 UTF-8 bytes and 64 terms;
+literal Text retains its 4,096-byte allowance. Path, language and type filters
+belong in project search and receive an explicit refusal here.
+
+Expression mode always checks the complete retained capture and counts primary
+occurrences, while retaining only the bounded navigation page. Its count
+control stays checked; returning to Text restores the previous counting
+preference. An incomplete or undecodable scan exposes no tentative expression
+matches, and the summary distinguishes incomplete qualification from a complete
+no-match result. Exact hit navigation and copying use the primary term's
+original spelling and encoded bytes, never the expression syntax. The same
+controls work in pinned readers, Reading Desk and saved-source readers.
+
 The paged source reader's **Find** scans its complete retained capture, including
 text outside the visible page. **Match case** starts enabled. Turn it off for the
 same Unicode lowercase comparison as workspace search, including `k` matching
@@ -1540,9 +1557,11 @@ page's capacity. Automatic activation admits at most 64 pages and 64 MiB of
 aggregate capture replay; reaching either limit reports that the selected hit
 is unavailable. It never substitutes a nearby occurrence or opens the live file.
 
-The additive `fcb_reader_find_page` ABI uses global occurrence offsets and fresh
-query generations. It preserves the original Find and Find-with-options entry
-points. Host, C-boundary, and native model/decoder regressions cover result-page
+The additive `fcb_reader_find_page` and `fcb_reader_find_expression_page` ABIs use
+global occurrence offsets and fresh query generations. Expression is a separate
+entry point, preserving the original literal Find flags and older transports.
+Hosts without expression support keep literal Find available. Source-selection
+Find and automatic project-hit activation explicitly use literal spelling. Host, C-boundary, and native model/decoder regressions cover result-page
 boundaries, UTF-16, overlapping matches, lowercase expansion witnesses, and
 stale/canceled requests. The native suites are available through
 `swiftui/tests/test-reader-search.sh` and `swiftui/tests/test-reader-commands.sh`;

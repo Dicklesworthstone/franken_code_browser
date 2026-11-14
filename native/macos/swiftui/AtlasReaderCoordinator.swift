@@ -175,6 +175,10 @@ private final class AtlasReaderSession: @unchecked Sendable {
     var supportsFind: Bool { searchTransport != nil }
     var supportsFindOptions: Bool { searchTransport?.findWithOptions != nil || supportsFindPages }
     var supportsFindPages: Bool { searchTransport?.findPage != nil }
+    var supportsFindExpression: Bool { searchTransport?.findExpressionPage != nil }
+    func supportsFindPages(for mode: AtlasReaderFindMode) -> Bool {
+        searchTransport?.supportsPages(for: mode) == true
+    }
     var supportsOutline: Bool { outlineTransport != nil }
     var supportsReferences: Bool { (session?.transport ?? transport).references != nil }
     var supportsDocument: Bool { documentTransport != nil }
@@ -641,10 +645,14 @@ private final class AtlasReaderSession: @unchecked Sendable {
     func find(_ needle: String, options: AtlasReaderFindOptions = .init(),
               startAfter: UInt64 = 0) async throws -> AtlasReaderFindReport {
         guard let session, let info, let search = searchTransport else { throw AtlasReaderError.unavailable }
-        try AtlasReaderFindReport.validateNeedle(needle)
+        try AtlasReaderFindReport.validateNeedle(needle, mode: options.mode)
         guard startAfter <= info.identity.capturedBytes else { throw AtlasReaderError.invalidInput }
-        guard startAfter == 0 || search.findPage != nil,
-              options == .init() || supportsFindOptions else { throw AtlasReaderError.unavailable }
+        if options.mode == .expression {
+            guard supportsFindExpression else { throw AtlasReaderError.unavailable }
+        } else {
+            guard startAfter == 0 || supportsFindPages,
+                  options == .init() || supportsFindOptions else { throw AtlasReaderError.unavailable }
+        }
         let (generation, overflow) = lastFindGeneration.addingReportingOverflow(1)
         guard !overflow else { throw AtlasReaderError.unavailable }
         lastFindGeneration = generation
@@ -660,7 +668,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
                     search.performFind(session.handle, generation, needle, AtlasReaderFindReport.maxHits,
                         info.identity.capturedBytes, options: options, startAfter: startAfter),
                     info: info, generation: generation, needle: needle, options: options,
-                    startAfter: search.findPage == nil ? nil : startAfter)
+                    startAfter: search.supportsPages(for: options.mode) ? startAfter : nil)
             }
             guard self.session === session, operation == ticket, !flag.isCanceled else { throw AtlasReaderError.canceled }
             acceptedFind = report

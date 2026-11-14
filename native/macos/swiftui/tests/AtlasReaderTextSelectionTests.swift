@@ -446,8 +446,9 @@ private final class TextSelectionFixture: @unchecked Sendable {
         check(model.selectionQuery(.expression, selectionID: second) == nil,
               "selected text opted into expression parsing")
         let source = model.source!, navigation = model.navigation, opens = fixture.calls.opened
+        model.findOptions.mode = .expression
         check(model.findSelectedText(selectionID: second), "current selected text did not start retained-file Find")
-        check(model.fileQuery == "beta" && model.findOptions.caseSensitive
+        check(model.fileQuery == "beta" && model.findOptions.caseSensitive && model.findOptions.mode == .literal
               && model.selectionQuery(.text, selectionID: second) == nil,
               "Find changed the spelling or reused a selection during reader work")
         await wait("refused search did not drain and rebind the displayed selection") {

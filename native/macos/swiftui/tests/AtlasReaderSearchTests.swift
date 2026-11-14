@@ -677,6 +677,7 @@ private final class Transport: @unchecked Sendable {
         }
         try pagingReceipts(info: info)
         pagingNavigation()
+        checks += try AtlasReaderExpressionTests.run()
         print("PASS: \(checks) retained-file find, UTF-16 hit, generation, copy and cancellation checks")
     }
 }

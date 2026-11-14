@@ -464,19 +464,33 @@ import AppKit
     private var findControls: some View {
         ScrollView(.horizontal) {
             HStack(spacing: 6) {
+                Picker("Find mode", selection: $model.findOptions.mode) {
+                    ForEach(AtlasReaderFindMode.allCases) { mode in
+                        Text(mode.rawValue).tag(mode)
+                            .disabled(mode == .expression && !model.canFindExpression)
+                    }
+                }
+                .frame(width: 116)
+                .help(model.findOptions.mode.help)
+                .accessibilityLabel("Retained file search mode")
                 AtlasReaderFindField(text: $model.fileQuery, commands: readerCommands,
                     active: !showsOutline && !showsReferences && !showsDocument && !showsLinked,
                     canMove: { [model] in model.canMoveHit },
-                    move: { [model] in model.moveHit(backwards: $0) }, submit: model.find)
+                    move: { [model] in model.moveHit(backwards: $0) }, submit: model.find,
+                    placeholder: model.findOptions.mode.placeholder)
                     .frame(width: 190)
-                    .help("Find in this retained file (⌘F). Move between accepted matches with ⌘G and ⇧⌘G.")
+                    .help(model.findOptions.mode.help)
                 Button("Find", action: model.find).disabled(!model.canFind || model.fileQuery.isEmpty)
                 Toggle("Match case", isOn: $model.findOptions.caseSensitive)
                     .disabled(!model.canConfigureFind)
                     .help("When off, compare Unicode lowercase spellings. Original source characters and bytes remain unchanged.")
-                Toggle("Count all matches", isOn: $model.findOptions.countAllMatches)
-                    .disabled(!model.canConfigureFind)
-                    .help("Continue scanning the retained file after navigation rows fill; completeness and retained rows are reported separately.")
+                Toggle("Count all matches", isOn: Binding(
+                    get: { model.findOptions.mode == .expression || model.findOptions.countAllMatches },
+                    set: { model.findOptions.countAllMatches = $0 }))
+                    .disabled(!model.canConfigureFind || model.findOptions.mode == .expression)
+                    .help(model.findOptions.mode == .expression
+                        ? "Expressions always scan the entire admitted capture to check required and excluded terms; all primary-term matches are counted."
+                        : "Continue scanning the retained file after navigation rows fill; completeness and retained rows are reported separately.")
                 Button("Outline") { showsOutline = true }
                     .disabled(!model.canBuildOutline)
                     .popover(isPresented: $showsOutline) {

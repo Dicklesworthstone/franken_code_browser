@@ -117,11 +117,12 @@ import AppKit
     let canMove: () -> Bool
     let move: (Bool) -> Void
     let submit: () -> Void
+    var placeholder = "Find in retained file…"
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     func makeNSView(context: Context) -> AtlasReaderFindTextField {
         let field = AtlasReaderFindTextField()
-        field.placeholderString = "Find in retained file…"
+        field.placeholderString = placeholder
         field.isBezeled = true
         field.bezelStyle = .roundedBezel
         field.controlSize = .small
@@ -130,7 +131,7 @@ import AppKit
         field.delegate = context.coordinator
         field.target = context.coordinator
         field.action = #selector(Coordinator.submitQuery(_:))
-        field.setAccessibilityLabel("Text to find in this retained file")
+        field.setAccessibilityLabel(placeholder)
         field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         field.readerCommands = commands
         commands.attach(field: field)
@@ -139,6 +140,8 @@ import AppKit
     func updateNSView(_ field: AtlasReaderFindTextField, context: Context) {
         context.coordinator.parent = self
         field.isEnabled = context.environment.isEnabled
+        field.placeholderString = placeholder
+        field.setAccessibilityLabel(placeholder)
         commands.configure(active: active && context.environment.isEnabled, canMove: canMove, move: move)
         // Do not replace a live composition or normalize canonically equivalent
         // but byte-distinct query text on an unrelated presentation update.
