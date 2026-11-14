@@ -192,6 +192,69 @@ import Foundation
         }
     }
 
+    /// The C/C++ wire policy never promotes an angle or computed header to a
+    /// catalog target, even when a foreign envelope supplies target metadata.
+    private static func cppWire(_ index: AtlasPreparedIndex) throws {
+        var value = ProjectLinksFixture.importPage(owner: index.basis.owner,
+            generation: 1, command: "imports-page")
+        var rows = value["links"] as! [[String: Any]]
+        for i in rows.indices {
+            rows[i]["language"] = "cpp"; rows[i]["lexical_import_kind"] = "cpp-quoted-include"
+            rows[i]["destination"] = "detail/value.h"
+            rows[i]["resolution_basis"] = "cpp-source-relative-include-candidate"
+            rows[i]["source_path"] = ProjectLinksFixture.path("src/main.cpp")
+            rows[i]["target_path"] = ProjectLinksFixture.path("src/detail/value.h")
+        }
+        value["links"] = rows
+        let link = try decode(value, index: index).links[0]
+        precondition(link.canOpenTarget && link.importEvidence?.language == "cpp"
+            && link.evidenceLabel.contains("Quoted C/C++ include")
+            && link.evidenceLabel.contains("not compiler resolved"))
+        for (key, wrong) in [("language", "rust"), ("lexical_import_kind", "cpp-angle-include"),
+            ("lexical_import_kind", "cpp-computed-include"), ("resolution_basis", "unique-relative-module-candidate"),
+            ("resolution_basis", "python-relative-module-candidate"), ("resolution_basis", "ambiguous-catalog-target")] {
+            var bad = value, changed = rows
+            changed[0][key] = wrong; bad["links"] = changed; refuse(bad, index: index)
+        }
+        var compiler = value; compiler["compiler_resolved"] = true; refuse(compiler, index: index)
+        var oldPolicy = value; oldPolicy["resolver"] = "fcb-closed-catalog-imports-v3"
+        refuse(oldPolicy, index: index)
+        for resolution in ["unavailable", "uncaptured", "outside-capture-scope"] {
+            var unavailable = value, changed = rows
+            for i in changed.indices {
+                changed[i]["resolution"] = resolution
+                for key in ["target_revision", "target_sha256", "target_bytes"] { changed[i][key] = NSNull() }
+            }
+            unavailable["links"] = changed
+            let unavailablePage = try decode(unavailable, index: index)
+            precondition(unavailablePage.links.allSatisfy { !$0.canOpenTarget && $0.targetFile == 4 })
+        }
+        for (kind, destination, resolution, basis, label) in [
+            ("cpp-angle-include", "vector", "external", "external-specifier", "External C/C++ include"),
+            ("cpp-computed-include", "HEADER_NAME", "unresolved", "unresolved-cpp-include", "Unresolved computed C/C++ include"),
+            ("cpp-quoted-include", "missing.h", "missing", "no-catalog-target", "Quoted C/C++ include"),
+            ("cpp-quoted-include", "../escape.h", "unresolved", "unsupported-specifier", "Quoted C/C++ include")
+        ] {
+            var other = value, changed = rows
+            for i in changed.indices {
+                changed[i]["lexical_import_kind"] = kind; changed[i]["destination"] = destination
+                changed[i]["resolution"] = resolution; changed[i]["resolution_basis"] = basis
+                for key in ["target_file_id", "target_path", "target_revision", "target_sha256", "target_bytes"] { changed[i][key] = NSNull() }
+            }
+            other["links"] = changed
+            let edge = try decode(other, index: index).links[0]
+            precondition(!edge.canOpenTarget && edge.targetFile == nil && edge.evidenceLabel.contains(label))
+            changed[0]["target_file_id"] = "4"; changed[0]["target_path"] = ProjectLinksFixture.path("src/detail/value.h")
+            other["links"] = changed; refuse(other, index: index)
+        }
+        var partial = value
+        partial["scanned_source_files"] = "1"; partial["unsupported_source_files"] = "1"
+        partial["relationships_complete"] = false
+        let page = try decode(partial, index: index)
+        precondition(!page.complete && page.summary.contains("1 unsupported") && page.links[0].canOpenTarget)
+        partial["relationships_complete"] = true; refuse(partial, index: index)
+    }
+
     /// A use leaf may identify a conventional module file or only the module
     /// containing a possible item. Both remain lexical navigation candidates.
     private static func rustUseWire(_ index: AtlasPreparedIndex) throws {
@@ -297,6 +360,7 @@ import Foundation
         let fixture = ProjectLinksFixture(includesImports: true), index = try await prepared(fixture)
         try wire(index)
         try pythonWire(index)
+        try cppWire(index)
         try rustUseWire(index)
         let live = ProjectLinksFixture(includesImports: true)
         let model = AtlasProjectLinksModel(root: "/project", transport: live.transport)

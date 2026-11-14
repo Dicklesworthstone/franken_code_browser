@@ -484,8 +484,8 @@ qualification remain pending.
 ## Following imports in a saved repository
 
 Open an FCBS archive in **Saved Repository**, choose **Imports**, and select
-**Build imports**. This uses the same Rust, JavaScript/TypeScript/JSX/TSX and
-Python lexical import engine and finite catalog policies as Project relationships.
+**Build imports**. This uses the same Rust, JavaScript/TypeScript/JSX/TSX,
+Python and C/C++ lexical import engine and finite catalog policies as Project relationships.
 The archive supplies both source evidence and target membership; opening an
 import does not require a working-tree checkout or grant access to live paths.
 
@@ -877,12 +877,25 @@ readable evidence but do not search `sys.path`, execute package code, or infer
 installed dependencies. A catalog candidate does not establish a Python runtime
 binding. Bare-relative wildcard imports have no guessed target.
 
+C and C++ literal includes participate in both Project and Saved Repository
+Imports. Quoted `#include "header.h"` can open an exact source-relative catalog
+candidate. Angle headers stay external; computed and macro includes stay
+unresolved. Statement and specifier ranges preserve the original UTF-8/UTF-16
+bytes, and evidence/target readers retain their accepted captures. The policy
+does not infer compiler include directories, expand macros, or evaluate
+conditional branches.
+
+The pinned lexer's coverage limits are explicit: a capture containing any
+backslash-newline (including multiline macros), trigraph, bare-CR line ending,
+or raw-string delimiter outside the upstream-supported subset is counted
+unsupported. Its import coverage stays partial and its source remains readable.
+
 The inventory admits 128 KiB per source, 32 MiB of aggregate parsing and 4,096
 retained import occurrences. Unsupported syntax, malformed decoding, parse limits and
 omitted rows remain visible coverage conditions. These limits apply to the
 captured project import browser. The **Saved Repository → Imports** workflow
 applies the same lexical policies to archived members. Rust/Swift regression fixtures cover Rust
-use trees and Python imports, UTF-16 coordinates, relative targets, ambiguity, stale captures and
+use trees, Python imports and C/C++ includes, UTF-16 coordinates, relative targets, ambiguity, stale captures and
 native evidence validation. Executable and physical-Mac verification remain
 pending.
 

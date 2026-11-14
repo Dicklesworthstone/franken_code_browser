@@ -91,9 +91,9 @@ fn coverage(page: &Json) {
     assert_eq!(page.get("evidence_precision").text(), "exact-import-source-range");
     assert_eq!(page.get("relationship_kind").text(), "lexical-import");
     assert_eq!(page.get("resolution_domain").text(), "declared-catalog-candidates");
-    assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v3");
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v3");
-    assert_eq!(page.get("extraction_policy").text(), "rust-use-tree-js-static-and-python-import-v3");
+    assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v4");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v4");
+    assert_eq!(page.get("extraction_policy").text(), "rust-use-tree-js-python-and-cpp-literal-include-v4");
     assert!(!page.get("compiler_resolved").flag()); assert!(!page.get("semantic_complete").flag());
     assert_eq!(page.get("source_files").number(), page.get("captured_source_files").number()
         + page.get("capture_unavailable_source_files").number() + page.get("outside_capture_scope_source_files").number()
@@ -107,6 +107,75 @@ fn coverage(page: &Json) {
     assert!(page.get("metadata_bytes").number() <= MAX_ATLAS_IMPORT_METADATA_BYTES as u64);
     assert!(page.get("parsed_source_bytes").number() <= page.get("max_parse_bytes").number());
     assert!(page.get("retained_links").number() <= page.get("links_seen").number());
+}
+
+#[test]
+fn cpp_includes_keep_exact_catalog_targets_and_retained_reader_evidence() {
+    let source = b"// captured C++\r\n# include \"detail/value.h\" // evidence\r\n#include <vector>\r\n#include HEADER_NAME\r\n";
+    let header = b"#pragma once\nstruct Value {};\n";
+    let mut f = Fixture::new(&[("src/main.cpp", source), ("src/detail/value.h", header),
+        ("include/detail/value.h", b"// another include root is not guessed\n")]);
+    f.build(1);
+    let result = f.prepare(1, 1);
+    assert!(result.get("relationships_complete").flag());
+    assert_eq!(result.get("links_seen").number(), 3);
+    let quoted = link(&result, b"src/main.cpp", "detail/value.h");
+    assert_eq!(quoted.get("language").text(), "cpp");
+    assert_eq!(quoted.get("lexical_import_kind").text(), "cpp-quoted-include");
+    assert_eq!(quoted.get("resolution_basis").text(), "cpp-source-relative-include-candidate");
+    assert_eq!(quoted.get("target_path").get("hex").text(), hex(b"src/detail/value.h"));
+    assert_eq!(range(quoted.get("evidence_range"), source), b"# include \"detail/value.h\"");
+    assert_eq!(range(quoted.get("specifier_range"), source), b"detail/value.h");
+    let id = quoted.get("link_id").number();
+    let incoming = f.page(1, Direction::Incoming, Some(b"src/detail/value.h"), 0, 64);
+    assert_eq!(ids(&incoming), [id]);
+    assert_eq!(f.page(1, Direction::Incoming, Some(b"include/detail/value.h"), 0, 64)
+        .get("matching_links").number(), 0);
+    assert_eq!(f.page(1, Direction::Outgoing, Some(b"src/main.cpp"), 0, 64)
+        .get("matching_links").number(), 3);
+    for (destination, kind, resolution, basis) in [
+        ("vector", "cpp-angle-include", "external", "external-specifier"),
+        ("HEADER_NAME", "cpp-computed-include", "unresolved", "unresolved-cpp-include"),
+    ] {
+        let row = link(&result, b"src/main.cpp", destination);
+        assert_eq!(row.get("lexical_import_kind").text(), kind);
+        assert_eq!(row.get("resolution").text(), resolution);
+        assert_eq!(row.get("resolution_basis").text(), basis);
+        assert_eq!(row.get("target_path"), &Json::Null);
+    }
+    fs::write(f.root.join("src/main.cpp"), b"#include \"changed.h\"\n").unwrap();
+    fs::write(f.root.join("src/detail/value.h"), b"replacement header").unwrap();
+    let (evidence, receipt) = f.search.open_import_reader(&f.atlas, owner(72960), 1, id, Side::Evidence, || false).unwrap();
+    let receipt = json(&receipt);
+    assert_eq!(receipt.get("relationship"), quoted);
+    assert_eq!(receipt.get("initial_original_offset"), quoted.get("evidence_range").get("start"));
+    assert_eq!(evidence.capture().bytes(), source);
+    let (target, receipt) = f.search.open_import_reader(&f.atlas, owner(72961), 1, id, Side::Target, || false).unwrap();
+    let receipt = json(&receipt);
+    assert_eq!(receipt.get("source_sha256").text(), Sha256::digest(header).to_hex());
+    assert_eq!(receipt.get("additional_source_bytes_read").number(), 0);
+    assert!(!receipt.get("source_reopened").flag());
+    assert!(!receipt.get("compiler_resolved").flag());
+    f.search.clear_index(&f.atlas, 2, || false).unwrap();
+    assert_eq!(target.capture().bytes(), header);
+    assert_eq!(evidence.capture().bytes(), source);
+}
+
+#[test]
+fn cpp_translation_phase_refusal_is_partial_coverage_without_false_edges() {
+    let continued = b"#define MULTILINE(x) \\\n    x\n#include \"header.h\"\n";
+    let mut f = Fixture::new(&[("bad.cpp", continued), ("good.c", b"#include \"header.h\"\n"),
+        ("header.h", b"#pragma once\n")]);
+    f.build(1);
+    let result = f.prepare(1, 1);
+    assert!(!result.get("relationships_complete").flag());
+    assert_eq!(result.get("source_files").number(), 3);
+    assert_eq!(result.get("unsupported_source_files").number(), 1);
+    assert_eq!(result.get("scanned_source_files").number(), 2);
+    assert_eq!(result.get("pending_source_files").number(), 0);
+    assert_eq!(result.get("links_seen").number(), 1);
+    assert_eq!(link(&result, b"good.c", "header.h").get("resolution").text(), "captured");
+    assert!(f.page(1, Direction::Outgoing, Some(b"bad.cpp"), 0, 64).get("links").array().is_empty());
 }
 
 #[test]
@@ -536,7 +605,7 @@ fn python_relative_imports_share_incoming_navigation_and_exact_retained_readers(
     let page = f.prepare(1, 1);
     assert!(page.get("relationships_complete").flag(), "{page:?}");
     assert_eq!(page.get("retained_links").number(), 5);
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v3");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v4");
 
     let row = link(&page, b"pkg/main.py", ".worker");
     assert_eq!(row.get("language").text(), "python");

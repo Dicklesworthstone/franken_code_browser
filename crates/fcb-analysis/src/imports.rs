@@ -5,12 +5,13 @@
 //! FrankenMarkdown owns string/comment/keyword classification. This module
 //! consumes its validated byte spans and recognizes a small source-specific
 //! statement grammar: Rust external mod/use, JS/TS static import/export-from,
-//! and Python import/from statements.
+//! Python import/from statements, and C/C++ literal include directives.
 //! It is not a compiler, build graph, package resolver, or replacement lexer.
 //! Every result remains lexical evidence; closed-catalog navigation is explicit.
 //! UTF-8/UTF-16 decoding and evidence conversion use the common source map.
 
 mod python;
+mod cpp;
 mod resolve;
 mod rust;
 pub use resolve::{resolve_import, ImportResolution, ImportResolutionKind};
@@ -26,15 +27,15 @@ pub const MAX_IMPORT_ITEMS: usize = 4096;
 pub const MAX_IMPORT_SPECIFIER_BYTES: usize = 1024;
 const MAX_STATEMENT_TERMINALS: usize = 1024;
 const MAX_STATEMENT_BYTES: usize = 16 * 1024;
-pub const IMPORT_EXTRACTOR: &str = "franken-markdown-d6fbd1d5/import-statements-v3";
-pub const IMPORT_POLICY: &str = "rust-use-tree-js-static-and-python-import-v3";
+pub const IMPORT_EXTRACTOR: &str = "franken-markdown-d6fbd1d5/import-statements-v4";
+pub const IMPORT_POLICY: &str = "rust-use-tree-js-python-and-cpp-literal-include-v4";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ImportLanguage { Rust, JavaScript, TypeScript, Jsx, Tsx, Python }
+pub enum ImportLanguage { Rust, JavaScript, TypeScript, Jsx, Tsx, Python, Cpp }
 impl ImportLanguage {
     pub const fn name(self) -> &'static str {
         match self { Self::Rust => "rust", Self::JavaScript => "javascript", Self::TypeScript => "typescript",
-            Self::Jsx => "jsx", Self::Tsx => "tsx", Self::Python => "python" }
+            Self::Jsx => "jsx", Self::Tsx => "tsx", Self::Python => "python", Self::Cpp => "cpp" }
     }
     pub fn from_path(path: &[u8]) -> Option<Self> {
         let file = path.rsplit(|&byte| byte == b'/').next()?;
@@ -46,22 +47,27 @@ impl ImportLanguage {
             b"rs" => Some(Self::Rust), b"js" | b"mjs" | b"cjs" => Some(Self::JavaScript),
             b"ts" | b"mts" | b"cts" => Some(Self::TypeScript), b"jsx" => Some(Self::Jsx), b"tsx" => Some(Self::Tsx),
             b"py" | b"pyi" => Some(Self::Python),
+            b"c" | b"h" | b"cc" | b"cpp" | b"cxx" | b"c++" | b"hh" | b"hpp" | b"hxx"
+                | b"ipp" | b"tpp" | b"inl" | b"ixx" => Some(Self::Cpp),
             _ => None,
         }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ImportKind { RustModule, RustUse, JavaScriptImport, JavaScriptExport, PythonImport, PythonFrom }
+pub enum ImportKind { RustModule, RustUse, JavaScriptImport, JavaScriptExport, PythonImport, PythonFrom,
+    CppQuotedInclude, CppAngleInclude, CppComputedInclude }
 impl ImportKind {
     pub const fn name(self) -> &'static str {
         match self { Self::RustModule => "rust-module", Self::RustUse => "rust-use",
             Self::JavaScriptImport => "javascript-import", Self::JavaScriptExport => "javascript-export",
-            Self::PythonImport => "python-import", Self::PythonFrom => "python-from" }
+            Self::PythonImport => "python-import", Self::PythonFrom => "python-from",
+            Self::CppQuotedInclude => "cpp-quoted-include", Self::CppAngleInclude => "cpp-angle-include",
+            Self::CppComputedInclude => "cpp-computed-include" }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImportError {
-    SourceLimit, InvalidLimits, UnsupportedEncoding, InvalidEvidence, ResourceDenied,
+    SourceLimit, InvalidLimits, UnsupportedEncoding, UnsupportedLexicalContext, InvalidEvidence, ResourceDenied,
     Canceled, StaleSource, StaleQuery, OwnerMismatch, NotFound,
 }
 impl ImportError {
@@ -69,6 +75,7 @@ impl ImportError {
         match self {
             Self::SourceLimit => "IMPORT_SOURCE_LIMIT", Self::InvalidLimits => "IMPORT_INVALID_LIMITS",
             Self::UnsupportedEncoding => "IMPORT_UNSUPPORTED_ENCODING", Self::InvalidEvidence => "IMPORT_INVALID_EVIDENCE",
+            Self::UnsupportedLexicalContext => "IMPORT_UNSUPPORTED_LEXICAL_CONTEXT",
             Self::ResourceDenied => "IMPORT_RESOURCE_DENIED", Self::Canceled => "IMPORT_CANCELED",
             Self::StaleSource => "IMPORT_STALE_SOURCE", Self::StaleQuery => "IMPORT_STALE_QUERY",
             Self::OwnerMismatch => "IMPORT_OWNER_MISMATCH", Self::NotFound => "IMPORT_NOT_FOUND",
@@ -135,6 +142,7 @@ impl<'source> CapturedImports<'source> {
         }
         let text = map.decoded_text();
         if text.len() > MAX_IMPORT_SOURCE_BYTES * 4 { return Err(ImportError::SourceLimit); }
+        if language == ImportLanguage::Cpp { cpp::check_source(text, &mut canceled)?; }
         check(&mut canceled)?;
         let capacity = text.len().max(1);
         let mut spans = reserve::<Span>(capacity)?;
@@ -146,6 +154,7 @@ impl<'source> CapturedImports<'source> {
         match language {
             ImportLanguage::Rust => parser.rust(&mut canceled)?,
             ImportLanguage::Python => parser.python(&mut canceled)?,
+            ImportLanguage::Cpp => parser.cpp(&mut canceled)?,
             _ => parser.javascript(&mut canceled)?,
         }
         check(&mut canceled)?;

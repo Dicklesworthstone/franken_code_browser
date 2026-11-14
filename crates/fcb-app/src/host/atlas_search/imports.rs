@@ -281,7 +281,8 @@ impl RetainedAtlasSearch {
             language, snapshot.max_links - snapshot.links.len(), &self.budget, work.parser_id,
             || canceled() || atlas.validate_active().is_err()) {
             Ok(imports) => imports,
-            Err(ImportError::UnsupportedEncoding | ImportError::InvalidEvidence | ImportError::SourceLimit) => {
+            Err(ImportError::UnsupportedEncoding | ImportError::UnsupportedLexicalContext
+                | ImportError::InvalidEvidence | ImportError::SourceLimit) => {
                 snapshot.unsupported += 1; snapshot.examined += 1; return Ok(());
             }
             Err(error) => return Err(error.into()),

@@ -53,6 +53,10 @@ impl<T> ImportResolution<T> {
 /// the source directory, then dotted names become components, with .py and
 /// /__init__.py as the complete finite set. Absolute imports remain external;
 /// no sys.path, package execution, namespace-package or NFKC inference occurs.
+/// C/C++ quoted includes admit only the exact source-relative catalog path.
+/// Angle includes remain external; computed includes remain unresolved. No
+/// include directories, compilation database, macro expansion or header suffix
+/// preference is inferred, and header-name bytes are not C-unescaped.
 pub fn resolve_import<T: Copy + Eq>(
     source_path: &[u8], fact: &ImportFact, mut lookup: impl FnMut(&[u8]) -> Option<T>,
 ) -> ImportResolution<T> {
@@ -62,6 +66,9 @@ pub fn resolve_import<T: Copy + Eq>(
     }
     if fact.kind() == ImportKind::RustUse {
         return rust::resolve_use(source_path, fact, &mut lookup);
+    }
+    if matches!(fact.kind(), ImportKind::CppQuotedInclude | ImportKind::CppAngleInclude | ImportKind::CppComputedInclude) {
+        return cpp_include(source_path, fact, &mut lookup);
     }
     let destination = fact.destination();
     if !fact.resolution_allowed() || destination.is_empty()
@@ -98,6 +105,30 @@ pub fn resolve_import<T: Copy + Eq>(
         b"/index.ts", b"/index.tsx", b"/index.js", b"/index.jsx", b"/index.mjs", b"/index.cjs",
     ];
     candidates(&mut path, &CANDIDATES, "unique-relative-module-candidate", &mut lookup)
+}
+
+fn cpp_include<T: Copy + Eq>(source_path: &[u8], fact: &ImportFact,
+    lookup: &mut impl FnMut(&[u8]) -> Option<T>) -> ImportResolution<T> {
+    let unsupported = || ImportResolution::without(ImportResolutionKind::Unresolved, "unsupported-specifier");
+    if ImportLanguage::from_path(source_path) != Some(ImportLanguage::Cpp) { return unsupported(); }
+    if fact.kind() == ImportKind::CppComputedInclude {
+        return ImportResolution::without(ImportResolutionKind::Unresolved, "unresolved-cpp-include");
+    }
+    let destination = fact.destination();
+    if !fact.resolution_allowed() || destination.is_empty() || destination.len() > MAX_IMPORT_RESOLUTION_PATH_BYTES
+        || destination.chars().any(|c| c.is_control() || matches!(c, '\\' | '"' | '<' | '>')) {
+        return unsupported();
+    }
+    if fact.kind() == ImportKind::CppAngleInclude {
+        return ImportResolution::without(ImportResolutionKind::External, "external-specifier");
+    }
+    if destination.starts_with('/') || destination.contains(':') || destination.ends_with('/')
+        || matches!(destination.rsplit('/').next(), Some("." | "..")) { return unsupported(); }
+    let Some(path) = CatalogPath::relative(source_path, destination.as_bytes()) else { return unsupported(); };
+    match lookup(path.bytes()) {
+        Some(target) => ImportResolution::local(target, "cpp-source-relative-include-candidate"),
+        None => ImportResolution::without(ImportResolutionKind::Missing, "no-catalog-target"),
+    }
 }
 
 fn rust_module<T: Copy + Eq>(

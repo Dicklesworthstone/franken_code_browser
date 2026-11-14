@@ -134,9 +134,9 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
         guard try w.text("projection") == "lexical-source-imports",
               try w.text("relationship_kind") == "lexical-import",
               try w.text("evidence_precision") == "exact-import-source-range",
-              try w.text("extractor") == "franken-markdown-d6fbd1d5/import-statements-v3",
-              try w.text("resolver") == "fcb-closed-catalog-imports-v3",
-              try w.text("extraction_policy") == "rust-use-tree-js-static-and-python-import-v3",
+              try w.text("extractor") == "franken-markdown-d6fbd1d5/import-statements-v4",
+              try w.text("resolver") == "fcb-closed-catalog-imports-v4",
+              try w.text("extraction_policy") == "rust-use-tree-js-python-and-cpp-literal-include-v4",
               try !w.flag("compiler_resolved"), try !w.flag("semantic_complete") else {
             throw AtlasProjectLinksError.invalidResponse
         }
@@ -148,13 +148,15 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
         switch language {
         case "rust": kinds = ["rust-module", "rust-use"]
         case "python": kinds = ["python-import", "python-from"]
+        case "cpp": kinds = ["cpp-quoted-include", "cpp-angle-include", "cpp-computed-include"]
         case "javascript", "typescript", "jsx", "tsx": kinds = ["javascript-import", "javascript-export"]
         default: throw AtlasProjectLinksError.invalidResponse
         }
         guard kinds.contains(kind),
               ["exact-relative-path", "unique-relative-module-candidate", "rust-module-file-candidate",
                "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "ambiguous-rust-crate-root",
-               "python-relative-module-candidate", "unresolved-rust-use", "external-specifier",
+               "python-relative-module-candidate", "cpp-source-relative-include-candidate",
+               "unresolved-cpp-include", "unresolved-rust-use", "external-specifier",
                "unsupported-specifier", "no-catalog-target", "ambiguous-catalog-target"].contains(resolutionBasis) else {
             throw AtlasProjectLinksError.invalidResponse
         }
@@ -169,6 +171,17 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
             "unsupported-specifier", "no-catalog-target", "ambiguous-catalog-target"].contains(resolutionBasis) {
             throw AtlasProjectLinksError.invalidResponse
         }
+        if ["cpp-source-relative-include-candidate", "unresolved-cpp-include"].contains(resolutionBasis)
+            && language != "cpp" { throw AtlasProjectLinksError.invalidResponse }
+        if language == "cpp" {
+            let allowed: [String]
+            switch kind {
+            case "cpp-quoted-include": allowed = ["cpp-source-relative-include-candidate", "no-catalog-target", "unsupported-specifier"]
+            case "cpp-angle-include": allowed = ["external-specifier", "unsupported-specifier"]
+            default: allowed = ["unresolved-cpp-include"]
+            }
+            guard allowed.contains(resolutionBasis) else { throw AtlasProjectLinksError.invalidResponse }
+        }
     }
     var label: String {
         let statement: String
@@ -177,6 +190,9 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
         case "rust-use": statement = "Rust use statement"
         case "python-import": statement = "Python import statement"
         case "python-from": statement = "Python from-import statement"
+        case "cpp-quoted-include": statement = "Quoted C/C++ include"
+        case "cpp-angle-include": statement = "External C/C++ include"
+        case "cpp-computed-include": statement = "Unresolved computed C/C++ include"
         case "javascript-export": statement = "Re-export statement"
         default: statement = "Import statement"
         }
@@ -290,11 +306,12 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
             switch resolution {
             case "captured", "unavailable", "uncaptured", "outside-capture-scope":
                 allowed = ["exact-relative-path", "unique-relative-module-candidate", "rust-module-file-candidate",
-                    "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "python-relative-module-candidate"]
+                    "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "python-relative-module-candidate",
+                    "cpp-source-relative-include-candidate"]
             case "missing": allowed = ["no-catalog-target"]
             case "ambiguous": allowed = ["ambiguous-catalog-target", "ambiguous-rust-crate-root"]
             case "external": allowed = ["external-specifier"]
-            default: allowed = ["unresolved-rust-use", "unsupported-specifier"]
+            default: allowed = ["unresolved-rust-use", "unresolved-cpp-include", "unsupported-specifier"]
             }
             guard allowed.contains(importEvidence.resolutionBasis) else { throw AtlasProjectLinksError.invalidResponse }
         }

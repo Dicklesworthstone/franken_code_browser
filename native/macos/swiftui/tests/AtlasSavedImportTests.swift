@@ -28,8 +28,8 @@ private final class SavedImportFixture: @unchecked Sendable {
         ["projection": "lexical-source-imports", "relationship_kind": "lexical-import",
          "evidence_precision": "exact-import-source-range", "resolution_domain": "declared-catalog-candidates",
          "compiler_resolved": false, "semantic_complete": false,
-         "extractor": "franken-markdown-d6fbd1d5/import-statements-v3",
-         "extraction_policy": "rust-use-tree-js-static-and-python-import-v3", "resolver": "fcb-closed-catalog-imports-v3"]
+         "extractor": "franken-markdown-d6fbd1d5/import-statements-v4",
+         "extraction_policy": "rust-use-tree-js-python-and-cpp-literal-include-v4", "resolver": "fcb-closed-catalog-imports-v4"]
     }
     func link(_ id: UInt64) -> [String: Any] {
         let target = base.members[id == 1 ? 3 : 4]
@@ -236,6 +236,62 @@ private final class SavedImportFixture: @unchecked Sendable {
         targetRows[0]["resolution_basis"] = "ambiguous-rust-crate-root"
         forgedTarget["links"] = targetRows; reject { _ = try decode(forgedTarget) }
     }
+    private static func cppWire(_ f: SavedImportFixture, identity: AtlasSavedIdentity) throws {
+        let decode: ([String: Any]) throws -> AtlasSavedImports = {
+            try AtlasSavedImports.decode(f.base.encode($0), identity: identity, generation: 1,
+                direction: .all, member: nil, start: 0, limit: 64)
+        }
+        var value = f.page(identity.owner, generation: 1)
+        var rows = value["links"] as! [[String: Any]]
+        for i in rows.indices {
+            rows[i]["language"] = "cpp"; rows[i]["lexical_import_kind"] = "cpp-quoted-include"
+            rows[i]["destination"] = "detail/value.h"
+            rows[i]["resolution_basis"] = "cpp-source-relative-include-candidate"
+            rows[i]["source_path"] = f.base.path(Array("src/main.cpp".utf8), "src/main.cpp")
+            rows[i]["target_path"] = f.base.path(Array("src/detail/value.h".utf8), "src/detail/value.h")
+        }
+        value["links"] = rows
+        let accepted = try decode(value)
+        precondition(accepted.links[0].canOpenTarget && !accepted.links[1].canOpenTarget
+            && accepted.links[0].language == "cpp" && accepted.links[0].label == "Quoted C/C++ include")
+        for (key, wrong) in [("language", "python"), ("lexical_import_kind", "cpp-angle-include"),
+            ("lexical_import_kind", "cpp-computed-include"), ("resolution_basis", "unique-relative-module-candidate"),
+            ("resolution_basis", "python-relative-module-candidate"), ("resolution_basis", "ambiguous-catalog-target")] {
+            var bad = value, changed = rows
+            changed[0][key] = wrong; bad["links"] = changed; reject { _ = try decode(bad) }
+        }
+        var compiler = value; compiler["compiler_resolved"] = true; reject { _ = try decode(compiler) }
+        var oldPolicy = value; oldPolicy["resolver"] = "fcb-closed-catalog-imports-v3"
+        reject { _ = try decode(oldPolicy) }
+        for (kind, destination, resolution, basis, label) in [
+            ("cpp-angle-include", "vector", "external", "external-specifier", "External C/C++ include"),
+            ("cpp-computed-include", "HEADER_NAME", "unresolved", "unresolved-cpp-include", "Unresolved computed C/C++ include"),
+            ("cpp-quoted-include", "missing.h", "missing", "no-catalog-target", "Quoted C/C++ include"),
+            ("cpp-angle-include", "broken\\header", "unresolved", "unsupported-specifier", "External C/C++ include")
+        ] {
+            var other = value, changed = rows
+            for i in changed.indices {
+                changed[i]["lexical_import_kind"] = kind; changed[i]["destination"] = destination
+                changed[i]["resolution"] = resolution; changed[i]["resolution_basis"] = basis
+                for key in ["target_member", "target_file_id", "target_revision", "target_digest", "target_path", "target_bytes"] {
+                    changed[i][key] = NSNull()
+                }
+            }
+            other["links"] = changed
+            let edge = try decode(other).links[0]
+            precondition(!edge.canOpenTarget && edge.targetMember == nil && edge.label == label)
+            changed[0]["target_member"] = "3"; changed[0]["target_file_id"] = "4"
+            changed[0]["target_path"] = f.base.path(Array("src/detail/value.h".utf8), "src/detail/value.h")
+            other["links"] = changed; reject { _ = try decode(other) }
+        }
+        var partial = value
+        partial["source_members"] = "2"; partial["unsupported_source_members"] = "1"
+        partial["imports_complete"] = false
+        let page = try decode(partial)
+        precondition(!page.complete && page.unsupported == 1 && page.links[0].canOpenTarget)
+        partial["imports_complete"] = true; reject { _ = try decode(partial) }
+    }
+
     @MainActor static func main() async throws {
         let f = SavedImportFixture()
         let browser = AtlasSavedRepositoryModel(transport: f.transport)
@@ -247,6 +303,7 @@ private final class SavedImportFixture: @unchecked Sendable {
                 direction: .all, member: nil, start: 0, limit: 64)
         }
         let accepted = try decode(f.page(identity.owner, generation: 1))
+        try cppWire(f, identity: identity)
         precondition(accepted.complete && accepted.links[0].sourcePath.bytes == f.base.rawPath)
         precondition(accepted.links[0].canOpenTarget && !accepted.links[1].canOpenTarget)
         var interrupted = f.page(identity.owner, generation: 1); interrupted["member_read_calls"] = "1048576"

@@ -44,6 +44,71 @@ fn utf16(text: &str, big: bool) -> Vec<u8> {
 }
 
 #[test]
+fn saved_cpp_includes_preserve_utf16_evidence_and_independent_offline_readers() {
+    let prefix = "// \u{1f980} saved source\r\n";
+    let statement = "# include \"detail/café.h\"";
+    for big in [false, true] {
+        let source = utf16(&format!("{prefix}{statement}\r\n#include <vector>\r\n#include HEADER\r\n"), big);
+        let header = b"#pragma once\nstruct Saved {};\n";
+        let f = Fixture::new(&[entry("src/detail/café.h".as_bytes(), header), entry(b"src/main.cxx", &source)], true);
+        let mut saved = f.open(57950 + u64::from(big) * 10);
+        let result = prepare(&mut saved, 1);
+        assert!(result.get("imports_complete").flag());
+        assert_eq!(result.get("links_seen").number(), 3);
+        let row = link(&result, b"src/main.cxx", "detail/café.h");
+        let id = row.get("link_id").number();
+        assert_eq!(row.get("language").text(), "cpp");
+        assert_eq!(row.get("lexical_import_kind").text(), "cpp-quoted-include");
+        assert_eq!(row.get("resolution_basis").text(), "cpp-source-relative-include-candidate");
+        assert_eq!(row.get("target_path").get("hex").text(), hex("src/detail/café.h".as_bytes()));
+        assert_eq!(row.get("evidence_range").get("start").number(), 2 + prefix.encode_utf16().count() as u64 * 2);
+        assert_eq!(range(&source, row.get("evidence_range")), &utf16(statement, big)[2..]);
+        assert_eq!(range(&source, row.get("specifier_range")), &utf16("detail/café.h", big)[2..]);
+        let before = reads(&mut saved);
+        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number()), Direction::Incoming, 0, 64, || false).unwrap());
+        assert_eq!(incoming.get("matching_links").number(), 1);
+        assert_eq!(&incoming.get("links").array()[0], row);
+        assert_eq!(reads(&mut saved), before);
+        for (destination, resolution, basis) in [("vector", "external", "external-specifier"),
+            ("HEADER", "unresolved", "unresolved-cpp-include")] {
+            let edge = link(&result, b"src/main.cxx", destination);
+            assert_eq!(edge.get("resolution").text(), resolution);
+            assert_eq!(edge.get("resolution_basis").text(), basis);
+            assert_eq!(edge.get("target_member"), &Json::Null);
+        }
+        let (mut evidence, receipt) = saved.open_import_reader(owner(57951 + u64::from(big) * 10), 1, id, Side::Evidence, || false).unwrap();
+        let receipt = json(&receipt);
+        assert_eq!(receipt.get("selection"), row.get("evidence_range"));
+        assert_eq!(receipt.get("source_digest").text(), Sha256::digest(&source).to_hex());
+        assert!(!receipt.get("live_source_reopened").flag());
+        let (mut target, receipt) = saved.open_import_reader(owner(57952 + u64::from(big) * 10), 1, id, Side::Target, || false).unwrap();
+        assert_eq!(json(&receipt).get("source_digest").text(), Sha256::digest(header).to_hex());
+        saved.clear_imports(2, || false).unwrap();
+        drop(saved);
+        fs::rename(&f.path, f.root.join("moved.fcbs")).unwrap();
+        assert_eq!(copy_all(&mut evidence).get("original_hex").text(), hex(&source));
+        assert_eq!(copy_all(&mut target).get("original_hex").text(), hex(header));
+    }
+}
+
+#[test]
+fn saved_cpp_unsupported_lexical_context_is_counted_and_never_reported_complete() {
+    let continued = b"// continued comment \\\r\n#include \"false.h\"\r\n";
+    let f = Fixture::new(&[entry(b"bad.cpp", continued), entry(b"good.c", b"#include \"header.h\"\n"),
+        entry(b"header.h", b"#pragma once\n")], true);
+    let mut saved = f.open(57970);
+    let response = saved.prepare_imports(1, 64, 1024 * 1024, || false).unwrap();
+    assert_eq!(response.exit_code(), EXIT_PARTIAL);
+    let result = json(&response);
+    assert!(!result.get("imports_complete").flag());
+    assert_eq!(result.get("source_members").number(), 3);
+    assert_eq!(result.get("unsupported_source_members").number(), 1);
+    assert_eq!(result.get("scanned_source_members").number(), 2);
+    assert_eq!(result.get("links_seen").number(), 1);
+    assert_eq!(link(&result, b"good.c", "header.h").get("resolution").text(), "captured");
+}
+
+#[test]
 fn saved_rust_use_tree_pages_preserve_leaf_identity_and_original_utf16_evidence() {
     let statement = "use crate::shared::{self, Thing as Alias, nested::{Alpha, Beta}, *};";
     for big in [false, true] {
@@ -56,7 +121,7 @@ fn saved_rust_use_tree_pages_preserve_leaf_identity_and_original_utf16_evidence(
         let result = prepare(&mut saved, 1);
         assert!(result.get("imports_complete").flag());
         assert_eq!(result.get("links_seen").number(), 5);
-        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v3");
+        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v4");
         let rows = result.get("links").array();
         for (index, (destination, spelling)) in [
             ("crate::shared", "self"), ("crate::shared::Thing", "Thing"),
@@ -139,8 +204,8 @@ fn shared_language_extractors_publish_exact_occurrences_and_metadata_only_revers
     assert_eq!(result.get("import_generation").number(), 7);
     assert_eq!(result.get("projection").text(), "lexical-source-imports");
     assert_eq!(result.get("evidence_precision").text(), "exact-import-source-range");
-    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v3");
-    assert_eq!(result.get("extraction_policy").text(), "rust-use-tree-js-static-and-python-import-v3");
+    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v4");
+    assert_eq!(result.get("extraction_policy").text(), "rust-use-tree-js-python-and-cpp-literal-include-v4");
     assert_eq!(result.get("completeness_scope").text(), "parsed-source-imports-in-saved-manifest");
     assert!(!result.get("compiler_resolved").flag());
     assert!(!result.get("semantic_complete").flag());

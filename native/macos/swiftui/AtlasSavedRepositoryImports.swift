@@ -20,9 +20,9 @@ enum AtlasSavedImportWire {
         guard w.projection == "lexical-source-imports", w.relationship_kind == "lexical-import",
               w.evidence_precision == "exact-import-source-range",
               w.resolution_domain == "declared-catalog-candidates",
-              w.extractor == "franken-markdown-d6fbd1d5/import-statements-v3",
-              w.extraction_policy == "rust-use-tree-js-static-and-python-import-v3",
-              w.resolver == "fcb-closed-catalog-imports-v3",
+              w.extractor == "franken-markdown-d6fbd1d5/import-statements-v4",
+              w.extraction_policy == "rust-use-tree-js-python-and-cpp-literal-include-v4",
+              w.resolver == "fcb-closed-catalog-imports-v4",
               !w.compiler_resolved, !w.semantic_complete else { throw AtlasSavedError.invalidResponse }
     }
 
@@ -65,6 +65,9 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         case "rust-use": return "Rust use statement"
         case "python-import": return "Python import statement"
         case "python-from": return "Python from-import statement"
+        case "cpp-quoted-include": return "Quoted C/C++ include"
+        case "cpp-angle-include": return "External C/C++ include"
+        case "cpp-computed-include": return "Unresolved computed C/C++ include"
         case "javascript-export": return "Re-export statement"
         default: return "Import statement"
         }
@@ -111,6 +114,7 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         switch language {
         case "rust": kinds = ["rust-module", "rust-use"]
         case "python": kinds = ["python-import", "python-from"]
+        case "cpp": kinds = ["cpp-quoted-include", "cpp-angle-include", "cpp-computed-include"]
         case "javascript", "typescript", "jsx", "tsx": kinds = ["javascript-import", "javascript-export"]
         default: throw AtlasSavedError.invalidResponse
         }
@@ -123,7 +127,8 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
               ["captured", "unavailable", "missing", "ambiguous", "external", "unresolved"].contains(resolution),
               ["exact-relative-path", "unique-relative-module-candidate", "rust-module-file-candidate",
                "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "ambiguous-rust-crate-root",
-               "python-relative-module-candidate", "unresolved-rust-use", "external-specifier",
+               "python-relative-module-candidate", "cpp-source-relative-include-candidate",
+               "unresolved-cpp-include", "unresolved-rust-use", "external-specifier",
                "unsupported-specifier", "no-catalog-target", "ambiguous-catalog-target"].contains(resolutionBasis) else {
             throw AtlasSavedError.invalidResponse
         }
@@ -138,15 +143,26 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
             "unsupported-specifier", "no-catalog-target", "ambiguous-catalog-target"].contains(resolutionBasis) {
             throw AtlasSavedError.invalidResponse
         }
+        if ["cpp-source-relative-include-candidate", "unresolved-cpp-include"].contains(resolutionBasis)
+            && language != "cpp" { throw AtlasSavedError.invalidResponse }
+        if language == "cpp" {
+            let allowed: [String]
+            switch kind {
+            case "cpp-quoted-include": allowed = ["cpp-source-relative-include-candidate", "no-catalog-target", "unsupported-specifier"]
+            case "cpp-angle-include": allowed = ["external-specifier", "unsupported-specifier"]
+            default: allowed = ["unresolved-cpp-include"]
+            }
+            guard allowed.contains(resolutionBasis) else { throw AtlasSavedError.invalidResponse }
+        }
         let acceptedBases: [String]
         switch resolution {
         case "captured", "unavailable": acceptedBases = ["exact-relative-path", "unique-relative-module-candidate",
             "rust-module-file-candidate", "rust-use-module-file-candidate", "rust-use-module-prefix-candidate",
-            "python-relative-module-candidate"]
+            "python-relative-module-candidate", "cpp-source-relative-include-candidate"]
         case "missing": acceptedBases = ["no-catalog-target"]
         case "ambiguous": acceptedBases = ["ambiguous-catalog-target", "ambiguous-rust-crate-root"]
         case "external": acceptedBases = ["external-specifier"]
-        default: acceptedBases = ["unsupported-specifier", "unresolved-rust-use"]
+        default: acceptedBases = ["unsupported-specifier", "unresolved-rust-use", "unresolved-cpp-include"]
         }
         guard acceptedBases.contains(resolutionBasis) else { throw AtlasSavedError.invalidResponse }
         if resolution == "captured" || resolution == "unavailable" {
