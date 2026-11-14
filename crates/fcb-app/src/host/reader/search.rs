@@ -4,6 +4,8 @@
 //! matching and original-byte provenance. Only bounded hit ranges survive in
 //! the reader; source spellings and wire witnesses are encoded from its capture.
 
+mod page;
+
 use super::*;
 use fcb::search::{DirectSourceScanner, QueryOptions, SearchCoverage, SearchMatch,
     SearchMode, UnicodeNormalization};

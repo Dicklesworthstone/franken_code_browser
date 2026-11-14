@@ -501,7 +501,8 @@ fn lowercase_whole_file_requests_reject_byte_and_window_options_before_io() {
     for flags in [
         vec!["--whole-file", "--raw-hex", "4b", "--ignore-case"],
         vec!["--workspace", "--whole-file", "--raw-hex", "4b", "--ignore-case"],
-        vec!["--text", "k", "--ignore-case"],
+        // Lowercase window search is supported; a whole-file scan budget is not.
+        vec!["--text", "k", "--ignore-case", "--max-scan-bytes", "4"],
         vec!["--whole-file", "--text", "k", "--ignore-case", "--bytes", "4"],
         vec!["--whole-file", "--text", "k", "--ignore-case", "--offset", "0"],
     ] {

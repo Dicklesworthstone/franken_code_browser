@@ -229,6 +229,7 @@ pub struct ReaderSearch<'needle, R: Read> {
     length: ByteLength,
     options: StreamReadOptions,
     count_all_matches: bool,
+    skip_matches: u64,
     encoding: Option<DetectedEncoding>,
     header: u64,
     cursor: Option<ByteSearchCursor<'needle>>,
@@ -255,6 +256,28 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
     /// state; use `new_counting` to continue without retaining additional hits.
     pub fn new(reader: R, request: CaptureRequest, length: ByteLength,
         needle: &'needle StreamingNeedle, options: StreamReadOptions,
+        budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
+        Self::new_page(reader, request, length, needle, options, 0, false, budget, allocation)
+    }
+    /// Retain a bounded page after `skip_matches` qualified occurrences, keeping
+    /// occurrence IDs and counts relative to the whole supplied input. The
+    /// reader must still start at byte zero: skipped matches spend the same
+    /// byte, read-call, per-step and cancellation budgets as retained matches.
+    /// No skipped witness or source prefix is retained.
+    ///
+    /// Replaying pages is exact only when the host supplies the SAME immutable
+    /// input and query. Separate reads of a mutable file are new observations,
+    /// not pages of an earlier query. This constructor does not relax that
+    /// contract or make independently observed extents one complete capture.
+    ///
+    /// Without counting, the first occurrence after the page fills establishes
+    /// a lower-bound count and match-limit state. With counting, omitted later
+    /// occurrences consume work but no result storage. A false
+    /// `StreamReadReport::has_more_matches` proves no later matches only when
+    /// the input completed; byte/call limits and cancellation remain partial.
+    pub fn new_page(reader: R, request: CaptureRequest, length: ByteLength,
+        needle: &'needle StreamingNeedle, options: StreamReadOptions,
+        skip_matches: u64, count_all_matches: bool,
         budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
         if request.file().owner() != needle.owner || options.generation.owner() != needle.owner {
             return Err(StreamReadError::OwnerMismatch);
@@ -296,7 +319,7 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
                 window: None, decoded_base: 0, position: 0, token_start: 0, token_end: 0 })
         } else { None };
         let witnesses = reserve(if lowercase.is_some() { options.max_matches } else { 0 })?;
-        let mut search = Self { reader, needle, request, length, options, count_all_matches: false, encoding: options.encoding,
+        let mut search = Self { reader, needle, request, length, options, count_all_matches, skip_matches, encoding: options.encoding,
             header: 0, initialized: cursor.is_some(), cursor, lowercase, identifier, witnesses,
             buffer, base: 0, filled: 0, ready: 0, consumed: 0, eof: false,
             hits: reserve(options.max_matches)?, matches_seen: 0, unsupported_at: None,
@@ -311,9 +334,7 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
     pub fn new_counting(reader: R, request: CaptureRequest, length: ByteLength,
         needle: &'needle StreamingNeedle, options: StreamReadOptions,
         budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
-        let mut search = Self::new(reader, request, length, needle, options, budget, allocation)?;
-        search.count_all_matches = true;
-        Ok(search)
+        Self::new_page(reader, request, length, needle, options, 0, true, budget, allocation)
     }
     pub const fn state(&self) -> StreamReadState { self.state }
     pub const fn stats(&self) -> StreamReadStats { self.stats }
@@ -377,6 +398,7 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
                 if self.needle.mode == StreamingMode::ExactText && (hit.start < self.header
                     || (self.encoding.is_some_and(|encoding| encoding.is_utf16()) && hit.start % 2 != 0)) { continue; }
                 self.matches_seen += 1;
+                if self.matches_seen <= self.skip_matches { continue; }
                 if self.hits.len() == self.options.max_matches {
                     if self.count_all_matches { continue; }
                     self.state = StreamReadState::Truncated; break;
@@ -472,6 +494,7 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
             return Err(StreamReadError::InvalidRange);
         }
         self.matches_seen = self.matches_seen.checked_add(1).ok_or(StreamReadError::InvalidLimits)?;
+        if self.matches_seen <= self.skip_matches { return Ok(()); }
         if self.hits.len() < self.options.max_matches {
             self.hits.push(StreamingHit { occurrence: self.matches_seen, range });
         } else if !self.count_all_matches {
@@ -492,6 +515,10 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
                     if let Some(hit) = work.cursor.push(unit, *scalar) {
                         emitted += 1;
                         let occurrence = self.matches_seen.checked_add(1).ok_or(StreamReadError::InvalidLimits)?;
+                        if occurrence <= self.skip_matches {
+                            self.matches_seen = occurrence;
+                            continue;
+                        }
                         if self.hits.len() == self.options.max_matches {
                             self.matches_seen = occurrence;
                             if self.count_all_matches { continue; }
@@ -610,7 +637,7 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
         if self.state == StreamReadState::Pending { return Err(StreamReadError::Pending); }
         let report = StreamReadReport { needle: self.needle, request: self.request, length: self.length,
             generation: self.options.generation, encoding: self.encoding, header: self.header,
-            count_all_matches: self.count_all_matches,
+            count_all_matches: self.count_all_matches, skip_matches: self.skip_matches,
             hits: self.hits, witnesses: self.witnesses, matches_seen: self.matches_seen, unsupported_at: self.unsupported_at,
             state: self.state, stats: self.stats, _lease: self.lease };
         Ok((self.reader, report))
@@ -625,6 +652,7 @@ pub struct StreamReadReport<'needle> {
     encoding: Option<DetectedEncoding>,
     header: u64,
     count_all_matches: bool,
+    skip_matches: u64,
     hits: Vec<StreamingHit>,
     witnesses: Vec<RetainedWitness>,
     matches_seen: u64,
@@ -647,8 +675,21 @@ impl StreamReadReport<'_> {
     /// Whether this scan was asked to continue counting after its hit table filled.
     /// Work limits, cancellation and decoding failures can still leave it partial.
     pub const fn count_all_matches(&self) -> bool { self.count_all_matches }
-    /// Whether known occurrences were omitted from the retained result table.
-    /// This is independent of input coverage and may be true for a complete scan.
+    /// Requested number of occurrences preceding this page, independent of how
+    /// many occurrences the admitted scan actually reached.
+    pub const fn page_start_after(&self) -> u64 { self.skip_matches }
+    /// Qualified occurrences skipped before this page. A partial scan can stop
+    /// before the requested page, so this can be less than `page_start_after`.
+    pub fn skipped_matches(&self) -> u64 { self.skip_matches.min(self.matches_seen) }
+    /// Whether at least one qualified occurrence after this page was omitted.
+    /// False leaves later matches unknown unless `input_complete` is also true.
+    /// Deliberately skipped earlier matches do not set this flag.
+    pub fn has_more_matches(&self) -> bool {
+        self.matches_seen.saturating_sub(self.skip_matches) > self.hits.len() as u64
+    }
+    /// Whether known occurrences were omitted from the retained result table,
+    /// including intentionally skipped earlier pages. This is independent of
+    /// input coverage and may be true for a complete scan.
     pub fn hits_truncated(&self) -> bool { self.matches_seen > self.hits.len() as u64 }
     pub const fn unsupported_at(&self) -> Option<ByteOffset> { self.unsupported_at }
     pub fn hits(&self) -> &[StreamingHit] { &self.hits }
