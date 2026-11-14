@@ -1206,6 +1206,22 @@ import Dispatch
             nameMode: .exact, needle: f.occurrenceNeedle), mode: .occurrences, name: .exact, needle: f.occurrenceNeedle)
         precondition(occurrences.hits.map(\.hit.start) == [0, 2] && occurrences.hits.map(\.hit.end) == [208, 416])
 
+        // Wire admission only; saved-structure CLI tests run the actual extractor.
+        for language in ["java", "csharp", "kotlin"] {
+            var object = f.structurePage(40, generation: 1)
+            var hits = object["hits"] as! [[String: Any]], witness = hits[0]["structure"] as! [String: Any]
+            witness["language"] = language; hits[0]["structure"] = witness; object["hits"] = hits
+            if language == "kotlin" {
+                rejected("Unknown saved symbol language accepted") { _ = try decode(object) }
+            } else {
+                let managed = try decode(object)
+                precondition(managed.hits.count == 1 && managed.hits[0].structure.language == language
+                    && managed.hits[0].hit.start == page.hits[0].hit.start
+                    && managed.hits[0].hit.end == page.hits[0].hit.end,
+                    "Java/C# saved declaration admission changed exact selection evidence")
+            }
+        }
+
         var truncated = f.structurePage(40, generation: 1)
         truncated["state"] = "truncated"; truncated["truncated"] = true; truncated["matches_seen"] = "2"
         let capped = try decode(truncated)

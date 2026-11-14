@@ -23,7 +23,8 @@ pub(super) const CODE_HELP: &str = "\nCode navigation on exact retained desk sou
   code-ref-page PANE REFERENCE_GEN FIRST COUNT\n\
   code-ref-select PANE REFERENCE_GEN REFERENCE_ID\n\
   code-clear PANE OUTLINE_GEN | code-ref-clear PANE REFERENCE_GEN\n\
-Languages: rust, python, javascript, typescript, go, cpp (C/C++). auto uses only\n\
+Languages: rust, python, javascript, typescript, go, cpp (C/C++), swift, java,\n\
+csharp (C#). auto uses only\n\
 the retained label suffix. No parser/LSP process or live source is invoked.\n\
 Outlines are heuristic declaration candidates, NOT exhaustive or compiler-proven.\n\
 Names/IDs/parents retain their original inventory identity across filtered pages.\n\

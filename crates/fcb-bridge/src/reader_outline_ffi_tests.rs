@@ -84,3 +84,26 @@ fn c_outline_types_modes_and_public_header_declarations_agree() {
         assert_eq!(header.matches(name).count(), 1, "{name}");
     }
 }
+
+
+#[test]
+fn c_java_and_csharp_outline_aliases_copy_original_utf16_names_after_source_replacement() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    for (alias, language) in [("java", "java"), ("cs", "csharp"), ("c#", "csharp")] {
+        let bytes: Vec<_> = "\u{feff}// 😀\nclass Browser { public void open() {} }\n"
+            .encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let (path, r) = source(&bytes);
+        fs::write(&path, b"class Replacement {}").unwrap();
+        let alias = CString::new(alias).unwrap();
+        let outline = take(unsafe { fcb_reader_outline(r, 1, alias.as_ptr(), 4096) });
+        assert!(outline.contains(&format!("\"language\":\"{language}\"")), "{outline}");
+        assert!(outline.contains("\"retained_symbols\":\"2\""));
+        let needle = CString::new("open").unwrap();
+        let page = take(unsafe { fcb_reader_symbols(r, 1, needle.as_ptr(), 0, 0, 128) });
+        assert!(page.contains("\"name\":\"open\"") && page.contains("\"symbol_id\":\"2\""), "{page}");
+        assert!(take(fcb_reader_copy_symbol(r, 1, 2, 0)).contains("6f00700065006e00"));
+        let window = take(fcb_reader_symbol(r, 1, 2, 128));
+        assert!(window.contains("class Browser") && !window.contains("Replacement"), "{window}");
+        assert_eq!(fcb_reader_close(r), 1);
+    }
+}

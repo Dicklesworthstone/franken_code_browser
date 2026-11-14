@@ -248,3 +248,29 @@ fn canceled_or_replaced_index_queries_cannot_resume_but_accepted_sources_stay_pi
     assert_eq!(search.hit(&atlas, 2, 1).unwrap(), accepted);
     assert_eq!(search.progress(&atlas, 2).unwrap().stop_reason, Some(AtlasSearchStop::AllFilesExamined));
 }
+
+
+#[test]
+fn indexed_java_and_csharp_symbols_reuse_utf16_sources_after_paths_disappear() {
+    for (path, language) in [("Browser.java", "java"), ("Browser.cs", "csharp")] {
+        let source: Vec<_> = "\u{feff}// 😀\nclass Browser { public void open() {} }\n".encode_utf16()
+            .flat_map(u16::to_be_bytes).collect();
+        let fixture = Fixture::new(&[(path, &source)]);
+        let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+        search.prepare_index(&atlas, 1, index_options(), || false).unwrap();
+        fs::remove_file(fixture.0.join(path)).unwrap();
+        search.begin_indexed_structure(&atlas, 2, 1, "open", AtlasSearchScope::all(),
+            options(AtlasStructureMode::Symbols), || false).unwrap();
+        let page = finish(&mut search, &atlas, 2);
+        count(&page, "retained_hits", 1); count(&page, "source_bytes_read", 0);
+        assert!(page.contains(&format!("\"language\":\"{language}\"")));
+        assert!(page.contains("\"search_complete\":true") && page.contains("\"semantic_complete\":false"));
+        let hit = search.hit(&atlas, 2, 1).unwrap();
+        let (start, end) = hit.original_range.as_usize_bounds().unwrap();
+        let expected: Vec<_> = "open".encode_utf16().flat_map(u16::to_be_bytes).collect();
+        assert_eq!(&source[start..end], expected);
+        let (reader, receipt) = search.open_reader(&atlas, ArenaOwnerId::new(31622).unwrap(), 2, 1, || false).unwrap();
+        assert_eq!(reader.capture().bytes(), source);
+        assert!(receipt.as_str().contains("\"source_reopened\":false"));
+    }
+}

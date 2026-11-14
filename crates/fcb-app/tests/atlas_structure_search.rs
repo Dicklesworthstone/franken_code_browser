@@ -283,3 +283,27 @@ fn exact_symbol_and_heading_caps_continue_through_later_negative_files() {
         }
     }
 }
+
+
+#[test]
+fn live_java_and_csharp_symbol_search_opens_exact_retained_names_and_bodies() {
+    for (path, language, source) in [
+        ("Browser.java", "java", b"class Browser { void open() {} }\n".as_slice()),
+        ("Browser.cs", "csharp", b"namespace Sample; class Browser { public void open() {} }\n".as_slice()),
+    ] {
+        let fixture = Fixture::new(&[(path, source)]);
+        let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+        let mut settings = options(AtlasStructureMode::Symbols); settings.name_mode = SymbolNameMode::Exact;
+        search.begin_structure(&atlas, 1, "open", AtlasSearchScope::all(), settings, || false).unwrap();
+        let page = finish(&mut search, &atlas, 1);
+        count(&page, "retained_hits", 1); count(&page, "unsupported_structure_files", 0);
+        assert!(page.contains(&format!("\"language\":\"{language}\"")));
+        assert!(page.contains("\"semantic_complete\":false"));
+        let hit = search.hit(&atlas, 1, 1).unwrap();
+        let (start, end) = hit.original_range.as_usize_bounds().unwrap();
+        assert_eq!(&source[start..end], b"open");
+        fs::write(fixture.0.join(path), b"class Replacement {}").unwrap();
+        let (reader, _) = search.open_reader(&atlas, ArenaOwnerId::new(31606).unwrap(), 1, 1, || false).unwrap();
+        assert_eq!(reader.capture().bytes(), source);
+    }
+}

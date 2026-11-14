@@ -208,7 +208,7 @@ private func closeRetainedReader(_ handle: UInt64) -> UInt8
         let headings = Data([0xef, 0xbb, 0xbf])
             + Data("# Deploy!\r\n\r\nDeploy! is ordinary text too.\r\n\r\n# Deploy!\r\n".utf8)
         try headings.write(to: structureRoot.appendingPathComponent("README.md"))
-        try Data("func run() {}\n".utf8).write(to: structureRoot.appendingPathComponent("unsupported.swift"))
+        try Data("fun run() {}\n".utf8).write(to: structureRoot.appendingPathComponent("unsupported.kt"))
         let structureScope = try AtlasSearchPathScope(kind: .directory, path: "structure")
         let rustOnly = try AtlasSearchFileScope(extensions: ["rs"])
         do {
@@ -233,13 +233,29 @@ private func closeRetainedReader(_ handle: UInt64) -> UInt8
                 "Prefix name request must reach the actual public symbol extractor")
         }
         do {
-            let swiftOnly = try AtlasSearchFileScope(extensions: ["swift"])
-            let result = try execute(AtlasSearchInput(root: root.path, query: "run", fileScope: swiftOnly,
+            let unsupportedOnly = try AtlasSearchFileScope(extensions: ["kt"])
+            let result = try execute(AtlasSearchInput(root: root.path, query: "run", fileScope: unsupportedOnly,
                 pathScope: structureScope, mode: .symbols, nameMode: .exact))
             precondition(!result.complete && result.hits.isEmpty && result.unavailableFiles == 1
                 && result.unsupportedFiles == 1 && result.structureCoverage?.unsupportedFiles == 1
                 && result.summary.contains("unsupported languages"),
                 "Unsupported extraction is an explicit partial search, not a complete negative")
+        }
+        for (extensionName, language) in [("java", "java"), ("cs", "csharp")] {
+            let source = "class Browser { public void open() {} }\n"
+            try Data(source.utf8).write(to: structureRoot.appendingPathComponent("Browser." + extensionName))
+            let managedOnly = try AtlasSearchFileScope(extensions: [extensionName])
+            let result = try execute(AtlasSearchInput(root: root.path, query: "open", fileScope: managedOnly,
+                pathScope: structureScope, mode: .symbols, nameMode: .exact))
+            precondition(result.complete && result.hits.count == 1 && result.unsupportedFiles == 0,
+                "Java/C# source must reach the production shared declaration engine")
+            let hit = result.hits[0]
+            precondition(hit.structure?.language == language && hit.structure?.kind == "method"
+                && hit.structure?.evidence == "heuristic-outline-candidate",
+                "Managed declaration metadata changed at native admission")
+            precondition(Array(source.utf8)[Int(hit.start)..<Int(hit.end)].elementsEqual("open".utf8)
+                && result.capture?.target(hit)?.mode == .symbols,
+                "Managed declaration activation must retain exact original-name bytes")
         }
         let markdownOnly = try AtlasSearchFileScope(extensions: ["md"])
         let headingInput = try AtlasSearchInput(root: root.path, query: "Deploy!", fileScope: markdownOnly,

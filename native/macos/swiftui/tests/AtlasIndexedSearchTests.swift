@@ -154,6 +154,32 @@ import Dispatch
                 && report.indexStatus?.verifiedFiles == 0 && report.indexStatus?.verificationBytes == 4096,
                 "Heading qualification failure preserves admitted work without claiming accepted extraction")
         }
+        // Wire admission only; Rust public-route cases own declaration extraction.
+        for language in ["java", "csharp", "kotlin"] {
+            let f = IndexedFixture()
+            f.patch { phase, original in
+                var value = original
+                if phase == "query-step", let originalRows = value["hits"] as? [[String: Any]] {
+                    value["hits"] = originalRows.map { originalRow in
+                        var row = originalRow, structure = originalRow["structure"] as! [String: Any]
+                        structure["language"] = language; row["structure"] = structure
+                        return row
+                    }
+                }
+                return value
+            }
+            if language == "kotlin" {
+                do { _ = try search(AtlasIndexedSearch(transport: f.structuralTransport), .symbols)
+                    preconditionFailure("Unknown symbol language accepted by captured search") }
+                catch AtlasSearchError.invalidResponse { checks += 1 }
+            } else {
+                let report = try search(AtlasIndexedSearch(transport: f.structuralTransport), .symbols)
+                check(report.hits.count == 2 && report.hits.allSatisfy { $0.structure?.language == language },
+                    "Java/C# structural metadata was refused by captured search")
+                check(report.capture?.target(report.hits[0])?.mode == .symbols,
+                    "Managed-language declaration lost captured activation authority")
+            }
+        }
         for defect in ["strategy", "io", "mode", "semantic", "name-policy", "range", "candidate", "missing-evidence", "repeated-evidence"] {
             let f = IndexedFixture()
             f.patch { phase, original in

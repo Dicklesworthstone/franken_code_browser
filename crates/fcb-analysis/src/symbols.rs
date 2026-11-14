@@ -13,8 +13,8 @@
 //! Rust, and at most 128 bytes of Python indentation. These conservative guards
 //! bound recursive extraction/destruction without trusting legacy max_depth or
 //! max_items settings. Rejected files remain available to the ordinary reader.
-//! Swift uses the pinned upstream lexer and a bounded declaration recognizer;
-//! it does not introduce another lexer or compiler-semantic claims.
+//! Swift, Java and C# use pinned upstream lexers and bounded declaration
+//! recognizers; they do not introduce lexers or compiler-semantic claims.
 
 use std::mem::size_of;
 use fcb_core::{ByteLength, ByteRange, DecodedUtf8Offset, DecodedUtf8Range, FileId,
@@ -23,6 +23,7 @@ use fcb_source::{CaptureEncodingMap, CaptureRequest, DetectedEncoding, SpanKind,
 use crate::{ExtractorLimits, OutlineExtractor, OutlineItem, OutlineItemKind};
 
 mod swift;
+mod managed;
 
 pub const MAX_SYMBOL_SOURCE_BYTES: usize = 64 * 1024;
 pub const MAX_SYMBOL_ITEMS: usize = 4096;
@@ -30,11 +31,12 @@ const MAX_LINES: usize = 4096;
 const MAX_RECURSIVE_SCOPES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SymbolLanguage { Rust, Python, JavaScript, TypeScript, Go, Cpp, Swift }
+pub enum SymbolLanguage { Rust, Python, JavaScript, TypeScript, Go, Cpp, Swift, Java, CSharp }
 impl SymbolLanguage {
     pub const fn name(self) -> &'static str {
         match self { Self::Rust => "rust", Self::Python => "python", Self::JavaScript => "javascript",
-            Self::TypeScript => "typescript", Self::Go => "go", Self::Cpp => "cpp", Self::Swift => "swift" }
+            Self::TypeScript => "typescript", Self::Go => "go", Self::Cpp => "cpp", Self::Swift => "swift",
+            Self::Java => "java", Self::CSharp => "csharp" }
     }
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
@@ -42,7 +44,8 @@ impl SymbolLanguage {
             "javascript" | "js" | "jsx" | "mjs" | "cjs" => Some(Self::JavaScript),
             "typescript" | "ts" | "tsx" => Some(Self::TypeScript), "go" => Some(Self::Go),
             "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" => Some(Self::Cpp),
-            "swift" => Some(Self::Swift), _ => None,
+            "swift" => Some(Self::Swift), "java" => Some(Self::Java),
+            "csharp" | "cs" | "c#" => Some(Self::CSharp), _ => None,
         }
     }
     /// Only inspect a raw filename suffix. No lossy path conversion or source I/O.
@@ -59,7 +62,7 @@ impl SymbolLanguage {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SymbolError {
-    SourceLimit, ComplexityLimit, InvalidLimits, UnsupportedEncoding, InvalidEvidence,
+    SourceLimit, ComplexityLimit, InvalidLimits, UnsupportedEncoding, UnsupportedLexicalContext, InvalidEvidence,
     ResourceDenied, Canceled, StaleSource, StaleQuery, OwnerMismatch, NotFound,
 }
 impl SymbolError {
@@ -67,6 +70,7 @@ impl SymbolError {
         match self {
             Self::SourceLimit => "SYMBOL_SOURCE_LIMIT", Self::ComplexityLimit => "SYMBOL_COMPLEXITY_LIMIT",
             Self::InvalidLimits => "SYMBOL_INVALID_LIMITS", Self::UnsupportedEncoding => "SYMBOL_UNSUPPORTED_ENCODING",
+            Self::UnsupportedLexicalContext => "SYMBOL_UNSUPPORTED_LEXICAL_CONTEXT",
             Self::InvalidEvidence => "SYMBOL_INVALID_EVIDENCE", Self::ResourceDenied => "SYMBOL_RESOURCE_DENIED",
             Self::Canceled => "SYMBOL_CANCELED", Self::StaleSource => "SYMBOL_STALE_SOURCE",
             Self::StaleQuery => "SYMBOL_STALE_QUERY", Self::OwnerMismatch => "SYMBOL_OWNER_MISMATCH",
@@ -167,6 +171,8 @@ impl<'source> CapturedSymbols<'source> {
         if canceled() { return Err(SymbolError::Canceled); }
         let (candidates, limited) = if language == SymbolLanguage::Swift {
             swift::extract(&map, &line_starts, max_items, &mut canceled)?
+        } else if matches!(language, SymbolLanguage::Java | SymbolLanguage::CSharp) {
+            managed::extract(&map, language, &line_starts, max_items, &mut canceled)?
         } else {
             // Do not pass the caller's display limit into extraction: nested items
             // outside earlier top-level results must not disappear during filtering.

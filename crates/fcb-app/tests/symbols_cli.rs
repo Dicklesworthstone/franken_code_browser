@@ -273,3 +273,61 @@ fn swift_workspace_and_offline_snapshot_routes_count_only_recognized_file_suffix
     assert_eq!(output.get("candidates").array()[0].get("language").text(), "swift");
     assert_eq!(output.get("stats").get("unsupported_language_files").number(), 1);
 }
+
+
+#[test]
+fn java_and_csharp_file_and_language_alias_routes_select_method_names() {
+    for (language, alias, filename) in [("java", "java", "Browser.java"), ("csharp", "cs", "Browser.cs")] {
+        let fixture = Fixture::new();
+        let source = b"class Browser {\n    public void open() { String text = \"void fake() {}\"; }\n}\n";
+        fixture.file(filename, source);
+        fixture.file("capture.txt", source);
+        for (path, explicit) in [(filename, false), ("capture.txt", true)] {
+            let mut args = fixture.file_args(path); values(&mut args, &["--name", "open"]);
+            if explicit { values(&mut args, &["--language", alias]); }
+            let (exit, output) = invoke(&args, || false);
+            assert_eq!(exit, EXIT_OK);
+            assert!(!output.get("compiler_resolved").flag());
+            assert!(!output.get("symbol_inventory_complete").flag());
+            let candidates = output.get("candidates").array(); assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].get("language").text(), language);
+            assert_eq!(candidates[0].get("kind").text(), "method");
+            let range = candidates[0].get("name_range");
+            assert_eq!(&source[range.get("start").number() as usize..range.get("end").number() as usize], b"open");
+            assert_eq!(output.get("stats").get("unsupported_language_files").number(), 0);
+        }
+    }
+}
+
+#[test]
+fn java_and_csharp_workspace_and_offline_archives_share_utf16_name_evidence() {
+    let fixture = Fixture::new();
+    fixture.file("Browser.JAVA", b"class Browser { void open() {} }\n");
+    let csharp = utf16("namespace Sample; class Browser { public void open() {} }\n", false);
+    fixture.file("Browser.CS", &csharp);
+    let mut live = fixture.workspace_args(); values(&mut live, &["--name", "open"]);
+    let (exit, output) = invoke(&live, || false);
+    assert_eq!(exit, EXIT_OK); assert_eq!(output.get("candidates").array().len(), 2);
+    fixture.save(); fs::rename(fixture.root(), fixture.0.join("retired-root")).unwrap();
+    let mut saved = fixture.saved_args(); values(&mut saved, &["--name", "open"]);
+    let (exit, output) = invoke(&saved, || false);
+    assert_eq!(exit, EXIT_OK); assert!(!output.get("live_roots_accessed").flag());
+    let candidates = output.get("candidates").array(); assert_eq!(candidates.len(), 2);
+    let candidate = candidates.iter().find(|c| c.get("language").text() == "csharp").unwrap();
+    let range = candidate.get("name_range");
+    let expected: Vec<_> = "open".encode_utf16().flat_map(u16::to_be_bytes).collect();
+    assert_eq!(&csharp[range.get("start").number() as usize..range.get("end").number() as usize], expected);
+    assert_eq!(output.get("stats").get("analyzed_files").number(), 2);
+    assert_eq!(output.get("stats").get("unsupported_language_files").number(), 0);
+}
+
+#[test]
+fn java_prelexical_escape_refusal_cannot_be_reported_as_complete_no_match() {
+    let fixture = Fixture::new();
+    fixture.file("Escaped.java", br"// \u000a class Hidden { void open() {} }");
+    let mut args = fixture.file_args("Escaped.java"); values(&mut args, &["--name", "open"]);
+    let (exit, output) = invoke(&args, || false);
+    assert_eq!(exit, EXIT_PARTIAL); assert!(!output.get("processing_complete").flag());
+    assert!(output.get("candidates").array().is_empty());
+    assert_eq!(output.get("stats").get("refused_files").number(), 1);
+}

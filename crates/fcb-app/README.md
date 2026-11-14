@@ -959,3 +959,37 @@ Authored production-path regressions are in
 malformed text, UTF-16, lowercase expansion witnesses, later occurrence pages,
 stale/canceled requests and independent captured sources. Execution remains
 pending the repository's independent batch verification lane.
+
+## Java and C# declaration candidates
+
+The shared symbol route accepts Java and C# for file, workspace, saved-repository
+and retained-desk navigation. Infer them from case-insensitive `.java`/`.cs`
+suffixes, or select `--language java` / `--language csharp` (`cs` and `c#` are
+aliases). For example:
+
+```sh
+fcb symbols Browser.java --name open --json
+fcb symbols src --workspace --name open --json
+fcb symbols project.fcbs --snapshot --name open --json
+fcb symbols captured.txt --language csharp --json
+```
+
+Java candidates include type/record/annotation declarations, nested types,
+constructors and methods. C# adds namespace declarations and accessor or
+expression-bodied properties. Both reuse pinned FrankenMarkdown lexer terminals
+and shared original-byte maps; names in BOM-marked UTF-16 remain exact.
+Bodies and initializers are opaque, and every candidate keeps the existing
+`heuristic-outline-candidate` evidence level. Compiler name binding, local
+declarations, conditional compilation evaluation and complete language
+inventories are not claimed.
+
+The existing 64 KiB source/decoded-text, 4,096-line/item and 128 nesting limits
+still apply. Unsupported pre-token Java Unicode escapes and unsupported C#
+escaped-identifier contexts return `SYMBOL_UNSUPPORTED_LEXICAL_CONTEXT`.
+Workspace/offline responses retain their partial coverage when a source cannot
+be analyzed; no unsupported source becomes a complete empty inventory.
+
+Public-path regressions cover CLI scopes, live/indexed structural search,
+UTF-16 evidence, retained C-bridge copies after live source replacement, lexical
+contexts, limits, cancellation and stale activation. These tests are authored;
+independent executable verification remains pending.

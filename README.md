@@ -37,6 +37,15 @@ original-byte hex; use **Keep selected text** to add the passage to your Reading
 Desk for bookmarks and personal notes. See [selected passages, copying, and notes](native/macos/README.md#selected-passages-copying-and-notes).
 This source addition awaits executable and physical-Mac qualification.
 
+Current source includes **Expression** Find in retained and pinned readers:
+quoted phrases, required terms and exclusions are checked against the same
+immutable file before primary matches become navigable. Java and C# also join
+live/saved **Symbols** search and retained **Outline**, with exact original-byte
+selection and explicitly heuristic declaration evidence. See
+[retained Find](native/macos/README.md#finding-text-in-a-retained-file) and
+[Java/C# navigation](native/macos/README.md#navigating-java-and-c-declarations)
+for supported syntax and limits. Executable/native qualification is pending.
+
 The global search sidebar also offers **Occurrences** for exact whole-token
 identifier text across the selected workspace, folder, file or visible scope.
 Results include comments and strings and open their retained source with exact

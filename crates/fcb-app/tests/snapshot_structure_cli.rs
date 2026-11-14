@@ -168,3 +168,28 @@ fn actual_binary_searches_saved_headings_without_a_live_source_root() {
     assert_eq!(result.get("hits").array()[0].get("heading_slug").text(), "offline-guide");
     assert!(!result.get("live_roots_accessed").flag());
 }
+
+
+#[test]
+fn saved_java_and_csharp_symbols_keep_capture_ranges_and_unsupported_context_coverage() {
+    let java = b"class Browser { void open() {} }\n";
+    let csharp: Vec<_> = "\u{feff}namespace Sample; class Browser { void open() {} }\n"
+        .encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let f = Fixture::new(&[entry(b"src/Browser.JAVA", java), entry(b"src/Browser.CS", &csharp)], true);
+    let (exit, result) = invoke(&args(&f, "symbols", "open", &["--name-mode", "exact"]), || false);
+    assert_eq!(exit, EXIT_OK); assert_eq!(result.get("retained_hits").number(), 2);
+    assert!(result.get("workspace_complete").flag()); assert!(!result.get("semantic_complete").flag());
+    assert!(!result.get("live_roots_accessed").flag());
+    let hits = result.get("hits").array();
+    for (language, original, expected) in [("java", java.as_slice(), b"open".to_vec()),
+        ("csharp", csharp.as_slice(), "open".encode_utf16().flat_map(u16::to_le_bytes).collect())] {
+        let hit = hits.iter().find(|h| h.get("language").text() == language).unwrap();
+        assert_eq!(hit.get("kind").text(), "method");
+        let range = hit.get("original_range");
+        assert_eq!(&original[range.get("start").number() as usize..range.get("end").number() as usize], expected);
+    }
+    let refused = Fixture::new(&[entry(b"Escaped.java", br"// \u000a class Hidden {}")], true);
+    let (exit, result) = invoke(&args(&refused, "symbols", "Hidden", &[]), || false);
+    assert_eq!(exit, EXIT_PARTIAL); assert_eq!(result.get("unsupported_files").number(), 1);
+    assert!(!result.get("workspace_complete").flag()); assert_eq!(result.get("retained_hits").number(), 0);
+}

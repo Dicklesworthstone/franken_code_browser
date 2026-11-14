@@ -479,7 +479,7 @@ member names are labels and never open working-tree paths.
 
 | Mode | Matching and evidence | Per-member source limit |
 | --- | --- | --- |
-| Symbols | Case-sensitive exact, prefix, or contains matching against shared outline names, including qualified names. Rust, Python, JavaScript, TypeScript, Go, C/C++ and Swift declarations are heuristic candidates. | 64 KiB |
+| Symbols | Case-sensitive exact, prefix, or contains matching against shared outline names, including qualified names. Rust, Python, JavaScript, TypeScript, Go, C/C++, Swift, Java and C# declarations are heuristic candidates. | 64 KiB |
 | Headings | Case-sensitive exact, prefix, or contains matching against FrankenMarkdown heading titles. Results retain duplicate-aware slugs and qualified original source ranges. | 256 KiB |
 | Occurrences | One exact identifier token, including spelling matches in declarations, comments and string literals. Supported UTF-8 and BOM-marked UTF-16 keep their original byte coordinates. | 512 KiB |
 
@@ -559,6 +559,46 @@ requirements, opaque syntax, limits and cancellation. The native decoder admits
 the Swift language without changing evidence or capture validation. These
 cases are authored; executable Rust/Swift verification and physical-Mac
 qualification remain pending.
+
+## Navigating Java and C# declarations
+
+Java and C# source now participates in **Symbols** searches in live projects,
+retained indexes and saved repositories, and in retained-reader and Reading Desk
+**Outline** tools. Filenames ending in `.java` or `.cs` select the language,
+including uppercase suffixes. The reader also offers **Java** and **C#** for
+captures with another extension. The headless language selectors are `java`
+and `csharp` (`cs` and `c#` are aliases).
+
+| Language | Navigable declaration candidates |
+| --- | --- |
+| Java | Classes, interfaces, enums, records, annotation types, nested types, ordinary and compact constructors, methods, generic methods, interface/abstract signatures and annotation member defaults. |
+| C# | Block and file-scoped namespaces, classes, structs, interfaces, enums, records, nested types, constructors, generic methods, explicit-interface methods, tuple-returning methods and accessor/expression-bodied properties. |
+
+Choosing a candidate selects its exact original name bytes; declaration copying
+uses the same captured source. UTF-8 BOM and BOM-marked UTF-16 in both byte
+orders preserve their original coordinates. A C# `@name` selects the name after
+the escape prefix; a dotted namespace preserves its full source spelling,
+including intervening separators and spacing.
+
+The existing FrankenMarkdown lexers own comments, strings, text blocks,
+interpolation and token boundaries. Method bodies, field initializers, local
+declarations and enum constants do not contribute candidates. Fields, delegates,
+events, indexers, destructors and operator declarations are outside this slice.
+C# conditional compilation is not evaluated. Every result remains a
+`heuristic-outline-candidate`, without compiler binding or an exhaustive
+symbol-inventory claim.
+
+The shared limits remain 64 KiB of original and decoded source, 4,096 lines and
+candidates, 128 delimiter/scope levels and 4,096 UTF-8 bytes per retained name.
+Unbalanced delimiters fail closed. Java pre-token Unicode escapes and
+unsupported line terminators, and C# identifier escapes outside opaque
+comments/strings, return `SYMBOL_UNSUPPORTED_LEXICAL_CONTEXT`. Refusal leaves
+the source readable and keeps search coverage explicitly incomplete.
+
+Authored regressions exercise the shared extractor, CLI file/workspace/offline
+archive routes, live and indexed structural search, retained C-bridge selection
+and copy, and strict native language admission. Independent executable and
+physical-Mac verification remain pending.
 
 ## Following imports in a saved repository
 
@@ -1604,14 +1644,14 @@ occurrences before retaining witnesses. They do not reread the live file.
 Replay spends the ordinary scan and cancellation budgets, so later pages may
 take longer even though retained result memory stays bounded.
 
-Enable **Count all matches** to continue counting after a page fills. The
-summary distinguishes the full observed count from the current page; byte
+In Text mode, enable **Count all matches** to continue counting after a page
+fills. The summary distinguishes the full observed count from the current page; byte
 limits or unsupported text remain explicitly incomplete. Navigation wraps
 between the first and last match only after a complete scan has established the
 total. Before then, Previous at the first match stays there; Next continues
 forward. A partial scan never presents its last retained row as the file's final
-match. Queries admit at most 4,096 UTF-8 bytes. Editing the query or either
-option immediately revokes the old hit actions and cancels pending publication.
+match. Literal queries admit at most 4,096 UTF-8 bytes; expressions admit 1,024.
+Editing the query, mode or either option immediately revokes the old hit actions and cancels pending publication.
 Canceling a page request preserves the readable source but revokes its old hit
 actions; use Find to start again.
 
@@ -1625,7 +1665,8 @@ The additive `fcb_reader_find_page` and `fcb_reader_find_expression_page` ABIs u
 global occurrence offsets and fresh query generations. Expression is a separate
 entry point, preserving the original literal Find flags and older transports.
 Hosts without expression support keep literal Find available. Source-selection
-Find and automatic project-hit activation explicitly use literal spelling. Host, C-boundary, and native model/decoder regressions cover result-page
+Find and automatic project-hit activation explicitly use literal spelling.
+Host, C-boundary, and native model/decoder regressions cover result-page
 boundaries, UTF-16, overlapping matches, lowercase expansion witnesses, and
 stale/canceled requests. The native suites are available through
 `swiftui/tests/test-reader-search.sh` and `swiftui/tests/test-reader-commands.sh`;
