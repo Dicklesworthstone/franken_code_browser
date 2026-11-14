@@ -1010,13 +1010,16 @@ the sheet shows cumulative byte/read progress and previews up to the first 32
 matches from finalized file observations. The unfinished file contributes I/O
 progress, but its tentative matches are withheld until its observation finishes.
 
-For Text and Occurrences, **Scan later matches** and **Scan earlier matches**
+For Text, Expression and Occurrences, **Scan later matches** and **Scan earlier matches**
 open another bounded result window when available. Each action scans current
 files again from the beginning, charging skipped matches against the same I/O
 budgets. The new window replaces the previous observation and receives fresh
 query and source identities; files may have changed between scans. A regular
-**Search** starts again at the first window. Expression retains its first
-256 results and counts all qualifying primary matches within the I/O budgets.
+**Search** starts again at the first window. Each Expression window counts all
+qualifying primary matches within the I/O budgets and retains up to 256 results
+after the requested number of skipped matches. Required and excluded predicates
+are re-evaluated against each new file observation, including files whose
+primary matches all precede the retained window.
 
 Enable **Count all matches** to continue through the selected files after the
 256 retained rows fill. The total includes overlapping occurrences and matching

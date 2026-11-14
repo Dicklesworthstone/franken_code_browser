@@ -887,3 +887,178 @@ fn c_stream_expression_latches_one_shot_cancellation_before_callback() {
     assert!(previous.contains("\"expression\":\"needle required\""));
     assert_eq!(fcb_atlas_close(handle), 1);
 }
+
+#[test]
+fn c_stream_expression_pages_skip_qualified_matches_and_keep_utf16_witnesses() {
+    let _: unsafe extern "C" fn(u64, *const c_char, u64, u64, u64,
+        *const c_char, *const c_char, u64, *const c_char, u64, u64,
+        Option<SearchCancellationCallback>, Option<SearchCancellationCallback>,
+        Option<AtlasStreamProgressCallback>, *mut c_void) -> *mut c_char =
+        fcb_atlas_stream_search_scoped_expression_page_progress;
+    assert_eq!(include_str!("../include/fcb_atlas_stream_search.h")
+        .matches("fcb_atlas_stream_search_scoped_expression_page_progress(").count(), 1);
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new(); fs::create_dir(fixture.0.join("src")).unwrap();
+    let utf16: Vec<u8> = "\u{feff}banana required".encode_utf16().flat_map(u16::to_be_bytes).collect();
+    fs::write(fixture.0.join("src/a.rs"), b"banana required").unwrap();
+    fs::write(fixture.0.join("src/b.rs"), &utf16).unwrap();
+    fs::write(fixture.0.join("src/a-rejected.rs"), b"banana required forbidden").unwrap();
+    fs::write(fixture.0.join("src/a-missing.rs"), b"banana").unwrap();
+    fs::write(fixture.0.join("src/skip.rs"), b"banana required").unwrap();
+    fs::write(fixture.0.join("outside.rs"), b"banana required").unwrap();
+    let handle = fixture.open();
+    let expression = CString::new("ana required -forbidden -path:skip lang:rust").unwrap();
+    let extensions = CString::new("rs").unwrap(); let path = CString::new("src").unwrap();
+    let first = take(unsafe {
+        fcb_atlas_stream_search_scoped_expression_progress(handle, expression.as_ptr(), 1, 4096, 4096,
+            extensions.as_ptr(), std::ptr::null(), 1, path.as_ptr(), 1,
+            None, None, None, std::ptr::null_mut())
+    });
+    assert_eq!(field(&first, "page_start_after"), 0);
+    let run = |offset| take(unsafe {
+        fcb_atlas_stream_search_scoped_expression_page_progress(handle, expression.as_ptr(), 1, 4096, 4096,
+            extensions.as_ptr(), std::ptr::null(), 1, path.as_ptr(), 1, offset,
+            None, None, None, std::ptr::null_mut())
+    });
+    let later = run(3);
+    assert!(later.contains("\"status\":\"ok\""), "{later}");
+    assert!(later.contains("\"search_complete\":true"));
+    assert!(later.contains("\"match_count_complete\":true"));
+    assert!(later.contains("\"truncated\":true"));
+    assert!(later.contains("\"page_has_more_matches\":false"));
+    assert_eq!(field(&later, "skipped_matches"), 3);
+    assert_eq!(field(&later, "matches_seen"), 4);
+    assert_eq!(field(&later, "matching_files"), 2);
+    assert_eq!(field(&later, "retained_matching_files"), 1);
+    assert_eq!(field(&later, "retained_hits"), 1);
+    assert_eq!(field(&later, "occurrence_id"), 2);
+    assert_eq!(field(&later, "files_examined"), 4);
+    assert_eq!(field(&later, "payload_bytes_read"), 15 + utf16.len() as u64 + 25 + 6);
+    assert!(field(&later, "query_generation") > field(&first, "query_generation"));
+    assert!(field(&later, "source_revision") > field(&first, "source_revision"));
+    let generation = field(&later, "query_generation");
+    fs::write(fixture.0.join("src/b.rs"), b"replacement").unwrap();
+    let witness = take(fcb_atlas_stream_search_hit(handle, generation, 0));
+    assert!(witness.contains("\"text\":\"ana\""));
+    assert!(witness.contains("\"original_hex\":\"0061006e0061\""));
+    assert!(witness.contains("\"additional_source_bytes_read\":\"0\""));
+    let page = take(fcb_atlas_stream_search_page(handle, generation, 0, 1));
+    for receipt in [&later, &witness, &page] {
+        assert_eq!(field(receipt, "page_start_after"), 3);
+        assert_eq!(field(receipt, "eligible_files"), 5);
+        assert_eq!(field(receipt, "excluded_files"), 1);
+        assert_eq!(field(receipt, "expression_scope_files"), 4);
+        assert_eq!(field(receipt, "expression_excluded_files"), 1);
+        assert!(receipt.contains("\"expression\":\"ana required -forbidden -path:skip lang:rust\""));
+        assert!(receipt.contains("\"primary_needle\":\"ana\""));
+        assert!(receipt.contains("\"count_all_matches\":true"));
+    }
+    let beyond = run(9_007_199_254_740_993);
+    assert_eq!(field(&beyond, "page_start_after"), 9_007_199_254_740_993);
+    assert_eq!(field(&beyond, "skipped_matches"), 2);
+    assert_eq!(field(&beyond, "matches_seen"), 2);
+    assert_eq!(field(&beyond, "retained_hits"), 0);
+    assert!(beyond.contains("\"search_complete\":true"));
+    assert!(beyond.contains("\"page_has_more_matches\":false"));
+    assert!(take(fcb_atlas_stream_search_hit(handle, generation, 0)).contains("STALE_QUERY"));
+    assert_eq!(fcb_atlas_close(handle), 1);
+}
+
+#[test]
+fn c_stream_expression_page_case_policy_and_rejected_attempts_preserve_the_window() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("a.rs"), "K REQUIRED").unwrap();
+    let utf16: Vec<u8> = "\u{feff}K REQUIRED".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    fs::write(fixture.0.join("b.rs"), utf16).unwrap();
+    fs::write(fixture.0.join("c.rs"), "k required Forbidden").unwrap();
+    let handle = fixture.open(); let expression = CString::new("k required -forbidden").unwrap();
+    let run = |query, case, offset| take(unsafe {
+        fcb_atlas_stream_search_scoped_expression_page_progress(handle, query, 1, 4096, 4096,
+            std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), case, offset,
+            None, None, None, std::ptr::null_mut())
+    });
+    let exact = run(expression.as_ptr(), 1, 1);
+    assert_eq!(field(&exact, "matches_seen"), 1);
+    assert_eq!(field(&exact, "retained_hits"), 0);
+    let lower = run(expression.as_ptr(), 0, 1);
+    assert!(lower.contains("\"case_sensitive\":false"));
+    assert_eq!(field(&lower, "matches_seen"), 2);
+    assert_eq!(field(&lower, "skipped_matches"), 1);
+    assert_eq!(field(&lower, "retained_hits"), 1);
+    let generation = field(&lower, "query_generation");
+    for (query, code) in [("", "QUERY_EMPTY"), ("-forbidden", "QUERY_EMPTY"),
+        ("\"unfinished", "QUERY_SYNTAX_ERROR"), ("k regex:.*", "QUERY_REGEX_UNQUALIFIED")] {
+        let query = CString::new(query).unwrap();
+        assert!(run(query.as_ptr(), 0, 1).contains(code));
+    }
+    let invalid_utf8 = [0xffu8, 0]; let oversized = [b'x'; MAX_ATLAS_STREAM_SEARCH_NEEDLE_BYTES + 1];
+    for pointer in [std::ptr::null(), invalid_utf8.as_ptr().cast(), oversized.as_ptr().cast()] {
+        assert!(run(pointer, 0, 1).contains("ATLAS_HANDLE_INVALID_ARGUMENT"));
+    }
+    assert!(run(expression.as_ptr(), 2, 1).contains("ATLAS_HANDLE_INVALID_ARGUMENT"));
+    for offset in [u64::MAX, u64::MAX - 1] {
+        assert!(run(expression.as_ptr(), 0, offset).contains("ATLAS_STREAM_SEARCH_INVALID_LIMITS"));
+    }
+    let canceled = take(unsafe {
+        fcb_atlas_stream_search_scoped_expression_page_progress(handle, expression.as_ptr(), 1, 4096, 4096,
+            std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 0, 1,
+            Some(canceled), None, None, std::ptr::null_mut())
+    });
+    assert!(canceled.contains("ATLAS_HANDLE_CANCELED"));
+    fs::write(fixture.0.join("b.rs"), b"replacement").unwrap();
+    let witness = take(fcb_atlas_stream_search_hit(handle, generation, 0));
+    assert_eq!(field(&witness, "page_start_after"), 1);
+    assert!(witness.contains("\"text\":\"K\""));
+    assert!(witness.contains("\"original_hex\":\"4b00\""));
+    assert!(witness.contains("\"expression\":\"k required -forbidden\""));
+    assert_eq!(fcb_atlas_close(handle), 1);
+}
+
+#[test]
+fn c_stream_expression_page_budgets_stop_and_cancel_include_skipped_work() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    for name in ["a.rs", "b.rs", "c.rs"] {
+        fs::write(fixture.0.join(name), b"needle required").unwrap();
+    }
+    let handle = fixture.open(); let expression = CString::new("needle required -forbidden").unwrap();
+    let partial = take(unsafe {
+        fcb_atlas_stream_search_scoped_expression_page_progress(handle, expression.as_ptr(), 1, 16, 4096,
+            std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 1, 1,
+            None, None, None, std::ptr::null_mut())
+    });
+    assert!(partial.contains("\"search_complete\":false"));
+    assert_eq!(field(&partial, "payload_bytes_read"), 16);
+    assert_eq!(field(&partial, "matches_seen"), 1);
+    assert_eq!(field(&partial, "skipped_matches"), 1);
+    assert_eq!(field(&partial, "retained_hits"), 0);
+    let run = |state: &mut ProgressContext| take(unsafe {
+        fcb_atlas_stream_search_scoped_expression_page_progress(handle, expression.as_ptr(), 1, 4096, 4096,
+            std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 1, 1,
+            Some(progress_poll), Some(progress_stop), Some(progress_receive), std::ptr::from_mut(state).cast())
+    });
+    let mut state = ProgressContext::default(); let accepted = run(&mut state);
+    assert!(!state.invalid && state.stop && !state.canceled);
+    assert!(accepted.contains("\"stop_reason\":\"user-stopped\""), "{accepted}");
+    assert_eq!(field(&accepted, "files_examined"), 2);
+    assert_eq!(field(&accepted, "files_unexamined"), 1);
+    assert_eq!(field(&accepted, "matches_seen"), 2);
+    assert_eq!(field(&accepted, "skipped_matches"), 1);
+    assert_eq!(field(&accepted, "retained_hits"), 1);
+    assert_eq!(field(&accepted, "payload_bytes_read"), 30);
+    for receipt in state.frames.iter().chain(std::iter::once(&accepted)) {
+        assert_eq!(field(receipt, "page_start_after"), 1);
+        assert!(receipt.contains("\"expression\":\"needle required -forbidden\""));
+        assert!(receipt.contains("\"count_all_matches\":true"));
+        assert!(receipt.contains("\"match_count_complete\":false"));
+    }
+    let generation = field(&accepted, "query_generation");
+    let mut canceled = ProgressContext { cancel_on_match: true, ..Default::default() };
+    assert!(run(&mut canceled).contains("ATLAS_HANDLE_CANCELED"));
+    assert!(!canceled.invalid && canceled.canceled);
+    let retained = take(fcb_atlas_stream_search_hit(handle, generation, 0));
+    assert_eq!(field(&retained, "page_start_after"), 1);
+    assert!(retained.contains("\"original_hex\":\"6e6565646c65\""));
+    assert_eq!(fcb_atlas_close(handle), 1);
+}

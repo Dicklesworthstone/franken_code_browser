@@ -78,8 +78,7 @@ struct AtlasWorkspaceStreamRequest: Equatable, Sendable {
               !needle.utf8.contains(0), (1...AtlasWorkspaceStreamLimits.hits).contains(maximumMatches),
               (1...AtlasWorkspaceStreamLimits.maximumScanBytes).contains(maximumScanBytes),
               (1...AtlasWorkspaceStreamLimits.readCalls).contains(maximumReadCalls),
-              mode != .occurrences || caseSensitive,
-              mode != .expression || pageStartAfter == 0 else {
+              mode != .occurrences || caseSensitive else {
             throw AtlasWorkspaceStreamError.invalidInput
         }
         self.needle = needle; self.maximumScanBytes = maximumScanBytes

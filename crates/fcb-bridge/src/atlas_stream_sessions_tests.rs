@@ -206,3 +206,49 @@ fn expression_progress_close_retains_session_permit_until_worker_drains() {
     assert_eq!(registry.live.load(Ordering::Acquire), 0);
     assert_eq!(registry.budget.accounting().reserved().get(), 0);
 }
+
+#[test]
+fn expression_page_progress_cancel_and_close_hold_the_session_until_drain() {
+    let fixture = Fixture::new();
+    let registry = AtlasSessions::new();
+    let handle = fixture.open(&registry);
+    let independent = fixture.open(&registry);
+    registry.execute_stream(handle, search("old"), || false).unwrap();
+    let mut callbacks = 0;
+    let canceled = registry.execute_stream_scoped_expression_page_with_progress(handle, "needle -forbidden",
+        AtlasStreamSearchOptions::default(), &AtlasSearchScope::all(), 9_007_199_254_740_993,
+        || false, || false, |response| {
+            callbacks += 1;
+            assert!(response.as_str().contains("\"page_start_after\":\"9007199254740993\""));
+            assert!(response.as_str().contains("\"count_all_matches\":true"));
+            assert!(response.as_str().contains("\"selection_available\":false"));
+            assert!(matches!(registry.execute_stream(handle,
+                StreamCommand::Page { generation: 1, start: 0, count: 1 }, || false), Err(AccessError::Busy)));
+            assert!(registry.execute(independent, Command::Info, || false).is_ok());
+            registry.cancel(handle).unwrap();
+        });
+    assert_eq!(callbacks, 1);
+    assert!(matches!(canceled, Err(AccessError::Canceled)));
+    let retained = registry.execute_stream(handle,
+        StreamCommand::Hit { generation: 1, position: 0 }, || false).unwrap();
+    assert!(retained.as_str().contains("\"original_hex\":\"6f6c64\""));
+    drop(retained);
+    let others: Vec<_> = (2..MAX_ATLAS_SESSIONS).map(|_| registry.create().unwrap()).collect();
+    let mut closed_callbacks = 0;
+    let closed = registry.execute_stream_scoped_expression_page_with_progress(handle, "needle -forbidden",
+        AtlasStreamSearchOptions::default(), &AtlasSearchScope::all(), 1,
+        || false, || false, |response| {
+            closed_callbacks += 1;
+            assert!(response.as_str().contains("\"page_start_after\":\"1\""));
+            registry.close(handle).unwrap();
+            assert_eq!(registry.live.load(Ordering::Acquire), MAX_ATLAS_SESSIONS);
+            assert!(matches!(registry.create(), Err(AccessError::Capacity)));
+        });
+    assert_eq!(closed_callbacks, 1);
+    assert!(matches!(closed, Err(AccessError::Closed)));
+    assert_eq!(registry.live.load(Ordering::Acquire), MAX_ATLAS_SESSIONS - 1);
+    registry.close(independent).unwrap();
+    for id in others { registry.close(id).unwrap(); }
+    assert_eq!(registry.live.load(Ordering::Acquire), 0);
+    assert_eq!(registry.budget.accounting().reserved().get(), 0);
+}

@@ -485,8 +485,75 @@ private final class WorkspaceProgressCopies: @unchecked Sendable {
                 && frees() == releasedBefore + 1 && allocations() == frees())
         }
         mode(0)
+        try expressionWindowBridgeTests(scopedRequests)
         try matchWindowBridgeTests()
         print("Workspace stream ABI match windows, expression/occurrence/matching/count flags, ownership, progressive bytes, Stop and cancellation fixtures passed")
+    }
+
+    private static func expressionWindowBridgeTests(_ scopes: [(UInt32, AtlasWorkspaceStreamRequest)]) throws {
+        let transport = AtlasWorkspaceStreamTransport.native, progressive = transport.progressiveSearch!
+        for (selection, scoped) in scopes {
+            for sensitive in [true, false] {
+                reset(); scope(selection)
+                let owner = transport.create()
+                let request = try AtlasWorkspaceStreamRequest(
+                    needle: "\"exact é😀\" required -forbidden path:src/ lang:rust",
+                    maximumScanBytes: scoped.maximumScanBytes, fileScope: scoped.fileScope,
+                    pathScope: scoped.pathScope, caseSensitive: sensitive, mode: .expression,
+                    pageStartAfter: 9_007_199_254_740_993)
+                precondition(request.countAllMatches)
+                let direct = try transport.search(owner, request, AtlasSearchCancellation())
+                let copies = WorkspaceProgressCopies(), stop = AtlasWorkspaceStreamStop()
+                let terminal = try progressive(owner, request, AtlasSearchCancellation(), stop) {
+                    copies.append($0); stop.requestStop()
+                }
+                precondition(direct == "{\"fixture\":\"workspace-stream\"}" && terminal == direct
+                    && copies.values == ["{\"fixture\":\"workspace-progress\"}"] && count(12) == 1)
+                precondition(count(32) == 1 && count(33) == 1 && count(34) == (sensitive ? 2 : 0))
+                precondition((UInt32(14)...UInt32(31)).allSatisfy { count($0) == 0 },
+                    "Later expression windows must use their dedicated ABI with the raw query")
+                precondition(allocations() == frees())
+
+                let canceled = AtlasSearchCancellation(); canceled.cancel()
+                do {
+                    _ = try transport.search(owner, request, canceled)
+                    preconditionFailure("Canceled expression window entered C")
+                } catch AtlasWorkspaceStreamError.canceled { }
+                do {
+                    _ = try progressive(owner, request, canceled, AtlasWorkspaceStreamStop()) { _ in }
+                    preconditionFailure("Canceled progressive expression window entered C")
+                } catch AtlasWorkspaceStreamError.canceled { }
+                precondition(count(32) == 1 && count(33) == 1)
+
+                let stopped = AtlasWorkspaceStreamStop(); stopped.requestStop()
+                let silent = WorkspaceProgressCopies(), callbacks = count(10)
+                _ = try progressive(owner, request, AtlasSearchCancellation(), stopped) { silent.append($0) }
+                precondition(silent.values.isEmpty && count(10) == callbacks && count(12) == 2)
+                let live = AtlasSearchCancellation(), released = frees()
+                do {
+                    _ = try progressive(owner, request, live, AtlasWorkspaceStreamStop()) { _ in live.cancel() }
+                    preconditionFailure("Canceled expression window callback delivered a terminal response")
+                } catch AtlasWorkspaceStreamError.canceled { }
+                precondition(count(13) == 1 && frees() == released + 1 && allocations() == frees())
+
+                for late in [Int32(4), Int32(5)] {
+                    mode(late); let flag = AtlasSearchCancellation(), before = frees()
+                    do {
+                        _ = try transport.search(owner, request, flag)
+                        preconditionFailure("Late expression window cancellation was ignored")
+                    } catch AtlasWorkspaceStreamError.canceled { }
+                    precondition(flag.isCanceled && frees() == before + (late == 4 ? 1 : 0) && allocations() == frees())
+                }
+                mode(8)
+                let malformed = WorkspaceProgressCopies(), before = frees()
+                do {
+                    _ = try progressive(owner, request, AtlasSearchCancellation(), AtlasWorkspaceStreamStop()) { malformed.append($0) }
+                    preconditionFailure("Malformed expression window progress reached the sink")
+                } catch AtlasWorkspaceStreamError.invalidResponse { }
+                precondition(malformed.values.isEmpty && frees() == before + 1 && allocations() == frees())
+                mode(0); precondition(transport.close(owner))
+            }
+        }
     }
 
     private static func matchWindowBridgeTests() throws {

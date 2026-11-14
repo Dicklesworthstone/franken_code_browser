@@ -180,6 +180,15 @@ the attempted replacement and leaves the previously accepted query available.
 Invalid syntax likewise leaves accepted evidence intact and performs no source
 I/O. Existing literal and occurrence methods retain their original semantics.
 
+`search_scoped_expression_page_with_progress` additionally accepts `start_after`
+to retain a later window of qualified primary occurrences across files in
+catalog order. Metadata exclusions and files that fail content predicates do
+not consume that offset. Qualifying files whose rows are entirely skipped still
+contribute their full counts, as do qualifying files after retained rows fill.
+Every window scans current files again under the same byte/read-call limits and
+receives fresh query and source-observation identities. It is not a continuation
+of the preceding immutable results. The original method requests offset zero.
+
 Progress, terminal pages and selected-witness replies carry the same immutable
 expression policy:
 
@@ -194,13 +203,19 @@ expression policy:
 | `eligible_files`, `excluded_files` | Membership after the native location/file-type scope. |
 | `expression_scope_files`, `expression_excluded_files` | The subdivision of eligible files after expression metadata filters. |
 
+Window summaries also carry `page_start_after`, `skipped_matches` and
+`page_has_more_matches`. The skipped count cannot exceed qualified matches
+actually observed. Later-window navigation requires observed matches beyond the
+current window; `truncated` alone is insufficient because it also describes an
+omitted prefix.
+
 Examined and unexamined counts sum to `expression_scope_files`. Content-predicate
 rejections are examined nonmatching files, not metadata exclusions. Missing
 requested visible paths and incomplete discovery still prevent a complete
 search claim. Completed observations with changed or unavailable metadata may
 retain expression witnesses while making overall coverage incomplete.
 
-Pages and hit lookup perform no additional source reads. A retained hit contains
+Retained-page and hit lookup perform no additional source reads. A retained hit contains
 only the primary occurrence's original bytes and decoded spelling. Reading its
 current surrounding context is a separate observation: matching those bytes
 again does **not** revalidate every required or excluded expression term against

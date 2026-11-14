@@ -185,6 +185,29 @@ char *fcb_atlas_stream_search_scoped_expression_progress(uint64_t handle, const 
     int32_t (*poll)(void *context), int32_t (*stop)(void *context),
     fcb_atlas_stream_progress_callback progress, void *context);
 
+/* NEW live expression observation retaining a later primary-match window.
+ * This preserves the expression API's syntax, scope, complete-stream predicate
+ * checks, counting and ownership contract. start_after skips qualified primary
+ * occurrences across expression-eligible files in catalog order. Failed or
+ * undecidable predicates contribute no occurrences to the skipped prefix.
+ * All skipped file reads consume the normal total byte/read-call limits.
+ * start_after + max_matches + 1 must fit uint64_t; callbacks may be NULL.
+ *
+ * Counts include all qualified occurrences in this attempt, including skipped
+ * and unretained rows. Replies preserve expression metadata and echo the same
+ * page_start_after, skipped_matches and page_has_more_matches contract as the
+ * literal/identifier window API below. Every call has fresh query/source
+ * identities; replace earlier results instead of appending them as one capture.
+ * The original expression API above is the start_after=0 form. Retained-row
+ * page/hit calls still require this accepted generation and perform no I/O.
+ */
+char *fcb_atlas_stream_search_scoped_expression_page_progress(uint64_t handle, const char *expression,
+    uint64_t max_matches, uint64_t max_scan_bytes, uint64_t max_read_calls,
+    const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
+    uint64_t case_sensitive, uint64_t start_after,
+    int32_t (*poll)(void *context), int32_t (*stop)(void *context),
+    fcb_atlas_stream_progress_callback progress, void *context);
+
 /* Exact whole-identifier occurrences through the same bounded streaming
  * decoder, with no per-file capture limit. count_all_matches is exactly 0 or 1;
  * all callbacks may be NULL. Scope and callback ownership match the APIs above.

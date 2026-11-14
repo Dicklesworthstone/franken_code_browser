@@ -111,12 +111,12 @@ private enum StreamFixture {
     /// One live-file observation containing total matching occurrences. Window
     /// ordinals are regenerated on each call and never appended to old evidence.
     static func matchWindow(_ owner: UInt64, _ generation: UInt64, _ request: AtlasWorkspaceStreamRequest,
-        total: UInt64 = 600) -> [String: Any] {
+        total: UInt64 = 600, primaryNeedle: String? = nil) -> [String: Any] {
         let skipped = min(request.pageStartAfter, total)
         let retained = min(request.maximumMatches, total - skipped)
         let seen = request.countAllMatches ? total : min(total, skipped + retained + 1)
         let more = seen - skipped > retained, complete = request.countAllMatches || !more
-        var value = report(owner, generation, request, count: Int(retained))
+        var value = report(owner, generation, request, count: Int(retained), primaryNeedle: primaryNeedle)
         value["page_start_after"] = String(request.pageStartAfter)
         value["skipped_matches"] = String(skipped); value["page_has_more_matches"] = more
         value["matches_seen"] = String(seen); value["truncated"] = seen > retained
@@ -293,7 +293,8 @@ private final class StreamProbe: @unchecked Sendable {
         }
         gate?.wait()
         var report = windows
-            ? StreamFixture.matchWindow(owner, stale ? generation - 1 : generation, request)
+            ? StreamFixture.matchWindow(owner, stale ? generation - 1 : generation, request,
+                primaryNeedle: request.mode == .expression ? expressionPrimary : nil)
             : StreamFixture.report(owner, stale ? generation - 1 : generation, request,
                 count: request.countAllMatches ? 256 : 40,
                 primaryNeedle: request.mode == .expression ? expressionPrimary : nil)
@@ -406,11 +407,13 @@ private final class StreamContextProbe: @unchecked Sendable {
         try lowercaseWireTests()
         try occurrenceWireTests()
         try expressionWireTests()
+        try expressionWindowWireTests()
         try progressWireTests()
         try await countedModelTests()
         try await lowercaseModelTests()
         try await occurrenceModelTests()
         try await expressionModelTests()
+        try await expressionWindowModelTests()
         try await progressModelTests()
         try await modelTests()
         try await matchWindowModelTests()
@@ -1481,9 +1484,6 @@ private extension AtlasWorkspaceStreamTests {
         let explicitlyCounted = try AtlasWorkspaceStreamRequest(needle: expressionQuery, maximumMatches: 3,
             countAllMatches: true, mode: .expression)
         precondition(request == explicitlyCounted, "Expression predicates always require observation to the end")
-        rejects("expression endpoint cannot resume a later match window") {
-            _ = try AtlasWorkspaceStreamRequest(needle: expressionQuery, mode: .expression, pageStartAfter: 1)
-        }
         let metadata = ["expression", "primary_needle", "query_syntax", "predicate_scope",
             "path_filter_domain", "expression_scope_files", "expression_excluded_files"]
 
@@ -1738,12 +1738,108 @@ private extension AtlasWorkspaceStreamTests {
         try await wait("complete counted expression") { !model.busy && model.reportAuthorized }
         precondition(model.report?.summary.matchesSeen == 2_000 && model.report?.summary.matchCountComplete == true
             && model.report?.summary.retainedHits == 256 && model.report?.summary.expression != nil)
-        precondition(!model.canScanLater && !model.canScanEarlier)
-        let searches = probe.searchCount; model.scanLater(); model.scanEarlier()
-        precondition(probe.searchCount == searches && model.reportAuthorized,
-            "Expression results cannot dispatch to literal later-window scans")
+        precondition(model.canScanLater && !model.canScanEarlier)
         model.clear(); try await wait("clear expression evidence") { !model.busy }
         precondition(model.canSearch && model.report == nil && model.witness == nil)
         model.close(); try await wait("expression owner retirement") { probe.closedCount == probe.createCount }
+    }
+
+    static func expressionWindowWireTests() throws {
+        let owner: UInt64 = 0xfedcba9876543210
+        let catalog = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(StreamFixture.catalog(owner)), owner: owner)
+        let request = try AtlasWorkspaceStreamRequest(needle: expressionQuery, maximumMatches: 2,
+            mode: .expression, pageStartAfter: 3)
+        precondition(request.countAllMatches && request.pageStartAfter == 3)
+        let wire = StreamFixture.matchWindow(owner, 1, request, total: 6, primaryNeedle: "old")
+        let page = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(wire)),
+            catalog: catalog, root: catalog.root, request: request)
+        let report = try AtlasWorkspaceStreamReport(summary: page.summary, hits: page.hits)
+        precondition(report.summary.complete && report.summary.matchCountComplete && report.summary.matchesSeen == 6
+            && report.summary.skippedMatches == 3 && report.summary.nextStartAfter == 5
+            && report.hits.map(\.occurrence) == [4, 5] && report.summary.primaryNeedle == "old")
+        let target = report.target(for: report.hits[0])
+        let selected = StreamFixture.witness(wire, index: 0)
+        let witness = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(selected), report: report,
+            root: catalog.root, target: target)
+        precondition(witness.text == "old" && witness.originalHex == "6f6c64")
+        var wrong = selected; wrong["page_start_after"] = "0"
+        rejects("expression witness from the initial window") {
+            _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(wrong), report: report,
+                root: catalog.root, target: target)
+        }
+
+        var progressWire = StreamFixture.page(wire)
+        progressWire["command"] = "progress"; progressWire["terminal"] = false
+        progressWire["selection_available"] = false; progressWire["progress_sequence"] = "1"
+        progressWire["search_complete"] = false; progressWire["match_count_complete"] = false
+        let progress = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(progressWire), catalog: catalog, request: request)
+        try progress.validateTerminal(page)
+        precondition(progress.summary.skippedMatches == 3 && progress.page.hits.map(\.occurrence) == [4, 5])
+
+        let finalRequest = try AtlasWorkspaceStreamRequest(needle: expressionQuery, maximumMatches: 2,
+            mode: .expression, pageStartAfter: 5)
+        let finalWire = StreamFixture.matchWindow(owner, 2, finalRequest, total: 6, primaryNeedle: "old")
+        let finalPage = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(finalWire)),
+            catalog: catalog, root: catalog.root, request: finalRequest)
+        let final = try AtlasWorkspaceStreamReport(summary: finalPage.summary, hits: finalPage.hits)
+        precondition(final.summary.complete && final.summary.truncated && final.summary.nextStartAfter == nil
+            && final.hits.map(\.occurrence) == [6] && !final.admits(target))
+
+        let beyond = try AtlasWorkspaceStreamRequest(needle: expressionQuery, maximumMatches: 2,
+            caseSensitive: false, mode: .expression, pageStartAfter: 9_007_199_254_740_993)
+        let emptyWire = StreamFixture.matchWindow(owner, 3, beyond, total: 6, primaryNeedle: "old")
+        let empty = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(emptyWire)),
+            catalog: catalog, root: catalog.root, request: beyond)
+        precondition(empty.summary.request.pageStartAfter == 9_007_199_254_740_993 && empty.hits.isEmpty
+            && empty.summary.complete && empty.summary.matchesSeen == 6 && empty.summary.skippedMatches == 6)
+        var rounded = emptyWire; rounded["page_start_after"] = "9007199254740992"
+        rejects("rounded expression-window ordinal") {
+            _ = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(rounded)),
+                catalog: catalog, root: catalog.root, request: beyond)
+        }
+    }
+
+    @MainActor static func expressionWindowModelTests() async throws {
+        let probe = StreamProbe(expressionPrimary: "old")
+        let model = AtlasWorkspaceStreamModel(transport: probe.transport, query: expressionQuery,
+            caseSensitive: false, mode: .expression)
+        probe.enableMatchWindows()
+        model.open(.init(root: StreamFixture.root, project: UUID(), browserOwner: 1, access: nil))
+        try await wait("expression window catalog") { !model.busy && model.catalog != nil }
+        model.search(); try await wait("first expression window") { !model.busy && model.reportAuthorized }
+        let first = model.report!, oldTarget = first.target(for: first.hits[0])
+        precondition(first.hits.count == 256 && first.summary.matchesSeen == 600
+            && first.summary.matchCountComplete && model.canScanLater && !model.canScanEarlier)
+        model.scanLater(); try await wait("second expression window") { !model.busy && model.reportAuthorized }
+        let second = model.report!
+        precondition(second.summary.request.mode == .expression && second.summary.request.needle == expressionQuery
+            && second.summary.request.countAllMatches && !second.summary.request.caseSensitive
+            && second.summary.request.pageStartAfter == 256 && second.summary.primaryNeedle == "old"
+            && second.summary.matchesSeen == 600 && second.hits.first?.occurrence == 257
+            && second.hits.last?.occurrence == 512 && !second.admits(oldTarget))
+        let calls = probe.hitCount; model.select(oldTarget); precondition(probe.hitCount == calls)
+        model.select(second.target(for: second.hits[0]))
+        try await wait("later expression primary witness") { !model.busy && model.witness != nil }
+        precondition(model.witness?.text == "old")
+        let contextProbe = StreamContextProbe(); model.readCurrentContext(transport: contextProbe.transport)
+        let context = model.currentContext!; context.start()
+        try await wait("later expression primary context") { !context.model.busy && context.model.page != nil }
+        precondition(context.model.searchSelection == NSRange(location: 1024, length: 3))
+        model.scanLater(); precondition(context.model.closed && model.currentContext == nil)
+        try await wait("last expression window") { !model.busy && model.reportAuthorized }
+        precondition(model.report?.summary.request.pageStartAfter == 512 && model.report?.hits.count == 88
+            && model.report?.summary.matchesSeen == 600 && !model.canScanLater && model.canScanEarlier)
+        model.scanEarlier(); try await wait("earlier expression observation") { !model.busy && model.reportAuthorized }
+        let earlier = model.report!
+        precondition(earlier.summary.request.pageStartAfter == 256 && earlier.summary.identity.generation > second.summary.identity.generation)
+        let gate = ObservedReaderGate(); probe.blockSearch(gate); model.scanLater()
+        try await wait("cancelable later expression scan") { gate.entered }
+        model.cancel(); gate.release(); try await wait("expression window drains") { probe.activeCount == 0 }
+        await Task.yield()
+        precondition(model.report?.summary.identity == earlier.summary.identity
+            && !model.reportAuthorized && !model.canScanLater && !model.canScanEarlier)
+        model.search(); try await wait("expression restart at first window") { !model.busy && model.reportAuthorized }
+        precondition(model.report?.summary.request.pageStartAfter == 0 && model.report?.hits.first?.occurrence == 1)
+        model.close(); try await wait("expression window owner retirement") { probe.closedCount == probe.createCount }
     }
 }

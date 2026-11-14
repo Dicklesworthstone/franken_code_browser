@@ -13,7 +13,8 @@ enum { CREATE, OPEN, SEARCH, PAGE, HIT, CLEAR, CANCEL, CLOSE, POLLS,
     MATCHING_SEARCH, MATCHING_PROGRESS, MATCHING_COUNTED,
     OCCURRENCES_SEARCH, OCCURRENCES_PROGRESS, OCCURRENCES_COUNTED,
     WINDOW_SEARCH, WINDOW_PROGRESS, WINDOW_COUNTED, WINDOW_OCCURRENCES, WINDOW_LOWERCASE,
-    EXPRESSION_SEARCH, EXPRESSION_PROGRESS, EXPRESSION_CASE_SENSITIVE, COUNTERS };
+    EXPRESSION_SEARCH, EXPRESSION_PROGRESS, EXPRESSION_CASE_SENSITIVE,
+    EXPRESSION_WINDOW_SEARCH, EXPRESSION_WINDOW_PROGRESS, EXPRESSION_WINDOW_CASE_SENSITIVE, COUNTERS };
 static uint32_t counts[COUNTERS], allocations, frees;
 static int32_t mode;
 static uint32_t expected_scope;
@@ -311,6 +312,30 @@ char *fcb_atlas_stream_search_scoped_expression_progress(uint64_t owner, const c
     } else {
         assert(stop != NULL && progress != NULL);
         ++counts[EXPRESSION_PROGRESS];
+        result = fixture_progress(owner, query, maximum_matches, maximum_bytes, maximum_calls,
+            poll, stop, progress, context, expression);
+    }
+    check_scope(extensions, filenames, path_kind, path);
+    return result;
+}
+char *fcb_atlas_stream_search_scoped_expression_page_progress(uint64_t owner, const char *query,
+    uint64_t maximum_matches, uint64_t maximum_bytes, uint64_t maximum_calls,
+    const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
+    uint64_t case_sensitive, uint64_t start_after,
+    workspace_fixture_poll poll, workspace_fixture_poll stop,
+    fcb_atlas_stream_progress_callback progress, void *context) {
+    assert(case_sensitive <= 1 && start_after == UINT64_C(9007199254740993));
+    counts[EXPRESSION_WINDOW_CASE_SENSITIVE] += (uint32_t)case_sensitive;
+    check_scope(extensions, filenames, path_kind, path);
+    const char *expression = "\"exact \xc3\xa9\xf0\x9f\x98\x80\" required -forbidden path:src/ lang:rust";
+    char *result;
+    if (stop == NULL && progress == NULL) {
+        ++counts[EXPRESSION_WINDOW_SEARCH];
+        result = fixture_search(owner, query, maximum_matches, maximum_bytes, maximum_calls,
+            poll, context, expression);
+    } else {
+        assert(stop != NULL && progress != NULL);
+        ++counts[EXPRESSION_WINDOW_PROGRESS];
         result = fixture_progress(owner, query, maximum_matches, maximum_bytes, maximum_calls,
             poll, stop, progress, context, expression);
     }

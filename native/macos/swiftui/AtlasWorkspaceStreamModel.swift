@@ -288,8 +288,8 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
     var canRefresh: Bool { !closed && authority != nil }
     var canStopAndKeep: Bool { !closed && busy && searching && !stopping && stopFlag != nil }
     var canSelect: Bool { !closed && !busy && reportAuthorized && session != nil && report != nil }
-    var canScanLater: Bool { mode != .expression && canSelect && report?.summary.nextStartAfter != nil }
-    var canScanEarlier: Bool { mode != .expression && canSelect && (report?.summary.request.pageStartAfter ?? 0) > 0 }
+    var canScanLater: Bool { canSelect && report?.summary.nextStartAfter != nil }
+    var canScanEarlier: Bool { canSelect && (report?.summary.request.pageStartAfter ?? 0) > 0 }
     var canReadCurrentContext: Bool {
         guard canSelect, let report, let witness else { return false }
         return report.admits(witness.target)

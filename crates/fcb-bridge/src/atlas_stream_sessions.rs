@@ -83,8 +83,16 @@ impl AtlasSessions {
         options: AtlasStreamSearchOptions, scope: &AtlasSearchScope,
         canceled: impl FnMut() -> bool, stopped: impl FnMut() -> bool,
         progress: impl FnMut(&HostResponse)) -> Result<HostResponse, AccessError> {
+        self.execute_stream_scoped_expression_page_with_progress(handle, expression, options, scope, 0,
+            canceled, stopped, progress)
+    }
+
+    pub(crate) fn execute_stream_scoped_expression_page_with_progress(&self, handle: u64, expression: &str,
+        options: AtlasStreamSearchOptions, scope: &AtlasSearchScope, start_after: u64,
+        canceled: impl FnMut() -> bool, stopped: impl FnMut() -> bool,
+        progress: impl FnMut(&HostResponse)) -> Result<HostResponse, AccessError> {
         self.execute_stream_progress_inner(handle, expression, options, scope, canceled, stopped, progress,
-            ProgressMode::Expression, 0)
+            ProgressMode::Expression, start_after)
     }
 
     fn execute_stream_progress_inner(&self, handle: u64, needle: &str,
@@ -105,8 +113,8 @@ impl AtlasSessions {
             };
             match mode {
                 ProgressMode::Expression =>
-                    session.stream.search_scoped_expression_with_progress(&session.atlas, needle, options, scope.clone(),
-                        &mut guarded_canceled, stopped, &mut guarded_progress),
+                    session.stream.search_scoped_expression_page_with_progress(&session.atlas, needle, options, scope.clone(),
+                        start_after, &mut guarded_canceled, stopped, &mut guarded_progress),
                 ProgressMode::Occurrences { count_all_matches } =>
                     session.stream.search_scoped_page_with_progress(&session.atlas, needle, options, scope.clone(),
                         start_after, count_all_matches, true, &mut guarded_canceled, stopped, &mut guarded_progress),

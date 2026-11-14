@@ -368,7 +368,23 @@ impl RetainedAtlasStreamSearch {
         options: AtlasStreamSearchOptions, scope: AtlasSearchScope, canceled: impl FnMut() -> bool,
         stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
         -> Result<HostResponse, AtlasStreamSearchError> {
-        self.search_inner(atlas, expression, options, scope, canceled, stopped, progress, true, true, QueryKind::Expression, 0)
+        self.search_scoped_expression_page_with_progress(atlas, expression, options, scope, 0,
+            canceled, stopped, progress)
+    }
+
+    /// Observe the expression scope again and retain a later bounded window of
+    /// qualified primary matches. Metadata exclusions and content-predicate
+    /// rejections consume no match offset; fully skipped qualifying files still
+    /// contribute their complete primary counts. All source work, including
+    /// skipped matches and predicate evaluation, remains inside the I/O limits.
+    /// Each call allocates fresh query and source identities, not a continuation
+    /// of the preceding live observation. Counting is always enabled.
+    pub fn search_scoped_expression_page_with_progress(&mut self, atlas: &AtlasSession, expression: &str,
+        options: AtlasStreamSearchOptions, scope: AtlasSearchScope, start_after: u64,
+        canceled: impl FnMut() -> bool, stopped: impl FnMut() -> bool,
+        progress: impl FnMut(&HostResponse)) -> Result<HostResponse, AtlasStreamSearchError> {
+        self.search_inner(atlas, expression, options, scope, canceled, stopped, progress,
+            true, true, QueryKind::Expression, start_after)
     }
 
     /// Rescan eligible files from their beginnings and retain a later match

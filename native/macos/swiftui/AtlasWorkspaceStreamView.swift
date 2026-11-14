@@ -66,7 +66,7 @@ import AppKit
                         ? "Expressions must finish each file observation to verify required and excluded terms. Counting stays on within the byte and read-call limits."
                         : "Continue counting beyond the retained result window, within the selected byte and read-call limits")
                 Text(model.mode == .expression
-                    ? "Expressions finish each file observation and count primary matches; the first 256 results are retained. Stop remains available."
+                    ? "Expressions finish each file observation and count primary matches; each scan retains up to 256 results. Stop remains available."
                     : model.effectiveCountAllMatches
                         ? "Scan past the result limit; keep up to 256 results per scan. Counts are exact only when the search completes."
                         : "The search stops when the result limit is reached.")
@@ -144,7 +144,7 @@ import AppKit
                 Spacer()
                 Button("Clear", action: model.clear).disabled(model.report == nil)
             }
-            if let report = model.report, report.summary.request.mode != .expression,
+            if let report = model.report,
                report.summary.pageHasMoreMatches || report.summary.request.pageStartAfter > 0 {
                 HStack {
                     Button("Scan earlier matches", action: model.scanEarlier).disabled(!model.canScanEarlier)

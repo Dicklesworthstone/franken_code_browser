@@ -81,12 +81,17 @@ fn coverage(receipt: &Json) {
     assert!(receipt.get("scanned_input_bytes").number() <= receipt.get("payload_bytes_read").number());
     assert!(receipt.get("peak_input_buffer_bytes").number() <= CHUNK as u64);
 }
+fn window(receipt: &Json, start_after: u64, skipped: u64, more: bool) {
+    assert_eq!(receipt.get("page_start_after").number(), start_after);
+    assert_eq!(receipt.get("skipped_matches").number(), skipped);
+    assert_eq!(receipt.get("page_has_more_matches").flag(), more);
+}
 fn echo(receipt: &Json, original: &Json) {
     for key in ["owner", "source_manifest", "layout_revision", "query_generation", "root_path", "mode",
         "needle", "expression", "primary_needle", "query_syntax", "predicate_scope", "path_filter_domain",
         "eligible_files", "excluded_files", "expression_scope_files", "expression_excluded_files",
         "search_scope", "scope_extensions", "scope_filenames", "scope_path_kind", "scope_path_hex",
-        "case_sensitive", "count_all_matches"] {
+        "case_sensitive", "count_all_matches", "page_start_after"] {
         assert_eq!(receipt.get(key), original.get(key), "immutable query field changed: {key}");
     }
 }
@@ -428,4 +433,173 @@ fn query_syntax_is_explicit_and_literal_entry_points_preserve_operator_text() {
     assert_eq!(preserved.get("matches_seen").number(), 1);
     assert_eq!(preserved.get("hits").array()[0].get("original_range"),
         literal.get("hits").array()[0].get("original_range"));
+}
+
+#[test]
+fn expression_window_skips_only_qualified_files_and_counts_past_retention() {
+    let fixture = Fixture::new(); let missing_required = b"banana";
+    let mut rejected = b"banana banana banana required ".to_vec();
+    rejected.resize(2 * CHUNK, b'x'); rejected.extend_from_slice(b" forbidden");
+    let skipped_file = b"banana required"; let retained_file = b"banana banana required";
+    let counted_file = b"banana required";
+    fixture.write("a.rs", missing_required); fixture.write("b.rs", &rejected);
+    fixture.write("c.rs", skipped_file); fixture.write("d.rs", retained_file);
+    fixture.write("e.rs", counted_file);
+    let atlas = fixture.atlas(); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let query = "ana required -forbidden"; let mut progress = Vec::new();
+    let response = service.search_scoped_expression_page_with_progress(&atlas, query,
+        AtlasStreamSearchOptions { max_matches: 2, ..opts() }, AtlasSearchScope::all(), 3,
+        || false, || false, |response| progress.push(json(response))).unwrap();
+    assert_eq!(response.exit_code(), EXIT_PARTIAL, "the complete scan still omits prefix and later rows");
+    let report = json(&response); policy(&report, query, "ana"); coverage(&report); window(&report, 3, 3, true);
+    assert!(report.get("search_complete").flag()); assert!(report.get("match_count_complete").flag());
+    assert_eq!(report.get("stop_reason"), &Json::Null);
+    assert_eq!(report.get("matches_seen").number(), 8);
+    assert_eq!(report.get("matching_files").number(), 3);
+    assert_eq!(report.get("retained_matching_files").number(), 1);
+    assert_eq!(report.get("retained_hits").number(), 2);
+    assert_eq!(report.get("retained_witness_bytes").number(), 3);
+    assert_eq!(report.get("files_examined").number(), 5);
+    assert_eq!(report.get("incomplete_files").number(), 0);
+    assert_eq!(report.get("payload_bytes_read").number(),
+        (missing_required.len() + rejected.len() + skipped_file.len() + retained_file.len() + counted_file.len()) as u64);
+    for (index, row) in report.get("hits").array().iter().enumerate() {
+        assert_eq!(row.get("path").get("hex").text(), hex(b"d.rs"));
+        assert_eq!(row.get("occurrence_id").number(), index as u64 + 2);
+        assert_eq!(bounds(row), [(3, 6), (8, 11)][index]);
+    }
+    assert!(progress.iter().any(|frame| frame.get("files_examined").number() == 4));
+    for frame in &progress {
+        policy(frame, query, "ana"); coverage(frame); echo(frame, &report);
+        let examined = frame.get("files_examined").number() as usize;
+        assert_eq!(frame.get("matches_seen").number(), [0, 0, 0, 2, 6, 8][examined]);
+        window(frame, 3, [0, 0, 0, 2, 3, 3][examined], examined >= 4);
+        assert!(report.get("hits").array().starts_with(frame.get("hits").array()));
+        assert!(!frame.get("selection_available").flag());
+    }
+    let generation = report.get("query_generation").number();
+    let io = (service.source_bytes_read(), service.read_calls());
+    fixture.write("d.rs", b"later source replacement");
+    let page = json(&service.page(&atlas, generation, 0, 32).unwrap());
+    echo(&page, &report); window(&page, 3, 3, true);
+    assert_eq!(page.get("hits"), report.get("hits"));
+    for index in 0..2 {
+        let witness = json(&service.hit(&atlas, generation, index).unwrap());
+        echo(&witness, &report);
+        assert_eq!(witness.get("hit").get("text").text(), "ana");
+        assert_eq!(witness.get("hit").get("original_hex").text(), "616e61");
+    }
+    assert_eq!(io, (service.source_bytes_read(), service.read_calls()));
+}
+
+#[test]
+fn expression_window_metadata_exclusions_spend_neither_offsets_nor_io_budgets() {
+    let fixture = Fixture::new(); let admitted = b"banana required";
+    let excluded = b"banana required ".repeat(CHUNK);
+    for path in ["a.py", "other/a.rs", "src/a_drop.rs", "src/readme.md"] {
+        fixture.write(path, &excluded);
+    }
+    fixture.write("src/b.rs", admitted); fixture.write("src/c.rs", admitted);
+    let atlas = fixture.atlas(); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let query = "ana required path:src/ -path:drop lang:rust";
+    let scope = AtlasSearchScope::from_csv(Some("rs,md"), None).unwrap()
+        .with_path(AtlasSearchPathKind::Directory, "src").unwrap();
+    let response = service.search_scoped_expression_page_with_progress(&atlas, query,
+        AtlasStreamSearchOptions { max_matches: 1, max_scan_bytes: 2 * admitted.len() as u64,
+            max_read_calls: 2 }, scope, 3, || false, || false, |_| {}).unwrap();
+    assert_eq!(response.exit_code(), EXIT_PARTIAL, "skipped prefix rows remain explicitly omitted");
+    let report = json(&response); policy(&report, query, "ana"); coverage(&report); window(&report, 3, 3, false);
+    assert!(report.get("search_complete").flag()); assert!(report.get("match_count_complete").flag());
+    assert_eq!(report.get("stop_reason"), &Json::Null);
+    assert_eq!(report.get("catalogued_files").number(), 6);
+    assert_eq!(report.get("eligible_files").number(), 4);
+    assert_eq!(report.get("excluded_files").number(), 2);
+    assert_eq!(report.get("expression_scope_files").number(), 2);
+    assert_eq!(report.get("expression_excluded_files").number(), 2);
+    assert_eq!(report.get("files_examined").number(), 2);
+    assert_eq!(report.get("matches_seen").number(), 4);
+    assert_eq!(report.get("matching_files").number(), 2);
+    assert_eq!(report.get("retained_matching_files").number(), 1);
+    assert_eq!(report.get("retained_hits").number(), 1);
+    assert_eq!(report.get("payload_bytes_read").number(), 2 * admitted.len() as u64);
+    assert_eq!(report.get("read_calls").number(), 2);
+    let row = &report.get("hits").array()[0];
+    assert_eq!(row.get("path").get("hex").text(), hex(b"src/c.rs"));
+    assert_eq!(row.get("occurrence_id").number(), 2); assert_eq!(bounds(row), (3, 6));
+    let catalog = atlas.atlas().catalog();
+    let ordinal = catalog.entries().iter().position(|entry| entry.path().raw().as_bytes() == b"src/c.rs").unwrap();
+    assert_eq!(row.get("file_id").number(), catalog.file_id(ordinal).unwrap().get());
+    assert_eq!(row.get("source_revision").number(), 1 + ordinal as u64);
+    assert_eq!((service.source_bytes_read(), service.read_calls()), (2 * admitted.len() as u64, 2));
+}
+
+#[test]
+fn incomplete_expression_window_keeps_qualified_prefix_and_fresh_utf16_rescan_selects_exact_witness() {
+    for encoding in ["utf16le", "utf16be"] {
+        let fixture = Fixture::new(); let first = "İ İ READY".as_bytes();
+        let mut rejected = first.to_vec(); rejected.resize(2 * CHUNK, b'x');
+        rejected.extend_from_slice(b" FORBIDDEN");
+        let last = encoded("\u{feff}İ İ READY", encoding);
+        fixture.write("a.rs", first); fixture.write("b.rs", &rejected); fixture.write("c.rs", &last);
+        let atlas = fixture.atlas(); let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+        let query = "i ready -forbidden";
+        let scope = AtlasSearchScope::all().with_case_sensitive(false);
+        let partial_response = service.search_scoped_expression_page_with_progress(&atlas, query,
+            AtlasStreamSearchOptions { max_matches: 1, max_scan_bytes: first.len() as u64 + CHUNK as u64,
+                ..opts() }, scope.clone(), 3, || false, || false, |_| {}).unwrap();
+        assert_eq!(partial_response.exit_code(), EXIT_PARTIAL);
+        let partial = json(&partial_response); policy(&partial, query, "i"); coverage(&partial);
+        window(&partial, 3, 2, false);
+        assert_eq!(partial.get("stop_reason").text(), "byte-limit");
+        assert!(!partial.get("search_complete").flag()); assert!(!partial.get("match_count_complete").flag());
+        assert_eq!(partial.get("matches_seen").number(), 2);
+        assert_eq!(partial.get("matching_files").number(), 1);
+        assert_eq!(partial.get("retained_hits").number(), 0);
+        assert_eq!(partial.get("retained_witness_bytes").number(), 0);
+        assert_eq!(partial.get("files_examined").number(), 2);
+        assert_eq!(partial.get("files_unexamined").number(), 1);
+        assert_eq!(partial.get("incomplete_files").number(), 1);
+        assert_eq!(partial.get("payload_bytes_read").number(), first.len() as u64 + CHUNK as u64);
+        let old_generation = partial.get("query_generation").number();
+        let io = (service.source_bytes_read(), service.read_calls());
+        let response = service.search_scoped_expression_page_with_progress(&atlas, query,
+            AtlasStreamSearchOptions { max_matches: 1, ..opts() }, scope, 3,
+            || false, || false, |_| {}).unwrap();
+        assert_eq!(response.exit_code(), EXIT_PARTIAL, "the complete later window omits its prefix");
+        let report = json(&response); policy(&report, query, "i"); coverage(&report); window(&report, 3, 3, false);
+        assert!(report.get("search_complete").flag()); assert!(report.get("match_count_complete").flag());
+        assert_eq!(report.get("stop_reason"), &Json::Null);
+        assert_eq!(report.get("matches_seen").number(), 4);
+        assert_eq!(report.get("matching_files").number(), 2);
+        assert_eq!(report.get("retained_matching_files").number(), 1);
+        assert_eq!(report.get("retained_hits").number(), 1);
+        assert_eq!(report.get("retained_witness_bytes").number(), 2);
+        assert_eq!(report.get("files_examined").number(), 3);
+        assert_eq!(report.get("incomplete_files").number(), 0);
+        assert_eq!(report.get("payload_bytes_read").number(), (first.len() + rejected.len() + last.len()) as u64);
+        let generation = report.get("query_generation").number();
+        assert_eq!(generation, old_generation + 1);
+        assert!(matches!(service.page(&atlas, old_generation, 0, 32), Err(AtlasStreamSearchError::StaleQuery)));
+        assert!(matches!(service.hit(&atlas, old_generation, 0), Err(AtlasStreamSearchError::StaleQuery)));
+        let row = &report.get("hits").array()[0];
+        assert_eq!(row.get("path").get("hex").text(), hex(b"c.rs"));
+        assert_eq!(row.get("occurrence_id").number(), 2); assert_eq!(bounds(row), (6, 8));
+        assert_eq!(row.get("encoding").text(), encoding);
+        let catalog = atlas.atlas().catalog();
+        let ordinal = catalog.entries().iter().position(|entry| entry.path().raw().as_bytes() == b"c.rs").unwrap();
+        assert_eq!(row.get("source_revision").number(), 1 + atlas.atlas().file_count() as u64 + ordinal as u64);
+        assert_eq!(service.source_bytes_read(), io.0 + report.get("payload_bytes_read").number());
+        assert_eq!(service.read_calls(), io.1 + report.get("read_calls").number());
+        let frozen_io = (service.source_bytes_read(), service.read_calls());
+        fixture.write("c.rs", b"different live bytes");
+        let page = json(&service.page(&atlas, generation, 0, 32).unwrap());
+        echo(&page, &report); window(&page, 3, 3, false);
+        assert_eq!(page.get("hits"), report.get("hits"));
+        let witness = json(&service.hit(&atlas, generation, 0).unwrap());
+        echo(&witness, &report);
+        assert_eq!(witness.get("hit").get("text").text(), "İ");
+        assert_eq!(witness.get("hit").get("original_hex").text(), hex(&last[6..8]));
+        assert_eq!(witness.get("additional_source_bytes_read").number(), 0);
+        assert_eq!(frozen_io, (service.source_bytes_read(), service.read_calls()));
+    }
 }
