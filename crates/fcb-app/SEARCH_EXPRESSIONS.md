@@ -1,4 +1,4 @@
-# Exact search expressions
+# Search expressions with original-byte witnesses
 
 Implementation and regression tests are committed; Rust compilation and test
 execution are pending independent batch verification. This document is not an
@@ -19,6 +19,11 @@ fcb search ROOT --workspace --respect-ignores \
 # Evaluate the same syntax over saved source without accessing the original root.
 fcb snapshot search saved.fcbs \
   --query 'ana required -forbidden lang:rs' --json
+
+# Apply Unicode lowercase comparison to every text term and count all qualified
+# primary occurrences without retaining rows. This never reads the live root.
+fcb snapshot search saved.fcbs \
+  --query 'ana required -forbidden lang:rs' --ignore-case --count-all --limit 0 --json
 
 # Reuse an independently pinned catalog instead of validating the archive body
 # on open. Selected members are still verified before predicate evaluation.
@@ -44,13 +49,23 @@ returned occurrence ranges. Additional positive terms are document-wide AND
 predicates; `+term` is also accepted. `-term` and `-"quoted phrase"` exclude a file
 when that text occurs anywhere in that same capture. Quoted phrases support
 escaped quotes and backslashes. Text comparisons are case-sensitive decoded
-matching by default. Live captured-workspace expressions accept `--ignore-case`,
+matching by default. Live captured-workspace and snapshot expressions accept `--ignore-case`,
 which applies the existing Unicode lowercase comparison to primary, required and
 excluded text together. Metadata path/type filters keep their existing semantics.
-The result declares `case_sensitive`, and hits retain the original source spelling
-and complete contributing source byte ranges. Snapshot expressions retain their
-existing case-sensitive semantics. Neither route implies compiler symbols or
+The result declares `case_sensitive`, and hits retain complete contributing source
+byte ranges. Snapshot results also declare `mode` as `decoded-text-expression` or
+`unicode-lowercase-expression`, with `normalization: "exact"`. Unicode scalar
+lowercase comparison can expand a character, so a query `i` can select the complete
+original `İ` scalar, and `k` can select `K`. It does not fold `ß` to `ss` or equate
+composed and decomposed accents. Neither route implies compiler symbols or
 whole-word matching.
+
+Snapshot expression rows retain metadata without source payloads. Their
+`primary_needle` identifies the requested primary term; `matched_text` is `null`
+for lowercase matches because query spelling cannot certify source spelling.
+Open the verified member at `original_range` to obtain the original bytes. The
+retained saved-repository reader API returns the actual decoded source spelling
+as `selection.text`, its exact `original_hex`, and the frozen matching policy.
 
 Positive predicates may occur on different lines, but never in different files.
 Predicate occurrences do not multiply the primary hits. Overlapping primary
@@ -104,7 +119,8 @@ query generations, and allocation IDs are checked before publication.
 
 `ExpressionQuery::new_indexed` additionally accepts the existing pinned per-file
 `SnapshotIndex`. Only a mandatory positive primary term can certify exclusion;
-NOT terms never act as unsafe negative prefilters. UTF-16, malformed text, short
+NOT terms never act as unsafe negative prefilters. Lowercase plans bypass exact
+index exclusions rather than treating an incompatible negative as proof. UTF-16, malformed text, short
 needles, and uncovered segments take their normal exact scan path. That indexed
 constructor is currently a public-library option: the new snapshot CLI expression
 route does not consume an index artifact. Existing `snapshot index search` retains
@@ -135,6 +151,19 @@ lookahead continues. Limit zero performs lookahead too: an exhaustive negative
 can succeed with no hits, while an actual occurrence returns a truncated response.
 `matches_seen` is observed qualified matches, not an invented exhaustive total
 when work or result limits stop the query.
+
+Snapshot `--count-all` continues past the retained-row cap, including a zero cap,
+while keeping the same source and matching-work allowances. A completed count
+reports `matches_seen_exact: true` even when `truncated` indicates omitted rows.
+An interrupted or otherwise incomplete scan keeps the total a lower bound.
+
+The retained host API `SavedRepositorySession::expression_search_matching` and
+the additive C endpoint `fcb_saved_expression_search_matching` accept matching
+and counting policy together. A successful generation freezes both policies for
+paging and reader activation. Invalid or canceled replacements preserve the
+previous accepted results. The original expression APIs keep exact matching,
+and literal queries, attached indexes, and already opened readers remain
+independent of expression replacement or clearing.
 
 Saved hits retain archive/source digests, owner-qualified file/revision IDs,
 query generation, occurrence identity, and original-byte ranges. UTF-16 positions

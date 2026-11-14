@@ -214,6 +214,20 @@ char *fcb_saved_expression_search(uint64_t handle, uint64_t generation,
  */
 char *fcb_saved_expression_search_counted(uint64_t handle, uint64_t generation,
     const char *query, uint64_t max_hits, uint64_t max_scan_bytes);
+/* Explicit matching/count policy for every primary/required/excluded term.
+ * Both flags are exactly 0 or 1. case_sensitive=0 applies Unicode scalar
+ * lowercase, not full case folding or canonical accent normalization. Original
+ * byte ranges include complete contributing scalars (e.g. i may match U+0130).
+ * max_hits and aggregate matching-work bounds are unchanged, including count
+ * only. Attached exact-byte indexes are bypassed without detaching them.
+ * Receipts/pages/readers freeze case_sensitive, mode (decoded-text-expression
+ * or unicode-lowercase-expression), and normalization (exact). Reader selection
+ * original_hex is the verified source spelling, which may differ from the
+ * primary query text. Old search/count endpoints remain case-sensitive.
+ */
+char *fcb_saved_expression_search_matching(uint64_t handle, uint64_t generation,
+    const char *query, uint64_t case_sensitive, uint64_t count_all_matches,
+    uint64_t max_hits, uint64_t max_scan_bytes);
 char *fcb_saved_expression_results(uint64_t handle, uint64_t generation,
     uint64_t start, uint64_t limit);
 char *fcb_saved_clear_expression(uint64_t handle, uint64_t generation);

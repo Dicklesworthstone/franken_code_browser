@@ -11,6 +11,7 @@ use fcb::{ArenaOwnerId, FileId, QueryGeneration, SourceRevision};
 use fcb::search::{MAX_QUERY_LEN, MAX_QUERY_TOKENS, StreamReadStep};
 use fcb::search::expression::{ExpressionPlan, ExpressionQuery, ExpressionOptions,
     ExpressionReport, ExpressionState, ExpressionStats, ExpressionHit};
+use fcb::source::{CaptureEncodingMap, SpanKind, detect_encoding};
 pub use fcb::search::expression::ExpressionError;
 use super::{SavedRepositorySession, SavedRepositoryError, SavedDeskError, SavedDeskOpen,
     DeskSession, HostResponse, ByteLength, RawPath, AppError, check};
@@ -45,16 +46,20 @@ pub struct SavedExpression {
 impl SavedExpression {
     pub fn prepare(saved: &mut SavedRepositorySession, generation: u64, query: &str,
         options: SavedExpressionOptions, canceled: impl FnMut() -> bool) -> Result<Self, SavedDeskError> {
-        Self::prepare_with_counting(saved, generation, query, options, false, canceled)
+        Self::prepare_matching(saved, generation, query, options, true, false, canceled)
     }
 
     pub fn prepare_counted(saved: &mut SavedRepositorySession, generation: u64, query: &str,
         options: SavedExpressionOptions, canceled: impl FnMut() -> bool) -> Result<Self, SavedDeskError> {
-        Self::prepare_with_counting(saved, generation, query, options, true, canceled)
+        Self::prepare_matching(saved, generation, query, options, true, true, canceled)
     }
 
-    fn prepare_with_counting(saved: &mut SavedRepositorySession, generation: u64, query: &str,
-        options: SavedExpressionOptions, count_all_matches: bool, mut canceled: impl FnMut() -> bool)
+    /// Apply one matching policy to primary, required and excluded terms.
+    /// Lowercase comparison keeps original byte witnesses and does not consult
+    /// an attached exact-byte index. Existing constructors remain exact.
+    pub fn prepare_matching(saved: &mut SavedRepositorySession, generation: u64, query: &str,
+        options: SavedExpressionOptions, case_sensitive: bool, count_all_matches: bool,
+        mut canceled: impl FnMut() -> bool)
         -> Result<Self, SavedDeskError> {
         check(&mut canceled)?;
         if options.max_hits > super::super::MAX_SAVED_HITS || query.len() > MAX_QUERY_LEN {
@@ -69,7 +74,8 @@ impl SavedExpression {
         let allocations = saved.allocations()?;
         let lease = saved.budget.try_reserve_managed(owner, object_id, ByteLength::new(size_of::<Self>() as u64))
             .map_err(|_| AppError::Admission)?;
-        let plan = ExpressionPlan::parse(owner, query, &saved.budget, plan_id, pattern_ids[0])?;
+        let plan = ExpressionPlan::parse_with_matching(owner, query, case_sensitive,
+            &saved.budget, plan_id, pattern_ids[0])?;
         let first_file = FileId::new(owner, 1).map_err(|_| ExpressionError::IdentityExhausted)?;
         let first_revision = SourceRevision::new(owner, 1).map_err(|_| ExpressionError::IdentityExhausted)?;
         let before = saved.archive.load_stats();
@@ -120,7 +126,10 @@ impl SavedExpression {
         out.integer(self.generation)?;
         out.literal(",\"expression\":")?; out.quoted(&self.plan.syntax().raw_query)?;
         out.literal(",\"primary_needle\":")?; out.quoted(&self.plan.syntax().primary_needle)?;
-        out.literal(",\"predicate_scope\":\"whole-captured-member\",\"case_sensitive\":true,\"index_used\":false,\"index_policy\":\"direct-verified-member-scan\",\"state\":")?;
+        out.literal(",\"predicate_scope\":\"whole-captured-member\",\"case_sensitive\":")?;
+        out.boolean(self.plan.case_sensitive())?;
+        out.literal(",\"mode\":")?; out.quoted(self.plan.realized_mode())?;
+        out.literal(",\"normalization\":\"exact\",\"index_used\":false,\"index_policy\":\"direct-verified-member-scan\",\"state\":")?;
         out.quoted(match self.report.state() {
             ExpressionState::Complete => "complete", ExpressionState::Truncated => "truncated",
             ExpressionState::WorkLimit => "work-limit", _ => return Err(ExpressionError::Pending.into()),
@@ -196,6 +205,9 @@ impl SavedExpression {
         out.literal(",\"selection_namespace\":\"saved-expression\",\"expression_generation\":")?;
         out.integer(self.generation)?;
         out.literal(",\"primary_needle\":")?; out.quoted(&self.plan.syntax().primary_needle)?;
+        out.literal(",\"case_sensitive\":")?; out.boolean(self.plan.case_sensitive())?;
+        out.literal(",\"mode\":")?; out.quoted(self.plan.realized_mode())?;
+        out.literal(",\"normalization\":\"exact\"")?;
         out.literal(",\"member\":")?; out.integer(hit.ordinal() as u64)?;
         out.literal(",\"file_id\":")?; out.integer(capture.file().get())?;
         out.literal(",\"source_revision\":")?; out.integer(capture.revision().get())?;
@@ -204,6 +216,10 @@ impl SavedExpression {
         out.integer(prepared.reader_owner.get())?;
         out.literal(",\"selection\":{\"expression_generation\":")?; out.integer(self.generation)?;
         out.literal(",\"hit_id\":")?; out.integer(hit_id)?;
+        out.literal(",\"case_sensitive\":")?; out.boolean(self.plan.case_sensitive())?;
+        out.literal(",\"mode\":")?; out.quoted(self.plan.realized_mode())?;
+        out.literal(",\"normalization\":\"exact\",\"text\":")?;
+        out.quoted(prepared.selected_text.decoded_text())?;
         out.literal(",\"domain\":\"original-source-bytes\",\"original_range\":")?; out.range(hit.original_range())?;
         out.literal(",\"original_hex\":")?; out.hex(selected)?; out.literal("}")?;
         out.literal(",\"reader\":")?; out.literal(prepared.info.as_str())?;
@@ -248,6 +264,8 @@ struct ExpressionReader {
     reader: ReaderSession,
     info: HostResponse,
     window: HostResponse,
+    selected_text: CaptureEncodingMap,
+    _text_lease: ResourceLease,
 }
 
 impl SavedRepositorySession {
@@ -262,7 +280,7 @@ impl SavedRepositorySession {
     /// before replacing that report, including work-limit/partial responses.
     pub fn expression_search(&mut self, generation: u64, query: &str, max_hits: usize,
         max_scan_bytes: u64, canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedDeskError> {
-        self.expression_search_with_counting(generation, query, max_hits, max_scan_bytes, false, canceled)
+        self.expression_search_matching(generation, query, max_hits, max_scan_bytes, true, false, canceled)
     }
 
     /// Count all primary occurrences after the existing whole-member predicates
@@ -270,18 +288,20 @@ impl SavedRepositorySession {
     /// The aggregate predicate/primary scan budget remains authoritative.
     pub fn expression_search_counted(&mut self, generation: u64, query: &str, max_hits: usize,
         max_scan_bytes: u64, canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedDeskError> {
-        self.expression_search_with_counting(generation, query, max_hits, max_scan_bytes, true, canceled)
+        self.expression_search_matching(generation, query, max_hits, max_scan_bytes, true, true, canceled)
     }
 
-    fn expression_search_with_counting(&mut self, generation: u64, query: &str, max_hits: usize,
-        max_scan_bytes: u64, count_all_matches: bool, mut canceled: impl FnMut() -> bool)
+    /// Freeze matching and counting policy with the accepted generation. Failed
+    /// replacements keep the prior report and its original matching semantics.
+    pub fn expression_search_matching(&mut self, generation: u64, query: &str, max_hits: usize,
+        max_scan_bytes: u64, case_sensitive: bool, count_all_matches: bool,
+        mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, SavedDeskError> {
         super::super::query_attempt(&mut self.last_expression_attempt, generation)?;
         check(&mut canceled)?;
         let options = SavedExpressionOptions { max_hits, max_scan_bytes };
-        let candidate = if count_all_matches {
-            SavedExpression::prepare_counted(self, generation, query, options, &mut canceled)?
-        } else { SavedExpression::prepare(self, generation, query, options, &mut canceled)? };
+        let candidate = SavedExpression::prepare_matching(self, generation, query, options,
+            case_sensitive, count_all_matches, &mut canceled)?;
         let response = candidate.page(self, generation, 0, 64, &mut canceled)?;
         self.expression = Some(candidate);
         Ok(response)
@@ -341,17 +361,36 @@ impl SavedRepositorySession {
         // Digest verification covers every predicate's captured source, not
         // just the visible primary occurrence or a newly reopened live path.
         let capture = hit.open(&mut self.archive, qgen, &self.budget, allocations, &mut *canceled)?;
+        let range = hit.original_range();
+        let (start, end) = range.as_usize_bounds().map_err(|_| PagedSearchError::InvalidHit)?;
+        let original = capture.bytes().get(start..end).ok_or(PagedSearchError::InvalidHit)?;
+        let maximum = super::super::MAX_SAVED_MATCHED_TEXT_BYTES;
+        if original.len() > maximum { return Err(SavedRepositoryError::MissingHit.into()); }
+        let [text_id] = self.allocations()?;
+        let text_lease = self.budget.try_reserve_managed(self.owner(), text_id,
+            ByteLength::new((original.len().max(4) * 256 + 4096) as u64))
+            .map_err(|_| AppError::Admission)?;
+        // A normalized needle can occupy different bytes from its source. Decode
+        // the complete contributing source scalars, preserving interior BOMs.
+        let selected_text = CaptureEncodingMap::build_with_base_offset(original,
+            detect_encoding(capture.bytes()), range.start().get(), 0, 0, 0)
+            .map_err(|_| SavedRepositoryError::MissingHit)?;
+        if selected_text.decoded_text().is_empty() || selected_text.decoded_text().len() > maximum
+            || selected_text.spans().iter().any(|span|
+                matches!(span.kind, SpanKind::ReplacementMalformed | SpanKind::EscapedByte)) {
+            return Err(SavedRepositoryError::MissingHit.into());
+        }
         let member = self.archive.directory().member(hit.ordinal()).ok_or(SavedRepositoryError::MissingHit)?;
         let label = RawPath::from_bytes(member.path).to_path_buf();
         let mut reader = ReaderSession::from_bytes(reader_owner, &label, capture.bytes(), &mut *canceled)
             .map_err(SavedRepositoryError::from)?;
         let info = reader.info(&mut *canceled).map_err(SavedRepositoryError::from)?;
-        let range = hit.original_range();
         let start = range.start().get().saturating_sub(132);
         let end = range.end().get().saturating_add(132).min(capture.bytes().len() as u64);
         let window = reader.read_window(start, ((end - start) as usize).max(4), &mut *canceled)
             .map_err(SavedRepositoryError::from)?;
         check(canceled)?;
-        Ok(ExpressionReader { reader_owner, hit, capture, reader, info, window })
+        Ok(ExpressionReader { reader_owner, hit, capture, reader, info, window,
+            selected_text, _text_lease: text_lease })
     }
 }

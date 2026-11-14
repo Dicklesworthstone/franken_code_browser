@@ -84,3 +84,46 @@ fn expression_c_errors_are_bounded_and_failed_replacement_is_recoverable() {
     assert!(take(fcb_saved_expression_results(handle, 1, 0, 129)).contains("\"status\":\"error\""));
     assert_eq!(fcb_saved_close(handle), 1);
 }
+
+#[test]
+fn matching_expression_c_entrypoint_preserves_utf16_spelling_and_legacy_exact_mode() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
+    let bytes: Vec<_> = "\u{feff}K REQUIRED".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let path = archive(&bytes); let handle = fcb_saved_create();
+    take(unsafe { fcb_saved_open(handle, path.as_ptr()) });
+    let query = CString::new("k required -forbidden").unwrap();
+    let lower = take(unsafe { fcb_saved_expression_search_matching(handle, 1, query.as_ptr(), 0, 1, 10, 4096) });
+    assert!(lower.contains("\"mode\":\"unicode-lowercase-expression\""), "{lower}");
+    assert!(lower.contains("\"case_sensitive\":false")); assert!(lower.contains("\"retained_hits\":\"1\""));
+    let reader = crate::reader_ffi::fcb_reader_create();
+    let opened = take(fcb_saved_open_expression_hit_reader(handle, reader, 1, 1));
+    assert!(opened.contains("\"text\":\"K\""), "{opened}");
+    assert!(opened.contains("\"original_hex\":\"2a21\""));
+    let count = take(unsafe { fcb_saved_expression_search_matching(handle, 2, query.as_ptr(), 0, 1, 0, 4096) });
+    assert!(count.contains("\"matches_seen\":\"1\"")); assert!(count.contains("\"retained_hits\":\"0\""));
+    assert!(count.contains("\"matches_seen_exact\":true"));
+    let exact = take(unsafe { fcb_saved_expression_search(handle, 3, query.as_ptr(), 10, 4096) });
+    assert!(exact.contains("\"case_sensitive\":true")); assert!(exact.contains("\"retained_hits\":\"0\""));
+    assert_eq!(fcb_saved_close(handle), 1);
+    assert!(take(crate::reader_ffi::fcb_reader_copy_range(reader, 2, 4)).contains("\"original_hex\":\"2a21\""));
+    assert_eq!(crate::reader_ffi::fcb_reader_close(reader), 1);
+}
+
+#[test]
+fn matching_expression_c_flags_reject_invalid_values_without_replacing_results() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
+    let path = archive(b"NEEDLE REQUIRED"); let handle = fcb_saved_create();
+    take(unsafe { fcb_saved_open(handle, path.as_ptr()) });
+    let query = CString::new("needle required").unwrap();
+    let first = take(unsafe { fcb_saved_expression_search_matching(handle, 1, query.as_ptr(), 0, 0, 10, 4096) });
+    assert!(first.contains("\"retained_hits\":\"1\""));
+    for (case, count) in [(2, 0), (0, 2), (u64::MAX, u64::MAX)] {
+        let error = take(unsafe { fcb_saved_expression_search_matching(handle, 2, query.as_ptr(), case, count, 10, 4096) });
+        assert!(error.len() < 4096 && error.contains("\"status\":\"error\""));
+    }
+    let missing = take(unsafe { fcb_saved_expression_search_matching(handle, 2, std::ptr::null(), 0, 0, 10, 4096) });
+    assert!(missing.contains("\"status\":\"error\""));
+    let retained = take(fcb_saved_expression_results(handle, 1, 0, 10));
+    assert!(retained.contains("\"case_sensitive\":false")); assert!(retained.contains("\"retained_hits\":\"1\""));
+    assert_eq!(fcb_saved_close(handle), 1);
+}

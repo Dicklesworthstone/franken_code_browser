@@ -85,6 +85,8 @@ pub(super) enum Command<'a> {
     Clear { generation: u64 },
     ExpressionSearch { generation: u64, query: &'a str, max_hits: usize, max_scan_bytes: u64 },
     ExpressionSearchCounted { generation: u64, query: &'a str, max_hits: usize, max_scan_bytes: u64 },
+    ExpressionSearchMatching { generation: u64, query: &'a str, max_hits: usize, max_scan_bytes: u64,
+        case_sensitive: bool, count_all_matches: bool },
     ExpressionResults { generation: u64, start: usize, limit: usize },
     ClearExpression { generation: u64 },
     StructureSearch { generation: u64, mode: StructureMode, name_mode: SymbolNameMode,
@@ -192,6 +194,9 @@ impl SavedSessions {
                 session.expression_search(generation, query, max_hits, max_scan_bytes, &mut stop).map_err(AccessError::from),
             Command::ExpressionSearchCounted { generation, query, max_hits, max_scan_bytes } =>
                 session.expression_search_counted(generation, query, max_hits, max_scan_bytes, &mut stop).map_err(AccessError::from),
+            Command::ExpressionSearchMatching { generation, query, max_hits, max_scan_bytes, case_sensitive, count_all_matches } =>
+                session.expression_search_matching(generation, query, max_hits, max_scan_bytes,
+                    case_sensitive, count_all_matches, &mut stop).map_err(AccessError::from),
             Command::ExpressionResults { generation, start, limit } =>
                 session.expression_results(generation, start, limit, &mut stop).map_err(AccessError::from),
             Command::ClearExpression { generation } =>

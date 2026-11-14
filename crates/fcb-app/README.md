@@ -626,6 +626,9 @@ whole-member required, excluded, and path predicates:
 
 ```sh
 fcb snapshot search saved.fcbs --query 'needle required -excluded path:src/' --count-all --max-matches 0 --json
+
+# Match every positive and excluded text term using Unicode lowercase comparison.
+fcb snapshot search saved.fcbs --query 'needle required -excluded path:src/' --ignore-case --count-all --max-matches 0 --json
 ```
 
 Here `needle` supplies the occurrences being counted; `required`, `-excluded`
@@ -635,6 +638,15 @@ independent of counting: zero retains no rows, while a positive
 Source and work allowances, unavailable members, archive discovery, and the
 reported completeness fields remain authoritative. `--count-all` does not
 turn a partial scan into a complete count or widen its budgets.
+
+`--ignore-case` applies one matching policy to the primary, required, and excluded
+text terms. Metadata path and language filters retain their existing semantics.
+Matching preserves the complete contributing source byte ranges, including UTF-16
+and lowercase expansions such as `İ`. It does not add full case folding or accent
+normalization. Snapshot expression JSON records the realized mode and primary
+needle; lowercase rows leave `matched_text` null until source bytes are opened
+and verified. See [search expressions](SEARCH_EXPRESSIONS.md) for the source,
+counting, and retained-reader contracts.
 
 ## Build a saved repository search index in the host
 

@@ -167,6 +167,24 @@ pub unsafe extern "C" fn fcb_saved_expression_search_counted(handle: u64, genera
             max_hits: number(max_hits)?, max_scan_bytes }, || false)
     }))
 }
+/// Match all expression terms exactly or with Unicode scalar lowercase.
+/// Both flags must be zero or one. Matching/count policy is retained per query;
+/// old entrypoints remain case-sensitive and no attached index is modified.
+/// # Safety
+/// query is null or readable NUL-terminated UTF-8 stable until return.
+/// Release every non-null response exactly once with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_saved_expression_search_matching(handle: u64, generation: u64,
+    query: *const c_char, case_sensitive: u64, count_all_matches: u64,
+    max_hits: u64, max_scan_bytes: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| {
+        if case_sensitive > 1 || count_all_matches > 1 { return Err(AccessError::InvalidArgument); }
+        let query = unsafe { cstr(query) }.ok_or(AccessError::InvalidArgument)?;
+        sessions.execute(handle, Command::ExpressionSearchMatching { generation, query,
+            max_hits: number(max_hits)?, max_scan_bytes, case_sensitive: case_sensitive == 1,
+            count_all_matches: count_all_matches == 1 }, || false)
+    }))
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_saved_expression_results(handle: u64, generation: u64,
     start: u64, limit: u64) -> *mut c_char {

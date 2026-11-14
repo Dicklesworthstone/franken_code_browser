@@ -126,7 +126,7 @@ fn cancellation_and_invalid_modes_do_not_publish_success_or_change_the_archive()
     let args = args(&f, "needle required", &["--count-all", "--limit", "0", "--json"]);
     let (exit, out) = invoke(&args, || true);
     assert_eq!(exit, EXIT_CANCELED); assert_eq!(parse(out.as_bytes()).unwrap().get("status").text(), "error");
-    for tail in [vec!["--count-all", "--ignore-case"], vec!["--count-all", "--count-all"],
+    for tail in [vec!["--count-all", "--ignore-case", "--ignore-case"], vec!["--count-all", "--count-all"],
         vec!["--count-all", "--text", "needle"]] {
         assert_eq!(search(&f, "needle", &tail).0, EXIT_ERROR);
     }
@@ -140,4 +140,58 @@ fn human_count_only_output_reports_totals_without_inventing_rows() {
     assert_eq!(exit, EXIT_OK);
     assert!(out.contains("Primary matches seen: 2 (exact); retained hits: 0; matching files: 1."));
     assert!(!out.contains(" bytes 0.."));
+}
+
+#[test]
+fn lowercase_expression_cli_applies_one_policy_and_preserves_source_byte_ranges() {
+    let little = utf16("KELVIN REQUIRED", true);
+    let big = utf16("KELVIN REQUIRED", false);
+    let f = Fixture::new(&[entry(b"src/a.rs", "KELVIN REQUIRED".as_bytes()),
+        entry(b"src/b.rs", &little), entry(b"src/c.rs", &big),
+        entry(b"src/d.rs", b"KELVIN REQUIRED FoRbIdDeN"),
+        entry(b"docs/a.rs", b"KELVIN REQUIRED")], true);
+    let expression = "kelvin required -forbidden path:src/ lang:rust";
+    let (exit, exact) = search(&f, expression, &[]);
+    assert_eq!(exit, EXIT_NO_MATCH); assert!(exact.get("case_sensitive").flag());
+    let (exit, lower) = search(&f, expression, &["--ignore-case", "--count-all"]);
+    assert_eq!(exit, EXIT_OK); assert!(!lower.get("case_sensitive").flag());
+    assert_eq!(lower.get("mode").text(), "unicode-lowercase-expression");
+    assert_eq!(lower.get("normalization").text(), "exact");
+    assert_eq!(lower.get("primary_needle").text(), "kelvin");
+    assert_eq!(lower.get("matches_seen").number(), 3);
+    assert_eq!(lower.get("predicate_rejections").number(), 1);
+    assert_eq!(lower.get("metadata_excluded_files").number(), 1);
+    assert!(lower.get("matches_seen_exact").flag());
+    assert!(!lower.get("live_roots_accessed").flag());
+    for (hit, start, end) in lower.get("hits").array().iter().zip([0, 2, 2]).zip([8, 14, 14])
+        .map(|((hit, start), end)| (hit, start, end)) {
+        assert_eq!(hit.get("original_range").get("start").number(), start);
+        assert_eq!(hit.get("original_range").get("end").number(), end);
+        assert_eq!(*hit.get("matched_text"), Json::Null,
+            "metadata-only results must not invent the source spelling from the needle");
+    }
+    let (exit, counted) = search(&f, expression, &["--ignore-case", "--count-all", "--limit", "0"]);
+    assert_eq!(exit, EXIT_OK); assert_eq!(counted.get("matches_seen").number(), 3);
+    assert!(counted.get("match_count_complete").flag()); assert!(counted.get("hits").array().is_empty());
+    assert_eq!(fs::read(&f.path).unwrap(), f.bytes);
+}
+
+#[test]
+fn lowercase_cli_keeps_expansion_witnesses_and_incomplete_counts_honest() {
+    let f = Fixture::new(&[entry(b"a.rs", "İ REQUIRED".as_bytes())], true);
+    let (exit, found) = search(&f, "i required", &["--ignore-case"]);
+    assert_eq!(exit, EXIT_OK); assert_eq!(found.get("matches_seen").number(), 1);
+    let range = found.get("hits").array()[0].get("original_range");
+    assert_eq!(range.get("start").number(), 0); assert_eq!(range.get("end").number(), 2);
+    let (exit, partial) = search(&f, "i -forbidden",
+        &["--ignore-case", "--count-all", "--limit", "0", "--max-scan-bytes", "3"]);
+    assert_eq!(exit, EXIT_PARTIAL); assert!(!partial.get("match_count_complete").flag());
+    assert_eq!(partial.get("matches_seen").number(), 0);
+    assert!(partial.get("scanned_input_bytes").number() <= 3);
+    let incomplete = Fixture::new(&[entry(b"a.rs", "İ REQUIRED".as_bytes()), SnapshotEntry {
+        path: b"b.rs", observed_bytes: 100, data: SnapshotData::Unavailable("READ_DENIED") }], true);
+    let (exit, partial) = search(&incomplete, "i required", &["--ignore-case", "--count-all", "--limit", "0"]);
+    assert_eq!(exit, EXIT_PARTIAL); assert_eq!(partial.get("matches_seen").number(), 1);
+    assert!(!partial.get("matches_seen_exact").flag());
+    assert_eq!(partial.get("unavailable_files_count").number(), 1);
 }

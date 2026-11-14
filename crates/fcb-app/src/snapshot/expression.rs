@@ -24,7 +24,8 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
     if canceled() { return Err(Failure::canceled()); }
     let raw = settings.expression.as_deref().ok_or_else(|| Failure::new("CLI_INVALID_NEEDLE"))?;
     // Parse and reserve every pattern BEFORE opening any input archive/catalog.
-    let plan = ExpressionPlan::parse(owner(), raw, budget, allocation(150), allocation(1000))?;
+    let plan = ExpressionPlan::parse_with_matching(owner(), raw, !settings.ignore_case,
+        budget, allocation(150), allocation(1000))?;
     let path = settings.source.as_deref().ok_or_else(|| Failure::new("CLI_MISSING_SOURCE"))?;
     let mut archive = catalog::open(path, settings.catalog.as_deref(), settings.catalog_pin,
         budget, [allocation(104), allocation(110)], canceled)?;
@@ -44,7 +45,10 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
     let stats = report.stats();
     if settings.json {
         begin(out, "snapshot-search")?;
-        out.literal(",\"mode\":\"decoded-text-expression\",\"expression\":")?; out.quoted(raw)?;
+        out.literal(",\"mode\":")?; out.quoted(plan.realized_mode())?;
+        out.literal(",\"case_sensitive\":")?; out.boolean(plan.case_sensitive())?;
+        out.literal(",\"normalization\":\"exact\",\"expression\":")?; out.quoted(raw)?;
+        out.literal(",\"primary_needle\":")?; out.quoted(&plan.syntax().primary_needle)?;
         out.literal(",\"source_scope\":\"saved-observations-only\",\"live_roots_accessed\":false,\"identity_scope\":\"response-local\",\"predicate_scope\":\"same-complete-capture\",\"path_filter_domain\":\"utf8-or-escaped-search-key\",\"strategy\":\"one-verified-member-expression\",\"snapshot_digest\":")?;
         out.quoted(&report.archive_digest().to_hex())?;
         out.literal(",\"policy\":")?; out.quoted(archive.directory().policy())?;
@@ -84,6 +88,7 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
         out.literal(if report.is_complete() { "Complete saved-scope expression search; no live root accessed.\n" }
             else { "PARTIAL saved-scope expression search; no live root accessed.\n" })?;
         out.literal("Query: ")?; out.human_text(raw)?; out.literal("\n")?;
+        if !plan.case_sensitive() { out.literal("Text case: Unicode lowercase comparison for every positive and excluded term.\n")?; }
         if report.count_all_matches() {
             out.literal("Primary matches seen: ")?; out.literal(&report.matches_seen().to_string())?;
             out.literal(if report.is_complete() { " (exact)" } else { " (lower bound; saved scope incomplete)" })?;
@@ -104,7 +109,12 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
             out.literal(",\"path\":")?; out.path(&path)?;
             out.literal(",\"source_digest\":")?; out.quoted(&hit.source_digest().to_hex())?;
             out.literal(",\"original_range\":")?; out.range(hit.original_range())?;
-            out.literal(",\"matched_text\":")?; out.quoted(&plan.syntax().primary_needle)?;
+            out.literal(",\"matched_text\":")?;
+            // The report retains exact range/digest witnesses, not payloads.
+            // Lowercase matches can have a different spelling and width from
+            // the needle; never label the query as the original source text.
+            if plan.case_sensitive() { out.quoted(&plan.syntax().primary_needle)?; }
+            else { out.literal("null")?; }
             out.literal("}")?;
         } else {
             out.path(&path)?; out.literal(" bytes ")?; out.literal(&hit.original_range().start().get().to_string())?;
