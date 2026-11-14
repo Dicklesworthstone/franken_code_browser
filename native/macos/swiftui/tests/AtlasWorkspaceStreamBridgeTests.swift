@@ -407,14 +407,92 @@ private final class WorkspaceProgressCopies: @unchecked Sendable {
         let absentProgress = try progressive(owner, occurrences, AtlasSearchCancellation(), AtlasWorkspaceStreamStop()) { _ in }
         precondition(absentOccurrences == nil && absentProgress == nil && allocations() == frees())
         mode(0)
+        // Expressions forward their raw query, never the extracted primary,
+        // through a dedicated ABI with one case flag and no count-policy slot.
+        let beforeExpressions = (UInt32(14)...UInt32(28)).map { count($0) }
+        let expressionText = "\"exact é😀\" required -forbidden path:src/ lang:rust"
+        for (selection, scoped) in scopedRequests {
+            scope(selection)
+            for exact in [true, false] {
+                let expression = try AtlasWorkspaceStreamRequest(needle: expressionText,
+                    maximumScanBytes: scoped.maximumScanBytes, maximumMatches: scoped.maximumMatches,
+                    maximumReadCalls: scoped.maximumReadCalls, fileScope: scoped.fileScope,
+                    pathScope: scoped.pathScope, caseSensitive: exact, mode: .expression)
+                precondition(expression.countAllMatches)
+                let direct = try transport.search(owner, expression, AtlasSearchCancellation())
+                let stop = AtlasWorkspaceStreamStop(), copies = WorkspaceProgressCopies()
+                let terminal = try progressive(owner, expression, AtlasSearchCancellation(), stop) {
+                    copies.append($0); stop.requestStop()
+                }
+                precondition(direct == expected && terminal == expected && stop.isRequested)
+                precondition(copies.values == ["{\"fixture\":\"workspace-progress\"}"] && allocations() == frees())
+            }
+        }
+        precondition(count(29) == UInt32(scopedRequests.count * 2)
+            && count(30) == UInt32(scopedRequests.count * 2) && count(31) == UInt32(scopedRequests.count * 2))
+        precondition((UInt32(14)...UInt32(28)).map { count($0) } == beforeExpressions,
+            "Expressions must never dispatch their raw query to a literal or identifier ABI")
+        scope(0)
+        let expression = try AtlasWorkspaceStreamRequest(needle: expressionText,
+            maximumScanBytes: request.maximumScanBytes, caseSensitive: false, mode: .expression)
+        let expressionEntries = count(29), expressionProgress = count(30), expressionCallbacks = count(10)
+        do {
+            _ = try transport.search(owner, expression, canceledBeforeEntry)
+            preconditionFailure("Canceled expression request entered C")
+        } catch AtlasWorkspaceStreamError.canceled { }
+        do {
+            _ = try progressive(owner, expression, canceledBeforeEntry, AtlasWorkspaceStreamStop()) { _ in }
+            preconditionFailure("Canceled expression progress entered C")
+        } catch AtlasWorkspaceStreamError.canceled { }
+        precondition(count(29) == expressionEntries && count(30) == expressionProgress && count(10) == expressionCallbacks)
+        let expressionStop = AtlasWorkspaceStreamStop(); expressionStop.requestStop()
+        let noExpressionProgress = WorkspaceProgressCopies(), previousExpressionStops = count(12)
+        let stoppedExpression = try progressive(owner, expression, AtlasSearchCancellation(), expressionStop) {
+            noExpressionProgress.append($0)
+        }
+        precondition(stoppedExpression == expected && noExpressionProgress.values.isEmpty
+            && count(10) == expressionCallbacks && count(12) == previousExpressionStops + 1)
+        for late in [Int32(4), Int32(5)] {
+            mode(late); let live = AtlasSearchCancellation(), releasedBefore = frees()
+            do {
+                _ = try transport.search(owner, expression, live)
+                preconditionFailure("Expression terminal route accepted late cancellation")
+            } catch AtlasWorkspaceStreamError.canceled { }
+            precondition(live.isCanceled && frees() == releasedBefore + (late == 4 ? 1 : 0) && allocations() == frees())
+        }
+        for terminalMode in [Int32(0), Int32(1)] {
+            mode(terminalMode)
+            weak var released: AtlasSearchCancellation?
+            let releasedBefore = frees(), canceledBefore = count(13)
+            do {
+                let live = AtlasSearchCancellation(); released = live
+                do {
+                    _ = try progressive(owner, expression, live, AtlasWorkspaceStreamStop()) { _ in live.cancel() }
+                    preconditionFailure("Expression callback cancellation accepted a terminal response")
+                } catch AtlasWorkspaceStreamError.canceled { }
+            }
+            precondition(released == nil && count(13) == canceledBefore + 1
+                && frees() == releasedBefore + (terminalMode == 0 ? 1 : 0) && allocations() == frees())
+        }
+        for malformed in [Int32(8), Int32(9), Int32(10), Int32(11)] {
+            mode(malformed)
+            let copies = WorkspaceProgressCopies(), releasedBefore = frees(), canceledBefore = count(13)
+            do {
+                _ = try progressive(owner, expression, AtlasSearchCancellation(), AtlasWorkspaceStreamStop()) { copies.append($0) }
+                preconditionFailure("Malformed expression callback reached the sink")
+            } catch AtlasWorkspaceStreamError.invalidResponse { }
+            precondition(copies.values.isEmpty && count(13) == canceledBefore + 1
+                && frees() == releasedBefore + 1 && allocations() == frees())
+        }
+        mode(0)
         try matchWindowBridgeTests()
-        print("Workspace stream ABI match windows, occurrence/matching/count flags, ownership, progressive bytes, Stop and cancellation fixtures passed")
+        print("Workspace stream ABI match windows, expression/occurrence/matching/count flags, ownership, progressive bytes, Stop and cancellation fixtures passed")
     }
 
     private static func matchWindowBridgeTests() throws {
         let transport = AtlasWorkspaceStreamTransport.native
         let progressive = transport.progressiveSearch!
-        for searchMode in AtlasWorkspaceStreamMode.allCases {
+        for searchMode in AtlasWorkspaceStreamMode.allCases where searchMode != .expression {
             for counting in [false, true] {
                 for sensitive in (searchMode == .occurrences ? [true] : [true, false]) {
                     reset()

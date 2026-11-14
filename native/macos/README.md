@@ -931,8 +931,8 @@ executable Rust/Swift verification and physical-Mac qualification.
 
 ## Searching large files across a project
 
-Choose **Search large project files…** in the search sidebar to search text or
-exact whole identifiers in the sidebar's selected location and file types,
+Choose **Search large project files…** in the search sidebar to search text,
+expressions or exact whole identifiers in the sidebar's selected location and file types,
 using a separately retained project catalog. Workspace, folder, exact file and frozen
 visible-atlas selections use the same predicates as ordinary search. Rust scopes
 include `Cargo.toml`; custom extension scopes keep their exact selected keys,
@@ -946,6 +946,34 @@ Choose **Text** for literal matching. **Match case** selects exact spelling;
 turning it off uses Unicode scalar lowercase matching without canonical
 normalization or full case folding. Lowercase results retain each match's
 original spelling and encoded bytes.
+
+Choose **Expression** to combine literal terms, quoted phrases, exclusions such
+as `-generated`, and `path:` or `lang:` filters. For example,
+`"retry request" timeout -deprecated path:src/ lang:rust` finds occurrences of
+`retry request` in admitted files whose observed text also contains `timeout`
+and does not contain `deprecated`. The first positive literal supplies the
+counts, retained bytes and highlights. The shared engine parser admits up to
+64 terms and filters within the 1,024-byte query limit; regular expressions
+remain unavailable. **Match case** applies to all text predicates. Opening the
+sheet from the sidebar's Expression mode preserves that mode and the raw query.
+
+Every required and excluded term is checked against the same continuous file
+observation, including terms beyond the retained-hit allowance or earlier
+capture limits. An observation cut short by an I/O limit, Stop or a decoding
+failure cannot provide expression hits. Reaching the observed end establishes predicates over
+those observed bytes; it does not establish an atomic file snapshot. Changed or
+unavailable final metadata remains disclosed and keeps overall coverage partial.
+Only primary literal witnesses are retained, not the other predicates' text.
+
+Expression path and language filters intersect the frozen sidebar location and
+file types before source reads. UTF-8 root-relative paths are filtered directly;
+non-UTF-8 paths use the engine's escaped search key. The summary separately
+reports files excluded by these expression filters and by native location/type
+selection. **Count all matches** stays on in Expression mode because a file must
+be observed through its end before all text predicates can be established. The
+selected byte and read-call limits still apply, at most 256 rows are retained,
+and **Stop and keep matches** remains available. Returning to Text or Occurrences
+restores the user's counting preference.
 
 Choose **Occurrences** for one complete, case-sensitive identifier. This route
 continues beyond the captured occurrence extractor's 512 KiB source allowance,
@@ -972,15 +1000,23 @@ remain separately reported as missing requested files, preventing a false
 complete result. Location/type exclusions are reported separately from discovery
 policy exclusions and do not consume file-read, byte or result budgets.
 
-Open the sheet, enter the literal or identifier, choose **256 MiB**, **1 GiB**, or **4 GiB** as
+Open the sheet, enter the literal, expression or identifier, choose **256 MiB**, **1 GiB**, or **4 GiB** as
 the total source I/O budget, and press **Search**. There is no per-file capture
 ceiling. The scan admits at most 1,048,576 read calls and retains at most 256
-matches. It uses a 16 KiB input buffer. Exact Text and Occurrences share one
-encoded witness per file with retained matches; lowercase Text retains each
+matches. It uses a 16 KiB input buffer. Exact Text, Expression and Occurrences share one
+encoded primary witness per file with retained matches; lowercase Text and Expression retain each
 hit's original spelling and bytes. Complete sources are not retained. While the scan runs,
 the sheet shows cumulative byte/read progress and previews up to the first 32
 matches from finalized file observations. The unfinished file contributes I/O
 progress, but its tentative matches are withheld until its observation finishes.
+
+For Text and Occurrences, **Scan later matches** and **Scan earlier matches**
+open another bounded result window when available. Each action scans current
+files again from the beginning, charging skipped matches against the same I/O
+budgets. The new window replaces the previous observation and receives fresh
+query and source identities; files may have changed between scans. A regular
+**Search** starts again at the first window. Expression retains its first
+256 results and counts all qualifying primary matches within the I/O budgets.
 
 Enable **Count all matches** to continue through the selected files after the
 256 retained rows fill. The total includes overlapping occurrences and matching
@@ -991,7 +1027,7 @@ read-call budget, unsupported text, unavailable file, changed source or Stop
 prevents complete coverage, the displayed count remains partial. Counting uses
 the same memory, I/O and cancellation limits; it does not retain more source or
 occurrence rows. Without this option, the first additional match beyond the row
-allowance still stops the scan. Changing the option revokes the previous query's
+allowance still stops Text and Occurrences scans. Changing the option revokes the previous query's
 results and requires a new search.
 
 Choose **Stop and keep matches** to accept the finalized-file results immediately
@@ -1026,6 +1062,8 @@ and checks the literal's original bytes before highlighting. Changed bytes are
 reported as changed; the earlier result never claims the new file's identity.
 For an occurrence result, this comparison verifies the retained token bytes;
 it does not re-establish surrounding token boundaries or compiler binding.
+For an expression result, it verifies only the primary literal bytes; it does
+not re-evaluate other required or excluded terms against the current file.
 Changing the query, mode or case policy, refreshing the catalog, replacing the
 project or closing the sheet closes this child reader and revokes its actions
 synchronously.
@@ -1035,7 +1073,9 @@ The safe host service is `fcb_app::host::atlas_stream_search`; native hosts use
 with existing atlas handles. The public `AtlasStreamSearch` accepts both borrowed
 and retained atlas metadata without rebuilding geometry. Added core, host, C ABI,
 native receipt, cancellation/lifetime and context-navigation cases cover this
-integration. They are code-first additions: executable Rust/Swift verification
+integration, including raw-expression ABI routing, immutable parsed-primary and
+predicate metadata, expression scope accounting, original encoded witnesses,
+observed-end admission, counted progress and Stop. They are code-first additions: executable Rust/Swift verification
 and physical-Mac qualification remain pending.
 
 ## Finding text in one large file

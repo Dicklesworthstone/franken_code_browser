@@ -12,11 +12,28 @@ enum AtlasWorkspaceStreamLimits {
 }
 
 enum AtlasWorkspaceStreamMode: String, CaseIterable, Identifiable, Sendable {
-    case text, occurrences
+    case text, expression, occurrences
     var id: String { rawValue }
-    var label: String { self == .text ? "Text" : "Occurrences" }
+    var label: String {
+        switch self {
+        case .text: return "Text"
+        case .expression: return "Expression"
+        case .occurrences: return "Occurrences"
+        }
+    }
+    var queryPrompt: String {
+        switch self {
+        case .text: return "Text to find"
+        case .expression: return "Text, required terms, -excluded, path: or lang:"
+        case .occurrences: return "Exact identifier"
+        }
+    }
     func wireMode(caseSensitive: Bool) -> String {
-        self == .occurrences ? "whole-token-occurrences" : AtlasSearchText.wireMode(caseSensitive: caseSensitive)
+        switch self {
+        case .text: return AtlasSearchText.wireMode(caseSensitive: caseSensitive)
+        case .expression: return "decoded-text-expression"
+        case .occurrences: return "whole-token-occurrences"
+        }
     }
 }
 
@@ -31,12 +48,16 @@ enum AtlasWorkspaceStreamError: Error, Sendable {
         case .canceled: return "Search canceled. Entered file work may still be draining."
         case .engine("STREAM_READ_INVALID_IDENTIFIER"):
             return "Enter one exact identifier without spaces or ASCII punctuation other than _ and $. An identifier cannot start with an ASCII digit."
+        case .engine(let code) where code.hasPrefix("QUERY_"):
+            return AtlasSearchError.query(code).message
         case .engine(let code): return "The requested search operation is unavailable (\(code))."
         }
     }
 }
 
 struct AtlasWorkspaceStreamRequest: Equatable, Sendable {
+    /// The entered query. In Expression mode this is sent verbatim to the
+    /// shared parser; the accepted receipt supplies the primary literal.
     let needle: String
     let maximumMatches, maximumScanBytes, maximumReadCalls: UInt64
     let pageStartAfter: UInt64
@@ -57,13 +78,14 @@ struct AtlasWorkspaceStreamRequest: Equatable, Sendable {
               !needle.utf8.contains(0), (1...AtlasWorkspaceStreamLimits.hits).contains(maximumMatches),
               (1...AtlasWorkspaceStreamLimits.maximumScanBytes).contains(maximumScanBytes),
               (1...AtlasWorkspaceStreamLimits.readCalls).contains(maximumReadCalls),
-              mode != .occurrences || caseSensitive else {
+              mode != .occurrences || caseSensitive,
+              mode != .expression || pageStartAfter == 0 else {
             throw AtlasWorkspaceStreamError.invalidInput
         }
         self.needle = needle; self.maximumScanBytes = maximumScanBytes
         self.maximumMatches = maximumMatches; self.maximumReadCalls = maximumReadCalls
         self.fileScope = fileScope; self.pathScope = pathScope
-        self.countAllMatches = countAllMatches
+        self.countAllMatches = mode == .expression || countAllMatches
         self.caseSensitive = caseSensitive; self.mode = mode; self.pageStartAfter = pageStartAfter
     }
     static func == (a: Self, b: Self) -> Bool {
@@ -146,9 +168,22 @@ struct AtlasWorkspaceStreamIdentity: Equatable, Sendable {
     let root: [UInt8]
 }
 
+/// Immutable parser and path-filter evidence for this query generation. Swift
+/// validates the engine's receipt and never parses expression syntax itself.
+struct AtlasWorkspaceStreamExpression: Equatable, Sendable {
+    let query, primaryNeedle: String
+    let scopeFiles, excludedFiles: UInt64
+    static func == (a: Self, b: Self) -> Bool {
+        a.query.utf8.elementsEqual(b.query.utf8) && a.primaryNeedle.utf8.elementsEqual(b.primaryNeedle.utf8)
+            && a.scopeFiles == b.scopeFiles && a.excludedFiles == b.excludedFiles
+    }
+}
+
 struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
     let identity: AtlasWorkspaceStreamIdentity
     let request: AtlasWorkspaceStreamRequest
+    let primaryNeedle: String
+    let expression: AtlasWorkspaceStreamExpression?
     let discoveryComplete, complete, matchCountComplete, truncated: Bool
     let skippedMatches: UInt64
     let pageHasMoreMatches: Bool
@@ -158,6 +193,7 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
     let eligibleFiles, excludedFiles, missingVisibleFiles: UInt64
     let cataloguedFiles, examinedFiles, unexaminedFiles, incompleteFiles, unavailableFiles, unsupportedFiles, failedFiles, matchingFiles: UInt64
     let retainedMatchingFiles, retainedHits, matchesSeen, payloadBytes, scannedBytes, readCalls, interruptedCalls, peakBufferBytes, witnessBytes: UInt64
+    var searchedFiles: UInt64 { expression?.scopeFiles ?? eligibleFiles }
 
     var retainedRangeLabel: String {
         guard retainedHits > 0 else { return "No retained matches; \(skippedMatches) occurrences skipped" }
@@ -185,7 +221,10 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
         var result = request.mode == .occurrences
             ? "Exact whole-identifier text candidates, including comments and literals; no compiler resolution. "
             : (request.caseSensitive ? "Exact text matching. " : "Unicode lowercase matching without canonical normalization or full case folding. ")
-        result += "Examined \(examinedFiles) of \(eligibleFiles) eligible files; \(excludedFiles) catalogued files excluded by location or file type. \(unexaminedFiles) eligible files remain unexamined, \(incompleteFiles) incomplete (\(unavailableFiles) unavailable, \(unsupportedFiles) unsupported text, \(failedFiles) failed reads). "
+        if let expression {
+            result += "Expression counts and highlights the primary literal; required and excluded terms were checked against the same completed file observation. \(expression.excludedFiles) of \(eligibleFiles) location/type-eligible files excluded by expression path or language filters. "
+        }
+        result += "Examined \(examinedFiles) of \(searchedFiles) search-eligible files; \(excludedFiles) catalogued files excluded by location or file type. \(unexaminedFiles) search-eligible files remain unexamined, \(incompleteFiles) incomplete (\(unavailableFiles) unavailable, \(unsupportedFiles) unsupported text, \(failedFiles) failed reads). "
         result += "Scanned \(scannedBytes) bytes; read \(payloadBytes) bytes in \(readCalls) calls. "
         if request.pageStartAfter > 0 {
             result += "This new scan skipped \(skippedMatches) of \(request.pageStartAfter) requested occurrences. "
@@ -225,15 +264,17 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
         let window = try w.matchWindow(request: request, seen: seen, retained: retained)
         let retainedFiles = counting.retainedFiles
         let scope = try w.scopeCoverage(request: request, catalogued: catalog.files, complete: complete)
+        let primary = try w.text("needle")
+        let expression = try w.expressionCoverage(request: request, primary: primary, eligible: scope.eligible)
+        let searchedFiles = expression?.scopeFiles ?? scope.eligible
         guard identity.layout == catalog.layout, identity.manifest == catalog.manifest,
               files == catalog.files, discovery == catalog.discoveryComplete,
               !policy.isEmpty, policy.utf8.count <= 256,
               policy.unicodeScalars.allSatisfy({ $0.value >= 32 && $0.value != 127 }),
-              try w.text("needle").utf8.elementsEqual(request.needle.utf8),
               try limit.number("max_matches") == request.maximumMatches,
               try limit.number("max_scan_bytes") == request.maximumScanBytes,
               try limit.number("max_read_calls") == request.maximumReadCalls,
-              examined <= scope.eligible, unexamined == scope.eligible - examined, incomplete <= examined,
+              examined <= searchedFiles, unexamined == searchedFiles - examined, incomplete <= examined,
               unavailable <= incomplete, unsupported <= incomplete - unavailable,
               failed <= incomplete - unavailable - unsupported, matching <= examined, matching <= seen,
               retainedFiles <= matching, retainedFiles <= retained,
@@ -247,8 +288,8 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
               calls <= request.maximumReadCalls, interrupted <= calls,
               payload == 0 || calls > 0, peak <= min(payload, 16 * 1024),
               witnesses >= (request.caseSensitive ? retainedFiles : retained),
-              witnesses <= (request.caseSensitive ? retainedFiles * UInt64(request.needle.utf8.count * 2)
-                : retained * UInt64(request.needle.utf8.count * 12)),
+              witnesses <= (request.caseSensitive ? retainedFiles * UInt64(primary.utf8.count * 2)
+                : retained * UInt64(primary.utf8.count * 12)),
               stop != "byte-limit" || payload == request.maximumScanBytes,
               stop != "read-call-limit" || calls == request.maximumReadCalls,
               complete == (terminal && discovery && scope.missing == 0 && unexamined == 0 && incomplete == 0 && stop == nil) else {
@@ -263,7 +304,8 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
                 throw AtlasWorkspaceStreamError.invalidResponse
             }
         }
-        return Self(identity: identity, request: request, discoveryComplete: discovery, complete: complete,
+        return Self(identity: identity, request: request, primaryNeedle: primary, expression: expression,
+            discoveryComplete: discovery, complete: complete,
             matchCountComplete: counting.complete, truncated: truncated,
             skippedMatches: window.skipped, pageHasMoreMatches: window.hasMore, stop: stop,
             discoveryPolicy: policy, excludedEntries: excluded,
@@ -319,11 +361,12 @@ struct AtlasWorkspaceStreamHit: Equatable, Identifiable, Sendable {
         let complete = try w.flag("file_complete"), digest = try w.text("witness_sha256")
         guard index < summary.retainedHits, occurrence > 0, occurrence <= summary.request.pageStartAfter + index + 1,
               file > 0, revision > 0,
-              AtlasObservedReaderSearchRequest.validWitnessRange(range, needle: summary.request.needle,
+              AtlasObservedReaderSearchRequest.validWitnessRange(range, needle: summary.primaryNeedle,
                 encoding: encoding, caseSensitive: summary.request.caseSensitive),
               range.end <= length, range.end <= summary.scannedBytes,
               encoding == .utf8 || range.start % 2 == 0,
               ["complete-observed-input", "match-limit", "byte-limit", "read-call-limit", "short-read", "failed"].contains(state),
+              summary.request.mode != .expression || state == "complete-observed-input",
               ["unchanged-metadata-not-atomic", "changed-during-read", "short-read", "metadata-unavailable"].contains(consistency),
               consistency != "unchanged-metadata-not-atomic" || final == length,
               complete == (state == "complete-observed-input" && consistency == "unchanged-metadata-not-atomic"),
@@ -350,7 +393,7 @@ struct AtlasWorkspaceStreamPage: Sendable {
                        offset: UInt64 = 0, requireTerminal: Bool = false) throws -> Self {
         let w = try AtlasWorkspaceStreamWire.read(json, owner: catalog.owner)
         do {
-            try w.terminalState(expected: true, required: requireTerminal || request.mode == .occurrences)
+            try w.terminalState(expected: true, required: requireTerminal || request.mode != .text)
             return try decode(w, catalog: catalog, root: root, request: request,
                 command: previous == nil ? "search" : "page", terminal: true, previous: previous, offset: offset)
         } catch { throw AtlasWorkspaceStreamError.invalidResponse }
@@ -421,6 +464,7 @@ struct AtlasWorkspaceStreamProgress: Sendable {
         to next: AtlasWorkspaceStreamPage) throws {
         let old = previous.summary, new = next.summary
         guard new.identity == old.identity, new.request == old.request,
+              new.primaryNeedle.utf8.elementsEqual(old.primaryNeedle.utf8), new.expression == old.expression,
               new.cataloguedFiles == old.cataloguedFiles, new.discoveryComplete == old.discoveryComplete,
               new.eligibleFiles == old.eligibleFiles, new.excludedFiles == old.excludedFiles,
               new.missingVisibleFiles == old.missingVisibleFiles,
@@ -507,6 +551,9 @@ struct AtlasWorkspaceStreamWitness: Sendable {
             try w.matchOffset(request: report.summary.request)
             let counting = try w.countCoverage(request: report.summary.request,
                 complete: report.summary.complete, matchingFiles: report.summary.matchingFiles)
+            let primary = try w.text("needle")
+            let expression = try w.expressionCoverage(request: report.summary.request,
+                primary: primary, eligible: scope.eligible)
             guard report.admits(target),
                   try w.streamIdentity(owner: target.identity.owner, root: root,
                     caseSensitive: report.summary.request.caseSensitive, mode: report.summary.request.mode) == target.identity,
@@ -514,9 +561,10 @@ struct AtlasWorkspaceStreamWitness: Sendable {
                   scope.missing == report.summary.missingVisibleFiles,
                   counting.complete == report.summary.matchCountComplete,
                   counting.retainedFiles == report.summary.retainedMatchingFiles,
-                  row == target.hit, try w.text("needle").utf8.elementsEqual(report.summary.request.needle.utf8),
+                  expression == report.summary.expression,
+                  row == target.hit, primary.utf8.elementsEqual(report.summary.primaryNeedle.utf8),
                   AtlasObservedReaderSearchRequest.validWitnessText(text, hex: hex, range: row.range,
-                    needle: report.summary.request.needle, encoding: row.encoding, caseSensitive: report.summary.request.caseSensitive),
+                    needle: report.summary.primaryNeedle, encoding: row.encoding, caseSensitive: report.summary.request.caseSensitive),
                   try w.number("additional_source_bytes_read") == 0, try w.number("additional_read_calls") == 0 else {
                 throw AtlasWorkspaceStreamError.invalidResponse
             }
@@ -599,6 +647,32 @@ struct AtlasWorkspaceStreamWire: Decodable {
         guard skipped == min(request.pageStartAfter, seen), retained <= seen - skipped,
               more == (seen - skipped > retained) else { throw AtlasWorkspaceStreamError.invalidResponse }
         return (skipped, more)
+    }
+    func expressionCoverage(request: AtlasWorkspaceStreamRequest, primary: String,
+        eligible: UInt64) throws -> AtlasWorkspaceStreamExpression? {
+        let required = ["expression", "primary_needle", "query_syntax", "predicate_scope",
+            "path_filter_domain", "expression_scope_files", "expression_excluded_files"]
+        guard request.mode == .expression else {
+            guard !required.contains(where: { fields.contains(Key($0)) }),
+                  primary.utf8.elementsEqual(request.needle.utf8) else {
+                throw AtlasWorkspaceStreamError.invalidResponse
+            }
+            return nil
+        }
+        guard required.allSatisfy({ fields.contains(Key($0)) }),
+              !primary.isEmpty, primary.utf8.count <= AtlasWorkspaceStreamLimits.needleBytes,
+              !primary.utf8.contains(0), try text("expression").utf8.elementsEqual(request.needle.utf8),
+              try text("primary_needle").utf8.elementsEqual(primary.utf8),
+              try text("query_syntax") == "fcb-bounded-expression/1",
+              try text("predicate_scope") == "same-observed-stream",
+              try text("path_filter_domain") == "root-relative-utf8-or-escaped-search-key" else {
+            throw AtlasWorkspaceStreamError.invalidResponse
+        }
+        let admitted = try number("expression_scope_files"), excluded = try number("expression_excluded_files")
+        guard excluded <= eligible, admitted == eligible - excluded else {
+            throw AtlasWorkspaceStreamError.invalidResponse
+        }
+        return .init(query: request.needle, primaryNeedle: primary, scopeFiles: admitted, excludedFiles: excluded)
     }
     /// A legacy receipt is valid only for the original bounded-result mode.
     /// Counted searches must echo the complete extension on every page and hit.

@@ -46,12 +46,26 @@ private enum StreamFixture {
     }
     static func report(_ owner: UInt64, _ generation: UInt64, _ request: AtlasWorkspaceStreamRequest,
                        count: Int = 40, encoding: AtlasObservedReaderEncoding = .utf8,
-                       spellings: [String]? = nil) -> [String: Any] {
+                       spellings: [String]? = nil, primaryNeedle: String? = nil) -> [String: Any] {
         var value = common(owner, generation, "search")
-        let literals = spellings ?? Array(repeating: request.needle, count: count)
+        // An explicit fixture oracle supplies parsed evidence; Swift does not
+        // duplicate the production expression parser, even in this test seam.
+        precondition(request.mode != .expression || primaryNeedle != nil)
+        let primary = primaryNeedle ?? request.needle
+        let literals = spellings ?? Array(repeating: primary, count: count)
         precondition(literals.count == count)
-        let bytes = AtlasObservedReaderSearchRequest.originalBytes(request.needle, encoding: encoding)
+        let bytes = AtlasObservedReaderSearchRequest.originalBytes(primary, encoding: encoding)
         value["mode"] = request.mode.wireMode(caseSensitive: request.caseSensitive)
+        if request.mode == .expression {
+            value["expression"] = request.needle; value["primary_needle"] = primary
+            value["query_syntax"] = "fcb-bounded-expression/1"
+            value["predicate_scope"] = "same-observed-stream"
+            value["path_filter_domain"] = "root-relative-utf8-or-escaped-search-key"
+            value["expression_scope_files"] = "1"; value["expression_excluded_files"] = "0"
+            value["terminal"] = true; value["selection_available"] = true
+            value["page_start_after"] = "0"; value["skipped_matches"] = "0"
+            value["page_has_more_matches"] = false
+        }
         if request.mode == .occurrences {
             value["evidence_level"] = "whole-token-text-candidate"
             value["includes_comments_and_literals"] = true
@@ -61,7 +75,7 @@ private enum StreamFixture {
             value["retained_matching_files"] = count == 0 ? "0" : "1"
             value["terminal"] = true; value["selection_available"] = true
         }
-        value["needle"] = request.needle; value["discovery_complete"] = true
+        value["needle"] = primary; value["discovery_complete"] = true
         value["search_complete"] = true; value["truncated"] = false; value["stop_reason"] = NSNull()
         value["files_examined"] = "1"; value["files_unexamined"] = "0"
         value["incomplete_files"] = "0"; value["unavailable_files"] = "0"
@@ -86,7 +100,7 @@ private enum StreamFixture {
              "fixture_spelling": literals[index]]
         }
         // Keep default receipts legacy to exercise backward compatibility.
-        if request.mode == .occurrences || !request.fileScope.isAll || !request.pathScope.isWorkspace || !request.caseSensitive {
+        if request.mode != .text || !request.fileScope.isAll || !request.pathScope.isWorkspace || !request.caseSensitive {
             value.merge(scope(request), uniquingKeysWith: { _, next in next })
         }
         if request.countAllMatches {
@@ -129,6 +143,11 @@ private enum StreamFixture {
         value["retained_matching_files"] = report["retained_matching_files"] ?? report["matching_files"]
         value["matching_files"] = String(matchingFiles); value["matches_seen"] = String(matches)
         value["truncated"] = matches > UInt64(report["retained_hits"] as! String)!
+        if let start = report["page_start_after"] as? String {
+            let skipped = min(UInt64(start)!, matches)
+            value["skipped_matches"] = String(skipped)
+            value["page_has_more_matches"] = matches - skipped > UInt64(report["retained_hits"] as! String)!
+        }
         return value
     }
     static func page(_ report: [String: Any], offset: Int = 0) -> [String: Any] {
@@ -163,8 +182,8 @@ private enum StreamProgressFixture {
     /// chunk of a second unfinished file, whose matches are deliberately absent.
     static func report(_ owner: UInt64, _ generation: UInt64, _ request: AtlasWorkspaceStreamRequest,
         stopped: Bool, count: Int = 40, examined: UInt64 = 1,
-        payload: UInt64 = StreamFixture.length + 16_384) -> [String: Any] {
-        var value = StreamFixture.report(owner, generation, request, count: count)
+        payload: UInt64 = StreamFixture.length + 16_384, primaryNeedle: String? = nil) -> [String: Any] {
+        var value = StreamFixture.report(owner, generation, request, count: count, primaryNeedle: primaryNeedle)
         value["catalogued_files"] = "2"; value["terminal"] = true; value["selection_available"] = true
         value["files_examined"] = stopped ? String(examined) : "2"
         value["files_unexamined"] = stopped ? String(2 - examined) : "0"
@@ -174,16 +193,18 @@ private enum StreamProgressFixture {
         value["payload_bytes_read"] = String(bytes); value["scanned_input_bytes"] = String(bytes)
         value["read_calls"] = String((bytes + 16_383) / 16_384)
         value["peak_input_buffer_bytes"] = String(min(bytes, 16_384))
-        if request.mode == .occurrences || !request.fileScope.isAll || !request.pathScope.isWorkspace || !request.caseSensitive {
+        if request.mode != .text || !request.fileScope.isAll || !request.pathScope.isWorkspace || !request.caseSensitive {
             value.merge(StreamFixture.scope(request, catalogued: 2, eligible: 2),
                 uniquingKeysWith: { _, next in next })
         }
+        if request.mode == .expression { value["expression_scope_files"] = "2" }
         return value
     }
     static func progress(_ owner: UInt64, _ generation: UInt64, _ request: AtlasWorkspaceStreamRequest,
         sequence: UInt64, count: Int = 40, examined: UInt64 = 1,
-        payload: UInt64 = StreamFixture.length + 16_384) -> [String: Any] {
-        var value = report(owner, generation, request, stopped: true, count: count, examined: examined, payload: payload)
+        payload: UInt64 = StreamFixture.length + 16_384, primaryNeedle: String? = nil) -> [String: Any] {
+        var value = report(owner, generation, request, stopped: true, count: count, examined: examined,
+            payload: payload, primaryNeedle: primaryNeedle)
         value["stop_reason"] = NSNull(); value["terminal"] = false; value["selection_available"] = false
         value["progress_sequence"] = String(sequence)
         value = StreamFixture.page(value)
@@ -193,6 +214,8 @@ private enum StreamProgressFixture {
 }
 
 private final class StreamProbe: @unchecked Sendable {
+    private let expressionPrimary: String?
+    init(expressionPrimary: String? = nil) { self.expressionPrimary = expressionPrimary }
     private let lock = NSLock()
     private var nextOwner: UInt64 = 100
     private var generations: [UInt64: UInt64] = [:]
@@ -272,7 +295,8 @@ private final class StreamProbe: @unchecked Sendable {
         var report = windows
             ? StreamFixture.matchWindow(owner, stale ? generation - 1 : generation, request)
             : StreamFixture.report(owner, stale ? generation - 1 : generation, request,
-                count: request.countAllMatches ? 256 : 40)
+                count: request.countAllMatches ? 256 : 40,
+                primaryNeedle: request.mode == .expression ? expressionPrimary : nil)
         if request.countAllMatches && !windows { report = StreamFixture.counted(report, matches: 2_000, matchingFiles: 1) }
         locked { reports[owner] = report }
         if fails { report["scope"] = "visible-only" } // Backend already replaced before bad delivery.
@@ -289,10 +313,12 @@ private final class StreamProbe: @unchecked Sendable {
             return result
         }
         publish(try StreamFixture.json(StreamProgressFixture.progress(owner, generation, request,
-            sequence: 1, count: 0, examined: 0, payload: 16_384)))
+            sequence: 1, count: 0, examined: 0, payload: 16_384,
+            primaryNeedle: request.mode == .expression ? expressionPrimary : nil)))
         for sequence in UInt64(2)...UInt64(burst ? 128 : 2) {
             var progress = StreamProgressFixture.progress(owner, generation, request, sequence: sequence,
-                count: request.countAllMatches ? 256 : 40)
+                count: request.countAllMatches ? 256 : 40,
+                primaryNeedle: request.mode == .expression ? expressionPrimary : nil)
             if request.countAllMatches { progress = StreamFixture.counted(progress, matches: 1_000, matchingFiles: 1) }
             if poisoned { progress["scope"] = "visible-only" }
             publish(try StreamFixture.json(progress))
@@ -304,7 +330,8 @@ private final class StreamProbe: @unchecked Sendable {
         }
         guard !flag.isCanceled else { throw AtlasWorkspaceStreamError.canceled }
         var report = StreamProgressFixture.report(owner, stale ? generation - 1 : generation, request,
-            stopped: stop.isRequested, count: request.countAllMatches ? 256 : 40)
+            stopped: stop.isRequested, count: request.countAllMatches ? 256 : 40,
+            primaryNeedle: request.mode == .expression ? expressionPrimary : nil)
         if request.countAllMatches {
             report = StreamFixture.counted(report, matches: stop.isRequested ? 1_000 : 2_000,
                 matchingFiles: stop.isRequested ? 1 : 2)
@@ -378,10 +405,12 @@ private final class StreamContextProbe: @unchecked Sendable {
         try matchWindowWireTests()
         try lowercaseWireTests()
         try occurrenceWireTests()
+        try expressionWireTests()
         try progressWireTests()
         try await countedModelTests()
         try await lowercaseModelTests()
         try await occurrenceModelTests()
+        try await expressionModelTests()
         try await progressModelTests()
         try await modelTests()
         try await matchWindowModelTests()
@@ -1438,5 +1467,283 @@ private extension AtlasWorkspaceStreamTests {
         precondition(model.canSearch && model.report == nil && model.witness == nil
             && model.notice.contains("Retained search literals cleared"))
         model.close(); try await wait("identifier owner retirement") { probe.closedCount == probe.createCount }
+    }
+}
+
+private extension AtlasWorkspaceStreamTests {
+    static let expressionQuery = "\"old\" required -forbidden path:src/"
+
+    static func expressionWireTests() throws {
+        let owner: UInt64 = 0xfedcba9876543210
+        let catalog = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(StreamFixture.catalog(owner)), owner: owner)
+        let request = try AtlasWorkspaceStreamRequest(needle: expressionQuery, maximumMatches: 3, mode: .expression)
+        precondition(request.countAllMatches && request.mode.wireMode(caseSensitive: false) == "decoded-text-expression")
+        let explicitlyCounted = try AtlasWorkspaceStreamRequest(needle: expressionQuery, maximumMatches: 3,
+            countAllMatches: true, mode: .expression)
+        precondition(request == explicitlyCounted, "Expression predicates always require observation to the end")
+        rejects("expression endpoint cannot resume a later match window") {
+            _ = try AtlasWorkspaceStreamRequest(needle: expressionQuery, mode: .expression, pageStartAfter: 1)
+        }
+        let metadata = ["expression", "primary_needle", "query_syntax", "predicate_scope",
+            "path_filter_domain", "expression_scope_files", "expression_excluded_files"]
+
+        for encoding in AtlasObservedReaderEncoding.allCases {
+            let wire = StreamFixture.report(owner, 1, request, count: 3, encoding: encoding, primaryNeedle: "old")
+            func decode(_ value: [String: Any]) throws -> AtlasWorkspaceStreamReport {
+                let page = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(value)),
+                    catalog: catalog, root: catalog.root, request: request)
+                return try .init(summary: page.summary, hits: page.hits)
+            }
+            let report = try decode(wire)
+            let target = report.target(for: report.hits[0])
+            precondition(report.summary.primaryNeedle == "old" && report.summary.expression?.query == expressionQuery
+                && report.summary.expression?.scopeFiles == 1 && report.summary.expression?.excludedFiles == 0)
+            precondition(report.summary.matchCountComplete && report.summary.request.needle == expressionQuery)
+            let witness = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(StreamFixture.witness(wire, index: 0)),
+                report: report, root: catalog.root, target: target)
+            precondition(witness.text == "old" && witness.originalHex == ObservedReaderFixture.hex(
+                AtlasObservedReaderSearchRequest.originalBytes("old", encoding: encoding)))
+            precondition(target.hit.range.count == UInt64(witness.originalHex.utf8.count / 2),
+                "Ranges and selected evidence describe the primary literal, never the raw query")
+
+            for key in metadata + ["count_all_matches", "match_count_complete", "retained_matching_files",
+                "search_scope", "case_sensitive", "terminal", "selection_available"] {
+                var bad = wire; bad.removeValue(forKey: key)
+                rejects("missing expression contract \(key)") { _ = try decode(bad) }
+            }
+            let changed: [(String, Any)] = [
+                ("expression", expressionQuery + " "), ("primary_needle", "new"),
+                ("query_syntax", "fcb-bounded-expression/2"), ("predicate_scope", "same-path-multiple-reads"),
+                ("path_filter_domain", "display-path"), ("expression_scope_files", "0"),
+                ("expression_excluded_files", "1"), ("needle", expressionQuery),
+                ("count_all_matches", false), ("mode", "exact-decoded-literal")]
+            for (key, value) in changed {
+                var bad = wire; bad[key] = value
+                rejects("changed expression report \(key)") { _ = try decode(bad) }
+                var selected = StreamFixture.witness(wire, index: 0); selected[key] = value
+                rejects("changed expression witness \(key)") {
+                    _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(selected), report: report,
+                        root: catalog.root, target: target)
+                }
+            }
+            for key in metadata {
+                var selected = StreamFixture.witness(wire, index: 0); selected.removeValue(forKey: key)
+                rejects("missing selected expression evidence \(key)") {
+                    _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(selected), report: report,
+                        root: catalog.root, target: target)
+                }
+            }
+            var wrongRange = wire, wrongRows = wire["hits"] as! [[String: Any]]
+            let rawBytes = AtlasObservedReaderSearchRequest.originalBytes(expressionQuery, encoding: encoding)
+            wrongRows[0]["original_range"] = ObservedReaderFixture.range(StreamFixture.start,
+                StreamFixture.start + UInt64(rawBytes.count)); wrongRange["hits"] = wrongRows
+            rejects("expression-length witness range") { _ = try decode(wrongRange) }
+
+            // A file stopped before its observed end cannot establish required
+            // or absent terms, even if its primary literal has already matched.
+            for state in ["match-limit", "byte-limit", "read-call-limit", "short-read", "failed"] {
+                var unfinished = wire, rows = wire["hits"] as! [[String: Any]]
+                unfinished["search_complete"] = false; unfinished["match_count_complete"] = false
+                unfinished["incomplete_files"] = "1"
+                for index in rows.indices { rows[index]["file_state"] = state; rows[index]["file_complete"] = false }
+                unfinished["hits"] = rows
+                rejects("expression matches from unfinished \(state) input") { _ = try decode(unfinished) }
+            }
+            // Reaching the observed end qualifies predicates over that stream.
+            // Changed/unavailable metadata still keeps overall coverage partial.
+            for consistency in ["changed-during-read", "metadata-unavailable"] {
+                var changedSource = wire, rows = wire["hits"] as! [[String: Any]]
+                changedSource["search_complete"] = false; changedSource["match_count_complete"] = false
+                changedSource["incomplete_files"] = "1"
+                for index in rows.indices {
+                    rows[index]["consistency"] = consistency; rows[index]["file_complete"] = false
+                    rows[index]["final_observed_length"] = consistency == "metadata-unavailable"
+                        ? NSNull() : String(StreamFixture.length + 2) as Any
+                }
+                changedSource["hits"] = rows
+                let observed = try decode(changedSource)
+                precondition(!observed.summary.complete && !observed.hits[0].complete
+                    && observed.hits[0].state == "complete-observed-input")
+            }
+            let full = StreamFixture.counted(wire, matches: 2_000, matchingFiles: 1)
+            let counted = try decode(full)
+            precondition(counted.summary.matchCountComplete && counted.summary.truncated
+                && counted.hits.count == 3 && counted.summary.matchesSeen == 2_000)
+        }
+
+        // Literal and identifier receipts cannot be decorated with expression
+        // evidence, including a null field that would otherwise look absent.
+        for mode in [AtlasWorkspaceStreamMode.text, .occurrences] {
+            let literalRequest = try AtlasWorkspaceStreamRequest(needle: "old", mode: mode)
+            let literal = StreamFixture.report(owner, 1, literalRequest, count: 1)
+            let first = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(literal)),
+                catalog: catalog, root: catalog.root, request: literalRequest)
+            let report = try AtlasWorkspaceStreamReport(summary: first.summary, hits: first.hits)
+            for key in metadata {
+                var mixed = literal; mixed[key] = NSNull()
+                rejects("mixed \(mode.rawValue) expression field \(key)") {
+                    _ = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(mixed)),
+                        catalog: catalog, root: catalog.root, request: literalRequest)
+                }
+                var selected = StreamFixture.witness(literal, index: 0); selected[key] = NSNull()
+                rejects("mixed selected literal expression field \(key)") {
+                    _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(selected), report: report,
+                        root: catalog.root, target: report.target(for: report.hits[0]))
+                }
+            }
+        }
+
+        let lower = try AtlasWorkspaceStreamRequest(needle: "\"k\" required -forbidden", maximumMatches: 3,
+            caseSensitive: false, mode: .expression)
+        for encoding in AtlasObservedReaderEncoding.allCases {
+            let wire = StreamFixture.report(owner, 2, lower, count: 3, encoding: encoding,
+                spellings: ["k", "K", "K"], primaryNeedle: "k")
+            let page = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(wire)),
+                catalog: catalog, root: catalog.root, request: lower)
+            let report = try AtlasWorkspaceStreamReport(summary: page.summary, hits: page.hits)
+            for index in report.hits.indices {
+                let selected = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(StreamFixture.witness(wire, index: index)),
+                    report: report, root: catalog.root, target: report.target(for: report.hits[index]))
+                precondition(selected.text.utf8.elementsEqual(["k", "K", "K"][index].utf8))
+            }
+        }
+        try expressionCoverageAndProgress(owner: owner, request: request)
+
+        for code in ["QUERY_EMPTY", "QUERY_SYNTAX_ERROR", "QUERY_REGEX_UNQUALIFIED", "QUERY_LIMIT_EXCEEDED"] {
+            let refused: [String: Any] = ["schema": "fcb.atlas-stream-search/1", "status": "error",
+                "owner": String(owner), "error": ["code": code]]
+            do {
+                _ = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(refused), catalog: catalog,
+                    root: catalog.root, request: request)
+                preconditionFailure("Expression refusal became an empty result")
+            } catch AtlasWorkspaceStreamError.engine(let received) { precondition(received == code) }
+            precondition(AtlasWorkspaceStreamError.engine(code).message == AtlasSearchError.query(code).message)
+        }
+    }
+
+    static func expressionCoverageAndProgress(owner: UInt64, request: AtlasWorkspaceStreamRequest) throws {
+        var catalogWire = StreamFixture.catalog(owner)
+        catalogWire["catalogued_files"] = "4"; catalogWire["workspace_files"] = "4"
+        let catalog = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(catalogWire), owner: owner)
+        let scoped = try AtlasWorkspaceStreamRequest(needle: expressionQuery, maximumMatches: 3,
+            fileScope: .init(extensions: ["txt"]), mode: .expression)
+        var wire = StreamFixture.report(owner, 3, scoped, count: 3, primaryNeedle: "old")
+        wire["catalogued_files"] = "4"
+        wire.merge(StreamFixture.scope(scoped, catalogued: 4, eligible: 3), uniquingKeysWith: { _, next in next })
+        wire["expression_excluded_files"] = "2"
+        func scopedPage(_ value: [String: Any]) throws -> AtlasWorkspaceStreamPage {
+            try .decode(StreamFixture.json(StreamFixture.page(value)), catalog: catalog, root: catalog.root, request: scoped)
+        }
+        let filtered = try scopedPage(wire)
+        precondition(filtered.summary.complete && filtered.summary.eligibleFiles == 3
+            && filtered.summary.excludedFiles == 1 && filtered.summary.searchedFiles == 1
+            && filtered.summary.expression?.excludedFiles == 2 && filtered.summary.examinedFiles == 1)
+        var wrong = wire; wrong["files_examined"] = "3"
+        rejects("expression filters charged as examined files") { _ = try scopedPage(wrong) }
+        wrong = wire; wrong["files_unexamined"] = "2"
+        rejects("expression-excluded files charged as unexamined") { _ = try scopedPage(wrong) }
+        wrong = wire; wrong["expression_excluded_files"] = "4"
+        rejects("expression exclusions exceed native scope") { _ = try scopedPage(wrong) }
+
+        var empty = StreamFixture.report(owner, 4, scoped, count: 0, primaryNeedle: "old")
+        empty["catalogued_files"] = "4"
+        empty.merge(StreamFixture.scope(scoped, catalogued: 4, eligible: 3), uniquingKeysWith: { _, next in next })
+        empty["expression_scope_files"] = "0"; empty["expression_excluded_files"] = "3"
+        for key in ["files_examined", "payload_bytes_read", "scanned_input_bytes", "read_calls", "peak_input_buffer_bytes"] {
+            empty[key] = "0"
+        }
+        let emptyPage = try scopedPage(empty)
+        precondition(emptyPage.summary.complete && emptyPage.summary.matchCountComplete
+            && emptyPage.summary.searchedFiles == 0 && emptyPage.summary.payloadBytes == 0)
+
+        let progressiveCatalog = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(StreamProgressFixture.catalog(owner)), owner: owner)
+        let beginning = StreamProgressFixture.progress(owner, 5, request, sequence: 1, count: 0,
+            examined: 0, payload: 16_384, primaryNeedle: "old")
+        let first = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(beginning), catalog: progressiveCatalog, request: request)
+        var replacement = beginning; replacement["progress_sequence"] = "2"
+        replacement["needle"] = "new"; replacement["primary_needle"] = "new"
+        rejects("parsed primary changes before any rows exist") {
+            _ = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(replacement),
+                catalog: progressiveCatalog, request: request, previous: first)
+        }
+        replacement = beginning; replacement["progress_sequence"] = "2"
+        replacement["expression_scope_files"] = "1"; replacement["expression_excluded_files"] = "1"
+        replacement["files_unexamined"] = "1"
+        rejects("expression path-filter universe changes during progress") {
+            _ = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(replacement),
+                catalog: progressiveCatalog, request: request, previous: first)
+        }
+        let middle = StreamProgressFixture.progress(owner, 5, request, sequence: 2, count: 3, primaryNeedle: "old")
+        let progress = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(middle),
+            catalog: progressiveCatalog, request: request, previous: first)
+        let stoppedWire = StreamProgressFixture.report(owner, 5, request, stopped: true, count: 3, primaryNeedle: "old")
+        let stopped = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(stoppedWire)),
+            catalog: progressiveCatalog, root: progressiveCatalog.root, request: request, requireTerminal: true)
+        try progress.validateTerminal(stopped)
+        precondition(stopped.summary.stop == "user-stopped" && !stopped.summary.matchCountComplete
+            && stopped.summary.examinedFiles == 1 && stopped.summary.unexaminedFiles == 1)
+
+        let paged = try AtlasWorkspaceStreamRequest(needle: expressionQuery, mode: .expression)
+        let pages = StreamProgressFixture.report(owner, 6, paged, stopped: false, primaryNeedle: "old")
+        let initial = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(pages)),
+            catalog: progressiveCatalog, root: progressiveCatalog.root, request: paged)
+        var last = StreamFixture.page(pages, offset: 32)
+        last["needle"] = "new"; last["primary_needle"] = "new"
+        rejects("parsed primary changes between terminal pages") {
+            _ = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(last), catalog: progressiveCatalog,
+                root: progressiveCatalog.root, request: paged, previous: initial.summary, offset: 32)
+        }
+    }
+
+    @MainActor static func expressionModelTests() async throws {
+        let probe = StreamProbe(expressionPrimary: "old")
+        let model = AtlasWorkspaceStreamModel(transport: probe.progressiveTransport,
+            query: expressionQuery, caseSensitive: false, mode: .expression)
+        precondition(!model.countAllMatches && model.effectiveCountAllMatches)
+        model.open(.init(root: StreamFixture.root, project: UUID(), browserOwner: 1, access: nil))
+        try await wait("expression catalog") { !model.busy && model.catalog != nil }
+        let gate = ObservedReaderGate(); probe.blockProgress(gate); model.search()
+        try await wait("expression primary progress") { gate.entered && model.progress?.summary.retainedHits == 256 }
+        precondition(model.progress?.summary.primaryNeedle == "old"
+            && model.progress?.summary.request.needle == expressionQuery
+            && model.progress?.summary.request.countAllMatches == true && !model.canSelect)
+        model.stopAndKeep(); gate.release()
+        try await wait("stopped expression pages") { !model.busy && model.reportAuthorized }
+        let report = model.report!, target = report.target(for: report.hits[0])
+        precondition(report.hits.count == 256 && report.summary.matchesSeen == 1_000
+            && report.summary.stop == "user-stopped" && !report.summary.matchCountComplete
+            && probe.stopCount == 1 && !probe.stopCanceledWork)
+        model.select(target); try await wait("expression primary witness") { !model.busy && model.witness != nil }
+        precondition(model.witness?.text == "old")
+        let contextProbe = StreamContextProbe(); model.readCurrentContext(transport: contextProbe.transport)
+        let context = model.currentContext!; context.start()
+        try await wait("expression current literal context") { context.model.page != nil && !context.model.busy }
+        precondition(context.model.searchSelection == NSRange(location: 1024, length: 3))
+        model.queryText = expressionQuery + " additional"
+        precondition(context.model.closed && model.currentContext == nil && model.report == nil && model.witness == nil)
+        let hitCalls = probe.hitCount; model.select(target); precondition(probe.hitCount == hitCalls)
+
+        let late = ObservedReaderGate(); probe.blockProgress(late); model.search()
+        try await wait("expression work before mode change") { late.entered && model.progress != nil }
+        model.mode = .text
+        precondition(!model.effectiveCountAllMatches && !model.countAllMatches && !model.busy
+            && model.progress == nil && model.report == nil)
+        late.release(); try await wait("expression revoked worker drains") { probe.activeCount == 0 }
+        await Task.yield(); precondition(model.report == nil && model.progress == nil)
+
+        model.queryText = "old"; model.search()
+        try await wait("restored literal counting preference") { !model.busy && model.reportAuthorized }
+        precondition(model.report?.summary.request.mode == .text && model.report?.summary.request.countAllMatches == false)
+        model.mode = .expression; model.queryText = expressionQuery; model.search()
+        try await wait("complete counted expression") { !model.busy && model.reportAuthorized }
+        precondition(model.report?.summary.matchesSeen == 2_000 && model.report?.summary.matchCountComplete == true
+            && model.report?.summary.retainedHits == 256 && model.report?.summary.expression != nil)
+        precondition(!model.canScanLater && !model.canScanEarlier)
+        let searches = probe.searchCount; model.scanLater(); model.scanEarlier()
+        precondition(probe.searchCount == searches && model.reportAuthorized,
+            "Expression results cannot dispatch to literal later-window scans")
+        model.clear(); try await wait("clear expression evidence") { !model.busy }
+        precondition(model.canSearch && model.report == nil && model.witness == nil)
+        model.close(); try await wait("expression owner retirement") { probe.closedCount == probe.createCount }
     }
 }

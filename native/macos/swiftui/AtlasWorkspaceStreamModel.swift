@@ -273,6 +273,7 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
     deinit { task?.cancel() }
     static func retryRetirements() { AtlasWorkspaceStreamRetirement.shared.retry() }
 
+    var effectiveCountAllMatches: Bool { mode == .expression || countAllMatches }
     var canSearch: Bool {
         !closed && !opening && session != nil && catalog != nil && lastGeneration < UInt64.max
             && (try? currentRequest()) != nil
@@ -281,14 +282,14 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
         guard let authority else { throw AtlasWorkspaceStreamError.unavailable }
         return try .init(needle: queryText, maximumScanBytes: scanBytes,
             fileScope: authority.fileScope, pathScope: authority.pathScope,
-            countAllMatches: countAllMatches, caseSensitive: mode == .occurrences || caseSensitive,
+            countAllMatches: effectiveCountAllMatches, caseSensitive: mode == .occurrences || caseSensitive,
             mode: mode, pageStartAfter: startAfter)
     }
     var canRefresh: Bool { !closed && authority != nil }
     var canStopAndKeep: Bool { !closed && busy && searching && !stopping && stopFlag != nil }
     var canSelect: Bool { !closed && !busy && reportAuthorized && session != nil && report != nil }
-    var canScanLater: Bool { canSelect && report?.summary.nextStartAfter != nil }
-    var canScanEarlier: Bool { canSelect && (report?.summary.request.pageStartAfter ?? 0) > 0 }
+    var canScanLater: Bool { mode != .expression && canSelect && report?.summary.nextStartAfter != nil }
+    var canScanEarlier: Bool { mode != .expression && canSelect && (report?.summary.request.pageStartAfter ?? 0) > 0 }
     var canReadCurrentContext: Bool {
         guard canSelect, let report, let witness else { return false }
         return report.admits(witness.target)

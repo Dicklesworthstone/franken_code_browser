@@ -34,6 +34,13 @@ private typealias WorkspaceStreamProgress = @convention(c) (
     _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ caseSensitive: UInt64, _ countAllMatches: UInt64,
     _ poll: WorkspaceStreamPoll?, _ stop: WorkspaceStreamPoll?, _ progress: WorkspaceStreamProgress?,
     _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_stream_search_scoped_expression_progress") private func workspaceStreamExpressionProgress(
+    _ owner: UInt64, _ expression: UnsafePointer<CChar>?, _ maximumMatches: UInt64,
+    _ maximumBytes: UInt64, _ maximumCalls: UInt64,
+    _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
+    _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ caseSensitive: UInt64,
+    _ poll: WorkspaceStreamPoll?, _ stop: WorkspaceStreamPoll?, _ progress: WorkspaceStreamProgress?,
+    _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_stream_search_scoped_occurrences_progress") private func workspaceStreamOccurrencesProgress(
     _ owner: UInt64, _ needle: UnsafePointer<CChar>?, _ maximumMatches: UInt64,
     _ maximumBytes: UInt64, _ maximumCalls: UInt64,
@@ -73,6 +80,11 @@ extension AtlasWorkspaceStreamTransport {
                                 request.maximumScanBytes, request.maximumReadCalls, extensions, filenames,
                                 kind, path, request.caseSensitive ? 1 : 0, request.countAllMatches ? 1 : 0,
                                 request.mode == .occurrences ? 1 : 0, request.pageStartAfter, poll, nil, nil, context)
+                        }
+                        if request.mode == .expression {
+                            return workspaceStreamExpressionProgress(owner, needle, request.maximumMatches,
+                                request.maximumScanBytes, request.maximumReadCalls, extensions, filenames,
+                                kind, path, request.caseSensitive ? 1 : 0, poll, nil, nil, context)
                         }
                         if request.mode == .occurrences {
                             return workspaceStreamOccurrencesProgress(owner, needle, request.maximumMatches,
@@ -183,6 +195,12 @@ private func workspaceStreamProgressive(_ owner: UInt64, _ request: AtlasWorkspa
                                 request.maximumScanBytes, request.maximumReadCalls, extensions, filenames,
                                 kind, path, request.caseSensitive ? 1 : 0, request.countAllMatches ? 1 : 0,
                                 request.mode == .occurrences ? 1 : 0, request.pageStartAfter,
+                                poll, stopped, receive, Unmanaged.passUnretained(box).toOpaque())
+                        }
+                        if request.mode == .expression {
+                            return workspaceStreamExpressionProgress(owner, needle, request.maximumMatches,
+                                request.maximumScanBytes, request.maximumReadCalls, extensions, filenames,
+                                kind, path, request.caseSensitive ? 1 : 0,
                                 poll, stopped, receive, Unmanaged.passUnretained(box).toOpaque())
                         }
                         if request.mode == .occurrences {

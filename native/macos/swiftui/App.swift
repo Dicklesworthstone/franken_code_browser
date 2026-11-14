@@ -476,7 +476,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         workspaceStreamSearch = AtlasWorkspaceStreamPresentation(source: source,
             query: query, caseSensitive: searchCaseSensitive,
             countAllMatches: searchCountAllMatches,
-            mode: searchMode == .occurrences ? .occurrences : .text, transport: .native)
+            mode: searchMode == .occurrences ? .occurrences : searchMode == .expression ? .expression : .text,
+            transport: .native)
     }
 
     private func closeWorkspaceStreamSearch() {
