@@ -13,6 +13,7 @@ extern "C" {
 #define FCB_READER_MAX_CONTEXT_BYTES UINT64_C(16384)
 #define FCB_READER_MAX_MATCHES UINT64_C(4096)
 #define FCB_READER_MAX_NEEDLE_BYTES UINT64_C(4096)
+#define FCB_READER_MAX_EXPRESSION_BYTES UINT64_C(1024)
 
 /*
  * Retained SINGLE-FILE reader sessions; no runtime or worker is created.
@@ -127,6 +128,27 @@ char *fcb_reader_find_with_options(uint64_t handle, uint64_t generation,
  * the final occurrence yields an empty page when the scan reaches the end. */
 char *fcb_reader_find_page(uint64_t handle, uint64_t generation, const char *needle,
     uint64_t start_after, uint64_t max_matches, uint64_t max_scan_bytes, uint64_t flags);
+/* Expression Find is explicitly selected, never guessed from literal text.
+ * The shared bounded parser accepts phrases, conjunctions and exclusions in
+ * at most MAX_EXPRESSION_BYTES UTF-8 bytes / 64 terms. Regex is unavailable.
+ * Path/lang/type filters fail with READER_SESSION_EXPRESSION_SCOPE_UNSUPPORTED.
+ * Flags and page/generation bounds are identical to find_page (including
+ * max_matches=0 requiring COUNT_ALL). Qualification scans the entire retained
+ * capture within max_scan_bytes even when COUNT_ALL is absent.
+ *
+ * mode/realized_mode are "decoded-text-expression"; requested_mode is
+ * "expression". needle and expression preserve the raw query; primary_needle
+ * names the text whose occurrences are returned. query_syntax is
+ * "fcb-bounded-expression/1"; predicate_scope is "retained-source-capture".
+ * expression_qualified is true only after all predicates succeed, false after
+ * complete rejection, or null when work/decoding prevents a complete answer.
+ * False/null expose zero hits/counts; never treat null as a complete no-match.
+ * Match witnesses, original ranges, paging and copy/hit authority refer only
+ * to the primary term under the accepted capture/query generation.
+ * Failed/canceled requests preserve the previous accepted page. */
+char *fcb_reader_find_expression_page(uint64_t handle, uint64_t generation,
+    const char *expression, uint64_t start_after, uint64_t max_matches,
+    uint64_t max_scan_bytes, uint64_t flags);
 char *fcb_reader_hit(uint64_t handle, uint64_t generation, uint64_t index, uint64_t context_bytes);
 
 /* Exact byte exports as JSON hex; no clipboard or filesystem write. The range

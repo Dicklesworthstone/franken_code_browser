@@ -915,3 +915,45 @@ fallback, exclusive writes, operation/receipt ownership, lost replies,
 short and complete canceled writes, source damage, and every observed
 construction/publication cancellation boundary. This implementation is
 code-first; independent executable verification remains pending.
+
+## Retained-reader expression Find
+
+`ReaderSession::search_expression_page` applies the shared bounded expression
+syntax to one retained immutable source capture. The primary term supplies the
+returned occurrences; additional terms and exclusions determine whether that
+capture qualifies. Quoted phrases, overlapping primary matches, exact decoded
+UTF-8/UTF-16 ranges and Unicode lowercase comparison use the same public search
+engine as workspace expression search.
+
+The arguments are the same as `search_page`: a fresh generation, raw expression,
+occurrence ordinal to skip, retained row limit, original-byte scan allowance,
+`ReaderFindOptions` and cancellation callback. For example, `"ana" permit -blocked`
+selects occurrences of `ana` only when `permit` occurs and `blocked` does not occur
+in that same capture. Raw expressions are at most 1024 UTF-8 bytes and 64 parser
+tokens. Path, language and type filters return
+`READER_SESSION_EXPRESSION_SCOPE_UNSUPPORTED`; a retained reader does not invent
+a workspace metadata scope from its display path. The existing literal APIs
+and the two fields of `ReaderFindOptions` retain their original meaning.
+
+Qualification scans the complete capture within the byte allowance, even when
+`count_all_matches` is false. The response echoes that requested policy and
+reports actual completeness separately. `expression_qualified` is true after
+complete eligibility, false after complete rejection, and null if the byte
+budget or decoding prevents a complete answer. False and null carry no
+tentative hits or match counts. Retained row omission remains independent from
+scan completeness. Zero-row counting requires `count_all_matches`, as for
+literal pages.
+
+Every page replays the retained bytes from zero and counts skipped occurrences
+without retaining them. Selection and exact copying remain attached to the
+accepted generation and immutable capture; parsing/scanning/cancellation failures
+preserve previously accepted hits. The additive C entry point is
+`fcb_reader_find_expression_page` in `fcb_reader_sessions.h`, with the existing
+ignore-case/count-all flag bits. It performs no live-path read.
+
+Authored production-path regressions are in
+`tests/retained_reader_expressions.rs` and the bridge's
+`reader_expression_ffi_tests.rs`. They cover late exclusions, budget exhaustion,
+malformed text, UTF-16, lowercase expansion witnesses, later occurrence pages,
+stale/canceled requests and independent captured sources. Execution remains
+pending the repository's independent batch verification lane.

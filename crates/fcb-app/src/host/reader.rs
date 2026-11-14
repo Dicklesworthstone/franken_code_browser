@@ -60,6 +60,8 @@ pub const MAX_READER_MATCHES: usize = 4096;
 // can be wider after lowercase comparison (for example, Kelvin sign vs "k").
 // Retained-reader activation searches that original spelling exactly.
 pub const MAX_READER_NEEDLE_BYTES: usize = 4096;
+/// Raw shared expression syntax has a separate, smaller UTF-8 admission limit.
+pub const MAX_READER_EXPRESSION_BYTES: usize = fcb::search::MAX_QUERY_LEN;
 pub const MAX_READER_CONTEXT_BYTES: usize = 16 * 1024;
 const LINE_SCAN_STEP: usize = 64 * 1024;
 const LINE_CHECKPOINTS: usize = MAX_READER_SOURCE_BYTES / LINE_SCAN_STEP + 1;
@@ -76,7 +78,7 @@ pub enum ReaderSessionError {
     DocumentImage(DocumentImageError),
     DocumentLinks(fcb::document::links::DocumentLinkError), MissingDocumentLinks, MissingDocumentLink,
     Comparison(fcb::analysis::comparison::ComparisonError),
-    Query(fcb::search::QueryError),
+    Query(fcb::search::QueryError), ExpressionScopeUnsupported,
 }
 impl std::fmt::Display for ReaderSessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -91,6 +93,7 @@ impl std::fmt::Display for ReaderSessionError {
             Self::DocumentLinks(e) => write!(f, "{e}"),
             Self::Comparison(e) => write!(f, "{e}"),
             Self::Query(e) => write!(f, "{e}"),
+            Self::ExpressionScopeUnsupported => f.write_str("READER_SESSION_EXPRESSION_SCOPE_UNSUPPORTED"),
             Self::MissingDocument => f.write_str("READER_SESSION_NO_DOCUMENT"),
             Self::MissingDocumentLinks => f.write_str("READER_SESSION_NO_DOCUMENT_LINKS"),
             Self::MissingDocumentLink => f.write_str("READER_SESSION_MISSING_DOCUMENT_LINK"),

@@ -5,6 +5,29 @@
 //! keep their original occurrence identities. Skipped rows are never retained.
 
 use super::*;
+use fcb::search::{ParsedQuery, QueryError, MAX_QUERY_LEN, MAX_QUERY_TOKENS};
+
+/// The raw query and AST live under a reservation until both scanning and wire
+/// encoding finish. Accepted hits need only ranges: the retained capture never
+/// changes, and selecting one does not re-evaluate a live file or query.
+struct RetainedExpression { parsed: ParsedQuery, _lease: ResourceLease }
+impl RetainedExpression {
+    fn admit(raw: &str, owner: ArenaOwnerId, budget: &ResourceBudget,
+        id: ResourceAllocationId) -> Result<Self, ReaderSessionError> {
+        if raw.len() > MAX_QUERY_LEN { return Err(QueryError::NeedleTooLong.into()); }
+        let charge = size_of::<Self>() + MAX_QUERY_LEN * 32
+            + MAX_QUERY_TOKENS * 8 * size_of::<String>();
+        let lease = budget.try_reserve_managed(owner, id, ByteLength::new(charge as u64))
+            .map_err(|_| AppError::Admission)?;
+        let parsed = ParsedQuery::parse(raw)?;
+        // These predicates require a workspace metadata scope. A reader has
+        // exactly one immutable capture, with no admitted catalog query.
+        if !parsed.path_filters.is_empty() || !parsed.lang_filters.is_empty() {
+            return Err(ReaderSessionError::ExpressionScopeUnsupported);
+        }
+        Ok(Self { parsed, _lease: lease })
+    }
+}
 
 impl ReaderSession {
     /// Return a bounded page after the first start_after occurrences. This is
@@ -18,11 +41,38 @@ impl ReaderSession {
     /// has_more_matches distinguish omitted earlier rows from later matches.
     pub fn search_page(&mut self, generation: u64, needle: &str, start_after: u64,
         max_matches: usize, max_scan_bytes: u64, options: ReaderFindOptions,
-        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
+        self.search_page_inner(generation, needle, start_after, max_matches,
+            max_scan_bytes, options, false, canceled)
+    }
+
+    /// Find the primary term of a bounded expression only when every required
+    /// term and exclusion is qualified against this entire immutable capture.
+    /// Uses the shared expression parser and streaming search engine, including
+    /// phrases, overlapping occurrences, lowercase comparison and byte maps.
+    ///
+    /// Raw queries are at most MAX_READER_EXPRESSION_BYTES (1024 UTF-8 bytes).
+    /// Path/language/type filters are refused, not inferred from a display path.
+    /// Qualification scans the whole capture within max_scan_bytes even without
+    /// count_all_matches. An incomplete scan exposes no tentative hits/counts.
+    /// Pages replay from byte zero; hit selection/copy uses this exact capture.
+    /// Zero retained rows still require count_all_matches, as for literal pages.
+    pub fn search_expression_page(&mut self, generation: u64, expression: &str,
+        start_after: u64, max_matches: usize, max_scan_bytes: u64,
+        options: ReaderFindOptions, canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, ReaderSessionError> {
+        self.search_page_inner(generation, expression, start_after, max_matches,
+            max_scan_bytes, options, true, canceled)
+    }
+
+    fn search_page_inner(&mut self, generation: u64, needle: &str, start_after: u64,
+        max_matches: usize, max_scan_bytes: u64, options: ReaderFindOptions,
+        is_expression: bool, mut canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, ReaderSessionError> {
         if generation == 0 || generation <= self.last_query_attempt {
             return Err(ReaderSessionError::StaleQuery);
         }
-        if needle.is_empty() || needle.len() > MAX_READER_NEEDLE_BYTES
+        if (!is_expression && (needle.is_empty() || needle.len() > MAX_READER_NEEDLE_BYTES))
             || max_matches > MAX_READER_MATCHES || start_after > self.length()
             || (max_matches == 0 && !options.count_all_matches) {
             return Err(ReaderSessionError::InvalidLimits);
@@ -31,8 +81,17 @@ impl ReaderSession {
         check(&mut canceled)?;
 
         let [pattern_id, worker_id, result_id] = self.allocations()?;
-        let pattern = StreamingNeedle::text_matching(self.owner(), needle,
-            options.case_sensitive, &self.budget, pattern_id)?;
+        let expression = if is_expression {
+            let [query_id] = self.allocations()?;
+            Some(RetainedExpression::admit(needle, self.owner(), &self.budget, query_id)?)
+        } else { None };
+        let pattern = if let Some(expression) = &expression {
+            StreamingNeedle::expression(self.owner(), &expression.parsed,
+                options.case_sensitive, &self.budget, pattern_id)?
+        } else {
+            StreamingNeedle::text_matching(self.owner(), needle,
+                options.case_sensitive, &self.budget, pattern_id)?
+        };
         // Bound wire escaping and hex independently of the scanner's retained
         // storage. A long query can reduce page size without losing occurrences.
         let witness_capacity = pattern.max_witness_bytes();
@@ -68,8 +127,19 @@ impl ReaderSession {
         let mut out = self.output("find")?;
         out.literal(",\"query_generation\":")?; out.integer(generation)?;
         out.literal(",\"mode\":")?;
-        out.quoted(if options.case_sensitive { "exact-decoded-literal" } else { "unicode-lowercase-literal" })?;
+        out.quoted(if is_expression { "decoded-text-expression" }
+            else if options.case_sensitive { "exact-decoded-literal" }
+            else { "unicode-lowercase-literal" })?;
         out.literal(",\"needle\":")?; out.quoted(needle)?;
+        if let Some(expression) = &expression {
+            out.literal(",\"requested_mode\":\"expression\",\"realized_mode\":\"decoded-text-expression\"")?;
+            out.literal(",\"expression\":")?; out.quoted(&expression.parsed.raw_query)?;
+            out.literal(",\"primary_needle\":")?; out.quoted(&expression.parsed.primary_needle)?;
+            out.literal(",\"query_syntax\":\"fcb-bounded-expression/1\",\"predicate_scope\":\"retained-source-capture\"")?;
+            out.literal(",\"expression_qualified\":")?;
+            if let Some(qualified) = report.expression_qualified() { out.boolean(qualified)?; }
+            else { out.literal("null")?; }
+        }
         out.literal(",\"case_sensitive\":")?; out.boolean(options.case_sensitive)?;
         out.literal(",\"count_all_matches\":")?; out.boolean(options.count_all_matches)?;
         out.literal(",\"retained_limit\":")?; out.integer(retained_limit as u64)?;
