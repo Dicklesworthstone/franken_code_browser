@@ -182,6 +182,7 @@ pub struct ExpressionQuery<'archive, 'plan, R: Read + Seek> {
     seen: u64,
     matching_files: usize,
     count_all_matches: bool,
+    skip_matches: u64,
     state: ExpressionState,
     stats: ExpressionStats,
     _lease: ResourceLease,
@@ -192,6 +193,14 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
     pub fn new(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
         options: ExpressionOptions, budget: &ResourceBudget, allocations: [ResourceAllocationId; 3])
         -> Result<Self, ExpressionError> {
+        Self::new_page(archive, plan, options, 0, false, budget, allocations)
+    }
+    /// Reevaluate the same saved-member predicates and skip only their qualified
+    /// primary occurrences. Predicate work and skipped matches spend the same
+    /// aggregate scan budget; no source bytes or candidate table are retained.
+    pub fn new_page(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
+        options: ExpressionOptions, skip_matches: u64, count_all_matches: bool,
+        budget: &ResourceBudget, allocations: [ResourceAllocationId; 3]) -> Result<Self, ExpressionError> {
         let owner = archive.directory().owner();
         if plan.owner != owner || options.generation.owner() != owner || options.first_file.owner() != owner
             || options.first_revision.owner() != owner { return Err(PagedSearchError::OwnerMismatch.into()); }
@@ -210,7 +219,7 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
         let mut hits = Vec::new(); hits.try_reserve_exact(options.max_matches).map_err(|_| ExpressionError::ResourceDenied)?;
         if hits.capacity() > options.max_matches { return Err(ExpressionError::ResourceDenied); }
         Ok(Self { archive, plan, index: None, options, allocations, scope_at: 0, next: 0, term: 0,
-            active: None, hits, seen: 0, matching_files: 0, count_all_matches: false,
+            active: None, hits, seen: 0, matching_files: 0, count_all_matches, skip_matches,
             state: ExpressionState::Pending, stats: ExpressionStats::default(), _lease: lease })
     }
     /// Evaluate the same whole-member predicates, then count every primary
@@ -237,6 +246,13 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
         allocations: [ResourceAllocationId; 3]) -> Result<Self, ExpressionError> {
         let mut query = Self::new_indexed(archive, plan, index, options, budget, allocations)?;
         query.count_all_matches = true; Ok(query)
+    }
+    pub fn new_indexed_page(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
+        index: &'plan SnapshotIndex, options: ExpressionOptions, skip_matches: u64,
+        count_all_matches: bool, budget: &ResourceBudget, allocations: [ResourceAllocationId; 3])
+        -> Result<Self, ExpressionError> {
+        let mut query = Self::new_indexed(archive, plan, index, options, budget, allocations)?;
+        query.skip_matches = skip_matches; query.count_all_matches = count_all_matches; Ok(query)
     }
     pub const fn state(&self) -> ExpressionState { self.state }
     pub const fn stats(&self) -> ExpressionStats { self.stats }
@@ -350,9 +366,10 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
         options.max_matches = if self.term == self.plan.primary() { self.options.max_matches - self.hits.len() } else { 1 };
         options.max_bytes = length.min(self.options.max_scan_bytes.saturating_sub(self.stats.scanned_bytes));
         options.max_read_calls = fcb_store::paged_snapshot::MAX_SNAPSHOT_READ_CALLS;
-        let scan = if self.count_all_matches && self.term == self.plan.primary() {
-            ReaderSearch::new_counting(Cursor::new(verified), request, ByteLength::new(length),
-                &self.plan.patterns[self.term], options, budget, self.allocations[2])?
+        let scan = if self.term == self.plan.primary() {
+            ReaderSearch::new_page(Cursor::new(verified), request, ByteLength::new(length),
+                &self.plan.patterns[self.term], options, self.skip_matches.saturating_sub(self.seen),
+                self.count_all_matches, budget, self.allocations[2])?
         } else {
             ReaderSearch::new(Cursor::new(verified), request, ByteLength::new(length),
                 &self.plan.patterns[self.term], options, budget, self.allocations[2])?
@@ -370,6 +387,7 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
             discovery_complete: self.archive.directory().discovery_complete(), state: self.state,
             hits: self.hits, seen: self.seen, matching_files: self.matching_files,
             case_sensitive: self.plan.case_sensitive, count_all_matches: self.count_all_matches,
+            skip_matches: self.skip_matches,
             stats: self.stats, _lease: self._lease })
     }
 }
@@ -377,11 +395,19 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
 pub struct ExpressionReport {
     archive: Sha256Digest, generation: QueryGeneration, discovery_complete: bool,
     state: ExpressionState, hits: Vec<ExpressionHit>, seen: u64, matching_files: usize,
-    case_sensitive: bool, count_all_matches: bool, stats: ExpressionStats, _lease: ResourceLease,
+    case_sensitive: bool, count_all_matches: bool, skip_matches: u64, stats: ExpressionStats, _lease: ResourceLease,
 }
 impl ExpressionReport {
     pub fn hits(&self) -> &[ExpressionHit] { &self.hits }
     pub const fn matches_seen(&self) -> u64 { self.seen }
+    pub const fn skip_matches(&self) -> u64 { self.skip_matches }
+    pub fn skipped_matches(&self) -> u64 { self.skip_matches.min(self.seen) }
+    pub fn has_more_matches(&self) -> bool {
+        self.seen.saturating_sub(self.skipped_matches()) > self.hits.len() as u64
+    }
+    pub fn next_match_offset(&self) -> Option<u64> {
+        self.has_more_matches().then(|| self.skipped_matches() + self.hits.len() as u64)
+    }
     pub const fn case_sensitive(&self) -> bool { self.case_sensitive }
     pub const fn realized_mode(&self) -> &'static str { realized_mode(self.case_sensitive) }
     pub const fn count_all_matches(&self) -> bool { self.count_all_matches }

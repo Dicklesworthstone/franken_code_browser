@@ -89,6 +89,18 @@ impl<'source> CapturedReferences<'source> {
     pub fn build(source: &'source [u8], request: CaptureRequest, generation: QueryGeneration,
         name: &str, encoding: Option<DetectedEncoding>, max_items: usize,
         budget: &ResourceBudget, allocation: ResourceAllocationId,
+        canceled: impl FnMut() -> bool) -> Result<Self, ReferenceError> {
+        Self::build_page(source, request, generation, name, encoding, max_items, 0, budget, allocation, canceled)
+    }
+
+    /// Decode and validate the SAME complete capture, then skip qualified token
+    /// occurrences without retaining them. The cap and cancellation quantum are
+    /// unchanged. Candidate IDs remain local to this result window; the count
+    /// includes skipped occurrences and at most one later lookahead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_page(source: &'source [u8], request: CaptureRequest, generation: QueryGeneration,
+        name: &str, encoding: Option<DetectedEncoding>, max_items: usize, skip_matches: u64,
+        budget: &ResourceBudget, allocation: ResourceAllocationId,
         mut canceled: impl FnMut() -> bool) -> Result<Self, ReferenceError> {
         if generation.owner() != request.file().owner() { return Err(ReferenceError::OwnerMismatch); }
         if request.range().is_some() { return Err(ReferenceError::InvalidEvidence); }
@@ -138,13 +150,15 @@ impl<'source> CapturedReferences<'source> {
             if !cursor.in_token() { start = offset; token_line = line; }
             if cursor.push(scalar) {
                 counted += 1;
-                if candidates.len() == max_items { limited = true; break; }
-                let decoded_range = DecodedUtf8Range::new(DecodedUtf8Offset::new(start as u64),
-                    DecodedUtf8Offset::new(offset as u64)).map_err(|_| ReferenceError::InvalidEvidence)?;
-                let original_range = map.decoded_utf8_range_to_byte_range(decoded_range)
-                    .map_err(|_| ReferenceError::InvalidEvidence)?;
-                candidates.push(ReferenceCandidate { id: candidates.len() as u64 + 1,
-                    original_range, decoded_range, line: token_line });
+                if counted as u64 > skip_matches {
+                    if candidates.len() == max_items { limited = true; break; }
+                    let decoded_range = DecodedUtf8Range::new(DecodedUtf8Offset::new(start as u64),
+                        DecodedUtf8Offset::new(offset as u64)).map_err(|_| ReferenceError::InvalidEvidence)?;
+                    let original_range = map.decoded_utf8_range_to_byte_range(decoded_range)
+                        .map_err(|_| ReferenceError::InvalidEvidence)?;
+                    candidates.push(ReferenceCandidate { id: candidates.len() as u64 + 1,
+                        original_range, decoded_range, line: token_line });
+                }
             }
             if scalar == '\n' { line += 1; }
         }
@@ -235,6 +249,21 @@ mod tests {
         assert_eq!(limited.candidates().len(), 2);
         assert_eq!(limited.total_matches_counted(), 3);
     }
+    #[test]
+    fn later_window_preserves_original_ranges_lines_and_collection_local_ids() {
+        let bytes = b"foo\nfoo\nfoo";
+        let budget = ResourceBudget::new(owner(), ByteLength::new(256 * 1024 * 1024)).unwrap();
+        let refs = CapturedReferences::build_page(bytes, CaptureRequest::new(file(), revision()).unwrap(),
+            generation(), "foo", None, 1, 2, &budget, ResourceAllocationId::new(1).unwrap(), || false).unwrap();
+        assert!(refs.is_complete());
+        assert_eq!(refs.total_matches_counted(), 3);
+        assert_eq!(refs.candidates().len(), 1);
+        assert_eq!(refs.candidates()[0].id(), 1);
+        assert_eq!(refs.candidates()[0].line(), 3);
+        assert_eq!(refs.candidates()[0].original_range().start().get(), 8);
+        assert_eq!(refs.source_bytes(1).unwrap(), b"foo");
+    }
+
     #[test]
     fn zero_cap_counts_lookahead_without_allocating_a_result() {
         let hit = build(b"foo", "foo", 0);

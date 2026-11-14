@@ -136,6 +136,7 @@ pub struct PagedQuery<'archive, 'needle, R: Read + Seek> {
     matches_seen: u64,
     matching_files: usize,
     count_all_matches: bool,
+    skip_matches: u64,
     state: PagedQueryState,
     stats: PagedQueryStats,
     _lease: ResourceLease,
@@ -146,6 +147,17 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
     /// be distinct and must not collide with the retained archive/needle leases.
     pub fn new(archive: &'archive mut PagedSnapshot<R>, needle: &'needle StreamingNeedle,
         options: PagedQueryOptions, budget: &ResourceBudget, allocations: [ResourceAllocationId; 3])
+        -> Result<Self, PagedSearchError> {
+        Self::new_page(archive, needle, options, 0, false, budget, allocations)
+    }
+    /// Reverify the fixed archive, skipping qualified occurrences before retaining
+    /// a bounded result window. Skipped occurrences consume the same scan work
+    /// and contribute to counts; unavailable/unsupported members do not consume
+    /// the offset. Use a fresh query generation for each accepted window.
+    /// The legacy noncounting zero-cap no-scan policy is preserved.
+    pub fn new_page(archive: &'archive mut PagedSnapshot<R>, needle: &'needle StreamingNeedle,
+        options: PagedQueryOptions, skip_matches: u64, count_all_matches: bool,
+        budget: &ResourceBudget, allocations: [ResourceAllocationId; 3])
         -> Result<Self, PagedSearchError> {
         let owner = archive.directory().owner();
         if options.generation.owner() != owner || options.first_file.owner() != owner || options.first_revision.owner() != owner {
@@ -165,7 +177,7 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
         let mut hits = Vec::new(); hits.try_reserve_exact(options.max_matches).map_err(|_| PagedSearchError::ResourceDenied)?;
         if hits.capacity() > options.max_matches { return Err(PagedSearchError::ResourceDenied); }
         Ok(Self { archive, needle, index: None, postings: None, paged_postings: None, options, allocations, next: 0,
-            active: None, hits, matches_seen: 0, matching_files: 0, count_all_matches: false,
+            active: None, hits, matches_seen: 0, matching_files: 0, count_all_matches, skip_matches,
             state: PagedQueryState::Pending, stats: PagedQueryStats::default(), _lease: lease })
     }
     /// Count every occurrence in the fixed archive while retaining at most
@@ -241,6 +253,31 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
         allocations: [ResourceAllocationId; 3]) -> Result<Self, PagedSearchError> {
         let mut query = Self::new_paged(archive, needle, index, options, budget, allocations)?;
         query.count_all_matches = true; Ok(query)
+    }
+    /// In-memory per-member index variant of the same bounded result window.
+    pub fn new_indexed_page(archive: &'archive mut PagedSnapshot<R>, needle: &'needle IndexedNeedle<'_>,
+        index: &'needle SnapshotIndex, options: PagedQueryOptions, skip_matches: u64,
+        count_all_matches: bool, budget: &ResourceBudget, allocations: [ResourceAllocationId; 3])
+        -> Result<Self, PagedSearchError> {
+        let mut query = Self::new_indexed(archive, needle, index, options, budget, allocations)?;
+        query.skip_matches = skip_matches; query.count_all_matches = count_all_matches; Ok(query)
+    }
+    /// Global postings retain the original member order; only verified matches
+    /// consume the result offset, never posting candidates or negative proofs.
+    pub fn new_postings_page(archive: &'archive mut PagedSnapshot<R>, needle: &'needle IndexedNeedle<'_>,
+        index: &'needle SnapshotPostings, options: PagedQueryOptions, skip_matches: u64,
+        count_all_matches: bool, budget: &ResourceBudget, allocations: [ResourceAllocationId; 3])
+        -> Result<Self, PagedSearchError> {
+        let mut query = Self::new_postings(archive, needle, index, options, budget, allocations)?;
+        query.skip_matches = skip_matches; query.count_all_matches = count_all_matches; Ok(query)
+    }
+    /// Demand-paged postings use the same match-offset and coverage semantics.
+    pub fn new_paged_page<I: Read + Seek>(archive: &'archive mut PagedSnapshot<R>,
+        needle: &'needle IndexedNeedle<'_>, index: &'needle mut PagedPostings<I>,
+        options: PagedQueryOptions, skip_matches: u64, count_all_matches: bool,
+        budget: &ResourceBudget, allocations: [ResourceAllocationId; 3]) -> Result<Self, PagedSearchError> {
+        let mut query = Self::new_paged(archive, needle, index, options, budget, allocations)?;
+        query.skip_matches = skip_matches; query.count_all_matches = count_all_matches; Ok(query)
     }
     pub const fn state(&self) -> PagedQueryState { self.state }
     pub const fn generation(&self) -> QueryGeneration { self.options.generation }
@@ -332,13 +369,10 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
                 else { remaining.max(1) };
             options.max_bytes = length as u64;
             options.max_read_calls = fcb_store::paged_snapshot::MAX_SNAPSHOT_READ_CALLS;
-            self.active = Some(if self.count_all_matches {
-                ReaderSearch::new_counting(Cursor::new(verified), request, ByteLength::new(length as u64),
-                    self.needle, options, budget, self.allocations[2])?
-            } else {
-                ReaderSearch::new(Cursor::new(verified), request, ByteLength::new(length as u64),
-                    self.needle, options, budget, self.allocations[2])?
-            });
+            let file_skip = self.skip_matches.saturating_sub(self.matches_seen);
+            self.active = Some(ReaderSearch::new_page(Cursor::new(verified), request,
+                ByteLength::new(length as u64), self.needle, options, file_skip,
+                self.count_all_matches, budget, self.allocations[2])?);
         }
         let query = self.active.as_mut().ok_or(PagedSearchError::Pending)?;
         let before = query.stats().scanned_bytes;
@@ -357,15 +391,16 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
                 self.stats.files_searched += 1;
                 let remaining = self.options.max_matches.saturating_sub(self.hits.len());
                 if report.matches_seen() > 0 { self.matching_files += 1; }
+                let file_skip = self.skip_matches.saturating_sub(self.matches_seen);
                 self.matches_seen += if self.count_all_matches { report.matches_seen() }
-                    else { report.matches_seen().min(remaining as u64 + 1) };
+                    else { report.matches_seen().min(file_skip.saturating_add(remaining as u64).saturating_add(1)) };
                 for hit in report.hits().iter().take(remaining) {
                     self.hits.push(PagedHit { ordinal: verified.ordinal(), file: report.request().file(),
                         revision: report.request().revision(), generation: self.options.generation,
                         range: hit.original_range(), archive: verified.archive_digest(), source: verified.source_digest() });
                 }
                 if !self.count_all_matches && (report.state() == StreamReadState::Truncated
-                    || report.matches_seen() > remaining as u64) {
+                    || report.matches_seen().saturating_sub(file_skip) > remaining as u64) {
                     self.state = PagedQueryState::Truncated;
                 }
             }
@@ -395,7 +430,8 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
             unavailable: directory.len() - directory.captured_files(),
             truncated: self.state == PagedQueryState::Truncated || self.matches_seen > self.hits.len() as u64,
             input_complete: self.state == PagedQueryState::Complete, count_all_matches: self.count_all_matches,
-            max_matches: self.options.max_matches, matching_files: self.matching_files, hits: self.hits,
+            max_matches: self.options.max_matches, skip_matches: self.skip_matches,
+            matching_files: self.matching_files, hits: self.hits,
             matches_seen: self.matches_seen, stats: self.stats, _lease: self._lease })
     }
 }
@@ -403,12 +439,22 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
 pub struct PagedReport {
     archive: Sha256Digest, generation: QueryGeneration, discovery_complete: bool,
     unavailable: usize, truncated: bool, input_complete: bool, count_all_matches: bool,
-    max_matches: usize, matching_files: usize, hits: Vec<PagedHit>, matches_seen: u64,
+    max_matches: usize, skip_matches: u64, matching_files: usize, hits: Vec<PagedHit>, matches_seen: u64,
     stats: PagedQueryStats, _lease: ResourceLease,
 }
 impl PagedReport {
     pub fn hits(&self) -> &[PagedHit] { &self.hits }
     pub const fn matches_seen(&self) -> u64 { self.matches_seen }
+    /// Requested offset and actually observed preceding matches are distinct
+    /// when a window begins beyond the available or fully verified input.
+    pub const fn skip_matches(&self) -> u64 { self.skip_matches }
+    pub fn skipped_matches(&self) -> u64 { self.skip_matches.min(self.matches_seen) }
+    pub fn has_more_matches(&self) -> bool {
+        self.matches_seen.saturating_sub(self.skipped_matches()) > self.hits.len() as u64
+    }
+    pub fn next_match_offset(&self) -> Option<u64> {
+        self.has_more_matches().then(|| self.skipped_matches() + self.hits.len() as u64)
+    }
     pub const fn unavailable_files(&self) -> usize { self.unavailable }
     pub const fn truncated(&self) -> bool { self.truncated }
     pub const fn count_all_matches(&self) -> bool { self.count_all_matches }

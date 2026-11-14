@@ -177,6 +177,7 @@ pub struct StructureQuery<'archive, R: Read + Seek> {
     allocations: [ResourceAllocationId; 5],
     hits: Vec<StructureHit>,
     seen: u64,
+    skip_matches: u64,
     next: usize,
     metadata_limit: usize,
     state: StructureState,
@@ -189,6 +190,14 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
     /// also keep them disjoint from the archive's retained directory lease.
     pub fn new(archive: &'archive mut PagedSnapshot<R>, needle: &str, options: StructureOptions,
         budget: &ResourceBudget, allocations: [ResourceAllocationId; 5]) -> Result<Self, StructureError> {
+        Self::new_page(archive, needle, options, 0, budget, allocations)
+    }
+    /// Skip qualified extracted matches, then retain the next bounded window.
+    /// Source/extractor budgets remain unchanged; a fresh generation identifies
+    /// the new accepted result table over the same verified archive members.
+    pub fn new_page(archive: &'archive mut PagedSnapshot<R>, needle: &str, options: StructureOptions,
+        skip_matches: u64, budget: &ResourceBudget, allocations: [ResourceAllocationId; 5])
+        -> Result<Self, StructureError> {
         let owner = archive.directory().owner();
         if options.generation.owner() != owner || options.first_file.owner() != owner
             || options.first_revision.owner() != owner { return Err(PagedSearchError::OwnerMismatch.into()); }
@@ -216,7 +225,7 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
         let mut hits = Vec::new();
         hits.try_reserve_exact(options.max_matches).map_err(|_| StructureError::ResourceDenied)?;
         if hits.capacity() > options.max_matches { return Err(StructureError::ResourceDenied); }
-        Ok(Self { archive, options, needle: copy_text(needle)?, allocations, hits, seen: 0, next: 0,
+        Ok(Self { archive, options, needle: copy_text(needle)?, allocations, hits, seen: 0, skip_matches, next: 0,
             metadata_limit, state: StructureState::Pending, stats: StructureStats::default(), _lease: lease })
     }
     pub const fn state(&self) -> StructureState { self.state }
@@ -296,8 +305,9 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
             }
             StructureMode::Occurrences => {
                 let remaining = self.options.max_matches - self.hits.len();
-                let references = match CapturedReferences::build(source.bytes(), request, self.options.generation,
-                    &self.needle, None, remaining, budget, self.allocations[3], &mut *canceled) {
+                let file_skip = self.skip_matches.saturating_sub(self.seen);
+                let references = match CapturedReferences::build_page(source.bytes(), request, self.options.generation,
+                    &self.needle, None, remaining, file_skip, budget, self.allocations[3], &mut *canceled) {
                     Ok(references) => references,
                     Err(ReferenceError::Canceled) => return Err(StructureError::Canceled),
                     Err(ReferenceError::ResourceDenied) => return Err(StructureError::ResourceDenied),
@@ -305,6 +315,8 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
                     Err(_) => { self.stats.unsupported_files += 1; return Ok(()); }
                 };
                 self.stats.files_searched += 1;
+                let skipped = file_skip.min(references.total_matches_counted() as u64);
+                self.seen = self.seen.checked_add(skipped).ok_or(StructureError::IdentityExhausted)?;
                 for occurrence in references.candidates() {
                     check(canceled)?;
                     let range = occurrence.original_range();
@@ -382,6 +394,7 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
             return Err(StructureError::InvalidHit);
         }
         self.seen = self.seen.checked_add(1).ok_or(StructureError::IdentityExhausted)?;
+        if self.seen <= self.skip_matches { return Ok(true); }
         if self.hits.len() == self.options.max_matches { self.state = StructureState::Truncated; return Ok(false); }
         let bytes = name.len().checked_add(slug.map_or(0, str::len)).ok_or(StructureError::ResourceDenied)?;
         if name.is_empty() || name.len() > MAX_STRUCTURE_NAME_BYTES
@@ -405,7 +418,7 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
             StructureState::Failed(error) => Err(error),
             _ => Ok(StructureReport { archive: self.archive.directory().digest(),
                 discovery_complete: self.archive.directory().discovery_complete(), options: self.options,
-                needle: self.needle, hits: self.hits, seen: self.seen, state: self.state,
+                needle: self.needle, hits: self.hits, seen: self.seen, skip_matches: self.skip_matches, state: self.state,
                 stats: self.stats, _lease: self._lease }),
         }
     }
@@ -422,6 +435,7 @@ pub struct StructureReport {
     needle: String,
     hits: Vec<StructureHit>,
     seen: u64,
+    skip_matches: u64,
     state: StructureState,
     stats: StructureStats,
     _lease: ResourceLease,
@@ -429,6 +443,14 @@ pub struct StructureReport {
 impl StructureReport {
     pub fn hits(&self) -> &[StructureHit] { &self.hits }
     pub const fn matches_seen(&self) -> u64 { self.seen }
+    pub const fn skip_matches(&self) -> u64 { self.skip_matches }
+    pub fn skipped_matches(&self) -> u64 { self.skip_matches.min(self.seen) }
+    pub fn has_more_matches(&self) -> bool { self.state == StructureState::Truncated }
+    /// Omitted post-offset metadata still consumed a qualified match position.
+    /// Advancing only by stored rows would replay earlier retained candidates.
+    pub fn next_match_offset(&self) -> Option<u64> {
+        self.has_more_matches().then(|| self.seen - 1)
+    }
     pub const fn stats(&self) -> StructureStats { self.stats }
     pub const fn mode(&self) -> StructureMode { self.options.mode }
     pub const fn name_mode(&self) -> SymbolNameMode { self.options.name_mode }
