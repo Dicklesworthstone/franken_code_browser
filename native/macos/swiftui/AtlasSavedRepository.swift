@@ -692,6 +692,8 @@ enum AtlasSavedRequest: Sendable {
     case search(generation: UInt64, needle: String, matches: UInt64)
     case countedSearch(generation: UInt64, needle: String, matches: UInt64)
     case matchingSearch(generation: UInt64, needle: String, caseSensitive: Bool, countAllMatches: Bool, matches: UInt64)
+    case searchWindow(generation: UInt64, needle: String, caseSensitive: Bool, countAllMatches: Bool,
+        matches: UInt64, skipMatches: UInt64)
     case results(generation: UInt64, start: UInt64, limit: UInt64)
     case clearResults(generation: UInt64)
     case openHit(reader: UInt64, generation: UInt64, hit: UInt64)
@@ -699,11 +701,15 @@ enum AtlasSavedRequest: Sendable {
     case countedExpressionSearch(generation: UInt64, query: String, matches: UInt64, scanBytes: UInt64)
     case matchingExpressionSearch(generation: UInt64, query: String, caseSensitive: Bool,
         countAllMatches: Bool, matches: UInt64, scanBytes: UInt64)
+    case expressionWindow(generation: UInt64, query: String, caseSensitive: Bool, countAllMatches: Bool,
+        matches: UInt64, scanBytes: UInt64, skipMatches: UInt64)
     case expressionResults(generation: UInt64, start: UInt64, limit: UInt64)
     case clearExpression(generation: UInt64)
     case openExpressionHit(reader: UInt64, generation: UInt64, hit: UInt64)
     case structureSearch(generation: UInt64, mode: AtlasSavedSearchMode, nameMode: AtlasSearchNameMode,
         query: String, matches: UInt64, sourceBytes: UInt64)
+    case structureWindow(generation: UInt64, mode: AtlasSavedSearchMode, nameMode: AtlasSearchNameMode,
+        query: String, matches: UInt64, sourceBytes: UInt64, skipMatches: UInt64)
     case structureResults(generation: UInt64, start: UInt64, limit: UInt64)
     case clearStructure(generation: UInt64)
     case openStructureHit(reader: UInt64, generation: UInt64, hit: UInt64)

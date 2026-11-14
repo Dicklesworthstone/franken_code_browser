@@ -20,7 +20,7 @@ set -- "$@" -swift-version 6 -warnings-as-errors -D FCB_SAVED_SEARCH_TESTS \
     "$src/AtlasSavedRepository.swift" "$src/AtlasSavedRepositoryIndexBuild.swift" "$src/AtlasSavedRepositoryImports.swift" "$src/AtlasSavedRepositoryPaths.swift" "$src/AtlasSavedRepositorySearch.swift" \
     "$src/AtlasSavedRepositoryReader.swift" "$src/AtlasSavedRepositoryModel.swift" \
     "$src/tests/AtlasSavedRepositoryTests.swift"
-swiftc "$@" "$src/tests/AtlasSavedSearchTests.swift" -o "$out/saved-search-tests"
+swiftc "$@" "$src/tests/AtlasSavedSearchTests.swift" "$src/tests/AtlasSavedResultWindowTests.swift" -o "$out/saved-search-tests"
 "$out/saved-search-tests"
 cc -std=c11 -Wall -Wextra -Werror -I"$src/../../../crates/fcb-bridge/include" \
     -c "$src/tests/AtlasSavedIndexBridgeFixtures.c" -o "$out/saved-index-fixture.o"

@@ -13,6 +13,9 @@ import Foundation
 @_silgen_name("fcb_saved_search_counted") private func savedCountedSearch(_ h: UInt64, _ generation: UInt64, _ needle: UnsafePointer<CChar>?, _ matches: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_search_matching") private func savedMatchingSearch(_ h: UInt64, _ generation: UInt64,
     _ needle: UnsafePointer<CChar>?, _ caseSensitive: UInt64, _ countAllMatches: UInt64, _ matches: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_search_page") private func savedSearchWindow(_ h: UInt64, _ generation: UInt64,
+    _ needle: UnsafePointer<CChar>?, _ caseSensitive: UInt64, _ countAllMatches: UInt64,
+    _ matches: UInt64, _ skipMatches: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_results") private func savedResults(_ h: UInt64, _ generation: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_clear_results") private func savedClearResults(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_open_hit_reader") private func savedHitReader(_ h: UInt64, _ reader: UInt64, _ generation: UInt64, _ hit: UInt64) -> UnsafeMutablePointer<CChar>?
@@ -21,11 +24,17 @@ import Foundation
 @_silgen_name("fcb_saved_expression_search_matching") private func savedMatchingExpressionSearch(_ h: UInt64, _ generation: UInt64,
     _ query: UnsafePointer<CChar>?, _ caseSensitive: UInt64, _ countAllMatches: UInt64,
     _ matches: UInt64, _ scanBytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_expression_search_page") private func savedExpressionWindow(_ h: UInt64, _ generation: UInt64,
+    _ query: UnsafePointer<CChar>?, _ caseSensitive: UInt64, _ countAllMatches: UInt64,
+    _ matches: UInt64, _ scanBytes: UInt64, _ skipMatches: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_expression_results") private func savedExpressionResults(_ h: UInt64, _ generation: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_clear_expression") private func savedClearExpression(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_open_expression_hit_reader") private func savedExpressionReader(_ h: UInt64, _ reader: UInt64, _ generation: UInt64, _ hit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_structure_search") private func savedStructureSearch(_ h: UInt64, _ generation: UInt64,
     _ mode: UInt64, _ nameMode: UInt64, _ query: UnsafePointer<CChar>?, _ matches: UInt64, _ sourceBytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_structure_search_page") private func savedStructureWindow(_ h: UInt64, _ generation: UInt64,
+    _ mode: UInt64, _ nameMode: UInt64, _ query: UnsafePointer<CChar>?,
+    _ matches: UInt64, _ sourceBytes: UInt64, _ skipMatches: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_structure_results") private func savedStructureResults(_ h: UInt64, _ generation: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_clear_structure") private func savedClearStructure(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_open_structure_hit_reader") private func savedStructureReader(_ h: UInt64, _ reader: UInt64, _ generation: UInt64, _ hit: UInt64) -> UnsafeMutablePointer<CChar>?
@@ -96,6 +105,11 @@ extension AtlasSavedTransport {
                   matches <= AtlasSavedSearchWire.maximumHits, countAllMatches || matches > 0 else { return nil }
             return needle.withCString { take(savedMatchingSearch(handle, generation, $0,
                 caseSensitive ? 1 : 0, countAllMatches ? 1 : 0, matches)) }
+        case .searchWindow(let generation, let needle, let caseSensitive, let countAllMatches, let matches, let skipped):
+            guard generation > 0, AtlasSavedSearchWire.validNeedle(needle),
+                  matches <= AtlasSavedSearchWire.maximumHits, countAllMatches || matches > 0 else { return nil }
+            return needle.withCString { take(savedSearchWindow(handle, generation, $0,
+                caseSensitive ? 1 : 0, countAllMatches ? 1 : 0, matches, skipped)) }
         case .results(let generation, let start, let limit):
             return take(savedResults(handle, generation, start, limit))
         case .clearResults(let generation): return take(savedClearResults(handle, generation))
@@ -116,6 +130,12 @@ extension AtlasSavedTransport {
                   bytes <= AtlasSavedSearchWire.maximumSourceBytes else { return nil }
             return query.withCString { take(savedMatchingExpressionSearch(handle, generation, $0,
                 caseSensitive ? 1 : 0, countAllMatches ? 1 : 0, matches, bytes)) }
+        case .expressionWindow(let generation, let query, let caseSensitive, let countAllMatches, let matches, let bytes, let skipped):
+            guard generation > 0, AtlasSavedSearchWire.validNeedle(query),
+                  matches <= AtlasSavedSearchWire.maximumHits, countAllMatches || matches > 0,
+                  bytes <= AtlasSavedSearchWire.maximumSourceBytes else { return nil }
+            return query.withCString { take(savedExpressionWindow(handle, generation, $0,
+                caseSensitive ? 1 : 0, countAllMatches ? 1 : 0, matches, bytes, skipped)) }
         case .expressionResults(let generation, let start, let limit):
             return take(savedExpressionResults(handle, generation, start, limit))
         case .clearExpression(let generation): return take(savedClearExpression(handle, generation))
@@ -127,6 +147,13 @@ extension AtlasSavedTransport {
                   (1...AtlasSavedSearchWire.maximumHits).contains(matches),
                   bytes <= AtlasSavedSearchWire.maximumSourceBytes else { return nil }
             return query.withCString { take(savedStructureSearch(handle, generation, structure.code, nameMode.code, $0, matches, bytes)) }
+        case .structureWindow(let generation, let mode, let nameMode, let query, let matches, let bytes, let skipped):
+            guard generation > 0, let structure = mode.structure, AtlasSavedSearchWire.validNeedle(query),
+                  mode != .occurrences || nameMode == .exact,
+                  (1...AtlasSavedSearchWire.maximumHits).contains(matches),
+                  bytes <= AtlasSavedSearchWire.maximumSourceBytes else { return nil }
+            return query.withCString { take(savedStructureWindow(handle, generation, structure.code, nameMode.code,
+                $0, matches, bytes, skipped)) }
         case .structureResults(let generation, let start, let limit):
             return take(savedStructureResults(handle, generation, start, limit))
         case .clearStructure(let generation): return take(savedClearStructure(handle, generation))

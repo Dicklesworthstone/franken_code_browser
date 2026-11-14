@@ -936,6 +936,8 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                     log.append("structure-open:\(handle):\(generation):\(id)")
                     return handoff(handle, reader: reader, ordinal: structureHits(mode, needle: needle)[Int(id - 1)].member,
                         generation: nil, link: nil, side: nil, hitID: id, structure: generation)
+                case .searchWindow, .expressionWindow, .structureWindow:
+                    return nil // Dedicated result-window fixture wraps this shared source owner.
                 case .pathSearch, .pathResults, .clearPaths, .openPathHit:
                     return nil // Dedicated path fixture wraps this shared source owner.
                 case .buildIndex, .indexBuildReceipt:

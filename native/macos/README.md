@@ -391,6 +391,28 @@ The source reader remains independently usable after the archive closes.
 Case/mode, byte-witness, index-bypass, cancellation and native ABI regressions
 are included; executable verification remains pending.
 
+### Saved result windows
+
+Literal, expression, symbol, Markdown heading and identifier-occurrence results
+offer **First matches**, **Earlier matches** and **Later matches**, alongside
+the ordinary **Previous page** and **Next page** controls. Each result window
+retains at most 4,096 hits. Later follows the producer's verified match offset,
+so results beyond the first retained table—including more than 4,096 identifier
+occurrences in one member—remain reachable without increasing that cap.
+
+Earlier repeats the accepted query up to 4,096 qualified positions earlier;
+First returns to offset zero. The displayed skipped count belongs to the current
+window. Each new window uses a fresh query generation and freezes the accepted
+query, matching/count policy and source budget. It revalidates the opened
+archive's captured members and rechecks whole-member expression predicates;
+it never opens a current-project path.
+
+Counts include skipped matches, while complete coverage and evidence of later
+matches remain separate. After cancellation or a failed/lost reply, the browser
+reconciles the host's accepted table without repeating the scan. Already opened
+readers remain usable. Previous/Next page within one retained window still reads
+only metadata.
+
 ## Searching saved repository structure
 
 Open **Saved Repository**, choose an FCBS archive, and use **Search** to select

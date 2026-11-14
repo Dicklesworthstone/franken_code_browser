@@ -170,6 +170,44 @@ extension AtlasReaderTransport {
                 matches: 0, scanBytes: 67_108_864)) == nil)
         }
         precondition(count(20) == 7 && count(6) == 48, "matching expression response ownership leaked or double-freed")
-        print("AtlasSavedIndexBridgeTests: public-header signatures, publication/import/path/matching requests, native bytes, full-width IDs and buffer ownership passed")
+        mode(0)
+        let windows: [AtlasSavedRequest] = [
+            .searchWindow(generation: generation, needle: "e\u{301}", caseSensitive: false,
+                countAllMatches: true, matches: 4096, skipMatches: 9_007_199_254_740_993),
+            .expressionWindow(generation: generation, query: "e\u{301} path:src/", caseSensitive: true,
+                countAllMatches: false, matches: 4096, scanBytes: 67_108_864, skipMatches: UInt64.max),
+            .structureWindow(generation: generation, mode: .occurrences, nameMode: .exact, query: "e\u{301}",
+                matches: 4096, sourceBytes: 67_108_864, skipMatches: 9_007_199_254_740_993)
+        ]
+        for request in windows { precondition(transport.run(owner, request) == "{}") }
+        precondition((21...23).allSatisfy { count(UInt64($0)) == 1 } && count(6) == 51)
+        let invalidWindows: [AtlasSavedRequest] = [
+            .searchWindow(generation: 0, needle: "e\u{301}", caseSensitive: true, countAllMatches: true, matches: 4096, skipMatches: 0),
+            .searchWindow(generation: generation, needle: "", caseSensitive: true, countAllMatches: true, matches: 4096, skipMatches: 0),
+            .searchWindow(generation: generation, needle: "e\u{301}", caseSensitive: true, countAllMatches: false, matches: 0, skipMatches: 0),
+            .searchWindow(generation: generation, needle: "e\u{301}", caseSensitive: true, countAllMatches: true, matches: 4097, skipMatches: 0),
+            .expressionWindow(generation: generation, query: "a\0", caseSensitive: false,
+                countAllMatches: true, matches: 4096, scanBytes: 1, skipMatches: 0),
+            .expressionWindow(generation: generation, query: "a", caseSensitive: false,
+                countAllMatches: true, matches: 4096, scanBytes: 67_108_865, skipMatches: 0),
+            .structureWindow(generation: generation, mode: .literal, nameMode: .exact, query: "a",
+                matches: 4096, sourceBytes: 1, skipMatches: 0),
+            .structureWindow(generation: generation, mode: .occurrences, nameMode: .contains, query: "a",
+                matches: 4096, sourceBytes: 1, skipMatches: 0),
+            .structureWindow(generation: generation, mode: .symbols, nameMode: .exact, query: "a",
+                matches: 0, sourceBytes: 1, skipMatches: 0),
+            .structureWindow(generation: generation, mode: .headings, nameMode: .exact, query: "a",
+                matches: 4096, sourceBytes: 67_108_865, skipMatches: 0)
+        ]
+        for request in invalidWindows { precondition(transport.run(owner, request) == nil) }
+        precondition((21...23).allSatisfy { count(UInt64($0)) == 1 } && count(6) == 51,
+            "invalid saved result window crossed the C boundary")
+        for invalid in [Int32(1), 2, 3, 4] {
+            mode(invalid)
+            for request in windows { precondition(transport.run(owner, request) == nil) }
+        }
+        precondition((21...23).allSatisfy { count(UInt64($0)) == 5 } && count(6) == 60,
+            "saved result-window ownership leaked or double-freed")
+        print("AtlasSavedIndexBridgeTests: public-header signatures, publication/import/path/matching/window requests, native bytes, full-width IDs and offsets, and buffer ownership passed")
     }
 }

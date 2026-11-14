@@ -364,7 +364,7 @@ final class AtlasSavedFileAccess {
                     .help("Turn off to compare Unicode lowercase text. This does not use full case folding or Unicode normalization.")
                 Toggle("Count all matches", isOn: $model.countAllMatches)
                     .toggleStyle(.checkbox).disabled(!model.canOperate)
-                Text("Entire saved archive · up to 4,096 retained matches")
+                Text("Entire saved archive · up to 4,096 matches per window")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("Reload results") { panelNotice = ""; model.reloadSearchResults() }
@@ -397,7 +397,8 @@ final class AtlasSavedFileAccess {
                 if page.hits.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("No retained text matches.").font(.headline)
-                        Text(page.seen > 0 ? "Matches were counted without retaining rows. Search again with a positive retained-match limit to open them."
+                        Text(page.window.offset > 0 ? "This window retained no later matches. Use Earlier or First to return to previous results; partial coverage can leave later matches unknown."
+                            : page.seen > 0 ? "Matches were counted without retaining rows. Search again with a positive retained-match limit to open them."
                             : page.complete ? "The accepted literal has no matches in the complete saved manifest."
                             : "Coverage is partial. An empty result cannot establish that the literal is absent from the repository.")
                             .foregroundStyle(.secondary)
@@ -410,17 +411,21 @@ final class AtlasSavedFileAccess {
                     }.id("saved-query:\(page.identity.owner):\(page.generation)").frame(maxHeight: .infinity)
                 }
                 HStack {
-                    Button("Previous matches") {
+                    Button("Previous page") {
                         model.loadSearchResults(start: page.start >= 64 ? page.start - 64 : 0, from: page)
                     }.disabled(!model.canOperate || !model.searchIsCurrent || page.start == 0)
                     Spacer()
                     Text("\(page.start)..<\(page.start + UInt64(page.hits.count)) of \(page.retained) retained")
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
-                    Button("Next matches") {
+                    Button("Next page") {
                         if let next = page.next { model.loadSearchResults(start: next, from: page) }
                     }.disabled(!model.canOperate || !model.searchIsCurrent || page.next == nil)
                 }.controlSize(.small)
+                resultWindowControls(page.window, retained: page.retained,
+                    enabled: model.canSearch && model.searchIsCurrent && page.counting.maximum > 0) {
+                    model.loadSearchWindow(offset: $0, from: page)
+                }
             } else {
                 VStack(alignment: .leading, spacing: 10) {
                     Text(model.busy ? "Waiting for saved archive work…" : "Find text across your saved repository.")
@@ -543,7 +548,7 @@ final class AtlasSavedFileAccess {
                     .toggleStyle(.checkbox).disabled(!model.canOperate)
                 Toggle("Count all matches", isOn: $model.countAllMatches)
                     .toggleStyle(.checkbox).disabled(!model.canOperate)
-                Text("64 terms and filters maximum · up to 4,096 retained rows · 64 MiB matching-work budget")
+                Text("64 terms and filters maximum · 4,096 rows per window · 64 MiB matching-work budget")
                     .font(.caption2).foregroundStyle(.secondary)
                 Spacer()
                 Button("Reload results") { panelNotice = ""; model.reloadSearchResults() }
@@ -578,7 +583,8 @@ final class AtlasSavedFileAccess {
                 if page.hits.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("No retained expression matches.").font(.headline)
-                        Text(page.seen > 0 ? "Matches were counted without retaining rows. Search again with a positive retained-match limit to open them."
+                        Text(page.window.offset > 0 ? "This window retained no later primary matches. Use Earlier or First to return; partial coverage can leave later matches unknown."
+                            : page.seen > 0 ? "Matches were counted without retaining rows. Search again with a positive retained-match limit to open them."
                             : page.complete ? "The accepted expression has no matches in the complete captured scope."
                             : "Coverage is partial. An empty result does not establish that the expression has no matches.")
                             .foregroundStyle(.secondary)
@@ -590,7 +596,7 @@ final class AtlasSavedFileAccess {
                                 HStack(alignment: .top, spacing: 10) {
                                     VStack(alignment: .leading, spacing: 4) {
                                         Text(hit.path.display).font(.callout.weight(.semibold)).lineLimit(2).textSelection(.enabled)
-                                        Text("Occurrence \(hit.id) · original bytes \(hit.start)..<\(hit.end)")
+                                        Text("Occurrence \(page.window.skipped + hit.id) · original bytes \(hit.start)..<\(hit.end)")
                                             .font(.caption).foregroundStyle(.secondary)
                                     }
                                     Spacer()
@@ -603,17 +609,21 @@ final class AtlasSavedFileAccess {
                     }.id("saved-expression:\(page.identity.owner):\(page.generation)").frame(maxHeight: .infinity)
                 }
                 HStack {
-                    Button("Previous matches") {
+                    Button("Previous page") {
                         model.loadExpressionResults(start: page.start >= 64 ? page.start - 64 : 0, from: page)
                     }.disabled(!model.canOperate || !model.expressionIsCurrent || page.start == 0)
                     Spacer()
                     Text("\(page.start)..<\(page.start + UInt64(page.hits.count)) of \(page.retained) retained")
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
-                    Button("Next matches") {
+                    Button("Next page") {
                         if let next = page.next { model.loadExpressionResults(start: next, from: page) }
                     }.disabled(!model.canOperate || !model.expressionIsCurrent || page.next == nil)
                 }.controlSize(.small)
+                resultWindowControls(page.window, retained: page.retained,
+                    enabled: model.canOperate && model.expressionIsCurrent && page.counting.maximum > 0) {
+                    model.loadExpressionWindow(offset: $0, from: page)
+                }
             } else {
                 VStack(alignment: .leading, spacing: 10) {
                     Text(model.busy ? "Waiting for saved archive work…" : "Combine source terms with member filters.").font(.headline)
@@ -674,7 +684,8 @@ final class AtlasSavedFileAccess {
                 if page.hits.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("No retained \(page.mode.structure?.resultLabel ?? "results").").font(.headline)
-                        Text(page.complete ? "The accepted extractor found no matching results at its stated evidence level."
+                        Text(page.window.offset > 0 ? "No results were retained after this window's skipped prefix. Use Earlier or First; partial extraction can leave later results unknown."
+                            : page.complete ? "The accepted extractor found no matching results at its stated evidence level."
                             : "Coverage is partial. Empty results do not establish that the name is absent from the repository.")
                             .foregroundStyle(.secondary)
                     }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 10)
@@ -701,20 +712,24 @@ final class AtlasSavedFileAccess {
                     }.id("saved-structure:\(page.identity.owner):\(page.generation)").frame(maxHeight: .infinity)
                 }
                 HStack {
-                    Button("Previous results") { model.loadStructureResults(start: page.start >= 64 ? page.start - 64 : 0, from: page) }
+                    Button("Previous page") { model.loadStructureResults(start: page.start >= 64 ? page.start - 64 : 0, from: page) }
                         .disabled(!model.canOperate || !model.structureIsCurrent || page.start == 0)
                     Spacer()
                     Text("\(page.start)..<\(page.start + UInt64(page.hits.count)) of \(page.retained) retained")
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
-                    Button("Next results") { if let next = page.next { model.loadStructureResults(start: next, from: page) } }
+                    Button("Next page") { if let next = page.next { model.loadStructureResults(start: next, from: page) } }
                         .disabled(!model.canOperate || !model.structureIsCurrent || page.next == nil)
                 }.controlSize(.small)
+                resultWindowControls(page.window, retained: page.retained,
+                    enabled: model.canOperate && model.structureIsCurrent) {
+                    model.loadStructureWindow(offset: $0, from: page)
+                }
             } else {
                 VStack(alignment: .leading, spacing: 10) {
                     Text(model.busy ? "Waiting for saved archive work…" : "Navigate the structure of your saved repository.").font(.headline)
                     Text("Search symbols, Markdown heading titles or exact identifier tokens. Open a result to read its verified captured source; that reader remains available after the archive closes.")
-                    Text("Up to 4,096 results and 64 MiB of aggregate source reads. Per-member limits: symbols 64 KiB, headings 256 KiB, occurrences 512 KiB. Coverage counts expose omitted and unsupported members.")
+                    Text("Each result window retains up to 4,096 results within 64 MiB of source reads. Per-member limits: symbols 64 KiB, headings 256 KiB, occurrences 512 KiB. Coverage counts expose omitted and unsupported members.")
                         .font(.caption).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 12)
             }
@@ -729,6 +744,27 @@ final class AtlasSavedFileAccess {
         case .occurrences:
             return "Whole-token text occurrences include comments and string literals. These are spelling matches; they do not establish a semantic reference or call graph."
         case .literal, .expression: return ""
+        }
+    }
+    private func resultWindowControls(_ window: AtlasSavedResultWindow, retained: UInt64,
+        enabled: Bool, select: @escaping (UInt64) -> Void) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Button("First matches") { select(0) }
+                    .disabled(!enabled || window.offset == 0)
+                Button("Earlier matches") { if let earlier = window.earlier { select(earlier) } }
+                    .disabled(!enabled || window.earlier == nil)
+                    .help("Repeat the accepted search up to 4,096 qualified matches earlier.")
+                Spacer()
+                Button("Later matches") { if let next = window.next { select(next) } }
+                    .disabled(!enabled || window.next == nil || window.next == window.offset)
+                    .help("Search the saved archive again and retain the next bounded window of qualified matches.")
+            }.controlSize(.small)
+            Text(window.summary(retained: retained)).font(.caption).foregroundStyle(.secondary)
+            if window.offset > 0 || window.hasMore {
+                Text("Each window repeats the accepted search with the same source limits. Existing readers remain available.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
         }
     }
     private func structureCoverage(_ page: AtlasSavedStructurePage) -> some View {
@@ -760,7 +796,7 @@ final class AtlasSavedFileAccess {
             Label(page.complete ? "Complete expression coverage" : "Partial expression coverage",
                 systemImage: page.complete ? "checkmark.circle" : "exclamationmark.circle")
                 .font(.caption.weight(.semibold)).foregroundStyle(page.complete ? Color.secondary : Color.orange)
-            Text(page.counting.summary(seen: page.seen, retained: page.retained))
+            Text(page.counting.summary(seen: page.seen, retained: page.retained, skipped: page.window.skipped))
                 .font(.caption)
             Text("\(page.scopeFiles) members in scope · \(page.filteredFiles) filtered by path/language")
                 .font(.caption)
@@ -771,7 +807,7 @@ final class AtlasSavedFileAccess {
             if page.state == "work-limit" {
                 Text("The matching-work budget was exhausted. Earlier matches remain valid; more may exist. Narrow path or language filters and search again.")
                     .font(.caption).foregroundStyle(.orange)
-            } else if page.truncated && !page.counting.all {
+            } else if page.window.hasMore && !page.counting.all {
                 Text("At least \(page.seen) matches were seen. The retained-match limit stopped the search.")
                     .font(.caption).foregroundStyle(.orange)
             }
@@ -790,7 +826,7 @@ final class AtlasSavedFileAccess {
                 Spacer()
                 Text("Query generation \(page.generation)").foregroundStyle(.secondary)
             }.font(.caption.weight(.semibold))
-            Text(page.counting.summary(seen: page.seen, retained: page.retained))
+            Text(page.counting.summary(seen: page.seen, retained: page.retained, skipped: page.window.skipped))
                 .font(.caption)
             Text("Unavailable members: \(page.unavailable) · Unsupported decoding: \(page.unsupported) · \(page.sourceBytes) source bytes read")
                 .font(.caption).foregroundStyle(.secondary)
@@ -800,7 +836,7 @@ final class AtlasSavedFileAccess {
             } else {
                 Text("This query scanned saved source without an index.").font(.caption2).foregroundStyle(.secondary)
             }
-            if page.truncated && !page.counting.all {
+            if page.window.hasMore && !page.counting.all {
                 Text("The retained-match limit stopped the search. More matches may exist, and the seen count is a lower bound.")
                     .font(.caption).foregroundStyle(.orange)
             }
@@ -814,7 +850,7 @@ final class AtlasSavedFileAccess {
         HStack(alignment: .top, spacing: 10) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(hit.path.display).font(.callout.weight(.semibold)).lineLimit(2).textSelection(.enabled)
-                Text("Occurrence \(hit.id) · original bytes \(hit.start)..<\(hit.end) · \(hit.end - hit.start) source bytes")
+                Text("Occurrence \(page.window.skipped + hit.id) · original bytes \(hit.start)..<\(hit.end) · \(hit.end - hit.start) source bytes")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
@@ -843,7 +879,7 @@ final class AtlasSavedFileAccess {
                 Text("\(model.importDirection == .incoming ? "Imports targeting" : "Imports declared in") \(member.path.display)")
                     .font(.caption).lineLimit(2).textSelection(.enabled)
             }
-            Text("Rust modules/use, JavaScript and TypeScript imports/re-exports, and Python imports. Targets are candidates in this saved manifest; compiler and package resolution are not established.")
+            Text("Source imports in Rust, JavaScript/TypeScript/JSX/TSX, Python and C/C++. Targets are candidates in this saved manifest; compiler and package resolution are not established.")
                 .font(.caption).foregroundStyle(.secondary)
             if let page = model.imports, model.importsAreCurrent {
                 VStack(alignment: .leading, spacing: 4) {

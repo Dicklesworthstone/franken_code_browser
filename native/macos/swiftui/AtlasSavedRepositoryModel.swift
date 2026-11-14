@@ -776,7 +776,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 let page = try AtlasSavedSearchPage.decode(await model.run(lease, request, flag: flag),
                     identity: info.identity, generation: generation, needle: needle, start: 0, limit: 64,
                     searching: true, countAllMatches: counting, caseSensitive: caseSensitive)
-                guard page.counting.maximum == 4096,
+                guard page.counting.maximum == 4096, page.window.offset == 0,
                       page.indexGeneration == (caseSensitive ? info.index?.generation : nil),
                       page.indexPin == (caseSensitive ? info.index?.pin : nil) else {
                     throw AtlasSavedError.invalidResponse
@@ -814,6 +814,42 @@ private final class AtlasSavedSession: @unchecked Sendable {
             }
         }
     }
+    /// A later window is a fresh bounded search over the opened archive. Freeze
+    /// the accepted query and policy; mutable draft controls never enter it.
+    func loadSearchWindow(offset: UInt64, from page: AtlasSavedSearchPage) {
+        guard canSearch, searchIsCurrent, let info, let accepted = searchPage,
+              page.hasSameSummary(as: accepted), page.start == accepted.start,
+              page.counting.maximum > 0, offset != page.window.offset,
+              offset == page.window.next || offset < page.window.offset else { return }
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let generation = try model.nextQueryGeneration()
+            model.notice = "Finding the saved result window after \(offset) matches…"
+            do {
+                let next = try AtlasSavedSearchPage.decode(await model.run(lease,
+                    .searchWindow(generation: generation, needle: page.needle, caseSensitive: page.caseSensitive,
+                        countAllMatches: page.counting.all, matches: page.counting.maximum, skipMatches: offset), flag: flag),
+                    identity: page.identity, generation: generation, needle: page.needle, start: 0, limit: 64,
+                    searching: true, countAllMatches: page.counting.all, caseSensitive: page.caseSensitive,
+                    resultOffset: offset)
+                guard next.counting.maximum == page.counting.maximum,
+                      next.indexGeneration == (page.caseSensitive ? info.index?.generation : nil),
+                      next.indexPin == (page.caseSensitive ? info.index?.pin : nil) else {
+                    throw AtlasSavedError.invalidResponse
+                }
+                guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
+                model.queryGeneration = generation; model.searchPage = next
+                model.notice = next.complete ? "Loaded the saved result window with complete captured-source coverage."
+                    : "Loaded a result window with partial coverage. Inspect unavailable sources and search limits."
+            } catch {
+                let failure = Self.message(error)
+                let recovered = await model.reconcileSearch(lease)
+                model.notice = recovered ? "\(failure) Reloaded the accepted result window without repeating its scan."
+                    : "\(failure) The accepted result window is unconfirmed. Reload before opening matches."
+            }
+        }
+    }
+
     func loadSearchResults(start: UInt64, from page: AtlasSavedSearchPage? = nil) {
         guard searchIsCurrent, let info, let accepted = searchPage, let generation = queryGeneration,
               start <= accepted.retained else { return }
@@ -892,7 +928,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 let page = try AtlasSavedExpressionPage.decode(await model.run(lease, request, flag: flag),
                     identity: info.identity, generation: generation, expression: query, start: 0, limit: 64,
                     countAllMatches: counting, caseSensitive: caseSensitive)
-                guard page.counting.maximum == 4096 else { throw AtlasSavedError.invalidResponse }
+                guard page.counting.maximum == 4096, page.window.offset == 0 else { throw AtlasSavedError.invalidResponse }
                 guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
                 model.expressionGeneration = generation; model.expressionPage = page
                 model.notice = page.complete ? "Expression search finished over the captured scope."
@@ -925,6 +961,39 @@ private final class AtlasSavedSession: @unchecked Sendable {
             }
         }
     }
+    func loadExpressionWindow(offset: UInt64, from page: AtlasSavedExpressionPage) {
+        guard canOperate, expressionIsCurrent, let accepted = expressionPage,
+              page.hasSameSummary(as: accepted), page.start == accepted.start,
+              page.counting.maximum > 0, offset != page.window.offset,
+              offset == page.window.next || offset < page.window.offset else { return }
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let generation = try model.nextExpressionGeneration()
+            model.notice = "Checking the saved expression window after \(offset) primary matches…"
+            do {
+                let next = try AtlasSavedExpressionPage.decode(await model.run(lease,
+                    .expressionWindow(generation: generation, query: page.expression, caseSensitive: page.caseSensitive,
+                        countAllMatches: page.counting.all, matches: page.counting.maximum,
+                        scanBytes: page.scanLimit, skipMatches: offset), flag: flag),
+                    identity: page.identity, generation: generation, expression: page.expression, start: 0, limit: 64,
+                    countAllMatches: page.counting.all, caseSensitive: page.caseSensitive, resultOffset: offset)
+                guard next.counting.maximum == page.counting.maximum, next.scanLimit == page.scanLimit,
+                      next.primaryNeedle.utf8.elementsEqual(page.primaryNeedle.utf8) else {
+                    throw AtlasSavedError.invalidResponse
+                }
+                guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
+                model.expressionGeneration = generation; model.expressionPage = next
+                model.notice = next.complete ? "Loaded the expression window with complete captured-scope coverage."
+                    : "Loaded an expression window with partial coverage. Skipped work uses the same scan budget."
+            } catch {
+                let failure = Self.message(error)
+                let recovered = await model.reconcileExpression(lease)
+                model.notice = recovered ? "\(failure) Reloaded the accepted expression window without repeating its scan."
+                    : "\(failure) The expression window is unconfirmed. Reload before opening matches."
+            }
+        }
+    }
+
     func loadExpressionResults(start: UInt64, from page: AtlasSavedExpressionPage) {
         guard expressionIsCurrent, let accepted = expressionPage, page.hasSameSummary(as: accepted),
               page.start == accepted.start, start <= accepted.retained else { return }
@@ -986,6 +1055,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                         matches: AtlasSavedSearchWire.maximumHits, sourceBytes: AtlasSavedSearchWire.maximumSourceBytes), flag: flag),
                     identity: info.identity, generation: generation, mode: mode, nameMode: nameMode,
                     needle: needle, start: 0, limit: 64)
+                guard page.window.offset == 0 else { throw AtlasSavedError.invalidResponse }
                 guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
                 model.structureGeneration = generation; model.structurePage = page
                 model.notice = page.complete ? "Finished extraction across the captured manifest. Results retain their stated evidence level."
@@ -1017,9 +1087,41 @@ private final class AtlasSavedSession: @unchecked Sendable {
             }
         }
     }
+    func loadStructureWindow(offset: UInt64, from page: AtlasSavedStructurePage) {
+        guard canOperate, structureIsCurrent, let accepted = structurePage,
+              page.identity == accepted.identity, page.generation == accepted.generation,
+              page.start == accepted.start, page.window == accepted.window,
+              page.mode == accepted.mode, page.nameMode == accepted.nameMode,
+              page.needle.utf8.elementsEqual(accepted.needle.utf8),
+              offset != page.window.offset, offset == page.window.next || offset < page.window.offset else { return }
+        perform { model, flag in
+            guard let lease = model.session else { throw AtlasSavedError.unavailable }
+            let generation = try model.nextStructureGeneration()
+            model.notice = "Finding saved \(page.mode.label.lowercased()) after \(offset) qualified matches…"
+            do {
+                let next = try AtlasSavedStructurePage.decode(await model.run(lease,
+                    .structureWindow(generation: generation, mode: page.mode, nameMode: page.nameMode,
+                        query: page.needle, matches: AtlasSavedSearchWire.maximumHits,
+                        sourceBytes: page.sourceLimit, skipMatches: offset), flag: flag),
+                    identity: page.identity, generation: generation, mode: page.mode, nameMode: page.nameMode,
+                    needle: page.needle, start: 0, limit: 64, resultOffset: offset)
+                guard next.sourceLimit == page.sourceLimit else { throw AtlasSavedError.invalidResponse }
+                guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
+                model.structureGeneration = generation; model.structurePage = next
+                model.notice = next.complete ? "Loaded the structural window at its stated evidence level."
+                    : "Loaded a structural window with partial coverage. Inspect extraction and metadata omissions."
+            } catch {
+                let failure = Self.message(error)
+                let recovered = await model.reconcileStructure(lease)
+                model.notice = recovered ? "\(failure) Reloaded the accepted structural window without repeating extraction."
+                    : "\(failure) The structural window is unconfirmed. Reload before opening a result."
+            }
+        }
+    }
+
     func loadStructureResults(start: UInt64, from page: AtlasSavedStructurePage) {
         guard structureIsCurrent, let accepted = structurePage, page.identity == accepted.identity,
-              page.generation == accepted.generation, page.start == accepted.start,
+              page.generation == accepted.generation, page.start == accepted.start, page.window == accepted.window,
               page.mode == accepted.mode, page.nameMode == accepted.nameMode,
               page.needle.utf8.elementsEqual(accepted.needle.utf8), start <= accepted.retained else { return }
         perform { model, flag in
@@ -1028,6 +1130,10 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 .structureResults(generation: page.generation, start: start, limit: 64), flag: flag),
                 identity: page.identity, generation: page.generation, mode: page.mode, nameMode: page.nameMode,
                 needle: page.needle, start: start, limit: 64)
+            guard next.window == accepted.window, next.retained == accepted.retained, next.seen == accepted.seen,
+                  next.complete == accepted.complete, next.sourceLimit == accepted.sourceLimit else {
+                throw AtlasSavedError.invalidResponse
+            }
             guard model.session === lease, !model.closed, model.structureGeneration == page.generation else {
                 throw AtlasSavedError.canceled
             }
@@ -1068,7 +1174,8 @@ private final class AtlasSavedSession: @unchecked Sendable {
         outline: AtlasReaderOutlineTransport? = nil, document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasSavedReaderCapture {
         guard structureIsCurrent, let accepted = structurePage, info?.identity == page.identity,
               accepted.identity == page.identity, structureGeneration == page.generation, accepted.generation == page.generation,
-              accepted.start == page.start, accepted.mode == page.mode, accepted.nameMode == page.nameMode,
+              accepted.start == page.start, accepted.window == page.window,
+              accepted.mode == page.mode, accepted.nameMode == page.nameMode,
               accepted.needle.utf8.elementsEqual(page.needle.utf8),
               page.hits.contains(where: { $0.matches(item) }), accepted.hits.contains(where: { $0.matches(item) }) else {
             throw AtlasSavedError.invalidInput

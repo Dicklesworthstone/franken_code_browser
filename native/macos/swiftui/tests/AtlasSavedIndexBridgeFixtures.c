@@ -5,10 +5,10 @@
 
 /* Public-header-checked foreign boundary. These responses test Swift marshaling
  * and ownership; real archive/posting behavior is exercised in saved_sessions_tests. */
-static uint64_t calls[21];
+static uint64_t calls[24];
 static int result_mode;
 void fixture_saved_index_mode(int mode) { result_mode = mode; }
-uint64_t fixture_saved_index_count(uint64_t index) { assert(index < 21); return calls[index]; }
+uint64_t fixture_saved_index_count(uint64_t index) { assert(index < 24); return calls[index]; }
 static char *reply(void) {
     if (result_mode == 1) return NULL;
     if (result_mode == 2) { char *p = malloc(2); assert(p); p[0] = (char)0xff; p[1] = 0; return p; }
@@ -144,4 +144,27 @@ char *fcb_saved_clear_paths(uint64_t handle, uint64_t generation) {
 char *fcb_saved_open_path_hit_reader(uint64_t handle, uint64_t reader, uint64_t generation, uint64_t hit) {
     assert(handle == UINT64_MAX - 10 && reader == UINT64_MAX - 8 && generation == UINT64_MAX - 9 && hit == 256);
     calls[17]++; return reply();
+}
+
+/* Offsets stay full-width UInt64 across Swift/C and are independent of IDs. */
+char *fcb_saved_search_page(uint64_t handle, uint64_t generation, const char *needle,
+    uint64_t case_sensitive, uint64_t count_all_matches, uint64_t matches, uint64_t skipped) {
+    assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9);
+    assert(needle && strcmp(needle, "e\xcc\x81") == 0);
+    assert(case_sensitive == 0 && count_all_matches == 1 && matches == 4096);
+    assert(skipped == UINT64_C(9007199254740993)); calls[21]++; return reply();
+}
+char *fcb_saved_expression_search_page(uint64_t handle, uint64_t generation, const char *query,
+    uint64_t case_sensitive, uint64_t count_all_matches, uint64_t matches, uint64_t bytes, uint64_t skipped) {
+    assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9);
+    assert(query && strcmp(query, "e\xcc\x81 path:src/") == 0);
+    assert(case_sensitive == 1 && count_all_matches == 0 && matches == 4096);
+    assert(bytes == 67108864 && skipped == UINT64_MAX); calls[22]++; return reply();
+}
+char *fcb_saved_structure_search_page(uint64_t handle, uint64_t generation, uint64_t mode,
+    uint64_t name_mode, const char *query, uint64_t matches, uint64_t bytes, uint64_t skipped) {
+    assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9);
+    assert(query && strcmp(query, "e\xcc\x81") == 0 && mode == 4 && name_mode == 0);
+    assert(matches == 4096 && bytes == 67108864 && skipped == UINT64_C(9007199254740993));
+    calls[23]++; return reply();
 }

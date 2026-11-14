@@ -48,6 +48,7 @@ import Dispatch
         try exactPageAndPartialCoverageContracts()
         try countedTotalsRemainIndependentOfStoredRows()
         try laterWindowsValidateOffsetsCountsAndContinuations()
+        try await AtlasSavedResultWindowTests.run()
         try await countedPoliciesStayFrozenAcrossPagingAndReaders()
         try await exactUTF8AndUTF16HandoffsKeepOriginalMatches()
         await frozenArchiveQueryPageAndEditorRejectStaleHits()
