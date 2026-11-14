@@ -169,7 +169,7 @@ final class AtlasSavedFileAccess {
                 ? (model.searchMode == .literal
                     ? "Match case compares literal text exactly. Turn it off to compare Unicode lowercase text; neither mode normalizes Unicode or interprets query syntax. Member names never open working-tree paths."
                     : (model.searchMode == .expression
-                        ? "Expression terms are exact and case sensitive. Required/excluded terms apply across each complete captured member; results identify primary-term occurrences. Member names never open working-tree paths."
+                        ? "Match case applies to every expression term; turn it off for Unicode lowercase matching without normalization. Required/excluded terms apply across each complete captured member; results identify primary-term occurrences. Path and language filters keep their declared matching rules."
                         : "Structural results retain the shared extractor's evidence level and original source coordinates. All searches use this saved archive; member names never open working-tree paths."))
                 : "Documentation evidence is the original captured document. Qualified Markdown headings and source-line fragments open their captured byte range; unresolved destinations show why. Member names never open working-tree paths.")
                 .font(.caption2).foregroundStyle(.secondary)
@@ -539,9 +539,11 @@ final class AtlasSavedFileAccess {
             Text("The first positive term names matches. Other terms must appear in the same captured member; -terms must be absent. Quote phrases and paths containing spaces. Use path:, -path:, lang: or -lang: to filter members.")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
+                Toggle("Match case", isOn: $model.searchCaseSensitive)
+                    .toggleStyle(.checkbox).disabled(!model.canOperate)
                 Toggle("Count all matches", isOn: $model.countAllMatches)
                     .toggleStyle(.checkbox).disabled(!model.canOperate)
-                Text("Case sensitive · 64 terms and filters maximum · up to 4,096 retained rows · 64 MiB matching-work budget")
+                Text("64 terms and filters maximum · up to 4,096 retained rows · 64 MiB matching-work budget")
                     .font(.caption2).foregroundStyle(.secondary)
                 Spacer()
                 Button("Reload results") { panelNotice = ""; model.reloadSearchResults() }
@@ -555,6 +557,7 @@ final class AtlasSavedFileAccess {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("Accepted expression").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                     Text(page.expression).font(.body.monospaced()).lineLimit(3).textSelection(.enabled)
+                    Text(page.matchingDescription).font(.caption).foregroundStyle(.secondary)
                     Text("Primary occurrence: \(page.primaryNeedle) · \(page.required) required · \(page.excluded) excluded terms")
                         .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                     if !model.expressionIsCurrent {
@@ -563,7 +566,8 @@ final class AtlasSavedFileAccess {
                                 .font(.caption).foregroundStyle(.orange)
                             Spacer()
                             Button("Use accepted expression") {
-                                model.searchInput = page.expression; model.countAllMatches = page.counting.all; panelNotice = ""
+                                model.searchInput = page.expression; model.countAllMatches = page.counting.all
+                                model.searchCaseSensitive = page.caseSensitive; panelNotice = ""
                             }
                                 .controlSize(.small).disabled(!model.canOperate)
                         }
@@ -1294,8 +1298,9 @@ final class AtlasSavedFileAccess {
             if case .hit(_, let needle, _, let caseSensitive) = capture.origin {
                 Text("Saved literal: \(needle)").font(.callout.monospaced()).lineLimit(2).textSelection(.enabled)
                 Text(caseSensitive ? "Match case" : "Unicode lowercase matching").font(.caption).foregroundStyle(.secondary)
-            } else if case .expressionHit(_, let expression, let primary, _) = capture.origin {
+            } else if case .expressionHit(_, let expression, let primary, _, let caseSensitive) = capture.origin {
                 Text("Saved expression: \(expression)").font(.callout.monospaced()).lineLimit(2).textSelection(.enabled)
+                Text(caseSensitive ? "Match case" : "Unicode lowercase matching").font(.caption).foregroundStyle(.secondary)
                 Text("Primary occurrence: \(primary)").font(.caption.monospaced()).lineLimit(2).textSelection(.enabled)
             } else if case .structureHit(_, _, _, _, let item) = capture.origin {
                 Text(item.structure.name).font(.callout.monospaced()).lineLimit(2).textSelection(.enabled)

@@ -18,6 +18,9 @@ import Foundation
 @_silgen_name("fcb_saved_open_hit_reader") private func savedHitReader(_ h: UInt64, _ reader: UInt64, _ generation: UInt64, _ hit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_expression_search") private func savedExpressionSearch(_ h: UInt64, _ generation: UInt64, _ query: UnsafePointer<CChar>?, _ matches: UInt64, _ scanBytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_expression_search_counted") private func savedCountedExpressionSearch(_ h: UInt64, _ generation: UInt64, _ query: UnsafePointer<CChar>?, _ matches: UInt64, _ scanBytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_expression_search_matching") private func savedMatchingExpressionSearch(_ h: UInt64, _ generation: UInt64,
+    _ query: UnsafePointer<CChar>?, _ caseSensitive: UInt64, _ countAllMatches: UInt64,
+    _ matches: UInt64, _ scanBytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_expression_results") private func savedExpressionResults(_ h: UInt64, _ generation: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_clear_expression") private func savedClearExpression(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_open_expression_hit_reader") private func savedExpressionReader(_ h: UInt64, _ reader: UInt64, _ generation: UInt64, _ hit: UInt64) -> UnsafeMutablePointer<CChar>?
@@ -107,6 +110,12 @@ extension AtlasSavedTransport {
                   matches <= AtlasSavedSearchWire.maximumHits,
                   bytes <= AtlasSavedSearchWire.maximumSourceBytes else { return nil }
             return query.withCString { take(savedCountedExpressionSearch(handle, generation, $0, matches, bytes)) }
+        case .matchingExpressionSearch(let generation, let query, let caseSensitive, let countAllMatches, let matches, let bytes):
+            guard generation > 0, AtlasSavedSearchWire.validNeedle(query),
+                  matches <= AtlasSavedSearchWire.maximumHits, countAllMatches || matches > 0,
+                  bytes <= AtlasSavedSearchWire.maximumSourceBytes else { return nil }
+            return query.withCString { take(savedMatchingExpressionSearch(handle, generation, $0,
+                caseSensitive ? 1 : 0, countAllMatches ? 1 : 0, matches, bytes)) }
         case .expressionResults(let generation, let start, let limit):
             return take(savedExpressionResults(handle, generation, start, limit))
         case .clearExpression(let generation): return take(savedClearExpression(handle, generation))

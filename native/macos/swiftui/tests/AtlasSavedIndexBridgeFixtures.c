@@ -5,10 +5,10 @@
 
 /* Public-header-checked foreign boundary. These responses test Swift marshaling
  * and ownership; real archive/posting behavior is exercised in saved_sessions_tests. */
-static uint64_t calls[20];
+static uint64_t calls[21];
 static int result_mode;
 void fixture_saved_index_mode(int mode) { result_mode = mode; }
-uint64_t fixture_saved_index_count(uint64_t index) { assert(index < 20); return calls[index]; }
+uint64_t fixture_saved_index_count(uint64_t index) { assert(index < 21); return calls[index]; }
 static char *reply(void) {
     if (result_mode == 1) return NULL;
     if (result_mode == 2) { char *p = malloc(2); assert(p); p[0] = (char)0xff; p[1] = 0; return p; }
@@ -75,6 +75,16 @@ char *fcb_saved_expression_search_counted(uint64_t handle, uint64_t generation, 
     assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9);
     assert(query && strcmp(query, "e\xcc\x81 path:src/") == 0 && (matches == 0 || matches == 4096));
     assert(bytes == 67108864); calls[8]++; return reply();
+}
+char *fcb_saved_expression_search_matching(uint64_t handle, uint64_t generation, const char *query,
+    uint64_t case_sensitive, uint64_t count_all_matches, uint64_t matches, uint64_t bytes) {
+    assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9);
+    assert(strcmp(query, "e\xcc\x81 path:src/") == 0);
+    assert(case_sensitive <= 1 && count_all_matches <= 1);
+    if (calls[20] == 0) { assert(case_sensitive == 0 && count_all_matches == 0 && matches == 4096); }
+    else if (calls[20] == 2) { assert(case_sensitive == 1 && count_all_matches == 1 && matches == 4096); }
+    else { assert(case_sensitive == 0 && count_all_matches == 1 && matches == 0); }
+    assert(bytes == 67108864); calls[20]++; return reply();
 }
 STUB4(fcb_saved_expression_results)
 STUB2(fcb_saved_clear_expression)

@@ -55,6 +55,10 @@ import Dispatch
         await invalidMetadataAndHitReceiptsNeverPublishReaders()
         await closeDuringHitHandoffDrainsAndRetires()
         try expressionCoverageAndNamespaceContracts()
+        try expressionMatchingPoliciesBindPagesAndOccurrences()
+        try await lowercaseExpressionsKeepOriginalReadersAndFrozenPolicy()
+        try await lowercaseExpressionExpansionsKeepWholeOriginalScalars()
+        await forgedLowercaseExpressionPoliciesRetireDestinations()
         try await scopedExpressionsKeepExactReadersAndIndependentModes()
         await expressionRecoveryCancellationAndArchiveReplacement()
         await forgedExpressionReceiptsAndLateReadersRetire()
@@ -137,7 +141,7 @@ import Dispatch
         let utf8 = try await model.openHit(accepted.hits[0], from: accepted, readerTransport: f.readerTransport())
         let utf16 = try await model.openHit(accepted.hits[3], from: accepted, readerTransport: f.readerTransport())
         precondition(utf8.match?.originalHex == "616e61" && utf16.match?.originalHex == "61006e006100")
-        precondition(!utf8.origin.literalCaseSensitive && !utf16.origin.literalCaseSensitive)
+        precondition(!utf8.origin.matchingCaseSensitive && !utf16.origin.matchingCaseSensitive)
         model.searchCaseSensitive = true
         precondition(!model.searchIsCurrent && utf8.canUseMatch && utf16.canUseMatch)
         await refused("edited case policy authorized an old hit") {
@@ -745,6 +749,133 @@ import Dispatch
         precondition(model.closed && model.info == nil && model.queryGeneration == nil && !f.calls.contains("LIVE-OPEN"))
     }
 
+    private static func expressionMatchingPoliciesBindPagesAndOccurrences() throws {
+        let f = SavedRepositoryFixture(searchVectors: true)
+        let exactObject = f.expressionPage(40, generation: 1, countAllMatches: true)
+        let identity = try JSONDecoder().decode(AtlasSavedIdentity.self, from: Data(f.encode(exactObject).utf8))
+        func decode(_ object: [String: Any], caseSensitive: Bool = false) throws -> AtlasSavedExpressionPage {
+            try AtlasSavedExpressionPage.decode(f.encode(object), identity: identity, generation: 1,
+                expression: "ana +banana -unsafe", start: 0, limit: 64,
+                countAllMatches: true, caseSensitive: caseSensitive)
+        }
+        let exact = try decode(exactObject, caseSensitive: true)
+        var lowercase = f.expressionPage(40, generation: 1, countAllMatches: true, caseSensitive: false)
+        let accepted = try decode(lowercase)
+        precondition(!accepted.caseSensitive && accepted.counting == exact.counting && !accepted.hasSameSummary(as: exact))
+        rejected("an exact expression response satisfied a lowercase request") { _ = try decode(exactObject) }
+        for field in ["case_sensitive", "mode", "normalization"] {
+            var bad = lowercase; bad.removeValue(forKey: field)
+            rejected("lowercase expression omitted its \(field)") { _ = try decode(bad) }
+        }
+        for (field, value) in [("case_sensitive", true as Any), ("case_sensitive", "false" as Any),
+            ("mode", "unicode-lowercase-literal" as Any), ("normalization", "nfc" as Any),
+            ("index_used", true as Any), ("index_policy", "exact-compatible-postings" as Any)] {
+            var bad = lowercase; bad[field] = value
+            rejected("expression accepted inconsistent \(field)") { _ = try decode(bad) }
+        }
+        var legacy = exactObject
+        legacy.removeValue(forKey: "mode"); legacy.removeValue(forKey: "normalization")
+        let legacyPage = try decode(legacy, caseSensitive: true)
+        precondition(legacyPage.hasSameSummary(as: exact))
+        // Distinct normalized positions may cover the same original scalar.
+        // The producer's occurrence IDs remain distinct across that expansion.
+        var hits = lowercase["hits"] as! [[String: Any]]
+        hits[1]["original_range"] = hits[0]["original_range"]; lowercase["hits"] = hits
+        let overlapping = try decode(lowercase)
+        precondition(overlapping.hits[0].id != overlapping.hits[1].id)
+        precondition(overlapping.hits[0].start == overlapping.hits[1].start)
+        var exactDuplicate = lowercase
+        exactDuplicate["case_sensitive"] = true; exactDuplicate["mode"] = "decoded-text-expression"
+        rejected("exact expression accepted duplicate source occurrences") { _ = try decode(exactDuplicate, caseSensitive: true) }
+        hits[1]["original_range"] = ["start": "202", "end": "205"]; lowercase["hits"] = hits
+        rejected("lowercase expression accepted backward source occurrences") { _ = try decode(lowercase) }
+    }
+
+    @MainActor private static func lowercaseExpressionsKeepOriginalReadersAndFrozenPolicy() async throws {
+        let f = SavedRepositoryFixture(searchVectors: true), model = await preparedExpression(f)
+        model.searchCaseSensitive = false; model.searchInput = "ANA +BANANA -UNSAFE"; model.search()
+        await wait("lowercase expression did not finish") { !model.busy }
+        let accepted = model.expressionPage!
+        precondition(!accepted.caseSensitive && accepted.primaryNeedle == "ANA" && accepted.hits.count == 4)
+        precondition(model.expressionIsCurrent && accepted.counting.all && model.queryGeneration == 1)
+        let utf8 = try await model.openExpressionHit(accepted.hits[0], from: accepted, readerTransport: f.readerTransport())
+        let utf16 = try await model.openExpressionHit(accepted.hits[3], from: accepted, readerTransport: f.readerTransport())
+        precondition(utf8.match?.originalHex == "616e61" && utf16.match?.originalHex == "61006e006100")
+        precondition(!utf8.origin.matchingCaseSensitive && !utf16.origin.matchingCaseSensitive)
+        model.searchCaseSensitive = true
+        precondition(!model.expressionIsCurrent && utf8.canUseMatch && utf16.canUseMatch)
+        await refused("edited case policy authorized an old expression hit") {
+            _ = try await model.openExpressionHit(accepted.hits[0], from: accepted, readerTransport: f.readerTransport())
+        }
+        let calls = f.calls.count
+        model.loadExpressionResults(start: 2, from: accepted)
+        precondition(!model.busy && f.calls.count == calls, "draft case policy requested old expression pages")
+        model.searchCaseSensitive = false
+        f.corruptNext("expression-case-policy"); model.loadExpressionResults(start: 2, from: accepted)
+        await wait("forged expression matching policy did not drain") { !model.busy }
+        precondition(model.expressionPage?.start == 0 && model.expressionPage?.caseSensitive == false)
+        f.corruptNext("expression-lost"); model.search()
+        await wait("lost lowercase expression did not reconcile") { !model.busy }
+        precondition(model.expressionGeneration == 3 && model.expressionPage?.caseSensitive == false && model.expressionIsCurrent)
+        precondition(f.calls.filter { $0 == "expression:40:3:ANA +BANANA -UNSAFE" }.count == 1)
+        f.blockNextSearch(); model.search()
+        await wait("lowercase expression did not enter its worker") { f.entered.wait(timeout: .now()) == .success }
+        model.searchCaseSensitive = true; model.cancel(); f.resume.signal()
+        await wait("canceled expression did not reconcile its frozen case policy") { !model.busy }
+        precondition(model.expressionGeneration == 4 && model.expressionPage?.caseSensitive == false && !model.expressionIsCurrent)
+        precondition(model.queryGeneration == 1 && model.relationshipGeneration == 1)
+        model.searchCaseSensitive = false
+        precondition(model.expressionIsCurrent)
+        model.closeArchive()
+        precondition(utf8.canUseMatch && utf16.canUseMatch)
+        _ = try await utf16.withMatchReader { $0 }
+        precondition(!f.calls.contains("LIVE-OPEN"))
+        utf8.reader.close(); utf16.reader.close(); model.close()
+    }
+
+    @MainActor private static func lowercaseExpressionExpansionsKeepWholeOriginalScalars() async throws {
+        let f = SavedRepositoryFixture(searchVectors: true, expansionVectors: true)
+        let model = AtlasSavedRepositoryModel(transport: f.savedTransport)
+        model.open(path: "/saved/expansions.fcbs", accessLease: nil)
+        await wait("expression expansion archive did not open") { !model.busy }
+        model.searchMode = .expression; model.searchCaseSensitive = false
+        model.searchInput = "i +i -absent"; model.search()
+        await wait("expression expansion search did not finish") { !model.busy }
+        let page = model.expressionPage!
+        precondition(page.hits.count == 2 && page.seen == 2 && !page.caseSensitive)
+        let utf8 = try await model.openExpressionHit(page.hits[0], from: page, readerTransport: f.readerTransport())
+        let utf16 = try await model.openExpressionHit(page.hits[1], from: page, readerTransport: f.readerTransport())
+        precondition(utf8.match?.start == 0 && utf8.match?.end == 2 && utf8.match?.originalHex == "c4b0")
+        precondition(utf16.match?.start == 2 && utf16.match?.end == 4 && utf16.match?.originalHex == "3001")
+        model.searchInput = "\u{307} +i -absent"; model.search()
+        await wait("combining expression expansion did not finish") { !model.busy }
+        let combining = model.expressionPage!
+        let scalar = try await model.openExpressionHit(combining.hits[0], from: combining, readerTransport: f.readerTransport())
+        precondition(scalar.match?.originalHex == "c4b0", "an expression expansion narrowed the source scalar witness")
+        model.closeArchive()
+        precondition(utf8.canUseMatch && utf16.canUseMatch && scalar.canUseMatch)
+        utf8.reader.close(); utf16.reader.close(); scalar.reader.close(); model.close()
+    }
+
+    @MainActor private static func forgedLowercaseExpressionPoliciesRetireDestinations() async {
+        for fault in ["expression-reader-case", "expression-reader-mode", "expression-reader-normalization",
+                      "expression-reader-policy-missing", "hit-case", "hit-mode", "hit-text",
+                      "hit-text-missing", "hit-policy-missing", "hit-normalization"] {
+            let f = SavedRepositoryFixture(searchVectors: true), model = await preparedExpression(f)
+            model.searchCaseSensitive = false; model.searchInput = "ANA +BANANA -UNSAFE"; model.search()
+            await wait("lowercase expression fault fixture did not search") { !model.busy }
+            let page = model.expressionPage!
+            f.corruptNext(fault)
+            await refused("forged lowercase expression published a reader: \(fault)") {
+                _ = try await model.openExpressionHit(page.hits[0], from: page, readerTransport: f.readerTransport())
+            }
+            await wait("forged expression destination did not retire") { f.calls.contains("reader-close:100") }
+            precondition(f.calls.filter { $0 == "handoff:100" }.count == 1 && !f.calls.contains("LIVE-OPEN"))
+            precondition(model.expressionGeneration == 2 && model.expressionPage?.caseSensitive == false)
+            model.close()
+        }
+    }
+
     private static func expressionCoverageAndNamespaceContracts() throws {
         let f = SavedRepositoryFixture(searchVectors: true), archivePath = Array("/saved/repository.fcbs".utf8)
         let info = try AtlasSavedInfo.decode(f.encode(f.info(40)), handle: 40, expectedPath: archivePath, fresh: true)
@@ -845,7 +976,7 @@ import Dispatch
         precondition(utf8.match?.start == 203 && utf8.match?.end == 206 && utf8.match?.originalHex == "616e61")
         precondition(utf16.match?.start == 410 && utf16.match?.end == 416 && utf16.match?.originalHex == "61006e006100")
         precondition(utf16.reader.page?.start == 278 && utf16.reader.page?.identity.encoding == "utf16le")
-        guard case .expressionHit(let generation, let query, let primary, _) = utf16.origin else {
+        guard case .expressionHit(let generation, let query, let primary, _, _) = utf16.origin else {
             preconditionFailure("expression reader lost its accepted predicate provenance")
         }
         precondition(generation == 1 && query == expression.expression && primary == "ana")

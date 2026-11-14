@@ -363,6 +363,8 @@ struct AtlasSavedExpressionPage: Sendable {
     let generation: UInt64
     let expression: String
     let primaryNeedle: String
+    let caseSensitive: Bool
+    var matchingDescription: String { caseSensitive ? "Match case" : "Unicode lowercase matching" }
     let hits: [AtlasSavedHit]
     let start: UInt64
     let next: UInt64?
@@ -377,6 +379,7 @@ struct AtlasSavedExpressionPage: Sendable {
         identity == other.identity && generation == other.generation
             && expression.utf8.elementsEqual(other.expression.utf8)
             && primaryNeedle.utf8.elementsEqual(other.primaryNeedle.utf8)
+            && caseSensitive == other.caseSensitive
             && counting == other.counting && state == other.state && complete == other.complete
             && truncated == other.truncated && retained == other.retained && seen == other.seen
             && scopeFiles == other.scopeFiles && filteredFiles == other.filteredFiles
@@ -387,10 +390,15 @@ struct AtlasSavedExpressionPage: Sendable {
 
     static func decode(_ json: String?, identity: AtlasSavedIdentity, generation: UInt64,
         expression expected: String?, start: UInt64, limit: UInt64,
-        countAllMatches expectedCount: Bool? = nil) throws -> Self {
+        countAllMatches expectedCount: Bool? = nil, caseSensitive expectedCase: Bool? = nil) throws -> Self {
         let data = try AtlasSavedWire.admit(json, handle: identity.owner, command: "expression", identity: identity)
         do {
             let w = try JSONDecoder().decode(Wire.self, from: data)
+            let caseSensitive = w.case_sensitive
+            if w.mode != nil || w.normalization != nil || !caseSensitive {
+                guard w.mode == (caseSensitive ? "decoded-text-expression" : "unicode-lowercase-expression"),
+                      w.normalization == "exact" else { throw AtlasSavedError.invalidResponse }
+            }
             let retained = w.retained_hits.value, seen = w.matches_seen.value
             let required = w.required_terms.value, excluded = w.excluded_terms.value
             let scope = w.scope_files.value, unavailable = w.unavailable_files.value
@@ -404,7 +412,8 @@ struct AtlasSavedExpressionPage: Sendable {
                   w.selection_namespace == "saved-expression",
                   AtlasSavedSearchWire.validNeedle(w.expression), AtlasSavedSearchWire.validNeedle(w.primary_needle),
                   expected == nil || w.expression.utf8.elementsEqual(expected!.utf8),
-                  w.predicate_scope == "whole-captured-member", w.case_sensitive,
+                  w.predicate_scope == "whole-captured-member",
+                  expectedCase == nil || caseSensitive == expectedCase,
                   !w.index_used, w.index_policy == "direct-verified-member-scan",
                   ["complete", "truncated", "work-limit"].contains(w.state),
                   required <= 63, excluded <= 63 - required,
@@ -436,7 +445,8 @@ struct AtlasSavedExpressionPage: Sendable {
                 if let previous {
                     guard hit.member >= previous.member else { throw AtlasSavedError.invalidResponse }
                     if hit.member == previous.member {
-                        guard hit.start > previous.start, hit.path.bytes == previous.path.bytes,
+                        guard (caseSensitive ? hit.start > previous.start :
+                            hit.start >= previous.start && hit.end >= previous.end), hit.path.bytes == previous.path.bytes,
                               hit.digest == previous.digest else { throw AtlasSavedError.invalidResponse }
                     }
                 }
@@ -446,6 +456,7 @@ struct AtlasSavedExpressionPage: Sendable {
             guard next == (end < retained ? end : nil) else { throw AtlasSavedError.invalidResponse }
             try counting.validatePage(w.hits, retained: retained)
             return Self(identity: identity, generation: generation, expression: w.expression, primaryNeedle: w.primary_needle,
+                caseSensitive: caseSensitive,
                 hits: w.hits, start: start, next: next, state: w.state, complete: w.complete, truncated: w.truncated,
                 retained: retained, seen: seen, required: required, excluded: excluded, scopeFiles: scope,
                 filteredFiles: w.metadata_excluded.value, unavailable: unavailable, unsupported: unsupported,
@@ -489,6 +500,7 @@ struct AtlasSavedExpressionPage: Sendable {
     }
     private struct Wire: Decodable {
         let selection_namespace, expression, primary_needle, predicate_scope, index_policy, state: String
+        let mode, normalization: String?
         let case_sensitive, index_used, complete, matches_seen_exact, truncated: Bool
         let count_all_matches: Bool?
         let matching_files, retained_matching_files: AtlasSavedNumber?
@@ -502,6 +514,7 @@ struct AtlasSavedExpressionPage: Sendable {
         let next_offset: AtlasSavedSearchOptional<AtlasSavedNumber>
         enum CodingKeys: String, CodingKey {
             case selection_namespace, expression, primary_needle, predicate_scope, index_policy, state
+            case mode, normalization
             case case_sensitive, index_used, complete, matches_seen_exact, truncated
             case count_all_matches, matching_files, retained_matching_files
             case expression_generation, required_terms, excluded_terms, max_hits, max_scan_bytes

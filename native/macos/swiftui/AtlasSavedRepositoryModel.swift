@@ -209,6 +209,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         guard searchMode == .expression, let expressionPage, info?.identity == expressionPage.identity,
               expressionGeneration == expressionPage.generation else { return false }
         return searchInput.utf8.elementsEqual(expressionPage.expression.utf8) && countAllMatches == expressionPage.counting.all
+            && searchCaseSensitive == expressionPage.caseSensitive
     }
 
     var structureIsCurrent: Bool {
@@ -871,20 +872,26 @@ private final class AtlasSavedSession: @unchecked Sendable {
         guard validSearchInput else {
             notice = "Enter 1–1024 UTF-8 bytes of expression syntax without NUL. The first positive term names matches."; return
         }
-        let query = searchInput, counting = countAllMatches
+        let query = searchInput, counting = countAllMatches, caseSensitive = searchCaseSensitive
         perform { model, flag in
             guard let lease = model.session else { throw AtlasSavedError.unavailable }
             let generation = try model.nextExpressionGeneration()
             model.notice = "Checking required and excluded terms across captured members…"
             do {
-                let request: AtlasSavedRequest = counting
-                    ? .countedExpressionSearch(generation: generation, query: query, matches: 4096,
-                        scanBytes: AtlasSavedSearchWire.maximumSourceBytes)
-                    : .expressionSearch(generation: generation, query: query, matches: 4096,
-                        scanBytes: AtlasSavedSearchWire.maximumSourceBytes)
+                let request: AtlasSavedRequest
+                if caseSensitive {
+                    request = counting
+                        ? .countedExpressionSearch(generation: generation, query: query, matches: 4096,
+                            scanBytes: AtlasSavedSearchWire.maximumSourceBytes)
+                        : .expressionSearch(generation: generation, query: query, matches: 4096,
+                            scanBytes: AtlasSavedSearchWire.maximumSourceBytes)
+                } else {
+                    request = .matchingExpressionSearch(generation: generation, query: query, caseSensitive: false,
+                        countAllMatches: counting, matches: 4096, scanBytes: AtlasSavedSearchWire.maximumSourceBytes)
+                }
                 let page = try AtlasSavedExpressionPage.decode(await model.run(lease, request, flag: flag),
                     identity: info.identity, generation: generation, expression: query, start: 0, limit: 64,
-                    countAllMatches: counting)
+                    countAllMatches: counting, caseSensitive: caseSensitive)
                 guard page.counting.maximum == 4096 else { throw AtlasSavedError.invalidResponse }
                 guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
                 model.expressionGeneration = generation; model.expressionPage = page
@@ -926,7 +933,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
             let next = try AtlasSavedExpressionPage.decode(await model.run(lease,
                 .expressionResults(generation: page.generation, start: start, limit: 64), flag: flag),
                 identity: page.identity, generation: page.generation, expression: page.expression, start: start, limit: 64,
-                countAllMatches: page.counting.all)
+                countAllMatches: page.counting.all, caseSensitive: page.caseSensitive)
             guard next.hasSameSummary(as: accepted) else { throw AtlasSavedError.invalidResponse }
             guard model.session === lease, !model.closed, model.expressionGeneration == page.generation,
                   next.primaryNeedle.utf8.elementsEqual(page.primaryNeedle.utf8) else { throw AtlasSavedError.canceled }
@@ -1083,7 +1090,8 @@ private final class AtlasSavedSession: @unchecked Sendable {
             throw AtlasSavedError.invalidInput
         }
         return try await openReader(saved: page.identity, ordinal: hit.member, expected: nil,
-            origin: .expressionHit(generation: page.generation, expression: page.expression, primaryNeedle: page.primaryNeedle, hit: hit),
+            origin: .expressionHit(generation: page.generation, expression: page.expression,
+                primaryNeedle: page.primaryNeedle, hit: hit, caseSensitive: page.caseSensitive),
             readerTransport: readerTransport, search: search, outline: outline, document: document)
     }
 
@@ -1307,7 +1315,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                         request = .openImport(reader: destination, generation: generation, importID: link.id, side: side)
                     case .hit(let generation, _, let hit, _):
                         request = .openHit(reader: destination, generation: generation, hit: hit.id)
-                    case .expressionHit(let generation, _, _, let hit):
+                    case .expressionHit(let generation, _, _, let hit, _):
                         request = .openExpressionHit(reader: destination, generation: generation, hit: hit.id)
                     case .structureHit(let generation, _, _, _, let item):
                         request = .openStructureHit(reader: destination, generation: generation, hit: item.id)

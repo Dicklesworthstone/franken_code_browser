@@ -143,6 +143,33 @@ extension AtlasReaderTransport {
         }
         precondition(count(18) == 6 && count(19) == 5 && count(6) == 42,
             "publication response ownership leaked or double-freed")
+        mode(0)
+        for (caseSensitive, countAll, retained) in [(false, false, UInt64(4096)), (false, true, 0), (true, true, 4096)] {
+            precondition(transport.run(owner, .matchingExpressionSearch(generation: generation,
+                query: "e\u{301} path:src/", caseSensitive: caseSensitive, countAllMatches: countAll,
+                matches: retained, scanBytes: 67_108_864)) == "{}")
+        }
+        precondition(count(20) == 3 && count(6) == 45)
+        for (queryGeneration, query, countAll, retained, bytes) in [
+            (UInt64(0), "e\u{301} path:src/", true, UInt64(0), UInt64(67_108_864)),
+            (generation, "", true, 0, 67_108_864), (generation, "e\0", true, 0, 67_108_864),
+            (generation, String(repeating: "x", count: 1025), true, 0, 67_108_864),
+            (generation, "e\u{301} path:src/", true, 4097, 67_108_864),
+            (generation, "e\u{301} path:src/", false, 0, 67_108_864),
+            (generation, "e\u{301} path:src/", true, 0, 67_108_865)
+        ] {
+            precondition(transport.run(owner, .matchingExpressionSearch(generation: queryGeneration,
+                query: query, caseSensitive: false, countAllMatches: countAll,
+                matches: retained, scanBytes: bytes)) == nil)
+        }
+        precondition(count(20) == 3 && count(6) == 45, "invalid matching expressions crossed the foreign boundary")
+        for invalid in [Int32(1), 2, 3, 4] {
+            mode(invalid)
+            precondition(transport.run(owner, .matchingExpressionSearch(generation: generation,
+                query: "e\u{301} path:src/", caseSensitive: false, countAllMatches: true,
+                matches: 0, scanBytes: 67_108_864)) == nil)
+        }
+        precondition(count(20) == 7 && count(6) == 48, "matching expression response ownership leaked or double-freed")
         print("AtlasSavedIndexBridgeTests: public-header signatures, publication/import/path/matching requests, native bytes, full-width IDs and buffer ownership passed")
     }
 }

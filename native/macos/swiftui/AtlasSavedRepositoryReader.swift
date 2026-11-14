@@ -6,16 +6,19 @@ enum AtlasSavedReaderOrigin: Sendable {
     case relationship(generation: UInt64, link: AtlasSavedLink, side: AtlasSavedLinkSide)
     case importLink(generation: UInt64, link: AtlasSavedImport, side: AtlasSavedLinkSide)
     case hit(generation: UInt64, needle: String, hit: AtlasSavedHit, caseSensitive: Bool = true)
-    case expressionHit(generation: UInt64, expression: String, primaryNeedle: String, hit: AtlasSavedHit)
+    case expressionHit(generation: UInt64, expression: String, primaryNeedle: String, hit: AtlasSavedHit,
+        caseSensitive: Bool = true)
     case structureHit(generation: UInt64, mode: AtlasSavedSearchMode, nameMode: AtlasSearchNameMode,
         needle: String, hit: AtlasSavedStructureHit)
-    var literalCaseSensitive: Bool {
-        if case .hit(_, _, _, let caseSensitive) = self { return caseSensitive }
-        return true
+    var matchingCaseSensitive: Bool {
+        switch self {
+        case .hit(_, _, _, let caseSensitive), .expressionHit(_, _, _, _, let caseSensitive): return caseSensitive
+        default: return true
+        }
     }
     var searchHit: AtlasSavedHit? {
         switch self {
-        case .hit(_, _, let hit, _), .expressionHit(_, _, _, let hit): return hit
+        case .hit(_, _, let hit, _), .expressionHit(_, _, _, let hit, _): return hit
         case .structureHit(_, _, _, _, let item): return item.hit
         case .member, .relationship, .importLink, .pathHit: return nil
         }
@@ -106,16 +109,23 @@ struct AtlasSavedReaderReceipt: Sendable {
             guard info.identity.capturedBytes == member.observedBytes, info.captureSHA256 == member.digest else {
                 throw AtlasSavedError.invalidResponse
             }
-            let caseSensitive = origin.literalCaseSensitive
+            let caseSensitive = origin.matchingCaseSensitive
             let request: AtlasReaderRequest
             let match: AtlasSavedMatchEvidence?
             let selectionGeneration: String
-            if case .expressionHit(let generation, let expression, let primary, _) = origin {
+            if case .expressionHit(let generation, let expression, let primary, _, _) = origin {
                 guard AtlasSavedSearchWire.validNeedle(expression),
                       object["selection_namespace"] as? String == "saved-expression",
                       (object["expression_generation"] as? String).flatMap(AtlasReaderWire.integer) == generation,
                       let acceptedPrimary = object["primary_needle"] as? String,
                       acceptedPrimary.utf8.elementsEqual(primary.utf8) else { throw AtlasSavedError.invalidResponse }
+                if object["case_sensitive"] != nil || object["mode"] != nil || object["normalization"] != nil || !caseSensitive {
+                    struct ExpressionPolicy: Decodable { let case_sensitive: Bool; let mode, normalization: String }
+                    let policy = try JSONDecoder().decode(ExpressionPolicy.self, from: data)
+                    guard policy.case_sensitive == caseSensitive,
+                          policy.mode == (caseSensitive ? "decoded-text-expression" : "unicode-lowercase-expression"),
+                          policy.normalization == "exact" else { throw AtlasSavedError.invalidResponse }
+                }
                 selectionGeneration = "expression_generation"
             } else { selectionGeneration = "query_generation" }
             switch origin {
@@ -259,7 +269,7 @@ struct AtlasSavedReaderReceipt: Sendable {
                     guard selected["original_hex"] is NSNull else { throw AtlasSavedError.invalidResponse }
                     request = .window(offset: contextStart, bytes: 16 * 1024); match = nil
                 }
-            case .hit(let generation, let needle, let hit, _), .expressionHit(let generation, _, let needle, let hit):
+            case .hit(let generation, let needle, let hit, _), .expressionHit(let generation, _, let needle, let hit, _):
                 guard generation > 0, AtlasSavedSearchWire.validNeedle(needle),
                       member.id == hit.member, member.file == hit.file, member.file == hit.revision,
                       member.path.bytes == hit.path.bytes, member.digest == hit.digest,
@@ -278,24 +288,34 @@ struct AtlasSavedReaderReceipt: Sendable {
                     throw AtlasSavedError.invalidResponse
                 }
                 let literal: String
-                if case .hit = origin {
-                    if selected["case_sensitive"] != nil || selected["mode"] != nil || selected["text"] != nil {
-                        struct MatchingSelection: Decodable { let case_sensitive: Bool; let mode, text: String }
-                        let accepted = try JSONDecoder().decode(MatchingSelection.self,
-                            from: JSONSerialization.data(withJSONObject: selected))
-                        guard accepted.case_sensitive == caseSensitive,
-                              accepted.mode == (caseSensitive ? "exact-decoded-literal" : "unicode-lowercase-literal"),
-                              !caseSensitive || accepted.text.utf8.elementsEqual(needle.utf8) else {
-                            throw AtlasSavedError.invalidResponse
-                        }
-                        literal = try AtlasSavedMatchEvidence.sourceHex(accepted.text, encoding: info.identity.encoding)
-                    } else {
-                        // The legacy exact ABI did not return additive policy
-                        // fields. Lowercase activation always requires them.
-                        guard caseSensitive else { throw AtlasSavedError.invalidResponse }
-                        literal = try AtlasSavedMatchEvidence.literalHex(needle, encoding: info.identity.encoding)
-                    }
+                let expectedMode: String
+                if case .expressionHit = origin {
+                    expectedMode = caseSensitive ? "decoded-text-expression" : "unicode-lowercase-expression"
                 } else {
+                    expectedMode = caseSensitive ? "exact-decoded-literal" : "unicode-lowercase-literal"
+                }
+                if selected["case_sensitive"] != nil || selected["mode"] != nil || selected["text"] != nil
+                    || selected["normalization"] != nil {
+                    struct MatchingSelection: Decodable {
+                        let case_sensitive: Bool
+                        let mode, text: String
+                        let normalization: String?
+                    }
+                    let accepted = try JSONDecoder().decode(MatchingSelection.self,
+                        from: JSONSerialization.data(withJSONObject: selected))
+                    guard accepted.case_sensitive == caseSensitive,
+                          accepted.mode == expectedMode,
+                          !caseSensitive || accepted.text.utf8.elementsEqual(needle.utf8) else {
+                        throw AtlasSavedError.invalidResponse
+                    }
+                    if case .expressionHit = origin {
+                        guard accepted.normalization == "exact" else { throw AtlasSavedError.invalidResponse }
+                    }
+                    literal = try AtlasSavedMatchEvidence.sourceHex(accepted.text, encoding: info.identity.encoding)
+                } else {
+                    // The legacy exact ABI did not return additive policy
+                    // fields. Lowercase activation always requires them.
+                    guard caseSensitive else { throw AtlasSavedError.invalidResponse }
                     literal = try AtlasSavedMatchEvidence.literalHex(needle, encoding: info.identity.encoding)
                 }
                 guard literal.utf8.elementsEqual(originalHex.utf8),
@@ -375,8 +395,8 @@ final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
             return "Saved catalog candidate for \(link.destination) · \(link.resolutionBasis) · lexical relationship, not compiler resolution"
         case .hit(let generation, _, let hit, let caseSensitive):
             return "Saved search \(generation), occurrence \(hit.id) · \(caseSensitive ? "match case" : "Unicode lowercase matching") · original bytes \(hit.start)..<\(hit.end)"
-        case .expressionHit(let generation, _, _, let hit):
-            return "Saved expression \(generation), occurrence \(hit.id) · exact original bytes \(hit.start)..<\(hit.end)"
+        case .expressionHit(let generation, _, _, let hit, let caseSensitive):
+            return "Saved expression \(generation), occurrence \(hit.id) · \(caseSensitive ? "match case" : "Unicode lowercase matching") · original bytes \(hit.start)..<\(hit.end)"
         case .structureHit(_, _, _, _, let item):
             return "\(item.structure.label) · original bytes \(item.hit.start)..<\(item.hit.end)"
         }

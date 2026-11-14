@@ -697,6 +697,8 @@ enum AtlasSavedRequest: Sendable {
     case openHit(reader: UInt64, generation: UInt64, hit: UInt64)
     case expressionSearch(generation: UInt64, query: String, matches: UInt64, scanBytes: UInt64)
     case countedExpressionSearch(generation: UInt64, query: String, matches: UInt64, scanBytes: UInt64)
+    case matchingExpressionSearch(generation: UInt64, query: String, caseSensitive: Bool,
+        countAllMatches: Bool, matches: UInt64, scanBytes: UInt64)
     case expressionResults(generation: UInt64, start: UInt64, limit: UInt64)
     case clearExpression(generation: UInt64)
     case openExpressionHit(reader: UInt64, generation: UInt64, hit: UInt64)

@@ -30,6 +30,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         var expressionGeneration: UInt64?
         var expression: String?
         var countAllExpressionMatches = false
+        var expressionCaseSensitive = true
         var expressionAttempt: UInt64 = 0
         var structureGeneration: UInt64?
         var structureMode: AtlasSavedSearchMode?
@@ -324,19 +325,32 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         }
         return out
     }
+    func expressionPrimary(_ query: String) -> String {
+        switch query {
+        case "ANA +BANANA -UNSAFE": return "ANA"
+        case "i +i -absent": return "i"
+        case "\u{307} +i -absent": return "\u{307}"
+        default: return "ana"
+        }
+    }
     func expressionPage(_ owner: UInt64, generation: UInt64, query: String = "ana +banana -unsafe",
-        start: UInt64 = 0, limit: UInt64 = 64, countAllMatches: Bool? = nil) -> [String: Any] {
+        start: UInt64 = 0, limit: UInt64 = 64, countAllMatches: Bool? = nil,
+        caseSensitive: Bool = true) -> [String: Any] {
         // Fixed protocol vectors. The production Rust tests own grammar and
         // predicate evaluation; this fixture does not implement either.
         let filtered = query == "ana path:raw"
-        let count: UInt64 = filtered ? 2 : 4
+        let primary = expressionPrimary(query)
+        let hits = searchHits(primary, caseSensitive: caseSensitive)
+        let count = UInt64(filtered ? min(2, hits.count) : hits.count)
         let sourceBytes = filtered ? members[1].bytes!.count : members.compactMap(\.bytes).reduce(0) { $0 + $1.count }
         let end = min(count, start + limit)
         var out = header(owner, "expression")
         out.merge([
             "selection_namespace": "saved-expression", "expression_generation": String(generation),
-            "expression": query, "primary_needle": "ana", "predicate_scope": "whole-captured-member",
-            "case_sensitive": true, "index_used": false, "index_policy": "direct-verified-member-scan",
+            "expression": query, "primary_needle": primary, "predicate_scope": "whole-captured-member",
+            "case_sensitive": caseSensitive,
+            "mode": caseSensitive ? "decoded-text-expression" : "unicode-lowercase-expression",
+            "normalization": "exact", "index_used": false, "index_policy": "direct-verified-member-scan",
             "state": "complete", "complete": filtered, "matches_seen_exact": filtered, "truncated": false,
             "required_terms": filtered ? "0" : "1", "excluded_terms": filtered ? "0" : "1",
             "max_hits": "4096", "max_scan_bytes": "67108864", "retained_hits": String(count), "matches_seen": String(count),
@@ -346,12 +360,13 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             "loaded_bytes": String(sourceBytes), "peak_source_bytes": String(filtered ? sourceBytes : members.compactMap(\.bytes).map(\.count).max()!),
             "predicate_scans": filtered ? "0" : "8", "predicate_rejections": filtered ? "0" : "2",
             "primary_scans": filtered ? "1" : "2", "scanned_bytes": String(filtered ? sourceBytes : sourceBytes * 2 + searchUTF8.count + searchUTF16.count),
-            "retained_source_payload_bytes": "0", "hits": (start..<end).map { hitObject($0 + 1) },
+            "retained_source_payload_bytes": "0",
+            "hits": (start..<end).map { hitObject($0 + 1, needle: primary, caseSensitive: caseSensitive) },
             "next_offset": end < count ? String(end) as Any : NSNull()
         ]) { _, next in next }
         if let countAllMatches {
             out["count_all_matches"] = countAllMatches
-            out["matching_files"] = filtered ? "1" : "2"
+            out["matching_files"] = String(Set(hits.prefix(Int(count)).map(\.member)).count)
             out["retained_matching_files"] = out["matching_files"]
         }
         return out
@@ -520,14 +535,29 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             windowStart = hit.start - min(hit.start, 132)
             windowBytes = max(4, min(UInt64(bytes.count), hit.end + 132) - windowStart)
         }
-        if let expression, let hitID {
-            let hit = searchHits("ana")[Int(hitID - 1)]
+        if let expression, let hitID, let session = sessions[saved], let query = session.expression {
+            let primary = expressionPrimary(query)
+            let hit = searchHits(primary, caseSensitive: session.expressionCaseSensitive)[Int(hitID - 1)]
+            let original = Array(bytes[Int(hit.start)..<Int(hit.end)])
+            let spelling: String
+            if member.encoding == "utf8" { spelling = String(decoding: original, as: UTF8.self) }
+            else {
+                let units = stride(from: 0, to: original.count, by: 2).map { offset in
+                    member.encoding == "utf16le"
+                        ? UInt16(original[offset]) | UInt16(original[offset + 1]) << 8
+                        : UInt16(original[offset]) << 8 | UInt16(original[offset + 1])
+                }
+                spelling = String(decoding: units, as: UTF16.self)
+            }
+            let mode = session.expressionCaseSensitive ? "decoded-text-expression" : "unicode-lowercase-expression"
             out["command"] = "expression-open-reader"
             out["selection_namespace"] = "saved-expression"; out["expression_generation"] = String(expression)
-            out["primary_needle"] = "ana"
+            out["primary_needle"] = primary
+            out["case_sensitive"] = session.expressionCaseSensitive; out["mode"] = mode; out["normalization"] = "exact"
             out["selection"] = ["expression_generation": String(expression), "hit_id": String(hitID),
+                "case_sensitive": session.expressionCaseSensitive, "mode": mode, "normalization": "exact", "text": spelling,
                 "domain": "original-source-bytes", "original_range": ["start": String(hit.start), "end": String(hit.end)],
-                "original_hex": hex(bytes[Int(hit.start)..<Int(hit.end)])]
+                "original_hex": hex(original)]
             windowStart = hit.start - min(hit.start, 132)
             windowBytes = max(4, min(UInt64(bytes.count), hit.end + 132) - windowStart)
         }
@@ -598,17 +628,23 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             case "expression-namespace": out["selection_namespace"] = "saved-literal"
             case "expression-generation": out["expression_generation"] = String((expression ?? 0) + 1)
             case "expression-primary": out["primary_needle"] = "banana"
+            case "expression-reader-case": out["case_sensitive"] = true
+            case "expression-reader-mode": out["mode"] = "decoded-text-expression"
+            case "expression-reader-normalization": out["normalization"] = "nfc"
+            case "expression-reader-policy-missing":
+                for field in ["case_sensitive", "mode", "normalization"] { out.removeValue(forKey: field) }
             case "expression-selection":
                 var selected = out["selection"] as! [String: Any]
                 selected["query_generation"] = selected.removeValue(forKey: "expression_generation")
                 out["selection"] = selected
-            case "hit-case", "hit-mode", "hit-text", "hit-text-missing", "hit-policy-missing":
+            case "hit-case", "hit-mode", "hit-text", "hit-text-missing", "hit-policy-missing", "hit-normalization":
                 var selected = out["selection"] as! [String: Any]
                 switch fault {
                 case "hit-case": selected["case_sensitive"] = true
                 case "hit-mode": selected["mode"] = "exact-decoded-literal"
                 case "hit-text": selected["text"] = "ANA"
                 case "hit-text-missing": selected.removeValue(forKey: "text")
+                case "hit-normalization": selected["normalization"] = "nfc"
                 default:
                     for field in ["case_sensitive", "mode", "text"] { selected.removeValue(forKey: field) }
                 }
@@ -640,7 +676,8 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             case .openMember, .openRelationship, .openHit, .openExpressionHit, .openStructureHit:
                 let pause = locked { let value = blocked; blocked = false; return value }
                 if pause { entered.signal(); precondition(resume.wait(timeout: .now() + .seconds(5)) == .success) }
-            case .search, .countedSearch, .matchingSearch, .expressionSearch, .countedExpressionSearch, .structureSearch:
+            case .search, .countedSearch, .matchingSearch, .expressionSearch, .countedExpressionSearch,
+                 .matchingExpressionSearch, .structureSearch:
                 let pause = locked { let value = blockedSearch; blockedSearch = false; return value }
                 if pause { entered.signal(); precondition(resume.wait(timeout: .now() + .seconds(5)) == .success) }
             case .attachIndex, .detachIndex:
@@ -800,7 +837,8 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                         ordinal: searchHits(needle, caseSensitive: session.caseSensitive)[Int(id - 1)].member,
                         generation: nil, link: nil, side: nil, query: generation, hitID: id)
                 case .expressionSearch(let generation, let query, let matches, let bytes),
-                     .countedExpressionSearch(let generation, let query, let matches, let bytes):
+                     .countedExpressionSearch(let generation, let query, let matches, let bytes),
+                     .matchingExpressionSearch(let generation, let query, _, _, let matches, let bytes):
                     precondition(matches == 4096 && bytes == AtlasSavedSearchWire.maximumSourceBytes)
                     log.append("expression:\(handle):\(generation):\(query)")
                     guard var session = sessions[handle], generation > session.expressionAttempt else { return nil }
@@ -811,22 +849,29 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                             "error": ["code": "QUERY_SYNTAX_ERROR"]])
                     }
                     session.expressionGeneration = generation; session.expression = query
-                    if case .countedExpressionSearch = request { session.countAllExpressionMatches = true }
-                    else { session.countAllExpressionMatches = false }
+                    switch request {
+                    case .countedExpressionSearch:
+                        session.countAllExpressionMatches = true; session.expressionCaseSensitive = true
+                    case .matchingExpressionSearch(_, _, let caseSensitive, let countAll, _, _):
+                        session.countAllExpressionMatches = countAll; session.expressionCaseSensitive = caseSensitive
+                    default:
+                        session.countAllExpressionMatches = false; session.expressionCaseSensitive = true
+                    }
                     session.readBytes += UInt64(members.compactMap(\.bytes).reduce(0) { $0 + $1.count }); session.readCalls += 4
                     sessions[handle] = session
                     if fault == "expression-lost" { fault = nil; return nil }
                     return encode(expressionPage(handle, generation: generation, query: query,
-                        countAllMatches: session.countAllExpressionMatches))
+                        countAllMatches: session.countAllExpressionMatches, caseSensitive: session.expressionCaseSensitive))
                 case .expressionResults(let generation, let start, let limit):
                     log.append("expression-results:\(handle):\(generation):\(start)")
                     guard let session = sessions[handle], session.expressionGeneration == generation,
                           let query = session.expression else { return nil }
                     if fault == "expression-results" { fault = nil; return nil }
                     var page = expressionPage(handle, generation: generation, query: query, start: start, limit: limit,
-                        countAllMatches: session.countAllExpressionMatches)
+                        countAllMatches: session.countAllExpressionMatches, caseSensitive: session.expressionCaseSensitive)
                     if fault == "expression-results-primary" { fault = nil; page["primary_needle"] = "banana" }
                     if fault == "expression-count-policy" { fault = nil; page["count_all_matches"] = !session.countAllExpressionMatches }
+                    if fault == "expression-case-policy" { fault = nil; page["case_sensitive"] = !session.expressionCaseSensitive }
                     return encode(page)
                 case .clearExpression(let generation):
                     guard var session = sessions[handle], generation > session.expressionAttempt else { return nil }
@@ -839,9 +884,11 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                     return encode(out)
                 case .openExpressionHit(let reader, let generation, let id):
                     guard let session = sessions[handle], session.expressionGeneration == generation,
-                          let query = session.expression, id > 0, id <= (query == "ana path:raw" ? 2 : 4) else { return nil }
+                          let query = session.expression, id > 0 else { return nil }
+                    let hits = searchHits(expressionPrimary(query), caseSensitive: session.expressionCaseSensitive)
+                    guard id <= UInt64(query == "ana path:raw" ? min(2, hits.count) : hits.count) else { return nil }
                     log.append("expression-open:\(handle):\(generation):\(id)")
-                    return handoff(handle, reader: reader, ordinal: searchHits("ana")[Int(id - 1)].member,
+                    return handoff(handle, reader: reader, ordinal: hits[Int(id - 1)].member,
                         generation: nil, link: nil, side: nil, hitID: id, expression: generation)
                 case .structureSearch(let generation, let mode, let nameMode, let needle, let matches, let bytes):
                     precondition(matches == 4096 && bytes == AtlasSavedSearchWire.maximumSourceBytes)
