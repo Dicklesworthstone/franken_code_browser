@@ -171,6 +171,67 @@ window offsets/byte counts, `--path` queries, `--max-file-bytes` or
 indexed route. Workspace discovery limits and static exclusions still apply.
 Use `--max-files` and `--include-excluded` with an explicit workspace as before.
 
+### Progressive NDJSON output
+
+Add **`--stream`** to a whole-file search to receive discovery progress, scan
+progress, and each completed file as soon as they are available:
+
+```sh
+fcb search huge.rs --whole-file --text needle --stream
+fcb search /path/to/repository --workspace --whole-file --query 'anchor required -forbidden' --stream
+fcb search /path/to/repository --workspace --whole-file --identifier cancel --count-all --limit 50 --stream
+```
+
+This flag is explicit, requires a named file or an explicit workspace, and
+cannot be combined with `--json`. Ordinary `--json` still produces exactly one
+bounded document. Window searches, stdin, and capability reports retain their
+existing output modes.
+
+Each newline-delimited JSON record uses schema **`fcb.search-stream/1`.
+All integers, including the monotonically increasing `sequence`, are canonical
+decimal strings. Native paths retain reversible byte encodings; embedded
+newlines are JSON escapes, never record delimiters. The `start` record declares
+the query, scope, limits, and `identity_scope: "invocation-local"`. Owner,
+file, revision, and query IDs identify only this invocation; they must not
+merge observations from separate processes.
+
+| Record type | Meaning |
+| --- | --- |
+| `start` | Accepted query and explicit source/output budgets, published before source discovery or reads. |
+| `progress` | Discovery, catalog readiness, source opening, or bounded scan progress. Match counts cover finalized files only. The catalog-ready record includes discovery limits, rule diagnostics, and the existing confinement/consistency contract. |
+| `file` | One finalized source observation, with the same exact ranges, literal witnesses, encoding, coverage, truncation, and expression qualification as ordinary whole-file JSON. Unavailable sources have explicit errors. |
+| `terminal` | Final status and exit code, aggregate actual reads, coverage, finalized counts, delivered-file/hit counts, truncation, and any stopping reason. |
+
+No expression candidate hits or candidate counts are published before all
+predicates have been evaluated on that file's observed stream. Matching,
+decoding, metadata filters, ignore policy, and global byte/read/hit budgets
+are shared with ordinary whole-file search. `--count-all` can produce complete
+counts with omitted result rows; that remains a partial result (exit 3), with
+`match_count_complete: true` and `results_complete: false`.
+
+The encoder reuses one **8 MiB** record buffer instead of accumulating a
+repository response. A stream can deliver up to **256 MiB** total, with space
+reserved for its terminal record. Reaching either output limit stops further
+scanning and reports a partial terminal with `stop_reason: "output-limit"`.
+Actual read counters include work already done for a record that could not fit;
+`file_records` and `delivered_hits` distinguish delivered results from
+finalized scan counters. Progress is emitted before opening the next source,
+so a closed consumer can stop the operation before another file is read.
+
+A consumer must require exactly one final terminal record; **EOF without a
+terminal is interrupted output**, even if earlier file records were complete.
+An argument/admission error may produce a terminal alone. Cancellation at a
+clean record boundary emits a canceled terminal (exit 130). A failed write,
+failed flush, or cancellation after a partial record poisons that output:
+scanning stops, a redacted diagnostic goes to stderr, and no recovery JSON is
+appended. Records are flushed individually; delivery limits each write to
+16 KiB and allows at most 4096 write calls per record, including interrupted
+retries. A foreign writer can block inside a single write or flush; these
+bounds are not a wall-clock timeout.
+
+The progressive route is implemented but awaits the same independent strict-RCH
+verification as the existing CLI search routes.
+
 ### Retention and consistency
 
 Streaming results retain **literal witnesses only**, not arbitrary discarded

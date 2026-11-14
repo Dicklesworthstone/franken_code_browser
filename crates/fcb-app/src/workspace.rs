@@ -27,8 +27,10 @@ use crate::output::Output;
 
 const MAX_READ_CALLS: u64 = 131_072;
 
-pub(crate) fn execute(args: &Arguments, out: &mut Output, budget: &ResourceBudget,
-    canceled: &mut impl FnMut() -> bool) -> Result<u8, AppError> {
+/// Admit a catalog without consuming discovery pages, so explicit streaming
+/// callers can publish bounded discovery progress through the same policy.
+pub(crate) fn open_catalog(args: &Arguments, budget: &ResourceBudget)
+    -> Result<(PathBuf, WorkspaceCatalog), AppError> {
     if !input::NATIVE_FILE_SUPPORTED { return Err(AppError::UnsupportedPlatform); }
     let requested = input::absolute(args.file.as_deref().ok_or(AppError::InvalidRange)?)?;
     let meta = fs::symlink_metadata(&requested).map_err(|_| AppError::Io)?;
@@ -40,12 +42,18 @@ pub(crate) fn execute(args: &Arguments, out: &mut Output, budget: &ResourceBudge
     let limits = WorkspaceLimits { max_files: args.max_files, max_file_bytes: args.max_file_bytes,
         max_source_bytes: args.max_total_bytes, ..WorkspaceLimits::default() };
     let id = SearchManifestId::new(owner(), 1)?;
-    let mut catalog = if args.respect_ignores {
+    let catalog = if args.respect_ignores {
         WorkspaceCatalog::open_rule_aware(grant, id, file_id(), limits, RuleLimits::default(),
             budget, [allocation(30), allocation(39)])?
     } else {
         WorkspaceCatalog::open(grant, id, file_id(), limits, args.include_excluded, budget, allocation(30))?
     };
+    Ok((root, catalog))
+}
+
+pub(crate) fn execute(args: &Arguments, out: &mut Output, budget: &ResourceBudget,
+    canceled: &mut impl FnMut() -> bool) -> Result<u8, AppError> {
+    let (root, mut catalog) = open_catalog(args, budget)?;
     let cancel = CancelFlag::new();
     while catalog.stage() == WorkspaceStage::Discovering {
         if canceled() { return Err(AppError::Canceled); }

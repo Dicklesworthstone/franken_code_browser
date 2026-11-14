@@ -48,6 +48,11 @@ Continuous whole-file search, without retaining full source:\n\
   fcb search ROOT --workspace --whole-file --query EXPRESSION [--ignore-case] [--json]\n\
   fcb search FILE --whole-file --identifier NAME [--json]\n\
   fcb search ROOT --workspace --whole-file --identifier NAME [--json]\n\
+  Add --stream for progressive fcb.search-stream/1 NDJSON (exclusive with --json).\n\
+  Each record is bounded to 8 MiB; all output to 256 MiB. EOF without a terminal\n\
+  means interrupted output. Cancellation between records emits a canceled terminal;\n\
+  a failed/partial write or flush stops scanning without appending recovery JSON.\n\
+  Foreign writers may block inside one write/flush; no wall-clock timeout is claimed.\n\
   --count-all continues counting after --limit retained rows, within I/O limits.\n\
   Use --count-all --limit 0 for counts without retaining occurrence rows.\n\
   --raw-hex HEX also works; --max-scan-bytes N admits source I/O separately.\n\
@@ -138,14 +143,14 @@ pub(crate) fn capabilities(args: &Arguments, out: &mut Output) -> Result<u8, App
             out.literal(",\"reason\":")?; out.quoted(reason)?; out.literal("}")?;
         }
         out.literal("],\"whole_file_search\":{\"state\":")?; out.quoted(file_state)?;
-        out.literal(",\"flag\":\"--whole-file\",\"count_all_flag\":\"--count-all\",\"ignore_case_flag\":\"--ignore-case\",\"identifier_flag\":\"--identifier\",\"expression_flag\":\"--query\",\"expression_predicate_scope\":\"same-observed-stream\",\"expression_requires_complete_input\":true,\"expression_counts_full_observation\":true,\"identifier_semantics\":\"whole-token-text-candidate\",\"identifier_case_sensitive\":true,\"case_insensitive_semantics\":\"unicode-lowercase\",\"normalization\":\"exact\",\"input_buffer_bytes\":\"16384\",\"default_max_scan_bytes\":\"268435456\",\"maximum_max_scan_bytes\":\"1099511627776\",\"retention\":\"literal-witnesses-only\"}}\n")?;
+        out.literal(",\"stream_flag\":\"--stream\",\"stream_schema\":\"fcb.search-stream/1\",\"stream_identity_scope\":\"invocation-local\",\"stream_max_record_bytes\":\"8388608\",\"stream_max_output_bytes\":\"268435456\",\"stream_terminal_required\":true,\"ordinary_json_single_document\":true,\"flag\":\"--whole-file\",\"count_all_flag\":\"--count-all\",\"ignore_case_flag\":\"--ignore-case\",\"identifier_flag\":\"--identifier\",\"expression_flag\":\"--query\",\"expression_predicate_scope\":\"same-observed-stream\",\"expression_requires_complete_input\":true,\"expression_counts_full_observation\":true,\"identifier_semantics\":\"whole-token-text-candidate\",\"identifier_case_sensitive\":true,\"case_insensitive_semantics\":\"unicode-lowercase\",\"normalization\":\"exact\",\"input_buffer_bytes\":\"16384\",\"default_max_scan_bytes\":\"268435456\",\"maximum_max_scan_bytes\":\"1099511627776\",\"retention\":\"literal-witnesses-only\"}}\n")?;
     } else {
         out.literal("FrankenCodeBrowser: headless source tools; independent verification pending.\n")?;
         if diagnostic { out.literal("Static diagnostic only: no source scans, benchmarks, database opens, or repairs.\n")?; }
         for (name, state, reason) in rows { out.literal(name)?; out.literal(": ")?;
             out.literal(state)?; out.literal(" — ")?; out.literal(reason)?; out.literal("\n")?; }
         out.literal("whole-file-streaming: ")?; out.literal(file_state)?;
-        out.literal(" — explicit --whole-file; text, --query expressions or whole-token --identifier; optional text/expression --ignore-case and --count-all, global I/O budget, 16 KiB input buffer, literal witnesses only.\n")?;
+        out.literal(" — explicit --whole-file; text, --query expressions or whole-token --identifier; optional text/expression --ignore-case and --count-all, global I/O budget, 16 KiB input buffer, literal witnesses only; --stream explicitly selects progressive terminal-framed NDJSON.\n")?;
     }
     Ok(EXIT_OK)
 }

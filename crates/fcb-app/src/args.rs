@@ -22,6 +22,8 @@ pub enum Needle { Text(String), Raw(Vec<u8>), Path(String), Query(ParsedQuery), 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Arguments {
     pub command: Command, pub json: bool, pub file: Option<PathBuf>, pub stdin: bool,
+    /// Explicit versioned NDJSON for continuous named-file/workspace search.
+    pub stream: bool,
     pub offset: u64, pub bytes: usize, pub limit: usize, pub encoding: Encoding,
     pub needle: Option<Needle>, pub workspace: bool, pub include_excluded: bool,
     pub respect_ignores: bool,
@@ -52,13 +54,15 @@ impl std::fmt::Display for ArgumentError {
 impl std::error::Error for ArgumentError {}
 
 /// Option values and positional-only paths remain data, not output-mode flags.
-pub fn json_requested(args: &[OsString]) -> bool {
+pub fn json_requested(args: &[OsString]) -> bool { output_flag_requested(args, "--json") }
+pub fn stream_requested(args: &[OsString]) -> bool { output_flag_requested(args, "--stream") }
+fn output_flag_requested(args: &[OsString], flag: &str) -> bool {
     let mut cursor = 0;
     let end = args.len().min(MAX_ARGUMENTS + 1);
     while cursor < end {
         let argument = &args[cursor]; cursor += 1;
         if argument == "--" { break; }
-        if argument == "--json" { return true; }
+        if argument == flag { return true; }
         if matches!(argument.to_str(), Some("--offset" | "--bytes" | "--limit" | "--encoding" | "--text" | "--raw-hex"
             | "--query" | "--identifier" | "--path" | "--max-files" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes")) { cursor += 1; }
     }
@@ -75,7 +79,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         if total > MAX_ARGUMENT_BYTES { return Err(ArgumentError::Limit); }
     }
     let mut parsed = Arguments { command: Command::Launch, json: false, file: None,
-        stdin: false, offset: 0, bytes: 64 * 1024, limit: 100, encoding: Encoding::Auto, needle: None,
+        stdin: false, stream: false, offset: 0, bytes: 64 * 1024, limit: 100, encoding: Encoding::Auto, needle: None,
         workspace: false, include_excluded: false, respect_ignores: false, max_files: 4096,
         max_file_bytes: 1024 * 1024, max_total_bytes: 32 * 1024 * 1024,
         whole_file: false, max_scan_bytes: 256 * 1024 * 1024, ignore_case: false, count_all: false };
@@ -108,12 +112,13 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
                 "--max-file-bytes" => 2048, "--max-total-bytes" => 4096, "--path" => 8192,
                 "--whole-file" => 16384, "--max-scan-bytes" => 32768, "--respect-ignores" => 65536,
                 "--query" => 131072, "--ignore-case" => 262144, "--count-all" => 524288,
-                "--identifier" => 1048576,
+                "--identifier" => 1048576, "--stream" => 2097152,
                 _ => return Err(ArgumentError::UnknownOption),
             };
             if seen & bit != 0 { return Err(ArgumentError::DuplicateOption); }
             seen |= bit;
             if option == "--json" { parsed.json = true; continue; }
+            if option == "--stream" { parsed.stream = true; continue; }
             if option == "--stdin" { parsed.stdin = true; continue; }
             if option == "--workspace" { parsed.workspace = true; continue; }
             if option == "--include-excluded" { parsed.include_excluded = true; continue; }
@@ -181,6 +186,9 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         }
     }
     if parsed.stdin && parsed.file.is_some() { return Err(ArgumentError::MultipleSources); }
+    if parsed.stream && (parsed.json || parsed.command != Command::Search || !parsed.whole_file) {
+        return Err(ArgumentError::IncompatibleOptions);
+    }
     // A window boundary is not a token boundary. Whole identifiers use the
     // continuous observation engine, which can establish both boundaries.
     if matches!(parsed.needle.as_ref(), Some(Needle::Identifier(_))) && !parsed.whole_file {
@@ -291,6 +299,29 @@ fn hex_bytes(text: &str) -> Result<Vec<u8>, ArgumentError> {
 mod tests {
     use super::*;
     fn args(values: &[&str]) -> Vec<OsString> { values.iter().map(OsString::from).collect() }
+    #[test]
+    fn progressive_output_is_explicit_and_only_for_continuous_file_search() {
+        for source in [vec!["search", "file.rs", "--whole-file", "--text", "x", "--stream"],
+            vec!["search", "root", "--workspace", "--whole-file", "--raw-hex", "ff", "--stream"]] {
+            let parsed = parse(&args(&source)).unwrap();
+            assert!(parsed.stream && !parsed.json);
+        }
+        for source in [vec!["search", "file.rs", "--text", "x", "--stream"],
+            vec!["search", "file.rs", "--whole-file", "--text", "x", "--stream", "--json"],
+            vec!["search", "--stdin", "--whole-file", "--text", "x", "--stream"],
+            vec!["read", "file.rs", "--stream"], vec!["capabilities", "--stream"],
+            vec!["search", "file.rs", "--whole-file", "--text", "x", "--stream", "--stream"]] {
+            assert!(parse(&args(&source)).is_err(), "{source:?}");
+        }
+        let literal = args(&["search", "file.rs", "--whole-file", "--text", "--stream"]);
+        assert!(!stream_requested(&literal));
+        assert!(!parse(&literal).unwrap().stream);
+        let path = args(&["search", "--whole-file", "--text", "x", "--", "--stream"]);
+        assert!(!stream_requested(&path));
+        assert!(!parse(&path).unwrap().stream);
+        assert!(!stream_requested(&args(&["search", "file.rs", "--identifier", "--stream"])));
+    }
+
     #[test]
     fn no_machine_request_can_silently_open_the_gui() {
         assert_eq!(parse(&[]).unwrap().command, Command::Launch);

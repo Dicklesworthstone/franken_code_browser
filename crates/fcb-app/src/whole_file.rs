@@ -4,11 +4,13 @@
 //! persistent index, spool file or new matcher. The byte/call/result budgets are
 //! GLOBAL for a workspace, including work spent before a source failure.
 
+pub(crate) mod ndjson;
+
 use std::{fs::File, path::Path};
 use fcb::source::path::{NormalizedPath, RawPath};
 use fcb::ByteLength;
 use fcb::search::{CaptureRequest, DetectedEncoding, ExtentConsistency, FileSearch, FileSearchReport,
-    ParsedQuery, ReferenceScanOracle, ResourceBudget, StreamReadOptions, StreamReadState, StreamReadStep,
+    ParsedQuery, ReferenceScanOracle, ResourceBudget, StreamReadOptions, StreamReadState, StreamReadStats, StreamReadStep,
     StreamingMode, StreamingNeedle};
 use fcb::search::workspace::WorkspaceCatalog;
 use crate::{AppError, SCHEMA, EXIT_OK, EXIT_NO_MATCH, EXIT_PARTIAL, allocation, owner, generation, revision, file_id};
@@ -67,18 +69,30 @@ fn options(args: &Arguments, bytes: u64, calls: u64, matches: usize) -> StreamRe
 fn scan<'needle>(file: File, request: CaptureRequest, needle: &'needle StreamingNeedle,
     options: StreamReadOptions, count_all: bool, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool)
     -> Result<FileSearchReport<'needle>, AppError> {
+    scan_with_progress(file, request, needle, options, count_all, budget, canceled, |_, _| Ok(()))
+}
+
+/// The ordinary response and explicit NDJSON driver share one scanner. The
+/// observer receives only bounded work counters; candidate expression hits
+/// cannot escape before finish establishes same-observation qualification.
+fn scan_with_progress<'needle, C: FnMut() -> bool, E: From<AppError>>(
+    file: File, request: CaptureRequest, needle: &'needle StreamingNeedle,
+    options: StreamReadOptions, count_all: bool, budget: &ResourceBudget, canceled: &mut C,
+    mut progress: impl FnMut(StreamReadStats, &mut C) -> Result<(), E>)
+    -> Result<FileSearchReport<'needle>, E> {
     let mut scan = if count_all {
-        FileSearch::new_counting(file, request, needle, options, budget, allocation(41))?
+        FileSearch::new_counting(file, request, needle, options, budget, allocation(41))
     } else {
-        FileSearch::new(file, request, needle, options, budget, allocation(41))?
-    };
+        FileSearch::new(file, request, needle, options, budget, allocation(41))
+    }.map_err(AppError::from)?;
     while scan.state() == StreamReadState::Pending {
         // Read/decoder failures are retained terminal report states. No retry
         // restarts at byte zero and silently double-counts a partial observation.
         let _ = scan.step(StreamReadStep::default(), generation(), &mut *canceled);
+        progress(scan.stats(), canceled)?;
     }
-    if canceled() || scan.state() == StreamReadState::Canceled { return Err(AppError::Canceled); }
-    Ok(scan.finish()?)
+    if canceled() || scan.state() == StreamReadState::Canceled { return Err(AppError::Canceled.into()); }
+    Ok(scan.finish().map_err(AppError::from)?)
 }
 
 pub(crate) fn single(args: &Arguments, out: &mut Output, budget: &ResourceBudget,

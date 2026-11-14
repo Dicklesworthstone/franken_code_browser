@@ -178,11 +178,15 @@ pub fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut impl Writ
         return snapshot::run(&arguments[1..], stdout, stderr, canceled);
     }
     let wants_json = args::json_requested(arguments);
+    let wants_stream = args::stream_requested(arguments);
     let parsed = args::parse(arguments);
     let budget = match ResourceBudget::new(owner(), ByteLength::new(MANAGED_BYTES)) {
         Ok(budget) => budget,
         Err(_) => { let _ = stderr.write(b"CLI_RESOURCE_DENIED\n"); return EXIT_ERROR; }
     };
+    if wants_stream {
+        return whole_file::ndjson::run(parsed, stdout, stderr, &budget, &mut canceled);
+    }
     let size = match parsed.as_ref() {
         Ok(args) if args.workspace || matches!(args.command, Command::Read | Command::Open | Command::Search) => MAX_RESPONSE_BYTES,
         _ => 16 * 1024,
