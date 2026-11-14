@@ -249,8 +249,8 @@ extension AtlasObservedReaderModel {
                     Text("4 GiB").tag(AtlasObservedReaderSearchLimits.maximumScanBytes)
                 }.frame(width: 185)
                 Button(model.searching ? "Restart Find" : "Find", action: model.find).disabled(!model.canSearch)
-                Button("Previous match", action: model.previousSearchHit).disabled(!model.canSelectSearchHit)
-                Button("Next match", action: model.nextSearchHit).disabled(!model.canSelectSearchHit)
+                Button("Previous match", action: model.previousSearchHit).disabled(!model.canPreviousSearchHit)
+                Button("Next match", action: model.nextSearchHit).disabled(!model.canNextSearchHit)
             }
             HStack(spacing: 7) {
                 Picker("Find mode", selection: $model.searchMode) {
@@ -262,10 +262,10 @@ extension AtlasObservedReaderModel {
                     .help(model.searchMode == .occurrences ? "Whole identifiers always use exact case."
                         : "When off, use Unicode lowercase matching and retain the original spelling and byte ranges")
                 Toggle("Count all matches", isOn: $model.countAllSearchMatches).toggleStyle(.checkbox)
-                    .help("Continue counting after the first 256 retained matches, within the selected scan and read-call limits")
+                    .help("Continue counting beyond this page’s 256 retained matches, within the selected scan and read-call limits")
                 Text(model.countAllSearchMatches
-                    ? "Keep the first 256 matches but continue counting. The count is exact only when the observation completes unchanged."
-                    : "Find stops at the first match beyond the retained-result limit.")
+                    ? "Keep up to 256 matches on the requested page and continue counting. The count is exact only when the observation completes unchanged."
+                    : "Find stops at the first match beyond the requested result page.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
             Text(model.searchMode == .occurrences
@@ -273,6 +273,16 @@ extension AtlasObservedReaderModel {
                 : "Find starts at byte 0 using the selected decoding, with at most 256 retained matches. A scan limit or file change leaves the total count unknown.")
                 .font(.caption2).foregroundStyle(.secondary)
             if let report = model.searchReport {
+                if model.supportsSearchPages {
+                    HStack(spacing: 7) {
+                        Button("Rescan previous matches", action: model.previousSearchPage)
+                            .disabled(!model.canPreviousSearchPage)
+                        Button("Rescan next matches", action: model.nextSearchPage)
+                            .disabled(!model.canNextSearchPage)
+                        Text("Each rescan reads current bytes from the beginning. Changes can shift occurrence numbers.")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }.controlSize(.small)
+                }
                 HStack(alignment: .top, spacing: 12) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(report.request.mode.label + " · " + report.countLabel).font(.caption.bold())
@@ -286,7 +296,7 @@ extension AtlasObservedReaderModel {
                                             HStack {
                                                 Image(systemName: model.selectedSearchWitness?.target == report.target(for: hit)
                                                     ? "checkmark.circle.fill" : "text.magnifyingglass")
-                                                Text("\(hit.index + 1). bytes \(hit.range.start)..<\(hit.range.end)")
+                                                Text("\(hit.occurrence). bytes \(hit.range.start)..<\(hit.range.end)")
                                                     .font(.system(.caption, design: .monospaced))
                                             }
                                         }
@@ -319,7 +329,11 @@ extension AtlasObservedReaderModel {
                         }.frame(maxWidth: .infinity, alignment: .leading)
                     } else {
                         Text(report.hits.isEmpty
-                            ? (report.searchComplete
+                            ? (report.request.pageStartAfter > 0
+                                ? "No matches from the requested result page were retained. " + (report.matchCountComplete
+                                    ? "This new observation counted \(report.matchesSeen) matches in total."
+                                    : "A partial search cannot prove that the unsearched remainder has no matches.")
+                                : report.searchComplete
                                 ? "No matches in the observed input. Metadata checks did not detect a change; the scan is not an atomic snapshot."
                                 : "A partial search cannot prove that the unsearched remainder has no matches.")
                             : "Select a result to verify its retained literal. Read current context is a separate explicit action.")

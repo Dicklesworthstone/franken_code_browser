@@ -27,6 +27,11 @@ private typealias ObservedReaderPoll = @convention(c) (UnsafeMutableRawPointer?)
     _ mode: UInt64, _ caseSensitive: UInt64, _ countAllMatches: UInt64,
     _ maximumMatches: UInt64, _ maximumScanBytes: UInt64,
     _ poll: ObservedReaderPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_observed_reader_find_page") private func observedReaderFindPage(
+    _ handle: UInt64, _ generation: UInt64, _ needle: UnsafePointer<CChar>?, _ encoding: UInt64,
+    _ mode: UInt64, _ caseSensitive: UInt64, _ countAllMatches: UInt64, _ startAfter: UInt64,
+    _ maximumMatches: UInt64, _ maximumScanBytes: UInt64,
+    _ poll: ObservedReaderPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_observed_reader_find") private func observedReaderFind(
     _ handle: UInt64, _ generation: UInt64, _ needle: UnsafePointer<CChar>?, _ encoding: UInt64,
     _ maximumMatches: UInt64, _ maximumScanBytes: UInt64,
@@ -78,7 +83,8 @@ extension AtlasObservedReaderTransport {
         cancel: { observedReaderCancel($0) != 0 }, close: { observedReaderClose($0) != 0 },
         retirementFailed: { NSLog("Observed range reader retirement could not be confirmed") },
         search: .init(find: { handle, request, cancellation in
-            try observedReaderPolling(cancellation) { poll, context in
+            guard request.pageStartAfter == 0 else { throw AtlasObservedReaderError.invalidInput }
+            return try observedReaderPolling(cancellation) { poll, context in
                 request.needle.withCString { needle in
                     if request.mode == .occurrences {
                         return observedReaderFindMode(handle, request.generation, needle, request.encoding.abi,
@@ -119,6 +125,15 @@ extension AtlasObservedReaderTransport {
             }
             return try observedReaderPolling(cancellation) { poll, context in
                 observedReaderObserveHit(handle, target.generation, target.hit.index, prefix, request.bytes, poll, context)
+            }
+        }, findPage: { handle, request, cancellation in
+            try observedReaderPolling(cancellation) { poll, context in
+                request.needle.withCString { needle in
+                    observedReaderFindPage(handle, request.generation, needle, request.encoding.abi,
+                        request.mode == .occurrences ? 1 : 0, request.caseSensitive ? 1 : 0,
+                        request.countAllMatches ? 1 : 0, request.pageStartAfter,
+                        request.maximumMatches, request.maximumScanBytes, poll, context)
+                }
             }
         }), lines: { handle, request, cancellation in
             try observedReaderPolling(cancellation) { poll, context in

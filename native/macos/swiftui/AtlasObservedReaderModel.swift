@@ -278,6 +278,29 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     var canSelectSearchHit: Bool {
         searchAuthorized && !closed && !busy && session != nil && !(searchReport?.hits.isEmpty ?? true)
     }
+    private var selectedSearchIndex: UInt64? {
+        guard let report = searchReport, let witness = selectedSearchWitness,
+              report.admits(witness.target) else { return nil }
+        return witness.target.hit.index
+    }
+    var canNextSearchHit: Bool {
+        guard canSelectSearchHit, let report = searchReport else { return false }
+        return report.containsCompleteMatchInventory
+            || (selectedSearchIndex.map { $0 + 1 < UInt64(report.hits.count) } ?? true)
+    }
+    var canPreviousSearchHit: Bool {
+        guard canSelectSearchHit, let report = searchReport else { return false }
+        return report.containsCompleteMatchInventory || (selectedSearchIndex.map { $0 > 0 } ?? true)
+    }
+    var supportsSearchPages: Bool { transport.search?.findPage != nil }
+    var canPreviousSearchPage: Bool {
+        canSearch && searchAuthorized && !busy && supportsSearchPages && (searchReport?.request.pageStartAfter ?? 0) > 0
+    }
+    var canNextSearchPage: Bool {
+        guard canSearch, searchAuthorized, !busy, supportsSearchPages,
+              let report = searchReport, report.pageHasMoreMatches, !report.hits.isEmpty else { return false }
+        return !report.request.pageStartAfter.addingReportingOverflow(UInt64(report.hits.count)).overflow
+    }
     var canReadSearchContext: Bool { canSelectSearchHit && selectedSearchWitness != nil }
     var canGoToVerifiedMatch: Bool { canReadSearchContext && transport.search?.observeHit != nil }
     var searchCoverage: String? {
@@ -606,14 +629,37 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     /// Find shares the same owner, grant and one-active/one-pending queue as
     /// range reads. A failed same-query replacement preserves its old receipt;
     /// editing any query input revokes the receipt before another call begins.
-    func find() {
+    func find() { runSearch(pageStartAfter: 0, rescan: false) }
+
+    /// Result pages are explicit fresh scans of the current opened object.
+    /// Nothing from the old scan is merged or relabeled as retained continuity.
+    func nextSearchPage() {
+        guard canNextSearchPage, let report = searchReport else { return }
+        let (offset, overflow) = report.request.pageStartAfter.addingReportingOverflow(UInt64(report.hits.count))
+        guard !overflow else { return }
+        runSearch(pageStartAfter: offset, rescan: true)
+    }
+
+    func previousSearchPage() {
+        guard canPreviousSearchPage, let report = searchReport else { return }
+        let offset = report.request.pageStartAfter - min(report.request.pageStartAfter, report.request.maximumMatches)
+        runSearch(pageStartAfter: offset, rescan: true)
+    }
+
+    private func runSearch(pageStartAfter: UInt64, rescan: Bool) {
         guard canSearch, let session, let input = authority?.input,
               let search = session.transport.search else { return }
+        let execute: @Sendable (UInt64, AtlasObservedReaderSearchRequest, AtlasSearchCancellation) throws -> String?
+        if rescan {
+            guard let findPage = search.findPage else { return }
+            execute = findPage
+        } else { execute = search.find }
         let request: AtlasObservedReaderSearchRequest
         do {
             request = try .init(generation: lastSearchGeneration + 1, needle: searchText,
                 encoding: encoding, maximumScanBytes: searchScanBytes,
-                countAllMatches: countAllSearchMatches, caseSensitive: effectiveSearchCaseSensitive, mode: searchMode)
+                countAllMatches: countAllSearchMatches, caseSensitive: effectiveSearchCaseSensitive, mode: searchMode,
+                pageStartAfter: pageStartAfter)
         } catch {
             notice = searchMode == .occurrences
                 ? "Enter one exact identifier of at most 1024 UTF-8 bytes, and choose a bounded scan limit."
@@ -625,12 +671,15 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         // rejected. Old literal bytes stay readable, but their query cannot
         // lend authority to more hit actions without an accepted new receipt.
         searchAuthorized = false
-        let (ticket, flag) = begin("Searching up to \(request.maximumScanBytes) bytes of the opened file…")
+        let message = rescan
+            ? "Rescanning current bytes from the beginning, skipping up to \(pageStartAfter) matches in a new observation…"
+            : "Searching up to \(request.maximumScanBytes) bytes of the opened file…"
+        let (ticket, flag) = begin(message)
         searchOperation = true; searching = true
         task = Task {
             do {
                 let report = try await io.perform(cancellation: flag, keepingAlive: [session]) {
-                    try AtlasObservedReaderSearchReport.decode(search.find(session.handle, request, flag),
+                    try AtlasObservedReaderSearchReport.decode(execute(session.handle, request, flag),
                         handle: session.handle, input: input, request: request)
                 }
                 guard accepts(ticket, flag), self.session === session,
@@ -651,7 +700,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     func selectSearchHit(_ target: AtlasObservedReaderSearchTarget) {
         guard canSelectSearchHit, let report = searchReport, report.admits(target),
               let session, let input = authority?.input, let search = session.transport.search else { return }
-        let (ticket, flag) = begin("Verifying the retained literal for result \(target.hit.index + 1)…")
+        let (ticket, flag) = begin("Verifying the retained literal for occurrence \(target.hit.occurrence)…")
         selectedSearchWitness = nil; clearSearchContext(); searchOperation = true
         task = Task {
             do {
@@ -667,16 +716,15 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     }
 
     func nextSearchHit() {
-        guard canSelectSearchHit, let report = searchReport else { return }
-        let current = selectedSearchWitness.flatMap { report.admits($0.target) ? $0.target.hit.index : nil }
-        let index = current.map { ($0 + 1) % UInt64(report.hits.count) } ?? 0
+        guard canNextSearchHit, let report = searchReport else { return }
+        let index = selectedSearchIndex.map { ($0 + 1) % UInt64(report.hits.count) } ?? 0
         selectSearchHit(report.target(for: report.hits[Int(index)]))
     }
     func previousSearchHit() {
-        guard canSelectSearchHit, let report = searchReport else { return }
+        guard canPreviousSearchHit, let report = searchReport else { return }
         let count = UInt64(report.hits.count)
-        let current = selectedSearchWitness.flatMap { report.admits($0.target) ? $0.target.hit.index : nil }
-        let index = current.map { ($0 + count - 1) % count } ?? (count - 1)
+        let index = selectedSearchIndex.map { ($0 + count - 1) % count }
+            ?? (report.containsCompleteMatchInventory ? count - 1 : 0)
         selectSearchHit(report.target(for: report.hits[Int(index)]))
     }
 

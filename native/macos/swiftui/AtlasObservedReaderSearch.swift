@@ -26,12 +26,13 @@ struct AtlasObservedReaderSearchRequest: Equatable, Sendable {
     let countAllMatches: Bool
     let caseSensitive: Bool
     let mode: AtlasObservedReaderSearchMode
+    let pageStartAfter: UInt64
 
     init(generation: UInt64, needle: String, encoding: AtlasObservedReaderEncoding,
          maximumMatches: UInt64 = AtlasObservedReaderSearchLimits.matches,
          maximumScanBytes: UInt64 = AtlasObservedReaderSearchLimits.scanBytes,
          countAllMatches: Bool = false, caseSensitive: Bool = true,
-         mode: AtlasObservedReaderSearchMode = .text) throws {
+         mode: AtlasObservedReaderSearchMode = .text, pageStartAfter: UInt64 = 0) throws {
         guard generation > 0, !needle.isEmpty,
               needle.utf8.count <= AtlasObservedReaderSearchLimits.needleBytes,
               !needle.utf8.contains(0),
@@ -44,13 +45,14 @@ struct AtlasObservedReaderSearchRequest: Equatable, Sendable {
         self.maximumMatches = maximumMatches; self.maximumScanBytes = maximumScanBytes
         self.countAllMatches = countAllMatches
         self.caseSensitive = caseSensitive; self.mode = mode
+        self.pageStartAfter = pageStartAfter
     }
 
     static func == (a: Self, b: Self) -> Bool {
         a.generation == b.generation && a.needle.utf8.elementsEqual(b.needle.utf8)
             && a.encoding == b.encoding && a.maximumMatches == b.maximumMatches
             && a.maximumScanBytes == b.maximumScanBytes && a.countAllMatches == b.countAllMatches
-            && a.caseSensitive == b.caseSensitive && a.mode == b.mode
+            && a.caseSensitive == b.caseSensitive && a.mode == b.mode && a.pageStartAfter == b.pageStartAfter
     }
 
     /// Reverse encoding is only a correlation check against engine receipts;
@@ -92,6 +94,10 @@ struct AtlasObservedReaderSearchTransport: Sendable {
     let hit: @Sendable (UInt64, UInt64, UInt64) throws -> String?
     var observeHit: (@Sendable (UInt64, AtlasObservedReaderSearchWitness, AtlasObservedReaderRequest,
         AtlasSearchCancellation) throws -> String?)? = nil
+    /// Replays current bytes from zero under a new generation and observation.
+    /// This does not continue an immutable capture of the previous result page.
+    var findPage: (@Sendable (UInt64, AtlasObservedReaderSearchRequest,
+        AtlasSearchCancellation) throws -> String?)? = nil
 }
 
 struct AtlasObservedReaderSearchHit: Equatable, Identifiable, Sendable {
@@ -113,6 +119,7 @@ struct AtlasObservedReaderSearchTarget: Equatable, Sendable {
 /// query replacement. Its exact decoded range remains usable in retained history.
 struct AtlasObservedReaderHitNavigation: Equatable, Sendable, Decodable {
     let generation, searchObservation, index, occurrence: UInt64
+    let pageStartAfter: UInt64
     let originalRange, decodedRange: AtlasObservedByteRange
     let mode: String?
     let caseSensitive, tokenBoundariesVerified: Bool?
@@ -123,6 +130,9 @@ struct AtlasObservedReaderHitNavigation: Equatable, Sendable, Decodable {
         searchObservation = try c.decode(AtlasObservedReaderWire.Number.self, forKey: .search_observation).value
         index = try c.decode(AtlasObservedReaderWire.Number.self, forKey: .hit_index).value
         occurrence = try c.decode(AtlasObservedReaderWire.Number.self, forKey: .occurrence_id).value
+        if c.contains(.page_start_after) {
+            pageStartAfter = try c.decode(AtlasObservedReaderWire.Number.self, forKey: .page_start_after).value
+        } else { pageStartAfter = 0 }
         originalRange = try c.decode(AtlasObservedByteRange.self, forKey: .original_range)
         decodedRange = try c.decode(AtlasObservedByteRange.self, forKey: .decoded_utf8_range)
         mode = try c.decodeIfPresent(String.self, forKey: .mode)
@@ -139,15 +149,18 @@ struct AtlasObservedReaderHitNavigation: Equatable, Sendable, Decodable {
         if mode == "whole-token-occurrences" {
             try AtlasObservedReaderModeEvidence(from: decoder).validate(.occurrences)
         }
+        let (ordinal, overflow) = pageStartAfter.addingReportingOverflow(index)
+        let (expectedOccurrence, occurrenceOverflow) = ordinal.addingReportingOverflow(1)
         guard generation > 0, searchObservation > 0, index < AtlasObservedReaderSearchLimits.matches,
-              occurrence == index + 1, originalRange.count > 0, decodedRange.count > 0,
+              !overflow, !occurrenceOverflow, occurrence == expectedOccurrence,
+              originalRange.count > 0, decodedRange.count > 0,
               try c.decode(Bool.self, forKey: .witness_verified),
               try c.decode(String.self, forKey: .verification) == "equal-original-bytes-in-new-observation" else {
             throw AtlasObservedReaderError.invalidResponse
         }
     }
     private enum CodingKeys: CodingKey {
-        case query_generation, search_observation, hit_index, occurrence_id, original_range,
+        case query_generation, search_observation, hit_index, occurrence_id, page_start_after, original_range,
              decoded_utf8_range, witness_verified, verification, mode, case_sensitive, token_boundaries_verified
     }
 }
@@ -164,6 +177,8 @@ struct AtlasObservedReaderSearchReport: Sendable {
     let originalHex, witnessSHA256: String?
     let retainedWitnessBytes: UInt64
     let hits: [AtlasObservedReaderSearchHit]
+    let skippedMatches: UInt64
+    let pageHasMoreMatches: Bool
 
     func target(for hit: AtlasObservedReaderSearchHit) -> AtlasObservedReaderSearchTarget {
         .init(identity: identity, generation: request.generation, observation: observation, hit: hit)
@@ -172,22 +187,35 @@ struct AtlasObservedReaderSearchReport: Sendable {
         target.identity == identity && target.generation == request.generation && target.observation == observation
             && target.hit.index < UInt64(hits.count) && hits[Int(target.hit.index)] == target.hit
     }
+    var containsCompleteMatchInventory: Bool {
+        request.pageStartAfter == 0 && matchCountComplete && matchesSeen == UInt64(hits.count)
+    }
+    var retainedLabel: String {
+        guard let first = hits.first, let last = hits.last else {
+            return request.pageStartAfter == 0 ? "0 retained"
+                : "no matches retained after occurrence \(request.pageStartAfter)"
+        }
+        return request.pageStartAfter == 0 ? "first \(hits.count) retained"
+            : "occurrences \(first.occurrence)–\(last.occurrence) retained"
+    }
     var countLabel: String {
         if matchCountComplete {
             let total = "\(matchesSeen) matches in the observed input"
-            return matchesSeen > UInt64(hits.count) ? total + "; first \(hits.count) retained" : total
+            return request.pageStartAfter > 0 || matchesSeen > UInt64(hits.count)
+                ? total + "; " + retainedLabel : total
         }
         if request.countAllMatches {
-            return "At least \(matchesSeen) matches; first \(hits.count) retained · partial count"
+            return "At least \(matchesSeen) matches; \(retainedLabel) · partial count"
         }
-        if state == "match-limit" { return "At least \(matchesSeen) matches; first \(hits.count) retained" }
-        return "\(hits.count) retained matches · partial search"
+        if state == "match-limit" { return "At least \(matchesSeen) matches; \(retainedLabel)" }
+        return request.pageStartAfter == 0 ? "\(hits.count) retained matches · partial search"
+            : "At least \(matchesSeen) matches; \(retainedLabel) · partial search"
     }
     var coverage: String {
         let reason: String
         switch state {
         case "complete-observed-input": reason = "Reached the length observed before the scan."
-        case "match-limit": reason = "Stopped at the match limit. Later matches are unknown."
+        case "match-limit": reason = "Stopped after verifying a match beyond this result page. The total match count is unknown."
         case "byte-limit": reason = "Stopped at the byte limit. Remaining bytes are unsearched."
         case "read-call-limit": reason = "Stopped at the read-call limit. Remaining bytes are unsearched."
         case "short-read": reason = "The opened file ended before its initially observed length."
@@ -196,11 +224,14 @@ struct AtlasObservedReaderSearchReport: Sendable {
         let changed = consistency == "unchanged-metadata-not-atomic"
             ? " Metadata checks did not detect a change; this is not an atomic snapshot."
             : " Metadata or read consistency: \(consistency). The total match count is unknown."
-        let retained = request.countAllMatches && matchesSeen > UInt64(hits.count)
+        let retained = request.pageStartAfter > 0
+            ? " This scan skipped \(skippedMatches) earlier matches; \(retainedLabel)."
+            : request.countAllMatches && matchesSeen > UInt64(hits.count)
             ? " The result list retains the first \(hits.count) matches; the count includes later occurrences."
             : ""
         return "Scanned \(scannedInputBytes) of \(observedLength) initially observed bytes; read \(payloadBytesRead) bytes in \(readCalls) calls. "
             + reason + changed + retained + " Only matching bytes are retained, without surrounding context."
+            + " Rescanning a result page reads current bytes from the beginning and creates a new observation; edits can change occurrence numbers."
             + (request.mode == .occurrences
                 ? " Whole-token spelling matches include comments and literals; compiler references are not established." : "")
     }
@@ -228,6 +259,11 @@ struct AtlasObservedReaderSearchReport: Sendable {
                 guard !request.countAllMatches else { throw AtlasObservedReaderError.invalidResponse }
                 matchCountComplete = observation.searchComplete
             }
+            let skippedMatches = min(request.pageStartAfter, w.matches_seen.value)
+            let availableMatches = w.matches_seen.value - skippedMatches
+            let pageHasMoreMatches = availableMatches > count
+            try decoder.decode(AtlasObservedReaderSearchPageEvidence.self, from: data)
+                .validate(startAfter: request.pageStartAfter, skipped: skippedMatches, hasMore: pageHasMoreMatches)
             guard w.mode == request.wireMode, w.case_sensitive == request.caseSensitive,
                   w.literal_text.utf8.elementsEqual(request.needle.utf8),
                   w.max_matches.value == request.maximumMatches, w.max_scan_bytes.value == request.maximumScanBytes,
@@ -242,13 +278,13 @@ struct AtlasObservedReaderSearchReport: Sendable {
                   w.additional_read_calls.value == w.read_calls.value,
                   w.truncated == (w.matches_seen.value > count),
                   count <= w.matches_seen.value, w.matches_seen.value <= w.scanned_input_bytes.value,
-                  !w.truncated || count == request.maximumMatches,
+                  count == min(availableMatches, request.maximumMatches),
                   !observation.inputComplete || (w.scanned_input_bytes.value == observation.length
                     && w.payload_bytes_read.value == observation.length),
                   w.observation.state != "byte-limit" || w.payload_bytes_read.value == request.maximumScanBytes,
                   w.observation.state != "read-call-limit" || w.read_calls.value == AtlasObservedReaderSearchLimits.readCalls,
                   (w.observation.state == "unsupported-text") == (w.unsupported_at != nil),
-                  w.observation.state != "unsupported-text" || count == 0,
+                  w.observation.state != "unsupported-text" || (count == 0 && w.matches_seen.value == 0),
                   w.unsupported_at.map({ $0.value < w.payload_bytes_read.value }) ?? true,
                   (count == 0 || !request.caseSensitive ? (w.literal_original_hex == nil && w.literal_sha256 == nil)
                     : (w.literal_original_hex == encoded
@@ -258,8 +294,8 @@ struct AtlasObservedReaderSearchReport: Sendable {
             if request.countAllMatches {
                 guard w.observation.state != "match-limit" else { throw AtlasObservedReaderError.invalidResponse }
             } else {
-                guard w.truncated == (w.observation.state == "match-limit"),
-                      w.matches_seen.value == count + (w.truncated ? 1 : 0) else {
+                guard pageHasMoreMatches == (w.observation.state == "match-limit"),
+                      availableMatches == count + (pageHasMoreMatches ? 1 : 0) else {
                     throw AtlasObservedReaderError.invalidResponse
                 }
             }
@@ -267,7 +303,10 @@ struct AtlasObservedReaderSearchReport: Sendable {
             var witnessBytes: UInt64 = 0
             for (index, hit) in w.hits.enumerated() {
                 let digest = request.caseSensitive ? w.literal_sha256 : hit.witness_sha256
-                guard hit.index.value == UInt64(index), hit.occurrence_id.value == UInt64(index) + 1,
+                let (ordinal, overflow) = request.pageStartAfter.addingReportingOverflow(UInt64(index))
+                let (occurrence, occurrenceOverflow) = ordinal.addingReportingOverflow(1)
+                guard !overflow, !occurrenceOverflow,
+                      hit.index.value == UInt64(index), hit.occurrence_id.value == occurrence,
                       AtlasObservedReaderSearchRequest.validWitnessRange(hit.original_range, needle: request.needle,
                         encoding: request.encoding, caseSensitive: request.caseSensitive),
                       hit.original_range.end <= w.scanned_input_bytes.value,
@@ -295,7 +334,8 @@ struct AtlasObservedReaderSearchReport: Sendable {
                 readCalls: w.read_calls.value, peakInputBufferBytes: w.peak_input_buffer_bytes.value,
                 matchesSeen: w.matches_seen.value, unsupportedAt: w.unsupported_at?.value,
                 originalHex: w.literal_original_hex, witnessSHA256: w.literal_sha256,
-                retainedWitnessBytes: witnessBytes, hits: hits)
+                retainedWitnessBytes: witnessBytes, hits: hits,
+                skippedMatches: skippedMatches, pageHasMoreMatches: pageHasMoreMatches)
         } catch { throw AtlasObservedReaderError.invalidResponse }
     }
 
@@ -366,6 +406,9 @@ struct AtlasObservedReaderSearchWitness: Sendable {
                 .identity(handle: handle, input: input, command: "search-hit")
             let common = try decoder.decode(AtlasObservedReaderSearchWire.Observation.self, from: data)
             let observation = try common.value(request: report.request)
+            try decoder.decode(AtlasObservedReaderSearchPageEvidence.self, from: data)
+                .validate(startAfter: report.request.pageStartAfter, skipped: report.skippedMatches,
+                    hasMore: report.pageHasMoreMatches)
             if w.mode != nil || w.case_sensitive != nil || !report.request.caseSensitive || report.request.mode == .occurrences {
                 guard w.mode == report.request.wireMode, w.case_sensitive == report.request.caseSensitive else {
                     throw AtlasObservedReaderError.invalidResponse
@@ -514,6 +557,26 @@ enum AtlasObservedReaderSearchContext: Equatable, Sendable {
         case .unavailable: return "The result range is unavailable in this new observation. No old-match highlight was applied."
         }
     }
+}
+
+/// All page proof fields travel together. Earlier transports may omit them
+/// only for a query beginning with the first match.
+private struct AtlasObservedReaderSearchPageEvidence: Decodable {
+    let present: Bool
+    let startAfter, skipped: AtlasObservedReaderWire.Number?
+    let hasMore: Bool?
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        present = c.contains(.page_start_after) || c.contains(.skipped_matches) || c.contains(.page_has_more_matches)
+        startAfter = try c.decodeIfPresent(AtlasObservedReaderWire.Number.self, forKey: .page_start_after)
+        skipped = try c.decodeIfPresent(AtlasObservedReaderWire.Number.self, forKey: .skipped_matches)
+        hasMore = try c.decodeIfPresent(Bool.self, forKey: .page_has_more_matches)
+    }
+    func validate(startAfter: UInt64, skipped: UInt64, hasMore: Bool) throws {
+        guard present ? (self.startAfter?.value == startAfter && self.skipped?.value == skipped && self.hasMore == hasMore)
+            : startAfter == 0 else { throw AtlasObservedReaderError.invalidResponse }
+    }
+    private enum CodingKeys: CodingKey { case page_start_after, skipped_matches, page_has_more_matches }
 }
 
 /// Additive proof fields are mandatory for Occurrences. A literal response

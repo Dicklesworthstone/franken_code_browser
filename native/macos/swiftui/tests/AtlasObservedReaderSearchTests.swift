@@ -40,14 +40,17 @@ private enum ObservedSearchFixture {
         out["payload_bytes_read"] = String(bytes); out["scanned_input_bytes"] = String(bytes)
         out["read_calls"] = bytes == 0 ? "0" : "1"
         out["peak_input_buffer_bytes"] = String(min(bytes, AtlasObservedReaderSearchLimits.inputBufferBytes))
-        let seen = matchesSeen ?? UInt64(offsets.count + (state == "match-limit" ? 1 : 0))
+        let seen = matchesSeen ?? (request.pageStartAfter + UInt64(offsets.count + (state == "match-limit" ? 1 : 0)))
         out["matches_seen"] = String(seen)
         out["retained_hits"] = String(offsets.count); out["truncated"] = seen > UInt64(offsets.count)
+        let skipped = min(request.pageStartAfter, seen)
+        out["page_start_after"] = String(request.pageStartAfter); out["skipped_matches"] = String(skipped)
+        out["page_has_more_matches"] = seen - skipped > UInt64(offsets.count)
         out["unsupported_at"] = NSNull()
         out["additional_source_bytes_read"] = String(bytes); out["additional_read_calls"] = out["read_calls"]
         out["hits"] = offsets.enumerated().map { index, start in
             let literalBytes = UInt64(AtlasObservedReaderSearchRequest.originalBytes(literals[index], encoding: request.encoding).count)
-            var row: [String: Any] = ["index": String(index), "occurrence_id": String(index + 1),
+            var row: [String: Any] = ["index": String(index), "occurrence_id": String(request.pageStartAfter + UInt64(index) + 1),
                 "original_range": ObservedReaderFixture.range(start, start + literalBytes)]
             if !request.caseSensitive {
                 row["witness_sha256"] = String(repeating: index % 2 == 0 ? "b" : "c", count: 64)
@@ -78,6 +81,7 @@ private enum ObservedSearchFixture {
 private final class ObservedSearchProbe: @unchecked Sendable {
     let lifetime = ObservedReaderProbe()
     private let verifiedNavigation: Bool
+    private let paging: Bool
     private let lock = NSLock()
     private var inputs: [UInt64: AtlasObservedReaderInput] = [:]
     private var revisions: [UInt64: UInt64] = [:]
@@ -91,14 +95,21 @@ private final class ObservedSearchProbe: @unchecked Sendable {
     private var active = 0, mostActive = 0, windows = 0, hits = 0
     private var verifiedJumps = 0
     private var generations: [UInt64] = []
+    private var startAfters: [UInt64] = []
 
-    init(verifiedNavigation: Bool = false) { self.verifiedNavigation = verifiedNavigation }
+    init(verifiedNavigation: Bool = false, paging: Bool = true) {
+        self.verifiedNavigation = verifiedNavigation; self.paging = paging
+    }
 
     var transport: AtlasObservedReaderTransport {
         let base = lifetime.transport
         let verified: (@Sendable (UInt64, AtlasObservedReaderSearchWitness, AtlasObservedReaderRequest,
             AtlasSearchCancellation) throws -> String?)? = verifiedNavigation ? { owner, witness, request, _ in
                 try self.verifiedJump(owner, witness, request)
+            } : nil
+        let paged: (@Sendable (UInt64, AtlasObservedReaderSearchRequest,
+            AtlasSearchCancellation) throws -> String?)? = paging ? { owner, request, _ in
+                try self.find(owner, request)
             } : nil
         return .init(create: base.create,
             open: { owner, input, flag in
@@ -111,7 +122,8 @@ private final class ObservedSearchProbe: @unchecked Sendable {
             copy: { owner, observation, start, end in try self.copy(owner, observation, start, end) },
             cancel: base.cancel, close: base.close, retirementFailed: base.retirementFailed,
             search: .init(find: { owner, request, _ in try self.find(owner, request) },
-                hit: { owner, generation, index in try self.hit(owner, generation, index) }, observeHit: verified))
+                hit: { owner, generation, index in try self.hit(owner, generation, index) },
+                observeHit: verified, findPage: paged))
     }
     private func recordOpen(_ owner: UInt64, _ input: AtlasObservedReaderInput) {
         lock.lock(); defer { lock.unlock() }; inputs[owner] = input; revisions[owner] = 0
@@ -132,6 +144,7 @@ private final class ObservedSearchProbe: @unchecked Sendable {
     var hitCount: Int { lock.lock(); defer { lock.unlock() }; return hits }
     var verifiedJumpCount: Int { lock.lock(); defer { lock.unlock() }; return verifiedJumps }
     var findGenerations: [UInt64] { lock.lock(); defer { lock.unlock() }; return generations }
+    var findStartAfters: [UInt64] { lock.lock(); defer { lock.unlock() }; return startAfters }
     private func finish() { lock.lock(); active -= 1; lock.unlock() }
     private func revision(_ owner: UInt64) -> UInt64 {
         let next = (revisions[owner] ?? 0) + 1; revisions[owner] = next; return next
@@ -165,7 +178,8 @@ private final class ObservedSearchProbe: @unchecked Sendable {
         let id = revision(owner), fail = findFailure, stale = staleFind, gate = nextFindGate, text = content
         let replyGate = nextFindReplyGate
         findFailure = false; staleFind = false; nextFindGate = nil; nextFindReplyGate = nil
-        generations.append(request.generation); active += 1; mostActive = max(mostActive, active)
+        generations.append(request.generation); startAfters.append(request.pageStartAfter)
+        active += 1; mostActive = max(mostActive, active)
         lock.unlock(); defer { finish() }; gate?.wait()
         if fail { return try ObservedReaderFixture.failure(owner, "OBSERVED_READER_SEARCH_FAILED") }
         let bytes = AtlasObservedReaderSearchRequest.originalBytes(text, encoding: request.encoding)
@@ -184,16 +198,17 @@ private final class ObservedSearchProbe: @unchecked Sendable {
         if count >= needle.count {
             for offset in 0...(count - needle.count) where haystack[offset..<(offset + needle.count)].elementsEqual(sought) {
                 allOffsets.append(UInt64(offset))
-                if !request.countAllMatches && allOffsets.count > Int(request.maximumMatches) { break }
+                if !request.countAllMatches, UInt64(allOffsets.count) > request.pageStartAfter,
+                   UInt64(allOffsets.count) - request.pageStartAfter > request.maximumMatches { break }
             }
         }
         let state: String
-        if !request.countAllMatches && allOffsets.count > Int(request.maximumMatches) {
-            allOffsets.removeLast(); state = "match-limit"
+        let skipped = min(request.pageStartAfter, UInt64(allOffsets.count))
+        if !request.countAllMatches && UInt64(allOffsets.count) - skipped > request.maximumMatches {
+            state = "match-limit"
         } else { state = count == bytes.count ? "complete-observed-input" : "byte-limit" }
-        let retained = Array(allOffsets.prefix(Int(request.maximumMatches)))
-        let seen = request.countAllMatches ? UInt64(allOffsets.count)
-            : UInt64(retained.count + (state == "match-limit" ? 1 : 0))
+        let retained = Array(allOffsets.dropFirst(Int(skipped)).prefix(Int(request.maximumMatches)))
+        let seen = UInt64(allOffsets.count)
         let report = ObservedSearchFixture.report(owner, input, request, observation: stale ? id - 1 : id,
             length: UInt64(bytes.count), offsets: retained, state: state, matchesSeen: seen,
             spellings: retained.map { ObservedReaderFixture.decodedOriginal(
@@ -240,6 +255,7 @@ private final class ObservedSearchProbe: @unchecked Sendable {
         page["command"] = "observe-hit"; page["has_replacements"] = malformed
         page["find_hit"] = ["query_generation": String(witness.target.generation),
             "search_observation": String(witness.target.observation), "hit_index": String(witness.target.hit.index),
+            "page_start_after": report["page_start_after"] as! String,
             "occurrence_id": String(witness.target.hit.occurrence), "original_range": ObservedReaderFixture.range(hit.start, hit.end),
             "decoded_utf8_range": ObservedReaderFixture.range(decodedStart, decodedStart + UInt64(witness.text.utf8.count)),
             "witness_verified": true, "verification": "equal-original-bytes-in-new-observation"]
@@ -378,6 +394,7 @@ private final class ObservedSearchProbe: @unchecked Sendable {
         precondition(!limited.searchComplete && !limited.inputComplete && limited.countLabel.contains("partial"))
         for consistency in ["changed-during-read", "metadata-unavailable"] {
             var changed = base; changed["consistency"] = consistency; changed["search_complete"] = false
+            changed["match_count_complete"] = false
             let accepted = try decode(changed)
             precondition(accepted.inputComplete && !accepted.searchComplete && accepted.finalObservedLength == 64)
         }
@@ -701,6 +718,9 @@ private final class ObservedSearchProbe: @unchecked Sendable {
     }
 
     @MainActor static func main() async throws {
+        try pagingWireTests()
+        try await pagingModelTests()
+        try await pagingReplacementAuthorityTests()
         try occurrenceWireTests()
         try await occurrenceModelTests()
         try wireTests()
@@ -716,6 +736,307 @@ private final class ObservedSearchProbe: @unchecked Sendable {
 
 
 private extension AtlasObservedReaderSearchTests {
+    @MainActor static func pagingModelTests() async throws {
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.txt".utf8))
+        let probe = ObservedSearchProbe(verifiedNavigation: true)
+        probe.setContent(String(repeating: "old\n", count: 300))
+        let model = AtlasObservedReaderModel(transport: probe.transport)
+        model.pageBytes = 4
+        model.open(.init(input: input, project: UUID(), access: nil))
+        try await wait("paged reader opening") { model.page != nil && !model.busy }
+        model.searchText = "old"; model.find()
+        try await wait("first capped Find page") { model.searchAuthorized && !model.busy }
+        let first = model.searchReport!, staleTarget = first.target(for: first.hits[0])
+        precondition(first.hits.count == 256 && first.matchesSeen == 257
+            && model.canNextSearchPage && !model.canPreviousSearchPage)
+        model.previousSearchHit()
+        try await wait("partial inventory begins with first retained hit") { model.selectedSearchWitness != nil && !model.busy }
+        precondition(model.selectedSearchWitness?.target.hit.occurrence == 1 && !model.canPreviousSearchHit)
+        let firstCalls = probe.hitCount
+        model.previousSearchHit()
+        precondition(probe.hitCount == firstCalls && !model.busy, "An incomplete prefix must not wrap backward")
+        model.selectSearchHit(first.target(for: first.hits[255]))
+        try await wait("last retained first-page hit") { !model.busy }
+        let lastCalls = probe.hitCount
+        precondition(!model.canNextSearchHit)
+        model.nextSearchHit()
+        precondition(probe.hitCount == lastCalls && !model.busy, "A match limit must not masquerade as the end of the file")
+
+        model.nextSearchPage()
+        precondition(!model.searchAuthorized && model.searchReport?.request == first.request)
+        try await wait("fresh later match page") { model.searchAuthorized && !model.busy }
+        let later = model.searchReport!
+        precondition(later.request.pageStartAfter == 256 && later.request.generation > first.request.generation
+            && later.observation > first.observation && later.hits.count == 44
+            && later.hits.first?.occurrence == 257 && later.hits.last?.occurrence == 300
+            && later.matchCountComplete && !later.pageHasMoreMatches
+            && model.canPreviousSearchPage && !model.canNextSearchPage
+            && probe.findStartAfters == [0, 256])
+        let beforeStale = probe.hitCount
+        model.selectSearchHit(staleTarget)
+        precondition(probe.hitCount == beforeStale, "The old page cannot lend its local row index to this observation")
+        model.selectSearchHit(later.target(for: later.hits[43]))
+        try await wait("last later-page hit") { !model.busy }
+        precondition(!model.canNextSearchHit, "A complete later page still omits earlier matches and cannot wrap")
+        model.selectSearchHit(later.target(for: later.hits[0]))
+        try await wait("first later-page witness") { !model.busy }
+        precondition(!model.canPreviousSearchHit && model.selectedSearchWitness?.target.hit.occurrence == 257)
+        model.goToVerifiedMatch()
+        try await wait("later-page verified navigation") { !model.busy }
+        let verified = model.page!
+        precondition(verified.findHit?.pageStartAfter == 256 && verified.findHit?.occurrence == 257
+            && model.searchSelection == NSRange(location: 1024, length: 3))
+        model.previousSearchPage()
+        try await wait("fresh previous match page") { model.searchAuthorized && !model.busy }
+        precondition(model.searchReport?.request.pageStartAfter == 0
+            && model.searchReport!.observation > verified.observation.id)
+        let windows = probe.windowCount, jumps = probe.verifiedJumpCount
+        model.back(); try await wait("back before later-page navigation") { !model.busy }
+        model.forward(); try await wait("replay later-page verified history") { !model.busy }
+        precondition(model.page!.matches(verified) && model.searchSelection == NSRange(location: 1024, length: 3)
+            && probe.windowCount == windows && probe.verifiedJumpCount == jumps
+            && model.verifiedPageNotice?.contains("earlier Find") == true)
+
+        probe.setContent("x\n" + String(repeating: "old\n", count: 300))
+        model.nextSearchPage()
+        try await wait("rescan reflects live edits") { model.searchAuthorized && !model.busy }
+        precondition(model.searchReport?.hits.first?.occurrence == 257
+            && model.searchReport?.hits.first?.range.start == 1026
+            && model.page!.matches(verified), "A new result page must not merge old ranges or mutate retained history")
+        model.previousSearchPage()
+        try await wait("earlier page before live truncation") { model.searchAuthorized && !model.busy }
+        probe.setContent(String(repeating: "old\n", count: 4))
+        model.nextSearchPage()
+        try await wait("later page after live truncation") { model.searchAuthorized && !model.busy }
+        precondition(model.searchReport?.request.pageStartAfter == 256 && model.searchReport?.matchesSeen == 4
+            && model.searchReport?.skippedMatches == 4 && model.searchReport?.hits.isEmpty == true
+            && !model.canNextSearchPage && model.canPreviousSearchPage && model.selectedSearchWitness == nil)
+        model.previousSearchPage()
+        try await wait("complete inventory after rescan") { model.searchAuthorized && !model.busy }
+        let complete = model.searchReport!
+        precondition(complete.containsCompleteMatchInventory && complete.hits.count == 4)
+        model.selectSearchHit(complete.target(for: complete.hits[3]))
+        try await wait("complete inventory last hit") { !model.busy }
+        model.nextSearchHit(); try await wait("complete inventory forward wrap") { !model.busy }
+        precondition(model.selectedSearchWitness?.target.hit.occurrence == 1)
+        model.previousSearchHit(); try await wait("complete inventory backward wrap") { !model.busy }
+        precondition(model.selectedSearchWitness?.target.hit.occurrence == 4)
+        model.searchScanBytes = 8; model.find()
+        try await wait("byte-limited result prefix") { model.searchAuthorized && !model.busy }
+        let limited = model.searchReport!
+        precondition(limited.hits.count == 2 && !limited.matchCountComplete && !model.canNextSearchPage)
+        model.selectSearchHit(limited.target(for: limited.hits[1]))
+        try await wait("last byte-limited hit") { !model.busy }
+        precondition(!model.canNextSearchHit && probe.maximumActive == 1)
+        model.close()
+        try await wait("paged owner retirement") { probe.lifetime.closedCount == probe.lifetime.createCount }
+
+        let legacyProbe = ObservedSearchProbe(paging: false)
+        legacyProbe.setContent(String(repeating: "old\n", count: 300))
+        let legacy = AtlasObservedReaderModel(transport: legacyProbe.transport)
+        legacy.open(.init(input: input, project: UUID(), access: nil))
+        try await wait("legacy reader opening") { legacy.page != nil && !legacy.busy }
+        legacy.searchText = "old"; legacy.find()
+        try await wait("legacy first-page query") { legacy.searchAuthorized && !legacy.busy }
+        let queries = legacyProbe.findGenerations.count
+        precondition(legacy.searchReport?.pageHasMoreMatches == true && !legacy.supportsSearchPages
+            && !legacy.canNextSearchPage && !legacy.canPreviousSearchPage)
+        legacy.nextSearchPage(); legacy.previousSearchPage()
+        precondition(legacyProbe.findGenerations.count == queries && !legacy.busy)
+        legacy.close()
+        try await wait("legacy page owner retirement") { legacyProbe.lifetime.closedCount == legacyProbe.lifetime.createCount }
+    }
+
+    @MainActor static func pagingReplacementAuthorityTests() async throws {
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.txt".utf8))
+        let probe = ObservedSearchProbe(verifiedNavigation: true)
+        probe.setContent(String(repeating: "old\n", count: 300))
+        let model = AtlasObservedReaderModel(transport: probe.transport)
+        model.open(.init(input: input, project: UUID(), access: nil))
+        try await wait("page authority opening") { model.page != nil && !model.busy }
+        model.searchText = "old"; model.find()
+        try await wait("page authority first query") { model.searchAuthorized && !model.busy }
+        model.nextSearchHit()
+        try await wait("page authority retained witness") { model.selectedSearchWitness != nil && !model.busy }
+        let accepted = model.searchReport!, witness = model.selectedSearchWitness!, page = model.page!
+        let gate = ObservedReaderGate(); probe.blockFindReply(gate); model.nextSearchPage()
+        try await wait("host replaces query before page reply") { gate.entered }
+        model.cancel()
+        precondition(!model.searchAuthorized && !model.canSelectSearchHit && !model.canNextSearchPage
+            && !model.canPreviousSearchPage && !model.canGoToVerifiedMatch
+            && model.searchReport?.request == accepted.request && model.selectedSearchWitness?.target == witness.target
+            && model.page!.matches(page))
+        let hitCalls = probe.hitCount, findCalls = probe.findGenerations.count
+        model.nextSearchHit(); model.previousSearchHit(); model.nextSearchPage(); model.previousSearchPage()
+        model.goToVerifiedMatch()
+        precondition(probe.hitCount == hitCalls && probe.findGenerations.count == findCalls)
+        gate.release()
+        try await wait("canceled page reply drains") { probe.activeCount == 0 }
+        await Task.yield()
+        precondition(!model.searchAuthorized && model.searchReport?.request == accepted.request)
+        model.find()
+        try await wait("new receipt restores page authority") { model.searchAuthorized && !model.busy }
+        let restored = model.searchReport!
+        probe.failFind(); model.nextSearchPage()
+        try await wait("failed rescan preserves read-only report") { !model.busy }
+        precondition(!model.searchAuthorized && model.searchReport?.request == restored.request && !model.canNextSearchPage)
+        model.find()
+        try await wait("restore query before input edit") { model.searchAuthorized && !model.busy }
+        let obsolete = ObservedReaderGate(); probe.blockFindReply(obsolete); model.nextSearchPage()
+        try await wait("page delivery pending before edit") { obsolete.entered }
+        model.searchText = "new"
+        precondition(model.searchReport == nil && model.selectedSearchWitness == nil && !model.searchAuthorized)
+        obsolete.release()
+        try await wait("edited page reply drains") { probe.activeCount == 0 }
+        await Task.yield()
+        precondition(model.searchReport == nil && !model.searchAuthorized && probe.maximumActive == 1)
+        model.close()
+        try await wait("page authority owner retirement") { probe.lifetime.closedCount == probe.lifetime.createCount }
+    }
+
+    static func pagingWireTests() throws {
+        let owner: UInt64 = 0xfedcba9876543210
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.txt".utf8))
+        func decode(_ wire: [String: Any], _ request: AtlasObservedReaderSearchRequest) throws -> AtlasObservedReaderSearchReport {
+            try .decode(ObservedReaderFixture.encode(wire), handle: owner, input: input, request: request)
+        }
+        for encoding in AtlasObservedReaderEncoding.allCases {
+            for (mode, sensitive, needle, spellings) in [
+                (AtlasObservedReaderSearchMode.text, true, "old", ["old", "old"]),
+                (.text, false, "k", ["K", "K"]),
+                (.occurrences, true, "old", ["old", "old"]),
+            ] {
+                for counted in [false, true] {
+                    let request = try AtlasObservedReaderSearchRequest(generation: 10, needle: needle,
+                        encoding: encoding, maximumMatches: 2, countAllMatches: counted,
+                        caseSensitive: sensitive, mode: mode, pageStartAfter: 2)
+                    let wire = ObservedSearchFixture.report(owner, input, request, offsets: [8, 16],
+                        state: counted ? "complete-observed-input" : "match-limit",
+                        matchesSeen: counted ? 8 : 5, spellings: spellings)
+                    let report = try decode(wire, request)
+                    precondition(report.hits.map(\.index) == [0, 1] && report.hits.map(\.occurrence) == [3, 4]
+                        && report.skippedMatches == 2 && report.pageHasMoreMatches
+                        && !report.containsCompleteMatchInventory && report.matchCountComplete == counted
+                        && report.countLabel.contains("occurrences 3–4") && report.coverage.contains("new observation"))
+                    for index in 0..<2 {
+                        let witnessJSON = ObservedSearchFixture.witness(wire, index: index)
+                        let target = report.target(for: report.hits[index])
+                        let witness = try AtlasObservedReaderSearchWitness.decode(ObservedReaderFixture.encode(witnessJSON),
+                            handle: owner, input: input, report: report, target: target)
+                        precondition(witness.text == spellings[index] && witness.target.hit.occurrence == UInt64(index + 3))
+                        for (key, badValue) in [("page_start_after", "0" as Any), ("skipped_matches", "1" as Any),
+                            ("page_has_more_matches", false as Any), ("occurrence_id", String(index + 1) as Any)] {
+                            var bad = witnessJSON; bad[key] = badValue
+                            rejects("paged witness " + key) {
+                                _ = try AtlasObservedReaderSearchWitness.decode(ObservedReaderFixture.encode(bad),
+                                    handle: owner, input: input, report: report, target: target)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let request = try AtlasObservedReaderSearchRequest(generation: 10, needle: "old", encoding: .utf8,
+            maximumMatches: 2, pageStartAfter: 2)
+        let firstRequest = try AtlasObservedReaderSearchRequest(generation: 10, needle: "old", encoding: .utf8,
+            maximumMatches: 2)
+        precondition(request != firstRequest, "Page position is part of the frozen query")
+        let wire = ObservedSearchFixture.report(owner, input, request, offsets: [8, 16], state: "match-limit", matchesSeen: 5)
+        for (key, value) in [("page_start_after", "0" as Any), ("page_start_after", "02" as Any),
+            ("page_start_after", 2 as Any), ("skipped_matches", "1" as Any),
+            ("page_has_more_matches", false as Any), ("truncated", false as Any)] {
+            var bad = wire; bad[key] = value
+            rejects("page proof " + key) { _ = try decode(bad, request) }
+        }
+        let pageKeys = ["page_start_after", "skipped_matches", "page_has_more_matches"]
+        for key in pageKeys {
+            var missing = wire; missing.removeValue(forKey: key)
+            rejects("incomplete page proof " + key) { _ = try decode(missing, request) }
+            var null = wire; null[key] = NSNull()
+            rejects("null page proof " + key) { _ = try decode(null, request) }
+        }
+        var absent = wire
+        for key in pageKeys { absent.removeValue(forKey: key) }
+        rejects("later page cannot use a legacy receipt") { _ = try decode(absent, request) }
+        var legacy = ObservedSearchFixture.report(owner, input, firstRequest, offsets: [0])
+        for key in pageKeys { legacy.removeValue(forKey: key) }
+        let legacyReport = try decode(legacy, firstRequest)
+        precondition(legacyReport.containsCompleteMatchInventory && !legacyReport.pageHasMoreMatches)
+        _ = try AtlasObservedReaderSearchWitness.decode(ObservedReaderFixture.encode(ObservedSearchFixture.witness(legacy)),
+            handle: owner, input: input, report: legacyReport, target: legacyReport.target(for: legacyReport.hits[0]))
+        let paged = try decode(wire, request)
+        var absentWitness = ObservedSearchFixture.witness(wire)
+        for key in pageKeys { absentWitness.removeValue(forKey: key) }
+        rejects("later-page witness cannot omit its page proof") {
+            _ = try AtlasObservedReaderSearchWitness.decode(ObservedReaderFixture.encode(absentWitness), handle: owner,
+                input: input, report: paged, target: paged.target(for: paged.hits[0]))
+        }
+
+        let finalRequest = try AtlasObservedReaderSearchRequest(generation: 11, needle: "old", encoding: .utf8,
+            maximumMatches: 2, pageStartAfter: 4)
+        let finalPage = try decode(ObservedSearchFixture.report(owner, input, finalRequest,
+            offsets: [20], matchesSeen: 5), finalRequest)
+        precondition(finalPage.matchCountComplete && finalPage.hits[0].occurrence == 5
+            && !finalPage.pageHasMoreMatches && !finalPage.containsCompleteMatchInventory,
+            "Skipped earlier rows make truncation true without implying a later result page")
+        let beyondRequest = try AtlasObservedReaderSearchRequest(generation: 12, needle: "old", encoding: .utf8,
+            pageStartAfter: UInt64.max)
+        let beyond = try decode(ObservedSearchFixture.report(owner, input, beyondRequest,
+            offsets: [], matchesSeen: 5), beyondRequest)
+        precondition(beyond.skippedMatches == 5 && beyond.matchesSeen == 5 && beyond.hits.isEmpty
+            && beyond.matchCountComplete && !beyond.pageHasMoreMatches && beyond.countLabel.contains("5 matches"))
+        let limitedRequest = try AtlasObservedReaderSearchRequest(generation: 13, needle: "old", encoding: .utf8,
+            maximumScanBytes: 8, countAllMatches: true, pageStartAfter: 256)
+        let limited = try decode(ObservedSearchFixture.report(owner, input, limitedRequest,
+            offsets: [], state: "byte-limit", matchesSeen: 2), limitedRequest)
+        precondition(limited.skippedMatches == 2 && limited.hits.isEmpty && !limited.pageHasMoreMatches
+            && !limited.matchCountComplete && limited.countLabel.contains("At least 2"))
+        var malformed = ObservedSearchFixture.report(owner, input, limitedRequest,
+            offsets: [], state: "unsupported-text", matchesSeen: 0)
+        malformed["unsupported_at"] = "3"
+        let unsupported = try decode(malformed, limitedRequest)
+        precondition(unsupported.matchesSeen == 0)
+        malformed["matches_seen"] = "2"; malformed["skipped_matches"] = "2"; malformed["truncated"] = true
+        rejects("malformed input revokes skipped tentative counts too") { _ = try decode(malformed, limitedRequest) }
+
+        // Verified navigation and retained history preserve both global
+        // occurrence and result-page position without rereading old context.
+        let selectedJSON = ObservedSearchFixture.report(owner, input, request, length: 12, offsets: [8], matchesSeen: 3)
+        let selectedReport = try decode(selectedJSON, request)
+        let witness = try AtlasObservedReaderSearchWitness.decode(ObservedReaderFixture.encode(ObservedSearchFixture.witness(selectedJSON)),
+            handle: owner, input: input, report: selectedReport, target: selectedReport.target(for: selectedReport.hits[0]))
+        let windowRequest = try AtlasObservedReaderRequest(offset: 0, bytes: 32)
+        var pageJSON = ObservedReaderFixture.page(owner, input, 3, windowRequest, length: 12, text: "old old old\n")
+        pageJSON["command"] = "observe-hit"
+        let navigation: [String: Any] = ["query_generation": "10", "search_observation": "2",
+            "page_start_after": "2", "hit_index": "0", "occurrence_id": "3",
+            "original_range": ObservedReaderFixture.range(8, 11), "decoded_utf8_range": ObservedReaderFixture.range(8, 11),
+            "witness_verified": true, "verification": "equal-original-bytes-in-new-observation"]
+        pageJSON["find_hit"] = navigation
+        let page = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(pageJSON), handle: owner,
+            input: input, request: windowRequest, hit: witness)
+        precondition(page.findHit?.pageStartAfter == 2 && page.verifiedSearchSelection == NSRange(location: 8, length: 3))
+        let replayJSON = ObservedReaderFixture.retained(pageJSON)
+        let replay = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(replayJSON),
+            handle: owner, input: input, retained: page)
+        precondition(replay.matches(page))
+        for (key, value) in [("page_start_after", "0"), ("page_start_after", String(UInt64.max)),
+            ("occurrence_id", "1"), ("hit_index", "2")] {
+            var badPage = pageJSON, badNavigation = navigation; badNavigation[key] = value; badPage["find_hit"] = badNavigation
+            rejects("paged verified navigation " + key) {
+                _ = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(badPage), handle: owner,
+                    input: input, request: windowRequest, hit: witness)
+            }
+        }
+        var missingPage = pageJSON, missingNavigation = navigation
+        missingNavigation.removeValue(forKey: "page_start_after"); missingPage["find_hit"] = missingNavigation
+        rejects("later-page navigation cannot masquerade as legacy page zero") {
+            _ = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(missingPage), handle: owner,
+                input: input, request: windowRequest, hit: witness)
+        }
+    }
+
     static func lowercaseWireTests() throws {
         let owner: UInt64 = 0xfedcba9876543210
         let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.txt".utf8))

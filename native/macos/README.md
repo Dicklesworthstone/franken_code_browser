@@ -1040,6 +1040,27 @@ intent is to inspect what changed.
 
 Press **Command-F** to focus Find. **Previous match** and **Next match** select
 retained results without rereading source; choose the context action explicitly.
+They wrap only when the completed observation's entire match set fits in the
+current page. An incomplete scan or a page that omits earlier or later matches
+does not turn its retained subset into a complete cycle.
+
+Use **Rescan next matches** to reach occurrences beyond the 256 retained rows,
+and **Rescan previous matches** to return to an earlier result page. These
+actions scan the same opened file object again from byte zero, skipping the
+requested number of occurrences before retaining a new bounded page. Skipped
+matches still spend the selected scan and read-call limits. A limit can stop
+the scan before the requested page; the result then reports incomplete coverage,
+rather than claiming those matches are absent.
+
+Each rescan creates a fresh observation and query identity. Live edits may
+change occurrence positions and counts between pages, so the reader replaces
+the result page instead of combining different observations into one snapshot.
+Labels show the retained occurrence range and distinguish a completed count
+from a lower bound. Copy and verified context navigation use the accepted
+page's exact original-byte witnesses, including later-page UTF-16, overlapping
+and lowercase matches. Hosts without the additive page API retain first-page
+Find and cannot perform result-page rescans.
+
 Restarting a valid Find revokes the previous result actions until a replacement
 reply is accepted. If cancellation races with worker acceptance, the old report
 stays readable and its controls remain disabled until another Find succeeds.

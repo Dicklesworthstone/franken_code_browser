@@ -65,7 +65,8 @@ import Foundation
         let verifiedHit = try observeHit(handle, witness, request, AtlasSearchCancellation())
         precondition(verifiedHit == expected && count(11) == 1 && allocations() == 12 && frees() == 12)
         let legacy = AtlasObservedReaderSearchTransport(find: search.find, hit: search.hit)
-        precondition(legacy.observeHit == nil, "Existing search-only transports retain their optional capability boundary")
+        precondition(legacy.observeHit == nil && legacy.findPage == nil,
+            "Existing search-only transports retain their optional capability boundary")
         guard let readLines = transport.lines else { preconditionFailure("Native physical-line transport is missing") }
         let lineRequest = try AtlasObservedReaderLineRequest(firstLine: offset, lines: 4096,
             maximumScanBytes: 1 << 32)
@@ -88,6 +89,9 @@ import Foundation
         guard let resolveSelection = transport.resolveSelection else { preconditionFailure("Native selection transport is missing") }
         let occurrences = try AtlasObservedReaderSearchRequest(generation: observation,
             needle: "exact_é", encoding: .utf8, maximumScanBytes: 1 << 32, mode: .occurrences)
+        guard let findPage = search.findPage else { preconditionFailure("Native result-page transport is missing") }
+        let pageRequest = try AtlasObservedReaderSearchRequest(generation: observation,
+            needle: "exact é😀", encoding: .utf8, maximumScanBytes: 1 << 32, pageStartAfter: offset)
 
         // Inconsistent requests must not cross the ABI or let the host silently
         // reduce their prefix and return a different requested observation.
@@ -120,6 +124,7 @@ import Foundation
             { try readLines(handle, lineRequest, AtlasSearchCancellation()) },
             { try resolveSelection(handle, observation, offset + 3, offset + 17) },
             { try search.find(handle, occurrences, AtlasSearchCancellation()) },
+            { try findPage(handle, pageRequest, AtlasSearchCancellation()) },
         ]
         for command in commands {
             mode(1)
@@ -140,7 +145,7 @@ import Foundation
 
         // C invokes the supplied callback with its live object context. The
         // transport frees the obsolete reply before throwing cancellation.
-        for operation in 0..<7 {
+        for operation in 0..<8 {
             for lateMode: Int32 in [4, 5] {
                 mode(lateMode)
                 weak var released: AtlasSearchCancellation?
@@ -155,7 +160,8 @@ import Foundation
                         case 3: _ = try observeHit(handle, witness, request, token)
                         case 4: _ = try readLines(handle, lineRequest, token)
                         case 5: _ = try search.find(handle, occurrences, token)
-                        default: _ = try transport.open(handle, selectedFile, token)
+                        case 6: _ = try transport.open(handle, selectedFile, token)
+                        default: _ = try findPage(handle, pageRequest, token)
                         }
                         preconditionFailure("Late canceled read-only delivery was not suppressed")
                     } catch AtlasObservedReaderError.canceled { }
@@ -247,6 +253,36 @@ import Foundation
         do { _ = try search.find(handle, occurrences, canceled); preconditionFailure("Canceled occurrences crossed ABI") }
         catch AtlasObservedReaderError.canceled { }
         precondition(count(16) == enteredOccurrences)
+        let enteredPages = count(20)
+        do { _ = try findPage(handle, pageRequest, canceled); preconditionFailure("Canceled page Find crossed ABI") }
+        catch AtlasObservedReaderError.canceled { }
+        precondition(count(20) == enteredPages)
+        let beforePages = count(20), beforeCountedPages = count(21), beforeLowercasePages = count(22), beforeOccurrencePages = count(23)
+        let beforeLegacyFinds = count(9), beforeLegacyCounted = count(13), beforeLegacyMatching = count(14), beforeLegacyOccurrences = count(16)
+        for encoding in AtlasObservedReaderEncoding.allCases {
+            for countAll in [false, true] {
+                for (selectedMode, caseSensitive, needle) in [
+                    (AtlasObservedReaderSearchMode.text, true, "exact é😀"),
+                    (.text, false, "exact é😀"), (.occurrences, true, "exact_é"),
+                ] {
+                    let selectedPage = try AtlasObservedReaderSearchRequest(generation: observation, needle: needle,
+                        encoding: encoding, maximumScanBytes: 1 << 32, countAllMatches: countAll,
+                        caseSensitive: caseSensitive, mode: selectedMode, pageStartAfter: offset)
+                    let result = try findPage(handle, selectedPage, AtlasSearchCancellation())
+                    precondition(result == expected && allocations() == frees())
+                }
+            }
+        }
+        precondition(count(20) == beforePages + 18 && count(21) == beforeCountedPages + 9
+            && count(22) == beforeLowercasePages + 6 && count(23) == beforeOccurrencePages + 6,
+            "The page ABI preserves full-width skip positions, all decoding modes, matching policies and count flags")
+        do {
+            _ = try search.find(handle, pageRequest, AtlasSearchCancellation())
+            preconditionFailure("Legacy Find silently ignored a nonzero page position")
+        } catch AtlasObservedReaderError.invalidInput { }
+        precondition(count(9) == beforeLegacyFinds && count(13) == beforeLegacyCounted
+            && count(14) == beforeLegacyMatching && count(16) == beforeLegacyOccurrences,
+            "Explicit page scans do not reuse a legacy ABI that would drop the requested skip")
         let beforeSelection = count(18)
         let selected = try resolveSelection(handle, observation, offset + 3, offset + 17)
         precondition(selected == expected && count(18) == beforeSelection + 1 && allocations() == frees(),
