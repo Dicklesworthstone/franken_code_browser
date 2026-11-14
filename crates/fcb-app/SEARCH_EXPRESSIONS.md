@@ -162,6 +162,51 @@ Only primary witnesses are retained. Predicate qualification does not retain
 every contributing source span, neighboring lines, or a full snapshot.
 Unchanged before/after file metadata is still not an atomic snapshot.
 
+## Retained native-host streaming expressions
+
+`RetainedAtlasStreamSearch::search_scoped_expression_with_progress` exposes
+the same single-observation engine through the native host's existing frozen
+catalog. It accepts the expression, location/file-type scope, case policy and
+ordinary streaming I/O limits. Path/language predicates intersect that native
+scope before any source file is opened. Original catalog file IDs and source
+observation ordinals remain stable through this projection.
+
+This route always counts all qualified primary occurrences within the byte and
+read-call budgets, retaining at most the requested number of rows (1–256).
+It does not stop predicate evaluation when those rows fill. Progress previews
+include only finalized files; **Stop and keep matches** discards an unfinished
+file's candidates while preserving earlier results. Hard cancellation discards
+the attempted replacement and leaves the previously accepted query available.
+Invalid syntax likewise leaves accepted evidence intact and performs no source
+I/O. Existing literal and occurrence methods retain their original semantics.
+
+Progress, terminal pages and selected-witness replies carry the same immutable
+expression policy:
+
+| Field | Meaning |
+|---|---|
+| `mode` | `decoded-text-expression`; `case_sensitive` selects the text comparison. |
+| `expression` | The original bounded query. |
+| `needle`, `primary_needle` | The primary literal whose occurrences supply result ranges. |
+| `query_syntax` | `fcb-bounded-expression/1`. |
+| `predicate_scope` | `same-observed-stream`, not a retained complete capture. |
+| `path_filter_domain` | `root-relative-utf8-or-escaped-search-key`. |
+| `eligible_files`, `excluded_files` | Membership after the native location/file-type scope. |
+| `expression_scope_files`, `expression_excluded_files` | The subdivision of eligible files after expression metadata filters. |
+
+Examined and unexamined counts sum to `expression_scope_files`. Content-predicate
+rejections are examined nonmatching files, not metadata exclusions. Missing
+requested visible paths and incomplete discovery still prevent a complete
+search claim. Completed observations with changed or unavailable metadata may
+retain expression witnesses while making overall coverage incomplete.
+
+Pages and hit lookup perform no additional source reads. A retained hit contains
+only the primary occurrence's original bytes and decoded spelling. Reading its
+current surrounding context is a separate observation: matching those bytes
+again does **not** revalidate every required or excluded expression term against
+the current file. The host never labels a changed live file as the original
+expression observation.
+
 ## Live capture and saved-source execution
 
 Captured-workspace expressions reuse the current discovery, optional repository
@@ -269,10 +314,14 @@ raw names, read-only effects, and the actual executable after a source-root move
 `whole_file_expression_cli` covers large-file streaming, metadata filtering
 before source access, UTF-16 offsets, cross-buffer predicates, lowercase
 witnesses, invalid suffixes, global I/O limits, zero-row counting and executable
-dispatch. These tests are committed, not claimed executed in this implementation
-session.
+dispatch. `atlas_stream_expression` exercises the retained native-host route
+with real files, late required/excluded terms, bounded result retention, UTF-16
+and lowercase witnesses, native/expression scope intersection, incomplete
+observations, Stop/cancellation, immutable pages and query-error recovery.
+These tests are committed, not claimed executed in this implementation session.
 
-This adds usable expression search, not a native search panel, general boolean or
-regex engine, complete glob matching, or new index format. Existing snapshot size
-limits, trusted-catalog integrity boundaries, and capture-consistency limitations
-remain unchanged. No performance benchmark or native qualification is inferred.
+The query language remains the existing bounded conjunction/exclusion syntax;
+there is no general boolean or regex engine, complete glob grammar, or new
+index format. Existing snapshot size limits, trusted-catalog integrity
+boundaries, and capture-consistency limitations remain unchanged. No performance
+benchmark or native qualification is inferred.

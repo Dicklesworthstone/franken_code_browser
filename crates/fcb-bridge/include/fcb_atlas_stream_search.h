@@ -148,6 +148,43 @@ char *fcb_atlas_stream_search_scoped_matching_progress(uint64_t handle, const ch
     int32_t (*poll)(void *context), int32_t (*stop)(void *context),
     fcb_atlas_stream_progress_callback progress, void *context);
 
+/* Bounded expression search over the SAME observed file stream. expression is
+ * at most 1024 UTF-8 bytes, readable through NUL or 1025 bytes, whichever comes
+ * first. The shared parser supports phrases, required/excluded text, path: and
+ * lang:/type: filters; unsupported syntax returns its stable QUERY_* error.
+ * Empty or malformed expressions never replace an accepted report. Foreign
+ * NULL, invalid UTF-8, overlong strings and a case_sensitive value other than
+ * 0 or 1 are ATLAS_HANDLE_INVALID_ARGUMENT. Scope/callback lifetimes match above.
+ * All callbacks may be NULL for a synchronous terminal-only response.
+ *
+ * Metadata filters intersect the frozen native scope before source I/O. All
+ * required/excluded content predicates must be decided from one fully decoded
+ * observed stream before its primary-literal hits can appear. A read limit,
+ * malformed encoding or stop cannot prove that excluded text was absent.
+ * No complete-file capture or atomic snapshot guarantee is implied.
+ *
+ * All qualified primary-literal occurrences are counted within the I/O budget;
+ * max_matches bounds retained rows, never expression evaluation. Summaries and
+ * hit receipts echo count_all_matches=true, mode=decoded-text-expression,
+ * expression (the original query), needle and primary_needle (the first required
+ * literal), query_syntax=fcb-bounded-expression/1,
+ * predicate_scope=same-observed-stream and
+ * path_filter_domain=root-relative-utf8-or-escaped-search-key.
+ * expression_scope_files + expression_excluded_files equals eligible_files;
+ * files_examined + files_unexamined equals expression_scope_files. Native scope
+ * eligible_files + excluded_files still equals catalogued_files. Progress,
+ * terminal search, pages and retained witnesses preserve this immutable policy.
+ * Exact/lowercase matching, retained original bytes, Stop and hard cancellation
+ * retain their existing semantics. A retained witness proves only the matching
+ * literal; opening current context cannot revalidate all expression predicates.
+ */
+char *fcb_atlas_stream_search_scoped_expression_progress(uint64_t handle, const char *expression,
+    uint64_t max_matches, uint64_t max_scan_bytes, uint64_t max_read_calls,
+    const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
+    uint64_t case_sensitive,
+    int32_t (*poll)(void *context), int32_t (*stop)(void *context),
+    fcb_atlas_stream_progress_callback progress, void *context);
+
 /* Exact whole-identifier occurrences through the same bounded streaming
  * decoder, with no per-file capture limit. count_all_matches is exactly 0 or 1;
  * all callbacks may be NULL. Scope and callback ownership match the APIs above.

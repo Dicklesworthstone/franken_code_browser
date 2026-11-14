@@ -15,6 +15,12 @@ pub(crate) enum StreamCommand<'a> {
     Clear,
 }
 
+enum ProgressMode {
+    Literal { count_all_matches: bool },
+    Occurrences { count_all_matches: bool },
+    Expression,
+}
+
 impl AtlasSessions {
     /// Synchronous progress holds this session's permit until the entered call
     /// drains. Other sessions and nonblocking cancellation/close remain usable.
@@ -30,14 +36,16 @@ impl AtlasSessions {
         options: AtlasStreamSearchOptions, scope: &AtlasSearchScope, canceled: impl FnMut() -> bool,
         stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
         -> Result<HostResponse, AccessError> {
-        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress, false, false, 0)
+        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress,
+            ProgressMode::Literal { count_all_matches: false }, 0)
     }
 
     pub(crate) fn execute_stream_scoped_counted_with_progress(&self, handle: u64, needle: &str,
         options: AtlasStreamSearchOptions, scope: &AtlasSearchScope, canceled: impl FnMut() -> bool,
         stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
         -> Result<HostResponse, AccessError> {
-        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress, true, false, 0)
+        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress,
+            ProgressMode::Literal { count_all_matches: true }, 0)
     }
 
     /// The scope carries the immutable case policy. The host chooses the shared
@@ -46,14 +54,16 @@ impl AtlasSessions {
         options: AtlasStreamSearchOptions, scope: &AtlasSearchScope, count_all_matches: bool,
         canceled: impl FnMut() -> bool, stopped: impl FnMut() -> bool,
         progress: impl FnMut(&HostResponse)) -> Result<HostResponse, AccessError> {
-        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress, count_all_matches, false, 0)
+        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress,
+            ProgressMode::Literal { count_all_matches }, 0)
     }
 
     pub(crate) fn execute_stream_scoped_occurrences_with_progress(&self, handle: u64, needle: &str,
         options: AtlasStreamSearchOptions, scope: &AtlasSearchScope, count_all_matches: bool,
         canceled: impl FnMut() -> bool, stopped: impl FnMut() -> bool,
         progress: impl FnMut(&HostResponse)) -> Result<HostResponse, AccessError> {
-        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress, count_all_matches, true, 0)
+        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress,
+            ProgressMode::Occurrences { count_all_matches }, 0)
     }
 
     pub(crate) fn execute_stream_scoped_page_with_progress(&self, handle: u64, needle: &str,
@@ -61,13 +71,25 @@ impl AtlasSessions {
         count_all_matches: bool, occurrences: bool, canceled: impl FnMut() -> bool,
         stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
         -> Result<HostResponse, AccessError> {
+        let mode = if occurrences { ProgressMode::Occurrences { count_all_matches } }
+            else { ProgressMode::Literal { count_all_matches } };
         self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress,
-            count_all_matches, occurrences, start_after)
+            mode, start_after)
+    }
+
+    /// The host parses and evaluates every expression predicate over the same
+    /// observed stream. No expression syntax is interpreted by this registry.
+    pub(crate) fn execute_stream_scoped_expression_with_progress(&self, handle: u64, expression: &str,
+        options: AtlasStreamSearchOptions, scope: &AtlasSearchScope,
+        canceled: impl FnMut() -> bool, stopped: impl FnMut() -> bool,
+        progress: impl FnMut(&HostResponse)) -> Result<HostResponse, AccessError> {
+        self.execute_stream_progress_inner(handle, expression, options, scope, canceled, stopped, progress,
+            ProgressMode::Expression, 0)
     }
 
     fn execute_stream_progress_inner(&self, handle: u64, needle: &str,
         options: AtlasStreamSearchOptions, scope: &AtlasSearchScope, mut canceled: impl FnMut() -> bool,
-        stopped: impl FnMut() -> bool, mut progress: impl FnMut(&HostResponse), count_all_matches: bool, occurrences: bool,
+        stopped: impl FnMut() -> bool, mut progress: impl FnMut(&HostResponse), mode: ProgressMode,
         start_after: u64)
         -> Result<HostResponse, AccessError> {
         let cell = self.get(handle)?;
@@ -81,8 +103,17 @@ impl AtlasSessions {
             let mut guarded_progress = |response: &HostResponse| {
                 if cell.validate(epoch).is_ok() { progress(response); }
             };
-            session.stream.search_scoped_page_with_progress(&session.atlas, needle, options, scope.clone(),
-                start_after, count_all_matches, occurrences, &mut guarded_canceled, stopped, &mut guarded_progress)
+            match mode {
+                ProgressMode::Expression =>
+                    session.stream.search_scoped_expression_with_progress(&session.atlas, needle, options, scope.clone(),
+                        &mut guarded_canceled, stopped, &mut guarded_progress),
+                ProgressMode::Occurrences { count_all_matches } =>
+                    session.stream.search_scoped_page_with_progress(&session.atlas, needle, options, scope.clone(),
+                        start_after, count_all_matches, true, &mut guarded_canceled, stopped, &mut guarded_progress),
+                ProgressMode::Literal { count_all_matches } =>
+                    session.stream.search_scoped_page_with_progress(&session.atlas, needle, options, scope.clone(),
+                        start_after, count_all_matches, false, &mut guarded_canceled, stopped, &mut guarded_progress),
+            }
         };
         if let Err(error) = cell.validate(epoch) {
             session.cancel_work();

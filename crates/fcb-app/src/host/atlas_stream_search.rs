@@ -6,16 +6,17 @@
 //! never reopens source or presents a witness as a complete source capture.
 
 use std::{mem::size_of, path::Path, sync::Arc};
-use fcb::{ByteLength, QueryGeneration, SourceRevision};
+use fcb::{ArenaOwnerId, ByteLength, QueryGeneration, SourceRevision};
 use fcb::map::LayoutRevision;
 use fcb::map::workspace::retained::RetainedWorkspaceAtlas;
 use fcb::map::workspace::stream_search::{AtlasStreamError, AtlasStreamFile,
     AtlasStreamFileState, AtlasStreamHit, AtlasStreamLimits, AtlasStreamReport,
     AtlasStreamSearch, AtlasStreamState, AtlasStreamStats, AtlasStreamStop};
-use fcb::search::{DetectedEncoding, ExtentConsistency, ResourceAllocationId,
-    ResourceBudget, SearchManifestId, StreamReadState, StreamReadStep, StreamingNeedle};
+use fcb::search::{DetectedEncoding, ExtentConsistency, IndexError, ParsedQuery, ReferenceScanOracle,
+    ResourceAllocationId, ResourceBudget, SearchManifestId, StreamReadState, StreamReadStep, StreamingNeedle};
 use fcb::search::workspace::RootGrant;
 use fcb::source::SourceError;
+use fcb::source::path::NormalizedPath;
 use fcb::store::{Sha256, Sha256Digest};
 use fcb_core::ResourceLease;
 use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES, input, workspace};
@@ -105,26 +106,74 @@ struct Hit {
     text_len: usize,
     digest: Sha256Digest,
 }
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum QueryKind { Text, Occurrences, Expression }
+
+/// The query AST and its metadata-filtered universe remain pinned with the
+/// accepted result. Content predicates are implemented by the shared streaming
+/// engine, never by another capture/read in this host.
+struct FrozenExpression {
+    parsed: ParsedQuery,
+    scope_files: usize,
+    _lease: ResourceLease,
+}
+impl FrozenExpression {
+    fn admit(raw: &str, owner: ArenaOwnerId, budget: &ResourceBudget, id: ResourceAllocationId)
+        -> Result<Self, AtlasStreamSearchError> {
+        if raw.len() > fcb::search::MAX_QUERY_LEN {
+            return Err(AtlasSearchError::from(IndexError::from(fcb::search::QueryError::NeedleTooLong)).into());
+        }
+        // Account for parser/AST capacity and temporary string growth before
+        // parsing. The bound depends on query size, never on source-file size.
+        let charge = size_of::<Self>() + fcb::search::MAX_QUERY_LEN * 32
+            + fcb::search::MAX_QUERY_TOKENS * 8 * size_of::<String>();
+        let lease = budget.try_reserve_managed(owner, id, ByteLength::new(charge as u64))
+            .map_err(|_| AppError::Admission)?;
+        let parsed = ParsedQuery::parse(raw).map_err(|error| AtlasSearchError::from(IndexError::from(error)))?;
+        Ok(Self { parsed, scope_files: 0, _lease: lease })
+    }
+    fn admits(&self, path: &NormalizedPath) -> bool {
+        let matches = |key: &str| ReferenceScanOracle::matches_path_filters(key, &self.parsed.path_filters)
+            && ReferenceScanOracle::matches_lang_filters(key, &self.parsed.lang_filters);
+        match path.as_str() {
+            Ok(key) => matches(key),
+            Err(_) => matches(&path.display_escaped().to_string()),
+        }
+    }
+    fn encode(&self, out: &mut Output, eligible: usize) -> Result<(), AtlasStreamSearchError> {
+        out.literal(",\"expression\":")?; out.quoted(&self.parsed.raw_query)?;
+        out.literal(",\"primary_needle\":")?; out.quoted(&self.parsed.primary_needle)?;
+        out.literal(",\"query_syntax\":\"fcb-bounded-expression/1\",\"predicate_scope\":\"same-observed-stream\",\"path_filter_domain\":\"root-relative-utf8-or-escaped-search-key\"")?;
+        out.literal(",\"expression_scope_files\":")?; out.integer(self.scope_files as u64)?;
+        out.literal(",\"expression_excluded_files\":")?;
+        out.integer(eligible.checked_sub(self.scope_files).ok_or(AtlasStreamSearchError::WrongAtlas)? as u64)?;
+        Ok(())
+    }
+}
+
 /// Reuse captured-search membership semantics and wire identity while keeping
 /// streaming observations independent of its capture limits and index state.
 struct FrozenScope {
     predicate: AtlasSearchScope,
     occurrences: bool,
+    expression: Option<FrozenExpression>,
     region: Option<RegionCoverage>,
     eligible: usize,
     excluded: usize,
 }
 impl FrozenScope {
-    fn admit(predicate: AtlasSearchScope, occurrences: bool, atlas: &AtlasSession, canceled: &mut impl FnMut() -> bool)
+    fn admit(predicate: AtlasSearchScope, occurrences: bool, expression: Option<FrozenExpression>,
+        atlas: &AtlasSession, canceled: &mut impl FnMut() -> bool)
         -> Result<Self, AtlasStreamSearchError> {
         if occurrences && !predicate.case_sensitive() { return Err(AtlasStreamSearchError::InvalidLimits); }
         let (eligible, region) = predicate.admission_counts(atlas, canceled)?;
         let excluded = atlas.atlas().file_count().checked_sub(eligible).ok_or(AtlasStreamSearchError::WrongAtlas)?;
-        Ok(Self { predicate, occurrences, region, eligible, excluded })
+        Ok(Self { predicate, occurrences, expression, region, eligible, excluded })
     }
-    fn projection(&self, atlas: &AtlasSession, budget: &ResourceBudget, id: ResourceAllocationId,
+    fn projection(&mut self, atlas: &AtlasSession, budget: &ResourceBudget, id: ResourceAllocationId,
         canceled: &mut impl FnMut() -> bool) -> Result<(Option<Vec<usize>>, Option<ResourceLease>), AtlasStreamSearchError> {
-        if self.predicate.is_all() { return Ok((None, None)); }
+        if self.predicate.is_all() && self.expression.is_none() { return Ok((None, None)); }
         let bytes = self.eligible.checked_mul(size_of::<usize>())
             .and_then(|n| n.checked_add(size_of::<Vec<usize>>())).ok_or(AppError::Admission)?;
         let lease = budget.try_reserve_managed(atlas.atlas().catalog().id().owner(), id, ByteLength::new(bytes as u64))
@@ -132,12 +181,14 @@ impl FrozenScope {
         let mut ordinals = reserve(self.eligible)?;
         for (ordinal, entry) in atlas.atlas().catalog().entries().iter().enumerate() {
             check(canceled)?;
-            if self.predicate.includes_path(entry.path().raw().as_bytes()) {
+            if self.predicate.includes_path(entry.path().raw().as_bytes())
+                && self.expression.as_ref().is_none_or(|expression| expression.admits(entry.path())) {
                 if ordinals.len() == self.eligible { return Err(AtlasStreamSearchError::WrongAtlas); }
                 ordinals.push(ordinal);
             }
         }
-        if ordinals.len() != self.eligible { return Err(AtlasStreamSearchError::WrongAtlas); }
+        if let Some(expression) = &mut self.expression { expression.scope_files = ordinals.len(); }
+        else if ordinals.len() != self.eligible { return Err(AtlasStreamSearchError::WrongAtlas); }
         // Original order preserves file/node IDs and directory count ordering.
         // This temporary capacity overlaps the engine's separately leased copy.
         Ok((Some(ordinals), Some(lease)))
@@ -145,8 +196,10 @@ impl FrozenScope {
     fn encode(&self, out: &mut Output) -> Result<(), AtlasStreamSearchError> {
         self.predicate.encode(out)?;
         out.literal(",\"mode\":")?;
-        out.quoted(if self.occurrences { "whole-token-occurrences" }
+        out.quoted(if self.expression.is_some() { "decoded-text-expression" }
+            else if self.occurrences { "whole-token-occurrences" }
             else if self.predicate.case_sensitive() { "exact-decoded-literal" } else { "unicode-lowercase-literal" })?;
+        if let Some(expression) = &self.expression { expression.encode(out, self.eligible)?; }
         if self.occurrences {
             out.literal(",\"evidence_level\":\"whole-token-text-candidate\",\"includes_comments_and_literals\":true,\"compiler_resolved\":false,\"semantic_complete\":false")?;
         }
@@ -155,6 +208,7 @@ impl FrozenScope {
         out.literal(",\"excluded_files\":")?; out.integer(self.excluded as u64)?;
         Ok(())
     }
+    fn search_files(&self) -> usize { self.expression.as_ref().map_or(self.eligible, |expression| expression.scope_files) }
     fn region_complete(&self) -> bool { self.region.is_none_or(|region| region.missing == 0) }
 }
 struct Snapshot {
@@ -236,7 +290,7 @@ impl RetainedAtlasStreamSearch {
     /// requested visible paths absent from the catalog keep coverage partial.
     pub fn search_scoped(&mut self, atlas: &AtlasSession, needle: &str, options: AtlasStreamSearchOptions,
         scope: AtlasSearchScope, canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasStreamSearchError> {
-        self.search_inner(atlas, needle, options, scope, canceled, || false, |_| {}, false, false, false, 0)
+        self.search_inner(atlas, needle, options, scope, canceled, || false, |_| {}, false, false, QueryKind::Text, 0)
     }
 
     /// Count all exact occurrences within the I/O limits while keeping the
@@ -248,7 +302,7 @@ impl RetainedAtlasStreamSearch {
 
     pub fn search_scoped_counted(&mut self, atlas: &AtlasSession, needle: &str, options: AtlasStreamSearchOptions,
         scope: AtlasSearchScope, canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasStreamSearchError> {
-        self.search_inner(atlas, needle, options, scope, canceled, || false, |_| {}, false, true, false, 0)
+        self.search_inner(atlas, needle, options, scope, canceled, || false, |_| {}, false, true, QueryKind::Text, 0)
     }
 
     /// Publish a bounded first-page preview while the SAME scanner continues.
@@ -270,7 +324,7 @@ impl RetainedAtlasStreamSearch {
         options: AtlasStreamSearchOptions, scope: AtlasSearchScope, canceled: impl FnMut() -> bool,
         stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
         -> Result<HostResponse, AtlasStreamSearchError> {
-        self.search_inner(atlas, needle, options, scope, canceled, stopped, progress, true, false, false, 0)
+        self.search_inner(atlas, needle, options, scope, canceled, stopped, progress, true, false, QueryKind::Text, 0)
     }
 
     pub fn search_counted_with_progress(&mut self, atlas: &AtlasSession, needle: &str,
@@ -286,7 +340,7 @@ impl RetainedAtlasStreamSearch {
         options: AtlasStreamSearchOptions, scope: AtlasSearchScope, canceled: impl FnMut() -> bool,
         stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
         -> Result<HostResponse, AtlasStreamSearchError> {
-        self.search_inner(atlas, needle, options, scope, canceled, stopped, progress, true, true, false, 0)
+        self.search_inner(atlas, needle, options, scope, canceled, stopped, progress, true, true, QueryKind::Text, 0)
     }
 
     /// Search one exact whole identifier through the shared streaming decoder,
@@ -297,7 +351,24 @@ impl RetainedAtlasStreamSearch {
         options: AtlasStreamSearchOptions, scope: AtlasSearchScope, count_all_matches: bool,
         canceled: impl FnMut() -> bool, stopped: impl FnMut() -> bool,
         progress: impl FnMut(&HostResponse)) -> Result<HostResponse, AtlasStreamSearchError> {
-        self.search_inner(atlas, needle, options, scope, canceled, stopped, progress, true, count_all_matches, true, 0)
+        self.search_inner(atlas, needle, options, scope, canceled, stopped, progress, true, count_all_matches, QueryKind::Occurrences, 0)
+    }
+
+    /// Evaluate the shared bounded expression against each complete observed
+    /// file stream. Path/language filters intersect the frozen native scope
+    /// before opening files or spending I/O limits. Retained rows name primary
+    /// term occurrences, with the original expression echoed separately.
+    ///
+    /// Expressions always count all qualified primary occurrences within the
+    /// scan limits, while retaining at most max_matches witnesses. A retained
+    /// row limit cannot prove a required term or the absence of an exclusion.
+    /// Progress and Stop expose only finalized file observations; an unfinished
+    /// file contributes I/O work but no expression hits or matching-file count.
+    pub fn search_scoped_expression_with_progress(&mut self, atlas: &AtlasSession, expression: &str,
+        options: AtlasStreamSearchOptions, scope: AtlasSearchScope, canceled: impl FnMut() -> bool,
+        stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
+        -> Result<HostResponse, AtlasStreamSearchError> {
+        self.search_inner(atlas, expression, options, scope, canceled, stopped, progress, true, true, QueryKind::Expression, 0)
     }
 
     /// Rescan eligible files from their beginnings and retain a later match
@@ -309,13 +380,14 @@ impl RetainedAtlasStreamSearch {
         count_all_matches: bool, occurrences: bool, canceled: impl FnMut() -> bool,
         stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
         -> Result<HostResponse, AtlasStreamSearchError> {
+        let kind = if occurrences { QueryKind::Occurrences } else { QueryKind::Text };
         self.search_inner(atlas, needle, options, scope, canceled, stopped, progress,
-            true, count_all_matches, occurrences, start_after)
+            true, count_all_matches, kind, start_after)
     }
 
     fn search_inner(&mut self, atlas: &AtlasSession, needle: &str, options: AtlasStreamSearchOptions,
         scope: AtlasSearchScope, mut canceled: impl FnMut() -> bool, mut stopped: impl FnMut() -> bool,
-        mut progress: impl FnMut(&HostResponse), publish_progress: bool, count_all_matches: bool, occurrences: bool,
+        mut progress: impl FnMut(&HostResponse), publish_progress: bool, count_all_matches: bool, kind: QueryKind,
         start_after: u64)
         -> Result<HostResponse, AtlasStreamSearchError> {
         self.validate(atlas)?;
@@ -329,11 +401,15 @@ impl RetainedAtlasStreamSearch {
             .map_err(|_| AtlasStreamSearchError::IdentityExhausted)?;
         check(&mut canceled)?;
         options.validate()?;
-        if needle.is_empty() || needle.len() > MAX_ATLAS_STREAM_SEARCH_NEEDLE_BYTES
+        if (kind != QueryKind::Expression && (needle.is_empty() || needle.len() > MAX_ATLAS_STREAM_SEARCH_NEEDLE_BYTES))
             || start_after.checked_add(options.max_matches as u64).and_then(|n| n.checked_add(1)).is_none() {
             return Err(AtlasStreamSearchError::InvalidLimits);
         }
-        let scope = FrozenScope::admit(scope, occurrences, atlas, &mut canceled)?;
+        let expression = if kind == QueryKind::Expression {
+            let id = self.next_id()?;
+            Some(FrozenExpression::admit(needle, self.manifest.owner(), &self.budget, id)?)
+        } else { None };
+        let mut scope = FrozenScope::admit(scope, kind == QueryKind::Occurrences, expression, atlas, &mut canceled)?;
         let projection_id = self.next_id()?;
         let (ordinals, projection_lease) = scope.projection(atlas, &self.budget, projection_id, &mut canceled)?;
         self.source_bytes_read.checked_add(options.max_scan_bytes).ok_or(AtlasStreamSearchError::IdentityExhausted)?;
@@ -345,7 +421,10 @@ impl RetainedAtlasStreamSearch {
         // Reuse these allocation identities only after the previous callback's
         // admitted output and response have both been dropped.
         let progress_ids = if publish_progress { Some([self.next_id()?, self.next_id()?]) } else { None };
-        let pattern = if occurrences {
+        let pattern = if let Some(expression) = &scope.expression {
+            StreamingNeedle::expression(self.manifest.owner(), &expression.parsed,
+                scope.predicate.case_sensitive(), &self.budget, pattern_id)
+        } else if kind == QueryKind::Occurrences {
             StreamingNeedle::identifier(self.manifest.owner(), needle, &self.budget, pattern_id)
         } else {
             StreamingNeedle::text_matching(self.manifest.owner(), needle,
@@ -637,7 +716,9 @@ impl Snapshot {
         -> Result<Self, AtlasStreamSearchError> {
         report.validate_delivery(report.atlas(), report.generation())?;
         check(canceled)?;
-        if scope.eligible != report.eligible_files() || scope.excluded != report.excluded_files() {
+        let eligible = scope.search_files();
+        let excluded = report.atlas().file_count().checked_sub(eligible).ok_or(AtlasStreamSearchError::WrongAtlas)?;
+        if eligible != report.eligible_files() || excluded != report.excluded_files() {
             return Err(AtlasStreamSearchError::WrongAtlas);
         }
         let diagnostic_count = report.stats().incomplete_files.min(MAX_DIAGNOSTICS);

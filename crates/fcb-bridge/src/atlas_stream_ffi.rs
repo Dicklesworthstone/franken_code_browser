@@ -229,6 +229,51 @@ pub unsafe extern "C" fn fcb_atlas_stream_search_scoped_matching_progress(handle
     }))
 }
 
+/// Evaluate a bounded decoded-text expression over each complete observed
+/// file stream. The host owns parsing, metadata filters and same-file content
+/// predicates. All qualified primary matches are counted within the I/O budget;
+/// max_matches limits retained rows only. case_sensitive must be 0 or 1.
+/// # Safety
+/// expression is null or readable through NUL or 1025 bytes, whichever comes
+/// first, and remains stable until return. Scope strings, callbacks and return
+/// ownership follow fcb_atlas_stream_search_scoped_progress. No foreign pointer
+/// is retained. Progress cannot authorize activation before terminal acceptance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_stream_search_scoped_expression_progress(handle: u64,
+    expression: *const c_char, max_matches: u64, max_scan_bytes: u64, max_read_calls: u64,
+    extensions: *const c_char, filenames: *const c_char, path_kind: u64, path: *const c_char,
+    case_sensitive: u64,
+    poll: Option<SearchCancellationCallback>, stop: Option<SearchCancellationCallback>,
+    progress: Option<AtlasStreamProgressCallback>, context: *mut c_void) -> *mut c_char {
+    reply(|| answer(handle, |atlases| {
+        let cancellation_seen = std::cell::Cell::new(false);
+        let canceled = || {
+            let requested = cancellation_seen.get()
+                || poll.is_some_and(|poll| unsafe { poll(context) != 0 });
+            cancellation_seen.set(requested);
+            requested
+        };
+        if canceled() { return Err(AccessError::Canceled); }
+        if case_sensitive > 1 { return Err(AccessError::InvalidArgument); }
+        // Empty and malformed expressions belong to the shared query parser;
+        // foreign null, invalid UTF-8 and overlong strings are ABI errors.
+        let expression = unsafe { bounded_optional(expression, MAX_ATLAS_STREAM_SEARCH_NEEDLE_BYTES) }?
+            .ok_or(AccessError::InvalidArgument)?;
+        let scope = unsafe { bounded_scope(extensions, filenames, path_kind, path) }?
+            .with_case_sensitive(case_sensitive == 1);
+        let options = AtlasStreamSearchOptions { max_matches: number(max_matches)?, max_scan_bytes, max_read_calls };
+        atlases.execute_stream_scoped_expression_with_progress(handle, expression, options, &scope,
+            &canceled, || stop.is_some_and(|stop| unsafe { stop(context) != 0 }),
+            |response| {
+                if canceled() { return; }
+                if let Some(progress) = progress {
+                    let bytes = response.as_str().as_bytes();
+                    unsafe { progress(bytes.as_ptr(), bytes.len() as u64, context) };
+                }
+            })
+    }))
+}
+
 /// Exact whole-identifier occurrences with bounded progress and independent
 /// count/row limits. Comments and literals are included; no compiler resolution
 /// is implied. Identifier syntax and token boundaries belong to the shared

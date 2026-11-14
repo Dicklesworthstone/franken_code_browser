@@ -155,3 +155,54 @@ fn close_from_progress_retains_capacity_until_entered_call_drains() {
     assert_eq!(registry.live.load(Ordering::Acquire), 0);
     assert_eq!(registry.budget.accounting().reserved().get(), 0);
 }
+
+#[test]
+fn expression_progress_keeps_other_sessions_available_and_cancel_preserves_prior_witness() {
+    let fixture = Fixture::new();
+    let registry = AtlasSessions::new();
+    let handle = fixture.open(&registry);
+    let independent = fixture.open(&registry);
+    registry.execute_stream(handle, search("old"), || false).unwrap();
+    let mut callbacks = 0;
+    let canceled = registry.execute_stream_scoped_expression_with_progress(handle, "needle -forbidden",
+        AtlasStreamSearchOptions::default(), &AtlasSearchScope::all(), || false, || false, |response| {
+            callbacks += 1;
+            assert!(response.as_str().contains("\"mode\":\"decoded-text-expression\""));
+            assert!(response.as_str().contains("\"selection_available\":false"));
+            assert!(matches!(registry.execute_stream(handle,
+                StreamCommand::Page { generation: 1, start: 0, count: 1 }, || false),
+                Err(AccessError::Busy)));
+            assert!(registry.execute(independent, Command::Info, || false).is_ok());
+            registry.cancel(handle).unwrap();
+        });
+    assert_eq!(callbacks, 1);
+    assert!(matches!(canceled, Err(AccessError::Canceled)));
+    let retained = registry.execute_stream(handle,
+        StreamCommand::Hit { generation: 1, position: 0 }, || false).unwrap();
+    assert!(retained.as_str().contains("\"original_hex\":\"6f6c64\""));
+    assert!(retained.as_str().contains("\"mode\":\"exact-decoded-literal\""));
+    registry.close(handle).unwrap();
+    registry.close(independent).unwrap();
+}
+
+#[test]
+fn expression_progress_close_retains_session_permit_until_worker_drains() {
+    let fixture = Fixture::new();
+    let registry = AtlasSessions::new();
+    let handle = fixture.open(&registry);
+    let others: Vec<_> = (1..MAX_ATLAS_SESSIONS).map(|_| registry.create().unwrap()).collect();
+    let mut callbacks = 0;
+    let closed = registry.execute_stream_scoped_expression_with_progress(handle, "needle -forbidden",
+        AtlasStreamSearchOptions::default(), &AtlasSearchScope::all(), || false, || false, |_| {
+            callbacks += 1;
+            registry.close(handle).unwrap();
+            assert_eq!(registry.live.load(Ordering::Acquire), MAX_ATLAS_SESSIONS);
+            assert!(matches!(registry.create(), Err(AccessError::Capacity)));
+        });
+    assert_eq!(callbacks, 1);
+    assert!(matches!(closed, Err(AccessError::Closed)));
+    assert_eq!(registry.live.load(Ordering::Acquire), MAX_ATLAS_SESSIONS - 1);
+    for id in others { registry.close(id).unwrap(); }
+    assert_eq!(registry.live.load(Ordering::Acquire), 0);
+    assert_eq!(registry.budget.accounting().reserved().get(), 0);
+}
