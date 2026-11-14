@@ -101,9 +101,14 @@ struct AtlasExternalWebLink: Sendable {
         guard let identity else { return "Open a retained source capture first." }
         guard identity.encoding == "utf8" else { return "Markdown preview requires UTF-8; the source reader remains available." }
         guard identity.capturedBytes <= AtlasReaderDocumentLimits.sourceBytes else {
-            return "Markdown preview admits at most 64 KiB of source. The larger retained file remains readable."
+            return "Markdown preview admits at most 256 KiB of source. The larger retained file remains readable."
         }
         return nil
+    }
+    private var styledSourceLimitReason: String? {
+        guard richSupported, let identity,
+              identity.capturedBytes > AtlasReaderDocumentLimits.styledSourceBytes else { return nil }
+        return "This document uses Text preview because Styled preview is limited to 64 KiB. Headings, links, and source navigation remain available."
     }
     var canPrepare: Bool { unavailableReason == nil }
     var canNavigate: Bool { authorized && page != nil && !busy }
@@ -125,7 +130,10 @@ struct AtlasExternalWebLink: Sendable {
             + "Evidence identifies the complete original document, not an inline span."
     }
     var coverage: String {
-        guard let page else { return unavailableReason ?? "Prepare a logical FrankenMarkdown preview from the retained source." }
+        guard let page else {
+            return unavailableReason ?? styledSourceLimitReason
+                ?? "Prepare a logical FrankenMarkdown preview from the retained source."
+        }
         let inventory = page.inventory
         let status = authorized ? "" : "Previous preview is read-only; prepare again before navigating or copying. "
         if showsStyled, let display = displayPage {
@@ -139,7 +147,8 @@ struct AtlasExternalWebLink: Sendable {
                     ? "Source actions select enclosing Markdown blocks."
                     : "Source regions could not be qualified for this layout; use Text or the source reader.")
         }
-        return status + "Logical FrankenMarkdown flow, not native shaped document layout. "
+        return status + (styledSourceLimitReason.map { $0 + " " } ?? "")
+            + "Logical FrankenMarkdown flow, not native shaped document layout. "
             + "\(page.lines.count) of \(inventory.totalLines) flow rows shown at \(inventory.width) columns. "
             + "Source links select enclosing Markdown regions, not glyph-exact spans. "
             + "Width changes return to the start of the first mapped Markdown region shown. Web links open only through Open in browser. Styled mode can load local images from the current project or captured assets in the opened saved archive."
@@ -260,6 +269,13 @@ struct AtlasExternalWebLink: Sendable {
     }
     func prepareDisplay() {
         guard richSupported, canNavigate, let page else { return }
+        if let reason = styledSourceLimitReason {
+            // Keep the accepted logical page and its source/heading authority.
+            // No doomed typography request or font/image acquisition is queued.
+            retireDisplayLocation()
+            notice = reason
+            return
+        }
         let inventory = page.inventory
         let width = max(160, min(4096, inventory.width * 8))
         let anchor: UInt64?

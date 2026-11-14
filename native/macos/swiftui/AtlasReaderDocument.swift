@@ -71,8 +71,11 @@ struct AtlasDocumentImageSource: Sendable, Equatable {
 }
 
 enum AtlasReaderDocumentLimits {
-    // Match DocumentReadOptions::default(), not the larger whole-source reader.
-    static let sourceBytes: UInt64 = 64 * 1024
+    // Use the public DocumentReadOptions source allowance while retaining the
+    // default bounded flow/metadata quotas. NativeDocumentDisplay has its own
+    // smaller source allowance; a larger document still has logical navigation.
+    static let sourceBytes: UInt64 = 256 * 1024
+    static let styledSourceBytes: UInt64 = 64 * 1024
     static let flowLines: UInt64 = 8192
     static let flowItems: UInt64 = 8192
     static let blocks: UInt64 = 4096
@@ -390,7 +393,10 @@ struct AtlasReaderDocumentJob: Sendable {
             json = link(handle, generation, target.link.id, count)
         case .prepareDisplay(let width):
             guard let prepare = transport.prepareDisplay, let font = transport.displayFont,
-                  let inventory else { throw AtlasReaderError.unavailable }
+                  let inventory,
+                  info.identity.capturedBytes <= AtlasReaderDocumentLimits.styledSourceBytes else {
+                throw AtlasReaderError.unavailable
+            }
             let page = try AtlasDocumentDisplayWire.page(prepare(handle, generation, width),
                 document: inventory, command: request.command, first: 0, width: width)
             var fonts: [AtlasDocumentDisplayFont] = []
@@ -633,7 +639,8 @@ struct AtlasReaderDocumentJob: Sendable {
             case .link(let target):
                 guard links?.target(id: target.link.id) == target else { throw AtlasReaderError.invalidInput }
             case .prepareDisplay(let width):
-                guard (160...4096).contains(width),
+                guard info.identity.capturedBytes <= AtlasReaderDocumentLimits.styledSourceBytes,
+                      (160...4096).contains(width),
                       displayInventory == nil || displayInventory?.width == width else {
                     throw AtlasReaderError.invalidInput
                 }

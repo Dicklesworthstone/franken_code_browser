@@ -1430,10 +1430,13 @@ pending; it is not a claim about the already released binary.
 ## Styled Markdown preview
 
 Open a retained source file and choose **Markdown**, or **Split preview** to keep
-the source alongside the document. The native reader now prepares a **Styled**
-view by default when the host supplies the rich-display capability. **Text**
-keeps the existing selectable logical preview available. The **Columns** field
-and **Reflow** control change the width without reopening the file.
+the source alongside the document. The native reader prepares a **Styled**
+view by default when the host supplies the rich-display capability and the
+capture fits its 64 KiB source limit. **Text** keeps the selectable logical
+preview available for UTF-8 captures up to **256 KiB**. Larger supported
+documents automatically use Text with an explanation; choosing Styled keeps
+that logical preview and its navigation available. The **Columns** field and
+**Reflow** control change the width without reopening the file.
 
 Styled pages draw FrankenMarkdown's shaped glyph IDs and positions using the
 exact bundled font bytes supplied by the retained reader. Headings, prose,
@@ -1458,13 +1461,27 @@ Canceling, reflowing, replacing or closing the preview withdraws a pending
 handoff. URL-policy and stale-action regressions are included; executable and
 physical-Mac browser-handoff verification remain pending.
 
-Preparation admits UTF-8 captures up to 64 KiB, at most 8,192 display elements,
-131,072 glyphs, and 8 MiB of bundled font resources. A page admits at most 128
+Logical preparation uses the existing public 256 KiB source bound with at most
+8,192 flow rows, 8,192 flow items and 4,096 blocks; each page requests at most
+64 rows. The larger source allowance preserves heading/link navigation,
+original-byte anchors, rendered-text copy and enclosing-Markdown copy. Files
+above 256 KiB remain available in the source reader.
+
+Styled preparation retains its 64 KiB source bound, at most 8,192 display
+elements, 131,072 glyphs, and 8 MiB of bundled font resources. It does not queue
+typography, font or image work for a document above that source bound. A page admits at most 128
 elements and 16,384 glyphs. Source, generation, layout and page identities are
 checked before accepting asynchronous results or enabling source actions.
 Cancellation, capture replacement and failed reflow cannot reactivate stale
 pages. Each logical generation retains one rich width; reflow creates a fresh
 generation.
+
+`tests/test-large-document-preview.sh` covers the native size boundaries,
+fallback, late source anchors, copy domains, reflow and cancellation. The Rust
+host regression `crates/fcb-app/tests/retained_reader_large_document.rs`
+exercises actual larger Markdown parsing and original BOM/CRLF offsets, including
+the exact 256 KiB boundary. These code-first additions await independent
+execution; they do not qualify native drawing or raise the styled-rendering limit.
 
 The bundled upstream shaping profile does not cover every writing system or
 combining sequence. Unsupported text leaves Text and the exact source readable.

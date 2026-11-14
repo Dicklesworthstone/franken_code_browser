@@ -328,7 +328,8 @@ import Foundation
             check(m.page?.id == accepted && m.page?.inventory.width == 100, "Out-of-order old reflow cannot replace newest page")
         }
         do {
-            for (encoding, bytes) in [("utf16le", UInt64(100)), ("unsupported", 100), ("utf8", 65537)] {
+            for (encoding, bytes) in [("utf16le", UInt64(100)), ("unsupported", 100),
+                                      ("utf8", AtlasReaderDocumentLimits.sourceBytes + 1)] {
                 let f = Fixture(), m = f.model()
                 m.bind(identity: Fixture.identity(bytes: bytes, encoding: encoding), sourceOffset: 0)
                 m.prepare()
