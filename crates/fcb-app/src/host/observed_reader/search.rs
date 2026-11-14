@@ -8,7 +8,7 @@
 use std::{fs::File, mem::size_of, sync::Arc};
 use fcb::{ByteLength, ByteOffset, ByteRange, QueryGeneration, SourceRevision};
 use fcb::search::{CaptureRequest, DetectedEncoding, ExtentConsistency, FileSearch,
-    FileSearchReport, ResourceAllocationId, ResourceBudget, StreamReadOptions,
+    FileSearchReport, IndexError, ParsedQuery, QueryError, ResourceAllocationId, ResourceBudget, StreamReadOptions,
     StreamReadState, StreamReadStats, StreamReadStep, StreamingHit, StreamingMode, StreamingNeedle};
 use fcb::store::Sha256Digest;
 use fcb::search::identifier::{MAX_IDENTIFIER_BYTES, token_scalar};
@@ -27,15 +27,18 @@ pub const MAX_OBSERVED_READER_OCCURRENCE_BYTES: usize = MAX_IDENTIFIER_BYTES;
 /// Whole-token occurrences are exact text candidates, including comments and
 /// literals, under the shared conservative token policy. They are not compiler
 /// references. Text mode preserves the existing literal/lowercase semantics.
+/// Expressions use the shared bounded parser and same-observation predicates;
+/// their primary term supplies exact witnesses, without retaining the file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ObservedReaderSearchKind { Text, Occurrences }
+pub enum ObservedReaderSearchKind { Text, Occurrences, Expression }
 impl ObservedReaderSearchKind {
     pub const fn requested(self) -> &'static str {
-        match self { Self::Text => "text", Self::Occurrences => "occurrences" }
+        match self { Self::Text => "text", Self::Occurrences => "occurrences", Self::Expression => "expression" }
     }
     pub const fn realized(self, case_sensitive: bool) -> &'static str {
         match self {
             Self::Occurrences => "whole-token-occurrences",
+            Self::Expression => "decoded-text-expression",
             Self::Text if case_sensitive => "exact-decoded-text",
             Self::Text => "unicode-lowercase-text",
         }
@@ -56,6 +59,8 @@ pub(super) struct AcceptedSearch {
     count_all_matches: bool,
     kind: ObservedReaderSearchKind,
     case_sensitive: bool,
+    expression: Option<Arc<FrozenExpression>>,
+    expression_qualified: Option<bool>,
     unsupported_at: Option<ByteOffset>,
     max_matches: usize,
     max_scan_bytes: u64,
@@ -71,8 +76,9 @@ struct SearchWitness { text: String, bytes: Vec<u8>, sha256: Sha256Digest }
 
 /// A verified hit selection belongs to its accepted immutable page. Replacing
 /// the current query cannot erase the provenance needed for history replay.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct FindHit {
+    expression: Option<Arc<FrozenExpression>>,
     kind: ObservedReaderSearchKind,
     case_sensitive: bool,
     generation: u64,
@@ -83,6 +89,41 @@ pub(super) struct FindHit {
     original_range: ByteRange,
     decoded_start: u64,
     decoded_end: u64,
+}
+
+
+/// Shared with accepted observed-history pages, without retaining source or the
+/// entire hit table. The parser/AST and its lease outlive query replacement only
+/// while an exact primary-witness observation still needs its provenance.
+struct FrozenExpression { parsed: ParsedQuery, _lease: ResourceLease }
+impl FrozenExpression {
+    fn admit(raw: &str, owner: fcb::ArenaOwnerId, budget: &ResourceBudget, id: ResourceAllocationId)
+        -> Result<Self, ObservedReaderError> {
+        if raw.len() > fcb::search::MAX_QUERY_LEN {
+            return Err(AppError::from(IndexError::from(QueryError::NeedleTooLong)).into());
+        }
+        let charge = size_of::<Self>() + 2 * size_of::<usize>() + fcb::search::MAX_QUERY_LEN * 32
+            + fcb::search::MAX_QUERY_TOKENS * 8 * size_of::<String>();
+        let lease = budget.try_reserve_managed(owner, id, ByteLength::new(charge as u64))
+            .map_err(|_| AppError::Admission)?;
+        let parsed = ParsedQuery::parse(raw).map_err(|error| AppError::from(IndexError::from(error)))?;
+        // The reader has one already-opened file, not a metadata-filtered
+        // workspace manifest. Refuse filters before any source payload read.
+        if !parsed.path_filters.is_empty() || !parsed.lang_filters.is_empty() {
+            return Err(ObservedReaderError::ExpressionScopeUnsupported);
+        }
+        Ok(Self { parsed, _lease: lease })
+    }
+    fn encode(&self, out: &mut Output, scope: &str, qualified: Option<bool>)
+        -> Result<(), ObservedReaderError> {
+        out.literal(",\"expression\":")?; out.quoted(&self.parsed.raw_query)?;
+        out.literal(",\"primary_needle\":")?; out.quoted(&self.parsed.primary_needle)?;
+        out.literal(",\"query_syntax\":\"fcb-bounded-expression/1\",\"predicate_scope\":")?;
+        out.quoted(scope)?;
+        out.literal(",\"expression_qualified\":")?;
+        if let Some(qualified) = qualified { out.boolean(qualified)?; } else { out.literal("null")?; }
+        Ok(())
+    }
 }
 
 impl ObservedReaderSession {
@@ -127,11 +168,14 @@ impl ObservedReaderSession {
             case_sensitive, count_all_matches, max_matches, max_scan_bytes, canceled)
     }
 
-    /// Search literal text or exact whole-token occurrences with one frozen
-    /// mode/count policy. Occurrences use the shared streaming token cursor,
+    /// Search literal text, exact whole-token occurrences, or a bounded content
+    /// expression with one frozen mode/count policy. Occurrences use the shared streaming token cursor,
     /// including UTF-16 and read-chunk boundaries, without retaining the file.
     /// Only case-sensitive occurrences are supported; incompatible options and
     /// invalid token names fail before source I/O and preserve accepted results.
+    /// Expressions admit phrases, conjunctions and exclusions; path/language
+    /// filters are refused before I/O. Every expression qualifies the complete
+    /// observed input under the same limits, even without count_all_matches.
     pub fn find_with_kind(&mut self, generation: u64, needle: &str, encoding: ObservedReaderEncoding,
         kind: ObservedReaderSearchKind, case_sensitive: bool, count_all_matches: bool,
         max_matches: usize, max_scan_bytes: u64, canceled: impl FnMut() -> bool)
@@ -166,7 +210,8 @@ impl ObservedReaderSession {
         let generation = QueryGeneration::new(self.owner(), generation)
             .map_err(|_| ObservedReaderError::IdentityExhausted)?;
         check(&mut canceled)?;
-        if needle.is_empty() || needle.len() > MAX_OBSERVED_READER_NEEDLE_BYTES
+        if (kind != ObservedReaderSearchKind::Expression
+                && (needle.is_empty() || needle.len() > MAX_OBSERVED_READER_NEEDLE_BYTES))
             || max_matches > MAX_OBSERVED_READER_MATCHES || max_scan_bytes > MAX_OBSERVED_READER_SCAN_BYTES
             || (kind == ObservedReaderSearchKind::Occurrences && !case_sensitive) {
             return Err(ObservedReaderError::InvalidLimits);
@@ -175,12 +220,18 @@ impl ObservedReaderSession {
         // A canceled/failed attempt still spends every actual native read call.
         self.source_bytes_read.checked_add(max_scan_bytes).ok_or(ObservedReaderError::IdentityExhausted)?;
         self.read_calls.checked_add(MAX_OBSERVED_READER_SEARCH_CALLS).ok_or(ObservedReaderError::IdentityExhausted)?;
-        let [pattern_id, worker_id, result_id] = self.allocations()?;
+        let [pattern_id, worker_id, result_id, expression_id] = self.allocations()?;
+        let expression = if kind == ObservedReaderSearchKind::Expression {
+            Some(Arc::new(FrozenExpression::admit(needle, self.owner(), &self.budget, expression_id)?))
+        } else { None };
         let pattern = match kind {
             ObservedReaderSearchKind::Text =>
                 StreamingNeedle::text_matching(self.owner(), needle, case_sensitive, &self.budget, pattern_id),
             ObservedReaderSearchKind::Occurrences =>
                 StreamingNeedle::identifier(self.owner(), needle, &self.budget, pattern_id),
+            ObservedReaderSearchKind::Expression => StreamingNeedle::expression(self.owner(),
+                &expression.as_ref().ok_or(ObservedReaderError::InvalidRange)?.parsed,
+                case_sensitive, &self.budget, pattern_id),
         }.map_err(AppError::from)?;
         let request = CaptureRequest::new(self.reader.file_id(), revision)?;
         let options = StreamReadOptions { generation, max_matches, max_bytes: max_scan_bytes,
@@ -198,7 +249,7 @@ impl ObservedReaderSession {
         self.read_calls += io.read_calls;
         let report = scanned?;
         let candidate = Arc::new(AcceptedSearch::retain(&report, encoding, max_matches, max_scan_bytes,
-            &self.budget, result_id, &mut canceled)?);
+            expression, &self.budget, result_id, &mut canceled)?);
         // The temporary report/compiled query need not overlap output encoding.
         // The retained occurrence table and witness own their independent lease.
         drop(report);
@@ -280,7 +331,11 @@ impl ObservedReaderSession {
             let end = usize::try_from(decoded.end().get()).map_err(|_| ObservedReaderError::InvalidRange)?;
             verify_token_context(&candidate, &text, start, end)?;
         }
-        candidate.find_hit = Some(FindHit { kind: query.kind, case_sensitive: query.case_sensitive,
+        if query.expression.is_some() && query.expression_qualified != Some(true) {
+            return Err(ObservedReaderError::InvalidRange);
+        }
+        candidate.find_hit = Some(FindHit { expression: query.expression.clone(),
+            kind: query.kind, case_sensitive: query.case_sensitive,
             generation, search_observation: query.request.revision().get(),
             page_start_after: query.page_start_after,
             hit_index, occurrence: hit.occurrence_id(), original_range: original,
@@ -299,7 +354,7 @@ impl ObservedReaderSession {
         out.quoted(&query.literal_text)?;
         // Additive native aliases preserve every existing search receipt field.
         out.literal(",\"search_kind\":\"continuous-open-file-observation\",\"needle\":")?;
-        out.quoted(&query.literal_text)?;
+        out.quoted(query.expression.as_ref().map_or(query.literal_text.as_str(), |expression| expression.parsed.raw_query.as_str()))?;
         out.literal(",\"literal_original_hex\":")?;
         if query.hits.is_empty() || !query.case_sensitive { out.literal("null")?; } else { out.hex(&query.literal_bytes)?; }
         out.literal(",\"literal_sha256\":")?;
@@ -359,7 +414,7 @@ fn verify_token_context(page: &Observation, text: &fcb::search::ExtentText, star
     Ok(())
 }
 
-pub(super) fn encode_find_hit(out: &mut Output, hit: Option<FindHit>) -> Result<(), ObservedReaderError> {
+pub(super) fn encode_find_hit(out: &mut Output, hit: Option<&FindHit>) -> Result<(), ObservedReaderError> {
     out.literal(",\"find_hit\":")?;
     let Some(hit) = hit else { out.literal("null")?; return Ok(()); };
     out.literal("{\"query_generation\":")?; out.integer(hit.generation)?;
@@ -374,6 +429,10 @@ pub(super) fn encode_find_hit(out: &mut Output, hit: Option<FindHit>) -> Result<
     encode_mode(out, hit.kind, hit.case_sensitive)?;
     out.literal(",\"token_boundaries_verified\":")?;
     out.boolean(hit.kind == ObservedReaderSearchKind::Occurrences)?;
+    if let Some(expression) = &hit.expression {
+        expression.encode(out, "original-search-observation", Some(true))?;
+        out.literal(",\"expression_revalidated\":false")?;
+    }
     out.literal("}")?;
     Ok(())
 }
@@ -393,18 +452,23 @@ pub(super) fn encode_search_info(out: &mut Output, query: Option<&AcceptedSearch
 
 impl AcceptedSearch {
     fn retain(report: &FileSearchReport<'_>, encoding: ObservedReaderEncoding,
-        max_matches: usize, max_scan_bytes: u64, budget: &ResourceBudget,
+        max_matches: usize, max_scan_bytes: u64, expression: Option<Arc<FrozenExpression>>, budget: &ResourceBudget,
         allocation: ResourceAllocationId, canceled: &mut impl FnMut() -> bool)
         -> Result<Self, ObservedReaderError> {
         check(canceled)?;
         let search = report.search();
         let text = search.text_literal().ok_or(ObservedReaderError::InvalidRange)?;
+        if search.is_expression() != expression.is_some()
+            || expression.as_ref().is_some_and(|expression| expression.parsed.primary_needle != text) {
+            return Err(ObservedReaderError::InvalidRange);
+        }
         let (kind, case_sensitive) = match search.mode() {
             StreamingMode::ExactText => (ObservedReaderSearchKind::Text, true),
             StreamingMode::LowercaseText => (ObservedReaderSearchKind::Text, false),
             StreamingMode::Identifier => (ObservedReaderSearchKind::Occurrences, true),
             StreamingMode::OriginalBytes => return Err(ObservedReaderError::InvalidRange),
         };
+        let kind = if expression.is_some() { ObservedReaderSearchKind::Expression } else { kind };
         let witness = if search.hits().is_empty() || !case_sensitive { &[][..] }
             else { search.witness_bytes(0).map_err(AppError::from)? };
         let mut per_hit_charge = 0usize;
@@ -451,6 +515,7 @@ impl AcceptedSearch {
             observed_length: search.observed_length(), final_length: report.final_length(),
             consistency: report.consistency(), state: search.state(), io: search.stats(),
             matches_seen: search.matches_seen(), count_all_matches: search.count_all_matches(), kind, case_sensitive,
+            expression, expression_qualified: search.expression_qualified(),
             page_start_after: search.page_start_after(),
             unsupported_at: search.unsupported_at(), max_matches, max_scan_bytes,
             literal_text, literal_bytes, sha256, witnesses, hits, _lease: lease })
@@ -508,6 +573,9 @@ fn encode_mode(out: &mut Output, kind: ObservedReaderSearchKind, case_sensitive:
 
 fn encode_query(out: &mut Output, query: &AcceptedSearch) -> Result<(), ObservedReaderError> {
     encode_mode(out, query.kind, query.case_sensitive)?;
+    if let Some(expression) = &query.expression {
+        expression.encode(out, "same-observed-stream", query.expression_qualified)?;
+    }
     out.literal(",\"query_generation\":")?; out.integer(query.generation.get())?;
     out.literal(",\"search_observation\":")?; out.integer(query.request.revision().get())?;
     out.literal(",\"page_start_after\":")?; out.integer(query.page_start_after)?;

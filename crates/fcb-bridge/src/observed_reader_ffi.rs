@@ -222,7 +222,9 @@ pub unsafe extern "C" fn fcb_observed_reader_find_matching(handle: u64, generati
     }))
 }
 
-/// Select literal text (mode 0) or whole-token occurrences (mode 1). Occurrence
+/// Select literal text (mode 0), whole-token occurrences (mode 1), or a bounded
+/// content expression (mode 2). Expressions reject metadata filters and qualify
+/// the complete observed input before publishing primary-term witnesses. Occurrence
 /// names use the shared bounded token policy and require case_sensitive=1.
 /// Existing find entry points retain their literal-text behavior.
 /// # Safety
@@ -236,6 +238,7 @@ pub unsafe extern "C" fn fcb_observed_reader_find_mode(handle: u64, generation: 
         if case_sensitive > 1 || count_all_matches > 1 { return Err(AccessError::InvalidArgument); }
         let kind = match mode {
             0 => ObservedReaderSearchKind::Text, 1 => ObservedReaderSearchKind::Occurrences,
+            2 => ObservedReaderSearchKind::Expression,
             _ => return Err(AccessError::InvalidArgument),
         };
         let needle = unsafe { bounded_text(needle, MAX_OBSERVED_READER_NEEDLE_BYTES) }?;
@@ -261,6 +264,7 @@ pub unsafe extern "C" fn fcb_observed_reader_find_page(handle: u64, generation: 
         if case_sensitive > 1 || count_all_matches > 1 { return Err(AccessError::InvalidArgument); }
         let kind = match mode {
             0 => ObservedReaderSearchKind::Text, 1 => ObservedReaderSearchKind::Occurrences,
+            2 => ObservedReaderSearchKind::Expression,
             _ => return Err(AccessError::InvalidArgument),
         };
         let needle = unsafe { bounded_text(needle, MAX_OBSERVED_READER_NEEDLE_BYTES) }?;

@@ -264,7 +264,7 @@ fn c_occurrence_mode_rejects_unknown_flags_invalid_names_and_canceled_replacemen
     fs::write(root.join("source"), b"foo foobar Foo").unwrap();
     let handle = open(&croot);
     assert_eq!(number(&find_mode(handle, 1, "foo", 1, 1, 1, 0, 16, 1024), "matches_seen"), 1);
-    for (mode, case_sensitive, count_all) in [(2, 1, 0), (u64::MAX, 1, 0), (1, 2, 0), (1, 1, 2)] {
+    for (mode, case_sensitive, count_all) in [(3, 1, 0), (u64::MAX, 1, 0), (1, 2, 0), (1, 1, 2)] {
         let result = find_mode(handle, 2, "foo", 1, mode, case_sensitive, count_all, 16, 1024);
         assert!(result.contains("OBSERVED_READER_HANDLE_INVALID_ARGUMENT"), "{result}");
     }
@@ -351,7 +351,7 @@ fn c_find_page_preserves_limits_lowercase_utf16_and_canceled_accepted_results() 
     let witness = take(fcb_observed_reader_search_hit(handle, 1, 0));
     assert!(witness.contains("\"original_hex\":\"4b00\""));
     assert_eq!(number(&witness, "occurrence_id"), 2);
-    for (mode, case_sensitive, count_all) in [(2, 1, 0), (0, 2, 0), (0, 1, 2)] {
+    for (mode, case_sensitive, count_all) in [(3, 1, 0), (0, 2, 0), (0, 1, 2)] {
         let invalid = find_page(handle, 2, "k", 2, mode, case_sensitive, count_all, 2, 1, 1024);
         assert!(invalid.contains("OBSERVED_READER_HANDLE_INVALID_ARGUMENT"), "{invalid}");
     }
@@ -374,5 +374,123 @@ fn c_find_page_preserves_limits_lowercase_utf16_and_canceled_accepted_results() 
     assert_eq!(number(&beyond, "retained_hits"), 0);
     assert!(beyond.contains("\"search_complete\":true"));
     assert!(beyond.contains("\"page_has_more_matches\":false"));
+    assert_eq!(fcb_observed_reader_close(handle), 1);
+}
+
+#[test]
+fn c_expression_mode_qualifies_primary_pages_and_retains_original_predicates_in_history() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (root, croot) = root();
+    fs::write(root.join("source"), b"banana permit\n").unwrap();
+    let handle = open(&croot);
+    let raw = "\"ana\" permit -blocked";
+    let found = find_mode(handle, 1, raw, 1, 2, 1, 0, 1, 1024);
+    for expected in ["\"requested_mode\":\"expression\"", "\"mode\":\"decoded-text-expression\"",
+        "\"realized_mode\":\"decoded-text-expression\"", "\"expression\":\"\\\"ana\\\" permit -blocked\"",
+        "\"needle\":\"\\\"ana\\\" permit -blocked\"", "\"primary_needle\":\"ana\"", "\"literal_text\":\"ana\"",
+        "\"query_syntax\":\"fcb-bounded-expression/1\"", "\"predicate_scope\":\"same-observed-stream\"",
+        "\"expression_qualified\":true", "\"search_complete\":true", "\"match_count_complete\":true",
+        "\"count_all_matches\":false", "\"literal_original_hex\":\"616e61\"", "\"truncated\":true"] {
+        assert!(found.contains(expected), "missing {expected}: {found}");
+    }
+    assert_eq!(number(&found, "matches_seen"), 2);
+    assert_eq!(number(&found, "retained_hits"), 1);
+    assert_eq!(number(&found, "payload_bytes_read"), 14);
+    let later = find_page(handle, 2, raw, 1, 2, 1, 0, 1, 1, 1024);
+    assert!(later.contains("\"expression_qualified\":true"), "{later}");
+    assert!(later.contains("\"page_has_more_matches\":false"));
+    assert_eq!(number(&later, "matches_seen"), 2);
+    assert_eq!(number(&later, "occurrence_id"), 2);
+    let before = take(fcb_observed_reader_info(handle));
+    let selected = take(fcb_observed_reader_search_hit(handle, 2, 0));
+    assert!(selected.contains("\"expression\":\"\\\"ana\\\" permit -blocked\""), "{selected}");
+    assert!(selected.contains("\"text\":\"ana\"")); assert!(selected.contains("\"original_hex\":\"616e61\""));
+    assert_eq!(number(&selected, "additional_source_bytes_read"), 0);
+    assert_eq!(take(fcb_observed_reader_info(handle)), before);
+
+    // Fresh context retains the primary; its old whole-input qualification is
+    // provenance, not an assertion about these now-changed surrounding bytes.
+    fs::write(root.join("source"), b"banana denied\n").unwrap();
+    let current = hit(handle, 2, 0);
+    assert!(current.contains("\"predicate_scope\":\"original-search-observation\""), "{current}");
+    assert!(current.contains("\"expression_qualified\":true"));
+    assert!(current.contains("\"expression_revalidated\":false"));
+    assert!(current.contains("\"witness_verified\":true"));
+    assert!(current.contains("\"token_boundaries_verified\":false"));
+    assert!(current.contains("\"requested_mode\":\"expression\""));
+    let observation = number(&current, "observation");
+    assert!(observation > number(&later, "search_observation"));
+    assert!(find(handle, 3, "denied", 1, 8, 1024).contains("\"retained_hits\":\"1\""));
+    let before = take(fcb_observed_reader_info(handle));
+    let replay = take(fcb_observed_reader_retained(handle, observation));
+    assert!(replay.contains("\"expression\":\"\\\"ana\\\" permit -blocked\""), "{replay}");
+    assert!(replay.contains("\"expression_revalidated\":false"));
+    assert!(replay.contains("\"query_generation\":\"2\""));
+    assert_eq!(number(&replay, "additional_source_bytes_read"), 0);
+    assert_eq!(take(fcb_observed_reader_info(handle)), before);
+    assert!(!take(fcb_observed_reader_search_hit(handle, 3, 0)).contains("\"expression\""));
+    assert_eq!(fcb_observed_reader_close(handle), 1);
+}
+
+#[test]
+fn c_expression_negative_partial_and_invalid_queries_keep_qualification_and_io_distinct() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (root, croot) = root();
+    fs::write(root.join("source"), b"banana permit blocked").unwrap();
+    let handle = open(&croot);
+    let denied = find_mode(handle, 1, "ana permit -blocked", 1, 2, 1, 0, 1, 1024);
+    assert!(denied.contains("\"expression_qualified\":false"), "{denied}");
+    assert!(denied.contains("\"search_complete\":true"));
+    assert_eq!(number(&denied, "matches_seen"), 0); assert_eq!(number(&denied, "retained_hits"), 0);
+    let partial = find_mode(handle, 2, "ana permit -blocked", 1, 2, 1, 0, 1, 13);
+    assert!(partial.contains("\"expression_qualified\":null"), "{partial}");
+    assert!(partial.contains("\"search_complete\":false"));
+    assert!(partial.contains("\"state\":\"byte-limit\""));
+    assert_eq!(number(&partial, "matches_seen"), 0); assert_eq!(number(&partial, "payload_bytes_read"), 13);
+    let accepted = find_mode(handle, 3, "ana permit", 1, 2, 1, 1, 8, 1024);
+    assert!(accepted.contains("\"expression_qualified\":true"));
+    let selected = take(fcb_observed_reader_search_hit(handle, 3, 0));
+    let before = take(fcb_observed_reader_info(handle));
+    for (offset, (raw, code)) in [
+        ("", "QUERY_EMPTY"), ("\"unclosed", "QUERY_SYNTAX_ERROR"),
+        ("re:ana", "QUERY_REGEX_UNQUALIFIED"),
+        ("ana path:src", "OBSERVED_READER_EXPRESSION_SCOPE_UNSUPPORTED"),
+        ("ana -lang:rust", "OBSERVED_READER_EXPRESSION_SCOPE_UNSUPPORTED"),
+        ("ana type:js", "OBSERVED_READER_EXPRESSION_SCOPE_UNSUPPORTED"),
+    ].into_iter().enumerate() {
+        let rejected = find_mode(handle, 4 + offset as u64, raw, 1, 2, 1, 1, 8, 1024);
+        assert!(rejected.contains(code), "{rejected}");
+        assert_eq!(take(fcb_observed_reader_search_hit(handle, 3, 0)), selected);
+        assert_eq!(take(fcb_observed_reader_info(handle)), before);
+    }
+    let too_long = find_mode(handle, 20, &"x".repeat(1025), 1, 2, 1, 1, 8, 1024);
+    assert!(too_long.contains("QUERY_NEEDLE_TOO_LONG"), "{too_long}");
+    assert_eq!(take(fcb_observed_reader_info(handle)), before);
+    let count = find_mode(handle, 21, "ana permit", 1, 2, 1, 0, 0, 1024);
+    assert!(count.contains("\"expression_qualified\":true"));
+    assert!(count.contains("\"match_count_complete\":true"));
+    assert_eq!(number(&count, "matches_seen"), 2); assert_eq!(number(&count, "retained_witness_bytes"), 0);
+    assert_eq!(fcb_observed_reader_close(handle), 1);
+}
+
+#[test]
+fn c_expression_lowercase_utf16_witnesses_keep_primary_spelling_and_exact_bytes() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (root, croot) = root();
+    let bytes: Vec<u8> = "\u{feff}K K k Permit".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    fs::write(root.join("source"), &bytes).unwrap();
+    let handle = open(&croot);
+    let found = find_mode(handle, 1, "\"k\" permit -blocked", 2, 2, 0, 1, 8, 1024);
+    assert!(found.contains("\"expression_qualified\":true"), "{found}");
+    assert!(found.contains("\"case_sensitive\":false"));
+    assert!(found.contains("\"literal_original_hex\":null")); assert!(found.contains("\"literal_sha256\":null"));
+    assert_eq!(number(&found, "matches_seen"), 3);
+    let selected = take(fcb_observed_reader_search_hit(handle, 1, 0));
+    assert!(selected.contains("\"primary_needle\":\"k\""), "{selected}");
+    assert!(selected.contains("\"text\":\"K\"")); assert!(selected.contains("\"original_hex\":\"2a21\""));
+    assert!(selected.contains("\"original_range\":{\"start\":\"2\",\"end\":\"4\"}"));
+    let page = hit(handle, 1, 0);
+    assert!(page.contains("\"expression_revalidated\":false"), "{page}");
+    assert!(page.contains("\"case_sensitive\":false"));
     assert_eq!(fcb_observed_reader_close(handle), 1);
 }

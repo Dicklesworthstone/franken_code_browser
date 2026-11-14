@@ -164,7 +164,8 @@ char *fcb_observed_reader_find_matching(uint64_t handle, uint64_t generation,
     uint64_t count_all_matches, uint64_t max_matches, uint64_t max_scan_bytes,
     fcb_observed_reader_poll poll, void *context);
 
-/* Additive search mode: 0=literal text, 1=whole-token occurrences. mode and
+/* Additive search mode: 0=literal text, 1=whole-token occurrences, 2=bounded
+ * content expression. mode and
  * boolean flags are checked; unknown values are never coerced. Text preserves
  * the matching/count semantics above. Occurrences requires case_sensitive=1
  * and a valid shared identifier of at most 1024 UTF-8 bytes. ASCII letters,
@@ -177,6 +178,27 @@ char *fcb_observed_reader_find_matching(uint64_t handle, uint64_t generation,
  * includes_comments_and_literals=true and compiler_resolved/semantic_complete
  * false. Count-only and bounded partial coverage remain separate from rows.
  * Read boundaries, byte limits and malformed input are not inferred EOF.
+ *
+ * Expression mode uses the shared bounded query syntax: quoted phrases,
+ * conjunctions and exclusions, at most 1024 UTF-8 bytes / 64 tokens. Metadata
+ * filters (path:/lang:/type:, including exclusions) are refused before payload
+ * I/O with OBSERVED_READER_EXPRESSION_SCOPE_UNSUPPORTED. Parser errors retain
+ * QUERY_* codes. Both exact and Unicode-lowercase text policies are supported.
+ * All predicates must qualify on the SAME complete observed sequence before
+ * any primary matches publish. Even count_all_matches=0 scans/counts the full
+ * bounded input; max_matches limits only retained rows. Zero supports counting.
+ *
+ * Expression find/search-hit carry requested_mode="expression",
+ * mode/realized_mode="decoded-text-expression", expression (the full raw query),
+ * primary_needle, query_syntax="fcb-bounded-expression/1" and predicate_scope=
+ * "same-observed-stream". expression_qualified is null on incomplete/unsupported
+ * input, false on a completed sequence with no qualifying primary matches, or
+ * true with a positive total (possibly zero retained rows after limits/skips).
+ * Null/false never exposes primary candidates or tentative counts.
+ * Find needle echoes the FULL raw expression; literal_text, literal witnesses
+ * and hit ranges describe only the PRIMARY. Lowercase per-hit witnesses retain
+ * exact original spelling/bytes as above. Completion remains observed metadata
+ * consistency, never an atomic-snapshot claim.
  */
 char *fcb_observed_reader_find_mode(uint64_t handle, uint64_t generation,
     const char *needle, uint64_t encoding, uint64_t mode, uint64_t case_sensitive,
@@ -231,6 +253,14 @@ char *fcb_observed_reader_search_hit(uint64_t handle, uint64_t generation,
  * old witness inside a now-longer identifier is refused. The retained find_hit
  * records its original mode and token_boundaries_verified, so history replay
  * remains qualified after another query replaces the active search.
+ *
+ * Expression activation verifies only the retained PRIMARY witness in the new
+ * context, not the whole-file predicates. find_hit retains the original raw
+ * expression, primary_needle and query_syntax with predicate_scope=
+ * "original-search-observation", expression_qualified=true and
+ * expression_revalidated=false. Its mode/case flags remain frozen. Retained
+ * history keeps that small query provenance independently of active-query
+ * replacement; it does not retain old full search tables or reread predicates.
  * Retained-window navigation afterward performs no file I/O.
  */
 char *fcb_observed_reader_observe_hit(uint64_t handle, uint64_t generation,

@@ -70,7 +70,7 @@ impl ObservedReaderEncoding {
 pub enum ObservedReaderError {
     App(AppError), Source(SourceError), Extent(ExtentError), View(ExtentViewError),
     InvalidPath, InvalidLimits, InvalidRange, MissingObservation, ObservationChanged,
-    StaleQuery, MissingHit, SearchHitChanged, LineMissing, LineScanByteLimit,
+    StaleQuery, MissingHit, SearchHitChanged, ExpressionScopeUnsupported, LineMissing, LineScanByteLimit,
     LineOutputByteLimit, LineReadCallLimit, Canceled, IdentityExhausted,
 }
 impl ObservedReaderError {
@@ -97,6 +97,7 @@ impl std::fmt::Display for ObservedReaderError {
             Self::StaleQuery => f.write_str("OBSERVED_READER_STALE_QUERY"),
             Self::MissingHit => f.write_str("OBSERVED_READER_MISSING_HIT"),
             Self::SearchHitChanged => f.write_str("OBSERVED_READER_SEARCH_HIT_CHANGED"),
+            Self::ExpressionScopeUnsupported => f.write_str("OBSERVED_READER_EXPRESSION_SCOPE_UNSUPPORTED"),
             Self::LineMissing => f.write_str("OBSERVED_READER_LINE_MISSING"),
             Self::LineScanByteLimit => f.write_str("OBSERVED_READER_LINE_SCAN_BYTE_LIMIT"),
             Self::LineOutputByteLimit => f.write_str("OBSERVED_READER_LINE_OUTPUT_BYTE_LIMIT"),
@@ -344,7 +345,7 @@ impl ObservedReaderSession {
         out.literal(",\"has_replacements\":")?; out.boolean(text.has_replacements())?;
         out.literal(",\"next_offset\":")?;
         if let Some(next) = text.next_offset() { out.integer(next.get())?; } else { out.literal("null")?; }
-        search::encode_find_hit(&mut out, page.find_hit)?;
+        search::encode_find_hit(&mut out, page.find_hit.as_ref())?;
         out.literal("}\n")?;
         let exit = if whole_observation(&page.extent) { EXIT_OK } else { EXIT_PARTIAL };
         self.finish_output(out, exit, canceled)
