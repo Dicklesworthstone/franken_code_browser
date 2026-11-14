@@ -16,6 +16,7 @@ import AppKit
     private let canKeep: Bool
     private let openLocalLink: AtlasDocumentPreviewModel.LocalNavigation?
     private let project: AtlasProjectBrowserModel?
+    private let searchProject: ((AtlasReaderSelectionQuery) -> Void)?
     @State private var model: AtlasPagedReaderModel
     @State private var readerCommands = AtlasReaderCommands()
     @State private var copyNotice = ""
@@ -37,7 +38,8 @@ import AppKit
          canPin: Bool = false, pin: ((AtlasPagedReaderModel) -> Void)? = nil,
          canKeep: Bool = false, keep: ((AtlasPagedReaderModel) -> Void)? = nil,
          openLocalLink: AtlasDocumentPreviewModel.LocalNavigation? = nil,
-         project: AtlasProjectBrowserModel? = nil) {
+         project: AtlasProjectBrowserModel? = nil,
+         searchProject: ((AtlasReaderSelectionQuery) -> Void)? = nil) {
         self.root = root
         self.path = path
         self.accessLease = accessLease
@@ -48,6 +50,7 @@ import AppKit
         self.keep = keep
         self.openLocalLink = openLocalLink
         self.project = project
+        self.searchProject = searchProject
         _model = State(initialValue: AtlasPagedReaderModel(transport: .native, search: .native,
             outline: .native, document: .native, captured: captured, supplied: supplied))
     }
@@ -58,12 +61,14 @@ import AppKit
          canKeep: Bool = false,
          keep: ((AtlasPagedReaderModel) -> Void)? = nil,
          openLocalLink: AtlasDocumentPreviewModel.LocalNavigation? = nil,
-         project: AtlasProjectBrowserModel? = nil) {
+         project: AtlasProjectBrowserModel? = nil,
+         searchProject: ((AtlasReaderSelectionQuery) -> Void)? = nil) {
         root = ""; path = ""; accessLease = nil
         ownsModel = false; self.canPin = canPin; self.pin = pin
         self.canKeep = canKeep; self.keep = keep
         self.openLocalLink = openLocalLink
         self.project = project
+        self.searchProject = searchProject
         _model = State(initialValue: model)
     }
 
@@ -190,7 +195,15 @@ import AppKit
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             AtlasPagedSourceView(model: capture.reader, canKeep: canKeep, keep: keep,
-                openLocalLink: capturedNavigation(from: capture))
+                openLocalLink: capturedNavigation(from: capture), searchProject: linkedProjectSearch)
+        }
+    }
+
+    private var linkedProjectSearch: ((AtlasReaderSelectionQuery) -> Void)? {
+        guard let searchProject else { return nil }
+        return { query in
+            showsLinked = false
+            searchProject(query)
         }
     }
 
@@ -296,7 +309,31 @@ import AppKit
                         .font(.caption2).foregroundStyle(.secondary)
                         .lineLimit(3).textSelection(.enabled)
                     Spacer(minLength: 4)
-                    if model.textSelection != nil {
+                    if let selected = model.textSelection {
+                        Menu("Search selection") {
+                            Button("Find text in this file") { model.findSelectedText(selectionID: selected.id) }
+                                .disabled(!model.canFindSelectedText)
+                            Button("Find declaration candidates in this file") {
+                                if model.findSelectedDeclarations(selectionID: selected.id) { showsOutline = true }
+                            }.disabled(!model.canFindSelectedDeclarations)
+                            Button("Find identifier occurrences in this file") {
+                                if model.findSelectedOccurrences(selectionID: selected.id) { showsReferences = true }
+                            }.disabled(!model.canFindSelectedOccurrences)
+                            if let searchProject {
+                                Divider()
+                                Button("Find text in project scope") {
+                                    if let query = model.selectionQuery(.text, selectionID: selected.id) { searchProject(query) }
+                                }.disabled(model.selectionQuery(.text, selectionID: selected.id) == nil)
+                                Button("Find declaration candidates in project scope") {
+                                    if let query = model.selectionQuery(.symbols, selectionID: selected.id) { searchProject(query) }
+                                }.disabled(model.selectionQuery(.symbols, selectionID: selected.id) == nil)
+                                Button("Find identifier occurrences in project scope") {
+                                    if let query = model.selectionQuery(.occurrences, selectionID: selected.id) { searchProject(query) }
+                                }.disabled(model.selectionQuery(.occurrences, selectionID: selected.id) == nil)
+                            }
+                        }
+                        .help("Use the exact selected spelling. Declaration candidates use exact names; occurrence search requires one identifier and includes comments and literals. Project actions keep the search sidebar's location and file-type scope. Text with decoding replacements cannot seed a text query.")
+                        .accessibilityLabel("Search selected source text")
                         Menu("Copy selection") {
                             Button("Copy selected text") { copySelected(.text) }
                             Button("Copy text with location") { copySelected(.withLocation) }

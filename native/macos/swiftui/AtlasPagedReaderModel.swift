@@ -209,6 +209,57 @@ import Observation
         return "Identifier occurrence \(target.occurrence.id) · LF line \(target.occurrence.line)"
     }
 
+    /// A retained menu action must still name the displayed selection receipt.
+    /// No selected string is reconstructed from native offsets or a live path.
+    private var searchableSelection: AtlasReaderTextSelection? {
+        guard !busy, !pinning, !documentPreview.busy, !resolvingTextSelection,
+              let selection = textSelection, let intent = textSelectionIntent, let page,
+              source === intent.source, navigation == intent.navigation,
+              page.identity.matches(selection.identity), page.identity.matches(intent.page.identity),
+              page.start == selection.pageStart, page.end == selection.pageEnd,
+              page.start == intent.page.start, page.end == intent.page.end,
+              selection.nativeRange == intent.range else { return nil }
+        return selection
+    }
+    var canFindSelectedText: Bool {
+        canFind && searchableSelection?.searchText(maximumUTF8Bytes: AtlasReaderFindReport.maximumNeedleBytes) != nil
+    }
+    var canFindSelectedDeclarations: Bool {
+        canBuildOutline && searchableSelection?.searchText(maximumUTF8Bytes: 256) != nil
+    }
+    var canFindSelectedOccurrences: Bool {
+        canFindReferences && searchableSelection?.searchText(maximumUTF8Bytes: AtlasReferencePage.nameBytes) != nil
+    }
+    func selectionQuery(_ mode: AtlasSearchMode, selectionID: UUID) -> AtlasReaderSelectionQuery? {
+        guard let selection = searchableSelection, selection.id == selectionID else { return nil }
+        return try? AtlasReaderSelectionQuery(selection: selection, mode: mode)
+    }
+    @discardableResult func findSelectedText(selectionID: UUID) -> Bool {
+        guard canFind, let selection = searchableSelection, selection.id == selectionID,
+              let text = selection.searchText(maximumUTF8Bytes: AtlasReaderFindReport.maximumNeedleBytes) else { return false }
+        fileQuery = text
+        findOptions.caseSensitive = true
+        find()
+        return true
+    }
+    @discardableResult func findSelectedDeclarations(selectionID: UUID) -> Bool {
+        guard canBuildOutline, let selection = searchableSelection, selection.id == selectionID,
+              let text = selection.searchText(maximumUTF8Bytes: 256) else { return false }
+        outlineNeedle = text
+        outlineMode = .exact
+        if hasOutline { filterOutline() } else { buildOutline() }
+        return true
+    }
+    @discardableResult func findSelectedOccurrences(selectionID: UUID) -> Bool {
+        guard canFindReferences, let selection = searchableSelection, selection.id == selectionID,
+              let text = selection.searchText(maximumUTF8Bytes: AtlasReferencePage.nameBytes) else { return false }
+        // The shared engine validates the identifier grammar. Native code only
+        // enforces transport bounds and never substitutes its own token rules.
+        referenceName = text
+        findReferences()
+        return true
+    }
+
     /// Only the displayed immutable source and navigation may report native
     /// coordinates. Selection notifications retain a small descriptor; one
     /// draining task and one newest descriptor bound work during a drag.

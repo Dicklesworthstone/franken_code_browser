@@ -7,6 +7,7 @@ import SwiftUI
     var canKeep = false
     var keep: ((AtlasPagedReaderModel) -> Void)? = nil
     var project: AtlasProjectBrowserModel? = nil
+    var searchProject: ((AtlasReaderSelectionQuery) -> Void)? = nil
     @State private var comparison: Pair?
     private struct Pair: Identifiable {
         let id = UUID()
@@ -62,7 +63,8 @@ import SwiftUI
             }
             Divider()
             if let entry = readers.selected {
-                AtlasPagedSourceView(model: entry.reader, canKeep: canKeep, keep: keep, project: project)
+                AtlasPagedSourceView(model: entry.reader, canKeep: canKeep, keep: keep, project: project,
+                    searchProject: searchProject)
                     .id(entry.id)
             } else {
                 Text(readers.busy ? "Preparing an independent retained reader…" : "Pin a retained source to read files side by side.")

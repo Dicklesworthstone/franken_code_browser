@@ -55,6 +55,7 @@ private final class TextSelectionFixture: @unchecked Sendable {
     private var blocked = 0
     private var corrupt = false
     private var completed = 0
+    private var searched: [String] = []
     let gate = DispatchSemaphore(value: 0)
     let raw = Array("alpha beta gamma\r\n".utf8)
 
@@ -62,6 +63,18 @@ private final class TextSelectionFixture: @unchecked Sendable {
     func blockNext() { locked { block = true } }
     func corruptNext() { locked { corrupt = true } }
     var calls: (selected: Int, opened: Int, blocked: Int, completed: Int) { locked { (selected, opened, blocked, completed) } }
+    var searchCalls: [String] { locked { searched } }
+
+    /// The foreign search is deliberately refused. The test observes the real
+    /// coordinator's worker handoff and failure/rebinding lifecycle, without
+    /// pretending this fixture implements source matching.
+    var refusingSearch: AtlasReaderSearchTransport {
+        AtlasReaderSearchTransport(find: { [self] _, _, text, _, _ in
+            precondition(!Thread.isMainThread)
+            locked { searched.append(text) }
+            return nil
+        }, hit: { _, _, _, _ in nil })
+    }
 
     var transport: AtlasReaderTransport {
         AtlasReaderTransport(create: { [self] in locked { let id = next; next += 1; return id } },
@@ -142,10 +155,12 @@ private final class TextSelectionFixture: @unchecked Sendable {
         try utf16AndReplacementWitnesses()
         try malformedCoordinatesAndReceipts()
         try boundaryAdjustedPages()
+        try exactSelectionSearchSeeds()
         await latestSelectionCoalesces()
         await stalePagesAndClosureRevoke()
         await failureCannotReuseSelection()
         await failedNavigationRebindsVisibleSelection()
+        await selectionSearchRejectsRetiredMenus()
         try suppliedTransportPreservesSelection()
         print("AtlasReaderTextSelection: \(checks) production coordinate, receipt, coalescing and lifetime checks passed")
     }
@@ -189,11 +204,15 @@ private final class TextSelectionFixture: @unchecked Sendable {
             originalStart: 1, originalEnd: 2, originalHex: "ff", replacements: true)), request: request)
         check(selection.text == "�" && selection.originalHex == "ff" && selection.containsReplacements,
               "replacement was relabeled as original Unicode bytes")
+        check(selection.searchText(maximumUTF8Bytes: 1024) == nil,
+              "malformed source became an apparently exact text query")
         let literal = selectionPage(text: "�", raw: [239, 191, 189])
         let literalRequest = try AtlasReaderTextSelectionRequest(page: literal, nativeRange: NSRange(location: 0, length: 1))
         let exact = try AtlasReaderTextSelection.decode(selectionJSON(selectionReceipt(literalRequest,
             originalStart: 0, originalEnd: 3, originalHex: "efbfbd")), request: literalRequest)
         check(!exact.containsReplacements, "genuine replacement-character scalar labeled malformed")
+        check(exact.searchText(maximumUTF8Bytes: 1024) == "�",
+              "genuine U+FFFD was refused as a decoding replacement")
         var hiddenReplacement = selectionReceipt(request, originalStart: 1, originalEnd: 2, originalHex: "ff")
         rejects("malformed byte advertised as lossless Unicode") {
             _ = try AtlasReaderTextSelection.decode(selectionJSON(hiddenReplacement), request: request)
@@ -260,6 +279,48 @@ private final class TextSelectionFixture: @unchecked Sendable {
         rejects("oversized page entered selection worker") {
             _ = try AtlasReaderTextSelectionRequest(page: oversized, nativeRange: NSRange(location: 0, length: 1))
         }
+    }
+
+    private static func exactSelectionSearchSeeds() throws {
+        func selected(_ text: String) throws -> AtlasReaderTextSelection {
+            let raw = Array(text.utf8), page = selectionPage(text: text, raw: Array(text.utf8), start: 17)
+            let request = try AtlasReaderTextSelectionRequest(page: page,
+                nativeRange: NSRange(location: 0, length: (text as NSString).length))
+            return try AtlasReaderTextSelection.decode(selectionJSON(selectionReceipt(request,
+                originalStart: 17, originalEnd: 17 + UInt64(raw.count), originalHex: selectionHex(raw))), request: request)
+        }
+        for text in ["café", "cafe\u{301}", "  alpha\r\nbeta\t", "path:src/ -unsafe", "😀"] {
+            let selection = try selected(text)
+            for mode in [AtlasSearchMode.text, .symbols, .occurrences] {
+                let query = try AtlasReaderSelectionQuery(selection: selection, mode: mode)
+                check(query.text.utf8.elementsEqual(text.utf8), "selection search trimmed, normalized or parsed the query")
+                check(query.selectionID == selection.id && query.identity.matches(selection.identity)
+                      && query.originalStart == 17 && query.originalEnd == 17 + UInt64(text.utf8.count),
+                      "selection search changed the originating source witness")
+                check(query.mode == mode, "selected literal silently became an expression")
+            }
+        }
+        let simple = try selected("alpha")
+        for unsupported in [AtlasSearchMode.expression, .headings] {
+            rejects("selection silently opted into unrelated query semantics") {
+                _ = try AtlasReaderSelectionQuery(selection: simple, mode: unsupported)
+            }
+        }
+        let atProjectLimit = try selected(String(repeating: "é", count: 512))
+        let atLimitQuery = try AtlasReaderSelectionQuery(selection: atProjectLimit, mode: .text)
+        check(atLimitQuery.text.utf8.count == 1024,
+              "project selection limit measured characters instead of UTF-8 bytes")
+        let overProjectLimit = try selected(String(repeating: "é", count: 513))
+        rejects("oversized project selection silently shortened") {
+            _ = try AtlasReaderSelectionQuery(selection: overProjectLimit, mode: .text)
+        }
+        check(overProjectLimit.searchText(maximumUTF8Bytes: AtlasReaderFindReport.maximumNeedleBytes) != nil,
+              "project query limit disabled the larger retained-file Find route")
+        let overFileLimit = try selected(String(repeating: "a", count: AtlasReaderFindReport.maximumNeedleBytes + 1))
+        check(overFileLimit.searchText(maximumUTF8Bytes: AtlasReaderFindReport.maximumNeedleBytes) == nil,
+              "oversized file selection silently shortened")
+        let nul = try selected("alpha\0beta")
+        check(nul.searchText(maximumUTF8Bytes: 4096) == nil, "selection query could be truncated at the C boundary")
     }
 
     private static func latestSelectionCoalesces() async {
@@ -356,6 +417,57 @@ private final class TextSelectionFixture: @unchecked Sendable {
         check(model.source === source && model.textSelection?.id != oldReceipt
               && model.textSelection?.text == "beta" && model.canKeep,
               "failed navigation lost the displayed selection or reused its revoked receipt")
+    }
+
+    private static func selectionSearchRejectsRetiredMenus() async {
+        let fixture = TextSelectionFixture()
+        let model = AtlasPagedReaderModel(transport: fixture.transport, search: fixture.refusingSearch)
+        model.open(root: "/project", path: "source", accessLease: nil)
+        await wait("selection-search reader did not open") { !model.busy && model.page != nil }
+        defer { model.close() }
+        model.fileQuery = "unchanged"
+        select(model, NSRange(location: 0, length: 5))
+        await wait("first menu selection did not resolve") { model.textSelection != nil }
+        let first = model.textSelection!.id
+        check(model.selectionQuery(.symbols, selectionID: first)?.text == "alpha",
+              "accepted source selection did not seed declaration lookup")
+        fixture.blockNext()
+        select(model, NSRange(location: 6, length: 4))
+        await wait("replacement selection did not start") { fixture.calls.blocked == 1 }
+        check(model.selectionQuery(.text, selectionID: first) == nil
+              && !model.findSelectedText(selectionID: first) && model.fileQuery == "unchanged",
+              "retained menu activated a superseded selection while its replacement was pending")
+        fixture.gate.signal()
+        await wait("replacement selection did not resolve") { model.textSelection != nil }
+        let second = model.textSelection!.id
+        check(model.selectionQuery(.occurrences, selectionID: second)?.originalStart == 6
+              && model.selectionQuery(.occurrences, selectionID: first) == nil,
+              "an old menu borrowed the new selection receipt")
+        check(model.selectionQuery(.expression, selectionID: second) == nil,
+              "selected text opted into expression parsing")
+        let source = model.source!, navigation = model.navigation, opens = fixture.calls.opened
+        check(model.findSelectedText(selectionID: second), "current selected text did not start retained-file Find")
+        check(model.fileQuery == "beta" && model.findOptions.caseSensitive
+              && model.selectionQuery(.text, selectionID: second) == nil,
+              "Find changed the spelling or reused a selection during reader work")
+        await wait("refused search did not drain and rebind the displayed selection") {
+            !model.busy && fixture.searchCalls.count == 1 && model.textSelection != nil
+        }
+        check(fixture.searchCalls == ["beta"] && fixture.calls.opened == opens
+              && model.source === source && model.navigation == navigation,
+              "selection Find reread disk or replaced the retained source/navigation")
+        check(model.textSelection?.id != second && model.selectionQuery(.text, selectionID: second) == nil,
+              "failed search revived a retired menu receipt")
+        let rebound = model.textSelection!.id
+        model.offsetInput = "0"; model.goToByte()
+        check(model.selectionQuery(.symbols, selectionID: rebound) == nil,
+              "navigation accepted a previous selection despite identical page text")
+        await wait("same-text navigation did not complete") { !model.busy }
+        check(model.selectionQuery(.symbols, selectionID: rebound) == nil,
+              "same-text page replacement revived an old selection")
+        model.close()
+        check(!model.findSelectedText(selectionID: rebound) && fixture.calls.opened == opens,
+              "closed selection could start a query or reopen a pathname")
     }
 
     private static func suppliedTransportPreservesSelection() throws {

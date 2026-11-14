@@ -14,6 +14,7 @@ import SwiftUI
     let keep: (AtlasPagedReaderModel) -> Void
     let canReadRanges: Bool
     let readRanges: (AtlasProjectBrowserFile, AtlasProjectBrowserPage) throws -> Void
+    var searchProject: ((AtlasReaderSelectionQuery) -> Void)? = nil
     @State private var capture: AtlasProjectBrowserCapture?
     @State private var readerTask: Task<Void, Never>?
     @State private var readerNotice = ""
@@ -128,7 +129,8 @@ import SwiftUI
                 .font(.caption2).foregroundStyle(.secondary)
         }.padding(12).frame(maxWidth: .infinity, maxHeight: .infinity)
         .sheet(item: $capture) { capture in
-            AtlasProjectCaptureView(model: model, origin: capture, canKeep: canKeep, keep: keep) {
+            AtlasProjectCaptureView(model: model, origin: capture, canKeep: canKeep, keep: keep,
+                searchProject: searchProject) {
                 capture.reader.close(); self.capture = nil
             }
         }
@@ -179,6 +181,7 @@ import SwiftUI
     let origin: AtlasProjectBrowserCapture
     let canKeep: Bool
     let keep: (AtlasPagedReaderModel) -> Void
+    let searchProject: ((AtlasReaderSelectionQuery) -> Void)?
     let done: () -> Void
     @State private var history = AtlasDocumentLinkHistory<AtlasProjectBrowserCapture>(
         retire: { $0.reader.close() },
@@ -204,7 +207,8 @@ import SwiftUI
             }
             HSplitView {
                 AtlasPagedSourceView(model: origin.reader, canKeep: canKeep, keep: keep,
-                    openLocalLink: navigation(from: origin)).id(origin.id).frame(minWidth: 400)
+                    openLocalLink: navigation(from: origin), searchProject: selectionSearch)
+                    .id(origin.id).frame(minWidth: 400)
                 if history.current != nil { linkedReaders.frame(minWidth: 400) }
             }
             if !history.notice.isEmpty {
@@ -251,7 +255,16 @@ import SwiftUI
                     .textSelection(.enabled)
             }
             AtlasPagedSourceView(model: capture.reader, canKeep: canKeep, keep: keep,
-                openLocalLink: navigation(from: capture))
+                openLocalLink: navigation(from: capture), searchProject: selectionSearch)
+        }
+    }
+    private var selectionSearch: ((AtlasReaderSelectionQuery) -> Void)? {
+        guard let searchProject else { return nil }
+        return { query in
+            searchProject(query)
+            // Reveal the project's results instead of leaving them behind a
+            // modal reader. The query owns its bounded selected spelling.
+            done()
         }
     }
     private func navigation(from source: AtlasProjectBrowserCapture) -> AtlasDocumentPreviewModel.LocalNavigation? {

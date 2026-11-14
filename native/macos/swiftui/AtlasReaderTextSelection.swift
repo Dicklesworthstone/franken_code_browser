@@ -58,6 +58,15 @@ struct AtlasReaderTextSelection: Sendable, Identifiable {
         return "Selected original bytes \(originalStart)..<\(originalEnd) · \(kind); line endings preserved."
     }
 
+    /// A query is the exact selected spelling, without trimming, normalization
+    /// or expression escaping. Replacement-decoded bytes have no lossless text
+    /// query; the existing original-byte copy action remains available for them.
+    func searchText(maximumUTF8Bytes: Int) -> String? {
+        guard !containsReplacements, !text.isEmpty,
+              text.utf8.count <= maximumUTF8Bytes, !text.utf8.contains(0) else { return nil }
+        return text
+    }
+
     static func decode(_ json: String?, request: AtlasReaderTextSelectionRequest,
                        captureSHA256: String? = nil) throws -> Self {
         let page = request.page
@@ -170,6 +179,28 @@ struct AtlasReaderTextSelection: Sendable, Identifiable {
             original_hex = try c.decode(String.self, forKey: .original_hex)
             contains_replacements = try c.decode(Bool.self, forKey: .contains_replacements)
         }
+    }
+}
+
+/// The selection seeds an independent project query. Its source identity is
+/// provenance, never a grant or an assertion that other captures share a binding.
+/// The receiving host freezes its own visible location/file scope and access.
+struct AtlasReaderSelectionQuery: Sendable {
+    let selectionID: UUID
+    let identity: AtlasReaderIdentity
+    let originalStart: UInt64
+    let originalEnd: UInt64
+    let text: String
+    let mode: AtlasSearchMode
+
+    init(selection: AtlasReaderTextSelection, mode: AtlasSearchMode) throws {
+        guard mode == .text || mode == .symbols || mode == .occurrences,
+              let text = selection.searchText(maximumUTF8Bytes: 1024) else {
+            throw AtlasReaderError.invalidInput
+        }
+        selectionID = selection.id; identity = selection.identity
+        originalStart = selection.originalStart; originalEnd = selection.originalEnd
+        self.text = text; self.mode = mode
     }
 }
 

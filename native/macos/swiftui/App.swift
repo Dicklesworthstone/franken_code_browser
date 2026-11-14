@@ -1473,7 +1473,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                         if !pinnedReaders.entries.isEmpty || pinnedReaders.busy {
                             AtlasPinnedReadersView(readers: pinnedReaders,
                                 canKeep: readingDesk.canOperate, keep: keepSource,
-                                project: projectBrowser).frame(minWidth: 320)
+                                project: projectBrowser, searchProject: selectedSourceProjectSearch).frame(minWidth: 320)
                         }
                     }
                     .frame(height: (!pinnedReaders.entries.isEmpty || pinnedReaders.busy) ? 380 : (usesPagedReader ? 320 : 240))
@@ -1536,7 +1536,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                     accessLease: authority.access)
                 closeObservedReader()
                 observedReader = AtlasObservedReaderPresentation(source: source, transport: .native)
-            })
+            }, searchProject: selectedSourceProjectSearch)
             .id(projectViewIdentity)
     }
 
@@ -1684,7 +1684,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             }
             if let capture = finderReaderCapture {
                 AtlasPagedSourceView(model: capture.reader, canPin: pinnedReaders.canAdd, pin: pinSource,
-                    canKeep: readingDesk.canOperate, keep: keepSource, project: projectBrowser)
+                    canKeep: readingDesk.canOperate, keep: keepSource, project: projectBrowser,
+                    searchProject: selectedSourceProjectSearch)
                     .id(capture.id)
             } else if usesPagedReader, let path = selectedPath {
                 if !loadingProject, acceptsSource(path, searchRow: sourceSearchRow, exactMatch: false) {
@@ -1692,7 +1693,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                     if let access = rootAccess, access.url.path.utf8.elementsEqual(root.utf8) {
                         AtlasPagedSourceView(root: root, path: path, accessLease: access, captured: capturedReaderTarget,
                             supplied: suppliedReaderTarget, canPin: pinnedReaders.canAdd, pin: pinSource,
-                            canKeep: readingDesk.canOperate, keep: keepSource, project: projectBrowser)
+                            canKeep: readingDesk.canOperate, keep: keepSource, project: projectBrowser,
+                            searchProject: selectedSourceProjectSearch)
                             .id(focusRequest)
                     } else {
                         Text("Choose the project folder again to grant read access.")
@@ -1700,7 +1702,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
 #else
                     AtlasPagedSourceView(root: root, path: path, accessLease: nil, captured: capturedReaderTarget,
                         supplied: suppliedReaderTarget, canPin: pinnedReaders.canAdd, pin: pinSource,
-                        canKeep: readingDesk.canOperate, keep: keepSource, project: projectBrowser)
+                        canKeep: readingDesk.canOperate, keep: keepSource, project: projectBrowser,
+                        searchProject: selectedSourceProjectSearch)
                         .id(focusRequest)
 #endif
                 } else {
@@ -2481,6 +2484,34 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             verifiedHitIDs: Set(matches.keys), id: report.streamID ?? retainingReportID ?? UUID())
         searchPaths = Set(report.hits.compactMap(\.sourcePath))
         overlayLimited = limited
+    }
+
+    /// A reader supplies only a verified spelling. This closure captures the
+    /// displayed project's authority; a queued action cannot borrow a new root.
+    private var selectedSourceProjectSearch: ((AtlasReaderSelectionQuery) -> Void)? {
+        guard !loadingProject, !root.isEmpty else { return nil }
+        let requestedRoot = root, requestedProject = browserProject
+        let browser = projectBrowser
+        return { selected in
+            guard !loadingProject, browserProject == requestedProject, projectBrowser === browser,
+                  root.utf8.elementsEqual(requestedRoot.utf8) else { return }
+            // Detach the current retained reader from the old result row before
+            // replacing that query. Its capture and navigation remain mounted.
+            cancelSourceLoad()
+            clearSearch()
+            let changesInput = searchMode != selected.mode || !query.utf8.elementsEqual(selected.text.utf8)
+                || (selected.mode.supportsNameMatching && searchNameMode != .exact)
+                || (selected.mode.isTextual && !searchCaseSensitive)
+            searchMode = selected.mode
+            if selected.mode.supportsNameMatching { searchNameMode = .exact }
+            if selected.mode.isTextual { searchCaseSensitive = true }
+            query = selected.text
+            showsSidebar = true
+            searchFocused = false
+            // Changed controls enter the existing bounded/debounced generation
+            // path. Repeating an unchanged action still starts a fresh query.
+            if !changesInput { runSearch() }
+        }
     }
 
     private func runSearch() { runSearch(debounce: false) }

@@ -1393,6 +1393,29 @@ the original encoded bytes, including malformed sequences. A decoded replacement
 character is identified explicitly rather than being described as an original
 source byte.
 
+**Search selection** uses that resolved passage as an exact query. Choose **Find
+text in this file**, **Find declaration candidates in this file**, or **Find
+identifier occurrences in this file** to search the same retained capture. Text
+Find accepts up to 4,096 UTF-8 bytes; exact declaration-name filtering accepts
+256; occurrence queries accept 1,024 and are validated by the shared identifier
+engine. Text Find switches to case-sensitive matching while preserving its
+count-all option. Declaration candidates are heuristic; occurrences include
+comments and string literals and do not establish compiler bindings.
+
+Live-project readers, Project Files, Quick Open, and pinned readers also offer
+these searches **in project scope**. They fill the search sidebar, preserve its
+current location and file-type filters, and start a fresh query using at most
+1,024 selected UTF-8 bytes. Declaration names use exact matching. Project Files
+dismisses its reader sheet to reveal the results; an already mounted main or
+pinned reader keeps its capture and position. The selected spelling comes from
+the retained source, while project results belong to their own current or
+indexed captures. Selection text is never interpreted as an expression.
+
+Search actions preserve whitespace, CR/LF and Unicode spelling without trimming,
+normalization or truncation. NUL-containing text and selections containing
+decoding replacements cannot seed a text query. Changing selection, page,
+capture, or reader operation revokes an older menu's receipt before dispatch.
+
 **Keep selected text** retains that exact passage in the Reading Desk, where
 existing bookmark and personal-note actions use the saved range. Save a desk
 checkpoint to preserve those notes and locations after closing the app. A

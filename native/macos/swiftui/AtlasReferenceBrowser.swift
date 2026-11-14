@@ -76,7 +76,7 @@ import SwiftUI
                 }
             } else {
                 Text(model.canFindReferences
-                    ? "Enter an identifier, or choose Occurrences beside a source outline entry."
+                    ? "Enter an identifier, use Search selection in the reader, or choose Occurrences beside a source outline entry."
                     : "Identifier occurrences are available for retained source captures up to 512 KiB.")
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
