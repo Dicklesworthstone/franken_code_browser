@@ -8,13 +8,16 @@ import SwiftUI
     let scopeLabel: String
     let onSelect: (AtlasProjectCatalog.Entry) -> Void
     let returnTo2D: () -> Void
+    let onPresentedCamera: (AtlasCityCamera) -> Void
 
     init(revision: UUID, entries: [AtlasProjectCatalog.Entry], complete: Bool,
          seed: AtlasCitySeed, selectedPath: String?, scopeLabel: String,
-         onSelect: @escaping (AtlasProjectCatalog.Entry) -> Void, returnTo2D: @escaping () -> Void) {
+         onSelect: @escaping (AtlasProjectCatalog.Entry) -> Void, returnTo2D: @escaping () -> Void,
+         onPresentedCamera: @escaping (AtlasCityCamera) -> Void = { _ in }) {
         _model = State(initialValue: AtlasCityModel(revision: revision, entries: entries, complete: complete, seed: seed))
         self.selectedPath = selectedPath; self.scopeLabel = scopeLabel
         self.onSelect = onSelect; self.returnTo2D = returnTo2D
+        self.onPresentedCamera = onPresentedCamera
     }
 
     var body: some View {
@@ -70,7 +73,8 @@ import SwiftUI
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
-            model.onSelect = onSelect; model.selectPath(selectedPath); model.start()
+            model.onSelect = onSelect; model.onPresentedCamera = onPresentedCamera
+            model.selectPath(selectedPath); model.start()
         }
         .onChange(of: selectedPath.map { Array($0.utf8) }) { _, _ in model.selectPath(selectedPath) }
         .onDisappear { model.close() }

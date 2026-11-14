@@ -3,9 +3,9 @@ import Observation
 
 /// A replacement catalog is prepared independently of the displayed project.
 /// The host retains its accepted browser, readers, search and geometry until
-/// the first candidate page has passed the ordinary browser's wire validation.
-/// This is an admission/ownership transaction, not filesystem reconciliation:
-/// a first page can still have unknown membership and never proves deletion.
+/// the first candidate page and optional atlas preparation have both passed
+/// admission. A first page can still have unknown membership and never proves
+/// deletion; additional preparation must preserve its own coverage boundary.
 @Observable @MainActor final class AtlasProjectRefresh {
     struct Candidate {
         let browser: AtlasProjectBrowserModel
@@ -23,16 +23,19 @@ import Observation
         let root: String
         let accessIdentity: ObjectIdentifier?
         let failed: @MainActor (UUID) -> Void
+        let cancellation = AtlasSearchCancellation()
+        private let accessLease: AnyObject?
         var opening: AtlasProjectOpening
         var canceled = false
         private var failureDelivered = false
 
         init(browser: AtlasProjectBrowserModel, project: UUID, root: String,
-             accessIdentity: ObjectIdentifier?, failed: @escaping @MainActor (UUID) -> Void) {
+             accessLease: AnyObject?, failed: @escaping @MainActor (UUID) -> Void) {
             self.browser = browser
             self.previousProject = project
             self.root = root
-            self.accessIdentity = accessIdentity
+            self.accessIdentity = accessLease.map(ObjectIdentifier.init)
+            self.accessLease = accessLease
             self.failed = failed
             var opening = AtlasProjectOpening()
             ticket = opening.begin()
@@ -64,15 +67,18 @@ import Observation
     /// replacement without suspension. Returning true transfers browser
     /// ownership; false retires only the candidate. Failure/cancel reports its
     /// discovery identity once so the host can withdraw that acknowledgment.
+    /// `prepare` may stage bounded worker results, but must not mutate the
+    /// displayed project. Its cancellation token remains owned until it drains.
     @discardableResult
     func stage(root: String, project: UUID, accessLease: AnyObject?,
+               prepare: @escaping @MainActor (AtlasSearchCancellation) async throws -> Void = { _ in },
                accepted: @escaping @MainActor (Candidate) -> Bool,
                failed: @escaping @MainActor (UUID) -> Void) -> UUID? {
         guard !isRefreshing, root.hasPrefix("/"), root.utf8.count <= 16_384,
               !root.utf8.contains(0) else { return nil }
         let browser = AtlasProjectBrowserModel(transport: transport)
         let request = Attempt(browser: browser, project: project, root: root,
-            accessIdentity: accessLease.map(ObjectIdentifier.init), failed: failed)
+            accessLease: accessLease, failed: failed)
         attempt = request
         isRefreshing = true
         notice = "Checking the project… Your current files, readers and search remain available."
@@ -90,6 +96,14 @@ import Observation
                       !browser.closed, browser.currentPage, browser.info != nil,
                       browser.root.utf8.elementsEqual(root.utf8),
                       request.opening.acceptProgressive(for: request.ticket) else {
+                    request.failOnce()
+                    return
+                }
+                try await prepare(request.cancellation)
+                try Task.checkCancellation()
+                guard self.attempt === request, !request.canceled, !request.cancellation.isCanceled,
+                      !browser.closed, browser.currentPage, browser.info != nil,
+                      browser.root.utf8.elementsEqual(root.utf8) else {
                     request.failOnce()
                     return
                 }
@@ -125,6 +139,7 @@ import Observation
     func cancel() {
         guard let attempt, !attempt.canceled else { return }
         attempt.canceled = true
+        attempt.cancellation.cancel()
         task?.cancel()
         attempt.browser.close()
         attempt.failOnce()

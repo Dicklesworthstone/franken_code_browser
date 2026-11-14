@@ -68,6 +68,17 @@ struct AtlasProjectOpening {
         active = nil; phase = .ready
         return true
     }
+    /// A refresh has already prepared and admitted metadata/layout on its
+    /// worker. Install those values with the new first page in one transaction,
+    /// without scanning the metadata again on the main actor.
+    @discardableResult mutating func acceptPreparedAtlas(_ report: AtlasProjectCatalog,
+        in project: UUID, hasOpenableFiles: Bool) -> Bool {
+        guard projectID == project, phase == .ready, progressiveReady, !hasAtlas else { return false }
+        catalog = report
+        self.hasOpenableFiles = hasOpenableFiles
+        hasAtlas = true
+        return true
+    }
     @discardableResult mutating func fail(_ ticket: Ticket) -> Bool {
         guard accepts(ticket) else { return false }
         cancel()

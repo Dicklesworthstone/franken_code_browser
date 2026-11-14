@@ -6,9 +6,9 @@ import Dispatch
 /// A hierarchy over immutable metadata. Exact viewport culling happens before
 /// leaf candidates consume the bounded query allowance, so a late small parcel
 /// in a dense region remains reachable when the camera zooms into that region.
-private struct AtlasViewportIndex {
-    private struct Leaf { let id: UInt64; let rect: CGRect }
-    private struct Node {
+fileprivate struct AtlasViewportIndex: Sendable {
+    private struct Leaf: Sendable { let id: UInt64; let rect: CGRect }
+    private struct Node: Sendable {
         let bounds: CGRect
         let children: [Int]
         let leaves: [Leaf]
@@ -72,6 +72,50 @@ private struct AtlasViewportIndex {
             }
         }
         return result
+    }
+}
+
+/// Immutable admission and spatial-index work can be prepared on the bounded
+/// project worker. Publication then swaps this admitted value without scanning
+/// or sorting the project on the interaction thread.
+struct AtlasViewportLayout: Sendable {
+    let root: String
+    let revision: UUID
+    fileprivate let entries: [UInt64: AtlasProjectCatalog.Entry]
+    fileprivate let rawIDs: [[UInt8]: UInt64]
+    fileprivate let index: AtlasViewportIndex
+    fileprivate let previewStates: [UInt64: AtlasViewportPreviewState]
+
+    static func prepare(root: String, entries next: [AtlasProjectCatalog.Entry], revision: UUID) -> Self? {
+        guard root.hasPrefix("/"), root.utf8.count <= 16_384, !root.utf8.contains(0),
+              next.count <= AtlasProjectCatalog.maximumFiles else { return nil }
+        var entries: [UInt64: AtlasProjectCatalog.Entry] = [:], rawIDs: [[UInt8]: UInt64] = [:]
+        var spellings: [String: (UInt64, [UInt8])] = [:], ambiguous = Set<UInt64>()
+        for entry in next {
+            let raw = entry.rawPath
+            guard entry.id > 0, entries[entry.id] == nil, rawIDs[raw] == nil,
+                  !raw.isEmpty, raw.count <= 16_384, raw.first != 47, !raw.contains(0),
+                  !raw.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
+                      $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46])
+                  }), [entry.x, entry.y, entry.width, entry.height, entry.x + entry.width, entry.y + entry.height]
+                    .allSatisfy({ $0.isFinite && abs($0) <= 1e12 }),
+                  entry.width > 0, entry.height > 0,
+                  entry.sourcePath.map({ $0.utf8.elementsEqual(raw) }) ?? (String(bytes: raw, encoding: .utf8) == nil) else {
+                return nil
+            }
+            entries[entry.id] = entry; rawIDs[raw] = entry.id
+            if let path = entry.sourcePath {
+                if let previous = spellings[path], previous.1 != raw { ambiguous.insert(previous.0); ambiguous.insert(entry.id) }
+                else { spellings[path] = (entry.id, raw) }
+            }
+        }
+        var states: [UInt64: AtlasViewportPreviewState] = [:]
+        for entry in next where entry.sourcePath == nil || ambiguous.contains(entry.id)
+            || entry.observedBytes > UInt64(AtlasViewportLimits.sourceFileBytes) {
+            states[entry.id] = .readerOnly
+        }
+        return Self(root: root, revision: revision, entries: entries, rawIDs: rawIDs,
+            index: AtlasViewportIndex(entries: next), previewStates: states)
     }
 }
 
@@ -158,43 +202,26 @@ private struct AtlasViewportIndex {
     @discardableResult func install(root nextRoot: String, entries next: [AtlasProjectCatalog.Entry],
         layoutRevision nextRevision: UUID, accessLease: AnyObject?, sourceCacheHandle: UInt64 = 0,
         cacheLease: AnyObject? = nil, preservingCaptures: Bool = false) -> Bool {
-        guard nextRoot.hasPrefix("/"), nextRoot.utf8.count <= 16_384, !nextRoot.utf8.contains(0),
-              next.count <= AtlasProjectCatalog.maximumFiles,
-              sourceCacheHandle == 0 || cacheLease != nil else { return false }
-        var newEntries: [UInt64: AtlasProjectCatalog.Entry] = [:], newRawIDs: [[UInt8]: UInt64] = [:]
-        var spellings: [String: (UInt64, [UInt8])] = [:], ambiguous = Set<UInt64>()
-        for entry in next {
-            let raw = entry.rawPath
-            guard entry.id > 0, newEntries[entry.id] == nil, newRawIDs[raw] == nil,
-                  !raw.isEmpty, raw.count <= 16_384, raw.first != 47, !raw.contains(0),
-                  !raw.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
-                      $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46])
-                  }), [entry.x, entry.y, entry.width, entry.height].allSatisfy({ $0.isFinite && abs($0) <= 1e12 }),
-                  entry.width > 0, entry.height > 0,
-                  entry.sourcePath.map({ $0.utf8.elementsEqual(raw) }) ?? (String(bytes: raw, encoding: .utf8) == nil) else {
-                return false
-            }
-            newEntries[entry.id] = entry; newRawIDs[raw] = entry.id
-            if let path = entry.sourcePath {
-                if let previous = spellings[path], previous.1 != raw { ambiguous.insert(previous.0); ambiguous.insert(entry.id) }
-                else { spellings[path] = (entry.id, raw) }
-            }
-        }
-        let preserve = preservingCaptures && isInstalled && self.root.utf8.elementsEqual(nextRoot.utf8)
+        guard let layout = AtlasViewportLayout.prepare(root: nextRoot, entries: next, revision: nextRevision) else { return false }
+        return install(layout, accessLease: accessLease, sourceCacheHandle: sourceCacheHandle,
+            cacheLease: cacheLease, preservingCaptures: preservingCaptures)
+    }
+
+    @discardableResult func install(_ layout: AtlasViewportLayout, accessLease: AnyObject?,
+        sourceCacheHandle: UInt64 = 0, cacheLease: AnyObject? = nil, preservingCaptures: Bool = false) -> Bool {
+        guard sourceCacheHandle == 0 || cacheLease != nil else { return false }
+        let preserve = preservingCaptures && isInstalled && root.utf8.elementsEqual(layout.root.utf8)
         active?.cancellation.cancel()
         if !preserve {
             residents = [:]
         }
-        self.root = nextRoot; layoutRevision = nextRevision
-        entries = newEntries; rawIDs = newRawIDs; index = AtlasViewportIndex(entries: next)
+        root = layout.root; layoutRevision = layout.revision
+        entries = layout.entries; rawIDs = layout.rawIDs; index = layout.index
         self.accessLease = accessLease; self.cacheLease = cacheLease; self.sourceCacheHandle = sourceCacheHandle
         isInstalled = true; isSuspended = false; selectedID = nil
         wanted = []; blocked = []; pendingCount = 0; lastViewport = nil; lastSelected = nil
-        previewStates = [:]; readerOnlyCount = 0; unavailableCount = 0; capacityLimitedCount = 0
-        for entry in next where entry.sourcePath == nil || ambiguous.contains(entry.id)
-            || entry.observedBytes > UInt64(AtlasViewportLimits.sourceFileBytes) {
-            setState(entry.id, .readerOnly)
-        }
+        previewStates = layout.previewStates; readerOnlyCount = layout.previewStates.count
+        unavailableCount = 0; capacityLimitedCount = 0
         publish()
         isLoading = active != nil
         return true

@@ -237,27 +237,47 @@ Executable verification and physical-Mac interaction checks remain pending.
 ### Refreshing an open project
 
 **Refresh project** prepares a new bounded metadata page while the accepted
-project remains usable. You can keep browsing its files, searching, moving the
-atlas, and reading captured source during that work. **Cancel refresh** or a
-failed scan leaves that project in place. Only one replacement may be pending;
-after cancellation, another refresh waits for entered I/O to drain.
+project remains usable. If an atlas is already open, the same transaction also
+stages a fresh bounded catalog, incremental parcel placement, and its spatial
+index on the project worker. You can keep browsing, searching, moving the atlas,
+and reading captured source during that work. **Cancel refresh**, a failed scan,
+or a rejected layout leaves the accepted project in place. Only one replacement
+may be pending; after cancellation, another refresh waits for entered I/O to drain.
 
-A validated replacement is installed only while the same window, project,
-byte-exact root, and access grant still own the request. Successful refresh
-restarts current-project search against the new catalog while keeping the open
-retained reader's source, page, Find selection, and navigation. Quick Open,
-pinned readers, and Reading Desk captures also keep their original source bytes.
-The earlier atlas keeps its membership, previews, and navigation until you
-choose **Rebuild atlas**; **Project Files** shows the refreshed discovery
-separately. File and directory search scopes remain selected, while an old
-visible-atlas scope must be selected again after the new map is built.
+A replacement is installed only while the same window, project, byte-exact root,
+access grant, atlas revision, and file scope still own the request. Successful
+refresh restarts current-project search against the new catalog. Existing raw-path
+parcels keep their position and dimensions even when observed file sizes change.
+New files are packed with the existing Rust layout engine in a new neighborhood
+beyond the previous coordinate frame. **Show added files** takes you there; your
+current camera position, Back/Forward history, and selection otherwise remain in
+place. When City is visible, its last displayed center, zoom, orbit, and tilt are
+carried into the refreshed scene. Explicit file-scope repacking still compacts
+the selected membership and uses the ordinary camera initialization.
 
-Filesystem-change notices are hints to refresh. A partial first page remains
+Viewport source previews are observed again after publication under the new
+layout revision, so a late old preview cannot populate the refreshed atlas. The
+open captured reader keeps its source, page, Find selection, and navigation.
+Quick Open, pinned readers, and Reading Desk captures also keep their original
+source bytes. Current-range observations are closed because they belong to the
+retired current-project authority. File and directory search scopes remain
+selected; an old visible-atlas search scope must be selected again.
+
+A partial metadata scan never proves that a missing path was deleted. Earlier
+parcels not re-observed in that scan stay on the map, are counted as unconfirmed
+in the refresh notice, and show an explicit qualification in the inspector.
+Only a complete scan removes absent paths from map membership; it does not delete
+captured sources, annotations, or reader history. The retained union is bounded
+at 20,000 files. If that union or layout admission exceeds its limits, the entire
+refresh is refused and the previous project remains available; choose a narrower
+file scope before retrying. Refresh before first preparing an atlas still does
+only progressive discovery and does not force atlas construction.
+
+Filesystem-change notices remain hints to refresh. A partial first page remains
 partial, and the notice clears only after complete discovery without omissions
-or a newer observed change. Choosing a different folder or granting access
-again replaces the project immediately through the normal opening flow. This
-refresh operation does not automatically reconcile deleted files or migrate
-annotations between captures.
+or a newer observed change. Choosing a different folder or granting access again
+replaces the project through the normal opening flow. Refresh does not migrate
+annotations between different source captures.
 
 ### Opening a source file
 

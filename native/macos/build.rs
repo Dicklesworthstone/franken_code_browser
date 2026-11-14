@@ -48,6 +48,7 @@ fn main() {
         "swiftui/AtlasViewportResidency.swift",
         "swiftui/AtlasProjectOpening.swift",
         "swiftui/AtlasProjectRefresh.swift",
+        "swiftui/AtlasRefreshLayout.swift",
         "swiftui/AtlasRepositoryPolicy.swift",
         "swiftui/AtlasProjectBrowser.swift",
         "swiftui/AtlasProjectBrowserBridge.swift",

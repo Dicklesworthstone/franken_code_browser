@@ -133,6 +133,13 @@ private final class CityFixture: @unchecked Sendable {
         try await until { model.canPick && !model.busy }
     }
     static func main() async throws {
+        let retained = AtlasCityCamera(center_x: 701, center_y: 902, scale: 2.5, yaw: 1.2, tilt: 0.45)
+        let refreshSeed = AtlasCitySeed(scale: 0.2, offsetX: 17, offsetY: 31, retainedCamera: retained)
+        precondition(refreshSeed.camera(width: 400, height: 200) == retained,
+            "compatible refresh keeps the displayed City's center, zoom, orbit and tilt")
+        precondition(AtlasCitySeed(scale: 2, offsetX: 0, offsetY: 0).camera(width: 400, height: 200)
+            == AtlasCityCamera(center_x: 100, center_y: 50, scale: 2, yaw: 0, tilt: 0.7),
+            "ordinary City opening still derives its camera from the 2D atlas")
         try wireIdentityAndRefusal()
         try await lostReplyRecoveryAndAcceptedSelection()
         try await delayedOldStyleAcknowledgmentCannotRestorePicking()
@@ -214,19 +221,26 @@ private final class CityFixture: @unchecked Sendable {
     static func resizeAndCloseFenceLateWork() async throws {
         let fixture = CityFixture()
         var model: AtlasCityModel? = make(fixture)
+        var displayedCameras: [AtlasCityCamera] = []
+        model?.onPresentedCamera = { displayedCameras.append($0) }
         try await until { model?.frame?.generation == 1 && model?.busy == false }
+        precondition(displayedCameras.isEmpty, "an undisplayed candidate is not a refresh camera")
         try await acknowledge(model!, frame: 1)
         let old = model!.frame!, oldDisplay = model!.display
+        precondition(displayedCameras == [old.camera])
         fixture.holdView(2); model?.move(.orbit(0.3, 0.1))
         try await until { fixture.counts.views == 2 }
         model?.resize(width: 400, height: 200, backing: 2)
         precondition(model?.canPick == false && model?.frame == nil && model?.display != oldDisplay)
         model?.presented(.init(view: old, frame: 2, display: oldDisplay))
+        precondition(displayedCameras == [old.camera], "stale-size receipts cannot replace the retained camera")
         fixture.gate.signal()
         try await until { model?.frame?.width == 400 && model?.frame?.height == 200 && model?.busy == false }
         try await acknowledge(model!, frame: 3)
+        precondition(displayedCameras.count == 2 && displayedCameras.last == model?.frame?.camera)
         model?.close()
         model?.presented(.init(view: old, frame: 4, display: oldDisplay)); model?.click(x: 50, y: 50)
+        precondition(displayedCameras.count == 2, "a closed City cannot replace the refresh camera")
         precondition(model?.canPick == false && fixture.counts.picks == 0)
         try await finish(&model)
     }

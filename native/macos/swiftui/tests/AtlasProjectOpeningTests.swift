@@ -33,6 +33,23 @@ import Foundation
     @MainActor static func main() throws {
         let metadata = try catalog()
         do {
+            var opening = AtlasProjectOpening()
+            let ticket = opening.begin()
+            check(!opening.acceptPreparedAtlas(metadata, in: ticket.project, hasOpenableFiles: true),
+                  "Prepared refresh cannot bypass first-page admission")
+            check(opening.acceptProgressive(for: ticket), "Refresh candidate first page is admitted")
+            check(!opening.acceptPreparedAtlas(metadata, in: UUID(), hasOpenableFiles: true),
+                  "Prepared atlas cannot install into a different project")
+            check(opening.acceptPreparedAtlas(metadata, in: ticket.project, hasOpenableFiles: true),
+                  "Prepared metadata and atlas publish into the accepted candidate")
+            check(opening.hasAtlas && opening.canBrowse && !opening.canPrepare && !opening.isPreparing,
+                  "Accepted refresh is immediately ready for map and project browsing")
+            check(opening.file(1, in: ticket.project)?.sourcePath == "a.rs",
+                  "Fresh catalog rows retain their own response-local identity")
+            check(!opening.acceptPreparedAtlas(metadata, in: ticket.project, hasOpenableFiles: true),
+                  "A duplicate candidate cannot overwrite the accepted atlas")
+        }
+        do {
             var startup = AtlasProjectStartup()
             check(!startup.consumed, "Startup construction reads no defaults or process arguments")
             check(opens(startup.consume(arguments: ["fcb", "/first-launch"], restoredRoot: ""),

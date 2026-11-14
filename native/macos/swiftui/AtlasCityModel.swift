@@ -128,7 +128,13 @@ final class AtlasCityWorker: @unchecked Sendable {
 
 struct AtlasCitySeed: Sendable {
     let scale, offsetX, offsetY: Double
+    let retainedCamera: AtlasCityCamera?
+    init(scale: Double, offsetX: Double, offsetY: Double, retainedCamera: AtlasCityCamera? = nil) {
+        self.scale = scale; self.offsetX = offsetX; self.offsetY = offsetY
+        self.retainedCamera = retainedCamera
+    }
     func camera(width: Double, height: Double) -> AtlasCityCamera? {
+        if let retainedCamera { return retainedCamera.valid ? retainedCamera : nil }
         guard [scale, offsetX, offsetY].allSatisfy(\.isFinite), scale > 0 else { return nil }
         let camera = AtlasCityCamera(center_x: (width / 2 - offsetX) / scale,
             center_y: (height / 2 - offsetY) / scale, scale: scale, yaw: 0, tilt: 0.7)
@@ -189,6 +195,7 @@ enum AtlasCityMotion: Sendable, Equatable {
     private struct Click { let receipt: AtlasCityReceipt; let x, y: Double }
     private var pendingClick: Click?
     var onSelect: ((AtlasProjectCatalog.Entry) -> Void)?
+    var onPresentedCamera: ((AtlasCityCamera) -> Void)?
 
     init(revision: UUID, entries: [AtlasProjectCatalog.Entry], complete: Bool, seed: AtlasCitySeed? = nil,
          transport: AtlasCityTransport = .native) {
@@ -282,6 +289,7 @@ enum AtlasCityMotion: Sendable, Equatable {
               receipt.frame > 0, actual.map({ receipt.frame > $0.frame }) ?? true else { return }
         // The Metal surface calls only after a positive actual presentedTime.
         actual = receipt; accepted = nil; pendingReceipt = receipt
+        onPresentedCamera?(receipt.view.camera)
         if pendingClick?.receipt != receipt { pendingClick = nil }
         pump()
     }
@@ -307,7 +315,7 @@ enum AtlasCityMotion: Sendable, Equatable {
         closed = true; operation = UUID(); task?.cancel(); task = nil
         if workerStarted { worker.close(); workerStarted = false }
         actual = nil; accepted = nil; pendingReceipt = nil; pendingClick = nil; pendingMotion = nil
-        awaitingPresentation = nil; frame = nil; busy = false; onSelect = nil
+        awaitingPresentation = nil; frame = nil; busy = false; onSelect = nil; onPresentedCamera = nil
         scene = nil; base = nil; files = [:]; indices = [:]
         entries = []
     }

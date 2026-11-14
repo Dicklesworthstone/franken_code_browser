@@ -545,6 +545,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         try await projectRangeRevocationDrainsWithoutClosingCaptures()
         try await closeDrainsGrantAndLateCapture()
         try await refreshKeepsAcceptedProjectUsableUntilPublication()
+        try await refreshWaitsForAtlasPreparationAndDrainsCancellation()
         try await failedAndRejectedRefreshKeepTheAcceptedProject()
         try await canceledRefreshDrainsBeforeRetryAndRetainsItsGrant()
         try await refreshPreservesPartialAndEmptyCoverage()
@@ -1103,6 +1104,56 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         precondition(replacement.canOperate && !replacement.closed)
         capture.reader.close(); replacement.close()
     }
+    @MainActor private static func refreshWaitsForAtlasPreparationAndDrainsCancellation() async throws {
+        final class Grant { }
+        enum Failure: Error { case preparation }
+        for mode in ["accepted", "rejected", "failed", "canceled"] {
+            let f = ProjectBrowserFixture(), old = AtlasProjectBrowserModel(transport: f.transport)
+            try await old.open(root: "/repo", accessLease: nil)
+            let oldPage = old.page!, refresh = AtlasProjectRefresh(transport: f.transport), project = UUID()
+            var grant: Grant? = Grant(); weak var observed = grant
+            var resume: CheckedContinuation<Void, Never>?
+            var preparationToken: AtlasSearchCancellation?
+            var publications = 0, failures: [UUID] = []
+            var installed: AtlasProjectBrowserModel?
+            let candidateProject = refresh.stage(root: "/repo", project: project, accessLease: grant,
+                prepare: { cancellation in
+                    preparationToken = cancellation
+                    await withCheckedContinuation { resume = $0 }
+                    if mode == "failed" { throw Failure.preparation }
+                }, accepted: { candidate in
+                    publications += 1
+                    precondition(candidate.previousProject == project && old.canOperate && old.page?.id == oldPage.id)
+                    guard mode == "accepted" else { return false }
+                    installed = candidate.browser
+                    return true
+                }, failed: { failures.append($0) })!
+            grant = nil
+            await wait("refresh did not enter atlas preparation") { resume != nil }
+            precondition(refresh.isRefreshing && publications == 0 && failures.isEmpty && observed != nil)
+            precondition(old.currentPage && old.canOperate && old.page?.id == oldPage.id,
+                "the first candidate page cannot replace the project before its atlas is admitted")
+            if mode == "canceled" {
+                refresh.cancel(); refresh.cancel()
+                precondition(preparationToken?.isCanceled == true && observed != nil && refresh.isRefreshing)
+                precondition(failures == [candidateProject] && old.canOperate)
+                precondition(refresh.stage(root: "/repo", project: project, accessLease: nil,
+                    accepted: { _ in preconditionFailure("canceled preparation accumulated another worker") },
+                    failed: { _ in }) == nil)
+            }
+            resume?.resume(); resume = nil
+            await wait("atlas preparation did not drain") { !refresh.isRefreshing }
+            if mode == "accepted" {
+                precondition(publications == 1 && failures.isEmpty && installed?.canOperate == true && observed != nil)
+            } else {
+                await wait("refused atlas candidate or grant was retained") { observed == nil && f.calls.contains("close:41") }
+                precondition(publications == (mode == "rejected" ? 1 : 0) && failures == [candidateProject])
+            }
+            precondition(old.canOperate && old.page?.id == oldPage.id && !f.calls.contains("close:40"))
+            refresh.close(); installed?.close(); old.close()
+        }
+    }
+
     @MainActor private static func failedAndRejectedRefreshKeepTheAcceptedProject() async throws {
         for mode in ["failed", "rejected"] {
             let f = ProjectBrowserFixture(), old = AtlasProjectBrowserModel(transport: f.transport)

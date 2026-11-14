@@ -71,14 +71,21 @@ final class AtlasPresentedFrame {
 
     /// Reflow or project/scope replacement retires the coordinate domain. An
     /// old view's queued button action cannot navigate the replacement atlas.
-    func bindNavigation(to revision: UUID) {
+    func bindNavigation(to revision: UUID, preservingHistory: Bool = false) {
         guard navigationRevision != revision else { return }
         stopMotion()
         isDragging = false
         lastTranslation = .zero
         lastDragTime = nil
         navigationRevision = revision
-        navigationHistory.reset()
+        if !preservingHistory { navigationHistory.reset() }
+    }
+
+    /// Refresh preserves the coordinate frame. Show added files can focus the
+    /// new neighborhood using the last usable viewport.
+    @discardableResult
+    func navigateFocus(bounds: CGRect, revision: UUID) -> Bool {
+        navigateFocus(bounds: bounds, viewport: viewportSize, revision: revision)
     }
 
     @discardableResult
