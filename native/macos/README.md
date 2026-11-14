@@ -1204,23 +1204,46 @@ Rust/Swift verification and physical-Mac qualification remain pending.
 
 The **Observed Range Reader** can search a file without capturing its complete
 contents. Open it from the current source or Quick Open, choose UTF-8, UTF-16 LE,
-or UTF-16 BE, and enter an exact, case-sensitive literal. Search uses the same
+or UTF-16 BE, and select **Text**, **Expression**, or **Occurrences**. Text uses a
+literal; **Match case** chooses exact spelling or Unicode scalar lowercase
+matching. Occurrences uses one exact whole identifier. Search uses the same
 opened file object as byte navigation, including after that pathname is replaced.
 Reopen explicitly to observe the replacement file.
 
 Each search starts at byte zero and reads through a 16 KiB streaming buffer.
 The selected scan limit bounds source I/O; the default is 256 MiB and the maximum
-is 4 GiB. At most 256 hits and a 4096-byte UTF-8 query are admitted. Overlapping
+is 4 GiB. At most 256 hits are retained. Text admits 4,096 UTF-8 query bytes;
+Expression and Occurrences admit 1,024. Overlapping
 matches and matches split across read buffers retain exact original byte ranges,
 including UTF-16 surrogate pairs. Enable **Count all matches** to continue
 counting after the retained-hit table fills without retaining more rows or source
 bytes. A completed unchanged observation can then report an exhaustive count;
 byte/read-call limits, decoding failures, source changes and cancellation keep
-that count explicitly partial. Without the option, Find preserves its existing
-stop-at-first-overflow behavior. The result reports actual bytes scanned and
+that count explicitly partial. Without the option, Text and Occurrences stop
+after the first match beyond the retained result allowance. The result reports actual bytes scanned and
 read, and distinguishes reaching the observed end from stopping at a byte,
 read-call, result, or encoding limit. A completed scan is an observation of a
 mutable file, never an atomic snapshot.
+
+Choose **Expression** for required terms, quoted phrases and exclusions. For
+example, `"retry request" timeout -deprecated` finds the primary phrase
+`retry request` only when the same observed file also contains `timeout` and
+does not contain `deprecated`. The first positive literal supplies the counts,
+highlights and retained byte witnesses; **Match case** applies to every text
+predicate. The shared parser admits at most 64 terms within the 1,024-byte query
+limit. Regular expressions are unavailable. Path, language and type filters are
+rejected because this reader searches one explicitly opened file.
+
+Expression searches check all required and excluded terms through the end of
+one continuous observation, including text beyond the retained-hit allowance.
+**Count all matches** stays on in Expression mode; returning to another
+mode restores the previous counting preference. A scan cut short by a byte or
+read-call limit, cancellation or malformed text cannot establish the predicates
+and cannot publish expression hits. A completed predicate rejection reports no
+qualifying matches. Reaching the observed end can qualify an expression over
+those bytes, while changed or unavailable final metadata still keeps the overall
+coverage partial. This does not turn the observation into an atomic snapshot.
+Each result-page rescan evaluates the complete expression again.
 
 Selecting a result retrieves only its retained matched text and original bytes;
 it does not reread the file. Copy preserves that matched spelling. **Read current
@@ -1235,7 +1258,11 @@ to verify the retained match before accepting the page. It checks original bytes
 the decoded literal and the exact source-to-text range together. A changed or
 unavailable match leaves the accepted reader page intact. Verified selections
 remain attached to retained pages, so Back/Forward can restore the same highlight
-without source I/O even after another query replaces the active search. This
+without source I/O even after another query replaces the active search. For an
+Expression hit, this fresh context check verifies only the primary matched
+bytes. The page retains the expression and its qualification from the original
+search observation; it does not claim to recheck required or excluded terms
+elsewhere in the current file. This
 action also handles valid matches beside malformed neighboring text through the
 shared decoder's source map. **Read current context** remains available when the
 intent is to inspect what changed.

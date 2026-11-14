@@ -237,11 +237,10 @@ extension AtlasObservedReaderModel {
     private var searchControls: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 7) {
-                TextField(model.searchMode == .occurrences ? "Find exact identifier" : "Find text in the opened file", text: $model.searchText)
+                TextField(model.searchMode.prompt, text: $model.searchText)
                     .textFieldStyle(.roundedBorder).focused($searchFocused).onSubmit(model.find)
-                    .accessibilityLabel(model.searchMode == .occurrences ? "Exact identifier in the opened file" : "Text to find in the opened file")
-                    .help(model.searchMode == .occurrences ? "One exact identifier, up to 1024 UTF-8 bytes. Includes comments and literals; compiler references are not established."
-                        : "Literal text with optional Unicode lowercase matching. Up to 4096 UTF-8 bytes; NUL is unsupported.")
+                    .accessibilityLabel(model.searchMode.label + " query in the opened file")
+                    .help(model.searchMode.help)
                 Picker("Scan up to", selection: $model.searchScanBytes) {
                     Text("16 MiB").tag(UInt64(16 * 1024 * 1024))
                     Text("256 MiB").tag(AtlasObservedReaderSearchLimits.scanBytes)
@@ -255,21 +254,27 @@ extension AtlasObservedReaderModel {
             HStack(spacing: 7) {
                 Picker("Find mode", selection: $model.searchMode) {
                     ForEach(AtlasObservedReaderSearchMode.allCases) { Text($0.label).tag($0) }
-                }.frame(width: 165)
+                }.frame(width: 185)
                 Toggle("Match case", isOn: Binding(get: { model.searchMode == .occurrences || model.searchCaseSensitive },
                     set: { model.searchCaseSensitive = $0 })).toggleStyle(.checkbox)
                     .disabled(model.searchMode == .occurrences)
                     .help(model.searchMode == .occurrences ? "Whole identifiers always use exact case."
                         : "When off, use Unicode lowercase matching and retain the original spelling and byte ranges")
-                Toggle("Count all matches", isOn: $model.countAllSearchMatches).toggleStyle(.checkbox)
+                Toggle("Count all matches", isOn: Binding(get: { model.effectiveSearchCountAllMatches },
+                    set: { model.countAllSearchMatches = $0 })).toggleStyle(.checkbox)
+                    .disabled(model.searchMode == .expression)
                     .help("Continue counting beyond this page’s 256 retained matches, within the selected scan and read-call limits")
-                Text(model.countAllSearchMatches
+                Text(model.searchMode == .expression
+                    ? "Expression predicates require the complete bounded input. Counts and highlights use the first positive literal."
+                    : model.effectiveSearchCountAllMatches
                     ? "Keep up to 256 matches on the requested page and continue counting. The count is exact only when the observation completes unchanged."
                     : "Find stops at the first match beyond the requested result page.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
             Text(model.searchMode == .occurrences
                 ? "Occurrences use shared whole-token rules and exact spelling, including comments and literals. Compiler resolution is not claimed. Scanning starts at byte 0; at most 256 matches are retained."
+                : model.searchMode == .expression
+                ? "Use required terms, quoted phrases and -excluded terms, within 1024 UTF-8 bytes and 64 tokens. All predicates use the same observed stream. A scan cutoff leaves the expression undecided; primary matches alone are not published. Path/language/type filters and regex are unavailable here."
                 : "Find starts at byte 0 using the selected decoding, with at most 256 retained matches. A scan limit or file change leaves the total count unknown.")
                 .font(.caption2).foregroundStyle(.secondary)
             if let report = model.searchReport {
@@ -286,6 +291,12 @@ extension AtlasObservedReaderModel {
                 HStack(alignment: .top, spacing: 12) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(report.request.mode.label + " · " + report.countLabel).font(.caption.bold())
+                        if let expression = report.expression {
+                            Text(verbatim: "Primary literal: " + expression.primaryNeedle)
+                                .font(.caption2.monospaced()).lineLimit(2).textSelection(.enabled)
+                            Text(verbatim: "Expression: " + expression.query)
+                                .font(.caption2).lineLimit(2).textSelection(.enabled)
+                        }
                         if !report.hits.isEmpty {
                             ScrollView {
                                 LazyVStack(alignment: .leading, spacing: 2) {
@@ -309,13 +320,19 @@ extension AtlasObservedReaderModel {
                     }.frame(minWidth: 230, alignment: .leading)
                     if let witness = model.selectedSearchWitness {
                         VStack(alignment: .leading, spacing: 4) {
-                            Text((witness.mode == .occurrences ? "Retained identifier" : "Verified retained literal") + " · \(witness.encoding.label)").font(.caption.bold())
+                            Text((witness.mode == .occurrences ? "Retained identifier"
+                                : witness.mode == .expression ? "Retained primary literal" : "Verified retained literal")
+                                + " · \(witness.encoding.label)").font(.caption.bold())
                             ScrollView {
                                 Text(verbatim: witness.text).font(.system(.caption, design: .monospaced))
                                     .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                             }.frame(maxHeight: 50)
                             Text(verbatim: "Original hex: " + witness.originalHex)
                                 .font(.system(.caption2, design: .monospaced)).lineLimit(2).textSelection(.enabled)
+                            if witness.expression != nil {
+                                Text("Required and excluded terms were checked in the original search observation. Reading context rechecks only these primary literal bytes.")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            }
                             HStack {
                                 Button("Copy match") { copyWitness(hex: false) }
                                 Button("Copy match hex") { copyWitness(hex: true) }
@@ -329,7 +346,11 @@ extension AtlasObservedReaderModel {
                         }.frame(maxWidth: .infinity, alignment: .leading)
                     } else {
                         Text(report.hits.isEmpty
-                            ? (report.request.pageStartAfter > 0
+                            ? (report.expression?.qualified == nil && report.expression != nil
+                                ? "The bounded observation could not decide every expression predicate. Increase Scan up to and run Find again."
+                                : report.expression?.qualified == false
+                                ? "The completed observed input does not satisfy the expression. A primary literal alone does not qualify."
+                                : report.request.pageStartAfter > 0
                                 ? "No matches from the requested result page were retained. " + (report.matchCountComplete
                                     ? "This new observation counted \(report.matchesSeen) matches in total."
                                     : "A partial search cannot prove that the unsearched remainder has no matches.")

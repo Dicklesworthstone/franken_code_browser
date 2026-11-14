@@ -269,11 +269,12 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
             && intent.range == selection.nativeRange
     }
     private var effectiveSearchCaseSensitive: Bool { searchMode == .occurrences || searchCaseSensitive }
+    var effectiveSearchCountAllMatches: Bool { searchMode == .expression || countAllSearchMatches }
     var canSearch: Bool {
         !closed && session != nil && transport.search != nil && lastSearchGeneration < UInt64.max
             && (try? AtlasObservedReaderSearchRequest(generation: 1, needle: searchText,
                 encoding: encoding, maximumScanBytes: searchScanBytes,
-                countAllMatches: countAllSearchMatches, caseSensitive: effectiveSearchCaseSensitive, mode: searchMode)) != nil
+                countAllMatches: effectiveSearchCountAllMatches, caseSensitive: effectiveSearchCaseSensitive, mode: searchMode)) != nil
     }
     var canSelectSearchHit: Bool {
         searchAuthorized && !closed && !busy && session != nil && !(searchReport?.hits.isEmpty ?? true)
@@ -309,14 +310,16 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     }
     var verifiedPageNotice: String? {
         guard let hit = page?.findHit else { return nil }
+        let expressionNotice = hit.expression == nil ? ""
+            : " Only primary literal bytes were verified in this page. Other expression predicates belong to the original search observation."
         guard let report = searchReport, hit.generation == report.request.generation,
               hit.searchObservation == report.observation else {
-            return "Verified match retained from an earlier Find."
+            return "Verified match retained from an earlier Find." + expressionNotice
         }
         guard selectedSearchWitness?.target.hit.index == hit.index else {
-            return "Verified match retained from another result of this Find."
+            return "Verified match retained from another result of this Find." + expressionNotice
         }
-        return nil
+        return expressionNotice.isEmpty ? nil : expressionNotice
     }
 
     var coverage: String {
@@ -658,11 +661,13 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         do {
             request = try .init(generation: lastSearchGeneration + 1, needle: searchText,
                 encoding: encoding, maximumScanBytes: searchScanBytes,
-                countAllMatches: countAllSearchMatches, caseSensitive: effectiveSearchCaseSensitive, mode: searchMode,
+                countAllMatches: effectiveSearchCountAllMatches, caseSensitive: effectiveSearchCaseSensitive, mode: searchMode,
                 pageStartAfter: pageStartAfter)
         } catch {
             notice = searchMode == .occurrences
                 ? "Enter one exact identifier of at most 1024 UTF-8 bytes, and choose a bounded scan limit."
+                : searchMode == .expression
+                ? "Enter an expression of at most 1024 UTF-8 bytes and choose a bounded scan limit. Path and language filters are unavailable in a single opened file."
                 : "Enter text of 1–4096 UTF-8 bytes without NUL, and choose a bounded scan limit."
             return
         }
@@ -685,7 +690,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
                 guard accepts(ticket, flag), self.session === session,
                       searchText.utf8.elementsEqual(request.needle.utf8), encoding == request.encoding,
                       searchScanBytes == request.maximumScanBytes,
-                      countAllSearchMatches == request.countAllMatches,
+                      effectiveSearchCountAllMatches == request.countAllMatches,
                       effectiveSearchCaseSensitive == request.caseSensitive, searchMode == request.mode else { return }
                 guard report.observation > latestObservation else { throw AtlasObservedReaderError.invalidResponse }
                 latestObservation = report.observation
@@ -798,6 +803,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
                 install(page, append: true)
                 finish(ticket)
                 notice = "Match verified in new observation \(page.observation.id). Its exact selection is retained with this page; Back restores earlier bytes."
+                    + (witness.mode == .expression ? " Only the primary literal was rechecked; other expression predicates retain their original search observation." : "")
             } catch { fail(error, ticket: ticket) }
         }
     }
@@ -865,6 +871,16 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         if let error = error as? AtlasObservedReaderError {
             if case .engine(let code) = error {
                 switch code {
+                case "OBSERVED_READER_EXPRESSION_SCOPE_UNSUPPORTED":
+                    return "This search already names one opened file. Use content terms and phrases; path, language and type filters require project search. The accepted range is unchanged."
+                case "QUERY_NEEDLE_TOO_LONG":
+                    return "The expression exceeds its 1024 UTF-8 byte limit. Shorten the query; the accepted range is unchanged."
+                case "QUERY_EMPTY":
+                    return "Enter at least one positive text term or quoted phrase. Excluded terms alone cannot identify a primary match."
+                case "QUERY_REGEX_UNQUALIFIED":
+                    return "Regular expressions are unavailable. Use required literal terms, quoted phrases and -excluded terms. The accepted range is unchanged."
+                case "QUERY_LIMIT_EXCEEDED", "QUERY_SYNTAX_ERROR":
+                    return "The expression syntax was refused (\(code)). Use required terms, quoted phrases and -excluded terms, within 64 tokens. The accepted range is unchanged."
                 case "STREAM_READ_INVALID_IDENTIFIER":
                     return "Enter one exact identifier without spaces or ASCII punctuation other than _ and $. An identifier cannot start with an ASCII digit."
                 case "OBSERVED_READER_SEARCH_HIT_CHANGED":
@@ -907,7 +923,8 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
            hit.generation == witness.target.generation, hit.searchObservation == witness.target.observation,
            hit.index == witness.target.hit.index, hit.occurrence == witness.target.hit.occurrence,
            hit.originalRange == witness.target.hit.range {
-            searchContext = .verified(selection: searchSelection)
+            searchContext = hit.expression == nil ? .verified(selection: searchSelection)
+                : .expressionPrimaryVerified(selection: searchSelection)
         }
         offsetInput = String(page.observation.request.offset)
         if let lines = page.lineNavigation {

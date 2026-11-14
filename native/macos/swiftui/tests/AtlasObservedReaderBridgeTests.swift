@@ -283,6 +283,67 @@ import Foundation
         precondition(count(9) == beforeLegacyFinds && count(13) == beforeLegacyCounted
             && count(14) == beforeLegacyMatching && count(16) == beforeLegacyOccurrences,
             "Explicit page scans do not reuse a legacy ABI that would drop the requested skip")
+        let expressionText = "\"exact é😀\" required -excluded"
+        let expressionFinds = count(24), expressionCounts = count(25), expressionLower = count(26), expressionPages = count(27)
+        for encoding in AtlasObservedReaderEncoding.allCases {
+            for countAll in [false, true] {
+                for caseSensitive in [false, true] {
+                    let expression = try AtlasObservedReaderSearchRequest(generation: observation, needle: expressionText,
+                        encoding: encoding, maximumScanBytes: 1 << 32, countAllMatches: countAll,
+                        caseSensitive: caseSensitive, mode: .expression)
+                    let found = try search.find(handle, expression, AtlasSearchCancellation())
+                    precondition(found == expected)
+                    let page = try AtlasObservedReaderSearchRequest(generation: observation, needle: expressionText,
+                        encoding: encoding, maximumScanBytes: 1 << 32, countAllMatches: countAll,
+                        caseSensitive: caseSensitive, mode: .expression, pageStartAfter: offset)
+                    let paged = try findPage(handle, page, AtlasSearchCancellation())
+                    precondition(paged == expected)
+                    precondition(allocations() == frees())
+                }
+            }
+        }
+        precondition(count(24) == expressionFinds + 12 && count(25) == expressionCounts + 6
+            && count(26) == expressionLower + 6 && count(27) == expressionPages + 12,
+            "Expression mode 2 preserves the full raw query, decoding, case/count policies and full-width rescan offset")
+        precondition(count(9) == beforeLegacyFinds && count(13) == beforeLegacyCounted
+            && count(14) == beforeLegacyMatching && count(16) == beforeLegacyOccurrences,
+            "Expression dispatch cannot fall through to legacy literal or identifier search")
+        let expression = try AtlasObservedReaderSearchRequest(generation: observation, needle: expressionText,
+            encoding: .utf16be, maximumScanBytes: 1 << 32, countAllMatches: true, caseSensitive: false, mode: .expression)
+        let expressionPage = try AtlasObservedReaderSearchRequest(generation: observation, needle: expressionText,
+            encoding: .utf16be, maximumScanBytes: 1 << 32, countAllMatches: true, caseSensitive: false,
+            mode: .expression, pageStartAfter: offset)
+        let enteredExpressions = count(24), enteredExpressionPages = count(27)
+        do { _ = try search.find(handle, expression, canceled); preconditionFailure("Canceled expression crossed ABI") }
+        catch AtlasObservedReaderError.canceled { }
+        do { _ = try findPage(handle, expressionPage, canceled); preconditionFailure("Canceled expression page crossed ABI") }
+        catch AtlasObservedReaderError.canceled { }
+        precondition(count(24) == enteredExpressions && count(27) == enteredExpressionPages)
+        for invalid in [Int32(2), Int32(3)] {
+            mode(invalid)
+            for page in [false, true] {
+                let beforeFrees = frees()
+                do {
+                    if page { _ = try findPage(handle, expressionPage, AtlasSearchCancellation()) }
+                    else { _ = try search.find(handle, expression, AtlasSearchCancellation()) }
+                    preconditionFailure("Malformed expression response accepted")
+                } catch AtlasObservedReaderError.invalidResponse { }
+                precondition(frees() == beforeFrees + 1 && allocations() == frees())
+            }
+        }
+        for late in [Int32(4), Int32(5)] {
+            mode(late)
+            for page in [false, true] {
+                let token = AtlasSearchCancellation()
+                do {
+                    if page { _ = try findPage(handle, expressionPage, token) }
+                    else { _ = try search.find(handle, expression, token) }
+                    preconditionFailure("Late expression cancellation accepted")
+                } catch AtlasObservedReaderError.canceled { }
+                precondition(token.isCanceled && allocations() == frees())
+            }
+        }
+        mode(0)
         let beforeSelection = count(18)
         let selected = try resolveSelection(handle, observation, offset + 3, offset + 17)
         precondition(selected == expected && count(18) == beforeSelection + 1 && allocations() == frees(),

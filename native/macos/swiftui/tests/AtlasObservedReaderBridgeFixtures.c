@@ -8,13 +8,15 @@
 
 enum { CREATE, OPEN, INFO, WINDOW, RETAINED, COPY, CANCEL, CLOSE, POLLS, FIND, HIT, OBSERVE_HIT, LINES, COUNTED_FIND,
     MATCHING_FIND, MATCHING_COUNTED, OCCURRENCES_FIND, OCCURRENCES_COUNTED, RESOLVE_SELECTION, OPEN_FILE,
-    PAGED_FIND, PAGED_COUNTED, PAGED_LOWERCASE, PAGED_OCCURRENCES, COUNTERS };
+    PAGED_FIND, PAGED_COUNTED, PAGED_LOWERCASE, PAGED_OCCURRENCES,
+    EXPRESSION_FIND, EXPRESSION_COUNTED, EXPRESSION_LOWERCASE, PAGED_EXPRESSION, COUNTERS };
 static uint32_t counts[COUNTERS], allocations, frees, encoding_bits;
 static int32_t mode;
 static char *owned;
 static const uint64_t handle_value = UINT64_C(0xfedcba9876543210);
 static const uint64_t offset_value = UINT64_C(0x0020000100000047);
 static const uint64_t observation_value = UINT64_C(0x8000000100000007);
+static const char expression_query[] = "\"exact \xc3\xa9\xf0\x9f\x98\x80\" required -excluded";
 extern void observed_reader_fixture_cancel(void *context);
 
 void observed_reader_fixture_reset(void) {
@@ -110,13 +112,20 @@ char *fcb_observed_reader_find_mode(uint64_t handle, uint64_t generation, const 
     uint64_t encoding, uint64_t search_mode, uint64_t case_sensitive, uint64_t count_all_matches,
     uint64_t max_matches, uint64_t max_scan_bytes, fcb_observed_reader_poll poll, void *context) {
     assert(handle == handle_value && generation == observation_value);
-    assert(search_mode == 1 && case_sensitive == 1 && count_all_matches <= 1);
-    assert(needle != NULL && strcmp(needle, "exact_\xc3\xa9") == 0);
+    assert((search_mode == 1 || search_mode == 2) && case_sensitive <= 1 && count_all_matches <= 1);
+    assert(search_mode != 1 || case_sensitive == 1);
+    const char *expected = search_mode == 2 ? expression_query : "exact_\xc3\xa9";
+    assert(needle != NULL && strcmp(needle, expected) == 0);
     assert(encoding >= 1 && encoding <= 3 && max_matches == 256 && max_scan_bytes == UINT64_C(4294967296));
-    ++counts[OCCURRENCES_FIND]; counts[OCCURRENCES_COUNTED] += (uint32_t)count_all_matches;
+    if (search_mode == 1) {
+        ++counts[OCCURRENCES_FIND]; counts[OCCURRENCES_COUNTED] += (uint32_t)count_all_matches;
+    } else {
+        ++counts[EXPRESSION_FIND]; counts[EXPRESSION_COUNTED] += (uint32_t)count_all_matches;
+        counts[EXPRESSION_LOWERCASE] += case_sensitive == 0;
+    }
     encoding_bits |= 1u << (unsigned)encoding;
     poll_context(poll, context);
-    assert(strcmp(needle, "exact_\xc3\xa9") == 0);
+    assert(strcmp(needle, expected) == 0);
     return response();
 }
 char *fcb_observed_reader_find(uint64_t handle, uint64_t generation, const char *needle,
@@ -135,14 +144,16 @@ char *fcb_observed_reader_find_page(uint64_t handle, uint64_t generation, const 
     uint64_t start_after, uint64_t max_matches, uint64_t max_scan_bytes,
     fcb_observed_reader_poll poll, void *context) {
     assert(handle == handle_value && generation == observation_value);
-    assert(search_mode <= 1 && case_sensitive <= 1 && count_all_matches <= 1);
-    assert(search_mode == 0 || case_sensitive == 1);
-    const char *expected = search_mode == 1 ? "exact_\xc3\xa9" : "exact \xc3\xa9\xf0\x9f\x98\x80";
+    assert(search_mode <= 2 && case_sensitive <= 1 && count_all_matches <= 1);
+    assert(search_mode != 1 || case_sensitive == 1);
+    const char *expected = search_mode == 2 ? expression_query
+        : search_mode == 1 ? "exact_\xc3\xa9" : "exact \xc3\xa9\xf0\x9f\x98\x80";
     assert(needle != NULL && strcmp(needle, expected) == 0);
     assert(encoding >= 1 && encoding <= 3 && start_after == offset_value);
     assert(max_matches == 256 && max_scan_bytes == UINT64_C(4294967296));
     ++counts[PAGED_FIND]; counts[PAGED_COUNTED] += (uint32_t)count_all_matches;
-    counts[PAGED_LOWERCASE] += case_sensitive == 0; counts[PAGED_OCCURRENCES] += (uint32_t)search_mode;
+    counts[PAGED_LOWERCASE] += case_sensitive == 0; counts[PAGED_OCCURRENCES] += search_mode == 1;
+    counts[PAGED_EXPRESSION] += search_mode == 2;
     encoding_bits |= 1u << (unsigned)encoding;
     poll_context(poll, context);
     assert(strcmp(needle, expected) == 0);

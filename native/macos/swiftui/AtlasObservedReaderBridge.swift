@@ -86,9 +86,9 @@ extension AtlasObservedReaderTransport {
             guard request.pageStartAfter == 0 else { throw AtlasObservedReaderError.invalidInput }
             return try observedReaderPolling(cancellation) { poll, context in
                 request.needle.withCString { needle in
-                    if request.mode == .occurrences {
+                    if request.mode != .text {
                         return observedReaderFindMode(handle, request.generation, needle, request.encoding.abi,
-                            1, 1, request.countAllMatches ? 1 : 0,
+                            request.mode.abi, request.caseSensitive ? 1 : 0, request.countAllMatches ? 1 : 0,
                             request.maximumMatches, request.maximumScanBytes, poll, context)
                     }
                     if !request.caseSensitive {
@@ -130,7 +130,7 @@ extension AtlasObservedReaderTransport {
             try observedReaderPolling(cancellation) { poll, context in
                 request.needle.withCString { needle in
                     observedReaderFindPage(handle, request.generation, needle, request.encoding.abi,
-                        request.mode == .occurrences ? 1 : 0, request.caseSensitive ? 1 : 0,
+                        request.mode.abi, request.caseSensitive ? 1 : 0,
                         request.countAllMatches ? 1 : 0, request.pageStartAfter,
                         request.maximumMatches, request.maximumScanBytes, poll, context)
                 }

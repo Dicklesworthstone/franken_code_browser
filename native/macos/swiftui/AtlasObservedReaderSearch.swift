@@ -2,6 +2,7 @@ import Foundation
 
 enum AtlasObservedReaderSearchLimits {
     static let needleBytes = 4096
+    static let expressionBytes = 1024
     static let maximumWitnessBytes = needleBytes * 12
     static let matches: UInt64 = 256
     static let scanBytes: UInt64 = 256 * 1024 * 1024
@@ -11,9 +12,24 @@ enum AtlasObservedReaderSearchLimits {
 }
 
 enum AtlasObservedReaderSearchMode: String, CaseIterable, Identifiable, Sendable {
-    case text, occurrences
+    case text, occurrences, expression
     var id: String { rawValue }
-    var label: String { self == .text ? "Text" : "Occurrences" }
+    var label: String { switch self { case .text: "Text"; case .occurrences: "Occurrences"; case .expression: "Expression" } }
+    var abi: UInt64 { switch self { case .text: 0; case .occurrences: 1; case .expression: 2 } }
+    var prompt: String {
+        switch self {
+        case .text: "Find text in the opened file"
+        case .occurrences: "Find exact identifier"
+        case .expression: "Expression, e.g. \"request failed\" timeout -deprecated"
+        }
+    }
+    var help: String {
+        switch self {
+        case .text: "Literal text with optional Unicode lowercase matching. Up to 4096 UTF-8 bytes; NUL is unsupported."
+        case .occurrences: "One exact identifier, up to 1024 UTF-8 bytes. Includes comments and literals; compiler references are not established."
+        case .expression: "Required terms, quoted phrases and -excluded terms in this opened file. Up to 1024 UTF-8 bytes. Path/language filters and regular expressions are unavailable."
+        }
+    }
 }
 
 /// Text, matching policy and explicit encoding for one bounded scan of the
@@ -37,6 +53,7 @@ struct AtlasObservedReaderSearchRequest: Equatable, Sendable {
               needle.utf8.count <= AtlasObservedReaderSearchLimits.needleBytes,
               !needle.utf8.contains(0),
               mode != .occurrences || (caseSensitive && needle.utf8.count <= 1024),
+              mode != .expression || needle.utf8.count <= AtlasObservedReaderSearchLimits.expressionBytes,
               (1...AtlasObservedReaderSearchLimits.matches).contains(maximumMatches),
               (1...AtlasObservedReaderSearchLimits.maximumScanBytes).contains(maximumScanBytes) else {
             throw AtlasObservedReaderError.invalidInput
@@ -68,7 +85,11 @@ struct AtlasObservedReaderSearchRequest: Equatable, Sendable {
     }
     var originalHex: String { AtlasObservedReaderWire.hex(Self.originalBytes(needle, encoding: encoding)) }
     var wireMode: String {
-        mode == .occurrences ? "whole-token-occurrences" : (caseSensitive ? "exact-decoded-text" : "unicode-lowercase-text")
+        switch mode {
+        case .text: caseSensitive ? "exact-decoded-text" : "unicode-lowercase-text"
+        case .occurrences: "whole-token-occurrences"
+        case .expression: "decoded-text-expression"
+        }
     }
 
     static func validWitnessRange(_ range: AtlasObservedByteRange, needle: String,
@@ -86,6 +107,18 @@ struct AtlasObservedReaderSearchRequest: Equatable, Sendable {
               !caseSensitive || text.utf8.elementsEqual(needle.utf8) else { return false }
         let bytes = originalBytes(text, encoding: encoding)
         return UInt64(bytes.count) == range.count && hex == AtlasObservedReaderWire.hex(bytes)
+    }
+}
+
+/// The engine's bounded expression receipt, not a second native query parser.
+/// The primary literal owns all highlighted ranges and retained witnesses;
+/// other predicates describe the original completed search observation.
+struct AtlasObservedReaderExpression: Equatable, Sendable {
+    let query, primaryNeedle: String
+    let qualified: Bool?
+    static func == (a: Self, b: Self) -> Bool {
+        a.query.utf8.elementsEqual(b.query.utf8) && a.primaryNeedle.utf8.elementsEqual(b.primaryNeedle.utf8)
+            && a.qualified == b.qualified
     }
 }
 
@@ -123,6 +156,7 @@ struct AtlasObservedReaderHitNavigation: Equatable, Sendable, Decodable {
     let originalRange, decodedRange: AtlasObservedByteRange
     let mode: String?
     let caseSensitive, tokenBoundariesVerified: Bool?
+    let expression: AtlasObservedReaderExpression?
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -140,14 +174,23 @@ struct AtlasObservedReaderHitNavigation: Equatable, Sendable, Decodable {
         tokenBoundariesVerified = try c.decodeIfPresent(Bool.self, forKey: .token_boundaries_verified)
         if mode != nil || caseSensitive != nil || tokenBoundariesVerified != nil {
             guard let mode, let caseSensitive, let tokenBoundariesVerified,
-                  ["exact-decoded-text", "unicode-lowercase-text", "whole-token-occurrences"].contains(mode),
-                  caseSensitive == (mode != "unicode-lowercase-text"),
+                  ["exact-decoded-text", "unicode-lowercase-text", "whole-token-occurrences", "decoded-text-expression"].contains(mode),
+                  mode == "decoded-text-expression" || caseSensitive == (mode != "unicode-lowercase-text"),
                   tokenBoundariesVerified == (mode == "whole-token-occurrences") else {
                 throw AtlasObservedReaderError.invalidResponse
             }
         }
         if mode == "whole-token-occurrences" {
             try AtlasObservedReaderModeEvidence(from: decoder).validate(.occurrences)
+        }
+        if mode == "decoded-text-expression" {
+            try AtlasObservedReaderModeEvidence(from: decoder).validate(.expression)
+        }
+        expression = try AtlasObservedReaderExpressionEvidence(from: decoder)
+            .validate(mode: mode == "decoded-text-expression" ? .expression : .text,
+                scope: "original-search-observation")
+        if let expression {
+            guard expression.qualified == true else { throw AtlasObservedReaderError.invalidResponse }
         }
         let (ordinal, overflow) = pageStartAfter.addingReportingOverflow(index)
         let (expectedOccurrence, occurrenceOverflow) = ordinal.addingReportingOverflow(1)
@@ -168,6 +211,8 @@ struct AtlasObservedReaderHitNavigation: Equatable, Sendable, Decodable {
 struct AtlasObservedReaderSearchReport: Sendable {
     let identity: AtlasObservedReaderIdentity
     let request: AtlasObservedReaderSearchRequest
+    let primaryNeedle: String
+    let expression: AtlasObservedReaderExpression?
     let observation, observedLength: UInt64
     let finalObservedLength: UInt64?
     let state, consistency: String
@@ -199,6 +244,12 @@ struct AtlasObservedReaderSearchReport: Sendable {
             : "occurrences \(first.occurrence)–\(last.occurrence) retained"
     }
     var countLabel: String {
+        if let expression, expression.qualified == nil {
+            return "Expression not yet established · no qualifying matches retained"
+        }
+        if let expression, expression.qualified == false {
+            return "No matches satisfy this expression in the observed input"
+        }
         if matchCountComplete {
             let total = "\(matchesSeen) matches in the observed input"
             return request.pageStartAfter > 0 || matchesSeen > UInt64(hits.count)
@@ -234,6 +285,11 @@ struct AtlasObservedReaderSearchReport: Sendable {
             + " Rescanning a result page reads current bytes from the beginning and creates a new observation; edits can change occurrence numbers."
             + (request.mode == .occurrences
                 ? " Whole-token spelling matches include comments and literals; compiler references are not established." : "")
+            + (expression.map { value in
+                value.qualified == nil
+                    ? " Required and excluded terms could not all be decided in the bounded observation; an observed primary literal alone is not a qualifying result."
+                    : " Required and excluded terms were checked through the same observed input. Counts and highlights refer only to the primary literal; no compiler binding is inferred."
+            } ?? "")
     }
 
     static func decode(_ json: String?, handle: UInt64, input: AtlasObservedReaderInput,
@@ -246,7 +302,17 @@ struct AtlasObservedReaderSearchReport: Sendable {
                 .identity(handle: handle, input: input, command: "find")
             let observation = try w.observation.value(request: request)
             let count = UInt64(w.hits.count)
-            let encoded = request.originalHex
+            let expression = try decoder.decode(AtlasObservedReaderExpressionEvidence.self, from: data)
+                .validate(mode: request.mode, query: request.needle, primary: w.literal_text,
+                    scope: "same-observed-stream", requireNeedle: true)
+            let primary = expression?.primaryNeedle ?? request.needle
+            let encoded = AtlasObservedReaderWire.hex(AtlasObservedReaderSearchRequest.originalBytes(primary, encoding: request.encoding))
+            if let expression {
+                guard observation.inputComplete == (expression.qualified != nil),
+                      (expression.qualified == true ? w.matches_seen.value > 0 : (count == 0 && w.matches_seen.value == 0)) else {
+                    throw AtlasObservedReaderError.invalidResponse
+                }
+            }
             let countFieldsPresent = w.count_all_matches != nil || w.match_count_complete != nil
             let matchCountComplete: Bool
             if countFieldsPresent {
@@ -265,7 +331,7 @@ struct AtlasObservedReaderSearchReport: Sendable {
             try decoder.decode(AtlasObservedReaderSearchPageEvidence.self, from: data)
                 .validate(startAfter: request.pageStartAfter, skipped: skippedMatches, hasMore: pageHasMoreMatches)
             guard w.mode == request.wireMode, w.case_sensitive == request.caseSensitive,
-                  w.literal_text.utf8.elementsEqual(request.needle.utf8),
+                  w.literal_text.utf8.elementsEqual(primary.utf8),
                   w.max_matches.value == request.maximumMatches, w.max_scan_bytes.value == request.maximumScanBytes,
                   w.max_read_calls.value == AtlasObservedReaderSearchLimits.readCalls,
                   w.retained_hits.value == count, count <= request.maximumMatches,
@@ -291,7 +357,7 @@ struct AtlasObservedReaderSearchReport: Sendable {
                       && w.literal_sha256.map { AtlasObservedReaderWire.validHex($0, bytes: 32) } == true)) else {
                 throw AtlasObservedReaderError.invalidResponse
             }
-            if request.countAllMatches {
+            if request.countAllMatches || request.mode == .expression {
                 guard w.observation.state != "match-limit" else { throw AtlasObservedReaderError.invalidResponse }
             } else {
                 guard pageHasMoreMatches == (w.observation.state == "match-limit"),
@@ -307,7 +373,7 @@ struct AtlasObservedReaderSearchReport: Sendable {
                 let (occurrence, occurrenceOverflow) = ordinal.addingReportingOverflow(1)
                 guard !overflow, !occurrenceOverflow,
                       hit.index.value == UInt64(index), hit.occurrence_id.value == occurrence,
-                      AtlasObservedReaderSearchRequest.validWitnessRange(hit.original_range, needle: request.needle,
+                      AtlasObservedReaderSearchRequest.validWitnessRange(hit.original_range, needle: primary,
                         encoding: request.encoding, caseSensitive: request.caseSensitive),
                       hit.original_range.end <= w.scanned_input_bytes.value,
                       let digest, AtlasObservedReaderWire.validHex(digest, bytes: 32),
@@ -325,7 +391,8 @@ struct AtlasObservedReaderSearchReport: Sendable {
                   w.retained_witness_bytes.map({ $0.value == witnessBytes }) ?? true else {
                 throw AtlasObservedReaderError.invalidResponse
             }
-            return Self(identity: identity, request: request, observation: observation.id,
+            return Self(identity: identity, request: request, primaryNeedle: primary, expression: expression,
+                observation: observation.id,
                 observedLength: observation.length, finalObservedLength: observation.finalLength,
                 state: w.observation.state, consistency: w.observation.consistency,
                 inputComplete: observation.inputComplete, searchComplete: observation.searchComplete,
@@ -395,6 +462,8 @@ struct AtlasObservedReaderSearchWitness: Sendable {
     let encoding: AtlasObservedReaderEncoding
     let text, originalHex, sha256: String
     var mode: AtlasObservedReaderSearchMode = .text
+    var caseSensitive = true
+    var expression: AtlasObservedReaderExpression? = nil
 
     static func decode(_ json: String?, handle: UInt64, input: AtlasObservedReaderInput,
                        report: AtlasObservedReaderSearchReport, target: AtlasObservedReaderSearchTarget) throws -> Self {
@@ -406,10 +475,15 @@ struct AtlasObservedReaderSearchWitness: Sendable {
                 .identity(handle: handle, input: input, command: "search-hit")
             let common = try decoder.decode(AtlasObservedReaderSearchWire.Observation.self, from: data)
             let observation = try common.value(request: report.request)
+            let expression = try decoder.decode(AtlasObservedReaderExpressionEvidence.self, from: data)
+                .validate(mode: report.request.mode, query: report.request.needle,
+                    primary: report.primaryNeedle, scope: "same-observed-stream")
+            guard expression == report.expression,
+                  expression == nil || expression?.qualified == true else { throw AtlasObservedReaderError.invalidResponse }
             try decoder.decode(AtlasObservedReaderSearchPageEvidence.self, from: data)
                 .validate(startAfter: report.request.pageStartAfter, skipped: report.skippedMatches,
                     hasMore: report.pageHasMoreMatches)
-            if w.mode != nil || w.case_sensitive != nil || !report.request.caseSensitive || report.request.mode == .occurrences {
+            if w.mode != nil || w.case_sensitive != nil || !report.request.caseSensitive || report.request.mode != .text {
                 guard w.mode == report.request.wireMode, w.case_sensitive == report.request.caseSensitive else {
                     throw AtlasObservedReaderError.invalidResponse
                 }
@@ -421,13 +495,14 @@ struct AtlasObservedReaderSearchWitness: Sendable {
                   w.index.value == target.hit.index, w.occurrence_id.value == target.hit.occurrence,
                   w.original_range == target.hit.range,
                   AtlasObservedReaderSearchRequest.validWitnessText(w.text, hex: w.original_hex, range: target.hit.range,
-                    needle: report.request.needle, encoding: report.request.encoding, caseSensitive: report.request.caseSensitive),
+                    needle: report.primaryNeedle, encoding: report.request.encoding, caseSensitive: report.request.caseSensitive),
                   w.witness_sha256 == target.hit.witnessSHA256,
                   w.additional_source_bytes_read.value == 0, w.additional_read_calls.value == 0 else {
                 throw AtlasObservedReaderError.invalidResponse
             }
             return .init(target: target, encoding: report.request.encoding, text: w.text,
-                originalHex: w.original_hex, sha256: w.witness_sha256, mode: report.request.mode)
+                originalHex: w.original_hex, sha256: w.witness_sha256, mode: report.request.mode,
+                caseSensitive: report.request.caseSensitive, expression: expression)
         } catch { throw AtlasObservedReaderError.invalidResponse }
     }
     private struct Wire: Decodable {
@@ -444,7 +519,8 @@ struct AtlasObservedReaderSearchWitness: Sendable {
         if page.findHit != nil {
             do {
                 try validateVerifiedContext(page)
-                return .verified(selection: page.verifiedSearchSelection)
+                return mode == .expression ? .expressionPrimaryVerified(selection: page.verifiedSearchSelection)
+                    : .verified(selection: page.verifiedSearchSelection)
             } catch { return .unavailable }
         }
         guard page.observation.identity == target.identity, page.observation.id > target.observation,
@@ -455,6 +531,9 @@ struct AtlasObservedReaderSearchWitness: Sendable {
         // An ordinary current window verifies bytes only. Identifier token
         // boundaries require the shared engine's explicit observe-hit action.
         if mode == .occurrences, case .verified = result { return .tokenBoundariesUnverified }
+        if mode == .expression, case .verified(let selection) = result {
+            return .expressionPrimaryVerified(selection: selection)
+        }
         return result
     }
 
@@ -472,7 +551,12 @@ struct AtlasObservedReaderSearchWitness: Sendable {
               page.verifiedSearchSelection != nil,
               (mode != .occurrences || (selected.mode == "whole-token-occurrences"
                 && selected.caseSensitive == true && selected.tokenBoundariesVerified == true)),
-              (mode != .text || selected.mode != "whole-token-occurrences") else { throw AtlasObservedReaderError.invalidResponse }
+              (mode != .expression || (selected.mode == "decoded-text-expression"
+                && selected.caseSensitive == caseSensitive && selected.tokenBoundariesVerified == false
+                && expression != nil && selected.expression == expression)),
+              (mode != .text || (selected.mode != "whole-token-occurrences" && selected.expression == nil)) else {
+            throw AtlasObservedReaderError.invalidResponse
+        }
         let start = Int(target.hit.range.start - page.visibleRange.start) * 2
         let count = Int(target.hit.range.count) * 2
         let raw = Array(page.originalHex.utf8), decoded = Array(page.text.utf8)
@@ -544,8 +628,10 @@ struct AtlasObservedReaderExternalMatch: Sendable {
 }
 
 enum AtlasObservedReaderSearchContext: Equatable, Sendable {
-    case verified(selection: NSRange?), changed, unavailable, tokenBoundariesUnverified
-    var selection: NSRange? { if case .verified(let range) = self { return range }; return nil }
+    case verified(selection: NSRange?), expressionPrimaryVerified(selection: NSRange?), changed, unavailable, tokenBoundariesUnverified
+    var selection: NSRange? {
+        switch self { case .verified(let range), .expressionPrimaryVerified(let range): range; default: nil }
+    }
     var message: String {
         switch self {
         case .verified(let selection):
@@ -553,6 +639,9 @@ enum AtlasObservedReaderSearchContext: Equatable, Sendable {
                 ? "The matching bytes still agree in this new observation. An exact native text selection could not be verified."
                 : "Matching bytes verified in this new observation and selected. Surrounding context was read now; it was not retained by the earlier search."
         case .tokenBoundariesUnverified: return "Matching bytes still agree, but whole-token boundaries were not rechecked. Use Go to verified match to verify this identifier in current context."
+        case .expressionPrimaryVerified(let selection):
+            return "Primary literal bytes still agree in this new observation. Other required and excluded terms belong to the original search observation and were not rechecked."
+                + (selection == nil ? " An exact native selection is unavailable." : " The primary literal is selected.")
         case .changed: return "The bytes at this result changed. Current context is shown without an old-match highlight; the retained literal remains available."
         case .unavailable: return "The result range is unavailable in this new observation. No old-match highlight was applied."
         }
@@ -592,7 +681,63 @@ private struct AtlasObservedReaderModeEvidence: Decodable {
                   compiler_resolved == false, semantic_complete == false else {
                 throw AtlasObservedReaderError.invalidResponse
             }
+        } else if mode == .expression {
+            guard requested_mode == "expression", realized_mode == "decoded-text-expression",
+                  compiler_resolved != true, semantic_complete != true else {
+                throw AtlasObservedReaderError.invalidResponse
+            }
         }
+    }
+}
+
+/// Expression proof is atomic, including the explicitly nullable qualification.
+/// Reject stray fields on literal/identifier routes so their witnesses cannot
+/// acquire expression authority through a partially populated receipt.
+private struct AtlasObservedReaderExpressionEvidence: Decodable {
+    private let anyPresent, allPresent, revalidationPresent: Bool
+    private let expression, primary_needle, query_syntax, predicate_scope: String?
+    private let expression_qualified, expression_revalidated: Bool?
+    private let needle: String?
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let required: [CodingKeys] = [.expression, .primary_needle, .query_syntax, .predicate_scope, .expression_qualified]
+        anyPresent = required.contains { c.contains($0) } || c.contains(.expression_revalidated)
+        allPresent = required.allSatisfy { c.contains($0) }
+        revalidationPresent = c.contains(.expression_revalidated)
+        expression = try c.decodeIfPresent(String.self, forKey: .expression)
+        primary_needle = try c.decodeIfPresent(String.self, forKey: .primary_needle)
+        query_syntax = try c.decodeIfPresent(String.self, forKey: .query_syntax)
+        predicate_scope = try c.decodeIfPresent(String.self, forKey: .predicate_scope)
+        expression_qualified = try c.decodeIfPresent(Bool.self, forKey: .expression_qualified)
+        expression_revalidated = try c.decodeIfPresent(Bool.self, forKey: .expression_revalidated)
+        needle = try c.decodeIfPresent(String.self, forKey: .needle)
+    }
+
+    func validate(mode: AtlasObservedReaderSearchMode, query: String? = nil, primary: String? = nil,
+                  scope: String, requireNeedle: Bool = false) throws -> AtlasObservedReaderExpression? {
+        guard mode == .expression else {
+            guard !anyPresent else { throw AtlasObservedReaderError.invalidResponse }
+            return nil
+        }
+        guard allPresent, let expression, let primary_needle,
+              !expression.isEmpty, !primary_needle.isEmpty,
+              expression.utf8.count <= AtlasObservedReaderSearchLimits.expressionBytes,
+              primary_needle.utf8.count <= AtlasObservedReaderSearchLimits.expressionBytes,
+              !expression.utf8.contains(0), !primary_needle.utf8.contains(0),
+              query.map({ $0.utf8.elementsEqual(expression.utf8) }) ?? true,
+              primary.map({ $0.utf8.elementsEqual(primary_needle.utf8) }) ?? true,
+              query_syntax == "fcb-bounded-expression/1", predicate_scope == scope,
+              !requireNeedle || needle?.utf8.elementsEqual(expression.utf8) == true,
+              needle.map({ $0.utf8.elementsEqual(expression.utf8) }) ?? true,
+              scope == "original-search-observation"
+                ? (revalidationPresent && expression_revalidated == false) : !revalidationPresent else {
+            throw AtlasObservedReaderError.invalidResponse
+        }
+        return .init(query: expression, primaryNeedle: primary_needle, qualified: expression_qualified)
+    }
+    private enum CodingKeys: CodingKey {
+        case expression, primary_needle, query_syntax, predicate_scope, expression_qualified, expression_revalidated, needle
     }
 }
 
