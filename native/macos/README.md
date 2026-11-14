@@ -369,6 +369,31 @@ They execute the actual packaging scripts with fake compiler/signing tools and
 retain their fixture logs. They establish packaging control flow, not native
 compilation, code-signing validity, Launch Services behavior or rendering.
 
+## Saving the current project
+
+Open **Saved Repository → Save current project…** to choose a new FCBS archive
+destination. The action captures current on-disk observations using repository
+ignore rules, with limits of 20,000 known files, 1 MiB per member and 64 MiB of
+total captured source. Source bytes and filenames are stored as plaintext. The
+receipt reports captured and unavailable members, discovery coverage and the
+actual destination effect, including when cancellation arrives after writing.
+Existing destinations are never overwritten. **Open saved archive** opens the
+completed saved observation independently of subsequent live edits.
+
+The shared native/CLI writer now releases unused capture quota and temporary
+handoff reservations after all capture callbacks finish. FCBS encoding writes
+directly into one exactly reserved final envelope, retaining the existing
+canonical format and checksum. This removes the former four-times-archive
+reservation and duplicate output buffer without raising the 256 MiB managed
+budget or the source limits. Capture work still reserves its full working
+overlap before reading; unavailable members remain explicit.
+
+`crates/fcb-app/tests/snapshot_export_capacity.rs` exercises the production host
+at the 64 MiB source limit, opens the saved final member after a live edit, and
+checks that a smaller requested quota still produces a partial archive. Codec
+and capture-ledger regressions accompany it. These are unexecuted code-first
+regressions; independent batch verification remains pending.
+
 ## Finding filenames in a saved repository
 
 Open an FCBS archive in **Saved Repository** and use **Find filename or path**

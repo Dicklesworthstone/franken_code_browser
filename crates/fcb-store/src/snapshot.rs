@@ -8,8 +8,9 @@
 
 use std::mem::size_of;
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
-use crate::{EnvelopeLimits, EnvelopeReader, EnvelopeSchema, EnvelopeWriter, Sha256Digest,
+use crate::{EnvelopeLimits, EnvelopeReader, EnvelopeSchema, Sha256, Sha256Digest,
     UnknownPolicy, CHECKSUM_LEN, FRAME_LEN};
+use crate::envelope::{ExactEnvelopeError, ExactEnvelopeWriter};
 
 pub const SNAPSHOT_SCHEMA: EnvelopeSchema = EnvelopeSchema::with_magic(*b"FCBS", 0x53524331, 1, 0);
 pub const MAX_SNAPSHOT_BYTES: usize = 80 * 1024 * 1024;
@@ -67,6 +68,12 @@ impl std::error::Error for SnapshotError {}
 impl From<crate::EnvelopeError> for SnapshotError {
     fn from(_: crate::EnvelopeError) -> Self { Self::Envelope }
 }
+impl From<ExactEnvelopeError> for SnapshotError {
+    fn from(error: ExactEnvelopeError) -> Self {
+        match error { ExactEnvelopeError::Length => Self::Envelope,
+            ExactEnvelopeError::Allocation => Self::ResourceDenied, ExactEnvelopeError::Canceled => Self::Canceled }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SnapshotData<'a> { Captured(&'a [u8]), Unavailable(&'a str) }
@@ -90,8 +97,9 @@ impl SnapshotBytes {
     }
 
     /// Two bounded passes, first validating all lengths/order before building.
-    /// The reservation conservatively covers the existing envelope writer's
-    /// growing payload and final-document overlap. This is explicit worker work.
+    /// The existing canonical envelope codec writes directly into one admitted
+    /// final buffer. No growing payload or second whole-archive copy overlaps
+    /// the retained captures. This is explicit, cancellable worker work.
     pub fn encode(owner: ArenaOwnerId, discovery_complete: bool, policy: &str,
         entries: &[SnapshotEntry<'_>], limits: SnapshotLimits, budget: &ResourceBudget,
         allocation: ResourceAllocationId, mut canceled: impl FnMut() -> bool) -> Result<Self, SnapshotError> {
@@ -109,26 +117,26 @@ impl SnapshotBytes {
         }
         if length > limits.max_document_bytes { return Err(SnapshotError::Limit); }
         if canceled() { return Err(SnapshotError::Canceled); }
-        let charge = length.checked_mul(4).and_then(|n| n.checked_add(size_of::<Self>()))
+        let charge = length.checked_add(size_of::<Self>() + size_of::<ExactEnvelopeWriter>() + size_of::<Sha256>())
             .ok_or(SnapshotError::Limit)?;
         let lease = budget.try_reserve_managed(owner, allocation, ByteLength::new(charge as u64))
             .map_err(|_| SnapshotError::ResourceDenied)?;
-        let mut writer = EnvelopeWriter::new(SNAPSHOT_SCHEMA);
-        writer.put_u8(u8::from(discovery_complete));
-        writer.put_u8(1); // Native Unix relative path bytes, not Unicode or a URI.
-        writer.put_u64(entries.len() as u64);
-        writer.put_str(policy);
+        let mut writer = ExactEnvelopeWriter::new(SNAPSHOT_SCHEMA, length - FRAME_LEN)?;
+        writer.put_u8(u8::from(discovery_complete))?;
+        writer.put_u8(1)?; // Native Unix relative path bytes, not Unicode or a URI.
+        writer.put_u64(entries.len() as u64)?;
+        writer.put_str(policy)?;
         for entry in entries {
             if canceled() { return Err(SnapshotError::Canceled); }
-            writer.put_bytes(entry.path);
-            writer.put_u64(entry.observed_bytes);
+            writer.put_bytes(entry.path)?;
+            writer.put_u64(entry.observed_bytes)?;
             match entry.data {
-                SnapshotData::Captured(bytes) => { writer.put_u8(1); writer.put_bytes(bytes); }
-                SnapshotData::Unavailable(reason) => { writer.put_u8(0); writer.put_str(reason); }
+                SnapshotData::Captured(bytes) => { writer.put_u8(1)?; writer.put_bytes(bytes)?; }
+                SnapshotData::Unavailable(reason) => { writer.put_u8(0)?; writer.put_str(reason)?; }
             }
         }
-        let bytes = writer.finish();
-        if bytes.len() != length || bytes.capacity() > charge { return Err(SnapshotError::ResourceDenied); }
+        let bytes = writer.finish(&mut canceled)?;
+        if bytes.len() != length || bytes.capacity() != length { return Err(SnapshotError::ResourceDenied); }
         if canceled() { return Err(SnapshotError::Canceled); }
         Ok(Self { bytes, _lease: lease })
     }
@@ -322,6 +330,51 @@ mod tests {
         let result = SnapshotBytes::encode(owner(), true, "test-v1", &[], SnapshotLimits::default(), &budget,
             ResourceAllocationId::new(1).unwrap(), || budget.accounting().reserved().get() > 0);
         assert!(matches!(result, Err(SnapshotError::Canceled)));
+        assert_eq!(budget.accounting().reserved().get(), 0);
+    }
+
+    #[test]
+    fn a_snapshot_needs_only_one_final_archive_buffer_beside_its_borrowed_sources() {
+        let source = vec![0x5a; 1024 * 1024];
+        // The source is caller-owned. This budget admits one encoded archive
+        // and bounded bookkeeping, but cannot admit a duplicate source-sized
+        // payload or the previous four-times-archive reservation.
+        let budget = ResourceBudget::new(owner(), ByteLength::new((source.len() + 4096) as u64)).unwrap();
+        let entries = [SnapshotEntry { path: b"source.bin", observed_bytes: source.len() as u64,
+            data: SnapshotData::Captured(&source) }];
+        let encoded = encode(&entries, true, &budget).unwrap();
+        assert_eq!(encoded.bytes.capacity(), encoded.bytes.len());
+        assert!(budget.accounting().peak_reserved().get() < (source.len() + 1024) as u64);
+        let view = SnapshotView::open(encoded.bytes(), SnapshotLimits::default(), || false).unwrap();
+        assert_eq!(view.entries().next().unwrap().unwrap(), entries[0]);
+        let archive_bytes = encoded.bytes.len();
+        drop(encoded);
+        assert_eq!(budget.accounting().reserved().get(), 0);
+
+        let insufficient = ResourceBudget::new(owner(), ByteLength::new(archive_bytes as u64 - 1)).unwrap();
+        assert!(matches!(encode(&entries, true, &insufficient), Err(SnapshotError::ResourceDenied)));
+        assert_eq!(insufficient.accounting().reserved().get(), 0);
+        let limits = SnapshotLimits { max_source_bytes: source.len() - 1, ..SnapshotLimits::default() };
+        assert!(matches!(SnapshotBytes::encode(owner(), true, "test-policy-v1", &entries, limits,
+            &budget, ResourceAllocationId::new(2).unwrap(), || false), Err(SnapshotError::Limit)));
+        assert_eq!(budget.accounting().reserved().get(), 0);
+    }
+
+    #[test]
+    fn cancellation_during_final_archive_hashing_releases_the_only_output_buffer() {
+        let source = vec![0x5a; 3 * 64 * 1024];
+        let budget = budget();
+        let entries = [SnapshotEntry { path: b"source.bin", observed_bytes: source.len() as u64,
+            data: SnapshotData::Captured(&source) }];
+        let mut after_admission = 0;
+        let result = SnapshotBytes::encode(owner(), true, "test-policy-v1", &entries, SnapshotLimits::default(),
+            &budget, ResourceAllocationId::new(1).unwrap(), || {
+                if budget.accounting().reserved().get() == 0 { return false; }
+                after_admission += 1;
+                after_admission == 3 // encoded entry, first hash chunk, next hash chunk
+            });
+        assert!(matches!(result, Err(SnapshotError::Canceled)));
+        assert_eq!(after_admission, 3);
         assert_eq!(budget.accounting().reserved().get(), 0);
     }
 }

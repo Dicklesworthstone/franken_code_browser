@@ -301,7 +301,9 @@ impl<'catalog> WorkspaceCaptures<'catalog> {
             .map_err(|_| WorkspaceError::ResourceDenied)?;
         let mut slots = reserve(catalog.entries.len())?;
         slots.resize_with(catalog.entries.len(), || CaptureSlot::Pending);
-        Ok(Self { catalog, first_revision, slots, next: 0, bytes: 0, canceled: false, _lease: lease })
+        let captures = Self { catalog, first_revision, slots, next: 0, bytes: 0, canceled: false, _lease: lease };
+        if captures.finished() { captures.reconcile_retained()?; }
+        Ok(captures)
     }
     pub fn catalog(&self) -> &'catalog WorkspaceCatalog { self.catalog }
     pub const fn captured_bytes(&self) -> usize { self.bytes }
@@ -347,7 +349,26 @@ impl<'catalog> WorkspaceCaptures<'catalog> {
         if cancel.is_canceled() { self.cancel(); return Err(WorkspaceError::Canceled); }
         self.catalog.validate_active()?;
         if let CaptureSlot::Ready(captured) = &slot { self.bytes += captured.bytes().len(); }
-        self.slots[self.next] = slot; self.next += 1; Ok(self.finished())
+        self.slots[self.next] = slot;
+        self.next += 1;
+        if self.finished() {
+            // The host callback has returned and its temporary source buffers
+            // have dropped. Only immutable accepted Arc bytes and the bounded
+            // slot table remain. Return unused quota and capture-copy headroom
+            // before a subsequent index/export reserves its own overlap.
+            self.reconcile_retained()?;
+        }
+        Ok(self.finished())
+    }
+    fn reconcile_retained(&self) -> Result<(), WorkspaceError> {
+        debug_assert!(self.finished());
+        // Arc<[u8]> has no spare byte capacity. Keep the same conservative
+        // per-slot metadata allowance, now using actual retained Vec capacity.
+        // Hosts still own separate leases for captures cloned out of this owner.
+        let charge = self.slots.capacity().checked_mul(size_of::<CaptureSlot>() + 32)
+            .and_then(|n| n.checked_add(self.bytes))
+            .and_then(|n| n.checked_add(size_of::<Self>())).ok_or(WorkspaceError::InvalidLimits)?;
+        self._lease.reconcile(ByteLength::new(charge as u64)).map_err(|_| WorkspaceError::ResourceDenied)
     }
     /// Pending/unavailable slots and incomplete policies prevent completeness.
     /// Input vectors own their lease and borrow the retained captures.

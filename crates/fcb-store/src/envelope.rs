@@ -424,15 +424,7 @@ impl EnvelopeWriter {
         let payload_len = self.payload.len() as u64;
         let total_doc_len = HEADER_LEN + self.payload.len() + CHECKSUM_LEN;
         let mut document = Vec::with_capacity(total_doc_len);
-
-        // Header: 24 bytes
-        document.extend_from_slice(&self.schema.magic);
-        document.extend_from_slice(&self.schema.schema_id.to_le_bytes());
-        document.extend_from_slice(&self.schema.major.to_le_bytes());
-        document.extend_from_slice(&self.schema.minor.to_le_bytes());
-        document.extend_from_slice(&0u16.to_le_bytes()); // flags
-        document.extend_from_slice(&0u16.to_le_bytes()); // reserved
-        document.extend_from_slice(&payload_len.to_le_bytes());
+        append_header(&mut document, self.schema, payload_len);
 
         // Payload
         document.extend_from_slice(&self.payload);
@@ -442,6 +434,84 @@ impl EnvelopeWriter {
         document.extend_from_slice(checksum.as_bytes());
 
         document
+    }
+}
+
+/// One canonical header implementation for growing and exactly sized writers.
+fn append_header(document: &mut Vec<u8>, schema: EnvelopeSchema, payload_len: u64) {
+    document.extend_from_slice(&schema.magic);
+    document.extend_from_slice(&schema.schema_id.to_le_bytes());
+    document.extend_from_slice(&schema.major.to_le_bytes());
+    document.extend_from_slice(&schema.minor.to_le_bytes());
+    document.extend_from_slice(&0u16.to_le_bytes()); // flags
+    document.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    document.extend_from_slice(&payload_len.to_le_bytes());
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExactEnvelopeError { Length, Allocation, Canceled }
+
+/// Internal two-pass encoders know their validated payload length before any
+/// output is allocated. Fill ONE final envelope buffer rather than retaining a
+/// growing payload and then allocating another complete document at finish.
+/// All writes are checked against the declared payload; none can grow capacity.
+/// The caller admits the full document capacity before construction.
+pub(crate) struct ExactEnvelopeWriter {
+    document: Vec<u8>,
+    payload_end: usize,
+}
+impl ExactEnvelopeWriter {
+    pub(crate) fn new(schema: EnvelopeSchema, payload_len: usize) -> Result<Self, ExactEnvelopeError> {
+        let length = payload_len.checked_add(FRAME_LEN).ok_or(ExactEnvelopeError::Length)?;
+        let payload_end = length - CHECKSUM_LEN;
+        let payload_len = u64::try_from(payload_len).map_err(|_| ExactEnvelopeError::Length)?;
+        let mut document = Vec::new();
+        document.try_reserve_exact(length).map_err(|_| ExactEnvelopeError::Allocation)?;
+        if document.capacity() != length { return Err(ExactEnvelopeError::Allocation); }
+        append_header(&mut document, schema, payload_len);
+        Ok(Self { document, payload_end })
+    }
+
+    fn admit(&self, bytes: usize) -> Result<(), ExactEnvelopeError> {
+        if bytes > self.payload_end - self.document.len() { return Err(ExactEnvelopeError::Length); }
+        Ok(())
+    }
+    pub(crate) fn put_u8(&mut self, value: u8) -> Result<(), ExactEnvelopeError> {
+        self.admit(1)?;
+        self.document.push(value);
+        Ok(())
+    }
+    pub(crate) fn put_u64(&mut self, value: u64) -> Result<(), ExactEnvelopeError> {
+        self.admit(8)?;
+        self.document.extend_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+    pub(crate) fn put_bytes(&mut self, bytes: &[u8]) -> Result<(), ExactEnvelopeError> {
+        // Admit the length prefix and data together; a refused field leaves the
+        // cursor and document unchanged and cannot spend unreserved capacity.
+        let field_len = bytes.len().checked_add(8).ok_or(ExactEnvelopeError::Length)?;
+        let byte_len = u64::try_from(bytes.len()).map_err(|_| ExactEnvelopeError::Length)?;
+        self.admit(field_len)?;
+        self.document.extend_from_slice(&byte_len.to_le_bytes());
+        self.document.extend_from_slice(bytes);
+        Ok(())
+    }
+    pub(crate) fn put_str(&mut self, text: &str) -> Result<(), ExactEnvelopeError> {
+        self.put_bytes(text.as_bytes())
+    }
+    pub(crate) fn finish(mut self, mut canceled: impl FnMut() -> bool) -> Result<Vec<u8>, ExactEnvelopeError> {
+        if self.document.len() != self.payload_end { return Err(ExactEnvelopeError::Length); }
+        let mut digest = Sha256::new();
+        // This is the same canonical checksum, with cancellation checkpoints
+        // during large archives. Borrowed chunks allocate no hash/source copy.
+        for chunk in self.document.chunks(64 * 1024) {
+            if canceled() { return Err(ExactEnvelopeError::Canceled); }
+            digest.update(chunk);
+        }
+        if canceled() { return Err(ExactEnvelopeError::Canceled); }
+        self.document.extend_from_slice(digest.finalize().as_bytes());
+        debug_assert_eq!(self.document.len(), self.document.capacity());
+        Ok(self.document)
     }
 }
 
@@ -639,5 +709,51 @@ impl<'a> EnvelopeReader<'a> {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod exact_writer_tests {
+    use super::*;
+
+    #[test]
+    fn exact_writer_matches_the_existing_codec_without_changing_capacity() {
+        let schema = EnvelopeSchema::with_magic(*b"TEST", 7, 2, 1);
+        let bytes = b"raw\xff\0bytes";
+        let mut reference = EnvelopeWriter::new(schema);
+        reference.put_u8(1); reference.put_u64(u64::MAX); reference.put_bytes(bytes); reference.put_str("text");
+        let expected = reference.finish();
+        let mut writer = ExactEnvelopeWriter::new(schema, expected.len() - FRAME_LEN).unwrap();
+        let capacity = writer.document.capacity();
+        writer.put_u8(1).unwrap(); writer.put_u64(u64::MAX).unwrap();
+        writer.put_bytes(bytes).unwrap(); writer.put_str("text").unwrap();
+        assert_eq!(writer.document.capacity(), capacity);
+        let actual = writer.finish(|| false).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.capacity(), actual.len());
+    }
+
+    #[test]
+    fn mismatched_lengths_are_refused_before_an_unadmitted_write() {
+        assert!(matches!(ExactEnvelopeWriter::new(EnvelopeSchema::new(1, 1, 0), usize::MAX), Err(ExactEnvelopeError::Length)));
+        let mut writer = ExactEnvelopeWriter::new(EnvelopeSchema::new(1, 1, 0), 9).unwrap();
+        let before = writer.document.clone();
+        assert_eq!(writer.put_bytes(b"xx"), Err(ExactEnvelopeError::Length));
+        assert_eq!(writer.document, before);
+        assert!(matches!(writer.finish(|| false), Err(ExactEnvelopeError::Length)));
+        let mut writer = ExactEnvelopeWriter::new(EnvelopeSchema::new(1, 1, 0), 1).unwrap();
+        writer.put_u8(0).unwrap();
+        assert_eq!(writer.put_u8(1), Err(ExactEnvelopeError::Length));
+        assert!(writer.finish(|| false).is_ok());
+    }
+
+    #[test]
+    fn final_checksum_work_can_be_canceled_between_bounded_chunks() {
+        let bytes = vec![0x5a; 3 * 64 * 1024];
+        let mut writer = ExactEnvelopeWriter::new(EnvelopeSchema::new(1, 1, 0), bytes.len() + 8).unwrap();
+        writer.put_bytes(&bytes).unwrap();
+        let mut polls = 0;
+        assert!(matches!(writer.finish(|| { polls += 1; polls == 2 }), Err(ExactEnvelopeError::Canceled)));
+        assert_eq!(polls, 2);
     }
 }
