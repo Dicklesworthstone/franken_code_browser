@@ -52,6 +52,7 @@ pub(super) struct AcceptedSearch {
     state: StreamReadState,
     io: StreamReadStats,
     matches_seen: u64,
+    page_start_after: u64,
     count_all_matches: bool,
     kind: ObservedReaderSearchKind,
     case_sensitive: bool,
@@ -76,6 +77,7 @@ pub(super) struct FindHit {
     case_sensitive: bool,
     generation: u64,
     search_observation: u64,
+    page_start_after: u64,
     hit_index: usize,
     occurrence: u64,
     original_range: ByteRange,
@@ -104,7 +106,7 @@ impl ObservedReaderSession {
         max_matches: usize, max_scan_bytes: u64, canceled: impl FnMut() -> bool)
         -> Result<HostResponse, ObservedReaderError> {
         self.search_inner(generation, needle, encoding, ObservedReaderSearchKind::Text,
-            max_matches, max_scan_bytes, true, false, canceled)
+            max_matches, max_scan_bytes, true, false, 0, canceled)
     }
 
     /// Count every exact occurrence within the same byte/read-call budgets while
@@ -113,7 +115,7 @@ impl ObservedReaderSession {
         max_matches: usize, max_scan_bytes: u64, canceled: impl FnMut() -> bool)
         -> Result<HostResponse, ObservedReaderError> {
         self.search_inner(generation, needle, encoding, ObservedReaderSearchKind::Text,
-            max_matches, max_scan_bytes, true, true, canceled)
+            max_matches, max_scan_bytes, true, true, 0, canceled)
     }
 
     /// Search with an explicit frozen matching/count policy. Lowercase matching
@@ -135,12 +137,25 @@ impl ObservedReaderSession {
         max_matches: usize, max_scan_bytes: u64, canceled: impl FnMut() -> bool)
         -> Result<HostResponse, ObservedReaderError> {
         self.search_inner(generation, needle, encoding, kind, max_matches, max_scan_bytes,
-            case_sensitive, count_all_matches, canceled)
+            case_sensitive, count_all_matches, 0, canceled)
+    }
+
+    /// Rescan the current opened file and retain matches after `start_after`
+    /// whole-input occurrences. Replaying from byte zero keeps decoding,
+    /// overlapping matches and token boundaries exact under the same budgets.
+    /// Every call consumes a fresh generation/observation; separate pages are
+    /// not one immutable search and may differ after live source edits.
+    pub fn find_page(&mut self, generation: u64, needle: &str, encoding: ObservedReaderEncoding,
+        kind: ObservedReaderSearchKind, case_sensitive: bool, count_all_matches: bool,
+        start_after: u64, max_matches: usize, max_scan_bytes: u64,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, ObservedReaderError> {
+        self.search_inner(generation, needle, encoding, kind, max_matches, max_scan_bytes,
+            case_sensitive, count_all_matches, start_after, canceled)
     }
 
     fn search_inner(&mut self, generation: u64, needle: &str, encoding: ObservedReaderEncoding,
         kind: ObservedReaderSearchKind, max_matches: usize, max_scan_bytes: u64,
-        case_sensitive: bool, count_all_matches: bool,
+        case_sensitive: bool, count_all_matches: bool, start_after: u64,
         mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, ObservedReaderError> {
         if generation == 0 || generation <= self.last_query_attempt { return Err(ObservedReaderError::StaleQuery); }
@@ -178,7 +193,7 @@ impl ObservedReaderSession {
         check(&mut canceled)?;
         let file = self.search_file.try_clone().map_err(|_| AppError::Io)?;
         let (scanned, io) = scan(file, request, &pattern, options, &self.budget, worker_id,
-            count_all_matches, &mut canceled);
+            start_after, count_all_matches, &mut canceled);
         self.source_bytes_read += io.bytes_read; // Headroom was admitted above.
         self.read_calls += io.read_calls;
         let report = scanned?;
@@ -267,6 +282,7 @@ impl ObservedReaderSession {
         }
         candidate.find_hit = Some(FindHit { kind: query.kind, case_sensitive: query.case_sensitive,
             generation, search_observation: query.request.revision().get(),
+            page_start_after: query.page_start_after,
             hit_index, occurrence: hit.occurrence_id(), original_range: original,
             decoded_start: decoded.start().get(), decoded_end: decoded.end().get() });
         let response = self.page_response_decoded("observe-hit", &candidate, &text, true, &mut canceled)?;
@@ -348,6 +364,7 @@ pub(super) fn encode_find_hit(out: &mut Output, hit: Option<FindHit>) -> Result<
     let Some(hit) = hit else { out.literal("null")?; return Ok(()); };
     out.literal("{\"query_generation\":")?; out.integer(hit.generation)?;
     out.literal(",\"search_observation\":")?; out.integer(hit.search_observation)?;
+    out.literal(",\"page_start_after\":")?; out.integer(hit.page_start_after)?;
     out.literal(",\"hit_index\":")?; out.integer(hit.hit_index as u64)?;
     out.literal(",\"occurrence_id\":")?; out.integer(hit.occurrence)?;
     out.literal(",\"original_range\":")?; out.range(hit.original_range)?;
@@ -434,6 +451,7 @@ impl AcceptedSearch {
             observed_length: search.observed_length(), final_length: report.final_length(),
             consistency: report.consistency(), state: search.state(), io: search.stats(),
             matches_seen: search.matches_seen(), count_all_matches: search.count_all_matches(), kind, case_sensitive,
+            page_start_after: search.page_start_after(),
             unsupported_at: search.unsupported_at(), max_matches, max_scan_bytes,
             literal_text, literal_bytes, sha256, witnesses, hits, _lease: lease })
     }
@@ -456,16 +474,13 @@ impl AcceptedSearch {
 
 fn scan<'needle>(file: File, request: CaptureRequest, needle: &'needle StreamingNeedle,
     options: StreamReadOptions, budget: &ResourceBudget, allocation: ResourceAllocationId,
-    count_all_matches: bool, canceled: &mut impl FnMut() -> bool)
+    start_after: u64, count_all_matches: bool, canceled: &mut impl FnMut() -> bool)
     -> (Result<FileSearchReport<'needle>, ObservedReaderError>, StreamReadStats) {
     let mut io = StreamReadStats::default();
     let result = (|| {
         check(canceled)?;
-        let mut scan = if count_all_matches {
-            FileSearch::new_counting(file, request, needle, options, budget, allocation)
-        } else {
-            FileSearch::new(file, request, needle, options, budget, allocation)
-        }.map_err(AppError::from)?;
+        let mut scan = FileSearch::new_page(file, request, needle, options,
+            start_after, count_all_matches, budget, allocation).map_err(AppError::from)?;
         while scan.state() == StreamReadState::Pending {
             let step = scan.step(StreamReadStep::default(), options.generation, &mut *canceled);
             io = scan.stats(); // Include attempted I/O even if this step fails.
@@ -495,6 +510,10 @@ fn encode_query(out: &mut Output, query: &AcceptedSearch) -> Result<(), Observed
     encode_mode(out, query.kind, query.case_sensitive)?;
     out.literal(",\"query_generation\":")?; out.integer(query.generation.get())?;
     out.literal(",\"search_observation\":")?; out.integer(query.request.revision().get())?;
+    out.literal(",\"page_start_after\":")?; out.integer(query.page_start_after)?;
+    out.literal(",\"skipped_matches\":")?; out.integer(query.page_start_after.min(query.matches_seen))?;
+    out.literal(",\"page_has_more_matches\":")?;
+    out.boolean(query.matches_seen.saturating_sub(query.page_start_after) > query.hits.len() as u64)?;
     out.literal(",\"encoding\":")?; out.quoted(query.encoding.code())?;
     out.literal(",\"encoding_basis\":\"explicit-for-this-search\",\"retention\":\"literal-witnesses-only\",\"observed_length\":")?;
     out.integer(query.observed_length.get())?;

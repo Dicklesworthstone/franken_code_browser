@@ -284,3 +284,95 @@ fn c_occurrence_mode_rejects_unknown_flags_invalid_names_and_canceled_replacemen
     assert!(lower.contains("\"mode\":\"unicode-lowercase-text\""));
     assert_eq!(fcb_observed_reader_close(handle), 1);
 }
+
+fn find_page(handle: u64, generation: u64, needle: &str, encoding: u64, mode: u64,
+    case_sensitive: u64, count_all_matches: u64, start_after: u64, hits: u64, bytes: u64) -> String {
+    let needle = CString::new(needle).unwrap();
+    take(unsafe { fcb_observed_reader_find_page(handle, generation, needle.as_ptr(), encoding,
+        mode, case_sensitive, count_all_matches, start_after, hits, bytes, None, std::ptr::null_mut()) })
+}
+
+#[test]
+fn c_find_page_reaches_later_occurrences_and_retains_page_provenance_in_history() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (root, croot) = root();
+    fs::write(root.join("source"), b"cat ".repeat(300)).unwrap();
+    let handle = open(&croot);
+    let first = find_mode(handle, 1, "cat", 1, 1, 1, 0, 256, 4096);
+    assert_eq!(number(&first, "page_start_after"), 0);
+    assert_eq!(number(&first, "skipped_matches"), 0);
+    assert!(first.contains("\"page_has_more_matches\":true"));
+    let later = find_page(handle, 2, "cat", 1, 1, 1, 1, 256, 256, 4096);
+    assert!(later.contains("\"search_complete\":true"), "{later}");
+    assert!(later.contains("\"mode\":\"whole-token-occurrences\""));
+    assert!(later.contains("\"count_all_matches\":true"));
+    assert!(later.contains("\"truncated\":true"));
+    assert!(later.contains("\"page_has_more_matches\":false"));
+    assert_eq!(number(&later, "page_start_after"), 256);
+    assert_eq!(number(&later, "skipped_matches"), 256);
+    assert_eq!(number(&later, "matches_seen"), 300);
+    assert_eq!(number(&later, "retained_hits"), 44);
+    assert_eq!(number(&later, "occurrence_id"), 257);
+    assert!(number(&later, "search_observation") > number(&first, "search_observation"));
+
+    let literal = take(fcb_observed_reader_search_hit(handle, 2, 43));
+    assert_eq!(number(&literal, "page_start_after"), 256);
+    assert_eq!(number(&literal, "occurrence_id"), 300);
+    assert!(literal.contains("\"original_hex\":\"636174\""));
+    assert!(literal.contains("\"additional_source_bytes_read\":\"0\""));
+    let selected = hit(handle, 2, 43);
+    let observation = number(&selected, "observation");
+    assert_eq!(number(&selected, "page_start_after"), 256);
+    assert_eq!(number(&selected, "hit_index"), 43);
+    assert_eq!(number(&selected, "occurrence_id"), 300);
+    assert!(selected.contains("\"token_boundaries_verified\":true"));
+    assert_eq!(number(&find_page(handle, 3, "cat", 1, 0, 1, 0, 0, 1, 4096), "page_start_after"), 0);
+    let replay = take(fcb_observed_reader_retained(handle, observation));
+    assert_eq!(number(&replay, "page_start_after"), 256);
+    assert_eq!(number(&replay, "query_generation"), 2);
+    assert_eq!(number(&replay, "occurrence_id"), 300);
+    assert!(replay.contains("\"additional_source_bytes_read\":\"0\""));
+    assert_eq!(fcb_observed_reader_close(handle), 1);
+}
+
+#[test]
+fn c_find_page_preserves_limits_lowercase_utf16_and_canceled_accepted_results() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (root, croot) = root();
+    let bytes: Vec<u8> = "\u{feff}K K k".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    fs::write(root.join("source"), &bytes).unwrap();
+    let handle = open(&croot);
+    let lower = find_page(handle, 1, "k", 2, 0, 0, 1, 1, 1, 1024);
+    assert!(lower.contains("\"mode\":\"unicode-lowercase-text\""), "{lower}");
+    assert_eq!(number(&lower, "page_start_after"), 1);
+    assert_eq!(number(&lower, "matches_seen"), 3);
+    assert_eq!(number(&lower, "retained_hits"), 1);
+    assert!(lower.contains("\"page_has_more_matches\":true"));
+    let witness = take(fcb_observed_reader_search_hit(handle, 1, 0));
+    assert!(witness.contains("\"original_hex\":\"4b00\""));
+    assert_eq!(number(&witness, "occurrence_id"), 2);
+    for (mode, case_sensitive, count_all) in [(2, 1, 0), (0, 2, 0), (0, 1, 2)] {
+        let invalid = find_page(handle, 2, "k", 2, mode, case_sensitive, count_all, 2, 1, 1024);
+        assert!(invalid.contains("OBSERVED_READER_HANDLE_INVALID_ARGUMENT"), "{invalid}");
+    }
+    let needle = CString::new("k").unwrap();
+    let canceled = take(unsafe { fcb_observed_reader_find_page(handle, 2, needle.as_ptr(),
+        2, 0, 0, 1, 2, 1, 1024, Some(cancel_now), std::ptr::null_mut()) });
+    assert!(canceled.contains("\"exit_code\":\"130\""), "{canceled}");
+    assert_eq!(take(fcb_observed_reader_search_hit(handle, 1, 0)), witness);
+
+    let limited = find_page(handle, 3, "k", 2, 0, 0, 1, 2, 1, 4);
+    assert!(limited.contains("\"state\":\"byte-limit\""), "{limited}");
+    assert_eq!(number(&limited, "payload_bytes_read"), 4);
+    assert_eq!(number(&limited, "skipped_matches"), 1);
+    assert_eq!(number(&limited, "retained_hits"), 0);
+    assert!(limited.contains("\"page_has_more_matches\":false"));
+    assert!(limited.contains("\"match_count_complete\":false"));
+    let beyond = find_page(handle, 4, "k", 2, 0, 0, 1, u64::MAX, 256, 1024);
+    assert_eq!(number(&beyond, "page_start_after"), u64::MAX);
+    assert_eq!(number(&beyond, "skipped_matches"), 3);
+    assert_eq!(number(&beyond, "retained_hits"), 0);
+    assert!(beyond.contains("\"search_complete\":true"));
+    assert!(beyond.contains("\"page_has_more_matches\":false"));
+    assert_eq!(fcb_observed_reader_close(handle), 1);
+}

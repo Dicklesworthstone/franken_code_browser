@@ -58,7 +58,7 @@ impl<'needle> FileSearch<'needle> {
     pub fn new(file: File, request: CaptureRequest, needle: &'needle StreamingNeedle,
         options: StreamReadOptions, budget: &ResourceBudget, allocation: ResourceAllocationId)
         -> Result<Self, FileSearchError> {
-        Self::build(file, request, needle, options, budget, allocation, false)
+        Self::new_page(file, request, needle, options, 0, false, budget, allocation)
     }
     /// Observe the complete declared file within the work budgets, counting
     /// overlapping occurrences after the bounded hit table fills. A zero
@@ -66,21 +66,26 @@ impl<'needle> FileSearch<'needle> {
     pub fn new_counting(file: File, request: CaptureRequest, needle: &'needle StreamingNeedle,
         options: StreamReadOptions, budget: &ResourceBudget, allocation: ResourceAllocationId)
         -> Result<Self, FileSearchError> {
-        Self::build(file, request, needle, options, budget, allocation, true)
+        Self::new_page(file, request, needle, options, 0, true, budget, allocation)
     }
-    fn build(file: File, request: CaptureRequest, needle: &'needle StreamingNeedle,
-        options: StreamReadOptions, budget: &ResourceBudget, allocation: ResourceAllocationId,
-        count_all_matches: bool) -> Result<Self, FileSearchError> {
+    /// Rescan from byte zero, skipping the first `skip_matches` occurrences
+    /// before retaining a bounded page. Skipping consumes the same byte/read
+    /// budgets and preserves whole-input occurrence IDs, decoding and token
+    /// boundaries. Counting may continue after this page fills.
+    ///
+    /// This is a NEW live-file observation. The host must allocate a fresh
+    /// source revision and must not describe separate scans as pages of one
+    /// immutable capture: edits can change occurrence positions and counts.
+    pub fn new_page(file: File, request: CaptureRequest, needle: &'needle StreamingNeedle,
+        options: StreamReadOptions, skip_matches: u64, count_all_matches: bool,
+        budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<Self, FileSearchError> {
         if !cfg!(unix) { return Err(FileSearchError::UnsupportedPlatform); }
         let metadata = file.metadata().map_err(|_| SourceError::CaptureUnavailable)?;
         if !metadata.is_file() { return Err(SourceError::SpecialObject.into()); }
         let before = Stamp::from_metadata(&metadata);
         let input = PositionedInput { file, offset: 0 };
-        let search = if count_all_matches {
-            ReaderSearch::new_counting(input, request, ByteLength::new(before.length), needle, options, budget, allocation)?
-        } else {
-            ReaderSearch::new(input, request, ByteLength::new(before.length), needle, options, budget, allocation)?
-        };
+        let search = ReaderSearch::new_page(input, request, ByteLength::new(before.length), needle,
+            options, skip_matches, count_all_matches, budget, allocation)?;
         Ok(Self { search, before })
     }
     pub fn state(&self) -> StreamReadState { self.search.state() }

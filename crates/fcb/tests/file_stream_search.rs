@@ -95,6 +95,45 @@ fn counting_completes_a_file_with_more_matches_than_retained_witnesses() {
 }
 
 #[test]
+fn result_pages_replay_with_bounded_storage_global_ordinals_and_unchanged_file_cursor() {
+    let temp = Temp::new();
+    let bytes = b"banana".repeat(6000); fs::write(temp.file(), &bytes).unwrap();
+    let mut host = File::open(temp.file()).unwrap(); host.seek(SeekFrom::Start(5)).unwrap();
+    let budget = budget();
+    let pattern = StreamingNeedle::text(owner(), "ana", &budget, allocation(1)).unwrap();
+    for (revision, count_all) in [(1, false), (2, true)] {
+        let request = CaptureRequest::new(FileId::new(owner(), 1).unwrap(),
+            SourceRevision::new(owner(), revision).unwrap()).unwrap();
+        let mut options = StreamReadOptions::new(generation(revision)); options.max_matches = 2;
+        let mut query = FileSearch::new_page(host.try_clone().unwrap(), request, &pattern,
+            options, 11_997, count_all, &budget, allocation(2)).unwrap();
+        let charge = budget.accounting().reserved().get();
+        finish(&mut query);
+        assert_eq!(budget.accounting().reserved().get(), charge);
+        let report = query.finish().unwrap();
+        assert_eq!(report.is_complete(), count_all);
+        assert_eq!(report.search().count_all_matches(), count_all);
+        assert_eq!(report.search().page_start_after(), 11_997);
+        assert_eq!(report.search().skipped_matches(), 11_997);
+        assert_eq!(report.search().matches_seen(), 12_000);
+        assert_eq!(report.search().hits().len(), 2);
+        assert!(report.search().has_more_matches());
+        assert_eq!(report.search().hits()[0].occurrence_id(), 11_998);
+        assert_eq!(report.search().hits()[1].occurrence_id(), 11_999);
+        assert_eq!(report.search().hits()[0].original_range().start().get(), 35_991);
+        assert_eq!(report.search().hits()[1].original_range().start().get(), 35_995);
+        assert!(report.search().stats().bytes_read <= bytes.len() as u64);
+        assert!(report.search().stats().peak_buffer_bytes <= 16 * 1024);
+        assert_eq!(host.stream_position().unwrap(), 5);
+        let witness = report.retain_hit(0, &budget, allocation(3)).unwrap();
+        assert_eq!(witness.request().revision().get(), revision);
+        assert_eq!(witness.range().start().get(), 35_991);
+        let view = BrowserSession::new(owner()).open_extent(witness.clone()).unwrap();
+        assert_eq!(view.raw_selection(witness.range()).unwrap(), b"ana");
+    }
+}
+
+#[test]
 fn counting_after_hit_retention_fills_does_not_hide_file_mutation_or_short_reads() {
     for grow in [false, true] {
         let temp = Temp::new(); fs::write(temp.file(), vec![b'a'; 64 * 1024]).unwrap();

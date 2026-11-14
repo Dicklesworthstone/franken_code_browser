@@ -120,6 +120,47 @@ cancellation or lost bridge reply can suppress delivery after state acceptance;
 hosts preserve their last accepted view and use retained/info operations when
 reconciling. They never automatically repeat a live read under an old identity.
 
+## Rescanning later result pages
+
+`fcb_observed_reader_find_page` accepts the same text or whole-token mode,
+matching policy, counting option and work limits as `find_mode`, plus
+`start_after`: the number of qualified occurrences to skip before retaining
+this result page. It exposes the public `FileSearch::new_page` route. Existing
+Find entry points keep their first-page behavior.
+
+Every page request scans the explicitly opened file object again from byte zero.
+Skipped occurrences still consume the byte, read-call and cancellation budgets;
+their source bytes and witnesses are not retained. Each request can retain at
+most 256 hits. Exact UTF-8/UTF-16 text, overlapping matches, Unicode lowercase
+expansions and whole-token occurrences use the same shared search engine as the
+first page. Row indexes start at zero within a page; `occurrence_id` identifies
+the occurrence in that request's complete observed sequence, including its
+skipped prefix.
+
+The Find receipt includes three independent page fields:
+
+| Field | Meaning |
+|---|---|
+| `page_start_after` | Requested number of occurrences to skip. |
+| `skipped_matches` | Qualified occurrences actually skipped; a bounded scan may stop before reaching the requested page. |
+| `page_has_more_matches` | This scan verified at least one additional occurrence after the retained page. A false value proves no later occurrence only when `search_complete` is true. |
+
+`matches_seen` and match-count completeness describe this request's whole scan,
+not just its retained page. Deliberately skipped occurrences contribute to
+`truncated`; that flag alone does not mean a later page exists. A completed
+scan can return an empty page when fewer occurrences exist than `start_after`.
+A byte or read-call limit before the requested page instead leaves coverage
+partial.
+
+These are **new observations of live source**, not continuation of an immutable
+capture. Each request requires a fresh query generation and spends a fresh
+observation ID. Edits can change which occurrence falls at a given ordinal.
+Hosts must disclose the rescan, replace the accepted result page only after its
+receipt is validated, and never combine pages into one exact snapshot or carry
+a previous observation's total count forward as current. Hit activation and
+copy continue to use only the new page's retained witnesses. The existing stale
+generation, cancellation, grant-lifetime and lost-reply rules still apply.
+
 ## Verification boundary
 
 `fcb-app/tests/observed_host_reader.rs`, `observed_reader_search.rs` and

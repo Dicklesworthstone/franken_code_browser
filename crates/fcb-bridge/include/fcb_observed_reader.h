@@ -183,6 +183,32 @@ char *fcb_observed_reader_find_mode(uint64_t handle, uint64_t generation,
     uint64_t count_all_matches, uint64_t max_matches, uint64_t max_scan_bytes,
     fcb_observed_reader_poll poll, void *context);
 
+/* Retain a later result page by rescanning from byte zero and skipping the
+ * first start_after matching occurrences. Modes/flags and all limits match
+ * find_mode. Skipped occurrences spend the SAME byte/read-call budgets, so a
+ * large offset cannot create unbounded work. Zero selects the first page;
+ * offsets beyond observed matches return no rows and preserve honest coverage.
+ *
+ * Every call requires a fresh generation and creates a NEW search_observation
+ * of the live opened file. Pages from separate calls are not one immutable
+ * capture: source edits may change counts, order and positions. The host must
+ * label this as a rescan and must not combine results under an old identity.
+ * Failed/canceled attempts preserve the previously accepted query as above.
+ *
+ * All find/search-hit receipts add page_start_after, skipped_matches (the lesser
+ * of the requested skip and matches_seen), and page_has_more_matches (a known
+ * match AFTER the retained page). Existing entry points use page_start_after=0.
+ * A false page_has_more_matches does not prove EOF on an incomplete scan.
+ * matches_seen counts from byte zero; retained row index/hit_index is local to
+ * this page, while occurrence_id remains the one-based whole-input ordinal.
+ * truncated includes skipped rows; completion/count/retention remain separate.
+ * observe_hit and retained history preserve page_start_after in find_hit.
+ */
+char *fcb_observed_reader_find_page(uint64_t handle, uint64_t generation,
+    const char *needle, uint64_t encoding, uint64_t mode, uint64_t case_sensitive,
+    uint64_t count_all_matches, uint64_t start_after, uint64_t max_matches,
+    uint64_t max_scan_bytes, fcb_observed_reader_poll poll, void *context);
+
 /* Zero-based hit_index must belong to the current accepted query generation.
  * Returns exactly the retained literal text/bytes and original-byte range,
  * with no source reread. Surrounding context was NOT retained. A host may

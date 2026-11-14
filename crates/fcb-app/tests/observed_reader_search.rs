@@ -10,7 +10,7 @@ use std::{fs::{self, OpenOptions}, os::unix::fs::FileExt, path::PathBuf,
     sync::atomic::{AtomicU64, Ordering}, time::{SystemTime, UNIX_EPOCH}};
 use fcb::ArenaOwnerId;
 use fcb_app::{EXIT_OK, EXIT_PARTIAL, host::{HostResponse, observed_reader::{ObservedReaderEncoding,
-    ObservedReaderError, ObservedReaderSession, MAX_OBSERVED_READER_MATCHES,
+    ObservedReaderError, ObservedReaderSearchKind, ObservedReaderSession, MAX_OBSERVED_READER_MATCHES,
     MAX_OBSERVED_READER_NEEDLE_BYTES, MAX_OBSERVED_READER_SCAN_BYTES, MAX_OBSERVED_READER_SEARCH_CALLS}}};
 use support::{Json, parse};
 
@@ -509,4 +509,174 @@ fn malformed_late_lowercase_source_revokes_tentative_counts_and_witnesses() {
     assert_eq!(report.get("retained_witness_bytes").number(), 0);
     assert_eq!(report.get("unsupported_at").number(), BUFFER_BYTES as u64);
     assert!(report.get("hits").array().is_empty());
+}
+
+#[test]
+fn later_result_pages_reach_matches_beyond_256_and_preserve_exact_activation_history() {
+    let fixture = Fixture::new(); fixture.write(&b"cat\n".repeat(300));
+    let mut reader = fixture.reader();
+    let first = json(&reader.search(1, "cat", ObservedReaderEncoding::Utf8, 256, 4096, || false).unwrap());
+    assert_eq!(first.get("retained_hits").number(), 256);
+    assert_eq!(first.get("matches_seen").number(), 257);
+    assert_eq!(first.get("page_start_after").number(), 0);
+    assert_eq!(first.get("skipped_matches").number(), 0);
+    assert!(first.get("page_has_more_matches").flag());
+    assert!(!first.get("search_complete").flag());
+
+    let response = reader.find_page(2, "cat", ObservedReaderEncoding::Utf8,
+        ObservedReaderSearchKind::Text, true, false, 256, 256, 4096, || false).unwrap();
+    assert_eq!(response.exit_code(), EXIT_PARTIAL, "skipped matches are not retained on this page");
+    let later = json(&response);
+    assert_eq!(later.get("page_start_after").number(), 256);
+    assert_eq!(later.get("skipped_matches").number(), 256);
+    assert_eq!(later.get("retained_hits").number(), 44);
+    assert_eq!(later.get("matches_seen").number(), 300);
+    assert!(later.get("truncated").flag());
+    assert!(later.get("match_count_complete").flag());
+    assert!(!later.get("page_has_more_matches").flag());
+    assert!(later.get("search_observation").number() > first.get("search_observation").number());
+    for (index, hit) in later.get("hits").array().iter().enumerate() {
+        assert_eq!(hit.get("index").number(), index as u64);
+        assert_eq!(hit.get("hit_index").number(), index as u64);
+        assert_eq!(hit.get("occurrence_id").number(), 257 + index as u64);
+        let start = (256 + index as u64) * 4;
+        assert_eq!(bounds(hit.get("original_range")), (start, start + 3));
+    }
+    let before = json(&reader.info(|| false).unwrap());
+    let witness = json(&reader.search_hit(2, 43, || false).unwrap());
+    assert_eq!(witness.get("page_start_after").number(), 256);
+    assert_eq!(witness.get("occurrence_id").number(), 300);
+    assert_eq!(witness.get("original_hex").text(), "636174");
+    assert_eq!(json(&reader.info(|| false).unwrap()), before, "retained selection performs no source I/O");
+    let page = json(&reader.observe_hit(2, 43, 4, 64, || false).unwrap());
+    let observation = page.get("observation").number();
+    assert!(observation > later.get("search_observation").number());
+    let selected = page.get("find_hit");
+    assert_eq!(selected.get("page_start_after").number(), 256);
+    assert_eq!(selected.get("hit_index").number(), 43);
+    assert_eq!(selected.get("occurrence_id").number(), 300);
+    assert_eq!(bounds(selected.get("original_range")), (1196, 1199));
+
+    // A rescan sees current bytes and assigns a new identity. It cannot make
+    // occurrence 257 in this new scan authoritative for the previous scan.
+    let writer = OpenOptions::new().write(true).open(fixture.0.join("source")).unwrap();
+    writer.write_at(b"dog", 0).unwrap();
+    let changed = json(&reader.find_page(3, "cat", ObservedReaderEncoding::Utf8,
+        ObservedReaderSearchKind::Text, true, false, 256, 256, 4096, || false).unwrap());
+    assert_eq!(changed.get("matches_seen").number(), 299);
+    assert_eq!(changed.get("retained_hits").number(), 43);
+    assert_eq!(bounds(changed.get("hits").array()[0].get("original_range")), (1028, 1031));
+    assert!(changed.get("search_observation").number() > observation);
+    assert_eq!(reader.search_hit(2, 43, || false).err(), Some(ObservedReaderError::StaleQuery));
+    let replay = json(&reader.retained_window(observation, || false).unwrap());
+    assert_eq!(replay.get("find_hit"), selected);
+    assert_eq!(replay.get("additional_source_bytes_read").number(), 0);
+}
+
+#[test]
+fn page_skips_counting_and_exhaustion_keep_independent_work_and_retention_limits() {
+    let fixture = Fixture::new(); fixture.write(b"banana banana");
+    let mut reader = fixture.reader();
+    let counted = json(&reader.find_page(1, "ana", ObservedReaderEncoding::Utf8,
+        ObservedReaderSearchKind::Text, true, true, 2, 1, 64, || false).unwrap());
+    assert!(counted.get("search_complete").flag());
+    assert!(counted.get("count_all_matches").flag());
+    assert!(counted.get("page_has_more_matches").flag());
+    assert_eq!(counted.get("matches_seen").number(), 4);
+    assert_eq!(counted.get("skipped_matches").number(), 2);
+    assert_eq!(counted.get("retained_hits").number(), 1);
+    assert_eq!(counted.get("hits").array()[0].get("occurrence_id").number(), 3);
+    assert_eq!(bounds(counted.get("hits").array()[0].get("original_range")), (8, 11));
+
+    let partial = json(&reader.find_page(2, "ana", ObservedReaderEncoding::Utf8,
+        ObservedReaderSearchKind::Text, true, true, 3, 1, 6, || false).unwrap());
+    assert_eq!(partial.get("state").text(), "byte-limit");
+    assert_eq!(partial.get("payload_bytes_read").number(), 6);
+    assert_eq!(partial.get("page_start_after").number(), 3);
+    assert_eq!(partial.get("skipped_matches").number(), 2);
+    assert_eq!(partial.get("retained_hits").number(), 0);
+    assert!(!partial.get("page_has_more_matches").flag());
+    assert!(!partial.get("match_count_complete").flag(), "no rows before a budget stop is not EOF");
+
+    let beyond = json(&reader.find_page(3, "ana", ObservedReaderEncoding::Utf8,
+        ObservedReaderSearchKind::Text, true, false, u64::MAX, 256, 64, || false).unwrap());
+    assert_eq!(beyond.get("page_start_after").number(), u64::MAX);
+    assert_eq!(beyond.get("matches_seen").number(), 4);
+    assert_eq!(beyond.get("skipped_matches").number(), 4);
+    assert_eq!(beyond.get("retained_hits").number(), 0);
+    assert!(beyond.get("search_complete").flag());
+    assert!(!beyond.get("page_has_more_matches").flag());
+
+    let count_only = json(&reader.find_page(4, "ana", ObservedReaderEncoding::Utf8,
+        ObservedReaderSearchKind::Text, true, true, 2, 0, 64, || false).unwrap());
+    assert!(count_only.get("match_count_complete").flag());
+    assert!(count_only.get("page_has_more_matches").flag());
+    assert_eq!(count_only.get("matches_seen").number(), 4);
+    assert_eq!(count_only.get("retained_hits").number(), 0);
+    assert_eq!(count_only.get("retained_witness_bytes").number(), 0);
+}
+
+#[test]
+fn page_replays_preserve_utf16_lowercase_expansion_and_whole_token_witnesses() {
+    let source = "\u{feff}K K k İ i\u{307} cat bobcat cat2 cat";
+    for encoding in [ObservedReaderEncoding::Utf8, ObservedReaderEncoding::Utf16Le, ObservedReaderEncoding::Utf16Be] {
+        let fixture = Fixture::new(); fixture.write(&encoded(source, encoding));
+        let mut reader = fixture.reader();
+        let lower = json(&reader.find_page(1, "k", encoding, ObservedReaderSearchKind::Text,
+            false, true, 1, 1, 1024, || false).unwrap());
+        assert_eq!(lower.get("matches_seen").number(), 3);
+        assert_eq!(lower.get("hits").array()[0].get("occurrence_id").number(), 2);
+        assert!(lower.get("page_has_more_matches").flag());
+        let witness = json(&reader.search_hit(1, 0, || false).unwrap());
+        assert_eq!(witness.get("text").text(), "K");
+        assert_eq!(witness.get("original_hex").text(), hex(&encoded("K", encoding)));
+        let start = encoded("\u{feff}K ", encoding).len() as u64;
+        assert_eq!(bounds(witness.get("original_range")), (start, start + encoded("K", encoding).len() as u64));
+
+        // The first dot comes from lowering İ; the next is an original scalar.
+        // Skipping by occurrence must retain the latter's exact bytes only.
+        let expansion = json(&reader.find_page(2, "\u{307}", encoding, ObservedReaderSearchKind::Text,
+            false, true, 1, 1, 1024, || false).unwrap());
+        assert_eq!(expansion.get("matches_seen").number(), 2);
+        assert!(!expansion.get("page_has_more_matches").flag());
+        let witness = json(&reader.search_hit(2, 0, || false).unwrap());
+        assert_eq!(witness.get("text").text(), "\u{307}");
+        assert_eq!(witness.get("original_hex").text(), hex(&encoded("\u{307}", encoding)));
+
+        let tokens = json(&reader.find_page(3, "cat", encoding, ObservedReaderSearchKind::Occurrences,
+            true, true, 1, 1, 1024, || false).unwrap());
+        assert_eq!(tokens.get("matches_seen").number(), 2);
+        assert_eq!(tokens.get("hits").array()[0].get("occurrence_id").number(), 2);
+        let start = encoded(&source[..source.rfind("cat").unwrap()], encoding).len() as u64;
+        assert_eq!(bounds(tokens.get("hits").array()[0].get("original_range")),
+            (start, start + encoded("cat", encoding).len() as u64));
+        let page = json(&reader.observe_hit(3, 0, 0, 64, || false).unwrap());
+        assert!(page.get("find_hit").get("token_boundaries_verified").flag());
+        assert_eq!(page.get("find_hit").get("page_start_after").number(), 1);
+        assert_eq!(page.get("find_hit").get("occurrence_id").number(), 2);
+    }
+}
+
+#[test]
+fn failed_and_canceled_page_attempts_preserve_the_accepted_page_and_consume_generations() {
+    let fixture = Fixture::new(); fixture.write(b"cat cat cat");
+    let mut reader = fixture.reader();
+    reader.find_page(1, "cat", ObservedReaderEncoding::Utf8, ObservedReaderSearchKind::Text,
+        true, true, 1, 1, 64, || false).unwrap();
+    let witness = json(&reader.search_hit(1, 0, || false).unwrap());
+    let info = json(&reader.info(|| false).unwrap());
+    assert_eq!(reader.find_page(2, "cat", ObservedReaderEncoding::Utf8, ObservedReaderSearchKind::Text,
+        true, false, 2, 257, 64, || false).err(), Some(ObservedReaderError::InvalidLimits));
+    assert_eq!(reader.find_page(2, "cat", ObservedReaderEncoding::Utf8, ObservedReaderSearchKind::Text,
+        true, false, 2, 1, 64, || false).err(), Some(ObservedReaderError::StaleQuery));
+    assert_eq!(reader.find_page(3, "cat", ObservedReaderEncoding::Utf8, ObservedReaderSearchKind::Text,
+        true, false, 2, 1, 64, || true).err(), Some(ObservedReaderError::Canceled));
+    assert_eq!(reader.find_page(3, "cat", ObservedReaderEncoding::Utf8, ObservedReaderSearchKind::Text,
+        true, false, 2, 1, 64, || false).err(), Some(ObservedReaderError::StaleQuery));
+    assert_eq!(json(&reader.search_hit(1, 0, || false).unwrap()), witness);
+    assert_eq!(json(&reader.info(|| false).unwrap()), info);
+    let next = json(&reader.find_page(4, "cat", ObservedReaderEncoding::Utf8, ObservedReaderSearchKind::Text,
+        true, false, 2, 1, 64, || false).unwrap());
+    assert!(next.get("search_observation").number() >= witness.get("search_observation").number() + 3);
+    assert_eq!(next.get("hits").array()[0].get("occurrence_id").number(), 3);
 }
