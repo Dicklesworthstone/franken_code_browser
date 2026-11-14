@@ -99,7 +99,7 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
     pub fn new(atlas: &'atlas A, needle: &'worker StreamingNeedle,
         first_revision: SourceRevision, generation: QueryGeneration, limits: AtlasStreamLimits,
         budget: &'worker ResourceBudget, allocations: [ResourceAllocationId; 2]) -> Result<Self, AtlasStreamError> {
-        Self::admit(atlas, needle, first_revision, generation, limits, None, false, budget, allocations)
+        Self::admit(atlas, needle, first_revision, generation, limits, None, false, 0, budget, allocations)
     }
 
     /// Count every occurrence within the admitted byte/read-call universe while
@@ -108,7 +108,7 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
     pub fn new_counting(atlas: &'atlas A, needle: &'worker StreamingNeedle,
         first_revision: SourceRevision, generation: QueryGeneration, limits: AtlasStreamLimits,
         budget: &'worker ResourceBudget, allocations: [ResourceAllocationId; 2]) -> Result<Self, AtlasStreamError> {
-        Self::admit(atlas, needle, first_revision, generation, limits, None, true, budget, allocations)
+        Self::admit(atlas, needle, first_revision, generation, limits, None, true, 0, budget, allocations)
     }
 
     /// Search an immutable, strictly increasing projection of ORIGINAL catalog
@@ -121,7 +121,7 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
         first_revision: SourceRevision, generation: QueryGeneration, limits: AtlasStreamLimits,
         ordinals: &[usize], budget: &'worker ResourceBudget, allocations: [ResourceAllocationId; 2])
         -> Result<Self, AtlasStreamError> {
-        Self::admit(atlas, needle, first_revision, generation, limits, Some(ordinals), false, budget, allocations)
+        Self::admit(atlas, needle, first_revision, generation, limits, Some(ordinals), false, 0, budget, allocations)
     }
 
     /// Counting variant of `new_scoped`; excluded catalog entries never consume
@@ -130,12 +130,36 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
         first_revision: SourceRevision, generation: QueryGeneration, limits: AtlasStreamLimits,
         ordinals: &[usize], budget: &'worker ResourceBudget, allocations: [ResourceAllocationId; 2])
         -> Result<Self, AtlasStreamError> {
-        Self::admit(atlas, needle, first_revision, generation, limits, Some(ordinals), true, budget, allocations)
+        Self::admit(atlas, needle, first_revision, generation, limits, Some(ordinals), true, 0, budget, allocations)
+    }
+
+    /// Observe the catalog again and retain a bounded match window after
+    /// `start_after` occurrences across eligible files in catalog order.
+    /// Skipping still scans and charges every byte/call. This is a NEW live
+    /// observation, not a continuation of an immutable workspace capture;
+    /// callers must allocate fresh query and source revision identities.
+    pub fn new_page(atlas: &'atlas A, needle: &'worker StreamingNeedle,
+        first_revision: SourceRevision, generation: QueryGeneration, limits: AtlasStreamLimits,
+        start_after: u64, count_all_matches: bool, budget: &'worker ResourceBudget,
+        allocations: [ResourceAllocationId; 2]) -> Result<Self, AtlasStreamError> {
+        Self::admit(atlas, needle, first_revision, generation, limits, None,
+            count_all_matches, start_after, budget, allocations)
+    }
+
+    /// Match-window observation within a frozen projection of original
+    /// catalog ordinals. Excluded files neither consume skips nor source I/O.
+    pub fn new_scoped_page(atlas: &'atlas A, needle: &'worker StreamingNeedle,
+        first_revision: SourceRevision, generation: QueryGeneration, limits: AtlasStreamLimits,
+        ordinals: &[usize], start_after: u64, count_all_matches: bool,
+        budget: &'worker ResourceBudget, allocations: [ResourceAllocationId; 2])
+        -> Result<Self, AtlasStreamError> {
+        Self::admit(atlas, needle, first_revision, generation, limits, Some(ordinals),
+            count_all_matches, start_after, budget, allocations)
     }
 
     fn admit(atlas: &'atlas A, needle: &'worker StreamingNeedle,
         first_revision: SourceRevision, generation: QueryGeneration, limits: AtlasStreamLimits,
-        ordinals: Option<&[usize]>, count_all_matches: bool,
+        ordinals: Option<&[usize]>, count_all_matches: bool, start_after: u64,
         budget: &'worker ResourceBudget, allocations: [ResourceAllocationId; 2])
         -> Result<Self, AtlasStreamError> {
         atlas.validate_active()?;
@@ -144,6 +168,7 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
         if catalogued != atlas.file_count() || text.is_empty() || text.len() > MAX_ATLAS_STREAM_NEEDLE_BYTES
             || limits.max_matches > MAX_ATLAS_STREAM_MATCHES || limits.max_bytes > MAX_ATLAS_STREAM_BYTES
             || limits.max_read_calls > MAX_ATLAS_STREAM_CALLS || allocations[0] == allocations[1]
+            || start_after.checked_add(limits.max_matches as u64).and_then(|n| n.checked_add(1)).is_none()
             || generation.owner() != atlas.layout().owner() || first_revision.owner() != atlas.layout().owner()
             || first_revision.get().checked_add(catalogued.saturating_sub(1) as u64).is_none() {
             return Err(AtlasStreamError::InvalidLimits);
@@ -185,7 +210,7 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
             selected.extend_from_slice(values);
             Ok::<_, AtlasStreamError>(selected)
         }).transpose()?;
-        let report = AtlasStreamReport { atlas, generation, limits, count_all_matches, case_sensitive, mode: needle.mode(), files: reserve(count)?,
+        let report = AtlasStreamReport { atlas, generation, limits, count_all_matches, page_start_after: start_after, case_sensitive, mode: needle.mode(), files: reserve(count)?,
             hits: reserve(limits.max_matches)?, matched_files: reserve(witness_files)?,
             witnesses: reserve(witness_bytes)?, matched_text, selected_ordinals, literal, stats: AtlasStreamStats::default(),
             state: if count == 0 { AtlasStreamState::Finished } else { AtlasStreamState::Pending },
@@ -261,11 +286,9 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
                 max_bytes: self.report.limits.max_bytes - self.report.stats.bytes_read,
                 max_read_calls: self.report.limits.max_read_calls - self.report.stats.read_calls };
             let started = match opened {
-                Ok(file) => if self.report.count_all_matches {
-                    FileSearch::new_counting(file, request, self.needle, options, self.budget, self.worker_allocation)
-                } else {
-                    FileSearch::new(file, request, self.needle, options, self.budget, self.worker_allocation)
-                },
+                Ok(file) => FileSearch::new_page(file, request, self.needle, options,
+                    self.report.page_start_after.saturating_sub(self.report.stats.matches_seen),
+                    self.report.count_all_matches, self.budget, self.worker_allocation),
                 Err(e) => Err(FileSearchError::Source(e)),
             };
             match started {

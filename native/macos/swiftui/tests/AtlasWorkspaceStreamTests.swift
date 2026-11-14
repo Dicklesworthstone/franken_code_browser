@@ -94,6 +94,34 @@ private enum StreamFixture {
         }
         return value
     }
+    /// One live-file observation containing total matching occurrences. Window
+    /// ordinals are regenerated on each call and never appended to old evidence.
+    static func matchWindow(_ owner: UInt64, _ generation: UInt64, _ request: AtlasWorkspaceStreamRequest,
+        total: UInt64 = 600) -> [String: Any] {
+        let skipped = min(request.pageStartAfter, total)
+        let retained = min(request.maximumMatches, total - skipped)
+        let seen = request.countAllMatches ? total : min(total, skipped + retained + 1)
+        let more = seen - skipped > retained, complete = request.countAllMatches || !more
+        var value = report(owner, generation, request, count: Int(retained))
+        value["page_start_after"] = String(request.pageStartAfter)
+        value["skipped_matches"] = String(skipped); value["page_has_more_matches"] = more
+        value["matches_seen"] = String(seen); value["truncated"] = seen > retained
+        value["count_all_matches"] = request.countAllMatches; value["match_count_complete"] = complete
+        value["matching_files"] = seen == 0 ? "0" : "1"
+        value["retained_matching_files"] = retained == 0 ? "0" : "1"
+        value["search_complete"] = complete
+        value["stop_reason"] = complete ? NSNull() : "match-limit" as Any
+        value["incomplete_files"] = complete ? "0" : "1"
+        value["terminal"] = true; value["selection_available"] = true
+        var rows = value["hits"] as! [[String: Any]]
+        for index in rows.indices {
+            rows[index]["occurrence_id"] = String(request.pageStartAfter + UInt64(index) + 1)
+            rows[index]["file_state"] = complete ? "complete-observed-input" : "match-limit"
+            rows[index]["file_complete"] = complete
+        }
+        value["hits"] = rows
+        return value
+    }
     static func counted(_ report: [String: Any], matches: UInt64, matchingFiles: UInt64) -> [String: Any] {
         var value = report
         value["count_all_matches"] = true
@@ -343,6 +371,7 @@ private final class StreamContextProbe: @unchecked Sendable {
         try wireTests()
         try scopeWireTests()
         try countedWireTests()
+        try matchWindowWireTests()
         try lowercaseWireTests()
         try occurrenceWireTests()
         try progressWireTests()
@@ -364,6 +393,81 @@ private final class StreamContextProbe: @unchecked Sendable {
             try await Task.sleep(for: .milliseconds(5))
         }
         preconditionFailure("Timed out: " + label)
+    }
+    private static func matchWindowWireTests() throws {
+        let owner: UInt64 = 0xfedcba9876543210
+        let catalog = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(StreamFixture.catalog(owner)), owner: owner)
+        let request = try AtlasWorkspaceStreamRequest(needle: "old", maximumMatches: 2, pageStartAfter: 3)
+        func decode(_ value: [String: Any], selected: AtlasWorkspaceStreamRequest? = nil) throws -> AtlasWorkspaceStreamPage {
+            try .decode(StreamFixture.json(StreamFixture.page(value)), catalog: catalog, root: catalog.root,
+                request: selected ?? request, requireTerminal: true)
+        }
+        let finalWire = StreamFixture.matchWindow(owner, 9, request, total: 5)
+        let final = try decode(finalWire)
+        precondition(final.summary.complete && final.summary.truncated && !final.summary.pageHasMoreMatches)
+        precondition(final.summary.skippedMatches == 3 && final.summary.nextStartAfter == nil)
+        precondition(final.hits.map(\.occurrence) == [4, 5])
+        let report = try AtlasWorkspaceStreamReport(summary: final.summary, hits: final.hits)
+        let target = report.target(for: final.hits[0])
+        _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(StreamFixture.witness(finalWire, index: 0)),
+            report: report, root: catalog.root, target: target)
+        var wrongWitness = StreamFixture.witness(finalWire, index: 0)
+        wrongWitness["page_start_after"] = "0"
+        rejects("witness from another match window") {
+            _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(wrongWitness),
+                report: report, root: catalog.root, target: target)
+        }
+        let more = try decode(StreamFixture.matchWindow(owner, 10, request, total: 6))
+        precondition(!more.summary.complete && more.summary.pageHasMoreMatches && more.summary.nextStartAfter == 5)
+        let counted = try AtlasWorkspaceStreamRequest(needle: "old", maximumMatches: 2,
+            countAllMatches: true, pageStartAfter: 3)
+        let countedPage = try decode(StreamFixture.matchWindow(owner, 11, counted, total: 99), selected: counted)
+        precondition(countedPage.summary.complete && countedPage.summary.matchCountComplete
+            && countedPage.summary.pageHasMoreMatches && countedPage.summary.matchesSeen == 99)
+        let beyond = try AtlasWorkspaceStreamRequest(needle: "old", maximumMatches: 2,
+            pageStartAfter: 9_007_199_254_740_993)
+        let empty = try decode(StreamFixture.matchWindow(owner, 12, beyond, total: 5), selected: beyond)
+        precondition(empty.hits.isEmpty && empty.summary.complete && empty.summary.skippedMatches == 5
+            && !empty.summary.pageHasMoreMatches)
+        rejects("overflowing match window") {
+            _ = try AtlasWorkspaceStreamRequest(needle: "old", pageStartAfter: UInt64.max)
+        }
+        for (key, replacement) in [("page_start_after", "03" as Any), ("page_start_after", "2" as Any),
+            ("skipped_matches", "2" as Any), ("page_has_more_matches", true as Any)] {
+            var invalid = finalWire; invalid[key] = replacement
+            rejects("changed match window " + key) { _ = try decode(invalid) }
+        }
+        for key in ["page_start_after", "skipped_matches", "page_has_more_matches"] {
+            var invalid = finalWire; invalid.removeValue(forKey: key)
+            rejects("incomplete match-window metadata") { _ = try decode(invalid) }
+        }
+        var legacy = finalWire
+        for key in ["page_start_after", "skipped_matches", "page_has_more_matches"] { legacy.removeValue(forKey: key) }
+        rejects("legacy reply cannot authorize a later scan") { _ = try decode(legacy) }
+
+        // A budget stop before the skip is exhausted is partial, never an
+        // exhaustive empty result. Earlier matches still contribute to counts.
+        let pending = try AtlasWorkspaceStreamRequest(needle: "old",
+            maximumScanBytes: StreamFixture.length, maximumMatches: 2, pageStartAfter: 8)
+        var limited = StreamFixture.matchWindow(owner, 13, pending, total: 3)
+        limited["search_complete"] = false; limited["match_count_complete"] = false
+        limited["incomplete_files"] = "1"; limited["stop_reason"] = "byte-limit"
+        let partial = try decode(limited, selected: pending)
+        precondition(partial.hits.isEmpty && !partial.summary.complete && partial.summary.skippedMatches == 3)
+        precondition(!partial.summary.pageHasMoreMatches && partial.summary.nextStartAfter == nil)
+
+        // The lookahead can occur in another file with no retained rows.
+        let first = try AtlasWorkspaceStreamRequest(needle: "old", maximumMatches: 2)
+        var crossFile = StreamFixture.matchWindow(owner, 14, first, total: 3)
+        var twoFiles = StreamFixture.catalog(owner)
+        twoFiles["catalogued_files"] = "2"; twoFiles["workspace_files"] = "2"
+        let catalog2 = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(twoFiles), owner: owner)
+        crossFile["catalogued_files"] = "2"; crossFile["files_examined"] = "2"
+        crossFile["matching_files"] = "2"; crossFile["retained_matching_files"] = "1"
+        let crossPage = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(crossFile)),
+            catalog: catalog2, root: catalog2.root, request: first, requireTerminal: true)
+        precondition(crossPage.summary.matchingFiles == 2 && crossPage.summary.retainedMatchingFiles == 1
+            && crossPage.summary.pageHasMoreMatches)
     }
     private static func wireTests() throws {
         let owner: UInt64 = 0xfedcba9876543210

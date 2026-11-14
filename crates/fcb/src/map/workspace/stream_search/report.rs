@@ -107,6 +107,7 @@ pub struct AtlasStreamReport<'atlas, 'catalog, A: AtlasStreamSource = WorkspaceA
     pub(super) generation: QueryGeneration,
     pub(super) limits: AtlasStreamLimits,
     pub(super) count_all_matches: bool,
+    pub(super) page_start_after: u64,
     pub(super) case_sensitive: bool,
     pub(super) mode: StreamingMode,
     pub(super) files: Vec<AtlasStreamFile>,
@@ -129,9 +130,18 @@ impl<'atlas, 'catalog, A: AtlasStreamSource> AtlasStreamReport<'atlas, 'catalog,
     pub const fn generation(&self) -> QueryGeneration { self.generation }
     pub const fn limits(&self) -> AtlasStreamLimits { self.limits }
     pub const fn count_all_matches(&self) -> bool { self.count_all_matches }
+    /// Occurrences requested to be skipped in this fresh catalog observation.
+    pub const fn page_start_after(&self) -> u64 { self.page_start_after }
+    pub fn skipped_matches(&self) -> u64 { self.page_start_after.min(self.stats.matches_seen) }
+    /// Omitted prefix rows do not imply that another later match was observed.
+    pub fn page_has_more_matches(&self) -> bool {
+        self.stats.matches_seen.saturating_sub(self.page_start_after) > self.hits.len() as u64
+    }
     pub const fn case_sensitive(&self) -> bool { self.case_sensitive }
     pub const fn mode(&self) -> StreamingMode { self.mode }
-    /// Row retention and scan completeness are independent in counting mode.
+    /// True when any observed rows were omitted, including a skipped prefix.
+    /// Use page_has_more_matches for later-row navigation; scan completeness
+    /// remains independent of both retention and match-window boundaries.
     pub fn hits_truncated(&self) -> bool { self.stats.matches_seen > self.hits.len() as u64 }
     /// Finalized files with at least one observed occurrence, even when none of
     /// that file's rows were retained. Unexamined files never contribute.

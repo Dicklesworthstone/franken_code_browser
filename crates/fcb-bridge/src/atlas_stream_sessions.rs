@@ -30,14 +30,14 @@ impl AtlasSessions {
         options: AtlasStreamSearchOptions, scope: &AtlasSearchScope, canceled: impl FnMut() -> bool,
         stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
         -> Result<HostResponse, AccessError> {
-        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress, false, false)
+        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress, false, false, 0)
     }
 
     pub(crate) fn execute_stream_scoped_counted_with_progress(&self, handle: u64, needle: &str,
         options: AtlasStreamSearchOptions, scope: &AtlasSearchScope, canceled: impl FnMut() -> bool,
         stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
         -> Result<HostResponse, AccessError> {
-        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress, true, false)
+        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress, true, false, 0)
     }
 
     /// The scope carries the immutable case policy. The host chooses the shared
@@ -46,19 +46,29 @@ impl AtlasSessions {
         options: AtlasStreamSearchOptions, scope: &AtlasSearchScope, count_all_matches: bool,
         canceled: impl FnMut() -> bool, stopped: impl FnMut() -> bool,
         progress: impl FnMut(&HostResponse)) -> Result<HostResponse, AccessError> {
-        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress, count_all_matches, false)
+        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress, count_all_matches, false, 0)
     }
 
     pub(crate) fn execute_stream_scoped_occurrences_with_progress(&self, handle: u64, needle: &str,
         options: AtlasStreamSearchOptions, scope: &AtlasSearchScope, count_all_matches: bool,
         canceled: impl FnMut() -> bool, stopped: impl FnMut() -> bool,
         progress: impl FnMut(&HostResponse)) -> Result<HostResponse, AccessError> {
-        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress, count_all_matches, true)
+        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress, count_all_matches, true, 0)
+    }
+
+    pub(crate) fn execute_stream_scoped_page_with_progress(&self, handle: u64, needle: &str,
+        options: AtlasStreamSearchOptions, scope: &AtlasSearchScope, start_after: u64,
+        count_all_matches: bool, occurrences: bool, canceled: impl FnMut() -> bool,
+        stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
+        -> Result<HostResponse, AccessError> {
+        self.execute_stream_progress_inner(handle, needle, options, scope, canceled, stopped, progress,
+            count_all_matches, occurrences, start_after)
     }
 
     fn execute_stream_progress_inner(&self, handle: u64, needle: &str,
         options: AtlasStreamSearchOptions, scope: &AtlasSearchScope, mut canceled: impl FnMut() -> bool,
-        stopped: impl FnMut() -> bool, mut progress: impl FnMut(&HostResponse), count_all_matches: bool, occurrences: bool)
+        stopped: impl FnMut() -> bool, mut progress: impl FnMut(&HostResponse), count_all_matches: bool, occurrences: bool,
+        start_after: u64)
         -> Result<HostResponse, AccessError> {
         let cell = self.get(handle)?;
         let epoch = cell.epoch.load(Ordering::Acquire);
@@ -71,16 +81,8 @@ impl AtlasSessions {
             let mut guarded_progress = |response: &HostResponse| {
                 if cell.validate(epoch).is_ok() { progress(response); }
             };
-            if occurrences {
-                session.stream.search_scoped_occurrences_with_progress(&session.atlas, needle, options, scope.clone(),
-                    count_all_matches, &mut guarded_canceled, stopped, &mut guarded_progress)
-            } else if count_all_matches {
-                session.stream.search_scoped_counted_with_progress(&session.atlas, needle, options, scope.clone(),
-                    &mut guarded_canceled, stopped, &mut guarded_progress)
-            } else {
-                session.stream.search_scoped_with_progress(&session.atlas, needle, options, scope.clone(),
-                    &mut guarded_canceled, stopped, &mut guarded_progress)
-            }
+            session.stream.search_scoped_page_with_progress(&session.atlas, needle, options, scope.clone(),
+                start_after, count_all_matches, occurrences, &mut guarded_canceled, stopped, &mut guarded_progress)
         };
         if let Err(error) = cell.validate(epoch) {
             session.cancel_work();

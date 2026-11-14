@@ -174,6 +174,7 @@ struct Snapshot {
     matching_files: usize,
     retained_matching_files: usize,
     count_all_matches: bool,
+    page_start_after: u64,
     stats: AtlasStreamStats,
     discovery_complete: bool,
     complete: bool,
@@ -235,7 +236,7 @@ impl RetainedAtlasStreamSearch {
     /// requested visible paths absent from the catalog keep coverage partial.
     pub fn search_scoped(&mut self, atlas: &AtlasSession, needle: &str, options: AtlasStreamSearchOptions,
         scope: AtlasSearchScope, canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasStreamSearchError> {
-        self.search_inner(atlas, needle, options, scope, canceled, || false, |_| {}, false, false, false)
+        self.search_inner(atlas, needle, options, scope, canceled, || false, |_| {}, false, false, false, 0)
     }
 
     /// Count all exact occurrences within the I/O limits while keeping the
@@ -247,7 +248,7 @@ impl RetainedAtlasStreamSearch {
 
     pub fn search_scoped_counted(&mut self, atlas: &AtlasSession, needle: &str, options: AtlasStreamSearchOptions,
         scope: AtlasSearchScope, canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasStreamSearchError> {
-        self.search_inner(atlas, needle, options, scope, canceled, || false, |_| {}, false, true, false)
+        self.search_inner(atlas, needle, options, scope, canceled, || false, |_| {}, false, true, false, 0)
     }
 
     /// Publish a bounded first-page preview while the SAME scanner continues.
@@ -269,7 +270,7 @@ impl RetainedAtlasStreamSearch {
         options: AtlasStreamSearchOptions, scope: AtlasSearchScope, canceled: impl FnMut() -> bool,
         stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
         -> Result<HostResponse, AtlasStreamSearchError> {
-        self.search_inner(atlas, needle, options, scope, canceled, stopped, progress, true, false, false)
+        self.search_inner(atlas, needle, options, scope, canceled, stopped, progress, true, false, false, 0)
     }
 
     pub fn search_counted_with_progress(&mut self, atlas: &AtlasSession, needle: &str,
@@ -285,7 +286,7 @@ impl RetainedAtlasStreamSearch {
         options: AtlasStreamSearchOptions, scope: AtlasSearchScope, canceled: impl FnMut() -> bool,
         stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
         -> Result<HostResponse, AtlasStreamSearchError> {
-        self.search_inner(atlas, needle, options, scope, canceled, stopped, progress, true, true, false)
+        self.search_inner(atlas, needle, options, scope, canceled, stopped, progress, true, true, false, 0)
     }
 
     /// Search one exact whole identifier through the shared streaming decoder,
@@ -296,12 +297,26 @@ impl RetainedAtlasStreamSearch {
         options: AtlasStreamSearchOptions, scope: AtlasSearchScope, count_all_matches: bool,
         canceled: impl FnMut() -> bool, stopped: impl FnMut() -> bool,
         progress: impl FnMut(&HostResponse)) -> Result<HostResponse, AtlasStreamSearchError> {
-        self.search_inner(atlas, needle, options, scope, canceled, stopped, progress, true, count_all_matches, true)
+        self.search_inner(atlas, needle, options, scope, canceled, stopped, progress, true, count_all_matches, true, 0)
+    }
+
+    /// Rescan eligible files from their beginnings and retain a later match
+    /// window. Every attempt receives a fresh query and source-observation span.
+    /// Offsets describe this new live observation, never an immutable cursor;
+    /// skipped bytes/calls remain inside the same global I/O limits.
+    pub fn search_scoped_page_with_progress(&mut self, atlas: &AtlasSession, needle: &str,
+        options: AtlasStreamSearchOptions, scope: AtlasSearchScope, start_after: u64,
+        count_all_matches: bool, occurrences: bool, canceled: impl FnMut() -> bool,
+        stopped: impl FnMut() -> bool, progress: impl FnMut(&HostResponse))
+        -> Result<HostResponse, AtlasStreamSearchError> {
+        self.search_inner(atlas, needle, options, scope, canceled, stopped, progress,
+            true, count_all_matches, occurrences, start_after)
     }
 
     fn search_inner(&mut self, atlas: &AtlasSession, needle: &str, options: AtlasStreamSearchOptions,
         scope: AtlasSearchScope, mut canceled: impl FnMut() -> bool, mut stopped: impl FnMut() -> bool,
-        mut progress: impl FnMut(&HostResponse), publish_progress: bool, count_all_matches: bool, occurrences: bool)
+        mut progress: impl FnMut(&HostResponse), publish_progress: bool, count_all_matches: bool, occurrences: bool,
+        start_after: u64)
         -> Result<HostResponse, AtlasStreamSearchError> {
         self.validate(atlas)?;
         let generation = self.next_generation()?;
@@ -314,7 +329,8 @@ impl RetainedAtlasStreamSearch {
             .map_err(|_| AtlasStreamSearchError::IdentityExhausted)?;
         check(&mut canceled)?;
         options.validate()?;
-        if needle.is_empty() || needle.len() > MAX_ATLAS_STREAM_SEARCH_NEEDLE_BYTES {
+        if needle.is_empty() || needle.len() > MAX_ATLAS_STREAM_SEARCH_NEEDLE_BYTES
+            || start_after.checked_add(options.max_matches as u64).and_then(|n| n.checked_add(1)).is_none() {
             return Err(AtlasStreamSearchError::InvalidLimits);
         }
         let scope = FrozenScope::admit(scope, occurrences, atlas, &mut canceled)?;
@@ -338,7 +354,7 @@ impl RetainedAtlasStreamSearch {
         let root = self.grant.root_path().to_path_buf();
         let mut tally = ProgressTally::default();
         let (scanned, io) = scan(atlas.atlas(), &root, &pattern, first_revision, query, options, ordinals.as_deref(),
-            &self.budget, [report_id, worker_id], &mut canceled, &mut stopped, publish_progress, count_all_matches,
+            &self.budget, [report_id, worker_id], &mut canceled, &mut stopped, publish_progress, count_all_matches, start_after,
             &mut |report, sequence, canceled| {
                 let ids = progress_ids.ok_or(AtlasStreamSearchError::InvalidLimits)?;
                 tally.update(report)?;
@@ -384,6 +400,7 @@ impl RetainedAtlasStreamSearch {
         out.literal(",\"count_all_matches\":")?; out.boolean(snapshot.count_all_matches)?;
         out.literal(",\"match_count_complete\":")?; out.boolean(snapshot.complete)?;
         out.literal(",\"retained_matching_files\":")?; out.integer(snapshot.retained_matching_files as u64)?;
+        out.literal(",\"page_start_after\":")?; out.integer(snapshot.page_start_after)?;
         out.literal(",\"hit\":{")?;
         encode_hit(&mut out, atlas, hit, position)?;
         out.literal(",\"text\":")?;
@@ -549,18 +566,15 @@ fn scan<'a, C: FnMut() -> bool>(atlas: &'a RetainedWorkspaceAtlas, root: &Path, 
     first_revision: SourceRevision, generation: QueryGeneration, options: AtlasStreamSearchOptions,
     ordinals: Option<&[usize]>,
     budget: &ResourceBudget, allocations: [ResourceAllocationId; 2], canceled: &mut C,
-    stopped: &mut impl FnMut() -> bool, publish_progress: bool, count_all_matches: bool,
+    stopped: &mut impl FnMut() -> bool, publish_progress: bool, count_all_matches: bool, start_after: u64,
     progress: &mut impl FnMut(&AtlasStreamReport<'a, 'a, RetainedWorkspaceAtlas>, u64, &mut C)
         -> Result<(), AtlasStreamSearchError>)
     -> (Result<AtlasStreamReport<'a, 'a, RetainedWorkspaceAtlas>, AtlasStreamSearchError>, AtlasStreamStats) {
-    let admitted = match (ordinals, count_all_matches) {
-        (Some(ordinals), true) => AtlasStreamSearch::new_scoped_counting(atlas, pattern, first_revision, generation,
-            options.limits(), ordinals, budget, allocations),
-        (None, true) => AtlasStreamSearch::new_counting(atlas, pattern, first_revision, generation,
-            options.limits(), budget, allocations),
-        (Some(ordinals), false) => AtlasStreamSearch::new_scoped(atlas, pattern, first_revision, generation,
-            options.limits(), ordinals, budget, allocations),
-        (None, false) => AtlasStreamSearch::new(atlas, pattern, first_revision, generation, options.limits(), budget, allocations),
+    let admitted = match ordinals {
+        Some(ordinals) => AtlasStreamSearch::new_scoped_page(atlas, pattern, first_revision, generation,
+            options.limits(), ordinals, start_after, count_all_matches, budget, allocations),
+        None => AtlasStreamSearch::new_page(atlas, pattern, first_revision, generation,
+            options.limits(), start_after, count_all_matches, budget, allocations),
     };
     let mut job = match admitted {
         Ok(job) => job,
@@ -614,6 +628,7 @@ impl Snapshot {
             examined: self.examined, unexamined: self.unexamined, unavailable: self.unavailable,
             unsupported: self.unsupported, failed: self.failed, matching_files: self.matching_files,
             retained_matching_files: self.retained_matching_files, count_all_matches: self.count_all_matches,
+            page_start_after: self.page_start_after,
             stats: self.stats, discovery_complete: self.discovery_complete, complete: self.complete,
             stop: self.stop, retained_hits: self.hits.len(), retained_witness_bytes: self.witnesses.len() }
     }
@@ -684,10 +699,10 @@ impl Snapshot {
         check(canceled)?;
         let complete = report.is_complete() && scope.region_complete();
         let count_all_matches = report.count_all_matches();
-        let matching_files = if count_all_matches { report.matching_files_seen() } else { retained_matching_files };
+        let matching_files = report.matching_files_seen();
         Ok(Self { generation: report.generation().get(), needle, options, scope, hits, witnesses, matched_text, diagnostics,
             examined: report.files_examined(), unexamined: report.unexamined_files(), unavailable, unsupported, failed, matching_files,
-            retained_matching_files, count_all_matches,
+            retained_matching_files, count_all_matches, page_start_after: report.page_start_after(),
             stats: report.stats(), discovery_complete: report.atlas().discovery_complete(), complete,
             stop: report.stop_reason(), _lease: lease })
     }
@@ -707,6 +722,7 @@ struct Summary<'a> {
     matching_files: usize,
     retained_matching_files: usize,
     count_all_matches: bool,
+    page_start_after: u64,
     stats: AtlasStreamStats,
     discovery_complete: bool,
     complete: bool,
@@ -749,8 +765,9 @@ impl ProgressTally {
         Summary { generation: report.generation().get(), needle: report.literal(), options,
             examined: self.examined, unexamined: report.unexamined_files(), unavailable: self.unavailable,
             unsupported: self.unsupported, failed: self.failed,
-            matching_files: if report.count_all_matches() { report.matching_files_seen() } else { self.matching_files },
+            matching_files: report.matching_files_seen(),
             retained_matching_files: self.matching_files, count_all_matches: report.count_all_matches(),
+            page_start_after: report.page_start_after(),
             stats: report.stats(), discovery_complete: report.atlas().discovery_complete(), complete: false,
             stop: None, retained_hits: report.hits().len(), retained_witness_bytes: report.retained_witness_bytes() }
     }
@@ -763,6 +780,10 @@ fn summary(out: &mut Output, snapshot: Summary<'_>) -> Result<(), AtlasStreamSea
     out.literal(",\"search_complete\":")?; out.boolean(snapshot.complete)?;
     out.literal(",\"count_all_matches\":")?; out.boolean(snapshot.count_all_matches)?;
     out.literal(",\"match_count_complete\":")?; out.boolean(snapshot.complete)?;
+    out.literal(",\"page_start_after\":")?; out.integer(snapshot.page_start_after)?;
+    out.literal(",\"skipped_matches\":")?; out.integer(snapshot.page_start_after.min(snapshot.stats.matches_seen))?;
+    out.literal(",\"page_has_more_matches\":")?;
+    out.boolean(snapshot.stats.matches_seen.saturating_sub(snapshot.page_start_after) > snapshot.retained_hits as u64)?;
     out.literal(",\"truncated\":")?; out.boolean(snapshot.stats.matches_seen > snapshot.retained_hits as u64)?;
     out.literal(",\"stop_reason\":")?;
     if let Some(stop) = snapshot.stop { out.quoted(stop.code())?; } else { out.literal("null")?; }

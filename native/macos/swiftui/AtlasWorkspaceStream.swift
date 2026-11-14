@@ -39,6 +39,7 @@ enum AtlasWorkspaceStreamError: Error, Sendable {
 struct AtlasWorkspaceStreamRequest: Equatable, Sendable {
     let needle: String
     let maximumMatches, maximumScanBytes, maximumReadCalls: UInt64
+    let pageStartAfter: UInt64
     let fileScope: AtlasSearchFileScope
     let pathScope: AtlasSearchPathScope
     let countAllMatches: Bool
@@ -50,8 +51,9 @@ struct AtlasWorkspaceStreamRequest: Equatable, Sendable {
          fileScope: AtlasSearchFileScope = .all,
          pathScope: AtlasSearchPathScope = .workspace,
          countAllMatches: Bool = false, caseSensitive: Bool = true,
-         mode: AtlasWorkspaceStreamMode = .text) throws {
-        guard !needle.isEmpty, needle.utf8.count <= AtlasWorkspaceStreamLimits.needleBytes,
+         mode: AtlasWorkspaceStreamMode = .text, pageStartAfter: UInt64 = 0) throws {
+        let end = pageStartAfter.addingReportingOverflow(maximumMatches)
+        guard !end.overflow, end.partialValue < UInt64.max, !needle.isEmpty, needle.utf8.count <= AtlasWorkspaceStreamLimits.needleBytes,
               !needle.utf8.contains(0), (1...AtlasWorkspaceStreamLimits.hits).contains(maximumMatches),
               (1...AtlasWorkspaceStreamLimits.maximumScanBytes).contains(maximumScanBytes),
               (1...AtlasWorkspaceStreamLimits.readCalls).contains(maximumReadCalls),
@@ -62,14 +64,14 @@ struct AtlasWorkspaceStreamRequest: Equatable, Sendable {
         self.maximumMatches = maximumMatches; self.maximumReadCalls = maximumReadCalls
         self.fileScope = fileScope; self.pathScope = pathScope
         self.countAllMatches = countAllMatches
-        self.caseSensitive = caseSensitive; self.mode = mode
+        self.caseSensitive = caseSensitive; self.mode = mode; self.pageStartAfter = pageStartAfter
     }
     static func == (a: Self, b: Self) -> Bool {
         a.needle.utf8.elementsEqual(b.needle.utf8) && a.maximumMatches == b.maximumMatches
             && a.maximumScanBytes == b.maximumScanBytes && a.maximumReadCalls == b.maximumReadCalls
             && a.fileScope == b.fileScope && a.pathScope == b.pathScope
             && a.countAllMatches == b.countAllMatches
-            && a.caseSensitive == b.caseSensitive && a.mode == b.mode
+            && a.caseSensitive == b.caseSensitive && a.mode == b.mode && a.pageStartAfter == b.pageStartAfter
     }
 }
 
@@ -148,6 +150,8 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
     let identity: AtlasWorkspaceStreamIdentity
     let request: AtlasWorkspaceStreamRequest
     let discoveryComplete, complete, matchCountComplete, truncated: Bool
+    let skippedMatches: UInt64
+    let pageHasMoreMatches: Bool
     let stop: String?
     let discoveryPolicy: String
     let excludedEntries: UInt64
@@ -155,7 +159,18 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
     let cataloguedFiles, examinedFiles, unexaminedFiles, incompleteFiles, unavailableFiles, unsupportedFiles, failedFiles, matchingFiles: UInt64
     let retainedMatchingFiles, retainedHits, matchesSeen, payloadBytes, scannedBytes, readCalls, interruptedCalls, peakBufferBytes, witnessBytes: UInt64
 
+    var retainedRangeLabel: String {
+        guard retainedHits > 0 else { return "No retained matches; \(skippedMatches) occurrences skipped" }
+        return "Matches \(request.pageStartAfter + 1)–\(request.pageStartAfter + retainedHits) retained"
+    }
+    var nextStartAfter: UInt64? {
+        pageHasMoreMatches && retainedHits > 0 ? request.pageStartAfter + retainedHits : nil
+    }
     var countLabel: String {
+        if request.pageStartAfter > 0 {
+            let total = matchCountComplete ? "\(matchesSeen) matches observed" : "At least \(matchesSeen) matches observed"
+            return retainedRangeLabel + "; " + total + (complete ? "" : " · partial search")
+        }
         if matchCountComplete {
             let total = "\(matchesSeen) matches in \(matchingFiles) observed files"
             return truncated ? total + "; first \(retainedHits) retained" : total
@@ -172,8 +187,12 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
             : (request.caseSensitive ? "Exact text matching. " : "Unicode lowercase matching without canonical normalization or full case folding. ")
         result += "Examined \(examinedFiles) of \(eligibleFiles) eligible files; \(excludedFiles) catalogued files excluded by location or file type. \(unexaminedFiles) eligible files remain unexamined, \(incompleteFiles) incomplete (\(unavailableFiles) unavailable, \(unsupportedFiles) unsupported text, \(failedFiles) failed reads). "
         result += "Scanned \(scannedBytes) bytes; read \(payloadBytes) bytes in \(readCalls) calls. "
+        if request.pageStartAfter > 0 {
+            result += "This new scan skipped \(skippedMatches) of \(request.pageStartAfter) requested occurrences. "
+            result += "Files may differ from an earlier scan; these results are a separate observation. "
+        }
         if request.countAllMatches && truncated {
-            result += "The result list retains the first \(retainedHits) matches in \(retainedMatchingFiles) files; counts include later matches. "
+            result += "\(retainedRangeLabel) in \(retainedMatchingFiles) files; counts include omitted matches. "
         }
         if missingVisibleFiles > 0 { result += "\(missingVisibleFiles) requested atlas files are absent from this search catalog. " }
         if !discoveryComplete { result += "Discovery is incomplete; additional project files may be absent. " }
@@ -203,6 +222,7 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
         let discovery = try w.flag("discovery_complete"), complete = try w.flag("search_complete")
         let truncated = try w.flag("truncated"), stop = try w.optionalText("stop_reason")
         let counting = try w.countCoverage(request: request, complete: complete, matchingFiles: matching)
+        let window = try w.matchWindow(request: request, seen: seen, retained: retained)
         let retainedFiles = counting.retainedFiles
         let scope = try w.scopeCoverage(request: request, catalogued: catalog.files, complete: complete)
         guard identity.layout == catalog.layout, identity.manifest == catalog.manifest,
@@ -222,7 +242,7 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
               stop == nil || ["match-limit", "byte-limit", "read-call-limit", "user-stopped"].contains(stop!),
               terminal || (stop == nil && !complete),
               truncated == (seen > retained),
-              !truncated || retained == request.maximumMatches,
+              !window.hasMore || retained == request.maximumMatches,
               payload <= request.maximumScanBytes, scanned <= payload,
               calls <= request.maximumReadCalls, interrupted <= calls,
               payload == 0 || calls > 0, peak <= min(payload, 16 * 1024),
@@ -237,13 +257,15 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
         if request.countAllMatches {
             guard stop != "match-limit" else { throw AtlasWorkspaceStreamError.invalidResponse }
         } else {
-            guard retainedFiles == matching, truncated == (stop == "match-limit"),
-                  seen == retained + (truncated ? 1 : 0), terminal || !truncated else {
+            guard matching - retainedFiles <= window.skipped + (window.hasMore ? 1 : 0),
+                  window.hasMore == (stop == "match-limit"),
+                  seen == window.skipped + retained + (window.hasMore ? 1 : 0), terminal || !window.hasMore else {
                 throw AtlasWorkspaceStreamError.invalidResponse
             }
         }
         return Self(identity: identity, request: request, discoveryComplete: discovery, complete: complete,
-            matchCountComplete: counting.complete, truncated: truncated, stop: stop,
+            matchCountComplete: counting.complete, truncated: truncated,
+            skippedMatches: window.skipped, pageHasMoreMatches: window.hasMore, stop: stop,
             discoveryPolicy: policy, excludedEntries: excluded,
             eligibleFiles: scope.eligible, excludedFiles: scope.excluded, missingVisibleFiles: scope.missing,
             cataloguedFiles: files, examinedFiles: examined,
@@ -295,7 +317,7 @@ struct AtlasWorkspaceStreamHit: Equatable, Identifiable, Sendable {
         let length = try w.number("observed_length"), final = try w.optionalNumber("final_observed_length")
         let consistency = try w.text("consistency"), state = try w.text("file_state")
         let complete = try w.flag("file_complete"), digest = try w.text("witness_sha256")
-        guard index < summary.retainedHits, occurrence > 0, occurrence <= summary.request.maximumMatches,
+        guard index < summary.retainedHits, occurrence > 0, occurrence <= summary.request.pageStartAfter + index + 1,
               file > 0, revision > 0,
               AtlasObservedReaderSearchRequest.validWitnessRange(range, needle: summary.request.needle,
                 encoding: encoding, caseSensitive: summary.request.caseSensitive),
@@ -365,6 +387,7 @@ struct AtlasWorkspaceStreamProgress: Sendable {
     var summary: AtlasWorkspaceStreamSummary { page.summary }
     var countLabel: String {
         let total = "\(summary.matchesSeen) matches so far in \(summary.matchingFiles) finalized files"
+        if summary.request.pageStartAfter > 0 { return total + "; " + summary.retainedRangeLabel }
         return summary.truncated ? total + "; first \(summary.retainedHits) retained" : total
     }
     var coverage: String {
@@ -442,7 +465,8 @@ struct AtlasWorkspaceStreamReport: Sendable {
                     throw AtlasWorkspaceStreamError.invalidResponse
                 }
             } else {
-                guard files.insert(hit.file).inserted, hit.occurrence == 1,
+                guard files.insert(hit.file).inserted,
+                      index == 0 ? hit.occurrence <= summary.skippedMatches + 1 : hit.occurrence == 1,
                       index == 0 || hits[index - 1].path.lexicographicallyPrecedes(hit.path) else {
                     throw AtlasWorkspaceStreamError.invalidResponse
                 }
@@ -480,6 +504,7 @@ struct AtlasWorkspaceStreamWitness: Sendable {
             let text = try hit.text("text"), hex = try hit.text("original_hex")
             let scope = try w.scopeCoverage(request: report.summary.request,
                 catalogued: report.summary.cataloguedFiles, complete: report.summary.complete)
+            try w.matchOffset(request: report.summary.request)
             let counting = try w.countCoverage(request: report.summary.request,
                 complete: report.summary.complete, matchingFiles: report.summary.matchingFiles)
             guard report.admits(target),
@@ -550,6 +575,31 @@ struct AtlasWorkspaceStreamWire: Decodable {
         return try fields.decodeIfPresent(String.self, forKey: Key(key))
     }
     func optionalNumber(_ key: String) throws -> UInt64? { try optionalText(key).map(Self.number) }
+    /// Match-window metadata must be complete and exact. Legacy receipts are
+    /// accepted only for the initial window, never as later-scan evidence.
+    func matchOffset(request: AtlasWorkspaceStreamRequest) throws {
+        if !fields.contains(Key("page_start_after")) {
+            guard request.pageStartAfter == 0 else { throw AtlasWorkspaceStreamError.invalidResponse }
+            return
+        }
+        guard try number("page_start_after") == request.pageStartAfter else {
+            throw AtlasWorkspaceStreamError.invalidResponse
+        }
+    }
+    func matchWindow(request: AtlasWorkspaceStreamRequest, seen: UInt64,
+        retained: UInt64) throws -> (skipped: UInt64, hasMore: Bool) {
+        let keys = ["page_start_after", "skipped_matches", "page_has_more_matches"]
+        if !keys.contains(where: { fields.contains(Key($0)) }) {
+            guard request.pageStartAfter == 0 else { throw AtlasWorkspaceStreamError.invalidResponse }
+            return (0, seen > retained)
+        }
+        guard keys.allSatisfy({ fields.contains(Key($0)) }) else { throw AtlasWorkspaceStreamError.invalidResponse }
+        try matchOffset(request: request)
+        let skipped = try number("skipped_matches"), more = try flag("page_has_more_matches")
+        guard skipped == min(request.pageStartAfter, seen), retained <= seen - skipped,
+              more == (seen - skipped > retained) else { throw AtlasWorkspaceStreamError.invalidResponse }
+        return (skipped, more)
+    }
     /// A legacy receipt is valid only for the original bounded-result mode.
     /// Counted searches must echo the complete extension on every page and hit.
     func countCoverage(request: AtlasWorkspaceStreamRequest, complete: Bool,

@@ -177,6 +177,34 @@ char *fcb_atlas_stream_search_scoped_occurrences_progress(uint64_t handle, const
     int32_t (*poll)(void *context), int32_t (*stop)(void *context),
     fcb_atlas_stream_progress_callback progress, void *context);
 
+/* NEW live observation retaining a match window beyond the initial result cap.
+ * Scan eligible files again in catalog order, discard the first start_after
+ * observed occurrences, and retain up to max_matches thereafter. Every skipped
+ * byte/read call consumes the same total limits. No source-sized cache is built.
+ *
+ * case_sensitive, count_all_matches and occurrences are exactly 0 or 1.
+ * occurrences=1 selects whole-identifier text and requires case_sensitive=1.
+ * start_after + max_matches + 1 must fit uint64_t. All callbacks may be NULL.
+ *
+ * This is NOT a cursor into an immutable workspace snapshot. Files may change
+ * between calls, and every attempt receives new query/source revision identities.
+ * Replace the previous result set; do not append rows as one coherent capture.
+ * Progress and terminal replies echo page_start_after (the requested offset),
+ * skipped_matches=min(page_start_after,matches_seen), and page_has_more_matches.
+ * truncated means ANY observed rows were omitted, including the skipped prefix;
+ * page_has_more_matches means a later occurrence was actually observed. Neither
+ * false nor an empty page proves absence when search_complete=false. Counts cover
+ * this attempt's finalized file observations, including skipped occurrences/files.
+ * Later requests must repeat the same intended scope/matching policies. Existing
+ * retained-row page/hit calls still perform zero I/O; hit echoes page_start_after.
+ */
+char *fcb_atlas_stream_search_scoped_page_progress(uint64_t handle, const char *needle,
+    uint64_t max_matches, uint64_t max_scan_bytes, uint64_t max_read_calls,
+    const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
+    uint64_t case_sensitive, uint64_t count_all_matches, uint64_t occurrences, uint64_t start_after,
+    int32_t (*poll)(void *context), int32_t (*stop)(void *context),
+    fcb_atlas_stream_progress_callback progress, void *context);
+
 /* No source I/O. generation must identify the accepted report; start is a
  * zero-based retained-row position and count is 1..32. next_offset=null means
  * the end of the terminal retained rows, not proof of full source coverage.
