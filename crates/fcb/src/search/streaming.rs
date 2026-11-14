@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Whole-observation literal search without retaining the whole source.
+//! Whole-observation literal and expression search without retaining the whole source.
 //!
 //! The host explicitly supplies one reader positioned at byte zero and its
 //! observed length. Reads are one continuous observation, not concatenated
@@ -16,6 +16,8 @@
 //! case folding, canonical equivalence, replacement text, or guessed encodings.
 //! Identifier occurrences share the captured-reference whole-token policy and
 //! wait for a delimiter or actual input end, including across read boundaries.
+//! Expressions feed bounded predicate cursors from the same validated observation
+//! and withhold primary witnesses until the entire declared input qualifies.
 
 use std::{io::{self, Read}, mem::size_of};
 use fcb_core::{ArenaOwnerId, ByteLength, ByteOffset, ByteRange, DecodedUtf8Offset, FileId, QueryGeneration,
@@ -26,6 +28,9 @@ use fcb_search::identifier::{IdentifierCursor, validate_identifier};
 use fcb_search::{SearchMode, UnicodeNormalization};
 use fcb_search::normalized::{NormalizedCursor, SourceScalar, Units, matched_text_capacity};
 
+mod expression;
+use expression::{ExpressionNeedle, ExpressionWork};
+
 pub const STREAM_BUFFER_BYTES: usize = 16 * 1024;
 pub const MAX_STREAM_RESULTS: usize = 4096;
 pub const MAX_STREAM_STEP_HITS: usize = 64;
@@ -33,7 +38,7 @@ pub const MAX_STREAM_STEP_CALLS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamReadError {
-    InvalidLimits, InvalidRange, InvalidIdentifier, OwnerMismatch, ResourceDenied, AllocationFailed,
+    InvalidLimits, InvalidRange, InvalidIdentifier, InvalidExpression, OwnerMismatch, ResourceDenied, AllocationFailed,
     Io, InvalidReadCount, Pending, StaleGeneration,
     Decoder(SourceError), Matcher(StreamError),
 }
@@ -46,6 +51,7 @@ impl std::fmt::Display for StreamReadError {
                 Self::InvalidLimits => "STREAM_READ_INVALID_LIMITS",
                 Self::InvalidRange => "STREAM_READ_INVALID_RANGE",
                 Self::InvalidIdentifier => "STREAM_READ_INVALID_IDENTIFIER",
+                Self::InvalidExpression => "STREAM_READ_INVALID_EXPRESSION",
                 Self::OwnerMismatch => "STREAM_READ_OWNER_MISMATCH",
                 Self::ResourceDenied => "STREAM_READ_RESOURCE_DENIED",
                 Self::AllocationFailed => "STREAM_READ_ALLOCATION_FAILED",
@@ -62,8 +68,9 @@ impl From<StreamError> for StreamReadError { fn from(error: StreamError) -> Self
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamingMode { OriginalBytes, ExactText, LowercaseText, Identifier }
 
-/// Reusable immutable literal. Pre-encoded alternatives avoid a self-referential
-/// cursor and allow reports to share ONE exact literal witness across all hits.
+/// Reusable immutable primary literal with optional content predicates.
+/// Pre-encoded alternatives avoid a self-referential cursor and allow reports
+/// to share ONE exact literal witness across all hits.
 /// The pattern's lease remains alive while any query/report borrows it.
 pub struct StreamingNeedle {
     owner: ArenaOwnerId,
@@ -72,6 +79,7 @@ pub struct StreamingNeedle {
     little: Vec<u8>,
     big: Vec<u8>,
     max_witness_bytes: usize,
+    expression: Option<ExpressionNeedle>,
     _lease: ResourceLease,
 }
 impl StreamingNeedle {
@@ -99,17 +107,22 @@ impl StreamingNeedle {
     pub fn text_matching(owner: ArenaOwnerId, text: &str, case_sensitive: bool,
         budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
         let mut needle = Self::text(owner, text, budget, allocation)?;
+        needle.set_case_sensitive(case_sensitive)?;
+        Ok(needle)
+    }
+    fn set_case_sensitive(&mut self, case_sensitive: bool) -> Result<(), StreamReadError> {
         if !case_sensitive {
+            let text = self.text_value().ok_or(StreamReadError::InvalidLimits)?;
             let bound = matched_text_capacity(text, lowercase_mode()).map_err(|_| StreamReadError::InvalidLimits)?;
             // Public host receipts admit at most twelve source bytes per UTF-8
             // query byte. Refuse rather than silently widen it if tables change.
             if bound > text.len().checked_mul(12).ok_or(StreamReadError::InvalidLimits)? {
                 return Err(StreamReadError::InvalidLimits);
             }
-            needle.mode = StreamingMode::LowercaseText;
-            needle.max_witness_bytes = bound;
+            self.mode = StreamingMode::LowercaseText;
+            self.max_witness_bytes = bound;
         }
-        Ok(needle)
+        Ok(())
     }
     /// A source-length-independent upper bound for one retained original witness.
     pub const fn max_witness_bytes(&self) -> usize { self.max_witness_bytes }
@@ -122,6 +135,11 @@ impl StreamingNeedle {
         let size = size_of::<Self>() + bytes.len() + 2 * utf16;
         let lease = budget.try_reserve_managed(owner, allocation, ByteLength::new(size as u64))
             .map_err(|_| StreamReadError::ResourceDenied)?;
+        Self::build_reserved(owner, bytes, text, lease)
+    }
+    fn build_reserved(owner: ArenaOwnerId, bytes: &[u8], text: Option<&str>,
+        lease: ResourceLease) -> Result<Self, StreamReadError> {
+        let utf16 = text.map_or(0, |text| text.encode_utf16().count() * 2);
         let mut utf8 = reserve(bytes.len())?;
         utf8.extend_from_slice(bytes);
         let mut little = reserve(utf16)?;
@@ -133,7 +151,7 @@ impl StreamingNeedle {
             }
         }
         Ok(Self { owner, mode: if text.is_some() { StreamingMode::ExactText } else { StreamingMode::OriginalBytes },
-            max_witness_bytes: bytes.len().max(utf16), utf8, little, big, _lease: lease })
+            max_witness_bytes: bytes.len().max(utf16), utf8, little, big, expression: None, _lease: lease })
     }
     pub const fn mode(&self) -> StreamingMode { self.mode }
     pub fn text_value(&self) -> Option<&str> {
@@ -152,6 +170,8 @@ pub struct StreamReadOptions {
     pub encoding: Option<DetectedEncoding>,
     /// Maximum retained hits. `ReaderSearch::new` stops after the first omitted
     /// occurrence; `ReaderSearch::new_counting` keeps counting within its budgets.
+    /// Expressions always scan/count their whole admitted input to qualify its
+    /// predicates; this limit bounds only their retained primary witnesses.
     pub max_matches: usize,
     pub max_bytes: u64,
     pub max_read_calls: u64,
@@ -220,7 +240,9 @@ struct IdentifierWork<'needle> {
 }
 
 /// Explicit synchronous-resumable reader operation. A step admits at most one
-/// successful read and one matcher batch. Interrupted calls spend call budget.
+/// successful read and one primary matcher batch. Bounded expression predicates
+/// consume exactly that prefix/scalar progress, with cancellation checkpoints.
+/// Interrupted calls spend call budget.
 /// A foreign blocking Read implementation has no invented wall-clock deadline.
 pub struct ReaderSearch<'needle, R: Read> {
     reader: R,
@@ -234,6 +256,8 @@ pub struct ReaderSearch<'needle, R: Read> {
     header: u64,
     cursor: Option<ByteSearchCursor<'needle>>,
     initialized: bool,
+    expression: Option<ExpressionWork<'needle>>,
+    expression_qualified: Option<bool>,
     lowercase: Option<LowercaseWork>,
     identifier: Option<IdentifierWork<'needle>>,
     witnesses: Vec<RetainedWitness>,
@@ -254,6 +278,8 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
     /// Search until completion, a work limit, or the first occurrence beyond the
     /// retained-hit limit. The latter leaves a lower-bound count and match-limit
     /// state; use `new_counting` to continue without retaining additional hits.
+    /// An expression must qualify its entire observation and always continues
+    /// scanning/counting, while withholding candidates until qualification.
     pub fn new(reader: R, request: CaptureRequest, length: ByteLength,
         needle: &'needle StreamingNeedle, options: StreamReadOptions,
         budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
@@ -270,8 +296,9 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
     /// not pages of an earlier query. This constructor does not relax that
     /// contract or make independently observed extents one complete capture.
     ///
-    /// Without counting, the first occurrence after the page fills establishes
-    /// a lower-bound count and match-limit state. With counting, omitted later
+    /// For literal patterns without counting, the first occurrence after the page
+    /// fills establishes a lower-bound count and match-limit state. Expressions
+    /// always continue to qualify/count their full input. With counting, omitted later
     /// occurrences consume work but no result storage. A false
     /// `StreamReadReport::has_more_matches` proves no later matches only when
     /// the input completed; byte/call limits and cancellation remain partial.
@@ -302,7 +329,9 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
             + MAX_STREAM_NEEDLE_BYTES * size_of::<usize>()
             + options.max_matches * size_of::<StreamingHit>()
             + MAX_STREAM_STEP_HITS * size_of::<fcb_search::stream::ByteMatch>())
-            .checked_add(lowercase_charge).ok_or(StreamReadError::InvalidLimits)?;
+            .checked_add(lowercase_charge)
+            .and_then(|n| n.checked_add(if needle.is_expression() { ExpressionWork::charge() } else { 0 }))
+            .ok_or(StreamReadError::InvalidLimits)?;
         let lease = budget.try_reserve_managed(needle.owner, allocation, ByteLength::new(charge as u64))
             .map_err(|_| StreamReadError::ResourceDenied)?;
         let mut buffer = reserve(STREAM_BUFFER_BYTES)?;
@@ -320,7 +349,8 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
         } else { None };
         let witnesses = reserve(if lowercase.is_some() { options.max_matches } else { 0 })?;
         let mut search = Self { reader, needle, request, length, options, count_all_matches, skip_matches, encoding: options.encoding,
-            header: 0, initialized: cursor.is_some(), cursor, lowercase, identifier, witnesses,
+            header: 0, initialized: cursor.is_some(), cursor, expression: None, expression_qualified: None,
+            lowercase, identifier, witnesses,
             buffer, base: 0, filled: 0, ready: 0, consumed: 0, eof: false,
             hits: reserve(options.max_matches)?, matches_seen: 0, unsupported_at: None,
             state: StreamReadState::Pending, stats: StreamReadStats::default(), lease };
@@ -338,11 +368,29 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
     }
     pub const fn state(&self) -> StreamReadState { self.state }
     pub const fn stats(&self) -> StreamReadStats { self.stats }
-    pub fn hits(&self) -> &[StreamingHit] { &self.hits }
-    pub const fn matches_seen(&self) -> u64 { self.matches_seen }
+    /// Expressions publish no provisional anchor occurrences.
+    pub fn hits(&self) -> &[StreamingHit] {
+        if self.needle.is_expression() && !matches!(self.expression_qualified, Some(true)) { &[] }
+        else { &self.hits }
+    }
+    pub const fn matches_seen(&self) -> u64 {
+        if self.needle.is_expression() && !matches!(self.expression_qualified, Some(true)) { 0 }
+        else { self.matches_seen }
+    }
+    pub const fn is_expression(&self) -> bool { self.needle.is_expression() }
+    pub const fn expression_qualified(&self) -> Option<bool> { self.expression_qualified }
     pub const fn count_all_matches(&self) -> bool { self.count_all_matches }
     pub const fn generation(&self) -> QueryGeneration { self.options.generation }
-    pub fn cancel(&mut self) { self.state = StreamReadState::Canceled; }
+    pub fn cancel(&mut self) {
+        self.state = StreamReadState::Canceled;
+        self.expression_qualified = None;
+        self.discard_expression_candidates();
+    }
+    fn discard_expression_candidates(&mut self) {
+        if self.needle.is_expression() {
+            self.hits.clear(); self.witnesses.clear(); self.matches_seen = 0;
+        }
+    }
 
     pub fn step(&mut self, step: StreamReadStep, active: QueryGeneration,
         mut canceled: impl FnMut() -> bool) -> Result<StreamReadState, StreamReadError> {
@@ -352,7 +400,12 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
         if self.state != StreamReadState::Pending { return Ok(self.state); }
         if step.max_bytes == 0 || step.max_hits == 0 { return Ok(self.state); }
         let result = self.advance(step, &mut canceled);
-        if let Err(error) = result { self.state = StreamReadState::Failed(error); return Err(error); }
+        if let Err(error) = result {
+            self.state = StreamReadState::Failed(error);
+            self.expression_qualified = None;
+            self.discard_expression_candidates();
+            return Err(error);
+        }
         if canceled() { self.cancel(); }
         Ok(self.state)
     }
@@ -386,21 +439,28 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
         if self.identifier.is_some() && self.ready > 0 {
             self.advance_identifier(step)?;
         } else if self.lowercase.is_some() && self.ready > 0 {
-            self.advance_lowercase(step)?;
+            self.advance_lowercase(step, canceled)?;
         } else if self.ready > self.consumed {
+            let before = self.consumed;
             let cursor = self.cursor.as_mut().ok_or(StreamReadError::InvalidRange)?;
             let batch = cursor.step(&self.buffer[self.consumed..self.ready], step.max_bytes.min(STREAM_BUFFER_BYTES),
                 step.max_hits.min(MAX_STREAM_STEP_HITS))?;
             self.consumed += batch.consumed;
             self.stats.scanned_bytes = cursor.scanned_bytes();
             self.stats.last_step_scanned = batch.consumed;
+            if let Some(expression) = &mut self.expression {
+                if !expression.feed_exact(&self.buffer[before..self.consumed], self.header, self.encoding, canceled)? {
+                    self.cancel();
+                    return Ok(());
+                }
+            }
             for hit in batch.hits {
                 if self.needle.mode == StreamingMode::ExactText && (hit.start < self.header
                     || (self.encoding.is_some_and(|encoding| encoding.is_utf16()) && hit.start % 2 != 0)) { continue; }
                 self.matches_seen += 1;
                 if self.matches_seen <= self.skip_matches { continue; }
                 if self.hits.len() == self.options.max_matches {
-                    if self.count_all_matches { continue; }
+                    if self.count_all_matches || self.needle.is_expression() { continue; }
                     self.state = StreamReadState::Truncated; break;
                 }
                 let range = ByteRange::new(ByteOffset::new(hit.start), ByteOffset::new(hit.end))
@@ -503,12 +563,14 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
         Ok(())
     }
 
-    fn advance_lowercase(&mut self, step: StreamReadStep) -> Result<(), StreamReadError> {
+    fn advance_lowercase(&mut self, step: StreamReadStep, canceled: &mut impl FnMut() -> bool)
+        -> Result<(), StreamReadError> {
         let before = self.consumed;
         let end = self.ready.min(self.consumed + step.max_bytes.min(STREAM_BUFFER_BYTES));
         let max_hits = step.max_hits.min(MAX_STREAM_STEP_HITS);
         let mut emitted = 0;
         while emitted < max_hits {
+            if self.needle.is_expression() && canceled() { self.cancel(); return Ok(()); }
             let work = self.lowercase.as_mut().ok_or(StreamReadError::InvalidRange)?;
             if let Some((scalar, units)) = &mut work.pending {
                 if let Some(unit) = units.next() {
@@ -521,7 +583,7 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
                         }
                         if self.hits.len() == self.options.max_matches {
                             self.matches_seen = occurrence;
-                            if self.count_all_matches { continue; }
+                            if self.count_all_matches || self.needle.is_expression() { continue; }
                             self.state = StreamReadState::Truncated;
                             break;
                         }
@@ -569,6 +631,7 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
             work.position += ch.len_utf8();
             let scalar = SourceScalar { ch, raw_start, raw_end, decoded_start, decoded_end };
             work.pending = Some((scalar, work.cursor.units(ch)));
+            if let Some(expression) = &mut self.expression { expression.feed_scalar(scalar)?; }
         }
         self.stats.last_step_scanned = self.consumed - before;
         self.stats.scanned_bytes = self.base + self.consumed as u64;
@@ -594,6 +657,9 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
             let needle: &'needle StreamingNeedle = self.needle;
             if self.lowercase.is_none() && self.identifier.is_none() {
                 self.cursor = Some(ByteSearchCursor::new(needle.encoded(self.encoding))?);
+            }
+            if let Some(expression) = &needle.expression {
+                self.expression = Some(ExpressionWork::new(expression, needle.mode, encoding)?);
             }
             self.initialized = true;
         }
@@ -628,16 +694,24 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
             else if self.stats.bytes_read >= self.options.max_bytes { StreamReadState::ByteLimit }
             else if self.stats.read_calls >= self.options.max_read_calls { StreamReadState::CallLimit }
             else { StreamReadState::Pending };
+        if self.needle.is_expression() && self.state != StreamReadState::Pending {
+            self.expression_qualified = if self.state == StreamReadState::Complete {
+                Some(self.matches_seen > 0 && self.expression.as_ref().is_some_and(ExpressionWork::qualifies))
+            } else { None };
+            if !matches!(self.expression_qualified, Some(true)) { self.discard_expression_candidates(); }
+        }
     }
 
     /// Returns the reader to its host and a self-contained result table borrowing
     /// only the immutable compiled literal. It never retains the reader/buffers.
     /// The conservative lease remains attached to the report until it is dropped.
-    pub fn finish(self) -> Result<(R, StreamReadReport<'needle>), StreamReadError> {
+    pub fn finish(mut self) -> Result<(R, StreamReadReport<'needle>), StreamReadError> {
         if self.state == StreamReadState::Pending { return Err(StreamReadError::Pending); }
+        if !matches!(self.expression_qualified, Some(true)) { self.discard_expression_candidates(); }
         let report = StreamReadReport { needle: self.needle, request: self.request, length: self.length,
             generation: self.options.generation, encoding: self.encoding, header: self.header,
             count_all_matches: self.count_all_matches, skip_matches: self.skip_matches,
+            expression_qualified: self.expression_qualified,
             hits: self.hits, witnesses: self.witnesses, matches_seen: self.matches_seen, unsupported_at: self.unsupported_at,
             state: self.state, stats: self.stats, _lease: self.lease };
         Ok((self.reader, report))
@@ -653,6 +727,7 @@ pub struct StreamReadReport<'needle> {
     header: u64,
     count_all_matches: bool,
     skip_matches: u64,
+    expression_qualified: Option<bool>,
     hits: Vec<StreamingHit>,
     witnesses: Vec<RetainedWitness>,
     matches_seen: u64,
@@ -669,11 +744,19 @@ impl StreamReadReport<'_> {
     pub const fn header_bytes(&self) -> u64 { self.header }
     pub fn mode(&self) -> StreamingMode { self.needle.mode }
     pub fn text_literal(&self) -> Option<&str> { self.needle.text_value() }
+    pub const fn is_expression(&self) -> bool { self.needle.is_expression() }
+    /// Content eligibility over this observation, including the primary term.
+    /// None means a literal pattern or unresolved/incomplete expression. Use
+    /// `is_expression` to distinguish those cases. Metadata filters belong to
+    /// the host's admission policy and are not evaluated by a reader.
+    pub const fn expression_qualified(&self) -> Option<bool> { self.expression_qualified }
     pub const fn state(&self) -> StreamReadState { self.state }
     pub const fn stats(&self) -> StreamReadStats { self.stats }
     pub const fn matches_seen(&self) -> u64 { self.matches_seen }
     /// Whether this scan was asked to continue counting after its hit table filled.
     /// Work limits, cancellation and decoding failures can still leave it partial.
+    /// Expressions also count their full observation when this requested flag
+    /// is false, because qualification already requires scanning the whole input.
     pub const fn count_all_matches(&self) -> bool { self.count_all_matches }
     /// Requested number of occurrences preceding this page, independent of how
     /// many occurrences the admitted scan actually reached.
