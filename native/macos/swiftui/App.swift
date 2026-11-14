@@ -319,6 +319,9 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     @State private var projectBrowser = AtlasProjectBrowserModel(transport: .native)
     @State private var projectChanges = AtlasProjectChanges(makeDriver: { AtlasNativeProjectChangeDriver() })
     @State private var projectRefresh = AtlasProjectRefresh(transport: .native)
+    @State private var liveRefresh = AtlasProjectLiveRefresh()
+    @State private var liveRefreshEnabled = false
+    @State private var automaticRefreshProject: UUID?
     @State private var projectRefreshIO = AtlasProjectIO()
     @State private var refreshOriginProject: UUID?
     // Readers in Project Files belong to this root/grant lifetime, not to one
@@ -594,6 +597,14 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             }
             .disabled(!projectOpening.canBrowse)
             .help("Browse known files without waiting for text-atlas previews")
+            Menu {
+                Toggle("Live refresh", isOn: $liveRefreshEnabled)
+                Button("Refresh project", action: requestAtlasLoad)
+                    .disabled(!projectOpening.canBrowse || loadingProject || projectRefresh.isRefreshing)
+            } label: {
+                Label(liveRefreshEnabled ? "Live refresh on" : "Refresh", systemImage: "arrow.triangle.2.circlepath")
+            }
+            .help("Keep this window's project catalog, atlas and project search current after filesystem changes. Open captured readers keep their bytes.")
             Picker("Atlas projection", selection: $showsCity) {
                 Text("2D").tag(false)
                 Text("City").tag(true)
@@ -715,6 +726,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         .onDisappear {
             projectViewActive = false
             nativeOpen.close()
+            liveRefresh.close()
+            automaticRefreshProject = nil
             projectRefresh.cancel()
             refreshOriginProject = nil
             projectViewIdentity = UUID()
@@ -819,6 +832,18 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                   projectOpening.projectID == browserProject, let info = projectBrowser.info else { return }
             projectChanges.reportDiscovery(project: browserProject, complete: info.complete,
                 more: info.more, omissions: info.omissionCount)
+        }
+        .onChange(of: liveRefreshInput, initial: true) { _, input in
+            liveRefresh.update(input) { ticket in
+                guard liveRefreshInput.admits(ticket), projectChanges.acceptsAutomaticRefresh(ticket) else { return false }
+                return requestProjectRefresh(automatic: ticket)
+            }
+        }
+        .onChange(of: liveRefreshEnabled) { _, enabled in
+            if !enabled, automaticRefreshProject != nil { projectRefresh.cancel() }
+        }
+        .onChange(of: projectRefresh.isRefreshing) { _, refreshing in
+            if !refreshing { automaticRefreshProject = nil }
         }
         .onChange(of: Array(query.utf8)) { _, _ in
             // Revoke old rows immediately, including empty or invalid edits.
@@ -1282,6 +1307,35 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         return "\(browserProject):\(info.owner):\(info.latest):\(info.complete):\(info.more):\(info.omissionCount)"
     }
 
+    /// Both admission and publication protect transient current-project
+    /// consumers. The manual refresh transaction closes those surfaces; an
+    /// unattended refresh must wait instead of dismissing an active workflow.
+    private var liveRefreshContextReady: Bool {
+        guard projectViewActive, !loadingProject, !projectOpening.isPreparing,
+              !atlasLayoutPending, projectOpening.canBrowse, !projectBrowser.closed, !projectBrowser.busy,
+              browserProject == loadGeneration, projectBrowser.root.utf8.elementsEqual(root.utf8),
+              (try? fileScope.searchScope(custom: customExtensions)) != nil,
+              observedReader == nil, workspaceStreamSearch == nil, projectLinks == nil,
+              !snapshotExport.busy, !showsFileFinder, !showsReadingDesk,
+              !showsSavedRepository, !showsSnapshotComparison,
+              !nativeOpen.isLoading, !nativeOpen.showsReader,
+              sourceTask == nil, !searchPending, !searchFocused,
+              !camera.isDragging, !camera.isAnimating else { return false }
+#if FCB_APP_STORE
+        guard !rootAccessLoader.isLoading, let access = rootAccess,
+              access.url.path.utf8.elementsEqual(root.utf8),
+              projectBrowser.rootAccessIdentity == ObjectIdentifier(access) else { return false }
+#endif
+        return true
+    }
+
+    private var liveRefreshInput: AtlasProjectLiveRefreshInput {
+        AtlasProjectLiveRefreshInput(generation: projectChanges.generation,
+            change: projectChanges.refreshTicket?.change, enabled: liveRefreshEnabled,
+            watching: projectChanges.allowsAutomaticRefresh,
+            canRefresh: liveRefreshContextReady && !projectRefresh.isRefreshing)
+    }
+
     @ViewBuilder private var projectChangeNotice: some View {
         if let notice = projectChanges.notice {
             HStack(alignment: .top, spacing: 10) {
@@ -1291,6 +1345,9 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                     Text(notice).font(.callout)
                     Text("Pinned and kept captures remain unchanged.")
                         .font(.caption).foregroundStyle(.secondary)
+                    if let liveNotice = liveRefresh.notice {
+                        Text(liveNotice).font(.caption).foregroundStyle(.secondary)
+                    }
                 }.frame(maxWidth: .infinity, alignment: .leading)
                 Button("Refresh project", action: requestAtlasLoad)
                     .disabled(loadingProject || projectRefresh.isRefreshing)
@@ -1311,7 +1368,11 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 Text(projectRefresh.notice).font(.callout)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 if projectRefresh.isRefreshing {
-                    Button("Cancel refresh") { projectRefresh.cancel() }
+                    if automaticRefreshProject != nil {
+                        Button("Pause live refresh") { liveRefreshEnabled = false; projectRefresh.cancel() }
+                    } else {
+                        Button("Cancel refresh") { projectRefresh.cancel() }
+                    }
                 } else {
                     Button("Dismiss") { refreshOriginProject = nil }
                 }
@@ -1798,17 +1859,20 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         }
     }
 
-    private func requestProjectRefresh() {
+    @discardableResult private func requestProjectRefresh(automatic: AtlasProjectChangeTicket? = nil) -> Bool {
         guard projectViewActive, !projectRefresh.isRefreshing, !loadingProject,
               !projectOpening.isPreparing, !atlasLayoutPending,
               projectOpening.canBrowse, !projectBrowser.closed,
-              browserProject == loadGeneration, projectBrowser.root.utf8.elementsEqual(root.utf8) else { return }
+              browserProject == loadGeneration, projectBrowser.root.utf8.elementsEqual(root.utf8) else { return false }
+        if let automatic {
+            guard liveRefreshInput.admits(automatic), projectChanges.acceptsAutomaticRefresh(automatic) else { return false }
+        }
         let previous = projectBrowser, previousProject = browserProject
         let requestedRoot = root, previousRevision = atlasRevision, previousRequest = atlasLayoutRequest
         let requestedScope = fileScope, requestedExtensions = Array(customExtensions.utf8)
         guard let scope = try? fileScope.searchScope(custom: customExtensions) else {
             status = "Choose a valid file scope before refreshing the atlas."
-            return
+            return false
         }
         let includesUnsupportedNames = fileScope == .all
         let previousEntries = atlasEntries, previousBounds = contentBounds, refreshAtlas = hasMetadataAtlas
@@ -1818,7 +1882,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         guard !rootAccessLoader.isLoading, let access = rootAccess,
               access.url.path.utf8.elementsEqual(root.utf8) else {
             status = "Choose the project folder again to grant read access."
-            return
+            return false
         }
         accessLease = access
 #else
@@ -1835,18 +1899,26 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 }
             },
             accepted: { candidate in
+                if let automatic {
+                    guard liveRefreshEnabled, liveRefreshContextReady,
+                          projectChanges.acceptsAutomaticRefresh(automatic) else { return false }
+                }
                 guard atlasRevision == previousRevision, atlasLayoutRequest == previousRequest,
                       fileScope == requestedScope, Array(customExtensions.utf8) == requestedExtensions,
                       hasMetadataAtlas == refreshAtlas, !atlasLayoutPending, !projectOpening.isPreparing else { return false }
                 return acceptProjectRefresh(candidate, replacing: previous, atlas: stagedAtlas, accessLease: accessLease)
             },
             failed: { project in projectChanges.cancelDiscovery(project: project) }) {
+            automaticRefreshProject = automatic == nil ? nil : project
             refreshOriginProject = previousProject
             // The coordinator opens on a later main-actor turn. Record the
             // watcher epoch before any candidate result can be delivered.
             projectChanges.bind(root: root, accessLease: accessLease)
+            liveRefresh.didStart(projectChanges.refreshTicket, input: liveRefreshInput)
             projectChanges.beginDiscovery(project: project)
+            return true
         }
+        return false
     }
 
     /// Commit only after the replacement page is validated. There is no await
@@ -1940,6 +2012,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     /// Initial project opening performs only the bounded metadata operation.
     /// Text capture/highlighting/raster preparation is a subsequent action.
     private func replaceProject() {
+        liveRefresh.close()
+        automaticRefreshProject = nil
         projectRefresh.cancel()
         refreshOriginProject = nil
         projectViewIdentity = UUID()

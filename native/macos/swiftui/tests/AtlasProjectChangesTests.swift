@@ -32,6 +32,21 @@ private final class ChangeDriver: AtlasProjectChangeDriver, @unchecked Sendable 
     }
 }
 
+@MainActor private final class ChangeDelay {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var entries = 0
+    func wait() async {
+        precondition(continuation == nil, "More than one coalescing wake entered")
+        entries += 1
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func release() {
+        let value = continuation
+        continuation = nil
+        value?.resume()
+    }
+}
+
 /// Pure model and actual bounded mailbox. OS event delivery, sandbox scope
 /// activation and native teardown are qualified separately on macOS.
 @MainActor @main private enum AtlasProjectChangesTests {
@@ -59,6 +74,12 @@ private final class ChangeDriver: AtlasProjectChangeDriver, @unchecked Sendable 
         try await modelOwnershipAndRetry()
         try await pendingHintPreventsAcknowledgment()
         try await independentWindows()
+        liveRefreshConsumesOnlyAdmittedEpochs()
+        try await liveRefreshCoalescesWithoutStarvation()
+        try await liveRefreshDefersAndRetainsRefusedAdmission()
+        try await liveRefreshFencesCloseAndRebinding()
+        try await automaticReceiptsRejectQueuedAndNewerHints()
+        try await manualRefreshRebindConsumesTheNewGeneration()
         print("Project-change admission, bounded delivery and refresh acknowledgment: \(checks) checks passed")
     }
 
@@ -220,5 +241,180 @@ private final class ChangeDriver: AtlasProjectChangeDriver, @unchecked Sendable 
         check(second.hints == .volumeChanged && secondDriver.counts.stopped == 0,
               "Closing one window cannot revoke another's stream, hints or grant")
         second.close()
+    }
+
+    private static func liveInput(_ generation: UUID, _ change: UUID = UUID(), enabled: Bool = true,
+                                  watching: Bool = true, available: Bool = true) -> AtlasProjectLiveRefreshInput {
+        AtlasProjectLiveRefreshInput(generation: generation, change: change,
+            enabled: enabled, watching: watching, canRefresh: available)
+    }
+
+    private static func liveRefreshConsumesOnlyAdmittedEpochs() {
+        let generation = UUID(), first = UUID(), newer = UUID()
+        var state = AtlasProjectLiveRefreshState()
+        let input = liveInput(generation, first)
+        state.update(input)
+        check(state.ready == input.ticket, "A watched dirty epoch can request reconciliation")
+        state.didStart(input.ticket!)
+        for _ in 0..<100 {
+            state.update(input)
+            check(state.ready == nil && state.pending == nil,
+                  "Failed, partial or canceled admitted work cannot retry the same unchanged hint")
+        }
+        state.update(liveInput(generation, newer, available: false))
+        check(state.pending?.change == newer && state.ready == nil, "A change during work remains pending without parallel admission")
+        state.update(liveInput(generation, newer))
+        check(state.ready?.change == newer, "Draining the prior work exposes the latest dirty epoch")
+        state.didStart(state.ready!)
+        state.update(liveInput(generation, newer, enabled: false))
+        state.update(liveInput(generation, newer))
+        check(state.ready == nil, "Toggling does not turn retained uncertainty into a fresh filesystem event")
+
+        state.update(liveInput(generation, UUID(), watching: false))
+        check(state.pending == nil, "Moved roots and unavailable monitoring cannot automatically rebind by path")
+        let replacement = liveInput(UUID(), first)
+        state.update(replacement)
+        state.didStart(input.ticket!)
+        check(state.ready == replacement.ticket, "An old watcher cannot consume the replacement root's epoch")
+        state.didStart(replacement.ticket!)
+        check(state.ready == nil, "A manual admitted refresh also consumes its current epoch")
+    }
+
+    private static func liveRefreshCoalescesWithoutStarvation() async throws {
+        let delay = ChangeDelay(), refresh = AtlasProjectLiveRefresh(wait: { await delay.wait() })
+        let generation = UUID()
+        var latest = liveInput(generation), calls: [AtlasProjectChangeTicket] = []
+        refresh.update(latest) { calls.append($0); return true }
+        try await until { delay.entries == 1 }
+        for _ in 0..<10_000 {
+            latest = liveInput(generation)
+            refresh.update(latest) { calls.append($0); return true }
+        }
+        check(delay.entries == 1 && calls.isEmpty, "An event storm neither creates timer tasks nor starts scans inline")
+        delay.release()
+        try await until { calls.count == 1 }
+        check(calls[0] == latest.ticket, "The original wake dispatches the latest epoch instead of being postponed by every save")
+        refresh.update(latest) { calls.append($0); return true }
+        check(delay.entries == 1, "Retained partial hints cannot schedule another timer")
+        refresh.close()
+    }
+
+    private static func liveRefreshDefersAndRetainsRefusedAdmission() async throws {
+        let delay = ChangeDelay(), refresh = AtlasProjectLiveRefresh(wait: { await delay.wait() })
+        let generation = UUID(), change = UUID()
+        var accepted = false, calls = 0
+        let perform: @MainActor (AtlasProjectChangeTicket) -> Bool = { _ in calls += 1; return accepted }
+        let available = liveInput(generation, change)
+        let busy = liveInput(generation, change, available: false)
+        refresh.update(available, action: perform)
+        try await until { delay.entries == 1 }
+        refresh.update(busy, action: perform)
+        delay.release()
+        try await until { !refresh.hasScheduledWake }
+        check(calls == 0 && refresh.notice?.contains("waiting") == true,
+              "A workflow opened during coalescing prevents admission without dropping the epoch")
+        refresh.update(available, action: perform)
+        try await until { delay.entries == 2 }
+        delay.release()
+        try await until { calls == 1 }
+        for _ in 0..<10 { refresh.update(available, action: perform) }
+        check(delay.entries == 2, "A pre-admission refusal cannot immediately loop")
+        accepted = true
+        refresh.update(busy, action: perform)
+        refresh.update(available, action: perform)
+        try await until { delay.entries == 3 }
+        delay.release()
+        try await until { calls == 2 }
+        refresh.update(available, action: perform)
+        check(delay.entries == 3, "The later successful admission consumes the still-pending epoch")
+        refresh.close()
+    }
+
+    private static func liveRefreshFencesCloseAndRebinding() async throws {
+        for transition in ["close", "rebind", "disable"] {
+            let delay = ChangeDelay(), refresh = AtlasProjectLiveRefresh(wait: { await delay.wait() })
+            var calls: [AtlasProjectChangeTicket] = []
+            let old = liveInput(UUID())
+            let replacement = transition == "disable" ? old : liveInput(UUID())
+            refresh.update(old) { calls.append($0); return true }
+            try await until { delay.entries == 1 }
+            if transition == "close" { refresh.close() }
+            if transition == "disable" {
+                var disabled = old; disabled.enabled = false
+                refresh.update(disabled) { calls.append($0); return true }
+            }
+            refresh.update(replacement) { calls.append($0); return true }
+            check(delay.entries == 1, "A canceled but entered wake retains its one slot across rebinding or re-enabling")
+            delay.release()
+            try await until { delay.entries == 2 }
+            check(calls.isEmpty, "A revoked timer cannot dispatch the replacement or re-enabled project")
+            delay.release()
+            try await until { calls.count == 1 }
+            check(calls[0] == replacement.ticket, "The admitted binding receives its own coalescing interval")
+            var disabled = replacement; disabled.enabled = false; disabled.change = UUID()
+            refresh.update(disabled) { calls.append($0); return true }
+            check(delay.entries == 2 && refresh.notice == nil, "Turning off live refresh leaves no pending automatic work")
+            refresh.close()
+        }
+    }
+
+    private static func automaticReceiptsRejectQueuedAndNewerHints() async throws {
+        let driver = ChangeDriver(), changes = AtlasProjectChanges(makeDriver: { driver })
+        changes.bind(root: "/repo", accessLease: nil)
+        driver.emit(.watching)
+        driver.emit(.changed(.contentsChanged))
+        try await until { changes.allowsAutomaticRefresh && changes.refreshTicket != nil }
+        let first = changes.refreshTicket!
+        check(changes.acceptsAutomaticRefresh(first), "A matching watched dirty epoch permits automatic reconciliation")
+        driver.emit(.changed(.contentsChanged))
+        check(!changes.acceptsAutomaticRefresh(first), "Undelivered hints fence scan publication before the main-actor wake")
+        try await until { changes.refreshTicket != first }
+        let newer = changes.refreshTicket!
+        check(!changes.acceptsAutomaticRefresh(first) && changes.acceptsAutomaticRefresh(newer),
+              "Repeated same-kind hints still revoke the older scan's receipt")
+        driver.emit(.changed(.rootMoved))
+        try await until { !changes.allowsAutomaticRefresh }
+        check(!changes.acceptsAutomaticRefresh(newer), "Automatic refresh never follows a moved root")
+        changes.bind(root: "/repo", accessLease: NSObject())
+        driver.emit(.watching); driver.emit(.changed(.contentsChanged))
+        try await until { changes.allowsAutomaticRefresh && changes.refreshTicket != nil }
+        check(!changes.acceptsAutomaticRefresh(newer), "A replacement grant invalidates the old refresh receipt")
+        changes.close()
+        check(!changes.acceptsAutomaticRefresh(changes.refreshTicket ?? newer), "Closing revokes scan publication")
+    }
+
+    private static func manualRefreshRebindConsumesTheNewGeneration() async throws {
+        let driver = ChangeDriver(), changes = AtlasProjectChanges(makeDriver: { driver })
+        let delay = ChangeDelay(), refresh = AtlasProjectLiveRefresh(wait: { await delay.wait() })
+        var calls = 0
+        func input(available: Bool) -> AtlasProjectLiveRefreshInput {
+            AtlasProjectLiveRefreshInput(generation: changes.generation, change: changes.refreshTicket?.change,
+                enabled: true, watching: changes.allowsAutomaticRefresh, canRefresh: available)
+        }
+        changes.bind(root: "/repo", accessLease: nil)
+        driver.emit(.unavailable)
+        try await until { changes.monitoring == .unavailable }
+        refresh.update(input(available: true)) { _ in calls += 1; return true }
+        let oldGeneration = changes.generation
+        // Same-root manual refresh restarts monitoring before SwiftUI can
+        // publish a new live-refresh input. Its first discovery stays partial.
+        changes.bind(root: "/repo", accessLease: nil)
+        let ticket = changes.refreshTicket!, project = UUID()
+        check(changes.generation != oldGeneration, "The manual retry owns a new watcher lifetime")
+        refresh.didStart(ticket, input: input(available: false))
+        changes.beginDiscovery(project: project)
+        driver.emit(.watching)
+        try await until { changes.allowsAutomaticRefresh }
+        changes.reportDiscovery(project: project, complete: false, more: true, omissions: 0)
+        refresh.update(input(available: true)) { _ in calls += 1; return true }
+        check(!refresh.hasScheduledWake && calls == 0 && changes.refreshTicket == ticket,
+              "A partial manual refresh cannot enqueue a duplicate automatic scan after rebind")
+        driver.emit(.changed(.contentsChanged))
+        try await until { changes.refreshTicket != ticket }
+        refresh.update(input(available: true)) { _ in calls += 1; return true }
+        try await until { delay.entries == 1 }
+        delay.release()
+        try await until { calls == 1 }
+        refresh.close(); changes.close()
     }
 }

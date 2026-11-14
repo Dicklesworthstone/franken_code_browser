@@ -279,6 +279,38 @@ or a newer observed change. Choosing a different folder or granting access again
 replaces the project through the normal opening flow. Refresh does not migrate
 annotations between different source captures.
 
+### Automatic live refresh
+
+Enable **Live refresh** in the toolbar's **Refresh** menu to keep this window's
+project catalog, atlas and project search current after observed filesystem
+changes. It is off initially and scoped to this window. Changes are coalesced
+for 750 milliseconds and use the same bounded, cancelable refresh transaction
+described above. Repeated saves update the pending change without creating
+parallel scans or postponing the coalescing interval indefinitely.
+
+Automatic work waits while you interact with search or move the camera, while
+project loading/export is active, and while current-range, streaming-search,
+relationship, file-finder, Reading Desk, saved-repository or comparison workflows
+are open. These conditions are checked again before installing the replacement.
+Open captured and pinned readers keep their original bytes, selection and
+navigation. A successful replacement restarts project search under the new
+catalog authority.
+
+A newer filesystem event, queued watcher hint, changed grant/root or newly
+opened protected workflow prevents an older automatic candidate from replacing
+the project. The latest observed change stays pending for a later available
+turn. A partial, failed or canceled attempt is not retried indefinitely without
+a new change: the notice offers **Refresh project** for an explicit retry or
+continued discovery. Partial discovery still cannot establish deletion.
+
+**Pause live refresh** turns the option off and cancels an automatic attempt
+while its entered work drains. Turning the toggle off leaves a manual refresh
+under its existing explicit cancellation control. Unavailable monitoring or a
+moved root suspends automatic work; choosing the folder again restores the
+normal access and monitoring flow. Native lifecycle tests cover coalescing,
+protected workflows, new-event publication races and retained-reader continuity;
+physical-Mac qualification remains pending.
+
 ### Opening a source file
 
 ```sh

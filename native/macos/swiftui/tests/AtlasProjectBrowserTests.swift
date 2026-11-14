@@ -1,6 +1,20 @@
 import Foundation
 import Dispatch
 
+private final class ProjectRefreshChangeDriver: AtlasProjectChangeDriver, @unchecked Sendable {
+    private let lock = NSLock()
+    private var delivery: (UUID, @Sendable (UUID, AtlasProjectChangeEvent) -> Void)?
+    func watch(root: String, generation: UUID, accessLease: AnyObject?,
+               emit: @escaping @Sendable (UUID, AtlasProjectChangeEvent) -> Void) {
+        lock.lock(); delivery = (generation, emit); lock.unlock()
+    }
+    func stop() { lock.lock(); delivery = nil; lock.unlock() }
+    func emit(_ event: AtlasProjectChangeEvent) {
+        lock.lock(); let current = delivery; lock.unlock()
+        if let current { current.1(current.0, event) }
+    }
+}
+
 /// Only the foreign boundary is injected. Production page admission, current
 /// row authority, recovery and retained-reader scheduling remain in use.
 private final class ProjectBrowserFixture: @unchecked Sendable {
@@ -549,6 +563,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         try await failedAndRejectedRefreshKeepTheAcceptedProject()
         try await canceledRefreshDrainsBeforeRetryAndRetainsItsGrant()
         try await refreshPreservesPartialAndEmptyCoverage()
+        try await liveRefreshUsesTheRealTransactionAndPreservesReaders()
         try await refreshedCatalogVerifiesLinksWithoutReplacingTheReader()
         await refreshRejectsInvalidRootsAndCancelBeforeEntry()
         try await capturedDocumentLinkOpensIndependentChain()
@@ -1314,6 +1329,77 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         precondition(refresh.isRefreshing && failures == [project])
         await wait("pre-entry cancel did not release its slot") { !refresh.isRefreshing }
         precondition(f.calls.isEmpty && failures == [project])
+    }
+
+    /// A real refresh coordinator and retained reader, with only foreign
+    /// discovery/source calls and the debounce delay injected. New hints and
+    /// protected current-project workflows are rechecked after entered work.
+    @MainActor private static func liveRefreshUsesTheRealTransactionAndPreservesReaders() async throws {
+        for race in ["none", "newer-event", "workflow", "pause"] {
+            let f = ProjectBrowserFixture(), old = AtlasProjectBrowserModel(transport: f.transport)
+            try await old.open(root: "/repo", accessLease: nil)
+            let capture = try await old.openFile(old.page!.files[0], from: old.page!, readerTransport: f.readerTransport)
+            let original = capture.reader.page!
+            let driver = ProjectRefreshChangeDriver(), changes = AtlasProjectChanges(makeDriver: { driver })
+            let live = AtlasProjectLiveRefresh(wait: {}), refresh = AtlasProjectRefresh(transport: f.transport)
+            let project = UUID()
+            var enabled = true, protectedWorkflow = false, attempts = 0, failures = 0
+            var installed: AtlasProjectBrowserModel?, entered: CheckedContinuation<Void, Never>?
+            changes.bind(root: "/repo", accessLease: nil)
+            driver.emit(.watching); driver.emit(.changed(.contentsChanged))
+            await wait("watcher did not publish a dirty epoch") { changes.refreshTicket != nil && changes.allowsAutomaticRefresh }
+            let initial = changes.refreshTicket!
+            let input = AtlasProjectLiveRefreshInput(generation: changes.generation, change: initial.change,
+                enabled: true, watching: true, canRefresh: true)
+            live.update(input) { ticket in
+                guard enabled, !protectedWorkflow, changes.acceptsAutomaticRefresh(ticket) else { return false }
+                guard let candidate = refresh.stage(root: "/repo", project: project, accessLease: nil,
+                    prepare: { _ in await withCheckedContinuation { entered = $0 } },
+                    accepted: { candidate in
+                        guard enabled, !protectedWorkflow, changes.acceptsAutomaticRefresh(ticket) else { return false }
+                        installed = candidate.browser
+                        let info = candidate.browser.info!
+                        changes.reportDiscovery(project: candidate.project, complete: info.complete,
+                            more: info.more, omissions: info.omissionCount)
+                        old.close()
+                        return true
+                    }, failed: { candidate in failures += 1; changes.cancelDiscovery(project: candidate) }) else { return false }
+                attempts += 1
+                changes.beginDiscovery(project: candidate)
+                return true
+            }
+            await wait("automatic work did not enter the real refresh coordinator") { entered != nil }
+            precondition(attempts == 1 && refresh.isRefreshing && !old.closed && installed == nil)
+            precondition(capture.reader.page?.identity.matches(original.identity) == true)
+            switch race {
+            case "newer-event":
+                driver.emit(.changed(.contentsChanged))
+                await wait("newer dirty epoch was not delivered") { changes.refreshTicket != initial }
+            case "workflow": protectedWorkflow = true
+            case "pause": enabled = false; live.close(); refresh.cancel()
+            default: break
+            }
+            entered!.resume(); entered = nil
+            await wait("automatic refresh did not drain") { !refresh.isRefreshing }
+            precondition(attempts == 1 && (installed != nil) == (race == "none"))
+            precondition(failures == (race == "none" ? 0 : 1))
+            precondition(old.closed == (race == "none"))
+            precondition(capture.reader.page?.identity.matches(original.identity) == true
+                && capture.reader.page?.originalHex == original.originalHex && capture.reader.canPin,
+                "Automatic refresh replaced or retired an independent exact source reader")
+            capture.reader.offsetInput = "4"; capture.reader.goToByte()
+            await wait("retained source navigation failed after automatic refresh") { !capture.reader.busy }
+            precondition(capture.reader.page?.text == "ured\n")
+            if race == "none" {
+                precondition(changes.refreshTicket == initial && installed?.canContinue == true,
+                    "A partial first page cannot acknowledge the filesystem hint")
+                live.update(input) { _ in preconditionFailure("Partial coverage triggered a repeated automatic scan") }
+                for _ in 0..<10 { await Task.yield() }
+                precondition(attempts == 1)
+            }
+            live.close(); refresh.close(); changes.close()
+            capture.reader.close(); installed?.close(); old.close()
+        }
     }
     @MainActor private static func prepareLink(_ reader: AtlasPagedReaderModel) async -> AtlasReaderDocumentLinkTarget {
         let preview = reader.documentPreview
