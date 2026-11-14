@@ -1,6 +1,177 @@
 import SwiftUI
 import AppKit
 
+/// Commands are scoped to the reader that owns native keyboard focus. The weak
+/// registry lets the workspace toolbar use the same route as AppKit, including
+/// a field editor shared by several Find fields. No event monitor or last-used
+/// reader can redirect a command to a different pin, window or hidden history.
+@MainActor final class AtlasReaderCommands {
+    enum Command: Equatable { case find, next, previous }
+    private final class Registration {
+        weak var commands: AtlasReaderCommands?
+        init(_ commands: AtlasReaderCommands) { self.commands = commands }
+    }
+    private static var registrations: [Registration] = []
+    private weak var source: NSTextView?
+    private weak var field: NSTextField?
+    private var active = false
+    private var canMove: () -> Bool = { false }
+    private var move: (Bool) -> Void = { _ in }
+
+    init() {
+        Self.registrations.removeAll { $0.commands == nil }
+        Self.registrations.append(Registration(self))
+    }
+
+    func attach(source: NSTextView) { self.source = source }
+    func detach(source: NSTextView) { if self.source === source { self.source = nil } }
+    func attach(field: NSTextField) { self.field = field }
+    func detach(field: NSTextField) {
+        if self.field === field {
+            self.field = nil
+            active = false
+            canMove = { false }
+            move = { _ in }
+        }
+    }
+    func configure(active: Bool, canMove: @escaping () -> Bool, move: @escaping (Bool) -> Void) {
+        self.active = active
+        self.canMove = canMove
+        self.move = move
+    }
+
+    /// Return true for an owned but unavailable command as well: a pending or
+    /// edited Find must not accidentally navigate the workspace's old results.
+    @discardableResult
+    func perform(_ command: Command, in window: NSWindow?) -> Bool {
+        guard let window, ownsFocus(in: window) else { return false }
+        guard active, let field, field.isEnabled, field.window === window,
+              !field.isHiddenOrHasHiddenAncestor, window.attachedSheet == nil,
+              NSApp.modalWindow == nil || NSApp.modalWindow === window else { return true }
+        if let source, window.firstResponder === source, source.isHiddenOrHasHiddenAncestor { return true }
+        switch command {
+        case .find:
+            field.selectText(nil)
+        case .next, .previous:
+            if canMove() { move(command == .previous) }
+        }
+        return true
+    }
+
+    private func ownsFocus(in window: NSWindow) -> Bool {
+        guard let responder = window.firstResponder else { return false }
+        if let source, source.window === window, responder === source { return true }
+        guard let field, field.window === window else { return false }
+        return responder === field || field.currentEditor() === responder
+    }
+
+    @discardableResult
+    static func perform(_ command: Command) -> Bool { perform(command, in: NSApp.keyWindow) }
+
+    @discardableResult
+    static func perform(_ command: Command, in window: NSWindow?) -> Bool {
+        registrations.removeAll { $0.commands == nil }
+        return registrations.contains { $0.commands?.perform(command, in: window) == true }
+    }
+
+    static func command(for event: NSEvent) -> Command? {
+        guard event.type == .keyDown else { return nil }
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .control, .option])
+        switch event.charactersIgnoringModifiers?.lowercased() {
+        case "f" where modifiers == .command: return .find
+        case "g" where modifiers == .command: return .next
+        case "g" where modifiers == [.command, .shift]: return .previous
+        default: return nil
+        }
+    }
+}
+
+/// The window asks its native views for key equivalents even when the workspace
+/// has no search hits and its Next/Previous toolbar items are disabled. Every
+/// handler rechecks the actual first responder before accepting the event.
+@MainActor final class AtlasReaderTextView: NSTextView {
+    weak var readerCommands: AtlasReaderCommands?
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if let command = AtlasReaderCommands.command(for: event),
+           readerCommands?.perform(command, in: window) == true { return true }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
+@MainActor final class AtlasReaderFindTextField: NSTextField {
+    weak var readerCommands: AtlasReaderCommands?
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if let command = AtlasReaderCommands.command(for: event),
+           readerCommands?.perform(command, in: window) == true { return true }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
+/// Expose the actual AppKit field/editor identity, so two visible readers never
+/// compete for a SwiftUI focus flag. Query edits stay local and Enter remains
+/// the explicit request to search the retained capture.
+@MainActor struct AtlasReaderFindField: NSViewRepresentable {
+    @Binding var text: String
+    let commands: AtlasReaderCommands
+    let active: Bool
+    let canMove: () -> Bool
+    let move: (Bool) -> Void
+    let submit: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+    func makeNSView(context: Context) -> AtlasReaderFindTextField {
+        let field = AtlasReaderFindTextField()
+        field.placeholderString = "Find in retained file…"
+        field.isBezeled = true
+        field.bezelStyle = .roundedBezel
+        field.controlSize = .small
+        field.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        field.sendsActionOnEndEditing = false
+        field.delegate = context.coordinator
+        field.target = context.coordinator
+        field.action = #selector(Coordinator.submitQuery(_:))
+        field.setAccessibilityLabel("Text to find in this retained file")
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        field.readerCommands = commands
+        commands.attach(field: field)
+        return field
+    }
+    func updateNSView(_ field: AtlasReaderFindTextField, context: Context) {
+        context.coordinator.parent = self
+        field.isEnabled = context.environment.isEnabled
+        commands.configure(active: active && context.environment.isEnabled, canMove: canMove, move: move)
+        // Do not replace a live composition or normalize canonically equivalent
+        // but byte-distinct query text on an unrelated presentation update.
+        if !field.stringValue.utf8.elementsEqual(text.utf8),
+           (field.currentEditor() as? NSTextView)?.hasMarkedText() != true {
+            field.stringValue = text
+        }
+    }
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: AtlasReaderFindTextField, context: Context) -> CGSize? {
+        CGSize(width: proposal.width ?? 190, height: nsView.intrinsicContentSize.height)
+    }
+    static func dismantleNSView(_ field: AtlasReaderFindTextField, coordinator: Coordinator) {
+        field.readerCommands?.detach(field: field)
+        field.readerCommands = nil
+        field.delegate = nil
+        field.target = nil
+    }
+
+    @MainActor final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: AtlasReaderFindField
+        init(_ parent: AtlasReaderFindField) { self.parent = parent }
+        func controlTextDidChange(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            parent.text = field.stringValue
+        }
+        @objc func submitQuery(_ sender: NSTextField) {
+            guard sender.isEnabled, parent.active else { return }
+            parent.text = sender.stringValue
+            parent.submit()
+        }
+    }
+}
+
 /// A native UTF-16 target bound to the immutable source that produced it. This
 /// is not an original-byte range and never authorizes a fresh pathname read.
 struct AtlasReaderSelection {
@@ -23,6 +194,7 @@ struct AtlasReaderSelection {
     var backgroundColor: NSColor = .textBackgroundColor
     var foregroundColor: NSColor = .textColor
     var usesSyntaxPalette = false
+    var readerCommands: AtlasReaderCommands? = nil
     /// Only user-driven native changes are delivered; the receiver resolves
     /// original bytes against this immutable presentation on its bounded worker.
     var onSelectionChange: ((AtlasSource, UUID, NSRange?) -> Void)? = nil
@@ -31,6 +203,7 @@ struct AtlasReaderSelection {
     func makeCoordinator() -> AtlasSourceReaderController { AtlasSourceReaderController() }
     func makeNSView(context: Context) -> NSStackView { context.coordinator.view }
     func updateNSView(_ view: NSStackView, context: Context) {
+        context.coordinator.setReaderCommands(readerCommands)
         context.coordinator.update(source: source, navigation: navigation,
             selection: selection, wrapsLines: wrapsLines, showsLineNumbers: showsLineNumbers,
             showsWhitespace: showsWhitespace, firstPhysicalLine: firstPhysicalLine,
@@ -38,6 +211,9 @@ struct AtlasReaderSelection {
             foregroundColor: usesSyntaxPalette ? appearance.color("plain").nsColor : foregroundColor,
             palette: usesSyntaxPalette ? appearance : .canonical,
             onSelectionChange: onSelectionChange, styledSource: styledSource)
+    }
+    static func dismantleNSView(_ view: NSStackView, coordinator: AtlasSourceReaderController) {
+        coordinator.setReaderCommands(nil)
     }
 }
 
@@ -77,7 +253,7 @@ struct AtlasReaderSelection {
 
     override init() {
         scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 640, height: 220))
-        textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 640, height: 220))
+        textView = AtlasReaderTextView(frame: NSRect(x: 0, y: 0, width: 640, height: 220))
         lineRuler = AtlasReaderLineRuler(scrollView: scrollView, textView: textView)
         notice = NSTextField(labelWithString: "")
         view = NSStackView(views: [scrollView, notice])
@@ -123,6 +299,18 @@ struct AtlasReaderSelection {
         notice.font = .systemFont(ofSize: 11)
         notice.textColor = .secondaryLabelColor
         notice.isHidden = true
+    }
+
+    func setReaderCommands(_ commands: AtlasReaderCommands?) {
+        guard let textView = textView as? AtlasReaderTextView else { return }
+        if textView.readerCommands !== commands {
+            textView.readerCommands?.detach(source: textView)
+            textView.readerCommands = commands
+            commands?.attach(source: textView)
+        }
+        // Retained Find searches the complete captured file through its model;
+        // the standard text finder would search only this materialized page.
+        textView.usesFindPanel = commands == nil
     }
 
     @discardableResult

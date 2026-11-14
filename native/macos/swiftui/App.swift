@@ -511,13 +511,14 @@ private struct AtlasFrozenViewportSearch: Sendable {
             }
             .help("Open one file or project folder (⌘O)")
             Button {
+                guard !AtlasReaderCommands.perform(.find) else { return }
                 showsSidebar = true
                 searchFocused = true
             } label: {
                 Label("Search and Projects", systemImage: "sidebar.right")
             }
             .keyboardShortcut("f", modifiers: .command)
-            .help("Show search and projects (⌘F)")
+            .help("Find in the focused source reader, or show search and projects (⌘F)")
             Button { showsFileFinder = true } label: {
                 Label("Quick Open", systemImage: "doc.text.magnifyingglass")
             }
@@ -566,13 +567,19 @@ private struct AtlasFrozenViewportSearch: Sendable {
             }
             .disabled(snapshotExportSource == nil)
             .help("Capture project sources and follow documentation links or lexical import candidates with retained evidence")
-            Button { moveSearchResult(backwards: true) } label: {
+            Button {
+                guard !AtlasReaderCommands.perform(.previous) else { return }
+                moveSearchResult(backwards: true)
+            } label: {
                 Label("Previous Match", systemImage: "arrow.up")
             }
             .keyboardShortcut("g", modifiers: [.command, .shift])
             .disabled(!searchIsCurrent || hits.isEmpty)
             .help("Previous search match (⇧⌘G)")
-            Button { moveSearchResult(backwards: false) } label: {
+            Button {
+                guard !AtlasReaderCommands.perform(.next) else { return }
+                moveSearchResult(backwards: false)
+            } label: {
                 Label("Next Match", systemImage: "arrow.down")
             }
             .keyboardShortcut("g", modifiers: .command)

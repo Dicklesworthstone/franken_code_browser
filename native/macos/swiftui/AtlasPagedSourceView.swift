@@ -17,6 +17,7 @@ import AppKit
     private let openLocalLink: AtlasDocumentPreviewModel.LocalNavigation?
     private let project: AtlasProjectBrowserModel?
     @State private var model: AtlasPagedReaderModel
+    @State private var readerCommands = AtlasReaderCommands()
     @State private var copyNotice = ""
     @State private var showsOutline = false
     @State private var showsReferences = false
@@ -317,7 +318,7 @@ import AppKit
                     selection: model.nativeSelectionRange.map { AtlasReaderSelection(source: source, range: $0) },
                     wrapsLines: wrapsLines, showsLineNumbers: showsLineNumbers,
                     showsWhitespace: showsWhitespace, firstPhysicalLine: physicalLineBase(page),
-                    usesSyntaxPalette: true,
+                    usesSyntaxPalette: true, readerCommands: readerCommands,
                     onSelectionChange: { source, navigation, range in
                         copyNotice = ""
                         model.updateTextSelection(source: source, navigation: navigation, range: range)
@@ -426,10 +427,12 @@ import AppKit
     private var findControls: some View {
         ScrollView(.horizontal) {
             HStack(spacing: 6) {
-                TextField("Find in retained file…", text: $model.fileQuery)
+                AtlasReaderFindField(text: $model.fileQuery, commands: readerCommands,
+                    active: !showsOutline && !showsReferences && !showsDocument && !showsLinked,
+                    canMove: { [model] in model.canMoveHit },
+                    move: { [model] in model.moveHit(backwards: $0) }, submit: model.find)
                     .frame(width: 190)
-                    .textFieldStyle(.roundedBorder).onSubmit(model.find)
-                    .accessibilityLabel("Text to find in this retained file")
+                    .help("Find in this retained file (⌘F). Move between accepted matches with ⌘G and ⇧⌘G.")
                 Button("Find", action: model.find).disabled(!model.canFind || model.fileQuery.isEmpty)
                 Toggle("Match case", isOn: $model.findOptions.caseSensitive)
                     .disabled(!model.canConfigureFind)
