@@ -4,12 +4,14 @@
 //!
 //! FrankenMarkdown owns string/comment/keyword classification. This module
 //! consumes its validated byte spans and recognizes a small source-specific
-//! statement grammar: Rust external mod/use, JS/TS static import/export-from,
-//! Python import/from statements, and C/C++ literal include directives.
+//! statement grammar: Rust external mod/use, JS/TS static import/export-from and
+//! literal require/import() expressions, Python import/from statements, and
+//! C/C++ literal include directives.
 //! It is not a compiler, build graph, package resolver, or replacement lexer.
 //! Every result remains lexical evidence; closed-catalog navigation is explicit.
 //! UTF-8/UTF-16 decoding and evidence conversion use the common source map.
 
+mod javascript;
 mod python;
 mod cpp;
 mod resolve;
@@ -27,8 +29,8 @@ pub const MAX_IMPORT_ITEMS: usize = 4096;
 pub const MAX_IMPORT_SPECIFIER_BYTES: usize = 1024;
 const MAX_STATEMENT_TERMINALS: usize = 1024;
 const MAX_STATEMENT_BYTES: usize = 16 * 1024;
-pub const IMPORT_EXTRACTOR: &str = "franken-markdown-d6fbd1d5/import-statements-v4";
-pub const IMPORT_POLICY: &str = "rust-use-tree-js-python-and-cpp-literal-include-v4";
+pub const IMPORT_EXTRACTOR: &str = "franken-markdown-d6fbd1d5/import-statements-v5";
+pub const IMPORT_POLICY: &str = "rust-use-tree-js-literal-loads-python-cpp-v5";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImportLanguage { Rust, JavaScript, TypeScript, Jsx, Tsx, Python, Cpp }
@@ -54,12 +56,14 @@ impl ImportLanguage {
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ImportKind { RustModule, RustUse, JavaScriptImport, JavaScriptExport, PythonImport, PythonFrom,
+pub enum ImportKind { RustModule, RustUse, JavaScriptImport, JavaScriptExport,
+    JavaScriptRequire, JavaScriptDynamicImport, PythonImport, PythonFrom,
     CppQuotedInclude, CppAngleInclude, CppComputedInclude }
 impl ImportKind {
     pub const fn name(self) -> &'static str {
         match self { Self::RustModule => "rust-module", Self::RustUse => "rust-use",
             Self::JavaScriptImport => "javascript-import", Self::JavaScriptExport => "javascript-export",
+            Self::JavaScriptRequire => "javascript-require", Self::JavaScriptDynamicImport => "javascript-dynamic-import",
             Self::PythonImport => "python-import", Self::PythonFrom => "python-from",
             Self::CppQuotedInclude => "cpp-quoted-include", Self::CppAngleInclude => "cpp-angle-include",
             Self::CppComputedInclude => "cpp-computed-include" }
@@ -149,6 +153,9 @@ impl<'source> CapturedImports<'source> {
         highlight::highlight_into(language.name(), text, &mut spans);
         if spans.capacity() > capacity { return Err(ImportError::InvalidEvidence); }
         let terminals = terminals(text, &spans, &mut canceled)?;
+        if matches!(language, ImportLanguage::JavaScript | ImportLanguage::TypeScript | ImportLanguage::Jsx | ImportLanguage::Tsx) {
+            javascript::check_context(text, &terminals, &mut canceled)?;
+        }
         let mut parser = Statements { text, map: &map, tokens: &terminals,
             facts: reserve(max_items)?, max_items, seen: 0, diagnostics: 0, truncated: false };
         match language {
@@ -266,12 +273,23 @@ impl<'a> Statements<'a> {
         let mut i = 0;
         while i < self.tokens.len() {
             check(canceled)?;
+            if self.javascript_require(i) {
+                i = self.javascript_call(i, ImportKind::JavaScriptRequire, canceled)?; continue;
+            }
             let import = self.keyword(i, "import"); let export = self.keyword(i, "export");
             if (!import && !export) || (i > 0 && matches!(self.word(i - 1), "." | "?")) { i += 1; continue; }
             let kind = if import { ImportKind::JavaScriptImport } else { ImportKind::JavaScriptExport };
             let next = self.word(i + 1);
             if import && next == "." { i += 1; continue; } // import.meta is not an import edge.
-            if import && next == "(" { self.diagnostics += 1; i += 1; continue; }
+            if import && next == "(" {
+                i = self.javascript_call(i, ImportKind::JavaScriptDynamicImport, canceled)?; continue;
+            }
+            // TypeScript import-equals delegates its load expression to the
+            // same literal require grammar. The evidence begins at require;
+            // it does not establish the imported binding or compiler types.
+            if import && identifier(next) && self.word(i + 2) == "=" && self.javascript_require(i + 3) {
+                i += 3; continue;
+            }
             if export && !matches!(next, "*" | "{" | "type") { i += 1; continue; }
             let mut literal = None;
             let mut requires_source = import || next == "*";

@@ -887,11 +887,38 @@ range. **Read target candidate** opens an independent reader over the retained
 target, even if the live files have since changed.
 
 The shared import engine supports Rust external module/use declarations,
-JavaScript/TypeScript static imports and re-exports (including JSX/TSX), and
-Python `import` and `from` statements in `.py` and `.pyi` files. Python aliases,
+JavaScript/TypeScript static imports, re-exports and literal load expressions
+(including JSX/TSX), and Python `import` and `from` statements in `.py` and `.pyi`
+files. Python aliases,
 comma-separated imports, parenthesized from-import lists and explicit line
 continuations preserve their original statement evidence. Comments and strings
 are classified by the shared FrankenMarkdown lexer.
+
+Bare `require('./worker')` and literal `import('./worker')` expressions now
+participate in the same **Outgoing**, **Imported by**, evidence and target-reader
+flows. TypeScript `import Worker = require('./worker')` retains the exact
+`require(...)` expression. Comments, newlines and an optional trailing comma
+are admitted around one quoted argument. Each row keeps the original call and
+specifier byte ranges, including BOM-marked UTF-16 coordinates.
+
+These rows are lexical candidates. A bare `require` can refer to a locally
+shadowed function; an `import()` spelling can occur in a TypeScript type query.
+The labels do not establish a runtime load or compiler binding. Relative
+specifiers resolve only against the captured catalog: an exact path takes
+precedence; an extensionless path can otherwise offer a unique supported
+extension or directory-index candidate. Competing paths remain ambiguous. Bare package names stay
+external; the resolver does not read package manifests, follow Node resolution,
+or execute source.
+
+Member calls such as `loader.require(...)`, constructors and `require.resolve`
+are outside the load-expression grammar. Computed expressions, template
+specifiers and multiple arguments (including import options) disclose partial
+coverage. Escaped quoted spellings retain unresolved evidence. If the pinned
+lexer cannot safely classify a regex-versus-code boundary, extraction refuses
+that source with partial coverage rather than publishing apparent imports from
+inside the regex. This conservative boundary also declines newline-leading
+division. The same policy applies to saved repository imports and their CLI
+output.
 
 Rust `use` trees produce one retained occurrence per imported path, including
 aliases, nested groups, grouped `self`, and glob imports. For example,
@@ -949,8 +976,9 @@ retained import occurrences. Unsupported syntax, malformed decoding, parse limit
 omitted rows remain visible coverage conditions. These limits apply to the
 captured project import browser. The **Saved Repository → Imports** workflow
 applies the same lexical policies to archived members. Rust/Swift regression fixtures cover Rust
-use trees, Python imports and C/C++ includes, UTF-16 coordinates, relative targets, ambiguity, stale captures and
-native evidence validation. Executable and physical-Mac verification remain
+use trees, JavaScript literal loads, Python imports and C/C++ includes, UTF-16
+coordinates, relative targets, ambiguity, stale captures and native evidence
+validation. Executable and physical-Mac verification remain
 pending.
 
 

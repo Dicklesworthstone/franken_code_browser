@@ -121,7 +121,7 @@ fn saved_rust_use_tree_pages_preserve_leaf_identity_and_original_utf16_evidence(
         let result = prepare(&mut saved, 1);
         assert!(result.get("imports_complete").flag());
         assert_eq!(result.get("links_seen").number(), 5);
-        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v4");
+        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v5");
         let rows = result.get("links").array();
         for (index, (destination, spelling)) in [
             ("crate::shared", "self"), ("crate::shared::Thing", "Thing"),
@@ -204,8 +204,8 @@ fn shared_language_extractors_publish_exact_occurrences_and_metadata_only_revers
     assert_eq!(result.get("import_generation").number(), 7);
     assert_eq!(result.get("projection").text(), "lexical-source-imports");
     assert_eq!(result.get("evidence_precision").text(), "exact-import-source-range");
-    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v4");
-    assert_eq!(result.get("extraction_policy").text(), "rust-use-tree-js-python-and-cpp-literal-include-v4");
+    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v5");
+    assert_eq!(result.get("extraction_policy").text(), "rust-use-tree-js-literal-loads-python-cpp-v5");
     assert_eq!(result.get("completeness_scope").text(), "parsed-source-imports-in-saved-manifest");
     assert!(!result.get("compiler_resolved").flag());
     assert!(!result.get("semantic_complete").flag());
@@ -573,3 +573,65 @@ fn owner_qualified_archives_with_equal_generations_never_share_import_authority(
     assert_eq!(copy_all(&mut right_reader).get("original_hex").text(), hex(b"Value = 2\n"));
 }
 
+
+#[test]
+fn saved_javascript_loads_keep_utf16_calls_and_independent_offline_targets() {
+    for big in [false, true] {
+        let text = "// 😀\r\nconst one = require('./child');\r\nimport('./child');";
+        let source = utf16(text, big);
+        let child = b"module.exports = { saved: true };\n";
+        let f = Fixture::new(&[entry(b"src/child.cjs", child), entry(b"src/main.cts", &source)], true);
+        let mut saved = f.open(57980 + u64::from(big) * 10);
+        let result = prepare(&mut saved, 1);
+        assert!(result.get("imports_complete").flag());
+        assert_eq!(result.get("links_seen").number(), 2);
+        let rows = result.get("links").array();
+        for (i, (kind, expression)) in [
+            ("javascript-require", "require('./child')"), ("javascript-dynamic-import", "import('./child')"),
+        ].into_iter().enumerate() {
+            let row = &rows[i];
+            assert_eq!(row.get("language").text(), "typescript");
+            assert_eq!(row.get("lexical_import_kind").text(), kind);
+            assert_eq!(range(&source, row.get("evidence_range")), &utf16(expression, big)[2..]);
+            assert_eq!(range(&source, row.get("specifier_range")), &utf16("./child", big)[2..]);
+            assert_eq!(row.get("target_path").get("hex").text(), hex(b"src/child.cjs"));
+            assert_eq!(row.get("resolution_basis").text(), "unique-relative-module-candidate");
+        }
+        let before = reads(&mut saved);
+        let incoming = json(&saved.import_page(1, Some(0), Direction::Incoming, 0, 64, || false).unwrap());
+        assert_eq!(incoming.get("links").array(), rows); assert_eq!(reads(&mut saved), before);
+        let (mut evidence, receipt) = saved.open_import_reader(owner(57981 + u64::from(big) * 10),
+            1, 2, Side::Evidence, || false).unwrap();
+        let receipt = json(&receipt);
+        assert_eq!(receipt.get("relationship"), &rows[1]);
+        assert_eq!(receipt.get("selection"), rows[1].get("evidence_range"));
+        assert!(!receipt.get("compiler_resolved").flag());
+        let (mut target, receipt) = saved.open_import_reader(owner(57982 + u64::from(big) * 10),
+            1, 2, Side::Target, || false).unwrap();
+        assert_eq!(json(&receipt).get("source_digest").text(), Sha256::digest(child).to_hex());
+        saved.clear_imports(2, || false).unwrap(); drop(saved);
+        fs::rename(&f.path, f.root.join("literal-loads-retired.fcbs")).unwrap();
+        assert_eq!(copy_all(&mut evidence).get("original_hex").text(), hex(&source));
+        assert_eq!(copy_all(&mut target).get("original_hex").text(), hex(child));
+    }
+}
+
+#[test]
+fn saved_computed_loads_remain_partial_without_hiding_literal_candidates() {
+    let source = b"require(variable); import('./child'); import('./prefix' + suffix);";
+    let f = Fixture::new(&[entry(b"child.mjs", b"export {};"), entry(b"main.mjs", source),
+        entry(b"regex.mjs", b"if (ready) /import('fake-package')/.test(text);")], true);
+    let mut saved = f.open(58001);
+    let response = saved.prepare_imports(1, 64, 1024 * 1024, || false).unwrap();
+    assert_eq!(response.exit_code(), EXIT_PARTIAL);
+    let result = json(&response);
+    assert!(!result.get("imports_complete").flag());
+    assert_eq!(result.get("parser_diagnostics").number(), 2);
+    assert_eq!(result.get("diagnostic_source_members").number(), 1);
+    assert_eq!(result.get("unsupported_source_members").number(), 1);
+    assert_eq!(result.get("links_seen").number(), 1);
+    let row = &result.get("links").array()[0];
+    assert_eq!(row.get("lexical_import_kind").text(), "javascript-dynamic-import");
+    assert_eq!(row.get("resolution").text(), "captured");
+    assert_eq!(range(source, row.get("evidence_range")), b"import('./child')");
+}

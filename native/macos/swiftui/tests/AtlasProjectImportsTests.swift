@@ -356,11 +356,58 @@ import Foundation
         forgedTarget["links"] = targetRows; refuse(forgedTarget, index: index)
     }
 
+
+    private static func javascriptLoadWire(_ index: AtlasPreparedIndex) throws {
+        let original = ProjectLinksFixture.importPage(owner: index.basis.owner,
+            generation: 1, command: "imports-page")
+        for (kind, label) in [
+            ("javascript-require", "binding not resolved"),
+            ("javascript-dynamic-import", "Literal import() expression")
+        ] {
+            var value = original, rows = original["links"] as! [[String: Any]]
+            for i in rows.indices {
+                rows[i]["language"] = "javascript"; rows[i]["lexical_import_kind"] = kind
+                rows[i]["destination"] = "./child"
+                rows[i]["resolution_basis"] = "unique-relative-module-candidate"
+                rows[i]["source_path"] = ProjectLinksFixture.path("src/main.cjs")
+                rows[i]["target_path"] = ProjectLinksFixture.path("src/child.cjs")
+            }
+            value["links"] = rows
+            let page = try decode(value, index: index), link = page.links[0]
+            precondition(link.canOpenTarget && link.importEvidence?.kind == kind)
+            precondition(link.evidenceLabel.contains(label) && link.evidenceLabel.contains("not compiler resolved"))
+            for (key, wrong) in [("language", "rust"), ("language", "python"),
+                ("resolution_basis", "rust-module-file-candidate"),
+                ("resolution_basis", "python-relative-module-candidate"),
+                ("resolution_basis", "cpp-source-relative-include-candidate")] {
+                var bad = value, changed = rows
+                changed[0][key] = wrong; bad["links"] = changed; refuse(bad, index: index)
+            }
+            for (key, old) in [("extractor", "franken-markdown-d6fbd1d5/import-statements-v4"),
+                ("resolver", "fcb-closed-catalog-imports-v4"),
+                ("extraction_policy", "rust-use-tree-js-python-and-cpp-literal-include-v4")] {
+                var bad = value; bad[key] = old; refuse(bad, index: index)
+            }
+            // A readable external literal is still not target-opening authority.
+            for i in rows.indices {
+                rows[i]["resolution"] = "external"; rows[i]["resolution_basis"] = "external-specifier"
+                rows[i]["destination"] = "node:fs"
+                for key in ["target_file_id", "target_path", "target_revision", "target_sha256", "target_bytes"] {
+                    rows[i][key] = NSNull()
+                }
+            }
+            value["links"] = rows
+            let external = try decode(value, index: index).links[0]
+            precondition(!external.canOpenTarget && external.importEvidence?.kind == kind)
+        }
+    }
+
     @MainActor static func main() async throws {
         let fixture = ProjectLinksFixture(includesImports: true), index = try await prepared(fixture)
         try wire(index)
         try pythonWire(index)
         try cppWire(index)
+        try javascriptLoadWire(index)
         try rustUseWire(index)
         let live = ProjectLinksFixture(includesImports: true)
         let model = AtlasProjectLinksModel(root: "/project", transport: live.transport)

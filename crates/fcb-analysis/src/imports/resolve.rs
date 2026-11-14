@@ -40,7 +40,10 @@ impl<T> ImportResolution<T> {
 /// native bytes are retained, including non-UTF-8 parent components. The lookup
 /// must inspect that immutable catalog, not open paths or consult a live root.
 ///
-/// JavaScript/TypeScript uses the exact relative filename first. If absent and
+/// JavaScript/TypeScript static imports, literal import() expressions and bare
+/// require() candidates use the exact relative filename first. The latter does
+/// not establish that the require identifier binds to Node's module loader.
+/// If absent and
 /// extensionless, a finite set of source extensions and index files is admitted
 /// only when exactly one path exists. Rust uses conventional file modules for
 /// a top-level external mod. Eligible qualified use leaves navigate conventional

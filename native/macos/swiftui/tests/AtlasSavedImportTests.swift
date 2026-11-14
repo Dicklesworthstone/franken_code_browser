@@ -28,8 +28,8 @@ private final class SavedImportFixture: @unchecked Sendable {
         ["projection": "lexical-source-imports", "relationship_kind": "lexical-import",
          "evidence_precision": "exact-import-source-range", "resolution_domain": "declared-catalog-candidates",
          "compiler_resolved": false, "semantic_complete": false,
-         "extractor": "franken-markdown-d6fbd1d5/import-statements-v4",
-         "extraction_policy": "rust-use-tree-js-python-and-cpp-literal-include-v4", "resolver": "fcb-closed-catalog-imports-v4"]
+         "extractor": "franken-markdown-d6fbd1d5/import-statements-v5",
+         "extraction_policy": "rust-use-tree-js-literal-loads-python-cpp-v5", "resolver": "fcb-closed-catalog-imports-v5"]
     }
     func link(_ id: UInt64) -> [String: Any] {
         let target = base.members[id == 1 ? 3 : 4]
@@ -292,6 +292,53 @@ private final class SavedImportFixture: @unchecked Sendable {
         partial["imports_complete"] = true; reject { _ = try decode(partial) }
     }
 
+
+    private static func javascriptLoadWire(_ f: SavedImportFixture, identity: AtlasSavedIdentity) throws {
+        let decode: ([String: Any]) throws -> AtlasSavedImports = {
+            try AtlasSavedImports.decode(f.base.encode($0), identity: identity, generation: 1,
+                direction: .all, member: nil, start: 0, limit: 64)
+        }
+        let original = f.page(identity.owner, generation: 1)
+        for (kind, label) in [
+            ("javascript-require", "Bare require() candidate (binding not resolved)"),
+            ("javascript-dynamic-import", "Literal import() expression")
+        ] {
+            var value = original, rows = original["links"] as! [[String: Any]]
+            for i in rows.indices {
+                rows[i]["language"] = "typescript"; rows[i]["lexical_import_kind"] = kind
+                rows[i]["destination"] = "./child"; rows[i]["resolution_basis"] = "unique-relative-module-candidate"
+                rows[i]["source_path"] = f.base.path(Array("src/main.cts".utf8), "src/main.cts")
+                rows[i]["target_path"] = f.base.path(Array("src/child.cjs".utf8), "src/child.cjs")
+            }
+            value["links"] = rows
+            let page = try decode(value)
+            precondition(page.links[0].canOpenTarget && !page.links[1].canOpenTarget)
+            precondition(page.links[0].kind == kind && page.links[0].label == label)
+            for (key, wrong) in [("language", "rust"), ("language", "python"),
+                ("resolution_basis", "rust-module-file-candidate"),
+                ("resolution_basis", "python-relative-module-candidate"),
+                ("resolution_basis", "cpp-source-relative-include-candidate")] {
+                var bad = value, changed = rows
+                changed[0][key] = wrong; bad["links"] = changed; reject { _ = try decode(bad) }
+            }
+            for (key, old) in [("extractor", "franken-markdown-d6fbd1d5/import-statements-v4"),
+                ("resolver", "fcb-closed-catalog-imports-v4"),
+                ("extraction_policy", "rust-use-tree-js-python-and-cpp-literal-include-v4")] {
+                var bad = value; bad[key] = old; reject { _ = try decode(bad) }
+            }
+            for i in rows.indices {
+                rows[i]["resolution"] = "external"; rows[i]["resolution_basis"] = "external-specifier"
+                rows[i]["destination"] = "package"
+                for key in ["target_member", "target_file_id", "target_revision", "target_digest", "target_path", "target_bytes"] {
+                    rows[i][key] = NSNull()
+                }
+            }
+            value["links"] = rows
+            let external = try decode(value).links[0]
+            precondition(!external.canOpenTarget && external.kind == kind)
+        }
+    }
+
     @MainActor static func main() async throws {
         let f = SavedImportFixture()
         let browser = AtlasSavedRepositoryModel(transport: f.transport)
@@ -304,6 +351,7 @@ private final class SavedImportFixture: @unchecked Sendable {
         }
         let accepted = try decode(f.page(identity.owner, generation: 1))
         try cppWire(f, identity: identity)
+        try javascriptLoadWire(f, identity: identity)
         precondition(accepted.complete && accepted.links[0].sourcePath.bytes == f.base.rawPath)
         precondition(accepted.links[0].canOpenTarget && !accepted.links[1].canOpenTarget)
         var interrupted = f.page(identity.owner, generation: 1); interrupted["member_read_calls"] = "1048576"

@@ -62,7 +62,7 @@ fn c_imports_open_exact_statement_and_target_from_frozen_captures() {
     assert_eq!(incoming.matches("\"link_id\":").count(), 1);
     assert!(incoming.contains("\"lexical_import_kind\":\"rust-use\""), "{incoming}");
     assert!(incoming.contains("\"resolution_basis\":\"rust-use-module-prefix-candidate\""));
-    assert!(incoming.contains("\"resolver\":\"fcb-closed-catalog-imports-v4\""));
+    assert!(incoming.contains("\"resolver\":\"fcb-closed-catalog-imports-v5\""));
     assert!(incoming.contains("\"source_bytes_read\":\"0\""));
     let id = number(&incoming, "link_id");
     fs::write(root.join("src/lib.rs"), b"mod changed;\n").unwrap();
@@ -192,7 +192,7 @@ fn c_python_import_candidates_keep_exact_evidence_and_targets_after_live_edits()
     let result = finish(atlas, 1);
     assert_eq!(number(&result, "retained_links"), 1, "{result}");
     assert!(result.contains("\"language\":\"python\""));
-    assert!(result.contains("\"extraction_policy\":\"rust-use-tree-js-python-and-cpp-literal-include-v4\""));
+    assert!(result.contains("\"extraction_policy\":\"rust-use-tree-js-literal-loads-python-cpp-v5\""));
     let filter = CString::new(hex(b"pkg/worker.py")).unwrap();
     let incoming = take(unsafe { fcb_atlas_imports_page(atlas, 1, 2, filter.as_ptr(), 0, 64) });
     assert_eq!(number(&incoming, "matching_links"), 1);
@@ -214,4 +214,52 @@ fn c_python_import_candidates_keep_exact_evidence_and_targets_after_live_edits()
         assert!(take(fcb_reader_copy_range(reader, 0, bytes.len() as u64)).contains(&hex(bytes)));
         assert_eq!(fcb_reader_close(reader), 1);
     }
+}
+
+#[test]
+fn c_literal_require_and_import_calls_reach_exact_frozen_source_and_targets() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let root = std::env::temp_dir().join(format!("fcb-javascript-imports-c-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let source = b"const value = require('./child');\nconst later = () => import('./child');\n";
+    let child = b"module.exports = 7;\n";
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.cjs"), source).unwrap();
+    fs::write(root.join("src/child.cjs"), child).unwrap();
+    let atlas = fcb_atlas_create(); assert_ne!(atlas, 0);
+    let path = CString::new(root.to_str().unwrap()).unwrap();
+    assert!(take(unsafe { fcb_atlas_open(atlas, path.as_ptr(), 100) }).contains("\"status\":\"ok\""));
+    assert!(take(fcb_atlas_index_prepare(atlas, 1, 100, 8192, 65536, 65536)).contains("\"capture_complete\":true"));
+    begin(atlas, 1); let result = finish(atlas, 1);
+    assert_eq!(number(&result, "retained_links"), 2, "{result}");
+    assert!(result.contains("\"relationships_complete\":true"));
+    let filter = CString::new(hex(b"src/child.cjs")).unwrap();
+    fs::write(root.join("src/main.cjs"), b"require('./replacement')").unwrap();
+    fs::write(root.join("src/child.cjs"), b"replacement").unwrap();
+    for (ordinal, kind, spelling) in [
+        (0, "javascript-require", b"require('./child')".as_slice()),
+        (1, "javascript-dynamic-import", b"import('./child')".as_slice()),
+    ] {
+        let incoming = take(unsafe { fcb_atlas_imports_page(atlas, 1, 2, filter.as_ptr(), ordinal, 1) });
+        assert_eq!(number(&incoming, "matching_links"), 2);
+        assert!(incoming.contains(&format!("\"lexical_import_kind\":\"{kind}\"")));
+        assert!(incoming.contains("\"resolution_basis\":\"unique-relative-module-candidate\""));
+        let id = number(&incoming, "link_id");
+        let start = source.windows(spelling.len()).position(|w| w == spelling).unwrap() as u64;
+        let evidence = fcb_reader_create(); let target = fcb_reader_create();
+        assert_ne!(evidence, 0); assert_ne!(target, 0);
+        for (reader, side, offset) in [(evidence, 0, start), (target, 1, 0)] {
+            let receipt = take(fcb_atlas_imports_open_reader(atlas, reader, 1, id, side));
+            assert!(receipt.contains("\"status\":\"ok\""), "{receipt}");
+            assert!(receipt.contains(&format!("\"lexical_import_kind\":\"{kind}\"")));
+            assert!(!receipt.contains("\"compiler_resolved\":true"));
+            assert!(receipt.contains("\"source_reopened\":false"));
+            assert_eq!(number(&receipt, "initial_original_offset"), offset);
+        }
+        for (reader, bytes) in [(evidence, source.as_slice()), (target, child.as_slice())] {
+            assert!(take(fcb_reader_copy_range(reader, 0, bytes.len() as u64)).contains(&hex(bytes)));
+            assert_eq!(fcb_reader_close(reader), 1);
+        }
+    }
+    assert_eq!(fcb_atlas_close(atlas), 1);
 }

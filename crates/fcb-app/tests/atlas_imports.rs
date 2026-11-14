@@ -91,9 +91,9 @@ fn coverage(page: &Json) {
     assert_eq!(page.get("evidence_precision").text(), "exact-import-source-range");
     assert_eq!(page.get("relationship_kind").text(), "lexical-import");
     assert_eq!(page.get("resolution_domain").text(), "declared-catalog-candidates");
-    assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v4");
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v4");
-    assert_eq!(page.get("extraction_policy").text(), "rust-use-tree-js-python-and-cpp-literal-include-v4");
+    assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v5");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v5");
+    assert_eq!(page.get("extraction_policy").text(), "rust-use-tree-js-literal-loads-python-cpp-v5");
     assert!(!page.get("compiler_resolved").flag()); assert!(!page.get("semantic_complete").flag());
     assert_eq!(page.get("source_files").number(), page.get("captured_source_files").number()
         + page.get("capture_unavailable_source_files").number() + page.get("outside_capture_scope_source_files").number()
@@ -351,12 +351,12 @@ fn rust_root_and_module_ambiguity_preserve_evidence_and_never_guess_a_target() {
 
 #[test]
 fn catalog_ambiguity_external_names_and_unsupported_specifiers_never_open_guessed_targets() {
-    let source = b"import './pick';\nimport './exact';\nimport './explicit.js';\nimport 'package';\nimport '../outside';\nimport './bad\\u002ejs';\nimport('./late');\n";
+    let source = b"import './pick';\nimport './exact';\nimport './explicit.js';\nimport 'package';\nimport '../outside';\nimport './bad\\u002ejs';\nimport('./late');\nimport(computed);\n";
     let mut f = Fixture::new(&[("main.ts", source), ("pick.ts", b""), ("pick.js", b""),
         ("exact", b"exact captured target"), ("exact.ts", b"alternative candidate"), ("explicit.ts", b""),
         ("late.ts", b""), ("bad.js", b""), ("lib.rs", b"use crate::missing;\n")]);
     f.build(1); let page = f.prepare(1, 1);
-    assert_eq!(page.get("retained_links").number(), 7);
+    assert_eq!(page.get("retained_links").number(), 8);
     assert_eq!(page.get("parser_diagnostics").number(), 1);
     assert!(!page.get("relationships_complete").flag());
     for (destination, resolution, basis) in [
@@ -382,7 +382,11 @@ fn catalog_ambiguity_external_names_and_unsupported_specifiers_never_open_guesse
     let exact = link(&page, b"main.ts", "./exact");
     assert_eq!(exact.get("resolution_basis").text(), "exact-relative-path");
     assert_eq!(exact.get("target_path").get("hex").text(), hex(b"exact"));
-    assert!(!page.get("links").array().iter().any(|row| row.get("destination").text() == "./late"));
+    let dynamic = link(&page, b"main.ts", "./late");
+    assert_eq!(dynamic.get("lexical_import_kind").text(), "javascript-dynamic-import");
+    assert_eq!(dynamic.get("resolution").text(), "captured");
+    assert_eq!(dynamic.get("target_path").get("hex").text(), hex(b"late.ts"));
+    assert_eq!(range(dynamic.get("evidence_range"), source), b"import('./late')");
 }
 
 #[test]
@@ -605,7 +609,7 @@ fn python_relative_imports_share_incoming_navigation_and_exact_retained_readers(
     let page = f.prepare(1, 1);
     assert!(page.get("relationships_complete").flag(), "{page:?}");
     assert_eq!(page.get("retained_links").number(), 5);
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v4");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v5");
 
     let row = link(&page, b"pkg/main.py", ".worker");
     assert_eq!(row.get("language").text(), "python");
@@ -679,4 +683,78 @@ fn python_import_evidence_keeps_original_utf16_coordinates_and_package_candidate
         assert_eq!(reader.capture().bytes(), source);
         assert_eq!(json(&receipt).get("initial_original_offset").number(), start as u64);
     }
+}
+
+#[test]
+fn javascript_literal_loads_navigate_incoming_edges_and_keep_original_captures() {
+    let source = b"const first = require('./child');\nconst later = () => import('./child');\nrequire('node:fs');\nimport(computed);\n";
+    let child = b"module.exports = { retained: true };\n";
+    let mut f = Fixture::new(&[("src/main.cjs", source), ("src/child.cjs", child)]);
+    f.build(1);
+    let result = f.prepare(1, 1);
+    assert!(!result.get("relationships_complete").flag());
+    assert_eq!(result.get("parser_diagnostics").number(), 1);
+    assert_eq!(result.get("links_seen").number(), 3);
+    let rows = result.get("links").array();
+    for (i, kind) in ["javascript-require", "javascript-dynamic-import"].into_iter().enumerate() {
+        assert_eq!(rows[i].get("lexical_import_kind").text(), kind);
+        assert_eq!(rows[i].get("destination").text(), "./child");
+        assert_eq!(rows[i].get("resolution").text(), "captured");
+        assert_eq!(rows[i].get("resolution_basis").text(), "unique-relative-module-candidate");
+        assert_eq!(rows[i].get("target_path").get("hex").text(), hex(b"src/child.cjs"));
+        assert_eq!(range(rows[i].get("specifier_range"), source), b"./child");
+    }
+    assert_eq!(range(rows[0].get("evidence_range"), source), b"require('./child')");
+    assert_eq!(range(rows[1].get("evidence_range"), source), b"import('./child')");
+    assert_eq!(rows[2].get("resolution").text(), "external");
+    assert_eq!(rows[2].get("target_file_id"), &Json::Null);
+    let incoming = f.page(1, Direction::Incoming, Some(b"src/child.cjs"), 0, 64);
+    assert_eq!(incoming.get("links").array(), &rows[..2]);
+    assert_eq!(incoming.get("source_bytes_read").number(), 0);
+    fs::write(f.root.join("src/main.cjs"), b"require('./replacement');").unwrap();
+    fs::write(f.root.join("src/child.cjs"), b"replacement").unwrap();
+    let id = rows[1].get("link_id").number();
+    let (evidence, receipt) = f.search.open_import_reader(&f.atlas, owner(72980), 1, id, Side::Evidence, || false).unwrap();
+    let receipt = json(&receipt);
+    assert_eq!(receipt.get("relationship"), &rows[1]);
+    assert_eq!(receipt.get("initial_original_offset"), rows[1].get("evidence_range").get("start"));
+    let (target, receipt) = f.search.open_import_reader(&f.atlas, owner(72981), 1, id, Side::Target, || false).unwrap();
+    let receipt = json(&receipt);
+    assert_eq!(receipt.get("source_sha256").text(), Sha256::digest(child).to_hex());
+    assert_eq!(receipt.get("additional_source_bytes_read").number(), 0);
+    assert!(!receipt.get("source_reopened").flag()); assert!(!receipt.get("compiler_resolved").flag());
+    f.search.clear_index(&f.atlas, 2, || false).unwrap();
+    assert_eq!(evidence.capture().bytes(), source);
+    assert_eq!(target.capture().bytes(), child);
+}
+
+#[test]
+fn javascript_literal_loads_preserve_ambiguity_and_complete_empty_code_boundaries() {
+    let source = b"require('./same'); import('./same');";
+    let mut f = Fixture::new(&[("main.cjs", source), ("same.js", b"export {};"),
+        ("same.cjs", b"module.exports = {};"),
+        ("markup.jsx", b"const view = <div>require('./false') import('./false')</div>;")]);
+    f.build(1); let result = f.prepare(1, 1);
+    assert!(result.get("relationships_complete").flag());
+    assert_eq!(result.get("links_seen").number(), 2);
+    for row in result.get("links").array() {
+        assert_eq!(row.get("resolution").text(), "ambiguous");
+        assert_eq!(row.get("target_file_id"), &Json::Null);
+    }
+    assert_eq!(f.page(1, Direction::Incoming, Some(b"same.js"), 0, 64).get("matching_links").number(), 0);
+    assert_eq!(f.page(1, Direction::Outgoing, Some(b"markup.jsx"), 0, 64).get("matching_links").number(), 0);
+}
+
+#[test]
+fn ambiguous_upstream_javascript_regex_context_stays_partial_without_false_imports() {
+    let ambiguous = b"if (ready) /require('fake-package')/.test(text);";
+    let mut f = Fixture::new(&[("ambiguous.js", ambiguous),
+        ("real.cjs", b"require('./child');"), ("child.cjs", b"module.exports = 1;")]);
+    f.build(1); let result = f.prepare(1, 1);
+    assert!(!result.get("relationships_complete").flag());
+    assert_eq!(result.get("unsupported_source_files").number(), 1);
+    assert_eq!(result.get("links_seen").number(), 1);
+    assert_eq!(result.get("links").array()[0].get("destination").text(), "./child");
+    assert_eq!(result.get("links").array()[0].get("resolution").text(), "captured");
+    assert_eq!(f.page(1, Direction::Outgoing, Some(b"ambiguous.js"), 0, 64).get("matching_links").number(), 0);
 }

@@ -134,9 +134,9 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
         guard try w.text("projection") == "lexical-source-imports",
               try w.text("relationship_kind") == "lexical-import",
               try w.text("evidence_precision") == "exact-import-source-range",
-              try w.text("extractor") == "franken-markdown-d6fbd1d5/import-statements-v4",
-              try w.text("resolver") == "fcb-closed-catalog-imports-v4",
-              try w.text("extraction_policy") == "rust-use-tree-js-python-and-cpp-literal-include-v4",
+              try w.text("extractor") == "franken-markdown-d6fbd1d5/import-statements-v5",
+              try w.text("resolver") == "fcb-closed-catalog-imports-v5",
+              try w.text("extraction_policy") == "rust-use-tree-js-literal-loads-python-cpp-v5",
               try !w.flag("compiler_resolved"), try !w.flag("semantic_complete") else {
             throw AtlasProjectLinksError.invalidResponse
         }
@@ -149,7 +149,8 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
         case "rust": kinds = ["rust-module", "rust-use"]
         case "python": kinds = ["python-import", "python-from"]
         case "cpp": kinds = ["cpp-quoted-include", "cpp-angle-include", "cpp-computed-include"]
-        case "javascript", "typescript", "jsx", "tsx": kinds = ["javascript-import", "javascript-export"]
+        case "javascript", "typescript", "jsx", "tsx":
+            kinds = ["javascript-import", "javascript-export", "javascript-require", "javascript-dynamic-import"]
         default: throw AtlasProjectLinksError.invalidResponse
         }
         guard kinds.contains(kind),
@@ -165,6 +166,11 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
             throw AtlasProjectLinksError.invalidResponse
         }
         if resolutionBasis == "python-relative-module-candidate" && (language != "python" || kind != "python-from") {
+            throw AtlasProjectLinksError.invalidResponse
+        }
+        if ["javascript", "typescript", "jsx", "tsx"].contains(language)
+            && !["exact-relative-path", "unique-relative-module-candidate", "external-specifier",
+                "unsupported-specifier", "no-catalog-target", "ambiguous-catalog-target"].contains(resolutionBasis) {
             throw AtlasProjectLinksError.invalidResponse
         }
         if language == "python" && !["python-relative-module-candidate", "external-specifier",
@@ -194,6 +200,8 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
         case "cpp-angle-include": statement = "External C/C++ include"
         case "cpp-computed-include": statement = "Unresolved computed C/C++ include"
         case "javascript-export": statement = "Re-export statement"
+        case "javascript-require": statement = "Bare require() candidate (binding not resolved)"
+        case "javascript-dynamic-import": statement = "Literal import() expression"
         default: statement = "Import statement"
         }
         return "\(statement) · \(language) · lexical evidence"

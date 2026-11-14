@@ -151,3 +151,35 @@ fn partial_import_coverage_and_refused_targets_still_allow_exact_source_evidence
     assert_eq!(rows[8].get("saved_import_generation").number(), 2);
 }
 
+
+#[test]
+fn saved_literal_loads_are_navigable_and_copy_exact_call_evidence_through_stdio() {
+    let source = b"const first = require('./child');\nconst later = () => import('./child');\n";
+    let target = b"module.exports = 7;\n";
+    let f = Fixture::new(&[entry(b"src/child.cjs", target), entry(b"src/main.cjs", source)], true);
+    let script = format!(
+        "0\tsaved-open\t{}\n\
+         0\tsaved-imports-build\t1\t1\t64\t4096\n\
+         0\tsaved-importers\t1\t1\t0\t0\t64\n\
+         0\tsaved-import-source\t1\t1\t1\n\
+         4\tcopy\t1\n\
+         4\tsaved-import-source\t1\t1\t2\n\
+         6\tcopy\t2\n\
+         6\tsaved-import-target\t1\t1\t2\n\
+         8\tread\t3\t0\t64\t4\n\
+         8\tsaved-close\t1\n\
+         8\tcopy\t1\n\
+         8\tquit\n", f.path.display());
+    let (exit, rows) = invoke(&script);
+    assert_eq!(exit, EXIT_OK); assert_eq!(rows.len(), 12);
+    let links = result(&rows[2]).get("links").array();
+    assert_eq!(links.len(), 2);
+    assert_eq!(links[0].get("lexical_import_kind").text(), "javascript-require");
+    assert_eq!(links[1].get("lexical_import_kind").text(), "javascript-dynamic-import");
+    assert!(!result(&rows[1]).get("compiler_resolved").flag());
+    assert_eq!(result(&rows[4]).get("original_hex").text(), hex(b"require('./child')"));
+    assert_eq!(result(&rows[6]).get("original_hex").text(), hex(b"import('./child')"));
+    assert_eq!(result(&rows[8]).get("text").text(), std::str::from_utf8(target).unwrap());
+    assert_eq!(result(&rows[10]).get("original_hex").text(), hex(b"require('./child')"));
+    assert!(!f.root.join("src/main.cjs").exists() && !f.root.join("src/child.cjs").exists());
+}

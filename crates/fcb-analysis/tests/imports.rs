@@ -83,16 +83,18 @@ fn static_javascript_and_typescript_import_forms_keep_specifier_and_statement_ra
 }
 
 #[test]
-fn dynamic_meta_and_escaped_imports_never_become_resolvable_static_dependencies() {
-    let source = br#"import("./dynamic"); import.meta.url;
+fn literal_dynamic_imports_have_separate_evidence_and_computed_calls_stay_partial() {
+    let source = br#"import("./dynamic"); import.meta.url; import(computed);
 import value from "./escaped\u002ejs";
 import direct from "./actual.js";
 export { local };
 "#;
     let imports = build(source, ImportLanguage::TypeScript, 20);
-    assert_eq!(destinations(&imports), [r"./escaped\u002ejs", "./actual.js"]);
-    assert!(!imports.facts()[0].resolution_allowed()); assert!(imports.facts()[1].resolution_allowed());
-    assert_eq!(imports.diagnostics(), 1, "dynamic imports remain explicit unsupported inventory coverage");
+    assert_eq!(destinations(&imports), ["./dynamic", r"./escaped\u002ejs", "./actual.js"]);
+    assert_eq!(imports.facts()[0].kind(), ImportKind::JavaScriptDynamicImport);
+    assert!(imports.facts()[0].resolution_allowed());
+    assert!(!imports.facts()[1].resolution_allowed()); assert!(imports.facts()[2].resolution_allowed());
+    assert_eq!(imports.diagnostics(), 1, "computed imports remain explicit unsupported inventory coverage");
     assert!(!imports.is_complete());
     let meta = build(b"const url = import.meta.url; export { local };", ImportLanguage::JavaScript, 20);
     assert!(meta.facts().is_empty()); assert!(meta.is_complete());

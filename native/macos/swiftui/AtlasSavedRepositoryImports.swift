@@ -20,9 +20,9 @@ enum AtlasSavedImportWire {
         guard w.projection == "lexical-source-imports", w.relationship_kind == "lexical-import",
               w.evidence_precision == "exact-import-source-range",
               w.resolution_domain == "declared-catalog-candidates",
-              w.extractor == "franken-markdown-d6fbd1d5/import-statements-v4",
-              w.extraction_policy == "rust-use-tree-js-python-and-cpp-literal-include-v4",
-              w.resolver == "fcb-closed-catalog-imports-v4",
+              w.extractor == "franken-markdown-d6fbd1d5/import-statements-v5",
+              w.extraction_policy == "rust-use-tree-js-literal-loads-python-cpp-v5",
+              w.resolver == "fcb-closed-catalog-imports-v5",
               !w.compiler_resolved, !w.semantic_complete else { throw AtlasSavedError.invalidResponse }
     }
 
@@ -69,6 +69,8 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         case "cpp-angle-include": return "External C/C++ include"
         case "cpp-computed-include": return "Unresolved computed C/C++ include"
         case "javascript-export": return "Re-export statement"
+        case "javascript-require": return "Bare require() candidate (binding not resolved)"
+        case "javascript-dynamic-import": return "Literal import() expression"
         default: return "Import statement"
         }
     }
@@ -115,7 +117,8 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         case "rust": kinds = ["rust-module", "rust-use"]
         case "python": kinds = ["python-import", "python-from"]
         case "cpp": kinds = ["cpp-quoted-include", "cpp-angle-include", "cpp-computed-include"]
-        case "javascript", "typescript", "jsx", "tsx": kinds = ["javascript-import", "javascript-export"]
+        case "javascript", "typescript", "jsx", "tsx":
+            kinds = ["javascript-import", "javascript-export", "javascript-require", "javascript-dynamic-import"]
         default: throw AtlasSavedError.invalidResponse
         }
         guard id > 0, id <= AtlasSavedImportWire.maximumLinks, sourceMember < 65_536,
@@ -137,6 +140,11 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
             throw AtlasSavedError.invalidResponse
         }
         if resolutionBasis == "python-relative-module-candidate" && (language != "python" || kind != "python-from") {
+            throw AtlasSavedError.invalidResponse
+        }
+        if ["javascript", "typescript", "jsx", "tsx"].contains(language)
+            && !["exact-relative-path", "unique-relative-module-candidate", "external-specifier",
+                "unsupported-specifier", "no-catalog-target", "ambiguous-catalog-target"].contains(resolutionBasis) {
             throw AtlasSavedError.invalidResponse
         }
         if language == "python" && !["python-relative-module-candidate", "external-specifier",
