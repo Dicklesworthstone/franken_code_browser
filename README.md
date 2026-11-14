@@ -126,8 +126,10 @@ debuggers and terminals are outside its initial release scope.
 window opens FCBT trails, keeps mixed-archive and unavailable visits visible, and follows
 ordered ranges through independently verified archived readers. Ranges can be retained in
 the Reading Desk, including point bookmarks and selections spanning several pages. See
-[the native workflow](native/macos/README.md#following-saved-reading-trails) for controls and
-the existing CLI commands that create trails. This source implementation still requires
+[the native workflow](native/macos/README.md#following-saved-reading-trails) to create a new
+trail or append a saved-source selection with a rationale. Each save creates a new file,
+preserving the previous trail and all its visits. The CLI offers the same immutable trail
+workflow. This source implementation still requires
 independent native verification.
 
 **Project relationships keep your reading place.** Documentation links and

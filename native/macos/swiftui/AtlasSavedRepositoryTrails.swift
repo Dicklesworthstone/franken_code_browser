@@ -22,6 +22,10 @@ struct AtlasSavedTrailRange: Decodable, Sendable, Equatable {
     let start, end: UInt64
     var contextStart: UInt64 { start > 132 ? start - 132 : 0 }
     var label: String { start == end ? "Bookmark at byte \(start)" : "Original bytes \(start)..<\(end)" }
+    init(start: UInt64, end: UInt64) throws {
+        guard start <= end else { throw AtlasSavedError.invalidInput }
+        self.start = start; self.end = end
+    }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         start = try c.decode(AtlasSavedNumber.self, forKey: .start).value
@@ -198,4 +202,6 @@ enum AtlasSavedTrailRequest: Sendable {
 /// lifetime still belong to that archive handle and its reader registry.
 struct AtlasSavedTrailTransport: Sendable {
     let run: @Sendable (UInt64, AtlasSavedTrailRequest) -> String?
+    var write: (@Sendable (UInt64, AtlasSavedTrailWriteRequest) -> String?)? = nil
+    var writeReceipt: (@Sendable (UInt64, UInt64) -> String?)? = nil
 }

@@ -4,7 +4,7 @@ import Foundation
 @_silgen_name("fixture_saved_trail_count") private func count(_ index: UInt64) -> UInt64
 
 @main private enum AtlasSavedTrailBridgeTests {
-    static func main() {
+    static func main() throws {
         let transport = AtlasSavedTrailTransport.native
         let owner = UInt64.max - 10, generation = UInt64.max - 9, reader = UInt64.max - 8
         let path = "/trail-e\u{301}.fcbt"
@@ -36,6 +36,39 @@ import Foundation
             for request in requests { precondition(transport.run(owner, request) == nil) }
         }
         precondition(count(4) == 16, "all nonnull rejected responses must be freed exactly once")
+        let fixture = SavedRepositoryFixture(searchVectors: true)
+        let identity = try JSONDecoder().decode(AtlasSavedIdentity.self, from: Data(fixture.encode(fixture.header(owner, "info")).utf8))
+        let member = try JSONDecoder().decode(AtlasSavedMember.self, from: Data(fixture.encode(fixture.memberObject(1)).utf8))
+        let readerIdentity = AtlasReaderIdentity(owner: reader, file: 1, revision: 1, capturedBytes: 209,
+            pathBytes: fixture.rawPath, encoding: "utf8", displayPath: member.path.display)
+        let selection = try AtlasSavedTrailSelection(identity: identity, member: member,
+            readerIdentity: readerIdentity, start: 202, end: 208)
+        let point = try AtlasSavedTrailSelection(identity: identity, member: member,
+            readerIdentity: readerIdentity, start: 209, end: 209)
+        let title = "e\u{301}\0T", rationale = "why\0é\n", destination = "/write-e\u{301}.fcbt"
+        let parent = AtlasSavedTrailParent(AtlasSavedTrailPage(identity: identity, generation: generation, lastAttempt: generation,
+            digest: String(repeating: "a", count: 64), path: member.path, title: title, parentDigest: nil,
+            total: 1, referenceBytes: 5, retainedBytes: 512, ready: 1, unavailable: 0, readCalls: 1,
+            start: 0, limit: 32, items: [], next: nil))
+        let new = try AtlasSavedTrailWriteRequest(selection: selection, operation: .max, parent: nil,
+            title: title, rationale: rationale, destination: destination)
+        let append = try AtlasSavedTrailWriteRequest(selection: point, operation: .max - 1, parent: parent,
+            title: title, rationale: rationale, destination: destination)
+        let empty = try AtlasSavedTrailWriteRequest(selection: selection, operation: .max - 2, parent: nil,
+            title: "", rationale: "", destination: destination)
+        mode(0)
+        for request in [new, append, empty] { precondition(transport.write!(owner, request) == "{}") }
+        precondition(transport.writeReceipt!(owner, .max) == "{}" && count(5) == 3 && count(6) == 1 && count(4) == 20)
+        precondition(transport.write!(0, new) == nil && transport.write!(owner - 1, new) == nil)
+        precondition(transport.writeReceipt!(0, .max) == nil && transport.writeReceipt!(owner, 0) == nil)
+        precondition(count(5) == 3 && count(6) == 1)
+        mode(1)
+        precondition(transport.write!(owner, new) == nil && transport.writeReceipt!(owner, .max) == nil && count(4) == 20)
+        for invalidMode in [Int32(2), 3, 4] {
+            mode(invalidMode)
+            precondition(transport.write!(owner, new) == nil && transport.writeReceipt!(owner, .max) == nil)
+        }
+        precondition(count(4) == 26, "every nonnull write response must be freed exactly once")
         print("Saved trail public-header ABI, full-width IDs, exact paths and response ownership fixtures passed")
     }
 }

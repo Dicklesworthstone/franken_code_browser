@@ -346,6 +346,16 @@ final class AtlasSavedFileAccess {
                 Button("Close trail", action: model.detachTrail)
                     .disabled(!model.canOpenTrail || model.trailGeneration == nil || readerTask != nil)
             }.controlSize(.small)
+            if let request = model.trailWriteRequest {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Last saved destination: \(String(reflecting: request.destination))")
+                        .font(.caption).lineLimit(2).textSelection(.enabled)
+                    Text(verbatim: model.trailWriteNotice).font(.caption)
+                        .foregroundStyle(model.trailWriteOutcomeKnown ? Color.secondary : Color.orange).textSelection(.enabled)
+                    Button("Reload write receipt", action: model.reloadTrailWriteReceipt)
+                        .controlSize(.small).disabled(!model.canOperate)
+                }
+            }
             if !model.trailStateKnown {
                 Text("The accepted attachment is unknown. These previously verified notes are read only until Reload state succeeds.")
                     .font(.caption).foregroundStyle(.orange).textSelection(.enabled)
@@ -403,6 +413,8 @@ final class AtlasSavedFileAccess {
                     Text("Follow a saved sequence of exact source ranges and notes.").font(.title3)
                     Text("Choose an FCBT reading trail for the opened saved repository. Items for other archives, uncaptured members or changed sources stay visible with their notes. Select those archives explicitly to read their matching entries.")
                     Text("The trail contains references and rationale. Source comes only from the saved archive you opened.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("Open a captured source and choose Add to reading trail to create a new trail or append a reviewed range and rationale to the attached trail as a new file.")
                         .font(.caption).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
@@ -1326,6 +1338,7 @@ final class AtlasSavedFileAccess {
     @State private var linkTask: Task<Void, Never>?
     @State private var linkOperation = UUID()
     @State private var linkNotice = ""
+    @State private var trailDraft: AtlasSavedTrailDraft?
 
     init(capture: AtlasSavedReaderCapture, archive: AtlasSavedRepositoryModel, desk: AtlasReadingDeskModel,
          pins: AtlasPinnedReaders<AtlasPagedReaderModel>) {
@@ -1346,6 +1359,10 @@ final class AtlasSavedFileAccess {
                     Text(capture.evidenceLabel).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                 }
                 Spacer()
+                Button("Add to reading trail…") {
+                    do { trailDraft = try archive.trailDraft(from: capture) }
+                    catch { linkNotice = (error as? AtlasSavedError)?.message ?? "This saved source cannot be added to a trail right now." }
+                }.disabled(linkTask != nil || !archive.canAuthorTrail(from: capture))
                 Button("Reading Desk") { showsDesk = true }
                 Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
             }.controlSize(.small).padding(.horizontal, 12).padding(.top, 12)
@@ -1417,6 +1434,7 @@ final class AtlasSavedFileAccess {
         .frame(minWidth: 980, idealWidth: 1280, minHeight: 680, idealHeight: 820)
         .onAppear { pins.bind(root: pinGroup) }
         .sheet(isPresented: $showsDesk) { AtlasReadingDeskView(model: desk) }
+        .sheet(item: $trailDraft) { draft in AtlasSavedTrailAuthoringView(model: archive, desk: desk, draft: draft) }
         .onDisappear {
             linkOperation = UUID(); linkTask?.cancel(); linkTask = nil
             history.close()

@@ -134,6 +134,12 @@ private final class AtlasSavedSession: @unchecked Sendable {
     private(set) var trailGeneration: UInt64?
     private(set) var trailStateKnown = true
     private(set) var selectedTrailItem: UInt64?
+    private(set) var trailWriteRequest: AtlasSavedTrailWriteRequest?
+    private(set) var trailWriteReceipt: AtlasSavedTrailWriteReceipt?
+    private(set) var trailWriteOutcomeKnown = true
+    private(set) var trailWriteInProgress = false
+    private(set) var trailWriteCancellationRequested = false
+    private(set) var trailWriteNotice = "Save a new reading trail from an exact saved source range."
     private(set) var searchPage: AtlasSavedSearchPage?
     private(set) var queryGeneration: UInt64?
     private(set) var expressionPage: AtlasSavedExpressionPage?
@@ -172,6 +178,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     @ObservationIgnored private var lastImportAttempt: UInt64 = 0
     @ObservationIgnored private var lastPathAttempt: UInt64 = 0
     @ObservationIgnored private var lastTrailAttempt: UInt64 = 0
+    @ObservationIgnored private var lastTrailWriteAttempt: UInt64 = 0
     @ObservationIgnored private var lastQueryAttempt: UInt64 = 0
     @ObservationIgnored private var lastExpressionAttempt: UInt64 = 0
     @ObservationIgnored private var lastStructureAttempt: UInt64 = 0
@@ -195,6 +202,18 @@ private final class AtlasSavedSession: @unchecked Sendable {
     var selectedTrailEntry: AtlasSavedTrailEntry? {
         guard trailIsCurrent, let selectedTrailItem else { return nil }
         return trailPage?.items.first { $0.id == selectedTrailItem }
+    }
+    var canWriteTrail: Bool {
+        canOperate && trails?.write != nil && trails?.writeReceipt != nil && info?.trailWriteStateKnown == true &&
+            max(lastTrailWriteAttempt, info?.lastTrailWriteAttempt ?? 0) < UInt64.max
+    }
+    func canAuthorTrail(from source: AtlasSavedReaderCapture) -> Bool {
+        canWriteTrail && ownsDocumentSource(source) && source.reader.canKeep
+    }
+    func trailDraft(from source: AtlasSavedReaderCapture) throws -> AtlasSavedTrailDraft {
+        guard canAuthorTrail(from: source) else { throw AtlasSavedError.unavailable }
+        return try AtlasSavedTrailDraft(source: source,
+            parent: trailIsCurrent ? trailPage.map(AtlasSavedTrailParent.init) : nil)
     }
     var validPathInput: Bool { AtlasSavedPathWire.validQuery(Array(pathInput.utf8)) }
     var pathSearchIsCurrent: Bool {
@@ -276,6 +295,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 model.pathPage = nil; model.pathGeneration = nil; model.lastPathAttempt = 0; model.pathInput = ""
                 model.trailPage = nil; model.trailGeneration = nil; model.lastTrailAttempt = 0
                 model.trailStateKnown = true; model.selectedTrailItem = nil
+                model.clearTrailWrite()
                 model.lastRelationshipAttempt = 0; model.memberOffsetInput = "0"
                 model.searchPage = nil; model.queryGeneration = nil; model.lastQueryAttempt = 0; model.searchInput = ""
                 model.expressionPage = nil; model.expressionGeneration = nil; model.lastExpressionAttempt = 0
@@ -437,6 +457,107 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 : "Index acceptance is unconfirmed. Its file grants remain held until status is recovered or the archive is closed."
         }
     }
+    /// Freeze the entire reviewed write before scheduling it. A destination is
+    /// always a new file, and even a lost terminal reply cannot replay a writer.
+    @discardableResult func writeTrail(from source: AtlasSavedReaderCapture, selection: AtlasSavedTrailSelection,
+        parent: AtlasSavedTrailParent?, title: String, rationale: String,
+        destination: String, accessLease: AnyObject?) -> AtlasSavedTrailWriteRequest? {
+        guard canAuthorTrail(from: source), let info, selection.identity == info.identity,
+              selection.member.matches(source.member), let page = source.reader.page,
+              selection.readerIdentity.matches(page.identity) else { return nil }
+        guard AtlasSavedIndexBuildRequest.validDestination(destination), Array(destination.utf8) != info.path.bytes,
+              trailPage?.path.bytes != Array(destination.utf8) else {
+            trailWriteNotice = "Choose a new trail filename distinct from the archive and attached trail. No write was started."
+            notice = trailWriteNotice; return nil
+        }
+        if let parent {
+            guard trailIsCurrent, let current = trailPage, parent.matches(current) else {
+                trailWriteNotice = "The attached trail changed. Reopen the editor or choose New trail; your rationale remains available."
+                notice = trailWriteNotice; return nil
+            }
+        }
+        if !trailWriteOutcomeKnown, let prior = trailWriteRequest, prior.destination.utf8.elementsEqual(destination.utf8) {
+            trailWriteNotice = "The previous write outcome for this destination is unknown. Reload its receipt or choose a different new filename."
+            notice = trailWriteNotice; return nil
+        }
+        let request: AtlasSavedTrailWriteRequest
+        do {
+            request = try AtlasSavedTrailWriteRequest(selection: selection, operation: nextTrailWriteOperation(),
+                parent: parent, title: title, rationale: rationale, destination: destination)
+        } catch {
+            trailWriteNotice = Self.message(error); notice = trailWriteNotice; return nil
+        }
+        trailWriteRequest = request; trailWriteReceipt = nil; trailWriteOutcomeKnown = false
+        trailWriteInProgress = true; trailWriteCancellationRequested = false
+        trailWriteNotice = "Verifying the selected archived source, then creating the new reading trail…"
+        notice = trailWriteNotice
+        perform { model, flag in
+            defer { model.trailWriteInProgress = false }
+            guard let lease = model.session, model.info?.identity == request.identity,
+                  let write = model.trails?.write else { throw AtlasSavedError.unavailable }
+            do {
+                let lifetime: [AnyObject] = [lease] + [accessLease].compactMap { $0 }
+                let json = try await model.io.perform(cancellation: flag, keepingAlive: lifetime) {
+                    write(lease.handle, request)
+                }
+                let receipt = try AtlasSavedTrailWriteReceipt.decode(json, request: request)
+                guard !model.closed, model.session === lease else { return }
+                try model.acceptTrailWrite(receipt, request: request)
+            } catch {
+                guard !model.closed, model.session === lease else { return }
+                // Cancellation discards delivery only after the entered writer
+                // drains. Read its retained terminal receipt with a fresh flag.
+                if await model.reconcileTrailWrite(lease, request: request) {
+                    model.trailWriteNotice = "Recovered the retained write receipt. \(model.trailWriteReceipt!.message)"
+                } else {
+                    model.trailWriteNotice = "The trail write outcome is unknown. The destination may contain a complete or incomplete file. Reload the retained receipt before using it; any new write needs a different filename."
+                }
+                model.notice = model.trailWriteNotice
+            }
+        }
+        return request
+    }
+    func reloadTrailWriteReceipt() {
+        guard let request = trailWriteRequest else { return }
+        perform { model, _ in
+            guard let lease = model.session, model.info?.identity == request.identity else { throw AtlasSavedError.unavailable }
+            if await model.reconcileTrailWrite(lease, request: request) {
+                model.trailWriteNotice = "Recovered the retained write receipt. \(model.trailWriteReceipt!.message)"
+            } else {
+                model.trailWriteNotice = model.trailWriteOutcomeKnown
+                    ? "The latest receipt read failed. The previously verified write receipt remains available."
+                    : "The write outcome is still unknown. No write was retried. Inspect the destination before explicitly choosing another new filename."
+            }
+            model.notice = model.trailWriteNotice
+        }
+    }
+    private func acceptTrailWrite(_ receipt: AtlasSavedTrailWriteReceipt, request: AtlasSavedTrailWriteRequest) throws {
+        guard info?.identity == request.identity, receipt.identity == request.identity,
+              receipt.operation == request.operation, trailWriteRequest?.operation == request.operation else {
+            throw AtlasSavedError.invalidResponse
+        }
+        trailWriteReceipt = receipt; trailWriteOutcomeKnown = true
+        lastTrailWriteAttempt = max(lastTrailWriteAttempt, request.operation)
+        info?.lastTrailWriteAttempt = max(info?.lastTrailWriteAttempt ?? 0, request.operation)
+        info?.lastTrailWriteOperation = request.operation
+        trailWriteNotice = receipt.message; notice = receipt.message
+    }
+    private func reconcileTrailWrite(_ lease: AtlasSavedSession, request: AtlasSavedTrailWriteRequest) async -> Bool {
+        guard !closed, session === lease, info?.identity == request.identity,
+              trailWriteRequest?.operation == request.operation, let receipt = trails?.writeReceipt else { return false }
+        do {
+            let json = try await io.perform(cancellation: AtlasSearchCancellation(), keepingAlive: [lease]) {
+                receipt(lease.handle, request.operation)
+            }
+            let accepted = try AtlasSavedTrailWriteReceipt.decode(json, request: request)
+            guard !closed, session === lease else { return false }
+            try acceptTrailWrite(accepted, request: request); return true
+        } catch {
+            trailWriteOutcomeKnown = trailWriteReceipt?.operation == request.operation
+            return false
+        }
+    }
+
     func attachTrail(path: String, accessLease: AnyObject?) {
         guard canOpenTrail, let info, path.hasPrefix("/"), path.utf8.count <= 16_384,
               !path.utf8.contains(0) else { return }
@@ -598,12 +719,14 @@ private final class AtlasSavedSession: @unchecked Sendable {
     }
     private func acceptInfo(_ current: AtlasSavedInfo, lease: AtlasSavedSession) throws {
         guard current.lastIndexAttempt >= (info?.lastIndexAttempt ?? 0),
+              !current.trailWriteStateKnown || current.lastTrailWriteAttempt >= (info?.lastTrailWriteAttempt ?? 0),
               !current.indexBuildStateKnown || current.lastIndexBuildAttempt >= (info?.lastIndexBuildAttempt ?? 0) else {
             throw AtlasSavedError.invalidResponse
         }
         indexPath = try lease.resolveIndex(current.index)
         info = current; lastIndexAttempt = max(lastIndexAttempt, current.lastIndexAttempt); indexStateKnown = true
         lastIndexBuildAttempt = max(lastIndexBuildAttempt, current.lastIndexBuildAttempt)
+        lastTrailWriteAttempt = max(lastTrailWriteAttempt, current.lastTrailWriteAttempt)
     }
     private func reconcileIndex(_ lease: AtlasSavedSession) async -> Bool {
         guard !closed, session === lease, let previous = info else { return false }
@@ -1652,6 +1775,10 @@ private final class AtlasSavedSession: @unchecked Sendable {
             indexBuildCancellationRequested = true
             indexBuildNotice = "Cancellation requested. Waiting for the writer to drain and report whether the destination was created."
             notice = indexBuildNotice
+        } else if trailWriteInProgress {
+            trailWriteCancellationRequested = true
+            trailWriteNotice = "Cancellation requested. Waiting for the writer to drain and report whether the new trail was created."
+            notice = trailWriteNotice
         } else { notice = "Cancel requested. Waiting for entered saved-archive work to drain." }
     }
     func closeArchive() {
@@ -1671,6 +1798,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         imports = nil; importGeneration = nil; importDirection = .all; lastImportAttempt = 0
         pathPage = nil; pathGeneration = nil; pathInput = ""; lastPathAttempt = 0
         trailPage = nil; trailGeneration = nil; selectedTrailItem = nil; lastTrailAttempt = 0; trailStateKnown = true
+        clearTrailWrite()
         searchPage = nil; queryGeneration = nil; lastQueryAttempt = 0; searchInput = ""
         expressionPage = nil; expressionGeneration = nil; lastExpressionAttempt = 0
         structurePage = nil; structureGeneration = nil; lastStructureAttempt = 0
@@ -1682,6 +1810,11 @@ private final class AtlasSavedSession: @unchecked Sendable {
         indexBuildOutcomeKnown = true; indexBuildInProgress = false; indexBuildCancellationRequested = false
         lastIndexBuildAttempt = 0
         indexBuildNotice = "Build an index from this opened archive and save it to a new file."
+    }
+    private func clearTrailWrite() {
+        trailWriteRequest = nil; trailWriteReceipt = nil; trailWriteOutcomeKnown = true
+        trailWriteInProgress = false; trailWriteCancellationRequested = false; lastTrailWriteAttempt = 0
+        trailWriteNotice = "Save a new reading trail from an exact saved source range."
     }
     private func run(_ lease: AtlasSavedSession, _ request: AtlasSavedRequest,
         flag: AtlasSearchCancellation) async throws -> String? {
@@ -1731,6 +1864,11 @@ private final class AtlasSavedSession: @unchecked Sendable {
         let previous = max(lastTrailAttempt, max(trailGeneration ?? 0, info?.lastTrailAttempt ?? 0))
         guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
         lastTrailAttempt = previous + 1; return lastTrailAttempt
+    }
+    private func nextTrailWriteOperation() throws -> UInt64 {
+        let previous = max(lastTrailWriteAttempt, info?.lastTrailWriteAttempt ?? 0)
+        guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
+        lastTrailWriteAttempt = previous + 1; return lastTrailWriteAttempt
     }
     private func nextExpressionGeneration() throws -> UInt64 {
         let previous = max(lastExpressionAttempt, max(expressionGeneration ?? 0, info?.lastExpressionAttempt ?? 0))

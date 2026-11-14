@@ -737,7 +737,31 @@ early-canceled replacements preserve the preceding attachment. Late cancellation
 can arrive after acceptance; **Reload state** recovers the accepted attachment
 after an unavailable reply without reopening the trail pathname.
 
-Existing CLI commands create and append immutable trails with an explicit new
+### Creating and extending a trail in the native reader
+
+Open a captured member, search hit or trail entry, then choose **Add to reading
+trail…** in its saved reader. Choose **New trail** with a title, or **Append to
+attached trail**. The editor starts from the verified selected text or the
+source's exact match/trail range when available. **Use source range** also offers
+the current window, the complete member and a point bookmark. Original byte
+offsets remain editable within the verified member length.
+
+Add an optional rationale and choose **Save new trail file…**. Titles admit up
+to 256 UTF-8 bytes and rationale up to 4,096 bytes. An append preserves every
+existing visit, repeated selection and note, including entries for other
+archives, and records the original trail's digest as its parent. The source is
+verified through the already opened archive descriptor, so replacing the
+archive or trail pathname cannot silently substitute new content.
+
+Every save uses an explicit new destination and refuses to overwrite an
+existing file. The attached trail remains available until you deliberately
+choose **Open reading trail…** for the new file. Cancellation or an unavailable
+reply may follow a filesystem effect; the editor reports the retained write
+outcome and **Reload write receipt** retrieves it without repeating the write.
+Uncertain or refused outcomes preserve the draft. Source/range/parent changes
+while the save panel is open require reviewing the draft again.
+
+CLI commands also create and append immutable trails with an explicit new
 destination. For example, after saving `project.fcbs`:
 
 ```sh
@@ -749,8 +773,8 @@ fcb trail add project.fcbs --member src/lib.rs --start 0 --end 120 \
 
 Choose ranges within each captured member. Ranges are half-open original byte
 offsets, not text columns. Trail files contain notes and references; the saved
-archive supplies the source. The native attachment, reader navigation and Desk
-handoff have host, C-boundary and Swift regression fixtures. Independent
+archive supplies the source. The native attachment, authoring, reader navigation
+and Desk handoff have host, C-boundary and Swift regression fixtures. Independent
 execution and physical-Mac qualification remain pending.
 
 ## Comparing saved project captures

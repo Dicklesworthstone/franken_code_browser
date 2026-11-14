@@ -3,7 +3,7 @@ import Dispatch
 
 /// Fixed FCBT producer receipts exercise production admission, recovery and
 /// independent readers. Rust owns format validation and readiness resolution.
-private final class SavedTrailFixture: @unchecked Sendable {
+final class SavedTrailFixture: @unchecked Sendable {
     struct State {
         var generation: UInt64?
         var attempt: UInt64 = 0
@@ -255,6 +255,7 @@ private final class SavedTrailFixture: @unchecked Sendable {
         precondition(model.trailPage == nil && !model.canNavigateTrail(from: point) && point.canUseTrailRange)
         precondition(!fixture.base.calls.contains("LIVE-OPEN"), "trail navigation reopened live source")
         capture.reader.close(); later.reader.close(); point.reader.close(); model.close()
+        try await AtlasSavedTrailAuthoringTests.run()
         print("Saved trail wire, ordered navigation, exact ranges, uncertain replies and retained-reader fixtures passed")
     }
 }

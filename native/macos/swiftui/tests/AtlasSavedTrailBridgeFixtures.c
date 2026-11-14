@@ -5,10 +5,10 @@
 
 /* Header-checked marshaling and owned-response fixture. Real FCBT/archive
  * resolution and payload verification remain in the Rust service fixtures. */
-static uint64_t calls[5];
+static uint64_t calls[7];
 static int result_mode;
 void fixture_saved_trail_mode(int mode) { result_mode = mode; }
-uint64_t fixture_saved_trail_count(uint64_t index) { assert(index < 5); return calls[index]; }
+uint64_t fixture_saved_trail_count(uint64_t index) { assert(index < 7); return calls[index]; }
 static char *reply(void) {
     if (result_mode == 1) return NULL;
     if (result_mode == 2) {
@@ -36,4 +36,33 @@ char *fcb_saved_trail_detach(uint64_t handle, uint64_t generation) {
 char *fcb_saved_open_trail_reader(uint64_t handle, uint64_t reader, uint64_t generation, uint64_t item) {
     assert(handle == UINT64_MAX - 10 && reader == UINT64_MAX - 8 && generation == UINT64_MAX - 9 && item == 1023);
     calls[3]++; return reply();
+}
+char *fcb_saved_trail_write(uint64_t handle, uint64_t operation,
+    uint64_t parent_generation, const char *parent_digest, uint64_t member,
+    uint64_t start, uint64_t end, const uint8_t *title, uint64_t title_length,
+    const uint8_t *rationale, uint64_t rationale_length, const char *destination) {
+    assert(handle == UINT64_MAX - 10 && member == 1);
+    assert(destination && strcmp(destination, "/write-e\xcc\x81.fcbt") == 0);
+    assert(parent_digest);
+    if (operation == UINT64_MAX - 1) {
+        assert(parent_generation == UINT64_MAX - 9 && strlen(parent_digest) == 64);
+        for (size_t i = 0; i < 64; i++) assert(parent_digest[i] == 'a');
+        assert(start == 209 && end == 209);
+    } else {
+        assert((operation == UINT64_MAX || operation == UINT64_MAX - 2) && parent_generation == 0);
+        assert(parent_digest[0] == 0 && start == 202 && end == 208);
+    }
+    if (operation == UINT64_MAX - 2) {
+        assert(title_length == 0 && rationale_length == 0);
+    } else {
+        static const uint8_t expected_title[] = {'e', 0xcc, 0x81, 0, 'T'};
+        static const uint8_t expected_rationale[] = {'w', 'h', 'y', 0, 0xc3, 0xa9, '\n'};
+        assert(title && title_length == sizeof expected_title && memcmp(title, expected_title, sizeof expected_title) == 0);
+        assert(rationale && rationale_length == sizeof expected_rationale && memcmp(rationale, expected_rationale, sizeof expected_rationale) == 0);
+    }
+    calls[5]++; return reply();
+}
+char *fcb_saved_trail_write_receipt(uint64_t handle, uint64_t operation) {
+    assert(handle == UINT64_MAX - 10 && operation == UINT64_MAX);
+    calls[6]++; return reply();
 }
