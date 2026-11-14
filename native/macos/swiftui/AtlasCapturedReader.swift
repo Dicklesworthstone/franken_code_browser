@@ -39,8 +39,8 @@ struct AtlasCapturedReferenceResult<Page: Sendable>: Sendable {
 }
 
 /// Re-establish the exact occurrence in the independently owned reader's query
-/// namespace. This is one bounded retained-file search, not source I/O or a
-/// second matcher. The existing hit decoder maps UTF-8/UTF-16/BOM/NUL coordinates;
+/// namespace. Bounded ordinal pages search only the retained capture, without
+/// source I/O or a second matcher. The hit decoder maps UTF-8/UTF-16/BOM/NUL coordinates;
 /// a workspace offset is never cast into a native text offset or a reader ID.
 enum AtlasCapturedReader {
     /// Structural names may be prefixes or parsed heading text, so they do not
@@ -57,34 +57,82 @@ enum AtlasCapturedReader {
             bytes: max(AtlasReaderLimits.pageBytes, selected.end - selected.start))
     }
 
+    // Ordinal paging replays the capture from its beginning. Reserve the full
+    // possible scan before each request, including the first; receipt sizes
+    // cannot justify unbounded replay when an adversarial file has many hits.
+    static let maximumActivationReplayBytes: UInt64 = 64 * 1024 * 1024
+    static let maximumActivationPages = 64
+
     @MainActor static func activate<Page: Sendable>(
         _ selected: AtlasSearchCapturedHit, identity: AtlasReaderIdentity,
         find: @MainActor (String) async throws -> AtlasReaderFindReport,
-        read: @MainActor (AtlasReaderHitTarget) async throws -> Page
+        nextPage: (@MainActor (String, UInt64) async throws -> AtlasReaderFindReport)? = nil,
+        read: @MainActor (AtlasReaderHitTarget) async throws -> Page,
+        isCurrent: @MainActor () -> Bool = { true }
     ) async throws -> AtlasCapturedReaderResult<Page> {
-        try Task.checkCancellation()
+        @MainActor func checkCurrent() throws {
+            try Task.checkCancellation()
+            guard isCurrent() else { throw AtlasReaderError.canceled }
+        }
+        try checkCurrent()
         guard selected.mode.isTextual, identity.capturedBytes == selected.capturedBytes,
               identity.pathBytes.elementsEqual(selected.path.utf8),
               selected.start < selected.end, selected.end <= selected.capturedBytes else {
             throw AtlasReaderError.invalidResponse
         }
         try AtlasReaderFindReport.validateNeedle(selected.needle)
-        let report = try await find(selected.needle)
-        try Task.checkCancellation()
-        guard report.identity.matches(identity), report.needle.utf8.elementsEqual(selected.needle.utf8),
-              report.hits.count <= Int(AtlasReaderFindReport.maxHits) else { throw AtlasReaderError.invalidResponse }
-        // Native workspace reports retain at most 1000 hits; the retained-file
-        // query admits 4096. The selected occurrence must actually be present:
-        // never substitute the first hit, the nearest byte, or file start.
-        let matches = report.hits.indices.filter {
-            report.hits[$0].start == selected.start && report.hits[$0].end == selected.end
+        var remainingBytes = maximumActivationReplayBytes
+        var pageCount = 0
+        @MainActor func reserveScan() throws {
+            try checkCurrent()
+            guard pageCount < maximumActivationPages, identity.capturedBytes <= remainingBytes else {
+                throw AtlasReaderError.engine("CAPTURED_SEARCH_HIT_UNAVAILABLE")
+            }
+            remainingBytes -= identity.capturedBytes
+            pageCount += 1
         }
-        guard matches.count == 1, let index = matches.first, let target = report.target(at: index) else {
-            throw AtlasReaderError.engine("CAPTURED_SEARCH_HIT_UNAVAILABLE")
+        try reserveScan()
+        var report = try await find(selected.needle)
+        var cursor: UInt64 = 0
+        var previousGeneration: UInt64 = 0
+        while true {
+            try checkCurrent()
+            guard report.identity.matches(identity), report.generation > previousGeneration,
+                  report.needle.utf8.elementsEqual(selected.needle.utf8),
+                  report.options == .init(),
+                  report.hits.count <= Int(AtlasReaderFindReport.maxHits),
+                  report.skippedMatches == cursor,
+                  report.pageStartAfter == cursor || (pageCount == 1 && report.pageStartAfter == nil) else {
+                throw AtlasReaderError.invalidResponse
+            }
+            // Long exact witnesses can lower the retained row allowance. A
+            // workspace selection may therefore occur after the first page.
+            // Rebind only its exact original range in the current generation.
+            let matches = report.hits.indices.filter {
+                report.hits[$0].start == selected.start && report.hits[$0].end == selected.end
+            }
+            if matches.count == 1, let index = matches.first, let target = report.target(at: index) {
+                try checkCurrent()
+                let page = try await read(target)
+                try checkCurrent()
+                return AtlasCapturedReaderResult(page: page, report: report, index: index, target: target)
+            }
+            guard matches.isEmpty else {
+                throw AtlasReaderError.engine("CAPTURED_SEARCH_HIT_UNAVAILABLE")
+            }
+            // A legacy table has no continuation authority. A continuation is
+            // derived only from a validated global occurrence, never a byte
+            // offset, the look-ahead count, or a page-local hit index.
+            guard report.pageStartAfter != nil, report.hasMoreMatches,
+                  let nextPage, let last = report.hits.last,
+                  last.occurrence > cursor, last.occurrence <= report.matchesSeen else {
+                throw AtlasReaderError.engine("CAPTURED_SEARCH_HIT_UNAVAILABLE")
+            }
+            cursor = last.occurrence
+            previousGeneration = report.generation
+            try reserveScan()
+            report = try await nextPage(selected.needle, cursor)
         }
-        let page = try await read(target)
-        try Task.checkCancellation()
-        return AtlasCapturedReaderResult(page: page, report: report, index: index, target: target)
     }
 
     /// Revalidate against the shared whole-token engine in this retained

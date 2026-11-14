@@ -445,7 +445,13 @@ import Observation
                         // this reader's own exact-spelling query IDs.
                         let selected = try await AtlasCapturedReader.activate(target, identity: opened.identity,
                             find: { try await coordinator.find($0) },
-                            read: { try await coordinator.read(.hit($0)) })
+                            nextPage: { needle, cursor in
+                                try await coordinator.find(needle, startAfter: cursor)
+                            }, read: { try await coordinator.read(.hit($0)) },
+                            isCurrent: {
+                                operation == ticket && fileQuery.utf8.elementsEqual(target.needle.utf8)
+                                    && findOptions == .init()
+                            })
                         guard operation == ticket, !Task.isCancelled else { return }
                         findReport = selected.report
                         knownFindMatchCount = selected.report.complete ? selected.report.matchesSeen : nil

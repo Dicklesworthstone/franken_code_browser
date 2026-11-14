@@ -26,20 +26,56 @@ private final class Calls: @unchecked Sendable {
     }
     private static func report(identity: AtlasReaderIdentity = identity(), needle: String = "x",
                                ranges: [(UInt64, UInt64)] = [(2, 4), (10, 12)],
-                               hex: String? = "7800", complete: Bool = true) -> AtlasReaderFindReport {
-        .init(identity: identity, generation: 23, needle: needle, complete: complete,
-            state: complete ? "complete-observed-input" : "match-limit", matchesSeen: UInt64(ranges.count),
-            hits: ranges.enumerated().map { i, range in
-                .init(index: UInt64(i), occurrence: UInt64(i + 1), start: range.0, end: range.1)
-            }, originalHex: hex)
+                               hex: String? = "7800", complete: Bool = true,
+                               generation: UInt64 = 23, startAfter: UInt64? = nil,
+                               more: Bool = false, retainedLimit: UInt64 = 4096,
+                               options: AtlasReaderFindOptions = .init()) throws -> AtlasReaderFindReport {
+        let seen = (startAfter ?? 0) + UInt64(ranges.count) + (more ? 1 : 0)
+        var wire: [String: Any] = [
+            "schema": "fcb.reader-session/1", "status": "ok", "command": "find",
+            "owner": String(identity.owner), "file_id": String(identity.file),
+            "source_revision": String(identity.revision), "captured_bytes": String(identity.capturedBytes),
+            "encoding": identity.encoding, "additional_source_bytes_read": "0", "native_presented": false,
+            "path": ["encoding": "unix-bytes", "display": identity.displayPath,
+                "hex": identity.pathBytes.map { String(format: "%02x", $0) }.joined()],
+            "query_generation": String(generation), "needle": needle,
+            "mode": options.caseSensitive ? "exact-decoded-literal" : "unicode-lowercase-literal",
+            "state": complete ? "complete-observed-input" : "match-limit", "search_complete": complete,
+            "scanned_bytes": String(identity.capturedBytes), "matches_seen": String(seen),
+            "retained_hits": String(ranges.count), "retained_limit": String(retainedLimit),
+            "case_sensitive": options.caseSensitive, "count_all_matches": options.countAllMatches,
+            "match_count_complete": complete, "rows_truncated": seen > UInt64(ranges.count),
+            "literal_original_hex": options.caseSensitive && !ranges.isEmpty ? (hex.map { $0 as Any } ?? NSNull()) : NSNull(),
+            "unsupported_at": NSNull()
+        ]
+        wire["hits"] = ranges.enumerated().map { index, range -> [String: Any] in
+            var row: [String: Any] = [
+                "hit_index": String(index), "occurrence_id": String((startAfter ?? 0) + UInt64(index) + 1),
+                "original_range": ["start": String(range.0), "end": String(range.1)]
+            ]
+            if !options.caseSensitive {
+                row["matched_text"] = needle
+                row["original_hex"] = hex.map { $0 as Any } ?? NSNull()
+            }
+            return row
+        }
+        if let startAfter {
+            wire["page_start_after"] = String(startAfter)
+            wire["skipped_matches"] = String(startAfter)
+            wire["has_more_matches"] = more
+        }
+        let json = String(data: try JSONSerialization.data(withJSONObject: wire), encoding: .utf8)!
+        let info = AtlasReaderInfo(identity: identity, origin: "regular-file-observation-not-atomic", captureSHA256: nil)
+        return try AtlasReaderFindReport.decode(json, info: info, generation: generation, needle: needle,
+            options: options, startAfter: startAfter)
     }
     @MainActor private static func refused(_ target: AtlasSearchCapturedHit = selected(),
                                           identity: AtlasReaderIdentity = identity(),
-                                          result: AtlasReaderFindReport = report()) async {
+                                          result: () throws -> AtlasReaderFindReport = { try report() }) async {
         var readCount = 0
         do {
             _ = try await AtlasCapturedReader.activate(target, identity: identity,
-                find: { _ in result }, read: { _ in readCount += 1; return "wrong page" })
+                find: { _ in try result() }, read: { _ in readCount += 1; return "wrong page" })
             preconditionFailure("Invalid selection admitted")
         } catch {}
         check(readCount == 0, "Invalid source/range must not trigger any approximate read")
@@ -215,8 +251,183 @@ private final class Calls: @unchecked Sendable {
         check(!preparedCanceled, "Canceled opening performs no local occurrence extraction")
     }
 
+
+    @MainActor private static func pagedTextActivation() async throws {
+        let needle = String(repeating: "x", count: 4096)
+        let witness = String(repeating: "78", count: 4096)
+        let sourceID = identity(bytes: 8192, encoding: "utf8")
+        for mode in [AtlasSearchMode.text, .expression] {
+            let target = selected(needle: needle, start: 4, end: 4100, bytes: 8192,
+                mode: mode, caseSensitive: false)
+            var cursors: [UInt64] = [], reads = 0
+            let activated = try await AtlasCapturedReader.activate(target, identity: sourceID,
+                find: { exact in
+                    check(exact.utf8.elementsEqual(needle.utf8), "Initial activation uses the exact source spelling")
+                    return try report(identity: sourceID, needle: exact, ranges: [(0, 4096), (1, 4097)],
+                        hex: witness, complete: false, startAfter: 0, more: true, retainedLimit: 2)
+                }, nextPage: { exact, cursor in
+                    check(exact.utf8.elementsEqual(needle.utf8), "Continuation preserves exact source spelling")
+                    cursors.append(cursor)
+                    if cursor == 2 {
+                        return try report(identity: sourceID, needle: exact, ranges: [(2, 4098), (3, 4099)],
+                            hex: witness, complete: false, generation: 24, startAfter: 2, more: true, retainedLimit: 2)
+                    }
+                    check(cursor == 4, "Resume after the last global occurrence, not the look-ahead count")
+                    return try report(identity: sourceID, needle: exact, ranges: [(4, 4100)],
+                        hex: witness, generation: 25, startAfter: 4, retainedLimit: 2)
+                }, read: { selected in reads += 1; return selected })
+            check(cursors == [2, 4] && reads == 1, "Long witnesses activate beyond the initial retained row allowance")
+            check(activated.index == 0 && activated.target.index == 0 && activated.target.generation == 25,
+                "Later activation uses the new generation and page-local index")
+            check(activated.report.hits[0].occurrence == 5 && activated.target.start == 4
+                  && activated.target.end == 4100 && activated.target.originalHex == witness,
+                "Only the selected original range and witness authorize the page")
+        }
+    }
+
+    @MainActor private static func pagedActivationRefusals() async throws {
+        let first = try report(ranges: [(0, 2)], complete: false, startAfter: 0, more: true, retainedLimit: 1)
+        let wrongPages = try [
+            report(ranges: [(10, 12)], generation: 24, startAfter: 0, retainedLimit: 1),
+            report(ranges: [(10, 12)], generation: 23, startAfter: 1, retainedLimit: 1),
+            report(identity: identity(owner: 101), ranges: [(10, 12)],
+                generation: 24, startAfter: 1, retainedLimit: 1),
+            report(identity: identity(revision: 2), ranges: [(10, 12)],
+                generation: 24, startAfter: 1, retainedLimit: 1),
+            report(needle: "y", ranges: [(10, 12)], generation: 24, startAfter: 1, retainedLimit: 1),
+            report(ranges: [(10, 12)], generation: 24, startAfter: 1, retainedLimit: 1,
+                options: .init(caseSensitive: false, countAllMatches: false)),
+            report(ranges: [(10, 12)], generation: 24, startAfter: 1, retainedLimit: 1,
+                options: .init(caseSensitive: true, countAllMatches: true))
+        ]
+        for wrong in wrongPages {
+            var reads = 0
+            do {
+                _ = try await AtlasCapturedReader.activate(selected(), identity: identity(),
+                    find: { _ in first }, nextPage: { _, _ in wrong },
+                    read: { _ in reads += 1; return "wrong page" })
+                preconditionFailure("Changed page authority activated")
+            } catch AtlasReaderError.invalidResponse { checks += 1 }
+            check(reads == 0, "Wrong cursor, generation, source, query or options cannot read an approximate selection")
+        }
+
+        let legacy = try report(ranges: [(0, 2)], complete: false, more: true, retainedLimit: 1)
+        let terminal = try report(ranges: [(9, 11)], startAfter: 0, retainedLimit: 1)
+        for unavailable in [legacy, terminal] {
+            var nextCalls = 0, reads = 0
+            do {
+                _ = try await AtlasCapturedReader.activate(selected(), identity: identity(),
+                    find: { _ in unavailable },
+                    nextPage: { _, _ in nextCalls += 1; return first },
+                    read: { _ in reads += 1; return "nearby page" })
+                preconditionFailure("Unavailable captured range substituted")
+            } catch AtlasReaderError.engine(let code) {
+                check(code == "CAPTURED_SEARCH_HIT_UNAVAILABLE", "Absent ranges use the explicit unavailable outcome")
+            }
+            check(nextCalls == 0 && reads == 0, "Legacy and terminal reports authorize neither continuation nor nearby selection")
+        }
+        do {
+            _ = try await AtlasCapturedReader.activate(selected(), identity: identity(),
+                find: { _ in first }, read: { _ in "missing continuation" })
+            preconditionFailure("Missing continuation capability accepted")
+        } catch AtlasReaderError.engine(let code) {
+            check(code == "CAPTURED_SEARCH_HIT_UNAVAILABLE", "Single-table callers remain source-compatible and bounded")
+        }
+    }
+
+    @MainActor private static func pagedActivationBudgets() async throws {
+        // Receipts carry these capture sizes; the fixture allocates only its
+        // bounded JSON rows, not a giant source or a second search engine.
+        for (bytes, admittedPages) in [(UInt64(32 * 1024 * 1024), 2), (UInt64(200), 64)] {
+            let sourceID = identity(bytes: bytes)
+            for reachesBoundary in [false, true] {
+                let desiredPage = reachesBoundary ? admittedPages : admittedPages + 1
+                let offset = UInt64((desiredPage - 1) * 2)
+                let target = selected(start: offset, end: offset + 2, bytes: bytes)
+                var scans = 0, reads = 0
+                do {
+                    let result = try await AtlasCapturedReader.activate(target, identity: sourceID,
+                        find: { _ in
+                            scans += 1
+                            return try report(identity: sourceID, ranges: [(0, 2)], complete: false,
+                                startAfter: 0, more: true, retainedLimit: 1)
+                        }, nextPage: { _, cursor in
+                            scans += 1
+                            return try report(identity: sourceID, ranges: [(cursor * 2, cursor * 2 + 2)],
+                                complete: false, generation: 23 + cursor, startAfter: cursor, more: true, retainedLimit: 1)
+                        }, read: { target in reads += 1; return target })
+                    check(reachesBoundary && result.target.start == offset,
+                        "The last admitted scan may still activate its exact selected row")
+                } catch AtlasReaderError.engine(let code) {
+                    check(!reachesBoundary && code == "CAPTURED_SEARCH_HIT_UNAVAILABLE",
+                        "Byte/page exhaustion refuses the next scan explicitly")
+                }
+                check(scans == admittedPages && reads == (reachesBoundary ? 1 : 0),
+                    "Reserve each entire capture before scanning: at most 64 MiB and 64 pages")
+            }
+        }
+        var attempts = 0
+        do {
+            _ = try await AtlasCapturedReader.activate(selected(bytes: UInt64.max),
+                identity: identity(bytes: UInt64.max),
+                find: { _ in attempts += 1; return try report() }, read: { _ in "overflow" })
+            preconditionFailure("Oversized initial replay admitted")
+        } catch AtlasReaderError.engine(let code) {
+            check(code == "CAPTURED_SEARCH_HIT_UNAVAILABLE", "Unadmitted initial replay has a bounded failure")
+        }
+        check(attempts == 0, "Replay admission never overflows or allocates before its byte reservation")
+    }
+
+    @MainActor private static func pagedActivationCurrentAndCancellation() async throws {
+        let first = try report(ranges: [(0, 2)], complete: false, startAfter: 0, more: true, retainedLimit: 1)
+        let second = try report(ranges: [(10, 12)], generation: 24, startAfter: 1, retainedLimit: 1)
+        for revokedAt in 0...3 {
+            var current = revokedAt != 0
+            var finds = 0, pages = 0, reads = 0
+            do {
+                _ = try await AtlasCapturedReader.activate(selected(), identity: identity(),
+                    find: { _ in
+                        finds += 1
+                        if revokedAt == 1 { current = false }
+                        return first
+                    }, nextPage: { _, _ in
+                        pages += 1
+                        if revokedAt == 2 { current = false }
+                        return second
+                    }, read: { _ in
+                        reads += 1
+                        if revokedAt == 3 { current = false }
+                        return "obsolete selection"
+                    }, isCurrent: { current })
+                preconditionFailure("Revoked captured activation published")
+            } catch AtlasReaderError.canceled { checks += 1 }
+            check(finds == (revokedAt == 0 ? 0 : 1) && pages == (revokedAt >= 2 ? 1 : 0)
+                  && reads == (revokedAt == 3 ? 1 : 0),
+                "Current-owner fences surround initial query, continuation and selected-page delivery")
+        }
+
+        var pending: CheckedContinuation<AtlasReaderFindReport, Never>?
+        var reads = 0
+        let canceled = Task { @MainActor in
+            try await AtlasCapturedReader.activate(selected(), identity: identity(),
+                find: { _ in first },
+                nextPage: { _, _ in await withCheckedContinuation { pending = $0 } },
+                read: { _ in reads += 1; return "canceled page" })
+        }
+        while pending == nil { await Task.yield() }
+        canceled.cancel()
+        pending!.resume(returning: second)
+        do { _ = try await canceled.value; preconditionFailure("Canceled continuation selected a row") }
+        catch is CancellationError { checks += 1 }
+        check(reads == 0, "Late successful continuation cannot revive a canceled activation")
+    }
+
     @MainActor static func main() async throws {
         try await occurrenceActivation()
+        try await pagedTextActivation()
+        try await pagedActivationRefusals()
+        try await pagedActivationBudgets()
+        try await pagedActivationCurrentAndCancellation()
         let imported = try AtlasReaderInput(captured: selected())
         check(imported.fullPath == "src.rs", "Imported label remains the engine's relative source identity")
         let live = try AtlasReaderInput(root: "/repo", path: "src.rs")
@@ -307,7 +518,7 @@ private final class Calls: @unchecked Sendable {
         let activated = try await AtlasCapturedReader.activate(selected(), identity: identity(),
             find: { needle in
                 check(needle == "x", "Original exact query bytes passed through")
-                return report()
+                return try report()
             }, read: { target in chosen = target; return "page from reader" })
         check(activated.page == "page from reader" && activated.index == 1, "Select exact later occurrence, not the first matching word")
         check(chosen?.generation == 23 && chosen?.index == 1, "Selection uses the new reader's query namespace")
@@ -317,7 +528,7 @@ private final class Calls: @unchecked Sendable {
         let expression = try await AtlasCapturedReader.activate(expressionTarget, identity: expressionSource,
             find: { primary in
                 check(primary == "pub fn", "Expression activation searches only the exact primary source text")
-                return report(identity: expressionSource, needle: primary, ranges: [(2, 14), (30, 42)],
+                return try report(identity: expressionSource, needle: primary, ranges: [(2, 14), (30, 42)],
                     hex: "700075006200200066006e00")
             }, read: { $0 })
         check(expression.index == 1 && expression.page.generation == 23,
@@ -326,7 +537,7 @@ private final class Calls: @unchecked Sendable {
               && expression.page.originalHex == "700075006200200066006e00",
             "Expression activation preserves original UTF-16 phrase bytes")
         let partial = try await AtlasCapturedReader.activate(selected(), identity: identity(),
-            find: { _ in report(complete: false) }, read: { $0.index })
+            find: { _ in try report(complete: false) }, read: { $0.index })
         check(partial.page == 1 && !partial.report.complete, "A verified retained hit is usable even when total count is partial")
         for (encoding, start, end, needle, hex) in [
             ("utf8", UInt64(3), UInt64(7), "🎵", "f09f8eb5"),
@@ -336,7 +547,7 @@ private final class Calls: @unchecked Sendable {
             let request = selected(needle: needle, start: start, end: end)
             let source = identity(encoding: encoding)
             let value = try await AtlasCapturedReader.activate(request, identity: source,
-                find: { _ in report(identity: source, needle: needle, ranges: [(start, end)], hex: hex) },
+                find: { _ in try report(identity: source, needle: needle, ranges: [(start, end)], hex: hex) },
                 read: { $0.originalHex })
             check(value.page == hex, "Decoder-owned witness preserved for " + encoding)
         }
@@ -355,7 +566,7 @@ private final class Calls: @unchecked Sendable {
                     find: { exact in
                         check(exact.utf8.elementsEqual(actualText.utf8) && !exact.utf8.elementsEqual(query.utf8),
                             "Insensitive activation performs exact Find using the engine's source spelling")
-                        return report(identity: source, needle: actualText, ranges: [(2, 2 + count)], hex: hex)
+                        return try report(identity: source, needle: actualText, ranges: [(2, 2 + count)], hex: hex)
                     }, read: { $0 })
                 check(value.page.start == 2 && value.page.end == 2 + count && value.page.originalHex == hex,
                     "Insensitive activation preserves original-byte evidence for " + encoding + " " + mode.rawValue)
@@ -363,23 +574,23 @@ private final class Calls: @unchecked Sendable {
         }
         await refused(identity: identity(bytes: 21))
         await refused(identity: identity(path: "other.rs"))
-        await refused(result: report(identity: identity(owner: 101)))
-        await refused(result: report(identity: identity(revision: 2)))
-        await refused(result: report(needle: "y"))
-        await refused(result: report(ranges: [(2, 4), (11, 13)]))
-        await refused(result: report(ranges: [(10, 12), (10, 12)]))
-        await refused(result: report(hex: nil))
+        await refused(result: { try report(identity: identity(owner: 101)) })
+        await refused(result: { try report(identity: identity(revision: 2)) })
+        await refused(result: { try report(needle: "y") })
+        await refused(result: { try report(ranges: [(2, 4), (11, 13)]) })
+        await refused(result: { try report(ranges: [(10, 12), (10, 12)]) })
+        await refused(result: { try report(hex: nil) })
         await refused(selected(start: 12, end: 10))
         await refused(selected(start: 10, end: 21))
         await refused(selected(needle: ""))
-        await refused(selected(needle: "e\u{301}"), result: report(needle: "é"))
+        await refused(selected(needle: "e\u{301}"), result: { try report(needle: "é") })
         await refused(selected(path: "é.rs"), identity: identity(path: "e\u{301}.rs"))
         let many = (0..<4097).map { _ in (UInt64(10), UInt64(12)) }
-        await refused(result: report(ranges: many))
+        await refused(result: { try report(ranges: many) })
         var findCalled = false
         let canceled = Task { @MainActor in
             try await AtlasCapturedReader.activate(selected(), identity: identity(),
-                find: { _ in findCalled = true; return report() }, read: { _ in "must not read" })
+                find: { _ in findCalled = true; return try report() }, read: { _ in "must not read" })
         }
         canceled.cancel()
         do { _ = try await canceled.value; preconditionFailure("Pre-cancel ignored") }
@@ -393,14 +604,14 @@ private final class Calls: @unchecked Sendable {
                 read: { _ in reads += 1; return "wrong page" })
         }
         while continuation == nil { await Task.yield() }
-        mid.cancel(); continuation!.resume(returning: report())
+        mid.cancel(); continuation!.resume(returning: try report())
         do { _ = try await mid.value; preconditionFailure("Mid-query cancellation ignored") }
         catch is CancellationError { checks += 1 }
         check(reads == 0, "Canceled find cannot become a later native selection")
         var pageContinuation: CheckedContinuation<String, Never>?
         let late = Task { @MainActor in
             try await AtlasCapturedReader.activate(selected(), identity: identity(),
-                find: { _ in report() }, read: { _ in await withCheckedContinuation { pageContinuation = $0 } })
+                find: { _ in try report() }, read: { _ in await withCheckedContinuation { pageContinuation = $0 } })
         }
         while pageContinuation == nil { await Task.yield() }
         late.cancel(); pageContinuation!.resume(returning: "stale page")

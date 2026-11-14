@@ -1239,6 +1239,12 @@ option immediately revokes the old hit actions and cancels pending publication.
 Canceling a page request preserves the readable source but revokes its old hit
 actions; use Find to start again.
 
+Opening a workspace text or expression result can also continue through these
+pages to locate its exact original range when a long witness reduces the first
+page's capacity. Automatic activation admits at most 64 pages and 64 MiB of
+aggregate capture replay; reaching either limit reports that the selected hit
+is unavailable. It never substitutes a nearby occurrence or opens the live file.
+
 The additive `fcb_reader_find_page` ABI uses global occurrence offsets and fresh
 query generations. It preserves the original Find and Find-with-options entry
 points. Host, C-boundary, and native model/decoder regressions cover result-page
