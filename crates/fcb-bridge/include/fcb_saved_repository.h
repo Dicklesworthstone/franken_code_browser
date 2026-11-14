@@ -175,6 +175,28 @@ char *fcb_saved_search_counted(uint64_t handle, uint64_t generation,
 char *fcb_saved_search_matching(uint64_t handle, uint64_t generation,
     const char *needle, uint64_t case_sensitive, uint64_t count_all_matches,
     uint64_t max_matches);
+/* A bounded later literal window over the same immutable archive. This is a
+ * new search with a fresh increasing query generation, not an extension of the
+ * old retained table. skip_matches is a zero-based count of verified qualified
+ * occurrences; index candidates, negative proofs and unavailable members do not
+ * consume it. All skipped source work still counts against existing budgets.
+ *
+ * All search/results receipts expose result_offset (requested skip),
+ * skipped_matches (the admitted prefix actually seen), has_more_matches and
+ * nullable next_match_offset. matches_seen includes skipped matches; retained_hits
+ * counts only this window. truncated continues to mean omitted rows, including
+ * the skipped prefix. Use has_more_matches, not truncated, to enable Later.
+ * next_offset remains metadata paging within this window. Hit IDs remain local
+ * to the accepted generation. An incomplete scan is not a completed inventory;
+ * never concatenate independent windows into one accepted query.
+ *
+ * Flags, limits, index policy and pointer ownership match search_matching.
+ * Failed/canceled replacement preserves accepted rows. Existing retained readers
+ * survive replacement; opening a new hit revalidates its immutable member digest.
+ */
+char *fcb_saved_search_page(uint64_t handle, uint64_t generation,
+    const char *needle, uint64_t case_sensitive, uint64_t count_all_matches,
+    uint64_t max_matches, uint64_t skip_matches);
 char *fcb_saved_results(uint64_t handle, uint64_t generation,
     uint64_t start, uint64_t limit);
 char *fcb_saved_clear_results(uint64_t handle, uint64_t generation);
@@ -228,6 +250,15 @@ char *fcb_saved_expression_search_counted(uint64_t handle, uint64_t generation,
 char *fcb_saved_expression_search_matching(uint64_t handle, uint64_t generation,
     const char *query, uint64_t case_sensitive, uint64_t count_all_matches,
     uint64_t max_hits, uint64_t max_scan_bytes);
+/* Later primary-hit window with the same window receipt fields and ownership
+ * rules as saved_search_page. Predicates are reestablished over the entire
+ * verified member before its primary occurrences consume skip_matches.
+ * Uses a fresh expression generation; max_scan_bytes includes skipped work.
+ * All old expression entrypoints keep result_offset zero.
+ */
+char *fcb_saved_expression_search_page(uint64_t handle, uint64_t generation,
+    const char *query, uint64_t case_sensitive, uint64_t count_all_matches,
+    uint64_t max_hits, uint64_t max_scan_bytes, uint64_t skip_matches);
 char *fcb_saved_expression_results(uint64_t handle, uint64_t generation,
     uint64_t start, uint64_t limit);
 char *fcb_saved_clear_expression(uint64_t handle, uint64_t generation);
@@ -268,6 +299,17 @@ char *fcb_saved_open_expression_hit_reader(uint64_t handle, uint64_t reader,
 char *fcb_saved_structure_search(uint64_t handle, uint64_t generation,
     uint64_t mode, uint64_t name_mode, const char *needle,
     uint64_t max_hits, uint64_t max_source_bytes);
+/* Later symbols/headings/whole-token window under a fresh structure generation.
+ * Same admission, source budgets, verification and modes as structure_search.
+ * result_offset/skipped_matches/has_more_matches/next_match_offset describe the
+ * window; skipped and metadata-omitted qualified candidates count in matches_seen.
+ * Follow next_match_offset because metadata omissions also consume positions.
+ * Structure truncated retains its existing later-lookahead meaning; a complete
+ * final window may have a skipped prefix. No semantic resolution is implied.
+ */
+char *fcb_saved_structure_search_page(uint64_t handle, uint64_t generation,
+    uint64_t mode, uint64_t name_mode, const char *needle,
+    uint64_t max_hits, uint64_t max_source_bytes, uint64_t skip_matches);
 char *fcb_saved_structure_results(uint64_t handle, uint64_t generation,
     uint64_t start, uint64_t limit);
 char *fcb_saved_clear_structure(uint64_t handle, uint64_t generation);

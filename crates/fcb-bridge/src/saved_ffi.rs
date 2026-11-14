@@ -129,6 +129,23 @@ pub unsafe extern "C" fn fcb_saved_search_matching(handle: u64, generation: u64,
             count_all_matches: count_all_matches == 1 }, || false)
     }))
 }
+/// Retain a later bounded literal result window in a fresh query generation.
+/// skip_matches counts verified occurrences, not members or retained-page rows.
+/// # Safety
+/// needle is null or readable NUL-terminated UTF-8 stable until return.
+/// Release every non-null response exactly once with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_saved_search_page(handle: u64, generation: u64,
+    needle: *const c_char, case_sensitive: u64, count_all_matches: u64,
+    max_matches: u64, skip_matches: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| {
+        if case_sensitive > 1 || count_all_matches > 1 { return Err(AccessError::InvalidArgument); }
+        let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
+        sessions.execute(handle, Command::SearchPage { generation, needle,
+            limit: number(max_matches)?, case_sensitive: case_sensitive == 1,
+            count_all_matches: count_all_matches == 1, skip_matches }, || false)
+    }))
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_saved_results(handle: u64, generation: u64, start: u64, limit: u64) -> *mut c_char {
     reply(|| answer(handle, |sessions| sessions.execute(handle,
@@ -183,6 +200,23 @@ pub unsafe extern "C" fn fcb_saved_expression_search_matching(handle: u64, gener
         sessions.execute(handle, Command::ExpressionSearchMatching { generation, query,
             max_hits: number(max_hits)?, max_scan_bytes, case_sensitive: case_sensitive == 1,
             count_all_matches: count_all_matches == 1 }, || false)
+    }))
+}
+/// Reevaluate whole-member predicates and retain a later primary-hit window.
+/// A fresh expression generation owns each window; scan budgets include skipped work.
+/// # Safety
+/// query is null or readable NUL-terminated UTF-8 stable until return.
+/// Release every non-null response exactly once with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_saved_expression_search_page(handle: u64, generation: u64,
+    query: *const c_char, case_sensitive: u64, count_all_matches: u64,
+    max_hits: u64, max_scan_bytes: u64, skip_matches: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| {
+        if case_sensitive > 1 || count_all_matches > 1 { return Err(AccessError::InvalidArgument); }
+        let query = unsafe { cstr(query) }.ok_or(AccessError::InvalidArgument)?;
+        sessions.execute(handle, Command::ExpressionSearchPage { generation, query,
+            max_hits: number(max_hits)?, max_scan_bytes, case_sensitive: case_sensitive == 1,
+            count_all_matches: count_all_matches == 1, skip_matches }, || false)
     }))
 }
 #[unsafe(no_mangle)]
@@ -327,3 +361,7 @@ mod matching_tests;
 #[cfg(all(test, unix))]
 #[path = "saved_document_images_ffi_tests.rs"]
 mod document_images_tests;
+
+#[cfg(all(test, unix))]
+#[path = "saved_windows_ffi_tests.rs"]
+mod window_tests;

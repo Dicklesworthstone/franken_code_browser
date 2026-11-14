@@ -260,6 +260,17 @@ impl SavedRepositorySession {
     /// The selected policy is frozen with counts, pages and activation receipts.
     pub fn search_matching(&mut self, generation: u64, needle: &str, max_matches: usize,
         case_sensitive: bool, count_all_matches: bool,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedRepositoryError> {
+        self.search_matching_page(generation, needle, max_matches, case_sensitive, count_all_matches, 0, canceled)
+    }
+
+    /// Reverify a later bounded window of the same saved archive. A fresh query
+    /// generation replaces only this accepted result table; earlier readers
+    /// retain their exact captured source. Offsets count verified occurrences,
+    /// including overlaps, rather than files or distinct source spans.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_matching_page(&mut self, generation: u64, needle: &str, max_matches: usize,
+        case_sensitive: bool, count_all_matches: bool, skip_matches: u64,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedRepositoryError> {
         query_attempt(&mut self.last_query_attempt, generation)?; check(&mut canceled)?;
         if needle.is_empty() || needle.len() > MAX_SAVED_NEEDLE_BYTES
@@ -281,20 +292,14 @@ impl SavedRepositorySession {
         let report = if let Some(index) = self.index.as_mut().filter(|_| case_sensitive) {
             let pattern = IndexedNeedle::text(owner, needle, &self.budget, pattern_id)
                 .map_err(PagedSearchError::from)?;
-            let query = if count_all_matches {
-                PagedQuery::new_paged_counting(&mut self.archive, &pattern, &mut index.pages, opts, &self.budget, ids)?
-            } else {
-                PagedQuery::new_paged(&mut self.archive, &pattern, &mut index.pages, opts, &self.budget, ids)?
-            };
+            let query = PagedQuery::new_paged_page(&mut self.archive, &pattern, &mut index.pages,
+                opts, skip_matches, count_all_matches, &self.budget, ids)?;
             finish_query(query, qgen, &self.budget, &mut canceled)?
         } else {
             let pattern = StreamingNeedle::text_matching(owner, needle, case_sensitive, &self.budget, pattern_id)
                 .map_err(PagedSearchError::from)?;
-            let query = if count_all_matches {
-                PagedQuery::new_counting(&mut self.archive, &pattern, opts, &self.budget, ids)?
-            } else {
-                PagedQuery::new(&mut self.archive, &pattern, opts, &self.budget, ids)?
-            };
+            let query = PagedQuery::new_page(&mut self.archive, &pattern, opts,
+                skip_matches, count_all_matches, &self.budget, ids)?;
             finish_query(query, qgen, &self.budget, &mut canceled)?
         };
         check(&mut canceled)?;
@@ -431,6 +436,8 @@ impl SavedRepositorySession {
         out.literal(",\"count_all_matches\":")?; out.boolean(report.count_all_matches())?;
         out.literal(",\"matches_seen_exact\":")?; out.boolean(report.is_complete())?;
         out.literal(",\"truncated\":")?; out.boolean(report.truncated())?;
+        window_fields(out, report.skip_matches(), report.skipped_matches(),
+            report.has_more_matches(), report.next_match_offset())?;
         for (key, value) in [("retained_hits", report.hits().len() as u64), ("matches_seen", report.matches_seen()),
             ("max_matches", report.max_matches() as u64), ("matching_files", report.matching_files() as u64),
             ("retained_matching_files", report.retained_matching_files() as u64),
@@ -532,6 +539,16 @@ fn encode_matching(out: &mut Output, case_sensitive: bool) -> Result<(), OutputE
     out.literal(",\"case_sensitive\":")?; out.boolean(case_sensitive)?;
     out.literal(",\"mode\":")?;
     out.quoted(if case_sensitive { "exact-decoded-literal" } else { "unicode-lowercase-literal" })
+}
+/// Shared metadata for literal, expression and structural result windows.
+/// next_offset still pages only the currently retained metadata; this explicit
+/// next_match_offset starts another bounded scan with a fresh generation.
+fn window_fields(out: &mut Output, offset: u64, skipped: u64, more: bool, next: Option<u64>)
+    -> Result<(), OutputError> {
+    out.literal(",\"result_offset\":")?; out.integer(offset)?;
+    out.literal(",\"skipped_matches\":")?; out.integer(skipped)?;
+    out.literal(",\"has_more_matches\":")?; out.boolean(more)?;
+    out.literal(",\"next_match_offset\":")?; optional(out, next)
 }
 fn optional(out: &mut Output, value: Option<u64>) -> Result<(), OutputError> {
     if let Some(value) = value { out.integer(value) } else { out.literal("null") }

@@ -59,8 +59,16 @@ impl SavedExpression {
     /// an attached exact-byte index. Existing constructors remain exact.
     pub fn prepare_matching(saved: &mut SavedRepositorySession, generation: u64, query: &str,
         options: SavedExpressionOptions, case_sensitive: bool, count_all_matches: bool,
-        mut canceled: impl FnMut() -> bool)
-        -> Result<Self, SavedDeskError> {
+        canceled: impl FnMut() -> bool) -> Result<Self, SavedDeskError> {
+        Self::prepare_matching_page(saved, generation, query, options, case_sensitive, count_all_matches, 0, canceled)
+    }
+
+    /// A new query generation retains one later window, while all required and
+    /// excluded terms still inspect the same verified member as the primary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_matching_page(saved: &mut SavedRepositorySession, generation: u64, query: &str,
+        options: SavedExpressionOptions, case_sensitive: bool, count_all_matches: bool, skip_matches: u64,
+        mut canceled: impl FnMut() -> bool) -> Result<Self, SavedDeskError> {
         check(&mut canceled)?;
         if options.max_hits > super::super::MAX_SAVED_HITS || query.len() > MAX_QUERY_LEN {
             return Err(SavedRepositoryError::InvalidLimits.into());
@@ -83,11 +91,8 @@ impl SavedExpression {
             generation: qgen, first_file, first_revision, max_matches: options.max_hits,
             max_scan_bytes: options.max_scan_bytes,
         };
-        let mut work = if count_all_matches {
-            ExpressionQuery::new_counting(&mut saved.archive, &plan, query_options, &saved.budget, allocations)?
-        } else {
-            ExpressionQuery::new(&mut saved.archive, &plan, query_options, &saved.budget, allocations)?
-        };
+        let mut work = ExpressionQuery::new_page(&mut saved.archive, &plan, query_options,
+            skip_matches, count_all_matches, &saved.budget, allocations)?;
         while work.state() == ExpressionState::Pending {
             work.step(StreamReadStep::default(), qgen, &saved.budget, &mut canceled)?;
         }
@@ -138,6 +143,8 @@ impl SavedExpression {
         out.literal(",\"matches_seen_exact\":")?; out.boolean(self.is_complete())?;
         out.literal(",\"count_all_matches\":")?; out.boolean(self.report.count_all_matches())?;
         out.literal(",\"truncated\":")?; out.boolean(self.report.hits_truncated())?;
+        super::super::window_fields(out, self.report.skip_matches(), self.report.skipped_matches(),
+            self.report.has_more_matches(), self.report.next_match_offset())?;
         let s = self.stats();
         for (key, value) in [
             ("required_terms", self.plan.syntax().conjunction_terms.len() as u64),
@@ -295,13 +302,20 @@ impl SavedRepositorySession {
     /// replacements keep the prior report and its original matching semantics.
     pub fn expression_search_matching(&mut self, generation: u64, query: &str, max_hits: usize,
         max_scan_bytes: u64, case_sensitive: bool, count_all_matches: bool,
-        mut canceled: impl FnMut() -> bool)
-        -> Result<HostResponse, SavedDeskError> {
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedDeskError> {
+        self.expression_search_matching_page(generation, query, max_hits, max_scan_bytes,
+            case_sensitive, count_all_matches, 0, canceled)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn expression_search_matching_page(&mut self, generation: u64, query: &str, max_hits: usize,
+        max_scan_bytes: u64, case_sensitive: bool, count_all_matches: bool, skip_matches: u64,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedDeskError> {
         super::super::query_attempt(&mut self.last_expression_attempt, generation)?;
         check(&mut canceled)?;
         let options = SavedExpressionOptions { max_hits, max_scan_bytes };
-        let candidate = SavedExpression::prepare_matching(self, generation, query, options,
-            case_sensitive, count_all_matches, &mut canceled)?;
+        let candidate = SavedExpression::prepare_matching_page(self, generation, query, options,
+            case_sensitive, count_all_matches, skip_matches, &mut canceled)?;
         let response = candidate.page(self, generation, 0, 64, &mut canceled)?;
         self.expression = Some(candidate);
         Ok(response)

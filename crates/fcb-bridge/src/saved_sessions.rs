@@ -81,16 +81,22 @@ pub(super) enum Command<'a> {
     SearchCounted { generation: u64, needle: &'a str, limit: usize },
     SearchMatching { generation: u64, needle: &'a str, limit: usize,
         case_sensitive: bool, count_all_matches: bool },
+    SearchPage { generation: u64, needle: &'a str, limit: usize,
+        case_sensitive: bool, count_all_matches: bool, skip_matches: u64 },
     Results { generation: u64, start: usize, limit: usize },
     Clear { generation: u64 },
     ExpressionSearch { generation: u64, query: &'a str, max_hits: usize, max_scan_bytes: u64 },
     ExpressionSearchCounted { generation: u64, query: &'a str, max_hits: usize, max_scan_bytes: u64 },
     ExpressionSearchMatching { generation: u64, query: &'a str, max_hits: usize, max_scan_bytes: u64,
         case_sensitive: bool, count_all_matches: bool },
+    ExpressionSearchPage { generation: u64, query: &'a str, max_hits: usize, max_scan_bytes: u64,
+        case_sensitive: bool, count_all_matches: bool, skip_matches: u64 },
     ExpressionResults { generation: u64, start: usize, limit: usize },
     ClearExpression { generation: u64 },
     StructureSearch { generation: u64, mode: StructureMode, name_mode: SymbolNameMode,
         needle: &'a str, max_hits: usize, max_source_bytes: u64 },
+    StructureSearchPage { generation: u64, mode: StructureMode, name_mode: SymbolNameMode,
+        needle: &'a str, max_hits: usize, max_source_bytes: u64, skip_matches: u64 },
     StructureResults { generation: u64, start: usize, limit: usize },
     ClearStructure { generation: u64 },
     PrepareRelationships { generation: u64, max_links: usize, max_source_bytes: u64 },
@@ -197,6 +203,10 @@ impl SavedSessions {
             Command::ExpressionSearchMatching { generation, query, max_hits, max_scan_bytes, case_sensitive, count_all_matches } =>
                 session.expression_search_matching(generation, query, max_hits, max_scan_bytes,
                     case_sensitive, count_all_matches, &mut stop).map_err(AccessError::from),
+            Command::ExpressionSearchPage { generation, query, max_hits, max_scan_bytes,
+                case_sensitive, count_all_matches, skip_matches } =>
+                session.expression_search_matching_page(generation, query, max_hits, max_scan_bytes,
+                    case_sensitive, count_all_matches, skip_matches, &mut stop).map_err(AccessError::from),
             Command::ExpressionResults { generation, start, limit } =>
                 session.expression_results(generation, start, limit, &mut stop).map_err(AccessError::from),
             Command::ClearExpression { generation } =>
@@ -204,6 +214,10 @@ impl SavedSessions {
             Command::StructureSearch { generation, mode, name_mode, needle, max_hits, max_source_bytes } =>
                 session.structure_search(generation, mode, name_mode, needle, max_hits, max_source_bytes,
                     &mut stop).map_err(AccessError::from),
+            Command::StructureSearchPage { generation, mode, name_mode, needle,
+                max_hits, max_source_bytes, skip_matches } =>
+                session.structure_search_page(generation, mode, name_mode, needle, max_hits,
+                    max_source_bytes, skip_matches, &mut stop).map_err(AccessError::from),
             Command::StructureResults { generation, start, limit } =>
                 session.structure_results(generation, start, limit, &mut stop).map_err(AccessError::from),
             Command::ClearStructure { generation } =>
@@ -237,6 +251,9 @@ impl SavedSessions {
             Command::SearchMatching { generation, needle, limit, case_sensitive, count_all_matches } =>
                 session.search_matching(generation, needle, limit, case_sensitive, count_all_matches,
                     &mut stop).map_err(AccessError::from),
+            Command::SearchPage { generation, needle, limit, case_sensitive, count_all_matches, skip_matches } =>
+                session.search_matching_page(generation, needle, limit, case_sensitive, count_all_matches,
+                    skip_matches, &mut stop).map_err(AccessError::from),
             Command::Results { generation, start, limit } => session.results(generation, start, limit, &mut stop).map_err(AccessError::from),
             Command::Clear { generation } => session.clear_results(generation, &mut stop).map_err(AccessError::from),
         };

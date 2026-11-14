@@ -34,7 +34,7 @@ pub(super) struct AcceptedStructure {
 impl AcceptedStructure {
     #[allow(clippy::too_many_arguments)]
     fn prepare(saved: &mut SavedRepositorySession, generation: u64, mode: StructureMode,
-        name_mode: SymbolNameMode, needle: &str, max_hits: usize, max_source_bytes: u64,
+        name_mode: SymbolNameMode, needle: &str, max_hits: usize, max_source_bytes: u64, skip_matches: u64,
         canceled: &mut impl FnMut() -> bool) -> Result<Self, SavedRepositoryError> {
         check(canceled)?;
         let owner = saved.owner();
@@ -46,10 +46,10 @@ impl AcceptedStructure {
         let first_file = FileId::new(owner, 1).map_err(|_| SavedRepositoryError::IdentityExhausted)?;
         let first_revision = SourceRevision::new(owner, 1).map_err(|_| SavedRepositoryError::IdentityExhausted)?;
         let before = saved.archive.load_stats();
-        let mut work = StructureQuery::new(&mut saved.archive, needle, StructureOptions {
+        let mut work = StructureQuery::new_page(&mut saved.archive, needle, StructureOptions {
             generation: qgen, first_file, first_revision, mode, name_mode,
             max_matches: max_hits, max_source_bytes,
-        }, &saved.budget, allocations)?;
+        }, skip_matches, &saved.budget, allocations)?;
         while work.state() == StructureState::Pending {
             work.step(qgen, &saved.budget, &mut *canceled)?;
         }
@@ -115,6 +115,8 @@ impl AcceptedStructure {
         out.literal(",\"complete\":")?; out.boolean(self.report.is_complete())?;
         out.literal(",\"matches_seen_exact\":")?; out.boolean(self.report.is_complete())?;
         out.literal(",\"truncated\":")?; out.boolean(self.report.state() == StructureState::Truncated)?;
+        super::window_fields(out, self.report.skip_matches(), self.report.skipped_matches(),
+            self.report.has_more_matches(), self.report.next_match_offset())?;
         let s = self.report.stats();
         for (key, value) in [
             ("max_hits", self.max_hits as u64), ("max_source_bytes", self.max_source_bytes),
@@ -208,12 +210,19 @@ impl SavedRepositorySession {
     /// complete; canceled work never publishes a partially prepared report.
     #[allow(clippy::too_many_arguments)]
     pub fn structure_search(&mut self, generation: u64, mode: StructureMode, name_mode: SymbolNameMode,
-        needle: &str, max_hits: usize, max_source_bytes: u64, mut canceled: impl FnMut() -> bool)
+        needle: &str, max_hits: usize, max_source_bytes: u64, canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, SavedRepositoryError> {
+        self.structure_search_page(generation, mode, name_mode, needle, max_hits, max_source_bytes, 0, canceled)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn structure_search_page(&mut self, generation: u64, mode: StructureMode, name_mode: SymbolNameMode,
+        needle: &str, max_hits: usize, max_source_bytes: u64, skip_matches: u64, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, SavedRepositoryError> {
         query_attempt(&mut self.last_structure_attempt, generation)?;
         check(&mut canceled)?;
         let candidate = AcceptedStructure::prepare(self, generation, mode, name_mode, needle,
-            max_hits, max_source_bytes, &mut canceled)?;
+            max_hits, max_source_bytes, skip_matches, &mut canceled)?;
         let response = candidate.page(self, generation, 0, 64, &mut canceled)?;
         self.structure = Some(candidate);
         Ok(response)

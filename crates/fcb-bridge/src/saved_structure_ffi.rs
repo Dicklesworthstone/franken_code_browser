@@ -36,6 +36,35 @@ pub unsafe extern "C" fn fcb_saved_structure_search(handle: u64, generation: u64
     }))
 }
 
+/// Retain a later bounded structural-result window under a fresh generation.
+/// skip_matches counts qualified candidates across verified members, including
+/// metadata omissions; next_match_offset is the authoritative later window.
+/// # Safety
+/// needle is null or readable NUL-terminated UTF-8 stable until return.
+/// Release every non-null response exactly once with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_saved_structure_search_page(handle: u64, generation: u64,
+    mode: u64, name_mode: u64, needle: *const c_char,
+    max_hits: u64, max_source_bytes: u64, skip_matches: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| {
+        let mode = match mode {
+            1 => StructureMode::Symbols,
+            2 => StructureMode::Headings,
+            4 => StructureMode::Occurrences,
+            _ => return Err(AccessError::InvalidArgument),
+        };
+        let name_mode = match name_mode {
+            0 => SymbolNameMode::Exact,
+            1 => SymbolNameMode::Prefix,
+            2 => SymbolNameMode::Contains,
+            _ => return Err(AccessError::InvalidArgument),
+        };
+        let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
+        sessions.execute(handle, Command::StructureSearchPage { generation, mode, name_mode,
+            needle, max_hits: number(max_hits)?, max_source_bytes, skip_matches }, || false)
+    }))
+}
+
 /// Page retained structural metadata without rereading archived source.
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_saved_structure_results(handle: u64, generation: u64,

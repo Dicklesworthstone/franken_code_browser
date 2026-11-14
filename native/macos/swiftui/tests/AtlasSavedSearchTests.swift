@@ -47,6 +47,7 @@ import Dispatch
         await forgedLowercaseActivationPoliciesRetireDestinations()
         try exactPageAndPartialCoverageContracts()
         try countedTotalsRemainIndependentOfStoredRows()
+        try laterWindowsValidateOffsetsCountsAndContinuations()
         try await countedPoliciesStayFrozenAcrossPagingAndReaders()
         try await exactUTF8AndUTF16HandoffsKeepOriginalMatches()
         await frozenArchiveQueryPageAndEditorRejectStaleHits()
@@ -293,6 +294,108 @@ import Dispatch
         var stoppedAtRows = expression; stoppedAtRows["state"] = "truncated"
         stoppedAtRows["complete"] = false; stoppedAtRows["matches_seen_exact"] = false
         rejected("count-all expression stopped at its retained-row limit") { _ = try decodeExpression(stoppedAtRows) }
+    }
+
+
+    private static func laterWindowsValidateOffsetsCountsAndContinuations() throws {
+        let f = SavedRepositoryFixture(searchVectors: true, headingVectors: true)
+        func window(_ input: [String: Any], offset: UInt64, skipped: UInt64,
+            seen: UInt64, more: Bool, next: UInt64?) -> [String: Any] {
+            var out = input
+            out["result_offset"] = String(offset); out["skipped_matches"] = String(skipped)
+            out["matches_seen"] = String(seen); out["has_more_matches"] = more
+            out["next_match_offset"] = next.map(String.init) as Any? ?? NSNull()
+            return out
+        }
+        var literal = f.searchPage(40, generation: 1, countAllMatches: true)
+        literal["captured_members"] = "5"; literal["unavailable_files"] = "0"
+        literal["search_complete"] = true; literal["matches_seen_exact"] = true
+        literal["truncated"] = true; literal["member_bytes_read"] = "60000"; literal["scanned_bytes"] = "60000"
+        literal = window(literal, offset: 4096, skipped: 4096, seen: 4100, more: false, next: nil)
+        let identity = try JSONDecoder().decode(AtlasSavedIdentity.self, from: Data(f.encode(literal).utf8))
+        func decode(_ object: [String: Any], offset: UInt64 = 4096) throws -> AtlasSavedSearchPage {
+            try AtlasSavedSearchPage.decode(f.encode(object), identity: identity, generation: 1,
+                needle: "ana", start: 0, limit: 64, resultOffset: offset)
+        }
+        let tail = try decode(literal)
+        precondition(tail.complete && tail.truncated && tail.retained == 4 && tail.seen == 4100)
+        precondition(!tail.window.hasMore && tail.window.next == nil && tail.window.earlier == 0)
+        precondition(tail.counting.summary(seen: tail.seen, retained: tail.retained,
+            skipped: tail.window.skipped).contains("after 4096"))
+        var bounded = literal; bounded["count_all_matches"] = false
+        let boundedTail = try decode(bounded)
+        precondition(boundedTail.complete, "exact last bounded window was mistaken for truncation")
+        rejected("response rebound a requested result offset") { _ = try decode(literal, offset: 0) }
+        for field in ["result_offset", "skipped_matches", "has_more_matches", "next_match_offset"] {
+            var bad = literal; bad.removeValue(forKey: field)
+            rejected("partial window receipt accepted missing \(field)") { _ = try decode(bad) }
+        }
+        for (field, value) in [("result_offset", "4095" as Any), ("skipped_matches", "4095" as Any),
+            ("has_more_matches", true as Any), ("next_match_offset", "4100" as Any),
+            ("result_offset", "04096" as Any)] {
+            var bad = literal; bad[field] = value
+            rejected("inconsistent window receipt accepted \(field)") { _ = try decode(bad) }
+        }
+        var empty = window(literal, offset: UInt64.max, skipped: 4100, seen: 4100, more: false, next: nil)
+        empty["retained_hits"] = "0"; empty["retained_matching_files"] = "0"; empty["hits"] = [[String: Any]]()
+        let beyond = try decode(empty, offset: UInt64.max)
+        precondition(beyond.hits.isEmpty && beyond.window.skipped == 4100 && beyond.complete)
+        var legacy = f.searchPage(40, generation: 1, countAllMatches: true)
+        legacy["captured_members"] = "5"; legacy["unavailable_files"] = "0"
+        legacy["search_complete"] = true; legacy["matches_seen_exact"] = true
+        var zeroBounded = window(legacy, offset: 0, skipped: 0, seen: 0, more: false, next: nil)
+        zeroBounded["count_all_matches"] = false; zeroBounded["max_matches"] = "0"
+        zeroBounded["retained_hits"] = "0"; zeroBounded["matching_files"] = "0"
+        zeroBounded["retained_matching_files"] = "0"; zeroBounded["hits"] = [[String: Any]]()
+        rejected("unsupported noncounting zero-cap literal receipt was accepted") { _ = try decode(zeroBounded, offset: 0) }
+        zeroBounded["truncated"] = true; zeroBounded["search_complete"] = false
+        zeroBounded["matches_seen_exact"] = false
+        rejected("core no-scan zero-cap result crossed the saved-host boundary") { _ = try decode(zeroBounded, offset: 0) }
+        let first = try AtlasSavedSearchPage.decode(f.encode(legacy), identity: identity, generation: 1,
+            needle: "ana", start: 0, limit: 64)
+        precondition(first.window.offset == 0 && first.window.skipped == 0 && !first.window.hasMore)
+        rejected("legacy first-window receipt satisfied an explicit window request") { _ = try decode(legacy, offset: 0) }
+        precondition(!first.hasSameSummary(as: tail))
+
+        var expression = f.expressionPage(40, generation: 1, query: "ana path:raw", countAllMatches: true)
+        expression["member_bytes_read"] = "60000"; expression["loaded_bytes"] = "60000"
+        expression["scanned_bytes"] = "60000"; expression["truncated"] = true
+        expression = window(expression, offset: 4096, skipped: 4096, seen: 4098, more: false, next: nil)
+        let expressionIdentity = try JSONDecoder().decode(AtlasSavedIdentity.self, from: Data(f.encode(expression).utf8))
+        let expressionTail = try AtlasSavedExpressionPage.decode(f.encode(expression), identity: expressionIdentity,
+            generation: 1, expression: "ana path:raw", start: 0, limit: 64, resultOffset: 4096)
+        precondition(expressionTail.complete && expressionTail.retained == 2 && !expressionTail.window.hasMore)
+        expression["count_all_matches"] = false
+        let boundedExpression = try AtlasSavedExpressionPage.decode(f.encode(expression), identity: expressionIdentity,
+            generation: 1, expression: "ana path:raw", start: 0, limit: 64, resultOffset: 4096)
+        precondition(boundedExpression.complete && boundedExpression.truncated)
+        var workLimited = window(expression, offset: 4096, skipped: 100, seen: 100, more: false, next: nil)
+        workLimited["state"] = "work-limit"; workLimited["complete"] = false; workLimited["matches_seen_exact"] = false
+        workLimited["retained_hits"] = "0"; workLimited["retained_matching_files"] = "0"
+        workLimited["hits"] = [[String: Any]]()
+        let partial = try AtlasSavedExpressionPage.decode(f.encode(workLimited), identity: expressionIdentity,
+            generation: 1, expression: "ana path:raw", start: 0, limit: 64, resultOffset: 4096)
+        precondition(!partial.complete && partial.window.skipped == 100 && !partial.window.hasMore)
+
+        let structural = window(f.structurePage(40, generation: 1, mode: .occurrences,
+            nameMode: .exact, needle: f.occurrenceNeedle), offset: 4096, skipped: 4096, seen: 4098, more: false, next: nil)
+        let structureIdentity = try JSONDecoder().decode(AtlasSavedIdentity.self, from: Data(f.encode(structural).utf8))
+        let structureTail = try AtlasSavedStructurePage.decode(f.encode(structural), identity: structureIdentity,
+            generation: 1, mode: .occurrences, nameMode: .exact, needle: f.occurrenceNeedle,
+            start: 0, limit: 64, resultOffset: 4096)
+        precondition(!structureTail.truncated && structureTail.seen == 4098 && structureTail.window.skipped == 4096)
+        var omitted = window(structural, offset: 4096, skipped: 4096, seen: 4102, more: true, next: 4101)
+        omitted["metadata_omitted"] = "3"; omitted["state"] = "truncated"; omitted["truncated"] = true
+        let omittedTail = try AtlasSavedStructurePage.decode(f.encode(omitted), identity: structureIdentity,
+            generation: 1, mode: .occurrences, nameMode: .exact, needle: f.occurrenceNeedle,
+            start: 0, limit: 64, resultOffset: 4096)
+        precondition(omittedTail.window.next == 4101, "omitted qualified candidates did not advance the continuation")
+        omitted["next_match_offset"] = "4098"
+        rejected("structural metadata omission rebound the next match offset") {
+            _ = try AtlasSavedStructurePage.decode(f.encode(omitted), identity: structureIdentity,
+                generation: 1, mode: .occurrences, nameMode: .exact, needle: f.occurrenceNeedle,
+                start: 0, limit: 64, resultOffset: 4096)
+        }
     }
 
     @MainActor private static func countedPoliciesStayFrozenAcrossPagingAndReaders() async throws {
