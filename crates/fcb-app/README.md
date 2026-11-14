@@ -171,6 +171,46 @@ window offsets/byte counts, `--path` queries, `--max-file-bytes` or
 indexed route. Workspace discovery limits and static exclusions still apply.
 Use `--max-files` and `--include-excluded` with an explicit workspace as before.
 
+### Later match windows
+
+Use **`--skip-matches N`** with `--whole-file` to reach occurrences beyond the
+first retained result table without increasing its 4,096-row maximum:
+
+```sh
+fcb search huge.rs --whole-file --text needle --skip-matches 4096 --limit 100 --json
+fcb search /path/to/repository --workspace --whole-file --identifier cancel --skip-matches 4096 --limit 100 --stream
+fcb search /path/to/repository --workspace --whole-file --query 'anchor required -forbidden' --skip-matches 100 --limit 50 --count-all --json
+```
+
+The offset counts matching occurrences, including overlaps, under the selected
+literal, raw-byte, identifier or expression policy. In a workspace it spans
+the admitted files in catalog order. Metadata exclusions, failed opens and
+unqualified expression candidates do not consume it. Expressions still evaluate
+their whole-file predicates before any candidate contributes to the offset.
+
+Skipping scans from byte zero using the same decoding/token context and global
+byte/read-call budgets. It does not seek into the middle of source or reserve a
+larger hit table. Each invocation is a new live-file observation: edits or changed
+catalog membership can change the result ordering. Offsets across invocations
+are not pages of one immutable capture.
+
+JSON reports and NDJSON progress/terminal records distinguish `page_start_after`
+(the requested offset), `skipped_matches` (preceding matches actually observed),
+`has_more_matches` (evidence of an omitted later occurrence), and
+`next_match_offset` (the continuation after retained rows, or null). Per-file
+records use file-local offsets; workspace summaries use the global offset.
+A false `has_more_matches` does not prove absence when scan coverage is partial.
+Zero-row requests never advertise a nonprogressing continuation. A terminal
+record also withholds continuation if an output limit or cancellation prevented
+a retained file record from being delivered; resuming must not skip unseen rows.
+
+Counts include deliberately skipped matches. The existing truncated-row and
+partial-result exit policy still reports these omitted earlier rows, even if
+the last requested window reaches EOF. Use the window fields separately from
+coverage and count completeness. `--count-all --limit 0` remains a bounded
+count-only scan. `--skip-matches` is unavailable on the captured-window and
+indexed-workspace CLI routes.
+
 ### Progressive NDJSON output
 
 Add **`--stream`** to a whole-file search to receive discovery progress, scan

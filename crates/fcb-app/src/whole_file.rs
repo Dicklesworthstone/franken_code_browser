@@ -66,25 +66,24 @@ fn options(args: &Arguments, bytes: u64, calls: u64, matches: usize) -> StreamRe
             Encoding::Utf16Be => Some(DetectedEncoding::Utf16Be),
         }}
 }
+#[allow(clippy::too_many_arguments)]
 fn scan<'needle>(file: File, request: CaptureRequest, needle: &'needle StreamingNeedle,
-    options: StreamReadOptions, count_all: bool, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool)
+    options: StreamReadOptions, skip_matches: u64, count_all: bool, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool)
     -> Result<FileSearchReport<'needle>, AppError> {
-    scan_with_progress(file, request, needle, options, count_all, budget, canceled, |_, _| Ok(()))
+    scan_with_progress(file, request, needle, options, skip_matches, count_all, budget, canceled, |_, _| Ok(()))
 }
 
 /// The ordinary response and explicit NDJSON driver share one scanner. The
 /// observer receives only bounded work counters; candidate expression hits
 /// cannot escape before finish establishes same-observation qualification.
+#[allow(clippy::too_many_arguments)]
 fn scan_with_progress<'needle, C: FnMut() -> bool, E: From<AppError>>(
     file: File, request: CaptureRequest, needle: &'needle StreamingNeedle,
-    options: StreamReadOptions, count_all: bool, budget: &ResourceBudget, canceled: &mut C,
+    options: StreamReadOptions, skip_matches: u64, count_all: bool, budget: &ResourceBudget, canceled: &mut C,
     mut progress: impl FnMut(StreamReadStats, &mut C) -> Result<(), E>)
     -> Result<FileSearchReport<'needle>, E> {
-    let mut scan = if count_all {
-        FileSearch::new_counting(file, request, needle, options, budget, allocation(41))
-    } else {
-        FileSearch::new(file, request, needle, options, budget, allocation(41))
-    }.map_err(AppError::from)?;
+    let mut scan = FileSearch::new_page(file, request, needle, options, skip_matches,
+        count_all, budget, allocation(41)).map_err(AppError::from)?;
     while scan.state() == StreamReadState::Pending {
         // Read/decoder failures are retained terminal report states. No retry
         // restarts at byte zero and silently double-counts a partial observation.
@@ -110,7 +109,7 @@ pub(crate) fn single(args: &Arguments, out: &mut Output, budget: &ResourceBudget
     let (file, _) = input::open_regular(&path)?;
     let request = CaptureRequest::new(file_id(), revision()).map_err(|_| AppError::InvalidRange)?;
     let report = scan(file, request, &pattern, options(args, args.max_scan_bytes, MAX_READ_CALLS, args.limit),
-        args.count_all, budget, canceled)?;
+        args.skip_matches, args.count_all, budget, canceled)?;
     if args.json {
         out.literal("{\"schema\":")?; out.quoted(SCHEMA)?;
         out.literal(",\"status\":\"ok\",\"command\":\"search\",\"scope\":\"named-file\",\"identity_scope\":\"response-local\",\"path\":")?;
@@ -147,7 +146,9 @@ fn excluded_single(args: &Arguments, path: &Path, out: &mut Output) -> Result<u8
         out.literal(",\"count_all_matches\":")?; out.boolean(args.count_all)?;
         out.literal(",\"match_count_complete\":true,\"truncated\":false,\"file_id\":null,\"revision\":null,\"query_generation\":")?;
         out.integer(generation().get())?;
-        out.literal(",\"encoding\":null,\"observed_length\":null,\"final_length\":null,\"payload_bytes_read\":\"0\",\"scanned_input_bytes\":\"0\",\"read_calls\":\"0\",\"peak_input_buffer_bytes\":\"0\",\"matches_seen\":\"0\",\"stored_hits\":\"0\",\"retained_witness_bytes\":\"0\",\"unsupported_at\":null,\"error_code\":null,\"consistency\":null,\"retention\":\"literal-witnesses-only\",\"literal_text\":null,\"literal_original_hex\":null,\"hits\":[]}\n")?;
+        out.literal(",\"encoding\":null,\"observed_length\":null,\"final_length\":null,\"payload_bytes_read\":\"0\",\"scanned_input_bytes\":\"0\",\"read_calls\":\"0\",\"peak_input_buffer_bytes\":\"0\",\"matches_seen\":\"0\",\"stored_hits\":\"0\",\"retained_witness_bytes\":\"0\",\"unsupported_at\":null,\"error_code\":null,\"consistency\":null,\"retention\":\"literal-witnesses-only\",\"literal_text\":null,\"literal_original_hex\":null,\"hits\":[]")?;
+        window_fields(args.skip_matches, 0, 0, true, out)?;
+        out.literal("}\n")?;
     } else {
         out.literal("Excluded by expression path/language filters: ")?; out.path(path)?;
         out.literal("\nSource payload bytes read: 0; matches: 0\n")?;
@@ -202,7 +203,8 @@ pub(crate) fn workspace(args: &Arguments, catalog: &WorkspaceCatalog, root: &Pat
             Ok(file) => {
                 let mut stop = || canceled() || catalog.validate_active().is_err();
                 scan(file, request, &pattern, options(args, args.max_scan_bytes.saturating_sub(bytes),
-                    MAX_READ_CALLS.saturating_sub(calls), args.limit.saturating_sub(stored)), args.count_all, budget, &mut stop)
+                    MAX_READ_CALLS.saturating_sub(calls), args.limit.saturating_sub(stored)),
+                    args.skip_matches.saturating_sub(seen), args.count_all, budget, &mut stop)
             }
             Err(error) => Err(error),
         };
@@ -257,6 +259,7 @@ pub(crate) fn workspace(args: &Arguments, catalog: &WorkspaceCatalog, root: &Pat
         out.literal(",\"matches_seen\":")?; out.integer(seen)?;
         out.literal(",\"stored_hits\":")?; out.integer(stored as u64)?;
         out.literal(",\"matching_files\":")?; out.integer(matching_files as u64)?;
+        window_fields(args.skip_matches, seen, stored, true, out)?;
         out.literal(",\"stop_reason\":")?;
         if let Some(reason) = stopped { out.quoted(reason)?; } else { out.literal("null")?; }
         out.literal("}\n")?;
@@ -266,6 +269,7 @@ pub(crate) fn workspace(args: &Arguments, catalog: &WorkspaceCatalog, root: &Pat
         out.literal("; source bytes read: ")?; out.literal(&bytes.to_string())?;
         out.literal(if complete { "; total matches: " } else { "; matches seen: " })?;
         out.literal(&seen.to_string())?;
+        out.literal("; skipped preceding matches: ")?; out.literal(&args.skip_matches.min(seen).to_string())?;
         out.literal("; retained hits: ")?; out.literal(&stored.to_string())?;
         if truncated { out.literal(" (additional matches omitted)")?; }
         out.literal("\n")?;
@@ -300,6 +304,24 @@ fn matching_fields(mode: StreamingMode, is_expression: bool, out: &mut Output) -
     }
     Ok(())
 }
+/// Offsets count observed matches in this result's scope, not source bytes.
+/// A continuation is offered only after retaining at least one row: count-only
+/// and existence-probe requests cannot advance by a zero-size result window.
+/// A stream summary also withholds continuation if a retained file record was
+/// not delivered, so resuming cannot silently skip unseen rows.
+fn window_fields(skip_matches: u64, seen: u64, stored: usize, allow_continuation: bool,
+    out: &mut Output) -> Result<(), AppError> {
+    let skipped = skip_matches.min(seen);
+    let more = seen.saturating_sub(skipped) > stored as u64;
+    out.literal(",\"page_start_after\":")?; out.integer(skip_matches)?;
+    out.literal(",\"skipped_matches\":")?; out.integer(skipped)?;
+    out.literal(",\"has_more_matches\":")?; out.boolean(more)?;
+    out.literal(",\"next_match_offset\":")?;
+    if more && stored != 0 && allow_continuation { out.integer(skipped + stored as u64)?; }
+    else { out.literal("null")?; }
+    Ok(())
+}
+
 fn fields(report: &FileSearchReport<'_>, out: &mut Output, canceled: &mut impl FnMut() -> bool) -> Result<(), AppError> {
     let search = report.search();
     out.literal(",\"file_id\":")?; out.integer(search.request().file().get())?;
@@ -330,6 +352,7 @@ fn fields(report: &FileSearchReport<'_>, out: &mut Output, canceled: &mut impl F
     out.literal(",\"peak_input_buffer_bytes\":")?; out.integer(search.stats().peak_buffer_bytes as u64)?;
     out.literal(",\"matches_seen\":")?; out.integer(search.matches_seen())?;
     out.literal(",\"stored_hits\":")?; out.integer(search.hits().len() as u64)?;
+    window_fields(search.page_start_after(), search.matches_seen(), search.hits().len(), true, out)?;
     out.literal(",\"retained_witness_bytes\":")?; out.integer(search.retained_witness_bytes() as u64)?;
     out.literal(",\"unsupported_at\":")?;
     if let Some(offset) = search.unsupported_at() { out.integer(offset.get())?; } else { out.literal("null")?; }
@@ -387,6 +410,7 @@ fn human(report: &FileSearchReport<'_>, out: &mut Output) -> Result<(), AppError
     out.literal(search.state().code())?;
     out.literal(if report.is_complete() { "; total matches " } else { "; matches seen " })?;
     out.literal(&search.matches_seen().to_string())?;
+    out.literal("; skipped preceding matches ")?; out.literal(&search.skipped_matches().to_string())?;
     out.literal("; retained hits ")?; out.literal(&search.hits().len().to_string())?;
     if search.hits_truncated() { out.literal(" (additional matches omitted)")?; }
     out.literal("; bytes read ")?; out.literal(&search.stats().bytes_read.to_string())?; out.literal("\n")?;

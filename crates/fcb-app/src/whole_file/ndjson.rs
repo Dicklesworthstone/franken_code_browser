@@ -102,6 +102,7 @@ struct Summary {
     scanned: u64,
     calls: u64,
     seen: u64,
+    skip_matches: u64,
     stored: usize,
     matching_files: u64,
     delivered_files: u64,
@@ -135,6 +136,8 @@ impl Summary {
             ("delivered_hits", self.delivered_hits)] {
             out.literal(",")?; out.quoted(name)?; out.literal(":")?; out.integer(value)?;
         }
+        super::window_fields(self.skip_matches, self.seen, self.stored,
+            self.delivered_hits == self.stored as u64, out)?;
         out.literal(",\"truncated\":")?; out.boolean(self.truncated)?;
         Ok(())
     }
@@ -228,6 +231,7 @@ fn terminal<W: Write, C: FnMut() -> bool>(sink: &mut Sink<'_, W>, summary: &Summ
 
 fn search<W: Write, C: FnMut() -> bool>(args: &Arguments, budget: &ResourceBudget,
     sink: &mut Sink<'_, W>, summary: &mut Summary, canceled: &mut C) -> Result<(), Failure> {
+    summary.skip_matches = args.skip_matches;
     if canceled() { return Err(AppError::Canceled.into()); }
     let pattern = super::needle(args, budget)?;
     let _paths = budget.try_reserve_managed(owner(), allocation(42), ByteLength::new(128 * 1024))
@@ -251,7 +255,7 @@ fn search<W: Write, C: FnMut() -> bool>(args: &Arguments, budget: &ResourceBudge
             _ => return Err(AppError::InvalidRange),
         }
         out.literal("},\"count_all_matches\":")?; out.boolean(args.count_all)?;
-        for (name, value) in [("max_scan_bytes", args.max_scan_bytes), ("max_read_calls", super::MAX_READ_CALLS),
+        for (name, value) in [("page_start_after", args.skip_matches), ("max_scan_bytes", args.max_scan_bytes), ("max_read_calls", super::MAX_READ_CALLS),
             ("max_retained_hits", args.limit as u64), ("max_record_bytes", MAX_RESPONSE_BYTES as u64),
             ("max_stream_output_bytes", MAX_STREAM_OUTPUT_BYTES), ("max_write_calls_per_record", MAX_WRITE_CALLS as u64)] {
             out.literal(",")?; out.quoted(name)?; out.literal(":")?; out.integer(value)?;
@@ -346,9 +350,10 @@ fn observe<W: Write, C: FnMut() -> bool>(args: &Arguments, opened: Result<File, 
     let baseline = (summary.bytes, summary.calls, summary.scanned);
     let options = super::options(args, args.max_scan_bytes.saturating_sub(summary.bytes),
         super::MAX_READ_CALLS.saturating_sub(summary.calls), args.limit.saturating_sub(summary.stored));
+    let skip_matches = args.skip_matches.saturating_sub(summary.seen);
     let mut steps = 0u64;
     let result = match opened {
-        Ok(file) => super::scan_with_progress(file, request, pattern, options, args.count_all, budget, canceled,
+        Ok(file) => super::scan_with_progress(file, request, pattern, options, skip_matches, args.count_all, budget, canceled,
             |stats, canceled| {
                 // Work is charged even when delivery fails on this very step.
                 summary.work(baseline, stats);

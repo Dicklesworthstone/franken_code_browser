@@ -53,6 +53,8 @@ Continuous whole-file search, without retaining full source:\n\
   means interrupted output. Cancellation between records emits a canceled terminal;\n\
   a failed/partial write or flush stops scanning without appending recovery JSON.\n\
   Foreign writers may block inside one write/flush; no wall-clock timeout is claimed.\n\
+  --skip-matches N skips preceding occurrences before --limit retained rows.\n\
+  Skipping rescans from byte zero within the same I/O budget; each run is a new observation.\n\
   --count-all continues counting after --limit retained rows, within I/O limits.\n\
   Use --count-all --limit 0 for counts without retaining occurrence rows.\n\
   --raw-hex HEX also works; --max-scan-bytes N admits source I/O separately.\n\
@@ -143,7 +145,7 @@ pub(crate) fn capabilities(args: &Arguments, out: &mut Output) -> Result<u8, App
             out.literal(",\"reason\":")?; out.quoted(reason)?; out.literal("}")?;
         }
         out.literal("],\"whole_file_search\":{\"state\":")?; out.quoted(file_state)?;
-        out.literal(",\"stream_flag\":\"--stream\",\"stream_schema\":\"fcb.search-stream/1\",\"stream_identity_scope\":\"invocation-local\",\"stream_max_record_bytes\":\"8388608\",\"stream_max_output_bytes\":\"268435456\",\"stream_terminal_required\":true,\"ordinary_json_single_document\":true,\"flag\":\"--whole-file\",\"count_all_flag\":\"--count-all\",\"ignore_case_flag\":\"--ignore-case\",\"identifier_flag\":\"--identifier\",\"expression_flag\":\"--query\",\"expression_predicate_scope\":\"same-observed-stream\",\"expression_requires_complete_input\":true,\"expression_counts_full_observation\":true,\"identifier_semantics\":\"whole-token-text-candidate\",\"identifier_case_sensitive\":true,\"case_insensitive_semantics\":\"unicode-lowercase\",\"normalization\":\"exact\",\"input_buffer_bytes\":\"16384\",\"default_max_scan_bytes\":\"268435456\",\"maximum_max_scan_bytes\":\"1099511627776\",\"retention\":\"literal-witnesses-only\"}}\n")?;
+        out.literal(",\"stream_flag\":\"--stream\",\"stream_schema\":\"fcb.search-stream/1\",\"stream_identity_scope\":\"invocation-local\",\"stream_max_record_bytes\":\"8388608\",\"stream_max_output_bytes\":\"268435456\",\"stream_terminal_required\":true,\"ordinary_json_single_document\":true,\"flag\":\"--whole-file\",\"count_all_flag\":\"--count-all\",\"match_offset_flag\":\"--skip-matches\",\"match_offset_scope\":\"observed-matches-in-catalog-order\",\"result_window_reopens_source\":true,\"ignore_case_flag\":\"--ignore-case\",\"identifier_flag\":\"--identifier\",\"expression_flag\":\"--query\",\"expression_predicate_scope\":\"same-observed-stream\",\"expression_requires_complete_input\":true,\"expression_counts_full_observation\":true,\"identifier_semantics\":\"whole-token-text-candidate\",\"identifier_case_sensitive\":true,\"case_insensitive_semantics\":\"unicode-lowercase\",\"normalization\":\"exact\",\"input_buffer_bytes\":\"16384\",\"default_max_scan_bytes\":\"268435456\",\"maximum_max_scan_bytes\":\"1099511627776\",\"retention\":\"literal-witnesses-only\"}}\n")?;
     } else {
         out.literal("FrankenCodeBrowser: headless source tools; independent verification pending.\n")?;
         if diagnostic { out.literal("Static diagnostic only: no source scans, benchmarks, database opens, or repairs.\n")?; }

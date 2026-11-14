@@ -31,6 +31,8 @@ pub struct Arguments {
     pub whole_file: bool, pub max_scan_bytes: u64, pub ignore_case: bool,
     /// Continue the admitted literal/expression scan after retained rows fill.
     pub count_all: bool,
+    /// Skip observed matches before retaining a bounded whole-file result window.
+    pub skip_matches: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArgumentError { Limit, UnknownCommand, UnknownOption, DuplicateOption, MissingValue,
@@ -64,7 +66,7 @@ fn output_flag_requested(args: &[OsString], flag: &str) -> bool {
         if argument == "--" { break; }
         if argument == flag { return true; }
         if matches!(argument.to_str(), Some("--offset" | "--bytes" | "--limit" | "--encoding" | "--text" | "--raw-hex"
-            | "--query" | "--identifier" | "--path" | "--max-files" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes")) { cursor += 1; }
+            | "--query" | "--identifier" | "--skip-matches" | "--path" | "--max-files" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes")) { cursor += 1; }
     }
     false
 }
@@ -82,7 +84,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         stdin: false, stream: false, offset: 0, bytes: 64 * 1024, limit: 100, encoding: Encoding::Auto, needle: None,
         workspace: false, include_excluded: false, respect_ignores: false, max_files: 4096,
         max_file_bytes: 1024 * 1024, max_total_bytes: 32 * 1024 * 1024,
-        whole_file: false, max_scan_bytes: 256 * 1024 * 1024, ignore_case: false, count_all: false };
+        whole_file: false, max_scan_bytes: 256 * 1024 * 1024, ignore_case: false, count_all: false, skip_matches: 0 };
     if args.is_empty() { return Ok(parsed); }
     let mut start = 1;
     parsed.command = match args[0].to_str() {
@@ -112,7 +114,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
                 "--max-file-bytes" => 2048, "--max-total-bytes" => 4096, "--path" => 8192,
                 "--whole-file" => 16384, "--max-scan-bytes" => 32768, "--respect-ignores" => 65536,
                 "--query" => 131072, "--ignore-case" => 262144, "--count-all" => 524288,
-                "--identifier" => 1048576, "--stream" => 2097152,
+                "--identifier" => 1048576, "--stream" => 2097152, "--skip-matches" => 4194304,
                 _ => return Err(ArgumentError::UnknownOption),
             };
             if seen & bit != 0 { return Err(ArgumentError::DuplicateOption); }
@@ -130,6 +132,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
             let value = value.to_str().ok_or(ArgumentError::MissingValue)?;
             match option {
                 "--offset" => parsed.offset = decimal(value)?,
+                "--skip-matches" => parsed.skip_matches = decimal(value)?,
                 "--bytes" => {
                     let value = decimal(value)?;
                     if !(4..=MAX_WINDOW_BYTES as u64).contains(&value) { return Err(ArgumentError::Limit); }
@@ -187,6 +190,9 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
     }
     if parsed.stdin && parsed.file.is_some() { return Err(ArgumentError::MultipleSources); }
     if parsed.stream && (parsed.json || parsed.command != Command::Search || !parsed.whole_file) {
+        return Err(ArgumentError::IncompatibleOptions);
+    }
+    if seen & 4194304 != 0 && (parsed.command != Command::Search || !parsed.whole_file) {
         return Err(ArgumentError::IncompatibleOptions);
     }
     // A window boundary is not a token boundary. Whole identifiers use the
@@ -386,6 +392,39 @@ mod tests {
         }
         assert!(!json_requested(&args(&["search", "root", "--workspace", "--path", "--json"])));
     }
+    #[test]
+    fn match_offsets_are_explicit_whole_file_options_and_preserve_u64_precision() {
+        for (option, needle) in [("--text", "needle"), ("--raw-hex", "ff"),
+            ("--identifier", "needle"), ("--query", "needle required -forbidden")] {
+            for scope in [false, true] {
+                let mut input = vec!["search", "source", "--whole-file", option, needle,
+                    "--skip-matches", "9007199254740993", "--limit", "2"];
+                if scope { input.push("--workspace"); }
+                let parsed = parse(&args(&input)).unwrap();
+                assert_eq!(parsed.skip_matches, 9_007_199_254_740_993);
+                assert_eq!(parsed.limit, 2);
+            }
+        }
+        let maximum = parse(&args(&["search", "source", "--whole-file", "--text", "x",
+            "--skip-matches", "18446744073709551615", "--stream"])).unwrap();
+        assert_eq!(maximum.skip_matches, u64::MAX);
+        for input in [vec!["search", "source", "--text", "x", "--skip-matches", "0"],
+            vec!["search", "root", "--workspace", "--text", "x", "--skip-matches", "1"],
+            vec!["inspect", "source", "--skip-matches", "0"],
+            vec!["search", "source", "--whole-file", "--text", "x", "--skip-matches", "1", "--skip-matches", "2"],
+            vec!["search", "source", "--whole-file", "--text", "x", "--skip-matches", "-1"],
+            vec!["search", "source", "--whole-file", "--text", "x", "--skip-matches", "18446744073709551616"]] {
+            assert!(parse(&args(&input)).is_err(), "{input:?}");
+        }
+        let value = args(&["search", "source", "--whole-file", "--text", "x", "--skip-matches", "--stream"]);
+        assert!(!stream_requested(&value));
+        let value = args(&["search", "source", "--whole-file", "--text", "x", "--skip-matches", "--json"]);
+        assert!(!json_requested(&value));
+        let literal = parse(&args(&["search", "source", "--whole-file", "--text", "--skip-matches"])).unwrap();
+        assert_eq!(literal.needle, Some(Needle::Text("--skip-matches".into())));
+        assert_eq!(literal.skip_matches, 0);
+    }
+
     #[test]
     fn whole_file_search_has_explicit_nonconflicting_io_admission() {
         let options = parse(&args(&["search", "file", "--whole-file", "--text", "needle", "--max-scan-bytes", "4294967297"])).unwrap();

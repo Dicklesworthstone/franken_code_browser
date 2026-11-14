@@ -382,19 +382,25 @@ fn interrupted_output_retries_are_bounded_before_source_admission() {
 fn an_oversized_file_record_preserves_progress_and_actual_work_in_a_partial_terminal() {
     let temp = Temp::new();
     let needle = "a".repeat(1024);
-    let content = format!("{} ", "A".repeat(1024)).repeat(4096);
+    let content = format!("{} ", "A".repeat(1024)).repeat(4098);
     let path = temp.file("large-witnesses.rs", content.as_bytes());
     let (exit, records) = invoke(&path,
-        &["--text", &needle, "--ignore-case", "--count-all", "--limit", "4096"]);
+        &["--text", &needle, "--ignore-case", "--count-all", "--skip-matches", "1", "--limit", "4096"]);
     assert_eq!(exit, EXIT_PARTIAL);
     assert!(files(&records).is_empty());
     let terminal = records.last().unwrap();
     assert_eq!(terminal.get("stop_reason").text(), "output-limit");
     assert_eq!(terminal.get("error").get("code").text(), "CLI_OUTPUT_LIMIT");
     assert_eq!(terminal.get("payload_bytes_read").number(), content.len() as u64);
-    assert_eq!(terminal.get("matches_seen").number(), 4096);
+    assert_eq!(terminal.get("matches_seen").number(), 4098);
     assert_eq!(terminal.get("stored_hits").number(), 4096);
     assert_eq!(terminal.get("delivered_hits").number(), 0);
+    assert_eq!(terminal.get("page_start_after").number(), 1);
+    assert_eq!(terminal.get("skipped_matches").number(), 1);
+    assert!(terminal.get("has_more_matches").flag());
+    // The staged file contained a full window plus evidence of another match,
+    // but no row was delivered. A continuation past those rows would lose data.
+    assert_eq!(terminal.get("next_match_offset"), &Json::Null);
     assert!(!terminal.get("results_complete").flag());
     assert!(!terminal.get("match_count_complete").flag());
 }
