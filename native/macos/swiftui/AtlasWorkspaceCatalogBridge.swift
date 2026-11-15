@@ -1,13 +1,13 @@
 import Foundation
 
 @_silgen_name("fcb_catalog_stream_create") private func catalogStreamCreate() -> UInt64
-@_silgen_name("fcb_catalog_stream_open") private func catalogStreamOpen(
+@_silgen_name("fcb_catalog_stream_open_with_policy") private func catalogStreamOpenWithPolicy(
     _ owner: UInt64, _ root: UnsafePointer<CChar>?, _ generation: UInt64,
     _ query: UnsafePointer<UInt8>?, _ queryBytes: UInt64, _ mode: UInt64,
     _ caseSensitive: UInt64, _ countAll: UInt64, _ startAfter: UInt64,
     _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
     _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ maximumMatches: UInt64,
-    _ maximumBytes: UInt64, _ maximumCalls: UInt64) -> UnsafeMutablePointer<CChar>?
+    _ maximumBytes: UInt64, _ maximumCalls: UInt64, _ policy: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_catalog_stream_advance") private func catalogStreamAdvance(
     _ owner: UInt64, _ generation: UInt64, _ revision: UInt64, _ steps: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_catalog_stream_page") private func catalogStreamPage(
@@ -36,7 +36,7 @@ extension AtlasWorkspaceStreamTransport {
             try catalogStreamSearch(owner: owner, root: root, generation: generation,
                 request: request, flag: flag, stop: stop, progress: progress)
         }, page: { try catalogStreamTake(catalogStreamPage($0, $1, $2, $3, $4)) },
-            hit: { try catalogStreamTake(catalogStreamHit($0, $1, $2, $3)) }))
+            hit: { try catalogStreamTake(catalogStreamHit($0, $1, $2, $3)) }), supportsDiscoveryPolicy: true)
 }
 
 /// Scheduling and bounded receipt copying only. Traversal, matching, scope
@@ -52,10 +52,11 @@ private func catalogStreamSearch(owner: UInt64, root: String, generation: UInt64
         try bytes.withUnsafeBufferPointer { query in
             try request.fileScope.withCStrings { extensions, filenames in
                 try request.pathScope.withCString { kind, path in
-                    try catalogStreamTake(catalogStreamOpen(owner, root, generation,
+                    try catalogStreamTake(catalogStreamOpenWithPolicy(owner, root, generation,
                         query.baseAddress, UInt64(query.count), mode, request.caseSensitive ? 1 : 0,
                         request.countAllMatches ? 1 : 0, request.pageStartAfter, extensions, filenames,
-                        kind, path, request.maximumMatches, request.maximumScanBytes, request.maximumReadCalls))
+                        kind, path, request.maximumMatches, request.maximumScanBytes, request.maximumReadCalls,
+                        request.discoveryPolicy.rawValue))
                 }
             }
         }
@@ -65,6 +66,7 @@ private func catalogStreamSearch(owner: UInt64, root: String, generation: UInt64
         guard !flag.isCanceled else { throw AtlasWorkspaceStreamError.canceled }
         let wire = try AtlasWorkspaceStreamWire.read(response, owner: owner)
         try wire.header(schema: "fcb.catalog-stream/1", command: command, owner: owner)
+        try wire.discoveryPolicy(request: request, progressive: true)
         let revision = try wire.number("revision"), more = try wire.flag("more")
         guard revision > priorRevision, try wire.number("progress_sequence") == revision,
               try wire.number("query_generation") == generation else {

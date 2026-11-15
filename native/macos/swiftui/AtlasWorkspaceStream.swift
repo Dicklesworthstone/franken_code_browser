@@ -66,19 +66,22 @@ struct AtlasWorkspaceStreamRequest: Equatable, Sendable {
     let countAllMatches: Bool
     let caseSensitive: Bool
     let mode: AtlasWorkspaceStreamMode
+    let discoveryPolicy: AtlasDiscoveryPolicy
     init(needle: String, maximumScanBytes: UInt64 = AtlasWorkspaceStreamLimits.scanBytes,
          maximumMatches: UInt64 = AtlasWorkspaceStreamLimits.hits,
          maximumReadCalls: UInt64 = AtlasWorkspaceStreamLimits.readCalls,
          fileScope: AtlasSearchFileScope = .all,
          pathScope: AtlasSearchPathScope = .workspace,
          countAllMatches: Bool = false, caseSensitive: Bool = true,
-         mode: AtlasWorkspaceStreamMode = .text, pageStartAfter: UInt64 = 0) throws {
+         mode: AtlasWorkspaceStreamMode = .text, pageStartAfter: UInt64 = 0,
+         discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules) throws {
         let end = pageStartAfter.addingReportingOverflow(maximumMatches)
         guard !end.overflow, end.partialValue < UInt64.max, !needle.isEmpty, needle.utf8.count <= AtlasWorkspaceStreamLimits.needleBytes,
               !needle.utf8.contains(0), (1...AtlasWorkspaceStreamLimits.hits).contains(maximumMatches),
               (1...AtlasWorkspaceStreamLimits.maximumScanBytes).contains(maximumScanBytes),
               (1...AtlasWorkspaceStreamLimits.readCalls).contains(maximumReadCalls),
-              mode != .occurrences || caseSensitive else {
+              mode != .occurrences || caseSensitive,
+              discoveryPolicy == .repositoryRules || !pathScope.isVisible else {
             throw AtlasWorkspaceStreamError.invalidInput
         }
         self.needle = needle; self.maximumScanBytes = maximumScanBytes
@@ -86,6 +89,7 @@ struct AtlasWorkspaceStreamRequest: Equatable, Sendable {
         self.fileScope = fileScope; self.pathScope = pathScope
         self.countAllMatches = mode == .expression || countAllMatches
         self.caseSensitive = caseSensitive; self.mode = mode; self.pageStartAfter = pageStartAfter
+        self.discoveryPolicy = discoveryPolicy
     }
     static func == (a: Self, b: Self) -> Bool {
         a.needle.utf8.elementsEqual(b.needle.utf8) && a.maximumMatches == b.maximumMatches
@@ -93,6 +97,7 @@ struct AtlasWorkspaceStreamRequest: Equatable, Sendable {
             && a.fileScope == b.fileScope && a.pathScope == b.pathScope
             && a.countAllMatches == b.countAllMatches
             && a.caseSensitive == b.caseSensitive && a.mode == b.mode && a.pageStartAfter == b.pageStartAfter
+            && a.discoveryPolicy == b.discoveryPolicy
     }
 }
 
@@ -127,6 +132,7 @@ struct AtlasWorkspaceStreamTransport: Sendable {
         let hit: @Sendable (UInt64, UInt64, UInt64, UInt64) throws -> String?
     }
     let catalogSearch: CatalogSearch?
+    let supportsDiscoveryPolicy: Bool
 
     init(create: @escaping @Sendable () -> UInt64,
          open: @escaping @Sendable (UInt64, String, AtlasSearchCancellation) throws -> String?,
@@ -137,11 +143,13 @@ struct AtlasWorkspaceStreamTransport: Sendable {
          cancel: @escaping @Sendable (UInt64) -> Bool,
          close: @escaping @Sendable (UInt64) -> Bool,
          retirementFailed: @escaping @Sendable () -> Void,
-         progressiveSearch: ProgressiveSearch? = nil, catalogSearch: CatalogSearch? = nil) {
+         progressiveSearch: ProgressiveSearch? = nil, catalogSearch: CatalogSearch? = nil,
+         supportsDiscoveryPolicy: Bool = false) {
         self.create = create; self.open = open; self.search = search; self.page = page
         self.hit = hit; self.clear = clear; self.cancel = cancel; self.close = close
         self.retirementFailed = retirementFailed; self.progressiveSearch = progressiveSearch
         self.catalogSearch = catalogSearch
+        self.supportsDiscoveryPolicy = supportsDiscoveryPolicy
     }
 }
 
@@ -289,6 +297,7 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
         let unavailable = try w.number("unavailable_files"), matching = try w.number("matching_files")
         let unsupported = try w.number("unsupported_files"), failed = try w.number("failed_files")
         let policy = try w.text("discovery_policy"), excluded = try w.number("excluded_entries")
+        try w.discoveryPolicy(request: request, progressive: catalog.progressive)
         let retained = try w.number("retained_hits"), seen = try w.number("matches_seen")
         let payload = try w.number("payload_bytes_read"), scanned = try w.number("scanned_input_bytes")
         let calls = try w.number("read_calls"), interrupted = try w.number("interrupted_read_calls")
@@ -641,6 +650,7 @@ struct AtlasWorkspaceStreamWitness: Sendable {
                 catalogued: report.summary.cataloguedFiles, complete: report.summary.complete,
                 progressive: target.identity.progressive)
             try w.matchOffset(request: report.summary.request)
+            try w.discoveryPolicy(request: report.summary.request, progressive: target.identity.progressive)
             let counting = try w.countCoverage(request: report.summary.request,
                 complete: report.summary.complete, matchingFiles: report.summary.matchingFiles)
             let primary = try w.text("needle")
@@ -721,6 +731,23 @@ struct AtlasWorkspaceStreamWire: Decodable {
         return try fields.decodeIfPresent(String.self, forKey: Key(key))
     }
     func optionalNumber(_ key: String) throws -> UInt64? { try optionalText(key).map(Self.number) }
+    /// Policy is immutable query identity. In particular, an opt-in request
+    /// cannot accept a narrower default scan that would silently miss files.
+    func discoveryPolicy(request: AtlasWorkspaceStreamRequest, progressive: Bool) throws {
+        if progressive {
+            guard request.discoveryPolicy.admits(try text("discovery_policy")) else {
+                throw AtlasWorkspaceStreamError.invalidResponse
+            }
+            if request.discoveryPolicy.includesExcluded {
+                guard try flag("rule_files_enabled") == false,
+                      fields.contains(Key("rule_policy")), try fields.decodeNil(forKey: Key("rule_policy")) else {
+                    throw AtlasWorkspaceStreamError.invalidResponse
+                }
+            }
+        } else if request.discoveryPolicy != .repositoryRules {
+            throw AtlasWorkspaceStreamError.invalidResponse
+        }
+    }
     /// Match-window metadata must be complete and exact. Legacy receipts are
     /// accepted only for the initial window, never as later-scan evidence.
     func matchOffset(request: AtlasWorkspaceStreamRequest) throws {

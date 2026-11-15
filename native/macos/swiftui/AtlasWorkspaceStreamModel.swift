@@ -252,6 +252,9 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
     var mode: AtlasWorkspaceStreamMode = .text {
         didSet { if oldValue != mode { revokeQuery() } }
     }
+    var discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules {
+        didSet { if oldValue != discoveryPolicy { revokeQuery(keepingEvidence: true) } }
+    }
     @ObservationIgnored private let transport: AtlasWorkspaceStreamTransport
     @ObservationIgnored private let io = AtlasProjectIO()
     @ObservationIgnored private var authority: AtlasWorkspaceStreamSource?
@@ -274,16 +277,22 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
     static func retryRetirements() { AtlasWorkspaceStreamRetirement.shared.retry() }
 
     var effectiveCountAllMatches: Bool { mode == .expression || countAllMatches }
+    var supportsDiscoveryPolicy: Bool {
+        transport.supportsDiscoveryPolicy && transport.catalogSearch != nil && authority?.pathScope.isVisible == false
+    }
     var canSearch: Bool {
         !closed && !opening && session != nil && catalog != nil && lastGeneration < UInt64.max
             && (try? currentRequest()) != nil
     }
     private func currentRequest(startAfter: UInt64 = 0) throws -> AtlasWorkspaceStreamRequest {
         guard let authority else { throw AtlasWorkspaceStreamError.unavailable }
+        guard discoveryPolicy == .repositoryRules || supportsDiscoveryPolicy else {
+            throw AtlasWorkspaceStreamError.unavailable
+        }
         return try .init(needle: queryText, maximumScanBytes: scanBytes,
             fileScope: authority.fileScope, pathScope: authority.pathScope,
             countAllMatches: effectiveCountAllMatches, caseSensitive: mode == .occurrences || caseSensitive,
-            mode: mode, pageStartAfter: startAfter)
+            mode: mode, pageStartAfter: startAfter, discoveryPolicy: discoveryPolicy)
     }
     var canRefresh: Bool { !closed && authority != nil }
     var canStopAndKeep: Bool { !closed && busy && searching && !stopping && stopFlag != nil }
@@ -540,9 +549,9 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
         cancelWork(); revokeTargets(clearEvidence: true)
         closed = true; authority = nil; session = nil; pendingSession = nil; catalog = nil; lastGeneration = 0
     }
-    private func revokeQuery() {
+    private func revokeQuery(keepingEvidence: Bool = false) {
         if !opening { cancelWork() }
-        revokeTargets(clearEvidence: true)
+        revokeTargets(clearEvidence: !keepingEvidence)
     }
     private func revokeTargets(clearEvidence: Bool) {
         closeContext(); reportAuthorized = false

@@ -223,6 +223,10 @@ private enum CatalogStreamFixture {
             primaryNeedle: request.mode == .expression ? "old" : nil)
         for key in ["source_manifest", "layout_revision", "last_attempt"] { value.removeValue(forKey: key) }
         value["schema"] = "fcb.catalog-stream/1"
+        value["discovery_policy"] = request.discoveryPolicy.wireName
+        if request.discoveryPolicy.includesExcluded {
+            value["rule_files_enabled"] = false; value["rule_policy"] = NSNull()
+        }
         value["scope"] = "progressively-discovered-whole-files"
         value["membership"] = "progressive-observation"; value["ordering"] = "provisional-discovery-order"
         value["revision"] = String(revision); value["progress_sequence"] = String(revision)
@@ -308,7 +312,7 @@ private final class StreamProbe: @unchecked Sendable {
             }, hit: { owner, generation, revision, index in
                 precondition(revision == 3)
                 return try self.hit(owner, generation, index)
-            }))
+            }), supportsDiscoveryPolicy: true)
     }
     func blockProgress(_ gate: ObservedReaderGate) { locked { progressGate = gate } }
     func poisonProgress() { locked { badProgress = true } }
@@ -493,7 +497,9 @@ private final class StreamContextProbe: @unchecked Sendable {
         try expressionWindowWireTests()
         try progressWireTests()
         try catalogWireTests()
+        try discoveryPolicyWireTests()
         try await catalogModelTests()
+        try await discoveryPolicyModelTests()
         try await countedModelTests()
         try await lowercaseModelTests()
         try await occurrenceModelTests()
@@ -665,6 +671,101 @@ private final class StreamContextProbe: @unchecked Sendable {
         precondition(!model.reportAuthorized && model.notice.contains("could not be verified"))
         model.clear(); precondition(model.report == nil && model.witness == nil && model.canSearch)
         model.close(); try await wait("progressive query owners retired") { probe.closedCount == probe.createCount }
+    }
+    private static func discoveryPolicyWireTests() throws {
+        let owner: UInt64 = 0xfedcba9876543210
+        let catalog = try AtlasWorkspaceStreamCatalog.ready(owner: owner, root: StreamFixture.root)
+        let ordinary = try AtlasWorkspaceStreamRequest(needle: "old")
+        let included = try AtlasWorkspaceStreamRequest(needle: "old", discoveryPolicy: .includeExcluded)
+        precondition(ordinary != included)
+        #if canImport(CryptoKit)
+        let visible = try AtlasSearchPathScope(visiblePaths: [Array("src/main.rs".utf8)])
+        rejects("broadened frozen visible membership") {
+            _ = try AtlasWorkspaceStreamRequest(needle: "old", pathScope: visible, discoveryPolicy: .includeExcluded)
+        }
+        #endif
+        let value = CatalogStreamFixture.report(owner, 7, included, count: 2)
+        let page = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(CatalogStreamFixture.page(value)),
+            catalog: catalog, root: catalog.root, request: included, requireTerminal: true)
+        let report = try AtlasWorkspaceStreamReport(summary: page.summary, hits: page.hits)
+        let target = report.target(for: report.hits[0])
+        let witness = StreamFixture.witness(value, index: 0)
+        _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(witness), report: report,
+            root: catalog.root, target: target)
+        for fault in ["narrower-policy", "legacy-policy", "unknown-policy", "missing-disabled", "enabled", "rule-evidence"] {
+            var bad = value, badWitness = witness
+            switch fault {
+            case "narrower-policy":
+                bad["discovery_policy"] = ordinary.discoveryPolicy.wireName
+                badWitness["discovery_policy"] = ordinary.discoveryPolicy.wireName
+            case "legacy-policy":
+                bad["discovery_policy"] = "product-defaults/no-rule-files-v1"
+                badWitness["discovery_policy"] = "product-defaults/no-rule-files-v1"
+            case "unknown-policy":
+                bad["discovery_policy"] = "future-policy"; badWitness["discovery_policy"] = "future-policy"
+            case "missing-disabled":
+                bad.removeValue(forKey: "rule_files_enabled"); badWitness.removeValue(forKey: "rule_files_enabled")
+            case "enabled":
+                bad["rule_files_enabled"] = true; badWitness["rule_files_enabled"] = true
+            default:
+                bad["rule_policy"] = [:] as [String: Any]; badWitness["rule_policy"] = [:] as [String: Any]
+            }
+            rejects("included search receipt " + fault) {
+                _ = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(CatalogStreamFixture.page(bad)),
+                    catalog: catalog, root: catalog.root, request: included, requireTerminal: true)
+            }
+            rejects("included retained witness " + fault) {
+                _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(badWitness), report: report,
+                    root: catalog.root, target: target)
+            }
+        }
+        rejects("unrequested broad search receipt") {
+            _ = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(CatalogStreamFixture.page(value)),
+                catalog: catalog, root: catalog.root, request: ordinary, requireTerminal: true)
+        }
+        var pending = CatalogStreamFixture.report(owner, 7, included, revision: 1,
+            discovered: 20_001, pending: 1, terminal: false)
+        pending["discovery_policy"] = ordinary.discoveryPolicy.wireName
+        rejects("narrower progressive search receipt") {
+            _ = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(CatalogStreamFixture.progress(pending)),
+                catalog: catalog, request: included)
+        }
+    }
+    @MainActor private static func discoveryPolicyModelTests() async throws {
+        let probe = StreamProbe(), model = AtlasWorkspaceStreamModel(transport: probe.catalogTransport, query: "old")
+        model.open(.init(root: StreamFixture.root, project: UUID(), browserOwner: 1, access: nil))
+        precondition(model.supportsDiscoveryPolicy && model.discoveryPolicy == .repositoryRules)
+        model.search()
+        try await wait("default-policy search") { !model.busy && model.reportAuthorized }
+        let previous = model.report!, target = previous.target(for: previous.hits[0])
+        model.select(target)
+        try await wait("default-policy retained witness") { !model.busy && model.witness != nil }
+        let originalHex = model.witness!.originalHex
+        model.discoveryPolicy = .includeExcluded
+        precondition(model.report?.summary.identity == previous.summary.identity
+            && model.witness?.originalHex == originalHex && !model.reportAuthorized
+            && !model.canSelect && !model.canReadCurrentContext && model.canSearch)
+        let hits = probe.hitCount
+        model.select(target); precondition(probe.hitCount == hits)
+        model.search()
+        try await wait("included-policy search") { !model.busy && model.reportAuthorized }
+        precondition(model.report?.summary.request.discoveryPolicy == .includeExcluded
+            && model.report?.summary.identity.owner != previous.summary.identity.owner)
+        model.refreshCatalog()
+        precondition(model.discoveryPolicy == .includeExcluded && model.canSearch && model.report == nil)
+        model.search()
+        try await wait("included policy survives reset") { !model.busy && model.reportAuthorized }
+        precondition(model.report?.summary.request.discoveryPolicy == .includeExcluded)
+        model.close()
+        try await wait("policy query owners retired") { probe.closedCount == probe.createCount }
+
+        let legacyProbe = StreamProbe()
+        let legacy = AtlasWorkspaceStreamModel(transport: legacyProbe.transport, query: "old")
+        legacy.open(.init(root: StreamFixture.root, project: UUID(), browserOwner: 1, access: nil))
+        try await wait("legacy catalog ready") { !legacy.busy }
+        legacy.discoveryPolicy = .includeExcluded
+        precondition(!legacy.supportsDiscoveryPolicy && !legacy.canSearch && legacyProbe.searchCount == 0)
+        legacy.close()
     }
     private static func matchWindowWireTests() throws {
         let owner: UInt64 = 0xfedcba9876543210

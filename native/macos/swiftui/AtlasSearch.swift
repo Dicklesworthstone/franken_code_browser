@@ -3,6 +3,22 @@ import Foundation
 import CryptoKit
 #endif
 
+/// Discovery scope is an explicit user choice, independent of file-type and
+/// path filters. It never changes a root grant or enables links/special files.
+enum AtlasDiscoveryPolicy: UInt64, Sendable {
+    case repositoryRules = 0
+    case includeExcluded = 1
+
+    var wireName: String {
+        self == .repositoryRules ? "repository-rules-v1" : "all-regular-files/no-rule-files-v1"
+    }
+    var includesExcluded: Bool { self == .includeExcluded }
+    func admits(_ name: String, legacyDefault: Bool = false) -> Bool {
+        name == wireName || (legacyDefault && self == .repositoryRules
+            && name == "product-defaults/no-rule-files-v1")
+    }
+}
+
 struct SearchHit: Identifiable, Hashable, Sendable {
     let id: Int
     /// Escaped presentation label is never used as a filesystem path.

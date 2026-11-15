@@ -247,12 +247,23 @@ enum AtlasProgressiveFileRequest: Sendable {
     case openReader(reader: UInt64, generation: UInt64, revision: UInt64, file: UInt64, bytes: UInt64)
 }
 struct AtlasProgressiveFileTransport: Sendable {
+    typealias OpenWithPolicy = @Sendable (UInt64, String, UInt64, AtlasFileQuery, AtlasDiscoveryPolicy) -> String?
     let create: @Sendable () -> UInt64
     let run: @Sendable (UInt64, AtlasProgressiveFileRequest) -> String?
     let cancel: @Sendable (UInt64) -> Bool
     let close: @Sendable (UInt64) -> Bool
     let retirementFailed: @Sendable () -> Void
     let readerDomain: UUID?
+    let openWithPolicy: OpenWithPolicy?
+    init(create: @escaping @Sendable () -> UInt64,
+         run: @escaping @Sendable (UInt64, AtlasProgressiveFileRequest) -> String?,
+         cancel: @escaping @Sendable (UInt64) -> Bool, close: @escaping @Sendable (UInt64) -> Bool,
+         retirementFailed: @escaping @Sendable () -> Void, readerDomain: UUID?,
+         openWithPolicy: OpenWithPolicy? = nil) {
+        self.create = create; self.run = run; self.cancel = cancel; self.close = close
+        self.retirementFailed = retirementFailed; self.readerDomain = readerDomain
+        self.openWithPolicy = openWithPolicy
+    }
 }
 
 private struct AtlasProgressiveFileReceipt: Sendable {
@@ -364,13 +375,25 @@ private final class AtlasProgressiveFileSession: @unchecked Sendable {
     let owner: UInt64
     let generation: UInt64 = 1
     let query: AtlasFileQuery
+    let discoveryPolicy: AtlasDiscoveryPolicy
     let transport: AtlasProgressiveFileTransport
     private let access: AtlasProgressiveFileAccess
     private static let retirement = DispatchQueue(label: "dev.frankencode.browser.progressive-finder-retirement", qos: .utility)
-    init(query: AtlasFileQuery, transport: AtlasProgressiveFileTransport, access: AnyObject?) throws {
+    init(query: AtlasFileQuery, discoveryPolicy: AtlasDiscoveryPolicy,
+         transport: AtlasProgressiveFileTransport, access: AnyObject?) throws {
+        guard discoveryPolicy == .repositoryRules || transport.openWithPolicy != nil else {
+            throw AtlasProgressiveFileError.unavailable
+        }
         let owner = transport.create()
         guard owner != 0 else { throw AtlasProgressiveFileError.unavailable }
         self.owner = owner; self.query = query; self.transport = transport; self.access = AtlasProgressiveFileAccess(access)
+        self.discoveryPolicy = discoveryPolicy
+    }
+    func validate(_ report: AtlasProgressiveFileReport) throws {
+        guard report.owner == owner,
+              discoveryPolicy.admits(report.policy.name, legacyDefault: transport.openWithPolicy == nil) else {
+            throw AtlasProgressiveFileError.invalidResponse
+        }
     }
     func cancel() { _ = transport.cancel(owner) }
     deinit {
@@ -394,6 +417,9 @@ private final class AtlasProgressiveFileSession: @unchecked Sendable {
     var text = "" { didSet { if !oldValue.utf8.elementsEqual(text.utf8) { submit(debounce: true) } } }
     var mode: AtlasFileFindMode = .fuzzy { didSet { if oldValue != mode { submit(debounce: true) } } }
     var matchCase = false { didSet { if oldValue != matchCase { submit(debounce: true) } } }
+    var discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules {
+        didSet { if oldValue != discoveryPolicy { submit() } }
+    }
     var selected: AtlasProgressiveFileSelection? {
         didSet { if opening && oldValue != selected { flag?.cancel(); session?.cancel() } }
     }
@@ -411,19 +437,22 @@ private final class AtlasProgressiveFileSession: @unchecked Sendable {
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var version = UUID()
     @ObservationIgnored private var debouncing = false
-    @ObservationIgnored private var pending: (version: UUID, query: AtlasFileQuery, debounce: Bool)?
+    @ObservationIgnored private var pending: (version: UUID, query: AtlasFileQuery, policy: AtlasDiscoveryPolicy, debounce: Bool)?
     @ObservationIgnored private var stopRequested = false
     @ObservationIgnored private var hasPresentedHits = false
 
     init(transport: AtlasProgressiveFileTransport) { self.transport = transport }
+    var supportsDiscoveryPolicy: Bool { transport.openWithPolicy != nil }
     var isCurrent: Bool {
         guard !closed, let report, let session, let query = try? input() else { return false }
         return report.owner == session.owner && report.generation == session.generation
             && report.query == query && session.query == query
+            && session.discoveryPolicy == discoveryPolicy
     }
     var canOpen: Bool { !busy && isCurrent && selected.flatMap { report?.row($0) } != nil }
     var canContinue: Bool { !busy && isCurrent && report?.more == true }
-    var canReload: Bool { !busy && !closed && session != nil && session?.query == (try? input()) }
+    var canReload: Bool { !busy && !closed && session != nil && session?.query == (try? input())
+        && session?.discoveryPolicy == discoveryPolicy }
     func bind(root: String, accessLease: AnyObject?) {
         guard self.root.isEmpty, !closed, root.hasPrefix("/"), root.utf8.count <= 16_384,
               !root.utf8.contains(0) else { notice = AtlasProgressiveFileError.unavailable.message; return }
@@ -441,7 +470,7 @@ private final class AtlasProgressiveFileSession: @unchecked Sendable {
             if !busy { session = nil }
             return
         }
-        do { pending = (version, try input(), debounce) }
+        do { pending = (version, try input(), discoveryPolicy, debounce) }
         catch { notice = Self.message(error); if !busy { session = nil }; return }
         notice = busy ? "Replacing the previous search after entered work drains…" : "Finding project files…"
         if !busy { session = nil; startPending() }
@@ -453,13 +482,13 @@ private final class AtlasProgressiveFileSession: @unchecked Sendable {
             do {
                 let next = try await model.advance(lease, after: report.revision, flag: flag)
                 guard model.accepts(lease, ticket: ticket) else { return }
-                model.accept(next)
+                try model.accept(next)
                 while let current = model.report, current.rows.isEmpty, current.more, !flag.isCanceled,
                       model.accepts(lease, ticket: ticket) {
                     await Task.yield()
                     let next = try await model.advance(lease, after: current.revision, flag: flag)
                     guard model.accepts(lease, ticket: ticket) else { return }
-                    model.accept(next)
+                    try model.accept(next)
                 }
             } catch {
                 guard model.accepts(lease, ticket: ticket) else { return }
@@ -538,6 +567,7 @@ private final class AtlasProgressiveFileSession: @unchecked Sendable {
     private func input() throws -> AtlasFileQuery { try .init(text: text, mode: mode, matchCase: matchCase) }
     private func accepts(_ lease: AtlasProgressiveFileSession, ticket: UUID) -> Bool {
         !closed && version == ticket && session === lease && (try? input()) == lease.query
+            && discoveryPolicy == lease.discoveryPolicy
     }
     private func startPending() {
         guard !busy, !closed, let request = pending else { return }
@@ -549,20 +579,21 @@ private final class AtlasProgressiveFileSession: @unchecked Sendable {
                 if request.debounce { try await Task.sleep(nanoseconds: 150_000_000) }
                 guard !closed, version == request.version, !flag.isCanceled else { return }
                 debouncing = false
-                let lease = try AtlasProgressiveFileSession(query: request.query, transport: transport, access: access)
+                let lease = try AtlasProgressiveFileSession(query: request.query, discoveryPolicy: request.policy,
+                    transport: transport, access: access)
                 session = lease
                 do {
                     let initial = try AtlasProgressiveFileReport.decode(await run(lease,
                         .open(root: root, generation: lease.generation, query: lease.query), flag: flag),
                         owner: lease.owner, generation: lease.generation, query: lease.query, command: "page", revision: 1)
                     guard accepts(lease, ticket: request.version) else { return }
-                    accept(initial)
+                    try accept(initial)
                     while let current = report, current.rows.isEmpty, current.more, !flag.isCanceled,
                           accepts(lease, ticket: request.version) {
                         await Task.yield()
                         let next = try await advance(lease, after: current.revision, flag: flag)
                         guard accepts(lease, ticket: request.version) else { return }
-                        accept(next)
+                        try accept(next)
                     }
                 } catch {
                     guard accepts(lease, ticket: request.version) else { return }
@@ -585,7 +616,9 @@ private final class AtlasProgressiveFileSession: @unchecked Sendable {
         }
         return next
     }
-    private func accept(_ report: AtlasProgressiveFileReport) {
+    private func accept(_ report: AtlasProgressiveFileReport) throws {
+        guard let session else { throw AtlasProgressiveFileError.stale }
+        try session.validate(report)
         let previous = selected
         self.report = report
         notice = report.summary
@@ -603,6 +636,7 @@ private final class AtlasProgressiveFileSession: @unchecked Sendable {
         do {
             let info = try AtlasProgressiveFileReport.decode(await run(lease, .info, flag: recovery),
                 owner: lease.owner, generation: lease.generation, query: lease.query, command: "info")
+            try lease.validate(info)
             if let current = report, current.owner == lease.owner, info.revision < current.revision {
                 throw AtlasProgressiveFileError.invalidResponse
             }
@@ -610,7 +644,7 @@ private final class AtlasProgressiveFileSession: @unchecked Sendable {
                 .page(generation: lease.generation, revision: info.revision), flag: recovery),
                 owner: lease.owner, generation: lease.generation, query: lease.query, command: "page", revision: info.revision)
             guard accepts(lease, ticket: ticket) else { return false }
-            accept(page); return true
+            try accept(page); return true
         } catch {
             if accepts(lease, ticket: ticket) { report = nil; selected = nil }
             return false
@@ -625,7 +659,7 @@ private final class AtlasProgressiveFileSession: @unchecked Sendable {
                     .stop(generation: lease.generation), flag: flag),
                     owner: lease.owner, generation: lease.generation, query: lease.query, command: "stop", revision: current.revision)
                 guard model.accepts(lease, ticket: ticket) else { return }
-                model.accept(report)
+                try model.accept(report)
             } catch {
                 guard model.accepts(lease, ticket: ticket) else { return }
                 _ = await model.recover(lease, ticket: ticket); model.notice = Self.message(error)
@@ -634,7 +668,12 @@ private final class AtlasProgressiveFileSession: @unchecked Sendable {
     }
     private func run(_ lease: AtlasProgressiveFileSession, _ request: AtlasProgressiveFileRequest,
         flag: AtlasSearchCancellation) async throws -> String? {
-        try await io.perform(cancellation: flag, keepingAlive: [lease]) { lease.transport.run(lease.owner, request) }
+        try await io.perform(cancellation: flag, keepingAlive: [lease]) {
+            if case .open(let root, let generation, let query) = request, let open = lease.transport.openWithPolicy {
+                return open(lease.owner, root, generation, query, lease.discoveryPolicy)
+            }
+            return lease.transport.run(lease.owner, request)
+        }
     }
     private func perform(_ work: @escaping @MainActor (AtlasProgressiveQuickOpenModel, AtlasSearchCancellation) async throws -> Void) {
         guard !busy, !closed else { return }
@@ -650,7 +689,7 @@ private final class AtlasProgressiveFileSession: @unchecked Sendable {
         busy = false; opening = false; debouncing = false; flag = nil; task = nil
         if closed { session = nil; access = nil }
         else if pending != nil { session = nil; startPending() }
-        else if session?.query != (try? input()) { session = nil; stopRequested = false }
+        else if session?.query != (try? input()) || session?.discoveryPolicy != discoveryPolicy { session = nil; stopRequested = false }
         else if stopRequested { stopRequested = false; pause() }
     }
     private static func message(_ error: Error) -> String {

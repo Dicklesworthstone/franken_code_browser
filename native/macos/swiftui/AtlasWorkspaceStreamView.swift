@@ -30,8 +30,21 @@ import AppKit
                 .font(.caption).foregroundStyle(.secondary)
             Text(presentation.source.pathScope.isVisible
                 ? "This sheet keeps the displayed atlas membership and file-type selection fixed. Its frozen search catalog contains at most 20,000 files; missing requested paths are reported as incomplete coverage."
-                : "This sheet keeps the sidebar's location and file-type selection fixed. Discovery continues beyond the atlas file limit using repository rules; excluded files do not consume the scan budget. The total file count remains unknown until discovery finishes.")
+                : "This sheet keeps the sidebar's location and file-type selection fixed. Discovery continues beyond the atlas file limit under the selected exclusion policy. The total file count remains unknown until discovery finishes.")
                 .font(.caption).foregroundStyle(.secondary)
+            if model.supportsDiscoveryPolicy {
+                HStack(alignment: .top, spacing: 10) {
+                    Toggle("Include ignored files", isOn: Binding(
+                        get: { model.discoveryPolicy.includesExcluded },
+                        set: { model.discoveryPolicy = $0 ? .includeExcluded : .repositoryRules }))
+                        .toggleStyle(.checkbox)
+                        .help("Apply this discovery policy to the next search. Existing results become read-only; the atlas and other searches are unchanged.")
+                    Text(model.discoveryPolicy.includesExcluded
+                        ? "Includes ignored and generated files within the selected location and file types. These files consume the same total scan budget."
+                        : "Applies repository ignore rules and default exclusions. Excluded source does not consume the scan budget.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
             HStack(spacing: 8) {
                 Picker("Search mode", selection: $model.mode) {
                     ForEach(AtlasWorkspaceStreamMode.allCases) { mode in Text(mode.label).tag(mode) }

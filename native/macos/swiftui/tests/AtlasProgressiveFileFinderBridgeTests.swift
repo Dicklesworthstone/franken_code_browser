@@ -1,6 +1,7 @@
 import Foundation
 
 @_silgen_name("progressive_fixture_bad") private func fixtureBad(_ value: Int32)
+@_silgen_name("progressive_fixture_policy") private func fixturePolicy(_ value: UInt64)
 @_silgen_name("progressive_fixture_allocations") private func fixtureAllocations() -> UInt32
 @_silgen_name("progressive_fixture_frees") private func fixtureFrees() -> UInt32
 
@@ -22,6 +23,10 @@ extension AtlasReaderTransport {
                 let query = try AtlasFileQuery(text: "é.rs", mode: mode, matchCase: sensitive)
                 let expected = mode.wire + (sensitive ? "-sensitive" : "-lowercase")
                 precondition(transport.run(handle, .open(root: "/repo/é", generation: generation, query: query)) == expected)
+                for policy: AtlasDiscoveryPolicy in [.repositoryRules, .includeExcluded] {
+                    fixturePolicy(policy.rawValue)
+                    precondition(transport.openWithPolicy!(handle, "/repo/é", generation, query, policy) == expected)
+                }
             }
         }
         precondition(transport.run(handle, .info) == "info")
@@ -37,6 +42,6 @@ extension AtlasReaderTransport {
         fixtureBad(0)
         precondition(transport.cancel(handle) && transport.close(handle))
         precondition(fixtureAllocations() == fixtureFrees())
-        print("Progressive filename ABI mode/case/raw-query/u64/reader/response-ownership regressions passed.")
+        print("Progressive filename ABI policy/mode/case/raw-query/u64/reader/response-ownership regressions passed.")
     }
 }

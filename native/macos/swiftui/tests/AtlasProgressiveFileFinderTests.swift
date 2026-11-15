@@ -15,20 +15,26 @@ private final class ProgressiveFinderFixture: @unchecked Sendable {
     let firstMatchStep: UInt64
     let completeStep: UInt64
     let repositoryRules: Bool
+    let policyAware: Bool
     let source = Array("captured\n".utf8)
     let digest = "af9f5d825b4a9e493a23ea438db355287c4320107eb98c3542879fef26b82628"
     private let lock = NSLock()
     private var sessions: [UInt64: Session] = [:], readers: [UInt64: [UInt8]] = [:]
+    private var policies: [UInt64: AtlasDiscoveryPolicy] = [:]
+    private var policyOverride: AtlasDiscoveryPolicy?
     private var nextOwner: UInt64 = 40, nextReader: UInt64 = 100
     private var fault: String?, blocked = false, evicts = false
     private var log: [String] = []
-    init(firstMatchStep: UInt64 = 1, completeStep: UInt64 = 8, repositoryRules: Bool = false) {
+    init(firstMatchStep: UInt64 = 1, completeStep: UInt64 = 8, repositoryRules: Bool = false,
+        policyAware: Bool = false) {
         self.firstMatchStep = firstMatchStep; self.completeStep = completeStep; self.repositoryRules = repositoryRules
+        self.policyAware = policyAware
     }
     private func locked<T>(_ work: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return work() }
     var calls: [String] { locked { log } }
     func corrupt(_ value: String) { locked { fault = value } }
     func blockNext() { locked { blocked = true } }
+    func overridePolicy(_ policy: AtlasDiscoveryPolicy?) { locked { policyOverride = policy } }
     func evictSelected() { locked { evicts = true } }
     func json(_ value: [String: Any]) -> String {
         String(decoding: try! JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]), as: UTF8.self)
@@ -78,6 +84,11 @@ private final class ProgressiveFinderFixture: @unchecked Sendable {
             out["policy"] = "repository-rules-v1"; out["rule_files_enabled"] = true
             out["rule_policy"] = ruleEvidence(complete: terminal)
         }
+        if let selected = policies[owner] {
+            let policy = policyOverride ?? selected
+            out["policy"] = policy.wireName; out["rule_files_enabled"] = !policy.includesExcluded
+            out["rule_policy"] = policy.includesExcluded ? NSNull() : ruleEvidence(complete: terminal) as Any
+        }
         return out
     }
     func ruleEvidence(complete: Bool) -> [String: Any] {
@@ -114,6 +125,13 @@ private final class ProgressiveFinderFixture: @unchecked Sendable {
         out["has_replacements"] = false; out["first_physical_line"] = NSNull(); out["selection"] = NSNull()
         out["next_offset"] = end < UInt64(source.count) ? String(end) as Any : NSNull()
         return out
+    }
+    private var policyOpen: AtlasProgressiveFileTransport.OpenWithPolicy? {
+        guard policyAware else { return nil }
+        return { [self] owner, root, generation, query, policy in
+            locked { policies[owner] = policy; log.append("policy:\(owner):\(policy.rawValue)") }
+            return transport.run(owner, .open(root: root, generation: generation, query: query))
+        }
     }
     var transport: AtlasProgressiveFileTransport {
         AtlasProgressiveFileTransport(create: { [self] in locked {
@@ -203,7 +221,7 @@ private final class ProgressiveFinderFixture: @unchecked Sendable {
             }
         }, cancel: { [self] owner in locked { log.append("cancel:\(owner)") }; return true },
         close: { [self] owner in locked { sessions.removeValue(forKey: owner); log.append("close:\(owner)") }; return true },
-        retirementFailed: { fatalError("finder retirement failed") }, readerDomain: domain)
+        retirementFailed: { fatalError("finder retirement failed") }, readerDomain: domain, openWithPolicy: policyOpen)
     }
     var readerTransport: AtlasReaderTransport {
         AtlasReaderTransport(create: { [self] in locked {
@@ -239,6 +257,7 @@ private final class ProgressiveFinderFixture: @unchecked Sendable {
         try repositoryRuleEvidence()
         try await autoProgressStopRecoveryAndSelection()
         await editsCoalesceAndRevokeOldRows()
+        await discoveryPolicyReplacesAndRecovers()
         await exactRawCaptureAndForgedReceipts()
         await ruleAwareCaptureReceipts()
         await closeDrainsGrantAndCapture()
@@ -409,6 +428,39 @@ private final class ProgressiveFinderFixture: @unchecked Sendable {
         model.text = ""
         precondition(model.report == nil && !model.canOpen)
         model.close()
+    }
+    @MainActor private static func discoveryPolicyReplacesAndRecovers() async {
+        let fixture = ProgressiveFinderFixture(policyAware: true), model = await started(fixture)
+        let original = model.selected!
+        precondition(model.supportsDiscoveryPolicy && model.discoveryPolicy == .repositoryRules)
+        fixture.blockNext(); model.continueSearch()
+        await wait("old-policy finder did not enter") { fixture.entered.wait(timeout: .now()) == .success }
+        model.discoveryPolicy = .includeExcluded
+        precondition(model.report == nil && model.selected == nil && !model.canOpen)
+        fixture.resume.signal()
+        await wait("included-policy finder did not finish") { !model.busy }
+        precondition(model.isCurrent && model.canOpen && model.selected?.owner != original.owner
+            && model.report?.policy.name == AtlasDiscoveryPolicy.includeExcluded.wireName
+            && fixture.calls.filter { $0.hasPrefix("open:") }.count == 2
+            && fixture.calls.contains("policy:41:1"))
+        model.selected = original
+        model.openSelected(readerTransport: fixture.readerTransport) { _ in preconditionFailure("Prior-policy row opened") }
+        precondition(!model.canOpen && !fixture.calls.contains(where: { $0.hasPrefix("reader-create:") }))
+
+        fixture.overridePolicy(.repositoryRules)
+        model.reload(); await wait("mismatched finder recovery did not finish") { !model.busy }
+        precondition(model.report == nil && !model.canOpen && model.discoveryPolicy == .includeExcluded)
+        fixture.overridePolicy(nil)
+        model.reload(); await wait("included finder recovery did not finish") { !model.busy }
+        precondition(model.isCurrent && model.report?.policy.name == AtlasDiscoveryPolicy.includeExcluded.wireName)
+        model.close()
+
+        let legacyFixture = ProgressiveFinderFixture(), legacy = await started(legacyFixture)
+        legacy.discoveryPolicy = .includeExcluded
+        await wait("unsupported finder policy did not finish") { !legacy.busy }
+        precondition(!legacy.supportsDiscoveryPolicy && !legacy.canOpen && legacy.report == nil
+            && legacyFixture.calls.filter { $0.hasPrefix("open:") }.count == 1)
+        legacy.close()
     }
     @MainActor private static func exactRawCaptureAndForgedReceipts() async {
         let fixture = ProgressiveFinderFixture(), model = await started(fixture)

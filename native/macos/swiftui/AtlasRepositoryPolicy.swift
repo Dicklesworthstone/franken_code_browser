@@ -13,6 +13,8 @@ struct AtlasRepositoryPolicy: Equatable, Sendable {
         switch name {
         case "product-defaults/no-rule-files-v1":
             guard enabled != true, evidence == nil else { throw AtlasRepositoryPolicyError.invalidResponse }
+        case "all-regular-files/no-rule-files-v1":
+            guard enabled == false, evidence == nil else { throw AtlasRepositoryPolicyError.invalidResponse }
         case "repository-rules-v1":
             guard enabled == true, let evidence,
                   evidence.scopeComplete == discoveryComplete,
@@ -25,6 +27,9 @@ struct AtlasRepositoryPolicy: Equatable, Sendable {
     }
 
     var summary: String {
+        if name == "all-regular-files/no-rule-files-v1" {
+            return "Ignored and generated files included. Repository ignore files and default exclusions are not applied; symlinks, special files and discovery limits still apply."
+        }
         guard let evidence else { return "Default exclusions apply; repository ignore files were not read." }
         var text = "Repository ignore rules: \(evidence.filesLoaded) files applied."
         if !evidence.observedRulesComplete {

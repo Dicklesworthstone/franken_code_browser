@@ -1597,7 +1597,12 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                     accessLease: authority.access)
                 closeObservedReader()
                 observedReader = AtlasObservedReaderPresentation(source: source, transport: .native)
-            }, searchProject: selectedSourceProjectSearch)
+            }, searchProject: selectedSourceProjectSearch,
+            canChangeDiscoveryPolicy: !projectRefresh.isRefreshing && !loadingProject,
+            changeDiscoveryPolicy: { policy in
+                guard projectBrowser === browser else { return }
+                _ = requestProjectRefresh(discoveryPolicy: policy)
+            })
             .id(projectViewIdentity)
     }
 
@@ -1859,7 +1864,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         }
     }
 
-    @discardableResult private func requestProjectRefresh(automatic: AtlasProjectChangeTicket? = nil) -> Bool {
+    @discardableResult private func requestProjectRefresh(automatic: AtlasProjectChangeTicket? = nil,
+        discoveryPolicy: AtlasDiscoveryPolicy? = nil) -> Bool {
         guard projectViewActive, !projectRefresh.isRefreshing, !loadingProject,
               !projectOpening.isPreparing, !atlasLayoutPending,
               projectOpening.canBrowse, !projectBrowser.closed,
@@ -1868,6 +1874,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             guard liveRefreshInput.admits(automatic), projectChanges.acceptsAutomaticRefresh(automatic) else { return false }
         }
         let previous = projectBrowser, previousProject = browserProject
+        let requestedDiscoveryPolicy = discoveryPolicy ?? previous.discoveryPolicy
         let requestedRoot = root, previousRevision = atlasRevision, previousRequest = atlasLayoutRequest
         let requestedScope = fileScope, requestedExtensions = Array(customExtensions.utf8)
         guard let scope = try? fileScope.searchScope(custom: customExtensions) else {
@@ -1889,6 +1896,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         accessLease = nil
 #endif
         if let project = projectRefresh.stage(root: root, project: previousProject, accessLease: accessLease,
+            discoveryPolicy: requestedDiscoveryPolicy,
             prepare: { cancellation in
                 guard refreshAtlas else { return }
                 stagedAtlas = try await projectRefreshIO.perform(cancellation: cancellation,
@@ -1905,7 +1913,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 }
                 guard atlasRevision == previousRevision, atlasLayoutRequest == previousRequest,
                       fileScope == requestedScope, Array(customExtensions.utf8) == requestedExtensions,
-                      hasMetadataAtlas == refreshAtlas, !atlasLayoutPending, !projectOpening.isPreparing else { return false }
+                      hasMetadataAtlas == refreshAtlas, !atlasLayoutPending, !projectOpening.isPreparing,
+                      candidate.browser.discoveryPolicy == requestedDiscoveryPolicy else { return false }
                 return acceptProjectRefresh(candidate, replacing: previous, atlas: stagedAtlas, accessLease: accessLease)
             },
             failed: { project in projectChanges.cancelDiscovery(project: project) }) {

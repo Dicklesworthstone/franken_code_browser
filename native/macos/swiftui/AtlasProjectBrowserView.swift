@@ -15,6 +15,8 @@ import SwiftUI
     let canReadRanges: Bool
     let readRanges: (AtlasProjectBrowserFile, AtlasProjectBrowserPage) throws -> Void
     var searchProject: ((AtlasReaderSelectionQuery) -> Void)? = nil
+    var canChangeDiscoveryPolicy = true
+    var changeDiscoveryPolicy: ((AtlasDiscoveryPolicy) -> Void)? = nil
     @State private var capture: AtlasProjectBrowserCapture?
     @State private var readerTask: Task<Void, Never>?
     @State private var readerNotice = ""
@@ -35,6 +37,18 @@ import SwiftUI
                 Button("Refresh project", action: refresh)
             }
             if preparing { Text(progress).font(.caption).foregroundStyle(.secondary) }
+            if let changeDiscoveryPolicy, model.supportsDiscoveryPolicy {
+                Toggle("Include ignored and generated files", isOn: Binding(
+                    get: { model.discoveryPolicy.includesExcluded },
+                    set: { changeDiscoveryPolicy($0 ? .includeExcluded : .repositoryRules) }))
+                    .toggleStyle(.checkbox)
+                    .disabled(!canChangeDiscoveryPolicy || !model.canOperate || preparing || readerTask != nil)
+                    .help("Restart Project Files with the selected discovery policy. Existing readers keep their captured bytes. The text atlas keeps its separate default exclusions.")
+                if model.discoveryPolicy.includesExcluded {
+                    Text("Project Files includes ignored and generated files. The text atlas keeps its default exclusions; Quick Open and large-file search offer their own Include ignored control.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
             if let info = model.info {
                 HStack {
                     Text("\(info.discovered) files discovered").font(.callout.weight(.semibold))

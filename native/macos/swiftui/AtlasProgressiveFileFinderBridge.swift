@@ -5,6 +5,10 @@ import Foundation
 private func openProgressiveFinder(_ handle: UInt64, _ root: UnsafePointer<CChar>?, _ generation: UInt64,
     _ query: UnsafePointer<UInt8>?, _ queryBytes: UInt64, _ mode: UInt32, _ matchCase: UInt8,
     _ maximumResults: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_file_finder_open_with_policy")
+private func openProgressiveFinderWithPolicy(_ handle: UInt64, _ root: UnsafePointer<CChar>?, _ generation: UInt64,
+    _ query: UnsafePointer<UInt8>?, _ queryBytes: UInt64, _ mode: UInt32, _ matchCase: UInt8,
+    _ maximumResults: UInt64, _ policy: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_file_finder_info")
 private func progressiveFinderInfo(_ handle: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_file_finder_page")
@@ -48,7 +52,16 @@ extension AtlasProgressiveFileTransport {
     }, cancel: { cancelProgressiveFinder($0) != 0 }, close: { closeProgressiveFinder($0) != 0 },
     retirementFailed: {
         FileHandle.standardError.write(Data("ATLAS_PROGRESSIVE_FILE_FINDER_RETIREMENT_FAILED\n".utf8))
-    }, readerDomain: AtlasReaderTransport.native.comparison?.domain)
+    }, readerDomain: AtlasReaderTransport.native.comparison?.domain, openWithPolicy: { handle, root, generation, query, policy in
+        guard root.hasPrefix("/"), root.utf8.count <= 16_384, !root.utf8.contains(0) else { return nil }
+        let bytes = Array(query.text.utf8)
+        return root.withCString { path in
+            bytes.withUnsafeBufferPointer {
+                take(openProgressiveFinderWithPolicy(handle, path, generation, $0.baseAddress, UInt64($0.count),
+                    nativeMode(query.mode), query.matchCase ? 1 : 0, 256, policy.rawValue))
+            }
+        }
+    })
 
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
         guard let pointer else { return nil }

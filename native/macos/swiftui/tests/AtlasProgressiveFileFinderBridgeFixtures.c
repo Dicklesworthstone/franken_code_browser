@@ -9,6 +9,8 @@
 #define REVISION UINT64_C(9007199254740995)
 static unsigned allocations, frees;
 static int bad;
+static uint64_t expected_policy;
+void progressive_fixture_policy(uint64_t value) { expected_policy = value; }
 void progressive_fixture_bad(int value) { bad = value; }
 unsigned progressive_fixture_allocations(void) { return allocations; }
 unsigned progressive_fixture_frees(void) { return frees; }
@@ -34,6 +36,12 @@ char *fcb_file_finder_open(uint64_t handle, const char *root, uint64_t generatio
     if (mode == 0) return answer(match_case ? "exact-sensitive" : "exact-lowercase");
     if (mode == 1) return answer(match_case ? "prefix-sensitive" : "prefix-lowercase");
     return answer(match_case ? "fuzzy-sensitive" : "fuzzy-lowercase");
+}
+char *fcb_file_finder_open_with_policy(uint64_t handle, const char *root, uint64_t generation,
+    const uint8_t *query, uint64_t query_bytes, uint32_t mode, uint8_t match_case,
+    uint64_t max_results, uint64_t policy) {
+    assert(policy == expected_policy && policy <= 1);
+    return fcb_file_finder_open(handle, root, generation, query, query_bytes, mode, match_case, max_results);
 }
 char *fcb_file_finder_info(uint64_t handle) { assert(handle == HANDLE); return answer("info"); }
 char *fcb_file_finder_page(uint64_t handle, uint64_t generation, uint64_t revision) {

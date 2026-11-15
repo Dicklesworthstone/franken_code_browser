@@ -252,6 +252,7 @@ enum AtlasProjectBrowserRequest: Sendable {
 }
 struct AtlasProjectBrowserTransport: Sendable {
     typealias VerifiedDocumentLink = @Sendable (UInt64, UInt64, UInt64, UInt64, UInt64, UInt64) -> String?
+    typealias OpenWithPolicy = @Sendable (UInt64, String, AtlasDiscoveryPolicy) -> String?
     let create: @Sendable () -> UInt64
     let run: @Sendable (UInt64, AtlasProjectBrowserRequest) -> String?
     let cancel: @Sendable (UInt64) -> Bool
@@ -259,15 +260,17 @@ struct AtlasProjectBrowserTransport: Sendable {
     let retirementFailed: @Sendable () -> Void
     let readerDomain: UUID?
     let verifiedDocumentLink: VerifiedDocumentLink?
+    let openWithPolicy: OpenWithPolicy?
 
     init(create: @escaping @Sendable () -> UInt64,
         run: @escaping @Sendable (UInt64, AtlasProjectBrowserRequest) -> String?,
         cancel: @escaping @Sendable (UInt64) -> Bool, close: @escaping @Sendable (UInt64) -> Bool,
         retirementFailed: @escaping @Sendable () -> Void, readerDomain: UUID?,
-        verifiedDocumentLink: VerifiedDocumentLink? = nil) {
+        verifiedDocumentLink: VerifiedDocumentLink? = nil, openWithPolicy: OpenWithPolicy? = nil) {
         self.create = create; self.run = run; self.cancel = cancel; self.close = close
         self.retirementFailed = retirementFailed; self.readerDomain = readerDomain
         self.verifiedDocumentLink = verifiedDocumentLink
+        self.openWithPolicy = openWithPolicy
     }
 }
 
@@ -382,10 +385,14 @@ private struct AtlasProjectBrowserReceipt: Sendable {
     let window: AtlasReaderPage
     let initialOriginalOffset: UInt64
     static func decode(_ json: String?, owner: UInt64, page: UInt64, file: AtlasProjectBrowserFile,
-        destination: UInt64) throws -> Self {
+        destination: UInt64, discoveryPolicy: AtlasDiscoveryPolicy? = nil,
+        legacyDefault: Bool = false) throws -> Self {
         let data = try AtlasProjectBrowserWire.admit(json, owner: owner, command: "open-reader")
         do {
             let current = try AtlasProjectBrowserInfo.decode(data, owner: owner)
+            guard discoveryPolicy?.admits(current.policy.name, legacyDefault: legacyDefault) != false else {
+                throw AtlasProjectBrowserError.invalidResponse
+            }
             struct Selection: Decodable {
                 let page_id, file_id, reader_owner, source_bytes_read, source_read_calls: AtlasCatalogNumber
                 let path: AtlasCatalogPath
@@ -462,10 +469,14 @@ private struct AtlasProjectBrowserLinkReceipt: Sendable {
     let page: UInt64
     let fragment: AtlasProjectBrowserFragment
     static func decode(_ json: String?, source: AtlasProjectBrowserLinkOrigin,
-        target: AtlasReaderDocumentLinkTarget, destination: UInt64) throws -> Self {
+        target: AtlasReaderDocumentLinkTarget, destination: UInt64,
+        discoveryPolicy: AtlasDiscoveryPolicy, legacyDefault: Bool) throws -> Self {
         let data = try AtlasProjectBrowserWire.admit(json, owner: source.catalog, command: "open-document-link")
         do {
             let current = try AtlasProjectBrowserInfo.decode(data, owner: source.catalog)
+            guard discoveryPolicy.admits(current.policy.name, legacyDefault: legacyDefault) else {
+                throw AtlasProjectBrowserError.invalidResponse
+            }
             struct Wire: Decodable {
                 let source_page_id, source_file_id, source_reader_owner, document_generation, link_id: AtlasCatalogNumber
                 let target_page_id, reader_owner, source_bytes_read, source_read_calls, initial_original_offset: AtlasCatalogNumber
@@ -563,15 +574,25 @@ private final class AtlasProjectBrowserAccess: @unchecked Sendable {
 private final class AtlasProjectBrowserSession: @unchecked Sendable {
     let owner: UInt64
     let transport: AtlasProjectBrowserTransport
+    let discoveryPolicy: AtlasDiscoveryPolicy
     private let access: AtlasProjectBrowserAccess
     /// Share only the native root-access lifetime with a captured reader. The
     /// catalog itself can retire while the independent reader keeps this grant.
     var retainedAccessLease: AnyObject { access }
     private static let retirement = DispatchQueue(label: "dev.frankencode.browser.discovery-retirement", qos: .utility)
-    init(transport: AtlasProjectBrowserTransport, access: AnyObject?) throws {
+    init(transport: AtlasProjectBrowserTransport, access: AnyObject?, discoveryPolicy: AtlasDiscoveryPolicy) throws {
+        guard discoveryPolicy == .repositoryRules || transport.openWithPolicy != nil else {
+            throw AtlasProjectBrowserError.unavailable
+        }
         let owner = transport.create()
         guard owner != 0 else { throw AtlasProjectBrowserError.unavailable }
         self.owner = owner; self.transport = transport; self.access = AtlasProjectBrowserAccess(access)
+        self.discoveryPolicy = discoveryPolicy
+    }
+    func validate(_ info: AtlasProjectBrowserInfo) throws {
+        guard discoveryPolicy.admits(info.policy.name, legacyDefault: transport.openWithPolicy == nil) else {
+            throw AtlasProjectBrowserError.invalidResponse
+        }
     }
     func cancel() { _ = transport.cancel(owner) }
     deinit {
@@ -594,6 +615,7 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
     private(set) var info: AtlasProjectBrowserInfo?
     private(set) var page: AtlasProjectBrowserPage?
     private(set) var root = ""
+    private(set) var discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules
     /// Lifetime identity of the native grant supplied by the project owner.
     /// Same-path grant replacement must revoke local-link history; a catalog
     /// refresh using this same grant may preserve already retained readers.
@@ -625,16 +647,20 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
         return accepted.files.first(where: { $0.matches(file) })
     }
 
-    func open(root: String, accessLease: AnyObject?) async throws {
+    var supportsDiscoveryPolicy: Bool { transport.openWithPolicy != nil }
+
+    func open(root: String, accessLease: AnyObject?, discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules) async throws {
         guard !closed, !busy, session == nil, root.hasPrefix("/"), root.utf8.count <= 16_384,
               !root.utf8.contains(0) else { throw AtlasProjectBrowserError.unavailable }
-        let lease = try AtlasProjectBrowserSession(transport: transport, access: accessLease)
+        let lease = try AtlasProjectBrowserSession(transport: transport, access: accessLease, discoveryPolicy: discoveryPolicy)
         self.root = root; rootAccessIdentity = accessLease.map(ObjectIdentifier.init)
+        self.discoveryPolicy = discoveryPolicy
         session = lease; busy = true
         let flag = AtlasSearchCancellation(); self.flag = flag
         defer { finish() }
         do {
             let first = try AtlasProjectBrowserPage.decode(await run(lease, .open(root), flag: flag), owner: lease.owner, page: 1)
+            try lease.validate(first.info)
             guard !closed, session === lease else { throw AtlasProjectBrowserError.canceled }
             accept(first)
         } catch {
@@ -650,6 +676,7 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
             do {
                 let next = try AtlasProjectBrowserPage.decode(await model.run(lease, .advance(after: after), flag: flag),
                     owner: lease.owner, page: after + 1)
+                try lease.validate(next.info)
                 guard !model.closed, model.session === lease else { throw AtlasProjectBrowserError.canceled }
                 model.accept(next)
             } catch {
@@ -663,6 +690,7 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
         guard canOperate, info?.retains(id) == true else { return }
         perform { model, lease, flag in
             let page = try AtlasProjectBrowserPage.decode(await model.run(lease, .page(id), flag: flag), owner: lease.owner, page: id)
+            try lease.validate(page.info)
             guard !model.closed, model.session === lease else { throw AtlasProjectBrowserError.canceled }
             model.accept(page)
         }
@@ -684,6 +712,7 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
         perform { model, lease, flag in
             do {
                 let info = try AtlasProjectBrowserInfo.decode(await model.run(lease, .stop, flag: flag), owner: lease.owner, command: "stop")
+                try lease.validate(info)
                 guard !model.closed, model.session === lease else { throw AtlasProjectBrowserError.canceled }
                 model.info = info
                 model.notice = "Discovery paused. Retained pages remain readable; Continue resumes from this cursor."
@@ -712,7 +741,8 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
                     return try withExtendedLifetime(lease) {
                         let admitted = try AtlasProjectBrowserReceipt.decode(lease.transport.run(lease.owner,
                             .openReader(reader: destination, page: page.id, file: file.id, bytes: AtlasReaderLimits.captureBytes)),
-                            owner: lease.owner, page: page.id, file: file, destination: destination)
+                            owner: lease.owner, page: page.id, file: file, destination: destination,
+                            discoveryPolicy: lease.discoveryPolicy, legacyDefault: lease.transport.openWithPolicy == nil)
                         try receipt.set(admitted)
                         return AtlasReaderRetainedInitialization(info: admitted.info, initialOriginalOffset: 0,
                             imageSource: imageSource)
@@ -808,7 +838,8 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
                     guard !flag.isCanceled else { throw AtlasProjectBrowserError.canceled }
                     return try withExtendedLifetime(lease) {
                         let admitted = try AtlasProjectBrowserLinkReceipt.decode(initialize(destination),
-                            source: source, target: target, destination: destination)
+                            source: source, target: target, destination: destination,
+                            discoveryPolicy: lease.discoveryPolicy, legacyDefault: lease.transport.openWithPolicy == nil)
                         try receipt.set(admitted)
                         return AtlasReaderRetainedInitialization(info: admitted.capture.info,
                             initialOriginalOffset: admitted.capture.initialOriginalOffset,
@@ -859,7 +890,9 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
         let recovery = AtlasSearchCancellation()
         do {
             let info = try AtlasProjectBrowserInfo.decode(await run(lease, .info, flag: recovery), owner: lease.owner)
+            try lease.validate(info)
             let page = try AtlasProjectBrowserPage.decode(await run(lease, .page(info.latest), flag: recovery), owner: lease.owner, page: info.latest)
+            try lease.validate(page.info)
             guard !closed, session === lease else { return false }
             accept(page); return true
         } catch {
@@ -869,7 +902,12 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
     }
     private func run(_ lease: AtlasProjectBrowserSession, _ request: AtlasProjectBrowserRequest,
         flag: AtlasSearchCancellation) async throws -> String? {
-        try await io.perform(cancellation: flag, keepingAlive: [lease]) { lease.transport.run(lease.owner, request) }
+        try await io.perform(cancellation: flag, keepingAlive: [lease]) {
+            if case .open(let root) = request, let open = lease.transport.openWithPolicy {
+                return open(lease.owner, root, lease.discoveryPolicy)
+            }
+            return lease.transport.run(lease.owner, request)
+        }
     }
     private func perform(_ work: @escaping @MainActor (AtlasProjectBrowserModel, AtlasProjectBrowserSession, AtlasSearchCancellation) async throws -> Void) {
         guard !busy, !closed, let lease = session else { return }

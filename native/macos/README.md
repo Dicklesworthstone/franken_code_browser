@@ -188,7 +188,7 @@ native startup path rather than being lossily rewritten.
 ### Repository ignore rules
 
 The native file browser, Quick Open, project-wide source search, 2D atlas and
-City use the engine's bounded repository-rule policy. Discovery reads nested
+City use the engine's bounded repository-rule policy by default. Discovery reads nested
 `.gitignore` and `.fcbignore` files; `.fcbignore` follows `.gitignore` within each
 directory. The existing product exclusions and protected internal directories
 still apply. Rule files are configuration inputs, never commands to execute.
@@ -205,6 +205,20 @@ a count for their unvisited descendants.
 Use **Refresh project**, or the search surface's **Refresh file catalog**, after
 changing ignore rules. Captures and searches already retained by an earlier
 catalog keep their original identity and coverage.
+
+**Project Files → Include ignored and generated files** prepares a replacement
+catalog; the previous project and readers remain available until its first page
+is accepted. Failed or canceled switches preserve the previous scope, and
+**Refresh project** keeps the accepted policy. **Quick Open → Include ignored
+files** restarts filename discovery for the current query. **Search large
+project files… → Include ignored files** applies to the next **Search** and
+survives **Reset search**. Superseded rows cannot authorize new actions; retained
+source evidence remains readable. These controls are local to each tool:
+ordinary sidebar search and atlas construction retain their own default scope,
+and visible-atlas search keeps its frozen membership. The override reports
+`all-regular-files/no-rule-files-v1`, with no repository-rule configuration reads.
+Root confinement, symlink and special-object refusal, resource limits and
+independent exclusions for FCB's own artifacts still apply.
 
 ### Reading large files from Project Files
 
@@ -1341,7 +1355,7 @@ readable when retained by the surface, with obsolete actions disabled.
 
 Workspace, folder and exact-file search has no total discovered-file cutoff. It
 retains at most four discovery pages of 256 entries each, one active streaming
-reader, 256 result rows and a bounded diagnostic prefix. The shared
+reader, 256 result rows and a bounded diagnostic prefix. By default, the shared
 `repository-rules-v1` policy observes supported `.gitignore` and `.fcbignore`
 rules. Traversal still has separate path, depth, pending-directory and rule-reading
 limits; a refusal remains visible as incomplete discovery. Matches keep their raw

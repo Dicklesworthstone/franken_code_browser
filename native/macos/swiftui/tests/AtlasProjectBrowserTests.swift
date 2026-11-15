@@ -30,10 +30,13 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
     let completeFirst: Bool
     let fragmentStatus: String
     let repositoryRules: Bool
+    let policyAware: Bool
     let ruleFailure: String?
     let observedBytes: UInt64
     private let lock = NSLock()
     private var sessions: [UInt64: Session] = [:], readers: [UInt64: [UInt8]] = [:]
+    private var policies: [UInt64: AtlasDiscoveryPolicy] = [:]
+    private var policyOverride: AtlasDiscoveryPolicy?
     private var receipts: [UInt64: (page: UInt64, file: UInt64)] = [:]
     private var documents: [UInt64: (generation: UInt64, width: UInt64)] = [:]
     private var nextOwner: UInt64 = 40, nextReader: UInt64 = 100
@@ -41,18 +44,20 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
     private var fault: String?, blocked = false
     private var log: [String] = []
     init(emptyFirst: Bool = false, completeFirst: Bool = false, fragmentStatus: String = "unsupported",
-        repositoryRules: Bool = false, ruleFailure: String? = nil, observedBytes: UInt64 = 4096) {
+        repositoryRules: Bool = false, ruleFailure: String? = nil, observedBytes: UInt64 = 4096,
+        policyAware: Bool = false) {
         precondition(["none", "document-start", "resolved", "missing-heading", "ambiguous",
             "limited", "unsupported", "invalid", "resolved-lines", "missing-line"].contains(fragmentStatus))
         precondition(ruleFailure == nil || repositoryRules)
         self.emptyFirst = emptyFirst; self.completeFirst = completeFirst; self.fragmentStatus = fragmentStatus
         self.repositoryRules = repositoryRules; self.ruleFailure = ruleFailure
-        self.observedBytes = observedBytes
+        self.observedBytes = observedBytes; self.policyAware = policyAware
     }
     private func locked<T>(_ work: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return work() }
     var calls: [String] { locked { log } }
     func corrupt(_ value: String) { locked { fault = value } }
     func blockNext() { locked { blocked = true } }
+    func overridePolicy(_ policy: AtlasDiscoveryPolicy?) { locked { policyOverride = policy } }
     func json(_ value: [String: Any]) -> String {
         String(decoding: try! JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]), as: UTF8.self)
     }
@@ -135,6 +140,11 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
             out["policy"] = "repository-rules-v1"
             out["rule_files_enabled"] = true
             out["rule_policy"] = ruleEvidence(scopeComplete: complete)
+        }
+        if let selected = policies[owner] {
+            let policy = policyOverride ?? selected
+            out["policy"] = policy.wireName; out["rule_files_enabled"] = !policy.includesExcluded
+            out["rule_policy"] = policy.includesExcluded ? NSNull() : ruleEvidence(scopeComplete: complete) as Any
         }
         return out
     }
@@ -281,6 +291,13 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         transport.imagePrepare = { _, _, _, _ in preconditionFailure("Refused image source was read") }
         transport.imageChunk = { _, _, _, _, _, _ in preconditionFailure("Refused image source supplied bytes") }
         return transport
+    }
+    private var policyOpen: AtlasProjectBrowserTransport.OpenWithPolicy? {
+        guard policyAware else { return nil }
+        return { [self] owner, root, policy in
+            locked { policies[owner] = policy; log.append("policy:\(owner):\(policy.rawValue)") }
+            return transport.run(owner, .open(root))
+        }
     }
     var transport: AtlasProjectBrowserTransport {
         AtlasProjectBrowserTransport(create: { [self] in locked { let id = nextOwner; nextOwner += 1; return id } },
@@ -461,7 +478,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
             verifiedDocumentLink: { [self] owner, origin, destination, generation, link, bytes in
                 verifiedLink(owner: owner, origin: origin, destination: destination,
                     generation: generation, link: link, bytes: bytes)
-            })
+            }, openWithPolicy: policyOpen)
     }
     /// Inject the distinct service verification receipt. Source-byte comparison
     /// and root confinement belong to the real Rust service tests; native tests
@@ -551,6 +568,8 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         try await retainedLabelsAndNonUTF8PathsStayImageInert()
         try boundedWireAndCoverage()
         try repositoryRuleWireAndCoverage()
+        try includeExcludedPolicyWire()
+        try await discoveryPolicyTransactions()
         try await repositoryRuleFailuresKeepRowsAndDirtyHints()
         try await emptyPagesLostRepliesPauseAndEviction()
         try await exactRawFileCaptureAndForgedReceipts()
@@ -815,6 +834,88 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
                 _ = try AtlasProjectBrowserInfo.decode(complete.json(bad), owner: 40)
             }
         }
+    }
+    private static func includeExcludedPolicyWire() throws {
+        let fixture = ProjectBrowserFixture()
+        var value = fixture.page()
+        value["policy"] = AtlasDiscoveryPolicy.includeExcluded.wireName
+        value["rule_files_enabled"] = false; value["rule_policy"] = NSNull()
+        let page = try AtlasProjectBrowserPage.decode(fixture.json(value), owner: 40)
+        precondition(page.info.policy.evidence == nil && page.info.policy.summary.contains("Ignored and generated files included"))
+        for fault in ["missing-disabled", "enabled", "evidence"] {
+            var invalid = value
+            if fault == "missing-disabled" { invalid.removeValue(forKey: "rule_files_enabled") }
+            else if fault == "enabled" { invalid["rule_files_enabled"] = true }
+            else { invalid["rule_policy"] = ProjectBrowserFixture(repositoryRules: true).page()["rule_policy"] }
+            reject("invalid include-excluded browser policy: \(fault)") {
+                _ = try AtlasProjectBrowserPage.decode(fixture.json(invalid), owner: 40)
+            }
+        }
+    }
+    @MainActor private static func discoveryPolicyTransactions() async throws {
+        let fixture = ProjectBrowserFixture(policyAware: true)
+        let original = AtlasProjectBrowserModel(transport: fixture.transport)
+        try await original.open(root: "/repo", accessLease: nil)
+        precondition(original.discoveryPolicy == .repositoryRules && original.supportsDiscoveryPolicy)
+        let oldPage = original.page!
+        let capture = try await original.openFile(oldPage.files[0], from: oldPage, readerTransport: fixture.readerTransport)
+        let oldHex = capture.reader.page!.originalHex
+        let refresh = AtlasProjectRefresh(transport: fixture.transport), project = UUID()
+        var installed: AtlasProjectBrowserModel?
+        fixture.blockNext()
+        precondition(refresh.stage(root: "/repo", project: project, accessLease: nil,
+            discoveryPolicy: .includeExcluded, accepted: { candidate in
+                precondition(candidate.browser.discoveryPolicy == .includeExcluded
+                    && candidate.browser.info?.policy.name == AtlasDiscoveryPolicy.includeExcluded.wireName
+                    && original.canOperate && original.currentPage)
+                installed = candidate.browser; original.close(); return true
+            }, failed: { _ in preconditionFailure("Policy candidate failed") }) != nil)
+        await wait("policy candidate did not enter") { fixture.entered.wait(timeout: .now()) == .success }
+        precondition(installed == nil && original.discoveryPolicy == .repositoryRules
+            && original.currentPage && capture.reader.page?.originalHex == oldHex)
+        fixture.resume.signal()
+        await wait("policy candidate did not publish") { !refresh.isRefreshing }
+        let included = installed!
+        precondition(original.closed && included.canOperate && fixture.calls.contains("policy:41:1")
+            && capture.reader.page?.originalHex == oldHex && capture.reader.canPin)
+
+        // A lost/corrupt response must not recover into a narrower policy.
+        fixture.overridePolicy(.repositoryRules)
+        included.reload(); await wait("mismatched recovery did not finish") { !included.busy }
+        precondition(!included.currentPage && !included.canOperate && included.discoveryPolicy == .includeExcluded)
+        fixture.overridePolicy(nil)
+        included.reload(); await wait("same-policy recovery did not finish") { !included.busy }
+        precondition(included.currentPage && included.canOperate
+            && included.info?.policy.name == AtlasDiscoveryPolicy.includeExcluded.wireName)
+
+        // Failed replacement leaves the accepted policy and captured readers.
+        fixture.overridePolicy(.repositoryRules)
+        var failed = false
+        let acceptedPage = included.page!
+        precondition(refresh.stage(root: "/repo", project: UUID(), accessLease: nil,
+            discoveryPolicy: included.discoveryPolicy, accepted: { _ in
+                preconditionFailure("Narrower refresh was accepted")
+            }, failed: { _ in failed = true }) != nil)
+        await wait("failed policy candidate did not drain") { !refresh.isRefreshing }
+        precondition(failed && included.canOperate && included.page?.info.owner == acceptedPage.info.owner
+            && included.discoveryPolicy == .includeExcluded && capture.reader.page?.originalHex == oldHex)
+        fixture.overridePolicy(nil)
+        var refreshed: AtlasProjectBrowserModel?
+        precondition(refresh.stage(root: "/repo", project: UUID(), accessLease: nil,
+            discoveryPolicy: included.discoveryPolicy, accepted: { candidate in
+                refreshed = candidate.browser; included.close(); return true
+            }, failed: { _ in preconditionFailure("Accepted policy was lost on refresh") }) != nil)
+        await wait("included refresh did not finish") { !refresh.isRefreshing }
+        precondition(refreshed?.discoveryPolicy == .includeExcluded && fixture.calls.contains("policy:43:1"))
+        refresh.close(); refreshed?.close(); capture.reader.close()
+
+        let legacyFixture = ProjectBrowserFixture()
+        let legacy = AtlasProjectBrowserModel(transport: legacyFixture.transport)
+        await refuse("Legacy transport silently ignored opt-in") {
+            try await legacy.open(root: "/repo", accessLease: nil, discoveryPolicy: .includeExcluded)
+        }
+        precondition(legacyFixture.calls.isEmpty && legacy.root.isEmpty && !legacy.supportsDiscoveryPolicy)
+        legacy.close()
     }
     @MainActor private static func repositoryRuleFailuresKeepRowsAndDirtyHints() async throws {
         for failure in ["RULE_UNSUPPORTED_PATTERN", "RULE_READ_FAILED"] {

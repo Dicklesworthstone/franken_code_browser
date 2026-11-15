@@ -5,6 +5,7 @@ import Foundation
 @_silgen_name("catalog_stream_fixture_expected") private func expected(_ query: UnsafePointer<CChar>?,
     _ mode: UInt64, _ sensitive: UInt64, _ counted: UInt64, _ start: UInt64, _ scope: UInt64)
 @_silgen_name("catalog_stream_fixture_mode") private func mode(_ value: Int32)
+@_silgen_name("catalog_stream_fixture_policy") private func expectedPolicy(_ value: UInt64)
 @_silgen_name("catalog_stream_fixture_count") private func count(_ kind: UInt32) -> UInt32
 @_silgen_name("catalog_stream_fixture_allocations") private func allocations() -> UInt32
 @_silgen_name("catalog_stream_fixture_frees") private func frees() -> UInt32
@@ -65,6 +66,7 @@ private final class CatalogProgressCopies: @unchecked Sendable {
         return value
     }
     static func configure(_ request: AtlasWorkspaceStreamRequest, scope: UInt64 = 0) {
+        expectedPolicy(request.discoveryPolicy.rawValue)
         request.needle.withCString { expected($0, request.mode == .text ? 0 : request.mode == .occurrences ? 1 : 2,
             request.caseSensitive ? 1 : 0, request.countAllMatches ? 1 : 0, request.pageStartAfter, scope) }
     }
@@ -91,6 +93,48 @@ private final class CatalogProgressCopies: @unchecked Sendable {
             report: report, root: root, target: report.target(for: report.hits[1]))
         precondition(witness.text == needle && allocations() == frees())
         precondition(count(0) == 1 && count(1) == 1 && count(2) == 1 && count(3) == 1)
+
+        // The final ABI argument carries the explicit policy. Every progress,
+        // terminal and retained-hit receipt must agree with the immutable input.
+        let included = try AtlasWorkspaceStreamRequest(needle: needle, maximumScanBytes: 1 << 32,
+            discoveryPolicy: .includeExcluded)
+        configure(included)
+        for (kind, command, terminal) in [(UInt32(0), "info", false), (1, "advance", true),
+            (2, "page", true), (3, "hit", true), (4, "stop", true)] {
+            var value = fixture(command, terminal: terminal)
+            value["discovery_policy"] = included.discoveryPolicy.wireName
+            value["rule_files_enabled"] = false; value["rule_policy"] = NSNull()
+            try json(value).withCString { receipt(kind, $0) }
+        }
+        let broadCopies = CatalogProgressCopies()
+        let broadResult = try catalogSearch.search(owner, root, generation, included,
+            AtlasSearchCancellation(), AtlasWorkspaceStreamStop()) { broadCopies.append($0) }
+        let broadProgress = try AtlasWorkspaceStreamProgress.decode(broadCopies.values.first!, catalog: catalog, request: included)
+        let broadPage = try AtlasWorkspaceStreamPage.decode(broadResult, catalog: catalog, root: root,
+            request: included, requireTerminal: true)
+        try broadProgress.validateTerminal(broadPage)
+        let broadReport = try AtlasWorkspaceStreamReport(summary: broadPage.summary, hits: broadPage.hits)
+        let broadTarget = broadReport.target(for: broadReport.hits[1])
+        _ = try AtlasWorkspaceStreamWitness.decode(catalogSearch.hit(owner, generation, 2, 1),
+            report: broadReport, root: root, target: broadTarget)
+        try json(fixture("hit", terminal: true)).withCString { receipt(3, $0) }
+        do {
+            _ = try AtlasWorkspaceStreamWitness.decode(catalogSearch.hit(owner, generation, 2, 1),
+                report: broadReport, root: root, target: broadTarget)
+            preconditionFailure("Retained hit silently changed discovery policy")
+        } catch AtlasWorkspaceStreamError.invalidResponse { }
+        try json(fixture("advance", terminal: true)).withCString { receipt(1, $0) }
+        do {
+            _ = try catalogSearch.search(owner, root, generation, included,
+                AtlasSearchCancellation(), AtlasWorkspaceStreamStop()) { _ in }
+            preconditionFailure("Progress silently narrowed discovery policy")
+        } catch AtlasWorkspaceStreamError.invalidResponse { }
+        for (kind, command, terminal) in [(UInt32(0), "info", false), (1, "advance", true),
+            (2, "page", true), (3, "hit", true), (4, "stop", true)] {
+            try json(fixture(command, terminal: terminal)).withCString { receipt(kind, $0) }
+        }
+        configure(request)
+        precondition(allocations() == frees())
 
         // Opening an empty root can be terminal immediately. Do not advance
         // that cursor or invent progress to manufacture a later revision.

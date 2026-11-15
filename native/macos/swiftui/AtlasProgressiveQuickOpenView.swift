@@ -44,6 +44,13 @@ import SwiftUI
                 Spacer()
                 Text("Workspace filenames").font(.caption).foregroundStyle(.secondary)
             }
+            if model.supportsDiscoveryPolicy {
+                Toggle("Include ignored files", isOn: Binding(
+                    get: { model.discoveryPolicy.includesExcluded },
+                    set: { model.discoveryPolicy = $0 ? .includeExcluded : .repositoryRules }))
+                    .toggleStyle(.checkbox)
+                    .help("Search filenames in ignored and generated directories as well. This starts a new filename search; the atlas and other search scopes are unchanged.")
+            }
             if let report = model.report, model.isCurrent {
                 List(selection: $model.selected) {
                     ForEach(report.rows) { row in

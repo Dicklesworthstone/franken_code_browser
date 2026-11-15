@@ -2,6 +2,8 @@ import Foundation
 
 @_silgen_name("fcb_catalog_create") private func catalogCreate() -> UInt64
 @_silgen_name("fcb_catalog_open") private func catalogOpen(_ handle: UInt64, _ root: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_catalog_open_with_policy") private func catalogOpenWithPolicy(_ handle: UInt64,
+    _ root: UnsafePointer<CChar>?, _ policy: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_catalog_info") private func catalogInfo(_ handle: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_catalog_page") private func catalogPage(_ handle: UInt64, _ page: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_catalog_advance") private func catalogAdvance(_ handle: UInt64, _ page: UInt64) -> UnsafeMutablePointer<CChar>?
@@ -38,6 +40,9 @@ extension AtlasProjectBrowserTransport {
     }, readerDomain: AtlasReaderTransport.native.comparison?.domain,
     verifiedDocumentLink: { handle, origin, destination, generation, link, bytes in
         take(catalogVerifiedDocumentLink(handle, origin, destination, generation, link, bytes))
+    }, openWithPolicy: { handle, root, policy in
+        guard root.hasPrefix("/"), root.utf8.count <= 16_384, !root.utf8.contains(0) else { return nil }
+        return root.withCString { take(catalogOpenWithPolicy(handle, $0, policy.rawValue)) }
     })
 
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {

@@ -71,6 +71,7 @@ import Observation
     /// displayed project. Its cancellation token remains owned until it drains.
     @discardableResult
     func stage(root: String, project: UUID, accessLease: AnyObject?,
+               discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules,
                prepare: @escaping @MainActor (AtlasSearchCancellation) async throws -> Void = { _ in },
                accepted: @escaping @MainActor (Candidate) -> Bool,
                failed: @escaping @MainActor (UUID) -> Void) -> UUID? {
@@ -90,7 +91,7 @@ import Observation
             }
             do {
                 try Task.checkCancellation()
-                try await browser.open(root: root, accessLease: accessLease)
+                try await browser.open(root: root, accessLease: accessLease, discoveryPolicy: discoveryPolicy)
                 try Task.checkCancellation()
                 guard let self, self.attempt === request, !request.canceled,
                       !browser.closed, browser.currentPage, browser.info != nil,
