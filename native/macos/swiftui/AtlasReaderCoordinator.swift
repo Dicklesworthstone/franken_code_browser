@@ -86,51 +86,125 @@ private final class AtlasReaderAccessLease: @unchecked Sendable {
     init(_ reference: AnyObject?) { self.reference = reference }
 }
 
+/// A refused native close still owns its handle and access grant. Keep that
+/// ownership charged even if an injected transport does not enforce the native
+/// registry's eight-reader limit. Admission never waits for retirement.
+private final class AtlasReaderPermit: @unchecked Sendable {
+    private static let state = State()
+    private var acquired = false
+    private final class State: @unchecked Sendable {
+        let lock = NSLock()
+        var count = 0
+    }
+    init?() {
+        Self.state.lock.lock(); defer { Self.state.lock.unlock() }
+        guard Self.state.count < 8 else { return nil }
+        Self.state.count += 1
+        acquired = true
+    }
+    deinit {
+        guard acquired else { return }
+        Self.state.lock.lock(); defer { Self.state.lock.unlock() }
+        Self.state.count -= 1
+    }
+}
+
+/// Retain unsuccessful retirements for a later explicit opening/retirement
+/// attempt. There is no timer or unbounded retry loop, and grants are released
+/// only after the native owner confirms that the handle was closed.
+private final class AtlasReaderRetirement: @unchecked Sendable {
+    static let shared = AtlasReaderRetirement()
+    private let queue = DispatchQueue(label: "dev.frankencode.browser.reader-retirement", qos: .utility)
+    private let retryLock = NSLock()
+    private var retryScheduled = false
+    private var quarantine: [Record] = [] // Queue-owned; at most eight permits.
+
+    final class Record: @unchecked Sendable {
+        let handle: UInt64
+        let transport: AtlasReaderTransport
+        let access: AtlasReaderAccessLease
+        let permit: AtlasReaderPermit
+        init(handle: UInt64, transport: AtlasReaderTransport,
+             access: AtlasReaderAccessLease, permit: AtlasReaderPermit) {
+            self.handle = handle; self.transport = transport
+            self.access = access; self.permit = permit
+        }
+        func close() -> Bool {
+            withExtendedLifetime(access) {
+                for attempt in 0..<8 {
+                    if transport.close(handle) { return true }
+                    if attempt < 7 { Thread.sleep(forTimeInterval: 0.001) }
+                }
+                transport.retirementFailed()
+                return false
+            }
+        }
+    }
+
+    func retire(_ record: Record) {
+        queue.async { [self, record] in
+            drain()
+            if !record.close() { quarantine.append(record) }
+        }
+    }
+
+    func retry() {
+        retryLock.lock()
+        guard !retryScheduled else { retryLock.unlock(); return }
+        retryScheduled = true
+        retryLock.unlock()
+        queue.async { [self] in
+            drain()
+            retryLock.lock(); retryScheduled = false; retryLock.unlock()
+        }
+    }
+
+    private func drain() {
+        let pending = quarantine
+        quarantine = []
+        for record in pending where !record.close() { quarantine.append(record) }
+    }
+}
+
 /// All fields are immutable; mutable Rust state is protected by its registry.
 /// Foreign calls retain this object until return. Its last Swift owner queues
 /// retirement rather than deallocating a large Rust capture on the main actor.
 private final class AtlasReaderSession: @unchecked Sendable {
-    private static let retirement = DispatchQueue(label: "dev.frankencode.browser.reader-retirement", qos: .utility)
     let handle: UInt64
     let transport: AtlasReaderTransport
     private let access: AtlasReaderAccessLease
+    private let permit: AtlasReaderPermit
 
     init(transport: AtlasReaderTransport, accessLease: AnyObject?) throws {
+        AtlasReaderRetirement.shared.retry()
+        guard let permit = AtlasReaderPermit() else { throw AtlasReaderError.unavailable }
         let handle = transport.create()
         guard handle != 0 else { throw AtlasReaderError.unavailable }
         self.handle = handle
         self.transport = transport
         access = AtlasReaderAccessLease(accessLease)
+        self.permit = permit
     }
 
     /// Share the native grant lifetime, not the source reader or mutable state.
     /// Rust shares immutable source backing and its reservation; each fork
     /// admits and retires its private reader state independently.
     init(transport: AtlasReaderTransport, sharingAccessFrom source: AtlasReaderSession) throws {
+        AtlasReaderRetirement.shared.retry()
+        guard let permit = AtlasReaderPermit() else { throw AtlasReaderError.unavailable }
         let handle = transport.create()
         guard handle != 0 else { throw AtlasReaderError.unavailable }
         self.handle = handle
         self.transport = transport
         access = source.access
+        self.permit = permit
     }
 
     func cancel() { _ = transport.cancel(handle) }
 
     deinit {
-        let handle = handle, transport = transport, access = access
-        Self.retirement.async {
-            withExtendedLifetime(access) {
-                // The registry uses try_lock and can briefly refuse a close.
-                // At most eight reader handles exist, so this retirement queue
-                // cannot retain an unbounded number of source captures. Retry
-                // contention for a bounded interval; never claim failed cleanup.
-                for attempt in 0..<8 {
-                    if transport.close(handle) { return }
-                    if attempt < 7 { Thread.sleep(forTimeInterval: 0.001) }
-                }
-                transport.retirementFailed()
-            }
-        }
+        AtlasReaderRetirement.shared.retire(.init(handle: handle, transport: transport,
+            access: access, permit: permit))
     }
 }
 

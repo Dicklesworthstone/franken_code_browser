@@ -49,6 +49,10 @@ private func highlight(_ runs: [(Int, Int, String)] = [], state: String = "highl
 }
 
 private final class Lease {}
+private final class WeakLease {
+    weak var value: Lease?
+    init(_ value: Lease) { self.value = value }
+}
 private final class Driver: @unchecked Sendable {
     private let lock = NSLock()
     private var next: UInt64 = 2
@@ -464,6 +468,99 @@ private final class Driver: @unchecked Sendable {
             wait("closed capture did not drain") { stopped && driver.snapshot.closed == 1 && weakLease == nil }
             check(!driver.snapshot.calls.contains("window:2:0"), "canceled open continued into source presentation")
             check(driver.snapshot.attempts == 3 && !driver.snapshot.closeOnMain, "close contention/lane handling")
+        }
+
+        // Exhausting one close pass is not terminal ownership. Preserve both
+        // the grant and native handle, then recover on an explicit later open.
+        do {
+            let driver = Driver(); driver.refuseClose(8)
+            let coordinator = AtlasReaderCoordinator(transport: driver.transport)
+            var lease: Lease? = Lease()
+            weak var weakLease = lease
+            var opened = false
+            Task { [access = lease] in
+                _ = try! await coordinator.open(input: input, accessLease: access)
+                opened = true
+            }
+            lease = nil
+            wait("quarantine source did not open") { opened }
+            coordinator.close()
+            wait("refused retirement was not reported") { driver.snapshot.failures == 1 }
+            check(driver.snapshot.closed == 0 && weakLease != nil,
+                  "failed native close released the source grant or claimed retirement")
+            check(driver.snapshot.attempts == 8 && !driver.snapshot.closeOnMain,
+                  "retirement must be one bounded off-main pass")
+
+            let replacement = AtlasReaderCoordinator(transport: driver.transport)
+            var recovered = false
+            Task { _ = try! await replacement.open(input: input); recovered = true }
+            wait("explicit open did not retry the quarantined native handle") {
+                recovered && driver.snapshot.closed == 1 && weakLease == nil
+            }
+            check(driver.snapshot.calls.filter { $0 == "close:2" }.count == 9,
+                  "successful quarantined close was repeated or the old handle was forgotten")
+            replacement.close()
+            wait("replacement reader did not retire") { driver.snapshot.closed == 2 }
+        }
+
+        // Failed close records consume the same finite admission as active
+        // readers. Repeated opens cannot manufacture an unbounded quarantine,
+        // even with an injected transport whose create never refuses.
+        do {
+            let driver = Driver(); driver.refuseClose(Int.max)
+            var coordinators: [AtlasReaderCoordinator] = []
+            var grants: [WeakLease] = []
+            for _ in 0..<8 {
+                let coordinator = AtlasReaderCoordinator(transport: driver.transport)
+                var lease: Lease? = Lease()
+                grants.append(WeakLease(lease!))
+                var opened = false
+                Task { [access = lease] in
+                    _ = try! await coordinator.open(input: input, accessLease: access)
+                    opened = true
+                }
+                lease = nil
+                wait("reader admission failed below the eight-owner limit") { opened }
+                coordinators.append(coordinator)
+            }
+            for coordinator in coordinators { coordinator.close() }
+            wait("failed readers did not reach quarantine") { driver.snapshot.failures >= 8 }
+            let retry = AtlasReaderCoordinator(transport: driver.transport)
+            var refused = 0
+            Task {
+                for _ in 0..<128 {
+                    do { _ = try await retry.open(input: input); fatalError("quarantine admission was bypassed") }
+                    catch AtlasReaderError.unavailable { refused += 1 }
+                    catch { fatalError("wrong retirement pressure result: \(error)") }
+                }
+            }
+            wait("bounded reader admission did not refuse repeated opens") { refused == 128 }
+            check(driver.snapshot.calls.filter { $0.hasPrefix("create:") }.count == 8
+                    && driver.snapshot.closed == 0 && grants.allSatisfy { $0.value != nil },
+                  "quarantine lost grants or admitted extra native owners")
+            check(!driver.snapshot.closeOnMain, "quarantine retry ran on the interaction thread")
+
+            driver.refuseClose(0)
+            var attempted = false, reopened = false
+            Task {
+                do { _ = try await retry.open(input: input); reopened = true }
+                catch AtlasReaderError.unavailable { } // Retry drain never blocks admission.
+                catch { fatalError("wrong quarantine recovery result: \(error)") }
+                attempted = true
+            }
+            wait("recovered native owners were not reclaimed") {
+                attempted && driver.snapshot.closed == 8 && grants.allSatisfy { $0.value == nil }
+            }
+            if !reopened {
+                Task { _ = try! await retry.open(input: input); reopened = true }
+                wait("reclaimed admission did not permit source reading") { reopened }
+            }
+            check(driver.snapshot.calls.filter { $0.hasPrefix("create:") }.count == 9,
+                  "recovery did not create exactly one replacement")
+            retry.close()
+            wait("post-quarantine replacement did not retire") { driver.snapshot.closed == 9 }
+            check(driver.snapshot.closed == driver.snapshot.calls.filter { $0.hasPrefix("create:") }.count,
+                  "reader creation and successful retirement did not conserve ownership")
         }
 
         // The actual observable presentation model commits history only after
