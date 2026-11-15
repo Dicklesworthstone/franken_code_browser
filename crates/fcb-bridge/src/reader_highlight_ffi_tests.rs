@@ -35,6 +35,11 @@ fn highlighted(page: &str, owner: u64) {
     assert!(page.contains("\"source_context\":\"complete-capture\""), "{page}");
 }
 
+fn utf16(text: &str, little: bool) -> Vec<u8> {
+    std::iter::once(0xfeff).chain(text.encode_utf16())
+        .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect()
+}
+
 #[test]
 fn late_page_inherits_comment_context_from_owned_complete_capture() {
     let _guard = FFI_TEST_LOCK.lock().unwrap();
@@ -68,15 +73,39 @@ fn bom_unicode_and_crlf_keep_window_coordinates_and_exact_copy() {
 }
 
 #[test]
+fn utf16_byte_orders_keep_complete_context_and_exact_bytes_across_the_c_handoff() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    for little in [true, false] {
+        let mut original = utf16("/* 🦀\r\ninside */\r\nfn actual() {}\r\n", little);
+        let hex: String = original.iter().map(|byte| format!("{byte:02x}")).collect();
+        let handle = supplied("utf16.rs", &original);
+        original.fill(b'x'); // Native caller storage is no longer the capture.
+        let page = take(fcb_reader_lines(handle, 2, 1, 1024));
+        highlighted(&page, handle);
+        assert!(page.contains(if little { "\"encoding\":\"utf16le\"" } else { "\"encoding\":\"utf16be\"" }), "{page}");
+        assert!(page.contains("inside */\\r\\n"), "{page}");
+        assert!(page.contains("\"start\":\"0\",\"length\":\"9\",\"role\":\"comment\""), "{page}");
+        let code = take(fcb_reader_lines(handle, 3, 1, 1024));
+        highlighted(&code, handle);
+        assert!(code.contains("\"start\":\"0\",\"length\":\"2\",\"role\":\"keyword\""), "{code}");
+        assert!(take(fcb_reader_copy_range(handle, 0, original.len() as u64))
+            .contains(&format!("\"original_hex\":\"{hex}\"")));
+        assert_eq!(fcb_reader_close(handle), 1);
+    }
+}
+
+#[test]
 fn unsupported_capture_decoding_remains_readable_and_copyable() {
     let _guard = FFI_TEST_LOCK.lock().unwrap();
-    let utf16: Vec<u8> = "\u{feff}fn main() {}\n".encode_utf16().flat_map(u16::to_le_bytes).collect();
-    for bytes in [utf16.as_slice(), b"fn main() {}\n\xff"] {
+    let mut little = utf16("fn main() {}\n", true); little.push(0);
+    let mut big = utf16("fn main() {}\n", false); big.push(0);
+    for bytes in [little.as_slice(), big.as_slice(), b"fn main() {}\n\xff"] {
         let handle = supplied("fallback.rs", bytes);
-        // A valid UTF-8 prefix cannot establish that the complete capture is
-        // lexically supported when malformed bytes occur after this page.
+        // A valid local page cannot establish that the complete capture is
+        // lexically supported when malformed bytes occur later in the source.
         let page = take(fcb_reader_window(handle, 0, 12));
         assert!(page.contains("\"status\":\"ok\""), "{page}");
+        assert!(page.contains("\"has_replacements\":false"), "{page}");
         assert!(page.contains("\"state\":\"unsupported_encoding\""), "{page}");
         assert!(page.contains("\"runs\":[]"), "{page}");
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();

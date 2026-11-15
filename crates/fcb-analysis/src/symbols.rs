@@ -8,12 +8,10 @@
 //! name ranges are validated against the decoded capture and mapped back to its
 //! original bytes. Markdown stays with its upstream document owner.
 //!
-//! Worker work is bounded before invoking the non-resumable legacy extractor:
-//! 64 KiB original/decoded source, 4096 lines, at most 128 opening braces for
-//! Rust, and at most 128 bytes of Python indentation. These conservative guards
-//! bound recursive extraction/destruction without trusting legacy max_depth or
-//! max_items settings. Rejected files remain available to the ordinary reader.
-//! Swift, Java and C# use pinned upstream lexers and bounded declaration
+//! Worker work is bounded by 64 KiB original/decoded source and 4096 lines.
+//! Python also limits indentation to 128 bytes before invoking its recursive
+//! legacy extractor. Rejected files remain available to the ordinary reader.
+//! Rust, Swift, Java and C# use pinned upstream lexers and bounded declaration
 //! recognizers; they do not introduce lexers or compiler-semantic claims.
 
 use std::mem::size_of;
@@ -24,6 +22,7 @@ use crate::{ExtractorLimits, OutlineExtractor, OutlineItem, OutlineItemKind};
 
 mod swift;
 mod managed;
+mod rust;
 
 pub const MAX_SYMBOL_SOURCE_BYTES: usize = 64 * 1024;
 pub const MAX_SYMBOL_ITEMS: usize = 4096;
@@ -157,9 +156,6 @@ impl<'source> CapturedSymbols<'source> {
         if text.len() > MAX_SYMBOL_SOURCE_BYTES { return Err(SymbolError::SourceLimit); }
         let line_count = text.bytes().filter(|&b| b == b'\n').count() + 1;
         if line_count > MAX_LINES { return Err(SymbolError::ComplexityLimit); }
-        if language == SymbolLanguage::Rust && text.bytes().filter(|&b| b == b'{').count() > MAX_RECURSIVE_SCOPES {
-            return Err(SymbolError::ComplexityLimit);
-        }
         if language == SymbolLanguage::Python && text.lines().any(|line| line.len() - line.trim_start().len() > MAX_RECURSIVE_SCOPES) {
             return Err(SymbolError::ComplexityLimit);
         }
@@ -169,7 +165,9 @@ impl<'source> CapturedSymbols<'source> {
         line_starts.push(0);
         line_starts.extend(text.bytes().enumerate().filter_map(|(i, b)| (b == b'\n').then_some(i + 1)));
         if canceled() { return Err(SymbolError::Canceled); }
-        let (candidates, limited) = if language == SymbolLanguage::Swift {
+        let (candidates, limited) = if language == SymbolLanguage::Rust {
+            rust::extract(&map, &line_starts, max_items, &mut canceled)?
+        } else if language == SymbolLanguage::Swift {
             swift::extract(&map, &line_starts, max_items, &mut canceled)?
         } else if matches!(language, SymbolLanguage::Java | SymbolLanguage::CSharp) {
             managed::extract(&map, language, &line_starts, max_items, &mut canceled)?
