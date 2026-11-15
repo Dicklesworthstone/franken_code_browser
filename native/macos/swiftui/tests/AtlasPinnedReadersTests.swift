@@ -115,11 +115,24 @@ import Foundation
             store.pin(source, root: "/repo", label: "canceled")
             await wait { f.waiting.count == 1 }
             store.cancelPin()
-            check(!store.busy && store.selectedID == kept.id, "Cancel is immediate and preserves accepted pins")
+            check(store.busy && !store.canAdd && store.selectedID == kept.id,
+                "Cancel revokes publication immediately but retains the entered fork's admission slot")
+            for _ in 0..<128 {
+                store.cancelPin()
+                store.pin(source, root: "/repo", label: "retry while draining")
+                await Task.yield()
+            }
+            check(f.calls == 3 && f.waiting.count == 1 && store.busy,
+                "Repeated cancellation and retry cannot accumulate foreign forks")
             f.complete()
-            await wait { f.children.last?.closes == 1 }
-            check(store.entries.count == 1 && kept.reader.closes == 0,
+            await wait { !store.busy && f.children.last?.closes == 1 }
+            check(store.entries.count == 1 && kept.reader.closes == 0 && store.canAdd,
                 "A successful late foreign reply is retired, never published after cancellation")
+            store.pin(source, root: "/repo", label: "after drain")
+            await wait { f.waiting.count == 1 }; f.complete(); await wait { !store.busy }
+            check(store.entries.count == 2 && store.selected?.label == "after drain"
+                && f.children.last?.closes == 0 && kept.reader.closes == 0,
+                "A new pin succeeds after the canceled operation has drained")
             store.closeAll()
         }
         do {
@@ -134,16 +147,55 @@ import Foundation
             await wait { f.waiting.count == 1 }
             store.bind(root: decomposed)
             store.pin(source, root: decomposed, label: "new root")
-            await wait { f.waiting.count == 2 }
+            for index in 0..<128 {
+                let root = index.isMultiple(of: 2) ? composed : decomposed
+                store.bind(root: root)
+                store.pin(source, root: root, label: "changed root")
+                await Task.yield()
+            }
+            store.bind(root: decomposed)
+            check(f.calls == 1 && f.waiting.count == 1 && store.busy && !store.canAdd,
+                "Rapid root changes retain only the original draining fork and do not widen admission")
             f.complete()
-            await wait { f.children.first?.closes == 1 }
-            check(store.busy && store.entries.isEmpty, "Old root's reply cannot clear a newer pending pin")
+            await wait { !store.busy && f.children.first?.closes == 1 }
+            check(store.entries.isEmpty && store.canAdd,
+                "Old root's terminal reply releases admission without publishing a pin in the new root")
+            store.pin(source, root: decomposed, label: "new root")
+            await wait { f.waiting.count == 1 }
             f.complete(); await wait { !store.busy }
             check(store.selected?.label == "new root" && f.children.last?.closes == 0,
                 "Only the new root's independently admitted reader is published")
             store.bind(root: "")
             check(store.entries.isEmpty && !store.canAdd && f.children.last?.closes == 1,
                 "Revoking the root closes accepted pins and stops admission")
+        }
+        do {
+            let f = PinFixture(), store = f.makeStore(), source = PinnedTestReader([4])
+            store.bind(root: "/repo")
+            store.pin(source, root: "/repo", label: "canceled before entry")
+            store.cancelPin()
+            check(store.busy && !store.canAdd, "A queued canceled task still owns its single admission slot")
+            await wait { !store.busy }
+            check(f.calls == 0 && f.waiting.isEmpty && f.children.isEmpty && store.canAdd,
+                "Cancellation before task entry performs no foreign fork and restores admission")
+            store.pin(source, root: "/repo", label: "late failure")
+            await wait { f.waiting.count == 1 }
+            store.cancelPin()
+            store.bind(root: "")
+            store.bind(root: "/replacement")
+            store.pin(source, root: "/replacement", label: "blocked replacement")
+            await Task.yield()
+            check(f.calls == 1 && store.busy && !store.canAdd,
+                "Revoking and restoring a root cannot admit a second fork before an entered failure")
+            f.complete(fail: true)
+            await wait { !store.busy }
+            check(store.entries.isEmpty && f.children.isEmpty && store.canAdd && source.closes == 0,
+                "A canceled terminal failure releases admission without retiring or publishing the source")
+            store.pin(source, root: "/replacement", label: "after failure")
+            await wait { f.waiting.count == 1 }; f.complete(); await wait { !store.busy }
+            check(store.selected?.label == "after failure" && f.children.last?.closes == 0,
+                "The replacement root can pin successfully after the canceled failure drains")
+            store.closeAll()
         }
         do {
             let f = PinFixture(), source = PinnedTestReader([1])

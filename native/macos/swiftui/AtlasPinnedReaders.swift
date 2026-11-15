@@ -11,6 +11,12 @@ import Observation
         let reader: Reader
     }
 
+    /// Publication can be revoked before a foreign fork returns. The attempt
+    /// keeps its admission slot until that return, including across root changes.
+    private final class Attempt {
+        var canceled = false
+    }
+
     // Leave room in the eight-handle Rust registry for the current reader,
     // replacement proposals and foreign operations that are still draining.
     static var maximumPins: Int { 2 }
@@ -19,7 +25,7 @@ import Observation
     private(set) var busy = false
     private(set) var notice = ""
     @ObservationIgnored private var root: String?
-    @ObservationIgnored private var operation = UUID()
+    @ObservationIgnored private var attempt: Attempt?
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private let canFork: @MainActor (Reader) -> Bool
     @ObservationIgnored private let fork: @MainActor (Reader) async throws -> Reader
@@ -67,15 +73,19 @@ import Observation
             notice = "Wait for the retained reader to finish, then pin its source."
             return
         }
-        let ticket = UUID()
-        operation = ticket
+        let request = Attempt()
+        attempt = request
         busy = true
         notice = "Pinning the retained source…"
         let fork = fork, retire = retire
         task = Task { [weak self] in
+            defer { self?.finish(request) }
             do {
+                // Cancellation before the task enters must not allocate a
+                // destination reader just to retire it on the next turn.
+                try Task.checkCancellation()
                 let child = try await fork(reader)
-                guard let self, self.operation == ticket, !Task.isCancelled,
+                guard let self, self.attempt === request, !request.canceled, !Task.isCancelled,
                       self.root?.utf8.elementsEqual(expectedRoot.utf8) == true,
                       self.entries.count < Self.maximumPins else {
                     retire(child)
@@ -84,13 +94,9 @@ import Observation
                 let entry = Entry(id: UUID(), label: label, reader: child)
                 self.entries.append(entry)
                 self.selectedID = entry.id
-                self.busy = false
-                self.task = nil
                 self.notice = "Pinned source stays available while you open other files."
             } catch {
-                guard let self, self.operation == ticket, !Task.isCancelled else { return }
-                self.busy = false
-                self.task = nil
+                guard let self, self.attempt === request, !request.canceled, !Task.isCancelled else { return }
                 self.notice = self.failureMessage(error)
             }
         }
@@ -110,11 +116,20 @@ import Observation
     }
 
     func cancelPin() {
-        operation = UUID()
+        guard let attempt, !attempt.canceled else { return }
+        attempt.canceled = true
         task?.cancel()
+        // An entered fork may ignore cancellation until its native request
+        // drains. Keeping this slot prevents repeated cancel/rebind actions
+        // from accumulating source captures, native grants and reader handles.
+        notice = "Pinning canceled. Existing readers are unchanged."
+    }
+
+    private func finish(_ request: Attempt) {
+        guard attempt === request else { return }
+        attempt = nil
         task = nil
         busy = false
-        notice = "Pinning canceled. Existing readers are unchanged."
     }
 
     func closeAll() {
