@@ -279,3 +279,50 @@ fn malformed_swift_outline_refusal_preserves_source_reading() {
     assert!(r.copy_range(0, source.len() as u64, || false).is_ok());
     assert_eq!(r.outline_generation(), None);
 }
+
+#[test]
+fn javascript_family_methods_use_exact_retained_names_and_the_correct_markup_language() {
+    for (extension, language) in [("js", "javascript"), ("ts", "typescript"), ("jsx", "jsx"), ("tsx", "tsx")] {
+        let body = if extension.ends_with('x') { "return <div>function Fake()</div>;" } else { "return this;" };
+        let source = format!("/* function open() {{}} */\nclass Browser {{\n    open(\n        value\n    ) {{ {body} }}\n}}\n");
+        let filename = format!("Browser.{extension}");
+        let mut reader = ReaderSession::from_bytes(ArenaOwnerId::new(9307).unwrap(), Path::new(&filename),
+            source.as_bytes(), || false).unwrap();
+        let address = reader.capture().bytes().as_ptr();
+        let response = reader.prepare_outline(1, Default::default(), || false).unwrap();
+        assert_eq!(response.exit_code(), EXIT_OK);
+        assert!(response.as_str().contains(&format!("\"language\":\"{language}\"")));
+        assert!(response.as_str().contains("\"retained_symbols\":\"2\""));
+        assert!(response.as_str().contains("\"semantic_complete\":false"));
+        let target = id(&mut reader, 1, "open");
+        assert_eq!(bytes(&reader, reader.symbol_range(1, target, false).unwrap()), b"open");
+        let window = reader.symbol_window(1, target, 128, || false).unwrap();
+        assert!(window.as_str().contains("\"selection_namespace\":\"outline\""));
+        assert!(window.as_str().contains("\"declaration_line\":\"3\""));
+        let copy = reader.copy_symbol(1, target, false, || false).unwrap();
+        assert!(copy.as_str().contains("\"original_hex\":\"6f70656e\""));
+        assert!(copy.as_str().contains("\"additional_source_bytes_read\":\"0\""));
+        assert_eq!(reader.capture().bytes().as_ptr(), address);
+    }
+}
+
+#[test]
+fn typescript_utf16_method_activation_copies_original_units_from_the_retained_capture() {
+    for little in [false, true] {
+        let encode = |s: &str| -> Vec<u8> {
+            s.encode_utf16().flat_map(|u| if little { u.to_le_bytes() } else { u.to_be_bytes() }).collect()
+        };
+        let source = encode("\u{feff}// 😀\r\nclass Browser {\r\n    open(): string { return \"ok\"; }\r\n}\r\n");
+        let mut reader = ReaderSession::from_bytes(ArenaOwnerId::new(9308).unwrap(), Path::new("Browser.ts"),
+            &source, || false).unwrap();
+        prepare(&mut reader, 1);
+        let target = id(&mut reader, 1, "open");
+        let expected = encode("open");
+        assert_eq!(bytes(&reader, reader.symbol_range(1, target, false).unwrap()), expected);
+        let selected = reader.symbol_window(1, target, 0, || false).unwrap();
+        assert!(selected.as_str().contains("\"declaration_line\":\"3\""));
+        assert!(selected.as_str().contains(&format!("\"original_hex\":\"{}\"", hex(&expected))));
+        assert!(reader.copy_symbol(1, target, false, || false).unwrap().as_str()
+            .contains(&format!("\"original_hex\":\"{}\"", hex(&expected))));
+    }
+}

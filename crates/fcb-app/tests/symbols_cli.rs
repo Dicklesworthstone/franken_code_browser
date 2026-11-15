@@ -331,3 +331,65 @@ fn java_prelexical_escape_refusal_cannot_be_reported_as_complete_no_match() {
     assert!(output.get("candidates").array().is_empty());
     assert_eq!(output.get("stats").get("refused_files").number(), 1);
 }
+
+#[test]
+fn javascript_family_file_and_explicit_language_routes_select_multiline_method_names() {
+    for (extension, language) in [("js", "javascript"), ("ts", "typescript"), ("jsx", "jsx"), ("tsx", "tsx")] {
+        let fixture = Fixture::new();
+        let body = if extension.ends_with('x') { "return <div>function Fake()</div>;" } else { "return this;" };
+        let source = format!("/* function open() {{}} */\nclass Browser {{\n    open(\n        value\n    ) {{ {body} }}\n}}\n");
+        let filename = format!("Browser.{extension}");
+        fixture.file(&filename, source.as_bytes());
+        fixture.file("capture.txt", source.as_bytes());
+        for (path, explicit) in [(filename.as_str(), false), ("capture.txt", true)] {
+            let mut args = fixture.file_args(path); values(&mut args, &["--name", "open"]);
+            if explicit { values(&mut args, &["--language", language]); }
+            let (exit, output) = invoke(&args, || false);
+            assert_eq!(exit, EXIT_OK);
+            assert!(!output.get("compiler_resolved").flag());
+            assert!(!output.get("symbol_inventory_complete").flag());
+            let candidates = output.get("candidates").array();
+            assert_eq!(candidates.len(), 1);
+            let candidate = &candidates[0];
+            assert_eq!(candidate.get("language").text(), language);
+            assert_eq!(candidate.get("kind").text(), "method");
+            assert_eq!(candidate.get("line").number(), 3);
+            let range = candidate.get("name_range");
+            assert_eq!(&source.as_bytes()[range.get("start").number() as usize..range.get("end").number() as usize], b"open");
+            assert_eq!(output.get("stats").get("unsupported_language_files").number(), 0);
+        }
+    }
+}
+
+#[test]
+fn javascript_family_live_and_offline_symbols_share_qualified_original_name_evidence() {
+    let fixture = Fixture::new();
+    fixture.file("module.MJS", b"/* function open() {} */\nexport const open = (\nvalue\n) => value;\n");
+    fixture.file("View.JSX", b"class View { open() { return <div>function Fake()</div>; } }\n");
+    let typed = utf16("// \u{1f600}\r\ninterface Port { open(value: string): string; }\r\n", false);
+    fixture.file("Port.MTS", &typed);
+    fixture.file("View.TSX", b"function open() { return <div title=\"function Fake() {}\" />; }\n");
+    let mut live = fixture.workspace_args(); values(&mut live, &["--name", "open"]);
+    let (exit, output) = invoke(&live, || false);
+    assert_eq!(exit, EXIT_OK);
+    assert_eq!(output.get("candidates").array().len(), 4);
+    assert_eq!(output.get("stats").get("analyzed_files").number(), 4);
+    fixture.save();
+    fs::rename(fixture.root(), fixture.0.join("retired-js-root")).unwrap();
+    let mut saved = fixture.saved_args(); values(&mut saved, &["--name", "open"]);
+    let (exit, output) = invoke(&saved, || false);
+    assert_eq!(exit, EXIT_OK);
+    assert!(!output.get("live_roots_accessed").flag());
+    assert!(!output.get("compiler_resolved").flag());
+    assert!(!output.get("symbol_inventory_complete").flag());
+    let candidates = output.get("candidates").array();
+    assert_eq!(candidates.len(), 4);
+    for language in ["javascript", "typescript", "jsx", "tsx"] {
+        assert_eq!(candidates.iter().filter(|c| c.get("language").text() == language).count(), 1);
+    }
+    let candidate = candidates.iter().find(|c| c.get("language").text() == "typescript").unwrap();
+    let range = candidate.get("name_range");
+    let expected: Vec<_> = "open".encode_utf16().flat_map(u16::to_be_bytes).collect();
+    assert_eq!(&typed[range.get("start").number() as usize..range.get("end").number() as usize], expected);
+    assert_eq!(output.get("stats").get("unsupported_language_files").number(), 0);
+}

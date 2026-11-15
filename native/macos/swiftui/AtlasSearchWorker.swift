@@ -567,7 +567,7 @@ private struct SearchStream {
                         || end - start == UInt64(query.utf16.count * 2) else { throw invalid() }
             } else {
                 guard value.heading_slug == nil,
-                      ["rust", "python", "javascript", "typescript", "go", "cpp", "swift", "java", "csharp"].contains(value.language) else { throw invalid() }
+                      ["rust", "python", "javascript", "typescript", "jsx", "tsx", "go", "cpp", "swift", "java", "csharp"].contains(value.language) else { throw invalid() }
             }
             structure = AtlasSearchStructure(name: value.name, kind: value.kind, language: value.language,
                 evidence: value.evidence_level, candidate: candidate, headingSlug: value.heading_slug,

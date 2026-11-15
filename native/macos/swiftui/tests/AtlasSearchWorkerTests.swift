@@ -257,6 +257,23 @@ private func closeRetainedReader(_ handle: UInt64) -> UInt8
                 && result.capture?.target(hit)?.mode == .symbols,
                 "Managed declaration activation must retain exact original-name bytes")
         }
+        for (extensionName, language) in [("js", "javascript"), ("ts", "typescript"), ("jsx", "jsx"), ("tsx", "tsx")] {
+            let body = extensionName.hasSuffix("x") ? "return <div>function Fake()</div>;" : "return this;"
+            let source = "/* function open() {} */\nclass Browser {\n    open(\n        value\n    ) { \(body) }\n}\n"
+            try Data(source.utf8).write(to: structureRoot.appendingPathComponent("Browser." + extensionName))
+            let languageOnly = try AtlasSearchFileScope(extensions: [extensionName])
+            let result = try execute(AtlasSearchInput(root: root.path, query: "open", fileScope: languageOnly,
+                pathScope: structureScope, mode: .symbols, nameMode: .exact))
+            precondition(result.complete && result.hits.count == 1 && result.unsupportedFiles == 0,
+                "JS/TS multiline methods must reach the production shared declaration engine")
+            let hit = result.hits[0]
+            precondition(hit.structure?.language == language && hit.structure?.kind == "method"
+                && hit.structure?.evidence == "heuristic-outline-candidate",
+                "JSX/TSX must retain their distinct upstream language at native wire admission")
+            precondition(Array(source.utf8)[Int(hit.start)..<Int(hit.end)].elementsEqual("open".utf8)
+                && result.capture?.target(hit)?.mode == .symbols,
+                "JS/TS declaration activation must select exact names, not enclosing lines")
+        }
         let markdownOnly = try AtlasSearchFileScope(extensions: ["md"])
         let headingInput = try AtlasSearchInput(root: root.path, query: "Deploy!", fileScope: markdownOnly,
             pathScope: structureScope, mode: .headings, nameMode: .exact)

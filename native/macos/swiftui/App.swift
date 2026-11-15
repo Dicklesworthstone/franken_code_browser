@@ -1886,6 +1886,11 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         accessLease = nil
 #endif
         cancelSourceLoad()
+        // Keep explicit range-reading recovery available when the first file
+        // cannot be captured completely. Never relabel an accepted reader.
+        if readerHistory.current == nil, selectedSource == nil {
+            selectedPath = path
+        }
         if captured == nil { selectedHit = nil }
         readerHistory.open(root: root, path: path, accessLease: accessLease, initialLine: initialLine) {
             AtlasPagedReaderModel(transport: .native, search: .native, outline: .native,

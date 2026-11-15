@@ -194,11 +194,11 @@ private final class Driver: @unchecked Sendable {
         let swiftOutline = try decode(Fixture.outline(language: "swift"))
         check(swiftOutline.inventory.language == "swift" && swiftOutline.rows.count == 2,
             "Swift result rejected by native outline decoder")
-        for language in [AtlasOutlineLanguage.java, .csharp] {
-            check(language.engineName == language.rawValue, "Managed language request lost its shared engine name")
+        for language in [AtlasOutlineLanguage.java, .csharp, .javascript, .typescript, .jsx, .tsx] {
+            check(language.engineName == language.rawValue, "Language request lost its distinct shared lexer name")
             let managed = try decode(Fixture.outline(language: language.rawValue))
             check(managed.inventory.language == language.rawValue && managed.rows.count == 2,
-                "Java/C# results rejected by strict native outline admission")
+                "Supported declaration language rejected by strict native outline admission")
         }
         rejects("Unknown languages must remain unsupported") { _ = try decode(Fixture.outline(language: "kotlin")) }
         check(outline.target(id: 0) == nil && outline.target(id: 3) == nil, "row offset used as symbol ID")

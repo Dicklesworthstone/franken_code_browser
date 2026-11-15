@@ -195,6 +195,15 @@ impl<'source> CapturedImports<'source> {
         self.source.get(start..end).ok_or(ImportError::InvalidEvidence)
     }
 }
+/// Shared source-specific guard for consumers of the pinned JS-family lexer.
+/// Terminal normalization and regex/control/ASI policy stay identical to the
+/// import route; callers still own their source/working-set admission.
+pub(crate) fn validate_javascript_context(text: &str, spans: &[Span],
+    canceled: &mut impl FnMut() -> bool) -> Result<(), ImportError> {
+    let tokens = terminals(text, spans, canceled)?;
+    javascript::check_context(text, &tokens, canceled)
+}
+
 #[derive(Clone, Copy)]
 struct Terminal { start: usize, end: usize, kind: Tok }
 impl Terminal {

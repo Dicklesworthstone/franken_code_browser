@@ -155,7 +155,7 @@ import Dispatch
                 "Heading qualification failure preserves admitted work without claiming accepted extraction")
         }
         // Wire admission only; Rust public-route cases own declaration extraction.
-        for language in ["java", "csharp", "kotlin"] {
+        for language in ["java", "csharp", "javascript", "typescript", "jsx", "tsx", "kotlin"] {
             let f = IndexedFixture()
             f.patch { phase, original in
                 var value = original
@@ -175,9 +175,9 @@ import Dispatch
             } else {
                 let report = try search(AtlasIndexedSearch(transport: f.structuralTransport), .symbols)
                 check(report.hits.count == 2 && report.hits.allSatisfy { $0.structure?.language == language },
-                    "Java/C# structural metadata was refused by captured search")
+                    "Supported structural language metadata was refused by captured search")
                 check(report.capture?.target(report.hits[0])?.mode == .symbols,
-                    "Managed-language declaration lost captured activation authority")
+                    "Declaration language lost captured activation authority")
             }
         }
         for defect in ["strategy", "io", "mode", "semantic", "name-policy", "range", "candidate", "missing-evidence", "repeated-evidence"] {

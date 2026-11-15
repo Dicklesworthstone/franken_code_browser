@@ -11,7 +11,8 @@
 //! Worker work is bounded by 64 KiB original/decoded source and 4096 lines.
 //! Python also limits indentation to 128 bytes before invoking its recursive
 //! legacy extractor. Rejected files remain available to the ordinary reader.
-//! Rust, Swift, Java and C# use pinned upstream lexers and bounded declaration
+//! Rust, JavaScript/JSX, TypeScript/TSX, Swift, Java and C# use pinned upstream
+//! lexers and bounded declaration
 //! recognizers; they do not introduce lexers or compiler-semantic claims.
 
 use std::mem::size_of;
@@ -23,6 +24,7 @@ use crate::{ExtractorLimits, OutlineExtractor, OutlineItem, OutlineItemKind};
 mod swift;
 mod managed;
 mod rust;
+mod javascript;
 
 pub const MAX_SYMBOL_SOURCE_BYTES: usize = 64 * 1024;
 pub const MAX_SYMBOL_ITEMS: usize = 4096;
@@ -30,18 +32,20 @@ const MAX_LINES: usize = 4096;
 const MAX_RECURSIVE_SCOPES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SymbolLanguage { Rust, Python, JavaScript, TypeScript, Go, Cpp, Swift, Java, CSharp }
+pub enum SymbolLanguage { Rust, Python, JavaScript, TypeScript, Jsx, Tsx, Go, Cpp, Swift, Java, CSharp }
 impl SymbolLanguage {
     pub const fn name(self) -> &'static str {
         match self { Self::Rust => "rust", Self::Python => "python", Self::JavaScript => "javascript",
-            Self::TypeScript => "typescript", Self::Go => "go", Self::Cpp => "cpp", Self::Swift => "swift",
+            Self::TypeScript => "typescript", Self::Jsx => "jsx", Self::Tsx => "tsx",
+            Self::Go => "go", Self::Cpp => "cpp", Self::Swift => "swift",
             Self::Java => "java", Self::CSharp => "csharp" }
     }
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "rust" | "rs" => Some(Self::Rust), "python" | "py" => Some(Self::Python),
-            "javascript" | "js" | "jsx" | "mjs" | "cjs" => Some(Self::JavaScript),
-            "typescript" | "ts" | "tsx" => Some(Self::TypeScript), "go" => Some(Self::Go),
+            "javascript" | "js" | "mjs" | "cjs" => Some(Self::JavaScript),
+            "typescript" | "ts" | "mts" | "cts" => Some(Self::TypeScript),
+            "jsx" => Some(Self::Jsx), "tsx" => Some(Self::Tsx), "go" => Some(Self::Go),
             "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" => Some(Self::Cpp),
             "swift" => Some(Self::Swift), "java" => Some(Self::Java),
             "csharp" | "cs" | "c#" => Some(Self::CSharp), _ => None,
@@ -167,6 +171,8 @@ impl<'source> CapturedSymbols<'source> {
         if canceled() { return Err(SymbolError::Canceled); }
         let (candidates, limited) = if language == SymbolLanguage::Rust {
             rust::extract(&map, &line_starts, max_items, &mut canceled)?
+        } else if matches!(language, SymbolLanguage::JavaScript | SymbolLanguage::TypeScript | SymbolLanguage::Jsx | SymbolLanguage::Tsx) {
+            javascript::extract(&map, language, &line_starts, max_items, &mut canceled)?
         } else if language == SymbolLanguage::Swift {
             swift::extract(&map, &line_starts, max_items, &mut canceled)?
         } else if matches!(language, SymbolLanguage::Java | SymbolLanguage::CSharp) {
@@ -316,7 +322,8 @@ mod tests {
             let budget = budget(); let outline = build(source, language, 32, &budget);
             let candidate = outline.candidates().iter().find(|candidate| candidate.name() == name).unwrap();
             assert!(outline.source_bytes(candidate.id()).unwrap().windows(name.len()).any(|window| window == name.as_bytes()));
-            assert_eq!(candidate.name_range(), None);
+            if language == SymbolLanguage::Python { assert_eq!(candidate.name_range(), None); }
+            else { assert_eq!(outline.name_bytes(candidate.id()).unwrap().unwrap(), name.as_bytes()); }
         }
     }
     #[test]
