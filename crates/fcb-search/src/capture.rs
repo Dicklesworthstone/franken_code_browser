@@ -4,6 +4,7 @@
 
 use fcb_core::{ByteOffset, ByteRange, FileId, SourceRevision};
 
+use crate::expression::Predicates;
 use crate::stream::{ByteSearchCursor, StreamError, MAX_STREAM_BATCH_HITS, MAX_STREAM_STEP_BYTES};
 use crate::{QueryError, QueryOptions, SearchCoverage, SearchMatch, SearchResult};
 
@@ -31,7 +32,7 @@ pub(crate) fn scan_raw_chunks<'a>(
     options: &QueryOptions,
     canceled: impl FnMut() -> bool,
 ) -> Result<SearchResult, QueryError> {
-    scan_raw_chunks_inner(chunks, total_bytes, file_id, revision, needle, options, false, canceled)
+    scan_raw_chunks_inner(chunks, total_bytes, file_id, revision, needle, options, false, None, canceled)
 }
 
 pub(crate) fn scan_raw_chunks_counting<'a>(
@@ -43,21 +44,32 @@ pub(crate) fn scan_raw_chunks_counting<'a>(
     options: &QueryOptions,
     canceled: impl FnMut() -> bool,
 ) -> Result<SearchResult, QueryError> {
-    scan_raw_chunks_inner(chunks, total_bytes, file_id, revision, needle, options, true, canceled)
+    scan_raw_chunks_inner(chunks, total_bytes, file_id, revision, needle, options, true, None, canceled)
 }
 
-fn scan_raw_chunks_inner<'a>(
+pub(crate) fn scan_raw_expression<'query>(
+    bytes: &[u8], file_id: FileId, revision: SourceRevision, needle: &'query [u8],
+    options: &QueryOptions, count_all_matches: bool, predicates: Predicates<'query>,
+    canceled: impl FnMut() -> bool,
+) -> Result<SearchResult, QueryError> {
+    scan_raw_chunks_inner(std::iter::once(Ok(bytes)), bytes.len() as u64,
+        file_id, revision, needle, options, count_all_matches, Some(predicates), canceled)
+}
+
+fn scan_raw_chunks_inner<'a, 'query>(
     chunks: impl IntoIterator<Item = Result<&'a [u8], QueryError>>,
     total_bytes: u64,
     file_id: FileId,
     revision: SourceRevision,
-    needle: &[u8],
+    needle: &'query [u8],
     options: &QueryOptions,
     count_all_matches: bool,
+    mut predicates: Option<Predicates<'query>>,
     mut canceled: impl FnMut() -> bool,
 ) -> Result<SearchResult, QueryError> {
     let mut cursor = ByteSearchCursor::new(needle)?;
     let mut result = SearchResult::empty(SearchCoverage::Exhaustive);
+    let mut primary_limited = false;
     if canceled() {
         result.coverage = SearchCoverage::CanceledEarly;
         return Ok(result);
@@ -83,22 +95,49 @@ fn scan_raw_chunks_inner<'a>(
         while !remaining.is_empty() {
             if canceled() {
                 result.coverage = SearchCoverage::CanceledEarly;
-                return Ok(result);
+                return Ok(finish_expression(result, &predicates, false, primary_limited, options.max_matches));
             }
-            let remaining_bytes = byte_limit.saturating_sub(cursor.scanned_bytes());
+            let remaining_bytes = byte_limit.saturating_sub(result.scanned_bytes);
             if remaining_bytes == 0 {
                 result.coverage = SearchCoverage::BudgetExhausted {
-                    bytes_scanned: cursor.scanned_bytes(),
+                    bytes_scanned: result.scanned_bytes,
                 };
-                return Ok(result);
+                return Ok(finish_expression(result, &predicates, false, primary_limited, options.max_matches));
             }
             let work = remaining_bytes.min(MAX_STREAM_STEP_BYTES as u64) as usize;
+            if primary_limited {
+                let consumed = work.min(remaining.len());
+                let predicates = predicates.as_mut().ok_or(QueryError::InvalidRange)?;
+                result.scanned_bytes += consumed as u64;
+                if !predicates.feed_raw(&remaining[..consumed], &mut canceled)? {
+                    result.coverage = SearchCoverage::CanceledEarly;
+                    predicates.finish(&mut result, false, primary_limited, options.max_matches);
+                    return Ok(result);
+                }
+                remaining = &remaining[consumed..];
+                if predicates.rejected() || predicates.proven_without_eof() {
+                    predicates.finish(&mut result, false, primary_limited, options.max_matches);
+                    return Ok(result);
+                }
+                continue;
+            }
             let hit_budget = if count_all_matches { MAX_STREAM_BATCH_HITS } else {
                 options.max_matches.saturating_sub(result.matches.len())
                     .saturating_add(1).min(MAX_STREAM_BATCH_HITS)
             };
             let batch = cursor.step(remaining, work, hit_budget)?;
             result.scanned_bytes = cursor.scanned_bytes();
+            if let Some(predicates) = &mut predicates {
+                if !predicates.feed_raw(&remaining[..batch.consumed], &mut canceled)? {
+                    result.coverage = SearchCoverage::CanceledEarly;
+                    predicates.finish(&mut result, false, primary_limited, options.max_matches);
+                    return Ok(result);
+                }
+                if predicates.rejected() {
+                    predicates.finish(&mut result, false, primary_limited, options.max_matches);
+                    return Ok(result);
+                }
+            }
             remaining = &remaining[batch.consumed..];
             let stored = batch.hits.len().min(options.max_matches - result.matches.len());
             result.matches.try_reserve_exact(stored).map_err(|_| QueryError::LimitExceeded)?;
@@ -107,6 +146,10 @@ fn scan_raw_chunks_inner<'a>(
                     .checked_add(1).ok_or(QueryError::LimitExceeded)?;
                 if result.matches.len() == options.max_matches {
                     if count_all_matches { continue; }
+                    if predicates.is_some() {
+                        primary_limited = true;
+                        break;
+                    }
                     result.coverage = SearchCoverage::TruncatedAtLimit {
                         max_matches: options.max_matches,
                     };
@@ -124,12 +167,23 @@ fn scan_raw_chunks_inner<'a>(
                     multiplicity: 1,
                 });
             }
+            if primary_limited && predicates.as_ref().is_some_and(Predicates::proven_without_eof) {
+                return Ok(finish_expression(result, &predicates, false, primary_limited, options.max_matches));
+            }
         }
     }
     if declared_bytes != total_bytes {
         return Err(QueryError::InvalidRange);
     }
-    Ok(result)
+    Ok(finish_expression(result, &predicates, true, primary_limited, options.max_matches))
+}
+
+fn finish_expression(mut result: SearchResult, predicates: &Option<Predicates<'_>>,
+    complete_source: bool, primary_limited: bool, max_matches: usize) -> SearchResult {
+    if let Some(predicates) = predicates {
+        predicates.finish(&mut result, complete_source, primary_limited, max_matches);
+    }
+    result
 }
 
 #[cfg(test)]

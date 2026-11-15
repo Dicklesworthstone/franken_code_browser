@@ -262,11 +262,12 @@ its literal/raw query routes, including resident and demand-paged postings.
 
 ## Work, completeness, and identity
 
-For saved-source expressions, `--max-scan-bytes` admits original source bytes
-consumed by the shared decoding pass: 256 MiB by default, with an explicit
-maximum of 1 TiB. Each member byte spends that allowance once, regardless of
+For captured-workspace and saved-source expressions, `--max-scan-bytes` admits
+original source bytes consumed by a shared matching/decoding pass: 256 MiB by
+default, with an explicit maximum of 1 TiB. Each source byte spends that allowance once, regardless of
 the number of content terms. Matcher CPU work still depends on the parser's
-bounded term count. Captured-workspace matching has its own scanner accounting.
+bounded term count. Captured candidates use `CaptureQueryScanner`; the independent
+`ReferenceScanOracle` retains separate term scans for differential verification.
 This does not replace
 source-capture, source-load, archive-validation, or configuration-I/O accounting.
 Live source admission and index construction may precede a matching-work stop.
@@ -277,6 +278,9 @@ qualify. Saved-source compound queries and the single-pass whole-file route
 withhold a member's candidates when its observation is incomplete. Exact hits
 from already completed, qualified saved members remain available with partial
 coverage. Literal-only saved queries retain their bounded lookahead behavior.
+Captured queries may retain exact partial hits once every required term has
+been observed and there are no unproved exclusions. Reaching a primary row cap
+does not stop unresolved predicate work or let a late exclusion escape.
 Unsupported text is counted separately, rather than silently searched through
 replacement characters as though it were exact text.
 

@@ -10,6 +10,7 @@ use fcb_core::{ByteOffset, ByteRange, DecodedUtf8Offset, DecodedUtf8Range, FileI
 use fcb_source::{CaptureEncodingMap, DetectedEncoding, MappingSpan, SpanKind, detect_encoding};
 
 use crate::normalized::{NormalizedCursor, SourceScalar};
+use crate::expression::Predicates;
 use crate::stream::{ByteSearchCursor, MAX_STREAM_BATCH_HITS, MAX_STREAM_STEP_BYTES};
 use crate::{QueryError, QueryOptions, SearchCoverage, SearchMatch, SearchResult};
 
@@ -24,7 +25,7 @@ pub(crate) fn scan_text_chunks<'a>(
     options: &QueryOptions,
     canceled: impl FnMut() -> bool,
 ) -> Result<SearchResult, QueryError> {
-    scan_text_chunks_inner(chunks, total_bytes, file_id, revision, query, options, false, canceled)
+    scan_text_chunks_inner(chunks, total_bytes, file_id, revision, query, options, false, None, canceled)
 }
 
 pub(crate) fn scan_text_chunks_counting<'a>(
@@ -36,13 +37,23 @@ pub(crate) fn scan_text_chunks_counting<'a>(
     options: &QueryOptions,
     canceled: impl FnMut() -> bool,
 ) -> Result<SearchResult, QueryError> {
-    scan_text_chunks_inner(chunks, total_bytes, file_id, revision, query, options, true, canceled)
+    scan_text_chunks_inner(chunks, total_bytes, file_id, revision, query, options, true, None, canceled)
 }
 
-fn scan_text_chunks_inner<'a>(
+pub(crate) fn scan_text_expression<'query>(
+    bytes: &[u8], file_id: FileId, revision: SourceRevision, query: &'query str,
+    options: &'query QueryOptions, count_all_matches: bool, predicates: Predicates<'query>,
+    canceled: impl FnMut() -> bool,
+) -> Result<SearchResult, QueryError> {
+    scan_text_chunks_inner(std::iter::once(Ok(bytes)), bytes.len() as u64,
+        file_id, revision, query, options, count_all_matches, Some(predicates), canceled)
+}
+
+fn scan_text_chunks_inner<'a, 'query>(
     chunks: impl IntoIterator<Item = Result<&'a [u8], QueryError>>,
-    total_bytes: u64, file_id: FileId, revision: SourceRevision, query: &str,
-    options: &QueryOptions, count_all_matches: bool, mut canceled: impl FnMut() -> bool,
+    total_bytes: u64, file_id: FileId, revision: SourceRevision, query: &'query str,
+    options: &'query QueryOptions, count_all_matches: bool, predicates: Option<Predicates<'query>>,
+    mut canceled: impl FnMut() -> bool,
 ) -> Result<SearchResult, QueryError> {
     let mut scan = TextScan {
         cursor: ByteSearchCursor::new(query.as_bytes())?,
@@ -50,6 +61,8 @@ fn scan_text_chunks_inner<'a>(
         query,
         options,
         count_all_matches,
+        predicates,
+        primary_limited: false,
         file_id,
         revision,
         encoding: options.declared_encoding,
@@ -63,11 +76,11 @@ fn scan_text_chunks_inner<'a>(
     };
     if canceled() {
         scan.result.coverage = SearchCoverage::CanceledEarly;
-        return Ok(scan.result);
+        return Ok(scan.finish(false));
     }
     if !count_all_matches && options.max_matches == 0 && total_bytes > 0 {
         scan.result.coverage = SearchCoverage::TruncatedAtLimit { max_matches: 0 };
-        return Ok(scan.result);
+        return Ok(scan.finish(false));
     }
     let byte_limit = options.max_bytes_scanned.unwrap_or(u64::MAX).min(total_bytes);
     let mut staging = Vec::new();
@@ -88,17 +101,17 @@ fn scan_text_chunks_inner<'a>(
         while !remaining.is_empty() {
             if canceled() {
                 scan.result.coverage = SearchCoverage::CanceledEarly;
-                return Ok(scan.result);
+                return Ok(scan.finish(false));
             }
             let available = byte_limit.saturating_sub(scan.result.scanned_bytes);
             if available == 0 {
                 if scan.process(&mut staging, false, &mut canceled)? {
-                    return Ok(scan.result);
+                    return Ok(scan.finish(false));
                 }
                 scan.result.coverage = SearchCoverage::BudgetExhausted {
                     bytes_scanned: scan.result.scanned_bytes,
                 };
-                return Ok(scan.result);
+                return Ok(scan.finish(false));
             }
             let take = remaining.len().min(WINDOW_BYTES - staging.len())
                 .min(available.min(WINDOW_BYTES as u64) as usize);
@@ -106,7 +119,7 @@ fn scan_text_chunks_inner<'a>(
             remaining = &remaining[take..];
             scan.result.scanned_bytes += take as u64;
             if staging.len() == WINDOW_BYTES && scan.process(&mut staging, false, &mut canceled)? {
-                return Ok(scan.result);
+                return Ok(scan.finish(false));
             }
         }
     }
@@ -114,7 +127,11 @@ fn scan_text_chunks_inner<'a>(
         return Err(QueryError::InvalidRange);
     }
     scan.process(&mut staging, true, &mut canceled)?;
-    Ok(scan.result)
+    // Input EOF does not prove predicate EOF if cancellation interrupted the
+    // final decoded window. raw_offset advances only after every predicate has
+    // consumed that window, before optional primary matching can be canceled.
+    let complete_source = scan.raw_offset == total_bytes;
+    Ok(scan.finish(complete_source))
 }
 
 struct TextScan<'a> {
@@ -123,6 +140,8 @@ struct TextScan<'a> {
     query: &'a str,
     options: &'a QueryOptions,
     count_all_matches: bool,
+    predicates: Option<Predicates<'a>>,
+    primary_limited: bool,
     file_id: FileId,
     revision: SourceRevision,
     encoding: Option<DetectedEncoding>,
@@ -136,6 +155,14 @@ struct TextScan<'a> {
 }
 
 impl TextScan<'_> {
+    fn finish(mut self, complete_source: bool) -> SearchResult {
+        if let Some(predicates) = &self.predicates {
+            predicates.finish(&mut self.result, complete_source, self.primary_limited,
+                self.options.max_matches);
+        }
+        self.result
+    }
+
     /// Return true for a terminal result (proven truncation or unavailable text).
     fn process(&mut self, staging: &mut Vec<u8>, eof: bool,
         canceled: &mut impl FnMut() -> bool) -> Result<bool, QueryError> {
@@ -167,6 +194,12 @@ impl TextScan<'_> {
             self.unavailable();
             return Ok(true);
         }
+        if let Some(predicates) = &mut self.predicates {
+            if !predicates.feed_text(&map, self.decoded_offset, canceled)? {
+                self.result.coverage = SearchCoverage::CanceledEarly;
+                return Ok(true);
+            }
+        }
         self.spans.try_reserve(map.spans().len())
             .map_err(|_| QueryError::LimitExceeded)?;
         let decoded = map.decoded_text();
@@ -183,11 +216,17 @@ impl TextScan<'_> {
             .ok_or(QueryError::InvalidRange)?;
         self.decoded_offset = self.decoded_offset.checked_add(decoded.len() as u64)
             .ok_or(QueryError::InvalidRange)?;
-        if self.normalized.is_some() {
+        if self.primary_limited || self.predicates.as_ref().is_some_and(Predicates::rejected) {
+            // Predicate eligibility may require the rest of the source after a
+            // primary lookahead proves row truncation. Do not keep matching or
+            // retain mapping spans for primary occurrences that cannot be used.
+            // Excluded documents still finish decoding so malformed suffixes
+            // cannot silently turn unavailable text into complete negatives.
+        } else if self.normalized.is_some() {
             if self.process_normalized(decoded, canceled)? { return Ok(true); }
         } else {
             let mut remaining = decoded.as_bytes();
-            while !remaining.is_empty() {
+            'primary: while !remaining.is_empty() {
                 let hit_budget = if self.count_all_matches { MAX_STREAM_BATCH_HITS } else {
                     self.options.max_matches.saturating_sub(self.result.matches.len())
                         .saturating_add(1).min(MAX_STREAM_BATCH_HITS)
@@ -204,6 +243,10 @@ impl TextScan<'_> {
                         .checked_add(1).ok_or(QueryError::LimitExceeded)?;
                     if self.result.matches.len() == self.options.max_matches {
                         if self.count_all_matches { continue; }
+                        if self.predicates.is_some() {
+                            self.primary_limited = true;
+                            break 'primary;
+                        }
                         self.result.coverage = SearchCoverage::TruncatedAtLimit {
                             max_matches: self.options.max_matches,
                         };
@@ -225,6 +268,10 @@ impl TextScan<'_> {
                 }
                 self.prune();
             }
+        }
+        if self.primary_limited && self.predicates.as_ref().is_some_and(Predicates::proven_without_eof) {
+            self.result.coverage = SearchCoverage::TruncatedAtLimit { max_matches: self.options.max_matches };
+            return Ok(true);
         }
         // Empty decoded windows (for example a BOM) still allow retirement.
         self.prune();
@@ -261,6 +308,10 @@ impl TextScan<'_> {
                     .checked_add(1).ok_or(QueryError::LimitExceeded)?;
                 if self.result.matches.len() == self.options.max_matches {
                     if self.count_all_matches { continue; }
+                    if self.predicates.is_some() {
+                        self.primary_limited = true;
+                        return Ok(false);
+                    }
                     self.result.coverage = SearchCoverage::TruncatedAtLimit {
                         max_matches: self.options.max_matches,
                     };
@@ -291,7 +342,10 @@ impl TextScan<'_> {
     }
 
     fn prune(&mut self) {
-        let raw_from = if let Some(cursor) = &self.normalized {
+        let raw_from = if self.primary_limited || self.predicates.as_ref().is_some_and(Predicates::rejected) {
+            self.spans.clear();
+            self.raw_offset
+        } else if let Some(cursor) = &self.normalized {
             // The normalized ring owns the provenance it needs across windows;
             // decoding maps can be retired immediately, source boundaries cannot.
             self.spans.clear();

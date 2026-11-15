@@ -273,19 +273,51 @@ fn lowercase_expansions_keep_complete_original_scalars_for_exact_activation() {
 }
 
 #[test]
-fn predicate_scan_work_is_separate_from_captured_bytes_and_charged_cumulatively() {
+fn predicates_share_one_capture_pass_and_finish_at_the_exact_source_byte_allowance() {
     let source = b"needle required\n";
     let raw = "needle required -absent";
     let mut f = Fixture::new(&[("source.rs", source)]);
-    let live = f.live(1, raw, AtlasSearchScope::all());
+    f.search.begin_expression_scoped(&f.atlas, 1, raw, AtlasSearchScope::all(),
+        options(), source.len() as u64, || false).unwrap();
+    let live = f.finish(1);
     assert!(live.get("search_complete").flag());
     assert_eq!(live.get("source_bytes_read").number(), source.len() as u64);
-    assert_eq!(live.get("scanned_input_bytes").number(), (3 * source.len()) as u64);
+    assert_eq!(live.get("scanned_input_bytes").number(), source.len() as u64);
+    assert_eq!(live.get("retained_hits").number(), 1);
+    let live_hits = f.hits(1, &live);
     f.build(2);
-    let indexed = f.indexed(3, 2, raw, AtlasSearchScope::all()); indexed_counts(&indexed);
+    f.search.begin_indexed_expression_scoped(&f.atlas, 3, 2, raw, AtlasSearchScope::all(),
+        options().max_matches, source.len() as u64, || false).unwrap();
+    let indexed = f.finish(3); indexed_counts(&indexed);
     assert!(indexed.get("search_complete").flag());
-    assert_eq!(indexed.get("verification_source_bytes").number(), (3 * source.len()) as u64);
-    assert!(indexed.get("verification_source_bytes").number() > f.search.indexed_source_bytes());
+    assert_eq!(indexed.get("verification_source_bytes").number(), source.len() as u64);
+    assert_eq!(indexed.get("retained_hits").number(), 1);
+    assert_eq!(f.hits(3, &indexed), live_hits);
+}
+
+#[test]
+fn counted_utf16_predicates_finish_with_zero_rows_at_one_source_pass() {
+    let text = format!("NEEDLE NEEDLE {} REQUIRED", "x".repeat(17_000));
+    for little in [true, false] {
+        let source = utf16(&text, little);
+        let mut f = Fixture::new(&[("source.rs", &source)]);
+        let query = "needle required -absent";
+        f.build(1);
+        f.search.begin_expression_counted_scoped(&f.atlas, 2, query,
+            insensitive(), AtlasSearchOptions { max_matches: 0, ..options() },
+            source.len() as u64, || false).unwrap();
+        let live = f.finish(2);
+        f.search.begin_indexed_expression_counted_scoped(&f.atlas, 3, 1, query,
+            insensitive(), 0, source.len() as u64, || false).unwrap();
+        let indexed = f.finish(3); indexed_counts(&indexed);
+        for page in [&live, &indexed] {
+            assert!(page.get("search_complete").flag());
+            assert!(page.get("match_count_complete").flag());
+            assert_eq!(page.get("retained_hits").number(), 0);
+            assert_eq!(page.get("matches_seen").number(), 2);
+            assert_eq!(page.get("scanned_input_bytes").number(), source.len() as u64);
+        }
+    }
 }
 
 #[test]

@@ -9,7 +9,7 @@ use std::{borrow::Cow, mem::size_of, sync::Arc};
 use fcb_core::{ByteLength, FileId, QueryGeneration, ResourceAllocationId, ResourceBudget, ResourceLease};
 use crate::index::{EphemeralIndex, IndexError, MembershipState, SearchManifestId};
 use crate::index::export::OwnedEphemeralIndex;
-use crate::{LangFilterKind, ParsedQuery, PathFilterKind, QueryOptions, ReferenceScanOracle,
+use crate::{CaptureQueryScanner, LangFilterKind, ParsedQuery, PathFilterKind, QueryOptions, ReferenceScanOracle,
     SearchCoverage, SearchDocument, SearchMatch, SearchResult};
 
 pub const MAX_QUERY_STEP_DOCUMENTS: usize = 256;
@@ -144,7 +144,9 @@ impl<'source> Execution<'source> {
             Cow::Owned(ids) => ids.capacity().checked_mul(size_of::<FileId>()).ok_or(IndexError::LimitExceeded)?,
             Cow::Borrowed(_) => 0,
         };
+        let predicate_bytes = CaptureQueryScanner::predicate_scratch_bytes(query, &options)?;
         let reserved = retained.checked_mul(3).and_then(|n| n.checked_add(unavailable_bytes as u64))
+            .and_then(|n| n.checked_add(predicate_bytes as u64))
             .ok_or(IndexError::LimitExceeded)?;
         let lease = budget.try_reserve_managed(index.id().owner(), allocation, ByteLength::new(reserved))
             .map_err(|_| IndexError::ResourceDenied)?;
@@ -224,9 +226,9 @@ impl<'source> Execution<'source> {
         options.max_bytes_scanned = self.options.max_bytes_scanned
             .map(|limit| limit.saturating_sub(self.report.results.scanned_bytes));
         let child = if self.count_all_matches {
-            ReferenceScanOracle::scan_document_counting_with_cancel(&doc, query, &options, canceled)
+            CaptureQueryScanner::scan_document_counting_with_cancel(&doc, query, &options, canceled)
         } else {
-            ReferenceScanOracle::scan_document_with_cancel(&doc, query, &options, canceled)
+            CaptureQueryScanner::scan_document_with_cancel(&doc, query, &options, canceled)
         }?;
         let scanned = self.report.results.scanned_bytes.checked_add(child.scanned_bytes).ok_or(IndexError::LimitExceeded)?;
         if self.options.max_bytes_scanned.is_some_and(|limit| scanned > limit) { return Err(IndexError::LimitExceeded); }

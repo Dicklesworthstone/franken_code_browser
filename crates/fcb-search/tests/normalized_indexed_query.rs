@@ -131,15 +131,26 @@ fn normalized_predicates_and_partial_coverage_share_the_global_byte_budget() {
     let output_budget = budget(64 * 1024);
     for expression in ["strasse", "strasse ready", "strasse -blocked"] {
         let query = ParsedQuery::parse(expression).unwrap();
+        let expected = ReferenceScanOracle::scan_collection(&docs, &query,
+            &options(UnicodeNormalization::CaseFold)).unwrap();
+        let total_source_bytes = (a.bytes().len() + b.bytes().len()) as u64;
         for bytes in 0..=96 {
             let mut opts = options(UnicodeNormalization::CaseFold);
             opts.max_bytes_scanned = Some(bytes);
-            let expected = ReferenceScanOracle::scan_collection(&docs, &query, &opts).unwrap();
             let report = index.search(&query, opts, &output_budget, allocation(2), || false).unwrap();
-            assert_eq!(report.capture_results(), &expected, "query={expression}, budget={bytes}");
-            assert!(report.capture_results().scanned_bytes <= bytes);
-            if matches!(expected.coverage, SearchCoverage::BudgetExhausted { .. }) {
+            let actual = report.capture_results();
+            assert!(actual.scanned_bytes <= bytes);
+            assert!(actual.unsupported_files.is_empty());
+            assert_eq!(actual.matches, expected.matches[..actual.matches.len()],
+                "query={expression}, budget={bytes}");
+            assert_eq!(actual.match_count(), actual.matches.len());
+            if bytes < total_source_bytes {
                 assert!(!report.is_complete());
+                assert_eq!(actual.coverage, SearchCoverage::BudgetExhausted { bytes_scanned: bytes });
+            } else {
+                assert!(report.is_complete());
+                assert_eq!(actual.scanned_bytes, total_source_bytes);
+                ReferenceScanOracle::verify_oracle_match(actual, &expected).unwrap();
             }
         }
     }

@@ -260,21 +260,34 @@ fn existing_normalized_modes_keep_occurrence_multiplicity_and_source_ranges() {
 }
 
 #[test]
-fn one_global_byte_budget_covers_predicates_and_primary_scans() {
+fn one_global_byte_budget_covers_the_shared_predicate_and_primary_scan() {
     let a = capture(1, 1, b"needle red");
     let b = capture(2, 1, b"needle blue");
     let docs = [document("a.rs", &a), document("b.rs", &b)];
     let budget = budget();
-    // No candidates eliminated, so the byte accounting must match the direct route exactly.
+    // No candidates are eliminated. Every source byte is charged once across
+    // predicates and primary matching, while the reference keeps separate scans.
     let index = index(&docs, IndexLimits { max_total_grams: 0, ..Default::default() }, &budget);
     for raw in ["needle", "needle red", "needle -blue"] {
         let query = ParsedQuery::parse(raw).unwrap();
+        let oracle = ReferenceScanOracle::scan_collection(&docs, &query, &options()).unwrap();
+        let source_bytes = (a.bytes().len() + b.bytes().len()) as u64;
         for bytes in 0..=64 {
             let mut options = options(); options.max_bytes_scanned = Some(bytes);
-            let oracle = ReferenceScanOracle::scan_collection(&docs, &query, &options).unwrap();
             let result = index.search(&query, options, &budget, allocation(2), || false).unwrap();
-            assert_eq!(result.capture_results(), &oracle, "query={raw}, budget={bytes}");
-            assert!(result.capture_results().scanned_bytes <= bytes);
+            let actual = result.capture_results();
+            assert!(actual.scanned_bytes <= bytes);
+            assert_eq!(actual.matches, oracle.matches[..actual.matches.len()], "query={raw}, budget={bytes}");
+            assert_eq!(actual.match_count(), actual.matches.len());
+            assert!(actual.unsupported_files.is_empty());
+            if bytes < source_bytes {
+                assert!(!result.is_complete());
+                assert_eq!(actual.coverage, SearchCoverage::BudgetExhausted { bytes_scanned: bytes });
+            } else {
+                assert!(result.is_complete());
+                assert_eq!(actual.scanned_bytes, source_bytes);
+                ReferenceScanOracle::verify_oracle_match(actual, &oracle).unwrap();
+            }
         }
     }
 }

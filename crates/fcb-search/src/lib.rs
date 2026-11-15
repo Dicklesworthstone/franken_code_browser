@@ -9,6 +9,7 @@
 //! a newly qualified complete Unicode normalization implementation.
 
 mod capture;
+mod expression;
 pub mod identifier;
 pub mod normalized;
 pub mod index;
@@ -24,6 +25,7 @@ pub use index::{
     MembershipState, SearchManifest, SearchManifestId, SegmentCoverage, UncoveredReason,
 };
 pub use indexed_query::{IndexedQuery, IndexedQueryState, IndexedSearchReport};
+pub use expression::CaptureQueryScanner;
 pub use oracle::{OracleMismatchError, ReferenceScanOracle, SearchDocument};
 pub use query::{LangFilterKind, ParsedQuery, PathFilterKind, MAX_QUERY_LEN, MAX_QUERY_TOKENS};
 

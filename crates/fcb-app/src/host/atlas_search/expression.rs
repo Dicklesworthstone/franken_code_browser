@@ -3,16 +3,16 @@
 //! Explicit bounded expressions over the existing parser and capture verifier.
 //! Metadata predicates narrow frozen membership before source/file quotas;
 //! required/excluded content terms all inspect the same complete capture.
-//! Source I/O and repeated predicate-verification work have separate budgets.
+//! Source I/O and the single-pass predicate verifier have separate budgets.
 
 use std::borrow::Cow;
-use fcb::search::{CaptureRequest, ParsedQuery, QueryGeneration, QueryOptions,
+use fcb::search::{CaptureQueryScanner, CaptureRequest, ParsedQuery, QueryGeneration, QueryOptions,
     ReferenceScanOracle, SearchCoverage, SearchDocument, SearchMode, UnicodeNormalization};
 use crate::workspace;
 use super::*;
 use super::progressive::SearchExecution;
 
-/// Aggregate original bytes consumed by all required/excluded/primary probes.
+/// Original bytes consumed once by the shared required/excluded/primary scan.
 /// Capturing source remains independently limited to 32 MiB per query/index.
 pub const MAX_ATLAS_EXPRESSION_SCAN_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -240,14 +240,17 @@ impl RetainedAtlasSearch {
         options.max_matches = if candidate.count_all_matches { remaining } else { remaining.max(1) };
         options.max_bytes_scanned = Some(remaining_work);
         let text_capacity = candidate.matched_text_capacity.max(candidate.needle.len());
-        let scratch = text_matching::scan_scratch_bytes(options.max_matches, text_capacity)?;
+        let predicate_scratch = CaptureQueryScanner::predicate_scratch_bytes(&work.parsed, &options)
+            .map_err(IndexError::from)?;
+        let scratch = text_matching::scan_scratch_bytes(options.max_matches, text_capacity)?
+            .checked_add(predicate_scratch).ok_or(AppError::Admission)?;
         let _scan_lease = self.budget.try_reserve_managed(owner, work.scan_id, ByteLength::new(scratch as u64))
             .map_err(|_| AppError::Admission)?;
         let report = if candidate.count_all_matches {
-            ReferenceScanOracle::scan_document_counting_with_cancel(&document, &work.parsed, &options,
+            CaptureQueryScanner::scan_document_counting_with_cancel(&document, &work.parsed, &options,
                 || canceled() || atlas.validate_active().is_err())
         } else {
-            ReferenceScanOracle::scan_document_with_cancel(&document, &work.parsed, &options,
+            CaptureQueryScanner::scan_document_with_cancel(&document, &work.parsed, &options,
                 || canceled() || atlas.validate_active().is_err())
         }.map_err(IndexError::from)?;
         self.validate(atlas)?; check(canceled)?;
