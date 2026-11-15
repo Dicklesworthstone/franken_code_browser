@@ -56,6 +56,9 @@ impl ReferenceScanOracle {
         })
     }
 
+    /// Descriptive language names include their supported filename variants.
+    /// Extension filters such as `ts`, `tsx`, `js` and `jsx` stay specific to
+    /// that suffix; existing C/C++ and Markdown aliases retain their scope.
     pub fn matches_lang_filters(path: &str, filters: &[LangFilterKind]) -> bool {
         // A dot in a directory name does not give an extension to its children.
         let filename = path.rsplit('/').next().unwrap_or(path);
@@ -299,8 +302,9 @@ impl ReferenceScanOracle {
         match lang.as_str() {
             "rust" | "rs" => ext == "rs",
             "python" | "py" => ext == "py",
-            "javascript" | "js" => ext == "js",
-            "typescript" | "ts" => ext == "ts",
+            "javascript" => matches!(ext, "js" | "jsx" | "mjs" | "cjs"),
+            "typescript" => matches!(ext, "ts" | "tsx"),
+            "csharp" | "c#" => ext == "cs",
             "c" => ext == "c" || ext == "h",
             "cpp" | "cxx" | "cc" => ext == "cpp" || ext == "cxx" || ext == "cc" || ext == "hpp",
             "markdown" | "md" => ext == "md" || ext == "markdown",

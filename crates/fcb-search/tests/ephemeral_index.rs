@@ -98,6 +98,52 @@ fn indexed_and_direct_results_agree_across_modes_filters_and_result_limits() {
 }
 
 #[test]
+fn language_family_scope_matches_exact_expected_files_in_direct_indexed_and_uncovered_searches() {
+    let paths = ["src/types.ts", "src/Panel.tsx", "src/main.js", "src/Panel.jsx",
+        "src/module.mjs", "src/common.cjs", "src/State.cs", "src/main.rs", "src/data.custom"];
+    let captures: Vec<_> = (1..=paths.len()).map(|file|
+        capture(file as u64, 1, b"prefix needle suffix")).collect();
+    let docs: Vec<_> = paths.iter().zip(&captures).map(|(path, capture)| document(path, capture)).collect();
+    let cases: &[(&str, &[u64])] = &[
+        ("needle lang:typescript", &[1, 2]),
+        ("needle -type:typescript", &[3, 4, 5, 6, 7, 8, 9]),
+        ("needle lang:javascript", &[3, 4, 5, 6]),
+        ("needle -lang:javascript", &[1, 2, 7, 8, 9]),
+        ("needle lang:C#", &[7]),
+        ("needle -lang:csharp", &[1, 2, 3, 4, 5, 6, 8, 9]),
+        ("needle lang:ts", &[1]),
+        ("needle lang:js", &[3]),
+        ("needle type:custom", &[9]),
+        ("needle lang:typescript -lang:tsx", &[1]),
+    ];
+    for limits in [IndexLimits::default(),
+        IndexLimits { max_source_bytes_per_file: 2, ..Default::default() }] {
+        let budget = budget();
+        let index = index(&docs, limits, &budget);
+        for &(raw, expected) in cases {
+            let query = ParsedQuery::parse(raw).unwrap();
+            let oracle = ReferenceScanOracle::scan_collection(&docs, &query, &options()).unwrap();
+            // Expected membership is independent of the shared filter: parity
+            // alone would let every route agree on the same false negatives.
+            let files: Vec<_> = oracle.matches.iter().map(|hit| hit.file_id.get()).collect();
+            assert_eq!(files, expected, "{raw}");
+            assert!(oracle.is_complete(), "{raw}");
+            assert_eq!(oracle.scanned_bytes, (expected.len() * b"prefix needle suffix".len()) as u64,
+                "metadata-excluded files must not consume scan bytes: {raw}");
+            for hit in &oracle.matches {
+                assert_eq!(hit.original_byte_range.as_usize_bounds().unwrap(), (7, 13), "{raw}");
+                assert_eq!(hit.matched_text, "needle");
+            }
+            let result = index.search(&query, options(), &budget, allocation(2), || false).unwrap();
+            ReferenceScanOracle::verify_oracle_match(result.capture_results(), &oracle).unwrap();
+            assert!(result.is_complete(), "{raw}");
+            assert_eq!(result.scan_attempts(), expected.len(), "{raw}");
+            assert_eq!(result.capture_results().scanned_bytes, oracle.scanned_bytes, "{raw}");
+        }
+    }
+}
+
+#[test]
 fn every_quota_route_searches_the_uncovered_source_instead_of_excluding_it() {
     let c = capture(1, 1, b"abcdefghi needle needle");
     let docs = [document("a.rs", &c)];

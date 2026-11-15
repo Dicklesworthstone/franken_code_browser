@@ -184,6 +184,52 @@ fn path_and_language_filters_constrain_document_selection() {
 }
 
 #[test]
+fn descriptive_language_filters_include_supported_filename_variants() {
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        ("typescript", &["src/types.ts", "src/Panel.TSX"],
+            &["src/Panel.jsx", "src/file.typescript", "src.ts/README"]),
+        ("javascript", &["src/main.js", "src/Panel.jsx", "src/module.mjs", "src/common.CJS"],
+            &["src/Panel.tsx", "src/file.javascript", "src.js/README"]),
+        ("csharp", &["src/State.cs", "src/Other.CS"],
+            &["src/State.java", "src/file.csharp", "src.cs/README"]),
+        ("C#", &["src/State.cs", "src/Other.CS"],
+            &["src/State.cpp", "src/file.c#", "src.cs/README"]),
+    ];
+    for &(language, included, excluded) in cases {
+        // Exercise the public parser, including an unquoted C# name and the
+        // type: synonym, before using the shared pre-capture predicate.
+        let positive = ParsedQuery::parse(&format!("needle lang:{language}")).unwrap();
+        let negative = ParsedQuery::parse(&format!("needle -type:{language}")).unwrap();
+        assert_eq!(positive.lang_filters, [LangFilterKind::Include(language.to_lowercase())]);
+        assert_eq!(negative.lang_filters, [LangFilterKind::Exclude(language.to_lowercase())]);
+        for (paths, expected) in [(included, true), (excluded, false)] {
+            for path in paths {
+                assert_eq!(ReferenceScanOracle::matches_lang_filters(path, &positive.lang_filters),
+                    expected, "lang:{language} {path}");
+                assert_eq!(ReferenceScanOracle::matches_lang_filters(path, &negative.lang_filters),
+                    !expected, "-type:{language} {path}");
+            }
+        }
+    }
+}
+
+#[test]
+fn extension_filters_keep_their_existing_exact_scope() {
+    let extensions = ["ts", "tsx", "js", "jsx", "mjs", "cjs", "cs", "java", "swift", "go", "custom"];
+    for requested in extensions {
+        let positive = ParsedQuery::parse(&format!("needle type:{requested}")).unwrap();
+        let negative = ParsedQuery::parse(&format!("needle -lang:{requested}")).unwrap();
+        for extension in extensions {
+            let path = format!("src/File.{}", extension.to_uppercase());
+            assert_eq!(ReferenceScanOracle::matches_lang_filters(&path, &positive.lang_filters),
+                requested == extension, "type:{requested} {path}");
+            assert_eq!(ReferenceScanOracle::matches_lang_filters(&path, &negative.lang_filters),
+                requested != extension, "-lang:{requested} {path}");
+        }
+    }
+}
+
+#[test]
 fn reference_oracle_verification_matches_identical_results_and_detects_mismatches() {
     let (file, rev, generation) = setup_identities(100);
     let options = QueryOptions::new(generation);
