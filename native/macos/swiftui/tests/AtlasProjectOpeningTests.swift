@@ -71,6 +71,7 @@ import Foundation
                 ["fcb", "-fcb.root", "/native"],
                 ["fcb", "-fcb.root", "/native", "-fcb.file-hex", "2d66696c652e7273"],
                 ["fcb", "-fcb.file-hex", "2d66696c652e7273", "-fcb.root", "/native"],
+                ["fcb", "-fcb.line", "120", "-fcb.file-hex", "2d66696c652e7273", "-fcb.root", "/native"],
                 ["fcb", "-NSDocumentRevisionsDebugMode", "YES", "-fcb.root", "/native"],
                 ["fcb", "/legacy", "-fcb.root", "/native"],
             ] {
@@ -79,7 +80,7 @@ import Foundation
                       "The named launcher protocol takes precedence and does not persist a per-launch override")
             }
             for arguments in [["fcb"], ["fcb", "-unknown", "/not-a-project"],
-                              ["fcb", "-fcb.file-hex", "2d66696c652e7273"]] {
+                              ["fcb", "-fcb.file-hex", "2d66696c652e7273"], ["fcb", "-fcb.line", "120"]] {
                 var startup = AtlasProjectStartup()
                 check(opens(startup.consume(arguments: arguments, restoredRoot: "/saved"), root: "/saved"),
                       "Unknown options and filename-hex values are never inferred to be project directories")
@@ -96,7 +97,7 @@ import Foundation
                       "An invalid explicit root cannot silently fall back to a different saved project")
             }
             for arguments in [["fcb", "-fcb.root"], ["fcb", "-fcb.root", "/a", "-fcb.root", "/b"],
-                              ["fcb", "-fcb.file-hex"], ["fcb", "relative/path"]] {
+                              ["fcb", "-fcb.file-hex"], ["fcb", "-fcb.line"], ["fcb", "relative/path"]] {
                 var startup = AtlasProjectStartup()
                 check(rejects(startup.consume(arguments: arguments, restoredRoot: "/saved")),
                       "Malformed or ambiguous startup roots are rejected before opening")

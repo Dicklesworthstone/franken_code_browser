@@ -329,41 +329,60 @@ physical-Mac qualification remains pending.
 
 ```sh
 "$APP/Contents/MacOS/fcb" open /absolute/path/to/src/main.rs
-"$APP/Contents/MacOS/fcb" open -- -notes.rs
+"$APP/Contents/MacOS/fcb" open /absolute/path/to/src/main.rs --line 120
+"$APP/Contents/MacOS/fcb" open --line 120 -- -notes.rs
 ```
 
 A regular-file request opens its **immediate parent directory** as the project
-and selects that filename once the metadata catalog is ready. It does not walk
+and selects that filename once the project root is ready. It does not walk
 ancestors looking for a repository root, prepare all source previews, or execute
 anything from the project. Parent-directory metadata discovery is part of this
 native operation; use `read FILE` or `open FILE --json` for a file-only headless
 read without that discovery.
 
 The filename is passed as a bounded hex encoding of its original UTF-8 bytes.
-The native endpoint accepts it only against the requesting worker's matching
-root and the exact raw filename in that catalog, then invokes the same checked
-reader action as a row click. Quoting, spaces, tabs, newlines and native
+The native endpoint accepts it only against the matching established root,
+then opens that exact single-component filename through the retained reader.
+Quoting, spaces, tabs, newlines and native
 backslashes do not turn into command syntax. Unicode-equivalent but byte-distinct
 filenames are not interchanged. A filename is a request for a **new capture**,
 not an exact anchor into bytes observed by the launcher.
 
-Discovery exclusions, catalog limits and normal reader admission still apply.
-An excluded, filtered or uncatalogued file produces a visible limitation rather
-than opening another row or declaring an unseen file absent. A known file in a
-partial catalog remains openable. The first catalog presentation consumes the
-startup request, including failure; project replacement or refresh cannot replay
-it. It is never persisted as a filename preference.
+An explicitly named file does not wait for the optional 20,000-entry atlas
+catalog and remains openable when discovery ignores or display filters hide it.
+Normal source admission still applies: the retained reader accepts a complete
+regular-file observation up to 32 MiB, with no prefix substituted for an
+over-limit or failed capture. The startup request is consumed once under the
+matching root; project replacement or refresh cannot replay it. It is never
+persisted as a filename preference.
+
+`--line N` selects one-based physical line N at Unicode scalar column one using
+the reader's checked position service over that same immutable capture. The
+native caret uses the validated source-to-UTF-16 mapping. Zero, signed,
+noncanonical, repeated and overflowing line arguments are rejected. If the
+line cannot be resolved, the native reader keeps its captured first page and
+reports the requested line failure. Canceling or opening another source revokes
+pending line publication. Refresh from disk starts new capture history without
+replaying the startup location. For headless line output, use
+`fcb open FILE --line N --json` or `fcb read FILE --line N`.
 
 File requests require the additional `fcb-launch-file-v1` bundle marker. Rebuild
 older bundles; the launcher refuses a file request instead of silently dropping
-its selection. Project-only older bundles retain their directory-launch behavior.
-App Store builds do not advertise this marker and independently refuse argv file
+its selection. Line requests additionally require `fcb-launch-line-v1`, so an
+older file-capable bundle cannot silently open at line one. Project-only older
+bundles retain their directory-launch behavior.
+App Store builds do not advertise these markers and independently refuse argv file
 activation: use the native folder picker and catalog there.
 
 The Foundation-only endpoint regressions are in
 `tests/AtlasStartupFileRegressionTests.swift`, compiled together with
 `swiftui/AtlasProjectCatalog.swift` in the configured qualification lane. Rust
-launcher tests remain in `crates/fcb-app/src/native_launch.rs`. Neither these
+launcher tests remain in `crates/fcb-app/src/native_launch.rs`. The production
+reader startup/cancellation tests are in `tests/AtlasReaderStartupRegressionTests.swift`,
+using the existing `AtlasReaderRefreshFixture.swift` with the production reader
+model, coordinator and queue. The existing `swiftui/tests/test-project-catalog.sh`
+and `swiftui/tests/test-reader-position.sh` runners include these fixtures for
+the strict-RCH qualification lane. Neither these
 unexecuted suites nor portable packaging checks qualify native file activation
 on a physical Mac.
 

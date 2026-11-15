@@ -459,11 +459,14 @@ import Observation
         }
     }
 
-    func open(root: String, path: String, accessLease: AnyObject?) {
+    func open(root: String, path: String, accessLease: AnyObject?, initialLine: UInt64? = nil) {
         close()
         let input: AtlasReaderInput
         do {
             guard capturedTarget == nil || suppliedSource == nil else { throw AtlasReaderError.invalidInput }
+            if let initialLine {
+                guard initialLine > 0, capturedTarget == nil else { throw AtlasReaderError.invalidInput }
+            }
             let liveInput = try AtlasReaderInput(root: root, path: path)
             if let target = capturedTarget {
                 guard target.root.utf8.elementsEqual(root.utf8), target.path.utf8.elementsEqual(path.utf8),
@@ -488,8 +491,9 @@ import Observation
         } catch let error as AtlasReaderError { notice = error.message; return }
         catch { notice = AtlasReaderError.invalidInput.message; return }
         let imageSource = refreshImageSource
+        if let initialLine { lineInput = String(initialLine) }
         let ticket = begin(query: capturedTarget?.mode.isTextual == true,
-            references: capturedTarget?.mode == .occurrences)
+            references: capturedTarget?.mode == .occurrences, position: initialLine != nil)
         notice = capturedTarget != nil ? "Opening the exact retained search capture…"
             : suppliedSource != nil ? "Opening the complete source already displayed…"
             : "Capturing source for bounded page navigation…"
@@ -541,6 +545,26 @@ import Observation
                     } else {
                         notice = target.mode.isTextual ? "Opened the exact search capture without rereading the live file."
                             : "Opened retained \(target.mode == .headings ? "heading" : "declaration") evidence at original bytes \(target.start)–\(target.end). No live-file reread."
+                    }
+                } else if let initialLine {
+                    let request = AtlasReaderRequest.position(line: initialLine, column: 1,
+                        kind: .unicodeScalar, bytes: AtlasReaderLimits.pageBytes)
+                    do {
+                        // Resolve against the just-opened immutable capture.
+                        // No native offset guess, second open or live reread.
+                        let located = try await coordinator.read(request)
+                        guard operation == ticket, !Task.isCancelled else { return }
+                        install(located, request: request)
+                        finish(ticket)
+                        notice = "Opened requested line \(initialLine) in the retained source."
+                    } catch {
+                        guard operation == ticket, !Task.isCancelled else { return }
+                        // Keep a useful readable capture when the requested
+                        // line is absent or cannot be mapped, and report it.
+                        install(opened, request: .firstPage)
+                        finish(ticket)
+                        notice = "Could not open requested line \(initialLine). Showing the first page. "
+                            + ((error as? AtlasReaderError)?.message ?? AtlasReaderError.unavailable.message)
                     }
                 } else {
                     install(opened, request: .firstPage)

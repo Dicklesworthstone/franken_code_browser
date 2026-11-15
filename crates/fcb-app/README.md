@@ -7,9 +7,10 @@ its inert default profile. The app selects only the `search` profile and
 std/core dependencies.
 
 **Implementation status: code-first, independent RCH verification pending.**
-There is no native AppKit/Metal GUI in this binary. `fcb`, `fcb FILE`, and human
-`fcb open FILE` reserve that launcher route and return an explicit unavailable
-error. `fcb --json` reports capabilities and never launches a window. `doctor`
+There is no native AppKit/Metal GUI in this binary. On macOS, `fcb`, `fcb FILE`,
+and human `fcb open FILE` can hand off to a compatible installed native app;
+other platforms return an explicit unavailable error for GUI requests.
+`fcb --json` reports capabilities and never launches a window. `doctor`
 is a **static capability report**, not a benchmark, repair operation, source
 scan, or claim that product gates passed.
 
@@ -64,6 +65,34 @@ The CLI also provides bounded saved-archive and reading-trail commands, includin
 follow the resulting FCBT files; see [reading-trail usage](../../native/macos/README.md#following-saved-reading-trails).
 On macOS, human `fcb open` and bare `fcb` can hand off to an installed native app.
 This CLI lane does not claim completion of all FCB-057 acceptance criteria.
+
+## Native file and line startup on macOS
+
+```sh
+fcb open /absolute/path/to/main.rs --line 120
+fcb open --line 120 -- -notes.rs
+fcb open /absolute/path/to/main.rs --line 120 --json
+```
+
+The first two commands open the native retained reader at physical line 120,
+column one. Lines are one-based canonical decimal integers. The third command
+uses the existing headless line reader and does not launch a window. Native
+`--line` applies to a regular file; other reader options require `read` or
+`open --json`.
+
+The native project is the file's immediate parent. Once that root is admitted,
+the explicit filename opens independently of catalog page limits, ignores and
+display filters. The reader captures at most 32 MiB, resolves the line in those
+same immutable bytes, and presents bounded pages. An absent/unmappable line
+keeps the captured first page with a visible explanation; an unreadable or
+over-limit source is refused. Source contents are never executed.
+
+Rebuild the app with `scripts/build_macos_app.sh` to include the versioned
+`fcb-launch-file-v1` and `fcb-launch-line-v1` markers. A bundle without line
+support is refused before launch instead of opening at the wrong position.
+App Store builds require their native picker and do not advertise command-line
+file/line access. The launch receipt confirms submission only; native builds,
+physical-Mac activation and independent RCH verification remain pending.
 
 ## Whole-file streaming search
 

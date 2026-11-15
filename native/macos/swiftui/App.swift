@@ -340,6 +340,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     @State private var usesPagedReader = false
     @State private var capturedReaderTarget: AtlasSearchCapturedHit?
     @State private var suppliedReaderTarget: AtlasSuppliedReaderSource?
+    @State private var startupReaderLine: (navigation: UUID, line: UInt64)?
     @State private var finderReaderCapture: AtlasProgressiveFileCapture?
     @State private var observedReader: AtlasObservedReaderPresentation?
     @State private var workspaceStreamSearch: AtlasWorkspaceStreamPresentation?
@@ -825,7 +826,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                   projectOpening.recoverProgressive(in: browserProject) else { return }
             status = projectBrowser.notice
             if !query.isEmpty { runSearch(debounce: true) }
-            if AtlasFileStartup.needsCatalog { requestStartupCatalog() }
+            if AtlasFileStartup.isPending { openStartupFile() }
         }
         .onChange(of: projectChangeDiscoveryKey) { _, _ in
             guard !projectBrowser.closed, projectBrowser.root.utf8.elementsEqual(root.utf8),
@@ -1755,10 +1756,17 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                     .id(capture.id)
             } else if usesPagedReader, let path = selectedPath {
                 if !loadingProject, acceptsSource(path, searchRow: sourceSearchRow, exactMatch: false) {
+                    let startupLine = startupReaderLine?.navigation == focusRequest ? startupReaderLine : nil
 #if FCB_APP_STORE
                     if let access = rootAccess, access.url.path.utf8.elementsEqual(root.utf8) {
                         AtlasPagedSourceView(root: root, path: path, accessLease: access, captured: capturedReaderTarget,
-                            supplied: suppliedReaderTarget, canPin: pinnedReaders.canAdd, pin: pinSource,
+                            supplied: suppliedReaderTarget,
+                            initialLine: startupLine?.line, initialLineConsumed: {
+                                if let startupLine, startupReaderLine?.navigation == startupLine.navigation {
+                                    startupReaderLine = nil
+                                }
+                            },
+                            canPin: pinnedReaders.canAdd, pin: pinSource,
                             canKeep: readingDesk.canOperate, keep: keepSource, project: projectBrowser,
                             searchProject: selectedSourceProjectSearch)
                             .id(focusRequest)
@@ -1767,7 +1775,13 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                     }
 #else
                     AtlasPagedSourceView(root: root, path: path, accessLease: nil, captured: capturedReaderTarget,
-                        supplied: suppliedReaderTarget, canPin: pinnedReaders.canAdd, pin: pinSource,
+                        supplied: suppliedReaderTarget,
+                        initialLine: startupLine?.line, initialLineConsumed: {
+                            if let startupLine, startupReaderLine?.navigation == startupLine.navigation {
+                                startupReaderLine = nil
+                            }
+                        },
+                        canPin: pinnedReaders.canAdd, pin: pinSource,
                         canKeep: readingDesk.canOperate, keep: keepSource, project: projectBrowser,
                         searchProject: selectedSourceProjectSearch)
                         .id(focusRequest)
@@ -2134,10 +2148,10 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         loadTask = nil; loadCancellation = nil; loadProgress = ""
         status = browser.notice
         if !query.isEmpty { runSearch(debounce: true) }
-        // A CLI-selected filename is consumed once against the established
-        // bounded catalog contract. This compatibility work starts only AFTER
-        // the progressive file page is usable and never gates normal startup.
-        if AtlasFileStartup.needsCatalog { requestStartupCatalog() }
+        // The explicit single-component filename is independent of metadata
+        // page limits, discovery ignores and presentation filters. Its reader
+        // captures under this established root using the normal native checks.
+        if AtlasFileStartup.isPending { openStartupFile() }
     }
 
     private func loadPreviewCatalog(root requestedRoot: String, ticket: AtlasProjectOpening.Ticket,
@@ -2168,34 +2182,18 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         displayedFiles = files.filter { fileScope.includes($0.path, custom: customExtensions) }
     }
 
-    private func requestStartupCatalog() {
-        guard AtlasFileStartup.needsCatalog, let ticket = projectOpening.beginPreviews() else { return }
-        let requestedRoot = root, cancellation = AtlasSearchCancellation()
-        loadCancellation = cancellation; loadProgress = "Locating the requested startup file…"
-#if FCB_APP_STORE
-        let accessLease: AnyObject? = rootAccess
-#else
-        let accessLease: AnyObject? = nil
-#endif
-        loadTask = Task {
-            defer {
-                if projectOpening.accepts(ticket) {
-                    projectOpening.finishPreviews(ticket, available: false)
-                    loadTask = nil; loadCancellation = nil; loadProgress = ""
-                }
-            }
-            do {
-                try await loadPreviewCatalog(root: requestedRoot, ticket: ticket,
-                    cancellation: cancellation, accessLease: accessLease)
-                guard let catalog = projectOpening.catalog, projectOpening.accepts(ticket) else { return }
-                let outcome = AtlasFileStartup.consume(catalog: catalog, visibleEntries: catalogEntries)
-                if case .open(let id) = outcome { openCatalogFile(id, project: ticket.project) }
-                else if let message = outcome.message { status = message }
-            } catch {
-                if !cancellation.isCanceled, projectOpening.accepts(ticket) {
-                    status = "The startup file could not be located. Project pages remain available."
-                }
-            }
+    private func openStartupFile() {
+        guard AtlasFileStartup.isPending, !loadingProject, projectOpening.canBrowse,
+              projectOpening.projectID == browserProject, !projectBrowser.closed,
+              projectBrowser.root.utf8.elementsEqual(root.utf8) else { return }
+        let outcome = AtlasFileStartup.consume(root: root)
+        if case .open(let path, let line) = outcome {
+            selectedHit = nil
+            openFile(path)
+            if let line { startupReaderLine = (focusRequest, line) }
+            showsReader = true
+        } else if let message = outcome.message {
+            status = message
         }
     }
 

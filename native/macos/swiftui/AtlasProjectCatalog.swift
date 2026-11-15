@@ -122,54 +122,44 @@ struct AtlasProjectCatalog: Sendable {
 
 /// One launch's explicit filename selection, not a persisted preference or an
 /// exact source anchor. Resolving it does no I/O and uses raw Unix path identity.
-/// The first catalog presentation consumes it, including failure, so refresh,
-/// another window or a project replacement cannot replay an old startup action.
+/// The established project consumes it once, including failure. An explicitly
+/// named file does not depend on discovery limits, ignores or a display filter;
+/// the retained reader still admits the actual file under this exact root.
 struct AtlasStartupFileRequest {
     enum Outcome: Equatable {
-        case none, open(UInt64), invalid, differentRoot, grantRequired, filtered, unavailable
-        case notCatalogued(partial: Bool)
+        case none, open(path: String, line: UInt64?), invalid, differentRoot, grantRequired
         var message: String? {
             switch self {
             case .none, .open: return nil
             case .invalid: return "The startup file request is invalid; no file was opened."
             case .differentRoot: return "The startup project changed; choose the file from this project's catalog."
             case .grantRequired: return "This build requires the native folder picker; command-line filenames do not grant access."
-            case .filtered: return "The startup file is hidden by the current filter. Change the filter and select it explicitly."
-            case .unavailable: return "The startup filename cannot be opened by this UTF-8 reader."
-            case .notCatalogued(let partial):
-                return partial ? "The startup file was not in the partial catalog. It may be unseen or excluded; refresh or choose a narrower project."
-                    : "The startup file was not in the admitted catalog. It may have changed or been excluded by discovery policy."
             }
         }
     }
-    private enum Pending { case none, invalid, file(root: String, bytes: [UInt8]) }
+    private enum Pending { case none, invalid, file(root: String, path: String, line: UInt64?) }
     private var pending: Pending
 
     init(arguments: [String]) { pending = Self.parse(arguments) }
-    var needsCatalog: Bool { if case .none = pending { return false }; return true }
+    var isPending: Bool { if case .none = pending { return false }; return true }
 
-    mutating func consume(catalog: AtlasProjectCatalog, visibleEntries: [AtlasProjectCatalog.Entry],
+    mutating func consume(root currentRoot: String?,
         permitsProjectArguments: Bool = true) -> Outcome {
         let request = pending
         pending = .none
         switch request {
         case .none: return .none
         case .invalid: return .invalid
-        case .file(let root, let bytes):
+        case .file(let root, let path, let line):
             guard permitsProjectArguments else { return .grantRequired }
-            guard catalog.requestedRoot?.utf8.elementsEqual(root.utf8) == true else { return .differentRoot }
-            guard let entry = catalog.entries.first(where: { $0.rawPath == bytes }) else {
-                return .notCatalogued(partial: !catalog.discoveryComplete)
-            }
-            guard entry.sourcePath?.utf8.elementsEqual(bytes) == true else { return .unavailable }
-            guard visibleEntries.contains(where: { $0.id == entry.id && $0.rawPath == bytes }) else { return .filtered }
-            return .open(entry.id)
+            guard currentRoot?.utf8.elementsEqual(root.utf8) == true else { return .differentRoot }
+            return .open(path: path, line: line)
         }
     }
 
     private static func parse(_ arguments: [String]) -> Pending {
         // Never read UserDefaults: a saved filename cannot authorize startup.
-        guard arguments.dropFirst().contains("-fcb.file-hex") else { return .none }
+        guard arguments.dropFirst().contains(where: { $0 == "-fcb.file-hex" || $0 == "-fcb.line" }) else { return .none }
         guard arguments.count <= 64 else { return .invalid }
         var total = 0
         for argument in arguments.dropFirst() {
@@ -177,17 +167,21 @@ struct AtlasStartupFileRequest {
             guard count <= 32_768, count <= 65_536 - total else { return .invalid }
             total += count
         }
-        var root: String?, hex: String?
+        var root: String?, hex: String?, line: UInt64?
         var i = 1
         while i < arguments.count {
             let key = arguments[i]; i += 1
-            if key != "-fcb.root" && key != "-fcb.file-hex" { continue }
+            if key != "-fcb.root" && key != "-fcb.file-hex" && key != "-fcb.line" { continue }
             guard i < arguments.count else { return .invalid }
             let value = arguments[i]; i += 1
             if key == "-fcb.root" {
                 guard root == nil else { return .invalid }; root = value
-            } else {
+            } else if key == "-fcb.file-hex" {
                 guard hex == nil else { return .invalid }; hex = value
+            } else {
+                guard line == nil, let number = UInt64(value), number > 0,
+                      String(number) == value else { return .invalid }
+                line = number
             }
         }
         guard let root, root.hasPrefix("/"), root.utf8.count <= 16_384, !root.utf8.contains(0),
@@ -204,8 +198,8 @@ struct AtlasStartupFileRequest {
         // The CLI selects a file's immediate parent as its project. Accept only
         // one native component, never traversal, absolute paths or lossy UTF-8.
         guard !raw.contains(0), !raw.contains(47), raw != [46], raw != [46, 46],
-              String(bytes: raw, encoding: .utf8) != nil else { return .invalid }
-        return .file(root: root, bytes: raw)
+              let path = String(bytes: raw, encoding: .utf8) else { return .invalid }
+        return .file(root: root, path: path, line: line)
     }
 }
 
@@ -213,12 +207,12 @@ struct AtlasStartupFileRequest {
 /// action. Pure request state above is independently testable without a window.
 @MainActor enum AtlasFileStartup {
     private static var pending = AtlasStartupFileRequest(arguments: ProcessInfo.processInfo.arguments)
-    static var needsCatalog: Bool { pending.needsCatalog }
-    static func consume(catalog: AtlasProjectCatalog, visibleEntries: [AtlasProjectCatalog.Entry]) -> AtlasStartupFileRequest.Outcome {
+    static var isPending: Bool { pending.isPending }
+    static func consume(root: String) -> AtlasStartupFileRequest.Outcome {
 #if FCB_APP_STORE
-        return pending.consume(catalog: catalog, visibleEntries: visibleEntries, permitsProjectArguments: false)
+        return pending.consume(root: root, permitsProjectArguments: false)
 #else
-        return pending.consume(catalog: catalog, visibleEntries: visibleEntries)
+        return pending.consume(root: root)
 #endif
     }
 }

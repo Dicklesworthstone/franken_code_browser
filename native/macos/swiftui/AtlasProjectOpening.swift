@@ -138,7 +138,7 @@ struct AtlasProjectStartup {
                 let value = arguments[index]; index += 1
                 guard Self.validRoot(value) else { return .invalidRoot }
                 namedRoot = value
-            } else if argument == "-fcb.file-hex" {
+            } else if argument == "-fcb.file-hex" || argument == "-fcb.line" {
                 // Filename decoding and capture authority belong exclusively to
                 // AtlasStartupFileRequest. Its value is never a project path.
                 guard index < arguments.count else { return .invalidRoot }

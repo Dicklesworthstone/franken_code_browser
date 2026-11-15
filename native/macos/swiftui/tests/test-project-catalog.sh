@@ -8,6 +8,9 @@ swiftc -swift-version 6 -warnings-as-errors "$src/AtlasProjectCatalog.swift" \
     "$src/tests/AtlasProjectCatalogTests.swift" -o "$out/catalog"
 "$out/catalog"
 swiftc -swift-version 6 -warnings-as-errors "$src/AtlasProjectCatalog.swift" \
+    "$src/../tests/AtlasStartupFileRegressionTests.swift" -o "$out/startup-file"
+"$out/startup-file"
+swiftc -swift-version 6 -warnings-as-errors "$src/AtlasProjectCatalog.swift" \
     "$src/AtlasRefreshLayout.swift" "$src/tests/AtlasRefreshLayoutTests.swift" -o "$out/refresh-layout"
 "$out/refresh-layout"
 swiftc -swift-version 6 -warnings-as-errors "$src/AtlasProjectCatalog.swift" \

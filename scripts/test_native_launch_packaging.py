@@ -53,6 +53,7 @@ elif name == "codesign":
         resources = destination / "Contents/Resources"
         if (resources / "fcb-launch-project-v1").exists():
             assert (resources / "fcb-launch-file-v1").read_bytes() == b"", "file marker must precede signing"
+            assert (resources / "fcb-launch-line-v1").read_bytes() == b"", "line marker must precede signing"
 elif name != "sbh":
     raise SystemExit("unexpected fixture tool " + name)
 '''
@@ -124,6 +125,7 @@ class NativeLaunchPackaging(unittest.TestCase):
         self.assertTrue(copied.stat().st_mode & 0o111)
         self.assertEqual((self.app / "Contents/Resources/fcb-launch-project-v1").read_bytes(), b"")
         self.assertEqual((self.app / "Contents/Resources/fcb-launch-file-v1").read_bytes(), b"")
+        self.assertEqual((self.app / "Contents/Resources/fcb-launch-line-v1").read_bytes(), b"")
         self.assertFalse((self.app / "Contents/Resources/fcb-launch-picker-v1").exists())
         signs = [args for name, args in self.calls() if name == "codesign"]
         self.assertEqual(signs, [["--force", "--sign", "-", str(copied)],
@@ -152,6 +154,7 @@ class NativeLaunchPackaging(unittest.TestCase):
         self.assertFalse((self.app / "Contents/MacOS/fcb").exists())
         self.assertTrue((self.app / "Contents/Resources/fcb-launch-project-v1").exists())
         self.assertEqual((self.app / "Contents/Resources/fcb-launch-file-v1").read_bytes(), b"")
+        self.assertEqual((self.app / "Contents/Resources/fcb-launch-line-v1").read_bytes(), b"")
 
     def test_sandbox_staging_never_advertises_cli_file_access(self) -> None:
         # Deliberately stop at the build-number guard before platform PlistBuddy.
@@ -163,6 +166,7 @@ class NativeLaunchPackaging(unittest.TestCase):
         self.assertEqual((resources / "fcb-launch-picker-v1").read_bytes(), b"")
         self.assertFalse((resources / "fcb-launch-project-v1").exists())
         self.assertFalse((resources / "fcb-launch-file-v1").exists())
+        self.assertFalse((resources / "fcb-launch-line-v1").exists())
         self.assertFalse((self.app / "Contents/MacOS/fcb").exists())
         compiler = next(args for name, args in self.calls() if name == "xcrun")
         self.assertIn("FCB_APP_STORE", compiler)

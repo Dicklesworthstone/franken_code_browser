@@ -9,6 +9,8 @@ import AppKit
     let root: String
     let path: String
     let accessLease: AnyObject?
+    private let initialLine: UInt64?
+    private let initialLineConsumed: (() -> Void)?
     private let ownsModel: Bool
     private let pin: ((AtlasPagedReaderModel) -> Void)?
     private let canPin: Bool
@@ -18,6 +20,7 @@ import AppKit
     private let project: AtlasProjectBrowserModel?
     private let searchProject: ((AtlasReaderSelectionQuery) -> Void)?
     @State private var model: AtlasPagedReaderModel
+    @State private var didConsumeInitialLine = false
     @State private var readerCommands = AtlasReaderCommands()
     @State private var copyNotice = ""
     @State private var showsOutline = false
@@ -34,7 +37,8 @@ import AppKit
     @State private var showsLinked = false
 
     init(root: String, path: String, accessLease: AnyObject?, captured: AtlasSearchCapturedHit? = nil,
-         supplied: AtlasSuppliedReaderSource? = nil,
+         supplied: AtlasSuppliedReaderSource? = nil, initialLine: UInt64? = nil,
+         initialLineConsumed: (() -> Void)? = nil,
          canPin: Bool = false, pin: ((AtlasPagedReaderModel) -> Void)? = nil,
          canKeep: Bool = false, keep: ((AtlasPagedReaderModel) -> Void)? = nil,
          openLocalLink: AtlasDocumentPreviewModel.LocalNavigation? = nil,
@@ -43,6 +47,8 @@ import AppKit
         self.root = root
         self.path = path
         self.accessLease = accessLease
+        self.initialLine = initialLine
+        self.initialLineConsumed = initialLineConsumed
         ownsModel = true
         self.canPin = canPin
         self.pin = pin
@@ -63,7 +69,7 @@ import AppKit
          openLocalLink: AtlasDocumentPreviewModel.LocalNavigation? = nil,
          project: AtlasProjectBrowserModel? = nil,
          searchProject: ((AtlasReaderSelectionQuery) -> Void)? = nil) {
-        root = ""; path = ""; accessLease = nil
+        root = ""; path = ""; accessLease = nil; initialLine = nil; initialLineConsumed = nil
         ownsModel = false; self.canPin = canPin; self.pin = pin
         self.canKeep = canKeep; self.keep = keep
         self.openLocalLink = openLocalLink
@@ -554,7 +560,12 @@ import AppKit
     }
     private func open() {
         copyNotice = ""
-        model.open(root: root, path: path, accessLease: accessLease)
+        let line = didConsumeInitialLine ? nil : initialLine
+        didConsumeInitialLine = true
+        model.open(root: root, path: path, accessLease: accessLease, initialLine: line)
+        // Reappearance may reopen the view's source, but it is not another CLI
+        // navigation. The parent also clears its request before a later remount.
+        if line != nil { initialLineConsumed?() }
     }
     private enum SelectionCopyFormat { case text, withLocation, originalHex }
 

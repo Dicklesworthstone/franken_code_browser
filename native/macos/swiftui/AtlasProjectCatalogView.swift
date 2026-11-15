@@ -15,7 +15,6 @@ import SwiftUI
     let refresh: () -> Void
     let showAtlas: () -> Void
     let open: (UInt64) -> Void
-    @State private var startupMessage: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -35,11 +34,6 @@ import SwiftUI
             }.padding(12)
             Text(catalog.summary).font(.callout).foregroundStyle(.secondary)
                 .textSelection(.enabled).padding(.horizontal, 12).padding(.bottom, 6)
-            if let startupMessage {
-                Label(startupMessage, systemImage: "exclamationmark.triangle")
-                    .font(.callout).textSelection(.enabled)
-                    .padding(.horizontal, 12).padding(.bottom, 6)
-            }
             if preparing {
                 Text(progress + " You can keep opening files and searching.")
                     .font(.caption).padding(.horizontal, 12).padding(.bottom, 6)
@@ -85,15 +79,5 @@ import SwiftUI
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onAppear {
-            let outcome = AtlasFileStartup.consume(catalog: catalog, visibleEntries: entries)
-            if case .open(let id) = outcome {
-                // Use the same project/generation/grant-checked action as a row
-                // click. This requests a new capture, not an old search anchor.
-                open(id)
-            } else if let message = outcome.message {
-                startupMessage = message
-            }
-        }
     }
 }

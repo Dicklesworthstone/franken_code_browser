@@ -6,16 +6,17 @@
 //! default application, or implicit stdin is involved.
 
 use std::{ffi::{OsStr, OsString}, path::{Path, PathBuf}};
-use fcb_app::args::{self, Command, MAX_SINGLE_ARGUMENT};
+use fcb_app::args::{self, Command, MAX_ARGUMENTS, MAX_ARGUMENT_BYTES, MAX_SINGLE_ARGUMENT};
 
 const PROJECT_MARKER: &str = "Contents/Resources/fcb-launch-project-v1";
 const FILE_MARKER: &str = "Contents/Resources/fcb-launch-file-v1";
+const LINE_MARKER: &str = "Contents/Resources/fcb-launch-line-v1";
 const PICKER_MARKER: &str = "Contents/Resources/fcb-launch-picker-v1";
 const NATIVE_EXECUTABLE: &str = "Contents/MacOS/FrankenCodeBrowser";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Failure {
-    Options, Path, Source, File, Special, Symlink, Bundle, MissingBundle,
+    Options, Path, Source, File, Line, Special, Symlink, Bundle, MissingBundle,
     RootGrant, Canceled, Spawn,
 }
 impl Failure {
@@ -25,6 +26,7 @@ impl Failure {
             Self::Path => "CLI_NATIVE_LAUNCH_PATH",
             Self::Source => "CLI_SOURCE_IO",
             Self::File => "CLI_NATIVE_FILE_OPEN_UNAVAILABLE",
+            Self::Line => "CLI_NATIVE_LINE_OPEN_UNAVAILABLE",
             Self::Special => "CLI_SPECIAL_OBJECT_REFUSED",
             Self::Symlink => "CLI_SYMLINK_REFUSED",
             Self::Bundle => "CLI_NATIVE_APP_INVALID",
@@ -36,10 +38,11 @@ impl Failure {
     }
     fn message(self) -> &'static str {
         match self {
-            Self::Options => "GUI launch accepts a project directory or regular file; use read or open --json for reader options.",
+            Self::Options => "GUI launch accepts a project directory or regular file, with --line N on open FILE; use read or open --json for other reader options.",
             Self::Path => "Native launch needs a bounded, NUL-free UTF-8 source path and an absolute .app bundle path.",
             Self::Source => "The selected source or its parent directory could not be inspected.",
             Self::File => "This app does not support native file startup. Rebuild it with scripts/build_macos_app.sh, or use fcb read FILE.",
+            Self::Line => "This app does not support native line startup. Rebuild it with scripts/build_macos_app.sh, or use fcb read FILE --line N.",
             Self::Special => "Native opening accepts directories or regular files, never devices, pipes or sockets.",
             Self::Symlink => "The selected final source or project component is a symbolic link.",
             Self::Bundle => "The selected app lacks a valid launcher contract or executable. Rebuild it with scripts/build_macos_app.sh.",
@@ -52,24 +55,53 @@ impl Failure {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BundleMode { ProjectArgument, ProjectAndFileArgument, NativePicker }
+enum BundleMode { ProjectArgument, ProjectAndFileArgument, ProjectFileAndLineArgument, NativePicker }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LaunchRequest { path: Option<PathBuf>, line: Option<u64> }
 
 /// None means the existing headless parser/service owns the request, including
 /// all malformed requests and machine-readable output. Never reinterpret them.
-fn request(arguments: &[OsString]) -> Option<Result<Option<PathBuf>, Failure>> {
-    let parsed = args::parse(arguments).ok()?;
+fn request(arguments: &[OsString]) -> Option<Result<LaunchRequest, Failure>> {
+    // Keep the human-only location option out of the general machine parser.
+    // Apply the same admission bounds before allocating the filtered argv, and
+    // leave every malformed/JSON request to its existing headless service.
+    if arguments.len() > MAX_ARGUMENTS || args::json_requested(arguments) { return None; }
+    let mut total = 0usize;
+    for argument in arguments {
+        if argument.len() > MAX_SINGLE_ARGUMENT { return None; }
+        total = total.checked_add(argument.len())?;
+        if total > MAX_ARGUMENT_BYTES { return None; }
+    }
+    let mut filtered = Vec::with_capacity(arguments.len());
+    let mut line = None;
+    let mut positional_only = false;
+    let mut cursor = 0;
+    while cursor < arguments.len() {
+        let argument = &arguments[cursor]; cursor += 1;
+        if !positional_only && argument == "--" { positional_only = true; }
+        if !positional_only && argument == "--line" && arguments.first().is_some_and(|a| a == "open") {
+            if line.is_some() { return None; }
+            let value = args::decimal(arguments.get(cursor)?.to_str()?).ok()?;
+            if value == 0 { return None; }
+            line = Some(value); cursor += 1;
+        } else {
+            filtered.push(argument.clone());
+        }
+    }
+    let parsed = args::parse(&filtered).ok()?;
     if parsed.json || !matches!(parsed.command, Command::Launch | Command::Open) { return None; }
     // The general reader parser also accepts options on `open`. They cannot be
     // silently ignored by the GUI, even when their values equal reader defaults.
     let start = usize::from(parsed.command == Command::Open);
     let mut positional_only = false;
-    for argument in &arguments[start..] {
+    for argument in &filtered[start..] {
         if !positional_only && argument == "--" { positional_only = true; continue; }
         if !positional_only && argument.as_encoded_bytes().first() == Some(&b'-') {
             return Some(Err(Failure::Options));
         }
     }
-    Some(Ok(parsed.file))
+    Some(Ok(LaunchRequest { path: parsed.file, line }))
 }
 
 fn bounded_path(path: &Path) -> bool {
@@ -123,11 +155,12 @@ fn choose_bundle(
     inspect(&path).map(|mode| (path, mode))
 }
 
-fn marker_mode(project: bool, picker: bool, file: bool) -> Result<BundleMode, Failure> {
-    match (project, picker, file) {
-        (true, false, false) => Ok(BundleMode::ProjectArgument),
-        (true, false, true) => Ok(BundleMode::ProjectAndFileArgument),
-        (false, true, false) => Ok(BundleMode::NativePicker),
+fn marker_mode(project: bool, picker: bool, file: bool, line: bool) -> Result<BundleMode, Failure> {
+    match (project, picker, file, line) {
+        (true, false, false, false) => Ok(BundleMode::ProjectArgument),
+        (true, false, true, false) => Ok(BundleMode::ProjectAndFileArgument),
+        (true, false, true, true) => Ok(BundleMode::ProjectFileAndLineArgument),
+        (false, true, false, false) => Ok(BundleMode::NativePicker),
         _ => Err(Failure::Bundle),
     }
 }
@@ -185,14 +218,22 @@ fn filename_hex(name: &OsStr) -> Result<String, Failure> {
     Ok(hex)
 }
 
-fn open_file_arguments(bundle: &Path, mode: BundleMode, root: &Path, name: &OsStr)
+fn open_file_arguments(bundle: &Path, mode: BundleMode, root: &Path, name: &OsStr, line: Option<u64>)
     -> Result<Vec<OsString>, Failure>
 {
     let mut arguments = open_arguments(bundle, mode, Some(root))?;
     // Project-only older bundles must not silently discard the filename.
-    if mode != BundleMode::ProjectAndFileArgument { return Err(Failure::File); }
+    if !matches!(mode, BundleMode::ProjectAndFileArgument | BundleMode::ProjectFileAndLineArgument) {
+        return Err(Failure::File);
+    }
     arguments.push("-fcb.file-hex".into());
     arguments.push(filename_hex(name)?.into());
+    if let line = line {
+        if line == 0 { return Err(Failure::Options); }
+        if mode != BundleMode::ProjectFileAndLineArgument { return Err(Failure::Line); }
+        arguments.push("-fcb.line".into());
+        arguments.push(line.to_string().into());
+    }
     Ok(arguments)
 }
 
@@ -237,10 +278,10 @@ mod native {
         // source-sized file. This is a compatibility contract, not code signing.
         let marker = |name: &str| fs::symlink_metadata(path.join(name))
             .is_ok_and(|entry| entry.is_file() && entry.len() == 0);
-        marker_mode(marker(PROJECT_MARKER), marker(PICKER_MARKER), marker(FILE_MARKER))
+        marker_mode(marker(PROJECT_MARKER), marker(PICKER_MARKER), marker(FILE_MARKER), marker(LINE_MARKER))
     }
 
-    fn prepare(path: Option<&Path>) -> Result<Vec<OsString>, Failure> {
+    fn prepare(path: Option<&Path>, line: Option<u64>) -> Result<Vec<OsString>, Failure> {
         let target = path.map(|path| {
             let cwd = if path.is_absolute() { PathBuf::from("/") }
                 else { std::env::current_dir().map_err(|_| Failure::Source)? };
@@ -255,6 +296,7 @@ mod native {
                 return Ok((root, Some(name)));
             }
             if !metadata.is_dir() { return Err(Failure::Special); }
+            if line.is_some() { return Err(Failure::Options); }
             Ok((path, None))
         }).transpose()?;
         let explicit = std::env::var_os("FCB_APP_BUNDLE").map(PathBuf::from);
@@ -262,7 +304,7 @@ mod native {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let (bundle, mode) = choose_bundle(explicit.as_deref(), executable.as_deref(), home.as_deref(), inspect_bundle)?;
         match target {
-            Some((root, Some(name))) => open_file_arguments(&bundle, mode, &root, &name),
+            Some((root, Some(name))) => open_file_arguments(&bundle, mode, &root, &name, line),
             Some((root, None)) => open_arguments(&bundle, mode, Some(&root)),
             None => open_arguments(&bundle, mode, None),
         }
@@ -272,9 +314,9 @@ mod native {
         mut canceled: impl FnMut() -> bool) -> Option<u8>
     {
         let selected = request(arguments)?;
-        let ready = selected.and_then(|root| {
+        let ready = selected.and_then(|request| {
             if canceled() { return Err(Failure::Canceled); }
-            let argv = prepare(root.as_deref())?;
+            let argv = prepare(request.path.as_deref(), request.line)?;
             if canceled() { return Err(Failure::Canceled); }
             Process::new("/usr/bin/open").args(argv)
                 .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
@@ -327,6 +369,9 @@ pub(crate) use native::run;
 mod tests {
     use super::*;
     fn args(values: &[&str]) -> Vec<OsString> { values.iter().map(OsString::from).collect() }
+    fn launch(path: Option<&str>, line: Option<u64>) -> Option<Result<LaunchRequest, Failure>> {
+        Some(Ok(LaunchRequest { path: path.map(PathBuf::from), line }))
+    }
     #[test]
     fn headless_and_invalid_requests_never_enter_native_launch() {
         for values in [&["--json"][..], &["capabilities"], &["doctor"], &["--help"],
@@ -338,11 +383,11 @@ mod tests {
     }
     #[test]
     fn native_requests_preserve_explicit_scope() {
-        assert_eq!(request(&[]), Some(Ok(None)));
-        assert_eq!(request(&args(&["project"])), Some(Ok(Some("project".into()))));
-        assert_eq!(request(&args(&["open", "project"])), Some(Ok(Some("project".into()))));
-        assert_eq!(request(&args(&["--", "-project"])), Some(Ok(Some("-project".into()))));
-        assert_eq!(request(&args(&["open", "--", "--json"])), Some(Ok(Some("--json".into()))));
+        assert_eq!(request(&[]), launch(None, None));
+        assert_eq!(request(&args(&["project"])), launch(Some("project"), None));
+        assert_eq!(request(&args(&["open", "project"])), launch(Some("project"), None));
+        assert_eq!(request(&args(&["--", "-project"])), launch(Some("-project"), None));
+        assert_eq!(request(&args(&["open", "--", "--json"])), launch(Some("--json"), None));
     }
     #[test]
     fn reader_options_are_not_silently_discarded() {
@@ -351,6 +396,31 @@ mod tests {
             &["open", "root", "--encoding", "auto"]] {
             assert_eq!(request(&args(values)), Some(Err(Failure::Options)), "{values:?}");
         }
+    }
+    #[test]
+    fn native_line_requests_are_exact_bounded_and_leave_machine_output_headless() {
+        for values in [&["open", "main.rs", "--line", "120"][..],
+            &["open", "--line", "120", "main.rs"]] {
+            assert_eq!(request(&args(values)), launch(Some("main.rs"), Some(120)));
+        }
+        assert_eq!(request(&args(&["open", "--line", "18446744073709551615", "--", "--json"])),
+            launch(Some("--json"), Some(u64::MAX)));
+        assert_eq!(request(&args(&["open", "--", "--line"])), launch(Some("--line"), None));
+        for values in [&["open", "main.rs", "--line", "120", "--json"][..],
+            &["read", "main.rs", "--line", "120"], &["open", "--line", "120"],
+            &["open", "main.rs", "--line"], &["open", "main.rs", "--line", "1", "--line", "2"],
+            &["open", "--", "main.rs", "--line", "2"]] {
+            assert_eq!(request(&args(values)), None, "{values:?}");
+        }
+        for number in ["0", "01", "+1", "-1", "1.0", " 1", "1 ", "18446744073709551616", "--json"] {
+            assert_eq!(request(&args(&["open", "main.rs", "--line", number])), None, "{number}");
+        }
+        let mut excessive = args(&["open", "main.rs", "--line", "1"]);
+        excessive.extend((0..MAX_ARGUMENTS).map(|_| OsString::from("--line")));
+        assert_eq!(request(&excessive), None);
+        assert_eq!(request(&args(&["open", &"x".repeat(MAX_SINGLE_ARGUMENT + 1), "--line", "1"])), None);
+        assert_eq!(request(&args(&["open", "main.rs", "--line", "1", "--bytes", "100"])),
+            Some(Err(Failure::Options)));
     }
     #[test]
     fn relative_paths_use_the_invoking_directory_without_shell_expansion() {
@@ -398,10 +468,10 @@ mod tests {
     }
     #[test]
     fn bundle_markers_distinguish_direct_access_from_sandbox_grants() {
-        assert_eq!(marker_mode(true, false, false), Ok(BundleMode::ProjectArgument));
-        assert_eq!(marker_mode(false, true, false), Ok(BundleMode::NativePicker));
-        assert_eq!(marker_mode(false, false, false), Err(Failure::Bundle));
-        assert_eq!(marker_mode(true, true, false), Err(Failure::Bundle));
+        assert_eq!(marker_mode(true, false, false, false), Ok(BundleMode::ProjectArgument));
+        assert_eq!(marker_mode(false, true, false, false), Ok(BundleMode::NativePicker));
+        assert_eq!(marker_mode(false, false, false, false), Err(Failure::Bundle));
+        assert_eq!(marker_mode(true, true, false, false), Err(Failure::Bundle));
         assert_eq!(open_arguments(Path::new("/App.app"), BundleMode::NativePicker, Some(Path::new("/repo"))),
             Err(Failure::RootGrant));
         assert!(open_arguments(Path::new("/App.app"), BundleMode::NativePicker, None).is_ok());
@@ -442,7 +512,7 @@ mod tests {
     #[test]
     fn file_launch_preserves_the_exact_native_name_as_one_hex_argument() {
         let (root, name) = file_target(Path::new("/work/My Project/é.rs")).unwrap();
-        let arguments = open_file_arguments(Path::new("/My App.app"), BundleMode::ProjectAndFileArgument, &root, &name).unwrap();
+        let arguments = open_file_arguments(Path::new("/My App.app"), BundleMode::ProjectAndFileArgument, &root, &name, None).unwrap();
         assert_eq!(arguments, args(&["-n", "-a", "/My App.app", "--args", "-fcb.root",
             "/work/My Project", "-fcb.file-hex", "c3a92e7273"]));
         assert_ne!(filename_hex(OsStr::new("é.rs")).unwrap(), filename_hex(OsStr::new("e\u{301}.rs")).unwrap());
@@ -453,31 +523,45 @@ mod tests {
             ("a\nb", "610a62"), ("a\tb", "610962"), ("a\\b", "615c62"), ("a\"b", "612262")] {
             assert_eq!(filename_hex(OsStr::new(name)).unwrap(), expected);
             let arguments = open_file_arguments(Path::new("/App.app"), BundleMode::ProjectAndFileArgument,
-                Path::new("/repo"), OsStr::new(name)).unwrap();
+                Path::new("/repo"), OsStr::new(name), None).unwrap();
             assert_eq!(arguments.len(), 8);
             assert_eq!(arguments[7], OsStr::new(expected));
         }
     }
     #[test]
     fn file_markers_are_additive_but_cannot_cross_the_sandbox_boundary() {
-        for project in [false, true] { for picker in [false, true] { for file in [false, true] {
-            let expected = match (project, picker, file) {
-                (true, false, false) => Ok(BundleMode::ProjectArgument),
-                (true, false, true) => Ok(BundleMode::ProjectAndFileArgument),
-                (false, true, false) => Ok(BundleMode::NativePicker),
+        for project in [false, true] { for picker in [false, true] { for file in [false, true] { for line in [false, true] {
+            let expected = match (project, picker, file, line) {
+                (true, false, false, false) => Ok(BundleMode::ProjectArgument),
+                (true, false, true, false) => Ok(BundleMode::ProjectAndFileArgument),
+                (true, false, true, true) => Ok(BundleMode::ProjectFileAndLineArgument),
+                (false, true, false, false) => Ok(BundleMode::NativePicker),
                 _ => Err(Failure::Bundle),
             };
-            assert_eq!(marker_mode(project, picker, file), expected);
-        } } }
+            assert_eq!(marker_mode(project, picker, file, line), expected);
+        } } } }
         assert!(open_arguments(Path::new("/App.app"), BundleMode::ProjectAndFileArgument, None).is_ok());
         assert!(open_arguments(Path::new("/App.app"), BundleMode::ProjectAndFileArgument, Some(Path::new("/repo"))).is_ok());
     }
     #[test]
     fn old_bundles_and_sandboxed_bundles_do_not_silently_drop_file_selection() {
         assert_eq!(open_file_arguments(Path::new("/App.app"), BundleMode::ProjectArgument,
-            Path::new("/repo"), OsStr::new("main.rs")), Err(Failure::File));
+            Path::new("/repo"), OsStr::new("main.rs"), None), Err(Failure::File));
         assert_eq!(open_file_arguments(Path::new("/App.app"), BundleMode::NativePicker,
-            Path::new("/repo"), OsStr::new("main.rs")), Err(Failure::RootGrant));
+            Path::new("/repo"), OsStr::new("main.rs"), None), Err(Failure::RootGrant));
+    }
+    #[test]
+    fn line_handoff_requires_a_matching_bundle_and_preserves_full_width_values() {
+        let arguments = open_file_arguments(Path::new("/App.app"), BundleMode::ProjectFileAndLineArgument,
+            Path::new("/repo"), OsStr::new("-fcb.line"), Some(u64::MAX)).unwrap();
+        assert_eq!(arguments, args(&["-n", "-a", "/App.app", "--args", "-fcb.root", "/repo",
+            "-fcb.file-hex", "2d6663622e6c696e65", "-fcb.line", "18446744073709551615"]));
+        assert_eq!(open_file_arguments(Path::new("/App.app"), BundleMode::ProjectAndFileArgument,
+            Path::new("/repo"), OsStr::new("main.rs"), Some(120)), Err(Failure::Line));
+        assert_eq!(open_file_arguments(Path::new("/App.app"), BundleMode::ProjectFileAndLineArgument,
+            Path::new("/repo"), OsStr::new("main.rs"), Some(0)), Err(Failure::Options));
+        assert_eq!(open_file_arguments(Path::new("/App.app"), BundleMode::NativePicker,
+            Path::new("/repo"), OsStr::new("main.rs"), Some(120)), Err(Failure::RootGrant));
     }
     #[test]
     fn file_argument_validation_rejects_traversal_and_preserves_size_limits() {

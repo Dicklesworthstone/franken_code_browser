@@ -4,10 +4,17 @@
 set -eu
 src=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 out=$(mktemp -d "${TMPDIR:-/tmp}/fcb-reader-position.XXXXXX")
-set --
-if [ "$(uname -s)" = Linux ]; then set -- -static-stdlib; fi
-if [ "$(uname -s)" = Darwin ]; then set -- "$@" "$src/AtlasAppearance.swift" "$src/AtlasSourceReader.swift"; fi
-swiftc "$@" -swift-version 6 -warnings-as-errors \
+for suite in reader-position reader-startup; do
+    set --
+    if [ "$(uname -s)" = Linux ]; then set -- -static-stdlib; fi
+    if [ "$(uname -s)" = Darwin ]; then set -- "$@" "$src/AtlasAppearance.swift" "$src/AtlasSourceReader.swift"; fi
+    if [ "$suite" = reader-position ]; then
+        set -- "$@" "$src/tests/AtlasReaderPositionTests.swift"
+    else
+        set -- "$@" "$src/AtlasProjectCatalog.swift" "$src/../tests/AtlasReaderRefreshFixture.swift" \
+            "$src/../tests/AtlasReaderStartupRegressionTests.swift"
+    fi
+    swiftc "$@" -swift-version 6 -warnings-as-errors \
     "$src/AtlasSearch.swift" "$src/AtlasSearchExpression.swift" "$src/AtlasSearchCapture.swift" \
     "$src/AtlasSearchCoordinator.swift" "$src/AtlasProjectIO.swift" \
     "$src/AtlasReader.swift" "$src/AtlasReaderSearch.swift" "$src/AtlasReaderComparison.swift" \
@@ -15,6 +22,7 @@ swiftc "$@" -swift-version 6 -warnings-as-errors \
     "$src/AtlasReaderTextSelection.swift" "$src/AtlasReaderCoordinator.swift" "$src/AtlasCapturedReader.swift" "$src/AtlasSuppliedReader.swift" \
     "$src/AtlasNavigationHistory.swift" "$src/AtlasSource.swift" \
     "$src/AtlasDocumentPreviewModel.swift" "$src/AtlasPagedReaderModel.swift" \
-    "$src/tests/AtlasReaderPositionTests.swift" -o "$out/reader-position-tests"
-"$out/reader-position-tests"
+    -o "$out/$suite-tests"
+    "$out/$suite-tests"
+done
 printf 'Retained test artifacts: %s\n' "$out"

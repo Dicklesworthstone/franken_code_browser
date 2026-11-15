@@ -11,87 +11,87 @@ import Foundation
     static func argv(_ name: String, root: String = "/project") -> [String] {
         ["FrankenCodeBrowser", "-fcb.root", root, "-fcb.file-hex", hex(name)]
     }
-    static func row(_ id: UInt64, _ name: String, openable: Bool = true) -> AtlasProjectCatalog.Entry {
-        .init(id: id, rawPath: Array(name.utf8), displayPath: "display-only",
-            sourcePath: openable ? name : nil, observedBytes: 10, x: 0, y: 0, width: 1, height: 1)
-    }
-    static func catalog(_ rows: [AtlasProjectCatalog.Entry], root: String? = "/project", complete: Bool = true) -> AtlasProjectCatalog {
-        .init(entries: rows, discoveryComplete: complete, policy: "static-product-exclusions", requestedRoot: root)
-    }
-    static func outcome(_ arguments: [String], in report: AtlasProjectCatalog,
-        visible: [AtlasProjectCatalog.Entry]? = nil, permitted: Bool = true) -> Outcome {
+    static func outcome(_ arguments: [String], root: String? = "/project", permitted: Bool = true) -> Outcome {
         var request = AtlasStartupFileRequest(arguments: arguments)
-        return request.consume(catalog: report, visibleEntries: visible ?? report.entries, permitsProjectArguments: permitted)
+        return request.consume(root: root, permitsProjectArguments: permitted)
     }
 
     static func normalSelectionIsConsumedOnce() {
-        let rows = [row(1, "other.rs"), row(2, "main.rs")]
         var request = AtlasStartupFileRequest(arguments: argv("main.rs"))
-        require(request.consume(catalog: catalog(rows), visibleEntries: rows) == .open(2), "must open the named row")
-        require(request.consume(catalog: catalog(rows), visibleEntries: rows) == .none, "must not reopen after refresh")
+        require(request.isPending, "explicit filename is pending")
+        require(request.consume(root: "/project") == .open(path: "main.rs", line: nil), "must open the exact filename")
+        require(!request.isPending, "request is consumed")
+        require(request.consume(root: "/project") == .none, "must not reopen after refresh")
     }
     static func ordinaryStartupDoesNotSelect() {
-        let report = catalog([row(1, "main.rs")])
         for args in [["app"], ["app", "-fcb.root", "/project"], ["app", "/project"]] {
-            require(outcome(args, in: report) == .none, "no filename action without explicit flag")
+            require(outcome(args) == .none, "no filename action without explicit flag")
         }
     }
     static func rootReplacementConsumesWithoutActivation() {
-        let rows = [row(1, "main.rs")]
         var request = AtlasStartupFileRequest(arguments: argv("main.rs"))
-        require(request.consume(catalog: catalog(rows, root: "/other"), visibleEntries: rows) == .differentRoot, "stale root")
-        require(request.consume(catalog: catalog(rows), visibleEntries: rows) == .none, "old root cannot revive the action")
-        require(outcome(argv("main.rs"), in: catalog(rows, root: nil)) == .differentRoot, "unbound reports cannot select")
+        require(request.consume(root: "/other") == .differentRoot, "stale root")
+        require(request.consume(root: "/project") == .none, "old root cannot revive the action")
+        require(outcome(argv("main.rs"), root: nil) == .differentRoot, "unbound project cannot select")
     }
     static func nativeIdentityIsNotUnicodeCanonicalEquality() {
         let composed = "é.rs", decomposed = "e\u{301}.rs"
         require(composed == decomposed, "negative control must be Swift-canonically equal")
-        let report = catalog([row(1, composed), row(2, decomposed)])
-        require(outcome(argv(decomposed), in: report) == .open(2), "raw filename identity")
-        require(outcome(argv(composed, root: "/é"), in: catalog(report.entries, root: "/e\u{301}")) == .differentRoot, "raw root identity")
+        guard case .open(let path, _) = outcome(argv(decomposed)) else { fatalError("missing filename") }
+        require(path.utf8.elementsEqual(decomposed.utf8) && !path.utf8.elementsEqual(composed.utf8), "raw filename identity")
+        require(outcome(argv(composed, root: "/é"), root: "/e\u{301}") == .differentRoot, "raw root identity")
     }
     static func punctuationIsData() {
-        for name in ["my source.rs", "-fcb.root", "quote\".rs", "line\nfeed.rs", "tab\t.rs", "back\\slash.rs", "資料.rs"] {
-            let report = catalog([row(9, name)])
-            require(outcome(argv(name), in: report) == .open(9), "native punctuation must survive hex framing")
+        for name in ["my source.rs", "-fcb.root", "-fcb.line", "quote\".rs", "line\nfeed.rs", "tab\t.rs", "back\\slash.rs", "資料.rs"] {
+            require(outcome(argv(name)) == .open(path: name, line: nil), "native punctuation must survive hex framing")
         }
     }
-    static func missingFilesPreserveCoverage() {
-        for complete in [true, false] {
-            require(outcome(argv("main.rs"), in: catalog([], complete: complete)) == .notCatalogued(partial: !complete), "missing is not proven absent")
+    static func explicitFilesDoNotDependOnDiscoveryOrDisplayFilters() {
+        for name in [".hidden", "ignored.log", "last-file-outside-catalog.rs", "unknown.extension"] {
+            require(outcome(argv(name)) == .open(path: name, line: nil),
+                "the exact filename needs no metadata row; the reader performs actual source admission")
         }
-        let report = catalog([row(1, "main.rs")], complete: false)
-        require(outcome(argv("main.rs"), in: report) == .open(1), "partial catalog does not forbid a known file")
-    }
-    static func filtersAndAvailabilityRemainAuthoritative() {
-        let report = catalog([row(1, "main.rs")])
-        require(outcome(argv("main.rs"), in: report, visible: []) == .filtered, "do not bypass display filter")
-        require(outcome(argv("main.rs"), in: report, visible: [row(1, "wrong.rs")]) == .filtered, "ID alone cannot authorize")
-        require(outcome(argv("main.rs"), in: catalog([row(1, "main.rs", openable: false)])) == .unavailable, "no lossy source path")
     }
     static func sandboxDoesNotAcceptCommandLineGrants() {
-        let report = catalog([row(1, "main.rs")])
-        require(outcome(argv("main.rs"), in: report, permitted: false) == .grantRequired, "picker grant required")
+        require(outcome(argv("main.rs"), permitted: false) == .grantRequired, "picker grant required")
+        require(outcome(argv("main.rs") + ["-fcb.line", "120"], permitted: false) == .grantRequired,
+            "line navigation cannot create a root grant")
     }
     static func malformedFramingIsRejected() {
-        let report = catalog([row(1, "main.rs")])
         for args in [
             ["app", "-fcb.file-hex"], ["app", "-fcb.file-hex", "61"],
             argv("main.rs") + ["-fcb.root", "/other"],
             argv("main.rs") + ["-fcb.file-hex", "62"],
             argv("main.rs", root: "relative"), argv("main.rs", root: "/nul\0root")
-        ] { require(outcome(args, in: report) == .invalid, "invalid startup framing") }
+        ] { require(outcome(args) == .invalid, "invalid startup framing") }
         for value in ["", "6", "zz", "FF", "ff", "00", "2e", "2e2e", "2f61", "612f62", "c0af"] {
-            require(outcome(["app", "-fcb.root", "/project", "-fcb.file-hex", value], in: report) == .invalid,
+            require(outcome(["app", "-fcb.root", "/project", "-fcb.file-hex", value]) == .invalid,
                 "invalid hex, traversal, NUL or malformed UTF-8")
         }
     }
     static func inputBoundsAreEnforced() {
-        let report = catalog([])
-        require(outcome(argv("x") + Array(repeating: "ignored", count: 64), in: report) == .invalid, "argument bound")
-        require(outcome(argv(String(repeating: "x", count: 16_385)), in: report) == .invalid, "hex byte bound")
-        require(outcome(argv("x", root: "/" + String(repeating: "a", count: 16_384)), in: report) == .invalid, "root byte bound")
-        require(outcome(argv("x") + [String(repeating: "a", count: 32_768), String(repeating: "b", count: 32_768)], in: report) == .invalid, "total byte bound")
+        require(outcome(argv("x") + Array(repeating: "ignored", count: 64)) == .invalid, "argument bound")
+        require(outcome(argv(String(repeating: "x", count: 16_385))) == .invalid, "hex byte bound")
+        require(outcome(argv("x", root: "/" + String(repeating: "a", count: 16_384))) == .invalid, "root byte bound")
+        require(outcome(argv("x") + [String(repeating: "a", count: 32_768), String(repeating: "b", count: 32_768)]) == .invalid, "total byte bound")
+    }
+    static func requestedLinesPreserveFullWidthIdentity() {
+        for line in [UInt64(1), 120, 9_007_199_254_740_993, UInt64.max] {
+            require(outcome(argv("main.rs") + ["-fcb.line", String(line)]) == .open(path: "main.rs", line: line),
+                "one-based line is preserved without floating-point conversion")
+        }
+        require(outcome(["app", "-fcb.line", "120", "-fcb.root", "/project", "-fcb.file-hex", hex("main.rs")])
+            == .open(path: "main.rs", line: 120), "option order does not change the request")
+    }
+    static func invalidLineRequestsCannotSilentlyOpenLineOne() {
+        for value in ["", "0", "01", "+1", "-1", "1.0", " 1", "1 ", "18446744073709551616", "-fcb.root"] {
+            require(outcome(argv("main.rs") + ["-fcb.line", value]) == .invalid, "invalid line must not be ignored")
+        }
+        for args in [argv("main.rs") + ["-fcb.line"],
+            argv("main.rs") + ["-fcb.line", "1", "-fcb.line", "2"],
+            ["app", "-fcb.root", "/project", "-fcb.line", "120"]] {
+            require(outcome(args) == .invalid, "line requires one explicit filename and one canonical value")
+        }
     }
     static func rootProvenanceIsHostSupplied() throws {
         let wire: [String: Any] = [
@@ -106,7 +106,7 @@ import Foundation
         let data = try JSONSerialization.data(withJSONObject: wire)
         let report = try AtlasProjectCatalog.decode(data, requestedRoot: "/project")
         require(report.requestedRoot == "/project", "wire cannot replace host provenance")
-        require(outcome(argv("main.rs"), in: report) == .open(1), "decoded production report admits the file")
+        require(outcome(argv("main.rs"), root: report.requestedRoot) == .open(path: "main.rs", line: nil), "host establishes root identity")
         let unbound = try AtlasProjectCatalog.decode(data)
         require(unbound.requestedRoot == nil, "unbound decoder remains unbound")
     }
@@ -116,12 +116,13 @@ import Foundation
         rootReplacementConsumesWithoutActivation()
         nativeIdentityIsNotUnicodeCanonicalEquality()
         punctuationIsData()
-        missingFilesPreserveCoverage()
-        filtersAndAvailabilityRemainAuthoritative()
+        explicitFilesDoNotDependOnDiscoveryOrDisplayFilters()
         sandboxDoesNotAcceptCommandLineGrants()
         malformedFramingIsRejected()
         inputBoundsAreEnforced()
+        requestedLinesPreserveFullWidthIdentity()
+        invalidLineRequestsCannotSilentlyOpenLineOne()
         try rootProvenanceIsHostSupplied()
-        print("11 startup file regression cases passed")
+        print("12 startup file regression cases passed")
     }
 }
