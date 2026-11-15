@@ -40,6 +40,12 @@ import Foundation
             precondition(accepted.withLocationText.contains("\"whole_file_immutable\":false"))
             precondition(accepted.withLocationText.contains("\"extent_sha256\"") && !accepted.withLocationText.contains("\"capture_sha256\""))
             precondition(accepted.withLocationText.contains(String(originalStart)), "Full-width original offsets must survive provenance")
+            precondition(accepted.searchText(maximumUTF8Bytes: 1024)?.utf8.elementsEqual(accepted.text.utf8) == true)
+            let authority = AtlasObservedReaderSourceIdentity(input: input, project: UUID(), grant: nil)
+            let query = try AtlasObservedReaderSelectionQuery(selection: accepted, authority: authority, mode: .text)
+            precondition(query.selectionID == accepted.id && query.authority == authority
+                && query.observation == page.observation && query.originalRange == accepted.originalRange)
+            precondition(query.text.utf8.elementsEqual(accepted.text.utf8))
 
             let mutations: [(String, (inout [String: Any]) -> Void)] = [
                 ("wrong observation", { $0["observation"] = "8" }),
@@ -90,6 +96,12 @@ import Foundation
         let decoded = try AtlasObservedReaderSelection.decode(ObservedReaderFixture.encode(malformedReceipt),
             input: input, request: malformedSelection)
         precondition(decoded.originalHex == "ff" && decoded.containsReplacements)
+        precondition(decoded.searchText(maximumUTF8Bytes: 4096) == nil,
+            "Replacement-decoded bytes cannot seed an exact text query")
+        rejects("replacement-decoded query") {
+            _ = try AtlasObservedReaderSelectionQuery(selection: decoded,
+                authority: .init(input: input, project: UUID(), grant: nil), mode: .text)
+        }
 
         // UTF-16 BOM bytes are outside the visible decoded window, never
         // silently prepended to a selected logical passage.
@@ -119,6 +131,165 @@ import Foundation
         rejects("missing line-scan provenance") {
             _ = try AtlasObservedReaderSelection.decode(ObservedReaderFixture.encode(missingLines), input: input, request: lineSelection)
         }
+    }
+
+    private static func queryPolicyTests() throws {
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("a.swift".utf8))
+        let authority = AtlasObservedReaderSourceIdentity(input: input, project: UUID(), grant: nil)
+        func selected(_ text: String) throws -> AtlasObservedReaderSelection {
+            let length = UInt64(text.utf8.count)
+            let request = try AtlasObservedReaderRequest(offset: 0, bytes: max(4, length))
+            let raw = ObservedReaderFixture.page(41, input, 1, request, length: length, text: text)
+            let page = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(raw),
+                handle: 41, input: input, request: request)
+            let selection = try AtlasObservedReaderSelectionRequest(page: page,
+                nativeRange: NSRange(location: 0, length: (text as NSString).length))
+            let wire = ObservedReaderFixture.selection(raw, utf8Start: 0, utf8End: length,
+                originalStart: 0, originalEnd: length, text: text, originalHex: ObservedReaderFixture.hex(Array(text.utf8)))
+            return try AtlasObservedReaderSelection.decode(ObservedReaderFixture.encode(wire), input: input, request: selection)
+        }
+        for text in [" path:src -excluded\r\n", "e\u{301}", "é", "\u{fffd}", String(repeating: "x", count: 1024)] {
+            let selection = try selected(text)
+            for mode in [AtlasSearchMode.text, .symbols, .occurrences] {
+                let query = try AtlasObservedReaderSelectionQuery(selection: selection, authority: authority, mode: mode)
+                precondition(query.text.utf8.elementsEqual(text.utf8),
+                    "Selection query spelling is not trimmed, normalized or parsed as an expression")
+            }
+        }
+        let overProject = try selected(String(repeating: "é", count: 513))
+        precondition(overProject.searchText(maximumUTF8Bytes: 4096) != nil)
+        rejects("project query UTF-8 byte limit") {
+            _ = try AtlasObservedReaderSelectionQuery(selection: overProject, authority: authority, mode: .text)
+        }
+        let overFile = try selected(String(repeating: "x", count: 4097))
+        precondition(overFile.searchText(maximumUTF8Bytes: 4096) == nil)
+        let nul = try selected("a\0b")
+        precondition(nul.searchText(maximumUTF8Bytes: 4096) == nil)
+        rejects("NUL query") {
+            _ = try AtlasObservedReaderSelectionQuery(selection: nul, authority: authority, mode: .text)
+        }
+        let word = try selected("word")
+        for mode in [AtlasSearchMode.expression, .headings] {
+            rejects("unsupported selection query mode") {
+                _ = try AtlasObservedReaderSelectionQuery(selection: word, authority: authority, mode: mode)
+            }
+        }
+        let standalone = try AtlasObservedReaderInput(selectedFile: input.absolutePath)
+        rejects("selected file cannot invent project authority") {
+            _ = try AtlasObservedReaderSelectionQuery(selection: word,
+                authority: .init(input: standalone, project: authority.project, grant: nil), mode: .text)
+        }
+        let other = try AtlasObservedReaderInput(root: "/another", relativePath: Array("a.swift".utf8))
+        rejects("different project pathname") {
+            _ = try AtlasObservedReaderSelectionQuery(selection: word,
+                authority: .init(input: other, project: authority.project, grant: nil), mode: .text)
+        }
+    }
+
+    private final class SubmittedSearches: @unchecked Sendable {
+        private let lock = NSLock()
+        private var requests: [AtlasObservedReaderSearchRequest] = []
+        var values: [AtlasObservedReaderSearchRequest] { lock.lock(); defer { lock.unlock() }; return requests }
+        func submit(_ request: AtlasObservedReaderSearchRequest) {
+            lock.lock(); defer { lock.unlock() }; requests.append(request)
+        }
+    }
+
+    @MainActor private static func selectionSearchTests() async throws {
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.txt".utf8))
+        let origin = AtlasObservedReaderSource(input: input, project: UUID(), access: nil)
+        let probe = ObservedReaderProbe(), submissions = SubmittedSearches()
+        var transport = probe.transport
+        transport.search = .init(find: { _, request, _ in
+            submissions.submit(request)
+            // The action uses the production request path; existing search
+            // fixtures cover successful search receipt and hit publication.
+            throw AtlasObservedReaderError.engine("STREAM_READ_INVALID_IDENTIFIER")
+        }, hit: { _, _, _ in nil })
+        let model = AtlasObservedReaderModel(transport: transport); model.pageBytes = 4
+        precondition(!model.canFindSelectedText && !model.canFindSelectedOccurrences)
+        model.open(origin)
+        await wait("open for selection search") { model.page != nil && !model.busy }
+        let source = model.source!, navigation = model.navigation, observation = model.page!.observation
+        model.updateTextSelection(source: source, navigation: navigation, range: NSRange(location: 0, length: 3))
+        await wait("selection search receipt") { model.canCopySelection }
+        let selected = model.textSelection!
+        precondition(model.canFindSelectedText && model.canFindSelectedOccurrences)
+        let query = model.selectionQuery(.symbols, selectionID: selected.id)!
+        precondition(query.authority == origin.identity && query.observation == observation
+            && query.text == "old" && query.originalRange == selected.originalRange)
+        precondition(!model.findSelectedText(selectionID: UUID())
+            && model.selectionQuery(.text, selectionID: UUID()) == nil)
+
+        model.searchMode = .expression; model.searchText = "unrelated -excluded"
+        model.searchCaseSensitive = false; model.encoding = .utf16be; model.searchScanBytes = 128
+        probe.setContent("new\n")
+        let reads = probe.windowOffsets.count
+        precondition(model.findSelectedText(selectionID: selected.id))
+        await wait("literal selection search submitted") {
+            submissions.values.count == 1 && !model.busy && model.canCopySelection
+        }
+        let literal = submissions.values[0]
+        precondition(literal.mode == .text && literal.needle == "old" && literal.caseSensitive
+            && literal.encoding == .utf8 && literal.maximumScanBytes == 128 && literal.pageStartAfter == 0)
+        precondition(model.page?.observation == observation && model.textSelection?.text == "old"
+            && probe.windowOffsets.count == reads, "A failed search retains the selected observed evidence")
+        precondition(!model.findSelectedOccurrences(selectionID: selected.id)
+            && model.selectionQuery(.text, selectionID: selected.id) == nil,
+            "A menu from a superseded selection receipt cannot launch another query")
+
+        let current = model.textSelection!
+        precondition(model.findSelectedOccurrences(selectionID: current.id))
+        await wait("identifier selection search submitted") {
+            submissions.values.count == 2 && !model.busy && model.canCopySelection
+        }
+        let identifier = submissions.values[1]
+        precondition(identifier.mode == .occurrences && identifier.needle == "old" && identifier.caseSensitive
+            && identifier.encoding == .utf8 && identifier.generation > literal.generation)
+        precondition(model.notice.contains("Enter one exact identifier"),
+            "Identifier grammar errors remain explicit engine outcomes")
+
+        let latest = model.textSelection!
+        model.searchScanBytes = 0
+        precondition(!model.canFindSelectedText && !model.canFindSelectedOccurrences
+            && !model.findSelectedText(selectionID: latest.id) && submissions.values.count == 2)
+        model.searchScanBytes = 128
+        model.observe(offset: 4)
+        precondition(!model.canFindSelectedText && model.selectionQuery(.text, selectionID: latest.id) == nil)
+        await wait("new page retires search selection") { model.page?.visibleRange.start == 4 && !model.busy }
+        precondition(!model.findSelectedText(selectionID: latest.id) && model.textSelection == nil)
+        model.close()
+        precondition(!model.canFindSelectedText && model.selectionQuery(.text, selectionID: latest.id) == nil)
+        await wait("selection-search retirement") { probe.closedCount == probe.createCount }
+
+        // Missing in-file search does not remove independently authorized
+        // project search; standalone file access never enables project search.
+        let noSearch = AtlasObservedReaderModel(transport: probe.transport); noSearch.pageBytes = 4
+        noSearch.open(origin)
+        await wait("selection-only transport") { noSearch.page != nil && !noSearch.busy }
+        noSearch.updateTextSelection(source: noSearch.source!, navigation: noSearch.navigation,
+            range: NSRange(location: 0, length: 3))
+        await wait("selection-only receipt") { noSearch.canCopySelection }
+        let local = noSearch.textSelection!
+        precondition(!noSearch.canFindSelectedText && !noSearch.canFindSelectedOccurrences
+            && !noSearch.findSelectedText(selectionID: local.id)
+            && noSearch.selectionQuery(.text, selectionID: local.id) != nil)
+        noSearch.close()
+        await wait("selection-only close") { probe.closedCount == probe.createCount }
+
+        let fileOnly = AtlasObservedReaderModel(transport: transport); fileOnly.pageBytes = 4
+        try await fileOnly.openSelectedFile(.init(selectedFile:
+            AtlasObservedReaderInput(selectedFile: input.absolutePath), access: nil))
+        fileOnly.updateTextSelection(source: fileOnly.source!, navigation: fileOnly.navigation,
+            range: NSRange(location: 0, length: 3))
+        await wait("standalone selection receipt") { fileOnly.canCopySelection }
+        let fileSelection = fileOnly.textSelection!
+        precondition(fileOnly.canFindSelectedText && fileOnly.canFindSelectedOccurrences
+            && fileOnly.selectionQuery(.text, selectionID: fileSelection.id) == nil
+            && fileOnly.selectionQuery(.symbols, selectionID: fileSelection.id) == nil
+            && fileOnly.selectionQuery(.occurrences, selectionID: fileSelection.id) == nil)
+        fileOnly.close()
+        await wait("standalone selection close") { probe.closedCount == probe.createCount }
     }
 
     @MainActor private static func modelTests() async throws {
@@ -253,9 +424,11 @@ import Foundation
 
     @MainActor static func main() async throws {
         try wireTests()
+        try queryPolicyTests()
+        try await selectionSearchTests()
         try await modelTests()
         try await cancellationAndLegacy()
         try await failedAndEditedNavigation()
-        print("Observed selection mapping, original-byte correlation, provenance, latest drag, cancellation and legacy fixtures passed.")
+        print("Observed selection mapping, exact query seeding, file/project authority, original-byte correlation, provenance, latest drag, cancellation and legacy fixtures passed.")
     }
 }

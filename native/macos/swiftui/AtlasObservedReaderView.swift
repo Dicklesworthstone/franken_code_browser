@@ -20,6 +20,9 @@ extension AtlasObservedReaderModel {
 @MainActor struct AtlasObservedReaderView: View {
     let presentation: AtlasObservedReaderPresentation
     let showsCloseButton: Bool
+    /// Supplied only by a host that owns the same current project authority.
+    /// Standalone file and other range-only hosts keep this capability absent.
+    let searchProject: ((AtlasObservedReaderSelectionQuery) -> Void)?
     private var origin: AtlasObservedReaderSource { presentation.source }
     @State private var model: AtlasObservedReaderModel
     @State private var wrapsLines = false
@@ -29,9 +32,11 @@ extension AtlasObservedReaderModel {
     @FocusState private var searchFocused: Bool
     @Environment(\.dismiss) private var dismiss
 
-    init(presentation: AtlasObservedReaderPresentation, showsCloseButton: Bool = true) {
+    init(presentation: AtlasObservedReaderPresentation, showsCloseButton: Bool = true,
+         searchProject: ((AtlasObservedReaderSelectionQuery) -> Void)? = nil) {
         self.presentation = presentation
         self.showsCloseButton = showsCloseButton
+        self.searchProject = searchProject
         _model = State(initialValue: presentation.model)
     }
 
@@ -107,10 +112,34 @@ extension AtlasObservedReaderModel {
                     HStack(spacing: 8) {
                         if model.resolvingTextSelection { ProgressView().controlSize(.small) }
                         Text(model.textSelectionNotice.isEmpty
-                            ? "Select text to copy its exact original bytes or observed-source location."
+                            ? "Select text to search its exact spelling or copy its observed-source location."
                             : model.textSelectionNotice)
                             .font(.caption).foregroundStyle(.secondary).lineLimit(2)
                         Spacer()
+                        if let selected = model.textSelection {
+                            Menu("Search selection") {
+                                Button("Find text in this file") {
+                                    if model.findSelectedText(selectionID: selected.id) { searchFocused = true }
+                                }.disabled(!model.canFindSelectedText)
+                                Button("Find identifier occurrences in this file") {
+                                    if model.findSelectedOccurrences(selectionID: selected.id) { searchFocused = true }
+                                }.disabled(!model.canFindSelectedOccurrences)
+                                if let searchProject, origin.input.route == .project {
+                                    Divider()
+                                    Button("Find text in project scope") {
+                                        if let query = model.selectionQuery(.text, selectionID: selected.id) { searchProject(query) }
+                                    }.disabled(model.selectionQuery(.text, selectionID: selected.id) == nil)
+                                    Button("Find declaration candidates in project scope") {
+                                        if let query = model.selectionQuery(.symbols, selectionID: selected.id) { searchProject(query) }
+                                    }.disabled(model.selectionQuery(.symbols, selectionID: selected.id) == nil)
+                                    Button("Find identifier occurrences in project scope") {
+                                        if let query = model.selectionQuery(.occurrences, selectionID: selected.id) { searchProject(query) }
+                                    }.disabled(model.selectionQuery(.occurrences, selectionID: selected.id) == nil)
+                                }
+                            }
+                            .accessibilityLabel("Search selected observed source text")
+                            .help("Use the exact selected spelling. In-file Find starts a new bounded scan of the opened file using this observation's encoding. Project actions keep the current location and file-type scope. Occurrences require one identifier; text with decoding replacements cannot seed a query.")
+                        }
                         Menu("Copy selection") {
                             Button("Copy selected text") { copySelected(.text) }
                             Button("Copy text with location") { copySelected(.withLocation) }

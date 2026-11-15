@@ -10,6 +10,41 @@ struct AtlasObservedReaderSourceIdentity: Equatable, Sendable {
     let grant: ObjectIdentifier?
 }
 
+extension AtlasObservedReaderSelection {
+    /// Match the complete reader's selection-query policy: exact spelling,
+    /// no trimming or normalization, and no query from replacement decoding.
+    func searchText(maximumUTF8Bytes: Int) -> String? {
+        guard !containsReplacements, !text.isEmpty,
+              text.utf8.count <= maximumUTF8Bytes, !text.utf8.contains(0) else { return nil }
+        return text
+    }
+}
+
+/// The observed counterpart of AtlasReaderSelectionQuery. This seeds a new
+/// project query from verified text; its extent provenance never becomes a
+/// complete source revision or a grant to search a different project.
+struct AtlasObservedReaderSelectionQuery: Sendable {
+    let selectionID: UUID
+    let authority: AtlasObservedReaderSourceIdentity
+    let observation: AtlasObservedReaderObservation
+    let originalRange: AtlasObservedByteRange
+    let text: String
+    let mode: AtlasSearchMode
+
+    init(selection: AtlasObservedReaderSelection, authority: AtlasObservedReaderSourceIdentity,
+         mode: AtlasSearchMode) throws {
+        guard authority.input.route == .project,
+              authority.input.absolutePath == selection.observation.identity.path,
+              mode == .text || mode == .symbols || mode == .occurrences,
+              let text = selection.searchText(maximumUTF8Bytes: 1024) else {
+            throw AtlasObservedReaderError.invalidInput
+        }
+        selectionID = selection.id; self.authority = authority
+        observation = selection.observation; originalRange = selection.originalRange
+        self.text = text; self.mode = mode
+    }
+}
+
 /// Created by a current-project or exact-file UI action, never by a saved label
 /// or an old exact search anchor. Authority is retained until close/drain.
 @MainActor struct AtlasObservedReaderSource: Identifiable {
@@ -268,6 +303,58 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
             && page.observation == selection.observation && page.visibleRange == selection.visibleRange
             && intent.range == selection.nativeRange
     }
+    /// Menu actions carry the resolved selection ID, so a delayed click cannot
+    /// borrow a new observation, a newer drag selection or a replacement owner.
+    private var searchableSelection: AtlasObservedReaderSelection? {
+        guard canCopySelection, !resolvingTextSelection,
+              let selection = textSelection, let intent = textSelectionIntent,
+              let page, let session, let authority,
+              page.observation == intent.page.observation,
+              page.visibleRange == intent.page.visibleRange,
+              selection.observation.identity.owner == session.handle,
+              selection.observation.identity.path == authority.input.absolutePath else { return nil }
+        return selection
+    }
+    private func selectedFindRequest(_ mode: AtlasObservedReaderSearchMode,
+        selectionID: UUID? = nil) -> AtlasObservedReaderSearchRequest? {
+        guard mode == .text || mode == .occurrences, transport.search != nil,
+              lastSearchGeneration < UInt64.max, let selection = searchableSelection,
+              selectionID == nil || selection.id == selectionID,
+              let text = selection.searchText(maximumUTF8Bytes: mode == .occurrences
+                ? 1024 : AtlasObservedReaderSearchLimits.needleBytes) else { return nil }
+        // Search the opened object using the decoding that established this
+        // spelling, even if the encoding control was edited after observation.
+        return try? .init(generation: lastSearchGeneration + 1, needle: text,
+            encoding: selection.observation.request.encoding, maximumScanBytes: searchScanBytes,
+            countAllMatches: countAllSearchMatches, caseSensitive: true, mode: mode)
+    }
+    var canFindSelectedText: Bool { selectedFindRequest(.text) != nil }
+    var canFindSelectedOccurrences: Bool { selectedFindRequest(.occurrences) != nil }
+
+    func selectionQuery(_ mode: AtlasSearchMode, selectionID: UUID) -> AtlasObservedReaderSelectionQuery? {
+        guard let selection = searchableSelection, selection.id == selectionID,
+              let authority else { return nil }
+        return try? .init(selection: selection, authority: authority.identity, mode: mode)
+    }
+    @discardableResult func findSelectedText(selectionID: UUID) -> Bool {
+        findSelection(.text, selectionID: selectionID)
+    }
+    @discardableResult func findSelectedOccurrences(selectionID: UUID) -> Bool {
+        findSelection(.occurrences, selectionID: selectionID)
+    }
+    private func findSelection(_ mode: AtlasObservedReaderSearchMode, selectionID: UUID) -> Bool {
+        guard let request = selectedFindRequest(mode, selectionID: selectionID) else { return false }
+        // Freeze the verified spelling before changing controls, which may
+        // revoke prior Find and selection receipts. Identifier grammar stays
+        // with the shared search engine, exactly as in the complete reader.
+        searchMode = request.mode
+        searchCaseSensitive = true
+        encoding = request.encoding
+        searchText = request.needle
+        find()
+        return true
+    }
+
     private var effectiveSearchCaseSensitive: Bool { searchMode == .occurrences || searchCaseSensitive }
     var effectiveSearchCountAllMatches: Bool { searchMode == .expression || countAllSearchMatches }
     var canSearch: Bool {

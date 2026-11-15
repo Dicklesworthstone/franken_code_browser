@@ -682,7 +682,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 .onDisappear { presentation.close() }
         }
         .sheet(item: $observedReader, onDismiss: finishReadingDeskReview) { presentation in
-            AtlasObservedReaderView(presentation: presentation).id(presentation.id)
+            AtlasObservedReaderView(presentation: presentation,
+                searchProject: observedSourceProjectSearch(for: presentation)).id(presentation.id)
         }
         .sheet(item: $workspaceStreamSearch, onDismiss: {
             closeWorkspaceStreamSearch()
@@ -2576,23 +2577,51 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         return { selected in
             guard !loadingProject, browserProject == requestedProject, projectBrowser === browser,
                   root.utf8.elementsEqual(requestedRoot.utf8) else { return }
-            // Detach the current retained reader from the old result row before
-            // replacing that query. Its capture and navigation remain mounted.
-            cancelSourceLoad()
-            clearSearch()
-            let changesInput = searchMode != selected.mode || !query.utf8.elementsEqual(selected.text.utf8)
-                || (selected.mode.supportsNameMatching && searchNameMode != .exact)
-                || (selected.mode.isTextual && !searchCaseSensitive)
-            searchMode = selected.mode
-            if selected.mode.supportsNameMatching { searchNameMode = .exact }
-            if selected.mode.isTextual { searchCaseSensitive = true }
-            query = selected.text
-            showsSidebar = true
-            searchFocused = false
-            // Changed controls enter the existing bounded/debounced generation
-            // path. Repeating an unchanged action still starts a fresh query.
-            if !changesInput { runSearch() }
+            searchFromSelectedSource(text: selected.text, mode: selected.mode)
         }
+    }
+
+    /// A bounded observation supplies exact selected text, not an immutable
+    /// source capture. Only this sheet's current project grant permits using
+    /// that spelling as a new project query.
+    private func observedSourceProjectSearch(for presentation: AtlasObservedReaderPresentation)
+        -> ((AtlasObservedReaderSelectionQuery) -> Void)? {
+        let source = presentation.source
+        guard source.input.route == .project, let authority = snapshotExportSource,
+              source.identity.project == authority.identity.project,
+              source.input.root.utf8.elementsEqual(authority.root.utf8),
+              source.identity.grant == authority.access.map(ObjectIdentifier.init) else { return nil }
+        let browser = projectBrowser
+        return { selected in
+            guard observedReader?.id == presentation.id, projectBrowser === browser,
+                  selected.authority == source.identity,
+                  presentation.model.textSelection?.id == selected.selectionID,
+                  presentation.model.page?.observation == selected.observation,
+                  let current = snapshotExportSource,
+                  current.identity == authority.identity,
+                  current.root.utf8.elementsEqual(authority.root.utf8),
+                  current.access.map(ObjectIdentifier.init) == source.identity.grant else { return }
+            searchFromSelectedSource(text: selected.text, mode: selected.mode)
+        }
+    }
+
+    private func searchFromSelectedSource(text: String, mode: AtlasSearchMode) {
+        // Detach the current retained reader from the old result row before
+        // replacing that query. Its capture and navigation remain mounted.
+        cancelSourceLoad()
+        clearSearch()
+        let changesInput = searchMode != mode || !query.utf8.elementsEqual(text.utf8)
+            || (mode.supportsNameMatching && searchNameMode != .exact)
+            || (mode.isTextual && !searchCaseSensitive)
+        searchMode = mode
+        if mode.supportsNameMatching { searchNameMode = .exact }
+        if mode.isTextual { searchCaseSensitive = true }
+        query = text
+        showsSidebar = true
+        searchFocused = false
+        // Changed controls enter the existing bounded/debounced generation
+        // path. Repeating an unchanged action still starts a fresh query.
+        if !changesInput { runSearch() }
     }
 
     private func runSearch() { runSearch(debounce: false) }
