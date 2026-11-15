@@ -338,10 +338,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     @State private var loadCancellation: AtlasSearchCancellation?
     @State private var showsReader = false
     @State private var usesPagedReader = false
-    @State private var capturedReaderTarget: AtlasSearchCapturedHit?
-    @State private var suppliedReaderTarget: AtlasSuppliedReaderSource?
-    @State private var startupReaderLine: (navigation: UUID, line: UInt64)?
-    @State private var finderReaderCapture: AtlasProgressiveFileCapture?
+    @State private var readerHistory = AtlasWorkspaceReaderHistory()
     @State private var observedReader: AtlasObservedReaderPresentation?
     @State private var workspaceStreamSearch: AtlasWorkspaceStreamPresentation?
     @State private var projectLinks: AtlasProjectLinksPresentation?
@@ -422,6 +419,12 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         atlasResidency.hasInstalledLayout(root: root, layoutRevision: atlasRevision)
     }
     private var hasRetainedAtlas: Bool { hasMetadataAtlas && retainedAtlasRevision == atlasRevision }
+    private var workspaceReader: AtlasWorkspaceReaderCapture? {
+        usesPagedReader ? readerHistory.current : nil
+    }
+    private var hasSourcePane: Bool {
+        selectedPath != nil || readerHistory.current != nil || readerHistory.busy || !readerHistory.notice.isEmpty
+    }
     private var retainedReaderSelection: AtlasReaderSelection? {
         guard retainedReaderPresentation?.navigation == focusRequest else { return nil }
         return retainedReaderPresentation?.selection
@@ -443,7 +446,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
 
     private var selectedObservedSource: AtlasObservedReaderSource? {
         guard let authority = snapshotExportSource,
-              let raw = finderReaderCapture?.file.rawPath ?? selectedPath.map({ Array($0.utf8) }),
+              let raw = workspaceReader?.relativePath ?? selectedPath.map({ Array($0.utf8) }),
               let input = try? AtlasObservedReaderInput(root: authority.root, relativePath: raw) else { return nil }
         return AtlasObservedReaderSource(input: input, project: authority.identity.project, access: authority.access)
     }
@@ -493,7 +496,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         projection: AtlasProjectRelationshipProjection = .documentation) {
         guard let authority = snapshotExportSource else { return }
         let path = direction == .all ? nil
-            : (finderReaderCapture?.file.rawPath ?? selectedPath.map { Array($0.utf8) })
+            : (workspaceReader?.relativePath ?? selectedPath.map { Array($0.utf8) })
         guard direction == .all || path != nil else { return }
         closeProjectLinks()
         projectLinks = AtlasProjectLinksPresentation(root: authority.root,
@@ -624,7 +627,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             } label: {
                 Label("Source Reader", systemImage: "doc.text")
             }
-            .disabled(selectedPath == nil && finderReaderCapture == nil)
+            .disabled(!hasSourcePane)
             .help("Show or hide the selectable source reader")
             Button { showsReadingDesk = true } label: {
                 Label("Reading Desk", systemImage: "books.vertical")
@@ -739,7 +742,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
 #endif
             projectChanges.close()
             closeAtlasResidency()
-            closeFinderReader()
+            readerHistory.close()
             projectBrowser.close()
             savedRepository.close()
             snapshotExport.cancel()
@@ -752,8 +755,6 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             showsReadingDesk = false
             pinnedReaders.closeAll()
             showsFileFinder = false
-            capturedReaderTarget = nil
-            suppliedReaderTarget = nil
             cancelSourceLoad()
             loadTask?.cancel()
             loadCancellation?.cancel()
@@ -773,7 +774,11 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             // Returning creates a new native surface whose accepted frame
             // supplies fresh viewport demand; hidden views do no enrichment.
         }
+        .onChange(of: readerHistory.current?.id) { _, _ in
+            if readerHistory.current != nil { presentWorkspaceReader() }
+        }
         .onChange(of: snapshotExportSource?.identity) { _, _ in
+            bindWorkspaceReaderHistory()
             snapshotExport.cancel()
             closeObservedReader()
             closeWorkspaceStreamSearch()
@@ -960,24 +965,19 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 capture.reader.close(); return
             }
 #if FCB_APP_STORE
-            guard rootAccess?.url.path.utf8.elementsEqual(requestedRoot.utf8) == true else {
+            guard !rootAccessLoader.isLoading,
+                  rootAccess.map(ObjectIdentifier.init) == accessLease.map(ObjectIdentifier.init),
+                  rootAccess?.url.path.utf8.elementsEqual(requestedRoot.utf8) == true else {
                 capture.reader.close(); return
             }
 #endif
-            closeFinderReader()
             cancelSourceLoad()
-            capturedReaderTarget = nil; suppliedReaderTarget = nil
-            selectedHit = nil; selectedMatch = nil; selectedReaderSelection = nil
-            selectedSource = nil; sourceError = nil; fileText = ""
-            // UTF-8 is optional presentation/navigation metadata. Neither this
-            // value nor the escaped label is used to reopen the selected file.
-            selectedPath = capture.file.path
-            finderReaderCapture = capture
-            usesPagedReader = true
-            focusRequest = UUID()
+            selectedHit = nil
+            readerHistory.adopt(root: requestedRoot, relativePath: capture.file.rawPath,
+                label: capture.file.display, accessLease: accessLease, reader: capture.reader)
             showsFileFinder = false
             showsReader = true
-            status = "Opened a new source capture from the selected filename. The retained reader stays available after search closes."
+            status = "Opening the selected retained filename in source history."
         }
         .id(generation)
     }
@@ -1527,10 +1527,10 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                         }
                     }
                 }
-                if ((selectedPath != nil || finderReaderCapture != nil) && showsReader) || !pinnedReaders.entries.isEmpty || pinnedReaders.busy {
+                if (hasSourcePane && showsReader) || !pinnedReaders.entries.isEmpty || pinnedReaders.busy {
                     Divider()
                     HSplitView {
-                        if (selectedPath != nil || finderReaderCapture != nil) && showsReader {
+                        if hasSourcePane && showsReader {
                             sourcePane.frame(minWidth: 320)
                         }
                         if !pinnedReaders.entries.isEmpty || pinnedReaders.busy {
@@ -1544,7 +1544,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             }
             .frame(maxWidth: .infinity)
 
-            if selectedPath != nil && finderReaderCapture == nil && showsReader && pinnedReaders.entries.isEmpty && !pinnedReaders.busy {
+            if selectedPath != nil && showsReader && pinnedReaders.entries.isEmpty && !pinnedReaders.busy {
                 Divider()
                 inspector.frame(width: 264)
             }
@@ -1662,7 +1662,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             Divider()
             VStack(alignment: .leading, spacing: 7) {
                 Text("Relationships").font(.caption.weight(.semibold))
-                if selectedPath != nil || finderReaderCapture != nil {
+                if selectedPath != nil || workspaceReader != nil {
                     Button { openProjectLinks(.outgoing, projection: .imports) } label: {
                         Label("Imports from this file", systemImage: "arrow.up.right")
                     }
@@ -1700,7 +1700,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
 
     private var sourcePane: some View {
         VStack(spacing: 0) {
-            if let label = finderReaderCapture?.file.display ?? selectedPath {
+            if let label = workspaceReader?.label ?? selectedPath ?? readerHistory.requestedLabel {
                 HStack(spacing: 8) {
                     Image(systemName: "doc.text")
                         .foregroundStyle(.secondary)
@@ -1717,7 +1717,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                         }
                             .help("Explicitly open the current project file in bounded observed ranges, including files larger than 32 MiB. Keep this retained source unchanged.")
                     }
-                    if finderReaderCapture != nil {
+                    if workspaceReader != nil {
                         Text("Retained source capture").font(.caption).foregroundStyle(.secondary)
                     } else if let path = selectedPath {
                         let fileHits = hits.filter { $0.sourcePath == path }
@@ -1726,7 +1726,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                             .foregroundStyle(.secondary)
                     }
                     if !usesPagedReader, let path = selectedPath {
-                        if finderReaderCapture == nil, selectedSource != nil, sourceError == nil {
+                        if selectedSource != nil, sourceError == nil {
                             Menu("Display") {
                                 Toggle("Line numbers", isOn: $showsSourceLineNumbers)
                                 Toggle("Visible whitespace", isOn: $showsSourceWhitespace)
@@ -1750,73 +1750,90 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12).padding(.vertical, 4)
             }
-            if let capture = finderReaderCapture {
-                AtlasPagedSourceView(model: capture.reader, canPin: pinnedReaders.canAdd, pin: pinSource,
-                    canKeep: readingDesk.canOperate, keep: keepSource, project: projectBrowser,
-                    searchProject: selectedSourceProjectSearch)
-                    .id(capture.id)
-            } else if usesPagedReader, let path = selectedPath {
-                if !loadingProject, acceptsSource(path, searchRow: sourceSearchRow, exactMatch: false) {
-                    let startupLine = startupReaderLine?.navigation == focusRequest ? startupReaderLine : nil
-#if FCB_APP_STORE
-                    if let access = rootAccess, access.url.path.utf8.elementsEqual(root.utf8) {
-                        AtlasPagedSourceView(root: root, path: path, accessLease: access, captured: capturedReaderTarget,
-                            supplied: suppliedReaderTarget,
-                            initialLine: startupLine?.line, initialLineConsumed: {
-                                if let startupLine, startupReaderLine?.navigation == startupLine.navigation {
-                                    startupReaderLine = nil
-                                }
-                            },
-                            canPin: pinnedReaders.canAdd, pin: pinSource,
-                            canKeep: readingDesk.canOperate, keep: keepSource, project: projectBrowser,
-                            searchProject: selectedSourceProjectSearch)
-                            .id(focusRequest)
-                    } else {
-                        Text("Choose the project folder again to grant read access.")
+            if readerHistory.current != nil || readerHistory.busy {
+                HStack(spacing: 8) {
+                    Button { sourceBack() } label: { Label("Source Back", systemImage: "chevron.left") }
+                        .disabled(readerHistory.busy || (usesPagedReader ? !readerHistory.canBack : readerHistory.current == nil))
+                    Button { sourceForward() } label: { Label("Source Forward", systemImage: "chevron.right") }
+                        .disabled(!usesPagedReader || !readerHistory.canForward)
+                    Text("\(readerHistory.position) of \(readerHistory.count) retained sources")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    if readerHistory.busy {
+                        ProgressView().controlSize(.small)
+                        Button("Cancel opening", action: readerHistory.cancel)
+                            .disabled(readerHistory.canceling && readerHistory.requestedLabel == nil)
                     }
-#else
-                    AtlasPagedSourceView(root: root, path: path, accessLease: nil, captured: capturedReaderTarget,
-                        supplied: suppliedReaderTarget,
-                        initialLine: startupLine?.line, initialLineConsumed: {
-                            if let startupLine, startupReaderLine?.navigation == startupLine.navigation {
-                                startupReaderLine = nil
+                }.controlSize(.small).padding(.horizontal, 12).padding(.vertical, 5)
+                    .help("Keep the last three source captures and their page and Find state. Source Back and Forward never reread a file.")
+            }
+            if !readerHistory.notice.isEmpty {
+                Text(readerHistory.notice).font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12).padding(.vertical, 3)
+            }
+            ZStack(alignment: .topLeading) {
+                ForEach(readerHistory.captures) { capture in
+                    workspaceSourceView(capture)
+                        .opacity(workspaceReader === capture ? 1 : 0)
+                        .allowsHitTesting(workspaceReader === capture)
+                        .disabled(workspaceReader !== capture)
+                        .accessibilityHidden(workspaceReader !== capture)
+                }
+                if workspaceReader == nil {
+                    if let source = selectedSource, sourceError == nil {
+                        AtlasSourceReader(source: source, navigation: focusRequest,
+                            selection: (searchIsCurrent ? selectedReaderSelection : nil) ?? retainedReaderSelection,
+                            wrapsLines: wrapsSourceLines,
+                            showsLineNumbers: showsSourceLineNumbers, showsWhitespace: showsSourceWhitespace,
+                            firstPhysicalLine: 1, usesSyntaxPalette: true) {
+                            if let document = atlasDocuments[source.path],
+                               document.source.path.utf8.elementsEqual(source.path.utf8),
+                               document.source.text.utf8.elementsEqual(source.text.utf8) {
+                                return AtlasDocument.style(document.capture)
                             }
-                        },
-                        canPin: pinnedReaders.canAdd, pin: pinSource,
-                        canKeep: readingDesk.canOperate, keep: keepSource, project: projectBrowser,
-                        searchProject: selectedSourceProjectSearch)
-                        .id(focusRequest)
-#endif
-                } else {
-                    Text("This source origin changed. Open the file again from the current project.")
-                }
-            } else if let source = selectedSource, sourceError == nil {
-                AtlasSourceReader(source: source, navigation: focusRequest,
-                    selection: (searchIsCurrent ? selectedReaderSelection : nil) ?? retainedReaderSelection,
-                    wrapsLines: wrapsSourceLines,
-                    showsLineNumbers: showsSourceLineNumbers, showsWhitespace: showsSourceWhitespace,
-                    firstPhysicalLine: 1, usesSyntaxPalette: true) {
-                    if let document = atlasDocuments[source.path],
-                       document.source.path.utf8.elementsEqual(source.path.utf8),
-                       document.source.text.utf8.elementsEqual(source.text.utf8) {
-                        return AtlasDocument.style(document.capture)
+                            return NSAttributedString(string: source.text, attributes: [
+                                .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
+                                .foregroundColor: Monokai.color("plain")
+                            ])
+                        }
+                    } else {
+                        ScrollView {
+                            Text(sourceError ?? fileText)
+                                .font(.system(size: 12, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .topLeading)
+                                .padding(10)
+                        }
                     }
-                    return NSAttributedString(string: source.text, attributes: [
-                        .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
-                        .foregroundColor: Monokai.color("plain")
-                    ])
-                }
-            } else {
-                ScrollView {
-                    Text(sourceError ?? fileText)
-                        .font(.system(size: 12, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
-                        .padding(10)
                 }
             }
+            .background(AtlasDocumentLinkFocus(capture: workspaceReader?.id)
+                .allowsHitTesting(false).accessibilityHidden(true))
         }
         .background(Color(nsColor: .textBackgroundColor))
+    }
+
+    private func workspaceSourceView(_ capture: AtlasWorkspaceReaderCapture) -> some View {
+        AtlasPagedSourceView(model: capture.reader,
+            canPin: workspaceReader === capture && pinnedReaders.canAdd,
+            pin: { reader in
+                guard workspaceReader === capture, capture.reader === reader else { return }
+                pinSource(reader)
+            },
+            canKeep: workspaceReader === capture && readingDesk.canOperate,
+            keep: { reader in
+                guard workspaceReader === capture, capture.reader === reader else { return }
+                keepSource(reader)
+            }, project: projectBrowser, searchProject: workspaceSourceProjectSearch(for: capture))
+    }
+
+    private func workspaceSourceProjectSearch(for capture: AtlasWorkspaceReaderCapture)
+        -> ((AtlasReaderSelectionQuery) -> Void)? {
+        guard let search = selectedSourceProjectSearch else { return nil }
+        return { selected in
+            guard workspaceReader === capture else { return }
+            search(selected)
+        }
     }
 
     // MARK: Actions
@@ -1831,29 +1848,80 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     }
 
     private func pinSource(_ reader: AtlasPagedReaderModel) {
-        if let capture = finderReaderCapture, capture.reader === reader, reader.canPin,
-           capture.root.utf8.elementsEqual(root.utf8),
-           reader.page?.identity.pathBytes == capture.file.rawPath {
-            pinnedReaders.pin(reader, root: root, label: capture.file.display)
-            return
-        }
-        guard !loadingProject, let path = selectedPath, let page = reader.page, reader.canPin,
-              let input = try? AtlasReaderInput(root: root, path: path) else { return }
-        let isLiveLabel = page.identity.pathBytes.elementsEqual(input.fullPath.utf8)
-        let isCapturedLabel = capturedReaderTarget.map {
-            $0.root.utf8.elementsEqual(root.utf8) && $0.path.utf8.elementsEqual(path.utf8)
-                && page.identity.pathBytes.elementsEqual($0.path.utf8)
-        } ?? false
-        guard isLiveLabel || isCapturedLabel else { return }
+        guard let capture = workspaceReader, capture.reader === reader, reader.canPin,
+              capture.root.utf8.elementsEqual(root.utf8) else { return }
 #if FCB_APP_STORE
-        guard rootAccess?.url.path.utf8.elementsEqual(root.utf8) == true else { return }
+        guard !rootAccessLoader.isLoading, let access = rootAccess,
+              access.url.path.utf8.elementsEqual(root.utf8) else { return }
 #endif
-        pinnedReaders.pin(reader, root: root, label: page.identity.displayPath)
+        pinnedReaders.pin(reader, root: root, label: capture.label)
     }
 
-    private func closeFinderReader() {
-        finderReaderCapture?.reader.close()
-        finderReaderCapture = nil
+    private func bindWorkspaceReaderHistory() {
+#if FCB_APP_STORE
+        guard let access = rootAccess, access.url.path.utf8.elementsEqual(root.utf8) else {
+            readerHistory.close()
+            return
+        }
+        readerHistory.bind(root: root, accessIdentity: ObjectIdentifier(access))
+#else
+        readerHistory.bind(root: root, accessIdentity: nil)
+#endif
+    }
+
+    /// Opening is a proposal: the displayed capture and Forward entries remain
+    /// usable until the new reader has validated its first page/exact target.
+    private func openWorkspaceReader(_ path: String, captured: AtlasSearchCapturedHit? = nil,
+                                     supplied: AtlasSuppliedReaderSource? = nil, initialLine: UInt64? = nil) {
+        guard !loadingProject else { return }
+        let accessLease: AnyObject?
+#if FCB_APP_STORE
+        guard !rootAccessLoader.isLoading, let access = rootAccess,
+              access.url.path.utf8.elementsEqual(root.utf8) else {
+            status = "Choose the project folder again to grant read access."
+            return
+        }
+        accessLease = access
+#else
+        accessLease = nil
+#endif
+        cancelSourceLoad()
+        if captured == nil { selectedHit = nil }
+        readerHistory.open(root: root, path: path, accessLease: accessLease, initialLine: initialLine) {
+            AtlasPagedReaderModel(transport: .native, search: .native, outline: .native,
+                document: .native, captured: captured, supplied: supplied)
+        }
+        showsReader = true
+        status = "Opening \(path). The retained reader stays available until the new source is ready."
+    }
+
+    private func presentWorkspaceReader() {
+        guard let capture = readerHistory.current else { return }
+        cancelSourceLoad()
+        selectedMatch = selectedHit.flatMap { row in
+            guard searchIsCurrent,
+                  let hit = searchPresentation?.captureCandidate(for: row, in: searchContext),
+                  hit.sourcePath?.utf8.elementsEqual(capture.relativePath) == true else { return nil }
+            return resolvedMatches[hit.id]
+        }
+        selectedReaderSelection = nil
+        selectedSource = nil; sourceError = nil; fileText = ""
+        selectedPath = capture.path
+        usesPagedReader = true
+        showsReader = true
+        focusRequest = UUID()
+        status = capture.reader.notice.isEmpty ? readerHistory.notice : capture.reader.notice
+    }
+    private func sourceBack() {
+        selectedHit = nil
+        if usesPagedReader { readerHistory.back() }
+        presentWorkspaceReader()
+    }
+    private func sourceForward() {
+        guard usesPagedReader else { return }
+        selectedHit = nil
+        readerHistory.forward()
+        presentWorkspaceReader()
     }
 
     /// Revoke old camera coordinates when publishing a layout, before a
@@ -1977,7 +2045,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         closeWorkspaceStreamSearch()
         closeProjectLinks()
         retainedAtlasRevision = nil
-        if showsReader, finderReaderCapture != nil || selectedPath != nil {
+        readerHistory.catalogRefreshed()
+        if showsReader, hasSourcePane {
             retainedReaderPresentation = (focusRequest, selectedReaderSelection ?? retainedReaderSelection)
         }
         // These inputs and focusRequest own the mounted paged reader. Keeping
@@ -2047,13 +2116,11 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         closeWorkspaceStreamSearch()
         closeProjectLinks()
         closeAtlasResidency()
-        closeFinderReader()
+        readerHistory.close()
         workspaceSearch?.refresh()
         projectBrowser.close()
         projectBrowser = AtlasProjectBrowserModel(transport: .native)
         showsFileFinder = false
-        capturedReaderTarget = nil
-        suppliedReaderTarget = nil
         cancelSourceLoad()
         clearSearch()
         selectedPath = nil
@@ -2190,8 +2257,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         let outcome = AtlasFileStartup.consume(root: root)
         if case .open(let path, let line) = outcome {
             selectedHit = nil
-            openFile(path)
-            if let line { startupReaderLine = (focusRequest, line) }
+            openFile(path, initialLine: line)
             showsReader = true
         } else if let message = outcome.message {
             status = message
@@ -2474,12 +2540,11 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     }
 
     private func applyFileScope() {
-        closeFinderReader()
-        capturedReaderTarget = nil
-        suppliedReaderTarget = nil
+        readerHistory.catalogRefreshed()
         cancelSourceLoad()
         clearSearch()
-        selectedPath = nil; selectedSource = nil; selectedMatch = nil
+        if usesPagedReader, readerHistory.current != nil { presentWorkspaceReader() }
+        else { selectedPath = nil; selectedSource = nil; selectedMatch = nil }
         updateCatalogFilter()
         if hasRetainedAtlas {
             if projectOpening.isPreparing { cancelAtlasLoad() }
@@ -2501,7 +2566,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     private func clearSearch() {
         if sourceSearchRow != nil {
             cancelSourceLoad()
-            if selectedSource == nil {
+            if selectedSource == nil, workspaceReader == nil {
                 selectedPath = nil
                 fileText = ""
                 sourceError = nil
@@ -2780,20 +2845,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             status = (error as? AtlasReaderError)?.message ?? "The displayed source could not be opened as retained pages."
             return
         }
-        capturedReaderTarget = nil
-        suppliedReaderTarget = supplied
-        cancelSourceLoad()
-        selectedHit = nil
-        selectedMatch = nil
-        selectedReaderSelection = nil
-        selectedSource = nil
-        sourceError = nil
-        fileText = ""
-        usesPagedReader = true
-        showsReader = true
-        focusRequest = UUID()
-        status = supplied == nil ? "Capturing the current file for byte and line navigation."
-            : "Opening pages from the displayed capture. Use Refresh from disk to load later file edits."
+        openWorkspaceReader(path, supplied: supplied)
     }
 
     private func openSearchFile(_ row: AtlasSearchRowID) {
@@ -2826,21 +2878,9 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             && presentation.captureCandidate(for: row, in: searchContext) != nil)
     }
 
-    private func openFile(_ path: String, searchRow: AtlasSearchRowID? = nil, exactMatch: Bool = false) {
-        guard acceptsSource(path, searchRow: searchRow, exactMatch: exactMatch) else { return }
-        closeFinderReader()
-        capturedReaderTarget = nil
-        suppliedReaderTarget = nil
-        cancelSourceLoad()
-        usesPagedReader = false
-        sourceSearchRow = searchRow
-        selectedMatch = nil
-        selectedReaderSelection = nil
-        selectedPath = path
-        selectedSource = nil
-        sourceError = nil
-        fileText = ""
-        focusRequest = UUID()
+    private func openFile(_ path: String, searchRow: AtlasSearchRowID? = nil,
+                          exactMatch: Bool = false, initialLine: UInt64? = nil) {
+        guard !loadingProject, acceptsSource(path, searchRow: searchRow, exactMatch: exactMatch) else { return }
         if exactMatch, let capture = searchReport?.capture {
             guard let row = searchRow,
                   let hit = searchPresentation?.captureCandidate(for: row, in: searchContext),
@@ -2849,57 +2889,50 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                   target.needle.utf8.elementsEqual((hit.actualText ?? searchReport?.expression?.primaryNeedle ?? query).utf8),
                   searchMode != .expression || searchReport?.expression?.query.utf8.elementsEqual(query.utf8) == true,
                   target.mode == searchMode, target.caseSensitive == effectiveSearchCaseSensitive else {
-                sourceUnavailable()
-                sourceError = "The retained search capture could not authorize this match. Search again, or explicitly open the current file."
-                status = sourceError ?? "Retained match unavailable"
+                status = "The retained search capture could not authorize this match. Your current reader is unchanged. Search again, or explicitly open the current file."
                 return
             }
-            capturedReaderTarget = target
-            usesPagedReader = true
-            showsReader = true
-            // The current row authorizes this transfer. The independent reader
-            // survives query edits and same-root discovery refresh; replacing
-            // its root grant or explicitly opening another source revokes it.
-            // No live-file fallback and no atlas geometry used as source proof.
-            sourceSearchRow = nil
-            selectedMatch = resolvedMatches[hit.id]
-            status = "Opening the exact retained search capture without rereading the live file."
+            // This current row authorizes one independent capture transfer.
+            // Query edits cannot revoke its accepted reader or lend it a path.
+            openWorkspaceReader(path, captured: target)
             return
         }
-        // String-keyed lookup may return a canonically equivalent filename.
-        // Such a document cannot lend this request its source or capture proof.
-        // An earlier atlas remains readable, but new file/search actions after
-        // refresh must capture their own source rather than borrow its bytes.
-        if !hasRetainedAtlas, let source = atlasDocuments[path]?.source, source.path.utf8.elementsEqual(path.utf8) {
-            if exactMatch {
-                presentSource(source, searchRow: searchRow, exactMatch: true)
-            } else {
-                // Ordinary atlas activation gets the same exact-selection,
-                // notes and navigation tools as every other retained reader.
-                // Import the already displayed capture; never reread its path.
-                selectedSource = source
-                openPagedFile(path)
+        if !exactMatch {
+            let supplied: AtlasSuppliedReaderSource?
+            do {
+                // String dictionaries use canonical equality; original path
+                // bytes must match before an atlas lends us its exact capture.
+                if !hasRetainedAtlas, let source = atlasDocuments[path]?.source,
+                   source.path.utf8.elementsEqual(path.utf8) {
+                    supplied = try AtlasSuppliedReaderSource(root: root, path: path, text: source.text)
+                } else { supplied = nil }
+            } catch {
+                status = "The displayed source could not be opened as retained pages. Your current reader is unchanged."
+                return
             }
+            openWorkspaceReader(path, supplied: supplied, initialLine: initialLine)
             return
         }
 
-        // File-only activation can use decoded pages, including UTF-16/NUL,
-        // without inventing an exact search location in a different capture.
-        if !exactMatch {
-            usesPagedReader = true
-            showsReader = true
-            status = "Opening retained source pages without search-match navigation."
+        // Legacy reports without a transferable capture keep their existing
+        // exact digest/range verification. Retained history remains available
+        // through Source Back, and is never replaced by an unverified result.
+        readerHistory.cancel()
+        cancelSourceLoad()
+        sourceSearchRow = searchRow
+        if !hasRetainedAtlas, let source = atlasDocuments[path]?.source,
+           source.path.utf8.elementsEqual(path.utf8) {
+            presentSource(source, searchRow: searchRow, exactMatch: true)
+            sourceSearchRow = nil
             return
         }
 
         // Preserve the bounded native queue and root lease for on-demand reads.
         // Revalidate the report as well as the project before any publication.
         let requestedRoot = root
-        let navigation = focusRequest
         let generation = loadGeneration
         let cancellation = AtlasSearchCancellation()
         sourceCancellation = cancellation
-        fileText = "Opening source…"
         status = "Opening \(path)…"
         let leases: [AnyObject]
 #if FCB_APP_STORE
@@ -2914,7 +2947,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
 #endif
         sourceTask = Task {
             defer {
-                if focusRequest == navigation {
+                if sourceCancellation === cancellation {
                     sourceTask = nil
                     sourceCancellation = nil
                     sourceSearchRow = nil
@@ -2925,18 +2958,16 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                     Engine.read(root: requestedRoot, path: path)
                 }
                 guard !Task.isCancelled, !cancellation.isCanceled,
-                      focusRequest == navigation, loadGeneration == generation,
+                      sourceCancellation === cancellation, loadGeneration == generation,
                       root.utf8.elementsEqual(requestedRoot.utf8),
-                      selectedPath?.utf8.elementsEqual(path.utf8) == true,
                       acceptsSource(path, searchRow: searchRow, exactMatch: exactMatch) else { return }
                 if let text {
                     presentSource(AtlasSource(path: path, text: text), searchRow: searchRow, exactMatch: exactMatch)
                 } else { sourceUnavailable() }
             } catch {
                 guard !Task.isCancelled, !cancellation.isCanceled,
-                      focusRequest == navigation, loadGeneration == generation,
+                      sourceCancellation === cancellation, loadGeneration == generation,
                       root.utf8.elementsEqual(requestedRoot.utf8),
-                      selectedPath?.utf8.elementsEqual(path.utf8) == true,
                       acceptsSource(path, searchRow: searchRow, exactMatch: exactMatch) else { return }
                 sourceUnavailable()
             }
@@ -2955,9 +2986,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                       byteEnd: candidate.end, expectedSHA256: digest, expectedByteCount: count) else {
                 // An exact-hit request must not silently become a file-start
                 // navigation. The separate Open file action remains available.
-                sourceUnavailable()
-                sourceError = "Exact match unavailable: the source capture changed or its offsets cannot be mapped. Search again, or use Open file without match navigation."
-                status = sourceError ?? "Exact match unavailable"
+                status = "Exact match unavailable: the source capture changed or its offsets cannot be mapped. Your current reader is unchanged. Search again, or use Open file without match navigation."
                 return
             }
             hit = candidate
@@ -2966,6 +2995,11 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             hit = nil
             range = nil
         }
+        usesPagedReader = false
+        selectedPath = source.path
+        selectedMatch = nil
+        focusRequest = UUID()
+        showsReader = true
         fileText = source.text
         selectedSource = source
         sourceError = nil
@@ -2988,12 +3022,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     }
 
     private func sourceUnavailable() {
-        fileText = ""
-        selectedSource = nil
-        selectedReaderSelection = nil
-        selectedMatch = nil
-        sourceError = "Source unavailable: this reader accepts UTF-8 files up to 4 MiB, without embedded NUL. The file may also have changed or become inaccessible."
-        status = sourceError ?? "Source unavailable"
+        status = "Source unavailable: this legacy match reader accepts UTF-8 files up to 4 MiB, without embedded NUL. The file may have changed or become inaccessible. Your current reader is unchanged."
     }
 
 #if FCB_APP_STORE

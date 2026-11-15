@@ -4,15 +4,18 @@
 set -eu
 src=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 out=$(mktemp -d "${TMPDIR:-/tmp}/fcb-reader-position.XXXXXX")
-for suite in reader-position reader-startup; do
+for suite in reader-position reader-startup workspace-history; do
     set --
     if [ "$(uname -s)" = Linux ]; then set -- -static-stdlib; fi
     if [ "$(uname -s)" = Darwin ]; then set -- "$@" "$src/AtlasAppearance.swift" "$src/AtlasSourceReader.swift"; fi
     if [ "$suite" = reader-position ]; then
         set -- "$@" "$src/tests/AtlasReaderPositionTests.swift"
-    else
+    elif [ "$suite" = reader-startup ]; then
         set -- "$@" "$src/AtlasProjectCatalog.swift" "$src/../tests/AtlasReaderRefreshFixture.swift" \
             "$src/../tests/AtlasReaderStartupRegressionTests.swift"
+    else
+        set -- "$@" "$src/AtlasDocumentLinkHistory.swift" "$src/AtlasWorkspaceReaderHistory.swift" \
+            "$src/../tests/AtlasReaderRefreshFixture.swift" "$src/../tests/AtlasWorkspaceReaderHistoryTests.swift"
     fi
     swiftc "$@" -swift-version 6 -warnings-as-errors \
     "$src/AtlasSearch.swift" "$src/AtlasSearchExpression.swift" "$src/AtlasSearchCapture.swift" \

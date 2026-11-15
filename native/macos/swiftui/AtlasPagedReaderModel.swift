@@ -460,36 +460,66 @@ import Observation
     }
 
     func open(root: String, path: String, accessLease: AnyObject?, initialLine: UInt64? = nil) {
+        do {
+            let request = try beginOpen(root: root, path: path, accessLease: accessLease, initialLine: initialLine)
+            task = Task {
+                do { try await completeOpen(request) }
+                catch { /* completeOpen reports failure and retires an unpublished capture. */ }
+            }
+        } catch {
+            notice = (error as? AtlasReaderError)?.message ?? AtlasReaderError.invalidInput.message
+        }
+    }
+
+    /// Prepare a new, independent reader before a workspace history accepts it.
+    /// The caller owns publication and closes this model if it is superseded.
+    /// Cancellation waits for entered native work to drain before returning.
+    func prepareOpen(root: String, path: String, accessLease: AnyObject?, initialLine: UInt64? = nil) async throws {
+        try Task.checkCancellation()
+        guard page == nil, !busy else { throw AtlasReaderError.unavailable }
+        let request = try beginOpen(root: root, path: path, accessLease: accessLease, initialLine: initialLine)
+        try await completeOpen(request)
+    }
+
+    private struct PreparedOpen {
+        let input: AtlasReaderInput
+        let accessLease: AnyObject?
+        let imageSource: AtlasDocumentImageSource?
+        let initialLine: UInt64?
+        let ticket: UUID
+    }
+
+    /// Set up the operation before assigning the view-owned Task: begin()
+    /// cancels earlier work and must never cancel the task being initialized.
+    private func beginOpen(root: String, path: String, accessLease: AnyObject?,
+                           initialLine: UInt64?) throws -> PreparedOpen {
         close()
         let input: AtlasReaderInput
-        do {
-            guard capturedTarget == nil || suppliedSource == nil else { throw AtlasReaderError.invalidInput }
-            if let initialLine {
-                guard initialLine > 0, capturedTarget == nil else { throw AtlasReaderError.invalidInput }
-            }
-            let liveInput = try AtlasReaderInput(root: root, path: path)
-            if let target = capturedTarget {
-                guard target.root.utf8.elementsEqual(root.utf8), target.path.utf8.elementsEqual(path.utf8),
-                      !target.mode.isTextual || coordinator.supportsFind,
-                      target.mode != .occurrences || coordinator.supportsReferences else { throw AtlasReaderError.invalidInput }
-                input = try AtlasReaderInput(captured: target)
-                findOptions = .init()
-                fileQuery = target.mode.isTextual ? target.needle : ""
-                referenceName = target.mode == .occurrences ? target.needle : ""
-            } else if let supplied = suppliedSource {
-                guard supplied.matches(root: root, path: path) else { throw AtlasReaderError.invalidInput }
-                guard liveTransport.openBytes != nil else { throw AtlasReaderError.unavailable }
-                input = supplied.input
-            } else {
-                input = liveInput
-            }
-            // Remember only the explicitly opened project/path and its current
-            // lease. Captured metadata alone never grants a refresh destination.
-            refreshInput = liveInput
-            refreshImageSource = try? AtlasDocumentImageSource(root: root, relativePath: path)
-            refreshAccessLease = accessLease
-        } catch let error as AtlasReaderError { notice = error.message; return }
-        catch { notice = AtlasReaderError.invalidInput.message; return }
+        guard capturedTarget == nil || suppliedSource == nil else { throw AtlasReaderError.invalidInput }
+        if let initialLine {
+            guard initialLine > 0, capturedTarget == nil else { throw AtlasReaderError.invalidInput }
+        }
+        let liveInput = try AtlasReaderInput(root: root, path: path)
+        if let target = capturedTarget {
+            guard target.root.utf8.elementsEqual(root.utf8), target.path.utf8.elementsEqual(path.utf8),
+                  !target.mode.isTextual || coordinator.supportsFind,
+                  target.mode != .occurrences || coordinator.supportsReferences else { throw AtlasReaderError.invalidInput }
+            input = try AtlasReaderInput(captured: target)
+            findOptions = .init()
+            fileQuery = target.mode.isTextual ? target.needle : ""
+            referenceName = target.mode == .occurrences ? target.needle : ""
+        } else if let supplied = suppliedSource {
+            guard supplied.matches(root: root, path: path) else { throw AtlasReaderError.invalidInput }
+            guard liveTransport.openBytes != nil else { throw AtlasReaderError.unavailable }
+            input = supplied.input
+        } else {
+            input = liveInput
+        }
+        // Remember only the explicitly opened project/path and its current
+        // lease. Captured metadata alone never grants a refresh destination.
+        refreshInput = liveInput
+        refreshImageSource = try? AtlasDocumentImageSource(root: root, relativePath: path)
+        refreshAccessLease = accessLease
         let imageSource = refreshImageSource
         if let initialLine { lineInput = String(initialLine) }
         let ticket = begin(query: capturedTarget?.mode.isTextual == true,
@@ -497,92 +527,99 @@ import Observation
         notice = capturedTarget != nil ? "Opening the exact retained search capture…"
             : suppliedSource != nil ? "Opening the complete source already displayed…"
             : "Capturing source for bounded page navigation…"
-        task = Task {
-            do {
-                let opened = try await coordinator.open(input: input, accessLease: accessLease, imageSource: imageSource)
-                guard operation == ticket, !Task.isCancelled else { return }
-                if let target = capturedTarget {
-                    if target.mode.isTextual {
-                        // Literal hits and expression anchor terms receive
-                        // this reader's own exact-spelling query IDs.
-                        let selected = try await AtlasCapturedReader.activate(target, identity: opened.identity,
-                            find: { try await coordinator.find($0) },
-                            nextPage: { needle, cursor in
-                                try await coordinator.find(needle, startAfter: cursor)
-                            }, read: { try await coordinator.read(.hit($0)) },
-                            isCurrent: {
-                                operation == ticket && fileQuery.utf8.elementsEqual(target.needle.utf8)
-                                    && findOptions == .init()
-                            })
-                        guard operation == ticket, !Task.isCancelled else { return }
-                        findReport = selected.report
-                        knownFindMatchCount = selected.report.complete ? selected.report.matchesSeen : nil
-                        selectedHitIndex = selected.index
-                        install(selected.page, request: .hit(selected.target))
-                    } else if target.mode == .occurrences {
-                        let selected = try await AtlasCapturedReader.activateOccurrence(target,
-                            identity: opened.identity,
-                            prepare: { try await coordinator.prepareReferences($0) },
-                            nextPage: { try await coordinator.referencePage($0) },
-                            read: { try await coordinator.read(.reference($0)) },
-                            isCurrent: {
-                                operation == ticket && referenceName.utf8.elementsEqual(target.needle.utf8)
-                            })
-                        guard operation == ticket, !Task.isCancelled else { return }
-                        referencePage = selected.referencePage
-                        referenceRowsAuthorized = true
-                        referenceHistory = selected.history
-                        install(selected.page, request: .reference(selected.target))
-                    } else {
-                        let request = try AtlasCapturedReader.structuralRequest(target, identity: opened.identity)
-                        let selected = try await coordinator.read(request)
-                        guard operation == ticket, !Task.isCancelled else { return }
-                        install(selected, request: request)
-                    }
-                    finish(ticket)
-                    if target.mode == .occurrences {
-                        notice = "Opened the exact whole-token occurrence in the retained search capture. Comments and literals are included; compiler resolution is not claimed. No live-file reread."
-                    } else {
-                        notice = target.mode.isTextual ? "Opened the exact search capture without rereading the live file."
-                            : "Opened retained \(target.mode == .headings ? "heading" : "declaration") evidence at original bytes \(target.start)–\(target.end). No live-file reread."
-                    }
-                } else if let initialLine {
-                    let request = AtlasReaderRequest.position(line: initialLine, column: 1,
-                        kind: .unicodeScalar, bytes: AtlasReaderLimits.pageBytes)
-                    do {
-                        // Resolve against the just-opened immutable capture.
-                        // No native offset guess, second open or live reread.
-                        let located = try await coordinator.read(request)
-                        guard operation == ticket, !Task.isCancelled else { return }
-                        install(located, request: request)
-                        finish(ticket)
-                        notice = "Opened requested line \(initialLine) in the retained source."
-                    } catch {
-                        guard operation == ticket, !Task.isCancelled else { return }
-                        // Keep a useful readable capture when the requested
-                        // line is absent or cannot be mapped, and report it.
-                        install(opened, request: .firstPage)
-                        finish(ticket)
-                        notice = "Could not open requested line \(initialLine). Showing the first page. "
-                            + ((error as? AtlasReaderError)?.message ?? AtlasReaderError.unavailable.message)
-                    }
+        return PreparedOpen(input: input, accessLease: accessLease, imageSource: imageSource,
+            initialLine: initialLine, ticket: ticket)
+    }
+
+    private func completeOpen(_ request: PreparedOpen) async throws {
+        let input = request.input, accessLease = request.accessLease, imageSource = request.imageSource
+        let initialLine = request.initialLine, ticket = request.ticket
+        do {
+            let opened = try await coordinator.open(input: input, accessLease: accessLease, imageSource: imageSource)
+            guard operation == ticket, !Task.isCancelled else { throw AtlasReaderError.canceled }
+            if let target = capturedTarget {
+                if target.mode.isTextual {
+                    // Literal hits and expression anchor terms receive
+                    // this reader's own exact-spelling query IDs.
+                    let selected = try await AtlasCapturedReader.activate(target, identity: opened.identity,
+                        find: { try await coordinator.find($0) },
+                        nextPage: { needle, cursor in
+                            try await coordinator.find(needle, startAfter: cursor)
+                        }, read: { try await coordinator.read(.hit($0)) },
+                        isCurrent: {
+                            operation == ticket && fileQuery.utf8.elementsEqual(target.needle.utf8)
+                                && findOptions == .init()
+                        })
+                    guard operation == ticket, !Task.isCancelled else { throw AtlasReaderError.canceled }
+                    findReport = selected.report
+                    knownFindMatchCount = selected.report.complete ? selected.report.matchesSeen : nil
+                    selectedHitIndex = selected.index
+                    install(selected.page, request: .hit(selected.target))
+                } else if target.mode == .occurrences {
+                    let selected = try await AtlasCapturedReader.activateOccurrence(target,
+                        identity: opened.identity,
+                        prepare: { try await coordinator.prepareReferences($0) },
+                        nextPage: { try await coordinator.referencePage($0) },
+                        read: { try await coordinator.read(.reference($0)) },
+                        isCurrent: {
+                            operation == ticket && referenceName.utf8.elementsEqual(target.needle.utf8)
+                        })
+                    guard operation == ticket, !Task.isCancelled else { throw AtlasReaderError.canceled }
+                    referencePage = selected.referencePage
+                    referenceRowsAuthorized = true
+                    referenceHistory = selected.history
+                    install(selected.page, request: .reference(selected.target))
                 } else {
+                    let request = try AtlasCapturedReader.structuralRequest(target, identity: opened.identity)
+                    let selected = try await coordinator.read(request)
+                    guard operation == ticket, !Task.isCancelled else { throw AtlasReaderError.canceled }
+                    install(selected, request: request)
+                }
+                finish(ticket)
+                if target.mode == .occurrences {
+                    notice = "Opened the exact whole-token occurrence in the retained search capture. Comments and literals are included; compiler resolution is not claimed. No live-file reread."
+                } else {
+                    notice = target.mode.isTextual ? "Opened the exact search capture without rereading the live file."
+                        : "Opened retained \(target.mode == .headings ? "heading" : "declaration") evidence at original bytes \(target.start)–\(target.end). No live-file reread."
+                }
+            } else if let initialLine {
+                let request = AtlasReaderRequest.position(line: initialLine, column: 1,
+                    kind: .unicodeScalar, bytes: AtlasReaderLimits.pageBytes)
+                do {
+                    // Resolve against the just-opened immutable capture.
+                    // No native offset guess, second open or live reread.
+                    let located = try await coordinator.read(request)
+                    guard operation == ticket, !Task.isCancelled else { throw AtlasReaderError.canceled }
+                    install(located, request: request)
+                    finish(ticket)
+                    notice = "Opened requested line \(initialLine) in the retained source."
+                } catch {
+                    guard operation == ticket, !Task.isCancelled else { throw AtlasReaderError.canceled }
+                    // Keep a useful readable capture when the requested
+                    // line is absent or cannot be mapped, and report it.
                     install(opened, request: .firstPage)
                     finish(ticket)
-                    if suppliedSource != nil {
-                        notice = "Opened the exact displayed source without rereading the live file."
-                    }
+                    notice = "Could not open requested line \(initialLine). Showing the first page. "
+                        + ((error as? AtlasReaderError)?.message ?? AtlasReaderError.unavailable.message)
                 }
-            } catch {
-                // Failed initial activation has no publishable page. Retire
-                // its independently imported reader rather than retaining a
-                // hidden capture or falling back to current disk contents.
-                if operation == ticket, page == nil {
-                    coordinator.close()
-                    refreshInput = nil; refreshImageSource = nil; refreshAccessLease = nil
+            } else {
+                install(opened, request: .firstPage)
+                finish(ticket)
+                if suppliedSource != nil {
+                    notice = "Opened the exact displayed source without rereading the live file."
                 }
-                fail(error, ticket: ticket)
             }
+        } catch {
+            // Failed initial activation has no publishable page. Retire
+            // its independently imported reader rather than retaining a
+            // hidden capture or falling back to current disk contents.
+            if operation == ticket, page == nil {
+                coordinator.close()
+                refreshInput = nil; refreshImageSource = nil; refreshAccessLease = nil
+            }
+            fail(error, ticket: ticket)
+            if operation == ticket, Task.isCancelled { finish(ticket) }
+            throw error
         }
     }
 

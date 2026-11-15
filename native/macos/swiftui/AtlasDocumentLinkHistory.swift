@@ -1,7 +1,7 @@
 import Foundation
 import Observation
 
-/// Native ownership of a short Markdown link trail. Every destination is an
+/// Native ownership of a short source trail. Every destination is an
 /// already verified, independently retained capture; moving through this
 /// history neither opens a pathname nor replays an old catalog/query receipt.
 @Observable @MainActor final class AtlasDocumentLinkHistory<Capture: AnyObject> {
@@ -65,15 +65,19 @@ import Observation
     /// The caller supplies the existing verified project-link operation.
     /// Keep its single admission slot occupied until the foreign call drains,
     /// including cancellation, root replacement, and sheet dismissal.
-    func follow(_ open: @escaping @MainActor () async throws -> Capture) {
+    func follow(didFinish: @escaping @MainActor () -> Void = {},
+                _ open: @escaping @MainActor () async throws -> Capture) {
         guard canFollow, let scope else { return }
         let ticket = UUID(), acceptedEpoch = epoch
         let retire = retire, failureMessage = failureMessage
         operation = ticket
         busy = true
         canceling = false
-        notice = "Opening the linked source…"
+        notice = "Opening source…"
         task = Task { [weak self] in
+            // Hosts may start one coalesced request only after finish() has
+            // released this operation's admission, including canceled work.
+            defer { didFinish() }
             do {
                 try Task.checkCancellation()
                 let candidate = try await open()
@@ -88,7 +92,7 @@ import Observation
                 // Do not retire an already owned entry if a host mistakenly
                 // returns it again, and do not let it alias multiple slots.
                 guard !self.captures.contains(where: { $0 === candidate }) else {
-                    self.notice = "The link did not return an independent source capture. Your reading position is unchanged."
+                    self.notice = "The destination did not return an independent source capture. Your reading position is unchanged."
                     return
                 }
                 self.accept(candidate)
@@ -105,12 +109,12 @@ import Observation
     func back() {
         guard canBack else { return }
         position -= 1
-        notice = "Earlier linked source restored from retained bytes."
+        notice = "Earlier source restored from retained bytes."
     }
     func forward() {
         guard canForward else { return }
         position += 1
-        notice = "Later linked source restored from retained bytes."
+        notice = "Later source restored from retained bytes."
     }
 
     func cancel() {
@@ -118,7 +122,7 @@ import Observation
         epoch = UUID()
         canceling = true
         task?.cancel()
-        notice = "Link opening canceled. Your reading position is unchanged; entered work is draining."
+        notice = "Source opening canceled. Your reading position is unchanged; entered work is draining."
     }
 
     /// A catalog's old page/file receipts cannot cross its replacement.
@@ -128,8 +132,8 @@ import Observation
         cancel()
         if current != nil {
             notice = busy
-                ? "Project refreshed. The linked sources remain open; the previous link operation is draining."
-                : "Project refreshed. Back and Forward keep the retained sources; following another link verifies its source against the current project."
+                ? "Project refreshed. Retained sources remain open; the previous opening operation is draining."
+                : "Project refreshed. Back and Forward keep the retained sources; new destinations use the current project."
         }
     }
 
@@ -164,9 +168,9 @@ import Observation
         // retires the capture away from the interaction thread after drain.
         for capture in future { retire(capture) }
         for capture in expired { retire(capture) }
-        notice = "Linked source ready. Back and Forward restore retained reading positions."
+        notice = "Source ready. Back and Forward restore retained reading positions."
         if !expired.isEmpty {
-            notice += " The oldest linked source was released; the last three remain available."
+            notice += " The oldest source was released; the last three remain available."
         }
     }
 
@@ -179,7 +183,7 @@ import Observation
         canceling = false
         if wasCanceled {
             notice = bound
-                ? "Canceled link work finished. Your retained reading position is unchanged."
+                ? "Canceled source work finished. Your retained reading position is unchanged."
                 : ""
         }
     }
