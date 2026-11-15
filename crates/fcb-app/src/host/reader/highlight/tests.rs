@@ -69,15 +69,6 @@ fn unsupported_capture_encoding_never_colors_a_valid_local_fragment() {
     assert!(response.as_str().contains("\"has_replacements\":false"));
     assert!(response.as_str().contains("\"highlight\":{\"state\":\"unsupported_encoding\""));
     assert!(response.as_str().contains("\"runs\":[]"));
-    for little in [true, false] {
-        let bytes: Vec<u8> = "\u{feff}fn 🦀() {}\r\n".encode_utf16()
-            .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
-        let mut reader = source(9622, "source.rs", &bytes);
-        let response = reader.read_window(0, 1024, || false).unwrap();
-        assert!(response.as_str().contains("fn 🦀() {}\\r\\n"));
-        assert!(response.as_str().contains("\"highlight\":{\"state\":\"unsupported_encoding\""));
-        assert!(response.as_str().contains("\"runs\":[]"));
-    }
     let mut unknown = source(9623, "source.no-such-language", b"fn normal() {}");
     let response = unknown.read_window(0, 1024, || false).unwrap();
     assert!(response.as_str().contains("\"highlight\":{\"state\":\"plain\",\"language\":\"plain\""));
@@ -92,6 +83,8 @@ fn unsupported_capture_encoding_never_colors_a_valid_local_fragment() {
         assert!(response.as_str().contains("\"runs\":[]"));
     }
 }
+
+mod utf16;
 
 #[test]
 fn excessive_page_runs_fall_back_without_poisoning_smaller_pages() {

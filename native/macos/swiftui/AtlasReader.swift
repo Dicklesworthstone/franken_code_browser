@@ -333,7 +333,7 @@ struct AtlasReaderHighlight: Sendable {
                 guard runs.isEmpty else { throw AtlasReaderError.invalidResponse }
                 return AtlasReaderHighlight(state: state, language: language, runs: [])
             }
-            guard encoding == "utf8", !hasReplacements, language != "plain" else {
+            guard ["utf8", "utf16le", "utf16be"].contains(encoding), !hasReplacements, language != "plain" else {
                 throw AtlasReaderError.invalidResponse
             }
             let source = text as NSString

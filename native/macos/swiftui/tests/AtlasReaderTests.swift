@@ -291,9 +291,51 @@ private final class Driver: @unchecked Sendable {
         let genuineReplacement = try standalone("�", metadata: highlight([(0, 1, "string")]))
         check(!genuineReplacement.hasReplacements && genuineReplacement.highlight?.state == .highlighted,
               "genuine U+FFFD confused with decoding replacement")
+        func utf16Bytes(_ source: String, little: Bool) -> [UInt8] {
+            let bom: [UInt8] = little ? [255, 254] : [254, 255]
+            return bom + source.utf16.flatMap { unit -> [UInt8] in
+                let low = UInt8(truncatingIfNeeded: unit), high = UInt8(unit >> 8)
+                return little ? [low, high] : [high, low]
+            }
+        }
+        for little in [true, false] {
+            let encoding = little ? "utf16le" : "utf16be"
+            let bytes = utf16Bytes(text, little: little)
+            let colored = try standalone(text, raw: bytes, encoding: encoding, metadata: highlight(runs))
+            check(colored.highlight?.state == .highlighted && colored.originalHex == hex(bytes)
+                && colored.text.utf8.elementsEqual(text.utf8), "UTF-16 highlighting rewrote original source")
+            check(colored.highlight?.runs == page.highlight?.runs, "source byte order changed native UTF-16 spans")
+            let emptyBytes = utf16Bytes("", little: little)
+            let empty = try standalone("", raw: emptyBytes, encoding: encoding, metadata: highlight())
+            check(empty.highlight?.runs.isEmpty == true && empty.originalHex == hex(emptyBytes),
+                  "BOM-only UTF-16 source fabricated tokens or lost original bytes")
+            let replacement = try standalone("�", raw: utf16Bytes("�", little: little), encoding: encoding,
+                metadata: highlight([(0, 1, "string")]))
+            check(!replacement.hasReplacements && replacement.highlight?.state == .highlighted,
+                  "genuine UTF-16 U+FFFD confused with decoder repair")
+            rejects("UTF-16 source accepted a surrogate-splitting token") {
+                _ = try standalone(text, raw: bytes, encoding: encoding,
+                    metadata: highlight([(0, 3, "comment"), (3, text.utf16.count - 3, "plain")]))
+            }
+            let inner = "inside😀\r\n"
+            let prefix = "/*🦀\n"
+            let complete = utf16Bytes(prefix + inner + "*/\n", little: little)
+            let start = UInt64(2 + prefix.utf16.count * 2), length = UInt64(inner.utf16.count * 2)
+            let identity = try AtlasReaderInfo.decode(json(header(length: UInt64(complete.count), encoding: encoding)),
+                handle: 2, path: "/project/file")
+            var wire = window(raw: complete, start: start, end: start + length, encoding: encoding, text: inner)
+            wire["highlight"] = highlight([(0, inner.utf16.count, "comment")])
+            let selected = try AtlasReaderPage.decode(json(wire), info: identity,
+                request: .window(offset: start, bytes: length))
+            check(selected.start == start && selected.end == start + length
+                && selected.highlight?.runs == [.init(range: NSRange(location: 0, length: inner.utf16.count), role: .comment)]
+                && selected.originalHex == hex(complete[Int(start)..<Int(start + length)]),
+                  "interior UTF-16 page mixed source-byte and window UTF-16 coordinates")
+        }
         for (source, bytes, encoding, replacements) in [("�", [UInt8(255)], "utf8", true),
-                                                        ("a", [UInt8(255), 254, 97, 0], "utf16le", false)] {
-            rejects("unsupported decoded source claimed exact UTF-8 highlighting") {
+                ("�", [UInt8(255), 254, 0, 216], "utf16le", true),
+                ("�", [UInt8(254), 255, 216, 0], "utf16be", true)] {
+            rejects("malformed decoded source claimed exact highlighting") {
                 _ = try standalone(source, raw: bytes, encoding: encoding, replacements: replacements,
                     metadata: highlight([(0, 1, "plain")]))
             }
