@@ -3,8 +3,8 @@
 //! Multi-term saved-source queries over the existing parser, metadata filters,
 //! decoder and streaming matcher. Predicates are document-wide, not line-local.
 //! Each step evaluates one metadata record or one bounded matcher quantum. A
-//! member's verified buffer moves between predicate scans without rereading or
-//! copying its source. No runtime, source grant, or filesystem path is inferred.
+//! member's verified buffer feeds all predicates and the primary matcher in one
+//! decoding pass. No runtime, source grant, or filesystem path is inferred.
 
 use std::{io::{Cursor, Read, Seek}, mem::size_of};
 use fcb_core::{ArenaOwnerId, ByteLength, ByteRange, FileId, QueryGeneration,
@@ -41,13 +41,14 @@ impl From<PagedSearchError> for ExpressionError { fn from(e: PagedSearchError) -
 
 /// Immutable query syntax plus separately admitted matcher patterns. Borrowing
 /// this plan binds every prefilter, predicate and primary scan to the SAME AST.
-/// Hosts reserve a noncolliding allocation interval beginning at first_pattern;
-/// exactly exclusion_count + conjunction_count + 1 pattern IDs are used.
+/// Hosts reserve a noncolliding allocation interval beginning at first_pattern.
+/// The legacy term-sized interval is still validated, but the shared pattern
+/// now retains only its first allocation ID.
 pub struct ExpressionPlan {
     owner: ArenaOwnerId,
     case_sensitive: bool,
     syntax: ParsedQuery,
-    patterns: Vec<StreamingNeedle>,
+    pattern: StreamingNeedle,
     _lease: ResourceLease,
 }
 impl ExpressionPlan {
@@ -73,23 +74,20 @@ impl ExpressionPlan {
         let last = first_pattern.get().checked_add(count as u64 - 1)
             .ok_or(ExpressionError::IdentityExhausted)?;
         if (first_pattern.get()..=last).contains(&allocation.get()) { return Err(ExpressionError::InvalidLimits); }
-        let mut patterns = Vec::new();
-        patterns.try_reserve_exact(count).map_err(|_| ExpressionError::ResourceDenied)?;
-        if patterns.capacity() > count { return Err(ExpressionError::ResourceDenied); }
-        for (i, term) in syntax.exclusion_terms.iter().chain(&syntax.conjunction_terms)
-            .chain(std::iter::once(&syntax.primary_needle)).enumerate() {
-            let id = ResourceAllocationId::new(first_pattern.get() + i as u64)
-                .map_err(|_| ExpressionError::IdentityExhausted)?;
-            patterns.push(StreamingNeedle::text_matching(owner, term, case_sensitive, budget, id)?);
-        }
-        Ok(Self { owner, case_sensitive, syntax, patterns, _lease: lease })
+        let pattern = if count == 1 {
+            // A literal-only expression keeps its bounded lookahead route;
+            // there are no document-wide predicates requiring an EOF scan.
+            StreamingNeedle::text_matching(owner, &syntax.primary_needle, case_sensitive, budget, first_pattern)?
+        } else {
+            StreamingNeedle::expression(owner, &syntax, case_sensitive, budget, first_pattern)?
+        };
+        Ok(Self { owner, case_sensitive, syntax, pattern, _lease: lease })
     }
     pub fn syntax(&self) -> &ParsedQuery { &self.syntax }
     pub const fn owner(&self) -> ArenaOwnerId { self.owner }
     pub const fn case_sensitive(&self) -> bool { self.case_sensitive }
     pub const fn realized_mode(&self) -> &'static str { realized_mode(self.case_sensitive) }
-    fn primary(&self) -> usize { self.patterns.len() - 1 }
-    fn required(&self, term: usize) -> bool { term >= self.syntax.exclusion_terms.len() }
+    fn predicate_count(&self) -> usize { self.syntax.exclusion_terms.len() + self.syntax.conjunction_terms.len() }
     fn admits(&self, native: &[u8]) -> bool {
         // Match the established SearchDocument key convention. Escaped labels
         // are filter keys ONLY; output/activation always use native identities.
@@ -109,8 +107,9 @@ pub struct ExpressionOptions {
     pub first_file: FileId,
     pub first_revision: SourceRevision,
     pub max_matches: usize,
-    /// Aggregate raw bytes consumed by ALL predicate and primary scans. A
-    /// reread of retained bytes is still matching work and spends this budget.
+    /// Aggregate original bytes consumed by the shared decoding pass. Each
+    /// member byte is charged once regardless of the number of predicates.
+    /// Matcher CPU work also depends on the parser's bounded term count.
     pub max_scan_bytes: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -124,6 +123,8 @@ pub struct ExpressionStats {
     pub members_loaded: usize,
     pub loaded_bytes: u64,
     pub peak_member_bytes: usize,
+    /// Predicate cursors evaluated inside the shared source passes, not
+    /// additional reads or decoder passes.
     pub predicate_scans: usize,
     pub predicate_rejections: usize,
     pub primary_scans: usize,
@@ -176,7 +177,6 @@ pub struct ExpressionQuery<'archive, 'plan, R: Read + Seek> {
     allocations: [ResourceAllocationId; 3],
     scope_at: usize,
     next: usize,
-    term: usize,
     active: Option<ReaderSearch<'plan, Cursor<VerifiedMember>>>,
     hits: Vec<ExpressionHit>,
     seen: u64,
@@ -218,7 +218,7 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
             .map_err(|_| ExpressionError::ResourceDenied)?;
         let mut hits = Vec::new(); hits.try_reserve_exact(options.max_matches).map_err(|_| ExpressionError::ResourceDenied)?;
         if hits.capacity() > options.max_matches { return Err(ExpressionError::ResourceDenied); }
-        Ok(Self { archive, plan, index: None, options, allocations, scope_at: 0, next: 0, term: 0,
+        Ok(Self { archive, plan, index: None, options, allocations, scope_at: 0, next: 0,
             active: None, hits, seen: 0, matching_files: 0, count_all_matches, skip_matches,
             state: ExpressionState::Pending, stats: ExpressionStats::default(), _lease: lease })
     }
@@ -304,10 +304,9 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
             self.stats.members_loaded += 1;
             self.stats.loaded_bytes += verified.bytes().len() as u64;
             self.stats.peak_member_bytes = self.stats.peak_member_bytes.max(verified.bytes().len());
-            self.term = 0;
             self.start(verified, budget)?;
             // Member validation is distinct worker work. Do not hide a matcher
-            // quantum behind this load or a second term behind one step.
+            // quantum behind this load.
             return Ok(());
         }
         let scan = self.active.as_mut().ok_or(ExpressionError::Pending)?;
@@ -318,7 +317,6 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
         if state == StreamReadState::Pending { return Ok(()); }
         let (cursor, report) = self.active.take().ok_or(ExpressionError::Pending)?.finish()?;
         let verified = cursor.into_inner();
-        let primary = self.term == self.plan.primary();
         match report.state() {
             StreamReadState::UnsupportedText => { self.stats.unsupported_files += 1; return Ok(()); }
             StreamReadState::Canceled => return Err(ExpressionError::Canceled),
@@ -326,33 +324,28 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
             StreamReadState::Complete | StreamReadState::Truncated | StreamReadState::ByteLimit => {},
             _ => return Err(PagedSearchError::IncompleteInput.into()),
         }
-        if primary {
-            self.seen += report.matches_seen();
-            if report.matches_seen() > 0 { self.matching_files += 1; }
-            for hit in report.hits() {
-                self.hits.push(ExpressionHit { ordinal: verified.ordinal(), file: report.request().file(),
-                    revision: report.request().revision(), generation: self.options.generation,
-                    occurrence: hit.occurrence_id(), range: hit.original_range(),
-                    archive: verified.archive_digest(), source: verified.source_digest() });
-            }
-            if report.state() == StreamReadState::Truncated { self.state = ExpressionState::Truncated; }
-            else if report.state() == StreamReadState::ByteLimit { self.state = ExpressionState::WorkLimit; }
-        } else {
-            let found = report.matches_seen() > 0;
-            let complete = report.state() == StreamReadState::Complete;
-            let required = self.plan.required(self.term);
-            if (found && !required) || (!found && required && complete) {
-                self.stats.predicate_rejections += 1;
-            } else if !found && !complete {
-                self.state = ExpressionState::WorkLimit;
-            } else {
-                self.term += 1;
-                // Drop the prior matcher's result lease before reserving the
-                // same allocation ID for its successor. Source remains owned.
-                drop(report);
-                self.start(verified, budget)?;
-            }
+        if report.content_predicates_qualified() == Some(false) {
+            self.stats.predicate_rejections += 1;
         }
+        // The shared expression matcher finishes its predicates before exposing
+        // any primary candidates. Preserve this query's public non-counting
+        // contract: only one extra occurrence proves truncation, and later
+        // members remain unexamined once that evidence exists.
+        let remaining = self.options.max_matches - self.hits.len();
+        let skip = self.skip_matches.saturating_sub(self.seen);
+        let counted = if self.count_all_matches { report.matches_seen() } else {
+            report.matches_seen().min(skip.saturating_add(remaining as u64).saturating_add(1))
+        };
+        self.seen = self.seen.checked_add(counted).ok_or(ExpressionError::InvalidLimits)?;
+        if counted > 0 { self.matching_files += 1; }
+        for hit in report.hits() {
+            self.hits.push(ExpressionHit { ordinal: verified.ordinal(), file: report.request().file(),
+                revision: report.request().revision(), generation: self.options.generation,
+                occurrence: hit.occurrence_id(), range: hit.original_range(),
+                archive: verified.archive_digest(), source: verified.source_digest() });
+        }
+        if report.state() == StreamReadState::ByteLimit { self.state = ExpressionState::WorkLimit; }
+        else if !self.count_all_matches && report.has_more_matches() { self.state = ExpressionState::Truncated; }
         Ok(())
     }
     fn start(&mut self, verified: VerifiedMember, budget: &ResourceBudget) -> Result<(), ExpressionError> {
@@ -363,18 +356,14 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
         let request = CaptureRequest::new(file, revision).map_err(|_| PagedSearchError::InvalidHit)?;
         let length = verified.bytes().len() as u64;
         let mut options = StreamReadOptions::new(self.options.generation);
-        options.max_matches = if self.term == self.plan.primary() { self.options.max_matches - self.hits.len() } else { 1 };
+        options.max_matches = self.options.max_matches - self.hits.len();
         options.max_bytes = length.min(self.options.max_scan_bytes.saturating_sub(self.stats.scanned_bytes));
         options.max_read_calls = fcb_store::paged_snapshot::MAX_SNAPSHOT_READ_CALLS;
-        let scan = if self.term == self.plan.primary() {
-            ReaderSearch::new_page(Cursor::new(verified), request, ByteLength::new(length),
-                &self.plan.patterns[self.term], options, self.skip_matches.saturating_sub(self.seen),
-                self.count_all_matches, budget, self.allocations[2])?
-        } else {
-            ReaderSearch::new(Cursor::new(verified), request, ByteLength::new(length),
-                &self.plan.patterns[self.term], options, budget, self.allocations[2])?
-        };
-        if self.term == self.plan.primary() { self.stats.primary_scans += 1; } else { self.stats.predicate_scans += 1; }
+        let scan = ReaderSearch::new_page(Cursor::new(verified), request, ByteLength::new(length),
+            &self.plan.pattern, options, self.skip_matches.saturating_sub(self.seen),
+            self.count_all_matches, budget, self.allocations[2])?;
+        self.stats.primary_scans += 1;
+        self.stats.predicate_scans += self.plan.predicate_count();
         self.active = Some(scan); Ok(())
     }
     pub fn finish(self) -> Result<ExpressionReport, ExpressionError> {
@@ -448,7 +437,8 @@ mod tests {
         assert_eq!(budget.accounting().reserved().get(), 0);
         let plan = ExpressionPlan::parse(owner(), "\"pub fn\" Result -unsafe path:src/ lang:rust", &budget, allocation(1), allocation(10)).unwrap();
         assert_eq!(plan.syntax().primary_needle, "pub fn");
-        assert_eq!(plan.patterns.len(), 3);
+        assert_eq!(plan.predicate_count(), 2);
+        assert!(plan.pattern.is_expression());
         assert!(plan.admits(b"src/lib.rs")); assert!(!plan.admits(b"src/lib.py"));
         drop(plan); assert_eq!(budget.accounting().reserved().get(), 0);
     }

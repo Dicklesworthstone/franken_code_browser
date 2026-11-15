@@ -22,10 +22,13 @@ fn conjunction_and_exclusion_apply_to_whole_members_not_matching_lines() {
     let mut distant = b"needle\n".to_vec(); distant.extend(vec![b'x'; 96 * 1024]); distant.extend_from_slice(b"\nrequired");
     let f = Fixture::new(&[entry(b"a.rs", &distant), entry(b"b.rs", b"needle\nrequired\nforbidden"),
         entry(b"c.rs", b"needle"), entry(b"d.rs", b"required")], true);
-    let mut s = f.open(66101); let result = query(&mut s, 1, "needle required -forbidden");
+    let work = (distant.len() + b"needle\nrequired\nforbidden".len() + b"needle".len() + b"required".len()) as u64;
+    let mut s = f.open(66101);
+    let result = SavedExpression::prepare(&mut s, 1, "needle required -forbidden",
+        SavedExpressionOptions { max_hits: 10, max_scan_bytes: work }, || false).unwrap();
     assert!(result.is_complete()); assert_eq!(result.retained_hits(), 1);
     assert_eq!(result.stats().members_loaded, 4);
-    assert!(result.stats().scanned_bytes > distant.len() as u64);
+    assert_eq!(result.stats().scanned_bytes, work);
     let page = json(&result.page(&mut s, 1, 0, 128, || false).unwrap());
     assert_eq!(page.get("predicate_scope").text(), "whole-captured-member");
     assert_eq!(page.get("hits").array()[0].get("member").number(), 0);

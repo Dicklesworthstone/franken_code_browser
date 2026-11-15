@@ -239,9 +239,10 @@ workspace traversal, so a later query filter cannot undo unfinished discovery.
 Saved-source expressions use `fcb::search::expression::ExpressionPlan` and
 `ExpressionQuery`. A preliminary metadata pass counts the selected scope one
 record per step, including missing selected members. The query then loads one
-member with digest verification and moves that SAME owned buffer between the
-existing `ReaderSearch` predicate and primary scans. No term reopens the source,
-no complete decoded source copy is needed, and files are never concatenated.
+member with digest verification and feeds that SAME owned buffer through a
+single `ReaderSearch` decoding pass shared by all predicates and the primary
+matcher. No term reopens or rescans the source, no complete decoded source copy
+is needed, and files are never concatenated.
 
 Each step evaluates at most one metadata record, loads one admitted member, or
 runs one bounded matcher quantum. Loading and hashing a whole admitted member
@@ -261,18 +262,21 @@ its literal/raw query routes, including resident and demand-paged postings.
 
 ## Work, completeness, and identity
 
-For captured-workspace and saved-source expressions, `--max-scan-bytes` admits
-aggregate matching work across ALL predicate and primary scans: 256 MiB by
-default, with an explicit maximum of 1 TiB. Reading the same retained source for
-another term still spends matching work. This does not replace
+For saved-source expressions, `--max-scan-bytes` admits original source bytes
+consumed by the shared decoding pass: 256 MiB by default, with an explicit
+maximum of 1 TiB. Each member byte spends that allowance once, regardless of
+the number of content terms. Matcher CPU work still depends on the parser's
+bounded term count. Captured-workspace matching has its own scanner accounting.
+This does not replace
 source-capture, source-load, archive-validation, or configuration-I/O accounting.
 Live source admission and index construction may precede a matching-work stop.
 
 A partial predicate scan cannot establish that a required term is absent or an
 excluded term never occurs. Primary hits are withheld until their predicates
-qualify. On the captured and saved routes, a subsequent primary scan that reaches
-its work cap can return useful exact hits with partial coverage. The single-pass
-whole-file route instead withholds all candidates from an incomplete observation.
+qualify. Saved-source compound queries and the single-pass whole-file route
+withhold a member's candidates when its observation is incomplete. Exact hits
+from already completed, qualified saved members remain available with partial
+coverage. Literal-only saved queries retain their bounded lookahead behavior.
 Unsupported text is counted separately, rather than silently searched through
 replacement characters as though it were exact text.
 
@@ -309,7 +313,7 @@ include the correct original encoding/BOM offsets. `ExpressionHit::open` reloads
 and verifies the selected saved member, then exposes the ordinary bounded reader.
 A stale query or changed backing bytes cannot open beneath an old hit's identity.
 Already verified member bytes remain coherent if the backing artifact changes
-between predicate scans; reopening changed backing still fails verification.
+during the shared scan; reopening changed backing still fails verification.
 
 JSON is one bounded document with canonical decimal-string counters and reversible
 native paths. Human query text and filenames escape terminal controls. Exit codes
@@ -322,7 +326,7 @@ artifacts, runs no repository commands, and never modifies either source route.
 The public consumer suites `snapshot_expressions` and `expression_capture_io`
 compare results with the existing production capture scanner, cover UTF-16 and
 predicate/work/result boundaries, and independently guard actual archive reads.
-They exercise retained-buffer mutation between terms, changed-source rejection,
+They exercise retained-buffer mutation during scanning, changed-source rejection,
 filtered unavailable members, cancellation, stale identities, and reader reopening.
 `expression_cli` covers live and saved commands, repository rules, catalog opening,
 raw names, read-only effects, and the actual executable after a source-root move.

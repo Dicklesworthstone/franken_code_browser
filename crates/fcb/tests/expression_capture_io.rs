@@ -71,17 +71,19 @@ fn all_predicates_and_primary_share_one_verified_load_and_cannot_read_excluded_p
     let budget = budget(); let (mut archive, backing) = source(&budget);
     arm(&archive, &backing); let before = backing.borrow().read_bytes;
     let plan = ExpressionPlan::parse(owner(), "needle required -forbidden lang:rust", &budget, allocation(3), allocation(100)).unwrap();
-    let mut query = ExpressionQuery::new(&mut archive, &plan, options(), &budget,
+    let mut opts = options(); opts.max_scan_bytes = 15;
+    let mut query = ExpressionQuery::new(&mut archive, &plan, opts, &budget,
         [allocation(4), allocation(5), allocation(6)]).unwrap();
     drain(&mut query, &budget); let report = query.finish().unwrap();
     assert!(report.is_complete()); assert_eq!(report.matches_seen(), 1);
     assert_eq!(report.stats().predicate_scans, 2); assert_eq!(report.stats().primary_scans, 1);
-    assert_eq!(backing.borrow().read_bytes - before, 15, "three scans must not mean three archive loads");
+    assert_eq!(backing.borrow().read_bytes - before, 15, "all terms share one archive load");
+    assert_eq!(report.stats().scanned_bytes, 15, "all terms share one decoding pass");
     assert_eq!(report.stats().members_loaded, 1); assert_eq!(report.stats().metadata_excluded, 1);
 }
 
 #[test]
-fn backing_mutation_between_predicates_does_not_change_the_retained_source_but_blocks_reopen() {
+fn backing_mutation_during_the_shared_scan_preserves_the_retained_source_but_blocks_reopen() {
     let budget = budget(); let (mut archive, backing) = source(&budget);
     let start = arm(&archive, &backing);
     let plan = ExpressionPlan::parse(owner(), "needle required lang:rust", &budget, allocation(3), allocation(100)).unwrap();

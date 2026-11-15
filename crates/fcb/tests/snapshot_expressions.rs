@@ -63,7 +63,7 @@ fn all_terms_are_document_wide_but_must_belong_to_the_same_capture() {
     assert_eq!(coords(&report), [(100, 200, 1, 4), (100, 200, 3, 6)]);
     assert_eq!(report.stats().predicate_rejections, 2);
     assert_eq!(report.stats().members_loaded, 4);
-    assert_eq!(archive.load_stats().loaded_members, 4, "term scans must move the same verified buffer, not reload it");
+    assert_eq!(archive.load_stats().loaded_members, 4, "all terms must share one verified member load");
 }
 
 #[test]
@@ -117,15 +117,32 @@ fn unfinished_discovery_and_unsupported_predicates_cannot_prove_a_negative() {
 }
 
 #[test]
-fn work_limit_counts_every_term_and_does_not_publish_unproven_primary_hits() {
+fn work_limit_charges_each_source_byte_once_and_withholds_unproven_primary_hits() {
     let budget = budget();
-    let mut archive = archive(&[entry(b"a.rs", b"needle................forbidden")], true, &budget);
+    let source = b"needle................forbidden";
+    let mut archive = archive(&[entry(b"a.rs", source)], true, &budget);
     let report = run(&mut archive, "needle -forbidden", None, options(100, 8), &budget);
     assert_eq!(report.state(), ExpressionState::WorkLimit); assert!(!report.is_complete());
     assert!(report.hits().is_empty()); assert!(report.stats().scanned_bytes <= 8); drop(report);
-    let report = run(&mut archive, "needle needle", None, options(100, 31), &budget);
-    assert_eq!(report.state(), ExpressionState::WorkLimit); assert!(report.stats().scanned_bytes <= 31);
+    let report = run(&mut archive, "needle needle -absent", None, options(100, source.len() as u64), &budget);
+    assert!(report.is_complete()); assert_eq!(report.matches_seen(), 1);
+    assert_eq!(report.stats().scanned_bytes, source.len() as u64);
+    assert_eq!(coords(&report), [(100, 200, 0, 6)]);
     assert_eq!(report.stats().members_loaded, 1);
+}
+
+#[test]
+fn a_late_exclusion_rejects_candidates_after_the_row_cap_without_extra_source_work() {
+    let budget = budget();
+    let rejected = b"needle needle needle required forbidden";
+    let accepted = b"needle required";
+    let work = (rejected.len() + accepted.len()) as u64;
+    let mut archive = archive(&[entry(b"a.rs", rejected), entry(b"b.rs", accepted)], true, &budget);
+    let report = run(&mut archive, "needle required -forbidden", None, options(1, work), &budget);
+    assert!(report.is_complete()); assert_eq!(report.matches_seen(), 1);
+    assert_eq!(coords(&report), [(101, 201, 0, 6)]);
+    assert_eq!(report.stats().predicate_rejections, 1);
+    assert_eq!(report.stats().scanned_bytes, work);
 }
 
 #[test]

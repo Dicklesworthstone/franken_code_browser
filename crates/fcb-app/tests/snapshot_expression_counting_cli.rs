@@ -106,6 +106,24 @@ fn negative_predicates_must_finish_before_primary_occurrences_can_count() {
 }
 
 #[test]
+fn compound_counts_complete_with_one_source_length_of_scan_budget() {
+    for little in [false, true] {
+        let source = utf16("KELVIN KELVIN REQUIRED", little);
+        let f = Fixture::new(&[entry(b"a.rs", &source)], true);
+        let allowance = source.len().to_string();
+        let (exit, counted) = search(&f, "kelvin required -forbidden",
+            &["--ignore-case", "--count-all", "--limit", "0", "--max-scan-bytes", &allowance]);
+        assert_eq!(exit, EXIT_OK);
+        assert_eq!(counted.get("matches_seen").number(), 2);
+        assert!(counted.get("match_count_complete").flag());
+        assert!(!counted.get("work_limited").flag());
+        assert_eq!(counted.get("scanned_input_bytes").number(), source.len() as u64);
+        assert!(counted.get("hits").array().is_empty());
+        assert_eq!(fs::read(&f.path).unwrap(), f.bytes);
+    }
+}
+
+#[test]
 fn unavailable_unsupported_and_incomplete_discovery_keep_counts_partial() {
     let f = Fixture::new(&[entry(b"a.rs", b"needle needle"), entry(b"b.rs", &[0xff]),
         SnapshotEntry { path: b"c.rs", observed_bytes: 100, data: SnapshotData::Unavailable("READ_DENIED") }], true);

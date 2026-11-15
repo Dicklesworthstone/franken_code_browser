@@ -768,12 +768,15 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
     /// The conservative lease remains attached to the report until it is dropped.
     pub fn finish(mut self) -> Result<(R, StreamReadReport<'needle>), StreamReadError> {
         if self.state == StreamReadState::Pending { return Err(StreamReadError::Pending); }
+        let content_predicates_qualified = if self.expression_enabled && self.state == StreamReadState::Complete {
+            self.expression.as_ref().map(ExpressionWork::qualifies)
+        } else { None };
         if !matches!(self.expression_qualified, Some(true)) { self.discard_expression_candidates(); }
         let report = StreamReadReport { needle: self.needle, expression_enabled: self.expression_enabled,
             request: self.request, length: self.length,
             generation: self.options.generation, encoding: self.encoding, header: self.header,
             count_all_matches: self.count_all_matches, skip_matches: self.skip_matches,
-            expression_qualified: self.expression_qualified,
+            expression_qualified: self.expression_qualified, content_predicates_qualified,
             hits: self.hits, witnesses: self.witnesses, matches_seen: self.matches_seen, unsupported_at: self.unsupported_at,
             state: self.state, stats: self.stats, _lease: self.lease };
         Ok((self.reader, report))
@@ -791,6 +794,7 @@ pub struct StreamReadReport<'needle> {
     count_all_matches: bool,
     skip_matches: u64,
     expression_qualified: Option<bool>,
+    content_predicates_qualified: Option<bool>,
     hits: Vec<StreamingHit>,
     witnesses: Vec<RetainedWitness>,
     matches_seen: u64,
@@ -813,6 +817,10 @@ impl StreamReadReport<'_> {
     /// `is_expression` to distinguish those cases. Metadata filters belong to
     /// the host's admission policy and are not evaluated by a reader.
     pub const fn expression_qualified(&self) -> Option<bool> { self.expression_qualified }
+    /// Whether the additional required/excluded terms qualify, independently
+    /// of the primary term's occurrence count. Available only after a complete
+    /// expression observation; literal and incomplete scans return None.
+    pub const fn content_predicates_qualified(&self) -> Option<bool> { self.content_predicates_qualified }
     pub const fn state(&self) -> StreamReadState { self.state }
     pub const fn stats(&self) -> StreamReadStats { self.stats }
     pub const fn matches_seen(&self) -> u64 { self.matches_seen }
