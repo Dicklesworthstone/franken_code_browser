@@ -83,9 +83,7 @@ enum AtlasNativeSearch {
         access: AtlasSearchAccessLease, progress: @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport {
         let root = input.root, query = input.query, scope = input.fileScope, pathScope = input.pathScope
         if cancellation.isCanceled { throw AtlasSearchError.canceled }
-        let handle = createSearchAtlas()
-        guard handle != 0 else { throw AtlasSearchError.unavailable }
-        let owner = try AtlasSearchCaptureOwner(handle: handle,
+        let owner = try AtlasSearchCaptureOwner(create: { createSearchAtlas() },
             close: { closeSearchAtlas($0) != 0 }, retirementFailed: {
                 FileHandle.standardError.write(Data("ATLAS_SEARCH_RETIREMENT_FAILED\n".utf8))
             })

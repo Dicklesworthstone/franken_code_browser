@@ -116,7 +116,7 @@ private final class AtlasReaderRetirement: @unchecked Sendable {
     static let shared = AtlasReaderRetirement()
     private let queue = DispatchQueue(label: "dev.frankencode.browser.reader-retirement", qos: .utility)
     private let retryLock = NSLock()
-    private var retryScheduled = false
+    private var retryScheduled = false // One queued pass, in addition to any running pass.
     private var quarantine: [Record] = [] // Queue-owned; at most eight permits.
 
     final class Record: @unchecked Sendable {
@@ -154,8 +154,11 @@ private final class AtlasReaderRetirement: @unchecked Sendable {
         retryScheduled = true
         retryLock.unlock()
         queue.async { [self] in
-            drain()
+            // An explicit retry arriving during this pass may need to revisit
+            // a record already refused by it. Coalesce into ONE queued follow-
+            // up, rather than lose that request against the running pass.
             retryLock.lock(); retryScheduled = false; retryLock.unlock()
+            drain()
         }
     }
 

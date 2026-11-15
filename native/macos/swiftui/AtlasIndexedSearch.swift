@@ -245,8 +245,9 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             guard pathScope.isWorkspace else { throw AtlasSearchError.invalidPathScope }
             guard scope.isAll else { throw AtlasSearchError.invalidScope }
         }
-        let handle = transport.create()
-        let owner = try AtlasSearchCaptureOwner(handle: handle, close: transport.close, retirementFailed: transport.retirementFailed)
+        let owner = try AtlasSearchCaptureOwner(create: transport.create, close: transport.close,
+            retirementFailed: transport.retirementFailed)
+        let handle = owner.call { $0 }
         owner.retainAccess(access)
         try check(cancellation)
         let opened = try AtlasIndexWire.decode(owner.call { try transport.open($0, root, cancellation) })

@@ -1,22 +1,109 @@
 import Foundation
 import Dispatch
 
+/// The native atlas registry admits four owners. Failed retirement continues
+/// to consume admission, including when an injected create closure has no cap.
+/// Reserve before creating a handle, so refusal never strands an unowned one.
+private final class AtlasSearchCapturePermit: @unchecked Sendable {
+    private static let state = State()
+    private var acquired = false
+    private final class State: @unchecked Sendable {
+        let lock = NSLock()
+        var count = 0
+    }
+    init?() {
+        Self.state.lock.lock(); defer { Self.state.lock.unlock() }
+        guard Self.state.count < 4 else { return nil }
+        Self.state.count += 1
+        acquired = true
+    }
+    deinit {
+        guard acquired else { return }
+        Self.state.lock.lock(); defer { Self.state.lock.unlock() }
+        Self.state.count -= 1
+    }
+}
+
+/// Preserve the native handle and root grant after a refused close. Explicit
+/// opening or retirement triggers one bounded retry pass, never a polling loop.
+private final class AtlasSearchCaptureRetirement: @unchecked Sendable {
+    static let shared = AtlasSearchCaptureRetirement()
+    private let queue = DispatchQueue(label: "dev.frankencode.browser.search-retirement", qos: .utility)
+    private let retryLock = NSLock()
+    private var retryScheduled = false // At most one queued pass behind an active drain.
+    private var quarantine: [Record] = [] // Queue-owned; at most four permits.
+
+    final class Record: @unchecked Sendable {
+        let handle: UInt64
+        let closeHandle: @Sendable (UInt64) -> Bool
+        let failed: @Sendable () -> Void
+        let access: AtlasSearchAccessLease?
+        let permit: AtlasSearchCapturePermit
+        init(handle: UInt64, close: @escaping @Sendable (UInt64) -> Bool,
+             failed: @escaping @Sendable () -> Void, access: AtlasSearchAccessLease?,
+             permit: AtlasSearchCapturePermit) {
+            self.handle = handle; closeHandle = close; self.failed = failed
+            self.access = access; self.permit = permit
+        }
+        func close() -> Bool {
+            withExtendedLifetime(access) {
+                for attempt in 0..<8 {
+                    if closeHandle(handle) { return true }
+                    if attempt < 7 { Thread.sleep(forTimeInterval: 0.001) }
+                }
+                failed()
+                return false
+            }
+        }
+    }
+
+    func retire(_ record: Record) {
+        queue.async { [self, record] in
+            drain()
+            if !record.close() { quarantine.append(record) }
+        }
+    }
+
+    func retry() {
+        retryLock.lock()
+        guard !retryScheduled else { retryLock.unlock(); return }
+        retryScheduled = true
+        retryLock.unlock()
+        queue.async { [self] in
+            // A new opening during this pass can require revisiting a record
+            // already refused. Allow one queued follow-up behind this drain.
+            retryLock.lock(); retryScheduled = false; retryLock.unlock()
+            drain()
+        }
+    }
+
+    private func drain() {
+        let pending = quarantine
+        quarantine = []
+        for record in pending where !record.close() { quarantine.append(record) }
+    }
+}
+
 /// One native retained-search handle. All foreign use is worker-only and
 /// serialized between incremental steps and reader imports; no UI waits on
 /// this lock. Last-owner destruction queues bounded retirement off the UI.
 final class AtlasSearchCaptureOwner: @unchecked Sendable {
-    private static let retirement = DispatchQueue(label: "dev.frankencode.browser.search-retirement", qos: .utility)
     private let handle: UInt64
     private let foreign = NSLock()
     private let accessLock = NSLock()
     private var access: AtlasSearchAccessLease?
+    private let permit: AtlasSearchCapturePermit
     private let close: @Sendable (UInt64) -> Bool
     private let retirementFailed: @Sendable () -> Void
 
-    init(handle: UInt64, close: @escaping @Sendable (UInt64) -> Bool,
+    init(create: @Sendable () -> UInt64, close: @escaping @Sendable (UInt64) -> Bool,
          retirementFailed: @escaping @Sendable () -> Void) throws {
+        AtlasSearchCaptureRetirement.shared.retry()
+        guard let permit = AtlasSearchCapturePermit() else { throw AtlasSearchError.unavailable }
+        let handle = create()
         guard handle != 0 else { throw AtlasSearchError.unavailable }
         self.handle = handle
+        self.permit = permit
         self.close = close
         self.retirementFailed = retirementFailed
     }
@@ -36,18 +123,8 @@ final class AtlasSearchCaptureOwner: @unchecked Sendable {
     }
 
     deinit {
-        let handle = handle, close = close, failed = retirementFailed, access = access
-        Self.retirement.async {
-            withExtendedLifetime(access) {
-                // The Rust registry caps retained atlas handles. Retry transient
-                // registry contention, not arbitrary source or filesystem work.
-                for attempt in 0..<8 {
-                    if close(handle) { return }
-                    if attempt < 7 { Thread.sleep(forTimeInterval: 0.001) }
-                }
-                failed()
-            }
-        }
+        AtlasSearchCaptureRetirement.shared.retire(.init(handle: handle, close: close,
+            failed: retirementFailed, access: access, permit: permit))
     }
 }
 

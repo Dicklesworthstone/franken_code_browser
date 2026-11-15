@@ -63,12 +63,14 @@ private final class Driver: @unchecked Sendable {
     private var failedRetirements = 0
     private var blockNextWindow = false
     private var blockNextOpen = false
+    private var blockCloseOwner: UInt64?
     private var closeFailures = 0
     let entered = DispatchSemaphore(value: 0)
     let gate = DispatchSemaphore(value: 0)
 
     func blockWindow() { lock.lock(); blockNextWindow = true; lock.unlock() }
     func blockOpen() { lock.lock(); blockNextOpen = true; lock.unlock() }
+    func blockClose(_ owner: UInt64) { lock.lock(); blockCloseOwner = owner; lock.unlock() }
     func refuseClose(_ count: Int) { lock.lock(); closeFailures = count; lock.unlock() }
     var snapshot: (calls: [String], closed: Int, attempts: Int, closeOnMain: Bool, failures: Int) {
         lock.lock(); defer { lock.unlock() }
@@ -81,6 +83,20 @@ private final class Driver: @unchecked Sendable {
         if open { blockNextOpen = false } else { blockNextWindow = false }
         lock.unlock()
         if pause { entered.signal(); precondition(gate.wait(timeout: .now() + .seconds(5)) == .success) }
+    }
+    private func close(_ owner: UInt64) -> Bool {
+        lock.lock()
+        calls.append("close:\(owner)"); closeAttempts += 1
+        closeOnMain = closeOnMain || Thread.isMainThread
+        let pause = blockCloseOwner == owner
+        if pause { blockCloseOwner = nil }
+        let refused = closeFailures > 0
+        if refused { closeFailures -= 1 }
+        lock.unlock()
+        if pause { entered.signal(); precondition(gate.wait(timeout: .now() + .seconds(5)) == .success) }
+        if refused { return false }
+        lock.lock(); closed += 1; lock.unlock()
+        return true
     }
     var transport: AtlasReaderTransport {
         AtlasReaderTransport(create: { [self] in
@@ -106,13 +122,9 @@ private final class Driver: @unchecked Sendable {
                              "error": ["code": "READER_SESSION_MISSING_LINE"]])
             }
             return json(window(owner: owner, start: 5, end: 9, command: "lines", first: first))
-        }, cancel: { [self] owner in record("cancel:\(owner)"); return true }, close: { [self] owner in
-            lock.lock(); defer { lock.unlock() }
-            calls.append("close:\(owner)"); closeAttempts += 1
-            closeOnMain = closeOnMain || Thread.isMainThread
-            if closeFailures > 0 { closeFailures -= 1; return false }
-            closed += 1; return true
-        }, retirementFailed: { [self] in lock.lock(); failedRetirements += 1; lock.unlock() })
+        }, cancel: { [self] owner in record("cancel:\(owner)"); return true },
+        close: { [self] in close($0) },
+        retirementFailed: { [self] in lock.lock(); failedRetirements += 1; lock.unlock() })
     }
 }
 
@@ -501,6 +513,47 @@ private final class Driver: @unchecked Sendable {
                   "successful quarantined close was repeated or the old handle was forgotten")
             replacement.close()
             wait("replacement reader did not retire") { driver.snapshot.closed == 2 }
+        }
+
+        // A retry arriving while a pass is active must revisit records that
+        // pass already refused. Block its SECOND record to make the ordering
+        // deterministic; no unrelated retirement may rescue the first record.
+        do {
+            let driver = Driver(); driver.refuseClose(Int.max)
+            let first = AtlasReaderCoordinator(transport: driver.transport)
+            let second = AtlasReaderCoordinator(transport: driver.transport)
+            var opened = false
+            Task {
+                _ = try! await first.open(input: input)
+                _ = try! await second.open(input: input)
+                opened = true
+            }
+            wait("retry-race sources did not open") { opened }
+            first.close()
+            wait("first retry-race source was not quarantined") { driver.snapshot.failures == 1 }
+            second.close()
+            wait("second retry-race source was not quarantined") { driver.snapshot.failures == 3 }
+
+            driver.blockClose(3)
+            let trigger = AtlasReaderCoordinator(transport: driver.transport)
+            var triggered = false
+            Task { _ = try! await trigger.open(input: input); triggered = true }
+            wait("retry pass did not enter its second quarantined record") {
+                driver.entered.wait(timeout: .now()) == .success
+            }
+            wait("opening waited for retirement") { triggered }
+            let firstAttempts = driver.snapshot.calls.filter { $0 == "close:2" }.count
+            driver.refuseClose(0)
+            let followup = AtlasReaderCoordinator(transport: driver.transport)
+            var retried = false
+            Task { _ = try! await followup.open(input: input); retried = true }
+            wait("follow-up open waited for an active retirement pass") { retried }
+            driver.gate.signal()
+            wait("explicit retry was lost against the already-running pass") { driver.snapshot.closed == 2 }
+            check(driver.snapshot.calls.filter { $0 == "close:2" }.count == firstAttempts + 1,
+                  "follow-up pass did not retire the earlier refused record exactly once")
+            trigger.close(); followup.close()
+            wait("retry-race readers did not all retire") { driver.snapshot.closed == 4 }
         }
 
         // Failed close records consume the same finite admission as active

@@ -52,6 +52,22 @@ private final class Access: @unchecked Sendable {
             preconditionFailure("Accepted " + message)
         } catch AtlasSearchError.invalidResponse { checks += 1 }
     }
+    private static func retirementOwner(_ counts: Counts, handle: UInt64) throws -> AtlasSearchCaptureOwner {
+        let owner = try AtlasSearchCaptureOwner(create: {
+            counts.add("create")
+            return handle
+        }, close: { current in
+            precondition(current == handle)
+            counts.add("close")
+            if Thread.isMainThread { counts.add("closeOnMain") }
+            guard counts.get("allowClose") > 0 else { return false }
+            counts.add("closed")
+            counts.add("closed:\(current)")
+            return true
+        }, retirementFailed: { counts.add("failure") })
+        owner.retainAccess(AtlasSearchAccessLease(Access(counts)))
+        return owner
+    }
     @MainActor static func main() async throws {
         let valid = try json(envelope())
         let reader = try AtlasSearchCaptureFactory.validatedReader(valid, receiver: 100, identity: identity, witness: witness)
@@ -90,12 +106,18 @@ private final class Access: @unchecked Sendable {
                 receiver: 100, identity: identity, witness: witness)
             preconditionFailure("Oversize handoff admitted")
         } catch AtlasSearchError.invalidResponse { checks += 1 }
+        let refusedCreates = Counts()
+        for _ in 0..<128 {
+            do {
+                _ = try AtlasSearchCaptureOwner(create: { refusedCreates.add("create"); return 0 },
+                    close: { _ in preconditionFailure("A failed creation owns no handle to close") },
+                    retirementFailed: { preconditionFailure("A failed creation owns no retirement") })
+                preconditionFailure("Zero handle admitted")
+            } catch AtlasSearchError.unavailable { }
+        }
+        check(refusedCreates.get("create") == 128, "Failed creation releases its reserved admission")
         do {
-            _ = try AtlasSearchCaptureOwner(handle: 0, close: { _ in true }, retirementFailed: {})
-            preconditionFailure("Zero handle admitted")
-        } catch AtlasSearchError.unavailable { checks += 1 }
-        do {
-            let spellingOwner = try AtlasSearchCaptureOwner(handle: 42, close: { _ in true }, retirementFailed: {})
+            let spellingOwner = try AtlasSearchCaptureOwner(create: { 42 }, close: { _ in true }, retirementFailed: {})
             var spellingHit = hit; spellingHit.actualText = "é"
             let spellingWitness = AtlasSearchCaptureWitness(hit: spellingHit, file: 6, revision: 7, pathHex: witness.pathHex)
             let spellingCapture = AtlasSearchCaptureFactory.make(owner: spellingOwner, identity: identity,
@@ -117,7 +139,7 @@ private final class Access: @unchecked Sendable {
             check(wrongExact.target(spellingHit) == nil, "Sensitive capture cannot substitute different query spelling")
         }
         let counts = Counts()
-        var owner: AtlasSearchCaptureOwner? = try AtlasSearchCaptureOwner(handle: 42, close: { handle in
+        var owner: AtlasSearchCaptureOwner? = try AtlasSearchCaptureOwner(create: { 42 }, close: { handle in
             precondition(handle == 42)
             counts.add("close")
             precondition(counts.get("grantReleased") == 0, "Grant must survive retirement")
@@ -146,16 +168,75 @@ private final class Access: @unchecked Sendable {
         target = nil
         await wait { counts.get("close") == 3 && counts.get("grantReleased") == 1 }
         check(weakOwner == nil && counts.get("failure") == 0, "Last target retires handle with bounded contention retry")
-        let failed = Counts()
-        var denied: AtlasSearchCaptureOwner? = try AtlasSearchCaptureOwner(handle: 9, close: { _ in failed.add("close"); return false },
-            retirementFailed: { failed.add("failure") })
-        _ = denied
-        denied = nil
-        await wait { failed.get("failure") == 1 }
-        check(failed.get("close") == 8, "Permanent retirement refusal is bounded and reported")
+        do {
+            let failed = Counts()
+            var denied: AtlasSearchCaptureOwner? = try retirementOwner(failed, handle: 9)
+            weak var weakDenied = denied
+            denied = nil
+            await wait { failed.get("failure") == 1 }
+            check(weakDenied == nil && failed.get("close") == 8,
+                "Refused retirement drops the presentation owner after one bounded close pass")
+            check(failed.get("grantReleased") == 0 && failed.get("closed") == 0,
+                "A refused native close keeps the source grant and handle alive")
+            check(failed.get("closeOnMain") == 0, "Retirement never runs on the interaction thread")
+
+            failed.add("allowClose")
+            var replacement: AtlasSearchCaptureOwner? = try retirementOwner(failed, handle: 10)
+            await wait { failed.get("closed") == 1 && failed.get("grantReleased") == 1 }
+            check(replacement?.call { $0 } == 10 && failed.get("closed:9") == 1,
+                "A new capture retries the quarantined handle exactly once after contention ends")
+            replacement = nil
+            await wait { failed.get("closed") == 2 && failed.get("grantReleased") == 2 }
+            check(failed.get("closed:10") == 1, "Replacement capture has independent retirement")
+        }
+        do {
+            let saturated = Counts()
+            var owners: [AtlasSearchCaptureOwner] = []
+            for handle in UInt64(1)...4 {
+                owners.append(try retirementOwner(saturated, handle: handle))
+            }
+            owners.removeAll()
+            await wait { saturated.get("failure") >= 4 }
+            var refused = 0
+            for _ in 0..<128 {
+                do {
+                    _ = try retirementOwner(saturated, handle: 5)
+                    preconditionFailure("Quarantined handles did not consume atlas admission")
+                } catch AtlasSearchError.unavailable { refused += 1 }
+            }
+            check(refused == 128 && saturated.get("create") == 4,
+                "Four failed closes block native creation, including repeated capture attempts")
+            check(saturated.get("grantReleased") == 0 && saturated.get("closed") == 0,
+                "Full quarantine retains every native root grant")
+
+            saturated.add("allowClose")
+            var replacement: AtlasSearchCaptureOwner?
+            // Admission does not wait on the retirement lane. A request can be
+            // coalesced with a retry already running, so explicitly retry until
+            // the finite old-owner set drains and one new owner is admitted.
+            for _ in 0..<1000 {
+                if replacement == nil {
+                    do { replacement = try retirementOwner(saturated, handle: 5) }
+                    catch AtlasSearchError.unavailable { }
+                }
+                if saturated.get("closed") == 4 && saturated.get("grantReleased") == 4,
+                   replacement != nil { break }
+                try? await Task.sleep(nanoseconds: 1_000_000)
+            }
+            check(replacement?.call { $0 } == 5 && saturated.get("create") == 5,
+                "Recovered admission creates exactly one new native owner")
+            check(saturated.get("closed") == 4 && saturated.get("grantReleased") == 4,
+                "Recovery releases all four grants only after confirmed native closes")
+            check((UInt64(1)...4).allSatisfy { saturated.get("closed:\($0)") == 1 },
+                "Quarantined owners each close successfully once")
+            replacement = nil
+            await wait { saturated.get("closed") == 5 && saturated.get("grantReleased") == 5 }
+            check(saturated.get("create") == saturated.get("closed") && saturated.get("closeOnMain") == 0,
+                "Retirement conserves native ownership and stays off the interaction thread")
+        }
         // The exact production lock serializes reader import with a paused
         // foreign step. Other owners remain independently usable.
-        let serial = try AtlasSearchCaptureOwner(handle: 1, close: { _ in true }, retirementFailed: {})
+        let serial = try AtlasSearchCaptureOwner(create: { 1 }, close: { _ in true }, retirementFailed: {})
         let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
         let done = Counts()
         DispatchQueue.global().async {
@@ -163,7 +244,7 @@ private final class Access: @unchecked Sendable {
         }
         check(entered.wait(timeout: .now() + 5) == .success, "Foreign step entered")
         DispatchQueue.global().async { serial.call { _ in precondition(done.get("first") == 1); done.add("second") } }
-        let independent = try AtlasSearchCaptureOwner(handle: 2, close: { _ in true }, retirementFailed: {})
+        let independent = try AtlasSearchCaptureOwner(create: { 2 }, close: { _ in true }, retirementFailed: {})
         check(independent.call { $0 } == 2 && done.get("second") == 0, "Another owner does not wait on this source")
         release.signal(); await wait { done.get("second") == 1 }
         checks += 1
